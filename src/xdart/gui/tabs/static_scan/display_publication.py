@@ -385,7 +385,7 @@ class PublicationDisplayAdapter:
         # Eviction guard.  For Sum/Average the cake aggregates the WHOLE intended
         # set, so check store residency against selected_ids and serve the on-disk
         # aggregate (Step 7b) when a frame is evicted — else blank, never average a
-        # wrong subset (review_2026-06-15 §2.C).  For Single/Overlay/Waterfall the
+        # wrong subset.  For Single/Overlay/Waterfall the
         # cake shows only the current frame, so guard just that one (None => blank;
         # the hydration worker rehydrates an evicted current frame and re-renders).
         guard_ids = (state.selected_ids

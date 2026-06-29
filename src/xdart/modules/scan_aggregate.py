@@ -22,7 +22,7 @@ Round-12 trap).  The caller gates on :func:`mode_aggregation_allowed` with the
 currently-displayed mode; this module always reads the primary (top-level) stack
 and folds the frames' *active* result as the tail.
 
-**Normalization** is applied per-frame before reducing (review_2026-06-15 §2.B):
+**Normalization** is applied per-frame before reducing:
 the caller passes ``norm={label: divisor}`` (the normChannel value per frame) and
 :mod:`xrd_tools.io.aggregate` divides each row before folding.
 

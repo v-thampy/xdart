@@ -60,8 +60,7 @@ params = [
     # PONI is the first row of DATA — the standalone CALIBRATION group is gone.
     # This collapses the N1 progressive disclosure to two stages (Folder -> DATA),
     # since the PONI picker now lives inside DATA (see _apply_disclosure).  A
-    # proper redo belongs in the Tier-B custom-card wrangler migration
-    # (design_gui_int_migration_jun2026.md).
+    # proper redo belongs in the Tier-B custom-card wrangler migration.
     {'name': 'Signal', 'title': 'DATA', 'type': 'group', 'children': [
         {'name': 'poni_file', 'title': 'Poni', 'type': 'str_browse', 'value': def_poni_file},
         {'name': 'inp_type', 'title': 'Source', 'type': 'list',
