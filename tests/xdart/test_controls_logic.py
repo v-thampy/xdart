@@ -6,6 +6,7 @@ from xdart.gui.tabs.static_scan.controls_logic import (
     SectionId,
     StatusKind,
     MeasMode,
+    ResultCap,
     ResultCaps,
     SourceCaps,
     Tool,
@@ -40,6 +41,23 @@ def test_analysis_launchers_can_gate_known_missing_optional_dependencies():
     assert not _launcher(specs, AnalysisTool.PEAK_FIT).enabled
     assert not _launcher(specs, AnalysisTool.PHASE_FIT).enabled
     assert _launcher(specs, AnalysisTool.SCAN_PLOT).enabled
+
+
+def test_analysis_launchers_carry_context_contract_metadata():
+    specs = build_analysis_launchers(
+        ResultCaps(has_1d=True, raw_reachable=True, has_scan_metadata=True))
+
+    peak = _launcher(specs, AnalysisTool.PEAK_FIT)
+    roi = _launcher(specs, AnalysisTool.ROI_STATS)
+    scan_plot = _launcher(specs, AnalysisTool.SCAN_PLOT)
+
+    assert peak.entry_point.endswith("peak_fit_dialog:PeakFitDialog")
+    assert peak.required_caps == frozenset({ResultCap.HAS_1D})
+    assert peak.optional_deps == frozenset({"fitting"})
+    assert peak.singleton_key == AnalysisTool.PEAK_FIT.value
+    assert roi.required_caps == frozenset({ResultCap.RAW_REACHABLE})
+    assert roi.singleton_key == "roi_stats"
+    assert scan_plot.required_caps == frozenset({ResultCap.SCAN_METADATA})
 
 
 def test_future_analysis_tools_are_present_but_gated_by_data():

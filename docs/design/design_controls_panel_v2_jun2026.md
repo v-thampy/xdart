@@ -415,9 +415,11 @@ friendly message without crashing xdart.
 
 **Status:** PARTIAL/PREVIEW IMPLEMENTED. `AnalysisContext` exists and existing Peak/Phase/Scan
 Plot entry points use it instead of direct dialog-to-widget internals. The hidden V2 Analysis
-card renders launcher buttons with disabled reasons and opens the existing Peak Fit, Phase Fit,
-Plot Metadata/Scan Plot, and ROI entry points. Future Strain/Texture launchers are present but
-disabled until their headless result contracts and real-data gates are ready.
+card renders launcher buttons with disabled reasons, entry-point metadata, required result
+capabilities, optional dependency names, and singleton keys. It opens the existing Peak Fit,
+Phase Fit, Plot Metadata/Scan Plot, and ROI entry points through the tab owner. Future
+Strain/Texture launchers are present but disabled until their headless result contracts and
+real-data gates are ready.
 
 ### Phase 7 — Int 1D/2D migration
 
