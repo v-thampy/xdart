@@ -17,7 +17,7 @@ via `CompositeFrameSource`) shows only for stitch/RSM.
 
 import logging
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -452,7 +452,23 @@ class ScanSourceWidget(QtWidgets.QWidget):
                 return gen, sig, spec, None, False, None, exc
 
         future = self._probe_executor.submit(_work)
-        future.add_done_callback(lambda fut: self.sigProbeDone.emit(fut.result()))
+
+        def _emit_done(fut):
+            try:
+                result = fut.result()
+            except CancelledError:
+                return
+            except Exception as exc:  # pragma: no cover - defensive callback guard
+                result = (gen, sig, spec, None, False, None, exc)
+            try:
+                self.sigProbeDone.emit(result)
+            except RuntimeError:
+                # The widget may have been deleted while an off-thread probe was
+                # unwinding.  The generation token already invalidates the work;
+                # this guard prevents a teardown-only warning/crash.
+                return
+
+        future.add_done_callback(_emit_done)
 
     def _on_probe_done(self, result):
         gen, sig, spec, source, reachable, first_image, exc = result

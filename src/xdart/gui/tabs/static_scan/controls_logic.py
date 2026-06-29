@@ -53,8 +53,8 @@ class ControlAction(str, Enum):
     """Intent emitted by the Controls V2 preview.
 
     The Qt widget renders these as buttons, but the static-scan tab owns the
-    actual routing while V2 is hidden.  Keeping the action list pure avoids
-    giving the preview direct access to wrangler/integrator internals.
+    actual routing.  Keeping the action list pure avoids giving the preview
+    direct access to wrangler/integrator internals.
     """
 
     CHOOSE_SOURCE = "choose_source"

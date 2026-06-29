@@ -489,6 +489,11 @@ class staticWidget(QWidget):
         # side-effects (unchecking Live, command='stop', button morph).
         self.controls.stopButton.clicked.connect(self._on_stop_clicked)
         self.controls_v2 = None
+        self._controls_v2_last_profile = None
+        self._controls_v2_refresh_timer = Coalescer(
+            250, mode="throttle", parent=self)
+        self._controls_v2_refresh_timer.triggered.connect(
+            self._refresh_controls_v2_profile_now)
         self._init_controls_v2_preview()
         # Reintegrate reuses the shared Batch toggle: Batch off -> live (per-frame,
         # the default); Batch on -> fast multicore.  The integrator reads it
@@ -566,7 +571,7 @@ class staticWidget(QWidget):
                 self._on_controls_v2_action)
             self.ui.verticalLayout.insertWidget(0, panel)
             self.controls_v2 = panel
-            self._refresh_controls_v2_profile()
+            self._refresh_controls_v2_profile(immediate=True)
         except Exception:
             self.controls_v2 = None
             logger.debug("Controls Panel V2 preview mount failed",
@@ -658,12 +663,25 @@ class staticWidget(QWidget):
         if callable(browse):
             browse()
 
-    def _refresh_controls_v2_profile(self) -> None:
+    def _refresh_controls_v2_profile(self, *, immediate: bool = False) -> None:
+        if getattr(self, "_tearing_down", False):
+            return
+        timer = getattr(self, "_controls_v2_refresh_timer", None)
+        if immediate or timer is None:
+            self._refresh_controls_v2_profile_now()
+        else:
+            timer.trigger()
+
+    def _refresh_controls_v2_profile_now(self) -> None:
         panel = getattr(self, "controls_v2", None)
         if panel is None:
             return
         try:
-            panel.set_profile(build_profile(self._controls_v2_state()))
+            profile = build_profile(self._controls_v2_state())
+            if profile == getattr(self, "_controls_v2_last_profile", None):
+                return
+            panel.set_profile(profile)
+            self._controls_v2_last_profile = profile
         except Exception:
             logger.debug("Controls Panel V2 profile refresh failed",
                          exc_info=True)
@@ -715,10 +733,9 @@ class staticWidget(QWidget):
         try:
             labels = self.publication_store.labels()
             recent = labels[-16:] if len(labels) > 16 else labels
-            pubs = self.publication_store.get_many(recent).values()
+            pubs = tuple(self.publication_store.get_many(recent).values())
             has_1d = has_1d or any(getattr(pub.view, "int_1d", None) is not None
                                    for pub in pubs)
-            pubs = self.publication_store.get_many(recent).values()
             has_2d = has_2d or any(getattr(pub.view, "int_2d", None) is not None
                                    for pub in pubs)
         except Exception:
