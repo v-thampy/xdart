@@ -64,6 +64,7 @@ class _DuckScan:
         self.scan_data = scan_data
         self.stitched_1d = None
         self.stitched_2d = None
+        self.stitch_skipped = None
 
 
 def _patch_stitch_images(monkeypatch):
@@ -163,6 +164,9 @@ def test_run_stitch_skips_frames_without_raw_and_aligns_geometry(monkeypatch):
 
     assert len(cap["images"]) == 2
     np.testing.assert_allclose(cap["rot1"], [10.0, 12.0], atol=1e-4)
+    # The partial skip is recorded on the scan so the GUI can warn the merge is a
+    # subset (frame 1 had no raw data); the surviving frames still stitched.
+    assert scan.stitch_skipped == [1]
 
 
 # ---------------------------------------------------------------------------

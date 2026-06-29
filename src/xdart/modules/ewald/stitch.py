@@ -278,6 +278,11 @@ def run_stitch(
                 'stitch: skipped %d frames with no raw data: %s',
                 len(skipped), skipped,
             )
+        # Surface the partial-skip so the GUI/caller can warn that the merge
+        # represents only a subset (a stitch over fewer frames can look valid but
+        # be missing data).  Recorded unconditionally so a prior run's value never
+        # lingers; the all-missing case still raises below.
+        scan.stitch_skipped = list(skipped)
         if not images:
             raise RuntimeError(
                 'stitch: no frames with raw data available — '

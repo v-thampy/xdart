@@ -2329,8 +2329,12 @@ class staticWidget(QWidget):
         if getattr(self.stitch_thread, 'ok', False):
             self.displayframe.stitch_display_mode = self.stitch_thread.mode
             self.displayframe._bump_display_generation()
+            # Surface a partial skip so the merge isn't silently a subset.
+            skipped = getattr(self.scan, 'stitch_skipped', None) or []
+            suffix = (f' — WARNING: {len(skipped)} frame(s) skipped (no raw data)'
+                      if skipped else '')
             self._stitch_status(
-                f'Stitch {self.stitch_thread.mode.upper()} complete.')
+                f'Stitch {self.stitch_thread.mode.upper()} complete.{suffix}')
         # else: _on_stitch_error already surfaced the failure — don't overwrite.
         self.update_all()
         if not self.wrangler.thread.isRunning():
