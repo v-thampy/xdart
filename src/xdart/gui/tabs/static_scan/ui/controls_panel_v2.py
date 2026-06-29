@@ -160,12 +160,14 @@ class ControlsPanelV2(QtWidgets.QWidget):
         lay.setSpacing(7)
 
         self.summary_card = SectionCard("Run Readiness")
+        self.project_card = SectionCard("Project")
         self.source_card = SectionCard("Source")
         self.experiment_card = SectionCard("Experiment")
         self.processing_card = SectionCard("Processing")
         self.output_card = SectionCard("Output")
         self.analysis_card = SectionCard("Analysis")
         lay.addWidget(self.summary_card)
+        lay.addWidget(self.project_card)
         lay.addWidget(self.source_card)
         lay.addWidget(self.experiment_card)
         lay.addWidget(self.processing_card)
@@ -199,6 +201,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
 
     def _render_fields(self, profile: ControlProfile) -> None:
         sections = (
+            (self.project_card, SectionId.PROJECT),
             (self.source_card, SectionId.SOURCE),
             (self.experiment_card, SectionId.EXPERIMENT),
             (self.processing_card, SectionId.PROCESSING),

@@ -274,15 +274,17 @@ Qt-free or hidden behind a flag; the live visible flip comes only after profile 
 `xdart.gui.tabs.static_scan.controls_logic` provides the Qt-free `ControlState →
 ControlProfile` / field-status / analysis-launcher gate,
 `xdart.gui.tabs.static_scan.ui.controls_panel_v2.ControlsPanelV2` renders a hidden
-card scaffold behind `XDART_CONTROLS_PANEL_V2=1`, and
+four-section Project / Source / Experiment / Processing scaffold behind
+`XDART_CONTROLS_PANEL_V2=1`, and
 `xdart.gui.tabs.static_scan.analysis_context.AnalysisContext` is now the seam used by
 Peak Fit, Phase Fit, and Scan Plot launch. This is intentionally behavior-preserving:
 the visible controls panel is still legacy-backed, and live fitting still follows the
 latest processed frame through the same latest-wins worker. The hidden V2 panel is
 observational only: it shows source/experiment/processing/output/analysis status and opens
 the existing analysis popups. It also renders hidden producer/inspector action intents for
-Choose Source, Calibrate, Make Mask, Refine, and Advanced; the enabled ones route through
-the existing production hooks and do not yet replace legacy processing controls.
+Choose Project, Save Folder, Choose Source, Calibrate, Make Mask, Refine, and
+Advanced; the enabled ones route through the existing production hooks and do not yet
+replace legacy processing controls.
 
 ### Phase 0 — doc/API reconcile, no GUI behavior change
 
@@ -332,7 +334,7 @@ work as the Experiment card becomes authoritative.
 signal blocking during profile swaps.
 
 **Status:** HIDDEN PREVIEW IMPLEMENTED. `ControlsPanelV2` renders Run Readiness,
-Source, Experiment, Processing, Output, and Analysis cards from `ControlProfile`.
+Project, Source, Experiment, Processing, Output, and Analysis cards from `ControlProfile`.
 `staticWidget` mounts it only when `XDART_CONTROLS_PANEL_V2=1`; the legacy panel remains
 the production surface. The preview refreshes on wrangler attach, mode changes, new scans,
 display data changes, viewer mode changes, and stitch-mode changes. `MoreButton`,
@@ -369,11 +371,11 @@ processing axes without spurious reintegrate; conflicting energy blocks run; Ref
 diffractometer summary; mask value and mask reachability do not drift.
 
 **Status:** PREVIEW ACTIONS IMPLEMENTED. The hidden V2 panel now exposes typed
-`ControlActionSpec` producer/inspector buttons. Choose Source delegates to the current wrangler
-browser, Calibrate and Make Mask click the existing integrator buttons, and Advanced opens the
-current combined advanced integration dialog. Refine is visible but disabled with a real-data-gate
-reason. The Experiment card is still a read-only status preview; the legacy panel remains the
-authoritative editor until field hydration/provenance parity is complete.
+`ControlActionSpec` producer/inspector buttons. Choose Project, Save Folder, and Choose Source
+delegate to the current wrangler browsers; Calibrate and Make Mask click the existing integrator
+buttons; and Advanced opens the current combined advanced integration dialog. Refine is visible but
+disabled with a real-data-gate reason. The Experiment card is still a read-only status preview; the
+legacy panel remains the authoritative editor until field hydration/provenance parity is complete.
 
 ### Phase 5 — Processing stack for Int/Stitch/RSM
 

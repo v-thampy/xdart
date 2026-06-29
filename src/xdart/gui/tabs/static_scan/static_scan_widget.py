@@ -587,6 +587,10 @@ class staticWidget(QWidget):
         """Route Controls V2 preview actions through existing production hooks."""
         if action == ControlAction.CHOOSE_SOURCE:
             self._controls_v2_choose_source()
+        elif action == ControlAction.CHOOSE_PROJECT:
+            self._controls_v2_choose_project()
+        elif action == ControlAction.CHOOSE_OUTPUT:
+            self._controls_v2_choose_output()
         elif action == ControlAction.CALIBRATE:
             self._controls_v2_click_integrator_button("pyfai_calib")
         elif action == ControlAction.MAKE_MASK:
@@ -629,6 +633,26 @@ class staticWidget(QWidget):
             browse = getattr(wrangler, "set_img_file", None)
         if mode_text in ("Image Viewer", "XYE Viewer"):
             browse = getattr(wrangler, "set_img_file", None) or browse
+        if callable(browse):
+            browse()
+
+    def _controls_v2_choose_project(self) -> None:
+        wrangler = getattr(self, "wrangler", None)
+        if wrangler is None:
+            return
+        browse = getattr(wrangler, "set_project_folder", None)
+        if browse is None:
+            browse = getattr(wrangler, "browse_project_folder", None)
+        if callable(browse):
+            browse()
+
+    def _controls_v2_choose_output(self) -> None:
+        wrangler = getattr(self, "wrangler", None)
+        if wrangler is None:
+            return
+        browse = getattr(wrangler, "set_h5_dir", None)
+        if browse is None:
+            browse = getattr(wrangler, "browse_h5_dir", None)
         if callable(browse):
             browse()
 
@@ -723,6 +747,7 @@ class staticWidget(QWidget):
             result_caps=result_caps,
             geom=geom,
             backend=self._controls_v2_backend(tool),
+            project_root=str(getattr(getattr(self, "wrangler", None), "project_folder", "") or ""),
             source_label=source_label,
             save_path=str(getattr(getattr(self, "wrangler", None), "h5_dir", "") or ""),
             frame_count=frame_count or len(labels),

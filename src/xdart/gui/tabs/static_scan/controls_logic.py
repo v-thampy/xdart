@@ -41,6 +41,7 @@ class ProcessingPage(str, Enum):
 
 
 class SectionId(str, Enum):
+    PROJECT = "project"
     SOURCE = "source"
     EXPERIMENT = "experiment"
     PROCESSING = "processing"
@@ -57,6 +58,8 @@ class ControlAction(str, Enum):
     """
 
     CHOOSE_SOURCE = "choose_source"
+    CHOOSE_PROJECT = "choose_project"
+    CHOOSE_OUTPUT = "choose_output"
     CALIBRATE = "calibrate"
     MAKE_MASK = "make_mask"
     REFINE_GEOMETRY = "refine_geometry"
@@ -64,6 +67,7 @@ class ControlAction(str, Enum):
 
 
 class FieldId(str, Enum):
+    PROJECT_ROOT = "project.root"
     SOURCE_PATH = "source.path"
     SOURCE_FRAMES = "source.frames"
     SOURCE_RAW = "source.raw"
@@ -104,6 +108,8 @@ class FieldSpec:
 
 
 FIELD_INVENTORY: tuple[FieldSpec, ...] = (
+    FieldSpec(FieldId.PROJECT_ROOT, SectionId.PROJECT, "Project folder", "project",
+              session_key="wrangler.project_folder"),
     FieldSpec(FieldId.SOURCE_PATH, SectionId.SOURCE, "Source", "source"),
     FieldSpec(FieldId.SOURCE_FRAMES, SectionId.SOURCE, "Frames", "source",
               headless_key="FrameSource.frame_indices"),
@@ -261,6 +267,7 @@ class ControlState:
     result_caps: ResultCaps = field(default_factory=ResultCaps)
     geom: GeomState = field(default_factory=GeomState)
     backend: str | None = None
+    project_root: str = ""
     source_label: str = ""
     save_path: str = ""
     frame_count: int = 0
@@ -320,6 +327,11 @@ def build_field_statuses(state: ControlState) -> Mapping[FieldId, FieldStatus]:
     source_label = state.source_label or "No source selected"
     frame_value = str(state.frame_count) if state.frame_count else ""
     fields = {
+        FieldId.PROJECT_ROOT: _field(
+            FieldId.PROJECT_ROOT,
+            StatusKind.OK if state.project_root else StatusKind.DEFERRED,
+            value=state.project_root,
+            reason="" if state.project_root else "Optional; improves portable paths."),
         FieldId.SOURCE_PATH: _field(
             FieldId.SOURCE_PATH,
             StatusKind.OK if caps.has_frames or source_label != "No source selected"
@@ -565,6 +577,22 @@ def build_section_actions(state: ControlState) -> Mapping[SectionId, tuple[Contr
                 SectionId.SOURCE,
                 enabled=True,
                 reason="Uses the current legacy source browser until the Source card is live.",
+            ),
+        ),
+        SectionId.PROJECT: (
+            ControlActionSpec(
+                ControlAction.CHOOSE_PROJECT,
+                "Choose Project",
+                SectionId.PROJECT,
+                enabled=True,
+                reason="Set the project folder used for portable source paths.",
+            ),
+            ControlActionSpec(
+                ControlAction.CHOOSE_OUTPUT,
+                "Save Folder",
+                SectionId.PROJECT,
+                enabled=True,
+                reason="Choose where processed NeXus files are written.",
             ),
         ),
         SectionId.EXPERIMENT: (

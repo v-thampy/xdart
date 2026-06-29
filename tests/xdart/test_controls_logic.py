@@ -119,6 +119,7 @@ def test_build_field_statuses_tracks_source_geometry_and_results():
     fields = build_field_statuses(
         ControlState(
             tool=Tool.INT_2D,
+            project_root="/data",
             source_label="/data/scan001.nxs",
             save_path="/data/out",
             frame_count=3,
@@ -132,6 +133,8 @@ def test_build_field_statuses_tracks_source_geometry_and_results():
         )
     )
 
+    assert fields[FieldId.PROJECT_ROOT].status == StatusKind.OK
+    assert fields[FieldId.PROJECT_ROOT].value == "/data"
     assert fields[FieldId.SOURCE_PATH].status == StatusKind.OK
     assert fields[FieldId.SOURCE_FRAMES].value == "3"
     assert fields[FieldId.CALIBRATION_PONI].status == StatusKind.OK
@@ -149,6 +152,8 @@ def test_control_profile_returns_fields_by_section_in_inventory_order():
     )
 
     source_fields = profile.fields_for(SectionId.SOURCE)
+    project_fields = profile.fields_for(SectionId.PROJECT)
+    assert [field.field_id for field in project_fields] == [FieldId.PROJECT_ROOT]
     assert [field.field_id for field in source_fields][:2] == [
         FieldId.SOURCE_PATH,
         FieldId.SOURCE_FRAMES,
@@ -166,9 +171,14 @@ def test_control_profile_exposes_section_actions():
     )
 
     source_actions = profile.actions_for(SectionId.SOURCE)
+    project_actions = profile.actions_for(SectionId.PROJECT)
     experiment_actions = profile.actions_for(SectionId.EXPERIMENT)
     processing_actions = profile.actions_for(SectionId.PROCESSING)
 
+    assert [action.action for action in project_actions] == [
+        ControlAction.CHOOSE_PROJECT,
+        ControlAction.CHOOSE_OUTPUT,
+    ]
     assert [action.action for action in source_actions] == [
         ControlAction.CHOOSE_SOURCE]
     assert [action.action for action in experiment_actions] == [

@@ -76,6 +76,7 @@ def test_controls_panel_v2_emits_action_intent(qapp):
     profile = build_control_profile(
         ControlState(
             tool=Tool.INT_2D,
+            project_root="/tmp/project",
             source_caps=SourceCaps(has_frames=True),
         )
     )
@@ -84,16 +85,17 @@ def test_controls_panel_v2_emits_action_intent(qapp):
     got = []
     panel.controlActionRequested.connect(got.append)
 
-    buttons = panel.source_card.body.findChildren(QtWidgets.QPushButton)
+    buttons = panel.project_card.body.findChildren(QtWidgets.QPushButton)
     buttons[0].click()
 
-    assert got == [ControlAction.CHOOSE_SOURCE]
+    assert got == [ControlAction.CHOOSE_PROJECT]
 
 
 def test_controls_panel_v2_renders_typed_field_cards(qapp):
     profile = build_control_profile(
         ControlState(
             source_label="/tmp/scan.nxs",
+            project_root="/tmp/project",
             save_path="/tmp/out",
             frame_count=5,
             processing_mode="Int 1D",
@@ -106,6 +108,10 @@ def test_controls_panel_v2_renders_typed_field_cards(qapp):
 
     panel = ControlsPanelV2()
     panel.set_profile(profile)
+
+    project_rows = panel.project_card.body.findChildren(FieldRow)
+    assert [row.status.label for row in project_rows] == ["Project folder"]
+    assert project_rows[0].status.value == "/tmp/project"
 
     source_rows = panel.source_card.body.findChildren(FieldRow)
     assert [row.status.label for row in source_rows][:2] == ["Source", "Frames"]
@@ -145,6 +151,16 @@ def test_controls_panel_v2_static_widget_routes_actions(qapp, monkeypatch):
         )
         monkeypatch.setattr(
             widget,
+            "_controls_v2_choose_project",
+            lambda: calls.append(("project", None)),
+        )
+        monkeypatch.setattr(
+            widget,
+            "_controls_v2_choose_output",
+            lambda: calls.append(("output", None)),
+        )
+        monkeypatch.setattr(
+            widget,
             "_controls_v2_click_integrator_button",
             lambda name: calls.append(("button", name)),
         )
@@ -155,12 +171,16 @@ def test_controls_panel_v2_static_widget_routes_actions(qapp, monkeypatch):
         )
 
         widget._on_controls_v2_action(ControlAction.CHOOSE_SOURCE)
+        widget._on_controls_v2_action(ControlAction.CHOOSE_PROJECT)
+        widget._on_controls_v2_action(ControlAction.CHOOSE_OUTPUT)
         widget._on_controls_v2_action(ControlAction.CALIBRATE)
         widget._on_controls_v2_action(ControlAction.MAKE_MASK)
         widget._on_controls_v2_action(ControlAction.ADVANCED_PROCESSING)
 
         assert calls == [
             ("source", None),
+            ("project", None),
+            ("output", None),
             ("button", "pyfai_calib"),
             ("button", "get_mask"),
             ("advanced", None),
