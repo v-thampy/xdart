@@ -491,6 +491,12 @@ class FormRow(QtWidgets.QWidget):
     def path(self) -> tuple[str, ...]:
         return self._path
 
+    def add_trailing_widget(self, widget: QtWidgets.QWidget) -> None:
+        """Append a widget to the right of the row (after the editor).  Used to
+        park the compact 'Pts' cluster on the Axis row — the editor stretches, so
+        trailing widgets pin to the right."""
+        self.layout().addWidget(widget)
+
     def current_value(self):
         if self._kind == "bool":
             return bool(self.editor.isChecked())
@@ -882,16 +888,17 @@ class ControlsPanelV2(QtWidgets.QWidget):
         Threshold min/max into one compact :class:`RangeRow` each (mockup)."""
         by_path = {field.path: field for field in fields}
         consumed: set[tuple[str, ...]] = set()
-        # Points ride in the section header ("Pts [field] [field]"), matching the
-        # mockup — they don't get their own body row.
+        # The point-count field(s) park on the Axis row, right of the dropdown —
+        # NOT their own body row, and no longer in the subsection header (which
+        # stays clear for a status line).  Collected here; attached when the Axis
+        # row is built below.
         point_fields = [
             f for f in fields
             if f.path and f.path[-1] in (
                 "points", "points_oop", "radial_points", "azim_points")
         ]
-        if point_fields:
-            self._add_points_header(sub, point_fields)
-            consumed.update(f.path for f in point_fields)
+        consumed.update(f.path for f in point_fields)
+        points_attached = False
         # Consecutive standalone bool toggles render as one compact pill row
         # (mockup), not full-width stacked buttons.
         pending_pills: list[ControlFormField] = []
@@ -942,10 +949,21 @@ class ControlsPanelV2(QtWidgets.QWidget):
                 pending_pills.append(field)
                 continue
             flush_pills()
-            # The chip already says 1-D / 2-D, so drop the redundant prefix on the
-            # axis label ("1D Axis" -> "Axis").
-            self._add_bound_row(sub, field, label="Axis" if last == "axis" else None)
+            if last == "axis":
+                # Drop the redundant "1D"/"2D" prefix and park the Pts cluster to
+                # the right of the Axis dropdown (frees the header for status).
+                row = self._make_bound_row(field, label="Axis")
+                if point_fields:
+                    self._attach_points_to_row(row, point_fields)
+                    points_attached = True
+                sub.add_row(row)
+                continue
+            self._add_bound_row(sub, field)
         flush_pills()
+        # Safety net: never drop the point fields if a group has them but no
+        # Axis row to host them.
+        if point_fields and not points_attached:
+            self._add_points_header(sub, point_fields)
 
     def _add_points_header(
         self,
@@ -1090,13 +1108,12 @@ class ControlsPanelV2(QtWidgets.QWidget):
             key=lambda spec: self._PRODUCER_ORDER.get(spec.action, 99),
         )
 
-    def _add_bound_row(
+    def _make_bound_row(
         self,
-        card: SectionCard | SubsectionCard,
         field: ControlFormField,
         *,
         label: str | None = None,
-    ) -> None:
+    ) -> FormRow:
         row = FormRow(
             label=field.label if label is None else label,
             path=field.path,
@@ -1113,7 +1130,42 @@ class ControlsPanelV2(QtWidgets.QWidget):
         )
         row.valueChanged.connect(self.fieldValueChanged)
         row.browseRequested.connect(self.fieldBrowseRequested)
-        card.add_row(row)
+        return row
+
+    def _add_bound_row(
+        self,
+        card: SectionCard | SubsectionCard,
+        field: ControlFormField,
+        *,
+        label: str | None = None,
+    ) -> None:
+        card.add_row(self._make_bound_row(field, label=label))
+
+    def _attach_points_to_row(
+        self,
+        row: FormRow,
+        point_fields: Sequence[ControlFormField],
+    ) -> None:
+        """Park the compact ``Pts [n] …`` cluster on the right of an Axis row.
+
+        Reuses :class:`FormRow` (label hidden) so the editors stay harvestable by
+        ``current_form_edits`` and route through the same write-through path."""
+        label = QtWidgets.QLabel("Pts")
+        label.setObjectName("controlsV2HeaderLabel")
+        row.add_trailing_widget(label)
+        for field in point_fields:
+            pr = FormRow(
+                label="",
+                path=field.path,
+                value=field.value,
+                kind="line",
+                enabled=field.enabled,
+                reason=field.reason,
+            )
+            pr.label.hide()
+            pr.setMaximumWidth(72)
+            pr.valueChanged.connect(self.fieldValueChanged)
+            row.add_trailing_widget(pr)
 
     @staticmethod
     def _processing_group_for_path(path: tuple[str, ...]) -> str:

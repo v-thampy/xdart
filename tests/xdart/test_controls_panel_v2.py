@@ -407,8 +407,8 @@ def test_controls_panel_v2_renders_integration_fields_from_live_widgets(qapp, mo
         assert "Axis" in visible_labels
         assert "1D Axis" not in visible_labels
         assert "2D Axis" not in visible_labels
-        # Points now ride in the subsection header (hidden-label FormRows), not as
-        # body rows — but still exist + route through the write-through.
+        # Points now ride on the Axis row, right of the dropdown (hidden-label
+        # FormRows), not their own body rows — still exist + route through.
         point_rows = [
             r for r in rows
             if r.path and r.path[-1] in ("points", "radial_points", "azim_points")
