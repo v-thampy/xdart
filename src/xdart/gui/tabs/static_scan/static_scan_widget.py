@@ -542,15 +542,17 @@ class staticWidget(QWidget):
 
     @staticmethod
     def _controls_v2_enabled() -> bool:
-        value = os.environ.get("XDART_CONTROLS_PANEL_V2", "")
-        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+        value = os.environ.get("XDART_CONTROLS_PANEL_V2", "1")
+        return str(value).strip().lower() not in {"0", "false", "no", "off"}
 
     def _init_controls_v2_preview(self) -> None:
-        """Mount the Controls Panel V2 preview behind a feature flag.
+        """Mount the Controls Panel V2 preview.
 
         The panel is observational for now: it renders the typed control
         profile and emits analysis-launch intents, but the legacy wrangler and
-        integration widgets remain the production controls.
+        integration widgets remain the production controls.  It is visible by
+        default on the V2 branch; set ``XDART_CONTROLS_PANEL_V2=0`` to compare
+        against the legacy-only panel during live testing.
         """
         if not self._controls_v2_enabled():
             return

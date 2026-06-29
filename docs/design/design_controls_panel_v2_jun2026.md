@@ -273,14 +273,15 @@ Qt-free or hidden behind a flag; the live visible flip comes only after profile 
 `feature/controls-panel-v2`:
 `xdart.gui.tabs.static_scan.controls_logic` provides the Qt-free `ControlState →
 ControlProfile` / field-status / analysis-launcher gate,
-`xdart.gui.tabs.static_scan.ui.controls_panel_v2.ControlsPanelV2` renders a hidden
+`xdart.gui.tabs.static_scan.ui.controls_panel_v2.ControlsPanelV2` renders a visible
 four-section Project / Source / Experiment / Processing scaffold behind
-`XDART_CONTROLS_PANEL_V2=1`, and
+the `feature/controls-panel-v2` branch's default-on preview
+(`XDART_CONTROLS_PANEL_V2=0` opts out for legacy comparison), and
 `xdart.gui.tabs.static_scan.analysis_context.AnalysisContext` is now the seam used by
 Peak Fit, Phase Fit, and Scan Plot launch. This is intentionally behavior-preserving:
-the visible controls panel is still legacy-backed, and live fitting still follows the
-latest processed frame through the same latest-wins worker. The hidden V2 panel is
-observational only: it shows source/experiment/processing/output/analysis status and opens
+the production controls are still legacy-backed, and live fitting still follows the
+latest processed frame through the same latest-wins worker. The V2 panel is
+observational/action-preview only: it shows source/experiment/processing/output/analysis status and opens
 the existing analysis popups. It also renders hidden producer/inspector action intents for
 Choose Project, Save Folder, Choose Source, Calibrate, Make Mask, Refine, and
 Advanced; the enabled ones route through the existing production hooks and do not yet
@@ -324,7 +325,7 @@ Processing stack can render mode/backend constraints without Qt-side branching. 
 first-pass status/provenance surface; richer conflict/provenance detail remains Phase 4
 work as the Experiment card becomes authoritative.
 
-### Phase 2 — hidden `ControlsPanelV2` scaffold
+### Phase 2 — visible preview `ControlsPanelV2` scaffold
 
 - Add a hidden/feature-flagged card panel that renders `ControlProfile` but does not yet drive runs.
 - Build reusable widgets:
@@ -336,10 +337,11 @@ work as the Experiment card becomes authoritative.
 **Tests:** offscreen render tests for card visibility, badge text/classes, disabled tooltips, and
 signal blocking during profile swaps.
 
-**Status:** HIDDEN PREVIEW IMPLEMENTED. `ControlsPanelV2` renders Run Readiness,
+**Status:** VISIBLE PREVIEW IMPLEMENTED. `ControlsPanelV2` renders Run Readiness,
 Project, Source, Experiment, Processing, Output, and Analysis cards from `ControlProfile`.
-`staticWidget` mounts it only when `XDART_CONTROLS_PANEL_V2=1`; the legacy panel remains
-the production surface. The preview refreshes on wrangler attach, mode changes, new scans,
+`staticWidget` mounts it by default on this branch; set `XDART_CONTROLS_PANEL_V2=0`
+to compare against the legacy-only panel. The legacy panel remains the production surface.
+The preview refreshes on wrangler attach, mode changes, new scans,
 display data changes, viewer mode changes, and stitch-mode changes. `MoreButton`,
 `SegmentedControl`, and the real Processing stack remain future phases.
 

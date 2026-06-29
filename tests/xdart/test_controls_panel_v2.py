@@ -123,8 +123,8 @@ def test_controls_panel_v2_renders_typed_field_cards(qapp):
         "1D result", "2D result", "RSM result"]
 
 
-def test_controls_panel_v2_mounts_behind_feature_flag(qapp, monkeypatch):
-    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+def test_controls_panel_v2_mounts_by_default(qapp, monkeypatch):
+    monkeypatch.delenv("XDART_CONTROLS_PANEL_V2", raising=False)
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
     widget = staticWidget()
@@ -132,6 +132,18 @@ def test_controls_panel_v2_mounts_behind_feature_flag(qapp, monkeypatch):
         assert widget.controls_v2 is not None
         assert widget.controls_v2.profile is not None
         assert widget.controls_v2.source_card.body.findChildren(FieldRow)
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_can_be_hidden_by_env(qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "0")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        assert widget.controls_v2 is None
     finally:
         widget.close()
         widget.deleteLater()
