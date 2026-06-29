@@ -3347,3 +3347,30 @@ def test_build_stitch_params_converts_flat_mask_to_2d_bool(widget):
     w.scan.detector_shape = (4, 5)
     w.scan.global_mask = None
     assert w._build_stitch_params('1d')['mask'] is None
+
+
+def test_gi_mode_blocks_stitch_with_message(widget):
+    """A Stitch launched while GI (Fiber) mode is ON is blocked with a clear
+    message: the GUI stitch is the multigeometry (non-GI) backend, and the
+    GI-corrected path is gated on real-data validation, so it must not silently
+    run a non-GI merge.  With GI off the guard passes and the worker starts."""
+    w = widget
+    msgs, started = [], []
+    w._stitch_status = lambda m: msgs.append(m)
+    w.stitch_thread.start = lambda *a, **k: started.append(True)
+    # frames + geometry present so start_stitch reaches the GI guard.
+    w.scan.frames = [object()]
+    w.scan.geometry = object()
+    w.scan.bai_1d_args = {'unit': 'q_A^-1', 'method': 'BBox', 'numpoints': 1000}
+    w.scan.global_mask = None
+    w.scan.detector_shape = None
+
+    w.scan.gi = True
+    w.start_stitch('1d')
+    assert not started, "stitch must not start while GI mode is active"
+    assert msgs and 'GI' in msgs[-1]
+
+    msgs.clear(); started.clear()
+    w.scan.gi = False
+    w.start_stitch('1d')
+    assert started, "stitch should start when GI is off"

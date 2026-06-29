@@ -2250,6 +2250,17 @@ class staticWidget(QWidget):
             self._stitch_status(
                 'Stitch needs a calibration/geometry on the scan.')
             return
+        # GI guard: the GUI stitch uses the multigeometry backend, which applies
+        # NO GI correction (footprint/Fresnel/refraction).  Running it with GI
+        # (Fiber) mode ON would silently produce a *non-GI* merge.  The GI-corrected
+        # stitch (pyfai_hist + GISettings) is gated on the real-data GIXSGUI
+        # convention check, so block rather than mislead.  Toggle GI off for a
+        # standard q-stitch.
+        if getattr(scan, 'gi', False):
+            self._stitch_status(
+                'GI-corrected stitch is pending real-data validation — toggle GI '
+                '(Fiber) off to run a standard (non-GI) stitch.')
+            return
         try:
             params = self._build_stitch_params(mode)
         except Exception:
