@@ -641,8 +641,8 @@ QPushButton#controlsV2ActionButton {
 /* Reintegrate = transparent green (run-like); Advanced = transparent red
    (destructive/expert).  Producers stay neutral $field. */
 QPushButton#controlsV2ActionButton[actionRole="reintegrate"] {
-    background-color: rgba(70, 201, 138, 0.16);
-    border-color: rgba(70, 201, 138, 0.45);
+    background-color: rgba(224, 108, 117, 0.16);
+    border-color: rgba(224, 108, 117, 0.45);
 }
 QPushButton#controlsV2ActionButton[actionRole="advanced"] {
     background-color: rgba(224, 108, 117, 0.16);

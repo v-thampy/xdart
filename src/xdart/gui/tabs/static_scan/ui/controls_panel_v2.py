@@ -1163,7 +1163,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
                 reason=field.reason,
             )
             pr.label.hide()
-            pr.setMaximumWidth(72)
+            pr.setMaximumWidth(58)   # ~20% narrower than the old 72px cap
             pr.valueChanged.connect(self.fieldValueChanged)
             row.add_trailing_widget(pr)
 
