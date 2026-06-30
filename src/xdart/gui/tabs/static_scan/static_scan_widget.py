@@ -653,6 +653,7 @@ class staticWidget(QWidget):
         elif action == ControlAction.REINTEGRATE_2D:
             self._controls_v2_click_integrator_button("reintegrate2D")
         elif action == ControlAction.ADVANCED_PROCESSING:
+            self._commit_controls_v2_pending_edits()
             self._show_integration_advanced()
         elif action == ControlAction.REFINE_GEOMETRY:
             QMessageBox.information(

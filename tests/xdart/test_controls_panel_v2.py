@@ -1692,6 +1692,68 @@ def test_controls_panel_v2_run_commits_focused_2d_points(qapp, monkeypatch):
         widget.deleteLater()
 
 
+def test_controls_panel_v2_reintegrate_commits_focused_edit(qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    class FakeButton:
+        def __init__(self):
+            self.clicked = False
+
+        def click(self):
+            self.clicked = True
+
+    widget = staticWidget()
+    fake = FakeButton()
+    try:
+        widget._refresh_controls_v2_profile_now()
+        rows = {
+            row.path: row
+            for row in widget.controls_v2.processing_card.body.findChildren(FormRow)
+        }
+        rows[("Int1D", "points")].editor.setText("432")
+        assert widget.integratorTree.ui.npts_1D.text() != "432"
+
+        monkeypatch.setattr(widget.integratorTree.ui, "reintegrate1D", fake)
+        widget._controls_v2_click_integrator_button("reintegrate1D")
+
+        assert fake.clicked is True
+        assert widget.integratorTree.ui.npts_1D.text() == "432"
+        assert widget.scan.bai_1d_args["numpoints"] == 432
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_advanced_commits_focused_edit(qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    calls = []
+    try:
+        widget._refresh_controls_v2_profile_now()
+        rows = {
+            row.path: row
+            for row in widget.controls_v2.processing_card.body.findChildren(FormRow)
+        }
+        rows[("Int1D", "points")].editor.setText("543")
+        assert widget.integratorTree.ui.npts_1D.text() != "543"
+
+        def _fake_advanced():
+            calls.append("advanced")
+            assert widget.integratorTree.ui.npts_1D.text() == "543"
+            assert widget.scan.bai_1d_args["numpoints"] == 543
+
+        monkeypatch.setattr(widget, "_show_integration_advanced", _fake_advanced)
+        widget._on_controls_v2_action(ControlAction.ADVANCED_PROCESSING)
+
+        assert calls == ["advanced"]
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
 def test_controls_panel_v2_range_labels_follow_legacy_integrator_labels(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
