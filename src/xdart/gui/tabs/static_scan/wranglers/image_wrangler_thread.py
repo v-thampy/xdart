@@ -444,6 +444,15 @@ class imageThread(wranglerThread):
         self.scan_name = scan_name
         self.single_img = single_img
         self.poni = poni
+        # GENERIC-DETECTOR FIX: when a Run adopts a loaded processed scan's
+        # geometry (image_wrangler._adopt_loaded_scan_run_inputs), the wrangler
+        # also hands over the restored PIXEL-BEARING integrator keyed on the
+        # adopted poni.  The poni-identity rebuild block below REUSES it instead
+        # of rebuilding a pixel-less integrator from the (name-only) PONI.  Both
+        # default None (a normal poni-file Run rebuilds as before).
+        self._adopted_poni = None
+        self._adopted_integrator = None
+        self._adopted_fiber_integrator = None
         self.inp_type = inp_type
         self.img_file = img_file
         self.img_dir = img_dir
@@ -689,6 +698,38 @@ class imageThread(wranglerThread):
             if output_path:
                 logger.info('Output file: %s\n', output_path)
 
+    def _install_run_integrator(self, scan):
+        """Build (or reuse) the scan's cached AzimuthalIntegrator for this run.
+
+        Called when ``self.poni`` differs from the scan's currently-cached poni
+        (a fresh scan, or a user-loaded calibration).  The default path rebuilds
+        from ``self.poni`` via ``poni_to_integrator``.
+
+        GENERIC-DETECTOR FIX: a PONI dataclass carries only a detector *name*, so
+        rebuilding for an unnamed/generic detector yields a pyFAI integrator with
+        ``_pixel1``/``_pixel2`` = None — and the reduction then crashes in
+        ``calc_cartesian_positions`` (``NoneType * float``).  When this run ADOPTED
+        a loaded processed scan's geometry (image_wrangler._adopt_loaded_scan_run_inputs),
+        the wrangler also handed over that scan's restored PIXEL-BEARING integrator,
+        keyed on the adopted poni object.  Reuse it here whenever ``self.poni`` IS
+        that adopted poni (identity check) so the pixel size survives.  A
+        genuinely-new user-loaded .poni is a different object, so it still rebuilds.
+        """
+        adopted_ai = getattr(self, "_adopted_integrator", None)
+        if (adopted_ai is not None
+                and self.poni is getattr(self, "_adopted_poni", None)):
+            scan._cached_integrator = adopted_ai
+            scan._cached_fiber_integrator = getattr(
+                self, "_adopted_fiber_integrator", None)
+            logger.info(
+                "[RUN-CAL] reusing restored pixel-bearing integrator for %s "
+                "(generic detector — poni rebuild would drop pixel size)",
+                getattr(scan, "name", "scan"))
+        else:
+            scan._cached_integrator = poni_to_integrator(self.poni)
+            scan._cached_fiber_integrator = None
+        scan._cached_poni = self.poni
+
     def process_scan(self):
         """Batch-integrate all existing images, then optionally watch for new ones (live mode).
 
@@ -803,9 +844,7 @@ class imageThread(wranglerThread):
 
             # Rebuild cached AzimuthalIntegrator when poni identity changes
             if self.poni is not _cached_poni:
-                scan._cached_integrator = poni_to_integrator(self.poni)
-                scan._cached_poni = self.poni
-                scan._cached_fiber_integrator = None
+                self._install_run_integrator(scan)
                 _cached_poni = self.poni
                 self._cached_gi_incident_angle = None
 
@@ -925,9 +964,7 @@ class imageThread(wranglerThread):
                     _cached_poni = None
 
                 if self.poni is not _cached_poni:
-                    scan._cached_integrator = poni_to_integrator(self.poni)
-                    scan._cached_poni = self.poni
-                    scan._cached_fiber_integrator = None
+                    self._install_run_integrator(scan)
                     _cached_poni = self.poni
                     self._cached_gi_incident_angle = None
 

@@ -1133,11 +1133,36 @@ class imageWrangler(wranglerWidget):
         stale calibration (BUG-1).  The image source / save path remain guarded
         inside the run thread."""
         self._adopt_loaded_scan_run_inputs()
-        if self.poni is None:
-            imageWrangler._safe_status_text(
-                self,
-                'Load a PONI calibration file to begin.',
-            )
+        # GENERIC-DETECTOR FIX (block, not crash): a processed .nxs saved WITHOUT
+        # detector pixel sizes AND without a resolvable detector name (an
+        # unnamed/generic 'Detector') restores no usable calibration — its
+        # ``_restore_calibration_from_group`` returns False, leaving both
+        # ``_cached_poni`` AND ``_cached_integrator`` None.  Adoption then can't
+        # seed ``self.poni`` and a Run would otherwise build a pixel-less
+        # integrator and crash mid-write in pyFAI's calc_cartesian_positions
+        # ('NoneType' * float).  Refuse up front with a SPECIFIC message when a
+        # scan is loaded but carries no usable calibration; the user can still
+        # supply their own .poni (a different poni object than the scan's).
+        scan = getattr(self, "scan", None)
+        adopted_poni = getattr(self.thread, "_adopted_poni", None)
+        scan_loaded = bool(
+            list(getattr(getattr(scan, "frames", None), "index", ()) or ()))
+        scan_has_integrator = getattr(scan, "_cached_integrator", None) is not None
+        adopted_pixel_less = (
+            adopted_poni is not None and self.poni is adopted_poni
+            and not scan_has_integrator)
+        if self.poni is None or adopted_pixel_less:
+            if scan_loaded and not scan_has_integrator:
+                imageWrangler._safe_status_text(
+                    self,
+                    'This scan was saved without detector pixel sizes — load a '
+                    'PONI calibration file to integrate.',
+                )
+            else:
+                imageWrangler._safe_status_text(
+                    self,
+                    'Load a PONI calibration file to begin.',
+                )
             return False
         if not self.img_file and not getattr(self, 'stitch_mode', False):
             imageWrangler._safe_status_text(
@@ -1163,6 +1188,19 @@ class imageWrangler(wranglerWidget):
                 self.poni = cached_poni
                 try:
                     self.thread.poni = cached_poni
+                    # GENERIC-DETECTOR FIX: the restored ``_cached_integrator``
+                    # carries the detector PIXEL SIZE that a pixel-less PONI
+                    # dataclass (detector NAME only) cannot rebuild.  Carry it
+                    # to the run thread KEYED on the adopted poni, so the
+                    # thread's poni-identity rebuild block REUSES it instead of
+                    # clobbering it with a pixel-less ``poni_to_integrator``.
+                    # A genuinely-new user-loaded .poni is a DIFFERENT object,
+                    # so it still rebuilds (the key won't match).
+                    self.thread._adopted_poni = cached_poni
+                    self.thread._adopted_integrator = getattr(
+                        scan, "_cached_integrator", None)
+                    self.thread._adopted_fiber_integrator = getattr(
+                        scan, "_cached_fiber_integrator", None)
                 except Exception:
                     pass
 

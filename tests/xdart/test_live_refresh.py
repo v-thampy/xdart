@@ -5822,6 +5822,10 @@ def test_start_guard_adopts_processed_scan_cached_poni_and_source(tmp_path):
     host.img_dir = ""
     host.img_ext = ""
     host.scan._cached_poni = cached_poni
+    # A reloaded scan with usable calibration also restores a pixel-bearing
+    # integrator (both-or-neither: _restore_calibration_from_group sets both or
+    # returns False); the generic-detector readiness guard requires it.
+    host.scan._cached_integrator = object()
     host.scan.frames = Frames()
 
     assert imageWrangler._inputs_valid(host) is True
