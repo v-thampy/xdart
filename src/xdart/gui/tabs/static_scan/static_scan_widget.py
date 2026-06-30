@@ -956,6 +956,30 @@ class staticWidget(QWidget):
             logger.debug("Controls Panel V2 full integrator sync failed",
                          exc_info=True)
 
+    def _apply_controls_v2_run_state(self) -> dict:
+        """Apply the Controls V2 state and snapshot args for this run.
+
+        Controls V2 is the visible editor during this migration, while the
+        legacy integrator widgets remain the production parser.  Keep that
+        bridge in one place: harvest any focused/unfinished V2 edits, write
+        them through immediately, push the carrier params, then deep-copy the
+        scan args that the wrangler will use for this run.
+        """
+        self._commit_controls_v2_pending_edits()
+        self._sync_controls_v2_integrator_args()
+        self._push_threshold_to_wrangler()
+        self._push_gi_to_wrangler()
+        args = {
+            'bai_1d_args': copy.deepcopy(
+                getattr(self.scan, 'bai_1d_args', {}) or {}
+            ),
+            'bai_2d_args': copy.deepcopy(
+                getattr(self.scan, 'bai_2d_args', {}) or {}
+            ),
+        }
+        self.wrangler.scan_args = args
+        return args
+
     def _on_controls_v2_field_changed(self, path, value) -> None:
         self._apply_controls_v2_field_value(path, value)
         self._refresh_controls_v2_profile(immediate=True)
@@ -3589,19 +3613,7 @@ class staticWidget(QWidget):
         """
         # i_qChi = np.zeros((1000, 1000), dtype=float)
 
-        self._commit_controls_v2_pending_edits()
-        self._sync_controls_v2_integrator_args()
-
-        args = {'bai_1d_args': self.scan.bai_1d_args,
-                'bai_2d_args': self.scan.bai_2d_args}
-        self.wrangler.scan_args = copy.deepcopy(args)
-        # Pixel rejection is owned by the integrator panel now — push the
-        # current Threshold / Mask-Saturated policy into the wrangler BEFORE
-        # setup() so the live run applies exactly what Reintegrate would.
-        self._push_threshold_to_wrangler()
-        # GI geometry is owned by the integrator panel now — push it into the
-        # wrangler's hidden GI carrier params BEFORE setup() too, same reason.
-        self._push_gi_to_wrangler()
+        self._apply_controls_v2_run_state()
         self.wrangler.enabled(False)
         self.wrangler.setup()
         self.h5viewer.auto_last = True

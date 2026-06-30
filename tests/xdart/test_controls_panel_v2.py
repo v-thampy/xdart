@@ -241,6 +241,15 @@ def _visible_control_value(widget, path):
     raise AssertionError(f"No visible V2 control for {path!r}")
 
 
+def _reset_controls_v2_gi(*widgets):
+    """Leave GI tests in Standard mode even if an assertion fails midway."""
+    for widget in widgets:
+        try:
+            widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
+        except Exception:
+            pass
+
+
 @pytest.fixture(scope="module")
 def qapp():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -562,6 +571,7 @@ def test_controls_panel_v2_gi_edits_update_integrator_and_carrier(qapp, monkeypa
         assert widget.integratorTree.ui.gi_sample_orientation.value() == 5
         assert widget.wrangler.parameters.child("GI", "sample_orientation").value() == 5
     finally:
+        _reset_controls_v2_gi(widget)
         widget.close()
         widget.deleteLater()
 
@@ -590,6 +600,7 @@ def test_controls_panel_v2_grazing_renders_as_segmented_control(qapp, monkeypatc
         assert widget.integratorTree.ui.gi_enable.isChecked()
         assert widget.wrangler.parameters.child("GI", "Grazing").value() is True
     finally:
+        _reset_controls_v2_gi(widget)
         widget.close()
         widget.deleteLater()
 
@@ -614,7 +625,7 @@ def test_controls_panel_v2_gi_detail_fields_inline_only_in_grazing(qapp, monkeyp
         assert _gi_detail_rows(widget) == {("GI", "th_motor")}
         assert _find_more_button(widget) is not None
     finally:
-        widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
+        _reset_controls_v2_gi(widget)
         widget.close()
         widget.deleteLater()
 
@@ -637,6 +648,7 @@ def test_controls_panel_v2_grazing_roundtrips_scan_gi_and_config(qapp, monkeypat
         widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
         assert widget.scan.gi is False
     finally:
+        _reset_controls_v2_gi(widget)
         widget.close()
         widget.deleteLater()
 
@@ -669,6 +681,7 @@ def test_controls_panel_v2_refresh_does_not_refire_gi_signal(qapp, monkeypatch):
         widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
         assert emissions == [False]
     finally:
+        _reset_controls_v2_gi(widget)
         widget.close()
         widget.deleteLater()
 
@@ -970,8 +983,7 @@ def test_controls_panel_v2_gi_edits_match_legacy_reduction_plan(
             commit_pending=False,
         )
     finally:
-        v2_widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
-        legacy_widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
+        _reset_controls_v2_gi(v2_widget, legacy_widget)
         v2_widget.close()
         legacy_widget.close()
         v2_widget.deleteLater()
@@ -1081,6 +1093,7 @@ def test_controls_panel_v2_integrator_session_roundtrip_hydrates_visible_rows(
         assert _visible_control_value(restored, ("Mask", "max")) == "777"
         assert _visible_control_value(restored, ("MaskSat", "mask_sentinel")) is True
     finally:
+        _reset_controls_v2_gi(edited, restored)
         edited.close()
         restored.close()
         edited.deleteLater()
@@ -1308,8 +1321,7 @@ def test_controls_panel_v2_gi_options_popup_holds_orient_and_tilt(qapp, monkeypa
                 r.editor.editingFinished.emit()
         assert widget.integratorTree.get_gi_config()["sample_orientation"] == 6
     finally:
-        # Reset GI so the toggle state doesn't leak (via session) to later tests.
-        widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
+        _reset_controls_v2_gi(widget)
         widget.close()
         widget.deleteLater()
 
@@ -1428,7 +1440,7 @@ def test_controls_panel_v2_gi_popup_torn_down_on_rebuild_no_stale_clobber(qapp, 
         widget._commit_controls_v2_pending_edits()
         assert widget.integratorTree.get_gi_config()["sample_orientation"] == 7
     finally:
-        widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
+        _reset_controls_v2_gi(widget)
         widget.close()
         widget.deleteLater()
 
@@ -1462,7 +1474,7 @@ def test_controls_panel_v2_gi_popup_edit_commits_on_run(qapp, monkeypatch):
         widget._commit_controls_v2_pending_edits()
         assert widget.integratorTree.get_gi_config()["sample_orientation"] == 4
     finally:
-        widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
+        _reset_controls_v2_gi(widget)
         widget.close()
         widget.deleteLater()
 
@@ -1520,6 +1532,41 @@ def test_controls_panel_v2_run_commits_focused_integration_edit(qapp, monkeypatc
         assert widget.wrangler.scan_args["bai_1d_args"]["numpoints"] == 777
     finally:
         widget._exit_run_state()
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_run_state_harvests_and_deep_copies_snapshot(
+        qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget._refresh_controls_v2_profile_now()
+        rows = {
+            row.path: row
+            for row in widget.controls_v2.processing_card.body.findChildren(FormRow)
+        }
+        assert ("Int1D", "points") in rows
+
+        # Simulate the user typing and immediately pressing Run: no
+        # editingFinished has fired yet, so only the run-boundary harvest can
+        # make this value part of the current run.
+        rows[("Int1D", "points")].editor.setText("246")
+        assert widget.integratorTree.ui.npts_1D.text() != "246"
+
+        args = widget._apply_controls_v2_run_state()
+
+        assert args is widget.wrangler.scan_args
+        assert widget.integratorTree.ui.npts_1D.text() == "246"
+        assert widget.scan.bai_1d_args["numpoints"] == 246
+        assert args["bai_1d_args"]["numpoints"] == 246
+
+        widget.scan.bai_1d_args["numpoints"] = 999
+        assert args["bai_1d_args"]["numpoints"] == 246
+        assert widget.wrangler.scan_args["bai_1d_args"]["numpoints"] == 246
+    finally:
         widget.close()
         widget.deleteLater()
 
