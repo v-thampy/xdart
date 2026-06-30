@@ -328,13 +328,14 @@ def _read_spec_metadata(
 ) -> dict[str, float]:
     """Extract per-image counters and motor positions from a SPEC file.
 
-    The SPEC file is located by, in order:
+    The SPEC file (a SPEC data file, named with NO extension — the bare
+    ``spec_fname`` from the image stem) is located by, in order:
 
     1. ``search_dir`` (when provided) — the explicit directory the
        caller passed in via ``read_image_metadata(meta_dir=...)``.
        Useful when the SPEC file lives apart from the image files.
-    2. The image's directory.
-    3. The image's parent directory.
+    2. The image's own directory (the same folder as the image).
+    3. Up to two levels of parent directories above that folder.
 
     The scan and image numbers are inferred from the filename stem
     using SSRL naming conventions.
@@ -374,7 +375,13 @@ def _read_spec_metadata(
         candidate_dirs: list[Path] = []
         if search_dir is not None:
             candidate_dirs.append(Path(search_dir))
-        candidate_dirs.extend([image_path.parent, image_path.parent.parent])
+        # The image's own folder, then up to TWO levels of parent directories
+        # above it (SSRL convention: the SPEC file may sit a couple levels up).
+        candidate_dirs.extend([
+            image_path.parent,
+            image_path.parent.parent,
+            image_path.parent.parent.parent,
+        ])
 
         spec_file: Path | None = None
         for sd in candidate_dirs:

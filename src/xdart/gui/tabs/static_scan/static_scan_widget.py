@@ -45,6 +45,23 @@ from .integrator import integratorTree
 from .scan_threads import stitchThread
 from .metadata import metadataWidget
 from .wranglers import imageWrangler, nexusWrangler, wranglerWidget
+from .controls_logic import (
+    AnalysisTool,
+    BOUND_CONTROL_PATHS,
+    ControlAction,
+    INTEGRATOR_BACKED_CONTROL_PATHS,
+    INTEGRATOR_BACKED_CONTROL_SPECS,
+    INTEGRATION_CONTROL_PATHS,
+    ControlState,
+    GeomState,
+    MeasMode,
+    ResultCaps,
+    SourceCaps,
+    Tool,
+    build_control_panel_state,
+    coerce_control_edit_value,
+    tool_from_mode_text,
+)
 from xdart.utils.throttle import Coalescer
 from xdart.utils._utils import FixSizeOrderedDict, get_fname_dir, get_img_data
 
@@ -407,11 +424,15 @@ class staticWidget(QWidget):
         def _default_split():
             try:
                 total = sum(self.ui.mainSplitter.sizes()) or 1000
-                # Right (integration/wrangler) column reduced another ~15%
-                # (0.204 -> 0.173; was too wide, esp. on Windows); the freed
-                # width goes to the middle display panels (Vivek).
+                # Controls (right) and data-browser (left) columns start at the
+                # SAME width; the middle display panels take the rest (Vivek).
+                # The side columns are 10% narrower than before (0.28 -> 0.252)
+                # so the central display isn't squished; the freed space goes to
+                # the middle.  Min/max widths are untouched (set elsewhere) --
+                # this only moves the default/initial split.  User-resizable via
+                # the splitter (re-asserted only during the first-3s launch storm).
                 self.ui.mainSplitter.setSizes(
-                    [int(total * f) for f in (0.19, 0.637, 0.173)])
+                    [int(total * f) for f in (0.252, 0.496, 0.252)])
                 self.ui.mainSplitter.setStretchFactor(1, 1)
                 # Left column: the Tools card is now a compact 3-button panel, so
                 # give it only a small share (~18%) and let the data browser take
@@ -476,6 +497,13 @@ class staticWidget(QWidget):
         # press during a reintegrate can't also trip the idle wrangler's stop()
         # side-effects (unchecking Live, command='stop', button morph).
         self.controls.stopButton.clicked.connect(self._on_stop_clicked)
+        self.controls_v2 = None
+        self._controls_v2_last_signature = None
+        self._controls_v2_refresh_timer = Coalescer(
+            250, mode="throttle", parent=self)
+        self._controls_v2_refresh_timer.triggered.connect(
+            self._refresh_controls_v2_profile_now)
+        self._init_controls_v2_preview()
         # Reintegrate reuses the shared Batch toggle: Batch off -> live (per-frame,
         # the default); Batch on -> fast multicore.  The integrator reads it
         # through this provider at click time (no direct controls ref needed).
@@ -526,6 +554,800 @@ class staticWidget(QWidget):
         self._tearing_down = False
         self._build_tools_placeholder()
 
+    @staticmethod
+    def _controls_v2_enabled() -> bool:
+        value = os.environ.get("XDART_CONTROLS_PANEL_V2", "1")
+        return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+    def _init_controls_v2_preview(self) -> None:
+        """Mount the Controls Panel V2 editor.
+
+        The panel is visible by default on the V2 branch.  It renders real
+        editable rows backed by the existing wrangler Parameter objects, while
+        the legacy ParameterTree stays alive but hidden so run setup, session
+        restore, and browse handlers remain unchanged during the migration.
+        Set ``XDART_CONTROLS_PANEL_V2=0`` to compare against the legacy panel.
+        """
+        if not self._controls_v2_enabled():
+            return
+        try:
+            from .ui.controls_panel_v2 import ControlsPanelV2
+            panel = ControlsPanelV2(self.ui.wranglerFrame)
+            preview = QtWidgets.QScrollArea(self.ui.wranglerFrame)
+            preview.setObjectName("controlsPanelV2Preview")
+            preview.setWidgetResizable(True)
+            preview.setFrameShape(QtWidgets.QFrame.NoFrame)
+            preview.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+            preview.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            preview.setMinimumHeight(0)
+            preview.setSizePolicy(
+                QtWidgets.QSizePolicy.Expanding,
+                QtWidgets.QSizePolicy.Expanding,
+            )
+            panel.analysisLaunchRequested.connect(
+                self._on_controls_v2_analysis_launch)
+            panel.controlActionRequested.connect(
+                self._on_controls_v2_action)
+            panel.fieldValueChanged.connect(
+                self._on_controls_v2_field_changed)
+            panel.fieldBrowseRequested.connect(
+                self._on_controls_v2_field_browse)
+            preview.setWidget(panel)
+            self.ui.verticalLayout.insertWidget(0, preview, 1)
+            self.ui.verticalLayout.setStretchFactor(preview, 1)
+            self.ui.wranglerStack.hide()
+            # The legacy integrator Calibrate/Make Mask row (frame_3, lifted into
+            # toolsLayout) is redundant under V2 — the V2 producer buttons render
+            # in the Experiment section and delegate clicks to these.  Hide it so
+            # it doesn't duplicate them (the buttons stay alive for delegation).
+            try:
+                self.integratorTree.ui.frame_3.hide()
+            except Exception:
+                pass
+            self.controls_v2_preview = preview
+            self.controls_v2 = panel
+            panel.set_processing_widget(self.ui.integratorFrame, visible=False)
+            self._refresh_controls_v2_profile(immediate=True)
+        except Exception:
+            self.controls_v2_preview = None
+            self.controls_v2 = None
+            logger.debug("Controls Panel V2 preview mount failed",
+                         exc_info=True)
+
+    def _on_controls_v2_analysis_launch(self, tool) -> None:
+        """Open the existing analysis popup for a V2 launcher intent."""
+        if tool == AnalysisTool.PEAK_FIT:
+            self._open_peak_fit_dialog()
+        elif tool == AnalysisTool.PHASE_FIT:
+            self._open_phase_fit_dialog()
+        elif tool in (AnalysisTool.SCAN_PLOT, AnalysisTool.ROI_STATS):
+            self._open_scan_plot_dialog()
+        else:
+            QMessageBox.information(
+                self, "Tool not ready",
+                "This analysis tool is scaffolded but not production-ready yet.")
+
+    def _on_controls_v2_action(self, action) -> None:
+        """Route Controls V2 preview actions through existing production hooks."""
+        if action == ControlAction.CHOOSE_SOURCE:
+            self._controls_v2_choose_source()
+        elif action == ControlAction.CHOOSE_PROJECT:
+            self._controls_v2_choose_project()
+        elif action == ControlAction.CHOOSE_OUTPUT:
+            self._controls_v2_choose_output()
+        elif action == ControlAction.CALIBRATE:
+            import time as _time
+            calib_started = _time.time()
+            self._controls_v2_click_integrator_button("pyfai_calib")
+            # pyFAI-calib2 runs as a BLOCKING external subprocess, so by here it
+            # has closed.  It can't report the saved path back, so offer to
+            # adopt any .poni it just wrote (confirmation popup).
+            self._autofill_poni_after_calibrate(calib_started)
+        elif action == ControlAction.MAKE_MASK:
+            self._controls_v2_click_integrator_button("get_mask")
+        elif action == ControlAction.REINTEGRATE_1D:
+            self._controls_v2_click_integrator_button("reintegrate1D")
+        elif action == ControlAction.REINTEGRATE_2D:
+            self._controls_v2_click_integrator_button("reintegrate2D")
+        elif action == ControlAction.ADVANCED_PROCESSING:
+            self._show_integration_advanced()
+        elif action == ControlAction.REFINE_GEOMETRY:
+            QMessageBox.information(
+                self, "Refine geometry",
+                "Geometry refinement is scaffolded and will be enabled after "
+                "the real-data GUI gate lands.")
+        else:
+            QMessageBox.information(
+                self, "Action not ready",
+                "This control is scaffolded but not production-ready yet.")
+        self._refresh_controls_v2_profile()
+
+    def _controls_v2_click_integrator_button(self, button_name: str) -> None:
+        self._commit_controls_v2_pending_edits()
+        button = getattr(getattr(self.integratorTree, "ui", None), button_name, None)
+        if button is None:
+            return
+        click = getattr(button, "click", None)
+        if callable(click):
+            click()
+
+    def _apply_controls_v2_field_value(self, path, value) -> bool:
+        if self._set_controls_v2_integrator_field(path, value):
+            return True
+        param = self._controls_v2_param(tuple(path))
+        if param is None:
+            return False
+        try:
+            current = param.value()
+            new_value = coerce_control_edit_value(current, value)
+            if current != new_value:
+                param.setValue(new_value)
+        except Exception:
+            logger.debug("Controls Panel V2 field update failed for %s", path,
+                         exc_info=True)
+        return True
+
+    def _commit_controls_v2_pending_edits(self) -> None:
+        panel = getattr(self, "controls_v2", None)
+        get_edits = getattr(panel, "current_form_edits", None)
+        if not callable(get_edits):
+            return
+        try:
+            edits = get_edits()
+        except Exception:
+            logger.debug("Controls Panel V2 pending edit harvest failed",
+                         exc_info=True)
+            return
+        for edit in edits:
+            self._apply_controls_v2_field_value(edit.path, edit.value)
+        if edits:
+            self._sync_controls_v2_integrator_args()
+            self._refresh_controls_v2_profile(immediate=True)
+
+    def _controls_v2_param(self, path):
+        wrangler = getattr(self, "wrangler", None)
+        params = getattr(wrangler, "parameters", None)
+        if params is None:
+            return None
+        try:
+            return params.child(*path)
+        except Exception:
+            return None
+
+    def _controls_v2_field_paths(self):
+        return BOUND_CONTROL_PATHS
+
+    def _controls_v2_field_values(self):
+        values = {}
+        for path in self._controls_v2_field_paths():
+            param = self._controls_v2_param(path)
+            if param is None:
+                continue
+            try:
+                values[path] = param.value()
+            except Exception:
+                pass
+        values.update(self._controls_v2_integrator_values())
+        return values
+
+    def _controls_v2_field_choices(self):
+        choices = {}
+        for path in self._controls_v2_field_paths():
+            param = self._controls_v2_param(path)
+            if param is None:
+                continue
+            opts = getattr(param, "opts", {}) or {}
+            limits = opts.get("limits", None)
+            if limits is None:
+                limits = opts.get("values", None)
+            if isinstance(limits, dict):
+                vals = tuple(str(v) for v in limits.values())
+            elif isinstance(limits, (list, tuple, set)):
+                vals = tuple(str(v) for v in limits)
+            else:
+                vals = ()
+            if vals:
+                choices[path] = vals
+        choices.update(self._controls_v2_integrator_choices())
+        return choices
+
+    def _controls_v2_integrator_values(self):
+        ui = getattr(getattr(self, "integratorTree", None), "ui", None)
+        if ui is None:
+            return {}
+
+        values = {}
+        for spec in INTEGRATOR_BACKED_CONTROL_SPECS:
+            widget = getattr(ui, spec.widget_name, None)
+            if widget is None:
+                continue
+            if spec.visible_when == "widget_visible" and not widget.isVisible():
+                continue
+            try:
+                if spec.value_role == "checked":
+                    values[spec.path] = bool(widget.isChecked())
+                elif spec.value_role == "current_text":
+                    values[spec.path] = widget.currentText()
+                elif spec.value_role == "value":
+                    values[spec.path] = widget.value()
+                else:
+                    values[spec.path] = widget.text()
+            except Exception:
+                logger.debug("Controls Panel V2 could not read %s",
+                             spec.widget_name, exc_info=True)
+        for path, widget_name in {
+            ("Int1D", "radial_label"): "gi_radial_label_1D",
+            ("Int1D", "azim_label"): "label_azim_1D",
+            ("Int2D", "radial_label"): "gi_radial_label_2D",
+            ("Int2D", "azim_label"): "label_azim_2D",
+        }.items():
+            widget = getattr(ui, widget_name, None)
+            text = getattr(widget, "text", None)
+            if callable(text):
+                try:
+                    values[path] = text()
+                except Exception:
+                    logger.debug("Controls Panel V2 could not read %s",
+                                 widget_name, exc_info=True)
+        scan = getattr(self, "scan", None)
+        if scan is not None:
+            try:
+                bai_1d = getattr(scan, "bai_1d_args", {}) or {}
+                bai_2d = getattr(scan, "bai_2d_args", {}) or {}
+                values[("Int1D", "unit")] = bai_1d.get("unit", "q_A^-1")
+                values[("Int2D", "unit")] = bai_2d.get("unit", "q_A^-1")
+                if getattr(scan, "gi", False):
+                    values[("Int1D", "gi_mode")] = bai_1d.get(
+                        "gi_mode_1d", "q_total")
+                    values[("Int2D", "gi_mode")] = bai_2d.get(
+                        "gi_mode_2d", "qip_qoop")
+            except Exception:
+                logger.debug("Controls Panel V2 could not read scan axis state",
+                             exc_info=True)
+        return values
+
+    def _controls_v2_integrator_choices(self):
+        ui = getattr(getattr(self, "integratorTree", None), "ui", None)
+        if ui is None:
+            return {}
+
+        def _combo_choices(name):
+            combo = getattr(ui, name, None)
+            if combo is None:
+                return ()
+            return tuple(combo.itemText(i) for i in range(combo.count()))
+
+        choices = {}
+        for spec in INTEGRATOR_BACKED_CONTROL_SPECS:
+            if spec.kind.value != "combo" or not spec.choices_widget:
+                continue
+            choices[spec.path] = _combo_choices(spec.choices_widget)
+        return {path: vals for path, vals in choices.items() if vals}
+
+    def _set_controls_v2_integrator_field(self, path, value) -> bool:
+        path = tuple(path)
+        if path not in INTEGRATOR_BACKED_CONTROL_PATHS:
+            return False
+        ui = getattr(getattr(self, "integratorTree", None), "ui", None)
+        if ui is None:
+            return True
+        spec = next(
+            (spec for spec in INTEGRATOR_BACKED_CONTROL_SPECS
+             if spec.path == path),
+            None,
+        )
+        if spec is None:
+            return True
+        widget = getattr(ui, spec.widget_name, None)
+        try:
+            if spec.value_role == "current_text":
+                combo = widget
+                if combo is not None:
+                    text = str(value)
+                    idx = combo.findText(text)
+                    if idx >= 0 and combo.currentIndex() != idx:
+                        combo.setCurrentIndex(idx)
+            elif spec.value_role == "checked":
+                if widget is not None:
+                    checked = bool(
+                        coerce_control_edit_value(widget.isChecked(), value)
+                    )
+                    if widget.isChecked() != checked:
+                        widget.setChecked(checked)
+            elif spec.value_role == "value":
+                if widget is not None:
+                    current = widget.value()
+                    new_value = coerce_control_edit_value(current, value)
+                    if current != new_value:
+                        widget.setValue(new_value)
+            else:
+                if widget is not None:
+                    text = "" if value is None else str(value)
+                    if widget.text() != text:
+                        widget.setText(text)
+            self._sync_controls_v2_integrator_path(path)
+        except Exception:
+            logger.debug("Controls Panel V2 integrator field update failed for %s",
+                         path, exc_info=True)
+        return True
+
+    def _sync_controls_v2_integrator_path(self, path) -> None:
+        """Route a V2 edit through the legacy integrator parser immediately.
+
+        The hidden v1 panel remains the production parser during this
+        migration.  Calling its granular update hooks after every V2 edit keeps
+        ``scan.bai_1d_args`` / ``scan.bai_2d_args`` current before run setup
+        snapshots them.
+        """
+        path = tuple(path)
+        integrator = getattr(self, "integratorTree", None)
+        ui = getattr(integrator, "ui", None)
+        if integrator is None or ui is None:
+            return
+        try:
+            if path[0] == "GI":
+                # Do NOT call _on_gi_toggled here.  Setting gi_enable in
+                # _set_controls_v2_integrator_field already fires it via the
+                # widget's `toggled` signal — but only when the value actually
+                # CHANGES (guarded).  Calling it unconditionally here re-ran the
+                # toggle side effects (incl. re-opening the GI Options popup) on
+                # every programmatic re-sync, so the popup reappeared on Run and
+                # on each profile refresh.  The widget signal covers the real
+                # toggle; here we only refresh the derived args.
+                self._push_gi_to_wrangler()
+                integrator.get_args("bai_1d")
+                integrator.get_args("bai_2d")
+                return
+
+            if path[0] in {"Mask", "MaskSat"}:
+                self._push_threshold_to_wrangler()
+                return
+
+            if path[0] == "Int1D":
+                self._sync_controls_v2_1d_path(path, integrator, ui)
+                integrator.get_args("bai_1d")
+                return
+
+            if path[0] == "Int2D":
+                self._sync_controls_v2_2d_path(path, integrator, ui)
+                integrator.get_args("bai_2d")
+                return
+        except Exception:
+            logger.debug("Controls Panel V2 legacy parser sync failed for %s",
+                         path, exc_info=True)
+
+    def _sync_controls_v2_1d_path(self, path, integrator, ui) -> None:
+        leaf = path[1] if len(path) > 1 else ""
+        if leaf == "axis":
+            integrator._update_gi_mode_1d(ui.axis1D.currentIndex())
+        elif leaf in {"points", "points_oop"}:
+            integrator._get_npts_1D()
+        elif leaf in {"radial_auto", "radial_low", "radial_high"}:
+            integrator._get_radial_range_1D()
+        elif leaf in {"azim_auto", "azim_low", "azim_high"}:
+            integrator._get_azim_range_1D()
+
+    def _sync_controls_v2_2d_path(self, path, integrator, ui) -> None:
+        leaf = path[1] if len(path) > 1 else ""
+        if leaf == "axis":
+            integrator._update_gi_mode_2d(ui.axis2D.currentIndex())
+        elif leaf == "radial_points":
+            integrator._get_npts_radial_2D()
+        elif leaf == "azim_points":
+            integrator._get_npts_azim_2D()
+        elif leaf in {"radial_auto", "radial_low", "radial_high"}:
+            integrator._get_radial_range_2D()
+        elif leaf in {"azim_auto", "azim_low", "azim_high"}:
+            integrator._get_azim_range_2D()
+
+    def _sync_controls_v2_integrator_args(self) -> None:
+        integrator = getattr(self, "integratorTree", None)
+        if integrator is None:
+            return
+        try:
+            integrator.get_args("bai_1d")
+            integrator.get_args("bai_2d")
+            self._push_threshold_to_wrangler()
+            self._push_gi_to_wrangler()
+        except Exception:
+            logger.debug("Controls Panel V2 full integrator sync failed",
+                         exc_info=True)
+
+    def _on_controls_v2_field_changed(self, path, value) -> None:
+        self._apply_controls_v2_field_value(path, value)
+        self._refresh_controls_v2_profile(immediate=True)
+
+    def _on_controls_v2_field_browse(self, path) -> None:
+        wrangler = getattr(self, "wrangler", None)
+        if wrangler is None:
+            return
+        handlers = {
+            ("Project", "project_folder"): self._controls_v2_choose_project,
+            ("Project", "h5_dir"): self._controls_v2_choose_output,
+            ("Output", "h5_dir"): self._controls_v2_choose_output,
+            ("Signal", "poni_file"): getattr(wrangler, "set_poni_file", None),
+            ("Calibration", "poni_file"): getattr(wrangler, "browse_poni", None),
+            ("Signal", "File"): getattr(wrangler, "set_img_file", None),
+            ("Signal", "img_dir"): getattr(wrangler, "set_img_dir", None),
+            ("Signal", "meta_dir"): getattr(wrangler, "set_meta_dir", None),
+            ("Signal", "mask_file"): (
+                getattr(wrangler, "set_mask_file", None)
+                or getattr(wrangler, "browse_mask", None)
+            ),
+            ("NeXus File", "nexus_file"): getattr(wrangler, "browse_nexus", None),
+            ("BG", "File"): getattr(wrangler, "set_bg_file", None),
+        }
+        handler = handlers.get(tuple(path))
+        if callable(handler):
+            handler()
+        self._refresh_controls_v2_profile(immediate=True)
+
+    def _on_mask_created(self, mask_file) -> None:
+        """Auto-populate the Mask File field after Make Mask saves a mask.
+
+        Single source of truth: write the same wrangler param the Mask File
+        browse handler sets (``("Signal", "mask_file")``) + mirror the cached
+        ``wrangler.mask_file`` attr, then refresh the V2 panel so the new path
+        shows.  No-op if the path is empty or the param doesn't exist (e.g. a
+        wrangler without a mask_file param).
+        """
+        if not mask_file:
+            return
+        param = self._controls_v2_param(("Signal", "mask_file"))
+        if param is not None:
+            try:
+                param.setValue(str(mask_file))
+            except Exception:
+                logger.debug("Auto-populate mask_file failed", exc_info=True)
+        wrangler = getattr(self, "wrangler", None)
+        if wrangler is not None:
+            try:
+                wrangler.mask_file = str(mask_file)
+            except Exception:
+                pass
+        self._refresh_controls_v2_profile(immediate=True)
+
+    def _autofill_poni_after_calibrate(self, since_ts) -> None:
+        """Offer to adopt a PONI written by the just-closed pyFAI-calib2.
+
+        pyFAI-calib2 is an external program that doesn't tell us where the user
+        saved the ``.poni``, so we rglob the project folder (falling back to the
+        image directory) for a ``*.poni`` modified at/after the calibration
+        launch and, if one is found, populate the Poni field after a
+        confirmation popup so the user can double-check.  Picks the newest if
+        several match; does nothing if none are found.
+        """
+        from pathlib import Path
+        folder = ""
+        for path in (("Project", "project_folder"), ("Signal", "img_dir")):
+            param = self._controls_v2_param(path)
+            try:
+                value = param.value() if param is not None else ""
+            except Exception:
+                value = ""
+            if value and os.path.isdir(value):
+                folder = value
+                break
+        if not folder:
+            return
+        try:
+            recent = [
+                p for p in Path(folder).rglob("*.poni")
+                if p.stat().st_mtime >= since_ts - 2.0
+            ]
+        except Exception:
+            logger.debug("PONI auto-detect scan failed", exc_info=True)
+            return
+        if not recent:
+            return
+        newest = max(recent, key=lambda p: p.stat().st_mtime)
+        poni_path = str(newest)
+        extra = (f"\n\n(newest of {len(recent)} created during calibration)"
+                 if len(recent) > 1 else "")
+        answer = QMessageBox.question(
+            self, "Calibration complete",
+            "A new PONI file was found:\n\n"
+            f"{poni_path}{extra}\n\nUse it as the calibration for this scan?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if answer == QMessageBox.Yes:
+            self._set_poni_field(poni_path)
+
+    def _set_poni_field(self, poni_path) -> None:
+        """Adopt ``poni_path`` as the calibration, mirroring a manual browse.
+
+        Sets the active Poni param — Image: ``("Signal", "poni_file")`` (its
+        ``sigValueChanged`` runs ``get_poni_dict``); NeXus: ``("Calibration",
+        "poni_file")`` — mirrors the wrangler's cached ``poni_file``, reloads
+        the NeXus wrangler's cached ``poni`` (which only reloads on browse /
+        session-restore, not a bare ``setValue``), then refreshes the V2 panel.
+        """
+        poni_path = str(poni_path)
+        for path in (("Signal", "poni_file"), ("Calibration", "poni_file")):
+            param = self._controls_v2_param(path)
+            if param is not None:
+                try:
+                    param.setValue(poni_path)
+                except Exception:
+                    logger.debug("Set poni_file param failed for %s", path,
+                                 exc_info=True)
+                break
+        wrangler = getattr(self, "wrangler", None)
+        if wrangler is not None:
+            try:
+                wrangler.poni_file = poni_path
+            except Exception:
+                pass
+            if isinstance(wrangler, nexusWrangler):
+                try:
+                    from xrd_tools.core.containers import PONI
+                    if os.path.exists(poni_path):
+                        wrangler.poni = PONI.from_poni_file(poni_path)
+                except Exception:
+                    logger.debug("PONI reload after autofill failed",
+                                 exc_info=True)
+        self._refresh_controls_v2_profile(immediate=True)
+
+    def _controls_v2_choose_source(self) -> None:
+        wrangler = getattr(self, "wrangler", None)
+        if wrangler is None:
+            return
+        try:
+            mode_text = self.controls.current_mode()
+        except Exception:
+            mode_text = ""
+        if hasattr(wrangler, "browse_nexus"):
+            wrangler.browse_nexus()
+            return
+        if "directory" in str(getattr(wrangler, "inp_type", "")).lower():
+            browse = getattr(wrangler, "set_img_dir", None)
+        else:
+            browse = getattr(wrangler, "set_img_file", None)
+        if mode_text in ("Image Viewer", "XYE Viewer"):
+            browse = getattr(wrangler, "set_img_file", None) or browse
+        if callable(browse):
+            browse()
+
+    def _controls_v2_choose_project(self) -> None:
+        wrangler = getattr(self, "wrangler", None)
+        if wrangler is None:
+            return
+        browse = getattr(wrangler, "set_project_folder", None)
+        if browse is None:
+            browse = getattr(wrangler, "browse_project_folder", None)
+        if callable(browse):
+            browse()
+
+    def _controls_v2_choose_output(self) -> None:
+        wrangler = getattr(self, "wrangler", None)
+        if wrangler is None:
+            return
+        browse = getattr(wrangler, "set_h5_dir", None)
+        if browse is None:
+            browse = getattr(wrangler, "browse_h5_dir", None)
+        if callable(browse):
+            browse()
+
+    def _refresh_controls_v2_profile(self, *, immediate: bool = False) -> None:
+        if getattr(self, "_tearing_down", False):
+            return
+        timer = getattr(self, "_controls_v2_refresh_timer", None)
+        if immediate or timer is None:
+            self._refresh_controls_v2_profile_now()
+        else:
+            timer.trigger()
+
+    def _refresh_controls_v2_profile_now(self) -> None:
+        panel = getattr(self, "controls_v2", None)
+        if panel is None:
+            return
+        try:
+            state = self._controls_v2_state()
+            values = self._controls_v2_field_values()
+            choices = self._controls_v2_field_choices()
+            render_state = build_control_panel_state(state, values, choices)
+            signature = render_state
+            if signature == getattr(self, "_controls_v2_last_signature", None):
+                return
+            # A background rebuild (set_state -> clear_rows) would destroy a line
+            # editor the user is mid-way through and silently drop the uncommitted
+            # text.  If one is focused, defer until it COMMITS (editingFinished =
+            # Enter / focus loss) rather than re-arming the throttle every interval
+            # (which would keep a timer waking through a long acquisition).  The
+            # rebuild is then SCHEDULED through the throttle, never run inside the
+            # editingFinished slot (which would delete the editor mid-emission).
+            # Signature is left unstamped so the deferred pass still detects the
+            # change and rebuilds.
+            editor = panel.focusWidget()
+            if isinstance(editor, QtWidgets.QLineEdit):
+                self._defer_controls_v2_refresh_until_commit(editor)
+                return
+            self._cancel_deferred_controls_v2_refresh()
+            panel.set_state(render_state)
+            self._controls_v2_last_signature = signature
+        except Exception:
+            logger.debug("Controls Panel V2 profile refresh failed",
+                         exc_info=True)
+
+    def _defer_controls_v2_refresh_until_commit(self, editor) -> None:
+        """Arm a one-shot: when ``editor`` finishes editing (Enter / focus loss),
+        schedule the deferred Controls V2 rebuild through the throttle.  Replaces
+        re-arming the throttle each interval, so a focused field during a long
+        acquisition no longer keeps a timer alive."""
+        if getattr(self, "_controls_v2_pending_editor", None) is editor:
+            return
+        self._cancel_deferred_controls_v2_refresh()
+        self._controls_v2_pending_editor = editor
+        editor.editingFinished.connect(self._on_controls_v2_pending_editor_done)
+
+    def _cancel_deferred_controls_v2_refresh(self) -> None:
+        """Drop a pending editingFinished one-shot (editor committed, was
+        destroyed by a rebuild, or teardown)."""
+        editor = getattr(self, "_controls_v2_pending_editor", None)
+        if editor is not None:
+            try:
+                editor.editingFinished.disconnect(
+                    self._on_controls_v2_pending_editor_done)
+            except (TypeError, RuntimeError):
+                pass
+        self._controls_v2_pending_editor = None
+
+    def _on_controls_v2_pending_editor_done(self, *args) -> None:
+        """The deferred-on editor committed: schedule (do NOT run) the rebuild
+        via the throttle, so it lands after this slot returns and we never delete
+        the editor while it is still emitting editingFinished."""
+        self._cancel_deferred_controls_v2_refresh()
+        self._refresh_controls_v2_profile(immediate=False)
+
+    def _on_gi_motor_options_changed(self, _motors=None) -> None:
+        """The wrangler emitted a fresh GI motor-column list (metadata loaded);
+        re-render so the inline V2 GI motor combo shows the updated choices."""
+        self._refresh_controls_v2_profile(immediate=True)
+
+    def _controls_v2_state(self) -> ControlState:
+        """Build a lightweight, best-effort Controls V2 state snapshot."""
+        mode_text = ""
+        try:
+            mode_text = self.controls.current_mode()
+        except Exception:
+            pass
+        tool = tool_from_mode_text(mode_text)
+        gi_cfg = {}
+        try:
+            gi_cfg = self.integratorTree.get_gi_config()
+        except Exception:
+            gi_cfg = {}
+        gi_on = bool(gi_cfg.get("gi", getattr(self.scan, "gi", False)))
+        meas_mode = MeasMode.GI if gi_on else MeasMode.STANDARD
+
+        frame_count = 0
+        try:
+            frame_count = len(getattr(self.scan.frames, "index", ()) or ())
+        except Exception:
+            frame_count = 0
+        source_label = self._controls_v2_source_label()
+        has_scan_data = False
+        try:
+            has_scan_data = not getattr(self.scan, "scan_data", None).empty
+        except Exception:
+            has_scan_data = False
+        wrangler = getattr(self, "wrangler", None)
+        has_motors = bool(getattr(wrangler, "motors", None)) or has_scan_data
+        has_raw = bool(frame_count or source_label)
+        source_caps = SourceCaps(
+            has_frames=frame_count > 0,
+            has_raw=has_raw,
+            raw_reachable=has_raw,
+            has_metadata=has_scan_data or bool(getattr(wrangler, "scan_args", None)),
+            has_motors=has_motors,
+            has_energy=self._controls_v2_energy_known(),
+            has_geometry=self._controls_v2_calibrated(),
+            has_psi_metadata=has_scan_data,
+        )
+
+        has_1d = bool(self.data_1d)
+        has_2d = bool(self.data_2d)
+        labels = ()
+        try:
+            labels = self.publication_store.labels()
+            recent = labels[-16:] if len(labels) > 16 else labels
+            pubs = tuple(self.publication_store.get_many(recent).values())
+            has_1d = has_1d or any(getattr(pub.view, "int_1d", None) is not None
+                                   for pub in pubs)
+            has_2d = has_2d or any(getattr(pub.view, "int_2d", None) is not None
+                                   for pub in pubs)
+        except Exception:
+            labels = ()
+        result_caps = ResultCaps(
+            has_1d=has_1d,
+            has_2d=has_2d,
+            has_raw=has_raw,
+            raw_reachable=has_raw,
+            has_scan_metadata=has_scan_data,
+            has_rsm=bool(getattr(self.scan, "rsm_result", None)),
+            has_phase_result=False,
+            has_psi_metadata=has_scan_data,
+        )
+        geom = GeomState(
+            calibrated=self._controls_v2_calibrated(),
+            energy_known=source_caps.has_energy,
+            gi_enabled=gi_on,
+            sample_orientation_known=(
+                not gi_on or bool(gi_cfg.get("sample_orientation"))),
+            ub_known=bool(getattr(self.scan, "ub_matrix", None)),
+            material_known=False,
+        )
+        run_active = (bool(getattr(self, "_run_active", False))
+                      or self._session_run_active())
+        display_frame_count = frame_count or len(labels)
+        if run_active:
+            # During a run the processed-frame count ticks every frame; letting
+            # it into the render signature would rebuild the whole controls panel
+            # ~5 Hz (clear_rows + recreate every row).  Live progress is shown in
+            # the status bar, so freeze the panel's frame count at the run-start
+            # value (snapshot once) — it resyncs when the run ends and the
+            # snapshot clears.  The panel is locked during a run, so a frozen
+            # count loses nothing.
+            if getattr(self, "_controls_v2_run_frame_count", None) is None:
+                self._controls_v2_run_frame_count = display_frame_count
+            display_frame_count = self._controls_v2_run_frame_count
+        else:
+            self._controls_v2_run_frame_count = None
+        return ControlState(
+            tool=tool,
+            mode=meas_mode,
+            source_caps=source_caps,
+            result_caps=result_caps,
+            geom=geom,
+            backend=self._controls_v2_backend(tool),
+            project_root=str(getattr(getattr(self, "wrangler", None), "project_folder", "") or ""),
+            source_label=source_label,
+            save_path=str(getattr(getattr(self, "wrangler", None), "h5_dir", "") or ""),
+            frame_count=display_frame_count,
+            processing_mode=mode_text,
+            real_data_gates=frozenset(),
+            controls_locked=run_active,
+        )
+
+    def _controls_v2_source_label(self) -> str:
+        for candidate in (
+            getattr(self.scan, "data_file", None),
+            getattr(self, "fname", None),
+            getattr(getattr(self, "wrangler", None), "fname", None),
+        ):
+            if candidate:
+                return str(candidate)
+        return ""
+
+    def _controls_v2_calibrated(self) -> bool:
+        scan = getattr(self, "scan", None)
+        if getattr(scan, "_cached_integrator", None) is not None:
+            return True
+        if getattr(scan, "geometry", None) is not None:
+            return True
+        try:
+            return bool(getattr(self.integratorTree, "_cached_poni", None))
+        except Exception:
+            return False
+
+    def _controls_v2_energy_known(self) -> bool:
+        scan = getattr(self, "scan", None)
+        if getattr(scan, "_persisted_wavelength_m", None) is not None:
+            return True
+        integrator = getattr(scan, "_cached_integrator", None)
+        if getattr(integrator, "wavelength", None) is not None:
+            return True
+        mg_args = getattr(scan, "mg_args", {}) or {}
+        return mg_args.get("wavelength") not in (None, 1e-10)
+
+    @staticmethod
+    def _controls_v2_backend(tool) -> str | None:
+        if tool == Tool.STITCH:
+            return "multigeometry"
+        if tool == Tool.RSM:
+            return "rsm"
+        return None
+
     def _build_tools_placeholder(self):
         """Fill the vacated bottom-left ``metaFrame`` with the compact 'Tools' card.
 
@@ -547,18 +1369,19 @@ class staticWidget(QWidget):
         card_lay = QtWidgets.QVBoxLayout(card)
         card_lay.setContentsMargins(9, 9, 9, 9)
         card_lay.setSpacing(6)
-        # (label, handler-or-None, tooltip).  Handler => active tool; the button
-        # opens it.  A None handler is a not-yet-built tool (button disabled).
+        # (symbol, label, handler-or-None, tooltip).  Handler => active tool; the
+        # button opens it.  A None handler is a not-yet-built tool (button
+        # disabled).  Symbols are decorative glyphs (standard-font safe).
         tools = [
-            ('Peak Fitting', self._open_peak_fit_dialog,
+            ('∧', 'Peak Fitting', self._open_peak_fit_dialog,
              'Structure-agnostic peak fitting — selected frame and across the scan.'),
-            ('Phase Fitting', self._open_phase_fit_dialog,
+            ('≈', 'Phase Fitting', self._open_phase_fit_dialog,
              'CIF-based phase fitting — selected frame and across the scan.'),
-            ('Plot Metadata', self._open_scan_plot_dialog,
+            ('▤', 'Plot Metadata', self._open_scan_plot_dialog,
              'Plot scan metadata + image-ROI statistics vs frame.'),
         ]
-        for name, handler, tip in tools:
-            btn = QtWidgets.QPushButton(name)
+        for symbol, name, handler, tip in tools:
+            btn = QtWidgets.QPushButton(f'{symbol}   {name}')
             btn.setObjectName('toolButton')
             btn.setToolTip(tip)
             if handler is not None:
@@ -924,6 +1747,8 @@ class staticWidget(QWidget):
         # the same handler the wrangler's GI checkbox used (sets scan.gi +
         # refreshes the panel axis units/labels).
         self.integratorTree.sigUpdateGI.connect(self.update_scattering_geometry)
+        # Make Mask just wrote a mask file — auto-populate the Mask File field.
+        self.integratorTree.sigMaskCreated.connect(self._on_mask_created)
         self.integratorTree.integrator_thread.started.connect(self.thread_state_changed)
         # Re-integration is a "run" too: route its START through the single
         # run-state owner (task #68) — keeps the 2D panels persistent AND
@@ -1126,6 +1951,12 @@ class staticWidget(QWidget):
         if hasattr(self.wrangler, 'sigGIMotorOptions'):
             self.wrangler.sigGIMotorOptions.connect(
                 self.integratorTree.set_gi_motor_options)
+            # Re-render the V2 panel so its inline GI motor combo picks up the
+            # freshly-populated choices (it reads them from the integrator combo,
+            # which set_gi_motor_options just repopulated).  Signature-gated, so
+            # it's a no-op when the motor list is unchanged.
+            self.wrangler.sigGIMotorOptions.connect(
+                self._on_gi_motor_options_changed)
         self.wrangler.started.connect(self.thread_state_changed)
         self.wrangler.finished.connect(self.wrangler_finished)
         # Pause/Resume (Phase B): lift the freeze guard once paused (frozen at a
@@ -1217,6 +2048,7 @@ class staticWidget(QWidget):
         # The freshly-attached profile may have shown/hidden run rows -> refit the
         # controls bar to the new content height.
         self._fit_controls_height()
+        self._refresh_controls_v2_profile(immediate=True)
 
     def disconnect_wrangler(self):
         """Disconnects all signals attached the the current wrangler
@@ -1293,6 +2125,7 @@ class staticWidget(QWidget):
         # Skip the rest when in viewer mode — set_viewer_display_mode controls
         # panels.
         if 'Viewer' in mode_text:
+            self._refresh_controls_v2_profile()
             return
         # A non-viewer processing mode (Int 1D/2D, Int 1D (XYE)) must take the
         # display OUT of any viewer mode it is stuck in.  The wrangler's
@@ -1311,6 +2144,7 @@ class staticWidget(QWidget):
         self.displayframe.clear_display_state()
         self.displayframe.request_plot_autorange()
         self.h5viewer.data_changed()
+        self._refresh_controls_v2_profile()
 
     @staticmethod
     def _mode_skips_2d(mode_text):
@@ -1689,6 +2523,7 @@ class staticWidget(QWidget):
 
             # Live peak-fit preview (no-op unless the dialog is open + Live on).
             self._maybe_live_fit()
+            self._refresh_controls_v2_profile()
 
     def _hydrate_integrator_on_load(self, *args):
         """Stage C: when a ``.nxs`` is loaded, populate the integration panel from
@@ -1942,6 +2777,9 @@ class staticWidget(QWidget):
             if frame is not None:
                 frame.setEnabled(not is_viewer and not run_active)
 
+        if getattr(self, "controls_v2", None) is not None:
+            self._refresh_controls_v2_profile(immediate=True)
+
     def _session_run_active(self):
         """4d: True iff a streaming session is open AND reports it is running.
 
@@ -1972,6 +2810,12 @@ class staticWidget(QWidget):
         if self._run_active:
             return
         self._run_active = True
+        # Re-snapshot the frame-count freeze from scratch each run: clear any
+        # leftover snapshot so a new run can't freeze at the PREVIOUS run's frame
+        # count if no run_active=False refresh happened to clear it in between
+        # (F6 — the clear in _controls_v2_state is timing-dependent; this is the
+        # authoritative reset at run START).
+        self._controls_v2_run_frame_count = None
         # Append-mode feedback: track whether THIS run displayed any frame, so a
         # run that processes 0 new frames (Append over an already-complete scan)
         # can still show the scan's last frame at the end (visual confirmation
@@ -2343,6 +3187,7 @@ class staticWidget(QWidget):
         self.displayframe.stitch_display_mode = stitch_mode_str or None
         self.displayframe._bump_display_generation()
         self.update_all()
+        self._refresh_controls_v2_profile()
 
     def stitch_thread_finished(self):
         """Stitch worker done: end the shared run-state (unless a wrangler run is
@@ -2423,6 +3268,7 @@ class staticWidget(QWidget):
         self.scan.stitched_1d = None
         self.scan.stitched_2d = None
         self.displayframe.stitch_display_mode = None
+        self._refresh_controls_v2_profile()
         # Propagate the wrangler-loaded mask (detector + user Mask File,
         # combined into flat indices) into the main scan so the
         # displayframe can overlay it on the raw image.  Without this,
@@ -2591,10 +3437,8 @@ class staticWidget(QWidget):
         """
         # i_qChi = np.zeros((1000, 1000), dtype=float)
 
-        self.wrangler.enabled(False)
-
-        self.integratorTree.get_args('bai_1d')
-        self.integratorTree.get_args('bai_2d')
+        self._commit_controls_v2_pending_edits()
+        self._sync_controls_v2_integrator_args()
 
         args = {'bai_1d_args': self.scan.bai_1d_args,
                 'bai_2d_args': self.scan.bai_2d_args}
@@ -2606,6 +3450,7 @@ class staticWidget(QWidget):
         # GI geometry is owned by the integrator panel now — push it into the
         # wrangler's hidden GI carrier params BEFORE setup() too, same reason.
         self._push_gi_to_wrangler()
+        self.wrangler.enabled(False)
         self.wrangler.setup()
         self.h5viewer.auto_last = True
 
@@ -2882,6 +3727,7 @@ class staticWidget(QWidget):
         finally:
             self.h5viewer._suspend_scan_selection_loads = prev_suspend
             scans.blockSignals(was_blocked)
+        self._refresh_controls_v2_profile()
 
     def latest_frame(self, checked=None, *, emit_update=True):
         """Advances to last frame in data list, updates displayframe, and

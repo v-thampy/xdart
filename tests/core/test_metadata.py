@@ -424,3 +424,65 @@ class TestHelpers:
         assert spec_fname == "run_myspec"
         assert scan_num == 1
         assert img_num == 99
+
+
+# ---------------------------------------------------------------------------
+# SPEC file location: extensionless name, searched in the image's folder plus
+# up to two parent directories above it.
+# ---------------------------------------------------------------------------
+
+_SPEC_MINIMAL = """#F myscan
+#E 1
+#D today
+#O0 th  chi  phi
+
+#S 5 ascan th 0 2 2 1
+#D today
+#P0 0 5 10
+#N 4
+#L th  Epoch  i0  det
+0 1 100 10
+1 2 110 20
+2 3 120 30
+"""
+
+
+@pytest.mark.parametrize("levels_up", [0, 1, 2])
+def test_read_spec_metadata_finds_extensionless_spec_within_two_parents(
+        tmp_path: Path, levels_up: int) -> None:
+    """The SPEC file is extensionless and is found in the image's own folder
+    (level 0) or up to two parent directories above it (levels 1 and 2)."""
+    pytest.importorskip("silx")
+
+    img_dir = tmp_path / "a" / "b" / "c"
+    img_dir.mkdir(parents=True)
+    image = img_dir / "myscan_scan5_0001.tif"
+    image.write_bytes(b"")  # content irrelevant — only the name is parsed
+
+    spec_dir = img_dir
+    for _ in range(levels_up):
+        spec_dir = spec_dir.parent
+    spec = spec_dir / "myscan"          # extensionless (SSRL convention)
+    assert spec.suffix == ""
+    spec.write_text(_SPEC_MINIMAL)
+
+    md = read_image_metadata(image, meta_format="SPEC")
+    # The file was found and parsed: scan 5 / image index 1 per-point counter +
+    # the constant (non-scanned) #O/#P motors.  (th is in both tables; motors
+    # win the merge, so it's the motor position, hence we check i0 / chi / phi.)
+    assert md["i0"] == 110.0    # per-point counter at image index 1
+    assert md["chi"] == 5.0     # constant non-scanned motor
+    assert md["phi"] == 10.0
+
+
+def test_read_spec_metadata_ignores_spec_beyond_two_parents(tmp_path: Path) -> None:
+    """A SPEC file three or more levels above the image folder is NOT picked up."""
+    pytest.importorskip("silx")
+
+    img_dir = tmp_path / "a" / "b" / "c"
+    img_dir.mkdir(parents=True)
+    image = img_dir / "myscan_scan5_0001.tif"
+    image.write_bytes(b"")
+    (tmp_path / "myscan").write_text(_SPEC_MINIMAL)  # tmp_path is 3 levels up
+
+    assert read_image_metadata(image, meta_format="SPEC") == {}

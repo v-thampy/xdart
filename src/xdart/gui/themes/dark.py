@@ -25,6 +25,10 @@ DARK = {
     "field_border": "#3c4052",
     "gap": "#cfd4e3",
     "grid": "#d6d9e0",
+    "hdr_project": "#263044",
+    "hdr_source": "#213932",
+    "hdr_experiment": "#393529",
+    "hdr_processing": "#3a2832",
     "menubar": "#1b1d27",
     "panel": "#1e2029",
     "plot1d_bg": "#eceef2",
@@ -57,6 +61,10 @@ LIGHT = {
     "field_border": "#d7dbe6",
     "gap": "#ffffff",
     "grid": "#e8eaf0",
+    "hdr_project": "#e8eefc",
+    "hdr_source": "#e6f6ee",
+    "hdr_experiment": "#f7f1de",
+    "hdr_processing": "#fbe9ed",
     "menubar": "#eef0f5",
     "panel": "#f5f6fa",
     "plot1d_bg": "#fbfbfd",
@@ -562,7 +570,7 @@ QPushButton#toolButton {
     border: 1px solid $field_border;
     border-radius: 5px;
     padding: 4px 10px;
-    text-align: left;
+    text-align: center;
     font-weight: 600;
 }
 QPushButton#toolButton:hover {
@@ -616,6 +624,268 @@ QFrame#displayScaleGroup QPushButton {
 QFrame#displayScaleDivider {
     color: $field_border;
     max-width: 1px;
+}
+
+/* ── Controls Panel V2 workflow cards ─────────────────────────── */
+QWidget#controlsPanelV2 {
+    background-color: $win_bg;
+    /* No font-family override — inherit the app default so the panel matches
+       the rest of xdart (left browser + display frame).  A hair smaller than
+       the default so the dense panel reads lighter. */
+    font-size: 12px;
+}
+QWidget#controlsV2TopActionBar {
+    background-color: transparent;
+    border: none;
+}
+QPushButton#controlsV2ActionButton {
+    background-color: $field;
+    color: $text;
+    border: 1px solid $field_border;
+    border-radius: 7px;
+    padding: 6px 10px;
+    font-weight: 500;
+}
+/* Reintegrate = transparent green (run-like); Advanced = transparent red
+   (destructive/expert).  Producers stay neutral $field. */
+QPushButton#controlsV2ActionButton[actionRole="reintegrate"] {
+    background-color: rgba(224, 108, 117, 0.16);
+    border-color: rgba(224, 108, 117, 0.45);
+}
+QPushButton#controlsV2ActionButton[actionRole="advanced"] {
+    background-color: rgba(224, 108, 117, 0.16);
+    border-color: rgba(224, 108, 117, 0.45);
+}
+QPushButton#controlsV2ActionButton:hover {
+    background-color: $accent_muted;
+    border-color: $accent;
+}
+QPushButton#controlsV2ActionButton:disabled {
+    background-color: $panel;
+    color: $text_muted;
+    border-color: $field_border;
+}
+
+QFrame#controlsV2SectionCard {
+    background-color: transparent;
+    border: none;
+    border-radius: 0px;
+}
+QFrame#controlsV2SectionHeader {
+    background-color: $panel;
+    border: 1px solid $field_border;
+    border-left: 4px solid $field_border;
+    border-top-left-radius: 7px;
+    border-top-right-radius: 7px;
+    border-bottom-left-radius: 0px;
+    border-bottom-right-radius: 0px;
+}
+QFrame#controlsV2SectionHeader[accent="project"] {
+    background-color: $hdr_project;
+    border-left-color: #8fb4ff;
+}
+QFrame#controlsV2SectionHeader[accent="source"] {
+    background-color: $hdr_source;
+    border-left-color: #6fdca5;
+}
+QFrame#controlsV2SectionHeader[accent="experiment"] {
+    background-color: $hdr_experiment;
+    border-left-color: #e8c46a;
+}
+QFrame#controlsV2SectionHeader[accent="processing"] {
+    background-color: $hdr_processing;
+    border-left-color: #e06c75;
+}
+QToolButton#controlsV2Chevron,
+QToolButton#controlsV2SubChevron {
+    background-color: transparent;
+    color: $text_muted;
+    border: none;
+    padding: 0px;
+    min-width: 12px;
+    max-width: 14px;
+}
+QLabel#controlsV2SectionChip {
+    color: #11131a;
+    border-radius: 5px;
+    font-weight: 800;
+    padding: 1px 6px;
+    min-width: 18px;
+}
+QLabel#controlsV2SectionChip[accent="project"] {
+    background-color: #8fb4ff;
+}
+QLabel#controlsV2SectionChip[accent="source"] {
+    background-color: #6fdca5;
+}
+QLabel#controlsV2SectionChip[accent="experiment"] {
+    background-color: #e8c46a;
+}
+QLabel#controlsV2SectionChip[accent="processing"] {
+    background-color: #e06c75;
+}
+QLabel#controlsV2SectionTitle {
+    color: $text;
+    font-weight: 800;
+    letter-spacing: 1px;
+}
+QLabel#controlsV2SectionStatus {
+    color: $text_muted;
+    font-weight: 700;
+}
+QFrame#controlsV2SectionBody {
+    background-color: $card;
+    border: 1px solid $field_border;
+    border-top: none;
+    border-bottom-left-radius: 7px;
+    border-bottom-right-radius: 7px;
+}
+
+QFrame#controlsV2SubsectionCard {
+    background-color: transparent;
+    border: 1px solid $field_border;
+    border-radius: 7px;
+}
+QFrame#controlsV2SubsectionHeader {
+    background-color: $panel;
+    border: none;
+    border-top-left-radius: 7px;
+    border-top-right-radius: 7px;
+}
+QFrame#controlsV2SubsectionBody {
+    background-color: transparent;
+    border: none;
+}
+/* Subsection number (3a/3b, 1-D/2-D): the accent shown as TEXT on the section
+   background — not dark text on a filled chip. */
+QLabel#controlsV2SubsectionPrefix {
+    background-color: transparent;
+    color: $accent_text;
+    padding: 1px 4px;
+    font-weight: 800;
+}
+QLabel#controlsV2SubsectionPrefix[accent="project"] { color: #8fb4ff; }
+QLabel#controlsV2SubsectionPrefix[accent="source"] { color: #6fdca5; }
+QLabel#controlsV2SubsectionPrefix[accent="experiment"] { color: #e8c46a; }
+QLabel#controlsV2SubsectionPrefix[accent="processing"] { color: #e06c75; }
+QLabel#controlsV2SubsectionTitle {
+    color: $text_2;
+    font-weight: 700;
+}
+QLabel#controlsV2SubsectionTitle[accent="project"] { color: #8fb4ff; }
+QLabel#controlsV2SubsectionTitle[accent="source"] { color: #6fdca5; }
+QLabel#controlsV2SubsectionTitle[accent="experiment"] { color: #e8c46a; }
+QLabel#controlsV2SubsectionTitle[accent="processing"] { color: #e06c75; }
+QLabel#controlsV2SubsectionStatus {
+    color: $text_muted;
+    font-weight: 700;
+}
+
+QWidget#controlsV2FormRow,
+QWidget#controlsV2FieldRow {
+    background-color: transparent;
+}
+QLabel#controlsV2FieldLabel {
+    color: $text_2;
+}
+QLabel#controlsV2FieldValue {
+    color: $text;
+}
+QLineEdit#controlsV2LineEdit,
+QComboBox#controlsV2ComboBox {
+    background-color: $field;
+    color: $text;
+    border: 1px solid $field_border;
+    border-radius: 5px;
+    padding: 3px 7px;
+}
+QLineEdit#controlsV2LineEdit:disabled,
+QComboBox#controlsV2ComboBox:disabled {
+    background-color: $panel;
+    color: $text_muted;
+}
+QToolButton#controlsV2BrowseButton,
+QToolButton#controlsV2MoreButton {
+    background-color: #4d6fbd;
+    color: $browse_text;
+    border: 1px solid #6483ce;
+    border-radius: 5px;
+    padding: 2px 4px;
+    font-weight: 800;
+    font-size: 13px;
+    min-width: 28px;
+}
+QToolButton#controlsV2BrowseButton:hover,
+QToolButton#controlsV2MoreButton:hover {
+    background-color: #5a7bd0;
+}
+QToolButton#controlsV2BrowseButton:pressed,
+QToolButton#controlsV2MoreButton:pressed {
+    background-color: $browse_pressed;
+}
+QPushButton#controlsV2ToggleButton {
+    background-color: $field;
+    color: $text_2;
+    border: 1px solid $field_border;
+    border-radius: 7px;
+    padding: 5px 8px;
+    font-weight: 700;
+    text-align: center;
+}
+QPushButton#controlsV2ToggleButton:checked {
+    background-color: $accent;
+    color: $accent_on_text;
+    border-color: $accent;
+}
+QPushButton#controlsV2ToggleButton:checked:disabled {
+    background-color: $accent_muted;
+    color: $text_2;
+    border-color: $accent_muted;
+}
+QPushButton#controlsV2ToggleButton:disabled {
+    background-color: $panel;
+    color: $text_muted;
+    border-color: $field_border;
+}
+/* Pill variant (Conditioning / Corrections toggles): fully rounded + content-
+   sized so several share a row, instead of full-width stacked buttons. */
+QPushButton#controlsV2ToggleButton[pill="true"] {
+    border-radius: 13px;
+    padding: 4px 13px;
+}
+/* The compact RangeRow's ✦ auto/enable toggle + the low–high separator. */
+QToolButton#controlsV2AutoButton {
+    background-color: $field;
+    color: $accent_text;
+    border: 1px solid $field_border;
+    border-radius: 6px;
+    padding: 4px 7px;
+    font-weight: 700;
+}
+QToolButton#controlsV2AutoButton:checked {
+    background-color: $accent;
+    color: $accent_on_text;
+    border-color: $accent;
+}
+QToolButton#controlsV2AutoButton:disabled {
+    background-color: $panel;
+    color: $text_muted;
+    border-color: $field_border;
+}
+QLabel#controlsV2RangeDash {
+    color: $text_muted;
+    min-width: 8px;
+    background: transparent;
+    border: none;
+}
+QLabel#controlsV2GroupHeader {
+    color: $text_muted;
+    font-weight: 800;
+    padding-top: 4px;
+}
+QFrame#controlsV2ActionRow {
+    border: none;
+    background-color: transparent;
 }
 
 /* ── Tabs ──────────────────────────────────────────────────────── */

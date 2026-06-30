@@ -408,7 +408,9 @@ def test_metadata_popup_and_tools_placeholder(widget):
     # was dropped; the hover tooltip carries the description).
     btn_texts = {b.text() for b in w.ui.metaFrame.findChildren(QtWidgets.QPushButton)
                  if b.objectName() == "toolButton"}
-    assert {"Peak Fitting", "Phase Fitting", "Plot Metadata"} <= btn_texts
+    # Buttons carry a leading glyph (e.g. "∧   Peak Fitting"); match the label.
+    assert all(any(name in t for t in btn_texts)
+               for name in ("Peak Fitting", "Phase Fitting", "Plot Metadata"))
     # Opening the popup reparents the live metawidget into a non-modal dialog.
     assert w._metadata_dialog is None
     w._open_metadata_dialog()
@@ -2838,7 +2840,7 @@ def test_gi_1d_npts_defaults_and_per_axis_memory(widget):
     tree.set_image_units()
 
     labels = [tree.ui.axis1D.itemText(i) for i in range(tree.ui.axis1D.count())]
-    qip_idx = next(i for i, t in enumerate(labels) if "ᵢₚ" in t or "ᵢ" in t)
+    qip_idx = next(i for i, t in enumerate(labels) if "Qip" in t)
 
     tree.ui.axis1D.setCurrentIndex(qip_idx)            # -> q_ip
     assert tree.ui.npts_1D.text() == "1000"
@@ -2970,11 +2972,20 @@ def test_live_run_injects_integrator_threshold_into_wrangler(widget):
 
 
 def test_layout_wrangler_above_integrator(widget):
-    """Stage 1 of the panel refactor: the wrangler pane sits ABOVE the integrator
-    panel in the right vertical splitter (index 0 renders at the top)."""
+    """The processing controls live in the right controls area.
+
+    In the legacy layout the wrangler pane sat above the integrator pane in the
+    right splitter.  Controls Panel V2 embeds the existing integrator widget
+    inside its Processing card instead.
+    """
     w = widget
     rs = w.ui.rightSplitter
-    assert rs.indexOf(w.ui.wranglerFrame) < rs.indexOf(w.ui.integratorFrame)
+    if getattr(w, "controls_v2", None) is not None:
+        assert rs.indexOf(w.ui.wranglerFrame) >= 0
+        assert rs.indexOf(w.ui.integratorFrame) == -1
+        assert w.controls_v2.processing_card.isAncestorOf(w.ui.integratorFrame)
+    else:
+        assert rs.indexOf(w.ui.wranglerFrame) < rs.indexOf(w.ui.integratorFrame)
 
 
 def test_tools_bar_hosts_calibrate_and_make_mask(widget):
@@ -2991,7 +3002,58 @@ def test_tools_bar_hosts_calibrate_and_make_mask(widget):
     assert not w.integratorTree.ui.get_mask.isHidden()
     rs = w.ui.rightSplitter
     assert rs.indexOf(tools) == 0                       # very top pane
-    assert rs.indexOf(w.ui.wranglerFrame) < rs.indexOf(w.ui.integratorFrame)
+    if getattr(w, "controls_v2", None) is not None:
+        assert rs.indexOf(w.ui.integratorFrame) == -1
+        assert w.controls_v2.processing_card.isAncestorOf(w.ui.integratorFrame)
+    else:
+        assert rs.indexOf(w.ui.wranglerFrame) < rs.indexOf(w.ui.integratorFrame)
+
+
+def test_calibrate_offers_recent_poni_from_project_folder(widget, tmp_path, monkeypatch):
+    """After pyFAI-calib2 (an external program that can't report its save path)
+    closes, ``_autofill_poni_after_calibrate`` rglobs the project folder for a
+    ``.poni`` written during calibration and offers it via a confirmation popup
+    (newest wins).  Nothing is offered if none are recent.  (The Yes-path reuses
+    the existing poni-browse plumbing, so we only assert the offer here.)"""
+    import os
+    import time
+    from xdart.gui.tabs.static_scan import static_scan_widget as ssw
+
+    w = widget
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    w.wrangler.parameters.child("Project", "project_folder").setValue(str(proj))
+
+    asked = []
+    monkeypatch.setattr(
+        ssw.QMessageBox, "question",
+        lambda *a, **k: asked.append(a[2]) or ssw.QMessageBox.No)
+
+    # Nothing written yet -> no popup.
+    w._autofill_poni_after_calibrate(time.time())
+    assert asked == []
+
+    # An OLD .poni (predating this calibration) is ignored.
+    old = proj / "old.poni"
+    old.write_text("x")
+    os.utime(old, (1.0, 1.0))                       # far in the past
+    w._autofill_poni_after_calibrate(time.time())
+    assert asked == []
+
+    # A .poni written during this calibration is offered, by path.
+    t0 = time.time()
+    fresh = proj / "fresh.poni"
+    fresh.write_text("x")
+    w._autofill_poni_after_calibrate(t0)
+    assert asked and str(fresh) in asked[-1]
+
+    # When several are recent, the newest is the one offered.
+    asked.clear()
+    newest = proj / "newest.poni"
+    newest.write_text("x")
+    os.utime(newest, (time.time() + 5, time.time() + 5))
+    w._autofill_poni_after_calibrate(t0 - 1)
+    assert str(newest) in asked[-1]
 
 
 def test_gi_manual_incidence_reintegrate_uses_numeric_not_motor_name(widget):
@@ -3058,33 +3120,27 @@ def test_hydrate_from_scan_populates_panel_from_saved_settings(widget):
     assert it.ui.radial_high_1D.text() == '7.5'
 
 
-def test_gi_toggle_opens_options_popup(widget):
-    """The GI (Fiber) toggle IS the options control — there is NO separate More
-    button.  Toggling GI on opens the options popup (Motor / Value / Orient /
-    Tilt); toggling it off hides it.  The widgets are the SAME objects
-    (get_gi_config / session / hydrate read them) — just re-parented into the
-    popup — and the header row is just the INTEGRATION title + the GI toggle."""
+def test_gi_detail_widgets_live_in_hidden_holder(widget):
+    """The GI detail fields (Motor / Value / Orient / Tilt) are no longer in a
+    floating popup — the popup was removed in favour of inline Controls Panel V2
+    rows.  The widgets are re-parented into a hidden holder so they stay ALIVE
+    (get_gi_config / session / hydrate read these same objects) and round-trip;
+    there is no popup window and no separate More button."""
     w = widget
     it = w.integratorTree
 
-    # Every GI option lives in the popup window, not inline on the row.
+    # The floating popup is gone; the detail widgets live in a hidden holder.
+    assert getattr(it, 'gi_more_popup', None) is None
+    assert getattr(it.ui, 'gi_more', None) is None
+    holder = it.ui.gi_hidden_holder
+    assert not holder.isVisible()
     for wdg in (it.ui.gi_motor, it.ui.gi_motor_value,
                 it.ui.gi_sample_orientation, it.ui.gi_tilt):
-        assert wdg.window() is it.gi_more_popup
-    assert it.ui.integration_heading.window() is not it.gi_more_popup
-    # No "More" button — the GI toggle drives the popup.
-    assert getattr(it.ui, 'gi_more', None) is None
+        # Re-parented into the hidden holder and kept alive (never destroyed).
+        assert wdg.parent() is holder
 
-    # GI on -> the options popup opens; GI off -> it hides (not left floating).
-    # (Reset first: the widget fixture is module-scoped, so a prior test may have
-    # left GI on — without the reset, setChecked(True) wouldn't emit `toggled`.)
-    it.ui.gi_enable.setChecked(False)
-    it.ui.gi_enable.setChecked(True)
-    assert it.gi_more_popup.isVisible()
-    it.ui.gi_enable.setChecked(False)
-    assert not it.gi_more_popup.isVisible()
-
-    # Motor + Orient + Tilt all round-trip through get_gi_config from the popup.
+    # Motor + Orient + Tilt all still round-trip through get_gi_config — the
+    # widgets are the single source of truth regardless of where they're parented.
     it.ui.gi_enable.setChecked(True)
     it.ui.gi_motor.setCurrentText('Manual')
     it.ui.gi_motor_value.setText('0.3')
@@ -3128,7 +3184,7 @@ def test_run_in_stitch_mode_routes_to_stitch_not_wrangler(widget):
     wr.start()
     assert got['stitch'] == '1d'
     assert got['start'] is False
-    assert w.controls.startButton.text() == 'Run'      # no Pause morph
+    assert w.controls.startButton.text() == '▶ Run'      # no Pause morph
 
 
 def test_build_stitch_params_reads_integrator_args(widget):

@@ -33,10 +33,10 @@ class StaticControls(QtWidgets.QWidget):
     # Idle reads "Run" (the run trigger); the running/paused phases keep the
     # Pause/Resume morph.
     _PHASES = {
-        'idle':    ('Run',      'idle',   True),
-        'running': ('Pause',    'active', True),
-        'pausing': ('Pausing…', 'active', False),
-        'paused':  ('Resume',   'active', True),
+        'idle':    ('▶ Run',      'idle',   True),
+        'running': ('❚❚ Pause',    'active', True),
+        'pausing': ('❚❚ Pausing…', 'active', False),
+        'paused':  ('▶ Resume',   'active', True),
     }
 
     def __init__(self, parent=None):
@@ -109,38 +109,43 @@ class StaticControls(QtWidgets.QWidget):
         row2.setSpacing(6)
         outer.addWidget(self.actionRow)
 
-        # Row order: Run · Stop · Append · Live, filling the row edge-to-edge (no
-        # gap).  The slack splits 12 : 1 : 1 : 1, so Run keeps ~80% (its current
-        # prominent width) while Stop / Append / Live take the remaining ~20%
-        # between them instead of leaving a gap.
-        self.startButton = QtWidgets.QPushButton('Run')
+        # Row order: Live · Run · Stop · Append (Vivek).  Live + Stop are compact
+        # icon buttons (◉ / ■, reduced width); Run (▶) is the wide primary action;
+        # Append/Replace (⇄) is a touch wider for its label.  Symbols carry
+        # tooltips so the icon-only buttons stay discoverable.
+        self.liveButton = QtWidgets.QPushButton('◉')
+        self.liveButton.setObjectName('liveCheckBox')
+        self.liveButton.setCheckable(True)
+        self.liveButton.setToolTip('Live (per-frame display)')
+        self.liveButton.setMaximumWidth(50)
+
         # objectName 'startButton' + the runPhase property are what the dark
-        # theme keys the green/orange Run/Pause styling on.
+        # theme keys the green/orange Run/Pause styling on.  Text comes from
+        # _PHASES (▶ Run / ❚❚ Pause / ▶ Resume) via set_action_phase.
+        self.startButton = QtWidgets.QPushButton('▶ Run')
         self.startButton.setObjectName('startButton')
         self.startButton.setProperty('runPhase', 'idle')
-        row2.addWidget(self.startButton, 12)
 
-        self.stopButton = QtWidgets.QPushButton('Stop')
+        self.stopButton = QtWidgets.QPushButton('■')
         self.stopButton.setObjectName('stopButton')
+        self.stopButton.setToolTip('Stop')
         self.stopButton.setEnabled(False)
-        row2.addWidget(self.stopButton, 1)
+        self.stopButton.setMaximumWidth(50)
 
-        # Output mode (Append vs Replace): a run/output property — it lives with
-        # the run controls now, not in the data wrangler.  A checkable button that
-        # reads its current state; Replace (== writer 'Overwrite') is destructive,
-        # shown next to Run so it's visible at the moment of triggering a run.
-        # Default Append.  The displayed label is 'Append'/'Replace'; the value
-        # string the writer expects stays 'Append'/'Overwrite' (see write_mode).
-        self.writeModeButton = QtWidgets.QPushButton('Append')
+        # Output mode (Append vs Replace): a run/output property.  Checkable;
+        # Replace (== writer 'Overwrite') is destructive.  The displayed label is
+        # 'Append'/'Replace' (+ a ⇄ glyph); the writer value stays
+        # 'Append'/'Overwrite' (see write_mode).
+        self.writeModeButton = QtWidgets.QPushButton('Append ⇄')
         self.writeModeButton.setObjectName('writeModeButton')
         self.writeModeButton.setCheckable(True)
         self.writeModeButton.setChecked(False)            # Append
-        row2.addWidget(self.writeModeButton, 1)
+        self.writeModeButton.setMinimumWidth(96)
 
-        self.liveButton = QtWidgets.QPushButton('Live')
-        self.liveButton.setObjectName('liveCheckBox')
-        self.liveButton.setCheckable(True)
-        row2.addWidget(self.liveButton, 1)
+        row2.addWidget(self.liveButton)          # compact icon, stretch 0
+        row2.addWidget(self.startButton, 6)       # wide primary action
+        row2.addWidget(self.stopButton)          # compact icon, stretch 0
+        row2.addWidget(self.writeModeButton, 2)   # ~20% wider than the icons' share
 
         self._run_phase = 'idle'
 
@@ -188,10 +193,10 @@ class StaticControls(QtWidgets.QWidget):
             self.writeModeButton.blockSignals(True)
             self.writeModeButton.setChecked(checked)
             self.writeModeButton.blockSignals(False)
-        self.writeModeButton.setText('Replace' if checked else 'Append')
+        self.writeModeButton.setText('Replace ⇄' if checked else 'Append ⇄')
 
     def _on_write_mode_toggled(self, checked):
-        self.writeModeButton.setText('Replace' if checked else 'Append')
+        self.writeModeButton.setText('Replace ⇄' if checked else 'Append ⇄')
         self.writeModeChanged.emit(self.write_mode())
 
     # ── run-state gating (self-contained helper) ──

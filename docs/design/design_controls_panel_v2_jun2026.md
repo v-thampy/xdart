@@ -269,14 +269,23 @@ the card panel reaches behavior parity — with the inspector as the escape hatc
 Implement this as a new branch and land it in small, gated commits. The first half is deliberately
 Qt-free or hidden behind a flag; the live visible flip comes only after profile parity is proven.
 
-**Current implementation note (2026-06-28):** the first foundation slice has landed:
+**Current implementation note (2026-06-28):** the foundation slices have landed on
+`feature/controls-panel-v2`:
 `xdart.gui.tabs.static_scan.controls_logic` provides the Qt-free `ControlState →
-ControlProfile` / analysis-launcher gate, and
+ControlProfile` / field-status / analysis-launcher gate,
+`xdart.gui.tabs.static_scan.ui.controls_panel_v2.ControlsPanelV2` renders a visible
+four-section Project / Source / Experiment / Processing scaffold behind
+the `feature/controls-panel-v2` branch's default-on preview
+(`XDART_CONTROLS_PANEL_V2=0` opts out for legacy comparison), and
 `xdart.gui.tabs.static_scan.analysis_context.AnalysisContext` is now the seam used by
 Peak Fit, Phase Fit, and Scan Plot launch. This is intentionally behavior-preserving:
-the visible controls panel is still legacy-backed, and live fitting still follows the
-latest processed frame through the same latest-wins worker. The hidden card-panel scaffold
-and visible flip remain later phases.
+the production controls are still legacy-backed, and live fitting still follows the
+latest processed frame through the same latest-wins worker. The V2 panel is
+observational/action-preview only: it shows source/experiment/processing/output/analysis status and opens
+the existing analysis popups. It also renders hidden producer/inspector action intents for
+Choose Project, Save Folder, Choose Source, Calibrate, Make Mask, Refine, and
+Advanced; the enabled ones route through the existing production hooks and do not yet
+replace legacy processing controls.
 
 ### Phase 0 — doc/API reconcile, no GUI behavior change
 
@@ -306,12 +315,17 @@ and visible flip remain later phases.
 raw-unreachable ROI, missing 1D fit inputs, optional dependency missing, energy conflict, and
 `multigeometry`+corrections conflict.
 
-**Status:** PARTIAL/FOUNDATION IMPLEMENTED. The current module covers `ControlState`,
-`ControlProfile`, source/result/geometry caps, analysis launchers, viewer run suppression,
-and GI Stitch/RSM/xu_hist real-data gates. Detailed `FieldId`/`FieldStatus` provenance rows
-remain Phase 2/4 work, where the actual card renderer needs them.
+**Status:** FOUNDATION IMPLEMENTED. The current module covers `ControlState`,
+`ControlProfile`, `FieldId`, `FieldSpec`, `FieldStatus`, source/result/geometry caps,
+analysis launchers, viewer run suppression, legacy mode-text mapping, and
+GI Stitch/RSM/xu_hist real-data gates. It now also exposes design-level
+`valid_modes`, `backend_required`, and `can_run`/`run_enabled` outputs so the future
+Processing stack can render mode/backend constraints without Qt-side branching. The current
+`FieldStatus` implementation is a
+first-pass status/provenance surface; richer conflict/provenance detail remains Phase 4
+work as the Experiment card becomes authoritative.
 
-### Phase 2 — hidden `ControlsPanelV2` scaffold
+### Phase 2 — visible preview `ControlsPanelV2` scaffold
 
 - Add a hidden/feature-flagged card panel that renders `ControlProfile` but does not yet drive runs.
 - Build reusable widgets:
@@ -322,6 +336,14 @@ remain Phase 2/4 work, where the actual card renderer needs them.
 
 **Tests:** offscreen render tests for card visibility, badge text/classes, disabled tooltips, and
 signal blocking during profile swaps.
+
+**Status:** VISIBLE PREVIEW IMPLEMENTED. `ControlsPanelV2` renders Run Readiness,
+Project, Source, Experiment, Processing, Output, and Analysis cards from `ControlProfile`.
+`staticWidget` mounts it by default on this branch; set `XDART_CONTROLS_PANEL_V2=0`
+to compare against the legacy-only panel. The legacy panel remains the production surface.
+The preview refreshes on wrangler attach, mode changes, new scans,
+display data changes, viewer mode changes, and stitch-mode changes. `MoreButton`,
+`SegmentedControl`, and the real Processing stack remain future phases.
 
 ### Phase 3 — Source card over `ScanSourceWidget`
 
@@ -336,6 +358,12 @@ signal blocking during profile swaps.
 **Tests:** source-kind probes with stale-generation cancellation, natural scan order, raw-reachable
 truth table, grouped scans producing one composite source, no GUI-thread blocking regression for a
 slow fake source.
+
+**Status:** PARTIAL FOUNDATION IMPLEMENTED. `ScanSourceWidget` now has an opt-in async source
+probe path with generation cancellation and stale-result suppression, while preserving the existing
+synchronous default for current callers. This gives the future Source card the needed worker pattern
+without flipping production source selection yet. The V2 panel still delegates "Choose Source" to
+the legacy wrangler browser until ScanSourceWidget is mounted and parity-tested as the active card.
 
 ### Phase 4 — Experiment card and instrument producer tools
 
@@ -352,6 +380,13 @@ slow fake source.
 **Tests:** PONI load hydrates detector+beam; `.nxs` reload marks saved fields; GI toggle changes valid
 processing axes without spurious reintegrate; conflicting energy blocks run; Refine result updates
 diffractometer summary; mask value and mask reachability do not drift.
+
+**Status:** PREVIEW ACTIONS IMPLEMENTED. The hidden V2 panel now exposes typed
+`ControlActionSpec` producer/inspector buttons. Choose Project, Save Folder, and Choose Source
+delegate to the current wrangler browsers; Calibrate and Make Mask click the existing integrator
+buttons; and Advanced opens the current combined advanced integration dialog. Refine is visible but
+disabled with a real-data-gate reason. The Experiment card is still a read-only status preview; the
+legacy panel remains the authoritative editor until field hydration/provenance parity is complete.
 
 ### Phase 5 — Processing stack for Int/Stitch/RSM
 
@@ -391,9 +426,13 @@ the plan during session restore.
 Scan Plot opens from loaded metadata; ROI disabled when raw is unreachable; optional deps missing yields
 friendly message without crashing xdart.
 
-**Status:** PARTIAL/FOUNDATION IMPLEMENTED. `AnalysisContext` exists and existing Peak/Phase/Scan
-Plot entry points use it instead of direct dialog-to-widget internals. The launcher rail,
-tooltip wiring, and future Strain/Texture popups remain future visible UI work.
+**Status:** PARTIAL/PREVIEW IMPLEMENTED. `AnalysisContext` exists and existing Peak/Phase/Scan
+Plot entry points use it instead of direct dialog-to-widget internals. The hidden V2 Analysis
+card renders launcher buttons with disabled reasons, entry-point metadata, required result
+capabilities, optional dependency names, and singleton keys. It opens the existing Peak Fit,
+Phase Fit, Plot Metadata/Scan Plot, and ROI entry points through the tab owner. Future
+Strain/Texture launchers are present but disabled until their headless result contracts and
+real-data gates are ready.
 
 ### Phase 7 — Int 1D/2D migration
 

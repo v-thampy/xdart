@@ -17,6 +17,7 @@ via `CompositeFrameSource`) shows only for stitch/RSM.
 
 import logging
 from dataclasses import dataclass
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -48,14 +49,21 @@ class ScanSourceWidget(QtWidgets.QWidget):
 
     #: emitted with a :class:`ScanSelection` (or ``None`` when cleared/invalid).
     sigSourceChanged = QtCore.Signal(object)
+    #: internal thread-safe completion channel for async source probes.
+    sigProbeDone = QtCore.Signal(object)
 
-    def __init__(self, mode="roi", parent=None):
+    def __init__(self, mode="roi", parent=None, *, async_probe=False):
         super().__init__(parent)
         self._mode = mode
         self._allow_grouping = mode in ("stitch", "rsm")
+        self._async_probe = bool(async_probe)
+        self._probe_generation = 0
+        self._probe_executor = None
+        self._pending_sig = None
         self._candidates = []          # list[SourceSpec] for the Scan selector
         self._last_sig = None          # signature of the last-opened spec (dedupe)
         self._last_selection = None
+        self.sigProbeDone.connect(self._on_probe_done)
         self._build_ui()
 
     # ---- UI -------------------------------------------------------------
@@ -263,6 +271,7 @@ class ScanSourceWidget(QtWidgets.QWidget):
         return [SourceSpec(path, kind)]
 
     def _set_candidates(self, specs):
+        self._cancel_pending_probe()
         self._candidates = list(specs)
         self.scan_combo.blockSignals(True)
         self.scan_combo.clear()
@@ -383,6 +392,7 @@ class ScanSourceWidget(QtWidgets.QWidget):
     def _emit_selection(self):
         spec = self._build_spec()
         if spec is None:
+            self._cancel_pending_probe()
             self._last_sig = self._last_selection = None
             self._set_dot(False)
             self.sigSourceChanged.emit(None)
@@ -393,17 +403,20 @@ class ScanSourceWidget(QtWidgets.QWidget):
             # re-decoding a (possibly multi-MB Eiger) frame.
             self.sigSourceChanged.emit(self._last_selection)
             return
-        from xrd_tools.sources import open_source
-        from .scan_plot_dialog import probe_first_frame
+        if self._async_probe:
+            self._start_async_probe(spec, sig)
+            return
+        self._finish_sync_probe(spec, sig)
+
+    def _finish_sync_probe(self, spec, sig):
         try:
-            source = open_source(spec)
+            source, reachable, first_image = self._open_source_and_probe(spec)
         except Exception:
             logger.exception("scan-source: open_source failed for %s", spec.uri)
             self._last_sig = self._last_selection = None
             self._set_dot(False)
             self.sigSourceChanged.emit(None)
             return
-        reachable, first_image = probe_first_frame(source)
         self._set_dot(reachable)
         selection = ScanSelection(
             spec=spec, source=source, label=self._candidate_label(spec),
@@ -411,10 +424,93 @@ class ScanSourceWidget(QtWidgets.QWidget):
         self._last_sig, self._last_selection = sig, selection
         self.sigSourceChanged.emit(selection)
 
-    def _set_dot(self, reachable):
-        self.raw_dot.setText("● raw" if reachable else "○ no raw")
+    @staticmethod
+    def _open_source_and_probe(spec):
+        from xrd_tools.sources import open_source
+        from .scan_plot_dialog import probe_first_frame
+
+        source = open_source(spec)
+        reachable, first_image = probe_first_frame(source)
+        return source, reachable, first_image
+
+    def _start_async_probe(self, spec, sig):
+        self._probe_generation += 1
+        gen = self._probe_generation
+        self._pending_sig = sig
+        self._set_dot(False, text="probing…")
+        if self._probe_executor is None:
+            self._probe_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="xdart-source-probe",
+            )
+
+        def _work():
+            try:
+                source, reachable, first_image = self._open_source_and_probe(spec)
+                return gen, sig, spec, source, reachable, first_image, None
+            except Exception as exc:  # pragma: no cover - logged in GUI path
+                return gen, sig, spec, None, False, None, exc
+
+        future = self._probe_executor.submit(_work)
+
+        def _emit_done(fut):
+            try:
+                result = fut.result()
+            except CancelledError:
+                return
+            except Exception as exc:  # pragma: no cover - defensive callback guard
+                result = (gen, sig, spec, None, False, None, exc)
+            try:
+                self.sigProbeDone.emit(result)
+            except RuntimeError:
+                # The widget may have been deleted while an off-thread probe was
+                # unwinding.  The generation token already invalidates the work;
+                # this guard prevents a teardown-only warning/crash.
+                return
+
+        future.add_done_callback(_emit_done)
+
+    def _on_probe_done(self, result):
+        gen, sig, spec, source, reachable, first_image, exc = result
+        if gen != self._probe_generation or sig != self._pending_sig:
+            return
+        self._pending_sig = None
+        if exc is not None or source is None:
+            logger.warning(
+                "scan-source: open_source failed for %s",
+                spec.uri,
+                exc_info=(type(exc), exc, exc.__traceback__) if exc is not None else None,
+            )
+            self._last_sig = self._last_selection = None
+            self._set_dot(False)
+            self.sigSourceChanged.emit(None)
+            return
+        self._set_dot(reachable)
+        selection = ScanSelection(
+            spec=spec, source=source, label=self._candidate_label(spec),
+            reachable=reachable, first_image=first_image)
+        self._last_sig, self._last_selection = sig, selection
+        self.sigSourceChanged.emit(selection)
+
+    def _cancel_pending_probe(self):
+        self._probe_generation += 1
+        self._pending_sig = None
+
+    def _set_dot(self, reachable, *, text=None):
+        self.raw_dot.setText(text or ("● raw" if reachable else "○ no raw"))
         self.raw_dot.setStyleSheet(
             "color: #50fa7b;" if reachable else "color: #888;")
+
+    def shutdown_probe_worker(self):
+        executor = self._probe_executor
+        self._probe_executor = None
+        self._cancel_pending_probe()
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def closeEvent(self, event):
+        self.shutdown_probe_worker()
+        super().closeEvent(event)
 
     # ---- public API for consumers --------------------------------------
     def set_uri(self, uri):

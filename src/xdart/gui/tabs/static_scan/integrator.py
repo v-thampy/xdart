@@ -52,9 +52,9 @@ Units_dict = {Units[0]: 'q_A^-1', Units[1]: '2th_deg', Units[2]: 'chi_deg'}
 Units_dict_inv = {'q_A^-1': 0, '2th_deg': 1, 'chi_deg': 2}
 
 GI_MODES_1D = ['q_total', 'q_ip', 'q_oop', 'exit_angle', 'chi_gi']
-GI_LABELS_1D = ["Q", "Q\u1D62\u209A", "Q\u2092\u2092\u209A", "Exit", f"{Chi}GI"]
+GI_LABELS_1D = ["Q", "Qip", "Qoop", "Exit", f"{Chi}GI"]
 GI_MODES_2D = ['qip_qoop', 'q_chi', 'exit_angles']
-GI_LABELS_2D = [u"Q\u1D62\u209A\u2013Q\u2092\u2092\u209A", f"Q-{Chi}", "Exit"]
+GI_LABELS_2D = ["Qip-Qoop", f"Q-{Chi}", "Exit"]
 
 params = [
     {'name': 'Default', 'type': 'group', 'children': [
@@ -126,6 +126,9 @@ class integratorTree(QtWidgets.QWidget):
     # connects it to update_scattering_geometry (sets scan.gi + refreshes the
     # panel), the same handler the wrangler's GI checkbox used to drive.
     sigUpdateGI = QtCore.Signal(bool)
+    # Emitted with the saved mask-file path after Make Mask writes a mask —
+    # staticWidget uses it to auto-populate the Mask File field.
+    sigMaskCreated = QtCore.Signal(str)
 
     def __init__(self, scan, frame, file_lock,
                  frames, frame_ids, data_1d, data_2d, parent=None,
@@ -288,10 +291,10 @@ class integratorTree(QtWidgets.QWidget):
         _gi_lay.addWidget(self.ui.gi_enable)
 
         # Motor (incidence-angle source) + its manual-theta value are CONSTRUCTED
-        # here but live in the "More" popup form (added below), NOT inline on the
-        # row — the header stays just the title + GI toggle.  Every consumer
-        # (get_gi_config / session / hydrate) reads these widget objects, so
-        # their location is display-only.
+        # here but parented into a hidden holder (added below), NOT inline on the
+        # row — the header stays just the title + GI toggle, and Controls Panel V2
+        # renders the editable rows.  Every consumer (get_gi_config / session /
+        # hydrate) reads these widget objects, so their location is display-only.
         self.ui.gi_motor_label = QtWidgets.QLabel('Motor')
         self.ui.gi_motor = QtWidgets.QComboBox()
         self.ui.gi_motor.setObjectName('gi_motor')
@@ -303,11 +306,11 @@ class integratorTree(QtWidgets.QWidget):
         self.ui.gi_motor_value.setObjectName('gi_motor_value')
         self.ui.gi_motor_value.setMaximumWidth(55)
 
-        # Orient + Tilt no longer sit inline on the row — they live in a "More"
-        # popup (below), which keeps the row compact and is the seam for future
-        # GI options (e.g. a tilt motor).  Created here, re-parented into the
-        # popup's form; every consumer (get_gi_config / session / hydrate) reads
-        # these same widget objects, so moving them is display-only.
+        # Orient + Tilt no longer sit inline on the row — they are parented into
+        # the hidden holder (below) and surfaced as editable rows by Controls
+        # Panel V2.  Created here; every consumer (get_gi_config / session /
+        # hydrate) reads these same widget objects, so moving them is
+        # display-only.
         self.ui.gi_orient_label = QtWidgets.QLabel('Orient')
         self.ui.gi_sample_orientation = QtWidgets.QSpinBox()
         self.ui.gi_sample_orientation.setObjectName('gi_sample_orientation')
@@ -321,29 +324,28 @@ class integratorTree(QtWidgets.QWidget):
         self.ui.gi_tilt.setObjectName('gi_tilt')
         self.ui.gi_tilt.setMaximumWidth(70)
 
-        # No separate "More" button: the GI (Fiber) toggle IS the options
-        # control — toggling GI on opens the options popup, toggling it off hides
-        # it (see _on_gi_toggled).  So the header row is just the INTEGRATION
-        # title (left) + the GI (Fiber) toggle (right).
+        # No separate "More" button and no popup: the GI detail fields render
+        # inline in the Controls Panel V2 "Sample & measurement" subsection
+        # (shown only when Grazing is selected).  The header row stays just the
+        # INTEGRATION title (left) + the GI (Fiber) toggle (right).
 
         # GI section sits at the very top of the integrator panel.
         self.ui.verticalLayout.insertWidget(0, self.ui.gi_frame)
 
-        # GI options popup: a floating tool window PARENTED to the integrator so
-        # its lifetime is owned (destroyed with the panel) rather than leaking as
-        # an unparented top-level across mode/window teardown.  Orient + Tilt
-        # today; add future GI options (tilt motor, etc.) as more rows on this
-        # form without touching the compact GI row.
-        self.gi_more_popup = QtWidgets.QWidget(self, QtCore.Qt.Tool)
-        self.gi_more_popup.setObjectName('gi_more_popup')
-        self.gi_more_popup.setWindowTitle('GI Options')
-        _gi_more_form = QtWidgets.QFormLayout(self.gi_more_popup)
-        # Motor (+ its manual-theta value) lead, then Orient + Tilt.
-        _gi_more_form.addRow(self.ui.gi_motor_label, self.ui.gi_motor)
-        _gi_more_form.addRow(self.ui.gi_motor_value_label, self.ui.gi_motor_value)
-        _gi_more_form.addRow(self.ui.gi_orient_label,
-                             self.ui.gi_sample_orientation)
-        _gi_more_form.addRow(self.ui.gi_tilt_label, self.ui.gi_tilt)
+        # The GI detail widgets (motor / value / orient / tilt) are backing
+        # state: get_gi_config / session restore / hydrate read these exact
+        # objects, and the Controls Panel V2 rows write THROUGH to them.  They no
+        # longer live in a floating popup (removed in favour of inline V2 rows) —
+        # keep them ALIVE in a hidden holder so their object identity is
+        # preserved without showing a separate window.
+        self.ui.gi_hidden_holder = QtWidgets.QWidget(self)
+        self.ui.gi_hidden_holder.setObjectName('gi_hidden_holder')
+        self.ui.gi_hidden_holder.hide()
+        _gi_hidden_form = QtWidgets.QFormLayout(self.ui.gi_hidden_holder)
+        _gi_hidden_form.addRow(self.ui.gi_motor_label, self.ui.gi_motor)
+        _gi_hidden_form.addRow(self.ui.gi_motor_value_label, self.ui.gi_motor_value)
+        _gi_hidden_form.addRow(self.ui.gi_orient_label, self.ui.gi_sample_orientation)
+        _gi_hidden_form.addRow(self.ui.gi_tilt_label, self.ui.gi_tilt)
 
         self.ui.gi_enable.toggled.connect(self._on_gi_toggled)
         self.ui.gi_enable.toggled.connect(self._save_to_session)
@@ -351,6 +353,12 @@ class integratorTree(QtWidgets.QWidget):
         self.ui.gi_tilt.textChanged.connect(self._save_to_session)
         self.ui.gi_motor.currentIndexChanged.connect(self._on_gi_motor_changed)
         self.ui.gi_motor.currentIndexChanged.connect(self._save_to_session)
+        # `activated` fires only on an explicit user pick (not programmatic
+        # setCurrentIndex), so it records the user's *deliberate* motor choice —
+        # used to keep a chosen 'Manual' sticky across motor-list repopulation
+        # while the initial default 'Manual' still yields to th/eta (F3).
+        self.ui.gi_motor.activated.connect(self._on_gi_motor_user_pick)
+        self._gi_motor_user_choice = None
         self.ui.gi_motor_value.textChanged.connect(self._save_to_session)
 
         self.setEnabled()
@@ -623,6 +631,10 @@ class integratorTree(QtWidgets.QWidget):
             val = thv if thv is not None else _num
             if val is not None:
                 self.ui.gi_motor_value.setText(str(val))
+            # A saved gi_config that says Manual is a deliberate choice — keep it
+            # sticky so a later metadata/source repopulation doesn't auto-switch
+            # it onto a file motor (F3).
+            self._gi_motor_user_choice = 'Manual'
         else:
             i = self.ui.gi_motor.findText(mot)
             if i < 0:
@@ -630,6 +642,7 @@ class integratorTree(QtWidgets.QWidget):
                 i = self.ui.gi_motor.findText(mot)
             if i >= 0:
                 self.ui.gi_motor.setCurrentIndex(i)
+            self._gi_motor_user_choice = mot
 
     @staticmethod
     def _hydrate_range(rng, low_w, high_w, auto_w):
@@ -1451,8 +1464,9 @@ class integratorTree(QtWidgets.QWidget):
             self.integrator_thread.start()
 
     # Default-select order for the GI incidence motor when the current selection
-    # isn't in the loaded scan's motor list (case-insensitive).
-    _GI_MOTOR_PREFERENCE = ('th', 'theta', 'eta', 'halpha', 'gth', 'gonth')
+    # isn't in the loaded scan's motor list (case-insensitive).  Keep in sync
+    # with image_wrangler._GI_MOTOR_PREFERENCE (the wrangler th_motor default).
+    _GI_MOTOR_PREFERENCE = ('th', 'eta', 'theta', 'gonth', 'halpha')
 
     def set_gi_motor_options(self, motors):
         """Populate the GI motor dropdown from the active wrangler's available
@@ -1465,10 +1479,20 @@ class integratorTree(QtWidgets.QWidget):
         self.ui.gi_motor.blockSignals(True)
         self.ui.gi_motor.clear()
         self.ui.gi_motor.addItems(items)
-        if current in items:
+        # Selection precedence on repopulation:
+        #  1. A DELIBERATE 'Manual' (user-picked or hydrated from a saved
+        #     gi_config) is sticky — keep it so a source/format switch doesn't
+        #     silently swap the user's manual incidence angle for a file motor
+        #     (F3).  The initial *default* 'Manual' is not deliberate, so it
+        #     falls through to the preference order below (auto-select th).
+        #  2. Otherwise keep a still-present real motor the user already has.
+        #  3. Else default by _GI_MOTOR_PREFERENCE, then first motor, then Manual.
+        lower = {m.lower(): m for m in motors}
+        if getattr(self, '_gi_motor_user_choice', None) == 'Manual':
+            target = 'Manual'
+        elif current in motors and current != 'Manual':
             target = current
         else:
-            lower = {m.lower(): m for m in motors}
             target = next((lower[p] for p in self._GI_MOTOR_PREFERENCE
                            if p in lower),
                           motors[0] if motors else 'Manual')
@@ -1479,40 +1503,30 @@ class integratorTree(QtWidgets.QWidget):
         self._update_gi_section_visibility()
         self._save_to_session()
 
+    def _on_gi_motor_user_pick(self, *args):
+        """Record the user's explicit GI motor selection (fires only on a real
+        user activation).  A deliberately-picked 'Manual' becomes sticky across
+        later motor-list repopulations; picking a real motor clears that (F3)."""
+        self._gi_motor_user_choice = str(self.ui.gi_motor.currentText())
+
     def _on_gi_motor_changed(self, *args):
         self._update_gi_section_visibility()
 
-    def _show_gi_more(self):
-        """Open the GI options popup (Orient/Tilt; extensible) — raised + focused."""
-        popup = getattr(self, 'gi_more_popup', None)
-        if popup is None:
-            return
-        popup.show()
-        popup.raise_()
-        popup.activateWindow()
-
     def _update_gi_section_visibility(self):
-        """Keep the GI options popup consistent with GI state.  All GI options
-        live in the popup (there is no inline More button); the manual-theta
-        Value row shows only when the motor is 'Manual', and the popup as a whole
-        is hidden when GI is off, so the field keys on `manual` alone."""
-        on = self.ui.gi_enable.isChecked()
+        """Show the manual-theta Value field only when the motor is 'Manual'.
+
+        The GI detail widgets live in a hidden holder and are surfaced as inline
+        rows by Controls Panel V2, so there is no popup to show/hide here."""
         manual = (self.ui.gi_motor.currentText() == 'Manual')
         self.ui.gi_motor_value_label.setVisible(manual)
         self.ui.gi_motor_value.setVisible(manual)
-        # Don't leave the options popup floating once GI is switched off.
-        popup = getattr(self, 'gi_more_popup', None)
-        if popup is not None and not on:
-            popup.hide()
 
     def _on_gi_toggled(self, checked):
-        """GI on/off — the toggle IS the options control: turning GI on opens the
-        options popup, turning it off hides it.  Also drives scan.gi via the same
+        """GI on/off.  Drives ``scan.gi`` through the same
         ``update_scattering_geometry`` seam the wrangler checkbox used (sets
-        scan.gi + refreshes the panel's axis units/labels)."""
+        scan.gi + refreshes the panel's axis units/labels).  The GI detail fields
+        render inline in Controls Panel V2; there is no popup to open."""
         self._update_gi_section_visibility()
-        if checked:
-            self._show_gi_more()        # toggle on -> reveal the options popup
         scan = getattr(self, 'scan', None)
         if scan is not None:
             scan.gi = bool(checked)
@@ -1808,6 +1822,9 @@ class integratorTree(QtWidgets.QWidget):
         MaskWidgetClass = get_MaskImageWidgetXdart()
         self.mask_window = MaskWidgetClass()
         self.mask_window.setWindowModality(QtCore.Qt.WindowModal)
+        # Re-emit upward so staticWidget can auto-populate the Mask File field
+        # once the user saves + closes the editor.
+        self.mask_window.maskSaved.connect(self.sigMaskCreated)
         self.mask_window.show()
 
         image = fabio.open(processFile).data
@@ -2075,13 +2092,13 @@ class integratorTree(QtWidgets.QWidget):
         self.scan.bai_1d_args['gi_mode_1d'] = mode
         if mode in ('q_ip', 'q_oop'):
             self.ui.unit_1D.hide()
-            self.ui.gi_radial_label_1D.setText(f"IP ({AA_inv})")
+            self.ui.gi_radial_label_1D.setText(f"Qip ({AA_inv})")
             self.ui.gi_radial_label_1D.show()
-            self.ui.label_azim_1D.setText(f"OOP ({AA_inv})")
+            self.ui.label_azim_1D.setText(f"Qoop ({AA_inv})")
             self._set_range_defaults_1d(-10, 10, 0, 5)
         elif mode == 'exit_angle':
             self.ui.unit_1D.hide()
-            self.ui.gi_radial_label_1D.setText(f"IP ({AA_inv})")
+            self.ui.gi_radial_label_1D.setText(f"Qip ({AA_inv})")
             self.ui.gi_radial_label_1D.show()
             self.ui.label_azim_1D.setText(f"Exit ({Deg})")
             self._set_range_defaults_1d(-5, 5, 0, 90)
@@ -2142,9 +2159,9 @@ class integratorTree(QtWidgets.QWidget):
         self.scan.bai_2d_args['gi_mode_2d'] = mode
         if mode == 'qip_qoop':
             self.ui.unit_2D.hide()
-            self.ui.gi_radial_label_2D.setText(f"IP ({AA_inv})")
+            self.ui.gi_radial_label_2D.setText(f"Qip ({AA_inv})")
             self.ui.gi_radial_label_2D.show()
-            self.ui.label_azim_2D.setText(f"OOP ({AA_inv})")
+            self.ui.label_azim_2D.setText(f"Qoop ({AA_inv})")
             self._set_range_defaults_2d(-10, 10, 0, 5)
         elif mode == 'q_chi':
             self.ui.unit_2D.show()
@@ -2157,7 +2174,7 @@ class integratorTree(QtWidgets.QWidget):
                 self._set_range_defaults_2d(0, 5, -180, 180)
         else:  # exit_angles
             self.ui.unit_2D.hide()
-            self.ui.gi_radial_label_2D.setText(f"IP ({AA_inv})")
+            self.ui.gi_radial_label_2D.setText(f"Qip ({AA_inv})")
             self.ui.gi_radial_label_2D.show()
             self._set_range_defaults_2d(-5, 5, 0, 90)
             self.ui.label_azim_2D.setText(f"Exit ({Deg})")

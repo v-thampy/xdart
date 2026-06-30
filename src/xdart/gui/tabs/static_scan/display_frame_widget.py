@@ -3075,9 +3075,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # selected) frame (see _display_ids_for_2d), so the title shows that
         # frame's number -- not the bare name / "[Average]".  Only Sum/Average
         # show the aggregate (handled by the chain below).  single_img scans have
-        # no per-frame index, so they keep the bare-name title.
+        # no per-frame index, so they keep the bare-name title.  An AVERAGED
+        # series also collapses to one frame: it stays frame #1 in the Frames
+        # list, but the title is the bare series name (no "_1") -- handled by the
+        # series_average branch below, so exclude it from this early return.
         method = getattr(self, 'plotMethod', '') or ''
-        if method not in ('Sum', 'Average') and not self.scan.single_img:
+        if (method not in ('Sum', 'Average') and not self.scan.single_img
+                and not getattr(self.scan, 'series_average', False)):
             idxs = getattr(self, 'idxs_2d', None) or getattr(self, 'idxs_1d', None) or []
             if idxs:
                 self.ui.labelCurrent.setText(f'{label}_{idxs[-1]}')
