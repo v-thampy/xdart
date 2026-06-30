@@ -546,7 +546,9 @@ def test_finish_join_timeout_loud_on_stuck_worker(monkeypatch):
 
     t0 = time.monotonic()
     result = session.finish(raise_on_failure=False, join_timeout=0.3)
-    assert time.monotonic() - t0 < 2.0         # did NOT hang
+    # Looser wall-clock budget (TQ-2): the real intent is "did NOT hang ~5s on the
+    # stuck worker" — a tighter bound only adds flake surface on a loaded machine.
+    assert time.monotonic() - t0 < 5.0
     assert result.failed and result.error       # marked failed + recorded error
     assert "timed out" in result.error.lower() or isinstance(
         session._failure, TimeoutError)

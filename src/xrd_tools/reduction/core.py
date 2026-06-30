@@ -1467,6 +1467,14 @@ class ReductionSession:
                 except _ReductionCancelled:
                     self._mark_cancelled()
                     break
+                except BaseException as exc:
+                    # Per-frame integration failure (incl. a loud StrictnessError):
+                    # record + SKIP this frame, never abort the whole chunk — mirror
+                    # the streaming submit path so chunked is symmetric and honours
+                    # "reject per frame, never abort a whole-scan save".  The other
+                    # frames still process; finish() re-raises once (fail-loud).
+                    self._record_failure(exc)
+                    continue
                 pending.append((frame, reduction))
             else:
                 pending.append((
@@ -1503,6 +1511,13 @@ class ReductionSession:
                     self._mark_cancelled()
                     _cancel_pending_futures(pending[pos + 1:], worker=self._worker)
                     break
+                except BaseException as exc:
+                    # Per-frame integration failure (incl. a loud StrictnessError)
+                    # surfacing from the worker future: record + SKIP, never abort
+                    # the chunk — symmetric with the streaming submit path.  The
+                    # outer BaseException handler still covers sink/IO failures.
+                    self._record_failure(exc)
+                    continue
                 idx = int(frame.index)
                 # Re-feeding an already-processed index (reintegrate / replace
                 # re-feed) is a *replace*, not a new completion: overwrite the
