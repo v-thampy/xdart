@@ -5,6 +5,7 @@ ReductionSink interface (the streaming write path)."""
 from __future__ import annotations
 
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import numpy as np
@@ -82,6 +83,18 @@ class _FakeHost:
         for idx, _frame in buf:
             if published_idxs is None or int(idx) in published_idxs:
                 self.xye_written.append(int(idx))
+
+    @contextmanager
+    def _h5pool_bracket(self, scan):
+        # mirrors imageThread._h5pool_bracket — pause/resume the real h5 pool
+        # around the QtNexusSink write (the same path the pre-DRY flush took).
+        from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
+            _get_h5pool)
+        _get_h5pool().pause(scan.data_file)
+        try:
+            yield
+        finally:
+            _get_h5pool().resume(scan.data_file)
 
 
 def _minimal_plan():

@@ -6025,6 +6025,7 @@ def test_batch_process_scan_dispatches_each_frame_as_read():
         initialize_scan=make_scan,
         get_background=lambda *_: 0.0,
         _flush_xye_buffer=lambda *_args, **_kw: None,
+        _save_due=lambda scan, force=False: False,   # frames=0 -> nothing due
     )
 
     def dispatch(scan, pending, *, force_save=False):
@@ -6032,6 +6033,10 @@ def test_batch_process_scan_dispatches_each_frame_as_read():
         return len(pending)
 
     host._dispatch_batch = dispatch
+    # run()'s final-flush tail now always calls flush_serial_tail (the gate is
+    # inside it); bind it + the bracket on the stand-in.
+    host.flush_serial_tail = MethodType(imageThread.flush_serial_tail, host)
+    host._h5pool_bracket = MethodType(imageThread._h5pool_bracket, host)
 
     MethodType(imageThread.process_scan, host)()
 

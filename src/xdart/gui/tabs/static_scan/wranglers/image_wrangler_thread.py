@@ -20,6 +20,7 @@ import numpy as np
 from pathlib import Path
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
@@ -788,18 +789,12 @@ class imageThread(wranglerThread):
                 if (scan is not None
                         and not self.xye_only
                         and self._frames_since_save > 0):
-                    _get_h5pool().pause(scan.data_file)
-                    try:
-                        with self.file_lock:
-                            scan._save_to_nexus()
-                    finally:
-                        _get_h5pool().resume(scan.data_file)
-                    self._flush_xye_buffer(scan)
-                    logger.info(
-                        '[SAVE-ON-SWAP] %d frames flushed for %s',
-                        self._frames_since_save, scan.name,
-                    )
-                    self._frames_since_save = 0
+                    _n_swap = self._frames_since_save     # reset by the tail
+                    if self.flush_serial_tail(scan, force=True):
+                        logger.info(
+                            '[SAVE-ON-SWAP] %d frames flushed for %s',
+                            _n_swap, scan.name,
+                        )
                 scan = self.initialize_scan()
                 self._active_scan = scan      # Pause: serial-flush handle
                 _cached_poni = None
@@ -875,17 +870,10 @@ class imageThread(wranglerThread):
             )
         elif (scan is not None and not self.xye_only
               and self._frames_since_save > 0 and self.command != 'stop'):
-            # Pending was empty but the live-save batcher has unflushed
-            # frames (last batch hit the divisor exactly).  Force a save
-            # before leaving the collect loop.
-            _get_h5pool().pause(scan.data_file)
-            try:
-                with self.file_lock:
-                    scan._save_to_nexus()
-            finally:
-                _get_h5pool().resume(scan.data_file)
-            self._flush_xye_buffer(scan)
-            self._frames_since_save = 0
+            # Pending was empty but the live-save batcher has unflushed frames
+            # (last batch hit the divisor exactly).  Force a save before leaving
+            # the collect loop.
+            self.flush_serial_tail(scan, force=True)
 
         # ── Phase 3: live watching ────────────────────────────────────────────
         if self.live_mode and self.command != 'stop' and scan is not None:
@@ -946,30 +934,13 @@ class imageThread(wranglerThread):
                     # No .nxs save in this mode -- drain the XYE buffer per
                     # frame so output appears as the watch processes files.
                     self._flush_xye_buffer(scan)
-                if self._save_due(scan):
-                    _get_h5pool().pause(scan.data_file)
-                    try:
-                        with self.file_lock:
-                            scan._save_to_nexus()
-                    finally:
-                        _get_h5pool().resume(scan.data_file)
-                    self._flush_xye_buffer(scan)
-                    self._frames_since_save = 0
+                self.flush_serial_tail(scan)
 
         # Final flush on exit (live-watch tail or stop request) so the
         # last few frames aren't lost.
         if scan is not None and self.xye_only:
             self._flush_xye_buffer(scan)
-        if (scan is not None and not self.xye_only
-                and self._frames_since_save > 0):
-            _get_h5pool().pause(scan.data_file)
-            try:
-                with self.file_lock:
-                    scan._save_to_nexus()
-            finally:
-                _get_h5pool().resume(scan.data_file)
-            self._flush_xye_buffer(scan)
-            self._frames_since_save = 0
+        self.flush_serial_tail(scan, force=True)
 
         # In batch mode, emit a single final signal so the GUI can refresh
         if self.batch_mode and files_processed > 0:
@@ -1582,15 +1553,11 @@ class imageThread(wranglerThread):
             elif scan is not None and self._frames_since_save > 0:
                 # Serial path is the active writer (watch loop / serial
                 # dispatch): flush the serial tail.
-                if not self.xye_only:
-                    _get_h5pool().pause(scan.data_file)
-                    try:
-                        with self.file_lock:
-                            scan._save_to_nexus()
-                    finally:
-                        _get_h5pool().resume(scan.data_file)
-                self._flush_xye_buffer(scan)
-                self._frames_since_save = 0
+                if self.xye_only:
+                    self._flush_xye_buffer(scan)      # no .nxs save in xye-only
+                    self._frames_since_save = 0
+                else:
+                    self.flush_serial_tail(scan, force=True)
             elif adapter is not None:
                 # Streaming path (batch / reprocess / live Phase 2): in-flight
                 # window drained (non-terminal — session stays open) + flush
@@ -1605,6 +1572,43 @@ class imageThread(wranglerThread):
             logger.error("error draining/flushing on pause", exc_info=True)
         finally:
             self.sigPaused.emit()
+
+    @contextmanager
+    def _h5pool_bracket(self, scan):
+        """Pause the shared h5 pool around a serial write to ``scan.data_file``,
+        resuming even if the wrapped body raises (the symmetric bracket the .nxs
+        single-writer path needs).  Shared by :meth:`flush_serial_tail` and
+        ``QtNexusSink.flush`` (the streaming write reuses ONLY this bracket,
+        keeping its own ``mode=`` + bookkeeping)."""
+        _get_h5pool().pause(scan.data_file)
+        try:
+            yield
+        finally:
+            _get_h5pool().resume(scan.data_file)
+
+    def flush_serial_tail(self, scan, *, force=False) -> bool:
+        """The serial save tail (the DRYed copy-paste idiom).
+
+        When a save is due (cadence / cap-pressure / ``force``), h5pool-bracket a
+        file-locked ``scan._save_to_nexus()``, drain the XYE buffer, and reset
+        the per-save counter.  Returns ``True`` iff it saved.
+
+        persist-before-evict: ``_save_to_nexus`` marks the written frames
+        persisted BEFORE ``_frames_since_save`` is reset (the counter that gates
+        the next save cycle), so an unsaved frame is never evicted.  ``force=True``
+        respects the per-site ``_frames_since_save > 0`` precondition because
+        ``_save_due(force=True)`` is False on an empty tail.  No-op in xye_only
+        mode (no .nxs target — ``_save_due`` returns False) and for ``scan is
+        None``.
+        """
+        if scan is None or not self._save_due(scan, force=force):
+            return False
+        with self._h5pool_bracket(scan):
+            with self.file_lock:
+                scan._save_to_nexus()
+        self._flush_xye_buffer(scan)
+        self._frames_since_save = 0
+        return True
 
     def _save_due(self, scan, *, force=False):
         """Whether a non-batch v2 save should fire now (persist-before-evict).
@@ -1657,23 +1661,13 @@ class imageThread(wranglerThread):
 
         self._frames_since_save += count
 
-        if self._save_due(scan, force=force_save):
-            _t_save0 = time.time()
-            _get_h5pool().pause(scan.data_file)
-            try:
-                with self.file_lock:
-                    scan._save_to_nexus()
-            finally:
-                _get_h5pool().resume(scan.data_file)
-            _t_save = time.time() - _t_save0
-            _t_xye0 = time.time()
-            self._flush_xye_buffer(scan)
-            _t_xye = time.time() - _t_xye0
+        _n_save = self._frames_since_save        # reset by the tail
+        _t_save0 = time.time()
+        if self.flush_serial_tail(scan, force=force_save):
             logger.info(
-                '[SAVE] %d frames since last save  save=%.3fs  xye=%.3fs',
-                self._frames_since_save, _t_save, _t_xye,
+                '[SAVE] %d frames since last save  flush=%.3fs',
+                _n_save, time.time() - _t_save0,
             )
-            self._frames_since_save = 0
         elif self.xye_only:
             # Int 1D (XYE) on the serial fallback: there is no .nxs save to
             # ride on (_save_due is always False in this mode), so drain the
@@ -2593,8 +2587,7 @@ class imageThread(wranglerThread):
         # the per-batch ``scan._save_to_nexus`` is already gated off for
         # xye_only, so the scan object is used purely in-memory for integration.
         if not self.xye_only:
-            _get_h5pool().pause(scan.data_file)
-            try:
+            with self._h5pool_bracket(scan):
                 with self.file_lock:
                     if write_mode == 'Append':
                         # v2 NeXus loader (the only one we support now).
@@ -2607,8 +2600,6 @@ class imageThread(wranglerThread):
                             scan.save_to_nexus(replace=True)
                     else:
                         scan.save_to_nexus(replace=True)
-            finally:
-                _get_h5pool().resume(scan.data_file)
 
         # Copy integration args (including GI modes) from the main scan.
         scan.bai_1d_args = self.scan.bai_1d_args.copy()
