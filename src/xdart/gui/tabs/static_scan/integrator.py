@@ -6,6 +6,7 @@
 # Standard library imports
 import logging
 import os
+import shlex
 import sys
 import subprocess
 
@@ -1836,14 +1837,19 @@ class integratorTree(QtWidgets.QWidget):
 
         outfile = os.path.splitext(processFile)[0] + "-mask.edf"
         prev_mtime = os.path.getmtime(outfile) if os.path.exists(outfile) else None
-        # Run pyFAI-drawmask as a SUBPROCESS (same pattern as run_pyfai_calib
-        # above).  Embedding silx's MaskImageWidget in xdart's running Qt
-        # process SIGTRAPs on macOS; the standalone tool is rock-solid.
-        try:
-            subprocess.run(['pyFAI-drawmask', processFile], check=False)
-        except FileNotFoundError:
-            logger.error('pyFAI-drawmask not found on PATH')
-            return
+        # Run pyFAI-drawmask as a SUBPROCESS, launched the SAME WAY
+        # run_pyfai_calib launches calib2: shell + piped stdout.  Embedding
+        # silx's MaskImageWidget in xdart's running Qt process SIGTRAPs on
+        # macOS; and a plain list-form subprocess launches but leaves the silx
+        # mask canvas unable to receive mouse events (frozen plot) because the
+        # child shares xdart's controlling-terminal stdout.  Piping stdout (as
+        # calib2 does) detaches it from the TTY and the editor stays fully
+        # interactive.
+        subprocess.run(
+            f'pyFAI-drawmask {shlex.quote(processFile)}',
+            check=False, shell=True,
+            stdout=subprocess.PIPE, universal_newlines=True,
+        )
         # "Save mask and quit" writes <image>-mask.edf -> auto-populate the Mask
         # File field (preserving the old maskSaved behavior).  Guard on mtime so
         # a pre-existing mask the user did NOT re-save does not fire.
