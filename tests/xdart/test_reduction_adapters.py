@@ -1257,6 +1257,28 @@ def test_open_live_reduction_session_retention_policy() -> None:
     assert streaming_no_sink.retain_products is True
 
 
+def test_open_live_scan_session_is_graceful() -> None:
+    """B-1 regression: the GUI streaming live/batch WRITE path
+    (open_live_scan_session -> ScanSession) must run GRACEFUL, not the headless
+    loud default — otherwise a single degraded frame (dead monitor /
+    MissingNormalizationError, or all-dummy 2D / GIAllDummyError) raises mid-stream,
+    re-raises at finish(), and the GUI reports "Save FAILED" + halts, aborting the
+    whole-scan save even though the good frames are persisted.  ScanSession forwards
+    its strict policy to the internal ReductionSession; the adapter must opt into
+    graceful() like its three siblings (reduce_live_frame / reduce_live_frames /
+    open_live_reduction_session)."""
+    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.reduction import StrictPolicy
+
+    frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
+    plan = ReductionPlan(integration_2d=None)
+    sess = open_live_scan_session([frame], plan, scan_name="s")
+    assert sess._session.strict == StrictPolicy.graceful()
+    assert sess._session.strict != StrictPolicy.loud()
+    assert sess._session.strict.missing_normalization is False
+    assert sess._session.strict.gi_all_dummy is False
+
+
 def test_persistent_session_does_not_accumulate_products(monkeypatch) -> None:
     """S2 (serial flavor): the true-live per-frame path reuses ONE chunked
     session for the whole watch run; reduce_live_frames must release each

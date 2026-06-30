@@ -619,6 +619,10 @@ def open_live_scan_session(
         gi_freeze_mode=gi_freeze_mode,
         cancel_token=cancel_token,
         clear_frame_images=True,
+        # GUI never aborts a save (loud is the headless default).  Without this, the
+        # streaming live/batch write path ran loud and a single degraded frame
+        # (dead monitor / all-dummy 2D) aborted the whole-scan save (B-1 regression).
+        strict=StrictPolicy.graceful(),
     )
 
 
