@@ -857,14 +857,26 @@ class StandardPlanCache:
     known-legacy site, but the cache no longer forces that fork.
     """
 
-    __slots__ = ("_plan", "_key", "_mask_obj", "_mask_sig")
+    __slots__ = ("_plan", "_key", "_mask_obj", "_mask_sig", "_plan_builder")
 
-    def __init__(self) -> None:
+    def __init__(self, plan_builder: Any = None) -> None:
         self._plan: ReductionPlan | None = None
         self._key: tuple | None = None
+        self._plan_builder: Any = plan_builder
         # Memoized mask digest, keyed by the mask *object* (see below).
         self._mask_obj: Any = _UNSET
         self._mask_sig: Any = None
+
+    @property
+    def plan_builder(self) -> Any:
+        return self._plan_builder
+
+    @plan_builder.setter
+    def plan_builder(self, builder: Any) -> None:
+        if builder is self._plan_builder:
+            return
+        self._plan_builder = builder
+        self.invalidate()
 
     def _mask_sig_for(self, mask: Any) -> Any:
         """Return the mask digest, recomputing the O(N) part only when the
@@ -892,11 +904,12 @@ class StandardPlanCache:
         integrate_2d: bool = True,
     ) -> ReductionPlan | None:
         mask_sig = self._mask_sig_for(getattr(live_scan, "global_mask", None))
+        builder = self._plan_builder or plan_from_live_scan
         key = _plan_signature(
             live_scan, integrate_1d, integrate_2d, mask_sig=mask_sig,
-        )
+        ) + (id(builder),)
         if self._plan is None or self._key != key:
-            self._plan = plan_from_live_scan(
+            self._plan = builder(
                 live_scan,
                 integrate_1d=integrate_1d,
                 integrate_2d=integrate_2d,

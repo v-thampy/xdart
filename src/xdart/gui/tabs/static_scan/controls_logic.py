@@ -972,6 +972,65 @@ def build_native_int_reduction_plan_from_args(
     )
 
 
+def build_native_int_reduction_plan_from_scan(
+    scan: Any,
+    *,
+    integrate_1d: bool = True,
+    integrate_2d: bool | None = None,
+    threshold_min: Any = None,
+    threshold_max: Any = None,
+    mask_saturation: bool = False,
+):
+    """Build the native Controls V2 Int plan from a live-scan-like object.
+
+    This is the Qt-free run-path form of
+    :func:`build_native_int_reduction_plan_from_args`: it reads only typed scan
+    attributes and ``bai_*_args`` dictionaries, not legacy widgets.
+    """
+
+    if integrate_2d is None:
+        integrate_2d = not bool(getattr(scan, "skip_2d", False))
+
+    gi_config = dict(getattr(scan, "gi_config", {}) or {})
+
+    def _gi_value(name: str, default: Any) -> Any:
+        value = getattr(scan, name, None)
+        if value is None:
+            value = gi_config.get(name, None)
+        return default if value is None else value
+
+    detector_shape = getattr(scan, "detector_shape", None)
+    if detector_shape is not None:
+        try:
+            detector_shape = (int(detector_shape[0]), int(detector_shape[1]))
+        except (TypeError, ValueError, IndexError):
+            detector_shape = None
+    if detector_shape is None:
+        try:
+            first_idx = scan.frames.index[0]
+            first_img = getattr(scan.frames[int(first_idx)], "map_raw", None)
+            detector_shape = getattr(first_img, "shape", None)
+        except Exception:
+            detector_shape = None
+
+    return build_native_int_reduction_plan_from_args(
+        dict(getattr(scan, "bai_1d_args", {}) or {}),
+        dict(getattr(scan, "bai_2d_args", {}) or {}),
+        gi_enabled=bool(getattr(scan, "gi", False)),
+        gi_incident_angle=getattr(scan, "_cached_fiber_integrator_angle", None),
+        incidence_motor=getattr(scan, "incidence_motor", None),
+        tilt_angle=_gi_value("tilt_angle", 0.0),
+        sample_orientation=_gi_value("sample_orientation", 1),
+        integrate_1d=integrate_1d,
+        integrate_2d=bool(integrate_2d),
+        threshold_min=threshold_min,
+        threshold_max=threshold_max,
+        mask_saturation=mask_saturation,
+        detector_mask=getattr(scan, "global_mask", None),
+        detector_shape=detector_shape,
+    )
+
+
 def build_bound_control_state(
     values: Mapping[tuple[str, ...], object] | None = None,
     choices: Mapping[tuple[str, ...], Sequence[object]] | None = None,

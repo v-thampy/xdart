@@ -61,7 +61,7 @@ from .controls_logic import (
     SourceCaps,
     Tool,
     build_control_panel_state,
-    build_native_int_reduction_plan_from_args,
+    build_native_int_reduction_plan_from_scan,
     coerce_control_edit_value,
     tool_from_mode_text,
 )
@@ -1077,13 +1077,6 @@ class staticWidget(QWidget):
         self.integratorTree._apply_gi_config_to_scan()
 
         scan = getattr(self, "scan", None)
-        gi_config = dict(getattr(scan, "gi_config", {}) or {})
-
-        def _gi_value(name, default):
-            value = getattr(scan, name, None)
-            if value is None:
-                value = gi_config.get(name, None)
-            return default if value is None else value
 
         threshold_min = None
         threshold_max = None
@@ -1095,36 +1088,42 @@ class staticWidget(QWidget):
                 threshold_max = cfg.threshold_max
             mask_saturation = bool(cfg.mask_saturation)
 
-        detector_shape = getattr(scan, "detector_shape", None)
-        if detector_shape is not None:
-            try:
-                detector_shape = (int(detector_shape[0]), int(detector_shape[1]))
-            except (TypeError, ValueError, IndexError):
-                detector_shape = None
-        if detector_shape is None:
-            try:
-                first_idx = scan.frames.index[0]
-                first_img = getattr(scan.frames[int(first_idx)], "map_raw", None)
-                detector_shape = getattr(first_img, "shape", None)
-            except Exception:
-                detector_shape = None
-
-        return build_native_int_reduction_plan_from_args(
-            copy.deepcopy(getattr(scan, "bai_1d_args", {}) or {}),
-            copy.deepcopy(getattr(scan, "bai_2d_args", {}) or {}),
-            gi_enabled=bool(getattr(scan, "gi", False)),
-            gi_incident_angle=getattr(scan, "_cached_fiber_integrator_angle", None),
-            incidence_motor=getattr(scan, "incidence_motor", None),
-            tilt_angle=_gi_value("tilt_angle", 0.0),
-            sample_orientation=_gi_value("sample_orientation", 1),
+        return build_native_int_reduction_plan_from_scan(
+            scan,
             integrate_1d=integrate_1d,
             integrate_2d=integrate_2d,
             threshold_min=threshold_min,
             threshold_max=threshold_max,
             mask_saturation=mask_saturation,
-            detector_mask=getattr(scan, "global_mask", None),
-            detector_shape=detector_shape,
         )
+
+    @staticmethod
+    def _controls_v2_native_run_plan_enabled() -> bool:
+        value = os.environ.get("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", "0")
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _controls_v2_native_run_plan_builder(
+        scan,
+        *,
+        integrate_1d: bool = True,
+        integrate_2d: bool = True,
+    ):
+        return build_native_int_reduction_plan_from_scan(
+            scan,
+            integrate_1d=integrate_1d,
+            integrate_2d=integrate_2d,
+        )
+
+    def _configure_controls_v2_native_run_plan(self) -> None:
+        thread = getattr(getattr(self, "wrangler", None), "thread", None)
+        cache = getattr(thread, "_plan_cache", None)
+        if cache is None or not hasattr(cache, "plan_builder"):
+            return
+        if self._controls_v2_enabled() and self._controls_v2_native_run_plan_enabled():
+            cache.plan_builder = self._controls_v2_native_run_plan_builder
+        else:
+            cache.plan_builder = None
 
     def _on_controls_v2_field_changed(self, path, value) -> None:
         self._apply_controls_v2_field_value(path, value)
@@ -3762,6 +3761,7 @@ class staticWidget(QWidget):
         self._apply_controls_v2_run_state()
         self.wrangler.enabled(False)
         self.wrangler.setup()
+        self._configure_controls_v2_native_run_plan()
         self.h5viewer.auto_last = True
 
         # Live (non-batch) runs drive the display from the in-memory

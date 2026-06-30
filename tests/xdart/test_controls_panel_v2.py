@@ -35,6 +35,7 @@ from xdart.gui.tabs.static_scan.controls_logic import (
     build_control_panel_state,
     build_control_profile,
     build_native_int_reduction_plan_from_args,
+    build_native_int_reduction_plan_from_scan,
 )
 from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import (
     ControlsPanelV2,
@@ -1388,6 +1389,86 @@ def test_controls_panel_v2_native_plan_preserves_monitor_parity():
     assert snapshot["mask"]["true_count"] == 2
     assert "normalization_factor" not in snapshot["integration_1d"]["extra"]
     assert "normalization_factor" not in snapshot["integration_2d"]["extra"]
+
+
+def test_controls_panel_v2_native_scan_builder_matches_legacy_plan():
+    from xdart.modules.reduction import plan_from_live_scan
+
+    args_1d = {
+        "unit": "2th_deg",
+        "method": "BBox",
+        "numpoints": 321,
+        "radial_range": (1.0, 4.0),
+        "azimuth_range": (60.0, 120.0),
+        "chi_offset": 90.0,
+        "error_model": "poisson",
+        "polarization_factor": 0.8,
+        "correctSolidAngle": False,
+        "dummy": -2.0,
+        "delta_dummy": 0.1,
+        "safe": False,
+    }
+    args_2d = {
+        "unit": "q_A^-1",
+        "method": "csr",
+        "npt_rad": 77,
+        "npt_azim": 88,
+        "radial_range": (0.5, 5.0),
+        "azimuth_range": (-45.0, 45.0),
+        "chi_offset": 12.0,
+        "error_model": "azimuthal",
+        "polarization_factor": 0.9,
+        "correctSolidAngle": True,
+        "dummy": -3.0,
+        "delta_dummy": 0.2,
+        "safe": True,
+    }
+
+    class FakeFrames:
+        index = []
+
+    class FakeScan:
+        skip_2d = False
+        gi = False
+        global_mask = np.array([1, 4])
+        detector_shape = (2, 3)
+        frames = FakeFrames()
+        bai_1d_args = dict(args_1d)
+        bai_2d_args = dict(args_2d)
+
+    assert _plan_snapshot(build_native_int_reduction_plan_from_scan(
+        FakeScan(), integrate_1d=True, integrate_2d=True
+    )) == _plan_snapshot(plan_from_live_scan(
+        FakeScan(), integrate_1d=True, integrate_2d=True
+    ))
+
+
+def test_controls_panel_v2_native_run_plan_gate_configures_wrangler_cache(
+        qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    monkeypatch.setenv("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        cache = widget.wrangler.thread._plan_cache
+        assert cache.plan_builder is None
+        widget._configure_controls_v2_native_run_plan()
+        assert cache.plan_builder is not None
+        scan = widget.scan
+        scan.skip_2d = False
+        scan.bai_1d_args.update({"numpoints": 123, "unit": "q_A^-1"})
+        scan.bai_2d_args.update({"npt_rad": 45, "npt_azim": 67})
+        assert _plan_snapshot(cache.get(scan)) == _plan_snapshot(
+            build_native_int_reduction_plan_from_scan(scan)
+        )
+
+        monkeypatch.setenv("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", "0")
+        widget._configure_controls_v2_native_run_plan()
+        assert cache.plan_builder is None
+    finally:
+        widget.close()
+        widget.deleteLater()
 
 
 def test_controls_panel_v2_integrator_session_roundtrip_hydrates_visible_rows(
