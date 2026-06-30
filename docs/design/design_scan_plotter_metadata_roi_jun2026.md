@@ -1,5 +1,17 @@
 # Design: unified Scan Plotter (metadata + ROI stats)
 
+> **2026-06-29 — planned split: ROI Statistics gets its OWN Tools button.** The
+> maintainer wants **ROI Statistics surfaced as a separate tool button** in the
+> Tools card (`static_scan_widget._build_tools_card`), distinct from the current
+> **"Plot Metadata"** button — today ROI stats are reached *through* Plot Metadata
+> (the "add a computed column" fold below). This is a **GUI-surface** change only,
+> NOT a re-split of the headless layer: the unified per-frame-table /
+> `ParamTrendMixin` / `BatchAnalysisWorker` machinery stays shared. Likely shape:
+> "Plot Metadata" opens the plotter focused on metadata columns; a new
+> **"ROI Statistics"** button opens the same dialog (or a sibling) focused on the
+> ROI picker + computed ROI columns. Details TBD with the maintainer ("more on that
+> later"). Keep the headless `RoiSpec`/`RoiSignal`/`run_roi_signals` contract intact.
+
 **Status:** PARTIAL / implemented · reconciled 2026-06-27. The Scan Plotter,
 metadata plotting, ROI picker, ROI worker, per-ROI reducers/background operations, and
 source picker are implemented. Optional ROI persistence/live monitor remain deferred.
@@ -74,9 +86,10 @@ The popup is XRD-agnostic: it holds a per-frame table `{frame -> {column: value}
 plots selected columns. Axes:
 
 - **x axis** — a column selector. **Default = the positioner** (the scanned motor).
-  Selectable to **any** column (incl. `frame_index`).
+  Selectable to **any** column (incl. `frame_index`). *(default refined by §10.3.)*
 - **y axis** — a column selector. **Default = intensity** (a sensible default counter /
   the first ROI when ROIs exist). Selectable to **any** column.
+  *(default refined by §10.1–10.2 — counter priority list, never an ROI column.)*
 - **normalization axis** — a third column selector, **default `None`**. When set to any
   column, the plotted y is **y / norm** (per frame). (Display-time; applies to whatever
   y series are shown.)
@@ -214,3 +227,101 @@ The GUI steps, in order:
   batch wiring `_on_batch_clicked(dialog)`).
 - Memory: `planned_features_roi_and_stitching_jun2026`, `keep_xdart_thin`,
   `gui_redesign_direction_a` (the fitting tools + `ParamTrendMixin` + the batch worker).
+
+## 10. Refinement backlog — 2026-06-30 GUI review
+
+Captured from a live GUI pass (reloading `Combi4_Angledependence_samz_4p9_03271002.nxs`).
+These refine the *shipped* Scan Plotter; **items 10.1–10.3 supersede the default-axis
+wording in §3.** Source files:
+`xdart/gui/tabs/static_scan/scan_plot_dialog.py` (the Scan Plot popup),
+`roi_select_dialog.py` (the "Select ROIs" image popup),
+`plot_axes.py` / `param_trend.py` (shared trend plotting),
+`xdart/gui/widgets/image_widget.py` (`ImageWidget` — histogram + log),
+`display_plot.py` (the Int1D/2D display — the styling + log reference).
+
+**STATUS — all of §10 implemented on `feature/geometry` @ `8492b16` (2026-06-30).**
+10.1 resolved: the `ROI1..6` are confirmed real `scan_data` counters (not pre-seeded);
+per the maintainer they stay **listed/selectable**, just **never auto-defaulted**.
+10.4 done as a **graft** (ceiling-safe autoscale + `ColorBarItem` + Default/Log onto the
+existing viewer), NOT a `pgImageWidget` swap — that would have broken the RectROI↔field
+coordinate sync.  10.6 = markers 4→7 / lines 2→3 (tunable).  A 3-lens adversarial review
+caught + fixed one P2 (10.5 right-axis log mislabel).  Visual-only aspects (colorbar
+render, viridis, marker size, the Folder-clip width) need an eyeball pass.
+
+### Axis defaults + column list (refine §3)
+
+**10.1 — ROI columns must not appear (or be defaulted) before they are computed.**
+On launch the y/overlay list shows `ROI1`–`ROI6` and even defaults y to `ROI1`, before
+any ROI has been computed via *Plot ROI*. No ROI-stat column should be offered in the
+x / y / normalize selectors until it has actually been computed, and the default-y
+heuristic must never pick an ROI column. *Open question for implementation:* are the
+`ROI1..6` in the list **pre-seeded ROI slots**, or **`scan_data` counters literally
+named `ROI*`** (beamline detector ROI counters carried in from the file)? If the latter,
+the real defect is the §3 "first ROI when ROIs exist" name-heuristic matching metadata
+columns — fixed anyway by 10.2; the question is only whether such counters should still
+be *plottable* (just not the default). Resolve during implementation; either way nothing
+ROI-named is offered/defaulted pre-compute. (`scan_plot_dialog.py` — column-model
+population + default selection.)
+
+**10.2 — Default y-axis = first present of a fixed counter priority list.**
+On first launch pick y = the first column that exists, in order:
+`Photod`, `bs`, `mon`, `i2`, `i1`, `i0`; if none present → `frame_index`.
+Replaces §3's "a sensible default counter / the first ROI when ROIs exist." Explicitly
+**never** an ROI column (ties to 10.1). Match the file's actual column spelling
+(`scan_data` keys are case-sensitive — confirm `Photod` casing against real data).
+
+**10.3 — Default x-axis = the NeXus positioner (scanned motor) if present, else
+`frame_index`.** §3 already says "default = positioner"; pin it to the positioner
+recorded in the processed `.nxs` (the scanned-motor entry / `NXdata @axes`), with
+`frame_index` as the fallback when no positioner is recorded. (`io/read.py` metadata
+exposes the positioner; `scan_plot_dialog.py` consumes it for the x default.)
+
+### Viewer parity + styling
+
+**10.4 — ROI-selection image viewer = full Image-Viewer controls.** The "Select ROIs"
+popup (`roi_select_dialog.py`) must reuse the same controls as the Image Viewer display
+mode: identical **autoscaling**, the **intensity (histogram) bar**, and the
+**Default / Log** buttons. Today it's a bare image without them. Reuse
+`xdart/gui/widgets/image_widget.py` (`ImageWidget` — histogram + `setLogMode`, ~lines
+221–258) rather than a plain `ImageView`, so ROI picking sees the same levels/log the
+main viewer does.
+
+**10.5 — Log toggle for the 1D Scan Plot.** Add a **Log** button (y-axis log scale) to
+the Scan Plot 1D, matching the Default/Log pattern. Reference:
+`display_plot.py:757–770` (`getAxis("left").setLogMode(True/False)`).
+
+**10.6 — Bigger markers + thicker connecting lines.** Match the marker size and line
+width the Int1D 1D plots use. Scan Plot currently uses `symbolSize=4` with a thin pen
+(`scan_plot_dialog.py:434`); raise to the Int1D values (`display_plot.py:1024`,
+`plot_axes.py:63`, `param_trend.py:131`, and the Int1D `mkPen` width).
+
+**10.7 — Legend font ~50% larger.** Increase the Scan Plot legend font size by ~50%
+(`scan_plot_dialog.py` legend setup — `LegendItem` label text size / per-item style).
+
+### UX
+
+**10.8 — Esc must not close the Plot Metadata windows.** Esc currently dismisses the
+Scan Plot (and the ROI-select) popup via the default `QDialog` Esc→reject. Suppress it
+(override `keyPressEvent` to ignore `Qt.Key_Escape`, or don't route Esc to `reject`) so
+an accidental Esc doesn't discard the assembled table / ROI setup. Applies to both
+`scan_plot_dialog.py` and `roi_select_dialog.py`.
+
+## 11. Source-panel fixes — 2026-06-30 GUI review (round 2)
+
+`scan_source_widget.py`.  **Implemented on `feature/geometry` @ `da22887`.**
+
+**11.1 — A picked single TIFF loaded the WHOLE folder (BUG, fixed).** `_file_candidates`
+turned a picked `.tif` into `SourceSpec(parent_dir, TIFF_SERIES)` with no filter, and
+`TiffSeriesSource.from_directory` globs `*.tif*` — so a folder holding several scans
+(`…_03271002_*` + `…_03271005_*`) was concatenated into one bogus 22-frame series (the
+metadata "from nowhere" + the frame-5→6 discontinuity in the `bs` plot were the two scan
+boundaries).  Fix: filter the glob to the picked file's **scan stem** (name minus a
+trailing `_<frame number>`) via the `pattern` option the registry already forwards to
+`from_directory` — GUI-only, no headless change.  No frame-number suffix → fall back to
+the whole folder.  The kind label now shows the **resolved** kind (`tiff_series`) so it's
+clear one file pulls in the scan's frames.
+
+**11.2 — "Folder" checkbox clipped to "Folde".** Reserve min width (font-metrics based).
+
+**11.3 — Combine the source rows.** The "Raw params" toggle now shares the images/Repoint
+row instead of taking its own (its expandable params still drop below).
