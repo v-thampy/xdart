@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import subprocess
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -1856,21 +1857,21 @@ class integratorTree(QtWidgets.QWidget):
             logger.error('pyFAI-drawmask not found on PATH')
             return
 
-        # Non-blocking watch: when the editor exits, emit sigMaskCreated if it
-        # wrote a fresh <image>-mask.edf (mtime guard so a pre-existing mask the
-        # user did NOT re-save does not fire).  Keep a ref so the timer lives.
-        watch = QtCore.QTimer(self)
-
-        def _drawmask_done():
-            if proc.poll() is None:
+        # Auto-populate the Mask File field when the detached editor closes.  A
+        # daemon waiter blocks on proc.wait() (deterministic — no GUI polling)
+        # then emits sigMaskCreated if a fresh <image>-mask.edf was written
+        # (mtime guard so a pre-existing mask the user did NOT re-save doesn't
+        # fire).  Cross-thread emit is delivered queued onto the GUI thread.
+        def _await_drawmask():
+            try:
+                proc.wait()
+            except Exception:
                 return
-            watch.stop()
             if os.path.exists(outfile) and os.path.getmtime(outfile) != prev_mtime:
                 self.sigMaskCreated.emit(outfile)
 
-        watch.timeout.connect(_drawmask_done)
-        watch.start(500)
-        self._drawmask_watch = watch
+        threading.Thread(target=_await_drawmask, daemon=True,
+                         name='drawmask-waiter').start()
 
         # mask = self.mask_window.getSelectionMask()
         # postProcessId21([processFile], mask)
