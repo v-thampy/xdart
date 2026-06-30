@@ -38,6 +38,8 @@ from xdart.modules.frame_publication import (
     publication_from_live_frame,
     publication_has_2d_errors,
 )
+from xdart.modules.wavelength import normalize_wavelength_m
+from xrd_tools.core.energy import wavelength_m_to_energy_eV
 from .ui.staticUI import Ui_Form
 from .h5viewer import H5Viewer
 from .display_frame_widget import displayFrameWidget
@@ -499,6 +501,7 @@ class staticWidget(QWidget):
         self.controls.stopButton.clicked.connect(self._on_stop_clicked)
         self.controls_v2 = None
         self._controls_v2_last_signature = None
+        self._controls_v2_batch_refresh_deferred = False
         self._controls_v2_refresh_timer = Coalescer(
             250, mode="throttle", parent=self)
         self._controls_v2_refresh_timer.triggered.connect(
@@ -1141,7 +1144,11 @@ class staticWidget(QWidget):
         panel = getattr(self, "controls_v2", None)
         if panel is None:
             return
+        if self._controls_v2_batch_run_active():
+            self._controls_v2_batch_refresh_deferred = True
+            return
         try:
+            self._controls_v2_batch_refresh_deferred = False
             state = self._controls_v2_state()
             values = self._controls_v2_field_values()
             choices = self._controls_v2_field_choices()
@@ -1234,13 +1241,19 @@ class staticWidget(QWidget):
         wrangler = getattr(self, "wrangler", None)
         has_motors = bool(getattr(wrangler, "motors", None)) or has_scan_data
         has_raw = bool(frame_count or source_label)
+        calibration_energy_eV, source_energy_eV = (
+            self._controls_v2_energy_values())
+        energy_known = (
+            calibration_energy_eV is not None
+            or source_energy_eV is not None
+        )
         source_caps = SourceCaps(
             has_frames=frame_count > 0,
             has_raw=has_raw,
             raw_reachable=has_raw,
             has_metadata=has_scan_data or bool(getattr(wrangler, "scan_args", None)),
             has_motors=has_motors,
-            has_energy=self._controls_v2_energy_known(),
+            has_energy=energy_known,
             has_geometry=self._controls_v2_calibrated(),
             has_psi_metadata=has_scan_data,
         )
@@ -1270,7 +1283,9 @@ class staticWidget(QWidget):
         )
         geom = GeomState(
             calibrated=self._controls_v2_calibrated(),
-            energy_known=source_caps.has_energy,
+            energy_known=energy_known,
+            calibration_energy_eV=calibration_energy_eV,
+            source_energy_eV=source_energy_eV,
             gi_enabled=gi_on,
             sample_orientation_known=(
                 not gi_on or bool(gi_cfg.get("sample_orientation"))),
@@ -1331,14 +1346,146 @@ class staticWidget(QWidget):
             return False
 
     def _controls_v2_energy_known(self) -> bool:
+        calibration_energy_eV, source_energy_eV = self._controls_v2_energy_values()
+        return calibration_energy_eV is not None or source_energy_eV is not None
+
+    def _controls_v2_energy_values(self) -> tuple[float | None, float | None]:
+        """Return ``(calibration_energy_eV, source_energy_eV)`` for run gating.
+
+        The calibration wavelength is authoritative.  A persisted 1 Å value can
+        be real, but the historical ``mg_args['wavelength'] == 1e-10``
+        constructor default is only a placeholder and must not satisfy the gate.
+        """
         scan = getattr(self, "scan", None)
-        if getattr(scan, "_persisted_wavelength_m", None) is not None:
-            return True
+        calibration_energy_eV = self._controls_v2_calibration_energy_eV(scan)
+        source_energy_eV = self._controls_v2_source_energy_eV(scan)
+        return calibration_energy_eV, source_energy_eV
+
+    @classmethod
+    def _controls_v2_energy_from_wavelength(
+            cls, value, *, allow_default_sentinel: bool = False
+    ) -> float | None:
+        wavelength_m = normalize_wavelength_m(
+            value,
+            allow_default_sentinel=allow_default_sentinel,
+        )
+        if wavelength_m is None:
+            return None
+        try:
+            energy = float(wavelength_m_to_energy_eV(wavelength_m))
+        except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+            return None
+        return energy if energy > 0 else None
+
+    @classmethod
+    def _controls_v2_calibration_energy_eV(cls, scan) -> float | None:
+        if scan is None:
+            return None
+        persisted = cls._controls_v2_energy_from_wavelength(
+            getattr(scan, "_persisted_wavelength_m", None),
+            allow_default_sentinel=True,
+        )
+        if persisted is not None:
+            return persisted
         integrator = getattr(scan, "_cached_integrator", None)
-        if getattr(integrator, "wavelength", None) is not None:
-            return True
+        from_integrator = cls._controls_v2_energy_from_wavelength(
+            getattr(integrator, "wavelength", None))
+        if from_integrator is not None:
+            return from_integrator
         mg_args = getattr(scan, "mg_args", {}) or {}
-        return mg_args.get("wavelength") not in (None, 1e-10)
+        if isinstance(mg_args, dict):
+            return cls._controls_v2_energy_from_wavelength(
+                mg_args.get("wavelength"))
+        return None
+
+    @staticmethod
+    def _controls_v2_positive_float(value) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if number != number or number <= 0:
+            return None
+        if number in (float("inf"), float("-inf")):
+            return None
+        return number
+
+    @classmethod
+    def _controls_v2_extract_energy_eV(cls, mapping) -> float | None:
+        if not hasattr(mapping, "items"):
+            return None
+        try:
+            lowered = {str(key).lower(): value for key, value in mapping.items()}
+        except Exception:
+            return None
+        for key in (
+            "energy_ev",
+            "energyev",
+            "beam_energy_ev",
+            "source_energy_ev",
+            "calibration_energy_ev",
+        ):
+            energy = cls._controls_v2_positive_float(lowered.get(key))
+            if energy is not None:
+                return energy
+        for key in (
+            "energy_kev",
+            "energykev",
+            "beam_energy_kev",
+            "source_energy_kev",
+        ):
+            energy = cls._controls_v2_positive_float(lowered.get(key))
+            if energy is not None:
+                return energy * 1000.0
+        return None
+
+    @classmethod
+    def _controls_v2_source_energy_eV(cls, scan) -> float | None:
+        if scan is None:
+            return None
+        for attr in (
+            "source_energy_eV",
+            "beam_energy_eV",
+            "energy_eV",
+        ):
+            energy = cls._controls_v2_positive_float(getattr(scan, attr, None))
+            if energy is not None:
+                return energy
+        for attr in ("source_energy_keV", "beam_energy_keV", "energy_keV"):
+            energy = cls._controls_v2_positive_float(getattr(scan, attr, None))
+            if energy is not None:
+                return energy * 1000.0
+        for attr in ("metadata", "meta", "scan_info"):
+            energy = cls._controls_v2_extract_energy_eV(getattr(scan, attr, None))
+            if energy is not None:
+                return energy
+        return None
+
+    def _controls_v2_batch_run_active(self) -> bool:
+        run_active = (
+            bool(getattr(self, "_run_active", False))
+            or self._session_run_active()
+        )
+        if not run_active:
+            return False
+        controls = getattr(self, "controls", None)
+        try:
+            if controls is not None and controls.current_mode() in (
+                    "Image Viewer", "XYE Viewer", "NeXus Viewer"):
+                return False
+        except Exception:
+            pass
+        try:
+            if controls is not None and controls.batchButton.isChecked():
+                return True
+        except Exception:
+            pass
+        wrangler = getattr(self, "wrangler", None)
+        thread = getattr(wrangler, "thread", None)
+        return bool(
+            getattr(wrangler, "batch_mode", False)
+            or getattr(thread, "batch_mode", False)
+        )
 
     @staticmethod
     def _controls_v2_backend(tool) -> str | None:
@@ -2909,6 +3056,11 @@ class staticWidget(QWidget):
             self.controls.startButton.setEnabled(True)
         except Exception:
             logger.debug("re-enable Start on run exit failed", exc_info=True)
+        self._controls_v2_run_frame_count = None
+        self._controls_v2_last_signature = None
+        if getattr(self, "_controls_v2_batch_refresh_deferred", False):
+            self._controls_v2_batch_refresh_deferred = False
+        self._refresh_controls_v2_profile(immediate=True)
 
     def _on_stop_clicked(self):
         """Single owner of the shared Stop button — route to the active run.
