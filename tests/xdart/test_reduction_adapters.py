@@ -535,6 +535,41 @@ def test_standard_plan_cache_can_use_native_builder_override() -> None:
     assert cache.get(scan) is not native
 
 
+def test_standard_plan_cache_prepares_builder_scan_before_fingerprint() -> None:
+    scan = LiveScan(
+        "scan",
+        frames=[LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())],
+        bai_1d_args={"numpoints": 10},
+        bai_2d_args={},
+    )
+    calls = []
+
+    def builder(live_scan, *, integrate_1d=True, integrate_2d=True):
+        calls.append(("build", live_scan.bai_1d_args["numpoints"]))
+        return ReductionPlan(
+            integration_1d=Integration1DPlan(
+                npt=live_scan.bai_1d_args["numpoints"]
+            )
+        )
+
+    def prepare_scan(live_scan):
+        calls.append(("prepare", live_scan.bai_1d_args["numpoints"]))
+        live_scan.bai_1d_args["numpoints"] = 44
+
+    builder.prepare_scan = prepare_scan
+    builder.plan_cache_key = ("snapshot", 44)
+    cache = StandardPlanCache(plan_builder=builder)
+
+    plan = cache.get(scan, integrate_1d=True, integrate_2d=False)
+
+    assert plan.integration_1d.npt == 44
+    assert calls == [("prepare", 10), ("build", 44)]
+
+    scan.bai_1d_args["numpoints"] = 10
+    assert cache.get(scan, integrate_1d=True, integrate_2d=False) is plan
+    assert calls == [("prepare", 10), ("build", 44), ("prepare", 10)]
+
+
 def test_reduce_live_frame_populates_existing_frame(monkeypatch) -> None:
     frame = LiveFrame(
         idx=7,

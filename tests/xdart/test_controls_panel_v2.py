@@ -1492,6 +1492,34 @@ def test_controls_panel_v2_native_run_plan_gate_configures_plan_caches(
         widget.deleteLater()
 
 
+def test_controls_panel_v2_native_plan_builder_is_snapshot_scoped(
+        qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    monkeypatch.delenv("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", raising=False)
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget.scan.bai_1d_args.update({"numpoints": 123, "unit": "q_A^-1"})
+        builder = widget._controls_v2_native_run_plan_builder(
+            widget._controls_v2_native_int_snapshot()
+        )
+        assert getattr(builder, "prepare_scan", None) is not None
+        assert getattr(builder, "plan_cache_key", None) is not None
+        closure_values = [
+            cell.cell_contents for cell in (builder.__closure__ or ())
+        ]
+        prepare_values = [
+            cell.cell_contents
+            for cell in (builder.prepare_scan.__closure__ or ())
+        ]
+        assert widget not in closure_values
+        assert widget not in prepare_values
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
 def test_controls_panel_v2_native_reintegrate_plan_is_authoritative(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")

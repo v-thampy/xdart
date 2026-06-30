@@ -6064,3 +6064,139 @@ def test_batch_single_frame_still_routes_to_streaming_when_live_policy_serial():
 
     assert MethodType(imageThread._dispatch_batch, host)(object(), pending) == 1
     assert calls == [("streaming", (1,))]
+
+
+def test_series_average_pending_tracks_running_mean():
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+
+    host = SimpleNamespace(series_average=True)
+    pending = []
+    entries = [
+        ("scan_0001.tif", 1, np.full((2, 2), 2.0), {"th": "1.0", "tag": "a"}, 4.0, 0.1),
+        ("scan_0002.tif", 2, np.full((2, 2), 4.0), {"th": "3.0", "tag": "b"}, 8.0, 0.2),
+        ("scan_0003.tif", 3, np.full((2, 2), 9.0), {"th": "5.0", "tag": "c"}, 11.0, 0.3),
+    ]
+    count = 0
+
+    for entry in entries:
+        count = imageThread._append_series_average_pending(
+            host, pending, entry, count)
+
+    assert count == 3
+    assert len(pending) == 1
+    img_file, img_number, img_data, img_meta, bg_raw, t_read = pending[0]
+    assert img_file == "scan_0003.tif"
+    assert img_number == 1
+    np.testing.assert_allclose(img_data, np.full((2, 2), 5.0))
+    assert img_meta["th"] == pytest.approx(3.0)
+    assert img_meta["tag"] == "a"
+    assert bg_raw == pytest.approx(23.0 / 3.0)
+    assert t_read == pytest.approx(0.6)
+
+
+def test_streaming_dispatch_series_average_submits_one_mean_frame(monkeypatch):
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+    from xdart.modules.live import LiveScan
+    from xdart.modules.reduction import StandardPlanCache
+    from xrd_tools.reduction import Integration1DPlan, ReductionPlan
+    import xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread as module
+
+    submitted = []
+    opened = []
+    registered = []
+
+    class FakeSession:
+        is_paused = False
+        is_running = True
+
+        def submit(self, frame):
+            submitted.append(frame)
+            return True
+
+        def pause(self, timeout=None):
+            return True
+
+        def flush(self, force=False):
+            pass
+
+        def resume(self):
+            pass
+
+    class FakeSink:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def register(self, live):
+            registered.append(live)
+
+        def unregister(self, idx):
+            pass
+
+    def fake_open(frames, *args, **kwargs):
+        opened.append(list(frames))
+        return FakeSession()
+
+    monkeypatch.setattr(module, "open_live_scan_session", fake_open)
+    monkeypatch.setattr(module, "QtNexusSink", FakeSink)
+
+    scan = LiveScan(
+        "scan",
+        frames=[],
+        static=True,
+        series_average=True,
+        detector_shape=(2, 2),
+    )
+    scan.skip_2d = True
+    scan._cached_integrator = SimpleNamespace(
+        USE_LEGACY_MASK_NORMALIZATION=False)
+    scan.bai_1d_args = {"numpoints": 5}
+    scan.bai_2d_args = {}
+    host = SimpleNamespace(
+        max_cores=1,
+        gi=False,
+        incidence_motor="",
+        sample_orientation=4,
+        tilt_angle=0.0,
+        series_average=True,
+        mask=None,
+        poni=None,
+        command="",
+        batch_mode=True,
+        _plan_cache=StandardPlanCache(
+            plan_builder=lambda _scan, **_kw: ReductionPlan(
+                integration_1d=Integration1DPlan(npt=5)
+            )
+        ),
+        _streaming_session=None,
+        _streaming_sink=None,
+        _streaming_scan_id=None,
+        _scan_session_adapter=None,
+        max_cores_count=1,
+        _cached_gi_incident_angle=None,
+        showLabel=SimpleNamespace(emit=lambda *_: None),
+        _wait_if_paused=lambda: None,
+        _prewarm_frame_mask=lambda _scan, _img: None,
+        _apply_threshold_inline=lambda img: img,
+        _resolve_frame_mask=lambda _scan, _img: None,
+        _gi_freeze_whole_scan_prepass=lambda _scan: True,
+        _cancel_token=lambda: None,
+    )
+    for name in ("_build_batch_frames", "_dispatch_batch_streaming",
+                 "_get_streaming_session"):
+        setattr(host, name, MethodType(getattr(imageThread, name), host))
+
+    pending = [
+        ("scan_0001.tif", 1, np.full((2, 2), 2.0), {"th": "1.0"}, 0.0, 0.1),
+        ("scan_0002.tif", 2, np.full((2, 2), 4.0), {"th": "3.0"}, 0.0, 0.1),
+        ("scan_0003.tif", 3, np.full((2, 2), 9.0), {"th": "5.0"}, 0.0, 0.1),
+    ]
+
+    count = host._dispatch_batch_streaming(scan, pending)
+
+    assert count == 1
+    assert len(opened) == 1
+    assert len(opened[0]) == 1
+    assert len(registered) == 1
+    assert len(submitted) == 1
+    np.testing.assert_allclose(submitted[0].image, np.full((2, 2), 5.0))
+    assert submitted[0].metadata["th"] == pytest.approx(3.0)

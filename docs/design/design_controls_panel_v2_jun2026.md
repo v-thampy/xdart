@@ -718,15 +718,16 @@ Acceptance for the polish pass:
 
 ---
 
-## 14. 2026-06-30 status — V2 Int flip code complete; live re-pass pending
+## 14. 2026-06-30 status — V2 Int flip code complete; live re-pass pending after checkpoint fixes
 
 **Current branch state.** `feature/controls-panel-v2` has merged the latest
 `feature/geometry` fast-forward for the flip chunk. The V2 functional flip is
-code-complete on cp2, but the manual checkpoint found one post-flip regression:
+code-complete on cp2, but the manual checkpoint found two live-path regressions:
 native Reintegrate 1D/2D could diverge from the fresh run plan because the
 reintegrate cache installed the native builder without first reapplying native V2
-Int state to `scan`. That regression is fixed and gated offscreen; the flip is not
-declared fully cleared until the live checkpoint is rerun.
+Int state to `scan`, and `Average Scan` did not collapse streaming reductions to a
+single averaged frame. Both regressions are fixed and gated offscreen; the flip is
+not declared fully cleared until the live checkpoint is rerun.
 
 **What changed in the flip.**
 - The V2-to-legacy Int write-through bridge is retired. Int edits no longer mirror
@@ -748,8 +749,15 @@ declared fully cleared until the live checkpoint is rerun.
 - Reintegrate now shares the same native-apply step as Run, and the installed
   plan-cache builder captures a native snapshot so a stale legacy click cannot
   clobber `scan.bai_*_args` before the plan is built.
+- The native plan-cache builder is snapshot-scoped and does not capture the
+  Controls V2 widget into worker caches. `StandardPlanCache` lets builders prepare
+  the scan before fingerprinting, so the cache key reflects authoritative native
+  state instead of stale legacy scan args.
 - The active-run panel flash fix is included: live/Append/non-viewer runs now defer
   Controls V2 rebuilds while a run is active and flush once at run end.
+- `Average Scan` on the streaming run path now maintains a running mean and submits
+  one averaged frame/result, matching the legacy feeder behavior for image data and
+  numeric metadata.
 
 **Acceptance gates converted.** Offscreen tests now assert native-authoritative
 correctness rather than V2-vs-hidden-widget parity. The core checks are:
@@ -764,19 +772,23 @@ correctness rather than V2-vs-hidden-widget parity. The core checks are:
 - default-on native plan caches are installed for run and reintegrate, with
   `XDART_CONTROLS_V2_NATIVE_RUN_PLAN=0` preserving the fallback;
 - GI default orientation is 4, matching the frame/integrator default.
+- streaming `Average Scan` submits exactly one averaged frame/result for an N-frame
+  source and preserves the mean image/metadata at the reduction boundary.
 
 **Validated in `xrd_test` for this chunk.**
-- `tests/xdart/test_controls_panel_v2.py -q` → 64 passed.
+- `tests/xdart/test_controls_panel_v2.py -q` → 65 passed.
 - `tests/xdart/test_controls_logic.py tests/core/test_v2_record_compat.py -q` → 31 passed.
-- `tests/xdart/test_reduction_adapters.py -q` → 47 passed.
+- `tests/xdart/test_reduction_adapters.py -q` → 48 passed.
+- `tests/xdart/test_live_refresh.py::{series-average/process-scan streaming slice} -q` → 4 passed.
 - `tests/xdart/test_gi_batch_real_data.py -k equivalence -q` → 18 passed, 50 deselected.
 
 **Manual live checkpoint must be rerun.** A human live scan remains the final
 offscreen-impossible gate before declaring the flip integrated on geometry. Rerun
-the checkpoint after this reintegrate fix: real QThread teardown,
-Start/Stop/Append/Live, Reintegrate 1D/2D matching the fresh run, GI mode switch,
-reload, session restore with native-run-plan default-on, and XYE/Image-viewer
-transitions. Bundle this with the pending Phase-4e/4f checkpoint.
+the checkpoint after the reintegrate and Average Scan fixes: real QThread teardown,
+Start/Stop/Append/Live, Average Scan producing one averaged frame/result,
+Reintegrate 1D/2D matching the fresh run, GI mode switch, reload, session restore
+with native-run-plan default-on, and XYE/Image-viewer transitions. Bundle this with
+the pending Phase-4e/4f checkpoint.
 
 **Explicitly post-v2.**
 - Native Stitch/RSM Processing pages.
