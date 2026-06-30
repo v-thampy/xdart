@@ -977,8 +977,11 @@ class staticWidget(QWidget):
         } if scan.gi else {}
         self._controls_v2_apply_gi_config_to_scan()
 
-    def _controls_v2_apply_snapshot_to_scan(self, snapshot: dict, scan=None) -> None:
-        scan = scan if scan is not None else getattr(self, "scan", None)
+    @staticmethod
+    def _controls_v2_apply_native_int_snapshot_to_scan(
+        snapshot: dict,
+        scan,
+    ) -> None:
         if scan is None or not isinstance(snapshot, dict):
             return
         lock = getattr(scan, "scan_lock", None)
@@ -1002,6 +1005,10 @@ class staticWidget(QWidget):
         else:
             with lock:
                 _apply()
+
+    def _controls_v2_apply_snapshot_to_scan(self, snapshot: dict, scan=None) -> None:
+        scan = scan if scan is not None else getattr(self, "scan", None)
+        self._controls_v2_apply_native_int_snapshot_to_scan(snapshot, scan)
 
     def _controls_v2_push_threshold_to_integrator(self) -> None:
         thread = getattr(getattr(self, "integratorTree", None),
@@ -1050,6 +1057,36 @@ class staticWidget(QWidget):
             ),
             "tilt_angle": copy.deepcopy(getattr(scan, "tilt_angle", None)),
         }
+
+    @staticmethod
+    def _controls_v2_native_int_snapshot_key(value):
+        if isinstance(value, dict):
+            return tuple(
+                (str(key), staticWidget._controls_v2_native_int_snapshot_key(val))
+                for key, val in sorted(value.items(), key=lambda item: str(item[0]))
+            )
+        if isinstance(value, (list, tuple)):
+            return tuple(
+                staticWidget._controls_v2_native_int_snapshot_key(val)
+                for val in value
+            )
+        if isinstance(value, set):
+            return tuple(
+                sorted(
+                    staticWidget._controls_v2_native_int_snapshot_key(val)
+                    for val in value
+                )
+            )
+        try:
+            hash(value)
+        except TypeError:
+            tolist = getattr(value, "tolist", None)
+            if callable(tolist):
+                return staticWidget._controls_v2_native_int_snapshot_key(
+                    tolist()
+                )
+            return repr(value)
+        return value
 
     def _controls_v2_scan_int_args(self):
         scan = getattr(self, "scan", None)
@@ -1649,19 +1686,28 @@ class staticWidget(QWidget):
         self,
         snapshot: dict,
     ):
+        snapshot = copy.deepcopy(snapshot or {})
+        snapshot_key = self._controls_v2_native_int_snapshot_key(snapshot)
+        apply_snapshot = type(self)._controls_v2_apply_native_int_snapshot_to_scan
+
+        def _prepare_scan(scan):
+            apply_snapshot(snapshot, scan)
+
         def _builder(
             scan,
             *,
             integrate_1d: bool = True,
             integrate_2d: bool = True,
         ):
-            self._controls_v2_apply_snapshot_to_scan(snapshot, scan)
+            _prepare_scan(scan)
             return build_native_int_reduction_plan_from_scan(
                 scan,
                 integrate_1d=integrate_1d,
                 integrate_2d=integrate_2d,
             )
 
+        _builder.prepare_scan = _prepare_scan
+        _builder.plan_cache_key = ("controls_v2_native_int", snapshot_key)
         return _builder
 
     def _configure_controls_v2_native_run_plan(

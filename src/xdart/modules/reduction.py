@@ -903,11 +903,19 @@ class StandardPlanCache:
         integrate_1d: bool = True,
         integrate_2d: bool = True,
     ) -> ReductionPlan | None:
-        mask_sig = self._mask_sig_for(getattr(live_scan, "global_mask", None))
         builder = self._plan_builder or plan_from_live_scan
+        prepare_scan = getattr(builder, "prepare_scan", None)
+        if callable(prepare_scan):
+            prepare_scan(live_scan)
+        mask_sig = self._mask_sig_for(getattr(live_scan, "global_mask", None))
+        builder_key = getattr(builder, "plan_cache_key", _UNSET)
+        if builder_key is _UNSET:
+            builder_key = id(builder)
+        elif callable(builder_key):
+            builder_key = builder_key()
         key = _plan_signature(
             live_scan, integrate_1d, integrate_2d, mask_sig=mask_sig,
-        ) + (id(builder),)
+        ) + (builder_key,)
         if self._plan is None or self._key != key:
             self._plan = builder(
                 live_scan,

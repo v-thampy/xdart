@@ -708,6 +708,7 @@ class imageThread(wranglerThread):
 
         # ── Phase 1 & 2: collect then process all existing images ─────────────
         pending = []  # [(img_file, img_number, img_data, img_meta, bg_raw)]
+        pending_avg_count = 0
         # Per-flush read-time accumulator.  With the prefetcher this is mostly
         # queue-wait time on the main thread, not raw h5py I/O.
         _t_read_accum = 0.0
@@ -782,6 +783,7 @@ class imageThread(wranglerThread):
                         scan, pending, force_save=True,
                     )
                     pending = []
+                    pending_avg_count = 0
                 # Catch the case where pending was already drained by
                 # the per-iteration dispatch cadence below: the old
                 # scan may have integrated-but-unsaved frames in
@@ -807,7 +809,9 @@ class imageThread(wranglerThread):
                 _cached_poni = self.poni
                 self._cached_gi_incident_angle = None
 
-            if img_number in scan.frames.index:
+            series_average = bool(getattr(self, "series_average", False))
+            output_img_number = 1 if series_average else img_number
+            if output_img_number in scan.frames.index:
                 if self.single_img and not is_eiger:
                     self.sigUpdate.emit(img_number)
                     break
@@ -817,8 +821,13 @@ class imageThread(wranglerThread):
             # Stash the per-frame read time on the tuple so the per-frame
             # TIMING log can show it (otherwise it gets lumped into the
             # batch [FLUSH] line and hides per-frame variance).
-            pending.append((img_file, img_number, img_data, img_meta,
-                            bg_raw, _t_read_this))
+            entry = (img_file, img_number, img_data, img_meta,
+                     bg_raw, _t_read_this)
+            if series_average:
+                pending_avg_count = imageThread._append_series_average_pending(
+                    self, pending, entry, pending_avg_count)
+            else:
+                pending.append(entry)
 
             if self.single_img and not is_eiger:
                 break
@@ -830,7 +839,7 @@ class imageThread(wranglerThread):
             # QtNexusSink/FlushPolicy still batch persistence, and batch remains
             # display-silent until the final sigUpdate(-1).
             flush_size = 1
-            if len(pending) >= flush_size:
+            if pending and len(pending) >= flush_size and not series_average:
                 if self.batch_mode:
                     self.showLabel.emit(
                         f'Integrating {len(pending)} frame(s)...'
@@ -849,6 +858,7 @@ class imageThread(wranglerThread):
                         len(pending), _t_read_accum, _disp_dt,
                     )
                 pending = []
+                pending_avg_count = 0
                 _t_read_accum = 0.0
 
         # Process whatever is left.  force_save=True so any remaining
@@ -858,6 +868,7 @@ class imageThread(wranglerThread):
             files_processed += self._dispatch_batch(
                 scan, pending, force_save=True,
             )
+            pending_avg_count = 0
             _disp_dt = time.time() - _t_disp
             _perf = getattr(self, '_perf', None)
             if _perf is not None:
@@ -948,6 +959,82 @@ class imageThread(wranglerThread):
         logger.info('Total Files Processed: %d', files_processed)
 
     # ── Batch dispatch ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _average_numeric_metadata(current, incoming, old_count, new_count):
+        out = dict(current or {})
+        for key in list(out):
+            try:
+                out[key] = (
+                    float(out[key]) * old_count
+                    + float((incoming or {}).get(key, 0.0))
+                ) / new_count
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    @staticmethod
+    def _average_payload(current, incoming, old_count, new_count):
+        if current is None:
+            return None
+        if incoming is None:
+            return current
+        try:
+            return (
+                np.asarray(current, dtype=float) * old_count
+                + np.asarray(incoming, dtype=float)
+            ) / new_count
+        except (TypeError, ValueError):
+            return current
+
+    @staticmethod
+    def _copy_average_payload(value):
+        if value is None:
+            return None
+        return np.asarray(value, dtype=float).copy()
+
+    def _append_series_average_pending(self, pending, entry, count):
+        """Fold one source frame into the pending Average Scan mean.
+
+        ``pending`` keeps the normal dispatcher tuple shape, but holds exactly
+        one running-mean entry.  This mirrors the old queue feeder without
+        retaining every detector image until the streaming session opens.
+        """
+
+        img_file, _img_number, img_data, img_meta, bg_raw, t_read = entry
+        if count <= 0 or not pending:
+            pending[:] = [(
+                img_file,
+                1,
+                imageThread._copy_average_payload(img_data),
+                dict(img_meta or {}),
+                imageThread._copy_average_payload(bg_raw),
+                float(t_read or 0.0),
+            )]
+            return 1
+
+        old_file, _old_number, old_data, old_meta, old_bg, old_t = pending[0]
+        new_count = count + 1
+        pending[0] = (
+            img_file or old_file,
+            1,
+            imageThread._average_payload(old_data, img_data, count, new_count),
+            imageThread._average_numeric_metadata(
+                old_meta, img_meta, count, new_count),
+            imageThread._average_payload(old_bg, bg_raw, count, new_count),
+            float(old_t or 0.0) + float(t_read or 0.0),
+        )
+        return new_count
+
+    def _series_average_pending(self, pending):
+        if not bool(getattr(self, "series_average", False)) or len(pending) <= 1:
+            return list(pending)
+        averaged = []
+        count = 0
+        for entry in pending:
+            count = imageThread._append_series_average_pending(
+                self, averaged, entry, count)
+        return averaged
 
     def _dispatch_batch(self, scan, pending, *, force_save=False):
         """Process a list of pending images — parallel in batch mode, serial otherwise.
@@ -1687,6 +1774,7 @@ class imageThread(wranglerThread):
         tilt_angle = self.tilt_angle
         series_average = self.series_average
         frames = []
+        pending = imageThread._series_average_pending(self, pending)
         for img_file, img_number, img_data, img_meta, bg_raw, _t_read in pending:
             if self.command == 'stop':
                 break
@@ -1724,6 +1812,7 @@ class imageThread(wranglerThread):
         ``_close_reduction_session`` ``finish()`` drains the writer and does the
         final flush.  Behind the execution flag; chunked is the default.
         """
+        pending = imageThread._series_average_pending(self, pending)
         if getattr(scan, "_cached_integrator", None) is None:
             logger.info('[STREAM] no cached integrator yet — first frame falls '
                         'back to serial (streaming engages from the next frame)')
