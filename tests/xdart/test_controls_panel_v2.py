@@ -32,6 +32,7 @@ from xdart.gui.tabs.static_scan.controls_logic import (
     Tool,
     build_control_panel_state,
     build_control_profile,
+    build_native_int_reduction_plan_from_args,
 )
 from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import (
     ControlsPanelV2,
@@ -1148,6 +1149,63 @@ def test_controls_panel_v2_threshold_edits_match_legacy_plan_overlay(
         legacy_widget.close()
         v2_widget.deleteLater()
         legacy_widget.deleteLater()
+
+
+def test_controls_panel_v2_native_plan_preserves_monitor_parity():
+    from xdart.modules.reduction import plan_from_live_scan
+
+    args_1d = {
+        "unit": "q_A^-1",
+        "method": "csr",
+        "numpoints": 250,
+        "radial_range": (0.2, 4.4),
+        "azimuth_range": (-30.0, 30.0),
+        "monitor": "I0",
+        "normalization_factor": 5.0,
+        "error_model": "poisson",
+        "polarization_factor": 0.95,
+    }
+    args_2d = {
+        "unit": "q_A^-1",
+        "method": "csr",
+        "npt_rad": 80,
+        "npt_azim": 90,
+        "radial_range": (0.1, 5.0),
+        "azimuth_range": (-90.0, 90.0),
+        "chi_offset": 2.5,
+        "monitor": "mon",
+        "normalization_factor": 2.0,
+        "error_model": "azimuthal",
+        "polarization_factor": 0.9,
+    }
+
+    class FakeFrames:
+        index = []
+
+    class FakeScan:
+        skip_2d = False
+        gi = False
+        global_mask = None
+        detector_shape = None
+        frames = FakeFrames()
+        bai_1d_args = dict(args_1d)
+        bai_2d_args = dict(args_2d)
+
+    legacy = plan_from_live_scan(FakeScan(), integrate_2d=True)
+    native = build_native_int_reduction_plan_from_args(
+        args_1d,
+        args_2d,
+        gi_enabled=False,
+        integrate_1d=True,
+        integrate_2d=True,
+    )
+
+    assert _plan_snapshot(native) == _plan_snapshot(legacy)
+    snapshot = _plan_snapshot(native)
+    assert snapshot["integration_1d"]["monitor_key"] == "I0"
+    assert snapshot["integration_2d"]["monitor_key"] == "mon"
+    assert "normalization_factor" not in snapshot["integration_1d"]["extra"]
+    assert "normalization_factor" not in snapshot["integration_2d"]["extra"]
 
 
 def test_controls_panel_v2_integrator_session_roundtrip_hydrates_visible_rows(
