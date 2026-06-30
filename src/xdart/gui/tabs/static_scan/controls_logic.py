@@ -302,21 +302,24 @@ class ControlFormEdit:
 
 @dataclass(frozen=True, slots=True)
 class LegacyWidgetBinding:
-    """One transitional Controls V2 field backed by an integrator widget.
+    """One transitional Controls V2 field backed by the Int carrier.
 
     This is intentionally just metadata: the Qt-free logic decides what should
-    render, while :mod:`static_scan_widget` maps the widget names into the
-    existing legacy backend.  Keeping these bindings in one table prevents the
-    render/read/write/membership lists from drifting during the migration.
+    render, while :mod:`static_scan_widget` maps the widget or ParameterTree
+    names into the existing legacy backend.  Keeping these bindings in one
+    table prevents the render/read/write/membership lists from drifting during
+    the migration.
     """
 
     section: SectionId
     label: str
     path: tuple[str, ...]
     kind: ControlFieldKind
-    widget_name: str
-    value_role: str
+    widget_name: str = ""
+    value_role: str = "text"
     choices_widget: str = ""
+    parameter_group: str = ""
+    parameter_name: str = ""
     tools: frozenset[Tool] = frozenset({Tool.INT_1D, Tool.INT_2D})
     visible_when: str = ""
 
@@ -518,7 +521,61 @@ def _field_enabled_reason(
     ):
         return False, "Enable Threshold to edit this limit."
 
+    if (
+        path in {("Int1D", "polarization_factor"),
+                 ("Int2D", "polarization_factor")}
+        and not _truthy(values.get((path[0], "apply_polarization"), False))
+    ):
+        return False, "Enable Polarization to edit this factor."
+
     return True, ""
+
+
+def _int_advanced_specs(
+    root: str,
+    label_prefix: str,
+    parameter_group: str,
+    tools: frozenset[Tool],
+) -> tuple[LegacyWidgetBinding, ...]:
+    base = dict(
+        section=SectionId.PROCESSING,
+        parameter_group=parameter_group,
+        tools=tools,
+    )
+    return (
+        LegacyWidgetBinding(
+            **base, label=f"{label_prefix} Solid Angle",
+            path=(root, "correctSolidAngle"), kind=ControlFieldKind.BOOL,
+            value_role="checked", parameter_name="correctSolidAngle"),
+        LegacyWidgetBinding(
+            **base, label=f"{label_prefix} Polarization",
+            path=(root, "apply_polarization"), kind=ControlFieldKind.BOOL,
+            value_role="checked", parameter_name="Apply polarization factor"),
+        LegacyWidgetBinding(
+            **base, label=f"{label_prefix} Pol. Factor",
+            path=(root, "polarization_factor"), kind=ControlFieldKind.LINE,
+            value_role="float", parameter_name="polarization_factor"),
+        LegacyWidgetBinding(
+            **base, label=f"{label_prefix} Method",
+            path=(root, "method"), kind=ControlFieldKind.COMBO,
+            value_role="current_text", parameter_name="method"),
+        LegacyWidgetBinding(
+            **base, label=f"{label_prefix} Dummy",
+            path=(root, "dummy"), kind=ControlFieldKind.LINE,
+            value_role="float", parameter_name="dummy"),
+        LegacyWidgetBinding(
+            **base, label=f"{label_prefix} Delta Dummy",
+            path=(root, "delta_dummy"), kind=ControlFieldKind.LINE,
+            value_role="float", parameter_name="delta_dummy"),
+        LegacyWidgetBinding(
+            **base, label=f"{label_prefix} Chi Offset",
+            path=(root, "chi_offset"), kind=ControlFieldKind.LINE,
+            value_role="float", parameter_name="chi_offset"),
+        LegacyWidgetBinding(
+            **base, label=f"{label_prefix} Safe",
+            path=(root, "safe"), kind=ControlFieldKind.BOOL,
+            value_role="checked", parameter_name="safe"),
+    )
 
 
 INTEGRATOR_BACKED_CONTROL_SPECS: tuple[LegacyWidgetBinding, ...] = (
@@ -553,6 +610,10 @@ INTEGRATOR_BACKED_CONTROL_SPECS: tuple[LegacyWidgetBinding, ...] = (
     LegacyWidgetBinding(
         SectionId.PROCESSING, "Mask Saturated", ("MaskSat", "mask_sentinel"),
         ControlFieldKind.BOOL, "mask_saturated", "checked"),
+    LegacyWidgetBinding(
+        SectionId.PROCESSING, "1D Unit", ("Int1D", "unit"),
+        ControlFieldKind.COMBO, "unit_1D", "current_text", "unit_1D",
+        tools=INT_1D_OUTPUT_TOOLS),
     LegacyWidgetBinding(
         SectionId.PROCESSING, "1D Axis", ("Int1D", "axis"),
         ControlFieldKind.COMBO, "axis1D", "current_text", "axis1D",
@@ -589,6 +650,11 @@ INTEGRATOR_BACKED_CONTROL_SPECS: tuple[LegacyWidgetBinding, ...] = (
         SectionId.PROCESSING, "1D Azim High", ("Int1D", "azim_high"),
         ControlFieldKind.LINE, "azim_high_1D", "text",
         tools=INT_1D_OUTPUT_TOOLS),
+    *_int_advanced_specs("Int1D", "1D", "1d", INT_1D_OUTPUT_TOOLS),
+    LegacyWidgetBinding(
+        SectionId.PROCESSING, "2D Unit", ("Int2D", "unit"),
+        ControlFieldKind.COMBO, "unit_2D", "current_text", "unit_2D",
+        tools=INT_2D_OUTPUT_TOOLS),
     LegacyWidgetBinding(
         SectionId.PROCESSING, "2D Axis", ("Int2D", "axis"),
         ControlFieldKind.COMBO, "axis2D", "current_text", "axis2D",
@@ -625,6 +691,7 @@ INTEGRATOR_BACKED_CONTROL_SPECS: tuple[LegacyWidgetBinding, ...] = (
         SectionId.PROCESSING, "2D Azim High", ("Int2D", "azim_high"),
         ControlFieldKind.LINE, "azim_high_2D", "text",
         tools=INT_2D_OUTPUT_TOOLS),
+    *_int_advanced_specs("Int2D", "2D", "2d", INT_2D_OUTPUT_TOOLS),
 )
 
 INTEGRATOR_BACKED_CONTROL_PATHS: tuple[tuple[str, ...], ...] = tuple(

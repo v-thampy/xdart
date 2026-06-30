@@ -757,12 +757,24 @@ class staticWidget(QWidget):
         return choices
 
     def _controls_v2_integrator_values(self):
-        ui = getattr(getattr(self, "integratorTree", None), "ui", None)
-        if ui is None:
+        integrator = getattr(self, "integratorTree", None)
+        ui = getattr(integrator, "ui", None)
+        if integrator is None:
             return {}
 
         values = {}
         for spec in INTEGRATOR_BACKED_CONTROL_SPECS:
+            if spec.parameter_name:
+                param = self._controls_v2_integrator_parameter(spec)
+                if param is None:
+                    continue
+                try:
+                    values[spec.path] = param.value()
+                except Exception:
+                    logger.debug("Controls Panel V2 could not read %s",
+                                 spec.parameter_name, exc_info=True)
+                continue
+
             widget = getattr(ui, spec.widget_name, None)
             if widget is None:
                 continue
@@ -802,8 +814,6 @@ class staticWidget(QWidget):
             try:
                 bai_1d = getattr(scan, "bai_1d_args", {}) or {}
                 bai_2d = getattr(scan, "bai_2d_args", {}) or {}
-                values[("Int1D", "unit")] = bai_1d.get("unit", "q_A^-1")
-                values[("Int2D", "unit")] = bai_2d.get("unit", "q_A^-1")
                 if getattr(scan, "gi", False):
                     values[("Int1D", "gi_mode")] = bai_1d.get(
                         "gi_mode_1d", "q_total")
@@ -826,9 +836,26 @@ class staticWidget(QWidget):
         """
         return widget is not None and not widget.isHidden()
 
+    def _controls_v2_integrator_parameter(self, spec):
+        integrator = getattr(self, "integratorTree", None)
+        if integrator is None or not getattr(spec, "parameter_name", ""):
+            return None
+        tree_name = {
+            "1d": "bai_1d_pars",
+            "2d": "bai_2d_pars",
+        }.get(spec.parameter_group)
+        tree = getattr(integrator, tree_name, None)
+        if tree is None:
+            return None
+        try:
+            return tree.child(spec.parameter_name)
+        except Exception:
+            return None
+
     def _controls_v2_integrator_choices(self):
-        ui = getattr(getattr(self, "integratorTree", None), "ui", None)
-        if ui is None:
+        integrator = getattr(self, "integratorTree", None)
+        ui = getattr(integrator, "ui", None)
+        if integrator is None:
             return {}
 
         def _combo_choices(name):
@@ -840,6 +867,16 @@ class staticWidget(QWidget):
         choices = {}
         for spec in INTEGRATOR_BACKED_CONTROL_SPECS:
             if spec.kind.value != "combo" or not spec.choices_widget:
+                if spec.kind.value == "combo" and spec.parameter_name:
+                    param = self._controls_v2_integrator_parameter(spec)
+                    opts = getattr(param, "opts", {}) or {}
+                    vals = opts.get("limits", None)
+                    if vals is None:
+                        vals = opts.get("values", None)
+                    if isinstance(vals, dict):
+                        choices[spec.path] = tuple(str(v) for v in vals.values())
+                    elif isinstance(vals, (list, tuple, set)):
+                        choices[spec.path] = tuple(str(v) for v in vals)
                 continue
             choices[spec.path] = _combo_choices(spec.choices_widget)
         return {path: vals for path, vals in choices.items() if vals}
@@ -848,8 +885,9 @@ class staticWidget(QWidget):
         path = tuple(path)
         if path not in INTEGRATOR_BACKED_CONTROL_PATHS:
             return False
-        ui = getattr(getattr(self, "integratorTree", None), "ui", None)
-        if ui is None:
+        integrator = getattr(self, "integratorTree", None)
+        ui = getattr(integrator, "ui", None)
+        if integrator is None:
             return True
         spec = next(
             (spec for spec in INTEGRATOR_BACKED_CONTROL_SPECS
@@ -858,8 +896,29 @@ class staticWidget(QWidget):
         )
         if spec is None:
             return True
-        widget = getattr(ui, spec.widget_name, None)
         try:
+            if spec.parameter_name:
+                param = self._controls_v2_integrator_parameter(spec)
+                if param is not None:
+                    current = param.value()
+                    if spec.value_role == "checked":
+                        new_value = bool(
+                            coerce_control_edit_value(current, value)
+                        )
+                    elif spec.value_role == "float":
+                        new_value = float(value)
+                    elif spec.value_role == "current_text":
+                        new_value = str(value)
+                    else:
+                        new_value = coerce_control_edit_value(current, value)
+                    if current != new_value:
+                        param.setValue(new_value)
+                self._sync_controls_v2_integrator_path(path)
+                return True
+
+            if ui is None:
+                return True
+            widget = getattr(ui, spec.widget_name, None)
             if spec.value_role == "current_text":
                 combo = widget
                 if combo is not None:
