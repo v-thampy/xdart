@@ -1,6 +1,7 @@
 """Offscreen tests for the hidden Controls Panel V2 scaffold."""
 
 import os
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -38,6 +39,30 @@ from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import (
     RangeRow,
     SegmentedControl,
 )
+
+
+@pytest.fixture(autouse=True)
+def _controls_panel_session_isolation():
+    """Keep saved integrator state from leaking between tests in this module.
+
+    ``staticWidget.close()`` persists the integrator session, including GI mode.
+    Individual GI tests still reset explicitly before close, but this guard makes
+    the file resilient to test reordering and future tests that forget cleanup.
+    """
+
+    path = os.environ.get("XDART_SESSION_FILE")
+
+    def _unlink_session():
+        if not path:
+            return
+        try:
+            Path(path).unlink()
+        except FileNotFoundError:
+            pass
+
+    _unlink_session()
+    yield
+    _unlink_session()
 
 
 def _find_pill(widget, path):
