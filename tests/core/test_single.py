@@ -141,6 +141,21 @@ def test_integrate_radial_returns_pooled_chi_profile(ai_fixture, synthetic_image
     assert not np.allclose(res.intensity[b2], res2.intensity[b2], rtol=1e-3)
 
 
+def test_integrate_radial_drops_integrate1d_only_kwargs(ai_fixture, synthetic_image):
+    """A 1D-χ reduction carries the full Int arg set, but pyFAI's integrate_radial
+    rejects `safe` / `error_model` / `chi_offset` — they must be dropped, not
+    forwarded (regression: integrate_radial got an unexpected keyword argument
+    'safe' on a non-GI χ-axis integration)."""
+    from xrd_tools.integrate.single import integrate_radial
+    res = integrate_radial(synthetic_image, ai_fixture, npt=180, npt_rad=500,
+                           radial_unit="q_A^-1", radial_range=(0.5, 5.0),
+                           correctSolidAngle=False,
+                           safe=True, error_model="poisson", chi_offset=90.0)
+    assert res.unit == "chi_deg"
+    assert res.radial.shape == (180,)
+    assert np.isfinite(res.intensity).any()
+
+
 @pytest.mark.slow
 def test_integrate_scan_sum(ai_fixture, synthetic_image):
     images = np.stack([synthetic_image] * 3, axis=0)

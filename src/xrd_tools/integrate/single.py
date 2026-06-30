@@ -141,6 +141,16 @@ def integrate_radial(
         extra["polarization_factor"] = polarization_factor
     if normalization_factor is not None:
         extra["normalization_factor"] = normalization_factor
+    # pyFAI's integrate_radial has a NARROWER signature than integrate1d/2d -- it
+    # does NOT accept `safe`, `error_model`, or `chi_offset`.  A 1D-χ reduction
+    # carries the full Int arg set, so forwarding it raises "unexpected keyword
+    # argument" (the offenders that actually reach here are `safe`/`error_model` --
+    # integrate1d accepts those, so the Q-axis never crashed).  chi_offset is
+    # already consumed UPSTREAM by the plan builder (popped -> azimuth_range for 1D,
+    # azimuth_offset for 2D), so dropping it here is a defensive no-op; it stays
+    # applied.  Drop the integrate1d-only kwargs.
+    for _unsupported in ("safe", "error_model", "chi_offset"):
+        extra.pop(_unsupported, None)
     result = ai.integrate_radial(
         image,
         npt,
