@@ -61,6 +61,7 @@ from .controls_logic import (
     SourceCaps,
     Tool,
     build_control_panel_state,
+    build_native_int_reduction_plan_from_args,
     coerce_control_edit_value,
     tool_from_mode_text,
 )
@@ -653,6 +654,7 @@ class staticWidget(QWidget):
         elif action == ControlAction.REINTEGRATE_2D:
             self._controls_v2_click_integrator_button("reintegrate2D")
         elif action == ControlAction.ADVANCED_PROCESSING:
+            self._commit_controls_v2_pending_edits()
             self._show_integration_advanced()
         elif action == ControlAction.REFINE_GEOMETRY:
             QMessageBox.information(
@@ -994,6 +996,76 @@ class staticWidget(QWidget):
         }
         self.wrangler.scan_args = args
         return args
+
+    def _controls_v2_native_reduction_plan(
+        self,
+        *,
+        include_threshold: bool = True,
+        integrate_1d: bool = True,
+        integrate_2d: bool = True,
+        commit_pending: bool = True,
+    ):
+        """Build the dormant native Controls V2 reduction plan.
+
+        Runtime still uses the legacy plan builder.  This seam exists so tests
+        can prove V2's direct plan construction is equivalent before the final
+        carrier retirement.
+        """
+
+        if commit_pending:
+            self._commit_controls_v2_pending_edits()
+        self._sync_controls_v2_integrator_args()
+        self.integratorTree._apply_gi_config_to_scan()
+
+        scan = getattr(self, "scan", None)
+        gi_config = dict(getattr(scan, "gi_config", {}) or {})
+
+        def _gi_value(name, default):
+            value = getattr(scan, name, None)
+            if value is None:
+                value = gi_config.get(name, None)
+            return default if value is None else value
+
+        threshold_min = None
+        threshold_max = None
+        mask_saturation = False
+        if include_threshold:
+            cfg = self.integratorTree.get_threshold_config()
+            if cfg.apply_threshold:
+                threshold_min = cfg.threshold_min
+                threshold_max = cfg.threshold_max
+            mask_saturation = bool(cfg.mask_saturation)
+
+        detector_shape = getattr(scan, "detector_shape", None)
+        if detector_shape is not None:
+            try:
+                detector_shape = (int(detector_shape[0]), int(detector_shape[1]))
+            except (TypeError, ValueError, IndexError):
+                detector_shape = None
+        if detector_shape is None:
+            try:
+                first_idx = scan.frames.index[0]
+                first_img = getattr(scan.frames[int(first_idx)], "map_raw", None)
+                detector_shape = getattr(first_img, "shape", None)
+            except Exception:
+                detector_shape = None
+
+        return build_native_int_reduction_plan_from_args(
+            copy.deepcopy(getattr(scan, "bai_1d_args", {}) or {}),
+            copy.deepcopy(getattr(scan, "bai_2d_args", {}) or {}),
+            gi_enabled=bool(getattr(scan, "gi", False)),
+            gi_incident_angle=getattr(scan, "_cached_fiber_integrator_angle", None),
+            incidence_motor=getattr(scan, "incidence_motor", None),
+            tilt_angle=_gi_value("tilt_angle", 0.0),
+            sample_orientation=_gi_value("sample_orientation", 1),
+            integrate_1d=integrate_1d,
+            integrate_2d=integrate_2d,
+            threshold_min=threshold_min,
+            threshold_max=threshold_max,
+            mask_saturation=mask_saturation,
+            detector_mask=getattr(scan, "global_mask", None),
+            detector_shape=detector_shape,
+        )
 
     def _on_controls_v2_field_changed(self, path, value) -> None:
         self._apply_controls_v2_field_value(path, value)

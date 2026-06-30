@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import math
 from types import MappingProxyType
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 
 class Tool(str, Enum):
@@ -679,6 +679,232 @@ def coerce_control_edit_value(current: object, incoming: object) -> object:
     return incoming
 
 
+_NATIVE_GI_ONLY_ARGS: frozenset[str] = frozenset(
+    {
+        "incident_angle",
+        "incidence_motor",
+        "tilt_angle",
+        "sample_orientation",
+        "method",
+        "mode_1d",
+        "mode_2d",
+        "npt_oop",
+        "gi_mode_1d",
+        "gi_mode_2d",
+        "npt_ip",
+        "x_range",
+        "y_range",
+    }
+)
+
+
+def _native_pop_first(
+    args: dict[str, Any],
+    keys: tuple[str, ...],
+    default: Any,
+) -> Any:
+    for key in keys:
+        if key in args:
+            return args.pop(key)
+    return default
+
+
+def _native_npt_2d(args_2d: dict[str, Any]) -> tuple[int, int]:
+    npt = args_2d.pop("npt", None)
+    if isinstance(npt, (tuple, list)) and len(npt) == 2:
+        return int(npt[0]), int(npt[1])
+    npt_rad = args_2d.pop("npt_rad", None)
+    npt_azim = args_2d.pop("npt_azim", None)
+    if npt_rad is None:
+        npt_rad = npt if npt is not None else 1000
+    if npt_azim is None:
+        npt_azim = 360
+    return int(npt_rad), int(npt_azim)
+
+
+def _native_strip_nonstandard_args(args: dict[str, Any]) -> None:
+    for key in _NATIVE_GI_ONLY_ARGS:
+        args.pop(key, None)
+
+
+def _native_offset_range(
+    value: tuple[float, float] | list[float] | None,
+    offset: float,
+) -> tuple[float, float] | None:
+    if value is None:
+        return None
+    return float(value[0]) - offset, float(value[1]) - offset
+
+
+def _native_gi_1d_unit_default(unit: Any, mode: str, *, is_gi: bool) -> str:
+    if not is_gi:
+        return str(unit or "q_A^-1")
+    if mode == "q_ip":
+        return "qip_A^-1"
+    if mode == "q_oop":
+        return "qoop_A^-1"
+    return str(unit or "q_A^-1")
+
+
+def _native_gi_2d_unit_default(unit: Any, mode: str, *, is_gi: bool) -> str:
+    text = str(unit or "").strip()
+    if not is_gi:
+        return text or "q_A^-1"
+    if mode == "qip_qoop":
+        return text if text.startswith("qip_") else "qip_A^-1"
+    return text or "q_A^-1"
+
+
+def build_native_int_reduction_plan_from_args(
+    bai_1d_args: Mapping[str, Any] | None,
+    bai_2d_args: Mapping[str, Any] | None,
+    *,
+    gi_enabled: bool = False,
+    gi_incident_angle: Any = None,
+    incidence_motor: Any = None,
+    tilt_angle: Any = 0.0,
+    sample_orientation: Any = 1,
+    integrate_1d: bool = True,
+    integrate_2d: bool = True,
+    threshold_min: Any = None,
+    threshold_max: Any = None,
+    mask_saturation: bool = False,
+    detector_mask: Any = None,
+    detector_shape: tuple[int, int] | None = None,
+):
+    """Build the native Controls V2 Int reduction plan.
+
+    This mirrors ``xdart.modules.reduction.plan_from_live_scan`` but takes the
+    already-synced Controls V2 argument dictionaries directly.  It stays in the
+    pure controls layer as the pre-flip equivalence gate; callers still decide
+    when this becomes the production plan source.
+    """
+
+    from xrd_tools.reduction import (  # lazy: preserve controls_logic import purity
+        GIMode,
+        Integration1DPlan,
+        Integration2DPlan,
+        ReductionPlan,
+    )
+    from xdart.modules.reduction import _mask_for_plan  # lazy, Qt-free legacy parity
+
+    args_1d = dict(bai_1d_args or {})
+    args_2d = dict(bai_2d_args or {})
+
+    unit_1d = _native_pop_first(args_1d, ("unit",), "q_A^-1")
+    unit_2d = _native_pop_first(args_2d, ("unit",), "q_A^-1")
+    method_1d = _native_pop_first(args_1d, ("method",), "csr")
+    method_2d = _native_pop_first(args_2d, ("method",), "csr")
+
+    npt_1d = int(_native_pop_first(args_1d, ("npt", "numpoints", "npt_rad"), 1000))
+    npt_rad_1d = int(_native_pop_first(args_1d, ("chi_npt_rad",), 1000))
+    npt_rad_2d, npt_azim_2d = _native_npt_2d(args_2d)
+
+    radial_range_1d = _native_pop_first(args_1d, ("radial_range",), None)
+    azimuth_range_1d = _native_pop_first(args_1d, ("azimuth_range",), None)
+    radial_range_2d = _native_pop_first(args_2d, ("radial_range",), None)
+    azimuth_range_2d = _native_pop_first(args_2d, ("azimuth_range",), None)
+    azimuth_offset_2d = float(
+        _native_pop_first(args_2d, ("azimuth_offset", "chi_offset"), 0.0) or 0.0
+    )
+    chi_offset_1d = float(_native_pop_first(args_1d, ("chi_offset",), 0.0) or 0.0)
+    if chi_offset_1d and not gi_enabled:
+        azimuth_range_1d = _native_offset_range(azimuth_range_1d, chi_offset_1d)
+
+    monitor_1d = _native_pop_first(args_1d, ("monitor",), None)
+    monitor_2d = _native_pop_first(args_2d, ("monitor",), None)
+    error_1d = _native_pop_first(args_1d, ("error_model",), None)
+    error_2d = _native_pop_first(args_2d, ("error_model",), None)
+    pol_1d = _native_pop_first(args_1d, ("polarization_factor",), None)
+    pol_2d = _native_pop_first(args_2d, ("polarization_factor",), None)
+    _native_pop_first(args_1d, ("normalization_factor",), None)
+    _native_pop_first(args_2d, ("normalization_factor",), None)
+
+    gi_mode_1d = str(_native_pop_first(args_1d, ("gi_mode_1d",), "q_total"))
+    gi_mode_2d = str(_native_pop_first(args_2d, ("gi_mode_2d",), "qip_qoop"))
+    npt_oop = _native_pop_first(args_1d, ("npt_oop",), None)
+    if npt_oop is None:
+        npt_oop = _native_pop_first(args_2d, ("npt_oop",), None)
+    gi_method = _native_pop_first(args_1d, ("gi_method_1d",), None)
+    if gi_method is None:
+        gi_method = _native_pop_first(args_2d, ("gi_method_2d",), "no")
+    gi_method = str(gi_method)
+
+    if not gi_enabled:
+        _native_strip_nonstandard_args(args_1d)
+        _native_strip_nonstandard_args(args_2d)
+
+    gi = None
+    if gi_enabled:
+        incident = gi_incident_angle
+        motor = None if incidence_motor is None else str(incidence_motor)
+        if incident is None and motor is not None:
+            try:
+                incident = float(motor)
+                motor = None
+            except (TypeError, ValueError):
+                pass
+        if incident is None and motor is None:
+            raise ValueError(
+                "GI reduction requires an incident angle or incidence motor"
+            )
+        gi = GIMode(
+            incident_angle=incident,
+            incidence_motor=motor,
+            tilt_angle=float(tilt_angle or 0.0),
+            sample_orientation=int(sample_orientation or 1),
+            method=gi_method,
+            mode_1d=gi_mode_1d,
+            mode_2d=gi_mode_2d,
+            npt_oop=None if npt_oop is None else int(npt_oop),
+        )
+
+    integration_1d = None
+    if integrate_1d:
+        integration_1d = Integration1DPlan(
+            npt=npt_1d,
+            npt_rad=npt_rad_1d,
+            unit=_native_gi_1d_unit_default(
+                unit_1d, gi_mode_1d, is_gi=gi_enabled
+            ),
+            method=str(method_1d),
+            radial_range=radial_range_1d,
+            azimuth_range=azimuth_range_1d,
+            monitor_key=monitor_1d,
+            error_model=error_1d,
+            polarization_factor=pol_1d,
+            extra=args_1d,
+        )
+
+    integration_2d = None
+    if integrate_2d:
+        integration_2d = Integration2DPlan(
+            npt_rad=npt_rad_2d,
+            npt_azim=npt_azim_2d,
+            unit=_native_gi_2d_unit_default(
+                unit_2d, gi_mode_2d, is_gi=gi_enabled
+            ),
+            method=str(method_2d),
+            radial_range=radial_range_2d,
+            azimuth_range=azimuth_range_2d,
+            azimuth_offset=azimuth_offset_2d,
+            monitor_key=monitor_2d,
+            error_model=error_2d,
+            polarization_factor=pol_2d,
+            extra=args_2d,
+        )
+
+    return ReductionPlan(
+        integration_1d=integration_1d,
+        integration_2d=integration_2d,
+        gi=gi,
+        mask=_mask_for_plan(detector_mask, detector_shape),
+        threshold_min=threshold_min,
+        threshold_max=threshold_max,
+        mask_saturation=bool(mask_saturation),
+    )
+
+
 def build_bound_control_state(
     values: Mapping[tuple[str, ...], object] | None = None,
     choices: Mapping[tuple[str, ...], Sequence[object]] | None = None,
@@ -965,6 +1191,31 @@ def _energy_status_reason(geom: GeomState, caps: SourceCaps) -> tuple[StatusKind
     )
 
 
+def _processing_backend_status_reason(
+    state: ControlState,
+) -> tuple[StatusKind, str]:
+    """Return the status for the selected processing backend.
+
+    F-1 keeps backend constraints in the same field-status stream as missing
+    inputs.  For now this is intentionally narrow: GI stitching needs the
+    histogram path because the MultiGeometry path has no GI correction support.
+    The broader GI correction stack for Int modes is a later feature, not part
+    of the Panel V2 carrier migration.
+    """
+
+    required = backend_required_for(state)
+    if not state.backend:
+        if required:
+            return StatusKind.MISSING, f"Select backend {required}."
+        return StatusKind.DEFERRED, ""
+    if required and state.backend != required:
+        return (
+            StatusKind.CONFLICT,
+            f"{state.mode.value} {state.tool.value} requires backend {required}.",
+        )
+    return StatusKind.OK, ""
+
+
 def build_field_statuses(state: ControlState) -> Mapping[FieldId, FieldStatus]:
     caps = state.source_caps
     geom = state.geom
@@ -972,6 +1223,7 @@ def build_field_statuses(state: ControlState) -> Mapping[FieldId, FieldStatus]:
     source_label = state.source_label or "No source selected"
     frame_value = str(state.frame_count) if state.frame_count else ""
     energy_status, energy_value, energy_reason = _energy_status_reason(geom, caps)
+    backend_status, backend_reason = _processing_backend_status_reason(state)
     fields = {
         FieldId.PROJECT_ROOT: _field(
             FieldId.PROJECT_ROOT,
@@ -1043,8 +1295,9 @@ def build_field_statuses(state: ControlState) -> Mapping[FieldId, FieldStatus]:
             value=state.processing_mode or state.tool.value),
         FieldId.PROCESSING_BACKEND: _field(
             FieldId.PROCESSING_BACKEND,
-            StatusKind.OK if state.backend else StatusKind.DEFERRED,
-            value=state.backend or "default"),
+            backend_status,
+            value=state.backend or "default",
+            reason=backend_reason),
         FieldId.OUTPUT_SAVE_PATH: _field(
             FieldId.OUTPUT_SAVE_PATH,
             StatusKind.OK if state.save_path else StatusKind.MISSING,
@@ -1400,6 +1653,8 @@ def run_required_fields_for(state: ControlState) -> tuple[FieldId, ...]:
         required.append(FieldId.SAMPLE_ORIENTATION)
     if state.tool == Tool.RSM:
         required.extend((FieldId.SOURCE_MOTORS, FieldId.DIFFRACTOMETER_UB))
+    if backend_required_for(state):
+        required.append(FieldId.PROCESSING_BACKEND)
     return tuple(dict.fromkeys(required))
 
 

@@ -3,7 +3,11 @@
 **Status:** PARTIAL / implemented headless stack · reconciled 2026-06-27. The shared
 `CorrectionStack`, GI correction primitives, stitch/RSM weighting seams, and persistence
 provenance are implemented. Remaining work is real-data GI convention/sign validation and
-GUI surfacing.
+GUI surfacing — **including extending the optional GI corrections (footprint/absorption/Fresnel/
+refraction) to Int 1D/2D** (today wired into Stitch/RSM only; Int applies pyFAI SA+pol alone).
+§3 already specs "Plain Int: SA+pol; GI: add the GI stack"; tracked as a post-v2 follow-up in
+`design_controls_panel_v2_jun2026.md` §12 F-3 (footprint/absorption/Fresnel fold into the Int
+reduction; refraction needs the histogram q-provider path, like GI-Stitch).
 **Why now:** the xu cake/RSM χ-bug surfaced that `I(q, χ)` and RSM voxel intensities are
 load-bearing, not cosmetic (`design_diffractometer_geometry_jun2026.md` §3.5). The *value* in
 each (q, χ) / HKL cell is only meaningful once per-pixel intensity corrections are applied. Our

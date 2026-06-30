@@ -97,6 +97,20 @@ def test_gi_stitch_and_rsm_controls_are_ready_but_blocked_until_gates():
     assert not gi_stitch.run_enabled
     assert "GI stitching awaits real-data gate." in gi_stitch.run_blockers
 
+    gi_stitch_gate_passed_without_backend = build_control_profile(
+        ControlState(
+            tool=Tool.STITCH,
+            mode=MeasMode.GI,
+            real_data_gates=frozenset({"gi_stitch_real_data"}),
+            **common,
+        )
+    )
+    assert not gi_stitch_gate_passed_without_backend.run_enabled
+    assert (
+        "Select backend pyfai_hist."
+        in gi_stitch_gate_passed_without_backend.run_blockers
+    )
+
     rsm = build_control_profile(
         ControlState(tool=Tool.RSM, mode=MeasMode.STANDARD, **common))
     assert rsm.valid_modes == frozenset()
@@ -199,6 +213,51 @@ def test_run_blockers_are_derived_from_required_field_statuses():
         "Set/refine UB matrix before RSM.",
         "RSM GUI awaits real-data gate.",
     )
+
+
+def test_control_profile_blockers_match_field_status_contract():
+    states = [
+        (
+            ControlState(
+                tool=Tool.INT_2D,
+                source_caps=SourceCaps(has_frames=True, has_energy=True),
+                geom=GeomState(
+                    calibrated=True,
+                    energy_known=True,
+                    calibration_energy_eV=12_700.0,
+                    source_energy_eV=13_100.0,
+                ),
+            ),
+            FieldId.BEAM_ENERGY,
+        ),
+        (
+            ControlState(
+                tool=Tool.STITCH,
+                mode=MeasMode.GI,
+                backend="multigeometry",
+                real_data_gates=frozenset({"gi_stitch_real_data"}),
+                source_caps=SourceCaps(has_frames=True, has_energy=True),
+                geom=GeomState(
+                    calibrated=True,
+                    energy_known=True,
+                    gi_enabled=True,
+                    sample_orientation_known=True,
+                ),
+            ),
+            FieldId.PROCESSING_BACKEND,
+        ),
+        (ControlState(tool=Tool.INT_2D), None),
+    ]
+
+    for state, conflict_field in states:
+        fields = build_field_statuses(state)
+        profile = build_control_profile(state)
+
+        assert profile.run_blockers == run_blockers_from_fields(state, fields)
+        if conflict_field is not None:
+            conflict = fields[conflict_field]
+            assert conflict.status == StatusKind.CONFLICT
+            assert conflict.reason in profile.run_blockers
 
 
 def test_control_profile_returns_fields_by_section_in_inventory_order():
