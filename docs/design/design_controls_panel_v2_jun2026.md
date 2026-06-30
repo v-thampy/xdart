@@ -779,7 +779,7 @@ correctness rather than V2-vs-hidden-widget parity. The core checks are:
 - `tests/xdart/test_controls_panel_v2.py -q` → 65 passed.
 - `tests/xdart/test_controls_logic.py tests/core/test_v2_record_compat.py -q` → 31 passed.
 - `tests/xdart/test_reduction_adapters.py -q` → 48 passed.
-- `tests/xdart/test_live_refresh.py::{series-average/process-scan streaming slice} -q` → 4 passed.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_live_refresh.py -q` → 190 passed, 1 skipped.
 - `tests/xdart/test_gi_batch_real_data.py -k equivalence -q` → 18 passed, 50 deselected.
 
 **Manual live checkpoint must be rerun.** A human live scan remains the final

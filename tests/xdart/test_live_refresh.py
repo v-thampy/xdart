@@ -1410,6 +1410,7 @@ def test_live_new_scan_invalidates_publication_store():
         displayframe=SimpleNamespace(set_axes=lambda: None),
         # new_scan refreshes the (optional) Controls Panel v2 profile as a
         # side effect; this host has no v2 panel, so it is a no-op here.
+        _controls_v2_enabled=lambda: False,
         _refresh_controls_v2_profile=lambda *a, **k: None,
         metawidget=SimpleNamespace(update=lambda: None),
     )
@@ -1475,6 +1476,7 @@ def _new_scan_host_with_wrangler_mask(wrangler_mask, initial_global_mask,
         displayframe=SimpleNamespace(set_axes=lambda: None),
         # new_scan refreshes the (optional) Controls Panel v2 profile as a
         # side effect; this host has no v2 panel, so it is a no-op here.
+        _controls_v2_enabled=lambda: False,
         _refresh_controls_v2_profile=lambda *a, **k: None,
         metawidget=SimpleNamespace(update=lambda: None),
     )
