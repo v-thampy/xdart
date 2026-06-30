@@ -144,3 +144,35 @@ def test_strict_gi_all_dummy_graceful_keeps(monkeypatch):
     session.submit(session.scan.frames[0])
     result = session.finish()                          # no raise
     assert result is not None
+
+
+# ── chunked path symmetry (B-2) ──────────────────────────────────────────────
+
+def test_strict_chunked_skips_bad_frame_writes_good_and_raises_at_finish(monkeypatch):
+    """B-2: a loud per-frame degradation in the CHUNKED path is recorded + SKIPPED
+    (the good frames are still written) with the raise DEFERRED to finish() —
+    mirroring the streaming submit path.  Pre-fix, the chunked path caught only
+    _ReductionCancelled, so a StrictnessError aborted the whole chunk and wrote
+    ZERO good frames, violating 'reject per frame, never abort a whole-scan save'."""
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+    real_reduce = reduction_core._reduce_frame
+
+    def _reduce_with_one_dead(frame, *a, **k):
+        if int(frame.index) == 1:                      # frame 1: simulate a loud raise
+            raise MissingNormalizationError("dead monitor (frame 1)")
+        return real_reduce(frame, *a, **k)
+
+    monkeypatch.setattr(reduction_core, "_reduce_frame", _reduce_with_one_dead)
+
+    plan = ReductionPlan(integration_2d=None)
+    sink = MemorySink()
+    session = ReductionSession(
+        plan, Scan("chunked_mix", _frames(3), integrator=object()),
+        sink=sink, execution="chunked")                # serial chunked (no executor)
+    session.process()                                  # must NOT abort the chunk
+    # the good frames are written; the bad one is skipped — NOT a whole-chunk abort:
+    assert set(sink.frames) == {0, 2}
+    # ...and it is still fail-loud, deferred to finish():
+    with pytest.raises(MissingNormalizationError):
+        session.finish()
