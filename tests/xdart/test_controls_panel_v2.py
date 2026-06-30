@@ -1,6 +1,7 @@
 """Offscreen tests for the hidden Controls Panel V2 scaffold."""
 
 import os
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -38,6 +39,30 @@ from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import (
     RangeRow,
     SegmentedControl,
 )
+
+
+@pytest.fixture(autouse=True)
+def _controls_panel_session_isolation():
+    """Keep saved integrator state from leaking between tests in this module.
+
+    ``staticWidget.close()`` persists the integrator session, including GI mode.
+    Individual GI tests still reset explicitly before close, but this guard makes
+    the file resilient to test reordering and future tests that forget cleanup.
+    """
+
+    path = os.environ.get("XDART_SESSION_FILE")
+
+    def _unlink_session():
+        if not path:
+            return
+        try:
+            Path(path).unlink()
+        except FileNotFoundError:
+            pass
+
+    _unlink_session()
+    yield
+    _unlink_session()
 
 
 def _find_pill(widget, path):
@@ -839,7 +864,9 @@ def test_controls_panel_v2_integrator_bridge_uses_binding_table(
             if getattr(ui, spec.widget_name, None) is not None
             if not (
                 spec.visible_when == "widget_visible"
-                and not getattr(ui, spec.widget_name).isVisible()
+                and not widget._controls_v2_integrator_widget_exposed(
+                    getattr(ui, spec.widget_name)
+                )
             )
         }
         assert expected_paths <= set(values)
@@ -853,7 +880,10 @@ def test_controls_panel_v2_integrator_bridge_uses_binding_table(
             source_widget = getattr(ui, spec.widget_name, None)
             if source_widget is None:
                 continue
-            if spec.visible_when == "widget_visible" and not source_widget.isVisible():
+            if (
+                spec.visible_when == "widget_visible"
+                and not widget._controls_v2_integrator_widget_exposed(source_widget)
+            ):
                 continue
             assert widget._set_controls_v2_integrator_field(
                 spec.path,
@@ -862,6 +892,57 @@ def test_controls_panel_v2_integrator_bridge_uses_binding_table(
 
         assert set(synced) == expected_paths
     finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_hidden_legacy_parent_keeps_gi_oop_points(
+        qapp, monkeypatch):
+    """The V2 bridge uses the hidden v1 integrator as a parser.
+
+    ``npts_oop_1D`` is intentionally shown by the legacy GI mode logic, but its
+    parent panel is hidden while V2 owns the surface.  The bridge must key off
+    the child widget's explicit show/hide state so GI fiber OOP points remain
+    visible to V2 and reach the plan for the very next run.
+    """
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        _apply_v2_edits(widget, ((("GI", "Grazing"), True),))
+        qip = _combo_text(
+            widget,
+            "axis1D",
+            lambda text: "ip" in text.lower(),
+            fallback_current=False,
+        )
+        _apply_v2_edits(
+            widget,
+            (
+                (("Int1D", "axis"), qip),
+                (("Int1D", "points"), "234"),
+                (("Int1D", "points_oop"), "345"),
+            ),
+        )
+        widget._refresh_controls_v2_profile_now()
+
+        ui = widget.integratorTree.ui
+        assert widget.ui.integratorFrame.isHidden()
+        assert not ui.npts_oop_1D.isHidden()
+        assert not ui.npts_oop_1D.isVisible()
+
+        values = widget._controls_v2_integrator_values()
+        assert values[("Int1D", "points_oop")] == "345"
+        assert _visible_control_value(widget, ("Int1D", "points_oop")) == "345"
+
+        widget._apply_controls_v2_run_state()
+        snapshot = _current_plan_snapshot(widget, commit_pending=False)
+        assert snapshot["integration_1d"]["npt"] == 234
+        assert snapshot["gi"]["mode_1d"] == "q_ip"
+        assert snapshot["gi"]["npt_oop"] == 345
+    finally:
+        _reset_controls_v2_gi(widget)
         widget.close()
         widget.deleteLater()
 
