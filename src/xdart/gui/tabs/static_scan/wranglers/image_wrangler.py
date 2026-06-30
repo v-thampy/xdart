@@ -152,6 +152,12 @@ params = [
 ctr = 1
 
 
+# Default-select order for the GI incidence motor (case-insensitive); the FIRST
+# that exists in the scan's motor keys wins, else the first available, else
+# Manual.  Keep in sync with integrator._GI_MOTOR_PREFERENCE so the wrangler's
+# th_motor param and the integrator's gi_motor combo auto-pick the same motor.
+_GI_MOTOR_PREFERENCE = ('th', 'eta', 'theta', 'gonth', 'halpha')
+
 
 class imageWrangler(wranglerWidget):
     """Widget for integrating detector image files (TIFF/EDF/CBF/Eiger
@@ -1524,20 +1530,33 @@ class imageWrangler(wranglerWidget):
                 # Auto-detect metadata sidecar if not set
                 if not self.meta_ext:
                     self.detect_meta_ext(fname)
+            else:
+                # No seed yet (e.g. the Source just switched to Image Directory
+                # and no directory is chosen): drop the previous source's file
+                # so the motor/parameter reset below fires and the GI Theta Motor
+                # dropdown doesn't keep the old file's columns.
+                self.img_file = ''
 
         if ((self.img_file != old_fname)
                 or (self.img_file and (len(self.scan_parameters) < 1))):
             if (self.meta_ext and self.img_file
                     and self.exists_meta_file(self.img_file)):
                 self.set_pars_from_meta()
-            elif self.img_file:
-                # New signal file with no sidecar metadata (e.g. Eiger):
-                # clear the previous file's stale motor/parameter options and
-                # default the GI Theta Motor to Manual (no 'th' to read), so
-                # the incidence angle can be entered directly.
+            else:
+                # No sidecar metadata (e.g. Eiger) OR no file resolved yet (the
+                # source just switched, nothing chosen): clear the previous
+                # source's stale motor/parameter options and default the GI Theta
+                # Motor to Manual, so the incidence angle can be entered directly.
                 self.scan_parameters = []
                 self.motors = []
+                self.counters = []
                 self.set_gi_motor_options()
+                # Refresh the BG Match + norm-channel dropdowns too, so they don't
+                # keep the previous format's columns after a format/source switch
+                # (F4 — mirror set_pars_from_meta's option refresh on the clear
+                # side; with the lists empty both collapse to just 'None').
+                self.set_bg_matching_options()
+                self.set_bg_norm_options()
 
     def set_series_average(self):
         self.series_average = self.parameters.child('Signal').child('series_average').value()
@@ -1552,6 +1571,12 @@ class imageWrangler(wranglerWidget):
         is_spec = (self.meta_ext == 'SPEC')
         self.parameters.child('Signal').child('meta_dir').show(is_spec)
         self._save_to_session()
+        # The metadata FORMAT changed: drop the previous format's parsed
+        # parameters so get_img_fname re-resolves the metadata (and the GI motor
+        # list) for the SAME file under the new format.  Without this, its
+        # "img_file unchanged" guard would keep the old format's motors (e.g.
+        # switching txt -> pdi when there is no .pdi sidecar should clear them).
+        self.scan_parameters = []
         self.get_img_fname()
 
     def set_meta_dir(self):
@@ -1819,17 +1844,12 @@ class imageWrangler(wranglerWidget):
         metadata — Manual is the default, since there's no ``th`` to read.
         """
         pars = [p for p in self.motors if not any(x.lower() in p.lower() for x in ['ROI', 'PD'])]
-        if 'th' in pars:
-            pars.insert(0, pars.pop(pars.index('th')))
-            value = 'th'
-        elif 'theta' in pars:
-            pars.insert(0, pars.pop(pars.index('theta')))
-            value = 'theta'
-        elif pars:
-            value = pars[0]
-        else:
-            # No motors (no metadata) → default to Manual incidence entry.
-            value = 'Manual'
+        # Default-select by preference order (case-insensitive); else the first
+        # available motor; else Manual (no metadata, e.g. Eiger).  Matches the
+        # integrator's gi_motor combo so the two never disagree on the auto-pick.
+        _lower = {p.lower(): p for p in pars}
+        value = next((_lower[p] for p in _GI_MOTOR_PREFERENCE if p in _lower),
+                     pars[0] if pars else 'Manual')
 
         pars = ['Manual'] + pars
 
@@ -1873,7 +1893,12 @@ class imageWrangler(wranglerWidget):
         if not self.img_file:
             return
 
-        img_meta = read_image_metadata(self.img_file, meta_format=self.meta_ext)
+        # Pass meta_dir so SPEC metadata (which often lives in a separate Meta
+        # Directory) is found here too -- the worker threads already do.  Without
+        # it the SPEC read returns {} and the GI motor dropdown collapses to its
+        # 'th'/'Manual' placeholder.  meta_dir is ignored for txt/pdi sidecars.
+        img_meta = read_image_metadata(self.img_file, meta_format=self.meta_ext,
+                                       meta_dir=self.meta_dir)
         self.scan_parameters = list(img_meta.keys())
         self.counters = self.scan_parameters
         self.motors = self.scan_parameters

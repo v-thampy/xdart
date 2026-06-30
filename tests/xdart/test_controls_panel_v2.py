@@ -32,6 +32,7 @@ from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import (
     FormRow,
     PillRow,
     RangeRow,
+    SegmentedControl,
 )
 
 
@@ -41,6 +42,34 @@ def _find_pill(widget, path):
         for p, btn in pill_row._pills:
             if p == path:
                 return btn
+    return None
+
+
+def _find_segmented(widget, path):
+    """Return the SegmentedControl for ``path`` in the experiment card, or None."""
+    for seg in widget.controls_v2.experiment_card.body.findChildren(SegmentedControl):
+        if seg.path == tuple(path):
+            return seg
+    return None
+
+
+def _gi_detail_rows(widget):
+    """Paths of the inline GI detail FormRows in Experiment (θ motor + the
+    manual θ value; Orientation/Tilt now live behind the '…' popup)."""
+    gi_detail = {("GI", "th_motor"), ("GI", "th_val")}
+    return {
+        row.path
+        for row in widget.controls_v2.experiment_card.body.findChildren(FormRow)
+        if row.path in gi_detail
+    }
+
+
+def _find_more_button(widget):
+    """The '…' GI-options button in the Experiment card, or None."""
+    for btn in widget.controls_v2.experiment_card.body.findChildren(
+            QtWidgets.QToolButton):
+        if btn.objectName() == "controlsV2MoreButton":
+            return btn
     return None
 
 
@@ -369,6 +398,173 @@ def test_controls_panel_v2_gi_edits_update_integrator_and_carrier(qapp, monkeypa
         widget.deleteLater()
 
 
+def test_controls_panel_v2_grazing_renders_as_segmented_control(qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
+        widget._refresh_controls_v2_profile_now()
+
+        seg = _find_segmented(widget, ("GI", "Grazing"))
+        assert seg is not None
+        # Two mutually-exclusive segments: Standard | Grazing.
+        labels = [btn.text() for _v, btn in seg._segments]
+        assert labels == ["Standard", "Grazing"]
+        assert seg._group.exclusive()
+        assert seg.current_value() is False  # Standard active
+
+        # Clicking Grazing flips the integrator + wrangler carrier (same
+        # (path, bool) signal the old toggle emitted).
+        grazing_btn = next(btn for v, btn in seg._segments if v is True)
+        grazing_btn.click()
+        assert widget.integratorTree.ui.gi_enable.isChecked()
+        assert widget.wrangler.parameters.child("GI", "Grazing").value() is True
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_gi_detail_fields_inline_only_in_grazing(qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        # Standard mode -> only the segmented control, no GI detail rows / popup.
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
+        widget._refresh_controls_v2_profile_now()
+        assert _find_segmented(widget, ("GI", "Grazing")) is not None
+        assert _gi_detail_rows(widget) == set()
+        assert _find_more_button(widget) is None
+
+        # Grazing mode -> θ motor inline + the '…' GI-options button (progressive
+        # disclosure, gated in controls_logic on the Grazing state).
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        widget._refresh_controls_v2_profile_now()
+        assert _gi_detail_rows(widget) == {("GI", "th_motor")}
+        assert _find_more_button(widget) is not None
+    finally:
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_grazing_roundtrips_scan_gi_and_config(qapp, monkeypatch):
+    """P2: the V2 Grazing path must flip scan.gi AND land sample facts in
+    get_gi_config() (the reintegrate source), independent of the legacy toggle —
+    the GI-inline rework re-routes exactly this signal."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        assert widget.scan.gi is True
+
+        widget._on_controls_v2_field_changed(("GI", "sample_orientation"), "5")
+        assert widget.integratorTree.get_gi_config()["sample_orientation"] == 5
+
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
+        assert widget.scan.gi is False
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_refresh_does_not_refire_gi_signal(qapp, monkeypatch):
+    """P2/#56: a profile refresh or programmatic GI re-sync must NOT re-emit
+    sigUpdateGI when the user didn't toggle.  Removing the GI popup makes the old
+    re-open-on-refresh bug impossible; this pins that no spurious GI signal fires
+    across refreshes, and exactly one fires per real value-changing toggle."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        emissions = []
+        widget.integratorTree.sigUpdateGI.connect(lambda v: emissions.append(v))
+
+        # Forced rebuilds + a programmatic GI re-sync with GI already on -> no
+        # spurious GI emissions.
+        for _ in range(5):
+            widget._refresh_controls_v2_profile_now()
+        widget._sync_controls_v2_integrator_path(("GI", "Grazing"))
+        assert emissions == []
+
+        # A genuine value-changing toggle -> exactly one emission; re-applying the
+        # same value is idempotent (equality-guarded -> no emission).
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
+        assert emissions == [False]
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
+        assert emissions == [False]
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_refresh_defers_while_line_editor_focused(qapp, monkeypatch):
+    """P2 (dropped input): a background rebuild (set_state -> clear_rows) must NOT
+    destroy a line editor the user is mid-edit in and drop the uncommitted text.
+    When a QLineEdit is focused, the refresh defers by arming a one-shot on the
+    editor's editingFinished (NO throttle re-arm / spin); the rebuild is scheduled
+    once the editor commits."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget._refresh_controls_v2_profile_now()
+        rows = [
+            row
+            for row in widget.controls_v2.processing_card.body.findChildren(FormRow)
+            if row.path == ("Int1D", "points")
+        ]
+        assert rows
+        editor = rows[0].editor
+        editor.setText("999")  # typed, NOT committed (no editingFinished)
+
+        # Simulate the editor holding focus and a signature-changing background
+        # event (e.g. a load completing).
+        monkeypatch.setattr(widget.controls_v2, "focusWidget", lambda: editor)
+        widget._controls_v2_last_signature = None
+        triggered = []
+        monkeypatch.setattr(
+            widget._controls_v2_refresh_timer, "trigger",
+            lambda: triggered.append(True),
+        )
+
+        widget._refresh_controls_v2_profile_now()
+
+        # Rebuild deferred WITHOUT re-arming the throttle (no spin): the editor is
+        # the SAME object, its uncommitted text survived, and a one-shot is armed
+        # on the editor instead of waking a timer.
+        assert triggered == []                              # no throttle spin
+        assert widget._controls_v2_pending_editor is editor
+        same = [
+            row
+            for row in widget.controls_v2.processing_card.body.findChildren(FormRow)
+            if row.path == ("Int1D", "points")
+        ]
+        assert same and same[0].editor is editor
+        assert editor.text() == "999"
+
+        # When the editor commits, the one-shot SCHEDULES the deferred rebuild
+        # through the throttle (immediate=False) and clears itself — it does not
+        # run synchronously (would delete the editor mid-emission) nor re-arm a
+        # spinning timer.  (Invoke the handler directly: emitting editingFinished
+        # on a real FormRow editor would also fire the row's own field-change.)
+        monkeypatch.setattr(widget.controls_v2, "focusWidget", lambda: None)
+        widget._on_controls_v2_pending_editor_done()
+        assert widget._controls_v2_pending_editor is None
+        assert triggered == [True]                           # scheduled once, on commit
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
 def test_controls_panel_v2_threshold_edits_update_integrator_and_carrier(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -472,6 +668,303 @@ def test_controls_panel_v2_bool_rows_render_as_pill_toggles(qapp, monkeypatch):
         widget.deleteLater()
 
 
+def test_controls_panel_v2_average_scan_renders_as_conditioning_pill(qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        # Image Series source -> Average Scan is offered (a frame-averaging
+        # *processing* choice, re-homed from SOURCE to PROCESSING).
+        widget._on_controls_v2_field_changed(("Signal", "inp_type"), "Image Series")
+        widget._refresh_controls_v2_profile_now()
+
+        avg = _find_pill(widget, ("Signal", "series_average"))
+        assert avg is not None
+        assert isinstance(avg, QtWidgets.QPushButton)
+        assert avg.isCheckable()
+        assert avg.text() == "Average Scan"
+
+        # It coalesces into the same Conditioning PillRow as Mask Saturated.
+        sat = _find_pill(widget, ("MaskSat", "mask_sentinel"))
+        assert sat is not None
+        assert avg.parent() is sat.parent()
+
+        # The pill writes through to the wrangler param (no integrator widget
+        # backs series_average), flipping the legacy carrier immediately.
+        widget._on_controls_v2_field_changed(("Signal", "series_average"), True)
+        assert (
+            widget.wrangler.parameters.child("Signal", "series_average").value()
+            is True
+        )
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_source_layout_coalesces_rows(qapp, monkeypatch):
+    """SOURCE layout: in Image Directory mode the mode combo + Subdirs toggle
+    share a row, and File Type + Meta Type share a row.  In Image Series mode
+    Subdirs is absent and Meta Type stands alone."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    def _src_row(widget, path):
+        for row in widget.controls_v2.source_card.body.findChildren(FormRow):
+            if row.path == path:
+                return row
+        return None
+
+    widget = staticWidget()
+    try:
+        widget._on_controls_v2_field_changed(("Signal", "inp_type"), "Image Directory")
+        widget._refresh_controls_v2_profile_now()
+
+        src = _src_row(widget, ("Signal", "inp_type"))
+        subdirs = _src_row(widget, ("Signal", "include_subdir"))
+        ftype = _src_row(widget, ("Signal", "img_ext"))
+        mtype = _src_row(widget, ("Signal", "meta_ext"))
+        assert src is not None and subdirs is not None
+        assert ftype is not None and mtype is not None
+        # Mode combo + Subdirs share a row; File Type + Meta Type share a row;
+        # the two rows are distinct.
+        assert src.parent() is subdirs.parent()
+        assert ftype.parent() is mtype.parent()
+        assert src.parent() is not ftype.parent()
+
+        # Image Series: no Subdirs (directory-only), Meta Type still renders.
+        widget._on_controls_v2_field_changed(("Signal", "inp_type"), "Image Series")
+        widget._refresh_controls_v2_profile_now()
+        assert _src_row(widget, ("Signal", "include_subdir")) is None
+        assert _src_row(widget, ("Signal", "meta_ext")) is not None
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_gi_options_popup_holds_orient_and_tilt(qapp, monkeypatch):
+    """In Grazing mode: θ motor renders inline (compact label, descriptive
+    tooltip); Orientation + Tilt Angle live behind a '…' button that opens a
+    small popup, whose rows still write through."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        widget._refresh_controls_v2_profile_now()
+
+        exp = widget.controls_v2.experiment_card
+
+        def _row(card, path):
+            for r in card.body.findChildren(FormRow):
+                if r.path == path:
+                    return r
+            return None
+
+        motor = _row(exp, ("GI", "th_motor"))
+        assert motor is not None
+        assert motor.label.text() == "θ motor"
+        assert "incidence" in motor.editor.toolTip().lower()
+        # Orient + Tilt are NOT inline -- they live behind the '…' button.
+        assert _row(exp, ("GI", "sample_orientation")) is None
+        assert _row(exp, ("GI", "tilt_angle")) is None
+        more = _find_more_button(widget)
+        assert more is not None
+
+        # Clicking '…' opens a popup containing the Orientation + Tilt rows.
+        more.click()
+        popup = widget.controls_v2._gi_options_popup
+        popup_paths = {r.path for r in popup.findChildren(FormRow)}
+        assert ("GI", "sample_orientation") in popup_paths
+        assert ("GI", "tilt_angle") in popup_paths
+
+        # A popup row writes through to the integrator carrier.
+        for r in popup.findChildren(FormRow):
+            if r.path == ("GI", "sample_orientation"):
+                r.editor.setText("6")
+                r.editor.editingFinished.emit()
+        assert widget.integratorTree.get_gi_config()["sample_orientation"] == 6
+    finally:
+        # Reset GI so the toggle state doesn't leak (via session) to later tests.
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_path_fields_show_full_path_tooltip(qapp, monkeypatch):
+    """Path/file fields (browse) show their FULL value on hover, since the editor
+    truncates it in the narrow panel (a description would be less useful)."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget._on_controls_v2_field_changed(("Signal", "inp_type"), "Image Series")
+        widget._on_controls_v2_field_changed(
+            ("Signal", "File"), "/data/very/long/path/scan_0001.tif")
+        widget._refresh_controls_v2_profile_now()
+
+        rows = [
+            r for r in widget.controls_v2.source_card.body.findChildren(FormRow)
+            if r.path == ("Signal", "File")
+        ]
+        assert rows
+        editor = rows[0].editor
+        # The tooltip is the full path (the editor's own text), not empty/a blurb.
+        assert editor.toolTip()
+        assert editor.toolTip() == editor.text()
+        assert "/" in editor.toolTip()
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_integrator_gi_motor_autoselects_preferred_over_manual(qapp, monkeypatch):
+    """A new motor list with a preferred motor (th) auto-selects it instead of
+    staying on the 'Manual' fallback; a deliberate real-motor choice is kept."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        it = widget.integratorTree
+        # On 'Manual' (no motors), then a source whose metadata offers 'th'.
+        it.set_gi_motor_options([])
+        assert it.ui.gi_motor.currentText() == "Manual"
+        it.set_gi_motor_options(["th", "i0", "eta"])
+        assert it.ui.gi_motor.currentText() == "th"   # auto-selected, not Manual
+
+        # A deliberate real-motor choice survives a same-list refresh.
+        it.ui.gi_motor.setCurrentText("eta")
+        it.set_gi_motor_options(["th", "i0", "eta"])
+        assert it.ui.gi_motor.currentText() == "eta"
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_integrator_gi_motor_keeps_deliberate_manual_across_repopulation(qapp, monkeypatch):
+    """F3: a DELIBERATELY chosen 'Manual' incidence motor stays Manual when the
+    motor list repopulates on a source/format switch — the user's manual θ must
+    not be silently swapped for a file motor.  The INITIAL DEFAULT Manual still
+    yields to the preference order (th)."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        it = widget.integratorTree
+        it._gi_motor_user_choice = None  # deterministic: no prior deliberate pick
+
+        # Default (non-deliberate) state -> a source offering th auto-selects it.
+        it.set_gi_motor_options(["th", "eta"])
+        assert it.ui.gi_motor.currentText() == "th"
+
+        # The user DELIBERATELY picks 'Manual' (fires the activated user-pick
+        # signal that records the deliberate choice).
+        it.ui.gi_motor.setCurrentText("Manual")
+        it.ui.gi_motor.activated.emit(it.ui.gi_motor.currentIndex())
+        assert it.ui.gi_motor.currentText() == "Manual"
+
+        # A source/format switch repopulates the motor list -> Manual persists.
+        it.set_gi_motor_options(["th", "eta", "gonth"])
+        assert it.ui.gi_motor.currentText() == "Manual"
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_gi_popup_torn_down_on_rebuild_no_stale_clobber(qapp, monkeypatch):
+    """F1/F2: the GI '…' popup is torn down on a panel rebuild, so a stale popup
+    row can't be harvested by current_form_edits and clobber a fresher
+    sample_orientation on the next pending-edit commit — and it leaves no orphan
+    window."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        widget._refresh_controls_v2_profile_now()
+
+        # Open the '…' popup (Orientation + Tilt).
+        more = _find_more_button(widget)
+        more.click()
+        assert widget.controls_v2._gi_options_popup is not None
+
+        # An out-of-band orientation change + a panel rebuild.
+        widget._on_controls_v2_field_changed(("GI", "sample_orientation"), "7")
+        widget._refresh_controls_v2_profile_now()
+
+        # Popup torn down: no orphan, nothing stale for current_form_edits.
+        assert widget.controls_v2._gi_options_popup is None
+        edit_paths = {e.path for e in widget.controls_v2.current_form_edits()}
+        assert ("GI", "sample_orientation") not in edit_paths
+
+        # Committing pending edits must NOT revert the fresh value.
+        widget._commit_controls_v2_pending_edits()
+        assert widget.integratorTree.get_gi_config()["sample_orientation"] == 7
+    finally:
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_gi_popup_edit_commits_on_run(qapp, monkeypatch):
+    """Finding 2: typing a new Orientation in the GI '…' popup and immediately
+    committing pending edits (what Run does at run start) applies the value to
+    THIS run — the popup is a transient widget, so the run-commit must harvest its
+    in-progress edit, not let it land only on the *next* run."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        widget._refresh_controls_v2_profile_now()
+
+        more = _find_more_button(widget)
+        more.click()
+        popup = widget.controls_v2._gi_options_popup
+        assert popup is not None
+
+        # Type a new Orientation but do NOT commit it (no editingFinished) — as if
+        # the user types and clicks Run immediately.
+        for r in popup.findChildren(FormRow):
+            if r.path == ("GI", "sample_orientation"):
+                r.editor.setText("4")
+
+        # Run's pending-edit commit harvests the in-progress popup value, so the
+        # reduction config sees it for THIS run.
+        widget._commit_controls_v2_pending_edits()
+        assert widget.integratorTree.get_gi_config()["sample_orientation"] == 4
+    finally:
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
+        widget.close()
+        widget.deleteLater()
+
+
+def test_enter_run_state_resets_frame_count_snapshot(qapp, monkeypatch):
+    """F6: a new run re-snapshots the frozen frame count from scratch, so it can't
+    freeze at the PREVIOUS run's count if no inter-run refresh cleared it."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget._controls_v2_run_frame_count = 999  # stale leftover from a prior run
+        widget._run_active = False
+        widget._enter_run_state()
+        # The stale snapshot is discarded at run start: it's reset to None and the
+        # freeze logic re-snapshots the CURRENT frame count (never the old 999).
+        assert widget._controls_v2_run_frame_count != 999
+    finally:
+        widget._exit_run_state()
+        widget.close()
+        widget.deleteLater()
+
+
 def test_controls_panel_v2_run_commits_focused_integration_edit(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -556,6 +1049,10 @@ def test_controls_panel_v2_range_labels_follow_legacy_integrator_labels(
 
     widget = staticWidget()
     try:
+        # Standard mode: the live legacy label is authoritative here (in GI mode
+        # gi_mode wins -- see _range_axis_labels_1d).  Force it explicitly so the
+        # test is independent of any GI state leaked via session from a prior test.
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
         widget.integratorTree.ui.gi_radial_label_1D.setText("LEGACY Q")
         widget.integratorTree.ui.label_azim_1D.setText("LEGACY CHI")
         widget._refresh_controls_v2_profile_now()

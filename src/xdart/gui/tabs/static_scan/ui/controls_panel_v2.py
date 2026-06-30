@@ -48,6 +48,60 @@ _ACTION_LABELS = {
     ControlAction.MAKE_MASK: "▦ Make Mask",
 }
 
+# Descriptive hover tooltips, keyed by bound-control path.  Used by every row
+# renderer (FormRow/PillRow/SegmentedControl); a field's disabled `reason` is
+# used as a fallback when there is no entry here.
+_FIELD_TOOLTIPS: dict[tuple[str, ...], str] = {
+    # Experiment / grazing-incidence
+    ("GI", "Grazing"): (
+        "Measurement geometry: Standard, or Grazing-incidence (GIWAXS), which "
+        "enables the fiber/GI integration axes and corrections."),
+    ("GI", "th_motor"): (
+        "Incidence-angle source: the scan-metadata motor column read as the "
+        "grazing incidence angle θ. Pick 'Manual' to enter θ directly."),
+    ("GI", "th_val"): (
+        "Manual grazing incidence angle θ in degrees (used when the motor is "
+        "set to 'Manual')."),
+    ("GI", "sample_orientation"): (
+        "Sample orientation index (1–8): the pyFAI fiber sample-frame "
+        "convention for the grazing geometry."),
+    ("GI", "tilt_angle"): "Sample tilt angle in degrees for the grazing geometry.",
+    # Processing / conditioning
+    ("MaskSat", "mask_sentinel"): (
+        "Mask dead/saturated detector pixels (the uint32 sentinel). OFF keeps "
+        "strong saturated Bragg peaks unmasked."),
+    ("Signal", "series_average"): (
+        "Average all frames in the series into one frame before integration."),
+    ("Mask", "Threshold"): (
+        "Clip pixel intensities outside the [min, max] band before integration."),
+    # Source
+    ("Signal", "inp_type"): (
+        "Source kind: a numbered image series, a directory of images, or a "
+        "single image."),
+    ("Signal", "include_subdir"): "Also search sub-directories for matching images.",
+    ("Signal", "img_ext"): "Image file type (extension).",
+    ("Signal", "meta_ext"): "Per-frame metadata format (e.g. txt, SPEC, pdi).",
+    ("Signal", "meta_dir"): (
+        "Directory holding the SPEC metadata file, when it's separate from the "
+        "images."),
+}
+
+# Descriptive hover tooltips for the producer/inspector action buttons.
+_ACTION_TOOLTIPS: dict[ControlAction, str] = {
+    ControlAction.CALIBRATE: "Run pyFAI calibration to produce a PONI (detector geometry) file.",
+    ControlAction.MAKE_MASK: "Build a detector mask from the current frame.",
+    ControlAction.REFINE_GEOMETRY: "Refine the diffractometer geometry from the loaded scan.",
+    ControlAction.ADVANCED_PROCESSING: "Open the advanced integration settings (full parameter tree).",
+    ControlAction.REINTEGRATE_1D: "Re-integrate the loaded scan to 1D with the current settings.",
+    ControlAction.REINTEGRATE_2D: "Re-integrate the loaded scan to 2D with the current settings.",
+}
+
+
+def _field_tooltip(path, reason: str = "") -> str:
+    """Resolve a control's hover tooltip: the disabled `reason` takes precedence
+    (so a locked control explains WHY), else the descriptive help text."""
+    return (reason or "") or _FIELD_TOOLTIPS.get(tuple(path), "")
+
 
 class StatusBadge(QtWidgets.QLabel):
     """Small status label used by card rows."""
@@ -109,7 +163,7 @@ class ActionButton(QtWidgets.QPushButton):
         self._spec = spec
         self.setText(spec.label)
         self.setEnabled(bool(spec.enabled))
-        self.setToolTip(spec.reason or "")
+        self.setToolTip(spec.reason or _ACTION_TOOLTIPS.get(spec.action, ""))
         self.setProperty("productionReady", bool(spec.production_ready))
         # Role drives a subtle tint: Reintegrate = green (run-like), Advanced =
         # red (the destructive/expert escape hatch); producers stay neutral.
@@ -602,7 +656,7 @@ class PillRow(QtWidgets.QWidget):
             btn.setCheckable(True)
             btn.setChecked(bool(field.value))
             btn.setEnabled(bool(field.enabled))
-            btn.setToolTip(field.reason or "")
+            btn.setToolTip(_field_tooltip(field.path, field.reason))
             btn.setSizePolicy(
                 QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed
             )
@@ -616,6 +670,72 @@ class PillRow(QtWidgets.QWidget):
 
     def current_edits(self) -> tuple[tuple[tuple[str, ...], object], ...]:
         return tuple((p, bool(btn.isChecked())) for p, btn in self._pills)
+
+
+class SegmentedControl(QtWidgets.QWidget):
+    """A mutually-exclusive segmented toggle (e.g. ``Standard | Grazing``).
+
+    Replaces a group-header bool checkbox with a proper two-state segmented
+    control — the header checkbox was the #56 repaint class.  Built as an
+    exclusive ``QButtonGroup`` of checkable buttons; ``options`` maps each segment
+    label to the value emitted when it becomes the active selection.  It emits
+    ``valueChanged(path, value)`` for the SAME path the old single bool toggle
+    used, so the write-through is unchanged.  Reusable: Stitch GI drives the same
+    ``("GI", "Grazing")`` path through this control.
+    """
+
+    valueChanged = QtCore.Signal(object, object)
+
+    def __init__(self, path, options, *, value, enabled=True, reason="",
+                 parent=None):
+        super().__init__(parent)
+        self.setObjectName("controlsV2SegmentedControl")
+        self._path = tuple(path)
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        self._group = QtWidgets.QButtonGroup(self)
+        self._group.setExclusive(True)
+        self._segments: list[tuple[object, QtWidgets.QPushButton]] = []
+        for idx, (label, opt_value) in enumerate(options):
+            btn = QtWidgets.QPushButton(label)
+            btn.setObjectName("controlsV2SegmentButton")
+            btn.setProperty("segment", True)
+            btn.setCheckable(True)
+            btn.setEnabled(bool(enabled))
+            btn.setToolTip(_field_tooltip(self._path, reason))
+            btn.setChecked(opt_value == value)
+            btn.setSizePolicy(
+                QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed
+            )
+            self._group.addButton(btn, idx)
+            # Use `clicked` (not `toggled`): an exclusive group fires `toggled` on
+            # BOTH the newly-checked and newly-unchecked buttons; `clicked` fires
+            # once, on the button the user pressed.  Emit the segment's fixed
+            # value so the write-through gets (path, True/False) regardless of the
+            # prior selection (re-clicking the active segment re-emits the same
+            # value — the equality-guarded write-through makes that a no-op).
+            btn.clicked.connect(
+                lambda _checked, v=opt_value: self.valueChanged.emit(self._path, v)
+            )
+            lay.addWidget(btn, 1)
+            self._segments.append((opt_value, btn))
+
+    @property
+    def path(self) -> tuple[str, ...]:
+        return self._path
+
+    def current_value(self):
+        for opt_value, btn in self._segments:
+            if btn.isChecked():
+                return opt_value
+        return None
+
+    def current_edits(self) -> tuple[tuple[tuple[str, ...], object], ...]:
+        value = self.current_value()
+        if value is None:
+            return ()
+        return ((self._path, value),)
 
 
 class ControlsPanelV2(QtWidgets.QWidget):
@@ -718,6 +838,10 @@ class ControlsPanelV2(QtWidgets.QWidget):
             edits.extend(
                 ControlFormEdit(path=p, value=v) for p, v in row.current_edits()
             )
+        for row in self.findChildren(SegmentedControl):
+            edits.extend(
+                ControlFormEdit(path=p, value=v) for p, v in row.current_edits()
+            )
         return tuple(edits)
 
     def _render_summary(self, profile: ControlProfile) -> None:
@@ -755,6 +879,15 @@ class ControlsPanelV2(QtWidgets.QWidget):
         self.processing_card.setVisible(bool(profile.show_processing_card))
 
     def _render_bound_fields(self, profile: ControlProfile) -> None:
+        # Tear down any open GI '…' popup on every rebuild.  Its rows are parented
+        # under this panel, so current_form_edits() (findChildren(FormRow)) would
+        # otherwise harvest a STALE popup whose displayed value froze at open time
+        # — a later _commit_controls_v2_pending_edits could then clobber a fresher
+        # sample_orientation/tilt_angle back to the old value (F1).  Leaving
+        # Grazing triggers a rebuild too, so this also disposes the orphan popup
+        # (F2).  Popup edits already write through on change, so nothing is lost;
+        # reopening rebuilds its rows from the live profile.
+        self._close_gi_more_popup()
         cards = {
             SectionId.PROJECT: self.project_card,
             SectionId.SOURCE: self.source_card,
@@ -770,8 +903,8 @@ class ControlsPanelV2(QtWidgets.QWidget):
         self.summary_card.hide()
         self._render_plain_bound_section(
             self.project_card, state.fields_for(SectionId.PROJECT))
-        self._render_plain_bound_section(
-            self.source_card, state.fields_for(SectionId.SOURCE))
+        self._render_source_bound_section(
+            state.fields_for(SectionId.SOURCE))
         self._render_experiment_bound_section(
             profile, state.fields_for(SectionId.EXPERIMENT))
         self._render_processing_bound_section(
@@ -793,6 +926,61 @@ class ControlsPanelV2(QtWidgets.QWidget):
     ) -> None:
         for field in fields:
             self._add_bound_row(card, field)
+
+    def _render_source_bound_section(
+        self,
+        fields: Iterable[ControlFormField],
+    ) -> None:
+        """SOURCE layout with a few coalesced rows (Vivek): the mode combo + the
+        directory-only Subdirs toggle share a row, and File Type + Meta Type share
+        a row.  Everything else renders one field per row, in field order."""
+        fields = tuple(fields)
+        by_path = {field.path: field for field in fields}
+        rendered: set[tuple[str, ...]] = set()
+
+        def row_for(*paths: tuple[str, ...], stretches=None, tight=()) -> None:
+            present = [by_path[p] for p in paths
+                       if p in by_path and p not in rendered]
+            if not present:
+                return
+            rendered.update(field.path for field in present)
+            if len(present) == 1 and not tight:
+                self._add_bound_row(self.source_card, present[0])
+                return
+            container = QtWidgets.QWidget()
+            lay = QtWidgets.QHBoxLayout(container)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(8)
+            for field in present:
+                sub = self._make_bound_row(field)
+                if field.path in tight:
+                    # Tighten the label against its editor (less gap); the editor
+                    # still fills to the right edge of the cell (right-justified).
+                    if getattr(sub, "label", None) is not None:
+                        sub.label.setMinimumWidth(0)
+                    if sub.layout() is not None:
+                        sub.layout().setSpacing(3)
+                is_bool = getattr(field.kind, "value", field.kind) == "bool"
+                st = 0 if is_bool else 1
+                if stretches and field.path in stretches:
+                    st = stretches[field.path]
+                lay.addWidget(sub, st)
+            self.source_card.add_row(container)
+
+        # Mode combo + (directory-only) Subdirs toggle on one row.
+        row_for(("Signal", "inp_type"), ("Signal", "include_subdir"))
+        row_for(("Signal", "img_dir"))                           # Directory
+        row_for(("Signal", "File"))                              # Image File
+        # File Type | Meta Type: Meta Type ~10% narrower with a tight label.
+        row_for(("Signal", "img_ext"), ("Signal", "meta_ext"),
+                stretches={("Signal", "img_ext"): 11, ("Signal", "meta_ext"): 9},
+                tight={("Signal", "meta_ext")})
+        row_for(("Signal", "Filter"))                            # Filter
+        row_for(("Signal", "meta_dir"))                          # SPEC Dir
+        # Anything else (e.g. NeXus File / Entry) one per row, in order.
+        for field in fields:
+            if field.path not in rendered:
+                self._add_bound_row(self.source_card, field)
 
     def _render_experiment_bound_section(
         self,
@@ -821,10 +1009,19 @@ class ControlsPanelV2(QtWidgets.QWidget):
             ("Calibration", "poni_file"),
             ("Signal", "mask_file"),
         }
-        # Only the Grazing toggle renders inline; the GI detail fields (motor,
-        # orientation, tilt) live in the GI Options popup, not the panel, so the
-        # Sample & measurement subsection stays compact (Vivek).
-        gi_paths = {("GI", "Grazing")}
+        # Sample & measurement shows a Standard | Grazing segmented control (not a
+        # group-header checkbox — that was the #56 repaint class).  The GI detail
+        # fields (motor, value, orientation, tilt) render inline beneath it, but
+        # only in Grazing mode: controls_logic gates their PRESENCE on the Grazing
+        # state (progressive disclosure), so here they are simply rendered when
+        # present.
+        gi_paths = {
+            ("GI", "Grazing"),
+            ("GI", "th_motor"),
+            ("GI", "th_val"),
+            ("GI", "sample_orientation"),
+            ("GI", "tilt_angle"),
+        }
         groups = [
             (
                 "Detector",
@@ -843,9 +1040,101 @@ class ControlsPanelV2(QtWidgets.QWidget):
             if not group_fields:
                 continue
             group = SubsectionCard(title, status=status, accent="experiment")
-            for field in group_fields:
-                self._add_bound_row(group, field)
+            if title == "Sample & measurement":
+                self._render_sample_measurement_rows(group, group_fields)
+            else:
+                for field in group_fields:
+                    self._add_bound_row(group, field)
             self.experiment_card.add_row(group)
+
+    def _render_sample_measurement_rows(
+        self,
+        group: "SubsectionCard",
+        fields: tuple[ControlFormField, ...],
+    ) -> None:
+        """Render the Standard|Grazing segmented control, then a compact GI row:
+        the θ motor combo, the manual θ value (manual mode only), and a '…'
+        button that opens a small popup with the less-used Orientation + Tilt
+        Angle options.  controls_logic drops the detail fields in Standard mode."""
+        compact_labels = {
+            ("GI", "th_motor"): "θ motor",
+            ("GI", "th_val"): "θ",
+        }
+        popup_paths = {("GI", "sample_orientation"), ("GI", "tilt_angle")}
+        inline = []
+        popup_fields = []
+        for field in fields:
+            if field.path == ("GI", "Grazing"):
+                seg = SegmentedControl(
+                    field.path,
+                    (("Standard", False), ("Grazing", True)),
+                    value=bool(field.value),
+                    enabled=bool(field.enabled),
+                    reason=field.reason or "",
+                )
+                seg.valueChanged.connect(self.fieldValueChanged)
+                group.add_row(seg)
+            elif field.path in popup_paths:
+                popup_fields.append(field)
+            else:
+                inline.append(field)  # θ motor, θ value (manual)
+        if not (inline or popup_fields):
+            return
+        # θ motor + (manual) θ value share one row; Orientation + Tilt go behind
+        # a '…' popup so the row isn't squished (Vivek).
+        row = QtWidgets.QWidget()
+        lay = QtWidgets.QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        # θ motor (dropdown) takes ~2/3, the θ value box ~1/3 (≈30% narrower) so
+        # the motor name isn't clipped; the motor combo expands to fill (Vivek).
+        stretch = {("GI", "th_motor"): 2, ("GI", "th_val"): 1}
+        for field in inline:
+            sub = self._make_bound_row(
+                field, label=compact_labels.get(field.path, field.label))
+            if getattr(sub, "label", None) is not None:
+                sub.label.setMinimumWidth(0)
+            lay.addWidget(sub, stretch.get(field.path, 1))
+        if popup_fields:
+            more = QtWidgets.QToolButton()
+            more.setText("…")
+            more.setObjectName("controlsV2MoreButton")
+            more.setToolTip("More GI options: Orientation, Tilt Angle")
+            more.clicked.connect(
+                lambda _=False, f=tuple(popup_fields): self._open_gi_more_popup(f))
+            lay.addWidget(more, 0)
+        group.add_row(row)
+
+    def _close_gi_more_popup(self) -> None:
+        """Close + dispose the GI '…' options popup if open, clearing the ref so a
+        stale popup can't be harvested by ``current_form_edits`` (F1/F2)."""
+        popup = getattr(self, "_gi_options_popup", None)
+        if popup is not None:
+            popup.close()
+            # deleteLater() is async — its FormRow children would still be found
+            # by findChildren() (current_form_edits) until the event loop runs.
+            # setParent(None) detaches the subtree from this panel NOW, so a
+            # rebuild can't harvest its stale rows before the deferred delete.
+            popup.setParent(None)
+            popup.deleteLater()
+        self._gi_options_popup = None
+
+    def _open_gi_more_popup(self, fields: tuple[ControlFormField, ...]) -> None:
+        """Small floating popup for the less-used GI options (Orientation, Tilt
+        Angle).  Its rows write through like any other V2 row."""
+        self._close_gi_more_popup()
+        popup = QtWidgets.QWidget(self, QtCore.Qt.Tool)
+        popup.setObjectName("controlsV2GIMorePopup")
+        popup.setWindowTitle("GI Options")
+        lay = QtWidgets.QVBoxLayout(popup)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+        for field in fields:
+            lay.addWidget(self._make_bound_row(field))
+        self._gi_options_popup = popup  # keep a ref so it isn't GC'd
+        popup.show()
+        popup.raise_()
+        popup.activateWindow()
 
     def _render_processing_bound_section(
         self,
@@ -1130,6 +1419,19 @@ class ControlsPanelV2(QtWidgets.QWidget):
         )
         row.valueChanged.connect(self.fieldValueChanged)
         row.browseRequested.connect(self.fieldBrowseRequested)
+        if field.browse and field.value and not field.reason:
+            # Path/file fields truncate in the narrow panel; show the FULL path
+            # on hover (a disabled field still shows its reason).
+            tip = str(field.value)
+        else:
+            tip = _field_tooltip(field.path, field.reason)
+        if tip:
+            # Set on the editor + label too (not just the container) so the
+            # tooltip shows on hover over the control itself.  The browse button
+            # keeps its own "Browse …" tooltip.
+            for widget in (row, row.editor, row.label):
+                if widget is not None:
+                    widget.setToolTip(tip)
         return row
 
     def _add_bound_row(
@@ -1171,6 +1473,10 @@ class ControlsPanelV2(QtWidgets.QWidget):
     def _processing_group_for_path(path: tuple[str, ...]) -> str:
         if not path:
             return ""
+        # Average Scan is a wrangler bool re-homed into PROCESSING; match the
+        # full path because the "Signal" root carries many non-processing params.
+        if path == ("Signal", "series_average"):
+            return "Conditioning"
         root = path[0]
         if root in {"Mask", "MaskSat"}:
             return "Conditioning"

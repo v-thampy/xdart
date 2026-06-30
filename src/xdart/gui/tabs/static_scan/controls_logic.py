@@ -391,11 +391,12 @@ def _axis_text_to_gi_2d_mode(axis: object) -> str:
 
 
 def _range_axis_labels_1d(values: Mapping[tuple[str, ...], object]) -> tuple[str, str]:
-    live_radial = values.get(("Int1D", "radial_label"))
-    live_azim = values.get(("Int1D", "azim_label"))
-    if live_radial and live_azim:
-        return str(live_radial), str(live_azim)
-
+    # In GI mode the AUTHORITATIVE source is gi_mode, NOT the live legacy label:
+    # the integrator HIDES the radial label in polar modes (q_total) WITHOUT
+    # resetting its stale text, so trusting the widget text mislabels the range
+    # box (e.g. "Qip" while integrating polar Q).  gi_mode wins here; the live
+    # label is trusted only in standard mode (no gi_mode), where the integrator
+    # keeps it set + shown.
     gi_mode = values.get(("Int1D", "gi_mode"))
     if gi_mode is not None:
         mode = str(gi_mode)
@@ -410,6 +411,11 @@ def _range_axis_labels_1d(values: Mapping[tuple[str, ...], object]) -> tuple[str
             f"{_CHI} ({_DEG})",
         )
 
+    live_radial = values.get(("Int1D", "radial_label"))
+    live_azim = values.get(("Int1D", "azim_label"))
+    if live_radial and live_azim:
+        return str(live_radial), str(live_azim)
+
     axis = values.get(("Int1D", "axis"), "")
     mode = _axis_text_to_gi_1d_mode(axis)
     axis_text = str(axis or "").lower()
@@ -422,11 +428,9 @@ def _range_axis_labels_1d(values: Mapping[tuple[str, ...], object]) -> tuple[str
 
 
 def _range_axis_labels_2d(values: Mapping[tuple[str, ...], object]) -> tuple[str, str]:
-    live_radial = values.get(("Int2D", "radial_label"))
-    live_azim = values.get(("Int2D", "azim_label"))
-    if live_radial and live_azim:
-        return str(live_radial), str(live_azim)
-
+    # GI mode: gi_mode is authoritative over the (possibly stale, hidden) live
+    # label — see _range_axis_labels_1d.  q_chi hides the 2D radial label without
+    # resetting it, so the widget text would mislabel polar Q as "Qip".
     gi_mode = values.get(("Int2D", "gi_mode"))
     if gi_mode is not None:
         mode = str(gi_mode)
@@ -438,6 +442,11 @@ def _range_axis_labels_2d(values: Mapping[tuple[str, ...], object]) -> tuple[str
             _unit_radial_label(values.get(("Int2D", "unit"), "q_A^-1")),
             f"{_CHI} ({_DEG})",
         )
+
+    live_radial = values.get(("Int2D", "radial_label"))
+    live_azim = values.get(("Int2D", "azim_label"))
+    if live_radial and live_azim:
+        return str(live_radial), str(live_azim)
 
     axis = values.get(("Int2D", "axis"), "")
     mode = _axis_text_to_gi_2d_mode(axis)
@@ -514,17 +523,20 @@ INTEGRATOR_BACKED_CONTROL_SPECS: tuple[LegacyWidgetBinding, ...] = (
         ControlFieldKind.BOOL, "gi_enable", "checked"),
     LegacyWidgetBinding(
         SectionId.EXPERIMENT, "Theta Motor", ("GI", "th_motor"),
-        ControlFieldKind.COMBO, "gi_motor", "current_text", "gi_motor"),
+        ControlFieldKind.COMBO, "gi_motor", "current_text", "gi_motor",
+        visible_when="grazing"),
     LegacyWidgetBinding(
         SectionId.EXPERIMENT, "Theta", ("GI", "th_val"),
         ControlFieldKind.LINE, "gi_motor_value", "text",
-        visible_when="manual_theta"),
+        visible_when="grazing_manual"),
     LegacyWidgetBinding(
         SectionId.EXPERIMENT, "Orientation", ("GI", "sample_orientation"),
-        ControlFieldKind.LINE, "gi_sample_orientation", "value"),
+        ControlFieldKind.LINE, "gi_sample_orientation", "value",
+        visible_when="grazing"),
     LegacyWidgetBinding(
         SectionId.EXPERIMENT, "Tilt Angle", ("GI", "tilt_angle"),
-        ControlFieldKind.LINE, "gi_tilt", "text"),
+        ControlFieldKind.LINE, "gi_tilt", "text",
+        visible_when="grazing"),
     LegacyWidgetBinding(
         SectionId.PROCESSING, "Threshold", ("Mask", "Threshold"),
         ControlFieldKind.BOOL, "threshold_enable", "checked"),
@@ -718,13 +730,14 @@ def build_bound_control_state(
     else:
         add(SectionId.PROJECT, "Save Path", ("Output", "h5_dir"), browse=True)
 
-    if ("NeXus File", "nexus_file") in values:
+    nexus = ("NeXus File", "nexus_file") in values
+    source_type = str(values.get(("Signal", "inp_type"), ""))
+    if nexus:
         add(SectionId.SOURCE, "NeXus File", ("NeXus File", "nexus_file"), browse=True)
         add(SectionId.SOURCE, "Entry", ("NeXus File", "entry"))
         add(SectionId.EXPERIMENT, "Poni", ("Calibration", "poni_file"), browse=True)
         add(SectionId.EXPERIMENT, "Mask File", ("Signal", "mask_file"), browse=True)
     else:
-        source_type = str(values.get(("Signal", "inp_type"), ""))
         add(SectionId.SOURCE, "Source", ("Signal", "inp_type"),
             kind=ControlFieldKind.COMBO)
         if source_type == "Image Directory":
@@ -736,21 +749,27 @@ def build_bound_control_state(
             add(SectionId.SOURCE, "Filter", ("Signal", "Filter"))
         else:
             add(SectionId.SOURCE, "Image File", ("Signal", "File"), browse=True)
-            if source_type != "Single Image":
-                add(SectionId.SOURCE, "Average Scan", ("Signal", "series_average"),
-                    kind=ControlFieldKind.BOOL)
-        add(SectionId.SOURCE, "Meta File", ("Signal", "meta_ext"),
+        add(SectionId.SOURCE, "Meta Type", ("Signal", "meta_ext"),
             kind=ControlFieldKind.COMBO)
         if str(values.get(("Signal", "meta_ext"), "")) == "SPEC":
-            add(SectionId.SOURCE, "Meta Dir", ("Signal", "meta_dir"), browse=True)
+            add(SectionId.SOURCE, "SPEC Dir", ("Signal", "meta_dir"), browse=True)
         add(SectionId.EXPERIMENT, "Poni", ("Signal", "poni_file"), browse=True)
         add(SectionId.EXPERIMENT, "Mask File", ("Signal", "mask_file"), browse=True)
 
+    gi_on = bool(values.get(("GI", "Grazing"), False))
+    manual_theta = str(values.get(("GI", "th_motor"), "")) == "Manual"
     for spec in INTEGRATOR_BACKED_CONTROL_SPECS:
         if tool is not None and tool not in spec.tools:
             continue
-        if spec.visible_when == "manual_theta" and str(
-                values.get(("GI", "th_motor"), "")) != "Manual":
+        # Progressive disclosure for the GI detail fields: motor/orientation/tilt
+        # appear only in Grazing mode; the manual-theta Value also needs the
+        # incidence motor to be 'Manual'.  The Grazing toggle itself is always
+        # shown (it carries no visible_when).
+        if spec.visible_when == "grazing" and not gi_on:
+            continue
+        if spec.visible_when == "grazing_manual" and not (gi_on and manual_theta):
+            continue
+        if spec.visible_when == "manual_theta" and not manual_theta:
             continue
         add(
             spec.section,
@@ -758,6 +777,18 @@ def build_bound_control_state(
             spec.path,
             kind=spec.kind,
         )
+    # Average Scan (frame averaging) is a processing choice, not a source
+    # identity, so it renders in PROCESSING as a Conditioning pill next to Mask
+    # Saturated rather than in SOURCE (design doc item 6).  Placing the add()
+    # here (after the Mask spec block, both bools) lets flush_pills coalesce it
+    # into Mask Saturated's PillRow.  Shown for any multi-frame image source
+    # (Image Series OR Image Directory — averaging applies within a series in
+    # both), hidden for Single Image and NeXus.  This matches the legacy
+    # wrangler's set_inp_type, which reveals series_average for everything
+    # except Single Image.
+    if not nexus and source_type != "Single Image":
+        add(SectionId.PROCESSING, "Average Scan", ("Signal", "series_average"),
+            kind=ControlFieldKind.BOOL)
     add(SectionId.PROCESSING, "Background", ("BG", "bg_type"),
         kind=ControlFieldKind.COMBO)
     if str(values.get(("BG", "bg_type"), "None")) != "None":

@@ -214,8 +214,8 @@ def test_bound_control_state_describes_image_directory_form():
         "File Type",
         "Subdirs",
         "Filter",
-        "Meta File",
-        "Meta Dir",
+        "Meta Type",
+        "SPEC Dir",
     ]
     assert source[0].kind == ControlFieldKind.COMBO
     assert source[0].choices == ("Image Series", "Image Directory")
@@ -228,6 +228,144 @@ def test_bound_control_state_describes_image_directory_form():
         "BG File",
         "Scale",
     ]
+
+
+def test_average_scan_is_a_processing_conditioning_field_not_source():
+    """Average Scan moved from SOURCE to PROCESSING (design doc item 6).
+
+    It is a frame-averaging *processing* choice, so it renders as a Conditioning
+    bool next to Mask Saturated, not as a source-identity field.  Shown for any
+    multi-frame image source (Image Series OR Image Directory), hidden for Single
+    Image — matching the legacy wrangler's set_inp_type.
+    """
+    series = build_bound_control_state(
+        {
+            ("Signal", "inp_type"): "Image Series",
+            ("Signal", "File"): "/data/img_0001.tif",
+            ("Signal", "series_average"): False,
+            ("MaskSat", "mask_sentinel"): False,
+        },
+        {("Signal", "inp_type"): ("Image Series", "Image Directory", "Single Image")},
+    )
+    source_paths = [field.path for field in series.fields_for(SectionId.SOURCE)]
+    processing = series.fields_for(SectionId.PROCESSING)
+    assert ("Signal", "series_average") not in source_paths
+    avg = next(
+        (f for f in processing if f.path == ("Signal", "series_average")), None
+    )
+    assert avg is not None
+    assert avg.label == "Average Scan"
+    assert avg.kind == ControlFieldKind.BOOL
+    # Ordering: Average Scan follows Mask Saturated so the two coalesce into one
+    # Conditioning pill row in the panel.
+    labels = [field.label for field in processing]
+    assert labels.index("Average Scan") == labels.index("Mask Saturated") + 1
+
+    # Image Directory is also a multi-frame source (averaging applies within a
+    # series) -> Average Scan still shown in PROCESSING, not SOURCE.
+    directory = build_bound_control_state({
+        ("Signal", "inp_type"): "Image Directory",
+        ("Signal", "img_dir"): "/data/images",
+        ("Signal", "series_average"): False,
+        ("MaskSat", "mask_sentinel"): False,
+    })
+    assert "Average Scan" in [
+        field.label for field in directory.fields_for(SectionId.PROCESSING)
+    ]
+    assert "Average Scan" not in [
+        field.label for field in directory.fields_for(SectionId.SOURCE)
+    ]
+
+    # Single Image has no series to average -> hidden in BOTH sections.
+    single = build_bound_control_state(
+        {
+            ("Signal", "inp_type"): "Single Image",
+            ("Signal", "File"): "/data/img.tif",
+            ("Signal", "series_average"): False,
+        },
+    )
+    assert "Average Scan" not in [
+        field.label for field in single.fields_for(SectionId.PROCESSING)
+    ]
+    assert "Average Scan" not in [
+        field.label for field in single.fields_for(SectionId.SOURCE)
+    ]
+
+
+def test_gi_mode_overrides_stale_hidden_radial_label():
+    """P2 (GI label staleness): in GI polar modes the integrator HIDES the radial
+    label without resetting its text, so the stale widget text (e.g. 'Qip' left
+    over from q_ip) must NOT win over the authoritative gi_mode."""
+    from xdart.gui.tabs.static_scan.controls_logic import (
+        _range_axis_labels_1d,
+        _range_axis_labels_2d,
+    )
+
+    # 1D q_total carrying a STALE 'Qip' radial label -> gi_mode wins -> polar Q.
+    radial, azim = _range_axis_labels_1d({
+        ("Int1D", "gi_mode"): "q_total",
+        ("Int1D", "unit"): "q_A^-1",
+        ("Int1D", "radial_label"): "Qip (Å⁻¹)",
+        ("Int1D", "azim_label"): "χ (°)",
+    })
+    assert radial == "Q (Å⁻¹)"
+    assert azim == "χ (°)"
+
+    # 2D q_chi carrying a stale 'Qip' radial label -> gi_mode wins.
+    radial2, azim2 = _range_axis_labels_2d({
+        ("Int2D", "gi_mode"): "q_chi",
+        ("Int2D", "unit"): "q_A^-1",
+        ("Int2D", "radial_label"): "Qip (Å⁻¹)",
+        ("Int2D", "azim_label"): "χ (°)",
+    })
+    assert radial2 == "Q (Å⁻¹)"
+    assert azim2 == "χ (°)"
+
+    # Standard mode (no gi_mode) STILL prefers the live legacy label.
+    radial_std, azim_std = _range_axis_labels_1d({
+        ("Int1D", "radial_label"): "2θ (°)",
+        ("Int1D", "azim_label"): "χ (°)",
+    })
+    assert radial_std == "2θ (°)"
+    assert azim_std == "χ (°)"
+
+
+def test_controls_logic_imports_no_heavy_deps():
+    """controls_logic.py MUST stay Qt-free (CLAUDE.md: pure decision layer).
+
+    Load it BY FILE PATH in a clean subprocess — not via the dotted
+    ``xdart.gui...`` package, whose ``__init__`` chain pulls Qt/pyqtgraph — and
+    assert it imported none of the forbidden heavy modules.  Mirrors
+    ``test_display_logic_imports_no_heavy_deps``; makes the Qt-free invariant a
+    CI gate rather than a convention.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    import xdart.gui.tabs.static_scan.controls_logic as _cl
+
+    path = _cl.__file__
+    forbidden = ('PySide6', 'PySide2', 'PyQt5', 'PyQt6',
+                 'pyqtgraph', 'h5py', 'pyFAI', 'fabio')
+    code = textwrap.dedent(f"""
+        import sys, importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "controls_logic_isolated", {path!r})
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod  # dataclasses needs the module registered
+        spec.loader.exec_module(mod)
+        bad = [m for m in {forbidden!r} if m in sys.modules]
+        if bad:
+            print(','.join(bad))
+            sys.exit(1)
+    """)
+    proc = subprocess.run([sys.executable, '-c', code],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, (
+        f"controls_logic pulled in forbidden modules: {proc.stdout.strip()}\n"
+        f"{proc.stderr.strip()}"
+    )
 
 
 def test_bound_control_state_describes_integration_form():

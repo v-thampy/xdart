@@ -879,6 +879,51 @@ def test_clear_display_state_resets_visible_and_cached_state():
     assert wf_widget.raw_image.size == 0
 
 
+def test_update_2d_label_omits_frame_index_for_averaged_series():
+    """An averaged series collapses to one frame: the title is the bare series
+    name (no '_1'), even though it stays frame #1 in the Frames list.  A non-
+    averaged frame still carries its current index.  (Regression: the
+    Single/Overlay/Waterfall early-return appended '_1' for averaged series.)"""
+    label = _FakeLabel()
+
+    def _host(series_average, idxs=(1,)):
+        host = SimpleNamespace(
+            scan=SimpleNamespace(name='myscan', single_img=False,
+                                 series_average=series_average),
+            plotMethod='Single',
+            idxs_2d=list(idxs),
+            idxs_1d=list(idxs),
+            frame_ids=['1'],
+            overall=False,
+            ui=SimpleNamespace(labelCurrent=label),
+        )
+        host.update_2d_label = MethodType(displayFrameWidget.update_2d_label, host)
+        return host
+
+    _host(series_average=True).update_2d_label()
+    assert label.text == 'myscan'                 # bare name, no '_1'
+
+    _host(series_average=False, idxs=(5,)).update_2d_label()
+    assert label.text == 'myscan_5'               # non-averaged still indexed
+
+
+def test_trace_name_omits_frame_index_for_averaged_series():
+    """The 1D legend (publication path) is the bare series name for an averaged
+    series, matching the title + legacy build_plot_names."""
+    from xdart.gui.tabs.static_scan.display_publication import _trace_name
+
+    pub = SimpleNamespace(
+        label=1,
+        metadata_raw={},
+        view=SimpleNamespace(source_path=None),
+        source_identity=None,
+    )
+    avg = SimpleNamespace(scan=SimpleNamespace(name='myscan', series_average=True))
+    plain = SimpleNamespace(scan=SimpleNamespace(name='myscan', series_average=False))
+    assert _trace_name(pub, avg) == 'myscan'
+    assert _trace_name(pub, plain) == 'myscan_1'
+
+
 def _clear_1d_host(viewer_mode):
     emitted = []
     label = _FakeLabel()
@@ -1546,6 +1591,204 @@ def test_gi_motor_options_default_manual_when_no_metadata():
     assert gi["th_motor"].value() == "th"
     assert gi["th_val"].visible is False
     assert h.incidence_motor == "th"
+
+
+def test_gi_motor_options_default_select_follows_preference_order():
+    """The GI incidence motor default-selects by preference order
+    (th, eta, theta, gonth, halpha; case-insensitive): the first present wins,
+    else the first available motor, else Manual.  ALL motor columns are offered
+    so a non-default motor is still pickable."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    class _P:
+        def __init__(self, value=None):
+            self._v = value
+            self.visible = True
+        def value(self):
+            return self._v
+        def setValue(self, v):
+            self._v = v
+        def setOpts(self, **o):
+            if "value" in o:
+                self._v = o["value"]
+            if "visible" in o:
+                self.visible = o["visible"]
+            self.opts = o
+        def hide(self):
+            self.visible = False
+        def show(self):
+            self.visible = True
+
+    def _select(motors):
+        gi = {"th_motor": _P("th"), "th_val": _P("0.1")}
+        params = SimpleNamespace(child=lambda name: SimpleNamespace(child=lambda n: gi[n]))
+        h = SimpleNamespace(motors=motors, parameters=params, incidence_motor=None)
+        h.set_gi_th_motor = MethodType(imageWrangler.set_gi_th_motor, h)
+        h.set_gi_motor_options = MethodType(imageWrangler.set_gi_motor_options, h)
+        h.set_gi_motor_options()
+        return gi["th_motor"].value(), gi["th_motor"].opts["values"]
+
+    # eta is preferred over theta (the key difference from the old order), and
+    # every motor column is offered (plus Manual).
+    value, items = _select(["theta", "eta", "i0"])
+    assert value == "eta"
+    assert set(items) == {"Manual", "theta", "eta", "i0"}
+
+    # Case-insensitive: 'TH' still wins as the top preference.
+    value, _ = _select(["i0", "TH", "eta"])
+    assert value == "TH"
+
+    # No preferred motor present -> first available motor (still pickable list).
+    value, _ = _select(["mu", "chi"])
+    assert value == "mu"
+
+
+def test_get_img_fname_clears_motors_when_source_switch_resolves_no_file():
+    """Switching to Image Directory with no directory chosen must drop the
+    previous source's motors (and the stale img_file) so the GI Theta Motor
+    dropdown resets to Manual instead of keeping the last file's columns."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    class _P:
+        def __init__(self, value=None):
+            self._v = value
+            self.visible = True
+        def value(self):
+            return self._v
+        def setValue(self, v):
+            self._v = v
+        def setOpts(self, **o):
+            self.opts = o
+            if "value" in o:
+                self._v = o["value"]
+            if "visible" in o:
+                self.visible = o["visible"]
+        def hide(self):
+            self.visible = False
+        def show(self):
+            self.visible = True
+
+    signal = {"img_ext": _P("h5"), "img_dir": _P(""), "include_subdir": _P(False),
+              "File": _P("")}
+    gi = {"th_motor": _P("th"), "th_val": _P("0.1")}
+    groups = {"Signal": signal, "GI": gi}
+    params = SimpleNamespace(
+        child=lambda name: SimpleNamespace(child=lambda n: groups[name][n]))
+
+    h = SimpleNamespace(
+        inp_type="Image Directory",
+        img_file="/prev/scan_0001.tif",   # stale, from the previous Image Series
+        scan_parameters=["th", "i0"],
+        motors=["th", "i0"],
+        counters=["i0", "mon"],           # stale
+        parameters=params,
+        meta_ext="",
+        file_filter="",
+        include_subdir=False,
+        img_ext="h5",
+        img_dir="",
+        incidence_motor=None,
+    )
+    h.get_img_fname = MethodType(imageWrangler.get_img_fname, h)
+    h.set_gi_motor_options = MethodType(imageWrangler.set_gi_motor_options, h)
+    h.set_gi_th_motor = MethodType(imageWrangler.set_gi_th_motor, h)
+    h._sync_meta_ext_to_img_ext = lambda: None
+    h._find_image_directory_seed = lambda match, suffix: None  # no seed -> no file
+    h.exists_meta_file = lambda f: False
+    h.detect_meta_ext = lambda f: None
+    h.set_bg_matching_options = lambda: None
+    h.set_bg_norm_options = lambda: None
+
+    h.get_img_fname()
+
+    assert h.img_file == ""          # stale file dropped
+    assert h.motors == []            # stale motors cleared
+    assert h.scan_parameters == []
+    assert h.counters == []          # stale counters cleared too (F4)
+    assert gi["th_motor"].value() == "Manual"   # dropdown reset to Manual
+
+
+def test_set_meta_ext_clears_params_to_force_metadata_reread():
+    """Changing the Meta Type drops the previous format's parsed parameters
+    BEFORE re-running get_img_fname, so the metadata (and GI motor list) is
+    re-resolved under the new format (e.g. txt -> pdi with no .pdi sidecar)."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    class _P:
+        def __init__(self, value=None):
+            self._v = value
+        def value(self):
+            return self._v
+        def show(self, *_a):
+            pass
+        def hide(self):
+            pass
+
+    signal = {"meta_ext": _P("pdi"), "meta_dir": _P("")}
+    params = SimpleNamespace(
+        child=lambda name: SimpleNamespace(child=lambda n: signal[n]))
+
+    seen = []
+    h = SimpleNamespace(
+        parameters=params,
+        scan_parameters=["th", "i0"],   # stale, from the previous (txt) format
+        meta_ext="txt",
+    )
+    h.set_meta_ext = MethodType(imageWrangler.set_meta_ext, h)
+    h._save_to_session = lambda: None
+    # Capture scan_parameters AT THE MOMENT get_img_fname is called.
+    h.get_img_fname = lambda: seen.append(list(h.scan_parameters))
+
+    h.set_meta_ext()
+
+    assert h.meta_ext == "pdi"
+    assert seen == [[]]              # params were cleared before the re-read
+    assert h.scan_parameters == []
+
+
+def test_get_img_fname_no_sidecar_clears_counters_and_refreshes_bg(tmp_path):
+    """F4: when a format/source switch resolves a file with NO metadata sidecar,
+    get_img_fname clears scan_parameters, motors AND counters, and refreshes the
+    GI motor + BG Match + norm-channel dropdowns — so none keeps the previous
+    format's stale columns."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    img = tmp_path / "scan_0001.tif"
+    img.write_bytes(b"x")
+
+    class _P:
+        def __init__(self, v):
+            self._v = v
+        def value(self):
+            return self._v
+
+    signal = {"File": _P(str(img))}
+    params = SimpleNamespace(
+        child=lambda name: SimpleNamespace(child=lambda n: signal[n]))
+
+    called = []
+    h = SimpleNamespace(
+        inp_type="Image Series",
+        img_file="",
+        meta_ext="pdi",                 # truthy, but the file has no .pdi sidecar
+        scan_parameters=["th", "i0"],   # stale, from the previous format
+        motors=["th"],                  # stale
+        counters=["i0", "mon"],         # stale
+        parameters=params,
+    )
+    h._sync_meta_ext_to_img_ext = lambda: None
+    h.exists_meta_file = lambda *_a: False   # force the no-sidecar branch
+    h.set_gi_motor_options = lambda: called.append("gi")
+    h.set_bg_matching_options = lambda: called.append("bg_match")
+    h.set_bg_norm_options = lambda: called.append("bg_norm")
+    h.get_img_fname = MethodType(imageWrangler.get_img_fname, h)
+
+    h.get_img_fname()
+
+    assert h.scan_parameters == []
+    assert h.motors == []
+    assert h.counters == []                       # F4: counters cleared too
+    assert called == ["gi", "bg_match", "bg_norm"]  # all three dropdowns refreshed
 
 
 def test_data_changed_tolerates_non_integer_labels():

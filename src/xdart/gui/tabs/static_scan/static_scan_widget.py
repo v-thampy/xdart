@@ -426,10 +426,13 @@ class staticWidget(QWidget):
                 total = sum(self.ui.mainSplitter.sizes()) or 1000
                 # Controls (right) and data-browser (left) columns start at the
                 # SAME width; the middle display panels take the rest (Vivek).
-                # User-resizable via the splitter (re-asserted only during the
-                # first-3s launch resize storm).
+                # The side columns are 10% narrower than before (0.28 -> 0.252)
+                # so the central display isn't squished; the freed space goes to
+                # the middle.  Min/max widths are untouched (set elsewhere) --
+                # this only moves the default/initial split.  User-resizable via
+                # the splitter (re-asserted only during the first-3s launch storm).
                 self.ui.mainSplitter.setSizes(
-                    [int(total * f) for f in (0.28, 0.44, 0.28)])
+                    [int(total * f) for f in (0.252, 0.496, 0.252)])
                 self.ui.mainSplitter.setStretchFactor(1, 1)
                 # Left column: the Tools card is now a compact 3-button panel, so
                 # give it only a small share (~18%) and let the data browser take
@@ -1146,11 +1149,60 @@ class staticWidget(QWidget):
             signature = render_state
             if signature == getattr(self, "_controls_v2_last_signature", None):
                 return
+            # A background rebuild (set_state -> clear_rows) would destroy a line
+            # editor the user is mid-way through and silently drop the uncommitted
+            # text.  If one is focused, defer until it COMMITS (editingFinished =
+            # Enter / focus loss) rather than re-arming the throttle every interval
+            # (which would keep a timer waking through a long acquisition).  The
+            # rebuild is then SCHEDULED through the throttle, never run inside the
+            # editingFinished slot (which would delete the editor mid-emission).
+            # Signature is left unstamped so the deferred pass still detects the
+            # change and rebuilds.
+            editor = panel.focusWidget()
+            if isinstance(editor, QtWidgets.QLineEdit):
+                self._defer_controls_v2_refresh_until_commit(editor)
+                return
+            self._cancel_deferred_controls_v2_refresh()
             panel.set_state(render_state)
             self._controls_v2_last_signature = signature
         except Exception:
             logger.debug("Controls Panel V2 profile refresh failed",
                          exc_info=True)
+
+    def _defer_controls_v2_refresh_until_commit(self, editor) -> None:
+        """Arm a one-shot: when ``editor`` finishes editing (Enter / focus loss),
+        schedule the deferred Controls V2 rebuild through the throttle.  Replaces
+        re-arming the throttle each interval, so a focused field during a long
+        acquisition no longer keeps a timer alive."""
+        if getattr(self, "_controls_v2_pending_editor", None) is editor:
+            return
+        self._cancel_deferred_controls_v2_refresh()
+        self._controls_v2_pending_editor = editor
+        editor.editingFinished.connect(self._on_controls_v2_pending_editor_done)
+
+    def _cancel_deferred_controls_v2_refresh(self) -> None:
+        """Drop a pending editingFinished one-shot (editor committed, was
+        destroyed by a rebuild, or teardown)."""
+        editor = getattr(self, "_controls_v2_pending_editor", None)
+        if editor is not None:
+            try:
+                editor.editingFinished.disconnect(
+                    self._on_controls_v2_pending_editor_done)
+            except (TypeError, RuntimeError):
+                pass
+        self._controls_v2_pending_editor = None
+
+    def _on_controls_v2_pending_editor_done(self, *args) -> None:
+        """The deferred-on editor committed: schedule (do NOT run) the rebuild
+        via the throttle, so it lands after this slot returns and we never delete
+        the editor while it is still emitting editingFinished."""
+        self._cancel_deferred_controls_v2_refresh()
+        self._refresh_controls_v2_profile(immediate=False)
+
+    def _on_gi_motor_options_changed(self, _motors=None) -> None:
+        """The wrangler emitted a fresh GI motor-column list (metadata loaded);
+        re-render so the inline V2 GI motor combo shows the updated choices."""
+        self._refresh_controls_v2_profile(immediate=True)
 
     def _controls_v2_state(self) -> ControlState:
         """Build a lightweight, best-effort Controls V2 state snapshot."""
@@ -1225,6 +1277,22 @@ class staticWidget(QWidget):
             ub_known=bool(getattr(self.scan, "ub_matrix", None)),
             material_known=False,
         )
+        run_active = (bool(getattr(self, "_run_active", False))
+                      or self._session_run_active())
+        display_frame_count = frame_count or len(labels)
+        if run_active:
+            # During a run the processed-frame count ticks every frame; letting
+            # it into the render signature would rebuild the whole controls panel
+            # ~5 Hz (clear_rows + recreate every row).  Live progress is shown in
+            # the status bar, so freeze the panel's frame count at the run-start
+            # value (snapshot once) — it resyncs when the run ends and the
+            # snapshot clears.  The panel is locked during a run, so a frozen
+            # count loses nothing.
+            if getattr(self, "_controls_v2_run_frame_count", None) is None:
+                self._controls_v2_run_frame_count = display_frame_count
+            display_frame_count = self._controls_v2_run_frame_count
+        else:
+            self._controls_v2_run_frame_count = None
         return ControlState(
             tool=tool,
             mode=meas_mode,
@@ -1235,13 +1303,10 @@ class staticWidget(QWidget):
             project_root=str(getattr(getattr(self, "wrangler", None), "project_folder", "") or ""),
             source_label=source_label,
             save_path=str(getattr(getattr(self, "wrangler", None), "h5_dir", "") or ""),
-            frame_count=frame_count or len(labels),
+            frame_count=display_frame_count,
             processing_mode=mode_text,
             real_data_gates=frozenset(),
-            controls_locked=(
-                bool(getattr(self, "_run_active", False))
-                or self._session_run_active()
-            ),
+            controls_locked=run_active,
         )
 
     def _controls_v2_source_label(self) -> str:
@@ -1886,6 +1951,12 @@ class staticWidget(QWidget):
         if hasattr(self.wrangler, 'sigGIMotorOptions'):
             self.wrangler.sigGIMotorOptions.connect(
                 self.integratorTree.set_gi_motor_options)
+            # Re-render the V2 panel so its inline GI motor combo picks up the
+            # freshly-populated choices (it reads them from the integrator combo,
+            # which set_gi_motor_options just repopulated).  Signature-gated, so
+            # it's a no-op when the motor list is unchanged.
+            self.wrangler.sigGIMotorOptions.connect(
+                self._on_gi_motor_options_changed)
         self.wrangler.started.connect(self.thread_state_changed)
         self.wrangler.finished.connect(self.wrangler_finished)
         # Pause/Resume (Phase B): lift the freeze guard once paused (frozen at a
@@ -2739,6 +2810,12 @@ class staticWidget(QWidget):
         if self._run_active:
             return
         self._run_active = True
+        # Re-snapshot the frame-count freeze from scratch each run: clear any
+        # leftover snapshot so a new run can't freeze at the PREVIOUS run's frame
+        # count if no run_active=False refresh happened to clear it in between
+        # (F6 — the clear in _controls_v2_state is timing-dependent; this is the
+        # authoritative reset at run START).
+        self._controls_v2_run_frame_count = None
         # Append-mode feedback: track whether THIS run displayed any frame, so a
         # run that processes 0 new frames (Append over an already-complete scan)
         # can still show the scan's last frame at the end (visual confirmation
