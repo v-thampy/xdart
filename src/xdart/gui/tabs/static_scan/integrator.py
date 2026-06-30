@@ -1253,7 +1253,7 @@ class integratorTree(QtWidgets.QWidget):
         # use the fiber methods (q_ip / q_oop / exit_angle), or for q_total
         # with a restricted χ range.  When hidden, frame.py falls back to
         # npt_oop = numpoints.
-        if self.scan.gi and self.ui.npts_oop_1D.isVisible():
+        if self.scan.gi and self._npts_oop_1d_exposed():
             oop_val = self.ui.npts_oop_1D.text()
             oop_val = val if (not oop_val) else int(oop_val)
             self.scan.bai_1d_args['npt_oop'] = oop_val
@@ -2085,9 +2085,19 @@ class integratorTree(QtWidgets.QWidget):
         self.ui.npts_1D.setText(npt)
         if oop:
             self.ui.npts_oop_1D.setText(oop)
-        elif self.ui.npts_oop_1D.isVisible():
+        elif self._npts_oop_1d_exposed():
             # visible-but-unset (q_total with a chi wedge): mirror npt
             self.ui.npts_oop_1D.setText(npt)
+
+    def _npts_oop_1d_exposed(self):
+        """Whether the second 1-D points box is intentionally exposed.
+
+        During the Controls V2 migration the legacy integrator widget tree can
+        be hidden while it remains the parser.  Use the child widget's explicit
+        hidden state instead of ``isVisible()``, which would include the hidden
+        parent and incorrectly suppress ``npt_oop``.
+        """
+        return not self.ui.npts_oop_1D.isHidden()
 
     def _update_gi_mode_1d(self, n):
         """Update 1D integration mode from axis1D combo selection.

@@ -764,7 +764,10 @@ class staticWidget(QWidget):
             widget = getattr(ui, spec.widget_name, None)
             if widget is None:
                 continue
-            if spec.visible_when == "widget_visible" and not widget.isVisible():
+            if (
+                spec.visible_when == "widget_visible"
+                and not self._controls_v2_integrator_widget_exposed(widget)
+            ):
                 continue
             try:
                 if spec.value_role == "checked":
@@ -808,6 +811,18 @@ class staticWidget(QWidget):
                 logger.debug("Controls Panel V2 could not read scan axis state",
                              exc_info=True)
         return values
+
+    @staticmethod
+    def _controls_v2_integrator_widget_exposed(widget):
+        """Return whether the hidden legacy parser explicitly exposes a widget.
+
+        Controls V2 hides the old integrator panel but still uses its widgets as
+        the migration parser.  ``isVisible()`` includes hidden ancestors, so it
+        would report False for controls the legacy parser intentionally showed
+        before the parent frame was hidden.  ``isHidden()`` tracks the child's
+        own show/hide state, which is the signal we need here.
+        """
+        return widget is not None and not widget.isHidden()
 
     def _controls_v2_integrator_choices(self):
         ui = getattr(getattr(self, "integratorTree", None), "ui", None)
