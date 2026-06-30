@@ -64,6 +64,21 @@ class StaticControls(QtWidgets.QWidget):
         self.statusLabel.setObjectName('statusLabel')
         self.statusLabel.hide()
 
+        self.readinessRow = QtWidgets.QWidget()
+        self.readinessRow.setObjectName('runReadinessRow')
+        readiness = QtWidgets.QHBoxLayout(self.readinessRow)
+        readiness.setContentsMargins(2, 0, 2, 0)
+        readiness.setSpacing(6)
+        self.readinessDot = QtWidgets.QLabel('●')
+        self.readinessDot.setObjectName('runReadinessDot')
+        self.readinessDot.setAlignment(QtCore.Qt.AlignCenter)
+        readiness.addWidget(self.readinessDot)
+        self.readinessLabel = QtWidgets.QLabel('')
+        self.readinessLabel.setObjectName('runReadinessLabel')
+        readiness.addWidget(self.readinessLabel, 1)
+        self.readinessRow.hide()
+        outer.addWidget(self.readinessRow)
+
         row1 = QtWidgets.QHBoxLayout()
         row1.setContentsMargins(0, 0, 0, 0)
         row1.setSpacing(6)
@@ -174,6 +189,17 @@ class StaticControls(QtWidgets.QWidget):
 
     def action_phase(self):
         return self._run_phase
+
+    def set_readiness_summary(self, text='', *, ready=True, tooltip=''):
+        text = str(text or '').strip()
+        was_hidden = self.readinessRow.isHidden()
+        self.readinessRow.setVisible(bool(text))
+        self.readinessDot.setProperty('ready', bool(ready))
+        self.readinessLabel.setText(text)
+        self.readinessLabel.setToolTip(tooltip or text)
+        self.readinessDot.style().unpolish(self.readinessDot)
+        self.readinessDot.style().polish(self.readinessDot)
+        return was_hidden != self.readinessRow.isHidden()
 
     def set_stop_enabled(self, enabled):
         self.stopButton.setEnabled(bool(enabled))

@@ -626,6 +626,36 @@ def test_controls_panel_v2_renders_bound_render_state_directly(qapp):
     assert panel.analysis_card.isHidden()
 
 
+def test_controls_panel_v2_detector_status_uses_poni_summary(qapp):
+    profile = build_control_profile(
+        ControlState(
+            source_caps=SourceCaps(has_frames=True),
+            detector_summary="Eiger 1M · 200.4mm · fitted",
+        )
+    )
+    state = ControlPanelRenderState(
+        profile=profile,
+        bound_controls=BoundControlState(fields=(
+            ControlFormField(
+                section=SectionId.EXPERIMENT,
+                label="Poni",
+                path=("Signal", "poni_file"),
+                value="/tmp/example.poni",
+                browse=True,
+            ),
+        )),
+    )
+
+    panel = ControlsPanelV2()
+    panel.set_state(state)
+
+    detector = next(
+        card for card in panel.experiment_card.body.findChildren(SubsectionCard)
+        if card.title.text() == "Detector"
+    )
+    assert detector.status.text() == "Eiger 1M · 200.4mm · fitted"
+
+
 def test_make_mask_updates_mask_file_box(qapp, monkeypatch):
     """_on_mask_created writes the mask path to the wrangler param AND the V2
     Mask File box reflects it — the handler refreshes the panel, which re-reads
@@ -1048,6 +1078,29 @@ def test_controls_panel_v2_energy_conflict_reaches_widget_profile(
         assert state.geom.calibration_energy_eV == pytest.approx(
             wavelength_m_to_energy_eV(1.0e-10), rel=1e-12)
         assert state.geom.source_energy_eV == pytest.approx(15_000.0)
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_state_summarizes_cached_poni_detector(
+        qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.core.containers import PONI
+
+    widget = staticWidget()
+    try:
+        widget.scan._cached_poni = PONI(
+            dist=0.2004,
+            poni1=0.0,
+            poni2=0.0,
+            detector="Eiger 1M",
+        )
+
+        state = widget._controls_v2_state()
+
+        assert state.detector_summary == "Eiger 1M · 200.4mm · fitted"
     finally:
         widget.close()
         widget.deleteLater()

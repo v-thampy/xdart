@@ -9,6 +9,7 @@ from queue import Queue
 import threading
 import copy
 import os
+import math
 from collections import OrderedDict
 import gc
 import imageio
@@ -1933,6 +1934,7 @@ class staticWidget(QWidget):
             values = self._controls_v2_field_values()
             choices = self._controls_v2_field_choices()
             render_state = build_control_panel_state(state, values, choices)
+            self._controls_v2_update_run_summary(state, render_state.profile)
             signature = render_state
             if signature == getattr(self, "_controls_v2_last_signature", None):
                 return
@@ -1955,6 +1957,36 @@ class staticWidget(QWidget):
         except Exception:
             logger.debug("Controls Panel V2 profile refresh failed",
                          exc_info=True)
+
+    def _controls_v2_update_run_summary(self, state: ControlState, profile) -> None:
+        setter = getattr(getattr(self, "controls", None),
+                         "set_readiness_summary", None)
+        if not callable(setter):
+            return
+        text, ready, tooltip = self._controls_v2_run_summary(state, profile)
+        changed = setter(text, ready=ready, tooltip=tooltip)
+        if changed:
+            self._fit_controls_height()
+
+    @staticmethod
+    def _controls_v2_run_summary(state: ControlState, profile) -> tuple[str, bool, str]:
+        ready = bool(getattr(profile, "can_run", False))
+        status = "Ready" if ready else "Needs setup"
+        mode = str(getattr(state, "processing_mode", "") or "").strip()
+        if not mode:
+            page = getattr(getattr(profile, "processing_page", None),
+                           "value", "")
+            mode = str(page).replace("_", " ").title()
+        parts = [status]
+        if mode:
+            parts.append(mode)
+        frame_count = int(getattr(state, "frame_count", 0) or 0)
+        if frame_count:
+            plural = "" if frame_count == 1 else "s"
+            parts.append(f"{frame_count} frame{plural}")
+        blockers = tuple(getattr(profile, "run_blockers", ()) or ())
+        tooltip = "" if ready else "; ".join(str(b) for b in blockers[:3])
+        return " · ".join(parts), ready, tooltip
 
     def _defer_controls_v2_refresh_until_commit(self, editor) -> None:
         """Arm a one-shot: when ``editor`` finishes editing (Enter / focus loss),
@@ -2102,6 +2134,7 @@ class staticWidget(QWidget):
             project_root=str(getattr(getattr(self, "wrangler", None), "project_folder", "") or ""),
             source_label=source_label,
             save_path=str(getattr(getattr(self, "wrangler", None), "h5_dir", "") or ""),
+            detector_summary=self._controls_v2_detector_summary(),
             frame_count=display_frame_count,
             processing_mode=mode_text,
             real_data_gates=frozenset(),
@@ -2128,6 +2161,102 @@ class staticWidget(QWidget):
             return bool(getattr(self.integratorTree, "_cached_poni", None))
         except Exception:
             return False
+
+    def _controls_v2_detector_summary(self) -> str:
+        """Compact detector/PONI summary for the Experiment subsection header."""
+        poni = self._controls_v2_current_poni()
+        scan = getattr(self, "scan", None)
+        integrator = getattr(scan, "_cached_integrator", None)
+
+        detector = self._controls_v2_detector_name(
+            getattr(poni, "detector", None))
+        if not detector:
+            detector = self._controls_v2_detector_name(
+                getattr(getattr(integrator, "detector", None), "name", None))
+        if not detector:
+            detector = self._controls_v2_detector_name(
+                getattr(integrator, "detector", None))
+
+        dist_m = self._controls_v2_positive_float(getattr(poni, "dist", None))
+        if dist_m is None:
+            dist_m = self._controls_v2_positive_float(
+                getattr(integrator, "dist", None))
+
+        parts = []
+        if detector:
+            parts.append(detector)
+        if dist_m is not None:
+            parts.append(self._controls_v2_detector_distance_text(dist_m))
+        if parts:
+            parts.append("fitted")
+        return " · ".join(parts)
+
+    def _controls_v2_current_poni(self):
+        scan = getattr(self, "scan", None)
+        wrangler = getattr(self, "wrangler", None)
+        for candidate in (
+            getattr(scan, "_cached_poni", None),
+            getattr(wrangler, "poni", None),
+            getattr(getattr(wrangler, "thread", None), "poni", None),
+            getattr(getattr(self, "integratorTree", None), "_cached_poni", None),
+        ):
+            if candidate is not None:
+                return candidate
+
+        poni_path = self._controls_v2_poni_path()
+        if not poni_path or not os.path.exists(poni_path):
+            return None
+        try:
+            from xrd_tools.core.containers import PONI
+            return PONI.from_poni_file(poni_path)
+        except Exception:
+            logger.debug("Controls V2 PONI summary load failed for %s",
+                         poni_path, exc_info=True)
+            return None
+
+    def _controls_v2_poni_path(self) -> str:
+        candidates = []
+        for path in (("Signal", "poni_file"), ("Calibration", "poni_file")):
+            param = self._controls_v2_param(path)
+            if param is None:
+                continue
+            try:
+                candidates.append(param.value())
+            except Exception:
+                pass
+        wrangler = getattr(self, "wrangler", None)
+        candidates.append(getattr(wrangler, "poni_file", ""))
+        for candidate in candidates:
+            if candidate:
+                return str(candidate)
+        return ""
+
+    @staticmethod
+    def _controls_v2_detector_name(value) -> str:
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            value = (
+                getattr(value, "name", None)
+                or getattr(value, "alias", None)
+                or getattr(value, "__class__", type(value)).__name__
+            )
+        name = str(value).strip()
+        if name.lower() in {"", "none", "detector"}:
+            return ""
+        return name
+
+    @staticmethod
+    def _controls_v2_positive_float(value) -> float | None:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        return out if math.isfinite(out) and out > 0 else None
+
+    @staticmethod
+    def _controls_v2_detector_distance_text(dist_m: float) -> str:
+        return f"{dist_m * 1000.0:.1f}mm"
 
     def _controls_v2_energy_known(self) -> bool:
         calibration_energy_eV, source_energy_eV = self._controls_v2_energy_values()

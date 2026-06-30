@@ -1030,7 +1030,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
             (
                 "Detector",
                 tuple(field for field in fields if field.path in detector_paths),
-                self._detector_status(fields),
+                self._detector_status(fields, profile.detector_summary),
             ),
             (
                 "Sample & measurement",
@@ -1351,7 +1351,12 @@ class ControlsPanelV2(QtWidgets.QWidget):
         return "standard"
 
     @staticmethod
-    def _detector_status(fields: tuple[ControlFormField, ...]) -> str:
+    def _detector_status(
+        fields: tuple[ControlFormField, ...],
+        detector_summary: str = "",
+    ) -> str:
+        if detector_summary:
+            return detector_summary
         values = {field.path: field.value for field in fields}
         if values.get(("Signal", "poni_file")) or values.get(("Calibration", "poni_file")):
             return "fitted"

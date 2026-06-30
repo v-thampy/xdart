@@ -129,3 +129,23 @@ def test_getters(qapp):
     assert c.is_batch() is True
     assert c.is_live() is False
     assert c.get_cores() == 2
+
+
+def test_readiness_summary_toggles_compact_status_row(qapp):
+    c = StaticControls()
+    assert c.readinessRow.isHidden()
+
+    changed = c.set_readiness_summary(
+        "Ready · Int 2D · 50 frames",
+        ready=True,
+        tooltip="Everything is ready.",
+    )
+
+    assert changed is True
+    assert not c.readinessRow.isHidden()
+    assert c.readinessLabel.text() == "Ready · Int 2D · 50 frames"
+    assert c.readinessLabel.toolTip() == "Everything is ready."
+    assert c.readinessDot.property("ready") is True
+
+    assert c.set_readiness_summary("", ready=False) is True
+    assert c.readinessRow.isHidden()
