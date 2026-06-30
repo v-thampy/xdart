@@ -1644,17 +1644,7 @@ class staticWidget(QWidget):
                 return False
         except Exception:
             pass
-        try:
-            if controls is not None and controls.batchButton.isChecked():
-                return True
-        except Exception:
-            pass
-        wrangler = getattr(self, "wrangler", None)
-        thread = getattr(wrangler, "thread", None)
-        return bool(
-            getattr(wrangler, "batch_mode", False)
-            or getattr(thread, "batch_mode", False)
-        )
+        return True
 
     @staticmethod
     def _controls_v2_backend(tool) -> str | None:
@@ -3093,8 +3083,50 @@ class staticWidget(QWidget):
             if frame is not None:
                 frame.setEnabled(not is_viewer and not run_active)
 
-        if getattr(self, "controls_v2", None) is not None:
+        if getattr(self, "controls_v2", None) is not None and run_active:
+            self._set_controls_v2_current_fields_enabled(False)
+        elif getattr(self, "controls_v2", None) is not None:
             self._refresh_controls_v2_profile(immediate=True)
+
+    def _set_controls_v2_current_fields_enabled(self, enabled: bool) -> None:
+        """Lock existing V2 editors without rebuilding the panel."""
+
+        panel = getattr(self, "controls_v2", None)
+        if panel is None:
+            return
+        try:
+            from .ui.controls_panel_v2 import (  # local import avoids init-time Qt churn
+                FormRow,
+                PillRow,
+                RangeRow,
+                SegmentedControl,
+            )
+        except Exception:
+            logger.debug("Controls Panel V2 lock import failed", exc_info=True)
+            return
+
+        enabled = bool(enabled)
+        for row in panel.findChildren(FormRow):
+            editor = getattr(row, "editor", None)
+            if editor is not None:
+                editor.setEnabled(enabled)
+            browse = getattr(row, "browse_button", None)
+            if browse is not None:
+                browse.setEnabled(enabled)
+        for row in panel.findChildren(RangeRow):
+            for editor_name in ("_low", "_high"):
+                editor = getattr(row, editor_name, None)
+                if editor is not None:
+                    editor.setEnabled(enabled)
+            toggle = getattr(row, "_toggle", None)
+            if toggle is not None:
+                toggle[1].setEnabled(enabled)
+        for row in panel.findChildren(PillRow):
+            for _path, button in getattr(row, "_pills", ()):
+                button.setEnabled(enabled)
+        for row in panel.findChildren(SegmentedControl):
+            for _value, button in getattr(row, "_segments", ()):
+                button.setEnabled(enabled)
 
     def _session_run_active(self):
         """4d: True iff a streaming session is open AND reports it is running.

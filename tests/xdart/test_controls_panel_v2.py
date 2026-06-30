@@ -1020,11 +1020,11 @@ def test_controls_panel_v2_refresh_defers_while_line_editor_focused(qapp, monkey
         widget.deleteLater()
 
 
-def test_controls_panel_v2_batch_refreshes_once_after_run(qapp, monkeypatch):
-    """Batch runs should not rebuild the V2 controls panel every progress tick.
+def test_controls_panel_v2_active_run_refreshes_once_after_run(qapp, monkeypatch):
+    """Active non-viewer runs should not rebuild V2 controls every progress tick.
 
     The profile is refreshed once the run exits, so the final state still
-    appears without adding GUI churn during long batch reductions.
+    appears without adding GUI churn during live/append reductions.
     """
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -1036,7 +1036,7 @@ def test_controls_panel_v2_batch_refreshes_once_after_run(qapp, monkeypatch):
             widget.controls_v2, "set_state",
             lambda state: calls.append(state),
         )
-        widget.controls.batchButton.setChecked(True)
+        widget.controls.batchButton.setChecked(False)
         widget._run_active = True
 
         widget._refresh_controls_v2_profile_now()
