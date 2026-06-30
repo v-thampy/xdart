@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import math
 from types import MappingProxyType
 from typing import Mapping, Sequence
 
@@ -208,6 +209,9 @@ class ResultCaps:
 class GeomState:
     calibrated: bool = False
     energy_known: bool = False
+    calibration_energy_eV: float | None = None
+    source_energy_eV: float | None = None
+    correction_energy_eV: float | None = None
     gi_enabled: bool = False
     sample_orientation_known: bool = False
     ub_known: bool = False
@@ -884,12 +888,90 @@ def _field(
     )
 
 
+ENERGY_CONFLICT_RTOL = 1.0e-3
+
+
+def _finite_positive_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) and out > 0 else None
+
+
+def _energy_conflict(
+    energy_a_eV: object,
+    energy_b_eV: object,
+    *,
+    what_a: str,
+    what_b: str,
+    rtol: float = ENERGY_CONFLICT_RTOL,
+) -> str:
+    """Return a user-facing conflict reason when two energy sources disagree."""
+
+    a = _finite_positive_float(energy_a_eV)
+    b = _finite_positive_float(energy_b_eV)
+    if a is None or b is None:
+        return ""
+    if abs(a - b) <= rtol * max(abs(a), abs(b), 1.0):
+        return ""
+    return (
+        f"{what_a} energy ({a:.1f} eV) disagrees with "
+        f"{what_b} energy ({b:.1f} eV)."
+    )
+
+
+def _energy_value_text(geom: GeomState, caps: SourceCaps) -> str:
+    pieces = []
+    calibration = _finite_positive_float(geom.calibration_energy_eV)
+    source = _finite_positive_float(geom.source_energy_eV)
+    correction = _finite_positive_float(geom.correction_energy_eV)
+    if calibration is not None:
+        pieces.append(f"cal {calibration:.1f} eV")
+    if source is not None:
+        pieces.append(f"source {source:.1f} eV")
+    if correction is not None:
+        pieces.append(f"correction {correction:.1f} eV")
+    if pieces:
+        return "; ".join(pieces)
+    return "known" if geom.energy_known or caps.has_energy else ""
+
+
+def _energy_status_reason(geom: GeomState, caps: SourceCaps) -> tuple[StatusKind, str, str]:
+    calibration = _finite_positive_float(geom.calibration_energy_eV)
+    source = _finite_positive_float(geom.source_energy_eV)
+    correction = _finite_positive_float(geom.correction_energy_eV)
+    conflict = (
+        _energy_conflict(
+            calibration, source,
+            what_a="Calibration", what_b="source")
+        or _energy_conflict(
+            calibration, correction,
+            what_a="Calibration", what_b="correction")
+    )
+    value = _energy_value_text(geom, caps)
+    if conflict:
+        return StatusKind.CONFLICT, value, conflict
+    if geom.energy_known or caps.has_energy or any(
+        v is not None for v in (calibration, source, correction)
+    ):
+        return StatusKind.OK, value, ""
+    return (
+        StatusKind.MISSING,
+        "",
+        "Set calibration wavelength or source energy.",
+    )
+
+
 def build_field_statuses(state: ControlState) -> Mapping[FieldId, FieldStatus]:
     caps = state.source_caps
     geom = state.geom
     results = state.result_caps
     source_label = state.source_label or "No source selected"
     frame_value = str(state.frame_count) if state.frame_count else ""
+    energy_status, energy_value, energy_reason = _energy_status_reason(geom, caps)
     fields = {
         FieldId.PROJECT_ROOT: _field(
             FieldId.PROJECT_ROOT,
@@ -935,10 +1017,9 @@ def build_field_statuses(state: ControlState) -> Mapping[FieldId, FieldStatus]:
             reason="" if caps.has_raw else "Mask is optional until raw data is loaded."),
         FieldId.BEAM_ENERGY: _field(
             FieldId.BEAM_ENERGY,
-            StatusKind.OK if geom.energy_known or caps.has_energy else StatusKind.MISSING,
-            value="known" if geom.energy_known or caps.has_energy else "",
-            reason="" if geom.energy_known or caps.has_energy
-            else "Set calibration wavelength or source energy."),
+            energy_status,
+            value=energy_value,
+            reason=energy_reason),
         FieldId.SAMPLE_GI: _field(
             FieldId.SAMPLE_GI,
             StatusKind.OK if geom.gi_enabled else StatusKind.DEFERRED,
@@ -1294,29 +1375,53 @@ def tool_from_mode_text(mode_text: str | None) -> Tool:
 
 
 def run_blockers_for(state: ControlState) -> tuple[str, ...]:
-    blockers: list[str] = []
-    caps = state.source_caps
-    geom = state.geom
+    return run_blockers_from_fields(state, build_field_statuses(state))
+
+
+_RUN_BLOCKER_TEXT: Mapping[FieldId, str] = MappingProxyType({
+    FieldId.SOURCE_FRAMES: "Choose a frame source.",
+    FieldId.CALIBRATION_PONI: "Load detector calibration.",
+    FieldId.BEAM_ENERGY: "Set calibration wavelength or source energy.",
+    FieldId.SAMPLE_ORIENTATION: "Set GI sample orientation.",
+    FieldId.SOURCE_MOTORS: "RSM needs motor metadata.",
+    FieldId.DIFFRACTOMETER_UB: "Set/refine UB matrix before RSM.",
+})
+
+
+def run_required_fields_for(state: ControlState) -> tuple[FieldId, ...]:
+    required: list[FieldId] = []
     if state.tool in (Tool.INT_1D, Tool.INT_2D, Tool.STITCH, Tool.RSM):
-        if not caps.has_frames:
-            blockers.append("Choose a frame source.")
-        if not geom.calibrated:
-            blockers.append("Load detector calibration.")
-        if not geom.energy_known and not caps.has_energy:
-            blockers.append("Set calibration wavelength or source energy.")
+        required.extend((
+            FieldId.SOURCE_FRAMES,
+            FieldId.CALIBRATION_PONI,
+            FieldId.BEAM_ENERGY,
+        ))
     if state.mode == MeasMode.GI:
-        if not geom.sample_orientation_known:
-            blockers.append("Set GI sample orientation.")
+        required.append(FieldId.SAMPLE_ORIENTATION)
+    if state.tool == Tool.RSM:
+        required.extend((FieldId.SOURCE_MOTORS, FieldId.DIFFRACTOMETER_UB))
+    return tuple(dict.fromkeys(required))
+
+
+def run_blockers_from_fields(
+    state: ControlState,
+    fields: Mapping[FieldId, FieldStatus],
+) -> tuple[str, ...]:
+    blockers: list[str] = []
+    for field_id in run_required_fields_for(state):
+        field = fields.get(field_id)
+        if field is None:
+            continue
+        if field.status == StatusKind.MISSING:
+            blockers.append(_RUN_BLOCKER_TEXT.get(field_id) or field.reason)
+        elif field.status == StatusKind.CONFLICT:
+            blockers.append(field.reason or _RUN_BLOCKER_TEXT.get(field_id, "Resolve conflict."))
     if state.tool == Tool.STITCH:
         if state.mode == MeasMode.GI and "gi_stitch_real_data" not in state.real_data_gates:
             blockers.append("GI stitching awaits real-data gate.")
         if state.backend == "xu_hist" and "xu_hist_real_data" not in state.real_data_gates:
             blockers.append("xu_hist stitching awaits real-data gate.")
     if state.tool == Tool.RSM:
-        if not caps.has_motors:
-            blockers.append("RSM needs motor metadata.")
-        if not geom.ub_known:
-            blockers.append("Set/refine UB matrix before RSM.")
         if "rsm_real_data" not in state.real_data_gates:
             blockers.append("RSM GUI awaits real-data gate.")
     return tuple(dict.fromkeys(blockers))
@@ -1338,9 +1443,9 @@ def backend_required_for(state: ControlState) -> str | None:
 
 def build_control_profile(state: ControlState) -> ControlProfile:
     page = processing_page_for(state.tool, state.mode)
-    blockers = run_blockers_for(state)
     viewer = page == ProcessingPage.VIEWER
     fields = build_field_statuses(state)
+    blockers = run_blockers_from_fields(state, fields)
     return ControlProfile(
         processing_page=page,
         run_enabled=not blockers and not viewer,

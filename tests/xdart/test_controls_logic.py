@@ -22,6 +22,8 @@ from xdart.gui.tabs.static_scan.controls_logic import (
     build_control_panel_state,
     build_control_profile,
     coerce_control_edit_value,
+    run_blockers_from_fields,
+    run_required_fields_for,
     tool_from_mode_text,
 )
 
@@ -154,6 +156,49 @@ def test_build_field_statuses_tracks_source_geometry_and_results():
     assert fields[FieldId.OUTPUT_SAVE_PATH].value == "/data/out"
     assert fields[FieldId.RESULT_1D].status == StatusKind.OK
     assert fields[FieldId.RESULT_2D].status == StatusKind.MISSING
+
+
+def test_energy_conflict_blocks_runs_from_field_status():
+    state = ControlState(
+        tool=Tool.INT_2D,
+        source_caps=SourceCaps(has_frames=True, has_energy=True),
+        geom=GeomState(
+            calibrated=True,
+            energy_known=True,
+            calibration_energy_eV=12_700.0,
+            source_energy_eV=13_100.0,
+        ),
+    )
+    fields = build_field_statuses(state)
+    profile = build_control_profile(state)
+
+    assert fields[FieldId.BEAM_ENERGY].status == StatusKind.CONFLICT
+    assert "disagrees" in fields[FieldId.BEAM_ENERGY].reason
+    assert not profile.run_enabled
+    assert profile.run_blockers == (fields[FieldId.BEAM_ENERGY].reason,)
+
+
+def test_run_blockers_are_derived_from_required_field_statuses():
+    state = ControlState(tool=Tool.RSM, mode=MeasMode.GI)
+    fields = build_field_statuses(state)
+
+    assert run_required_fields_for(state) == (
+        FieldId.SOURCE_FRAMES,
+        FieldId.CALIBRATION_PONI,
+        FieldId.BEAM_ENERGY,
+        FieldId.SAMPLE_ORIENTATION,
+        FieldId.SOURCE_MOTORS,
+        FieldId.DIFFRACTOMETER_UB,
+    )
+    assert run_blockers_from_fields(state, fields) == (
+        "Choose a frame source.",
+        "Load detector calibration.",
+        "Set calibration wavelength or source energy.",
+        "Set GI sample orientation.",
+        "RSM needs motor metadata.",
+        "Set/refine UB matrix before RSM.",
+        "RSM GUI awaits real-data gate.",
+    )
 
 
 def test_control_profile_returns_fields_by_section_in_inventory_order():
@@ -333,9 +378,9 @@ def test_gi_mode_overrides_stale_hidden_radial_label():
 def test_controls_logic_imports_no_heavy_deps():
     """controls_logic.py MUST stay Qt-free (CLAUDE.md: pure decision layer).
 
-    Load it BY FILE PATH in a clean subprocess — not via the dotted
-    ``xdart.gui...`` package, whose ``__init__`` chain pulls Qt/pyqtgraph — and
-    assert it imported none of the forbidden heavy modules.  Mirrors
+    Import it by dotted path in a clean subprocess and assert it does not pull
+    the Qt/pyFAI GUI stack through ``static_scan.__init__``.  Then load the file
+    itself in isolation and assert the module has no broad heavy imports. Mirrors
     ``test_display_logic_imports_no_heavy_deps``; makes the Qt-free invariant a
     CI gate rather than a convention.
     """
@@ -343,27 +388,43 @@ def test_controls_logic_imports_no_heavy_deps():
     import sys
     import textwrap
 
-    import xdart.gui.tabs.static_scan.controls_logic as _cl
-
-    path = _cl.__file__
-    forbidden = ('PySide6', 'PySide2', 'PyQt5', 'PyQt6',
-                 'pyqtgraph', 'h5py', 'pyFAI', 'fabio')
-    code = textwrap.dedent(f"""
-        import sys, importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "controls_logic_isolated", {path!r})
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = mod  # dataclasses needs the module registered
-        spec.loader.exec_module(mod)
-        bad = [m for m in {forbidden!r} if m in sys.modules]
+    qt_forbidden = ('PySide6', 'PySide2', 'PyQt5', 'PyQt6',
+                    'pyqtgraph', 'pyFAI')
+    dotted = textwrap.dedent(f"""
+        import sys
+        import xdart.gui.tabs.static_scan.controls_logic
+        bad = [m for m in {qt_forbidden!r} if m in sys.modules]
         if bad:
             print(','.join(bad))
             sys.exit(1)
     """)
-    proc = subprocess.run([sys.executable, '-c', code],
+    proc = subprocess.run([sys.executable, '-c', dotted],
                           capture_output=True, text=True)
     assert proc.returncode == 0, (
-        f"controls_logic pulled in forbidden modules: {proc.stdout.strip()}\n"
+        f"controls_logic pulled in Qt/pyFAI modules: {proc.stdout.strip()}\n"
+        f"{proc.stderr.strip()}"
+    )
+
+    import xdart.gui.tabs.static_scan.controls_logic as _cl
+
+    file_forbidden = ('PySide6', 'PySide2', 'PyQt5', 'PyQt6',
+                      'pyqtgraph', 'h5py', 'pyFAI', 'fabio')
+    isolated = textwrap.dedent(f"""
+        import sys, importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "controls_logic_isolated", {_cl.__file__!r})
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        bad = [m for m in {file_forbidden!r} if m in sys.modules]
+        if bad:
+            print(','.join(bad))
+            sys.exit(1)
+    """)
+    proc = subprocess.run([sys.executable, '-c', isolated],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, (
+        f"controls_logic module pulled in forbidden modules: {proc.stdout.strip()}\n"
         f"{proc.stderr.strip()}"
     )
 
