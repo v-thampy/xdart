@@ -1145,13 +1145,15 @@ class ControlsPanelV2(QtWidgets.QWidget):
         profile: ControlProfile,
         fields: tuple[ControlFormField, ...],
     ) -> None:
+        inline_fields = [field for field in fields if not field.parameter_group]
+        advanced_fields = [field for field in fields if field.parameter_group]
         groups: dict[str, list[ControlFormField]] = {
             "1-D": [],
             "2-D": [],
             "Conditioning": [],
             "Background": [],
         }
-        for field in fields:
+        for field in inline_fields:
             groups.setdefault(self._processing_group_for_path(field.path), []).append(field)
 
         for name in ("1-D", "2-D", "Conditioning", "Background"):
@@ -1164,6 +1166,16 @@ class ControlsPanelV2(QtWidgets.QWidget):
             sub = SubsectionCard(name, accent="processing",
                                  status=self._group_status(group_fields))
             self._render_processing_group_rows(sub, group_fields)
+            self.processing_card.add_row(sub)
+
+        if advanced_fields:
+            sub = SubsectionCard(
+                "Advanced",
+                accent="processing",
+                status=self._group_status(advanced_fields),
+            )
+            self._render_processing_group_rows(sub, advanced_fields)
+            sub.set_collapsed(True)
             self.processing_card.add_row(sub)
 
         self._add_actions(

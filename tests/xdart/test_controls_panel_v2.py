@@ -44,6 +44,7 @@ from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import (
     PillRow,
     RangeRow,
     SegmentedControl,
+    SubsectionCard,
 )
 
 
@@ -366,6 +367,82 @@ def test_controls_panel_v2_int_inventory_includes_units_and_advanced_rows():
     assert specs[("Int2D", "unit")].widget_name == "unit_2D"
     assert specs[("Int1D", "method")].parameter_name == "method"
     assert specs[("Int2D", "method")].parameter_name == "method"
+    for path in required:
+        expected_group = "1d" if path[0] == "Int1D" else "2d"
+        assert specs[path].parameter_group == expected_group
+
+
+def test_controls_panel_v2_int_advanced_rows_are_collapsed(qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    def _subsections(widget):
+        return {
+            sub.title.text(): sub
+            for sub in widget.controls_v2.processing_card.body.findChildren(
+                SubsectionCard
+            )
+        }
+
+    def _paths(sub):
+        paths = {row.path for row in sub.body.findChildren(FormRow)}
+        for row in sub.body.findChildren(RangeRow):
+            paths.update(path for path, _ in row.current_edits())
+        for row in sub.body.findChildren(PillRow):
+            paths.update(path for path, _ in row.current_edits())
+        return paths
+
+    widget = staticWidget()
+    try:
+        widget._refresh_controls_v2_profile_now()
+
+        sections = _subsections(widget)
+        assert {"1-D", "2-D", "Advanced"} <= set(sections)
+        assert sections["Advanced"]._collapsed is True
+        assert sections["Advanced"].body.isVisible() is False
+
+        one_d_paths = _paths(sections["1-D"])
+        two_d_paths = _paths(sections["2-D"])
+        advanced_paths = _paths(sections["Advanced"])
+
+        assert {
+            ("Int1D", "axis"),
+            ("Int1D", "points"),
+            ("Int1D", "radial_auto"),
+            ("Int1D", "radial_low"),
+            ("Int1D", "radial_high"),
+            ("Int1D", "azim_auto"),
+            ("Int1D", "azim_low"),
+            ("Int1D", "azim_high"),
+        } <= one_d_paths
+        assert {
+            ("Int2D", "axis"),
+            ("Int2D", "radial_points"),
+            ("Int2D", "azim_points"),
+            ("Int2D", "radial_auto"),
+            ("Int2D", "radial_low"),
+            ("Int2D", "radial_high"),
+            ("Int2D", "azim_auto"),
+            ("Int2D", "azim_low"),
+            ("Int2D", "azim_high"),
+        } <= two_d_paths
+
+        moved_paths = {
+            ("Int1D", "unit"),
+            ("Int2D", "unit"),
+            ("Int1D", "method"),
+            ("Int2D", "method"),
+            ("Int1D", "correctSolidAngle"),
+            ("Int2D", "correctSolidAngle"),
+            ("Int1D", "safe"),
+            ("Int2D", "safe"),
+        }
+        assert not (moved_paths & one_d_paths)
+        assert not (moved_paths & two_d_paths)
+        assert moved_paths <= advanced_paths
+    finally:
+        widget.close()
+        widget.deleteLater()
 
 
 def test_controls_panel_v2_native_int_advanced_rows_write_through_and_match_plan(
@@ -1443,6 +1520,37 @@ def test_controls_panel_v2_native_scan_builder_matches_legacy_plan():
     ))
 
 
+def test_controls_panel_v2_native_gi_plan_defaults_orientation_to_4():
+    args_plan = build_native_int_reduction_plan_from_args(
+        {},
+        {},
+        gi_enabled=True,
+        gi_incident_angle=0.1,
+        integrate_2d=False,
+    )
+    assert args_plan.gi.sample_orientation == 4
+
+    class FakeFrames:
+        index = []
+
+    class FakeScan:
+        skip_2d = True
+        gi = True
+        _cached_fiber_integrator_angle = 0.1
+        incidence_motor = None
+        global_mask = None
+        detector_shape = (2, 3)
+        frames = FakeFrames()
+        bai_1d_args = {}
+        bai_2d_args = {}
+        gi_config = {}
+
+    scan_plan = build_native_int_reduction_plan_from_scan(
+        FakeScan(), integrate_1d=True, integrate_2d=False
+    )
+    assert scan_plan.gi.sample_orientation == 4
+
+
 def test_controls_panel_v2_native_run_plan_gate_configures_wrangler_cache(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
@@ -1731,6 +1839,7 @@ def test_controls_panel_v2_gi_options_popup_holds_orient_and_tilt(qapp, monkeypa
     tooltip); Orientation + Tilt Angle live behind a '…' button that opens a
     small popup, whose rows still write through."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    monkeypatch.setenv("XDART_SESSION_FRESH", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
     widget = staticWidget()
@@ -1762,12 +1871,16 @@ def test_controls_panel_v2_gi_options_popup_holds_orient_and_tilt(qapp, monkeypa
         popup_paths = {r.path for r in popup.findChildren(FormRow)}
         assert ("GI", "sample_orientation") in popup_paths
         assert ("GI", "tilt_angle") in popup_paths
+        orientation_rows = [
+            r for r in popup.findChildren(FormRow)
+            if r.path == ("GI", "sample_orientation")
+        ]
+        assert orientation_rows[0].current_value() == "4"
+        assert widget.integratorTree.get_gi_config()["sample_orientation"] == 4
 
         # A popup row writes through to the integrator carrier.
-        for r in popup.findChildren(FormRow):
-            if r.path == ("GI", "sample_orientation"):
-                r.editor.setText("6")
-                r.editor.editingFinished.emit()
+        orientation_rows[0].editor.setText("6")
+        orientation_rows[0].editor.editingFinished.emit()
         assert widget.integratorTree.get_gi_config()["sample_orientation"] == 6
     finally:
         _reset_controls_v2_gi(widget)
