@@ -813,12 +813,17 @@ class integratorTree(QtWidgets.QWidget):
     # ── Session persistence (panel fields + Advanced params) ─────────────
     _SESSION_UI_FIELDS = (
         'unit_1D',
+        'npts_1D', 'npts_oop_1D',
         'radial_low_1D', 'radial_high_1D', 'azim_low_1D', 'azim_high_1D',
         'radial_autoRange_1D', 'azim_autoRange_1D',
         'unit_2D', 'npts_radial_2D', 'npts_azim_2D',
         'radial_low_2D', 'radial_high_2D', 'azim_low_2D', 'azim_high_2D',
         'radial_autoRange_2D', 'azim_autoRange_2D',
         'axis1D', 'axis2D',
+        'threshold_enable', 'threshold_min', 'threshold_max',
+        'mask_saturated',
+        'gi_enable', 'gi_motor', 'gi_motor_value',
+        'gi_sample_orientation', 'gi_tilt',
     )
 
     def session_state(self) -> dict:
@@ -834,6 +839,8 @@ class integratorTree(QtWidgets.QWidget):
                 ui[name] = bool(w.isChecked())
             elif hasattr(w, 'currentIndex'):
                 ui[name] = int(w.currentIndex())
+            elif hasattr(w, 'value'):
+                ui[name] = w.value()
             elif hasattr(w, 'text'):
                 ui[name] = str(w.text())
         try:
@@ -866,6 +873,8 @@ class integratorTree(QtWidgets.QWidget):
                     _idx = int(val)
                     if 0 <= _idx < w.count():
                         w.setCurrentIndex(_idx)
+                elif hasattr(w, 'setValue'):
+                    w.setValue(val)
                 elif hasattr(w, 'setText'):
                     w.setText(str(val))
             except Exception:
