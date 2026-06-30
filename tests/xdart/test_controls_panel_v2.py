@@ -231,6 +231,17 @@ def _current_plan_snapshot(widget, *, include_threshold=True,
     return _plan_snapshot(plan)
 
 
+def _native_plan_snapshot(widget, *, include_threshold=True,
+                          commit_pending=True):
+    plan = widget._controls_v2_native_reduction_plan(
+        include_threshold=include_threshold,
+        integrate_1d=True,
+        integrate_2d=True,
+        commit_pending=commit_pending,
+    )
+    return _plan_snapshot(plan)
+
+
 def _combo_text(widget, name, predicate, *, fallback_current=True):
     combo = getattr(widget.integratorTree.ui, name)
     for i in range(combo.count()):
@@ -1026,6 +1037,9 @@ def test_controls_panel_v2_standard_edits_match_legacy_reduction_plan(
             legacy_widget,
             commit_pending=False,
         )
+        assert _native_plan_snapshot(v2_widget, commit_pending=False) == (
+            _current_plan_snapshot(v2_widget, commit_pending=False)
+        )
     finally:
         v2_widget.close()
         legacy_widget.close()
@@ -1090,6 +1104,9 @@ def test_controls_panel_v2_gi_edits_match_legacy_reduction_plan(
             legacy_widget,
             commit_pending=False,
         )
+        assert _native_plan_snapshot(v2_widget, commit_pending=False) == (
+            _current_plan_snapshot(v2_widget, commit_pending=False)
+        )
     finally:
         _reset_controls_v2_gi(v2_widget, legacy_widget)
         v2_widget.close()
@@ -1122,6 +1139,9 @@ def test_controls_panel_v2_threshold_edits_match_legacy_plan_overlay(
         assert _current_plan_snapshot(v2_widget) == _current_plan_snapshot(
             legacy_widget,
             commit_pending=False,
+        )
+        assert _native_plan_snapshot(v2_widget, commit_pending=False) == (
+            _current_plan_snapshot(v2_widget, commit_pending=False)
         )
     finally:
         v2_widget.close()
