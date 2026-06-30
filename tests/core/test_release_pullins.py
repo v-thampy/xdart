@@ -25,6 +25,7 @@ from xrd_tools.reduction import (
     ReductionPlan,
     ReductionSession,
     Scan,
+    StrictPolicy,
 )
 import xrd_tools.reduction.core as reduction_core
 
@@ -133,6 +134,9 @@ def test_dead_monitor_warns_again_on_a_new_scan(monkeypatch, execution):
         session = ReductionSession(
             plan, Scan(name, _frames(2), integrator=object()),
             sink=MemorySink(), execution=execution,
+            # the warn-once (un-normalized) path is the GRACEFUL behavior; the
+            # headless default is now loud (raises) — see test_strictness.
+            strict=StrictPolicy.graceful(),
         )
         if execution == "streaming":
             for fr in session.scan.frames:

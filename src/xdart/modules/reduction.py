@@ -28,6 +28,7 @@ from xrd_tools.reduction import (
     ReductionPlan,
     ReductionSession,
     Scan,
+    StrictPolicy,
     run_reduction,
 )
 from xdart.modules.wavelength import wavelength_m_to_angstrom
@@ -456,7 +457,9 @@ def reduce_live_frame(
         poni=getattr(live_frame, "poni", None),
         integrator=integrator if integrator is not None else getattr(live_frame, "integrator", None),
     )
-    result = run_reduction(plan, scan)
+    # GUI never aborts a save on a per-frame degradation — opt INTO graceful
+    # (the headless default is loud).
+    result = run_reduction(plan, scan, strict=StrictPolicy.graceful())
     reduction = result.frames[int(live_frame.idx)]
     # Only overwrite the dimension the plan actually computed.  A 1D-only or
     # 2D-only plan (e.g. a GI 2D reintegrate, which sets integrate_1d=False so it
@@ -508,6 +511,7 @@ def reduce_live_frames(
             cancel_token=cancel_token,
             chunk_size=chunk_size or (len(frames) if executor is not None else 1),
             gi_freeze_mode=gi_freeze_mode,
+            strict=StrictPolicy.graceful(),   # GUI never aborts a save
         )
         result_frames = result.frames
         active_plan = plan
@@ -657,6 +661,9 @@ def open_live_reduction_session(
         gi_freeze_mode=gi_freeze_mode,
         execution=execution,
         inflight_max=inflight_max,
+        strict=StrictPolicy.graceful(),   # GUI never aborts a save (loud is the
+        # headless default; the GUI drops a bad frame per-frame and keeps going)
+
         # S2: streaming sink-driven sessions (the GUI batch/live path) consume
         # results through the sink (QtNexusSink hydrates LiveFrames + writes
         # the .nxs per frame) and never read result.frames — retaining every

@@ -523,7 +523,7 @@ def test_reduce_live_frame_populates_existing_frame(monkeypatch) -> None:
         integration_2d=Integration2DPlan(),
     )
 
-    def fake_run_reduction(plan_arg, scan_arg):
+    def fake_run_reduction(plan_arg, scan_arg, **kwargs):
         assert plan_arg.integration_1d.monitor_key == "i0"
         assert scan_arg.name == "scan"
         assert scan_arg.integrator == "ai"
@@ -572,7 +572,7 @@ def test_reduce_live_frame_preserves_int_1d_when_plan_skips_1d(monkeypatch) -> N
 
     monkeypatch.setattr(
         reduction_adapters, "run_reduction",
-        lambda plan_arg, scan_arg: ReductionResult(
+        lambda plan_arg, scan_arg, **kwargs: ReductionResult(
             scan_name="scan",
             frames={7: FrameReduction(7, result_1d=_r1d(), result_2d=_r2d())},
             n_processed=1))
