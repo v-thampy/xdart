@@ -101,6 +101,7 @@ class TestGiGridWeight:
     absolute GI signs are the real-data-gated tail (not asserted here)."""
 
     def test_off_factors_reduce_to_unit_weight(self):
+        pytest.importorskip("xrayutilities")
         pytest.importorskip("pyFAI")
         from xrd_tools.corrections.grazing import GICorrectionStack
         from xrd_tools.rsm.corrections import gi_grid_weight
@@ -110,6 +111,7 @@ class TestGiGridWeight:
         np.testing.assert_allclose(w, 1.0)
 
     def test_footprint_only_is_inv_sin_alpha_i(self):
+        pytest.importorskip("xrayutilities")
         pytest.importorskip("pyFAI")
         from xrd_tools.corrections.grazing import GICorrectionStack
         from xrd_tools.rsm.corrections import gi_grid_weight
@@ -121,6 +123,7 @@ class TestGiGridWeight:
 
     def test_rsm_correction_weight_multiplies_gi_in(self):
         """rsm_correction_weight(corrections, gi) == base × GI weight."""
+        pytest.importorskip("xrayutilities")
         pytest.importorskip("pyFAI")
         from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
         from xrd_tools.corrections.stack import CorrectionStack
@@ -138,6 +141,7 @@ class TestGiGridWeight:
         np.testing.assert_allclose(combined, base * giw)
 
     def test_gi_requires_fixed_incident_angle(self):
+        pytest.importorskip("xrayutilities")
         pytest.importorskip("pyFAI")
         from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
         from xrd_tools.rsm.corrections import rsm_correction_weight
@@ -150,6 +154,7 @@ class TestGiGridWeight:
         refraction the stitch GI provider does — so a refraction=True stack would
         silently diverge from GI stitch.  Reject it (default is refraction=True);
         refraction=False is accepted."""
+        pytest.importorskip("xrayutilities")
         pytest.importorskip("pyFAI")
         from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
         from xrd_tools.rsm.corrections import rsm_correction_weight

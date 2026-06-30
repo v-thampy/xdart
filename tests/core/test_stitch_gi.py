@@ -100,6 +100,7 @@ class TestGIProvider:
     def test_gi_all_off_equals_plain_provider(self):
         """A GICorrectionStack with every factor off (incl. refraction) must yield a
         byte-equal frame to pyfai_q_frames — the GI path adds nothing when idle."""
+        pytest.importorskip("xrayutilities")
         pytest.importorskip("pyFAI")
         from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
         from xrd_tools.integrate.stitch_hist import pyfai_gi_q_frames, pyfai_q_frames
@@ -114,6 +115,7 @@ class TestGIProvider:
         np.testing.assert_allclose(s1, s0)
 
     def test_footprint_only_scales_weight_by_inv_sin_ai(self):
+        pytest.importorskip("xrayutilities")
         pytest.importorskip("pyFAI")
         from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
         from xrd_tools.integrate.stitch_hist import pyfai_gi_q_frames, pyfai_q_frames
@@ -130,6 +132,7 @@ class TestGIProvider:
         """Provider wiring: refraction=True rewrites |q| (and stays finite/≥0);
         refraction=False leaves |q| byte-equal to the plain provider. (The refraction
         *physics* — shift vanishing above αc — is gate-tested in test_grazing.py.)"""
+        pytest.importorskip("xrayutilities")
         pytest.importorskip("pyFAI")
         from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
         from xrd_tools.integrate.stitch_hist import pyfai_gi_q_frames, pyfai_q_frames
@@ -148,6 +151,7 @@ class TestGIProvider:
         assert np.all(np.isfinite(q_on)) and np.all(q_on >= 0.0)
 
     def test_bad_incident_angle_count_raises(self):
+        pytest.importorskip("xrayutilities")
         pytest.importorskip("pyFAI")
         from xrd_tools.corrections.grazing import GICorrectionStack
         from xrd_tools.integrate.stitch_hist import pyfai_gi_q_frames
@@ -182,6 +186,7 @@ class TestGIRunStitch:
 
     def test_gi_off_matches_non_gi_run(self):
         """An all-off GICorrectionStack run_stitch must equal the plain pyfai_hist run."""
+        pytest.importorskip("xrayutilities")
         pytest.importorskip("pyFAI")
         from xrd_tools.analysis.plans import StitchPlan, run_stitch
         from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
@@ -199,6 +204,7 @@ class TestGIRunStitch:
         """run_stitch GI footprint-only ⇒ I = I_nonGI · sin(αi) (αi=0.3° from eta):
         the 1/sin αi boost in the Σnorm denominator divides the over-illumination
         back out, so the corrected intensity is smaller at grazing."""
+        pytest.importorskip("xrayutilities")
         pytest.importorskip("pyFAI")
         from xrd_tools.analysis.plans import StitchPlan, run_stitch
         from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
@@ -214,6 +220,7 @@ class TestGIRunStitch:
         np.testing.assert_allclose(ratio, np.sin(np.deg2rad(0.3)), rtol=1e-6)
 
     def test_gi_explicit_incident_angle_override(self):
+        pytest.importorskip("xrayutilities")
         pytest.importorskip("pyFAI")
         from xrd_tools.analysis.plans import StitchPlan, run_stitch
         from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
