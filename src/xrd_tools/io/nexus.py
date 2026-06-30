@@ -1490,6 +1490,22 @@ def _schema_dataset(g: h5py.Group, group_name: str, name: str, data,
     return g.create_dataset(spec.name, data=data, **kwargs)
 
 
+def _norm_attr(value):
+    """Normalize an attr value (schema-declared or h5py-read) for comparison.
+
+    numpy arrays / tuples / lists → list, bytes → str — exactly the shape
+    ``_create_group_from_schema`` writes (it stores a declared tuple as a list,
+    and h5py reads a string attr back as ``str`` or ``bytes`` by build), so a
+    declared ``("q", "chi")`` compares equal to the on-disk ``["q", "chi"]``."""
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    if isinstance(value, (list, tuple)):
+        return [_norm_attr(v) for v in value]
+    return value
+
+
 def validate_group_against_schema(group: h5py.Group,
                                   group_name: str) -> list[str]:
     """2d: check an on-disk group against its SCHEMA declaration.
@@ -1526,6 +1542,22 @@ def validate_group_against_schema(group: h5py.Group,
                     f"{group_name}/{name}: row count {group[name].shape[0]} "
                     f"!= frame_index length {n}"
                 )
+
+    # nx_attrs pass (Q-C2): every group writer is schema-routed via
+    # _create_group_from_schema, which stamps these static NX attrs — so check
+    # them by strict equality, normalized exactly as that writer stores them
+    # (tuple→list, bytes→str), flagging absence too.  Runtime capability attrs
+    # (two_d_kind, the monotonic flag, primary_mode) are deliberately NOT in
+    # spec.nx_attrs, so they are never required here.
+    for key, value in spec.nx_attrs.items():
+        if key not in group.attrs:
+            problems.append(f"{group_name}: nx_attr {key!r} missing")
+            continue
+        want = _norm_attr(value)
+        got = _norm_attr(group.attrs[key])
+        if got != want:
+            problems.append(
+                f"{group_name}: nx_attr {key!r} = {got!r} != {want!r}")
     return problems
 
 
@@ -1920,17 +1952,15 @@ def write_stitched(
     if stitched_1d is not None:
         if "stitched_1d" in entry_grp:
             del entry_grp["stitched_1d"]
-        g = entry_grp.create_group("stitched_1d")
-        g.attrs["NX_class"] = "NXdata"
-        g.attrs["signal"] = "intensity"
-        g.attrs["axes"] = ["q"]
-        g.create_dataset("intensity",
-                         data=np.asarray(stitched_1d.intensity, np.float32), **ck)
-        qd = g.create_dataset("q", data=np.asarray(stitched_1d.radial, np.float32))
-        qd.attrs["units"] = stitched_1d.unit
+        # 2b: group + NX attrs + dataset dtypes/compression derive from SCHEMA
+        # (byte-identical to the hand-written form); only the per-axis units and
+        # the provenance_json blob (an additive extra) are stamped by hand.
+        g = _create_group_from_schema(entry_grp, "stitched_1d")
+        _schema_dataset(g, "stitched_1d", "intensity", stitched_1d.intensity, ck=ck)
+        qd = _schema_dataset(g, "stitched_1d", "q", stitched_1d.radial, ck=ck)
+        qd.attrs["units"] = stitched_1d.unit            # units_from="radial_unit"
         if stitched_1d.sigma is not None:
-            g.create_dataset("sigma",
-                             data=np.asarray(stitched_1d.sigma, np.float32), **ck)
+            _schema_dataset(g, "stitched_1d", "sigma", stitched_1d.sigma, ck=ck)
         if prov_json is not None:
             g.create_dataset("provenance_json", data=prov_json, dtype=_UTF8_DTYPE)
 
@@ -1948,16 +1978,15 @@ def write_stitched(
                 f"len(azimuthal)) = {_exp}; the stored cake must be (n_q, n_chi).")
         if "stitched_2d" in entry_grp:
             del entry_grp["stitched_2d"]
-        g = entry_grp.create_group("stitched_2d")
-        g.attrs["NX_class"] = "NXdata"
-        g.attrs["signal"] = "intensity"
-        g.attrs["axes"] = ["q", "chi"]
-        g.create_dataset("intensity",  # (n_q, n_chi) as-is — see docstring
-                         data=_i2d, **ck)
-        qd = g.create_dataset("q", data=np.asarray(stitched_2d.radial, np.float32))
-        qd.attrs["units"] = stitched_2d.unit
-        cd = g.create_dataset("chi", data=np.asarray(stitched_2d.azimuthal, np.float32))
-        cd.attrs["units"] = stitched_2d.azimuthal_unit
+        # 2b: schema-routed group + datasets (byte-identical); the (n_q, n_chi)
+        # intensity is stored as-is — see docstring.  Per-axis units + the
+        # provenance_json blob stay hand-stamped.
+        g = _create_group_from_schema(entry_grp, "stitched_2d")
+        _schema_dataset(g, "stitched_2d", "intensity", _i2d, ck=ck)
+        qd = _schema_dataset(g, "stitched_2d", "q", stitched_2d.radial, ck=ck)
+        qd.attrs["units"] = stitched_2d.unit            # units_from="radial_unit"
+        cd = _schema_dataset(g, "stitched_2d", "chi", stitched_2d.azimuthal, ck=ck)
+        cd.attrs["units"] = stitched_2d.azimuthal_unit  # units_from="azimuthal_unit"
         if prov_json is not None:
             g.create_dataset("provenance_json", data=prov_json, dtype=_UTF8_DTYPE)
 
@@ -1984,14 +2013,12 @@ def write_rsm(
     ck = _comp_kwargs(compression)
     if "rsm" in entry_grp:
         del entry_grp["rsm"]
-    g = entry_grp.create_group("rsm")
-    g.attrs["NX_class"] = "NXdata"
-    g.attrs["signal"] = "intensity"
-    g.attrs["axes"] = ["h", "k", "l"]
-    g.create_dataset("intensity",
-                     data=np.asarray(volume.intensity, np.float32), **ck)
+    # 2b: schema-routed group + datasets (byte-identical).  h/k/l carry NO units
+    # (no units_from in the schema) — do not add any, it would change the bytes.
+    g = _create_group_from_schema(entry_grp, "rsm")
+    _schema_dataset(g, "rsm", "intensity", volume.intensity, ck=ck)
     for name, axis in (("h", volume.h), ("k", volume.k), ("l", volume.l)):
-        g.create_dataset(name, data=np.asarray(axis, np.float32))
+        _schema_dataset(g, "rsm", name, axis, ck=ck)
     if provenance is not None:
         prov = provenance if isinstance(provenance, str) else json.dumps(
             provenance, default=str)
