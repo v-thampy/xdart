@@ -1408,6 +1408,9 @@ def test_live_new_scan_invalidates_publication_store():
         frame_ids=["1"],
         publication_store=store,
         displayframe=SimpleNamespace(set_axes=lambda: None),
+        # new_scan refreshes the (optional) Controls Panel v2 profile as a
+        # side effect; this host has no v2 panel, so it is a no-op here.
+        _refresh_controls_v2_profile=lambda *a, **k: None,
         metawidget=SimpleNamespace(update=lambda: None),
     )
     host._sync_h5viewer_save_dir = MethodType(
@@ -1470,6 +1473,9 @@ def _new_scan_host_with_wrangler_mask(wrangler_mask, initial_global_mask,
         frame_ids=["1"],
         publication_store=PublicationStore(),
         displayframe=SimpleNamespace(set_axes=lambda: None),
+        # new_scan refreshes the (optional) Controls Panel v2 profile as a
+        # side effect; this host has no v2 panel, so it is a no-op here.
+        _refresh_controls_v2_profile=lambda *a, **k: None,
         metawidget=SimpleNamespace(update=lambda: None),
     )
     host._sync_h5viewer_save_dir = MethodType(
@@ -2196,7 +2202,7 @@ def _update_smoke_host():
     host.ui.imageUnit.currentIndex.return_value = 0
     host.ui.plotMethod.currentText.return_value = 'Single'
     for name in ('get_idxs', '_note_selection_generation', '_bump_display_generation',
-                 '_live_mode', '_live_display_state',
+                 '_live_mode', '_active_stitch_mode', '_live_display_state',
                  '_current_image_axis_key', '_plot_axis_key',
                  '_share_axis_plot_index', '_set_plot_unit_index_silently',
                  '_apply_share_axis_state',
@@ -2597,7 +2603,7 @@ def test_live_display_state_render_ids_match_legacy_idxs():
                              frames=SimpleNamespace(index=[0, 1]), gi=False),
         ui=SimpleNamespace(plotMethod=SimpleNamespace(currentText=lambda: 'Single')),
     )
-    for name in ('_live_mode', '_live_display_state'):
+    for name in ('_live_mode', '_active_stitch_mode', '_live_display_state'):
         setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
 
     state = host._live_display_state()
@@ -2750,6 +2756,9 @@ def test_viewer_mode_change_blocks_scan_list_autoload():
     widget = SimpleNamespace(
         wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out", tree=_FakeControl()),
         _apply_integration_control_state=lambda: None,
+        # _on_viewer_mode_changed refreshes the (optional) Controls Panel v2
+        # profile at the end; no v2 panel on this host, so it is a no-op.
+        _refresh_controls_v2_profile=lambda *a, **k: None,
         h5viewer=SimpleNamespace(
             ui=SimpleNamespace(listScans=list_scans),
             actionNewFile=_FakeAction(),
@@ -2795,6 +2804,9 @@ def test_viewer_mode_tree_disable_only_for_file_viewers():
     widget = SimpleNamespace(
         wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out", tree=_FakeControl()),
         _apply_integration_control_state=lambda: None,
+        # _on_viewer_mode_changed refreshes the (optional) Controls Panel v2
+        # profile at the end; no v2 panel on this host, so it is a no-op.
+        _refresh_controls_v2_profile=lambda *a, **k: None,
         h5viewer=SimpleNamespace(
             ui=SimpleNamespace(listScans=list_scans),
             actionNewFile=_FakeAction(),
@@ -2835,6 +2847,9 @@ def test_leaving_viewer_mode_clears_stale_global_mask():
     widget = SimpleNamespace(
         wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out", tree=_FakeControl()),
         _apply_integration_control_state=lambda: None,
+        # _on_viewer_mode_changed refreshes the (optional) Controls Panel v2
+        # profile at the end; no v2 panel on this host, so it is a no-op.
+        _refresh_controls_v2_profile=lambda *a, **k: None,
         h5viewer=SimpleNamespace(
             ui=SimpleNamespace(listScans=list_scans),
             actionNewFile=_FakeAction(),
@@ -2910,6 +2925,9 @@ def test_viewer_mode_keeps_explicit_open_folder():
     widget = SimpleNamespace(
         wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out", tree=_FakeControl()),
         _apply_integration_control_state=lambda: None,
+        # _on_viewer_mode_changed refreshes the (optional) Controls Panel v2
+        # profile at the end; no v2 panel on this host, so it is a no-op.
+        _refresh_controls_v2_profile=lambda *a, **k: None,
         h5viewer=SimpleNamespace(
             ui=SimpleNamespace(listScans=list_scans),
             actionNewFile=_FakeAction(),
