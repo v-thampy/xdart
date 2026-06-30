@@ -16,6 +16,7 @@ from types import MethodType
 import pytest
 
 pytest.importorskip("pyqtgraph")
+import xdart.gui.gui_utils  # noqa: F401  # registers the 'str_browse' param type (the live GUI imports gui_utils at startup; the wrangler-only import path here does not)
 from pyqtgraph import QtWidgets
 from pyqtgraph.parametertree import Parameter
 

@@ -16,6 +16,8 @@ import h5py
 import numpy as np
 import pytest
 
+import xdart.gui.gui_utils  # noqa: F401  # registers the 'str_browse' param type (the live GUI imports gui_utils at startup; the wrangler-only import path here does not)
+
 from xdart.modules.ewald.nexus_writer import (
     _frame_source_index,
     _resolved_frame_source,
