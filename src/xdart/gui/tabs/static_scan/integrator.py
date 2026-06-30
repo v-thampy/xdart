@@ -914,6 +914,9 @@ class integratorTree(QtWidgets.QWidget):
         """
         with self.scan.scan_lock:
             if key == 'bai_1d':
+                if getattr(self, '_controls_v2_native_args', False):
+                    self._params_to_args(self.scan.bai_1d_args, self.bai_1d_pars)
+                    return
                 self._get_npts_1D()
                 self._get_unit_1D()
                 self._get_radial_range_1D()
@@ -921,6 +924,9 @@ class integratorTree(QtWidgets.QWidget):
                 self._params_to_args(self.scan.bai_1d_args, self.bai_1d_pars)
 
             elif key == 'bai_2d':
+                if getattr(self, '_controls_v2_native_args', False):
+                    self._params_to_args(self.scan.bai_2d_args, self.bai_2d_pars)
+                    return
                 self._get_npts_radial_2D()
                 self._get_npts_azim_2D()
                 self._get_unit_2D()

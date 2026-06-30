@@ -43,7 +43,16 @@ from xrd_tools.core.energy import wavelength_m_to_energy_eV
 from .ui.staticUI import Ui_Form
 from .h5viewer import H5Viewer
 from .display_frame_widget import displayFrameWidget
-from .integrator import integratorTree
+from .integrator import (
+    GI_LABELS_1D,
+    GI_LABELS_2D,
+    GI_MODES_1D,
+    GI_MODES_2D,
+    Units,
+    Units_dict,
+    Units_dict_inv,
+    integratorTree,
+)
 from .scan_threads import stitchThread
 from .metadata import metadataWidget
 from .wranglers import imageWrangler, nexusWrangler, wranglerWidget
@@ -67,6 +76,7 @@ from .controls_logic import (
 )
 from xdart.utils.throttle import Coalescer
 from xdart.utils._utils import FixSizeOrderedDict, get_fname_dir, get_img_data
+from xdart.modules.reduction import ThresholdSaturationConfig
 
 QWidget = QtWidgets.QWidget
 QSizePolicy = QtWidgets.QSizePolicy
@@ -519,7 +529,7 @@ class staticWidget(QWidget):
         try:
             from xdart.utils.session import load_session
             _integ = (load_session() or {}).get('integrator')
-            if _integ:
+            if _integ and not self._controls_v2_enabled():
                 self.integratorTree.restore_session_state(_integ)
         except Exception:
             logger.debug("integrator session restore failed", exc_info=True)
@@ -569,9 +579,8 @@ class staticWidget(QWidget):
         """Mount the Controls Panel V2 editor.
 
         The panel is visible by default on the V2 branch.  It renders real
-        editable rows backed by the existing wrangler Parameter objects, while
-        the legacy ParameterTree stays alive but hidden so run setup, session
-        restore, and browse handlers remain unchanged during the migration.
+        editable rows backed by native Controls V2 state, while the legacy
+        widgets stay alive only for delegated actions and the Advanced inspector.
         Set ``XDART_CONTROLS_PANEL_V2=0`` to compare against the legacy panel.
         """
         if not self._controls_v2_enabled():
@@ -612,6 +621,7 @@ class staticWidget(QWidget):
                 pass
             self.controls_v2_preview = preview
             self.controls_v2 = panel
+            self._install_controls_v2_native_int_hooks()
             panel.set_processing_widget(self.ui.integratorFrame, visible=False)
             self._refresh_controls_v2_profile(immediate=True)
         except Exception:
@@ -619,6 +629,18 @@ class staticWidget(QWidget):
             self.controls_v2 = None
             logger.debug("Controls Panel V2 preview mount failed",
                          exc_info=True)
+
+    def _install_controls_v2_native_int_hooks(self) -> None:
+        """Make V2 native Int state the provider for legacy-owned actions."""
+
+        integrator = getattr(self, "integratorTree", None)
+        if integrator is None:
+            return
+        integrator._controls_v2_native_args = True
+        integrator.get_gi_config = self._controls_v2_gi_config
+        integrator.get_threshold_config = self._controls_v2_threshold_config
+        self._controls_v2_ensure_native_int_defaults()
+        self._controls_v2_hydrate_advanced_from_scan()
 
     def _on_controls_v2_analysis_launch(self, tool) -> None:
         """Open the existing analysis popup for a V2 launcher intent."""
@@ -681,7 +703,7 @@ class staticWidget(QWidget):
             click()
 
     def _apply_controls_v2_field_value(self, path, value) -> bool:
-        if self._set_controls_v2_integrator_field(path, value):
+        if self._set_controls_v2_native_int_field(path, value):
             return True
         param = self._controls_v2_param(tuple(path))
         if param is None:
@@ -710,7 +732,6 @@ class staticWidget(QWidget):
         for edit in edits:
             self._apply_controls_v2_field_value(edit.path, edit.value)
         if edits:
-            self._sync_controls_v2_integrator_args()
             self._refresh_controls_v2_profile(immediate=True)
 
     def _controls_v2_param(self, path):
@@ -729,6 +750,8 @@ class staticWidget(QWidget):
     def _controls_v2_field_values(self):
         values = {}
         for path in self._controls_v2_field_paths():
+            if path in INTEGRATOR_BACKED_CONTROL_PATHS:
+                continue
             param = self._controls_v2_param(path)
             if param is None:
                 continue
@@ -736,12 +759,14 @@ class staticWidget(QWidget):
                 values[path] = param.value()
             except Exception:
                 pass
-        values.update(self._controls_v2_integrator_values())
+        values.update(self._controls_v2_native_int_values())
         return values
 
     def _controls_v2_field_choices(self):
         choices = {}
         for path in self._controls_v2_field_paths():
+            if path in INTEGRATOR_BACKED_CONTROL_PATHS:
+                continue
             param = self._controls_v2_param(path)
             if param is None:
                 continue
@@ -757,88 +782,408 @@ class staticWidget(QWidget):
                 vals = ()
             if vals:
                 choices[path] = vals
-        choices.update(self._controls_v2_integrator_choices())
+        choices.update(self._controls_v2_native_int_choices())
         return choices
 
-    def _controls_v2_integrator_values(self):
-        integrator = getattr(self, "integratorTree", None)
-        ui = getattr(integrator, "ui", None)
-        if integrator is None:
-            return {}
-
-        values = {}
-        for spec in INTEGRATOR_BACKED_CONTROL_SPECS:
-            if spec.parameter_name:
-                param = self._controls_v2_integrator_parameter(spec)
-                if param is None:
-                    continue
-                try:
-                    values[spec.path] = param.value()
-                except Exception:
-                    logger.debug("Controls Panel V2 could not read %s",
-                                 spec.parameter_name, exc_info=True)
-                continue
-
-            widget = getattr(ui, spec.widget_name, None)
-            if widget is None:
-                continue
-            if (
-                spec.visible_when == "widget_visible"
-                and not self._controls_v2_integrator_widget_exposed(widget)
-            ):
-                continue
-            try:
-                if spec.value_role == "checked":
-                    values[spec.path] = bool(widget.isChecked())
-                elif spec.value_role == "current_text":
-                    values[spec.path] = widget.currentText()
-                elif spec.value_role == "value":
-                    values[spec.path] = widget.value()
-                else:
-                    values[spec.path] = widget.text()
-            except Exception:
-                logger.debug("Controls Panel V2 could not read %s",
-                             spec.widget_name, exc_info=True)
-        for path, widget_name in {
-            ("Int1D", "radial_label"): "gi_radial_label_1D",
-            ("Int1D", "azim_label"): "label_azim_1D",
-            ("Int2D", "radial_label"): "gi_radial_label_2D",
-            ("Int2D", "azim_label"): "label_azim_2D",
-        }.items():
-            widget = getattr(ui, widget_name, None)
-            text = getattr(widget, "text", None)
-            if callable(text):
-                try:
-                    values[path] = text()
-                except Exception:
-                    logger.debug("Controls Panel V2 could not read %s",
-                                 widget_name, exc_info=True)
-        scan = getattr(self, "scan", None)
-        if scan is not None:
-            try:
-                bai_1d = getattr(scan, "bai_1d_args", {}) or {}
-                bai_2d = getattr(scan, "bai_2d_args", {}) or {}
-                if getattr(scan, "gi", False):
-                    values[("Int1D", "gi_mode")] = bai_1d.get(
-                        "gi_mode_1d", "q_total")
-                    values[("Int2D", "gi_mode")] = bai_2d.get(
-                        "gi_mode_2d", "qip_qoop")
-            except Exception:
-                logger.debug("Controls Panel V2 could not read scan axis state",
-                             exc_info=True)
-        return values
+    @staticmethod
+    def _controls_v2_number_text(value) -> str:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "" if value is None else str(value)
+        if number.is_integer():
+            return str(int(number))
+        return str(number)
 
     @staticmethod
-    def _controls_v2_integrator_widget_exposed(widget):
-        """Return whether the hidden legacy parser explicitly exposes a widget.
+    def _controls_v2_float(value, default=0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
 
-        Controls V2 hides the old integrator panel but still uses its widgets as
-        the migration parser.  ``isVisible()`` includes hidden ancestors, so it
-        would report False for controls the legacy parser intentionally showed
-        before the parent frame was hidden.  ``isHidden()`` tracks the child's
-        own show/hide state, which is the signal we need here.
-        """
-        return widget is not None and not widget.isHidden()
+    @staticmethod
+    def _controls_v2_int(value, default=0) -> int:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return int(default)
+
+    @staticmethod
+    def _controls_v2_bool(value) -> bool:
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on", "checked"}
+        return bool(value)
+
+    def _controls_v2_threshold_config(self):
+        state = getattr(self, "_controls_v2_threshold_state", None)
+        scan = getattr(self, "scan", None)
+        if not isinstance(state, dict):
+            state = {
+                "apply_threshold": bool(getattr(scan, "apply_threshold", False)),
+                "threshold_min": self._controls_v2_float(
+                    getattr(scan, "threshold_min", 0.0), 0.0),
+                "threshold_max": self._controls_v2_float(
+                    getattr(scan, "threshold_max", 0.0), 0.0),
+                "mask_saturation": bool(getattr(scan, "mask_sentinel", True)),
+            }
+            self._controls_v2_threshold_state = state
+        return ThresholdSaturationConfig(
+            apply_threshold=bool(state.get("apply_threshold", False)),
+            threshold_min=self._controls_v2_float(
+                state.get("threshold_min", 0.0), 0.0),
+            threshold_max=self._controls_v2_float(
+                state.get("threshold_max", 0.0), 0.0),
+            mask_saturation=bool(state.get("mask_saturation", True)),
+        )
+
+    def _controls_v2_set_threshold_field(self, path, value) -> None:
+        cfg = self._controls_v2_threshold_config()
+        state = {
+            "apply_threshold": bool(cfg.apply_threshold),
+            "threshold_min": cfg.threshold_min,
+            "threshold_max": cfg.threshold_max,
+            "mask_saturation": bool(cfg.mask_saturation),
+        }
+        if path == ("Mask", "Threshold"):
+            state["apply_threshold"] = self._controls_v2_bool(value)
+        elif path == ("Mask", "min"):
+            state["threshold_min"] = self._controls_v2_float(value, 0.0)
+        elif path == ("Mask", "max"):
+            state["threshold_max"] = self._controls_v2_float(value, 0.0)
+        elif path == ("MaskSat", "mask_sentinel"):
+            state["mask_saturation"] = self._controls_v2_bool(value)
+        self._controls_v2_threshold_state = state
+        scan = getattr(self, "scan", None)
+        if scan is not None:
+            for attr, key in (
+                ("apply_threshold", "apply_threshold"),
+                ("threshold_min", "threshold_min"),
+                ("threshold_max", "threshold_max"),
+                ("mask_sentinel", "mask_saturation"),
+            ):
+                try:
+                    setattr(scan, attr, state[key])
+                except Exception:
+                    pass
+
+    def _controls_v2_default_gi_motor(self) -> str:
+        choices = self._controls_v2_native_int_choices().get(("GI", "th_motor"), ())
+        for preferred in ("th", "eta", "theta", "gonth", "halpha"):
+            for choice in choices:
+                if str(choice).lower() == preferred:
+                    return str(choice)
+        return str(choices[0]) if choices else "Manual"
+
+    def _controls_v2_gi_config(self) -> dict:
+        scan = getattr(self, "scan", None)
+        a1, a2 = self._controls_v2_scan_int_args()
+        gic = dict(getattr(scan, "gi_config", {}) or {})
+        gi = bool(getattr(scan, "gi", False)) or bool(gic)
+        motor = gic.get("incidence_motor", None)
+        if motor is None:
+            motor = getattr(scan, "incidence_motor", None)
+        th_val = gic.get("th_val", 0.1)
+        if motor is None or str(motor) == "":
+            motor = self._controls_v2_default_gi_motor()
+        else:
+            try:
+                th_val = float(motor)
+                motor = "Manual"
+            except (TypeError, ValueError):
+                motor = str(motor)
+        sample_orientation = gic.get("sample_orientation", None)
+        if sample_orientation is None:
+            sample_orientation = getattr(scan, "sample_orientation", None)
+        if sample_orientation is None:
+            sample_orientation = 4
+        tilt_angle = gic.get("tilt_angle", None)
+        if tilt_angle is None:
+            tilt_angle = getattr(scan, "tilt_angle", None)
+        if tilt_angle is None:
+            tilt_angle = 0.0
+        return {
+            "gi": gi,
+            "sample_orientation": self._controls_v2_int(sample_orientation, 4),
+            "tilt_angle": self._controls_v2_float(tilt_angle, 0.0),
+            "incidence_motor": str(motor or "Manual"),
+            "th_val": self._controls_v2_float(th_val, 0.1),
+            "gi_mode_1d": str(a1.get("gi_mode_1d", "q_total")),
+            "gi_mode_2d": str(a2.get("gi_mode_2d", "qip_qoop")),
+        }
+
+    def _controls_v2_apply_gi_config_to_scan(self, cfg=None) -> None:
+        scan = getattr(self, "scan", None)
+        if scan is None:
+            return
+        if cfg is None:
+            cfg = self._controls_v2_gi_config()
+        scan.gi = bool(cfg["gi"])
+        if not cfg["gi"]:
+            scan.gi_config = {}
+            return
+        scan.gi_config = {
+            "gi_mode_1d": str(cfg["gi_mode_1d"]),
+            "gi_mode_2d": str(cfg["gi_mode_2d"]),
+            "incidence_motor": str(cfg["incidence_motor"] or ""),
+            "th_val": float(cfg["th_val"] or 0.0),
+            "tilt_angle": float(cfg["tilt_angle"] or 0.0),
+            "sample_orientation": int(cfg["sample_orientation"] or 4),
+        }
+        incidence = (
+            str(cfg["th_val"])
+            if cfg["incidence_motor"] == "Manual"
+            else str(cfg["incidence_motor"] or "")
+        )
+        scan.incidence_motor = incidence
+        scan.th_mtr = incidence
+        scan.sample_orientation = int(cfg["sample_orientation"] or 4)
+        scan.tilt_angle = float(cfg["tilt_angle"] or 0.0)
+
+    def _controls_v2_set_gi_field(self, leaf: str, value) -> None:
+        scan = getattr(self, "scan", None)
+        if scan is None:
+            return
+        cfg = self._controls_v2_gi_config()
+        if leaf == "Grazing":
+            cfg["gi"] = self._controls_v2_bool(value)
+        elif leaf == "th_motor":
+            cfg["incidence_motor"] = str(value)
+        elif leaf == "th_val":
+            cfg["th_val"] = self._controls_v2_float(value, cfg.get("th_val", 0.1))
+        elif leaf == "sample_orientation":
+            cfg["sample_orientation"] = self._controls_v2_int(value, 4)
+        elif leaf == "tilt_angle":
+            cfg["tilt_angle"] = self._controls_v2_float(value, 0.0)
+        scan.gi = bool(cfg["gi"])
+        if scan.gi:
+            a1, a2 = self._controls_v2_scan_int_args()
+            a1.setdefault("gi_mode_1d", "q_total")
+            a2.setdefault("gi_mode_2d", "qip_qoop")
+            a1["unit"] = "q_A^-1"
+            a2["unit"] = "q_A^-1"
+        scan.gi_config = {
+            "gi_mode_1d": str(cfg["gi_mode_1d"]),
+            "gi_mode_2d": str(cfg["gi_mode_2d"]),
+            "incidence_motor": str(cfg["incidence_motor"] or ""),
+            "th_val": float(cfg["th_val"] or 0.0),
+            "tilt_angle": float(cfg["tilt_angle"] or 0.0),
+            "sample_orientation": int(cfg["sample_orientation"] or 4),
+        } if scan.gi else {}
+        self._controls_v2_apply_gi_config_to_scan()
+
+    def _controls_v2_scan_int_args(self):
+        scan = getattr(self, "scan", None)
+        if scan is None:
+            return {}, {}
+        lock = getattr(scan, "scan_lock", None)
+
+        def _ensure():
+            if not isinstance(getattr(scan, "bai_1d_args", None), dict):
+                scan.bai_1d_args = {}
+            if not isinstance(getattr(scan, "bai_2d_args", None), dict):
+                scan.bai_2d_args = {}
+            return scan.bai_1d_args, scan.bai_2d_args
+
+        if lock is None:
+            return _ensure()
+        with lock:
+            return _ensure()
+
+    def _controls_v2_ensure_native_int_defaults(self) -> None:
+        a1, a2 = self._controls_v2_scan_int_args()
+        defaults_1d = {
+            "unit": "q_A^-1",
+            "numpoints": 3000,
+            "radial_range": None,
+            "azimuth_range": None,
+            "correctSolidAngle": True,
+            "dummy": -1.0,
+            "delta_dummy": 0.0,
+            "chi_offset": 90.0,
+            "polarization_factor": None,
+            "method": "csr",
+            "safe": True,
+        }
+        defaults_2d = {
+            "unit": "q_A^-1",
+            "npt_rad": 500,
+            "npt_azim": 500,
+            "radial_range": None,
+            "azimuth_range": None,
+            "correctSolidAngle": True,
+            "dummy": -1.0,
+            "delta_dummy": 0.0,
+            "chi_offset": 90.0,
+            "polarization_factor": None,
+            "method": "csr",
+            "safe": True,
+        }
+        for key, value in defaults_1d.items():
+            a1.setdefault(key, copy.deepcopy(value))
+        for key, value in defaults_2d.items():
+            a2.setdefault(key, copy.deepcopy(value))
+        if bool(getattr(getattr(self, "scan", None), "gi", False)):
+            a1.setdefault("gi_mode_1d", "q_total")
+            a2.setdefault("gi_mode_2d", "qip_qoop")
+            # GI integration is Q-space only in this panel.
+            a1["unit"] = "q_A^-1"
+            a2["unit"] = "q_A^-1"
+
+    def _controls_v2_unit_display(self, unit: object, *, dim: str = "1d") -> str:
+        code = str(unit or "q_A^-1")
+        idx = Units_dict_inv.get(code, 0)
+        if dim == "2d" and idx >= 2:
+            idx = 0
+        try:
+            return Units[idx]
+        except Exception:
+            return Units[0]
+
+    def _controls_v2_unit_code(self, text: object, *, dim: str = "1d") -> str:
+        value = str(text or "").strip()
+        if value in Units_dict:
+            code = Units_dict[value]
+        elif value in Units_dict_inv:
+            code = value
+        elif value.startswith("2") or "2θ" in value or "2th" in value.lower():
+            code = "2th_deg"
+        elif "chi" in value.lower() or "χ" in value:
+            code = "chi_deg"
+        else:
+            code = "q_A^-1"
+        if dim == "2d" and code == "chi_deg":
+            code = "q_A^-1"
+        return code
+
+    def _controls_v2_axis_display(self, root: str) -> str:
+        self._controls_v2_ensure_native_int_defaults()
+        scan = getattr(self, "scan", None)
+        a1, a2 = self._controls_v2_scan_int_args()
+        if bool(getattr(scan, "gi", False)):
+            if root == "Int1D":
+                mode = a1.get("gi_mode_1d", "q_total")
+                return GI_LABELS_1D[GI_MODES_1D.index(mode)] if mode in GI_MODES_1D else GI_LABELS_1D[0]
+            mode = a2.get("gi_mode_2d", "qip_qoop")
+            return GI_LABELS_2D[GI_MODES_2D.index(mode)] if mode in GI_MODES_2D else GI_LABELS_2D[0]
+        if root == "Int1D":
+            return self._controls_v2_unit_display(a1.get("unit"), dim="1d")
+        return "2θ-χ" if a2.get("unit") == "2th_deg" else "Q-χ"
+
+    def _controls_v2_axis_to_native(self, root: str, value: object) -> None:
+        self._controls_v2_ensure_native_int_defaults()
+        scan = getattr(self, "scan", None)
+        a1, a2 = self._controls_v2_scan_int_args()
+        text = str(value or "")
+        if bool(getattr(scan, "gi", False)):
+            if root == "Int1D":
+                try:
+                    a1["gi_mode_1d"] = GI_MODES_1D[GI_LABELS_1D.index(text)]
+                except ValueError:
+                    a1["gi_mode_1d"] = "q_total"
+                if self._controls_v2_npts_oop_visible():
+                    a1.setdefault("npt_oop", int(a1.get("numpoints", 3000)))
+            else:
+                try:
+                    a2["gi_mode_2d"] = GI_MODES_2D[GI_LABELS_2D.index(text)]
+                except ValueError:
+                    a2["gi_mode_2d"] = "qip_qoop"
+            a1["unit"] = "q_A^-1"
+            a2["unit"] = "q_A^-1"
+            return
+        if root == "Int1D":
+            a1["unit"] = self._controls_v2_unit_code(text, dim="1d")
+        else:
+            a2["unit"] = "2th_deg" if text.startswith("2") else "q_A^-1"
+
+    def _controls_v2_default_range(self, root: str, axis: str):
+        self._controls_v2_ensure_native_int_defaults()
+        scan = getattr(self, "scan", None)
+        a1, a2 = self._controls_v2_scan_int_args()
+        gi = bool(getattr(scan, "gi", False))
+        if root == "Int1D":
+            if gi:
+                mode = a1.get("gi_mode_1d", "q_total")
+                if axis == "radial":
+                    return (-5.0, 5.0) if mode == "exit_angle" else (
+                        (-10.0, 10.0) if mode in {"q_ip", "q_oop"} else (0.0, 5.0)
+                    )
+                if mode in {"q_ip", "q_oop"}:
+                    return (0.0, 5.0)
+                if mode == "exit_angle":
+                    return (0.0, 90.0)
+                return (-180.0, 180.0)
+            if axis == "radial":
+                return (0.0, 90.0) if a1.get("unit") == "2th_deg" else (0.0, 5.0)
+            return (-180.0, 180.0)
+        if gi:
+            mode = a2.get("gi_mode_2d", "qip_qoop")
+            if axis == "radial":
+                return (-5.0, 5.0) if mode == "exit_angles" else (
+                    (-10.0, 10.0) if mode == "qip_qoop" else (0.0, 5.0)
+                )
+            if mode == "qip_qoop":
+                return (0.0, 5.0)
+            if mode == "exit_angles":
+                return (0.0, 90.0)
+            return (-180.0, 180.0)
+        if axis == "radial":
+            return (0.0, 90.0) if a2.get("unit") == "2th_deg" else (0.0, 5.0)
+        return (-180.0, 180.0)
+
+    def _controls_v2_range_value(self, root: str, axis: str):
+        a1, a2 = self._controls_v2_scan_int_args()
+        args = a1 if root == "Int1D" else a2
+        key = "radial_range" if axis == "radial" else "azimuth_range"
+        value = args.get(key)
+        return value if value is not None else self._controls_v2_default_range(root, axis)
+
+    def _controls_v2_set_range_auto(self, root: str, axis: str, auto: bool) -> None:
+        a1, a2 = self._controls_v2_scan_int_args()
+        args = a1 if root == "Int1D" else a2
+        key = "radial_range" if axis == "radial" else "azimuth_range"
+        value = None if auto else self._controls_v2_range_value(root, axis)
+        args[key] = value
+        if root == "Int2D" and bool(getattr(getattr(self, "scan", None), "gi", False)):
+            alt = "x_range" if axis == "radial" else "y_range"
+            if value is None:
+                args.pop(alt, None)
+            else:
+                args[alt] = value
+        if root == "Int1D" and axis == "azimuth" and self._controls_v2_npts_oop_visible():
+            args.setdefault("npt_oop", int(args.get("numpoints", 3000)))
+
+    def _controls_v2_set_range_bound(
+        self,
+        root: str,
+        axis: str,
+        bound: str,
+        value: object,
+    ) -> None:
+        a1, a2 = self._controls_v2_scan_int_args()
+        args = a1 if root == "Int1D" else a2
+        key = "radial_range" if axis == "radial" else "azimuth_range"
+        low, high = self._controls_v2_range_value(root, axis)
+        number = self._controls_v2_float(value, low if bound == "low" else high)
+        if bound == "low":
+            low = number
+        else:
+            high = number
+        args[key] = (float(low), float(high))
+        if root == "Int2D" and bool(getattr(getattr(self, "scan", None), "gi", False)):
+            args["x_range" if axis == "radial" else "y_range"] = args[key]
+        if root == "Int1D" and axis == "azimuth" and self._controls_v2_npts_oop_visible():
+            args.setdefault("npt_oop", int(args.get("numpoints", 3000)))
+
+    def _controls_v2_npts_oop_visible(self) -> bool:
+        scan = getattr(self, "scan", None)
+        if not bool(getattr(scan, "gi", False)):
+            return False
+        a1, _ = self._controls_v2_scan_int_args()
+        return (
+            a1.get("gi_mode_1d", "q_total") != "q_total"
+            or a1.get("azimuth_range") is not None
+        )
 
     def _controls_v2_integrator_parameter(self, spec):
         integrator = getattr(self, "integratorTree", None)
@@ -856,11 +1201,83 @@ class staticWidget(QWidget):
         except Exception:
             return None
 
-    def _controls_v2_integrator_choices(self):
+    def _controls_v2_advanced_value(self, root: str, leaf: str):
+        a1, a2 = self._controls_v2_scan_int_args()
+        args = a1 if root == "Int1D" else a2
+        if leaf == "apply_polarization":
+            return args.get("polarization_factor") is not None
+        if leaf == "polarization_factor":
+            value = args.get("polarization_factor")
+            return 0.0 if value is None else value
+        defaults = {
+            "correctSolidAngle": True,
+            "method": "csr",
+            "dummy": -1.0,
+            "delta_dummy": 0.0,
+            "chi_offset": 90.0,
+            "safe": True,
+        }
+        return args.get(leaf, defaults.get(leaf, ""))
+
+    def _controls_v2_native_int_values(self):
+        self._controls_v2_ensure_native_int_defaults()
+        a1, a2 = self._controls_v2_scan_int_args()
+        gi_cfg = self._controls_v2_gi_config()
+        threshold = self._controls_v2_threshold_config()
+        r1 = self._controls_v2_range_value("Int1D", "radial")
+        z1 = self._controls_v2_range_value("Int1D", "azimuth")
+        r2 = self._controls_v2_range_value("Int2D", "radial")
+        z2 = self._controls_v2_range_value("Int2D", "azimuth")
+
+        values = {
+            ("GI", "Grazing"): bool(gi_cfg["gi"]),
+            ("GI", "th_motor"): str(gi_cfg["incidence_motor"]),
+            ("GI", "th_val"): self._controls_v2_number_text(gi_cfg["th_val"]),
+            ("GI", "sample_orientation"): int(gi_cfg["sample_orientation"]),
+            ("GI", "tilt_angle"): self._controls_v2_number_text(gi_cfg["tilt_angle"]),
+            ("Mask", "Threshold"): bool(threshold.apply_threshold),
+            ("Mask", "min"): self._controls_v2_number_text(threshold.threshold_min),
+            ("Mask", "max"): self._controls_v2_number_text(threshold.threshold_max),
+            ("MaskSat", "mask_sentinel"): bool(threshold.mask_saturation),
+            ("Int1D", "unit"): self._controls_v2_unit_display(a1.get("unit"), dim="1d"),
+            ("Int1D", "axis"): self._controls_v2_axis_display("Int1D"),
+            ("Int1D", "points"): str(int(a1.get("numpoints", 3000))),
+            ("Int1D", "radial_auto"): a1.get("radial_range") is None,
+            ("Int1D", "radial_low"): self._controls_v2_number_text(r1[0]),
+            ("Int1D", "radial_high"): self._controls_v2_number_text(r1[1]),
+            ("Int1D", "azim_auto"): a1.get("azimuth_range") is None,
+            ("Int1D", "azim_low"): self._controls_v2_number_text(z1[0]),
+            ("Int1D", "azim_high"): self._controls_v2_number_text(z1[1]),
+            ("Int2D", "unit"): self._controls_v2_unit_display(a2.get("unit"), dim="2d"),
+            ("Int2D", "axis"): self._controls_v2_axis_display("Int2D"),
+            ("Int2D", "radial_points"): str(int(a2.get("npt_rad", 500))),
+            ("Int2D", "azim_points"): str(int(a2.get("npt_azim", 500))),
+            ("Int2D", "radial_auto"): a2.get("radial_range") is None,
+            ("Int2D", "radial_low"): self._controls_v2_number_text(r2[0]),
+            ("Int2D", "radial_high"): self._controls_v2_number_text(r2[1]),
+            ("Int2D", "azim_auto"): a2.get("azimuth_range") is None,
+            ("Int2D", "azim_low"): self._controls_v2_number_text(z2[0]),
+            ("Int2D", "azim_high"): self._controls_v2_number_text(z2[1]),
+        }
+        if bool(gi_cfg["gi"]):
+            values[("Int1D", "gi_mode")] = a1.get("gi_mode_1d", "q_total")
+            values[("Int2D", "gi_mode")] = a2.get("gi_mode_2d", "qip_qoop")
+        if self._controls_v2_npts_oop_visible():
+            values[("Int1D", "points_oop")] = str(
+                int(a1.get("npt_oop", a1.get("numpoints", 3000)))
+            )
+        for spec in INTEGRATOR_BACKED_CONTROL_SPECS:
+            if not spec.parameter_name:
+                continue
+            values[spec.path] = self._controls_v2_advanced_value(
+                spec.path[0], spec.path[1]
+            )
+        return values
+
+    def _controls_v2_native_int_choices(self):
         integrator = getattr(self, "integratorTree", None)
         ui = getattr(integrator, "ui", None)
-        if integrator is None:
-            return {}
+        gi = bool(getattr(getattr(self, "scan", None), "gi", False))
 
         def _combo_choices(name):
             combo = getattr(ui, name, None)
@@ -868,185 +1285,148 @@ class staticWidget(QWidget):
                 return ()
             return tuple(combo.itemText(i) for i in range(combo.count()))
 
-        choices = {}
+        choices = {
+            ("Int1D", "unit"): tuple(Units),
+            ("Int2D", "unit"): tuple(Units[:2]),
+            ("Int1D", "axis"): tuple(GI_LABELS_1D if gi else Units),
+            ("Int2D", "axis"): tuple(GI_LABELS_2D if gi else ("Q-χ", "2θ-χ")),
+            ("GI", "th_motor"): _combo_choices("gi_motor") or ("Manual", "th"),
+        }
         for spec in INTEGRATOR_BACKED_CONTROL_SPECS:
-            if spec.kind.value != "combo" or not spec.choices_widget:
-                if spec.kind.value == "combo" and spec.parameter_name:
-                    param = self._controls_v2_integrator_parameter(spec)
-                    opts = getattr(param, "opts", {}) or {}
-                    vals = opts.get("limits", None)
-                    if vals is None:
-                        vals = opts.get("values", None)
-                    if isinstance(vals, dict):
-                        choices[spec.path] = tuple(str(v) for v in vals.values())
-                    elif isinstance(vals, (list, tuple, set)):
-                        choices[spec.path] = tuple(str(v) for v in vals)
-                continue
-            choices[spec.path] = _combo_choices(spec.choices_widget)
+            if spec.kind.value == "combo" and spec.parameter_name:
+                param = self._controls_v2_integrator_parameter(spec)
+                opts = getattr(param, "opts", {}) or {}
+                vals = opts.get("limits", None)
+                if vals is None:
+                    vals = opts.get("values", None)
+                if isinstance(vals, dict):
+                    choices[spec.path] = tuple(str(v) for v in vals.values())
+                elif isinstance(vals, (list, tuple, set)):
+                    choices[spec.path] = tuple(str(v) for v in vals)
         return {path: vals for path, vals in choices.items() if vals}
 
-    def _set_controls_v2_integrator_field(self, path, value) -> bool:
-        path = tuple(path)
-        if path not in INTEGRATOR_BACKED_CONTROL_PATHS:
-            return False
-        integrator = getattr(self, "integratorTree", None)
-        ui = getattr(integrator, "ui", None)
-        if integrator is None:
-            return True
+    def _controls_v2_sync_advanced_parameter(self, path) -> None:
         spec = next(
             (spec for spec in INTEGRATOR_BACKED_CONTROL_SPECS
-             if spec.path == path),
+             if spec.path == tuple(path) and spec.parameter_name),
             None,
         )
         if spec is None:
-            return True
-        try:
-            if spec.parameter_name:
-                param = self._controls_v2_integrator_parameter(spec)
-                if param is not None:
-                    current = param.value()
-                    if spec.value_role == "checked":
-                        new_value = bool(
-                            coerce_control_edit_value(current, value)
-                        )
-                    elif spec.value_role == "float":
-                        new_value = float(value)
-                    elif spec.value_role == "current_text":
-                        new_value = str(value)
-                    else:
-                        new_value = coerce_control_edit_value(current, value)
-                    if current != new_value:
-                        param.setValue(new_value)
-                self._sync_controls_v2_integrator_path(path)
-                return True
-
-            if ui is None:
-                return True
-            widget = getattr(ui, spec.widget_name, None)
-            if spec.value_role == "current_text":
-                combo = widget
-                if combo is not None:
-                    text = str(value)
-                    idx = combo.findText(text)
-                    if idx >= 0 and combo.currentIndex() != idx:
-                        combo.setCurrentIndex(idx)
-            elif spec.value_role == "checked":
-                if widget is not None:
-                    checked = bool(
-                        coerce_control_edit_value(widget.isChecked(), value)
-                    )
-                    if widget.isChecked() != checked:
-                        widget.setChecked(checked)
-            elif spec.value_role == "value":
-                if widget is not None:
-                    current = widget.value()
-                    new_value = coerce_control_edit_value(current, value)
-                    if current != new_value:
-                        widget.setValue(new_value)
-            else:
-                if widget is not None:
-                    text = "" if value is None else str(value)
-                    if widget.text() != text:
-                        widget.setText(text)
-            self._sync_controls_v2_integrator_path(path)
-        except Exception:
-            logger.debug("Controls Panel V2 integrator field update failed for %s",
-                         path, exc_info=True)
-        return True
-
-    def _sync_controls_v2_integrator_path(self, path) -> None:
-        """Route a V2 edit through the legacy integrator parser immediately.
-
-        The hidden v1 panel remains the production parser during this
-        migration.  Calling its granular update hooks after every V2 edit keeps
-        ``scan.bai_1d_args`` / ``scan.bai_2d_args`` current before run setup
-        snapshots them.
-        """
-        path = tuple(path)
-        integrator = getattr(self, "integratorTree", None)
-        ui = getattr(integrator, "ui", None)
-        if integrator is None or ui is None:
             return
+        param = self._controls_v2_integrator_parameter(spec)
+        if param is None:
+            return
+        value = self._controls_v2_advanced_value(spec.path[0], spec.path[1])
+        if spec.path[1] == "polarization_factor" and value is None:
+            value = 0.0
         try:
-            if path[0] == "GI":
-                # Do NOT call _on_gi_toggled here.  Setting gi_enable in
-                # _set_controls_v2_integrator_field already fires it via the
-                # widget's `toggled` signal — but only when the value actually
-                # CHANGES (guarded).  Calling it unconditionally here re-ran the
-                # toggle side effects (incl. re-opening the GI Options popup) on
-                # every programmatic re-sync, so the popup reappeared on Run and
-                # on each profile refresh.  The widget signal covers the real
-                # toggle; here we only refresh the derived args.
-                self._push_gi_to_wrangler()
-                integrator.get_args("bai_1d")
-                integrator.get_args("bai_2d")
-                return
-
-            if path[0] in {"Mask", "MaskSat"}:
-                self._push_threshold_to_wrangler()
-                return
-
-            if path[0] == "Int1D":
-                self._sync_controls_v2_1d_path(path, integrator, ui)
-                integrator.get_args("bai_1d")
-                return
-
-            if path[0] == "Int2D":
-                self._sync_controls_v2_2d_path(path, integrator, ui)
-                integrator.get_args("bai_2d")
-                return
+            if param.value() != value:
+                param.setValue(value)
         except Exception:
-            logger.debug("Controls Panel V2 legacy parser sync failed for %s",
+            logger.debug("Controls Panel V2 advanced mirror failed for %s",
                          path, exc_info=True)
 
-    def _sync_controls_v2_1d_path(self, path, integrator, ui) -> None:
-        leaf = path[1] if len(path) > 1 else ""
-        if leaf == "axis":
-            integrator._update_gi_mode_1d(ui.axis1D.currentIndex())
-        elif leaf in {"points", "points_oop"}:
-            integrator._get_npts_1D()
-        elif leaf in {"radial_auto", "radial_low", "radial_high"}:
-            integrator._get_radial_range_1D()
-        elif leaf in {"azim_auto", "azim_low", "azim_high"}:
-            integrator._get_azim_range_1D()
-
-    def _sync_controls_v2_2d_path(self, path, integrator, ui) -> None:
-        leaf = path[1] if len(path) > 1 else ""
-        if leaf == "axis":
-            integrator._update_gi_mode_2d(ui.axis2D.currentIndex())
-        elif leaf == "radial_points":
-            integrator._get_npts_radial_2D()
-        elif leaf == "azim_points":
-            integrator._get_npts_azim_2D()
-        elif leaf in {"radial_auto", "radial_low", "radial_high"}:
-            integrator._get_radial_range_2D()
-        elif leaf in {"azim_auto", "azim_low", "azim_high"}:
-            integrator._get_azim_range_2D()
-
-    def _sync_controls_v2_integrator_args(self) -> None:
+    def _controls_v2_hydrate_advanced_from_scan(self) -> None:
         integrator = getattr(self, "integratorTree", None)
         if integrator is None:
             return
+        self._controls_v2_ensure_native_int_defaults()
+        a1, a2 = self._controls_v2_scan_int_args()
+        keys = {
+            "correctSolidAngle",
+            "dummy",
+            "delta_dummy",
+            "chi_offset",
+            "polarization_factor",
+            "method",
+            "safe",
+        }
         try:
-            integrator.get_args("bai_1d")
-            integrator.get_args("bai_2d")
-            self._push_threshold_to_wrangler()
-            self._push_gi_to_wrangler()
+            integrator._args_to_params(
+                {k: v for k, v in a1.items() if k in keys},
+                integrator.bai_1d_pars,
+                dim="1D",
+            )
+            integrator._args_to_params(
+                {k: v for k, v in a2.items() if k in keys},
+                integrator.bai_2d_pars,
+                dim="2D",
+            )
         except Exception:
-            logger.debug("Controls Panel V2 full integrator sync failed",
+            logger.debug("Controls Panel V2 advanced hydrate failed",
                          exc_info=True)
 
-    def _apply_controls_v2_run_state(self) -> dict:
-        """Apply the Controls V2 state and snapshot args for this run.
+    def _set_controls_v2_native_int_field(self, path, value) -> bool:
+        path = tuple(path)
+        if path not in INTEGRATOR_BACKED_CONTROL_PATHS:
+            return False
+        root = path[0]
+        leaf = path[1] if len(path) > 1 else ""
+        if root == "GI":
+            self._controls_v2_set_gi_field(leaf, value)
+            return True
+        if root in {"Mask", "MaskSat"}:
+            self._controls_v2_set_threshold_field(path, value)
+            return True
+        if root not in {"Int1D", "Int2D"}:
+            return True
+        self._controls_v2_ensure_native_int_defaults()
+        a1, a2 = self._controls_v2_scan_int_args()
+        args = a1 if root == "Int1D" else a2
+        if leaf == "unit":
+            args["unit"] = self._controls_v2_unit_code(
+                value, dim="1d" if root == "Int1D" else "2d")
+        elif leaf == "axis":
+            self._controls_v2_axis_to_native(root, value)
+        elif leaf == "points":
+            args["numpoints"] = self._controls_v2_int(value, 3000)
+            if self._controls_v2_npts_oop_visible():
+                args.setdefault("npt_oop", args["numpoints"])
+        elif leaf == "points_oop":
+            args["npt_oop"] = self._controls_v2_int(
+                value, args.get("numpoints", 3000))
+        elif leaf == "radial_points":
+            args["npt_rad"] = self._controls_v2_int(value, 500)
+        elif leaf == "azim_points":
+            args["npt_azim"] = self._controls_v2_int(value, 500)
+        elif leaf == "radial_auto":
+            self._controls_v2_set_range_auto(root, "radial", self._controls_v2_bool(value))
+        elif leaf == "azim_auto":
+            self._controls_v2_set_range_auto(root, "azimuth", self._controls_v2_bool(value))
+        elif leaf == "radial_low":
+            self._controls_v2_set_range_bound(root, "radial", "low", value)
+        elif leaf == "radial_high":
+            self._controls_v2_set_range_bound(root, "radial", "high", value)
+        elif leaf == "azim_low":
+            self._controls_v2_set_range_bound(root, "azimuth", "low", value)
+        elif leaf == "azim_high":
+            self._controls_v2_set_range_bound(root, "azimuth", "high", value)
+        elif leaf == "apply_polarization":
+            if self._controls_v2_bool(value):
+                args["polarization_factor"] = self._controls_v2_float(
+                    args.get("polarization_factor"), 0.0)
+            else:
+                args["polarization_factor"] = None
+            self._controls_v2_sync_advanced_parameter(path)
+        elif leaf == "polarization_factor":
+            args["polarization_factor"] = self._controls_v2_float(value, 0.0)
+            self._controls_v2_sync_advanced_parameter(path)
+        elif leaf in {"correctSolidAngle", "safe"}:
+            args[leaf] = self._controls_v2_bool(value)
+            self._controls_v2_sync_advanced_parameter(path)
+        elif leaf in {"dummy", "delta_dummy", "chi_offset"}:
+            args[leaf] = self._controls_v2_float(value, args.get(leaf, 0.0))
+            self._controls_v2_sync_advanced_parameter(path)
+        elif leaf == "method":
+            args["method"] = str(value)
+            self._controls_v2_sync_advanced_parameter(path)
+        return True
 
-        Controls V2 is the visible editor during this migration, while the
-        legacy integrator widgets remain the production parser.  Keep that
-        bridge in one place: harvest any focused/unfinished V2 edits, write
-        them through immediately, push the carrier params, then deep-copy the
-        scan args that the wrangler will use for this run.
-        """
+    def _apply_controls_v2_run_state(self) -> dict:
+        """Apply native Controls V2 Int state and snapshot args for this run."""
         self._commit_controls_v2_pending_edits()
-        self._sync_controls_v2_integrator_args()
+        self._controls_v2_ensure_native_int_defaults()
+        self._controls_v2_apply_gi_config_to_scan()
         self._push_threshold_to_wrangler()
         self._push_gi_to_wrangler()
         args = {
@@ -1065,25 +1445,16 @@ class staticWidget(QWidget):
 
         if not getattr(self, "_tearing_down", False):
             self._commit_controls_v2_pending_edits()
-            self._sync_controls_v2_integrator_args()
-        try:
-            self.integratorTree._apply_gi_config_to_scan()
-        except Exception:
-            logger.debug("Controls V2 native GI session sync failed",
-                         exc_info=True)
+        self._controls_v2_ensure_native_int_defaults()
+        self._controls_v2_apply_gi_config_to_scan()
 
-        threshold = {}
-        try:
-            cfg = self.integratorTree.get_threshold_config()
-            threshold = {
-                "apply_threshold": bool(cfg.apply_threshold),
-                "threshold_min": cfg.threshold_min,
-                "threshold_max": cfg.threshold_max,
-                "mask_saturation": bool(cfg.mask_saturation),
-            }
-        except Exception:
-            logger.debug("Controls V2 native threshold session sync failed",
-                         exc_info=True)
+        cfg = self._controls_v2_threshold_config()
+        threshold = {
+            "apply_threshold": bool(cfg.apply_threshold),
+            "threshold_min": cfg.threshold_min,
+            "threshold_max": cfg.threshold_max,
+            "mask_saturation": bool(cfg.mask_saturation),
+        }
 
         scan = getattr(self, "scan", None)
         return {
@@ -1129,34 +1500,29 @@ class staticWidget(QWidget):
             logger.debug("Controls V2 native Int scan restore failed",
                          exc_info=True)
 
-        try:
-            self.integratorTree.hydrate_from_scan()
-            with scan.scan_lock:
-                self.integratorTree._args_to_params(
-                    scan.bai_1d_args, self.integratorTree.bai_1d_pars, dim="1D")
-                self.integratorTree._args_to_params(
-                    scan.bai_2d_args, self.integratorTree.bai_2d_pars, dim="2D")
-        except Exception:
-            logger.debug("Controls V2 native Int widget hydrate failed",
-                         exc_info=True)
+        self._controls_v2_hydrate_advanced_from_scan()
 
         threshold = data.get("threshold_config")
         if isinstance(threshold, dict):
-            ui = getattr(self.integratorTree, "ui", None)
-            try:
-                ui.threshold_enable.setChecked(
-                    bool(threshold.get("apply_threshold", False))
-                )
-                if threshold.get("threshold_min") is not None:
-                    ui.threshold_min.setText(str(threshold.get("threshold_min")))
-                if threshold.get("threshold_max") is not None:
-                    ui.threshold_max.setText(str(threshold.get("threshold_max")))
-                ui.mask_saturated.setChecked(
-                    bool(threshold.get("mask_saturation", False))
-                )
-            except Exception:
-                logger.debug("Controls V2 native threshold restore failed",
-                             exc_info=True)
+            self._controls_v2_threshold_state = {
+                "apply_threshold": bool(threshold.get("apply_threshold", False)),
+                "threshold_min": self._controls_v2_float(
+                    threshold.get("threshold_min", 0.0), 0.0),
+                "threshold_max": self._controls_v2_float(
+                    threshold.get("threshold_max", 0.0), 0.0),
+                "mask_saturation": bool(threshold.get("mask_saturation", True)),
+            }
+            cfg = self._controls_v2_threshold_config()
+            for attr, value in (
+                ("apply_threshold", cfg.apply_threshold),
+                ("threshold_min", cfg.threshold_min),
+                ("threshold_max", cfg.threshold_max),
+                ("mask_sentinel", cfg.mask_saturation),
+            ):
+                try:
+                    setattr(scan, attr, value)
+                except Exception:
+                    pass
 
         self._refresh_controls_v2_profile(immediate=True)
 
@@ -1168,17 +1534,12 @@ class staticWidget(QWidget):
         integrate_2d: bool = True,
         commit_pending: bool = True,
     ):
-        """Build the dormant native Controls V2 reduction plan.
-
-        Runtime still uses the legacy plan builder.  This seam exists so tests
-        can prove V2's direct plan construction is equivalent before the final
-        carrier retirement.
-        """
+        """Build the native Controls V2 reduction plan used by run/reintegrate."""
 
         if commit_pending:
             self._commit_controls_v2_pending_edits()
-        self._sync_controls_v2_integrator_args()
-        self.integratorTree._apply_gi_config_to_scan()
+        self._controls_v2_ensure_native_int_defaults()
+        self._controls_v2_apply_gi_config_to_scan()
 
         scan = getattr(self, "scan", None)
 
@@ -1186,7 +1547,7 @@ class staticWidget(QWidget):
         threshold_max = None
         mask_saturation = False
         if include_threshold:
-            cfg = self.integratorTree.get_threshold_config()
+            cfg = self._controls_v2_threshold_config()
             if cfg.apply_threshold:
                 threshold_min = cfg.threshold_min
                 threshold_max = cfg.threshold_max
@@ -1203,8 +1564,8 @@ class staticWidget(QWidget):
 
     @staticmethod
     def _controls_v2_native_run_plan_enabled() -> bool:
-        value = os.environ.get("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", "0")
-        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+        value = os.environ.get("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", "1")
+        return str(value).strip().lower() not in {"0", "false", "no", "off"}
 
     @staticmethod
     def _controls_v2_native_run_plan_builder(
@@ -1502,7 +1863,11 @@ class staticWidget(QWidget):
         tool = tool_from_mode_text(mode_text)
         gi_cfg = {}
         try:
-            gi_cfg = self.integratorTree.get_gi_config()
+            gi_cfg = (
+                self._controls_v2_gi_config()
+                if self._controls_v2_enabled()
+                else self.integratorTree.get_gi_config()
+            )
         except Exception:
             gi_cfg = {}
         gi_on = bool(gi_cfg.get("gi", getattr(self.scan, "gi", False)))
@@ -2199,10 +2564,8 @@ class staticWidget(QWidget):
                          exc_info=True)
 
     def _push_threshold_to_wrangler(self):
-        """Inject the integrator's CURRENT pixel-rejection policy into the active
-        wrangler's (now-hidden) Mask / MaskSat params, so a LIVE run applies the
-        SAME Intensity-Threshold / Mask-Saturated rejection that Reintegrate
-        does — the integrator is the single source of truth.
+        """Inject the native V2 pixel-rejection policy into the active
+        wrangler setup params so live and reintegrate share one policy.
 
         Called from ``start_wrangler`` BEFORE ``wrangler.setup()`` (which reads
         those params and pushes them to the thread).  Per-field guarded: a
@@ -2210,7 +2573,11 @@ class staticWidget(QWidget):
         it, and still receives 'Mask Saturated'.
         """
         try:
-            cfg = self.integratorTree.get_threshold_config()
+            cfg = (
+                self._controls_v2_threshold_config()
+                if self._controls_v2_enabled()
+                else self.integratorTree.get_threshold_config()
+            )
         except Exception:
             # Fail LOUD: silently falling back means the LIVE run applies the
             # wrangler's default pixel-rejection instead of the integrator's
@@ -2238,14 +2605,13 @@ class staticWidget(QWidget):
         _set('MaskSat', 'mask_sentinel', bool(cfg.mask_saturation))
 
     def _push_gi_to_wrangler(self):
-        """Inject the integrator's CURRENT GI geometry into the active wrangler's
-        (now-hidden) GI carrier params, so a LIVE run uses the SAME GI geometry
-        the integrator shows (and Reintegrate reads).  Called from
-        ``start_wrangler`` BEFORE ``wrangler.setup()`` (which reads the GI params
-        into the thread).  Per-field guarded: a wrangler without a 'GI' group
-        just skips."""
+        """Inject the native V2 GI geometry into the active wrangler setup params."""
         try:
-            cfg = self.integratorTree.get_gi_config()
+            cfg = (
+                self._controls_v2_gi_config()
+                if self._controls_v2_enabled()
+                else self.integratorTree.get_gi_config()
+            )
         except Exception:
             # Fail LOUD: a silent fallback means the LIVE run uses the wrangler's
             # default GI geometry instead of the integrator's (quiet divergence).
@@ -2327,6 +2693,7 @@ class staticWidget(QWidget):
         # flush instead of an O(N^2) per-frame `sd.loc[idx] = ser` enlargement.
         self._pending_frames = {}
         self._scan_info_rows = {}
+        self._restore_controls_v2_int_session_state()
 
     def _fit_controls_height(self):
         """Pin the bottom controls bar to its current content height.
@@ -2421,7 +2788,16 @@ class staticWidget(QWidget):
         # existing layouts/refs don't break) rather than wiring it.
         if hasattr(self.wrangler, 'ui') and hasattr(self.wrangler.ui, 'advancedButton'):
             self.wrangler.ui.advancedButton.hide()
+        native_gi_cfg = (
+            self._controls_v2_gi_config()
+            if self._controls_v2_enabled()
+            else None
+        )
         self.wrangler.setup()
+        if native_gi_cfg is not None:
+            self._controls_v2_apply_gi_config_to_scan(native_gi_cfg)
+            self._push_gi_to_wrangler()
+        self._configure_controls_v2_native_run_plan()
         self._sync_h5viewer_save_dir(getattr(self.wrangler, 'h5_dir', None))
         # currentTextChanged (above) only fires on a CHANGE, so seed the control
         # and display state once now.  This is especially important on a fresh
@@ -2950,6 +3326,11 @@ class staticWidget(QWidget):
         the wrangler owns the config then, and the scan is mid-write."""
         if getattr(self, '_run_active', False):
             return
+        if self._controls_v2_enabled():
+            self._controls_v2_ensure_native_int_defaults()
+            self._controls_v2_hydrate_advanced_from_scan()
+            self._refresh_controls_v2_profile(immediate=True)
+            return
         try:
             self.integratorTree.hydrate_from_scan()
         except Exception:
@@ -2988,10 +3369,10 @@ class staticWidget(QWidget):
         # continuously; the integrator panel saves here at exit).
         try:
             from xdart.utils.session import save_session
-            save_session({
-                'integrator': self.integratorTree.session_state(),
-                'controls_v2_int': self._controls_v2_int_session_state(),
-            })
+            state = {'controls_v2_int': self._controls_v2_int_session_state()}
+            if not self._controls_v2_enabled():
+                state['integrator'] = self.integratorTree.session_state()
+            save_session(state)
         except Exception:
             logger.debug("integrator session save failed", exc_info=True)
         # Pause/Resume (Phase B): a PAUSED run blocks the wrangler thread in its
@@ -3075,6 +3456,7 @@ class staticWidget(QWidget):
     def _show_integration_advanced(self):
         """Show a combined dialog with the integratorTree's existing
         1D and 2D advanced parameter widgets."""
+        self._controls_v2_hydrate_advanced_from_scan()
         if not hasattr(self, '_integ_adv_combined_dlg'):
             dlg = QtWidgets.QDialog(self)
             dlg.setWindowTitle('Integration \u2014 Advanced Settings')
@@ -3768,9 +4150,13 @@ class staticWidget(QWidget):
             except Exception:
                 pass
 
-        self.integratorTree.get_args('bai_1d')
-        self.integratorTree.get_args('bai_2d')
-        self.integratorTree.set_image_units()
+        if self._controls_v2_enabled():
+            self._controls_v2_ensure_native_int_defaults()
+            self._controls_v2_apply_gi_config_to_scan()
+        else:
+            self.integratorTree.get_args('bai_1d')
+            self.integratorTree.get_args('bai_2d')
+            self.integratorTree.set_image_units()
 
         # Flush any throttled update from the *previous* scan before we
         # blow away its in-memory state.  Without this, in non-batch
@@ -3881,7 +4267,11 @@ class staticWidget(QWidget):
         # plotUnit/imageUnit combos to GI/non-GI axes immediately is misleading.
         # The display combos rebuild via new_scan -> set_axes once a run actually
         # produces plots in the new mode.
-        self.integratorTree.set_image_units()
+        if self._controls_v2_enabled():
+            self._controls_v2_ensure_native_int_defaults()
+            self._refresh_controls_v2_profile(immediate=True)
+        else:
+            self.integratorTree.set_image_units()
 
     def new_frame(self, frame_data):
         """Connected to sigUpdateFile from wrangler. Called when a new
