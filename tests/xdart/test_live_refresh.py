@@ -5614,6 +5614,8 @@ def _wrangler_host(mode_text, *, live=False, batch=False):
     )
     host._on_mode_changed = MethodType(imageWrangler._on_mode_changed, host)
     host._apply_disclosure = MethodType(imageWrangler._apply_disclosure, host)
+    host._adopt_loaded_scan_run_inputs = MethodType(
+        imageWrangler._adopt_loaded_scan_run_inputs, host)
     host.start = MethodType(imageWrangler.start, host)
     host._inputs_valid = MethodType(imageWrangler._inputs_valid, host)
     # Phase B: the action-button morph helper + its state, used by enabled()/
@@ -5792,6 +5794,38 @@ def test_start_without_poni_is_gated():
 
     assert host.sigStart.emitted == []          # did not start
     assert getattr(host, "command", None) != "start"
+
+
+def test_start_guard_adopts_processed_scan_cached_poni_and_source(tmp_path):
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    source = tmp_path / "raw_0001.tif"
+    source.write_bytes(b"placeholder")
+    cached_poni = object()
+
+    class Frames:
+        index = [1]
+
+        def __getitem__(self, idx):
+            return SimpleNamespace(
+                source_file=str(source),
+                _resolved_source_path=lambda: str(source),
+            )
+
+    host = _wrangler_host("Int 2D", live=False, batch=False)
+    host.poni = None
+    host.img_file = ""
+    host.img_dir = ""
+    host.img_ext = ""
+    host.scan._cached_poni = cached_poni
+    host.scan.frames = Frames()
+
+    assert imageWrangler._inputs_valid(host) is True
+    assert host.poni is cached_poni
+    assert host.thread.poni is cached_poni
+    assert host.img_file == str(source)
+    assert host.img_dir == str(tmp_path)
+    assert host.img_ext == "tif"
 
 
 def test_active_run_locks_modes_but_keeps_action_button_enabled():

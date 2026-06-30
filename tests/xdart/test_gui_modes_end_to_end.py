@@ -3244,12 +3244,13 @@ def test_reintegrate_live_default_and_stop_wiring(widget, monkeypatch):
     assert wrangler_stops == [1]
 
     # Entering run-state for a reintegrate LOCKS Start (so a scan can't rebuild
-    # scan.frames out from under the reintegrate loop); _exit re-enables it.
+    # scan.frames out from under the reintegrate loop); _exit returns to the
+    # normal idle readiness gate (this fresh widget is still not ready).
     w._run_active = False
     w._enter_run_state()
     assert not w.controls.startButton.isEnabled()
     w._exit_run_state()
-    assert w.controls.startButton.isEnabled()
+    assert w.controls.actionRow.isEnabled() is False
 
     # Per-frame reintegrate updates are THROTTLED (coalesced), not rendered
     # synchronously — integrator_thread_update just stashes the latest index;

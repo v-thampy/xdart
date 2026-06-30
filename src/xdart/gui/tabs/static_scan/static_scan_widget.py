@@ -1965,12 +1965,25 @@ class staticWidget(QWidget):
     def _controls_v2_update_run_summary(self, state: ControlState, profile) -> None:
         setter = getattr(getattr(self, "controls", None),
                          "set_readiness_summary", None)
-        if not callable(setter):
-            return
         text, ready, tooltip = self._controls_v2_run_summary(state, profile)
-        changed = setter(text, ready=ready, tooltip=tooltip)
-        if changed:
-            self._fit_controls_height()
+        if callable(setter):
+            changed = setter(text, ready=ready, tooltip=tooltip)
+            if changed:
+                self._fit_controls_height()
+        self._controls_v2_sync_run_row(profile)
+
+    def _controls_v2_sync_run_row(self, profile) -> None:
+        controls = getattr(self, "controls", None)
+        if controls is None or getattr(self, "_run_active", False):
+            return
+        try:
+            viewer = str(getattr(profile.processing_page, "value", "")) == "viewer"
+            if viewer or controls.actionRow.isHidden():
+                return
+            controls.set_run_row_enabled(bool(getattr(profile, "can_run", False)))
+        except Exception:
+            logger.debug("Controls V2 run-row readiness sync failed",
+                         exc_info=True)
 
     @staticmethod
     def _controls_v2_run_summary(state: ControlState, profile) -> tuple[str, bool, str]:
@@ -2055,6 +2068,10 @@ class staticWidget(QWidget):
         except Exception:
             frame_count = 0
         source_label = self._controls_v2_source_label()
+        project_root = str(getattr(getattr(self, "wrangler", None), "project_folder", "") or "")
+        project_root_valid = bool(
+            project_root and os.path.isdir(os.path.expanduser(project_root))
+        )
         has_scan_data = False
         try:
             has_scan_data = not getattr(self.scan, "scan_data", None).empty
@@ -2137,7 +2154,9 @@ class staticWidget(QWidget):
             result_caps=result_caps,
             geom=geom,
             backend=self._controls_v2_backend(tool),
-            project_root=str(getattr(getattr(self, "wrangler", None), "project_folder", "") or ""),
+            project_root=project_root,
+            project_root_required=True,
+            project_root_valid=project_root_valid,
             source_label=source_label,
             save_path=str(getattr(getattr(self, "wrangler", None), "h5_dir", "") or ""),
             detector_summary=self._controls_v2_detector_summary(),
@@ -2158,15 +2177,7 @@ class staticWidget(QWidget):
         return ""
 
     def _controls_v2_calibrated(self) -> bool:
-        scan = getattr(self, "scan", None)
-        if getattr(scan, "_cached_integrator", None) is not None:
-            return True
-        if getattr(scan, "geometry", None) is not None:
-            return True
-        try:
-            return bool(getattr(self.integratorTree, "_cached_poni", None))
-        except Exception:
-            return False
+        return self._controls_v2_current_poni() is not None
 
     def _controls_v2_detector_summary(self) -> str:
         """Compact detector/PONI summary for the Experiment subsection header."""
@@ -3953,6 +3964,7 @@ class staticWidget(QWidget):
         # enabled (Pause/Resume/Stop).
         try:
             self.controls.set_mode_row_enabled(False)
+            self.controls.set_run_row_enabled(True)
         except Exception:
             logger.debug("lock mode row on run enter failed", exc_info=True)
         # Enable the shared Stop button for the run.  For a wrangler run this is

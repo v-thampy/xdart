@@ -770,6 +770,12 @@ the flip is not declared fully cleared until the live checkpoint is rerun.
 - Image Viewer and XYE Viewer collapse the bottom controls bar to the mode selector
   and hide non-Project V2 sections so file browsing does not expose inactive
   processing controls.
+- Missing or invalid Project Folder is now a first-stage gate: non-Project V2
+  sections stay hidden, readiness stays pink, and the Run row is disabled rather
+  than offering a green no-op.
+- A loaded processed `.nxs` with stored PONI and reachable raw-source pointers can
+  seed the streaming Run path from the scan cache, matching the green readiness
+  status instead of failing the old PONI-file-only guard.
 
 **Acceptance gates converted.** Offscreen tests now assert native-authoritative
 correctness rather than V2-vs-hidden-widget parity. The core checks are:
@@ -789,12 +795,19 @@ correctness rather than V2-vs-hidden-widget parity. The core checks are:
 - native threshold value entry is covered directly (`Max=1000` enables thresholding;
   `0/0` does not), and stale tests now assert native V2 state rather than retired
   legacy widget values.
+- Project-folder gating and processed-`.nxs` rerun readiness now use the same
+  predicates as the visible Run controls.
 
 **Validated in `xrd_test` for this chunk.**
-- `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_panel_v2.py -q` → 69 passed.
-- `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_logic.py -q` → 28 passed.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_panel_v2.py -q` → 72 passed.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_logic.py -q` → 29 passed.
 - `QT_QPA_PLATFORM=offscreen tests/xdart/test_static_controls.py tests/xdart/test_n1_disclosure.py -q` → 15 passed.
-- `QT_QPA_PLATFORM=offscreen tests/xdart/test_live_refresh.py -k "wrangler_enabled_reapplies_viewer_mode_controls or file_viewer_mode_disables_processing_tree_but_not_mode_combo" -q` → 2 passed.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_live_refresh.py -k "wrangler_enabled_reapplies_viewer_mode_controls or file_viewer_mode_disables_processing_tree_but_not_mode_combo or start_guard_adopts_processed_scan_cached_poni_and_source or start_without_poni_is_gated" -q` → 4 passed.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_gui_modes_end_to_end.py -k "run_state_disables_whole_integrator_and_mode_row" -q`,
+  `-k "run_in_stitch_mode_routes_to_stitch_not_wrangler" -q`, and
+  `-k "reintegrate_live_default_and_stop_wiring" -q` → 1 passed each; the
+  combined selector hit the known offscreen PySide/pyqtgraph segfault before a
+  clean summary.
 - `QT_QPA_PLATFORM=offscreen tests/xdart/test_gui_modes_end_to_end.py -k "threshold_autoenables_on_value_entry or integrator_panel_session_roundtrip or integrator_owns_threshold_config or live_run_injects_integrator_threshold_into_wrangler or gi_manual_incidence_reintegrate_uses_numeric_not_motor_name or gi_detail_widgets_live_in_hidden_holder" -q` → 6 passed.
 - Full `test_gui_modes_end_to_end.py -q` was attempted twice in the offscreen
   environment and hit a PySide/pyqtgraph segfault during widget construction

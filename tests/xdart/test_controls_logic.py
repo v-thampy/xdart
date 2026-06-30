@@ -133,6 +133,32 @@ def test_viewer_modes_do_not_offer_run_even_without_blockers():
     assert not profile.show_processing_card
 
 
+def test_required_project_root_blocks_run_when_missing_or_invalid():
+    common = dict(
+        tool=Tool.INT_2D,
+        project_root_required=True,
+        source_caps=SourceCaps(
+            has_frames=True, has_raw=True, raw_reachable=True,
+            has_energy=True,
+        ),
+        geom=GeomState(calibrated=True, energy_known=True),
+    )
+
+    missing = build_control_profile(ControlState(**common))
+    assert not missing.can_run
+    assert missing.fields[FieldId.PROJECT_ROOT].status is StatusKind.MISSING
+    assert "Choose a project folder." in missing.run_blockers
+
+    invalid = build_control_profile(ControlState(
+        project_root="/not/a/real/project",
+        project_root_valid=False,
+        **common,
+    ))
+    assert not invalid.can_run
+    assert invalid.fields[FieldId.PROJECT_ROOT].status is StatusKind.MISSING
+    assert "Choose a valid project folder." in invalid.run_blockers
+
+
 def test_tool_from_legacy_mode_text():
     assert tool_from_mode_text("Int 1D") == Tool.INT_1D
     assert tool_from_mode_text("Int 2D") == Tool.INT_2D

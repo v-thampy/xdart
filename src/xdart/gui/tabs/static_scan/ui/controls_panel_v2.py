@@ -27,6 +27,7 @@ from ..controls_logic import (
     FieldId,
     FieldStatus,
     SectionId,
+    StatusKind,
     build_bound_control_state,
 )
 
@@ -919,10 +920,17 @@ class ControlsPanelV2(QtWidgets.QWidget):
             state.fields_for(SectionId.EXPERIMENT)))
         self.processing_card.set_status_text(self._processing_status(profile))
         viewer_mode = str(getattr(profile.processing_page, "value", "")) == "viewer"
-        self.source_card.setVisible(not viewer_mode)
+        project_status = profile.fields.get(FieldId.PROJECT_ROOT)
+        project_ready = (
+            project_status is None
+            or project_status.status not in {StatusKind.MISSING, StatusKind.CONFLICT}
+        )
+        self.source_card.setVisible(not viewer_mode and project_ready)
         self.experiment_card.setVisible(
-            bool(state.fields_for(SectionId.EXPERIMENT)) and not viewer_mode)
-        self.processing_card.setVisible(not viewer_mode)
+            bool(state.fields_for(SectionId.EXPERIMENT))
+            and not viewer_mode
+            and project_ready)
+        self.processing_card.setVisible(not viewer_mode and project_ready)
         self.output_card.setVisible(False)
         self.analysis_card.setVisible(False)
 
