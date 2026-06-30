@@ -215,6 +215,32 @@ def _combo_text(widget, name, predicate, *, fallback_current=True):
     raise AssertionError(f"No matching choice in {name}")
 
 
+def _visible_control_value(widget, path):
+    path = tuple(path)
+    cards = (
+        widget.controls_v2.project_card,
+        widget.controls_v2.source_card,
+        widget.controls_v2.experiment_card,
+        widget.controls_v2.processing_card,
+    )
+    for card in cards:
+        for seg in card.body.findChildren(SegmentedControl):
+            if seg.path == path:
+                return seg.current_value()
+        for row in card.body.findChildren(FormRow):
+            if row.path == path:
+                return row.current_value()
+        for row in card.body.findChildren(RangeRow):
+            for row_path, value in row.current_edits():
+                if row_path == path:
+                    return value
+        for row in card.body.findChildren(PillRow):
+            for row_path, value in row.current_edits():
+                if row_path == path:
+                    return value
+    raise AssertionError(f"No visible V2 control for {path!r}")
+
+
 @pytest.fixture(scope="module")
 def qapp():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -982,6 +1008,83 @@ def test_controls_panel_v2_threshold_edits_match_legacy_plan_overlay(
         legacy_widget.close()
         v2_widget.deleteLater()
         legacy_widget.deleteLater()
+
+
+def test_controls_panel_v2_integrator_session_roundtrip_hydrates_visible_rows(
+        qapp, monkeypatch):
+    """V2-edited integration state must survive the close/open session path.
+
+    The visible V2 panel currently writes through to the hidden legacy
+    integrator.  Until the legacy widgets are retired, the close-time
+    ``integrator.session_state()`` blob is the migration bridge, so it must
+    preserve both the hidden parser widgets and the rows users see.
+    """
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    monkeypatch.setenv("XDART_SESSION_FRESH", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    edited = staticWidget()
+    restored = staticWidget()
+    try:
+        _apply_v2_edits(
+            edited,
+            (
+                (("GI", "Grazing"), True),
+                (("GI", "th_motor"), "Manual"),
+                (("GI", "th_val"), "0.23"),
+                (("GI", "sample_orientation"), "5"),
+                (("GI", "tilt_angle"), "0.75"),
+                (("Int1D", "points"), "432"),
+                (("Int1D", "radial_auto"), False),
+                (("Int1D", "radial_low"), "0.2"),
+                (("Int1D", "radial_high"), "4.2"),
+                (("Int2D", "radial_points"), "96"),
+                (("Int2D", "azim_points"), "84"),
+                (("Mask", "Threshold"), True),
+                (("Mask", "min"), "7"),
+                (("Mask", "max"), "777"),
+                (("MaskSat", "mask_sentinel"), True),
+            ),
+        )
+
+        blob = edited.integratorTree.session_state()
+        restored.integratorTree.restore_session_state(blob)
+        restored._refresh_controls_v2_profile_now()
+
+        ui = restored.integratorTree.ui
+        assert ui.gi_enable.isChecked()
+        assert ui.gi_sample_orientation.value() == 5
+        assert ui.gi_tilt.text() == "0.75"
+        assert ui.gi_motor.currentText() == "Manual"
+        assert ui.gi_motor_value.text() == "0.23"
+        assert ui.npts_1D.text() == "432"
+        assert not ui.radial_autoRange_1D.isChecked()
+        assert ui.radial_low_1D.text() == "0.2"
+        assert ui.radial_high_1D.text() == "4.2"
+        assert ui.npts_radial_2D.text() == "96"
+        assert ui.npts_azim_2D.text() == "84"
+        assert ui.threshold_enable.isChecked()
+        assert ui.threshold_min.text() == "7"
+        assert ui.threshold_max.text() == "777"
+        assert ui.mask_saturated.isChecked()
+
+        assert _visible_control_value(restored, ("GI", "Grazing")) is True
+        assert _visible_control_value(restored, ("GI", "th_motor")) == "Manual"
+        assert _visible_control_value(restored, ("GI", "th_val")) == "0.23"
+        assert _visible_control_value(restored, ("Int1D", "points")) == "432"
+        assert _visible_control_value(restored, ("Int1D", "radial_low")) == "0.2"
+        assert _visible_control_value(restored, ("Int1D", "radial_high")) == "4.2"
+        assert _visible_control_value(restored, ("Int2D", "radial_points")) == "96"
+        assert _visible_control_value(restored, ("Int2D", "azim_points")) == "84"
+        assert _visible_control_value(restored, ("Mask", "Threshold")) is True
+        assert _visible_control_value(restored, ("Mask", "min")) == "7"
+        assert _visible_control_value(restored, ("Mask", "max")) == "777"
+        assert _visible_control_value(restored, ("MaskSat", "mask_sentinel")) is True
+    finally:
+        edited.close()
+        restored.close()
+        edited.deleteLater()
+        restored.deleteLater()
 
 
 def test_controls_panel_v2_threshold_edits_update_integrator_and_carrier(qapp, monkeypatch):
