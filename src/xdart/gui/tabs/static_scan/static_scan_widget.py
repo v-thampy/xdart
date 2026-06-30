@@ -508,6 +508,7 @@ class staticWidget(QWidget):
         self._controls_v2_refresh_timer.triggered.connect(
             self._refresh_controls_v2_profile_now)
         self._init_controls_v2_preview()
+        self._configure_controls_v2_native_run_plan()
         # Reintegrate reuses the shared Batch toggle: Batch off -> live (per-frame,
         # the default); Batch on -> fast multicore.  The integrator reads it
         # through this provider at click time (no direct controls ref needed).
@@ -522,6 +523,7 @@ class staticWidget(QWidget):
                 self.integratorTree.restore_session_state(_integ)
         except Exception:
             logger.debug("integrator session restore failed", exc_info=True)
+        self._restore_controls_v2_int_session_state()
 
         # Metadata
         self.metawidget = metadataWidget(self.scan, self.frame,
@@ -669,6 +671,8 @@ class staticWidget(QWidget):
 
     def _controls_v2_click_integrator_button(self, button_name: str) -> None:
         self._commit_controls_v2_pending_edits()
+        if button_name in {"reintegrate1D", "reintegrate2D"}:
+            self._configure_controls_v2_native_run_plan()
         button = getattr(getattr(self.integratorTree, "ui", None), button_name, None)
         if button is None:
             return
@@ -1056,6 +1060,106 @@ class staticWidget(QWidget):
         self.wrangler.scan_args = args
         return args
 
+    def _controls_v2_int_session_state(self) -> dict:
+        """Native Controls V2 Int state used for run/reintegrate plans."""
+
+        if not getattr(self, "_tearing_down", False):
+            self._commit_controls_v2_pending_edits()
+            self._sync_controls_v2_integrator_args()
+        try:
+            self.integratorTree._apply_gi_config_to_scan()
+        except Exception:
+            logger.debug("Controls V2 native GI session sync failed",
+                         exc_info=True)
+
+        threshold = {}
+        try:
+            cfg = self.integratorTree.get_threshold_config()
+            threshold = {
+                "apply_threshold": bool(cfg.apply_threshold),
+                "threshold_min": cfg.threshold_min,
+                "threshold_max": cfg.threshold_max,
+                "mask_saturation": bool(cfg.mask_saturation),
+            }
+        except Exception:
+            logger.debug("Controls V2 native threshold session sync failed",
+                         exc_info=True)
+
+        scan = getattr(self, "scan", None)
+        return {
+            "bai_1d_args": copy.deepcopy(
+                getattr(scan, "bai_1d_args", {}) or {}
+            ),
+            "bai_2d_args": copy.deepcopy(
+                getattr(scan, "bai_2d_args", {}) or {}
+            ),
+            "gi_config": copy.deepcopy(getattr(scan, "gi_config", {}) or {}),
+            "gi": bool(getattr(scan, "gi", False)),
+            "threshold_config": threshold,
+        }
+
+    def _restore_controls_v2_int_session_state(self) -> None:
+        """Restore the native Controls V2 Int blob after the legacy fallback."""
+
+        try:
+            from xdart.utils.session import load_session
+            data = (load_session() or {}).get("controls_v2_int")
+        except Exception:
+            logger.debug("Controls V2 native Int session load failed",
+                         exc_info=True)
+            return
+        if not isinstance(data, dict):
+            return
+
+        scan = getattr(self, "scan", None)
+        if scan is None:
+            return
+        try:
+            with scan.scan_lock:
+                a1 = data.get("bai_1d_args")
+                a2 = data.get("bai_2d_args")
+                if isinstance(a1, dict):
+                    scan.bai_1d_args = copy.deepcopy(a1)
+                if isinstance(a2, dict):
+                    scan.bai_2d_args = copy.deepcopy(a2)
+                scan.gi = bool(data.get("gi", getattr(scan, "gi", False)))
+                gic = data.get("gi_config")
+                scan.gi_config = copy.deepcopy(gic) if isinstance(gic, dict) else {}
+        except Exception:
+            logger.debug("Controls V2 native Int scan restore failed",
+                         exc_info=True)
+
+        try:
+            self.integratorTree.hydrate_from_scan()
+            with scan.scan_lock:
+                self.integratorTree._args_to_params(
+                    scan.bai_1d_args, self.integratorTree.bai_1d_pars, dim="1D")
+                self.integratorTree._args_to_params(
+                    scan.bai_2d_args, self.integratorTree.bai_2d_pars, dim="2D")
+        except Exception:
+            logger.debug("Controls V2 native Int widget hydrate failed",
+                         exc_info=True)
+
+        threshold = data.get("threshold_config")
+        if isinstance(threshold, dict):
+            ui = getattr(self.integratorTree, "ui", None)
+            try:
+                ui.threshold_enable.setChecked(
+                    bool(threshold.get("apply_threshold", False))
+                )
+                if threshold.get("threshold_min") is not None:
+                    ui.threshold_min.setText(str(threshold.get("threshold_min")))
+                if threshold.get("threshold_max") is not None:
+                    ui.threshold_max.setText(str(threshold.get("threshold_max")))
+                ui.mask_saturated.setChecked(
+                    bool(threshold.get("mask_saturation", False))
+                )
+            except Exception:
+                logger.debug("Controls V2 native threshold restore failed",
+                             exc_info=True)
+
+        self._refresh_controls_v2_profile(immediate=True)
+
     def _controls_v2_native_reduction_plan(
         self,
         *,
@@ -1116,14 +1220,22 @@ class staticWidget(QWidget):
         )
 
     def _configure_controls_v2_native_run_plan(self) -> None:
-        thread = getattr(getattr(self, "wrangler", None), "thread", None)
-        cache = getattr(thread, "_plan_cache", None)
-        if cache is None or not hasattr(cache, "plan_builder"):
-            return
-        if self._controls_v2_enabled() and self._controls_v2_native_run_plan_enabled():
-            cache.plan_builder = self._controls_v2_native_run_plan_builder
-        else:
-            cache.plan_builder = None
+        builder = (
+            self._controls_v2_native_run_plan_builder
+            if (
+                self._controls_v2_enabled()
+                and self._controls_v2_native_run_plan_enabled()
+            )
+            else None
+        )
+        owners = (
+            getattr(getattr(self, "wrangler", None), "thread", None),
+            getattr(getattr(self, "integratorTree", None), "integrator_thread", None),
+        )
+        for owner in owners:
+            cache = getattr(owner, "_plan_cache", None)
+            if cache is not None and hasattr(cache, "plan_builder"):
+                cache.plan_builder = builder
 
     def _on_controls_v2_field_changed(self, path, value) -> None:
         self._apply_controls_v2_field_value(path, value)
@@ -2876,7 +2988,10 @@ class staticWidget(QWidget):
         # continuously; the integrator panel saves here at exit).
         try:
             from xdart.utils.session import save_session
-            save_session({'integrator': self.integratorTree.session_state()})
+            save_session({
+                'integrator': self.integratorTree.session_state(),
+                'controls_v2_int': self._controls_v2_int_session_state(),
+            })
         except Exception:
             logger.debug("integrator session save failed", exc_info=True)
         # Pause/Resume (Phase B): a PAUSED run blocks the wrangler thread in its
