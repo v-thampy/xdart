@@ -290,6 +290,7 @@ class ControlFormField:
     browse: bool = False
     enabled: bool = True
     reason: str = ""
+    parameter_group: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -613,7 +614,7 @@ INTEGRATOR_BACKED_CONTROL_SPECS: tuple[LegacyWidgetBinding, ...] = (
     LegacyWidgetBinding(
         SectionId.PROCESSING, "1D Unit", ("Int1D", "unit"),
         ControlFieldKind.COMBO, "unit_1D", "current_text", "unit_1D",
-        tools=INT_1D_OUTPUT_TOOLS),
+        parameter_group="1d", tools=INT_1D_OUTPUT_TOOLS),
     LegacyWidgetBinding(
         SectionId.PROCESSING, "1D Axis", ("Int1D", "axis"),
         ControlFieldKind.COMBO, "axis1D", "current_text", "axis1D",
@@ -654,7 +655,7 @@ INTEGRATOR_BACKED_CONTROL_SPECS: tuple[LegacyWidgetBinding, ...] = (
     LegacyWidgetBinding(
         SectionId.PROCESSING, "2D Unit", ("Int2D", "unit"),
         ControlFieldKind.COMBO, "unit_2D", "current_text", "unit_2D",
-        tools=INT_2D_OUTPUT_TOOLS),
+        parameter_group="2d", tools=INT_2D_OUTPUT_TOOLS),
     LegacyWidgetBinding(
         SectionId.PROCESSING, "2D Axis", ("Int2D", "axis"),
         ControlFieldKind.COMBO, "axis2D", "current_text", "axis2D",
@@ -830,7 +831,7 @@ def build_native_int_reduction_plan_from_args(
     gi_incident_angle: Any = None,
     incidence_motor: Any = None,
     tilt_angle: Any = 0.0,
-    sample_orientation: Any = 1,
+    sample_orientation: Any = 4,
     integrate_1d: bool = True,
     integrate_2d: bool = True,
     threshold_min: Any = None,
@@ -919,7 +920,7 @@ def build_native_int_reduction_plan_from_args(
             incident_angle=incident,
             incidence_motor=motor,
             tilt_angle=float(tilt_angle or 0.0),
-            sample_orientation=int(sample_orientation or 1),
+            sample_orientation=int(sample_orientation or 4),
             method=gi_method,
             mode_1d=gi_mode_1d,
             mode_2d=gi_mode_2d,
@@ -1020,7 +1021,7 @@ def build_native_int_reduction_plan_from_scan(
         gi_incident_angle=getattr(scan, "_cached_fiber_integrator_angle", None),
         incidence_motor=getattr(scan, "incidence_motor", None),
         tilt_angle=_gi_value("tilt_angle", 0.0),
-        sample_orientation=_gi_value("sample_orientation", 1),
+        sample_orientation=_gi_value("sample_orientation", 4),
         integrate_1d=integrate_1d,
         integrate_2d=bool(integrate_2d),
         threshold_min=threshold_min,
@@ -1060,6 +1061,7 @@ def build_bound_control_state(
         *,
         kind: ControlFieldKind = ControlFieldKind.LINE,
         browse: bool = False,
+        parameter_group: str = "",
     ) -> None:
         if path not in values:
             return
@@ -1078,6 +1080,7 @@ def build_bound_control_state(
             browse=browse,
             enabled=enabled,
             reason=reason,
+            parameter_group=parameter_group,
         ))
 
     add(SectionId.PROJECT, "Folder", ("Project", "project_folder"), browse=True)
@@ -1132,6 +1135,7 @@ def build_bound_control_state(
             label_overrides.get(spec.path, spec.label),
             spec.path,
             kind=spec.kind,
+            parameter_group=spec.parameter_group,
         )
     # Average Scan (frame averaging) is a processing choice, not a source
     # identity, so it renders in PROCESSING as a Conditioning pill next to Mask
