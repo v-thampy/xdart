@@ -527,6 +527,10 @@ class FormRow(QtWidgets.QWidget):
 
         self.editor = editor
         self.editor.setEnabled(self._enabled)
+        # Path/browse fields should show the root of long paths by default; the
+        # full value is still available on hover via the row tooltip.
+        if browse and isinstance(self.editor, QtWidgets.QLineEdit):
+            self.editor.setCursorPosition(0)
         self.browse_button = None
         if browse:
             btn = QtWidgets.QToolButton()
