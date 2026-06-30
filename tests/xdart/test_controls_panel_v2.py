@@ -77,6 +77,144 @@ def _find_more_button(widget):
     return None
 
 
+def _plain(value):
+    """Small, stable representation for reduction-plan equivalence tests."""
+    if hasattr(value, "value"):
+        return value.value
+    if isinstance(value, dict):
+        return {str(k): _plain(v) for k, v in sorted(value.items())}
+    if isinstance(value, (list, tuple)):
+        return tuple(_plain(v) for v in value)
+    return value
+
+
+def _plan_snapshot(plan):
+    def _snap(obj, attrs):
+        if obj is None:
+            return None
+        return {name: _plain(getattr(obj, name)) for name in attrs}
+
+    return {
+        "integration_1d": _snap(plan.integration_1d, (
+            "npt",
+            "npt_rad",
+            "unit",
+            "method",
+            "radial_range",
+            "azimuth_range",
+            "monitor_key",
+            "error_model",
+            "polarization_factor",
+            "extra",
+        )),
+        "integration_2d": _snap(plan.integration_2d, (
+            "npt_rad",
+            "npt_azim",
+            "unit",
+            "method",
+            "radial_range",
+            "azimuth_range",
+            "azimuth_offset",
+            "monitor_key",
+            "error_model",
+            "polarization_factor",
+            "extra",
+        )),
+        "gi": _snap(plan.gi, (
+            "incident_angle",
+            "incidence_motor",
+            "tilt_angle",
+            "sample_orientation",
+            "method",
+            "mode_1d",
+            "mode_2d",
+            "npt_oop",
+        )),
+        "mask_kind": type(plan.mask).__name__ if plan.mask is not None else None,
+        "threshold_min": _plain(plan.threshold_min),
+        "threshold_max": _plain(plan.threshold_max),
+        "mask_saturation": _plain(plan.mask_saturation),
+    }
+
+
+def _threshold_snapshot(widget):
+    cfg = widget.integratorTree.get_threshold_config()
+    return {
+        "apply_threshold": cfg.apply_threshold,
+        "threshold_min": cfg.threshold_min,
+        "threshold_max": cfg.threshold_max,
+        "mask_saturation": cfg.mask_saturation,
+    }
+
+
+def _set_legacy_integrator_field(widget, path, value):
+    """Set a hidden legacy integrator widget directly, then run the legacy parser.
+
+    V2 uses the same widgets while it is still migrating.  This helper bypasses
+    the V2 field-change signal so the tests compare V2 write-through against the
+    old parser surface instead of simply testing V2 against itself.
+    """
+    from xdart.gui.tabs.static_scan.controls_logic import (
+        coerce_control_edit_value,
+    )
+
+    spec = next(s for s in INTEGRATOR_BACKED_CONTROL_SPECS if s.path == path)
+    ui = widget.integratorTree.ui
+    editor = getattr(ui, spec.widget_name)
+    if spec.value_role == "current_text":
+        idx = editor.findText(str(value))
+        assert idx >= 0, f"{value!r} not found for {path}"
+        editor.setCurrentIndex(idx)
+    elif spec.value_role == "checked":
+        editor.setChecked(bool(coerce_control_edit_value(editor.isChecked(), value)))
+    elif spec.value_role == "value":
+        editor.setValue(coerce_control_edit_value(editor.value(), value))
+    else:
+        editor.setText("" if value is None else str(value))
+    widget._sync_controls_v2_integrator_path(path)
+
+
+def _apply_v2_edits(widget, edits):
+    for path, value in edits:
+        widget._on_controls_v2_field_changed(path, value)
+
+
+def _apply_legacy_edits(widget, edits):
+    for path, value in edits:
+        _set_legacy_integrator_field(widget, path, value)
+
+
+def _current_plan_snapshot(widget, *, include_threshold=True,
+                           commit_pending=True):
+    from xdart.modules.reduction import (
+        apply_threshold_saturation_to_plan,
+        plan_from_live_scan,
+    )
+
+    if commit_pending:
+        widget._commit_controls_v2_pending_edits()
+    widget._sync_controls_v2_integrator_args()
+    widget.integratorTree._apply_gi_config_to_scan()
+    plan = plan_from_live_scan(widget.scan, integrate_2d=True)
+    if include_threshold:
+        plan = apply_threshold_saturation_to_plan(
+            plan,
+            widget.integratorTree.get_threshold_config(),
+        )
+    return _plan_snapshot(plan)
+
+
+def _combo_text(widget, name, predicate, *, fallback_current=True):
+    combo = getattr(widget.integratorTree.ui, name)
+    for i in range(combo.count()):
+        text = combo.itemText(i)
+        if predicate(text):
+            return text
+    if fallback_current:
+        return combo.currentText()
+    raise AssertionError(f"No matching choice in {name}")
+
+
 @pytest.fixture(scope="module")
 def qapp():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -687,6 +825,163 @@ def test_controls_panel_v2_integrator_bridge_uses_binding_table(
     finally:
         widget.close()
         widget.deleteLater()
+
+
+def test_controls_panel_v2_standard_edits_match_legacy_reduction_plan(
+        qapp, monkeypatch):
+    """V2 edits must produce the same standard ReductionPlan as the v1 parser.
+
+    This is the migration gate for making the V2 controls authoritative: the
+    hidden integrator may disappear later, but first the resulting plan surface
+    must be indistinguishable for the settings users edit before pressing Run.
+    """
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    v2_widget = staticWidget()
+    legacy_widget = staticWidget()
+    try:
+        axis_1d = _combo_text(
+            v2_widget,
+            "axis1D",
+            lambda text: "2" in text and "θ" in text,
+        )
+        axis_2d = _combo_text(
+            v2_widget,
+            "axis2D",
+            lambda text: "2" in text and "θ" in text,
+        )
+        edits = (
+            (("GI", "Grazing"), False),
+            (("Int1D", "axis"), axis_1d),
+            (("Int1D", "points"), "321"),
+            (("Int1D", "radial_auto"), False),
+            (("Int1D", "radial_low"), "0.25"),
+            (("Int1D", "radial_high"), "4.5"),
+            (("Int1D", "azim_auto"), False),
+            (("Int1D", "azim_low"), "-90"),
+            (("Int1D", "azim_high"), "90"),
+            (("Int2D", "axis"), axis_2d),
+            (("Int2D", "radial_points"), "111"),
+            (("Int2D", "azim_points"), "77"),
+            (("Int2D", "radial_auto"), False),
+            (("Int2D", "radial_low"), "0.5"),
+            (("Int2D", "radial_high"), "5.0"),
+            (("Int2D", "azim_auto"), False),
+            (("Int2D", "azim_low"), "-120"),
+            (("Int2D", "azim_high"), "120"),
+        )
+
+        _apply_v2_edits(v2_widget, edits)
+        _apply_legacy_edits(legacy_widget, edits)
+
+        assert _current_plan_snapshot(v2_widget) == _current_plan_snapshot(
+            legacy_widget,
+            commit_pending=False,
+        )
+    finally:
+        v2_widget.close()
+        legacy_widget.close()
+        v2_widget.deleteLater()
+        legacy_widget.deleteLater()
+
+
+def test_controls_panel_v2_gi_edits_match_legacy_reduction_plan(
+        qapp, monkeypatch):
+    """GI is especially fragile: keep V2 labels/ranges/modes on legacy parity."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    v2_widget = staticWidget()
+    legacy_widget = staticWidget()
+    try:
+        # First switch both widgets to GI so the old integrator repopulates its
+        # axis labels and modes.  The subsequent labels come from those old combo
+        # boxes, not duplicated test knowledge.
+        _apply_v2_edits(v2_widget, ((("GI", "Grazing"), True),))
+        _apply_legacy_edits(legacy_widget, ((("GI", "Grazing"), True),))
+        q_total_or_current = _combo_text(
+            v2_widget,
+            "axis1D",
+            lambda text: "total" in text.lower(),
+        )
+        qip_qoop_or_current = _combo_text(
+            v2_widget,
+            "axis2D",
+            lambda text: "ip" in text.lower() and "oop" in text.lower(),
+        )
+        edits = (
+            (("GI", "Grazing"), True),
+            (("GI", "th_motor"), "Manual"),
+            (("GI", "th_val"), "0.17"),
+            (("GI", "sample_orientation"), "4"),
+            (("GI", "tilt_angle"), "0.25"),
+            (("Int1D", "axis"), q_total_or_current),
+            (("Int1D", "points"), "222"),
+            (("Int1D", "points_oop"), "33"),
+            (("Int1D", "radial_auto"), False),
+            (("Int1D", "radial_low"), "0.1"),
+            (("Int1D", "radial_high"), "5.4"),
+            (("Int1D", "azim_auto"), False),
+            (("Int1D", "azim_low"), "-45"),
+            (("Int1D", "azim_high"), "35"),
+            (("Int2D", "axis"), qip_qoop_or_current),
+            (("Int2D", "radial_points"), "64"),
+            (("Int2D", "azim_points"), "48"),
+            (("Int2D", "radial_auto"), False),
+            (("Int2D", "radial_low"), "-3.0"),
+            (("Int2D", "radial_high"), "3.0"),
+            (("Int2D", "azim_auto"), False),
+            (("Int2D", "azim_low"), "0.0"),
+            (("Int2D", "azim_high"), "4.0"),
+        )
+
+        _apply_v2_edits(v2_widget, edits)
+        _apply_legacy_edits(legacy_widget, edits)
+
+        assert _current_plan_snapshot(v2_widget) == _current_plan_snapshot(
+            legacy_widget,
+            commit_pending=False,
+        )
+    finally:
+        v2_widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
+        legacy_widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
+        v2_widget.close()
+        legacy_widget.close()
+        v2_widget.deleteLater()
+        legacy_widget.deleteLater()
+
+
+def test_controls_panel_v2_threshold_edits_match_legacy_plan_overlay(
+        qapp, monkeypatch):
+    """Threshold + saturation are a separate plan overlay; keep it in parity."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    v2_widget = staticWidget()
+    legacy_widget = staticWidget()
+    try:
+        edits = (
+            (("Mask", "Threshold"), True),
+            (("Mask", "min"), "12.5"),
+            (("Mask", "max"), "987.5"),
+            (("MaskSat", "mask_sentinel"), True),
+        )
+
+        _apply_v2_edits(v2_widget, edits)
+        _apply_legacy_edits(legacy_widget, edits)
+
+        assert _threshold_snapshot(v2_widget) == _threshold_snapshot(
+            legacy_widget)
+        assert _current_plan_snapshot(v2_widget) == _current_plan_snapshot(
+            legacy_widget,
+            commit_pending=False,
+        )
+    finally:
+        v2_widget.close()
+        legacy_widget.close()
+        v2_widget.deleteLater()
+        legacy_widget.deleteLater()
 
 
 def test_controls_panel_v2_threshold_edits_update_integrator_and_carrier(qapp, monkeypatch):

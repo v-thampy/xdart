@@ -1039,6 +1039,9 @@ class integratorTree(QtWidgets.QWidget):
                 and self.ui.axis2D.currentIndex() == 0):
             effective_key = gi_alt_key
         args_dict[effective_key] = _range
+        if gi_alt_key:
+            stale_key = key if effective_key == gi_alt_key else gi_alt_key
+            args_dict.pop(stale_key, None)
         low_edit.setEnabled(not auto)
         high_edit.setEnabled(not auto)
         if after is not None:
