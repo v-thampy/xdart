@@ -445,29 +445,27 @@ def test_write_without_registration_fails_loud(tmp_path):
 
 def _spy_session_drive(host, scan, lives, monkeypatch, *, executor=3):
     """Drive QtNexusSink through a real streaming ReductionSession wrapped
-    in the thread-tracking spy from tests.core.contracts."""
-    from tests.core.contracts import ThreadSpySink
-    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
-    from xrd_tools.reduction import Frame, ReductionSession, Scan
-    import xrd_tools.reduction.core as reduction_core
+    in the thread-tracking spy from tests.core.contracts.
 
-    monkeypatch.setattr(
-        reduction_core, "integrate_1d",
-        lambda image, ai, **kw: _r1d(float(np.sum(image))),
-    )
+    The session drive loop (monkeypatched integrator + submit/finish) is the
+    shared ``contracts.drive_streaming``; only the QtNexusSink-specific setup
+    (register the LiveFrames, supply 4×4 frames + the 16-bin _r1d stub) stays
+    here.
+    """
+    from tests.core.contracts import ThreadSpySink, drive_streaming
+    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
+    from xrd_tools.reduction import Frame
+
     sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
     for lv in lives:
         sink.register(lv)
     spy = ThreadSpySink(inner=sink)
     frames = [Frame(int(lv.idx), image=np.full((4, 4), int(lv.idx) + 1.0))
               for lv in lives]
-    session = ReductionSession(
-        _minimal_plan(), Scan("s", frames, integrator=object()),
-        sink=spy, execution="streaming", executor=executor,
+    drive_streaming(
+        spy, monkeypatch, frames=frames, plan=_minimal_plan(), executor=executor,
+        integrate_1d=lambda image, ai, **kw: _r1d(float(np.sum(image))),
     )
-    for fr in frames:
-        session.submit(fr)
-    session.finish()
     return spy, sink
 
 
