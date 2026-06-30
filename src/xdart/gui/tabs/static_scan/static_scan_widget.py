@@ -692,9 +692,14 @@ class staticWidget(QWidget):
         self._refresh_controls_v2_profile()
 
     def _controls_v2_click_integrator_button(self, button_name: str) -> None:
-        self._commit_controls_v2_pending_edits()
         if button_name in {"reintegrate1D", "reintegrate2D"}:
-            self._configure_controls_v2_native_run_plan()
+            self._apply_controls_v2_native_int_state(
+                commit_pending=True,
+                push_integrator=True,
+            )
+            self._configure_controls_v2_native_run_plan(commit_pending=False)
+        else:
+            self._commit_controls_v2_pending_edits()
         button = getattr(getattr(self.integratorTree, "ui", None), button_name, None)
         if button is None:
             return
@@ -971,6 +976,80 @@ class staticWidget(QWidget):
             "sample_orientation": int(cfg["sample_orientation"] or 4),
         } if scan.gi else {}
         self._controls_v2_apply_gi_config_to_scan()
+
+    def _controls_v2_apply_snapshot_to_scan(self, snapshot: dict, scan=None) -> None:
+        scan = scan if scan is not None else getattr(self, "scan", None)
+        if scan is None or not isinstance(snapshot, dict):
+            return
+        lock = getattr(scan, "scan_lock", None)
+
+        def _apply():
+            scan.bai_1d_args = copy.deepcopy(snapshot.get("bai_1d_args", {}) or {})
+            scan.bai_2d_args = copy.deepcopy(snapshot.get("bai_2d_args", {}) or {})
+            scan.gi = bool(snapshot.get("gi", False))
+            scan.gi_config = copy.deepcopy(snapshot.get("gi_config", {}) or {})
+            for attr in (
+                "incidence_motor",
+                "th_mtr",
+                "sample_orientation",
+                "tilt_angle",
+            ):
+                if attr in snapshot:
+                    setattr(scan, attr, copy.deepcopy(snapshot[attr]))
+
+        if lock is None:
+            _apply()
+        else:
+            with lock:
+                _apply()
+
+    def _controls_v2_push_threshold_to_integrator(self) -> None:
+        thread = getattr(getattr(self, "integratorTree", None),
+                         "integrator_thread", None)
+        if thread is not None:
+            thread.threshold_config = self._controls_v2_threshold_config()
+
+    def _apply_controls_v2_native_int_state(
+        self,
+        *,
+        commit_pending: bool = True,
+        push_wrangler: bool = False,
+        push_integrator: bool = False,
+    ) -> None:
+        """Apply native V2 Int/GI/threshold state to the scan and consumers."""
+
+        if commit_pending:
+            self._commit_controls_v2_pending_edits()
+        self._controls_v2_ensure_native_int_defaults()
+        self._controls_v2_apply_gi_config_to_scan()
+        if push_wrangler:
+            self._push_threshold_to_wrangler()
+            self._push_gi_to_wrangler()
+        if push_integrator:
+            self._controls_v2_push_threshold_to_integrator()
+
+    def _controls_v2_native_int_snapshot(self) -> dict:
+        scan = getattr(self, "scan", None)
+        if scan is None:
+            return {}
+        return {
+            "bai_1d_args": copy.deepcopy(
+                getattr(scan, "bai_1d_args", {}) or {}
+            ),
+            "bai_2d_args": copy.deepcopy(
+                getattr(scan, "bai_2d_args", {}) or {}
+            ),
+            "gi": bool(getattr(scan, "gi", False)),
+            "gi_config": copy.deepcopy(getattr(scan, "gi_config", {}) or {}),
+            "incidence_motor": copy.deepcopy(
+                getattr(scan, "incidence_motor", None)
+            ),
+            "th_mtr": copy.deepcopy(getattr(scan, "th_mtr", None)),
+            "sample_orientation": copy.deepcopy(
+                getattr(scan, "sample_orientation", None)
+            ),
+            "tilt_angle": copy.deepcopy(getattr(scan, "tilt_angle", None)),
+        }
 
     def _controls_v2_scan_int_args(self):
         scan = getattr(self, "scan", None)
@@ -1424,11 +1503,10 @@ class staticWidget(QWidget):
 
     def _apply_controls_v2_run_state(self) -> dict:
         """Apply native Controls V2 Int state and snapshot args for this run."""
-        self._commit_controls_v2_pending_edits()
-        self._controls_v2_ensure_native_int_defaults()
-        self._controls_v2_apply_gi_config_to_scan()
-        self._push_threshold_to_wrangler()
-        self._push_gi_to_wrangler()
+        self._apply_controls_v2_native_int_state(
+            commit_pending=True,
+            push_wrangler=True,
+        )
         args = {
             'bai_1d_args': copy.deepcopy(
                 getattr(self.scan, 'bai_1d_args', {}) or {}
@@ -1567,28 +1645,42 @@ class staticWidget(QWidget):
         value = os.environ.get("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", "1")
         return str(value).strip().lower() not in {"0", "false", "no", "off"}
 
-    @staticmethod
     def _controls_v2_native_run_plan_builder(
-        scan,
-        *,
-        integrate_1d: bool = True,
-        integrate_2d: bool = True,
+        self,
+        snapshot: dict,
     ):
-        return build_native_int_reduction_plan_from_scan(
+        def _builder(
             scan,
-            integrate_1d=integrate_1d,
-            integrate_2d=integrate_2d,
-        )
-
-    def _configure_controls_v2_native_run_plan(self) -> None:
-        builder = (
-            self._controls_v2_native_run_plan_builder
-            if (
-                self._controls_v2_enabled()
-                and self._controls_v2_native_run_plan_enabled()
+            *,
+            integrate_1d: bool = True,
+            integrate_2d: bool = True,
+        ):
+            self._controls_v2_apply_snapshot_to_scan(snapshot, scan)
+            return build_native_int_reduction_plan_from_scan(
+                scan,
+                integrate_1d=integrate_1d,
+                integrate_2d=integrate_2d,
             )
-            else None
-        )
+
+        return _builder
+
+    def _configure_controls_v2_native_run_plan(
+        self,
+        *,
+        commit_pending: bool = False,
+    ) -> None:
+        builder = None
+        if (
+            self._controls_v2_enabled()
+            and self._controls_v2_native_run_plan_enabled()
+        ):
+            self._apply_controls_v2_native_int_state(
+                commit_pending=commit_pending,
+                push_integrator=True,
+            )
+            builder = self._controls_v2_native_run_plan_builder(
+                self._controls_v2_native_int_snapshot()
+            )
         owners = (
             getattr(getattr(self, "wrangler", None), "thread", None),
             getattr(getattr(self, "integratorTree", None), "integrator_thread", None),

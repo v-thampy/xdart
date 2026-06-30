@@ -718,13 +718,15 @@ Acceptance for the polish pass:
 
 ---
 
-## 14. 2026-06-30 status — V2 Int flip complete on cp2
+## 14. 2026-06-30 status — V2 Int flip code complete; live re-pass pending
 
 **Current branch state.** `feature/controls-panel-v2` has merged the latest
-`feature/geometry` fast-forward for this chunk. The V2 functional flip is now
-code-complete on cp2: native Controls V2 Int state is authoritative for visible Int
-rows, native reduction plans are default-on for run/reintegrate, and native
-`controls_v2_int` session state wins over stale legacy integrator session blobs.
+`feature/geometry` fast-forward for the flip chunk. The V2 functional flip is
+code-complete on cp2, but the manual checkpoint found one post-flip regression:
+native Reintegrate 1D/2D could diverge from the fresh run plan because the
+reintegrate cache installed the native builder without first reapplying native V2
+Int state to `scan`. That regression is fixed and gated offscreen; the flip is not
+declared fully cleared until the live checkpoint is rerun.
 
 **What changed in the flip.**
 - The V2-to-legacy Int write-through bridge is retired. Int edits no longer mirror
@@ -743,6 +745,9 @@ rows, native reduction plans are default-on for run/reintegrate, and native
   use native scan-backed state before building plans. The wrangler ParameterTree is
   still populated at run setup where older setup code expects it, but it is no
   longer the V2 Int source of truth.
+- Reintegrate now shares the same native-apply step as Run, and the installed
+  plan-cache builder captures a native snapshot so a stale legacy click cannot
+  clobber `scan.bai_*_args` before the plan is built.
 - The active-run panel flash fix is included: live/Append/non-viewer runs now defer
   Controls V2 rebuilds while a run is active and flush once at run end.
 
@@ -751,6 +756,9 @@ correctness rather than V2-vs-hidden-widget parity. The core checks are:
 - native V2 edits update `scan.bai_1d_args` / `scan.bai_2d_args`, GI config, and
   threshold state immediately while hidden legacy widgets remain stale;
 - native run and reintegrate plan snapshots match the scan/headless plan;
+- native reintegrate 1D/2D fake-reduced results match the fresh run result for the
+  same frame/config in both standard and GI modes, even after a simulated stale
+  legacy click clobbers `scan.bai_*_args`;
 - native session state survives close/open and beats stale legacy `integrator`
   session data;
 - default-on native plan caches are installed for run and reintegrate, with
@@ -758,16 +766,17 @@ correctness rather than V2-vs-hidden-widget parity. The core checks are:
 - GI default orientation is 4, matching the frame/integrator default.
 
 **Validated in `xrd_test` for this chunk.**
-- `tests/xdart/test_controls_panel_v2.py -q` → 62 passed.
+- `tests/xdart/test_controls_panel_v2.py -q` → 64 passed.
 - `tests/xdart/test_controls_logic.py tests/core/test_v2_record_compat.py -q` → 31 passed.
 - `tests/xdart/test_reduction_adapters.py -q` → 47 passed.
 - `tests/xdart/test_gi_batch_real_data.py -k equivalence -q` → 18 passed, 50 deselected.
 
-**Manual live checkpoint still pending.** A human live scan remains the final
-offscreen-impossible gate before declaring the flip integrated on geometry:
-real QThread teardown, Start/Stop/Append/Live, GI mode switch, reintegrate, reload,
-session restore with native-run-plan default-on, and XYE/Image-viewer transitions.
-Bundle this with the pending Phase-4e/4f checkpoint.
+**Manual live checkpoint must be rerun.** A human live scan remains the final
+offscreen-impossible gate before declaring the flip integrated on geometry. Rerun
+the checkpoint after this reintegrate fix: real QThread teardown,
+Start/Stop/Append/Live, Reintegrate 1D/2D matching the fresh run, GI mode switch,
+reload, session restore with native-run-plan default-on, and XYE/Image-viewer
+transitions. Bundle this with the pending Phase-4e/4f checkpoint.
 
 **Explicitly post-v2.**
 - Native Stitch/RSM Processing pages.

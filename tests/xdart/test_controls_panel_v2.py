@@ -1472,13 +1472,13 @@ def test_controls_panel_v2_native_run_plan_gate_configures_plan_caches(
     try:
         cache = widget.wrangler.thread._plan_cache
         reint_cache = widget.integratorTree.integrator_thread._plan_cache
-        widget._configure_controls_v2_native_run_plan()
-        assert cache.plan_builder is not None
-        assert reint_cache.plan_builder is not None
         scan = widget.scan
         scan.skip_2d = False
         scan.bai_1d_args.update({"numpoints": 123, "unit": "q_A^-1"})
         scan.bai_2d_args.update({"npt_rad": 45, "npt_azim": 67})
+        widget._configure_controls_v2_native_run_plan()
+        assert cache.plan_builder is not None
+        assert reint_cache.plan_builder is not None
         assert _plan_snapshot(cache.get(scan)) == _plan_snapshot(
             build_native_int_reduction_plan_from_scan(scan)
         )
@@ -1538,6 +1538,174 @@ def test_controls_panel_v2_native_reintegrate_plan_is_authoritative(
         assert native_2d == _native_plan_snapshot(
             widget, integrate_1d=False, integrate_2d=True, commit_pending=False)
     finally:
+        widget.close()
+        widget.deleteLater()
+
+
+@pytest.mark.parametrize("gi_enabled", [False, True])
+def test_controls_panel_v2_native_reintegrate_results_match_run_after_stale_legacy_click(
+        qapp, monkeypatch, gi_enabled):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    monkeypatch.delenv("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", raising=False)
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xdart.modules.live import LiveFrame
+    import xdart.modules.reduction as reduction_adapters
+    from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+    from xrd_tools.reduction import FrameReduction, ReductionResult
+
+    def _range_pair(value):
+        if value is None:
+            return (0.0, 0.0)
+        return float(value[0]), float(value[1])
+
+    def _fake_run_reduction(plan_arg, scan_arg, **kwargs):
+        frame_idx = int(scan_arg.frames[0].index)
+        p1 = plan_arg.integration_1d
+        p2 = plan_arg.integration_2d
+        r1 = None
+        if p1 is not None:
+            rr = _range_pair(p1.radial_range)
+            ar = _range_pair(p1.azimuth_range)
+            r1 = IntegrationResult1D(
+                radial=np.array([float(p1.npt), rr[0], rr[1]], dtype=float),
+                intensity=np.array(
+                    [float(p1.npt_rad), ar[0], ar[1]], dtype=float),
+                sigma=None,
+                unit=p1.unit,
+            )
+        r2 = None
+        if p2 is not None:
+            rr = _range_pair(p2.radial_range)
+            ar = _range_pair(p2.azimuth_range)
+            r2 = IntegrationResult2D(
+                radial=np.array([float(p2.npt_rad), rr[0], rr[1]], dtype=float),
+                azimuthal=np.array(
+                    [float(p2.npt_azim), ar[0], ar[1]], dtype=float),
+                intensity=np.add.outer(
+                    np.array([float(p2.npt_rad), rr[0], rr[1]], dtype=float),
+                    np.array([float(p2.npt_azim), ar[0], ar[1]], dtype=float),
+                ),
+                sigma=None,
+                unit=p2.unit,
+            )
+        return ReductionResult(
+            scan_name=scan_arg.name,
+            frames={frame_idx: FrameReduction(
+                frame_idx, result_1d=r1, result_2d=r2)},
+            n_processed=1,
+        )
+
+    def _result_signature(plan):
+        frame = LiveFrame(
+            idx=7,
+            map_raw=np.arange(16, dtype=float).reshape(4, 4),
+            scan_info={"th": 0.24},
+        )
+        reduction_adapters.reduce_live_frame(frame, plan, scan_name="scan")
+        sig = {}
+        if frame.int_1d is not None:
+            sig["1d"] = (
+                frame.int_1d.unit,
+                tuple(np.asarray(frame.int_1d.radial, dtype=float)),
+                tuple(np.asarray(frame.int_1d.intensity, dtype=float)),
+            )
+        if frame.int_2d is not None:
+            sig["2d"] = (
+                frame.int_2d.unit,
+                tuple(np.asarray(frame.int_2d.radial, dtype=float)),
+                tuple(np.asarray(frame.int_2d.azimuthal, dtype=float)),
+                tuple(np.asarray(frame.int_2d.intensity, dtype=float).ravel()),
+            )
+        return sig
+
+    class ClobberingButton:
+        clicked = False
+
+        def __init__(self, widget):
+            self.widget = widget
+
+        def click(self):
+            self.clicked = True
+            scan = self.widget.scan
+            scan.bai_1d_args = {
+                "unit": "2th_deg",
+                "numpoints": 3000,
+                "radial_range": None,
+                "azimuth_range": None,
+            }
+            scan.bai_2d_args = {
+                "unit": "2th_deg",
+                "npt_rad": 500,
+                "npt_azim": 500,
+                "radial_range": None,
+                "azimuth_range": None,
+            }
+            scan.gi = False
+            scan.gi_config = {}
+            scan.incidence_motor = ""
+
+    monkeypatch.setattr(reduction_adapters, "run_reduction", _fake_run_reduction)
+
+    widget = staticWidget()
+    try:
+        edits = [
+            (("Int1D", "points"), "37"),
+            (("Int1D", "radial_auto"), False),
+            (("Int1D", "radial_low"), "0.15"),
+            (("Int1D", "radial_high"), "3.1"),
+            (("Int1D", "azim_auto"), False),
+            (("Int1D", "azim_low"), "-35"),
+            (("Int1D", "azim_high"), "48"),
+            (("Int2D", "radial_points"), "9"),
+            (("Int2D", "azim_points"), "7"),
+            (("Int2D", "radial_auto"), False),
+            (("Int2D", "radial_low"), "0.2"),
+            (("Int2D", "radial_high"), "3.4"),
+            (("Int2D", "azim_auto"), False),
+            (("Int2D", "azim_low"), "-42"),
+            (("Int2D", "azim_high"), "51"),
+            (("MaskSat", "mask_sentinel"), False),
+        ]
+        if gi_enabled:
+            edits = [
+                (("GI", "Grazing"), True),
+                (("GI", "th_motor"), "Manual"),
+                (("GI", "th_val"), "0.24"),
+                (("GI", "sample_orientation"), "4"),
+                (("GI", "tilt_angle"), "0.6"),
+            ] + edits
+        _apply_v2_edits(widget, edits)
+
+        widget.scan.skip_2d = False
+        widget._apply_controls_v2_run_state()
+        widget._configure_controls_v2_native_run_plan()
+        run_cache = widget.wrangler.thread._plan_cache
+        run_1d = run_cache.get(widget.scan, integrate_1d=True, integrate_2d=False)
+        run_cache.invalidate()
+        run_2d = run_cache.get(widget.scan, integrate_1d=False, integrate_2d=True)
+
+        thread = widget.integratorTree.integrator_thread
+        clobber_1d = ClobberingButton(widget)
+        monkeypatch.setattr(widget.integratorTree.ui, "reintegrate1D", clobber_1d)
+        widget._controls_v2_click_integrator_button("reintegrate1D")
+        assert clobber_1d.clicked is True
+        assert widget.scan.bai_1d_args["numpoints"] == 3000
+        reintegrate_1d = thread._plan_for_reintegration(integrate_2d=False)
+
+        clobber_2d = ClobberingButton(widget)
+        monkeypatch.setattr(widget.integratorTree.ui, "reintegrate2D", clobber_2d)
+        widget._controls_v2_click_integrator_button("reintegrate2D")
+        assert clobber_2d.clicked is True
+        assert widget.scan.bai_2d_args["npt_rad"] == 500
+        reintegrate_2d = thread._plan_for_reintegration(integrate_2d=True)
+
+        assert _plan_snapshot(reintegrate_1d) == _plan_snapshot(run_1d)
+        assert _plan_snapshot(reintegrate_2d) == _plan_snapshot(run_2d)
+        assert _result_signature(reintegrate_1d) == _result_signature(run_1d)
+        assert _result_signature(reintegrate_2d) == _result_signature(run_2d)
+    finally:
+        if gi_enabled:
+            _reset_controls_v2_gi(widget)
         widget.close()
         widget.deleteLater()
 
