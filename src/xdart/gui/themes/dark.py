@@ -25,6 +25,10 @@ DARK = {
     "field_border": "#3c4052",
     "gap": "#cfd4e3",
     "grid": "#d6d9e0",
+    "hdr_project": "#263044",
+    "hdr_source": "#213932",
+    "hdr_experiment": "#393529",
+    "hdr_processing": "#3a2832",
     "menubar": "#1b1d27",
     "panel": "#1e2029",
     "plot1d_bg": "#eceef2",
@@ -57,6 +61,10 @@ LIGHT = {
     "field_border": "#d7dbe6",
     "gap": "#ffffff",
     "grid": "#e8eaf0",
+    "hdr_project": "#e8eefc",
+    "hdr_source": "#e6f6ee",
+    "hdr_experiment": "#f7f1de",
+    "hdr_processing": "#fbe9ed",
     "menubar": "#eef0f5",
     "panel": "#f5f6fa",
     "plot1d_bg": "#fbfbfd",
@@ -673,19 +681,19 @@ QFrame#controlsV2SectionHeader {
     border-bottom-right-radius: 0px;
 }
 QFrame#controlsV2SectionHeader[accent="project"] {
-    background-color: #263044;
+    background-color: $hdr_project;
     border-left-color: #8fb4ff;
 }
 QFrame#controlsV2SectionHeader[accent="source"] {
-    background-color: #213932;
+    background-color: $hdr_source;
     border-left-color: #6fdca5;
 }
 QFrame#controlsV2SectionHeader[accent="experiment"] {
-    background-color: #393529;
+    background-color: $hdr_experiment;
     border-left-color: #e8c46a;
 }
 QFrame#controlsV2SectionHeader[accent="processing"] {
-    background-color: #3a2832;
+    background-color: $hdr_processing;
     border-left-color: #e06c75;
 }
 QToolButton#controlsV2Chevron,
@@ -785,7 +793,7 @@ QLabel#controlsV2FieldValue {
 }
 QLineEdit#controlsV2LineEdit,
 QComboBox#controlsV2ComboBox {
-    background-color: #272a38;
+    background-color: $field;
     color: $text;
     border: 1px solid $field_border;
     border-radius: 5px;
@@ -796,7 +804,8 @@ QComboBox#controlsV2ComboBox:disabled {
     background-color: $panel;
     color: $text_muted;
 }
-QToolButton#controlsV2BrowseButton {
+QToolButton#controlsV2BrowseButton,
+QToolButton#controlsV2MoreButton {
     background-color: #4d6fbd;
     color: $browse_text;
     border: 1px solid #6483ce;
@@ -806,10 +815,12 @@ QToolButton#controlsV2BrowseButton {
     font-size: 13px;
     min-width: 28px;
 }
-QToolButton#controlsV2BrowseButton:hover {
+QToolButton#controlsV2BrowseButton:hover,
+QToolButton#controlsV2MoreButton:hover {
     background-color: #5a7bd0;
 }
-QToolButton#controlsV2BrowseButton:pressed {
+QToolButton#controlsV2BrowseButton:pressed,
+QToolButton#controlsV2MoreButton:pressed {
     background-color: $browse_pressed;
 }
 QPushButton#controlsV2ToggleButton {
