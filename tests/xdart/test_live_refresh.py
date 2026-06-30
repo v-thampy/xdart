@@ -5632,10 +5632,11 @@ def test_wrangler_enabled_reapplies_viewer_mode_controls():
         assert host.ui.liveCheckBox.isChecked() is False
         assert host.ui.liveCheckBox.isEnabled() is False
         assert host.ui.batchCheckBox.isEnabled() is False
-        # Viewer modes now DISABLE the run row rather than hiding it (a hidden row
-        # left an ugly empty box) -- visible but greyed.
-        assert host.ui.frame.isVisible() is True
-        assert host.ui.frame.isEnabled() is False
+        if mode in ("Image Viewer", "XYE Viewer"):
+            assert host.ui.frame.isVisible() is False
+        else:
+            assert host.ui.frame.isVisible() is True
+            assert host.ui.frame.isEnabled() is False
         assert host._integration_controls_enabled is False
         assert host.thread.live_mode is False
         assert host.tree.isEnabled() is True   # Project/Save Path stay usable

@@ -859,6 +859,10 @@ class staticWidget(QWidget):
             state["threshold_max"] = self._controls_v2_float(value, 0.0)
         elif path == ("MaskSat", "mask_sentinel"):
             state["mask_saturation"] = self._controls_v2_bool(value)
+        if path in {("Mask", "min"), ("Mask", "max")} and (
+            state["threshold_min"] != 0.0 or state["threshold_max"] != 0.0
+        ):
+            state["apply_threshold"] = True
         self._controls_v2_threshold_state = state
         scan = getattr(self, "scan", None)
         if scan is not None:
@@ -1970,6 +1974,8 @@ class staticWidget(QWidget):
 
     @staticmethod
     def _controls_v2_run_summary(state: ControlState, profile) -> tuple[str, bool, str]:
+        if str(getattr(getattr(profile, "processing_page", None), "value", "")) == "viewer":
+            return "", False, ""
         ready = bool(getattr(profile, "can_run", False))
         status = "Ready" if ready else "Needs setup"
         mode = str(getattr(state, "processing_mode", "") or "").strip()
@@ -4841,6 +4847,7 @@ class staticWidget(QWidget):
         finally:
             self.h5viewer._suspend_scan_selection_loads = prev_suspend
             scans.blockSignals(was_blocked)
+        self._fit_controls_height()
         self._refresh_controls_v2_profile()
 
     def latest_frame(self, checked=None, *, emit_update=True):

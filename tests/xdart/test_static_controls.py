@@ -106,16 +106,15 @@ def test_mode_row_enabled_locks_mode_batch_cores(qapp):
     assert c.batchButton.isEnabled()
 
 
-def test_run_row_enabled_keeps_row_visible(qapp):
-    """Viewer modes DISABLE the action row rather than hiding it (an empty box
-    looked broken) -- the row stays visible, just greyed."""
+def test_run_row_visibility_can_collapse_to_mode_only(qapp):
+    """File viewers can collapse the controls bar to the mode row only."""
     c = StaticControls()
+    c.set_run_row_visible(False)
+    assert c.actionRow.isHidden()
+    assert c._divider.isHidden()
     c.set_run_row_visible(True)
-    c.set_run_row_enabled(False)
-    assert not c.actionRow.isEnabled()             # greyed
-    assert not c.actionRow.isHidden()              # but still visible (no empty box)
-    c.set_run_row_enabled(True)
-    assert c.actionRow.isEnabled()
+    assert not c.actionRow.isHidden()
+    assert not c._divider.isHidden()
 
 
 def test_getters(qapp):

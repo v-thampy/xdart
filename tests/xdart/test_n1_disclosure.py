@@ -19,6 +19,7 @@ pytest.importorskip("pyqtgraph")
 from pyqtgraph import QtWidgets
 from pyqtgraph.parametertree import Parameter
 
+from xdart.gui import gui_utils  # noqa: F401  -- registers str_browse params
 from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler, params
 
 
@@ -64,6 +65,8 @@ def test_disclosure_two_stages(qapp):
     h._apply_disclosure()
     assert not _hidden(root, "Project")
     assert _hidden(root, "Signal")
+    assert root.child("Project").child("project_folder").value() == ""
+    assert root.child("Project").child("h5_dir").value() == ""
     assert "Project Folder" in h.ui.specLabel.t
 
     # Folder set -> the whole DATA group reveals (Poni is its first row), even

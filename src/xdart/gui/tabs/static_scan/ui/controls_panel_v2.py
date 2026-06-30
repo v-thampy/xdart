@@ -918,8 +918,11 @@ class ControlsPanelV2(QtWidgets.QWidget):
         self.experiment_card.set_status_text(self._experiment_status(
             state.fields_for(SectionId.EXPERIMENT)))
         self.processing_card.set_status_text(self._processing_status(profile))
-        self.experiment_card.setVisible(bool(state.fields_for(SectionId.EXPERIMENT)))
-        self.processing_card.setVisible(True)
+        viewer_mode = str(getattr(profile.processing_page, "value", "")) == "viewer"
+        self.source_card.setVisible(not viewer_mode)
+        self.experiment_card.setVisible(
+            bool(state.fields_for(SectionId.EXPERIMENT)) and not viewer_mode)
+        self.processing_card.setVisible(not viewer_mode)
         self.output_card.setVisible(False)
         self.analysis_card.setVisible(False)
 
