@@ -965,6 +965,29 @@ def _energy_status_reason(geom: GeomState, caps: SourceCaps) -> tuple[StatusKind
     )
 
 
+def _processing_backend_status_reason(
+    state: ControlState,
+) -> tuple[StatusKind, str]:
+    """Return the status for the selected processing backend.
+
+    F-1 keeps backend constraints in the same field-status stream as missing
+    inputs.  For now this is intentionally narrow: GI stitching needs the
+    histogram path because the MultiGeometry path has no GI correction support.
+    The broader GI correction stack for Int modes is a later feature, not part
+    of the Panel V2 carrier migration.
+    """
+
+    required = backend_required_for(state)
+    if not state.backend:
+        return StatusKind.DEFERRED, ""
+    if required and state.backend != required:
+        return (
+            StatusKind.CONFLICT,
+            f"{state.mode.value} {state.tool.value} requires backend {required}.",
+        )
+    return StatusKind.OK, ""
+
+
 def build_field_statuses(state: ControlState) -> Mapping[FieldId, FieldStatus]:
     caps = state.source_caps
     geom = state.geom
@@ -972,6 +995,7 @@ def build_field_statuses(state: ControlState) -> Mapping[FieldId, FieldStatus]:
     source_label = state.source_label or "No source selected"
     frame_value = str(state.frame_count) if state.frame_count else ""
     energy_status, energy_value, energy_reason = _energy_status_reason(geom, caps)
+    backend_status, backend_reason = _processing_backend_status_reason(state)
     fields = {
         FieldId.PROJECT_ROOT: _field(
             FieldId.PROJECT_ROOT,
@@ -1043,8 +1067,9 @@ def build_field_statuses(state: ControlState) -> Mapping[FieldId, FieldStatus]:
             value=state.processing_mode or state.tool.value),
         FieldId.PROCESSING_BACKEND: _field(
             FieldId.PROCESSING_BACKEND,
-            StatusKind.OK if state.backend else StatusKind.DEFERRED,
-            value=state.backend or "default"),
+            backend_status,
+            value=state.backend or "default",
+            reason=backend_reason),
         FieldId.OUTPUT_SAVE_PATH: _field(
             FieldId.OUTPUT_SAVE_PATH,
             StatusKind.OK if state.save_path else StatusKind.MISSING,
@@ -1400,6 +1425,8 @@ def run_required_fields_for(state: ControlState) -> tuple[FieldId, ...]:
         required.append(FieldId.SAMPLE_ORIENTATION)
     if state.tool == Tool.RSM:
         required.extend((FieldId.SOURCE_MOTORS, FieldId.DIFFRACTOMETER_UB))
+    if backend_required_for(state):
+        required.append(FieldId.PROCESSING_BACKEND)
     return tuple(dict.fromkeys(required))
 
 

@@ -21,7 +21,9 @@ from xdart.gui.tabs.static_scan.controls_logic import (
     ControlState,
     ControlProfile,
     FieldId,
+    GeomState,
     INTEGRATOR_BACKED_CONTROL_SPECS,
+    MeasMode,
     ProcessingPage,
     ResultCaps,
     SectionId,
@@ -340,6 +342,31 @@ def test_controls_panel_v2_emits_action_intent(qapp):
     buttons[0].click()
 
     assert got == [ControlAction.CHOOSE_PROJECT]
+
+
+def test_controls_panel_v2_backend_conflict_gates_run():
+    profile = build_control_profile(
+        ControlState(
+            tool=Tool.STITCH,
+            mode=MeasMode.GI,
+            backend="multigeometry",
+            source_caps=SourceCaps(has_frames=True, has_energy=True),
+            geom=GeomState(
+                calibrated=True,
+                energy_known=True,
+                gi_enabled=True,
+                sample_orientation_known=True,
+            ),
+            real_data_gates=frozenset({"gi_stitch_real_data"}),
+        )
+    )
+
+    backend = profile.fields[FieldId.PROCESSING_BACKEND]
+
+    assert backend.status is StatusKind.CONFLICT
+    assert "pyfai_hist" in backend.reason
+    assert profile.can_run is False
+    assert profile.run_blockers == (backend.reason,)
 
 
 def test_controls_panel_v2_renders_typed_field_cards(qapp):
