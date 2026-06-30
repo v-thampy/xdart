@@ -212,3 +212,35 @@ def test_widget_async_probe_ignores_stale_generation(qapp, tmp_path):
     finally:
         w.shutdown_probe_worker()
         w.deleteLater()
+
+
+def test_file_candidates_tiff_filters_to_scan_stem(qapp, tmp_path):
+    """A picked TIFF resolves to a TIFF_SERIES filtered to its OWN scan stem, so a
+    folder holding several scans isn't concatenated into one series."""
+    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+
+    for name in ("scanA_0001.tif", "scanA_0002.tif",
+                 "scanB_0001.tif", "scanB_0002.tif", "scanB_0003.tif"):
+        (tmp_path / name).write_bytes(b"")
+    picked = str(tmp_path / "scanA_0002.tif")
+    specs = ScanSourceWidget._file_candidates(
+        picked, SourceKind.IMAGE_FILE, SourceKind, SourceSpec)
+    assert len(specs) == 1
+    spec = specs[0]
+    assert spec.kind is SourceKind.TIFF_SERIES
+    assert str(spec.uri) == str(tmp_path)
+    assert dict(spec.options).get("pattern") == "scanA_*"   # scan A only, not B
+
+
+def test_source_widget_ui_tweaks(qapp):
+    """Folder label reserves room (no clip), and Raw-params shares the images row."""
+    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+
+    w = ScanSourceWidget(mode="roi")
+    try:
+        fm = w.dir_check.fontMetrics()
+        assert w.dir_check.minimumWidth() >= fm.horizontalAdvance("Folder")
+        assert w.adv_btn.parentWidget() is w.images_row     # combined onto row 2
+    finally:
+        w.deleteLater()
