@@ -1,5 +1,8 @@
 # Design: Controls Panel v2 — Project / Source / Experiment / Processing
 
+> **Living doc — keep current.** Update §14 status + any affected section as part of every
+> panel-v2 change; each chunk + handoff ends with a doc-update step.
+
 **Status:** CANONICAL (updated 2026-06-29) · the single source of truth for the xdart controls panel.
 Synthesizes the `xdart_controls_handoff` mockup (visual + interaction direction), the Codex
 architecture review (the typed reactive layer + retire `ParameterTree`), and the two streamlining
@@ -715,229 +718,61 @@ Acceptance for the polish pass:
 
 ---
 
-## 14. 2026-06-29 status — what landed, what's left, and the merge plan
+## 14. 2026-06-30 status — V2 Int flip complete on cp2
 
-**Branch state.** `feature/controls-panel-v2` is **12 commits ahead / 1 behind**
-`feature/geometry`. The 1 behind is `6068246 test(gi): real-data validation of the GI
-corrections` (a test script, `scripts/gi_real_data_validation.py`) — additive and
-conflict-free. `git merge-tree --write-tree feature/geometry HEAD` returns **clean (no
-conflicted paths)**. The branch's net delta vs `feature/geometry` is **xdart GUI + tests
-only, plus one additive headless change** (`src/xrd_tools/io/metadata.py`, SPEC search
-depth) — **no `core/`, schema, or NeXus-writer changes**, so the byte-compat gate and the
-live≡batch≡reload equivalence spine are structurally untouched.
+**Current branch state.** `feature/controls-panel-v2` has merged the latest
+`feature/geometry` fast-forward for this chunk. The V2 functional flip is now
+code-complete on cp2: native Controls V2 Int state is authoritative for visible Int
+rows, native reduction plans are default-on for run/reintegrate, and native
+`controls_v2_int` session state wins over stale legacy integrator session blobs.
 
-**Test baseline.** `tests/core` is green; `tests/xdart/test_controls_logic.py` (25),
-`test_controls_panel_v2.py` (27), and `tests/core/test_metadata.py` (45) pass. Two **pre-existing,
-not-a-regression** artifacts are present and must not be mistaken for new breakage:
-- The offscreen-Qt **teardown segfault** — fires at interpreter exit *after* all tests report
-  passed; reproducible on a clean tree.
-- `tests/xdart/test_live_refresh.py` shows **12 deterministic failures when the file runs as a
-  whole**, but **every one passes when run individually** — classic intra-file state contamination.
-  Confirmed pre-existing by stash: the committed branch tip (no uncommitted changes) shows the
-  *same* 12 failures (`12 failed, 170 passed`); this session's changes add 5 passing tests and
-  **zero** new failures (`12 failed, 175 passed`). Worth a separate cleanup (find the leaking test),
-  but it does **not** gate the merge and is not caused by the V2 work.
+**What changed in the flip.**
+- The V2-to-legacy Int write-through bridge is retired. Int edits no longer mirror
+  into hidden legacy line edits/combos as the state carrier.
+- The embedded legacy Int widgets remain alive only for delegated actions that still
+  live there (Reintegrate, Calibrate, Make Mask) and for the Advanced inspector
+  dialog. `integratorTree.get_args()` no longer reparses hidden widgets while V2
+  native args are installed; Advanced parameter edits still sync into the native
+  scan args.
+- Native Int state covers the inline rows (Axis/Pts, radial range, azimuthal range)
+  and the Advanced-disclosure rows (1D/2D Unit, method, solid angle, polarization,
+  dummy/delta, chi offset, safe).
+- `XDART_CONTROLS_V2_NATIVE_RUN_PLAN` now defaults to **on**. Set it to `0` only as
+  an emergency opt-out while this lands through the orchestrator gates.
+- Run, reintegrate, session close/open, setup reload, threshold, and GI state paths
+  use native scan-backed state before building plans. The wrangler ParameterTree is
+  still populated at run setup where older setup code expects it, but it is no
+  longer the V2 Int source of truth.
+- The active-run panel flash fix is included: live/Append/non-viewer runs now defer
+  Controls V2 rebuilds while a run is active and flush once at run end.
 
-### 14.1 Landed this session (all behavior-preserving; V2 still writes THROUGH the legacy carrier)
-- **Average Scan → Processing.** `("Signal","series_average")` renders as a Conditioning pill
-  next to Mask Saturated (polish item 6).
-- **GI section, one row.** `θ motor` (expands) + manual `θ` (~30% narrower) inline; Orientation +
-  Tilt behind a compact light-blue `…` popup (§3c / item 7, corrected above). Old floating
-  `gi_more_popup` deleted; backing widgets live in `gi_hidden_holder`.
-- **GI motor reactivity.** Dropdown lists all metadata motors, `_GI_MOTOR_PREFERENCE`
-  (`th, eta, theta, gonth, halpha`, case-insensitive) ordered first; auto-selects `th` on source
-  switch; clears motors when Meta Type changes (`image_wrangler.get_img_fname` / `set_meta_ext`).
-- **Source/Meta layout.** File Type + Meta Type on one row; "Meta File"→"Meta Type",
-  "Meta Dir"→"SPEC Dir"; Subdirs beside the mode dropdown; Meta Type combo right-justified,
-  ~10% narrower, tightened label gap (polish item 5).
-- **Tooltips.** Per-field GI tooltips + action tooltips (`_FIELD_TOOLTIPS`/`_ACTION_TOOLTIPS`);
-  path fields show their full path on hover.
-- **`_1` averaged-series fix.** Averaged series shows the bare series name in title/legend
-  (`display_frame_widget.update_2d_label`, `display_publication._trace_name`); the Frames column
-  still exposes index 1.
-- **SPEC metadata search depth** (headless). `_read_spec_metadata` now searches the image folder
-  + **two** parent levels (`io/metadata.py`); SPEC files are extensionless; motor positions win
-  over counters (`{**counters, **motors}`). Covered by `tests/core/test_metadata.py` (depth 0/1/2 +
-  negative).
-- **Light theme fix.** V2 input boxes (`controlsV2LineEdit`/`ComboBox`) and the four section-header
-  backgrounds were hardcoded dark; now theme-adaptive via `$field` and new
-  `hdr_project/source/experiment/processing` tokens (dark values preserved exactly, light tints
-  added). *Open follow-up:* the subsection-title/prefix **accent text** (`#8fb4ff`/`#6fdca5`/
-  `#e8c46a`/`#e06c75`) is low-contrast as foreground on the light card — eyeball in a light-theme
-  screenshot; if confirmed, give those accents darker light-mode variants.
-- **Default panel width** reduced ~10% (left Data Browser + right controls) to de-squish the
-  central display.
-- **Processing-panel polish** (3 commits): Pts boxes narrower and moved onto the Axis row;
-  Reintegrate buttons recolored to match the Advanced red.
-- **`controls_logic` purity guard** test added; design docs added to `.gitignore`.
+**Acceptance gates converted.** Offscreen tests now assert native-authoritative
+correctness rather than V2-vs-hidden-widget parity. The core checks are:
+- native V2 edits update `scan.bai_1d_args` / `scan.bai_2d_args`, GI config, and
+  threshold state immediately while hidden legacy widgets remain stale;
+- native run and reintegrate plan snapshots match the scan/headless plan;
+- native session state survives close/open and beats stale legacy `integrator`
+  session data;
+- default-on native plan caches are installed for run and reintegrate, with
+  `XDART_CONTROLS_V2_NATIVE_RUN_PLAN=0` preserving the fallback;
+- GI default orientation is 4, matching the frame/integrator default.
 
-### 14.2 What "finish the panel v2 migration" still means (unchanged phase targets)
-The visible surface is default-on, but production behavior is still **legacy-backed**. To truly
-finish (per §8 Phases 5/7/8) the remaining work is, in order:
-1. **Phase 7 — native Int pages, field-by-field.** Replace the embedded legacy Int integration
-   widget with native V2 Int 1D/2D rows, each still writing through until its legacy twin is
-   retired. (First native Int rows already mirror the live integrator.)
-2. **Phase 5 — native Stitch/RSM Processing pages** keyed by `processing_page`, with backend-aware
-   corrections (`multigeometry` default Stitch-2D; `pyfai_hist` required for shared/GI corrections;
-   `xu_hist` hidden until its convention gate lands).
-3. **Phase 3/4 producers — mount `ScanSourceWidget`** as the active Source card (async probe +
-   generation cancellation already exist) and make the Experiment card the **authoritative**
-   instrument record (native detector/diffractometer/beam editors + real provenance badges),
-   replacing the transitional write-through.
-4. **Phase 8 — retire the primary `ParameterTree`** and the embedded Int widget once native pages
-   pass live/batch/reintegrate/reload/analysis gates; keep only the Advanced inspector. Remove dead
-   session keys + duplicate GI/PONI state.
-5. **Keystone follow-up F-3 (§12) — post-v2.** F-1/F-2 are implemented: conflict
-   detectors now gate `can_run`, and `run_blockers` are derived from the
-   `FieldStatus` set. The remaining keystone follow-up is extending the optional
-   GI correction stack to Int 1D/2D.
+**Validated in `xrd_test` for this chunk.**
+- `tests/xdart/test_controls_panel_v2.py -q` → 62 passed.
+- `tests/xdart/test_controls_logic.py tests/core/test_v2_record_compat.py -q` → 31 passed.
+- `tests/xdart/test_reduction_adapters.py -q` → 47 passed.
+- `tests/xdart/test_gi_batch_real_data.py -k equivalence -q` → 18 passed, 50 deselected.
 
-None of the above blocks the merge below — they are forward work on the same branch lineage.
-
-### 14.3 Merge plan — fold `feature/controls-panel-v2` into `feature/geometry`
-**2026-06-30 update:** this request explicitly merges the controls branch into
-`feature/geometry` and commits this status doc. The code is already committed; the only
-remaining local edits are design-doc status updates.
-
-1. Commit this doc/status reconciliation on `feature/controls-panel-v2`.
-2. Merge from `feature/controls-panel-v2` into `feature/geometry` with a normal merge commit.
-3. Run the focused controls gates first:
-   `tests/xdart/test_controls_logic.py`, `tests/xdart/test_controls_panel_v2.py`,
-   and `tests/core/test_metadata.py`.
-4. Run broader xdart/core gates before a release candidate, plus one **manual live checkpoint**
-   (real QThread teardown / GI mode switch) since 4e/4f-class paths are not offscreen-gatable.
-5. Guardrails remain: no `git push`, no tag, no version bump, and no retirement of the legacy Int
-   carrier until the Wave 2/3 acceptance gates in §14.6 pass.
-
-### 14.4 Post-review remediation (2026-06-29) — adversarial review findings fixed
-
-A two-pass adversarial review (find → independently refute) of the uncommitted diff raised eight
-findings; the two P2s + two of the P3s were fixed this session (the others are tracked below). All
-fixes are behavior-preserving on the happy path and pinned by new tests.
-
-- **F1 (P2) FIXED — GI `…` popup stale-value clobber.** The popup's rows are parented under the
-  panel, so `current_form_edits()` (`findChildren(FormRow)`) harvested them; a stale popup could
-  revert a fresher `sample_orientation`/`tilt_angle` on the next `_commit_controls_v2_pending_edits`.
-  Fix: `_render_bound_fields` now tears the popup down on every rebuild via `_close_gi_more_popup`,
-  which `setParent(None)`s it (detach from the tree *now* — `deleteLater` is async) then
-  `deleteLater`s it. Popup edits already write through on change, so nothing is lost; reopening
-  rebuilds rows from the live profile. Pinned by
-  `test_controls_panel_v2_gi_popup_torn_down_on_rebuild_no_stale_clobber`.
-- **F2 (P3) FIXED — orphan `…` popup after leaving Grazing.** Same teardown-on-rebuild disposes it
-  (leaving Grazing triggers a rebuild). Covered by the F1 test.
-- **F3 (P2) FIXED — deliberate `Manual` θ silently auto-switched on source/format change.** The
-  `set_gi_motor_options` guard now keeps a *deliberate* Manual sticky (recorded via the combo's
-  user-only `activated` signal → `_gi_motor_user_choice`, and on hydrate from a saved `gi_config`),
-  while the *initial default* Manual still yields to the `th/eta/...` preference order. Pinned by
-  `test_integrator_gi_motor_keeps_deliberate_manual_across_repopulation` (and the existing
-  `…_autoselects_preferred_over_manual` stays green).
-- **F4 (P3) FIXED — stale BG Match / norm dropdowns after a no-sidecar format switch.** The
-  `get_img_fname` no-sidecar branch now also clears `self.counters` and refreshes
-  `set_bg_matching_options`/`set_bg_norm_options` (mirroring `set_pars_from_meta` on the clear side).
-  Pinned by `test_get_img_fname_no_sidecar_clears_counters_and_refreshes_bg` (+ the directory-path
-  test now asserts counters clear too).
-- **F6 (P3) FIXED — frame-count freeze could leak across runs.** `_enter_run_state` now resets
-  `_controls_v2_run_frame_count = None` so each run re-snapshots from scratch, independent of
-  inter-run refresh timing. Pinned by `test_enter_run_state_resets_frame_count_snapshot`.
-
-**Still open (not blocking):**
-- **F5 (P3, low) — reloaded averaged scan can show `_1` again.** `scan.series_average` isn't restored
-  on a pure disk reload (only the run path sets it), so the bare-title/legend fix doesn't apply to a
-  reloaded averaged file. Fix would persist/restore `series_average` from the `.nxs` (or derive it
-  from frame-count == 1). Deferred.
-- **F7 (P4) — SPEC grandparent search:** accept as-is; the exact extensionless-name + scan-number
-  match with shallow-first ordering makes a wrong-file collision unlikely.
-- **F8 (P4) — pre-existing red `test_live_refresh.py` tests:** 12 deterministic in-file failures
-  (all pass individually; identical count on the committed tip — confirmed via stash). Separate
-  cleanup: find the leaking test / give the `SimpleNamespace` stubs a no-op
-  `_refresh_controls_v2_profile`.
-
-### 14.5 Second-review follow-ups (2026-06-29)
-
-A follow-on review raised five items; resolution:
-
-- **Legacy opt-out (`XDART_CONTROLS_PANEL_V2=0`) no longer edits GI details — accepted as a known
-  limitation (Vivek).** The GI rework parks the θ-motor/orientation/tilt widgets in the integrator's
-  hidden holder and deleted the old always-on popup, so with V2 disabled there is no usable editor for
-  those fields. The flag is retained only as an *emergency fallback* during migration (V2 is
-  default-on); it is **not** kept behavior-complete for GI and is removed for good at Phase 8 when the
-  primary `ParameterTree` is retired. Do not rely on `=0` for GI work.
-- **Refresh-deferral spin removed.** The focused-editor deferral in `_refresh_controls_v2_profile_now`
-  previously re-armed the throttle every interval while a `QLineEdit` held focus (a timer kept waking
-  through a long acquisition). It now arms a **one-shot** on the editor's `editingFinished`
-  (`_defer_controls_v2_refresh_until_commit` / `_on_controls_v2_pending_editor_done`) and schedules the
-  rebuild *through* the throttle on commit — never re-arming a spinning timer, never deleting the
-  editor inside its own signal. Dropped-input protection unchanged, still pinned by
-  `test_controls_panel_v2_refresh_defers_while_line_editor_focused`.
-- **GI `…` popup commit-on-run** is now pinned by `test_controls_panel_v2_gi_popup_edit_commits_on_run`
-  (typing Orientation then committing pending edits — what Run does — applies to *this* run).
-- **Metadata grandparent search** (`io/metadata.py`) is a real headless API behavior change — covered
-  by `tests/core/test_metadata.py`; watch for false positives from unrelated parent metadata. (F7.)
-- **Stale doc language** (this doc): the read-order banner up top now points to §14 as the
-  authoritative current-state and marks the §3/§8 numbered/"preview" prose as historical plan.
-
-### 14.6 Finish plan after merge with `feature/geometry` (2026-06-30)
-
-The current branch state is intentionally transitional: V2 is the visible panel and
-the Int 1D/2D rows now have a complete native typed inventory (including units and
-Advanced integration fields) with immediate write-through to the hidden legacy
-carrier. Production Int paths are still legacy-backed by default; the first Wave-2
-run-plan seam is available behind `XDART_CONTROLS_V2_NATIVE_RUN_PLAN=1`, where the
-run worker's plan cache uses the native scan-based builder. Reintegrate,
-save/session restore, and NeXus reload paths still read the legacy carrier.
-
-**V1-critical scope.** Finishing Panel V2 means completing the Int carrier migration:
-native Int state becomes the source of the reduction plan, the legacy Int widget and
-primary `ParameterTree` are retired, and the same behavior is proven through
-live/batch/reintegrate/reload/manual checkpoints. It does **not** mean deleting the
-display mirrors (`data_1d`/`data_2d`) or finishing Stitch/RSM/Source/Experiment
-producer redesigns; those remain separate follow-on slices.
-
-**Wave 1 — freeze the native Int state inventory.**
-Status: **LANDED on cp2 (2026-06-30)**. `INTEGRATOR_BACKED_CONTROL_SPECS` is now
-the single typed inventory for GI, Mask, Int 1D/2D visible rows, unit_1D/unit_2D,
-and Advanced ParameterTree-backed fields. Rendering, harvesting, choices,
-write-through, and membership derive from that table.
-- Add the remaining native Int fields that still live only in the embedded legacy
-  carrier: unit_1D/unit_2D, method, error model, polarization/solid-angle/dummy
-  handling, chi offset, and any still-used advanced fields.
-- Replace the parallel Int-field lists with one typed table and derive rendering,
-  harvesting, write-through, and membership from that table.
-- Keep immediate write-through to legacy until the final retirement step; do not
-  defer sync to run time.
-- Gate: native widgets, harvested state, and legacy write targets expose exactly the
-  same path set; standard/GI mode-gating is covered by tests.
-
-**Wave 2 — make the native Int builder production-ready behind a safety flag.**
-Status: **STARTED on cp2 (2026-06-30)**. A Qt-free
-`build_native_int_reduction_plan_from_scan` now feeds the optional
-`StandardPlanCache.plan_builder`; Controls V2 installs it for run paths only when
-`XDART_CONTROLS_V2_NATIVE_RUN_PLAN=1`. Legacy remains the default fallback while
-the offscreen matrix and live checkpoint are expanded.
-- Route one path at a time through `build_native_int_reduction_plan_from_args`:
-  batch/live run, single-frame reintegrate, full reintegrate, session save/restore,
-  and reload hydration.
-- For each path, compare the native `ReductionPlan` to the legacy plan across the
-  acceptance matrix: Int 1D/2D, GI on/off, auto/manual ranges, threshold, mask,
-  background, monitor normalization, and corrections.
-- Keep the legacy path available as an emergency fallback until the native path has
-  passed the offscreen matrix and a manual live checkpoint.
-- Gate: GUI native plan == legacy plan == headless plan for the matrix; GI
-  live/batch/reload spine and byte-compat remain green.
-
-**Wave 3 — retire the Int carrier.**
-- Remove the V2-to-legacy Int write-through bridge only after Wave 2 passes.
-- Remove the embedded legacy Int widget from the V2 panel; keep only the Advanced
-  inspector for truly advanced or debug-only state.
-- Migrate session persistence to the native controls-state blob while preserving
-  readability of old sessions during the transition.
-- Gate: manual live checklist passes (Start/Stop/Append/Live, GI mode switch, run
-  disable/enable, reintegrate, reload, XYE/Image viewer transitions), and no
-  production path reads the retired Int carrier.
+**Manual live checkpoint still pending.** A human live scan remains the final
+offscreen-impossible gate before declaring the flip integrated on geometry:
+real QThread teardown, Start/Stop/Append/Live, GI mode switch, reintegrate, reload,
+session restore with native-run-plan default-on, and XYE/Image-viewer transitions.
+Bundle this with the pending Phase-4e/4f checkpoint.
 
 **Explicitly post-v2.**
-- Native Stitch/RSM processing pages and display panels.
+- Native Stitch/RSM Processing pages.
 - Mounting `ScanSourceWidget` as the authoritative Source card.
-- Making Experiment producers authoritative beyond the currently mirrored GI fields.
+- Making Experiment producers/badges authoritative beyond the current mirrored GI
+  fields.
 - F-3 optional GI correction stack for Int 1D/2D.
-- Final visual-polish items from §13 that are not required for functional parity.
+- Final visual-polish backlog from §13 that is not required for functional parity.
