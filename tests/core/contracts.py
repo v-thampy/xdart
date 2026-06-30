@@ -154,18 +154,30 @@ def _fake_r1d(value: float):
 
 
 def drive_streaming(sink, monkeypatch, *, n_frames: int = 4,
-                    refeed: int | None = None, executor: int = 2):
+                    refeed: int | None = None, executor: int = 2,
+                    frames: list | None = None, plan: Any | None = None,
+                    integrate_1d: Callable | None = None):
     """Run a real streaming session against ``sink`` with a stub integrator.
 
     Returns the finished session.  ``refeed`` re-submits that frame index
     after a drain, exercising the replace path.
+
+    A caller with a bespoke sink (e.g. ``QtNexusSink``) may pass its own
+    ``frames`` / ``plan`` / ``integrate_1d`` stub so it reuses this one drive
+    loop instead of re-rolling it; the defaults reproduce the canonical
+    n-frame ``ReductionPlan(integration_2d=None)`` session.
     """
-    monkeypatch.setattr(reduction_core, "integrate_1d",
-                        lambda image, ai, **kw: _fake_r1d(float(np.sum(image))))
-    frames = [Frame(i, image=np.full((2, 2), i, dtype=float))
-              for i in range(n_frames)]
+    monkeypatch.setattr(
+        reduction_core, "integrate_1d",
+        integrate_1d or (lambda image, ai, **kw: _fake_r1d(float(np.sum(image)))),
+    )
+    if frames is None:
+        frames = [Frame(i, image=np.full((2, 2), i, dtype=float))
+                  for i in range(n_frames)]
+    if plan is None:
+        plan = ReductionPlan(integration_2d=None)
     session = ReductionSession(
-        ReductionPlan(integration_2d=None),
+        plan,
         Scan("contract", frames, integrator=object()),
         sink=sink, execution="streaming", executor=executor,
     )
@@ -182,6 +194,58 @@ def drive_streaming(sink, monkeypatch, *, n_frames: int = 4,
 # ---------------------------------------------------------------------------
 # the contract checks
 # ---------------------------------------------------------------------------
+
+def assert_streaming_contract(spy: ThreadSpySink, caller: int, *,
+                              n_frames: int,
+                              expect_worker_process: bool | None = None
+                              ) -> set[int]:
+    """Assert the observable single-writer streaming contract on a driven spy.
+
+    Shared by ``check_sink_contract`` (a raw ``ReductionSession``) and the
+    ScanSession-wrapper test (the ``_EventSink`` forwarding must preserve it,
+    ADR-0004 §1).  Returns the writer-thread set for extra caller assertions.
+
+    Asserted:
+    - begin exactly once before the first write, finish exactly once after the
+      last, both on the ``caller`` thread;
+    - one write per distinct frame index, all on ONE writer thread that is not
+      the caller.
+
+    ``expect_worker_process``:
+    - ``None`` (default) — assert the worker_process discipline only when the
+      INNER sink defines worker_process (the per-sink contract: a sink that
+      doesn't fan out won't be held to it);
+    - ``True`` — require it regardless.  The spy itself injects worker_process,
+      so this proves the *session* still dispatches it to pool workers even
+      when the inner sink (e.g. ``MemorySink``) does not define it.
+    """
+    hooks = spy.hooks()
+    assert hooks.count("begin") == 1, hooks
+    assert hooks.count("finish") == 1, hooks
+    assert hooks[0] == "begin" and hooks[-1] == "finish", hooks
+    assert sorted(spy.frames_for("write")) == list(range(n_frames))
+
+    # thread discipline -------------------------------------------------
+    assert spy.threads_for("begin") == {caller}
+    assert spy.threads_for("finish") == {caller}
+    writer_threads = spy.threads_for("write")
+    assert len(writer_threads) == 1, (
+        f"write() must stay on ONE writer thread; saw {len(writer_threads)}"
+    )
+    assert writer_threads != {caller}, "write() must not run on the caller"
+
+    if expect_worker_process is None:
+        expect_worker_process = callable(
+            getattr(spy.inner, "worker_process", None))
+    if expect_worker_process:
+        wp_threads = spy.threads_for("worker_process")
+        assert wp_threads, "worker_process expected but never called"
+        assert not (wp_threads & writer_threads), (
+            "worker_process must run on pool workers, not the writer thread"
+        )
+        assert sorted(spy.frames_for("worker_process")) == list(range(n_frames))
+    return writer_threads
+
 
 def check_sink_contract(sink_factory: Callable[[], Any], monkeypatch, *,
                         n_frames: int = 4) -> ThreadSpySink:
@@ -200,28 +264,7 @@ def check_sink_contract(sink_factory: Callable[[], Any], monkeypatch, *,
     spy = ThreadSpySink(inner=sink_factory())
     caller = threading.get_ident()
     drive_streaming(spy, monkeypatch, n_frames=n_frames)
-
-    hooks = spy.hooks()
-    assert hooks.count("begin") == 1, hooks
-    assert hooks.count("finish") == 1, hooks
-    assert hooks[0] == "begin" and hooks[-1] == "finish", hooks
-    assert sorted(spy.frames_for("write")) == list(range(n_frames))
-
-    # thread discipline -------------------------------------------------
-    assert spy.threads_for("begin") == {caller}
-    assert spy.threads_for("finish") == {caller}
-    writer_threads = spy.threads_for("write")
-    assert len(writer_threads) == 1, (
-        f"write() must stay on ONE writer thread; saw {len(writer_threads)}"
-    )
-    assert writer_threads != {caller}, "write() must not run on the caller"
-    if callable(getattr(spy.inner, "worker_process", None)):
-        wp_threads = spy.threads_for("worker_process")
-        assert wp_threads, "worker_process defined but never called"
-        assert not (wp_threads & writer_threads), (
-            "worker_process must run on pool workers, not the writer thread"
-        )
-        assert sorted(spy.frames_for("worker_process")) == list(range(n_frames))
+    assert_streaming_contract(spy, caller, n_frames=n_frames)
     return spy
 
 
@@ -288,6 +331,7 @@ __all__ = [
     "BoomSink",
     "MemorySink",
     "ThreadSpySink",
+    "assert_streaming_contract",
     "check_sink_contract",
     "check_source_contract",
     "drive_streaming",

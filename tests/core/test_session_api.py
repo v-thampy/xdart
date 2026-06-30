@@ -247,7 +247,7 @@ def test_event_sink_wrapper_preserves_single_writer_contract():
     the HDF5 single-writer discipline: the wrapper's forwarding may not move
     write() off the one writer thread, nor disable the pool-thread worker_process
     (ADR-0004 §1 / Difference 6 contract harness)."""
-    from tests.core.contracts import ThreadSpySink
+    from tests.core.contracts import ThreadSpySink, assert_streaming_contract
 
     spy = ThreadSpySink(inner=MemorySink())
     caller = threading.get_ident()
@@ -259,15 +259,10 @@ def test_event_sink_wrapper_preserves_single_writer_contract():
         sess.submit(fr)
     sess.finish()
 
-    hooks = spy.hooks()
-    assert hooks[0] == "begin" and hooks[-1] == "finish"
-    assert sorted(spy.frames_for("write")) == [0, 1, 2, 3]
-    writer_threads = spy.threads_for("write")
-    assert len(writer_threads) == 1 and writer_threads != {caller}
-    # worker_process (forwarded by the wrapper) ran on pool threads, off the writer
-    wp_threads = spy.threads_for("worker_process")
-    assert wp_threads and not (wp_threads & writer_threads)
-    assert sorted(spy.frames_for("worker_process")) == [0, 1, 2, 3]
+    # the SAME single-writer contract used for a raw ReductionSession; the spy
+    # injects worker_process, so the wrapper must still fan it to pool workers
+    # even though MemorySink does not define it (expect_worker_process=True).
+    assert_streaming_contract(spy, caller, n_frames=4, expect_worker_process=True)
 
 
 # ── adversarial-audit hardening (the event contract must be tamper-evident +
