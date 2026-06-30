@@ -9,6 +9,7 @@ integration loops itself.
 
 from __future__ import annotations
 
+import copy
 import os
 import queue
 import threading
@@ -2077,7 +2078,18 @@ class _ReductionIntegratorProvider:
             return self.ai
         ai = getattr(self._local, "ai", None)
         if ai is None:
-            ai = poni_to_integrator(self.scan.poni)
+            # Per-worker AI (pyFAI AIs aren't safe to share across threads).
+            # Deep-copy the base integrator instead of rebuilding from
+            # scan.poni: poni_to_integrator() cannot recover a GENERIC/unnamed
+            # detector's pixel size (PONI carries only a detector *name*), so a
+            # worker rebuild drops _pixel1/_pixel2 -> None and integrate1d
+            # crashes in calc_cartesian_positions.  A deepcopy keeps the
+            # detector (pixel sizes intact), stays thread-isolated, and is
+            # geometrically identical to the owner thread's AI (strengthening
+            # live==batch==reload equivalence).  Fall back to a poni rebuild
+            # only when there is no base AI (pure-PONI, named-detector path).
+            ai = copy.deepcopy(self.ai) if self.ai is not None \
+                else poni_to_integrator(self.scan.poni)
             self._local.ai = ai
         return ai
 
@@ -2088,15 +2100,21 @@ class _ReductionIntegratorProvider:
             return self.fi
         fi = getattr(self._local, "fi", None)
         if fi is None:
-            gi = self.plan.gi
-            if gi is None:
-                return None
-            fi = poni_to_fiber_integrator(
-                self.scan.poni,
-                incident_angle=float(self.initial_incident_angle or 0.0),
-                tilt_angle=float(gi.tilt_angle),
-                sample_orientation=int(gi.sample_orientation),
-            )
+            if self.fi is not None:
+                # Same reasoning as standard(): deepcopy the base
+                # FiberIntegrator to keep a generic detector's pixel size
+                # (a poni rebuild would drop it) and stay thread-isolated.
+                fi = copy.deepcopy(self.fi)
+            else:
+                gi = self.plan.gi
+                if gi is None:
+                    return None
+                fi = poni_to_fiber_integrator(
+                    self.scan.poni,
+                    incident_angle=float(self.initial_incident_angle or 0.0),
+                    tilt_angle=float(gi.tilt_angle),
+                    sample_orientation=int(gi.sample_orientation),
+                )
             self._local.fi = fi
         return fi
 
