@@ -122,6 +122,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self._table = {}
         self._columns = []
+        self._positioner_names = []         # scanned-motor names (X-default hint)
         # ROI path: the opened raw source + its computed columns.
         # ``mask_provider(uri)`` returns the static detector mask to apply to ROI
         # stats for that source (e.g. the loaded scan's global_mask when the
@@ -182,6 +183,10 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.save_btn = QtWidgets.QPushButton("Save CSV…")
         self.save_btn.setEnabled(False)
         axes_row.addWidget(self.save_btn)
+        self.log_btn = QtWidgets.QPushButton("Log")
+        self.log_btn.setCheckable(True)
+        self.log_btn.setToolTip("Log scale on the (left) Y axis")
+        axes_row.addWidget(self.log_btn)
         lay.addLayout(axes_row)
 
         # Y multi-select (check several to overlay) + the plot, side by side.
@@ -207,6 +212,8 @@ class ScanPlotDialog(QtWidgets.QDialog):
         body.addLayout(y_col)
         self.plot = pg.PlotWidget()
         self.legend = self.plot.addLegend(offset=(-10, 10))
+        # ~50% larger than pyqtgraph's ~9pt legend default (readability).
+        self.legend.setLabelTextSize("13pt")
         self.right_vb, self.right_axis = attach_right_axis(self.plot)
         body.addWidget(self.plot, 1)
         lay.addLayout(body, 1)
@@ -223,6 +230,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.source_widget.sigSourceChanged.connect(self._on_source_selected)
         self.roi_btn.clicked.connect(self._open_roi_dialog)
         self.save_btn.clicked.connect(self._save_csv)
+        self.log_btn.toggled.connect(self._redraw)
 
     # ---- source loading -------------------------------------------------
     def load_uri(self, uri):
@@ -252,6 +260,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
             self._raw_reachable = False
             self._first_image = None
             self._scan_identity = None
+            self._positioner_names = []
             self.set_table("", {})
             self._update_roi_button()
             return
@@ -266,6 +275,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
             return
         self._abort_roi_run()
         self._scan_identity = identity
+        self._positioner_names = self._positioners_for(selection)
         label, table = self._table_for(selection)
         self.set_table(label, table)
         self._update_roi_button()
@@ -288,6 +298,26 @@ class ScanPlotDialog(QtWidgets.QDialog):
         if not table:
             table = _table_from_source(source)
         return selection.label, table
+
+    @staticmethod
+    def _positioners_for(selection):
+        """Scanned-motor names for the X default.  For a processed NeXus these
+        are the recorded NXpositioner motors (``get_metadata`` — intentionally
+        narrow to the diffractometer/scanned motors); for other sources they are
+        the source's own ``motors`` keys.  Best-effort: a read failure yields no
+        hint (X then falls back to ``frame_index``)."""
+        from xrd_tools.core.scan import SourceKind
+        spec, source = selection.spec, selection.source
+        if spec is not None and spec.kind is SourceKind.PROCESSED_NEXUS:
+            from xrd_tools.io import get_metadata
+            try:
+                positioners = get_metadata(spec.uri).get("positioners") or {}
+                return [str(k) for k in positioners]
+            except Exception:
+                logger.exception("scan-plot: reading positioners failed")
+                return []
+        motors = getattr(source, "motors", None) or {}
+        return [str(k) for k in motors]
 
     def _abort_roi_run(self):
         """Stop an in-flight ROI computation + close the picker and forget its
@@ -348,30 +378,54 @@ class ScanPlotDialog(QtWidgets.QDialog):
                 f"{len(cols)} plottable column(s). Pick X and check Y column(s).")
         self._redraw()
 
+    #: Default-Y counter preference (first present wins; matched
+    #: case-insensitively).  ROI columns are deliberately absent — neither a
+    #: beamline ROI counter nor a computed ROI is ever auto-selected as the
+    #: default (a frame-0 ROI says nothing about the scan).
+    _Y_PRIORITY = ("Photod", "bs", "mon", "i2", "i1", "i0")
+
     def _guess_axes(self, cols):
-        """(x_default, y_default).  X = the scanned positioner — the
-        most-monotonic non-index column (a scan axis varies smoothly) — else
-        frame_index.  Y = an intensity-like column (name hint) else the first
-        non-X column."""
-        candidates = [c for c in cols if c != "frame_index"]
-        x, best = None, 0.0
-        for c in candidates:
-            a = np.asarray(self._table[c], dtype=float)
-            a = a[np.isfinite(a)]
-            if a.size < 3:
-                continue
-            d = np.diff(a)
-            mono = max(float(np.mean(d >= 0)), float(np.mean(d <= 0)))
-            if mono > best:
-                best, x = mono, c
-        if x is None or best < 0.9:
-            x = "frame_index" if "frame_index" in cols else cols[0]
-        hints = ("i0", "int", "counts", "roi", "mon", "signal", "intensity")
-        y = next((c for c in candidates
-                  if c != x and any(h in c.lower() for h in hints)), None)
-        if y is None:
-            y = next((c for c in cols if c != x), None)
+        """(x_default, y_default).
+
+        X = the scanned NeXus positioner (the recorded scanned motor) when one
+        is present and actually varies, else ``frame_index``.  Y = the first
+        present column of :attr:`_Y_PRIORITY` (case-insensitive), never an ROI
+        column, else ``frame_index``."""
+        x = self._scanned_positioner(cols)
+        if x is None:
+            x = "frame_index" if "frame_index" in cols else (cols[0] if cols else None)
+        y = self._priority_y(cols, exclude=x)
         return x, y
+
+    def _scanned_positioner(self, cols):
+        """The X default: among the file's positioners present as plottable
+        columns, the one that varies the most (a constant positioner wasn't the
+        scan axis).  ``None`` when none are present or vary."""
+        best, spread = None, 0.0
+        for name in self._positioner_names:
+            if name not in cols:
+                continue
+            a = np.asarray(self._table[name], dtype=float)
+            a = a[np.isfinite(a)]
+            if a.size < 2:
+                continue
+            s = float(np.nanmax(a) - np.nanmin(a))
+            if s > spread:
+                spread, best = s, name
+        return best
+
+    def _priority_y(self, cols, *, exclude):
+        """The Y default: first present of :attr:`_Y_PRIORITY` (case-insensitive
+        column match), skipping ``exclude``; never an ROI column.  Falls back to
+        ``frame_index`` then ``None``."""
+        by_lower = {c.lower(): c for c in cols}
+        for name in self._Y_PRIORITY:
+            col = by_lower.get(name.lower())
+            if col is not None and col != exclude:
+                return col
+        if "frame_index" in cols and exclude != "frame_index":
+            return "frame_index"
+        return None
 
     @staticmethod
     def _checked_in(list_widget):
@@ -423,15 +477,15 @@ class ScanPlotDialog(QtWidgets.QDialog):
             if not (np.isfinite(x).any() and np.isfinite(y).any()):
                 continue
             color = CURVE_PENS[n % len(CURVE_PENS)]
-            pen = pg.mkPen(color, width=2)
+            pen = pg.mkPen(color, width=3)
             if ycol in right_cols:
                 add_right_series(self.right_vb, self.legend, x, y, pen=pen,
-                                 name=ycol, symbol="o", symbol_size=4,
+                                 name=ycol, symbol="o", symbol_size=7,
                                  symbol_brush=color)
                 any_right = True
             else:
                 self.plot.plot(x, y, pen=pen, name=ycol, symbol="o",
-                               symbolSize=4, symbolBrush=color)
+                               symbolSize=7, symbolBrush=color)
                 any_left = True
         self.plot.setLabel("bottom", xcol)
         value_label = ("value / " + norm_col) if normalized else "value"
@@ -440,6 +494,14 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.right_vb.setVisible(any_right)
         if any_right:
             self.right_axis.setLabel(f"{value_label} (right)")
+        # Re-apply the Y-log toggle: plot.clear() at the top of every _redraw
+        # resets per-axis log mode, so the state lives on the button.  Log the
+        # LEFT axis only, then force the right axis back to linear: its curves
+        # live in a separate ViewBox that PlotItem.setLogMode does NOT transform,
+        # so without this the right ticks would go log while the data stayed
+        # linear (mislabelled).  Right axis = linear ticks + linear data.
+        self.plot.setLogMode(False, self.log_btn.isChecked())
+        self.right_axis.setLogMode(False)
 
     def _schedule_redraw(self):
         if self._closing:
@@ -661,6 +723,14 @@ class ScanPlotDialog(QtWidgets.QDialog):
         if no_raw:
             msg += f" ({len(no_raw)} frame(s) had unreachable raw → NaN.)"
         self.status.setText(msg)
+
+    def keyPressEvent(self, event):
+        # Esc must not discard the assembled table / ROI setup (the default
+        # QDialog Esc -> reject closes the popup).  Other keys pass through.
+        if event.key() == QtCore.Qt.Key.Key_Escape:
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def showEvent(self, event):
         self._closing = False

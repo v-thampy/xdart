@@ -22,6 +22,7 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from .peak_fit_util import CURVE_PENS
+from xdart.gui.widgets.image_widget import _ceiling_safe_levels
 
 logger = logging.getLogger(__name__)
 
@@ -86,10 +87,34 @@ class RoiSelectDialog(QtWidgets.QDialog):
         self.image_plot.setAspectLocked(True)
         self.image_plot.invertY(True)               # row 0 at the top
         self.image_item = pg.ImageItem(axisOrder="row-major")
-        self.image_item.setImage(self._image)
-        self._autoscale_levels()
         self.image_plot.addItem(self.image_item)
+        # Intensity bar + colormap matching the main Image Viewer mode: a
+        # ColorBarItem linked to the frame (the same widget pgImageWidget uses).
+        self._cmap = pg.colormap.getFromMatplotlib("viridis")
+        self.colorbar = pg.ColorBarItem(width=15)
+        self.colorbar.setImageItem(self.image_item,
+                                   insert_in=self.image_plot.getPlotItem())
+        self.colorbar.setColorMap(self._cmap)
         lay.addWidget(self.image_plot, 3)
+
+        # Default / Log intensity scale, mirroring the Image Viewer's buttons.
+        scale_row = QtWidgets.QHBoxLayout()
+        scale_row.setSpacing(6)
+        scale_row.addWidget(QtWidgets.QLabel("Intensity"))
+        self.scale_default_btn = QtWidgets.QPushButton("Default")
+        self.scale_log_btn = QtWidgets.QPushButton("Log")
+        self._scale_group = QtWidgets.QButtonGroup(self)
+        self._scale_group.setExclusive(True)
+        for b in (self.scale_default_btn, self.scale_log_btn):
+            b.setCheckable(True)
+            self._scale_group.addButton(b)
+        self.scale_default_btn.setChecked(True)
+        scale_row.addWidget(self.scale_default_btn)
+        scale_row.addWidget(self.scale_log_btn)
+        scale_row.addStretch(1)
+        lay.addLayout(scale_row)
+        self.scale_log_btn.toggled.connect(self._apply_scale)
+        self._apply_scale()                         # initial linear render
 
         # ROI list + Add / Remove.
         roi_row = QtWidgets.QHBoxLayout()
@@ -198,12 +223,42 @@ class RoiSelectDialog(QtWidgets.QDialog):
         self.close_btn.clicked.connect(self.close)
         self._set_bg_fields_visible(False)
 
-    def _autoscale_levels(self):
-        finite = self._image[np.isfinite(self._image)]
-        if finite.size:
-            lo, hi = np.percentile(finite, (1.0, 99.0))
-            if hi > lo:
-                self.image_item.setLevels((float(lo), float(hi)))
+    def keyPressEvent(self, event):
+        # Don't let a stray Esc (e.g. after editing a numeric field) dismiss the
+        # ROI picker mid-selection — Close is the explicit exit.
+        if event.key() == QtCore.Qt.Key.Key_Escape:
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _apply_scale(self, *_args):
+        """Render the frame at the chosen intensity scale (Default = linear,
+        Log), reusing the main Image Viewer's ceiling-safe autoscale + colorbar
+        so ROI picking sees the same levels the viewer does.  The RectROI
+        overlay lives on the plot (not the image item), so re-rendering here
+        never disturbs the picked boxes."""
+        disp = np.asarray(np.copy(self._image), dtype=float)
+        if disp.size == 0 or not np.isfinite(disp).any():
+            self.image_item.setImage(disp)
+            return
+        if self.scale_log_btn.isChecked():
+            min_val = float(np.nanmin(disp))
+            if min_val < 1:
+                disp -= (min_val - 1)
+            disp = np.log10(disp)
+            levels = _ceiling_safe_levels(disp, self._image, (0.1, 99.9))
+            self.image_item.setImage(disp, levels=levels)
+            self.colorbar.axis.setLogMode(True)
+        else:
+            levels = _ceiling_safe_levels(disp, self._image, (2, 98))
+            self.image_item.setImage(disp, levels=levels)
+            self.colorbar.axis.setLogMode(False)
+        if np.isfinite(disp).any():
+            low, high = float(np.nanmin(disp)), float(np.nanmax(disp))
+        else:
+            low, high = 0.0, 1.0
+        self.colorbar.lo_lim, self.colorbar.hi_lim = low, high
+        self.colorbar.setLevels(values=levels)
 
     # ---- ROI lifecycle --------------------------------------------------
     def _default_box(self):
