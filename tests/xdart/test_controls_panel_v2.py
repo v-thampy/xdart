@@ -19,11 +19,15 @@ from xdart.gui.tabs.static_scan.controls_logic import (
     ControlPanelRenderState,
     ControlState,
     ControlProfile,
+    FieldId,
+    INTEGRATOR_BACKED_CONTROL_SPECS,
     ProcessingPage,
     ResultCaps,
     SectionId,
     SourceCaps,
+    StatusKind,
     Tool,
+    build_control_panel_state,
     build_control_profile,
 )
 from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import (
@@ -560,6 +564,126 @@ def test_controls_panel_v2_refresh_defers_while_line_editor_focused(qapp, monkey
         widget._on_controls_v2_pending_editor_done()
         assert widget._controls_v2_pending_editor is None
         assert triggered == [True]                           # scheduled once, on commit
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_batch_refreshes_once_after_run(qapp, monkeypatch):
+    """Batch runs should not rebuild the V2 controls panel every progress tick.
+
+    The profile is refreshed once the run exits, so the final state still
+    appears without adding GUI churn during long batch reductions.
+    """
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    calls = []
+    try:
+        monkeypatch.setattr(
+            widget.controls_v2, "set_state",
+            lambda state: calls.append(state),
+        )
+        widget.controls.batchButton.setChecked(True)
+        widget._run_active = True
+
+        widget._refresh_controls_v2_profile_now()
+
+        assert calls == []
+        assert widget._controls_v2_batch_refresh_deferred is True
+
+        widget._exit_run_state()
+
+        assert len(calls) == 1
+        assert widget._controls_v2_batch_refresh_deferred is False
+        assert calls[0].profile is not None
+        assert calls[0].profile.fields
+    finally:
+        widget._run_active = False
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_energy_conflict_reaches_widget_profile(
+        qapp, monkeypatch):
+    """The real widget state now carries both calibration and source energy.
+
+    A mismatch is rendered as a conflict and becomes a run blocker before the
+    legacy gate is retired.
+    """
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.core.energy import wavelength_m_to_energy_eV
+
+    widget = staticWidget()
+    try:
+        widget.scan._persisted_wavelength_m = 1.0e-10
+        widget.scan.source_energy_eV = 15_000.0
+
+        state = widget._controls_v2_state()
+        render_state = build_control_panel_state(
+            state,
+            widget._controls_v2_field_values(),
+            widget._controls_v2_field_choices(),
+        )
+        energy = render_state.profile.fields[FieldId.BEAM_ENERGY]
+
+        assert energy.status is StatusKind.CONFLICT
+        assert "disagree" in energy.reason.lower()
+        assert render_state.profile.can_run is False
+        assert any("energy" in blocker.lower()
+                   for blocker in render_state.profile.run_blockers)
+        assert state.geom.calibration_energy_eV == pytest.approx(
+            wavelength_m_to_energy_eV(1.0e-10), rel=1e-12)
+        assert state.geom.source_energy_eV == pytest.approx(15_000.0)
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_integrator_bridge_uses_binding_table(
+        qapp, monkeypatch):
+    """All V2 integration fields are harvested and written through the single
+    binding table, so adding a future control is a one-row change."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    synced = []
+    try:
+        widget._refresh_controls_v2_profile_now()
+        values = widget._controls_v2_integrator_values()
+        ui = widget.integratorTree.ui
+
+        expected_paths = {
+            spec.path
+            for spec in INTEGRATOR_BACKED_CONTROL_SPECS
+            if getattr(ui, spec.widget_name, None) is not None
+            if not (
+                spec.visible_when == "widget_visible"
+                and not getattr(ui, spec.widget_name).isVisible()
+            )
+        }
+        assert expected_paths <= set(values)
+
+        monkeypatch.setattr(
+            widget,
+            "_sync_controls_v2_integrator_path",
+            lambda path: synced.append(tuple(path)),
+        )
+        for spec in INTEGRATOR_BACKED_CONTROL_SPECS:
+            source_widget = getattr(ui, spec.widget_name, None)
+            if source_widget is None:
+                continue
+            if spec.visible_when == "widget_visible" and not source_widget.isVisible():
+                continue
+            assert widget._set_controls_v2_integrator_field(
+                spec.path,
+                values[spec.path],
+            )
+
+        assert set(synced) == expected_paths
     finally:
         widget.close()
         widget.deleteLater()
