@@ -61,7 +61,7 @@ from .controls_logic import (
     SourceCaps,
     Tool,
     build_control_panel_state,
-    build_native_int_reduction_plan_from_args,
+    build_native_int_reduction_plan_from_scan,
     coerce_control_edit_value,
     tool_from_mode_text,
 )
@@ -757,12 +757,24 @@ class staticWidget(QWidget):
         return choices
 
     def _controls_v2_integrator_values(self):
-        ui = getattr(getattr(self, "integratorTree", None), "ui", None)
-        if ui is None:
+        integrator = getattr(self, "integratorTree", None)
+        ui = getattr(integrator, "ui", None)
+        if integrator is None:
             return {}
 
         values = {}
         for spec in INTEGRATOR_BACKED_CONTROL_SPECS:
+            if spec.parameter_name:
+                param = self._controls_v2_integrator_parameter(spec)
+                if param is None:
+                    continue
+                try:
+                    values[spec.path] = param.value()
+                except Exception:
+                    logger.debug("Controls Panel V2 could not read %s",
+                                 spec.parameter_name, exc_info=True)
+                continue
+
             widget = getattr(ui, spec.widget_name, None)
             if widget is None:
                 continue
@@ -802,8 +814,6 @@ class staticWidget(QWidget):
             try:
                 bai_1d = getattr(scan, "bai_1d_args", {}) or {}
                 bai_2d = getattr(scan, "bai_2d_args", {}) or {}
-                values[("Int1D", "unit")] = bai_1d.get("unit", "q_A^-1")
-                values[("Int2D", "unit")] = bai_2d.get("unit", "q_A^-1")
                 if getattr(scan, "gi", False):
                     values[("Int1D", "gi_mode")] = bai_1d.get(
                         "gi_mode_1d", "q_total")
@@ -826,9 +836,26 @@ class staticWidget(QWidget):
         """
         return widget is not None and not widget.isHidden()
 
+    def _controls_v2_integrator_parameter(self, spec):
+        integrator = getattr(self, "integratorTree", None)
+        if integrator is None or not getattr(spec, "parameter_name", ""):
+            return None
+        tree_name = {
+            "1d": "bai_1d_pars",
+            "2d": "bai_2d_pars",
+        }.get(spec.parameter_group)
+        tree = getattr(integrator, tree_name, None)
+        if tree is None:
+            return None
+        try:
+            return tree.child(spec.parameter_name)
+        except Exception:
+            return None
+
     def _controls_v2_integrator_choices(self):
-        ui = getattr(getattr(self, "integratorTree", None), "ui", None)
-        if ui is None:
+        integrator = getattr(self, "integratorTree", None)
+        ui = getattr(integrator, "ui", None)
+        if integrator is None:
             return {}
 
         def _combo_choices(name):
@@ -840,6 +867,16 @@ class staticWidget(QWidget):
         choices = {}
         for spec in INTEGRATOR_BACKED_CONTROL_SPECS:
             if spec.kind.value != "combo" or not spec.choices_widget:
+                if spec.kind.value == "combo" and spec.parameter_name:
+                    param = self._controls_v2_integrator_parameter(spec)
+                    opts = getattr(param, "opts", {}) or {}
+                    vals = opts.get("limits", None)
+                    if vals is None:
+                        vals = opts.get("values", None)
+                    if isinstance(vals, dict):
+                        choices[spec.path] = tuple(str(v) for v in vals.values())
+                    elif isinstance(vals, (list, tuple, set)):
+                        choices[spec.path] = tuple(str(v) for v in vals)
                 continue
             choices[spec.path] = _combo_choices(spec.choices_widget)
         return {path: vals for path, vals in choices.items() if vals}
@@ -848,8 +885,9 @@ class staticWidget(QWidget):
         path = tuple(path)
         if path not in INTEGRATOR_BACKED_CONTROL_PATHS:
             return False
-        ui = getattr(getattr(self, "integratorTree", None), "ui", None)
-        if ui is None:
+        integrator = getattr(self, "integratorTree", None)
+        ui = getattr(integrator, "ui", None)
+        if integrator is None:
             return True
         spec = next(
             (spec for spec in INTEGRATOR_BACKED_CONTROL_SPECS
@@ -858,8 +896,29 @@ class staticWidget(QWidget):
         )
         if spec is None:
             return True
-        widget = getattr(ui, spec.widget_name, None)
         try:
+            if spec.parameter_name:
+                param = self._controls_v2_integrator_parameter(spec)
+                if param is not None:
+                    current = param.value()
+                    if spec.value_role == "checked":
+                        new_value = bool(
+                            coerce_control_edit_value(current, value)
+                        )
+                    elif spec.value_role == "float":
+                        new_value = float(value)
+                    elif spec.value_role == "current_text":
+                        new_value = str(value)
+                    else:
+                        new_value = coerce_control_edit_value(current, value)
+                    if current != new_value:
+                        param.setValue(new_value)
+                self._sync_controls_v2_integrator_path(path)
+                return True
+
+            if ui is None:
+                return True
+            widget = getattr(ui, spec.widget_name, None)
             if spec.value_role == "current_text":
                 combo = widget
                 if combo is not None:
@@ -1018,13 +1077,6 @@ class staticWidget(QWidget):
         self.integratorTree._apply_gi_config_to_scan()
 
         scan = getattr(self, "scan", None)
-        gi_config = dict(getattr(scan, "gi_config", {}) or {})
-
-        def _gi_value(name, default):
-            value = getattr(scan, name, None)
-            if value is None:
-                value = gi_config.get(name, None)
-            return default if value is None else value
 
         threshold_min = None
         threshold_max = None
@@ -1036,36 +1088,42 @@ class staticWidget(QWidget):
                 threshold_max = cfg.threshold_max
             mask_saturation = bool(cfg.mask_saturation)
 
-        detector_shape = getattr(scan, "detector_shape", None)
-        if detector_shape is not None:
-            try:
-                detector_shape = (int(detector_shape[0]), int(detector_shape[1]))
-            except (TypeError, ValueError, IndexError):
-                detector_shape = None
-        if detector_shape is None:
-            try:
-                first_idx = scan.frames.index[0]
-                first_img = getattr(scan.frames[int(first_idx)], "map_raw", None)
-                detector_shape = getattr(first_img, "shape", None)
-            except Exception:
-                detector_shape = None
-
-        return build_native_int_reduction_plan_from_args(
-            copy.deepcopy(getattr(scan, "bai_1d_args", {}) or {}),
-            copy.deepcopy(getattr(scan, "bai_2d_args", {}) or {}),
-            gi_enabled=bool(getattr(scan, "gi", False)),
-            gi_incident_angle=getattr(scan, "_cached_fiber_integrator_angle", None),
-            incidence_motor=getattr(scan, "incidence_motor", None),
-            tilt_angle=_gi_value("tilt_angle", 0.0),
-            sample_orientation=_gi_value("sample_orientation", 1),
+        return build_native_int_reduction_plan_from_scan(
+            scan,
             integrate_1d=integrate_1d,
             integrate_2d=integrate_2d,
             threshold_min=threshold_min,
             threshold_max=threshold_max,
             mask_saturation=mask_saturation,
-            detector_mask=getattr(scan, "global_mask", None),
-            detector_shape=detector_shape,
         )
+
+    @staticmethod
+    def _controls_v2_native_run_plan_enabled() -> bool:
+        value = os.environ.get("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", "0")
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _controls_v2_native_run_plan_builder(
+        scan,
+        *,
+        integrate_1d: bool = True,
+        integrate_2d: bool = True,
+    ):
+        return build_native_int_reduction_plan_from_scan(
+            scan,
+            integrate_1d=integrate_1d,
+            integrate_2d=integrate_2d,
+        )
+
+    def _configure_controls_v2_native_run_plan(self) -> None:
+        thread = getattr(getattr(self, "wrangler", None), "thread", None)
+        cache = getattr(thread, "_plan_cache", None)
+        if cache is None or not hasattr(cache, "plan_builder"):
+            return
+        if self._controls_v2_enabled() and self._controls_v2_native_run_plan_enabled():
+            cache.plan_builder = self._controls_v2_native_run_plan_builder
+        else:
+            cache.plan_builder = None
 
     def _on_controls_v2_field_changed(self, path, value) -> None:
         self._apply_controls_v2_field_value(path, value)
@@ -3703,6 +3761,7 @@ class staticWidget(QWidget):
         self._apply_controls_v2_run_state()
         self.wrangler.enabled(False)
         self.wrangler.setup()
+        self._configure_controls_v2_native_run_plan()
         self.h5viewer.auto_last = True
 
         # Live (non-batch) runs drive the display from the in-memory

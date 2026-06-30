@@ -23,6 +23,7 @@ from xdart.modules.live import LiveFrame, LiveFrameSeries, LiveScan
 from xdart.modules.live_compat import normalize_live_class_names
 import xdart.modules.reduction as reduction_adapters
 from xdart.modules.reduction import (
+    StandardPlanCache,
     frame_from_live_frame,
     plan_from_live_scan,
     reduce_live_frame,
@@ -493,8 +494,6 @@ def test_plan_uses_detector_shape_for_flat_mask_on_reload() -> None:
 
 
 def test_standard_plan_cache_returns_headless_plan_for_gi_scan() -> None:
-    from xdart.modules.reduction import StandardPlanCache
-
     scan = LiveScan(
         "scan",
         frames=[LiveFrame(idx=0, map_raw=np.ones((2, 2)), scan_info={"th": 0.2})],
@@ -507,6 +506,33 @@ def test_standard_plan_cache_returns_headless_plan_for_gi_scan() -> None:
     assert plan is not None
     assert plan.gi is not None
     assert plan.gi.incidence_motor == "th"
+
+
+def test_standard_plan_cache_can_use_native_builder_override() -> None:
+    scan = LiveScan(
+        "scan",
+        frames=[LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())],
+        bai_1d_args={"numpoints": 10},
+        bai_2d_args={"npt_rad": 11, "npt_azim": 12},
+    )
+    native = ReductionPlan(
+        integration_1d=Integration1DPlan(npt=321),
+        integration_2d=Integration2DPlan(npt_rad=222, npt_azim=111),
+    )
+    calls = []
+
+    def builder(live_scan, *, integrate_1d=True, integrate_2d=True):
+        calls.append((live_scan, integrate_1d, integrate_2d))
+        return native
+
+    cache = StandardPlanCache(plan_builder=builder)
+
+    assert cache.get(scan) is native
+    assert calls == [(scan, True, True)]
+    assert cache.get(scan) is native
+    assert calls == [(scan, True, True)]
+    cache.plan_builder = None
+    assert cache.get(scan) is not native
 
 
 def test_reduce_live_frame_populates_existing_frame(monkeypatch) -> None:

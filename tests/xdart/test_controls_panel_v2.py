@@ -24,6 +24,7 @@ from xdart.gui.tabs.static_scan.controls_logic import (
     FieldId,
     GeomState,
     INTEGRATOR_BACKED_CONTROL_SPECS,
+    INTEGRATION_CONTROL_PATHS,
     MeasMode,
     ProcessingPage,
     ResultCaps,
@@ -34,6 +35,7 @@ from xdart.gui.tabs.static_scan.controls_logic import (
     build_control_panel_state,
     build_control_profile,
     build_native_int_reduction_plan_from_args,
+    build_native_int_reduction_plan_from_scan,
 )
 from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import (
     ControlsPanelV2,
@@ -205,18 +207,35 @@ def _set_legacy_integrator_field(widget, path, value):
     )
 
     spec = next(s for s in INTEGRATOR_BACKED_CONTROL_SPECS if s.path == path)
-    ui = widget.integratorTree.ui
-    editor = getattr(ui, spec.widget_name)
-    if spec.value_role == "current_text":
-        idx = editor.findText(str(value))
-        assert idx >= 0, f"{value!r} not found for {path}"
-        editor.setCurrentIndex(idx)
-    elif spec.value_role == "checked":
-        editor.setChecked(bool(coerce_control_edit_value(editor.isChecked(), value)))
-    elif spec.value_role == "value":
-        editor.setValue(coerce_control_edit_value(editor.value(), value))
+    if spec.parameter_name:
+        tree = getattr(
+            widget.integratorTree,
+            {"1d": "bai_1d_pars", "2d": "bai_2d_pars"}[spec.parameter_group],
+        )
+        param = tree.child(spec.parameter_name)
+        current = param.value()
+        if spec.value_role == "checked":
+            new_value = bool(coerce_control_edit_value(current, value))
+        elif spec.value_role == "float":
+            new_value = float(value)
+        elif spec.value_role == "current_text":
+            new_value = str(value)
+        else:
+            new_value = coerce_control_edit_value(current, value)
+        param.setValue(new_value)
     else:
-        editor.setText("" if value is None else str(value))
+        ui = widget.integratorTree.ui
+        editor = getattr(ui, spec.widget_name)
+        if spec.value_role == "current_text":
+            idx = editor.findText(str(value))
+            assert idx >= 0, f"{value!r} not found for {path}"
+            editor.setCurrentIndex(idx)
+        elif spec.value_role == "checked":
+            editor.setChecked(bool(coerce_control_edit_value(editor.isChecked(), value)))
+        elif spec.value_role == "value":
+            editor.setValue(coerce_control_edit_value(editor.value(), value))
+        else:
+            editor.setText("" if value is None else str(value))
     widget._sync_controls_v2_integrator_path(path)
 
 
@@ -316,6 +335,96 @@ def _reset_controls_v2_gi(*widgets):
 @pytest.fixture(scope="module")
 def qapp():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+
+def test_controls_panel_v2_int_inventory_includes_units_and_advanced_rows():
+    specs = {spec.path: spec for spec in INTEGRATOR_BACKED_CONTROL_SPECS}
+    required = {
+        ("Int1D", "unit"),
+        ("Int2D", "unit"),
+        ("Int1D", "method"),
+        ("Int2D", "method"),
+        ("Int1D", "correctSolidAngle"),
+        ("Int2D", "correctSolidAngle"),
+        ("Int1D", "apply_polarization"),
+        ("Int2D", "apply_polarization"),
+        ("Int1D", "polarization_factor"),
+        ("Int2D", "polarization_factor"),
+        ("Int1D", "dummy"),
+        ("Int2D", "dummy"),
+        ("Int1D", "delta_dummy"),
+        ("Int2D", "delta_dummy"),
+        ("Int1D", "chi_offset"),
+        ("Int2D", "chi_offset"),
+        ("Int1D", "safe"),
+        ("Int2D", "safe"),
+    }
+
+    assert required <= set(specs)
+    assert required <= set(INTEGRATION_CONTROL_PATHS)
+    assert specs[("Int1D", "unit")].widget_name == "unit_1D"
+    assert specs[("Int2D", "unit")].widget_name == "unit_2D"
+    assert specs[("Int1D", "method")].parameter_name == "method"
+    assert specs[("Int2D", "method")].parameter_name == "method"
+
+
+def test_controls_panel_v2_native_int_advanced_rows_write_through_and_match_plan(
+        qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        unit_1d = _combo_text(
+            widget, "unit_1D", lambda text: text.startswith("2"))
+        unit_2d = _combo_text(
+            widget, "unit_2D", lambda text: text.startswith("2"))
+        edits = (
+            (("Int1D", "unit"), unit_1d),
+            (("Int2D", "unit"), unit_2d),
+            (("Int1D", "correctSolidAngle"), False),
+            (("Int2D", "correctSolidAngle"), False),
+            (("Int1D", "apply_polarization"), True),
+            (("Int2D", "apply_polarization"), True),
+            (("Int1D", "polarization_factor"), "0.73"),
+            (("Int2D", "polarization_factor"), "0.81"),
+            (("Int1D", "method"), "BBox"),
+            (("Int2D", "method"), "BBox"),
+            (("Int1D", "dummy"), "-2.0"),
+            (("Int2D", "dummy"), "-3.0"),
+            (("Int1D", "delta_dummy"), "0.25"),
+            (("Int2D", "delta_dummy"), "0.5"),
+            (("Int1D", "chi_offset"), "5.0"),
+            (("Int2D", "chi_offset"), "12.0"),
+            (("Int1D", "safe"), False),
+            (("Int2D", "safe"), False),
+        )
+        _apply_v2_edits(widget, edits)
+
+        a1 = widget.scan.bai_1d_args
+        a2 = widget.scan.bai_2d_args
+        assert a1["unit"] == "2th_deg"
+        assert a2["unit"] == "2th_deg"
+        assert a1["method"] == "BBox"
+        assert a2["method"] == "BBox"
+        assert a1["correctSolidAngle"] is False
+        assert a2["correctSolidAngle"] is False
+        assert a1["polarization_factor"] == pytest.approx(0.73)
+        assert a2["polarization_factor"] == pytest.approx(0.81)
+        assert a1["dummy"] == pytest.approx(-2.0)
+        assert a2["dummy"] == pytest.approx(-3.0)
+        assert a1["delta_dummy"] == pytest.approx(0.25)
+        assert a2["delta_dummy"] == pytest.approx(0.5)
+        assert a1["chi_offset"] == pytest.approx(5.0)
+        assert a2["chi_offset"] == pytest.approx(12.0)
+        assert a1["safe"] is False
+        assert a2["safe"] is False
+        assert _native_plan_snapshot(widget, commit_pending=False) == (
+            _current_plan_snapshot(widget, commit_pending=False)
+        )
+    finally:
+        widget.close()
+        widget.deleteLater()
 
 
 def test_controls_panel_v2_renders_blockers_and_launchers(qapp):
@@ -1280,6 +1389,86 @@ def test_controls_panel_v2_native_plan_preserves_monitor_parity():
     assert snapshot["mask"]["true_count"] == 2
     assert "normalization_factor" not in snapshot["integration_1d"]["extra"]
     assert "normalization_factor" not in snapshot["integration_2d"]["extra"]
+
+
+def test_controls_panel_v2_native_scan_builder_matches_legacy_plan():
+    from xdart.modules.reduction import plan_from_live_scan
+
+    args_1d = {
+        "unit": "2th_deg",
+        "method": "BBox",
+        "numpoints": 321,
+        "radial_range": (1.0, 4.0),
+        "azimuth_range": (60.0, 120.0),
+        "chi_offset": 90.0,
+        "error_model": "poisson",
+        "polarization_factor": 0.8,
+        "correctSolidAngle": False,
+        "dummy": -2.0,
+        "delta_dummy": 0.1,
+        "safe": False,
+    }
+    args_2d = {
+        "unit": "q_A^-1",
+        "method": "csr",
+        "npt_rad": 77,
+        "npt_azim": 88,
+        "radial_range": (0.5, 5.0),
+        "azimuth_range": (-45.0, 45.0),
+        "chi_offset": 12.0,
+        "error_model": "azimuthal",
+        "polarization_factor": 0.9,
+        "correctSolidAngle": True,
+        "dummy": -3.0,
+        "delta_dummy": 0.2,
+        "safe": True,
+    }
+
+    class FakeFrames:
+        index = []
+
+    class FakeScan:
+        skip_2d = False
+        gi = False
+        global_mask = np.array([1, 4])
+        detector_shape = (2, 3)
+        frames = FakeFrames()
+        bai_1d_args = dict(args_1d)
+        bai_2d_args = dict(args_2d)
+
+    assert _plan_snapshot(build_native_int_reduction_plan_from_scan(
+        FakeScan(), integrate_1d=True, integrate_2d=True
+    )) == _plan_snapshot(plan_from_live_scan(
+        FakeScan(), integrate_1d=True, integrate_2d=True
+    ))
+
+
+def test_controls_panel_v2_native_run_plan_gate_configures_wrangler_cache(
+        qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    monkeypatch.setenv("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        cache = widget.wrangler.thread._plan_cache
+        assert cache.plan_builder is None
+        widget._configure_controls_v2_native_run_plan()
+        assert cache.plan_builder is not None
+        scan = widget.scan
+        scan.skip_2d = False
+        scan.bai_1d_args.update({"numpoints": 123, "unit": "q_A^-1"})
+        scan.bai_2d_args.update({"npt_rad": 45, "npt_azim": 67})
+        assert _plan_snapshot(cache.get(scan)) == _plan_snapshot(
+            build_native_int_reduction_plan_from_scan(scan)
+        )
+
+        monkeypatch.setenv("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", "0")
+        widget._configure_controls_v2_native_run_plan()
+        assert cache.plan_builder is None
+    finally:
+        widget.close()
+        widget.deleteLater()
 
 
 def test_controls_panel_v2_integrator_session_roundtrip_hydrates_visible_rows(

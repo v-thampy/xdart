@@ -879,10 +879,12 @@ A follow-on review raised five items; resolution:
 ### 14.6 Finish plan after merge with `feature/geometry` (2026-06-30)
 
 The current branch state is intentionally transitional: V2 is the visible panel and
-basic Int rows are native widgets, but production Int runs are still legacy-backed.
-The hidden legacy carrier remains authoritative for run, reintegrate, save/session
-restore, and NeXus reload paths. The dormant native plan builder is proven at parity
-but is not yet the production source.
+the Int 1D/2D rows now have a complete native typed inventory (including units and
+Advanced integration fields) with immediate write-through to the hidden legacy
+carrier. Production Int paths are still legacy-backed by default; the first Wave-2
+run-plan seam is available behind `XDART_CONTROLS_V2_NATIVE_RUN_PLAN=1`, where the
+run worker's plan cache uses the native scan-based builder. Reintegrate,
+save/session restore, and NeXus reload paths still read the legacy carrier.
 
 **V1-critical scope.** Finishing Panel V2 means completing the Int carrier migration:
 native Int state becomes the source of the reduction plan, the legacy Int widget and
@@ -892,6 +894,10 @@ display mirrors (`data_1d`/`data_2d`) or finishing Stitch/RSM/Source/Experiment
 producer redesigns; those remain separate follow-on slices.
 
 **Wave 1 — freeze the native Int state inventory.**
+Status: **LANDED on cp2 (2026-06-30)**. `INTEGRATOR_BACKED_CONTROL_SPECS` is now
+the single typed inventory for GI, Mask, Int 1D/2D visible rows, unit_1D/unit_2D,
+and Advanced ParameterTree-backed fields. Rendering, harvesting, choices,
+write-through, and membership derive from that table.
 - Add the remaining native Int fields that still live only in the embedded legacy
   carrier: unit_1D/unit_2D, method, error model, polarization/solid-angle/dummy
   handling, chi offset, and any still-used advanced fields.
@@ -903,6 +909,11 @@ producer redesigns; those remain separate follow-on slices.
   same path set; standard/GI mode-gating is covered by tests.
 
 **Wave 2 — make the native Int builder production-ready behind a safety flag.**
+Status: **STARTED on cp2 (2026-06-30)**. A Qt-free
+`build_native_int_reduction_plan_from_scan` now feeds the optional
+`StandardPlanCache.plan_builder`; Controls V2 installs it for run paths only when
+`XDART_CONTROLS_V2_NATIVE_RUN_PLAN=1`. Legacy remains the default fallback while
+the offscreen matrix and live checkpoint are expanded.
 - Route one path at a time through `build_native_int_reduction_plan_from_args`:
   batch/live run, single-frame reintegrate, full reintegrate, session save/restore,
   and reload hydration.
