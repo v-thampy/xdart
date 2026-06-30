@@ -6,7 +6,6 @@
 # Standard library imports
 import logging
 import os
-import shlex
 import sys
 import subprocess
 
@@ -1837,24 +1836,41 @@ class integratorTree(QtWidgets.QWidget):
 
         outfile = os.path.splitext(processFile)[0] + "-mask.edf"
         prev_mtime = os.path.getmtime(outfile) if os.path.exists(outfile) else None
-        # Run pyFAI-drawmask as a SUBPROCESS, launched the SAME WAY
-        # run_pyfai_calib launches calib2: shell + piped stdout.  Embedding
-        # silx's MaskImageWidget in xdart's running Qt process SIGTRAPs on
-        # macOS; and a plain list-form subprocess launches but leaves the silx
-        # mask canvas unable to receive mouse events (frozen plot) because the
-        # child shares xdart's controlling-terminal stdout.  Piping stdout (as
-        # calib2 does) detaches it from the TTY and the editor stays fully
-        # interactive.
-        subprocess.run(
-            f'pyFAI-drawmask {shlex.quote(processFile)}',
-            check=False, shell=True,
-            stdout=subprocess.PIPE, universal_newlines=True,
-        )
-        # "Save mask and quit" writes <image>-mask.edf -> auto-populate the Mask
-        # File field (preserving the old maskSaved behavior).  Guard on mtime so
-        # a pre-existing mask the user did NOT re-save does not fire.
-        if os.path.exists(outfile) and os.path.getmtime(outfile) != prev_mtime:
-            self.sigMaskCreated.emit(outfile)
+        # Launch pyFAI-drawmask FULLY DETACHED and NON-BLOCKING.  Embedding
+        # silx's MaskImageWidget in xdart's Qt process SIGTRAPs on macOS; and a
+        # BLOCKING subprocess.run (even shell+piped) freezes the editor's silx
+        # canvas because it stalls xdart's main thread / run loop the whole time
+        # the child is up.  Start it in its OWN session (own process group,
+        # severed from xdart's controlling terminal) with null stdio and DO NOT
+        # block — as close to a standalone terminal launch as possible — then
+        # poll for the editor to close and auto-populate the Mask File field.
+        try:
+            proc = subprocess.Popen(
+                ['pyFAI-drawmask', processFile],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            logger.error('pyFAI-drawmask not found on PATH')
+            return
+
+        # Non-blocking watch: when the editor exits, emit sigMaskCreated if it
+        # wrote a fresh <image>-mask.edf (mtime guard so a pre-existing mask the
+        # user did NOT re-save does not fire).  Keep a ref so the timer lives.
+        watch = QtCore.QTimer(self)
+
+        def _drawmask_done():
+            if proc.poll() is None:
+                return
+            watch.stop()
+            if os.path.exists(outfile) and os.path.getmtime(outfile) != prev_mtime:
+                self.sigMaskCreated.emit(outfile)
+
+        watch.timeout.connect(_drawmask_done)
+        watch.start(500)
+        self._drawmask_watch = watch
 
         # mask = self.mask_window.getSelectionMask()
         # postProcessId21([processFile], mask)
