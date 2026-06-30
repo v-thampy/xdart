@@ -120,6 +120,11 @@ def _trace_name(publication, widget=None) -> str:
     scan = getattr(widget, "scan", None)
     scan_name = getattr(scan, "name", "")
     if scan_name and scan_name != "null_main":
+        # An averaged series collapses to one frame; its legend is the bare
+        # series name (no per-frame index suffix), matching the display title and
+        # the legacy build_plot_names.
+        if getattr(scan, "series_average", False):
+            return scan_name
         return f"{scan_name}_{publication.label}"
     source = (
         publication.metadata_raw.get("source_file")
