@@ -11,9 +11,6 @@ import subprocess
 
 logger = logging.getLogger(__name__)
 
-import fabio
-from xdart.utils.pyFAI_binaries import pyFAI_drawmask_main, get_MaskImageWidgetXdart
-
 # Qt imports
 import pyqtgraph as pg
 from typing import TYPE_CHECKING, Any
@@ -1837,17 +1834,21 @@ class integratorTree(QtWidgets.QWidget):
             logger.info('No image chosen for mask creation')
             return
 
-        MaskWidgetClass = get_MaskImageWidgetXdart()
-        self.mask_window = MaskWidgetClass()
-        self.mask_window.setWindowModality(QtCore.Qt.WindowModal)
-        # Re-emit upward so staticWidget can auto-populate the Mask File field
-        # once the user saves + closes the editor.
-        self.mask_window.maskSaved.connect(self.sigMaskCreated)
-        self.mask_window.show()
-
-        image = fabio.open(processFile).data
-        pyFAI_drawmask_main(self.mask_window, image, processFile)
-        # pyFAI_drawmask_main(self.mask_window, processFile)
+        outfile = os.path.splitext(processFile)[0] + "-mask.edf"
+        prev_mtime = os.path.getmtime(outfile) if os.path.exists(outfile) else None
+        # Run pyFAI-drawmask as a SUBPROCESS (same pattern as run_pyfai_calib
+        # above).  Embedding silx's MaskImageWidget in xdart's running Qt
+        # process SIGTRAPs on macOS; the standalone tool is rock-solid.
+        try:
+            subprocess.run(['pyFAI-drawmask', processFile], check=False)
+        except FileNotFoundError:
+            logger.error('pyFAI-drawmask not found on PATH')
+            return
+        # "Save mask and quit" writes <image>-mask.edf -> auto-populate the Mask
+        # File field (preserving the old maskSaved behavior).  Guard on mtime so
+        # a pre-existing mask the user did NOT re-save does not fire.
+        if os.path.exists(outfile) and os.path.getmtime(outfile) != prev_mtime:
+            self.sigMaskCreated.emit(outfile)
 
         # mask = self.mask_window.getSelectionMask()
         # postProcessId21([processFile], mask)
