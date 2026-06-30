@@ -1036,6 +1036,20 @@ class staticWidget(QWidget):
                 threshold_max = cfg.threshold_max
             mask_saturation = bool(cfg.mask_saturation)
 
+        detector_shape = getattr(scan, "detector_shape", None)
+        if detector_shape is not None:
+            try:
+                detector_shape = (int(detector_shape[0]), int(detector_shape[1]))
+            except (TypeError, ValueError, IndexError):
+                detector_shape = None
+        if detector_shape is None:
+            try:
+                first_idx = scan.frames.index[0]
+                first_img = getattr(scan.frames[int(first_idx)], "map_raw", None)
+                detector_shape = getattr(first_img, "shape", None)
+            except Exception:
+                detector_shape = None
+
         return build_native_int_reduction_plan_from_args(
             copy.deepcopy(getattr(scan, "bai_1d_args", {}) or {}),
             copy.deepcopy(getattr(scan, "bai_2d_args", {}) or {}),
@@ -1049,6 +1063,8 @@ class staticWidget(QWidget):
             threshold_min=threshold_min,
             threshold_max=threshold_max,
             mask_saturation=mask_saturation,
+            detector_mask=getattr(scan, "global_mask", None),
+            detector_shape=detector_shape,
         )
 
     def _on_controls_v2_field_changed(self, path, value) -> None:

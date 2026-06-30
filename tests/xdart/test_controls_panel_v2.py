@@ -5,6 +5,7 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import numpy as np
 import pytest
 
 pytest.importorskip("pyqtgraph")
@@ -122,6 +123,23 @@ def _plan_snapshot(plan):
             return None
         return {name: _plain(getattr(obj, name)) for name in attrs}
 
+    def _mask(mask):
+        if mask is None:
+            return None
+        values = getattr(mask, "values", mask)
+        arr = np.asarray(values)
+        return {
+            "kind": type(mask).__name__,
+            "shape": tuple(arr.shape),
+            "dtype": str(arr.dtype),
+            "values": tuple(arr.ravel().tolist()) if arr.size <= 20 else None,
+            "true_count": (
+                int(arr.astype(bool, copy=False).sum())
+                if arr.dtype == bool
+                else None
+            ),
+        }
+
     return {
         "integration_1d": _snap(plan.integration_1d, (
             "npt",
@@ -158,7 +176,7 @@ def _plan_snapshot(plan):
             "mode_2d",
             "npt_oop",
         )),
-        "mask_kind": type(plan.mask).__name__ if plan.mask is not None else None,
+        "mask": _mask(plan.mask),
         "threshold_min": _plain(plan.threshold_min),
         "threshold_max": _plain(plan.threshold_max),
         "mask_saturation": _plain(plan.mask_saturation),
@@ -213,6 +231,7 @@ def _apply_legacy_edits(widget, edits):
 
 
 def _current_plan_snapshot(widget, *, include_threshold=True,
+                           integrate_1d=True, integrate_2d=True,
                            commit_pending=True):
     from xdart.modules.reduction import (
         apply_threshold_saturation_to_plan,
@@ -223,7 +242,11 @@ def _current_plan_snapshot(widget, *, include_threshold=True,
         widget._commit_controls_v2_pending_edits()
     widget._sync_controls_v2_integrator_args()
     widget.integratorTree._apply_gi_config_to_scan()
-    plan = plan_from_live_scan(widget.scan, integrate_2d=True)
+    plan = plan_from_live_scan(
+        widget.scan,
+        integrate_1d=integrate_1d,
+        integrate_2d=integrate_2d,
+    )
     if include_threshold:
         plan = apply_threshold_saturation_to_plan(
             plan,
@@ -233,11 +256,12 @@ def _current_plan_snapshot(widget, *, include_threshold=True,
 
 
 def _native_plan_snapshot(widget, *, include_threshold=True,
+                          integrate_1d=True, integrate_2d=True,
                           commit_pending=True):
     plan = widget._controls_v2_native_reduction_plan(
         include_threshold=include_threshold,
-        integrate_1d=True,
-        integrate_2d=True,
+        integrate_1d=integrate_1d,
+        integrate_2d=integrate_2d,
         commit_pending=commit_pending,
     )
     return _plan_snapshot(plan)
@@ -1151,6 +1175,51 @@ def test_controls_panel_v2_threshold_edits_match_legacy_plan_overlay(
         legacy_widget.deleteLater()
 
 
+@pytest.mark.parametrize(
+    ("integrate_1d", "integrate_2d"),
+    (
+        (True, False),
+        (False, True),
+        (True, True),
+    ),
+)
+def test_controls_panel_v2_native_plan_matches_legacy_output_modes(
+        qapp, monkeypatch, integrate_1d, integrate_2d):
+    """The native plan seam must preserve one-output and both-output runs."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        edits = (
+            (("Int1D", "points"), "345"),
+            (("Int1D", "radial_auto"), False),
+            (("Int1D", "radial_low"), "0.2"),
+            (("Int1D", "radial_high"), "4.8"),
+            (("Int2D", "radial_points"), "123"),
+            (("Int2D", "azim_points"), "77"),
+            (("Int2D", "radial_auto"), False),
+            (("Int2D", "radial_low"), "0.3"),
+            (("Int2D", "radial_high"), "4.7"),
+        )
+        _apply_v2_edits(widget, edits)
+
+        assert _native_plan_snapshot(
+            widget,
+            integrate_1d=integrate_1d,
+            integrate_2d=integrate_2d,
+            commit_pending=False,
+        ) == _current_plan_snapshot(
+            widget,
+            integrate_1d=integrate_1d,
+            integrate_2d=integrate_2d,
+            commit_pending=False,
+        )
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
 def test_controls_panel_v2_native_plan_preserves_monitor_parity():
     from xdart.modules.reduction import plan_from_live_scan
 
@@ -1185,8 +1254,8 @@ def test_controls_panel_v2_native_plan_preserves_monitor_parity():
     class FakeScan:
         skip_2d = False
         gi = False
-        global_mask = None
-        detector_shape = None
+        global_mask = np.array([1, 4])
+        detector_shape = (2, 3)
         frames = FakeFrames()
         bai_1d_args = dict(args_1d)
         bai_2d_args = dict(args_2d)
@@ -1198,12 +1267,17 @@ def test_controls_panel_v2_native_plan_preserves_monitor_parity():
         gi_enabled=False,
         integrate_1d=True,
         integrate_2d=True,
+        detector_mask=FakeScan.global_mask,
+        detector_shape=FakeScan.detector_shape,
     )
 
     assert _plan_snapshot(native) == _plan_snapshot(legacy)
     snapshot = _plan_snapshot(native)
     assert snapshot["integration_1d"]["monitor_key"] == "I0"
     assert snapshot["integration_2d"]["monitor_key"] == "mon"
+    assert snapshot["mask"]["kind"] == "ndarray"
+    assert snapshot["mask"]["shape"] == (2, 3)
+    assert snapshot["mask"]["true_count"] == 2
     assert "normalization_factor" not in snapshot["integration_1d"]["extra"]
     assert "normalization_factor" not in snapshot["integration_2d"]["extra"]
 

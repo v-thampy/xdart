@@ -769,6 +769,8 @@ def build_native_int_reduction_plan_from_args(
     threshold_min: Any = None,
     threshold_max: Any = None,
     mask_saturation: bool = False,
+    detector_mask: Any = None,
+    detector_shape: tuple[int, int] | None = None,
 ):
     """Build the native Controls V2 Int reduction plan.
 
@@ -784,6 +786,7 @@ def build_native_int_reduction_plan_from_args(
         Integration2DPlan,
         ReductionPlan,
     )
+    from xdart.modules.reduction import _mask_for_plan  # lazy, Qt-free legacy parity
 
     args_1d = dict(bai_1d_args or {})
     args_2d = dict(bai_2d_args or {})
@@ -895,6 +898,7 @@ def build_native_int_reduction_plan_from_args(
         integration_1d=integration_1d,
         integration_2d=integration_2d,
         gi=gi,
+        mask=_mask_for_plan(detector_mask, detector_shape),
         threshold_min=threshold_min,
         threshold_max=threshold_max,
         mask_saturation=bool(mask_saturation),
@@ -1201,6 +1205,8 @@ def _processing_backend_status_reason(
 
     required = backend_required_for(state)
     if not state.backend:
+        if required:
+            return StatusKind.MISSING, f"Select backend {required}."
         return StatusKind.DEFERRED, ""
     if required and state.backend != required:
         return (

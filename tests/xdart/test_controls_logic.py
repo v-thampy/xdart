@@ -97,6 +97,20 @@ def test_gi_stitch_and_rsm_controls_are_ready_but_blocked_until_gates():
     assert not gi_stitch.run_enabled
     assert "GI stitching awaits real-data gate." in gi_stitch.run_blockers
 
+    gi_stitch_gate_passed_without_backend = build_control_profile(
+        ControlState(
+            tool=Tool.STITCH,
+            mode=MeasMode.GI,
+            real_data_gates=frozenset({"gi_stitch_real_data"}),
+            **common,
+        )
+    )
+    assert not gi_stitch_gate_passed_without_backend.run_enabled
+    assert (
+        "Select backend pyfai_hist."
+        in gi_stitch_gate_passed_without_backend.run_blockers
+    )
+
     rsm = build_control_profile(
         ControlState(tool=Tool.RSM, mode=MeasMode.STANDARD, **common))
     assert rsm.valid_modes == frozenset()
