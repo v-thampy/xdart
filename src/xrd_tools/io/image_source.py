@@ -276,7 +276,8 @@ def _read_thumbnail_direct(path, frame) -> "np.ndarray | None":
         return None
 
 
-def load_processed_raw_or_thumbnail(path, frame, *, source_root=None) -> RawFrameResult:
+def load_processed_raw_or_thumbnail(path, frame, *, source_root=None,
+                                    strict=None) -> RawFrameResult:
     """For a processed ``.nxs``: return the full-resolution raw image for a
     frame **label** if the per-frame source master resolves, else the
     dequantized thumbnail, else nothing — recording which in ``source``.
@@ -284,9 +285,21 @@ def load_processed_raw_or_thumbnail(path, frame, *, source_root=None) -> RawFram
     Mirrors (and replaces) the GUI's strict-raw → thumbnail → direct-read
     fallback chain.  ``source_root`` (N1) repoints relative source paths at a
     moved data tree (overrides the stored ``@source_base``).
+
+    ``strict`` (:class:`~xrd_tools.core.strictness.StrictPolicy`) gates the
+    thumbnail substitution.  ``None`` (default) = **graceful**: this is the
+    DISPLAY API — it keeps the legacy raw → thumbnail → direct-read chain that
+    the GUI viewer relies on.  Pass ``StrictPolicy.loud()`` to RAISE the
+    underlying strict-raw error instead of substituting a lower-res thumbnail
+    (an analysis caller that must have the genuine full-res raw).  Note the
+    headless FrameSource raw path is strict by a different mechanism — it calls
+    ``get_raw_frame(allow_thumbnail=False)`` directly and is untouched here.
     """
     from xrd_tools.io.read import get_raw_frame
+    from xrd_tools.core.strictness import StrictPolicy
 
+    if strict is None:
+        strict = StrictPolicy.graceful()
     frame = int(frame)
     # Strict raw first (no thumbnail) so we know it's genuinely full-res.
     try:
@@ -294,6 +307,10 @@ def load_processed_raw_or_thumbnail(path, frame, *, source_root=None) -> RawFram
         return RawFrameResult(image=np.asarray(img, dtype=float),
                               source="raw", frame=frame)
     except Exception:
+        if strict.thumbnail_fallback:
+            # D7 loud: surface the missing full-res raw (with read.py's
+            # strict-raw message) rather than substituting a thumbnail.
+            raise
         logger.debug("load_processed_raw_or_thumbnail: no raw master for "
                      "frame %s of %s; trying thumbnail", frame, path,
                      exc_info=True)

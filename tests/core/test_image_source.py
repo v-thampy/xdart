@@ -12,6 +12,7 @@ import h5py
 import numpy as np
 import pytest
 
+from xrd_tools.core.strictness import StrictPolicy
 from xrd_tools.io import (
     ImageSourceKind,
     classify_image_source,
@@ -197,6 +198,21 @@ def test_load_processed_direct_thumbnail_when_get_raw_frame_errors(
     res = load_processed_raw_or_thumbnail(nxs, 0)
     assert res.source == "thumbnail"
     np.testing.assert_allclose(res.image, thumb, atol=1.0)
+
+
+def test_strict_thumbnail_fallback_loud_raises_graceful_degrades(thumbnail_only):
+    """D7: the display reader's thumbnail fallback is opt-OUT via StrictPolicy.
+    The DEFAULT is graceful (this display API keeps the raw→thumbnail fallback
+    the GUI viewer relies on); an explicit ``StrictPolicy.loud()`` raises the
+    strict-raw error instead of substituting a lower-res thumbnail."""
+    nxs, _thumb = thumbnail_only
+    # explicit loud: raise rather than substitute a thumbnail
+    with pytest.raises(KeyError):
+        load_processed_raw_or_thumbnail(nxs, 0, strict=StrictPolicy.loud())
+    # graceful AND the default degrade to the thumbnail
+    res = load_processed_raw_or_thumbnail(nxs, 0, strict=StrictPolicy.graceful())
+    assert res.source == "thumbnail"
+    assert load_processed_raw_or_thumbnail(nxs, 0).source == "thumbnail"  # default
 
 
 # ── frame_labels are the displayable frames-group labels (guard a/b) ───
