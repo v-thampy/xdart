@@ -1020,11 +1020,11 @@ def test_controls_panel_v2_refresh_defers_while_line_editor_focused(qapp, monkey
         widget.deleteLater()
 
 
-def test_controls_panel_v2_batch_refreshes_once_after_run(qapp, monkeypatch):
-    """Batch runs should not rebuild the V2 controls panel every progress tick.
+def test_controls_panel_v2_active_run_refreshes_once_after_run(qapp, monkeypatch):
+    """Active non-viewer runs should not rebuild V2 controls every progress tick.
 
     The profile is refreshed once the run exits, so the final state still
-    appears without adding GUI churn during long batch reductions.
+    appears without adding GUI churn during live/append reductions.
     """
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -1036,7 +1036,7 @@ def test_controls_panel_v2_batch_refreshes_once_after_run(qapp, monkeypatch):
             widget.controls_v2, "set_state",
             lambda state: calls.append(state),
         )
-        widget.controls.batchButton.setChecked(True)
+        widget.controls.batchButton.setChecked(False)
         widget._run_active = True
 
         widget._refresh_controls_v2_profile_now()
@@ -1551,7 +1551,7 @@ def test_controls_panel_v2_native_gi_plan_defaults_orientation_to_4():
     assert scan_plan.gi.sample_orientation == 4
 
 
-def test_controls_panel_v2_native_run_plan_gate_configures_wrangler_cache(
+def test_controls_panel_v2_native_run_plan_gate_configures_plan_caches(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     monkeypatch.setenv("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", "1")
@@ -1560,9 +1560,12 @@ def test_controls_panel_v2_native_run_plan_gate_configures_wrangler_cache(
     widget = staticWidget()
     try:
         cache = widget.wrangler.thread._plan_cache
+        reint_cache = widget.integratorTree.integrator_thread._plan_cache
         assert cache.plan_builder is None
+        assert reint_cache.plan_builder is not None
         widget._configure_controls_v2_native_run_plan()
         assert cache.plan_builder is not None
+        assert reint_cache.plan_builder is not None
         scan = widget.scan
         scan.skip_2d = False
         scan.bai_1d_args.update({"numpoints": 123, "unit": "q_A^-1"})
@@ -1574,6 +1577,91 @@ def test_controls_panel_v2_native_run_plan_gate_configures_wrangler_cache(
         monkeypatch.setenv("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", "0")
         widget._configure_controls_v2_native_run_plan()
         assert cache.plan_builder is None
+        assert reint_cache.plan_builder is None
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_native_reintegrate_plan_matches_legacy(
+        qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    monkeypatch.setenv("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        _apply_v2_edits(
+            widget,
+            (
+                (("Int1D", "points"), "321"),
+                (("Int1D", "radial_auto"), False),
+                (("Int1D", "radial_low"), "0.1"),
+                (("Int1D", "radial_high"), "4.2"),
+                (("Int1D", "azim_auto"), False),
+                (("Int1D", "azim_low"), "-50"),
+                (("Int1D", "azim_high"), "60"),
+                (("Int2D", "radial_points"), "77"),
+                (("Int2D", "azim_points"), "88"),
+                (("Int2D", "radial_auto"), False),
+                (("Int2D", "radial_low"), "0.2"),
+                (("Int2D", "radial_high"), "5.3"),
+                (("Int2D", "azim_auto"), False),
+                (("Int2D", "azim_low"), "-45"),
+                (("Int2D", "azim_high"), "45"),
+                (("Mask", "Threshold"), True),
+                (("Mask", "min"), "3"),
+                (("Mask", "max"), "999"),
+                (("MaskSat", "mask_sentinel"), False),
+            ),
+        )
+        widget._sync_controls_v2_integrator_args()
+
+        thread = widget.integratorTree.integrator_thread
+        thread.threshold_config = widget.integratorTree.get_threshold_config()
+        cache = thread._plan_cache
+        cache.plan_builder = None
+        legacy_1d = _plan_snapshot(thread._plan_for_reintegration(integrate_2d=False))
+        cache.invalidate()
+        legacy_2d = _plan_snapshot(thread._plan_for_reintegration(integrate_2d=True))
+
+        widget._configure_controls_v2_native_run_plan()
+        assert cache.plan_builder is not None
+        native_2d = _plan_snapshot(thread._plan_for_reintegration(integrate_2d=True))
+        cache.invalidate()
+        native_1d = _plan_snapshot(thread._plan_for_reintegration(integrate_2d=False))
+
+        assert native_1d == legacy_1d
+        assert native_2d == legacy_2d
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_reintegrate_action_installs_native_builder(
+        qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    monkeypatch.setenv("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    class FakeButton:
+        def __init__(self):
+            self.clicked = False
+
+        def click(self):
+            self.clicked = True
+
+    widget = staticWidget()
+    fake = FakeButton()
+    try:
+        cache = widget.integratorTree.integrator_thread._plan_cache
+        cache.plan_builder = None
+        monkeypatch.setattr(widget.integratorTree.ui, "reintegrate1D", fake)
+
+        widget._controls_v2_click_integrator_button("reintegrate1D")
+
+        assert fake.clicked is True
+        assert cache.plan_builder is not None
     finally:
         widget.close()
         widget.deleteLater()
@@ -1655,6 +1743,86 @@ def test_controls_panel_v2_integrator_session_roundtrip_hydrates_visible_rows(
         restored.close()
         edited.deleteLater()
         restored.deleteLater()
+
+
+def test_controls_panel_v2_native_int_session_roundtrip_feeds_native_plan(
+        qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    monkeypatch.setenv("XDART_CONTROLS_V2_NATIVE_RUN_PLAN", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xdart.utils.session import save_session
+
+    edited = staticWidget()
+    restored = None
+    try:
+        _apply_v2_edits(
+            edited,
+            (
+                (("Int1D", "points"), "246"),
+                (("Int1D", "radial_auto"), False),
+                (("Int1D", "radial_low"), "0.4"),
+                (("Int1D", "radial_high"), "3.9"),
+                (("Int1D", "azim_auto"), False),
+                (("Int1D", "azim_low"), "-80"),
+                (("Int1D", "azim_high"), "70"),
+                (("Int1D", "method"), "BBox"),
+                (("Int1D", "apply_polarization"), True),
+                (("Int1D", "polarization_factor"), "0.42"),
+                (("Int2D", "radial_points"), "55"),
+                (("Int2D", "azim_points"), "66"),
+                (("Int2D", "radial_auto"), False),
+                (("Int2D", "radial_low"), "0.5"),
+                (("Int2D", "radial_high"), "4.4"),
+                (("Int2D", "azim_auto"), False),
+                (("Int2D", "azim_low"), "-45"),
+                (("Int2D", "azim_high"), "45"),
+                (("Int2D", "method"), "BBox"),
+                (("Int2D", "apply_polarization"), True),
+                (("Int2D", "polarization_factor"), "0.24"),
+                (("Mask", "Threshold"), True),
+                (("Mask", "min"), "11"),
+                (("Mask", "max"), "900"),
+                (("MaskSat", "mask_sentinel"), False),
+            ),
+        )
+        before = _native_plan_snapshot(edited)
+
+        edited.close()
+        edited.deleteLater()
+        edited = None
+
+        # The native Controls V2 blob should win over a stale legacy bridge.
+        save_session({
+            "integrator": {
+                "ui": {
+                    "npts_1D": "999",
+                    "npts_radial_2D": "998",
+                    "threshold_min": "1",
+                },
+                "advanced": None,
+            }
+        })
+
+        restored = staticWidget()
+        after = _native_plan_snapshot(restored)
+
+        assert after == before
+        assert restored.scan.bai_1d_args["numpoints"] == 246
+        assert restored.scan.bai_2d_args["npt_rad"] == 55
+        assert restored.integratorTree.ui.npts_1D.text() == "246"
+        assert restored.integratorTree.ui.npts_radial_2D.text() == "55"
+        cfg = restored.integratorTree.get_threshold_config()
+        assert cfg.apply_threshold is True
+        assert cfg.threshold_min == pytest.approx(11)
+        assert cfg.threshold_max == pytest.approx(900)
+        assert cfg.mask_saturation is False
+    finally:
+        if edited is not None:
+            edited.close()
+            edited.deleteLater()
+        if restored is not None:
+            restored.close()
+            restored.deleteLater()
 
 
 def test_controls_panel_v2_threshold_edits_update_integrator_and_carrier(qapp, monkeypatch):
