@@ -16,6 +16,7 @@ via `CompositeFrameSource`) shows only for stitch/RSM.
 """
 
 import logging
+import re
 from dataclasses import dataclass
 from concurrent.futures import CancelledError, ThreadPoolExecutor
 from pathlib import Path
@@ -76,6 +77,9 @@ class ScanSourceWidget(QtWidgets.QWidget):
         row1 = QtWidgets.QHBoxLayout()
         row1.setSpacing(6)
         self.dir_check = QtWidgets.QCheckBox("Folder")
+        # Reserve room for the full label (it was clipping to "Folde" on macOS).
+        self.dir_check.setMinimumWidth(
+            self.dir_check.fontMetrics().horizontalAdvance("Folder") + 30)
         self.dir_check.setToolTip(
             "Directory mode: pick a folder + a scan kind; the folder is walked "
             "for matching scans")
@@ -134,15 +138,13 @@ class ScanSourceWidget(QtWidgets.QWidget):
         self.raw_dot = QtWidgets.QLabel("○ no raw")
         self.raw_dot.setToolTip("Whether raw frames are reachable (gates ROI)")
         row3.addWidget(self.raw_dot)
-        lay.addWidget(self.images_row)
-
-        # Row 4: advanced raw-read params (collapsible).
+        # Raw-params toggle shares the images row (its params expand below).
         self.adv_btn = QtWidgets.QPushButton("Raw params ▾")
         self.adv_btn.setCheckable(True)
-        adv_row = QtWidgets.QHBoxLayout()
-        adv_row.addWidget(self.adv_btn)
-        adv_row.addStretch(1)
-        lay.addLayout(adv_row)
+        row3.addWidget(self.adv_btn)
+        lay.addWidget(self.images_row)
+
+        # Collapsible advanced raw-read params (expand below the row).
         self.adv_box = QtWidgets.QWidget()
         self.adv_box.setVisible(False)
         adv = QtWidgets.QHBoxLayout(self.adv_box)
@@ -240,7 +242,10 @@ class ScanSourceWidget(QtWidgets.QWidget):
             else:
                 kind = guess_source_kind(path)
                 specs = self._file_candidates(path, kind, SourceKind, SourceSpec)
-                self.kind_label.setText(kind.value if hasattr(kind, "value") else str(kind))
+                # Show the RESOLVED kind (a picked TIFF resolves to a series), so
+                # it's clear when one file pulls in the whole scan's frames.
+                shown = specs[0].kind if specs else kind
+                self.kind_label.setText(shown.value if hasattr(shown, "value") else str(shown))
         except Exception:
             logger.exception("scan-source: could not enumerate scans for %s", path)
             specs = []
@@ -256,8 +261,14 @@ class ScanSourceWidget(QtWidgets.QWidget):
                     for s in scans] or [SourceSpec(path, SourceKind.SPEC)]
         if (kind is SourceKind.IMAGE_FILE
                 and Path(path).suffix.lower() in _TIFF_SUFFIXES):
-            # a picked TIFF is the first of a folder series (sidecars → metadata)
-            return [SourceSpec(Path(path).parent, SourceKind.TIFF_SERIES)]
+            # A picked TIFF means THIS scan's series (sidecars → metadata), not
+            # the whole folder — which may hold several scans.  Filter the folder
+            # glob to the picked file's scan stem = its name minus a trailing
+            # _<frame number>; with no such suffix, fall back to the whole folder.
+            p = Path(path)
+            m = re.match(r"(.*?_)\d+$", p.stem)
+            options = {"pattern": f"{m.group(1)}*"} if m else {}
+            return [SourceSpec(p.parent, SourceKind.TIFF_SERIES, options=options)]
         if kind in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER,
                     SourceKind.PROCESSED_NEXUS):
             from xrd_tools.io.nexus import list_entries

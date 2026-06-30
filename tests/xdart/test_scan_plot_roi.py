@@ -624,3 +624,159 @@ def test_scan_plot_skips_all_nan_series_without_pyqtgraph_warning(qapp):
         assert len(dlg.plot.getPlotItem().listDataItems()) == 0
     finally:
         dlg.close()
+
+
+# ---- §10 refinements: axis defaults, log, styling, viewer parity, Esc -------
+
+def test_scan_plot_default_y_priority_counter(qapp):
+    """10.2: default Y is the first present of the counter priority list
+    (Photod>bs>mon>i2>i1>i0), and an ROI counter is never auto-selected (10.1)."""
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    dlg = ScanPlotDialog()
+    try:
+        n = 5
+        table = {
+            "frame_index": np.arange(n, dtype=float),
+            "ROI1": np.linspace(1, 2, n),       # beamline counter — must NOT win
+            "i0": np.full(n, 3.0),
+            "i1": np.full(n, 4.0),
+            "mon": np.full(n, 5.0),
+            "samz": np.linspace(0, 4, n),       # the scanned positioner
+        }
+        dlg._positioner_names = ["samz"]
+        dlg.set_table("s", table)
+        assert dlg._checked_y() == ["mon"]      # mon precedes i1/i0; ROI1 excluded
+        assert dlg.x_combo.currentText() == "samz"
+    finally:
+        dlg.close()
+
+
+def test_scan_plot_default_y_never_roi(qapp):
+    """10.1: with only ROI columns present (no priority counter), default Y falls
+    back to frame_index — never an ROI column."""
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    dlg = ScanPlotDialog()
+    try:
+        n = 5
+        table = {
+            "frame_index": np.arange(n, dtype=float),
+            "ROI1": np.linspace(1, 2, n),
+            "ROI2": np.linspace(2, 3, n),
+            "samz": np.linspace(0, 4, n),
+        }
+        dlg._positioner_names = ["samz"]
+        dlg.set_table("s", table)
+        assert dlg._checked_y() == ["frame_index"]   # not ROI1/ROI2
+    finally:
+        dlg.close()
+
+
+def test_scan_plot_default_x_positioner_else_frame_index(qapp):
+    """10.3: default X = the positioner that actually varies; with no positioner
+    recorded, frame_index."""
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    n = 5
+    table = {
+        "frame_index": np.arange(n, dtype=float),
+        "i0": np.linspace(1, 2, n),
+        "samz": np.linspace(10, 14, n),     # scanned (varies)
+        "samx": np.full(n, 7.0),            # parked (constant) — not the scan axis
+    }
+    dlg = ScanPlotDialog()
+    try:
+        dlg._positioner_names = ["samx", "samz"]
+        dlg.set_table("s", table)
+        assert dlg.x_combo.currentText() == "samz"
+    finally:
+        dlg.close()
+    dlg2 = ScanPlotDialog()
+    try:
+        dlg2._positioner_names = []          # e.g. an older file with no positioners
+        dlg2.set_table("s", table)
+        assert dlg2.x_combo.currentText() == "frame_index"
+    finally:
+        dlg2.close()
+
+
+def test_scan_plot_log_button_drives_left_axis(qapp):
+    """10.5: Log toggles the LEFT axis only and survives a redraw; the RIGHT axis
+    stays linear so its ticks match its (untransformed) curves."""
+    from pyqtgraph.Qt import QtCore
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    dlg = ScanPlotDialog()
+    try:
+        n = 5
+        dlg._positioner_names = ["samz"]
+        dlg.set_table("s", {"frame_index": np.arange(n, dtype=float),
+                            "samz": np.linspace(0, 4, n),
+                            "i0": np.linspace(1, 100, n),
+                            "big": np.linspace(1e4, 1e5, n)})
+        for i in range(dlg.r_list.count()):     # 'big' onto the right axis
+            it = dlg.r_list.item(i)
+            if it.text() == "big":
+                it.setCheckState(QtCore.Qt.CheckState.Checked)
+        qapp.processEvents()
+        assert hasattr(dlg, "log_btn")
+        dlg.log_btn.setChecked(True)
+        qapp.processEvents()
+        assert dlg.plot.getAxis("left").logMode
+        assert not dlg.right_axis.logMode        # right stays linear (matches its curve)
+        dlg._redraw()                            # a later redraw must keep both
+        assert dlg.plot.getAxis("left").logMode
+        assert not dlg.right_axis.logMode
+        dlg.log_btn.setChecked(False)
+        qapp.processEvents()
+        assert not dlg.plot.getAxis("left").logMode
+    finally:
+        dlg.close()
+
+
+def test_roi_select_has_viewer_controls(qapp):
+    """10.4: the ROI picker carries the intensity bar + Default/Log controls, and
+    a Log re-render does not move the RectROI (the picked geometry is preserved)."""
+    from xdart.gui.tabs.static_scan.roi_select_dialog import (
+        RoiSelectDialog, _rect_center_size)
+    img = np.abs(np.random.RandomState(0).normal(100, 20, (40, 60)))
+    dlg = RoiSelectDialog(img)
+    try:
+        assert hasattr(dlg, "colorbar")
+        assert dlg.scale_default_btn.isChecked()     # default = linear
+        before = _rect_center_size(dlg._rois[0].rect)
+        dlg.scale_log_btn.setChecked(True)
+        qapp.processEvents()
+        assert _rect_center_size(dlg._rois[0].rect) == before
+        dlg.scale_default_btn.setChecked(True)
+        qapp.processEvents()
+    finally:
+        dlg.close()
+
+
+def test_dialogs_swallow_escape(qapp):
+    """10.8: Esc does not dismiss the Scan Plot / ROI picker popups."""
+    from pyqtgraph.Qt import QtCore, QtGui
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.tabs.static_scan.roi_select_dialog import RoiSelectDialog
+
+    def press_escape(widget):
+        ev = QtGui.QKeyEvent(QtCore.QEvent.Type.KeyPress,
+                             QtCore.Qt.Key.Key_Escape,
+                             QtCore.Qt.KeyboardModifier.NoModifier)
+        widget.keyPressEvent(ev)
+
+    sp = ScanPlotDialog()
+    sp.show()
+    try:
+        press_escape(sp)
+        qapp.processEvents()
+        assert sp.isVisible()                # still open after Esc
+    finally:
+        sp.close()
+
+    roi = RoiSelectDialog(np.zeros((20, 20), dtype=float))
+    roi.show()
+    try:
+        press_escape(roi)
+        qapp.processEvents()
+        assert roi.isVisible()
+    finally:
+        roi.close()
