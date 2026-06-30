@@ -135,6 +135,11 @@ def _build_batch_thread(poni, mask, *, incidence_motor="th",
                  "_apply_threshold_inline"):
         setattr(w, meth, MethodType(getattr(wranglerThread, meth), w))
     w._dispatch_batch_serial = MethodType(imageThread._dispatch_batch_serial, w)
+    # D₂: the serial dispatch tail now routes through these (real _save_due gate
+    # works — the rig sets LIVE_SAVE_INTERVAL + a real scan with frames).
+    w.flush_serial_tail = MethodType(imageThread.flush_serial_tail, w)
+    w._save_due = MethodType(imageThread._save_due, w)
+    w._h5pool_bracket = MethodType(imageThread._h5pool_bracket, w)
     # Pause: the dispatch/submit loops now call _wait_if_paused() at the top; it
     # early-returns since this rig's command is never 'pause'.
     w._wait_if_paused = MethodType(imageThread._wait_if_paused, w)
