@@ -1132,13 +1132,69 @@ class imageWrangler(wranglerWidget):
         click with no (or an invalid) PONI ran the *previous* scan with the
         stale calibration (BUG-1).  The image source / save path remain guarded
         inside the run thread."""
+        self._adopt_loaded_scan_run_inputs()
         if self.poni is None:
             imageWrangler._safe_status_text(
                 self,
                 'Load a PONI calibration file to begin.',
             )
             return False
+        if not self.img_file and not getattr(self, 'stitch_mode', False):
+            imageWrangler._safe_status_text(
+                self,
+                'Choose an image source, or load a processed scan with reachable raw data.',
+            )
+            return False
         return True
+
+    def _adopt_loaded_scan_run_inputs(self):
+        """Seed Run from a loaded processed scan when explicit inputs are blank.
+
+        A processed xdart ``.nxs`` can carry both the original PONI and per-frame
+        raw-source pointers.  Reintegrate already consumes those from
+        ``scan.frames``; a fresh Run click reaches this older wrangler guard
+        first, so mirror the same cached inputs here only when the user has not
+        chosen an explicit image source in the source rows.
+        """
+        scan = getattr(self, "scan", None)
+        if self.poni is None:
+            cached_poni = getattr(scan, "_cached_poni", None)
+            if cached_poni is not None:
+                self.poni = cached_poni
+                try:
+                    self.thread.poni = cached_poni
+                except Exception:
+                    pass
+
+        explicit_source = ""
+        try:
+            if self.parameters.child('Signal').child('inp_type').value() == 'Image Directory':
+                explicit_source = self.parameters.child('Signal').child('img_dir').value()
+            else:
+                explicit_source = self.parameters.child('Signal').child('File').value()
+        except Exception:
+            explicit_source = ""
+        if explicit_source or getattr(self, "img_file", ""):
+            return
+
+        frames = getattr(scan, "frames", None)
+        frame_index = list(getattr(frames, "index", ()) or ())
+        if not frame_index:
+            return
+        try:
+            frame = frames[int(frame_index[0])]
+            resolver = getattr(frame, "_resolved_source_path", None)
+            source = resolver() if callable(resolver) else getattr(frame, "source_file", "")
+        except Exception:
+            logger.debug("processed-scan source adoption failed", exc_info=True)
+            return
+        if not source or not os.path.exists(source):
+            return
+
+        self.img_file = str(source)
+        path = Path(source)
+        self.img_dir = str(path.parent)
+        self.img_ext = path.suffix.lstrip('.')
 
     def start(self):
         # Refuse to run without a valid PONI rather than re-running the stale
@@ -1737,9 +1793,12 @@ class imageWrangler(wranglerWidget):
 
     def _compute_source_base(self):
         """N1: the absolute project root, or None when the Project Folder is
-        blank (-> the writer stores absolute raw paths, back-compat)."""
+        blank or invalid (-> the writer stores absolute raw paths, back-compat)."""
         pf = (self.parameters.child('Project').child('project_folder').value() or '').strip()
-        return os.path.abspath(os.path.expanduser(pf)) if pf else None
+        if not pf:
+            return None
+        path = os.path.abspath(os.path.expanduser(pf))
+        return path if os.path.isdir(path) else None
 
     def _default_h5_under_project(self):
         """Default the Save Path to ``<project>/xdart_processed_data`` when the

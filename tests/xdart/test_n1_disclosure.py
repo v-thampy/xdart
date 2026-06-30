@@ -69,6 +69,13 @@ def test_disclosure_two_stages(qapp):
     assert root.child("Project").child("h5_dir").value() == ""
     assert "Project Folder" in h.ui.specLabel.t
 
+    # Invalid folder text is still a fresh-start state: keep setup hidden.
+    root.child("Project").child("project_folder").setValue(
+        "/definitely/not/an/xdart/project")
+    h._apply_disclosure()
+    assert _hidden(root, "Signal")
+    assert "Project Folder" in h.ui.specLabel.t
+
     # Folder set -> the whole DATA group reveals (Poni is its first row), even
     # without a PONI yet — but the status nudges to load one.
     root.child("Project").child("project_folder").setValue("/tmp")

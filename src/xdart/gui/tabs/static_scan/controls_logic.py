@@ -1167,6 +1167,8 @@ class ControlState:
     geom: GeomState = field(default_factory=GeomState)
     backend: str | None = None
     project_root: str = ""
+    project_root_required: bool = False
+    project_root_valid: bool = True
     source_label: str = ""
     save_path: str = ""
     frame_count: int = 0
@@ -1352,6 +1354,24 @@ def build_field_statuses(state: ControlState) -> Mapping[FieldId, FieldStatus]:
     caps = state.source_caps
     geom = state.geom
     results = state.result_caps
+    project_root = str(state.project_root or "")
+    project_ready = bool(project_root) and bool(state.project_root_valid)
+    if project_ready:
+        project_status = StatusKind.OK
+        project_reason = ""
+    elif state.project_root_required:
+        project_status = StatusKind.MISSING
+        project_reason = (
+            "Choose a valid project folder."
+            if project_root
+            else "Choose a project folder."
+        )
+    elif project_root and not state.project_root_valid:
+        project_status = StatusKind.CONFLICT
+        project_reason = "Project folder does not exist."
+    else:
+        project_status = StatusKind.DEFERRED
+        project_reason = "Optional; improves portable paths."
     source_label = state.source_label or "No source selected"
     frame_value = str(state.frame_count) if state.frame_count else ""
     energy_status, energy_value, energy_reason = _energy_status_reason(geom, caps)
@@ -1359,9 +1379,9 @@ def build_field_statuses(state: ControlState) -> Mapping[FieldId, FieldStatus]:
     fields = {
         FieldId.PROJECT_ROOT: _field(
             FieldId.PROJECT_ROOT,
-            StatusKind.OK if state.project_root else StatusKind.DEFERRED,
-            value=state.project_root,
-            reason="" if state.project_root else "Optional; improves portable paths."),
+            project_status,
+            value=project_root,
+            reason=project_reason),
         FieldId.SOURCE_PATH: _field(
             FieldId.SOURCE_PATH,
             StatusKind.OK if caps.has_frames or source_label != "No source selected"
@@ -1776,6 +1796,8 @@ _RUN_BLOCKER_TEXT: Mapping[FieldId, str] = MappingProxyType({
 def run_required_fields_for(state: ControlState) -> tuple[FieldId, ...]:
     required: list[FieldId] = []
     if state.tool in (Tool.INT_1D, Tool.INT_2D, Tool.STITCH, Tool.RSM):
+        if state.project_root_required:
+            required.append(FieldId.PROJECT_ROOT)
         required.extend((
             FieldId.SOURCE_FRAMES,
             FieldId.CALIBRATION_PONI,

@@ -703,6 +703,58 @@ def test_controls_panel_v2_viewer_mode_shows_only_project(qapp):
     assert panel.processing_card.isHidden()
 
 
+def test_controls_panel_v2_requires_valid_project_before_setup_cards(qapp):
+    fields = (
+        ControlFormField(
+            section=SectionId.PROJECT,
+            label="Folder",
+            path=("Project", "project_folder"),
+            value="",
+            browse=True,
+        ),
+        ControlFormField(
+            section=SectionId.SOURCE,
+            label="Source",
+            path=("Signal", "inp_type"),
+            value="Image Series",
+            kind=ControlFieldKind.COMBO,
+        ),
+        ControlFormField(
+            section=SectionId.EXPERIMENT,
+            label="Poni",
+            path=("Signal", "poni_file"),
+            value="",
+            browse=True,
+        ),
+        ControlFormField(
+            section=SectionId.PROCESSING,
+            label="Background",
+            path=("BG", "bg_type"),
+            value="None",
+            kind=ControlFieldKind.COMBO,
+        ),
+    )
+    profile = build_control_profile(
+        ControlState(
+            project_root_required=True,
+            project_root="",
+            project_root_valid=False,
+            processing_mode="Int 2D",
+        )
+    )
+
+    panel = ControlsPanelV2()
+    panel.set_state(ControlPanelRenderState(
+        profile=profile,
+        bound_controls=BoundControlState(fields=fields),
+    ))
+
+    assert not panel.project_card.isHidden()
+    assert panel.source_card.isHidden()
+    assert panel.experiment_card.isHidden()
+    assert panel.processing_card.isHidden()
+
+
 def test_make_mask_updates_mask_file_box(qapp, monkeypatch):
     """_on_mask_created writes the mask path to the wrangler param AND the V2
     Mask File box reflects it — the handler refreshes the panel, which re-reads
@@ -1148,6 +1200,50 @@ def test_controls_panel_v2_state_summarizes_cached_poni_detector(
         state = widget._controls_v2_state()
 
         assert state.detector_summary == "Eiger 1M · 200.4mm · fitted"
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_not_ready_disables_run_row(qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget.wrangler.project_folder = ""
+        widget._refresh_controls_v2_profile(immediate=True)
+
+        assert widget.controls.readinessDot.property("ready") is False
+        assert widget.controls.actionRow.isVisible()
+        assert widget.controls.actionRow.isEnabled() is False
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_cached_scan_poni_satisfies_calibration(
+        qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.core.containers import PONI
+
+    widget = staticWidget()
+    try:
+        widget.scan._cached_integrator = object()
+        widget.scan._cached_poni = PONI(
+            dist=0.1794,
+            poni1=0.0,
+            poni2=0.0,
+            detector="RayonixMx225",
+        )
+        widget.wrangler.poni = None
+        widget.wrangler.poni_file = ""
+
+        state = widget._controls_v2_state()
+
+        assert state.detector_summary == "RayonixMx225 · 179.4mm · fitted"
+        assert state.geom.calibrated is True
     finally:
         widget.close()
         widget.deleteLater()

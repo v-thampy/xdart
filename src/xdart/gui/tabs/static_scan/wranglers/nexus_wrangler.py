@@ -422,9 +422,12 @@ class nexusWrangler(wranglerWidget):
 
     def _compute_source_base(self):
         """N1: the absolute project root, or None when the Project Folder is
-        blank (-> the writer stores absolute raw paths, back-compat)."""
+        blank or invalid (-> the writer stores absolute raw paths, back-compat)."""
         pf = (self.parameters.child('Project').child('project_folder').value() or '').strip()
-        return os.path.abspath(os.path.expanduser(pf)) if pf else None
+        if not pf:
+            return None
+        path = os.path.abspath(os.path.expanduser(pf))
+        return path if os.path.isdir(path) else None
 
     def browse_project_folder(self):
         """Browse for the N1 Project Folder; setting it makes the processed

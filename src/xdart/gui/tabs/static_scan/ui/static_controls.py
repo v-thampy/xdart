@@ -254,9 +254,9 @@ class StaticControls(QtWidgets.QWidget):
 
     def set_run_row_enabled(self, enabled):
         """Enable/disable the whole ACTION row (Live/Start/Stop) while keeping it
-        VISIBLE.  Viewer modes have no run, but a hidden row leaves an ugly empty
-        box -- so they show the row greyed-out instead.  Within an enabled row the
-        per-button states (Stop disabled at idle, etc.) still apply."""
+        visible.  Used for not-ready processing states; file-viewer modes hide
+        the row altogether.  Within an enabled row the per-button states (Stop
+        disabled at idle, etc.) still apply."""
         self.actionRow.setEnabled(bool(enabled))
 
     def set_mode_row_enabled(self, enabled):
