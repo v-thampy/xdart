@@ -626,6 +626,83 @@ def test_controls_panel_v2_renders_bound_render_state_directly(qapp):
     assert panel.analysis_card.isHidden()
 
 
+def test_controls_panel_v2_detector_status_uses_poni_summary(qapp):
+    profile = build_control_profile(
+        ControlState(
+            source_caps=SourceCaps(has_frames=True),
+            detector_summary="Eiger 1M · 200.4mm · fitted",
+        )
+    )
+    state = ControlPanelRenderState(
+        profile=profile,
+        bound_controls=BoundControlState(fields=(
+            ControlFormField(
+                section=SectionId.EXPERIMENT,
+                label="Poni",
+                path=("Signal", "poni_file"),
+                value="/tmp/example.poni",
+                browse=True,
+            ),
+        )),
+    )
+
+    panel = ControlsPanelV2()
+    panel.set_state(state)
+
+    detector = next(
+        card for card in panel.experiment_card.body.findChildren(SubsectionCard)
+        if card.title.text() == "Detector"
+    )
+    assert detector.status.text() == "Eiger 1M · 200.4mm · fitted"
+
+
+def test_controls_panel_v2_viewer_mode_shows_only_project(qapp):
+    profile = build_control_profile(
+        ControlState(tool=Tool.IMAGE_VIEWER, processing_mode="Image Viewer")
+    )
+    state = ControlPanelRenderState(
+        profile=profile,
+        bound_controls=BoundControlState(fields=(
+            ControlFormField(
+                section=SectionId.PROJECT,
+                label="Folder",
+                path=("Project", "project_folder"),
+                value="",
+                browse=True,
+            ),
+            ControlFormField(
+                section=SectionId.SOURCE,
+                label="Source",
+                path=("Signal", "inp_type"),
+                value="Image Series",
+                kind=ControlFieldKind.COMBO,
+            ),
+            ControlFormField(
+                section=SectionId.EXPERIMENT,
+                label="Poni",
+                path=("Signal", "poni_file"),
+                value="",
+                browse=True,
+            ),
+            ControlFormField(
+                section=SectionId.PROCESSING,
+                label="Background",
+                path=("BG", "bg_type"),
+                value="None",
+                kind=ControlFieldKind.COMBO,
+            ),
+        )),
+    )
+
+    panel = ControlsPanelV2()
+    panel.set_state(state)
+
+    assert not panel.project_card.isHidden()
+    assert panel.source_card.isHidden()
+    assert panel.experiment_card.isHidden()
+    assert panel.processing_card.isHidden()
+
+
 def test_make_mask_updates_mask_file_box(qapp, monkeypatch):
     """_on_mask_created writes the mask path to the wrangler param AND the V2
     Mask File box reflects it — the handler refreshes the panel, which re-reads
@@ -1048,6 +1125,29 @@ def test_controls_panel_v2_energy_conflict_reaches_widget_profile(
         assert state.geom.calibration_energy_eV == pytest.approx(
             wavelength_m_to_energy_eV(1.0e-10), rel=1e-12)
         assert state.geom.source_energy_eV == pytest.approx(15_000.0)
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_state_summarizes_cached_poni_detector(
+        qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.core.containers import PONI
+
+    widget = staticWidget()
+    try:
+        widget.scan._cached_poni = PONI(
+            dist=0.2004,
+            poni1=0.0,
+            poni2=0.0,
+            detector="Eiger 1M",
+        )
+
+        state = widget._controls_v2_state()
+
+        assert state.detector_summary == "Eiger 1M · 200.4mm · fitted"
     finally:
         widget.close()
         widget.deleteLater()
@@ -1955,6 +2055,34 @@ def test_controls_panel_v2_renders_integration_fields_from_live_widgets(qapp, mo
         if widget.controls.current_mode() != "Int 1D":
             # Int 2D shows both groups → a 1-D and a 2-D Axis row.
             assert visible_labels.count("Axis") >= 2
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_threshold_value_autoenables_native_state(
+        qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget._on_controls_v2_field_changed(("Mask", "Threshold"), False)
+        widget._on_controls_v2_field_changed(("Mask", "max"), "1000")
+
+        cfg = widget._controls_v2_threshold_config()
+        assert cfg.apply_threshold is True
+        assert cfg.threshold_max == pytest.approx(1000.0)
+
+        widget._on_controls_v2_field_changed(("Mask", "max"), "0")
+        widget._on_controls_v2_field_changed(("Mask", "Threshold"), False)
+        widget._on_controls_v2_field_changed(("Mask", "min"), "0")
+        widget._on_controls_v2_field_changed(("Mask", "max"), "0")
+
+        cfg = widget._controls_v2_threshold_config()
+        assert cfg.apply_threshold is False
+        assert cfg.threshold_min == 0.0
+        assert cfg.threshold_max == 0.0
     finally:
         widget.close()
         widget.deleteLater()

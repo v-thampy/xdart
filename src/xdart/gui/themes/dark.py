@@ -430,6 +430,21 @@ QPushButton#stopButton:disabled {
     color: $text_muted;
     border-color: $stop_muted;
 }
+QWidget#runReadinessRow {
+    background-color: transparent;
+}
+QLabel#runReadinessDot {
+    color: $stop_text;
+    font-size: 11px;
+}
+QLabel#runReadinessDot[ready="true"] {
+    color: $start;
+}
+QLabel#runReadinessLabel {
+    color: $text_3;
+    font-size: 11px;
+    font-weight: 400;
+}
 
 /* ── Lists / trees / tables ────────────────────────────────────── */
 QListWidget, QListView, QTreeView, QTreeWidget, QTableView, QTableWidget {
@@ -731,7 +746,8 @@ QLabel#controlsV2SectionTitle {
 }
 QLabel#controlsV2SectionStatus {
     color: $text_muted;
-    font-weight: 700;
+    font-size: 11px;
+    font-weight: 400;
 }
 QFrame#controlsV2SectionBody {
     background-color: $card;
@@ -778,7 +794,8 @@ QLabel#controlsV2SubsectionTitle[accent="experiment"] { color: #e8c46a; }
 QLabel#controlsV2SubsectionTitle[accent="processing"] { color: #e06c75; }
 QLabel#controlsV2SubsectionStatus {
     color: $text_muted;
-    font-weight: 700;
+    font-size: 11px;
+    font-weight: 400;
 }
 
 QWidget#controlsV2FormRow,

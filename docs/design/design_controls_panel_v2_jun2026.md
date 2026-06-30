@@ -718,16 +718,19 @@ Acceptance for the polish pass:
 
 ---
 
-## 14. 2026-06-30 status — V2 Int flip code complete; live re-pass pending after checkpoint fixes
+## 14. 2026-06-30 status — V2 Int flip fixes landed; live re-pass pending
 
 **Current branch state.** `feature/controls-panel-v2` has merged the latest
 `feature/geometry` fast-forward for the flip chunk. The V2 functional flip is
-code-complete on cp2, but the manual checkpoint found two live-path regressions:
+code-complete on cp2, but live/manual and adversarial test triage found three
+post-flip regressions:
 native Reintegrate 1D/2D could diverge from the fresh run plan because the
 reintegrate cache installed the native builder without first reapplying native V2
 Int state to `scan`, and `Average Scan` did not collapse streaming reductions to a
-single averaged frame. Both regressions are fixed and gated offscreen; the flip is
-not declared fully cleared until the live checkpoint is rerun.
+single averaged frame. A later latent-red pass found the native threshold setter
+had dropped the legacy convenience that entering a nonzero Threshold Min/Max
+auto-enables thresholding. All three regressions are fixed and gated offscreen;
+the flip is not declared fully cleared until the live checkpoint is rerun.
 
 **What changed in the flip.**
 - The V2-to-legacy Int write-through bridge is retired. Int edits no longer mirror
@@ -758,6 +761,15 @@ not declared fully cleared until the live checkpoint is rerun.
 - `Average Scan` on the streaming run path now maintains a running mean and submits
   one averaged frame/result, matching the legacy feeder behavior for image data and
   numeric metadata.
+- Native threshold edits now mirror the legacy safety behavior: entering a nonzero
+  Threshold Min/Max auto-enables thresholding, while the default 0/0 state does not
+  auto-enable.
+- Fresh `xdart -f` / empty-session startup leaves both Project Folder and Save Path
+  blank until the user chooses a project; choosing a project still defaults Save
+  Path under that project.
+- Image Viewer and XYE Viewer collapse the bottom controls bar to the mode selector
+  and hide non-Project V2 sections so file browsing does not expose inactive
+  processing controls.
 
 **Acceptance gates converted.** Offscreen tests now assert native-authoritative
 correctness rather than V2-vs-hidden-widget parity. The core checks are:
@@ -774,21 +786,31 @@ correctness rather than V2-vs-hidden-widget parity. The core checks are:
 - GI default orientation is 4, matching the frame/integrator default.
 - streaming `Average Scan` submits exactly one averaged frame/result for an N-frame
   source and preserves the mean image/metadata at the reduction boundary.
+- native threshold value entry is covered directly (`Max=1000` enables thresholding;
+  `0/0` does not), and stale tests now assert native V2 state rather than retired
+  legacy widget values.
 
 **Validated in `xrd_test` for this chunk.**
-- `tests/xdart/test_controls_panel_v2.py -q` → 65 passed.
-- `tests/xdart/test_controls_logic.py tests/core/test_v2_record_compat.py -q` → 31 passed.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_panel_v2.py -q` → 69 passed.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_logic.py -q` → 28 passed.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_static_controls.py tests/xdart/test_n1_disclosure.py -q` → 15 passed.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_live_refresh.py -k "wrangler_enabled_reapplies_viewer_mode_controls or file_viewer_mode_disables_processing_tree_but_not_mode_combo" -q` → 2 passed.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_gui_modes_end_to_end.py -k "threshold_autoenables_on_value_entry or integrator_panel_session_roundtrip or integrator_owns_threshold_config or live_run_injects_integrator_threshold_into_wrangler or gi_manual_incidence_reintegrate_uses_numeric_not_motor_name or gi_detail_widgets_live_in_hidden_holder" -q` → 6 passed.
+- Full `test_gui_modes_end_to_end.py -q` was attempted twice in the offscreen
+  environment and hit a PySide/pyqtgraph segfault during widget construction
+  before a clean summary line; rerun remains part of the orchestrator gate.
+- `tests/core/test_v2_record_compat.py -q` → 3 passed.
 - `tests/xdart/test_reduction_adapters.py -q` → 48 passed.
-- `QT_QPA_PLATFORM=offscreen tests/xdart/test_live_refresh.py -q` → 190 passed, 1 skipped.
-- `tests/xdart/test_gi_batch_real_data.py -k equivalence -q` → 18 passed, 50 deselected.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_gi_batch_real_data.py -k equivalence -q` → 18 passed, 50 deselected.
 
 **Manual live checkpoint must be rerun.** A human live scan remains the final
 offscreen-impossible gate before declaring the flip integrated on geometry. Rerun
-the checkpoint after the reintegrate and Average Scan fixes: real QThread teardown,
-Start/Stop/Append/Live, Average Scan producing one averaged frame/result,
-Reintegrate 1D/2D matching the fresh run, GI mode switch, reload, session restore
-with native-run-plan default-on, and XYE/Image-viewer transitions. Bundle this with
-the pending Phase-4e/4f checkpoint.
+the checkpoint after the reintegrate, Average Scan, and threshold auto-enable
+fixes: real QThread teardown, Start/Stop/Append/Live, Average Scan producing one
+averaged frame/result, Threshold Max entry excluding pixels without an explicit
+toggle click, Reintegrate 1D/2D matching the fresh run, GI mode switch, reload,
+session restore with native-run-plan default-on, and XYE/Image-viewer transitions.
+Bundle this with the pending Phase-4e/4f checkpoint.
 
 **Explicitly post-v2.**
 - Native Stitch/RSM Processing pages.

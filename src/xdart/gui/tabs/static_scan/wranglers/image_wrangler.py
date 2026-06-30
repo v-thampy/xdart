@@ -55,7 +55,7 @@ params = [
     {'name': 'Project', 'title': 'PROJECT', 'type': 'group', 'children': [
         {'name': 'project_folder', 'title': 'Folder', 'type': 'str_browse', 'value': ''},
         {'name': 'h5_dir', 'title': 'Save Path', 'type': 'str_browse',
-         'value': get_fname_dir(), 'enabled': True},
+         'value': '', 'enabled': True},
     ], 'expanded': True},
     # PONI is the first row of DATA — the standalone CALIBRATION group is gone.
     # This collapses the N1 progressive disclosure to two stages (Folder -> DATA),
@@ -821,17 +821,15 @@ class imageWrangler(wranglerWidget):
             self.tree.setEnabled(True)
         except AttributeError:
             pass
-        # In viewer mode there's no run, but HIDING the run row leaves an ugly
-        # empty box (Vivek) -- so keep the row visible and just DISABLE it
-        # (greyed Live/Start/Stop).  Pre-attach (standalone / tests) the wrangler
-        # owns its specUI `frame`; post-attach that frame is dead (hidden by
-        # attach_controls) and we drive the SHARED controls' action row instead.
+        # Image/XYE viewers are pure file browsers.  Collapse the run controls
+        # down to the mode row instead of showing a disabled Run/Stop/Append row.
+        # Int 1D (XYE) is NOT a viewer here; it remains a processing mode.
         _controls = getattr(self, '_controls', None)
         if _controls is None:
-            self.ui.frame.setVisible(True)
+            self.ui.frame.setVisible(not is_file_viewer)
             self.ui.frame.setEnabled(not is_viewer)
         else:
-            _controls.set_run_row_visible(True)
+            _controls.set_run_row_visible(not is_file_viewer)
             _controls.set_run_row_enabled(not is_viewer)
             # No batch processing in a file viewer -> hide the Batch toggle (and
             # the Cores it gates) in viewer modes; apply_profile restores it for

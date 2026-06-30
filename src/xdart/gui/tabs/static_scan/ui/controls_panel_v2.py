@@ -918,8 +918,11 @@ class ControlsPanelV2(QtWidgets.QWidget):
         self.experiment_card.set_status_text(self._experiment_status(
             state.fields_for(SectionId.EXPERIMENT)))
         self.processing_card.set_status_text(self._processing_status(profile))
-        self.experiment_card.setVisible(bool(state.fields_for(SectionId.EXPERIMENT)))
-        self.processing_card.setVisible(True)
+        viewer_mode = str(getattr(profile.processing_page, "value", "")) == "viewer"
+        self.source_card.setVisible(not viewer_mode)
+        self.experiment_card.setVisible(
+            bool(state.fields_for(SectionId.EXPERIMENT)) and not viewer_mode)
+        self.processing_card.setVisible(not viewer_mode)
         self.output_card.setVisible(False)
         self.analysis_card.setVisible(False)
 
@@ -1030,7 +1033,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
             (
                 "Detector",
                 tuple(field for field in fields if field.path in detector_paths),
-                self._detector_status(fields),
+                self._detector_status(fields, profile.detector_summary),
             ),
             (
                 "Sample & measurement",
@@ -1351,7 +1354,12 @@ class ControlsPanelV2(QtWidgets.QWidget):
         return "standard"
 
     @staticmethod
-    def _detector_status(fields: tuple[ControlFormField, ...]) -> str:
+    def _detector_status(
+        fields: tuple[ControlFormField, ...],
+        detector_summary: str = "",
+    ) -> str:
+        if detector_summary:
+            return detector_summary
         values = {field.path: field.value for field in fields}
         if values.get(("Signal", "poni_file")) or values.get(("Calibration", "poni_file")):
             return "fitted"

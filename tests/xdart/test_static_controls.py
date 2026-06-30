@@ -106,16 +106,15 @@ def test_mode_row_enabled_locks_mode_batch_cores(qapp):
     assert c.batchButton.isEnabled()
 
 
-def test_run_row_enabled_keeps_row_visible(qapp):
-    """Viewer modes DISABLE the action row rather than hiding it (an empty box
-    looked broken) -- the row stays visible, just greyed."""
+def test_run_row_visibility_can_collapse_to_mode_only(qapp):
+    """File viewers can collapse the controls bar to the mode row only."""
     c = StaticControls()
+    c.set_run_row_visible(False)
+    assert c.actionRow.isHidden()
+    assert c._divider.isHidden()
     c.set_run_row_visible(True)
-    c.set_run_row_enabled(False)
-    assert not c.actionRow.isEnabled()             # greyed
-    assert not c.actionRow.isHidden()              # but still visible (no empty box)
-    c.set_run_row_enabled(True)
-    assert c.actionRow.isEnabled()
+    assert not c.actionRow.isHidden()
+    assert not c._divider.isHidden()
 
 
 def test_getters(qapp):
@@ -129,3 +128,23 @@ def test_getters(qapp):
     assert c.is_batch() is True
     assert c.is_live() is False
     assert c.get_cores() == 2
+
+
+def test_readiness_summary_toggles_compact_status_row(qapp):
+    c = StaticControls()
+    assert c.readinessRow.isHidden()
+
+    changed = c.set_readiness_summary(
+        "Ready · Int 2D · 50 frames",
+        ready=True,
+        tooltip="Everything is ready.",
+    )
+
+    assert changed is True
+    assert not c.readinessRow.isHidden()
+    assert c.readinessLabel.text() == "Ready · Int 2D · 50 frames"
+    assert c.readinessLabel.toolTip() == "Everything is ready."
+    assert c.readinessDot.property("ready") is True
+
+    assert c.set_readiness_summary("", ready=False) is True
+    assert c.readinessRow.isHidden()

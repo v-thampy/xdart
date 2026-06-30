@@ -65,6 +65,8 @@ def test_disclosure_two_stages(qapp):
     h._apply_disclosure()
     assert not _hidden(root, "Project")
     assert _hidden(root, "Signal")
+    assert root.child("Project").child("project_folder").value() == ""
+    assert root.child("Project").child("h5_dir").value() == ""
     assert "Project Folder" in h.ui.specLabel.t
 
     # Folder set -> the whole DATA group reveals (Poni is its first row), even

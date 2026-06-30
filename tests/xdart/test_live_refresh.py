@@ -1412,6 +1412,7 @@ def test_live_new_scan_invalidates_publication_store():
         # side effect; this host has no v2 panel, so it is a no-op here.
         _controls_v2_enabled=lambda: False,
         _refresh_controls_v2_profile=lambda *a, **k: None,
+        _fit_controls_height=lambda *a, **k: None,
         metawidget=SimpleNamespace(update=lambda: None),
     )
     host._sync_h5viewer_save_dir = MethodType(
@@ -1478,6 +1479,7 @@ def _new_scan_host_with_wrangler_mask(wrangler_mask, initial_global_mask,
         # side effect; this host has no v2 panel, so it is a no-op here.
         _controls_v2_enabled=lambda: False,
         _refresh_controls_v2_profile=lambda *a, **k: None,
+        _fit_controls_height=lambda *a, **k: None,
         metawidget=SimpleNamespace(update=lambda: None),
     )
     host._sync_h5viewer_save_dir = MethodType(
@@ -2761,6 +2763,7 @@ def test_viewer_mode_change_blocks_scan_list_autoload():
         # _on_viewer_mode_changed refreshes the (optional) Controls Panel v2
         # profile at the end; no v2 panel on this host, so it is a no-op.
         _refresh_controls_v2_profile=lambda *a, **k: None,
+        _fit_controls_height=lambda *a, **k: None,
         h5viewer=SimpleNamespace(
             ui=SimpleNamespace(listScans=list_scans),
             actionNewFile=_FakeAction(),
@@ -2809,6 +2812,7 @@ def test_viewer_mode_tree_disable_only_for_file_viewers():
         # _on_viewer_mode_changed refreshes the (optional) Controls Panel v2
         # profile at the end; no v2 panel on this host, so it is a no-op.
         _refresh_controls_v2_profile=lambda *a, **k: None,
+        _fit_controls_height=lambda *a, **k: None,
         h5viewer=SimpleNamespace(
             ui=SimpleNamespace(listScans=list_scans),
             actionNewFile=_FakeAction(),
@@ -2852,6 +2856,7 @@ def test_leaving_viewer_mode_clears_stale_global_mask():
         # _on_viewer_mode_changed refreshes the (optional) Controls Panel v2
         # profile at the end; no v2 panel on this host, so it is a no-op.
         _refresh_controls_v2_profile=lambda *a, **k: None,
+        _fit_controls_height=lambda *a, **k: None,
         h5viewer=SimpleNamespace(
             ui=SimpleNamespace(listScans=list_scans),
             actionNewFile=_FakeAction(),
@@ -2930,6 +2935,7 @@ def test_viewer_mode_keeps_explicit_open_folder():
         # _on_viewer_mode_changed refreshes the (optional) Controls Panel v2
         # profile at the end; no v2 panel on this host, so it is a no-op.
         _refresh_controls_v2_profile=lambda *a, **k: None,
+        _fit_controls_height=lambda *a, **k: None,
         h5viewer=SimpleNamespace(
             ui=SimpleNamespace(listScans=list_scans),
             actionNewFile=_FakeAction(),
@@ -5632,10 +5638,11 @@ def test_wrangler_enabled_reapplies_viewer_mode_controls():
         assert host.ui.liveCheckBox.isChecked() is False
         assert host.ui.liveCheckBox.isEnabled() is False
         assert host.ui.batchCheckBox.isEnabled() is False
-        # Viewer modes now DISABLE the run row rather than hiding it (a hidden row
-        # left an ugly empty box) -- visible but greyed.
-        assert host.ui.frame.isVisible() is True
-        assert host.ui.frame.isEnabled() is False
+        if mode in ("Image Viewer", "XYE Viewer"):
+            assert host.ui.frame.isVisible() is False
+        else:
+            assert host.ui.frame.isVisible() is True
+            assert host.ui.frame.isEnabled() is False
         assert host._integration_controls_enabled is False
         assert host.thread.live_mode is False
         assert host.tree.isEnabled() is True   # Project/Save Path stay usable

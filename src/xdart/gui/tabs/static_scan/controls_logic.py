@@ -1173,6 +1173,7 @@ class ControlState:
     processing_mode: str = ""
     real_data_gates: frozenset[str] = field(default_factory=frozenset)
     controls_locked: bool = False
+    detector_summary: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1191,6 +1192,7 @@ class ControlProfile:
     analysis_launchers: tuple[AnalysisLauncherSpec, ...] = ()
     show_experiment_card: bool = True
     show_processing_card: bool = True
+    detector_summary: str = ""
 
     def fields_for(self, section: SectionId) -> tuple[FieldStatus, ...]:
         return tuple(
@@ -1841,7 +1843,8 @@ def build_control_profile(state: ControlState) -> ControlProfile:
         section_actions=build_section_actions(state),
         analysis_launchers=build_analysis_launchers(state.result_caps),
         show_experiment_card=True,
-        show_processing_card=not viewer)
+        show_processing_card=not viewer,
+        detector_summary=state.detector_summary)
 
 
 # Public spelling used by the design docs.  Keep the longer name for call sites

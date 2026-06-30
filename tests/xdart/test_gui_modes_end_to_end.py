@@ -2759,32 +2759,36 @@ def test_shutdown_threads_stops_file_thread(widget):
     assert not ft.isRunning()
 
 
-def test_integrator_panel_session_roundtrip(widget):
+def test_integrator_panel_session_roundtrip(widget, monkeypatch):
     """Session persistence for the integration panel: units/pts/ranges/Auto
     flags + Advanced params survive a save/restore cycle (saved at app close,
     restored at startup -- they previously weren't persisted at all)."""
-    tree = widget.integratorTree
+    w = widget
 
-    tree.ui.npts_1D.setText("1234")
-    tree.ui.radial_autoRange_1D.setChecked(False)
-    tree.ui.radial_low_1D.setText("0.5")
-    tree.ui.radial_high_1D.setText("4.5")
-    tree.parameters.child('Default', 'Integrate 1D', 'chi_offset').setValue(45.0)
-    state = tree.session_state()
+    w._on_controls_v2_field_changed(("Int1D", "points"), "1234")
+    w._on_controls_v2_field_changed(("Int1D", "radial_auto"), False)
+    w._on_controls_v2_field_changed(("Int1D", "radial_low"), "0.5")
+    w._on_controls_v2_field_changed(("Int1D", "radial_high"), "4.5")
+    w._on_controls_v2_field_changed(("Int1D", "chi_offset"), "45.0")
+    state = w._controls_v2_int_session_state()
     import json
     json.dumps(state)                       # must be JSON-serializable
 
     # Scramble, then restore.
-    tree.ui.npts_1D.setText("999")
-    tree.ui.radial_autoRange_1D.setChecked(True)
-    tree.parameters.child('Default', 'Integrate 1D', 'chi_offset').setValue(90.0)
-    tree.restore_session_state(state)
+    w._on_controls_v2_field_changed(("Int1D", "points"), "999")
+    w._on_controls_v2_field_changed(("Int1D", "radial_auto"), True)
+    w._on_controls_v2_field_changed(("Int1D", "chi_offset"), "90.0")
+    monkeypatch.setattr(
+        "xdart.utils.session.load_session",
+        lambda: {"controls_v2_int": state},
+    )
+    w._restore_controls_v2_int_session_state()
 
-    assert tree.ui.npts_1D.text() == "1234"
-    assert tree.ui.radial_autoRange_1D.isChecked() is False
-    assert tree.ui.radial_low_1D.text() == "0.5"
-    assert tree.parameters.child(
-        'Default', 'Integrate 1D', 'chi_offset').value() == 45.0
+    args = w.scan.bai_1d_args
+    assert args["numpoints"] == 1234
+    assert args["radial_range"] == (0.5, 4.5)
+    assert args["chi_offset"] == 45.0
+    assert str(w._controls_v2_field_values()[("Int1D", "points")]) == "1234"
 
 
 def test_cake_view_trim_rearms_after_own_trim_but_respects_user_zoom(widget):
@@ -2934,14 +2938,15 @@ def test_integrator_owns_threshold_config(widget):
     assert cfg.apply_threshold is False
     assert cfg.mask_saturation is True          # default-on, mirrors old wrangler
 
-    it.ui.threshold_enable.setChecked(True)
-    it.ui.threshold_min.setText("7")
-    it.ui.threshold_max.setText("9000")
-    it.ui.mask_saturated.setChecked(False)
+    w._on_controls_v2_field_changed(("Mask", "Threshold"), True)
+    w._on_controls_v2_field_changed(("Mask", "min"), "7")
+    w._on_controls_v2_field_changed(("Mask", "max"), "9000")
+    w._on_controls_v2_field_changed(("MaskSat", "mask_sentinel"), False)
     cfg2 = it.get_threshold_config()
     assert cfg2.apply_threshold is True
     assert cfg2.threshold_min == 7 and cfg2.threshold_max == 9000
     assert cfg2.mask_saturation is False
+    assert cfg2 == w._controls_v2_threshold_config()
 
 
 def test_live_run_injects_integrator_threshold_into_wrangler(widget):
@@ -2950,11 +2955,10 @@ def test_live_run_injects_integrator_threshold_into_wrangler(widget):
     hidden Mask/MaskSat carrier params before setup() — so live == reintegrate by
     construction (both source from the integrator)."""
     w = widget
-    it = w.integratorTree
-    it.ui.threshold_enable.setChecked(True)
-    it.ui.threshold_min.setText("3")
-    it.ui.threshold_max.setText("5000")
-    it.ui.mask_saturated.setChecked(False)
+    w._on_controls_v2_field_changed(("Mask", "Threshold"), True)
+    w._on_controls_v2_field_changed(("Mask", "min"), "3")
+    w._on_controls_v2_field_changed(("Mask", "max"), "5000")
+    w._on_controls_v2_field_changed(("MaskSat", "mask_sentinel"), False)
 
     w._push_threshold_to_wrangler()
 
@@ -3066,14 +3070,10 @@ def test_gi_manual_incidence_reintegrate_uses_numeric_not_motor_name(widget):
     from xdart.modules.reduction import plan_from_live_scan
 
     w = widget
-    it = w.integratorTree
-    it.ui.gi_enable.setChecked(True)
-    mi = it.ui.gi_motor.findText('Manual')
-    assert mi >= 0
-    it.ui.gi_motor.setCurrentIndex(mi)
-    it.ui.gi_motor_value.setText('2.0')
-
-    it._apply_gi_config_to_scan()
+    w._on_controls_v2_field_changed(("GI", "Grazing"), True)
+    w._on_controls_v2_field_changed(("GI", "th_motor"), "Manual")
+    w._on_controls_v2_field_changed(("GI", "th_val"), "2.0")
+    w._controls_v2_apply_gi_config_to_scan()
 
     # Numeric theta, NOT the literal 'Manual' (which would crash the reduction).
     assert w.scan.incidence_motor == '2.0'
@@ -3139,18 +3139,24 @@ def test_gi_detail_widgets_live_in_hidden_holder(widget):
         # Re-parented into the hidden holder and kept alive (never destroyed).
         assert wdg.parent() is holder
 
-    # Motor + Orient + Tilt all still round-trip through get_gi_config — the
-    # widgets are the single source of truth regardless of where they're parented.
-    it.ui.gi_enable.setChecked(True)
-    it.ui.gi_motor.setCurrentText('Manual')
-    it.ui.gi_motor_value.setText('0.3')
-    it.ui.gi_sample_orientation.setValue(6)
-    it.ui.gi_tilt.setText('1.5')
+    # Motor + Orient + Tilt still round-trip through the native V2 state; the
+    # hidden widgets stay alive for the advanced inspector only.
+    w._on_controls_v2_field_changed(("GI", "Grazing"), True)
+    w._on_controls_v2_field_changed(("GI", "th_motor"), "Manual")
+    w._on_controls_v2_field_changed(("GI", "th_val"), "0.3")
+    w._on_controls_v2_field_changed(("GI", "sample_orientation"), "6")
+    w._on_controls_v2_field_changed(("GI", "tilt_angle"), "1.5")
     cfg = it.get_gi_config()
     assert cfg['incidence_motor'] == 'Manual'
     assert cfg['th_val'] == 0.3
     assert cfg['sample_orientation'] == 6
     assert cfg['tilt_angle'] == 1.5
+    assert cfg == w._controls_v2_gi_config()
+    w._controls_v2_apply_gi_config_to_scan()
+    assert w.scan.gi_config['incidence_motor'] == 'Manual'
+    assert w.scan.gi_config['th_val'] == 0.3
+    assert w.scan.gi_config['sample_orientation'] == 6
+    assert w.scan.gi_config['tilt_angle'] == 1.5
 
 
 def test_stitch_modes_present_and_mode_flags(widget):
@@ -3269,21 +3275,20 @@ def test_threshold_autoenables_on_value_entry(widget):
     so the clip actually applies (the "I set Max=1000 but it didn't clip" trap).
     Default 0/0 never auto-enables (Max=0 would mask everything)."""
     w = widget
-    it = w.integratorTree
 
-    it.ui.threshold_enable.setChecked(False)
-    it.ui.threshold_max.setText('1000')
-    it._maybe_autoenable_threshold()
-    assert it.ui.threshold_enable.isChecked() is True
-    cfg = it.get_threshold_config()
+    w._on_controls_v2_field_changed(("Mask", "Threshold"), False)
+    w._on_controls_v2_field_changed(("Mask", "max"), "1000")
+    cfg = w._controls_v2_threshold_config()
     assert cfg.apply_threshold is True and cfg.threshold_max == 1000.0
 
     # Default 0/0 must NOT auto-enable (Max=0 masks everything).
-    it.ui.threshold_enable.setChecked(False)
-    it.ui.threshold_min.setText('0')
-    it.ui.threshold_max.setText('0')
-    it._maybe_autoenable_threshold()
-    assert it.ui.threshold_enable.isChecked() is False
+    w._on_controls_v2_field_changed(("Mask", "max"), "0")
+    w._on_controls_v2_field_changed(("Mask", "Threshold"), False)
+    w._on_controls_v2_field_changed(("Mask", "min"), "0")
+    w._on_controls_v2_field_changed(("Mask", "max"), "0")
+    cfg = w._controls_v2_threshold_config()
+    assert cfg.apply_threshold is False
+    assert cfg.threshold_min == 0.0 and cfg.threshold_max == 0.0
 
 
 def test_shared_controls_reroute_on_wrangler_swap(widget):
