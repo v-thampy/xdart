@@ -70,6 +70,20 @@ def _label_key(label):
         return label
 
 
+def _label_keys(labels):
+    if labels is None:
+        return ()
+    seen = set()
+    keys = []
+    for label in labels:
+        key = _label_key(label)
+        if key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+    return tuple(keys)
+
+
 def _candidate_labels(mode, selected_ids, all_frame_index):
     """Labels whose availability can affect this render.
 
@@ -116,6 +130,16 @@ def _data_snapshot(widget, *, labels=None, include_legacy=True):
     from the render decision and kept the old ``data_1d`` mirror as an implicit
     source of truth.
     """
+    store_first_items = _store_first_publication_items(widget, labels)
+    if store_first_items is not None:
+        adapter = PublicationDisplayAdapter(
+            store=None, widget=widget, items=store_first_items)
+        return (
+            adapter.available_1d_keys(),
+            adapter.available_2d_keys(),
+            adapter.raw_availability(),
+        )
+
     store = getattr(widget, "publication_store", None)
     loaded_1d, loaded_2d, raw_avail = set(), set(), {}
     if store is not None:
@@ -150,6 +174,26 @@ def _data_snapshot(widget, *, labels=None, include_legacy=True):
             entry['has_thumbnail'] = bool(entry.get('has_thumbnail')) or (
                 v.get('thumbnail') is not None)
     return loaded_1d, loaded_2d, raw_avail
+
+
+def _store_first_publication_items(widget, labels):
+    """Return synthetic publications from the store-first FrameView accessor."""
+    if getattr(widget, "viewer_mode", None) is not None:
+        return None
+    if labels is None:
+        return None
+    lookup = getattr(widget, "_store_first_publication_for_display", None)
+    if (
+        lookup is None
+        or getattr(widget, "store_first_frame_view", None) is None
+    ):
+        return None
+    items = {}
+    for label in _label_keys(labels):
+        publication = lookup(label, allow_blocking_read=False)
+        if publication is not None:
+            items[_label_key(label)] = publication
+    return items
 
 
 def _image_viewer_raw_payload(widget, state):
@@ -264,10 +308,15 @@ class _BaseController:
     def build_payload(self, widget, state):
         store = getattr(widget, "publication_store", None)
         labels = tuple(dict.fromkeys((*state.selected_ids, *state.render_ids)))
-        adapter = (
-            None if store is None
-            else PublicationDisplayAdapter(store, widget=widget, labels=labels)
-        )
+        items = _store_first_publication_items(widget, labels)
+        if items is not None:
+            adapter = PublicationDisplayAdapter(
+                store=None, widget=widget, items=items)
+        else:
+            adapter = (
+                None if store is None
+                else PublicationDisplayAdapter(store, widget=widget, labels=labels)
+            )
         return build_payload(state, adapter)
 
 

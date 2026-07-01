@@ -14,12 +14,14 @@ import logging
 import os
 import re
 import time
+from dataclasses import replace
 
 import numpy as np
 from pathlib import Path
 from types import SimpleNamespace
 
 from .display_logic import RawSource, choose_raw_source, sentinel_mask
+from xdart.modules.frame_publication import publication_from_frame_view
 from xdart.modules.wavelength import normalize_wavelength_m, wavelength_angstrom_to_m
 from xrd_tools.core import view_to_result_1d, view_to_result_2d
 
@@ -250,7 +252,12 @@ class DisplayDataMixin:
             getattr(raw_ref, "image", None),
         )
         frame_1d = None
-        if int_1d is not None or thumbnail is not None or raw_ref is not None:
+        if (
+            int_1d is not None
+            or int_2d is not None
+            or thumbnail is not None
+            or raw_ref is not None
+        ):
             frame_1d = SimpleNamespace(
                 idx=publication.label,
                 int_1d=int_1d,
@@ -272,6 +279,61 @@ class DisplayDataMixin:
             frame_2d = {}
         return frame_1d, frame_2d
 
+    def _display_publication_from_view(self, idx, view):
+        """Wrap a selected ``FrameView`` in the GUI publication envelope.
+
+        The session store owns integration arrays; GUI-only raw artifacts may
+        still live in the PublicationStore while mirrors remain.  Borrow raw /
+        thumbnail / raw_ref from the publication fallback when the store view is
+        intentionally integration-only, preserving current raw-panel behavior.
+        """
+        if view is None:
+            return None
+        try:
+            key = int(idx)
+        except (TypeError, ValueError):
+            key = idx
+        publication = None
+        store = getattr(self, "publication_store", None)
+        if store is not None:
+            try:
+                publication = store.get(key)
+            except Exception:
+                logger.debug("publication artifact lookup failed for %s", key,
+                             exc_info=True)
+        fallback_view = getattr(publication, "view", None)
+        updates = {}
+        if fallback_view is not None:
+            if view.raw is None and getattr(fallback_view, "raw", None) is not None:
+                updates["raw"] = fallback_view.raw
+            if (
+                view.thumbnail is None
+                and getattr(fallback_view, "thumbnail", None) is not None
+            ):
+                updates["thumbnail"] = fallback_view.thumbnail
+                updates["mask_baked"] = bool(
+                    view.mask_baked or getattr(fallback_view, "mask_baked", False)
+                )
+        if updates:
+            view = replace(view, **updates)
+        return publication_from_frame_view(
+            view,
+            generation=int(getattr(self, "display_generation", 0) or 0),
+            raw_ref=getattr(publication, "raw_ref", None),
+            raw_status=getattr(publication, "raw_status", "unknown"),
+            validate=True,
+        )
+
+    def _store_first_publication_for_display(
+            self, idx, *, allow_blocking_read=False):
+        lookup = getattr(self, "store_first_frame_view", None)
+        if lookup is None:
+            return None
+        view = lookup(idx, allow_blocking_read=bool(allow_blocking_read))
+        if view is None:
+            return None
+        return self._display_publication_from_view(idx, view)
+
     def _snapshot_data(self, idxs, *, allow_blocking_read=None):
         """Return a small {idx: (frame_1d, frame_2d_dict)} dict for
         the requested ``idxs``, sampled atomically under
@@ -289,23 +351,39 @@ class DisplayDataMixin:
         """
         snapshot = {}
         missing = []
-        scan_store_active = (
-            getattr(self, "viewer_mode", None) is None
-            and getattr(self, "publication_store", None) is not None
+        scan_store_active = getattr(self, "viewer_mode", None) is None
+        store_first_lookup = getattr(
+            self, "_store_first_publication_for_display", None)
+        use_store_first = (
+            scan_store_active
+            and getattr(self, "store_first_frame_view", None) is not None
+            and store_first_lookup is not None
         )
         publication_lookup = getattr(
             self, "_publication_from_store_for_display", None)
+        block_check = getattr(self, "_display_hydration_should_block", None)
+        should_block = (
+            block_check(allow_blocking_read)
+            if callable(block_check)
+            else bool(allow_blocking_read)
+        )
         for idx in idxs:
             key = int(idx)
             publication = None
-            if publication_lookup is not None:
+            if use_store_first:
+                publication = store_first_lookup(
+                    key, allow_blocking_read=should_block)
+            elif publication_lookup is not None:
                 publication = publication_lookup(
                     key, allow_blocking_read=allow_blocking_read)
             if publication is None:
                 missing.append(key)
                 continue
             snapshot[key] = self._publication_legacy_parts(publication)
-        if missing and not scan_store_active:
+        if missing and not (
+            getattr(self, "viewer_mode", None) is None
+            and getattr(self, "publication_store", None) is not None
+        ):
             with self.data_lock:
                 for key in missing:
                     snapshot[key] = (

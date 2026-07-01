@@ -208,9 +208,11 @@ def _display_ids_for_2d(state) -> tuple:
 class PublicationDisplayAdapter:
     """Resolve display payload fragments from a publication snapshot."""
 
-    def __init__(self, store, *, widget=None, labels=None):
+    def __init__(self, store, *, widget=None, labels=None, items=None):
         self._widget = widget
-        if store is None:
+        if items is not None:
+            self._items = dict(items)
+        elif store is None:
             self._items = {}
         elif labels is None:
             self._items = dict(store.snapshot())

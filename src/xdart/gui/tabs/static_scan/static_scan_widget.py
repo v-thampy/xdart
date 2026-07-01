@@ -37,11 +37,14 @@ else:
 from xdart.modules.live import LiveFrame, LiveScan
 from xdart.modules.frame_publication import (
     PublicationStore,
+    legacy_to_canonical_1d,
+    legacy_to_canonical_2d,
     publication_error_details,
     publication_from_live_frame,
     publication_has_2d_errors,
 )
 from xdart.modules.wavelength import normalize_wavelength_m
+from xrd_tools.core import FrameView
 from xrd_tools.core.energy import wavelength_m_to_energy_eV
 from .ui.staticUI import Ui_Form
 from .h5viewer import H5Viewer
@@ -360,6 +363,7 @@ class staticWidget(QWidget):
         self.frame_ids = []
         self.frames = OrderedDict()
         self.publication_store = PublicationStore()
+        self._frame_record_store = None
         # Live-browse caches.  Both reset at scan/viewer boundaries and are no
         # longer authoritative for normal Int 1D/2D readiness; the
         # PublicationStore is.  The 1D mirror is capped in scan mode to prevent
@@ -394,6 +398,177 @@ class staticWidget(QWidget):
             while len(cache) > max_value:
                 cache.popitem(False)
 
+    def _active_frame_record_modes(
+            self, mode_1d: str | None = None,
+            mode_2d: str | None = None) -> tuple[str | None, str | None]:
+        """Return the active display mode keys for the current scan."""
+        scan = getattr(self, "scan", None)
+        if not bool(getattr(scan, "gi", False)):
+            return mode_1d, mode_2d
+        args_1d = getattr(scan, "bai_1d_args", {}) or {}
+        args_2d = getattr(scan, "bai_2d_args", {}) or {}
+        active_1d = mode_1d or args_1d.get("gi_mode_1d", "q_total")
+        active_2d = mode_2d or args_2d.get("gi_mode_2d", "qip_qoop")
+        if active_1d is not None:
+            active_1d = legacy_to_canonical_1d(str(active_1d))
+        if active_2d is not None:
+            active_2d = legacy_to_canonical_2d(str(active_2d))
+        return active_1d, active_2d
+
+    def _active_frame_record_store(self):
+        """The current per-scan session store, if the live path has one."""
+        thread = getattr(getattr(self, "wrangler", None), "thread", None)
+        store = getattr(thread, "_streaming_record_store", None)
+        if store is not None:
+            self._frame_record_store = store
+            return store
+        return getattr(self, "_frame_record_store", None)
+
+    def _clear_frame_record_store(self, *_args):
+        self._frame_record_store = None
+
+    @staticmethod
+    def _coerce_frame_label(idx):
+        try:
+            return int(idx)
+        except (TypeError, ValueError):
+            return idx
+
+    @staticmethod
+    def _mode_result(mapping, mode, canonicalizer):
+        if not mapping:
+            return None
+        if mode is not None and mode in mapping:
+            return mapping[mode]
+        if mode is not None:
+            for key, value in mapping.items():
+                try:
+                    if canonicalizer(str(key)) == mode:
+                        return value
+                except Exception:
+                    continue
+        return None
+
+    def _publication_frame_view(
+            self, idx, mode_1d: str | None, mode_2d: str | None,
+            *, allow_blocking_read: bool = False):
+        store = getattr(self, "publication_store", None)
+        if store is None:
+            return None
+        getter = getattr(store, "get_or_hydrate", None) if allow_blocking_read else None
+        try:
+            publication = (
+                getter(idx) if getter is not None else store.get(idx)
+            )
+        except Exception:
+            logger.debug("publication lookup failed for %s", idx, exc_info=True)
+            return None
+        if publication is None:
+            return None
+        record = getattr(publication, "record", None)
+        if record is not None:
+            try:
+                return record.project(mode_1d=mode_1d, mode_2d=mode_2d)
+            except ValueError:
+                pass
+        return getattr(publication, "view", None)
+
+    def _legacy_frame_view(self, idx):
+        """Build a ``FrameView`` from the transitional ``data_1d/data_2d`` mirrors."""
+        with self.data_lock:
+            frame_1d = self.data_1d.get(idx)
+            frame_2d = self.data_2d.get(idx, {})
+        if frame_2d is None:
+            frame_2d = {}
+
+        mode_1d, mode_2d = self._active_frame_record_modes()
+        result_1d = getattr(frame_1d, "int_1d", None) if frame_1d is not None else None
+        result_2d = None
+        if isinstance(frame_2d, dict):
+            result_2d = frame_2d.get("int_2d")
+        else:
+            result_2d = getattr(frame_2d, "int_2d", None)
+
+        if frame_1d is not None:
+            mode_result = self._mode_result(
+                getattr(frame_1d, "gi_1d", None) or {},
+                mode_1d,
+                legacy_to_canonical_1d,
+            )
+            if mode_result is not None:
+                result_1d = mode_result
+        gi_2d = {}
+        if isinstance(frame_2d, dict):
+            gi_2d = frame_2d.get("gi_2d", {}) or {}
+        elif frame_2d is not None:
+            gi_2d = getattr(frame_2d, "gi_2d", {}) or {}
+        mode_result = self._mode_result(gi_2d, mode_2d, legacy_to_canonical_2d)
+        if mode_result is not None:
+            result_2d = mode_result
+
+        raw = thumb = None
+        mask = None
+        if isinstance(frame_2d, dict):
+            raw = frame_2d.get("map_raw")
+            thumb = frame_2d.get("thumbnail")
+            mask = frame_2d.get("mask")
+        elif frame_2d is not None:
+            raw = getattr(frame_2d, "map_raw", None)
+            thumb = getattr(frame_2d, "thumbnail", None)
+            mask = getattr(frame_2d, "mask", None)
+        if thumb is None and frame_1d is not None:
+            thumb = getattr(frame_1d, "thumbnail", None)
+        if raw is None and frame_1d is not None:
+            raw = getattr(frame_1d, "map_raw", None)
+
+        if all(value is None for value in (result_1d, result_2d, raw, thumb)):
+            return None
+        metadata = dict(getattr(frame_1d, "scan_info", None) or {})
+        if mask is not None:
+            metadata.setdefault("mask", mask)
+        return FrameView.from_results(
+            label=idx,
+            result_1d=result_1d,
+            result_2d=result_2d,
+            raw=raw,
+            thumbnail=thumb,
+            mask_baked=thumb is not None,
+            metadata_raw=metadata,
+            incident_angle=metadata.get("incident_angle"),
+            source_path=getattr(frame_1d, "source_file", None)
+            if frame_1d is not None else None,
+            source_frame_index=getattr(frame_1d, "source_frame_idx", None)
+            if frame_1d is not None else None,
+        )
+
+    def store_first_frame_view(
+            self, idx, *, mode_1d: str | None = None,
+            mode_2d: str | None = None,
+            allow_blocking_read: bool = False):
+        """Return the selected frame view in store -> publication -> mirror order."""
+        key = self._coerce_frame_label(idx)
+        mode_1d, mode_2d = self._active_frame_record_modes(mode_1d, mode_2d)
+
+        store = self._active_frame_record_store()
+        if store is not None:
+            try:
+                record = store.get(key)
+            except Exception:
+                logger.debug("record_store lookup failed for %s", key, exc_info=True)
+                record = None
+            if record is not None:
+                try:
+                    return record.project(mode_1d=mode_1d, mode_2d=mode_2d)
+                except ValueError:
+                    logger.debug("record_store projection missed for %s", key,
+                                 exc_info=True)
+
+        view = self._publication_frame_view(
+            key, mode_1d, mode_2d, allow_blocking_read=allow_blocking_read)
+        if view is not None:
+            return view
+        return self._legacy_frame_view(key)
+
     def _init_ui(self):
         """Set up the main UI form and detector dialog."""
         self.ui = Ui_Form()
@@ -420,6 +595,7 @@ class staticWidget(QWidget):
                                                parent=self.ui.middleFrame,
                                                data_lock=self.data_lock,
                                                publication_store=self.publication_store)
+        self.displayframe.store_first_frame_view = self.store_first_frame_view
         # Back-ref so h5viewer.data_reset can re-arm display-side caches.
         self.h5viewer.displayframe = self.displayframe
         self.ui.middleFrame.setLayout(self.displayframe.ui.layout)
@@ -3631,6 +3807,7 @@ class staticWidget(QWidget):
             logger.debug("XYE overlay input filter install failed", exc_info=True)
         self.h5viewer.sigNewFile.connect(self.wrangler.set_fname)
         self.h5viewer.sigNewFile.connect(self.displayframe.set_axes)
+        self.h5viewer.sigNewFile.connect(self._clear_frame_record_store)
         self.h5viewer.sigNewFile.connect(
             lambda *_: self.displayframe._clear_bkg())
         self.h5viewer.sigNewFile.connect(self.h5viewer.data_reset)
@@ -3679,6 +3856,7 @@ class staticWidget(QWidget):
         # other subscriber.  Disconnect ONLY the slots set_wrangler attached.
         for slot in (getattr(self.wrangler, 'set_fname', None),
                      self.displayframe.set_axes,
+                     self._clear_frame_record_store,
                      self.h5viewer.data_reset,
                      self._hydrate_integrator_on_load):
             if slot is None:
@@ -3909,6 +4087,10 @@ class staticWidget(QWidget):
         _t_mask = _t_build = _t_upsert = _t_scan = 0.0   # per-leg accumulators
 
         published = getattr(self.wrangler, "thread", None)
+        record_store = getattr(published, "_streaming_record_store", None) \
+            if published is not None else None
+        if record_store is not None:
+            self._frame_record_store = record_store
         global_mask = getattr(published, "mask", None) if published is not None else None
         if global_mask is not None:
             # Publish the detector gap mask ONCE per drain for the display.  We do
@@ -5085,6 +5267,7 @@ class staticWidget(QWidget):
         # it on the next ``_flush_pending_update`` tick.
         self.frames.clear()
         self.frame_ids.clear()
+        self._frame_record_store = None
         self.publication_store.clear()
         # Drop any frames stashed-but-not-yet-drained + the scan_data row cache
         # from the previous scan so the new scan's coalesced flush starts clean.
