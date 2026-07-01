@@ -10,6 +10,7 @@ import threading
 import copy
 import os
 import math
+from pathlib import Path
 from collections import OrderedDict
 import gc
 import imageio
@@ -64,15 +65,18 @@ from .controls_logic import (
     INTEGRATOR_BACKED_CONTROL_PATHS,
     INTEGRATOR_BACKED_CONTROL_SPECS,
     INTEGRATION_CONTROL_PATHS,
+    NATIVE_CONTROL_PATHS,
     ControlState,
     GeomState,
     MeasMode,
     ResultCaps,
+    RunTarget,
     SourceCaps,
     Tool,
     build_control_panel_state,
     build_native_int_reduction_plan_from_scan,
     coerce_control_edit_value,
+    run_target_readiness_note,
     tool_from_mode_text,
 )
 from xdart.utils.throttle import Coalescer
@@ -709,6 +713,8 @@ class staticWidget(QWidget):
             click()
 
     def _apply_controls_v2_field_value(self, path, value) -> bool:
+        if self._set_controls_v2_native_source_field(path, value):
+            return True
         if self._set_controls_v2_native_int_field(path, value):
             return True
         param = self._controls_v2_param(tuple(path))
@@ -766,6 +772,7 @@ class staticWidget(QWidget):
             except Exception:
                 pass
         values.update(self._controls_v2_native_int_values())
+        values.update(self._controls_v2_native_source_values())
         return values
 
     def _controls_v2_field_choices(self):
@@ -789,7 +796,13 @@ class staticWidget(QWidget):
             if vals:
                 choices[path] = vals
         choices.update(self._controls_v2_native_int_choices())
+        choices[("Source", "energy_preference")] = ("poni", "metadata")
         return choices
+
+    def _controls_v2_native_source_values(self) -> dict[tuple[str, ...], object]:
+        return {
+            ("Source", "energy_preference"): self._controls_v2_energy_preference(),
+        }
 
     @staticmethod
     def _controls_v2_number_text(value) -> str:
@@ -1477,6 +1490,30 @@ class staticWidget(QWidget):
             logger.debug("Controls Panel V2 advanced hydrate failed",
                          exc_info=True)
 
+    def _set_controls_v2_native_source_field(self, path, value) -> bool:
+        path = tuple(path)
+        if path not in NATIVE_CONTROL_PATHS:
+            return False
+        if path == ("Source", "energy_preference"):
+            text = str(value or "").strip().lower()
+            aliases = {
+                "poni": "poni",
+                "poni file": "poni",
+                "metadata": "metadata",
+                "meta": "metadata",
+            }
+            self._controls_v2_source_energy_preference = aliases.get(text, "poni")
+            self._controls_v2_source_energy_cache = None
+            return True
+        return False
+
+    def _controls_v2_energy_preference(self) -> str:
+        pref = str(
+            getattr(self, "_controls_v2_source_energy_preference", "poni")
+            or "poni"
+        ).strip().lower()
+        return pref if pref in {"poni", "metadata"} else "poni"
+
     def _set_controls_v2_native_int_field(self, path, value) -> bool:
         path = tuple(path)
         if path not in INTEGRATOR_BACKED_CONTROL_PATHS:
@@ -2000,6 +2037,9 @@ class staticWidget(QWidget):
         parts = [status]
         if not ready and blockers:
             parts.append(str(blockers[0]).rstrip("."))
+        note = run_target_readiness_note(state, ready=ready).rstrip(".")
+        if note and note not in parts:
+            parts.append(note)
         if mode:
             parts.append(mode)
         frame_count = int(getattr(state, "frame_count", 0) or 0)
@@ -2064,12 +2104,19 @@ class staticWidget(QWidget):
         gi_on = bool(gi_cfg.get("gi", getattr(self.scan, "gi", False)))
         meas_mode = MeasMode.GI if gi_on else MeasMode.STANDARD
 
-        frame_count = 0
+        loaded_frame_count = 0
         try:
-            frame_count = len(getattr(self.scan.frames, "index", ()) or ())
+            loaded_frame_count = len(getattr(self.scan.frames, "index", ()) or ())
         except Exception:
-            frame_count = 0
+            loaded_frame_count = 0
         source_label = self._controls_v2_source_label()
+        try:
+            source_frame_count = self._controls_v2_source_frame_count()
+        except Exception:
+            logger.debug("Controls V2 source frame count failed", exc_info=True)
+            source_frame_count = 0
+        source_live_unknown = source_frame_count is None
+        frame_count = 0 if source_live_unknown else int(source_frame_count or 0)
         project_root = str(getattr(getattr(self, "wrangler", None), "project_folder", "") or "")
         project_root_valid = bool(
             project_root and os.path.isdir(os.path.expanduser(project_root))
@@ -2081,17 +2128,19 @@ class staticWidget(QWidget):
             has_scan_data = False
         wrangler = getattr(self, "wrangler", None)
         has_motors = bool(getattr(wrangler, "motors", None)) or has_scan_data
-        has_raw = bool(frame_count or source_label)
         calibration_energy_eV, source_energy_eV = (
             self._controls_v2_energy_values())
         energy_known = (
             calibration_energy_eV is not None
             or source_energy_eV is not None
         )
+        source_ready = bool(source_label) and (
+            source_live_unknown or frame_count > 0
+        )
         source_caps = SourceCaps(
-            has_frames=frame_count > 0,
-            has_raw=has_raw,
-            raw_reachable=has_raw,
+            has_frames=source_ready,
+            has_raw=source_ready,
+            raw_reachable=source_ready,
             has_metadata=has_scan_data or bool(getattr(wrangler, "scan_args", None)),
             has_motors=has_motors,
             has_energy=energy_known,
@@ -2112,11 +2161,16 @@ class staticWidget(QWidget):
                                    for pub in pubs)
         except Exception:
             labels = ()
+        loaded_scan_available = bool(
+            loaded_frame_count
+            or labels
+            or getattr(getattr(self, "scan", None), "data_file", None)
+        )
         result_caps = ResultCaps(
             has_1d=has_1d,
             has_2d=has_2d,
-            has_raw=has_raw,
-            raw_reachable=has_raw,
+            has_raw=source_ready or loaded_scan_available,
+            raw_reachable=source_ready or loaded_scan_available,
             has_scan_metadata=has_scan_data,
             has_rsm=bool(getattr(self.scan, "rsm_result", None)),
             has_phase_result=False,
@@ -2135,7 +2189,7 @@ class staticWidget(QWidget):
         )
         run_active = (bool(getattr(self, "_run_active", False))
                       or self._session_run_active())
-        display_frame_count = frame_count or len(labels)
+        display_frame_count = frame_count
         if run_active:
             # During a run the processed-frame count ticks every frame; letting
             # it into the render signature would rebuild the whole controls panel
@@ -2149,6 +2203,12 @@ class staticWidget(QWidget):
             display_frame_count = self._controls_v2_run_frame_count
         else:
             self._controls_v2_run_frame_count = None
+        if source_ready:
+            run_target = RunTarget.SOURCE
+        elif loaded_scan_available:
+            run_target = RunTarget.LOADED_SCAN
+        else:
+            run_target = RunTarget.NONE
         return ControlState(
             tool=tool,
             mode=meas_mode,
@@ -2160,6 +2220,8 @@ class staticWidget(QWidget):
             project_root_required=True,
             project_root_valid=project_root_valid,
             source_label=source_label,
+            run_target=run_target,
+            loaded_scan_available=loaded_scan_available,
             save_path=str(getattr(getattr(self, "wrangler", None), "h5_dir", "") or ""),
             detector_summary=self._controls_v2_detector_summary(),
             frame_count=display_frame_count,
@@ -2169,6 +2231,9 @@ class staticWidget(QWidget):
         )
 
     def _controls_v2_source_label(self) -> str:
+        return self._controls_v2_configured_source_label()
+
+    def _controls_v2_configured_source_label(self) -> str:
         source_type = ""
         param = self._controls_v2_param(("Signal", "inp_type"))
         if param is not None:
@@ -2203,12 +2268,169 @@ class staticWidget(QWidget):
             getattr(wrangler, "img_file", None),
             getattr(wrangler, "img_dir", None),
             getattr(wrangler, "nexus_file", None),
-            getattr(self.scan, "data_file", None),
         ))
         for candidate in candidates:
             if candidate:
                 return str(candidate)
         return ""
+
+    def _controls_v2_source_frame_count(self) -> int | None:
+        """Images the configured raw source will yield; ``None`` for live."""
+
+        source_type = str(
+            self._controls_v2_param_value(("Signal", "inp_type")) or ""
+        )
+        img_file = str(self._controls_v2_param_value(("Signal", "File")) or "")
+        img_dir = str(self._controls_v2_param_value(("Signal", "img_dir")) or "")
+        nexus_file = str(
+            self._controls_v2_param_value(("NeXus File", "nexus_file")) or ""
+        )
+        img_ext = str(self._controls_v2_param_value(("Signal", "img_ext")) or "")
+        include_subdir = bool(
+            self._controls_v2_param_value(("Signal", "include_subdir"), False)
+        )
+        file_filter = str(self._controls_v2_param_value(("Signal", "Filter")) or "")
+        source_path = (
+            img_dir
+            if source_type == "Image Directory"
+            else img_file or nexus_file
+        )
+        if not source_path:
+            return 0
+        if self._controls_v2_live_source_active():
+            return None
+
+        key = (
+            source_type,
+            img_file,
+            img_dir,
+            nexus_file,
+            img_ext,
+            include_subdir,
+            file_filter,
+        )
+        cached = getattr(self, "_v2_frame_count_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+
+        count = self._controls_v2_count_source_frames(
+            source_type=source_type,
+            img_file=img_file or nexus_file,
+            img_dir=img_dir,
+            img_ext=img_ext,
+            include_subdir=include_subdir,
+            file_filter=file_filter,
+        )
+        self._v2_frame_count_cache = (key, count)
+        return count
+
+    def _controls_v2_param_value(self, path, default=""):
+        param = self._controls_v2_param(tuple(path))
+        if param is None:
+            return default
+        try:
+            return param.value()
+        except Exception:
+            return default
+
+    def _controls_v2_live_source_active(self) -> bool:
+        controls = getattr(self, "controls", None)
+        try:
+            if controls is not None and controls.is_live():
+                return True
+        except Exception:
+            pass
+        wrangler = getattr(self, "wrangler", None)
+        if bool(getattr(wrangler, "live_mode", False)):
+            return True
+        return bool(getattr(getattr(wrangler, "thread", None), "live_mode", False))
+
+    @classmethod
+    def _controls_v2_count_source_frames(
+            cls,
+            *,
+            source_type: str,
+            img_file: str,
+            img_dir: str,
+            img_ext: str,
+            include_subdir: bool,
+            file_filter: str,
+    ) -> int:
+        from xrd_tools.io import image as image_io
+        from .wranglers.image_wrangler_thread import _get_scan_info, _name_filter
+
+        container_exts = {"h5", "hdf5", "nxs"}
+        ext = str(img_ext or "").lstrip(".").lower()
+        try:
+            if source_type == "Image Directory":
+                base = Path(str(img_dir or "")).expanduser()
+                if not base.is_dir():
+                    return 0
+                match = _name_filter(file_filter)
+                if ext in container_exts:
+                    files = cls._controls_v2_container_directory_files(
+                        base, ext, include_subdir, match)
+                    return sum(int(image_io.count_frames(path) or 0)
+                               for path in files)
+                pattern = f"*.{ext}" if ext else "*"
+                candidates = (
+                    base.rglob(pattern) if include_subdir else base.glob(pattern)
+                )
+                return sum(
+                    1 for path in candidates
+                    if path.is_file() and match(path.stem)
+                )
+
+            path = Path(str(img_file or "")).expanduser()
+            if not path.is_file():
+                return 0
+            file_ext = (ext or path.suffix.lstrip(".")).lower()
+            if source_type == "Image Series" and file_ext not in container_exts:
+                scan_name, _img_number = _get_scan_info(path)
+                import re
+                series_re = re.compile(
+                    rf"^{re.escape(scan_name)}_\d+\.{re.escape(file_ext)}$"
+                )
+                files = [
+                    sibling for sibling in path.parent.glob(
+                        f"{scan_name}_*.{file_ext}"
+                    )
+                    if series_re.match(sibling.name)
+                    and str(sibling) >= str(path)
+                ]
+                return len(files) if files else int(
+                    image_io.count_frames(path) or 0
+                )
+            return int(image_io.count_frames(path) or 0)
+        except Exception:
+            logger.debug("Controls V2 source frame count failed", exc_info=True)
+            return 0
+
+    @staticmethod
+    def _controls_v2_container_directory_files(
+            base: Path, ext: str, include_subdir: bool, match
+    ) -> tuple[Path, ...]:
+        if ext in {"h5", "hdf5"}:
+            patterns = (("*_master.h5", "_master.h5"),)
+            if ext == "hdf5":
+                patterns = (("*_master.hdf5", "_master.hdf5"), *patterns)
+        else:
+            suffix = f".{ext}"
+            patterns = ((f"*{suffix}", suffix),)
+
+        files = []
+        seen = set()
+        for pattern, suffix in patterns:
+            candidates = base.rglob(pattern) if include_subdir else base.glob(pattern)
+            for path in candidates:
+                key = str(path)
+                if key in seen or not path.is_file():
+                    continue
+                seen.add(key)
+                name = path.name[:-len(suffix)] if suffix else path.stem
+                if match(name):
+                    files.append(path)
+        return tuple(sorted(files))
 
     def _controls_v2_calibrated(self) -> bool:
         return self._controls_v2_current_poni() is not None
@@ -2316,17 +2538,21 @@ class staticWidget(QWidget):
     def _controls_v2_energy_values(self) -> tuple[float | None, float | None]:
         """Return ``(calibration_energy_eV, source_energy_eV)`` for run gating.
 
-        The calibration wavelength is authoritative.  A persisted 1 Å value can
-        be real, but the historical ``mg_args['wavelength'] == 1e-10``
-        constructor default is only a placeholder and must not satisfy the gate.
+        PONI wavelength is the default authority.  The native Source energy
+        preference can intentionally privilege metadata for beamlines where the
+        per-frame/source metadata is the more reliable energy record.
         """
         scan = getattr(self, "scan", None)
-        calibration_energy_eV = self._controls_v2_calibration_energy_eV(
+        poni_energy_eV = self._controls_v2_calibration_energy_eV(
             scan,
             poni=self._controls_v2_current_poni(),
         )
-        source_energy_eV = self._controls_v2_source_energy_eV(scan)
-        return calibration_energy_eV, source_energy_eV
+        metadata_energy_eV = self._controls_v2_metadata_energy_eV(scan)
+        if self._controls_v2_energy_preference() == "metadata":
+            if metadata_energy_eV is not None:
+                return metadata_energy_eV, None
+            return poni_energy_eV, None
+        return poni_energy_eV, metadata_energy_eV
 
     @classmethod
     def _controls_v2_energy_from_wavelength(
@@ -2346,20 +2572,21 @@ class staticWidget(QWidget):
 
     @classmethod
     def _controls_v2_calibration_energy_eV(cls, scan, *, poni=None) -> float | None:
-        if scan is None:
-            return None
-        persisted = cls._controls_v2_energy_from_wavelength(
-            getattr(scan, "_persisted_wavelength_m", None),
-            allow_default_sentinel=True,
-        )
-        if persisted is not None:
-            return persisted
         from_poni = cls._controls_v2_energy_from_wavelength(
             getattr(poni, "wavelength", None),
             allow_default_sentinel=True,
         )
         if from_poni is not None:
             return from_poni
+        if scan is not None:
+            persisted = cls._controls_v2_energy_from_wavelength(
+                getattr(scan, "_persisted_wavelength_m", None),
+                allow_default_sentinel=True,
+            )
+            if persisted is not None:
+                return persisted
+        if scan is None:
+            return None
         integrator = getattr(scan, "_cached_integrator", None)
         from_integrator = cls._controls_v2_energy_from_wavelength(
             getattr(integrator, "wavelength", None))
@@ -2433,6 +2660,86 @@ class staticWidget(QWidget):
             if energy is not None:
                 return energy
         return None
+
+    def _controls_v2_metadata_energy_eV(self, scan) -> float | None:
+        energy = self._controls_v2_source_energy_eV(scan)
+        if energy is not None:
+            return energy
+        return self._controls_v2_configured_source_energy_eV()
+
+    def _controls_v2_configured_source_energy_eV(self) -> float | None:
+        meta_ext = str(
+            self._controls_v2_param_value(("Signal", "meta_ext")) or ""
+        ).strip()
+        if not meta_ext or meta_ext == "None":
+            return None
+        img_file = self._controls_v2_first_metadata_file()
+        if not img_file:
+            return None
+        meta_dir = str(
+            self._controls_v2_param_value(("Signal", "meta_dir")) or ""
+        ).strip()
+        key = (str(img_file), meta_ext, meta_dir)
+        cached = getattr(self, "_controls_v2_source_energy_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        try:
+            from xrd_tools.io.metadata import read_image_metadata
+            metadata = read_image_metadata(
+                img_file,
+                meta_format=meta_ext,
+                meta_dir=meta_dir or None,
+            )
+            energy = self._controls_v2_extract_energy_eV(metadata)
+        except Exception:
+            logger.debug("Controls V2 metadata energy read failed",
+                         exc_info=True)
+            energy = None
+        self._controls_v2_source_energy_cache = (key, energy)
+        return energy
+
+    def _controls_v2_first_metadata_file(self) -> str:
+        source_type = str(
+            self._controls_v2_param_value(("Signal", "inp_type")) or ""
+        )
+        if source_type == "Image Directory":
+            wrangler = getattr(self, "wrangler", None)
+            img_file = str(getattr(wrangler, "img_file", "") or "")
+            if img_file:
+                return img_file
+            img_dir = str(
+                self._controls_v2_param_value(("Signal", "img_dir")) or ""
+            )
+            img_ext = str(
+                self._controls_v2_param_value(("Signal", "img_ext")) or ""
+            ).lstrip(".")
+            if not img_dir or not img_ext:
+                return ""
+            try:
+                from .wranglers.image_wrangler_thread import _name_filter
+                match = _name_filter(
+                    self._controls_v2_param_value(("Signal", "Filter")) or "")
+                base = Path(img_dir).expanduser()
+                include_subdir = bool(self._controls_v2_param_value(
+                    ("Signal", "include_subdir"), False))
+                pattern = f"*.{img_ext}"
+                candidates = (
+                    base.rglob(pattern) if include_subdir else base.glob(pattern)
+                )
+                for path in sorted(candidates):
+                    if path.is_file() and match(path.stem):
+                        return str(path)
+            except Exception:
+                logger.debug("Controls V2 metadata source probe failed",
+                             exc_info=True)
+                return ""
+            return ""
+        img_file = str(
+            self._controls_v2_param_value(("Signal", "File")) or ""
+        )
+        return img_file if img_file else str(
+            getattr(getattr(self, "wrangler", None), "img_file", "") or ""
+        )
 
     def _controls_v2_batch_run_active(self) -> bool:
         run_active = (

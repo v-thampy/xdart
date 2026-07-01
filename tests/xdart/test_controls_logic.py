@@ -12,6 +12,7 @@ from xdart.gui.tabs.static_scan.controls_logic import (
     MeasMode,
     ResultCap,
     ResultCaps,
+    RunTarget,
     SourceCaps,
     Tool,
     GeomState,
@@ -22,6 +23,7 @@ from xdart.gui.tabs.static_scan.controls_logic import (
     build_control_panel_state,
     build_control_profile,
     coerce_control_edit_value,
+    run_target_readiness_note,
     run_blockers_from_fields,
     run_required_fields_for,
     tool_from_mode_text,
@@ -257,6 +259,60 @@ def test_run_gate_accepts_configured_source_before_processed_frames():
     assert profile.fields[FieldId.SOURCE_FRAMES].status is StatusKind.MISSING
     assert profile.can_run
     assert "Choose a frame source." not in profile.run_blockers
+
+
+def test_loaded_scan_without_source_disables_run_but_keeps_reintegrate_actions():
+    profile = build_control_profile(
+        ControlState(
+            tool=Tool.INT_2D,
+            run_target=RunTarget.LOADED_SCAN,
+            loaded_scan_available=True,
+            source_label="",
+            source_caps=SourceCaps(has_energy=True),
+            result_caps=ResultCaps(has_1d=True, has_2d=True),
+            geom=GeomState(calibrated=True, energy_known=True),
+        )
+    )
+
+    assert not profile.can_run
+    assert profile.fields[FieldId.SOURCE_PATH].status is StatusKind.MISSING
+    assert profile.run_blockers == (
+        "Run needs a frame source - use Reintegrate for the loaded scan.",
+    )
+    actions = profile.actions_for(SectionId.PROCESSING)
+    reintegrate = {
+        action.action: action.enabled
+        for action in actions
+        if action.action in {
+            ControlAction.REINTEGRATE_1D,
+            ControlAction.REINTEGRATE_2D,
+        }
+    }
+    assert reintegrate == {
+        ControlAction.REINTEGRATE_1D: True,
+        ControlAction.REINTEGRATE_2D: True,
+    }
+
+
+def test_run_target_readiness_note_only_explains_loaded_scan_without_source():
+    loaded_only = ControlState(
+        tool=Tool.INT_2D,
+        run_target=RunTarget.LOADED_SCAN,
+        loaded_scan_available=True,
+    )
+    source_with_loaded_result = ControlState(
+        tool=Tool.INT_2D,
+        run_target=RunTarget.SOURCE,
+        loaded_scan_available=True,
+        source_caps=SourceCaps(has_frames=True, has_raw=True, raw_reachable=True),
+    )
+    no_target = ControlState(tool=Tool.INT_2D, run_target=RunTarget.NONE)
+
+    assert run_target_readiness_note(loaded_only) == (
+        "Run needs a frame source - use Reintegrate for the loaded scan."
+    )
+    assert run_target_readiness_note(source_with_loaded_result, ready=True) == ""
+    assert run_target_readiness_note(no_target) == ""
 
 
 def test_control_profile_blockers_match_field_status_contract():

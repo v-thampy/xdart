@@ -104,6 +104,10 @@ def _field_tooltip(path, reason: str = "") -> str:
     return (reason or "") or _FIELD_TOOLTIPS.get(tuple(path), "")
 
 
+_SOURCE_ENERGY_PATH = ("Source", "energy_preference")
+_SOURCE_ENERGY_OPTIONS = (("PONI", "poni"), ("Metadata", "metadata"))
+
+
 class StatusBadge(QtWidgets.QLabel):
     """Small status label used by card rows."""
 
@@ -904,6 +908,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
         # (F2).  Popup edits already write through on change, so nothing is lost;
         # reopening rebuilds its rows from the live profile.
         self._close_gi_more_popup()
+        self._close_source_energy_popup()
         cards = {
             SectionId.PROJECT: self.project_card,
             SectionId.SOURCE: self.source_card,
@@ -965,13 +970,28 @@ class ControlsPanelV2(QtWidgets.QWidget):
         by_path = {field.path: field for field in fields}
         rendered: set[tuple[str, ...]] = set()
 
-        def row_for(*paths: tuple[str, ...], stretches=None, tight=()) -> None:
+        def row_for(
+                *paths: tuple[str, ...],
+                stretches=None,
+                tight=(),
+                energy_field: ControlFormField | None = None,
+        ) -> None:
             present = [by_path[p] for p in paths
                        if p in by_path and p not in rendered]
+            if energy_field is not None and energy_field.path not in rendered:
+                rendered.add(energy_field.path)
             if not present:
+                if energy_field is not None:
+                    container = QtWidgets.QWidget()
+                    lay = QtWidgets.QHBoxLayout(container)
+                    lay.setContentsMargins(0, 0, 0, 0)
+                    lay.setSpacing(8)
+                    lay.addStretch(1)
+                    lay.addWidget(self._make_source_energy_button(energy_field))
+                    self.source_card.add_row(container)
                 return
             rendered.update(field.path for field in present)
-            if len(present) == 1 and not tight:
+            if len(present) == 1 and not tight and energy_field is None:
                 self._add_bound_row(self.source_card, present[0])
                 return
             container = QtWidgets.QWidget()
@@ -992,6 +1012,8 @@ class ControlsPanelV2(QtWidgets.QWidget):
                 if stretches and field.path in stretches:
                     st = stretches[field.path]
                 lay.addWidget(sub, st)
+            if energy_field is not None:
+                lay.addWidget(self._make_source_energy_button(energy_field), 0)
             self.source_card.add_row(container)
 
         # Mode combo + (directory-only) Subdirs toggle on one row.
@@ -999,15 +1021,59 @@ class ControlsPanelV2(QtWidgets.QWidget):
         row_for(("Signal", "img_dir"))                           # Directory
         row_for(("Signal", "File"))                              # Image File
         # File Type | Meta Type: Meta Type ~10% narrower with a tight label.
+        energy_field = by_path.get(_SOURCE_ENERGY_PATH)
         row_for(("Signal", "img_ext"), ("Signal", "meta_ext"),
-                stretches={("Signal", "img_ext"): 11, ("Signal", "meta_ext"): 9},
-                tight={("Signal", "meta_ext")})
+                stretches={("Signal", "img_ext"): 9, ("Signal", "meta_ext"): 7},
+                tight={("Signal", "meta_ext")},
+                energy_field=energy_field)
         row_for(("Signal", "Filter"))                            # Filter
         row_for(("Signal", "meta_dir"))                          # SPEC Dir
         # Anything else (e.g. NeXus File / Entry) one per row, in order.
         for field in fields:
             if field.path not in rendered:
                 self._add_bound_row(self.source_card, field)
+
+    def _make_source_energy_button(
+            self, field: ControlFormField) -> QtWidgets.QToolButton:
+        btn = QtWidgets.QToolButton()
+        btn.setText("…")
+        btn.setObjectName("controlsV2MoreButton")
+        btn.setProperty("role", "sourceEnergy")
+        btn.setToolTip("Energy source")
+        btn.clicked.connect(
+            lambda _=False, f=field: self._open_source_energy_popup(f))
+        return btn
+
+    def _close_source_energy_popup(self) -> None:
+        popup = getattr(self, "_source_energy_popup", None)
+        if popup is not None:
+            popup.close()
+            popup.setParent(None)
+            popup.deleteLater()
+        self._source_energy_popup = None
+
+    def _open_source_energy_popup(self, field: ControlFormField) -> None:
+        self._close_source_energy_popup()
+        popup = QtWidgets.QWidget(self, QtCore.Qt.Tool)
+        popup.setObjectName("controlsV2EnergyPopup")
+        popup.setWindowTitle("Energy Source")
+        lay = QtWidgets.QVBoxLayout(popup)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+        value = str(field.value or "poni").strip().lower()
+        seg = SegmentedControl(
+            field.path,
+            _SOURCE_ENERGY_OPTIONS,
+            value=value if value in {"poni", "metadata"} else "poni",
+            enabled=bool(field.enabled),
+            reason=field.reason or "",
+        )
+        seg.valueChanged.connect(self.fieldValueChanged)
+        lay.addWidget(seg)
+        self._source_energy_popup = popup
+        popup.show()
+        popup.raise_()
+        popup.activateWindow()
 
     def _render_experiment_bound_section(
         self,

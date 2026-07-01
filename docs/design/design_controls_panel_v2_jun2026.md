@@ -773,16 +773,18 @@ the flip is not declared fully cleared until the live checkpoint is rerun.
 - Missing or invalid Project Folder is now a first-stage gate: non-Project V2
   sections stay hidden, readiness stays pink, and the Run row is disabled rather
   than offering a green no-op.
-- A loaded processed `.nxs` with stored PONI and reachable raw-source pointers can
-  seed the streaming Run path from the scan cache, matching the green readiness
-  status instead of failing the old PONI-file-only guard.
-- Streaming-run readiness no longer requires an already-produced processed frame
-  count. A configured reachable raw source can enable Run before any `.nxs` frames
-  exist, while the Source header still reports processed frame count when present.
-- PONI wavelength now satisfies the calibration-energy gate, matching the detector
-  summary's PONI lookup. The output `.nxs` filename is no longer treated as a fake
-  source; the Source state is based on the selected image/Nexus source or a loaded
-  scan source.
+- A loaded processed `.nxs` no longer populates Source or enables a fresh
+  streaming Run. The loaded result touches the Processing/Reintegrate surface
+  only; if no raw frame source is configured, the readiness row says Run needs a
+  frame source and points the user to Reintegrate.
+- Streaming-run readiness now counts the configured raw source, not the loaded
+  scan. Image directories count images by file type/filter, Eiger/HDF5/Nexus
+  containers count images inside the container, directory-of-master scans sum
+  `*_master.h5` frame counts, and live mode skips the pre-known count gate.
+- PONI wavelength is the default calibration-energy authority, matching the
+  detector summary's PONI lookup. Source metadata energy remains available as a
+  native V2 preference behind the Source-card `...` button when a beamline needs
+  metadata to win. The output `.nxs` filename is never treated as a fake source.
 - The compact readiness row now names the first ordered blocker (Project → PONI /
   energy → Source → mode-specific facts), with the full blocker list in the tooltip.
   Section headers now carry small accent-coloured validity ticks driven by the same
@@ -808,11 +810,15 @@ correctness rather than V2-vs-hidden-widget parity. The core checks are:
   legacy widget values.
 - Project-folder gating and processed-`.nxs` rerun readiness now use the same
   predicates as the visible Run controls.
+- Source readiness tests cover configured-source counts, loaded-scan-without-source
+  Run-disabled behavior, and the Source header staying raw-source-only.
+- The Source-card energy preference is native V2 state, defaults to PONI, and can
+  make metadata energy authoritative without adding a new ParameterTree carrier.
 
 **Validated in `xrd_test` for this chunk.**
-- `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_logic.py -q` → 30 passed.
-- `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_panel_v2.py -q` → 75 passed.
-- `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_panel_v2.py -k "raw_source_and_poni_enable_run_without_frames or source_label_uses_configured_raw_source or cached_scan_poni_satisfies_calibration or section_ticks_and_source_synopsis" -q` → 4 passed, 71 deselected.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_logic.py -q` → 32 passed.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_panel_v2.py -q -p no:faulthandler` → 84 passed.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_panel_v2.py -k "source_energy_button or metadata_energy_preference or energy_conflict or energy_values_use_poni_without_scan or calibration_energy_prefers_poni or source_count or loaded_scan_does_not_populate_source_or_run or raw_source_and_poni_enable_run_with_source_frames" -q` → 10 passed, 74 deselected.
 - `QT_QPA_PLATFORM=offscreen tests/xdart/test_static_controls.py -q` → 8 passed.
 - `QT_QPA_PLATFORM=offscreen tests/xdart/test_static_controls.py tests/xdart/test_n1_disclosure.py -q` → 15 passed.
 - `QT_QPA_PLATFORM=offscreen tests/xdart/test_live_refresh.py -k "wrangler_enabled_reapplies_viewer_mode_controls or file_viewer_mode_disables_processing_tree_but_not_mode_combo or start_guard_adopts_processed_scan_cached_poni_and_source or start_without_poni_is_gated" -q` → 4 passed.

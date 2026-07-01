@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+from types import MethodType, SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -105,6 +106,18 @@ def _find_more_button(widget):
     for btn in widget.controls_v2.experiment_card.body.findChildren(
             QtWidgets.QToolButton):
         if btn.objectName() == "controlsV2MoreButton":
+            return btn
+    return None
+
+
+def _find_source_energy_button(widget):
+    """The Source-card energy-preference '…' button, or None."""
+    for btn in widget.controls_v2.source_card.body.findChildren(
+            QtWidgets.QToolButton):
+        if (
+            btn.objectName() == "controlsV2MoreButton"
+            and btn.property("role") == "sourceEnergy"
+        ):
             return btn
     return None
 
@@ -926,6 +939,38 @@ def test_controls_panel_v2_bound_mode_uses_inline_browse_and_top_actions(qapp, m
         widget.deleteLater()
 
 
+def test_controls_panel_v2_source_energy_button_updates_native_preference(
+        qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget._refresh_controls_v2_profile_now()
+
+        btn = _find_source_energy_button(widget)
+        assert btn is not None
+        assert widget._controls_v2_energy_preference() == "poni"
+
+        btn.click()
+        popup = widget.controls_v2.findChild(QtWidgets.QWidget, "controlsV2EnergyPopup")
+        assert popup is not None
+        seg = popup.findChild(SegmentedControl)
+        assert seg is not None
+        assert seg.current_value() == "poni"
+        metadata_button = next(
+            button for button in seg.findChildren(QtWidgets.QPushButton)
+            if button.text() == "Metadata"
+        )
+
+        metadata_button.click()
+
+        assert widget._controls_v2_energy_preference() == "metadata"
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
 def test_controls_panel_v2_can_be_hidden_by_env(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "0")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -1235,6 +1280,36 @@ def test_controls_panel_v2_energy_conflict_reaches_widget_profile(
         widget.deleteLater()
 
 
+def test_controls_panel_v2_metadata_energy_preference_becomes_authoritative(
+        qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget.scan._persisted_wavelength_m = 1.0e-10
+        widget.scan.source_energy_eV = 15_000.0
+
+        widget._on_controls_v2_field_changed(
+            ("Source", "energy_preference"), "metadata")
+        state = widget._controls_v2_state()
+        render_state = build_control_panel_state(
+            state,
+            widget._controls_v2_field_values(),
+            widget._controls_v2_field_choices(),
+        )
+        energy = render_state.profile.fields[FieldId.BEAM_ENERGY]
+
+        assert widget._controls_v2_energy_preference() == "metadata"
+        assert state.geom.calibration_energy_eV == pytest.approx(15_000.0)
+        assert state.geom.source_energy_eV is None
+        assert energy.status is StatusKind.OK
+        assert "disagree" not in energy.reason.lower()
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
 def test_controls_panel_v2_state_summarizes_cached_poni_detector(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
@@ -1310,13 +1385,168 @@ def test_controls_panel_v2_cached_scan_poni_satisfies_calibration(
         widget.deleteLater()
 
 
+def test_controls_panel_v2_energy_values_use_poni_without_scan():
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.core.energy import wavelength_m_to_energy_eV
+
+    wavelength_m = 1.0e-10
+    host = SimpleNamespace(
+        scan=None,
+        _controls_v2_current_poni=lambda: PONI(
+            dist=0.1,
+            poni1=0.0,
+            poni2=0.0,
+            detector="RayonixMx225",
+            wavelength=wavelength_m,
+        ),
+        _controls_v2_calibration_energy_eV=(
+            staticWidget._controls_v2_calibration_energy_eV
+        ),
+        _controls_v2_source_energy_eV=staticWidget._controls_v2_source_energy_eV,
+        _controls_v2_metadata_energy_eV=lambda scan: None,
+        _controls_v2_energy_preference=lambda: "poni",
+    )
+    host._controls_v2_energy_values = MethodType(
+        staticWidget._controls_v2_energy_values, host)
+
+    calibration_energy_eV, source_energy_eV = host._controls_v2_energy_values()
+
+    assert calibration_energy_eV == pytest.approx(
+        wavelength_m_to_energy_eV(wavelength_m), rel=1e-12)
+    assert source_energy_eV is None
+
+
+def test_controls_panel_v2_calibration_energy_prefers_poni_over_scan_wavelength():
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.core.energy import wavelength_m_to_energy_eV
+
+    poni_wavelength_m = 0.7293e-10
+    scan = SimpleNamespace(_persisted_wavelength_m=1.0e-10)
+    poni = PONI(
+        dist=0.1794,
+        poni1=0.0,
+        poni2=0.0,
+        detector="RayonixMx225",
+        wavelength=poni_wavelength_m,
+    )
+
+    assert staticWidget._controls_v2_calibration_energy_eV(
+        scan, poni=poni) == pytest.approx(
+            wavelength_m_to_energy_eV(poni_wavelength_m),
+            rel=1e-12,
+        )
+
+
+def test_controls_panel_v2_source_count_uses_container_frame_count(
+        monkeypatch, tmp_path):
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.io import image as image_io
+
+    master = tmp_path / "scan_master.h5"
+    master.write_bytes(b"")
+    monkeypatch.setattr(image_io, "count_frames", lambda path: 50)
+
+    count = staticWidget._controls_v2_count_source_frames(
+        source_type="Image Series",
+        img_file=str(master),
+        img_dir="",
+        img_ext="h5",
+        include_subdir=False,
+        file_filter="",
+    )
+
+    assert count == 50
+
+
+def test_controls_panel_v2_source_count_sums_directory_masters(
+        monkeypatch, tmp_path):
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.io import image as image_io
+
+    first = tmp_path / "a_master.h5"
+    second = tmp_path / "b_master.h5"
+    ignored = tmp_path / "not_a_container.h5"
+    for path in (first, second, ignored):
+        path.write_bytes(b"")
+
+    def _count(path):
+        return {first.name: 50, second.name: 30}.get(Path(path).name, 999)
+
+    monkeypatch.setattr(image_io, "count_frames", _count)
+
+    count = staticWidget._controls_v2_count_source_frames(
+        source_type="Image Directory",
+        img_file="",
+        img_dir=str(tmp_path),
+        img_ext="h5",
+        include_subdir=False,
+        file_filter="",
+    )
+
+    assert count == 80
+
+
+def test_controls_panel_v2_source_count_counts_single_image_files(
+        monkeypatch, tmp_path):
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.io import image as image_io
+
+    for idx in range(3):
+        (tmp_path / f"scan_{idx:04d}.tif").write_bytes(b"")
+    monkeypatch.setattr(
+        image_io,
+        "count_frames",
+        lambda path: pytest.fail("single-image directory count opened a file"),
+    )
+
+    count = staticWidget._controls_v2_count_source_frames(
+        source_type="Image Directory",
+        img_file="",
+        img_dir=str(tmp_path),
+        img_ext="tif",
+        include_subdir=False,
+        file_filter="",
+    )
+
+    assert count == 3
+
+
+def test_controls_panel_v2_source_frame_count_is_unknown_in_live_mode(tmp_path):
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    raw_path = tmp_path / "scan_0001.tif"
+    raw_path.write_bytes(b"")
+
+    values = {
+        ("Signal", "inp_type"): "Image Series",
+        ("Signal", "File"): str(raw_path),
+        ("Signal", "img_dir"): "",
+        ("Signal", "img_ext"): "tif",
+        ("Signal", "include_subdir"): False,
+        ("Signal", "Filter"): "",
+    }
+    host = SimpleNamespace(
+        _v2_frame_count_cache=None,
+        _controls_v2_param_value=lambda path, default="": values.get(tuple(path), default),
+        _controls_v2_live_source_active=lambda: True,
+    )
+    host._controls_v2_source_frame_count = MethodType(
+        staticWidget._controls_v2_source_frame_count, host)
+
+    assert host._controls_v2_source_frame_count() is None
+
+
 def test_controls_panel_v2_source_label_uses_configured_raw_source(
         qapp, monkeypatch, tmp_path):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.io import image as image_io
 
     widget = staticWidget()
     try:
+        monkeypatch.setattr(image_io, "count_frames", lambda path: 1)
         raw_path = tmp_path / "raw" / "scan_0001.tif"
         raw_path.parent.mkdir()
         raw_path.write_bytes(b"")
@@ -1328,13 +1558,14 @@ def test_controls_panel_v2_source_label_uses_configured_raw_source(
 
         assert state.source_label == str(raw_path)
         assert state.source_caps.has_raw is True
-        assert state.source_caps.has_frames is False
+        assert state.source_caps.has_frames is True
+        assert state.frame_count == 1
     finally:
         widget.close()
         widget.deleteLater()
 
 
-def test_controls_panel_v2_raw_source_and_poni_enable_run_without_frames(
+def test_controls_panel_v2_loaded_scan_does_not_populate_source_or_run(
         qapp, monkeypatch, tmp_path):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -1342,6 +1573,56 @@ def test_controls_panel_v2_raw_source_and_poni_enable_run_without_frames(
 
     widget = staticWidget()
     try:
+        project = tmp_path / "project"
+        project.mkdir()
+        processed = project / "processed.nxs"
+        processed.write_bytes(b"")
+        poni_path = project / "cal.poni"
+        PONI(
+            dist=0.1794,
+            poni1=0.0,
+            poni2=0.0,
+            detector="RayonixMx225",
+            wavelength=0.7293e-10,
+        ).to_poni_file(poni_path)
+
+        widget._controls_v2_param(("Project", "project_folder")).setValue(str(project))
+        widget.wrangler.project_folder = str(project)
+        widget._controls_v2_param(("Project", "h5_dir")).setValue(
+            str(project / "xdart_processed_data")
+        )
+        widget.wrangler.h5_dir = str(project / "xdart_processed_data")
+        widget._controls_v2_param(("Signal", "File")).setValue("")
+        widget.wrangler.img_file = ""
+        widget.scan.data_file = str(processed)
+        widget._set_poni_field(str(poni_path))
+
+        widget._refresh_controls_v2_profile_now()
+        state = widget._controls_v2_state()
+        summary, ready, _tooltip = widget._controls_v2_run_summary(
+            state, widget.controls_v2.profile)
+
+        assert state.loaded_scan_available is True
+        assert state.source_label == ""
+        assert state.frame_count == 0
+        assert state.source_caps.has_frames is False
+        assert widget.controls_v2.profile.can_run is False
+        assert "Run needs a frame source" in summary
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_raw_source_and_poni_enable_run_with_source_frames(
+        qapp, monkeypatch, tmp_path):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.io import image as image_io
+
+    widget = staticWidget()
+    try:
+        monkeypatch.setattr(image_io, "count_frames", lambda path: 1)
         project = tmp_path / "project"
         project.mkdir()
         raw_path = project / "raw" / "scan_0001.tif"
@@ -1369,7 +1650,7 @@ def test_controls_panel_v2_raw_source_and_poni_enable_run_without_frames(
         widget._refresh_controls_v2_profile_now()
 
         state = widget._controls_v2_state()
-        assert state.frame_count == 0
+        assert state.frame_count == 1
         assert state.source_label == str(raw_path)
         assert state.geom.calibration_energy_eV is not None
         assert widget.controls_v2.profile.can_run is True

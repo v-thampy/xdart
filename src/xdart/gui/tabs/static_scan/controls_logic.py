@@ -32,6 +32,17 @@ class MeasMode(str, Enum):
     GI = "gi"
 
 
+class RunTarget(str, Enum):
+    SOURCE = "source"
+    LOADED_SCAN = "loaded_scan"
+    NONE = "none"
+
+
+LOADED_SCAN_RUN_MESSAGE = (
+    "Run needs a frame source - use Reintegrate for the loaded scan."
+)
+
+
 class ProcessingPage(str, Enum):
     INT_1D = "int_1d"
     INT_2D = "int_2d"
@@ -733,6 +744,11 @@ BOUND_CONTROL_PATHS: tuple[tuple[str, ...], ...] = (
 )
 
 
+NATIVE_CONTROL_PATHS: frozenset[tuple[str, ...]] = frozenset({
+    ("Source", "energy_preference"),
+})
+
+
 def coerce_control_edit_value(current: object, incoming: object) -> object:
     """Coerce a form edit to the type of the current backing value."""
 
@@ -1110,6 +1126,8 @@ def build_bound_control_state(
             add(SectionId.SOURCE, "Image File", ("Signal", "File"), browse=True)
         add(SectionId.SOURCE, "Meta Type", ("Signal", "meta_ext"),
             kind=ControlFieldKind.COMBO)
+        add(SectionId.SOURCE, "Energy", ("Source", "energy_preference"),
+            kind=ControlFieldKind.COMBO)
         if str(values.get(("Signal", "meta_ext"), "")) == "SPEC":
             add(SectionId.SOURCE, "SPEC Dir", ("Signal", "meta_dir"), browse=True)
         add(SectionId.EXPERIMENT, "Poni", ("Signal", "poni_file"), browse=True)
@@ -1170,6 +1188,8 @@ class ControlState:
     project_root_required: bool = False
     project_root_valid: bool = True
     source_label: str = ""
+    run_target: RunTarget | str = ""
+    loaded_scan_available: bool = False
     save_path: str = ""
     frame_count: int = 0
     processing_mode: str = ""
@@ -1350,6 +1370,45 @@ def _processing_backend_status_reason(
     return StatusKind.OK, ""
 
 
+def effective_run_target(state: ControlState) -> RunTarget:
+    """Return what the Run button would operate on for this state.
+
+    A configured frame source is the only target that enables a fresh Run.
+    A loaded processed scan can still be re-integrated, but it is not a fresh
+    source and must not satisfy the Run gate.
+    """
+
+    raw = getattr(state, "run_target", "")
+    target = ""
+    if isinstance(raw, RunTarget):
+        return raw
+    try:
+        target = str(raw or "").strip().lower()
+    except Exception:
+        target = ""
+    for candidate in RunTarget:
+        if target == candidate.value:
+            return candidate
+
+    caps = state.source_caps
+    if caps.has_frames or caps.raw_reachable:
+        return RunTarget.SOURCE
+    if getattr(state, "loaded_scan_available", False):
+        return RunTarget.LOADED_SCAN
+    return RunTarget.NONE
+
+
+def run_target_readiness_note(
+    state: ControlState, *, ready: bool = False
+) -> str:
+    """Return the optional readiness-row note for the current run target."""
+
+    target = effective_run_target(state)
+    if target == RunTarget.LOADED_SCAN:
+        return LOADED_SCAN_RUN_MESSAGE
+    return ""
+
+
 def build_field_statuses(state: ControlState) -> Mapping[FieldId, FieldStatus]:
     caps = state.source_caps
     geom = state.geom
@@ -1372,10 +1431,11 @@ def build_field_statuses(state: ControlState) -> Mapping[FieldId, FieldStatus]:
     else:
         project_status = StatusKind.DEFERRED
         project_reason = "Optional; improves portable paths."
-    source_selected = bool(state.source_label or caps.has_frames or caps.has_raw)
+    run_target = effective_run_target(state)
+    source_selected = run_target == RunTarget.SOURCE
     source_label = (
         state.source_label
-        or ("Loaded frames" if caps.has_frames else "No source selected")
+        or ("Live source" if source_selected else "No source selected")
     )
     frame_value = str(state.frame_count) if state.frame_count else ""
     energy_status, energy_value, energy_reason = _energy_status_reason(geom, caps)
@@ -1390,7 +1450,13 @@ def build_field_statuses(state: ControlState) -> Mapping[FieldId, FieldStatus]:
             FieldId.SOURCE_PATH,
             StatusKind.OK if source_selected else StatusKind.MISSING,
             value=source_label,
-            reason="" if source_selected else "Choose a data source."),
+            reason=(
+                ""
+                if source_selected
+                else LOADED_SCAN_RUN_MESSAGE
+                if run_target == RunTarget.LOADED_SCAN
+                else "Choose a data source."
+            )),
         FieldId.SOURCE_FRAMES: _field(
             FieldId.SOURCE_FRAMES,
             StatusKind.OK if caps.has_frames else StatusKind.MISSING,
@@ -1821,12 +1887,16 @@ def run_blockers_from_fields(
     fields: Mapping[FieldId, FieldStatus],
 ) -> tuple[str, ...]:
     blockers: list[str] = []
+    run_target = effective_run_target(state)
     for field_id in run_required_fields_for(state):
         field = fields.get(field_id)
         if field is None:
             continue
         if field.status == StatusKind.MISSING:
-            blockers.append(_RUN_BLOCKER_TEXT.get(field_id) or field.reason)
+            if field_id == FieldId.SOURCE_PATH and run_target == RunTarget.LOADED_SCAN:
+                blockers.append(LOADED_SCAN_RUN_MESSAGE)
+            else:
+                blockers.append(_RUN_BLOCKER_TEXT.get(field_id) or field.reason)
         elif field.status == StatusKind.CONFLICT:
             blockers.append(field.reason or _RUN_BLOCKER_TEXT.get(field_id, "Resolve conflict."))
     if state.tool == Tool.STITCH:
