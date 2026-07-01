@@ -26,6 +26,10 @@ if TYPE_CHECKING:
     from xrd_tools.sources.memory import LiveFrameSource, MemoryFrameSource
     from xrd_tools.sources.nexus import NexusStackSource, ProcessedNexusSource
     from xrd_tools.sources.probe import probe_first_frame, raw_is_reachable
+    from xrd_tools.sources.readiness import (
+        capabilities_for_processed,
+        describe_source_readiness,
+    )
     from xrd_tools.sources.registry import (
         guess_source_kind,
         open_source,
@@ -45,6 +49,8 @@ _LAZY_EXPORTS = {
     "SpecSource": "xrd_tools.sources.spec",
     "TiffSeriesSource": "xrd_tools.sources.image",
     "concat_sources": "xrd_tools.sources.composite",
+    "capabilities_for_processed": "xrd_tools.sources.readiness",
+    "describe_source_readiness": "xrd_tools.sources.readiness",
     "discover_scans": "xrd_tools.sources.discover",
     "ensure_frame_source": "xrd_tools.sources.base",
     "flatten_scan_groups": "xrd_tools.sources.grouping",
@@ -84,7 +90,9 @@ __all__ = [
     "SourceSpec",
     "SpecSource",
     "TiffSeriesSource",
+    "capabilities_for_processed",
     "concat_sources",
+    "describe_source_readiness",
     "discover_scans",
     "ensure_frame_source",
     "flatten_scan_groups",
