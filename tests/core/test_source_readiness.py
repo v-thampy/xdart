@@ -179,3 +179,17 @@ def test_sources_readiness_import_and_processed_caps_are_pure():
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_live_spec_keeps_escape_hatch_when_open_fails(monkeypatch):
+    """Fallback path (open_source returns None): a LIVE spec must keep the
+    true-live escape hatch (raw_reachable=True), not collapse to all-False — a
+    live acquisition may legitimately have no frame 0 yet at gate time."""
+    from types import SimpleNamespace
+    from xrd_tools.sources import readiness as R
+
+    monkeypatch.setattr(R, "_open_source", lambda _v: None)   # force the fallback
+    caps = R.describe_source_readiness(SimpleNamespace(kind=R.SourceKind.LIVE))
+    assert caps.raw_reachable is True
+    assert caps.has_frames is True
+    assert caps.has_raw is True

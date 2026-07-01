@@ -141,6 +141,14 @@ def _open_source(value: Any) -> Any | None:
 
 
 def _caps_from_classification(value: Any) -> SourceCaps:
+    # True-live escape hatch on the FALLBACK path too: if open_source() failed but
+    # the spec is a LIVE kind, a live acquisition may simply have no frame 0 yet —
+    # keep it raw-reachable rather than collapsing to all-False (which would wrongly
+    # gate the Run).  Mirrors the live_unknown branch on the open-succeeds path.
+    if getattr(value, "kind", None) == SourceKind.LIVE:
+        return SourceCaps(
+            has_frames=True, has_raw=True, raw_reachable=True, has_metadata=False,
+        )
     info = _classify(value)
     frame_count = getattr(info, "n_frames", 0) if info is not None else _count_frames(value)
     has_frames = bool(frame_count and frame_count > 0)

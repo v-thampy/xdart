@@ -1,7 +1,8 @@
 # Design — Plan B item 3: headless source/capability/provenance contracts migration
 
-**Status:** Stage 1 = **NOT STARTED** (this doc created 2026-07-01, release commit `f2e99a4a`).
-See the per-stage **Status checklist** at the bottom.
+**Status (2026-07-01):** Stages 1–5 (the **headless half**) = **DONE + merged on `feature/remediation`**.
+Stages 6–8 (the contested-GUI Plan B items 1/2/4) are **deferred** post-Phase-5 / a stable
+`static_scan_widget.py` checkpoint. See the per-stage **Status checklist** at the bottom for commits.
 
 **Convention:** every agent that lands a chunk of this plan updates the Status checklist at the
 bottom of *this* doc after its chunk (stage tag → DONE + commit sha + one-line note). Keep the

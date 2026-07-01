@@ -158,3 +158,23 @@ F5 Set Bkg button in all display modes.
   auto-publish).
 * The old repos should be archived with a pointer here once the release is
   cut.
+
+## Post-v1.0 — Plan B item 3 (headless contracts, on `feature/remediation`)
+
+These land after the v1.0 tag (headless source/capability/provenance extraction). Two
+behavior notes for downstream users:
+
+* **Headless runs now emit `/entry/reduction/`.** A purely headless `run_reduction` /
+  `NexusSink` now writes the same `NXprocess` reduction-provenance group the GUI writer
+  already produced (config + inputs), via `xrd_tools.reduction.provenance_config
+  .build_reduction_config`. Additive to the frozen format; the GUI writer's bytes are
+  unchanged.
+* **Monitor-normalization is now guarded + case-insensitive everywhere.** The per-frame
+  monitor-norm resolver was unified into `xrd_tools.core.metadata.resolve_monitor_norm`
+  (canonical: case-insensitive key lookup; only finite, positive values normalize;
+  0/negative/inf/NaN → no normalization, factor 1.0). Two of these are strictly safer
+  (removing a div-by-zero / sign-flip / zeroing). One is a **silent numeric change**: a
+  monitor-counter key whose *case* didn't exactly match the configured key was previously
+  left un-normalized (factor 1.0) and now resolves and normalizes — so a dataset with a
+  case-mismatched monitor key will integrate to different (correct) numbers. Re-reduce such
+  datasets if exact reproduction of the old (un-normalized) values matters.
