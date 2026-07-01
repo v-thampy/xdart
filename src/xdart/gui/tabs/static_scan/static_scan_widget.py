@@ -2185,10 +2185,11 @@ class staticWidget(QWidget):
         note = run_target_readiness_note(state, ready=ready).rstrip(".")
         if not ready:
             if blockers:
-                parts.append(str(blockers[0]).rstrip("."))
+                parts.append(
+                    staticWidget._controls_v2_visible_run_blocker(blockers[0]))
             elif note:
-                parts.append(note)
-        if ready and mode:
+                parts.append(staticWidget._controls_v2_visible_run_blocker(note))
+        if mode:
             parts.append(mode)
         frame_count = int(getattr(state, "frame_count", 0) or 0)
         if ready and frame_count:
@@ -2199,6 +2200,13 @@ class staticWidget(QWidget):
             tooltip_parts.append(note)
         tooltip = "" if ready else "; ".join(tooltip_parts)
         return " · ".join(parts), ready, tooltip
+
+    @staticmethod
+    def _controls_v2_visible_run_blocker(message: object) -> str:
+        text = str(message).rstrip(".")
+        if text.startswith("Run needs a frame source"):
+            return "Run needs a frame source"
+        return text
 
     def _defer_controls_v2_refresh_until_commit(self, editor) -> None:
         """Arm a one-shot: when ``editor`` finishes editing (Enter / focus loss),

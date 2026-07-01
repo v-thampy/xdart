@@ -1440,9 +1440,8 @@ def test_controls_panel_v2_readiness_summary_shows_only_top_blocker():
         state, profile)
 
     assert ready is False
-    assert summary == "Needs setup · Choose a project folder"
+    assert summary == "Needs setup · Choose a project folder · Int 2D"
     assert "Run needs a frame source" not in summary
-    assert "Int 2D" not in summary
     assert "Run needs a frame source" in tooltip
 
 
@@ -1739,8 +1738,8 @@ def test_controls_panel_v2_loaded_scan_does_not_populate_source_or_run(
         assert state.frame_count == 0
         assert state.source_caps.has_frames is False
         assert widget.controls_v2.profile.can_run is False
-        assert "Run needs a frame source" in summary
-        assert "Int 2D" not in summary
+        assert summary == "Needs setup · Run needs a frame source · Int 2D"
+        assert "use Reintegrate" not in summary
     finally:
         widget.close()
         widget.deleteLater()
