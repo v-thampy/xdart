@@ -128,7 +128,7 @@ def _control_panel_font_tokens(size="default"):
     offset = _CONTROL_PANEL_FONT_OFFSETS.get(key, 0)
     return {
         "control_panel_font": f"{12 + offset}px",
-        "control_panel_status_font": f"{8 + offset}px",
+        "control_panel_status_font": f"{6 + offset}px",
         "control_panel_tick_font": f"{12 + offset}px",
         "control_panel_browse_font": f"{13 + offset}px",
         "control_panel_run_font": f"{13 + offset}px",
@@ -925,6 +925,13 @@ QPushButton#controlsV2PillButton:disabled {
 QPushButton#controlsV2PillButton {
     border-radius: 13px;
     padding: 4px 13px;
+    /* macOS (QMacStyle) renders a rounded QPushButton bezel only when the button
+       is tall enough that the 13px radius stays clear of ~half its height; at
+       the body-font height (~25px) cocoa gives up and draws SQUARE corners.
+       Floor the height so the pill lands at ~28px (min-height is the content
+       box; padding + border add ~10px) and the rounded bezel always renders --
+       at every font preset.  Harmless on platforms that already round it. */
+    min-height: 18px;
 }
 /* The compact RangeRow's ✦ auto/enable toggle + the low–high separator. */
 QToolButton#controlsV2AutoButton {

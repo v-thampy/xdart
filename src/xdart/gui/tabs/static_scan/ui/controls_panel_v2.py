@@ -763,12 +763,11 @@ class PillRow(QtWidgets.QWidget):
         for field in fields:
             btn = QtWidgets.QPushButton(field.label)
             # Reuse the accent-when-checked toggle styling, but content-sized and
-            # fully rounded.  Use a DEDICATED object name (grouped with
-            # controlsV2ToggleButton in the theme) rather than a [pill="true"]
-            # dynamic property: a property-based QSS selector only takes effect
-            # after a global restyle, so the rounded radius stayed unapplied
-            # (boxy pills) until an unrelated font-size change; an object-name
-            # selector is applied at the button's first polish.
+            # fully rounded, via a DEDICATED object name (grouped with
+            # controlsV2ToggleButton in the theme).  The fully-rounded radius
+            # also needs the button tall enough for macOS to draw the rounded
+            # bezel -- the theme floors it with a min-height (see the
+            # #controlsV2PillButton rule).
             btn.setObjectName("controlsV2PillButton")
             btn.setCheckable(True)
             btn.setChecked(bool(field.value))
