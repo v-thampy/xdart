@@ -1155,8 +1155,8 @@ class imageWrangler(wranglerWidget):
             if scan_loaded and not scan_has_integrator:
                 imageWrangler._safe_status_text(
                     self,
-                    'This scan was saved without detector pixel sizes — load a '
-                    'PONI calibration file to integrate.',
+                    'This scan was saved without a usable detector calibration '
+                    '— load a PONI calibration file to integrate.',
                 )
             else:
                 imageWrangler._safe_status_text(

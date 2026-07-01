@@ -575,6 +575,18 @@ class LiveScan:
         from xrd_tools.integrate.calibration import poni_to_integrator
         _pd = {k: float(_det[k][()]) for k in
                ("dist", "poni1", "poni2", "rot1", "rot2", "rot3") if k in _det}
+        # A zero (or negative) sample-detector distance is a placeholder, not a
+        # calibration: every pixel maps to a single constant q, so any requested
+        # q-range catches nothing -> an all-NaN 2D cake (loudly rejected) and a
+        # silent flat-zero 1D pattern.  Refuse to restore (same class as the
+        # pixel-less case) so the up-front readiness guard surfaces a clear
+        # "load a PONI" message instead of every frame silently failing
+        # publication mid-run.
+        if _pd.get("dist", 0.0) <= 0.0:
+            logger.info("[REINTEGRATE-CAL] %s has a zero/degenerate geometry "
+                        "(dist=%s) — not a usable calibration; refusing to "
+                        "restore", self.data_file, _pd.get("dist"))
+            return False
         if "detector_name" in _det:
             _nm = _det["detector_name"][()]
             _pd["detector"] = (_nm.decode() if isinstance(_nm, bytes)

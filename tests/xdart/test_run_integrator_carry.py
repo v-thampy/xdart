@@ -159,7 +159,47 @@ def test_inputs_valid_blocks_pixel_less_reloaded_scan():
     host, status = _readiness_host(scan, poni=None)
 
     assert host._inputs_valid() is False
-    assert "without detector pixel sizes" in status["text"]
+    assert "without a usable detector calibration" in status["text"]
+
+
+def test_restore_refuses_zero_placeholder_geometry():
+    """A processed .nxs saved with a zero/placeholder geometry (dist=0) is NOT a
+    usable calibration — with dist=0 every pixel maps to a single constant q, so
+    a requested q-range catches nothing -> an all-NaN cake. The restore must
+    REFUSE (return False, leaving _cached_integrator=None) so the readiness guard
+    blocks with a clear message rather than running to an all-NaN result. A real
+    dist restores normally."""
+    h5py = pytest.importorskip("h5py")
+    import numpy as np
+    from types import SimpleNamespace, MethodType
+    from xdart.modules.ewald.scan import LiveScan
+
+    restore = LiveScan._restore_calibration_from_group
+
+    def _det_group(f, dist):
+        g = f.create_group("det")
+        for k, v in (("dist", dist), ("poni1", 0.0), ("poni2", 0.0)):
+            g[k] = np.float64(v)
+        g["x_pixel_size"] = np.float64(7.3242e-05)
+        g["y_pixel_size"] = np.float64(7.3242e-05)
+        g["detector_name"] = "Detector"
+        return g
+
+    with h5py.File("zero.h5", "w", driver="core", backing_store=False) as f:
+        stub = SimpleNamespace(data_file="zero.nxs", detector_shape=None,
+                               _persisted_wavelength_m=1.0e-10,
+                               _cached_poni=None, _cached_integrator=None,
+                               _cached_fiber_integrator=None)
+        assert MethodType(restore, stub)(_det_group(f, 0.0)) is False
+        assert stub._cached_integrator is None
+
+    with h5py.File("real.h5", "w", driver="core", backing_store=False) as f:
+        stub = SimpleNamespace(data_file="real.nxs", detector_shape=None,
+                               _persisted_wavelength_m=1.0e-10,
+                               _cached_poni=None, _cached_integrator=None,
+                               _cached_fiber_integrator=None)
+        assert MethodType(restore, stub)(_det_group(f, 0.15)) is True
+        assert stub._cached_integrator is not None
 
 
 def test_inputs_valid_allows_reloaded_scan_with_integrator():
