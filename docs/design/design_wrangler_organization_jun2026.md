@@ -1,9 +1,11 @@
 # Design: wrangler widget organization (Int / Stitch / RSM)
 
-**Status:** DESIGN/P7 · reconciled 2026-06-27. Headless source, geometry,
-correction, stitch, and RSM foundations are implemented or tracked in
-`stitching_rsm_build_plan.md`; this document remains the GUI organization plan for
-future Stitch/RSM wrangler panels.
+**Status:** DESIGN/P7 · reconciled 2026-07-01 (against release `f2e99a4a`). Headless
+source, geometry, correction, stitch, and RSM foundations are implemented (tracked in
+`stitching_rsm_build_plan.md`). GUI **Stitch 1D/2D is now wired** (`stitchThread` +
+`StitchDisplayController` + `Tool`/`ProcessingPage` scaffolding in `controls_logic.py`);
+RSM GUI and the shared source/geometry/Refine wrangler panels below remain the future
+work this doc plans.
 **Companion to:** [`design_stitching_jun2026.md`](design_stitching_jun2026.md) §5.4 (the
 authoritative *input inventory*) and
 [`design_diffractometer_geometry_jun2026.md`](design_diffractometer_geometry_jun2026.md)
@@ -30,7 +32,11 @@ layer over the shipped headless seams.
   `keep_xdart_thin`). Source quirks (file layout, column names, sidecar `.pdi`, directory
   watch) live in the wrangler adapter; everything downstream consumes a uniform
   `motor_name → per-frame values` stream + image stream via the ssrl `FrameSource` seam.
-  Anything in the wrangler that doesn't touch Qt belongs in the headless core.
+  Anything in the wrangler that doesn't touch Qt belongs in the headless core. (Directory
+  watch is partly here already: `image_wrangler.py::_find_image_directory_seed` (~L1562) walks
+  the image dir with a FOUND-cached-indefinitely / NEGATIVE-0.5s-TTL seed cache, shipped in
+  `f2e99a4a`, so an unrelated edit does not re-walk and a still-filling dir is not negatively
+  cached.)
 - **During a run the wrangler tree is HARD-disabled** (`tree.setEnabled(False)`), not
   read-only (memory `feedback_wrangler_hard_disable`); the Grazing-checkbox repaint (#56) is an
   accepted cosmetic — don't revert to the readonly approach. **Batch mode stays silent**
@@ -168,15 +174,16 @@ repaint cosmetic (#56) by removing the bool widget entirely.
 ---
 
 ## 5. scan_data / positioners must round-trip (memory `nexussink_scan_data_persistence`)
-The per-frame motor/counter table is **collected during source reading** but the headless write
-path persists only integrated stacks today. For stitch/RSM to be correlated with experimental
-conditions (temperature, stress, time, field) — the whole point of variable-correlated analysis
-— `NexusSink.write` must persist `scan_data` + positioners (`upsert_scan_metadata` /
-`upsert_positioners` exist, just aren't called headlessly). The wrangler's responsibility is to
-*surface* the available positioner columns and *guarantee* they reach the output file; ROI-stats
-and any "plot vs scanned variable" view then read them back (memory
-`planned_features_roi_and_stitching`). Also handle **non-numeric** metadata (string tags/status)
-which is currently dropped (memory `source_agnostic_ingestion`).
+The per-frame motor/counter table is **collected during source reading** and, as of the arch-V2
+writer, is now **persisted**: `xdart/modules/ewald/nexus_writer.py::_write_incremental_metadata`
+calls `upsert_scan_metadata`, `upsert_positioners`, and `upsert_per_frame_geometry` during
+acquisition and on finalize (with a full-replacement fallback; `nexus_writer.py:1483-1518`). So
+`scan_data` + positioners already round-trip for the integration write path. The remaining
+wrangler work is to *surface* the positioner columns and *guarantee* they also reach the
+**stitch/RSM output** files; ROI-stats and any "plot vs scanned variable" view then read them back
+(memory `planned_features_roi_and_stitching`). Also handle **non-numeric** metadata (string
+tags/status) — still dropped by the numeric-only column filter in `io/nexus.py:2741` (memory
+`source_agnostic_ingestion`).
 
 ---
 
@@ -194,17 +201,22 @@ not wait for scan end?* The architecture is **half there**, and the two families
   (scout first+last frames, then stream). Bounds can also be supplied explicitly (`q_bounds`),
   removing the look-ahead entirely → live gridding with zero wait.
 - **Powder stitch is batch-only.** `integrate/multi.py` calls pyFAI `MultiGeometry.integrate1d`
-  over a Python list of *all* images + *all* per-image integrators; `analysis/plans.py::
-  run_stitch` materializes every image first and even guards against a too-large eager stack,
-  with a comment naming an unbuilt *"future streaming StitchPlan backend."* The per-q-bin
-  (signal, counts) histogram *is* associative in principle, but pyFAI exposes no incremental
-  accumulator — going live needs either a per-bin accumulator beneath `MultiGeometry` or
-  re-integrating a growing list.
-- **The streaming spine is mature but not wired to either.** `ScanSession`/`ReductionSession`
-  stream **single-frame integration** results to a `ReductionSink` (`begin`/`write`/`finish`,
-  pause/drain/finalize); there is no stitch/RSM event type and no sink hook calling
-  `StreamingGridder.add()`. Both `run_stitch` and `run_rsm` run as **scan-level finalize**
-  steps today; `run_rsm` is not imported anywhere in `xdart` yet.
+  over a Python list of *all* images + *all* per-image integrators; `analysis/plans.py::run_stitch`
+  materializes every image first (`_load_images_eager`) and guards against a too-large eager stack
+  via `StitchPlan.max_eager_bytes` (default 2 GiB). The design rationale that stitch is
+  **batch-only** is documented in the xdart wrapper `xdart/modules/ewald/stitch.py` (module
+  docstring, "Per plan §4.5: stitch is **batch-only**"). The per-q-bin (signal, counts) histogram
+  *is* associative in principle, but pyFAI exposes no incremental accumulator — going live needs
+  either a per-bin accumulator beneath `MultiGeometry` or re-integrating a growing list.
+- **The streaming spine is mature; Stitch GUI is now wired, RSM GUI is not.** `ScanSession`/
+  `ReductionSession` stream **single-frame integration** results to a `ReductionSink`
+  (`begin`/`write`/`finish`, pause/drain/finalize). Both `run_stitch` and `run_rsm` run as
+  **scan-level finalize** steps in the headless core. In the GUI, **Stitch 1D/2D is now wired** as
+  a processing mode: `scan_threads.py::stitchThread` (`scan_threads.py:990`) runs the xdart
+  `ewald.stitch.run_stitch` off-thread, `display_controllers.py::StitchDisplayController`
+  (`display_controllers.py:580`) gives it a persistent post-run display, and `controls_logic.py`
+  carries `Tool.STITCH`/`Tool.RSM` + `ProcessingPage.STITCH/STITCH_GI/RSM` scaffolding. RSM remains
+  headless-only — `run_rsm` is not imported anywhere in `xdart` yet.
 
 **Wrangler implications (design choices for Vivek):**
 - A **"live"** affordance is *architecturally cheap for RSM* (add an RSM-aware sink that calls

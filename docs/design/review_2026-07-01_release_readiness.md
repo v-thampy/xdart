@@ -5,9 +5,11 @@
 quick-wins) + a git-state check. Focus: release blockers + **low-hanging fruit** (hours-to-a-day,
 not weeks). All effort tags: **S ≤ 2 h · M ≤ 1 day**.
 
-**Git state.** `feature/controls-panel-v2` is **5 ahead / 0 behind `feature/geometry`** (clean
-merge), **234 ahead of `main` with `main` 2 ahead** (two `main`-only commits — see BLOCKER-1),
-version `1.0.0`, `MIGRATION.md` modified-uncommitted (expected — doc stays local). The recent log
+**Git state (at release commit `f2e99a4a`, 2026-07-01).** `feature/controls-panel-v2`,
+`feature/geometry`, `feature/remediation`, and `main` all resolve to `f2e99a4a` — `main..HEAD`
+and `HEAD..main` are both empty, so **BLOCKER-1 is CLOSED** (both `main`-only CI commits
+`abc5dd24` + `d07a7886` are now ancestors of HEAD). Version `1.0.0`; `MIGRATION.md` is now
+**committed** (it landed in `b05cb5a5` / `f2e99a4a`), not modified-uncommitted. The recent log
 is heavy active bug-fixing (generic-detector pixel size, geometry restore, Make-Mask freezes,
 controls-refresh) — all **verified complete + regression-free** (see bottom).
 
@@ -21,7 +23,11 @@ controls-refresh) — all **verified complete + regression-free** (see bottom).
 
 ## BLOCKERS (fix before release)
 
-**B-1 — Bring the two `main`-only CI commits through the merge; the branch is RED without them. [S]**
+**B-1 — RESOLVED (landed in the geometry→main merge; HEAD = `f2e99a4a`).** Both `abc5dd24`
+(adds `host`/`hostname` to `VOLATILE_LEAVES`, `tests/core/h5sig.py:18`) and `d07a7886` (xdart
+isolation + exit-139 retry) are now ancestors of HEAD; `pytest tests/core` runs clean
+(**1389 passed, 4 skipped**) with **no** B-1 deselection. *Original blocker (for the record):
+bring the two `main`-only CI commits through the merge; the branch was RED without them.*
 `git log HEAD..main` = `abc5dd24` + `d07a7886` (both pure CI/test, no product code):
 - `abc5dd24` "CI: mask entry/reduction/host in the byte-compat gate" — **this is why `tests/core`
   and `scripts/release.py check` are currently FAILING on this branch.** The branch's
@@ -40,7 +46,11 @@ controls-refresh) — all **verified complete + regression-free** (see bottom).
 
 ## SHOULD-FIX BEFORE RELEASE
 
-**S-1 — [major] Chunked-PARALLEL reduction drops the strict policy (D7 default-loud defeated on the executor path). [S]**
+**S-1 — FIXED (`b05cb5a5`). [major] Chunked-PARALLEL reduction dropped the strict policy (D7 default-loud defeated on the executor path). [S]**
+`src/xrd_tools/reduction/core.py:1499` now passes `strict=self.strict,` in the parallel
+`self._worker.submit(_reduce_frame, …)` call, and the executor-honors-loud regression test exists at
+`tests/core/test_strictness.py:181` (`test_strict_chunked_executor_honors_loud_policy`, `executor=2`).
+*Original bug (for the record):*
 `src/xrd_tools/reduction/core.py:1483-1499` — the serial and streaming branches pass `strict=self.strict`,
 but the parallel `self._worker.submit(_reduce_frame, …)` stops its positional args at
 `self._warned_monitor_keys` and never passes the keyword-only `strict=`. So `execution="chunked"` +
@@ -50,7 +60,11 @@ where chunked-serial correctly raises `MissingNormalizationError` (runtime-repro
 + MIGRATION.md item 11. **Fix:** add `strict=self.strict,` to the `submit(...)` call; add an
 `executor=True/2` variant to `tests/core/test_strictness.py:151` (today only serial-chunked is tested).
 
-**S-2 — [responsiveness, borderline] Full-directory `rglob` + `sorted()` on the throttled refresh path. [S]**
+**S-2 — FIXED (`b05cb5a5`). [responsiveness, borderline] Full-directory `rglob` + `sorted()` on the throttled refresh path. [S]**
+`static_scan_widget.py:2859-2903` (`_controls_v2_first_metadata_file`) now iterates the unsorted
+`base.rglob`/`base.glob` generator and returns on first match (no `sorted()`), caching the probe on
+`(str(base), img_ext, filter_text, include_subdir)` via `self._controls_v2_metadata_probe_cache`.
+*Original bug (for the record):*
 `static_scan_widget.py:2838-2843` (`_controls_v2_first_metadata_file`): for an Image-Directory source
 with a metadata ext, every V2 refresh (250 ms throttle, while `img_file` is empty during initial
 config) walks the whole tree and `sorted()`s it before returning the first match — a multi-hundred-ms-
@@ -63,27 +77,31 @@ sort) and cache the probe on `(img_dir, img_ext, filter, include_subdir)` like t
 not a product bug** (viewer-mode `SimpleNamespace` stub drift — same class `d07a7886` fixed in
 `test_gui_modes_end_to_end.py`, "no production code changed"). But CI runs the whole dir with no retry
 on this branch, so on a `[gui,dev]` machine run the full file offscreen; if red, complete the ~4 missing
-mock hosts (mechanical). Blocked from confirming here (no Qt in the sandbox).
+mock hosts (mechanical). **Now confirmed at tip:** the `f2e99a4a` release verification reports the
+offscreen GUI suite **1270 passed / 0 failed** (the run-end reconcile mock was fixed by binding the real
+`_reconcile_h5viewer_frame_list_after_run` onto the mock host — `tests/xdart/test_batch_finish_select_last.py:59-60`).
+S-3 is satisfied.
 
 ---
 
 ## QUICK WINS (low-hanging fruit — do opportunistically with the above)
 
-- **M-1 — [memory, ~144 MB] Drop the per-frame `np.zeros_like` `bg_raw`. [S]** `h5viewer.py:1949,2016`
-  allocate a full-size zero array (~18 MB/Eiger) as `bg_raw` for every Image-Viewer/single-frame row,
-  but every consumer treats scalar `0`/`None` as "no background" (`display_data.py:265,466`,
-  `display_controllers.py:213`). Replace with `'bg_raw': 0` → up to ~144 MB saved (cap-8 LRU). Safe/isolated.
-- **M-2 — [memory, trivial] Delete the dead `_raw_cache_order`.** `h5viewer.py:71,679-680` — assigned/
-  cleared, never appended/read. Removes the confusion the D₁ item calls out.
-- **M-3 — [memory, corner] Cap `data_1d` in viewer modes. [S]** `static_scan_widget.py:5326` sets the cap
-  to `None` (unbounded) for Image/XYE/NeXus viewers; entries are light markers, but a huge NeXus/XYE set
-  grows one row/frame unbounded. Cap at a large finite value.
-- **N-1 — [correctness] `write_rsm` lacks the intensity-shape guard its twin has. [S]** `nexus.py:2018-2021`
-  writes `volume.intensity` + h/k/l with no `shape == (len h, len k, len l)` check (`write_stitched`
-  enforces the cake contract at `:1973`). A transposed RSM volume round-trips silently wrong. Mirror the guard.
-- **N-2 — [gate] Pin compression/chunks/maxshape in the byte-compat signature. [S]** `tests/core/h5sig.py`
-  excludes filters; stitch/rsm byte-identity is clean *today* but a future compression change wouldn't be
-  caught. Add the filter fields and re-pin.
+- **M-1 — FIXED (`b05cb5a5`). [memory, ~144 MB] Dropped the per-frame `np.zeros_like` `bg_raw`. [S]**
+  `h5viewer.py:1998,2065` now set `'bg_raw': 0` (line refs shifted from 1949/2016); every consumer already
+  treats scalar `0`/`None` as "no background" (`display_data.py:265,466`, `display_controllers.py:213`).
+  Up to ~144 MB saved (cap-8 LRU). Safe/isolated.
+- **M-2 — FIXED (`b05cb5a5`). [memory, trivial] Deleted the dead `_raw_cache_order`.** No grep hits remain
+  in `h5viewer.py`. Removes the confusion the D₁ item calls out.
+- **M-3 — FIXED (`b05cb5a5`). [memory, corner] Cap `data_1d` in viewer modes. [S]** Image/XYE/NeXus viewer
+  modes now cap `data_1d` at the finite `_DISPLAY_1D_VIEWER_CACHE_MAX = 4096` (`static_scan_widget.py:5406`,
+  constant at `:25`), not `None`.
+- **N-1 — FIXED (`b05cb5a5`). [correctness] `write_rsm` now has the intensity-shape guard its twin has. [S]**
+  `nexus.py:2015-2021` raises when `intensity.shape != (len h, len k, len l)`, mirroring `write_stitched`'s
+  cake-contract enforcement (`:1975-1978`). A transposed RSM volume no longer round-trips silently wrong.
+- **N-2 — OPEN / deferred (the one quick-win NOT done). [gate] Pin compression/chunks/maxshape in the byte-compat signature. [S]**
+  `tests/core/h5sig.py` still records only shape/dtype/value/attrs (`VOLATILE_LEAVES` at `:17-29`) and does
+  NOT include compression/chunks/maxshape filter fields; stitch/rsm byte-identity is clean *today* but a
+  future compression change wouldn't be caught. Add the filter fields and re-pin.
 - **N-3 — [doc] MIGRATION.md / release-note wording: only the *reduction* path is loud-by-default. [S]** The
   one reader with a strict seam (`load_processed_raw_or_thumbnail`) *defaults graceful* by design (it backs
   the viewer). MIGRATION.md item 11 is correct; just don't let any note claim "readers raise."
@@ -120,16 +138,24 @@ mock hosts (mechanical). Blocked from confirming here (no Qt in the sandbox).
   no per-frame panel stutter. `set_state` defers a full rebuild until a focused editor commits. Timers are
   single-shot, no spin; FormRows `deleteLater`'d.
 - `pyproject` 1.0.0 metadata sound (requires-python ≥3.11, `[gui]` extras match the PySide6 pin, version
-  preflight passes). `tests/core` = **1386 pass / 2 skip** (once B-1 lands).
+  preflight passes). `tests/core` = **1389 pass / 4 skip** (measured at `f2e99a4a`, no B-1 deselection).
+  `pyproject` also now packages the MIT license into the wheel/sdist
+  (`[tool.setuptools] license-files = ["licenses/LICENSE-*"]`, `pyproject.toml:82`) — added in `f2e99a4a`.
+- **Additional `f2e99a4a` hardening (recorded for the release):** RSM `grid_img_data` guards the static-pixel
+  NaN mask (skips a single-frame OR fully-constant stack, `rsm/gridding.py:178-185`) so the volume is not
+  silently wiped to all-NaN; the GUI excepthook now has a single-in-flight dialog guard and is installed in
+  `run()` not at import (`_gui_main.py:88-92,291`); `h5viewer.update_scans` uses `os.scandir` (dropped the
+  per-entry `stat`); and the wrangler image-dir seed cache caches a FOUND seed indefinitely while negative
+  results keep a 0.5s TTL (`image_wrangler.py:1586-1611`).
 
 ---
 
-## Recommended release sequence
-1. Land **B-1** (merge geometry→main *with* the 2 main CI commits) — turns CI/preflight green. This is the
-   gate; nothing else can be validated until it's in.
-2. Land **S-1** (one-line `strict=` fix + test) — the only real headless correctness hole.
-3. Opportunistically land the **S** quick wins in one small commit: **S-2** (rglob), **M-1** (bg_raw),
-   **M-2/M-3**, **N-1/N-2/N-3**. All isolated, all ≤ 2 h, none risk the byte-compat/spine gates.
-4. **S-3**: run the full `xdart` offscreen suite on a `[gui,dev]` box; fix mock hosts if red.
-5. Re-run `scripts/release.py check` + `pytest tests/core` + offscreen `tests/xdart` on a fresh checkout →
+## Recommended release sequence (historical checklist — steps 1-3 DONE at `f2e99a4a`)
+1. ✅ **B-1** merged (geometry→main *with* the 2 main CI commits) — CI/preflight green.
+2. ✅ **S-1** landed (`b05cb5a5`) — the strict-policy hole is closed.
+3. ✅ The **S** quick wins landed in `b05cb5a5`: **S-2** (rglob), **M-1** (bg_raw), **M-2/M-3**, **N-1/N-3**.
+   Run-end/packaging/perf/isolation hardening + the RSM NaN-mask guard landed in `f2e99a4a`. Only **N-2**
+   (pin filter fields in the byte-compat signature) remains as an optional deferred quick-win.
+4. **S-3**: full `xdart` offscreen suite — already green at **1270 / 0** in the `f2e99a4a` run.
+5. Remaining pre-tag step: re-run `scripts/release.py check` + `pytest tests/core` on a fresh checkout →
    tag v1.0.0.

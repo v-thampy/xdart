@@ -1,12 +1,23 @@
 # Int-1D/2D → three-section layout — detailed migration design
 
-**Status:** DESIGN/P7, detailed migration design (Jun 2026), ready for UI mockups → Qt implementation.
+> **Status: SUPERSEDED / largely SHIPPED (2026-07-01).** The three-section model in this doc was
+> **retired and absorbed** by the canonical parent
+> [`design_controls_panel_v2_jun2026.md`](design_controls_panel_v2_jun2026.md) ("Supersedes — and
+> absorbs the content of — the earlier 3-section controls design + brief… their vocabulary/section
+> model… are replaced here"). A Controls-Panel-V2 realizing most of this migration has **shipped ON
+> BY DEFAULT** at release `f2e99a4a` (`XDART_CONTROLS_PANEL_V2` defaults to `"1"`,
+> `static_scan_widget.py:582`; panel mounted at `:597`). Keep this doc only as **historical
+> rationale**; for the authoritative section model see the parent's §14. **Note:** the shipped
+> section model and ordering *diverge* from this doc's DATA-first wireframe — see the NOTE in §1
+> below. Line-number citations throughout have also drifted (integrator.py/integratorUI.py moved
+> ~8–10 lines; the `aad2247d` sizing commit predates the monorepo and no longer resolves here).
+
+**Status (original):** DESIGN/P7, detailed migration design (Jun 2026), ready for UI mockups → Qt implementation.
 GI ownership follows [`ADR-0008`](../decisions/0008-gi-control-ownership.md); energy follows
 [`ADR-0009`](../decisions/0009-energy-single-source.md).
 Parent: `design_controls_panel_v2_jun2026.md` (the canonical controls-panel spec — the principle + the Stitch/RSM reference).
-Sizing: **MODERATE, ~6.5–13 h** (migration analysis `aad2247d`) — a re-organisation of already-
-separated widgets, *not* a redesign. **Do this once the Stitch/RSM 3-section layout is proven**, so
-Int inherits a validated pattern; not bundled with the new-tool wiring.
+Sizing: **MODERATE, ~6.5–13 h** (migration analysis `aad2247d`, a pre-monorepo commit not present in
+this repo's history) — a re-organisation of already-separated widgets, *not* a redesign.
 
 This is the **structural** spec (which control lives where + the re-wiring). The visual arrangement
 of section-2's sub-groups (tabs vs stacked group-boxes vs a tree) is deliberately left to the
@@ -25,7 +36,15 @@ INTEGRATOR (integratorFrame, ≤360) integratorTree                ── re-sli
 CONTROLS   (controlsFrame, fixed)  StaticControls (mode/Start)   ── mode-agnostic, KEEP
 ```
 
-Proposed — the two middle panes become **three** (Tools + Controls untouched):
+Proposed — the two middle panes become **three** (Tools + Controls untouched).
+
+> **NOTE (2026-07-01) — shipped model DIVERGES from this wireframe.** The shipped Controls-Panel-V2
+> uses a **different section model and ordering** than proposed here (per `controls_logic.py:55`
+> `SectionId`): **PROJECT (1) · SOURCE (3) · EXPERIMENT (2) · PROCESSING (4) · OUTPUT · ANALYSIS**,
+> rendered **instrument-config-before-data** (EXPERIMENT numbered 2, ahead of SOURCE numbered 3 —
+> `controls_panel_v2.py:40-52`) — the *opposite* of this doc's DATA-first section-1/2/3 wireframe.
+> The `DATA / EXPERIMENTAL CONFIG / PROCESSING OPTIONS` vocabulary is retired. A reader following the
+> wireframe below would build the wrong layout; use the parent's §14 for the authoritative model.
 
 ```
 TOOLS                              Calibrate | Make Mask | Refine…

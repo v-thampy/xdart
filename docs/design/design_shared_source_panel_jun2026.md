@@ -1,8 +1,12 @@
 # Design: the shared scan-source panel (`ScanSourceWidget`)
 
-**Status:** PARTIAL / implemented core widget · reconciled 2026-06-27. The shared
-source seam, SPEC source, grouped/composite sources, and Scan Plotter usage are
-implemented. Stitch/RSM wrangler embedding and Tiled remain deferred/P7.
+**Status:** IMPLEMENTED + ADOPTED (ROI) · reconciled 2026-07-01. The shared
+source seam, SPEC/NeXus sources, grouped/composite sources, directory-mode
+discovery, the `ScanSourceWidget` itself (with async-probe support), and its
+adoption in the ROI Scan Plotter are all shipped and tested (staged-plan steps
+0–3 complete; `scan_source_widget.py` 544 lines, `scan_plot_dialog.py:159-161`,
+`tests/xdart/test_scan_source_widget.py` 9 tests). Stitch/RSM wrangler embedding
+(step 4) and Tiled (step 5) remain deferred.
 **Realizes:** [`design_wrangler_organization_jun2026.md`](design_wrangler_organization_jun2026.md)
 §3.1 ("Source / data") as a concrete, reusable Qt widget — and
 [`design_stitching_jun2026.md`](design_stitching_jun2026.md) §5.4's source/data input
@@ -163,9 +167,12 @@ path should be exercised on one too — see §5 step 3 gate.)*
 
 ## 3. The widget — fields + behavior
 
-`ScanSourceWidget(QWidget)` with one signal: **`sigSourceChanged(SourceSpec | None)`** (emitted
-when a complete, openable source is defined, or `None` when cleared/invalid). Consumers connect
-to it and call `open_source(spec)` themselves (so the widget never holds analysis state).
+`ScanSourceWidget(QWidget)` with one public signal: **`sigSourceChanged(ScanSelection | None)`**
+(emitted when a complete, openable source is defined, or `None` when cleared/invalid). The widget
+itself calls `open_source(spec)` + `probe_first_frame(source)` and emits a `ScanSelection`
+dataclass (`spec`, opened `source`, `label`, `reachable`, `first_image`); consumers use the
+already-opened source and reuse the probed first frame rather than re-opening. (There is also an
+internal `sigProbeDone` channel used by the optional async-probe path.)
 
 ```
 ┌ Source ─────────────────────────────────────────────────────────┐
