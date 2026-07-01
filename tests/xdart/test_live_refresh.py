@@ -1600,52 +1600,6 @@ def test_live_new_scan_invalidates_publication_store():
     assert scan.scan_data.empty
 
 
-def _nonlive_new_scan_host(scan_name):
-    import pandas as pd
-    from xdart.modules.frame_publication import PublicationStore
-    scan = SimpleNamespace(
-        name=scan_name, gi=False, incidence_motor="th", single_img=False,
-        series_average=False, global_mask=None, scan_lock=RLock(),
-        frames=SimpleNamespace(index=[1, 2, 3], _in_memory={1: object()}),
-        scan_data=pd.DataFrame({"x": [1.0]}, index=[1]),
-    )
-    host = SimpleNamespace(
-        scan=scan,
-        h5viewer=SimpleNamespace(
-            dirname="", live_run_active=False, scan_name="old", auto_last=False,
-            latest_idx=3, set_file=lambda fname, **k: None,
-            update_scans=lambda: None, update=lambda: None),
-        wrangler=SimpleNamespace(thread=SimpleNamespace(mask=None)),
-        integratorTree=SimpleNamespace(get_args=lambda n: None, set_image_units=lambda: None),
-        _update_timer=SimpleNamespace(stop=lambda: None),
-        _list_timer=SimpleNamespace(stop=lambda: None, trigger=lambda: None),
-        _flush_pending_update=lambda: None,
-        frames={1: object()}, frame_ids=["1"],
-        publication_store=PublicationStore(),
-        displayframe=SimpleNamespace(set_axes=lambda: None),
-        _controls_v2_enabled=lambda: False,
-        _refresh_controls_v2_profile=lambda *a, **k: None,
-        _fit_controls_height=lambda *a, **k: None,
-        metawidget=SimpleNamespace(update=lambda: None),
-    )
-    host._sync_h5viewer_save_dir = MethodType(staticWidget._sync_h5viewer_save_dir, host)
-    return host, scan
-
-
-def test_nonlive_new_scan_identity_clears_stale_frames():
-    """Frames-bug fix: a NON-live new scan whose identity genuinely changed (name
-    differs) clears the stale frame index — previously gated only on
-    live_run_active, so a new scan starting post-run left stale frames on screen.
-    A same-name re-trigger keeps the intentional linger (no clear)."""
-    host, scan = _nonlive_new_scan_host("old")
-    staticWidget.new_scan(host, "new", "/tmp/new.nxs", False, "th", False, False)
-    assert list(scan.frames.index) == []          # stale frames cleared (the fix)
-
-    host2, scan2 = _nonlive_new_scan_host("same")
-    staticWidget.new_scan(host2, "same", "/tmp/same.nxs", False, "th", False, False)
-    assert list(scan2.frames.index) == [1, 2, 3]  # same scan -> intentional linger
-
-
 def _new_scan_host_with_wrangler_mask(wrangler_mask, initial_global_mask,
                                       wrangler_detector_shape=None):
     """A minimal staticWidget host for driving ``new_scan`` and observing how

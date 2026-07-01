@@ -5043,14 +5043,6 @@ class staticWidget(QWidget):
         # canonical name resolution (via ``scan.set_datafile``)
         # land correctly; this assignment just unblocks the
         # synchronous render path immediately.
-        # Frames-panel reset: capture the PRIOR scan identity before we overwrite
-        # it, so the stale-frame reset below fires for a genuinely-new scan even
-        # when NOT in a live run (it was gated only on live_run_active, so a new
-        # scan starting with live_run_active=False left the previous scan's frames
-        # stale in the panel).  Same name => same scan => keep the intentional linger.
-        _prev_scan_name = getattr(self.scan, "name", None)
-        _new_scan_identity = bool(name and name != _prev_scan_name
-                                  and _prev_scan_name not in (None, "", "null_main"))
         self.scan.name = name
         # G1/T0-1: a new run is a new data identity — drop the wavelength
         # restored from whatever file was open before, synchronously (the
@@ -5164,13 +5156,9 @@ class staticWidget(QWidget):
                 _idxlen = len(getattr(getattr(self.scan, "frames", None), "index", []) or [])
             except Exception:
                 _idxlen = -1
-            logger.info("[PERF] new_scan boundary: live_run_active=%s new_identity=%s "
-                        "index_len=%d name=%s",
-                        getattr(self.h5viewer, "live_run_active", None),
-                        _new_scan_identity, _idxlen, name)
-        # Reset the panel when a live run is active OR the scan identity genuinely
-        # changed (fixes stale frames persisting on a non-live new scan).
-        if self.h5viewer.live_run_active or _new_scan_identity:
+            logger.info("[PERF] new_scan boundary: live_run_active=%s index_len=%d name=%s",
+                        getattr(self.h5viewer, "live_run_active", None), _idxlen, name)
+        if self.h5viewer.live_run_active:
             try:
                 import pandas as pd
                 with self.scan.scan_lock:
