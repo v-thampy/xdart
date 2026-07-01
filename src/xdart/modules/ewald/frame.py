@@ -19,6 +19,11 @@ from xrd_tools.core.containers import (
     IntegrationResult1D,
     IntegrationResult2D,
 )
+from xrd_tools.core.metadata import (
+    IncidenceAngleUnresolved,
+    resolve_incident_angle,
+    resolve_monitor_norm,
+)
 from xrd_tools.integrate.calibration import poni_to_integrator
 from xrd_tools.integrate.single import integrate_1d, integrate_2d, integrate_radial
 from xrd_tools.integrate.gid import (
@@ -31,21 +36,6 @@ from xrd_tools.integrate.gid import (
     integrate_gi_exitangles_1d,
     integrate_gi_exitangles,
 )
-
-
-
-class IncidenceAngleUnresolved(Exception):
-    """A GI frame's incidence angle could not be resolved.
-
-    Raised by :meth:`LiveFrame._get_incident_angle` when the incidence
-    motor is neither a number (the Manual-Theta path) nor a motor name
-    present in the frame metadata.  Integrating a grazing-incidence map at
-    a defaulted 0° degenerates the qip/qoop transform (a blank/collapsed
-    cake), so callers must surface a "set Manual theta" state rather than
-    integrate silently.  See ``_get_incident_angle``.
-    """
-
-
 # Maximum thumbnail dimension — both axes are scaled to fit within this.
 _THUMBNAIL_MAX = 256
 
@@ -459,23 +449,7 @@ class LiveFrame():
            return 0.0 silently.  Callers surface "set Theta Motor to
            Manual and enter the angle".
         """
-        try:
-            return float(self.incidence_motor)
-        except (ValueError, TypeError):
-            # Case-insensitive lookup for motor position
-            motor = str(self.incidence_motor).lower()
-            for key, val in self.scan_info.items():
-                if key.lower() == motor:
-                    try:
-                        return float(val)
-                    except (ValueError, TypeError):
-                        break
-            raise IncidenceAngleUnresolved(
-                "GI incidence motor {!r} is not a number and was not found "
-                "in the frame metadata; refusing to integrate at a degenerate "
-                "0°. Set 'Theta Motor' to Manual and enter the incidence "
-                "angle.".format(self.incidence_motor)
-            )
+        return resolve_incident_angle(self.scan_info, self.incidence_motor)
 
     def reset(self):
         """Clears all data, resets to a default LiveFrame.
@@ -506,23 +480,21 @@ class LiveFrame():
 
         * ``monitor is None`` → return 1.0 (no normalization).  Always
           reset state — don't inherit from a previous call.
-        * ``monitor.upper()`` in ``scan_info`` → use that value.
-        * ``monitor.lower()`` in ``scan_info`` → use that value (back-
-          compat with lowercase counter names some SPEC setups use).
-        * monitor not found → return 1.0 and log debug.
+        * ``monitor`` in ``scan_info`` (case-insensitive) with a finite,
+          positive value → use that value.
+        * monitor not found / unusable → return 1.0 and log debug.
 
         Returns the resolved scalar; callers are expected to assign
         it to ``self.map_norm`` so the integrator divides by it.
         """
         if monitor is None:
             return 1.0
-        if monitor.upper() in self.scan_info:
-            return float(self.scan_info[monitor.upper()])
-        if monitor.lower() in self.scan_info:
-            return float(self.scan_info[monitor.lower()])
+        norm = resolve_monitor_norm(self.scan_info, monitor)
+        if norm is not None:
+            return norm
         import logging as _logging
         _logging.getLogger(__name__).debug(
-            "monitor=%r not in scan_info keys=%s; using 1.0",
+            "monitor=%r missing or unusable in scan_info keys=%s; using 1.0",
             monitor, list(self.scan_info.keys()),
         )
         return 1.0
