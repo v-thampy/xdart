@@ -3473,6 +3473,14 @@ class staticWidget(QWidget):
         # xdart.utils.throttle).
         self._update_timer = Coalescer(200, mode="throttle", parent=self)
         self._update_timer.triggered.connect(self._flush_pending_update)
+        # Liveness: a FAST list/cursor timer fires several times per heavy-render
+        # window so the Frames list + auto-last cursor + status scroll continuously
+        # during a fast scan, while the expensive drain + setImage stays paced on
+        # _update_timer.  _flush_frame_list runs the LIGHT legs only (O(new) list
+        # refresh + a signal-blocked cursor advance) — no drain, no render.  See
+        # docs/design/design_gui_liveness_jul2026.md.
+        self._list_timer = Coalescer(70, mode="throttle", parent=self)
+        self._list_timer.triggered.connect(self._flush_frame_list)
         # Reintegrate gets its OWN throttle: bai_*_all (live, batch=1) fires a
         # per-frame `update` signal, and rendering each one synchronously floods
         # the GUI (esp. the 2D cake at ~hundreds-of-ms each) -> the whole GUI
@@ -3885,6 +3893,30 @@ class staticWidget(QWidget):
         # the pending fire instead of restarting the countdown.
         self._pending_update_idx = idx
         self._update_timer.trigger()
+        # ...and the fast list/cursor timer so the Frames list scrolls between
+        # the (paced) heavy renders.
+        self._list_timer.trigger()
+
+    def _flush_frame_list(self):
+        """LIGHT flush (fast timer): refresh the Frames list + advance the
+        auto-last cursor, WITHOUT the heavy drain/render.
+
+        The frame-list widget is built purely from ``scan.frames.index`` (which
+        ``update_data`` appends per-frame), so it does not need the coalesced
+        publication drain; ``latest_frame(emit_update=False)`` advances the cursor
+        with signals blocked (no ``data_changed``/``setImage``).  This lets the
+        list + selection + status scroll continuously (~14 Hz) while the expensive
+        image/plot render stays paced on ``_update_timer`` (~5 Hz).  Idempotent
+        with ``_flush_pending_update``, which redoes these O(new) legs before it
+        renders."""
+        if self._pending_update_idx is None:
+            return
+        try:
+            self.h5viewer.update_data(emit_update=False)
+            if self.h5viewer.auto_last:
+                self.latest_frame(emit_update=False)
+        except Exception:
+            logger.debug("light frame-list flush failed", exc_info=True)
 
     def _drain_pending_frames(self):
         """Build + store publications and refresh scan_data for every frame
@@ -5075,6 +5107,7 @@ class staticWidget(QWidget):
         # repointed the viewer — so the user only ever saw blanks
         # during the run and the final scan at the end.
         self._update_timer.stop()
+        self._list_timer.stop()
         self._flush_pending_update()
 
         # Clear frame index lists (fast; rebuilt by h5viewer.update_data)
@@ -5258,6 +5291,7 @@ class staticWidget(QWidget):
 
         # Flush any pending coalesced update so the final frame is shown.
         self._update_timer.stop()
+        self._list_timer.stop()
         self._flush_pending_update()
 
         # End the live-run window before the end-of-batch reload below:
