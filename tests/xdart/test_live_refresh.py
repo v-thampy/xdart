@@ -551,6 +551,17 @@ def test_update_data_append_emits_once_when_requested():
     assert len(calls) == 1
 
 
+def test_update_data_force_rebuild_bypasses_equal_list_fast_path():
+    viewer, list_data, _calls = _viewer([1, 2], [1, 2])
+    viewer.auto_last = False
+    first_item = list_data.item(0)
+
+    viewer.update_data(emit_update=False, force_rebuild=True)
+
+    assert _labels(list_data) == ["1", "2"]
+    assert list_data.item(0) is not first_item
+
+
 def test_flush_pending_update_owns_single_repaint():
     calls = []
     widget = SimpleNamespace(
@@ -647,6 +658,53 @@ def test_update_data_stashes_frame_without_building_per_frame():
     assert host.h5viewer.latest_idx == 7                  # cursor advanced
     assert host._pending_update_idx == 7
     assert 7 in host.scan.frames.index                    # index appended (cheap)
+
+
+def test_run_end_reconciles_partial_frame_browser_from_written_index(tmp_path):
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    written = tmp_path / "finished.nxs"
+    written.write_bytes(b"")
+    list_data = _FakeListWidget([1, 9, 10])
+
+    class Scan:
+        def __init__(self):
+            self.name = "scan"
+            self.frames = SimpleNamespace(index=[1, 9, 10])
+
+        def load_frame_index_only(self, fname):
+            assert fname == str(written)
+            self.frames = SimpleNamespace(index=list(range(1, 11)))
+            return 10
+
+    scan = Scan()
+    calls = []
+    viewer = SimpleNamespace(
+        scan=scan,
+        ui=SimpleNamespace(listData=list_data),
+        new_scan_loaded=False,
+        frame_ids=[],
+        auto_last=True,
+        latest_idx=None,
+        data_changed=lambda *args, **kwargs: calls.append((args, kwargs)),
+        _displayed_list_count=list_data.count(),
+        _displayed_last_label=list_data.item(list_data.count() - 1).text(),
+    )
+    viewer.set_current_frame = MethodType(H5Viewer.set_current_frame, viewer)
+    viewer._remember_displayed_frames = MethodType(
+        H5Viewer._remember_displayed_frames, viewer)
+    viewer.update_data = MethodType(H5Viewer.update_data, viewer)
+
+    host = SimpleNamespace(scan=scan, h5viewer=viewer)
+
+    indexed = staticWidget._reconcile_h5viewer_frame_list_after_run(
+        host, str(written))
+
+    assert indexed == 10
+    assert _labels(list_data) == [str(i) for i in range(1, 11)]
+    assert viewer.latest_idx == 10
+    assert [item.text() for item in list_data.selectedItems()] == ["10"]
+    assert calls == []
 
 
 def test_drain_pending_frames_builds_store_and_scan_data():

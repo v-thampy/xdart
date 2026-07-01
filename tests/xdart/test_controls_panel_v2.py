@@ -101,6 +101,20 @@ def _gi_detail_rows(widget):
     }
 
 
+def _find_form_row(widget, path):
+    path = tuple(path)
+    for card in (
+        widget.controls_v2.project_card,
+        widget.controls_v2.source_card,
+        widget.controls_v2.experiment_card,
+        widget.controls_v2.processing_card,
+    ):
+        for row in card.body.findChildren(FormRow):
+            if getattr(row, "path", None) == path:
+                return row
+    return None
+
+
 def _find_more_button(widget):
     """The '…' GI-options button in the Experiment card, or None."""
     for btn in widget.controls_v2.experiment_card.body.findChildren(
@@ -835,18 +849,56 @@ def test_make_mask_updates_mask_file_box(qapp, monkeypatch):
 
     widget = staticWidget()
     try:
+        widget._refresh_controls_v2_profile_now()
+        focused = _find_form_row(widget, ("Project", "project_folder"))
+        assert focused is not None
+        focused.editor.setFocus()
+        monkeypatch.setattr(widget.controls_v2, "focusWidget", lambda: focused.editor)
+
         mask_path = "/tmp/example-mask.edf"
         widget._on_mask_created(mask_path)
         # single source of truth: the wrangler param is updated
         assert widget.wrangler.parameters.child(
             "Signal", "mask_file").value() == mask_path
         # ...and the rendered Mask File box shows it
-        rows = [
-            r for r in widget.controls_v2.experiment_card.body.findChildren(FormRow)
-            if getattr(r, "path", None) == ("Signal", "mask_file")
-        ]
-        assert rows, "Mask File row not rendered"
-        assert rows[0].current_value() == mask_path
+        row = _find_form_row(widget, ("Signal", "mask_file"))
+        assert row is not None, "Mask File row not rendered"
+        assert row.current_value() == mask_path
+        assert widget._controls_v2_pending_editor is None
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_set_poni_field_updates_poni_box_with_focused_editor(
+        qapp, monkeypatch, tmp_path):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.core.containers import PONI
+
+    widget = staticWidget()
+    try:
+        poni_path = tmp_path / "calibrated.poni"
+        PONI(
+            dist=0.1794,
+            poni1=0.0,
+            poni2=0.0,
+            detector="RayonixMx225",
+            wavelength=0.7293e-10,
+        ).to_poni_file(poni_path)
+
+        widget._refresh_controls_v2_profile_now()
+        focused = _find_form_row(widget, ("Project", "project_folder"))
+        assert focused is not None
+        focused.editor.setFocus()
+        monkeypatch.setattr(widget.controls_v2, "focusWidget", lambda: focused.editor)
+
+        widget._set_poni_field(str(poni_path))
+
+        row = _find_form_row(widget, ("Signal", "poni_file"))
+        assert row is not None, "Poni row not rendered"
+        assert row.current_value() == str(poni_path)
+        assert widget._controls_v2_pending_editor is None
     finally:
         widget.close()
         widget.deleteLater()

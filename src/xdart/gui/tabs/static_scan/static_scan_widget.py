@@ -1830,7 +1830,7 @@ class staticWidget(QWidget):
                 wrangler.mask_file = str(mask_file)
             except Exception:
                 pass
-        self._refresh_controls_v2_profile(immediate=True)
+        self._force_controls_v2_rebuild()
 
     def _autofill_poni_after_calibrate(self, since_ts) -> None:
         """Offer to adopt a PONI written by the just-closed pyFAI-calib2.
@@ -1911,7 +1911,7 @@ class staticWidget(QWidget):
                 except Exception:
                     logger.debug("PONI reload after autofill failed",
                                  exc_info=True)
-        self._refresh_controls_v2_profile(immediate=True)
+        self._force_controls_v2_rebuild()
 
     def _controls_v2_choose_source(self) -> None:
         wrangler = getattr(self, "wrangler", None)
@@ -2034,6 +2034,18 @@ class staticWidget(QWidget):
         except Exception:
             logger.debug("Controls Panel V2 profile refresh failed",
                          exc_info=True)
+
+    def _invalidate_controls_v2_render_cache(self) -> None:
+        self._cancel_deferred_controls_v2_refresh()
+        self._controls_v2_last_signature = None
+        self._controls_v2_last_schema_signature = None
+
+    def _force_controls_v2_rebuild(self) -> None:
+        self._invalidate_controls_v2_render_cache()
+        self._refresh_controls_v2_profile(
+            immediate=True,
+            preserve_focused_editor=False,
+        )
 
     @staticmethod
     def _controls_v2_render_schema_signature(render_state) -> tuple:
@@ -3985,6 +3997,44 @@ class staticWidget(QWidget):
                 (_t1 - _t0) * 1000, (_t2 - _t1) * 1000,
                 (_t3 - _t2) * 1000, (_t3 - _t0) * 1000)
 
+    def _reconcile_h5viewer_frame_list_after_run(self, written_file=None) -> int:
+        """Refresh the frame browser from the authoritative run-end frame index."""
+
+        scan = getattr(self, "scan", None)
+        viewer = getattr(self, "h5viewer", None)
+        if scan is None or viewer is None:
+            return 0
+
+        indexed = 0
+        if written_file and os.path.exists(written_file):
+            loader = getattr(scan, "load_frame_index_only", None)
+            if callable(loader):
+                try:
+                    indexed = int(loader(written_file) or 0)
+                    if indexed:
+                        logger.info(
+                            "post-live: indexed %d frame(s) from %s",
+                            indexed,
+                            os.path.basename(written_file),
+                        )
+                except Exception:
+                    logger.warning(
+                        "post-live frame-index populate failed",
+                        exc_info=True,
+                    )
+
+        try:
+            frame_index = list(getattr(getattr(scan, "frames", None), "index", ()) or ())
+            if frame_index:
+                try:
+                    viewer.latest_idx = int(frame_index[-1])
+                except (TypeError, ValueError):
+                    viewer.latest_idx = frame_index[-1]
+            viewer.update_data(emit_update=False, force_rebuild=True)
+        except Exception:
+            logger.debug("post-live frame-list rebuild failed", exc_info=True)
+        return indexed
+
     def disable_auto_last(self, q):
         """
         Parameters
@@ -4506,8 +4556,7 @@ class staticWidget(QWidget):
         # Re-enable the tree (restores the auto-range field gating) then overlay
         # the mode-correct state (run_active is now False).
         self.enable_integration(True)
-        self._controls_v2_last_signature = None
-        self._cancel_deferred_controls_v2_refresh()
+        self._invalidate_controls_v2_render_cache()
         self._controls_v2_unlocking_run = True
         try:
             self._apply_integration_control_state()
@@ -5197,30 +5246,19 @@ class staticWidget(QWidget):
                 # to this file) so the last-frame select-last actually fires.
                 self.h5viewer.set_file(existing_file, internal=True)
 
-        # Live run (saw frames): the streaming path populated the display caches
-        # but NOT self.scan.frames (the lazy series re-integration iterates), so
-        # the Reintegrate row would stay disabled post-run.  Now that the writer
-        # has closed the file, rebuild ONLY the lazy frame index from it (no
-        # display reload, no scan-state reset) so reintegrate works immediately —
-        # batch already gets this via its end-of-batch reload above.  Skip when a
+        # Live run (saw frames): the streaming path can leave the lazy frame index
+        # empty OR partial if frame production outruns the GUI coalescer.  Now that
+        # the writer has closed the file, rebuild ONLY the lazy frame index from it
+        # and force the H5Viewer Frames list to rebuild from that complete index.
+        # Batch already gets this via its end-of-batch reload above.  Skip when a
         # reintegrate is still running (don't repoint frames mid-reintegrate) or
         # when the run saw 0 frames (the append-feedback branch already reloaded).
-        _frames_index = getattr(getattr(self.scan, 'frames', None), 'index', None)
         if (not is_batch and not is_xye_only and not _reintegrate_running
-                and getattr(self, '_run_saw_frame', True)
-                and _frames_index is not None and len(_frames_index) == 0):
+                and getattr(self, '_run_saw_frame', True)):
             written = (getattr(self.wrangler.thread, 'fname', None)
                        or getattr(self.wrangler, 'fname', None))
-            if written and os.path.exists(written):
-                try:
-                    n = self.scan.load_frame_index_only(written)
-                    logger.info(
-                        "post-live: indexed %d frame(s) from %s for reintegrate",
-                        n, os.path.basename(written))
-                    self._apply_integration_control_state()
-                except Exception:
-                    logger.warning("post-live frame-index populate failed",
-                                   exc_info=True)
+            if self._reconcile_h5viewer_frame_list_after_run(written):
+                self._apply_integration_control_state()
 
         # The scan-matches branch delegates to integrator_thread_finished() to
         # run the post-integration UI enable + exit the run-state.  Skip it when

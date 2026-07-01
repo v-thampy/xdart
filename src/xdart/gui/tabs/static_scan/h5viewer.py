@@ -856,7 +856,7 @@ class H5Viewer(QWidget):
             lw.item(count - 1).text() if count > 0 else None
         )
 
-    def update_data(self, emit_update=True):
+    def update_data(self, emit_update=True, *, force_rebuild: bool = False):
         """Updates list with all frame ids.
 
         Fast paths in order of likelihood for a live scan:
@@ -909,7 +909,8 @@ class H5Viewer(QWidget):
         # the last GUI flush.  Verify only the cached boundary instead of
         # rebuilding and comparing the full list every 200 ms.
         current_count = lw.count()
-        if (current_count >= 1
+        if (not force_rebuild
+                and current_count >= 1
                 and len(frame_index) > current_count
                 and not self.new_scan_loaded):
             current_last = lw.item(current_count - 1).text()
@@ -936,7 +937,7 @@ class H5Viewer(QWidget):
         _idxs = [str(i) for i in frame_index]
         items = [lw.item(x).text() for x in range(lw.count())]
 
-        if _idxs == items:
+        if not force_rebuild and _idxs == items:
             if self.new_scan_loaded:
                 self.new_scan_loaded = False
                 self.ui.listData.setCurrentRow(-1)
@@ -964,7 +965,8 @@ class H5Viewer(QWidget):
         #   - the listWidget isn't empty (clear+insert is cheaper for
         #     small N anyway, and avoids fiddling with first-load
         #     selection semantics).
-        if (len(items) >= 1
+        if (not force_rebuild
+                and len(items) >= 1
                 and len(_idxs) > len(items)
                 and _idxs[: len(items)] == items
                 and not self.new_scan_loaded):
