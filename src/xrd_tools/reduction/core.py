@@ -1496,6 +1496,7 @@ class ReductionSession:
                         self._frame_masks,
                         self.cancel_token,
                         self._warned_monitor_keys,
+                        strict=self.strict,
                     ),
                 ))
 

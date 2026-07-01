@@ -1,5 +1,6 @@
 """Offscreen tests for the hidden Controls Panel V2 scaffold."""
 
+import gc
 import os
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -324,6 +325,16 @@ def _reset_controls_v2_gi(*widgets):
 @pytest.fixture(scope="module")
 def qapp():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def _drain_qt_events_after_test(qapp):
+    yield
+    for _ in range(3):
+        qapp.processEvents()
+    gc.collect()
+    for _ in range(2):
+        qapp.processEvents()
 
 
 def test_controls_panel_v2_int_inventory_includes_units_and_advanced_rows():

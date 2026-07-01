@@ -1194,19 +1194,18 @@ class imageWrangler(wranglerWidget):
         if not self.img_file and not getattr(self, 'stitch_mode', False):
             imageWrangler._safe_status_text(
                 self,
-                'Choose an image source, or load a processed scan with reachable raw data.',
+                'Choose an image source to run. Use Reintegrate for a loaded processed scan.',
             )
             return False
         return True
 
     def _adopt_loaded_scan_run_inputs(self):
-        """Seed Run from a loaded processed scan when explicit inputs are blank.
+        """Seed Run calibration from a loaded processed scan when blank.
 
-        A processed xdart ``.nxs`` can carry both the original PONI and per-frame
-        raw-source pointers.  Reintegrate already consumes those from
-        ``scan.frames``; a fresh Run click reaches this older wrangler guard
-        first, so mirror the same cached inputs here only when the user has not
-        chosen an explicit image source in the source rows.
+        A processed xdart ``.nxs`` can carry the original PONI/integrator, which
+        keeps Reintegrate and an explicitly configured fresh Run calibrated.  It
+        must not silently become the raw frame source for a fresh Run; Controls
+        V2 owns that source choice and disables Run until the user chooses one.
         """
         scan = getattr(self, "scan", None)
         if self.poni is None:
@@ -1230,36 +1229,6 @@ class imageWrangler(wranglerWidget):
                         scan, "_cached_fiber_integrator", None)
                 except Exception:
                     pass
-
-        explicit_source = ""
-        try:
-            if self.parameters.child('Signal').child('inp_type').value() == 'Image Directory':
-                explicit_source = self.parameters.child('Signal').child('img_dir').value()
-            else:
-                explicit_source = self.parameters.child('Signal').child('File').value()
-        except Exception:
-            explicit_source = ""
-        if explicit_source or getattr(self, "img_file", ""):
-            return
-
-        frames = getattr(scan, "frames", None)
-        frame_index = list(getattr(frames, "index", ()) or ())
-        if not frame_index:
-            return
-        try:
-            frame = frames[int(frame_index[0])]
-            resolver = getattr(frame, "_resolved_source_path", None)
-            source = resolver() if callable(resolver) else getattr(frame, "source_file", "")
-        except Exception:
-            logger.debug("processed-scan source adoption failed", exc_info=True)
-            return
-        if not source or not os.path.exists(source):
-            return
-
-        self.img_file = str(source)
-        path = Path(source)
-        self.img_dir = str(path.parent)
-        self.img_ext = path.suffix.lstrip('.')
 
     def start(self):
         # Refuse to run without a valid PONI rather than re-running the stale

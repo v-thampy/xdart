@@ -39,11 +39,14 @@ from __future__ import annotations
 
 import logging
 from collections import namedtuple
+from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 import h5py
 import numpy as np
+
+from xrd_tools.core.scan import ScanFrame
 
 # 2c: the convenience readers consume the declared layout — group and
 # dataset names come from the schema, so writer/reader drift is
@@ -900,6 +903,43 @@ class ProcessedScan:
 
     def get_thumbnail(self, frame: int) -> np.ndarray:
         return get_thumbnail(self.path, frame, entry=self.entry)
+
+    def metadata_for(self, index: int) -> Mapping[str, Any]:
+        """Return per-frame metadata/scan-data for ``index``.
+
+        ``ProcessedScan`` is the notebook-friendly reader, but stitch/ROI paths
+        also consume it as a lightweight FrameSource.  Surface the persisted
+        scan-data columns aligned to the stored frame labels; whole-scan scalar
+        metadata remains available through ``metadata``.
+        """
+        label = int(index)
+        labels = self.frame_indices
+        try:
+            pos = labels.index(label)
+        except ValueError as exc:
+            raise KeyError(f"frame {label!r} not present in {self.path}") from exc
+
+        result: dict[str, Any] = {"frame_index": label}
+        for key, values in self.scan_data.items():
+            arr = np.asarray(values)
+            try:
+                if arr.shape == ():
+                    result[key] = arr.item()
+                elif len(arr) == len(labels):
+                    value = arr[pos]
+                    result[key] = value.item() if hasattr(value, "item") else value
+            except Exception:
+                continue
+        return result
+
+    def frame_for(self, index: int) -> ScanFrame:
+        label = int(index)
+        return ScanFrame(
+            index=label,
+            metadata=dict(self.metadata_for(label)),
+            loader=lambda frame: self.load_frame(frame.index),
+            source_identity=str(self.path),
+        )
 
     def load_frame(self, index: int) -> np.ndarray:
         """Load one raw detector frame through its stored source pointer.

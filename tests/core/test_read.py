@@ -469,6 +469,11 @@ def test_open_scan_frame_source_uses_union_labels_and_scan_data(tmp_path):
     scan = open_scan(nxs)
     assert scan.frame_indices == [0, 1, 2]
     np.testing.assert_allclose(scan.scan_data["th"], [0.1, 0.2, 0.3])
+    assert dict(scan.metadata_for(2))["th"] == pytest.approx(0.3)
+    frame = scan.frame_for(2)
+    assert frame.index == 2
+    assert frame.metadata["th"] == pytest.approx(0.3)
+    assert frame.source_identity == str(nxs)
 
 
 def test_read_image_rejects_processed_file(tmp_path):

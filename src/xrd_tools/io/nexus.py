@@ -2011,12 +2011,20 @@ def write_rsm(
     group is replaced atomically (idempotent).
     """
     ck = _comp_kwargs(compression)
+    intensity = np.asarray(volume.intensity, np.float32)
+    expected = (len(volume.h), len(volume.k), len(volume.l))
+    if intensity.shape != expected:
+        raise ValueError(
+            f"rsm.intensity shape {intensity.shape} != "
+            f"(len(h), len(k), len(l)) = {expected}; the stored volume must be "
+            "(n_h, n_k, n_l)."
+        )
     if "rsm" in entry_grp:
         del entry_grp["rsm"]
     # 2b: schema-routed group + datasets (byte-identical).  h/k/l carry NO units
     # (no units_from in the schema) — do not add any, it would change the bytes.
     g = _create_group_from_schema(entry_grp, "rsm")
-    _schema_dataset(g, "rsm", "intensity", volume.intensity, ck=ck)
+    _schema_dataset(g, "rsm", "intensity", intensity, ck=ck)
     for name, axis in (("h", volume.h), ("k", volume.k), ("l", volume.l)):
         _schema_dataset(g, "rsm", name, axis, ck=ck)
     if provenance is not None:

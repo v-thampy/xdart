@@ -39,6 +39,22 @@ def test_write_read_rsm_roundtrips(tmp_path):
     assert out.provenance is None
 
 
+def test_write_rsm_rejects_mismatched_intensity_shape(tmp_path):
+    import h5py
+    from types import SimpleNamespace
+    from xrd_tools.io.nexus import write_rsm
+
+    bad = SimpleNamespace(
+        h=np.linspace(-1.0, 1.0, 5),
+        k=np.linspace(0.0, 2.0, 6),
+        l=np.linspace(-0.5, 0.5, 7),
+        intensity=np.zeros((6, 5, 7)),
+    )
+    with h5py.File(tmp_path / "bad_rsm.nxs", "w") as f:
+        with pytest.raises(ValueError, match="rsm.intensity shape"):
+            write_rsm(f.create_group("entry"), bad)
+
+
 def test_rsm_provenance_roundtrips(tmp_path):
     import h5py
     from xrd_tools.analysis.plans import RSMPlan

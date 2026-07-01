@@ -718,11 +718,20 @@ Acceptance for the polish pass:
 
 ---
 
-## 14. 2026-06-30 status — V2 Int flip fixes landed; live re-pass pending
+## 14. 2026-07-01 status — V2 Int flip shipped; manual live re-pass pending
+
+**Status summary.** Phases 7/8 of the Int migration are **SHIPPED / CODE-COMPLETE**
+on `feature/controls-panel-v2`: the native Int state, native run/reintegrate/session
+plan builder, default-on flip, write-through bridge retirement, threshold fix, Average
+Scan streaming fix, and viewer/readiness UI refinements are landed. Rounds 2-4 are
+complete. The only flip gate still marked **PENDING** is the human live checkpoint
+(`QThread` teardown, GI mode switch, session restore, live/Append, Reintegrate). The
+post-flip freeze/refresh saga is resolved in code and covered offscreen; the checkpoint
+must be rerun with those fixes in place.
 
 **Current branch state.** `feature/controls-panel-v2` has merged the latest
 `feature/geometry` fast-forward for the flip chunk. The V2 functional flip is
-code-complete on cp2, but live/manual and adversarial test triage found four
+code-complete on cp2. Live/manual and adversarial test triage found four
 post-flip regressions:
 native Reintegrate 1D/2D could diverge from the fresh run plan because the
 reintegrate cache installed the native builder without first reapplying native V2
@@ -769,6 +778,12 @@ cleared until the live checkpoint is rerun.
 - Reintegrate finish now treats the wrangler as active only when it is in a real
   run phase, so a stale idle thread flag cannot leave the V2 panel locked after
   the reintegrate thread finishes.
+- The controls-refresh path is now idempotent around disclosures/focused editors,
+  run-end frame-list reconciliation avoids unnecessary full rebuilds, and `XDART_PERF`
+  can log Controls V2 refresh counts/timings for future responsiveness work.
+- The persistent H5Viewer file thread starts lazily, shuts down through a drained
+  sentinel path, and is retained if a slow read outlives the bounded close wait,
+  reducing offscreen teardown crashes and stale file work.
 - Fresh `xdart -f` / empty-session startup leaves both Project Folder and Save Path
   blank until the user chooses a project; choosing a project still defaults Save
   Path under that project.
@@ -828,6 +843,11 @@ correctness rather than V2-vs-hidden-widget parity. The core checks are:
 - `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_panel_v2.py -k "source_energy_button or metadata_energy_preference or energy_conflict or energy_values_use_poni_without_scan or calibration_energy_prefers_poni or source_count or loaded_scan_does_not_populate_source_or_run or raw_source_and_poni_enable_run_with_source_frames" -q` → 10 passed, 74 deselected.
 - `QT_QPA_PLATFORM=offscreen tests/xdart/test_static_controls.py -q` → 8 passed.
 - `QT_QPA_PLATFORM=offscreen tests/xdart/test_static_controls.py tests/xdart/test_n1_disclosure.py -q` → 15 passed.
+- 2026-07-01 release-hardening spot checks: strictness/RSM/byte-compat/read
+  slice → 16 passed; focused live-refresh teardown/cache slice → 4 passed; cache
+  reset/viewer cleanup slice → 2 passed. Full GUI files should still be run in
+  chunks/offscreen at merge because PySide/pyqtgraph can exit-139 under repeated
+  widget construction.
 - `QT_QPA_PLATFORM=offscreen tests/xdart/test_live_refresh.py -k "wrangler_enabled_reapplies_viewer_mode_controls or file_viewer_mode_disables_processing_tree_but_not_mode_combo or start_guard_adopts_processed_scan_cached_poni_and_source or start_without_poni_is_gated" -q` → 4 passed.
 - `QT_QPA_PLATFORM=offscreen tests/xdart/test_live_refresh.py -k "start_guard_adopts_processed_scan_cached_poni_and_source or start_without_poni_is_gated" -q` → 2 passed, 190 deselected.
 - `QT_QPA_PLATFORM=offscreen tests/xdart/test_live_refresh.py -q` → 191 passed, 1 skipped.

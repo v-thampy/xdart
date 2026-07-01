@@ -68,6 +68,36 @@ from xdart.gui import tabs
 QMainWindow = QtWidgets.QMainWindow
 
 
+def _xdart_excepthook(exc_type, exc, tb):
+    """Log uncaught GUI-slot exceptions without terminating the process."""
+    if issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+        sys.__excepthook__(exc_type, exc, tb)
+        return
+    logger.error("Unhandled exception in xdart GUI", exc_info=(exc_type, exc, tb))
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        return
+
+    def _show_error():
+        try:
+            QtWidgets.QMessageBox.critical(
+                None,
+                "xdart error",
+                f"{exc_type.__name__}: {exc}\n\n"
+                "The error was logged; the application will stay open.",
+            )
+        except Exception:
+            logger.debug("Could not show GUI exception dialog", exc_info=True)
+
+    try:
+        QtCore.QTimer.singleShot(0, _show_error)
+    except Exception:
+        logger.debug("Could not schedule GUI exception dialog", exc_info=True)
+
+
+sys.excepthook = _xdart_excepthook
+
+
 class Main(QMainWindow):
     def __init__(self):
         super().__init__()

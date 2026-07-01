@@ -562,6 +562,55 @@ def test_update_data_force_rebuild_bypasses_equal_list_fast_path():
     assert list_data.item(0) is not first_item
 
 
+def test_shutdown_threads_discards_stale_file_thread_work():
+    class Signal:
+        def __init__(self):
+            self.disconnected = False
+
+        def disconnect(self):
+            self.disconnected = True
+
+    class FileThread:
+        def __init__(self):
+            self.queue = Queue()
+            self.sigTaskStarted = Signal()
+            self.sigTaskDone = Signal()
+            self.sigNewFile = Signal()
+            self.sigUpdate = Signal()
+            self.live_run = True
+            self.no_nxs = True
+            self.waited_items = []
+            self._running = True
+
+        def isRunning(self):
+            return self._running
+
+        def wait(self, _timeout):
+            while not self.queue.empty():
+                self.waited_items.append(self.queue.get_nowait())
+            self._running = False
+            return True
+
+    ft = FileThread()
+    ft.queue.put("set_datafile")
+    ft.queue.put("save_data_as")
+    viewer = SimpleNamespace(
+        cancel_pending_loads=lambda: None,
+        file_thread=ft,
+    )
+
+    H5Viewer.shutdown_threads(viewer)
+
+    assert ft.queue.empty()
+    assert ft.waited_items == [None]
+    assert ft.live_run is False
+    assert ft.no_nxs is False
+    assert ft.sigTaskStarted.disconnected
+    assert ft.sigTaskDone.disconnected
+    assert ft.sigNewFile.disconnected
+    assert ft.sigUpdate.disconnected
+
+
 def test_flush_pending_update_owns_single_repaint():
     calls = []
     widget = SimpleNamespace(
@@ -705,6 +754,29 @@ def test_run_end_reconciles_partial_frame_browser_from_written_index(tmp_path):
     assert viewer.latest_idx == 10
     assert [item.text() for item in list_data.selectedItems()] == ["10"]
     assert calls == []
+
+
+def test_run_end_reconcile_skips_forced_rebuild_when_list_is_current():
+    list_data = _FakeListWidget([1, 2, 3])
+    scan = SimpleNamespace(
+        name="scan",
+        frames=SimpleNamespace(index=[1, 2, 3]),
+    )
+    calls = []
+    viewer = SimpleNamespace(
+        scan=scan,
+        ui=SimpleNamespace(listData=list_data),
+        new_scan_loaded=False,
+        latest_idx=None,
+        update_data=lambda **kwargs: calls.append(kwargs),
+    )
+    host = SimpleNamespace(scan=scan, h5viewer=viewer)
+
+    indexed = staticWidget._reconcile_h5viewer_frame_list_after_run(host)
+
+    assert indexed == 0
+    assert viewer.latest_idx == 3
+    assert calls == [{"emit_update": False, "force_rebuild": False}]
 
 
 def test_drain_pending_frames_builds_store_and_scan_data():
@@ -2720,7 +2792,6 @@ def test_enter_viewer_mode_cleanup_clears_lists_and_cancels_loader():
     assert viewer.data_1d == {}
     assert viewer.data_2d == {}
     assert viewer.frame_ids == []
-    assert viewer._raw_cache_order == []
     assert viewer.latest_idx is None
     assert viewer.new_scan_loaded is False
     assert list_data.count() == 0
@@ -5571,10 +5642,9 @@ def test_image_viewer_raw_cache_evicts_reloadable_unselected_rows():
 def test_hydrated_raw_cache_reset_clears_order():
     data_2d = _AttrDict()
     data_2d._hydrated_raw_order = [1, 2, 3]
-    viewer = SimpleNamespace(_raw_cache_order=[1, 2, 3], data_2d=data_2d)
+    viewer = SimpleNamespace(data_2d=data_2d)
     viewer._clear_raw_cache = MethodType(H5Viewer._clear_raw_cache, viewer)
     viewer._clear_raw_cache()
-    assert viewer._raw_cache_order == []
     assert _hydrated_order(data_2d) == []
 
 
@@ -5858,7 +5928,7 @@ def test_start_without_poni_is_gated():
     assert getattr(host, "command", None) != "start"
 
 
-def test_start_guard_adopts_processed_scan_cached_poni_and_source(tmp_path):
+def test_start_guard_adopts_processed_scan_cached_poni_but_requires_source(tmp_path):
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
 
     source = tmp_path / "raw_0001.tif"
@@ -5879,6 +5949,8 @@ def test_start_guard_adopts_processed_scan_cached_poni_and_source(tmp_path):
     host.img_file = ""
     host.img_dir = ""
     host.img_ext = ""
+    messages = []
+    host.ui.specLabel.setText = messages.append
     host.scan._cached_poni = cached_poni
     # A reloaded scan with usable calibration also restores a pixel-bearing
     # integrator (both-or-neither: _restore_calibration_from_group sets both or
@@ -5886,12 +5958,13 @@ def test_start_guard_adopts_processed_scan_cached_poni_and_source(tmp_path):
     host.scan._cached_integrator = object()
     host.scan.frames = Frames()
 
-    assert imageWrangler._inputs_valid(host) is True
+    assert imageWrangler._inputs_valid(host) is False
     assert host.poni is cached_poni
     assert host.thread.poni is cached_poni
-    assert host.img_file == str(source)
-    assert host.img_dir == str(tmp_path)
-    assert host.img_ext == "tif"
+    assert host.img_file == ""
+    assert host.img_dir == ""
+    assert host.img_ext == ""
+    assert "Choose an image source" in messages[-1]
 
 
 def test_active_run_locks_modes_but_keeps_action_button_enabled():

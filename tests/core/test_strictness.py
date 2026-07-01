@@ -176,3 +176,33 @@ def test_strict_chunked_skips_bad_frame_writes_good_and_raises_at_finish(monkeyp
     # ...and it is still fail-loud, deferred to finish():
     with pytest.raises(MissingNormalizationError):
         session.finish()
+
+
+def test_strict_chunked_executor_honors_loud_policy(monkeypatch):
+    """The executor-backed chunked path must pass the session StrictPolicy.
+
+    Without the explicit ``strict=`` keyword, worker frames ran graceful and
+    silently wrote un-normalized reductions when a monitor was missing.
+    """
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+
+    frames = _frames(3)
+    frames[0].normalization_factor = 1.0
+    frames[2].normalization_factor = 1.0
+
+    plan = ReductionPlan(integration_2d=None)
+    plan.integration_1d.monitor_key = "dead_monitor"
+    sink = MemorySink()
+    session = ReductionSession(
+        plan,
+        Scan("chunked_executor_mix", frames, integrator=object()),
+        sink=sink,
+        execution="chunked",
+        executor=2,
+    )
+    session.process()
+
+    assert set(sink.frames) == {0, 2}
+    with pytest.raises(MissingNormalizationError):
+        session.finish()

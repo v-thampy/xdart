@@ -202,9 +202,8 @@ def test_restore_refuses_zero_placeholder_geometry():
         assert stub._cached_integrator is not None
 
 
-def test_inputs_valid_allows_reloaded_scan_with_integrator():
-    """The same adoption path SUCCEEDS when the reloaded scan restored a
-    pixel-bearing integrator (the normal generic-detector reload)."""
+def test_inputs_valid_requires_source_but_adopts_reloaded_scan_integrator():
+    """A loaded processed scan can seed calibration, but not the fresh Run source."""
     import os
 
     raw = "/tmp/xrd_test_run_integrator_carry_raw_0001.tif"
@@ -225,11 +224,15 @@ def test_inputs_valid_allows_reloaded_scan_with_integrator():
             frames=Frames())
         host, status = _readiness_host(scan, poni=None, img_file="")
 
-        assert host._inputs_valid() is True
+        assert host._inputs_valid() is False
         assert host.poni is poni
         # Adoption carried the restored integrator to the thread, keyed on poni.
         assert host.thread._adopted_poni is poni
         assert host.thread._adopted_integrator is scan._cached_integrator
+        assert status["text"] == (
+            "Choose an image source to run. "
+            "Use Reintegrate for a loaded processed scan."
+        )
     finally:
         os.path.exists(raw) and os.remove(raw)
 

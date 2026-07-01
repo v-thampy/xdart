@@ -24,6 +24,14 @@ from a **Tiled** server (no persistent file paths), which in turn needs an **emb
   (`h5_dir`), which **defaults to `[project_folder]/xdart_processed_data`**.
 - **Progressive disclosure (extends the existing PONI-first flow):**
   - **Fresh start (no session restored):** everything in the tree is hidden **except Project Folder**.
+    - **✓ Launch flags IMPLEMENTED (verified 2026-06-30).** `xdart -f` / `--fresh` enters this
+      fresh-start state directly by skipping session restore (`load_session()` → `{}`,
+      `save_session()` a no-op); `xdart -n NAME` / `--session NAME` restores a named session
+      (`~/.xdart/NAME.json`). Both are wired in `_gui_main._apply_cli_session_args(sys.argv)`
+      (called at the top of `run()`, before any widget loads) via the `XDART_SESSION_FRESH` /
+      `XDART_SESSION_FILE` env gates; the two flags are mutually exclusive. **Do not
+      re-implement.** The Controls V2 fresh-start path now also leaves Save Path blank
+      while Project Folder is unset, then defaults it under the selected project.
   - Enter Project Folder → the **PONI File** field appears (as today).
   - Enter a valid PONI → the **rest** of the tree appears (as today).
   - **Decision 2 — folder change RESETS, not just hides:** changing the Project Folder **clears** the

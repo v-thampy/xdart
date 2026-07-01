@@ -8,8 +8,37 @@ import logging
 import os
 import time
 import math
+import warnings
+from queue import Empty
 
 logger = logging.getLogger(__name__)
+
+_ORPHANED_FILE_THREADS = []
+
+
+def _retain_orphaned_file_thread(thread) -> None:
+    """Keep a slow fileHandlerThread alive until it exits.
+
+    Qt aborts if a QThread wrapper is destroyed while the native thread is
+    still running.  Close normally waits for the persistent file thread, but a
+    slow HDF5 read can outlive that bounded wait.  Retaining the Python wrapper
+    prevents teardown from deleting it; the already-queued sentinel lets it exit
+    after the current task.
+    """
+    if thread in _ORPHANED_FILE_THREADS:
+        return
+    _ORPHANED_FILE_THREADS.append(thread)
+
+    def _forget_thread():
+        try:
+            _ORPHANED_FILE_THREADS.remove(thread)
+        except ValueError:
+            pass
+
+    try:
+        thread.finished.connect(_forget_thread)
+    except Exception:
+        pass
 
 # This module imports
 import re
@@ -68,7 +97,6 @@ QItemSelectionModel = QtCore.QItemSelectionModel
 
 def _clear_raw_cache_for(viewer) -> None:
     """Reset hydrated-raw LRU state on real and lightweight test viewers."""
-    viewer._raw_cache_order = []        # legacy per-viewer state (pre-D5)
     data_2d = getattr(viewer, "data_2d", None)
     if data_2d is not None:
         clear_hydrated_raw(data_2d)
@@ -649,7 +677,12 @@ class H5Viewer(QWidget):
             self.data_changed()
 
     def _init_file_thread(self):
-        """Create and start the background file handler thread."""
+        """Create the background file handler thread.
+
+        The thread starts lazily on the first queued file operation.  A fresh
+        Controls/Viewer widget should not carry an idle QThread while the rest
+        of the Qt tree is still being constructed.
+        """
         self.file_thread = fileHandlerThread(self.scan, self.frame,
                                              self.file_lock,
                                              frame_ids=self.frame_ids,
@@ -660,7 +693,7 @@ class H5Viewer(QWidget):
         self.file_thread.sigTaskDone.connect(self.thread_finished)
         self.file_thread.sigNewFile.connect(self.sigNewFile.emit)
         self.file_thread.sigUpdate.connect(self.sigUpdate.emit)
-        self.file_thread.start(Qt.QtCore.QThread.LowPriority)
+        self._file_thread_shutdown = False
         self._h5pool = get_pool()
         # M1: handle for the per-selection LoadFramesWorker.  None
         # when no load is in flight.  Owns a QThread that gets
@@ -676,7 +709,6 @@ class H5Viewer(QWidget):
         self._load_generation = 0
         # Keep only a small working set of hydrated detector arrays. Reduced
         # results and thumbnails stay cached for every loaded frame.
-        self._raw_cache_order = []
         self._raw_cache_limit = 8
         # O6: coalesce ``sigUpdate`` emits while a chunk burst is
         # streaming in from ``_LoadFramesWorker``.  Without this, a
@@ -691,6 +723,17 @@ class H5Viewer(QWidget):
         self._update_coalesce_timer = Coalescer(100, mode="debounce",
                                                 parent=self)
         self._update_coalesce_timer.triggered.connect(self.sigUpdate.emit)
+
+    def _ensure_file_thread_running(self) -> None:
+        """Start the persistent file loader on first real file operation."""
+        ft = getattr(self, "file_thread", None)
+        if ft is None or getattr(self, "_file_thread_shutdown", False):
+            return
+        try:
+            if not ft.isRunning():
+                ft.start(Qt.QtCore.QThread.LowPriority)
+        except RuntimeError:
+            logger.debug("file_thread could not be started", exc_info=True)
         
     def load_starting_defaults(self):
         default_path = os.path.join(utils.get_config_dir(), "last_defaults.json")
@@ -1946,7 +1989,7 @@ class H5Viewer(QWidget):
             with self.data_lock:
                 self.data_2d[int(frame_id)] = {
                     'map_raw': img_data,
-                    'bg_raw': np.zeros_like(img_data),
+                    'bg_raw': 0,
                     'mask': None,
                     'int_2d': None,
                     'gi_2d': {},
@@ -2013,7 +2056,7 @@ class H5Viewer(QWidget):
             scan_info = {'source_file': os.path.basename(fpath)}
             self.data_2d[int(frame_id)] = {
                 'map_raw': img_data,
-                'bg_raw': np.zeros_like(img_data),
+                'bg_raw': 0,
                 'mask': None,
                 'int_2d': None,
                 'gi_2d': {},
@@ -2113,6 +2156,7 @@ class H5Viewer(QWidget):
                 self._remember_displayed_frames()
                 # self.set_open_enabled(False)
                 self.file_thread.fname = fname
+                self._ensure_file_thread_running()
                 self.file_thread.queue.put("set_datafile")
                 self.ui.listData.itemSelectionChanged.connect(self.data_changed)
                 self.new_scan = True
@@ -2261,7 +2305,7 @@ class H5Viewer(QWidget):
     def closeEvent(self, event):
         # Retire any in-flight load worker before teardown so the interpreter
         # doesn't GC-delete a still-running moveToThread'd QObject at shutdown.
-        self._teardown_load_worker()
+        self.shutdown_threads()
         self._h5pool.close_all()
         super().closeEvent(event)
 
@@ -2334,6 +2378,7 @@ class H5Viewer(QWidget):
         fname, _ = QFileDialog.getSaveFileName()
         with self.file_thread.lock:
             self.file_thread.new_fname = fname
+            self._ensure_file_thread_running()
             self.file_thread.queue.put("save_data_as")
         self.set_file(fname)
     
@@ -2599,9 +2644,41 @@ class H5Viewer(QWidget):
         ft = getattr(self, 'file_thread', None)
         if ft is not None:
             try:
+                self._file_thread_shutdown = True
+                # No stale file loads should run after close.  Drain queued
+                # work first, then append one sentinel so the thread exits
+                # after its current task (or immediately if idle).
+                queue = getattr(ft, 'queue', None)
+                if queue is not None:
+                    while True:
+                        try:
+                            queue.get_nowait()
+                        except Empty:
+                            break
+                for signal_name in (
+                    "sigTaskStarted", "sigTaskDone", "sigNewFile", "sigUpdate",
+                ):
+                    signal = getattr(ft, signal_name, None)
+                    if signal is not None:
+                        try:
+                            with warnings.catch_warnings():
+                                warnings.simplefilter("ignore", RuntimeWarning)
+                                signal.disconnect()
+                        except Exception:
+                            pass
+                try:
+                    ft.live_run = False
+                    ft.no_nxs = False
+                except Exception:
+                    pass
+                if queue is not None:
+                    queue.put(None)              # sentinel -> run() breaks
                 if ft.isRunning():
-                    ft.queue.put(None)           # sentinel -> run() breaks
-                    ft.wait(2000)                # bounded wait
+                    if not ft.wait(10000):       # bounded wait
+                        logger.warning(
+                            "file_thread still running after shutdown wait; "
+                            "keeping QThread handle until it exits")
+                        _retain_orphaned_file_thread(ft)
             except Exception:
                 logger.debug("file_thread shutdown failed", exc_info=True)
 

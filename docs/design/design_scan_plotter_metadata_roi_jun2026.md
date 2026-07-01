@@ -1,5 +1,8 @@
 # Design: unified Scan Plotter (metadata + ROI stats)
 
+> **Living doc — keep current.** Update §10/§11 status + any affected section as part of
+> every Scan-Plotter change; each chunk + handoff ends with a doc-update step.
+
 > **2026-06-29 — planned split: ROI Statistics gets its OWN Tools button.** The
 > maintainer wants **ROI Statistics surfaced as a separate tool button** in the
 > Tools card (`static_scan_widget._build_tools_card`), distinct from the current
@@ -10,7 +13,9 @@
 > "Plot Metadata" opens the plotter focused on metadata columns; a new
 > **"ROI Statistics"** button opens the same dialog (or a sibling) focused on the
 > ROI picker + computed ROI columns. Details TBD with the maintainer ("more on that
-> later"). Keep the headless `RoiSpec`/`RoiSignal`/`run_roi_signals` contract intact.
+> later"). **Deferred/post-v2 GUI-surface only:** today Plot Metadata still handles
+> both metadata and ROI stats; keep the headless `RoiSpec`/`RoiSignal`/`run_roi_signals`
+> contract intact.
 
 **Status:** PARTIAL / implemented · reconciled 2026-06-27. The Scan Plotter,
 metadata plotting, ROI picker, ROI worker, per-ROI reducers/background operations, and

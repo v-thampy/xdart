@@ -19,6 +19,7 @@ Real-data cells are gated on ``$XDART_TEST_DATA``.
 from __future__ import annotations
 
 import os
+import gc
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,32 +43,24 @@ def qapp():
 def widget(qapp):
     """A real staticWidget, torn down after each test."""
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    for _ in range(3):
+        qapp.processEvents()
+    gc.collect()
+    for _ in range(2):
+        qapp.processEvents()
     w = staticWidget()
     try:
         yield w
     finally:
-        # Stop the long-running background threads the widget started before the
-        # module-scoped QApplication GCs it.  Otherwise the still-running
-        # fileHandlerThread (started in H5Viewer._init_file_thread) triggers
-        # "QThread: Destroyed while thread is still running" -> abort at
-        # interpreter shutdown.
-        try:
-            h5v = w.h5viewer
-            h5v.cancel_pending_loads()            # quit+wait the load worker
-            ft = getattr(h5v, "file_thread", None)
-            if ft is not None:
-                ft.queue.put(None)                # sentinel: clean run() exit
-                ft.wait(2000)
-            pool = getattr(h5v, "_h5pool", None)
-            if pool is not None:
-                pool.close_all()
-        except Exception:
-            pass
         try:
             w.close()
         except Exception:
             pass
-        qapp.processEvents()
+        for _ in range(3):
+            qapp.processEvents()
+        gc.collect()
+        for _ in range(2):
+            qapp.processEvents()
 
 
 def _set_image_frame(w, idx, raw):
@@ -1627,8 +1620,11 @@ def test_int_scan_resolves_loaded_rows_from_publication_store(widget):
     assert df.binned_data is not None
 
 
-def test_scan_mode_1d_mirror_is_bounded_but_viewer_rows_are_not(widget):
-    from xdart.gui.tabs.static_scan.static_scan_widget import _DISPLAY_1D_CACHE_MAX
+def test_scan_mode_1d_mirror_and_viewer_rows_are_bounded(widget):
+    from xdart.gui.tabs.static_scan.static_scan_widget import (
+        _DISPLAY_1D_CACHE_MAX,
+        _DISPLAY_1D_VIEWER_CACHE_MAX,
+    )
 
     w = widget
     assert getattr(w.data_1d, "_max", None) == _DISPLAY_1D_CACHE_MAX
@@ -1639,7 +1635,10 @@ def test_scan_mode_1d_mirror_is_bounded_but_viewer_rows_are_not(widget):
     assert 0 not in w.data_1d
 
     w._on_viewer_mode_changed("xye")
-    assert getattr(w.data_1d, "_max", None) == 0
+    assert getattr(w.data_1d, "_max", None) == _DISPLAY_1D_VIEWER_CACHE_MAX
+    for i in range(_DISPLAY_1D_VIEWER_CACHE_MAX + 2):
+        w.data_1d[i] = SimpleNamespace(idx=i)
+    assert len(w.data_1d) == _DISPLAY_1D_VIEWER_CACHE_MAX
 
     w._on_viewer_mode_changed("")
     assert getattr(w.data_1d, "_max", None) == _DISPLAY_1D_CACHE_MAX
@@ -2749,7 +2748,9 @@ def test_shutdown_threads_stops_file_thread(widget):
     not 'destroyed while running' on tab/app close.  Idempotent."""
     w = widget
     ft = w.h5viewer.file_thread
-    assert ft.isRunning(), "file_thread should be running on a live widget"
+    assert not ft.isRunning(), "file_thread should start lazily"
+    w.h5viewer._ensure_file_thread_running()
+    assert ft.isRunning(), "file_thread should run once file work is queued"
 
     w.h5viewer.shutdown_threads()
     assert ft.wait(2000)

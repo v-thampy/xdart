@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 # display source now; these dicts remain as recent-row caches for legacy
 # fallback paths and viewer modes.
 _DISPLAY_1D_CACHE_MAX = 512
+_DISPLAY_1D_VIEWER_CACHE_MAX = 4096
 _DISPLAY_2D_CACHE_MAX = 40
 
 # Qt imports
@@ -363,8 +364,9 @@ class staticWidget(QWidget):
         # longer authoritative for normal Int 1D/2D readiness; the
         # PublicationStore is.  The 1D mirror is capped in scan mode to prevent
         # long live runs from accumulating every old IntegrationResult copy.
-        # Viewer modes temporarily lift the 1D cap because data_1d is their row
-        # table for XYE/NeXus previews, not the scan-display mirror.
+        # Viewer modes use a larger finite 1D cap because data_1d is their row
+        # table for XYE/NeXus previews, not the scan-display mirror. Keep it
+        # bounded so a huge viewer directory cannot grow without limit.
         #
         # 2D: bounded at 40.  Each data_2d entry carries the full
         # ``map_raw`` detector image (~18 MB) plus the cake, so the cap is a
@@ -1779,10 +1781,15 @@ class staticWidget(QWidget):
                 cache.plan_builder = builder
 
     def _on_controls_v2_field_changed(self, path, value) -> None:
+        path = tuple(path)
+        if path and path[0] in {"Signal", "Source"}:
+            self._controls_v2_source_energy_cache = None
+            self._controls_v2_metadata_probe_cache = None
         self._apply_controls_v2_field_value(path, value)
         self._refresh_controls_v2_profile(immediate=True)
 
     def _on_controls_v2_field_browse(self, path) -> None:
+        path = tuple(path)
         wrangler = getattr(self, "wrangler", None)
         if wrangler is None:
             return
@@ -1802,9 +1809,12 @@ class staticWidget(QWidget):
             ("NeXus File", "nexus_file"): getattr(wrangler, "browse_nexus", None),
             ("BG", "File"): getattr(wrangler, "set_bg_file", None),
         }
-        handler = handlers.get(tuple(path))
+        handler = handlers.get(path)
         if callable(handler):
             handler()
+        if path and path[0] in {"Signal", "Source"}:
+            self._controls_v2_source_energy_cache = None
+            self._controls_v2_metadata_probe_cache = None
         self._refresh_controls_v2_profile(immediate=True)
 
     def _on_mask_created(self, mask_file) -> None:
@@ -1980,7 +1990,10 @@ class staticWidget(QWidget):
             return
         if self._controls_v2_batch_run_active():
             self._controls_v2_batch_refresh_deferred = True
+            self._note_controls_v2_refresh("deferred_run")
             return
+        import time as _time
+        _t0 = _time.perf_counter()
         try:
             self._controls_v2_batch_refresh_deferred = False
             state = self._controls_v2_state()
@@ -1998,17 +2011,21 @@ class staticWidget(QWidget):
                 not force_refresh
                 and signature == getattr(self, "_controls_v2_last_signature", None)
             ):
+                self._note_controls_v2_refresh(
+                    "noop", (_time.perf_counter() - _t0) * 1000)
                 return
             schema_changed = (
                 schema_signature
                 != getattr(self, "_controls_v2_last_schema_signature", None)
             )
-            if not force_refresh and not schema_changed:
+            if not schema_changed:
                 updater = getattr(panel, "apply_state_update", None)
                 if callable(updater) and updater(render_state):
                     self._cancel_deferred_controls_v2_refresh()
                     self._controls_v2_last_signature = signature
                     self._controls_v2_last_schema_signature = schema_signature
+                    self._note_controls_v2_refresh(
+                        "in_place", (_time.perf_counter() - _t0) * 1000)
                     return
             # A background rebuild (set_state -> clear_rows) would destroy a line
             # editor the user is mid-way through and silently drop the uncommitted
@@ -2026,14 +2043,30 @@ class staticWidget(QWidget):
                 and isinstance(editor, QtWidgets.QLineEdit)
             ):
                 self._defer_controls_v2_refresh_until_commit(editor)
+                self._note_controls_v2_refresh(
+                    "deferred_focus", (_time.perf_counter() - _t0) * 1000)
                 return
             self._cancel_deferred_controls_v2_refresh()
             panel.set_state(render_state)
             self._controls_v2_last_signature = signature
             self._controls_v2_last_schema_signature = schema_signature
+            self._note_controls_v2_refresh(
+                "full_rebuild", (_time.perf_counter() - _t0) * 1000)
         except Exception:
             logger.debug("Controls Panel V2 profile refresh failed",
                          exc_info=True)
+
+    def _note_controls_v2_refresh(self, kind: str, elapsed_ms: float = 0.0) -> None:
+        stats = getattr(self, "_controls_v2_refresh_stats", None)
+        if stats is None:
+            stats = {}
+            self._controls_v2_refresh_stats = stats
+        stats[kind] = int(stats.get(kind, 0)) + 1
+        if os.environ.get("XDART_PERF"):
+            logger.info(
+                "[PERF] controls-v2 refresh: kind=%s elapsed=%.0fms counts=%s",
+                kind, elapsed_ms, dict(sorted(stats.items())),
+            )
 
     def _invalidate_controls_v2_render_cache(self) -> None:
         self._cancel_deferred_controls_v2_refresh()
@@ -2041,7 +2074,8 @@ class staticWidget(QWidget):
         self._controls_v2_last_schema_signature = None
 
     def _force_controls_v2_rebuild(self) -> None:
-        self._invalidate_controls_v2_render_cache()
+        self._cancel_deferred_controls_v2_refresh()
+        self._controls_v2_force_next_refresh = True
         self._refresh_controls_v2_profile(
             immediate=True,
             preserve_focused_editor=False,
@@ -2829,8 +2863,9 @@ class staticWidget(QWidget):
                 return ""
             try:
                 from .wranglers.image_wrangler_thread import _name_filter
-                match = _name_filter(
+                filter_text = str(
                     self._controls_v2_param_value(("Signal", "Filter")) or "")
+                match = _name_filter(filter_text)
                 base = Path(img_dir).expanduser()
                 include_subdir = bool(self._controls_v2_param_value(
                     ("Signal", "include_subdir"), False))
@@ -2838,13 +2873,21 @@ class staticWidget(QWidget):
                 candidates = (
                     base.rglob(pattern) if include_subdir else base.glob(pattern)
                 )
-                for path in sorted(candidates):
+                cache_key = (str(base), img_ext, filter_text, include_subdir)
+                cached = getattr(self, "_controls_v2_metadata_probe_cache", None)
+                if cached is not None and cached[0] == cache_key:
+                    return cached[1]
+                for path in candidates:
                     if path.is_file() and match(path.stem):
-                        return str(path)
+                        result = str(path)
+                        self._controls_v2_metadata_probe_cache = (
+                            cache_key, result)
+                        return result
             except Exception:
                 logger.debug("Controls V2 metadata source probe failed",
                              exc_info=True)
                 return ""
+            self._controls_v2_metadata_probe_cache = (cache_key, "")
             return ""
         img_file = str(
             self._controls_v2_param_value(("Signal", "File")) or ""
@@ -3576,6 +3619,8 @@ class staticWidget(QWidget):
             logger.debug("XYE overlay input filter install failed", exc_info=True)
         self.h5viewer.sigNewFile.connect(self.wrangler.set_fname)
         self.h5viewer.sigNewFile.connect(self.displayframe.set_axes)
+        self.h5viewer.sigNewFile.connect(
+            lambda *_: self.displayframe._clear_bkg())
         self.h5viewer.sigNewFile.connect(self.h5viewer.data_reset)
         # Stage C (2-way sync): on a .nxs load, populate the integration panel
         # from the saved scan so it shows the saved settings + reintegrate
@@ -4005,6 +4050,9 @@ class staticWidget(QWidget):
         if scan is None or viewer is None:
             return 0
 
+        import time as _time
+        _perf = bool(os.environ.get("XDART_PERF"))
+        _t0 = _time.perf_counter() if _perf else 0.0
         indexed = 0
         if written_file and os.path.exists(written_file):
             loader = getattr(scan, "load_frame_index_only", None)
@@ -4030,7 +4078,26 @@ class staticWidget(QWidget):
                     viewer.latest_idx = int(frame_index[-1])
                 except (TypeError, ValueError):
                     viewer.latest_idx = frame_index[-1]
-            viewer.update_data(emit_update=False, force_rebuild=True)
+            list_widget = getattr(getattr(viewer, "ui", None), "listData", None)
+            visible = []
+            if list_widget is not None:
+                visible = [
+                    list_widget.item(row).text()
+                    for row in range(list_widget.count())
+                ]
+            expected = [str(idx) for idx in frame_index]
+            force_rebuild = (
+                bool(getattr(viewer, "new_scan_loaded", False))
+                or visible != expected
+            )
+            viewer.update_data(emit_update=False, force_rebuild=force_rebuild)
+            if _perf:
+                logger.info(
+                    "[PERF] post-live frame-list reconcile: indexed=%d "
+                    "visible=%d expected=%d force=%s total=%.0fms",
+                    indexed, len(visible), len(expected), force_rebuild,
+                    (_time.perf_counter() - _t0) * 1000,
+                )
         except Exception:
             logger.debug("post-live frame-list rebuild failed", exc_info=True)
         return indexed
@@ -5324,7 +5391,8 @@ class staticWidget(QWidget):
             set_cache_limit = getattr(self, "_set_1d_cache_limit", None)
             if callable(set_cache_limit):
                 set_cache_limit(
-                    None if is_viewer else _DISPLAY_1D_CACHE_MAX)
+                    _DISPLAY_1D_VIEWER_CACHE_MAX
+                    if is_viewer else _DISPLAY_1D_CACHE_MAX)
             tree = getattr(self.wrangler, 'tree', None)
             if tree is not None:
                 # Only the actual file-Viewer *processing* modes disable the
