@@ -21,6 +21,7 @@ import threading
 import pytest
 
 pytest.importorskip("pyqtgraph")
+import xdart.gui.gui_utils  # noqa: F401  # registers the 'str_browse' param type
 from pyqtgraph import QtWidgets
 from pyqtgraph.Qt import QtCore
 from pyqtgraph.parametertree import Parameter, ParameterTree

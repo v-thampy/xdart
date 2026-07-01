@@ -1953,16 +1953,28 @@ class staticWidget(QWidget):
         if callable(browse):
             browse()
 
-    def _refresh_controls_v2_profile(self, *, immediate: bool = False) -> None:
+    def _refresh_controls_v2_profile(
+        self,
+        *,
+        immediate: bool = False,
+        preserve_focused_editor: bool = True,
+    ) -> None:
         if getattr(self, "_tearing_down", False):
             return
         timer = getattr(self, "_controls_v2_refresh_timer", None)
+        if not preserve_focused_editor:
+            self._controls_v2_force_next_refresh = True
         if immediate or timer is None:
-            self._refresh_controls_v2_profile_now()
+            self._refresh_controls_v2_profile_now(
+                preserve_focused_editor=preserve_focused_editor)
         else:
             timer.trigger()
 
-    def _refresh_controls_v2_profile_now(self) -> None:
+    def _refresh_controls_v2_profile_now(
+        self,
+        *,
+        preserve_focused_editor: bool = True,
+    ) -> None:
         panel = getattr(self, "controls_v2", None)
         if panel is None:
             return
@@ -1977,8 +1989,27 @@ class staticWidget(QWidget):
             render_state = build_control_panel_state(state, values, choices)
             self._controls_v2_update_run_summary(state, render_state.profile)
             signature = render_state
-            if signature == getattr(self, "_controls_v2_last_signature", None):
+            schema_signature = self._controls_v2_render_schema_signature(render_state)
+            force_refresh = bool(
+                getattr(self, "_controls_v2_force_next_refresh", False)
+            )
+            self._controls_v2_force_next_refresh = False
+            if (
+                not force_refresh
+                and signature == getattr(self, "_controls_v2_last_signature", None)
+            ):
                 return
+            schema_changed = (
+                schema_signature
+                != getattr(self, "_controls_v2_last_schema_signature", None)
+            )
+            if not force_refresh and not schema_changed:
+                updater = getattr(panel, "apply_state_update", None)
+                if callable(updater) and updater(render_state):
+                    self._cancel_deferred_controls_v2_refresh()
+                    self._controls_v2_last_signature = signature
+                    self._controls_v2_last_schema_signature = schema_signature
+                    return
             # A background rebuild (set_state -> clear_rows) would destroy a line
             # editor the user is mid-way through and silently drop the uncommitted
             # text.  If one is focused, defer until it COMMITS (editingFinished =
@@ -1989,15 +2020,85 @@ class staticWidget(QWidget):
             # Signature is left unstamped so the deferred pass still detects the
             # change and rebuilds.
             editor = panel.focusWidget()
-            if isinstance(editor, QtWidgets.QLineEdit):
+            if (
+                preserve_focused_editor
+                and not force_refresh
+                and isinstance(editor, QtWidgets.QLineEdit)
+            ):
                 self._defer_controls_v2_refresh_until_commit(editor)
                 return
             self._cancel_deferred_controls_v2_refresh()
             panel.set_state(render_state)
             self._controls_v2_last_signature = signature
+            self._controls_v2_last_schema_signature = schema_signature
         except Exception:
             logger.debug("Controls Panel V2 profile refresh failed",
                          exc_info=True)
+
+    @staticmethod
+    def _controls_v2_render_schema_signature(render_state) -> tuple:
+        profile = render_state.profile
+        bound = render_state.bound_controls
+
+        def _value(value):
+            return getattr(value, "value", value)
+
+        if bound is not None:
+            field_sig = tuple(
+                (
+                    _value(field.section),
+                    field.label,
+                    tuple(field.path),
+                    _value(field.kind),
+                    tuple(str(choice) for choice in field.choices),
+                    bool(field.browse),
+                    str(field.parameter_group or ""),
+                )
+                for field in bound.fields
+            )
+        else:
+            field_sig = tuple(
+                (
+                    _value(field_id),
+                    status.label,
+                    _value(status.section),
+                )
+                for field_id, status in sorted(
+                    profile.fields.items(), key=lambda item: _value(item[0]))
+            )
+
+        action_sig = tuple(
+            (
+                _value(section),
+                tuple(
+                    (
+                        _value(spec.action),
+                        spec.label,
+                        bool(spec.enabled),
+                        spec.reason,
+                    )
+                    for spec in specs
+                ),
+            )
+            for section, specs in sorted(
+                profile.section_actions.items(), key=lambda item: _value(item[0]))
+        )
+        analysis_sig = tuple(
+            (
+                _value(spec.tool),
+                spec.label,
+                bool(spec.enabled),
+                spec.reason,
+            )
+            for spec in profile.analysis_launchers
+        )
+        return (
+            field_sig,
+            action_sig,
+            analysis_sig,
+            bool(profile.show_experiment_card),
+            bool(profile.show_processing_card),
+        )
 
     def _controls_v2_update_run_summary(self, state: ControlState, profile) -> None:
         setter = getattr(getattr(self, "controls", None),
@@ -4213,7 +4314,11 @@ class staticWidget(QWidget):
         if getattr(self, "controls_v2", None) is not None and run_active:
             self._set_controls_v2_current_fields_enabled(False)
         elif getattr(self, "controls_v2", None) is not None:
-            self._refresh_controls_v2_profile(immediate=True)
+            self._refresh_controls_v2_profile(
+                immediate=True,
+                preserve_focused_editor=not getattr(
+                    self, "_controls_v2_unlocking_run", False),
+            )
 
     def _set_controls_v2_current_fields_enabled(self, enabled: bool) -> None:
         """Lock existing V2 editors without rebuilding the panel."""
@@ -4401,7 +4506,13 @@ class staticWidget(QWidget):
         # Re-enable the tree (restores the auto-range field gating) then overlay
         # the mode-correct state (run_active is now False).
         self.enable_integration(True)
-        self._apply_integration_control_state()
+        self._controls_v2_last_signature = None
+        self._cancel_deferred_controls_v2_refresh()
+        self._controls_v2_unlocking_run = True
+        try:
+            self._apply_integration_control_state()
+        finally:
+            self._controls_v2_unlocking_run = False
         # Unlock the mode row (matched with _enter_run_state).  A wrangler end
         # also does this via wrangler.enabled(True); both agree on the idle state.
         try:
@@ -4421,10 +4532,13 @@ class staticWidget(QWidget):
         except Exception:
             logger.debug("re-enable Start on run exit failed", exc_info=True)
         self._controls_v2_run_frame_count = None
-        self._controls_v2_last_signature = None
         if getattr(self, "_controls_v2_batch_refresh_deferred", False):
             self._controls_v2_batch_refresh_deferred = False
-        self._refresh_controls_v2_profile(immediate=True)
+        if getattr(self, "_controls_v2_last_signature", None) is None:
+            self._refresh_controls_v2_profile(
+                immediate=True,
+                preserve_focused_editor=False,
+            )
 
     def _on_stop_clicked(self):
         """Single owner of the shared Stop button — route to the active run.

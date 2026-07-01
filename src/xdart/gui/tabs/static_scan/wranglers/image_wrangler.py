@@ -361,8 +361,17 @@ class imageWrangler(wranglerWidget):
         # in static_scan_widget.set_wrangler() to show the integratorTree's
         # existing advancedWidget1D / advancedWidget2D dialogs directly.
 
-        # Wire signals from parameter tree based buttons
-        self.parameters.sigTreeStateChanged.connect(self.setup)
+        # Wire signals from parameter tree based buttons.
+        # setup() re-syncs params to the thread AND re-applies the N1 progressive
+        # disclosure, which setOpts(visible=...) on the param GROUPS.  Those
+        # setOpts calls fire sigTreeStateChanged with change type 'options'; if
+        # setup ran on them it re-entered setup -> re-disclosed -> 'options' -> ...
+        # an unbounded loop (froze the panel when a click/scroll in the poni/mask
+        # field kicked it off; sigUpdateGI -> V2 refresh rode along as spam).  Run
+        # setup ONLY on real 'value' edits, never on the disclosure's own
+        # 'options'/'limits' churn.  (Direct setup() calls at run start are
+        # unaffected.)
+        self.parameters.sigTreeStateChanged.connect(self._setup_on_value_change)
         self.parameters.sigTreeStateChanged.connect(self._save_to_session)
 
         # UI-1 (#81): put a real checkbox on the GI / Intensity-Threshold
@@ -571,6 +580,24 @@ class imageWrangler(wranglerWidget):
         ('mask_sentinel',  ('MaskSat', 'mask_sentinel'),             False, 'mask_sentinel'),
         ('h5_dir',         ('Project', 'h5_dir'),                    True,  'h5_dir'),
     ]
+
+    def _setup_on_value_change(self, param, changes):
+        """Gate setup() to real value edits only.
+
+        pyqtgraph fires sigTreeStateChanged for EVERY change including 'options'
+        (visibility) and 'limits' (dropdown repopulation).  setup()'s own N1
+        progressive disclosure toggles group visibility via setOpts(visible=...),
+        so running setup on 'options' changes re-entered it forever (the freeze).
+        Only a genuine 'value' edit should re-run the full sync.
+        """
+        try:
+            for ch in changes:
+                if ch[1] == 'value':
+                    self.setup()
+                    return
+        except (IndexError, TypeError):
+            # Malformed change tuple: fall back to the historical behaviour.
+            self.setup()
 
     def _save_to_session(self, *args):
         # Don't persist the transient half-restored state while a session restore
@@ -1403,6 +1430,20 @@ class imageWrangler(wranglerWidget):
     _DISCLOSURE_TOPLEVEL = ()              # Save Path now lives inside PROJECT
 
     @staticmethod
+    def _set_param_visible_if_changed(param, visible):
+        """Set pyqtgraph parameter visibility only on a real transition.
+
+        ``Parameter.show()/hide()`` can emit ``sigOptionsChanged`` even when the
+        row is already in the requested state, which makes disclosure calls noisy
+        enough to feed setup/session/refresh storms. Guard before ``setOpts`` so
+        unchanged disclosure passes are silent.
+        """
+        target = bool(visible)
+        current = bool(param.opts.get('visible', True))
+        if current != target:
+            param.setOpts(visible=target)
+
+    @staticmethod
     def _safe_status_text(obj, text):
         setter = getattr(obj, '_set_status_text', None)
         if callable(setter):
@@ -1432,37 +1473,42 @@ class imageWrangler(wranglerWidget):
         # undone by the next folder/PONI event.
         if getattr(self, 'viewer_mode', None) in ('image', 'xye'):
             # Project (Folder + Save Path) stays; every processing group hides.
-            self.parameters.child('Project').show()
-            for name in self._DISCLOSURE_REST:               # Signal/GI/Mask/MaskSat/BG
-                self.parameters.child(name).hide()
+            for child in self.parameters.children():
+                imageWrangler._set_param_visible_if_changed(
+                    child, child.name() == 'Project')
             imageWrangler._safe_status_text(self, '')
             return
         have_root = self._compute_source_base() is not None
         have_poni = self.poni is not None
         # Project (Folder + Save Path) is always visible.
-        self.parameters.child('Project').show()
-
-        def _hide_rest():
-            for name in self._DISCLOSURE_REST:
-                self.parameters.child(name).hide()
+        imageWrangler._set_param_visible_if_changed(
+            self.parameters.child('Project'), True)
 
         # Two-stage disclosure (the PONI picker now lives inside DATA as the first
         # row, so it can no longer be its own reveal stage): Project Folder ->
         # the whole DATA group once a folder is set.  PONI validity is enforced at
         # run time (the run guard / _inputs_valid), not by hiding DATA.
         if not have_root:
-            _hide_rest()
+            for child in self.parameters.children():
+                if child.name() != 'Project':
+                    imageWrangler._set_param_visible_if_changed(child, False)
             imageWrangler._safe_status_text(
                 self, 'Choose a Project Folder to begin.')
         else:
+            # Set each group to its FINAL visibility DIRECTLY.  The old
+            # "show() ALL children, THEN hide() the carriers" re-showed the
+            # hidden carriers on every call (visible False->True) and hid them
+            # again (True->False) — a genuine toggle that fires sigTreeStateChanged
+            # ('options') EVERY time.  With _apply_disclosure re-invoked on mode
+            # sync, that oscillated carrier visibility forever and froze the panel.
+            # Setting the target directly with a guard avoids pyqtgraph show/hide's
+            # unconditional options emit and makes disclosure idempotent.
+            # (getattr default keeps lightweight duck holders (tests) working.)
+            carriers = set(getattr(self, '_DISCLOSURE_CARRIERS', ()))
             for child in self.parameters.children():
-                child.show()                               # reveal DATA (Poni first) + rest
-            # …except the pixel-rejection carriers, which moved to the
-            # integrator panel and live here only as hidden injection targets.
-            # getattr default keeps lightweight duck holders (tests) working.
-            for name in getattr(self, '_DISCLOSURE_CARRIERS', ()):
                 try:
-                    self.parameters.child(name).hide()
+                    imageWrangler._set_param_visible_if_changed(
+                        child, child.name() not in carriers)
                 except Exception:
                     pass
             imageWrangler._safe_status_text(

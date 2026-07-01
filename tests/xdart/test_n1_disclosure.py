@@ -47,6 +47,7 @@ def _holder():
     # records the text (the disclosure messages are what's under test).
     h._set_status_text = h.ui.specLabel.setText
     h._DISCLOSURE_REST = imageWrangler._DISCLOSURE_REST
+    h._DISCLOSURE_CARRIERS = imageWrangler._DISCLOSURE_CARRIERS
     h._DISCLOSURE_TOPLEVEL = imageWrangler._DISCLOSURE_TOPLEVEL
     return h, root
 
@@ -181,6 +182,21 @@ def test_sync_meta_ext_is_idempotent_no_reemit(qapp):
     n = len(events)
     sync()                                   # unchanged nxs state -> silent
     assert len(events) == n
+
+
+def test_apply_disclosure_is_idempotent_no_reemit(qapp):
+    """A settled disclosure pass must not re-emit visibility options changes."""
+    h, root = _holder()
+    root.child("Project").child("project_folder").setValue("/tmp")
+    h.poni = object()
+    h._apply_disclosure()
+
+    events = []
+    for child in root.children():
+        child.sigOptionsChanged.connect(lambda *a: events.append(a))
+
+    h._apply_disclosure()
+    assert events == []
 
 
 def test_viewer_modes_hide_all_processing_groups(qapp):

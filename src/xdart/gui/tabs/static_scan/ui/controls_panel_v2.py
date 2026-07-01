@@ -277,12 +277,21 @@ class SectionCard(QtWidgets.QFrame):
         self.toggle.setToolTip("Expand section" if self._collapsed else "Collapse section")
 
     def set_status_text(self, text: str = "") -> None:
+        if self.status.text() == text and self.status.isVisible() == bool(text):
+            return
         self.status.setText(text)
         self.status.setVisible(bool(text))
 
     def set_valid_marker(self, visible: bool, tooltip: str = "") -> None:
-        self.valid_marker.setVisible(bool(visible))
-        self.valid_marker.setToolTip(tooltip or "")
+        visible = bool(visible)
+        tooltip = tooltip or ""
+        if (
+            self.valid_marker.isVisible() == visible
+            and self.valid_marker.toolTip() == tooltip
+        ):
+            return
+        self.valid_marker.setVisible(visible)
+        self.valid_marker.setToolTip(tooltip)
 
     def clear_rows(self) -> None:
         while self.body_layout.count():
@@ -577,6 +586,49 @@ class FormRow(QtWidgets.QWidget):
             return self.editor.currentText()
         return self.editor.text()
 
+    def apply_field(self, field: ControlFormField) -> bool:
+        if tuple(field.path) != self._path:
+            return False
+        kind = field.kind.value if isinstance(field.kind, ControlFieldKind) else str(field.kind)
+        if kind != self._kind:
+            return False
+
+        self._enabled = bool(field.enabled)
+        self.editor.setEnabled(self._enabled)
+        if self.browse_button is not None:
+            self.browse_button.setEnabled(self._enabled)
+
+        value = "" if field.value is None else str(field.value)
+        was_blocked = self.editor.blockSignals(True)
+        try:
+            if self._kind == "bool":
+                checked = bool(field.value)
+                if self.editor.isChecked() != checked:
+                    self.editor.setChecked(checked)
+            elif self._kind == "combo":
+                if self.editor.currentText() != value:
+                    idx = self.editor.findText(value)
+                    if idx < 0 and value:
+                        self.editor.addItem(value)
+                        idx = self.editor.findText(value)
+                    if idx >= 0:
+                        self.editor.setCurrentIndex(idx)
+            elif not self.editor.hasFocus() and self.editor.text() != value:
+                self.editor.setText(value)
+                if field.browse:
+                    self.editor.setCursorPosition(0)
+        finally:
+            self.editor.blockSignals(was_blocked)
+
+        if field.browse and field.value and not field.reason:
+            tip = str(field.value)
+        else:
+            tip = _field_tooltip(field.path, field.reason)
+        for widget in (self, self.editor, self.label):
+            if widget is not None and widget.toolTip() != tip:
+                widget.setToolTip(tip)
+        return True
+
     def _emit_edit(self, value) -> None:
         edit = ControlFormEdit(path=self._path, value=value)
         self.valueChanged.emit(edit.path, edit.value)
@@ -597,11 +649,12 @@ class RangeRow(QtWidgets.QWidget):
         super().__init__(parent)
         self.setObjectName("controlsV2RangeRow")
         self._entries: list[tuple[tuple[str, ...], str]] = []
+        self._display_label = str(label)
         lay = QtWidgets.QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(5)
 
-        self.label = QtWidgets.QLabel(label)
+        self.label = QtWidgets.QLabel(self._display_label)
         self.label.setObjectName("controlsV2FieldLabel")
         self.label.setMinimumWidth(72)
         lay.addWidget(self.label)
@@ -641,13 +694,53 @@ class RangeRow(QtWidgets.QWidget):
         return edit, path
 
     def current_edits(self) -> tuple[tuple[tuple[str, ...], object], ...]:
-        out = [
-            (tuple(self._low_path), self._low.text()),
-            (tuple(self._high_path), self._high.text()),
-        ]
+        out = []
         if self._toggle is not None:
             out.append((self._toggle[0], bool(self._toggle[1].isChecked())))
+        if self._low.isEnabled():
+            out.append((tuple(self._low_path), self._low.text()))
+        if self._high.isEnabled():
+            out.append((tuple(self._high_path), self._high.text()))
         return tuple(out)
+
+    def apply_fields(
+        self,
+        fields_by_path: dict[tuple[str, ...], ControlFormField],
+    ) -> bool:
+        low = fields_by_path.get(tuple(self._low_path))
+        high = fields_by_path.get(tuple(self._high_path))
+        if low is None or high is None:
+            return False
+        self._apply_edit(self._low, low)
+        self._apply_edit(self._high, high)
+        if self._toggle is not None:
+            path, btn = self._toggle
+            field = fields_by_path.get(tuple(path))
+            if field is None:
+                return False
+            was_blocked = btn.blockSignals(True)
+            try:
+                checked = bool(field.value)
+                if btn.isChecked() != checked:
+                    btn.setChecked(checked)
+            finally:
+                btn.blockSignals(was_blocked)
+            btn.setEnabled(bool(field.enabled))
+            btn.setToolTip(_field_tooltip(field.path, field.reason) or "Auto")
+        return True
+
+    @staticmethod
+    def _apply_edit(edit: QtWidgets.QLineEdit, field: ControlFormField) -> None:
+        edit.setEnabled(bool(field.enabled))
+        edit.setToolTip(_field_tooltip(field.path, field.reason))
+        value = "" if field.value is None else str(field.value)
+        if edit.hasFocus() or edit.text() == value:
+            return
+        was_blocked = edit.blockSignals(True)
+        try:
+            edit.setText(value)
+        finally:
+            edit.blockSignals(was_blocked)
 
 
 class PillRow(QtWidgets.QWidget):
@@ -689,6 +782,25 @@ class PillRow(QtWidgets.QWidget):
 
     def current_edits(self) -> tuple[tuple[tuple[str, ...], object], ...]:
         return tuple((p, bool(btn.isChecked())) for p, btn in self._pills)
+
+    def apply_fields(
+        self,
+        fields_by_path: dict[tuple[str, ...], ControlFormField],
+    ) -> bool:
+        for path, btn in self._pills:
+            field = fields_by_path.get(tuple(path))
+            if field is None:
+                return False
+            was_blocked = btn.blockSignals(True)
+            try:
+                checked = bool(field.value)
+                if btn.isChecked() != checked:
+                    btn.setChecked(checked)
+            finally:
+                btn.blockSignals(was_blocked)
+            btn.setEnabled(bool(field.enabled))
+            btn.setToolTip(_field_tooltip(field.path, field.reason))
+        return True
 
 
 class SegmentedControl(QtWidgets.QWidget):
@@ -755,6 +867,21 @@ class SegmentedControl(QtWidgets.QWidget):
         if value is None:
             return ()
         return ((self._path, value),)
+
+    def apply_field(self, field: ControlFormField) -> bool:
+        if tuple(field.path) != self._path:
+            return False
+        for opt_value, btn in self._segments:
+            btn.setEnabled(bool(field.enabled))
+            btn.setToolTip(_field_tooltip(field.path, field.reason))
+            was_blocked = btn.blockSignals(True)
+            try:
+                checked = opt_value == field.value
+                if btn.isChecked() != checked:
+                    btn.setChecked(checked)
+            finally:
+                btn.blockSignals(was_blocked)
+        return True
 
 
 class ControlsPanelV2(QtWidgets.QWidget):
@@ -839,6 +966,47 @@ class ControlsPanelV2(QtWidgets.QWidget):
         """Render one immutable Controls V2 state snapshot."""
         self._bound_state = state.bound_controls
         self.set_profile(state.profile)
+
+    def apply_state_update(self, state: ControlPanelRenderState) -> bool:
+        """Apply a same-schema snapshot without tearing down row widgets."""
+
+        if self._bound_state is None or state.bound_controls is None:
+            return False
+        self._profile = state.profile
+        self._bound_state = state.bound_controls
+        fields_by_path = {
+            tuple(field.path): field
+            for field in state.bound_controls.fields
+        }
+
+        updated = 0
+        for row in self.findChildren(FormRow):
+            field = fields_by_path.get(tuple(row.path))
+            if field is None:
+                return False
+            if not row.apply_field(field):
+                return False
+            updated += 1
+        for row in self.findChildren(RangeRow):
+            if not row.apply_fields(fields_by_path):
+                return False
+            updated += 1
+        for row in self.findChildren(PillRow):
+            if not row.apply_fields(fields_by_path):
+                return False
+            updated += 1
+        for row in self.findChildren(SegmentedControl):
+            field = fields_by_path.get(tuple(row.path))
+            if field is None:
+                return False
+            if not row.apply_field(field):
+                return False
+            updated += 1
+
+        if fields_by_path and not updated:
+            return False
+        self._update_bound_section_statuses(state.profile)
+        return True
 
     def set_profile(self, profile: ControlProfile) -> None:
         self._profile = profile
@@ -931,6 +1099,11 @@ class ControlsPanelV2(QtWidgets.QWidget):
         self._render_processing_bound_section(
             profile, state.fields_for(SectionId.PROCESSING))
 
+        self._update_bound_section_statuses(profile)
+
+    def _update_bound_section_statuses(self, profile: ControlProfile) -> None:
+        state = self._bound_state or BoundControlState()
+        self.summary_card.hide()
         self.source_card.set_status_text(self._source_status(profile, state))
         self.experiment_card.set_status_text(self._experiment_status(
             state.fields_for(SectionId.EXPERIMENT)))

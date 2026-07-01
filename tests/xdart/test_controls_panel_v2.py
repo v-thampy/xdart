@@ -361,7 +361,11 @@ def test_controls_panel_v2_int_advanced_rows_are_collapsed(qapp, monkeypatch):
     def _paths(sub):
         paths = {row.path for row in sub.body.findChildren(FormRow)}
         for row in sub.body.findChildren(RangeRow):
-            paths.update(path for path, _ in row.current_edits())
+            paths.add(tuple(row._low_path))
+            paths.add(tuple(row._high_path))
+            toggle = getattr(row, "_toggle", None)
+            if toggle is not None:
+                paths.add(tuple(toggle[0]))
         for row in sub.body.findChildren(PillRow):
             paths.update(path for path, _ in row.current_edits())
         return paths
@@ -1172,6 +1176,7 @@ def test_controls_panel_v2_refresh_defers_while_line_editor_focused(qapp, monkey
         # event (e.g. a load completing).
         monkeypatch.setattr(widget.controls_v2, "focusWidget", lambda: editor)
         widget._controls_v2_last_signature = None
+        widget._controls_v2_last_schema_signature = None
         triggered = []
         monkeypatch.setattr(
             widget._controls_v2_refresh_timer, "trigger",
@@ -1560,6 +1565,43 @@ def test_controls_panel_v2_source_label_uses_configured_raw_source(
         assert state.source_caps.has_raw is True
         assert state.source_caps.has_frames is True
         assert state.frame_count == 1
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_frame_count_refresh_updates_without_rebuild(
+        qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    count = {"frames": 1}
+    try:
+        monkeypatch.setattr(
+            widget, "_controls_v2_source_label", lambda: "/tmp/raw_scan")
+        monkeypatch.setattr(
+            widget,
+            "_controls_v2_source_frame_count",
+            lambda: count["frames"],
+        )
+        widget._refresh_controls_v2_profile_now()
+        assert "1 frames" in widget.controls_v2.source_card.status.text()
+
+        rebuilds = []
+        original_set_state = widget.controls_v2.set_state
+
+        def _record_rebuild(state):
+            rebuilds.append(state)
+            original_set_state(state)
+
+        monkeypatch.setattr(widget.controls_v2, "set_state", _record_rebuild)
+        count["frames"] = 2
+
+        widget._refresh_controls_v2_profile_now()
+
+        assert rebuilds == []
+        assert "2 frames" in widget.controls_v2.source_card.status.text()
     finally:
         widget.close()
         widget.deleteLater()
@@ -2874,7 +2916,9 @@ def test_controls_panel_v2_gi_popup_torn_down_on_rebuild_no_stale_clobber(qapp, 
 
         # An out-of-band orientation change + a panel rebuild.
         widget._on_controls_v2_field_changed(("GI", "sample_orientation"), "7")
-        widget._refresh_controls_v2_profile_now()
+        widget._controls_v2_last_signature = None
+        widget._controls_v2_last_schema_signature = None
+        widget._refresh_controls_v2_profile_now(preserve_focused_editor=False)
 
         # Popup torn down: no orphan, nothing stale for current_form_edits.
         assert widget.controls_v2._gi_options_popup is None
@@ -3128,6 +3172,40 @@ def test_controls_panel_v2_reintegrate_finish_unlocks_idle_wrangler_thread(
         widget.deleteLater()
 
 
+def test_controls_panel_v2_run_exit_unlocks_focused_editor(qapp, monkeypatch):
+    """A focused V2 line edit must not block the run-exit rebuild/unlock."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget._refresh_controls_v2_profile_now()
+        rows = {
+            row.path: row
+            for row in widget.controls_v2.processing_card.body.findChildren(FormRow)
+        }
+        editor = rows[("Int1D", "points")].editor
+        editor.setFocus()
+        assert widget.controls_v2.focusWidget() is editor
+        assert editor.isEnabled()
+
+        widget._enter_run_state()
+        assert not editor.isEnabled()
+
+        widget._exit_run_state()
+
+        rows = {
+            row.path: row
+            for row in widget.controls_v2.processing_card.body.findChildren(FormRow)
+        }
+        assert rows[("Int1D", "points")].editor.isEnabled()
+        assert widget._controls_v2_pending_editor is None
+    finally:
+        widget._exit_run_state()
+        widget.close()
+        widget.deleteLater()
+
+
 def test_controls_panel_v2_advanced_commits_focused_edit(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -3200,6 +3278,10 @@ def test_controls_panel_v2_auto_rows_disable_range_edits(qapp, monkeypatch):
         assert not ranges[("Int1D", "radial_low")]._low.isEnabled()
         assert not ranges[("Int1D", "radial_low")]._high.isEnabled()
         assert not ranges[("Mask", "min")]._low.isEnabled()
+        edit_paths = [edit.path for edit in widget.controls_v2.current_form_edits()]
+        assert ("Int1D", "radial_auto") in edit_paths
+        assert ("Int1D", "radial_low") not in edit_paths
+        assert ("Int1D", "radial_high") not in edit_paths
 
         widget._on_controls_v2_field_changed(("Int1D", "radial_auto"), False)
         widget._on_controls_v2_field_changed(("Mask", "Threshold"), True)
@@ -3212,6 +3294,34 @@ def test_controls_panel_v2_auto_rows_disable_range_edits(qapp, monkeypatch):
         assert ranges[("Int1D", "radial_low")]._low.isEnabled()
         assert ranges[("Int1D", "radial_low")]._high.isEnabled()
         assert ranges[("Mask", "min")]._low.isEnabled()
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_pending_manual_range_survives_run_commit(qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget._on_controls_v2_field_changed(("Int1D", "radial_auto"), False)
+        widget._refresh_controls_v2_profile_now()
+        ranges = {
+            row._low_path: row
+            for row in widget.controls_v2.processing_card.body.findChildren(RangeRow)
+        }
+        row = ranges[("Int1D", "radial_low")]
+        row._low.setText("0.25")
+        row._high.setText("4.25")
+
+        widget._commit_controls_v2_pending_edits()
+
+        assert widget.scan.bai_1d_args["radial_range"] == (0.25, 4.25)
+        assert widget._controls_v2_native_reduction_plan(
+            integrate_2d=False,
+            commit_pending=False,
+        ).integration_1d.radial_range == (0.25, 4.25)
     finally:
         widget.close()
         widget.deleteLater()
