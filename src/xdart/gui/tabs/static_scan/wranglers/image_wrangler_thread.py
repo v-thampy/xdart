@@ -67,6 +67,7 @@ from xrd_tools.reduction import (
     ReductionPlan,
     prepare_gi_freeze,
 )
+from xrd_tools.session import FrameRecordStore
 from xrd_tools.sources.image import ImageFileSource, TiffSeriesSource
 from xrd_tools.io.image import read_image, count_frames
 from xrd_tools.io.export import write_xye
@@ -1915,7 +1916,11 @@ class imageThread(wranglerThread):
         _default_freeze = ("scout_union" if self.batch_mode else "first_frame") \
             if self.gi else None
         gi_freeze_mode = getattr(self, "gi_freeze_mode", _default_freeze)
-        sink = QtNexusSink(self, scan, standard_plan, mask=self.mask)
+        record_store = FrameRecordStore(max_heavy_items=None)
+        self._streaming_record_store = record_store
+        sink = QtNexusSink(
+            self, scan, standard_plan, mask=self.mask, record_store=record_store
+        )
         try:
             # 4f-bridge: drive the streaming write path through the PUBLIC
             # xrd_tools.session.ScanSession (commands in / events out), not a raw
@@ -1935,6 +1940,8 @@ class imageThread(wranglerThread):
                 cancel_token=cancel_token,
                 gi_freeze_mode=gi_freeze_mode,
                 sink=sink,
+                record_store=record_store,
+                record_store_persisted_on_write=False,
             )
         except GIFreezeError as exc:
             self.showLabel.emit(
@@ -1946,6 +1953,7 @@ class imageThread(wranglerThread):
             self._streaming_session = None
             self._streaming_sink = None
             self._streaming_scan_id = None
+            self._streaming_record_store = None
             self._scan_session_adapter = None
             return None, None
         self._streaming_session = session

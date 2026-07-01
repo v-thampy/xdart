@@ -18,7 +18,9 @@ decisions before build. **Builds on:** ADR-0003 (multi-result record), ADR-0004 
 
 ## Current state (grounded in code)
 - `xrd_tools.session.ScanSession` holds the streaming `ReductionSession` + event contract
-  (`submit`/`on_frame_completed`); **no record store yet** — 7 adds it.
+  (`submit`/`on_frame_completed`) and an optional `FrameRecordStore`. Phase 5 A-Step-A wires the
+  xdart GUI streaming path to create a per-scan, unbounded store and mark it persisted after
+  `QtNexusSink.flush()` completes the Nexus save. **No read path consumes it yet.**
 - `PublicationStore` (xdart): bounded per-mode `FrameRecord`s (`max_heavy_items=64`); `get_or_hydrate`
   exists but is a per-frame path.
 - `data_1d = FixSizeOrderedDict(max=0)` — unbounded, the de-facto aggregation backstop; `data_2d` cap 40.
@@ -67,7 +69,10 @@ Whole-scan Sum/Average/Overall must source ALL frames without holding them all i
 
 ## Gated sub-step sequence (each: spine + byte-compat green; commit separately)
 - **7a (headless, additive):** bounded `FrameRecord` store + persist-before-evict + store-owns-hydration
-  in `xrd_tools.session`; headless-tested; dormant (not yet the GUI's source).
+  in `xrd_tools.session`; headless-tested.
+- **A-Step-A (live wiring, additive):** GUI streaming sessions now pass a dormant per-scan
+  `FrameRecordStore(max_heavy_items=None)` into `ScanSession`; `QtNexusSink` marks published labels
+  persisted only after the durable `.nxs` save. Display and aggregation still read the legacy mirrors.
 - **W (write wiring):** feed the accumulated record's per-mode subgroups to the writer (closes the
   Round-11 in-memory-only gap) → the on-disk stack carries all modes. byte-compat gated.
 - **7b (aggregation):** route whole-scan Sum/Average/Overall through the stacked-disk-read + in-memory

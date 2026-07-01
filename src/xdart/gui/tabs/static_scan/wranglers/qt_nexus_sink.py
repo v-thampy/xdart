@@ -58,13 +58,18 @@ class QtNexusSink:
         The active ``ReductionPlan`` (for the per-frame normalization factor).
     mask
         The detector-level global mask used for thumbnails.
+    record_store
+        Optional per-scan ``FrameRecordStore``.  When supplied, this sink marks
+        published frame records persisted only after the durable Nexus save
+        succeeds.
     """
 
-    def __init__(self, host, scan, plan, *, mask=None):
+    def __init__(self, host, scan, plan, *, mask=None, record_store=None):
         self._host = host
         self._scan = scan
         self._plan = plan
         self._mask = mask
+        self._record_store = record_store
         self._registry: dict[int, Any] = {}
         self._since_save = 0
         self._published: set[int] = set()
@@ -321,6 +326,7 @@ class QtNexusSink:
         forced."""
         if self._since_save <= 0 and not force:
             return
+        published = set(self._published)
         if not self._host.xye_only:
             # Streaming writer reuses ONLY the host's symmetric h5pool bracket
             # (keeps its own mode= + mark_persisted bookkeeping; not the serial
@@ -329,8 +335,10 @@ class QtNexusSink:
                 with self._host.file_lock:
                     mode = "w" if self._needs_atomic_first_batch_flush() else "a"
                     self._scan._save_to_nexus(mode=mode)   # also calls mark_persisted
+            if published and self._record_store is not None:
+                self._record_store.mark_persisted(published)
         self._host._flush_xye_buffer(
-            self._scan, published_idxs=set(self._published),
+            self._scan, published_idxs=published,
         )
         self._published.clear()
         self._since_save = 0

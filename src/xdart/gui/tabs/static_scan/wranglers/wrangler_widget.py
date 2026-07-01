@@ -458,6 +458,7 @@ class wranglerThread(Qt.QtCore.QThread):
         self._streaming_session = None
         self._streaming_sink = None
         self._streaming_scan_id = None
+        self._streaming_record_store = None
         # 4c-1/4d: the streaming register/submit/pause seam (created in
         # _get_streaming_session, dies in _close_reduction_session).  Initialised
         # here so the `scan_session` property + GUI run-state reads never hit an
@@ -521,6 +522,7 @@ class wranglerThread(Qt.QtCore.QThread):
         self._streaming_session = None
         self._streaming_sink = None
         self._streaming_scan_id = None
+        self._streaming_record_store = None
         self._scan_session_adapter = None        # 4c-1: adapter dies with the session
         self._gi_prepass_scan_id = None      # next scan re-runs its own pre-pass
         # BLOCKER 2: finish() is fail-loud — a streaming sink/write failure now

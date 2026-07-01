@@ -480,6 +480,48 @@ def test_optional_record_store_receives_completed_frame_records():
     assert store.source_identity(0) == "/tmp/source.tif#0"
 
 
+def test_live_scan_session_adapter_wires_store_with_live_source_identity(tmp_path):
+    from types import SimpleNamespace
+
+    from xdart.modules.reduction import frame_from_live_frame, open_live_scan_session
+
+    source = tmp_path / "raw_master.h5"
+    live_frames = [
+        SimpleNamespace(
+            idx=i,
+            map_raw=np.full((2, 2), i + 1, dtype=float),
+            bg_raw=None,
+            scan_info={},
+            source_file=str(source),
+            source_frame_idx=i + 10,
+            mask=None,
+            poni=None,
+            integrator=object(),
+        )
+        for i in range(2)
+    ]
+    store = FrameRecordStore(max_heavy_items=None)
+    sess = open_live_scan_session(
+        live_frames,
+        ReductionPlan(integration_2d=None),
+        scan_name="live",
+        record_store=store,
+    )
+
+    converted = [frame_from_live_frame(live) for live in live_frames]
+    for frame in converted:
+        sess.submit(frame)
+    sess.finish()
+
+    assert len(store) == len(converted)
+    for frame in converted:
+        rec = store.get(frame.index)
+        assert rec is not None
+        assert store.source_identity(frame.index) == (
+            f"{frame.source_path}#{frame.source_frame_index}"
+        )
+
+
 def test_optional_record_store_can_mark_completed_writes_persisted_for_eviction():
     store = FrameRecordStore(max_heavy_items=1)
     frames = _frames(2)

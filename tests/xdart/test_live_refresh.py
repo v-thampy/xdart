@@ -6285,6 +6285,8 @@ def test_streaming_dispatch_series_average_submits_one_mean_frame(monkeypatch):
 
     submitted = []
     opened = []
+    opened_kwargs = []
+    sink_kwargs = []
     registered = []
 
     class FakeSession:
@@ -6306,7 +6308,7 @@ def test_streaming_dispatch_series_average_submits_one_mean_frame(monkeypatch):
 
     class FakeSink:
         def __init__(self, *args, **kwargs):
-            pass
+            sink_kwargs.append(kwargs)
 
         def register(self, live):
             registered.append(live)
@@ -6316,6 +6318,7 @@ def test_streaming_dispatch_series_average_submits_one_mean_frame(monkeypatch):
 
     def fake_open(frames, *args, **kwargs):
         opened.append(list(frames))
+        opened_kwargs.append(kwargs)
         return FakeSession()
 
     monkeypatch.setattr(module, "open_live_scan_session", fake_open)
@@ -6378,6 +6381,9 @@ def test_streaming_dispatch_series_average_submits_one_mean_frame(monkeypatch):
     assert count == 1
     assert len(opened) == 1
     assert len(opened[0]) == 1
+    assert opened_kwargs[0]["record_store_persisted_on_write"] is False
+    assert opened_kwargs[0]["record_store"] is sink_kwargs[0]["record_store"]
+    assert host._streaming_record_store is opened_kwargs[0]["record_store"]
     assert len(registered) == 1
     assert len(submitted) == 1
     np.testing.assert_allclose(submitted[0].image, np.full((2, 2), 5.0))

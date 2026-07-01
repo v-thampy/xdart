@@ -218,6 +218,53 @@ def test_forced_batch_flush_appends_after_frames_are_persisted(tmp_path, monkeyp
     assert modes == ["a"]
 
 
+def test_qt_sink_marks_record_store_persisted_after_nexus_save(tmp_path, monkeypatch):
+    from xdart.modules.ewald import LiveScan
+    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
+    import xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread as iwt
+
+    class _Pool:
+        def pause(self, path):
+            pass
+
+        def resume(self, path):
+            pass
+
+    class _Store:
+        def __init__(self):
+            self.persisted = []
+
+        def mark_persisted(self, labels):
+            self.persisted.append(set(labels))
+
+    monkeypatch.setattr(iwt, "_get_h5pool", lambda: _Pool())
+
+    scan = LiveScan(data_file=str(tmp_path / "scan.nxs"))
+    scan.skip_2d = True
+    host = _FakeHost(batch_mode=True)
+    store = _Store()
+    sink = QtNexusSink(
+        host, scan, _minimal_plan(), mask=None, record_store=store
+    )
+    sink.begin(scan, _minimal_plan())
+    for i in range(2):
+        live = _live_frame(i)
+        sink.register(live)
+        sink.write(_headless(i), _reduction(i))
+
+    saved = []
+
+    def fake_save(*, mode="a", **kwargs):
+        saved.append(mode)
+        scan.frames.mark_persisted(scan.frames.index)
+
+    monkeypatch.setattr(scan, "_save_to_nexus", fake_save)
+    sink.flush(force=True)
+
+    assert saved == ["w"]
+    assert store.persisted == [{0, 1}]
+
+
 def test_sink_persist_before_evict_no_unsaved_eviction(tmp_path):
     """The streaming sink must flush before _in_memory evicts an unsaved frame —
     so even with N > cap and a high interval, reload has every frame."""

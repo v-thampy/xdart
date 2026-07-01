@@ -11,13 +11,16 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable, Any
+from typing import Iterable, Any, TYPE_CHECKING
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 from dataclasses import fields as _dc_fields
+
+if TYPE_CHECKING:
+    from xrd_tools.session import FrameRecordStore
 
 from xrd_tools.core.metadata import (
     IncidenceAngleUnresolved,
@@ -601,6 +604,8 @@ def open_live_scan_session(
     gi_freeze_mode: str | None = None,
     sink: Any = None,
     inflight_max: int | None = None,
+    record_store: FrameRecordStore | None = None,
+    record_store_persisted_on_write: bool = False,
 ):
     """Open a public :class:`xrd_tools.session.ScanSession` over xdart live
     frames (4f-bridge).
@@ -625,6 +630,8 @@ def open_live_scan_session(
         gi_freeze_mode=gi_freeze_mode,
         cancel_token=cancel_token,
         clear_frame_images=True,
+        record_store=record_store,
+        record_store_persisted_on_write=record_store_persisted_on_write,
         # GUI never aborts a save (loud is the headless default).  Without this, the
         # streaming live/batch write path ran loud and a single degraded frame
         # (dead monitor / all-dummy 2D) aborted the whole-scan save (B-1 regression).
