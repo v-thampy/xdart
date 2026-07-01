@@ -128,7 +128,7 @@ def _control_panel_font_tokens(size="default"):
     offset = _CONTROL_PANEL_FONT_OFFSETS.get(key, 0)
     return {
         "control_panel_font": f"{12 + offset}px",
-        "control_panel_status_font": f"{6 + offset}px",
+        "control_panel_status_font": f"{12 + offset}px",
         "control_panel_tick_font": f"{12 + offset}px",
         "control_panel_browse_font": f"{13 + offset}px",
         "control_panel_run_font": f"{13 + offset}px",
@@ -460,14 +460,20 @@ QWidget#staticRunControls QSpinBox,
 QWidget#staticRunControls QPushButton {
     font-size: $control_panel_run_font;
 }
-QLabel#runReadinessDot {
+/* The readiness dot/label live INSIDE #staticRunControls, whose group rule
+   (QWidget#staticRunControls QLabel -> control_panel_run_font) outranks a plain
+   #runReadinessDot/#runReadinessLabel selector -- so the readiness bar was
+   stuck at the run font and ignored control_panel_status_font.  Qualify these
+   with the #staticRunControls ancestor so they win (and keep the three in
+   lock-step so the green-when-ready colour still outranks the base colour). */
+QWidget#staticRunControls QLabel#runReadinessDot {
     color: $stop_text;
     font-size: $control_panel_status_font;
 }
-QLabel#runReadinessDot[ready="true"] {
+QWidget#staticRunControls QLabel#runReadinessDot[ready="true"] {
     color: $start;
 }
-QLabel#runReadinessLabel {
+QWidget#staticRunControls QLabel#runReadinessLabel {
     color: $text_3;
     font-size: $control_panel_status_font;
     font-weight: 400;
