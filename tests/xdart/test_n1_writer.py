@@ -91,7 +91,9 @@ def test_image_wrangler_project_folder_derives_source_base(tmp_path):
     root.child('Project').child('project_folder').setValue('   ')   # whitespace
     assert compute() is None
 
-    folder = str(tmp_path / "proj")
+    proj = tmp_path / "proj"
+    proj.mkdir()                       # N1: source_base requires an EXISTING dir
+    folder = str(proj)
     root.child('Project').child('project_folder').setValue(folder)
     assert compute() == os.path.abspath(folder)
     # And it's session-persisted (so a relaunch restores the portable root).
@@ -207,7 +209,7 @@ def test_nexus_wrangler_thread_initialize_scan_sets_source_base():
     assert getattr(t2._initialize_scan("s"), "source_base", "X") is None
 
 
-def test_nexus_wrangler_compute_source_base():
+def test_nexus_wrangler_compute_source_base(tmp_path):
     """N1: the nexus wrangler derives source_base from its Project Folder param
     (Project is the first group), mirroring the image wrangler."""
     from types import SimpleNamespace, MethodType
@@ -221,8 +223,10 @@ def test_nexus_wrangler_compute_source_base():
     h = SimpleNamespace(parameters=root)
     h._compute_source_base = MethodType(nexusWrangler._compute_source_base, h)
     assert h._compute_source_base() is None
-    root.child("Project").child("project_folder").setValue("/tmp/p")
-    assert h._compute_source_base() == os.path.abspath("/tmp/p")
+    proj = tmp_path / "p"
+    proj.mkdir()                       # N1: source_base requires an EXISTING dir
+    root.child("Project").child("project_folder").setValue(str(proj))
+    assert h._compute_source_base() == os.path.abspath(str(proj))
 
 
 def test_writer_rejects_append_with_mismatched_source_base(tmp_path):

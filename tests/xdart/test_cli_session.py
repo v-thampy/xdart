@@ -9,6 +9,24 @@ import pytest
 from xdart.utils import session as S
 
 
+@pytest.fixture(autouse=True)
+def _restore_session_env():
+    """``_apply_cli_session_args`` mutates ``os.environ`` DIRECTLY (not via the
+    test's monkeypatch), and ``monkeypatch.delenv(name, raising=False)`` on an
+    absent var records nothing to undo — so ``XDART_SESSION_FRESH="1"`` set by the
+    ``-f`` tests would leak into every later test, silently forcing them into
+    fresh mode (save = no-op, load = empty).  Snapshot + restore both keys so this
+    module can never poison the shared session env for the rest of the suite."""
+    keys = ("XDART_SESSION_FRESH", "XDART_SESSION_FILE")
+    saved = {k: os.environ.get(k) for k in keys}
+    yield
+    for k, v in saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+
 def test_load_reads_default_when_not_fresh(tmp_path, monkeypatch):
     f = tmp_path / "session.json"
     f.write_text(json.dumps({"a": 1}))

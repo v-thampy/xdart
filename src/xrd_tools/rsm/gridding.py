@@ -172,9 +172,17 @@ def grid_img_data(
         r0, r1, c0, c1 = roi
         img = img[:, r0:r1, c0:c1]
 
-    if mask_static_pixels:
-        std_dev = np.nanstd(img, axis=0)
-        img[:, std_dev == 0] = np.nan
+    # Mask temporally-static pixels (hot masks / chip gaps) by their zero
+    # per-frame variance.  Two guards keep this from wiping the WHOLE image to
+    # NaN (which yields a silently-empty RSMVolume with no error): skip a
+    # single-frame stack (variance is meaningless and 0 everywhere), and skip
+    # when EVERY pixel is static (a fully constant-in-time stack).  A real
+    # multi-frame scene has photon noise, so the all-static case only trips on
+    # degenerate/synthetic input; the caller can still pass an explicit mask.
+    if mask_static_pixels and img.shape[0] >= 2:
+        static = np.nanstd(img, axis=0) == 0
+        if not static.all():
+            img[:, static] = np.nan
 
     qx, qy, qz = mapper.pixel_q(
         angles,

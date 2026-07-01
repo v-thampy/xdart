@@ -68,8 +68,16 @@ from xdart.gui import tabs
 QMainWindow = QtWidgets.QMainWindow
 
 
+# One modal error dialog in flight at a time.  A repeating error source (e.g. a
+# timer/paint slot that raises every tick) would otherwise schedule an unbounded
+# stack of QMessageBoxes; every exception is still logged, only the dialog is
+# coalesced until the current one is dismissed.
+_error_dialog_pending = False
+
+
 def _xdart_excepthook(exc_type, exc, tb):
     """Log uncaught GUI-slot exceptions without terminating the process."""
+    global _error_dialog_pending
     if issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
         sys.__excepthook__(exc_type, exc, tb)
         return
@@ -77,8 +85,14 @@ def _xdart_excepthook(exc_type, exc, tb):
     app = QtWidgets.QApplication.instance()
     if app is None:
         return
+    if _error_dialog_pending:
+        # Already showing/queuing a dialog — the exception is logged above; don't
+        # pile up another modal for a fast-repeating error source.
+        return
+    _error_dialog_pending = True
 
     def _show_error():
+        global _error_dialog_pending
         try:
             QtWidgets.QMessageBox.critical(
                 None,
@@ -88,14 +102,14 @@ def _xdart_excepthook(exc_type, exc, tb):
             )
         except Exception:
             logger.debug("Could not show GUI exception dialog", exc_info=True)
+        finally:
+            _error_dialog_pending = False
 
     try:
         QtCore.QTimer.singleShot(0, _show_error)
     except Exception:
         logger.debug("Could not schedule GUI exception dialog", exc_info=True)
-
-
-sys.excepthook = _xdart_excepthook
+        _error_dialog_pending = False
 
 
 class Main(QMainWindow):
@@ -271,6 +285,10 @@ def _apply_cli_session_args(argv):
 def run():
     argv = _apply_cli_session_args(sys.argv)
     app = QtWidgets.QApplication(argv)
+    # Install the keep-alive excepthook only when the GUI is actually launched —
+    # never as an import-time side effect (importing this module must not hijack
+    # the process-global sys.excepthook for tests / headless / embedding hosts).
+    sys.excepthook = _xdart_excepthook
     # N8: apply the saved theme before any widget construction so
     # pyqtgraph plot backgrounds are set in time (pyqtgraph
     # snapshots the config at widget creation).

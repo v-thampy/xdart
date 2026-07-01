@@ -310,6 +310,81 @@ class TestGridImgData:
         assert isinstance(out, RSMVolume)
         assert out.shape == (8, 9, 10)
 
+    @pytest.mark.parametrize("n_frames", [1, 3])
+    def test_static_pixel_mask_never_wipes_whole_volume(
+        self, monkeypatch: pytest.MonkeyPatch, n_frames: int
+    ) -> None:
+        # Regression: a single-frame stack (n=1) OR a fully constant-in-time
+        # stack (n>=2, every pixel identical across frames) has zero per-pixel
+        # temporal variance EVERYWHERE, so the static-pixel mask would NaN the
+        # whole image -> _pair_intensity divides by an all-zero norm -> a
+        # silently-empty (all-NaN) RSMVolume.  The guards must skip the mask in
+        # both degenerate cases so the volume still carries signal.
+        shape = (n_frames, 5, 6)
+
+        class _FakeAng2Q:
+            def init_area(self, *a, **k):
+                return None
+
+            def area(self, *a, **k):
+                z = np.zeros(shape, dtype=float)
+                return (z, z, z)
+
+        class _FakeHXRD:
+            Ang2Q = _FakeAng2Q()
+
+        class _FakeGridder3D:
+            def __init__(self, nx: int, ny: int, nz: int):
+                self.xaxis = np.linspace(-1, 1, nx)
+                self.yaxis = np.linspace(-2, 2, ny)
+                self.zaxis = np.linspace(0, 3, nz)
+                self.data = np.zeros((nx, ny, nz), dtype=float)
+
+            def KeepData(self, flag):  # noqa: N802
+                pass
+
+            def Normalize(self, flag):  # noqa: N802
+                pass
+
+            def dataRange(self, *a, **k):  # noqa: N802
+                pass
+
+            def __call__(self, qx, qy, qz, img):
+                self.data = np.full(self.data.shape, float(np.nansum(img)))
+
+        import xrd_tools.rsm.gridding as gridding_module
+
+        monkeypatch.setattr(gridding_module.xu, "Gridder3D", _FakeGridder3D)
+        monkeypatch.setattr(
+            DiffractometerConfig, "make_hxrd", lambda self, energy: _FakeHXRD())
+
+        mapper = PixelQMap(
+            diff_config=DiffractometerConfig(),
+            header=_default_header(Nch1=5, Nch2=6),
+        )
+        rng = np.random.default_rng(0)
+        if n_frames == 1:
+            img = rng.random(shape) + 1.0                    # strictly positive
+        else:
+            # A fully constant-in-time stack: every frame EXACTLY identical so
+            # per-pixel temporal std is exactly 0 EVERYWHERE (the n>=2 degenerate
+            # case).  Integer-valued floats avoid the ~1e-16 mean residual that
+            # np.random leaves, which would make std != 0 for some pixels and
+            # silently bypass the `not static.all()` guard this test defends.
+            one = rng.integers(1, 50, (shape[1], shape[2])).astype(float)
+            img = np.stack([one] * n_frames)
+            assert (np.nanstd(img, axis=0) == 0).all()       # truly all-static
+        angles = [[0.0] * n_frames, [0.0] * n_frames,
+                  [0.0] * n_frames, [0.1] * n_frames]
+
+        out = grid_img_data(
+            mapper, img, angles, energy=12000.0, UB=np.eye(3),
+            bins=(8, 9, 10), mask_static_pixels=True,
+        )
+        assert isinstance(out, RSMVolume)
+        assert not np.isnan(out.intensity).all()   # pre-fix: whole volume was NaN
+        assert np.nansum(out.intensity) > 0
+
     def test_roi_crop(self, monkeypatch: pytest.MonkeyPatch) -> None:
         captured: dict[str, Any] = {}
 

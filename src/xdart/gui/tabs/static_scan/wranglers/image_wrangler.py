@@ -1578,8 +1578,17 @@ class imageWrangler(wranglerWidget):
         )
         now = time.monotonic()
         cached_key, cached_value, cached_at = self._img_dir_probe_cache
-        if cached_key == key and (now - cached_at) <= 0.5:
-            return cached_value
+        if cached_key == key:
+            # A FOUND seed for these exact inputs never changes, so cache it
+            # INDEFINITELY: setup() runs on every parameter edit (threshold, bg,
+            # write-mode, ...), and re-walking a large image directory on each one
+            # is the dominant source-config GUI stall.  A NEGATIVE (None) result is
+            # only burst-coalesced (0.5s TTL) — the directory may still be filling
+            # (frames arriving), so re-walk soon rather than poison the cache with
+            # a stale "no frames" (cf. the negative-cache trap); a genuine source
+            # change (dir/ext/filter/subdir/meta/poni) changes ``key`` and rescans.
+            if cached_value is not None or (now - cached_at) <= 0.5:
+                return cached_value
 
         found = None
         for _idx, (subdir, _dirs, files) in enumerate(os.walk(self.img_dir)):

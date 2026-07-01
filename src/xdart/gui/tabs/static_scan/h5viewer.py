@@ -792,10 +792,16 @@ class H5Viewer(QWidget):
             lw.clear()
             lw.addItem('..')
 
-            names = sorted(os.listdir(self.dirname), key=self._natural_sort_key)
-            for name in names:
-                abspath = os.path.join(self.dirname, name)
-                if os.path.isdir(abspath):
+            # os.scandir exposes d_type from the single readdir, so entry.is_dir()
+            # needs no extra stat() per entry (unlike os.path.isdir).  This is the
+            # hot path on Refresh / folder navigation / browsing large raw-image
+            # dirs, and every saved stat is a network round-trip on the SSRL NFS
+            # deployment.  is_dir() follows symlinks by default, matching isdir.
+            with os.scandir(self.dirname) as it:
+                entries = sorted(it, key=lambda e: self._natural_sort_key(e.name))
+            for entry in entries:
+                name = entry.name
+                if entry.is_dir():
                     lw.addItem(name + '/')
                 else:
                     ext = os.path.splitext(name)[1].lower()

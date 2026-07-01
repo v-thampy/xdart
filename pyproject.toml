@@ -75,6 +75,12 @@ Homepage = "https://github.com/v-thampy/xrd-tools"
 Repository = "https://github.com/v-thampy/xrd-tools"
 Issues = "https://github.com/v-thampy/xrd-tools/issues"
 
+[tool.setuptools]
+# Package the MIT license text into the wheel + sdist (the two per-provenance
+# copies under licenses/).  Without this the built artifacts carry the MIT
+# metadata classifier but no license file.
+license-files = ["licenses/LICENSE-*"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["xrd_tools*", "xdart*", "ssrl_xrd_tools*"]

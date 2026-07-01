@@ -50,6 +50,14 @@ def _finish_host(tmp_path, *, batch, saw_frame, xye_only=False,
     )
     host._loaded_paths = loaded
     host.wrangler_finished = MethodType(staticWidget.wrangler_finished, host)
+    # wrangler_finished now delegates the post-live frame-index populate to the
+    # real _reconcile_h5viewer_frame_list_after_run (it calls
+    # scan.load_frame_index_only and returns the indexed count).  Bind the real
+    # method so the mock exercises that contract: load_frame_index_only fires
+    # (populating _loaded_paths) and the reconcile returns 0 for these mocks (no
+    # frame index) so the reload branch is correctly skipped.
+    host._reconcile_h5viewer_frame_list_after_run = MethodType(
+        staticWidget._reconcile_h5viewer_frame_list_after_run, host)
     return host, h5viewer, str(nxs), calls
 
 

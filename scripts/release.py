@@ -17,6 +17,10 @@ Checks (each prints PASS/FAIL; any FAIL exits 1):
   schema     the persisted-format pins + byte-compat gate test files run
              green (tests/core/test_schema_as_code.py,
              tests/core/test_v2_record_compat.py).
+  gui        offscreen smoke of the run-end reload/select-last path
+             (tests/xdart/test_batch_finish_select_last.py); skipped where
+             Qt is absent.  NOTE: this is a smoke, not the full GUI suite —
+             the complete tests/xdart offscreen run is the CI gate (pr.yml).
   deps       known ceilings intact (pyFAI<2025.12 — 2025.12 ships a
              broken pyFAI-calib2 on Windows).
 
@@ -27,7 +31,9 @@ building the artifacts).
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -110,6 +116,26 @@ def check_schema() -> bool:
         "schema pins + byte-compat gate")
 
 
+def check_gui_smoke() -> bool:
+    """Offscreen GUI smoke for the run-end reload / select-last path — the class
+    of failure the schema-only checks miss (a stale mock there once left preflight
+    green while CI was red).  Skipped (not failed) where Qt isn't installed; the
+    full ``tests/xdart`` offscreen suite remains the CI gate (pr.yml)."""
+    try:
+        import PySide6  # noqa: F401
+    except Exception:
+        print("  note  PySide6 not installed; GUI smoke skipped "
+              "(full tests/xdart offscreen is CI-gated in pr.yml)")
+        return True
+    env = {**os.environ, "QT_QPA_PLATFORM": "offscreen"}
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         "tests/xdart/test_batch_finish_select_last.py"],
+        cwd=ROOT, env=env,
+    )
+    return (_ok if proc.returncode == 0 else _fail)("GUI run-end smoke (offscreen)")
+
+
 def check_deps() -> bool:
     text = (ROOT / "pyproject.toml").read_text()
     ok = True
@@ -128,10 +154,16 @@ def run_checks(tag: str | None, strict_tree: bool) -> bool:
     ok &= check_deps()
     print("schema (runs two test files):")
     ok &= check_schema()
+    print("gui smoke (offscreen; skipped if no Qt — full suite is CI-gated):")
+    ok &= check_gui_smoke()
     return ok
 
 
 def build() -> bool:
+    # Clean dist/ first: `python -m build` does not, so a stale same-version
+    # artifact (e.g. a weeks-old 1.0.0 wheel) would linger and could be uploaded
+    # by mistake.  CI is safe (fresh checkout) but a local `release.py build` is not.
+    shutil.rmtree(ROOT / "dist", ignore_errors=True)
     if subprocess.run([sys.executable, "-m", "build"], cwd=ROOT).returncode:
         return _fail("build failed")
     artifacts = [str(p) for p in (ROOT / "dist").glob("*")
