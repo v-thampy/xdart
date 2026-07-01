@@ -150,7 +150,7 @@ Stages 6–8 touch the contested Phase-5 GUI files (`static_scan_widget.py`, `di
 | Stage | Contract | Tag | Status | Commit | Note |
 |-------|----------|-----|--------|--------|------|
 | 1 | (1) readiness/caps/run-gate MOVE + mask relocation + purity guard | M / low / parallelizable / NOT contested | **NOT STARTED** | — | doc created 2026-07-01 (`f2e99a4a`) |
-| 2 | (2) probe extract | S / low / parallelizable | **NOT STARTED** | — | — |
+| 2 | (2) probe extract | S / low / parallelizable | **DONE** | HEAD | Moved `probe_first_frame` / `raw_is_reachable` to `xrd_tools.sources.probe` with GUI shims.<br>Added core behavior + import-purity coverage. |
 | 3 | (3) composition (needs 1+2) | M / low-med | **NOT STARTED** | — | consume `metadata['capabilities']`; keep true-live escape hatch |
 | 4 | (4) provenance builder + `/entry/reduction/` | M / med / spine-gated | **NOT STARTED** | — | ADDITIVE, spine-gated |
 | 5 | (5) resolver dedup | M / med / RECONCILING | **NOT STARTED** | — | canonical = guarded `_frame_norm`; no `StrictPolicy` arg; edit off Phase-5 A-Step-A |
