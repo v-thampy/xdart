@@ -720,6 +720,24 @@ Acceptance for the polish pass:
 
 ## 14. 2026-07-01 status — V2 Int flip shipped; manual live re-pass pending
 
+> **2026-07-01 — the §2 keystone is now HEADLESS (Plan B item 3, Stages 1–5, on
+> `feature/remediation` — NOT yet on `cp2`/`main`).** The Qt-free `ControlState →
+> ControlProfile` / readiness / caps / run-gate decision core this doc describes as
+> `xdart.gui.tabs.static_scan.controls_logic` has been **moved to `xrd_tools.session.readiness`**,
+> with a full re-export shim left at the old path (every existing import keeps working, and a
+> purity-guard test asserts `xrd_tools` imports no `xdart`). This literally realizes the doc's
+> north star — "the panel is a *renderer* of a Qt-free state model" — the state model is now
+> reusable headless from notebooks/scripts, not stranded under the GUI package. Also landed:
+> `probe_first_frame`/`raw_is_reachable` → `xrd_tools.sources.probe`; the composition builders
+> `describe_source_readiness` + `capabilities_for_processed` → `xrd_tools.sources.readiness`
+> (the headless replacement for the inline caps computation the GUI does today — its GUI *wiring*
+> is Stage 6 / Plan B item 1, still deferred/contested); the per-frame incidence-angle + monitor-norm
+> resolvers → `xrd_tools.core.metadata`; and headless reduction provenance (`/entry/reduction/`).
+> **GUI behavior is byte-identical** (pure MOVE + shims); the spine + byte-compat stay green.
+> Plan: `design_headless_contracts_migration_jul2026.md`. Next controls-panel-v2 step that
+> consumes this = **Stage 6** (rewire `staticWidget._controls_v2_state` to call
+> `describe_source_readiness`), gated on a stable `static_scan_widget.py` checkpoint / Phase 5.
+
 **Status summary.** Phases 7/8 of the Int migration are **SHIPPED / CODE-COMPLETE**
 on `feature/controls-panel-v2`: the native Int state, native run/reintegrate/session
 plan builder, default-on flip, write-through bridge retirement, threshold fix, Average
