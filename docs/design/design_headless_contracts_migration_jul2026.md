@@ -149,7 +149,7 @@ Stages 6–8 touch the contested Phase-5 GUI files (`static_scan_widget.py`, `di
 
 | Stage | Contract | Tag | Status | Commit | Note |
 |-------|----------|-----|--------|--------|------|
-| 1 | (1) readiness/caps/run-gate MOVE + mask relocation + purity guard | M / low / parallelizable / NOT contested | **NOT STARTED** | — | doc created 2026-07-01 (`f2e99a4a`) |
+| 1 | (1) readiness/caps/run-gate MOVE + mask relocation + purity guard | M / low / parallelizable / NOT contested | **DONE** | this commit | `controls_logic` moved to `xrd_tools.session.readiness`; mask helpers moved to `xrd_tools.reduction.masks`; shims kept at `xdart.gui.tabs.static_scan.controls_logic` and `xdart.modules.reduction`, with `tests/core/test_readiness_purity.py`. |
 | 2 | (2) probe extract | S / low / parallelizable | **NOT STARTED** | — | — |
 | 3 | (3) composition (needs 1+2) | M / low-med | **NOT STARTED** | — | consume `metadata['capabilities']`; keep true-live escape hatch |
 | 4 | (4) provenance builder + `/entry/reduction/` | M / med / spine-gated | **NOT STARTED** | — | ADDITIVE, spine-gated |
