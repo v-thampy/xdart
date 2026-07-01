@@ -3471,7 +3471,13 @@ class staticWidget(QWidget):
         # live stream must still paint every ~200 ms; the latest index
         # wins via _pending_update_idx (the shared coalescing idiom,
         # xdart.utils.throttle).
-        self._update_timer = Coalescer(200, mode="throttle", parent=self)
+        # Live heavy-render quantum. 200 -> 100 ms doubles the image update rate
+        # (the perceived-smoothness knob).  MEASURE-GATED: the window must stay >=
+        # the median flush total (drain+list+render, ~70-90 ms measured) or the
+        # event loop re-saturates; 80 ms is riskier on heavy 2D frames — raise back
+        # to 200 if XDART_PERF shows total creeping over the window.  See
+        # docs/design/design_gui_liveness_jul2026.md.
+        self._update_timer = Coalescer(100, mode="throttle", parent=self)
         self._update_timer.triggered.connect(self._flush_pending_update)
         # Liveness: a FAST list/cursor timer fires several times per heavy-render
         # window so the Frames list + auto-last cursor + status scroll continuously
@@ -5037,6 +5043,14 @@ class staticWidget(QWidget):
         # canonical name resolution (via ``scan.set_datafile``)
         # land correctly; this assignment just unblocks the
         # synchronous render path immediately.
+        # Frames-panel reset: capture the PRIOR scan identity before we overwrite
+        # it, so the stale-frame reset below fires for a genuinely-new scan even
+        # when NOT in a live run (it was gated only on live_run_active, so a new
+        # scan starting with live_run_active=False left the previous scan's frames
+        # stale in the panel).  Same name => same scan => keep the intentional linger.
+        _prev_scan_name = getattr(self.scan, "name", None)
+        _new_scan_identity = bool(name and name != _prev_scan_name
+                                  and _prev_scan_name not in (None, "", "null_main"))
         self.scan.name = name
         # G1/T0-1: a new run is a new data identity — drop the wavelength
         # restored from whatever file was open before, synchronously (the
@@ -5150,9 +5164,13 @@ class staticWidget(QWidget):
                 _idxlen = len(getattr(getattr(self.scan, "frames", None), "index", []) or [])
             except Exception:
                 _idxlen = -1
-            logger.info("[PERF] new_scan boundary: live_run_active=%s index_len=%d name=%s",
-                        getattr(self.h5viewer, "live_run_active", None), _idxlen, name)
-        if self.h5viewer.live_run_active:
+            logger.info("[PERF] new_scan boundary: live_run_active=%s new_identity=%s "
+                        "index_len=%d name=%s",
+                        getattr(self.h5viewer, "live_run_active", None),
+                        _new_scan_identity, _idxlen, name)
+        # Reset the panel when a live run is active OR the scan identity genuinely
+        # changed (fixes stale frames persisting on a non-live new scan).
+        if self.h5viewer.live_run_active or _new_scan_identity:
             try:
                 import pandas as pd
                 with self.scan.scan_lock:

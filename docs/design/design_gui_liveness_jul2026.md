@@ -47,9 +47,9 @@ paint; smoothing only helps the fast-scan case where frames pile up per window.
 |---|---|---|---|
 | 1 | **PATH CONFIRMED** (fix pending) | `d66671c6` (instrument) | `XDART_PERF` logs confirmed it live: during the run `live_run=True`; **post-run `live_run=False`**. The `new_scan` index-clear is gated on `live_run_active`, so a genuinely-new scan starting when `live_run_active=False` (a directory-watch new scan *after* a run ends) never clears → stale frames persist. **Fix (next):** in `new_scan`, clear the panel/index when the scan identity (name/output) genuinely changes, even when not live — while preserving the intentional same-scan linger. The refuted `new_scan_loaded=True` change stays out. |
 | 2 | **DONE + LIVE-VALIDATED** | `cf72fca3` | `_list_timer` (`Coalescer(70, throttle)`) → `_flush_frame_list` runs only the O(new) list refresh + signal-blocked auto-last cursor; heavy drain+render stays on `_update_timer` (200 ms). Timers stopped together at teardown; mocks updated (+`_list_timer`); unit test; offscreen + spine green. **Live (651-frame eiger, Int 2D): NO regression — total 27.25 s → 24.98 s, dispatch 24.97 → 22.58 s, per-frame 38.3 → 34.7 ms, flush render 51–83 → 40–68 ms; Frames list now scrolls continuously.** Well inside the ≤5%/≥50% bar (on the good side). |
-| 3 | NOT STARTED | — | measure-gated |
-| 4 | NOT STARTED | — | measure-gated |
-| 5 | NOT STARTED | — | optional |
+| 3 | **DONE** (live-perf pending) | this commit | live heavy-render quantum 200 → **100 ms** (2× image update rate). Measure-gated: keep window ≥ median flush total (~70–90 ms); raise back if `total` creeps over. |
+| 4 | **SKIPPED** | — | maintainer: waterfall throttle is not an issue |
+| 5 | proposed | — | next smoothing lever = cut the render leg (40–68 ms, dominated by re-drawing + re-leveling the raw Eiger frame): throttle/subsample the autoscale re-level. Needs finer render-leg instrumentation first (measure-first). |
 
 ## Measurement protocol (live — the maintainer runs)
 `conda activate xrd_test && XDART_PERF=1 xdart`, point at the 651-frame eiger dir (Image Directory,
