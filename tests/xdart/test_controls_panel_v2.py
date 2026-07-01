@@ -656,6 +656,59 @@ def test_controls_panel_v2_detector_status_uses_poni_summary(qapp):
     assert detector.status.text() == "Eiger 1M · 200.4mm · fitted"
 
 
+def test_controls_panel_v2_section_ticks_and_source_synopsis(qapp):
+    profile = build_control_profile(
+        ControlState(
+            tool=Tool.INT_2D,
+            project_root_required=True,
+            project_root="/tmp/project",
+            project_root_valid=True,
+            source_label="/tmp/project/raw/scan_0001.tif",
+            processing_mode="Int 2D",
+            source_caps=SourceCaps(
+                has_raw=True,
+                raw_reachable=True,
+                has_energy=True,
+            ),
+            geom=GeomState(calibrated=True, energy_known=True),
+        )
+    )
+    state = ControlPanelRenderState(
+        profile=profile,
+        bound_controls=BoundControlState(fields=(
+            ControlFormField(
+                section=SectionId.PROJECT,
+                label="Folder",
+                path=("Project", "project_folder"),
+                value="/tmp/project",
+                browse=True,
+            ),
+            ControlFormField(
+                section=SectionId.SOURCE,
+                label="Source",
+                path=("Signal", "inp_type"),
+                value="Image Series",
+                kind=ControlFieldKind.COMBO,
+            ),
+            ControlFormField(
+                section=SectionId.EXPERIMENT,
+                label="Poni",
+                path=("Signal", "poni_file"),
+                value="/tmp/project/cal.poni",
+                browse=True,
+            ),
+        )),
+    )
+
+    panel = ControlsPanelV2()
+    panel.set_state(state)
+
+    assert panel.source_card.status.text() == "Image Series · reachable"
+    assert not panel.project_card.valid_marker.isHidden()
+    assert not panel.source_card.valid_marker.isHidden()
+    assert not panel.experiment_card.valid_marker.isHidden()
+
+
 def test_controls_panel_v2_viewer_mode_shows_only_project(qapp):
     profile = build_control_profile(
         ControlState(tool=Tool.IMAGE_VIEWER, processing_mode="Image Viewer")
@@ -1215,6 +1268,7 @@ def test_controls_panel_v2_not_ready_disables_run_row(qapp, monkeypatch):
         widget._refresh_controls_v2_profile(immediate=True)
 
         assert widget.controls.readinessDot.property("ready") is False
+        assert "Choose a project folder" in widget.controls.readinessLabel.text()
         assert widget.controls.actionRow.isVisible()
         assert widget.controls.actionRow.isEnabled() is False
     finally:
@@ -1227,15 +1281,18 @@ def test_controls_panel_v2_cached_scan_poni_satisfies_calibration(
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
     from xrd_tools.core.containers import PONI
+    from xrd_tools.core.energy import wavelength_m_to_energy_eV
 
     widget = staticWidget()
     try:
+        wavelength_m = 0.7293e-10
         widget.scan._cached_integrator = object()
         widget.scan._cached_poni = PONI(
             dist=0.1794,
             poni1=0.0,
             poni2=0.0,
             detector="RayonixMx225",
+            wavelength=wavelength_m,
         )
         widget.wrangler.poni = None
         widget.wrangler.poni_file = ""
@@ -1244,6 +1301,80 @@ def test_controls_panel_v2_cached_scan_poni_satisfies_calibration(
 
         assert state.detector_summary == "RayonixMx225 · 179.4mm · fitted"
         assert state.geom.calibrated is True
+        assert state.geom.calibration_energy_eV == pytest.approx(
+            wavelength_m_to_energy_eV(wavelength_m),
+            rel=1e-12,
+        )
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_source_label_uses_configured_raw_source(
+        qapp, monkeypatch, tmp_path):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        raw_path = tmp_path / "raw" / "scan_0001.tif"
+        raw_path.parent.mkdir()
+        raw_path.write_bytes(b"")
+        widget.fname = str(tmp_path / "processed" / "output.nxs")
+        widget.wrangler.fname = widget.fname
+        widget._controls_v2_param(("Signal", "File")).setValue(str(raw_path))
+
+        state = widget._controls_v2_state()
+
+        assert state.source_label == str(raw_path)
+        assert state.source_caps.has_raw is True
+        assert state.source_caps.has_frames is False
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_raw_source_and_poni_enable_run_without_frames(
+        qapp, monkeypatch, tmp_path):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.core.containers import PONI
+
+    widget = staticWidget()
+    try:
+        project = tmp_path / "project"
+        project.mkdir()
+        raw_path = project / "raw" / "scan_0001.tif"
+        raw_path.parent.mkdir()
+        raw_path.write_bytes(b"")
+        poni_path = project / "cal.poni"
+        PONI(
+            dist=0.1794,
+            poni1=0.0,
+            poni2=0.0,
+            detector="RayonixMx225",
+            wavelength=0.7293e-10,
+        ).to_poni_file(poni_path)
+
+        widget._controls_v2_param(("Project", "project_folder")).setValue(str(project))
+        widget.wrangler.project_folder = str(project)
+        widget._controls_v2_param(("Project", "h5_dir")).setValue(
+            str(project / "xdart_processed_data")
+        )
+        widget.wrangler.h5_dir = str(project / "xdart_processed_data")
+        widget._controls_v2_param(("Signal", "File")).setValue(str(raw_path))
+        widget.wrangler.img_file = str(raw_path)
+        widget._set_poni_field(str(poni_path))
+
+        widget._refresh_controls_v2_profile_now()
+
+        state = widget._controls_v2_state()
+        assert state.frame_count == 0
+        assert state.source_label == str(raw_path)
+        assert state.geom.calibration_energy_eV is not None
+        assert widget.controls_v2.profile.can_run is True
+        assert widget.controls.actionRow.isEnabled() is True
+        assert widget.controls.readinessDot.property("ready") is True
     finally:
         widget.close()
         widget.deleteLater()

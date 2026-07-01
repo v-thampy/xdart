@@ -1996,14 +1996,16 @@ class staticWidget(QWidget):
             page = getattr(getattr(profile, "processing_page", None),
                            "value", "")
             mode = str(page).replace("_", " ").title()
+        blockers = tuple(getattr(profile, "run_blockers", ()) or ())
         parts = [status]
+        if not ready and blockers:
+            parts.append(str(blockers[0]).rstrip("."))
         if mode:
             parts.append(mode)
         frame_count = int(getattr(state, "frame_count", 0) or 0)
         if frame_count:
             plural = "" if frame_count == 1 else "s"
             parts.append(f"{frame_count} frame{plural}")
-        blockers = tuple(getattr(profile, "run_blockers", ()) or ())
         tooltip = "" if ready else "; ".join(str(b) for b in blockers[:3])
         return " · ".join(parts), ready, tooltip
 
@@ -2167,11 +2169,43 @@ class staticWidget(QWidget):
         )
 
     def _controls_v2_source_label(self) -> str:
-        for candidate in (
+        source_type = ""
+        param = self._controls_v2_param(("Signal", "inp_type"))
+        if param is not None:
+            try:
+                source_type = str(param.value() or "")
+            except Exception:
+                source_type = ""
+
+        source_paths = [("NeXus File", "nexus_file")]
+        if source_type == "Image Directory":
+            source_paths.append(("Signal", "img_dir"))
+        else:
+            source_paths.append(("Signal", "File"))
+        source_paths.extend((("Signal", "File"), ("Signal", "img_dir")))
+
+        seen = set()
+        candidates = []
+        for path in source_paths:
+            if path in seen:
+                continue
+            seen.add(path)
+            param = self._controls_v2_param(path)
+            if param is None:
+                continue
+            try:
+                candidates.append(param.value())
+            except Exception:
+                pass
+
+        wrangler = getattr(self, "wrangler", None)
+        candidates.extend((
+            getattr(wrangler, "img_file", None),
+            getattr(wrangler, "img_dir", None),
+            getattr(wrangler, "nexus_file", None),
             getattr(self.scan, "data_file", None),
-            getattr(self, "fname", None),
-            getattr(getattr(self, "wrangler", None), "fname", None),
-        ):
+        ))
+        for candidate in candidates:
             if candidate:
                 return str(candidate)
         return ""
@@ -2287,7 +2321,10 @@ class staticWidget(QWidget):
         constructor default is only a placeholder and must not satisfy the gate.
         """
         scan = getattr(self, "scan", None)
-        calibration_energy_eV = self._controls_v2_calibration_energy_eV(scan)
+        calibration_energy_eV = self._controls_v2_calibration_energy_eV(
+            scan,
+            poni=self._controls_v2_current_poni(),
+        )
         source_energy_eV = self._controls_v2_source_energy_eV(scan)
         return calibration_energy_eV, source_energy_eV
 
@@ -2308,7 +2345,7 @@ class staticWidget(QWidget):
         return energy if energy > 0 else None
 
     @classmethod
-    def _controls_v2_calibration_energy_eV(cls, scan) -> float | None:
+    def _controls_v2_calibration_energy_eV(cls, scan, *, poni=None) -> float | None:
         if scan is None:
             return None
         persisted = cls._controls_v2_energy_from_wavelength(
@@ -2317,6 +2354,12 @@ class staticWidget(QWidget):
         )
         if persisted is not None:
             return persisted
+        from_poni = cls._controls_v2_energy_from_wavelength(
+            getattr(poni, "wavelength", None),
+            allow_default_sentinel=True,
+        )
+        if from_poni is not None:
+            return from_poni
         integrator = getattr(scan, "_cached_integrator", None)
         from_integrator = cls._controls_v2_energy_from_wavelength(
             getattr(integrator, "wavelength", None))

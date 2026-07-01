@@ -776,6 +776,17 @@ the flip is not declared fully cleared until the live checkpoint is rerun.
 - A loaded processed `.nxs` with stored PONI and reachable raw-source pointers can
   seed the streaming Run path from the scan cache, matching the green readiness
   status instead of failing the old PONI-file-only guard.
+- Streaming-run readiness no longer requires an already-produced processed frame
+  count. A configured reachable raw source can enable Run before any `.nxs` frames
+  exist, while the Source header still reports processed frame count when present.
+- PONI wavelength now satisfies the calibration-energy gate, matching the detector
+  summary's PONI lookup. The output `.nxs` filename is no longer treated as a fake
+  source; the Source state is based on the selected image/Nexus source or a loaded
+  scan source.
+- The compact readiness row now names the first ordered blocker (Project → PONI /
+  energy → Source → mode-specific facts), with the full blocker list in the tooltip.
+  Section headers now carry small accent-coloured validity ticks driven by the same
+  `FieldStatus` stream.
 
 **Acceptance gates converted.** Offscreen tests now assert native-authoritative
 correctness rather than V2-vs-hidden-widget parity. The core checks are:
@@ -799,10 +810,15 @@ correctness rather than V2-vs-hidden-widget parity. The core checks are:
   predicates as the visible Run controls.
 
 **Validated in `xrd_test` for this chunk.**
-- `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_panel_v2.py -q` → 72 passed.
-- `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_logic.py -q` → 29 passed.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_logic.py -q` → 30 passed.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_panel_v2.py -q` → 75 passed.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_panel_v2.py -k "raw_source_and_poni_enable_run_without_frames or source_label_uses_configured_raw_source or cached_scan_poni_satisfies_calibration or section_ticks_and_source_synopsis" -q` → 4 passed, 71 deselected.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_static_controls.py -q` → 8 passed.
 - `QT_QPA_PLATFORM=offscreen tests/xdart/test_static_controls.py tests/xdart/test_n1_disclosure.py -q` → 15 passed.
 - `QT_QPA_PLATFORM=offscreen tests/xdart/test_live_refresh.py -k "wrangler_enabled_reapplies_viewer_mode_controls or file_viewer_mode_disables_processing_tree_but_not_mode_combo or start_guard_adopts_processed_scan_cached_poni_and_source or start_without_poni_is_gated" -q` → 4 passed.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_live_refresh.py -k "start_guard_adopts_processed_scan_cached_poni_and_source or start_without_poni_is_gated" -q` → 2 passed, 190 deselected.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_live_refresh.py -q` → 191 passed, 1 skipped.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_gui_modes_end_to_end.py -k "run_in_stitch_mode_routes_to_stitch_not_wrangler or reintegrate_live_default_and_stop_wiring" -q` → 2 passed, 148 deselected.
 - `QT_QPA_PLATFORM=offscreen tests/xdart/test_gui_modes_end_to_end.py -k "run_state_disables_whole_integrator_and_mode_row" -q`,
   `-k "run_in_stitch_mode_routes_to_stitch_not_wrangler" -q`, and
   `-k "reintegrate_live_default_and_stop_wiring" -q` → 1 passed each; the

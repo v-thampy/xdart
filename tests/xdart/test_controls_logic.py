@@ -223,22 +223,40 @@ def test_run_blockers_are_derived_from_required_field_statuses():
     fields = build_field_statuses(state)
 
     assert run_required_fields_for(state) == (
-        FieldId.SOURCE_FRAMES,
         FieldId.CALIBRATION_PONI,
         FieldId.BEAM_ENERGY,
+        FieldId.SOURCE_PATH,
         FieldId.SAMPLE_ORIENTATION,
         FieldId.SOURCE_MOTORS,
         FieldId.DIFFRACTOMETER_UB,
     )
     assert run_blockers_from_fields(state, fields) == (
-        "Choose a frame source.",
-        "Load detector calibration.",
-        "Set calibration wavelength or source energy.",
+        "Load a PONI file.",
+        "Load PONI wavelength or source energy.",
+        "Choose a data source.",
         "Set GI sample orientation.",
         "RSM needs motor metadata.",
         "Set/refine UB matrix before RSM.",
         "RSM GUI awaits real-data gate.",
     )
+
+
+def test_run_gate_accepts_configured_source_before_processed_frames():
+    profile = build_control_profile(
+        ControlState(
+            tool=Tool.INT_2D,
+            project_root_required=True,
+            project_root="/data/project",
+            project_root_valid=True,
+            source_label="/data/project/raw/scan_0001.tif",
+            source_caps=SourceCaps(has_raw=True, raw_reachable=True, has_energy=True),
+            geom=GeomState(calibrated=True, energy_known=True),
+        )
+    )
+
+    assert profile.fields[FieldId.SOURCE_FRAMES].status is StatusKind.MISSING
+    assert profile.can_run
+    assert "Choose a frame source." not in profile.run_blockers
 
 
 def test_control_profile_blockers_match_field_status_contract():

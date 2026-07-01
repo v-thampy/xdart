@@ -1372,7 +1372,11 @@ def build_field_statuses(state: ControlState) -> Mapping[FieldId, FieldStatus]:
     else:
         project_status = StatusKind.DEFERRED
         project_reason = "Optional; improves portable paths."
-    source_label = state.source_label or "No source selected"
+    source_selected = bool(state.source_label or caps.has_frames or caps.has_raw)
+    source_label = (
+        state.source_label
+        or ("Loaded frames" if caps.has_frames else "No source selected")
+    )
     frame_value = str(state.frame_count) if state.frame_count else ""
     energy_status, energy_value, energy_reason = _energy_status_reason(geom, caps)
     backend_status, backend_reason = _processing_backend_status_reason(state)
@@ -1384,10 +1388,9 @@ def build_field_statuses(state: ControlState) -> Mapping[FieldId, FieldStatus]:
             reason=project_reason),
         FieldId.SOURCE_PATH: _field(
             FieldId.SOURCE_PATH,
-            StatusKind.OK if caps.has_frames or source_label != "No source selected"
-            else StatusKind.MISSING,
+            StatusKind.OK if source_selected else StatusKind.MISSING,
             value=source_label,
-            reason="" if source_label != "No source selected" else "Choose data."),
+            reason="" if source_selected else "Choose a data source."),
         FieldId.SOURCE_FRAMES: _field(
             FieldId.SOURCE_FRAMES,
             StatusKind.OK if caps.has_frames else StatusKind.MISSING,
@@ -1784,9 +1787,10 @@ def run_blockers_for(state: ControlState) -> tuple[str, ...]:
 
 
 _RUN_BLOCKER_TEXT: Mapping[FieldId, str] = MappingProxyType({
+    FieldId.SOURCE_PATH: "Choose a data source.",
     FieldId.SOURCE_FRAMES: "Choose a frame source.",
-    FieldId.CALIBRATION_PONI: "Load detector calibration.",
-    FieldId.BEAM_ENERGY: "Set calibration wavelength or source energy.",
+    FieldId.CALIBRATION_PONI: "Load a PONI file.",
+    FieldId.BEAM_ENERGY: "Load PONI wavelength or source energy.",
     FieldId.SAMPLE_ORIENTATION: "Set GI sample orientation.",
     FieldId.SOURCE_MOTORS: "RSM needs motor metadata.",
     FieldId.DIFFRACTOMETER_UB: "Set/refine UB matrix before RSM.",
@@ -1799,9 +1803,9 @@ def run_required_fields_for(state: ControlState) -> tuple[FieldId, ...]:
         if state.project_root_required:
             required.append(FieldId.PROJECT_ROOT)
         required.extend((
-            FieldId.SOURCE_FRAMES,
             FieldId.CALIBRATION_PONI,
             FieldId.BEAM_ENERGY,
+            FieldId.SOURCE_PATH,
         ))
     if state.mode == MeasMode.GI:
         required.append(FieldId.SAMPLE_ORIENTATION)

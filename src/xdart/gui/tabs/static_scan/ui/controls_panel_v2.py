@@ -228,6 +228,12 @@ class SectionCard(QtWidgets.QFrame):
         self.status.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         self.status.hide()
         header_lay.addWidget(self.status)
+        self.valid_marker = QtWidgets.QLabel("✓")
+        self.valid_marker.setObjectName("controlsV2SectionTick")
+        self.valid_marker.setProperty("accent", accent)
+        self.valid_marker.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.valid_marker.hide()
+        header_lay.addWidget(self.valid_marker)
         self.header.mousePressEvent = self._header_mouse_press
         outer.addWidget(self.header)
 
@@ -269,6 +275,10 @@ class SectionCard(QtWidgets.QFrame):
     def set_status_text(self, text: str = "") -> None:
         self.status.setText(text)
         self.status.setVisible(bool(text))
+
+    def set_valid_marker(self, visible: bool, tooltip: str = "") -> None:
+        self.valid_marker.setVisible(bool(visible))
+        self.valid_marker.setToolTip(tooltip or "")
 
     def clear_rows(self) -> None:
         while self.body_layout.count():
@@ -880,6 +890,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
                 card.add_row(FieldRow(status))
             if section != SectionId.EXPERIMENT:
                 self._add_actions(card, profile.actions_for(section))
+        self._set_section_markers(profile)
         self.experiment_card.setVisible(bool(profile.show_experiment_card))
         self.processing_card.setVisible(bool(profile.show_processing_card))
 
@@ -915,10 +926,11 @@ class ControlsPanelV2(QtWidgets.QWidget):
         self._render_processing_bound_section(
             profile, state.fields_for(SectionId.PROCESSING))
 
-        self.source_card.set_status_text(self._source_status(profile))
+        self.source_card.set_status_text(self._source_status(profile, state))
         self.experiment_card.set_status_text(self._experiment_status(
             state.fields_for(SectionId.EXPERIMENT)))
         self.processing_card.set_status_text(self._processing_status(profile))
+        self._set_section_markers(profile)
         viewer_mode = str(getattr(profile.processing_page, "value", "")) == "viewer"
         project_status = profile.fields.get(FieldId.PROJECT_ROOT)
         project_ready = (
@@ -1376,16 +1388,50 @@ class ControlsPanelV2(QtWidgets.QWidget):
         return ""
 
     @staticmethod
-    def _source_status(profile: ControlProfile) -> str:
+    def _source_status(
+        profile: ControlProfile,
+        bound_state: BoundControlState | None = None,
+    ) -> str:
         fields = profile.fields
         frame_status = fields.get(FieldId.SOURCE_FRAMES)
         raw_status = fields.get(FieldId.SOURCE_RAW)
+        kind = ""
+        if bound_state is not None:
+            kind = str(bound_state.value_for(("Signal", "inp_type"), "") or "")
         parts = []
         if frame_status is not None and frame_status.value:
             parts.append(f"{frame_status.value} frames")
+        if kind:
+            parts.append(kind)
         if raw_status is not None and raw_status.value:
             parts.append(raw_status.value)
         return " · ".join(parts)
+
+    def _set_section_markers(self, profile: ControlProfile) -> None:
+        cards = {
+            SectionId.PROJECT: self.project_card,
+            SectionId.SOURCE: self.source_card,
+            SectionId.EXPERIMENT: self.experiment_card,
+            SectionId.PROCESSING: self.processing_card,
+            SectionId.OUTPUT: self.output_card,
+        }
+        ready_fields = {
+            SectionId.PROJECT: (FieldId.PROJECT_ROOT,),
+            SectionId.SOURCE: (FieldId.SOURCE_PATH, FieldId.SOURCE_RAW),
+            SectionId.EXPERIMENT: (FieldId.CALIBRATION_PONI, FieldId.BEAM_ENERGY),
+            SectionId.PROCESSING: (FieldId.PROCESSING_MODE, FieldId.PROCESSING_BACKEND),
+            SectionId.OUTPUT: (FieldId.OUTPUT_SAVE_PATH,),
+        }
+        for section, card in cards.items():
+            fields = tuple(
+                profile.fields.get(field_id)
+                for field_id in ready_fields.get(section, ())
+            )
+            if not fields or any(field is None for field in fields):
+                card.set_valid_marker(False)
+                continue
+            ready = all(field.ok for field in fields)
+            card.set_valid_marker(ready, "Section inputs are ready." if ready else "")
 
     @staticmethod
     def _processing_status(profile: ControlProfile) -> str:

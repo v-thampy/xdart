@@ -749,6 +749,16 @@ QLabel#controlsV2SectionStatus {
     font-size: 11px;
     font-weight: 400;
 }
+QLabel#controlsV2SectionTick {
+    background-color: transparent;
+    font-size: 12px;
+    font-weight: 600;
+    padding-left: 2px;
+}
+QLabel#controlsV2SectionTick[accent="project"] { color: #8fb4ff; }
+QLabel#controlsV2SectionTick[accent="source"] { color: #6fdca5; }
+QLabel#controlsV2SectionTick[accent="experiment"] { color: #e8c46a; }
+QLabel#controlsV2SectionTick[accent="processing"] { color: #e06c75; }
 QFrame#controlsV2SectionBody {
     background-color: $card;
     border: 1px solid $field_border;
