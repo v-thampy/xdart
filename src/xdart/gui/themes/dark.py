@@ -128,7 +128,7 @@ def _control_panel_font_tokens(size="default"):
     offset = _CONTROL_PANEL_FONT_OFFSETS.get(key, 0)
     return {
         "control_panel_font": f"{12 + offset}px",
-        "control_panel_status_font": f"{9 + offset}px",
+        "control_panel_status_font": f"{8 + offset}px",
         "control_panel_tick_font": f"{12 + offset}px",
         "control_panel_browse_font": f"{13 + offset}px",
         "control_panel_run_font": f"{13 + offset}px",
