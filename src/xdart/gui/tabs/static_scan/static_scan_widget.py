@@ -3471,21 +3471,28 @@ class staticWidget(QWidget):
         # live stream must still paint every ~200 ms; the latest index
         # wins via _pending_update_idx (the shared coalescing idiom,
         # xdart.utils.throttle).
-        # Live heavy-render quantum. 200 -> 100 ms doubles the image update rate
-        # (the perceived-smoothness knob).  MEASURE-GATED: the window must stay >=
-        # the median flush total (drain+list+render, ~70-90 ms measured) or the
-        # event loop re-saturates; 80 ms is riskier on heavy 2D frames — raise back
-        # to 200 if XDART_PERF shows total creeping over the window.  See
-        # docs/design/design_gui_liveness_jul2026.md.
-        self._update_timer = Coalescer(100, mode="throttle", parent=self)
+        # Live timers, both TERMINAL-TUNABLE for live sweeps (no rebuild):
+        #   XDART_FLUSH_MS (default 100) — the heavy image-update quantum. Keep it
+        #     >= the median flush total (drain+list+render, ~70-90 ms) or the event
+        #     loop re-saturates and the GUI freezes; smaller = smoother image but
+        #     riskier on heavy 2D frames.
+        #   XDART_LIST_MS  (default 70)  — the fast list/cursor refresh so the Frames
+        #     list + auto-last cursor + status scroll continuously between renders
+        #     (_flush_frame_list runs the LIGHT legs only: O(new) list refresh + a
+        #     signal-blocked cursor advance — no drain, no render).
+        # See docs/design/design_gui_liveness_jul2026.md.
+        def _ms(_name, _default):
+            try:
+                return max(10, int(os.environ.get(_name) or _default))
+            except (TypeError, ValueError):
+                return _default
+        _flush_ms = _ms("XDART_FLUSH_MS", 100)
+        _list_ms = _ms("XDART_LIST_MS", 70)
+        if os.environ.get("XDART_PERF"):
+            logger.info("[PERF] live timers: flush=%dms list=%dms", _flush_ms, _list_ms)
+        self._update_timer = Coalescer(_flush_ms, mode="throttle", parent=self)
         self._update_timer.triggered.connect(self._flush_pending_update)
-        # Liveness: a FAST list/cursor timer fires several times per heavy-render
-        # window so the Frames list + auto-last cursor + status scroll continuously
-        # during a fast scan, while the expensive drain + setImage stays paced on
-        # _update_timer.  _flush_frame_list runs the LIGHT legs only (O(new) list
-        # refresh + a signal-blocked cursor advance) — no drain, no render.  See
-        # docs/design/design_gui_liveness_jul2026.md.
-        self._list_timer = Coalescer(70, mode="throttle", parent=self)
+        self._list_timer = Coalescer(_list_ms, mode="throttle", parent=self)
         self._list_timer.triggered.connect(self._flush_frame_list)
         # Reintegrate gets its OWN throttle: bai_*_all (live, batch=1) fires a
         # per-frame `update` signal, and rendering each one synchronously floods

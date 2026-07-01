@@ -51,6 +51,13 @@ paint; smoothing only helps the fast-scan case where frames pile up per window.
 | 4 | **SKIPPED** | — | maintainer: waterfall throttle is not an issue |
 | 5 | proposed | — | next smoothing lever = cut the render leg (40–68 ms, dominated by re-drawing + re-leveling the raw Eiger frame): throttle/subsample the autoscale re-level. Needs finer render-leg instrumentation first (measure-first). |
 
+## Terminal-tunable knobs (sweep live, no rebuild)
+- `XDART_FLUSH_MS` (default 100) — the heavy image-update quantum (`_update_timer`). Keep ≥ median
+  flush total (~70–90 ms) or the event loop re-saturates (freeze). Smaller = smoother image, riskier.
+- `XDART_LIST_MS` (default 70) — the fast Frames-list/cursor refresh (`_list_timer`).
+- Both logged at startup under `XDART_PERF` (`[PERF] live timers: flush=… list=…`). Example sweep:
+  `XDART_PERF=1 XDART_FLUSH_MS=80 XDART_LIST_MS=40 PYTHONPATH=$PWD/src xdart`.
+
 ## Measurement protocol (live — the maintainer runs)
 `conda activate xrd_test && XDART_PERF=1 xdart`, point at the 651-frame eiger dir (Image Directory,
 live), run Int 1D + Int 2D, and capture the `[PERF] flush: drain= list= render= total=` lines
