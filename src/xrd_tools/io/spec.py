@@ -14,6 +14,66 @@ def _get_spec_scan(spec_file: Path | str, scan_num: str):
     return SpecFile(str(spec_file))[scan_num]
 
 
+#: SPEC control lines the first non-empty line of a SPEC file starts with.
+_SPEC_MARKERS = ("#F", "#S", "#E", "#C", "#O")
+
+
+def is_spec_file(path: Path | str) -> bool:
+    """True if *path* looks like a SPEC data file.
+
+    SSRL SPEC files are **extensionless**, so detection is content-based: the
+    first non-empty line of a SPEC file is a control line (``#F`` / ``#S`` / …).
+    Returns False for a directory, a missing file, or a binary file."""
+    p = Path(path)
+    if not p.is_file():
+        return False
+    try:
+        with p.open("r", errors="ignore") as fh:
+            for _ in range(50):
+                line = fh.readline()
+                if not line:
+                    break
+                stripped = line.strip()
+                if stripped:
+                    return stripped.startswith(_SPEC_MARKERS)
+    except OSError:
+        return False
+    return False
+
+
+def list_spec_scans(spec_file: Path | str) -> list[str]:
+    """The scan keys (``"1.1"``, ``"2.1"``, …) in a SPEC file, in file order."""
+    return list(SpecFile(str(spec_file)).keys())
+
+
+def read_spec_scan_table(
+    spec_file: Path | str, scan_num: str
+) -> tuple[dict[str, np.ndarray], dict[str, float], int]:
+    """Read ONE scan into ``(columns, motors, npts)``.
+
+    ``columns`` maps each per-point ``#L`` label (the scanned motor + counters)
+    to a length-``npts`` array; ``motors`` maps each ``#O``/``#P`` motor to its
+    constant scan-start position.  The complete per-frame metadata for a SPEC
+    scan, with no column pre-selection (cf. :func:`get_from_spec_file`)."""
+    scan_data = _get_spec_scan(spec_file, scan_num)
+    data = np.asarray(scan_data.data)
+    npts = int(data.shape[1]) if data.ndim == 2 else 0
+    columns: dict[str, np.ndarray] = {}
+    for label in scan_data.labels:
+        try:
+            columns[str(label)] = np.asarray(
+                scan_data.data_column_by_name(label), dtype=float)
+        except Exception:
+            logger.debug("read_spec_scan_table: column %r unreadable", label)
+    motors: dict[str, float] = {}
+    for motor in scan_data.motor_names:
+        try:
+            motors[str(motor)] = float(scan_data.motor_position_by_name(motor))
+        except Exception:
+            logger.debug("read_spec_scan_table: motor %r unreadable", motor)
+    return columns, motors, npts
+
+
 def get_scan_path_info(scan: str) -> tuple[str, str]:
     """
     Parse scan name into sample name and SPEC-compatible scan number.

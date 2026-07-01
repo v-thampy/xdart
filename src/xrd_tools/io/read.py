@@ -39,11 +39,14 @@ from __future__ import annotations
 
 import logging
 from collections import namedtuple
+from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 import h5py
 import numpy as np
+
+from xrd_tools.core.scan import ScanFrame
 
 # 2c: the convenience readers consume the declared layout — group and
 # dataset names come from the schema, so writer/reader drift is
@@ -70,6 +73,7 @@ __all__ = [
     "get_thumbnail",
     "get_raw_frame",
     "get_metadata",
+    "read_scan_data",
     "open_scan",
     "ProcessedScan",
     "Scan",
@@ -187,6 +191,35 @@ def _scan_data_for_frames(
                 if src >= 0:
                     aligned[dst] = arr[src]
             out[str(key)] = aligned
+    return out
+
+
+def read_scan_data(
+    scan_file: str | Path,
+    frames: Sequence[int] | None = None,
+    *,
+    entry: str = "entry",
+) -> dict[str, np.ndarray]:
+    """Read ``/entry/scan_data`` as ``{column: array}`` — the per-frame metadata
+    columns (motors + counters) a processed scan persisted.
+
+    With ``frames`` given, each column is aligned to those frame labels (missing
+    labels → NaN / "" rows); with ``frames=None``, every column is returned in
+    natural ``scan_data`` order, **including** ``frame_index``.  This is the
+    public, frame-aligned companion to :func:`get_metadata` — the basis for
+    plotting any column vs frame (or vs another column).  Returns ``{}`` when the
+    file has no ``scan_data``.
+    """
+    if frames is not None:
+        return _scan_data_for_frames(scan_file, frames, entry=entry)
+    out: dict[str, np.ndarray] = {}
+    with h5py.File(Path(scan_file), "r") as f:
+        e = _entry(f, entry)
+        if "scan_data" not in e:
+            return out
+        for key, item in e["scan_data"].items():
+            if isinstance(item, h5py.Dataset):
+                out[str(key)] = _dataset_values(item)
     return out
 
 
@@ -463,6 +496,7 @@ def get_raw_frame(
     scan_file: str | Path,
     frame: int,
     *,
+    scan: str | int | None = None,
     entry: str = "entry",
     allow_thumbnail: bool = True,
     source_root: str | Path | None = None,
@@ -485,7 +519,9 @@ def get_raw_frame(
     after processing.
 
     ``frame`` is the frame **label** (the ``frame_index`` value), matching
-    the other ``get_*`` readers.  Raises ``KeyError`` when neither a usable
+    the other ``get_*`` readers; ``scan`` selects a contributing scan for a
+    grouped Stitch/RSM result (``frames/scan_<scan>/frame_NNNN``), ``None`` is
+    the flat single-scan record.  Raises ``KeyError`` when neither a usable
     source pointer nor a thumbnail is present.
     """
     scan_file = Path(scan_file)
@@ -494,6 +530,7 @@ def get_raw_frame(
             scan_file,
             _entry(f, entry),
             int(frame),
+            scan=scan,
             source_root=source_root,
         )
     return _raw_frame_or_thumbnail(
@@ -540,18 +577,26 @@ def _raw_frame_parts_from_entry(
     entry_group: h5py.Group,
     frame: int,
     *,
+    scan: str | int | None = None,
     source_root: str | Path | None = None,
 ) -> tuple[Path | None, int, np.ndarray | None]:
-    """Resolve one processed frame's raw source pointer and thumbnail."""
+    """Resolve one processed frame's raw source pointer and thumbnail.
+
+    ``scan`` selects a grouped-scan record (``frames/scan_<scan>/frame_NNNN``);
+    ``None`` is the flat single-scan record (``frames/frame_NNNN``).
+    """
 
     source_base = (
         _decode(entry_group.attrs["source_base"])
         if "source_base" in entry_group.attrs
         else None
     )
-    fg = entry_group.get(f"frames/frame_{int(frame):04d}")
+    from xrd_tools.io.nexus_record import frame_record_key  # noqa: PLC0415
+    fg = entry_group.get(f"frames/{frame_record_key(scan, frame)}")
     if fg is None:
-        raise KeyError(f"No frame group for frame {frame} in {scan_file}")
+        raise KeyError(
+            f"No frame group for frame {frame}"
+            f"{f' (scan {scan})' if scan is not None else ''} in {scan_file}")
 
     master: Path | None = None
     src_frame_idx = 0
@@ -711,6 +756,36 @@ def _slice_stack(dset: h5py.Dataset, positions: np.ndarray, single: bool) -> np.
     return out[0] if single else out
 
 
+def get_diffractometer(scan_file: str | Path, *, entry: str = "entry"):
+    """Read the persisted canonical :class:`Diffractometer`, or ``None``.
+
+    Returns ``None`` when the ``diffractometer`` group is absent (every file
+    written before the group existed — the back-compat contract, mirroring
+    :func:`_read_ub_matrix`); never raises on an old file and never
+    synthesizes a default geometry.  Reconstructs the full instrument (both
+    adapter views + the fitted ``DetectorCalibration`` + preset + motor map)
+    from the ``config_json`` blob for offline stitch/RSM.
+    """
+    from xrd_tools.core.geometry import Diffractometer
+
+    with h5py.File(Path(scan_file), "r") as f:
+        if entry not in f:
+            return None
+        grp = f[entry]
+        ds = grp.get("diffractometer/config_json")
+        if ds is None:
+            return None
+        blob = ds.asstr()[()] if h5py.check_string_dtype(ds.dtype) else ds[()]
+        if isinstance(blob, (bytes, np.bytes_)):
+            blob = blob.decode("utf-8")
+    try:
+        return Diffractometer.from_json(str(blob))
+    except Exception:
+        logger.warning("Could not parse persisted diffractometer blob in %s",
+                       scan_file, exc_info=True)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # object-style sugar
 # ---------------------------------------------------------------------------
@@ -739,6 +814,9 @@ class ProcessedScan:
         self._metadata_cache: dict | None = None
         self._scan_data_cache: dict[str, np.ndarray] | None = None
         self._frames_cache: np.ndarray | None = None
+        #: ``None`` is a valid value (absent group), so cache via a flag.
+        self._diffractometer_cache = None
+        self._diffractometer_loaded = False
 
     @property
     def frames(self) -> np.ndarray:
@@ -782,6 +860,20 @@ class ProcessedScan:
         return self._scan_data_cache
 
     @property
+    def diffractometer(self):
+        """The persisted canonical :class:`Diffractometer`, or ``None``.
+
+        Lets offline stitch/RSM run from the file with no GUI (the "metadata
+        mandatory for stitch/RSM" contract).  ``None`` on any file written
+        before the group existed.
+        """
+        if not self._diffractometer_loaded:
+            self._diffractometer_cache = get_diffractometer(
+                self.path, entry=self.entry)
+            self._diffractometer_loaded = True
+        return self._diffractometer_cache
+
+    @property
     def energy(self) -> float | None:
         return self.energy_keV
 
@@ -799,6 +891,8 @@ class ProcessedScan:
         self._metadata_cache = None
         self._scan_data_cache = None
         self._frames_cache = None
+        self._diffractometer_cache = None
+        self._diffractometer_loaded = False
         return self.metadata
 
     def get_1d(self, frame=None) -> Integrated1D:
@@ -809,6 +903,43 @@ class ProcessedScan:
 
     def get_thumbnail(self, frame: int) -> np.ndarray:
         return get_thumbnail(self.path, frame, entry=self.entry)
+
+    def metadata_for(self, index: int) -> Mapping[str, Any]:
+        """Return per-frame metadata/scan-data for ``index``.
+
+        ``ProcessedScan`` is the notebook-friendly reader, but stitch/ROI paths
+        also consume it as a lightweight FrameSource.  Surface the persisted
+        scan-data columns aligned to the stored frame labels; whole-scan scalar
+        metadata remains available through ``metadata``.
+        """
+        label = int(index)
+        labels = self.frame_indices
+        try:
+            pos = labels.index(label)
+        except ValueError as exc:
+            raise KeyError(f"frame {label!r} not present in {self.path}") from exc
+
+        result: dict[str, Any] = {"frame_index": label}
+        for key, values in self.scan_data.items():
+            arr = np.asarray(values)
+            try:
+                if arr.shape == ():
+                    result[key] = arr.item()
+                elif len(arr) == len(labels):
+                    value = arr[pos]
+                    result[key] = value.item() if hasattr(value, "item") else value
+            except Exception:
+                continue
+        return result
+
+    def frame_for(self, index: int) -> ScanFrame:
+        label = int(index)
+        return ScanFrame(
+            index=label,
+            metadata=dict(self.metadata_for(label)),
+            loader=lambda frame: self.load_frame(frame.index),
+            source_identity=str(self.path),
+        )
 
     def load_frame(self, index: int) -> np.ndarray:
         """Load one raw detector frame through its stored source pointer.

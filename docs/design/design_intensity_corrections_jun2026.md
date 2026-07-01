@@ -1,6 +1,13 @@
 # Design: intensity corrections (porting pyFAI's + xu grazing-incidence)
 
-**Status:** draft for discussion · 2026-06-20 · planning only (no code)
+**Status:** PARTIAL / implemented headless stack · reconciled 2026-06-27. The shared
+`CorrectionStack`, GI correction primitives, stitch/RSM weighting seams, and persistence
+provenance are implemented. Remaining work is real-data GI convention/sign validation and
+GUI surfacing — **including extending the optional GI corrections (footprint/absorption/Fresnel/
+refraction) to Int 1D/2D** (today wired into Stitch/RSM only; Int applies pyFAI SA+pol alone).
+§3 already specs "Plain Int: SA+pol; GI: add the GI stack"; tracked as a post-v2 follow-up in
+`design_controls_panel_v2_jun2026.md` §12 F-3 (footprint/absorption/Fresnel fold into the Int
+reduction; refraction needs the histogram q-provider path, like GI-Stitch).
 **Why now:** the xu cake/RSM χ-bug surfaced that `I(q, χ)` and RSM voxel intensities are
 load-bearing, not cosmetic (`design_diffractometer_geometry_jun2026.md` §3.5). The *value* in
 each (q, χ) / HKL cell is only meaningful once per-pixel intensity corrections are applied. Our
@@ -9,6 +16,16 @@ none**, and **grazing-incidence corrections are missing everywhere**.
 **Relationship:** corrections are a per-pixel weight stack at the *provider/accumulator* seam —
 orthogonal to geometry (`Diffractometer`) and to the stitch/RSM plans. Headless, source-agnostic,
 mode-configured.
+
+> **Update 2026-06-23 — the correction stack is the shared pre-weight; the gridder is shared.**
+> Stitching has THREE backends (`design_stitching_jun2026.md` §2.6): **`"multigeometry"`** (pyFAI
+> MG, 1D+2D), **`"pyfai_hist"`** and **`"xu_hist"`** (pyFAI- vs xu-geometry q-provider → a shared
+> per-pixel **histogram merge**). The per-pixel correction stack in this doc is the **shared
+> pre-weight** for ALL of them + RSM, applied identically as weights at the provider/accumulator
+> seam. The two histogram stitch backends + RSM share the **same** `rsm.gridding.StreamingGridder`
+> accumulator (only the bin space differs: (q, χ) for stitch, (qx, qy, qz) for RSM) — so they
+> stream. That makes "reuse pyFAI's correction arrays on the xu/histogram path" (§2/§5)
+> load-bearing for stitch too, not just RSM. Validated in the `Multi120_*` notebooks (§6).
 
 ---
 
@@ -33,10 +50,9 @@ refraction, penetration-depth / absorption, and Fresnel (Vineyard/DWBA) transmis
 | **penetration / absorption** (GI) | evanescent below αc; finite probe depth | — | — | from `absorption_length` + `critical_angle` |
 | **Fresnel / Vineyard** (GI) | `|T(αi)|²|T(αf)|²` Yoneda enhancement near αc | — | — | from `chi0` / `simpack` reflectivity |
 
-**Takeaway:** for *powder stitch* the only real gap is turning on **polarization** (solid angle
-is already on). For the **xu RSM/cake path, all of solid-angle + polarization (+ optional
-dark/flat) are missing**. **GI corrections are missing in every path** and are the bigger
-scientific lift.
+**Takeaway:** the headless correction stack now covers the shared solid-angle/polarization
+and GI weighting seams. The remaining scientific gate is real-data convention/sign
+validation for GI and the deferred GUI controls.
 
 ---
 
@@ -103,21 +119,22 @@ C = C_solidangle · C_polarization · C_absorption_air · C_flat⁻¹ · (GI: C_
 
 ## 4. Implementation plan (gated, additive)
 
-0. **Correction primitives (headless).** `corrections.py`: `solid_angle(geom)`,
+0. **DONE: correction primitives (headless).** `corrections.py`: `solid_angle(geom)`,
    `polarization(geom, factor)`, `air_absorption(geom, μ_air)`, returning per-pixel arrays on
    the existing pixel grid. **Gate:** numeric match to pyFAI `ai.solidAngleArray()` /
    `ai.polarization()` on a shared geometry.
-1. **Wire into the accumulator weight.** Multiply into the provider/`StreamingGridder.add`
+1. **DONE: wire into the accumulator weight.** Multiply into the provider/`StreamingGridder.add`
    weight (and expose on the stitch path). **Gate:** powder stitch with polarization on
    reproduces pyFAI `MultiGeometry.integrate1d(polarization_factor=…)` within tolerance; RSM
    voxel intensities change only by the expected smooth factor.
-2. **GI corrections (headless, GI-mode).** `gi_footprint`, `gi_refraction` (Snell via
+2. **DONE headless / live-gated convention: GI corrections (GI-mode).** `gi_footprint`, `gi_refraction` (Snell via
    `idx_refraction`), `gi_absorption` (`absorption_length`+`critical_angle`), `gi_fresnel`
    (`chi0`/`simpack`). **Gate:** refraction shifts qz in the expected direction and vanishes far
    above αc; Fresnel peaks at αc (Yoneda); footprint ∝ 1/sin αi. Validate against a GIXSGUI/
    literature worked example.
-3. **Wrangler + persistence.** GI mode collects material + αi; persist applied-corrections
-   provenance. **Gate:** reload → corrections metadata round-trips; re-reduction reproducible.
+3. **PARTIAL: wrangler + persistence.** Correction provenance persists headlessly. GUI
+   material/energy/incidence controls are governed by ADR-0008/0009 and remain a GUI wiring
+   task.
 
 ---
 
@@ -147,4 +164,12 @@ C = C_solidangle · C_polarization · C_absorption_air · C_flat⁻¹ · (GI: C_
   `absorption`, `normalization_factor`); `Geometry.solidAngleArray`/`polarization`/
   `_correct_parallax`.
 - Companions: `design_diffractometer_geometry_jun2026.md` §3.5 (azimuth/2D load-bearing),
-  `design_wrangler_organization_jun2026.md` (GI-mode inputs), `design_stitching_jun2026.md`.
+  `design_wrangler_organization_jun2026.md` (GI-mode inputs), `design_stitching_jun2026.md` §2.6
+  (the three stitch backends the correction stack feeds), `design_rsm_jun2026.md` §3.3 (RSM
+  consumes the same stack at the gridder weight).
+- Reference notebooks (NOT in-repo — `~/repos/example_notebooks/Stitching/`):
+  `Multi120_Diagnose_xu_pyFAI_intensity_discrepancy.ipynb` (the per-pixel correction diff —
+  solid-angle/polarization reweight intensity, not ring position),
+  `Multi120_GI_Corrections_Explorer.ipynb` (the GI correction stack: footprint / refraction /
+  penetration / Fresnel), `Multi120_Compare_xu_vs_pyFAI_del_only.ipynb` (the dual-backend
+  head-to-head). RSM fixtures: `~/repos/example_notebooks/RSM/` (`RSM_process.ipynb`).

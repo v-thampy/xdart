@@ -122,6 +122,17 @@ pre-migration reference signature.  Two additive notes:
    small coverage pad; the empty bins it (or a masked gap) creates are now
    NaN-filled — so they don't plot/aggregate as a spurious flat line at the
    low/high edge.  Aggregations are NaN-aware (`nanmean`/`nansum`).
+11. **Default-loud reduction strictness (D7).**  `run_reduction` /
+   `ReductionSession` / `ScanSession` now take a `StrictPolicy` (default
+   `StrictPolicy.loud()`): a scripted/headless run **RAISES** on a degraded
+   frame — a missing normalization or an all-dummy 2D frame — instead of
+   silently writing bad data.  Errors are the `StrictnessError(ValueError)`
+   family (`MissingNormalizationError` / `GIAllDummyError`) in
+   `xrd_tools.core.strictness`.  **The xdart GUI is unaffected** — it passes
+   `StrictPolicy.graceful()` (records + skips the bad frame per-frame, re-raises
+   at `finish()`, never aborts a whole-scan save).  Scripted callers wanting the
+   old never-raise behavior pass `strict=StrictPolicy.graceful()`.  No on-disk
+   format change.
 
 ## Stage-6 redesign items: done vs deferred
 

@@ -23,6 +23,7 @@ from xdart.modules.live import LiveFrame, LiveFrameSeries, LiveScan
 from xdart.modules.live_compat import normalize_live_class_names
 import xdart.modules.reduction as reduction_adapters
 from xdart.modules.reduction import (
+    StandardPlanCache,
     frame_from_live_frame,
     plan_from_live_scan,
     reduce_live_frame,
@@ -493,8 +494,6 @@ def test_plan_uses_detector_shape_for_flat_mask_on_reload() -> None:
 
 
 def test_standard_plan_cache_returns_headless_plan_for_gi_scan() -> None:
-    from xdart.modules.reduction import StandardPlanCache
-
     scan = LiveScan(
         "scan",
         frames=[LiveFrame(idx=0, map_raw=np.ones((2, 2)), scan_info={"th": 0.2})],
@@ -507,6 +506,68 @@ def test_standard_plan_cache_returns_headless_plan_for_gi_scan() -> None:
     assert plan is not None
     assert plan.gi is not None
     assert plan.gi.incidence_motor == "th"
+
+
+def test_standard_plan_cache_can_use_native_builder_override() -> None:
+    scan = LiveScan(
+        "scan",
+        frames=[LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())],
+        bai_1d_args={"numpoints": 10},
+        bai_2d_args={"npt_rad": 11, "npt_azim": 12},
+    )
+    native = ReductionPlan(
+        integration_1d=Integration1DPlan(npt=321),
+        integration_2d=Integration2DPlan(npt_rad=222, npt_azim=111),
+    )
+    calls = []
+
+    def builder(live_scan, *, integrate_1d=True, integrate_2d=True):
+        calls.append((live_scan, integrate_1d, integrate_2d))
+        return native
+
+    cache = StandardPlanCache(plan_builder=builder)
+
+    assert cache.get(scan) is native
+    assert calls == [(scan, True, True)]
+    assert cache.get(scan) is native
+    assert calls == [(scan, True, True)]
+    cache.plan_builder = None
+    assert cache.get(scan) is not native
+
+
+def test_standard_plan_cache_prepares_builder_scan_before_fingerprint() -> None:
+    scan = LiveScan(
+        "scan",
+        frames=[LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())],
+        bai_1d_args={"numpoints": 10},
+        bai_2d_args={},
+    )
+    calls = []
+
+    def builder(live_scan, *, integrate_1d=True, integrate_2d=True):
+        calls.append(("build", live_scan.bai_1d_args["numpoints"]))
+        return ReductionPlan(
+            integration_1d=Integration1DPlan(
+                npt=live_scan.bai_1d_args["numpoints"]
+            )
+        )
+
+    def prepare_scan(live_scan):
+        calls.append(("prepare", live_scan.bai_1d_args["numpoints"]))
+        live_scan.bai_1d_args["numpoints"] = 44
+
+    builder.prepare_scan = prepare_scan
+    builder.plan_cache_key = ("snapshot", 44)
+    cache = StandardPlanCache(plan_builder=builder)
+
+    plan = cache.get(scan, integrate_1d=True, integrate_2d=False)
+
+    assert plan.integration_1d.npt == 44
+    assert calls == [("prepare", 10), ("build", 44)]
+
+    scan.bai_1d_args["numpoints"] = 10
+    assert cache.get(scan, integrate_1d=True, integrate_2d=False) is plan
+    assert calls == [("prepare", 10), ("build", 44), ("prepare", 10)]
 
 
 def test_reduce_live_frame_populates_existing_frame(monkeypatch) -> None:
@@ -523,7 +584,7 @@ def test_reduce_live_frame_populates_existing_frame(monkeypatch) -> None:
         integration_2d=Integration2DPlan(),
     )
 
-    def fake_run_reduction(plan_arg, scan_arg):
+    def fake_run_reduction(plan_arg, scan_arg, **kwargs):
         assert plan_arg.integration_1d.monitor_key == "i0"
         assert scan_arg.name == "scan"
         assert scan_arg.integrator == "ai"
@@ -572,7 +633,7 @@ def test_reduce_live_frame_preserves_int_1d_when_plan_skips_1d(monkeypatch) -> N
 
     monkeypatch.setattr(
         reduction_adapters, "run_reduction",
-        lambda plan_arg, scan_arg: ReductionResult(
+        lambda plan_arg, scan_arg, **kwargs: ReductionResult(
             scan_name="scan",
             frames={7: FrameReduction(7, result_1d=_r1d(), result_2d=_r2d())},
             n_processed=1))
@@ -1255,6 +1316,28 @@ def test_open_live_reduction_session_retention_policy() -> None:
     streaming_no_sink = open_live_reduction_session(
         [frame], plan, scan_name="s", execution="streaming")
     assert streaming_no_sink.retain_products is True
+
+
+def test_open_live_scan_session_is_graceful() -> None:
+    """B-1 regression: the GUI streaming live/batch WRITE path
+    (open_live_scan_session -> ScanSession) must run GRACEFUL, not the headless
+    loud default — otherwise a single degraded frame (dead monitor /
+    MissingNormalizationError, or all-dummy 2D / GIAllDummyError) raises mid-stream,
+    re-raises at finish(), and the GUI reports "Save FAILED" + halts, aborting the
+    whole-scan save even though the good frames are persisted.  ScanSession forwards
+    its strict policy to the internal ReductionSession; the adapter must opt into
+    graceful() like its three siblings (reduce_live_frame / reduce_live_frames /
+    open_live_reduction_session)."""
+    from xdart.modules.reduction import open_live_scan_session
+    from xrd_tools.reduction import StrictPolicy
+
+    frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
+    plan = ReductionPlan(integration_2d=None)
+    sess = open_live_scan_session([frame], plan, scan_name="s")
+    assert sess._session.strict == StrictPolicy.graceful()
+    assert sess._session.strict != StrictPolicy.loud()
+    assert sess._session.strict.missing_normalization is False
+    assert sess._session.strict.gi_all_dummy is False
 
 
 def test_persistent_session_does_not_accumulate_products(monkeypatch) -> None:

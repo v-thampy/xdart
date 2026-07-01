@@ -1,6 +1,9 @@
 # Design: wrangler widget organization (Int / Stitch / RSM)
 
-**Status:** draft for discussion · 2026-06-20 · planning only (no code)
+**Status:** DESIGN/P7 · reconciled 2026-06-27. Headless source, geometry,
+correction, stitch, and RSM foundations are implemented or tracked in
+`stitching_rsm_build_plan.md`; this document remains the GUI organization plan for
+future Stitch/RSM wrangler panels.
 **Companion to:** [`design_stitching_jun2026.md`](design_stitching_jun2026.md) §5.4 (the
 authoritative *input inventory*) and
 [`design_diffractometer_geometry_jun2026.md`](design_diffractometer_geometry_jun2026.md)
@@ -9,9 +12,8 @@ how those inputs are grouped into panels, gated by mode, and surfaced live vs ba
 new input list.
 **Purpose:** pull every wrangler requirement Vivek has stated (some only in project memory)
 into one place, organized for the eventual Claude Code handoff.
-**Gated on:** the headless seams (`Diffractometer`, `DetectorCalibration`, `refine_goniometer`,
-streaming sinks) land first; the wrangler is the thin Qt layer over them. Sequence after
-3e+Phase-5 (memory `planned_features_roi_and_stitching_jun2026`).
+**Gated on:** P7 GUI work after the current headless gates; the wrangler is the thin Qt
+layer over the shipped headless seams.
 
 ---
 
@@ -72,8 +74,21 @@ variables (T, stress, time…) — see §7. Always *collected*; the requirement 
 ## 3. Panel-by-panel organization
 
 ### 3.1 Source / data (stitch §5.4)
+
+> **This panel is now fully specced as a reusable widget in
+> [`design_shared_source_panel_jun2026.md`](design_shared_source_panel_jun2026.md)** (approved
+> 2026-06-23) — the `ScanSourceWidget` the ROI Scan Plotter uses now and the wrangler embeds
+> later (`mode="stitch"|"rsm"`). It resolves the items below + three additions: **(a)** a
+> File ⟷ Directory entry mode (a folder + a Scan-kind dropdown → headless `discover_scans(dir,
+> kind, recursive)`); **(b)** grouping that **combines** scans into one output via a
+> `CompositeFrameSource` (one run per group; also stitch's cross-file Multi); **(c)** explicit
+> metadata-**optional** sources (Eiger/raw burst → ROI-vs-frame + Int 1D/2D with no motors). The
+> bullets below remain the input inventory; that doc is the widget spec.
+
 - Master file path (SPEC / NeXus / Tiled) → builds the `FrameSource`.
-- Scan selection **+ grouping** with range syntax `1-3, 5, 7-9` → one reduction per group.
+- Scan selection **+ grouping** with range syntax `1-3, 5, 7-9` → one reduction per **group**
+  (members *combined* via `CompositeFrameSource`).
+- **Directory entry mode:** a folder + a Scan-kind selector → `discover_scans` walks the tree.
 - Image directory + filename pattern/prefix (headerless formats).
 - Raw-image read params: `detector_shape`, `raw_dtype`, `header_skip`, hot-pixel/saturation
   `threshold` → `read_image` args.
@@ -137,9 +152,9 @@ wrangler list:
   `radial_range`/`azimuth_range` (or auto from angle span), `mask`, `monitor_key`.
 - RSM: grid bins + q/HKL ranges (or auto-scout — §6), UB, energy.
 - Frame selection: optional angle filters → `frame_indices`; not an accuracy gate (§2 note ³).
-- Energy/wavelength: from the energy motor or an override field. *(Watch the per-beamline unit:
-  `get_from_spec_file` returns energy already in eV on the psic data — memory
-  `psic_del_nu_calibration_solved`.)*
+- Energy/wavelength: canonical source is the calibration wavelength persisted under
+  `/entry/diffractometer` per ADR-0009; plan/correction energy derives from or validates
+  against it. Explicit scan/GUI energy is an override only when intentionally authoritative.
 - Output: stitched/gridded file name + location, one `.nxs` per group.
 
 ---

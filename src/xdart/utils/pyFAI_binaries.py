@@ -107,16 +107,21 @@ def get_MaskImageWidgetXdart():
     class MaskImageWidgetXdart(MaskImageWidget):
         """Window application which allows creating a mask manually."""
 
+        # Emitted with the saved mask-file path when the editor closes and the
+        # mask was actually written — lets the caller auto-populate Mask File.
+        maskSaved = Qt.QtCore.Signal(str)
+
         def __init__(self):
             super().__init__()
             self.outFile = None
 
         def closeEvent(self, event):
-            if os.path.exists(self.outFile):
+            if self.outFile and os.path.exists(self.outFile):
                 mask_file = os.path.basename(self.outFile)
                 out_dialog = Qt.QtWidgets.QMessageBox()
                 out_dialog.setText(f'{mask_file} saved in Image directory')
                 out_dialog.exec()
+                self.maskSaved.emit(self.outFile)
             event.accept()
 
     return MaskImageWidgetXdart

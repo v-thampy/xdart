@@ -4,8 +4,7 @@
 This module is the single source of truth for *what should be on screen*.
 It is deliberately free of Qt, pyqtgraph, h5py and pyFAI so its decision
 logic can be unit-tested headlessly (``pytest -m display_logic``) — see
-``tests/test_display_logic.py`` and the design doc
-(``display_refactor_plan.md``).
+``tests/test_display_logic.py``.
 
 Populated across the staged refactor:
 
@@ -105,6 +104,8 @@ class Mode(Enum):
     IMAGE_VIEWER = "image_viewer"
     XYE_VIEWER = "xye_viewer"
     NEXUS_VIEWER = "nexus_viewer"
+    STITCH_1D = "stitch_1d"      # whole-scan merged 1D pattern (scan.stitched_1d)
+    STITCH_2D = "stitch_2d"      # whole-scan merged 2D cake (scan.stitched_2d)
 
 
 # ── Panel layout table (Stage 4/5 step 1) ────────────────────────────
@@ -229,6 +230,27 @@ PANEL_LAYOUT = {
         twoDWindow_h=(0, _FULL), imageWindow_h=(200, _FULL),
         plotWindow_h=(200, _FULL), imageToolbar_h=(40, 40),
         plotToolBar_h=(0, 0), binnedFrame_w=(0, 0),
+    ),
+    # Stitch 1D: the whole-scan merged 1D pattern — plot-only, identical
+    # geometry to INT_1D (2D pane collapsed, raw-preview button hidden since
+    # there is no per-frame raw for a merge).
+    Mode.STITCH_1D: PanelLayout(
+        frame_top_vis=True, twoDWindow_vis=True, imageToolbar_vis=True,
+        frame_4_vis=True, frame_6_vis=True, plotToolBar_vis=False,
+        show_image_btn_vis=False,
+        twoDWindow_h=(0, 0), imageWindow_h=(80, 85), plotWindow_h=(200, _FULL),
+        imageToolbar_h=(40, 40), plotToolBar_h=(0, 0), binnedFrame_w=(0, _FULL),
+    ),
+    # Stitch 2D: the whole-scan merged cake — cake-focused; the 1D plot is
+    # collapsed and the cake fills the 2D pane (the raw panel carries no
+    # per-frame image for a merge, so render_plan blanks it).
+    Mode.STITCH_2D: PanelLayout(
+        frame_top_vis=True, twoDWindow_vis=True, imageToolbar_vis=True,
+        frame_4_vis=True, frame_6_vis=True, plotToolBar_vis=False,
+        show_image_btn_vis=False,
+        twoDWindow_h=(0, _FULL), imageWindow_h=(200, _FULL),
+        plotWindow_h=(0, 0), imageToolbar_h=(40, 40),
+        plotToolBar_h=(0, 0), binnedFrame_w=(0, _FULL),
     ),
 }
 
@@ -1441,6 +1463,49 @@ def empty_display_state(mode, generation, *, title=""):
     )
 
 
+def stitch_display_state(mode, generation, *, has_1d, has_2d, title=""):
+    """A :class:`DisplayState` for a whole-scan stitch result (STITCH_1D/2D).
+
+    Pure / Qt-free.  Unlike :func:`compute_display_state` there is no per-frame
+    selection: the stitch is a single synthetic panel (PLOT_1D for STITCH_1D,
+    CAKE_2D for STITCH_2D) whose ``has_data`` is just "does the matching result
+    exist".  ``render_roles_for_state`` appends the other legacy roles as cleanup,
+    so the unused panels (raw + the other dimension) are always blanked.
+
+    ``load_status`` is READY when the relevant result exists, else EMPTY — so a
+    Stitch mode selected before a run renders an explicit blank rather than stale
+    per-frame content.
+    """
+    if mode is Mode.STITCH_2D:
+        role = PanelRole.CAKE_2D
+        has = bool(has_2d)
+    else:
+        role = PanelRole.PLOT_1D
+        has = bool(has_1d)
+    key = PanelKey(role)
+    panels = ((key, PanelPlan(visible=True, has_data=has)),)
+    layout = ((key,),)
+    return DisplayState(
+        mode=mode,
+        load_status=LoadStatus.READY if has else LoadStatus.EMPTY,
+        error_message=None,
+        generation=generation,
+        selected_ids=(),
+        render_ids=(),
+        overall=True,                # a stitch aggregates the whole scan
+        gi=False,
+        x_unit="q_A^-1",
+        x_label="q",
+        method="Single",
+        overlay=OverlayAction.REPLACE,
+        overlaid_ids=(),
+        title=title,
+        panels=panels,
+        layout=layout,
+        results=None,
+    )
+
+
 def build_payload(state, store=None):
     """Resolve the arrays/traces for ``state`` into a :class:`DisplayPayload`.
 
@@ -1469,6 +1534,53 @@ def build_payload(state, store=None):
             plot = store.plot_payload(state)
     return DisplayPayload(generation=state.generation, raw_image=raw,
                           cake_image=cake, plot=plot)
+
+
+def stitch_plot_payload(result):
+    """``IntegrationResult1D`` (a stitched 1-D pattern) → ``PlotPayload``.
+
+    Pure / Qt-free.  Returns ``None`` for a missing/empty/all-NaN result so the
+    caller skips drawing.  One ``data`` trace; the x-axis label/unit come from
+    the result's pyFAI unit string (the same mapping the integration view uses).
+    """
+    if result is None:
+        return None
+    radial = np.asarray(getattr(result, "radial", None), dtype=float)
+    inten = np.asarray(getattr(result, "intensity", None), dtype=float)
+    if radial.size == 0 or inten.size == 0 or not np.isfinite(inten).any():
+        return None
+    unit = getattr(result, "unit", "q_A^-1") or "q_A^-1"
+    label, _sym = x_axis_for_unit(unit)
+    return PlotPayload(
+        axis_x=Axis(label=label, unit=unit, values=radial),
+        traces=(Trace(label="Stitch", x=radial, y=inten),),
+    )
+
+
+def stitch_image_payload(result):
+    """``IntegrationResult2D`` (a stitched cake) → ``ImagePayload``.
+
+    Pure / Qt-free.  ``intensity`` is ``(len(radial), len(azimuthal))``; the
+    image-draw delegate transposes ``payload.image`` (rows=y, cols=x), so we
+    store ``intensity.T`` with x=radial, y=azimuthal — matching the integration
+    cake's orientation.  Returns ``None`` for a missing/empty/all-NaN result.
+    """
+    if result is None:
+        return None
+    radial = np.asarray(getattr(result, "radial", None), dtype=float)
+    azim = np.asarray(getattr(result, "azimuthal", None), dtype=float)
+    inten = np.asarray(getattr(result, "intensity", None), dtype=float)
+    if inten.ndim != 2 or inten.size == 0 or not np.isfinite(inten).any():
+        return None
+    r_unit = getattr(result, "unit", "q_A^-1") or "q_A^-1"
+    a_unit = getattr(result, "azimuthal_unit", "chi_deg") or "chi_deg"
+    r_label, _ = x_axis_for_unit(r_unit)
+    a_label, _ = x_axis_for_unit(a_unit)
+    return ImagePayload(
+        image=inten.T,                       # (azimuthal, radial) = rows=y, cols=x
+        axis_x=Axis(label=r_label, unit=r_unit, values=radial),
+        axis_y=Axis(label=a_label, unit=a_unit, values=azim),
+    )
 
 
 @dataclass(frozen=True)

@@ -42,6 +42,9 @@ class RSMVolume:
     k: np.ndarray
     l: np.ndarray
     intensity: np.ndarray
+    #: optional provenance (the RSMPlan + applied CorrectionStack) — populated by
+    #: read_rsm when a persisted volume carries a provenance_json blob.
+    provenance: Any = None
 
     def __post_init__(self) -> None:
         self.h = np.asarray(self.h, dtype=float)
@@ -307,7 +310,7 @@ def extract_line_cut(
         slab = np.moveaxis(slab, 0, dim)
 
     slab = np.moveaxis(slab, axis, -1)
-    intensity_1d = np.nansum(slab, axis=(0, 1))
+    intensity_1d = np.nanmean(slab, axis=(0, 1))
     return axes_arr[axis], intensity_1d
 
 
@@ -358,11 +361,11 @@ def extract_2d_slice(
 
     if integrate_axis == 0:
         slab = intensity[mask, :, :]
-        return k, l, np.nansum(slab, axis=0), h[mask]
+        return k, l, np.nanmean(slab, axis=0), h[mask]
 
     if integrate_axis == 1:
         slab = intensity[:, mask, :]
-        return h, l, np.nansum(slab, axis=1), k[mask]
+        return h, l, np.nanmean(slab, axis=1), k[mask]
 
     slab = intensity[:, :, mask]
-    return h, k, np.nansum(slab, axis=2), l[mask]
+    return h, k, np.nanmean(slab, axis=2), l[mask]

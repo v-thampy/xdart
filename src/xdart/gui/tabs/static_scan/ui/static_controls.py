@@ -27,18 +27,21 @@ class StaticControls(QtWidgets.QWidget):
     modeChanged = QtCore.Signal(str)
     batchToggled = QtCore.Signal(bool)
     liveToggled = QtCore.Signal(bool)
+    writeModeChanged = QtCore.Signal(str)    # 'Append' / 'Overwrite' (output mode)
 
-    # Phase-B action-button morph table (text, runPhase property, enabled),
-    # lifted verbatim from imageWrangler._set_action_button.
+    # Phase-B action-button morph table (text, runPhase property, enabled).
+    # Idle reads "Run" (the run trigger); the running/paused phases keep the
+    # Pause/Resume morph.
     _PHASES = {
-        'idle':    ('Start',    'idle',   True),
-        'running': ('Pause',    'active', True),
-        'pausing': ('Pausing…', 'active', False),
-        'paused':  ('Resume',   'active', True),
+        'idle':    ('▶ Run',      'idle',   True),
+        'running': ('❚❚ Pause',    'active', True),
+        'pausing': ('❚❚ Pausing…', 'active', False),
+        'paused':  ('▶ Resume',   'active', True),
     }
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName('staticRunControls')
         # Two rows separated by a divider: the SELECTION/OPTIONS row (mode +
         # Batch + Cores) on top, the ACTION row (Live + Start + Stop) below.  The
         # action row lives in its own container so it (and the divider) can be
@@ -53,19 +56,29 @@ class StaticControls(QtWidgets.QWidget):
         self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred,
                            QtWidgets.QSizePolicy.Policy.Fixed)
 
-        # Status / message bar — the control-layer home for run + browse messages
-        # (relocated here from the wrangler's orphaned specLabel).  Sits at the
-        # top of the control stack, above the mode/Batch row; the wranglers route
-        # status to it via wranglerWidget._status_label when controls are attached.
-        self.statusLabel = QtWidgets.QLabel('')
+        # Run/browse status now shows in the main window's BOTTOM status bar
+        # (wranglerWidget._set_status_text routes there), not in a strip above the
+        # mode row.  Keep this label — parented + hidden, NOT in the layout — only
+        # for back-compat references and the standalone fallback; dropping it from
+        # the layout frees the vertical space it used to occupy at the top.
+        self.statusLabel = QtWidgets.QLabel('', self)
         self.statusLabel.setObjectName('statusLabel')
-        self.statusLabel.setMinimumHeight(21)
-        # Ignored horizontal policy: overlong status text clips/elides instead of
-        # forcing the right panel wider (mirrors wranglerWidget._guard_status_label).
-        _sp = self.statusLabel.sizePolicy()
-        _sp.setHorizontalPolicy(QtWidgets.QSizePolicy.Policy.Ignored)
-        self.statusLabel.setSizePolicy(_sp)
-        outer.addWidget(self.statusLabel)
+        self.statusLabel.hide()
+
+        self.readinessRow = QtWidgets.QWidget()
+        self.readinessRow.setObjectName('runReadinessRow')
+        readiness = QtWidgets.QHBoxLayout(self.readinessRow)
+        readiness.setContentsMargins(2, 0, 2, 0)
+        readiness.setSpacing(6)
+        self.readinessDot = QtWidgets.QLabel('●')
+        self.readinessDot.setObjectName('runReadinessDot')
+        self.readinessDot.setAlignment(QtCore.Qt.AlignCenter)
+        readiness.addWidget(self.readinessDot)
+        self.readinessLabel = QtWidgets.QLabel('')
+        self.readinessLabel.setObjectName('runReadinessLabel')
+        readiness.addWidget(self.readinessLabel, 1)
+        self.readinessRow.hide()
+        outer.addWidget(self.readinessRow)
 
         row1 = QtWidgets.QHBoxLayout()
         row1.setContentsMargins(0, 0, 0, 0)
@@ -112,23 +125,43 @@ class StaticControls(QtWidgets.QWidget):
         row2.setSpacing(6)
         outer.addWidget(self.actionRow)
 
-        self.liveButton = QtWidgets.QPushButton('Live')
+        # Row order: Live · Run · Stop · Append (Vivek).  Live + Stop are compact
+        # icon buttons (◉ / ■, reduced width); Run (▶) is the wide primary action;
+        # Append/Replace (⇄) is a touch wider for its label.  Symbols carry
+        # tooltips so the icon-only buttons stay discoverable.
+        self.liveButton = QtWidgets.QPushButton('◉')
         self.liveButton.setObjectName('liveCheckBox')
         self.liveButton.setCheckable(True)
-        self.liveButton.setMaximumWidth(140)
-        row2.addWidget(self.liveButton)
+        self.liveButton.setToolTip('Live (per-frame display)')
+        self.liveButton.setMaximumWidth(50)
 
-        self.startButton = QtWidgets.QPushButton('Start')
         # objectName 'startButton' + the runPhase property are what the dark
-        # theme keys the green/orange Start/Pause styling on.
+        # theme keys the green/orange Run/Pause styling on.  Text comes from
+        # _PHASES (▶ Run / ❚❚ Pause / ▶ Resume) via set_action_phase.
+        self.startButton = QtWidgets.QPushButton('▶ Run')
         self.startButton.setObjectName('startButton')
         self.startButton.setProperty('runPhase', 'idle')
-        row2.addWidget(self.startButton)
 
-        self.stopButton = QtWidgets.QPushButton('Stop')
+        self.stopButton = QtWidgets.QPushButton('■')
         self.stopButton.setObjectName('stopButton')
+        self.stopButton.setToolTip('Stop')
         self.stopButton.setEnabled(False)
-        row2.addWidget(self.stopButton)
+        self.stopButton.setMaximumWidth(50)
+
+        # Output mode (Append vs Replace): a run/output property.  Checkable;
+        # Replace (== writer 'Overwrite') is destructive.  The displayed label is
+        # 'Append'/'Replace' (+ a ⇄ glyph); the writer value stays
+        # 'Append'/'Overwrite' (see write_mode).
+        self.writeModeButton = QtWidgets.QPushButton('Append ⇄')
+        self.writeModeButton.setObjectName('writeModeButton')
+        self.writeModeButton.setCheckable(True)
+        self.writeModeButton.setChecked(False)            # Append
+        self.writeModeButton.setMinimumWidth(96)
+
+        row2.addWidget(self.liveButton)          # compact icon, stretch 0
+        row2.addWidget(self.startButton, 6)       # wide primary action
+        row2.addWidget(self.stopButton)          # compact icon, stretch 0
+        row2.addWidget(self.writeModeButton, 2)   # ~20% wider than the icons' share
 
         self._run_phase = 'idle'
 
@@ -138,6 +171,7 @@ class StaticControls(QtWidgets.QWidget):
         self.modeCombo.currentTextChanged.connect(self.modeChanged)
         self.batchButton.toggled.connect(self.batchToggled)
         self.liveButton.toggled.connect(self.liveToggled)
+        self.writeModeButton.toggled.connect(self._on_write_mode_toggled)
 
     # ── action-button morph (the wrangler drives this via its back-ref) ──
     def set_action_phase(self, phase):
@@ -157,8 +191,40 @@ class StaticControls(QtWidgets.QWidget):
     def action_phase(self):
         return self._run_phase
 
+    def set_readiness_summary(self, text='', *, ready=True, tooltip=''):
+        text = str(text or '').strip()
+        was_hidden = self.readinessRow.isHidden()
+        self.readinessRow.setVisible(bool(text))
+        self.readinessDot.setProperty('ready', bool(ready))
+        self.readinessLabel.setText(text)
+        self.readinessLabel.setToolTip(tooltip or text)
+        self.readinessDot.style().unpolish(self.readinessDot)
+        self.readinessDot.style().polish(self.readinessDot)
+        return was_hidden != self.readinessRow.isHidden()
+
     def set_stop_enabled(self, enabled):
         self.stopButton.setEnabled(bool(enabled))
+
+    # ── output mode (Append / Overwrite) ──
+    # The button DISPLAYS 'Append'/'Replace'; the VALUE the writer compares
+    # against stays 'Append'/'Overwrite' (write_mode).  Keep the two apart.
+    def write_mode(self):
+        """The current output mode string the writer expects."""
+        return 'Overwrite' if self.writeModeButton.isChecked() else 'Append'
+
+    def set_write_mode(self, mode):
+        """Set the toggle from a mode string (session restore / external sync).
+        Blocks signals so a programmatic set doesn't re-emit writeModeChanged."""
+        checked = str(mode) == 'Overwrite'
+        if self.writeModeButton.isChecked() != checked:
+            self.writeModeButton.blockSignals(True)
+            self.writeModeButton.setChecked(checked)
+            self.writeModeButton.blockSignals(False)
+        self.writeModeButton.setText('Replace ⇄' if checked else 'Append ⇄')
+
+    def _on_write_mode_toggled(self, checked):
+        self.writeModeButton.setText('Replace ⇄' if checked else 'Append ⇄')
+        self.writeModeChanged.emit(self.write_mode())
 
     # ── run-state gating (self-contained helper) ──
     def set_run_active(self, active):
@@ -173,7 +239,7 @@ class StaticControls(QtWidgets.QWidget):
         run-state path or the controls would be double-gated."""
         active = bool(active)
         for w in (self.modeCombo, self.batchButton, self.coresSpin,
-                  self.liveButton):
+                  self.liveButton, self.writeModeButton):
             w.setEnabled(not active)
         if active:
             self.stopButton.setEnabled(True)
@@ -189,9 +255,9 @@ class StaticControls(QtWidgets.QWidget):
 
     def set_run_row_enabled(self, enabled):
         """Enable/disable the whole ACTION row (Live/Start/Stop) while keeping it
-        VISIBLE.  Viewer modes have no run, but a hidden row leaves an ugly empty
-        box -- so they show the row greyed-out instead.  Within an enabled row the
-        per-button states (Stop disabled at idle, etc.) still apply."""
+        visible.  Used for not-ready processing states; file-viewer modes hide
+        the row altogether.  Within an enabled row the per-button states (Stop
+        disabled at idle, etc.) still apply."""
         self.actionRow.setEnabled(bool(enabled))
 
     def set_mode_row_enabled(self, enabled):

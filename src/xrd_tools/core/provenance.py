@@ -1,7 +1,6 @@
 """NXprocess provenance capture for the v2 NeXus schema.
 
-Populates ``/entry/reduction/`` per the spec in
-``xdart/docs/nexus_stitch_refactor_plan.md`` §2.1.  The layout written
+Populates ``/entry/reduction/`` for the v2 NeXus schema.  The layout written
 here is:
 
 ::

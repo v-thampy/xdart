@@ -28,6 +28,7 @@ from xrd_tools.reduction import (
     ReductionPlan,
     ReductionSession,
     Scan,
+    StrictPolicy,
     run_reduction,
 )
 from xdart.modules.wavelength import wavelength_m_to_angstrom
@@ -456,7 +457,9 @@ def reduce_live_frame(
         poni=getattr(live_frame, "poni", None),
         integrator=integrator if integrator is not None else getattr(live_frame, "integrator", None),
     )
-    result = run_reduction(plan, scan)
+    # GUI never aborts a save on a per-frame degradation — opt INTO graceful
+    # (the headless default is loud).
+    result = run_reduction(plan, scan, strict=StrictPolicy.graceful())
     reduction = result.frames[int(live_frame.idx)]
     # Only overwrite the dimension the plan actually computed.  A 1D-only or
     # 2D-only plan (e.g. a GI 2D reintegrate, which sets integrate_1d=False so it
@@ -508,6 +511,7 @@ def reduce_live_frames(
             cancel_token=cancel_token,
             chunk_size=chunk_size or (len(frames) if executor is not None else 1),
             gi_freeze_mode=gi_freeze_mode,
+            strict=StrictPolicy.graceful(),   # GUI never aborts a save
         )
         result_frames = result.frames
         active_plan = plan
@@ -615,6 +619,10 @@ def open_live_scan_session(
         gi_freeze_mode=gi_freeze_mode,
         cancel_token=cancel_token,
         clear_frame_images=True,
+        # GUI never aborts a save (loud is the headless default).  Without this, the
+        # streaming live/batch write path ran loud and a single degraded frame
+        # (dead monitor / all-dummy 2D) aborted the whole-scan save (B-1 regression).
+        strict=StrictPolicy.graceful(),
     )
 
 
@@ -657,6 +665,9 @@ def open_live_reduction_session(
         gi_freeze_mode=gi_freeze_mode,
         execution=execution,
         inflight_max=inflight_max,
+        strict=StrictPolicy.graceful(),   # GUI never aborts a save (loud is the
+        # headless default; the GUI drops a bad frame per-frame and keeps going)
+
         # S2: streaming sink-driven sessions (the GUI batch/live path) consume
         # results through the sink (QtNexusSink hydrates LiveFrames + writes
         # the .nxs per frame) and never read result.frames — retaining every
@@ -846,14 +857,26 @@ class StandardPlanCache:
     known-legacy site, but the cache no longer forces that fork.
     """
 
-    __slots__ = ("_plan", "_key", "_mask_obj", "_mask_sig")
+    __slots__ = ("_plan", "_key", "_mask_obj", "_mask_sig", "_plan_builder")
 
-    def __init__(self) -> None:
+    def __init__(self, plan_builder: Any = None) -> None:
         self._plan: ReductionPlan | None = None
         self._key: tuple | None = None
+        self._plan_builder: Any = plan_builder
         # Memoized mask digest, keyed by the mask *object* (see below).
         self._mask_obj: Any = _UNSET
         self._mask_sig: Any = None
+
+    @property
+    def plan_builder(self) -> Any:
+        return self._plan_builder
+
+    @plan_builder.setter
+    def plan_builder(self, builder: Any) -> None:
+        if builder is self._plan_builder:
+            return
+        self._plan_builder = builder
+        self.invalidate()
 
     def _mask_sig_for(self, mask: Any) -> Any:
         """Return the mask digest, recomputing the O(N) part only when the
@@ -880,12 +903,21 @@ class StandardPlanCache:
         integrate_1d: bool = True,
         integrate_2d: bool = True,
     ) -> ReductionPlan | None:
+        builder = self._plan_builder or plan_from_live_scan
+        prepare_scan = getattr(builder, "prepare_scan", None)
+        if callable(prepare_scan):
+            prepare_scan(live_scan)
         mask_sig = self._mask_sig_for(getattr(live_scan, "global_mask", None))
+        builder_key = getattr(builder, "plan_cache_key", _UNSET)
+        if builder_key is _UNSET:
+            builder_key = id(builder)
+        elif callable(builder_key):
+            builder_key = builder_key()
         key = _plan_signature(
             live_scan, integrate_1d, integrate_2d, mask_sig=mask_sig,
-        )
+        ) + (builder_key,)
         if self._plan is None or self._key != key:
-            self._plan = plan_from_live_scan(
+            self._plan = builder(
                 live_scan,
                 integrate_1d=integrate_1d,
                 integrate_2d=integrate_2d,

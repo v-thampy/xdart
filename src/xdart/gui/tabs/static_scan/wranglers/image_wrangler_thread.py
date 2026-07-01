@@ -20,6 +20,7 @@ import numpy as np
 from pathlib import Path
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
@@ -443,6 +444,15 @@ class imageThread(wranglerThread):
         self.scan_name = scan_name
         self.single_img = single_img
         self.poni = poni
+        # GENERIC-DETECTOR FIX: when a Run adopts a loaded processed scan's
+        # geometry (image_wrangler._adopt_loaded_scan_run_inputs), the wrangler
+        # also hands over the restored PIXEL-BEARING integrator keyed on the
+        # adopted poni.  The poni-identity rebuild block below REUSES it instead
+        # of rebuilding a pixel-less integrator from the (name-only) PONI.  Both
+        # default None (a normal poni-file Run rebuilds as before).
+        self._adopted_poni = None
+        self._adopted_integrator = None
+        self._adopted_fiber_integrator = None
         self.inp_type = inp_type
         self.img_file = img_file
         self.img_dir = img_dir
@@ -688,6 +698,38 @@ class imageThread(wranglerThread):
             if output_path:
                 logger.info('Output file: %s\n', output_path)
 
+    def _install_run_integrator(self, scan):
+        """Build (or reuse) the scan's cached AzimuthalIntegrator for this run.
+
+        Called when ``self.poni`` differs from the scan's currently-cached poni
+        (a fresh scan, or a user-loaded calibration).  The default path rebuilds
+        from ``self.poni`` via ``poni_to_integrator``.
+
+        GENERIC-DETECTOR FIX: a PONI dataclass carries only a detector *name*, so
+        rebuilding for an unnamed/generic detector yields a pyFAI integrator with
+        ``_pixel1``/``_pixel2`` = None — and the reduction then crashes in
+        ``calc_cartesian_positions`` (``NoneType * float``).  When this run ADOPTED
+        a loaded processed scan's geometry (image_wrangler._adopt_loaded_scan_run_inputs),
+        the wrangler also handed over that scan's restored PIXEL-BEARING integrator,
+        keyed on the adopted poni object.  Reuse it here whenever ``self.poni`` IS
+        that adopted poni (identity check) so the pixel size survives.  A
+        genuinely-new user-loaded .poni is a different object, so it still rebuilds.
+        """
+        adopted_ai = getattr(self, "_adopted_integrator", None)
+        if (adopted_ai is not None
+                and self.poni is getattr(self, "_adopted_poni", None)):
+            scan._cached_integrator = adopted_ai
+            scan._cached_fiber_integrator = getattr(
+                self, "_adopted_fiber_integrator", None)
+            logger.info(
+                "[RUN-CAL] reusing restored pixel-bearing integrator for %s "
+                "(generic detector — poni rebuild would drop pixel size)",
+                getattr(scan, "name", "scan"))
+        else:
+            scan._cached_integrator = poni_to_integrator(self.poni)
+            scan._cached_fiber_integrator = None
+        scan._cached_poni = self.poni
+
     def process_scan(self):
         """Batch-integrate all existing images, then optionally watch for new ones (live mode).
 
@@ -707,6 +749,7 @@ class imageThread(wranglerThread):
 
         # ── Phase 1 & 2: collect then process all existing images ─────────────
         pending = []  # [(img_file, img_number, img_data, img_meta, bg_raw)]
+        pending_avg_count = 0
         # Per-flush read-time accumulator.  With the prefetcher this is mostly
         # queue-wait time on the main thread, not raw h5py I/O.
         _t_read_accum = 0.0
@@ -781,6 +824,7 @@ class imageThread(wranglerThread):
                         scan, pending, force_save=True,
                     )
                     pending = []
+                    pending_avg_count = 0
                 # Catch the case where pending was already drained by
                 # the per-iteration dispatch cadence below: the old
                 # scan may have integrated-but-unsaved frames in
@@ -788,31 +832,25 @@ class imageThread(wranglerThread):
                 if (scan is not None
                         and not self.xye_only
                         and self._frames_since_save > 0):
-                    _get_h5pool().pause(scan.data_file)
-                    try:
-                        with self.file_lock:
-                            scan._save_to_nexus()
-                    finally:
-                        _get_h5pool().resume(scan.data_file)
-                    self._flush_xye_buffer(scan)
-                    logger.info(
-                        '[SAVE-ON-SWAP] %d frames flushed for %s',
-                        self._frames_since_save, scan.name,
-                    )
-                    self._frames_since_save = 0
+                    _n_swap = self._frames_since_save     # reset by the tail
+                    if self.flush_serial_tail(scan, force=True):
+                        logger.info(
+                            '[SAVE-ON-SWAP] %d frames flushed for %s',
+                            _n_swap, scan.name,
+                        )
                 scan = self.initialize_scan()
                 self._active_scan = scan      # Pause: serial-flush handle
                 _cached_poni = None
 
             # Rebuild cached AzimuthalIntegrator when poni identity changes
             if self.poni is not _cached_poni:
-                scan._cached_integrator = poni_to_integrator(self.poni)
-                scan._cached_poni = self.poni
-                scan._cached_fiber_integrator = None
+                self._install_run_integrator(scan)
                 _cached_poni = self.poni
                 self._cached_gi_incident_angle = None
 
-            if img_number in scan.frames.index:
+            series_average = bool(getattr(self, "series_average", False))
+            output_img_number = 1 if series_average else img_number
+            if output_img_number in scan.frames.index:
                 if self.single_img and not is_eiger:
                     self.sigUpdate.emit(img_number)
                     break
@@ -822,8 +860,13 @@ class imageThread(wranglerThread):
             # Stash the per-frame read time on the tuple so the per-frame
             # TIMING log can show it (otherwise it gets lumped into the
             # batch [FLUSH] line and hides per-frame variance).
-            pending.append((img_file, img_number, img_data, img_meta,
-                            bg_raw, _t_read_this))
+            entry = (img_file, img_number, img_data, img_meta,
+                     bg_raw, _t_read_this)
+            if series_average:
+                pending_avg_count = imageThread._append_series_average_pending(
+                    self, pending, entry, pending_avg_count)
+            else:
+                pending.append(entry)
 
             if self.single_img and not is_eiger:
                 break
@@ -835,7 +878,7 @@ class imageThread(wranglerThread):
             # QtNexusSink/FlushPolicy still batch persistence, and batch remains
             # display-silent until the final sigUpdate(-1).
             flush_size = 1
-            if len(pending) >= flush_size:
+            if pending and len(pending) >= flush_size and not series_average:
                 if self.batch_mode:
                     self.showLabel.emit(
                         f'Integrating {len(pending)} frame(s)...'
@@ -854,6 +897,7 @@ class imageThread(wranglerThread):
                         len(pending), _t_read_accum, _disp_dt,
                     )
                 pending = []
+                pending_avg_count = 0
                 _t_read_accum = 0.0
 
         # Process whatever is left.  force_save=True so any remaining
@@ -863,6 +907,7 @@ class imageThread(wranglerThread):
             files_processed += self._dispatch_batch(
                 scan, pending, force_save=True,
             )
+            pending_avg_count = 0
             _disp_dt = time.time() - _t_disp
             _perf = getattr(self, '_perf', None)
             if _perf is not None:
@@ -875,17 +920,10 @@ class imageThread(wranglerThread):
             )
         elif (scan is not None and not self.xye_only
               and self._frames_since_save > 0 and self.command != 'stop'):
-            # Pending was empty but the live-save batcher has unflushed
-            # frames (last batch hit the divisor exactly).  Force a save
-            # before leaving the collect loop.
-            _get_h5pool().pause(scan.data_file)
-            try:
-                with self.file_lock:
-                    scan._save_to_nexus()
-            finally:
-                _get_h5pool().resume(scan.data_file)
-            self._flush_xye_buffer(scan)
-            self._frames_since_save = 0
+            # Pending was empty but the live-save batcher has unflushed frames
+            # (last batch hit the divisor exactly).  Force a save before leaving
+            # the collect loop.
+            self.flush_serial_tail(scan, force=True)
 
         # ── Phase 3: live watching ────────────────────────────────────────────
         if self.live_mode and self.command != 'stop' and scan is not None:
@@ -926,9 +964,7 @@ class imageThread(wranglerThread):
                     _cached_poni = None
 
                 if self.poni is not _cached_poni:
-                    scan._cached_integrator = poni_to_integrator(self.poni)
-                    scan._cached_poni = self.poni
-                    scan._cached_fiber_integrator = None
+                    self._install_run_integrator(scan)
                     _cached_poni = self.poni
                     self._cached_gi_incident_angle = None
 
@@ -946,30 +982,13 @@ class imageThread(wranglerThread):
                     # No .nxs save in this mode -- drain the XYE buffer per
                     # frame so output appears as the watch processes files.
                     self._flush_xye_buffer(scan)
-                if self._save_due(scan):
-                    _get_h5pool().pause(scan.data_file)
-                    try:
-                        with self.file_lock:
-                            scan._save_to_nexus()
-                    finally:
-                        _get_h5pool().resume(scan.data_file)
-                    self._flush_xye_buffer(scan)
-                    self._frames_since_save = 0
+                self.flush_serial_tail(scan)
 
         # Final flush on exit (live-watch tail or stop request) so the
         # last few frames aren't lost.
         if scan is not None and self.xye_only:
             self._flush_xye_buffer(scan)
-        if (scan is not None and not self.xye_only
-                and self._frames_since_save > 0):
-            _get_h5pool().pause(scan.data_file)
-            try:
-                with self.file_lock:
-                    scan._save_to_nexus()
-            finally:
-                _get_h5pool().resume(scan.data_file)
-            self._flush_xye_buffer(scan)
-            self._frames_since_save = 0
+        self.flush_serial_tail(scan, force=True)
 
         # In batch mode, emit a single final signal so the GUI can refresh
         if self.batch_mode and files_processed > 0:
@@ -977,6 +996,82 @@ class imageThread(wranglerThread):
         logger.info('Total Files Processed: %d', files_processed)
 
     # ── Batch dispatch ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _average_numeric_metadata(current, incoming, old_count, new_count):
+        out = dict(current or {})
+        for key in list(out):
+            try:
+                out[key] = (
+                    float(out[key]) * old_count
+                    + float((incoming or {}).get(key, 0.0))
+                ) / new_count
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    @staticmethod
+    def _average_payload(current, incoming, old_count, new_count):
+        if current is None:
+            return None
+        if incoming is None:
+            return current
+        try:
+            return (
+                np.asarray(current, dtype=float) * old_count
+                + np.asarray(incoming, dtype=float)
+            ) / new_count
+        except (TypeError, ValueError):
+            return current
+
+    @staticmethod
+    def _copy_average_payload(value):
+        if value is None:
+            return None
+        return np.asarray(value, dtype=float).copy()
+
+    def _append_series_average_pending(self, pending, entry, count):
+        """Fold one source frame into the pending Average Scan mean.
+
+        ``pending`` keeps the normal dispatcher tuple shape, but holds exactly
+        one running-mean entry.  This mirrors the old queue feeder without
+        retaining every detector image until the streaming session opens.
+        """
+
+        img_file, _img_number, img_data, img_meta, bg_raw, t_read = entry
+        if count <= 0 or not pending:
+            pending[:] = [(
+                img_file,
+                1,
+                imageThread._copy_average_payload(img_data),
+                dict(img_meta or {}),
+                imageThread._copy_average_payload(bg_raw),
+                float(t_read or 0.0),
+            )]
+            return 1
+
+        old_file, _old_number, old_data, old_meta, old_bg, old_t = pending[0]
+        new_count = count + 1
+        pending[0] = (
+            img_file or old_file,
+            1,
+            imageThread._average_payload(old_data, img_data, count, new_count),
+            imageThread._average_numeric_metadata(
+                old_meta, img_meta, count, new_count),
+            imageThread._average_payload(old_bg, bg_raw, count, new_count),
+            float(old_t or 0.0) + float(t_read or 0.0),
+        )
+        return new_count
+
+    def _series_average_pending(self, pending):
+        if not bool(getattr(self, "series_average", False)) or len(pending) <= 1:
+            return list(pending)
+        averaged = []
+        count = 0
+        for entry in pending:
+            count = imageThread._append_series_average_pending(
+                self, averaged, entry, count)
+        return averaged
 
     def _dispatch_batch(self, scan, pending, *, force_save=False):
         """Process a list of pending images — parallel in batch mode, serial otherwise.
@@ -1582,15 +1677,11 @@ class imageThread(wranglerThread):
             elif scan is not None and self._frames_since_save > 0:
                 # Serial path is the active writer (watch loop / serial
                 # dispatch): flush the serial tail.
-                if not self.xye_only:
-                    _get_h5pool().pause(scan.data_file)
-                    try:
-                        with self.file_lock:
-                            scan._save_to_nexus()
-                    finally:
-                        _get_h5pool().resume(scan.data_file)
-                self._flush_xye_buffer(scan)
-                self._frames_since_save = 0
+                if self.xye_only:
+                    self._flush_xye_buffer(scan)      # no .nxs save in xye-only
+                    self._frames_since_save = 0
+                else:
+                    self.flush_serial_tail(scan, force=True)
             elif adapter is not None:
                 # Streaming path (batch / reprocess / live Phase 2): in-flight
                 # window drained (non-terminal — session stays open) + flush
@@ -1605,6 +1696,43 @@ class imageThread(wranglerThread):
             logger.error("error draining/flushing on pause", exc_info=True)
         finally:
             self.sigPaused.emit()
+
+    @contextmanager
+    def _h5pool_bracket(self, scan):
+        """Pause the shared h5 pool around a serial write to ``scan.data_file``,
+        resuming even if the wrapped body raises (the symmetric bracket the .nxs
+        single-writer path needs).  Shared by :meth:`flush_serial_tail` and
+        ``QtNexusSink.flush`` (the streaming write reuses ONLY this bracket,
+        keeping its own ``mode=`` + bookkeeping)."""
+        _get_h5pool().pause(scan.data_file)
+        try:
+            yield
+        finally:
+            _get_h5pool().resume(scan.data_file)
+
+    def flush_serial_tail(self, scan, *, force=False) -> bool:
+        """The serial save tail (the DRYed copy-paste idiom).
+
+        When a save is due (cadence / cap-pressure / ``force``), h5pool-bracket a
+        file-locked ``scan._save_to_nexus()``, drain the XYE buffer, and reset
+        the per-save counter.  Returns ``True`` iff it saved.
+
+        persist-before-evict: ``_save_to_nexus`` marks the written frames
+        persisted BEFORE ``_frames_since_save`` is reset (the counter that gates
+        the next save cycle), so an unsaved frame is never evicted.  ``force=True``
+        respects the per-site ``_frames_since_save > 0`` precondition because
+        ``_save_due(force=True)`` is False on an empty tail.  No-op in xye_only
+        mode (no .nxs target — ``_save_due`` returns False) and for ``scan is
+        None``.
+        """
+        if scan is None or not self._save_due(scan, force=force):
+            return False
+        with self._h5pool_bracket(scan):
+            with self.file_lock:
+                scan._save_to_nexus()
+        self._flush_xye_buffer(scan)
+        self._frames_since_save = 0
+        return True
 
     def _save_due(self, scan, *, force=False):
         """Whether a non-batch v2 save should fire now (persist-before-evict).
@@ -1657,23 +1785,13 @@ class imageThread(wranglerThread):
 
         self._frames_since_save += count
 
-        if self._save_due(scan, force=force_save):
-            _t_save0 = time.time()
-            _get_h5pool().pause(scan.data_file)
-            try:
-                with self.file_lock:
-                    scan._save_to_nexus()
-            finally:
-                _get_h5pool().resume(scan.data_file)
-            _t_save = time.time() - _t_save0
-            _t_xye0 = time.time()
-            self._flush_xye_buffer(scan)
-            _t_xye = time.time() - _t_xye0
+        _n_save = self._frames_since_save        # reset by the tail
+        _t_save0 = time.time()
+        if self.flush_serial_tail(scan, force=force_save):
             logger.info(
-                '[SAVE] %d frames since last save  save=%.3fs  xye=%.3fs',
-                self._frames_since_save, _t_save, _t_xye,
+                '[SAVE] %d frames since last save  flush=%.3fs',
+                _n_save, time.time() - _t_save0,
             )
-            self._frames_since_save = 0
         elif self.xye_only:
             # Int 1D (XYE) on the serial fallback: there is no .nxs save to
             # ride on (_save_due is always False in this mode), so drain the
@@ -1693,6 +1811,7 @@ class imageThread(wranglerThread):
         tilt_angle = self.tilt_angle
         series_average = self.series_average
         frames = []
+        pending = imageThread._series_average_pending(self, pending)
         for img_file, img_number, img_data, img_meta, bg_raw, _t_read in pending:
             if self.command == 'stop':
                 break
@@ -1730,6 +1849,7 @@ class imageThread(wranglerThread):
         ``_close_reduction_session`` ``finish()`` drains the writer and does the
         final flush.  Behind the execution flag; chunked is the default.
         """
+        pending = imageThread._series_average_pending(self, pending)
         if getattr(scan, "_cached_integrator", None) is None:
             logger.info('[STREAM] no cached integrator yet — first frame falls '
                         'back to serial (streaming engages from the next frame)')
@@ -2576,11 +2696,12 @@ class imageThread(wranglerThread):
         # N1: the project root -> entry/@source_base + relative raw source paths
         # in the writer (portable .nxs).  None -> absolute paths (back-compat).
         scan.source_base = getattr(self, "source_base", None)
-        # v2 NeXus writer needs a DiffractometerGeometry to derive per-frame
-        # rot1/rot2/rot3 and incidence-angle arrays from scan_data.  The
-        # default is a two-circle convention using `tth` (detector arm) and
-        # whatever `th_mtr` resolves to (sample tilt).  Override later from
-        # the geometry UI panel when the user picks a non-default convention.
+        # v2 NeXus writer needs a Diffractometer to derive per-frame
+        # rot1/rot2/rot3 + incidence-angle arrays from scan_data.  default_geometry()
+        # picks the preset from what scan_data recorded: psic when nu/del are
+        # present (RSM/6-circle), else the two-circle convention (rot1←tth,
+        # incidence ← the resolved sample-tilt motor).  Override later from the
+        # geometry UI panel when the user picks a different convention.
         scan.default_geometry()
 
         write_mode = self.write_mode
@@ -2592,8 +2713,7 @@ class imageThread(wranglerThread):
         # the per-batch ``scan._save_to_nexus`` is already gated off for
         # xye_only, so the scan object is used purely in-memory for integration.
         if not self.xye_only:
-            _get_h5pool().pause(scan.data_file)
-            try:
+            with self._h5pool_bracket(scan):
                 with self.file_lock:
                     if write_mode == 'Append':
                         # v2 NeXus loader (the only one we support now).
@@ -2606,8 +2726,6 @@ class imageThread(wranglerThread):
                             scan.save_to_nexus(replace=True)
                     else:
                         scan.save_to_nexus(replace=True)
-            finally:
-                _get_h5pool().resume(scan.data_file)
 
         # Copy integration args (including GI modes) from the main scan.
         scan.bai_1d_args = self.scan.bai_1d_args.copy()

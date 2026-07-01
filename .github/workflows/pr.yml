@@ -38,7 +38,7 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         # The offscreen pyqtgraph backend intermittently segfaults (exit 139)
         # while constructing PlotItems under repeated widget creation — a Qt/GL
-        # teardown flake, not a test failure.  Retry ONLY on 139 so a real test
+        # teardown flake, not a test failure. Retry ONLY on 139 so a real test
         # failure (any other non-zero) still fails fast and is never masked.
         run: |
           for attempt in 1 2 3; do
@@ -48,3 +48,18 @@ jobs:
             echo "::warning::pytest tests/xdart segfaulted (139) on attempt $attempt; retrying"
           done
           exit 139
+
+  # Release-readiness preflight: version pins, the pyFAI ceiling, and the
+  # schema/byte-compat gate must stay green on every PR.  No --strict-tree, so an
+  # uncommitted tree only warns (a clean CI checkout passes the tree check anyway).
+  release-preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      # base+dev suffices: `import xdart` resolves without the gui extra, and the
+      # schema check's two test files need only io (h5py, pyFAI is a base dep) + pytest.
+      - run: pip install -e ".[dev]"
+      - run: python scripts/release.py check

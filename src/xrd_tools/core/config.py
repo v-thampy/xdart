@@ -14,6 +14,7 @@ from typing import Any, TYPE_CHECKING
 
 from xrd_tools.core.geometry import (
     DetectorHeader,
+    Diffractometer,
     DiffractometerConfig,
     PixelQMap,
 )
@@ -40,8 +41,10 @@ class ExperimentConfig:
     header: DetectorHeader = field(default_factory=_default_header)
 
     img_rel_path: str = "images"
-    diff_motors: tuple[str, ...] = ("th", "chi", "phi", "tth")
-    diff_config: DiffractometerConfig = field(default_factory=DiffractometerConfig)
+    # default to the house-standard psic motor order (sample mu/eta/chi/phi,
+    # detector nu/del) — matching the default psic diff_config.
+    diff_motors: tuple[str, ...] = ("mu", "eta", "chi", "phi", "nu", "del")
+    diff_config: Diffractometer = field(default_factory=Diffractometer.psic)
     bins: tuple[int, int, int] = (80, 80, 100)
     rotation: int = 0
     h5_glob: str = "{sample}_scan*{scan_num}_master.h5"
@@ -94,9 +97,17 @@ class ExperimentConfig:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        # Parse nested dataclasses.
+        # Parse the nested geometry.  Accept BOTH the canonical Diffractometer
+        # blob and a legacy DiffractometerConfig dict (back-compat: an old
+        # experiment config carried sample_rot/detector_rot keys) — the latter
+        # is lifted onto the one object.
         if "diff_config" in data and isinstance(data["diff_config"], dict):
-            data["diff_config"] = DiffractometerConfig(**data["diff_config"])
+            dc = data["diff_config"]
+            if "sample_rot" in dc or "detector_rot" in dc:
+                data["diff_config"] = Diffractometer.from_diffractometer_config(
+                    DiffractometerConfig(**dc))
+            else:
+                data["diff_config"] = Diffractometer.from_json(json.dumps(dc))
         else:
             data.pop("diff_config", None)
 

@@ -551,6 +551,66 @@ def test_update_data_append_emits_once_when_requested():
     assert len(calls) == 1
 
 
+def test_update_data_force_rebuild_bypasses_equal_list_fast_path():
+    viewer, list_data, _calls = _viewer([1, 2], [1, 2])
+    viewer.auto_last = False
+    first_item = list_data.item(0)
+
+    viewer.update_data(emit_update=False, force_rebuild=True)
+
+    assert _labels(list_data) == ["1", "2"]
+    assert list_data.item(0) is not first_item
+
+
+def test_shutdown_threads_discards_stale_file_thread_work():
+    class Signal:
+        def __init__(self):
+            self.disconnected = False
+
+        def disconnect(self):
+            self.disconnected = True
+
+    class FileThread:
+        def __init__(self):
+            self.queue = Queue()
+            self.sigTaskStarted = Signal()
+            self.sigTaskDone = Signal()
+            self.sigNewFile = Signal()
+            self.sigUpdate = Signal()
+            self.live_run = True
+            self.no_nxs = True
+            self.waited_items = []
+            self._running = True
+
+        def isRunning(self):
+            return self._running
+
+        def wait(self, _timeout):
+            while not self.queue.empty():
+                self.waited_items.append(self.queue.get_nowait())
+            self._running = False
+            return True
+
+    ft = FileThread()
+    ft.queue.put("set_datafile")
+    ft.queue.put("save_data_as")
+    viewer = SimpleNamespace(
+        cancel_pending_loads=lambda: None,
+        file_thread=ft,
+    )
+
+    H5Viewer.shutdown_threads(viewer)
+
+    assert ft.queue.empty()
+    assert ft.waited_items == [None]
+    assert ft.live_run is False
+    assert ft.no_nxs is False
+    assert ft.sigTaskStarted.disconnected
+    assert ft.sigTaskDone.disconnected
+    assert ft.sigNewFile.disconnected
+    assert ft.sigUpdate.disconnected
+
+
 def test_flush_pending_update_owns_single_repaint():
     calls = []
     widget = SimpleNamespace(
@@ -647,6 +707,76 @@ def test_update_data_stashes_frame_without_building_per_frame():
     assert host.h5viewer.latest_idx == 7                  # cursor advanced
     assert host._pending_update_idx == 7
     assert 7 in host.scan.frames.index                    # index appended (cheap)
+
+
+def test_run_end_reconciles_partial_frame_browser_from_written_index(tmp_path):
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    written = tmp_path / "finished.nxs"
+    written.write_bytes(b"")
+    list_data = _FakeListWidget([1, 9, 10])
+
+    class Scan:
+        def __init__(self):
+            self.name = "scan"
+            self.frames = SimpleNamespace(index=[1, 9, 10])
+
+        def load_frame_index_only(self, fname):
+            assert fname == str(written)
+            self.frames = SimpleNamespace(index=list(range(1, 11)))
+            return 10
+
+    scan = Scan()
+    calls = []
+    viewer = SimpleNamespace(
+        scan=scan,
+        ui=SimpleNamespace(listData=list_data),
+        new_scan_loaded=False,
+        frame_ids=[],
+        auto_last=True,
+        latest_idx=None,
+        data_changed=lambda *args, **kwargs: calls.append((args, kwargs)),
+        _displayed_list_count=list_data.count(),
+        _displayed_last_label=list_data.item(list_data.count() - 1).text(),
+    )
+    viewer.set_current_frame = MethodType(H5Viewer.set_current_frame, viewer)
+    viewer._remember_displayed_frames = MethodType(
+        H5Viewer._remember_displayed_frames, viewer)
+    viewer.update_data = MethodType(H5Viewer.update_data, viewer)
+
+    host = SimpleNamespace(scan=scan, h5viewer=viewer)
+
+    indexed = staticWidget._reconcile_h5viewer_frame_list_after_run(
+        host, str(written))
+
+    assert indexed == 10
+    assert _labels(list_data) == [str(i) for i in range(1, 11)]
+    assert viewer.latest_idx == 10
+    assert [item.text() for item in list_data.selectedItems()] == ["10"]
+    assert calls == []
+
+
+def test_run_end_reconcile_skips_forced_rebuild_when_list_is_current():
+    list_data = _FakeListWidget([1, 2, 3])
+    scan = SimpleNamespace(
+        name="scan",
+        frames=SimpleNamespace(index=[1, 2, 3]),
+    )
+    calls = []
+    viewer = SimpleNamespace(
+        scan=scan,
+        ui=SimpleNamespace(listData=list_data),
+        new_scan_loaded=False,
+        latest_idx=None,
+        update_data=lambda **kwargs: calls.append(kwargs),
+    )
+    host = SimpleNamespace(scan=scan, h5viewer=viewer)
+
+    indexed = staticWidget._reconcile_h5viewer_frame_list_after_run(host)
+
+    assert indexed == 0
+    assert viewer.latest_idx == 3
+    assert calls == [{"emit_update": False, "force_rebuild": False}]
 
 
 def test_drain_pending_frames_builds_store_and_scan_data():
@@ -877,6 +1007,51 @@ def test_clear_display_state_resets_visible_and_cached_state():
     assert image_widget.raw_image.size == 0
     assert binned_widget.raw_image.size == 0
     assert wf_widget.raw_image.size == 0
+
+
+def test_update_2d_label_omits_frame_index_for_averaged_series():
+    """An averaged series collapses to one frame: the title is the bare series
+    name (no '_1'), even though it stays frame #1 in the Frames list.  A non-
+    averaged frame still carries its current index.  (Regression: the
+    Single/Overlay/Waterfall early-return appended '_1' for averaged series.)"""
+    label = _FakeLabel()
+
+    def _host(series_average, idxs=(1,)):
+        host = SimpleNamespace(
+            scan=SimpleNamespace(name='myscan', single_img=False,
+                                 series_average=series_average),
+            plotMethod='Single',
+            idxs_2d=list(idxs),
+            idxs_1d=list(idxs),
+            frame_ids=['1'],
+            overall=False,
+            ui=SimpleNamespace(labelCurrent=label),
+        )
+        host.update_2d_label = MethodType(displayFrameWidget.update_2d_label, host)
+        return host
+
+    _host(series_average=True).update_2d_label()
+    assert label.text == 'myscan'                 # bare name, no '_1'
+
+    _host(series_average=False, idxs=(5,)).update_2d_label()
+    assert label.text == 'myscan_5'               # non-averaged still indexed
+
+
+def test_trace_name_omits_frame_index_for_averaged_series():
+    """The 1D legend (publication path) is the bare series name for an averaged
+    series, matching the title + legacy build_plot_names."""
+    from xdart.gui.tabs.static_scan.display_publication import _trace_name
+
+    pub = SimpleNamespace(
+        label=1,
+        metadata_raw={},
+        view=SimpleNamespace(source_path=None),
+        source_identity=None,
+    )
+    avg = SimpleNamespace(scan=SimpleNamespace(name='myscan', series_average=True))
+    plain = SimpleNamespace(scan=SimpleNamespace(name='myscan', series_average=False))
+    assert _trace_name(pub, avg) == 'myscan'
+    assert _trace_name(pub, plain) == 'myscan_1'
 
 
 def _clear_1d_host(viewer_mode):
@@ -1260,7 +1435,10 @@ def test_metadata_panel_populates_when_layout_reparented():
     assert not mw.isVisible()                    # the widget itself never shows
 
     frame = QtWidgets.QFrame()
-    frame.setLayout(mw.layout)                   # mirror static_scan_widget
+    # Layout-only host: the pre-Stage-4 inline pattern (Stage 4 instead reparents
+    # the metadataWidget into an on-demand popup dialog).  Either way the gate
+    # must key on the tableview, not self.isVisible(), so keep exercising it.
+    frame.setLayout(mw.layout)
     win = QtWidgets.QWidget()
     QtWidgets.QVBoxLayout(win).addWidget(frame)
     win.show()
@@ -1360,6 +1538,11 @@ def test_live_new_scan_invalidates_publication_store():
         frame_ids=["1"],
         publication_store=store,
         displayframe=SimpleNamespace(set_axes=lambda: None),
+        # new_scan refreshes the (optional) Controls Panel v2 profile as a
+        # side effect; this host has no v2 panel, so it is a no-op here.
+        _controls_v2_enabled=lambda: False,
+        _refresh_controls_v2_profile=lambda *a, **k: None,
+        _fit_controls_height=lambda *a, **k: None,
         metawidget=SimpleNamespace(update=lambda: None),
     )
     host._sync_h5viewer_save_dir = MethodType(
@@ -1422,6 +1605,11 @@ def _new_scan_host_with_wrangler_mask(wrangler_mask, initial_global_mask,
         frame_ids=["1"],
         publication_store=PublicationStore(),
         displayframe=SimpleNamespace(set_axes=lambda: None),
+        # new_scan refreshes the (optional) Controls Panel v2 profile as a
+        # side effect; this host has no v2 panel, so it is a no-op here.
+        _controls_v2_enabled=lambda: False,
+        _refresh_controls_v2_profile=lambda *a, **k: None,
+        _fit_controls_height=lambda *a, **k: None,
         metawidget=SimpleNamespace(update=lambda: None),
     )
     host._sync_h5viewer_save_dir = MethodType(
@@ -1543,6 +1731,204 @@ def test_gi_motor_options_default_manual_when_no_metadata():
     assert gi["th_motor"].value() == "th"
     assert gi["th_val"].visible is False
     assert h.incidence_motor == "th"
+
+
+def test_gi_motor_options_default_select_follows_preference_order():
+    """The GI incidence motor default-selects by preference order
+    (th, eta, theta, gonth, halpha; case-insensitive): the first present wins,
+    else the first available motor, else Manual.  ALL motor columns are offered
+    so a non-default motor is still pickable."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    class _P:
+        def __init__(self, value=None):
+            self._v = value
+            self.visible = True
+        def value(self):
+            return self._v
+        def setValue(self, v):
+            self._v = v
+        def setOpts(self, **o):
+            if "value" in o:
+                self._v = o["value"]
+            if "visible" in o:
+                self.visible = o["visible"]
+            self.opts = o
+        def hide(self):
+            self.visible = False
+        def show(self):
+            self.visible = True
+
+    def _select(motors):
+        gi = {"th_motor": _P("th"), "th_val": _P("0.1")}
+        params = SimpleNamespace(child=lambda name: SimpleNamespace(child=lambda n: gi[n]))
+        h = SimpleNamespace(motors=motors, parameters=params, incidence_motor=None)
+        h.set_gi_th_motor = MethodType(imageWrangler.set_gi_th_motor, h)
+        h.set_gi_motor_options = MethodType(imageWrangler.set_gi_motor_options, h)
+        h.set_gi_motor_options()
+        return gi["th_motor"].value(), gi["th_motor"].opts["values"]
+
+    # eta is preferred over theta (the key difference from the old order), and
+    # every motor column is offered (plus Manual).
+    value, items = _select(["theta", "eta", "i0"])
+    assert value == "eta"
+    assert set(items) == {"Manual", "theta", "eta", "i0"}
+
+    # Case-insensitive: 'TH' still wins as the top preference.
+    value, _ = _select(["i0", "TH", "eta"])
+    assert value == "TH"
+
+    # No preferred motor present -> first available motor (still pickable list).
+    value, _ = _select(["mu", "chi"])
+    assert value == "mu"
+
+
+def test_get_img_fname_clears_motors_when_source_switch_resolves_no_file():
+    """Switching to Image Directory with no directory chosen must drop the
+    previous source's motors (and the stale img_file) so the GI Theta Motor
+    dropdown resets to Manual instead of keeping the last file's columns."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    class _P:
+        def __init__(self, value=None):
+            self._v = value
+            self.visible = True
+        def value(self):
+            return self._v
+        def setValue(self, v):
+            self._v = v
+        def setOpts(self, **o):
+            self.opts = o
+            if "value" in o:
+                self._v = o["value"]
+            if "visible" in o:
+                self.visible = o["visible"]
+        def hide(self):
+            self.visible = False
+        def show(self):
+            self.visible = True
+
+    signal = {"img_ext": _P("h5"), "img_dir": _P(""), "include_subdir": _P(False),
+              "File": _P("")}
+    gi = {"th_motor": _P("th"), "th_val": _P("0.1")}
+    groups = {"Signal": signal, "GI": gi}
+    params = SimpleNamespace(
+        child=lambda name: SimpleNamespace(child=lambda n: groups[name][n]))
+
+    h = SimpleNamespace(
+        inp_type="Image Directory",
+        img_file="/prev/scan_0001.tif",   # stale, from the previous Image Series
+        scan_parameters=["th", "i0"],
+        motors=["th", "i0"],
+        counters=["i0", "mon"],           # stale
+        parameters=params,
+        meta_ext="",
+        file_filter="",
+        include_subdir=False,
+        img_ext="h5",
+        img_dir="",
+        incidence_motor=None,
+    )
+    h.get_img_fname = MethodType(imageWrangler.get_img_fname, h)
+    h.set_gi_motor_options = MethodType(imageWrangler.set_gi_motor_options, h)
+    h.set_gi_th_motor = MethodType(imageWrangler.set_gi_th_motor, h)
+    h._sync_meta_ext_to_img_ext = lambda: None
+    h._find_image_directory_seed = lambda match, suffix: None  # no seed -> no file
+    h.exists_meta_file = lambda f: False
+    h.detect_meta_ext = lambda f: None
+    h.set_bg_matching_options = lambda: None
+    h.set_bg_norm_options = lambda: None
+
+    h.get_img_fname()
+
+    assert h.img_file == ""          # stale file dropped
+    assert h.motors == []            # stale motors cleared
+    assert h.scan_parameters == []
+    assert h.counters == []          # stale counters cleared too (F4)
+    assert gi["th_motor"].value() == "Manual"   # dropdown reset to Manual
+
+
+def test_set_meta_ext_clears_params_to_force_metadata_reread():
+    """Changing the Meta Type drops the previous format's parsed parameters
+    BEFORE re-running get_img_fname, so the metadata (and GI motor list) is
+    re-resolved under the new format (e.g. txt -> pdi with no .pdi sidecar)."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    class _P:
+        def __init__(self, value=None):
+            self._v = value
+        def value(self):
+            return self._v
+        def show(self, *_a):
+            pass
+        def hide(self):
+            pass
+
+    signal = {"meta_ext": _P("pdi"), "meta_dir": _P("")}
+    params = SimpleNamespace(
+        child=lambda name: SimpleNamespace(child=lambda n: signal[n]))
+
+    seen = []
+    h = SimpleNamespace(
+        parameters=params,
+        scan_parameters=["th", "i0"],   # stale, from the previous (txt) format
+        meta_ext="txt",
+    )
+    h.set_meta_ext = MethodType(imageWrangler.set_meta_ext, h)
+    h._save_to_session = lambda: None
+    # Capture scan_parameters AT THE MOMENT get_img_fname is called.
+    h.get_img_fname = lambda: seen.append(list(h.scan_parameters))
+
+    h.set_meta_ext()
+
+    assert h.meta_ext == "pdi"
+    assert seen == [[]]              # params were cleared before the re-read
+    assert h.scan_parameters == []
+
+
+def test_get_img_fname_no_sidecar_clears_counters_and_refreshes_bg(tmp_path):
+    """F4: when a format/source switch resolves a file with NO metadata sidecar,
+    get_img_fname clears scan_parameters, motors AND counters, and refreshes the
+    GI motor + BG Match + norm-channel dropdowns — so none keeps the previous
+    format's stale columns."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    img = tmp_path / "scan_0001.tif"
+    img.write_bytes(b"x")
+
+    class _P:
+        def __init__(self, v):
+            self._v = v
+        def value(self):
+            return self._v
+
+    signal = {"File": _P(str(img))}
+    params = SimpleNamespace(
+        child=lambda name: SimpleNamespace(child=lambda n: signal[n]))
+
+    called = []
+    h = SimpleNamespace(
+        inp_type="Image Series",
+        img_file="",
+        meta_ext="pdi",                 # truthy, but the file has no .pdi sidecar
+        scan_parameters=["th", "i0"],   # stale, from the previous format
+        motors=["th"],                  # stale
+        counters=["i0", "mon"],         # stale
+        parameters=params,
+    )
+    h._sync_meta_ext_to_img_ext = lambda: None
+    h.exists_meta_file = lambda *_a: False   # force the no-sidecar branch
+    h.set_gi_motor_options = lambda: called.append("gi")
+    h.set_bg_matching_options = lambda: called.append("bg_match")
+    h.set_bg_norm_options = lambda: called.append("bg_norm")
+    h.get_img_fname = MethodType(imageWrangler.get_img_fname, h)
+
+    h.get_img_fname()
+
+    assert h.scan_parameters == []
+    assert h.motors == []
+    assert h.counters == []                       # F4: counters cleared too
+    assert called == ["gi", "bg_match", "bg_norm"]  # all three dropdowns refreshed
 
 
 def test_data_changed_tolerates_non_integer_labels():
@@ -1950,7 +2336,7 @@ def _update_smoke_host():
     host.ui.imageUnit.currentIndex.return_value = 0
     host.ui.plotMethod.currentText.return_value = 'Single'
     for name in ('get_idxs', '_note_selection_generation', '_bump_display_generation',
-                 '_live_mode', '_live_display_state',
+                 '_live_mode', '_active_stitch_mode', '_live_display_state',
                  '_current_image_axis_key', '_plot_axis_key',
                  '_share_axis_plot_index', '_set_plot_unit_index_silently',
                  '_apply_share_axis_state',
@@ -2351,7 +2737,7 @@ def test_live_display_state_render_ids_match_legacy_idxs():
                              frames=SimpleNamespace(index=[0, 1]), gi=False),
         ui=SimpleNamespace(plotMethod=SimpleNamespace(currentText=lambda: 'Single')),
     )
-    for name in ('_live_mode', '_live_display_state'):
+    for name in ('_live_mode', '_active_stitch_mode', '_live_display_state'):
         setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
 
     state = host._live_display_state()
@@ -2406,7 +2792,6 @@ def test_enter_viewer_mode_cleanup_clears_lists_and_cancels_loader():
     assert viewer.data_1d == {}
     assert viewer.data_2d == {}
     assert viewer.frame_ids == []
-    assert viewer._raw_cache_order == []
     assert viewer.latest_idx is None
     assert viewer.new_scan_loaded is False
     assert list_data.count() == 0
@@ -2504,6 +2889,10 @@ def test_viewer_mode_change_blocks_scan_list_autoload():
     widget = SimpleNamespace(
         wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out", tree=_FakeControl()),
         _apply_integration_control_state=lambda: None,
+        # _on_viewer_mode_changed refreshes the (optional) Controls Panel v2
+        # profile at the end; no v2 panel on this host, so it is a no-op.
+        _refresh_controls_v2_profile=lambda *a, **k: None,
+        _fit_controls_height=lambda *a, **k: None,
         h5viewer=SimpleNamespace(
             ui=SimpleNamespace(listScans=list_scans),
             actionNewFile=_FakeAction(),
@@ -2549,6 +2938,10 @@ def test_viewer_mode_tree_disable_only_for_file_viewers():
     widget = SimpleNamespace(
         wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out", tree=_FakeControl()),
         _apply_integration_control_state=lambda: None,
+        # _on_viewer_mode_changed refreshes the (optional) Controls Panel v2
+        # profile at the end; no v2 panel on this host, so it is a no-op.
+        _refresh_controls_v2_profile=lambda *a, **k: None,
+        _fit_controls_height=lambda *a, **k: None,
         h5viewer=SimpleNamespace(
             ui=SimpleNamespace(listScans=list_scans),
             actionNewFile=_FakeAction(),
@@ -2589,6 +2982,10 @@ def test_leaving_viewer_mode_clears_stale_global_mask():
     widget = SimpleNamespace(
         wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out", tree=_FakeControl()),
         _apply_integration_control_state=lambda: None,
+        # _on_viewer_mode_changed refreshes the (optional) Controls Panel v2
+        # profile at the end; no v2 panel on this host, so it is a no-op.
+        _refresh_controls_v2_profile=lambda *a, **k: None,
+        _fit_controls_height=lambda *a, **k: None,
         h5viewer=SimpleNamespace(
             ui=SimpleNamespace(listScans=list_scans),
             actionNewFile=_FakeAction(),
@@ -2664,6 +3061,10 @@ def test_viewer_mode_keeps_explicit_open_folder():
     widget = SimpleNamespace(
         wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out", tree=_FakeControl()),
         _apply_integration_control_state=lambda: None,
+        # _on_viewer_mode_changed refreshes the (optional) Controls Panel v2
+        # profile at the end; no v2 panel on this host, so it is a no-op.
+        _refresh_controls_v2_profile=lambda *a, **k: None,
+        _fit_controls_height=lambda *a, **k: None,
         h5viewer=SimpleNamespace(
             ui=SimpleNamespace(listScans=list_scans),
             actionNewFile=_FakeAction(),
@@ -5241,10 +5642,9 @@ def test_image_viewer_raw_cache_evicts_reloadable_unselected_rows():
 def test_hydrated_raw_cache_reset_clears_order():
     data_2d = _AttrDict()
     data_2d._hydrated_raw_order = [1, 2, 3]
-    viewer = SimpleNamespace(_raw_cache_order=[1, 2, 3], data_2d=data_2d)
+    viewer = SimpleNamespace(data_2d=data_2d)
     viewer._clear_raw_cache = MethodType(H5Viewer._clear_raw_cache, viewer)
     viewer._clear_raw_cache()
-    assert viewer._raw_cache_order == []
     assert _hydrated_order(data_2d) == []
 
 
@@ -5322,6 +5722,10 @@ def _wrangler_host(mode_text, *, live=False, batch=False):
         # A loaded PONI by default so the start() input-gate (BUG-1) passes;
         # tests that exercise the gate set ``host.poni = None`` explicitly.
         poni=object(),
+        # A non-empty image source so the readiness gate's img_file check
+        # (added with the processed-.nxs-rerun readiness work) also passes by
+        # default; gate-exercising tests override this explicitly.
+        img_file='/tmp/scan_0001.tif',
         live_mode=live,
         batch_mode=batch,
         xye_only=False,
@@ -5342,6 +5746,8 @@ def _wrangler_host(mode_text, *, live=False, batch=False):
     )
     host._on_mode_changed = MethodType(imageWrangler._on_mode_changed, host)
     host._apply_disclosure = MethodType(imageWrangler._apply_disclosure, host)
+    host._adopt_loaded_scan_run_inputs = MethodType(
+        imageWrangler._adopt_loaded_scan_run_inputs, host)
     host.start = MethodType(imageWrangler.start, host)
     host._inputs_valid = MethodType(imageWrangler._inputs_valid, host)
     # Phase B: the action-button morph helper + its state, used by enabled()/
@@ -5366,10 +5772,11 @@ def test_wrangler_enabled_reapplies_viewer_mode_controls():
         assert host.ui.liveCheckBox.isChecked() is False
         assert host.ui.liveCheckBox.isEnabled() is False
         assert host.ui.batchCheckBox.isEnabled() is False
-        # Viewer modes now DISABLE the run row rather than hiding it (a hidden row
-        # left an ugly empty box) -- visible but greyed.
-        assert host.ui.frame.isVisible() is True
-        assert host.ui.frame.isEnabled() is False
+        if mode in ("Image Viewer", "XYE Viewer"):
+            assert host.ui.frame.isVisible() is False
+        else:
+            assert host.ui.frame.isVisible() is True
+            assert host.ui.frame.isEnabled() is False
         assert host._integration_controls_enabled is False
         assert host.thread.live_mode is False
         assert host.tree.isEnabled() is True   # Project/Save Path stay usable
@@ -5420,7 +5827,7 @@ def test_wrangler_enabled_run_end_reenables_mode_toggles():
     assert host.ui.frame.isVisible() is True
     assert host._integration_controls_enabled is True
     # Action button reset to green Start (idle).
-    assert host.ui.startButton.text() == "Start"
+    assert host.ui.startButton.text() == "▶ Run"
     assert host.ui.startButton.property("runPhase") == "idle"
     assert host._run_phase == "idle"
 
@@ -5442,7 +5849,7 @@ def test_start_click_honors_live_toggle_and_morphs_to_pause():
     assert host.ui.stopButton.isEnabled() is True
     assert host.sigStart.emitted == [()]
     # The action button morphed to orange 'Pause'.
-    assert host.ui.startButton.text() == "Pause"
+    assert host.ui.startButton.text() == "❚❚ Pause"
     assert host.ui.startButton.property("runPhase") == "active"
     assert host._run_phase == "running"
 
@@ -5460,14 +5867,14 @@ def test_start_pause_resume_button_state_machine():
 
     imageWrangler._on_start_clicked(host)      # running -> pause
     assert host.command == "pause" and host.thread.command == "pause"
-    assert host.ui.startButton.text() == "Pausing…"   # transient until sigPaused
+    assert host.ui.startButton.text() == "❚❚ Pausing…"   # transient until sigPaused
 
     imageWrangler._on_paused(host)             # worker confirms paused
-    assert host._run_phase == "paused" and host.ui.startButton.text() == "Resume"
+    assert host._run_phase == "paused" and host.ui.startButton.text() == "▶ Resume"
 
     imageWrangler._on_start_clicked(host)      # paused -> resume
     assert host.command == "start" and host.thread.command == "start"
-    assert host._run_phase == "running" and host.ui.startButton.text() == "Pause"
+    assert host._run_phase == "running" and host.ui.startButton.text() == "❚❚ Pause"
     assert host.sigResuming.emitted == [()]    # guard re-engaged before resume
 
 
@@ -5483,11 +5890,11 @@ def test_stop_during_pausing_ignores_late_sigpaused():
     imageWrangler._on_start_clicked(host)      # running
     imageWrangler._on_start_clicked(host)      # -> pause ('Pausing…')
     imageWrangler.stop(host)                   # Stop lands during 'Pausing…'
-    assert host.ui.startButton.text() == "Start"     # morphed back to green
+    assert host.ui.startButton.text() == "▶ Run"     # morphed back to green
     assert host._run_phase == "idle"
 
     imageWrangler._on_paused(host)             # late queued sigPaused arrives
-    assert host.ui.startButton.text() == "Start"     # NOT flashed to 'Resume'
+    assert host.ui.startButton.text() == "▶ Run"     # NOT flashed to 'Resume'
     assert host._run_phase == "idle"
 
 
@@ -5504,7 +5911,7 @@ def test_redispatch_during_pausing_is_noop():
     host.thread.command = "sentinel"           # detect any spurious command write
     imageWrangler._on_start_clicked(host)      # re-dispatch while 'pausing'
     assert host.thread.command == "sentinel"   # no-op: no pause()/start() fired
-    assert host.ui.startButton.text() == "Pausing…"
+    assert host.ui.startButton.text() == "❚❚ Pausing…"
 
 
 def test_start_without_poni_is_gated():
@@ -5519,6 +5926,45 @@ def test_start_without_poni_is_gated():
 
     assert host.sigStart.emitted == []          # did not start
     assert getattr(host, "command", None) != "start"
+
+
+def test_start_guard_adopts_processed_scan_cached_poni_but_requires_source(tmp_path):
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    source = tmp_path / "raw_0001.tif"
+    source.write_bytes(b"placeholder")
+    cached_poni = object()
+
+    class Frames:
+        index = [1]
+
+        def __getitem__(self, idx):
+            return SimpleNamespace(
+                source_file=str(source),
+                _resolved_source_path=lambda: str(source),
+            )
+
+    host = _wrangler_host("Int 2D", live=False, batch=False)
+    host.poni = None
+    host.img_file = ""
+    host.img_dir = ""
+    host.img_ext = ""
+    messages = []
+    host.ui.specLabel.setText = messages.append
+    host.scan._cached_poni = cached_poni
+    # A reloaded scan with usable calibration also restores a pixel-bearing
+    # integrator (both-or-neither: _restore_calibration_from_group sets both or
+    # returns False); the generic-detector readiness guard requires it.
+    host.scan._cached_integrator = object()
+    host.scan.frames = Frames()
+
+    assert imageWrangler._inputs_valid(host) is False
+    assert host.poni is cached_poni
+    assert host.thread.poni is cached_poni
+    assert host.img_file == ""
+    assert host.img_dir == ""
+    assert host.img_ext == ""
+    assert "Choose an image source" in messages[-1]
 
 
 def test_active_run_locks_modes_but_keeps_action_button_enabled():
@@ -5761,6 +6207,7 @@ def test_batch_process_scan_dispatches_each_frame_as_read():
         initialize_scan=make_scan,
         get_background=lambda *_: 0.0,
         _flush_xye_buffer=lambda *_args, **_kw: None,
+        _save_due=lambda scan, force=False: False,   # frames=0 -> nothing due
     )
 
     def dispatch(scan, pending, *, force_save=False):
@@ -5768,6 +6215,10 @@ def test_batch_process_scan_dispatches_each_frame_as_read():
         return len(pending)
 
     host._dispatch_batch = dispatch
+    # run()'s final-flush tail now always calls flush_serial_tail (the gate is
+    # inside it); bind it + the bracket on the stand-in.
+    host.flush_serial_tail = MethodType(imageThread.flush_serial_tail, host)
+    host._h5pool_bracket = MethodType(imageThread._h5pool_bracket, host)
 
     MethodType(imageThread.process_scan, host)()
 
@@ -5795,3 +6246,139 @@ def test_batch_single_frame_still_routes_to_streaming_when_live_policy_serial():
 
     assert MethodType(imageThread._dispatch_batch, host)(object(), pending) == 1
     assert calls == [("streaming", (1,))]
+
+
+def test_series_average_pending_tracks_running_mean():
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+
+    host = SimpleNamespace(series_average=True)
+    pending = []
+    entries = [
+        ("scan_0001.tif", 1, np.full((2, 2), 2.0), {"th": "1.0", "tag": "a"}, 4.0, 0.1),
+        ("scan_0002.tif", 2, np.full((2, 2), 4.0), {"th": "3.0", "tag": "b"}, 8.0, 0.2),
+        ("scan_0003.tif", 3, np.full((2, 2), 9.0), {"th": "5.0", "tag": "c"}, 11.0, 0.3),
+    ]
+    count = 0
+
+    for entry in entries:
+        count = imageThread._append_series_average_pending(
+            host, pending, entry, count)
+
+    assert count == 3
+    assert len(pending) == 1
+    img_file, img_number, img_data, img_meta, bg_raw, t_read = pending[0]
+    assert img_file == "scan_0003.tif"
+    assert img_number == 1
+    np.testing.assert_allclose(img_data, np.full((2, 2), 5.0))
+    assert img_meta["th"] == pytest.approx(3.0)
+    assert img_meta["tag"] == "a"
+    assert bg_raw == pytest.approx(23.0 / 3.0)
+    assert t_read == pytest.approx(0.6)
+
+
+def test_streaming_dispatch_series_average_submits_one_mean_frame(monkeypatch):
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+    from xdart.modules.live import LiveScan
+    from xdart.modules.reduction import StandardPlanCache
+    from xrd_tools.reduction import Integration1DPlan, ReductionPlan
+    import xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread as module
+
+    submitted = []
+    opened = []
+    registered = []
+
+    class FakeSession:
+        is_paused = False
+        is_running = True
+
+        def submit(self, frame):
+            submitted.append(frame)
+            return True
+
+        def pause(self, timeout=None):
+            return True
+
+        def flush(self, force=False):
+            pass
+
+        def resume(self):
+            pass
+
+    class FakeSink:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def register(self, live):
+            registered.append(live)
+
+        def unregister(self, idx):
+            pass
+
+    def fake_open(frames, *args, **kwargs):
+        opened.append(list(frames))
+        return FakeSession()
+
+    monkeypatch.setattr(module, "open_live_scan_session", fake_open)
+    monkeypatch.setattr(module, "QtNexusSink", FakeSink)
+
+    scan = LiveScan(
+        "scan",
+        frames=[],
+        static=True,
+        series_average=True,
+        detector_shape=(2, 2),
+    )
+    scan.skip_2d = True
+    scan._cached_integrator = SimpleNamespace(
+        USE_LEGACY_MASK_NORMALIZATION=False)
+    scan.bai_1d_args = {"numpoints": 5}
+    scan.bai_2d_args = {}
+    host = SimpleNamespace(
+        max_cores=1,
+        gi=False,
+        incidence_motor="",
+        sample_orientation=4,
+        tilt_angle=0.0,
+        series_average=True,
+        mask=None,
+        poni=None,
+        command="",
+        batch_mode=True,
+        _plan_cache=StandardPlanCache(
+            plan_builder=lambda _scan, **_kw: ReductionPlan(
+                integration_1d=Integration1DPlan(npt=5)
+            )
+        ),
+        _streaming_session=None,
+        _streaming_sink=None,
+        _streaming_scan_id=None,
+        _scan_session_adapter=None,
+        max_cores_count=1,
+        _cached_gi_incident_angle=None,
+        showLabel=SimpleNamespace(emit=lambda *_: None),
+        _wait_if_paused=lambda: None,
+        _prewarm_frame_mask=lambda _scan, _img: None,
+        _apply_threshold_inline=lambda img: img,
+        _resolve_frame_mask=lambda _scan, _img: None,
+        _gi_freeze_whole_scan_prepass=lambda _scan: True,
+        _cancel_token=lambda: None,
+    )
+    for name in ("_build_batch_frames", "_dispatch_batch_streaming",
+                 "_get_streaming_session"):
+        setattr(host, name, MethodType(getattr(imageThread, name), host))
+
+    pending = [
+        ("scan_0001.tif", 1, np.full((2, 2), 2.0), {"th": "1.0"}, 0.0, 0.1),
+        ("scan_0002.tif", 2, np.full((2, 2), 4.0), {"th": "3.0"}, 0.0, 0.1),
+        ("scan_0003.tif", 3, np.full((2, 2), 9.0), {"th": "5.0"}, 0.0, 0.1),
+    ]
+
+    count = host._dispatch_batch_streaming(scan, pending)
+
+    assert count == 1
+    assert len(opened) == 1
+    assert len(opened[0]) == 1
+    assert len(registered) == 1
+    assert len(submitted) == 1
+    np.testing.assert_allclose(submitted[0].image, np.full((2, 2), 5.0))
+    assert submitted[0].metadata["th"] == pytest.approx(3.0)

@@ -32,6 +32,12 @@ from xrd_tools.reduction.core import (
     prepare_gi_freeze,
     run_reduction,
 )
+from xrd_tools.core.strictness import (
+    GIAllDummyError,
+    MissingNormalizationError,
+    StrictnessError,
+    StrictPolicy,
+)
 
 __all__ = [
     "CancelToken",
@@ -59,4 +65,8 @@ __all__ = [
     "XYESink",
     "prepare_gi_freeze",
     "run_reduction",
+    "StrictPolicy",
+    "StrictnessError",
+    "MissingNormalizationError",
+    "GIAllDummyError",
 ]

@@ -8,8 +8,37 @@ import logging
 import os
 import time
 import math
+import warnings
+from queue import Empty
 
 logger = logging.getLogger(__name__)
+
+_ORPHANED_FILE_THREADS = []
+
+
+def _retain_orphaned_file_thread(thread) -> None:
+    """Keep a slow fileHandlerThread alive until it exits.
+
+    Qt aborts if a QThread wrapper is destroyed while the native thread is
+    still running.  Close normally waits for the persistent file thread, but a
+    slow HDF5 read can outlive that bounded wait.  Retaining the Python wrapper
+    prevents teardown from deleting it; the already-queued sentinel lets it exit
+    after the current task.
+    """
+    if thread in _ORPHANED_FILE_THREADS:
+        return
+    _ORPHANED_FILE_THREADS.append(thread)
+
+    def _forget_thread():
+        try:
+            _ORPHANED_FILE_THREADS.remove(thread)
+        except ValueError:
+            pass
+
+    try:
+        thread.finished.connect(_forget_thread)
+    except Exception:
+        pass
 
 # This module imports
 import re
@@ -68,7 +97,6 @@ QItemSelectionModel = QtCore.QItemSelectionModel
 
 def _clear_raw_cache_for(viewer) -> None:
     """Reset hydrated-raw LRU state on real and lightweight test viewers."""
-    viewer._raw_cache_order = []        # legacy per-viewer state (pre-D5)
     data_2d = getattr(viewer, "data_2d", None)
     if data_2d is not None:
         clear_hydrated_raw(data_2d)
@@ -453,17 +481,22 @@ class H5Viewer(QWidget):
         self._apply_frames_panel_width(None)
 
     def _add_refresh_button(self):
-        """Add a Refresh button to the left of Show All / Auto Last.
+        """Place Refresh in the DATA BROWSER header (top-right), per the redesign.
 
-        It re-reads the current directory listing (``update_scans``) — handy in
-        Image/XYE Viewer modes where new files may be written outside xdart
-        while a run is in progress.  The three buttons are reflowed into one
-        row so Refresh sits to the left of the existing two.
+        Refresh re-reads the current directory listing (``update_scans``) — handy
+        in Image/XYE Viewer modes where new files may be written outside xdart
+        while a run is in progress.  The mockup puts it on the right of a header
+        row above the lists; the bottom row then holds Show All / Auto Last /
+        Metadata.
         """
         self.ui.refresh = QtWidgets.QPushButton('Refresh')
         self.ui.refresh.setObjectName('refresh')
         self.ui.refresh.setMaximumSize(QtCore.QSize(16777215, 25))
+        # Refresh is placed on the RIGHT of the DATA BROWSER header row (built in
+        # _init_toolbar, below the File/Config toolbar).  The bottom row below the
+        # lists holds Show All / Auto Last / Metadata.
 
+        # Bottom button row: Show All / Auto Last / Metadata (Refresh removed).
         btn_row = QtWidgets.QWidget()
         # Constrain the row to the button height so it doesn't steal vertical
         # stretch from the lists splitter above (which would leave the buttons
@@ -479,9 +512,15 @@ class H5Viewer(QWidget):
         # Move the existing buttons out of the grid into the row.
         self.ui.gridLayout.removeWidget(self.ui.show_all)
         self.ui.gridLayout.removeWidget(self.ui.auto_last)
-        btn_layout.addWidget(self.ui.refresh)
         btn_layout.addWidget(self.ui.show_all)
         btn_layout.addWidget(self.ui.auto_last)
+        # Stage 4 (Direction A): the frame-metadata table is no longer inline in
+        # the bottom-left — this button opens it as an on-demand popup (wired in
+        # staticWidget._connect_signals -> _open_metadata_dialog).
+        self.ui.metadata_btn = QtWidgets.QPushButton('Metadata ▾')
+        self.ui.metadata_btn.setObjectName('metadata_btn')
+        self.ui.metadata_btn.setMaximumSize(QtCore.QSize(16777215, 25))
+        btn_layout.addWidget(self.ui.metadata_btn)
         self.ui.gridLayout.addWidget(btn_row, 3, 0, 1, 2)
 
     def refresh_directory(self):
@@ -537,19 +576,45 @@ class H5Viewer(QWidget):
         self.fileMenu.addAction(self.actionSaveDataAs)
         self.fileMenu.addMenu(self.exportMenu)
 
-        # Toolbar buttons
+        # Toolbar buttons.  objectName'd so the theme can suppress the oversized
+        # QToolButton menu-indicator arrow (themes/dark.py).
         self.fileButton = QtWidgets.QToolButton()
+        self.fileButton.setObjectName('fileMenuButton')
         self.fileButton.setText('File')
         self.fileButton.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         self.fileButton.setMenu(self.fileMenu)
         self.paramButton = QtWidgets.QToolButton()
+        self.paramButton.setObjectName('configMenuButton')
         self.paramButton.setText('Config')
         self.paramButton.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         self.paramButton.setMenu(self.paramMenu)
 
         self.toolbar.addWidget(self.fileButton)
         self.toolbar.addWidget(self.paramButton)
-        self.layout.addWidget(self.toolbar, 0, 0, 1, 2)
+
+        # DATA BROWSER header row, sitting just BELOW the File/Config toolbar: a
+        # section title on the left, Refresh on the right.  Stacked with the
+        # toolbar inside one wrapper so the pair occupies grid row 0 together
+        # (no renumbering of the Scans/Data labels + lists below).
+        self.dataBrowserBar = QtWidgets.QFrame()
+        self.dataBrowserBar.setObjectName('dataBrowserBar')
+        _db = QtWidgets.QHBoxLayout(self.dataBrowserBar)
+        _db.setContentsMargins(2, 0, 0, 0)
+        _db.setSpacing(6)
+        self.dataBrowserHeader = QtWidgets.QLabel('DATA BROWSER')
+        self.dataBrowserHeader.setObjectName('dataBrowserHeader')
+        _db.addWidget(self.dataBrowserHeader)
+        _db.addStretch(1)
+        if hasattr(self.ui, 'refresh'):
+            _db.addWidget(self.ui.refresh)
+
+        header = QtWidgets.QWidget()
+        _hdr = QtWidgets.QVBoxLayout(header)
+        _hdr.setContentsMargins(0, 0, 0, 0)
+        _hdr.setSpacing(2)
+        _hdr.addWidget(self.toolbar)
+        _hdr.addWidget(self.dataBrowserBar)
+        self.layout.addWidget(header, 0, 0, 1, 2)
 
     def _connect_signals(self):
         """Wire signal/slot connections for list widgets and menu actions."""
@@ -612,7 +677,12 @@ class H5Viewer(QWidget):
             self.data_changed()
 
     def _init_file_thread(self):
-        """Create and start the background file handler thread."""
+        """Create the background file handler thread.
+
+        The thread starts lazily on the first queued file operation.  A fresh
+        Controls/Viewer widget should not carry an idle QThread while the rest
+        of the Qt tree is still being constructed.
+        """
         self.file_thread = fileHandlerThread(self.scan, self.frame,
                                              self.file_lock,
                                              frame_ids=self.frame_ids,
@@ -623,7 +693,7 @@ class H5Viewer(QWidget):
         self.file_thread.sigTaskDone.connect(self.thread_finished)
         self.file_thread.sigNewFile.connect(self.sigNewFile.emit)
         self.file_thread.sigUpdate.connect(self.sigUpdate.emit)
-        self.file_thread.start(Qt.QtCore.QThread.LowPriority)
+        self._file_thread_shutdown = False
         self._h5pool = get_pool()
         # M1: handle for the per-selection LoadFramesWorker.  None
         # when no load is in flight.  Owns a QThread that gets
@@ -639,7 +709,6 @@ class H5Viewer(QWidget):
         self._load_generation = 0
         # Keep only a small working set of hydrated detector arrays. Reduced
         # results and thumbnails stay cached for every loaded frame.
-        self._raw_cache_order = []
         self._raw_cache_limit = 8
         # O6: coalesce ``sigUpdate`` emits while a chunk burst is
         # streaming in from ``_LoadFramesWorker``.  Without this, a
@@ -654,6 +723,17 @@ class H5Viewer(QWidget):
         self._update_coalesce_timer = Coalescer(100, mode="debounce",
                                                 parent=self)
         self._update_coalesce_timer.triggered.connect(self.sigUpdate.emit)
+
+    def _ensure_file_thread_running(self) -> None:
+        """Start the persistent file loader on first real file operation."""
+        ft = getattr(self, "file_thread", None)
+        if ft is None or getattr(self, "_file_thread_shutdown", False):
+            return
+        try:
+            if not ft.isRunning():
+                ft.start(Qt.QtCore.QThread.LowPriority)
+        except RuntimeError:
+            logger.debug("file_thread could not be started", exc_info=True)
         
     def load_starting_defaults(self):
         default_path = os.path.join(utils.get_config_dir(), "last_defaults.json")
@@ -819,7 +899,7 @@ class H5Viewer(QWidget):
             lw.item(count - 1).text() if count > 0 else None
         )
 
-    def update_data(self, emit_update=True):
+    def update_data(self, emit_update=True, *, force_rebuild: bool = False):
         """Updates list with all frame ids.
 
         Fast paths in order of likelihood for a live scan:
@@ -872,7 +952,8 @@ class H5Viewer(QWidget):
         # the last GUI flush.  Verify only the cached boundary instead of
         # rebuilding and comparing the full list every 200 ms.
         current_count = lw.count()
-        if (current_count >= 1
+        if (not force_rebuild
+                and current_count >= 1
                 and len(frame_index) > current_count
                 and not self.new_scan_loaded):
             current_last = lw.item(current_count - 1).text()
@@ -899,7 +980,7 @@ class H5Viewer(QWidget):
         _idxs = [str(i) for i in frame_index]
         items = [lw.item(x).text() for x in range(lw.count())]
 
-        if _idxs == items:
+        if not force_rebuild and _idxs == items:
             if self.new_scan_loaded:
                 self.new_scan_loaded = False
                 self.ui.listData.setCurrentRow(-1)
@@ -927,7 +1008,8 @@ class H5Viewer(QWidget):
         #   - the listWidget isn't empty (clear+insert is cheaper for
         #     small N anyway, and avoids fiddling with first-load
         #     selection semantics).
-        if (len(items) >= 1
+        if (not force_rebuild
+                and len(items) >= 1
                 and len(_idxs) > len(items)
                 and _idxs[: len(items)] == items
                 and not self.new_scan_loaded):
@@ -1907,7 +1989,7 @@ class H5Viewer(QWidget):
             with self.data_lock:
                 self.data_2d[int(frame_id)] = {
                     'map_raw': img_data,
-                    'bg_raw': np.zeros_like(img_data),
+                    'bg_raw': 0,
                     'mask': None,
                     'int_2d': None,
                     'gi_2d': {},
@@ -1974,7 +2056,7 @@ class H5Viewer(QWidget):
             scan_info = {'source_file': os.path.basename(fpath)}
             self.data_2d[int(frame_id)] = {
                 'map_raw': img_data,
-                'bg_raw': np.zeros_like(img_data),
+                'bg_raw': 0,
                 'mask': None,
                 'int_2d': None,
                 'gi_2d': {},
@@ -2074,6 +2156,7 @@ class H5Viewer(QWidget):
                 self._remember_displayed_frames()
                 # self.set_open_enabled(False)
                 self.file_thread.fname = fname
+                self._ensure_file_thread_running()
                 self.file_thread.queue.put("set_datafile")
                 self.ui.listData.itemSelectionChanged.connect(self.data_changed)
                 self.new_scan = True
@@ -2222,7 +2305,7 @@ class H5Viewer(QWidget):
     def closeEvent(self, event):
         # Retire any in-flight load worker before teardown so the interpreter
         # doesn't GC-delete a still-running moveToThread'd QObject at shutdown.
-        self._teardown_load_worker()
+        self.shutdown_threads()
         self._h5pool.close_all()
         super().closeEvent(event)
 
@@ -2295,6 +2378,7 @@ class H5Viewer(QWidget):
         fname, _ = QFileDialog.getSaveFileName()
         with self.file_thread.lock:
             self.file_thread.new_fname = fname
+            self._ensure_file_thread_running()
             self.file_thread.queue.put("save_data_as")
         self.set_file(fname)
     
@@ -2560,9 +2644,41 @@ class H5Viewer(QWidget):
         ft = getattr(self, 'file_thread', None)
         if ft is not None:
             try:
+                self._file_thread_shutdown = True
+                # No stale file loads should run after close.  Drain queued
+                # work first, then append one sentinel so the thread exits
+                # after its current task (or immediately if idle).
+                queue = getattr(ft, 'queue', None)
+                if queue is not None:
+                    while True:
+                        try:
+                            queue.get_nowait()
+                        except Empty:
+                            break
+                for signal_name in (
+                    "sigTaskStarted", "sigTaskDone", "sigNewFile", "sigUpdate",
+                ):
+                    signal = getattr(ft, signal_name, None)
+                    if signal is not None:
+                        try:
+                            with warnings.catch_warnings():
+                                warnings.simplefilter("ignore", RuntimeWarning)
+                                signal.disconnect()
+                        except Exception:
+                            pass
+                try:
+                    ft.live_run = False
+                    ft.no_nxs = False
+                except Exception:
+                    pass
+                if queue is not None:
+                    queue.put(None)              # sentinel -> run() breaks
                 if ft.isRunning():
-                    ft.queue.put(None)           # sentinel -> run() breaks
-                    ft.wait(2000)                # bounded wait
+                    if not ft.wait(10000):       # bounded wait
+                        logger.warning(
+                            "file_thread still running after shutdown wait; "
+                            "keeping QThread handle until it exits")
+                        _retain_orphaned_file_thread(ft)
             except Exception:
                 logger.debug("file_thread shutdown failed", exc_info=True)
 

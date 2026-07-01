@@ -154,7 +154,8 @@ def read_image(
     Parameters
     ----------
     path : path-like
-        Image file. Supported: EDF, TIFF, CBF, raw binary, HDF5 (NeXus/Eiger).
+        Image file. Supported: EDF, TIFF, CBF, raw binary, HDF5 (NeXus/Eiger),
+        NPY (saved NumPy array, e.g. a mask).
     frame : int
         Frame index for multi-frame files. Ignored for single-frame files.
     rotation : int
@@ -189,7 +190,13 @@ def read_image(
     # Resolve detector shape: explicit tuple wins, then detector name lookup
     shape = detector_shape or resolve_detector_shape(detector)
 
-    if ext in {".h5", ".hdf5"} and _is_eiger_master(path):
+    if ext == ".npy":
+        # Saved NumPy array (e.g. a boolean/integer mask).  fabio can't open
+        # these, so load directly; index a stacked array by frame.
+        arr = np.load(path)
+        if arr.ndim > 2:
+            arr = arr[frame]
+    elif ext in {".h5", ".hdf5"} and _is_eiger_master(path):
         # Eiger master files — fabio handles external data-file linking
         arr = _read_fabio_frame(path, frame)
     elif ext in {".h5", ".hdf5", ".nxs"}:

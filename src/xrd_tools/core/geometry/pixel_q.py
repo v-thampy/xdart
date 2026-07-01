@@ -35,7 +35,10 @@ from typing import Any
 
 import numpy as np
 
-from xrd_tools.core.geometry.diffractometer import DiffractometerConfig
+from xrd_tools.core.geometry.diffractometer import (
+    Diffractometer,
+    DiffractometerConfig,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +238,10 @@ class PixelQMap:
     :mod:`xrd_tools.rsm.pipeline`.
     """
 
-    diff_config: DiffractometerConfig
+    #: the canonical :class:`Diffractometer` (or the legacy
+    #: :class:`DiffractometerConfig` it drop-in-replaces) — both expose
+    #: ``make_hxrd`` + ``init_area_detrot``/``init_area_tiltazimuth``.
+    diff_config: "Diffractometer | DiffractometerConfig"
     header: DetectorHeader
 
     def pixel_q(

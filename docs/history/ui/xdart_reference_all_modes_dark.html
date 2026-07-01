@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xdart redesign — all modes (flat reference, dark)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  /* =========================================================================
+     xdart UI redesign — ALL FOUR MODES, flat reference (DARK theme).
+     Each framed view shows the CENTER panel for one mode: Int 2D, Int 1D,
+     Image Viewer, XYE Viewer. The left Data Browser and the right wrangler are
+     identical across modes — see xdart_reference_dark_int2d.html for those in
+     full (and xdart_reference_light_int2d.html for the light palette).
+     The grey note under each frame says what changes in the RIGHT panel.
+     Fonts: Source Sans 3 (UI) + JetBrains Mono (paths / numbers / axis labels).
+     ========================================================================= */
+  * { box-sizing: border-box; }
+  :root {
+    --win-bg:#21232e; --titlebar:#16171f; --menubar:#1b1d27;
+    --panel:#1e2029; --card:#191b23; --field:#2d3040; --field-border:#3c4052; --border:#2b2e3b;
+    --text:#eef0f7; --text-2:#cfd4e3; --text-3:#9aa0b5; --text-muted:#828799;
+    --accent:#bd93f9; --accent-soft:rgba(189,147,249,.16); --accent-text:#d6c2fb;
+    --plot1d-bg:#eceef2; --plot2d-bg:#0f1118; --gap:#cfd4e3; --grid:#d6d9e0;
+  }
+  body { margin: 0; background: #15161d; font-family: 'Source Sans 3', system-ui, sans-serif; padding: 40px 32px 60px; }
+  input { min-width: 0; font-family: 'JetBrains Mono', monospace; }
+  .wrap { max-width: 920px; margin: 0 auto; }
+  .frame { width: 100%; background: var(--win-bg); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; box-shadow: 0 18px 44px rgba(0,0,0,.3); }
+  .tbar { height: 30px; background: var(--titlebar); display: flex; align-items: center; padding: 0 12px; position: relative; border-bottom: 1px solid var(--border); }
+  .dot { width: 11px; height: 11px; border-radius: 50%; }
+  .tname { position: absolute; left: 0; right: 0; text-align: center; font-size: 12px; font-weight: 600; color: var(--text-3); pointer-events: none; }
+  .center { display: flex; flex-direction: column; height: 520px; background: var(--win-bg); }
+  .toolbar { height: 44px; flex: none; display: flex; align-items: center; gap: 10px; padding: 0 15px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  .chip { display: flex; align-items: center; gap: 6px; background: var(--field); border: 1px solid var(--field-border); border-radius: 6px; padding: 5px 10px; font-size: 12px; font-weight: 500; color: var(--text-2); }
+  .btn { background: var(--field); border: 1px solid var(--field-border); border-radius: 6px; color: var(--text-2); font-size: 12px; font-weight: 500; padding: 6px 12px; cursor: pointer; }
+  .title { flex: 1; text-align: center; font-family: 'JetBrains Mono', monospace; font-size: 13.5px; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 8px; }
+  .seg { display: flex; background: var(--field); border: 1px solid var(--field-border); border-radius: 6px; overflow: hidden; }
+  .seg > span { font-size: 12px; font-weight: 500; padding: 6px 11px; }
+  .slider { width: 120px; height: 4px; border-radius: 2px; background: var(--field-border); position: relative; }
+  .slider > .fill { position: absolute; left: 0; top: 0; bottom: 0; background: var(--accent); border-radius: 2px; }
+  .slider > .knob { position: absolute; top: 50%; transform: translate(-50%,-50%); width: 13px; height: 13px; border-radius: 50%; background: var(--accent); }
+  .ptoolbar { height: 40px; flex: none; display: flex; align-items: center; gap: 8px; padding: 0 15px; background: var(--panel); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); overflow: hidden; }
+  .pchip { display: flex; align-items: center; gap: 5px; background: var(--field); border: 1px solid var(--field-border); border-radius: 6px; padding: 4px 8px; font-size: 11.5px; font-weight: 500; color: var(--text-2); }
+  .pbtn { background: var(--field); border: 1px solid var(--field-border); border-radius: 6px; color: var(--text-2); font-size: 11.5px; font-weight: 500; padding: 4px 9px; cursor: pointer; }
+  .pinput { width: 50px; background: var(--field); border: 1px solid var(--field-border); border-radius: 6px; color: var(--text-2); font-size: 11.5px; font-weight: 500; padding: 4px 6px; text-align: center; font-family: 'JetBrains Mono', monospace; }
+  .autoscale { background: var(--accent-soft); border: 1px solid var(--accent); border-radius: 6px; color: var(--accent-text); font-size: 12px; font-weight: 600; padding: 5px 12px; cursor: pointer; }
+  .ax { transform: rotate(-90deg); font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 500; white-space: nowrap; }
+  .axlabel { text-align: center; font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 500; color: var(--text-muted); padding-top: 5px; }
+  h2 { font-size: 17px; font-weight: 700; color: var(--text); margin: 0 0 4px; }
+  .note { font-size: 13px; line-height: 1.5; color: var(--text-3); margin: 12px 0 0; padding: 11px 14px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+  .note b { color: var(--accent-text); font-weight: 600; }
+  section { margin-bottom: 46px; }
+  .seclabel { font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--accent); margin-bottom: 9px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div style="margin-bottom:34px;">
+    <div class="seclabel">xdart · all modes · dark reference</div>
+    <h2 style="font-size:26px;letter-spacing:-.01em;">The four center-panel modes</h2>
+    <p style="font-size:14px;line-height:1.55;color:var(--text-3);max-width:760px;margin:10px 0 0;">The shell (left Data Browser, right wrangler cards, run dock) is identical across modes — only the top toolbar, the plot area, and which right-panel controls are greyed change. Each frame below shows one mode's center panel; the note says what the right panel does in that mode. Full window + both palettes: see the two <span style="font-family:'JetBrains Mono';color:var(--text-2);">_int2d</span> reference files.</p>
+  </div>
+
+  <!-- ===================== INT 2D ===================== -->
+  <section>
+    <div class="seclabel">Mode 1</div>
+    <h2>Int 2D</h2>
+    <div class="frame">
+      <div class="tbar"><div style="display:flex;gap:7px;"><span class="dot" style="background:#ff5f57;"></span><span class="dot" style="background:#febc2e;"></span><span class="dot" style="background:#28c840;"></span></div><span class="tname">Int 2D</span></div>
+      <div class="center">
+        <!-- toolbar: Norm Channel · Set BG · title · Default/Log -->
+        <div class="toolbar">
+          <div class="chip">Norm Channel <span style="color:var(--accent);font-size:9px;">▾</span></div>
+          <button class="btn">Set BG</button>
+          <div class="title">eiger_S069Ta_redo_eta2p0_1_scan001_55</div>
+          <div class="seg"><span style="color:var(--accent-text);background:var(--accent-soft);">Default</span><span style="color:var(--text-3);border-left:1px solid var(--field-border);">Log</span></div>
+        </div>
+        <!-- plot: detector 2D + caked top, 1-D bottom -->
+        <div style="flex:1;position:relative;min-height:0;">
+          <div style="position:absolute;inset:0;display:flex;flex-direction:column;">
+            <div style="flex:1.05;display:flex;gap:1px;min-height:0;background:var(--border);">
+              <div style="flex:1;background:var(--plot2d-bg);position:relative;display:flex;flex-direction:column;padding:10px 8px 8px 34px;">
+                <div style="position:absolute;left:8px;top:0;bottom:24px;width:22px;display:flex;align-items:center;justify-content:center;"><span class="ax" style="color:var(--text-muted);">y (Pixels)</span></div>
+                <div style="flex:1;border-radius:3px;position:relative;overflow:hidden;background:radial-gradient(120% 120% at 8% 108%, #fde725 0%, #7ad151 9%, #35b779 17%, #21908d 27%, #31688e 40%, #443983 60%, #440154 100%);">
+                  <div style="position:absolute;inset:0;background:repeating-radial-gradient(circle at 8% 108%, transparent 0 26px, rgba(0,0,0,.16) 26px 30px);"></div>
+                  <div style="position:absolute;left:48%;top:0;bottom:0;width:3px;background:var(--gap);opacity:.85;"></div>
+                  <div style="position:absolute;left:0;right:0;top:46%;height:3px;background:var(--gap);opacity:.85;"></div>
+                </div>
+                <div class="axlabel">x (Pixels)</div>
+                <div style="position:absolute;right:9px;top:12px;bottom:30px;width:9px;border-radius:2px;background:linear-gradient(#fde725,#35b779,#31688e,#440154);"></div>
+              </div>
+              <div style="flex:1;background:var(--plot2d-bg);position:relative;display:flex;flex-direction:column;padding:10px 8px 8px 34px;">
+                <div style="position:absolute;left:8px;top:0;bottom:24px;width:22px;display:flex;align-items:center;justify-content:center;"><span class="ax" style="color:var(--text-muted);">χ (°)</span></div>
+                <div style="flex:1;border-radius:3px;position:relative;overflow:hidden;background:#3a2f63;">
+                  <div style="position:absolute;inset:0;background:linear-gradient(90deg,#2a1a4a,#3a2f63 40%,#2f2557 70%,#241640);"></div>
+                  <div style="position:absolute;inset:0;background:repeating-linear-gradient(90deg, transparent 0 30px, rgba(126,209,81,.55) 31px 34px, transparent 34px 64px);"></div>
+                  <div style="position:absolute;inset:0;background:repeating-linear-gradient(90deg, transparent 0 52px, rgba(53,183,121,.4) 52px 55px, transparent 55px 104px);"></div>
+                  <div style="position:absolute;left:62%;top:38%;width:9px;height:9px;border-radius:50%;background:#fde725;box-shadow:0 0 9px 3px rgba(253,231,37,.6);"></div>
+                </div>
+                <div class="axlabel">Q (Å⁻¹)</div>
+                <div style="position:absolute;right:9px;top:12px;bottom:30px;width:9px;border-radius:2px;background:linear-gradient(#fde725,#35b779,#31688e,#440154);"></div>
+              </div>
+            </div>
+            <div class="ptoolbar">
+              <div class="pchip" style="font-family:'JetBrains Mono',monospace;">Q (Å⁻¹) <span style="color:var(--accent);font-size:8px;">▾</span></div>
+              <button class="pbtn">χ Range</button>
+              <input class="pinput" value="0.00"/>
+              <input class="pinput" style="width:54px;" value="10.00"/>
+              <div class="pchip">Single <span style="color:var(--accent);font-size:8px;">▾</span></div>
+              <button class="pbtn">Options</button>
+              <button class="pbtn">Legend</button>
+              <button class="pbtn">Clear</button>
+              <span style="flex:1;"></span>
+              <button class="pbtn">Share Axis</button>
+              <div class="pchip">Q-χ <span style="color:var(--accent);font-size:8px;">▾</span></div>
+            </div>
+            <div style="flex:1;background:var(--plot1d-bg);position:relative;display:flex;flex-direction:column;padding:10px 12px 6px 40px;min-height:0;">
+              <div style="position:absolute;left:10px;top:0;bottom:22px;width:24px;display:flex;align-items:center;justify-content:center;"><span class="ax" style="color:#5a5e6c;">I (a.u.)</span></div>
+              <div style="flex:1;position:relative;">
+                <svg viewBox="0 0 100 100" preserveAspectRatio="none" style="position:absolute;inset:0;width:100%;height:100%;">
+                  <defs><pattern id="g2d" width="11.1" height="20" patternUnits="userSpaceOnUse"><path d="M0 0 V100 M0 0 H100" stroke="var(--grid)" stroke-width="0.3"/></pattern></defs>
+                  <rect width="100" height="100" fill="url(#g2d)"/>
+                  <polyline points="2,93 28,92 33,91 36,40 37,9 38,40 40,90 41,88 44,89 50,88 52,62 53,78 54,88 62,87 64,71 66,86 73,85 74,81 76,85 82,84 83,80 85,84 90,84 91,82 93,84 98,85" fill="none" stroke="#2f7fc4" stroke-width="0.9" stroke-linejoin="round"/>
+                </svg>
+              </div>
+              <div class="axlabel" style="color:#5a5e6c;">Q (Å⁻¹)</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="note"><b>Right panel:</b> everything enabled. Integration card fully active (1-D and 2-D blocks), run dock Live / Start / Stop all live.</div>
+  </section>
+
+  <!-- ===================== INT 1D ===================== -->
+  <section>
+    <div class="seclabel">Mode 2</div>
+    <h2>Int 1D</h2>
+    <div class="frame">
+      <div class="tbar"><div style="display:flex;gap:7px;"><span class="dot" style="background:#ff5f57;"></span><span class="dot" style="background:#febc2e;"></span><span class="dot" style="background:#28c840;"></span></div><span class="tname">Int 1D</span></div>
+      <div class="center">
+        <!-- toolbar: Norm Channel · Set BG · title · Raw · Default/Log -->
+        <div class="toolbar">
+          <div class="chip">Norm Channel <span style="color:var(--accent);font-size:9px;">▾</span></div>
+          <button class="btn">Set BG</button>
+          <div class="title">eiger_S069Ta_redo_eta2p0_1_scan001_55</div>
+          <button class="btn">Raw</button>
+          <div class="seg"><span style="color:var(--accent-text);background:var(--accent-soft);">Default</span><span style="color:var(--text-3);border-left:1px solid var(--field-border);">Log</span></div>
+        </div>
+        <div style="flex:1;position:relative;min-height:0;">
+          <div style="position:absolute;inset:0;display:flex;flex-direction:column;">
+            <!-- 1-D plot toolbar with Intensity slider + Autoscale -->
+            <div class="ptoolbar">
+              <div class="pchip" style="font-family:'JetBrains Mono',monospace;">Q (Å⁻¹) <span style="color:var(--accent);font-size:8px;">▾</span></div>
+              <div class="pchip">Single <span style="color:var(--accent);font-size:8px;">▾</span></div>
+              <button class="pbtn">Options</button>
+              <button class="pbtn">Clear</button>
+              <span style="flex:1;"></span>
+              <span style="font-size:12px;font-weight:500;color:var(--text-3);">Intensity</span>
+              <div class="slider"><span class="fill" style="width:55%;"></span><span class="knob" style="left:55%;"></span></div>
+              <button class="autoscale" style="font-size:11.5px;padding:4px 11px;">Autoscale</button>
+            </div>
+            <div style="flex:1;background:var(--plot1d-bg);position:relative;display:flex;flex-direction:column;padding:12px 14px 6px 44px;min-height:0;">
+              <div style="position:absolute;left:12px;top:0;bottom:22px;width:24px;display:flex;align-items:center;justify-content:center;"><span class="ax" style="font-size:11px;color:#5a5e6c;">I (a.u.)</span></div>
+              <div style="flex:1;position:relative;">
+                <svg viewBox="0 0 100 100" preserveAspectRatio="none" style="position:absolute;inset:0;width:100%;height:100%;">
+                  <defs><pattern id="g1d" width="8" height="12.5" patternUnits="userSpaceOnUse"><path d="M0 0 V100 M0 0 H100" stroke="var(--grid)" stroke-width="0.25"/></pattern></defs>
+                  <rect width="100" height="100" fill="url(#g1d)"/>
+                  <polyline points="2,95 27,94 32,93 35,30 36,5 37,30 39,93 41,90 45,91 50,90 52,55 53,75 54,90 61,89 63,66 65,88 72,87 73,80 75,87 81,86 82,79 84,86 89,86 90,83 92,86 98,87" fill="none" stroke="#2f7fc4" stroke-width="0.7" stroke-linejoin="round"/>
+                </svg>
+              </div>
+              <div class="axlabel" style="font-size:11px;color:#5a5e6c;">Q (Å⁻¹)</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="note"><b>Right panel:</b> the <b>2-D</b> integration sub-card and the <b>Reintegrate 2D</b> button are greyed (opacity ~0.4, non-interactive) — a 1-D reduction doesn't use them. Everything else stays live.</div>
+  </section>
+
+  <!-- ===================== IMAGE VIEWER ===================== -->
+  <section>
+    <div class="seclabel">Mode 3</div>
+    <h2>Image Viewer</h2>
+    <div class="frame">
+      <div class="tbar"><div style="display:flex;gap:7px;"><span class="dot" style="background:#ff5f57;"></span><span class="dot" style="background:#febc2e;"></span><span class="dot" style="background:#28c840;"></span></div><span class="tname">Image Viewer</span></div>
+      <div class="center">
+        <!-- toolbar: Set BG · title · Intensity slider + Autoscale · Default/Log  (NO Norm Channel) -->
+        <div class="toolbar">
+          <button class="btn">Set BG</button>
+          <div class="title">Combi4_Angledependence_samz_4p9_03271002.nxs #1</div>
+          <span style="font-size:12px;font-weight:500;color:var(--text-3);">Intensity</span>
+          <div class="slider"><span class="fill" style="width:62%;"></span><span class="knob" style="left:62%;"></span></div>
+          <button class="autoscale">Autoscale</button>
+          <div class="seg"><span style="color:var(--accent-text);background:var(--accent-soft);">Default</span><span style="color:var(--text-3);border-left:1px solid var(--field-border);">Log</span></div>
+        </div>
+        <!-- full raw detector image -->
+        <div style="flex:1;position:relative;min-height:0;">
+          <div style="position:absolute;inset:0;background:var(--plot1d-bg);display:flex;flex-direction:column;padding:12px 14px 6px 44px;">
+            <div style="position:absolute;left:12px;top:0;bottom:22px;width:24px;display:flex;align-items:center;justify-content:center;"><span class="ax" style="font-size:11px;color:#5a5e6c;">y (Pixels)</span></div>
+            <div style="flex:1;display:flex;gap:10px;min-height:0;">
+              <div style="flex:1;border-radius:4px;position:relative;overflow:hidden;background:radial-gradient(125% 150% at 50% 100%, #fde725 0%, #b5de2b 9%, #6ccd5a 18%, #35b779 28%, #21908d 42%, #2c728e 56%, #3b528b 70%, #443983 84%, #440154 100%);">
+                <div style="position:absolute;inset:0;background:repeating-radial-gradient(circle at 50% 100%, transparent 0 40px, rgba(0,0,0,.16) 40px 46px);"></div>
+                <div style="position:absolute;left:26%;top:0;height:42%;width:9%;background:repeating-linear-gradient(0deg,#fde725 0 2px,#e0d040 2px 4px);opacity:.92;border-radius:2px;"></div>
+                <div style="position:absolute;left:50%;bottom:0;transform:translateX(-50%);width:34px;height:24px;border-radius:50% 50% 0 0;background:#2a0d3a;"></div>
+              </div>
+              <div style="width:14px;flex:none;border-radius:2px;background:linear-gradient(#fde725,#5ec962,#21918c,#3b528b,#440154);"></div>
+            </div>
+            <div class="axlabel" style="font-size:11px;color:#5a5e6c;">x (Pixels)</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="note"><b>Right panel:</b> raw view only — the whole <b>Integration</b> card and the run dock's <b>Live / Start / Stop</b> are greyed. Calibrate / Make Mask and the Project / Data / Output cards stay readable.</div>
+  </section>
+
+  <!-- ===================== XYE VIEWER ===================== -->
+  <section>
+    <div class="seclabel">Mode 4</div>
+    <h2>XYE Viewer</h2>
+    <div class="frame">
+      <div class="tbar"><div style="display:flex;gap:7px;"><span class="dot" style="background:#ff5f57;"></span><span class="dot" style="background:#febc2e;"></span><span class="dot" style="background:#28c840;"></span></div><span class="tname">XYE Viewer</span></div>
+      <div class="center">
+        <div class="toolbar">
+          <button class="btn">Set BG</button>
+          <div class="title">iq_Combi4_Angledependence_samz_4p9_03271002_0001.xye</div>
+          <span style="font-size:12px;font-weight:500;color:var(--text-3);">Intensity</span>
+          <div class="slider"><span class="fill" style="width:62%;"></span><span class="knob" style="left:62%;"></span></div>
+          <button class="autoscale">Autoscale</button>
+          <div class="seg"><span style="color:var(--accent-text);background:var(--accent-soft);">Default</span><span style="color:var(--text-3);border-left:1px solid var(--field-border);">Log</span></div>
+        </div>
+        <!-- full 1-D scatter of the .xye -->
+        <div style="flex:1;position:relative;min-height:0;">
+          <div style="position:absolute;inset:0;background:var(--plot1d-bg);display:flex;flex-direction:column;padding:12px 14px 6px 44px;">
+            <div style="position:absolute;left:12px;top:0;bottom:22px;width:24px;display:flex;align-items:center;justify-content:center;"><span class="ax" style="font-size:11px;color:#5a5e6c;">Intensity</span></div>
+            <div style="flex:1;position:relative;">
+              <svg viewBox="0 0 100 100" preserveAspectRatio="none" style="position:absolute;inset:0;width:100%;height:100%;">
+                <defs><pattern id="gxye" width="8" height="12.5" patternUnits="userSpaceOnUse"><path d="M0 0 V100 M0 0 H100" stroke="var(--grid)" stroke-width="0.25"/></pattern></defs>
+                <rect width="100" height="100" fill="url(#gxye)"/>
+                <polyline points="3,14 4,6 5,34 7,74 9,80 11,76 14,62 18,40 20,37 22,46 26,55 30,62 32,40 34,45 36,58 40,64 44,52 48,60 52,44 56,52 60,62 66,38 70,35 74,45 80,54 86,60 92,66 98,76" fill="none" stroke="#2f7fc4" stroke-width="0.7" stroke-linejoin="round"/>
+              </svg>
+            </div>
+            <div class="axlabel" style="font-size:11px;color:#5a5e6c;">Q (Å⁻¹)</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="note"><b>Right panel:</b> same as Image Viewer — <b>Integration</b> card and <b>Live / Start / Stop</b> greyed; this is a loaded-curve viewer, not a reduction.</div>
+  </section>
+
+</div>
+</body>
+</html>

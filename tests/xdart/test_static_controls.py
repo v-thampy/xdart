@@ -24,25 +24,25 @@ def qapp():
 def test_action_phase_morph_cycles(qapp):
     c = StaticControls()
     c.set_action_phase('idle')
-    assert c.startButton.text() == 'Start'
+    assert c.startButton.text() == '▶ Run'
     assert c.startButton.property('runPhase') == 'idle'
     assert c.startButton.isEnabled()
 
     c.set_action_phase('running')
-    assert c.startButton.text() == 'Pause'
+    assert c.startButton.text() == '❚❚ Pause'
     assert c.startButton.property('runPhase') == 'active'
 
     c.set_action_phase('pausing')
-    assert c.startButton.text().startswith('Pausing')
+    assert 'Pausing' in c.startButton.text()
     assert not c.startButton.isEnabled()           # transient, disabled
 
     c.set_action_phase('paused')
-    assert c.startButton.text() == 'Resume'
+    assert c.startButton.text() == '▶ Resume'
     assert c.startButton.property('runPhase') == 'active'
     assert c.action_phase() == 'paused'
 
     c.set_action_phase('idle')                      # morph back to green
-    assert c.startButton.text() == 'Start'
+    assert c.startButton.text() == '▶ Run'
     assert c.startButton.property('runPhase') == 'idle'
 
 
@@ -106,16 +106,15 @@ def test_mode_row_enabled_locks_mode_batch_cores(qapp):
     assert c.batchButton.isEnabled()
 
 
-def test_run_row_enabled_keeps_row_visible(qapp):
-    """Viewer modes DISABLE the action row rather than hiding it (an empty box
-    looked broken) -- the row stays visible, just greyed."""
+def test_run_row_visibility_can_collapse_to_mode_only(qapp):
+    """File viewers can collapse the controls bar to the mode row only."""
     c = StaticControls()
+    c.set_run_row_visible(False)
+    assert c.actionRow.isHidden()
+    assert c._divider.isHidden()
     c.set_run_row_visible(True)
-    c.set_run_row_enabled(False)
-    assert not c.actionRow.isEnabled()             # greyed
-    assert not c.actionRow.isHidden()              # but still visible (no empty box)
-    c.set_run_row_enabled(True)
-    assert c.actionRow.isEnabled()
+    assert not c.actionRow.isHidden()
+    assert not c._divider.isHidden()
 
 
 def test_getters(qapp):
@@ -129,3 +128,23 @@ def test_getters(qapp):
     assert c.is_batch() is True
     assert c.is_live() is False
     assert c.get_cores() == 2
+
+
+def test_readiness_summary_toggles_compact_status_row(qapp):
+    c = StaticControls()
+    assert c.readinessRow.isHidden()
+
+    changed = c.set_readiness_summary(
+        "Ready · Int 2D · 50 frames",
+        ready=True,
+        tooltip="Everything is ready.",
+    )
+
+    assert changed is True
+    assert not c.readinessRow.isHidden()
+    assert c.readinessLabel.text() == "Ready · Int 2D · 50 frames"
+    assert c.readinessLabel.toolTip() == "Everything is ready."
+    assert c.readinessDot.property("ready") is True
+
+    assert c.set_readiness_summary("", ready=False) is True
+    assert c.readinessRow.isHidden()

@@ -37,6 +37,7 @@ def run_stitch(
     radial_range: tuple[float, float] | None = None,
     azimuth_range: tuple[float, float] | None = None,
     unit: str = "q_A^-1",
+    backend: str = "multigeometry",
     max_stack_bytes: float = 16e9,
 ) -> None:
     """Stitch the scan's per-frame images into a single merged pattern.
@@ -44,7 +45,7 @@ def run_stitch(
     Reads:
 
     * ``scan.frames`` — image stack (via ``frame.map_raw - frame.bg_raw``).
-    * ``scan.geometry`` — :class:`DiffractometerGeometry` for the
+    * ``scan.geometry`` — :class:`Diffractometer` for the
       per-frame ``rot1``/``rot2`` derivation.
     * ``scan.scan_data`` — motor positions (DataFrame).
     * ``scan.frames[0].poni`` — base PONI geometry shared across
@@ -77,6 +78,10 @@ def run_stitch(
         Optional explicit bin ranges; pyFAI auto-sizes if ``None``.
     unit
         Radial output unit string.
+    backend
+        ``"multigeometry"`` (default, pyFAI MultiGeometry) or ``"pyfai_hist"``
+        (the per-pixel q-histogram merge — q-Å⁻¹ only; the substrate the shared
+        CorrectionStack + GI corrections layer on).
 
     Raises
     ------
@@ -90,7 +95,7 @@ def run_stitch(
     if scan.geometry is None:
         raise RuntimeError(
             "LiveScan.geometry is unset — set it before stitching "
-            "(use xrd_tools.core.geometry.DiffractometerGeometry)."
+            "(use xrd_tools.core.geometry.Diffractometer)."
         )
     frames = list(scan.frames)
     if not frames:
@@ -273,6 +278,11 @@ def run_stitch(
                 'stitch: skipped %d frames with no raw data: %s',
                 len(skipped), skipped,
             )
+        # Surface the partial-skip so the GUI/caller can warn that the merge
+        # represents only a subset (a stitch over fewer frames can look valid but
+        # be missing data).  Recorded unconditionally so a prior run's value never
+        # lingers; the all-missing case still raises below.
+        scan.stitch_skipped = list(skipped)
         if not images:
             raise RuntimeError(
                 'stitch: no frames with raw data available — '
@@ -319,6 +329,7 @@ def run_stitch(
             radial_range=radial_range,
             azimuth_range=azimuth_range,
             mask=mask,
+            backend=backend,
         )
         if mode == "1d":
             scan.stitched_1d = result

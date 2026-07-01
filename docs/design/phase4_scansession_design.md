@@ -1,6 +1,11 @@
 # Phase 4b–4f — The Headless Session Seam (ScanSession)
 
-**Status:** design, ready to implement. **Branch base:** `main` @ `875d46d` (Phase 4a done).
+> **DEFERRED / DESIGN-PHASE (post-flip):** keep this document as the accepted
+> design map, but do not start the ScanSession lift until the panel-v2 manual
+> live checkpoint and the store-collapse sequencing are cleared.
+
+**Status:** deferred design, ready to implement after the post-flip/store-collapse gates.
+**Branch base:** `main` @ `875d46d` (Phase 4a done).
 **Scope:** lift xdart's live-acquisition orchestration (save cadence, h5pool bracketing,
 run-state, dispatch) onto a headless session seam in `xrd_tools`, ending with a public
 `xrd_tools.session.ScanSession` that emits immutable frame events. xdart becomes a thin

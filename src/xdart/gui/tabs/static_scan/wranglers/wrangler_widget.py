@@ -28,9 +28,7 @@ logger = logging.getLogger(__name__)
 # Sentinel used by ``_apply_threshold_inline`` to mark out-of-band
 # pixels.  pyFAI's CSR integrator auto-skips NaN at integrate time
 # without invalidating the mask CRC, so the per-frame threshold
-# filter survives without forcing a per-frame LUT rebuild.  See the
-# session_may2026_nexusformat_writer.md lesson notes for the full
-# story (lessons 2, 3 in particular).
+# filter survives without forcing a per-frame LUT rebuild.
 _THRESHOLD_NAN = np.float32(np.nan)
 
 # Default cadence: flush scan state to disk every N frames in batch
@@ -46,8 +44,7 @@ _LIVE_SAVE_INTERVAL = 8
 # _save_due cap bound in imageWranglerThread) guarantees a save fires before the
 # unsaved in-memory set reaches _in_memory_cap, so no frame's int_1d is ever
 # evicted before it's written — the high interval is safe on scans longer than
-# the cap.  Effective cadence is therefore min(this, cap-margin).  See
-# review/CC_data_loss_save_vs_evict_jun2026.md.
+# the cap.  Effective cadence is therefore min(this, cap-margin).
 _LIVE_SAVE_INTERVAL_1D = 1000
 
 
@@ -286,14 +283,30 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         policy.setHorizontalPolicy(Qt.QtWidgets.QSizePolicy.Policy.Ignored)
         label.setSizePolicy(policy)
 
+    def _status_bar(self):
+        """The main window's BOTTOM QStatusBar, when this widget is hosted in a
+        QMainWindow (the normal app).  None when standalone (tests / popped-out
+        wranglers) — status then falls back to the elide-safe label."""
+        try:
+            win = self.window()
+            fn = getattr(win, 'statusBar', None)
+            return fn() if callable(fn) else None
+        except Exception:
+            return None
+
     def _set_status_text(self, text):
-        """Set the status label, eliding to the label's current width (the
-        full text goes in the tooltip).  Safe for arbitrarily long thread
-        messages — see _guard_status_label."""
+        """Route run/browse status to the main window's bottom status bar (the
+        message bar).  Falls back to the elide-safe status label when there is no
+        status bar (standalone): elides to the label's width, full text in the
+        tooltip — see _guard_status_label."""
+        text = text or ''
+        bar = self._status_bar()
+        if bar is not None:
+            bar.showMessage(text)
+            return
         label = self._status_label()
         if label is None:
             return
-        text = text or ''
         label.setToolTip(text)
         if label.isVisible() and label.width() > 0:
             metrics = Qt.QtGui.QFontMetrics(label.font())
@@ -568,7 +581,7 @@ class wranglerThread(Qt.QtCore.QThread):
         engine cache stay valid — a single pixel changing in the
         mask invalidates the cache and forces a ~250 ms LUT rebuild
         (observed on Eiger scans where saturation flicker shifts the
-        mask CRC frame-to-frame; see session_may2026 lesson 1).
+        mask CRC frame-to-frame).
 
         Per-frame threshold filtering is NOT routed through this
         mask — see :meth:`_apply_threshold_inline` for that path

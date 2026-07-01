@@ -11,6 +11,7 @@ from xrd_tools.io.image_source import ImageSourceKind, classify_image_source
 from xrd_tools.sources.image import ImageFileSource, TiffSeriesSource
 from xrd_tools.sources.memory import LiveFrameSource, MemoryFrameSource
 from xrd_tools.sources.nexus import NexusStackSource, ProcessedNexusSource
+from xrd_tools.sources.spec import SpecSource
 
 
 SourceFactory = Callable[[SourceSpec], FrameSource]
@@ -25,6 +26,12 @@ def guess_source_kind(uri: str | Path) -> SourceKind:
     path = Path(uri)
     if path.is_dir():
         return SourceKind.TIFF_SERIES
+    # SSRL SPEC files are extensionless; detect by content, not suffix.  Probe
+    # only no-extension (or .spec/.dat) files to avoid I/O on every image.
+    if path.suffix == "" or path.suffix.lower() in {".spec", ".dat"}:
+        from xrd_tools.io.spec import is_spec_file
+        if is_spec_file(path):
+            return SourceKind.SPEC
     info = classify_image_source(path)
     if info.kind is ImageSourceKind.PROCESSED_XDART or info.kind is ImageSourceKind.THUMBNAIL_ONLY:
         return SourceKind.PROCESSED_NEXUS
@@ -68,6 +75,12 @@ def open_source(uri_or_spec: str | Path | SourceSpec | FrameSource, **opts: Any)
             source_root=dict(spec.options).get("source_root"))
     if kind is SourceKind.IMAGE_FILE:
         return ImageFileSource(spec.uri, **dict(spec.options))
+    if kind is SourceKind.SPEC:
+        opts = dict(spec.options)
+        return SpecSource(
+            spec.uri, scan=opts.get("scan"), image_dir=opts.get("image_dir"),
+            image_stem=opts.get("image_stem"),
+            read_image_kwargs=opts.get("read_image_kwargs"))
     if kind is SourceKind.LIVE:
         return LiveFrameSource(name=str(spec.uri))
     raise ValueError(f"cannot open source {spec.uri!r} with kind {kind.value!r}")
@@ -79,6 +92,7 @@ __all__ = [
     "ImageFileSource",
     "NexusStackSource",
     "ProcessedNexusSource",
+    "SpecSource",
     "TiffSeriesSource",
     "guess_source_kind",
     "open_source",

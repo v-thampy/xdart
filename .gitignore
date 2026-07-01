@@ -24,3 +24,6 @@ test.hdf5
 docs/design/CC_*.md
 docs/design/deep_review_*.md
 docs/history/CC_monorepo_handoff.md
+docs/design/ui/
+docs/design/notes/
+docs/design/remediation_*.md

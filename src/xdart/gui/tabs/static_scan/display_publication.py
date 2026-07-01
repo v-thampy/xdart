@@ -120,6 +120,11 @@ def _trace_name(publication, widget=None) -> str:
     scan = getattr(widget, "scan", None)
     scan_name = getattr(scan, "name", "")
     if scan_name and scan_name != "null_main":
+        # An averaged series collapses to one frame; its legend is the bare
+        # series name (no per-frame index suffix), matching the display title and
+        # the legacy build_plot_names.
+        if getattr(scan, "series_average", False):
+            return scan_name
         return f"{scan_name}_{publication.label}"
     source = (
         publication.metadata_raw.get("source_file")
@@ -385,7 +390,7 @@ class PublicationDisplayAdapter:
         # Eviction guard.  For Sum/Average the cake aggregates the WHOLE intended
         # set, so check store residency against selected_ids and serve the on-disk
         # aggregate (Step 7b) when a frame is evicted — else blank, never average a
-        # wrong subset (review_2026-06-15 §2.C).  For Single/Overlay/Waterfall the
+        # wrong subset.  For Single/Overlay/Waterfall the
         # cake shows only the current frame, so guard just that one (None => blank;
         # the hydration worker rehydrates an evicted current frame and re-renders).
         guard_ids = (state.selected_ids

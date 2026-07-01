@@ -575,6 +575,18 @@ class LiveScan:
         from xrd_tools.integrate.calibration import poni_to_integrator
         _pd = {k: float(_det[k][()]) for k in
                ("dist", "poni1", "poni2", "rot1", "rot2", "rot3") if k in _det}
+        # A zero (or negative) sample-detector distance is a placeholder, not a
+        # calibration: every pixel maps to a single constant q, so any requested
+        # q-range catches nothing -> an all-NaN 2D cake (loudly rejected) and a
+        # silent flat-zero 1D pattern.  Refuse to restore (same class as the
+        # pixel-less case) so the up-front readiness guard surfaces a clear
+        # "load a PONI" message instead of every frame silently failing
+        # publication mid-run.
+        if _pd.get("dist", 0.0) <= 0.0:
+            logger.info("[REINTEGRATE-CAL] %s has a zero/degenerate geometry "
+                        "(dist=%s) — not a usable calibration; refusing to "
+                        "restore", self.data_file, _pd.get("dist"))
+            return False
         if "detector_name" in _det:
             _nm = _det["detector_name"][()]
             _pd["detector"] = (_nm.decode() if isinstance(_nm, bytes)
@@ -705,19 +717,24 @@ class LiveScan:
     def default_geometry(self):
         """Return ``self.geometry``, constructing a sensible default if unset.
 
-        The default is a two-circle convention with detector arm named
-        ``tth`` and sample tilt named ``self.incidence_motor`` (which
-        falls back to ``"th"``).  Suitable for standard transmission
-        and 2-circle GI experiments.  Override by assigning a different
-        :class:`DiffractometerGeometry` to ``self.geometry`` before
-        saving in v2 mode.
+        Picks the preset from what the scan actually recorded (do NOT stamp a
+        6-circle psic on a 2-circle scan): **psic** when the psic detector
+        motors ``nu``/``del`` are present in ``scan_data`` (a true RSM/6-circle
+        scan), else the **two-circle** convention (``rot1←tth``, incidence ←
+        ``self.incidence_motor`` or ``th``) — which preserves per-frame geometry
+        + GI incidence for standard/2-circle scans.  Override by assigning a
+        :class:`Diffractometer` to ``self.geometry`` before saving in v2 mode.
         """
         if self.geometry is not None:
             return self.geometry
-        from xrd_tools.core.geometry import DiffractometerGeometry
-        self.geometry = DiffractometerGeometry.two_circle(
-            tth="tth", th=self.incidence_motor or "th",
-        )
+        from xrd_tools.core.geometry import Diffractometer
+        _cols = getattr(getattr(self, "scan_data", None), "columns", None)
+        cols = set(_cols) if _cols is not None else set()
+        if {"nu", "del"} <= cols:
+            self.geometry = Diffractometer.psic(eta=self.incidence_motor or "eta")
+        else:
+            self.geometry = Diffractometer.two_circle(
+                tth="tth", th=self.incidence_motor or "th")
         return self.geometry
 
     # ------------------------------------------------------------------
@@ -813,21 +830,37 @@ class LiveScan:
             self.bai_2d_args = dict(config["bai_2d_args"])
         if isinstance(config.get("gi_config"), dict):
             self.gi_config = dict(config["gi_config"])
-        # geometry config → DiffractometerGeometry instance
-        geom_cfg = config.get("geometry")
-        if isinstance(geom_cfg, dict) and geom_cfg.get("mapping_json"):
-            try:
-                from xrd_tools.core.geometry import (
-                    DiffractometerGeometry,
-                )
-                mj = geom_cfg["mapping_json"]
-                if isinstance(mj, dict):  # already parsed by read_provenance
-                    import json as _json
-                    mj = _json.dumps(mj)
-                self.geometry = DiffractometerGeometry.from_json(mj)
-            except Exception:
-                logger.debug("Failed to restore geometry from reduction config",
-                             exc_info=True)
+        # geometry: prefer the canonical persisted Diffractometer blob (the
+        # full instrument for offline stitch/RSM); fall back to the legacy
+        # per-frame mapping_json on older files that lack the group.
+        try:
+            from xrd_tools.io.read import get_diffractometer
+            diff = get_diffractometer(self.data_file)
+            if diff is not None:
+                self.geometry = diff
+        except Exception:
+            logger.debug("Failed to read persisted diffractometer blob",
+                         exc_info=True)
+        if self.geometry is None:
+            geom_cfg = config.get("geometry")
+            if isinstance(geom_cfg, dict) and geom_cfg.get("mapping_json"):
+                try:
+                    from xrd_tools.core.geometry import (
+                        Diffractometer,
+                        DiffractometerGeometry,
+                    )
+                    mj = geom_cfg["mapping_json"]
+                    if isinstance(mj, dict):  # already parsed by read_provenance
+                        import json as _json
+                        mj = _json.dumps(mj)
+                    # parse the legacy per-frame mapping, then lift to the one
+                    # canonical object so self.geometry is always a Diffractometer
+                    self.geometry = Diffractometer.from_diffractometer_geometry(
+                        DiffractometerGeometry.from_json(mj))
+                except Exception:
+                    logger.debug(
+                        "Failed to restore geometry from reduction config",
+                        exc_info=True)
 
         # v2 writer stores real calibration wavelength at
         # /entry/instrument/source/wavelength_A.  Restore it into mg_args so a

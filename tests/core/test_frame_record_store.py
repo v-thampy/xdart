@@ -12,7 +12,8 @@ from xrd_tools.core import Axis, FrameRecord, FrameView
 from xrd_tools.session import FrameRecordStore
 
 
-def _view(label=0, *, source="/data/scan_0001.tif", source_frame=0, scale=1.0):
+def _view(label=0, *, source: "str | None" = "/data/scan_0001.tif",
+          source_frame: "int | None" = 0, scale=1.0):
     return FrameView(
         label=label,
         axis_1d=Axis("Q", "q_A^-1", values=np.array([1.0, 2.0, 3.0])),
@@ -27,8 +28,8 @@ def _record(
     label=0,
     *,
     mode="q_total",
-    source="/data/scan_0001.tif",
-    source_frame=0,
+    source: "str | None" = "/data/scan_0001.tif",
+    source_frame: "int | None" = 0,
     scale=1.0,
 ):
     return FrameRecord.from_view(
@@ -262,3 +263,167 @@ def test_concurrent_upsert_mark_hydrate_is_thread_safe():
     assert not errors, errors
     assert not any(t.is_alive() for t in threads)   # no deadlock
     assert len(store) <= 20                          # max_items bound held
+
+
+# --------------------------------------------------------------------------- #
+# A-prep2: freeze the config the LIVE store (D3 one-store collapse) will use.
+#
+# The live store mirrors xdart's LiveFrameSeries in-memory cap
+# (``frame_series.py::_in_memory_cap == 64``) and the persist-before-evict
+# invariant (``frame_series.py``: ``_in_memory`` never evicts unpersisted
+# frames).  These tests pin that exact config so the later eviction wiring lands
+# against a tested spec rather than re-deriving it.  Read-only confirmed against
+# ``src/xdart/modules/ewald/frame_series.py``; this constant is duplicated, not
+# imported, to keep the test xdart-free.
+# --------------------------------------------------------------------------- #
+
+LIVE_STORE_HEAVY_CAP = 64
+"""Mirror of ``LiveFrameSeries._in_memory_cap`` (xdart frame_series.py)."""
+
+
+def _live_store() -> FrameRecordStore:
+    """The exact config the live FrameRecordStore path will use."""
+    return FrameRecordStore(
+        max_heavy_items=LIVE_STORE_HEAVY_CAP,
+        require_persisted_for_eviction=True,
+    )
+
+
+def test_live_store_config_evicts_only_persisted_under_heavy_pressure():
+    # (a) With max_heavy_items=64 and require-persisted eviction, pushing past
+    # the cap thins ONLY persisted records; unpersisted heavy frames survive.
+    store = _live_store()
+
+    # Fill the cap with persisted frames (eligible for eviction)...
+    for i in range(LIVE_STORE_HEAVY_CAP):
+        store.upsert(_record(label=i, source=f"/d/{i}.tif"), persisted=True)
+    # ...then add one MORE persisted frame: exactly one persisted frame is thinned.
+    store.upsert(
+        _record(label=LIVE_STORE_HEAVY_CAP, source="/d/cap.tif"), persisted=True
+    )
+
+    thinned = [
+        i
+        for i in range(LIVE_STORE_HEAVY_CAP + 1)
+        if not store.has_heavy_payload(i)
+    ]
+    assert len(thinned) == 1                         # one over the cap -> one thinned
+    # The thinned frame keeps its labels/axes/metadata; only arrays are dropped.
+    rec = store.get(thinned[0])
+    assert rec is not None
+    assert rec.view_1d("q_total").intensity_1d is None
+    assert rec.view_1d("q_total").metadata_raw["sample"] == "A"
+
+
+def test_live_store_never_evicts_an_unsaved_extra_mode_under_heavy_pressure():
+    # (b) persist-before-evict with an EXTRA UNSAVED record present (simulating a
+    # freshly-computed GI sub-mode not yet on disk): the unpersisted frame is
+    # NEVER thinned, even when the store is at/over the heavy cap.
+    store = _live_store()
+
+    # One frame carries a persisted primary mode PLUS an unsaved extra GI mode.
+    store.upsert(_record(label=0, mode="q_total", source="/d/0.tif"), persisted=True)
+    store.upsert(_record(label=0, mode="q_ip", source="/d/0.tif", scale=2.0),
+                 persisted=False)
+    assert not store.is_persisted(0)                 # extra mode unsaved
+
+    # Flood the rest of the cap with fully-persisted frames, then overflow.
+    for i in range(1, LIVE_STORE_HEAVY_CAP + 4):
+        store.upsert(_record(label=i, source=f"/d/{i}.tif"), persisted=True)
+
+    # The unsaved frame must still hold its heavy arrays (never evicted).
+    assert store.has_heavy_payload(0)
+    rec = store.get(0)
+    assert rec is not None
+    assert rec.view_1d("q_ip").intensity_1d is not None
+    # Eviction happened among the persisted frames instead.
+    persisted_thinned = [
+        i
+        for i in range(1, LIVE_STORE_HEAVY_CAP + 4)
+        if not store.has_heavy_payload(i)
+    ]
+    assert persisted_thinned                         # some persisted frames thinned
+
+
+def test_live_store_all_unpersisted_overflow_keeps_everything():
+    # Corollary of (b): if EVERY heavy frame is unpersisted, nothing is
+    # evictable, so the store exceeds the cap rather than dropping unsaved data.
+    store = _live_store()
+    for i in range(LIVE_STORE_HEAVY_CAP + 5):
+        store.upsert(_record(label=i, source=f"/d/{i}.tif"), persisted=False)
+    assert all(
+        store.has_heavy_payload(i) for i in range(LIVE_STORE_HEAVY_CAP + 5)
+    )
+
+
+def test_live_store_mark_persisted_only_marks_passed_labels():
+    # (c) mark_persisted marks ONLY the labels passed (mirrors "mark from
+    # flush() only"): an unmentioned frame stays unpersisted and un-evictable.
+    store = _live_store()
+    store.upsert(_record(label=1, source="/d/1.tif"), persisted=False)
+    store.upsert(_record(label=2, source="/d/2.tif"), persisted=False)
+    assert not store.is_persisted(1)
+    assert not store.is_persisted(2)
+
+    store.mark_persisted([1])                         # only label 1
+
+    assert store.is_persisted(1)
+    assert not store.is_persisted(2)                  # 2 untouched
+
+    # And it only marks the modes that exist on the passed label: marking a
+    # missing label is a no-op (does not raise, marks nothing).
+    store.mark_persisted([999])
+    assert not store.is_persisted(999)
+
+
+def test_live_store_mark_persisted_marks_all_current_modes_of_passed_label():
+    # mark_persisted marks EVERY current mode of the passed label (so a frame
+    # with a primary + extra GI mode becomes fully persisted, hence evictable).
+    store = _live_store()
+    store.upsert(_record(label=1, mode="q_total", source="/d/1.tif"), persisted=True)
+    store.upsert(_record(label=1, mode="q_ip", source="/d/1.tif", scale=2.0),
+                 persisted=False)
+    assert not store.is_persisted(1)                  # q_ip unsaved
+
+    store.mark_persisted(1)                            # flush wrote both modes
+    assert store.is_persisted(1)
+    rec = store.get(1)
+    assert set(rec.modes_1d) == {"q_total", "q_ip"}
+
+
+def test_live_store_set_hydrator_rehydrates_an_evicted_record_on_access():
+    # (d) set_hydrator re-hydrates a thinned (evicted-arrays) record on access:
+    # get_or_hydrate calls the hydrator exactly once and restores heavy arrays.
+    store = _live_store()
+    # Fill + overflow with persisted frames so the oldest is thinned.
+    for i in range(LIVE_STORE_HEAVY_CAP + 1):
+        store.upsert(_record(label=i, source=f"/d/{i}.tif"), persisted=True)
+
+    thinned = next(
+        i for i in range(LIVE_STORE_HEAVY_CAP + 1) if not store.has_heavy_payload(i)
+    )
+
+    calls: list[int] = []
+
+    def hydrate(label):
+        calls.append(label)
+        return _record(label=label, source=f"/d/{label}.tif", scale=5.0)
+
+    store.set_hydrator(hydrate)
+    rec = store.get_or_hydrate(thinned)
+
+    assert calls == [thinned]                          # hydrator called once
+    assert store.has_heavy_payload(thinned)            # arrays restored
+    assert rec is not None
+    np.testing.assert_allclose(
+        rec.view_1d("q_total").intensity_1d, [50.0, 100.0, 150.0]
+    )
+
+    # A frame whose arrays are still resident is returned WITHOUT re-hydrating.
+    resident = next(
+        i for i in range(LIVE_STORE_HEAVY_CAP + 1) if store.has_heavy_payload(i)
+        and i != thinned
+    )
+    calls.clear()
+    store.get_or_hydrate(resident)
+    assert calls == []                                 # no hydrator call for resident

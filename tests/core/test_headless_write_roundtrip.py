@@ -6,6 +6,7 @@ split fix)."""
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.io.nexus import (
@@ -175,6 +176,87 @@ def test_write_stitched_roundtrips_through_read_stitched(tmp_path):
     assert ds["stitched_2d"].shape == (N_Q, N_CHI)
     np.testing.assert_allclose(ds["stitched_2d"].values, s2.intensity, rtol=1e-6)
     np.testing.assert_allclose(ds["stitched_1d"].values, s1.intensity, rtol=1e-6)
+
+
+def test_write_stitched_rejects_transposed_cake(tmp_path):
+    """write_stitched fails loud on a (chi, q) cake: read_stitched blindly applies
+    (q, chi) and the stitched validator skips the row-count block, so a transposed
+    array would round-trip as silently-wrong axes.  Enforce (n_q, n_chi) at write."""
+    import h5py
+    from xrd_tools.io.nexus import write_stitched
+
+    s2 = IntegrationResult2D(
+        radial=np.linspace(0.5, 4.0, N_Q),
+        azimuthal=np.linspace(-180, 180, N_CHI, endpoint=False),
+        intensity=np.random.default_rng(4).random((N_Q, N_CHI)),
+        unit="q_A^-1", azimuthal_unit="chi_deg",
+    )
+    s2.intensity = s2.intensity.T            # (chi, q) — transposed (slots dataclass)
+    p = tmp_path / "bad.nxs"
+    with h5py.File(p, "w") as f:
+        with pytest.raises(ValueError, match=r"n_q.*n_chi|len\(radial\)"):
+            write_stitched(f.create_group("entry"), stitched_2d=s2)
+
+
+def test_write_stitched_persists_provenance(tmp_path):
+    """P5: write_stitched(provenance=…) round-trips the StitchPlan + applied
+    CorrectionStack as a provenance_json blob, on each present stitched group."""
+    import h5py
+    from xrd_tools.analysis.plans import StitchPlan
+    from xrd_tools.corrections.stack import CorrectionStack
+    from xrd_tools.io.nexus import read_stitched, write_stitched
+
+    plan = StitchPlan(backend="pyfai_hist", mode="1d", npt_1d=321, unit="q_A^-1",
+                      monitor_key="i0",
+                      corrections=CorrectionStack(solid_angle=True,
+                                                  polarization_factor=0.97))
+    prov = plan.provenance()
+    assert prov["backend"] == "pyfai_hist" and prov["npt_1d"] == 321
+    assert prov["corrections"]["polarization_factor"] == 0.97   # CorrectionStack serialized
+
+    p = tmp_path / "prov.nxs"
+    with h5py.File(p, "w") as f:
+        write_stitched(f.create_group("entry"), stitched_1d=_r1d(0),
+                       stitched_2d=_r2d(1), provenance=prov)
+
+    ds = read_stitched(p)
+    assert ds.attrs["stitched_1d_provenance"]["backend"] == "pyfai_hist"
+    assert ds.attrs["stitched_1d_provenance"]["npt_1d"] == 321
+    assert ds.attrs["stitched_2d_provenance"]["monitor_key"] == "i0"
+    # the round-tripped provenance is the SAME record on both groups
+    assert ds.attrs["stitched_1d_provenance"] == ds.attrs["stitched_2d_provenance"]
+
+
+def test_stitched_groups_are_registered_capabilities(tmp_path):
+    """P5: stitched_1d/2d are schema-registered + feature-detected, and conform to
+    their GroupSchema (mirrors the diffractometer group)."""
+    import h5py
+    from xrd_tools.io.nexus import (
+        read_stitched, validate_group_against_schema, write_stitched)
+    from xrd_tools.io.schema import CAPABILITIES, SCHEMA, detect_capabilities
+
+    assert "stitched_1d" in CAPABILITIES and "stitched_2d" in CAPABILITIES
+    assert "stitched_1d" in SCHEMA.groups and "stitched_2d" in SCHEMA.groups
+
+    p = tmp_path / "cap.nxs"
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        write_stitched(e, stitched_1d=_r1d(0), stitched_2d=_r2d(1),
+                       provenance={"backend": "multigeometry"})
+        # feature-detect + schema-validate the written groups
+        caps = detect_capabilities(e)
+        assert {"stitched_1d", "stitched_2d"} <= caps
+        assert validate_group_against_schema(e["stitched_1d"], "stitched_1d") == []
+        assert validate_group_against_schema(e["stitched_2d"], "stitched_2d") == []
+
+    # a file WITHOUT stitched groups must not advertise the capability (optional)
+    q = tmp_path / "nostitch.nxs"
+    with h5py.File(q, "w") as f:
+        assert "stitched_1d" not in detect_capabilities(f.create_group("entry"))
+    # read_stitched on a stitch-less entry raises (unchanged contract)
+    import pytest
+    with pytest.raises(KeyError):
+        read_stitched(q)
 
 
 def test_write_integrated_stack_shape_change_rewrites(tmp_path):

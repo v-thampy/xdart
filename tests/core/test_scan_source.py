@@ -13,6 +13,7 @@ the tests run in any environment that has numpy + pandas + pytest.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import numpy as np
@@ -57,6 +58,9 @@ class _FakeGridder3D:
 
     def KeepData(self, flag: bool) -> None:
         self.keep_data = bool(flag)
+
+    def Normalize(self, flag: bool) -> None:  # noqa: N802 — matches xu API
+        self.normalize = bool(flag)
 
     def dataRange(  # noqa: N802 — matches xu API
         self, xmin, xmax, ymin, ymax, zmin, zmax, fixed=False,
@@ -214,12 +218,55 @@ def _make_scan(
 
 class TestEnergyFromSphere:
     def test_wavelength_to_eV(self) -> None:
-        # 1.10 Å ≈ 11271.0 eV (12398 / 1.10)
+        # 1.10 Å ≈ 11271 eV — via the single canonical conversion
+        from xrd_tools.core.energy import wavelength_m_to_energy_eV
         scan = _FakeScan([_FakeFrame(0, image=np.zeros((4, 4)))],
                              {"tth": [0.0]},
                              wavelength_m=1.10e-10)
         e = _energy_from_scan(scan)
-        assert e == pytest.approx(12398.0 / 1.10, rel=1e-6)
+        assert e == pytest.approx(wavelength_m_to_energy_eV(1.10e-10), rel=1e-9)
+
+    def test_legacy_default_wavelength_sentinel_is_not_authoritative(self) -> None:
+        scan = _FakeScan([_FakeFrame(0, image=np.zeros((4, 4)))],
+                         {"tth": [0.0]},
+                         wavelength_m=1.0e-10)
+        with pytest.raises(ValueError, match="no usable wavelength"):
+            _energy_from_scan(scan)
+
+    def test_persisted_wavelength_may_equal_sentinel_value(self) -> None:
+        from xrd_tools.core.energy import wavelength_m_to_energy_eV
+        scan = _FakeScan([_FakeFrame(0, image=np.zeros((4, 4)))],
+                         {"tth": [0.0]},
+                         wavelength_m=1.0e-10)
+        scan._persisted_wavelength_m = 1.0e-10
+        assert _energy_from_scan(scan) == pytest.approx(
+            wavelength_m_to_energy_eV(1.0e-10), rel=1e-9)
+
+    def test_persisted_wavelength_is_canonical_over_matching_energy(self) -> None:
+        from xrd_tools.core.energy import wavelength_m_to_energy_eV
+        scan = _FakeScan([_FakeFrame(0, image=np.zeros((4, 4)))],
+                         {"tth": [0.0]},
+                         wavelength_m=1.0e-10)
+        scan._persisted_wavelength_m = 1.20e-10
+        scan.energy_eV = wavelength_m_to_energy_eV(1.20e-10)
+        assert _energy_from_scan(scan) == pytest.approx(
+            wavelength_m_to_energy_eV(1.20e-10), rel=1e-9)
+
+    def test_persisted_wavelength_warns_and_wins_over_conflicting_energy(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from xrd_tools.core.energy import wavelength_m_to_energy_eV
+        scan = _FakeScan([_FakeFrame(0, image=np.zeros((4, 4)))],
+                         {"tth": [0.0]},
+                         wavelength_m=1.0e-10)
+        scan._persisted_wavelength_m = 1.20e-10
+        scan.energy_eV = 8000.0
+
+        with caplog.at_level(logging.WARNING, logger="xrd_tools.core.energy"):
+            energy = _energy_from_scan(scan)
+
+        assert energy == pytest.approx(wavelength_m_to_energy_eV(1.20e-10), rel=1e-9)
+        assert any("energy mismatch" in r.message for r in caplog.records)
 
     def test_missing_wavelength_raises(self) -> None:
         scan = _FakeScan([_FakeFrame(0, image=np.zeros((4, 4)))],
@@ -361,6 +408,13 @@ class TestIterSphereChunks:
 
         assert _energy_from_scan(_HeadlessSource()) == pytest.approx(12400.0)
 
+    def test_explicit_energy_wins_over_legacy_default_wavelength(self) -> None:
+        scan = _FakeScan([_FakeFrame(0, image=np.zeros((4, 4)))],
+                         {"tth": [0.0]},
+                         wavelength_m=1.0e-10)
+        scan.energy_eV = 11111.0
+        assert _energy_from_scan(scan) == pytest.approx(11111.0)
+
 
 # ---------------------------------------------------------------------------
 # process_scan_from_nexus
@@ -416,8 +470,8 @@ class TestProcessScanFromSphere:
             chunk_size=3,
             q_bounds=((-1, 1), (-1, 1), (-1, 1)),
         )
-        # Exactly one xu.Gridder3D for the whole scan
-        assert len(_FakeGridder3D.instances) == 1
+        # One Σ(raw·w)/Σ(w) accumulator PAIR for the whole scan
+        assert len(_FakeGridder3D.instances) == 2
         # 11 frames in chunk_size=3 → [3, 3, 3, 2]
         g = _FakeGridder3D.instances[0]
         sizes = [shape[0] for (_, shape) in g.chunks]
@@ -522,8 +576,8 @@ class TestGridSpheresStreaming:
             chunk_size=2,
             q_bounds=((-1, 1), (-1, 1), (-1, 1)),
         )
-        # 12 frames total, chunk_size 2 → 6 chunks, all into ONE gridder
-        assert len(_FakeGridder3D.instances) == 1
+        # 12 frames total, chunk_size 2 → 6 chunks, all into ONE accumulator pair
+        assert len(_FakeGridder3D.instances) == 2
         g = _FakeGridder3D.instances[0]
         sizes = [shape[0] for (_, shape) in g.chunks]
         assert sizes == [2, 2, 2, 2, 2, 2]
@@ -532,7 +586,8 @@ class TestGridSpheresStreaming:
         """If ScanInput.energy is None, each scan resolves its own."""
         s1 = _make_scan(n_frames=2, Nch1=8, Nch2=8)
         s2 = _make_scan(n_frames=2, Nch1=8, Nch2=8)
-        s1.mg_args["wavelength"] = 1.0e-10  # 12398 eV
+        s1.mg_args["wavelength"] = 1.0e-10  # real persisted 1 Å calibration
+        s1._persisted_wavelength_m = 1.0e-10
         s2.mg_args["wavelength"] = 2.0e-10  #  6199 eV
         grid_scans_streaming(
             _default_mapper(Nch1=8, Nch2=8),

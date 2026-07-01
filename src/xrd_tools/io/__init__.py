@@ -66,6 +66,7 @@ from xrd_tools.io.read import (
     get_raw_frame,
     get_thumbnail,
     open_scan,
+    read_scan_data,
     relative_source_path,
     resolve_source_master,
 )

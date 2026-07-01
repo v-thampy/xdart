@@ -290,3 +290,62 @@ def test_prepare_images_rejects_bad_normalization():
     # valid normalization still works
     out = _prepare_images(imgs, [2.0, 4.0])
     assert np.allclose(out[0], 0.5) and np.allclose(out[1], 0.25)
+
+
+def test_stitch_images_backend_pyfai_hist_routes_to_histogram(monkeypatch):
+    """backend='pyfai_hist' builds the same integrators but merges through the
+    q-histogram (pyfai_q_frames -> stitch_q_grid) instead of MultiGeometry,
+    forwarding the radial bin count + azim + unit."""
+    import xrd_tools.integrate.multi as multi
+    import xrd_tools.integrate.stitch_hist as sh
+
+    monkeypatch.setattr(
+        multi, "create_multigeometry_integrators",
+        lambda poni, rot1_angles, rot2_angles=None: "INTEG")
+    seen = {}
+
+    def fake_pyfai_q_frames(images, integrators, *, mask=None, normalization=None):
+        seen["qframes"] = (integrators, mask, normalization)
+        return iter([])
+
+    def fake_stitch_q_grid(frames, *, mode, npt, npt_azim, unit,
+                           radial_range, azimuth_range):
+        frames()                       # the factory must be invokable (replayable)
+        seen["grid"] = dict(mode=mode, npt=npt, npt_azim=npt_azim, unit=unit)
+        return f"HIST_{mode}"
+
+    monkeypatch.setattr(sh, "pyfai_q_frames", fake_pyfai_q_frames)
+    monkeypatch.setattr(sh, "stitch_q_grid", fake_stitch_q_grid)
+
+    imgs = np.zeros((2, 3, 3))
+    r1 = multi.stitch_images(imgs, "PONI", [10.0, 20.0], mode="1d",
+                             npt_1d=512, unit="q_A^-1", backend="pyfai_hist")
+    assert r1 == "HIST_1d"
+    assert seen["grid"]["mode"] == "1d" and seen["grid"]["npt"] == 512
+    assert seen["qframes"][0] == "INTEG"
+
+    r2 = multi.stitch_images(imgs, "PONI", [10.0, 20.0], mode="2d",
+                             npt_rad_2d=256, npt_azim_2d=180, backend="pyfai_hist")
+    assert r2 == "HIST_2d"
+    assert seen["grid"]["npt"] == 256 and seen["grid"]["npt_azim"] == 180
+
+
+def test_stitch_images_pyfai_hist_rejects_non_q_unit(monkeypatch):
+    """The pyfai_hist merge emits q only — a non-q unit must fail loud."""
+    import xrd_tools.integrate.multi as multi
+    monkeypatch.setattr(
+        multi, "create_multigeometry_integrators",
+        lambda poni, rot1_angles, rot2_angles=None: "INTEG")
+    with pytest.raises(ValueError, match="q_A"):
+        multi.stitch_images(np.zeros((1, 3, 3)), "PONI", [10.0],
+                            mode="1d", unit="2th_deg", backend="pyfai_hist")
+
+
+def test_stitch_images_rejects_unknown_backend(monkeypatch):
+    import xrd_tools.integrate.multi as multi
+    monkeypatch.setattr(
+        multi, "create_multigeometry_integrators",
+        lambda poni, rot1_angles, rot2_angles=None: "INTEG")
+    with pytest.raises(ValueError, match="backend"):
+        multi.stitch_images(np.zeros((1, 3, 3)), "PONI", [10.0],
+                            mode="1d", backend="bogus")

@@ -22,6 +22,15 @@ import xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread as itmod
 imageThread = itmod.imageThread
 
 
+def _bind_serial_tail(w):
+    """Bind the DRYed serial-save methods (flush_serial_tail + _h5pool_bracket)
+    onto a stand-in so _enter_pause / _dispatch_batch_serial reach them.  The
+    caller supplies the ``_save_due`` gate (a stub) for the desired outcome."""
+    from types import MethodType as _MT
+    w.flush_serial_tail = _MT(imageThread.flush_serial_tail, w)
+    w._h5pool_bracket = _MT(imageThread._h5pool_bracket, w)
+
+
 # ── _enter_pause: drain/flush ordering + signal ─────────────────────────────
 
 def test_enter_pause_streaming_drains_then_flushes_then_signals():
@@ -66,10 +75,12 @@ def test_enter_pause_serial_tail_wins_over_open_streaming_session(monkeypatch):
         _streaming_session=session, _streaming_sink=sink,   # open but dormant
         _active_scan=scan, xye_only=False, _frames_since_save=4,
         file_lock=threading.RLock(),
+        _save_due=lambda scan, force=False: True,
         _flush_xye_buffer=lambda s: order.append('xye'),
         sigPaused=SimpleNamespace(emit=lambda: order.append('paused')),
     )
     w._enter_pause = MethodType(imageThread._enter_pause, w)
+    _bind_serial_tail(w)
 
     w._enter_pause()
 
@@ -95,10 +106,12 @@ def test_enter_pause_serial_flushes_unsaved_tail(monkeypatch):
         _streaming_session=None, _streaming_sink=None,
         _active_scan=scan, xye_only=False, _frames_since_save=3,
         file_lock=threading.RLock(),
+        _save_due=lambda scan, force=False: True,
         _flush_xye_buffer=lambda s: flushed.append(s),
         sigPaused=SimpleNamespace(emit=lambda: emitted.append('paused')),
     )
     w._enter_pause = MethodType(imageThread._enter_pause, w)
+    _bind_serial_tail(w)
 
     w._enter_pause()
 
@@ -139,6 +152,57 @@ def test_enter_pause_signals_even_if_drain_raises():
     w._enter_pause = MethodType(imageThread._enter_pause, w)
     w._enter_pause()
     assert emitted == ['paused']
+
+
+# ── D₂: the DRYed serial-save helpers (_h5pool_bracket / flush_serial_tail) ──
+
+def test_h5pool_bracket_resumes_even_when_body_raises(monkeypatch):
+    """The symmetric bracket resumes the h5 pool even if the wrapped body raises
+    — a save failure must never strand the pool paused (which would deadlock
+    every later write to that file)."""
+    events = []
+    monkeypatch.setattr(itmod, '_get_h5pool',
+                        lambda: SimpleNamespace(
+                            pause=lambda f: events.append(('pause', f)),
+                            resume=lambda f: events.append(('resume', f))))
+    scan = SimpleNamespace(data_file='x.nxs')
+    w = SimpleNamespace()
+    w._h5pool_bracket = MethodType(imageThread._h5pool_bracket, w)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with w._h5pool_bracket(scan):
+            raise RuntimeError("boom")
+
+    assert events == [('pause', 'x.nxs'), ('resume', 'x.nxs')]   # balanced
+
+
+def test_flush_serial_tail_persists_before_resetting_counter(monkeypatch):
+    """persist-before-evict: ``_save_to_nexus`` (which marks frames persisted)
+    completes BEFORE ``_frames_since_save`` is reset — the save sees the
+    pre-reset counter, so an unsaved frame can never be evicted out from under
+    the writer."""
+    monkeypatch.setattr(itmod, '_get_h5pool',
+                        lambda: SimpleNamespace(pause=lambda f: None,
+                                                resume=lambda f: None))
+    saw_counter = []
+    scan = SimpleNamespace(
+        data_file='x.nxs',
+        _save_to_nexus=lambda: saw_counter.append(w._frames_since_save))
+    w = SimpleNamespace(
+        xye_only=False, _frames_since_save=5, file_lock=threading.RLock(),
+        _save_due=lambda scan, force=False: True,
+        _flush_xye_buffer=lambda s: None,
+    )
+    _bind_serial_tail(w)
+
+    assert w.flush_serial_tail(scan, force=True) is True
+    assert saw_counter == [5]              # counter NOT yet reset when saving
+    assert w._frames_since_save == 0       # reset only AFTER the persist
+
+    # not-due (the _save_due gate says no) and scan-None are no-ops -> False.
+    w._save_due = lambda scan, force=False: False
+    assert w.flush_serial_tail(scan, force=True) is False
+    assert w.flush_serial_tail(None, force=True) is False
 
 
 # ── _wait_if_paused: block until resume/stop, no-op otherwise ────────────────
@@ -335,6 +399,7 @@ def test_serial_dispatch_drains_xye_buffer_without_nxs_save():
     )
     w._dispatch_batch_serial = MethodType(
         imageThread._dispatch_batch_serial, w)
+    _bind_serial_tail(w)
     scan = object()
     w._dispatch_batch_serial(scan, [])
     assert flushed == [scan]
@@ -412,10 +477,12 @@ def test_enter_pause_serial_tail_wins_with_adapter_present(monkeypatch):
         _streaming_session=SimpleNamespace(), _streaming_sink=SimpleNamespace(),
         _active_scan=scan, xye_only=False, _frames_since_save=4,
         file_lock=threading.RLock(),
+        _save_due=lambda scan, force=False: True,
         _flush_xye_buffer=lambda s: order.append('xye'),
         sigPaused=SimpleNamespace(emit=lambda: order.append('paused')),
     )
     w._enter_pause = MethodType(imageThread._enter_pause, w)
+    _bind_serial_tail(w)
     w._enter_pause()
 
     assert adapter.calls == [('quiesce', 30.0)]      # quiesced, but NOT flushed

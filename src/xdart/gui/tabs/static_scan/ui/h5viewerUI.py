@@ -40,7 +40,7 @@ class Ui_Form(object):
         self.label_4 = QLabel(Form)
         self.label_4.setObjectName(u"label_4")
         self.label_4.setMaximumSize(QSize(70, 16777215))
-        self.label_4.setAlignment(Qt.AlignRight|Qt.AlignTrailing|Qt.AlignVCenter)
+        self.label_4.setAlignment(Qt.AlignLeft|Qt.AlignVCenter)
 
         self.gridLayout.addWidget(self.label_4, 1, 1, 1, 1)
 

@@ -12,6 +12,7 @@ import h5py
 import numpy as np
 import pytest
 
+from xrd_tools.core.strictness import StrictPolicy
 from xrd_tools.io import (
     ImageSourceKind,
     classify_image_source,
@@ -199,6 +200,21 @@ def test_load_processed_direct_thumbnail_when_get_raw_frame_errors(
     np.testing.assert_allclose(res.image, thumb, atol=1.0)
 
 
+def test_strict_thumbnail_fallback_loud_raises_graceful_degrades(thumbnail_only):
+    """D7: the display reader's thumbnail fallback is opt-OUT via StrictPolicy.
+    The DEFAULT is graceful (this display API keeps the raw→thumbnail fallback
+    the GUI viewer relies on); an explicit ``StrictPolicy.loud()`` raises the
+    strict-raw error instead of substituting a lower-res thumbnail."""
+    nxs, _thumb = thumbnail_only
+    # explicit loud: raise rather than substitute a thumbnail
+    with pytest.raises(KeyError):
+        load_processed_raw_or_thumbnail(nxs, 0, strict=StrictPolicy.loud())
+    # graceful AND the default degrade to the thumbnail
+    res = load_processed_raw_or_thumbnail(nxs, 0, strict=StrictPolicy.graceful())
+    assert res.source == "thumbnail"
+    assert load_processed_raw_or_thumbnail(nxs, 0).source == "thumbnail"  # default
+
+
 # ── frame_labels are the displayable frames-group labels (guard a/b) ───
 
 @pytest.fixture
@@ -290,3 +306,38 @@ def test_load_image_frame_reads_raw_master(raw_master):
     nxs, raw = raw_master
     img = load_image_frame(nxs, 2)
     np.testing.assert_allclose(img, raw[2])
+
+
+# ── .npy reading (mask files; fabio can't open these) ─────────────────
+
+def test_read_image_npy_2d(tmp_path):
+    """read_image loads a saved 2-D .npy array directly — the path a .npy mask
+    file takes (fabio cannot open .npy)."""
+    from xrd_tools.io.image import read_image
+    arr = np.array([[0, 1], [2, 0]], dtype=np.int32)
+    p = tmp_path / "mask.npy"
+    np.save(p, arr)
+    out = read_image(p)
+    assert out.shape == (2, 2)
+    np.testing.assert_array_equal(out, arr.astype(float))
+
+
+def test_read_image_npy_stack_indexes_frame(tmp_path):
+    """A stacked (>2-D) .npy is indexed by ``frame``."""
+    from xrd_tools.io.image import read_image
+    stack = np.arange(2 * 3 * 4, dtype=np.int32).reshape(2, 3, 4)
+    p = tmp_path / "stack.npy"
+    np.save(p, stack)
+    np.testing.assert_array_equal(read_image(p, frame=1), stack[1].astype(float))
+
+
+def test_load_mask_npy_roundtrip(tmp_path):
+    """A boolean .npy mask round-trips through load_mask (the GUI mask path:
+    str_browse value -> read_image -> bool)."""
+    from xrd_tools.io.image import load_mask
+    mask = np.array([[True, False], [False, True]])
+    p = tmp_path / "m.npy"
+    np.save(p, mask)
+    out = load_mask(p)
+    assert out.dtype == bool
+    np.testing.assert_array_equal(out, mask)

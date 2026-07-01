@@ -1,7 +1,7 @@
 """xdart v2 NeXus writer (xdart 0.37+ schema).
 
-This module produces files conforming to the layout described in
-``xdart/docs/nexus_stitch_refactor_plan.md`` §2.  The single public
+This module produces files conforming to the v2 NeXus schema
+(``xrd_tools.io.schema``).  The single public
 entry point is :func:`save_scan_to_nexus`, called from
 :meth:`LiveScan._save_to_nexus`.
 
@@ -32,7 +32,7 @@ Key invariants of the v2 schema:
    ``/entry/sample/positioners/``.
 5. Derived pyFAI rotations + GI incidence angle live in
    ``/entry/per_frame_geometry/``, recomputed from the raw positioners
-   via the :class:`DiffractometerGeometry` config blob stored in
+   via the :class:`Diffractometer` config blob stored in
    ``/entry/reduction/config/geometry/``.
 6. Provenance (NXprocess) is written via
    :func:`xrd_tools.core.provenance.write_provenance` — versions
@@ -56,7 +56,7 @@ import numpy as np
 from xrd_tools.io.nexus import resolve_stack_compression
 
 if TYPE_CHECKING:  # pragma: no cover
-    from xrd_tools.core.geometry import DiffractometerGeometry
+    from xrd_tools.core.geometry import Diffractometer  # noqa: F401
 
     from xdart.modules.live import LiveScan
 
@@ -469,7 +469,7 @@ def save_scan_to_nexus(
         :class:`LiveScan` carrying the in-memory state.  Must expose
         ``frames`` (ordered), ``scan_data`` (pandas DataFrame),
         ``bai_1d_args``, ``bai_2d_args``, optionally ``geometry``
-        (:class:`DiffractometerGeometry`) and ``incidence_motor``.
+        (:class:`Diffractometer`) and ``incidence_motor``.
     path
         Filesystem path to the ``.nxs`` file.  The writer opens and
         closes its own file handle (NFS-retry semantics included), so
@@ -727,7 +727,9 @@ def _write_reduction(h5f, scan, *, entry: str) -> None:
     geom = getattr(scan, "geometry", None)
     if geom is not None:
         config["geometry"] = {
-            "convention": geom.convention,
+            # dual-class safe: the canonical Diffractometer names it `preset`,
+            # the legacy DiffractometerGeometry names it `convention`.
+            "convention": getattr(geom, "convention", getattr(geom, "preset", "")),
             "mapping_json": geom.to_json(),
             "motor_sources": {
                 m: m for m in geom.all_referenced_motors()

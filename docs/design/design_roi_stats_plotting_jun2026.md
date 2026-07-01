@@ -1,12 +1,22 @@
 # Design: ROI statistics plotting + general `scan_data` popup plotter
 
-**Status:** draft for discussion · 2026-06-14 · planning only (no code)
-**Gated on:** 3e+Phase-5 (one store / `FrameRecord`) done + tested. The live ROI
-monitor reads the *same* raw projection the 2D panel maintains, so it must not be
-designed against a moving store.
+> **2026-06-22 update — folded into the unified Scan Plotter.** The GUI framing
+> (one combined metadata + ROI tool, generic source picker, multi-ROI overlay,
+> subtract-**or-divide** background, a **normalization axis**, and reuse of the
+> now-shipped `ParamTrendMixin` / `BatchAnalysisWorker` / reachable-raw gating)
+> lives in [`design_scan_plotter_metadata_roi_jun2026.md`]. **This doc remains the
+> source of truth for the HEADLESS layer**, reconciled to the shipped API:
+> `RoiSpec`, `RoiSignal`, `RoiStatsPlan` compatibility, `run_roi_signals`, and
+> `run_roi_stats`. Per-ROI reducers/backgrounds and `background_op="divide"` are
+> implemented; the normalization axis (y / column) is a plot-time GUI concern, not a
+> headless-plan field.
+
+**Status:** PARTIAL / implemented-headless · reconciled 2026-06-27. Headless ROI
+signals and the Scan Plotter GUI are implemented; optional ROI-series persistence and
+live monitor remain deferred.
 **Depends on:** N1 raw resolution (✓ shipped), the analysis-plan seam (✓
-`analysis/plans.py`), `scan_data` (✓ persisted + readable), and — for mask-aware
-stats — **R3-C "invalid-pixel policy into core"** (OPEN; see §6.3).
+`analysis/plans.py`), `scan_data` (✓ persisted + readable), and core
+`mask_saturation` / invalid-pixel handling (✓).
 **Pairs with:** [`design_diffractometer_geometry_jun2026.md`] (unrelated geometry,
 but same "headless-first, thin xdart" discipline).
 
@@ -34,7 +44,9 @@ the scan** (memory `planned_features_roi_and_stitching_jun2026`):
 ```
 HEADLESS  (xrd_tools, fully testable with synthetic images + scan_data)
   core/roi.py            RoiSpec  (rect in detector-pixel coords) + reducer math
-  analysis/plans.py      RoiStatsPlan + run_roi_stats(plan, source) -> AnalysisResult
+  analysis/plans.py      RoiSignal + run_roi_signals(signals, source) -> AnalysisResult
+                         RoiStatsPlan + run_roi_stats(plan, source) remain compatibility
+                         wrappers for shared-plan callers
                          (mirrors run_stitch / run_rsm — operates on a FrameSource)
 THIN xdart (Qt only)
   scan_data popup        a standalone QDialog plot window (NOT a display Mode)
@@ -68,27 +80,38 @@ class RoiSpec:
 
 # analysis/plans.py  (alongside StitchPlan/RSMPlan/PeakFitPlan)
 @dataclass(frozen=True, slots=True)
-class RoiStatsPlan:
-    rois: tuple[RoiSpec, ...] = ()          # <=5; if empty, run inserts RoiSpec.full_frame()
+class RoiSignal:
+    roi: RoiSpec
+    reducer: str = "mean"                   # "mean" | "sum" | "max" | "min" | "std"
     background: RoiSpec | None = None
-    reducer: str = "mean"                   # "mean" | "sum"
-    x_key: str | None = None                # scan_data column for x; None -> frame label
-    mask: MaskSpec | None = None            # static detector mask (core.scan.MaskSpec)
-    invalid_policy: InvalidPixelPolicy | None = None   # saturation/dead px (R3-C; §6.3)
-    require_raw: bool = True                 # strict raw; never compute stats off a thumbnail
-    frame_indices: tuple[int, ...] | None = None
+    background_op: str = "subtract"         # "subtract" | "divide"
+    name: str = ""
 
 @dataclass(frozen=True, slots=True)
+class RoiStatsPlan:
+    # Compatibility/shared-config wrapper over RoiSignal.
+    rois: tuple[RoiSpec, ...] = ()
+    background: RoiSpec | None = None
+    reducer: str = "mean"
+    background_op: str = "subtract"
+    x_key: str | None = None
+    mask: Any = None                        # MaskSpec / bool mask / flat-index array (annotated Any)
+    mask_saturation: bool = False
+    frame_indices: tuple[int, ...] | None = None
+
+@dataclass                                   # plain/mutable — NOT frozen+slots (unlike RoiSignal/RoiStatsPlan)
 class RoiStatsResult:
     x: np.ndarray                            # aligned x values (or frame labels)
     x_label: str
-    series: Mapping[str, np.ndarray]         # roi name -> bkg-subtracted stat per frame
+    series: dict[str, np.ndarray]            # roi name -> bkg-subtracted stat per frame
     frames: np.ndarray                       # frame labels
-    valid_counts: Mapping[str, np.ndarray]   # per-roi valid-pixel count per frame
-    diagnostics: Mapping[str, Any]           # e.g. frames where raw was unresolvable
+    valid_counts: dict[str, np.ndarray]      # per-roi valid-pixel count per frame
+    diagnostics: dict[str, Any]              # e.g. frames where raw was unresolvable
 
-def run_roi_stats(plan: RoiStatsPlan, source: FrameSource, *,
-                  frame_indices=None) -> AnalysisResult:
+def run_roi_signals(signals: Sequence[RoiSignal], source: FrameSource, *,
+                    x_key: str | None = None, mask=None, mask_saturation: bool = False,
+                    frame_indices=None, on_progress=None, on_frame=None,
+                    should_cancel=None) -> AnalysisResult:
     """For each frame: load RAW (strict), apply mask + invalid-pixel policy, reduce
     each ROI over VALID pixels, subtract the background density, append to the series.
     x = scan_data[plan.x_key] aligned to frame labels (else the labels themselves).
@@ -188,20 +211,16 @@ pixel*, not the raw background sum), and uses valid-pixel counts everywhere so m
 dead/saturated pixels never distort either the signal or the background. `mean` is
 area-independent as expected.
 
-### 6.3 Mask / saturation awareness — **resolved, with a hard prerequisite**
+### 6.3 Mask / saturation awareness — **implemented**
 ROI mean/sum must exclude masked, dead, and saturated pixels. The invalid-pixel
 policy must be the **same** one the reducer uses, or headless ROI stats and xdart's
-display would disagree (a live≡reload violation). Today that policy is **xdart-only**:
-memory's R3-C item ("expose invalid-pixel/saturation policy on `ReductionPlan`/
-`MaskSpec` in core; the headless reducer doesn't call `core/invalid.py`") is **still
-open**. Therefore:
+display would disagree (a live≡reload violation). This is now core-owned:
 
-- **R3-C-into-core is a prerequisite** for mask-aware ROI stats. `RoiStatsPlan` carries
-  a `MaskSpec` (static detector mask, `core.scan.MaskSpec`) + an `invalid_policy`
-  (saturation/NaN), and `run_roi_stats` applies the **same core helper** the reducer
-  applies. Sequence R3-C first (it is orthogonal, small, and benefits reduction too).
-- Until R3-C lands, ship ROI stats with **static-mask + NaN exclusion only** and a
-  documented caveat that saturation masking matches the reducer **only after** R3-C.
+- `RoiStatsPlan.mask` / `run_roi_signals(mask=...)` carry a static detector mask
+  (`core.scan.MaskSpec` accepted).
+- `mask_saturation=True` opts into the dtype-ceiling saturation mask using the shared
+  core helper, matching `ReductionPlan.mask_saturation`.
+- Non-finite pixels are always excluded.
 
 ### 6.4 Persistence — **resolved: on-demand by default, optional capability-gated save**
 - **Default: compute on demand.** ROIs are interactive/exploratory; persisting every
@@ -224,22 +243,17 @@ popup with y pre-bound to ROI series.
 
 > All steps land **after** 3e+Phase-5 is done + tested.
 
-0. **`core/roi.py`: `RoiSpec` + reducer math.** Rect → clamped pixel slice; mean/sum
-   over valid pixels; `bkg_density` subtraction (§6.2). **Gate:** unit tests on
-   synthetic arrays incl. clamping at edges, full-frame default, masked-pixel
-   exclusion, area-scaled sum.
-1. **(prereq) R3-C invalid-pixel policy into core.** Expose `invalid_policy` on
-   `ReductionPlan`/`MaskSpec`; headless reducer calls the core helper; xdart delegates.
-   **Gate:** headless saturation-masking test; xdart and headless agree on the same
-   frame. *(Orthogonal — can proceed in parallel.)*
-2. **`analysis/plans.py`: `RoiStatsPlan` + `run_roi_stats`.** Reload/completed-scan
-   path; strict raw; NaN + diagnostic on no-raw; x alignment from `scan_data`. **Gate:**
-   synthetic stack + synthetic `scan_data` → assert series, background subtraction,
-   mask exclusion, x alignment, and the no-raw NaN path; `AnalysisResult` JSON-safe.
-3. **xdart: general `scan_data` popup dialog.** Standalone QDialog; x dropdown + y
+0. **DONE: `core/roi.py`: `RoiSpec` + reducer math.** Rect → clamped pixel slice;
+   reducer over valid pixels; `bkg_density` subtraction/division (§6.2).
+1. **DONE: R3-C invalid-pixel policy into core.** `mask_saturation` is available to
+   reduction and ROI stats.
+2. **DONE: `analysis/plans.py`: `RoiSignal` / `RoiStatsPlan` +
+   `run_roi_signals` / `run_roi_stats`.** Reload/completed-scan path; strict raw; NaN
+   + diagnostic on no-raw; x alignment from `scan_data`.
+3. **DONE: xdart general `scan_data` popup dialog.** Standalone QDialog; x dropdown + y
    multi-select over `scan.scan_data`/positioners/`frame_index`; pyqtgraph plot. **Gate:**
    offscreen test feeding a synthetic `scan_data` dict renders the expected traces.
-4. **xdart: ROI items + two-way numeric/mouse sync.** pyqtgraph `RectROI` ↔ numeric
+4. **DONE: xdart ROI items + two-way numeric/mouse sync.** pyqtgraph `RectROI` ↔ numeric
    fields ↔ `RoiSpec`; ≤5 ROIs + a background ROI; "plot" calls `run_roi_stats` and
    feeds the popup as derived y-series. **Gate:** sync round-trip test (mouse-drag →
    `RoiSpec` → fields and back); end-to-end on a reloaded scan.

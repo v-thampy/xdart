@@ -33,6 +33,7 @@ Performance features:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import warnings
@@ -1489,6 +1490,22 @@ def _schema_dataset(g: h5py.Group, group_name: str, name: str, data,
     return g.create_dataset(spec.name, data=data, **kwargs)
 
 
+def _norm_attr(value):
+    """Normalize an attr value (schema-declared or h5py-read) for comparison.
+
+    numpy arrays / tuples / lists → list, bytes → str — exactly the shape
+    ``_create_group_from_schema`` writes (it stores a declared tuple as a list,
+    and h5py reads a string attr back as ``str`` or ``bytes`` by build), so a
+    declared ``("q", "chi")`` compares equal to the on-disk ``["q", "chi"]``."""
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    if isinstance(value, (list, tuple)):
+        return [_norm_attr(v) for v in value]
+    return value
+
+
 def validate_group_against_schema(group: h5py.Group,
                                   group_name: str) -> list[str]:
     """2d: check an on-disk group against its SCHEMA declaration.
@@ -1525,6 +1542,22 @@ def validate_group_against_schema(group: h5py.Group,
                     f"{group_name}/{name}: row count {group[name].shape[0]} "
                     f"!= frame_index length {n}"
                 )
+
+    # nx_attrs pass (Q-C2): every group writer is schema-routed via
+    # _create_group_from_schema, which stamps these static NX attrs — so check
+    # them by strict equality, normalized exactly as that writer stores them
+    # (tuple→list, bytes→str), flagging absence too.  Runtime capability attrs
+    # (two_d_kind, the monotonic flag, primary_mode) are deliberately NOT in
+    # spec.nx_attrs, so they are never required here.
+    for key, value in spec.nx_attrs.items():
+        if key not in group.attrs:
+            problems.append(f"{group_name}: nx_attr {key!r} missing")
+            continue
+        want = _norm_attr(value)
+        got = _norm_attr(group.attrs[key])
+        if got != want:
+            problems.append(
+                f"{group_name}: nx_attr {key!r} = {got!r} != {want!r}")
     return problems
 
 
@@ -1890,6 +1923,9 @@ def write_stitched(
     *,
     stitched_1d: IntegrationResult1D | None = None,
     stitched_2d: IntegrationResult2D | None = None,
+    provenance: "Mapping[str, object] | str | None" = None,
+    frame_records=None,
+    source_base=None,
     compression: str | None = None,
 ) -> None:
     """Write ``/entry/stitched_1d`` / ``/entry/stitched_2d`` — the symmetric
@@ -1900,37 +1936,138 @@ def write_stitched(
     **as-is** ``(n_q, n_chi)`` and read back with dims ``(q, chi)`` — this
     matches the existing xdart writer + ``read_stitched`` so files stay
     interchangeable.  Each group is replaced atomically (idempotent).
+
+    ``provenance`` (the StitchPlan + applied CorrectionStack — typically
+    ``StitchPlan.provenance()``) is stamped into each written group as a
+    ``provenance_json`` vlen-UTF8 blob, the same idiom as the diffractometer
+    ``config_json``; ``None`` writes no blob.  A dict is JSON-encoded; a str is
+    written verbatim (assumed already-JSON).
     """
     ck = _comp_kwargs(compression)
+    prov_json: str | None = None
+    if provenance is not None:
+        prov_json = provenance if isinstance(provenance, str) else json.dumps(
+            provenance, default=str)
 
     if stitched_1d is not None:
         if "stitched_1d" in entry_grp:
             del entry_grp["stitched_1d"]
-        g = entry_grp.create_group("stitched_1d")
-        g.attrs["NX_class"] = "NXdata"
-        g.attrs["signal"] = "intensity"
-        g.attrs["axes"] = ["q"]
-        g.create_dataset("intensity",
-                         data=np.asarray(stitched_1d.intensity, np.float32), **ck)
-        qd = g.create_dataset("q", data=np.asarray(stitched_1d.radial, np.float32))
-        qd.attrs["units"] = stitched_1d.unit
+        # 2b: group + NX attrs + dataset dtypes/compression derive from SCHEMA
+        # (byte-identical to the hand-written form); only the per-axis units and
+        # the provenance_json blob (an additive extra) are stamped by hand.
+        g = _create_group_from_schema(entry_grp, "stitched_1d")
+        _schema_dataset(g, "stitched_1d", "intensity", stitched_1d.intensity, ck=ck)
+        qd = _schema_dataset(g, "stitched_1d", "q", stitched_1d.radial, ck=ck)
+        qd.attrs["units"] = stitched_1d.unit            # units_from="radial_unit"
         if stitched_1d.sigma is not None:
-            g.create_dataset("sigma",
-                             data=np.asarray(stitched_1d.sigma, np.float32), **ck)
+            _schema_dataset(g, "stitched_1d", "sigma", stitched_1d.sigma, ck=ck)
+        if prov_json is not None:
+            g.create_dataset("provenance_json", data=prov_json, dtype=_UTF8_DTYPE)
 
     if stitched_2d is not None:
+        # Fail loud on a transposed cake: read_stitched blindly applies (q, chi)
+        # to the stored array and the stitched validator skips the row-count
+        # block, so a transposed (n_chi, n_q) array round-trips as silently
+        # wrong axes for a square cake.  Enforce the (n_q, n_chi) contract at the
+        # write boundary (complements, never relaxes, the validators).
+        _i2d = np.asarray(stitched_2d.intensity, np.float32)
+        _exp = (len(stitched_2d.radial), len(stitched_2d.azimuthal))
+        if _i2d.shape != _exp:
+            raise ValueError(
+                f"stitched_2d.intensity shape {_i2d.shape} != (len(radial), "
+                f"len(azimuthal)) = {_exp}; the stored cake must be (n_q, n_chi).")
         if "stitched_2d" in entry_grp:
             del entry_grp["stitched_2d"]
-        g = entry_grp.create_group("stitched_2d")
-        g.attrs["NX_class"] = "NXdata"
-        g.attrs["signal"] = "intensity"
-        g.attrs["axes"] = ["q", "chi"]
-        g.create_dataset("intensity",  # (n_q, n_chi) as-is — see docstring
-                         data=np.asarray(stitched_2d.intensity, np.float32), **ck)
-        qd = g.create_dataset("q", data=np.asarray(stitched_2d.radial, np.float32))
-        qd.attrs["units"] = stitched_2d.unit
-        cd = g.create_dataset("chi", data=np.asarray(stitched_2d.azimuthal, np.float32))
-        cd.attrs["units"] = stitched_2d.azimuthal_unit
+        # 2b: schema-routed group + datasets (byte-identical); the (n_q, n_chi)
+        # intensity is stored as-is — see docstring.  Per-axis units + the
+        # provenance_json blob stay hand-stamped.
+        g = _create_group_from_schema(entry_grp, "stitched_2d")
+        _schema_dataset(g, "stitched_2d", "intensity", _i2d, ck=ck)
+        qd = _schema_dataset(g, "stitched_2d", "q", stitched_2d.radial, ck=ck)
+        qd.attrs["units"] = stitched_2d.unit            # units_from="radial_unit"
+        cd = _schema_dataset(g, "stitched_2d", "chi", stitched_2d.azimuthal, ck=ck)
+        cd.attrs["units"] = stitched_2d.azimuthal_unit  # units_from="azimuthal_unit"
+        if prov_json is not None:
+            g.create_dataset("provenance_json", data=prov_json, dtype=_UTF8_DTYPE)
+
+    if frame_records:
+        from xrd_tools.io.nexus_record import write_contributing_frames  # noqa: PLC0415
+        write_contributing_frames(entry_grp, frame_records, source_base=source_base)
+
+
+def write_rsm(
+    entry_grp: h5py.Group,
+    volume: Any,
+    *,
+    provenance: "Mapping[str, object] | str | None" = None,
+    frame_records=None,
+    source_base=None,
+    compression: str | None = None,
+) -> None:
+    """Write ``/entry/rsm`` — a gridded :class:`~xrd_tools.rsm.RSMVolume` as an
+    NXdata group (``h``/``k``/``l`` axes + the 3D ``intensity``), plus an optional
+    ``provenance_json`` blob (the RSMPlan + applied CorrectionStack), the same
+    idiom as :func:`write_stitched` / the diffractometer ``config_json``.  The
+    group is replaced atomically (idempotent).
+    """
+    ck = _comp_kwargs(compression)
+    intensity = np.asarray(volume.intensity, np.float32)
+    expected = (len(volume.h), len(volume.k), len(volume.l))
+    if intensity.shape != expected:
+        raise ValueError(
+            f"rsm.intensity shape {intensity.shape} != "
+            f"(len(h), len(k), len(l)) = {expected}; the stored volume must be "
+            "(n_h, n_k, n_l)."
+        )
+    if "rsm" in entry_grp:
+        del entry_grp["rsm"]
+    # 2b: schema-routed group + datasets (byte-identical).  h/k/l carry NO units
+    # (no units_from in the schema) — do not add any, it would change the bytes.
+    g = _create_group_from_schema(entry_grp, "rsm")
+    _schema_dataset(g, "rsm", "intensity", intensity, ck=ck)
+    for name, axis in (("h", volume.h), ("k", volume.k), ("l", volume.l)):
+        _schema_dataset(g, "rsm", name, axis, ck=ck)
+    if provenance is not None:
+        prov = provenance if isinstance(provenance, str) else json.dumps(
+            provenance, default=str)
+        g.create_dataset("provenance_json", data=prov, dtype=_UTF8_DTYPE)
+
+    if frame_records:
+        from xrd_tools.io.nexus_record import write_contributing_frames  # noqa: PLC0415
+        write_contributing_frames(entry_grp, frame_records, source_base=source_base)
+
+
+def read_rsm(path: Path | str, *, entry: str = "entry"):
+    """Read ``/entry/rsm`` into an :class:`~xrd_tools.rsm.RSMVolume`.
+
+    The ``provenance_json`` blob (if present) is parsed onto
+    :attr:`RSMVolume.provenance`.  Raises :class:`KeyError` when the entry or the
+    ``rsm`` group is absent.
+    """
+    from xrd_tools.rsm.volume import RSMVolume  # noqa: PLC0415
+
+    path = Path(path)
+    with h5py.File(path, "r") as f:
+        if entry not in f:
+            raise KeyError(f"No {entry!r} group in {path}")
+        e = f[entry]
+        if "rsm" not in e:
+            raise KeyError(f"No rsm group in {path}:{entry}")
+        g = e["rsm"]
+        prov = None
+        if "provenance_json" in g:
+            raw = g["provenance_json"][()]
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            try:
+                prov = json.loads(raw)
+            except (ValueError, TypeError):
+                prov = str(raw)
+        return RSMVolume(
+            h=np.asarray(g["h"][()]), k=np.asarray(g["k"][()]),
+            l=np.asarray(g["l"][()]), intensity=np.asarray(g["intensity"][()]),
+            provenance=prov,
+        )
 
 
 def _reindex_scan_data_to_frames(scan_data, frame_indices):
@@ -2082,6 +2219,28 @@ def write_per_frame_geometry(
             ds = g.create_dataset(key, data=np.asarray(arr, dtype=np.float32),
                                   maxshape=(None,), chunks=(64,), **ck)
             ds.attrs["units"] = "rad"
+
+
+def write_diffractometer(entry_grp: h5py.Group, diffractometer) -> None:
+    """Write ``/entry/diffractometer`` — the canonical :class:`Diffractometer`
+    serialized to a single ``config_json`` vlen-UTF8 string blob.
+
+    Scan-level + capability-gated (``diffractometer``): a reloaded scan
+    reconstructs the full instrument geometry (both adapter views + the fitted
+    ``DetectorCalibration`` + preset + motor map) for offline stitch/RSM with
+    no GUI.  ``None`` (or a geometry without ``to_json``) → no-op / clears any
+    stale group, so an old file simply lacks the group (reader → ``None``).
+    """
+    to_json = getattr(diffractometer, "to_json", None)
+    if diffractometer is None or not callable(to_json):
+        if "diffractometer" in entry_grp:
+            del entry_grp["diffractometer"]
+        return
+    blob = to_json()
+    if "diffractometer" in entry_grp:
+        del entry_grp["diffractometer"]
+    g = _create_group_from_schema(entry_grp, "diffractometer")
+    g.create_dataset("config_json", data=blob, dtype=_UTF8_DTYPE)
 
 
 def write_scan_metadata(
@@ -2639,7 +2798,7 @@ def _read_data_group(
 # ===========================================================================
 # v2 schema reader (xdart 0.37+)
 # ---------------------------------------------------------------------------
-# See xdart/docs/nexus_stitch_refactor_plan.md §2 for the layout.
+# The v2 schema layout is defined in ``xrd_tools.io.schema``.
 # v1 (xdart ≤ 0.36.x) is intentionally not supported — re-reduce old
 # data with current xdart if you need to view it.
 #
@@ -3063,6 +3222,20 @@ def read_stitched(
     path = Path(path)
     data_vars: dict[str, tuple] = {}
     coords: dict[str, np.ndarray] = {}
+    attrs: dict[str, object] = {}
+
+    def _read_provenance(g):
+        """The provenance_json blob → a parsed dict (or the raw string if it
+        isn't JSON; absent → None)."""
+        if "provenance_json" not in g:
+            return None
+        raw = g["provenance_json"][()]
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        try:
+            return json.loads(raw)
+        except (ValueError, TypeError):
+            return str(raw)
 
     with h5py.File(path, "r") as f:
         if entry not in f:
@@ -3080,6 +3253,9 @@ def read_stitched(
                 data_vars["stitched_1d_sigma"] = (
                     ("q",), np.asarray(g["sigma"][()])
                 )
+            prov = _read_provenance(g)
+            if prov is not None:
+                attrs["stitched_1d_provenance"] = prov
         if has_2d:
             g = e["stitched_2d"]
             coords.setdefault("q", np.asarray(g["q"][()]))
@@ -3087,8 +3263,11 @@ def read_stitched(
             data_vars["stitched_2d"] = (
                 ("q", "chi"), np.asarray(g["intensity"][()])
             )
+            prov = _read_provenance(g)
+            if prov is not None:
+                attrs["stitched_2d_provenance"] = prov
 
-    return xr.Dataset(data_vars=data_vars, coords=coords)
+    return xr.Dataset(data_vars=data_vars, coords=coords, attrs=attrs)
 
 
 __all__ = [
@@ -3107,6 +3286,8 @@ __all__ = [
     "validate_integrated_stack_write",
     "write_integrated_stack",
     "write_stitched",
+    "write_rsm",
+    "read_rsm",
     "upsert_scan_metadata",
     "upsert_positioners",
     "upsert_per_frame_geometry",

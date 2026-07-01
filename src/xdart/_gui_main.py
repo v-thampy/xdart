@@ -54,10 +54,11 @@ logger = logging.getLogger(__name__)
 # Qt imports
 from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
+    QtCore: Any = None
     QtGui: Any = None
     QtWidgets: Any = None
 else:
-    from pyqtgraph.Qt import QtGui, QtWidgets
+    from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 # This module imports
 from xdart.gui.mainWindow import Ui_MainWindow
@@ -65,6 +66,36 @@ from xdart.gui import tabs
 
 
 QMainWindow = QtWidgets.QMainWindow
+
+
+def _xdart_excepthook(exc_type, exc, tb):
+    """Log uncaught GUI-slot exceptions without terminating the process."""
+    if issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+        sys.__excepthook__(exc_type, exc, tb)
+        return
+    logger.error("Unhandled exception in xdart GUI", exc_info=(exc_type, exc, tb))
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        return
+
+    def _show_error():
+        try:
+            QtWidgets.QMessageBox.critical(
+                None,
+                "xdart error",
+                f"{exc_type.__name__}: {exc}\n\n"
+                "The error was logged; the application will stay open.",
+            )
+        except Exception:
+            logger.debug("Could not show GUI exception dialog", exc_info=True)
+
+    try:
+        QtCore.QTimer.singleShot(0, _show_error)
+    except Exception:
+        logger.debug("Could not schedule GUI exception dialog", exc_info=True)
+
+
+sys.excepthook = _xdart_excepthook
 
 
 class Main(QMainWindow):
@@ -89,6 +120,7 @@ class Main(QMainWindow):
             self.main_widget.enable_async_hydration()
         except Exception:
             pass
+        self._init_theme_menu()
 
         # Default size: 90% of the available screen, centered (was a fixed
         # 1600x920, whose width clamped the middle display panels below
@@ -103,6 +135,84 @@ class Main(QMainWindow):
                              avail.y() + (avail.height() - h) // 2, w, h)
         except Exception:
             self.resize(1600, 920)
+
+    def _init_theme_menu(self):
+        """Add a Theme (Dark/Light) submenu to the in-window Config menu.
+
+        The visible File/Config controls are the H5Viewer toolbar's tool-buttons
+        (``h5viewer.paramMenu``), NOT the QMainWindow menu bar (which on macOS is
+        the native top-of-screen bar).  Add Theme there so it sits next to
+        Save/Load/Advanced where the user expects it.  Persisted in QSettings;
+        switching re-applies the QSS live (the pyqtgraph plot-canvas background
+        is snapshotted at widget creation, so a full plot recolor needs a
+        relaunch -- a later stage owns per-mode plot backgrounds)."""
+        try:
+            config_menu = self.main_widget.h5viewer.paramMenu
+        except Exception:
+            logger.exception("Could not locate the Config menu for the theme toggle")
+            return
+        settings = QtCore.QSettings("xdart", "xdart")
+        current = settings.value("theme", "dark")
+        if current not in ("dark", "light"):
+            current = "dark"
+        panel_font_size = settings.value(
+            "control_panel_font_size", "default")
+        if panel_font_size not in ("small", "default", "large"):
+            panel_font_size = "default"
+        config_menu.addSeparator()
+        theme_menu = config_menu.addMenu("Theme")
+        group = QtGui.QActionGroup(self)
+        group.setExclusive(True)
+        for name, label in (("dark", "Dark"), ("light", "Light")):
+            action = QtGui.QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(name == current)
+            action.triggered.connect(
+                lambda _checked=False, n=name: self._set_theme(n))
+            group.addAction(action)
+            theme_menu.addAction(action)
+        font_menu = config_menu.addMenu("Control Panel Font Size")
+        font_group = QtGui.QActionGroup(self)
+        font_group.setExclusive(True)
+        for size, label in (
+            ("small", "Small"),
+            ("default", "Default"),
+            ("large", "Large"),
+        ):
+            action = QtGui.QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(size == panel_font_size)
+            action.triggered.connect(
+                lambda _checked=False, s=size:
+                    self._set_control_panel_font_size(s))
+            font_group.addAction(action)
+            font_menu.addAction(action)
+
+    def _set_theme(self, name):
+        """Apply theme ``name`` live and persist the choice."""
+        from xdart.gui.themes import apply_theme
+        settings = QtCore.QSettings("xdart", "xdart")
+        panel_font_size = settings.value(
+            "control_panel_font_size", "default")
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            apply_theme(
+                app, name, control_panel_font_size=panel_font_size)
+        settings.setValue("theme", name)
+
+    def _set_control_panel_font_size(self, size):
+        """Apply the Controls-panel-only font-size preset and persist it."""
+        if size not in ("small", "default", "large"):
+            size = "default"
+        settings = QtCore.QSettings("xdart", "xdart")
+        settings.setValue("control_panel_font_size", size)
+        theme = settings.value("theme", "dark")
+        if theme not in ("dark", "light"):
+            theme = "dark"
+        from xdart.gui.themes import apply_theme
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            apply_theme(app, theme, control_panel_font_size=size)
 
     def exit(self):
         try:
@@ -161,14 +271,22 @@ def _apply_cli_session_args(argv):
 def run():
     argv = _apply_cli_session_args(sys.argv)
     app = QtWidgets.QApplication(argv)
-    # N8: apply dark theme before any widget construction so
+    # N8: apply the saved theme before any widget construction so
     # pyqtgraph plot backgrounds are set in time (pyqtgraph
     # snapshots the config at widget creation).
     try:
-        from xdart.gui.themes import apply_dark_theme
-        apply_dark_theme(app)
+        from xdart.gui.themes import apply_theme
+        settings = QtCore.QSettings("xdart", "xdart")
+        theme = settings.value("theme", "dark")
+        if theme not in ("dark", "light"):
+            theme = "dark"
+        panel_font_size = settings.value(
+            "control_panel_font_size", "default")
+        if panel_font_size not in ("small", "default", "large"):
+            panel_font_size = "default"
+        apply_theme(app, theme, control_panel_font_size=panel_font_size)
     except Exception:
-        logger.exception("Failed to apply dark theme; using Qt default")
+        logger.exception("Failed to apply theme; using Qt default")
     mw = Main()
     mw.show()
     app.exec()

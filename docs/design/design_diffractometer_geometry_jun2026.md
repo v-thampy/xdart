@@ -1,15 +1,16 @@
 # Design: one shared `Diffractometer` geometry object
 
-**Status:** draft for discussion · 2026-06-14 · planning only (no code)
-**Promote to:** ADR-0007 once ratified (this is a "kill parallel representations"
-decision that freezes a public API + a persisted group, so it deserves an ADR).
+**Status:** IMPLEMENTED / ADR-backed · reconciled 2026-06-27. Ratified by
+**ADR-0007** (`docs/decisions/0007-one-shared-diffractometer-geometry-object.md`).
+Headless core, consumer repointing, legacy bridges, capability-gated persistence,
+`from_pyfai_goniometer`, and `refine_goniometer` are implemented and test-gated. Remaining
+work is live confirmation and deferred convention validation noted in the stitch/RSM build
+plan. This doc stays the detailed reference; the ADR is the decision record.
+**Originally drafted:** 2026-06-14.
 **Consumed by:** [`design_stitching_jun2026.md`](design_stitching_jun2026.md) and the
 RSM viewer/reconcile work; both reference this object as their single geometry input.
-**Gated on:** nothing in this doc is blocked by 3e/Phase-5 (geometry is orthogonal to
-the FrameRecord store collapse), but the *consumer rewiring* should land **after**
-3e+Phase-5 is done + tested so it is not a moving target against the store work.
-This is its own pervasive `core/geometry` refactor — **do not run it concurrently
-with the store collapse** (memory `planned_features_roi_and_stitching_jun2026`).
+**Gated on:** no remaining code gate in this doc; real-data convention checks are tracked
+in [`stitching_rsm_build_plan.md`](stitching_rsm_build_plan.md).
 
 ---
 

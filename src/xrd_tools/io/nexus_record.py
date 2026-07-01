@@ -52,6 +52,11 @@ __all__ = [
     "stamp_source_base",
     "ensure_frames_container",
     "write_frame_record",
+    "frame_record_key",
+    "write_contributing_frames",
+    "iter_frame_record_groups",
+    "frame_record_labels",
+    "harvest_frame_records",
     "write_frame_source_ref",
     "write_thumbnail",
     "drop_integrated_rows",
@@ -223,6 +228,220 @@ def write_frame_record(frames_grp: h5py.Group, frame_key: str, *,
     if timestamp is not None and "timestamp" not in fg:
         fg["timestamp"] = str(timestamp)
     return fg
+
+
+def frame_record_key(scan_label, frame_index: int) -> str:
+    """The ``/entry/frames/<key>`` group name for one contributing frame.
+
+    ``scan_label is None`` → flat ``frame_NNNN`` (single-scan, the reduction
+    convention — backward-compatible).  A scan label → nested
+    ``scan_<label>/frame_NNNN`` so frames from **grouped** scans (a Stitch/RSM over
+    several scans) don't collide on the flat index.  The h5viewer Frames panel
+    surfaces these as ``"<label>-<frame>"``.
+    """
+    base = f"frame_{int(frame_index):04d}"
+    return base if scan_label is None else f"scan_{scan_label}/{base}"
+
+
+def write_contributing_frames(entry_grp: h5py.Group, records, *,
+                              source_base=None) -> int:
+    """Write the per-frame **source records** for a Stitch/RSM result — the
+    enabler for the raw-image popup (resolve a contributing frame from the saved
+    ``.nxs``).  ``records`` is an iterable of mappings with ``frame_index`` and
+    optionally ``scan_label`` / ``source_path`` / ``source_frame_index`` /
+    ``thumbnail``.  Multi-scan records (a ``scan_label``) nest under
+    ``scan_<label>/``; single-scan stays flat.  Returns the count written.
+    """
+    records = list(records)
+    if not records:
+        return 0
+    if source_base is not None:
+        stamp_source_base(entry_grp, source_base)
+    frames = ensure_frames_container(entry_grp)
+    # pre-create the scan subgroups so they carry NX_class (require_group via a
+    # nested key would leave the intermediate group bare).
+    for sl in sorted({r.get("scan_label") for r in records
+                      if r.get("scan_label") is not None}, key=str):
+        _nxcollection(frames, f"scan_{sl}")
+    for r in records:
+        write_frame_record(
+            frames, frame_record_key(r.get("scan_label"), r["frame_index"]),
+            source_path=r.get("source_path"),
+            source_frame_index=int(r.get("source_frame_index") or 0),
+            thumbnail=r.get("thumbnail"), source_base=source_base)
+    return len(records)
+
+
+def _frame_label_int(name: str):
+    """``frame_0007`` → ``7`` (the int label), or ``None`` if it doesn't parse."""
+    try:
+        return int(name.removeprefix("frame_"))
+    except ValueError:
+        return None
+
+
+def iter_frame_record_groups(frames_grp):
+    """Yield ``(scan_label, frame_label, group)`` for every contributing-frame
+    record, descending **one level** into nested ``scan_<N>/`` subgroups.
+
+    ``scan_label`` is ``None`` for flat single-scan records (``frame_NNNN``) and
+    the ``<N>`` string (as written) for grouped-scan records
+    (``scan_<N>/frame_NNNN``).  Intermediate ``scan_<N>`` containers are not
+    yielded themselves — only the leaf frame groups.  This is the grouped-aware
+    counterpart to the flat ``frames/frame_NNNN`` iteration the integrated-frame
+    readers do; use it wherever a Stitch/RSM result's contributing frames must be
+    surfaced (the Frames-panel raw popup).
+    """
+    if frames_grp is None:
+        return
+    for name, obj in frames_grp.items():
+        if not isinstance(obj, h5py.Group):
+            continue
+        if name.startswith("frame_"):
+            yield None, _frame_label_int(name), obj
+        elif name.startswith("scan_"):
+            scan_label = name.removeprefix("scan_")
+            for sub_name, sub_obj in obj.items():
+                if isinstance(sub_obj, h5py.Group) and sub_name.startswith("frame_"):
+                    yield scan_label, _frame_label_int(sub_name), sub_obj
+
+
+def frame_record_labels(frames_grp):
+    """The Frames-panel display list for a result's contributing frames.
+
+    Returns ``[(label_text, scan_label, frame_label), ...]`` — only records with
+    something loadable (a thumbnail or a source pointer).  Flat records sort
+    first as bare ``"<frame>"``; grouped records follow as ``"<scan>-<frame>"``
+    (Vivek's convention for grouped Stitch/RSM, e.g. ``5-1, 5-2, … 7-1``).
+    ``scan_label``/``frame_label`` are the resolution address — pass them to
+    :func:`~xrd_tools.io.read.get_raw_frame` (``scan=scan_label, frame=…``).
+    """
+    flat: list[int] = []
+    grouped: list[tuple[str, int]] = []
+    for scan_label, frame_label, grp in iter_frame_record_groups(frames_grp):
+        if frame_label is None:
+            continue
+        if "thumbnail" not in grp and "source" not in grp:
+            continue   # nothing the raw popup could resolve
+        if scan_label is None:
+            flat.append(frame_label)
+        else:
+            grouped.append((scan_label, frame_label))
+    flat.sort()
+    grouped.sort(key=lambda t: (str(t[0]), t[1]))
+    out = [(str(f), None, f) for f in flat]
+    out += [(f"{s}-{f}", s, f) for s, f in grouped]
+    return out
+
+
+def harvest_frame_records(source, *, scan_labels=None, selected_labels=None,
+                          with_thumbnails: bool = False):
+    """Build the ``frame_records`` list for a Stitch/RSM result from its source(s).
+
+    Mirrors what :class:`~xrd_tools.reduction.NexusSink` writes per frame, but for
+    a *whole-result* writer (:func:`write_stitched` / :func:`write_rsm` via
+    :func:`write_contributing_frames`).  ``source`` may be a single FrameSource, a
+    sequence of them (the ``run_rsm`` grouping), or a
+    :class:`~xrd_tools.sources.composite.CompositeFrameSource` (the ``run_stitch``
+    grouping) — the members are expanded either way.
+
+    * one source                  → flat records (``scan_label=None``);
+    * several sources/members      → one ``scan_label`` per member.  ``scan_labels``
+      overrides (e.g. the real scan numbers ``[5, 7, 8]``); the default is
+      ``1..N``.
+
+    Pointer-only by default (cheap — no image load): each record carries the
+    member's ``source_path`` / ``source_frame_index``, which the raw popup
+    resolves to the original master.  ``with_thumbnails=True`` additionally bakes a
+    downsampled preview (loads each frame).
+
+    ``selected_labels`` restricts the records to the frames that **actually
+    contributed** — pass ``run_stitch``'s reduced ``frame_indices`` here (in the
+    *source*'s own label space: the composite's GLOBAL index for a group, the
+    source's own labels otherwise).  ``None`` (the default) records every frame.
+    Without this, a subselected stitch would persist records for frames that were
+    never merged.
+    """
+    members = _expand_frame_sources(source)
+    if scan_labels is None:
+        labels = [None] if len(members) == 1 else list(range(1, len(members) + 1))
+    else:
+        labels = list(scan_labels)
+        if len(labels) != len(members):
+            raise ValueError(
+                f"scan_labels has {len(labels)} entries but the source expands to "
+                f"{len(members)} member(s)")
+    wanted = _partition_selected_local_labels(source, members, selected_labels)
+    records: list[dict] = []
+    for mi, (scan_label, member) in enumerate(zip(labels, members)):
+        want = wanted[mi] if wanted is not None else None
+        for idx in member.frame_indices:
+            if want is not None and int(idx) not in want:
+                continue
+            sf = member.frame_for(idx)
+            sp = getattr(sf, "source_path", None)
+            rec = {
+                "scan_label": scan_label,
+                "frame_index": int(idx),
+                "source_path": str(sp) if sp is not None else None,
+                "source_frame_index": int(getattr(sf, "source_frame_index", None) or 0),
+            }
+            if with_thumbnails:
+                try:
+                    rec["thumbnail"] = make_thumbnail_array(
+                        np.asarray(member.load_frame(idx), dtype=np.float32))
+                except Exception:  # noqa: BLE001 — a preview is best-effort
+                    logger.debug("harvest_frame_records: thumbnail failed for "
+                                 "%s frame %s", scan_label, idx, exc_info=True)
+            records.append(rec)
+    return records
+
+
+def _partition_selected_local_labels(source, members, selected_labels):
+    """Map ``selected_labels`` (in ``source``'s own label space) to a per-member
+    set of LOCAL frame labels — ``None`` means "no restriction".
+
+    For a :class:`~xrd_tools.sources.composite.CompositeFrameSource` the selection
+    is in the GLOBAL ``0..N-1`` index, so it's resolved through the composite's
+    ``_map`` (``global → (member_pos, local_label)``).  For a single source the
+    selection is already that source's own labels.  A bare multi-member sequence
+    with a selection is ambiguous — there is no global→local map to honour the
+    selection, so silently widening to ALL frames would be a label-space footgun;
+    raise instead (no caller hits this: run_stitch wraps groups in a
+    CompositeFrameSource before harvest)."""
+    if selected_labels is None:
+        return None
+    sel = {int(s) for s in selected_labels}
+    gmap = getattr(source, "_map", None)   # composite: list[(member_pos, local)]
+    if gmap is not None:
+        per: list[set] = [set() for _ in members]
+        for g in sel:
+            member_pos, local = gmap[int(g)]
+            per[int(member_pos)].add(int(local))
+        return per
+    if len(members) == 1:
+        return [sel]
+    raise ValueError(
+        f"selected_labels={sorted(sel)} given for a bare {len(members)}-member "
+        "sequence with no global→local index map; wrap the group in a "
+        "CompositeFrameSource (or omit selected_labels) — silently recording all "
+        "frames would ignore the selection.")
+
+
+def _expand_frame_sources(source) -> list:
+    """A composite → its members; a sequence → its items; a single source → ``[it]``.
+
+    Duck-typed (no import of CompositeFrameSource) to keep this io module free of a
+    ``sources`` dependency.  A CompositeFrameSource re-indexes its frames to a
+    global ``0..N-1``; harvesting from its **members** instead recovers each
+    contributing scan's own per-frame labels (so the records are scan-tagged, not
+    flattened)."""
+    members = getattr(source, "members", None)
+    if members is not None:
+        return list(members)
+    if isinstance(source, (list, tuple)):
+        return list(source)
+    return [source]
 
 
 # ---------------------------------------------------------------------------

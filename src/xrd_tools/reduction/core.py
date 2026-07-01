@@ -9,6 +9,7 @@ integration loops itself.
 
 from __future__ import annotations
 
+import copy
 import os
 import queue
 import threading
@@ -37,6 +38,12 @@ from xrd_tools.core.scan import (
     MaskSpec as CoreMaskSpec,
     Scan as CoreScan,
     ScanFrame,
+)
+from xrd_tools.core.strictness import (
+    GIAllDummyError,
+    MissingNormalizationError,
+    StrictnessError,
+    StrictPolicy,
 )
 from xrd_tools.io.export import write_xye
 from xrd_tools.io.image import read_image
@@ -612,6 +619,16 @@ class NexusSink:
                             self._h5[self.entry], scan_data,
                             list(scan.frame_indices), geom,
                         )
+                    # Persist the canonical Diffractometer blob for offline
+                    # stitch/RSM — but ONLY when a complete object is present.
+                    # Today's Scan.geometry is a bare DiffractometerGeometry
+                    # (pyFAI half only, no xu axes / calibration), so persisting
+                    # it would be a misleading partial blob; the step-4 rewire
+                    # threads the full Diffractometer in and flips this on.
+                    from xrd_tools.core.geometry import Diffractometer
+                    if isinstance(geom, Diffractometer):
+                        from xrd_tools.io.nexus import write_diffractometer
+                        write_diffractometer(self._h5[self.entry], geom)
             self._h5.flush()
             self._h5.close()
             self._h5 = None
@@ -705,6 +722,10 @@ class ReductionSession:
     # back from the sink's output.  Replace/re-feed detection is tracked
     # independently (``_seen_idxs``), so A1 idempotency is unaffected.
     retain_products: bool = True
+    # D7: per-degradation loud/graceful policy.  Default LOUD — a headless run
+    # RAISES on missing-normalization / GI-all-dummy instead of writing bad
+    # data; the xdart GUI passes StrictPolicy.graceful() (never abort a save).
+    strict: StrictPolicy = field(default_factory=StrictPolicy.loud)
     scan: Scan = field(init=False)
     result: ReductionResult | None = field(default=None, init=False)
     integrator_provider_builds: int = field(default=0, init=False)
@@ -1038,6 +1059,7 @@ class ReductionSession:
             self._frame_masks,
             self.cancel_token, self._warned_monitor_keys,
             include_corrected_image=callable(worker_process),
+            strict=self.strict,
         )
         try:
             if callable(worker_process):
@@ -1441,10 +1463,19 @@ class ReductionSession:
                         self._frame_masks,
                         cancel_token=self.cancel_token,
                         warned_monitor_keys=self._warned_monitor_keys,
+                        strict=self.strict,
                     )
                 except _ReductionCancelled:
                     self._mark_cancelled()
                     break
+                except BaseException as exc:
+                    # Per-frame integration failure (incl. a loud StrictnessError):
+                    # record + SKIP this frame, never abort the whole chunk — mirror
+                    # the streaming submit path so chunked is symmetric and honours
+                    # "reject per frame, never abort a whole-scan save".  The other
+                    # frames still process; finish() re-raises once (fail-loud).
+                    self._record_failure(exc)
+                    continue
                 pending.append((frame, reduction))
             else:
                 pending.append((
@@ -1465,6 +1496,7 @@ class ReductionSession:
                         self._frame_masks,
                         self.cancel_token,
                         self._warned_monitor_keys,
+                        strict=self.strict,
                     ),
                 ))
 
@@ -1481,6 +1513,13 @@ class ReductionSession:
                     self._mark_cancelled()
                     _cancel_pending_futures(pending[pos + 1:], worker=self._worker)
                     break
+                except BaseException as exc:
+                    # Per-frame integration failure (incl. a loud StrictnessError)
+                    # surfacing from the worker future: record + SKIP, never abort
+                    # the chunk — symmetric with the streaming submit path.  The
+                    # outer BaseException handler still covers sink/IO failures.
+                    self._record_failure(exc)
+                    continue
                 idx = int(frame.index)
                 # Re-feeding an already-processed index (reintegrate / replace
                 # re-feed) is a *replace*, not a new completion: overwrite the
@@ -1544,6 +1583,7 @@ def run_reduction(
     execution: str | None = None,
     inflight_max: int | None = None,
     retain_products: bool | None = None,
+    strict: StrictPolicy | None = None,
 ) -> ReductionResult:
     """Run a headless reduction job over all frames in ``scan`` or a source.
 
@@ -1602,6 +1642,12 @@ def run_reduction(
         data lands on disk per frame; read it back from the file), ``True``
         otherwise (MemorySink / no sink / chunked — ``result.frames`` is the
         only way to get results back).  Pass an explicit bool to override.
+    strict
+        :class:`~xrd_tools.core.strictness.StrictPolicy` — whether per-frame
+        degradations (missing normalization, an all-dummy 2D integration) RAISE
+        or degrade.  ``None`` (default) = :meth:`StrictPolicy.loud`: a headless
+        run fails loudly instead of persisting bad data.  Pass
+        ``StrictPolicy.graceful()`` for the GUI's never-abort behavior.
     """
     sink_obj = _coerce_sink(sink)
     durable_sink = not _sink_is_memory_only(sink_obj)
@@ -1624,6 +1670,7 @@ def run_reduction(
         execution=execution,
         inflight_max=inflight_max,
         retain_products=retain_products,
+        strict=strict if strict is not None else StrictPolicy.loud(),
     ) as session:
         if execution == "streaming":
             # Streaming drains via submit() (process() is rejected); feed every
@@ -2032,7 +2079,18 @@ class _ReductionIntegratorProvider:
             return self.ai
         ai = getattr(self._local, "ai", None)
         if ai is None:
-            ai = poni_to_integrator(self.scan.poni)
+            # Per-worker AI (pyFAI AIs aren't safe to share across threads).
+            # Deep-copy the base integrator instead of rebuilding from
+            # scan.poni: poni_to_integrator() cannot recover a GENERIC/unnamed
+            # detector's pixel size (PONI carries only a detector *name*), so a
+            # worker rebuild drops _pixel1/_pixel2 -> None and integrate1d
+            # crashes in calc_cartesian_positions.  A deepcopy keeps the
+            # detector (pixel sizes intact), stays thread-isolated, and is
+            # geometrically identical to the owner thread's AI (strengthening
+            # live==batch==reload equivalence).  Fall back to a poni rebuild
+            # only when there is no base AI (pure-PONI, named-detector path).
+            ai = copy.deepcopy(self.ai) if self.ai is not None \
+                else poni_to_integrator(self.scan.poni)
             self._local.ai = ai
         return ai
 
@@ -2043,15 +2101,21 @@ class _ReductionIntegratorProvider:
             return self.fi
         fi = getattr(self._local, "fi", None)
         if fi is None:
-            gi = self.plan.gi
-            if gi is None:
-                return None
-            fi = poni_to_fiber_integrator(
-                self.scan.poni,
-                incident_angle=float(self.initial_incident_angle or 0.0),
-                tilt_angle=float(gi.tilt_angle),
-                sample_orientation=int(gi.sample_orientation),
-            )
+            if self.fi is not None:
+                # Same reasoning as standard(): deepcopy the base
+                # FiberIntegrator to keep a generic detector's pixel size
+                # (a poni rebuild would drop it) and stay thread-isolated.
+                fi = copy.deepcopy(self.fi)
+            else:
+                gi = self.plan.gi
+                if gi is None:
+                    return None
+                fi = poni_to_fiber_integrator(
+                    self.scan.poni,
+                    incident_angle=float(self.initial_incident_angle or 0.0),
+                    tilt_angle=float(gi.tilt_angle),
+                    sample_orientation=int(gi.sample_orientation),
+                )
             self._local.fi = fi
         return fi
 
@@ -2123,6 +2187,7 @@ def _reduce_frame(
     warned_monitor_keys: set[str] | None = None,
     *,
     include_corrected_image: bool = False,
+    strict: StrictPolicy | None = None,
 ) -> FrameReduction:
     if cancel_token is not None and cancel_token.cancelled:
         raise _ReductionCancelled
@@ -2163,7 +2228,7 @@ def _reduce_frame(
                 mask=mask,
                 incident_angle=incident_angle,
                 normalization_factor=_normalization_for(
-                    frame, plan.integration_1d, warned_monitor_keys),
+                    frame, plan.integration_1d, warned_monitor_keys, strict=strict),
             )
             if plan.integration_1d is not None else None
         )
@@ -2176,7 +2241,7 @@ def _reduce_frame(
                 mask=mask,
                 incident_angle=incident_angle,
                 normalization_factor=_normalization_for(
-                    frame, plan.integration_2d, warned_monitor_keys),
+                    frame, plan.integration_2d, warned_monitor_keys, strict=strict),
             )
             if plan.integration_2d is not None else None
         )
@@ -2205,7 +2270,7 @@ def _reduce_frame(
                 radial_range=p1.radial_range,
                 polarization_factor=p1.polarization_factor,
                 normalization_factor=_normalization_for(
-                    frame, p1, warned_monitor_keys),
+                    frame, p1, warned_monitor_keys, strict=strict),
                 **chi_extra,
             )
         else:
@@ -2222,7 +2287,7 @@ def _reduce_frame(
                     error_model=p1.error_model,
                     polarization_factor=p1.polarization_factor,
                     normalization_factor=_normalization_for(
-                        frame, p1, warned_monitor_keys),
+                        frame, p1, warned_monitor_keys, strict=strict),
                     **p1.extra,
                 )
                 if p1 is not None else None
@@ -2241,7 +2306,7 @@ def _reduce_frame(
                 error_model=plan.integration_2d.error_model,
                 polarization_factor=plan.integration_2d.polarization_factor,
                 normalization_factor=_normalization_for(
-                    frame, plan.integration_2d, warned_monitor_keys),
+                    frame, plan.integration_2d, warned_monitor_keys, strict=strict),
                 **plan.integration_2d.extra,
             )
             if plan.integration_2d is not None else None
@@ -2249,6 +2314,19 @@ def _reduce_frame(
         if r2d is not None and plan.integration_2d.azimuth_offset:
             r2d.azimuthal = r2d.azimuthal + float(plan.integration_2d.azimuth_offset)
 
+    # D7 loud: a 2D integration with no usable data (all-dummy) would persist
+    # nothing meaningful.  Under a loud policy RAISE (the streaming writer
+    # records the failure + skips the frame, then re-raises at finish() — never
+    # writing bad data); under graceful the all-dummy result is returned and
+    # dropped per-frame downstream (the publication gate / writer), never
+    # aborting a whole-scan save.
+    if (strict is not None and strict.gi_all_dummy
+            and r2d is not None and _is_all_dummy_2d(r2d)):
+        raise GIAllDummyError(
+            f"frame {frame.index}: the 2D integration is entirely dummy "
+            "(no usable data); pass StrictPolicy.graceful() to drop it "
+            "per-frame instead of raising."
+        )
     return FrameReduction(
         frame_index=frame.index,
         result_1d=r1d,
@@ -2639,6 +2717,8 @@ def _normalization_for(
     frame: Frame,
     plan: Integration1DPlan | Integration2DPlan,
     warned_keys: set[str] | None = None,
+    *,
+    strict: StrictPolicy | None = None,
 ) -> float | None:
     if frame.normalization_factor is not None:
         return float(frame.normalization_factor)
@@ -2656,11 +2736,19 @@ def _normalization_for(
         if norm is not None and np.isfinite(norm) and norm != 0:
             return norm
         # S8: the monitor was configured but unusable — the frame is about to
-        # be written UN-normalized.  Warn once per monitor key per scan (not
-        # per frame: a dead monitor on a 10k-frame scan must not emit 10k
-        # warnings; per scan, not per process: the next scan's dead monitor
-        # must not be silenced by this one's).  set.add is GIL-atomic; a
-        # racing double-warn from two workers is harmless.
+        # be written UN-normalized.  D7 loud: RAISE so a scripted/batch run
+        # fails instead of silently persisting un-normalized data; graceful
+        # keeps the warn-once below.
+        if strict is not None and strict.missing_normalization:
+            raise MissingNormalizationError(
+                f"monitor {key!r} is missing/zero/non-finite on frame "
+                f"{frame.index} (value={value!r}); the frame would be written "
+                f"UN-normalized.  Pass StrictPolicy.graceful() to allow it."
+            )
+        # Warn once per monitor key per scan (not per frame: a dead monitor on
+        # a 10k-frame scan must not emit 10k warnings; per scan, not per
+        # process: the next scan's dead monitor must not be silenced by this
+        # one's).  set.add is GIL-atomic; a racing double-warn is harmless.
         warned = _warned_monitor_keys if warned_keys is None else warned_keys
         if key not in warned:
             warned.add(key)

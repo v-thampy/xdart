@@ -247,7 +247,7 @@ def test_event_sink_wrapper_preserves_single_writer_contract():
     the HDF5 single-writer discipline: the wrapper's forwarding may not move
     write() off the one writer thread, nor disable the pool-thread worker_process
     (ADR-0004 §1 / Difference 6 contract harness)."""
-    from tests.core.contracts import ThreadSpySink
+    from tests.core.contracts import ThreadSpySink, assert_streaming_contract
 
     spy = ThreadSpySink(inner=MemorySink())
     caller = threading.get_ident()
@@ -259,15 +259,10 @@ def test_event_sink_wrapper_preserves_single_writer_contract():
         sess.submit(fr)
     sess.finish()
 
-    hooks = spy.hooks()
-    assert hooks[0] == "begin" and hooks[-1] == "finish"
-    assert sorted(spy.frames_for("write")) == [0, 1, 2, 3]
-    writer_threads = spy.threads_for("write")
-    assert len(writer_threads) == 1 and writer_threads != {caller}
-    # worker_process (forwarded by the wrapper) ran on pool threads, off the writer
-    wp_threads = spy.threads_for("worker_process")
-    assert wp_threads and not (wp_threads & writer_threads)
-    assert sorted(spy.frames_for("worker_process")) == [0, 1, 2, 3]
+    # the SAME single-writer contract used for a raw ReductionSession; the spy
+    # injects worker_process, so the wrapper must still fan it to pool workers
+    # even though MemorySink does not define it (expect_worker_process=True).
+    assert_streaming_contract(spy, caller, n_frames=4, expect_worker_process=True)
 
 
 # ── adversarial-audit hardening (the event contract must be tamper-evident +
@@ -503,3 +498,40 @@ def test_optional_record_store_can_mark_completed_writes_persisted_for_eviction(
     assert store.get(0) is not None and store.get(1) is not None
     assert not store.has_heavy_payload(0)
     assert store.has_heavy_payload(1)
+
+
+def test_live_store_config_wired_through_scan_session_evicts_persisted_completions():
+    # A-prep2: pin the exact live-store config (max_heavy_items=64 mirror of
+    # LiveFrameSeries._in_memory_cap; require_persisted_for_eviction) end-to-end
+    # through ScanSession with record_store_persisted_on_write=True.  Completing
+    # more frames than the heavy cap thins the persisted overflow, never an
+    # unpersisted frame (none here, since each write marks itself persisted).
+    cap = 64
+    store = FrameRecordStore(
+        max_heavy_items=cap, require_persisted_for_eviction=True
+    )
+    frames = _frames(cap + 3)
+    sess = ScanSession(
+        ReductionPlan(integration_2d=None),
+        Scan("s", frames, integrator=object()),
+        sink=MemorySink(),
+        executor=2,
+        record_store=store,
+        record_store_persisted_on_write=True,
+    )
+    for fr in frames:
+        sess.submit(fr)
+    sess.finish()
+
+    # Every completed frame is in the store...
+    assert len(store) == cap + 3
+    # ...but heavy arrays are bounded at the cap: exactly the overflow is thinned.
+    heavy = sum(1 for fr in frames if store.has_heavy_payload(fr.index))
+    assert heavy == cap
+    thinned = sum(1 for fr in frames if not store.has_heavy_payload(fr.index))
+    assert thinned == 3
+    # Thinned records keep their light fields (labels/axes/metadata survive).
+    a_thinned = next(fr for fr in frames if not store.has_heavy_payload(fr.index))
+    rec = store.get(a_thinned.index)
+    assert rec is not None
+    assert rec.view_1d().intensity_1d is None

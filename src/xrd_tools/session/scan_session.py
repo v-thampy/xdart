@@ -39,6 +39,7 @@ from xrd_tools.reduction import (
     ReductionPlan,
     ReductionResult,
     ReductionSession,
+    StrictPolicy,
 )
 from .frame_record_store import FrameRecordStore
 
@@ -213,6 +214,7 @@ class ScanSession:
         clear_frame_images: bool = False,
         record_store: FrameRecordStore | None = None,
         record_store_persisted_on_write: bool = False,
+        strict: StrictPolicy | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self._frame_cbs: list[Callable[[FrameEvent], None]] = []
@@ -238,6 +240,11 @@ class ScanSession:
             inflight_max=inflight_max,
             gi_freeze_mode=gi_freeze_mode,
             cancel_token=cancel_token,
+            # Strictness policy (default loud, matching ReductionSession).  The GUI
+            # write path (open_live_scan_session) passes graceful() so a per-frame
+            # degradation skips-and-defers instead of aborting the whole-scan save —
+            # the streaming path's per-frame contract (B-1 regression fix).
+            strict=strict if strict is not None else StrictPolicy.loud(),
             retain_products=False,
             # The writer nulls frame.image after each write so the source-array
             # reference doesn't pin ~18 MB/frame for the session's life (xdart's

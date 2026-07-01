@@ -137,6 +137,45 @@ def poni_to_integrator(poni: PONI) -> AzimuthalIntegrator:
     )
 
 
+def detector_calibration_to_integrator(
+    cal, *, rot1: float | None = None, rot2: float | None = None,
+    rot3: float | None = None,
+) -> AzimuthalIntegrator:
+    """Build a pyFAI integrator from a :class:`DetectorCalibration`, honouring
+    its ``Detector_config`` (panel orientation) — unlike :func:`poni_to_integrator`,
+    which rebuilds the detector at default config and silently drops a non-default
+    orientation (stitching GAP B).
+
+    ``rot1``/``rot2``/``rot3`` override the base rotations to build a *per-frame*
+    integrator (base calibration ⊕ ``Diffractometer.to_pyfai_per_frame`` rotations).
+
+    Parameters
+    ----------
+    cal : DetectorCalibration
+        Base calibration (``poni`` + ``detector_config``).
+    rot1, rot2, rot3 : float, optional
+        Per-frame rotations (rad); ``None`` keeps the base ``poni`` value.
+    """
+    from pyFAI.integrator.azimuthal import AzimuthalIntegrator  # noqa: PLC0415
+    from pyFAI.detectors import detector_factory  # noqa: PLC0415
+
+    p = cal.poni
+    cfg = dict(cal.detector_config or {})
+    name = p.detector or ""
+    if name and name.lower() != "detector":
+        det = detector_factory(name, config=cfg) if cfg else detector_factory(name)
+    else:
+        det = None
+    return AzimuthalIntegrator(
+        dist=float(p.dist), poni1=float(p.poni1), poni2=float(p.poni2),
+        rot1=float(p.rot1 if rot1 is None else rot1),
+        rot2=float(p.rot2 if rot2 is None else rot2),
+        rot3=float(p.rot3 if rot3 is None else rot3),
+        wavelength=float(p.wavelength) if p.wavelength else None,
+        detector=det,
+    )
+
+
 def get_detector(name: str | Detector) -> Detector:
     """
     Get a detector instance from pyFAI's registry.

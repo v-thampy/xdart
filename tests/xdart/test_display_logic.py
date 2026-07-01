@@ -1107,3 +1107,85 @@ def test_image_and_plot_payload_carry_new_fields_and_freeze():
     assert pp.overlaid_ids is None and pp.plot_history is None
     with _pt.raises(dataclasses.FrozenInstanceError):
         ip.raw_full_shape = (1, 1)                          # frozen invariant preserved
+
+
+def test_stitch_plot_payload_builds_one_data_trace():
+    """stitch_plot_payload turns an IntegrationResult1D into a PlotPayload with a
+    single data trace + a unit-labelled x-axis; empty/None -> None."""
+    import numpy as np
+    from xrd_tools.core.containers import IntegrationResult1D
+    r = IntegrationResult1D(radial=np.linspace(0.5, 5, 50),
+                            intensity=np.arange(50.0), unit="q_A^-1")
+    pp = dl.stitch_plot_payload(r)
+    assert pp is not None and len(pp.traces) == 1
+    assert pp.axis_x.unit == "q_A^-1" and pp.axis_x.values.size == 50
+    assert pp.traces[0].x.size == 50 and pp.traces[0].kind == "data"
+    assert dl.stitch_plot_payload(None) is None
+    assert dl.stitch_plot_payload(
+        IntegrationResult1D(radial=np.array([]), intensity=np.array([]))) is None
+
+
+def test_stitch_image_payload_transposes_for_display():
+    """stitch_image_payload stores intensity.T (rows=y=azimuthal, cols=x=radial)
+    so the image-draw delegate's own transpose yields radial-on-x."""
+    import numpy as np
+    from xrd_tools.core.containers import IntegrationResult2D
+    R, A = 7, 4
+    inten = np.arange(R * A, dtype=float).reshape(R, A)     # (radial, azimuthal)
+    r = IntegrationResult2D(radial=np.linspace(0, 5, R),
+                            azimuthal=np.linspace(-90, 90, A),
+                            intensity=inten, unit="q_A^-1", azimuthal_unit="chi_deg")
+    ip = dl.stitch_image_payload(r)
+    assert ip is not None
+    assert ip.image.shape == (A, R)
+    assert np.array_equal(ip.image, inten.T)
+    assert ip.axis_x.values.size == R and ip.axis_y.values.size == A
+    assert dl.stitch_image_payload(None) is None
+
+
+def test_stitch_display_state_1d_draws_plot_clears_2d():
+    """STITCH_1D with a result is READY, lays out PLOT_1D, and render_plan draws
+    the plot while clearing the raw + cake panels (the merge has no per-frame raw
+    or cake)."""
+    s = dl.stitch_display_state(dl.Mode.STITCH_1D, 9, has_1d=True, has_2d=False)
+    assert s.mode is dl.Mode.STITCH_1D
+    assert s.load_status is dl.LoadStatus.READY
+    assert s.overall is True and s.generation == 9
+    assert s.layout == ((dl.PanelKey(dl.PanelRole.PLOT_1D),),)
+    assert s.panel(dl.PanelRole.PLOT_1D).has_data is True
+    plan = dl.render_plan(s, None)
+    assert dl.PanelRole.PLOT_1D in plan.draw
+    assert dl.PanelRole.RAW_2D in plan.clear
+    assert dl.PanelRole.CAKE_2D in plan.clear
+
+
+def test_stitch_display_state_2d_draws_cake_clears_others():
+    """STITCH_2D lays out CAKE_2D and clears raw + the 1D plot."""
+    s = dl.stitch_display_state(dl.Mode.STITCH_2D, 3, has_1d=False, has_2d=True)
+    assert s.mode is dl.Mode.STITCH_2D and s.load_status is dl.LoadStatus.READY
+    assert s.layout == ((dl.PanelKey(dl.PanelRole.CAKE_2D),),)
+    plan = dl.render_plan(s, None)
+    assert dl.PanelRole.CAKE_2D in plan.draw
+    assert dl.PanelRole.RAW_2D in plan.clear
+    assert dl.PanelRole.PLOT_1D in plan.clear
+
+
+def test_stitch_display_state_missing_result_is_empty():
+    """A Stitch mode whose matching result does NOT exist is EMPTY — render_plan
+    clears every panel (an explicit blank, never stale per-frame content)."""
+    s = dl.stitch_display_state(dl.Mode.STITCH_1D, 1, has_1d=False, has_2d=True)
+    assert s.load_status is dl.LoadStatus.EMPTY
+    assert s.panel(dl.PanelRole.PLOT_1D).has_data is False
+    plan = dl.render_plan(s, None)
+    assert plan.draw == ()
+    assert dl.PanelRole.PLOT_1D in plan.clear
+
+
+def test_stitch_modes_have_panel_layout_geometry():
+    """_apply_layout indexes PANEL_LAYOUT[mode] directly — both stitch modes must
+    have geometry entries or the widget KeyErrors entering a stitch view."""
+    assert dl.Mode.STITCH_1D in dl.PANEL_LAYOUT
+    assert dl.Mode.STITCH_2D in dl.PANEL_LAYOUT
+    # STITCH_1D is plot-only (2D pane collapsed); STITCH_2D collapses the 1D plot.
+    assert dl.PANEL_LAYOUT[dl.Mode.STITCH_1D].twoDWindow_h == (0, 0)
+    assert dl.PANEL_LAYOUT[dl.Mode.STITCH_2D].plotWindow_h == (0, 0)

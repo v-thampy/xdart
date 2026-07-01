@@ -19,6 +19,7 @@ Real-data cells are gated on ``$XDART_TEST_DATA``.
 from __future__ import annotations
 
 import os
+import gc
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,32 +43,24 @@ def qapp():
 def widget(qapp):
     """A real staticWidget, torn down after each test."""
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    for _ in range(3):
+        qapp.processEvents()
+    gc.collect()
+    for _ in range(2):
+        qapp.processEvents()
     w = staticWidget()
     try:
         yield w
     finally:
-        # Stop the long-running background threads the widget started before the
-        # module-scoped QApplication GCs it.  Otherwise the still-running
-        # fileHandlerThread (started in H5Viewer._init_file_thread) triggers
-        # "QThread: Destroyed while thread is still running" -> abort at
-        # interpreter shutdown.
-        try:
-            h5v = w.h5viewer
-            h5v.cancel_pending_loads()            # quit+wait the load worker
-            ft = getattr(h5v, "file_thread", None)
-            if ft is not None:
-                ft.queue.put(None)                # sentinel: clean run() exit
-                ft.wait(2000)
-            pool = getattr(h5v, "_h5pool", None)
-            if pool is not None:
-                pool.close_all()
-        except Exception:
-            pass
         try:
             w.close()
         except Exception:
             pass
-        qapp.processEvents()
+        for _ in range(3):
+            qapp.processEvents()
+        gc.collect()
+        for _ in range(2):
+            qapp.processEvents()
 
 
 def _set_image_frame(w, idx, raw):
@@ -278,12 +271,15 @@ def test_f8_intensity_controls_are_mode_scoped(widget):
     assert not df.ui.imageToolbar.isHidden()
     assert df.ui.plotToolBar.isHidden()
     assert df.ui.plotUnit.isHidden()
-    assert df.ui.plotMethod.isHidden()
+    assert not df.ui.plotMethod.isHidden()
+    assert not df.ui.wf_options.isHidden()
+    assert not df.ui.clear_1D.isHidden()
 
     w._on_viewer_mode_changed("")
     df.scan.skip_2d = False
     df._apply_1d_only_visibility()
     assert df._intensityWidget.isHidden()
+    assert not df.ui.plotUnit.isHidden()
 
     df.scan.skip_2d = True
     df._apply_1d_only_visibility()
@@ -316,17 +312,618 @@ def test_wrangler_tree_polish(widget):
     w = widget
     tree = w.wrangler.tree
     assert tree.header().minimumSectionSize() == 40
-    assert tree.header().sectionSize(0) <= 79
-    style = tree.styleSheet()
-    assert "#52566d" in style
-    assert "#3f4354" in style
+    # Direction-A Stage 3a: the name column is widened (resizeSection(0, 120), was
+    # 79) so card-row labels like "Average Scan" / "Write Mode" don't clip.  The
+    # *rendered* sectionSize is environment-dependent (clamped to the realized
+    # tree width — tiny offscreen, ~120 in the real 334px panel), so it's not a
+    # reliable headless assertion; the widening is verified by construction.  What
+    # IS deterministic is the resize MODE: pyqtgraph defaults col 0 to
+    # ResizeToContents (which silently ignored resizeSection + clipped labels);
+    # the fix forces Interactive so the fixed width actually applies.  Guard it.
+    from PySide6.QtWidgets import QHeaderView
+    assert tree.header().sectionResizeMode(0) == QHeaderView.ResizeMode.Interactive
+    # The wrangler tree is themed via the GLOBAL QSS by object name (replacing
+    # the old inline Dracula stylesheet), so it renders in both Dark and Light
+    # and live-switches.  Assert the QSS hook + that the rules exist, not colours
+    # on the widget-local stylesheet (which is now empty).
+    assert tree.objectName() == "WranglerTree"
+    from xdart.gui.themes import render_qss
+    assert "#WranglerTree" in render_qss("dark")
+    assert "#WranglerTree" in render_qss("light")
     from PySide6 import QtWidgets
     browse_buttons = [
         b for b in tree.findChildren(QtWidgets.QPushButton)
         if b.text() == "Browse"
     ]
     assert browse_buttons
-    assert "#5269a8" in browse_buttons[0].styleSheet()
+    # Direction-A Stage 2: the path field + Browse button are themed through the
+    # global QSS by object name (QLineEdit#BrowsePathEdit / QPushButton#
+    # BrowseButton) rather than inline Dracula hex, so both Dark and Light render
+    # and a live theme switch recolours them.  Assert the QSS hooks, not colours.
+    assert browse_buttons[0].objectName() == "BrowseButton"
+    path_edits = [
+        e for e in tree.findChildren(QtWidgets.QLineEdit)
+        if e.objectName() == "BrowsePathEdit"
+    ]
+    assert path_edits
+
+
+def test_param_rows_hide_reset_glyph(qapp):
+    """Stage 2 (Direction A): pyqtgraph's per-row reset-to-default glyph (the
+    little curved-arrow button it shows on every row whose param hasDefault())
+    is suppressed globally — the redesigned wrangler/integrator forms have none.
+    Patched on the shared base, so it holds for both str_browse and plain str
+    rows (``isHidden`` is independent of whether the tree has been shown)."""
+    from pyqtgraph.parametertree import Parameter, ParameterTree
+    p = Parameter.create(name="root", type="group", children=[
+        {"name": "poni_file", "title": "Calibration",
+         "type": "str_browse", "value": "/a/b/LaB6.poni"},
+        {"name": "entry", "title": "Entry", "type": "str", "value": "entry"},
+    ])
+    tree = ParameterTree()
+    tree.setParameters(p, showTop=False)
+    try:
+        for child in ("poni_file", "entry"):
+            item = next(iter(p.child(child).items))
+            assert item.defaultBtn.isHidden()
+    finally:
+        tree.deleteLater()
+        qapp.processEvents()
+
+
+def test_theme_token_and_selector_invariants():
+    """Direction-A guard rails for the theme refactor:
+    (1) DARK and LIGHT define the SAME token set and both render with no
+        unresolved ``$token`` — ``string.Template.substitute`` raises on a missing
+        key, so a one-sided token would crash ``render_qss`` (and the live app).
+    (2) NO descendant selector targets the integrator's ``frame1D``/``frame2D``
+        subtree, which is REPARENTED at runtime (frame_3 -> toolsFrame,
+        integratorFrame.setLayout) — a descendant style rule across a reparented
+        subtree segfaults Qt's style engine at teardown (the Stage-3b Mono-rule
+        crash).  Only direct ``#id`` selectors are allowed there."""
+    import re
+    from xdart.gui.themes.dark import DARK, LIGHT, _QSS_TEMPLATE, render_qss
+    assert set(DARK) == set(LIGHT)
+    for name in ("dark", "light"):
+        assert not re.search(r"\$\w+", render_qss(name)), f"unresolved token in {name}"
+    assert "#frame1D Q" not in _QSS_TEMPLATE, "descendant selector on reparented frame1D"
+    assert "#frame2D Q" not in _QSS_TEMPLATE, "descendant selector on reparented frame2D"
+
+
+def test_metadata_popup_and_tools_placeholder(widget):
+    """Stage 4 (Direction A): the metadata table opens as an on-demand non-modal
+    popup (reparenting the live metawidget) and the vacated bottom-left hosts the
+    Tools placeholder."""
+    from PySide6 import QtWidgets
+    w = widget
+    # The Metadata button exists in the Data-Browser button row.
+    assert hasattr(w.h5viewer.ui, "metadata_btn")
+    # Tools placeholder occupies metaFrame (the table is no longer inline there).
+    assert w.ui.metaFrame.findChild(QtWidgets.QFrame, "toolsPlaceholder") is not None
+    # Each tool is now a button labelled with the tool name (the descriptive note
+    # was dropped; the hover tooltip carries the description).
+    btn_texts = {b.text() for b in w.ui.metaFrame.findChildren(QtWidgets.QPushButton)
+                 if b.objectName() == "toolButton"}
+    # Buttons carry a leading glyph (e.g. "∧   Peak Fitting"); match the label.
+    assert all(any(name in t for t in btn_texts)
+               for name in ("Peak Fitting", "Phase Fitting", "Plot Metadata"))
+    # Opening the popup reparents the live metawidget into a non-modal dialog.
+    assert w._metadata_dialog is None
+    w._open_metadata_dialog()
+    dlg = w._metadata_dialog
+    assert dlg is not None and not dlg.isModal()
+    assert dlg.isAncestorOf(w.metawidget)
+    # Idempotent: a second open reuses the single instance.
+    w._open_metadata_dialog()
+    assert w._metadata_dialog is dlg
+
+
+def test_peak_fit_dialog_fits_synthetic_pattern(qapp):
+    """Tools ▸ Peak Fitting: the self-contained dialog fits the provided 1-D
+    pattern via xrd_tools.analysis.fitting and fills its results table.  Uses a
+    synthetic two-Gaussian pattern so the recovered centers are checkable."""
+    lmfit = pytest.importorskip("lmfit")  # the xrd-tools[fitting] extra
+    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    x = np.linspace(1.0, 5.0, 600)
+
+    def g(c, s, a):
+        return a * np.exp(-0.5 * ((x - c) / s) ** 2)
+
+    y = g(2.0, 0.05, 1.0e5) + g(3.5, 0.07, 6.0e4) + 2000.0 + 500.0 * x
+    dlg = PeakFitDialog(lambda: (x, y, "q (Å⁻¹)"))
+    try:
+        dlg.auto_check.setChecked(False)       # exercise the fixed-count path
+        dlg.npeaks_spin.setValue(2)
+        dlg.model_combo.setCurrentText("Gaussian")
+        dlg.refresh_pattern()
+        dlg._do_fit()
+        assert dlg.table.rowCount() == 2
+        centers = sorted(float(dlg.table.item(r, 1).text())
+                         for r in range(dlg.table.rowCount()))
+        assert abs(centers[0] - 2.0) < 0.05
+        assert abs(centers[1] - 3.5) < 0.05
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_peak_fit_auto_detect_and_range(qapp):
+    """Auto peak detection finds the peaks unaided, and the fit range restricts
+    the fit to the selected window (excludes out-of-range peaks)."""
+    pytest.importorskip("lmfit")
+    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    x = np.linspace(1.0, 6.0, 800)
+
+    def g(c, s, a):
+        return a * np.exp(-0.5 * ((x - c) / s) ** 2)
+
+    y = (g(2.0, 0.05, 1.0e5) + g(3.5, 0.06, 7.0e4) + g(4.8, 0.07, 5.0e4)
+         + 2000.0 + 300.0 * x)
+    dlg = PeakFitDialog(lambda: (x, y, "q (Å⁻¹)"))
+    try:
+        dlg.refresh_pattern()                  # auto is on by default
+        # (1) auto-detect over the whole pattern finds all three peaks
+        dlg._do_fit()
+        assert dlg.table.rowCount() == 3
+        # (2) restrict the range -> only the two in-window peaks are fit
+        dlg._fit_lo, dlg._fit_hi = 1.5, 4.0
+        assert dlg._fit_range() == (1.5, 4.0)
+        dlg._do_fit()
+        assert dlg.table.rowCount() == 2
+        centers = sorted(float(dlg.table.item(r, 1).text())
+                         for r in range(dlg.table.rowCount()))
+        assert abs(centers[0] - 2.0) < 0.05 and abs(centers[1] - 3.5) < 0.05
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_peak_fit_dialog_handles_no_pattern(qapp):
+    """No frame selected -> the dialog reports it and does not crash on Fit."""
+    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    dlg = PeakFitDialog(lambda: None)
+    try:
+        dlg.refresh_pattern()
+        assert dlg.table.rowCount() == 0
+        dlg._do_fit()                      # must not raise
+        assert dlg.table.rowCount() == 0
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_peak_fit_tool_wired_in_static_widget(widget):
+    """The Tools card exposes an active 'Open' affordance for Peak Fitting and
+    staticWidget can build the dialog (lazy, non-modal)."""
+    from PySide6 import QtWidgets
+    w = widget
+    tools = [b for b in w.ui.metaFrame.findChildren(QtWidgets.QPushButton)
+             if b.objectName() == "toolButton"]
+    assert len(tools) == 3                 # Peak + Phase + Scan Plot active
+    assert all(b.isEnabled() for b in tools)
+    assert w._peak_fit_dialog is None
+    w._open_peak_fit_dialog()
+    assert w._peak_fit_dialog is not None and not w._peak_fit_dialog.isModal()
+
+
+def test_peak_fit_live_path_draws_outcome(qapp):
+    """Step 3 (live): set_live_pattern shows the data, build_fit_request + analyze
+    produce an outcome, and _draw_outcome fills the table — the exact path the
+    live worker drives, run synchronously here so it's lmfit-real but not flaky."""
+    pytest.importorskip("lmfit")
+    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    x = np.linspace(1.0, 5.0, 600)
+
+    def g(c, s, a):
+        return a * np.exp(-0.5 * ((x - c) / s) ** 2)
+
+    y = g(2.0, 0.05, 1.0e5) + g(3.5, 0.07, 6.0e4) + 2000.0 + 500.0 * x
+    # The provider returns nothing — live PUSHES the pattern (set_live_pattern),
+    # it doesn't pull through the provider.
+    dlg = PeakFitDialog(lambda: None)
+    try:
+        dlg.live_check.setChecked(True)
+        dlg.auto_check.setChecked(False)
+        dlg.npeaks_spin.setValue(2)
+        dlg.model_combo.setCurrentText("Gaussian")
+        dlg.set_live_pattern(x, y, "q (Å⁻¹)")  # data shown immediately
+        req = dlg.build_fit_request()          # same request manual Fit builds
+        assert req is not None
+        inp, analyzer = req
+        outcome = analyzer.analyze(inp)
+        assert outcome.ok
+        dlg._draw_outcome(outcome, auto=False)
+        assert dlg.table.rowCount() == 2
+        centers = sorted(float(dlg.table.item(r, 1).text())
+                         for r in range(dlg.table.rowCount()))
+        assert abs(centers[0] - 2.0) < 0.05 and abs(centers[1] - 3.5) < 0.05
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_live_fit_is_noop_without_open_dialog(widget):
+    """set_data calls _maybe_live_fit on every frame, so with the dialog closed
+    (or Live off) it must be a cheap no-op that never spins up the worker."""
+    w = widget
+    assert w._peak_fit_dialog is None
+    w._maybe_live_fit()                        # no dialog -> no-op
+    assert w._live_analysis_worker is None     # worker stays lazy until a real request
+
+
+def test_param_family_helpers_are_pure():
+    """split_family / group_families / accumulator_to_table parse the flat param
+    keys into per-peak families + an aligned vs-frame table, with no Qt."""
+    from xdart.gui.tabs.static_scan.peak_fit_util import (
+        accumulator_to_table, group_families, split_family)
+    assert split_family("center_0") == ("center", 0)
+    assert split_family("center_err_2") == ("center_err", 2)
+    assert split_family("amplitude") == ("amplitude", 0)
+    fams = group_families(["center_0", "center_1", "fwhm_0"])
+    assert fams["center"] == [("center_0", 0), ("center_1", 1)]
+    assert fams["fwhm"] == [("fwhm_0", 0)]
+    # {frame: params} -> aligned (labels, columns), sorted, missing param -> nan
+    labels, cols = accumulator_to_table(
+        {2: {"center_0": 2.2, "center_1": 3.5}, 0: {"center_0": 2.0}})
+    assert labels == ["0", "2"]                     # sorted by frame index
+    assert cols["center_0"] == [2.0, 2.2]
+    assert cols["center_1"][0] != cols["center_1"][0]   # nan (frame 0 lacked it)
+    assert cols["center_1"][1] == 3.5
+
+
+def test_peak_fit_dialog_param_trend_row(qapp):
+    """Row 3 (params vs frame): accumulating frames builds the family combo and
+    plots one curve per peak; Overlay toggles all-peaks vs the first; reset
+    clears it."""
+    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    dlg = PeakFitDialog(lambda: None)
+    try:
+        for idx in range(3):
+            dlg._accumulate_frame_params(idx, {
+                "center_0": 2.0 + 0.1 * idx, "center_1": 3.5,
+                "fwhm_0": 0.1, "amplitude_0": 1e5})
+        fams = [dlg.param_family_combo.itemData(i)
+                for i in range(dlg.param_family_combo.count())]
+        assert {"center", "fwhm", "amplitude"} <= set(fams)
+        assert dlg.param_family_combo.isEnabled() and dlg.param_save_btn.isEnabled()
+        # default family = center; overlay off -> one curve (center_0)
+        dlg.param_family_combo.setCurrentIndex(fams.index("center"))
+        dlg.param_overlay_check.setChecked(False)
+        assert len(dlg.param_plot.getPlotItem().listDataItems()) == 1
+        # overlay on -> both center_0 + center_1
+        dlg.param_overlay_check.setChecked(True)
+        assert len(dlg.param_plot.getPlotItem().listDataItems()) == 2
+        # a re-fit of an existing frame updates, not duplicates
+        dlg._accumulate_frame_params(1, {"center_0": 9.9, "center_1": 3.5})
+        assert len(dlg._param_accumulator) == 3
+        # reset clears the trend + disables the controls
+        dlg.reset_param_trend()
+        assert dlg.param_plot.getPlotItem().listDataItems() == []
+        assert not dlg.param_family_combo.isEnabled()
+        assert dlg._param_accumulator == {}
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_peak_fit_advanced_options_feed_the_plan(qapp):
+    """Advanced box: manual centers override Auto, and the optional kwargs
+    (σ init/bounds, center δ, max_nfev) flow into the PeakFitPlan + fit."""
+    pytest.importorskip("lmfit")
+    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    x = np.linspace(1.0, 5.0, 600)
+
+    def g(c, s, a):
+        return a * np.exp(-0.5 * ((x - c) / s) ** 2)
+
+    y = g(2.0, 0.05, 1e5) + g(3.5, 0.07, 6e4) + 2000.0 + 500.0 * x
+    dlg = PeakFitDialog(lambda: (x, y, "q"))
+    try:
+        dlg.refresh_pattern()
+        dlg.auto_check.setChecked(True)        # manual centers must still win
+        dlg.adv_centers.setText("2.0, 3.5")
+        dlg.adv_sigma_init.setText("0.06")
+        dlg.adv_sigma_min.setText("0.01")
+        dlg.adv_sigma_max.setText("0.2")
+        dlg.adv_center_delta.setText("0.1")
+        dlg.adv_maxfev.setValue(5000)
+        req = dlg.build_fit_request()
+        assert req is not None
+        inp, analyzer = req
+        plan = analyzer.plan
+        assert plan.positions == (2.0, 3.5) and plan.n_peaks == 2   # manual wins
+        assert plan.sigma_init == 0.06
+        assert plan.sigma_bounds == (0.01, 0.2)
+        assert plan.center_bounds_delta == 0.1
+        assert plan.fit_kwargs == {"max_nfev": 5000}
+        out = analyzer.analyze(inp)            # and it actually fits
+        assert out.ok
+        centers = sorted(out.params[f"center_{i}"] for i in range(2))
+        assert abs(centers[0] - 2.0) < 0.05 and abs(centers[1] - 3.5) < 0.05
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_peak_fit_manual_centers_filter_to_range_and_toggle(qapp):
+    """The Advanced toggle shows the box; manual centers outside the fit range
+    are dropped (seeds must lie in the fitted window)."""
+    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    x = np.linspace(1.0, 5.0, 400)
+    dlg = PeakFitDialog(lambda: (x, x * 0 + 1.0, "q"))
+    try:
+        dlg.refresh_pattern()
+        # isVisibleTo (not isVisible) — the dialog itself isn't shown in the test
+        assert not dlg.advanced_box.isVisibleTo(dlg)
+        dlg.advanced_btn.setChecked(True)
+        assert dlg.advanced_box.isVisibleTo(dlg)
+        dlg._fit_lo, dlg._fit_hi = 1.5, 4.0
+        dlg.adv_centers.setText("0.5, 2.1, 3.5, 9.0")   # 0.5 & 9.0 out of window
+        assert dlg._manual_centers(*dlg._fit_range()) == [2.1, 3.5]
+        dlg.adv_centers.setText("")
+        assert dlg._manual_centers(*dlg._fit_range()) is None
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_reload_during_live_keeps_trend(qapp):
+    """Reload while Live is on must NOT wipe the accumulated vs-frame trend;
+    Reload when not live starts fresh."""
+    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    x = np.linspace(1.0, 5.0, 200)
+    dlg = PeakFitDialog(lambda: (x, x * 0 + 1.0, "q"))
+    try:
+        dlg._accumulate_frame_params(0, {"center_0": 2.0})
+        dlg._accumulate_frame_params(1, {"center_0": 2.1})
+        dlg.live_check.setChecked(True)
+        dlg.refresh_pattern()                  # Reload mid-live -> trend kept
+        assert set(dlg._param_accumulator) == {0, 1}
+        dlg.live_check.setChecked(False)
+        dlg.refresh_pattern()                  # Reload not-live -> fresh
+        assert dlg._param_accumulator == {}
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_close_guard_blocks_analysis_slots(widget):
+    """Once close() set _tearing_down, the worker-signal slots must bail without
+    touching the dialog — guards the close-during-run use-after-free."""
+    w = widget
+    w._tearing_down = True
+    # None of these may raise or require a live dialog (queued signal arriving
+    # mid-teardown).
+    w._on_batch_progress(1, 2)
+    w._on_batch_frame_fit("0", {"center_0": 2.0})
+    w._on_batch_done(["0"], {"center_0": [2.0]})
+    w._on_live_analyzed("0", w._live_fit_gen, None)
+
+
+# ── Phase Fitting tool ────────────────────────────────────────────────────
+
+
+def test_phase_fit_tool_wired_in_static_widget(widget):
+    """Tools exposes Peak + Phase Fitting (both active); the Phase dialog builds
+    lazily + non-modal and shares the batch machinery."""
+    from PySide6 import QtWidgets
+    w = widget
+    tools = [b for b in w.ui.metaFrame.findChildren(QtWidgets.QPushButton)
+             if b.objectName() == "toolButton"]
+    assert len(tools) == 3
+    assert w._phase_fit_dialog is None
+    w._open_phase_fit_dialog()
+    assert w._phase_fit_dialog is not None and not w._phase_fit_dialog.isModal()
+
+
+def test_phase_fit_dialog_scaffolding(qapp):
+    """The Phase dialog builds (CIF list + options + shared trend), and
+    build_fit_request refuses without phases."""
+    from xdart.gui.tabs.static_scan.phase_fit_dialog import PhaseFitDialog
+    x = np.linspace(1.0, 5.0, 200)
+    dlg = PhaseFitDialog(lambda: (x, x * 0 + 1.0, "q"))
+    try:
+        dlg.refresh_pattern()
+        # core widgets present
+        assert dlg.cif_list is not None and dlg.profile_combo.count() == 4
+        assert dlg.batch_btn is not None and dlg.param_plot is not None
+        # no phases -> can't build a request
+        assert dlg.build_fit_request() is None
+        assert "CIF" in dlg.status.text()
+        # pymatgen-absent: Add CIF shows the install hint instead of a dialog
+        try:
+            import pymatgen  # noqa: F401
+            has_pymatgen = True
+        except Exception:
+            has_pymatgen = False
+        if not has_pymatgen:
+            dlg._add_cif()
+            assert "pymatgen" in dlg.status.text()
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_phase_fit_fills_phase_table(qapp):
+    """_fill_phase_table renders the per-phase fractions + lattice from a
+    FitResultStore entry (synthetic — no pymatgen / lmfit)."""
+    from xdart.gui.tabs.static_scan.phase_fit_dialog import PhaseFitDialog
+    dlg = PhaseFitDialog(lambda: None)
+    try:
+        entry = {"phase_fractions": {"Ortho": 0.6, "Mono": 0.4},
+                 "lattice_params": {"Ortho": {"a": 4.0, "b": 4.1, "c": 4.2},
+                                    "Mono": {"a": 5.1}},
+                 "success": True, "redchi": 1.2}
+
+        class _Result:
+            payload = [entry]
+
+        class _Outcome:
+            result = _Result()
+            params = {}
+            label = "x"           # non-int -> trend skipped, table still fills
+
+        dlg._fill_phase_table(_Outcome())
+        assert dlg.table.rowCount() == 2
+        assert dlg.table.item(0, 0).text() == "Ortho"
+        assert dlg.table.item(0, 1).text() == "0.600"
+        assert dlg.table.item(0, 2).text() == "4.0000"
+        assert dlg.table.item(1, 2).text() == "5.1000"   # Mono a
+        assert "χ²" in dlg.status.text()
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_phase_batch_does_not_crash_on_range(widget, qapp):
+    """Regression: _run_batch_fit was peak-specific (called dlg._fit_range()),
+    which PhaseFitDialog lacks -> AttributeError on Phase ▸ Batch. Both fit
+    dialogs now expose batch_x_range() and the phase batch reaches the worker."""
+    import time
+    from types import SimpleNamespace
+    pytest.importorskip("lmfit")
+    w = widget
+
+    def fake_pattern(idx):
+        x = np.linspace(1.0, 5.0, 300)
+        y = 1.0e4 * np.exp(-0.5 * ((x - 3.0) / 0.05) ** 2) + 1000.0
+        return x, y, "q"
+
+    w._pattern_for_frame = fake_pattern
+    w.frame_ids = ["0"]
+    w.scan.frames = SimpleNamespace(index=[0, 1])
+    w._open_phase_fit_dialog()
+    dlg = w._phase_fit_dialog
+    # both dialogs honor the shared batch contract
+    assert len(dlg.batch_x_range()) == 2
+    assert dlg.batch_x_range()[0] == -np.inf      # phase = no x-window
+    # inject fake phases so build_fit_request returns a request (no pymatgen)
+    dlg.refresh_pattern()
+    dlg._phases = [("a.cif", SimpleNamespace(name="A"))]
+    w._run_batch_fit(dlg)                          # must NOT raise AttributeError
+    worker = w._batch_analysis_worker
+    if worker is not None:                         # reached the worker -> fix works
+        deadline = time.monotonic() + 8
+        while worker.isRunning() and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.01)
+        worker.wait(2000)
+
+
+# ── Scan Plot tool (metadata plotting — step 1) ───────────────────────────
+
+
+def test_scan_plot_tool_wired_in_static_widget(widget):
+    """Tools now exposes three active tools incl. Scan Plot; it builds lazily +
+    non-modal."""
+    from PySide6 import QtWidgets
+    w = widget
+    tools = [b for b in w.ui.metaFrame.findChildren(QtWidgets.QPushButton)
+             if b.objectName() == "toolButton"]
+    assert len(tools) == 3
+    assert w._scan_plot_dialog is None
+    w._open_scan_plot_dialog()
+    assert w._scan_plot_dialog is not None and not w._scan_plot_dialog.isModal()
+
+
+def test_scan_plot_dialog_columns_and_normalization(qapp):
+    """set_table populates X/Y/Normalize from the numeric columns; checking Y
+    plots a curve; a second Y overlays; normalization divides; non-numeric
+    columns are excluded."""
+    from pyqtgraph.Qt import QtCore
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    dlg = ScanPlotDialog()
+    try:
+        table = {
+            "frame_index": np.arange(5, dtype=float),
+            "theta": np.linspace(0.0, 2.0, 5),
+            "i0": np.array([100.0, 110.0, 120.0, 130.0, 140.0]),
+            "label": np.array(["a", "b", "c", "d", "e"], dtype=object),
+        }
+        dlg.set_table("scan.nxs", table)
+        cols = [dlg.x_combo.itemText(i) for i in range(dlg.x_combo.count())]
+        assert {"frame_index", "theta", "i0"} <= set(cols)
+        assert "label" not in cols                  # non-numeric excluded
+        # sensible defaults: X is a numeric column; exactly one Y checked -> 1 curve
+        assert dlg.x_combo.currentText() in cols
+        assert dlg.x_combo.currentText() != "label"
+        assert len(dlg.plot.getPlotItem().listDataItems()) == 1
+        # overlay: check every numeric column -> one curve per checked Y
+        for c in cols:
+            dlg.y_list.findItems(c, QtCore.Qt.MatchFlag.MatchExactly)[0].setCheckState(
+                QtCore.Qt.CheckState.Checked)
+        n_checked = sum(
+            1 for i in range(dlg.y_list.count())
+            if dlg.y_list.item(i).checkState() == QtCore.Qt.CheckState.Checked)
+        assert n_checked == len(cols)
+        assert len(dlg.plot.getPlotItem().listDataItems()) == n_checked
+        # normalization is available + divides without crashing (curve count holds)
+        norms = [dlg.norm_combo.itemText(i) for i in range(dlg.norm_combo.count())]
+        assert "None" in norms and "i0" in norms
+        dlg.norm_combo.setCurrentText("i0")
+        assert len(dlg.plot.getPlotItem().listDataItems()) == n_checked
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_scan_plot_dialog_empty_table_is_graceful(qapp):
+    """No metadata -> no columns, no curves, Save disabled, no crash."""
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    dlg = ScanPlotDialog()
+    try:
+        dlg.set_table("empty", {})
+        assert dlg.x_combo.count() == 0
+        assert dlg.plot.getPlotItem().listDataItems() == []
+        assert not dlg.save_btn.isEnabled()
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_batch_fit_through_static_widget_populates_results(widget, qapp):
+    """End-to-end Step 4: _run_batch_fit collects every frame's pattern, the
+    worker fits them off the GUI thread, and _on_batch_done opens the populated
+    vs-frame results popup — exercising the full signal wiring."""
+    import time
+    from types import SimpleNamespace
+    pytest.importorskip("lmfit")
+    w = widget
+
+    def fake_pattern(idx):
+        x = np.linspace(1.0, 5.0, 400)
+        shift = 0.02 * int(idx)              # peak drifts with frame -> series varies
+        y = (1.0e5 * np.exp(-0.5 * ((x - (2.0 + shift)) / 0.05) ** 2)
+             + 6.0e4 * np.exp(-0.5 * ((x - 3.5) / 0.07) ** 2) + 2000.0)
+        return x, y, "q (Å⁻¹)"
+
+    w._pattern_for_frame = fake_pattern      # feed synthetic patterns to batch
+    w.frame_ids = ["0"]
+    w.scan.frames = SimpleNamespace(index=[0, 1, 2])
+
+    w._open_peak_fit_dialog()
+    dlg = w._peak_fit_dialog
+    dlg.auto_check.setChecked(False)
+    dlg.npeaks_spin.setValue(2)
+    dlg.model_combo.setCurrentText("Gaussian")
+
+    w._run_batch_fit(dlg)
+    worker = w._batch_analysis_worker
+    assert worker is not None
+    deadline = time.monotonic() + 15
+    while worker.isRunning() and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+    worker.wait(3000)
+    qapp.processEvents()                     # deliver queued sigFrameFit/sigBatchDone
+
+    # The trend filled the dialog's embedded row 3 incrementally (no popup).
+    acc = dlg._param_accumulator
+    assert set(acc.keys()) == {0, 1, 2}
+    assert "center_0" in acc[0]
+    # the first peak's recovered center is near 2.0 across frames
+    assert all(abs(acc[i]["center_0"] - 2.0) < 0.1 for i in (0, 1, 2))
+    assert len(dlg.param_plot.getPlotItem().listDataItems()) >= 1
 
 
 def test_image_widget_colorbar_limits_nan_aware(qapp):
@@ -1033,8 +1630,11 @@ def test_int_scan_resolves_loaded_rows_from_publication_store(widget):
     assert df.binned_data is not None
 
 
-def test_scan_mode_1d_mirror_is_bounded_but_viewer_rows_are_not(widget):
-    from xdart.gui.tabs.static_scan.static_scan_widget import _DISPLAY_1D_CACHE_MAX
+def test_scan_mode_1d_mirror_and_viewer_rows_are_bounded(widget):
+    from xdart.gui.tabs.static_scan.static_scan_widget import (
+        _DISPLAY_1D_CACHE_MAX,
+        _DISPLAY_1D_VIEWER_CACHE_MAX,
+    )
 
     w = widget
     assert getattr(w.data_1d, "_max", None) == _DISPLAY_1D_CACHE_MAX
@@ -1045,7 +1645,10 @@ def test_scan_mode_1d_mirror_is_bounded_but_viewer_rows_are_not(widget):
     assert 0 not in w.data_1d
 
     w._on_viewer_mode_changed("xye")
-    assert getattr(w.data_1d, "_max", None) == 0
+    assert getattr(w.data_1d, "_max", None) == _DISPLAY_1D_VIEWER_CACHE_MAX
+    for i in range(_DISPLAY_1D_VIEWER_CACHE_MAX + 2):
+        w.data_1d[i] = SimpleNamespace(idx=i)
+    assert len(w.data_1d) == _DISPLAY_1D_VIEWER_CACHE_MAX
 
     w._on_viewer_mode_changed("")
     assert getattr(w.data_1d, "_max", None) == _DISPLAY_1D_CACHE_MAX
@@ -1236,7 +1839,7 @@ def test_int_plot_slice_characterizes_update_plot_state(widget):
     w = widget
     df = _set_int_scan(w, n=1)
     df.ui.plotMethod.setCurrentText("Single")
-    df.update()              # populate plotUnit (χ is added here, not at construction)
+    df.update()                                # populate the plot-unit axes first
     chi_index = df.ui.plotUnit.findText("χ (°)")
     assert chi_index >= 0
     df.ui.plotUnit.setCurrentIndex(chi_index)
@@ -1376,7 +1979,7 @@ def test_int1d_xye_keeps_wrangler_inputs_enabled(widget):
     # (Per-group disables are the WRANGLER's _on_mode_changed job -- covered
     # by test_file_viewer_mode_disables_processing_tree_but_not_mode_combo;
     # this helper drives the widget-side handler with combo signals blocked.)
-    assert w.wrangler.parameters.child('h5_dir').opts.get(
+    assert w.wrangler.parameters.child('Project').child('h5_dir').opts.get(
         'enabled', True) is True
 
 
@@ -2054,6 +2657,7 @@ def test_integrator_finish_while_wrangler_running_keeps_controls_locked(widget, 
 
     # Simulate the wrangler thread still running while the integrator finishes.
     monkeypatch.setattr(w.wrangler.thread, 'isRunning', lambda: True)
+    monkeypatch.setattr(w.wrangler, '_run_phase', 'running', raising=False)
     w.integrator_thread_finished()
     assert w._run_active is True, "run-state exited while wrangler still running"
     assert not any(_proc_controls(w).values()), "controls re-enabled mid-wrangler-run"
@@ -2154,7 +2758,9 @@ def test_shutdown_threads_stops_file_thread(widget):
     not 'destroyed while running' on tab/app close.  Idempotent."""
     w = widget
     ft = w.h5viewer.file_thread
-    assert ft.isRunning(), "file_thread should be running on a live widget"
+    assert not ft.isRunning(), "file_thread should start lazily"
+    w.h5viewer._ensure_file_thread_running()
+    assert ft.isRunning(), "file_thread should run once file work is queued"
 
     w.h5viewer.shutdown_threads()
     assert ft.wait(2000)
@@ -2165,32 +2771,36 @@ def test_shutdown_threads_stops_file_thread(widget):
     assert not ft.isRunning()
 
 
-def test_integrator_panel_session_roundtrip(widget):
+def test_integrator_panel_session_roundtrip(widget, monkeypatch):
     """Session persistence for the integration panel: units/pts/ranges/Auto
     flags + Advanced params survive a save/restore cycle (saved at app close,
     restored at startup -- they previously weren't persisted at all)."""
-    tree = widget.integratorTree
+    w = widget
 
-    tree.ui.npts_1D.setText("1234")
-    tree.ui.radial_autoRange_1D.setChecked(False)
-    tree.ui.radial_low_1D.setText("0.5")
-    tree.ui.radial_high_1D.setText("4.5")
-    tree.parameters.child('Default', 'Integrate 1D', 'chi_offset').setValue(45.0)
-    state = tree.session_state()
+    w._on_controls_v2_field_changed(("Int1D", "points"), "1234")
+    w._on_controls_v2_field_changed(("Int1D", "radial_auto"), False)
+    w._on_controls_v2_field_changed(("Int1D", "radial_low"), "0.5")
+    w._on_controls_v2_field_changed(("Int1D", "radial_high"), "4.5")
+    w._on_controls_v2_field_changed(("Int1D", "chi_offset"), "45.0")
+    state = w._controls_v2_int_session_state()
     import json
     json.dumps(state)                       # must be JSON-serializable
 
     # Scramble, then restore.
-    tree.ui.npts_1D.setText("999")
-    tree.ui.radial_autoRange_1D.setChecked(True)
-    tree.parameters.child('Default', 'Integrate 1D', 'chi_offset').setValue(90.0)
-    tree.restore_session_state(state)
+    w._on_controls_v2_field_changed(("Int1D", "points"), "999")
+    w._on_controls_v2_field_changed(("Int1D", "radial_auto"), True)
+    w._on_controls_v2_field_changed(("Int1D", "chi_offset"), "90.0")
+    monkeypatch.setattr(
+        "xdart.utils.session.load_session",
+        lambda: {"controls_v2_int": state},
+    )
+    w._restore_controls_v2_int_session_state()
 
-    assert tree.ui.npts_1D.text() == "1234"
-    assert tree.ui.radial_autoRange_1D.isChecked() is False
-    assert tree.ui.radial_low_1D.text() == "0.5"
-    assert tree.parameters.child(
-        'Default', 'Integrate 1D', 'chi_offset').value() == 45.0
+    args = w.scan.bai_1d_args
+    assert args["numpoints"] == 1234
+    assert args["radial_range"] == (0.5, 4.5)
+    assert args["chi_offset"] == 45.0
+    assert str(w._controls_v2_field_values()[("Int1D", "points")]) == "1234"
 
 
 def test_cake_view_trim_rearms_after_own_trim_but_respects_user_zoom(widget):
@@ -2246,7 +2856,7 @@ def test_gi_1d_npts_defaults_and_per_axis_memory(widget):
     tree.set_image_units()
 
     labels = [tree.ui.axis1D.itemText(i) for i in range(tree.ui.axis1D.count())]
-    qip_idx = next(i for i, t in enumerate(labels) if "ᵢₚ" in t or "ᵢ" in t)
+    qip_idx = next(i for i, t in enumerate(labels) if "Qip" in t)
 
     tree.ui.axis1D.setCurrentIndex(qip_idx)            # -> q_ip
     assert tree.ui.npts_1D.text() == "1000"
@@ -2340,14 +2950,15 @@ def test_integrator_owns_threshold_config(widget):
     assert cfg.apply_threshold is False
     assert cfg.mask_saturation is True          # default-on, mirrors old wrangler
 
-    it.ui.threshold_enable.setChecked(True)
-    it.ui.threshold_min.setText("7")
-    it.ui.threshold_max.setText("9000")
-    it.ui.mask_saturated.setChecked(False)
+    w._on_controls_v2_field_changed(("Mask", "Threshold"), True)
+    w._on_controls_v2_field_changed(("Mask", "min"), "7")
+    w._on_controls_v2_field_changed(("Mask", "max"), "9000")
+    w._on_controls_v2_field_changed(("MaskSat", "mask_sentinel"), False)
     cfg2 = it.get_threshold_config()
     assert cfg2.apply_threshold is True
     assert cfg2.threshold_min == 7 and cfg2.threshold_max == 9000
     assert cfg2.mask_saturation is False
+    assert cfg2 == w._controls_v2_threshold_config()
 
 
 def test_live_run_injects_integrator_threshold_into_wrangler(widget):
@@ -2356,11 +2967,10 @@ def test_live_run_injects_integrator_threshold_into_wrangler(widget):
     hidden Mask/MaskSat carrier params before setup() — so live == reintegrate by
     construction (both source from the integrator)."""
     w = widget
-    it = w.integratorTree
-    it.ui.threshold_enable.setChecked(True)
-    it.ui.threshold_min.setText("3")
-    it.ui.threshold_max.setText("5000")
-    it.ui.mask_saturated.setChecked(False)
+    w._on_controls_v2_field_changed(("Mask", "Threshold"), True)
+    w._on_controls_v2_field_changed(("Mask", "min"), "3")
+    w._on_controls_v2_field_changed(("Mask", "max"), "5000")
+    w._on_controls_v2_field_changed(("MaskSat", "mask_sentinel"), False)
 
     w._push_threshold_to_wrangler()
 
@@ -2378,11 +2988,20 @@ def test_live_run_injects_integrator_threshold_into_wrangler(widget):
 
 
 def test_layout_wrangler_above_integrator(widget):
-    """Stage 1 of the panel refactor: the wrangler pane sits ABOVE the integrator
-    panel in the right vertical splitter (index 0 renders at the top)."""
+    """The processing controls live in the right controls area.
+
+    In the legacy layout the wrangler pane sat above the integrator pane in the
+    right splitter.  Controls Panel V2 embeds the existing integrator widget
+    inside its Processing card instead.
+    """
     w = widget
     rs = w.ui.rightSplitter
-    assert rs.indexOf(w.ui.wranglerFrame) < rs.indexOf(w.ui.integratorFrame)
+    if getattr(w, "controls_v2", None) is not None:
+        assert rs.indexOf(w.ui.wranglerFrame) >= 0
+        assert rs.indexOf(w.ui.integratorFrame) == -1
+        assert w.controls_v2.processing_card.isAncestorOf(w.ui.integratorFrame)
+    else:
+        assert rs.indexOf(w.ui.wranglerFrame) < rs.indexOf(w.ui.integratorFrame)
 
 
 def test_tools_bar_hosts_calibrate_and_make_mask(widget):
@@ -2399,7 +3018,58 @@ def test_tools_bar_hosts_calibrate_and_make_mask(widget):
     assert not w.integratorTree.ui.get_mask.isHidden()
     rs = w.ui.rightSplitter
     assert rs.indexOf(tools) == 0                       # very top pane
-    assert rs.indexOf(w.ui.wranglerFrame) < rs.indexOf(w.ui.integratorFrame)
+    if getattr(w, "controls_v2", None) is not None:
+        assert rs.indexOf(w.ui.integratorFrame) == -1
+        assert w.controls_v2.processing_card.isAncestorOf(w.ui.integratorFrame)
+    else:
+        assert rs.indexOf(w.ui.wranglerFrame) < rs.indexOf(w.ui.integratorFrame)
+
+
+def test_calibrate_offers_recent_poni_from_project_folder(widget, tmp_path, monkeypatch):
+    """After pyFAI-calib2 (an external program that can't report its save path)
+    closes, ``_autofill_poni_after_calibrate`` rglobs the project folder for a
+    ``.poni`` written during calibration and offers it via a confirmation popup
+    (newest wins).  Nothing is offered if none are recent.  (The Yes-path reuses
+    the existing poni-browse plumbing, so we only assert the offer here.)"""
+    import os
+    import time
+    from xdart.gui.tabs.static_scan import static_scan_widget as ssw
+
+    w = widget
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    w.wrangler.parameters.child("Project", "project_folder").setValue(str(proj))
+
+    asked = []
+    monkeypatch.setattr(
+        ssw.QMessageBox, "question",
+        lambda *a, **k: asked.append(a[2]) or ssw.QMessageBox.No)
+
+    # Nothing written yet -> no popup.
+    w._autofill_poni_after_calibrate(time.time())
+    assert asked == []
+
+    # An OLD .poni (predating this calibration) is ignored.
+    old = proj / "old.poni"
+    old.write_text("x")
+    os.utime(old, (1.0, 1.0))                       # far in the past
+    w._autofill_poni_after_calibrate(time.time())
+    assert asked == []
+
+    # A .poni written during this calibration is offered, by path.
+    t0 = time.time()
+    fresh = proj / "fresh.poni"
+    fresh.write_text("x")
+    w._autofill_poni_after_calibrate(t0)
+    assert asked and str(fresh) in asked[-1]
+
+    # When several are recent, the newest is the one offered.
+    asked.clear()
+    newest = proj / "newest.poni"
+    newest.write_text("x")
+    os.utime(newest, (time.time() + 5, time.time() + 5))
+    w._autofill_poni_after_calibrate(t0 - 1)
+    assert str(newest) in asked[-1]
 
 
 def test_gi_manual_incidence_reintegrate_uses_numeric_not_motor_name(widget):
@@ -2412,14 +3082,10 @@ def test_gi_manual_incidence_reintegrate_uses_numeric_not_motor_name(widget):
     from xdart.modules.reduction import plan_from_live_scan
 
     w = widget
-    it = w.integratorTree
-    it.ui.gi_enable.setChecked(True)
-    mi = it.ui.gi_motor.findText('Manual')
-    assert mi >= 0
-    it.ui.gi_motor.setCurrentIndex(mi)
-    it.ui.gi_motor_value.setText('2.0')
-
-    it._apply_gi_config_to_scan()
+    w._on_controls_v2_field_changed(("GI", "Grazing"), True)
+    w._on_controls_v2_field_changed(("GI", "th_motor"), "Manual")
+    w._on_controls_v2_field_changed(("GI", "th_val"), "2.0")
+    w._controls_v2_apply_gi_config_to_scan()
 
     # Numeric theta, NOT the literal 'Manual' (which would crash the reduction).
     assert w.scan.incidence_motor == '2.0'
@@ -2466,38 +3132,93 @@ def test_hydrate_from_scan_populates_panel_from_saved_settings(widget):
     assert it.ui.radial_high_1D.text() == '7.5'
 
 
-def test_gi_more_popup_hosts_orient_and_tilt(widget):
-    """The GI (Fiber) row keeps only GI/Motor inline; Orient + Tilt moved into a
-    right-justified "More" popup (the seam for future GI options).  The widgets
-    are the SAME objects (get_gi_config / session / hydrate read them) — just
-    re-parented — and the More button + popup toggle with GI."""
+def test_gi_detail_widgets_live_in_hidden_holder(widget):
+    """The GI detail fields (Motor / Value / Orient / Tilt) are no longer in a
+    floating popup — the popup was removed in favour of inline Controls Panel V2
+    rows.  The widgets are re-parented into a hidden holder so they stay ALIVE
+    (get_gi_config / session / hydrate read these same objects) and round-trip;
+    there is no popup window and no separate More button."""
     w = widget
     it = w.integratorTree
 
-    # Orient/Tilt now live in the popup window, not inline on the GI row.
-    assert it.ui.gi_sample_orientation.window() is it.gi_more_popup
-    assert it.ui.gi_tilt.window() is it.gi_more_popup
-    assert it.ui.gi_more.maximumWidth() <= 60               # snug, won't clip
+    # The floating popup is gone; the detail widgets live in a hidden holder.
+    assert getattr(it, 'gi_more_popup', None) is None
+    assert getattr(it.ui, 'gi_more', None) is None
+    holder = it.ui.gi_hidden_holder
+    assert not holder.isVisible()
+    for wdg in (it.ui.gi_motor, it.ui.gi_motor_value,
+                it.ui.gi_sample_orientation, it.ui.gi_tilt):
+        # Re-parented into the hidden holder and kept alive (never destroyed).
+        assert wdg.parent() is holder
 
-    # GI on -> Motor + More visible; clicking More opens the popup.
-    it.ui.gi_enable.setChecked(True)
-    assert it.ui.gi_more.isVisibleTo(it.ui.gi_frame)
-    assert it.ui.gi_motor.isVisibleTo(it.ui.gi_frame)
-    it._show_gi_more()
-    assert it.gi_more_popup.isVisible()
-
-    # GI off -> Motor + More hidden, popup closed (not left floating).
-    it.ui.gi_enable.setChecked(False)
-    assert not it.ui.gi_more.isVisibleTo(it.ui.gi_frame)
-    assert not it.gi_more_popup.isVisible()
-
-    # Orient/Tilt still round-trip through get_gi_config from the popup widgets.
-    it.ui.gi_enable.setChecked(True)
-    it.ui.gi_sample_orientation.setValue(6)
-    it.ui.gi_tilt.setText('1.5')
+    # Motor + Orient + Tilt still round-trip through the native V2 state; the
+    # hidden widgets stay alive for the advanced inspector only.
+    w._on_controls_v2_field_changed(("GI", "Grazing"), True)
+    w._on_controls_v2_field_changed(("GI", "th_motor"), "Manual")
+    w._on_controls_v2_field_changed(("GI", "th_val"), "0.3")
+    w._on_controls_v2_field_changed(("GI", "sample_orientation"), "6")
+    w._on_controls_v2_field_changed(("GI", "tilt_angle"), "1.5")
     cfg = it.get_gi_config()
+    assert cfg['incidence_motor'] == 'Manual'
+    assert cfg['th_val'] == 0.3
     assert cfg['sample_orientation'] == 6
     assert cfg['tilt_angle'] == 1.5
+    assert cfg == w._controls_v2_gi_config()
+    w._controls_v2_apply_gi_config_to_scan()
+    assert w.scan.gi_config['incidence_motor'] == 'Manual'
+    assert w.scan.gi_config['th_val'] == 0.3
+    assert w.scan.gi_config['sample_orientation'] == 6
+    assert w.scan.gi_config['tilt_angle'] == 1.5
+
+
+def test_stitch_modes_present_and_mode_flags(widget):
+    """Stitch 1D / Stitch 2D appear in the image wrangler's mode list and set the
+    stitch_mode flag (+ the 1D/2D skip_2d) without being viewer modes."""
+    w = widget
+    wr = w.wrangler
+    assert {'Stitch 1D', 'Stitch 2D'} <= set(wr.controls_profile()['modes'])
+    combo = w.controls.modeCombo
+    combo.setCurrentIndex(combo.findText('Stitch 1D'))
+    assert wr.stitch_mode is True and w.scan.skip_2d is True
+    assert wr.viewer_mode is None
+    combo.setCurrentIndex(combo.findText('Stitch 2D'))
+    assert wr.stitch_mode is True and w.scan.skip_2d is False
+    combo.setCurrentIndex(combo.findText('Int 2D'))
+    assert wr.stitch_mode is False
+
+
+def test_run_in_stitch_mode_routes_to_stitch_not_wrangler(widget):
+    """A Run click while a Stitch mode is active emits sigStitchRequested (→
+    start_stitch) and does NOT emit sigStart (no wrangler run) nor morph the
+    action button to Pause — it stays a green 'Run' (stitch is Start/Stop only)."""
+    w = widget
+    wr = w.wrangler
+    combo = w.controls.modeCombo
+    combo.setCurrentIndex(combo.findText('Stitch 1D'))
+    got = {'stitch': None, 'start': False}
+    wr.sigStitchRequested.connect(lambda m: got.__setitem__('stitch', m))
+    wr.sigStart.connect(lambda: got.__setitem__('start', True))
+    wr.poni = object()                 # satisfy _inputs_valid (PONI loaded)
+    wr.start()
+    assert got['stitch'] == '1d'
+    assert got['start'] is False
+    assert w.controls.startButton.text() == '▶ Run'      # no Pause morph
+
+
+def test_build_stitch_params_reads_integrator_args(widget):
+    """_build_stitch_params pulls npts/unit/ranges/method from the scan's
+    bai_*_args, leaves mask None, and passes no `backend` kwarg (Phase 1a)."""
+    w = widget
+    w.scan.bai_1d_args.update(numpoints=1234, unit='q_A^-1', method='csr',
+                              radial_range=(0.0, 5.0), azimuth_range=None)
+    p1 = w._build_stitch_params('1d')
+    assert p1['npt_1d'] == 1234 and p1['unit'] == 'q_A^-1'
+    assert p1['method'] == 'csr' and p1['radial_range'] == (0.0, 5.0)
+    assert p1['mask'] is None and 'backend' not in p1
+    w.scan.bai_2d_args.update(npt_rad=600, npt_azim=360, unit='2th_deg')
+    p2 = w._build_stitch_params('2d')
+    assert p2['npt_rad_2d'] == 600 and p2['npt_azim_2d'] == 360
+    assert p2['unit'] == '2th_deg' and 'npt_1d' not in p2
 
 
 def test_reintegrate_live_default_and_stop_wiring(widget, monkeypatch):
@@ -2535,12 +3256,13 @@ def test_reintegrate_live_default_and_stop_wiring(widget, monkeypatch):
     assert wrangler_stops == [1]
 
     # Entering run-state for a reintegrate LOCKS Start (so a scan can't rebuild
-    # scan.frames out from under the reintegrate loop); _exit re-enables it.
+    # scan.frames out from under the reintegrate loop); _exit returns to the
+    # normal idle readiness gate (this fresh widget is still not ready).
     w._run_active = False
     w._enter_run_state()
     assert not w.controls.startButton.isEnabled()
     w._exit_run_state()
-    assert w.controls.startButton.isEnabled()
+    assert w.controls.actionRow.isEnabled() is False
 
     # Per-frame reintegrate updates are THROTTLED (coalesced), not rendered
     # synchronously — integrator_thread_update just stashes the latest index;
@@ -2566,21 +3288,20 @@ def test_threshold_autoenables_on_value_entry(widget):
     so the clip actually applies (the "I set Max=1000 but it didn't clip" trap).
     Default 0/0 never auto-enables (Max=0 would mask everything)."""
     w = widget
-    it = w.integratorTree
 
-    it.ui.threshold_enable.setChecked(False)
-    it.ui.threshold_max.setText('1000')
-    it._maybe_autoenable_threshold()
-    assert it.ui.threshold_enable.isChecked() is True
-    cfg = it.get_threshold_config()
+    w._on_controls_v2_field_changed(("Mask", "Threshold"), False)
+    w._on_controls_v2_field_changed(("Mask", "max"), "1000")
+    cfg = w._controls_v2_threshold_config()
     assert cfg.apply_threshold is True and cfg.threshold_max == 1000.0
 
     # Default 0/0 must NOT auto-enable (Max=0 masks everything).
-    it.ui.threshold_enable.setChecked(False)
-    it.ui.threshold_min.setText('0')
-    it.ui.threshold_max.setText('0')
-    it._maybe_autoenable_threshold()
-    assert it.ui.threshold_enable.isChecked() is False
+    w._on_controls_v2_field_changed(("Mask", "max"), "0")
+    w._on_controls_v2_field_changed(("Mask", "Threshold"), False)
+    w._on_controls_v2_field_changed(("Mask", "min"), "0")
+    w._on_controls_v2_field_changed(("Mask", "max"), "0")
+    cfg = w._controls_v2_threshold_config()
+    assert cfg.apply_threshold is False
+    assert cfg.threshold_min == 0.0 and cfg.threshold_max == 0.0
 
 
 def test_shared_controls_reroute_on_wrangler_swap(widget):
@@ -2629,3 +3350,101 @@ def test_shared_controls_reroute_on_wrangler_swap(widget):
     assert not ctrls.batchButton.isHidden()
     back_modes = [ctrls.modeCombo.itemText(i) for i in range(ctrls.modeCombo.count())]
     assert 'Int 2D' in back_modes
+
+
+def test_stitch_display_persists_across_updates(widget):
+    """The persistent StitchDisplayController keeps a merged result on screen
+    across subsequent update() calls (the regression the one-shot render had),
+    and returns to the per-frame view when the Stitch mode is left or the result
+    is cleared."""
+    from xdart.gui.tabs.static_scan.display_logic import Mode
+    from xrd_tools.core.containers import IntegrationResult1D
+    w = widget
+    df = w.displayframe
+    # No frames selected → the per-frame view has nothing; the stitch result is
+    # the only thing to draw.  get_idxs early-returns on empty frame_ids and
+    # _updated() returns True because a stitch is active.
+    df.frame_ids[:] = []
+    radial = np.linspace(1.0, 5.0, 40)
+    df.scan.stitched_2d = None
+    df.scan.stitched_1d = IntegrationResult1D(
+        radial=radial, intensity=np.linspace(10.0, 50.0, 40), unit="q_A^-1")
+    df.stitch_display_mode = '1d'
+
+    assert df._active_stitch_mode() == '1d'
+    assert df._live_mode() is Mode.STITCH_1D
+
+    df.update()
+    items = df.plot.listDataItems()
+    assert items, "stitch curve should be drawn"
+    x0 = np.asarray(items[0].getData()[0], dtype=float)
+    assert x0.size == 40
+    np.testing.assert_allclose([x0.min(), x0.max()], [1.0, 5.0], atol=1e-6)
+
+    # Persistence: the NEXT update() (the call that used to overwrite the one-shot
+    # paint with the per-frame view) must keep the stitch.
+    df.update()
+    assert df._live_mode() is Mode.STITCH_1D
+    items2 = df.plot.listDataItems()
+    assert items2
+    np.testing.assert_allclose(
+        np.asarray(items2[0].getData()[0], dtype=float), x0)
+
+    # Leaving the Stitch mode (dropdown → a per-frame mode) returns to per-frame.
+    df.stitch_display_mode = None
+    assert df._active_stitch_mode() is None
+    assert df._live_mode() in (Mode.INT_1D, Mode.INT_2D)
+
+    # Result-existence guard: a Stitch mode selected with no result also falls
+    # back to per-frame (no premature blank before a run / after new_scan clears).
+    df.stitch_display_mode = '1d'
+    df.scan.stitched_1d = None
+    assert df._active_stitch_mode() is None
+    assert df._live_mode() in (Mode.INT_1D, Mode.INT_2D)
+
+
+def test_build_stitch_params_converts_flat_mask_to_2d_bool(widget):
+    """_build_stitch_params turns the scan's flat-index detector mask + detector_
+    shape into the 2D boolean (True = exclude) run_stitch/pyFAI want; it degrades
+    to None (mask dropped, never crashes) when the shape is unknown."""
+    w = widget
+    w.scan.detector_shape = (4, 5)
+    w.scan.global_mask = np.array([0, 7])          # flat indices 0 and 7 masked
+    w.scan.bai_1d_args = {'unit': 'q_A^-1', 'method': 'BBox', 'numpoints': 1000}
+    m = w._build_stitch_params('1d')['mask']
+    assert m is not None and m.shape == (4, 5) and m.dtype == bool
+    assert m.ravel()[0] and m.ravel()[7] and m.sum() == 2
+    # Unknown detector shape → converter returns None (graceful, no crash).
+    w.scan.detector_shape = None
+    assert w._build_stitch_params('1d')['mask'] is None
+    # No mask at all → None.
+    w.scan.detector_shape = (4, 5)
+    w.scan.global_mask = None
+    assert w._build_stitch_params('1d')['mask'] is None
+
+
+def test_gi_mode_blocks_stitch_with_message(widget):
+    """A Stitch launched while GI (Fiber) mode is ON is blocked with a clear
+    message: the GUI stitch is the multigeometry (non-GI) backend, and the
+    GI-corrected path is gated on real-data validation, so it must not silently
+    run a non-GI merge.  With GI off the guard passes and the worker starts."""
+    w = widget
+    msgs, started = [], []
+    w._stitch_status = lambda m: msgs.append(m)
+    w.stitch_thread.start = lambda *a, **k: started.append(True)
+    # frames + geometry present so start_stitch reaches the GI guard.
+    w.scan.frames = [object()]
+    w.scan.geometry = object()
+    w.scan.bai_1d_args = {'unit': 'q_A^-1', 'method': 'BBox', 'numpoints': 1000}
+    w.scan.global_mask = None
+    w.scan.detector_shape = None
+
+    w.scan.gi = True
+    w.start_stitch('1d')
+    assert not started, "stitch must not start while GI mode is active"
+    assert msgs and 'GI' in msgs[-1]
+
+    msgs.clear(); started.clear()
+    w.scan.gi = False
+    w.start_stitch('1d')
+    assert started, "stitch should start when GI is off"

@@ -48,16 +48,22 @@ params = [
     # paths (back-compat).  (The full progressive-disclosure / folder-change
     # reset UX is a follow-up; the portable storage is active once a folder is
     # set.)
-    {'name': 'Project', 'title': 'Project Folder', 'type': 'group', 'children': [
-        # str_browse: path field + inline Browse (the group header already says
-        # "Project Folder", so the child label is dropped).
-        {'name': 'project_folder', 'title': '', 'type': 'str_browse', 'value': ''},
+    # Direction-A Stage 3: group `title`s are the card-header band text
+    # (uppercase per spec).  Only the display `title` changes — every group
+    # `name` (Project/Calibration/Signal/BG) stays put, so .child() paths,
+    # session save/load, and the disclosure/toggle logic are untouched.
+    {'name': 'Project', 'title': 'PROJECT', 'type': 'group', 'children': [
+        {'name': 'project_folder', 'title': 'Folder', 'type': 'str_browse', 'value': ''},
+        {'name': 'h5_dir', 'title': 'Save Path', 'type': 'str_browse',
+         'value': '', 'enabled': True},
     ], 'expanded': True},
-    {'name': 'Calibration', 'type': 'group', 'children': [
-        {'name': 'poni_file', 'title': '', 'type': 'str_browse', 'value': def_poni_file},
-    ], 'expanded': True},
-    {'name': 'Signal', 'type': 'group', 'children': [
-        {'name': 'inp_type', 'title': '', 'type': 'list',
+    # PONI is the first row of DATA — the standalone CALIBRATION group is gone.
+    # This collapses the N1 progressive disclosure to two stages (Folder -> DATA),
+    # since the PONI picker now lives inside DATA (see _apply_disclosure).  A
+    # proper redo belongs in the Tier-B custom-card wrangler migration.
+    {'name': 'Signal', 'title': 'DATA', 'type': 'group', 'children': [
+        {'name': 'poni_file', 'title': 'Poni', 'type': 'str_browse', 'value': def_poni_file},
+        {'name': 'inp_type', 'title': 'Source', 'type': 'list',
          'values': ['Image Series', 'Image Directory', 'Single Image'], 'value': 'Image Series'},
         {'name': 'File', 'title': 'Image File   ', 'type': 'str_browse', 'value': def_img_file},
         {'name': 'img_dir', 'title': 'Directory', 'type': 'str_browse', 'value': '', 'visible': False},
@@ -75,9 +81,9 @@ params = [
          'value': '', 'visible': False},
         {'name': 'Filter', 'type': 'str', 'value': '', 'visible': False,
          'tip': "Filename filter: space-separated terms = AND (any order), '|' or OR = either, leading -term or NOT = exclude.  Case-insensitive substrings; empty = all files."},
-        {'name': 'write_mode', 'title': 'Write Mode  ', 'type': 'list',
-         'values': ['Append', 'Overwrite'], 'value': 'Append'},
         {'name': 'mask_file', 'title': 'Mask File', 'type': 'str_browse', 'value': ''},
+        # (Write Mode moved to the Controls run bar — it's a run/output property,
+        # not a data input.  setup() reads it from the shared StaticControls.)
     ], 'expanded': True, 'visible': False},
     {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group',
      'children': [
@@ -125,7 +131,7 @@ params = [
         {'name': 'mask_sentinel', 'type': 'bool', 'value': True,
          'visible': False},
     ], 'expanded': False, 'visible': False},
-    {'name': 'BG', 'title': 'Background', 'type': 'group', 'children': [
+    {'name': 'BG', 'title': 'BACKGROUND', 'type': 'group', 'children': [
         {'name': 'bg_type', 'title': '', 'type': 'list',
          'values': ['None', 'Single BG File', 'Series Average', 'BG Directory'], 'value': 'None'},
         {'name': 'File', 'title': 'BG File', 'type': 'str_browse', 'value': '', 'visible': False},
@@ -139,12 +145,18 @@ params = [
         {'name': 'Scale', 'type': 'float', 'value': 1, 'visible': False},
         {'name': 'norm_channel', 'title': 'Normalize', 'type': 'list', 'values': ['bstop'], 'value': 'bstop',
          'visible': False},
-    ], 'expanded': False, 'visible': False},
-    {'name': 'h5_dir', 'title': 'Save Path', 'type': 'str_browse', 'value': get_fname_dir(), 'enabled': True},
+    ], 'expanded': True, 'visible': False},   # expanded so the BG dropdown shows (was collapsed)
+    # (h5_dir / Save Path moved into the PROJECT group above.)
 ]
 
 ctr = 1
 
+
+# Default-select order for the GI incidence motor (case-insensitive); the FIRST
+# that exists in the scan's motor keys wins, else the first available, else
+# Manual.  Keep in sync with integrator._GI_MOTOR_PREFERENCE so the wrangler's
+# th_motor param and the integrator's gi_motor combo auto-pick the same motor.
+_GI_MOTOR_PREFERENCE = ('th', 'eta', 'theta', 'gonth', 'halpha')
 
 
 class imageWrangler(wranglerWidget):
@@ -235,6 +247,11 @@ class imageWrangler(wranglerWidget):
 
         # Setup parameter tree
         self.tree = ParameterTree()
+        # Stage 3a: object-named so the global QSS themes it (card-band group
+        # headers + field tint) and live-switches Dark/Light, replacing the old
+        # widget-local Dracula stylesheet (see stylize_ParameterTree + the
+        # QTreeView#WranglerTree rules in themes/dark.py).
+        self.tree.setObjectName('WranglerTree')
         # This (and the name-column width below) is the dominant floor on
         # how narrow the right panel drags — the param tree is the widest
         # fixed content.  Keep it small so the panel can shrink.
@@ -247,18 +264,26 @@ class imageWrangler(wranglerWidget):
         # Squeeze parameter tree columns to reduce panel width
         header = self.tree.header()
         header.setStretchLastSection(True)
-        header.resizeSection(0, 79)  # name column (narrower -> wider value boxes)
+        # Stage 3a: wider name column (was nominally 79) so card-row labels like
+        # "Average Scan" / "Write Mode" / "Calibration" never clip, and a
+        # *consistent* label width per the spec.  ParameterTree defaults column 0
+        # to ResizeToContents (which ignored the old resizeSection AND marginally
+        # clipped "Average Scan" at ~98px); switch it to Interactive so the fixed
+        # 120 actually applies.
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Interactive)
+        # Root decoration (below) adds a small per-row gutter, so the name column
+        # needs a touch more room or labels like "Average Scan" clip.
+        header.resizeSection(0, 132)
         header.setMinimumSectionSize(40)
-        # Shallow indent so the grouped param names (Image File, Meta File, …)
-        # sit close under the top-level Save Path row instead of stepping far
-        # right, and Save Path itself sits nearer the left edge — both free up
-        # width for the path/value boxes.  The group chevrons need this column,
-        # so it can't go to 0 (the names land just shy of exact alignment with
-        # Save Path, which is a top-level row).  The name-column width (84) is
-        # unchanged, so the value boxes stay put as the names shift left.  At
-        # this point the group chevron column is very narrow; going lower starts
-        # to crowd it.
-        self.tree.setIndentation(3)
+        # The group expand/collapse chevrons live in the indentation column; the
+        # old shallow indent (3px) squeezed them to near-invisibility.  Root
+        # decoration makes the top-level group rows draw a branch arrow the theme
+        # replaces with a clear, high-contrast triangle (themes/dark:
+        # QTreeView#WranglerTree::branch).  Keep the indent small (a touch above
+        # the old 3) so the field labels are not pushed far right or clipped —
+        # just enough for the chevron to read.
+        self.tree.setIndentation(9)
+        self.tree.setRootIsDecorated(True)
         # Hide the "Parameter / Value" header bar — it's just visual noise above
         # the wrangler tree.  Column sizing above still applies (the header is
         # hidden, not removed).
@@ -274,7 +299,7 @@ class imageWrangler(wranglerWidget):
         self.project_folder = self.parameters.child('Project').child('project_folder').value()
         self.source_base = self._compute_source_base()
         # Calibration
-        self.poni_file = self.parameters.child('Calibration').child('poni_file').value()
+        self.poni_file = self.parameters.child('Signal').child('poni_file').value()
         # Applies the N1 progressive disclosure for the fresh-start state (no
         # folder -> only Project visible).
         self.get_poni_dict()
@@ -307,7 +332,7 @@ class imageWrangler(wranglerWidget):
         self.mask_sentinel = self.parameters.child('MaskSat').child('mask_sentinel').value()
 
         # Write Mode
-        self.write_mode = self.parameters.child('Signal').child('write_mode').value()
+        self.write_mode = self._active_write_mode()
 
         # Background
         self.bg_type = self.parameters.child('BG').child('bg_type').value()
@@ -330,14 +355,23 @@ class imageWrangler(wranglerWidget):
         self.gi_mode_2d = self.scan.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
 
         # HDF5 Save Path
-        self.h5_dir = self.parameters.child('h5_dir').value()
+        self.h5_dir = self.parameters.child('Project').child('h5_dir').value()
 
         # NOTE: Integration Advanced button (self.ui.advancedButton) is wired
         # in static_scan_widget.set_wrangler() to show the integratorTree's
         # existing advancedWidget1D / advancedWidget2D dialogs directly.
 
-        # Wire signals from parameter tree based buttons
-        self.parameters.sigTreeStateChanged.connect(self.setup)
+        # Wire signals from parameter tree based buttons.
+        # setup() re-syncs params to the thread AND re-applies the N1 progressive
+        # disclosure, which setOpts(visible=...) on the param GROUPS.  Those
+        # setOpts calls fire sigTreeStateChanged with change type 'options'; if
+        # setup ran on them it re-entered setup -> re-disclosed -> 'options' -> ...
+        # an unbounded loop (froze the panel when a click/scroll in the poni/mask
+        # field kicked it off; sigUpdateGI -> V2 refresh rode along as spam).  Run
+        # setup ONLY on real 'value' edits, never on the disclosure's own
+        # 'options'/'limits' churn.  (Direct setup() calls at run start are
+        # unaffected.)
+        self.parameters.sigTreeStateChanged.connect(self._setup_on_value_change)
         self.parameters.sigTreeStateChanged.connect(self._save_to_session)
 
         # UI-1 (#81): put a real checkbox on the GI / Intensity-Threshold
@@ -354,10 +388,10 @@ class imageWrangler(wranglerWidget):
         self.parameters.child('Project').child('project_folder').sigValueChanged.connect(
             self._on_project_folder_changed
         )
-        self.parameters.child('Calibration').child('poni_file').sigActivated.connect(
+        self.parameters.child('Signal').child('poni_file').sigActivated.connect(
             self.set_poni_file
         )
-        self.parameters.child('Calibration').child('poni_file').sigValueChanged.connect(
+        self.parameters.child('Signal').child('poni_file').sigValueChanged.connect(
             self.get_poni_dict
         )
         self.parameters.child('Signal').child('inp_type').sigValueChanged.connect(
@@ -402,7 +436,7 @@ class imageWrangler(wranglerWidget):
         self.parameters.child('GI').child('th_val').sigValueChanged.connect(
             self.set_gi_th_motor
         )
-        self.parameters.child('h5_dir').sigActivated.connect(
+        self.parameters.child('Project').child('h5_dir').sigActivated.connect(
             self.set_h5_dir
         )
 
@@ -515,7 +549,7 @@ class imageWrangler(wranglerWidget):
     # self_attr     → attribute to sync on restore (None = handled by sigValueChanged)
     _SESSION_PARAMS = [
         ('project_folder', ('Project', 'project_folder'),            True,  'project_folder'),
-        ('poni_file',      ('Calibration', 'poni_file'),             True,  'poni_file'),
+        ('poni_file',      ('Signal', 'poni_file'),                  True,  'poni_file'),
         ('inp_type',       ('Signal', 'inp_type'),                   False, 'inp_type'),
         ('img_file',       ('Signal', 'File'),                       True,  'img_file'),
         ('img_dir',        ('Signal', 'img_dir'),                    True,  'img_dir'),
@@ -525,7 +559,6 @@ class imageWrangler(wranglerWidget):
         ('meta_ext',       ('Signal', 'meta_ext'),                   False, None),
         ('meta_dir',       ('Signal', 'meta_dir'),                   True,  'meta_dir'),
         ('file_filter',    ('Signal', 'Filter'),                     False, 'file_filter'),
-        ('write_mode',     ('Signal', 'write_mode'),                 False, 'write_mode'),
         ('mask_file',      ('Signal', 'mask_file'),                  True,  'mask_file'),
         ('bg_type',        ('BG', 'bg_type'),                        False, 'bg_type'),
         ('bg_file',        ('BG', 'File'),                           True,  'bg_file'),
@@ -545,8 +578,26 @@ class imageWrangler(wranglerWidget):
         ('threshold_min',  ('Mask', 'min'),                          False, 'threshold_min'),
         ('threshold_max',  ('Mask', 'max'),                          False, 'threshold_max'),
         ('mask_sentinel',  ('MaskSat', 'mask_sentinel'),             False, 'mask_sentinel'),
-        ('h5_dir',         ('h5_dir',),                              True,  'h5_dir'),
+        ('h5_dir',         ('Project', 'h5_dir'),                    True,  'h5_dir'),
     ]
+
+    def _setup_on_value_change(self, param, changes):
+        """Gate setup() to real value edits only.
+
+        pyqtgraph fires sigTreeStateChanged for EVERY change including 'options'
+        (visibility) and 'limits' (dropdown repopulation).  setup()'s own N1
+        progressive disclosure toggles group visibility via setOpts(visible=...),
+        so running setup on 'options' changes re-entered it forever (the freeze).
+        Only a genuine 'value' edit should re-run the full sync.
+        """
+        try:
+            for ch in changes:
+                if ch[1] == 'value':
+                    self.setup()
+                    return
+        except (IndexError, TypeError):
+            # Malformed change tuple: fall back to the historical behaviour.
+            self.setup()
 
     def _save_to_session(self, *args):
         # Don't persist the transient half-restored state while a session restore
@@ -636,7 +687,7 @@ class imageWrangler(wranglerWidget):
         (the setValue re-enters this method via the tree-change cascade and
         passes validation on the second pass).
         """
-        path = self.parameters.child('h5_dir').value()
+        path = self.parameters.child('Project').child('h5_dir').value()
         base = self._compute_source_base()
         if path and base:
             _abs = os.path.abspath(os.path.expanduser(str(path)))
@@ -664,7 +715,7 @@ class imageWrangler(wranglerWidget):
                     'Save Path rejected: must be inside the Project Folder. '
                     f'Kept {os.path.basename(fallback) or fallback}.',
                 )
-                self.parameters.child('h5_dir').setValue(fallback)
+                self.parameters.child('Project').child('h5_dir').setValue(fallback)
                 return
         old_path = getattr(self, 'h5_dir', None)
         self.h5_dir = path
@@ -674,6 +725,14 @@ class imageWrangler(wranglerWidget):
     # Signal to notify static_scan_widget that viewer mode changed.
     # Emits the viewer_mode string ('image', 'xye') or '' for normal.
     sigViewerModeChanged = QtCore.Signal(str)
+
+    # A Run click in a Stitch mode diverts here instead of a wrangler run; the
+    # host (staticWidget.start_stitch) launches the stitch worker.  Arg: '1d'|'2d'.
+    sigStitchRequested = QtCore.Signal(str)
+    # Emitted ('1d'|'2d'|'') when the dropdown enters/leaves a Stitch mode, so the
+    # host can route the display to the persistent StitchDisplayController (mirrors
+    # sigViewerModeChanged).  Prev-tracked to fire only on an actual change.
+    sigStitchModeChanged = QtCore.Signal(str)
 
     def _on_mode_changed(self, *args):
         """Update all flags from the processing mode dropdown and checkboxes."""
@@ -749,7 +808,11 @@ class imageWrangler(wranglerWidget):
         self.batch_mode = self.ui.batchCheckBox.isChecked()
         self.live_mode = self.ui.liveCheckBox.isChecked()
         self.xye_only = is_xye
-        
+        # Stitch 1D / Stitch 2D are post-load batch reductions of the loaded
+        # scan, not a wrangler acquisition run; start() diverts to the host's
+        # stitch worker when this is set (viewer mode texts never contain it).
+        self.stitch_mode = ('Stitch' in mode_text)
+
         if mode_text == 'Image Viewer':
             self.viewer_mode = 'image'
             self.scan.skip_2d = False
@@ -785,17 +848,15 @@ class imageWrangler(wranglerWidget):
             self.tree.setEnabled(True)
         except AttributeError:
             pass
-        # In viewer mode there's no run, but HIDING the run row leaves an ugly
-        # empty box (Vivek) -- so keep the row visible and just DISABLE it
-        # (greyed Live/Start/Stop).  Pre-attach (standalone / tests) the wrangler
-        # owns its specUI `frame`; post-attach that frame is dead (hidden by
-        # attach_controls) and we drive the SHARED controls' action row instead.
+        # Image/XYE viewers are pure file browsers.  Collapse the run controls
+        # down to the mode row instead of showing a disabled Run/Stop/Append row.
+        # Int 1D (XYE) is NOT a viewer here; it remains a processing mode.
         _controls = getattr(self, '_controls', None)
         if _controls is None:
-            self.ui.frame.setVisible(True)
+            self.ui.frame.setVisible(not is_file_viewer)
             self.ui.frame.setEnabled(not is_viewer)
         else:
-            _controls.set_run_row_visible(True)
+            _controls.set_run_row_visible(not is_file_viewer)
             _controls.set_run_row_enabled(not is_viewer)
             # No batch processing in a file viewer -> hide the Batch toggle (and
             # the Cores it gates) in viewer modes; apply_profile restores it for
@@ -810,9 +871,17 @@ class imageWrangler(wranglerWidget):
             self._prev_viewer_mode = new_vm
             self.sigViewerModeChanged.emit(new_vm)
 
+        # Stitch-mode dropdown change → the host routes the display to/from the
+        # persistent StitchDisplayController.  '' on any non-stitch mode.
+        new_sm = ('1d' if mode_text == 'Stitch 1D'
+                  else '2d' if mode_text == 'Stitch 2D' else '')
+        if new_sm != getattr(self, '_prev_stitch_mode', ''):
+            self._prev_stitch_mode = new_sm
+            self.sigStitchModeChanged.emit(new_sm)
+
     def _set_integration_controls_enabled(self, enabled, *, include_gi=True):
         """Enable or disable parameter tree groups related to integration."""
-        group_names = ['Calibration', 'Signal', 'BG', 'Mask', 'MaskSat']
+        group_names = ['Signal', 'BG', 'Mask', 'MaskSat']  # poni_file lives in Signal now
         if include_gi:
             group_names.append('GI')
         for group_name in group_names:
@@ -831,6 +900,17 @@ class imageWrangler(wranglerWidget):
         # browser, which viewer modes rely on; the run-lock (enabled())
         # disables the whole tree during runs.
 
+    def _active_write_mode(self):
+        """Output mode ('Append'/'Overwrite') from the shared run Controls.
+
+        Write Mode moved out of the wrangler param tree into the Controls run bar
+        (it's a run/output property).  Defaults to the SAFE 'Append' when the
+        controls aren't attached (headless/test holders) — never silently
+        Overwrite."""
+        controls = getattr(self, '_controls', None)
+        getter = getattr(controls, 'write_mode', None)
+        return getter() if callable(getter) else 'Append'
+
     def setup(self):
         """Sets up the child thread, syncs all parameters.
         """
@@ -838,7 +918,7 @@ class imageWrangler(wranglerWidget):
         global ctr
         ctr += 1
 
-        self.poni_file = self.parameters.child('Calibration').child('poni_file').value()
+        self.poni_file = self.parameters.child('Signal').child('poni_file').value()
         self.thread.poni = self.poni
 
         # N1: Project Folder -> @source_base (raw source paths stored RELATIVE to
@@ -890,7 +970,7 @@ class imageWrangler(wranglerWidget):
         self.thread.mask_sentinel = self.mask_sentinel
 
         # Write Mode
-        self.write_mode = self.parameters.child('Signal').child('write_mode').value()
+        self.write_mode = self._active_write_mode()
         self.thread.write_mode = self.write_mode
 
         # Background
@@ -1004,6 +1084,7 @@ class imageWrangler(wranglerWidget):
             current = ''
         return {
             'modes': ['Int 1D', 'Int 2D', 'Int 1D (XYE)',
+                      'Stitch 1D', 'Stitch 2D',
                       'Image Viewer', 'XYE Viewer'],
             'live': True, 'batch': True, 'cores': True,
             'current': current,
@@ -1078,18 +1159,90 @@ class imageWrangler(wranglerWidget):
         click with no (or an invalid) PONI ran the *previous* scan with the
         stale calibration (BUG-1).  The image source / save path remain guarded
         inside the run thread."""
-        if self.poni is None:
+        self._adopt_loaded_scan_run_inputs()
+        # GENERIC-DETECTOR FIX (block, not crash): a processed .nxs saved WITHOUT
+        # detector pixel sizes AND without a resolvable detector name (an
+        # unnamed/generic 'Detector') restores no usable calibration — its
+        # ``_restore_calibration_from_group`` returns False, leaving both
+        # ``_cached_poni`` AND ``_cached_integrator`` None.  Adoption then can't
+        # seed ``self.poni`` and a Run would otherwise build a pixel-less
+        # integrator and crash mid-write in pyFAI's calc_cartesian_positions
+        # ('NoneType' * float).  Refuse up front with a SPECIFIC message when a
+        # scan is loaded but carries no usable calibration; the user can still
+        # supply their own .poni (a different poni object than the scan's).
+        scan = getattr(self, "scan", None)
+        adopted_poni = getattr(self.thread, "_adopted_poni", None)
+        scan_loaded = bool(
+            list(getattr(getattr(scan, "frames", None), "index", ()) or ()))
+        scan_has_integrator = getattr(scan, "_cached_integrator", None) is not None
+        adopted_pixel_less = (
+            adopted_poni is not None and self.poni is adopted_poni
+            and not scan_has_integrator)
+        if self.poni is None or adopted_pixel_less:
+            if scan_loaded and not scan_has_integrator:
+                imageWrangler._safe_status_text(
+                    self,
+                    'This scan was saved without a usable detector calibration '
+                    '— load a PONI calibration file to integrate.',
+                )
+            else:
+                imageWrangler._safe_status_text(
+                    self,
+                    'Load a PONI calibration file to begin.',
+                )
+            return False
+        if not self.img_file and not getattr(self, 'stitch_mode', False):
             imageWrangler._safe_status_text(
                 self,
-                'Load a PONI calibration file to begin.',
+                'Choose an image source to run. Use Reintegrate for a loaded processed scan.',
             )
             return False
         return True
+
+    def _adopt_loaded_scan_run_inputs(self):
+        """Seed Run calibration from a loaded processed scan when blank.
+
+        A processed xdart ``.nxs`` can carry the original PONI/integrator, which
+        keeps Reintegrate and an explicitly configured fresh Run calibrated.  It
+        must not silently become the raw frame source for a fresh Run; Controls
+        V2 owns that source choice and disables Run until the user chooses one.
+        """
+        scan = getattr(self, "scan", None)
+        if self.poni is None:
+            cached_poni = getattr(scan, "_cached_poni", None)
+            if cached_poni is not None:
+                self.poni = cached_poni
+                try:
+                    self.thread.poni = cached_poni
+                    # GENERIC-DETECTOR FIX: the restored ``_cached_integrator``
+                    # carries the detector PIXEL SIZE that a pixel-less PONI
+                    # dataclass (detector NAME only) cannot rebuild.  Carry it
+                    # to the run thread KEYED on the adopted poni, so the
+                    # thread's poni-identity rebuild block REUSES it instead of
+                    # clobbering it with a pixel-less ``poni_to_integrator``.
+                    # A genuinely-new user-loaded .poni is a DIFFERENT object,
+                    # so it still rebuilds (the key won't match).
+                    self.thread._adopted_poni = cached_poni
+                    self.thread._adopted_integrator = getattr(
+                        scan, "_cached_integrator", None)
+                    self.thread._adopted_fiber_integrator = getattr(
+                        scan, "_cached_fiber_integrator", None)
+                except Exception:
+                    pass
 
     def start(self):
         # Refuse to run without a valid PONI rather than re-running the stale
         # previous scan.  Honors the Live/Batch mode toggles (no force-off).
         if not self._inputs_valid():
+            return
+        if getattr(self, 'stitch_mode', False):
+            # Stitch is a one-shot batch reduction of the already-loaded scan,
+            # not a wrangler acquisition run.  Divert to the host's stitch worker
+            # and return BEFORE the Pause/Resume morph or sigStart, so the action
+            # button stays a green "Run" (stitch is Start/Stop only).
+            self.sigStitchRequested.emit(
+                '1d' if '1D' in self.ui.processingModeCombo.currentText()
+                else '2d')
             return
         self.command = 'start'
         # M2: Stop morphs the button back to green immediately, but the worker
@@ -1161,12 +1314,14 @@ class imageWrangler(wranglerWidget):
         orange-vs-green visual state driven by a dynamic ``runPhase`` Qt property
         (styled in the dark theme).  ``pausing`` is a transient disabled state."""
         btn = self.ui.startButton
+        # Labels carry the run-control glyphs (▶ play / ❚❚ pause), matching
+        # StaticControls._PHASES — both drive this same button.
         label, prop, enabled = {
-            'idle':    ('Start',    'idle',   True),
-            'running': ('Pause',    'active', True),
-            'pausing': ('Pausing…', 'active', False),
-            'paused':  ('Resume',   'active', True),
-        }.get(phase, ('Start', 'idle', True))
+            'idle':    ('▶ Run',      'idle',   True),
+            'running': ('❚❚ Pause',    'active', True),
+            'pausing': ('❚❚ Pausing…', 'active', False),
+            'paused':  ('▶ Resume',   'active', True),
+        }.get(phase, ('▶ Run', 'idle', True))
         # Keep the transient 'pausing' distinct (not collapsed into 'running'),
         # so a re-dispatch during the disabled 'Pausing…' window is an explicit
         # no-op in _on_start_clicked rather than a redundant second pause().
@@ -1226,13 +1381,14 @@ class imageWrangler(wranglerWidget):
             filter="PONI (*.poni *.PONI)"
         )
         if fname != '':
-            self.parameters.child('Calibration').child('poni_file').setValue(fname)
+            self.parameters.child('Signal').child('poni_file').setValue(fname)
             self.poni_file = fname
             self._save_to_session()
 
-    # N1: param groups gated behind the Project Folder + PONI (Project itself is
-    # always visible).  Calibration appears once a Project Folder is set; the
-    # rest (groups + the Save-Path row) appears once a valid PONI also loads.
+    # Two-stage disclosure: Project (Folder + Save Path) is always visible; the
+    # DATA group (PONI first, then the source rows) + BG reveal once a Project
+    # Folder is set.  (The PONI used to be its own CALIBRATION stage; it now lives
+    # inside DATA, so the staging collapsed — see _apply_disclosure.)
     # Intensity Threshold ('Mask') + Mask Saturated ('MaskSat') moved to the
     # integrator panel — kept here as hidden carriers the integrator injects into
     # at run-setup, so never disclosed (and re-hidden after "reveal everything").
@@ -1240,7 +1396,21 @@ class imageWrangler(wranglerWidget):
     # GI joins Mask/MaskSat as a HIDDEN CARRIER: the integrator panel owns the GI
     # controls now and injects into this group at run-setup (_push_gi_to_wrangler).
     _DISCLOSURE_CARRIERS = ('Mask', 'MaskSat', 'GI')
-    _DISCLOSURE_TOPLEVEL = ('h5_dir',)     # Save Path row (path + inline Browse)
+    _DISCLOSURE_TOPLEVEL = ()              # Save Path now lives inside PROJECT
+
+    @staticmethod
+    def _set_param_visible_if_changed(param, visible):
+        """Set pyqtgraph parameter visibility only on a real transition.
+
+        ``Parameter.show()/hide()`` can emit ``sigOptionsChanged`` even when the
+        row is already in the requested state, which makes disclosure calls noisy
+        enough to feed setup/session/refresh storms. Guard before ``setOpts`` so
+        unchanged disclosure passes are silent.
+        """
+        target = bool(visible)
+        current = bool(param.opts.get('visible', True))
+        if current != target:
+            param.setOpts(visible=target)
 
     @staticmethod
     def _safe_status_text(obj, text):
@@ -1271,54 +1441,48 @@ class imageWrangler(wranglerWidget):
         # child, so a check placed only in _on_mode_changed would be silently
         # undone by the next folder/PONI event.
         if getattr(self, 'viewer_mode', None) in ('image', 'xye'):
-            self.parameters.child('Project').show()          # Project Folder: keep
-            self.parameters.child('Calibration').hide()
-            for name in self._DISCLOSURE_REST:               # Signal/GI/Mask/MaskSat/BG
-                self.parameters.child(name).hide()
-            for name in self._DISCLOSURE_TOPLEVEL:           # Save Path row: keep
-                self.parameters.child(name).show()
+            # Project (Folder + Save Path) stays; every processing group hides.
+            for child in self.parameters.children():
+                imageWrangler._set_param_visible_if_changed(
+                    child, child.name() == 'Project')
             imageWrangler._safe_status_text(self, '')
             return
         have_root = self._compute_source_base() is not None
         have_poni = self.poni is not None
-        self.parameters.child('Project').show()            # always visible
-        cal = self.parameters.child('Calibration')
+        # Project (Folder + Save Path) is always visible.
+        imageWrangler._set_param_visible_if_changed(
+            self.parameters.child('Project'), True)
 
-        def _hide_rest():
-            for name in self._DISCLOSURE_REST + self._DISCLOSURE_TOPLEVEL:
-                self.parameters.child(name).hide()
-
+        # Two-stage disclosure (the PONI picker now lives inside DATA as the first
+        # row, so it can no longer be its own reveal stage): Project Folder ->
+        # the whole DATA group once a folder is set.  PONI validity is enforced at
+        # run time (the run guard / _inputs_valid), not by hiding DATA.
         if not have_root:
-            cal.hide()
-            _hide_rest()
-            imageWrangler._safe_status_text(
-                self,
-                'Choose a Project Folder to begin.',
-            )
-        elif not have_poni:
-            cal.show()
-            _hide_rest()
-            # Save Path stays visible alongside Calibration (Vivek): the
-            # processed-data location is project-level, decided before the
-            # PONI -- and the scans browser already follows it.
-            for name in self._DISCLOSURE_TOPLEVEL:
-                self.parameters.child(name).show()
-            imageWrangler._safe_status_text(
-                self,
-                'Load a PONI calibration file to begin.',
-            )
-        else:
             for child in self.parameters.children():
-                child.show()                               # reveal everything
-            # …except the pixel-rejection carriers, which moved to the
-            # integrator panel and live here only as hidden injection targets.
-            # getattr default keeps lightweight duck holders (tests) working.
-            for name in getattr(self, '_DISCLOSURE_CARRIERS', ()):
+                if child.name() != 'Project':
+                    imageWrangler._set_param_visible_if_changed(child, False)
+            imageWrangler._safe_status_text(
+                self, 'Choose a Project Folder to begin.')
+        else:
+            # Set each group to its FINAL visibility DIRECTLY.  The old
+            # "show() ALL children, THEN hide() the carriers" re-showed the
+            # hidden carriers on every call (visible False->True) and hid them
+            # again (True->False) — a genuine toggle that fires sigTreeStateChanged
+            # ('options') EVERY time.  With _apply_disclosure re-invoked on mode
+            # sync, that oscillated carrier visibility forever and froze the panel.
+            # Setting the target directly with a guard avoids pyqtgraph show/hide's
+            # unconditional options emit and makes disclosure idempotent.
+            # (getattr default keeps lightweight duck holders (tests) working.)
+            carriers = set(getattr(self, '_DISCLOSURE_CARRIERS', ()))
+            for child in self.parameters.children():
                 try:
-                    self.parameters.child(name).hide()
+                    imageWrangler._set_param_visible_if_changed(
+                        child, child.name() not in carriers)
                 except Exception:
                     pass
-            imageWrangler._safe_status_text(self, '')
+            imageWrangler._safe_status_text(
+                self,
+                '' if have_poni else 'Load a PONI calibration to enable a run.')
 
     def get_poni_dict(self):
         """Load the PONI calibration file and store as a PONI object, then apply
@@ -1473,20 +1637,33 @@ class imageWrangler(wranglerWidget):
                 # Auto-detect metadata sidecar if not set
                 if not self.meta_ext:
                     self.detect_meta_ext(fname)
+            else:
+                # No seed yet (e.g. the Source just switched to Image Directory
+                # and no directory is chosen): drop the previous source's file
+                # so the motor/parameter reset below fires and the GI Theta Motor
+                # dropdown doesn't keep the old file's columns.
+                self.img_file = ''
 
         if ((self.img_file != old_fname)
                 or (self.img_file and (len(self.scan_parameters) < 1))):
             if (self.meta_ext and self.img_file
                     and self.exists_meta_file(self.img_file)):
                 self.set_pars_from_meta()
-            elif self.img_file:
-                # New signal file with no sidecar metadata (e.g. Eiger):
-                # clear the previous file's stale motor/parameter options and
-                # default the GI Theta Motor to Manual (no 'th' to read), so
-                # the incidence angle can be entered directly.
+            else:
+                # No sidecar metadata (e.g. Eiger) OR no file resolved yet (the
+                # source just switched, nothing chosen): clear the previous
+                # source's stale motor/parameter options and default the GI Theta
+                # Motor to Manual, so the incidence angle can be entered directly.
                 self.scan_parameters = []
                 self.motors = []
+                self.counters = []
                 self.set_gi_motor_options()
+                # Refresh the BG Match + norm-channel dropdowns too, so they don't
+                # keep the previous format's columns after a format/source switch
+                # (F4 — mirror set_pars_from_meta's option refresh on the clear
+                # side; with the lists empty both collapse to just 'None').
+                self.set_bg_matching_options()
+                self.set_bg_norm_options()
 
     def set_series_average(self):
         self.series_average = self.parameters.child('Signal').child('series_average').value()
@@ -1501,6 +1678,12 @@ class imageWrangler(wranglerWidget):
         is_spec = (self.meta_ext == 'SPEC')
         self.parameters.child('Signal').child('meta_dir').show(is_spec)
         self._save_to_session()
+        # The metadata FORMAT changed: drop the previous format's parsed
+        # parameters so get_img_fname re-resolves the metadata (and the GI motor
+        # list) for the SAME file under the new format.  Without this, its
+        # "img_file unchanged" guard would keep the old format's motors (e.g.
+        # switching txt -> pdi when there is no .pdi sidecar should clear them).
+        self.scan_parameters = []
         self.get_img_fname()
 
     def set_meta_dir(self):
@@ -1596,7 +1779,7 @@ class imageWrangler(wranglerWidget):
         """
         fname, _ = QFileDialog().getOpenFileName(
             dir=self._browse_dir(self.mask_file),
-            filter="EDF (*.edf)"
+            filter="Mask files (*.edf *.npy);;EDF (*.edf);;NumPy (*.npy)"
         )
         if fname != '':
             self.parameters.child('Signal').child('mask_file').setValue(fname)
@@ -1658,14 +1841,17 @@ class imageWrangler(wranglerWidget):
         )
         if path != '':
             Path(path).mkdir(parents=True, exist_ok=True)
-            self.parameters.child('h5_dir').setValue(path)
+            self.parameters.child('Project').child('h5_dir').setValue(path)
             self._sync_h5_dir_from_parameters()
 
     def _compute_source_base(self):
         """N1: the absolute project root, or None when the Project Folder is
-        blank (-> the writer stores absolute raw paths, back-compat)."""
+        blank or invalid (-> the writer stores absolute raw paths, back-compat)."""
         pf = (self.parameters.child('Project').child('project_folder').value() or '').strip()
-        return os.path.abspath(os.path.expanduser(pf)) if pf else None
+        if not pf:
+            return None
+        path = os.path.abspath(os.path.expanduser(pf))
+        return path if os.path.isdir(path) else None
 
     def _default_h5_under_project(self):
         """Default the Save Path to ``<project>/xdart_processed_data`` when the
@@ -1673,9 +1859,9 @@ class imageWrangler(wranglerWidget):
         base = self._compute_source_base()
         if not base:
             return
-        cur_h5 = (self.parameters.child('h5_dir').value() or '').strip()
+        cur_h5 = (self.parameters.child('Project').child('h5_dir').value() or '').strip()
         if not cur_h5 or cur_h5 == get_fname_dir():
-            self.parameters.child('h5_dir').setValue(
+            self.parameters.child('Project').child('h5_dir').setValue(
                 os.path.join(base, 'xdart_processed_data'))
             self._sync_h5_dir_from_parameters()
 
@@ -1712,7 +1898,7 @@ class imageWrangler(wranglerWidget):
         # letting a Start run the new folder's images against the old calibration
         # (the BUG-1 this reset exists to prevent).
         self.poni_file = ''
-        self.parameters.child('Calibration').child('poni_file').setValue('')
+        self.parameters.child('Signal').child('poni_file').setValue('')
         for seg in (('Signal', 'File'), ('Signal', 'img_dir'),
                     ('Signal', 'mask_file')):
             try:
@@ -1723,7 +1909,7 @@ class imageWrangler(wranglerWidget):
         # helper re-points it under the NEW folder (its keep-user-value
         # guard otherwise retains the OLD project's path on a switch, and
         # the scans browser never followed).
-        self.parameters.child('h5_dir').setValue('')
+        self.parameters.child('Project').child('h5_dir').setValue('')
         self._default_h5_under_project()
         self._apply_disclosure()
 
@@ -1768,17 +1954,12 @@ class imageWrangler(wranglerWidget):
         metadata — Manual is the default, since there's no ``th`` to read.
         """
         pars = [p for p in self.motors if not any(x.lower() in p.lower() for x in ['ROI', 'PD'])]
-        if 'th' in pars:
-            pars.insert(0, pars.pop(pars.index('th')))
-            value = 'th'
-        elif 'theta' in pars:
-            pars.insert(0, pars.pop(pars.index('theta')))
-            value = 'theta'
-        elif pars:
-            value = pars[0]
-        else:
-            # No motors (no metadata) → default to Manual incidence entry.
-            value = 'Manual'
+        # Default-select by preference order (case-insensitive); else the first
+        # available motor; else Manual (no metadata, e.g. Eiger).  Matches the
+        # integrator's gi_motor combo so the two never disagree on the auto-pick.
+        _lower = {p.lower(): p for p in pars}
+        value = next((_lower[p] for p in _GI_MOTOR_PREFERENCE if p in _lower),
+                     pars[0] if pars else 'Manual')
 
         pars = ['Manual'] + pars
 
@@ -1822,7 +2003,12 @@ class imageWrangler(wranglerWidget):
         if not self.img_file:
             return
 
-        img_meta = read_image_metadata(self.img_file, meta_format=self.meta_ext)
+        # Pass meta_dir so SPEC metadata (which often lives in a separate Meta
+        # Directory) is found here too -- the worker threads already do.  Without
+        # it the SPEC read returns {} and the GI motor dropdown collapses to its
+        # 'th'/'Manual' placeholder.  meta_dir is ignored for txt/pdi sidecars.
+        img_meta = read_image_metadata(self.img_file, meta_format=self.meta_ext,
+                                       meta_dir=self.meta_dir)
         self.scan_parameters = list(img_meta.keys())
         self.counters = self.scan_parameters
         self.motors = self.scan_parameters
@@ -1878,24 +2064,10 @@ class imageWrangler(wranglerWidget):
             self.ui.batchCheckBox.setEnabled(False)
 
     def stylize_ParameterTree(self):
-        # Uniform DARK rows (no light/dark stripe) so the panel reads cleanly;
-        # the group-header rows keep their lighter band (the :has-children rule),
-        # and the input boxes are tinted a touch lighter so the editable fields
-        # stand out against the dark rows.  Scoped to this tree so the left scans
-        # list keeps its own alternating shading.
+        # Uniform rows (no light/dark stripe) so the panel reads cleanly.  The
+        # group-header band + field tint now come from the GLOBAL QSS, scoped by
+        # the tree's object name (QTreeView#WranglerTree in themes/dark.py), so
+        # the wrangler tree themes correctly in both Dark AND Light and recolours
+        # on a live theme switch — the old widget-local Dracula stylesheet broke
+        # under the Light palette (Stage-2 deferral, closed here).
         self.tree.setAlternatingRowColors(False)
-        self.tree.setStyleSheet("""
-        QTreeView { alternate-background-color: #21222c; }
-        QTreeView::item:has-children {
-            background-color: #52566d;
-            color: #f8f8f2;
-        }
-        QTreeView::item:has-children:disabled {
-            background-color: #46495c;
-            color: #6272a4;
-        }
-        QLineEdit, QComboBox, QAbstractSpinBox {
-            background-color: #3f4354;
-            color: #f8f8f2;
-        }
-            """)

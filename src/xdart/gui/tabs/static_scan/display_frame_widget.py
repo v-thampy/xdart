@@ -55,6 +55,7 @@ from .display_logic import (
     resolve_selection, resolve_render_ids,
     default_plot_unit, pretty_unit, sentinel_mask, integer_saturation_ceiling,
     combine_flat_masks, nan_gaps_in_thumbnail,
+    stitch_plot_payload, stitch_image_payload,
 )
 from .display_controllers import register_default_controllers
 
@@ -369,6 +370,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         for _c in (self.ui.normChannel, self.ui.scale, self.ui.cmap):
             displayFrameWidget._fit_combo_width(_c, max_w=130)
             _c.setFixedHeight(_ROW_H)
+        # The colormap selector shows a short value ("Default") and lives in the
+        # compact scale pill — trim it ~15% so the pill is tighter (Vivek).
+        _cmw = self.ui.cmap.maximumWidth()
+        self.ui.cmap.setFixedWidth(int(_cmw * 0.85) if 0 < _cmw < 16777215 else 110)
         # Widen the BG button (+7%, then another +10% = x1.177) so the 'Clear BG'
         # label has comfortable room (Vivek).
         displayFrameWidget._fit_button_width(self.ui.setBkg, scale=1.177)
@@ -658,6 +663,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # scan/file load — so a worker result computed against an old
         # generation can be dropped (full enforcement lands in Stage 5).
         self.display_generation = 0
+        # Persistent stitch display: '1d'/'2d' while a Stitch mode is selected in
+        # the wrangler dropdown AND a result exists; None ⇒ the per-frame view.
+        # Set by the host via sigStitchModeChanged + stitch_thread_finished;
+        # gated by result-existence in _active_stitch_mode.
+        self.stitch_display_mode = None
         # D2 (greenfield Phase 3): off-GUI-thread rehydration of evicted frames.
         # The store reads an evicted frame's heavy payload through THIS widget's
         # disk reader; the background worker calls it off the GUI thread.  Async
@@ -837,12 +847,26 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         displayFrameWidget._fit_button_width(self._showImageBtn)
         self._showImageBtn.setToolTip('Show raw image preview for selected frame')
         self._showImageBtn.setFocusPolicy(pyQt.StrongFocus)
-        # Rebuild the right cluster in its final order: Raw | colormap | Log
-        # (Log at the right corner in every mode).
+        # The colormap selector ("Default") and the Log scale toggle are always
+        # shown together, so group them into one segmented pill (shared border,
+        # a hairline divider between, flush edges).  Raw stays a separate button
+        # to the left of the pill.
+        self._scaleGroup = QtWidgets.QFrame()
+        self._scaleGroup.setObjectName('displayScaleGroup')
+        _sg = QtWidgets.QHBoxLayout(self._scaleGroup)
+        _sg.setContentsMargins(0, 0, 0, 0)
+        _sg.setSpacing(0)
+        _scale_div = QtWidgets.QFrame()
+        _scale_div.setObjectName('displayScaleDivider')
+        _scale_div.setFrameShape(QtWidgets.QFrame.VLine)
+        _sg.addWidget(self.ui.cmap)
+        _sg.addWidget(_scale_div)
+        _sg.addWidget(self._logBtn)
+        # Rebuild the right cluster in its final order: Raw | [colormap ┊ Log].
         _l9 = self.ui.horizontalLayout_9
         while _l9.count():
             _l9.takeAt(0)
-        for _w in (self._showImageBtn, self.ui.cmap, self._logBtn):
+        for _w in (self._showImageBtn, self._scaleGroup):
             _l9.addWidget(_w)
             _l9.setAlignment(_w, pyQt.AlignVCenter)
         _l9.setSpacing(8)
@@ -1187,16 +1211,37 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 self._bump_display_generation()
             self._last_selection_sig = sig
 
+    def _active_stitch_mode(self):
+        """``'1d'``/``'2d'`` when the persistent stitch display should show, else
+        None.  ``stitch_display_mode`` follows the wrangler Mode dropdown, but the
+        stitch only renders once the matching result actually exists on the scan —
+        so selecting a Stitch mode before a run (or after a new scan cleared the
+        result) keeps the per-frame view rather than flashing an empty stitch."""
+        m = getattr(self, 'stitch_display_mode', None)
+        scan = getattr(self, 'scan', None)
+        if m == '1d' and getattr(scan, 'stitched_1d', None) is not None:
+            return '1d'
+        if m == '2d' and getattr(scan, 'stitched_2d', None) is not None:
+            return '2d'
+        return None
+
     def _live_mode(self):
         """Map the widget's viewer state to a :class:`Mode`.  Normal mode is
         INT_1D when the scan is 1D-only (skip_2d) — plot-only, matching
-        _apply_1d_only_visibility — else INT_2D (raw|cake / plot)."""
+        _apply_1d_only_visibility — else INT_2D (raw|cake / plot).  A live stitch
+        result (STITCH_1D/2D) takes precedence over the per-frame integration
+        view but not over a file viewer."""
         if self.viewer_mode == 'image':
             return Mode.IMAGE_VIEWER
         if self.viewer_mode == 'xye':
             return Mode.XYE_VIEWER
         if self.viewer_mode == 'nexus':
             return Mode.NEXUS_VIEWER
+        stitch = self._active_stitch_mode()
+        if stitch == '1d':
+            return Mode.STITCH_1D
+        if stitch == '2d':
+            return Mode.STITCH_2D
         if getattr(self.scan, 'skip_2d', False):
             return Mode.INT_1D
         return Mode.INT_2D
@@ -1221,6 +1266,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def _updated(self):
         """Check if there is data to update
         """
+        # A live stitch result is a whole-scan synthetic independent of per-frame
+        # cache readiness — render it whenever it exists (so it survives eviction
+        # of the per-frame data and re-renders on every tick).
+        if self._active_stitch_mode() is not None:
+            return True
+
         # In viewer mode, bypass the scan.name check — no HDF5 scan is loaded
         if self.viewer_mode is not None:
             if len(self.frame_ids) == 0:
@@ -1418,6 +1469,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if role is not PanelRole.PLOT_1D:
             return False
 
+        # A stitch is a single synthetic whole-scan curve with no per-frame
+        # selection state — draw it directly rather than through update_plot_view
+        # (which keys legends/waterfall offsets off frame ids the stitch lacks).
+        if state is not None and state.mode in (Mode.STITCH_1D, Mode.STITCH_2D):
+            return self._draw_stitch_plot(payload_value)
+
         traces = tuple(getattr(payload_value, "traces", ()) or ())
         if not traces:
             self.clear_plot_view()
@@ -1566,6 +1623,51 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             if _sso is not None:
                 _sso()
         return True
+
+    def _draw_stitch_plot(self, plot_payload):
+        """Draw a stitch's single merged 1-D curve directly onto ``self.plot``.
+
+        A stitch is one synthetic whole-scan trace with no per-frame selection,
+        so it bypasses ``update_plot_view`` (which keys legends + waterfall
+        offsets off per-frame ids).  Shared by the persistent payload path
+        (:meth:`_draw_payload`) and the legacy :meth:`render_stitch_result`.
+        Returns True if it drew, False otherwise."""
+        traces = tuple(getattr(plot_payload, "traces", ()) or ())
+        if not traces:
+            self.clear_plot_view()
+            return True
+        try:
+            x = np.asarray(traces[0].x, dtype=float)
+            y = np.asarray(traces[0].y, dtype=float)
+            self.plot.clear()
+            self.plot.plot(x, y, pen=pg.mkPen('#2b6cb0', width=1.5), name='Stitch')
+            self.plot.setLabel('bottom', plot_payload.axis_x.label,
+                               units=pretty_unit(plot_payload.axis_x.unit))
+            self.plot.setLabel('left', 'Intensity')
+            self.plot.autoRange()
+            return True
+        except Exception:
+            logger.error("stitch 1D draw failed", exc_info=True)
+            return False
+
+    def render_stitch_result(self, result_1d=None, result_2d=None):
+        """Legacy one-shot stitch draw (``scan.stitched_1d`` / ``stitched_2d``).
+
+        Superseded by the persistent :class:`StitchDisplayController` (the stitch
+        is now a first-class display source routed through ``update()``); kept as a
+        direct-draw helper / rollback path.  Returns True if anything drew."""
+        drew = False
+        pp = stitch_plot_payload(result_1d)
+        if pp is not None and self._draw_stitch_plot(pp):
+            drew = True
+        ip = stitch_image_payload(result_2d)
+        if ip is not None:
+            try:
+                self._draw_image_payload(PanelRole.CAKE_2D, ip)
+                drew = True
+            except Exception:
+                logger.error("stitch 2D draw failed", exc_info=True)
+        return drew
 
     @staticmethod
     def _trim_view_to_data(widget, image, x, y):
@@ -2071,6 +2173,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if mode in (Mode.INT_1D, Mode.INT_2D):
             self._apply_share_axis_state()
             self._apply_1d_only_visibility()
+        elif mode in (Mode.STITCH_1D, Mode.STITCH_2D):
+            # Stitch modes are not in the _apply_1d_only_visibility path; assert
+            # their geometry here (idempotent) so the cake/plot pane is visible
+            # and so leaving stitch restores the INT geometry on the next render.
+            self._apply_layout(mode)
 
         # Clear the panels this state does not want (kills stale content).
         for role in plan.clear:
@@ -2968,9 +3075,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # selected) frame (see _display_ids_for_2d), so the title shows that
         # frame's number -- not the bare name / "[Average]".  Only Sum/Average
         # show the aggregate (handled by the chain below).  single_img scans have
-        # no per-frame index, so they keep the bare-name title.
+        # no per-frame index, so they keep the bare-name title.  An AVERAGED
+        # series also collapses to one frame: it stays frame #1 in the Frames
+        # list, but the title is the bare series name (no "_1") -- handled by the
+        # series_average branch below, so exclude it from this early return.
         method = getattr(self, 'plotMethod', '') or ''
-        if method not in ('Sum', 'Average') and not self.scan.single_img:
+        if (method not in ('Sum', 'Average') and not self.scan.single_img
+                and not getattr(self.scan, 'series_average', False)):
             idxs = getattr(self, 'idxs_2d', None) or getattr(self, 'idxs_1d', None) or []
             if idxs:
                 self.ui.labelCurrent.setText(f'{label}_{idxs[-1]}')
@@ -3449,10 +3560,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             _plot = getattr(self, 'plot', None)   # duck holders in tests
             if _plot is not None:
                 _plot.enableAutoRange()
+            # XYE has a 1D plot: show the 1D display controls (Single/Overlay,
+            # Options, Clear) — a prior image/nexus visit may have hidden them —
+            # and hide ONLY the transform combo (the XYE file owns its x-axis).
             set_middle_visible = getattr(
                 self, "_set_middle_1d_controls_visible", None)
             if set_middle_visible is not None:
-                set_middle_visible(False)
+                set_middle_visible(True)
+            self.ui.plotUnit.setVisible(False)
             self._set_2d_controls_visible(False)
             # frame_6 is shown so the Linear/Log scale applies to the 1D
             # plot; the colormap stays too (Vivek) — the XYE waterfall image
