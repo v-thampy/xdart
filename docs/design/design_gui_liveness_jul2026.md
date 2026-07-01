@@ -45,7 +45,7 @@ paint; smoothing only helps the fast-scan case where frames pile up per window.
 ## Status checklist (update after each step)
 | # | Status | Commit | Note |
 |---|---|---|---|
-| 1 | NOT STARTED | — | needs a live repro of the frames-panel bug |
+| 1 | **INSTRUMENTED** (repro pending) | this commit | `XDART_PERF` logs at the `new_scan` boundary (`live_run_active` + `index_len`) and `h5viewer.update_data` (`index_len` → CLEAR vs keep). KEY: `new_scan` clears the frame index ONLY when `live_run_active` (the index is *intentionally* left populated otherwise, so the prior frame lingers). So the bug is almost certainly a **non-live / `live_run_active=False`** new-scan boundary — the fix (once confirmed live) is to also clear the panel on a genuinely-new scan there, not the `new_scan_loaded` flag change (which was refuted). Run `XDART_PERF=1 xdart` on the failing scenario and read the two `[PERF]` lines. |
 | 2 | **CODE DONE** (live-perf pending) | this commit | `_list_timer` (`Coalescer(70, throttle)`) → `_flush_frame_list` runs only the O(new) list refresh + signal-blocked auto-last cursor; heavy drain+render stays on `_update_timer` (200 ms). Timers stopped together at teardown; mocks updated (+`_list_timer`); unit test `test_list_timer_flush_updates_list_and_cursor_without_render`; offscreen + spine green. **Live `XDART_PERF` before/after on the 651-frame eiger baseline still TBD by the maintainer** (confirm perceived-smoothness gain + no leg regression). |
 | 3 | NOT STARTED | — | measure-gated |
 | 4 | NOT STARTED | — | measure-gated |

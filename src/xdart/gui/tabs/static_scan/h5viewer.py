@@ -929,6 +929,14 @@ class H5Viewer(QWidget):
         # with self.scan.scan_lock:
         frame_index = self.scan.frames.index
 
+        if os.environ.get("XDART_PERF"):
+            logger.info(
+                "[PERF] h5viewer.update_data: index_len=%d live_run=%s "
+                "new_scan_loaded=%s -> %s",
+                len(frame_index), getattr(self, "live_run_active", None),
+                getattr(self, "new_scan_loaded", None),
+                "CLEAR" if len(frame_index) == 0 else "keep/rebuild")
+
         if len(frame_index) == 0:
             self.ui.listData.clear()
             self._remember_displayed_frames()

@@ -5142,6 +5142,16 @@ class staticWidget(QWidget):
         # this scan up from empty.  Transition/viewer snapshots are
         # intentionally left populated so the prior frame lingers on screen
         # until this scan's first publication replaces it.
+        if os.environ.get("XDART_PERF"):
+            # Frames-panel-persist diagnostic: the index is cleared here ONLY when
+            # live_run_active — so if the panel keeps stale frames on a new scan,
+            # this line shows live_run_active=False at the boundary (the real path).
+            try:
+                _idxlen = len(getattr(getattr(self.scan, "frames", None), "index", []) or [])
+            except Exception:
+                _idxlen = -1
+            logger.info("[PERF] new_scan boundary: live_run_active=%s index_len=%d name=%s",
+                        getattr(self.h5viewer, "live_run_active", None), _idxlen, name)
         if self.h5viewer.live_run_active:
             try:
                 import pandas as pd
