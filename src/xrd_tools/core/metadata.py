@@ -31,6 +31,107 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from xrd_tools.core.strictness import StrictnessError
+
+
+INCIDENCE_MOTOR_SEARCH_ORDER: tuple[str, ...] = (
+    "th",
+    "theta",
+    "eta",
+    "halpha",
+    "gth",
+    "gonth",
+)
+
+_MISSING = object()
+
+
+class IncidenceAngleUnresolved(StrictnessError):
+    """A GI frame's incidence angle could not be resolved from metadata."""
+
+
+def _metadata_get_case_insensitive(metadata: Mapping[str, Any], key: Any) -> Any:
+    key_lower = str(key).lower()
+    for existing, value in metadata.items():
+        if str(existing).lower() == key_lower:
+            return value
+    return _MISSING
+
+
+def _float_or_unresolved(value: Any, *, motor: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise IncidenceAngleUnresolved(
+            f"GI incidence motor {motor!r} was found but value {value!r} "
+            "could not be converted to an incidence angle."
+        ) from exc
+
+
+def resolve_incident_angle(
+    metadata: Mapping[str, Any],
+    incidence_motor: str | None,
+) -> float:
+    """Resolve a GI incidence angle in degrees from a frame metadata bag.
+
+    ``incidence_motor`` may be a manual numeric angle or a motor name.  When no
+    explicit motor is provided, common GI motor names are tried in
+    :data:`INCIDENCE_MOTOR_SEARCH_ORDER`.
+    """
+
+    metadata = metadata or {}
+    if incidence_motor is not None and str(incidence_motor).strip():
+        try:
+            return float(incidence_motor)
+        except (TypeError, ValueError):
+            motor = str(incidence_motor)
+            value = _metadata_get_case_insensitive(metadata, motor)
+            if value is not _MISSING:
+                return _float_or_unresolved(value, motor=motor)
+            raise IncidenceAngleUnresolved(
+                "GI incidence motor {!r} is not a number and was not found "
+                "in the frame metadata; refusing to integrate at a degenerate "
+                "0°. Set 'Theta Motor' to Manual and enter the incidence "
+                "angle.".format(incidence_motor)
+            )
+
+    first_error: IncidenceAngleUnresolved | None = None
+    for motor in INCIDENCE_MOTOR_SEARCH_ORDER:
+        value = _metadata_get_case_insensitive(metadata, motor)
+        if value is _MISSING:
+            continue
+        try:
+            return _float_or_unresolved(value, motor=motor)
+        except IncidenceAngleUnresolved as exc:
+            if first_error is None:
+                first_error = exc
+
+    if first_error is not None:
+        raise first_error
+    raise IncidenceAngleUnresolved(
+        "GI incidence angle could not be resolved from a manual value or "
+        "metadata motors: {}.".format(", ".join(INCIDENCE_MOTOR_SEARCH_ORDER))
+    )
+
+
+def resolve_monitor_norm(metadata: Mapping[str, Any], key: str | None) -> float | None:
+    """Resolve a guarded monitor normalization value from frame metadata.
+
+    Returns ``None`` when no monitor is configured, the key is absent, or the
+    value is nonnumeric, non-finite, zero, or negative.
+    """
+
+    if key is None or not str(key).strip():
+        return None
+    value = _metadata_get_case_insensitive(metadata or {}, key)
+    if value is _MISSING:
+        return None
+    try:
+        norm = float(value)
+    except (TypeError, ValueError):
+        return None
+    return norm if np.isfinite(norm) and norm > 0.0 else None
+
 
 def numeric_metadata(metadata: Mapping[str, Any] | None) -> dict[str, float]:
     """Return finite scalar numeric values from heterogeneous metadata."""

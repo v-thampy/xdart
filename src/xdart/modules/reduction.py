@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 
 from dataclasses import fields as _dc_fields
 
+from xrd_tools.core.metadata import (
+    IncidenceAngleUnresolved,
+    resolve_incident_angle,
+    resolve_monitor_norm,
+)
 from xrd_tools.reduction import (
     Frame,
     GIMode,
@@ -339,9 +344,9 @@ def plan_from_live_scan(
     incidence_motor = getattr(live_scan, "incidence_motor", None)
     if is_gi and gi_incident_angle is None and incidence_motor is not None:
         try:
-            gi_incident_angle = float(incidence_motor)
+            gi_incident_angle = resolve_incident_angle({}, incidence_motor)
             incidence_motor = None
-        except (TypeError, ValueError):
+        except IncidenceAngleUnresolved:
             pass
     if is_gi and gi_incident_angle is None and not incidence_motor:
         raise ValueError(
@@ -1006,17 +1011,8 @@ def _frame_norm(frame: Frame, plan: ReductionPlan) -> float:
         return float(frame.normalization_factor)
     integration = plan.integration_1d or plan.integration_2d
     if integration and integration.monitor_key:
-        key = integration.monitor_key
-        value = frame.metadata.get(key)
-        if value is None:
-            value = frame.metadata.get(key.upper())
-        if value is None:
-            value = frame.metadata.get(key.lower())
-        try:
-            value = float(value)
-            return value if np.isfinite(value) and value != 0 else 1.0
-        except (TypeError, ValueError):
-            return 1.0
+        norm = resolve_monitor_norm(frame.metadata, integration.monitor_key)
+        return norm if norm is not None else 1.0
     return 1.0
 
 
