@@ -24,6 +24,8 @@ from pathlib import Path
 import numpy as np
 from pyqtgraph.Qt import QtCore, QtWidgets
 
+from xrd_tools.sources.probe import probe_first_frame, raw_is_reachable  # noqa: F401
+
 logger = logging.getLogger(__name__)
 
 #: (label, SourceKind value) for the Directory-mode scan-kind dropdown.
@@ -438,7 +440,6 @@ class ScanSourceWidget(QtWidgets.QWidget):
     @staticmethod
     def _open_source_and_probe(spec):
         from xrd_tools.sources import open_source
-        from .scan_plot_dialog import probe_first_frame
 
         source = open_source(spec)
         reachable, first_image = probe_first_frame(source)
