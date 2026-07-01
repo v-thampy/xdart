@@ -30,6 +30,7 @@ from xdart.gui.tabs.static_scan.controls_logic import (
     MeasMode,
     ProcessingPage,
     ResultCaps,
+    RunTarget,
     SectionId,
     SourceCaps,
     StatusKind,
@@ -1419,6 +1420,32 @@ def test_controls_panel_v2_not_ready_disables_run_row(qapp, monkeypatch):
         widget.deleteLater()
 
 
+def test_controls_panel_v2_readiness_summary_shows_only_top_blocker():
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    state = ControlState(
+        processing_mode="Int 2D",
+        run_target=RunTarget.LOADED_SCAN,
+    )
+    profile = ControlProfile(
+        processing_page=ProcessingPage.INT_2D,
+        run_enabled=False,
+        run_blockers=(
+            "Choose a project folder.",
+            "Run needs a frame source - use Reintegrate for the loaded scan.",
+        ),
+    )
+
+    summary, ready, tooltip = staticWidget._controls_v2_run_summary(
+        state, profile)
+
+    assert ready is False
+    assert summary == "Needs setup · Choose a project folder"
+    assert "Run needs a frame source" not in summary
+    assert "Int 2D" not in summary
+    assert "Run needs a frame source" in tooltip
+
+
 def test_controls_panel_v2_cached_scan_poni_satisfies_calibration(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
@@ -1713,6 +1740,7 @@ def test_controls_panel_v2_loaded_scan_does_not_populate_source_or_run(
         assert state.source_caps.has_frames is False
         assert widget.controls_v2.profile.can_run is False
         assert "Run needs a frame source" in summary
+        assert "Int 2D" not in summary
     finally:
         widget.close()
         widget.deleteLater()

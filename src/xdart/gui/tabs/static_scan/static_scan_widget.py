@@ -2182,18 +2182,22 @@ class staticWidget(QWidget):
             mode = str(page).replace("_", " ").title()
         blockers = tuple(getattr(profile, "run_blockers", ()) or ())
         parts = [status]
-        if not ready and blockers:
-            parts.append(str(blockers[0]).rstrip("."))
         note = run_target_readiness_note(state, ready=ready).rstrip(".")
-        if note and note not in parts:
-            parts.append(note)
-        if mode:
+        if not ready:
+            if blockers:
+                parts.append(str(blockers[0]).rstrip("."))
+            elif note:
+                parts.append(note)
+        if ready and mode:
             parts.append(mode)
         frame_count = int(getattr(state, "frame_count", 0) or 0)
-        if frame_count:
+        if ready and frame_count:
             plural = "" if frame_count == 1 else "s"
             parts.append(f"{frame_count} frame{plural}")
-        tooltip = "" if ready else "; ".join(str(b) for b in blockers[:3])
+        tooltip_parts = [str(b) for b in blockers[:3]]
+        if note and note not in tooltip_parts:
+            tooltip_parts.append(note)
+        tooltip = "" if ready else "; ".join(tooltip_parts)
         return " · ".join(parts), ready, tooltip
 
     def _defer_controls_v2_refresh_until_commit(self, editor) -> None:
