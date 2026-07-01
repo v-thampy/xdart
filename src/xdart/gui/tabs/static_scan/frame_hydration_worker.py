@@ -5,10 +5,10 @@ Scroll-back to a frame that has been evicted from the in-memory window needs its
 heavy payload (cake / full raw) rehydrated from ``scan.frames`` / the ``.nxs``.
 Doing that h5py read on the GUI thread froze the UI for ~5 s per evicted frame
 (``display_data._hydrate_frame_from_disk``'s idle branch).  This worker moves the
-read OFF the GUI thread: it pulls publications through
-``PublicationStore.get_or_hydrate`` (which invokes the registered hydrator) on
-its own thread, then emits :attr:`sigHydrated` so the GUI re-renders — by which
-point the heavy payload is resident in the shared store.
+read OFF the GUI thread: it pulls records/publications through
+``*.get_or_hydrate`` (which invokes the registered hydrator) on its own thread,
+then emits :attr:`sigHydrated` so the GUI re-renders — by which point the heavy
+payload is resident in the shared store.
 
 Staleness is the CALLER's concern: every request carries the
 ``displayFrameWidget.display_generation`` it was made under, echoed back in the
@@ -34,6 +34,11 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
     payload is already resident — ``get_or_hydrate`` returns without a read — so
     duplicate requests from rapid scroll-back are nearly free and need no
     dedupe.  ``stop()`` drains and joins; safe to call once at teardown.
+
+    ``store`` may also be a zero-arg provider returning one store or an iterable
+    of stores.  The live app uses that to hydrate the authoritative
+    ``FrameRecordStore`` first while the transitional ``PublicationStore`` still
+    exists as a fallback projection.
     """
 
     #: (label, generation) — label echoes the request; generation gates staleness.
@@ -46,6 +51,16 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
         self._queue: deque = deque()
         self._newest_gen = -1        # highest generation ever requested (P3)
         self._stop = False
+
+    def _stores(self):
+        source = self._store
+        if callable(source) and not hasattr(source, "get_or_hydrate"):
+            source = source()
+        if source is None:
+            return ()
+        if hasattr(source, "get_or_hydrate"):
+            return (source,)
+        return tuple(store for store in source if store is not None)
 
     def request(self, label, generation: int) -> None:
         """Enqueue a hydration request (non-blocking; returns immediately)."""
@@ -72,13 +87,17 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
                 # so don't even hit disk for a frame the user already scrolled
                 # past — the GUI would drop the result anyway.
                 continue
-            try:
-                publication = self._store.get_or_hydrate(label)
-            except Exception:
-                logger.debug("background hydration failed for %s", label,
-                             exc_info=True)
-                publication = None
-            if publication is not None:
+            hydrated = False
+            for store in self._stores():
+                getter = getattr(store, "get_or_hydrate", None)
+                if getter is None:
+                    continue
+                try:
+                    hydrated = getter(label) is not None or hydrated
+                except Exception:
+                    logger.debug("background hydration failed for %s", label,
+                                 exc_info=True)
+            if hydrated:
                 # The GUI handler still re-checks generation == the live
                 # display_generation (a change that landed during the read).
                 self.sigHydrated.emit(label, generation)

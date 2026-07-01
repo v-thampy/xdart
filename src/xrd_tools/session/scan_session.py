@@ -264,6 +264,10 @@ class ScanSession:
         # exception unwind; surface the run failure only on a clean exit.
         self.finish(raise_on_failure=exc_type is None)
 
+    @property
+    def record_store(self) -> FrameRecordStore | None:
+        return self._record_store
+
     # -- commands in -------------------------------------------------------
     def start(self) -> None:
         """Idempotent: the writer is armed at construction; emit the initial

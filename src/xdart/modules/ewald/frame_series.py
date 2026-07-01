@@ -445,11 +445,11 @@ class LiveFrameSeries:
         self.index: _IndexedList = _IndexedList()
         self.static = static
         self.gi = gi
-        # Hot-cache of fully-populated LiveFrame objects.  Used by the
-        # writer to access freshly-integrated frames before they hit
-        # disk, and by viewer code to avoid re-loading recently-touched
-        # frames.  Bounded so long scans don't blow memory; see
-        # ``_in_memory_cap``.
+        # Write-side staging cache of fully-populated LiveFrame objects.  The
+        # writer reads freshly-integrated frames here until the durable NeXus
+        # flush; display-heavy ownership now lives in FrameRecordStore.  Viewer
+        # code may still benefit from resident hits, but this bound is no longer
+        # the canonical display cache.
         self._in_memory: dict[int, LiveFrame] = {}
         self._in_memory_cap = 64
         # Indices known to be safely written to disk.  ``stash`` refuses to
@@ -481,15 +481,14 @@ class LiveFrameSeries:
         instead of re-loading from disk (which would fail for the
         first-ever frame, before any stacked dataset has been written).
 
-        Entries beyond ``_in_memory_cap`` are evicted oldest-first to keep
-        memory bounded on long scans — but ONLY frames already persisted to
+        Entries beyond ``_in_memory_cap`` are evicted oldest-first to keep the
+        write-side staging window bounded — but ONLY frames already persisted to
         disk (``_persisted``).  An unsaved frame holds the sole copy of its
-        ``int_1d``/``int_2d`` (the writer reads them straight off this object;
-        ``__getitem__`` lazy-loads evicted frames from disk), so FIFO-dropping
-        an unsaved frame silently loses its results — the data-loss bug this
-        guards.  If nothing in memory is persisted yet, eviction is skipped
-        (the cache exceeds the cap until the next save); the non-batch
-        dispatcher forces a save before the unsaved set can grow unbounded.
+        ``int_1d``/``int_2d`` for the writer, so FIFO-dropping an unsaved frame
+        silently loses its results — the data-loss bug this guards.  If nothing
+        in memory is persisted yet, eviction is skipped (the cache exceeds the
+        cap until the next save); the save cadence forces a durable flush before
+        the unsaved staging set can grow unbounded.
         """
         with self._cache_lock:
             self._in_memory[frame.idx] = frame

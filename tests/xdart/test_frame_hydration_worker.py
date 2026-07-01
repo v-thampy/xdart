@@ -4,10 +4,21 @@ publications off the GUI thread and signals completion."""
 import threading
 import time
 
+import h5py
+import numpy as np
 import pytest
 
 from pyqtgraph import Qt
 from xdart.gui.tabs.static_scan.frame_hydration_worker import FrameHydrationWorker
+from xrd_tools.core import (
+    FrameRecord,
+    FrameView,
+    IntegrationResult1D,
+    assert_frameview_equivalent,
+    view_to_result_1d,
+)
+from xrd_tools.io import read_frame_view, write_integrated_stack
+from xrd_tools.session import FrameRecordStore
 
 _DIRECT = Qt.QtCore.Qt.ConnectionType.DirectConnection
 
@@ -109,6 +120,29 @@ def test_worker_survives_a_raising_hydrator(qapp):
     assert emitted == []
 
 
+def test_worker_hydrates_each_store_from_provider(qapp):
+    calls = []
+    done = threading.Event()
+
+    class Store:
+        def __init__(self, name):
+            self.name = name
+
+        def get_or_hydrate(self, label):
+            calls.append((self.name, label))
+            return {"label": label}
+
+    worker = FrameHydrationWorker(lambda: (Store("record"), Store("publication")))
+    worker.sigHydrated.connect(lambda l, g: done.set(), _DIRECT)
+    worker.start()
+    try:
+        worker.request(4, 1)
+        assert done.wait(5.0)
+    finally:
+        worker.stop()
+    assert calls == [("record", 4), ("publication", 4)]
+
+
 def test_request_after_stop_is_a_noop(qapp):
     class FakeStore:
         def get_or_hydrate(self, label):
@@ -122,3 +156,58 @@ def test_request_after_stop_is_a_noop(qapp):
     worker.request(5, 1)               # after stop -> dropped
     time.sleep(0.2)
     assert emitted == []
+
+
+def _view(label, scale=1.0):
+    intensity = scale * np.array([3.0, 6.0, 12.0])
+    return FrameView.from_results(
+        label=label,
+        result_1d=IntegrationResult1D(
+            radial=np.array([0.1, 0.2, 0.3]),
+            intensity=intensity,
+            sigma=np.sqrt(intensity),
+            unit="q_A^-1",
+        ),
+    )
+
+
+def test_record_store_rehydrates_evicted_frame_on_worker_thread(qapp, tmp_path):
+    path = tmp_path / "record_store_hydrate.nxs"
+    original = _view(1, scale=1.0)
+    second = _view(2, scale=2.0)
+    with h5py.File(path, "w") as f:
+        write_integrated_stack(
+            f.create_group("entry"),
+            frame_indices=[1, 2],
+            results_1d=[view_to_result_1d(original), view_to_result_1d(second)],
+        )
+
+    store = FrameRecordStore(max_heavy_items=1)
+    store.upsert(FrameRecord.from_view(original), persisted=True)
+    store.upsert(FrameRecord.from_view(second), persisted=True)
+    assert not store.has_heavy_payload(1)
+    assert store.has_heavy_payload(2)
+
+    caller_thread = threading.get_ident()
+    seen = {}
+
+    def hydrate(label):
+        seen["thread"] = threading.get_ident()
+        return FrameRecord.from_view(read_frame_view(path, int(label)))
+
+    store.set_hydrator(hydrate)
+
+    done = threading.Event()
+    worker = FrameHydrationWorker(store)
+    worker.sigHydrated.connect(lambda label, gen: done.set(), _DIRECT)
+    worker.start()
+    try:
+        worker.request(1, 1)
+        assert done.wait(5.0), "record-store hydration did not finish"
+    finally:
+        worker.stop()
+
+    assert seen["thread"] != caller_thread
+    assert store.has_heavy_payload(1)
+    assert not store.has_heavy_payload(2)
+    assert_frameview_equivalent(store.get(1).project(), original)

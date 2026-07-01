@@ -20,9 +20,12 @@ decisions before build. **Builds on:** ADR-0003 (multi-result record), ADR-0004 
 - `xrd_tools.session.ScanSession` holds the streaming `ReductionSession` + event contract
   (`submit`/`on_frame_completed`) and an optional `FrameRecordStore`. Phase 5 A-Step-A wires the
   xdart GUI streaming path to create a per-scan, unbounded store and mark it persisted after
-  `QtNexusSink.flush()` completes the Nexus save. **A-Step-B DONE (this commit): display reads now
+  `QtNexusSink.flush()` completes the Nexus save. **A-Step-B DONE (`ca61215b`): display reads now
   consult the session store first, with `PublicationStore` and `data_1d`/`data_2d` retained as
-  fallbacks.**
+  fallbacks. A-Step-C DONE (this commit; offscreen, live checkpoint PENDING): the session
+  `FrameRecordStore` owns the heavy-array bound and worker-thread hydration; `LiveFrameSeries`
+  is demoted to write-side staging, with persist-before-evict still marked at the Nexus flush
+  boundary.**
 - `PublicationStore` (xdart): bounded per-mode `FrameRecord`s (`max_heavy_items=64`); `get_or_hydrate`
   exists but is a per-frame path.
 - `data_1d = FixSizeOrderedDict(max=0)` — unbounded, the de-facto aggregation backstop; `data_2d` cap 40.
@@ -75,9 +78,14 @@ Whole-scan Sum/Average/Overall must source ALL frames without holding them all i
 - **A-Step-A (live wiring, additive):** GUI streaming sessions now pass a dormant per-scan
   `FrameRecordStore(max_heavy_items=None)` into `ScanSession`; `QtNexusSink` marks published labels
   persisted only after the durable `.nxs` save. Display and aggregation still read the legacy mirrors.
-- **A-Step-B DONE (this commit, store-first reads):** display access now resolves
+- **A-Step-B DONE (`ca61215b`, store-first reads):** display access now resolves
   `record_store → PublicationStore → data_1d/data_2d`, projecting the active `(mode_1d, mode_2d)`
   before adapting to the existing renderer. Mirror writes remain intact for fallback and rollback.
+- **A-Step-C DONE (this commit; offscreen, live checkpoint PENDING):** `FrameRecordStore` now uses
+  the 64-frame heavy-array cap, registers a `read_frame_view` disk hydrator, and hydrates through
+  the existing worker thread rather than the GUI thread. `LiveFrameSeries._in_memory_cap` and the
+  save-before-evict margin remain as write-side staging inputs to `FlushPolicy`; `QtNexusSink.flush`
+  marks both Nexus and store persistence at the durable save boundary.
 - **W (write wiring):** feed the accumulated record's per-mode subgroups to the writer (closes the
   Round-11 in-memory-only gap) → the on-disk stack carries all modes. byte-compat gated.
 - **7b (aggregation):** route whole-scan Sum/Average/Overall through the stacked-disk-read + in-memory

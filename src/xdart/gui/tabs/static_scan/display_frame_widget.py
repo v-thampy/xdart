@@ -651,6 +651,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # Viewer mode: None (normal), 'image', or 'xye'
         self.viewer_mode = None
         self._wrangler = None
+        self.frame_record_store = None
 
         # Frame index tracking
         self.idxs = []
@@ -969,8 +970,23 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._async_hydration_enabled = True
         self._ensure_hydration_worker()
 
+    def _hydration_stores(self):
+        stores = []
+        record_store = self.frame_record_store
+        if callable(record_store):
+            try:
+                record_store = record_store()
+            except Exception:
+                logger.debug("record-store provider failed", exc_info=True)
+                record_store = None
+        if record_store is not None:
+            stores.append(record_store)
+        if self.publication_store is not None:
+            stores.append(self.publication_store)
+        return tuple(stores)
+
     def _ensure_hydration_worker(self):
-        if self._hydration_worker is None and self.publication_store is not None:
+        if self._hydration_worker is None and self._hydration_stores():
             from .frame_hydration_worker import FrameHydrationWorker
             # parent=None (NOT self): a QThread parented to the widget is
             # C++-deleted when the widget is destroyed even if its thread is
@@ -978,7 +994,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             # parent the Python handle (kept by stop_hydration_worker on a slow
             # read) is the sole owner, so the thread is never force-deleted mid
             # read (codex P1).
-            worker = FrameHydrationWorker(self.publication_store, parent=None)
+            worker = FrameHydrationWorker(self._hydration_stores, parent=None)
             worker.sigHydrated.connect(self._on_frame_hydrated)
             worker.start()
             self._hydration_worker = worker

@@ -164,8 +164,10 @@ class FrameRecordStore:
     ) -> None:
         """Register a synchronous hydrator for thinned records.
 
-        Disk-backed hydrators should be called from a worker thread; this store
-        deliberately does not hide I/O behind a GUI thread.
+        Disk-backed hydrators must be called from a worker thread, never a GUI
+        render thread.  The store deliberately does not hide I/O behind an
+        implicit thread; UI integrations should register a disk reader here and
+        invoke :meth:`get_or_hydrate` from their existing hydration worker.
         """
         with self._lock:
             self._hydrator = hydrator

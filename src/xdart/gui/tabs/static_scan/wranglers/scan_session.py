@@ -58,6 +58,13 @@ class ScanSessionAdapter:
         return self._sink
 
     @property
+    def record_store(self):
+        store = getattr(self._session, "record_store", None)
+        if store is not None:
+            return store
+        return getattr(self._sink, "_record_store", None)
+
+    @property
     def is_paused(self) -> bool:
         return self._session.is_paused
 
@@ -133,6 +140,11 @@ class ScanSessionAdapter:
         through the session (not ``self._sink`` directly) keeps xdart thin over
         the public session API."""
         self._session.flush(force=True)
+
+    def set_hydrator(self, hydrator) -> None:
+        store = self.record_store
+        if store is not None:
+            store.set_hydrator(hydrator)
 
     def resume(self) -> None:
         """Re-allow submit() after a pause (delegates to

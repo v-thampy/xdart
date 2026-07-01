@@ -235,6 +235,7 @@ def test_qt_sink_marks_record_store_persisted_after_nexus_save(tmp_path, monkeyp
             self.persisted = []
 
         def mark_persisted(self, labels):
+            events.append("record_store")
             self.persisted.append(set(labels))
 
     monkeypatch.setattr(iwt, "_get_h5pool", lambda: _Pool())
@@ -242,6 +243,7 @@ def test_qt_sink_marks_record_store_persisted_after_nexus_save(tmp_path, monkeyp
     scan = LiveScan(data_file=str(tmp_path / "scan.nxs"))
     scan.skip_2d = True
     host = _FakeHost(batch_mode=True)
+    events = []
     store = _Store()
     sink = QtNexusSink(
         host, scan, _minimal_plan(), mask=None, record_store=store
@@ -255,13 +257,16 @@ def test_qt_sink_marks_record_store_persisted_after_nexus_save(tmp_path, monkeyp
     saved = []
 
     def fake_save(*, mode="a", **kwargs):
+        events.append("nexus")
         saved.append(mode)
         scan.frames.mark_persisted(scan.frames.index)
 
     monkeypatch.setattr(scan, "_save_to_nexus", fake_save)
+    assert store.persisted == []
     sink.flush(force=True)
 
     assert saved == ["w"]
+    assert events == ["nexus", "record_store"]
     assert store.persisted == [{0, 1}]
 
 

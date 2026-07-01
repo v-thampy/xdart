@@ -57,6 +57,7 @@ from pyqtgraph import Qt
 
 # Project imports
 from xdart.modules.live import LiveFrame, LiveScan, IncidenceAngleUnresolved
+from xrd_tools.core import DEFAULT_MODE_KEY, FrameRecord
 from xrd_tools.integrate.gid import gi_1d_output_axis_key
 from xrd_tools.integrate.calibration import poni_to_integrator, get_detector
 from xrd_tools.reduction import (
@@ -1897,6 +1898,67 @@ class imageThread(wranglerThread):
             count += 1
         return count
 
+    def _on_qt_gui_thread(self) -> bool:
+        try:
+            app = Qt.QtWidgets.QApplication.instance()
+            return app is not None and Qt.QtCore.QThread.currentThread() is app.thread()
+        except Exception:
+            return False
+
+    def _record_store_hydrator(self, scan, record_store):
+        """Build the disk-backed ``FrameRecordStore`` hydrator.
+
+        This hydrator is registered on the session store but is intentionally
+        invoked by ``FrameHydrationWorker``.  Refusing the Qt GUI thread here
+        protects the live UI if a caller accidentally asks the store to hydrate
+        synchronously from a render path.
+        """
+        initial_path = getattr(scan, "data_file", None)
+
+        def hydrate(label):
+            thread_check = getattr(self, "_on_qt_gui_thread", None)
+            on_gui_thread = (
+                thread_check()
+                if callable(thread_check)
+                else imageThread._on_qt_gui_thread(self)
+            )
+            if on_gui_thread:
+                logger.error(
+                    "FrameRecordStore hydrator refused GUI-thread disk read "
+                    "for frame %s", label)
+                return None
+            scan_file = getattr(scan, "data_file", None) or initial_path
+            if not scan_file:
+                return None
+            try:
+                frame_label = int(label)
+            except (TypeError, ValueError):
+                return None
+
+            existing = record_store.get(frame_label)
+            mode_1d = (
+                existing.active_mode_1d
+                if existing is not None and existing.results_1d
+                else DEFAULT_MODE_KEY
+            )
+            mode_2d = (
+                existing.active_mode_2d
+                if existing is not None and existing.results_2d
+                else DEFAULT_MODE_KEY
+            )
+            try:
+                from xrd_tools.io import read_frame_view
+                view = read_frame_view(
+                    scan_file, frame_label, mode_1d=mode_1d, mode_2d=mode_2d)
+            except Exception:
+                logger.debug("record-store hydrate failed for %s", label,
+                             exc_info=True)
+                return None
+            return FrameRecord.from_view(
+                view, mode_1d=mode_1d, mode_2d=mode_2d)
+
+        return hydrate
+
     def _get_streaming_session(self, scan, frames):
         """Build (once per scan) or return the persistent streaming session +
         its ``QtNexusSink``.  Returns ``(None, None)`` if the GI freeze scout
@@ -1916,7 +1978,8 @@ class imageThread(wranglerThread):
         _default_freeze = ("scout_union" if self.batch_mode else "first_frame") \
             if self.gi else None
         gi_freeze_mode = getattr(self, "gi_freeze_mode", _default_freeze)
-        record_store = FrameRecordStore(max_heavy_items=None)
+        frame_cap = getattr(getattr(scan, "frames", None), "_in_memory_cap", 64)
+        record_store = FrameRecordStore(max_heavy_items=frame_cap)
         self._streaming_record_store = record_store
         sink = QtNexusSink(
             self, scan, standard_plan, mask=self.mask, record_store=record_store
@@ -1964,6 +2027,8 @@ class imageThread(wranglerThread):
         # quiesce to ReductionSession.pause).
         from .scan_session import ScanSessionAdapter
         self._scan_session_adapter = ScanSessionAdapter(self, scan, session, sink)
+        self._scan_session_adapter.set_hydrator(
+            imageThread._record_store_hydrator(self, scan, record_store))
         return session, sink
 
     def _process_one(self, scan, img_file, img_number, img_data, img_meta,

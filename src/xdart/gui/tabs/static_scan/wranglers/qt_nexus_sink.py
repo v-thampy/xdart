@@ -24,8 +24,10 @@ Design (per the WS-X1 Phase-2 review notes):
   all N (otherwise it would be a third reference pinning every ~1 MB cake for
   the whole scan).
 * **Persist-before-evict** — the save cadence forces a flush before
-  ``LiveFrameSeries._in_memory`` (cap 64) could evict an unsaved frame (the same
-  invariant as the data-loss fix; ``_save_to_nexus`` calls ``mark_persisted``).
+  ``LiveFrameSeries._in_memory`` (cap 64) could evict an unsaved write-side
+  staging frame (the same invariant as the data-loss fix; ``_save_to_nexus``
+  calls ``mark_persisted``). Display-heavy ownership lives in the
+  ``FrameRecordStore``.
 """
 
 from __future__ import annotations
@@ -37,8 +39,9 @@ from xrd_tools.reduction import FlushPolicy
 
 logger = logging.getLogger(__name__)
 
-# Margin below the in-memory frame cache cap at which the sink forces a save,
-# so an unsaved frame is never evicted (data-loss invariant).
+# Margin below the LiveFrameSeries write-side staging cap at which the sink
+# forces a save, so an unsaved staged frame is never evicted (data-loss
+# invariant). The FrameRecordStore owns display-heavy eviction/hydration.
 _SAVE_BEFORE_EVICT_MARGIN = 8
 
 
@@ -287,6 +290,9 @@ class QtNexusSink:
         # interval is set to the cap to disable that branch; in live mode it
         # is LIVE_SAVE_INTERVAL (clamped by the cap−margin pressure bound via
         # should_flush's min semantics).
+        # LiveFrameSeries is now only the write-side staging window; its cap
+        # still feeds FlushPolicy so the durable save happens before staging
+        # would need to evict an unsaved frame.
         cap = getattr(self._scan.frames, "_in_memory_cap", 64)
         interval = (cap if getattr(self._host, "batch_mode", True)
                     else self._host.LIVE_SAVE_INTERVAL)

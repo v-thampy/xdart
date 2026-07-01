@@ -427,6 +427,17 @@ class staticWidget(QWidget):
     def _clear_frame_record_store(self, *_args):
         self._frame_record_store = None
 
+    def _request_frame_record_hydration(self, label):
+        display = getattr(self, "displayframe", None)
+        request = getattr(display, "_request_frame_hydration", None)
+        if request is None:
+            return
+        try:
+            request(label)
+        except Exception:
+            logger.debug("record-store hydration request failed for %s", label,
+                         exc_info=True)
+
     @staticmethod
     def _coerce_frame_label(idx):
         try:
@@ -552,16 +563,28 @@ class staticWidget(QWidget):
         store = self._active_frame_record_store()
         if store is not None:
             try:
-                record = store.get(key)
+                record = (
+                    store.get_or_hydrate(key)
+                    if allow_blocking_read and hasattr(store, "get_or_hydrate")
+                    else store.get(key)
+                )
             except Exception:
                 logger.debug("record_store lookup failed for %s", key, exc_info=True)
                 record = None
             if record is not None:
                 try:
-                    return record.project(mode_1d=mode_1d, mode_2d=mode_2d)
-                except ValueError:
-                    logger.debug("record_store projection missed for %s", key,
-                                 exc_info=True)
+                    heavy = store.has_heavy_payload(key)
+                except Exception:
+                    heavy = True
+                if not heavy:
+                    if not allow_blocking_read:
+                        self._request_frame_record_hydration(key)
+                else:
+                    try:
+                        return record.project(mode_1d=mode_1d, mode_2d=mode_2d)
+                    except ValueError:
+                        logger.debug("record_store projection missed for %s", key,
+                                     exc_info=True)
 
         view = self._publication_frame_view(
             key, mode_1d, mode_2d, allow_blocking_read=allow_blocking_read)
@@ -596,6 +619,7 @@ class staticWidget(QWidget):
                                                data_lock=self.data_lock,
                                                publication_store=self.publication_store)
         self.displayframe.store_first_frame_view = self.store_first_frame_view
+        self.displayframe.frame_record_store = self._active_frame_record_store
         # Back-ref so h5viewer.data_reset can re-arm display-side caches.
         self.h5viewer.displayframe = self.displayframe
         self.ui.middleFrame.setLayout(self.displayframe.ui.layout)
