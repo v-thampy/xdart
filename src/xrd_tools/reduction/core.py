@@ -505,6 +505,7 @@ class NexusSink:
     _h5: Any | None = field(default=None, init=False, repr=False)
     _n_written: int = field(default=0, init=False, repr=False)
     _scan: "Scan | None" = field(default=None, init=False, repr=False)
+    _plan: "ReductionPlan | None" = field(default=None, init=False, repr=False)
     _active_path: Path | None = field(default=None, init=False, repr=False)
     _tmp_path: Path | None = field(default=None, init=False, repr=False)
 
@@ -519,6 +520,7 @@ class NexusSink:
         # Stash the scan so finish() can persist its per-frame condition table
         # (scan_data) alongside the integrated stacks (core provenance).
         self._scan = scan
+        self._plan = plan
         use_atomic = (
             bool(self.atomic)
             if self.atomic is not None
@@ -629,10 +631,28 @@ class NexusSink:
                     if isinstance(geom, Diffractometer):
                         from xrd_tools.io.nexus import write_diffractometer
                         write_diffractometer(self._h5[self.entry], geom)
+                plan = self._plan
+                if plan is not None:
+                    from xrd_tools import __version__ as _xrd_tools_version
+                    from xrd_tools.core.provenance import write_provenance
+                    from xrd_tools.reduction.provenance_config import (
+                        build_reduction_config,
+                    )
+
+                    config, inputs = build_reduction_config((scan, plan))
+                    write_provenance(
+                        self._h5,
+                        entry=self.entry,
+                        program="xrd-tools",
+                        program_version=_xrd_tools_version,
+                        config=config,
+                        inputs=inputs or None,
+                    )
             self._h5.flush()
             self._h5.close()
             self._h5 = None
             self._scan = None
+            self._plan = None
             if tmp_path is not None:
                 tmp_path.replace(self.path)
         except BaseException:
@@ -654,6 +674,7 @@ class NexusSink:
         tmp_path = self._tmp_path
         self._h5 = None
         self._scan = None
+        self._plan = None
         self._active_path = None
         self._tmp_path = None
         if h5 is not None:

@@ -152,7 +152,7 @@ Stages 6–8 touch the contested Phase-5 GUI files (`static_scan_widget.py`, `di
 | 1 | (1) readiness/caps/run-gate MOVE + mask relocation + purity guard | M / low / parallelizable / NOT contested | **DONE** | Stage 1 | `controls_logic` moved to `xrd_tools.session.readiness`; mask helpers moved to `xrd_tools.reduction.masks`; shims kept at `xdart.gui.tabs.static_scan.controls_logic` and `xdart.modules.reduction`, with `tests/core/test_readiness_purity.py`. |
 | 2 | (2) probe extract | S / low / parallelizable | **DONE** | Stage 2 | Moved `probe_first_frame` / `raw_is_reachable` to `xrd_tools.sources.probe` with GUI shims. Added core behavior + import-purity coverage. |
 | 3 | (3) composition (needs 1+2) | M / low-med | **NOT STARTED** | — | consume `metadata['capabilities']`; keep true-live escape hatch |
-| 4 | (4) provenance builder + `/entry/reduction/` | M / med / spine-gated | **NOT STARTED** | — | ADDITIVE, spine-gated |
+| 4 | (4) provenance builder + `/entry/reduction/` | M / med / spine-gated | **DONE** | this commit | headless NexusSink emits `/entry/reduction/`; GUI writer byte-identical via shared builder |
 | 5 | (5) resolver dedup | M / med / RECONCILING | **NOT STARTED** | — | canonical = guarded `_frame_norm`; no `StrictPolicy` arg; edit off Phase-5 A-Step-A |
 | 6 | Plan B item 1 (source-card readiness) | contested-GUI | **DEFERRED** | — | after stable `static_scan_widget.py` / Phase-5 |
 | 7 | Plan B item 2 (run-gate GUI) | contested-GUI | **DEFERRED** | — | after stable `static_scan_widget.py` / Phase-5 |

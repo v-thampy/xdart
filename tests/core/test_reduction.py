@@ -937,17 +937,26 @@ def test_zero_scalar_background_is_noop_without_allocation() -> None:
 
 def test_nexus_sink_flush_policy(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     monkeypatch.setattr(reduction_core, "integrate_1d",
                         lambda image, ai, **kwargs: _r1d(float(image[0, 0])))
     calls = []
 
     class FakeH5:
+        def __init__(self):
+            self._h5 = h5py.File(tmp_path / "flush_policy_fake.h5", "w")
+
+        def require_group(self, *args, **kwargs):
+            return self._h5.require_group(*args, **kwargs)
+
         def flush(self):
             calls.append("flush")
+            self._h5.flush()
 
         def close(self):
             calls.append("close")
+            self._h5.close()
 
     monkeypatch.setattr(reduction_core, "open_nexus_writer", lambda *a, **k: FakeH5())
     monkeypatch.setattr(reduction_core, "write_nexus_frame", lambda *a, **k: None)
@@ -965,8 +974,8 @@ def test_nexus_sink_flush_policy(
             energy=12.398,
             wavelength=1.0,
         ),
-        # complete_record=False: FakeH5 only mocks flush/close, and this test
-        # is about flush cadence, not the per-frame record.
+        # complete_record=False: this test is about flush cadence, not the
+        # per-frame record.
         NexusSink("scan.nxs", overwrite=True, flush_every=2, atomic=False,
                   complete_record=False),
     )

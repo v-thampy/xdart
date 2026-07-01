@@ -708,42 +708,11 @@ def _ensure_nxentry(f, entry: str) -> None:
 def _write_reduction(h5f, scan, *, entry: str) -> None:
     """Write /entry/reduction/ via xrd_tools provenance."""
     from xrd_tools.core.provenance import write_provenance
-
-    config: dict[str, Any] = {
-        "bai_1d_args": dict(scan.bai_1d_args),
-        "bai_2d_args": dict(scan.bai_2d_args),
-    }
-    if hasattr(scan, "gi_config") and scan.gi_config:
-        config["gi_config"] = dict(scan.gi_config)
-    # T0-4 disclosure: when the GI grid was frozen from the first chunk
-    # because the whole-scan incidence range couldn't be verified, persist
-    # the advisory in the output file — not just a transient GUI label.
-    _gi_diag = getattr(scan, "gi_freeze_diagnostic", None)
-    if _gi_diag:
-        config["gi_freeze_diagnostic"] = str(_gi_diag)
-
-    # Geometry: stored as a structured subgroup (handled specially in
-    # write_provenance), so the convention is human-inspectable in HDF5.
-    geom = getattr(scan, "geometry", None)
-    if geom is not None:
-        config["geometry"] = {
-            # dual-class safe: the canonical Diffractometer names it `preset`,
-            # the legacy DiffractometerGeometry names it `convention`.
-            "convention": getattr(geom, "convention", getattr(geom, "preset", "")),
-            "mapping_json": geom.to_json(),
-            "motor_sources": {
-                m: m for m in geom.all_referenced_motors()
-            },
-        }
-
-    inputs: dict[str, Any] = {}
-    if hasattr(scan, "raw_files") and scan.raw_files:
-        inputs["raw_files"] = list(scan.raw_files)
-    if hasattr(scan, "meta_file") and scan.meta_file:
-        inputs["meta_file"] = str(scan.meta_file)
+    from xrd_tools.reduction.provenance_config import build_reduction_config
 
     from xdart import __version__ as _xdart_version
 
+    config, inputs = build_reduction_config(scan)
     write_provenance(
         h5f,
         entry=entry,
