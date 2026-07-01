@@ -888,7 +888,8 @@ QToolButton#controlsV2BrowseButton:pressed,
 QToolButton#controlsV2MoreButton:pressed {
     background-color: $browse_pressed;
 }
-QPushButton#controlsV2ToggleButton {
+QPushButton#controlsV2ToggleButton,
+QPushButton#controlsV2PillButton {
     background-color: $field;
     color: $text_2;
     border: 1px solid $field_border;
@@ -897,24 +898,31 @@ QPushButton#controlsV2ToggleButton {
     font-weight: 700;
     text-align: center;
 }
-QPushButton#controlsV2ToggleButton:checked {
+QPushButton#controlsV2ToggleButton:checked,
+QPushButton#controlsV2PillButton:checked {
     background-color: $accent;
     color: $accent_on_text;
     border-color: $accent;
 }
-QPushButton#controlsV2ToggleButton:checked:disabled {
+QPushButton#controlsV2ToggleButton:checked:disabled,
+QPushButton#controlsV2PillButton:checked:disabled {
     background-color: $accent_muted;
     color: $text_2;
     border-color: $accent_muted;
 }
-QPushButton#controlsV2ToggleButton:disabled {
+QPushButton#controlsV2ToggleButton:disabled,
+QPushButton#controlsV2PillButton:disabled {
     background-color: $panel;
     color: $text_muted;
     border-color: $field_border;
 }
 /* Pill variant (Conditioning / Corrections toggles): fully rounded + content-
-   sized so several share a row, instead of full-width stacked buttons. */
-QPushButton#controlsV2ToggleButton[pill="true"] {
+   sized so several share a row, instead of full-width stacked buttons.  Styled
+   by a DEDICATED object name (#controlsV2PillButton), NOT a [pill="true"]
+   dynamic property: an object-name selector is applied at the button's first
+   polish, whereas a property selector only takes effect after a global restyle
+   -- which left the pills boxy until an unrelated font-size change. */
+QPushButton#controlsV2PillButton {
     border-radius: 13px;
     padding: 4px 13px;
 }
