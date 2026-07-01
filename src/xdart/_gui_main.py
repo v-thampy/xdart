@@ -151,9 +151,14 @@ class Main(QMainWindow):
         except Exception:
             logger.exception("Could not locate the Config menu for the theme toggle")
             return
-        current = QtCore.QSettings("xdart", "xdart").value("theme", "dark")
+        settings = QtCore.QSettings("xdart", "xdart")
+        current = settings.value("theme", "dark")
         if current not in ("dark", "light"):
             current = "dark"
+        panel_font_size = settings.value(
+            "control_panel_font_size", "default")
+        if panel_font_size not in ("small", "default", "large"):
+            panel_font_size = "default"
         config_menu.addSeparator()
         theme_menu = config_menu.addMenu("Theme")
         group = QtGui.QActionGroup(self)
@@ -166,14 +171,48 @@ class Main(QMainWindow):
                 lambda _checked=False, n=name: self._set_theme(n))
             group.addAction(action)
             theme_menu.addAction(action)
+        font_menu = config_menu.addMenu("Control Panel Font Size")
+        font_group = QtGui.QActionGroup(self)
+        font_group.setExclusive(True)
+        for size, label in (
+            ("small", "Small"),
+            ("default", "Default"),
+            ("large", "Large"),
+        ):
+            action = QtGui.QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(size == panel_font_size)
+            action.triggered.connect(
+                lambda _checked=False, s=size:
+                    self._set_control_panel_font_size(s))
+            font_group.addAction(action)
+            font_menu.addAction(action)
 
     def _set_theme(self, name):
         """Apply theme ``name`` live and persist the choice."""
         from xdart.gui.themes import apply_theme
+        settings = QtCore.QSettings("xdart", "xdart")
+        panel_font_size = settings.value(
+            "control_panel_font_size", "default")
         app = QtWidgets.QApplication.instance()
         if app is not None:
-            apply_theme(app, name)
-        QtCore.QSettings("xdart", "xdart").setValue("theme", name)
+            apply_theme(
+                app, name, control_panel_font_size=panel_font_size)
+        settings.setValue("theme", name)
+
+    def _set_control_panel_font_size(self, size):
+        """Apply the Controls-panel-only font-size preset and persist it."""
+        if size not in ("small", "default", "large"):
+            size = "default"
+        settings = QtCore.QSettings("xdart", "xdart")
+        settings.setValue("control_panel_font_size", size)
+        theme = settings.value("theme", "dark")
+        if theme not in ("dark", "light"):
+            theme = "dark"
+        from xdart.gui.themes import apply_theme
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            apply_theme(app, theme, control_panel_font_size=size)
 
     def exit(self):
         try:
@@ -237,10 +276,15 @@ def run():
     # snapshots the config at widget creation).
     try:
         from xdart.gui.themes import apply_theme
-        theme = QtCore.QSettings("xdart", "xdart").value("theme", "dark")
+        settings = QtCore.QSettings("xdart", "xdart")
+        theme = settings.value("theme", "dark")
         if theme not in ("dark", "light"):
             theme = "dark"
-        apply_theme(app, theme)
+        panel_font_size = settings.value(
+            "control_panel_font_size", "default")
+        if panel_font_size not in ("small", "default", "large"):
+            panel_font_size = "default"
+        apply_theme(app, theme, control_panel_font_size=panel_font_size)
     except Exception:
         logger.exception("Failed to apply theme; using Qt default")
     mw = Main()

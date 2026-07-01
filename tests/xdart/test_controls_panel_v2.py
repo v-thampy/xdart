@@ -746,7 +746,7 @@ def test_controls_panel_v2_section_ticks_and_source_synopsis(qapp):
     panel = ControlsPanelV2()
     panel.set_state(state)
 
-    assert panel.source_card.status.text() == "Image Series · reachable"
+    assert panel.source_card.status.text() == "Image Series"
     assert not panel.project_card.valid_marker.isHidden()
     assert not panel.source_card.valid_marker.isHidden()
     assert not panel.experiment_card.valid_marker.isHidden()
@@ -2838,12 +2838,15 @@ def test_controls_panel_v2_source_layout_coalesces_rows(qapp, monkeypatch):
         assert src.parent() is subdirs.parent()
         assert ftype.parent() is mtype.parent()
         assert src.parent() is not ftype.parent()
+        assert mtype.label.minimumWidth() == 92
 
         # Image Series: no Subdirs (directory-only), Meta Type still renders.
         widget._on_controls_v2_field_changed(("Signal", "inp_type"), "Image Series")
         widget._refresh_controls_v2_profile_now()
         assert _src_row(widget, ("Signal", "include_subdir")) is None
-        assert _src_row(widget, ("Signal", "meta_ext")) is not None
+        mtype = _src_row(widget, ("Signal", "meta_ext"))
+        assert mtype is not None
+        assert mtype.label.minimumWidth() == 76
     finally:
         widget.close()
         widget.deleteLater()

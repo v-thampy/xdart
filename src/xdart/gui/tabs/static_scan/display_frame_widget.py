@@ -3560,10 +3560,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             _plot = getattr(self, 'plot', None)   # duck holders in tests
             if _plot is not None:
                 _plot.enableAutoRange()
+            # XYE has a 1D plot: show the 1D display controls (Single/Overlay,
+            # Options, Clear) — a prior image/nexus visit may have hidden them —
+            # and hide ONLY the transform combo (the XYE file owns its x-axis).
             set_middle_visible = getattr(
                 self, "_set_middle_1d_controls_visible", None)
             if set_middle_visible is not None:
-                set_middle_visible(False)
+                set_middle_visible(True)
+            self.ui.plotUnit.setVisible(False)
             self._set_2d_controls_visible(False)
             # frame_6 is shown so the Linear/Log scale applies to the 1D
             # plot; the colormap stays too (Vivek) — the XYE waterfall image

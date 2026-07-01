@@ -271,12 +271,15 @@ def test_f8_intensity_controls_are_mode_scoped(widget):
     assert not df.ui.imageToolbar.isHidden()
     assert df.ui.plotToolBar.isHidden()
     assert df.ui.plotUnit.isHidden()
-    assert df.ui.plotMethod.isHidden()
+    assert not df.ui.plotMethod.isHidden()
+    assert not df.ui.wf_options.isHidden()
+    assert not df.ui.clear_1D.isHidden()
 
     w._on_viewer_mode_changed("")
     df.scan.skip_2d = False
     df._apply_1d_only_visibility()
     assert df._intensityWidget.isHidden()
+    assert not df.ui.plotUnit.isHidden()
 
     df.scan.skip_2d = True
     df._apply_1d_only_visibility()

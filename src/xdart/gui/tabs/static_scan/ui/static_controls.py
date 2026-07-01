@@ -41,6 +41,7 @@ class StaticControls(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName('staticRunControls')
         # Two rows separated by a divider: the SELECTION/OPTIONS row (mode +
         # Batch + Cores) on top, the ACTION row (Live + Start + Stop) below.  The
         # action row lives in its own container so it (and the divider) can be

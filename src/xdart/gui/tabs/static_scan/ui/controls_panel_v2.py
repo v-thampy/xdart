@@ -765,6 +765,13 @@ class PillRow(QtWidgets.QWidget):
             # Reuse the accent-when-checked toggle styling, but content-sized.
             btn.setObjectName("controlsV2ToggleButton")
             btn.setProperty("pill", True)
+            # [pill="true"] -> border-radius: 13px is a property-based QSS
+            # selector; Qt does not re-evaluate it after setProperty without a
+            # re-polish, so the pill renders BOXY until a global restyle (e.g. a
+            # font-size change re-applies app.setStyleSheet).  Match the
+            # StatusBadge/LauncherButton unpolish/polish pattern used above.
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
             btn.setCheckable(True)
             btn.setChecked(bool(field.value))
             btn.setEnabled(bool(field.enabled))
@@ -1174,12 +1181,12 @@ class ControlsPanelV2(QtWidgets.QWidget):
             for field in present:
                 sub = self._make_bound_row(field)
                 if field.path in tight:
-                    # Tighten the label against its editor (less gap); the editor
-                    # still fills to the right edge of the cell (right-justified).
+                    # Directory mode pairs File Type + Meta Type; keep Meta Type
+                    # compact, but not jammed against its editor.
                     if getattr(sub, "label", None) is not None:
-                        sub.label.setMinimumWidth(0)
+                        sub.label.setMinimumWidth(92)
                     if sub.layout() is not None:
-                        sub.layout().setSpacing(3)
+                        sub.layout().setSpacing(6)
                 is_bool = getattr(field.kind, "value", field.kind) == "bool"
                 st = 0 if is_bool else 1
                 if stretches and field.path in stretches:
@@ -1193,11 +1200,14 @@ class ControlsPanelV2(QtWidgets.QWidget):
         row_for(("Signal", "inp_type"), ("Signal", "include_subdir"))
         row_for(("Signal", "img_dir"))                           # Directory
         row_for(("Signal", "File"))                              # Image File
-        # File Type | Meta Type: Meta Type ~10% narrower with a tight label.
+        # Directory mode: File Type | Meta Type share a row.  Other source modes
+        # keep Meta Type on the standard label column so it aligns with Source /
+        # Image File above it.
         energy_field = by_path.get(_SOURCE_ENERGY_PATH)
+        pair_meta_type = ("Signal", "img_ext") in by_path
         row_for(("Signal", "img_ext"), ("Signal", "meta_ext"),
                 stretches={("Signal", "img_ext"): 9, ("Signal", "meta_ext"): 7},
-                tight={("Signal", "meta_ext")},
+                tight={("Signal", "meta_ext")} if pair_meta_type else (),
                 energy_field=energy_field)
         row_for(("Signal", "Filter"))                            # Filter
         row_for(("Signal", "meta_dir"))                          # SPEC Dir
@@ -1642,7 +1652,11 @@ class ControlsPanelV2(QtWidgets.QWidget):
             parts.append(f"{frame_status.value} frames")
         if kind:
             parts.append(kind)
-        if raw_status is not None and raw_status.value:
+        if (
+            raw_status is not None
+            and raw_status.value
+            and raw_status.status is not StatusKind.OK
+        ):
             parts.append(raw_status.value)
         return " · ".join(parts)
 

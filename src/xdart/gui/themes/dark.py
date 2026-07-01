@@ -116,7 +116,26 @@ _ACTIVE = {"active": "#ffb86c", "active_border": "#e0a050",
            "active_hover": "#ffc987", "active_muted": "#5a4a35"}
 
 
-def _resolve(base, *, is_light):
+_CONTROL_PANEL_FONT_OFFSETS = {
+    "small": -1,
+    "default": 0,
+    "large": 1,
+}
+
+
+def _control_panel_font_tokens(size="default"):
+    key = str(size or "default").strip().lower()
+    offset = _CONTROL_PANEL_FONT_OFFSETS.get(key, 0)
+    return {
+        "control_panel_font": f"{12 + offset}px",
+        "control_panel_status_font": f"{9 + offset}px",
+        "control_panel_tick_font": f"{12 + offset}px",
+        "control_panel_browse_font": f"{13 + offset}px",
+        "control_panel_run_font": f"{13 + offset}px",
+    }
+
+
+def _resolve(base, *, is_light, control_panel_font_size="default"):
     """Palette + the derived state shades the template needs."""
     p = dict(base)
     p["accent_on_text"] = "#ffffff" if is_light else "#1a1a1a"
@@ -132,6 +151,7 @@ def _resolve(base, *, is_light):
     p["stop_hover"] = _blend(base["stop_bg"], base["stop_text"], 0.15)
     p["stop_muted"] = _blend(base["stop_bg"], base["panel"], 0.5)
     p.update(_ACTIVE)
+    p.update(_control_panel_font_tokens(control_panel_font_size))
     return p
 
 
@@ -433,16 +453,23 @@ QPushButton#stopButton:disabled {
 QWidget#runReadinessRow {
     background-color: transparent;
 }
+QWidget#staticRunControls,
+QWidget#staticRunControls QLabel,
+QWidget#staticRunControls QComboBox,
+QWidget#staticRunControls QSpinBox,
+QWidget#staticRunControls QPushButton {
+    font-size: $control_panel_run_font;
+}
 QLabel#runReadinessDot {
     color: $stop_text;
-    font-size: 11px;
+    font-size: $control_panel_status_font;
 }
 QLabel#runReadinessDot[ready="true"] {
     color: $start;
 }
 QLabel#runReadinessLabel {
     color: $text_3;
-    font-size: 11px;
+    font-size: $control_panel_status_font;
     font-weight: 400;
 }
 
@@ -647,7 +674,18 @@ QWidget#controlsPanelV2 {
     /* No font-family override — inherit the app default so the panel matches
        the rest of xdart (left browser + display frame).  A hair smaller than
        the default so the dense panel reads lighter. */
-    font-size: 12px;
+    font-size: $control_panel_font;
+}
+QWidget#controlsPanelV2 QLabel,
+QWidget#controlsPanelV2 QLineEdit,
+QWidget#controlsPanelV2 QComboBox,
+QWidget#controlsPanelV2 QPushButton,
+QWidget#controlsPanelV2 QToolButton {
+    font-size: $control_panel_font;
+}
+QMenu#controlsV2EnergyPopup,
+QMenu#controlsV2GIMorePopup {
+    font-size: $control_panel_font;
 }
 QWidget#controlsV2TopActionBar {
     background-color: transparent;
@@ -746,12 +784,12 @@ QLabel#controlsV2SectionTitle {
 }
 QLabel#controlsV2SectionStatus {
     color: $text_muted;
-    font-size: 11px;
+    font-size: $control_panel_status_font;
     font-weight: 400;
 }
 QLabel#controlsV2SectionTick {
     background-color: transparent;
-    font-size: 12px;
+    font-size: $control_panel_tick_font;
     font-weight: 600;
     padding-left: 2px;
 }
@@ -804,7 +842,7 @@ QLabel#controlsV2SubsectionTitle[accent="experiment"] { color: #e8c46a; }
 QLabel#controlsV2SubsectionTitle[accent="processing"] { color: #e06c75; }
 QLabel#controlsV2SubsectionStatus {
     color: $text_muted;
-    font-size: 11px;
+    font-size: $control_panel_status_font;
     font-weight: 400;
 }
 
@@ -839,7 +877,7 @@ QToolButton#controlsV2MoreButton {
     border-radius: 5px;
     padding: 2px 4px;
     font-weight: 800;
-    font-size: 13px;
+    font-size: $control_panel_browse_font;
     min-width: 28px;
 }
 QToolButton#controlsV2BrowseButton:hover,
@@ -1075,23 +1113,33 @@ def _branch_qss(right_url, down_url):
         f'\n    image: url("{down_url}"); }}\n')
 
 
-def render_qss(name="dark"):
+def render_qss(name="dark", control_panel_font_size="default"):
     """Render the QSS for theme ``name`` ("dark"/"light")."""
     base, is_light = _THEMES.get(name, _THEMES["dark"])
     return string.Template(_QSS_TEMPLATE).substitute(
-        _resolve(base, is_light=is_light))
+        _resolve(
+            base,
+            is_light=is_light,
+            control_panel_font_size=control_panel_font_size,
+        ))
 
 
-def apply_theme(app, name="dark") -> None:
+def apply_theme(app, name="dark", control_panel_font_size="default") -> None:
     """Apply theme ``name`` to a live QApplication (QSS + pyqtgraph config).
 
     Must run before pyqtgraph plot widgets are constructed."""
-    qss = render_qss(name)
+    qss = render_qss(
+        name, control_panel_font_size=control_panel_font_size)
     # Visible, themed expand/collapse arrows for the wrangler ParameterTree.
     # Generated lazily (needs a live QApplication) and appended here rather than
     # in render_qss so the import-time DARK_QSS render stays Qt-free.
     base, is_light = _THEMES.get(name, _THEMES["dark"])
-    right_url, down_url = _arrow_icon_paths(_resolve(base, is_light=is_light)["text"])
+    right_url, down_url = _arrow_icon_paths(
+        _resolve(
+            base,
+            is_light=is_light,
+            control_panel_font_size=control_panel_font_size,
+        )["text"])
     if right_url and down_url:
         qss += _branch_qss(right_url, down_url)
     import sys as _sys
