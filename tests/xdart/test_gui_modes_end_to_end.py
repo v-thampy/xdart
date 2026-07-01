@@ -2648,6 +2648,7 @@ def test_integrator_finish_while_wrangler_running_keeps_controls_locked(widget, 
 
     # Simulate the wrangler thread still running while the integrator finishes.
     monkeypatch.setattr(w.wrangler.thread, 'isRunning', lambda: True)
+    monkeypatch.setattr(w.wrangler, '_run_phase', 'running', raising=False)
     w.integrator_thread_finished()
     assert w._run_active is True, "run-state exited while wrangler still running"
     assert not any(_proc_controls(w).values()), "controls re-enabled mid-wrangler-run"

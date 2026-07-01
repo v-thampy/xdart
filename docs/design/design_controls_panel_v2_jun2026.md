@@ -722,15 +722,17 @@ Acceptance for the polish pass:
 
 **Current branch state.** `feature/controls-panel-v2` has merged the latest
 `feature/geometry` fast-forward for the flip chunk. The V2 functional flip is
-code-complete on cp2, but live/manual and adversarial test triage found three
+code-complete on cp2, but live/manual and adversarial test triage found four
 post-flip regressions:
 native Reintegrate 1D/2D could diverge from the fresh run plan because the
 reintegrate cache installed the native builder without first reapplying native V2
 Int state to `scan`, and `Average Scan` did not collapse streaming reductions to a
 single averaged frame. A later latent-red pass found the native threshold setter
 had dropped the legacy convenience that entering a nonzero Threshold Min/Max
-auto-enables thresholding. All three regressions are fixed and gated offscreen;
-the flip is not declared fully cleared until the live checkpoint is rerun.
+auto-enables thresholding. The live checkpoint also found that a stale idle
+wrangler thread state could keep the V2 controls grey after Reintegrate finished.
+All four regressions are fixed and gated offscreen; the flip is not declared fully
+cleared until the live checkpoint is rerun.
 
 **What changed in the flip.**
 - The V2-to-legacy Int write-through bridge is retired. Int edits no longer mirror
@@ -764,6 +766,9 @@ the flip is not declared fully cleared until the live checkpoint is rerun.
 - Native threshold edits now mirror the legacy safety behavior: entering a nonzero
   Threshold Min/Max auto-enables thresholding, while the default 0/0 state does not
   auto-enable.
+- Reintegrate finish now treats the wrangler as active only when it is in a real
+  run phase, so a stale idle thread flag cannot leave the V2 panel locked after
+  the reintegrate thread finishes.
 - Fresh `xdart -f` / empty-session startup leaves both Project Folder and Save Path
   blank until the user chooses a project; choosing a project still defaults Save
   Path under that project.
@@ -814,10 +819,12 @@ correctness rather than V2-vs-hidden-widget parity. The core checks are:
   Run-disabled behavior, and the Source header staying raw-source-only.
 - The Source-card energy preference is native V2 state, defaults to PONI, and can
   make metadata energy authoritative without adding a new ParameterTree carrier.
+- Reintegrate finish/unlock tests cover the stale idle-wrangler-thread case so the
+  V2 editors rebuild enabled after the reintegrate thread's finished signal.
 
 **Validated in `xrd_test` for this chunk.**
 - `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_logic.py -q` → 32 passed.
-- `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_panel_v2.py -q -p no:faulthandler` → 84 passed.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_panel_v2.py -q -p no:faulthandler` → 85 passed.
 - `QT_QPA_PLATFORM=offscreen tests/xdart/test_controls_panel_v2.py -k "source_energy_button or metadata_energy_preference or energy_conflict or energy_values_use_poni_without_scan or calibration_energy_prefers_poni or source_count or loaded_scan_does_not_populate_source_or_run or raw_source_and_poni_enable_run_with_source_frames" -q` → 10 passed, 74 deselected.
 - `QT_QPA_PLATFORM=offscreen tests/xdart/test_static_controls.py -q` → 8 passed.
 - `QT_QPA_PLATFORM=offscreen tests/xdart/test_static_controls.py tests/xdart/test_n1_disclosure.py -q` → 15 passed.
@@ -831,9 +838,7 @@ correctness rather than V2-vs-hidden-widget parity. The core checks are:
   combined selector hit the known offscreen PySide/pyqtgraph segfault before a
   clean summary.
 - `QT_QPA_PLATFORM=offscreen tests/xdart/test_gui_modes_end_to_end.py -k "threshold_autoenables_on_value_entry or integrator_panel_session_roundtrip or integrator_owns_threshold_config or live_run_injects_integrator_threshold_into_wrangler or gi_manual_incidence_reintegrate_uses_numeric_not_motor_name or gi_detail_widgets_live_in_hidden_holder" -q` → 6 passed.
-- Full `test_gui_modes_end_to_end.py -q` was attempted twice in the offscreen
-  environment and hit a PySide/pyqtgraph segfault during widget construction
-  before a clean summary line; rerun remains part of the orchestrator gate.
+- `QT_QPA_PLATFORM=offscreen tests/xdart/test_gui_modes_end_to_end.py -q -p no:faulthandler` → 149 passed, 1 skipped.
 - `tests/core/test_v2_record_compat.py -q` → 3 passed.
 - `tests/xdart/test_reduction_adapters.py -q` → 48 passed.
 - `QT_QPA_PLATFORM=offscreen tests/xdart/test_gi_batch_real_data.py -k equivalence -q` → 18 passed, 50 deselected.
@@ -843,8 +848,9 @@ offscreen-impossible gate before declaring the flip integrated on geometry. Reru
 the checkpoint after the reintegrate, Average Scan, and threshold auto-enable
 fixes: real QThread teardown, Start/Stop/Append/Live, Average Scan producing one
 averaged frame/result, Threshold Max entry excluding pixels without an explicit
-toggle click, Reintegrate 1D/2D matching the fresh run, GI mode switch, reload,
-session restore with native-run-plan default-on, and XYE/Image-viewer transitions.
+toggle click, Reintegrate 1D/2D matching the fresh run, controls re-enabled after
+Reintegrate completes, GI mode switch, reload, session restore with native-run-plan
+default-on, and XYE/Image-viewer transitions.
 Bundle this with the pending Phase-4e/4f checkpoint.
 
 **Explicitly post-v2.**

@@ -3089,6 +3089,45 @@ def test_controls_panel_v2_reintegrate_commits_focused_edit(qapp, monkeypatch):
         widget.deleteLater()
 
 
+def test_controls_panel_v2_reintegrate_finish_unlocks_idle_wrangler_thread(
+        qapp, monkeypatch):
+    """A stale/idle wrangler thread flag must not leave V2 grey after reintegrate."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget._refresh_controls_v2_profile_now()
+        rows = {
+            row.path: row
+            for row in widget.controls_v2.processing_card.body.findChildren(FormRow)
+        }
+        assert rows[("Int1D", "points")].editor.isEnabled()
+
+        widget._enter_run_state()
+        rows = {
+            row.path: row
+            for row in widget.controls_v2.processing_card.body.findChildren(FormRow)
+        }
+        assert not rows[("Int1D", "points")].editor.isEnabled()
+
+        monkeypatch.setattr(widget.wrangler.thread, "isRunning", lambda: True)
+        monkeypatch.setattr(widget.wrangler, "_run_phase", "idle", raising=False)
+
+        widget.integrator_thread_finished()
+
+        assert widget._run_active is False
+        rows = {
+            row.path: row
+            for row in widget.controls_v2.processing_card.body.findChildren(FormRow)
+        }
+        assert rows[("Int1D", "points")].editor.isEnabled()
+    finally:
+        widget._exit_run_state()
+        widget.close()
+        widget.deleteLater()
+
+
 def test_controls_panel_v2_advanced_commits_focused_edit(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget

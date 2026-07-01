@@ -2011,7 +2011,7 @@ class staticWidget(QWidget):
 
     def _controls_v2_sync_run_row(self, profile) -> None:
         controls = getattr(self, "controls", None)
-        if controls is None or getattr(self, "_run_active", False):
+        if controls is None or self._controls_v2_run_active():
             return
         try:
             viewer = str(getattr(profile.processing_page, "value", "")) == "viewer"
@@ -2187,8 +2187,7 @@ class staticWidget(QWidget):
             ub_known=bool(getattr(self.scan, "ub_matrix", None)),
             material_known=False,
         )
-        run_active = (bool(getattr(self, "_run_active", False))
-                      or self._session_run_active())
+        run_active = self._controls_v2_run_active()
         display_frame_count = frame_count
         if run_active:
             # During a run the processed-frame count ticks every frame; letting
@@ -2742,10 +2741,7 @@ class staticWidget(QWidget):
         )
 
     def _controls_v2_batch_run_active(self) -> bool:
-        run_active = (
-            bool(getattr(self, "_run_active", False))
-            or self._session_run_active()
-        )
+        run_active = self._controls_v2_run_active()
         if not run_active:
             return False
         controls = getattr(self, "controls", None)
@@ -4169,7 +4165,7 @@ class staticWidget(QWidget):
         # re-enabled before `_exit_run_state` re-asserts the mode-correct state.
         # (The disk-read-guard timing stays on sigPaused/sigResuming — R7 — never
         # on these reads.)
-        run_active = bool(getattr(self, '_run_active', False)) or self._session_run_active()
+        run_active = self._controls_v2_run_active()
         ui = itree.ui
         # 2-D integration panel: only in Int 2D, and never during a run.
         frame2d = getattr(ui, 'frame2D', None)
@@ -4269,11 +4265,46 @@ class staticWidget(QWidget):
         wrangler = getattr(self, 'wrangler', None)
         session = getattr(wrangler, 'scan_session', None) if wrangler else None
         if session is None:
+            thread = getattr(wrangler, 'thread', None) if wrangler else None
+            session = getattr(thread, 'scan_session', None) if thread else None
+        if session is None:
             return False
         try:
             return bool(session.is_running)
         except Exception:
             return False
+
+    def _controls_v2_run_active(self) -> bool:
+        return (
+            bool(getattr(self, '_run_active', False))
+            or self._session_run_active()
+        )
+
+    def _wrangler_run_active(self) -> bool:
+        """True when the wrangler is in an actual acquisition/reduction run.
+
+        ``QThread.isRunning()`` alone can be a stale/over-broad signal during
+        finish-slot ordering.  The shared run-state owner only needs to keep
+        controls locked for a wrangler that is also in a live run phase.
+        """
+        wrangler = getattr(self, 'wrangler', None)
+        thread = getattr(wrangler, 'thread', None) if wrangler else None
+        if thread is None:
+            return False
+        try:
+            if not bool(thread.isRunning()):
+                return False
+        except Exception:
+            return False
+        phase = str(getattr(wrangler, '_run_phase', '') or '').lower()
+        if phase:
+            return phase in {'running', 'pausing', 'paused'}
+        command = str(
+            getattr(wrangler, 'command', '')
+            or getattr(thread, 'command', '')
+            or ''
+        ).lower()
+        return command in {'start', 'pause'}
 
     def _enter_run_state(self):
         """Single owner of run START (task #68): mark a wrangler/integrator run
@@ -4560,11 +4591,12 @@ class staticWidget(QWidget):
         # frames still need the controls locked — its own finished handler will
         # exit the shared run-state then (mirrors the wrangler-enable guard
         # below).
-        if not self.wrangler.thread.isRunning():
+        wrangler_running = self._wrangler_run_active()
+        if not wrangler_running:
             self._exit_run_state()
         self.h5viewer.set_open_enabled(True)
         self.update_all()
-        if not self.wrangler.thread.isRunning():
+        if not wrangler_running:
             self.wrangler.enabled(True)
 
     # ── Stitch (Stitch 1D / Stitch 2D modes) ───────────────────────────
