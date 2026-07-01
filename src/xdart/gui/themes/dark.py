@@ -128,7 +128,7 @@ def _control_panel_font_tokens(size="default"):
     offset = _CONTROL_PANEL_FONT_OFFSETS.get(key, 0)
     return {
         "control_panel_font": f"{12 + offset}px",
-        "control_panel_status_font": f"{8 + offset}px",
+        "control_panel_status_font": f"{12 + offset}px",
         "control_panel_tick_font": f"{12 + offset}px",
         "control_panel_browse_font": f"{13 + offset}px",
         "control_panel_run_font": f"{13 + offset}px",
@@ -460,14 +460,20 @@ QWidget#staticRunControls QSpinBox,
 QWidget#staticRunControls QPushButton {
     font-size: $control_panel_run_font;
 }
-QLabel#runReadinessDot {
+/* The readiness dot/label live INSIDE #staticRunControls, whose group rule
+   (QWidget#staticRunControls QLabel -> control_panel_run_font) outranks a plain
+   #runReadinessDot/#runReadinessLabel selector -- so the readiness bar was
+   stuck at the run font and ignored control_panel_status_font.  Qualify these
+   with the #staticRunControls ancestor so they win (and keep the three in
+   lock-step so the green-when-ready colour still outranks the base colour). */
+QWidget#staticRunControls QLabel#runReadinessDot {
     color: $stop_text;
     font-size: $control_panel_status_font;
 }
-QLabel#runReadinessDot[ready="true"] {
+QWidget#staticRunControls QLabel#runReadinessDot[ready="true"] {
     color: $start;
 }
-QLabel#runReadinessLabel {
+QWidget#staticRunControls QLabel#runReadinessLabel {
     color: $text_3;
     font-size: $control_panel_status_font;
     font-weight: 400;
@@ -888,7 +894,8 @@ QToolButton#controlsV2BrowseButton:pressed,
 QToolButton#controlsV2MoreButton:pressed {
     background-color: $browse_pressed;
 }
-QPushButton#controlsV2ToggleButton {
+QPushButton#controlsV2ToggleButton,
+QPushButton#controlsV2PillButton {
     background-color: $field;
     color: $text_2;
     border: 1px solid $field_border;
@@ -897,26 +904,40 @@ QPushButton#controlsV2ToggleButton {
     font-weight: 700;
     text-align: center;
 }
-QPushButton#controlsV2ToggleButton:checked {
+QPushButton#controlsV2ToggleButton:checked,
+QPushButton#controlsV2PillButton:checked {
     background-color: $accent;
     color: $accent_on_text;
     border-color: $accent;
 }
-QPushButton#controlsV2ToggleButton:checked:disabled {
+QPushButton#controlsV2ToggleButton:checked:disabled,
+QPushButton#controlsV2PillButton:checked:disabled {
     background-color: $accent_muted;
     color: $text_2;
     border-color: $accent_muted;
 }
-QPushButton#controlsV2ToggleButton:disabled {
+QPushButton#controlsV2ToggleButton:disabled,
+QPushButton#controlsV2PillButton:disabled {
     background-color: $panel;
     color: $text_muted;
     border-color: $field_border;
 }
 /* Pill variant (Conditioning / Corrections toggles): fully rounded + content-
-   sized so several share a row, instead of full-width stacked buttons. */
-QPushButton#controlsV2ToggleButton[pill="true"] {
+   sized so several share a row, instead of full-width stacked buttons.  Styled
+   by a DEDICATED object name (#controlsV2PillButton), NOT a [pill="true"]
+   dynamic property: an object-name selector is applied at the button's first
+   polish, whereas a property selector only takes effect after a global restyle
+   -- which left the pills boxy until an unrelated font-size change. */
+QPushButton#controlsV2PillButton {
     border-radius: 13px;
     padding: 4px 13px;
+    /* macOS (QMacStyle) renders a rounded QPushButton bezel only when the button
+       is tall enough that the 13px radius stays clear of ~half its height; at
+       the body-font height (~25px) cocoa gives up and draws SQUARE corners.
+       Floor the height so the pill lands at ~28px (min-height is the content
+       box; padding + border add ~10px) and the rounded bezel always renders --
+       at every font preset.  Harmless on platforms that already round it. */
+    min-height: 18px;
 }
 /* The compact RangeRow's ✦ auto/enable toggle + the low–high separator. */
 QToolButton#controlsV2AutoButton {

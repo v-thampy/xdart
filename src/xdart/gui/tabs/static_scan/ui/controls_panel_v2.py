@@ -762,16 +762,13 @@ class PillRow(QtWidgets.QWidget):
         self._pills: list[tuple[tuple[str, ...], QtWidgets.QPushButton]] = []
         for field in fields:
             btn = QtWidgets.QPushButton(field.label)
-            # Reuse the accent-when-checked toggle styling, but content-sized.
-            btn.setObjectName("controlsV2ToggleButton")
-            btn.setProperty("pill", True)
-            # [pill="true"] -> border-radius: 13px is a property-based QSS
-            # selector; Qt does not re-evaluate it after setProperty without a
-            # re-polish, so the pill renders BOXY until a global restyle (e.g. a
-            # font-size change re-applies app.setStyleSheet).  Match the
-            # StatusBadge/LauncherButton unpolish/polish pattern used above.
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
+            # Reuse the accent-when-checked toggle styling, but content-sized and
+            # fully rounded, via a DEDICATED object name (grouped with
+            # controlsV2ToggleButton in the theme).  The fully-rounded radius
+            # also needs the button tall enough for macOS to draw the rounded
+            # bezel -- the theme floors it with a min-height (see the
+            # #controlsV2PillButton rule).
+            btn.setObjectName("controlsV2PillButton")
             btn.setCheckable(True)
             btn.setChecked(bool(field.value))
             btn.setEnabled(bool(field.enabled))
