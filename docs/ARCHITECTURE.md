@@ -13,13 +13,13 @@ xrd_tools  (pure compute + schema + I/O: core / io / reduction /
             integrate / sources / rsm / analysis / viz)
 ```
 
-\* the session layer is the in-flight piece.  The headless
-**`xrd_tools.session.ScanSession`** now EXISTS (4f-headless: commands in /
+\* the session layer.  The headless
+**`xrd_tools.session.ScanSession`** EXISTS (4f-headless: commands in /
 immutable `FrameEvent` out; ADR-0003/0004) and `reduction.ReductionSession`
-is its streaming engine.  What remains: the **4f-bridge** — rewiring xdart's
-`ScanSessionAdapter` over the public session so the GUI is a pure event→signal
-view (gated on live testing), plus moving the GI whole-scan freeze into core.
-So "public ScanSession exists" ≠ "xdart is thin" yet — the bridge is the line.
+is its streaming engine.  The **4f-bridge** is now BUILT — xdart's
+`ScanSessionAdapter` (`src/xdart/gui/tabs/static_scan/wranglers/scan_session.py`)
+wires over the public session so the GUI is an event→signal view (gated on live
+testing).  What remains: moving the GI whole-scan freeze into core.
 
 ## North star
 
@@ -66,9 +66,13 @@ from-scratch framing: `design/CC_greenfield_implementation_plan_2026-06-12.md`.)
 - The on-disk format is **frozen + additive-only**.  Attribute keys keep
   their historical `ssrl_` prefixes; the byte-compat gate
   (`tests/core/test_v2_record_compat.py`) pins the written record.
-- One frame, one record: `FrameView` (today) → `FrameRecord` (Phase 5) is
+- One frame, one record: `FrameView` (today) → `FrameRecord` is
   the immutable, round-trippable unit — integration results + source ref
-  + geometry + diagnostics.  N1 portability: raw-source paths are stored
+  + geometry + diagnostics.  Phase 5 A-Steps A/B/C have LANDED: the
+  `FrameRecordStore` is wired into the live path, owns eviction + worker-thread
+  hydration, and reads are store-first (`record_store → publication →
+  data_1d/2d` fallback), with `LiveFrameSeries` demoted to write-side staging.
+  N1 portability: raw-source paths are stored
   relative to `entry/@source_base` (design:
   `design/design_project_root_paths_jun2026.md`).
 

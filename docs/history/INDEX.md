@@ -77,8 +77,10 @@ Notable clusters (filenames as in the review folder):
   Phase 3 of the current plan executes it),
   `CC_step1..4_*.md` (renderer unification steps).
 - **Pre-release stabilization:** `CC_stabilization_fixes_jun2026.md`,
-  `stabilization_test_plan_jun2026.md`, `CC_prerelease_gate_jun2026.md`,
-  `CC_postreview_plan_jun2026.md`, `CC_codex_residuals_jun2026.md`,
+  `stabilization_test_plan_jun2026.md`, `CC_prerelease_gate_jun2026.md`
+  (dangling — local-only CC_ note, not published),
+  `CC_postreview_plan_jun2026.md` (dangling — local-only CC_ note, not published),
+  `CC_codex_residuals_jun2026.md`,
   `stable_release_immediate_fixes.md`.
 - **Performance pushes:** `CC_perf_round2_jun2026.md`,
   `CC_perf_4b_sharded_executor.md`, `xdart_speedup.md`.

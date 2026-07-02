@@ -24,6 +24,19 @@ The `xdart` console command probes for Qt and prints a friendly
 installed.  Core and GUI can no longer version-skew — the runtime
 version-guard machinery from the two-repo era was deleted.
 
+### Upgrading from the old PyPI packages
+
+Before installing `xrd-tools`, uninstall the two old distributions:
+
+```bash
+pip uninstall -y xdart ssrl_xrd_tools
+```
+
+The old `xdart` / `ssrl_xrd_tools` installs collide file-for-file with the new
+`xrd-tools` wheel (they ship the same `xdart` / `xrd_tools` import packages), so
+a leftover old install can shadow the new one.  Uninstall them first, then
+install `xrd-tools`.
+
 ## Imports
 
 ```python
@@ -71,6 +84,22 @@ pre-migration reference signature.  Two additive notes:
   minimal pre-1.0 output.
 
 ## Behavior changes to know about
+
+> **Strictness (D7): the headless REDUCTION is loud by default.**
+> `run_reduction` / `ReductionSession` now take a `strict: StrictPolicy`
+> (default `StrictPolicy.loud()`): a scripted/batch run now **raises**
+> (`MissingNormalizationError` / `GIAllDummyError` — both
+> `StrictnessError(ValueError)`) on a missing monitor normalization or an
+> all-dummy 2D frame, instead of silently writing degraded data.  Pass
+> `StrictPolicy.graceful()` for the old never-abort behavior — the xdart GUI
+> does this (it must never abort a whole-scan save).  The display reader
+> `io.image_source.load_processed_raw_or_thumbnail` keeps its raw→thumbnail
+> fallback **graceful by default** (a display helper); pass `StrictPolicy.loud()`
+> to make it raise on a missing full-res raw.  (The headless FrameSource raw
+> path stays strict by a separate, unchanged mechanism:
+> `get_raw_frame(allow_thumbnail=False)`.)  Import:
+> `from xrd_tools.reduction import StrictPolicy` (defined in
+> `xrd_tools.core.strictness`).
 
 1. **Filter fields (Image Directory / Eiger queue / BG Match)** use the new
    boolean grammar: space-separated terms are an **unordered** AND
@@ -133,6 +162,13 @@ pre-migration reference signature.  Two additive notes:
    at `finish()`, never aborts a whole-scan save).  Scripted callers wanting the
    old never-raise behavior pass `strict=StrictPolicy.graceful()`.  No on-disk
    format change.
+12. **Custom Mask File shape validation (no-built-in-mask detectors).** A custom
+   Mask File whose shape does not match the detector frame is now **rejected**
+   on detectors that have NO built-in mask (Rayonix-type), where it was
+   previously applied unchecked.  This is correct — a wrong-shape mask cannot
+   index the frame — but is a user-visible behavior change: a mismatched mask
+   that silently no-op'd (or corrupted the index) before now surfaces as a
+   validation error so you can supply a correctly-shaped mask.
 
 ## Stage-6 redesign items: done vs deferred
 
@@ -142,7 +178,7 @@ sink record + byte-compat gate), 6b schema-as-code starter, 6c API renames
 (+ import-light `xrd_tools.core`), 6e cleanups + S8 + D6 + D5 + F1.
 
 Deferred (tracked in
-`docs/design/CC_preship_sweep_deferred_jun2026.md`):
+`docs/design/deferred_ledger.md`):
 D1 re-integrate RAM rework (re-expose the buttons with a replace-aware
 sink), D2 thumbnail LRU + lazy reload (analyzed Jun 2026; lands with the
 publication-store migration), F2 outside-project Save Path consent design,

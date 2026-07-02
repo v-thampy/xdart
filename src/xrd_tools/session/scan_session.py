@@ -16,10 +16,13 @@ is caught + logged — a listener can never kill the writer (the T0-7/S1
 false-success trap).  A Qt bridge marshals ``on_frame_completed`` via a
 ``QueuedConnection``.
 
-This module is Qt-free (numpy only via the result containers).  Save *cadence*
-(FlushPolicy / persist-before-evict) is deliberately NOT here — it is an
-xdart-adapter concern (ADR-0004 §4); the session only exposes ``flush`` as a
-contract pass-through to the sink.
+This module is Qt-free (numpy only via the result containers).  Per ADR-0005's
+refinement of ADR-0004 §4, the *persist-before-evict* bookkeeping now lives here:
+the optional ``record_store`` is upserted after each sink ``write``, and a
+buffering sink marks its records persisted from ``flush`` (see :class:`ScanSession`).
+Only the Qt/file-handle flush *action* and the ``FlushPolicy`` *timing* remain
+xdart-adapter concerns; the session exposes ``flush`` as a contract pass-through to
+the sink.
 """
 from __future__ import annotations
 

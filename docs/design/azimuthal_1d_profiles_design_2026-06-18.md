@@ -265,5 +265,5 @@ the chosen q band, and empty azimuths (gaps, edges, GI wedge) are NaN.
    `integrate_gi_azimuthal_1d` wrapper, the `GI_MODES_1D` entry + `frame.py`
    branch; reuses the §4 display built in step 1.
 3. Add a one-line pointer to this doc from
-   `docs/design/CC_preship_sweep_deferred_jun2026.md` (the canonical deferred
+   `docs/design/deferred_ledger.md` (the canonical deferred
    register) for Mode B.

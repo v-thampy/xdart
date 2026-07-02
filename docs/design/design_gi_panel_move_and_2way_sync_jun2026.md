@@ -71,7 +71,7 @@ motor box is informational (angle already baked).
   `halpha`, `gth`, `gonth`, else first available / `Manual`.
 - integrator → wrangler: selected motor injected at run setup (Stage A seam).
 - **Depends on** the metadata reader capturing all motors (deferred item F6 in
-  `CC_preship_sweep_deferred_jun2026.md`) for the full non-standard-motor list;
+  `deferred_ledger.md`) for the full non-standard-motor list;
   ships functional with `th`/`Manual` until then.
 
 ### Stage C — load hydration (the 2-way sync)

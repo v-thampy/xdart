@@ -233,6 +233,13 @@ end-of-scan dark-gaps bug and **advances Wave 5 A3** (the raw-2D `map_raw` retar
 
 ### 0.4 `overlay-waterfall-payload-flip` branch (2026-06-17/18) — STEP-5 Overlay/Waterfall flip DONE (stages 1–3); A4 deletion still pending + cake/bg fixes
 
+> **SUPERSEDED — the remaining A3/A4 flip work is now owned by
+> `design_store_session_steps7_8_jun2026.md` Phase A.** The unique blockers
+> captured below (update_plot None-payload, C1 wrangler read-back, the
+> reset_key-not-generation trap, ImagePayload immutability) have been ported
+> into that doc's Phase A section; consult it for the current plan. This section
+> is retained as the historical record of the flip stages 1–3 landing.
+
 Branch off `main` (NOT pushed). The Overlay/Waterfall **1D** flip from §0.3's remaining list is now **DONE
 through stage 3** (it renders from the payload-owned accumulator). The A4 deletion is the only flip work left.
 
@@ -303,7 +310,7 @@ It is **live-gated**, so it is structured as offscreen prep + a live-checkpoint 
   up vertically under zoom), which is part of the maintainer's cake-and-axis live pass, not this plan.
 - **D1 reintegrate-all RAM** — dormant (buttons hidden), a post-v1 feature; track in the deferred register.
 - **D6 chunked error-cleanup vs an already-running worker** (`reduction/core.py` ~1540/1960) — LOW;
-  parked in `CC_preship_sweep_deferred_jun2026.md`, not carried here. Pointer only so it isn't lost.
+  parked in `deferred_ledger.md`, not carried here. Pointer only so it isn't lost.
 - **Batch submit-per-read (recommendation A)** — already specced in
   `fix_batch_dispatch_overlap_jun2026.md`; do it after Phase A+B. Not re-planned here. **But fold in N1
   below** (the headless-default correction that doc is missing).

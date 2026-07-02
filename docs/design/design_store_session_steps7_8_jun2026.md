@@ -148,6 +148,24 @@ are SEPARABLE:
   `_data_snapshot` availability) → retarget+delete; **Role-B** = viewer-mode arrays (Image/XYE/NeXus) →
   KEEP (the doc's earlier "keep `_ViewerRows`" understated this); (4) **8a** flip scan-1D draw to
   payload-only; (5) **8b** delete Role-A `data_1d/data_2d`, keep Role-B.
+
+  **Phase A blockers/traps (ported from `review_2026-06-15_followup_plan.md` §0.4, now superseded here):**
+  - **`update_plot` None-payload blocker.** Retiring the legacy `update_plot` requires full PLOT_1D payload
+    coverage for Single/Sum/Average FIRST — `update_plot` is still the None-payload fallback for those roles,
+    so it can only be deleted once every 1D role supplies a payload (or the None path resolves to a clean
+    clear). Do not delete it before that coverage exists.
+  - **C1 — wrangler read-back (silent data loss).** Before deleting Role-A `data_1d`/`data_2d` from
+    `staticWidget` + all constructors, verify no writer/reader pair breaks: silent data loss occurs if a
+    wrangler reads back what it wrote through these caches. Classify every writer/reader pair and confirm the
+    store covers it before removal.
+  - **reset_key-not-generation trap.** The payload accumulator (Overlay/Waterfall history and any store-backed
+    aggregate) MUST key its reset on a STABLE scan/source `reset_key`, **NOT** `state.generation`. The
+    generation bumps every tick as live auto-last grows the selection; keying reset on it would rebuild each
+    tick from only the un-evicted frames (`intensity_1d` is heavy → tier-1 eviction drops `has_1d`) = the exact
+    cap-truncation the accumulator exists to prevent.
+  - **`ImagePayload`/`PlotPayload` immutability.** Make the payload array fields read-only when payloads become
+    the SOLE display contract (this A4 boundary) — not partially now, which is inconsistent (the `image` field
+    is already mutable). Do the immutability flip as part of the final A4 deletion, not before.
 - **Phase B — ADR-0005 store→session relocation (7a + 7c). The architectural "thin xdart" move; biggest/
   riskiest headless change; NOT required to retire `data_1d`.** Build the authoritative `FrameRecord`
   store in `xrd_tools.session`, make `PublicationStore` a projection, move cadence/eviction (FlushPolicy)
