@@ -5374,9 +5374,11 @@ class staticWidget(QWidget):
         # Reset the Overlay/Waterfall accumulator (a new scan may use different
         # params / GI / axis; appending its traces across scans would mix data).
         try:
+            self.displayframe._clear_wavelength_cache()
             self.displayframe.clear_overlay()
         except Exception:
-            logger.debug("clear_overlay on scan rescope failed", exc_info=True)
+            logger.debug("display cache reset on scan rescope failed",
+                         exc_info=True)
         try:
             import pandas as pd
             with self.scan.scan_lock:
@@ -5456,6 +5458,10 @@ class staticWidget(QWidget):
         _clear_wl = getattr(self.scan, '_clear_persisted_wavelength', None)
         if callable(_clear_wl):
             _clear_wl()
+        try:
+            self.displayframe._clear_wavelength_cache()
+        except Exception:
+            logger.debug("display wavelength cache reset failed", exc_info=True)
         # (Viewer wiring — save-dir + set_file — is done frame-driven in
         # _rescope_frame_panel_to, NOT here; see the stash above.)
         self.scan.gi = gi

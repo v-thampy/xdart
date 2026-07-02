@@ -115,6 +115,70 @@ def test_display_wavelength_accepts_authoritative_one_angstrom_stamp(tmp_path):
     assert DisplayDataMixin._get_wavelength(host) == pytest.approx(1.0e-10)
 
 
+def test_display_wavelength_caches_hdf5_stamp_and_negative_result(tmp_path, monkeypatch):
+    import h5py
+
+    path = tmp_path / "wl_cached.nxs"
+    with h5py.File(path, "w") as f:
+        src = f.create_group("entry/instrument/source")
+        src.create_dataset("wavelength_A", data=0.7293)
+    missing = tmp_path / "wl_missing.nxs"
+    with h5py.File(missing, "w") as f:
+        f.create_group("entry")
+
+    real_file = h5py.File
+    opened = []
+
+    def counting_file(*args, **kwargs):
+        opened.append(os.fspath(args[0]))
+        return real_file(*args, **kwargs)
+
+    monkeypatch.setattr(h5py, "File", counting_file)
+    host = SimpleNamespace(
+        scan=SimpleNamespace(mg_args={"wavelength": 1.0e-10}, data_file=str(path)),
+    )
+    DisplayDataMixin._clear_wavelength_cache(host)
+
+    for _ in range(5):
+        assert DisplayDataMixin._get_wavelength(host) == pytest.approx(0.7293e-10)
+    assert opened == [str(path)]
+
+    host.scan.data_file = str(missing)
+    for _ in range(5):
+        assert DisplayDataMixin._get_wavelength(host) is None
+    assert opened == [str(path), str(missing)]
+
+    DisplayDataMixin._clear_wavelength_cache(host)
+    assert DisplayDataMixin._get_wavelength(host) is None
+    assert opened == [str(path), str(missing), str(missing)]
+
+
+def test_display_wavelength_skips_hdf5_fallback_while_run_writing(tmp_path, monkeypatch):
+    import h5py
+
+    path = tmp_path / "wl_run_active.nxs"
+    with h5py.File(path, "w") as f:
+        src = f.create_group("entry/instrument/source")
+        src.create_dataset("wavelength_A", data=0.7293)
+
+    real_file = h5py.File
+    opened = []
+
+    def counting_file(*args, **kwargs):
+        opened.append(os.fspath(args[0]))
+        return real_file(*args, **kwargs)
+
+    monkeypatch.setattr(h5py, "File", counting_file)
+    host = SimpleNamespace(
+        _run_writing=True,
+        scan=SimpleNamespace(mg_args={"wavelength": 1.0e-10}, data_file=str(path)),
+    )
+    DisplayDataMixin._clear_wavelength_cache(host)
+
+    assert DisplayDataMixin._get_wavelength(host) is None
+    assert opened == []
+
+
 @pytest.mark.parametrize("flags", [
     {"live_run": True, "no_nxs": False},
     {"live_run": False, "no_nxs": True},
@@ -338,6 +402,17 @@ class _FakeTimer:
     def start(self):
         self.active = True
         self.started += 1
+
+
+class _ManualDebounce(_FakeTimer):
+    def __init__(self, callback):
+        super().__init__(active=False)
+        self.callback = callback
+
+    def flush(self):
+        if self.active:
+            self.active = False
+            self.callback()
 
 
 class _FakeWorker:
@@ -2956,6 +3031,58 @@ def test_enter_viewer_mode_cleanup_clears_lists_and_cancels_loader():
     assert not hasattr(viewer, "_viewer_image_path")
 
 
+def test_fast_selection_sweep_debounces_whole_normal_mode_body():
+    class CountingList(_FakeListWidget):
+        def __init__(self, items=()):
+            super().__init__(items)
+            self.selected_calls = 0
+
+        def selectedItems(self):
+            self.selected_calls += 1
+            return super().selectedItems()
+
+    list_data = CountingList(range(1, 301))
+    update_timer = _FakeTimer(active=False)
+    load_calls = []
+    viewer = SimpleNamespace(
+        viewer_mode=None,
+        frame_ids=[],
+        ui=SimpleNamespace(listData=list_data),
+        scan=SimpleNamespace(frames=SimpleNamespace(index=list(range(1, 301)))),
+        update_2d=True,
+        data_1d={idx: object() for idx in range(1, 301)},
+        data_2d={},
+        _run_writing=False,
+        _pending_load_ids=None,
+        _pending_load_2d=True,
+        _update_coalesce_timer=update_timer,
+        _load_coalesce_timer=_FakeTimer(active=False),
+        load_frames_data=lambda ids, load_2d: load_calls.append((ids, load_2d)),
+    )
+    viewer._data_changed_now = MethodType(H5Viewer._data_changed_now, viewer)
+    viewer._flush_pending_data_changed = MethodType(
+        H5Viewer._flush_pending_data_changed, viewer)
+    viewer._selection_coalesce_timer = _ManualDebounce(
+        viewer._flush_pending_data_changed)
+    viewer.data_changed = MethodType(H5Viewer.data_changed, viewer)
+
+    for end in range(1, 301):
+        for row in range(list_data.count()):
+            list_data.item(row).setSelected(row < end)
+        viewer.data_changed()
+
+    assert list_data.selected_calls == 0
+    assert viewer._selection_coalesce_timer.started == 300
+
+    viewer._selection_coalesce_timer.flush()
+
+    assert list_data.selected_calls == 1
+    assert {int(idx) for idx in viewer.frame_ids} == set(range(1, 301))
+    assert len(viewer.frame_ids) == 300
+    assert update_timer.started == 1
+    assert load_calls == []
+
+
 def test_cancel_pending_loads_invalidates_late_chunks():
     calls = []
     timer = _FakeTimer(active=True)
@@ -4275,6 +4402,101 @@ def test_waterfall_y_axis_uses_decimated_row_ids_and_full_time_baseline():
         DisplayPlotMixin._wf_y_axis(host, display_ids),
         np.asarray([float(idx - 100) * 2.0 / 60.0 for idx in display_ids]),
     )
+
+
+def test_waterfall_decimates_rows_before_uniform_regrid():
+    regrid_rows = []
+    labels = []
+
+    def uniform_regrid(xdata, data):
+        regrid_rows.append(data.shape[0])
+        return xdata, data
+
+    host = SimpleNamespace(
+        _processing_active=False,
+        setup_wf_layout=lambda: None,
+        plot_data=[
+            np.linspace(1.0, 8.0, 32),
+            np.arange(700 * 32, dtype=float).reshape(700, 32),
+        ],
+        overlaid_idxs=list(range(1, 701)),
+        idxs=[],
+        wf_start=0,
+        wf_stop=None,
+        wf_step=1,
+        wf_yaxis="Frame #",
+        scale="linear",
+        cmap="viridis",
+        wf_widget=SimpleNamespace(
+            setImage=lambda *args, **kwargs: None,
+            setRect=lambda *args, **kwargs: None,
+            image_plot=SimpleNamespace(
+                setLabel=lambda *args, **kwargs: labels.append((args, kwargs)),
+            ),
+        ),
+        _uniform_waterfall_grid=uniform_regrid,
+        _current_plot_axis_label=lambda: ("Q", "A^-1"),
+    )
+    host._wf_y_axis = MethodType(DisplayPlotMixin._wf_y_axis, host)
+
+    DisplayPlotMixin.update_wf(host)
+
+    assert regrid_rows == [234]
+    assert regrid_rows[0] <= 256
+
+
+def test_waterfall_options_popup_requires_explicit_button_click():
+    from PySide6 import QtWidgets
+    from PySide6.QtCore import Qt as pyQt
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    dialog = QtWidgets.QDialog()
+    button = QtWidgets.QPushButton("Options")
+    host = SimpleNamespace(
+        ui=SimpleNamespace(wf_options=button),
+        popup_wf_options=lambda: dialog.show(),
+    )
+
+    displayFrameWidget._connect_wf_options_button(host)
+
+    assert button.focusPolicy() == pyQt.NoFocus
+    assert not dialog.isVisible()
+
+    win = QtWidgets.QWidget()
+    outer = QtWidgets.QVBoxLayout(win)
+    frame_list = QtWidgets.QListWidget()
+    frame_list.setObjectName("listData")
+    container = QtWidgets.QWidget()
+    plot_layout = QtWidgets.QVBoxLayout(container)
+    plot_win = QtWidgets.QWidget()
+    wf_widget = QtWidgets.QWidget()
+    plot_layout.addWidget(plot_win)
+    outer.addWidget(frame_list)
+    outer.addWidget(container)
+    win.show()
+    frame_list.setFocus()
+    app.processEvents()
+
+    layout_host = SimpleNamespace(
+        plot_win=plot_win,
+        wf_widget=wf_widget,
+        plot_layout=plot_layout,
+        _share_link_on=False,
+        ui=SimpleNamespace(wf_options=button),
+        wf_yaxis_widget=QtWidgets.QWidget(),
+    )
+
+    DisplayPlotMixin.setup_wf_layout(layout_host)
+    app.processEvents()
+
+    assert not dialog.isVisible()
+
+    button.click()
+    app.processEvents()
+
+    assert dialog.isVisible()
+    dialog.close()
+    win.close()
 
 
 def test_update_plot_accumulator_appends_skips_duplicates_and_merges_grids():

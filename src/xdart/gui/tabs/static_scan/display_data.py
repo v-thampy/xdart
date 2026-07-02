@@ -1153,22 +1153,36 @@ class DisplayDataMixin:
         if wl is not None:
             return wl
 
-        # 3. Read the writer's actual v2 NeXus wavelength stamp.
+        # 3. Read the writer's actual v2 NeXus wavelength stamp.  This fallback
+        # is intentionally cached per scan/file, including a negative result:
+        # large Single/Overlay selections can call _get_wavelength once per
+        # rendered frame, and opening the same .nxs hundreds of times on the GUI
+        # thread is enough to beachball the app.
         data_file = getattr(scan, 'data_file', None)
         if not data_file:
             return None
+        if getattr(self, '_run_writing', False):
+            return None
+        key = (id(scan), os.fspath(data_file))
+        if getattr(self, '_wavelength_cache_key', None) == key:
+            return getattr(self, '_wavelength_cache_value', None)
+        wl = None
         try:
             import h5py
             with h5py.File(data_file, 'r') as f:
                 wl = wavelength_angstrom_to_m(
                     f['entry/instrument/source/wavelength_A'][()] # type: ignore
                 )
-                if wl is not None:
-                    return wl
         except Exception:
             logger.debug("Failed to read wavelength from HDF5 instrument/source group in %s", data_file, exc_info=True)
 
-        return None
+        self._wavelength_cache_key = key
+        self._wavelength_cache_value = wl
+        return wl
+
+    def _clear_wavelength_cache(self):
+        self._wavelength_cache_key = None
+        self._wavelength_cache_value = None
 
     # ── Normalization ─────────────────────────────────────────────
 

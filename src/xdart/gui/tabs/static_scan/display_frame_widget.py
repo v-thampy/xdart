@@ -647,6 +647,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # XYE bkg carries its own x and is interpolated onto each trace at render.
         self._bkg_xye = None
         self._norm_channel_map = {}
+        self._clear_wavelength_cache()
 
         # Viewer mode: None (normal), 'image', or 'xye'
         self.viewer_mode = None
@@ -702,6 +703,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # 2D panels keep their last-rendered content instead of blanking when
         # the in-flight frame's 2D data isn't available yet.
         self._processing_active = False
+        self._run_writing = False
 
         # Stage 5: register the mode controllers (Scan/ImageViewer/XYEViewer)
         # into the open registry; _live_display_state dispatches through them.
@@ -818,13 +820,17 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.slice.toggled.connect(self._update_slice_range)
         self.ui.slice_center.valueChanged.connect(self.update_plot_range)
         self.ui.slice_width.valueChanged.connect(self.update_plot_range)
-        self.ui.wf_options.clicked.connect(self.popup_wf_options)
+        self._connect_wf_options_button()
 
         # Action buttons.  (The in-panel Save buttons were removed — use
         # pyqtgraph's right-click Export, or File ▸ Export.  The
         # save_image / save_1D methods are still wired to those menu
         # actions in static_scan_widget.)
         self.ui.clear_1D.clicked.connect(self.clear_1D)
+
+    def _connect_wf_options_button(self):
+        self.ui.wf_options.setFocusPolicy(pyQt.NoFocus)
+        self.ui.wf_options.clicked.connect(self.popup_wf_options)
 
     def _init_controls(self):
         """Initialize image units, waterfall options, and preview button."""
@@ -3472,6 +3478,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         data isn't available yet — so the 2D panels persist like the 1D plot.
         """
         self._processing_active = bool(active)
+        self._run_writing = bool(active)
         # Reset the waterfall-repaint throttle at every run boundary so the next
         # update_wf always repaints in full -- in particular the end-of-scan flush
         # (run just ended -> active False) must show the COMPLETE stack even if the

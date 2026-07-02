@@ -1092,6 +1092,7 @@ class DisplayPlotMixin:
     def setup_1d_layout(self):
         """Setup the layout for 1D plot
         """
+        restore_focus = DisplayPlotMixin._frame_list_focus_widget()
         self.wf_widget.setParent(None)
         self.plot_layout.addWidget(self.plot_win)
         if getattr(self, '_share_link_on', False):
@@ -1104,6 +1105,7 @@ class DisplayPlotMixin:
         self.ui.wf_options.setEnabled(True)
         if len(self.plot_data[1]) > 1:
             self.wf_yaxis_widget.setEnabled(False)
+        DisplayPlotMixin._restore_frame_list_focus(restore_focus)
 
     def setup_wf_widget(self):
         self.plot_layout.addWidget(self.wf_widget)
@@ -1123,6 +1125,7 @@ class DisplayPlotMixin:
     def setup_wf_layout(self):
         """Setup the layout for WF plot
         """
+        restore_focus = DisplayPlotMixin._frame_list_focus_widget()
         self.plot_win.setParent(None)
         self.plot_layout.addWidget(self.wf_widget)
         if getattr(self, '_share_link_on', False):
@@ -1130,6 +1133,31 @@ class DisplayPlotMixin:
 
         self.ui.wf_options.setEnabled(True)
         self.wf_yaxis_widget.setEnabled(True)
+        DisplayPlotMixin._restore_frame_list_focus(restore_focus)
+
+    @staticmethod
+    def _frame_list_focus_widget():
+        widget = QtWidgets.QApplication.focusWidget()
+        try:
+            if widget is not None and widget.objectName() == "listData":
+                return widget
+        except RuntimeError:
+            return None
+        return None
+
+    @staticmethod
+    def _restore_frame_list_focus(widget):
+        if widget is None:
+            return
+
+        def _restore():
+            try:
+                if widget.isVisible():
+                    widget.setFocus(Qt.QtCore.Qt.FocusReason.OtherFocusReason)
+            except RuntimeError:
+                pass
+
+        Qt.QtCore.QTimer.singleShot(0, _restore)
 
     # ── Waterfall options popup ───────────────────────────────────
 

@@ -741,6 +741,15 @@ class H5Viewer(QWidget):
         self._pending_load_2d = True
         self._load_coalesce_timer = Coalescer(100, mode="debounce", parent=self)
         self._load_coalesce_timer.triggered.connect(self._flush_pending_load)
+        # Fast shift+arrow selection sweeps can emit itemSelectionChanged dozens
+        # of times per second.  Debounce the whole normal-mode body so the O(k)
+        # selection parse / cache-probe work runs once for the final selection,
+        # not once for every intermediate range.
+        self._pending_data_changed = False
+        self._selection_coalesce_timer = Coalescer(100, mode="debounce",
+                                                  parent=self)
+        self._selection_coalesce_timer.triggered.connect(
+            self._flush_pending_data_changed)
 
     def _ensure_file_thread_running(self) -> None:
         """Start the persistent file loader on first real file operation."""
@@ -2233,6 +2242,12 @@ class H5Viewer(QWidget):
             self._pending_load_ids = None
             self.load_frames_data(ids, self._pending_load_2d)
 
+    def _flush_pending_data_changed(self):
+        if not getattr(self, "_pending_data_changed", False):
+            return
+        self._pending_data_changed = False
+        H5Viewer._data_changed_now(self, show_all=False)
+
     def data_changed(self, show_all=False):
         """Connected to itemSelectionChanged signal of listData.
 
@@ -2240,6 +2255,24 @@ class H5Viewer(QWidget):
         selected frame on demand.  Otherwise falls through to the
         normal HDF5-based loading.
         """
+        if show_all:
+            timer = getattr(self, "_selection_coalesce_timer", None)
+            if timer is not None and timer.isActive():
+                timer.stop()
+            self._pending_data_changed = False
+            H5Viewer._data_changed_now(self, show_all=True)
+            return
+
+        if getattr(self, "viewer_mode", None) not in ("image", "xye", "nexus"):
+            timer = getattr(self, "_selection_coalesce_timer", None)
+            if timer is not None:
+                self._pending_data_changed = True
+                timer.start()
+                return
+
+        H5Viewer._data_changed_now(self, show_all=False)
+
+    def _data_changed_now(self, show_all=False):
         if not show_all:
             self.frame_ids.clear()
             items = self.ui.listData.selectedItems()
@@ -2689,6 +2722,10 @@ class H5Viewer(QWidget):
         timer = getattr(self, '_update_coalesce_timer', None)
         if timer is not None and timer.isActive():
             timer.stop()
+        timer = getattr(self, '_selection_coalesce_timer', None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+        self._pending_data_changed = False
 
     def shutdown_threads(self) -> None:
         """Stop the persistent background threads this viewer owns so they are
