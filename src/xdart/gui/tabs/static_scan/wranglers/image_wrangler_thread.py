@@ -1948,8 +1948,22 @@ class imageThread(wranglerThread):
             )
             try:
                 from xrd_tools.io import read_frame_view
-                view = read_frame_view(
-                    scan_file, frame_label, mode_1d=mode_1d, mode_2d=mode_2d)
+                file_lock = (
+                    getattr(self, "file_lock", None)
+                    or getattr(scan, "file_lock", None)
+                )
+                if file_lock is None:
+                    view = read_frame_view(
+                        scan_file, frame_label,
+                        mode_1d=mode_1d, mode_2d=mode_2d)
+                else:
+                    # Same lock the serial and streaming writers hold around
+                    # _save_to_nexus, so background hydration can proceed during a
+                    # pause but cannot overlap the writer's HDF5 r+/w open.
+                    with file_lock:
+                        view = read_frame_view(
+                            scan_file, frame_label,
+                            mode_1d=mode_1d, mode_2d=mode_2d)
             except Exception:
                 logger.debug("record-store hydrate failed for %s", label,
                              exc_info=True)

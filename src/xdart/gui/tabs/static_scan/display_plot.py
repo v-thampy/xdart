@@ -29,9 +29,12 @@ from .display_logic import (
     pretty_unit,
     nanmean_slice,
     resample_image_axis_to_uniform,
+    waterfall_display_rows,
 )
 
 logger = logging.getLogger(__name__)
+
+MAX_WF_ROWS = 256
 
 
 def _as_plot_rows(ydata):
@@ -858,58 +861,74 @@ class DisplayPlotMixin:
             fr = d1.get(idx) if hasattr(d1, 'get') else None
         return getattr(fr, 'scan_info', None) or {}
 
-    def _wf_y_axis(self, n_rows: int):
+    def _wf_y_axis(self, row_ids):
         """Compute the waterfall y-axis array.
 
         G1: shared between :meth:`update_wf` and
         :meth:`update_wf_pmesh`.  Returns the ydata array shaped to
-        ``n_rows`` (= data.shape[0] after the wf_start/wf_step slice)
-        or ``None`` when a metadata key is missing — caller handles
-        the no-axis case.
+        the displayed rows or ``None`` when a metadata key is missing — caller
+        handles the no-axis case.
 
         ``self.wf_yaxis`` selects the source:
 
-        * ``'Frame #'`` → ``arange`` rooted at ``wf_start + 1``.
+        * ``'Frame #'`` → the displayed row ids.
         * ``'Time (s)'`` / ``'Time (minutes)'`` →
           ``scan_info['epoch']`` minus its own minimum (relative).
         * anything else → ``scan_info[wf_yaxis]`` directly.
 
-        For everything but ``'Frame #'`` we lift the values from each frame's
-        metadata via :meth:`_frame_scan_info` (store-first; Phase 3c) for the
-        ACTUAL accumulated row ids, then slice with the same wf_start/wf_step the
-        data uses.  The waterfall image rows come from the accumulator
+        For everything but ``'Frame #'`` we lift the values from each displayed
+        frame's metadata via :meth:`_frame_scan_info` (store-first; Phase 3c).
+        The waterfall image rows come from the accumulator
         (``overlaid_idxs``), which after a preserved partial read or
         non-contiguous accumulation need NOT equal ``self.idxs`` -- so building the
         y-axis from ``self.idxs`` could drift the metadata values off the rendered
         rows.  Use ``overlaid_idxs`` (it is maintained row-for-row with
         ``plot_data``), falling back to ``_plot_row_ids`` / ``self.idxs``.
         """
+        full_row_ids = (getattr(self, 'overlaid_idxs', None)
+                        or getattr(self, '_plot_row_ids', None)
+                        or self.idxs)
+        full_row_ids = [int(i) for i in full_row_ids]
+        legacy_count = None
+        if isinstance(row_ids, (int, np.integer)):
+            legacy_count = int(row_ids)
+            row_ids = full_row_ids
+            row_ids = row_ids[self.wf_start:self.wf_stop:self.wf_step]
+            row_ids = row_ids[:legacy_count]
+        else:
+            row_ids = [int(i) for i in row_ids]
+        if not row_ids:
+            return np.asarray([], dtype=float)
+        if not full_row_ids:
+            full_row_ids = row_ids
         if self.wf_yaxis == 'Frame #':
-            return np.asarray(np.arange(n_rows) + self.wf_start + 1,
-                              dtype=float)
-        row_ids = (getattr(self, 'overlaid_idxs', None)
-                   or getattr(self, '_plot_row_ids', None)
-                   or self.idxs)
-        row_ids = [int(i) for i in row_ids]
+            if legacy_count is not None:
+                return np.asarray(np.arange(legacy_count) + self.wf_start + 1,
+                                  dtype=float)
+            return np.asarray(row_ids, dtype=float)
         try:
             if self.wf_yaxis == 'Time (s)':
+                baseline = min(
+                    self._frame_scan_info(idx)['epoch'] for idx in full_row_ids)
                 s_ydata = np.asarray(
                     [self._frame_scan_info(idx)['epoch']
                      for idx in row_ids]
                 )
-                s_ydata -= s_ydata.min()
+                s_ydata -= baseline
             elif self.wf_yaxis == 'Time (minutes)':
+                baseline = min(
+                    self._frame_scan_info(idx)['epoch'] for idx in full_row_ids)
                 s_ydata = np.asarray(
                     [self._frame_scan_info(idx)['epoch']
                      for idx in row_ids]
-                ) / 60.
-                s_ydata -= s_ydata.min()
+                )
+                s_ydata = (s_ydata - baseline) / 60.
             else:
                 s_ydata = np.asarray(
                     [self._frame_scan_info(idx)[self.wf_yaxis]
                      for idx in row_ids]
                 )
-            return s_ydata[self.wf_start:self.wf_stop:self.wf_step]
+            return s_ydata
         except KeyError as e:
             logger.debug('Counter %s not present in metadata: %s',
                          self.wf_yaxis, e)
@@ -938,10 +957,17 @@ class DisplayPlotMixin:
 
         xdata_, data_ = self.plot_data
         s_xdata, data = xdata_.copy(), data_.copy()
+        row_ids = (getattr(self, 'overlaid_idxs', None)
+                   or getattr(self, '_plot_row_ids', None)
+                   or self.idxs)
+        row_ids = tuple(int(i) for i in row_ids)
         data = data[self.wf_start:self.wf_stop:self.wf_step, :]
+        row_ids = row_ids[self.wf_start:self.wf_stop:self.wf_step]
+        data, row_ids, _stride = waterfall_display_rows(
+            data, row_ids, MAX_WF_ROWS)
         s_xdata, data = self._uniform_waterfall_grid(s_xdata, data)
 
-        s_ydata = self._wf_y_axis(data.shape[0])
+        s_ydata = self._wf_y_axis(row_ids)
         if s_ydata is None:
             return
 

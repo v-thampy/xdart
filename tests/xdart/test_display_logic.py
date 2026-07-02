@@ -208,6 +208,47 @@ def test_accumulate_waterfall_selection_growth_does_not_reset():
     np.testing.assert_array_equal(h.rows[0], [0, 0, 0])
 
 
+def test_accumulate_waterfall_retains_long_live_stack_across_flushes():
+    # The live render throttle may skip full reselects, but admitted reselects
+    # must keep the append-only accumulator complete and idempotent.
+    np = pytest.importorskip("numpy")
+    x = np.array([0.0, 1.0, 2.0])
+    h = None
+    for start in range(0, 700, 25):
+        ids = list(range(start, min(start + 25, 700)))
+        h = dl.accumulate_waterfall(
+            h, reset_key=("scanA", False), unit="q", x=x,
+            rows=np.vstack([np.full(3, float(i)) for i in ids]),
+            ids=ids, names=[f"s{i}" for i in ids],
+        )
+
+    assert h.count == 700
+    assert h.ids == tuple(range(700))
+    h2 = dl.accumulate_waterfall(
+        h, reset_key=("scanA", False), unit="q", x=x,
+        rows=np.full((1, 3), 699.0), ids=[699], names=["s699"],
+    )
+    assert h2.count == 700
+    assert h2.ids == tuple(range(700))
+
+
+def test_waterfall_display_rows_decimates_rows_and_ids_together():
+    np = pytest.importorskip("numpy")
+    rows = np.arange(700 * 3, dtype=float).reshape(700, 3)
+    ids = tuple(range(1000, 1700))
+
+    small_rows, small_ids, small_stride = dl.waterfall_display_rows(
+        rows[:16], ids[:16], 256)
+    assert small_stride == 1
+    np.testing.assert_array_equal(small_rows, rows[:16])
+    assert small_ids == ids[:16]
+
+    display_rows, display_ids, stride = dl.waterfall_display_rows(rows, ids, 256)
+    assert stride == 3
+    np.testing.assert_array_equal(display_rows, rows[::3])
+    assert display_ids == ids[::3]
+
+
 def test_accumulate_waterfall_unit_toggle_relabels_grid_keeps_rows():
     # A Q<->2theta toggle does NOT change the reset_key: the rows are unit-invariant,
     # so the grid is RELABELLED in place (incoming x in the new unit) and every

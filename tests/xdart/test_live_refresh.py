@@ -677,6 +677,119 @@ def test_flush_pending_update_feeds_overlay_all_pending_frames():
     ]
 
 
+def test_flush_pending_update_throttles_overlay_full_reselect_during_run(monkeypatch):
+    import time
+
+    calls = []
+    frame_ids = []
+
+    def data_changed(*, show_all=False):
+        calls.append(("data_changed", show_all, tuple(frame_ids)))
+
+    monkeypatch.setattr(time, "perf_counter", lambda: 10.2)
+    widget = SimpleNamespace(
+        _pending_update_idx=5,
+        _overlay_flush_last_t=10.0,
+        _drain_pending_frames=lambda: None,
+        scan=SimpleNamespace(scan_lock=RLock(), frames=SimpleNamespace(index=[1, 2, 3, 4, 5])),
+        h5viewer=SimpleNamespace(
+            auto_last=True,
+            frame_ids=frame_ids,
+            update_data=lambda **kwargs: calls.append(("update_data", kwargs)),
+            data_changed=data_changed,
+        ),
+        latest_frame=lambda **kwargs: calls.append(("latest_frame", kwargs)),
+        displayframe=SimpleNamespace(
+            _processing_active=True,
+            ui=SimpleNamespace(plotMethod=_FakeCombo("Overlay")),
+        ),
+    )
+
+    staticWidget._flush_pending_update(widget)
+
+    assert widget._pending_update_idx is None
+    assert widget._overlay_flush_last_t == 10.0
+    assert calls == [
+        ("update_data", {"emit_update": False}),
+        ("latest_frame", {"emit_update": False}),
+        ("data_changed", False, ()),
+    ]
+
+
+def test_flush_pending_update_admits_overlay_full_reselect_after_interval(monkeypatch):
+    import time
+
+    calls = []
+    frame_ids = []
+
+    def data_changed(*, show_all=False):
+        calls.append(("data_changed", show_all, tuple(frame_ids)))
+
+    monkeypatch.setattr(time, "perf_counter", lambda: 10.0)
+    widget = SimpleNamespace(
+        _pending_update_idx=5,
+        _overlay_flush_last_t=9.4,
+        _drain_pending_frames=lambda: None,
+        scan=SimpleNamespace(scan_lock=RLock(), frames=SimpleNamespace(index=[1, 2, 3, 4, 5])),
+        h5viewer=SimpleNamespace(
+            auto_last=True,
+            frame_ids=frame_ids,
+            update_data=lambda **kwargs: calls.append(("update_data", kwargs)),
+            data_changed=data_changed,
+        ),
+        latest_frame=lambda **kwargs: calls.append(("latest_frame", kwargs)),
+        displayframe=SimpleNamespace(
+            _processing_active=True,
+            ui=SimpleNamespace(plotMethod=_FakeCombo("Waterfall")),
+        ),
+    )
+
+    staticWidget._flush_pending_update(widget)
+
+    assert widget._overlay_flush_last_t == 10.0
+    assert calls == [
+        ("update_data", {"emit_update": False}),
+        ("latest_frame", {"emit_update": False}),
+        ("data_changed", True, ("1", "2", "3", "4", "5")),
+    ]
+
+
+def test_run_end_reconcile_forces_overlay_full_reselect():
+    calls = []
+    frame_ids = []
+
+    def data_changed(*, show_all=False):
+        calls.append(("data_changed", show_all, tuple(frame_ids)))
+
+    host = SimpleNamespace(
+        scan=SimpleNamespace(
+            scan_lock=RLock(),
+            frames=SimpleNamespace(index=[1, 2, 3]),
+        ),
+        h5viewer=SimpleNamespace(
+            auto_last=True,
+            latest_idx=None,
+            new_scan_loaded=False,
+            frame_ids=frame_ids,
+            ui=SimpleNamespace(listData=None),
+            update_data=lambda **kwargs: calls.append(("update_data", kwargs)),
+            data_changed=data_changed,
+        ),
+        displayframe=SimpleNamespace(
+            _processing_active=False,
+            ui=SimpleNamespace(plotMethod=_FakeCombo("Overlay")),
+        ),
+    )
+
+    assert staticWidget._reconcile_h5viewer_frame_list_after_run(host) == 0
+
+    assert host.h5viewer.latest_idx == 3
+    assert calls == [
+        ("update_data", {"emit_update": False, "force_rebuild": True}),
+        ("data_changed", True, ("1", "2", "3")),
+    ]
+
+
 def test_update_data_stashes_frame_without_building_per_frame():
     """#3 (whole-scan freeze fix): per-frame update_data only STASHES the frame
     (cheap pop) + advances the cursor + triggers the timer.  It must NOT build or
@@ -4131,6 +4244,37 @@ def test_waterfall_grid_resamples_nonuniform_x_without_moving_peak():
         / q.size
     )
     assert abs(endpoint_linear - tth[peak]) > 2 * bin_width
+
+
+def test_waterfall_y_axis_uses_decimated_row_ids_and_full_time_baseline():
+    full_ids = list(range(100, 800))
+    display_ids = tuple(range(110, 800, 6))
+    host = SimpleNamespace(
+        wf_yaxis="Frame #",
+        wf_start=10,
+        wf_stop=None,
+        wf_step=2,
+        overlaid_idxs=full_ids,
+        idxs=[],
+        _frame_scan_info=lambda idx: {"epoch": float(idx) * 2.0},
+    )
+
+    np.testing.assert_allclose(
+        DisplayPlotMixin._wf_y_axis(host, display_ids),
+        np.asarray(display_ids, dtype=float),
+    )
+
+    host.wf_yaxis = "Time (s)"
+    np.testing.assert_allclose(
+        DisplayPlotMixin._wf_y_axis(host, display_ids),
+        np.asarray([float(idx - 100) * 2.0 for idx in display_ids]),
+    )
+
+    host.wf_yaxis = "Time (minutes)"
+    np.testing.assert_allclose(
+        DisplayPlotMixin._wf_y_axis(host, display_ids),
+        np.asarray([float(idx - 100) * 2.0 / 60.0 for idx in display_ids]),
+    )
 
 
 def test_update_plot_accumulator_appends_skips_duplicates_and_merges_grids():

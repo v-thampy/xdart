@@ -384,6 +384,7 @@ class staticWidget(QWidget):
         self.frames = OrderedDict()
         self.publication_store = PublicationStore()
         self._frame_record_store = None
+        self._overlay_flush_last_t = 0.0
         # Live-browse caches.  Both reset at scan/viewer boundaries and are no
         # longer authoritative for normal Int 1D/2D readiness; the
         # PublicationStore is.  The 1D mirror is capped in scan mode to prevent
@@ -4331,25 +4332,29 @@ class staticWidget(QWidget):
             self.latest_frame(emit_update=False)
         _t2 = _t.perf_counter() if _perf else 0.0
 
-        method = ""
-        try:
-            method = self.displayframe.ui.plotMethod.currentText()
-        except Exception:
-            method = ""
+        method = staticWidget._overlay_plot_method(self)
         if self.h5viewer.auto_last and method in ("Overlay", "Waterfall"):
             # Overlay/Waterfall must show EVERY processed frame, not just the
             # frames that landed in this timer window.  Fast (non-GI) scans
             # produce several frames between ticks; selecting only the tick's
             # pending set dropped earlier curves (visible only in slow GI runs).
-            # Re-select the FULL processed set each refresh — idempotent and
-            # race-free, no pending-delta bookkeeping.
-            with self.scan.scan_lock:
-                selected = [str(int(i)) for i in self.scan.frames.index]
-            if selected:
-                self.h5viewer.frame_ids[:] = selected
-                self.h5viewer.data_changed(show_all=True)
+            # Re-select the FULL processed set only at ~2 Hz during a live run:
+            # rebuilding the full WaterfallHistory payload + painted stack every
+            # 150 ms grows O(flushes x N) and beachballs the GUI on long catch-up.
+            # Throttled ticks still render the latest frame incrementally; run-end
+            # clears _processing_active before the final flush/reconcile, so the
+            # final full stack is unthrottled and complete.
+            if getattr(self.displayframe, "_processing_active", False):
+                now = _t.perf_counter()
+                last = getattr(self, "_overlay_flush_last_t", 0.0)
+                if now - last < 0.5:
+                    self.h5viewer.data_changed()
+                else:
+                    self._overlay_flush_last_t = now
+                    staticWidget._render_overlay_full_scan(self, method=method)
             else:
-                self.h5viewer.data_changed()
+                self._overlay_flush_last_t = 0.0
+                staticWidget._render_overlay_full_scan(self, method=method)
         else:
             self.h5viewer.data_changed()  # → sigUpdate → set_data → metawidget.update()
 
@@ -4409,6 +4414,7 @@ class staticWidget(QWidget):
                 or visible != expected
             )
             viewer.update_data(emit_update=False, force_rebuild=force_rebuild)
+            staticWidget._render_overlay_full_scan(self)
             if _perf:
                 logger.info(
                     "[PERF] post-live frame-list reconcile: indexed=%d "
@@ -4419,6 +4425,31 @@ class staticWidget(QWidget):
         except Exception:
             logger.debug("post-live frame-list rebuild failed", exc_info=True)
         return indexed
+
+    def _overlay_plot_method(self):
+        try:
+            return self.displayframe.ui.plotMethod.currentText()
+        except Exception:
+            return ""
+
+    def _render_overlay_full_scan(self, *, method=None) -> bool:
+        """Render Overlay/Waterfall from the full processed frame set.
+
+        Live throttling callers decide when this expensive path is allowed. This
+        helper only performs the full reselect and reports whether it owned the
+        render.
+        """
+        method = staticWidget._overlay_plot_method(self) if method is None else method
+        if not (self.h5viewer.auto_last and method in ("Overlay", "Waterfall")):
+            return False
+        with self.scan.scan_lock:
+            selected = [str(int(i)) for i in self.scan.frames.index]
+        if selected:
+            self.h5viewer.frame_ids[:] = selected
+            self.h5viewer.data_changed(show_all=True)
+        else:
+            self.h5viewer.data_changed()
+        return True
 
     def disable_auto_last(self, q):
         """

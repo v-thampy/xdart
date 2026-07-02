@@ -3,6 +3,7 @@
 publications off the GUI thread and signals completion."""
 import threading
 import time
+from types import SimpleNamespace
 
 import h5py
 import numpy as np
@@ -211,3 +212,64 @@ def test_record_store_rehydrates_evicted_frame_on_worker_thread(qapp, tmp_path):
     assert store.has_heavy_payload(1)
     assert not store.has_heavy_payload(2)
     assert_frameview_equivalent(store.get(1).project(), original)
+
+
+def test_record_store_hydrator_serializes_with_writer_file_lock(monkeypatch):
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+    import xrd_tools.io as xrd_io
+
+    file_lock = threading.Lock()
+    store = FrameRecordStore(max_heavy_items=1)
+    host = SimpleNamespace(
+        file_lock=file_lock,
+        _on_qt_gui_thread=lambda: False,
+    )
+    scan = SimpleNamespace(data_file="/tmp/live_scan.nxs")
+    entered = threading.Event()
+
+    def fake_read_frame_view(path, label, *, mode_1d=None, mode_2d=None):
+        entered.set()
+        return _view(label)
+
+    monkeypatch.setattr(xrd_io, "read_frame_view", fake_read_frame_view)
+    hydrate = imageThread._record_store_hydrator(host, scan, store)
+
+    file_lock.acquire()
+    result = []
+    thread = threading.Thread(target=lambda: result.append(hydrate(1)))
+    thread.start()
+    try:
+        assert not entered.wait(0.1), "hydration read overlapped writer lock"
+    finally:
+        file_lock.release()
+    thread.join(2.0)
+
+    assert not thread.is_alive()
+    assert entered.is_set()
+    assert isinstance(result[0], FrameRecord)
+
+
+def test_record_store_hydrator_reads_immediately_when_writer_idle(monkeypatch):
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+    import xrd_tools.io as xrd_io
+
+    file_lock = threading.Lock()
+    store = FrameRecordStore(max_heavy_items=1)
+    host = SimpleNamespace(
+        file_lock=file_lock,
+        _on_qt_gui_thread=lambda: False,
+    )
+    scan = SimpleNamespace(data_file="/tmp/live_scan.nxs")
+    entered = threading.Event()
+
+    def fake_read_frame_view(path, label, *, mode_1d=None, mode_2d=None):
+        entered.set()
+        return _view(label)
+
+    monkeypatch.setattr(xrd_io, "read_frame_view", fake_read_frame_view)
+    hydrate = imageThread._record_store_hydrator(host, scan, store)
+
+    result = hydrate(2)
+
+    assert entered.is_set()
+    assert isinstance(result, FrameRecord)

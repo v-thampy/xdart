@@ -65,6 +65,7 @@ __all__ = [
     "PlotPayload",
     "WaterfallHistory",
     "accumulate_waterfall",
+    "waterfall_display_rows",
     "ImagePayload",
     "ResultsView",
     "DisplayState",
@@ -483,6 +484,27 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names, label
     return WaterfallHistory(
         reset_key=reset_key, unit=unit, label=label, x=base_x, rows=new_rows,
         ids=tuple(out_ids), names=tuple(out_names))
+
+
+def waterfall_display_rows(rows, ids, max_rows):
+    """Display-only row decimation for a large Waterfall image.
+
+    The accumulator keeps every row.  This helper bounds only the rows painted in
+    one render and applies the same stride to the row ids so axis labels remain
+    aligned with the displayed image.
+    """
+    rows = np.asarray(rows)
+    ids = tuple(ids)
+    if max_rows is None:
+        return rows, ids, 1
+    max_rows = int(max_rows)
+    n_rows = int(rows.shape[0]) if rows.ndim else 0
+    if len(ids) != n_rows:
+        ids = tuple(range(n_rows))
+    if max_rows <= 0 or n_rows <= max_rows:
+        return rows, ids, 1
+    stride = int(np.ceil(n_rows / max_rows))
+    return rows[::stride], ids[::stride], stride
 
 
 @dataclass(frozen=True)
