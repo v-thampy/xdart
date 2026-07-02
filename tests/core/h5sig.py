@@ -1,8 +1,8 @@
 """Canonical content signature of an HDF5 tree, for write-compat gates.
 
-Walks every group/dataset: names, shapes, dtypes, value digests, and
-attributes -- EXCLUDING volatile provenance values (timestamps, package
-versions, hostname, python) whose change is expected run-to-run.
+Walks every group/dataset: names, shapes, dtypes, HDF5 storage layout, value
+digests, and attributes -- EXCLUDING volatile provenance values (timestamps,
+package versions, hostname, python) whose change is expected run-to-run.
 """
 from __future__ import annotations
 
@@ -39,6 +39,18 @@ def _digest(value) -> str:
     return hashlib.sha256(data).hexdigest()[:16]
 
 
+def _jsonable(value):
+    if value is None:
+        return None
+    if isinstance(value, tuple):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, list):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
 def _is_volatile(path: str, leaf: str) -> bool:
     if leaf in VOLATILE_LEAVES:
         return True
@@ -53,6 +65,10 @@ def h5_content_signature(path) -> dict:
             if isinstance(obj, h5py.Dataset):
                 entry["shape"] = list(obj.shape)
                 entry["dtype"] = str(obj.dtype)
+                entry["compression"] = _jsonable(obj.compression)
+                entry["compression_opts"] = _jsonable(obj.compression_opts)
+                entry["chunks"] = _jsonable(obj.chunks)
+                entry["maxshape"] = _jsonable(obj.maxshape)
                 leaf = name.rsplit("/", 1)[-1]
                 entry["value"] = ("<volatile>" if _is_volatile(name, leaf)
                                   else _digest(obj[()]))

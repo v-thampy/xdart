@@ -35,11 +35,9 @@ def test_v2_record_content_identical_to_pre6a(tmp_path):
     )
 
 
-# ── C1/C2: storage-layout tripwire (the half h5_content_signature misses) ─────
-# h5_content_signature digests VALUES + dtypes + attrs, not the on-disk storage
-# layout — so a writer regression in chunking / compression / resizability slips
-# past the content-identity gate above.  These additive tests pin that layout
-# WITHOUT touching the frozen content signature or its committed fixture.
+# ── C1/C2: readable storage-layout invariants ────────────────────────────────
+# h5_content_signature now pins the storage layout too; these additive tests keep
+# the critical writer promises obvious when the fixture diff is too large to scan.
 
 def test_v2_record_storage_layout_frozen(tmp_path):
     """The integrated stacks stay chunked + resizable (the streaming append

@@ -20,8 +20,16 @@
  },
  "entry/integrated_1d/frame_index": {
   "attrs": {},
+  "chunks": [
+   64
+  ],
+  "compression": null,
+  "compression_opts": null,
   "dtype": "int64",
   "kind": "dataset",
+  "maxshape": [
+   null
+  ],
   "shape": [
    3
   ],
@@ -29,8 +37,18 @@
  },
  "entry/integrated_1d/intensity": {
   "attrs": {},
+  "chunks": [
+   3,
+   5
+  ],
+  "compression": null,
+  "compression_opts": null,
   "dtype": "float32",
   "kind": "dataset",
+  "maxshape": [
+   null,
+   5
+  ],
   "shape": [
    3,
    5
@@ -41,8 +59,14 @@
   "attrs": {
    "units": "d6687e4288dea7ed"
   },
+  "chunks": null,
+  "compression": null,
+  "compression_opts": null,
   "dtype": "float32",
   "kind": "dataset",
+  "maxshape": [
+   5
+  ],
   "shape": [
    5
   ],
@@ -59,8 +83,16 @@
  },
  "entry/integrated_1d/q_oop/frame_index": {
   "attrs": {},
+  "chunks": [
+   64
+  ],
+  "compression": null,
+  "compression_opts": null,
   "dtype": "int64",
   "kind": "dataset",
+  "maxshape": [
+   null
+  ],
   "shape": [
    3
   ],
@@ -68,8 +100,18 @@
  },
  "entry/integrated_1d/q_oop/intensity": {
   "attrs": {},
+  "chunks": [
+   3,
+   7
+  ],
+  "compression": null,
+  "compression_opts": null,
   "dtype": "float32",
   "kind": "dataset",
+  "maxshape": [
+   null,
+   7
+  ],
   "shape": [
    3,
    7
@@ -80,8 +122,14 @@
   "attrs": {
    "units": "fedcaab9ff14ecb3"
   },
+  "chunks": null,
+  "compression": null,
+  "compression_opts": null,
   "dtype": "float32",
   "kind": "dataset",
+  "maxshape": [
+   7
+  ],
   "shape": [
    7
   ],
@@ -103,8 +151,14 @@
   "attrs": {
    "units": "fedcaab9ff14ecb3"
   },
+  "chunks": null,
+  "compression": null,
+  "compression_opts": null,
   "dtype": "float32",
   "kind": "dataset",
+  "maxshape": [
+   3
+  ],
   "shape": [
    3
   ],
@@ -112,8 +166,16 @@
  },
  "entry/integrated_2d/frame_index": {
   "attrs": {},
+  "chunks": [
+   64
+  ],
+  "compression": null,
+  "compression_opts": null,
   "dtype": "int64",
   "kind": "dataset",
+  "maxshape": [
+   null
+  ],
   "shape": [
    3
   ],
@@ -121,8 +183,20 @@
  },
  "entry/integrated_2d/intensity": {
   "attrs": {},
+  "chunks": [
+   3,
+   3,
+   5
+  ],
+  "compression": null,
+  "compression_opts": null,
   "dtype": "float32",
   "kind": "dataset",
+  "maxshape": [
+   null,
+   3,
+   5
+  ],
   "shape": [
    3,
    3,
@@ -134,8 +208,14 @@
   "attrs": {
    "units": "2fd38ff8cf91bd07"
   },
+  "chunks": null,
+  "compression": null,
+  "compression_opts": null,
   "dtype": "float32",
   "kind": "dataset",
+  "maxshape": [
+   5
+  ],
   "shape": [
    5
   ],
@@ -155,8 +235,14 @@
   "attrs": {
    "units": "f33afdc158cf0f75"
   },
+  "chunks": null,
+  "compression": null,
+  "compression_opts": null,
   "dtype": "float32",
   "kind": "dataset",
+  "maxshape": [
+   4
+  ],
   "shape": [
    4
   ],
@@ -164,8 +250,16 @@
  },
  "entry/integrated_2d/q_chi/frame_index": {
   "attrs": {},
+  "chunks": [
+   64
+  ],
+  "compression": null,
+  "compression_opts": null,
   "dtype": "int64",
   "kind": "dataset",
+  "maxshape": [
+   null
+  ],
   "shape": [
    3
   ],
@@ -173,8 +267,20 @@
  },
  "entry/integrated_2d/q_chi/intensity": {
   "attrs": {},
+  "chunks": [
+   3,
+   4,
+   5
+  ],
+  "compression": null,
+  "compression_opts": null,
   "dtype": "float32",
   "kind": "dataset",
+  "maxshape": [
+   null,
+   4,
+   5
+  ],
   "shape": [
    3,
    4,
@@ -186,8 +292,14 @@
   "attrs": {
    "units": "d6687e4288dea7ed"
   },
+  "chunks": null,
+  "compression": null,
+  "compression_opts": null,
   "dtype": "float32",
   "kind": "dataset",
+  "maxshape": [
+   5
+  ],
   "shape": [
    5
   ],

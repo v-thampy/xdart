@@ -26,6 +26,7 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 |----|-------|--------|------|---------|---------|-------|
 | RC-1 | MIGRATION mask-file + old-package notes | S | none | v1.0 promise kept | — | **DONE** `ddacbc0e` |
 | RC-2 | Flush floor + comment sync | S | low | live-checkpoint protection | — | **DONE** `4d2f3957` |
+| RC-3 | N-2 h5sig filter/chunk pinning + one re-pin | S | low | byte-gate sees filter drift before W | — | **DONE** this commit |
 | RC-4 | Deferred ledger re-homed + citations | S | none | planning survives git clean | — | **DONE** `ddacbc0e` |
 | RC-5 | Packaging: license fix, LICENSE, README, stubs, install scripts | S | low | correct PyPI metadata | — | **DONE** `c0535d21` |
 | RC-6 | Doc-ledger truth fixes + FLOOR salvage | S | none | agents read true state | — | **DONE** `ddacbc0e` |
@@ -47,8 +48,7 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 ### Post-tag: greenfield (store/session collapse)
 | ID | Chunk | Effort | Risk | Payback | Prereqs | State |
 |----|-------|--------|------|---------|---------|-------|
-| RC-3 | N-2 h5sig filter/chunk pinning + one re-pin | S | low | byte-gate sees filter drift before W | tag | open — **first post-tag commit** |
-| H6 (W) | Per-mode subgroup writes, GUI+headless via one path; production multi-mode spine gate | M | med | Round-11 durability closed; multi-mode seam real | RC-3, H1✓ | open |
+| H6 (W) | Per-mode subgroup writes, GUI+headless via one path; production multi-mode spine gate | M | med | Round-11 durability closed; multi-mode seam real | RC-3✓, H1✓ | open |
 | H8 (8a) | PublicationStore → bounded projection; delete legacy fallback; explicit-subset gate | M/L | med (was high; H7✓+H1✓ de-risked) | triple-store divergence class impossible | H6, H7✓, Session-2 live gate | open |
 | H9 (8b) | Delete Role-A `data_1d/data_2d/hydrated_raw` (~76 refs; keep Role-B) | M | med | **greenfield done-test**; ~0.5-1GB mirrors gone; H7b completes | H8 | open |
 | H10 (7c) | Cadence/eviction policy → session + `max_heavy_bytes` | M | low-med | second-sink recipe; detector-aware caps | H9, ADR-0005 reaffirm | open (ADR decision owed) |
@@ -82,7 +82,7 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 | H28 | ADR-0006 STEP 2 prepass deletion | M | med | dual-prepass risk retired | live gate slot | open |
 | H13(rest) | Config stash-restore; click-latency shed; reintegrate debounce-stack; update_scans memoize | S ea | med/low | UX niceties | live repro in hand | open |
 
-**Sequencing spine:** RC-FV → Session-1 → RC-8 (tag) → RC-3 → H6 → H8 → H9 (Session-2) → {H10, H18} → {H15, H19, H20} ∥ lanes → H21 (live gate) → next-cycle table.
+**Sequencing spine:** RC-FV → Session-1 → RC-8 (tag) → H6 → H8 → H9 (Session-2) → {H10, H18} → {H15, H19, H20} ∥ lanes → H21 (live gate) → next-cycle table.
 
 ---
 
@@ -92,7 +92,7 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 |----|-------|--------|
 | RC-1 | MIGRATION.md Mask-File validation note | open |
 | RC-2 | XDART_FLUSH_MS floor + stale-comment sync | open |
-| RC-3 | N-2: h5sig pins compression/chunks/maxshape (+ one fixture re-pin) | open |
+| RC-3 | N-2: h5sig pins compression/chunks/maxshape (+ one fixture re-pin) | **DONE** this commit |
 | RC-4 | Re-home the gitignored deferred ledger + fix citations | open |
 | RC-5 | Packaging/install-script/README fixes (finalized from release audit) | open |
 | RC-6 | Doc-ledger hygiene commit | open |

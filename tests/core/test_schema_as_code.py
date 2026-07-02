@@ -208,14 +208,15 @@ def test_validator_flags_nx_attr_drift(tmp_path):
 
 
 #: Byte-identity tripwire (Q-C1).  SHA-256 of the canonical h5_content_signature
-#: (group attrs + dataset names/dtypes/shapes/value digests) of a FIXED-SEED
-#: stitched+rsm write.  The schema-as-code routing of write_stitched/write_rsm
-#: was proven byte-identical to the hand-written form at refactor time (an empty
-#: before/after signature diff); this pin keeps every FUTURE writer change
-#: byte-identical too.  Re-pin ONLY for an intentional, additive format change
-#: (see CLAUDE.md — the persisted format is frozen + additive-only).
+#: (group attrs + dataset names/dtypes/shapes/storage/value digests) of a
+#: FIXED-SEED stitched+rsm write.  The schema-as-code routing of
+#: write_stitched/write_rsm was proven byte-identical to the hand-written form
+#: at refactor time (an empty before/after signature diff); this pin keeps every
+#: FUTURE writer change byte-identical too.  Re-pin ONLY for an intentional,
+#: additive format change (see CLAUDE.md — the persisted format is frozen +
+#: additive-only).
 _STITCH_RSM_SIGNATURE_SHA256 = (
-    "f3ffe6d3c75bb21fe8fb865522d6e54e5df0f58445c8607803a894e347241e90"
+    "207e82b24b951b2c889135aa5de3dbad1d1a11f08618aa52a4445f1b9ddfe08c"
 )
 
 
