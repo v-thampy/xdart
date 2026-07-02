@@ -19,7 +19,9 @@ immutable `FrameEvent` out; ADR-0003/0004) and `reduction.ReductionSession`
 is its streaming engine.  The **4f-bridge** is now BUILT — xdart's
 `ScanSessionAdapter` (`src/xdart/gui/tabs/static_scan/wranglers/scan_session.py`)
 wires over the public session so the GUI is an event→signal view (gated on live
-testing).  What remains: moving the GI whole-scan freeze into core.
+testing).  The static-scan display decision core also lives under
+`xrd_tools.session.display_logic`, with xdart retaining only a compatibility
+shim.  What remains: moving the GI whole-scan freeze into core.
 
 ## North star
 

@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "src"
 
 
-def test_readiness_and_masks_import_without_gui_or_heavy_io_stack() -> None:
+def _assert_imports_without_forbidden_modules(import_lines: str, label: str) -> None:
     forbidden = (
         "xdart",
         "PySide6",
@@ -27,8 +27,7 @@ def test_readiness_and_masks_import_without_gui_or_heavy_io_stack() -> None:
         f"""
         import sys
 
-        import xrd_tools.session.readiness  # noqa: F401
-        import xrd_tools.reduction.masks  # noqa: F401
+        {import_lines}
 
         bad = sorted(
             root
@@ -51,7 +50,30 @@ def test_readiness_and_masks_import_without_gui_or_heavy_io_stack() -> None:
         env=env,
     )
     assert proc.returncode == 0, (
-        "readiness/masks import pulled in forbidden modules: "
+        f"{label} import pulled in forbidden modules: "
         f"{proc.stdout.strip()}\n{proc.stderr.strip()}"
     )
 
+
+def test_readiness_and_masks_import_without_gui_or_heavy_io_stack() -> None:
+    _assert_imports_without_forbidden_modules(
+        """
+        import xrd_tools.session.readiness  # noqa: F401
+        import xrd_tools.reduction.masks  # noqa: F401
+        """,
+        "readiness/masks",
+    )
+
+
+def test_xrd_tools_package_imports_without_gui_stack() -> None:
+    _assert_imports_without_forbidden_modules(
+        "import xrd_tools  # noqa: F401",
+        "xrd_tools",
+    )
+
+
+def test_display_logic_imports_without_gui_or_heavy_io_stack() -> None:
+    _assert_imports_without_forbidden_modules(
+        "import xrd_tools.session.display_logic  # noqa: F401",
+        "display_logic",
+    )

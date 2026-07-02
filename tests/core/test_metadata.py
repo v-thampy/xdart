@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import xrd_tools.io.metadata as metadata_module
 from xrd_tools.io.metadata import (
     _extract_scan_info,
     _find_sidecar,
@@ -20,6 +21,8 @@ from xrd_tools.io.metadata import (
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
+
+_FIXTURE_DIR = Path(__file__).parent / "fixtures"
 
 _TXT_CONTENT = """\
 # Counters
@@ -61,6 +64,16 @@ _PDI_MINIMAL_CONTENT = """\
 foo bar baz
 """
 
+_STRUCTURED_CONTENT = """\
+[metadata]
+sampleName={sample}
+scanNumber=1
+exposureTime={exposure}
+timeStamp=1773873180.171
+dateTime=@DateTime(2026-03-18 12:33:00.171)
+emptyValue=
+"""
+
 
 @pytest.fixture
 def txt_meta_file(tmp_path: Path) -> Path:
@@ -88,6 +101,13 @@ def pdi_meta_file_minimal(tmp_path: Path) -> Path:
     p = tmp_path / "scan_minimal.pdi"
     p.write_text(_PDI_MINIMAL_CONTENT)
     return p
+
+
+@pytest.fixture
+def clear_auto_sidecar_cache():
+    metadata_module._AUTO_SIDECAR_CACHE.clear()
+    yield
+    metadata_module._AUTO_SIDECAR_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +290,155 @@ class TestReadImageMetadata:
 
         result = read_image_metadata(image)
         assert result["i0"] == pytest.approx(1000.0)
+
+    def test_structured_metadata_appended_extension_configparser_fixture(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        image = tmp_path / "scan_0001.tif"
+        image.touch()
+        sidecar = Path(str(image) + ".metadata")
+        sidecar.write_text(
+            (_FIXTURE_DIR / "aps_qxrd_trimmed.tif.metadata").read_text()
+        )
+
+        result = read_image_metadata(image, meta_format="metadata")
+
+        assert result["sampleName"] == "P25_C5"
+        assert result["exposureTime"] == 1
+        assert isinstance(result["exposureTime"], int)
+        assert result["timeStamp"] == pytest.approx(1773873180.171)
+        assert result["dateTime"] == "@DateTime(2026-03-18 12:33:00.171)"
+        assert result["emptyValue"] == ""
+        assert result["repeatedKey"] == "new"
+
+    def test_structured_metadata_replaced_extension_takes_priority(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        image = tmp_path / "scan_0001.tif"
+        image.touch()
+        replaced = tmp_path / "scan_0001.metadata"
+        replaced.write_text(_STRUCTURED_CONTENT.format(sample="replaced", exposure=1))
+        appended = Path(str(image) + ".metadata")
+        appended.write_text(_STRUCTURED_CONTENT.format(sample="appended", exposure=2))
+
+        result = read_image_metadata(image, meta_format="metadata")
+
+        assert result["sampleName"] == "replaced"
+        assert result["exposureTime"] == 1
+
+    def test_structured_metadata_colon_fallback(self, tmp_path: Path) -> None:
+        image = tmp_path / "scan_0001.tif"
+        image.touch()
+        sidecar = tmp_path / "scan_0001.meta"
+        sidecar.write_text(
+            "alpha: 1\n"
+            "beta: 2.5\n"
+            "dateTime: @DateTime(2026-03-18 12:33:00.171)\n"
+            "empty:\n"
+            "alpha: 3\n"
+        )
+
+        result = read_image_metadata(image, meta_format="meta")
+
+        assert result["alpha"] == 3
+        assert result["beta"] == pytest.approx(2.5)
+        assert result["dateTime"] == "@DateTime(2026-03-18 12:33:00.171)"
+        assert result["empty"] == ""
+
+    def test_auto_metadata_discovers_sidecar_and_uses_directory_cache(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        clear_auto_sidecar_cache,
+    ) -> None:
+        image1 = tmp_path / "scan_0001.tif"
+        image2 = tmp_path / "scan_0002.tif"
+        image1.touch()
+        image2.touch()
+        Path(str(image1) + ".metadata").write_text(
+            _STRUCTURED_CONTENT.format(sample="first", exposure=1)
+        )
+        Path(str(image2) + ".metadata").write_text(
+            _STRUCTURED_CONTENT.format(sample="second", exposure=2)
+        )
+
+        first = read_image_metadata(image1, meta_format="auto")
+
+        assert first["sampleName"] == "first"
+        assert metadata_module._AUTO_SIDECAR_CACHE[(tmp_path, ".tif")] == (
+            "append",
+            ".metadata",
+        )
+
+        def fail_discovery(_image_path: Path):
+            raise AssertionError("auto discovery should use cached convention")
+
+        monkeypatch.setattr(metadata_module, "_discover_auto_sidecar", fail_discovery)
+        second = read_image_metadata(image2, meta_format="auto")
+
+        assert second["sampleName"] == "second"
+        assert second["exposureTime"] == 2
+
+    def test_none_meta_format_uses_auto_metadata(
+        self,
+        tmp_path: Path,
+        clear_auto_sidecar_cache,
+    ) -> None:
+        image = tmp_path / "scan_0001.tif"
+        image.touch()
+        Path(str(image) + ".metadata").write_text(
+            _STRUCTURED_CONTENT.format(sample="none-auto", exposure=1)
+        )
+
+        result = read_image_metadata(image, meta_format=None)
+
+        assert result["sampleName"] == "none-auto"
+
+    def test_structured_metadata_junk_below_threshold_returns_empty(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        image = tmp_path / "scan_0001.tif"
+        image.touch()
+        sidecar = tmp_path / "scan_0001.metadata"
+        sidecar.write_text("alpha=1\nthis is junk\nbeta=2\n")
+
+        result = read_image_metadata(image, meta_format="metadata")
+
+        assert result == {}
+
+    def test_structured_metadata_reads_undecodable_values_with_replacement(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        image = tmp_path / "scan_0001.tif"
+        image.touch()
+        sidecar = tmp_path / "scan_0001.metadata"
+        sidecar.write_bytes(
+            b"[metadata]\nalpha=1\nbeta=2.5\nbad=abc\xffdef\n"
+        )
+
+        result = read_image_metadata(image, meta_format="metadata")
+
+        assert result["alpha"] == 1
+        assert result["beta"] == pytest.approx(2.5)
+        assert result["bad"] == "abc\ufffddef"
+
+    def test_txt_format_regression_does_not_use_structured_fallback(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        image = tmp_path / "scan_0001.tif"
+        image.touch()
+        (tmp_path / "scan_0001.txt").write_text(
+            "alpha=1\nbeta=2\ngamma=3\n"
+        )
+
+        result = read_image_metadata(image, meta_format="txt")
+
+        assert result == {}
 
 
 # ---------------------------------------------------------------------------

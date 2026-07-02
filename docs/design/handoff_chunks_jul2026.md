@@ -76,7 +76,9 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 | ID | Chunk | Effort | Risk | Payback | Prereqs | State |
 |----|-------|--------|------|---------|---------|-------|
 | H17 | Source-registry seam tests + SourceKind policy | S | low | Tiled/Bluesky additive | — | open |
-| H22 | Stage 5.5: `display_logic` → xrd_tools | M | low | 1.7k LOC decision core headless | H9 | **QUEUED** (Wave 5b, `h22_display_logic_headless.md` — pulled PRE-tag) |
+| H22 | Stage 5.5: `display_logic` → xrd_tools | M | low | 1.9k LOC decision core headless | H9 | **DONE** this commit |
+| PF-1/PF-2 | Append pre-read skip + dash-index filenames + zero-processed warning | S | low | completed appends skip raw I/O; APS dash-index series enumerates | — | **DONE** this commit |
+| MD-1 | APS/QXRD name=value sidecar autodetect | M | low | `.tif.metadata` works headless; auto sidecar convention cache | — | **DONE** this commit |
 | H23 | nexus_writer schema convergence | M/L | med | one on-disk-contract owner | H6 | open |
 | H25 | Placement ratchet + xrd_tools/gui disposition | S | low | shell can't re-thicken silently | — | open |
 | H28 | ADR-0006 STEP 2 prepass deletion | M | med | dual-prepass risk retired | live gate slot | open |
@@ -213,7 +215,9 @@ Lane D (tests/bounds):  {H2, H3, H4, H5} — anytime, no dependencies
 | H19 | CP2 Phase 3: mount ScanSourceWidget as authoritative Source card (+R-2 async open) | M | H18 | open |
 | H20 | CP2 Phase 4 completion: Experiment producers/badges authoritative, native editors | M/L | H18 | open |
 | H21 | CP2 Phase 8: retire ParameterTree primary + embedded Int widget + escape hatch + dead keys | M | H15,H18,H19,H20 + Session 2 | open |
-| H22 | Stage 5.5: MOVE `display_logic.py` → xrd_tools (shim + purity guard, Stage-1 recipe) | M | H9 | open |
+| H22 | Stage 5.5: MOVE `display_logic.py` → xrd_tools (shim + purity guard, Stage-1 recipe) | M | H9 | **DONE** this commit |
+| PF-1/PF-2 | Append-mode pre-read skips, dash-index filenames, zero-frame warning | S | — | **DONE** this commit |
+| MD-1 | APS/QXRD `.tif.metadata` structured sidecar parser + auto-detect | M | — | **DONE** this commit |
 | H23 | nexus_writer schema-ownership convergence onto shared xrd_tools.io | M/L | H6 | open |
 | H24 | ewald live model (scan/frame/frame_series) → session two-type shape | L | H9 | open |
 | H25 | Placement-ratchet test (xdart/gui h5py/pyFAI import whitelist) + xrd_tools/gui disposition note | S | — | open |

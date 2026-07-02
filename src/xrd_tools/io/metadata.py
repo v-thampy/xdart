@@ -1,6 +1,7 @@
 """Metadata parsing: read_txt_metadata, read_pdi_metadata, read_image_metadata."""
 from __future__ import annotations
 
+import configparser
 import logging
 import re
 import time
@@ -10,6 +11,29 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 __all__ = ["read_txt_metadata", "read_pdi_metadata", "read_image_metadata"]
+
+MetadataValue = int | float | str
+
+_STRUCTURED_SIDECAR_MIN_PAIRS = 3
+_AUTO_SIDECAR_CACHE: dict[tuple[Path, str], tuple[str, str]] = {}
+_IMAGE_EXTENSIONS = {
+    ".bmp",
+    ".cbf",
+    ".edf",
+    ".gif",
+    ".h5",
+    ".hdf5",
+    ".img",
+    ".jpeg",
+    ".jpg",
+    ".nexus",
+    ".npy",
+    ".nxs",
+    ".png",
+    ".raw",
+    ".tif",
+    ".tiff",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +70,112 @@ def _parse_kv_pairs(text: str, delimiters: str = ",|=") -> dict[str, float]:
     return result
 
 
+def _coerce_structured_value(value: str | None) -> MetadataValue:
+    """Coerce a structured sidecar value to int, then float, then string."""
+    if value is None:
+        return ""
+
+    value = value.strip()
+    if value == "":
+        return ""
+
+    try:
+        return int(value)
+    except ValueError:
+        pass
+
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def _is_plausible_metadata_key(key: str) -> bool:
+    """Return True for non-empty key tokens that look like metadata names."""
+    key = key.strip()
+    return (
+        bool(key)
+        and len(key) <= 128
+        and not key.startswith(("#", ";", "["))
+        and any(ch.isalnum() or ch == "_" for ch in key)
+    )
+
+
+def _parse_configparser_metadata(text: str) -> tuple[dict[str, MetadataValue], int]:
+    """Parse a ``[metadata]`` section using configparser."""
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    parser.optionxform = str
+
+    try:
+        parser.read_string(text)
+    except configparser.Error:
+        return {}, 0
+
+    if not parser.has_section("metadata"):
+        return {}, 0
+
+    result: dict[str, MetadataValue] = {}
+    pair_count = 0
+    for key, value in parser.items("metadata", raw=True):
+        key = key.strip()
+        if not _is_plausible_metadata_key(key):
+            continue
+        result[key] = _coerce_structured_value(value)
+        pair_count += 1
+    return result, pair_count
+
+
+def _parse_linewise_metadata(text: str) -> tuple[dict[str, MetadataValue], int]:
+    """Parse ``name=value`` / ``name: value`` lines with last-key-wins."""
+    result: dict[str, MetadataValue] = {}
+    pair_count = 0
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";", "[")):
+            continue
+
+        if "=" in line:
+            key, value = line.split("=", 1)
+        elif ":" in line:
+            key, value = line.split(":", 1)
+        else:
+            continue
+
+        key = key.strip()
+        if not _is_plausible_metadata_key(key):
+            continue
+
+        result[key] = _coerce_structured_value(value)
+        pair_count += 1
+
+    return result, pair_count
+
+
+def _parse_structured_metadata(text: str) -> tuple[dict[str, MetadataValue], int]:
+    """Parse generic structured sidecar text.
+
+    A ``[metadata]`` INI section takes precedence.  Files without such a
+    section fall back to line-wise ``name=value`` / ``name: value`` parsing.
+    """
+    metadata, pair_count = _parse_configparser_metadata(text)
+    if pair_count:
+        return metadata, pair_count
+    return _parse_linewise_metadata(text)
+
+
+def _read_structured_metadata(path: Path | str) -> tuple[dict[str, MetadataValue], int]:
+    """Read a generic structured sidecar with replacement decoding."""
+    path = Path(path)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        logger.warning("_read_structured_metadata: failed to read %s", path, exc_info=True)
+        return {}, 0
+
+    return _parse_structured_metadata(text)
+
+
 def _find_sidecar(image_path: Path, ext: str) -> Path | None:
     """Locate a sidecar file for *image_path* with extension *ext*.
 
@@ -65,6 +195,10 @@ def _find_sidecar(image_path: Path, ext: str) -> Path | None:
     Path | None
         First existing candidate, or ``None`` if neither exists.
     """
+    ext = ext[1:] if ext.startswith(".") else ext
+    if not ext:
+        return None
+
     candidate_replace = image_path.with_suffix(f".{ext}")
     if candidate_replace.exists():
         return candidate_replace
@@ -74,6 +208,117 @@ def _find_sidecar(image_path: Path, ext: str) -> Path | None:
         return candidate_append
 
     return None
+
+
+def _parse_structured_sidecar_if_plausible(path: Path) -> dict[str, MetadataValue] | None:
+    metadata, pair_count = _read_structured_metadata(path)
+    if pair_count >= _STRUCTURED_SIDECAR_MIN_PAIRS:
+        return metadata
+    return None
+
+
+def _read_auto_candidate_metadata(path: Path) -> dict[str, MetadataValue] | None:
+    """Try the appropriate parser for an auto-discovered sidecar."""
+    ext = path.suffix.lower().lstrip(".")
+
+    if ext == "txt":
+        metadata = read_txt_metadata(path)
+        return metadata or None
+
+    if ext == "pdi":
+        metadata = read_pdi_metadata(path)
+        return metadata or None
+
+    return _parse_structured_sidecar_if_plausible(path)
+
+
+def _auto_cache_key(image_path: Path) -> tuple[Path, str]:
+    return image_path.parent, image_path.suffix.lower()
+
+
+def _is_non_image_companion(path: Path, image_path: Path) -> bool:
+    return (
+        path.is_file()
+        and path != image_path
+        and path.suffix.lower() not in _IMAGE_EXTENSIONS
+    )
+
+
+def _iter_auto_sidecar_candidates(image_path: Path):
+    """Yield auto sidecar candidates as appended-name, then replaced-stem."""
+    try:
+        entries = sorted(image_path.parent.iterdir(), key=lambda p: p.name)
+    except OSError:
+        return
+
+    seen: set[Path] = set()
+    appended_prefix = image_path.name + "."
+    for candidate in entries:
+        if (
+            candidate.name.startswith(appended_prefix)
+            and _is_non_image_companion(candidate, image_path)
+        ):
+            seen.add(candidate)
+            yield candidate, "append", candidate.name[len(image_path.name):]
+
+    replaced_prefix = image_path.stem + "."
+    for candidate in entries:
+        if candidate in seen:
+            continue
+        if (
+            candidate.name.startswith(replaced_prefix)
+            and _is_non_image_companion(candidate, image_path)
+        ):
+            yield candidate, "replace", candidate.name[len(image_path.stem):]
+
+
+def _auto_sidecar_from_cache(image_path: Path) -> Path | None:
+    cached = _AUTO_SIDECAR_CACHE.get(_auto_cache_key(image_path))
+    if cached is None:
+        return None
+
+    convention, suffix = cached
+    if convention == "append":
+        candidate = Path(str(image_path) + suffix)
+    elif convention == "replace":
+        candidate = image_path.with_name(image_path.stem + suffix)
+    else:
+        _AUTO_SIDECAR_CACHE.pop(_auto_cache_key(image_path), None)
+        return None
+
+    if _is_non_image_companion(candidate, image_path):
+        return candidate
+
+    _AUTO_SIDECAR_CACHE.pop(_auto_cache_key(image_path), None)
+    return None
+
+
+def _discover_auto_sidecar(
+    image_path: Path,
+) -> tuple[Path, str, str, dict[str, MetadataValue]] | None:
+    for candidate, convention, suffix in _iter_auto_sidecar_candidates(image_path):
+        metadata = _read_auto_candidate_metadata(candidate)
+        if metadata is not None:
+            return candidate, convention, suffix, metadata
+    return None
+
+
+def _read_auto_metadata(image_path: Path) -> dict[str, MetadataValue]:
+    cached_sidecar = _auto_sidecar_from_cache(image_path)
+    if cached_sidecar is not None:
+        metadata = _read_auto_candidate_metadata(cached_sidecar)
+        if metadata is not None:
+            return metadata
+        _AUTO_SIDECAR_CACHE.pop(_auto_cache_key(image_path), None)
+
+    discovered = _discover_auto_sidecar(image_path)
+    if discovered is None:
+        logger.debug("read_image_metadata: no auto sidecar found for %s", image_path)
+        return {}
+
+    _, convention, suffix, metadata = discovered
+    _AUTO_SIDECAR_CACHE[_auto_cache_key(image_path)] = (convention, suffix)
+    return metadata
 
 
 def _extract_scan_info(image_path: Path) -> tuple[str | None, int | None, int]:
@@ -257,17 +502,21 @@ def read_pdi_metadata(path: Path | str) -> dict[str, float]:
 
 def read_image_metadata(
     image_path: Path | str,
-    meta_format: str = "txt",
+    meta_format: str | None = "txt",
     meta_dir: Path | str | None = None,
-) -> dict[str, float]:
+) -> dict[str, MetadataValue]:
     """Unified metadata reader for SSRL detector image sidecar files.
 
     Parameters
     ----------
     image_path : Path | str
         Path to the detector image file.
-    meta_format : str
-        One of ``"txt"``, ``"pdi"``, or ``"spec"``.  Case-insensitive.
+    meta_format : str | None
+        One of ``"txt"``, ``"pdi"``, ``"spec"``, ``"auto"``, or a generic
+        sidecar extension such as ``"metadata"``.  Case-insensitive.
+        ``None`` is treated as ``"auto"``.  Generic extensions are parsed as
+        structured ``name=value`` / ``name: value`` sidecars when they yield
+        at least three plausible pairs.
     meta_dir : Path | str | None
         Optional explicit directory to search for the metadata file.
         Currently used only for ``meta_format="spec"`` — overrides the
@@ -278,9 +527,10 @@ def read_image_metadata(
 
     Returns
     -------
-    dict[str, float]
-        Flat mapping of metadata key → value.  Returns ``{}`` when no sidecar
-        is found or parsing fails.
+    dict[str, int | float | str]
+        Flat mapping of metadata key → value.  Existing SSRL readers return
+        floats; structured sidecars may also return strings.  Returns ``{}``
+        when no sidecar is found or parsing fails.
     """
     image_path = Path(image_path)
 
@@ -290,7 +540,12 @@ def read_image_metadata(
     # lowercase.  Pre-fix this silently returned ``{}`` and logged
     # "unknown meta_format" for every SPEC frame, so positioners
     # never made it into the scan.
-    meta_format_norm = (meta_format or "").strip().lower()
+    meta_format_norm = (
+        "auto" if meta_format is None else str(meta_format).strip().lower()
+    )
+
+    if meta_format_norm == "auto":
+        return _read_auto_metadata(image_path)
 
     if meta_format_norm in ("txt", "pdi"):
         sidecar = _find_sidecar(image_path, meta_format_norm)
@@ -312,6 +567,16 @@ def read_image_metadata(
             Path(meta_dir) if meta_dir not in (None, "") else None
         )
         return _read_spec_metadata(image_path, search_dir=search_dir)
+
+    sidecar = _find_sidecar(image_path, meta_format_norm)
+    if sidecar is not None:
+        metadata = _parse_structured_sidecar_if_plausible(sidecar)
+        if metadata is not None:
+            return metadata
+        logger.debug(
+            "read_image_metadata: %s did not look like structured metadata",
+            sidecar,
+        )
 
     logger.warning("read_image_metadata: unknown meta_format %r", meta_format)
     return {}

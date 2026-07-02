@@ -155,6 +155,7 @@ Stages 6–8 touch the contested Phase-5 GUI files (`static_scan_widget.py`, `di
 | 3 | (3) composition (needs 1+2) | M / low-med | **DONE** | this commit | Added `xrd_tools.sources.readiness.describe_source_readiness` + `capabilities_for_processed`; consumes `metadata['capabilities']` and preserves the true-live failed-probe escape hatch. |
 | 4 | (4) provenance builder + `/entry/reduction/` | M / med / spine-gated | **DONE** | this commit | headless NexusSink emits `/entry/reduction/`; GUI writer byte-identical via shared builder |
 | 5 | (5) resolver dedup | M / med / RECONCILING | **DONE** | this commit | `resolve_incident_angle` / `resolve_monitor_norm` moved to `xrd_tools.core.metadata`; guarded `_frame_norm` monitor semantics are canonical; no `StrictPolicy` arg. |
+| 5.5 | Display decision core MOVE | M / low / parallelizable / NOT contested | **DONE** | this commit | `display_logic` moved to `xrd_tools.session.display_logic`; xdart shim kept. The H7 read contract is now a headless API, so notebook/service callers can consume `resolve_frame_data` and `compute_display_state` without importing the GUI package. |
 | 6 | Plan B item 1 (source-card readiness) | contested-GUI | **DEFERRED** | — | after stable `static_scan_widget.py` / Phase-5 |
 | 7 | Plan B item 2 (run-gate GUI) | contested-GUI | **DEFERRED** | — | after stable `static_scan_widget.py` / Phase-5 |
 | 8 | Plan B item 4 (provenance disclosure GUI) | contested-GUI | **DEFERRED** | — | after stable `static_scan_widget.py` / Phase-5 |

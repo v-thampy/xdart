@@ -1,0 +1,16 @@
+[metadata]
+sampleName=P25_C5
+scanNumber=1
+frameNumber=0
+exposureTime=1
+timeStamp=1773873180.171
+dateTime=@DateTime(2026-03-18 12:33:00.171)
+detectorDistance=1200
+incidentAngle=0.025
+energy=21.0
+filePath=/data/APS_Zoe/P25_C5_eta0p025_scan1FRFR_d1200-00000.tif
+emptyValue=
+operator=Zoe
+comment=trimmed APS/QXRD sidecar
+repeatedKey=old
+repeatedKey=new

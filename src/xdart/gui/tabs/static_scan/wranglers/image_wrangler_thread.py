@@ -18,7 +18,7 @@ import time
 import glob
 import numpy as np
 from pathlib import Path
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
@@ -142,17 +142,17 @@ def _raw_lives_in_source(path):
 def _get_scan_info(fname):
     """Return (scan_name, img_number) for a file path.
 
-    Strips trailing _<digits> suffix from the stem to get scan_name.
+    Strips trailing _<digits> or -<digits> suffix from the stem to get scan_name.
     Falls back to (stem, None) when no numeric suffix is found.
     """
-    stem = Path(fname).stem
-    try:
-        img_number = int(stem[stem.rindex('_') + 1:])
-        scan_name = stem[:stem.rindex('_')]
-    except ValueError:
-        scan_name = stem
-        img_number = None
-    return scan_name, img_number
+    return _split_scan_suffix(Path(fname).stem)
+
+
+def _split_scan_suffix(stem):
+    match = _FRAME_SUFFIX_PATTERN.match(stem)
+    if not match:
+        return stem, None
+    return match.group(1), int(match.group(2))
 
 
 def _gi_2d_range_keys(args):
@@ -278,6 +278,7 @@ def _freeze_gi_1d_range_from_result(args, result, gi_mode_1d=None):
 # Pre-compiled regex patterns (avoids recompilation on every sort key call)
 _INT_PATTERN = re.compile(r'(\d+)')
 _FLOAT_PATTERN = re.compile(r'[+-]?([0-9]+(?:[.][0-9]*)?|[.][0-9]+)')
+_FRAME_SUFFIX_PATTERN = re.compile(r'^(.*?)[_-](\d+)$')
 
 # How many integrated frames to accumulate between v2 _save_to_nexus
 # Live-save cadence and threshold-sentinel constants moved to the
@@ -521,6 +522,10 @@ class imageThread(wranglerThread):
         # instead of a silent end-of-scan.  None means "no error".
         self._prefetch_error = None
         self._plan_cache = StandardPlanCache()
+        self._append_skip_frames_by_scan = {}
+        self._append_skip_without_reading = 0
+        self._discovered_frame_count = 0
+        self._skip_reason_counts = Counter()
 
     # ── Display helpers ──────────────────────────────────────────────────
 
@@ -580,6 +585,10 @@ class imageThread(wranglerThread):
         self._prefetch_thread = None
         self._prefetch_stop_evt = None
         self._prefetch_error = None
+        self._append_skip_frames_by_scan = {}
+        self._append_skip_without_reading = 0
+        self._discovered_frame_count = 0
+        self._skip_reason_counts = Counter()
         # Per-run perf accumulators -> [PERF-SUMMARY] at end of run.  Breaks the
         # worker time into consumer read(queue-wait)/integrate/write + the actual
         # background prefetch I/O, so ONE run shows the bottleneck (read vs
@@ -729,6 +738,131 @@ class imageThread(wranglerThread):
             scan._cached_fiber_integrator = None
         scan._cached_poni = self.poni
 
+    def _append_skip_enabled(self):
+        return (getattr(self, "write_mode", None) == 'Append'
+                and not getattr(self, "xye_only", False))
+
+    def _append_output_number(self, img_number):
+        if getattr(self, "series_average", False):
+            return 1
+        return 1 if img_number is None else img_number
+
+    def _record_discovered_frame(self, count=1):
+        self._discovered_frame_count = (
+            getattr(self, "_discovered_frame_count", 0) + count)
+
+    def _record_skip_reason(self, reason, count=1):
+        reasons = getattr(self, "_skip_reason_counts", None)
+        if reasons is None:
+            reasons = Counter()
+            self._skip_reason_counts = reasons
+        reasons[str(reason)] += count
+
+    def _remember_append_skip_snapshot(self, scan_name, frame_index):
+        if not self._append_skip_enabled() or scan_name is None:
+            return
+        cache = getattr(self, "_append_skip_frames_by_scan", None)
+        if cache is None:
+            cache = {}
+            self._append_skip_frames_by_scan = cache
+        cache.setdefault(str(scan_name), set(frame_index))
+
+    @contextmanager
+    def _optional_file_lock(self):
+        lock = getattr(self, "file_lock", None)
+        if lock is None:
+            yield
+        else:
+            with lock:
+                yield
+
+    def _append_skip_snapshot(self, scan_name):
+        """Return this run's append-skip frame snapshot for *scan_name*.
+
+        The snapshot is keyed by scan name and loaded once from
+        ``scan.frames.index`` while holding the same file lock used by the
+        writer.  It is intentionally not updated as this run processes new
+        frames; the dispatch-time membership check remains the live correctness
+        backstop.
+        """
+        if not self._append_skip_enabled() or scan_name is None:
+            return set()
+        key = str(scan_name)
+        cache = getattr(self, "_append_skip_frames_by_scan", None)
+        if cache is None:
+            cache = {}
+            self._append_skip_frames_by_scan = cache
+        if key in cache:
+            return cache[key]
+
+        existing = set()
+        out_path = os.path.join(getattr(self, "h5_dir", ""), key + '.nxs')
+        if os.path.exists(out_path):
+            lock = getattr(self, "file_lock", None)
+            with self._optional_file_lock():
+                scan = LiveScan(
+                    key,
+                    data_file=out_path,
+                    static=True,
+                    gi=getattr(self, "gi", False),
+                    incidence_motor=getattr(self, "incidence_motor", None),
+                    series_average=getattr(self, "series_average", False),
+                    single_img=getattr(self, "single_img", False),
+                    global_mask=getattr(self, "mask", None),
+                    detector_shape=getattr(self, "detector_shape", None),
+                    file_lock=lock,
+                    **(getattr(self, "scan_args", {}) or {}),
+                )
+                scan.load_from_h5(replace=False, mode='a')
+                existing = set(scan.frames.index)
+        cache[key] = existing
+        return existing
+
+    def _should_skip_before_read(self, scan_name, img_number):
+        output_img_number = self._append_output_number(img_number)
+        if output_img_number in self._append_skip_snapshot(scan_name):
+            self._append_skip_without_reading = (
+                getattr(self, "_append_skip_without_reading", 0) + 1)
+            self._record_skip_reason("already processed")
+            return True
+        return False
+
+    def _format_skip_reasons(self):
+        reasons = getattr(self, "_skip_reason_counts", Counter())
+        if not reasons:
+            return ""
+        parts = []
+        for reason, count in reasons.most_common():
+            parts.append(f"{reason} ({count})" if count != 1 else reason)
+        return "; ".join(parts)
+
+    def _report_run_skip_summary(self, files_processed):
+        skipped = getattr(self, "_append_skip_without_reading", 0)
+        if skipped:
+            logger.info(
+                "append: skipping %d already-processed frame(s) without reading",
+                skipped,
+            )
+
+        discovered = getattr(self, "_discovered_frame_count", 0)
+        if (discovered <= 0 or files_processed >= discovered
+                or getattr(self, "command", None) == 'stop'):
+            return
+        if getattr(self, "series_average", False) and files_processed > 0:
+            return
+        msg = (
+            f"{files_processed} of {discovered} discovered frame(s) processed"
+        )
+        reasons = self._format_skip_reasons()
+        if reasons:
+            msg = f"{msg}: {reasons}"
+        logger.warning(msg)
+        try:
+            self.showLabel.emit(msg)
+        except Exception:
+            logger.debug("showLabel emit failed for zero-frame warning",
+                         exc_info=True)
+
     def process_scan(self):
         """Batch-integrate all existing images, then optionally watch for new ones (live mode).
 
@@ -850,6 +984,7 @@ class imageThread(wranglerThread):
             series_average = bool(getattr(self, "series_average", False))
             output_img_number = 1 if series_average else img_number
             if output_img_number in scan.frames.index:
+                self._record_skip_reason("already processed at dispatch")
                 if self.single_img and not is_eiger:
                     self.sigUpdate.emit(img_number)
                     break
@@ -970,6 +1105,7 @@ class imageThread(wranglerThread):
                     self._cached_gi_incident_angle = None
 
                 if img_number in scan.frames.index:
+                    self._record_skip_reason("already processed at dispatch")
                     continue
 
                 bg_raw = self.get_background(img_file, img_number, img_meta)
@@ -994,6 +1130,9 @@ class imageThread(wranglerThread):
         # In batch mode, emit a single final signal so the GUI can refresh
         if self.batch_mode and files_processed > 0:
             self.sigUpdate.emit(-1)
+        report_skip_summary = getattr(self, "_report_run_skip_summary", None)
+        if callable(report_skip_summary):
+            report_skip_summary(files_processed)
         logger.info('Total Files Processed: %d', files_processed)
 
     # ── Batch dispatch ────────────────────────────────────────────────────────
@@ -1585,9 +1724,8 @@ class imageThread(wranglerThread):
         if not scan_name or not img_dir:
             return []
         _series_re = re.compile(
-            rf'^{re.escape(scan_name)}_\d+\.{re.escape(img_ext)}$')
-        paths = [str(p) for p in Path(img_dir).glob(
-                     f'{scan_name}_*.{img_ext}')
+            rf'^{re.escape(scan_name)}[_-]\d+\.{re.escape(img_ext)}$')
+        paths = [str(p) for p in Path(img_dir).glob(f'*.{img_ext}')
                  if _series_re.match(p.name)]
         out = []
         for fname in natural_sort_ints(paths):
@@ -2341,6 +2479,11 @@ class imageThread(wranglerThread):
             )
         return dict(self._eiger_metadata_cache[key])
 
+    @staticmethod
+    def _eiger_scan_name(master_path):
+        master_stem = Path(master_path).stem
+        return master_stem[:-7] if master_stem.endswith('_master') else master_stem
+
     def _eiger_refill_master_queue(self):
         """Glob for *_master.h5 files not yet processed (Image Directory mode)."""
         match = _name_filter(self.file_filter)
@@ -2467,55 +2610,75 @@ class imageThread(wranglerThread):
 
                     start = self._eiger_frame_idx
                     end = min(start + _PREFETCH_READ_CHUNK, self._eiger_nframes)
-                    _t_blk = time.time()
-                    try:
-                        block = np.asarray(self._eiger_h5_dataset[start:end])
-                    except Exception as e:
-                        logger.warning(
-                            'Bulk read failed (start=%d end=%d): %s; '
-                            'falling back to per-frame read',
-                            start, end, e,
-                        )
-                        break  # outer loop will resume with sync reader
-                    _t_blk = time.time() - _t_blk
-                    _perf = getattr(self, '_perf', None)
-                    if _perf is not None:
-                        _perf['prefetch_io'] += _t_blk
-                        _perf['prefetch_frames'] += (end - start)
-                    # If a bulk read takes >50ms it can fight with the
-                    # consumer for memory bandwidth — log so we can
-                    # correlate against [TIMING] spikes on the consumer.
-                    if _t_blk > 0.05:
-                        logger.info(
-                            '[PREFETCH] block frames %d-%d read in %.3fs',
-                            start, end - 1, _t_blk,
-                        )
-
-                    meta = self._read_eiger_metadata(self._eiger_master_path)
-                    master_stem = Path(self._eiger_master_path).stem
-                    scan_name = (master_stem[:-7]
-                                 if master_stem.endswith('_master')
-                                 else master_stem)
+                    scan_name = self._eiger_scan_name(self._eiger_master_path)
 
                     # Advance the shared frame cursor *before* dispatching so
                     # that any concurrent sync read (e.g. in fallback) does
                     # not re-serve these frames.
                     self._eiger_frame_idx = end
+                    to_read = []
+                    for frame_idx in range(start, end):
+                        self._record_discovered_frame()
+                        if self._should_skip_before_read(scan_name, frame_idx + 1):
+                            continue
+                        to_read.append(frame_idx)
 
-                    for i in range(end - start):
-                        if (self._prefetch_stop_evt.is_set()
-                                or self.command == 'stop'):
-                            return
-                        frame_idx = start + i
-                        item = (
-                            self._eiger_master_path,
-                            scan_name,
-                            frame_idx + 1,   # 1-based img_number
-                            block[i],
-                            meta,
-                        )
-                        if not self._push_frame_to_queue(item):
-                            return
+                    if not to_read:
+                        continue
+
+                    meta = self._read_eiger_metadata(self._eiger_master_path)
+                    groups = []
+                    for frame_idx in to_read:
+                        if not groups or frame_idx != groups[-1][1]:
+                            groups.append([frame_idx, frame_idx + 1])
+                        else:
+                            groups[-1][1] = frame_idx + 1
+
+                    bulk_failed = False
+                    for group_start, group_end in groups:
+                        _t_blk = time.time()
+                        try:
+                            block = np.asarray(
+                                self._eiger_h5_dataset[group_start:group_end])
+                        except Exception as e:
+                            logger.warning(
+                                'Bulk read failed (start=%d end=%d): %s; '
+                                'falling back to per-frame read',
+                                group_start, group_end, e,
+                            )
+                            self._eiger_frame_idx = group_start
+                            bulk_failed = True
+                            break  # outer worker loop resumes with sync reader
+                        _t_blk = time.time() - _t_blk
+                        _perf = getattr(self, '_perf', None)
+                        if _perf is not None:
+                            _perf['prefetch_io'] += _t_blk
+                            _perf['prefetch_frames'] += (group_end - group_start)
+                        # If a bulk read takes >50ms it can fight with the
+                        # consumer for memory bandwidth — log so we can
+                        # correlate against [TIMING] spikes on the consumer.
+                        if _t_blk > 0.05:
+                            logger.info(
+                                '[PREFETCH] block frames %d-%d read in %.3fs',
+                                group_start, group_end - 1, _t_blk,
+                            )
+
+                        for offset, frame_idx in enumerate(
+                                range(group_start, group_end)):
+                            if (self._prefetch_stop_evt.is_set()
+                                    or self.command == 'stop'):
+                                return
+                            item = (
+                                self._eiger_master_path,
+                                scan_name,
+                                frame_idx + 1,   # 1-based img_number
+                                block[offset],
+                                meta,
+                            )
+                            if not self._push_frame_to_queue(item):
+                                return
+                    if bulk_failed:
+                        break
         except Exception as e:
             logger.exception('Eiger prefetch worker failed: %s', e)
             # O8: stamp the failure so the consumer of the sentinel
@@ -2565,90 +2728,93 @@ class imageThread(wranglerThread):
         expensive open/close cycle per frame.  Tracks position with
         (_eiger_master_path, _eiger_frame_idx, _eiger_nframes).
         """
-        # ── Initialise on the very first call ────────────────────────────────
-        if self._eiger_master_path is None:
-            if self.inp_type == 'Image Directory':
-                self._eiger_refill_master_queue()
-                if not self._eiger_master_queue:
-                    return None, None, 1, None, {}
-                self._eiger_master_path = self._eiger_master_queue.popleft()
-            else:
-                self._eiger_master_path = self.img_file
-            self._eiger_frame_idx = 0
-            self._eiger_open_master(self._eiger_master_path)
-            if self._eiger_nframes == 0:
-                self._eiger_close_master()
-                return None, None, 1, None, {}
-
-        # ── Current master exhausted?  Try to advance ────────────────────────
-        if self._eiger_frame_idx >= self._eiger_nframes:
-            # Re-check frame count (file may still be growing in live mode)
-            if self._eiger_fabio_handle is not None:
-                # Reopen fabio handle to pick up newly written data files
-                try:
-                    self._eiger_fabio_handle.close()
-                    self._eiger_fabio_handle = fabio.open(self._eiger_master_path)
-                    self._eiger_nframes = self._eiger_fabio_handle.nframes
-                except (IOError, OSError) as e:
-                    logger.debug("Failed to reopen fabio handle for %s: %s", self._eiger_master_path, e)
-                    self._eiger_nframes = self._get_nframes(self._eiger_master_path)
-            elif self._eiger_h5_dataset is not None:
-                try:
-                    self._eiger_h5_dataset.id.refresh()
-                    self._eiger_nframes = self._eiger_h5_dataset.shape[0]
-                except (IOError, OSError, KeyError) as e:
-                    logger.debug("Failed to refresh h5 dataset for %s: %s", self._eiger_master_path, e)
-                    self._eiger_nframes = self._get_nframes(self._eiger_master_path)
-            else:
-                self._eiger_nframes = self._get_nframes(self._eiger_master_path)
-
-        if self._eiger_frame_idx >= self._eiger_nframes:
-            if self.inp_type == 'Image Directory':
-                self._eiger_done_masters.add(self._eiger_master_path)
-                self._eiger_close_master()
-                if not self._eiger_master_queue:
+        while True:
+            # ── Initialise on the very first call ────────────────────────────
+            if self._eiger_master_path is None:
+                if self.inp_type == 'Image Directory':
                     self._eiger_refill_master_queue()
-                if not self._eiger_master_queue:
-                    return None, None, 1, None, {}
-                self._eiger_master_path = self._eiger_master_queue.popleft()
+                    if not self._eiger_master_queue:
+                        return None, None, 1, None, {}
+                    self._eiger_master_path = self._eiger_master_queue.popleft()
+                else:
+                    self._eiger_master_path = self.img_file
                 self._eiger_frame_idx = 0
                 self._eiger_open_master(self._eiger_master_path)
                 if self._eiger_nframes == 0:
                     self._eiger_close_master()
                     return None, None, 1, None, {}
-            else:
-                self._eiger_close_master()
-                return None, None, 1, None, {}
 
-        # ── Read one frame ────────────────────────────────────────────────────
-        frame_idx = self._eiger_frame_idx
-        self._eiger_frame_idx += 1
+            # ── Current master exhausted?  Try to advance ────────────────────
+            if self._eiger_frame_idx >= self._eiger_nframes:
+                # Re-check frame count (file may still be growing in live mode)
+                if self._eiger_fabio_handle is not None:
+                    # Reopen fabio handle to pick up newly written data files
+                    try:
+                        self._eiger_fabio_handle.close()
+                        self._eiger_fabio_handle = fabio.open(self._eiger_master_path)
+                        self._eiger_nframes = self._eiger_fabio_handle.nframes
+                    except (IOError, OSError) as e:
+                        logger.debug("Failed to reopen fabio handle for %s: %s", self._eiger_master_path, e)
+                        self._eiger_nframes = self._get_nframes(self._eiger_master_path)
+                elif self._eiger_h5_dataset is not None:
+                    try:
+                        self._eiger_h5_dataset.id.refresh()
+                        self._eiger_nframes = self._eiger_h5_dataset.shape[0]
+                    except (IOError, OSError, KeyError) as e:
+                        logger.debug("Failed to refresh h5 dataset for %s: %s", self._eiger_master_path, e)
+                        self._eiger_nframes = self._get_nframes(self._eiger_master_path)
+                else:
+                    self._eiger_nframes = self._get_nframes(self._eiger_master_path)
 
-        try:
-            if self._eiger_fabio_handle is not None:
-                # Primary: persistent fabio handle
-                _raw = (self._eiger_fabio_handle.data if frame_idx == 0
-                        else self._eiger_fabio_handle.get_frame(frame_idx).data)
-                img_data = np.asarray(_raw)
-            elif self._eiger_h5_dataset is not None:
-                # Fallback: h5py dataset
-                img_data = np.asarray(self._eiger_h5_dataset[frame_idx])
-            else:
-                # Should not happen, but safety net
-                with fabio.open(self._eiger_master_path) as _img:
-                    _raw = _img.data if frame_idx == 0 else _img.get_frame(frame_idx).data
-                img_data = np.asarray(_raw)
-        except Exception as e:
-            logger.error('Error reading frame %d from %s: %s', frame_idx, self._eiger_master_path, e)
-            img_data = None
+            if self._eiger_frame_idx >= self._eiger_nframes:
+                if self.inp_type == 'Image Directory':
+                    self._eiger_done_masters.add(self._eiger_master_path)
+                    self._eiger_close_master()
+                    if not self._eiger_master_queue:
+                        self._eiger_refill_master_queue()
+                    if not self._eiger_master_queue:
+                        return None, None, 1, None, {}
+                    self._eiger_master_path = self._eiger_master_queue.popleft()
+                    self._eiger_frame_idx = 0
+                    self._eiger_open_master(self._eiger_master_path)
+                    if self._eiger_nframes == 0:
+                        self._eiger_close_master()
+                        return None, None, 1, None, {}
+                else:
+                    self._eiger_close_master()
+                    return None, None, 1, None, {}
 
-        meta = self._read_eiger_metadata(self._eiger_master_path)
+            # ── Read one frame ────────────────────────────────────────────────
+            frame_idx = self._eiger_frame_idx
+            self._eiger_frame_idx += 1
+            scan_name = self._eiger_scan_name(self._eiger_master_path)
+            img_number = frame_idx + 1  # 1-based
+            self._record_discovered_frame()
+            if self._should_skip_before_read(scan_name, img_number):
+                continue
 
-        master_stem = Path(self._eiger_master_path).stem
-        scan_name = master_stem[:-7] if master_stem.endswith('_master') else master_stem
-        img_number = frame_idx + 1  # 1-based
+            try:
+                if self._eiger_fabio_handle is not None:
+                    # Primary: persistent fabio handle
+                    _raw = (self._eiger_fabio_handle.data if frame_idx == 0
+                            else self._eiger_fabio_handle.get_frame(frame_idx).data)
+                    img_data = np.asarray(_raw)
+                elif self._eiger_h5_dataset is not None:
+                    # Fallback: h5py dataset
+                    img_data = np.asarray(self._eiger_h5_dataset[frame_idx])
+                else:
+                    # Should not happen, but safety net
+                    with fabio.open(self._eiger_master_path) as _img:
+                        _raw = _img.data if frame_idx == 0 else _img.get_frame(frame_idx).data
+                    img_data = np.asarray(_raw)
+            except Exception as e:
+                logger.error('Error reading frame %d from %s: %s', frame_idx, self._eiger_master_path, e)
+                self._record_skip_reason("unreadable or empty image data")
+                img_data = None
 
-        return self._eiger_master_path, scan_name, img_number, img_data, meta
+            meta = self._read_eiger_metadata(self._eiger_master_path)
+
+            return self._eiger_master_path, scan_name, img_number, img_data, meta
 
     # ── Image iteration ──────────────────────────────────────────────────
 
@@ -2657,9 +2823,13 @@ class imageThread(wranglerThread):
         is_master = _is_eiger_master(self.img_file) if self.img_file else False
 
         if self.single_img and not is_master:
+            scan_name, img_number = _get_scan_info(self.img_file)
+            self._record_discovered_frame()
+            if self._should_skip_before_read(scan_name, img_number):
+                self.sigUpdate.emit(self._append_output_number(img_number))
+                return None, scan_name, img_number, None, {}
             img_data = np.asarray(read_image(self.img_file), dtype=float)
             meta = read_image_metadata(self.img_file, meta_format=self.meta_ext, meta_dir=self.meta_dir) if self.meta_ext else {}
-            scan_name, img_number = _get_scan_info(self.img_file)
             return self.img_file, scan_name, img_number, img_data, meta
 
         if is_master or self.img_ext.lower() in ('h5', 'hdf5', 'nxs'):
@@ -2673,12 +2843,10 @@ class imageThread(wranglerThread):
                 # files whose tail is purely a numeric frame index, so we
                 # only pick up the *strict* siblings of self.img_file.
                 _series_re = re.compile(
-                    rf'^{re.escape(self.scan_name)}_\d+\.{re.escape(self.img_ext)}$'
+                    rf'^{re.escape(self.scan_name)}[_-]\d+\.{re.escape(self.img_ext)}$'
                 )
                 self.img_fnames = [
-                    p for p in Path(self.img_dir).glob(
-                        f'{self.scan_name}_*.{self.img_ext}'
-                    )
+                    p for p in Path(self.img_dir).glob(f'*.{self.img_ext}')
                     if _series_re.match(p.name)
                 ]
             else:
@@ -2707,9 +2875,14 @@ class imageThread(wranglerThread):
 
             self.processed.append(fname)
             self.img_fnames.popleft()
+            self._record_discovered_frame()
+
+            if self._should_skip_before_read(sname, snumber):
+                continue
 
             data = np.asarray(read_image(fname), dtype=float)
             if data is None or not np.isfinite(data).any():
+                self._record_skip_reason("unreadable or empty image data")
                 continue
 
             meta = read_image_metadata(fname, meta_format=self.meta_ext, meta_dir=self.meta_dir) if self.meta_ext else {}
@@ -2809,6 +2982,8 @@ class imageThread(wranglerThread):
                         for (k, v) in self.scan_args.items():
                             setattr(scan, k, v)
                         existing_frames = scan.frames.index
+                        self._remember_append_skip_snapshot(
+                            scan.name, existing_frames)
                         if len(existing_frames) == 0:
                             scan.save_to_nexus(replace=True)
                     else:
