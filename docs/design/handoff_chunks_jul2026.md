@@ -128,7 +128,8 @@ Lane D (tests/bounds):  {H2, H3, H4, H5} — anytime, no dependencies
 | H4 | `_set_1d_cache_limit(None)` footgun (A4) | S | — | open |
 | H5 | Stage-6 parity test (A8) | S | — | open |
 | H6 | W: per-mode subgroup write wiring + production multi-mode spine gate (A2) | M | H1, RC-3 | open |
-| H7 | Typed store-read result + consumer contract test (A3) | M | — (lands as 8a's first commit) | open |
+| H7a | Typed read result + policy table + render authority (display-side, fallbacks KEPT) (A3) | M | round-2 fix — **PULLED FORWARD pre-release** after 3 live bugs of this class; `codex_tasks/h7_typed_reads_render_authority.md` | done |
+| H7b | Remove the fallback tiers behind the H7a accessor | S | H7a; rides 8a | open |
 | H8 | 8a flip: PublicationStore→bounded projection; remove update_plot fallback; §0.4 blockers; explicit-subset hydrate-all-or-refuse gate | M/L | H6, H7, H13; live-gated (Session 2) | open |
 | H9 | 8b delete Role-A `data_1d/data_2d/hydrated_raw` (keep Role-B `_ViewerRows`); greenfield done-test | M | H8 | open |
 | H10 | 7c cadence→session per ADR decision + optional `max_heavy_bytes` budget | M | H9, ADR decision | open |

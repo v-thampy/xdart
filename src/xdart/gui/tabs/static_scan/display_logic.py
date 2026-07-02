@@ -56,10 +56,15 @@ __all__ = [
     "Mode",
     "RawSource",
     "OverlayAction",
+    "DataTier",
+    "ReadStatus",
+    "ReadPolicyAction",
+    "ConsumerKind",
     "LoadStatus",
     "PanelRole",
     "PanelKey",
     "PanelPlan",
+    "ReadResult",
     "Axis",
     "Trace",
     "PlotPayload",
@@ -79,6 +84,8 @@ __all__ = [
     "controller_for",
     "resolve_selection",
     "resolve_render_ids",
+    "resolve_frame_data",
+    "read_policy_action",
     "choose_raw_source",
     "apply_mask_for",
     "x_axis_for_unit",
@@ -293,7 +300,46 @@ class LoadStatus(Enum):
     ERROR = "error"      # load failed — blank + error_message, never half-populated
 
 
+class DataTier(Enum):
+    ONE_D = "1d"
+    TWO_D = "2d"
+    RAW_OR_THUMBNAIL = "raw_or_thumbnail"
+    PUBLICATION = "publication"
+
+
+class ReadStatus(Enum):
+    RESIDENT = "resident"
+    EVICTED_HYDRATING = "evicted_hydrating"
+    ABSENT = "absent"
+
+
+class ReadPolicyAction(Enum):
+    DRAW = "draw"
+    PRESERVE_EXISTING = "preserve-existing"
+    BLANK_AWAIT = "blank-await"
+    ANNOTATE = "annotate"
+
+
+class ConsumerKind(Enum):
+    PLOT_1D = "plot_1d"
+    RAW_2D = "raw_2d"
+    CAKE_2D = "cake_2d"
+    IMAGE_VIEWER = "image_viewer"
+    XYE_VIEWER = "xye_viewer"
+    NEXUS_VIEWER = "nexus_viewer"
+
+
 # ── Data shapes (§4 + §10 of the plan) ────────────────────────────────
+
+@dataclass(frozen=True)
+class ReadResult:
+    label: object
+    tier_needed: DataTier
+    status: ReadStatus
+    data: object = None
+    source: str = ""
+    has_raw: bool = False
+    has_thumbnail: bool = False
 
 @dataclass(frozen=True)
 class PanelKey:
@@ -915,6 +961,213 @@ def plan_overlay(method, unit_changed, has_existing, new_ids, prev_overlaid_ids)
     return OverlayAction.REPLACE, new_ids
 
 
+def _label_key(label):
+    try:
+        return int(label)
+    except (TypeError, ValueError):
+        return label
+
+
+def _tier(value):
+    if isinstance(value, DataTier):
+        return value
+    try:
+        return DataTier(str(value))
+    except ValueError:
+        return DataTier.PUBLICATION
+
+
+def _view_has_tier(view, tier_needed):
+    if view is None:
+        return False
+    tier_needed = _tier(tier_needed)
+    if tier_needed is DataTier.ONE_D:
+        return bool(
+            getattr(view, "has_1d", False)
+            or getattr(view, "intensity_1d", None) is not None
+        )
+    if tier_needed is DataTier.TWO_D:
+        return bool(
+            getattr(view, "has_2d", False)
+            or getattr(view, "intensity_2d", None) is not None
+        )
+    if tier_needed is DataTier.RAW_OR_THUMBNAIL:
+        return bool(
+            getattr(view, "raw", None) is not None
+            or getattr(view, "thumbnail", None) is not None
+        )
+    return True
+
+
+def _publication_has_tier(publication, tier_needed):
+    if publication is None:
+        return False
+    return _view_has_tier(getattr(publication, "view", None), tier_needed)
+
+
+def _publication_raw_flags(publication):
+    view = getattr(publication, "view", None)
+    if view is None:
+        return False, False
+    return (
+        getattr(view, "raw", None) is not None,
+        getattr(view, "thumbnail", None) is not None,
+    )
+
+
+def _legacy_data_for_tier(label, tier_needed, data_1d=None, data_2d=None):
+    key = _label_key(label)
+    tier_needed = _tier(tier_needed)
+    if tier_needed in (DataTier.ONE_D, DataTier.PUBLICATION):
+        if hasattr(data_1d, "get"):
+            frame = data_1d.get(key)
+            if frame is not None:
+                return frame, False, False
+    if tier_needed in (DataTier.TWO_D, DataTier.RAW_OR_THUMBNAIL):
+        if hasattr(data_2d, "get"):
+            frame_2d = data_2d.get(key)
+            if isinstance(frame_2d, dict):
+                if tier_needed is DataTier.TWO_D:
+                    # Legacy readiness treated the presence of a data_2d entry
+                    # as loaded even when it held only raw/thumbnail data.  Keep
+                    # that fallback until the Role-A mirrors are retired.
+                    return frame_2d, False, False
+                else:
+                    has_raw = frame_2d.get("map_raw") is not None
+                    has_thumbnail = frame_2d.get("thumbnail") is not None
+                    if has_raw or has_thumbnail:
+                        return frame_2d, has_raw, has_thumbnail
+    return None, False, False
+
+
+def _request_tier_hydration(request_hydration, label, tier_needed):
+    if request_hydration is None:
+        return False
+    purpose = "1d" if _tier(tier_needed) is DataTier.ONE_D else "full"
+    try:
+        request_hydration(label, purpose=purpose)
+        return True
+    except TypeError:
+        try:
+            request_hydration(label)
+            return True
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+def resolve_frame_data(
+    label,
+    mode,
+    tier_needed,
+    *,
+    store_first_lookup=None,
+    publication_store=None,
+    data_1d=None,
+    data_2d=None,
+    include_legacy=True,
+    request_hydration=None,
+):
+    """Resolve one display datum through the additive H7a fallback chain.
+
+    The function is intentionally duck-typed and Qt-free.  It never calls a
+    blocking hydrate method; an unavailable-but-expected frame becomes
+    ``EVICTED_HYDRATING`` and the optional request callback is invoked instead.
+    Existing fallback tiers are preserved in order:
+    store-first accessor -> PublicationStore -> legacy mirrors.
+    """
+    key = _label_key(label)
+    tier_needed = _tier(tier_needed)
+
+    if callable(store_first_lookup):
+        publication = store_first_lookup(key, allow_blocking_read=False)
+        if _publication_has_tier(publication, tier_needed):
+            has_raw, has_thumbnail = _publication_raw_flags(publication)
+            return ReadResult(
+                key, tier_needed, ReadStatus.RESIDENT, publication,
+                source="store_first", has_raw=has_raw,
+                has_thumbnail=has_thumbnail)
+        if publication is not None and tier_needed is DataTier.PUBLICATION:
+            has_raw, has_thumbnail = _publication_raw_flags(publication)
+            return ReadResult(
+                key, tier_needed, ReadStatus.RESIDENT, publication,
+                source="store_first", has_raw=has_raw,
+                has_thumbnail=has_thumbnail)
+
+    if publication_store is not None:
+        publication = None
+        get = getattr(publication_store, "get", None)
+        if callable(get):
+            publication = get(key)
+        if _publication_has_tier(publication, tier_needed):
+            has_raw, has_thumbnail = _publication_raw_flags(publication)
+            return ReadResult(
+                key, tier_needed, ReadStatus.RESIDENT, publication,
+                source="publication_store", has_raw=has_raw,
+                has_thumbnail=has_thumbnail)
+        if publication is not None and tier_needed is DataTier.PUBLICATION:
+            has_raw, has_thumbnail = _publication_raw_flags(publication)
+            return ReadResult(
+                key, tier_needed, ReadStatus.RESIDENT, publication,
+                source="publication_store", has_raw=has_raw,
+                has_thumbnail=has_thumbnail)
+
+    if include_legacy:
+        data, has_raw, has_thumbnail = _legacy_data_for_tier(
+            key, tier_needed, data_1d=data_1d, data_2d=data_2d)
+        if data is not None:
+            return ReadResult(
+                key, tier_needed, ReadStatus.RESIDENT, data,
+                source="legacy_mirror", has_raw=has_raw,
+                has_thumbnail=has_thumbnail)
+
+    # Scan display paths with a store/store-first accessor can expect a later
+    # async completion.  Viewer-only mirror misses are genuinely absent.
+    scan_mode = mode in (Mode.INT_1D, Mode.INT_2D)
+    can_hydrate = scan_mode and (
+        callable(store_first_lookup)
+        or publication_store is not None
+        or request_hydration is not None
+    )
+    if can_hydrate:
+        _request_tier_hydration(request_hydration, key, tier_needed)
+        return ReadResult(
+            key, tier_needed, ReadStatus.EVICTED_HYDRATING,
+            source="hydration")
+    return ReadResult(key, tier_needed, ReadStatus.ABSENT, source="absent")
+
+
+def read_policy_action(consumer_kind, status, *, method=None, has_accumulator=False):
+    """Single display policy table for typed read outcomes."""
+    if isinstance(consumer_kind, PanelRole):
+        consumer_kind = {
+            PanelRole.PLOT_1D: ConsumerKind.PLOT_1D,
+            PanelRole.RAW_2D: ConsumerKind.RAW_2D,
+            PanelRole.CAKE_2D: ConsumerKind.CAKE_2D,
+        }.get(consumer_kind, ConsumerKind.PLOT_1D)
+    elif not isinstance(consumer_kind, ConsumerKind):
+        try:
+            consumer_kind = ConsumerKind(str(consumer_kind))
+        except ValueError:
+            consumer_kind = ConsumerKind.PLOT_1D
+    if not isinstance(status, ReadStatus):
+        status = ReadStatus(str(status))
+
+    if status is ReadStatus.RESIDENT:
+        return ReadPolicyAction.DRAW
+    if (
+        consumer_kind is ConsumerKind.PLOT_1D
+        and method in ("Overlay", "Waterfall")
+        and has_accumulator
+        and status is ReadStatus.EVICTED_HYDRATING
+    ):
+        return ReadPolicyAction.PRESERVE_EXISTING
+    if consumer_kind in (ConsumerKind.IMAGE_VIEWER, ConsumerKind.NEXUS_VIEWER):
+        return ReadPolicyAction.ANNOTATE if status is ReadStatus.ABSENT else ReadPolicyAction.BLANK_AWAIT
+    return ReadPolicyAction.BLANK_AWAIT
+
+
 def overlay_read_failure_action(method, has_accumulator):
     """Decide what an Overlay/Waterfall render does when its INCREMENTAL read of
     the not-yet-accumulated frames comes back empty.
@@ -935,7 +1188,13 @@ def overlay_read_failure_action(method, has_accumulator):
 
     Returns ``'preserve'`` or ``'clear'``.
     """
-    if method in ('Overlay', 'Waterfall') and has_accumulator:
+    action = read_policy_action(
+        ConsumerKind.PLOT_1D,
+        ReadStatus.EVICTED_HYDRATING,
+        method=method,
+        has_accumulator=has_accumulator,
+    )
+    if action is ReadPolicyAction.PRESERVE_EXISTING:
         return 'preserve'
     return 'clear'
 
@@ -1285,7 +1544,12 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
     _overlay_preserve_1d = (
         mode in _SCAN_MODES
         and not render_1d
-        and overlay_read_failure_action(method, bool(prev_overlaid_ids)) == 'preserve'
+        and read_policy_action(
+            ConsumerKind.PLOT_1D,
+            ReadStatus.EVICTED_HYDRATING,
+            method=method,
+            has_accumulator=bool(prev_overlaid_ids),
+        ) is ReadPolicyAction.PRESERVE_EXISTING
     )
 
     x_label, _sym = x_axis_for_unit(plot_unit)

@@ -30,14 +30,17 @@ import numpy as np
 
 from .display_logic import (
     Axis,
+    DataTier,
     DisplayPayload,
     ImagePayload,
     Mode,
     PlotPayload,
+    ReadStatus,
     Trace,
     compute_display_state,
     build_payload,
     register_controller,
+    resolve_frame_data,
     sentinel_mask,
     standalone_viewer_image,
     stitch_display_state,
@@ -48,7 +51,6 @@ from .display_logic import (
 )
 from .display_publication import (
     PublicationDisplayAdapter,
-    publication_availability,
 )
 
 logger = logging.getLogger(__name__)
@@ -120,7 +122,7 @@ class _FrameIndexCount:
         raise RuntimeError("frame labels were requested from a count-only index")
 
 
-def _data_snapshot(widget, *, labels=None, include_legacy=True):
+def _data_snapshot(widget, *, mode, labels=None, include_legacy=True):
     """Snapshot loaded keys + per-frame raw/thumbnail availability.
 
     X1 (Phase 3a): the PublicationStore is the primary source.  Viewer modes
@@ -130,51 +132,64 @@ def _data_snapshot(widget, *, labels=None, include_legacy=True):
     from the render decision and kept the old ``data_1d`` mirror as an implicit
     source of truth.
     """
-    store_first_items = _store_first_publication_items(widget, labels)
-    if store_first_items is not None:
-        adapter = PublicationDisplayAdapter(
-            store=None, widget=widget, items=store_first_items)
-        return (
-            adapter.available_1d_keys(),
-            adapter.available_2d_keys(),
-            adapter.raw_availability(),
-        )
-
-    store = getattr(widget, "publication_store", None)
     loaded_1d, loaded_2d, raw_avail = set(), set(), {}
-    if store is not None:
-        pub_1d, pub_2d, pub_raw = publication_availability(store, labels=labels)
-        loaded_1d |= pub_1d
-        loaded_2d |= pub_2d
-        raw_avail.update(pub_raw)
-        _request_missing_publications(widget, labels, loaded_1d)
-    if not include_legacy:
-        return loaded_1d, loaded_2d, raw_avail
-
-    label_filter = None if labels is None else {_label_key(label) for label in labels}
-    with widget.data_lock:
-        if label_filter is None:
-            data_1d_keys = set(widget.data_1d.keys())
-            data_2d_items = tuple(widget.data_2d.items())
-        else:
-            data_1d_keys = {key for key in label_filter if key in widget.data_1d}
-            data_2d_items = tuple(
-                (key, widget.data_2d[key])
-                for key in label_filter
-                if key in widget.data_2d
-            )
-        loaded_1d |= data_1d_keys
-        loaded_2d |= {key for key, _value in data_2d_items}
-        for k, v in data_2d_items:
-            if not isinstance(v, dict):
-                continue
-            entry = raw_avail.setdefault(
-                int(k), {'has_raw': False, 'has_thumbnail': False})
-            entry['has_raw'] = bool(entry.get('has_raw')) or (
-                v.get('map_raw') is not None)
-            entry['has_thumbnail'] = bool(entry.get('has_thumbnail')) or (
-                v.get('thumbnail') is not None)
+    if labels is None:
+        labels = ()
+    for label in _label_keys(labels):
+        if mode in (Mode.INT_2D, Mode.IMAGE_VIEWER, Mode.NEXUS_VIEWER):
+            r_2d = resolve_frame_data_for_widget(
+                widget, label, mode, DataTier.TWO_D,
+                include_legacy=include_legacy)
+            r_raw = resolve_frame_data_for_widget(
+                widget, label, mode, DataTier.RAW_OR_THUMBNAIL,
+                include_legacy=include_legacy)
+            if r_2d.status is ReadStatus.RESIDENT:
+                loaded_2d.add(_label_key(label))
+            if r_raw.status is ReadStatus.RESIDENT:
+                raw_avail[_label_key(label)] = {
+                    "has_raw": bool(r_raw.has_raw),
+                    "has_thumbnail": bool(r_raw.has_thumbnail),
+                }
+        if mode in (Mode.INT_1D, Mode.INT_2D, Mode.XYE_VIEWER, Mode.NEXUS_VIEWER):
+            r_1d = resolve_frame_data_for_widget(
+                widget, label, mode, DataTier.ONE_D,
+                include_legacy=include_legacy)
+            if r_1d.status is ReadStatus.RESIDENT:
+                loaded_1d.add(_label_key(label))
     return loaded_1d, loaded_2d, raw_avail
+
+
+def _store_first_lookup(widget):
+    if getattr(widget, "viewer_mode", None) is not None:
+        return None
+    lookup = getattr(widget, "_store_first_publication_for_display", None)
+    if (
+        lookup is None
+        or getattr(widget, "store_first_frame_view", None) is None
+    ):
+        return None
+    return lookup
+
+
+def resolve_frame_data_for_widget(
+        widget, label, mode, tier_needed, *, include_legacy=True,
+        request_hydration=True):
+    request = getattr(widget, "_request_frame_hydration", None)
+    if request is None:
+        request = getattr(widget, "_request_missing_publication", None)
+    if not request_hydration:
+        request = None
+    return resolve_frame_data(
+        label,
+        mode,
+        tier_needed,
+        store_first_lookup=_store_first_lookup(widget),
+        publication_store=getattr(widget, "publication_store", None),
+        data_1d=getattr(widget, "data_1d", None),
+        data_2d=getattr(widget, "data_2d", None),
+        include_legacy=include_legacy,
+        request_hydration=request,
+    )
 
 
 def _request_missing_publications(widget, labels, loaded_1d) -> None:
@@ -209,26 +224,21 @@ def _request_missing_publications(widget, labels, loaded_1d) -> None:
 
 
 def _store_first_publication_items(widget, labels):
-    """Return synthetic publications from the store-first FrameView accessor."""
+    """Return scan-display publications resolved through H7a typed reads."""
     if getattr(widget, "viewer_mode", None) is not None:
         return None
     if labels is None:
         return None
-    lookup = getattr(widget, "_store_first_publication_for_display", None)
-    if (
-        lookup is None
-        or getattr(widget, "store_first_frame_view", None) is None
-    ):
-        return None
     items = {}
     for label in _label_keys(labels):
-        publication = lookup(label, allow_blocking_read=False)
-        if publication is not None:
-            items[_label_key(label)] = publication
-    adapter = PublicationDisplayAdapter(
-        store=None, widget=widget, items=items)
-    _request_missing_publications(widget, labels, adapter.available_1d_keys())
-    return items
+        result = resolve_frame_data_for_widget(
+            widget, label, Mode.INT_2D, DataTier.PUBLICATION,
+            include_legacy=False, request_hydration=False)
+        if result.status is ReadStatus.RESIDENT and result.data is not None:
+            items[_label_key(label)] = result.data
+    if items or getattr(widget, "publication_store", None) is not None:
+        return items
+    return None
 
 
 def _image_viewer_raw_payload(widget, state):
@@ -258,23 +268,23 @@ def _image_viewer_raw_payload(widget, state):
     if not state.render_ids:
         return None
     idx = int(state.render_ids[0])
-    # X1 (Phase 3a): the publication is the primary render source; the
-    # legacy data_2d mirror fills the gap while it still exists.
     raw = None
-    store = getattr(widget, "publication_store", None)
-    if store is not None:
-        publication = store.get(idx)
-        if publication is not None:
-            raw = publication.view.raw
+    mode = getattr(state, "mode", Mode.IMAGE_VIEWER)
+    result = resolve_frame_data_for_widget(
+        widget, idx, mode, DataTier.RAW_OR_THUMBNAIL,
+        include_legacy=True, request_hydration=False)
+    if result.status is ReadStatus.RESIDENT:
+        if result.source in ("store_first", "publication_store"):
+            view = getattr(result.data, "view", None)
+            raw = getattr(view, "raw", None)
             if raw is None:
-                raw = publication.view.thumbnail
+                raw = getattr(view, "thumbnail", None)
+        elif isinstance(result.data, dict):
+            raw = result.data.get('map_raw')
+            if raw is None:
+                raw = result.data.get('thumbnail')
     if raw is None:
-        with widget.data_lock:
-            frame_2d = widget.data_2d.get(idx)
-        if frame_2d is not None:
-            raw = frame_2d.get('map_raw')
-            if raw is None:
-                raw = frame_2d.get('thumbnail')
+        return None
     if raw is None:
         return None
     if getattr(widget, '_viewer_is_xdart', False):
@@ -319,6 +329,7 @@ class _BaseController:
         store = getattr(widget, "publication_store", None)
         loaded_1d, loaded_2d, raw_avail = _data_snapshot(
             widget,
+            mode=mode,
             labels=labels,
             include_legacy=(
                 store is None or mode not in (Mode.INT_1D, Mode.INT_2D)
@@ -455,24 +466,27 @@ def _xye_plot_payload(widget, state):
             continue
     if not render_ids:
         return None
-    with widget.data_lock:
-        frames = {i: widget.data_1d.get(i) for i in render_ids}
-
-    store = getattr(widget, "publication_store", None)
 
     def _frame_data(idx):
         """(radial, intensity, source_file) — publication first (X1),
         legacy data_1d frame as the fallback while the dict exists."""
-        if store is not None:
-            pub = store.get(idx)
-            if (pub is not None and pub.view.intensity_1d is not None
-                    and pub.view.axis_1d is not None
-                    and pub.view.axis_1d.values is not None):
-                src = str(pub.metadata_raw.get('source_file', '') or '')
-                return (np.asarray(pub.view.axis_1d.values, dtype=float),
-                        np.asarray(pub.view.intensity_1d, dtype=float),
+        mode = getattr(state, "mode", Mode.XYE_VIEWER)
+        result = resolve_frame_data_for_widget(
+            widget, idx, mode, DataTier.ONE_D,
+            include_legacy=True, request_hydration=False)
+        if result.status is not ReadStatus.RESIDENT:
+            return None
+        if result.source in ("store_first", "publication_store"):
+            pub = result.data
+            view = getattr(pub, "view", None)
+            if (view is not None and getattr(view, "intensity_1d", None) is not None
+                    and getattr(view, "axis_1d", None) is not None
+                    and getattr(view.axis_1d, "values", None) is not None):
+                src = str(getattr(pub, "metadata_raw", {}).get('source_file', '') or '')
+                return (np.asarray(view.axis_1d.values, dtype=float),
+                        np.asarray(view.intensity_1d, dtype=float),
                         src)
-        fr = frames.get(idx)
+        fr = result.data
         int_1d = getattr(fr, 'int_1d', None) if fr is not None else None
         if int_1d is None:
             return None

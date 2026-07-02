@@ -12,6 +12,11 @@ import signal
 import logging
 import faulthandler
 faulthandler.enable()  # Print Python traceback on bus error / segfault
+if hasattr(signal, "SIGUSR1"):
+    # Live-freeze diagnostic: `kill -USR1 <pid>` dumps every thread's Python
+    # stack to stderr, even while the GUI thread is busy (the dump runs in the
+    # C signal handler, no GIL needed).  No root required, unlike py-spy on macOS.
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
 
 # Set PySide6 as the Qt binding for pyqtgraph before any Qt imports.
 # Also export MPLBACKEND so child processes (e.g. pyFAI-calib2) inherit it.

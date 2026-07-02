@@ -145,6 +145,108 @@ def test_overlay_read_failure_clears_for_non_accumulating_methods():
         assert dl.overlay_read_failure_action(method, has_accumulator=True) == 'clear'
 
 
+def test_resolve_frame_data_typed_statuses_and_fallbacks():
+    view_1d = SimpleNamespace(has_1d=True, intensity_1d=[1.0], axis_1d=object())
+    publication = SimpleNamespace(view=view_1d, metadata_raw={})
+
+    class Store:
+        def __init__(self, item):
+            self.item = item
+
+        def get(self, label):
+            assert label == 3
+            return self.item
+
+        def get_or_hydrate(self, label):  # must never be called by display resolve
+            raise AssertionError("blocking hydrate called on GUI resolve path")
+
+    resident = dl.resolve_frame_data(
+        "3", dl.Mode.INT_1D, dl.DataTier.ONE_D,
+        publication_store=Store(publication),
+        data_1d={3: "legacy"},
+        request_hydration=lambda *a, **k: None,
+    )
+    assert resident.status is dl.ReadStatus.RESIDENT
+    assert resident.source == "publication_store"
+    assert resident.data is publication
+
+    legacy = dl.resolve_frame_data(
+        4, dl.Mode.XYE_VIEWER, dl.DataTier.ONE_D,
+        data_1d={4: "legacy-frame"},
+    )
+    assert legacy.status is dl.ReadStatus.RESIDENT
+    assert legacy.source == "legacy_mirror"
+    assert legacy.data == "legacy-frame"
+
+    absent = dl.resolve_frame_data(
+        5, dl.Mode.XYE_VIEWER, dl.DataTier.ONE_D,
+        data_1d={},
+    )
+    assert absent.status is dl.ReadStatus.ABSENT
+
+
+def test_resolve_frame_data_hydrates_async_without_blocking_disk_read():
+    requests = []
+    thinned = SimpleNamespace(
+        view=SimpleNamespace(
+            has_1d=False, intensity_1d=None, axis_1d=None,
+            has_2d=False, intensity_2d=None, raw=None, thumbnail=None,
+        ),
+        raw_status="evicted",
+        metadata_raw={},
+    )
+
+    class Store:
+        def get(self, label):
+            return thinned
+
+        def get_or_hydrate(self, label):
+            raise AssertionError("blocking hydrate called on GUI resolve path")
+
+    result = dl.resolve_frame_data(
+        7, dl.Mode.INT_1D, dl.DataTier.ONE_D,
+        publication_store=Store(),
+        request_hydration=lambda label, *, purpose="full":
+            requests.append((label, purpose)),
+    )
+
+    assert result.status is dl.ReadStatus.EVICTED_HYDRATING
+    assert requests == [(7, "1d")]
+
+
+def test_read_policy_table_enumerates_consumers_and_statuses():
+    consumers = (
+        dl.ConsumerKind.PLOT_1D,
+        dl.ConsumerKind.RAW_2D,
+        dl.ConsumerKind.CAKE_2D,
+        dl.ConsumerKind.IMAGE_VIEWER,
+        dl.ConsumerKind.NEXUS_VIEWER,
+    )
+    for consumer in consumers:
+        assert dl.read_policy_action(
+            consumer, dl.ReadStatus.RESIDENT) is dl.ReadPolicyAction.DRAW
+        assert dl.read_policy_action(
+            consumer, dl.ReadStatus.EVICTED_HYDRATING
+        ) in (dl.ReadPolicyAction.BLANK_AWAIT,
+              dl.ReadPolicyAction.PRESERVE_EXISTING)
+        assert dl.read_policy_action(
+            consumer, dl.ReadStatus.ABSENT
+        ) in (dl.ReadPolicyAction.BLANK_AWAIT, dl.ReadPolicyAction.ANNOTATE)
+
+    assert dl.read_policy_action(
+        dl.ConsumerKind.PLOT_1D,
+        dl.ReadStatus.EVICTED_HYDRATING,
+        method="Overlay",
+        has_accumulator=True,
+    ) is dl.ReadPolicyAction.PRESERVE_EXISTING
+    assert dl.read_policy_action(
+        dl.ConsumerKind.PLOT_1D,
+        dl.ReadStatus.EVICTED_HYDRATING,
+        method="Single",
+        has_accumulator=True,
+    ) is dl.ReadPolicyAction.BLANK_AWAIT
+
+
 def test_accumulate_waterfall_builds_and_appends_monotonically():
     np = pytest.importorskip("numpy")
     x = np.array([0.0, 1.0, 2.0])
