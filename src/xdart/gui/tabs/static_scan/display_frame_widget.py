@@ -1489,17 +1489,33 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if (len(self.frame_ids) == 0) or (self.scan.name == 'null_main'):
             return False
 
-        if len(self.idxs_1d) == 0:
-            return False
-
         store = getattr(self, 'publication_store', None)
         if store is not None:
+            # A selected publication can be known to the store while its heavy 1D
+            # row is evicted.  Let the typed display path run anyway: it queues
+            # hydration and, for Overlay/Waterfall, re-emits the accumulator
+            # instead of taking the empty-state path that clears it.
+            labels = tuple(getattr(self, 'idxs', ()) or ())
             try:
-                if any(store.get(int(idx)) is not None for idx in self.idxs_1d):
+                if any(store.get(int(idx)) is not None for idx in labels):
                     return True
             except Exception:
                 logger.debug("publication-store readiness check failed",
                              exc_info=True)
+            try:
+                method = self.ui.plotMethod.currentText()
+            except Exception:
+                method = None
+            history = getattr(self, "_waterfall_history", None)
+            has_history = bool(
+                getattr(self, "overlaid_idxs", None)
+                or (history is not None and getattr(history, "count", 0))
+            )
+            if method in ("Overlay", "Waterfall") and has_history:
+                return True
+
+        if len(self.idxs_1d) == 0:
+            return False
 
         if len(self.data_1d) == 0:
             return False

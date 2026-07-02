@@ -2772,6 +2772,140 @@ def test_update_render_smoke_stale_generation_is_dropped():
     assert calls == []                        # nothing drawn or cleared
 
 
+def test_update_store_evicted_overlay_selection_preserves_history_and_hydrates():
+    from xdart.gui.tabs.static_scan.display_logic import WaterfallHistory
+    from xdart.modules.frame_publication import (
+        PublicationStore,
+        publication_from_live_frame,
+    )
+    from xrd_tools.core.containers import IntegrationResult1D
+
+    x = np.linspace(0.5, 5.0, 8, dtype=np.float32)
+
+    def _frame(i):
+        return SimpleNamespace(
+            idx=i,
+            int_1d=IntegrationResult1D(
+                radial=x,
+                intensity=np.full(x.shape, float(i), dtype=np.float32),
+                sigma=np.ones_like(x),
+                unit="q_A^-1",
+            ),
+            int_2d=None,
+            map_raw=None,
+            mask=None,
+            gi=False,
+            gi_2d={},
+            thumbnail=None,
+            bg_raw=0,
+            scan_info={},
+            source_file=f"f{i}.tif",
+            source_frame_idx=i,
+        )
+
+    store = PublicationStore(max_heavy_items=1)
+    store.upsert(publication_from_live_frame(_frame(10)))
+    store.upsert(publication_from_live_frame(_frame(11)))
+    assert store.get(10) is not None and not store.get(10).view.has_1d
+
+    initial_ids = (8, 9)
+    initial_history = WaterfallHistory(
+        reset_key=("scan.nxs", False),
+        unit="Å⁻¹",
+        label="Q",
+        x=x,
+        rows=np.vstack([np.full(x.shape, float(i)) for i in initial_ids]),
+        ids=initial_ids,
+        names=tuple(f"scan_{i}" for i in initial_ids),
+    )
+    calls = []
+    queued = []
+    host = SimpleNamespace(
+        viewer_mode=None,
+        publication_store=store,
+        display_generation=1,
+        _last_selection_sig=None,
+        frame_ids=["10"],
+        idxs=[],
+        idxs_1d=[],
+        idxs_2d=[],
+        overall=False,
+        overlaid_idxs=list(initial_ids),
+        _waterfall_history=initial_history,
+        plot_data=[x, initial_history.rows],
+        plot_data_range=[[float(x[0]), float(x[-1])], [8.0, 9.0]],
+        frame_names=list(initial_history.names),
+        bkg_1d=None,
+        _payload_x_axis_label=None,
+        _payload_y_axis_label=None,
+        _using_publication_plot_payload=False,
+        _plot_axis_info=[{"source": "1d"}],
+        data_lock=RLock(),
+        data_1d={},
+        data_2d={},
+        scan=SimpleNamespace(
+            scan_lock=RLock(),
+            frames=SimpleNamespace(index=[10, 11]),
+            gi=False,
+            skip_2d=True,
+            name="scan",
+            data_file="scan.nxs",
+            bai_1d_args={},
+            bai_2d_args={},
+        ),
+        ui=SimpleNamespace(
+            plotMethod=SimpleNamespace(currentText=lambda: "Overlay"),
+            plotUnit=SimpleNamespace(
+                currentText=lambda: "Q (Å⁻¹)",
+                currentIndex=lambda: 0,
+            ),
+            slice=SimpleNamespace(
+                isChecked=lambda: False,
+                isEnabled=lambda: False,
+            ),
+        ),
+        normalize=lambda data, metadata: data,
+        _request_frame_hydration=lambda label, *, purpose="full":
+            queued.append((int(label), purpose)),
+        _apply_share_axis_state=lambda: calls.append("share_axis"),
+        _apply_1d_only_visibility=lambda: calls.append("layout"),
+        update_plot_view=lambda: calls.append("payload_plot"),
+        clear_image_view=lambda: calls.append("clear_image"),
+        clear_binned_view=lambda: calls.append("clear_binned"),
+        clear_plot_view=lambda: calls.append("clear_plot"),
+        update_2d_label=lambda: calls.append("label_2d"),
+        _update_image_preview=lambda: calls.append("preview"),
+    )
+    for name in (
+        "get_idxs",
+        "_selection_generation_signature",
+        "_sync_selection_generation",
+        "_note_selection_generation",
+        "_bump_display_generation",
+        "_active_stitch_mode",
+        "_live_mode",
+        "_live_display_state",
+        "_updated",
+        "_draw_delegate",
+        "_clear_delegate",
+        "_payload_for_role",
+        "_draw_payload",
+        "render_display",
+        "update",
+        "_update_impl",
+    ):
+        setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
+
+    assert host.update() is True
+
+    assert queued == [(10, "1d")]
+    assert "payload_plot" in calls
+    assert "clear_plot" not in calls
+    assert host._waterfall_history.ids == initial_ids
+    assert host.overlaid_idxs == list(initial_ids)
+    assert host._display_blanked is False
+
+
 def _render_host():
     """A host that records which draw/clear delegates render_display calls."""
     from unittest.mock import MagicMock
