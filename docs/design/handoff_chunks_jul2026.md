@@ -26,7 +26,7 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 |----|-------|--------|------|---------|---------|-------|
 | RC-1 | MIGRATION mask-file + old-package notes | S | none | v1.0 promise kept | — | **DONE** `ddacbc0e` |
 | RC-2 | Flush floor + comment sync | S | low | live-checkpoint protection | — | **DONE** `4d2f3957` |
-| RC-3 | N-2 h5sig filter/chunk pinning + one re-pin | S | low | byte-gate sees filter drift before W | — | **DONE** this commit |
+| RC-3 | N-2 h5sig filter/chunk pinning + one re-pin | S | low | byte-gate sees filter drift before W | — | **DONE** `843b9f84` |
 | RC-4 | Deferred ledger re-homed + citations | S | none | planning survives git clean | — | **DONE** `ddacbc0e` |
 | RC-5 | Packaging: license fix, LICENSE, README, stubs, install scripts | S | low | correct PyPI metadata | — | **DONE** `c0535d21` |
 | RC-6 | Doc-ledger truth fixes + FLOOR salvage | S | none | agents read true state | — | **DONE** `ddacbc0e` |
@@ -40,20 +40,20 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 | MS-1 | Run-end count reconciliation + counter fix + shadow-drop lock | S | low | silent in-flight drop now visible | — | **DONE** `4d3e2b3c` |
 | H12 | Liveness step-5 render leg (level-reuse, subsampled percentile) | M | low | last big live-smoothness lever | — | **DONE** `7fb20748` (A6 live-verify pending) |
 | H13(a-c) | Timer safety: LD-1 load-debounce cancel, alias fix, reint-timer stop, pool race, non-blocking teardown, XYE cache, **BR-1** browser-select no-clear | S×7 | low-med | wrong-file pollute + last stalls + BR-1 | Wave 1 | **DONE** `b8e62542` (LD-1/BR-1 live-verify pending) |
-| H-hyd | Hydration purpose-scoping residuals (full→1d leaks, dedupe key, Sum/Avg churn) | S×4 | low | no 60MB/frame churn loops | H7-gate | **DONE** this commit |
+| H-hyd | Hydration purpose-scoping residuals (full→1d leaks, dedupe key, Sum/Avg churn) | S×4 | low | no 60MB/frame churn loops | H7-gate | **DONE** `cba5995c` |
 | RC-FV | Final verification (full suite, strict-tree, build, staging) | S | none | certifies the tag commit | Waves 1-3 | **QUEUED** (`release_final_verification.md`) |
 | RC-7s | Maintainer live Session-1 | — | — | closes every fixed-unverified row | RC-FV | **PENDING** (maintainer) |
 | RC-8 | Merge → tag v1.0.0 → publish + stubs + branch cleanup | S | low | **v1.0.0 on PyPI** | RC-7s, repo-public decision | **PENDING** (maintainer) |
 
-### Post-tag: greenfield (store/session collapse)
+### Greenfield (store/session collapse) — H6/H8/H9/H22 pulled PRE-tag (2026-07-02); only H10/H11/H29/H24 remain post-tag
 | ID | Chunk | Effort | Risk | Payback | Prereqs | State |
 |----|-------|--------|------|---------|---------|-------|
-| H6 (W) | Per-mode subgroup writes, GUI+headless via one path; production multi-mode spine gate | M | med | Round-11 durability closed; multi-mode seam real | RC-3✓, H1✓ | **DONE** this commit |
-| H8 (8a) | PublicationStore → bounded projection; delete legacy fallback; explicit-subset gate | M/L | med (was high; H7✓+H1✓+H6✓ de-risked) | triple-store divergence class impossible | H6✓, H7✓, Session-2 live gate | open |
-| H9 (8b) | Delete Role-A `data_1d/data_2d/hydrated_raw` (~76 refs; keep Role-B) | M | med | **greenfield done-test**; ~0.5-1GB mirrors gone; H7b completes | H8 | open |
+| H6 (W) | Per-mode subgroup writes, GUI+headless via one path; production multi-mode spine gate | M | med | Round-11 durability closed; multi-mode seam real | RC-3✓, H1✓ | **DONE** `c0b80b02` |
+| H8 (8a) | PublicationStore → bounded projection; delete legacy fallback; explicit-subset gate | M/L | med (was high; H7✓+H1✓+H6✓ de-risked) | triple-store divergence class impossible | H6✓, H7✓, Session-2 live gate | **IN-FLIGHT** (Wave 4, `h8_8a_store_flip.md`; incl. H2+H3 commit-0 + Wave-3 retry-counter carry-in; live gate folded into Session-1 §E) |
+| H9 (8b) | Delete Role-A `data_1d/data_2d/hydrated_raw` (~76 refs; keep Role-B) | M | med | **greenfield done-test**; ~0.5-1GB mirrors gone; H7b completes | H8 | **QUEUED** (Wave 5a, `h9_8b_retire_mirrors.md` — pulled PRE-tag) |
 | H10 (7c) | Cadence/eviction policy → session + `max_heavy_bytes` | M | low-med | second-sink recipe; detector-aware caps | H9, ADR-0005 reaffirm | open (ADR decision owed) |
-| H2 | Thin-tail axis-interning / max_items | S | low | long-scan memory bounded | — | open |
-| H3 | Memory-plateau acceptance gate | S | low | boundedness regression-detected | — | open |
+| H2 | Thin-tail axis-interning / max_items | S | low | long-scan memory bounded | — | riding H8 commit-0 |
+| H3 | Memory-plateau acceptance gate | S | low | boundedness regression-detected | — | riding H8 commit-0 |
 | H11 | ViewerModeHandler seam | M | low | new viewers register, not shotgun-edit | rides H8/H9 | open |
 | H29 (D1) | Reintegrate-All + chunked replace-save (M4) | M/L | med | top missing feature, no 10GB OOM | H1✓; session machinery | open |
 | H24 | ewald live model → session | L | high | thin-GUI mass; "xdart owns no data" true | H9; do last | open |
@@ -76,7 +76,7 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 | ID | Chunk | Effort | Risk | Payback | Prereqs | State |
 |----|-------|--------|------|---------|---------|-------|
 | H17 | Source-registry seam tests + SourceKind policy | S | low | Tiled/Bluesky additive | — | open |
-| H22 | Stage 5.5: `display_logic` → xrd_tools | M | low | 1.7k LOC decision core headless | H9 | open |
+| H22 | Stage 5.5: `display_logic` → xrd_tools | M | low | 1.7k LOC decision core headless | H9 | **QUEUED** (Wave 5b, `h22_display_logic_headless.md` — pulled PRE-tag) |
 | H23 | nexus_writer schema convergence | M/L | med | one on-disk-contract owner | H6 | open |
 | H25 | Placement ratchet + xrd_tools/gui disposition | S | low | shell can't re-thicken silently | — | open |
 | H28 | ADR-0006 STEP 2 prepass deletion | M | med | dual-prepass risk retired | live gate slot | open |
@@ -193,7 +193,7 @@ Lane D (tests/bounds):  {H2, H3, H4, H5} — anytime, no dependencies
 |----|-------|------|-----------|--------|
 | H1 | mark_persisted mode-scoping (A1) | S | — | open |
 | H2 | FrameRecordStore thin-tail bound / axis interning (A4) | S/M | — | open |
-| H3 | Memory-plateau acceptance gate (A4) | S | — | open |
+| H3 | Memory-plateau acceptance gate (A4) | S | — | riding H8 commit-0 |
 | H4 | `_set_1d_cache_limit(None)` footgun (A4) | S | — | open |
 | H5 | Stage-6 parity test (A8) | S | — | open |
 | H6 | W: per-mode subgroup write wiring + production multi-mode spine gate (A2) | M | H1, RC-3 | done (this commit) |
