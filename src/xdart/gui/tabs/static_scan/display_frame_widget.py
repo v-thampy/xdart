@@ -680,6 +680,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._async_hydration_enabled = False
         self._hydration_pending_labels = set()
         self._pending_hydration_render = False
+        self._pending_hydration_generation = None
         self._last_hydration_render = 0.0
         self._hydration_quiet_timer = Coalescer(250, mode="debounce", parent=self)
         self._hydration_quiet_timer.triggered.connect(
@@ -687,6 +688,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._hydration_progress_timer = Coalescer(1000, mode="throttle", parent=self)
         self._hydration_progress_timer.triggered.connect(
             self._flush_hydration_progress_render)
+        self._current_selection_repaint_generation = None
+        self._current_selection_repaint_pending = False
+        self._current_selection_repaint_timer = Coalescer(
+            0, mode="throttle", parent=self)
+        self._current_selection_repaint_timer.triggered.connect(
+            self._flush_current_selection_repaint)
         # Step 7b: off-GUI-thread whole-scan aggregation (Sum/Average over a scan
         # longer than the bounded store).  The worker computes from the on-disk
         # stack ⊕ in-memory tail; results are cached per (dim, method, channel)
@@ -970,6 +977,31 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     # ── Display generation (Stage 2) ──────────────────────────────────
 
+    def _selection_generation_signature(self):
+        """Return the current user-visible selection identity.
+
+        This intentionally reads ``frame_ids`` when available instead of waiting
+        for ``get_idxs()``: hydration completions can arrive between a browser
+        selection change and the next admitted render, and those completions
+        must be dropped against the new selection before they can request a
+        repaint.  Duck-widget tests that only expose ``idxs`` keep the legacy
+        signature.
+        """
+        ids = getattr(self, "frame_ids", None)
+        if ids is None:
+            ids = getattr(self, "idxs", ())
+        try:
+            ids = tuple(ids)
+        except TypeError:
+            ids = (ids,)
+        norm_ids = []
+        for idx in ids:
+            try:
+                norm_ids.append(int(idx))
+            except (TypeError, ValueError):
+                norm_ids.append(str(idx))
+        return (tuple(norm_ids), bool(getattr(self, "overall", False)))
+
     def _bump_display_generation(self):
         """Advance the monotonic display generation.  A render/worker result
         stamped with an older generation is stale and may be dropped (full
@@ -979,6 +1011,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if pending_hydration is not None:
             pending_hydration.clear()
         self._pending_hydration_render = False
+        self._pending_hydration_generation = None
+        self._current_selection_repaint_generation = None
+        self._current_selection_repaint_pending = False
+        repaint_timer = getattr(self, "_current_selection_repaint_timer", None)
+        cancel_repaint = getattr(repaint_timer, "cancel", None)
+        if callable(cancel_repaint):
+            cancel_repaint()
         worker = getattr(self, "_hydration_worker", None)
         cancel = getattr(worker, "cancel_stale_before", None)
         if callable(cancel):
@@ -987,6 +1026,82 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if pending is not None:
             pending.clear()
         return self.display_generation
+
+    def _sync_selection_generation(self):
+        """Bring ``display_generation`` current with the selection before a
+        deferred trigger is admitted.
+
+        The ordinary render path also calls this through
+        ``_note_selection_generation``.  The separate entry point exists for
+        async completions and worker absorptions, where accepting the old
+        generation even briefly can paint a stale frame during fast selection.
+        """
+        signature = getattr(self, "_selection_generation_signature", None)
+        if signature is None:
+            signature = displayFrameWidget._selection_generation_signature.__get__(
+                self, type(self))
+        sig = signature()
+        if sig != getattr(self, "_last_selection_sig", None):
+            if getattr(self, "_last_selection_sig", None) is not None:
+                self._bump_display_generation()
+            self._last_selection_sig = sig
+        return self.display_generation
+
+    def request_current_selection_repaint(self, *, generation=None,
+                                          reason=None) -> bool:
+        """Latest-wins repaint request for async data availability.
+
+        Callers pass the generation their work was requested under.  If the
+        user has since moved the selection, this syncs and drops the stale
+        request.  A request never carries a frame label; the eventual render
+        snapshots the current widget selection and merges whatever data is now
+        resident.
+        """
+        try:
+            current_generation = self._sync_selection_generation()
+        except Exception:
+            logger.debug("selection-generation sync failed", exc_info=True)
+            current_generation = self.display_generation
+        if generation is not None:
+            try:
+                generation = int(generation)
+            except (TypeError, ValueError):
+                pass
+            if generation != current_generation:
+                return False
+        self._current_selection_repaint_generation = current_generation
+        self._current_selection_repaint_pending = True
+        timer = getattr(self, "_current_selection_repaint_timer", None)
+        if timer is not None:
+            try:
+                timer.start()
+                return True
+            except Exception:
+                logger.debug("current-selection repaint timer failed",
+                             exc_info=True)
+        self._flush_current_selection_repaint()
+        return True
+
+    def _flush_current_selection_repaint(self):
+        if not getattr(self, "_current_selection_repaint_pending", False):
+            return True
+        self._current_selection_repaint_pending = False
+        generation = getattr(self, "_current_selection_repaint_generation", None)
+        self._current_selection_repaint_generation = None
+        if generation is not None:
+            try:
+                generation = int(generation)
+            except (TypeError, ValueError):
+                pass
+            if generation != self.display_generation:
+                return True
+        update = getattr(self, "update", None)
+        if not callable(update):
+            return True
+        try:
+            return update(expected_generation=generation)
+        except TypeError:
+            return update()
 
     # ── D2: off-GUI-thread frame hydration (greenfield Phase 3) ──────────────
     def enable_async_hydration(self) -> None:
@@ -1055,6 +1170,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._pending_hydration_render = False
         import time
         self._last_hydration_render = time.monotonic()
+        generation = getattr(self, "_pending_hydration_generation", None)
+        self._pending_hydration_generation = None
+        request = getattr(self, "request_current_selection_repaint", None)
+        if callable(request):
+            request(generation=generation, reason="hydration")
+            return
         try:
             self.update()
         except Exception:
@@ -1092,9 +1213,16 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if pending is not None:
             for label_key in label_keys:
                 pending.discard(label_key)
-        if int(generation) != self.display_generation:
+        try:
+            generation = int(generation)
+        except (TypeError, ValueError):
+            pass
+        sync = getattr(self, "_sync_selection_generation", None)
+        current_generation = sync() if callable(sync) else self.display_generation
+        if generation != current_generation:
             return
         self._pending_hydration_render = True
+        self._pending_hydration_generation = generation
         quiet = getattr(self, "_hydration_quiet_timer", None)
         if quiet is not None:
             quiet.start()
@@ -1238,6 +1366,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             # repaint loop; the next scan/display update will retry.
             return
         self._agg_cache[key] = (generation, result)
+        request = getattr(self, "request_current_selection_repaint", None)
+        if callable(request):
+            request(generation=generation, reason="aggregation")
+            return
         try:
             self.update()
         except Exception:
@@ -1269,16 +1401,16 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def _note_selection_generation(self):
         """Bump the generation when the *effective* selection changes.
 
-        Keyed on the resolved ``idxs`` (+ overall), so it is robust to how
-        ``frame_ids`` was mutated (assignment, ``.clear()``, ``.append()``).
+        The signature is shared with async repaint admission so fast browser
+        selection changes are visible before the next full ``update()`` enters.
         A new scan/file load resets the selection, so this also covers most
-        load events; explicit load-lifecycle bumps land with the
-        controllers in Stage 5.  The first call only records the baseline."""
-        sig = (tuple(self.idxs), bool(self.overall))
-        if sig != self._last_selection_sig:
-            if self._last_selection_sig is not None:
-                self._bump_display_generation()
-            self._last_selection_sig = sig
+        load events; explicit load-lifecycle bumps land with the controllers in
+        Stage 5.  The first call only records the baseline."""
+        sync = getattr(self, "_sync_selection_generation", None)
+        if sync is None:
+            sync = displayFrameWidget._sync_selection_generation.__get__(
+                self, type(self))
+        sync()
 
     def _active_stitch_mode(self):
         """``'1d'``/``'2d'`` when the persistent stitch display should show, else
@@ -1373,7 +1505,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         return True
 
-    def update(self):
+    def update(self, *, expected_generation=None):
         """Re-entrancy-guarded panel update.
 
         Drops a RE-ENTRANT call (a signal — aggregate-worker completion,
@@ -1382,6 +1514,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         on the next event-loop-driven update.  Defense-in-depth so a pathological
         render chain can never starve the event loop into a hard freeze.
         """
+        if expected_generation is not None:
+            try:
+                expected_generation = int(expected_generation)
+            except (TypeError, ValueError):
+                pass
+            if expected_generation != self.display_generation:
+                return True
         if getattr(self, "_in_update", False):
             return True
         self._in_update = True

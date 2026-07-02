@@ -167,6 +167,65 @@ def test_on_frame_hydrated_accepts_batched_1d_labels():
     assert rendered == [True]
 
 
+def test_hydration_completion_requests_current_selection_repaint():
+    requests = []
+    rendered = []
+    h = SimpleNamespace(
+        display_generation=7,
+        _hydration_pending_labels={4},
+        _pending_hydration_render=False,
+        _pending_hydration_generation=None,
+    )
+    h.update = lambda: rendered.append(True)
+    h.request_current_selection_repaint = (
+        lambda *, generation=None, reason=None:
+            requests.append((generation, reason)) or True
+    )
+    h._flush_hydration_render = MethodType(
+        displayFrameWidget._flush_hydration_render, h)
+    h._on_frame_hydrated = MethodType(
+        displayFrameWidget._on_frame_hydrated, h)
+
+    h._on_frame_hydrated(4, 7)
+
+    assert h._hydration_pending_labels == set()
+    assert requests == [(7, "hydration")]
+    assert rendered == []                    # completion never plots its label
+
+
+def test_hydration_completion_drops_when_selection_changed_before_update():
+    requests = []
+    h = SimpleNamespace(
+        display_generation=7,
+        _last_selection_sig=((1,), False),
+        frame_ids=["2"],
+        overall=False,
+        _hydration_pending_labels={1},
+        _pending_hydration_render=False,
+        _pending_hydration_generation=None,
+    )
+    h.request_current_selection_repaint = (
+        lambda *, generation=None, reason=None:
+            requests.append((generation, reason)) or True
+    )
+    h._bump_display_generation = MethodType(
+        displayFrameWidget._bump_display_generation, h)
+    h._selection_generation_signature = MethodType(
+        displayFrameWidget._selection_generation_signature, h)
+    h._sync_selection_generation = MethodType(
+        displayFrameWidget._sync_selection_generation, h)
+    h._flush_hydration_render = MethodType(
+        displayFrameWidget._flush_hydration_render, h)
+    h._on_frame_hydrated = MethodType(
+        displayFrameWidget._on_frame_hydrated, h)
+
+    h._on_frame_hydrated(1, 7)
+
+    assert h.display_generation == 8
+    assert requests == []
+    assert h._pending_hydration_render is False
+
+
 def test_hydration_completion_stream_coalesces_rerenders():
     rendered = []
 

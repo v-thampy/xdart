@@ -926,6 +926,88 @@ def test_overlay_selection_of_evicted_frame_preserves_then_appends():
     assert set(payload.plot_history.ids) >= {6, 99}
 
 
+def test_overlay_many_frame_selection_converges_after_out_of_order_hydration():
+    from xdart.gui.tabs.static_scan.display_controllers import ScanDisplayController
+    from xdart.gui.tabs.static_scan.display_logic import Mode
+    from xdart.gui.tabs.static_scan.display_publication import (
+        PublicationDisplayAdapter)
+    from xdart.modules.frame_publication import (
+        PublicationStore, publication_from_live_frame)
+    from xrd_tools.core.containers import IntegrationResult1D
+
+    x = np.linspace(0.5, 5.0, 8, dtype=np.float32)
+
+    def _frame(i):
+        return SimpleNamespace(
+            idx=i,
+            int_1d=IntegrationResult1D(
+                radial=x, intensity=np.full(x.shape, float(i), dtype=np.float32),
+                sigma=np.ones_like(x), unit="q_A^-1"),
+            int_2d=None, map_raw=None, mask=None, gi=False, gi_2d={},
+            thumbnail=None, bg_raw=0, scan_info={}, source_file=f"f{i}.tif",
+            source_frame_idx=i,
+        )
+
+    store = PublicationStore(max_heavy_items=64)
+    for i in range(100):
+        store.upsert(publication_from_live_frame(_frame(i)))
+    evicted_at_start = {
+        i for i in range(100) if not store.get(i).view.has_1d
+    }
+    assert evicted_at_start and 99 not in evicted_at_start
+
+    queued = set()
+    widget = SimpleNamespace(
+        publication_store=store,
+        viewer_mode=None,
+        data_lock=RLock(),
+        data_1d={},
+        data_2d={},
+        frame_ids=[str(i) for i in range(100)],
+        overlaid_idxs=[],
+        _waterfall_history=None,
+        display_generation=1,
+        normChannel=None,
+        scan=SimpleNamespace(
+            name="scan", data_file="scan.nxs", gi=False,
+            bai_1d_args={}, bai_2d_args={},
+            scan_lock=RLock(),
+            frames=SimpleNamespace(index=list(range(100))),
+        ),
+        ui=SimpleNamespace(
+            plotMethod=SimpleNamespace(currentText=lambda: "Overlay"),
+            plotUnit=SimpleNamespace(currentText=lambda: "Q (Å⁻¹)",
+                                     currentIndex=lambda: 0),
+            slice=SimpleNamespace(isChecked=lambda: False, isEnabled=lambda: False),
+        ),
+        _request_missing_publication=lambda label: queued.add(int(label)),
+    )
+
+    def render():
+        state = ScanDisplayController().compute_state(widget, Mode.INT_1D)
+        labels = tuple(dict.fromkeys((*state.selected_ids, *state.render_ids)))
+        adapter = PublicationDisplayAdapter(store, widget=widget, labels=labels)
+        payload = adapter.plot_payload(state)
+        if payload is not None and payload.plot_history is not None:
+            widget._waterfall_history = payload.plot_history
+            widget.overlaid_idxs = list(payload.overlaid_ids)
+        return state, payload
+
+    state, payload = render()
+    assert payload is not None and payload.plot_history is not None
+    assert payload.plot_history.count == 100 - len(evicted_at_start)
+    assert queued == evicted_at_start
+
+    completion_order = sorted(evicted_at_start)[::2] + sorted(evicted_at_start)[1::2]
+    for label in completion_order:
+        store.upsert(publication_from_live_frame(_frame(label)))
+        state, payload = render()
+        assert payload is not None and payload.plot_history is not None
+
+    assert payload.plot_history.count == 100
+    assert set(payload.plot_history.ids) == set(range(100))
+
+
 def test_waterfall_history_payload_decimates_display_rows_only():
     from xdart.gui.tabs.static_scan.display_logic import WaterfallHistory
     from xdart.gui.tabs.static_scan.display_publication import (
