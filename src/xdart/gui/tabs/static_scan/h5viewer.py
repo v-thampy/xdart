@@ -14,6 +14,7 @@ from queue import Empty
 logger = logging.getLogger(__name__)
 
 _ORPHANED_FILE_THREADS = []
+_ORPHANED_LOAD_WORKERS = []
 
 
 def _retain_orphaned_file_thread(thread) -> None:
@@ -37,6 +38,25 @@ def _retain_orphaned_file_thread(thread) -> None:
 
     try:
         thread.finished.connect(_forget_thread)
+    except Exception:
+        pass
+
+
+def _retain_orphaned_load_worker(worker, thread) -> None:
+    """Keep a cancelled load worker/thread alive until Qt finishes it."""
+    token = (worker, thread)
+    if token in _ORPHANED_LOAD_WORKERS:
+        return
+    _ORPHANED_LOAD_WORKERS.append(token)
+
+    def _forget_worker():
+        try:
+            _ORPHANED_LOAD_WORKERS.remove(token)
+        except ValueError:
+            pass
+
+    try:
+        thread.finished.connect(_forget_worker)
     except Exception:
         pass
 
@@ -217,29 +237,30 @@ class _LoadFramesWorker(QtCore.QObject):
                     self.cancelled.emit(self.generation)
                     return
                 try:
-                    file = pool.get(self.data_file)
-                except (FileNotFoundError, OSError) as e:
-                    # The scan file doesn't exist / can't be opened (e.g. a
-                    # default placeholder path before any scan is saved, or a
-                    # deleted file).  Bail cleanly rather than letting it reach
-                    # the top-level "crashed unexpectedly" handler.
-                    logger.debug(
-                        "load worker gen=%s: data file unavailable (%s); "
-                        "stopping", self.generation, e,
-                    )
-                    break
-                if file is None:
-                    # Writer paused the pool — exit gracefully; the
-                    # writer's resume() will trigger a sigUpdate
-                    # that re-fires the GUI's data_changed slot.
-                    logger.debug(
-                        "load worker gen=%s: pool paused at idx=%s; "
-                        "stopping",
-                        self.generation, idx,
-                    )
-                    break
-                try:
                     with self.file_lock:
+                        try:
+                            file = pool.get(self.data_file)
+                        except (FileNotFoundError, OSError) as e:
+                            # The scan file doesn't exist / can't be opened
+                            # (e.g. a default placeholder path before any scan
+                            # is saved, or a deleted file). Bail cleanly rather
+                            # than letting it reach the top-level "crashed
+                            # unexpectedly" handler.
+                            logger.debug(
+                                "load worker gen=%s: data file unavailable "
+                                "(%s); stopping", self.generation, e,
+                            )
+                            break
+                        if file is None:
+                            # Writer paused the pool — exit gracefully; the
+                            # writer's resume() will trigger a sigUpdate that
+                            # re-fires the GUI's data_changed slot.
+                            logger.debug(
+                                "load worker gen=%s: pool paused at idx=%s; "
+                                "stopping",
+                                self.generation, idx,
+                            )
+                            break
                         frame = _load_frame_v2(file, idx, static=True,
                                              gi=self.gi)
                 except (KeyError, IndexError, OSError, ValueError) as e:
@@ -741,6 +762,7 @@ class H5Viewer(QWidget):
         self._pending_load_2d = True
         self._load_coalesce_timer = Coalescer(100, mode="debounce", parent=self)
         self._load_coalesce_timer.triggered.connect(self._flush_pending_load)
+        self._xye_parse_cache = {}
         # Fast shift+arrow selection sweeps can emit itemSelectionChanged dozens
         # of times per second.  Debounce the whole normal-mode body so the O(k)
         # selection parse / cache-probe work runs once for the final selection,
@@ -1025,7 +1047,7 @@ class H5Viewer(QWidget):
             if self.new_scan_loaded:
                 self.new_scan_loaded = False
                 self.ui.listData.setCurrentRow(-1)
-                self.frame_ids = []
+                self.frame_ids.clear()
                 self._remember_displayed_frames()
                 return
             if self.auto_last and isinstance(self.latest_idx, int) and str(self.latest_idx) in _idxs:
@@ -1323,14 +1345,30 @@ class H5Viewer(QWidget):
         self.frame_ids.clear()
 
         idx = 1
+        cache = getattr(self, '_xye_parse_cache', None)
+        if cache is None:
+            cache = {}
+            self._xye_parse_cache = cache
         for item in selected:
             item_text = item.text()
             # Skip directories
             if item_text == '..' or item_text.endswith('/'):
                 continue
             fpath = os.path.join(self.dirname, item_text)
+            abspath = os.path.abspath(fpath)
             try:
-                xdata, ydata, sigma = read_xye(fpath)
+                mtime = os.path.getmtime(abspath)
+                key = (abspath, mtime)
+                cached = cache.get(key)
+                if cached is None:
+                    cached = read_xye(abspath)
+                    cache[key] = cached
+                    for old_key in [
+                        old for old in cache
+                        if old[0] == abspath and old != key
+                    ]:
+                        cache.pop(old_key, None)
+                xdata, ydata, sigma = cached
             except Exception:
                 logger.debug("Could not load xye file %s", fpath, exc_info=True)
                 continue
@@ -2195,6 +2233,7 @@ class H5Viewer(QWidget):
                 return
         if fname != '':
             try:
+                self.cancel_pending_loads()
                 # with self.file_lock:
                 #     with catch_h5py_file(fname, 'a') as _:
                 #         pass
@@ -2419,6 +2458,7 @@ class H5Viewer(QWidget):
         # the live path needs, so skip the wipe while a run is active.
         if self.live_run_active:
             return
+        self.cancel_pending_loads()
         self._h5pool.close(self.scan.data_file)
         self.frames.clear()
         self.frame_ids.clear()
@@ -2520,20 +2560,14 @@ class H5Viewer(QWidget):
             )
             self.cancel_pending_loads()
             return
-        # Deterministically retire any in-flight worker BEFORE we drop our
-        # refs to it: cancel + quit + bounded wait so its event loop runs
-        # the worker's deleteLater and exits.  Dropping the ref without this
-        # (the old non-waiting cancel) let GC direct-delete a moveToThread'd
-        # worker whose deleteLater lost the race with thread.quit → "shared
-        # QObject was deleted directly" segfault.
-        self._teardown_load_worker()
+        # N1: bump the generation counter before retiring the outgoing worker
+        # so any chunk queued from the old selection is rejected immediately.
+        self._load_generation += 1
+        gen = self._load_generation
+        self._retire_load_worker_for_reselection()
 
         # Spin up the new worker.  Lives on its own QThread; both get
         # cleaned up after ``finished`` signals via deleteLater.
-        # N1: bump the generation counter so any in-flight chunks
-        # from the previous worker are dropped.
-        self._load_generation += 1
-        gen = self._load_generation
         worker = _LoadFramesWorker(
             data_file=data_file,
             file_lock=self.file_lock,
@@ -2721,10 +2755,37 @@ class H5Viewer(QWidget):
         timer = getattr(self, '_update_coalesce_timer', None)
         if timer is not None and timer.isActive():
             timer.stop()
+        timer = getattr(self, '_load_coalesce_timer', None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+        self._pending_load_ids = None
         timer = getattr(self, '_selection_coalesce_timer', None)
         if timer is not None and timer.isActive():
             timer.stop()
         self._pending_data_changed = False
+
+    def _retire_load_worker_for_reselection(self) -> None:
+        """Cancel the old selection worker without blocking the GUI thread."""
+        worker = getattr(self, '_load_worker', None)
+        thread = getattr(self, '_load_thread', None)
+        if worker is not None and _qt_isvalid(worker):
+            try:
+                worker.cancel()
+            except (RuntimeError, AttributeError):
+                pass
+        if thread is not None and _qt_isvalid(thread):
+            try:
+                if thread.isRunning():
+                    thread.quit()
+            except (RuntimeError, AttributeError):
+                pass
+            try:
+                thread.setParent(None)
+            except (RuntimeError, AttributeError):
+                pass
+            _retain_orphaned_load_worker(worker, thread)
+        self._load_worker = None
+        self._load_thread = None
 
     def shutdown_threads(self) -> None:
         """Stop the persistent background threads this viewer owns so they are

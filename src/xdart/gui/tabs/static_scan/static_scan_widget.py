@@ -4525,12 +4525,34 @@ class staticWidget(QWidget):
         # (this is the only frame-selection path that reaches set_data; the
         # scan-select deselect is signal-blocked, so it never fires here).
         if getattr(self.h5viewer, "_browser_scan_reset_pending", False):
+            selected_ids = [
+                str(frame_id)
+                for frame_id in getattr(self.h5viewer, "frame_ids", ())
+                if str(frame_id) and str(frame_id) != "No data"
+            ]
+            if not selected_ids:
+                try:
+                    selected_ids = [
+                        str(item.text())
+                        for item in self.h5viewer.ui.listData.selectedItems()
+                        if str(item.text()) and str(item.text()) != "No data"
+                    ]
+                except Exception:
+                    selected_ids = []
+            if not selected_ids:
+                return
             self.h5viewer._browser_scan_reset_pending = False
             try:
                 self.displayframe.set_axes()
                 self._clear_frame_record_store()   # A-Step (Phase 5): reset the store
                 self.displayframe._clear_bkg()
                 self.h5viewer.data_reset()
+                try:
+                    self.h5viewer.frame_ids[:] = selected_ids
+                except TypeError:
+                    self.h5viewer.frame_ids = list(selected_ids)
+                self.h5viewer.data_changed()
+                return
             except Exception:
                 logger.debug("deferred browser-select reset failed", exc_info=True)
         # In viewer mode, always update display (no scan dependency)
@@ -5402,9 +5424,9 @@ class staticWidget(QWidget):
         self._frame_driven_scan_key = name
         self.frames.clear()
         self.frame_ids.clear()
-        # A-Step (Phase 5): reset the per-scan FrameRecordStore here so it clears on
-        # the frame-driven boundary too (lazily recreated by
-        # _active_frame_record_store, so None is safe + gives each scan a fresh store).
+        # A-Step (Phase 5): reset the per-scan FrameRecordStore here so it clears
+        # on the frame-driven boundary too. The next streaming session installs
+        # its own store; serial/live without one falls back to publication_store.
         self._frame_record_store = None
         self.publication_store.clear()
         # Undrained stash + scan_data row cache from the previous scan.
@@ -5574,6 +5596,9 @@ class staticWidget(QWidget):
         # In sync: flush the previous scan's throttled update, then reset the panel.
         self._update_timer.stop()
         self._list_timer.stop()
+        timer = getattr(self, "_reint_update_timer", None)
+        if timer is not None:
+            timer.stop()
         self._flush_pending_update()
         # Consume the frame-driven flag.  Clear ONLY for a same-name RE-RUN (the
         # frame stream can't detect it — same key); a LATE new_scan whose frames
@@ -5693,6 +5718,9 @@ class staticWidget(QWidget):
         # Flush any pending coalesced update so the final frame is shown.
         self._update_timer.stop()
         self._list_timer.stop()
+        timer = getattr(self, "_reint_update_timer", None)
+        if timer is not None:
+            timer.stop()
         self._flush_pending_update()
 
         # End the live-run window before the end-of-batch reload below:
@@ -5771,7 +5799,26 @@ class staticWidget(QWidget):
                 and getattr(self, '_run_saw_frame', True)):
             written = (getattr(self.wrangler.thread, 'fname', None)
                        or getattr(self.wrangler, 'fname', None))
-            if self._reconcile_h5viewer_frame_list_after_run(written):
+            indexed = self._reconcile_h5viewer_frame_list_after_run(written)
+            processed = None
+            for attr in ("files_processed", "_files_processed",
+                         "_last_files_processed"):
+                value = getattr(self.wrangler.thread, attr, None)
+                if value is not None:
+                    processed = value
+                    break
+            if processed is not None:
+                try:
+                    processed_count = int(processed)
+                    if indexed < processed_count:
+                        logger.warning(
+                            "post-live indexed fewer frames than processed: "
+                            "indexed=%d processed=%d file=%s",
+                            indexed, processed_count, written,
+                        )
+                except (TypeError, ValueError):
+                    logger.debug("invalid files_processed value: %r", processed)
+            if indexed:
                 self._apply_integration_control_state()
 
         # The scan-matches branch delegates to integrator_thread_finished() to

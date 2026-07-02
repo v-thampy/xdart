@@ -5,8 +5,20 @@ finishes.  The live run already pointed file_thread.fname at the output file
 internal=True to get past set_file's same-file dedupe — otherwise the reload and
 the select-last silently no-op and the last frame never appears."""
 from types import SimpleNamespace, MethodType
+import logging
 
 from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+
+class _StopTimer:
+    def __init__(self):
+        self.stopped = 0
+
+    def stop(self):
+        self.stopped += 1
+
+    def trigger(self):
+        pass
 
 
 def _finish_host(tmp_path, *, batch, saw_frame, xye_only=False,
@@ -34,8 +46,9 @@ def _finish_host(tmp_path, *, batch, saw_frame, xye_only=False,
             integrator_thread=SimpleNamespace(
                 isRunning=lambda: reintegrate_running)),
         _exit_run_state=lambda: None,
-        _update_timer=SimpleNamespace(stop=lambda: None),
-        _list_timer=SimpleNamespace(stop=lambda: None, trigger=lambda: None),
+        _update_timer=_StopTimer(),
+        _list_timer=_StopTimer(),
+        _reint_update_timer=_StopTimer(),
         _flush_pending_update=lambda: None,
         thread_state_changed=lambda: None,
         _apply_integration_control_state=lambda: None,
@@ -68,6 +81,7 @@ def test_batch_finish_forces_internal_reload_and_select_last(tmp_path):
     # exactly one reload, forced internal (past the same-file dedupe)
     assert calls == [(nxs, True)], f"expected one internal reload; got {calls}"
     assert h5viewer._auto_select_last_on_finish is True   # select-last armed
+    assert host._reint_update_timer.stopped == 1
 
 
 def test_append_zero_frame_finish_forces_internal_reload(tmp_path):
@@ -87,6 +101,17 @@ def test_nonbatch_run_that_saw_frames_does_not_reload(tmp_path):
     assert calls == [], f"a frames-seen run must not display-reload; got {calls}"
     assert host._loaded_paths == [nxs], \
         f"post-live should populate scan.frames once from the .nxs; got {host._loaded_paths}"
+
+
+def test_post_live_warns_when_indexed_less_than_processed(tmp_path, caplog):
+    host, _h5viewer, _nxs, _calls = _finish_host(
+        tmp_path, batch=False, saw_frame=True)
+    host.wrangler.thread.files_processed = 5
+
+    with caplog.at_level(logging.WARNING):
+        host.wrangler_finished()
+
+    assert "indexed fewer frames than processed" in caplog.text
 
 
 def test_batch_finish_skips_reload_while_reintegrate_running(tmp_path):

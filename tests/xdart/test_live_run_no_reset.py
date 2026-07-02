@@ -118,10 +118,13 @@ def _reset_viewer(live_run_active):
         publication_store=PublicationStore(),
         data_lock=_NullLock(),
         new_scan=False,
+        cancel_calls=0,
     )
     viewer._h5pool.close = lambda f: viewer._h5pool.closed.append(f)
     viewer.frames.clear = lambda: setattr(viewer.frames, "cleared", True)
     viewer.frame_ids.clear = lambda: setattr(viewer.frame_ids, "cleared", True)
+    viewer.cancel_pending_loads = lambda: setattr(
+        viewer, "cancel_calls", viewer.cancel_calls + 1)
     viewer.data_reset = MethodType(H5Viewer.data_reset, viewer)
     return viewer
 
@@ -139,6 +142,7 @@ def test_data_reset_suppressed_during_live_run():
     assert viewer.frames.cleared is False
     assert viewer.frame_ids.cleared is False
     assert viewer._h5pool.closed == []
+    assert viewer.cancel_calls == 0
 
 
 def test_data_reset_clears_when_not_live():
@@ -155,6 +159,7 @@ def test_data_reset_clears_when_not_live():
     assert viewer.frame_ids.cleared is True
     assert viewer._h5pool.closed == ["scan.nxs"]
     assert viewer.new_scan is True
+    assert viewer.cancel_calls == 1
 
 
 # ── Frame-click freeze guard (path #1: data_changed) ───────────────────────

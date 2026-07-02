@@ -3411,6 +3411,8 @@ def test_enter_viewer_mode_cleanup_clears_lists_and_cancels_loader():
         _load_generation=4,
         _load_worker=worker,
         _update_coalesce_timer=timer,
+        _load_coalesce_timer=_FakeTimer(active=True),
+        _pending_load_ids=[1],
         _viewer_image_path="/tmp/old.tif",
         _viewer_image_nframes=10,
         _viewer_is_xdart=True,
@@ -3434,6 +3436,8 @@ def test_enter_viewer_mode_cleanup_clears_lists_and_cancels_loader():
 
     assert worker.cancelled is True
     assert timer.isActive() is False
+    assert viewer._load_coalesce_timer.isActive() is False
+    assert viewer._pending_load_ids is None
     assert viewer._load_generation == 5
     assert viewer.data_1d == {}
     assert viewer.data_2d == {}
@@ -3501,9 +3505,12 @@ def test_fast_selection_sweep_debounces_whole_normal_mode_body():
 def test_cancel_pending_loads_invalidates_late_chunks():
     calls = []
     timer = _FakeTimer(active=True)
+    load_timer = _FakeTimer(active=True)
     viewer = SimpleNamespace(
         _load_generation=7,
         _update_coalesce_timer=timer,
+        _load_coalesce_timer=load_timer,
+        _pending_load_ids=[12],
         data_lock=RLock(),
         data_1d={},
         data_2d={},
@@ -3521,8 +3528,227 @@ def test_cancel_pending_loads_invalidates_late_chunks():
     assert viewer._load_generation == 8
     assert calls == ["teardown"]
     assert timer.isActive() is False
+    assert load_timer.isActive() is False
+    assert viewer._pending_load_ids is None
     assert viewer.data_1d == {}
     assert viewer.data_2d == {}
+
+
+def test_set_file_cancels_stale_load_debounce_before_switch():
+    load_calls = []
+    list_data = _FakeListWidget([1, 2])
+    signal_calls = []
+    item_signal = SimpleNamespace(
+        disconnect=lambda _slot: signal_calls.append("disconnect"),
+        connect=lambda _slot: signal_calls.append("connect"),
+    )
+    list_data.itemSelectionChanged = item_signal
+    viewer = SimpleNamespace(
+        _run_writing=False,
+        _load_generation=2,
+        _load_worker=None,
+        _load_thread=None,
+        _update_coalesce_timer=_FakeTimer(active=False),
+        _selection_coalesce_timer=_FakeTimer(active=False),
+        _pending_data_changed=False,
+        _load_coalesce_timer=_FakeTimer(active=True),
+        _pending_load_ids=[101],
+        _pending_load_2d=True,
+        ui=SimpleNamespace(listData=list_data),
+        file_thread=SimpleNamespace(
+            fname="/data/file_a.nxs",
+            queue=SimpleNamespace(put=lambda item: signal_calls.append(item)),
+        ),
+        data_changed=lambda: None,
+        new_scan=False,
+        _remember_displayed_frames=lambda: None,
+        _ensure_file_thread_running=lambda: None,
+        _teardown_load_worker=lambda: signal_calls.append("teardown"),
+        load_frames_data=lambda ids, load_2d: load_calls.append((ids, load_2d)),
+    )
+    viewer.cancel_pending_loads = MethodType(H5Viewer.cancel_pending_loads, viewer)
+    viewer._flush_pending_load = MethodType(H5Viewer._flush_pending_load, viewer)
+    viewer.set_file = MethodType(H5Viewer.set_file, viewer)
+
+    viewer.set_file("/data/file_b.nxs")
+    viewer._flush_pending_load()
+
+    assert viewer._pending_load_ids is None
+    assert viewer._load_coalesce_timer.isActive() is False
+    assert load_calls == []
+    assert viewer.file_thread.fname == "/data/file_b.nxs"
+    assert signal_calls[:2] == ["teardown", "disconnect"]
+
+
+def test_new_scan_loaded_equal_list_preserves_frame_ids_alias():
+    viewer, _list_data, _calls = _viewer([1, 2], [1, 2])
+    alias = viewer.frame_ids
+    viewer.new_scan_loaded = True
+
+    viewer.update_data()
+
+    assert viewer.frame_ids is alias
+    assert alias == []
+    assert viewer.new_scan_loaded is False
+
+
+def test_load_worker_reselection_retirement_does_not_wait(monkeypatch):
+    import xdart.gui.tabs.static_scan.h5viewer as h5viewer_mod
+
+    retained = []
+    monkeypatch.setattr(h5viewer_mod, "_qt_isvalid", lambda obj: obj is not None)
+    monkeypatch.setattr(
+        h5viewer_mod, "_retain_orphaned_load_worker",
+        lambda worker, thread: retained.append((worker, thread)),
+    )
+
+    class _FakeThread:
+        def __init__(self):
+            self.quit_calls = 0
+            self.wait_calls = 0
+            self.parent = object()
+
+        def isRunning(self):
+            return True
+
+        def quit(self):
+            self.quit_calls += 1
+
+        def wait(self, _ms):
+            self.wait_calls += 1
+            return True
+
+        def setParent(self, parent):
+            self.parent = parent
+
+    worker = _FakeWorker()
+    thread = _FakeThread()
+    viewer = SimpleNamespace(_load_worker=worker, _load_thread=thread)
+
+    H5Viewer._retire_load_worker_for_reselection(viewer)
+
+    assert worker.cancelled is True
+    assert thread.quit_calls == 1
+    assert thread.wait_calls == 0
+    assert thread.parent is None
+    assert retained == [(worker, thread)]
+    assert viewer._load_worker is None
+    assert viewer._load_thread is None
+
+
+def test_load_worker_gets_pool_handle_under_file_lock(monkeypatch):
+    import xdart.gui.tabs.static_scan.h5viewer as h5viewer_mod
+    import xdart.modules.ewald.frame_series as frame_series_mod
+    from xdart.gui.tabs.static_scan.h5viewer import _LoadFramesWorker
+
+    calls = []
+
+    class _TrackingLock:
+        held = False
+
+        def __enter__(self):
+            self.held = True
+            calls.append("lock-enter")
+            return self
+
+        def __exit__(self, *_exc):
+            calls.append("lock-exit")
+            self.held = False
+            return False
+
+    lock = _TrackingLock()
+
+    class _Pool:
+        def get(self, _path):
+            assert lock.held is True
+            calls.append("pool-get")
+            return object()
+
+    frame = SimpleNamespace(map_raw=np.ones((1, 1)))
+    monkeypatch.setattr(h5viewer_mod, "get_pool", lambda: _Pool())
+    monkeypatch.setattr(
+        frame_series_mod,
+        "_load_frame_v2",
+        lambda _file, _idx, static, gi: (
+            assert_lock_held(lock),
+            calls.append("load-frame"),
+            frame,
+        )[-1],
+    )
+
+    worker = _LoadFramesWorker(
+        data_file="/data/file.nxs",
+        file_lock=lock,
+        gi=False,
+        frame_ids=[1],
+        load_2d=True,
+        generation=1,
+        hydrate_raw=True,
+    )
+    worker.run()
+
+    assert calls[:4] == ["lock-enter", "pool-get", "load-frame", "lock-exit"]
+
+
+def assert_lock_held(lock):
+    assert lock.held is True
+
+
+def _browser_pending_set_data_host(*, frame_ids=(), selected=()):
+    calls = []
+    list_data = _FakeListWidget(selected)
+    for item in list_data._items:
+        item.setSelected(True)
+    h5viewer = SimpleNamespace(
+        _browser_scan_reset_pending=True,
+        frame_ids=list(frame_ids),
+        viewer_mode=None,
+        _viewer_is_xdart=False,
+        ui=SimpleNamespace(listData=list_data),
+        data_reset=lambda: (
+            calls.append("data_reset"),
+            h5viewer.frame_ids.clear(),
+        ),
+        data_changed=lambda: calls.append("data_changed"),
+    )
+    displayframe = SimpleNamespace(
+        set_axes=lambda: calls.append("set_axes"),
+        _clear_bkg=lambda: calls.append("clear_bkg"),
+        update=lambda: calls.append("update"),
+    )
+    host = SimpleNamespace(
+        h5viewer=h5viewer,
+        displayframe=displayframe,
+        scan=SimpleNamespace(name="scan"),
+        _clear_frame_record_store=lambda: calls.append("clear_store"),
+    )
+    host.set_data = MethodType(staticWidget.set_data, host)
+    return host, h5viewer, calls
+
+
+def test_browser_file_select_pending_without_frame_does_not_repaint():
+    host, h5viewer, calls = _browser_pending_set_data_host()
+
+    host.set_data()
+
+    assert h5viewer._browser_scan_reset_pending is True
+    assert calls == []
+
+
+def test_browser_file_first_frame_disarms_reset_and_reloads_selection():
+    host, h5viewer, calls = _browser_pending_set_data_host(frame_ids=("3",))
+
+    host.set_data()
+
+    assert h5viewer._browser_scan_reset_pending is False
+    assert h5viewer.frame_ids == ["3"]
+    assert calls == [
+        "set_axes",
+        "clear_store",
+        "clear_bkg",
+        "data_reset",
+        "data_changed",
+    ]
 
 
 def test_viewer_cleanup_stress_drops_stale_chunks_across_mode_switches():
@@ -3538,6 +3764,8 @@ def test_viewer_cleanup_stress_drops_stale_chunks_across_mode_switches():
         _load_worker=None,
         _load_thread=None,
         _update_coalesce_timer=_FakeTimer(active=True),
+        _load_coalesce_timer=_FakeTimer(active=True),
+        _pending_load_ids=[1],
         ui=SimpleNamespace(
             listData=_FakeListWidget([1]),
             listScans=_FakeListWidget(["scan.nxs"]),
@@ -5320,13 +5548,18 @@ def test_xye_axis_label_uses_file_unit_not_hidden_transform_combo():
 def test_xye_loader_defaults_unprefixed_files_to_q(monkeypatch, tmp_path):
     import xdart.gui.tabs.static_scan.h5viewer as h5viewer_mod
 
-    monkeypatch.setattr(
-        h5viewer_mod, "read_xye",
-        lambda _path: (
+    reads = []
+
+    def _fake_read(path):
+        reads.append(path)
+        return (
             np.array([0.0, 1.0]),
             np.array([2.0, 3.0]),
             np.array([0.1, 0.1]),
-        ),
+        )
+
+    monkeypatch.setattr(
+        h5viewer_mod, "read_xye", _fake_read,
     )
     for name in ("iq_scan.xye", "itth_scan.xye", "plain_scan.xye"):
         (tmp_path / name).write_text("0 1 0.1\n", encoding="utf-8")
@@ -5348,13 +5581,16 @@ def test_xye_loader_defaults_unprefixed_files_to_q(monkeypatch, tmp_path):
         ),
         _remember_displayed_frames=lambda: None,
         sigUpdate=_FakeSignal(),
+        _xye_parse_cache={},
     )
 
+    H5Viewer._load_xye_files(viewer)
     H5Viewer._load_xye_files(viewer)
 
     assert viewer.data_1d[1].int_1d.unit == "q_A^-1"
     assert viewer.data_1d[2].int_1d.unit == "2th_deg"
     assert viewer.data_1d[3].int_1d.unit == "q_A^-1"
+    assert len(reads) == 3
 
 
 def test_standard_plot_axis_defaults_to_integrated_2theta_unit():
