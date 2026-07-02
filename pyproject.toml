@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +7,10 @@ name = "xrd-tools"
 version = "1.0.0"
 description = "SSRL X-ray diffraction toolkit: headless reduction core (xrd_tools) + Qt GUI (xdart)"
 readme = "README.md"
-license = {text = "MIT"}
+# SPDX expression (PEP 639): first-party code is MIT (see LICENSE); the
+# ssrl_xrd_tools-provenance code is BSD-3-Clause (licenses/LICENSE-ssrl_xrd_tools).
+license = "MIT AND BSD-3-Clause"
+license-files = ["licenses/LICENSE-*", "LICENSE"]
 requires-python = ">=3.11"
 authors = [
     {name = "Vivek Thampy", email = "vthampy@stanford.edu"},
@@ -16,7 +19,6 @@ keywords = ["xrd", "diffraction", "pyFAI", "SSRL", "synchrotron", "GUI"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -42,7 +44,8 @@ dependencies = [
     "silx",              # io.spec / io.metadata SPEC parsing
     # pyFAI 2025.12 ships a broken pyFAI-calib2 on Windows (silx.gui import
     # path / qt plugin issue); cap to <2025.12 until fixed upstream.
-    # Confirmed 2025.3-2025.11 work.
+    # There are no pyFAI releases between 2025.3.0 and 2025.12.0, so this
+    # range selects exactly 2025.3.0 (the tested version).
     "pyFAI>=2025.3,<2025.12",
     "pyyaml",            # core/hdf5.py imports yaml directly
     "joblib",
@@ -74,12 +77,7 @@ xdart = "xdart.xdart_main:main"
 Homepage = "https://github.com/v-thampy/xrd-tools"
 Repository = "https://github.com/v-thampy/xrd-tools"
 Issues = "https://github.com/v-thampy/xrd-tools/issues"
-
-[tool.setuptools]
-# Package the MIT license text into the wheel + sdist (the two per-provenance
-# copies under licenses/).  Without this the built artifacts carry the MIT
-# metadata classifier but no license file.
-license-files = ["licenses/LICENSE-*"]
+Changelog = "https://github.com/v-thampy/xrd-tools/blob/main/MIGRATION.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]

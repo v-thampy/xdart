@@ -20,7 +20,8 @@ real-time Qt GUI). It ships **two import packages** from one wheel:
 
 The two former repositories were merged **with full git histories**
 (`git log --follow` works across the boundary); see
-[`MIGRATION.md`](MIGRATION.md). The old `ssrl_xrd_tools` import name still
+[`MIGRATION.md`](https://github.com/v-thampy/xrd-tools/blob/main/MIGRATION.md).
+The old `ssrl_xrd_tools` import name still
 works as a **deprecation shim** that re-exports the real `xrd_tools` modules
 — update imports to `xrd_tools` at your convenience.
 
@@ -74,6 +75,17 @@ then launch with `xdart`.
 ```bash
 pip install xrd-tools
 ```
+
+> **Upgrading from the old `xdart` / `ssrl_xrd_tools`?** Uninstall the legacy
+> packages first so their entry points and shims don't shadow `xrd-tools`:
+>
+> ```bash
+> pip uninstall -y xdart ssrl_xrd_tools
+> ```
+>
+> Then install `xrd-tools` as above. See
+> [`MIGRATION.md`](https://github.com/v-thampy/xrd-tools/blob/main/MIGRATION.md)
+> for the full import-name migration.
 
 ### Extras
 
@@ -686,7 +698,7 @@ Layer map: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## Development
 
 ```bash
-git clone <this repo> && cd xrd-tools
+git clone https://github.com/v-thampy/xrd-tools.git && cd xrd-tools
 python -m venv .venv && . .venv/bin/activate
 pip install -e ".[gui,dev,fitting,rsm]"
 
