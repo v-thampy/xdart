@@ -33,9 +33,10 @@ decisions before build. **Builds on:** ADR-0003 (multi-result record), ADR-0004 
   → O(N) disk opens.
 - **`io.read.get_1d(file, frame=None)` returns the FULL stacked 1D `(n_frames, n_q)` in one read**
   (and `get_2d` likewise) — the clean aggregation source.
-- Multi-mode persistence: per-mode nested subgroups are writable + readable (Step-1/2 gate), but **no
-  production write path feeds the accumulated record yet** (Round-11 in-memory-only gap) → non-primary
-  GI modes live only in the in-memory store.
+- Multi-mode persistence: per-mode nested subgroups are writable + readable, and **W DONE (this
+  commit)** wires both production writers through the shared `xrd_tools.io` record/stack path. The
+  accumulated per-mode record now survives crash/reload; non-primary GI modes are durable for
+  instant mode-switch after reload, but whole-scan aggregation remains primary-mode-scoped.
 
 ## Target architecture (ADR-0005)
 - **Authoritative store → `xrd_tools.session`** (headless): bounded `Mapping[idx → FrameRecord]`,
@@ -86,14 +87,15 @@ Whole-scan Sum/Average/Overall must source ALL frames without holding them all i
   the existing worker thread rather than the GUI thread. `LiveFrameSeries._in_memory_cap` and the
   save-before-evict margin remain as write-side staging inputs to `FlushPolicy`; `QtNexusSink.flush`
   marks both Nexus and store persistence at the durable save boundary.
-- **W (write wiring):** feed the accumulated record's per-mode subgroups to the writer (closes the
-  Round-11 in-memory-only gap) → the on-disk stack carries all modes. byte-compat gated.
+- **W DONE (this commit, H6):** feed the accumulated record's per-mode subgroups to both production
+  writers through one shared `xrd_tools.io` path. The on-disk stack carries every written mode;
+  byte-compat remains additive.
 - **7b (aggregation):** route whole-scan Sum/Average/Overall through the stacked-disk-read + in-memory
   tail, off the GUI thread. Still additive (`data_1d` still present). This is the capability that
   replaces `data_1d`.
 - **8a (flip):** `PublicationStore` becomes a derived projection over the session store; live display
   + aggregation read the session store / stacked-read; remove the legacy `update_plot` fallback (the
-  payload/session-store is the sole source).
+  payload/session-store is the sole source). **Unblocked by W/H6.**
 - **8b (delete):** remove `data_1d`/`data_2d`/`hydrated_raw`; keep h5viewer `_ViewerRows`.
   **Done-test:** those identifiers gone from the display layer (the greenfield "done").
 - **7c (cadence):** move `FlushPolicy` + eviction policy into the session (mechanism stays xdart).
@@ -127,8 +129,9 @@ plans — no rework. Step 9 (strictness/sentinel, offscreen-gatable) comes after
 4. Off-GUI-thread aggregation — **CONFIRMED worker (D2 hydration-worker pattern), never a blocking read.**
 
 Net effect on the sequence: 7b aggregation reads the PRIMARY mode's complete on-disk stack only; the W
-write-wiring still lands (durable multi-mode for instant-switch-after-reload) but is no longer on the
-aggregation critical path. Everything else in the sub-step sequence stands.
+write-wiring is now done (durable multi-mode for instant-switch-after-reload) and 8a is unblocked, but
+W is still not an aggregation source for non-primary partial stacks. Everything else in the sub-step
+sequence stands.
 
 ## DECOUPLING UPDATE (2026-06-15, after grounding) — supersedes the "7+8 coupled" framing above
 **Correction:** the earlier claim "Step 8 can't land without Step 7's session store" is WRONG. Grounding

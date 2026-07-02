@@ -8,7 +8,14 @@ from __future__ import annotations
 
 import numpy as np
 
-from xrd_tools.core import Axis, FrameRecord, FrameView
+from xrd_tools.core import (
+    Axis,
+    FrameRecord,
+    FrameView,
+    TwoDKind,
+    assert_framerecord_equivalent,
+    axis_from_unit,
+)
 from xrd_tools.session import FrameRecordStore
 
 
@@ -36,6 +43,47 @@ def _record(
         _view(label, source=source, source_frame=source_frame, scale=scale),
         mode_1d=mode,
     )
+
+
+def _multi_mode_record(label=0, *, scale=1.0):
+    nq = 4
+    nchi = 3
+    base = FrameView(
+        label=label,
+        axis_1d=axis_from_unit("q_A^-1", np.linspace(1.0, 2.0, nq)),
+        intensity_1d=np.arange(nq, dtype=float) * scale + label,
+        axis_2d_x=axis_from_unit("qip_A^-1", np.linspace(0.1, 0.4, nq)),
+        axis_2d_y=axis_from_unit("qoop_A^-1", np.linspace(-0.2, 0.2, nchi)),
+        intensity_2d=(
+            np.arange(nq * nchi, dtype=float).reshape(nchi, nq) * scale + label
+        ),
+        two_d_kind=TwoDKind.QIP_QOOP,
+    )
+    rec = FrameRecord.from_view(base, mode_1d="q_total", mode_2d="qip_qoop")
+    rec = rec.with_result_1d(
+        "q_ip",
+        FrameView(
+            label=label,
+            axis_1d=axis_from_unit("qip_A^-1", np.linspace(0.1, 0.4, nq + 1)),
+            intensity_1d=np.arange(nq + 1, dtype=float) * scale + 10 + label,
+        ),
+        make_active=False,
+    )
+    rec = rec.with_result_2d(
+        "q_chi",
+        FrameView(
+            label=label,
+            axis_2d_x=axis_from_unit("q_A^-1", np.linspace(1.0, 2.0, nq)),
+            axis_2d_y=axis_from_unit("chi_deg", np.linspace(-45.0, 45.0, nchi + 1)),
+            intensity_2d=(
+                np.arange(nq * (nchi + 1), dtype=float).reshape(nchi + 1, nq)
+                * scale + 20 + label
+            ),
+            two_d_kind=TwoDKind.Q_CHI,
+        ),
+        make_active=False,
+    )
+    return rec
 
 
 def test_store_accumulates_modes_for_same_source():
@@ -160,6 +208,32 @@ def test_get_or_hydrate_restores_thinned_record():
     assert store.has_heavy_payload(1)
     assert not store.has_heavy_payload(2)
     np.testing.assert_allclose(rec.view_1d("q_total").intensity_1d, [50.0, 100.0, 150.0])
+
+
+def test_get_or_hydrate_restores_every_written_mode_from_nexus(tmp_path):
+    import h5py
+
+    from xrd_tools.io import read_frame_record, write_frame_records
+
+    records = [_multi_mode_record(0, scale=1.0), _multi_mode_record(1, scale=2.0)]
+    path = tmp_path / "multi_mode.nxs"
+    with h5py.File(path, "w") as h5:
+        write_frame_records(h5.create_group("entry"), records)
+
+    store = FrameRecordStore(max_heavy_items=1)
+    store.upsert(records[0], persisted=True)
+    store.upsert(records[1], persisted=True)
+    assert not store.has_heavy_payload(0)
+
+    store.set_hydrator(lambda label: read_frame_record(path, int(label)))
+    hydrated = store.get_or_hydrate(0)
+
+    assert hydrated is not None
+    assert store.has_heavy_payload(0)
+    assert store.is_persisted(0)
+    assert set(hydrated.modes_1d) == {"q_total", "q_ip"}
+    assert set(hydrated.modes_2d) == {"qip_qoop", "q_chi"}
+    assert_framerecord_equivalent(records[0], hydrated)
 
 
 def test_get_or_hydrate_learns_source_identity_when_thinned_record_had_none():

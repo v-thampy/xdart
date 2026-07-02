@@ -13,23 +13,23 @@ import numpy as np
 import pytest
 
 
-def _r1d(value, nq=16):
+def _r1d(value, nq=16, *, unit="q_A^-1"):
     from xrd_tools.core.containers import IntegrationResult1D
     return IntegrationResult1D(
         radial=np.linspace(0.5, 5.0, nq, dtype=np.float32),
         intensity=np.full(nq, float(value), dtype=np.float32),
         sigma=np.ones(nq, dtype=np.float32),
-        unit="q_A^-1",
+        unit=unit,
     )
 
 
-def _r2d(value, nq=16, nchi=6):
+def _r2d(value, nq=16, nchi=6, *, unit="q_A^-1", azimuthal_unit="chi_deg"):
     from xrd_tools.core.containers import IntegrationResult2D
     return IntegrationResult2D(
         radial=np.linspace(0.5, 5.0, nq, dtype=np.float32),
         azimuthal=np.linspace(-180, 180, nchi, endpoint=False).astype(np.float32),
         intensity=np.full((nq, nchi), float(value), dtype=np.float32),
-        sigma=None, unit="q_A^-1")
+        sigma=None, unit=unit, azimuthal_unit=azimuthal_unit)
 
 
 def _reduction(idx, *, with_2d=False):
@@ -142,6 +142,53 @@ def test_sink_writes_all_frames_to_nxs_and_pops_register(tmp_path):
     # and NO per-frame signals (batch is silent during the run).
     assert sorted(host.xye_written) == list(range(N))
     assert host._signals == [-1]
+
+
+def test_qt_sink_persists_accumulated_gi_modes(tmp_path):
+    from xdart.modules.ewald import LiveScan
+    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
+    from xrd_tools.io import read_frame_record
+    from xrd_tools.reduction.core import FrameReduction
+
+    nxs = str(tmp_path / "gi_modes.nxs")
+    scan = LiveScan(data_file=nxs)
+    scan.gi = True
+    scan.skip_2d = False
+    scan.bai_1d_args["gi_mode_1d"] = "q_total"
+    scan.bai_2d_args["gi_mode_2d"] = "qip_qoop"
+    host = _FakeHost(batch_mode=True)
+    host.gi = True
+    host.incidence_motor = "th"
+    sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+    sink.begin(scan, _minimal_plan())
+
+    active_1d = _r1d(1.0, unit="q_A^-1")
+    extra_1d = _r1d(9.0, unit="qip_A^-1")
+    active_2d = _r2d(2.0, unit="qip_A^-1", azimuthal_unit="qoop_A^-1")
+    extra_2d = _r2d(7.0, unit="q_A^-1", azimuthal_unit="chi_deg")
+    live = _live_frame(0)
+    live.gi = True
+    live.scan_info = {"th": 0.2, "i0": 1.0}
+    live.gi_1d = {"qtotal": active_1d, "qip": extra_1d}
+    live.gi_2d = {"gi2d": active_2d, "polar": extra_2d}
+    sink.register(live)
+    sink.write(
+        _headless(0),
+        FrameReduction(
+            frame_index=0,
+            result_1d=active_1d,
+            result_2d=active_2d,
+            mode_1d="q_total",
+            mode_2d="qip_qoop",
+        ),
+    )
+    sink.flush(force=True)
+
+    rec = read_frame_record(nxs, 0)
+    assert set(rec.modes_1d) == {"q_total", "q_ip"}
+    assert set(rec.modes_2d) == {"qip_qoop", "q_chi"}
+    np.testing.assert_allclose(rec.view_1d("q_ip").intensity_1d, extra_1d.intensity)
+    np.testing.assert_allclose(rec.view_2d("q_chi").intensity_2d, extra_2d.intensity.T)
 
 
 def test_first_forced_batch_flush_replaces_skeleton_atomically(tmp_path, monkeypatch):

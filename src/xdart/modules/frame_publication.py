@@ -19,61 +19,18 @@ from typing import Any, Iterable, Mapping
 import numpy as np
 
 from xrd_tools.core import (
-    DEFAULT_MODE_KEY,
     FrameRecord,
     FrameView,
     TwoDKind,
     numeric_metadata,
 )
+from xrd_tools.io.nexus_record import (
+    frame_record_from_live_frame as _shared_frame_record_from_live_frame,
+    legacy_to_canonical_1d,
+    legacy_to_canonical_2d,
+)
 
 logger = logging.getLogger(__name__)
-
-
-# Legacy GUI dict keys (``frame.gi_1d`` / ``frame.gi_2d``, written by
-# ``ewald.frame``) -> canonical on-disk mode_keys (== GI*Mode.value, the same
-# vocabulary the io layer + FrameEvent use).  DIMENSION-SCOPED: ``polar`` means
-# q_total in a 1D context but q_chi in a 2D context, so the two maps must stay
-# separate — never flatten them.  These legacy spellings are GUI-side and never
-# reach disk; the canonical keys do.  ``exit2d`` is handled here because the ssrl
-# GI2D mode coercer has no alias for that literal 2D key.
-_LEGACY_TO_CANONICAL_1D = {
-    "qtotal": "q_total", "qip": "q_ip", "qoop": "q_oop", "exit": "exit_angle",
-    "chigi": "chi_gi",
-}
-_LEGACY_TO_CANONICAL_2D = {
-    "gi2d": "qip_qoop", "polar": "q_chi", "exit2d": "exit_angles",
-}
-
-
-def legacy_to_canonical_1d(key: str) -> str:
-    """Map a ``frame.gi_1d`` dict key to its canonical 1D mode_key (passthrough
-    if already canonical)."""
-    return _LEGACY_TO_CANONICAL_1D.get(key, key)
-
-
-def legacy_to_canonical_2d(key: str) -> str:
-    """Map a ``frame.gi_2d`` dict key to its canonical 2D mode_key (passthrough
-    if already canonical)."""
-    return _LEGACY_TO_CANONICAL_2D.get(key, key)
-
-
-def _resolve_active_mode(passed, modes, active_result):
-    """The canonical active mode_key for a per-dimension mode map.
-
-    Identity is authoritative: the publication's ``.view`` is built from
-    ``int_1d``/``int_2d``, so the record's active mode MUST be the one whose
-    result IS that object (the live integrator assigns the same result to
-    ``gi_*[key]`` and ``int_*``) — otherwise ``record.active_view()`` would
-    diverge from ``.view``.  The explicit ``passed`` key is only a fallback hint
-    for when there is no active result to match (then the first computed mode,
-    else ``DEFAULT_MODE_KEY``)."""
-    if active_result is not None:
-        for mode, result in modes.items():
-            if result is active_result:
-                return mode
-    if passed is not None and passed in modes:
-        return passed
-    return next(iter(modes), DEFAULT_MODE_KEY)
 
 
 def _readonly_mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -242,58 +199,6 @@ def publication_error_details(publication: FramePublication, output: str) -> str
     return "; ".join(errors)
 
 
-def _record_from_live_frame(frame, view, metadata_raw, incident_angle,
-                            active_mode_1d, active_mode_2d) -> FrameRecord:
-    """Build the multi-result :class:`FrameRecord` from a live frame's per-mode
-    GI dicts.
-
-    Non-GI frames (and the v2 reduce path, which sets only ``int_1d``/``int_2d``
-    and leaves ``gi_1d``/``gi_2d`` empty) collapse to a single-mode record from
-    ``view`` — keyed under the passed ``active_mode_*`` when given (so a GI scan's
-    record carries the real mode, e.g. ``q_total``, not ``DEFAULT_MODE_KEY``),
-    else ``DEFAULT_MODE_KEY`` (behaviour-preserving for non-GI callers)."""
-    gi_1d = getattr(frame, "gi_1d", None) or {}
-    gi_2d = getattr(frame, "gi_2d", None) or {}
-    if not gi_1d and not gi_2d:
-        return FrameRecord.from_view(
-            view,
-            mode_1d=active_mode_1d or DEFAULT_MODE_KEY,
-            mode_2d=active_mode_2d or DEFAULT_MODE_KEY,
-        )
-
-    label = view.label
-    common = dict(
-        metadata_raw=metadata_raw,
-        metadata_numeric=numeric_metadata(metadata_raw),
-        incident_angle=incident_angle,
-        source_path=getattr(frame, "source_file", None) or None,
-        source_frame_index=getattr(frame, "source_frame_idx", None),
-    )
-    thumbnail = getattr(frame, "thumbnail", None)
-    modes_1d = {legacy_to_canonical_1d(k): r for k, r in gi_1d.items()}
-    modes_2d = {legacy_to_canonical_2d(k): r for k, r in gi_2d.items()}
-    results_1d = {
-        m: FrameView.from_results(label=label, result_1d=r, **common)
-        for m, r in modes_1d.items()
-    }
-    results_2d = {
-        m: FrameView.from_results(
-            label=label, result_2d=r,
-            thumbnail=thumbnail, mask_baked=thumbnail is not None, **common,
-        )
-        for m, r in modes_2d.items()
-    }
-    am1 = _resolve_active_mode(active_mode_1d, modes_1d, getattr(frame, "int_1d", None))
-    am2 = _resolve_active_mode(active_mode_2d, modes_2d, getattr(frame, "int_2d", None))
-    return FrameRecord(
-        label=label,
-        results_1d=results_1d,
-        results_2d=results_2d,
-        active_mode_1d=am1 if results_1d else DEFAULT_MODE_KEY,
-        active_mode_2d=am2 if results_2d else DEFAULT_MODE_KEY,
-    )
-
-
 def publication_from_live_frame(
     frame: Any,
     *,
@@ -332,8 +237,11 @@ def publication_from_live_frame(
         source_path=getattr(frame, "source_file", None) or None,
         source_frame_index=getattr(frame, "source_frame_idx", None),
     )
-    record = _record_from_live_frame(
-        frame, view, metadata_raw, incident_angle, active_mode_1d, active_mode_2d,
+    record = _shared_frame_record_from_live_frame(
+        frame,
+        active_mode_1d=active_mode_1d,
+        active_mode_2d=active_mode_2d,
+        include_raw=include_raw,
     )
     publication = FramePublication(
         view=view,

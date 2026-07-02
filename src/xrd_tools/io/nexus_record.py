@@ -34,6 +34,12 @@ from pathlib import Path
 import h5py
 import numpy as np
 
+from xrd_tools.core import (
+    DEFAULT_MODE_KEY,
+    FrameRecord,
+    FrameView,
+    numeric_metadata,
+)
 from xrd_tools.io.schema import (
     INTEGRATED_ROW_ALIGNED,
     SOURCE_BASE_ATTR,
@@ -60,7 +66,202 @@ __all__ = [
     "write_frame_source_ref",
     "write_thumbnail",
     "drop_integrated_rows",
+    "legacy_to_canonical_1d",
+    "legacy_to_canonical_2d",
+    "frame_record_from_live_frame",
+    "frame_record_from_reduction",
+    "merge_frame_records",
 ]
+
+
+# Legacy GUI dict keys (``LiveFrame.gi_1d`` / ``gi_2d``) -> canonical on-disk
+# mode keys (the same vocabulary as GI*Mode.value and FrameEvent.mode_key).
+_LEGACY_TO_CANONICAL_1D = {
+    "qtotal": "q_total",
+    "qip": "q_ip",
+    "qoop": "q_oop",
+    "exit": "exit_angle",
+    "chigi": "chi_gi",
+}
+_LEGACY_TO_CANONICAL_2D = {
+    "gi2d": "qip_qoop",
+    "polar": "q_chi",
+    "exit2d": "exit_angles",
+}
+
+
+def legacy_to_canonical_1d(key: str) -> str:
+    return _LEGACY_TO_CANONICAL_1D.get(str(key), str(key))
+
+
+def legacy_to_canonical_2d(key: str) -> str:
+    return _LEGACY_TO_CANONICAL_2D.get(str(key), str(key))
+
+
+def _mode_or_default(mode) -> str:
+    if mode is None:
+        return DEFAULT_MODE_KEY
+    return str(getattr(mode, "value", mode) or DEFAULT_MODE_KEY)
+
+
+def _resolve_active_mode(passed, modes, active_result):
+    if active_result is not None:
+        for mode, result in modes.items():
+            if result is active_result:
+                return mode
+    passed = None if passed is None else str(passed)
+    if passed is not None and passed in modes:
+        return passed
+    return next(iter(modes), DEFAULT_MODE_KEY)
+
+
+def _with_active_result(modes: dict[str, object], active_mode, active_result) -> dict:
+    """Ensure the live frame's active result survives partial GI mode maps."""
+    if active_result is None:
+        return modes
+    if any(result is active_result for result in modes.values()):
+        return modes
+    active = _mode_or_default(active_mode)
+    if active == DEFAULT_MODE_KEY and modes:
+        return modes
+    return {**modes, active: active_result}
+
+
+def frame_record_from_live_frame(
+    frame,
+    *,
+    active_mode_1d: str | None = None,
+    active_mode_2d: str | None = None,
+    include_raw: bool = False,
+) -> FrameRecord:
+    """Build the durable multi-mode :class:`FrameRecord` for a LiveFrame-like
+    object.
+
+    This is the shared GUI writer/display adapter for ADR-0003: legacy
+    ``gi_1d``/``gi_2d`` keys are normalized here, while non-GI or single-result
+    frames collapse to one active/default mode.
+    """
+    metadata_raw = dict(getattr(frame, "scan_info", None) or {})
+    metadata_num = numeric_metadata(metadata_raw)
+    incident_angle = None
+    if getattr(frame, "gi", False):
+        try:
+            incident_angle = float(frame._get_incident_angle())
+        except Exception:
+            incident_angle = None
+    result_1d = getattr(frame, "int_1d", None)
+    result_2d = getattr(frame, "int_2d", None)
+    thumbnail = getattr(frame, "thumbnail", None)
+    common = dict(
+        metadata_raw=metadata_raw,
+        metadata_numeric=metadata_num,
+        incident_angle=incident_angle,
+        source_path=getattr(frame, "source_file", None) or None,
+        source_frame_index=getattr(frame, "source_frame_idx", None),
+    )
+    view = FrameView.from_results(
+        label=getattr(frame, "idx", ""),
+        result_1d=result_1d,
+        result_2d=result_2d,
+        raw=(getattr(frame, "map_raw", None) if include_raw else None),
+        thumbnail=thumbnail,
+        mask_baked=thumbnail is not None,
+        **common,
+    )
+
+    gi_1d = getattr(frame, "gi_1d", None) or {}
+    gi_2d = getattr(frame, "gi_2d", None) or {}
+    if not gi_1d and not gi_2d:
+        return FrameRecord.from_view(
+            view,
+            mode_1d=_mode_or_default(active_mode_1d),
+            mode_2d=_mode_or_default(active_mode_2d),
+        )
+
+    modes_1d = _with_active_result(
+        {legacy_to_canonical_1d(k): r for k, r in gi_1d.items()},
+        active_mode_1d,
+        result_1d,
+    )
+    modes_2d = _with_active_result(
+        {legacy_to_canonical_2d(k): r for k, r in gi_2d.items()},
+        active_mode_2d,
+        result_2d,
+    )
+    results_1d = {
+        m: FrameView.from_results(
+            label=view.label,
+            result_1d=r,
+            thumbnail=thumbnail,
+            mask_baked=thumbnail is not None,
+            **common,
+        )
+        for m, r in modes_1d.items()
+    }
+    results_2d = {
+        m: FrameView.from_results(
+            label=view.label,
+            result_2d=r,
+            thumbnail=thumbnail,
+            mask_baked=thumbnail is not None,
+            **common,
+        )
+        for m, r in modes_2d.items()
+    }
+    active_1d = _resolve_active_mode(active_mode_1d, modes_1d, result_1d)
+    active_2d = _resolve_active_mode(active_mode_2d, modes_2d, result_2d)
+    return FrameRecord(
+        label=view.label,
+        results_1d=results_1d,
+        results_2d=results_2d,
+        active_mode_1d=active_1d if results_1d else DEFAULT_MODE_KEY,
+        active_mode_2d=active_2d if results_2d else DEFAULT_MODE_KEY,
+    )
+
+
+def frame_record_from_reduction(
+    frame,
+    reduction,
+    *,
+    mode_1d: str | None = None,
+    mode_2d: str | None = None,
+) -> FrameRecord:
+    """Build a single-completion record from a headless FrameReduction."""
+    metadata_raw = dict(getattr(reduction, "metadata", None)
+                        or getattr(frame, "metadata", None) or {})
+    view = FrameView.from_results(
+        label=int(getattr(reduction, "frame_index", getattr(frame, "index", -1))),
+        result_1d=getattr(reduction, "result_1d", None),
+        result_2d=getattr(reduction, "result_2d", None),
+        metadata_raw=metadata_raw,
+        metadata_numeric=getattr(frame, "metadata_numeric", None),
+        incident_angle=getattr(getattr(frame, "geometry", None), "incident_angle", None),
+        source_path=getattr(frame, "source_path", None),
+        source_frame_index=getattr(frame, "source_frame_index", None),
+    )
+    return FrameRecord.from_view(
+        view,
+        mode_1d=_mode_or_default(mode_1d),
+        mode_2d=_mode_or_default(mode_2d),
+    )
+
+
+def merge_frame_records(existing: FrameRecord, incoming: FrameRecord) -> FrameRecord:
+    if existing.label != incoming.label:
+        raise ValueError(
+            f"cannot merge FrameRecords with labels {existing.label!r} and "
+            f"{incoming.label!r}"
+        )
+    merged = existing
+    for mode, view in incoming.results_1d.items():
+        merged = merged.with_result_1d(
+            mode, view, make_active=(mode == incoming.active_mode_1d)
+        )
+    for mode, view in incoming.results_2d.items():
+        merged = merged.with_result_2d(
+            mode, view, make_active=(mode == incoming.active_mode_2d)
+        )
+    return merged
 
 
 # ---------------------------------------------------------------------------

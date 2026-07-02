@@ -401,6 +401,56 @@ def test_nexus_sink_roundtrips_through_read_scan(tmp_path):
     assert ds["intensity_2d"].shape == (2, N_CHI, N_Q)
 
 
+def test_nexus_sink_persists_named_extra_modes(tmp_path):
+    from xrd_tools.io import read_frame_record
+    from xrd_tools.reduction import GIMode, NexusSink, ReductionPlan
+    from xrd_tools.reduction.core import FrameReduction, Frame, Scan
+
+    p = tmp_path / "sink_modes.nxs"
+    sink = NexusSink(path=p, overwrite=True)
+    scan = Scan(name="s", frames=[Frame(index=0, image=np.zeros((2, 2)))])
+    plan = ReductionPlan(gi=GIMode(mode_1d="q_total", mode_2d="qip_qoop"))
+    sink.begin(scan, plan=plan)
+    frame = Frame(index=0, image=np.zeros((2, 2)))
+    sink.write(
+        frame,
+        FrameReduction(
+            frame_index=0,
+            result_1d=_r1d(1),
+            result_2d=_r2d(2),
+            mode_1d="q_total",
+            mode_2d="qip_qoop",
+        ),
+    )
+    sink.write(
+        frame,
+        FrameReduction(
+            frame_index=0,
+            result_1d=IntegrationResult1D(
+                radial=np.linspace(0.5, 5.0, N_Q),
+                intensity=np.full(N_Q, 9.0),
+                unit="qip_A^-1",
+            ),
+            result_2d=IntegrationResult2D(
+                radial=np.linspace(0.5, 5.0, N_Q),
+                azimuthal=np.linspace(-180, 180, N_CHI, endpoint=False),
+                intensity=np.full((N_Q, N_CHI), 7.0),
+                unit="q_A^-1",
+                azimuthal_unit="chi_deg",
+            ),
+            mode_1d="q_ip",
+            mode_2d="q_chi",
+        ),
+    )
+    sink.finish(result=None)
+
+    rec = read_frame_record(p, 0)
+    assert set(rec.modes_1d) == {"q_total", "q_ip"}
+    assert set(rec.modes_2d) == {"qip_qoop", "q_chi"}
+    np.testing.assert_allclose(rec.view_1d("q_ip").intensity_1d, 9.0)
+    np.testing.assert_allclose(rec.view_2d("q_chi").intensity_2d, 7.0)
+
+
 def test_write_integrated_stack_axis_change_same_bincount_rewrites(tmp_path):
     """P1: a reintegration that keeps the bin count but changes the unit/
     axis (q_A^-1 → 2th_deg) must refresh the stored q axis + units, not

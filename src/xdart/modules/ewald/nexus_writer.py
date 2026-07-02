@@ -53,6 +53,7 @@ import h5py
 import nexusformat.nexus as nx
 import numpy as np
 
+from xrd_tools.core import DEFAULT_MODE_KEY
 from xrd_tools.io.nexus import resolve_stack_compression
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -994,6 +995,15 @@ def _axis_signatures_equal(left, right) -> bool:
     return True
 
 
+def _active_mode_keys(scan) -> tuple[str, str]:
+    if not getattr(scan, "gi", False):
+        return DEFAULT_MODE_KEY, DEFAULT_MODE_KEY
+    return (
+        str(getattr(scan, "bai_1d_args", {}).get("gi_mode_1d", "q_total")),
+        str(getattr(scan, "bai_2d_args", {}).get("gi_mode_2d", "qip_qoop")),
+    )
+
+
 def _validate_prepared_integrated(entry_grp, prepared_1d, prepared_2d) -> None:
     """Preflight every selected output before committing either one."""
     from xrd_tools.io.nexus import validate_integrated_stack_write
@@ -1128,6 +1138,23 @@ def _drop_integrated_rows(h5f, group_path: str, frame_indices) -> None:
     drop_integrated_rows(h5f, group_path, frame_indices)
 
 
+def _record_stack_parts(prepared, *, include_1d: bool, include_2d: bool):
+    from xrd_tools.io.nexus import frame_record_write_parts
+    from xrd_tools.io.nexus_record import frame_record_from_live_frame
+
+    records = [
+        frame_record_from_live_frame(
+            frame,
+            active_mode_1d=prepared.get("mode_1d"),
+            active_mode_2d=prepared.get("mode_2d"),
+        )
+        for frame in prepared["frames"]
+    ]
+    return frame_record_write_parts(
+        records, include_1d=include_1d, include_2d=include_2d,
+    )
+
+
 def _prepare_integrated_1d(f, scan, *, entry: str,
                            group_name: str = INTEGRATED_1D_GROUP,
                            replace_frame_indices=None,
@@ -1144,6 +1171,7 @@ def _prepare_integrated_1d(f, scan, *, entry: str,
     )
     if not frames:
         return
+    mode_1d, mode_2d = _active_mode_keys(scan)
     results = [getattr(fr, "int_1d", None) for fr in frames]
     if any(r is None for r in results):
         # H1: drop result-less rows PER FRAME, never the whole save (a frame
@@ -1179,6 +1207,8 @@ def _prepare_integrated_1d(f, scan, *, entry: str,
         "frames": frames,
         "indices": indices,
         "results": results,
+        "mode_1d": mode_1d,
+        "mode_2d": mode_2d,
         "cursor": cursor,
         "scan_index": scan.frames.index,
         "is_replace": replace_frame_indices is not None and group_path in h5f,
@@ -1190,10 +1220,14 @@ def _commit_integrated_1d(f, prepared) -> None:
         return
     from xrd_tools.io.nexus import write_integrated_stack
     h5f = _h5(f)
+    parts = _record_stack_parts(prepared, include_1d=True, include_2d=False)
     write_integrated_stack(
         h5f.require_group(prepared["entry"]),
         frame_indices=prepared["indices"],
         results_1d=prepared["results"],
+        extra_modes_1d=parts["extra_modes_1d"],
+        extra_mode_indices_1d=parts["extra_mode_indices_1d"],
+        primary_mode_1d=parts["primary_mode_1d"],
         group_name_1d=prepared["group_name"],
         compression=INTEGRATED_STACK_COMPRESSION,
     )
@@ -1224,6 +1258,7 @@ def _prepare_integrated_2d(f, scan, *, entry: str,
     )
     if not frames:
         return
+    mode_1d, mode_2d = _active_mode_keys(scan)
     results = [getattr(fr, "int_2d", None) for fr in frames]
     if any(r is None for r in results):
         # H1: drop result-less rows PER FRAME, never the whole save (a frame
@@ -1259,6 +1294,8 @@ def _prepare_integrated_2d(f, scan, *, entry: str,
         "frames": frames,
         "indices": indices,
         "results": results,
+        "mode_1d": mode_1d,
+        "mode_2d": mode_2d,
         "cursor": cursor,
         "scan_index": scan.frames.index,
         "is_replace": replace_frame_indices is not None and group_path in h5f,
@@ -1270,10 +1307,14 @@ def _commit_integrated_2d(f, prepared) -> None:
         return
     from xrd_tools.io.nexus import write_integrated_stack
     h5f = _h5(f)
+    parts = _record_stack_parts(prepared, include_1d=False, include_2d=True)
     write_integrated_stack(
         h5f.require_group(prepared["entry"]),
         frame_indices=prepared["indices"],
         results_2d=prepared["results"],
+        extra_modes_2d=parts["extra_modes_2d"],
+        extra_mode_indices_2d=parts["extra_mode_indices_2d"],
+        primary_mode_2d=parts["primary_mode_2d"],
         group_name_2d=prepared["group_name"],
         compression=INTEGRATED_STACK_COMPRESSION,
     )

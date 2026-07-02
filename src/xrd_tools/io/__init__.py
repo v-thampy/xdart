@@ -45,6 +45,7 @@ from xrd_tools.io.nexus import (
     upsert_positioners,
     upsert_scan_metadata,
     validate_integrated_stack_write,
+    frame_record_write_parts,
     write_frame_records,
     write_integrated_stack,
     write_nexus,

@@ -91,6 +91,32 @@ def test_multimode_reload_equivalence(tmp_path):
         assert_framerecord_equivalent(orig, rl)  # per (frame, mode) byte-equivalent
 
 
+def test_partial_extra_mode_rows_roundtrip(tmp_path):
+    records = []
+    for fi in range(3):
+        rec = FrameRecord.from_view(
+            _view(fi, 1.0), mode_1d="q_total", mode_2d="qip_qoop",
+        )
+        if fi != 1:
+            rec = rec.with_result_1d(
+                "q_ip",
+                _view(fi, 4.0, x1="qip_A^-1"),
+                make_active=False,
+            )
+        records.append(rec)
+    p = str(tmp_path / "partial_extra.nxs")
+    _write(p, records)
+
+    reloaded = read_frame_records(p)
+    assert set(reloaded[0].modes_1d) == {"q_total", "q_ip"}
+    assert set(reloaded[1].modes_1d) == {"q_total"}
+    assert set(reloaded[2].modes_1d) == {"q_total", "q_ip"}
+    np.testing.assert_allclose(
+        reloaded[2].view_1d("q_ip").intensity_1d,
+        records[2].view_1d("q_ip").intensity_1d,
+    )
+
+
 def test_nested_subgroup_nxdata_contract(tmp_path):
     p = str(tmp_path / "mm.nxs")
     _write(p, _multimode_records(2))

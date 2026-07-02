@@ -364,6 +364,7 @@ class QtNexusSink:
         mode_1d, mode_2d = self._active_mode_keys()
         dropped_1d, dropped_2d = self._dropped_labels_by_dimension(dropped)
         groups: dict[tuple[tuple[str, str], ...], list[int]] = {}
+        from xrd_tools.io.nexus_record import frame_record_from_live_frame
         for label in labels:
             try:
                 idx = int(label)
@@ -373,10 +374,18 @@ class QtNexusSink:
                              exc_info=True)
                 continue
             modes: list[tuple[str, str]] = []
-            if idx not in dropped_1d and getattr(live, "int_1d", None) is not None:
-                modes.append(("1d", mode_1d))
-            if idx not in dropped_2d and getattr(live, "int_2d", None) is not None:
-                modes.append(("2d", mode_2d))
+            try:
+                record = frame_record_from_live_frame(
+                    live, active_mode_1d=mode_1d, active_mode_2d=mode_2d,
+                )
+            except Exception:
+                logger.debug("could not build persisted-mode record for %s", label,
+                             exc_info=True)
+                continue
+            if idx not in dropped_1d:
+                modes.extend(("1d", mode) for mode in record.results_1d)
+            if idx not in dropped_2d:
+                modes.extend(("2d", mode) for mode in record.results_2d)
             if modes:
                 groups.setdefault(tuple(modes), []).append(idx)
         return groups

@@ -14,6 +14,7 @@ the poni, and mask.  They encode the roadmap's Phase-2 verification:
 Skipped automatically in CI / on machines without the data.
 """
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import h5py
@@ -271,7 +272,8 @@ def _frozen_gi_bai_args(poni, img, meta, mask, *, gi_mode_1d, gi_mode_2d,
 def _run_batch_streaming(poni, pending_data, mask, *, incidence_motor="th",
                          sample_orientation=4, gi=True,
                          gi_mode_1d="q_total", gi_mode_2d="qip_qoop",
-                         bai_1d_args=None, bai_2d_args=None):
+                         bai_1d_args=None, bai_2d_args=None,
+                         data_file=None, xye_only=True):
     """Drive the REAL streaming dispatch — ``ReductionSession`` + ``QtNexusSink``
     via ``_dispatch_batch_streaming`` — on real frames.
 
@@ -301,8 +303,11 @@ def _run_batch_streaming(poni, pending_data, mask, *, incidence_motor="th",
         poni, mask, incidence_motor=incidence_motor,
         sample_orientation=sample_orientation, gi=gi,
     )
+    w.xye_only = bool(xye_only)
     w.gi_freeze_mode = None
     scan = _make_scan(poni, mask, bai_1d_args, bai_2d_args, gi=gi)
+    if data_file is not None:
+        scan.data_file = str(data_file)
 
     pending = [(name, i + 1, img, info, 0.0, 0.0)
                for i, (name, img, info) in enumerate(pending_data)]
@@ -764,6 +769,97 @@ def test_gi_submode_publication_live_batch_reload_equivalence(
     live ≡ batch ≡ reload for each (gi_mode_1d × gi_mode_2d)."""
     _assert_live_batch_reload_equivalent(
         tmp_path, gi=True, gi_mode_1d=gi_mode_1d, gi_mode_2d=gi_mode_2d)
+
+
+def test_production_writer_persists_real_gi_accumulated_modes(tmp_path):
+    from xdart.modules.ewald import LiveScan
+    from xdart.modules.frame_publication import publication_from_live_frame
+    from xrd_tools.core import FrameRecord, assert_frameview_equivalent
+    from xrd_tools.io import read_frame_records
+    from xrd_tools.io.nexus_record import quantize_thumbnail
+
+    def _stored_thumbnail(thumbnail):
+        if thumbnail is None:
+            return None
+        arr, (vmin, vmax, dtype) = quantize_thumbnail(np.asarray(thumbnail), dtype="uint8")
+        scale = 65535.0 if dtype == "uint16" else 255.0
+        return vmin + (arr.astype(float) / scale) * (vmax - vmin)
+
+    def _as_written_record(record):
+        views = tuple(record.results_1d.values()) + tuple(record.results_2d.values())
+        thumbnail = next((view.thumbnail for view in views if view.thumbnail is not None), None)
+        if thumbnail is None:
+            return record
+        stored = _stored_thumbnail(thumbnail)
+        # This synthetic writer fixture persists the integrated stacks and compact
+        # thumbnails, but not the optional per-frame geometry sidecar.
+        return FrameRecord(
+            label=record.label,
+            results_1d={
+                mode: replace(view, thumbnail=stored, incident_angle=None)
+                for mode, view in record.results_1d.items()
+            },
+            results_2d={
+                mode: replace(view, thumbnail=stored, incident_angle=None)
+                for mode, view in record.results_2d.items()
+            },
+            active_mode_1d=record.active_mode_1d,
+            active_mode_2d=record.active_mode_2d,
+        )
+
+    poni = _tiff_poni()
+    raw = [_load_tiff(n) for n in _TIFF_FRAMES]
+    mask = _tiff_mask(raw[0][0])
+    pending = [
+        (name, img, meta)
+        for name, (img, _th, meta) in zip(_TIFF_FRAMES, raw)
+    ]
+
+    primary_1d, primary_2d = _frozen_gi_bai_args(
+        poni, raw[0][0], raw[0][2], mask,
+        gi_mode_1d="q_total", gi_mode_2d="qip_qoop",
+    )
+    extra_1d, extra_2d = _frozen_gi_bai_args(
+        poni, raw[0][0], raw[0][2], mask,
+        gi_mode_1d="q_ip", gi_mode_2d="q_chi",
+    )
+    primary = _run_batch_streaming(
+        poni, pending, mask, gi=True,
+        bai_1d_args=primary_1d, bai_2d_args=primary_2d,
+    )
+    extra = _run_batch_streaming(
+        poni, pending, mask, gi=True,
+        bai_1d_args=extra_1d, bai_2d_args=extra_2d,
+    )
+
+    out = tmp_path / "production_multimode.nxs"
+    scan = LiveScan("production_multimode", data_file=str(out))
+    scan.gi = True
+    scan.skip_2d = False
+    scan.bai_1d_args.update(primary_1d)
+    scan.bai_2d_args.update(primary_2d)
+    expected = []
+    for label in sorted(primary):
+        frame = primary[label]
+        frame.gi = True
+        frame.gi_1d = {"qtotal": frame.int_1d, "qip": extra[label].int_1d}
+        frame.gi_2d = {"gi2d": frame.int_2d, "polar": extra[label].int_2d}
+        frame.make_thumbnail(global_mask=getattr(scan, "global_mask", None))
+        expected.append(_as_written_record(publication_from_live_frame(
+            frame, active_mode_1d="q_total", active_mode_2d="qip_qoop",
+        ).record))
+        scan.add_frame(frame=frame, calculate=False, batch_save=True)
+
+    scan._save_to_nexus(mode="w")
+    reloaded = read_frame_records(out)
+    assert len(reloaded) == len(expected)
+    for want, got in zip(expected, reloaded):
+        assert set(got.modes_1d) == {"q_total", "q_ip"}
+        assert set(got.modes_2d) == {"qip_qoop", "q_chi"}
+        assert_frameview_equivalent(want.view_1d("q_total"), got.view_1d("q_total"))
+        assert_frameview_equivalent(want.view_1d("q_ip"), got.view_1d("q_ip"))
+        assert_frameview_equivalent(want.view_2d("qip_qoop"), got.view_2d("qip_qoop"))
+        assert_frameview_equivalent(want.view_2d("q_chi"), got.view_2d("q_chi"))
 
 
 @pytest.mark.parametrize("gi_mode_1d", GI_MODES_1D)

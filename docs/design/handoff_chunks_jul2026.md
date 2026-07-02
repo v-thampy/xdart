@@ -48,8 +48,8 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 ### Post-tag: greenfield (store/session collapse)
 | ID | Chunk | Effort | Risk | Payback | Prereqs | State |
 |----|-------|--------|------|---------|---------|-------|
-| H6 (W) | Per-mode subgroup writes, GUI+headless via one path; production multi-mode spine gate | M | med | Round-11 durability closed; multi-mode seam real | RC-3✓, H1✓ | open |
-| H8 (8a) | PublicationStore → bounded projection; delete legacy fallback; explicit-subset gate | M/L | med (was high; H7✓+H1✓ de-risked) | triple-store divergence class impossible | H6, H7✓, Session-2 live gate | open |
+| H6 (W) | Per-mode subgroup writes, GUI+headless via one path; production multi-mode spine gate | M | med | Round-11 durability closed; multi-mode seam real | RC-3✓, H1✓ | **DONE** this commit |
+| H8 (8a) | PublicationStore → bounded projection; delete legacy fallback; explicit-subset gate | M/L | med (was high; H7✓+H1✓+H6✓ de-risked) | triple-store divergence class impossible | H6✓, H7✓, Session-2 live gate | open |
 | H9 (8b) | Delete Role-A `data_1d/data_2d/hydrated_raw` (~76 refs; keep Role-B) | M | med | **greenfield done-test**; ~0.5-1GB mirrors gone; H7b completes | H8 | open |
 | H10 (7c) | Cadence/eviction policy → session + `max_heavy_bytes` | M | low-med | second-sink recipe; detector-aware caps | H9, ADR-0005 reaffirm | open (ADR decision owed) |
 | H2 | Thin-tail axis-interning / max_items | S | low | long-scan memory bounded | — | open |
@@ -196,7 +196,7 @@ Lane D (tests/bounds):  {H2, H3, H4, H5} — anytime, no dependencies
 | H3 | Memory-plateau acceptance gate (A4) | S | — | open |
 | H4 | `_set_1d_cache_limit(None)` footgun (A4) | S | — | open |
 | H5 | Stage-6 parity test (A8) | S | — | open |
-| H6 | W: per-mode subgroup write wiring + production multi-mode spine gate (A2) | M | H1, RC-3 | open |
+| H6 | W: per-mode subgroup write wiring + production multi-mode spine gate (A2) | M | H1, RC-3 | done (this commit) |
 | H7a | Typed read result + policy table + render authority (display-side, fallbacks KEPT) (A3) | M | round-2 fix — **PULLED FORWARD pre-release** after 3 live bugs of this class; `codex_tasks/h7_typed_reads_render_authority.md` | done |
 | H7b | Remove the fallback tiers behind the H7a accessor | S | H7a; rides 8a | open |
 | H8 | 8a flip: PublicationStore→bounded projection; remove update_plot fallback; §0.4 blockers; explicit-subset hydrate-all-or-refuse gate | M/L | H6, H7, H13; live-gated (Session 2) | open |
@@ -254,7 +254,7 @@ raw, live/unknown-length, unreachable). Read-only test; freezes the two truth so
 until H18. Known reconcile point: the inline `has_frames=has_raw=raw_reachable=source_ready`
 simplification vs the headless true-live escape hatch — the test documents which wins where.
 
-**H6** — W: production writer emits the accumulated record's per-mode subgroups. Wire BOTH the GUI
+**H6 — DONE this commit** — W: production writer emits the accumulated record's per-mode subgroups. Wire BOTH the GUI
 writer (`nexus_writer.py`) and headless `NexusSink` through the same `mode_subgroup_name` path
 (`nexus_record.py:212-230` currently metadata+thumbnail only). Gate: NEW production-path spine
 case in `test_gi_batch_real_data.py` — GI run persisting ≥2 sub-modes → flush → reload →

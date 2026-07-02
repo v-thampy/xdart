@@ -1574,7 +1574,15 @@ def _stamp_mode_attrs(entry_grp, group_name, primary_mode, extra_modes) -> None:
     if g is None:
         return
     g.attrs[PRIMARY_MODE_ATTR] = primary_mode
-    g.attrs[MULTI_RESULT_MODES_ATTR] = [primary_mode, *(extra_modes or {})]
+    existing = _norm_attr(g.attrs.get(MULTI_RESULT_MODES_ATTR, []))
+    if isinstance(existing, str):
+        existing = [existing]
+    modes: list[str] = [str(primary_mode)]
+    for mode in [*(existing or []), *((extra_modes or {}).keys())]:
+        mode = str(mode)
+        if mode != primary_mode and mode not in modes:
+            modes.append(mode)
+    g.attrs[MULTI_RESULT_MODES_ATTR] = modes
 
 
 def write_integrated_stack(
@@ -1585,6 +1593,8 @@ def write_integrated_stack(
     results_2d: Sequence[IntegrationResult2D] | None = None,
     extra_modes_1d: "Mapping[str, Sequence[IntegrationResult1D]] | None" = None,
     extra_modes_2d: "Mapping[str, Sequence[IntegrationResult2D]] | None" = None,
+    extra_mode_indices_1d: "Mapping[str, Sequence[int]] | None" = None,
+    extra_mode_indices_2d: "Mapping[str, Sequence[int]] | None" = None,
     primary_mode_1d: str | None = None,
     primary_mode_2d: str | None = None,
     group_name_1d: str = "integrated_1d",
@@ -1605,8 +1615,10 @@ def write_integrated_stack(
     every nested child — is validated independently by the frozen uniform-axes
     validators; nested children never affect top-level validation.
 
-    First-save only for nested modes in this revision: a nested per-mode re-save
-    raises ``NotImplementedError`` (the streaming/upsert wiring is a later step).
+    Nested modes may be partial: ``extra_mode_indices_*[mode]`` supplies the
+    labels for that subgroup, defaulting to ``frame_indices`` for the original
+    all-modes-aligned call shape.  Existing nested groups are upserted/appended
+    with the same axis/shape guards as the top-level stacks.
 
     The canonical stacked-write primitive — the headless path and
     (eventually, #18) the xdart GUI writer both target this so a single
@@ -1754,6 +1766,60 @@ def write_integrated_stack(
             for fi, r in zip(fis, results_2d):
                 _append_stacked_2d(entry_grp, fi, r, ck, group_name=group_name_2d)
 
+    def _mode_fis(mode_indices, mode_key, default_fis):
+        fis_ = [int(x) for x in (
+            mode_indices.get(mode_key) if mode_indices and mode_key in mode_indices
+            else default_fis
+        )]
+        if len(set(fis_)) != len(fis_):
+            raise ValueError(
+                f"extra mode {mode_key!r} frame_indices contains duplicates: {fis_}"
+            )
+        return fis_
+
+    def _write_extra_1d(parent, mode_key, results, fis_):
+        sub = mode_subgroup_name(mode_key)  # canonical; raises on default/unknown
+        if not results or len(results) != len(fis_):
+            raise ValueError(
+                f"extra_modes_1d[{mode_key!r}] length must match its frame_indices"
+            )
+        _require_uniform_axes_1d(results)
+        g = parent.get(sub)
+        if g is not None and (
+            g["intensity"].shape[1] != np.asarray(results[0].intensity).shape[0]
+            or not _axes_match_1d(g, results[0])
+        ):
+            _require_batch_covers_existing(g, f"{group_name_1d}/{sub}", fis_)
+            del parent[sub]
+            g = None
+        if g is None:
+            _bulk_create_1d(parent, results, fis_, disk_name=sub)
+        else:
+            for fi, r in zip(fis_, results):
+                _append_stacked_1d(parent, fi, r, ck, group_name=sub)
+
+    def _write_extra_2d(parent, mode_key, results, fis_):
+        sub = mode_subgroup_name(mode_key)
+        if not results or len(results) != len(fis_):
+            raise ValueError(
+                f"extra_modes_2d[{mode_key!r}] length must match its frame_indices"
+            )
+        _require_uniform_axes_2d(results)
+        g = parent.get(sub)
+        new_shape = np.asarray(results[0].intensity).T.shape
+        if g is not None and (
+            tuple(g["intensity"].shape[1:]) != new_shape
+            or not _axes_match_2d(g, results[0])
+        ):
+            _require_batch_covers_existing(g, f"{group_name_2d}/{sub}", fis_)
+            del parent[sub]
+            g = None
+        if g is None:
+            _bulk_create_2d(parent, results, fis_, disk_name=sub)
+        else:
+            for fi, r in zip(fis_, results):
+                _append_stacked_2d(parent, fi, r, ck, group_name=sub)
+
     # ── nested per-mode GI subgroups (ADR-0003) ─────────────────────────────
     # Each non-primary mode is its own NXdata child of the top-level group,
     # validated INDEPENDENTLY by the frozen uniform-axes validators (a child's
@@ -1778,18 +1844,10 @@ def write_integrated_stack(
                 "a subgroup)"
             )
         for mode_key, results in extra_modes_1d.items():
-            sub = mode_subgroup_name(mode_key)  # canonical; raises on default/unknown
-            if not results or len(results) != len(fis):
-                raise ValueError(
-                    f"extra_modes_1d[{mode_key!r}] length must match frame_indices"
-                )
-            _require_uniform_axes_1d(results)
-            if sub in parent:
-                raise NotImplementedError(
-                    "nested per-mode re-save is a later step; Step 1 writes "
-                    "first-save only"
-                )
-            _bulk_create_1d(parent, results, fis, disk_name=sub)
+            _write_extra_1d(
+                parent, mode_key, results,
+                _mode_fis(extra_mode_indices_1d, mode_key, fis),
+            )
 
     if extra_modes_2d:
         parent = entry_grp.get(group_name_2d)
@@ -1811,23 +1869,100 @@ def write_integrated_stack(
                 "a subgroup)"
             )
         for mode_key, results in extra_modes_2d.items():
-            sub = mode_subgroup_name(mode_key)
-            if not results or len(results) != len(fis):
-                raise ValueError(
-                    f"extra_modes_2d[{mode_key!r}] length must match frame_indices"
-                )
-            _require_uniform_axes_2d(results)
-            if sub in parent:
-                raise NotImplementedError(
-                    "nested per-mode re-save is a later step; Step 1 writes "
-                    "first-save only"
-                )
-            _bulk_create_2d(parent, results, fis, disk_name=sub)
+            _write_extra_2d(
+                parent, mode_key, results,
+                _mode_fis(extra_mode_indices_2d, mode_key, fis),
+            )
 
     # Stamp the per-scan mode attrs LAST, per dimension (no-op for a DEFAULT/
     # unnamed primary ⇒ standard scans stay byte-identical).
     _stamp_mode_attrs(entry_grp, group_name_1d, primary_mode_1d, extra_modes_1d)
     _stamp_mode_attrs(entry_grp, group_name_2d, primary_mode_2d, extra_modes_2d)
+
+
+def frame_record_write_parts(
+    records, *, include_1d: bool = True, include_2d: bool = True
+) -> dict[str, Any]:
+    """Convert multi-result FrameRecords into ``write_integrated_stack`` kwargs.
+
+    The top-level primary mode remains aligned to the full record list; nested
+    extra modes carry their own per-mode frame indices so lazy/partial mode
+    accumulation persists only the rows that actually exist.
+    """
+    from xrd_tools.core.frame_view import view_to_result_1d, view_to_result_2d
+
+    records = list(records)
+    fis = [int(r.label) for r in records]
+
+    prim_1d = {r.active_mode_1d for r in records if include_1d and r.results_1d}
+    prim_2d = {r.active_mode_2d for r in records if include_2d and r.results_2d}
+    if len(prim_1d) > 1 or len(prim_2d) > 1:
+        raise ValueError(
+            f"FrameRecords disagree on active mode (1D={sorted(prim_1d)}, "
+            f"2D={sorted(prim_2d)}); one scan = one primary per dimension"
+        )
+    primary_1d = next(iter(prim_1d), DEFAULT_MODE_KEY)
+    primary_2d = next(iter(prim_2d), DEFAULT_MODE_KEY)
+
+    # The stacked writer needs one aligned row per frame.  Partial /
+    # per-frame-varying mode sets (some frames have a dimension, others don't,
+    # or a record omits the agreed primary) aren't supported yet; fail with a
+    # precise message rather than a downstream length-mismatch.
+    has_1d = [bool(include_1d and r.results_1d) for r in records]
+    has_2d = [bool(include_2d and r.results_2d) for r in records]
+    if any(has_1d) and not all(has_1d):
+        miss = [r.label for r, h in zip(records, has_1d) if not h]
+        raise ValueError(
+            f"frames {miss} have no 1D results while others do; per-frame-"
+            "varying mode sets are not yet supported"
+        )
+    if any(has_2d) and not all(has_2d):
+        miss = [r.label for r, h in zip(records, has_2d) if not h]
+        raise ValueError(
+            f"frames {miss} have no 2D results while others do; per-frame-"
+            "varying mode sets are not yet supported"
+        )
+    for r in records:  # defensive: every record carries the agreed primary
+        if include_1d and r.results_1d and primary_1d not in r.results_1d:
+            raise ValueError(f"frame {r.label} lacks the primary 1D mode {primary_1d!r}")
+        if include_2d and r.results_2d and primary_2d not in r.results_2d:
+            raise ValueError(f"frame {r.label} lacks the primary 2D mode {primary_2d!r}")
+
+    top_1d: list = []
+    extra_1d: dict = {}
+    extra_idx_1d: dict = {}
+    for r in (records if include_1d else ()):
+        for mode, view in r.results_1d.items():
+            res = view_to_result_1d(view)
+            if mode == primary_1d:
+                top_1d.append(res)
+            else:
+                extra_1d.setdefault(mode, []).append(res)
+                extra_idx_1d.setdefault(mode, []).append(int(r.label))
+
+    top_2d: list = []
+    extra_2d: dict = {}
+    extra_idx_2d: dict = {}
+    for r in (records if include_2d else ()):
+        for mode, view in r.results_2d.items():
+            res = view_to_result_2d(view)
+            if mode == primary_2d:
+                top_2d.append(res)
+            else:
+                extra_2d.setdefault(mode, []).append(res)
+                extra_idx_2d.setdefault(mode, []).append(int(r.label))
+
+    return {
+        "frame_indices": fis,
+        "results_1d": top_1d or None,
+        "results_2d": top_2d or None,
+        "extra_modes_1d": extra_1d or None,
+        "extra_modes_2d": extra_2d or None,
+        "extra_mode_indices_1d": extra_idx_1d or None,
+        "extra_mode_indices_2d": extra_idx_2d or None,
+        "primary_mode_1d": primary_1d,
+        "primary_mode_2d": primary_2d,
+    }
 
 
 def write_frame_records(entry_grp: h5py.Group, records, *, compression=None) -> None:
@@ -1846,74 +1981,11 @@ def write_frame_records(entry_grp: h5py.Group, records, *, compression=None) -> 
     A single NAMED GI mode persists ``primary_mode`` (additive on GI files only)
     so the active mode round-trips.
     """
-    from xrd_tools.core.frame_view import view_to_result_1d, view_to_result_2d
-
-    records = list(records)
-    fis = [int(r.label) for r in records]
-
-    prim_1d = {r.active_mode_1d for r in records if r.results_1d}
-    prim_2d = {r.active_mode_2d for r in records if r.results_2d}
-    if len(prim_1d) > 1 or len(prim_2d) > 1:
-        raise ValueError(
-            f"FrameRecords disagree on active mode (1D={sorted(prim_1d)}, "
-            f"2D={sorted(prim_2d)}); one scan = one primary per dimension"
-        )
-    primary_1d = next(iter(prim_1d), DEFAULT_MODE_KEY)
-    primary_2d = next(iter(prim_2d), DEFAULT_MODE_KEY)
-
-    # The stacked writer needs one aligned row per frame.  Partial /
-    # per-frame-varying mode sets (some frames have a dimension, others don't,
-    # or a record omits the agreed primary) aren't supported yet; fail with a
-    # precise message rather than a downstream length-mismatch.
-    has_1d = [bool(r.results_1d) for r in records]
-    has_2d = [bool(r.results_2d) for r in records]
-    if any(has_1d) and not all(has_1d):
-        miss = [r.label for r, h in zip(records, has_1d) if not h]
-        raise ValueError(
-            f"frames {miss} have no 1D results while others do; per-frame-"
-            "varying mode sets are not yet supported"
-        )
-    if any(has_2d) and not all(has_2d):
-        miss = [r.label for r, h in zip(records, has_2d) if not h]
-        raise ValueError(
-            f"frames {miss} have no 2D results while others do; per-frame-"
-            "varying mode sets are not yet supported"
-        )
-    for r in records:  # defensive: every record carries the agreed primary
-        if r.results_1d and primary_1d not in r.results_1d:
-            raise ValueError(f"frame {r.label} lacks the primary 1D mode {primary_1d!r}")
-        if r.results_2d and primary_2d not in r.results_2d:
-            raise ValueError(f"frame {r.label} lacks the primary 2D mode {primary_2d!r}")
-
-    top_1d: list = []
-    extra_1d: dict = {}
-    for r in records:
-        for mode, view in r.results_1d.items():
-            res = view_to_result_1d(view)
-            if mode == primary_1d:
-                top_1d.append(res)
-            else:
-                extra_1d.setdefault(mode, []).append(res)
-
-    top_2d: list = []
-    extra_2d: dict = {}
-    for r in records:
-        for mode, view in r.results_2d.items():
-            res = view_to_result_2d(view)
-            if mode == primary_2d:
-                top_2d.append(res)
-            else:
-                extra_2d.setdefault(mode, []).append(res)
+    parts = frame_record_write_parts(records)
 
     write_integrated_stack(
         entry_grp,
-        frame_indices=fis,
-        results_1d=top_1d or None,
-        results_2d=top_2d or None,
-        extra_modes_1d=extra_1d or None,
-        extra_modes_2d=extra_2d or None,
-        primary_mode_1d=primary_1d,
-        primary_mode_2d=primary_2d,
+        **parts,
         compression=compression,
     )
 
@@ -3284,7 +3356,9 @@ __all__ = [
     "write_nexus",
     "write_nexus_frame",
     "validate_integrated_stack_write",
+    "frame_record_write_parts",
     "write_integrated_stack",
+    "write_frame_records",
     "write_stitched",
     "write_rsm",
     "read_rsm",

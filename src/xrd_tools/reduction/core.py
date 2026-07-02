@@ -32,6 +32,7 @@ from xrd_tools.core.containers import (
     IntegrationResult2D,
     PONI,
 )
+from xrd_tools.core.frame_view import DEFAULT_MODE_KEY
 from xrd_tools.core.metadata import ScanMetadata
 from xrd_tools.core.scan import (
     FrameSource as CoreFrameSource,
@@ -309,11 +310,25 @@ class FrameReduction:
     frame_index: int
     result_1d: IntegrationResult1D | None = None
     result_2d: IntegrationResult2D | None = None
+    mode_1d: str | None = None
+    mode_2d: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     corrected_image: np.ndarray | None = field(
         default=None,
         repr=False,
         compare=False,
+    )
+
+
+def _plan_mode_keys(plan: ReductionPlan | None) -> tuple[str, str]:
+    gi = getattr(plan, "gi", None)
+    if gi is None:
+        return DEFAULT_MODE_KEY, DEFAULT_MODE_KEY
+    return (
+        str(getattr(getattr(gi, "mode_1d", None), "value", getattr(gi, "mode_1d", None))
+            or DEFAULT_MODE_KEY),
+        str(getattr(getattr(gi, "mode_2d", None), "value", getattr(gi, "mode_2d", None))
+            or DEFAULT_MODE_KEY),
     )
 
 
@@ -511,6 +526,8 @@ class NexusSink:
     _plan: "ReductionPlan | None" = field(default=None, init=False, repr=False)
     _active_path: Path | None = field(default=None, init=False, repr=False)
     _tmp_path: Path | None = field(default=None, init=False, repr=False)
+    _primary_mode_1d: str = field(default=DEFAULT_MODE_KEY, init=False, repr=False)
+    _primary_mode_2d: str = field(default=DEFAULT_MODE_KEY, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.path, Path):
@@ -524,6 +541,7 @@ class NexusSink:
         # (scan_data) alongside the integrated stacks (core provenance).
         self._scan = scan
         self._plan = plan
+        self._primary_mode_1d, self._primary_mode_2d = _plan_mode_keys(plan)
         use_atomic = (
             bool(self.atomic)
             if self.atomic is not None
@@ -554,19 +572,89 @@ class NexusSink:
     def write(self, frame: Frame, reduction: FrameReduction) -> None:
         if self._h5 is None:
             raise RuntimeError("NexusSink.write called before begin().")
-        write_nexus_frame(
-            self._h5,
-            frame.index,
-            result_1d=reduction.result_1d,
-            result_2d=reduction.result_2d,
-            entry=self.entry,
-            compression=self.compression,
+        mode_1d = str(getattr(reduction, "mode_1d", None)
+                      or self._primary_mode_1d or DEFAULT_MODE_KEY)
+        mode_2d = str(getattr(reduction, "mode_2d", None)
+                      or self._primary_mode_2d or DEFAULT_MODE_KEY)
+        top_1d = (
+            reduction.result_1d
+            if mode_1d in (self._primary_mode_1d, DEFAULT_MODE_KEY)
+            else None
         )
+        top_2d = (
+            reduction.result_2d
+            if mode_2d in (self._primary_mode_2d, DEFAULT_MODE_KEY)
+            else None
+        )
+        if top_1d is not None or top_2d is not None:
+            write_nexus_frame(
+                self._h5,
+                frame.index,
+                result_1d=top_1d,
+                result_2d=top_2d,
+                entry=self.entry,
+                compression=self.compression,
+            )
+        self._write_named_modes(frame, reduction, mode_1d=mode_1d, mode_2d=mode_2d)
         if self.complete_record:
             self._write_frame_record(frame)
         self._n_written += 1
         if self.flush_every is not None and self._n_written % self.flush_every == 0:
             self._h5.flush()
+
+    def _write_named_modes(
+        self,
+        frame: Frame,
+        reduction: FrameReduction,
+        *,
+        mode_1d: str,
+        mode_2d: str,
+    ) -> None:
+        if mode_1d == DEFAULT_MODE_KEY and mode_2d == DEFAULT_MODE_KEY:
+            return
+        from xrd_tools.io.nexus import write_integrated_stack
+
+        result_1d = reduction.result_1d
+        result_2d = reduction.result_2d
+        top_1d = (
+            [result_1d]
+            if result_1d is not None and mode_1d == self._primary_mode_1d
+            else None
+        )
+        top_2d = (
+            [result_2d]
+            if result_2d is not None and mode_2d == self._primary_mode_2d
+            else None
+        )
+        extra_1d = (
+            {mode_1d: [result_1d]}
+            if result_1d is not None and mode_1d != self._primary_mode_1d
+            else None
+        )
+        extra_2d = (
+            {mode_2d: [result_2d]}
+            if result_2d is not None and mode_2d != self._primary_mode_2d
+            else None
+        )
+        if not any((top_1d, top_2d, extra_1d, extra_2d)):
+            return
+        write_integrated_stack(
+            self._h5[self.entry],
+            frame_indices=[int(frame.index)],
+            results_1d=top_1d,
+            results_2d=top_2d,
+            extra_modes_1d=extra_1d,
+            extra_modes_2d=extra_2d,
+            extra_mode_indices_1d=(
+                {mode_1d: [int(frame.index)]} if extra_1d else None
+            ),
+            extra_mode_indices_2d=(
+                {mode_2d: [int(frame.index)]} if extra_2d else None
+            ),
+            primary_mode_1d=self._primary_mode_1d,
+            primary_mode_2d=self._primary_mode_2d,
+            compression=self.compression,
+        )
 
     def _write_frame_record(self, frame: Frame) -> None:
         """Per-frame source pointer + thumbnail (complete-record mode)."""
@@ -2357,10 +2445,13 @@ def _reduce_frame(
             "(no usable data); pass StrictPolicy.graceful() to drop it "
             "per-frame instead of raising."
         )
+    mode_1d, mode_2d = _plan_mode_keys(plan)
     return FrameReduction(
         frame_index=frame.index,
         result_1d=r1d,
         result_2d=r2d,
+        mode_1d=mode_1d,
+        mode_2d=mode_2d,
         metadata=dict(frame.metadata),
         corrected_image=corrected_image,
     )
