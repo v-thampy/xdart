@@ -186,6 +186,13 @@ def _frame_select_viewer(run_writing=False, selected=('5',), cached_2d=()):
     # sigUpdate-count assertions still hold (a burst debounces to one emit).
     viewer._update_coalesce_timer = SimpleNamespace(
         start=lambda: viewer.sigUpdate.emit())
+    # data_changed also debounces the blocking DISK LOAD (freeze fix part 2);
+    # simulate the load timer firing synchronously so the load assertions hold.
+    viewer._pending_load_ids = None
+    viewer._pending_load_2d = True
+    viewer._flush_pending_load = MethodType(H5Viewer._flush_pending_load, viewer)
+    viewer._load_coalesce_timer = SimpleNamespace(
+        start=lambda: viewer._flush_pending_load())
     viewer.data_changed = MethodType(H5Viewer.data_changed, viewer)
     viewer.set_run_writing = MethodType(H5Viewer.set_run_writing, viewer)
     return viewer, calls

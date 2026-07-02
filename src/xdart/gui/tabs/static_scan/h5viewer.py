@@ -731,6 +731,16 @@ class H5Viewer(QWidget):
         self._update_coalesce_timer = Coalescer(100, mode="debounce",
                                                 parent=self)
         self._update_coalesce_timer.triggered.connect(self.sigUpdate.emit)
+        # FREEZE FIX (part 2): debounce the DISK LOAD too.  data_changed runs fully
+        # per selection event, and its load_frames_data does a blocking
+        # _teardown_load_worker (thread.wait ~2 s) — so a rapid shift/ctrl /
+        # arrow-hold burst fires a FLOOD of 2 s waits on the GUI thread -> beachball
+        # (the render debounce above alone doesn't cover this).  Coalesce the load to
+        # ONE call for the final selection.
+        self._pending_load_ids = None
+        self._pending_load_2d = True
+        self._load_coalesce_timer = Coalescer(100, mode="debounce", parent=self)
+        self._load_coalesce_timer.triggered.connect(self._flush_pending_load)
 
     def _ensure_file_thread_running(self) -> None:
         """Start the persistent file loader on first real file operation."""
@@ -2209,6 +2219,15 @@ class H5Viewer(QWidget):
             # disk-load guard in data_changed is now open).
             self.data_changed()
 
+    def _flush_pending_load(self):
+        """Fire the debounced disk load for the final selection of a rapid burst
+        (see _load_coalesce_timer).  One load -> one blocking _teardown_load_worker
+        wait, instead of one per selection event."""
+        ids = self._pending_load_ids
+        if ids and not getattr(self, '_run_writing', False):
+            self._pending_load_ids = None
+            self.load_frames_data(ids, self._pending_load_2d)
+
     def data_changed(self, show_all=False):
         """Connected to itemSelectionChanged signal of listData.
 
@@ -2320,7 +2339,12 @@ class H5Viewer(QWidget):
         # Cached frames display instantly; evicted frames repaint when the run
         # ends (set_run_writing(False) re-fires this handler).
         if frame_ids and not getattr(self, '_run_writing', False):
-            self.load_frames_data(frame_ids, load_2d)
+            # Debounce the disk load (see _load_coalesce_timer): coalesce a rapid
+            # selection burst to ONE load for the final selection, so the blocking
+            # _teardown_load_worker wait can't flood the GUI thread (beachball).
+            self._pending_load_ids = frame_ids
+            self._pending_load_2d = load_2d
+            self._load_coalesce_timer.start()
         elif frame_ids:
             logger.debug(
                 "Run active: skipping disk load of %d evicted frame(s) %s; "
