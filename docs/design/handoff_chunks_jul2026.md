@@ -17,6 +17,75 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 
 ---
 
+## MASTER STATUS TABLE (2026-07-02) — the status authority; agents update THIS table
+*(The per-wave tables further below are frozen history; briefs for each ID live below them and in
+`codex_tasks/`. Bug-level status lives in `live_findings_ledger.md`. Effort: S≤2h · M≤1day · L=days.)*
+
+### Pre-tag: release wave + fix series
+| ID | Chunk | Effort | Risk | Payback | Prereqs | State |
+|----|-------|--------|------|---------|---------|-------|
+| RC-1 | MIGRATION mask-file + old-package notes | S | none | v1.0 promise kept | — | **DONE** `ddacbc0e` |
+| RC-2 | Flush floor + comment sync | S | low | live-checkpoint protection | — | **DONE** `4d2f3957` |
+| RC-4 | Deferred ledger re-homed + citations | S | none | planning survives git clean | — | **DONE** `ddacbc0e` |
+| RC-5 | Packaging: license fix, LICENSE, README, stubs, install scripts | S | low | correct PyPI metadata | — | **DONE** `c0535d21` |
+| RC-6 | Doc-ledger truth fixes + FLOOR salvage | S | none | agents read true state | — | **DONE** `ddacbc0e` |
+| RC-7 | Session-1 live checklist doc | S | none | one artifact discharges all live gates | — | **DONE** `bec431b1` (session PENDING) |
+| Fix series | Freeze/overlay/race/popup/bounce (FS/OV/RN/LD/BR rows) | — | — | see `live_findings_ledger.md` | — | code DONE through Wave 2; live-verify at Session-1 |
+| H1 | Mode-scoped `mark_persisted` | S | low | no silent multi-mode loss on eviction | — | **DONE** `4d3e2b3c` |
+| H4 | `_set_1d_cache_limit(None)` guard | S | none | unbounded footgun closed | — | **DONE** `4d2f3957` |
+| H7a | Typed read contract + policy table | M | low | one read policy | — | **DONE** `03492440` |
+| H7-gate | Entry gate + accumulator lifecycle split (OV-5) | S+M | med | wipe class structurally closed | H7a | **DONE** `5a7736ee`+`031ab9bf` |
+| H14 | Waterfall accumulator bounding | S/M | low | O(N²) repaint gone | — | **DONE** `084f3410` |
+| MS-1 | Run-end count reconciliation + counter fix + shadow-drop lock | S | low | silent in-flight drop now visible | — | **DONE** `4d3e2b3c` |
+| H12 | Liveness step-5 render leg (level-reuse, subsampled percentile) | M | low | last big live-smoothness lever | — | **IN-FLIGHT** (Wave 2, `render_leg_smoothness.md`) |
+| H13(a-c) | Timer safety: LD-1 load-debounce cancel, alias fix, reint-timer stop, pool race, non-blocking teardown, XYE cache, **BR-1** browser-select no-clear | S×7 | low-med | wrong-file pollute + last stalls + BR-1 | Wave 1 | **IN-FLIGHT** (Wave 2, `timer_safety_viewer_perf.md`) |
+| H-hyd | Hydration purpose-scoping residuals (full→1d leaks, dedupe key, Sum/Avg churn) | S×4 | low | no 60MB/frame churn loops | H7-gate | **QUEUED** (Wave 3, `hydration_purpose_scoping.md`) |
+| RC-FV | Final verification (full suite, strict-tree, build, staging) | S | none | certifies the tag commit | Waves 1-3 | **QUEUED** (`release_final_verification.md`) |
+| RC-7s | Maintainer live Session-1 | — | — | closes every fixed-unverified row | RC-FV | **PENDING** (maintainer) |
+| RC-8 | Merge → tag v1.0.0 → publish + stubs + branch cleanup | S | low | **v1.0.0 on PyPI** | RC-7s, repo-public decision | **PENDING** (maintainer) |
+
+### Post-tag: greenfield (store/session collapse)
+| ID | Chunk | Effort | Risk | Payback | Prereqs | State |
+|----|-------|--------|------|---------|---------|-------|
+| RC-3 | N-2 h5sig filter/chunk pinning + one re-pin | S | low | byte-gate sees filter drift before W | tag | open — **first post-tag commit** |
+| H6 (W) | Per-mode subgroup writes, GUI+headless via one path; production multi-mode spine gate | M | med | Round-11 durability closed; multi-mode seam real | RC-3, H1✓ | open |
+| H8 (8a) | PublicationStore → bounded projection; delete legacy fallback; explicit-subset gate | M/L | med (was high; H7✓+H1✓ de-risked) | triple-store divergence class impossible | H6, H7✓, Session-2 live gate | open |
+| H9 (8b) | Delete Role-A `data_1d/data_2d/hydrated_raw` (~76 refs; keep Role-B) | M | med | **greenfield done-test**; ~0.5-1GB mirrors gone; H7b completes | H8 | open |
+| H10 (7c) | Cadence/eviction policy → session + `max_heavy_bytes` | M | low-med | second-sink recipe; detector-aware caps | H9, ADR-0005 reaffirm | open (ADR decision owed) |
+| H2 | Thin-tail axis-interning / max_items | S | low | long-scan memory bounded | — | open |
+| H3 | Memory-plateau acceptance gate | S | low | boundedness regression-detected | — | open |
+| H11 | ViewerModeHandler seam | M | low | new viewers register, not shotgun-edit | rides H8/H9 | open |
+| H29 (D1) | Reintegrate-All + chunked replace-save (M4) | M/L | med | top missing feature, no 10GB OOM | H1✓; session machinery | open |
+| H24 | ewald live model → session | L | high | thin-GUI mass; "xdart owns no data" true | H9; do last | open |
+
+### Post-tag: controls-panel-v2
+| ID | Chunk | Effort | Risk | Payback | Prereqs | State |
+|----|-------|--------|------|---------|---------|-------|
+| CP-live | Int-flip live re-pass (§14 gate) | — | — | closes the only open flip gate | = Session-1 items B1-B7 | **PENDING** (in RC-7s) |
+| H5 | Stage-6 parity test (inline caps ≡ headless readiness) | S | low | freezes two truth sources until H18 | — | open |
+| H15 | Phase 5: ToolDescriptor refactor → native Stitch/RSM pages | L | med | Stitch/RSM first-class; tool #4 = one descriptor | H6 (persistence) | open |
+| H18 | Stage 6: readiness delegation to headless core | M | low-med | one gating truth source; Tiled prereq | H9 (stable widget), H5 | open |
+| H19 | Phase 3: ScanSourceWidget as Source card + R-2 async open | M | med | no probe stalls; real grouped-scan chips | H18 | open |
+| H20 | Phase 4: Experiment card authoritative (editors, badges, Refine) | M/L | med | provenance UX; Refine usable | H18 | open |
+| H21 | Phase 8: retire ParameterTree + embedded Int + escape hatch | M | med | ~2k LOC gone; sync-bug class ends | H15,H18,H19,H20 + live gate | open |
+| H16 | Entry-point extraction from `readiness.py` | S | low | layering fixed; analyses GUI-side | before Strain/Texture | open |
+| H26 (F-3) | GI corrections for Int 1D/2D | M | low-med | GIWAXS physics parity | validated notebook exists | open |
+| H27 | §13 visual polish (items 1-4, 8-13) | M | low | the mockup look | H21 | open |
+
+### Next cycle: enablers + thin-GUI mass
+| ID | Chunk | Effort | Risk | Payback | Prereqs | State |
+|----|-------|--------|------|---------|---------|-------|
+| H17 | Source-registry seam tests + SourceKind policy | S | low | Tiled/Bluesky additive | — | open |
+| H22 | Stage 5.5: `display_logic` → xrd_tools | M | low | 1.7k LOC decision core headless | H9 | open |
+| H23 | nexus_writer schema convergence | M/L | med | one on-disk-contract owner | H6 | open |
+| H25 | Placement ratchet + xrd_tools/gui disposition | S | low | shell can't re-thicken silently | — | open |
+| H28 | ADR-0006 STEP 2 prepass deletion | M | med | dual-prepass risk retired | live gate slot | open |
+| H13(rest) | Config stash-restore; click-latency shed; reintegrate debounce-stack; update_scans memoize | S ea | med/low | UX niceties | live repro in hand | open |
+
+**Sequencing spine:** RC-FV → Session-1 → RC-8 (tag) → RC-3 → H6 → H8 → H9 (Session-2) → {H10, H18} → {H15, H19, H20} ∥ lanes → H21 (live gate) → next-cycle table.
+
+---
+
 ## Wave R — before the v1.0.0 tag (all S unless noted; parallel-safe with each other)
 
 | ID | Chunk | Status |
