@@ -24,6 +24,19 @@ if _HAS_PYQTGRAPH:
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
 
 
+def test_paths_with_suffix_matches_extensions_case_insensitively(tmp_path):
+    (tmp_path / "scan_0001.TIF").touch()
+    (tmp_path / "scan_0002.tif").touch()
+    (tmp_path / "scan_master.HDF5").touch()
+    (tmp_path / "notes.txt").touch()
+
+    tif_names = sorted(p.name for p in iwt._paths_with_suffix(tmp_path, ".tif"))
+    hdf5_names = sorted(p.name for p in iwt._paths_with_suffix(tmp_path, "_master.hdf5"))
+
+    assert tif_names == ["scan_0001.TIF", "scan_0002.tif"]
+    assert hdf5_names == ["scan_master.HDF5"]
+
+
 def _bare_worker(tmp_path):
     worker = imageThread.__new__(imageThread)
     worker.write_mode = "Append"

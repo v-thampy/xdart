@@ -176,6 +176,9 @@ pre-migration reference signature.  Two additive notes:
    index the frame — but is a user-visible behavior change: a mismatched mask
    that silently no-op'd (or corrupted the index) before now surfaces as a
    validation error so you can supply a correctly-shaped mask.
+13. **Fresh xdart sessions default Meta Type to `auto`.** Auto discovers `.txt`,
+   `.metadata`, and structured name=value sidecars; choose `none`/blank to
+   disable metadata, or `spec` for SPEC files.
 
 ## Stage-6 redesign items: done vs deferred
 

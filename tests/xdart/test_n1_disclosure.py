@@ -150,11 +150,64 @@ def test_meta_ext_hidden_for_nxs_image_type(qapp):
     sync()
     meta = root.child("Signal").child("meta_ext")
     assert meta.opts.get("visible") is False
-    assert meta.value() == "None"
+    assert meta.value() == "none"
 
     h.img_ext = "tif"
     sync()
     assert meta.opts.get("visible", True) is True
+
+
+def test_meta_ext_fresh_default_is_auto(qapp):
+    """Fresh sessions default to metadata auto-discovery, with explicit off."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import params as wparams
+
+    root = Parameter.create(name="p", type="group", children=wparams)
+    meta = root.child("Signal").child("meta_ext")
+
+    assert meta.value() == "auto"
+    assert set(meta.opts["limits"]) >= {"auto", "none", "txt", "pdi", "metadata", "spec"}
+
+
+@pytest.mark.parametrize(
+    ("saved", "param_value", "attr_value"),
+    [
+        ("txt", "txt", "txt"),
+        ("SPEC", "spec", "spec"),
+        (None, "none", None),
+    ],
+)
+def test_meta_ext_session_restore_keeps_saved_value(qapp, monkeypatch, saved, param_value, attr_value):
+    """Only fresh sessions get auto; restored sessions keep their saved Meta Type."""
+    from xdart.gui.tabs.static_scan.wranglers import image_wrangler as iw
+
+    class _Combo:
+        def findText(self, _text):
+            return -1
+        def setCurrentIndex(self, _idx):
+            pass
+
+    class _Check:
+        def setChecked(self, value):
+            self.value = value
+
+    root = Parameter.create(name="p", type="group", children=params)
+    h = types.SimpleNamespace(
+        parameters=root,
+        _restoring=False,
+        _SESSION_PARAMS=imageWrangler._SESSION_PARAMS,
+        ui=types.SimpleNamespace(
+            processingModeCombo=_Combo(),
+            batchCheckBox=_Check(),
+        ),
+        _compute_source_base=lambda: None,
+        get_poni_dict=lambda: None,
+    )
+    monkeypatch.setattr(iw, "load_session", lambda: {"meta_ext": saved})
+
+    MethodType(imageWrangler._restore_from_session, h)()
+
+    assert root.child("Signal").child("meta_ext").value() == param_value
+    assert h.meta_ext == attr_value
 
 
 def test_sync_meta_ext_is_idempotent_no_reemit(qapp):

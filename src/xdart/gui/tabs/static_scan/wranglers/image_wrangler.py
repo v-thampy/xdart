@@ -40,6 +40,40 @@ QPushButton = QtWidgets.QPushButton
 
 def_poni_file = ''
 def_img_file = ''
+def_meta_ext = 'auto'
+
+
+def _normalize_meta_ext(value):
+    """Return the internal metadata mode; ``None`` means GUI metadata off."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == '' or text.lower() == 'none':
+        return None
+    lowered = text.lower()
+    if lowered in ('auto', 'txt', 'pdi', 'metadata', 'spec'):
+        return lowered
+    return text
+
+
+def _meta_ext_parameter_value(value):
+    """Return a value accepted by the Meta File dropdown."""
+    normalized = _normalize_meta_ext(value)
+    return 'none' if normalized is None else normalized
+
+
+def _path_exists_case_insensitive(path):
+    candidate = Path(path)
+    if candidate.exists():
+        return True
+    target = candidate.name.lower()
+    try:
+        return any(
+            sibling.name.lower() == target and sibling.is_file()
+            for sibling in candidate.parent.iterdir()
+        )
+    except OSError:
+        return False
 
 params = [
     # N1: the portable Project Folder.  Setting it stamps entry/@source_base and
@@ -72,9 +106,10 @@ params = [
          'values': ['tif', 'raw', 'h5', 'nxs', 'mar3450'], 'value': 'tif', 'visible': False},
         {'name': 'series_average', 'title': 'Average Scan', 'type': 'bool', 'value': False, 'visible': True},
         {'name': 'meta_ext', 'title': 'Meta File', 'type': 'list',
-         'values': ['None', 'txt', 'pdi', 'SPEC'], 'value': 'txt'},
+         'values': ['auto', 'none', 'txt', 'pdi', 'metadata', 'spec'],
+         'value': def_meta_ext},
         # Optional override for the SPEC file's directory.  Shown only
-        # when ``meta_ext == 'SPEC'`` (see ``set_meta_ext``).  Blank
+        # when ``meta_ext == 'spec'`` (see ``set_meta_ext``).  Blank
         # → use the default search (image dir + immediate parent);
         # set → that directory is searched first.
         {'name': 'meta_dir', 'title': 'Meta Directory', 'type': 'str_browse',
@@ -312,9 +347,9 @@ class imageWrangler(wranglerWidget):
         self.single_img = True if self.inp_type == 'Single Image' else False
         self.file_filter = self.parameters.child('Signal').child('Filter').value()
         self.series_average = self.parameters.child('Signal').child('series_average').value()
-        self.meta_ext = self.parameters.child('Signal').child('meta_ext').value()
-        if self.meta_ext == 'None':
-            self.meta_ext = None
+        self.meta_ext = _normalize_meta_ext(
+            self.parameters.child('Signal').child('meta_ext').value()
+        )
         # Optional explicit dir for SPEC files; '' falls back to the
         # xrd_tools default (image dir + parent search).  Wired
         # to the thread so workers pass it to read_image_metadata.
@@ -629,8 +664,12 @@ class imageWrangler(wranglerWidget):
         self._restoring = True
         try:
             for key, path, is_path, attr in self._SESSION_PARAMS:
+                if key not in session:
+                    continue
                 val = session.get(key)
-                if val is None:
+                if key == 'meta_ext':
+                    val = _meta_ext_parameter_value(val)
+                elif val is None:
                     continue
                 if is_path and not Path(val).exists():
                     continue
@@ -639,7 +678,9 @@ class imageWrangler(wranglerWidget):
                     for segment in path:
                         p = p.child(segment)
                     p.setValue(val)
-                    if attr is not None:
+                    if key == 'meta_ext':
+                        self.meta_ext = _normalize_meta_ext(val)
+                    elif attr is not None:
                         setattr(self, attr, val)
                 except (AttributeError, KeyError, TypeError, ValueError) as e:
                     logger.debug("Failed to restore session parameter %s: %s", key, e)
@@ -1616,9 +1657,6 @@ class imageWrangler(wranglerWidget):
                 _p = Path(self.img_file)
                 self.img_dir, self.img_ext = str(_p.parent), _p.suffix.lstrip('.')
                 self._sync_meta_ext_to_img_ext()
-                # Auto-detect metadata sidecar if not already set (skipped for .nxs)
-                if not self.meta_ext and self.img_ext.lower() != 'nxs':
-                    self.detect_meta_ext(self.img_file)
 
         else:
             self.img_ext = self.parameters.child('Signal').child('img_ext').value()
@@ -1637,9 +1675,6 @@ class imageWrangler(wranglerWidget):
             fname = self._find_image_directory_seed(match, suffix)
             if fname:
                 self.img_file = fname
-                # Auto-detect metadata sidecar if not set
-                if not self.meta_ext:
-                    self.detect_meta_ext(fname)
             else:
                 # No seed yet (e.g. the Source just switched to Image Directory
                 # and no directory is chosen): drop the previous source's file
@@ -1672,13 +1707,13 @@ class imageWrangler(wranglerWidget):
         self.series_average = self.parameters.child('Signal').child('series_average').value()
 
     def set_meta_ext(self):
-        self.meta_ext = self.parameters.child('Signal').child('meta_ext').value()
-        if self.meta_ext == 'None':
-            self.meta_ext = None
+        self.meta_ext = _normalize_meta_ext(
+            self.parameters.child('Signal').child('meta_ext').value()
+        )
         # Show "Meta Directory" + Browse only for SPEC mode.  Other
-        # formats (txt/pdi) look next to the image — no separate dir
+        # formats (auto/txt/pdi/metadata) look next to the image — no separate dir
         # makes sense.  This mirrors the bg_dir pattern.
-        is_spec = (self.meta_ext == 'SPEC')
+        is_spec = (self.meta_ext == 'spec')
         self.parameters.child('Signal').child('meta_dir').show(is_spec)
         self._save_to_session()
         # The metadata FORMAT changed: drop the previous format's parsed
@@ -1706,7 +1741,7 @@ class imageWrangler(wranglerWidget):
             self.meta_dir = path
 
     def _sync_meta_ext_to_img_ext(self):
-        """Force meta_ext='None' and HIDE it when the image type is NeXus.
+        """Force meta_ext='none' and HIDE it when the image type is NeXus.
 
         NeXus/.nxs files embed their own metadata (motors, counters, energy)
         inside the HDF5 tree, so no sidecar file is needed — per the scan
@@ -1722,20 +1757,28 @@ class imageWrangler(wranglerWidget):
         # setup() recursion (RecursionError at app start, Jun 10).  setOpts
         # skips unchanged values, breaking the cycle.
         if (self.img_ext or '').lower() == 'nxs':
-            if meta_param.value() != 'None':
-                meta_param.setValue('None')    # fires set_meta_ext
+            if _normalize_meta_ext(meta_param.value()) is not None:
+                meta_param.setValue('none')    # fires set_meta_ext
             meta_param.setOpts(visible=False)
         else:
             meta_param.setOpts(visible=True)
 
     def exists_meta_file(self, img_file):
         """Checks for existence of meta file for image file"""
-        if self.meta_ext != 'SPEC':
+        meta_ext = _normalize_meta_ext(getattr(self, 'meta_ext', None))
+        if not meta_ext:
+            return False
+        if meta_ext == 'auto':
+            return bool(read_image_metadata(
+                img_file, meta_format='auto', meta_dir=self.meta_dir,
+            ))
+        if meta_ext != 'spec':
             meta_files = [
-                f'{os.path.splitext(img_file)[0]}.{self.meta_ext}',
-                f'{img_file}.{self.meta_ext}'
+                f'{os.path.splitext(img_file)[0]}.{meta_ext}',
+                f'{img_file}.{meta_ext}'
             ]
-            if os.path.exists(meta_files[0]) or os.path.exists(meta_files[1]):
+            if (_path_exists_case_insensitive(meta_files[0])
+                    or _path_exists_case_insensitive(meta_files[1])):
                 return True
         else:
             spec_fname, _, _ = _extract_scan_info(Path(img_file))
@@ -1764,7 +1807,8 @@ class imageWrangler(wranglerWidget):
         """
         base = os.path.splitext(img_file)[0]
         for ext in ('txt', 'pdi'):
-            if os.path.exists(f'{base}.{ext}') or os.path.exists(f'{img_file}.{ext}'):
+            if (_path_exists_case_insensitive(f'{base}.{ext}')
+                    or _path_exists_case_insensitive(f'{img_file}.{ext}')):
                 # Update the GUI dropdown so the user sees the change
                 param = self.parameters.child('Signal').child('meta_ext')
                 param.setValue(ext)          # fires set_meta_ext automatically
@@ -2004,6 +2048,14 @@ class imageWrangler(wranglerWidget):
         """ Reads image metadata to populate matching parameters
         """
         if not self.img_file:
+            return
+        if not self.meta_ext:
+            # GUI "none"/blank means metadata OFF.  Do not pass Python None to
+            # read_image_metadata here: the headless API deliberately treats
+            # None as "auto" for notebook/script callers.
+            self.scan_parameters = []
+            self.counters = []
+            self.motors = []
             return
 
         # Pass meta_dir so SPEC metadata (which often lives in a separate Meta

@@ -2205,6 +2205,71 @@ def test_set_meta_ext_clears_params_to_force_metadata_reread():
     assert h.scan_parameters == []
 
 
+def test_set_meta_ext_blank_maps_to_metadata_off():
+    """Blank Meta Type is the GUI off switch, not headless auto."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    class _P:
+        def __init__(self, value=None):
+            self._v = value
+            self.visible = True
+        def value(self):
+            return self._v
+        def show(self, visible):
+            self.visible = bool(visible)
+
+    signal = {"meta_ext": _P(""), "meta_dir": _P("")}
+    params = SimpleNamespace(
+        child=lambda name: SimpleNamespace(child=lambda n: signal[n]))
+
+    seen = []
+    h = SimpleNamespace(
+        parameters=params,
+        scan_parameters=["old"],
+        meta_ext="txt",
+    )
+    h.set_meta_ext = MethodType(imageWrangler.set_meta_ext, h)
+    h._save_to_session = lambda: None
+    h.get_img_fname = lambda: seen.append(list(h.scan_parameters))
+
+    h.set_meta_ext()
+
+    assert h.meta_ext is None
+    assert signal["meta_dir"].visible is False
+    assert seen == [[]]
+
+
+def test_get_scan_parameters_metadata_off_makes_zero_reader_calls(tmp_path, monkeypatch):
+    """GUI none/off must not leak Python None to read_image_metadata."""
+    from xdart.gui.tabs.static_scan.wranglers import image_wrangler as iw
+
+    image = tmp_path / "scan_0001.tif"
+    image.touch()
+    calls = []
+
+    def fail_reader(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("metadata reader must not be called when GUI metadata is off")
+
+    monkeypatch.setattr(iw, "read_image_metadata", fail_reader)
+
+    h = SimpleNamespace(
+        img_file=str(image),
+        meta_ext=None,
+        scan_parameters=["old"],
+        counters=["old"],
+        motors=["old"],
+    )
+    h.get_scan_parameters = MethodType(iw.imageWrangler.get_scan_parameters, h)
+
+    h.get_scan_parameters()
+
+    assert calls == []
+    assert h.scan_parameters == []
+    assert h.counters == []
+    assert h.motors == []
+
+
 def test_get_img_fname_no_sidecar_clears_counters_and_refreshes_bg(tmp_path):
     """F4: when a format/source switch resolves a file with NO metadata sidecar,
     get_img_fname clears scan_parameters, motors AND counters, and refreshes the

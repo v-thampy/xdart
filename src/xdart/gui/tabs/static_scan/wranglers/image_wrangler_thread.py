@@ -15,7 +15,6 @@ import queue
 import re
 import threading
 import time
-import glob
 import numpy as np
 from pathlib import Path
 from collections import Counter, deque
@@ -123,7 +122,20 @@ _LIVE_RECORD_STORE_MAX_ITEMS = 512
 
 def _is_eiger_master(path):
     """Return True if path looks like an Eiger HDF5 master file (*_master.h5 / *_master.hdf5)."""
-    return Path(path).stem.endswith('_master')
+    return Path(path).stem.lower().endswith('_master')
+
+
+def _paths_with_suffix(root, suffix, *, recursive=False):
+    """Yield files below *root* whose name ends with *suffix*, ignoring case."""
+    suffix = str(suffix or '').lower()
+    if not suffix:
+        return []
+    root = Path(root)
+    iterator = root.rglob('*') if recursive else root.glob('*')
+    return (
+        p for p in iterator
+        if p.is_file() and p.name.lower().endswith(suffix)
+    )
 
 
 def _raw_lives_in_source(path):
@@ -836,17 +848,16 @@ class imageThread(wranglerThread):
             include_subdir = bool(getattr(self, "include_subdir", False))
             if img_ext in ('h5', 'hdf5'):
                 suffix = f'_master.{img_ext}'
-                pattern = f'*{suffix}'
-                candidates = (root.rglob(pattern) if include_subdir
-                              else root.glob(pattern))
+                candidates = _paths_with_suffix(
+                    root, suffix, recursive=include_subdir)
                 for path in natural_sort_ints([str(p) for p in candidates]):
                     p = Path(path)
                     if match(p.name[:-len(suffix)]):
                         add(self._eiger_scan_name(p))
             elif img_ext and img_ext not in ('nxs',):
                 suffix = f'.{img_ext}'
-                candidates = (root.rglob(f'*{suffix}') if include_subdir
-                              else root.glob(f'*{suffix}'))
+                candidates = _paths_with_suffix(
+                    root, suffix, recursive=include_subdir)
                 for path in natural_sort_ints([str(p) for p in candidates]):
                     p = Path(path)
                     if match(p.name[:-len(suffix)]):
@@ -1839,8 +1850,10 @@ class imageThread(wranglerThread):
         if not scan_name or not img_dir:
             return []
         _series_re = re.compile(
-            rf'^{re.escape(scan_name)}[_-]\d+\.{re.escape(img_ext)}$')
-        paths = [str(p) for p in Path(img_dir).glob(f'*.{img_ext}')
+            rf'^{re.escape(scan_name)}[_-]\d+\.{re.escape(img_ext)}$',
+            re.IGNORECASE,
+        )
+        paths = [str(p) for p in _paths_with_suffix(Path(img_dir), f'.{img_ext}')
                  if _series_re.match(p.name)]
         out = []
         for fname in natural_sort_ints(paths):
@@ -2597,16 +2610,19 @@ class imageThread(wranglerThread):
     @staticmethod
     def _eiger_scan_name(master_path):
         master_stem = Path(master_path).stem
-        return master_stem[:-7] if master_stem.endswith('_master') else master_stem
+        return master_stem[:-7] if master_stem.lower().endswith('_master') else master_stem
 
     def _eiger_refill_master_queue(self):
-        """Glob for *_master.h5 files not yet processed (Image Directory mode)."""
+        """Queue matching HDF5 master / NeXus files not yet processed."""
         match = _name_filter(self.file_filter)
-        pattern = '*_master.h5'
-        candidates = (Path(self.img_dir).rglob(pattern) if self.include_subdir
-                      else Path(self.img_dir).glob(pattern))
+        img_ext = (getattr(self, 'img_ext', '') or '').lower().lstrip('.')
+        if not img_ext:
+            return
+        suffix = f'_master.{img_ext}' if img_ext in ('h5', 'hdf5') else f'.{img_ext}'
+        candidates = _paths_with_suffix(
+            Path(self.img_dir), suffix, recursive=self.include_subdir)
         master_files = sorted(
-            p for p in candidates if match(p.name[:-len('_master.h5')])
+            p for p in candidates if match(p.name[:-len(suffix)])
         )
         queued = set(self._eiger_master_queue)
         for mf in master_files:
@@ -2958,19 +2974,19 @@ class imageThread(wranglerThread):
                 # files whose tail is purely a numeric frame index, so we
                 # only pick up the *strict* siblings of self.img_file.
                 _series_re = re.compile(
-                    rf'^{re.escape(self.scan_name)}[_-]\d+\.{re.escape(self.img_ext)}$'
+                    rf'^{re.escape(self.scan_name)}[_-]\d+\.{re.escape(self.img_ext)}$',
+                    re.IGNORECASE,
                 )
                 self.img_fnames = [
-                    p for p in Path(self.img_dir).glob(f'*.{self.img_ext}')
+                    p for p in _paths_with_suffix(Path(self.img_dir), f'.{self.img_ext}')
                     if _series_re.match(p.name)
                 ]
             else:
                 first_img = ''
                 match = _name_filter(self.file_filter)
                 suffix = f'.{self.img_ext}'
-                candidates = (Path(self.img_dir).rglob(f'*{suffix}')
-                              if self.include_subdir
-                              else Path(self.img_dir).glob(f'*{suffix}'))
+                candidates = _paths_with_suffix(
+                    Path(self.img_dir), suffix, recursive=self.include_subdir)
                 self.img_fnames = (p for p in candidates
                                    if match(p.name[:-len(suffix)]))
 
@@ -3032,6 +3048,10 @@ class imageThread(wranglerThread):
     # ── Metadata / Background ────────────────────────────────────────────
 
     def get_meta_data(self, img_file):
+        if not self.meta_ext:
+            # GUI "none"/blank is an off switch.  The reusable headless reader
+            # maps None to auto, so the GUI worker must guard before calling it.
+            return {}
         return read_image_metadata(img_file, meta_format=self.meta_ext, meta_dir=self.meta_dir)
 
     def subtract_bg(self, img_data, img_file, img_number, img_meta):
@@ -3159,7 +3179,7 @@ class imageThread(wranglerThread):
         if self.bg_type == 'Single BG File':
             if self.bg_file:
                 bg_file = self.bg_file
-                bg_meta = read_image_metadata(bg_file, meta_format=self.meta_ext, meta_dir=self.meta_dir)
+                bg_meta = self.get_meta_data(bg_file)
         elif self.bg_type == 'Series Average':
             if self.bg_file:
                 sname, fnames, bg, bg_meta = get_series_avg(self.bg_file, self.detector, self.meta_ext)
@@ -3177,11 +3197,15 @@ class imageThread(wranglerThread):
                     scan_term = str(self.scan_name).lower()
                     match = (lambda name, _m=match, _t=scan_term:
                              _t in str(name).lower() and _m(name))
-                suffix = f'.{self.meta_ext}'
-                meta_files = sorted(
-                    f for f in glob.glob(os.path.join(self.img_dir, f'*{suffix}'))
-                    if match(os.path.basename(f)[:-len(suffix)])
-                )
+                if not self.meta_ext:
+                    meta_files = []
+                    suffix = ''
+                else:
+                    suffix = f'.{self.meta_ext}'
+                    meta_files = sorted(
+                        str(f) for f in _paths_with_suffix(self.img_dir, suffix)
+                        if match(f.name[:-len(suffix)])
+                    )
 
                 for meta_file in meta_files:
                     bg_file = f'{os.path.splitext(meta_file)[0]}.{self.img_ext}'
@@ -3189,7 +3213,7 @@ class imageThread(wranglerThread):
                         bg_file = None
                         continue
 
-                    bg_meta = read_image_metadata(bg_file, meta_format=self.meta_ext, meta_dir=self.meta_dir)
+                    bg_meta = self.get_meta_data(bg_file)
                     if self.bg_match_fname:
                         _, meta_img_num = _get_scan_info(meta_file)
                         if img_number == meta_img_num:

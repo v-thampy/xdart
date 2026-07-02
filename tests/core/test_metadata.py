@@ -256,6 +256,18 @@ class TestReadImageMetadata:
         result = read_image_metadata(image, meta_format="txt")
         assert result["i0"] == pytest.approx(1000.0)
 
+    def test_sidecar_extension_matching_is_case_insensitive(self, tmp_path: Path) -> None:
+        image = tmp_path / "scan_0001.tif"
+        image.touch()
+        sidecar = tmp_path / "scan_0001.TXT"
+        sidecar.write_text(_TXT_CONTENT)
+
+        found = _find_sidecar(image, "txt")
+        result = read_image_metadata(image, meta_format="txt")
+
+        assert found == sidecar
+        assert result["i0"] == pytest.approx(1000.0)
+
     def test_replaced_extension_takes_priority(self, tmp_path: Path) -> None:
         """When both foo.txt and foo.tif.txt exist, foo.txt (replaced ext) wins."""
         image = tmp_path / "scan_0001.tif"
@@ -380,6 +392,81 @@ class TestReadImageMetadata:
 
         assert second["sampleName"] == "second"
         assert second["exposureTime"] == 2
+
+    def test_auto_metadata_discovers_aps_appended_metadata_fixture(
+        self,
+        tmp_path: Path,
+        clear_auto_sidecar_cache,
+    ) -> None:
+        image = tmp_path / "aps_qxrd_trimmed.tif"
+        image.touch()
+        Path(str(image) + ".metadata").write_text(
+            (_FIXTURE_DIR / "aps_qxrd_trimmed.tif.metadata").read_text()
+        )
+
+        result = read_image_metadata(image, meta_format="auto")
+
+        assert result["sampleName"] == "P25_C5"
+        assert result["exposureTime"] == 1
+        assert metadata_module._AUTO_SIDECAR_CACHE[(tmp_path, ".tif")] == (
+            "append",
+            ".metadata",
+        )
+
+    def test_auto_metadata_discovers_case_insensitive_appended_sidecar(
+        self,
+        tmp_path: Path,
+        clear_auto_sidecar_cache,
+    ) -> None:
+        image = tmp_path / "scan_0001.tif"
+        image.touch()
+        Path(str(image) + ".METADATA").write_text(
+            _STRUCTURED_CONTENT.format(sample="upper", exposure=4)
+        )
+
+        result = read_image_metadata(image, meta_format="auto")
+
+        assert result["sampleName"] == "upper"
+        assert metadata_module._AUTO_SIDECAR_CACHE[(tmp_path, ".tif")] == (
+            "append",
+            ".METADATA",
+        )
+
+    def test_auto_metadata_discovers_ssrl_txt_sidecar(
+        self,
+        tmp_path: Path,
+        clear_auto_sidecar_cache,
+    ) -> None:
+        image = tmp_path / "scan_0001.tif"
+        image.touch()
+        (tmp_path / "scan_0001.txt").write_text(_TXT_CONTENT)
+
+        result = read_image_metadata(image, meta_format="auto")
+
+        assert result["i0"] == pytest.approx(1000.0)
+        assert result["del"] == pytest.approx(15.5)
+
+    def test_auto_metadata_does_not_cache_negative_late_sidecar(
+        self,
+        tmp_path: Path,
+        clear_auto_sidecar_cache,
+    ) -> None:
+        image = tmp_path / "scan_0001.tif"
+        image.touch()
+
+        assert read_image_metadata(image, meta_format="auto") == {}
+        assert (tmp_path, ".tif") not in metadata_module._AUTO_SIDECAR_CACHE
+
+        Path(str(image) + ".metadata").write_text(
+            _STRUCTURED_CONTENT.format(sample="late", exposure=3)
+        )
+        result = read_image_metadata(image, meta_format="auto")
+
+        assert result["sampleName"] == "late"
+        assert metadata_module._AUTO_SIDECAR_CACHE[(tmp_path, ".tif")] == (
+            "append",
+            ".metadata",
+        )
 
     def test_none_meta_format_uses_auto_metadata(
         self,

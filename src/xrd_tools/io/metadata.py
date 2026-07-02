@@ -176,6 +176,23 @@ def _read_structured_metadata(path: Path | str) -> tuple[dict[str, MetadataValue
     return _parse_structured_metadata(text)
 
 
+def _existing_path_case_insensitive(candidate: Path) -> Path | None:
+    """Return an existing sibling matching *candidate.name* case-insensitively."""
+    target = candidate.name.lower()
+    try:
+        for sibling in candidate.parent.iterdir():
+            if sibling.name == candidate.name and sibling.is_file():
+                return sibling
+        for sibling in candidate.parent.iterdir():
+            if sibling.name.lower() == target and sibling.is_file():
+                return sibling
+    except OSError:
+        pass
+    if candidate.exists():
+        return candidate
+    return None
+
+
 def _find_sidecar(image_path: Path, ext: str) -> Path | None:
     """Locate a sidecar file for *image_path* with extension *ext*.
 
@@ -196,15 +213,20 @@ def _find_sidecar(image_path: Path, ext: str) -> Path | None:
         First existing candidate, or ``None`` if neither exists.
     """
     ext = ext[1:] if ext.startswith(".") else ext
+    ext = ext.lower()
     if not ext:
         return None
 
-    candidate_replace = image_path.with_suffix(f".{ext}")
-    if candidate_replace.exists():
+    candidate_replace = _existing_path_case_insensitive(
+        image_path.with_suffix(f".{ext}")
+    )
+    if candidate_replace is not None:
         return candidate_replace
 
-    candidate_append = Path(str(image_path) + f".{ext}")
-    if candidate_append.exists():
+    candidate_append = _existing_path_case_insensitive(
+        Path(str(image_path) + f".{ext}")
+    )
+    if candidate_append is not None:
         return candidate_append
 
     return None
@@ -252,21 +274,21 @@ def _iter_auto_sidecar_candidates(image_path: Path):
         return
 
     seen: set[Path] = set()
-    appended_prefix = image_path.name + "."
+    appended_prefix = (image_path.name + ".").lower()
     for candidate in entries:
         if (
-            candidate.name.startswith(appended_prefix)
+            candidate.name.lower().startswith(appended_prefix)
             and _is_non_image_companion(candidate, image_path)
         ):
             seen.add(candidate)
             yield candidate, "append", candidate.name[len(image_path.name):]
 
-    replaced_prefix = image_path.stem + "."
+    replaced_prefix = (image_path.stem + ".").lower()
     for candidate in entries:
         if candidate in seen:
             continue
         if (
-            candidate.name.startswith(replaced_prefix)
+            candidate.name.lower().startswith(replaced_prefix)
             and _is_non_image_companion(candidate, image_path)
         ):
             yield candidate, "replace", candidate.name[len(image_path.stem):]
@@ -279,14 +301,16 @@ def _auto_sidecar_from_cache(image_path: Path) -> Path | None:
 
     convention, suffix = cached
     if convention == "append":
-        candidate = Path(str(image_path) + suffix)
+        candidate = _existing_path_case_insensitive(Path(str(image_path) + suffix))
     elif convention == "replace":
-        candidate = image_path.with_name(image_path.stem + suffix)
+        candidate = _existing_path_case_insensitive(
+            image_path.with_name(image_path.stem + suffix)
+        )
     else:
         _AUTO_SIDECAR_CACHE.pop(_auto_cache_key(image_path), None)
         return None
 
-    if _is_non_image_companion(candidate, image_path):
+    if candidate is not None and _is_non_image_companion(candidate, image_path):
         return candidate
 
     _AUTO_SIDECAR_CACHE.pop(_auto_cache_key(image_path), None)

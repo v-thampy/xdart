@@ -1128,7 +1128,7 @@ def build_bound_control_state(
             kind=ControlFieldKind.COMBO)
         add(SectionId.SOURCE, "Energy", ("Source", "energy_preference"),
             kind=ControlFieldKind.COMBO)
-        if str(values.get(("Signal", "meta_ext"), "")) == "SPEC":
+        if str(values.get(("Signal", "meta_ext"), "")).strip().lower() == "spec":
             add(SectionId.SOURCE, "SPEC Dir", ("Signal", "meta_dir"), browse=True)
         add(SectionId.EXPERIMENT, "Poni", ("Signal", "poni_file"), browse=True)
         add(SectionId.EXPERIMENT, "Mask File", ("Signal", "mask_file"), browse=True)

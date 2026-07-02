@@ -81,7 +81,7 @@ _FIELD_TOOLTIPS: dict[tuple[str, ...], str] = {
         "single image."),
     ("Signal", "include_subdir"): "Also search sub-directories for matching images.",
     ("Signal", "img_ext"): "Image file type (extension).",
-    ("Signal", "meta_ext"): "Per-frame metadata format (e.g. txt, SPEC, pdi).",
+    ("Signal", "meta_ext"): "Per-frame metadata format (auto, none, txt, metadata, spec, pdi).",
     ("Signal", "meta_dir"): (
         "Directory holding the SPEC metadata file, when it's separate from the "
         "images."),
