@@ -243,6 +243,26 @@ def scanlocked(func):
     return wrapper
 
 
+def _scan_key_from_source(src):
+    """Derive the wrangler's scan name from a frame's ``source_file``.
+
+    Matches ``image_wrangler_thread``'s own naming EXACTLY so the GUI can attribute
+    each frame to its scan without the mis-timed ``new_scan`` signal: strip a
+    trailing ``_master`` (Eiger HDF5), else fall back to ``_get_scan_info`` (which
+    strips a trailing ``_<digits>`` from the stem — the per-file series case).
+    Returns ``None`` for an empty/missing source (treated as "no scan change").
+    Pure string parse (no I/O) — safe to call per frame on the GUI thread.
+    """
+    if not src:
+        return None
+    from pathlib import Path
+    stem = Path(src).stem
+    if stem.endswith("_master"):
+        return stem[:-7]
+    from .wranglers.image_wrangler_thread import _get_scan_info
+    return _get_scan_info(src)[0] or None
+
+
 class staticWidget(QWidget):
     """Tab for integrating data collected by a scanning area detector.
     As of current version, only handles a single angle (2-theta).
@@ -3671,8 +3691,29 @@ class staticWidget(QWidget):
         # live stream must still paint every ~200 ms; the latest index
         # wins via _pending_update_idx (the shared coalescing idiom,
         # xdart.utils.throttle).
-        self._update_timer = Coalescer(200, mode="throttle", parent=self)
+        # Live timers, both TERMINAL-TUNABLE for live sweeps (no rebuild):
+        #   XDART_FLUSH_MS (default 100) — the heavy image-update quantum. Keep it
+        #     >= the median flush total (drain+list+render, ~70-90 ms) or the event
+        #     loop re-saturates and the GUI freezes; smaller = smoother image but
+        #     riskier on heavy 2D frames.
+        #   XDART_LIST_MS  (default 70)  — the fast list/cursor refresh so the Frames
+        #     list + auto-last cursor + status scroll continuously between renders
+        #     (_flush_frame_list runs the LIGHT legs only: O(new) list refresh + a
+        #     signal-blocked cursor advance — no drain, no render).
+        # See docs/design/design_gui_liveness_jul2026.md.
+        def _ms(_name, _default):
+            try:
+                return max(10, int(os.environ.get(_name) or _default))
+            except (TypeError, ValueError):
+                return _default
+        _flush_ms = _ms("XDART_FLUSH_MS", 150)
+        _list_ms = _ms("XDART_LIST_MS", 60)
+        if os.environ.get("XDART_PERF"):
+            logger.info("[PERF] live timers: flush=%dms list=%dms", _flush_ms, _list_ms)
+        self._update_timer = Coalescer(_flush_ms, mode="throttle", parent=self)
         self._update_timer.triggered.connect(self._flush_pending_update)
+        self._list_timer = Coalescer(_list_ms, mode="throttle", parent=self)
+        self._list_timer.triggered.connect(self._flush_frame_list)
         # Reintegrate gets its OWN throttle: bai_*_all (live, batch=1) fires a
         # per-frame `update` signal, and rendering each one synchronously floods
         # the GUI (esp. the 2D cake at ~hundreds-of-ms each) -> the whole GUI
@@ -4022,6 +4063,29 @@ class staticWidget(QWidget):
         # A real frame was processed this run (Append-mode feedback gate).
         self._run_saw_frame = True
 
+        # Frame-driven scan boundary.  The wrangler's new_scan signal races the
+        # frame stream (emitted from a different thread + Eiger prefetch read-ahead),
+        # so detect a genuinely-new scan from the FRAME itself — its source_file
+        # carries the scan identity — and rescope the panel BEFORE appending, so
+        # THIS frame becomes #1 of the new scan and its own frames can never be
+        # dropped (unlike reacting to the mis-timed new_scan signal).  PEEK the
+        # frame (never pop — the pop below stays the sole consumer).  Skipped in
+        # batch (which suppresses per-frame update_data) and for the very first
+        # scan (name "null_main", whose new_scan reliably precedes its frames).
+        published = getattr(self.wrangler, "thread", None)
+        if published is not None and not getattr(published, "batch_mode", False):
+            _peek = getattr(published, "_published_frames", {}).get(idx)
+            if _peek is not None:
+                _key = _scan_key_from_source(getattr(_peek, "source_file", ""))
+                _cur = getattr(self.scan, "name", None)
+                if _key and _key != _cur and _cur != "null_main":
+                    self._rescope_frame_panel_to(_key)
+                    # Tell new_scan a frame ALREADY rescoped THIS run, so its late
+                    # signal skips the (now-destructive) clear.  A consumed flag —
+                    # NOT a name match — so a same-name re-run (where no frame has
+                    # rescoped yet) still clears.
+                    self._frame_driven_rescoped_pending = True
+
         # Per-frame mid-scan refresh.  Append idx to scan.frames.index
         # and bypass the file_thread.load_frame disk read by pulling the
         # freshly-integrated frame directly out of the wrangler's in-memory
@@ -4087,6 +4151,30 @@ class staticWidget(QWidget):
         # the pending fire instead of restarting the countdown.
         self._pending_update_idx = idx
         self._update_timer.trigger()
+        # ...and the fast list/cursor timer so the Frames list scrolls between
+        # the (paced) heavy renders.
+        self._list_timer.trigger()
+
+    def _flush_frame_list(self):
+        """LIGHT flush (fast timer): refresh the Frames list + advance the
+        auto-last cursor, WITHOUT the heavy drain/render.
+
+        The frame-list widget is built purely from ``scan.frames.index`` (which
+        ``update_data`` appends per-frame), so it does not need the coalesced
+        publication drain; ``latest_frame(emit_update=False)`` advances the cursor
+        with signals blocked (no ``data_changed``/``setImage``).  This lets the
+        list + selection + status scroll continuously (~14 Hz) while the expensive
+        image/plot render stays paced on ``_update_timer`` (~5 Hz).  Idempotent
+        with ``_flush_pending_update``, which redoes these O(new) legs before it
+        renders."""
+        if self._pending_update_idx is None:
+            return
+        try:
+            self.h5viewer.update_data(emit_update=False)
+            if self.h5viewer.auto_last:
+                self.latest_frame(emit_update=False)
+        except Exception:
+            logger.debug("light frame-list flush failed", exc_info=True)
 
     def _drain_pending_frames(self):
         """Build + store publications and refresh scan_data for every frame
@@ -4760,6 +4848,10 @@ class staticWidget(QWidget):
         if self._run_active:
             return
         self._run_active = True
+        # Frame-driven scan-boundary flag: clear it at run START so the first
+        # new_scan of THIS run always clears the panel (fixes a same-name re-run
+        # not clearing) — an unconsumed flag from a prior run can't leak in.
+        self._frame_driven_rescoped_pending = False
         # Re-snapshot the frame-count freeze from scratch each run: clear any
         # leftover snapshot so a new run can't freeze at the PREVIOUS run's frame
         # count if no run_active=False refresh happened to clear it in between
@@ -5184,6 +5276,82 @@ class staticWidget(QWidget):
         self._stitch_status(f'Stitch failed: {msg}')
         logger.error("Stitch error: %s", msg)
 
+    def _rescope_frame_panel_to(self, name):
+        """Reset the Frames-panel / display state to a NEW scan identity.
+
+        The scan boundary is FRAME-DRIVEN: update_data() detects a source_file scan
+        change and calls this before appending the new scan's first frame, so it
+        runs on the GUI thread INDEPENDENTLY of the mis-timed new_scan signal.  It
+        does the light state clears only (the coalesced flush / new_scan's tail
+        redraws), so it stays cheap on the frame hot path.  It carries the FULL
+        destructive set: clearing _pending_frames / publication_store /
+        _scan_info_rows alongside the index is required — otherwise a late new_scan
+        (or this call) would strand the new scan's undrained frames.
+        """
+        self.scan.name = name
+        # Wire the viewer to THIS scan's output HERE (driven by the frame stream),
+        # NOT from the new_scan signal — set_file queues an async set_datafile that
+        # RENAMES scan.name (scan.py:set_datafile), so calling it from an out-of-sync
+        # new_scan would flip `cur` mid-scan and make the current scan's continuing
+        # frames rescope + drop.  fname comes from the per-scan stash new_scan fills.
+        _fname = getattr(self, "_scan_fname_cache", {}).get(name)
+        if _fname:
+            try:
+                self._sync_h5viewer_save_dir(os.path.dirname(_fname), refresh=False)
+                self.h5viewer.set_file(_fname, internal=True)
+            except Exception:
+                logger.debug("scan-rescope viewer rewire failed", exc_info=True)
+        # Stamp which scan the panel is now scoped to (retained for diagnostics).
+        self._frame_driven_scan_key = name
+        self.frames.clear()
+        self.frame_ids.clear()
+        # A-Step (Phase 5): reset the per-scan FrameRecordStore here so it clears on
+        # the frame-driven boundary too (lazily recreated by
+        # _active_frame_record_store, so None is safe + gives each scan a fresh store).
+        self._frame_record_store = None
+        self.publication_store.clear()
+        # Undrained stash + scan_data row cache from the previous scan.
+        self._pending_frames = {}
+        self._scan_info_rows = {}
+        # Reset the Overlay/Waterfall accumulator (a new scan may use different
+        # params / GI / axis; appending its traces across scans would mix data).
+        try:
+            self.displayframe.clear_overlay()
+        except Exception:
+            logger.debug("clear_overlay on scan rescope failed", exc_info=True)
+        try:
+            import pandas as pd
+            with self.scan.scan_lock:
+                self.scan.frames.index.clear()
+                self.scan.frames._in_memory.clear()
+                self.scan.scan_data = pd.DataFrame()
+        except AttributeError:
+            pass
+        # Keep only the currently-rendered frame(s) so the outgoing scan's image
+        # lingers until the new scan's first frame draws.
+        keep = set()
+        try:
+            df = self.displayframe
+            for lst in (df.idxs, df.idxs_1d, df.idxs_2d):
+                keep.update(int(i) for i in (lst or ()))
+        except Exception:
+            pass
+        try:
+            with self.data_lock:
+                for cache in (self.data_1d, self.data_2d):
+                    for k in [k for k in list(cache.keys()) if int(k) not in keep]:
+                        cache.pop(k, None)
+            # Frame indices restart per scan: re-arm the raw self-heal neg cache.
+            self.displayframe._raw_resolve_failed = set()
+            self.displayframe._raw_full_shape = None
+        except Exception:
+            logger.debug("scan-rescope cache purge skipped", exc_info=True)
+        # Point the viewer at the new scan (the frame-driven path has no new_scan
+        # tail of its own).
+        self.h5viewer.scan_name = name
+        self.h5viewer.auto_last = True
+        self.h5viewer.latest_idx = 1
+
     def new_scan(self, name, fname, gi, incidence_motor, single_img,
                  series_average):
         """Connected to sigUpdateFile from wrangler. Called when a new
@@ -5197,21 +5365,31 @@ class staticWidget(QWidget):
                 positional so the rename is purely cosmetic at this
                 boundary — the value still flows through unchanged.
         """
-        # Eagerly set the scan's name to the new scan's name so the
-        # per-frame ``h5viewer.update_data`` path doesn't bail on the
-        # ``if scan.name == "null_main": return`` guard.  Without
-        # this, the scan name only became real after the async
-        # ``file_thread`` processed the queued ``set_datafile``
-        # command — by which time the wrangler had often moved on
-        # to the next scan.  Visible symptom: in multi-scan Image
-        # Directory runs the plots stayed blank during the entire
-        # run and only the last scan's data appeared at the end.
-        # ``self.h5viewer.set_file`` below still queues the proper
-        # ``set_datafile`` so the scan's ``data_file`` and the
-        # canonical name resolution (via ``scan.set_datafile``)
-        # land correctly; this assignment just unblocks the
-        # synchronous render path immediately.
-        self.scan.name = name
+        # The frame-panel boundary is FRAME-DRIVEN (update_data attributes each
+        # frame to its scan via source_file), because Image Directory mode fires
+        # new_scan signals in a BURST wildly out of sync with the frame stream — the
+        # diagnostic log showed new_scan(LaB6) arriving while scan 03271005 was only
+        # at frame 8, so a signal-keyed clear wiped 03271005's frames and it
+        # restarted at 9.  So new_scan only touches scan.name / the panel / the
+        # cursor when it MATCHES the scan the frame stream is currently rendering (a
+        # same-name re-run or the first scan); an out-of-sync signal for a DIFFERENT
+        # scan defers entirely to the frame stream (which clears + rescopes when
+        # that scan's frames actually arrive).  Capture the pre-eager-set name.
+        _prev_name = getattr(self.scan, "name", None)
+        _in_sync = (name == _prev_name) or _prev_name in (None, "", "null_main")
+        # Eager name set unblocks the synchronous render path (past the
+        # ``scan.name == "null_main"`` guard) — but ONLY in sync, or an out-of-sync
+        # signal would hijack scan.name and make the currently-arriving scan's
+        # continuing frames spuriously rescope + drop.
+        if _in_sync:
+            self.scan.name = name
+        # Stash THIS scan's output path so the FRAME-DRIVEN boundary
+        # (_rescope_frame_panel_to) can wire the viewer when the scan's frames
+        # actually arrive.  new_scan must NOT set_file here: its async set_datafile
+        # renames scan.name, and out-of-sync signals would flip the current scan
+        # mid-stream (the "flickers to LaB6 then reverts to Combi" symptom).
+        self._scan_fname_cache = getattr(self, "_scan_fname_cache", {})
+        self._scan_fname_cache[name] = fname
         # G1/T0-1: a new run is a new data identity — drop the wavelength
         # restored from whatever file was open before, synchronously (the
         # async file-thread set_datafile also clears, but frames can render
@@ -5220,8 +5398,8 @@ class staticWidget(QWidget):
         _clear_wl = getattr(self.scan, '_clear_persisted_wavelength', None)
         if callable(_clear_wl):
             _clear_wl()
-        self._sync_h5viewer_save_dir(os.path.dirname(fname), refresh=False)
-        self.h5viewer.set_file(fname, internal=True)   # run's own wiring
+        # (Viewer wiring — save-dir + set_file — is done frame-driven in
+        # _rescope_frame_panel_to, NOT here; see the stash above.)
         self.scan.gi = gi
         self.scan.incidence_motor = incidence_motor
         self.scan.single_img = single_img
@@ -5273,98 +5451,44 @@ class staticWidget(QWidget):
             self.integratorTree.get_args('bai_2d')
             self.integratorTree.set_image_units()
 
-        # Flush any throttled update from the *previous* scan before we
-        # blow away its in-memory state.  Without this, in non-batch
-        # multi-scan runs (Image Directory + Eiger) the per-frame
-        # sigUpdate from the previous scan was scheduled but never had
-        # a chance to render before this slot wiped the caches and
-        # repointed the viewer — so the user only ever saw blanks
-        # during the run and the final scan at the end.
+        # ── Panel + cursor: FRAME-STREAM-AUTHORITATIVE ─────────────────────────
+        # Only act when this new_scan is IN SYNC with the scan the frame stream is
+        # rendering.  An out-of-sync signal for a DIFFERENT scan (directory mode
+        # bursts them out of order) must NOT clear or move the cursor — update_data's
+        # frame-driven boundary owns the transition and clears + rescopes when this
+        # scan's frames actually land (the config above is already applied, ready
+        # for then).  This is what stops new_scan(LaB6) wiping scan 03271005's
+        # in-flight frames.
+        _pending_was = getattr(self, "_frame_driven_rescoped_pending", False)
+        if os.environ.get("XDART_PERF"):
+            logger.info("[PERF] new_scan boundary: live=%s prev=%r name=%r in_sync=%s "
+                        "pending=%s index_len=%d",
+                        getattr(self.h5viewer, "live_run_active", None), _prev_name, name,
+                        _in_sync, _pending_was,
+                        len(getattr(getattr(self.scan, "frames", None), "index", []) or []))
+        if not _in_sync:
+            return
+        # In sync: flush the previous scan's throttled update, then reset the panel.
         self._update_timer.stop()
+        self._list_timer.stop()
         self._flush_pending_update()
-
-        # Clear frame index lists (fast; rebuilt by h5viewer.update_data)
-        # but DO NOT clear ``data_1d`` / ``data_2d``.  Pre-fix this
-        # blanked the display the instant a new scan started.  Leaving these
-        # transition/viewer dicts alone lets the previous scan's last-rendered
-        # frame linger visibly until the new scan's first publication replaces
-        # it on the next ``_flush_pending_update`` tick.
-        self.frames.clear()
-        self.frame_ids.clear()
-        self._frame_record_store = None
-        self.publication_store.clear()
-        # Drop any frames stashed-but-not-yet-drained + the scan_data row cache
-        # from the previous scan so the new scan's coalesced flush starts clean.
-        self._pending_frames = {}
-        self._scan_info_rows = {}
-        # Reset the Overlay/Waterfall accumulator at the scan boundary so a new
-        # scan (or a reprocess of the same scan) plots FRESH.  A new scan may use
-        # different integration params / GI / axis, so appending its traces across
-        # scans would mix incompatible data -- reset is the consistent, correct
-        # choice (same for <15 curves and >15 waterfall).  update_plot also
-        # self-heals on a scan-key change for any path that bypasses here.
-        try:
-            self.displayframe.clear_overlay()
-        except Exception:
-            logger.debug("clear_overlay on new scan failed", exc_info=True)
-
-        # During a live (non-batch) run the async file-thread set_datafile
-        # no longer reloads frames from disk (it would clobber the live
-        # in-memory index — see fileHandlerThread.set_datafile).  So reset
-        # the new scan's frame index synchronously here: drop the previous
-        # scan's indices + cached frames so per-frame sigUpdate appends build
-        # this scan up from empty.  Transition/viewer snapshots are
-        # intentionally left populated so the prior frame lingers on screen
-        # until this scan's first publication replaces it.
-        if self.h5viewer.live_run_active:
-            try:
-                import pandas as pd
-                with self.scan.scan_lock:
-                    self.scan.frames.index.clear()
-                    self.scan.frames._in_memory.clear()
-                    # Drop the previous scan's whole-scan metadata table so the
-                    # panel resets when a new scan starts; update_data rebuilds
-                    # it from this scan's frames.  Batch resets via its reload
-                    # path — the live run skips that, so without this the stale
-                    # table lingered and metawidget.update() below re-rendered it.
-                    self.scan.scan_data = pd.DataFrame()
-            except AttributeError:
-                pass
-            # Multi-scan live runs: keep only the currently rendered frame(s)
-            # from the outgoing scan so the previous image can linger until the
-            # first new frame lands without dragging the recent-row mirrors
-            # across scan boundaries.
-            keep = set()
-            try:
-                df = self.displayframe
-                for lst in (df.idxs, df.idxs_1d, df.idxs_2d):
-                    keep.update(int(i) for i in (lst or ()))
-            except Exception:
-                pass
-            try:
-                with self.data_lock:
-                    for cache in (self.data_1d, self.data_2d):
-                        for k in [k for k in list(cache.keys())
-                                  if int(k) not in keep]:
-                            cache.pop(k, None)
-                # Frame indices restart per scan: re-arm the raw self-heal
-                # negative cache alongside the purge.
-                self.displayframe._raw_resolve_failed = set()
-                self.displayframe._raw_full_shape = None
-            except Exception:
-                logger.debug("live-swap cache purge skipped", exc_info=True)
+        # Consume the frame-driven flag.  Clear ONLY for a same-name RE-RUN (the
+        # frame stream can't detect it — same key); a LATE new_scan whose frames
+        # already rescoped this run (pending) must NOT clear.  First scan (index
+        # empty) clears harmlessly.  (A-Step's per-scan _frame_record_store reset
+        # moved into _rescope_frame_panel_to so it fires on the frame-driven
+        # boundary too.)
+        self._frame_driven_rescoped_pending = False
+        if not _pending_was:
+            self._rescope_frame_panel_to(name)
 
         self.displayframe.set_axes()
-        # self.displayframe.auto_last = True
-
         self.h5viewer.scan_name = name
         self.h5viewer.auto_last = True
         self.h5viewer.latest_idx = 1
         self.h5viewer.update_scans()
         self.h5viewer.update()
-        # Refresh the metadata panel when a new scan starts — otherwise it
-        # only repopulates on the existing set_data / update_all paths and
-        # can stay empty for the first frames of a run.
+        # Refresh the metadata panel when a new scan starts.
         self.metawidget.update()
 
     def update_scattering_geometry(self, gi):
@@ -5465,6 +5589,7 @@ class staticWidget(QWidget):
 
         # Flush any pending coalesced update so the final frame is shown.
         self._update_timer.stop()
+        self._list_timer.stop()
         self._flush_pending_update()
 
         # End the live-run window before the end-of-batch reload below:

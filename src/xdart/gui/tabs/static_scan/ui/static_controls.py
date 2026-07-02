@@ -261,13 +261,16 @@ class StaticControls(QtWidgets.QWidget):
         self.actionRow.setEnabled(bool(enabled))
 
     def set_mode_row_enabled(self, enabled):
-        """Enable/disable the MODE row (mode combo + Batch + Cores).  Locked while
-        a run is in progress -- including a reintegrate, which (unlike a wrangler
-        run) does not go through wrangler.enabled().  The ACTION row is left
-        alone so Pause/Resume/Stop stay usable."""
+        """Enable/disable the run-config controls: mode combo + Batch + Cores + the
+        Append/Replace write-mode toggle.  Locked while a run is in progress --
+        including a reintegrate, which (unlike a wrangler run) does not go through
+        wrangler.enabled().  The ACTION row (Pause/Resume/Stop) is left alone so
+        those stay usable.  writeModeButton physically sits in the action row but is
+        a run-config control, so it locks here: you can't flip Append<->Replace
+        mid-scan."""
         enabled = bool(enabled)
         for w in (self.modeCombo, self.batchButton, self.coresSpin,
-                  self.coresLabel):
+                  self.coresLabel, self.writeModeButton):
             w.setEnabled(enabled)
 
     # ── per-wrangler capability profile ──

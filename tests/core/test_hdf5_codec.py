@@ -175,3 +175,38 @@ class TestPortableCompression:
             codec.data_to_h5(s, f, "s")                      # default compression
         with h5py.File(tmp_h5, "r") as f:
             assert f["s/data"].compression == "gzip"
+
+
+def test_catch_h5py_file_locked_raises_clear_message(monkeypatch, tmp_path):
+    """A persistent file-lock (BlockingIOError / EAGAIN) surfaces as a clear,
+    actionable message (not a raw h5py error buried in a traceback)."""
+    from xrd_tools.core import hdf5
+
+    def _locked(*a, **k):
+        raise BlockingIOError(35, "unable to lock file")
+
+    monkeypatch.setattr(hdf5.h5py, "File", _locked)
+    with pytest.raises(OSError, match="LOCKED"):
+        with hdf5.catch_h5py_file(str(tmp_path / "x.nxs"), mode="a", tries=2):
+            pass
+
+
+def test_catch_h5py_file_retries_then_succeeds(monkeypatch, tmp_path):
+    """A transient OSError retries and then succeeds (the common NFS case) — the
+    retry costs nothing on the happy path (first attempt breaks out)."""
+    import h5py as _h5
+    from xrd_tools.core import hdf5
+
+    real = _h5.File
+    calls = {"n": 0}
+
+    def _flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise OSError("transient")
+        return real(*a, **k)
+
+    monkeypatch.setattr(hdf5.h5py, "File", _flaky)
+    with hdf5.catch_h5py_file(str(tmp_path / "y.nxs"), mode="a", tries=10) as h:
+        h.create_group("g")
+    assert calls["n"] == 3

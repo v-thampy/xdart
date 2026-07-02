@@ -697,6 +697,7 @@ def test_update_data_stashes_frame_without_building_per_frame():
         publication_store=SimpleNamespace(
             upsert=lambda p: upserts.append(p), generation=0),
         _update_timer=SimpleNamespace(trigger=lambda: None),
+        _list_timer=SimpleNamespace(stop=lambda: None, trigger=lambda: None),
     )
 
     staticWidget.update_data(host, 7)
@@ -707,6 +708,36 @@ def test_update_data_stashes_frame_without_building_per_frame():
     assert host.h5viewer.latest_idx == 7                  # cursor advanced
     assert host._pending_update_idx == 7
     assert 7 in host.scan.frames.index                    # index appended (cheap)
+
+
+def test_list_timer_flush_updates_list_and_cursor_without_render():
+    """Liveness: the fast list/cursor flush (_list_timer -> _flush_frame_list)
+    refreshes the Frames list + advances the auto-last cursor, both signal-blocked
+    (emit_update=False), WITHOUT draining publications or rendering — those stay on
+    the heavy _update_timer.  This is what lets the Frames list scroll continuously
+    between paced renders."""
+    from types import SimpleNamespace
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    calls = []
+    host = SimpleNamespace(
+        _pending_update_idx=5,
+        h5viewer=SimpleNamespace(
+            auto_last=True,
+            update_data=lambda *a, emit_update=True, **k: calls.append(("update_data", emit_update)),
+        ),
+        latest_frame=lambda *a, emit_update=True, **k: calls.append(("latest_frame", emit_update)),
+    )
+    staticWidget._flush_frame_list(host)
+    assert ("update_data", False) in calls        # list refreshed, signals blocked
+    assert ("latest_frame", False) in calls        # cursor advanced, no render
+    assert host._pending_update_idx == 5           # light flush does NOT consume the idx
+    # (the heavy _flush_pending_update still drains + renders it)
+
+    calls.clear()                                   # nothing pending -> no-op
+    host._pending_update_idx = None
+    staticWidget._flush_frame_list(host)
+    assert calls == []
 
 
 def test_run_end_reconciles_partial_frame_browser_from_written_index(tmp_path):
@@ -1533,6 +1564,7 @@ def test_live_new_scan_invalidates_publication_store():
             set_image_units=lambda: None,
         ),
         _update_timer=SimpleNamespace(stop=lambda: None),
+        _list_timer=SimpleNamespace(stop=lambda: None, trigger=lambda: None),
         _flush_pending_update=lambda: None,
         frames={1: object()},
         frame_ids=["1"],
@@ -1548,10 +1580,17 @@ def test_live_new_scan_invalidates_publication_store():
     host._sync_h5viewer_save_dir = MethodType(
         staticWidget._sync_h5viewer_save_dir, host,
     )
+    host._rescope_frame_panel_to = MethodType(
+        staticWidget._rescope_frame_panel_to, host,
+    )
 
+    # Same-name re-run (name matches scan.name="old") -> IN SYNC with the frame
+    # stream -> new_scan performs the destructive clear + store invalidation.  (A
+    # genuinely-new / differently-named scan now DEFERS to update_data's frame-driven
+    # boundary; see test_multi_scan_frame_boundary.)
     staticWidget.new_scan(
         host,
-        "new",
+        "old",
         "/tmp/new.nxs",
         False,
         "th",
@@ -1600,6 +1639,7 @@ def _new_scan_host_with_wrangler_mask(wrangler_mask, initial_global_mask,
             get_args=lambda name: None, set_image_units=lambda: None,
         ),
         _update_timer=SimpleNamespace(stop=lambda: None),
+        _list_timer=SimpleNamespace(stop=lambda: None, trigger=lambda: None),
         _flush_pending_update=lambda: None,
         frames={1: object()},
         frame_ids=["1"],
@@ -1614,6 +1654,9 @@ def _new_scan_host_with_wrangler_mask(wrangler_mask, initial_global_mask,
     )
     host._sync_h5viewer_save_dir = MethodType(
         staticWidget._sync_h5viewer_save_dir, host,
+    )
+    host._rescope_frame_panel_to = MethodType(
+        staticWidget._rescope_frame_panel_to, host,
     )
     return host, scan
 

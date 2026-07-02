@@ -116,6 +116,30 @@ def soft_list_eval(data, scope: dict | None = None) -> list:
     return [_safe_literal(x) for x in data]
 
 
+def _h5_open_error_message(filename, mode, exc) -> str:
+    """A clear, actionable message for a failed HDF5 open, distinguishing a
+    file-LOCK collision (errno EAGAIN / 'unable to lock') from other OSErrors."""
+    text = str(exc or "")
+    locked = (
+        isinstance(exc, BlockingIOError)
+        or getattr(exc, "errno", None) in (11, 35)   # EAGAIN (Linux 11, macOS 35)
+        or "unable to lock" in text.lower()
+        or "resource temporarily unavailable" in text.lower()
+    )
+    if locked:
+        return (
+            f"Could not open '{filename}' (mode '{mode}'): the file is LOCKED. "
+            "Another process has it open — most likely a second xdart instance "
+            "writing to the same Save Path, or a stale lock left by a crashed run. "
+            "Close the other instance (or point it at a different Project Folder / "
+            f"Save Path) and try again.  [{type(exc).__name__}: {exc}]"
+        )
+    return (
+        f"Could not open '{filename}' (mode '{mode}') after retries: "
+        f"{type(exc).__name__}: {exc}"
+    )
+
+
 @contextmanager
 def catch_h5py_file(filename: str, mode: str = "r", tries: int = 100,
                     *args, **kwargs):
@@ -134,17 +158,22 @@ def catch_h5py_file(filename: str, mode: str = "r", tries: int = 100,
         Maximum number of attempts before re-raising.
     """
     hdf5_file = None
+    last_exc = None
     for i in range(tries):
         if i > 0 and i % 10 == 0:
             logger.debug("catch_h5py_file: attempt %d for %s", i, filename)
         try:
             hdf5_file = h5py.File(filename, mode, *args, **kwargs)
             break
-        except OSError:
+        except OSError as exc:
+            last_exc = exc
             time.sleep(0.05)
     if hdf5_file is None:
-        # Final attempt — let the exception propagate naturally
-        hdf5_file = h5py.File(filename, mode, *args, **kwargs)
+        # Retries exhausted — raise a CLEAR, actionable message instead of the raw
+        # BlockingIOError deep in h5py.  The common cause is a file-LOCK collision
+        # (a second xdart instance writing the same Save Path), which no amount of
+        # retrying can clear.
+        raise OSError(_h5_open_error_message(filename, mode, last_exc)) from last_exc
     try:
         yield hdf5_file
     finally:
