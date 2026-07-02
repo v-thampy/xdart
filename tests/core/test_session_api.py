@@ -57,6 +57,29 @@ def _standard_session(n=4, **kw) -> ScanSession:
                        sink=MemorySink(), executor=2, **kw)
 
 
+def _frame_record_store_array_nbytes(store: FrameRecordStore) -> int:
+    total = 0
+    for record in store.snapshot().values():
+        views = tuple(record.results_1d.values()) + tuple(record.results_2d.values())
+        for view in views:
+            for attr in (
+                "intensity_1d",
+                "sigma_1d",
+                "intensity_2d",
+                "sigma_2d",
+                "raw",
+                "thumbnail",
+            ):
+                array = getattr(view, attr, None)
+                if array is not None:
+                    total += np.asarray(array).nbytes
+            for attr in ("axis_1d", "axis_2d_x", "axis_2d_y"):
+                values = getattr(getattr(view, attr, None), "values", None)
+                if values is not None:
+                    total += np.asarray(values).nbytes
+    return total
+
+
 @pytest.fixture(autouse=True)
 def _fake_integrate(monkeypatch):
     monkeypatch.setattr(reduction_core, "integrate_1d",
@@ -577,3 +600,35 @@ def test_live_store_config_wired_through_scan_session_evicts_persisted_completio
     rec = store.get(a_thinned.index)
     assert rec is not None
     assert rec.view_1d().intensity_1d is None
+
+
+def test_long_live_scan_record_store_plateaus_under_item_bound():
+    """H8 pre-flip gate: a long ScanSession cannot grow a light tail forever."""
+    n_frames = 5000
+    heavy_cap = 64
+    item_cap = 512
+    retained_kb_per_submitted_frame_budget = 0.25
+    store = FrameRecordStore(
+        max_items=item_cap,
+        max_heavy_items=heavy_cap,
+        require_persisted_for_eviction=True,
+    )
+    frames = _frames(n_frames)
+    sess = ScanSession(
+        ReductionPlan(integration_2d=None),
+        Scan("s", frames, integrator=object()),
+        sink=MemorySink(),
+        executor=2,
+        record_store=store,
+        record_store_persisted_on_write=True,
+    )
+    for frame in frames:
+        sess.submit(frame)
+    sess.finish()
+
+    assert len(store) <= item_cap
+    assert sum(store.has_heavy_payload(frame.index) for frame in frames) <= heavy_cap
+    retained_kb_per_frame = (
+        _frame_record_store_array_nbytes(store) / 1024.0 / n_frames
+    )
+    assert retained_kb_per_frame < retained_kb_per_submitted_frame_budget

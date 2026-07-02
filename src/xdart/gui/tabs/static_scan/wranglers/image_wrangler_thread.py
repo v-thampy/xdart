@@ -114,6 +114,8 @@ if _LIVE_EXECUTION not in ("serial", "streaming"):
                    "using 'streaming'.", _LIVE_EXECUTION)
     _LIVE_EXECUTION = "streaming"
 
+_LIVE_RECORD_STORE_MAX_ITEMS = 512
+
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -1995,7 +1997,10 @@ class imageThread(wranglerThread):
             if self.gi else None
         gi_freeze_mode = getattr(self, "gi_freeze_mode", _default_freeze)
         frame_cap = getattr(getattr(scan, "frames", None), "_in_memory_cap", 64)
-        record_store = FrameRecordStore(max_heavy_items=frame_cap)
+        record_store = FrameRecordStore(
+            max_items=_LIVE_RECORD_STORE_MAX_ITEMS,
+            max_heavy_items=frame_cap,
+        )
         self._streaming_record_store = record_store
         sink = QtNexusSink(
             self, scan, standard_plan, mask=self.mask, record_store=record_store

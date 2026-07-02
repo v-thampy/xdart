@@ -7641,6 +7641,7 @@ def test_streaming_dispatch_series_average_submits_one_mean_frame(monkeypatch):
     assert opened_kwargs[0]["record_store"] is sink_kwargs[0]["record_store"]
     assert host._streaming_record_store is opened_kwargs[0]["record_store"]
     assert host._streaming_record_store._max_heavy_items == 64
+    assert host._streaming_record_store._max_items == 512
     assert host._streaming_record_store._hydrator is not None
     assert len(registered) == 1
     assert len(submitted) == 1
