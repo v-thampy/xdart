@@ -35,6 +35,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from xrd_tools.core import DEFAULT_MODE_KEY
 from xrd_tools.reduction import FlushPolicy
 
 logger = logging.getLogger(__name__)
@@ -323,6 +324,71 @@ class QtNexusSink:
                 persisted = set(getattr(frames, "_persisted", set()))
         return not persisted
 
+    def _active_mode_keys(self) -> tuple[str, str]:
+        gi = getattr(self._plan, "gi", None)
+        if gi is None:
+            return DEFAULT_MODE_KEY, DEFAULT_MODE_KEY
+
+        def _mode_value(value) -> str:
+            return str(getattr(value, "value", value) or DEFAULT_MODE_KEY)
+
+        return (
+            _mode_value(getattr(gi, "mode_1d", None)),
+            _mode_value(getattr(gi, "mode_2d", None)),
+        )
+
+    @staticmethod
+    def _dropped_labels_by_dimension(dropped) -> tuple[set[int], set[int]]:
+        dropped_1d: set[int] = set()
+        dropped_2d: set[int] = set()
+        if not dropped:
+            return dropped_1d, dropped_2d
+        for group_path, labels in dict(dropped).items():
+            path = str(group_path)
+            try:
+                ints = {int(label) for label in labels}
+            except Exception:
+                logger.debug("ignored malformed dropped-frame report %s=%r",
+                             group_path, labels, exc_info=True)
+                continue
+            if path.endswith("/integrated_1d") or path == "integrated_1d":
+                dropped_1d.update(ints)
+            elif path.endswith("/integrated_2d") or path == "integrated_2d":
+                dropped_2d.update(ints)
+        return dropped_1d, dropped_2d
+
+    def _record_store_mode_groups(self, labels, dropped=None):
+        frames = getattr(self._scan, "frames", None)
+        if frames is None:
+            return {}
+        mode_1d, mode_2d = self._active_mode_keys()
+        dropped_1d, dropped_2d = self._dropped_labels_by_dimension(dropped)
+        groups: dict[tuple[tuple[str, str], ...], list[int]] = {}
+        for label in labels:
+            try:
+                idx = int(label)
+                live = frames[idx]
+            except Exception:
+                logger.debug("could not inspect persisted frame %s", label,
+                             exc_info=True)
+                continue
+            modes: list[tuple[str, str]] = []
+            if idx not in dropped_1d and getattr(live, "int_1d", None) is not None:
+                modes.append(("1d", mode_1d))
+            if idx not in dropped_2d and getattr(live, "int_2d", None) is not None:
+                modes.append(("2d", mode_2d))
+            if modes:
+                groups.setdefault(tuple(modes), []).append(idx)
+        return groups
+
+    def _mark_record_store_persisted(self, labels, dropped=None) -> None:
+        if not labels or self._record_store is None:
+            return
+        for modes, mode_labels in self._record_store_mode_groups(
+            labels, dropped=dropped,
+        ).items():
+            self._record_store.mark_persisted(mode_labels, modes=modes)
+
     def flush(self, *, force=False) -> None:
         """Persist buffered output: h5pool-bracketed ``_save_to_nexus`` (skipped
         in xye_only) + the XYE row drain.  Public part of the ReductionSink
@@ -334,15 +400,16 @@ class QtNexusSink:
             return
         published = set(self._published)
         if not self._host.xye_only:
+            dropped = None
             # Streaming writer reuses ONLY the host's symmetric h5pool bracket
             # (keeps its own mode= + mark_persisted bookkeeping; not the serial
             # flush_serial_tail).
             with self._host._h5pool_bracket(self._scan):
                 with self._host.file_lock:
                     mode = "w" if self._needs_atomic_first_batch_flush() else "a"
-                    self._scan._save_to_nexus(mode=mode)   # also calls mark_persisted
-            if published and self._record_store is not None:
-                self._record_store.mark_persisted(published)
+                    # Also marks LiveFrameSeries persisted after a successful save.
+                    dropped = self._scan._save_to_nexus(mode=mode)
+            self._mark_record_store_persisted(published, dropped=dropped)
         self._host._flush_xye_buffer(
             self._scan, published_idxs=published,
         )

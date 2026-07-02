@@ -4,6 +4,7 @@ ReductionSink interface (the streaming write path)."""
 
 from __future__ import annotations
 
+import logging
 import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -234,9 +235,9 @@ def test_qt_sink_marks_record_store_persisted_after_nexus_save(tmp_path, monkeyp
         def __init__(self):
             self.persisted = []
 
-        def mark_persisted(self, labels):
+        def mark_persisted(self, labels, *, modes=None):
             events.append("record_store")
-            self.persisted.append(set(labels))
+            self.persisted.append((set(labels), tuple(modes or ())))
 
     monkeypatch.setattr(iwt, "_get_h5pool", lambda: _Pool())
 
@@ -267,7 +268,50 @@ def test_qt_sink_marks_record_store_persisted_after_nexus_save(tmp_path, monkeyp
 
     assert saved == ["w"]
     assert events == ["nexus", "record_store"]
-    assert store.persisted == [{0, 1}]
+    assert store.persisted == [({0, 1}, (("1d", "default"),))]
+
+
+def test_qt_sink_marks_only_written_record_store_modes(tmp_path, monkeypatch):
+    from xdart.modules.ewald import LiveScan
+    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
+    import xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread as iwt
+
+    class _Pool:
+        def pause(self, path):
+            pass
+
+        def resume(self, path):
+            pass
+
+    class _Store:
+        def __init__(self):
+            self.calls = []
+
+        def mark_persisted(self, labels, *, modes=None):
+            self.calls.append((tuple(labels), tuple(modes or ())))
+
+    monkeypatch.setattr(iwt, "_get_h5pool", lambda: _Pool())
+
+    scan = LiveScan(data_file=str(tmp_path / "scan.nxs"))
+    scan.skip_2d = False
+    host = _FakeHost(batch_mode=True)
+    store = _Store()
+    sink = QtNexusSink(
+        host, scan, _minimal_plan(), mask=None, record_store=store
+    )
+    sink.begin(scan, _minimal_plan())
+    live = _live_frame(0)
+    sink.register(live)
+    sink.write(_headless(0), _reduction(0, with_2d=True))
+
+    def fake_save(*, mode="a", **kwargs):
+        scan.frames.mark_persisted(scan.frames.index)
+        return {"entry/integrated_2d": [0]}
+
+    monkeypatch.setattr(scan, "_save_to_nexus", fake_save)
+    sink.flush(force=True)
+
+    assert store.calls == [((0,), (("1d", "default"),))]
 
 
 def test_sink_persist_before_evict_no_unsaved_eviction(tmp_path):
@@ -423,6 +467,45 @@ def test_close_reduction_session_surfaces_write_failure():
     assert labels and "Save FAILED" in labels[0]                # user-visible
     assert closed == ["first", "second"]                       # second closed despite first raising
     assert w._streaming_session is None and w._reduction_session is None
+
+
+def test_close_reduction_session_reports_cancelled_unwritten_frames(caplog):
+    from types import MethodType
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
+
+    labels = []
+
+    class _Session:
+        frames_submitted = 5
+
+        def finish(self, **kw):
+            return SimpleNamespace(n_processed=3, cancelled=True)
+
+    w = SimpleNamespace(
+        _reduction_session=None,
+        _reduction_session_key=None,
+        _streaming_session=_Session(),
+        _streaming_sink=object(),
+        _streaming_scan_id=1,
+        _streaming_record_store=object(),
+        _scan_session_adapter=object(),
+        _gi_prepass_scan_id=1,
+        _reduction_write_error=None,
+        command="stop",
+        showLabel=SimpleNamespace(emit=lambda m: labels.append(m)),
+    )
+    w._close_reduction_session = MethodType(
+        wranglerThread._close_reduction_session, w)
+
+    with caplog.at_level(logging.INFO):
+        w._close_reduction_session()
+
+    assert labels == [
+        "Stopped with 2 frame(s) un-written "
+        "(submitted=5, written=3) — source data intact; re-run Append/batch to recover"
+    ]
+    assert "Total Files Processed (durable after cancel): 3" in caplog.text
+    assert "submitted=5, written=3" in caplog.text
 
 
 def test_resume_parity_streaming_nxs_matches_unpaused(tmp_path):

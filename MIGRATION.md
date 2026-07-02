@@ -85,6 +85,11 @@ pre-migration reference signature.  Two additive notes:
 
 ## Behavior changes to know about
 
+* `resolve_monitor_norm` now treats zero or negative monitor values as
+  no-normalization.
+* `resolve_incident_angle` now falls back to metadata when the GI motor field
+  is blank.
+
 > **Strictness (D7): the headless REDUCTION is loud by default.**
 > `run_reduction` / `ReductionSession` now take a `strict: StrictPolicy`
 > (default `StrictPolicy.loud()`): a scripted/batch run now **raises**

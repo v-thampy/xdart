@@ -6093,6 +6093,7 @@ def test_drop_reintegrate_shadow_reconciles_published_frames(monkeypatch):
     store = SimpleNamespace(invalidate=lambda labels: invalidated.append(set(labels)))
     scan = SimpleNamespace(data_file="x.nxs", frames=frames)
     host = SimpleNamespace(
+        file_lock=RLock(),
         scan=scan, publication_store=store,
         _reint_published_idxs={0, 1, 2, 3}, _reintegrate_shadow_active=True)
     host._drop_reintegrate_shadow = MethodType(
@@ -6104,6 +6105,48 @@ def test_drop_reintegrate_shadow_reconciles_published_frames(monkeypatch):
     assert set(discarded) == {0, 1, 2, 3}       # discard in-memory recomputed
     assert invalidated == [{0, 1, 2, 3}]        # revert store -> re-hydrate prior
     assert host._reint_published_idxs == set()  # cleared after reconcile
+    assert host._reintegrate_shadow_active is False
+
+
+def test_drop_reintegrate_shadow_holds_writer_file_lock(monkeypatch):
+    """Shadow deletion must share the writer lock with Nexus saves."""
+    from types import MethodType, SimpleNamespace
+    import xdart.utils.h5pool as h5pool
+    import xdart.modules.ewald.nexus_writer as nw
+    from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+
+    monkeypatch.setattr(h5pool, "get_pool", lambda: SimpleNamespace(
+        pause=lambda *a, **k: None, resume=lambda *a, **k: None))
+
+    events = []
+
+    class _Lock:
+        held = False
+
+        def __enter__(self):
+            events.append("enter")
+            self.held = True
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("exit")
+            self.held = False
+
+    lock = _Lock()
+
+    def _drop(*_args, **_kwargs):
+        events.append(("drop", lock.held))
+
+    monkeypatch.setattr(nw, "drop_reintegrate_shadow_groups", _drop)
+    scan = SimpleNamespace(data_file="x.nxs", frames=SimpleNamespace())
+    host = SimpleNamespace(
+        file_lock=lock, scan=scan, publication_store=None,
+        _reint_published_idxs=set(), _reintegrate_shadow_active=True)
+    host._drop_reintegrate_shadow = MethodType(
+        integratorThread._drop_reintegrate_shadow, host)
+
+    host._drop_reintegrate_shadow()
+
+    assert events == ["enter", ("drop", True), "exit"]
     assert host._reintegrate_shadow_active is False
 
 

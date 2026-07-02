@@ -530,13 +530,51 @@ class wranglerThread(Qt.QtCore.QThread):
         # failed write succeeded).  Close BOTH sessions even if the first raises
         # (wrap each individually + collect), then surface the failure loudly.
         errors = []
+
+        def _submitted_count(sess):
+            value = getattr(sess, "frames_submitted", None)
+            if value is None:
+                return None
+            try:
+                return int(value() if callable(value) else value)
+            except Exception:
+                return None
+
+        def _report_result(sess, res):
+            if res is None:
+                return
+            submitted = _submitted_count(sess)
+            try:
+                written = int(getattr(res, "n_processed"))
+            except Exception:
+                written = None
+            if bool(getattr(res, "cancelled", False)) and written is not None:
+                logger.info("Total Files Processed (durable after cancel): %d",
+                            written)
+            if submitted is None or written is None or submitted == written:
+                return
+            unwritten = max(0, submitted - written)
+            msg = (
+                f"Stopped with {unwritten} frame(s) un-written "
+                f"(submitted={submitted}, written={written}) — source data "
+                "intact; re-run Append/batch to recover"
+            )
+            logger.warning(msg)
+            show = getattr(self, "showLabel", None)
+            if show is not None:
+                try:
+                    show.emit(msg)
+                except Exception:
+                    pass
+
         for sess in (session, streaming):
             if sess is not None:
                 try:
                     # #4 (codex): bound the writer-thread join so a stalled
                     # NFS/pyFAI worker can't wedge Stop/close indefinitely.
                     # 60 s is a generous ceiling for beamline conditions.
-                    sess.finish(join_timeout=60.0)
+                    res = sess.finish(join_timeout=60.0)
+                    _report_result(sess, res)
                 except Exception as exc:
                     errors.append(exc)
                     logger.error("reduction session WRITE FAILED on close: %s",

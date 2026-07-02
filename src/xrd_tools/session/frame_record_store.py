@@ -42,6 +42,22 @@ def _record_mode_keys(record: FrameRecord) -> set[_ModeKey]:
     return keys
 
 
+def _normalize_mode_keys(modes: Iterable[_ModeKey] | _ModeKey) -> set[_ModeKey]:
+    if (
+        isinstance(modes, tuple)
+        and len(modes) == 2
+        and isinstance(modes[0], str)
+    ):
+        iterable = (modes,)
+    else:
+        iterable = tuple(modes)  # type: ignore[arg-type]
+    keys: set[_ModeKey] = set()
+    for key in iterable:
+        dim, mode = key
+        keys.add((str(dim), str(mode)))
+    return keys
+
+
 def _heavy_mode_keys(record: FrameRecord) -> set[_ModeKey]:
     keys: set[_ModeKey] = set()
     for mode, view in record.results_1d.items():
@@ -219,7 +235,12 @@ class FrameRecordStore:
             self._enforce_bounds_locked()
             return self._records[label]
 
-    def mark_persisted(self, labels: Iterable[int | str] | int | str) -> None:
+    def mark_persisted(
+        self,
+        labels: Iterable[int | str] | int | str,
+        *,
+        modes: Iterable[_ModeKey] | _ModeKey | None = None,
+    ) -> None:
         if isinstance(labels, (str, bytes)):
             iterable = (labels,)
         else:
@@ -227,14 +248,20 @@ class FrameRecordStore:
                 iterable = tuple(labels)  # type: ignore[arg-type]
             except TypeError:
                 iterable = (labels,)  # type: ignore[assignment]
+        requested_modes = None if modes is None else _normalize_mode_keys(modes)
         with self._lock:
             for label in iterable:
                 record = self._records.get(label)
                 if record is None:
                     continue
-                self._persisted_modes.setdefault(label, set()).update(
-                    _record_mode_keys(record)
-                )
+                valid_modes = _record_mode_keys(record)
+                persisted = self._persisted_modes.setdefault(label, set())
+                if requested_modes is None:
+                    persisted.update(valid_modes)
+                else:
+                    persisted.update(requested_modes.intersection(valid_modes))
+                if not persisted:
+                    self._persisted_modes.pop(label, None)
             self._enforce_bounds_locked()
 
     def get(self, label: int | str) -> FrameRecord | None:

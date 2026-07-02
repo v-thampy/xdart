@@ -7,6 +7,7 @@ bounding the in-flight window and driving the sink from exactly one thread.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
@@ -272,7 +273,7 @@ def test_streaming_replace_is_idempotent(monkeypatch):
 # Cancellation — flush completed only, no torn frame
 # ---------------------------------------------------------------------------
 
-def test_streaming_stop_flushes_completed_only(monkeypatch):
+def test_streaming_stop_flushes_completed_only(monkeypatch, caplog):
     token = CancelToken()
     seen = {"n": 0}
 
@@ -293,12 +294,15 @@ def test_streaming_stop_flushes_completed_only(monkeypatch):
     )
     for fr in frames:
         session.submit(fr)
-    result = session.finish()
+    with caplog.at_level(logging.INFO, logger="xrd_tools.reduction.core"):
+        result = session.finish()
 
     assert result.cancelled is True
     # Only genuinely-completed frames were written; none are torn/half.
     assert len(sink.frames) <= 30
     assert all(r.result_1d is not None for r in sink.frames.values())
+    if session._submitted > result.n_processed:
+        assert "dropped in-flight" in caplog.text
 
 
 # ---------------------------------------------------------------------------

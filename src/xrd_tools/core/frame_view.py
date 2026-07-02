@@ -3,6 +3,11 @@
 These types are intentionally GUI-free.  They describe the data needed to
 display, validate, stitch, fit, or round-trip one processed detector frame
 without depending on xdart's live objects or Qt state.
+
+Array-bearing fields are frozen read-only by ``Axis.__post_init__`` and
+``_readonly_array``.  When NumPy can flip the writeable flag, this freezes the
+original array object in place; producers that will keep mutating their buffers
+must pass a copy.
 """
 
 from __future__ import annotations

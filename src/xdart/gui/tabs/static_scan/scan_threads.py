@@ -462,7 +462,8 @@ class integratorThread(Qt.QtCore.QThread):
 
         _get_h5pool().pause(self.scan.data_file)
         try:
-            drop_reintegrate_shadow_groups(self.scan.data_file, entry="entry")
+            with self.file_lock:
+                drop_reintegrate_shadow_groups(self.scan.data_file, entry="entry")
         except Exception:
             logger.debug("[REINT] shadow cleanup failed", exc_info=True)
         finally:

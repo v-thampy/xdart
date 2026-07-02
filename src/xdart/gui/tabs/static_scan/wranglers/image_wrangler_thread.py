@@ -886,13 +886,14 @@ class imageThread(wranglerThread):
                         f'Integrating {len(pending)} frame(s)...'
                     )
                 _t_disp = time.time()
-                files_processed += self._dispatch_batch(scan, pending)
+                dispatched = self._dispatch_batch(scan, pending)
+                files_processed += dispatched
                 _disp_dt = time.time() - _t_disp
                 _perf = getattr(self, '_perf', None)
                 if _perf is not None:
                     _perf['collect_read'] += _t_read_accum
                     _perf['dispatch'] += _disp_dt
-                    _perf['dispatch_frames'] += len(pending)
+                    _perf['dispatch_frames'] += dispatched
                 if _t_read_accum >= 0.5 or _disp_dt >= 0.5:
                     logger.info(
                         '[DISPATCH] %d frames  read=%.2fs  dispatch=%.2fs',
@@ -906,16 +907,17 @@ class imageThread(wranglerThread):
         # _frames_since_save tail in live mode is flushed to disk.
         if pending and scan is not None and self.command != 'stop':
             _t_disp = time.time()
-            files_processed += self._dispatch_batch(
+            dispatched = self._dispatch_batch(
                 scan, pending, force_save=True,
             )
+            files_processed += dispatched
             pending_avg_count = 0
             _disp_dt = time.time() - _t_disp
             _perf = getattr(self, '_perf', None)
             if _perf is not None:
                 _perf['collect_read'] += _t_read_accum
                 _perf['dispatch'] += _disp_dt
-                _perf['dispatch_frames'] += len(pending)
+                _perf['dispatch_frames'] += dispatched
             logger.info(
                 '[FLUSH-FINAL] %d frames  read=%.2fs  dispatch=%.2fs',
                 len(pending), _t_read_accum, _disp_dt,

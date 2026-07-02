@@ -10,6 +10,7 @@ integration loops itself.
 from __future__ import annotations
 
 import copy
+import logging
 import os
 import queue
 import threading
@@ -54,6 +55,8 @@ from xrd_tools.io.nexus import (
     upsert_scan_metadata,
     write_nexus_frame,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # C4 — tighter Scan.integrator type without forcing the import
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator
@@ -1312,6 +1315,12 @@ class ReductionSession:
             failed=failure is not None,
             error=None if failure is None else str(failure),
         )
+        dropped = max(0, int(self._submitted) - int(self._completed))
+        if cancelled and dropped:
+            logger.info(
+                "cancelled: %d submitted, %d written, %d dropped in-flight",
+                self._submitted, self._completed, dropped,
+            )
         try:
             if self._started:
                 if _writer_timed_out:

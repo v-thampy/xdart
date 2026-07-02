@@ -123,6 +123,23 @@ def test_mark_persisted_marks_all_current_modes_for_eviction():
     assert rec.view_1d("q_ip").intensity_1d is None
 
 
+def test_mark_persisted_with_modes_does_not_mark_unwritten_modes():
+    store = FrameRecordStore(max_heavy_items=1)
+    store.upsert(_record(label=1, mode="q_total"), persisted=True)
+    store.upsert(_record(label=1, mode="q_ip", scale=2.0), persisted=False)
+
+    store.mark_persisted(1, modes=[("1d", "q_total")])
+    assert not store.is_persisted(1)
+
+    store.upsert(_record(label=2, source="/data/scan_0002.tif"), persisted=True)
+
+    assert store.has_heavy_payload(1)
+    assert not store.has_heavy_payload(2)
+    rec = store.get(1)
+    assert rec is not None
+    np.testing.assert_allclose(rec.view_1d("q_ip").intensity_1d, [20.0, 40.0, 60.0])
+
+
 def test_get_or_hydrate_restores_thinned_record():
     store = FrameRecordStore(max_heavy_items=1)
     store.upsert(_record(label=1), persisted=True)
