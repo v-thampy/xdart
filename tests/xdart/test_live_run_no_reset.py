@@ -228,3 +228,74 @@ def test_set_run_writing_no_reload_without_selection():
     viewer, calls = _frame_select_viewer(run_writing=True, selected=())
     viewer.set_run_writing(False)
     assert calls['load'] == []
+
+
+class _ScanItem:
+    def __init__(self, text):
+        self._text = text
+
+    def data(self, _role):
+        return self._text
+
+
+def _scan_click_viewer(*, current_file="/data/old.nxs", run_writing=False,
+                       pending=False):
+    calls = []
+    viewer = SimpleNamespace(
+        _suspend_scan_selection_loads=False,
+        viewer_mode=None,
+        dirname="/data",
+        _browser_scan_reset_pending=pending,
+        _run_writing=run_writing,
+        new_scan_loaded=False,
+        file_thread=SimpleNamespace(fname=current_file),
+        set_file=lambda fpath: calls.append(fpath),
+    )
+    viewer.scans_clicked = MethodType(H5Viewer.scans_clicked, viewer)
+    return viewer, calls
+
+
+def test_manual_scan_select_arms_deferred_reset_only_for_real_file_load():
+    viewer, calls = _scan_click_viewer(current_file="/data/old.nxs")
+
+    viewer.scans_clicked(_ScanItem("new.nxs"))
+
+    assert calls == ["/data/new.nxs"]
+    assert viewer._browser_scan_reset_pending is True
+    assert viewer.new_scan_loaded is True
+
+
+def test_same_file_browser_click_does_not_arm_deferred_reset():
+    viewer, calls = _scan_click_viewer(current_file="/data/scan.nxs")
+
+    viewer.scans_clicked(_ScanItem("scan.nxs"))
+
+    assert calls == ["/data/scan.nxs"]
+    assert viewer._browser_scan_reset_pending is False
+    assert viewer.new_scan_loaded is False
+
+
+def test_same_file_second_click_preserves_existing_deferred_reset():
+    # A genuine first click can be followed by Qt's release-side duplicate
+    # same-file signal after set_file has already repointed file_thread.fname.
+    # That duplicate must not clear the valid pending reset.
+    viewer, calls = _scan_click_viewer(
+        current_file="/data/scan.nxs", pending=True,
+    )
+
+    viewer.scans_clicked(_ScanItem("scan.nxs"))
+
+    assert calls == ["/data/scan.nxs"]
+    assert viewer._browser_scan_reset_pending is True
+
+
+def test_run_guarded_browser_click_does_not_arm_deferred_reset():
+    viewer, calls = _scan_click_viewer(
+        current_file="/data/old.nxs", run_writing=True,
+    )
+
+    viewer.scans_clicked(_ScanItem("new.nxs"))
+
+    assert calls == ["/data/new.nxs"]
+    assert viewer._browser_scan_reset_pending is False
+    assert viewer.new_scan_loaded is False

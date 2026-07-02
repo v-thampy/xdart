@@ -1251,6 +1251,11 @@ class H5Viewer(QWidget):
             # frame is clicked, so the plots stay as-is on select (the frame list
             # still populates + deselects).  Only reached in normal mode — the
             # viewer branches above return first, keeping their auto-first-frame.
+            current_fname = getattr(getattr(self, 'file_thread', None), 'fname', None)
+            if (getattr(self, '_run_writing', False)
+                    or (fpath and fpath == current_fname)):
+                self.set_file(fpath)
+                return
             self._browser_scan_reset_pending = True
             self.set_file(fpath)
             self.new_scan_loaded = True
