@@ -181,6 +181,11 @@ def _frame_select_viewer(run_writing=False, selected=('5',), cached_2d=()):
     )
     viewer.load_frames_data = lambda ids, l2d: calls['load'].append((list(ids), l2d))
     viewer.cancel_pending_loads = lambda: calls.__setitem__('cancel', calls['cancel'] + 1)
+    # data_changed now routes its terminal render through the 100 ms debounce
+    # Coalescer (freeze fix); simulate the timer firing synchronously so the
+    # sigUpdate-count assertions still hold (a burst debounces to one emit).
+    viewer._update_coalesce_timer = SimpleNamespace(
+        start=lambda: viewer.sigUpdate.emit())
     viewer.data_changed = MethodType(H5Viewer.data_changed, viewer)
     viewer.set_run_writing = MethodType(H5Viewer.set_run_writing, viewer)
     return viewer, calls

@@ -3871,11 +3871,11 @@ class staticWidget(QWidget):
         except Exception:
             logger.debug("XYE overlay input filter install failed", exc_info=True)
         self.h5viewer.sigNewFile.connect(self.wrangler.set_fname)
-        self.h5viewer.sigNewFile.connect(self.displayframe.set_axes)
-        self.h5viewer.sigNewFile.connect(self._clear_frame_record_store)
-        self.h5viewer.sigNewFile.connect(
-            lambda *_: self.displayframe._clear_bkg())
-        self.h5viewer.sigNewFile.connect(self.h5viewer.data_reset)
+        # The display-clearing cascade (axes rebuild + bkg clear + cache wipe +
+        # A-Step FrameRecordStore reset) is DEFERRED on a manual browser .nxs select
+        # in Int 1D/2D so the plots stay as-is until a frame is clicked; runs
+        # immediately for the run path + viewers.
+        self.h5viewer.sigNewFile.connect(self._on_new_file_display_reset)
         # Stage C (2-way sync): on a .nxs load, populate the integration panel
         # from the saved scan so it shows the saved settings + reintegrate
         # reproduces them.  (Re-added per wrangler swap, like the lines above.)
@@ -3885,6 +3885,20 @@ class staticWidget(QWidget):
         # controls bar to the new content height.
         self._fit_controls_height()
         self._refresh_controls_v2_profile(immediate=True)
+
+    def _on_new_file_display_reset(self, *args):
+        """sigNewFile handler for the display-clearing cascade (axes rebuild + bkg
+        clear + cache wipe).  DEFERRED on a manual browser .nxs select in Int 1D/2D
+        (``h5viewer._browser_scan_reset_pending``) so the plots stay as-is until the
+        user clicks a frame — ``set_data`` runs it then.  Runs immediately for the
+        run path (new_scan's set_file(internal=True)) and viewer modes, which never
+        set the flag."""
+        if getattr(self.h5viewer, "_browser_scan_reset_pending", False):
+            return
+        self.displayframe.set_axes()
+        self._clear_frame_record_store()   # A-Step (Phase 5): reset the per-file store
+        self.displayframe._clear_bkg()
+        self.h5viewer.data_reset()
 
     def disconnect_wrangler(self):
         """Disconnects all signals attached the the current wrangler
@@ -3920,9 +3934,7 @@ class staticWidget(QWidget):
         # wrangler swaps), so a bare .disconnect() would also drop any future /
         # other subscriber.  Disconnect ONLY the slots set_wrangler attached.
         for slot in (getattr(self.wrangler, 'set_fname', None),
-                     self.displayframe.set_axes,
-                     self._clear_frame_record_store,
-                     self.h5viewer.data_reset,
+                     self._on_new_file_display_reset,
                      self._hydrate_integrator_on_load):
             if slot is None:
                 continue
@@ -4441,6 +4453,21 @@ class staticWidget(QWidget):
         """Connected to h5viewer, sets the data in displayframe based
         on the selected image or overall data.
         """
+        # Deferred browser-select reset (Int 1D/2D): a manual .nxs select left the
+        # display + caches untouched (see _on_new_file_display_reset).  Now that a
+        # frame is actually clicked, run that reset — clear the previous scan's
+        # caches + rebuild axes — BEFORE rendering, so the clicked frame loads fresh
+        # (this is the only frame-selection path that reaches set_data; the
+        # scan-select deselect is signal-blocked, so it never fires here).
+        if getattr(self.h5viewer, "_browser_scan_reset_pending", False):
+            self.h5viewer._browser_scan_reset_pending = False
+            try:
+                self.displayframe.set_axes()
+                self._clear_frame_record_store()   # A-Step (Phase 5): reset the store
+                self.displayframe._clear_bkg()
+                self.h5viewer.data_reset()
+            except Exception:
+                logger.debug("deferred browser-select reset failed", exc_info=True)
         # In viewer mode, always update display (no scan dependency)
         is_viewer = getattr(self.h5viewer, 'viewer_mode', None) is not None
         if is_viewer or self.scan.name != 'null_main':
