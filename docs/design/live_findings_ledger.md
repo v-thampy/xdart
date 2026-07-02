@@ -19,7 +19,8 @@ orchestrator checks this ledger at every review; the maintainer's live session v
 | MS-1 | Frame-count reconciliation: dispatch=288 / processed=287 / post-live indexed=283 (2026-07-02 00:51 log) | pause mid-run, read the post-live index line | **WATCH** — check the counts reconcile at run END; if not, persist-before-evict question |
 | BR-1 | **Clicking a processed .nxs in the data browser clears ALL plots immediately. They should persist until a FRAME of the new scan is clicked.** (Re-raised 2026-07-02 — reported earlier, not yet addressed. The deferred-reset `_browser_scan_reset_pending` was built for exactly this, but something still clears on file select — likely set_file's listData clear → empty shared frame_ids → EMPTY render, the OV-5 family, which blanks raw/cake/1D regardless of the deferral.) | Data browser → click a different processed .nxs → all panels blank before any frame is selected | **OPEN** — folded into Wave-2 `timer_safety_viewer_perf.md` task 9 |
 
-**Acceptance test that covers the OV family (round-3 handoff):** accumulator count is MONOTONIC
-through every step of: Overlay-mode entry (seeded with the displayed trace) → resident click →
-evicted click → hydration completion → repaint. Only `Clear`, a new scan/source (`reset_key`),
-or a REAL norm-channel change may reset it.
+**Acceptance test that covers the OV family (round-3/H7 handoff):** accumulator count is
+MONOTONIC through every step of: Overlay-mode entry (seeded with the displayed trace) →
+resident click → evicted click → deselect-all → unit toggle → hydration completion → repaint.
+Only `Clear`, a new scan/source (`reset_key`), reintegrate-finish, or a REAL norm-channel
+change may reset it.

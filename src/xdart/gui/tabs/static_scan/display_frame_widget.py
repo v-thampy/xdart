@@ -3674,9 +3674,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             logger.debug("clear_binned_view failed", exc_info=True)
 
     def clear_plot_view(self):
-        """Remove all 1D curves and reset cached plot state."""
+        """Remove visible 1D plot items without dropping overlay history."""
         try:
-            self.clear_overlay()
             # removeItem, not curve.clear() -- see update_plot_view: clear()
             # leaves the items registered on the plot and they accumulate.
             for curve in self.curves:
@@ -3692,7 +3691,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             logger.debug("clear_plot_view failed", exc_info=True)
 
     def clear_display_state(self, title=None):
-        """Blank all rendered panels and cached display data."""
+        """Blank rendered panels while preserving overlay accumulator state."""
         self._raw_resolve_failed = set()   # re-arm the raw hydrate retries
         self._raw_full_shape = None        # detector shape is per-scan (sizes vary)
         self.clear_image_view()
@@ -3785,7 +3784,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         else:
             title = ''
         # A mode transition must not carry the previous mode's visible
-        # image/curve or cached overlay data into the new one.
+        # image/curve into the new one.  Overlay history is owned by explicit
+        # lifecycle resets (clear/new scan/norm/reintegrate), not by panel blanking.
         self.clear_display_state(title)
 
         # Full panel geometry for this mode (idempotent, table-driven).  This

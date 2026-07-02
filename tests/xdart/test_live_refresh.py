@@ -1269,6 +1269,8 @@ def _display_host():
         plot_data=[np.arange(3), np.ones((1, 3))],
         plot_data_range=[[0, 3], [0, 1]],
         frame_names=["old"],
+        overlaid_idxs=[7],
+        _waterfall_history=object(),
         image_widget=image_widget,
         binned_widget=binned_widget,
         wf_widget=wf_widget,
@@ -1287,18 +1289,20 @@ def _display_host():
     return host, image_widget, binned_widget, wf_widget, curve, legend, label
 
 
-def test_clear_display_state_resets_visible_and_cached_state():
+def test_clear_display_state_resets_visible_state_preserves_overlay_history():
     host, image_widget, binned_widget, wf_widget, curve, legend, label = _display_host()
+    history = host._waterfall_history
 
     host.clear_display_state("XYE Viewer")
 
     assert host.image_data is None
     assert host.binned_data is None
-    assert host.plot_data[0].size == 0
-    assert host.plot_data[1].size == 0
-    assert host.plot_data_range == [[0, 0], [0, 0]]
-    assert host.frame_names == []
-    assert host.overlaid_idxs == []
+    np.testing.assert_array_equal(host.plot_data[0], np.arange(3))
+    np.testing.assert_array_equal(host.plot_data[1], np.ones((1, 3)))
+    assert host.plot_data_range == [[0, 3], [0, 1]]
+    assert host.frame_names == ["old"]
+    assert host.overlaid_idxs == [7]
+    assert host._waterfall_history is history
     assert host.curves == []
     # New contract: curves are REMOVED from the plot (removeItem), not just
     # data-cleared -- PlotDataItem.clear() left items accumulating.
@@ -1314,6 +1318,19 @@ def test_clear_display_state_resets_visible_and_cached_state():
     assert image_widget.raw_image.size == 0
     assert binned_widget.raw_image.size == 0
     assert wf_widget.raw_image.size == 0
+
+
+def test_clear_overlay_is_the_accumulator_destructor():
+    host, *_ = _display_host()
+
+    host.clear_overlay()
+
+    assert host.plot_data[0].size == 0
+    assert host.plot_data[1].size == 0
+    assert host.plot_data_range == [[0, 0], [0, 0]]
+    assert host.frame_names == []
+    assert host.overlaid_idxs == []
+    assert host._waterfall_history is None
 
 
 def test_update_2d_label_omits_frame_index_for_averaged_series():

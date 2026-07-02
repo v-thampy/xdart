@@ -11,7 +11,7 @@ cake adapter routes the §2.C blank to it instead of returning None.
 from __future__ import annotations
 
 from threading import RLock
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -1011,6 +1011,7 @@ def test_overlay_many_frame_selection_converges_after_out_of_order_hydration():
 def test_overlay_selection_evicted_hydration_never_decreases_history():
     from xdart.gui.tabs.static_scan.display_controllers import ScanDisplayController
     from xdart.gui.tabs.static_scan.display_logic import Mode, WaterfallHistory
+    from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
     from xdart.gui.tabs.static_scan.display_publication import (
         PublicationDisplayAdapter)
     from xdart.modules.frame_publication import (
@@ -1046,6 +1047,7 @@ def test_overlay_selection_evicted_hydration_never_decreases_history():
         names=tuple(f"scan_{i}" for i in initial_ids),
     )
     queued = []
+    plot_unit = {"text": "Q (Å⁻¹)", "index": 0}
     widget = SimpleNamespace(
         publication_store=store,
         viewer_mode=None,
@@ -1055,6 +1057,9 @@ def test_overlay_selection_evicted_hydration_never_decreases_history():
         frame_ids=["331"],
         overlaid_idxs=list(initial_history.ids),
         _waterfall_history=initial_history,
+        plot_data=[x, initial_history.rows],
+        plot_data_range=[[float(x[0]), float(x[-1])], [320.0, 330.0]],
+        frame_names=list(initial_history.names),
         display_generation=1,
         normChannel=None,
         scan=SimpleNamespace(
@@ -1065,8 +1070,10 @@ def test_overlay_selection_evicted_hydration_never_decreases_history():
         ),
         ui=SimpleNamespace(
             plotMethod=SimpleNamespace(currentText=lambda: "Overlay"),
-            plotUnit=SimpleNamespace(currentText=lambda: "Q (Å⁻¹)",
-                                     currentIndex=lambda: 0),
+            plotUnit=SimpleNamespace(
+                currentText=lambda: plot_unit["text"],
+                currentIndex=lambda: plot_unit["index"],
+            ),
             slice=SimpleNamespace(isChecked=lambda: False, isEnabled=lambda: False),
         ),
         _request_frame_hydration=lambda label, *, purpose="full":
@@ -1091,12 +1098,32 @@ def test_overlay_selection_evicted_hydration_never_decreases_history():
     assert queued == [(331, "1d")]
     assert payload.plot_history.ids == initial_ids
 
+    widget.frame_ids = []
+    state, payload = render_and_guard()
+    assert tuple(state.render_ids) == ()
+    assert payload.plot_history.ids == initial_ids
+
+    plot_unit.update({"text": "2θ (°)", "index": 1})
+    state, payload = render_and_guard()
+    assert tuple(state.render_ids) == ()
+    assert payload.plot_history.ids == initial_ids
+
     store.upsert(publication_from_live_frame(_frame(331)))
+    state, payload = render_and_guard()
+    assert tuple(state.render_ids) == ()
+    assert payload.plot_history.ids == initial_ids
+
+    widget.frame_ids = ["331"]
     state, payload = render_and_guard()
 
     assert tuple(state.render_ids) == (331,)
-    assert counts == [11, 11, 12]
+    assert counts == [11, 11, 11, 11, 11, 12]
     assert payload.plot_history.ids == initial_ids + (331,)
+
+    widget.clear_overlay = MethodType(displayFrameWidget.clear_overlay, widget)
+    widget.clear_overlay()
+    assert widget._waterfall_history is None
+    assert widget.overlaid_idxs == []
 
 
 def test_waterfall_history_payload_decimates_display_rows_only():
