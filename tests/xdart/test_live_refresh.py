@@ -1580,10 +1580,17 @@ def test_live_new_scan_invalidates_publication_store():
     host._sync_h5viewer_save_dir = MethodType(
         staticWidget._sync_h5viewer_save_dir, host,
     )
+    host._rescope_frame_panel_to = MethodType(
+        staticWidget._rescope_frame_panel_to, host,
+    )
 
+    # Same-name re-run (name matches scan.name="old") -> IN SYNC with the frame
+    # stream -> new_scan performs the destructive clear + store invalidation.  (A
+    # genuinely-new / differently-named scan now DEFERS to update_data's frame-driven
+    # boundary; see test_multi_scan_frame_boundary.)
     staticWidget.new_scan(
         host,
-        "new",
+        "old",
         "/tmp/new.nxs",
         False,
         "th",
@@ -1647,6 +1654,9 @@ def _new_scan_host_with_wrangler_mask(wrangler_mask, initial_global_mask,
     )
     host._sync_h5viewer_save_dir = MethodType(
         staticWidget._sync_h5viewer_save_dir, host,
+    )
+    host._rescope_frame_panel_to = MethodType(
+        staticWidget._rescope_frame_panel_to, host,
     )
     return host, scan
 

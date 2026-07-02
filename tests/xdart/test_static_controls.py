@@ -100,10 +100,14 @@ def test_mode_row_enabled_locks_mode_batch_cores(qapp):
     assert not c.modeCombo.isEnabled()
     assert not c.batchButton.isEnabled()
     assert not c.coresSpin.isEnabled()
+    # The Append/Replace write-mode toggle is a run-config control too: it must
+    # lock during a run (you can't switch Append<->Replace mid-scan).
+    assert not c.writeModeButton.isEnabled()
     assert c.actionRow.isEnabled()                 # action row left alone
     c.set_mode_row_enabled(True)
     assert c.modeCombo.isEnabled()
     assert c.batchButton.isEnabled()
+    assert c.writeModeButton.isEnabled()
 
 
 def test_run_row_visibility_can_collapse_to_mode_only(qapp):
