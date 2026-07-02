@@ -22,7 +22,8 @@ class _StopTimer:
 
 
 def _finish_host(tmp_path, *, batch, saw_frame, xye_only=False,
-                 reintegrate_running=False):
+                 reintegrate_running=False, write_mode="Overwrite",
+                 files_processed=None, append_skipped=0, indexed_count=0):
     nxs = tmp_path / "scan.nxs"
     nxs.write_bytes(b"")                         # os.path.exists -> True
     calls = []
@@ -31,16 +32,34 @@ def _finish_host(tmp_path, *, batch, saw_frame, xye_only=False,
         live_run_active=True, file_thread=file_thread, dirname=str(tmp_path),
         _auto_select_last_on_finish=False,
         update_scans=lambda: None,
+        update_data=lambda **_kwargs: None,
         set_file=lambda fname, *, internal=False: calls.append((fname, internal)),
     )
+    thread = SimpleNamespace(
+        batch_mode=batch,
+        xye_only=xye_only,
+        fname=str(nxs),
+        write_mode=write_mode,
+        _append_skip_without_reading=append_skipped,
+    )
+    if files_processed is not None:
+        thread.files_processed = files_processed
     wrangler = SimpleNamespace(
-        thread=SimpleNamespace(batch_mode=batch, xye_only=xye_only, fname=str(nxs)),
+        thread=thread,
         fname=str(nxs), stop=lambda: None,
         # scan_name differs from host.scan.name -> the post-load branch takes the
         # `else: wrangler.enabled(True)` path (no integrator_thread_finished).
         scan_name="other", enabled=lambda e: None,
     )
     loaded = []          # records post-live scan.frames populate (load_frame_index_only)
+    frame_index = []
+
+    def load_frame_index_only(fname):
+        loaded.append(fname)
+        if indexed_count:
+            frame_index[:] = list(range(1, indexed_count + 1))
+        return indexed_count
+
     host = SimpleNamespace(
         integratorTree=SimpleNamespace(
             integrator_thread=SimpleNamespace(
@@ -57,8 +76,8 @@ def _finish_host(tmp_path, *, batch, saw_frame, xye_only=False,
         # never populated scan.frames); load_frame_index_only is the populate hook.
         scan=SimpleNamespace(
             name="scanA", data_file=str(nxs),
-            frames=SimpleNamespace(index=[]),
-            load_frame_index_only=lambda f: (loaded.append(f), 0)[1],
+            frames=SimpleNamespace(index=frame_index),
+            load_frame_index_only=load_frame_index_only,
         ),
         _run_saw_frame=saw_frame,
     )
@@ -68,8 +87,8 @@ def _finish_host(tmp_path, *, batch, saw_frame, xye_only=False,
     # real _reconcile_h5viewer_frame_list_after_run (it calls
     # scan.load_frame_index_only and returns the indexed count).  Bind the real
     # method so the mock exercises that contract: load_frame_index_only fires
-    # (populating _loaded_paths) and the reconcile returns 0 for these mocks (no
-    # frame index) so the reload branch is correctly skipped.
+    # (populating _loaded_paths), with indexed_count controlling whether the
+    # mocked scan receives a populated frame index.
     host._reconcile_h5viewer_frame_list_after_run = MethodType(
         staticWidget._reconcile_h5viewer_frame_list_after_run, host)
     return host, h5viewer, str(nxs), calls
@@ -84,10 +103,23 @@ def test_batch_finish_forces_internal_reload_and_select_last(tmp_path):
     assert host._reint_update_timer.stopped == 1
 
 
+def test_append_all_skipped_batch_reconciles_then_reloads(tmp_path):
+    host, h5viewer, nxs, calls = _finish_host(
+        tmp_path, batch=True, saw_frame=False, write_mode="Append",
+        files_processed=0, append_skipped=3, indexed_count=3)
+    host.wrangler_finished()
+    assert host._loaded_paths == [nxs]
+    assert calls == [(nxs, True)], f"expected one internal reload; got {calls}"
+    assert h5viewer._auto_select_last_on_finish is True
+
+
 def test_append_zero_frame_finish_forces_internal_reload(tmp_path):
     # non-batch Append that processed 0 new frames -> also reload + select last
-    host, h5viewer, nxs, calls = _finish_host(tmp_path, batch=False, saw_frame=False)
+    host, h5viewer, nxs, calls = _finish_host(
+        tmp_path, batch=False, saw_frame=False, write_mode="Append",
+        files_processed=0, append_skipped=1, indexed_count=1)
     host.wrangler_finished()
+    assert host._loaded_paths == [nxs]
     assert calls == [(nxs, True)], f"expected one internal reload; got {calls}"
     assert h5viewer._auto_select_last_on_finish is True
 

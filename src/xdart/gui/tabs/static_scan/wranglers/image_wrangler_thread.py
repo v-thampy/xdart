@@ -758,32 +758,158 @@ class imageThread(wranglerThread):
             self._skip_reason_counts = reasons
         reasons[str(reason)] += count
 
-    def _remember_append_skip_snapshot(self, scan_name, frame_index):
-        if not self._append_skip_enabled() or scan_name is None:
-            return
-        cache = getattr(self, "_append_skip_frames_by_scan", None)
-        if cache is None:
-            cache = {}
-            self._append_skip_frames_by_scan = cache
-        cache.setdefault(str(scan_name), set(frame_index))
-
     @contextmanager
-    def _optional_file_lock(self):
-        lock = getattr(self, "file_lock", None)
+    def _optional_lock(self, lock):
         if lock is None:
             yield
         else:
             with lock:
                 yield
 
+    def _scan_frame_index_snapshot(self, scan):
+        frames = getattr(scan, "frames", None)
+        lock = getattr(scan, "scan_lock", None)
+        with self._optional_lock(lock):
+            index = getattr(frames, "index", ())
+            return set(index if index is not None else ())
+
+    def _warn_append_snapshot_failed(self, scan_name, out_path, exc):
+        warned = getattr(self, "_append_skip_snapshot_warnings", None)
+        if warned is None:
+            warned = set()
+            self._append_skip_snapshot_warnings = warned
+        key = str(scan_name)
+        if key in warned:
+            return
+        warned.add(key)
+        logger.warning(
+            "append skip snapshot unavailable for %s; proceeding without "
+            "pre-read skips: %s",
+            out_path, exc,
+        )
+
+    def _remember_append_skip_snapshot(self, scan_name, frame_index=None, *, scan=None):
+        if not self._append_skip_enabled() or scan_name is None:
+            return
+        cache = getattr(self, "_append_skip_frames_by_scan", None)
+        if cache is None:
+            cache = {}
+            self._append_skip_frames_by_scan = cache
+        try:
+            existing = (self._scan_frame_index_snapshot(scan)
+                        if scan is not None
+                        else set(frame_index or ()))
+        except Exception as exc:
+            out_path = self._append_output_path(scan_name)
+            self._warn_append_snapshot_failed(scan_name, out_path, exc)
+            existing = set()
+        cache[str(scan_name)] = existing
+
+    def _append_output_path(self, scan_name):
+        return os.path.join(getattr(self, "h5_dir", ""), str(scan_name) + '.nxs')
+
+    def _append_run_start_scan_names(self):
+        if not self._append_skip_enabled():
+            return []
+
+        names = []
+        seen = set()
+
+        def add(name):
+            if name is None:
+                return
+            key = str(name)
+            if key and key not in seen:
+                seen.add(key)
+                names.append(key)
+
+        img_file = getattr(self, "img_file", None)
+        inp_type = getattr(self, "inp_type", None)
+        img_ext = (getattr(self, "img_ext", "") or "").lower().lstrip(".")
+
+        if inp_type == 'Image Directory':
+            img_dir = getattr(self, "img_dir", None)
+            if not img_dir:
+                return names
+            match = _name_filter(getattr(self, "file_filter", ""))
+            root = Path(img_dir)
+            include_subdir = bool(getattr(self, "include_subdir", False))
+            if img_ext in ('h5', 'hdf5'):
+                suffix = f'_master.{img_ext}'
+                pattern = f'*{suffix}'
+                candidates = (root.rglob(pattern) if include_subdir
+                              else root.glob(pattern))
+                for path in natural_sort_ints([str(p) for p in candidates]):
+                    p = Path(path)
+                    if match(p.name[:-len(suffix)]):
+                        add(self._eiger_scan_name(p))
+            elif img_ext and img_ext not in ('nxs',):
+                suffix = f'.{img_ext}'
+                candidates = (root.rglob(f'*{suffix}') if include_subdir
+                              else root.glob(f'*{suffix}'))
+                for path in natural_sort_ints([str(p) for p in candidates]):
+                    p = Path(path)
+                    if match(p.name[:-len(suffix)]):
+                        add(_get_scan_info(p)[0])
+            return names
+
+        if img_file:
+            ext = Path(img_file).suffix.lower().lstrip(".")
+            if _is_eiger_master(img_file) or ext in ('h5', 'hdf5', 'nxs'):
+                add(self._eiger_scan_name(img_file))
+            else:
+                add(_get_scan_info(img_file)[0])
+        if not names:
+            add(getattr(self, "scan_name", None))
+        return names
+
+    def _new_append_scan_for_snapshot(self, scan_name, out_path):
+        return LiveScan(
+            scan_name,
+            data_file=out_path,
+            static=True,
+            gi=getattr(self, "gi", False),
+            incidence_motor=getattr(self, "incidence_motor", None),
+            series_average=getattr(self, "series_average", False),
+            single_img=getattr(self, "single_img", False),
+            global_mask=getattr(self, "mask", None),
+            detector_shape=getattr(self, "detector_shape", None),
+            file_lock=getattr(self, "file_lock", None),
+            **(getattr(self, "scan_args", {}) or {}),
+        )
+
+    def _prime_append_skip_snapshots_for_run(self):
+        if not self._append_skip_enabled():
+            return
+        cache = getattr(self, "_append_skip_frames_by_scan", None)
+        if cache is None:
+            cache = {}
+            self._append_skip_frames_by_scan = cache
+
+        for scan_name in self._append_run_start_scan_names():
+            if scan_name in cache:
+                continue
+            out_path = self._append_output_path(scan_name)
+            # The finish handler uses thread.fname even when every frame was
+            # skipped before initialize_scan() could run.
+            self.fname = out_path
+            if not os.path.exists(out_path):
+                cache[scan_name] = set()
+                continue
+            try:
+                scan = self._new_append_scan_for_snapshot(scan_name, out_path)
+                scan.load_from_h5(replace=False, mode='r')
+                self._remember_append_skip_snapshot(scan_name, scan=scan)
+            except Exception as exc:
+                self._warn_append_snapshot_failed(scan_name, out_path, exc)
+                cache[scan_name] = set()
+
     def _append_skip_snapshot(self, scan_name):
         """Return this run's append-skip frame snapshot for *scan_name*.
 
-        The snapshot is keyed by scan name and loaded once from
-        ``scan.frames.index`` while holding the same file lock used by the
-        writer.  It is intentionally not updated as this run processes new
-        frames; the dispatch-time membership check remains the live correctness
-        backstop.
+        Run start primes this cache from disk in read-only mode.  The per-frame
+        path is intentionally a pure in-memory lookup: no HDF5 open, no writer
+        mode, and no exception that can kill the run.
         """
         if not self._append_skip_enabled() or scan_name is None:
             return set()
@@ -794,29 +920,8 @@ class imageThread(wranglerThread):
             self._append_skip_frames_by_scan = cache
         if key in cache:
             return cache[key]
-
-        existing = set()
-        out_path = os.path.join(getattr(self, "h5_dir", ""), key + '.nxs')
-        if os.path.exists(out_path):
-            lock = getattr(self, "file_lock", None)
-            with self._optional_file_lock():
-                scan = LiveScan(
-                    key,
-                    data_file=out_path,
-                    static=True,
-                    gi=getattr(self, "gi", False),
-                    incidence_motor=getattr(self, "incidence_motor", None),
-                    series_average=getattr(self, "series_average", False),
-                    single_img=getattr(self, "single_img", False),
-                    global_mask=getattr(self, "mask", None),
-                    detector_shape=getattr(self, "detector_shape", None),
-                    file_lock=lock,
-                    **(getattr(self, "scan_args", {}) or {}),
-                )
-                scan.load_from_h5(replace=False, mode='a')
-                existing = set(scan.frames.index)
-        cache[key] = existing
-        return existing
+        cache[key] = set()
+        return cache[key]
 
     def _should_skip_before_read(self, scan_name, img_number):
         output_img_number = self._append_output_number(img_number)
@@ -856,7 +961,14 @@ class imageThread(wranglerThread):
         reasons = self._format_skip_reasons()
         if reasons:
             msg = f"{msg}: {reasons}"
-        logger.warning(msg)
+        only_already_processed = (
+            files_processed == 0
+            and discovered > 0
+            and getattr(self, "_skip_reason_counts", Counter())
+            == Counter({"already processed": discovered})
+        )
+        log = logger.info if only_already_processed else logger.warning
+        log(msg)
         try:
             self.showLabel.emit(msg)
         except Exception:
@@ -879,6 +991,7 @@ class imageThread(wranglerThread):
         # DEBUG: developer diagnostics, not run output.
         logger.debug('Execution policy: batch_mode=%s  batch=streaming  live=%s',
                      self.batch_mode, self._live_execution())
+        self._prime_append_skip_snapshots_for_run()
 
         # ── Phase 1 & 2: collect then process all existing images ─────────────
         pending = []  # [(img_file, img_number, img_data, img_meta, bg_raw)]
@@ -1128,6 +1241,8 @@ class imageThread(wranglerThread):
         self.flush_serial_tail(scan, force=True)
 
         # In batch mode, emit a single final signal so the GUI can refresh
+        self.files_processed = files_processed
+        self._last_files_processed = files_processed
         if self.batch_mode and files_processed > 0:
             self.sigUpdate.emit(-1)
         report_skip_summary = getattr(self, "_report_run_skip_summary", None)
@@ -2977,13 +3092,12 @@ class imageThread(wranglerThread):
                 with self.file_lock:
                     if write_mode == 'Append':
                         # v2 NeXus loader (the only one we support now).
-                        scan.load_from_h5(replace=False, mode='a')
+                        scan.load_from_h5(replace=False, mode='r')
                         scan.skip_2d = self.scan.skip_2d
                         for (k, v) in self.scan_args.items():
                             setattr(scan, k, v)
+                        self._remember_append_skip_snapshot(scan.name, scan=scan)
                         existing_frames = scan.frames.index
-                        self._remember_append_skip_snapshot(
-                            scan.name, existing_frames)
                         if len(existing_frames) == 0:
                             scan.save_to_nexus(replace=True)
                     else:

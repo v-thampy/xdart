@@ -35,6 +35,12 @@ def _bare_worker(tmp_path):
     worker.gi = False
     worker.incidence_motor = None
     worker.single_img = False
+    worker.img_file = ""
+    worker.img_ext = "tif"
+    worker.img_dir = str(tmp_path)
+    worker.inp_type = "Image File"
+    worker.include_subdir = False
+    worker.file_filter = ""
     worker.mask = None
     worker.detector_shape = None
     worker.meta_ext = None
@@ -45,7 +51,24 @@ def _bare_worker(tmp_path):
     worker._append_skip_without_reading = 0
     worker._discovered_frame_count = 0
     worker._skip_reason_counts = Counter()
+    worker._append_skip_snapshot_warnings = set()
     return worker
+
+
+class _FakeSnapshotScan:
+    frame_index = [1, 2]
+    load_calls = []
+
+    def __init__(self, name, data_file=None, file_lock=None, **_kwargs):
+        self.name = name
+        self.data_file = data_file
+        self.file_lock = file_lock
+        self.scan_lock = threading.RLock()
+        self.frames = SimpleNamespace(index=[])
+
+    def load_from_h5(self, replace=False, mode="r"):
+        self.load_calls.append((self.name, self.data_file, replace, mode))
+        self.frames.index = list(self.frame_index)
 
 
 def test_append_image_series_skips_before_reader_and_metadata(monkeypatch, tmp_path):
@@ -195,16 +218,183 @@ def test_eiger_prefetch_skips_indexed_frames_without_dataset_read(tmp_path):
     assert worker._append_skip_without_reading == 3
 
 
-def test_zero_processed_discovered_frames_warns_with_skip_reason(caplog, tmp_path):
+def test_append_skip_snapshot_lookup_never_opens_disk(monkeypatch, tmp_path):
+    worker = _bare_worker(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "scan.nxs").touch()
+
+    def fail_live_scan(*_args, **_kwargs):
+        pytest.fail("per-frame append skip lookup opened the .nxs")
+
+    monkeypatch.setattr(iwt, "LiveScan", fail_live_scan)
+
+    assert worker._should_skip_before_read("scan", 1) is False
+    assert worker._append_skip_frames_by_scan == {"scan": set()}
+
+
+def test_append_skip_snapshot_primes_once_read_only(monkeypatch, tmp_path):
+    worker = _bare_worker(tmp_path)
+    worker.inp_type = "Image File"
+    worker.img_file = str(tmp_path / "scan_master.h5")
+    worker.img_ext = "h5"
+    worker.scan_name = "scan_master"
+    out = tmp_path / "out"
+    out.mkdir()
+    output = out / "scan.nxs"
+    output.touch()
+
+    _FakeSnapshotScan.load_calls = []
+    _FakeSnapshotScan.frame_index = [1, 2]
+    monkeypatch.setattr(iwt, "LiveScan", _FakeSnapshotScan)
+
+    worker._prime_append_skip_snapshots_for_run()
+    worker._prime_append_skip_snapshots_for_run()
+
+    assert _FakeSnapshotScan.load_calls == [
+        ("scan", str(output), False, "r")
+    ]
+    assert worker._append_skip_frames_by_scan == {"scan": {1, 2}}
+    assert worker.fname == str(output)
+    assert worker._should_skip_before_read("scan", 2) is True
+
+
+def test_append_snapshot_primes_with_read_handle_open(monkeypatch, tmp_path):
+    import h5py
+
+    worker = _bare_worker(tmp_path)
+    worker.inp_type = "Image File"
+    worker.img_file = str(tmp_path / "scan_master.h5")
+    worker.img_ext = "h5"
+    out = tmp_path / "out"
+    out.mkdir()
+    output = out / "scan.nxs"
+    with h5py.File(output, "w") as h5:
+        h5.create_group("entry")
+
+    class H5OpeningSnapshotScan(_FakeSnapshotScan):
+        frame_index = [4, 5]
+
+        def load_from_h5(self, replace=False, mode="r"):
+            self.load_calls.append((self.name, self.data_file, replace, mode))
+            with h5py.File(self.data_file, mode):
+                pass
+            self.frames.index = list(self.frame_index)
+
+    H5OpeningSnapshotScan.load_calls = []
+    monkeypatch.setattr(iwt, "LiveScan", H5OpeningSnapshotScan)
+
+    with h5py.File(output, "r"):
+        worker._prime_append_skip_snapshots_for_run()
+
+    assert H5OpeningSnapshotScan.load_calls == [
+        ("scan", str(output), False, "r")
+    ]
+    assert worker._append_skip_frames_by_scan == {"scan": {4, 5}}
+
+
+def test_append_fresh_scan_primes_empty_and_reads_all(monkeypatch, tmp_path):
+    paths = [tmp_path / f"scan_{idx:04d}.tif" for idx in (1, 2)]
+    for path in paths:
+        path.touch()
+
+    worker = _bare_worker(tmp_path)
+    worker.inp_type = "Image Series"
+    worker.img_file = str(paths[0])
+    worker.img_dir = str(tmp_path)
+    worker.img_ext = "tif"
+    worker.scan_name = "scan"
+    worker.img_fnames = []
+    worker.processed = []
+
+    def fail_live_scan(*_args, **_kwargs):
+        pytest.fail("fresh append snapshot should not load a missing .nxs")
+
+    read_calls = []
+
+    def fake_read(path):
+        read_calls.append(os.fspath(path))
+        return np.ones((2, 2), dtype=float)
+
+    monkeypatch.setattr(iwt, "LiveScan", fail_live_scan)
+    monkeypatch.setattr(iwt, "read_image", fake_read)
+
+    worker._prime_append_skip_snapshots_for_run()
+    img_file, scan_name, img_number, img_data, _meta = worker.get_next_image()
+
+    assert worker._append_skip_frames_by_scan == {"scan": set()}
+    assert worker.fname == str(tmp_path / "out" / "scan.nxs")
+    assert img_file == str(paths[0])
+    assert scan_name == "scan"
+    assert img_number == 1
+    assert img_data.shape == (2, 2)
+    assert read_calls == [str(paths[0])]
+
+
+def test_append_snapshot_failure_warns_once_and_skips_nothing(
+        monkeypatch, caplog, tmp_path):
+    worker = _bare_worker(tmp_path)
+    worker.inp_type = "Image File"
+    worker.img_file = str(tmp_path / "scan_master.h5")
+    worker.img_ext = "h5"
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "scan.nxs").touch()
+
+    class BrokenSnapshotScan(_FakeSnapshotScan):
+        def load_from_h5(self, replace=False, mode="r"):
+            raise OSError("held read handle")
+
+    monkeypatch.setattr(iwt, "LiveScan", BrokenSnapshotScan)
+
+    with caplog.at_level(logging.WARNING):
+        worker._prime_append_skip_snapshots_for_run()
+        worker._prime_append_skip_snapshots_for_run()
+
+    assert worker._append_skip_frames_by_scan == {"scan": set()}
+    assert worker._should_skip_before_read("scan", 1) is False
+    warnings = [
+        rec for rec in caplog.records
+        if "append skip snapshot unavailable" in rec.message
+    ]
+    assert len(warnings) == 1
+
+
+def test_zero_processed_already_processed_frames_logs_info(caplog, tmp_path):
     worker = _bare_worker(tmp_path)
     labels = []
     worker.showLabel = SimpleNamespace(emit=labels.append)
     worker._record_discovered_frame()
     worker._record_skip_reason("already processed")
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.INFO):
         worker._report_run_skip_summary(0)
 
     expected = "0 of 1 discovered frame(s) processed: already processed"
     assert expected in caplog.text
+    assert not [
+        rec for rec in caplog.records
+        if rec.levelno >= logging.WARNING and expected in rec.message
+    ]
+    assert labels == [expected]
+
+
+def test_zero_processed_real_failure_still_warns(caplog, tmp_path):
+    worker = _bare_worker(tmp_path)
+    labels = []
+    worker.showLabel = SimpleNamespace(emit=labels.append)
+    worker._record_discovered_frame()
+    worker._record_skip_reason("unreadable or empty image data")
+
+    with caplog.at_level(logging.WARNING):
+        worker._report_run_skip_summary(0)
+
+    expected = (
+        "0 of 1 discovered frame(s) processed: unreadable or empty image data"
+    )
+    assert expected in caplog.text
+    assert [
+        rec for rec in caplog.records
+        if rec.levelno >= logging.WARNING and expected in rec.message
+    ]
     assert labels == [expected]

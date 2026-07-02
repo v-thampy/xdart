@@ -5613,8 +5613,31 @@ class staticWidget(QWidget):
         self.wrangler.stop()
 
         # Auto-load the final file generated from the batch if applicable
-        is_batch = getattr(self.wrangler.thread, 'batch_mode', False)
-        is_xye_only = getattr(self.wrangler.thread, 'xye_only', False)
+        thread = self.wrangler.thread
+        is_batch = getattr(thread, 'batch_mode', False)
+        is_xye_only = getattr(thread, 'xye_only', False)
+
+        processed_count = None
+        for attr in ("files_processed", "_files_processed",
+                     "_last_files_processed"):
+            value = getattr(thread, attr, None)
+            if value is None:
+                continue
+            try:
+                processed_count = int(value)
+            except (TypeError, ValueError):
+                logger.debug("invalid files_processed value: %r", value)
+            break
+        try:
+            append_skipped = int(
+                getattr(thread, "_append_skip_without_reading", 0) or 0)
+        except (TypeError, ValueError):
+            append_skipped = 0
+        all_skipped_append = (
+            getattr(thread, "write_mode", None) == 'Append'
+            and processed_count == 0
+            and append_skipped > 0
+        )
 
         if is_batch and not is_xye_only and not _reintegrate_running:
             # Prefer the thread's fname — it's the source of truth for
@@ -5640,6 +5663,8 @@ class staticWidget(QWidget):
                 # (the "last frame doesn't show after batch" regression).  The run has ended
                 # (_exit_run_state + live_run_active=False above), so bypassing the run guard
                 # is safe.
+                if all_skipped_append:
+                    self._reconcile_h5viewer_frame_list_after_run(generated_file)
                 self.h5viewer._auto_select_last_on_finish = True
                 self.h5viewer.set_file(generated_file, internal=True)
 
@@ -5657,6 +5682,8 @@ class staticWidget(QWidget):
                 if self.h5viewer.dirname != existing_dir:
                     self.h5viewer.dirname = existing_dir
                     self.h5viewer.update_scans()
+                if all_skipped_append:
+                    self._reconcile_h5viewer_frame_list_after_run(existing_file)
                 self.h5viewer._auto_select_last_on_finish = True
                 # internal=True for the same reason as the batch branch: force the
                 # reload past the same-file dedupe (the run wired file_thread.fname
@@ -5675,24 +5702,12 @@ class staticWidget(QWidget):
             written = (getattr(self.wrangler.thread, 'fname', None)
                        or getattr(self.wrangler, 'fname', None))
             indexed = self._reconcile_h5viewer_frame_list_after_run(written)
-            processed = None
-            for attr in ("files_processed", "_files_processed",
-                         "_last_files_processed"):
-                value = getattr(self.wrangler.thread, attr, None)
-                if value is not None:
-                    processed = value
-                    break
-            if processed is not None:
-                try:
-                    processed_count = int(processed)
-                    if indexed < processed_count:
-                        logger.warning(
-                            "post-live indexed fewer frames than processed: "
-                            "indexed=%d processed=%d file=%s",
-                            indexed, processed_count, written,
-                        )
-                except (TypeError, ValueError):
-                    logger.debug("invalid files_processed value: %r", processed)
+            if processed_count is not None and indexed < processed_count:
+                logger.warning(
+                    "post-live indexed fewer frames than processed: "
+                    "indexed=%d processed=%d file=%s",
+                    indexed, processed_count, written,
+                )
             if indexed:
                 self._apply_integration_control_state()
 
