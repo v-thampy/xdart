@@ -49,11 +49,11 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 | ID | Chunk | Effort | Risk | Payback | Prereqs | State |
 |----|-------|--------|------|---------|---------|-------|
 | H6 (W) | Per-mode subgroup writes, GUI+headless via one path; production multi-mode spine gate | M | med | Round-11 durability closed; multi-mode seam real | RC-3✓, H1✓ | **DONE** `c0b80b02` |
-| H8 (8a) | PublicationStore → bounded projection; delete legacy fallback; explicit-subset gate | M/L | med (was high; H7✓+H1✓+H6✓ de-risked) | triple-store divergence class impossible | H6✓, H7✓, Session-2 live gate | **IN-FLIGHT** (Wave 4, `h8_8a_store_flip.md`; incl. H2+H3 commit-0 + Wave-3 retry-counter carry-in; live gate folded into Session-1 §E) |
+| H8 (8a) | PublicationStore → bounded projection; delete legacy fallback; explicit-subset gate | M/L | med (was high; H7✓+H1✓+H6✓ de-risked) | triple-store divergence class impossible | H6✓, H7✓, Session-1 §E live gate | **DONE** this commit + `e509094c` (H2/H3 commit-0; Wave-3 retry-counter carry-in) |
 | H9 (8b) | Delete Role-A `data_1d/data_2d/hydrated_raw` (~76 refs; keep Role-B) | M | med | **greenfield done-test**; ~0.5-1GB mirrors gone; H7b completes | H8 | **QUEUED** (Wave 5a, `h9_8b_retire_mirrors.md` — pulled PRE-tag) |
 | H10 (7c) | Cadence/eviction policy → session + `max_heavy_bytes` | M | low-med | second-sink recipe; detector-aware caps | H9, ADR-0005 reaffirm | open (ADR decision owed) |
-| H2 | Thin-tail axis-interning / max_items | S | low | long-scan memory bounded | — | riding H8 commit-0 |
-| H3 | Memory-plateau acceptance gate | S | low | boundedness regression-detected | — | riding H8 commit-0 |
+| H2 | Thin-tail axis-interning / max_items | S | low | long-scan memory bounded | — | **DONE** `e509094c` |
+| H3 | Memory-plateau acceptance gate | S | low | boundedness regression-detected | — | **DONE** `e509094c` |
 | H11 | ViewerModeHandler seam | M | low | new viewers register, not shotgun-edit | rides H8/H9 | open |
 | H29 (D1) | Reintegrate-All + chunked replace-save (M4) | M/L | med | top missing feature, no 10GB OOM | H1✓; session machinery | open |
 | H24 | ewald live model → session | L | high | thin-GUI mass; "xdart owns no data" true | H9; do last | open |
@@ -192,14 +192,14 @@ Lane D (tests/bounds):  {H2, H3, H4, H5} — anytime, no dependencies
 | ID | Chunk | Size | Depends on | Status |
 |----|-------|------|-----------|--------|
 | H1 | mark_persisted mode-scoping (A1) | S | — | open |
-| H2 | FrameRecordStore thin-tail bound / axis interning (A4) | S/M | — | open |
-| H3 | Memory-plateau acceptance gate (A4) | S | — | riding H8 commit-0 |
+| H2 | FrameRecordStore thin-tail bound / axis interning (A4) | S/M | — | done `e509094c` |
+| H3 | Memory-plateau acceptance gate (A4) | S | — | done `e509094c` |
 | H4 | `_set_1d_cache_limit(None)` footgun (A4) | S | — | open |
 | H5 | Stage-6 parity test (A8) | S | — | open |
 | H6 | W: per-mode subgroup write wiring + production multi-mode spine gate (A2) | M | H1, RC-3 | done (this commit) |
 | H7a | Typed read result + policy table + render authority (display-side, fallbacks KEPT) (A3) | M | round-2 fix — **PULLED FORWARD pre-release** after 3 live bugs of this class; `codex_tasks/h7_typed_reads_render_authority.md` | done |
-| H7b | Remove the fallback tiers behind the H7a accessor | S | H7a; rides 8a | open |
-| H8 | 8a flip: PublicationStore→bounded projection; remove update_plot fallback; §0.4 blockers; explicit-subset hydrate-all-or-refuse gate | M/L | H6, H7, H13; live-gated (Session 2) | open |
+| H7b | Remove the fallback tiers behind the H7a accessor | S | H7a; rides 8a | partial: scan read-tier removed; Role-A deletion at H9/8b |
+| H8 | 8a flip: PublicationStore→bounded projection; remove update_plot fallback; §0.4 blockers; explicit-subset hydrate-all-or-refuse gate | M/L | H6, H7, H13; live-gated (Session 1 §E) | done this commit |
 | H9 | 8b delete Role-A `data_1d/data_2d/hydrated_raw` (keep Role-B `_ViewerRows`); greenfield done-test | M | H8 | open |
 | H10 | 7c cadence→session per ADR decision + optional `max_heavy_bytes` budget | M | H9, ADR decision | open |
 | H11 | ViewerModeHandler seam (rides inside H8/H9 commits) | M | with H8/H9 | open |

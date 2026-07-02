@@ -311,9 +311,7 @@ class _BaseController:
             widget,
             mode=mode,
             labels=labels,
-            include_legacy=(
-                store is None or mode not in (Mode.INT_1D, Mode.INT_2D)
-            ),
+            include_legacy=mode not in (Mode.INT_1D, Mode.INT_2D),
             request_2d_hydration=not aggregate_owns_2d,
         )
         return compute_display_state(

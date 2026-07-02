@@ -34,6 +34,7 @@ them.
 
 from __future__ import annotations
 
+import logging
 import warnings
 from dataclasses import dataclass
 from enum import Enum
@@ -51,6 +52,9 @@ from xrd_tools.core.invalid import (
     integer_saturation_ceiling as _core_saturation_ceiling,
     saturation_pixels as _saturation_pixels,
 )
+
+logger = logging.getLogger(__name__)
+_LEGACY_MIRROR_TELEMETRY: set[tuple[str, str]] = set()
 
 __all__ = [
     "Mode",
@@ -977,6 +981,31 @@ def _tier(value):
         return DataTier.PUBLICATION
 
 
+def _mode(value):
+    if isinstance(value, Mode):
+        return value
+    try:
+        return Mode(str(value))
+    except ValueError:
+        return value
+
+
+def _scan_mode(value) -> bool:
+    return _mode(value) in (Mode.INT_1D, Mode.INT_2D)
+
+
+def _log_legacy_mirror_ignored_once(mode, tier_needed) -> None:
+    key = (str(getattr(_mode(mode), "value", mode)), _tier(tier_needed).value)
+    if key in _LEGACY_MIRROR_TELEMETRY:
+        return
+    _LEGACY_MIRROR_TELEMETRY.add(key)
+    logger.info(
+        "display read ignored legacy mirror for scan mode=%s tier=%s",
+        key[0],
+        key[1],
+    )
+
+
 def _view_has_tier(view, tier_needed):
     if view is None:
         return False
@@ -1069,16 +1098,18 @@ def resolve_frame_data(
     include_legacy=True,
     request_hydration=None,
 ):
-    """Resolve one display datum through the additive H7a fallback chain.
+    """Resolve one display datum through the H8 store-first read chain.
 
     The function is intentionally duck-typed and Qt-free.  It never calls a
     blocking hydrate method; an unavailable-but-expected frame becomes
     ``EVICTED_HYDRATING`` and the optional request callback is invoked instead.
-    Existing fallback tiers are preserved in order:
-    store-first accessor -> PublicationStore -> legacy mirrors.
+    Scan displays read store-first accessor -> PublicationStore -> hydration.
+    Viewer modes may still read their file-browser legacy rows.  If a scan
+    mirror row would have been hit, log once as telemetry for the 8b deletion.
     """
     key = _label_key(label)
     tier_needed = _tier(tier_needed)
+    scan_mode = _scan_mode(mode)
 
     if callable(store_first_lookup):
         publication = store_first_lookup(key, allow_blocking_read=False)
@@ -1117,14 +1148,16 @@ def resolve_frame_data(
         data, has_raw, has_thumbnail = _legacy_data_for_tier(
             key, tier_needed, data_1d=data_1d, data_2d=data_2d)
         if data is not None:
-            return ReadResult(
-                key, tier_needed, ReadStatus.RESIDENT, data,
-                source="legacy_mirror", has_raw=has_raw,
-                has_thumbnail=has_thumbnail)
+            if scan_mode:
+                _log_legacy_mirror_ignored_once(mode, tier_needed)
+            else:
+                return ReadResult(
+                    key, tier_needed, ReadStatus.RESIDENT, data,
+                    source="legacy_mirror", has_raw=has_raw,
+                    has_thumbnail=has_thumbnail)
 
     # Scan display paths with a store/store-first accessor can expect a later
     # async completion.  Viewer-only mirror misses are genuinely absent.
-    scan_mode = mode in (Mode.INT_1D, Mode.INT_2D)
     can_hydrate = scan_mode and (
         callable(store_first_lookup)
         or publication_store is not None

@@ -224,6 +224,7 @@ class PublicationDisplayAdapter:
 
     def __init__(self, store, *, widget=None, labels=None, items=None):
         self._widget = widget
+        self._store = store
         if items is not None:
             self._items = dict(items)
         elif store is None:
@@ -238,6 +239,74 @@ class PublicationDisplayAdapter:
                 for label in _label_keys(labels)
                 if (publication := store.get(label)) is not None
             }
+
+    def _empty_plot_payload(self) -> PlotPayload:
+        return PlotPayload(axis_x=Axis(label="", unit=""), traces=())
+
+    def _plot_publication_missing(self, publication, *, needs_2d: bool) -> bool:
+        if publication is None:
+            return True
+        view = publication.view
+        if needs_2d:
+            return bool(not view.has_2d or publication_has_2d_errors(publication))
+        return bool(not view.has_1d or publication_has_1d_errors(publication))
+
+    def _request_missing_plot_hydration(self, labels, *, needs_2d: bool) -> None:
+        widget = self._widget
+        if widget is None:
+            return
+        request = getattr(widget, "_request_frame_hydration", None)
+        if request is None:
+            request = getattr(widget, "_request_missing_publication", None)
+        if request is None:
+            return
+        purpose = "full" if needs_2d else "1d"
+        for label in _label_keys(labels):
+            try:
+                request(label, purpose=purpose)
+            except TypeError:
+                try:
+                    request(label)
+                except Exception:
+                    continue
+            except Exception:
+                continue
+
+    def _hydrate_missing_plot_subset(self, labels, *, needs_2d: bool) -> None:
+        missing = [
+            _label_key(label)
+            for label in labels
+            if self._plot_publication_missing(
+                self._items.get(_label_key(label)),
+                needs_2d=needs_2d,
+            )
+        ]
+        if not missing:
+            return
+        widget = self._widget
+        async_enabled = bool(getattr(widget, "_async_hydration_enabled", False))
+        store = self._store
+        if not async_enabled and store is not None:
+            try:
+                if needs_2d and hasattr(store, "get_or_hydrate"):
+                    for label in missing:
+                        publication = store.get_or_hydrate(label)
+                        if publication is not None:
+                            self._items[label] = publication
+                elif not needs_2d and hasattr(store, "get_1d_many_or_hydrate"):
+                    self._items.update(store.get_1d_many_or_hydrate(tuple(missing)))
+            except Exception:
+                pass
+        still_missing = [
+            label for label in missing
+            if self._plot_publication_missing(
+                self._items.get(label),
+                needs_2d=needs_2d,
+            )
+        ]
+        if still_missing:
+            self._request_missing_plot_hydration(
+                still_missing, needs_2d=needs_2d)
 
     def available_1d_keys(self) -> set:
         return {
@@ -629,17 +698,15 @@ class PublicationDisplayAdapter:
         )
 
     def plot_payload(self, state):
-        # Step 5 FLIP: the integration 1D plot now draws from the publication
-        # record's active .view (see integration_plot_payload).  Single/Sum/
-        # Average flow through it (Sum/Average collapse at render in
-        # update_1d_view); the 2D-slice/converted-axis fallbacks return None
-        # there, so render_display falls back to the legacy update_plot for those.
+        # H8: integration 1D now draws from the publication record's active
+        # .view only.  Single/Sum/Average flow through integration_plot_payload;
+        # a None payload blanks through render_display, never through update_plot.
         #
         # Flip stage 3: Overlay/Waterfall now own their cross-render history in the
         # payload (_overlay_waterfall_payload -> WaterfallHistory), intercepted here
         # BEFORE the integration route (which returns None for these methods).  The
         # accumulator survives store eviction because it rides in the payload, not
-        # the store.  The legacy update_plot stays only as the None-payload fallback.
+        # the store.
         if (state.mode in (Mode.INT_1D, Mode.INT_2D)
                 and state.method in ("Overlay", "Waterfall")):
             return self._overlay_waterfall_payload(state)
@@ -651,8 +718,7 @@ class PublicationDisplayAdapter:
             if getattr(self._widget, "_waterfall_history", None) is not None:
                 self._widget._waterfall_history = None
             return self.integration_plot_payload(state)
-        # Overlay/Waterfall outside the integration modes have no payload owner
-        # yet -> legacy fallback.
+        # Overlay/Waterfall outside the integration modes have no payload owner yet.
         if state.method in ("Overlay", "Waterfall"):
             return None
         if not self._can_use_native_1d_axis(state):
@@ -688,20 +754,16 @@ class PublicationDisplayAdapter:
         return PlotPayload(axis_x=axis, traces=tuple(traces))
 
     # ----------------------------------------------------------------- #
-    # Full-parity integration 1D payload.  Step 5 WIRED this into
-    # plot_payload (above) for INT_1D/INT_2D; Overlay/Waterfall + the
-    # converted-axis-without-wavelength / 2D-slice cases return None here
-    # and stay on the legacy update_plot via render_display's fallback.
+    # Full-parity integration 1D payload.  H8 makes this the only INT_1D/INT_2D
+    # plot source; None means render_display clears/preserves per policy.
     # ----------------------------------------------------------------- #
     def integration_plot_payload(self, state):
         """Build the INT_1D/INT_2D 1D :class:`PlotPayload` for the active-mode
         ``.view`` at legacy parity: native readout, GI verbatim axis, on-the-fly
         Q↔2θ, and 2D-slice-derived 1D projection.
 
-        Returns ``None`` for Overlay/Waterfall (their cross-render history /
-        waterfall-y state is not owned by the payload yet — a later step), and
-        when no usable 1D trace can be built.  ``plot_payload`` calls this for
-        integration modes and lets the legacy renderer handle ``None`` fallbacks."""
+        Returns ``None`` for Overlay/Waterfall (owned by
+        _overlay_waterfall_payload) and when no usable 1D trace can be built."""
         if state.method in ("Overlay", "Waterfall"):
             return None
         widget = self._widget
@@ -711,25 +773,40 @@ class PublicationDisplayAdapter:
             source == "1d_2d" and _slice_enabled(widget)
         )
 
-        # Eviction parity (Step 7b): when any intended 1D frame is not resident
-        # in the publication STORE, Overall Sum/Average should use the complete
-        # on-disk aggregate.  Other non-resident selections return None so the
-        # remaining legacy fallback/hydration path can handle explicit subsets
-        # without silently dropping frames.  selected_ids holds the full intended
-        # set for both overall (= all_frame_index) and explicit selections.
-        for label in state.selected_ids:
-            pub = self._items.get(_label_key(label))
-            if pub is None:
+        # Eviction parity (H8): Overall Sum/Average may use the complete
+        # on-disk aggregate.  Explicit subsets must hydrate every requested
+        # frame or refuse with an empty payload; never aggregate/draw the
+        # resident subset silently, and never fall through to legacy mirrors.
+        selected_missing = [
+            _label_key(label)
+            for label in state.selected_ids
+            if self._plot_publication_missing(
+                self._items.get(_label_key(label)),
+                needs_2d=needs_2d,
+            )
+        ]
+        if selected_missing:
+            if getattr(state, "overall", False):
                 aggregate = (
                     self._aggregate_plot_payload(state) if not needs_2d else None
                 )
-                return aggregate
-            if needs_2d:
-                if not pub.view.has_2d or publication_has_2d_errors(pub):
-                    return None
-            elif not pub.view.has_1d or publication_has_1d_errors(pub):
-                aggregate = self._aggregate_plot_payload(state)
-                return aggregate
+                if aggregate is not None:
+                    return aggregate
+            if state.method in ("Sum", "Average"):
+                self._hydrate_missing_plot_subset(
+                    state.selected_ids, needs_2d=needs_2d)
+                selected_missing = [
+                    _label_key(label)
+                    for label in state.selected_ids
+                    if self._plot_publication_missing(
+                        self._items.get(_label_key(label)),
+                        needs_2d=needs_2d,
+                    )
+                ]
+                if selected_missing:
+                    return self._empty_plot_payload()
+            else:
+                return None
 
         render_ids = tuple(state.render_ids)
         if state.method == "Single" and len(render_ids) > 15:

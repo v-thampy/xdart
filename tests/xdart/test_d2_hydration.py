@@ -7,6 +7,7 @@ test, headlessly, that (a) _rehydrate_publication turns an evicted disk frame
 into a heavy publication, (b) the shared store rehydrates through it, and (c)
 the GUI render path only queues a background request when async hydration was
 explicitly enabled (off in headless tests -> synchronous reads preserved)."""
+import logging
 from types import SimpleNamespace, MethodType
 
 import numpy as np
@@ -137,6 +138,45 @@ def test_request_frame_hydration_respects_enabled_flag():
         (3, 5, "full"),
         (3, 5, "1d"),
     ]                                        # same label, different purpose
+
+
+def test_repeated_failed_hydration_suppresses_until_generation_bump(caplog):
+    calls = []
+    rendered = []
+    fake_worker = SimpleNamespace(
+        request=lambda label, gen, *, purpose="full": calls.append(
+            (label, gen, purpose)))
+    h = SimpleNamespace(
+        _async_hydration_enabled=True,
+        display_generation=5,
+        _hydration_pending_labels=set(),
+        _hydration_failure_counts={},
+        _hydration_failure_logged=set(),
+        _pending_hydration_render=False,
+        _pending_hydration_generation=None,
+    )
+    h.update = lambda: rendered.append(True)
+    h._ensure_hydration_worker = lambda: fake_worker
+    h._request_frame_hydration = MethodType(
+        displayFrameWidget._request_frame_hydration, h)
+    h._flush_hydration_render = MethodType(
+        displayFrameWidget._flush_hydration_render, h)
+    h._on_frame_hydrated = MethodType(
+        displayFrameWidget._on_frame_hydrated, h)
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(5):
+            before = len(calls)
+            h._request_frame_hydration(8, purpose="1d")
+            if len(calls) > before:
+                h._on_frame_hydrated(8, 5)
+
+    assert calls == [(8, 5, "1d")] * 3
+    assert caplog.text.count("suppressing repeated hydration requests") == 1
+
+    h.display_generation = 6
+    h._request_frame_hydration(8, purpose="1d")
+    assert calls[-1] == (8, 6, "1d")
 
 
 def test_legacy_1d_catchup_requests_1d_hydration_purpose():

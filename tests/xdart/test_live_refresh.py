@@ -2687,19 +2687,19 @@ def _update_smoke_host():
 def test_update_render_smoke_int_collapse_and_mode_switches():
     host, calls, dl = _update_smoke_host()
 
-    # Int-2D: the 1D plot draws via the legacy delegate; RAW_2D and CAKE_2D are
+    # Int-2D: the 1D plot is payload-only; RAW_2D and CAKE_2D are
     # both payload-only now (item-2 flip), and this host has no publication_store,
-    # so their payloads are None and both 2D panels blank.
+    # so all three panels blank cleanly.
     host.update()
-    assert "draw_plot" in calls
+    assert "clear_plot" in calls
     assert "clear_image" in calls and "clear_binned" in calls
-    assert "label_2d" in calls
+    assert "label_2d" not in calls
 
     # Int-1D (skip_2d): 1D-only — plot drawn, the two 2D panels cleared.
     calls.clear()
     host.scan.skip_2d = True
     host.update()
-    assert "draw_plot" in calls
+    assert "clear_plot" in calls
     assert "clear_image" in calls and "clear_binned" in calls
     assert "draw_image" not in calls and "draw_binned" not in calls
 
@@ -2762,7 +2762,7 @@ def test_update_render_smoke_int_collapse_and_mode_switches():
     host.viewer_mode = None
     host._bump_display_generation()
     host.update()
-    assert "draw_plot" in calls                        # 1D plot legacy delegate
+    assert "clear_plot" in calls
     # RAW_2D + CAKE_2D are payload-only; no publication_store -> both 2D blank.
     assert "clear_image" in calls and "clear_binned" in calls
 
@@ -2770,12 +2770,12 @@ def test_update_render_smoke_int_collapse_and_mode_switches():
 def test_update_render_smoke_gi_scan_propagates_and_dispatches():
     # A GI scan still renders through the same path; gi flag propagates into
     # the state.  RAW_2D + CAKE_2D are payload-only (item-2 flip); no
-    # publication_store on this host -> both 2D panels blank; the 1D plot draws.
+    # publication_store on this host -> all panels blank cleanly.
     host, calls, dl = _update_smoke_host()
     host.scan.gi = True
     host.update()
     assert host._live_display_state().gi is True
-    assert "draw_plot" in calls
+    assert "clear_plot" in calls
     assert "clear_image" in calls and "clear_binned" in calls
 
 
@@ -3188,16 +3188,18 @@ def test_render_display_int2d_draws_all_panels():
         method='Single', unit_changed=False, prev_overlaid_ids=(),
         raw_availability={0: dict(has_raw=True)}, titles={}, generation=1)
     # RAW_2D + CAKE_2D draw via the payload path (_draw_image_payload); PLOT_1D
-    # has no payload here so it falls through to the legacy update_plot.
+    # has no payload here, so the payload-only renderer clears it.
     payload = dl.DisplayPayload(
         generation=1,
         raw_image=dl.ImagePayload(image=np.ones((2, 2))),
         cake_image=dl.ImagePayload(image=np.ones((2, 2))),
         plot=None)
     host.render_display(state, payload)
-    assert "draw_payload_image" in calls and "draw_plot" in calls
+    assert "draw_payload_image" in calls
+    assert "clear_plot" in calls
     assert "label_2d" in calls and "preview" in calls
-    assert not any(c.startswith("clear_") for c in calls)
+    assert "clear_image" not in calls and "clear_binned" not in calls
+    assert "draw_plot" not in calls
 
 
 def test_render_display_uses_publication_plot_payload_when_present():
@@ -3236,11 +3238,11 @@ def test_render_display_uses_publication_plot_payload_when_present():
     np.testing.assert_allclose(host.plot_data[1], [[1.0, 2.0, 3.0]])
 
 
-def test_publication_plot_native_uses_payload_derived_falls_back():
+def test_publication_plot_native_uses_payload_derived_clears_when_missing():
     # Step 5 FLIP: native INT 1D draws through the publication payload
     # (update_plot_view).  A 2D-derived axis / slice on a 1D-ONLY frame can't
     # build a 2D projection (no intensity_2d), so the payload returns None and
-    # render_display falls back to the legacy update_plot.
+    # render_display clears the plot instead of falling back to update_plot.
     from xrd_tools.core import Axis, FrameView
     from xdart.gui.tabs.static_scan.display_publication import PublicationDisplayAdapter
     from xdart.modules.frame_publication import (
@@ -3307,11 +3309,12 @@ def test_publication_plot_native_uses_payload_derived_falls_back():
     assert "payload_plot" in calls
     assert "draw_plot" not in calls
 
-    # 2D-derived axis / slice on a 1D-only frame -> payload can't build -> legacy.
+    # 2D-derived axis / slice on a 1D-only frame -> payload can't build -> clear.
     for source, sliced in (("2d", False), ("1d_2d", True)):
         calls, payload = render_with_axis(source, sliced)
         assert payload.plot is None
-        assert "draw_plot" in calls
+        assert "clear_plot" in calls
+        assert "draw_plot" not in calls
         assert "payload_plot" not in calls
 
 
@@ -3365,9 +3368,25 @@ def test_live_display_state_render_ids_match_legacy_idxs():
     # idxs the (delegated) draw methods consume — the two paths coexist until
     # the data-source unification removes the idxs path.
     from xdart.gui.tabs.static_scan.display_logic import Mode
+    from xdart.modules.frame_publication import (
+        PublicationStore, publication_from_frame_view)
+    from xrd_tools.core import Axis, FrameView
+
+    store = PublicationStore(max_items=None)
+    for label in (0, 1):
+        store.upsert(publication_from_frame_view(FrameView(
+            label=label,
+            axis_1d=Axis("Q", "q_A^-1", values=np.arange(2)),
+            intensity_1d=np.ones(2),
+            axis_2d_x=Axis("Q", "q_A^-1", values=np.arange(2)),
+            axis_2d_y=Axis("chi", "chi_deg", values=np.arange(2)),
+            intensity_2d=np.ones((2, 2)),
+            raw=np.ones((2, 2)),
+        )))
 
     host = SimpleNamespace(
         viewer_mode=None,
+        publication_store=store,
         display_generation=3,
         frame_ids=['0', '1'],
         idxs=[0, 1], idxs_1d=[0, 1], idxs_2d=[0, 1],
@@ -6618,6 +6637,7 @@ def test_raw_preview_does_not_lazy_load_on_gui_data_access():
         _lazy_load_raw=lambda: calls.append("loaded"),
     )
     host = SimpleNamespace(
+        viewer_mode="image",
         idxs_2d=[1],
         data_lock=RLock(),
         data_1d={1: frame},
@@ -6633,6 +6653,7 @@ def test_raw_preview_does_not_lazy_load_on_gui_data_access():
 def test_map_raw_masks_eiger_sentinel_before_display_average():
     raw = np.array([[2.0, 4294967295.0], [4.0, 8.0]])
     host = SimpleNamespace(
+        viewer_mode="image",
         idxs_2d=[1],
         data_lock=RLock(),
         data_1d={1: SimpleNamespace(scan_info={})},
@@ -6703,6 +6724,7 @@ def test_normal_raw_display_all_sentinel_image_clears_safely():
 def test_overall_preview_prefers_bounded_thumbnail_data():
     frame = SimpleNamespace(scan_info={}, thumbnail=np.ones((2, 2)))
     host = SimpleNamespace(
+        viewer_mode="image",
         idxs_2d=[1],
         data_lock=RLock(),
         data_1d={1: frame},
@@ -6769,6 +6791,7 @@ def test_overall_2d_requires_all_requested_frames_when_strict():
 def test_map_raw_reports_thumbnail_source():
     frame = SimpleNamespace(scan_info={}, thumbnail=np.ones((2, 2)))
     host = SimpleNamespace(
+        viewer_mode="image",
         idxs_2d=[1],
         data_lock=RLock(),
         data_1d={1: frame},

@@ -15,8 +15,11 @@ import logging
 import os
 import re
 import threading
+import time
 
 logger = logging.getLogger(__name__)
+_HYDRATION_FAILURE_LIMIT = 3
+_HYDRATION_FAILURE_TTL_SECONDS = 30.0
 
 # Other imports
 import matplotlib.pyplot as plt
@@ -680,6 +683,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._hydration_worker = None
         self._async_hydration_enabled = False
         self._hydration_pending_labels = set()
+        self._hydration_failure_counts = {}
+        self._hydration_failure_logged = set()
         self._pending_hydration_render = False
         self._pending_hydration_generation = None
         self._last_hydration_render = 0.0
@@ -1011,6 +1016,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         pending_hydration = getattr(self, "_hydration_pending_labels", None)
         if pending_hydration is not None:
             pending_hydration.clear()
+        failures = getattr(self, "_hydration_failure_counts", None)
+        if failures is not None:
+            failures.clear()
+        logged = getattr(self, "_hydration_failure_logged", None)
+        if logged is not None:
+            logged.clear()
         self._pending_hydration_render = False
         self._pending_hydration_generation = None
         self._current_selection_repaint_generation = None
@@ -1145,22 +1156,150 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self._hydration_worker = worker
         return self._hydration_worker
 
+    def _view_has_hydration_payload(self, view, purpose) -> bool:
+        if view is None:
+            return False
+        if purpose == "1d":
+            return bool(
+                getattr(view, "has_1d", False)
+                or getattr(view, "intensity_1d", None) is not None
+            )
+        return bool(
+            getattr(view, "has_2d", False)
+            or getattr(view, "intensity_2d", None) is not None
+            or getattr(view, "raw", None) is not None
+            or getattr(view, "thumbnail", None) is not None
+            or getattr(view, "has_1d", False)
+            or getattr(view, "intensity_1d", None) is not None
+        )
+
+    def _hydration_item_views(self, item):
+        views = []
+        view = getattr(item, "view", None)
+        if view is not None:
+            views.append(view)
+        for attr in ("results_1d", "results_2d"):
+            mapping = getattr(item, attr, None)
+            values = getattr(mapping, "values", None)
+            if callable(values):
+                views.extend(values())
+        for name in ("view_1d", "view_2d", "active_view"):
+            fn = getattr(item, name, None)
+            if callable(fn):
+                try:
+                    view = fn()
+                except Exception:
+                    continue
+                if view is not None:
+                    views.append(view)
+        return tuple(views)
+
+    def _hydration_purpose_resident(self, label, purpose) -> bool:
+        purpose = str(purpose or "full")
+        stores_fn = getattr(self, "_hydration_stores", None)
+        if stores_fn is None:
+            return False
+        for store in stores_fn():
+            get = getattr(store, "get", None)
+            if not callable(get):
+                continue
+            try:
+                item = get(label)
+            except Exception:
+                logger.debug("hydration residency lookup failed for %s", label,
+                             exc_info=True)
+                continue
+            if item is None:
+                continue
+            if any(
+                self._view_has_hydration_payload(view, purpose)
+                for view in self._hydration_item_views(item)
+            ):
+                return True
+        return False
+
+    def _hydration_request_suppressed(self, label, purpose) -> bool:
+        failures = getattr(self, "_hydration_failure_counts", None)
+        if not failures:
+            return False
+        key = (label, str(purpose or "full"))
+        entry = failures.get(key)
+        if entry is None:
+            return False
+        generation, count, suppress_until = entry
+        if generation != getattr(self, "display_generation", None):
+            failures.pop(key, None)
+            return False
+        if count < _HYDRATION_FAILURE_LIMIT:
+            return False
+        if time.monotonic() >= suppress_until:
+            failures.pop(key, None)
+            logged = getattr(self, "_hydration_failure_logged", None)
+            if logged is not None:
+                logged.discard((key[0], key[1], generation))
+            return False
+        return True
+
+    def _record_hydration_completion(
+            self, label, purpose, *, success: bool, generation) -> None:
+        failures = getattr(self, "_hydration_failure_counts", None)
+        if failures is None:
+            failures = {}
+            self._hydration_failure_counts = failures
+        key = (label, str(purpose or "full"))
+        if success:
+            failures.pop(key, None)
+            return
+        try:
+            generation = int(generation)
+        except (TypeError, ValueError):
+            generation = getattr(self, "display_generation", 0)
+        prev_generation, prev_count, _until = failures.get(key, (generation, 0, 0.0))
+        count = (prev_count if prev_generation == generation else 0) + 1
+        suppress_until = (
+            time.monotonic() + _HYDRATION_FAILURE_TTL_SECONDS
+            if count >= _HYDRATION_FAILURE_LIMIT
+            else 0.0
+        )
+        failures[key] = (generation, count, suppress_until)
+        if count >= _HYDRATION_FAILURE_LIMIT:
+            logged = getattr(self, "_hydration_failure_logged", None)
+            if logged is None:
+                logged = set()
+                self._hydration_failure_logged = logged
+            log_key = (key[0], key[1], generation)
+            if log_key not in logged:
+                logged.add(log_key)
+                logger.warning(
+                    "suppressing repeated hydration requests for frame %s "
+                    "purpose %s after %s failures",
+                    key[0],
+                    key[1],
+                    count,
+                )
+
     def _request_frame_hydration(self, label, *, purpose="full") -> None:
         """Queue a background rehydration for an evicted frame (no-op unless the
         live app enabled async hydration)."""
         if not self._async_hydration_enabled:
             return
+        try:
+            label_key = int(label)
+        except (TypeError, ValueError):
+            label_key = label
+        purpose_key = str(purpose or "full")
+        suppressed = getattr(self, "_hydration_request_suppressed", None)
+        if suppressed is None:
+            suppressed = displayFrameWidget._hydration_request_suppressed.__get__(
+                self, type(self))
+        if suppressed(label_key, purpose_key):
+            return
         worker = self._ensure_hydration_worker()
         if worker is not None:
-            try:
-                label_key = int(label)
-            except (TypeError, ValueError):
-                label_key = label
             pending = getattr(self, "_hydration_pending_labels", None)
             if pending is None:
                 pending = set()
                 self._hydration_pending_labels = pending
-            purpose_key = str(purpose or "full")
             pending_key = (label_key, purpose_key)
             if pending_key in pending:
                 return
@@ -1214,6 +1353,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             except (TypeError, ValueError):
                 label_keys = [label]
         pending = getattr(self, "_hydration_pending_labels", None)
+        completed_pending_keys = []
         if pending is not None:
             for label_key in label_keys:
                 pending.discard(label_key)  # legacy test/old-state tolerance
@@ -1223,6 +1363,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                         and pending_key
                         and pending_key[0] == label_key
                     ):
+                        completed_pending_keys.append(pending_key)
                         pending.discard(pending_key)
         try:
             generation = int(generation)
@@ -1232,6 +1373,21 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         current_generation = sync() if callable(sync) else self.display_generation
         if generation != current_generation:
             return
+        resident = getattr(self, "_hydration_purpose_resident", None)
+        if resident is None:
+            resident = displayFrameWidget._hydration_purpose_resident.__get__(
+                self, type(self))
+        record = getattr(self, "_record_hydration_completion", None)
+        if record is None:
+            record = displayFrameWidget._record_hydration_completion.__get__(
+                self, type(self))
+        for label_key, purpose_key in completed_pending_keys:
+            record(
+                label_key,
+                purpose_key,
+                success=bool(resident(label_key, purpose_key)),
+                generation=generation,
+            )
         self._pending_hydration_render = True
         self._pending_hydration_generation = generation
         quiet = getattr(self, "_hydration_quiet_timer", None)
@@ -1641,8 +1797,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def _draw_delegate(self, role, mode):
         # Payload-only viewer modes (Image / XYE / NeXus): a ``None`` payload
         # means blank that panel — there is no legacy draw fallback.  Normal
-        # integration plots intentionally delegate to update_plot; raw images
-        # still keep update_image as their fallback.
+        # integration plots are payload-only too; raw images still keep
+        # update_image as their manual rollback path.
         if role is PanelRole.RAW_2D:
             if mode in (Mode.IMAGE_VIEWER, Mode.NEXUS_VIEWER):
                 return self.clear_image_view
@@ -1660,13 +1816,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if role is PanelRole.PLOT_1D:
             if mode in (Mode.XYE_VIEWER, Mode.NEXUS_VIEWER):
                 return self.clear_plot_view
-            # Stage 4: the production CONTROLS (plotUnit/slice/slice-range,
-            # plotMethod, slice converter) now drive the redraw through update()
-            # -> the payload pipeline.  The PLOT_1D None-payload fallback is KEPT
-            # as update_plot (a safety net + rollback path) pending the live
-            # checkpoint that confirms integration_plot_payload covers every case;
-            # removing it is the live-gated final step (see update_plot's note).
-            return self.update_plot
+            return self.clear_plot_view
         if role is PanelRole.CAKE_2D:
             # CAKE_2D renders solely from the payload (cake_image); a None cake
             # payload normally blanks the panel (no legacy update_binned

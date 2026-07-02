@@ -39,9 +39,40 @@ def _ir2d(val, *, nq=8, nchi=6, rad=None):
 
 def _make_host(scan, data_2d, data_1d=None):
     from xdart.gui.tabs.static_scan.display_data import DisplayDataMixin
+    from xdart.modules.frame_publication import (
+        PublicationStore, publication_from_frame_view)
+    from xrd_tools.core import FrameView
+
+    data_1d = data_1d if data_1d is not None else {}
+    store = PublicationStore(max_items=None, max_heavy_items=None,
+                             max_thumbnail_items=None)
+    for label in sorted(set(data_1d) | set(data_2d)):
+        one_d = data_1d.get(label)
+        two_d = data_2d.get(label, {}) or {}
+        result_1d = getattr(one_d, "int_1d", None)
+        result_2d = two_d.get("int_2d")
+        raw = two_d.get("map_raw")
+        thumbnail = two_d.get("thumbnail")
+        if result_1d is None and result_2d is None and raw is None and thumbnail is None:
+            continue
+        metadata = dict(getattr(one_d, "scan_info", {}) or {})
+        view = FrameView.from_results(
+            label=label,
+            result_1d=result_1d,
+            result_2d=result_2d,
+            raw=raw,
+            thumbnail=thumbnail,
+            metadata_raw=metadata,
+        )
+        store.upsert(publication_from_frame_view(
+            view,
+            raw_status=("raw" if raw is not None else "thumbnail"),
+            validate=False,
+        ))
+
     h = DisplayDataMixin.__new__(DisplayDataMixin)
     h.scan = scan
-    h.data_1d = data_1d if data_1d is not None else {}
+    h.data_1d = data_1d
     h.data_2d = data_2d
     h.data_lock = threading.RLock()
     h.normChannel = None
@@ -52,7 +83,7 @@ def _make_host(scan, data_2d, data_1d=None):
         plotUnit=SimpleNamespace(currentIndex=lambda: 0, currentText=lambda: ""),
         slice=SimpleNamespace(isChecked=lambda: False))
     h.viewer_mode = None
-    h.publication_store = None
+    h.publication_store = store if len(store) else None
     h._async_hydration_enabled = False
     return h
 
@@ -319,7 +350,7 @@ class TestSetBkgRawBlockingRead:
         host._request_frame_hydration = lambda idx: queued.append(int(idx))
         out = host.get_frames_map_raw([0, 1], require_all=True)   # no override
         assert (1, False) in calls               # served the async helper
-        assert queued == [1]                      # evicted frame queued off-thread
+        assert set(queued) == {1}                 # evicted frame queued off-thread
         assert out is None                        # async path can't complete inline
 
 

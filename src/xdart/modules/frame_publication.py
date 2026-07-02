@@ -32,6 +32,8 @@ from xrd_tools.io.nexus_record import (
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_PUBLICATION_MAX_ITEMS = 512
+
 
 def _readonly_mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
     if not value:
@@ -529,7 +531,7 @@ class PublicationStore:
     def __init__(
         self,
         *,
-        max_items: int | None = None,
+        max_items: int | None = DEFAULT_PUBLICATION_MAX_ITEMS,
         max_heavy_items: int | None = 64,
         max_thumbnail_items: int | None = 512,
     ) -> None:

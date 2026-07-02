@@ -134,8 +134,8 @@ class DisplayDataMixin:
         """Return the scan-display publication for ``idx`` when available.
 
         Viewer modes keep using their row/file-browser caches.  Normal Int 1D/2D
-        display paths should prefer the bounded publication store, falling back
-        to the legacy mirrors only while the A3/A4 retirement is in progress.
+        display paths read the bounded store/projection and queue hydration on a
+        miss; Role-A mirrors are written for rollback until H9 but not read here.
         """
         if getattr(self, "viewer_mode", None) is not None:
             return None
@@ -394,10 +394,7 @@ class DisplayDataMixin:
                 missing.append(key)
                 continue
             snapshot[key] = self._publication_legacy_parts(publication)
-        if missing and not (
-            getattr(self, "viewer_mode", None) is None
-            and getattr(self, "publication_store", None) is not None
-        ):
+        if missing and not scan_store_active:
             with self.data_lock:
                 for key in missing:
                     snapshot[key] = (

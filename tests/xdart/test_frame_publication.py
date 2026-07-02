@@ -284,6 +284,17 @@ def test_publication_store_can_bound_total_items():
     assert store.get(3).view.has_1d
 
 
+def test_publication_store_default_total_bound():
+    store = PublicationStore(max_heavy_items=None, max_thumbnail_items=None)
+    for idx in range(600):
+        store.upsert(publication_from_live_frame(DuckFrame(idx=idx)))
+
+    assert len(store) == 512
+    assert store.labels()[0] == 88
+    assert store.get(87) is None
+    assert store.get(599) is not None
+
+
 def test_publication_from_nexus_frame_matches_live_style_view(tmp_path):
     frame = DuckFrame(idx=8)
     live_publication = publication_from_live_frame(frame, include_raw=False)
@@ -1325,13 +1336,13 @@ def test_plot_payload_sum_average_emit_n_traces_collapsed_at_render():
         np.testing.assert_allclose(np.nansum(stack, 0), np.full(6, 6.0))
 
 
-def test_plot_payload_falls_back_when_store_evicted_even_if_render_ids_lists_it():
+def test_plot_payload_refuses_when_store_evicted_even_if_render_ids_lists_it():
     # P1 (codex/other-claude review): the bounded store evicts older frames' 1D
     # arrays (max_heavy_items).  Even if a caller hands in a state whose
     # render_ids still list those labels, plot_payload must check the store
     # itself and refuse to collapse a resident-only subset.  In production,
-    # Overall Sum/Average is filled by the on-disk aggregate; this low-level
-    # test keeps the store-only guard locked.
+    # Overall Sum/Average is filled by the on-disk aggregate; explicit subsets
+    # blank-await instead of falling back to legacy mirrors.
     store = PublicationStore(max_heavy_items=1)
     for i in (0, 1, 2):
         f = DuckFrame(idx=i)
@@ -1353,7 +1364,12 @@ def test_plot_payload_falls_back_when_store_evicted_even_if_render_ids_lists_it(
             prev_overlaid_ids=(), raw_availability={}, titles={},
             generation=store.generation)
         assert set(state.render_ids) == {0, 1, 2}   # stale state masks eviction
-        assert adapter.plot_payload(state) is None  # store-only gate -> fall back
+        payload = adapter.plot_payload(state)
+        if method in ("Average", "Sum"):
+            assert payload is not None
+            assert payload.traces == ()
+        else:
+            assert payload is None
     # an all-resident selection still builds the payload (the flip applies).
     assert adapter.plot_payload(_int_state(store, ids=(2,), method="Single")) is not None
 

@@ -173,6 +173,82 @@ def test_sum_average_state_snapshot_does_not_reenqueue_full_2d_hydration():
     assert queued == []
 
 
+def test_explicit_sum_subset_missing_frames_hydrates_or_refuses():
+    from xdart.gui.tabs.static_scan.display_logic import Mode
+    from xdart.gui.tabs.static_scan.display_publication import (
+        PublicationDisplayAdapter)
+    from xdart.modules.frame_publication import (
+        PublicationStore, publication_from_live_frame)
+    from xrd_tools.core.containers import IntegrationResult1D
+
+    x = np.linspace(0.5, 5.0, 6, dtype=np.float32)
+
+    def _frame(i):
+        return SimpleNamespace(
+            idx=i,
+            int_1d=IntegrationResult1D(
+                radial=x, intensity=np.full(x.shape, float(i), dtype=np.float32),
+                sigma=np.ones_like(x), unit="q_A^-1"),
+            int_2d=None, map_raw=None, mask=None, gi=False, gi_2d={},
+            thumbnail=None, bg_raw=0, scan_info={}, source_file=f"f{i}.tif",
+            source_frame_idx=i,
+        )
+
+    state = SimpleNamespace(
+        mode=Mode.INT_1D,
+        method="Sum",
+        overall=False,
+        selected_ids=(1, 2, 3),
+        render_ids=(1, 2, 3),
+    )
+    widget = SimpleNamespace(
+        _async_hydration_enabled=True,
+        _plot_axis_info=[{"source": "1d"}],
+        normalize=lambda data, _metadata: data,
+        scan=SimpleNamespace(name="scan", gi=False),
+        ui=SimpleNamespace(
+            plotUnit=SimpleNamespace(currentIndex=lambda: 0,
+                                     currentText=lambda: "Q (Å⁻¹)"),
+            slice=SimpleNamespace(isChecked=lambda: False),
+        ),
+    )
+
+    queued = []
+    widget._request_frame_hydration = (
+        lambda label, *, purpose="full": queued.append((label, purpose)))
+    live_store = PublicationStore(max_heavy_items=1)
+    for label in state.selected_ids:
+        live_store.upsert(publication_from_live_frame(_frame(label)))
+
+    payload = PublicationDisplayAdapter(
+        live_store, widget=widget, labels=state.selected_ids
+    ).plot_payload(state)
+
+    assert payload is not None
+    assert payload.traces == ()
+    assert queued == [(1, "1d"), (2, "1d")]
+
+    calls = []
+    sync_store = PublicationStore(max_heavy_items=None)
+
+    def hydrate(labels):
+        calls.append(tuple(labels))
+        return [publication_from_live_frame(_frame(label)) for label in labels]
+
+    sync_store.set_1d_hydrator(hydrate)
+    widget._async_hydration_enabled = False
+    queued.clear()
+
+    payload = PublicationDisplayAdapter(
+        sync_store, widget=widget, labels=state.selected_ids
+    ).plot_payload(state)
+
+    assert calls == [(1, 2, 3)]
+    assert queued == []
+    assert payload is not None
+    assert len(payload.traces) == 3
+
+
 def test_widget_whole_scan_aggregate_allows_primary_gi(tmp_path):
     scan, _, _ = _split_scan_2d(tmp_path, n=12)
     scan.gi = True

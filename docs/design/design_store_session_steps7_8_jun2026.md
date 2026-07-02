@@ -37,6 +37,10 @@ decisions before build. **Builds on:** ADR-0003 (multi-result record), ADR-0004 
   commit)** wires both production writers through the shared `xrd_tools.io` record/stack path. The
   accumulated per-mode record now survives crash/reload; non-primary GI modes are durable for
   instant mode-switch after reload, but whole-scan aggregation remains primary-mode-scoped.
+- **8a DONE (H8):** scan display reads no longer use Role-A `data_1d`/`data_2d` mirrors; the read
+  chain is session store → bounded `PublicationStore` projection → disk hydration. Mirrors remain
+  written as rollback/deletion safety until 8b, with log-once telemetry if a scan mirror would have
+  been hit.
 
 ## Target architecture (ADR-0005)
 - **Authoritative store → `xrd_tools.session`** (headless): bounded `Mapping[idx → FrameRecord]`,
@@ -93,9 +97,10 @@ Whole-scan Sum/Average/Overall must source ALL frames without holding them all i
 - **7b (aggregation):** route whole-scan Sum/Average/Overall through the stacked-disk-read + in-memory
   tail, off the GUI thread. Still additive (`data_1d` still present). This is the capability that
   replaces `data_1d`.
-- **8a (flip):** `PublicationStore` becomes a derived projection over the session store; live display
-  + aggregation read the session store / stacked-read; remove the legacy `update_plot` fallback (the
-  payload/session-store is the sole source). **Unblocked by W/H6.**
+- **8a DONE (H8):** `PublicationStore` is bounded (`max_items=512`) and treated as a derived
+  projection over the session store; live display + aggregation read the session store /
+  stacked-read / hydration path; the legacy `update_plot` None-payload fallback is removed and
+  explicit Sum/Average subsets hydrate-all-or-refuse.
 - **8b (delete):** remove `data_1d`/`data_2d`/`hydrated_raw`; keep h5viewer `_ViewerRows`.
   **Done-test:** those identifiers gone from the display layer (the greenfield "done").
 - **7c (cadence):** move `FlushPolicy` + eviction policy into the session (mechanism stays xdart).

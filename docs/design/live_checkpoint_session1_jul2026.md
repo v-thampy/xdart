@@ -48,6 +48,18 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
 - [ ] D3 Share-Axis link visual pass; ROI stats dialog §10 visual eyeball.
 - [ ] D4 Timer floor: `XDART_FLUSH_MS=80` now clamps (warning logged, render keeps working).
 
+## E. H8/8a store-flip live checks
+- [ ] E1 Store-only display sanity: reloaded scan draws Single, Overlay, Waterfall, Sum, and
+      Average without scan-display `data_1d`/`data_2d` mirror reads.
+- [ ] E2 Scroll-back to evicted frames: first paint from local disk feels responsive
+      (budget: <1 s) and converges to the requested frame/trace set.
+- [ ] E3 GI sub-mode switching: live mode switches and reload switches both draw the durable
+      W-backed mode data without recomputation or stale-mode drift.
+- [ ] E4 Explicit subset spanning evicted frames: Sum/Average hydrates every requested frame or
+      refuses/blank-awaits; it never draws a resident-only partial subset.
+- [ ] E5 Mirror-read telemetry: during the whole session, `display read ignored legacy mirror`
+      lines are ZERO after normal store-backed display setup (any hit is an 8b follow-up).
+
 **PASS ⇒ proceed to RC-8** (merge → tag v1.0.0 → publish; recipe in
 `handoff_chunks_jul2026.md`). Any FAIL: stop, report the item + `kill -USR1 <pid>` stack if a
 freeze, fix-forward on `feature/remediation`, re-run only the failed section.

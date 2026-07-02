@@ -22,6 +22,7 @@ for the green scaffold tests.
 """
 
 import dataclasses
+import logging
 import math
 import os
 import subprocess
@@ -145,7 +146,7 @@ def test_overlay_read_failure_clears_for_non_accumulating_methods():
         assert dl.overlay_read_failure_action(method, has_accumulator=True) == 'clear'
 
 
-def test_resolve_frame_data_typed_statuses_and_fallbacks():
+def test_resolve_frame_data_typed_statuses_and_fallbacks(caplog):
     view_1d = SimpleNamespace(has_1d=True, intensity_1d=[1.0], axis_1d=object())
     publication = SimpleNamespace(view=view_1d, metadata_raw={})
 
@@ -177,6 +178,27 @@ def test_resolve_frame_data_typed_statuses_and_fallbacks():
     assert legacy.status is dl.ReadStatus.RESIDENT
     assert legacy.source == "legacy_mirror"
     assert legacy.data == "legacy-frame"
+
+    requests = []
+    dl._LEGACY_MIRROR_TELEMETRY.clear()
+    with caplog.at_level(logging.INFO):
+        ignored = dl.resolve_frame_data(
+            6, dl.Mode.INT_1D, dl.DataTier.ONE_D,
+            data_1d={6: "scan-legacy-frame"},
+            request_hydration=lambda label, *, purpose="full":
+                requests.append((label, purpose)),
+        )
+        ignored_again = dl.resolve_frame_data(
+            7, dl.Mode.INT_1D, dl.DataTier.ONE_D,
+            data_1d={7: "scan-legacy-frame"},
+            request_hydration=lambda label, *, purpose="full":
+                requests.append((label, purpose)),
+        )
+    assert ignored.status is dl.ReadStatus.EVICTED_HYDRATING
+    assert ignored.source == "hydration"
+    assert ignored_again.status is dl.ReadStatus.EVICTED_HYDRATING
+    assert requests == [(6, "1d"), (7, "1d")]
+    assert caplog.text.count("ignored legacy mirror") == 1
 
     absent = dl.resolve_frame_data(
         5, dl.Mode.XYE_VIEWER, dl.DataTier.ONE_D,
@@ -966,6 +988,22 @@ class _CountingIndex:
 
 
 def _controller_widget(index, *, frame_ids, data_1d=None, data_2d=None):
+    publication_store = None
+    if data_1d:
+        import numpy as np
+        from xdart.modules.frame_publication import (
+            PublicationStore, publication_from_frame_view)
+        from xrd_tools.core import Axis, FrameView
+
+        publication_store = PublicationStore(max_items=None)
+        for label in data_1d:
+            publication_store.upsert(publication_from_frame_view(
+                FrameView(
+                    label=label,
+                    axis_1d=Axis("Q", "q_A^-1", values=np.arange(2)),
+                    intensity_1d=np.ones(2),
+                )
+            ))
     return SimpleNamespace(
         scan=SimpleNamespace(
             scan_lock=RLock(),
@@ -973,7 +1011,7 @@ def _controller_widget(index, *, frame_ids, data_1d=None, data_2d=None):
             gi=False,
         ),
         frame_ids=list(frame_ids),
-        publication_store=None,
+        publication_store=publication_store,
         data_lock=RLock(),
         data_1d={} if data_1d is None else data_1d,
         data_2d={} if data_2d is None else data_2d,
