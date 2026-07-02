@@ -36,8 +36,11 @@ from .display_logic import (
     is_gi_2d_units,
     nanmean_slice,
     resample_cake_to_unit,
+    waterfall_display_rows,
 )
 from .display_constants import AA_inv, Deg, Th, x_labels_2D, x_units_2D
+
+MAX_WATERFALL_PAYLOAD_ROWS = 256
 
 
 def _label_key(label: Any) -> Any:
@@ -190,6 +193,17 @@ def _label_keys(labels) -> tuple:
         seen.add(key)
         keys.append(key)
     return tuple(keys)
+
+
+def _decimate_display_ids(ids, max_rows=MAX_WATERFALL_PAYLOAD_ROWS) -> tuple:
+    ids = tuple(ids or ())
+    if max_rows is None:
+        return ids
+    max_rows = int(max_rows)
+    if max_rows <= 0 or len(ids) <= max_rows:
+        return ids
+    stride = int(np.ceil(len(ids) / max_rows))
+    return ids[::stride]
 
 
 def _display_ids_for_2d(state) -> tuple:
@@ -717,10 +731,14 @@ class PublicationDisplayAdapter:
                 aggregate = self._aggregate_plot_payload(state)
                 return aggregate
 
+        render_ids = tuple(state.render_ids)
+        if state.method == "Single" and len(render_ids) > 15:
+            render_ids = _decimate_display_ids(render_ids)
+
         traces = []
         axis = None
         ref_x = None
-        for label in state.render_ids:
+        for label in render_ids:
             publication = self._items.get(_label_key(label))
             if publication is None:
                 continue
@@ -754,7 +772,8 @@ class PublicationDisplayAdapter:
 
         if not traces or axis is None:
             return None
-        return PlotPayload(axis_x=axis, traces=tuple(traces))
+        return PlotPayload(
+            axis_x=axis, traces=tuple(traces), display_ids=tuple(render_ids))
 
     # ----------------------------------------------------------------- #
     # Overlay/Waterfall payload (flip stage 3 — WIRED into plot_payload): the
@@ -861,11 +880,17 @@ class PublicationDisplayAdapter:
         symbol does not always round-trip through x_axis_for_unit (e.g. 2θ)."""
         label = history.label or x_axis_for_unit(history.unit)[0]
         axis = Axis(label, history.unit)
+        rows, display_ids, _stride = waterfall_display_rows(
+            history.rows, history.ids, MAX_WATERFALL_PAYLOAD_ROWS)
+        name_by_id = {int(i): n for i, n in zip(history.ids, history.names)}
         traces = tuple(
-            Trace(label=history.names[k], x=history.x, y=history.rows[k])
-            for k in range(history.count))
+            Trace(label=name_by_id.get(int(display_ids[k]), str(display_ids[k])),
+                  x=history.x, y=rows[k])
+            for k in range(len(display_ids)))
         return PlotPayload(axis_x=axis, traces=traces,
-                           overlaid_ids=tuple(history.ids), plot_history=history)
+                           overlaid_ids=tuple(history.ids),
+                           plot_history=history,
+                           display_ids=tuple(display_ids))
 
     def _apply_plot_unit_1d(self, x_values, data_unit, ref_publication):
         """1D analog of :meth:`_apply_image_unit_2d`: on-the-fly Q↔2θ for the

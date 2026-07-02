@@ -354,6 +354,7 @@ class PlotPayload:
     axis_y: "Axis | None" = None
     overlaid_ids: "tuple | None" = None      # frame ids accumulated (Overlay/Waterfall)
     plot_history: "object | None" = None     # immutable accumulator view
+    display_ids: "tuple | None" = None       # ids for the emitted/painted traces
 
 
 @dataclass(frozen=True)

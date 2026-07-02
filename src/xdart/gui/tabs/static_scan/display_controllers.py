@@ -147,6 +147,7 @@ def _data_snapshot(widget, *, labels=None, include_legacy=True):
         loaded_1d |= pub_1d
         loaded_2d |= pub_2d
         raw_avail.update(pub_raw)
+        _request_missing_publications(widget, labels, loaded_1d)
     if not include_legacy:
         return loaded_1d, loaded_2d, raw_avail
 
@@ -176,6 +177,37 @@ def _data_snapshot(widget, *, labels=None, include_legacy=True):
     return loaded_1d, loaded_2d, raw_avail
 
 
+def _request_missing_publications(widget, labels, loaded_1d) -> None:
+    """Queue async hydration for selected scan labels whose 1D payload is thinned."""
+    if labels is None or getattr(widget, "viewer_mode", None) is not None:
+        return
+    try:
+        if widget.ui.plotMethod.currentText() in ("Sum", "Average"):
+            return
+    except Exception:
+        pass
+    request = getattr(widget, "_request_frame_hydration", None)
+    if request is None:
+        request = getattr(widget, "_request_missing_publication", None)
+    if request is None:
+        return
+    loaded = {_label_key(label) for label in loaded_1d}
+    for label in _label_keys(labels):
+        if label in loaded:
+            continue
+        try:
+            request(label, purpose="1d")
+        except TypeError:
+            try:
+                request(label)
+            except Exception:
+                logger.debug("publication hydration request failed for %s", label,
+                             exc_info=True)
+        except Exception:
+            logger.debug("publication hydration request failed for %s", label,
+                         exc_info=True)
+
+
 def _store_first_publication_items(widget, labels):
     """Return synthetic publications from the store-first FrameView accessor."""
     if getattr(widget, "viewer_mode", None) is not None:
@@ -193,6 +225,9 @@ def _store_first_publication_items(widget, labels):
         publication = lookup(label, allow_blocking_read=False)
         if publication is not None:
             items[_label_key(label)] = publication
+    adapter = PublicationDisplayAdapter(
+        store=None, widget=widget, items=items)
+    _request_missing_publications(widget, labels, adapter.available_1d_keys())
     return items
 
 

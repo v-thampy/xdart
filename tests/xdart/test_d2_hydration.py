@@ -74,10 +74,52 @@ def test_store_get_or_hydrate_uses_registered_rehydrator():
     assert store.get(7) is not None
 
 
+def test_store_get_1d_many_uses_batch_1d_rehydrator(monkeypatch):
+    import xrd_tools.io as xrd_io
+
+    calls = []
+
+    def fake_get_1d(path, frame):
+        calls.append((path, tuple(frame)))
+        return SimpleNamespace(
+            q=np.array([0.1, 0.2, 0.3]),
+            intensity=np.vstack([
+                np.full(3, float(label)) for label in frame
+            ]),
+            sigma=None,
+            q_unit="q_A^-1",
+            frames=np.asarray(frame, dtype=np.int64),
+        )
+
+    monkeypatch.setattr(xrd_io, "get_1d", fake_get_1d)
+    store = PublicationStore(max_heavy_items=0, max_thumbnail_items=0)
+    h = SimpleNamespace(
+        publication_store=store,
+        scan=SimpleNamespace(data_file="scan.nxs", gi=False),
+    )
+    h._rehydrate_publications_1d = MethodType(
+        DisplayDataMixin._rehydrate_publications_1d, h)
+    store.set_1d_hydrator(h._rehydrate_publications_1d)
+
+    out = store.get_1d_many_or_hydrate((3, 4))
+
+    assert calls == [("scan.nxs", (3, 4))]
+    assert set(out) == {3, 4}
+    assert out[3].view.has_1d
+    assert out[3].view.intensity_2d is None
+    assert out[3].view.raw is None
+    assert out[3].raw_status == "1d-only"
+
+
 def test_request_frame_hydration_respects_enabled_flag():
     calls = []
-    fake_worker = SimpleNamespace(request=lambda label, gen: calls.append((label, gen)))
-    h = SimpleNamespace(_async_hydration_enabled=False, display_generation=5)
+    fake_worker = SimpleNamespace(
+        request=lambda label, gen, *, purpose="full": calls.append(
+            (label, gen, purpose)))
+    h = SimpleNamespace(
+        _async_hydration_enabled=False, display_generation=5,
+        _hydration_pending_labels=set(),
+    )
     h._ensure_hydration_worker = lambda: fake_worker
     h._request_frame_hydration = MethodType(
         displayFrameWidget._request_frame_hydration, h)
@@ -87,13 +129,17 @@ def test_request_frame_hydration_respects_enabled_flag():
 
     h._async_hydration_enabled = True
     h._request_frame_hydration(3)
-    assert calls == [(3, 5)]                  # enabled -> queued with generation
+    assert calls == [(3, 5, "full")]          # enabled -> queued with generation
+    h._request_frame_hydration(3)
+    assert calls == [(3, 5, "full")]          # duplicate label/gen coalesced
 
 
 def test_on_frame_hydrated_drops_stale_generation():
     rendered = []
     h = SimpleNamespace(display_generation=7)
     h.update = lambda: rendered.append(True)
+    h._flush_hydration_render = MethodType(
+        displayFrameWidget._flush_hydration_render, h)
     h._on_frame_hydrated = MethodType(
         displayFrameWidget._on_frame_hydrated, h)
 
@@ -101,3 +147,66 @@ def test_on_frame_hydrated_drops_stale_generation():
     assert rendered == []
     h._on_frame_hydrated(4, 7)                 # current -> re-render
     assert rendered == [True]
+
+
+def test_on_frame_hydrated_accepts_batched_1d_labels():
+    rendered = []
+    h = SimpleNamespace(
+        display_generation=7,
+        _hydration_pending_labels={1, 2, 3},
+        _pending_hydration_render=False,
+    )
+    h.update = lambda: rendered.append(True)
+    h._flush_hydration_render = MethodType(
+        displayFrameWidget._flush_hydration_render, h)
+    h._on_frame_hydrated = MethodType(
+        displayFrameWidget._on_frame_hydrated, h)
+
+    h._on_frame_hydrated((1, 2), 7)
+    assert h._hydration_pending_labels == {3}
+    assert rendered == [True]
+
+
+def test_hydration_completion_stream_coalesces_rerenders():
+    rendered = []
+
+    class FakeTimer:
+        def __init__(self):
+            self.starts = 0
+
+        def start(self):
+            self.starts += 1
+
+    quiet = FakeTimer()
+    progress = FakeTimer()
+    h = SimpleNamespace(
+        display_generation=7,
+        _hydration_pending_labels=set(range(100)),
+        _pending_hydration_render=False,
+        _last_hydration_render=0.0,
+        _hydration_quiet_timer=quiet,
+        _hydration_progress_timer=progress,
+    )
+    h.update = lambda: rendered.append(True)
+    h._flush_hydration_render = MethodType(
+        displayFrameWidget._flush_hydration_render, h)
+    h._flush_hydration_progress_render = MethodType(
+        displayFrameWidget._flush_hydration_progress_render, h)
+    h._on_frame_hydrated = MethodType(
+        displayFrameWidget._on_frame_hydrated, h)
+
+    for label in range(50):
+        h._on_frame_hydrated(label, 7)
+
+    assert rendered == []
+    assert quiet.starts == 50
+    assert progress.starts == 50
+    h._flush_hydration_progress_render()
+    assert rendered == [True]
+
+    for label in range(50, 100):
+        h._on_frame_hydrated(label, 7)
+
+    assert len(rendered) == 1
+    h._flush_hydration_render()
+    assert len(rendered) == 2

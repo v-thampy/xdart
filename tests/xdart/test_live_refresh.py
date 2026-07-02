@@ -4570,9 +4570,14 @@ def test_waterfall_options_popup_requires_explicit_button_click():
         wf_widget=wf_widget,
         plot_layout=plot_layout,
         _share_link_on=False,
+        plot_data=[np.array([0.0]), np.ones((1, 1))],
         ui=SimpleNamespace(wf_options=button),
         wf_yaxis_widget=QtWidgets.QWidget(),
     )
+    layout_host._detach_bottom_widget = MethodType(
+        DisplayPlotMixin._detach_bottom_widget, layout_host)
+    layout_host._attach_bottom_widget = MethodType(
+        DisplayPlotMixin._attach_bottom_widget, layout_host)
 
     DisplayPlotMixin.setup_wf_layout(layout_host)
     app.processEvents()
@@ -4584,6 +4589,53 @@ def test_waterfall_options_popup_requires_explicit_button_click():
 
     assert dialog.isVisible()
     dialog.close()
+    win.close()
+
+
+def test_plot_waterfall_layout_swaps_do_not_show_detached_widgets():
+    from PySide6 import QtWidgets
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    win = QtWidgets.QWidget()
+    outer = QtWidgets.QVBoxLayout(win)
+    container = QtWidgets.QWidget()
+    plot_layout = QtWidgets.QVBoxLayout(container)
+    plot_win = QtWidgets.QWidget()
+    plot_win.setObjectName("plot_win")
+    wf_widget = QtWidgets.QWidget()
+    wf_widget.setObjectName("wf_widget")
+    plot_layout.addWidget(plot_win)
+    outer.addWidget(container)
+    win.show()
+    app.processEvents()
+
+    host = SimpleNamespace(
+        plot_win=plot_win,
+        wf_widget=wf_widget,
+        plot_layout=plot_layout,
+        _share_link_on=False,
+        plot_data=[np.array([0.0]), np.ones((1, 1))],
+        ui=SimpleNamespace(wf_options=QtWidgets.QPushButton("Options")),
+        wf_yaxis_widget=QtWidgets.QWidget(),
+    )
+    host._detach_bottom_widget = MethodType(
+        DisplayPlotMixin._detach_bottom_widget, host)
+    host._attach_bottom_widget = MethodType(
+        DisplayPlotMixin._attach_bottom_widget, host)
+
+    for _ in range(4):
+        DisplayPlotMixin.setup_wf_layout(host)
+        app.processEvents()
+        assert wf_widget.parent() is container
+        assert wf_widget.isVisible()
+        assert not (plot_win.isWindow() and plot_win.isVisible())
+
+        DisplayPlotMixin.setup_1d_layout(host)
+        app.processEvents()
+        assert plot_win.parent() is container
+        assert plot_win.isVisible()
+        assert not (wf_widget.isWindow() and wf_widget.isVisible())
+
     win.close()
 
 

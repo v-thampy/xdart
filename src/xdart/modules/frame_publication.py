@@ -9,6 +9,7 @@ store without reaching back through widget state.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field, replace
 from threading import RLock
@@ -24,6 +25,8 @@ from xrd_tools.core import (
     TwoDKind,
     numeric_metadata,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # Legacy GUI dict keys (``frame.gi_1d`` / ``frame.gi_2d``, written by
@@ -416,10 +419,12 @@ def publication_from_nexus_frame(
 
 
 def _view_has_heavy_arrays(view: FrameView) -> bool:
+    # 1D rows are tiny compared with raw detector images and 2D cakes.  The
+    # overlay/waterfall fast path hydrates many of them in one batch, so they
+    # must not be governed by the 64-item raw/cake heavy window.
     return any(
         value is not None
         for value in (
-            view.intensity_1d, view.sigma_1d,
             view.intensity_2d, view.sigma_2d,
             view.raw, view.thumbnail,
         )
@@ -461,6 +466,8 @@ def _publication_has_full_payload(publication: FramePublication) -> bool:
     _publication_has_heavy_payload — the latter counts the thumbnail as heavy, so
     a tier-1 (thumbnail-only) publication wrongly looked 'already loaded' and
     never rehydrated."""
+    if publication.raw_status == "1d-only":
+        return False
     if publication.raw_ref is not None:
         return True
     if _view_has_data_arrays(publication.view):
@@ -638,6 +645,7 @@ class PublicationStore:
         # reads on the GUI thread; the thumbnail tier keeps scroll-back
         # paintable meanwhile).
         self._hydrator = None
+        self._hydrator_1d_many = None
         # Step 6: prior-pass (record, source_identity) carried across a same-scan
         # reintegrate so a re-upsert MERGES the recomputed mode into the frame's
         # accumulated record (begin_reintegrate populates it; upsert consumes per
@@ -719,6 +727,16 @@ class PublicationStore:
         with self._lock:
             self._hydrator = hydrator
 
+    def set_1d_hydrator(self, hydrator) -> None:
+        """Register a batch 1D-only rehydration source.
+
+        Overlay/Waterfall selections need only the integrated 1D rows.  This
+        hook lets the GUI hydrate those rows in one stacked disk read without
+        materializing raw detector images or 2D cakes.
+        """
+        with self._lock:
+            self._hydrator_1d_many = hydrator
+
     def get_or_hydrate(self, label: int | str) -> FramePublication | None:
         """Return the publication, rehydrating an evicted payload via the
         registered hydrator (synchronous — call from a background worker
@@ -732,7 +750,7 @@ class PublicationStore:
         # tier-1 (semilight) frame, leaving it stuck on the thumbnail forever.
         if publication is not None and (
                 _publication_has_full_payload(publication)
-                or publication.raw_status not in ("evicted", "thumbnail")):
+                or publication.raw_status not in ("evicted", "thumbnail", "1d-only")):
             return publication
         if hydrator is None:
             return publication
@@ -743,6 +761,34 @@ class PublicationStore:
         if fresh is None:
             return publication
         return self.upsert(fresh)
+
+    def get_1d_many_or_hydrate(
+        self, labels: Iterable[int | str]
+    ) -> dict[int | str, FramePublication]:
+        """Return publications with 1D payloads, batch hydrating misses.
+
+        This deliberately bypasses :meth:`get_or_hydrate`: the full hydrator
+        rebuilds raw + cake payloads, which is far too much work for a bottom
+        1D plot selection sweep.
+        """
+        requested = tuple(labels)
+        if not requested:
+            return {}
+        with self._lock:
+            missing = []
+            for label in requested:
+                publication = self._items.get(label)
+                if publication is None or not publication.view.has_1d:
+                    missing.append(label)
+            hydrator = self._hydrator_1d_many
+        if missing and hydrator is not None:
+            try:
+                for publication in hydrator(tuple(missing)) or ():
+                    if publication is not None:
+                        self.upsert(publication)
+            except Exception:
+                logger.debug("batch 1D publication hydration failed", exc_info=True)
+        return self.get_many(requested)
 
     def upsert(self, publication: FramePublication) -> FramePublication:
         with self._lock:

@@ -58,6 +58,7 @@ from .display_logic import (
     stitch_plot_payload, stitch_image_payload,
 )
 from .display_controllers import register_default_controllers
+from xdart.utils.throttle import Coalescer
 
 QFileDialog = QtWidgets.QFileDialog
 QInputDialog = QtWidgets.QInputDialog
@@ -677,6 +678,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # test behaviour); the live app turns it on via enable_async_hydration().
         self._hydration_worker = None
         self._async_hydration_enabled = False
+        self._hydration_pending_labels = set()
+        self._pending_hydration_render = False
+        self._last_hydration_render = 0.0
+        self._hydration_quiet_timer = Coalescer(250, mode="debounce", parent=self)
+        self._hydration_quiet_timer.triggered.connect(
+            self._flush_hydration_render)
+        self._hydration_progress_timer = Coalescer(1000, mode="throttle", parent=self)
+        self._hydration_progress_timer.triggered.connect(
+            self._flush_hydration_progress_render)
         # Step 7b: off-GUI-thread whole-scan aggregation (Sum/Average over a scan
         # longer than the bounded store).  The worker computes from the on-disk
         # stack ⊕ in-memory tail; results are cached per (dim, method, channel)
@@ -691,6 +701,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 self.publication_store.set_hydrator(self._rehydrate_publication)
             except Exception:
                 logger.debug("set_hydrator failed", exc_info=True)
+            try:
+                self.publication_store.set_1d_hydrator(
+                    self._rehydrate_publications_1d)
+            except Exception:
+                logger.debug("set_1d_hydrator failed", exc_info=True)
         # True once an empty/no-data update has blanked all panels; reset
         # when a data render draws.  Lets update() no-op on repeated empty
         # updates instead of re-clearing every time.
@@ -773,15 +788,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         # Waterfall plot
         self.wf_widget = pgImageWidget()
+        self._install_detached_plot_show_logger()
         self.setup_wf_widget()
-        self.plot_layout.addWidget(self.wf_widget)
 
         if self.plotMethod == 'Waterfall':
-            self.plot_win.setParent(None)
-            self.plot_layout.addWidget(self.wf_widget)
+            self._detach_bottom_widget(self.plot_win)
+            self._attach_bottom_widget(self.wf_widget)
         else:
-            self.wf_widget.setParent(None)
-            self.plot_layout.addWidget(self.plot_win)
+            self._detach_bottom_widget(self.wf_widget)
+            self._attach_bottom_widget(self.plot_win)
 
     def _connect_signals(self):
         """Wire all signal/slot connections for display controls."""
@@ -960,6 +975,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         stamped with an older generation is stale and may be dropped (full
         enforcement: Stage 5)."""
         self.display_generation += 1
+        pending_hydration = getattr(self, "_hydration_pending_labels", None)
+        if pending_hydration is not None:
+            pending_hydration.clear()
+        self._pending_hydration_render = False
+        worker = getattr(self, "_hydration_worker", None)
+        cancel = getattr(worker, "cancel_stale_before", None)
+        if callable(cancel):
+            cancel(self.display_generation)
         pending = getattr(self, "_agg_pending", None)
         if pending is not None:
             pending.clear()
@@ -1006,57 +1029,81 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self._hydration_worker = worker
         return self._hydration_worker
 
-    def _request_frame_hydration(self, label) -> None:
+    def _request_frame_hydration(self, label, *, purpose="full") -> None:
         """Queue a background rehydration for an evicted frame (no-op unless the
         live app enabled async hydration)."""
         if not self._async_hydration_enabled:
             return
         worker = self._ensure_hydration_worker()
         if worker is not None:
-            worker.request(label, self.display_generation)
+            try:
+                label_key = int(label)
+            except (TypeError, ValueError):
+                label_key = label
+            pending = getattr(self, "_hydration_pending_labels", None)
+            if pending is None:
+                pending = set()
+                self._hydration_pending_labels = pending
+            if label_key in pending:
+                return
+            pending.add(label_key)
+            worker.request(label_key, self.display_generation, purpose=purpose)
+
+    def _flush_hydration_render(self) -> None:
+        if not getattr(self, "_pending_hydration_render", False):
+            return
+        self._pending_hydration_render = False
+        import time
+        self._last_hydration_render = time.monotonic()
+        try:
+            self.update()
+        except Exception:
+            logger.debug("re-render after hydration failed", exc_info=True)
+
+    def _flush_hydration_progress_render(self) -> None:
+        """Periodic progress paint while a large hydration burst is still running."""
+        if not getattr(self, "_hydration_pending_labels", None):
+            return
+        self._flush_hydration_render()
 
     def _on_frame_hydrated(self, label, generation) -> None:
         """A background hydration finished: the heavy payload is now resident in
         the store.  Drop a stale result (the selection/mode moved on), else
-        re-render so the panel upgrades from its thumbnail to the full frame.
+        schedule a bounded re-render so the panel upgrades from its thumbnail
+        to the full frame.
 
-        THROTTLED: a unit-switch REBUILD backfills hundreds of evicted frames,
-        firing this once per frame.  Render immediately when we haven't rendered
-        recently (sparse scroll-back hydration stays instant), but coalesce a
-        burst into one render per ~120 ms so the progressive fill stays smooth
-        instead of O(N) renders (the data is already resident, so the short
-        trailing delay is invisible)."""
+        A fast sweep over hundreds of evicted frames can stream hundreds of
+        completions.  The quiet timer gives one final render after the burst; the
+        progress timer allows at most one intermediate render per second while
+        more requested frames are still in flight."""
+        if isinstance(label, (list, tuple, set, frozenset)):
+            label_keys = []
+            for one_label in label:
+                try:
+                    label_keys.append(int(one_label))
+                except (TypeError, ValueError):
+                    label_keys.append(one_label)
+        else:
+            try:
+                label_keys = [int(label)]
+            except (TypeError, ValueError):
+                label_keys = [label]
+        pending = getattr(self, "_hydration_pending_labels", None)
+        if pending is not None:
+            for label_key in label_keys:
+                pending.discard(label_key)
         if int(generation) != self.display_generation:
             return
-        import time
-        now = time.monotonic()
-        last = getattr(self, "_last_hydration_render", 0.0)
         self._pending_hydration_render = True
-        if now - last >= 0.12:
-            self._last_hydration_render = now
-            self._pending_hydration_render = False
-            try:
-                self.update()
-            except Exception:
-                logger.debug("re-render after hydration failed for %s", label,
-                             exc_info=True)
-            return
-        # Inside the throttle window: coalesce into one trailing render.
-        if getattr(self, "_hydration_render_scheduled", False):
-            return
-        self._hydration_render_scheduled = True
-
-        def _go():
-            self._hydration_render_scheduled = False
-            if not getattr(self, "_pending_hydration_render", False):
-                return
-            self._pending_hydration_render = False
-            self._last_hydration_render = time.monotonic()
-            try:
-                self.update()
-            except Exception:
-                logger.debug("re-render after hydration failed", exc_info=True)
-        Qt.QtCore.QTimer.singleShot(120, _go)
+        quiet = getattr(self, "_hydration_quiet_timer", None)
+        if quiet is not None:
+            quiet.start()
+        else:
+            self._flush_hydration_render()
+        if pending:
+            progress = getattr(self, "_hydration_progress_timer", None)
+            if progress is not None:
+                progress.start()
 
     def stop_hydration_worker(self) -> None:
         """Stop + join the background worker (idempotent; call at teardown).
@@ -1528,10 +1575,16 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # Flip stage 3: an Overlay/Waterfall payload carries the FULL accumulator
         # (overlaid_ids = every captured frame, which may exceed this render's
         # render_ids after eviction), and the waterfall y-axis (_wf_y_axis) keys off
-        # self.overlaid_idxs -- so prefer it.  Single/Sum/Average payloads leave
+        # self.overlaid_idxs.  A large waterfall payload may emit only the decimated
+        # display rows while still carrying the full history, so use display_ids
+        # for the visible rows when present.  Single/Sum/Average payloads leave
         # overlaid_ids empty, so those keep the per-render selection.
         overlaid = getattr(payload_value, "overlaid_ids", None)
-        self.overlaid_idxs = list(overlaid) if overlaid else list(state.render_ids)
+        display_ids = getattr(payload_value, "display_ids", None)
+        self.overlaid_idxs = list(
+            display_ids if display_ids is not None
+            else (overlaid if overlaid else state.render_ids)
+        )
         # Carry the immutable accumulator back onto the widget so the NEXT render
         # appends onto it (the payload-owned successor to the legacy mutable triple).
         # Only Overlay/Waterfall payloads supply a history; others leave it alone.

@@ -23,7 +23,15 @@ from types import SimpleNamespace
 from .display_logic import RawSource, choose_raw_source, sentinel_mask
 from xdart.modules.frame_publication import publication_from_frame_view
 from xdart.modules.wavelength import normalize_wavelength_m, wavelength_angstrom_to_m
-from xrd_tools.core import view_to_result_1d, view_to_result_2d
+from xrd_tools.core import (
+    DEFAULT_MODE_KEY,
+    FrameRecord,
+    FrameView,
+    axis_from_unit,
+    numeric_metadata,
+    view_to_result_1d,
+    view_to_result_2d,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -491,6 +499,85 @@ class DisplayDataMixin:
             logger.debug("rehydrate: publication build failed for %s", label,
                          exc_info=True)
             return None
+
+    def _rehydrate_publications_1d(self, labels):
+        """Batch hydrate selected 1D rows without raw/cake materialization."""
+        labels = tuple(dict.fromkeys(int(label) for label in labels))
+        if not labels:
+            return ()
+        scan = getattr(self, "scan", None)
+        scan_file = getattr(scan, "data_file", None)
+        if not scan_file:
+            return ()
+        try:
+            from xrd_tools.io import get_1d
+            result = get_1d(scan_file, frame=labels)
+        except Exception:
+            logger.debug("batch 1D rehydrate failed for %s", labels, exc_info=True)
+            return ()
+
+        frames = np.asarray(result.frames).ravel()
+        intensity = np.asarray(result.intensity)
+        if intensity.ndim == 1:
+            intensity = intensity[np.newaxis, :]
+        sigma = result.sigma
+        if sigma is not None:
+            sigma = np.asarray(sigma)
+            if sigma.ndim == 1:
+                sigma = sigma[np.newaxis, :]
+        axis_1d = axis_from_unit(result.q_unit, np.asarray(result.q, dtype=float))
+        store = getattr(self, "publication_store", None)
+        generation = store.generation if store is not None else 0
+        mode_1d = DEFAULT_MODE_KEY
+        if bool(getattr(scan, "gi", False)):
+            mode_1d = getattr(scan, "bai_1d_args", {}).get(
+                "gi_mode_1d", "q_total")
+
+        publications = []
+        for row, frame in enumerate(frames):
+            label = int(frame)
+            existing = store.get(label) if store is not None else None
+            base_view = getattr(existing, "view", None)
+            metadata_raw = dict(
+                getattr(existing, "metadata_raw", None)
+                or getattr(base_view, "metadata_raw", None)
+                or {}
+            )
+            metadata_numeric = dict(
+                getattr(existing, "metadata_numeric", None)
+                or getattr(base_view, "metadata_numeric", None)
+                or numeric_metadata(metadata_raw)
+            )
+            view = FrameView(
+                label=label,
+                axis_1d=axis_1d,
+                intensity_1d=intensity[row],
+                sigma_1d=(None if sigma is None else sigma[row]),
+                thumbnail=getattr(base_view, "thumbnail", None),
+                mask_baked=bool(getattr(base_view, "mask_baked", False)),
+                metadata_raw=metadata_raw,
+                metadata_numeric=metadata_numeric,
+                incident_angle=getattr(base_view, "incident_angle", None),
+                geometry=getattr(base_view, "geometry", None),
+                source_path=getattr(base_view, "source_path", None),
+                source_frame_index=getattr(base_view, "source_frame_index", None),
+                extra=getattr(base_view, "extra", {}),
+            )
+            record = FrameRecord.from_view(view, mode_1d=mode_1d)
+            publications.append(
+                publication_from_frame_view(
+                    view,
+                    record=record,
+                    generation=generation,
+                    source_identity=(
+                        getattr(existing, "source_identity", "")
+                        or str(scan_file)
+                    ),
+                    raw_status="1d-only",
+                    validate=False,
+                )
+            )
+        return tuple(publications)
 
     # ── Raw 2D data access ────────────────────────────────────────
 

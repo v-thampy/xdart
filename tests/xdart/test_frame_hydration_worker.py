@@ -86,6 +86,80 @@ def test_worker_coalesces_superseded_generation(qapp):
     assert 1 not in reads, f"superseded gen-1 read should be skipped; got {reads}"
 
 
+def test_worker_dedupes_same_label_generation_before_read(qapp):
+    reads = []
+    done = threading.Event()
+
+    class FakeStore:
+        def get_or_hydrate(self, label):
+            reads.append(label)
+            done.set()
+            return {"label": label}
+
+    worker = FrameHydrationWorker(FakeStore())
+    worker.request(7, 3)
+    worker.request(7, 3)
+    worker.request(7, 3)
+    worker.start()
+    try:
+        assert done.wait(5.0)
+        time.sleep(0.1)
+    finally:
+        worker.stop()
+    assert reads == [7]
+
+
+def test_worker_drains_stale_queue_on_generation_cancel(qapp):
+    reads = []
+    done = threading.Event()
+
+    class FakeStore:
+        def get_or_hydrate(self, label):
+            reads.append(label)
+            done.set()
+            return {"label": label}
+
+    worker = FrameHydrationWorker(FakeStore())
+    worker.request(1, 1)
+    worker.request(2, 1)
+    worker.cancel_stale_before(2)
+    worker.request(3, 2)
+    worker.start()
+    try:
+        assert done.wait(5.0)
+        time.sleep(0.1)
+    finally:
+        worker.stop()
+    assert reads == [3]
+
+
+def test_worker_batches_same_generation_1d_requests(qapp):
+    calls = []
+    done = threading.Event()
+    emitted = []
+
+    class Store:
+        def get_1d_many_or_hydrate(self, labels):
+            calls.append(tuple(labels))
+            done.set()
+            return {label: {"label": label} for label in labels}
+
+    worker = FrameHydrationWorker(Store())
+    worker.sigHydrated.connect(
+        lambda label, gen: emitted.append((label, gen)), _DIRECT)
+    worker.request(1, 5, purpose="1d")
+    worker.request(2, 5, purpose="1d")
+    worker.request(3, 5, purpose="1d")
+    worker.start()
+    try:
+        assert done.wait(5.0)
+        time.sleep(0.1)
+    finally:
+        worker.stop()
+    assert calls == [(1, 2, 3)]
+    assert emitted == [((1, 2, 3), 5)]
+
+
 def test_worker_does_not_emit_when_hydrate_yields_none(qapp):
     class NoneStore:
         def get_or_hydrate(self, label):

@@ -12,6 +12,7 @@ the composite widget.
 
 import logging
 import re
+import traceback
 
 import numpy as np
 import pyqtgraph as pg
@@ -35,6 +36,23 @@ from .display_logic import (
 logger = logging.getLogger(__name__)
 
 MAX_WF_ROWS = 256
+
+
+class _DetachedPlotShowLogger(Qt.QtCore.QObject):
+    """Log an unexpected top-level show for plot widgets."""
+
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt API)
+        if event.type() == Qt.QtCore.QEvent.Type.Show:
+            try:
+                if obj.parent() is None and obj.isWindow():
+                    logger.warning(
+                        "Detached plot widget shown as a top-level window: %s\n%s",
+                        obj.objectName() or type(obj).__name__,
+                        "".join(traceback.format_stack(limit=24)),
+                    )
+            except RuntimeError:
+                pass
+        return False
 
 
 def _as_plot_rows(ydata):
@@ -161,6 +179,54 @@ class DisplayPlotMixin:
     """
 
     # ── 1D plot data accumulation ─────────────────────────────────
+
+    def _install_detached_plot_show_logger(self):
+        """Instrument plot widgets that should never appear as top-level windows."""
+        if getattr(self, "_detached_plot_show_logger", None) is not None:
+            return
+        event_filter = _DetachedPlotShowLogger(self)
+        for widget in (getattr(self, "plot_win", None), getattr(self, "wf_widget", None)):
+            if widget is not None:
+                widget.installEventFilter(event_filter)
+        self._detached_plot_show_logger = event_filter
+
+    def _detach_bottom_widget(self, widget):
+        """Hide and detach a bottom-panel plot widget without letting Qt show it."""
+        if widget is None:
+            return
+        try:
+            widget.hide()
+        except RuntimeError:
+            return
+        layout = getattr(self, "plot_layout", None)
+        if layout is not None:
+            try:
+                layout.removeWidget(widget)
+            except RuntimeError:
+                pass
+        try:
+            widget.setParent(None)
+        except RuntimeError:
+            pass
+
+    def _attach_bottom_widget(self, widget):
+        """Attach and explicitly show the active bottom-panel plot widget."""
+        if widget is None:
+            return
+        layout = getattr(self, "plot_layout", None)
+        if layout is not None:
+            try:
+                if layout.indexOf(widget) < 0:
+                    layout.addWidget(widget)
+            except (AttributeError, RuntimeError):
+                try:
+                    layout.addWidget(widget)
+                except RuntimeError:
+                    return
+        try:
+            widget.show()
+        except RuntimeError:
+            pass
 
     def resolve_plot_axis(self):
         """Return the selected plot-axis metadata and whether it needs 2D."""
@@ -826,10 +892,15 @@ class DisplayPlotMixin:
             n_curves = len(self.plot_data[1])
         except Exception:
             n_curves = 0
-        return (
-            (self.plotMethod == 'Waterfall' and n_curves > 3)
-            or (self.plotMethod not in ('Sum', 'Average') and n_curves > 15)
-        )
+        if self.plotMethod == 'Waterfall':
+            active = n_curves > 3
+        elif self.plotMethod in ('Sum', 'Average'):
+            active = False
+        else:
+            was_active = bool(getattr(self, "_bottom_waterfall_active", False))
+            active = n_curves >= 8 if was_active else n_curves > 15
+        self._bottom_waterfall_active = active
+        return active
 
     @staticmethod
     def _uniform_waterfall_grid(xdata, data):
@@ -1093,8 +1164,8 @@ class DisplayPlotMixin:
         """Setup the layout for 1D plot
         """
         restore_focus = DisplayPlotMixin._frame_list_focus_widget()
-        self.wf_widget.setParent(None)
-        self.plot_layout.addWidget(self.plot_win)
+        self._detach_bottom_widget(self.wf_widget)
+        self._attach_bottom_widget(self.plot_win)
         if getattr(self, '_share_link_on', False):
             self._schedule_align()
 
@@ -1108,17 +1179,17 @@ class DisplayPlotMixin:
         DisplayPlotMixin._restore_frame_list_focus(restore_focus)
 
     def setup_wf_widget(self):
-        self.plot_layout.addWidget(self.wf_widget)
+        self._attach_bottom_widget(self.wf_widget)
 
         # Waterfall Plot setup
         if self.plotMethod == 'Waterfall':
-            self.plot_win.setParent(None)
-            self.plot_layout.addWidget(self.wf_widget)
+            self._detach_bottom_widget(self.plot_win)
+            self._attach_bottom_widget(self.wf_widget)
             if getattr(self, '_share_link_on', False):
                 self._schedule_align()
         else:
-            self.wf_widget.setParent(None)
-            self.plot_layout.addWidget(self.plot_win)
+            self._detach_bottom_widget(self.wf_widget)
+            self._attach_bottom_widget(self.plot_win)
             if getattr(self, '_share_link_on', False):
                 self._schedule_align()
 
@@ -1126,8 +1197,8 @@ class DisplayPlotMixin:
         """Setup the layout for WF plot
         """
         restore_focus = DisplayPlotMixin._frame_list_focus_widget()
-        self.plot_win.setParent(None)
-        self.plot_layout.addWidget(self.wf_widget)
+        self._detach_bottom_widget(self.plot_win)
+        self._attach_bottom_widget(self.wf_widget)
         if getattr(self, '_share_link_on', False):
             self._schedule_align()
 

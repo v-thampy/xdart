@@ -43,8 +43,13 @@ class Axis:
     def __post_init__(self) -> None:
         if self.values is None:
             return
-        values = np.asarray(self.values, dtype=float).copy()
-        values.setflags(write=False)
+        values = np.asarray(self.values, dtype=float)
+        if values.flags.writeable:
+            try:
+                values.setflags(write=False)
+            except ValueError:
+                values = values.copy()
+                values.setflags(write=False)
         object.__setattr__(self, "values", values)
 
 
@@ -66,8 +71,13 @@ class FrameGeometry:
 def _readonly_array(value: Any, *, dtype: Any = float) -> np.ndarray | None:
     if value is None:
         return None
-    arr = np.asarray(value, dtype=dtype).copy()
-    arr.setflags(write=False)
+    arr = np.asarray(value, dtype=dtype)
+    if arr.flags.writeable:
+        try:
+            arr.setflags(write=False)
+        except ValueError:
+            arr = arr.copy()
+            arr.setflags(write=False)
     return arr
 
 
