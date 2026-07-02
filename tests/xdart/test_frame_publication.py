@@ -1274,6 +1274,28 @@ def test_plot_payload_routes_overlay_waterfall_through_accumulator_after_flip():
         assert payload.plot_history is not None and payload.overlaid_ids == (9,)
 
 
+def test_overlay_waterfall_payload_reset_key_includes_active_slice_range():
+    frame = DuckFrame(idx=9)
+    store = PublicationStore()
+    store.upsert(publication_from_live_frame(frame))
+
+    state = _int_state(store, ids=(9,), method="Overlay")
+    p1 = _adapter(
+        store,
+        _int_widget(source="1d_2d", slice_on=True, center=0.0, width=1.0),
+    ).plot_payload(state)
+    p2 = _adapter(
+        store,
+        _int_widget(source="1d_2d", slice_on=True, center=90.0, width=1.0),
+    ).plot_payload(state)
+
+    assert p1 is not None and p1.plot_history is not None
+    assert p2 is not None and p2.plot_history is not None
+    assert p1.plot_history.reset_key == ("scan", True, (0.0, 1.0))
+    assert p2.plot_history.reset_key == ("scan", True, (90.0, 1.0))
+    assert p1.plot_history.reset_key != p2.plot_history.reset_key
+
+
 def test_plot_payload_sum_average_emit_n_traces_collapsed_at_render():
     # Sum/Average go through the payload (NOT None): integration_plot_payload
     # emits one Trace per frame (un-reduced), exactly like legacy

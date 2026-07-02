@@ -815,7 +815,18 @@ class PublicationDisplayAdapter:
         scan = getattr(widget, "scan", None)
         scan_id = (getattr(scan, "data_file", None)
                    or getattr(scan, "name", None)) if scan is not None else None
-        reset_key = (scan_id, bool(needs_2d))
+        slice_key = None
+        if needs_2d:
+            try:
+                slice_key = (
+                    float(widget.ui.slice_center.value()),
+                    float(widget.ui.slice_width.value()),
+                ) if _slice_enabled(widget) else (None, None)
+            except Exception:
+                slice_key = (None, None)
+        reset_key = (
+            (scan_id, True, slice_key) if needs_2d else (scan_id, False)
+        )
 
         ref_x = None
         axis = None

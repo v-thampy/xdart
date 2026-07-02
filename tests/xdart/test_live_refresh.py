@@ -2906,6 +2906,105 @@ def test_update_store_evicted_overlay_selection_preserves_history_and_hydrates()
     assert host._display_blanked is False
 
 
+def test_update_empty_selection_overlay_preserves_history_on_control_repaint():
+    from xdart.gui.tabs.static_scan.display_logic import WaterfallHistory
+    from xdart.modules.frame_publication import PublicationStore
+
+    x = np.linspace(0.5, 5.0, 8, dtype=np.float32)
+    initial_ids = (8, 9)
+    initial_history = WaterfallHistory(
+        reset_key=("scan.nxs", False),
+        unit="Å⁻¹",
+        label="Q",
+        x=x,
+        rows=np.vstack([np.full(x.shape, float(i)) for i in initial_ids]),
+        ids=initial_ids,
+        names=tuple(f"scan_{i}" for i in initial_ids),
+    )
+    calls = []
+    host = SimpleNamespace(
+        viewer_mode=None,
+        publication_store=PublicationStore(),
+        display_generation=1,
+        _last_selection_sig=None,
+        frame_ids=[],
+        idxs=[],
+        idxs_1d=[],
+        idxs_2d=[],
+        overall=False,
+        overlaid_idxs=list(initial_ids),
+        _waterfall_history=initial_history,
+        plot_data=[x, initial_history.rows],
+        plot_data_range=[[float(x[0]), float(x[-1])], [8.0, 9.0]],
+        frame_names=list(initial_history.names),
+        bkg_1d=None,
+        _payload_x_axis_label=None,
+        _payload_y_axis_label=None,
+        _using_publication_plot_payload=False,
+        _plot_axis_info=[{"source": "1d"}],
+        data_lock=RLock(),
+        data_1d={},
+        data_2d={},
+        scan=SimpleNamespace(
+            scan_lock=RLock(),
+            frames=SimpleNamespace(index=[8, 9, 10]),
+            gi=False,
+            skip_2d=True,
+            name="scan",
+            data_file="scan.nxs",
+            bai_1d_args={},
+            bai_2d_args={},
+        ),
+        ui=SimpleNamespace(
+            plotMethod=SimpleNamespace(currentText=lambda: "Overlay"),
+            plotUnit=SimpleNamespace(
+                currentText=lambda: "2θ (°)",
+                currentIndex=lambda: 1,
+            ),
+            slice=SimpleNamespace(
+                isChecked=lambda: False,
+                isEnabled=lambda: False,
+            ),
+        ),
+        normalize=lambda data, metadata: data,
+        _apply_share_axis_state=lambda: calls.append("share_axis"),
+        _apply_1d_only_visibility=lambda: calls.append("layout"),
+        update_plot_view=lambda: calls.append("payload_plot"),
+        clear_image_view=lambda: calls.append("clear_image"),
+        clear_binned_view=lambda: calls.append("clear_binned"),
+        clear_plot_view=lambda: calls.append("clear_plot"),
+        update_2d_label=lambda: calls.append("label_2d"),
+        _update_image_preview=lambda: calls.append("preview"),
+    )
+    for name in (
+        "get_idxs",
+        "_selection_generation_signature",
+        "_sync_selection_generation",
+        "_note_selection_generation",
+        "_bump_display_generation",
+        "_active_stitch_mode",
+        "_live_mode",
+        "_live_display_state",
+        "_updated",
+        "_draw_delegate",
+        "_clear_delegate",
+        "_payload_for_role",
+        "_draw_payload",
+        "render_display",
+        "update",
+        "_update_impl",
+    ):
+        setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
+
+    assert host.update() is True
+
+    assert "payload_plot" in calls
+    assert "clear_plot" not in calls
+    assert host._waterfall_history.ids == initial_ids
+    assert host.overlaid_idxs == list(initial_ids)
+    assert host._display_blanked is False
+
+
 def _render_host():
     """A host that records which draw/clear delegates render_display calls."""
     from unittest.mock import MagicMock
@@ -2941,6 +3040,83 @@ def _render_host():
                  "_draw_payload", "render_display"):
         setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
     return host, calls, dl
+
+
+def test_render_clear_path_keeps_2d_panels_while_processing():
+    host, calls, dl = _render_host()
+    host._processing_active = True
+    host.PERSIST_2D_DURING_PROCESSING = True
+    state = dl.compute_display_state(
+        mode=dl.Mode.INT_2D,
+        selected_ids=(3,),
+        all_frame_index=[3],
+        loaded_1d_keys=set(),
+        loaded_2d_keys=set(),
+        gi=False,
+        plot_unit='q_A^-1',
+        method='Single',
+        unit_changed=False,
+        prev_overlaid_ids=(),
+        raw_availability={},
+        titles={},
+        generation=4,
+    )
+
+    host.render_display(state, dl.DisplayPayload(
+        generation=4, raw_image=None, cake_image=None, plot=None))
+
+    assert "clear_image" not in calls
+    assert "clear_binned" not in calls
+    assert "clear_plot" in calls
+
+
+def test_plot_payload_all_nan_overlay_history_does_not_clear_accumulator():
+    host, calls, dl = _render_host()
+    host.bkg_1d = None
+    x = np.array([0.0, 1.0])
+    history = dl.WaterfallHistory(
+        reset_key=("scan.nxs", False),
+        unit="Å⁻¹",
+        label="Q",
+        x=x,
+        rows=np.array([[1.0, 2.0]]),
+        ids=(1,),
+        names=("scan_1",),
+    )
+    host._waterfall_history = history
+    payload = dl.PlotPayload(
+        axis_x=dl.Axis("Q", "Å⁻¹"),
+        traces=(dl.Trace("scan_1", x=x, y=np.array([np.nan, np.nan])),),
+        overlaid_ids=(1,),
+        plot_history=history,
+    )
+    state = SimpleNamespace(mode=dl.Mode.INT_1D, render_ids=(1,))
+
+    assert host._draw_payload(dl.PanelRole.PLOT_1D, payload, state) is True
+
+    assert "clear_plot" not in calls
+    assert host._waterfall_history is history
+
+
+def test_reintegrate_finished_resets_overlay_before_refresh():
+    calls = []
+    host = SimpleNamespace(
+        thread_state_changed=lambda: calls.append("state"),
+        _wrangler_run_active=lambda: False,
+        _exit_run_state=lambda: calls.append("exit"),
+        h5viewer=SimpleNamespace(
+            set_open_enabled=lambda enabled: calls.append(("open", enabled))),
+        displayframe=SimpleNamespace(
+            clear_overlay=lambda: calls.append("clear_overlay")),
+        update_all=lambda: calls.append("update_all"),
+        wrangler=SimpleNamespace(enabled=lambda enabled: calls.append(("wrangler", enabled))),
+    )
+    host.integrator_thread_finished = MethodType(
+        staticWidget.integrator_thread_finished, host)
+
+    host.integrator_thread_finished()
+
+    assert calls.index("clear_overlay") < calls.index("update_all")
 
 
 def test_update_plot_view_sum_average_never_auto_waterfalls():
@@ -4517,10 +4693,30 @@ def _plot_host(method="Overlay"):
         "_waterfall_active",
         "_uniform_waterfall_grid",
         "_reexpress_overlay_unit",
+        "_overlay_history_reset_key",
         "update_plot",
     ):
         setattr(host, name, MethodType(getattr(DisplayPlotMixin, name), host))
     return host
+
+
+def test_overlay_history_reset_key_includes_active_slice_range():
+    center = {"value": 0.0}
+    width = {"value": 1.0}
+    host = _plot_host("Overlay")
+    host.scan.data_file = "scan.nxs"
+    host._plot_axis_info = [{"source": "1d_2d"}]
+    host.ui.slice.setChecked(True)
+    host.ui.slice_center = SimpleNamespace(value=lambda: center["value"])
+    host.ui.slice_width = SimpleNamespace(value=lambda: width["value"])
+
+    key1 = host._overlay_history_reset_key()
+    center["value"] = 5.0
+    key2 = host._overlay_history_reset_key()
+
+    assert key1 == ("scan.nxs", True, (0.0, 1.0))
+    assert key2 == ("scan.nxs", True, (5.0, 1.0))
+    assert key1 != key2
 
 
 def test_update_plot_accumulator_replaces_for_single_sum_average():

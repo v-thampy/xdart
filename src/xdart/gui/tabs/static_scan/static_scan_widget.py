@@ -5227,6 +5227,11 @@ class staticWidget(QWidget):
         if not wrangler_running:
             self._exit_run_state()
         self.h5viewer.set_open_enabled(True)
+        try:
+            self.displayframe.clear_overlay()
+        except Exception:
+            logger.debug("display overlay reset after reintegrate failed",
+                         exc_info=True)
         self.update_all()
         if not wrangler_running:
             self.wrangler.enabled(True)

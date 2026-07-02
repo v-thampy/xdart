@@ -751,7 +751,16 @@ class DisplayPlotMixin:
             getattr(scan, "data_file", None)
             or getattr(scan, "name", None)
         ) if scan is not None else None
-        return scan_id, bool(needs_2d)
+        slice_key = None
+        if needs_2d:
+            try:
+                slice_key = (
+                    float(self.ui.slice_center.value()),
+                    float(self.ui.slice_width.value()),
+                ) if bool(self.ui.slice.isChecked()) else (None, None)
+            except Exception:
+                slice_key = (None, None)
+        return (scan_id, True, slice_key) if needs_2d else (scan_id, False)
 
     def _seed_overlay_history_from_plot_state(self):
         """Seed WaterfallHistory from the current plot before Overlay entry."""

@@ -1486,10 +1486,26 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 return False
             return True
 
+        store = getattr(self, 'publication_store', None)
+        try:
+            method = self.ui.plotMethod.currentText()
+        except Exception:
+            method = None
+        history = getattr(self, "_waterfall_history", None)
+        has_history = bool(
+            getattr(self, "overlaid_idxs", None)
+            or (history is not None and getattr(history, "count", 0))
+        )
+        if (
+            method in ("Overlay", "Waterfall")
+            and has_history
+            and self.scan.name != 'null_main'
+        ):
+            return True
+
         if (len(self.frame_ids) == 0) or (self.scan.name == 'null_main'):
             return False
 
-        store = getattr(self, 'publication_store', None)
         if store is not None:
             # A selected publication can be known to the store while its heavy 1D
             # row is evicted.  Let the typed display path run anyway: it queues
@@ -1502,17 +1518,6 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             except Exception:
                 logger.debug("publication-store readiness check failed",
                              exc_info=True)
-            try:
-                method = self.ui.plotMethod.currentText()
-            except Exception:
-                method = None
-            history = getattr(self, "_waterfall_history", None)
-            has_history = bool(
-                getattr(self, "overlaid_idxs", None)
-                or (history is not None and getattr(history, "count", 0))
-            )
-            if method in ("Overlay", "Waterfall") and has_history:
-                return True
 
         if len(self.idxs_1d) == 0:
             return False
@@ -1665,6 +1670,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         return None
 
     def _clear_delegate(self, role):
+        if (
+            role in (PanelRole.RAW_2D, PanelRole.CAKE_2D)
+            and getattr(self, 'PERSIST_2D_DURING_PROCESSING', True)
+            and getattr(self, '_processing_active', False)
+        ):
+            return None
         return {
             PanelRole.RAW_2D: self.clear_image_view,
             PanelRole.CAKE_2D: self.clear_binned_view,
@@ -1726,6 +1737,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     np.shape(self.bkg_1d), ydata.shape,
                 )
 
+        if ref_x.size == 0 or ydata.size == 0 or not np.isfinite(ydata).any():
+            # An all-NaN Overlay/Waterfall payload should not destroy the carried
+            # accumulator.  Keep the last visible stack and let the next valid
+            # repaint replace it.
+            if getattr(payload_value, "plot_history", None) is not None:
+                return True
+            self.clear_plot_view()
+            return True
+
         self.plot_data = [ref_x, ydata]
         self.frame_names = names
         # Flip stage 3: an Overlay/Waterfall payload carries the FULL accumulator
@@ -1757,10 +1777,6 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._payload_y_axis_label = (
             (axis_y.label, axis_y.unit) if axis_y is not None else None
         )
-
-        if ref_x.size == 0 or ydata.size == 0 or not np.isfinite(ydata).any():
-            self.clear_plot_view()
-            return True
 
         self.plot_data_range = [
             [np.nanmin(ref_x), np.nanmax(ref_x)],
