@@ -179,6 +179,40 @@ def test_display_wavelength_skips_hdf5_fallback_while_run_writing(tmp_path, monk
     assert opened == []
 
 
+def test_display_wavelength_negative_cache_clears_when_run_writing_ends(tmp_path):
+    import h5py
+
+    path = tmp_path / "wl_late_stamp.nxs"
+    with h5py.File(path, "w") as f:
+        f.create_group("entry/instrument/source")
+
+    host = SimpleNamespace(
+        _processing_active=False,
+        _run_writing=False,
+        _wf_last_draw_t=0.0,
+        scan=SimpleNamespace(mg_args={"wavelength": 1.0e-10}, data_file=str(path)),
+    )
+    host._clear_wavelength_cache = MethodType(
+        DisplayDataMixin._clear_wavelength_cache, host)
+    host.set_processing_active = MethodType(
+        displayFrameWidget.set_processing_active, host)
+    DisplayDataMixin._clear_wavelength_cache(host)
+
+    assert DisplayDataMixin._get_wavelength(host) is None
+    assert host._wavelength_cache_key is not None
+    assert host._wavelength_cache_value is None
+
+    with h5py.File(path, "a") as f:
+        f["entry/instrument/source"].create_dataset("wavelength_A", data=0.7293)
+
+    host._processing_active = True
+    host._run_writing = True
+    host.set_processing_active(False)
+
+    assert host._wavelength_cache_key is None
+    assert DisplayDataMixin._get_wavelength(host) == pytest.approx(0.7293e-10)
+
+
 @pytest.mark.parametrize("flags", [
     {"live_run": True, "no_nxs": False},
     {"live_run": False, "no_nxs": True},
@@ -686,6 +720,33 @@ def test_shutdown_threads_discards_stale_file_thread_work():
     assert ft.sigUpdate.disconnected
 
 
+def test_live_flush_timer_env_clamps_below_selection_debounce(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setenv("XDART_FLUSH_MS", "80")
+
+    assert staticWidget._timer_ms_from_env(
+        "XDART_FLUSH_MS", 150, minimum=110) == 110
+    assert "XDART_FLUSH_MS=80ms" in caplog.text
+    assert "clamping to 110ms" in caplog.text
+
+
+def test_set_1d_cache_limit_rejects_none_and_keeps_finite_cap():
+    from xdart.utils._utils import FixSizeOrderedDict
+
+    cache = FixSizeOrderedDict(max=10)
+    for idx in range(6):
+        cache[idx] = idx
+    host = SimpleNamespace(data_1d=cache)
+
+    with pytest.raises(ValueError, match="finite"):
+        staticWidget._set_1d_cache_limit(host, None)
+
+    staticWidget._set_1d_cache_limit(host, 3)
+
+    assert cache._max == 3
+    assert len(cache) == 3
+
+
 def test_flush_pending_update_owns_single_repaint():
     calls = []
     widget = SimpleNamespace(
@@ -716,6 +777,33 @@ def test_flush_pending_update_owns_single_repaint():
         ("update_data", {"emit_update": False}),
         ("latest_frame", {"emit_update": False}),
         ("data_changed", {}),
+    ]
+
+
+def test_flush_pending_update_bypasses_user_selection_debounce():
+    calls = []
+    widget = SimpleNamespace(
+        _pending_update_idx=5,
+        _drain_pending_frames=lambda: calls.append(("drain", {})),
+        h5viewer=SimpleNamespace(
+            auto_last=False,
+            frame_ids=[],
+            update_data=lambda **kwargs: calls.append(("update_data", kwargs)),
+            data_changed=lambda **kwargs: calls.append(("debounced", kwargs)),
+            _data_changed_now=lambda **kwargs: calls.append(("immediate", kwargs)),
+        ),
+        latest_frame=lambda **kwargs: calls.append(("latest_frame", kwargs)),
+        displayframe=SimpleNamespace(
+            ui=SimpleNamespace(plotMethod=_FakeCombo("Single")),
+        ),
+    )
+
+    staticWidget._flush_pending_update(widget)
+
+    assert calls == [
+        ("drain", {}),
+        ("update_data", {"emit_update": False}),
+        ("immediate", {"show_all": False}),
     ]
 
 

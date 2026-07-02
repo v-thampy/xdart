@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 _DISPLAY_1D_CACHE_MAX = 512
 _DISPLAY_1D_VIEWER_CACHE_MAX = 4096
 _DISPLAY_2D_CACHE_MAX = 40
+_LIVE_FLUSH_MIN_MS = 110
+_LIVE_TIMER_MIN_MS = 10
 
 # Qt imports
 from typing import TYPE_CHECKING, Any
@@ -404,20 +406,43 @@ class staticWidget(QWidget):
         self.data_2d = FixSizeOrderedDict(max=_DISPLAY_2D_CACHE_MAX)
 
     def _set_1d_cache_limit(self, limit: int | None) -> None:
-        """Switch the transitional 1D mirror between scan and viewer policy."""
+        """Switch the transitional 1D mirror between scan and viewer policy.
+
+        ``FixSizeOrderedDict(max=0)`` means unbounded, so ``None`` is rejected
+        instead of silently disabling eviction.
+        """
+        if limit is None:
+            raise ValueError("1D cache limit must be finite; None disables eviction")
         cache = getattr(self, "data_1d", None)
         if cache is None:
             return
-        max_value = 0 if limit is None else int(limit)
+        max_value = int(limit)
+        if max_value <= 0:
+            raise ValueError("1D cache limit must be positive")
         if hasattr(cache, "_max"):
             cache._max = max_value
         elif hasattr(cache, "max"):
             cache.max = max_value
         else:
             return
-        if max_value > 0:
-            while len(cache) > max_value:
-                cache.popitem(False)
+        while len(cache) > max_value:
+            cache.popitem(False)
+
+    @staticmethod
+    def _timer_ms_from_env(name, default, *, minimum=_LIVE_TIMER_MIN_MS):
+        raw = os.environ.get(name)
+        try:
+            value = int(raw) if raw not in (None, "") else int(default)
+        except (TypeError, ValueError):
+            return int(default)
+        minimum = int(minimum)
+        if value < minimum:
+            logger.warning(
+                "%s=%dms is below the supported minimum %dms; clamping to %dms",
+                name, value, minimum, minimum,
+            )
+            return minimum
+        return value
 
     def _active_frame_record_modes(
             self, mode_1d: str | None = None,
@@ -3686,29 +3711,24 @@ class staticWidget(QWidget):
 
         # Coalescing timer for wrangler updates: when the wrangler thread
         # processes images faster than the GUI can render, only the most
-        # recent update is rendered after a short quiet period (200 ms).
+        # recent update is rendered at the configured flush interval.
         self._pending_update_idx = None
         # Per-frame display refresh: THROTTLE (not debounce) — a steady
-        # live stream must still paint every ~200 ms; the latest index
+        # live stream must still paint at the configured flush interval; the latest index
         # wins via _pending_update_idx (the shared coalescing idiom,
         # xdart.utils.throttle).
         # Live timers, both TERMINAL-TUNABLE for live sweeps (no rebuild):
-        #   XDART_FLUSH_MS (default 100) — the heavy image-update quantum. Keep it
-        #     >= the median flush total (drain+list+render, ~70-90 ms) or the event
-        #     loop re-saturates and the GUI freezes; smaller = smoother image but
-        #     riskier on heavy 2D frames.
-        #   XDART_LIST_MS  (default 70)  — the fast list/cursor refresh so the Frames
+        #   XDART_FLUSH_MS (default 150; floor 110) — the heavy image-update quantum.
+        #     Keep it >= the 100 ms user-selection debounce and the median flush
+        #     total (drain+list+render, ~70-90 ms) or the event loop re-saturates.
+        #   XDART_LIST_MS  (default 60)  — the fast list/cursor refresh so the Frames
         #     list + auto-last cursor + status scroll continuously between renders
         #     (_flush_frame_list runs the LIGHT legs only: O(new) list refresh + a
         #     signal-blocked cursor advance — no drain, no render).
         # See docs/design/design_gui_liveness_jul2026.md.
-        def _ms(_name, _default):
-            try:
-                return max(10, int(os.environ.get(_name) or _default))
-            except (TypeError, ValueError):
-                return _default
-        _flush_ms = _ms("XDART_FLUSH_MS", 150)
-        _list_ms = _ms("XDART_LIST_MS", 60)
+        _flush_ms = staticWidget._timer_ms_from_env(
+            "XDART_FLUSH_MS", 150, minimum=_LIVE_FLUSH_MIN_MS)
+        _list_ms = staticWidget._timer_ms_from_env("XDART_LIST_MS", 60)
         if os.environ.get("XDART_PERF"):
             logger.info("[PERF] live timers: flush=%dms list=%dms", _flush_ms, _list_ms)
         self._update_timer = Coalescer(_flush_ms, mode="throttle", parent=self)
@@ -4146,7 +4166,7 @@ class staticWidget(QWidget):
         # idx + restart the coalescing timer.  The heavy list-widget
         # rebuild (``h5viewer.update_data()``) and the cursor advance
         # (``latest_frame()``) both fire from ``_flush_pending_update``
-        # after the 200 ms quiet period — running them per-frame made
+        # on the configured flush interval — running them per-frame made
         # the GUI O(N) per frame (full list clear + insertItems for
         # every new frame in a long scan), which compounded to O(N²)
         # over the run and showed up as visible stutter on slow
@@ -4158,7 +4178,7 @@ class staticWidget(QWidget):
         # Record the latest index and start the coalescing timer if it
         # isn't already running.  Throttle, not debounce: during a fast
         # scan burst (frame inter-arrival < timer interval) the display
-        # must still refresh every ~200 ms, not only after the burst
+        # must still refresh on the configured flush interval, not only after the burst
         # settles (debounce here froze plots until end-of-scan).  The
         # Coalescer is constructed mode="throttle", so trigger() keeps
         # the pending fire instead of restarting the countdown.
@@ -4176,8 +4196,8 @@ class staticWidget(QWidget):
         ``update_data`` appends per-frame), so it does not need the coalesced
         publication drain; ``latest_frame(emit_update=False)`` advances the cursor
         with signals blocked (no ``data_changed``/``setImage``).  This lets the
-        list + selection + status scroll continuously (~14 Hz) while the expensive
-        image/plot render stays paced on ``_update_timer`` (~5 Hz).  Idempotent
+        list + selection + status scroll continuously while the expensive
+        image/plot render stays paced on ``_update_timer``.  Idempotent
         with ``_flush_pending_update``, which redoes these O(new) legs before it
         renders."""
         if self._pending_update_idx is None:
@@ -4295,10 +4315,24 @@ class staticWidget(QWidget):
         logger.debug("[PERF] drained %d frame(s) in %.1f ms",
                      len(pending), (_time.perf_counter() - t0) * 1000)
 
+    def _h5viewer_data_changed_now(self, *, show_all=False):
+        """Publish a programmatic live flush without the user-selection debounce."""
+        immediate = getattr(self.h5viewer, "_data_changed_now", None)
+        if callable(immediate):
+            immediate(show_all=show_all)
+            return
+        try:
+            self.h5viewer.data_changed(show_all=show_all)
+        except TypeError:
+            if show_all:
+                self.h5viewer.data_changed(True)
+            else:
+                self.h5viewer.data_changed()
+
     def _flush_pending_update(self):
         """Render the most recently received wrangler update.
 
-        Called by _update_timer at most once per ~200 ms.  Coalesces
+        Called by _update_timer at the configured flush interval.  Coalesces
         all per-frame GUI work that doesn't have to happen immediately:
 
         * ``h5viewer.update_data()`` — refresh the listData widget
@@ -4308,7 +4342,7 @@ class staticWidget(QWidget):
           ``latest_idx`` is now (P4: was per-frame, now per-flush so
           we don't rebuild the list widget more than once per timer
           tick).
-        * ``h5viewer.data_changed()`` — publish the selected frame
+        * immediate ``h5viewer`` selection publish — publish the selected frame
           through the normal ``sigUpdate`` path exactly once.
         """
         if self._pending_update_idx is None:
@@ -4348,7 +4382,7 @@ class staticWidget(QWidget):
                 now = _t.perf_counter()
                 last = getattr(self, "_overlay_flush_last_t", 0.0)
                 if now - last < 0.5:
-                    self.h5viewer.data_changed()
+                    staticWidget._h5viewer_data_changed_now(self)
                 else:
                     self._overlay_flush_last_t = now
                     staticWidget._render_overlay_full_scan(self, method=method)
@@ -4356,7 +4390,7 @@ class staticWidget(QWidget):
                 self._overlay_flush_last_t = 0.0
                 staticWidget._render_overlay_full_scan(self, method=method)
         else:
-            self.h5viewer.data_changed()  # → sigUpdate → set_data → metawidget.update()
+            staticWidget._h5viewer_data_changed_now(self)  # → sigUpdate → set_data → metawidget.update()
 
         if _perf:
             _t3 = _t.perf_counter()
@@ -4446,9 +4480,9 @@ class staticWidget(QWidget):
             selected = [str(int(i)) for i in self.scan.frames.index]
         if selected:
             self.h5viewer.frame_ids[:] = selected
-            self.h5viewer.data_changed(show_all=True)
+            staticWidget._h5viewer_data_changed_now(self, show_all=True)
         else:
-            self.h5viewer.data_changed()
+            staticWidget._h5viewer_data_changed_now(self)
         return True
 
     def disable_auto_last(self, q):

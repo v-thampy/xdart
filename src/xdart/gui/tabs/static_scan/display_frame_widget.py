@@ -3477,8 +3477,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         panels on screen instead of blanking them when the in-flight frame's 2D
         data isn't available yet — so the 2D panels persist like the 1D plot.
         """
-        self._processing_active = bool(active)
-        self._run_writing = bool(active)
+        was_writing = bool(getattr(self, "_run_writing", False))
+        active = bool(active)
+        self._processing_active = active
+        self._run_writing = active
+        if was_writing and not active:
+            clear_wavelength = getattr(self, "_clear_wavelength_cache", None)
+            if callable(clear_wavelength):
+                clear_wavelength()
         # Reset the waterfall-repaint throttle at every run boundary so the next
         # update_wf always repaints in full -- in particular the end-of-scan flush
         # (run just ended -> active False) must show the COMPLETE stack even if the

@@ -52,13 +52,15 @@ paint; smoothing only helps the fast-scan case where frames pile up per window.
 | 5 | proposed | — | next smoothing lever = cut the render leg (40–68 ms, dominated by re-drawing + re-leveling the raw Eiger frame): throttle/subsample the autoscale re-level. Needs finer render-leg instrumentation first (measure-first). |
 
 ## Terminal-tunable knobs (sweep live, no rebuild)
-- `XDART_FLUSH_MS` (default **150**) — the heavy image-update quantum (`_update_timer`). Keep ≥ median
-  flush total (~70–90 ms) or the event loop re-saturates (freeze). Smaller = smoother image, riskier.
+- `XDART_FLUSH_MS` (default **150**, floor **110**) — the heavy image-update quantum (`_update_timer`).
+  Values below 110 ms are clamped with a warning. Keep ≥ the 100 ms user-selection debounce and the
+  median flush total (~70–90 ms) or the event loop re-saturates (freeze). Smaller = smoother image,
+  riskier.
 - `XDART_LIST_MS` (default **60**) — the fast Frames-list/cursor refresh (`_list_timer`).
 - `XDART_PERF` — `[PERF]` logging: per-flush legs, per-scan-boundary, startup timer values (always
   available; per-frame boundary logging was removed after the directory-mode fix landed).
 - Both timers logged at startup under `XDART_PERF` (`[PERF] live timers: flush=… list=…`). Example sweep:
-  `XDART_PERF=1 XDART_FLUSH_MS=80 XDART_LIST_MS=40 PYTHONPATH=$PWD/src xdart`.
+  `XDART_PERF=1 XDART_FLUSH_MS=110 XDART_LIST_MS=40 PYTHONPATH=$PWD/src xdart`.
 
 ## Measurement protocol (live — the maintainer runs)
 `conda activate xrd_test && XDART_PERF=1 xdart`, point at the 651-frame eiger dir (Image Directory,

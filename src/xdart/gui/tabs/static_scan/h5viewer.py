@@ -2393,11 +2393,10 @@ class H5Viewer(QWidget):
         # the 100 ms debounce Coalescer instead of a direct synchronous emit — a
         # rapid shift/ctrl multi-select burst then collapses to ONE render of the
         # final selection instead of one heavy O(N) render per selection event (the
-        # beachball on a long scan).  Safe for live/auto-last: those also reach here
-        # via data_changed but are upstream-throttled by _update_timer (200 ms >
-        # 100 ms debounce, so no live render is dropped); the debounce only adds
-        # ~100 ms tail to the final paint.  Viewer-mode single-frame emits above stay
-        # direct (not the freeze driver + want an immediate paint).
+        # beachball on a long scan).  Programmatic live flushes bypass the
+        # selection debounce via ``_data_changed_now``; this debounce is for
+        # user-driven frame-list sweeps only.  Viewer-mode single-frame emits above
+        # stay direct (not the freeze driver + want an immediate paint).
         self._update_coalesce_timer.start()
 
     def closeEvent(self, event):
