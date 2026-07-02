@@ -124,6 +124,55 @@ def test_widget_async_aggregate_none_is_retryable(tmp_path):
     assert len(calls) == 2
 
 
+def test_sum_average_state_snapshot_does_not_reenqueue_full_2d_hydration():
+    from xdart.gui.tabs.static_scan.display_controllers import ScanDisplayController
+    from xdart.gui.tabs.static_scan.display_logic import Mode
+
+    queued = []
+    def request(label, *, purpose="full"):
+        queued.append((label, purpose))
+
+    pub = SimpleNamespace(
+        view=SimpleNamespace(
+            has_1d=True,
+            has_2d=False,
+            intensity_1d=np.ones(3),
+            intensity_2d=None,
+            raw=None,
+            thumbnail=None,
+        )
+    )
+    store = SimpleNamespace(get=lambda _label: pub)
+    widget = SimpleNamespace(
+        frame_ids=["0", "1", "2"],
+        viewer_mode=None,
+        publication_store=store,
+        data_1d={},
+        data_2d={},
+        overlaid_idxs=[],
+        display_generation=1,
+        scan=SimpleNamespace(
+            scan_lock=RLock(),
+            frames=SimpleNamespace(index=[0, 1, 2]),
+            gi=False,
+        ),
+        ui=SimpleNamespace(
+            plotMethod=SimpleNamespace(currentText=lambda: "Average"),
+        ),
+        _whole_scan_aggregate=lambda *, dim, method: None,
+        _request_frame_hydration=request,
+    )
+
+    controller = ScanDisplayController()
+
+    first = controller.compute_state(widget, Mode.INT_2D)
+    second = controller.compute_state(widget, Mode.INT_2D)
+
+    assert first.overall is True
+    assert second.overall is True
+    assert queued == []
+
+
 def test_widget_whole_scan_aggregate_allows_primary_gi(tmp_path):
     scan, _, _ = _split_scan_2d(tmp_path, n=12)
     scan.gi = True

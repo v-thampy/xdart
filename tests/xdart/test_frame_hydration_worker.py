@@ -160,7 +160,7 @@ def test_worker_batches_same_generation_1d_requests(qapp):
     assert emitted == [((1, 2, 3), 5)]
 
 
-def test_worker_does_not_emit_when_hydrate_yields_none(qapp):
+def test_worker_emits_when_hydrate_yields_none(qapp):
     class NoneStore:
         def get_or_hydrate(self, label):
             return None
@@ -174,10 +174,10 @@ def test_worker_does_not_emit_when_hydrate_yields_none(qapp):
         time.sleep(0.3)
     finally:
         worker.stop()
-    assert emitted == []
+    assert emitted == [(1, 1)]
 
 
-def test_worker_survives_a_raising_hydrator(qapp):
+def test_worker_survives_a_raising_hydrator_and_emits(qapp):
     class BoomStore:
         def get_or_hydrate(self, label):
             raise RuntimeError("disk gone")
@@ -192,7 +192,7 @@ def test_worker_survives_a_raising_hydrator(qapp):
         assert worker.isRunning()      # an exception in one request can't kill it
     finally:
         worker.stop()
-    assert emitted == []
+    assert emitted == [(1, 1)]
 
 
 def test_worker_hydrates_each_store_from_provider(qapp):

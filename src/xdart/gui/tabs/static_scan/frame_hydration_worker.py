@@ -163,16 +163,16 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
                 # past — the GUI would drop the result anyway.
                 continue
             if purpose == "1d":
-                hydrated = self._hydrate_1d_many(tuple(labels))
+                self._hydrate_1d_many(tuple(labels))
             else:
-                hydrated = False
                 for label in labels:
-                    hydrated = self._hydrate_full(label) or hydrated
-            if hydrated:
-                # The GUI handler still re-checks generation == the live
-                # display_generation (a change that landed during the read).
-                emitted_label = tuple(labels) if purpose == "1d" else labels[-1]
-                self.sigHydrated.emit(emitted_label, generation)
+                    self._hydrate_full(label)
+            # The GUI handler still re-checks generation == the live
+            # display_generation (a change that landed during the read). Emit
+            # even when hydration failed so GUI-side pending dedupe can clear the
+            # request key for this generation.
+            emitted_label = tuple(labels) if purpose == "1d" else labels[-1]
+            self.sigHydrated.emit(emitted_label, generation)
 
     def stop(self, timeout_ms: int = 8000) -> bool:
         """Signal the loop to exit and join (idempotent).

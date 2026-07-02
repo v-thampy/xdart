@@ -132,6 +132,69 @@ def test_request_frame_hydration_respects_enabled_flag():
     assert calls == [(3, 5, "full")]          # enabled -> queued with generation
     h._request_frame_hydration(3)
     assert calls == [(3, 5, "full")]          # duplicate label/gen coalesced
+    h._request_frame_hydration(3, purpose="1d")
+    assert calls == [
+        (3, 5, "full"),
+        (3, 5, "1d"),
+    ]                                        # same label, different purpose
+
+
+def test_legacy_1d_catchup_requests_1d_hydration_purpose():
+    calls = []
+    def request(idx, *, purpose="full"):
+        calls.append((idx, purpose))
+
+    h = SimpleNamespace(
+        idxs_1d=[],
+        _snapshot_data=lambda idxs, allow_blocking_read=None: {7: (None, None)},
+        _display_hydration_should_block=lambda allow_blocking_read=None: False,
+        _hydrate_frame_from_disk=lambda idx, *, allow_blocking_read=True: None,
+        _request_missing_publication=request,
+    )
+
+    ydata, xdata = DisplayDataMixin.get_frames_int_1d(h, [7])
+
+    assert (ydata, xdata) == (None, None)
+    assert calls == [(7, "1d")]
+
+
+def test_legacy_2d_catchup_keeps_full_hydration_purpose():
+    calls = []
+    def request(idx, *, purpose="full"):
+        calls.append((idx, purpose))
+
+    h = SimpleNamespace(
+        idxs_2d=[],
+        _snapshot_data=lambda idxs, allow_blocking_read=None: {7: (None, None)},
+        _display_hydration_should_block=lambda allow_blocking_read=None: False,
+        _hydrate_frame_from_disk=lambda idx, *, allow_blocking_read=True: None,
+        _request_missing_publication=request,
+    )
+
+    intensity, xdata, ydata = DisplayDataMixin.get_frames_int_2d(h, [7])
+
+    assert (intensity, xdata, ydata) == (None, None, None)
+    assert calls == [(7, "full")]
+
+
+def test_on_frame_hydrated_discards_all_pending_purposes_for_label():
+    rendered = []
+    h = SimpleNamespace(
+        display_generation=7,
+        _hydration_pending_labels={(4, "full"), (4, "1d"), (5, "full")},
+        _pending_hydration_render=False,
+        _pending_hydration_generation=None,
+    )
+    h.update = lambda: rendered.append(True)
+    h._flush_hydration_render = MethodType(
+        displayFrameWidget._flush_hydration_render, h)
+    h._on_frame_hydrated = MethodType(
+        displayFrameWidget._on_frame_hydrated, h)
+
+    h._on_frame_hydrated(4, 7)
+
+    assert h._hydration_pending_labels == {(5, "full")}
+    assert rendered == [True]
 
 
 def test_on_frame_hydrated_drops_stale_generation():
@@ -153,7 +216,7 @@ def test_on_frame_hydrated_accepts_batched_1d_labels():
     rendered = []
     h = SimpleNamespace(
         display_generation=7,
-        _hydration_pending_labels={1, 2, 3},
+        _hydration_pending_labels={(1, "1d"), (2, "1d"), (3, "1d")},
         _pending_hydration_render=False,
     )
     h.update = lambda: rendered.append(True)
@@ -163,7 +226,7 @@ def test_on_frame_hydrated_accepts_batched_1d_labels():
         displayFrameWidget._on_frame_hydrated, h)
 
     h._on_frame_hydrated((1, 2), 7)
-    assert h._hydration_pending_labels == {3}
+    assert h._hydration_pending_labels == {(3, "1d")}
     assert rendered == [True]
 
 
@@ -172,7 +235,7 @@ def test_hydration_completion_requests_current_selection_repaint():
     rendered = []
     h = SimpleNamespace(
         display_generation=7,
-        _hydration_pending_labels={4},
+        _hydration_pending_labels={(4, "full")},
         _pending_hydration_render=False,
         _pending_hydration_generation=None,
     )
@@ -200,7 +263,7 @@ def test_hydration_completion_drops_when_selection_changed_before_update():
         _last_selection_sig=((1,), False),
         frame_ids=["2"],
         overall=False,
-        _hydration_pending_labels={1},
+        _hydration_pending_labels={(1, "full")},
         _pending_hydration_render=False,
         _pending_hydration_generation=None,
     )
@@ -240,7 +303,7 @@ def test_hydration_completion_stream_coalesces_rerenders():
     progress = FakeTimer()
     h = SimpleNamespace(
         display_generation=7,
-        _hydration_pending_labels=set(range(100)),
+        _hydration_pending_labels={(label, "full") for label in range(100)},
         _pending_hydration_render=False,
         _last_hydration_render=0.0,
         _hydration_quiet_timer=quiet,

@@ -122,7 +122,8 @@ class _FrameIndexCount:
         raise RuntimeError("frame labels were requested from a count-only index")
 
 
-def _data_snapshot(widget, *, mode, labels=None, include_legacy=True):
+def _data_snapshot(widget, *, mode, labels=None, include_legacy=True,
+                   request_2d_hydration=True):
     """Snapshot loaded keys + per-frame raw/thumbnail availability.
 
     X1 (Phase 3a): the PublicationStore is the primary source.  Viewer modes
@@ -139,10 +140,12 @@ def _data_snapshot(widget, *, mode, labels=None, include_legacy=True):
         if mode in (Mode.INT_2D, Mode.IMAGE_VIEWER, Mode.NEXUS_VIEWER):
             r_2d = resolve_frame_data_for_widget(
                 widget, label, mode, DataTier.TWO_D,
-                include_legacy=include_legacy)
+                include_legacy=include_legacy,
+                request_hydration=request_2d_hydration)
             r_raw = resolve_frame_data_for_widget(
                 widget, label, mode, DataTier.RAW_OR_THUMBNAIL,
-                include_legacy=include_legacy)
+                include_legacy=include_legacy,
+                request_hydration=request_2d_hydration)
             if r_2d.status is ReadStatus.RESIDENT:
                 loaded_2d.add(_label_key(label))
             if r_raw.status is ReadStatus.RESIDENT:
@@ -190,37 +193,6 @@ def resolve_frame_data_for_widget(
         include_legacy=include_legacy,
         request_hydration=request,
     )
-
-
-def _request_missing_publications(widget, labels, loaded_1d) -> None:
-    """Queue async hydration for selected scan labels whose 1D payload is thinned."""
-    if labels is None or getattr(widget, "viewer_mode", None) is not None:
-        return
-    try:
-        if widget.ui.plotMethod.currentText() in ("Sum", "Average"):
-            return
-    except Exception:
-        pass
-    request = getattr(widget, "_request_frame_hydration", None)
-    if request is None:
-        request = getattr(widget, "_request_missing_publication", None)
-    if request is None:
-        return
-    loaded = {_label_key(label) for label in loaded_1d}
-    for label in _label_keys(labels):
-        if label in loaded:
-            continue
-        try:
-            request(label, purpose="1d")
-        except TypeError:
-            try:
-                request(label)
-            except Exception:
-                logger.debug("publication hydration request failed for %s", label,
-                             exc_info=True)
-        except Exception:
-            logger.debug("publication hydration request failed for %s", label,
-                         exc_info=True)
 
 
 def _store_first_publication_items(widget, labels):
@@ -327,6 +299,14 @@ class _BaseController:
     def _compute_state_from_inputs(self, widget, mode, *, selected_ids, all_index, gi):
         labels = _candidate_labels(mode, selected_ids, all_index)
         store = getattr(widget, "publication_store", None)
+        method = widget.ui.plotMethod.currentText()
+        aggregate_owns_2d = (
+            mode is Mode.INT_2D
+            and method in ("Sum", "Average")
+            and not isinstance(all_index, _FrameIndexCount)
+            and len(labels) > 1
+            and hasattr(widget, "_whole_scan_aggregate")
+        )
         loaded_1d, loaded_2d, raw_avail = _data_snapshot(
             widget,
             mode=mode,
@@ -334,6 +314,7 @@ class _BaseController:
             include_legacy=(
                 store is None or mode not in (Mode.INT_1D, Mode.INT_2D)
             ),
+            request_2d_hydration=not aggregate_owns_2d,
         )
         return compute_display_state(
             mode=mode,
@@ -343,7 +324,7 @@ class _BaseController:
             loaded_2d_keys=loaded_2d,
             gi=gi,
             plot_unit='q_A^-1',          # affects only x_label; live axis via legacy path
-            method=widget.ui.plotMethod.currentText(),
+            method=method,
             unit_changed=False,
             prev_overlaid_ids=tuple(widget.overlaid_idxs),
             raw_availability=raw_avail,

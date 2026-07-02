@@ -39,7 +39,7 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 | MS-1 | Run-end count reconciliation + counter fix + shadow-drop lock | S | low | silent in-flight drop now visible | — | **DONE** `4d3e2b3c` |
 | H12 | Liveness step-5 render leg (level-reuse, subsampled percentile) | M | low | last big live-smoothness lever | — | **DONE** `7fb20748` (A6 live-verify pending) |
 | H13(a-c) | Timer safety: LD-1 load-debounce cancel, alias fix, reint-timer stop, pool race, non-blocking teardown, XYE cache, **BR-1** browser-select no-clear | S×7 | low-med | wrong-file pollute + last stalls + BR-1 | Wave 1 | **DONE** `b8e62542` (LD-1/BR-1 live-verify pending) |
-| H-hyd | Hydration purpose-scoping residuals (full→1d leaks, dedupe key, Sum/Avg churn) | S×4 | low | no 60MB/frame churn loops | H7-gate | **IN-FLIGHT** (Wave 3, `hydration_purpose_scoping.md`) |
+| H-hyd | Hydration purpose-scoping residuals (full→1d leaks, dedupe key, Sum/Avg churn) | S×4 | low | no 60MB/frame churn loops | H7-gate | **DONE** this commit |
 | RC-FV | Final verification (full suite, strict-tree, build, staging) | S | none | certifies the tag commit | Waves 1-3 | **QUEUED** (`release_final_verification.md`) |
 | RC-7s | Maintainer live Session-1 | — | — | closes every fixed-unverified row | RC-FV | **PENDING** (maintainer) |
 | RC-8 | Merge → tag v1.0.0 → publish + stubs + branch cleanup | S | low | **v1.0.0 on PyPI** | RC-7s, repo-public decision | **PENDING** (maintainer) |

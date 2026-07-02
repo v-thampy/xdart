@@ -1160,10 +1160,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             if pending is None:
                 pending = set()
                 self._hydration_pending_labels = pending
-            if label_key in pending:
+            purpose_key = str(purpose or "full")
+            pending_key = (label_key, purpose_key)
+            if pending_key in pending:
                 return
-            pending.add(label_key)
-            worker.request(label_key, self.display_generation, purpose=purpose)
+            pending.add(pending_key)
+            worker.request(
+                label_key, self.display_generation, purpose=purpose_key)
 
     def _flush_hydration_render(self) -> None:
         if not getattr(self, "_pending_hydration_render", False):
@@ -1213,7 +1216,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         pending = getattr(self, "_hydration_pending_labels", None)
         if pending is not None:
             for label_key in label_keys:
-                pending.discard(label_key)
+                pending.discard(label_key)  # legacy test/old-state tolerance
+                for pending_key in tuple(pending):
+                    if (
+                        isinstance(pending_key, tuple)
+                        and pending_key
+                        and pending_key[0] == label_key
+                    ):
+                        pending.discard(pending_key)
         try:
             generation = int(generation)
         except (TypeError, ValueError):
