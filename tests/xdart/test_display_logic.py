@@ -406,6 +406,49 @@ def test_error_load_yields_error_status_not_partial():
     assert all(not plan.has_data for _role, plan in state.panels)
 
 
+def test_overlay_preserves_1d_panel_when_selected_frame_evicted():
+    # Phase-5 cap-store regression: selecting an evicted frame (not resident) in
+    # Overlay/Waterfall must NOT clear the 1D overlay when an accumulator already
+    # exists — PLOT_1D stays drawable (READY, has_data) so the payload re-emits the
+    # accumulator; the 2D cake stays blank (its frame is evicted too).
+    for mode in (dl.Mode.INT_1D, dl.Mode.INT_2D):
+        for method in ('Overlay', 'Waterfall'):
+            state = dl.compute_display_state(**_base_state_kwargs(
+                mode=mode, method=method,
+                selected_ids=(2,), loaded_1d_keys=set(), loaded_2d_keys=set(),
+                prev_overlaid_ids=(0, 1),          # accumulator already exists
+            ))
+            assert state.load_status is dl.LoadStatus.READY, (mode, method)
+            assert state.panel(dl.PanelRole.PLOT_1D).has_data is True, (mode, method)
+            cake = state.panel(dl.PanelRole.CAKE_2D)   # INT_1D has no cake panel
+            if cake is not None:
+                assert cake.has_data is False, (mode, method)
+
+
+def test_overlay_clears_1d_when_no_accumulator():
+    # A genuine empty selection (no accumulator yet) must still clear — the
+    # preserve must not spuriously keep stale curves.
+    state = dl.compute_display_state(**_base_state_kwargs(
+        mode=dl.Mode.INT_1D, method='Overlay',
+        selected_ids=(2,), loaded_1d_keys=set(), loaded_2d_keys=set(),
+        prev_overlaid_ids=(),                  # no accumulator
+    ))
+    assert state.load_status is not dl.LoadStatus.READY
+    assert state.panel(dl.PanelRole.PLOT_1D).has_data is False
+
+
+def test_non_accumulating_methods_do_not_preserve_on_evicted():
+    # Single/Sum/Average rebuild from the selection — an evicted read clears; the
+    # overlay preserve must NOT engage even with a stale accumulator present.
+    for method in ('Single', 'Sum', 'Average'):
+        state = dl.compute_display_state(**_base_state_kwargs(
+            mode=dl.Mode.INT_1D, method=method,
+            selected_ids=(2,), loaded_1d_keys=set(), loaded_2d_keys=set(),
+            prev_overlaid_ids=(0, 1),
+        ))
+        assert state.panel(dl.PanelRole.PLOT_1D).has_data is False, method
+
+
 def test_mode_switch_bumps_generation_and_clears_title():
     # Invariant: title/filename never updates independently of the payload;
     # switching modes produces a fresh state whose title matches the new
