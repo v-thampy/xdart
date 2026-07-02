@@ -648,6 +648,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # XYE bkg carries its own x and is interpolated onto each trace at render.
         self._bkg_xye = None
         self._norm_channel_map = {}
+        self._last_applied_norm_channel = None
         self._clear_wavelength_cache()
 
         # Viewer mode: None (normal), 'image', or 'xye'
@@ -3318,17 +3319,24 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     def normUpdate(self):
         """Update plots if norm channel exists"""
-        self.normChannel = self.get_normChannel()
-        if self.normChannel:
+        norm_channel = self.get_normChannel()
+        if norm_channel:
             # scan_data may now carry non-numeric columns (N2): treat a
             # non-numeric / zero norm channel as "no normalization".
             try:
-                norm_sum = float(self.scan.scan_data[self.normChannel].sum())
+                norm_sum = float(self.scan.scan_data[norm_channel].sum())
             except (TypeError, ValueError):
                 norm_sum = 0.0
             if norm_sum == 0.:
-                self.normChannel = None
-        # Clear stale plot_data so update_plot() rebuilds all overlay curves
+                norm_channel = None
+        previous = getattr(self, "_last_applied_norm_channel", None)
+        self.normChannel = norm_channel
+        if norm_channel == previous:
+            return
+        self._last_applied_norm_channel = norm_channel
+        # A real norm-channel change invalidates every accumulated intensity row;
+        # no-op calls (notably None->None during selection refresh) must not wipe
+        # Overlay/Waterfall history.
         self.plot_data = [np.zeros(0), np.zeros(0)]
         self.frame_names = []
         self.overlaid_idxs = []

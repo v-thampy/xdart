@@ -4703,6 +4703,85 @@ def test_update_plot_accumulator_skips_empty_incoming_grid():
     assert ids == [1]
 
 
+def test_norm_update_noop_preserves_overlay_history():
+    calls = []
+    history = SimpleNamespace(count=3)
+    host = SimpleNamespace(
+        normChannel=None,
+        _last_applied_norm_channel=None,
+        get_normChannel=lambda: None,
+        plot_data=[np.array([0.0, 1.0]), np.ones((3, 2))],
+        frame_names=["scan_1", "scan_2", "scan_3"],
+        overlaid_idxs=[1, 2, 3],
+        _waterfall_history=history,
+        update=lambda: calls.append("update"),
+    )
+    host.normUpdate = MethodType(displayFrameWidget.normUpdate, host)
+
+    host.normUpdate()
+
+    assert calls == []
+    assert host.plot_data[1].shape == (3, 2)
+    assert host.frame_names == ["scan_1", "scan_2", "scan_3"]
+    assert host.overlaid_idxs == [1, 2, 3]
+    assert host._waterfall_history is history
+
+
+def test_norm_update_real_channel_change_resets_overlay_history():
+    calls = []
+
+    class _Column:
+        def sum(self):
+            return 10.0
+
+    host = SimpleNamespace(
+        normChannel=None,
+        _last_applied_norm_channel=None,
+        get_normChannel=lambda: "I0",
+        scan=SimpleNamespace(scan_data={"I0": _Column()}),
+        plot_data=[np.array([0.0, 1.0]), np.ones((3, 2))],
+        frame_names=["scan_1", "scan_2", "scan_3"],
+        overlaid_idxs=[1, 2, 3],
+        _waterfall_history=SimpleNamespace(count=3),
+        update=lambda: calls.append("update"),
+    )
+    host.normUpdate = MethodType(displayFrameWidget.normUpdate, host)
+
+    host.normUpdate()
+
+    assert calls == ["update"]
+    assert host.normChannel == "I0"
+    assert host._last_applied_norm_channel == "I0"
+    assert host.plot_data[0].size == 0
+    assert host.frame_names == []
+    assert host.overlaid_idxs == []
+    assert host._waterfall_history is None
+
+
+def test_overlay_mode_entry_seeds_history_from_displayed_single_trace():
+    host = _plot_host("Single")
+    host.update_plot()
+    assert host.overlaid_idxs == [1]
+    assert getattr(host, "_waterfall_history", None) is None
+
+    host.ui.plotMethod._text = "Overlay"
+    host.sigPlotMethodChanged = _FakeSignal()
+    host.request_plot_autorange = lambda: None
+    for name in (
+        "_on_plotMethod_changed",
+        "_overlay_history_reset_key",
+        "_seed_overlay_history_from_plot_state",
+        "_current_plot_axis_label",
+    ):
+        setattr(host, name, MethodType(getattr(DisplayPlotMixin, name), host))
+
+    host._on_plotMethod_changed()
+
+    assert host._waterfall_history is not None
+    assert host._waterfall_history.count == 1
+    assert host._waterfall_history.ids == (1,)
+
+
 def test_overlay_unit_switch_rebuilds_all_accumulated_curves():
     host = _plot_host("Overlay")
     for idx in (1, 2, 3):

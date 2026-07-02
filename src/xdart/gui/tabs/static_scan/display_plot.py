@@ -27,6 +27,7 @@ from .display_logic import (
     plan_overlay,
     overlay_read_failure_action,
     OverlayAction,
+    WaterfallHistory,
     pretty_unit,
     nanmean_slice,
     resample_image_axis_to_uniform,
@@ -722,8 +723,71 @@ class DisplayPlotMixin:
             self.update()
         else:
             # Overlay / Waterfall: keep existing accumulated curves and
-            # just refresh the rendered view.
+            # seed the payload-owned history from the currently displayed trace
+            # before the next selection appends.  Without this, mode entry after
+            # Single shows frame A, but the first Overlay render for frame B has
+            # no prior WaterfallHistory and fresh-starts from B.
+            self._seed_overlay_history_from_plot_state()
             self.draw_plot_state()
+
+    def _overlay_history_reset_key(self):
+        """Return the reset identity used by the publication overlay payload."""
+        axis_info = {}
+        try:
+            idx = int(self.ui.plotUnit.currentIndex())
+            info = getattr(self, "_plot_axis_info", ())
+            if 0 <= idx < len(info):
+                axis_info = info[idx] or {}
+        except Exception:
+            axis_info = {}
+        source = axis_info.get("source", "1d")
+        try:
+            sliced = bool(self.ui.slice.isChecked())
+        except Exception:
+            sliced = False
+        needs_2d = (source == "2d") or (source == "1d_2d" and sliced)
+        scan = getattr(self, "scan", None)
+        scan_id = (
+            getattr(scan, "data_file", None)
+            or getattr(scan, "name", None)
+        ) if scan is not None else None
+        return scan_id, bool(needs_2d)
+
+    def _seed_overlay_history_from_plot_state(self):
+        """Seed WaterfallHistory from the current plot before Overlay entry."""
+        history = getattr(self, "_waterfall_history", None)
+        if history is not None and getattr(history, "count", 0):
+            return False
+        ids = tuple(getattr(self, "overlaid_idxs", None) or getattr(self, "idxs_1d", ()))
+        if not ids:
+            return False
+        try:
+            x = np.asarray(self.plot_data[0], dtype=float).ravel()
+            rows = np.atleast_2d(np.asarray(self.plot_data[1], dtype=float))
+        except Exception:
+            return False
+        if x.size == 0 or rows.size == 0 or rows.shape[-1] != x.size:
+            return False
+        row_count = min(len(ids), rows.shape[0])
+        if row_count <= 0:
+            return False
+        ids = tuple(int(i) for i in ids[:row_count])
+        rows = rows[:row_count]
+        names = tuple(getattr(self, "frame_names", ())[:row_count])
+        if len(names) < row_count:
+            scan_name = getattr(getattr(self, "scan", None), "name", "scan")
+            names = tuple(f"{scan_name}_{i}" for i in ids)
+        label, unit = self._current_plot_axis_label()
+        self._waterfall_history = WaterfallHistory(
+            reset_key=self._overlay_history_reset_key(),
+            unit=unit,
+            label=label,
+            x=x,
+            rows=rows,
+            ids=ids,
+            names=names,
+        )
+        return True
 
     def _current_plot_axis_label(self):
         """Return the bottom-axis label and unit for the current 1D view."""

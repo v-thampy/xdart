@@ -1008,6 +1008,97 @@ def test_overlay_many_frame_selection_converges_after_out_of_order_hydration():
     assert set(payload.plot_history.ids) == set(range(100))
 
 
+def test_overlay_selection_evicted_hydration_never_decreases_history():
+    from xdart.gui.tabs.static_scan.display_controllers import ScanDisplayController
+    from xdart.gui.tabs.static_scan.display_logic import Mode, WaterfallHistory
+    from xdart.gui.tabs.static_scan.display_publication import (
+        PublicationDisplayAdapter)
+    from xdart.modules.frame_publication import (
+        PublicationStore, publication_from_live_frame)
+    from xrd_tools.core.containers import IntegrationResult1D
+
+    x = np.linspace(0.5, 5.0, 8, dtype=np.float32)
+
+    def _frame(i):
+        return SimpleNamespace(
+            idx=i,
+            int_1d=IntegrationResult1D(
+                radial=x, intensity=np.full(x.shape, float(i), dtype=np.float32),
+                sigma=np.ones_like(x), unit="q_A^-1"),
+            int_2d=None, map_raw=None, mask=None, gi=False, gi_2d={},
+            thumbnail=None, bg_raw=0, scan_info={}, source_file=f"f{i}.tif",
+            source_frame_idx=i,
+        )
+
+    store = PublicationStore(max_heavy_items=4)
+    for i in range(320, 336):
+        store.upsert(publication_from_live_frame(_frame(i)))
+    assert not store.get(331).view.has_1d
+
+    initial_ids = tuple(range(320, 331))
+    initial_history = WaterfallHistory(
+        reset_key=("scan.nxs", False),
+        unit="Å⁻¹",
+        label="Q",
+        x=x,
+        rows=np.vstack([np.full(x.shape, float(i)) for i in initial_ids]),
+        ids=initial_ids,
+        names=tuple(f"scan_{i}" for i in initial_ids),
+    )
+    queued = []
+    widget = SimpleNamespace(
+        publication_store=store,
+        viewer_mode=None,
+        data_lock=RLock(),
+        data_1d={},
+        data_2d={},
+        frame_ids=["331"],
+        overlaid_idxs=list(initial_history.ids),
+        _waterfall_history=initial_history,
+        display_generation=1,
+        normChannel=None,
+        scan=SimpleNamespace(
+            name="scan", data_file="scan.nxs", gi=False,
+            bai_1d_args={}, bai_2d_args={},
+            scan_lock=RLock(),
+            frames=SimpleNamespace(index=list(range(320, 336))),
+        ),
+        ui=SimpleNamespace(
+            plotMethod=SimpleNamespace(currentText=lambda: "Overlay"),
+            plotUnit=SimpleNamespace(currentText=lambda: "Q (Å⁻¹)",
+                                     currentIndex=lambda: 0),
+            slice=SimpleNamespace(isChecked=lambda: False, isEnabled=lambda: False),
+        ),
+        _request_frame_hydration=lambda label, *, purpose="full":
+            queued.append((int(label), purpose)),
+    )
+    counts = [initial_history.count]
+
+    def render_and_guard():
+        state = ScanDisplayController().compute_state(widget, Mode.INT_1D)
+        labels = tuple(dict.fromkeys((*state.selected_ids, *state.render_ids)))
+        adapter = PublicationDisplayAdapter(store, widget=widget, labels=labels)
+        payload = adapter.plot_payload(state)
+        assert payload is not None and payload.plot_history is not None
+        assert payload.plot_history.count >= counts[-1]
+        counts.append(payload.plot_history.count)
+        widget._waterfall_history = payload.plot_history
+        widget.overlaid_idxs = list(payload.overlaid_ids)
+        return state, payload
+
+    state, payload = render_and_guard()
+    assert tuple(state.render_ids) == ()
+    assert queued == [(331, "1d")]
+    assert payload.plot_history.ids == initial_ids
+
+    store.upsert(publication_from_live_frame(_frame(331)))
+    state, payload = render_and_guard()
+
+    assert tuple(state.render_ids) == (331,)
+    assert counts == [11, 11, 12]
+    assert payload.plot_history.ids == initial_ids + (331,)
+
+
 def test_waterfall_history_payload_decimates_display_rows_only():
     from xdart.gui.tabs.static_scan.display_logic import WaterfallHistory
     from xdart.gui.tabs.static_scan.display_publication import (
