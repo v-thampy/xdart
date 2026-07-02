@@ -453,6 +453,13 @@ class H5Viewer(QWidget):
         self.auto_last = True
         self.latest_idx = None
         self.new_scan_loaded = False
+        # Int 1D/2D only: set True by scans_clicked when a .nxs is manually
+        # selected in the browser, so the display-clearing sigNewFile cascade
+        # (axes rebuild + bkg clear + cache wipe) is DEFERRED until the user
+        # actually clicks a frame — the plots stay as-is on scan-select instead of
+        # blanking.  Consumed by staticWidget.set_data on the first frame-click.
+        # (Image/XYE/NeXus viewers auto-display frame 0 and never set this.)
+        self._browser_scan_reset_pending = False
         self.viewer_mode = None
         # True only while a live (non-batch) wrangler run is in progress.
         # Suppresses ``data_reset`` (wired to the async ``sigNewFile``)
@@ -513,14 +520,15 @@ class H5Viewer(QWidget):
         self.ui.gridLayout.removeWidget(self.ui.show_all)
         self.ui.gridLayout.removeWidget(self.ui.auto_last)
         btn_layout.addWidget(self.ui.show_all)
-        btn_layout.addWidget(self.ui.auto_last)
         # Stage 4 (Direction A): the frame-metadata table is no longer inline in
         # the bottom-left — this button opens it as an on-demand popup (wired in
         # staticWidget._connect_signals -> _open_metadata_dialog).
         self.ui.metadata_btn = QtWidgets.QPushButton('Metadata ▾')
         self.ui.metadata_btn.setObjectName('metadata_btn')
         self.ui.metadata_btn.setMaximumSize(QtCore.QSize(16777215, 25))
+        # Order: Show All | Metadata | Auto Last (Auto Last rightmost).
         btn_layout.addWidget(self.ui.metadata_btn)
+        btn_layout.addWidget(self.ui.auto_last)
         self.ui.gridLayout.addWidget(btn_row, 3, 0, 1, 2)
 
     def refresh_directory(self):
@@ -1239,6 +1247,11 @@ class H5Viewer(QWidget):
                 return
 
             # ── Normal mode: open HDF5 scan ───────────────────────────
+            # Manual browser select in Int 1D/2D: DEFER the display reset until a
+            # frame is clicked, so the plots stay as-is on select (the frame list
+            # still populates + deselects).  Only reached in normal mode — the
+            # viewer branches above return first, keeping their auto-first-frame.
+            self._browser_scan_reset_pending = True
             self.set_file(fpath)
             self.new_scan_loaded = True
         except AttributeError:
@@ -2314,7 +2327,16 @@ class H5Viewer(QWidget):
                 "serving cache only until the run ends", len(frame_ids), frame_ids,
             )
 
-        self.sigUpdate.emit()
+        # FREEZE FIX: route the terminal (normal-mode, multi-frame) render through
+        # the 100 ms debounce Coalescer instead of a direct synchronous emit — a
+        # rapid shift/ctrl multi-select burst then collapses to ONE render of the
+        # final selection instead of one heavy O(N) render per selection event (the
+        # beachball on a long scan).  Safe for live/auto-last: those also reach here
+        # via data_changed but are upstream-throttled by _update_timer (200 ms >
+        # 100 ms debounce, so no live render is dropped); the debounce only adds
+        # ~100 ms tail to the final paint.  Viewer-mode single-frame emits above stay
+        # direct (not the freeze driver + want an immediate paint).
+        self._update_coalesce_timer.start()
 
     def closeEvent(self, event):
         # Retire any in-flight load worker before teardown so the interpreter
