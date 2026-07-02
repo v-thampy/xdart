@@ -1,7 +1,7 @@
 # Design checkpoint — Steps 7+8: one authoritative store (ADR-0005 store→session) + retire data_1d/data_2d
 
-**Date:** 2026-06-14 · **Status:** design checkpoint, needs maintainer sign-off on the open
-decisions before build. **Builds on:** ADR-0003 (multi-result record), ADR-0004 (event/threading;
+**Date:** 2026-06-14 · **Status:** H8/8a and H9/8b DONE; D3 one-store collapse COMPLETE
+except 7c cadence-policy relocation. **Builds on:** ADR-0003 (multi-result record), ADR-0004 (event/threading;
 §4 cadence interim), ADR-0005 (store ownership → session). **Trigger:** the Round-12 P1 finding
 (silent >64-frame aggregation truncation) is the direct symptom of the two-store half-migration that
 7+8 exist to remove.
@@ -37,10 +37,10 @@ decisions before build. **Builds on:** ADR-0003 (multi-result record), ADR-0004 
   commit)** wires both production writers through the shared `xrd_tools.io` record/stack path. The
   accumulated per-mode record now survives crash/reload; non-primary GI modes are durable for
   instant mode-switch after reload, but whole-scan aggregation remains primary-mode-scoped.
-- **8a DONE (H8):** scan display reads no longer use Role-A `data_1d`/`data_2d` mirrors; the read
-  chain is session store → bounded `PublicationStore` projection → disk hydration. Mirrors remain
-  written as rollback/deletion safety until 8b, with log-once telemetry if a scan mirror would have
-  been hit.
+- **8a DONE (H8) + 8b DONE (H9, this commit):** scan display reads no longer use Role-A
+  `data_1d`/`data_2d` mirrors; the read chain is session store → bounded `PublicationStore`
+  projection → disk hydration. The Role-A mirrors and `hydrated_raw.py` are physically retired;
+  Image/XYE/NeXus viewer rows remain under viewer-scoped identifiers.
 
 ## Target architecture (ADR-0005)
 - **Authoritative store → `xrd_tools.session`** (headless): bounded `Mapping[idx → FrameRecord]`,
@@ -101,8 +101,9 @@ Whole-scan Sum/Average/Overall must source ALL frames without holding them all i
   projection over the session store; live display + aggregation read the session store /
   stacked-read / hydration path; the legacy `update_plot` None-payload fallback is removed and
   explicit Sum/Average subsets hydrate-all-or-refuse.
-- **8b (delete):** remove `data_1d`/`data_2d`/`hydrated_raw`; keep h5viewer `_ViewerRows`.
-  **Done-test:** those identifiers gone from the display layer (the greenfield "done").
+- **8b DONE (H9, this commit):** removed `data_1d`/`data_2d`/`hydrated_raw` from
+  `src/xdart/gui/tabs/static_scan/`; kept h5viewer `_ViewerRows` as viewer-scoped row stores and
+  added an architecture guard for the greenfield done-test.
 - **7c (cadence):** move `FlushPolicy` + eviction policy into the session (mechanism stays xdart).
 
 ## Gates / risks

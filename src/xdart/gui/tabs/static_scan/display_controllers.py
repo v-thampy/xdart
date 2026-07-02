@@ -127,11 +127,9 @@ def _data_snapshot(widget, *, mode, labels=None, include_legacy=True,
     """Snapshot loaded keys + per-frame raw/thumbnail availability.
 
     X1 (Phase 3a): the PublicationStore is the primary source.  Viewer modes
-    still opt into the legacy dict caches because they are row/file browsers
-    rather than scan-display publications.  Normal Int 1D/2D modes do NOT
-    OR-merge those mirrors into readiness anymore: doing so hid store eviction
-    from the render decision and kept the old ``data_1d`` mirror as an implicit
-    source of truth.
+    opt into viewer-row stores because they are row/file browsers rather than
+    scan-display publications.  Normal Int 1D/2D modes do not OR-merge those
+    rows into readiness.
     """
     loaded_1d, loaded_2d, raw_avail = set(), set(), {}
     if labels is None:
@@ -182,14 +180,17 @@ def resolve_frame_data_for_widget(
         request = getattr(widget, "_request_missing_publication", None)
     if not request_hydration:
         request = None
+    viewer_mode = mode in (Mode.IMAGE_VIEWER, Mode.XYE_VIEWER, Mode.NEXUS_VIEWER)
     return resolve_frame_data(
         label,
         mode,
         tier_needed,
         store_first_lookup=_store_first_lookup(widget),
         publication_store=getattr(widget, "publication_store", None),
-        data_1d=getattr(widget, "data_1d", None),
-        data_2d=getattr(widget, "data_2d", None),
+        viewer_rows_1d=(
+            getattr(widget, "viewer_rows_1d", None) if viewer_mode else None),
+        viewer_rows_2d=(
+            getattr(widget, "viewer_rows_2d", None) if viewer_mode else None),
         include_legacy=include_legacy,
         request_hydration=request,
     )
@@ -219,7 +220,7 @@ def _image_viewer_raw_payload(widget, state):
     Mirrors the raw-browser semantics exactly (the behavior just fixed and
     verified in the GUI):
 
-    * source: the selected frame's ``map_raw`` from ``data_2d``, falling back
+    * source: the selected frame's ``map_raw`` from ``viewer_rows_2d``, falling back
       to its dequantized ``thumbnail`` when the full array isn't hydrated;
     * standalone files (``_viewer_is_xdart`` False): fill non-finite + the
       uint32 ceiling sentinel with the low finite value, **no** NaN mask;
@@ -447,8 +448,7 @@ def _xye_plot_payload(widget, state):
         return None
 
     def _frame_data(idx):
-        """(radial, intensity, source_file) — publication first (X1),
-        legacy data_1d frame as the fallback while the dict exists."""
+        """(radial, intensity, source_file) from viewer-row publication/storage."""
         mode = getattr(state, "mode", Mode.XYE_VIEWER)
         result = resolve_frame_data_for_widget(
             widget, idx, mode, DataTier.ONE_D,
@@ -558,7 +558,7 @@ class NexusViewerController(_BaseController):
     def compute_state(self, widget, mode):
         loaded_1d, loaded_2d, raw_avail = set(), set(), {}
         with widget.data_lock:
-            for key, frame in widget.data_1d.items():
+            for key, frame in widget.viewer_rows_1d.items():
                 payload = getattr(frame, "nexus_preview_payload", None)
                 if not isinstance(payload, dict):
                     continue
@@ -597,7 +597,7 @@ class NexusViewerController(_BaseController):
             )
         idx = int(state.render_ids[0])
         with widget.data_lock:
-            frame = widget.data_1d.get(idx)
+            frame = widget.viewer_rows_1d.get(idx)
         payload = getattr(frame, "nexus_preview_payload", None) if frame else None
         if not isinstance(payload, dict):
             return DisplayPayload(

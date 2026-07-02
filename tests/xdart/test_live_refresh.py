@@ -730,23 +730,6 @@ def test_live_flush_timer_env_clamps_below_selection_debounce(monkeypatch, caplo
     assert "clamping to 110ms" in caplog.text
 
 
-def test_set_1d_cache_limit_rejects_none_and_keeps_finite_cap():
-    from xdart.utils._utils import FixSizeOrderedDict
-
-    cache = FixSizeOrderedDict(max=10)
-    for idx in range(6):
-        cache[idx] = idx
-    host = SimpleNamespace(data_1d=cache)
-
-    with pytest.raises(ValueError, match="finite"):
-        staticWidget._set_1d_cache_limit(host, None)
-
-    staticWidget._set_1d_cache_limit(host, 3)
-
-    assert cache._max == 3
-    assert len(cache) == 3
-
-
 def test_flush_pending_update_owns_single_repaint():
     calls = []
     widget = SimpleNamespace(
@@ -1525,7 +1508,7 @@ def test_update_image_masks_uint16_sentinels_in_legacy_path():
     host = SimpleNamespace(
         PERSIST_2D_DURING_PROCESSING=True, _processing_active=False,
         _image_levels_override=None, overall=False, frame_ids=[0],
-        idxs_2d=[0], data_lock=RLock(), data_2d={0: {'mask': None}},
+        idxs_2d=[0], data_lock=RLock(), viewer_rows_2d={0: {'mask': None}},
         bkg_map_raw=0.0, scan=SimpleNamespace(global_mask=None),
         get_frames_map_raw=lambda *a, **k: (raw, 'raw'),
     )
@@ -1615,8 +1598,8 @@ def _empty_update_host(processing, persist=True):
         _processing_active=processing,
         _display_blanked=False,
         display_generation=0,
-        data_1d={},                 # empty caches == silent batch
-        data_2d={},
+        viewer_rows_1d={},                 # empty caches == silent batch
+        viewer_rows_2d={},
         data_lock=RLock(),
         refresh_norm_channels=lambda: None,
         get_idxs=lambda: None,
@@ -1803,7 +1786,7 @@ def test_metadata_panel_accepts_store_mapping_proxy():
         None,
         ["7"],
         {},
-        data_1d={},
+        viewer_rows_1d={},
         publication_store=store,
         data_lock=RLock(),
     )
@@ -2293,7 +2276,7 @@ def test_data_changed_tolerates_non_integer_labels():
         viewer_mode=None,                       # NOT 'xye' — the crash condition
         frame_ids=[],
         update_2d=False,
-        data_1d={}, data_2d={},
+        viewer_rows_1d={}, viewer_rows_2d={},
         scan=SimpleNamespace(frames=SimpleNamespace(index=[0, 1, 2])),
         ui=SimpleNamespace(listData=_List([
             _Item('iq_eiger_w2s3_test_2_scan001_0001.xye'),
@@ -2312,12 +2295,12 @@ def test_absorb_chunk_drops_stale_generation():
     # Stage 5: a background load worker publishes ONLY through a
     # generation-checked snapshot — a chunk whose generation no longer
     # matches the store's _load_generation (a newer load/selection has begun)
-    # is dropped, never written into data_1d/data_2d.
+    # is dropped, never written into viewer_rows_1d/viewer_rows_2d.
     viewer = SimpleNamespace(
         _load_generation=7,
         data_lock=RLock(),
-        data_1d={},
-        data_2d={},
+        viewer_rows_1d={},
+        viewer_rows_2d={},
     )
     viewer._absorb_chunk = MethodType(H5Viewer._absorb_chunk, viewer)
 
@@ -2327,7 +2310,7 @@ def test_absorb_chunk_drops_stale_generation():
 
     # Stale chunk (gen 6 < current 7) -> dropped.
     viewer._absorb_chunk(6, 3, _Frame(), False)
-    assert viewer.data_1d == {} and viewer.data_2d == {}
+    assert viewer.viewer_rows_1d == {} and viewer.viewer_rows_2d == {}
 
 
 def test_live_gi_clip_warning_fires_once_in_live_gi_only():
@@ -2458,15 +2441,15 @@ def test_absorb_chunk_populates_publication_store_for_1d_and_2d():
     viewer = SimpleNamespace(
         _load_generation=7,
         data_lock=RLock(),
-        data_1d={},
-        data_2d={},
+        viewer_rows_1d={},
+        viewer_rows_2d={},
         publication_store=PublicationStore(),
         _update_coalesce_timer=_FakeTimer(active=False),
         _raw_cache_order=[],
         _raw_cache_limit=8,
     )
     viewer._absorb_chunk = MethodType(H5Viewer._absorb_chunk, viewer)
-    viewer._remember_hydrated_raw = MethodType(H5Viewer._remember_hydrated_raw, viewer)
+    viewer._remember_viewer_raw_lru = MethodType(H5Viewer._remember_viewer_raw_lru, viewer)
 
     class _Frame:
         idx = 3
@@ -2493,8 +2476,8 @@ def test_absorb_chunk_populates_publication_store_for_1d_and_2d():
     publication = viewer.publication_store.get(3)
     assert publication is not None
     assert publication.view.has_1d
-    assert viewer.data_1d == {}
-    assert viewer.data_2d == {}
+    assert viewer.viewer_rows_1d == {}
+    assert viewer.viewer_rows_2d == {}
 
     frame = _Frame()
     frame.idx = 4
@@ -2503,8 +2486,8 @@ def test_absorb_chunk_populates_publication_store_for_1d_and_2d():
     assert publication is not None
     assert publication.view.has_1d
     assert publication.view.has_2d
-    assert viewer.data_1d == {}
-    assert viewer.data_2d == {}
+    assert viewer.viewer_rows_1d == {}
+    assert viewer.viewer_rows_2d == {}
 
 
 def test_absorb_chunk_skips_invalid_2d_cache_but_keeps_1d_publication(caplog):
@@ -2518,15 +2501,15 @@ def test_absorb_chunk_skips_invalid_2d_cache_but_keeps_1d_publication(caplog):
     viewer = SimpleNamespace(
         _load_generation=8,
         data_lock=RLock(),
-        data_1d={},
-        data_2d={12: {"int_2d": object()}},
+        viewer_rows_1d={},
+        viewer_rows_2d={12: {"int_2d": object()}},
         publication_store=PublicationStore(),
         _update_coalesce_timer=_FakeTimer(active=False),
         _raw_cache_order=[],
         _raw_cache_limit=8,
     )
     viewer._absorb_chunk = MethodType(H5Viewer._absorb_chunk, viewer)
-    viewer._remember_hydrated_raw = MethodType(H5Viewer._remember_hydrated_raw, viewer)
+    viewer._remember_viewer_raw_lru = MethodType(H5Viewer._remember_viewer_raw_lru, viewer)
 
     class _Frame:
         idx = 12
@@ -2558,8 +2541,8 @@ def test_absorb_chunk_skips_invalid_2d_cache_but_keeps_1d_publication(caplog):
 
     viewer._absorb_chunk(8, 12, _Frame(), True)
 
-    assert 12 not in viewer.data_1d
-    assert 12 not in viewer.data_2d
+    assert 12 not in viewer.viewer_rows_1d
+    assert 12 not in viewer.viewer_rows_2d
     publication = viewer.publication_store.get(12)
     assert publication is not None
     assert publication.view.has_1d
@@ -2637,8 +2620,8 @@ def _update_smoke_host():
         _payload_x_axis_label=None,
         _payload_y_axis_label=None,
         _using_publication_plot_payload=False,
-        data_1d={0: object(), 1: object()},
-        data_2d={
+        viewer_rows_1d={0: object(), 1: object()},
+        viewer_rows_2d={
             0: {'map_raw': np.ones((4, 4)), 'thumbnail': None},
             1: {'map_raw': np.ones((4, 4)), 'thumbnail': None},
         },
@@ -2695,13 +2678,12 @@ def test_update_render_smoke_int_collapse_and_mode_switches():
     assert "clear_image" in calls and "clear_binned" in calls
     assert "label_2d" not in calls
 
-    # Int-1D (skip_2d): 1D-only — plot drawn, the two 2D panels cleared.
+    # Int-1D (skip_2d): with no publication store, scan display has no
+    # authority to redraw and remains idle after the prior blank.
     calls.clear()
     host.scan.skip_2d = True
     host.update()
-    assert "clear_plot" in calls
-    assert "clear_image" in calls and "clear_binned" in calls
-    assert "draw_image" not in calls and "draw_binned" not in calls
+    assert calls == []
 
     # Switch to Image Viewer (mode switch bumps generation): raw drawn,
     # the 1D plot + cake from the prior mode are cleared (no stale panels).
@@ -2717,13 +2699,13 @@ def test_update_render_smoke_int_collapse_and_mode_switches():
     # Switch to XYE Viewer: 1D drawn via the payload path, the 2D panels cleared.
     calls.clear()
     host.frame_ids = ['0']
-    host.data_1d = {
+    host.viewer_rows_1d = {
         0: SimpleNamespace(
             int_1d=SimpleNamespace(radial=np.arange(3, dtype=float),
                                    intensity=np.array([1.0, 2.0, 3.0])),
             scan_info={'source_file': 'iq_a.xye'})
     }
-    host.data_2d = {}
+    host.viewer_rows_2d = {}
     host.viewer_mode = 'xye'
     host._bump_display_generation()
     host.update()
@@ -2735,7 +2717,7 @@ def test_update_render_smoke_int_collapse_and_mode_switches():
     # that is neither a scan integration view nor an Image/XYE viewer.
     calls.clear()
     host.frame_ids = ['0']
-    host.data_1d = {
+    host.viewer_rows_1d = {
         0: SimpleNamespace(nexus_preview_payload={
             "kind": "plot_1d",
             "x": np.arange(3, dtype=float),
@@ -2743,7 +2725,7 @@ def test_update_render_smoke_int_collapse_and_mode_switches():
             "label": "nexus-row",
         })
     }
-    host.data_2d = {}
+    host.viewer_rows_2d = {}
     host.viewer_mode = 'nexus'
     host._bump_display_generation()
     host.update()
@@ -2754,8 +2736,8 @@ def test_update_render_smoke_int_collapse_and_mode_switches():
     # Back to normal Int-2D: full panel set again.
     calls.clear()
     host.frame_ids = ['0', '1']
-    host.data_1d = {0: object(), 1: object()}
-    host.data_2d = {
+    host.viewer_rows_1d = {0: object(), 1: object()}
+    host.viewer_rows_2d = {
         0: {'map_raw': np.ones((4, 4)), 'thumbnail': None},
         1: {'map_raw': np.ones((4, 4)), 'thumbnail': None},
     }
@@ -2858,8 +2840,8 @@ def test_update_store_evicted_overlay_selection_preserves_history_and_hydrates()
         _using_publication_plot_payload=False,
         _plot_axis_info=[{"source": "1d"}],
         data_lock=RLock(),
-        data_1d={},
-        data_2d={},
+        viewer_rows_1d={},
+        viewer_rows_2d={},
         scan=SimpleNamespace(
             scan_lock=RLock(),
             frames=SimpleNamespace(index=[10, 11]),
@@ -2960,8 +2942,8 @@ def test_update_empty_selection_overlay_preserves_history_on_control_repaint():
         _using_publication_plot_payload=False,
         _plot_axis_info=[{"source": "1d"}],
         data_lock=RLock(),
-        data_1d={},
-        data_2d={},
+        viewer_rows_1d={},
+        viewer_rows_2d={},
         scan=SimpleNamespace(
             scan_lock=RLock(),
             frames=SimpleNamespace(index=[8, 9, 10]),
@@ -3148,7 +3130,7 @@ def test_update_plot_view_sum_average_never_auto_waterfalls():
         calls = []
         host = SimpleNamespace(
             _using_publication_plot_payload=True,
-            frame_ids=["0"], data_1d={}, curves=[], plot=MagicMock(),
+            frame_ids=["0"], viewer_rows_1d={}, curves=[], plot=MagicMock(),
             frame_names=["f"] * n,
             plot_data=[np.arange(5), np.ones((n, 5))],
             ui=SimpleNamespace(
@@ -3392,8 +3374,8 @@ def test_live_display_state_render_ids_match_legacy_idxs():
         idxs=[0, 1], idxs_1d=[0, 1], idxs_2d=[0, 1],
         overall=True,
         overlaid_idxs=[],
-        data_1d={0: object(), 1: object()},
-        data_2d={
+        viewer_rows_1d={0: object(), 1: object()},
+        viewer_rows_2d={
             0: {'map_raw': np.ones((2, 2)), 'thumbnail': None},
             1: {'map_raw': np.ones((2, 2)), 'thumbnail': None},
         },
@@ -3421,8 +3403,8 @@ def test_enter_viewer_mode_cleanup_clears_lists_and_cancels_loader():
     list_scans.selectAll()
     viewer = SimpleNamespace(
         data_lock=RLock(),
-        data_1d={1: object()},
-        data_2d={1: {"map_raw": np.ones((2, 2))}},
+        viewer_rows_1d={1: object()},
+        viewer_rows_2d={1: {"map_raw": np.ones((2, 2))}},
         frame_ids=["1"],
         latest_idx=1,
         new_scan_loaded=True,
@@ -3458,8 +3440,8 @@ def test_enter_viewer_mode_cleanup_clears_lists_and_cancels_loader():
     assert viewer._load_coalesce_timer.isActive() is False
     assert viewer._pending_load_ids is None
     assert viewer._load_generation == 5
-    assert viewer.data_1d == {}
-    assert viewer.data_2d == {}
+    assert viewer.viewer_rows_1d == {}
+    assert viewer.viewer_rows_2d == {}
     assert viewer.frame_ids == []
     assert viewer.latest_idx is None
     assert viewer.new_scan_loaded is False
@@ -3488,8 +3470,8 @@ def test_fast_selection_sweep_debounces_whole_normal_mode_body():
         ui=SimpleNamespace(listData=list_data),
         scan=SimpleNamespace(frames=SimpleNamespace(index=list(range(1, 301)))),
         update_2d=True,
-        data_1d={idx: object() for idx in range(1, 301)},
-        data_2d={},
+        viewer_rows_1d={idx: object() for idx in range(1, 301)},
+        viewer_rows_2d={},
         _run_writing=False,
         _pending_load_ids=None,
         _pending_load_2d=True,
@@ -3531,8 +3513,8 @@ def test_cancel_pending_loads_invalidates_late_chunks():
         _load_coalesce_timer=load_timer,
         _pending_load_ids=[12],
         data_lock=RLock(),
-        data_1d={},
-        data_2d={},
+        viewer_rows_1d={},
+        viewer_rows_2d={},
         _load_worker=None,
         _load_thread=None,
         publication_store=None,
@@ -3549,8 +3531,8 @@ def test_cancel_pending_loads_invalidates_late_chunks():
     assert timer.isActive() is False
     assert load_timer.isActive() is False
     assert viewer._pending_load_ids is None
-    assert viewer.data_1d == {}
-    assert viewer.data_2d == {}
+    assert viewer.viewer_rows_1d == {}
+    assert viewer.viewer_rows_2d == {}
 
 
 def test_set_file_cancels_stale_load_debounce_before_switch():
@@ -3773,8 +3755,8 @@ def test_browser_file_first_frame_disarms_reset_and_reloads_selection():
 def test_viewer_cleanup_stress_drops_stale_chunks_across_mode_switches():
     viewer = SimpleNamespace(
         data_lock=RLock(),
-        data_1d={1: object()},
-        data_2d={1: {"map_raw": np.ones((2, 2))}},
+        viewer_rows_1d={1: object()},
+        viewer_rows_2d={1: {"map_raw": np.ones((2, 2))}},
         frame_ids=["1"],
         latest_idx=1,
         new_scan_loaded=True,
@@ -3812,8 +3794,8 @@ def test_viewer_cleanup_stress_drops_stale_chunks_across_mode_switches():
         viewer._absorb_chunk(stale_generation, frame_id, object(), True)
 
     assert viewer._load_generation == 10
-    assert viewer.data_1d == {}
-    assert viewer.data_2d == {}
+    assert viewer.viewer_rows_1d == {}
+    assert viewer.viewer_rows_2d == {}
     assert viewer.frame_ids == []
     assert viewer.ui.listData.count() == 0
 
@@ -4072,8 +4054,8 @@ def test_reduction_only_nxs_not_loaded_as_generic_image(tmp_path):
     calls = []
     viewer = SimpleNamespace(
         data_lock=RLock(),
-        data_1d={1: object()},
-        data_2d={1: {"map_raw": np.ones((2, 2))}},
+        viewer_rows_1d={1: object()},
+        viewer_rows_2d={1: {"map_raw": np.ones((2, 2))}},
         frame_ids=["1"],
         ui=SimpleNamespace(listData=_FakeListWidget([1])),
         _raw_cache_order=[1],
@@ -4092,8 +4074,8 @@ def test_reduction_only_nxs_not_loaded_as_generic_image(tmp_path):
     assert viewer._viewer_is_xdart is False
     assert calls == ["remember"]
     assert viewer.ui.listData.count() == 0
-    assert viewer.data_1d == {}
-    assert viewer.data_2d == {}
+    assert viewer.viewer_rows_1d == {}
+    assert viewer.viewer_rows_2d == {}
     assert viewer.frame_ids == []
     assert viewer.sigUpdate.emitted == [()]
 
@@ -4111,8 +4093,8 @@ def test_reduction_group_raw_nexus_loads_as_generic_image(tmp_path):
     calls = []
     viewer = SimpleNamespace(
         data_lock=RLock(),
-        data_1d={1: object()},
-        data_2d={1: {"map_raw": np.ones((2, 2))}},
+        viewer_rows_1d={1: object()},
+        viewer_rows_2d={1: {"map_raw": np.ones((2, 2))}},
         frame_ids=["1"],
         ui=SimpleNamespace(listData=_FakeListWidget([1])),
         _raw_cache_order=[1],
@@ -4222,8 +4204,8 @@ def _nexus_viewer_host(tmp_path):
     QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     viewer = SimpleNamespace(
         data_lock=RLock(),
-        data_1d={},
-        data_2d={},
+        viewer_rows_1d={},
+        viewer_rows_2d={},
         frame_ids=[],
         viewer_mode="nexus",
         ui=SimpleNamespace(
@@ -4309,21 +4291,21 @@ def test_nexus_viewer_loads_rows_and_previews_1d_2d_units(tmp_path):
     key_1d = viewer.ui.listData.item(row_1d).data(QtCore.Qt.UserRole)
     assert viewer.frame_ids == [str(key_1d)]
     assert viewer.ui.labelCurrent.text == path.name
-    assert viewer.data_1d[1].__class__.__name__ == "_ViewerRow"
-    payload_1d = viewer.data_1d[key_1d].nexus_preview_payload
+    assert viewer.viewer_rows_1d[1].__class__.__name__ == "_ViewerRow"
+    payload_1d = viewer.viewer_rows_1d[key_1d].nexus_preview_payload
     assert payload_1d["kind"] == "plot_1d"
     assert payload_1d["x_unit"] == "q_A^-1"
     assert payload_1d["x_label"] == "Q"
     assert payload_1d["y_label"] == "Intensity"
     np.testing.assert_allclose(payload_1d["x"], np.linspace(0.5, 2.5, 5))
     np.testing.assert_allclose(payload_1d["y"], np.arange(5, dtype=float))
-    assert viewer.data_1d[key_1d].scan_info["preview_selection"] == "[0, :]"
+    assert viewer.viewer_rows_1d[key_1d].scan_info["preview_selection"] == "[0, :]"
 
     row_2d = labels.index("Integrated 2D")
     viewer.ui.listData.setCurrentRow(row_2d)
     viewer.data_changed()
     key_2d = viewer.ui.listData.item(row_2d).data(QtCore.Qt.UserRole)
-    payload_2d = viewer.data_1d[key_2d].nexus_preview_payload
+    payload_2d = viewer.viewer_rows_1d[key_2d].nexus_preview_payload
     assert payload_2d["kind"] == "image_2d"
     assert payload_2d["image"].shape == (3, 4)
     assert payload_2d["x_label"] == "Qip"
@@ -4335,13 +4317,13 @@ def test_nexus_viewer_loads_rows_and_previews_1d_2d_units(tmp_path):
     viewer.ui.listData.setCurrentRow(row_raw)
     viewer.data_changed()
     key_raw = viewer.ui.listData.item(row_raw).data(QtCore.Qt.UserRole)
-    payload_raw = viewer.data_1d[key_raw].nexus_preview_payload
+    payload_raw = viewer.viewer_rows_1d[key_raw].nexus_preview_payload
     assert payload_raw["kind"] == "image_2d"
     assert payload_raw["image"].shape == (6, 7)
     assert payload_raw["x_label"] == "column"
     assert payload_raw["y_label"] == "row"
-    assert viewer.data_1d[key_raw].scan_info["_shape"] == (2, 6, 7)
-    assert viewer.data_1d[key_raw].scan_info["dtype"] == "uint16"
+    assert viewer.viewer_rows_1d[key_raw].scan_info["_shape"] == (2, 6, 7)
+    assert viewer.viewer_rows_1d[key_raw].scan_info["dtype"] == "uint16"
 
 
 def test_wrangler_expands_active_groups_on_startup():
@@ -4535,7 +4517,7 @@ def test_nexus_viewer_real_xdart_processed_file_smoke():
     viewer.ui.listData.setCurrentRow(row_1d)
     viewer.data_changed()
     key_1d = viewer.ui.listData.item(row_1d).data(QtCore.Qt.UserRole)
-    payload_1d = viewer.data_1d[key_1d].nexus_preview_payload
+    payload_1d = viewer.viewer_rows_1d[key_1d].nexus_preview_payload
     assert payload_1d["kind"] == "plot_1d"
     assert payload_1d["x"].size == payload_1d["y"].size
     assert payload_1d["x_unit"]
@@ -4545,7 +4527,7 @@ def test_nexus_viewer_real_xdart_processed_file_smoke():
         viewer.ui.listData.setCurrentRow(row_2d)
         viewer.data_changed()
         key_2d = viewer.ui.listData.item(row_2d).data(QtCore.Qt.UserRole)
-        payload_2d = viewer.data_1d[key_2d].nexus_preview_payload
+        payload_2d = viewer.viewer_rows_1d[key_2d].nexus_preview_payload
         assert payload_2d["kind"] == "image_2d"
         assert payload_2d["image"].ndim == 2
         assert payload_2d["image"].size > 0
@@ -4615,7 +4597,7 @@ def test_image_viewer_missing_raw_and_thumbnail_yields_no_payload():
     )
     host = SimpleNamespace(
         data_lock=RLock(),
-        data_2d={1: {"map_raw": None, "thumbnail": None}},
+        viewer_rows_2d={1: {"map_raw": None, "thumbnail": None}},
         _viewer_is_xdart=False,
     )
     assert _image_viewer_raw_payload(host, _img_state([1])) is None
@@ -4625,7 +4607,7 @@ def test_image_viewer_no_selection_yields_no_payload():
     from xdart.gui.tabs.static_scan.display_controllers import (
         _image_viewer_raw_payload,
     )
-    host = SimpleNamespace(data_lock=RLock(), data_2d={}, _viewer_is_xdart=False)
+    host = SimpleNamespace(data_lock=RLock(), viewer_rows_2d={}, _viewer_is_xdart=False)
     assert _image_viewer_raw_payload(host, _img_state([])) is None
 
 
@@ -4635,7 +4617,7 @@ def test_image_viewer_all_sentinel_image_yields_no_payload():
     )
     host = SimpleNamespace(
         data_lock=RLock(),
-        data_2d={1: {"map_raw": np.full((2, 2), 4294967295.0),
+        viewer_rows_2d={1: {"map_raw": np.full((2, 2), 4294967295.0),
                      "thumbnail": None}},
         _viewer_is_xdart=False,
     )
@@ -4650,7 +4632,7 @@ def test_image_viewer_standalone_uint16_ceiling_stays_raw_and_finite():
     raw = np.array([[10.0, 65535.0], [20.0, 30.0]])
     host = SimpleNamespace(
         data_lock=RLock(),
-        data_2d={1: {"map_raw": raw, "thumbnail": None}},
+        viewer_rows_2d={1: {"map_raw": raw, "thumbnail": None}},
         _viewer_is_xdart=False,
     )
     payload = _image_viewer_raw_payload(host, _img_state([1]))
@@ -4667,7 +4649,7 @@ def test_image_viewer_payload_ignores_mask_and_norm_but_subtracts_matching_bkg()
     raw = np.array([[1.0, 2.0], [3.0, 4.0]])
     host = SimpleNamespace(
         data_lock=RLock(),
-        data_2d={1: {"map_raw": raw, "thumbnail": None}},
+        viewer_rows_2d={1: {"map_raw": raw, "thumbnail": None}},
         _viewer_is_xdart=False,
         # A wrangler threshold/mask + a monitor that the raw browser must IGNORE
         # (it shows detector counts, not a processed frame).
@@ -4700,7 +4682,7 @@ def test_xye_viewer_payload_subtracts_background():
                                    sigma=np.ones(3), unit="q_A^-1"),
         scan_info={"source_file": "data.xye"})
     host = SimpleNamespace(
-        data_lock=RLock(), data_1d={0: fr}, publication_store=None,
+        data_lock=RLock(), viewer_rows_1d={0: fr}, publication_store=None,
         _bkg_xye=(x, np.array([1.0, 2.0, 3.0])))   # XYE Set BG result
     payload = _xye_plot_payload(host, _img_state([0]))
     assert payload is not None and len(payload.traces) == 1
@@ -4774,7 +4756,7 @@ def test_processed_image_viewer_keeps_baked_nan_mask_visible():
     raw = np.array([[10.0, np.nan], [20.0, 30.0]])
     host = SimpleNamespace(
         data_lock=RLock(),
-        data_2d={1: {"map_raw": raw, "thumbnail": None}},
+        viewer_rows_2d={1: {"map_raw": raw, "thumbnail": None}},
         _viewer_is_xdart=True,
     )
     payload = _image_viewer_raw_payload(host, _img_state([1]))
@@ -4875,8 +4857,8 @@ def test_update_renders_blank_on_empty_no_data_instead_of_leaving_stale():
         _updated=lambda: False,
         _live_mode=lambda: Mode.IMAGE_VIEWER,   # skips INT-mode axis setup
         data_lock=RLock(),
-        data_1d={},
-        data_2d={},
+        viewer_rows_1d={},
+        viewer_rows_2d={},
         clear_plot_view=lambda: calls.append("plot"),
         clear_image_view=lambda: calls.append("image"),
         clear_binned_view=lambda: calls.append("cake"),
@@ -4907,8 +4889,8 @@ def _plot_host(method="Overlay"):
         idxs=[1],
         idxs_1d=[1],
         idxs_2d=[],
-        data_1d={1: object(), 2: object(), 3: object()},
-        data_2d={},
+        viewer_rows_1d={1: object(), 2: object(), 3: object()},
+        viewer_rows_2d={},
         plot_data=[np.zeros(0), np.zeros(0)],
         plot_data_range=[[0, 0], [0, 0]],
         frame_names=[],
@@ -4934,7 +4916,7 @@ def _plot_host(method="Overlay"):
         x = np.array([0.0, 1.0]) + host.ui.plotUnit.currentIndex() * 10.0
         rows = np.vstack([
             np.array([float(idx), float(idx) + 0.5])
-            for idx in ids if int(idx) in host.data_1d
+            for idx in ids if int(idx) in host.viewer_rows_1d
         ])
         if rows.shape[0] == 1:
             rows = rows[0]
@@ -5014,7 +4996,7 @@ def test_overlay_live_tail_rows_keep_matching_tail_labels_after_store_cap():
     host._processing_active = True
     host.idxs = list(range(1, 101))
     host.idxs_1d = list(range(37, 101))
-    host.data_1d = {idx: object() for idx in host.idxs_1d}
+    host.viewer_rows_1d = {idx: object() for idx in host.idxs_1d}
     host.plot_data = [
         np.array([0.0, 1.0]),
         np.vstack([np.array([float(i), float(i) + 0.5]) for i in range(1, 37)]),
@@ -5585,8 +5567,8 @@ def test_xye_loader_defaults_unprefixed_files_to_q(monkeypatch, tmp_path):
     viewer = SimpleNamespace(
         dirname=str(tmp_path),
         data_lock=RLock(),
-        data_1d={},
-        data_2d={},
+        viewer_rows_1d={},
+        viewer_rows_2d={},
         frame_ids=[],
         ui=SimpleNamespace(
             listScans=SimpleNamespace(
@@ -5606,9 +5588,9 @@ def test_xye_loader_defaults_unprefixed_files_to_q(monkeypatch, tmp_path):
     H5Viewer._load_xye_files(viewer)
     H5Viewer._load_xye_files(viewer)
 
-    assert viewer.data_1d[1].int_1d.unit == "q_A^-1"
-    assert viewer.data_1d[2].int_1d.unit == "2th_deg"
-    assert viewer.data_1d[3].int_1d.unit == "q_A^-1"
+    assert viewer.viewer_rows_1d[1].int_1d.unit == "q_A^-1"
+    assert viewer.viewer_rows_1d[2].int_1d.unit == "2th_deg"
+    assert viewer.viewer_rows_1d[3].int_1d.unit == "q_A^-1"
     assert len(reads) == 3
 
 
@@ -5955,7 +5937,7 @@ def test_reintegrate_live_processes_one_frame_at_a_time(monkeypatch):
             max_cores=4, frames=_Frames(), scan_lock=threading.RLock(),
             data_file='x.nxs', save_to_nexus=lambda **k: None)
         host = SimpleNamespace(
-            data_lock=threading.RLock(), data_1d={}, data_2d={},
+            data_lock=threading.RLock(), viewer_rows_1d={}, viewer_rows_2d={},
             publication_store=None, scan=scan, stop_requested=False,
             reintegrate_live=live,
             update=SimpleNamespace(emit=lambda *a, **k: None),
@@ -6005,7 +5987,7 @@ def test_reintegrate_skips_vanished_frame_without_crashing(monkeypatch):
         max_cores=1, frames=_Frames(), scan_lock=threading.RLock(),
         data_file='x.nxs', save_to_nexus=lambda **k: None)
     host = SimpleNamespace(
-        data_lock=threading.RLock(), data_1d={}, data_2d={},
+        data_lock=threading.RLock(), viewer_rows_1d={}, viewer_rows_2d={},
         publication_store=None, scan=scan, stop_requested=False,
         reintegrate_live=True,
         update=SimpleNamespace(emit=lambda *a, **k: None),
@@ -6055,7 +6037,7 @@ def test_reintegrate_drops_map_raw_and_2d_slab_for_ram(monkeypatch):
         scan.frames.evict_persisted_beyond_cap()
 
     host = SimpleNamespace(
-        data_lock=threading.RLock(), data_1d={}, data_2d={},
+        data_lock=threading.RLock(), viewer_rows_1d={}, viewer_rows_2d={},
         publication_store=None, scan=scan, stop_requested=False,
         reintegrate_live=True,
         update=SimpleNamespace(emit=lambda *a, **k: None),
@@ -6101,7 +6083,7 @@ def test_reintegrate_streams_batches_then_finalizes_shadow(monkeypatch):
         data_file='x.nxs', skip_2d=False,
     )
     host = SimpleNamespace(
-        data_lock=threading.RLock(), data_1d={}, data_2d={},
+        data_lock=threading.RLock(), viewer_rows_1d={}, viewer_rows_2d={},
         publication_store=None, scan=scan, stop_requested=False,
         reintegrate_live=False,
         update=SimpleNamespace(emit=lambda *a, **k: None),
@@ -6156,7 +6138,7 @@ def test_reintegrate_excludes_publication_dropped_frame_from_finalize(monkeypatc
         data_file='x.nxs', skip_2d=False,
     )
     host = SimpleNamespace(
-        data_lock=threading.RLock(), data_1d={}, data_2d={},
+        data_lock=threading.RLock(), viewer_rows_1d={}, viewer_rows_2d={},
         publication_store=None, scan=scan, stop_requested=False,
         reintegrate_live=False,
         update=SimpleNamespace(emit=lambda *a, **k: None),
@@ -6206,7 +6188,7 @@ def test_reintegrate_live_batches_shadow_writes_on_a_cadence(monkeypatch):
         data_file='x.nxs', skip_2d=False,
     )
     host = SimpleNamespace(
-        data_lock=threading.RLock(), data_1d={}, data_2d={},
+        data_lock=threading.RLock(), viewer_rows_1d={}, viewer_rows_2d={},
         publication_store=None, scan=scan, stop_requested=False,
         reintegrate_live=True,
         update=SimpleNamespace(emit=lambda *a, **k: None),
@@ -6257,7 +6239,7 @@ def test_reintegrate_all_frames_dropped_skips_swap_gracefully(monkeypatch):
         data_file='x.nxs', skip_2d=False,
     )
     host = SimpleNamespace(
-        data_lock=threading.RLock(), data_1d={}, data_2d={},
+        data_lock=threading.RLock(), viewer_rows_1d={}, viewer_rows_2d={},
         publication_store=None, scan=scan, stop_requested=False,
         reintegrate_live=False,
         update=SimpleNamespace(emit=lambda *a, **k: None),
@@ -6304,7 +6286,7 @@ def test_reintegrate_stop_drops_shadow_without_finalize(monkeypatch):
         data_file='x.nxs', skip_2d=False,
     )
     host = SimpleNamespace(
-        data_lock=threading.RLock(), data_1d={}, data_2d={},
+        data_lock=threading.RLock(), viewer_rows_1d={}, viewer_rows_2d={},
         publication_store=None, scan=scan, stop_requested=False,
         reintegrate_live=True,
         update=SimpleNamespace(emit=lambda *a, **k: None),
@@ -6534,18 +6516,18 @@ def test_processed_image_viewer_falls_back_to_thumbnail(tmp_path):
         ds.attrs["dtype"] = "uint8"
 
     viewer = SimpleNamespace(
-        _viewer_is_xdart=True, data_lock=RLock(), data_1d={}, data_2d={},
+        _viewer_is_xdart=True, data_lock=RLock(), viewer_rows_1d={}, viewer_rows_2d={},
     )
     loaded = H5Viewer._load_single_frame(
         viewer, str(path), frame_idx=5, frame_id=5,
     )
 
     assert loaded is True
-    assert viewer.data_2d[5]["map_raw"].shape == (3, 4)
+    assert viewer.viewer_rows_2d[5]["map_raw"].shape == (3, 4)
     expected = 10.0 + (128 / 255) * 10.0   # dequantize(128, vmin=10, vmax=20)
-    np.testing.assert_allclose(viewer.data_2d[5]["map_raw"], expected)
+    np.testing.assert_allclose(viewer.viewer_rows_2d[5]["map_raw"], expected)
     # Stored as a thumbnail so the renderer won't re-apply a flat mask.
-    np.testing.assert_allclose(viewer.data_2d[5]["thumbnail"], expected)
+    np.testing.assert_allclose(viewer.viewer_rows_2d[5]["thumbnail"], expected)
 
 
 def test_image_viewer_single_raw_file_gets_selectable_frame(tmp_path):
@@ -6555,8 +6537,8 @@ def test_image_viewer_single_raw_file_gets_selectable_frame(tmp_path):
 
     viewer = SimpleNamespace(
         data_lock=RLock(),
-        data_1d={},
-        data_2d={},
+        viewer_rows_1d={},
+        viewer_rows_2d={},
         frame_ids=[],
         ui=SimpleNamespace(listData=_FakeListWidget()),
         _raw_cache_order=[],
@@ -6576,7 +6558,7 @@ def test_image_viewer_single_raw_file_gets_selectable_frame(tmp_path):
     assert viewer.ui.listData.item(0).text() == "1"
     assert viewer.ui.listData.selectedItems()[0].text() == "1"
     assert viewer.frame_ids == ["1"]
-    np.testing.assert_array_equal(viewer.data_2d[1]["map_raw"], raw)
+    np.testing.assert_array_equal(viewer.viewer_rows_2d[1]["map_raw"], raw)
     assert viewer.sigUpdate.emitted == [()]
 
 
@@ -6640,8 +6622,8 @@ def test_raw_preview_does_not_lazy_load_on_gui_data_access():
         viewer_mode="image",
         idxs_2d=[1],
         data_lock=RLock(),
-        data_1d={1: frame},
-        data_2d={1: {"map_raw": None, "thumbnail": np.ones((2, 2))}},
+        viewer_rows_1d={1: frame},
+        viewer_rows_2d={1: {"map_raw": None, "thumbnail": np.ones((2, 2))}},
         normalize=lambda arr, _info: arr,
     )
     host._snapshot_data = MethodType(DisplayDataMixin._snapshot_data, host)
@@ -6656,8 +6638,8 @@ def test_map_raw_masks_eiger_sentinel_before_display_average():
         viewer_mode="image",
         idxs_2d=[1],
         data_lock=RLock(),
-        data_1d={1: SimpleNamespace(scan_info={})},
-        data_2d={1: {"map_raw": raw, "bg_raw": 0, "thumbnail": None}},
+        viewer_rows_1d={1: SimpleNamespace(scan_info={})},
+        viewer_rows_2d={1: {"map_raw": raw, "bg_raw": 0, "thumbnail": None}},
         normalize=lambda arr, _info: arr,
     )
     host._snapshot_data = MethodType(DisplayDataMixin._snapshot_data, host)
@@ -6677,8 +6659,8 @@ def test_scan_snapshot_ignores_legacy_mirror_when_store_is_active():
         viewer_mode=None,
         publication_store=PublicationStore(),
         data_lock=RLock(),
-        data_1d={1: stale},
-        data_2d={1: {"int_2d": object()}},
+        viewer_rows_1d={1: stale},
+        viewer_rows_2d={1: {"int_2d": object()}},
     )
     host._snapshot_data = MethodType(DisplayDataMixin._snapshot_data, host)
 
@@ -6692,8 +6674,8 @@ def test_viewer_snapshot_keeps_legacy_file_rows():
         viewer_mode="image",
         publication_store=None,
         data_lock=RLock(),
-        data_1d={1: stale},
-        data_2d={1: two_d},
+        viewer_rows_1d={1: stale},
+        viewer_rows_2d={1: two_d},
     )
     host._snapshot_data = MethodType(DisplayDataMixin._snapshot_data, host)
 
@@ -6707,7 +6689,7 @@ def test_normal_raw_display_all_sentinel_image_clears_safely():
         frame_ids=["1"],
         idxs_2d=[1],
         data_lock=RLock(),
-        data_2d={1: {"mask": None}},
+        viewer_rows_2d={1: {"mask": None}},
         scan=SimpleNamespace(global_mask=None),
         bkg_map_raw=0,
         get_frames_map_raw=lambda **kwargs: (
@@ -6727,8 +6709,8 @@ def test_overall_preview_prefers_bounded_thumbnail_data():
         viewer_mode="image",
         idxs_2d=[1],
         data_lock=RLock(),
-        data_1d={1: frame},
-        data_2d={1: {"map_raw": np.full((8, 8), 9.0),
+        viewer_rows_1d={1: frame},
+        viewer_rows_2d={1: {"map_raw": np.full((8, 8), 9.0),
                      "thumbnail": np.ones((2, 2))}},
         normalize=lambda arr, _info: arr,
     )
@@ -6742,8 +6724,8 @@ def test_overall_preview_requires_all_requested_frames_when_strict():
     host = SimpleNamespace(
         idxs_2d=[1, 2],
         data_lock=RLock(),
-        data_1d={1: frame},
-        data_2d={1: {"map_raw": None, "thumbnail": np.ones((2, 2))}},
+        viewer_rows_1d={1: frame},
+        viewer_rows_2d={1: {"map_raw": None, "thumbnail": np.ones((2, 2))}},
         normalize=lambda arr, _info: arr,
     )
     host._snapshot_data = MethodType(DisplayDataMixin._snapshot_data, host)
@@ -6767,8 +6749,8 @@ def test_overall_2d_requires_all_requested_frames_when_strict():
     host = SimpleNamespace(
         idxs_2d=[1, 2],
         data_lock=RLock(),
-        data_1d={1: frame},
-        data_2d={1: {"int_2d": result, "gi_2d": {}}},
+        viewer_rows_1d={1: frame},
+        viewer_rows_2d={1: {"int_2d": result, "gi_2d": {}}},
         get_int_2d=lambda int_2d, frame_1d, gi_2d=None: int_2d.intensity,
         get_xydata=lambda int_2d, gi_2d=None, frame=None: (
             int_2d.radial, int_2d.azimuthal,
@@ -6794,8 +6776,8 @@ def test_map_raw_reports_thumbnail_source():
         viewer_mode="image",
         idxs_2d=[1],
         data_lock=RLock(),
-        data_1d={1: frame},
-        data_2d={1: {"map_raw": None, "thumbnail": np.ones((2, 2))}},
+        viewer_rows_1d={1: frame},
+        viewer_rows_2d={1: {"map_raw": None, "thumbnail": np.ones((2, 2))}},
         normalize=lambda arr, _info: arr,
     )
     host._snapshot_data = MethodType(DisplayDataMixin._snapshot_data, host)
@@ -6814,10 +6796,11 @@ def test_thumbnail_image_update_skips_full_detector_flat_mask():
     calls = []
     host = SimpleNamespace(
         overall=False,
+        viewer_mode="image",
         frame_ids=[1],
         idxs_2d=[1],
         data_lock=RLock(),
-        data_2d={1: {"mask": np.array([0], dtype=int)}},
+        viewer_rows_2d={1: {"mask": np.array([0], dtype=int)}},
         scan=SimpleNamespace(global_mask=np.array([1], dtype=int)),
         bkg_map_raw=0,
         # no _raw_full_shape -> the gap mask can't be mapped -> skipped
@@ -6841,10 +6824,11 @@ def test_full_res_raw_masks_in_range_indices_despite_out_of_range():
     calls = []
     host = SimpleNamespace(
         overall=False,
+        viewer_mode="image",
         frame_ids=[1],
         idxs_2d=[1],
         data_lock=RLock(),
-        data_2d={1: {"mask": np.array([0], dtype=int)}},        # in-range
+        viewer_rows_2d={1: {"mask": np.array([0], dtype=int)}},        # in-range
         scan=SimpleNamespace(global_mask=np.array([3, 999], dtype=int)),  # 3 in, 999 OOB
         bkg_map_raw=0,
         get_frames_map_raw=lambda **kwargs: (np.ones((2, 2)), "raw"),
@@ -6859,29 +6843,29 @@ def test_full_res_raw_masks_in_range_indices_despite_out_of_range():
 
 
 class _AttrDict(dict):
-    """data_2d stand-in that, like FixSizeOrderedDict, can carry the shared
+    """viewer_rows_2d stand-in that, like FixSizeOrderedDict, can carry the shared
     hydrated-raw order attribute (plain dicts cannot)."""
 
 
-def _hydrated_order(data_2d):
-    return list(getattr(data_2d, "_hydrated_raw_order", []))
+def _hydrated_order(viewer_rows_2d):
+    return list(getattr(viewer_rows_2d, "_viewer_raw_lru_order", []))
 
 
-def test_hydrated_raw_cache_evicts_only_full_resolution_payload():
+def test_viewer_raw_lru_cache_evicts_only_full_resolution_payload():
     viewer = SimpleNamespace(
         data_lock=RLock(),
         _raw_cache_limit=2,
-        data_2d=_AttrDict({
+        viewer_rows_2d=_AttrDict({
             idx: {"map_raw": np.full((4, 4), idx), "thumbnail": np.ones((2, 2))}
             for idx in (1, 2, 3)
         }),
     )
-    viewer._remember_hydrated_raw = MethodType(H5Viewer._remember_hydrated_raw, viewer)
+    viewer._remember_viewer_raw_lru = MethodType(H5Viewer._remember_viewer_raw_lru, viewer)
     for idx in (1, 2, 3):
-        viewer._remember_hydrated_raw(idx)
-    assert _hydrated_order(viewer.data_2d) == [2, 3]
-    assert viewer.data_2d[1]["map_raw"] is None
-    assert viewer.data_2d[1]["thumbnail"] is not None
+        viewer._remember_viewer_raw_lru(idx)
+    assert _hydrated_order(viewer.viewer_rows_2d) == [2, 3]
+    assert viewer.viewer_rows_2d[1]["map_raw"] is None
+    assert viewer.viewer_rows_2d[1]["thumbnail"] is not None
 
 
 def test_image_viewer_raw_cache_evicts_reloadable_unselected_rows():
@@ -6890,75 +6874,75 @@ def test_image_viewer_raw_cache_evicts_reloadable_unselected_rows():
         _raw_cache_limit=2,
         viewer_mode="image",
         frame_ids=[],
-        data_1d={},
-        data_2d=_AttrDict(),
+        viewer_rows_1d={},
+        viewer_rows_2d=_AttrDict(),
     )
-    viewer._remember_hydrated_raw = MethodType(H5Viewer._remember_hydrated_raw, viewer)
+    viewer._remember_viewer_raw_lru = MethodType(H5Viewer._remember_viewer_raw_lru, viewer)
 
     for idx in (1, 2, 3, 4):
         viewer.frame_ids = [str(idx)]
-        viewer.data_1d[idx] = SimpleNamespace(map_raw=np.full((2, 2), idx))
-        viewer.data_2d[idx] = {"map_raw": np.full((2, 2), idx)}
-        viewer._remember_hydrated_raw(idx)
+        viewer.viewer_rows_1d[idx] = SimpleNamespace(map_raw=np.full((2, 2), idx))
+        viewer.viewer_rows_2d[idx] = {"map_raw": np.full((2, 2), idx)}
+        viewer._remember_viewer_raw_lru(idx)
 
-    assert sorted(viewer.data_1d) == [3, 4]
-    assert sorted(viewer.data_2d) == [3, 4]
-    assert _hydrated_order(viewer.data_2d) == [3, 4]
+    assert sorted(viewer.viewer_rows_1d) == [3, 4]
+    assert sorted(viewer.viewer_rows_2d) == [3, 4]
+    assert _hydrated_order(viewer.viewer_rows_2d) == [3, 4]
 
     # If the user has an older row selected while a newer one hydrates, keep
     # the selected image resident and evict the oldest unselected row instead.
     viewer.frame_ids = ["3"]
-    viewer.data_1d[5] = SimpleNamespace(map_raw=np.full((2, 2), 5))
-    viewer.data_2d[5] = {"map_raw": np.full((2, 2), 5)}
-    viewer._remember_hydrated_raw(5)
-    assert sorted(viewer.data_1d) == [3, 5]
-    assert sorted(viewer.data_2d) == [3, 5]
-    assert _hydrated_order(viewer.data_2d) == [3, 5]
+    viewer.viewer_rows_1d[5] = SimpleNamespace(map_raw=np.full((2, 2), 5))
+    viewer.viewer_rows_2d[5] = {"map_raw": np.full((2, 2), 5)}
+    viewer._remember_viewer_raw_lru(5)
+    assert sorted(viewer.viewer_rows_1d) == [3, 5]
+    assert sorted(viewer.viewer_rows_2d) == [3, 5]
+    assert _hydrated_order(viewer.viewer_rows_2d) == [3, 5]
 
 
-def test_hydrated_raw_cache_reset_clears_order():
-    data_2d = _AttrDict()
-    data_2d._hydrated_raw_order = [1, 2, 3]
-    viewer = SimpleNamespace(data_2d=data_2d)
+def test_viewer_raw_lru_cache_reset_clears_order():
+    viewer_rows_2d = _AttrDict()
+    viewer_rows_2d._viewer_raw_lru_order = [1, 2, 3]
+    viewer = SimpleNamespace(viewer_rows_2d=viewer_rows_2d)
     viewer._clear_raw_cache = MethodType(H5Viewer._clear_raw_cache, viewer)
     viewer._clear_raw_cache()
-    assert _hydrated_order(data_2d) == []
+    assert _hydrated_order(viewer_rows_2d) == []
 
 
-def test_hydrated_raw_lru_is_shared_with_thread_insert_paths():
+def test_viewer_raw_lru_lru_is_shared_with_thread_insert_paths():
     """D5: the reintegrate-publish and full-reload worker paths trim the
-    SAME LRU as the GUI — order state rides on the shared data_2d object."""
-    from xdart.gui.tabs.static_scan.hydrated_raw import remember_hydrated_raw
+    SAME LRU as the GUI — order state rides on the shared viewer_rows_2d object."""
+    from xdart.gui.tabs.static_scan.viewer_raw_lru import remember_viewer_raw_lru
 
-    data_2d = _AttrDict()
+    viewer_rows_2d = _AttrDict()
     # GUI hydrates 1..2, then a worker path hydrates 3..4 (limit 3): the
     # worker's inserts must evict the GUI's oldest, not pile up past the cap.
     for idx in (1, 2):
-        data_2d[idx] = {"map_raw": np.full((2, 2), idx)}
-        remember_hydrated_raw(data_2d, idx, limit=3)
+        viewer_rows_2d[idx] = {"map_raw": np.full((2, 2), idx)}
+        remember_viewer_raw_lru(viewer_rows_2d, idx, limit=3)
     for idx in (3, 4):
-        data_2d[idx] = {"map_raw": np.full((2, 2), idx)}
-        remember_hydrated_raw(data_2d, idx, limit=3)
-    assert _hydrated_order(data_2d) == [2, 3, 4]
-    assert data_2d[1]["map_raw"] is None
-    hydrated = [i for i in (1, 2, 3, 4) if data_2d[i]["map_raw"] is not None]
+        viewer_rows_2d[idx] = {"map_raw": np.full((2, 2), idx)}
+        remember_viewer_raw_lru(viewer_rows_2d, idx, limit=3)
+    assert _hydrated_order(viewer_rows_2d) == [2, 3, 4]
+    assert viewer_rows_2d[1]["map_raw"] is None
+    hydrated = [i for i in (1, 2, 3, 4) if viewer_rows_2d[i]["map_raw"] is not None]
     assert hydrated == [2, 3, 4]
 
 
 def test_reintegrate_publish_updates_publication_store_not_legacy_raw_mirror():
-    """Reintegration publishes through the store, not the old data_2d mirror."""
+    """Reintegration publishes through the store, not the old viewer_rows_2d mirror."""
     from xdart.gui.tabs.static_scan.scan_threads import integratorThread
 
-    data_2d = _AttrDict({
+    viewer_rows_2d = _AttrDict({
         idx: {"map_raw": np.full((2, 2), idx)} for idx in range(8)
     })
-    data_2d._hydrated_raw_order = list(range(8))
+    viewer_rows_2d._viewer_raw_lru_order = list(range(8))
     upserts = []
     updates = []
     host = SimpleNamespace(
         data_lock=RLock(),
-        data_1d={},
-        data_2d=data_2d,
+        viewer_rows_1d={},
+        viewer_rows_2d=viewer_rows_2d,
         _upsert_publication_for_frame=lambda frame: upserts.append(frame.idx),
         update=SimpleNamespace(emit=lambda idx: updates.append(idx)),
     )
@@ -6972,9 +6956,9 @@ def test_reintegrate_publish_updates_publication_store_not_legacy_raw_mirror():
     )
     assert upserts == [8]
     assert updates == [8]
-    assert 8 not in data_2d
-    assert data_2d[0]["map_raw"] is not None
-    assert len(_hydrated_order(data_2d)) == 8
+    assert 8 not in viewer_rows_2d
+    assert viewer_rows_2d[0]["map_raw"] is not None
+    assert len(_hydrated_order(viewer_rows_2d)) == 8
 
 
 def _wrangler_host(mode_text, *, live=False, batch=False):
@@ -7348,7 +7332,7 @@ def _build_real_wrangler(cls):
     scan = SimpleNamespace(
         skip_2d=None, bai_1d_args={}, bai_2d_args={},
         scan_lock=threading.RLock(), gi=False, poni_file='', name='null_main')
-    return cls("test", threading.Condition(), scan, {}, {})
+    return cls("test", threading.Condition(), scan)
 
 
 def test_real_wrangler_run_lock_disables_tree_and_keeps_values():

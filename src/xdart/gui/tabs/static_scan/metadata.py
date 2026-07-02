@@ -27,7 +27,7 @@ class metadataWidget(Qt.QtWidgets.QWidget):
         update: Updates the data displayed
     """
     def __init__(self, scan, frame, frame_ids, frames, parent=None,
-                 data_1d=None, publication_store=None, data_lock=None):
+                 viewer_rows_1d=None, publication_store=None, data_lock=None):
         super().__init__(parent)
         self.layout = Qt.QtWidgets.QVBoxLayout()
         self.layout.setContentsMargins(0, 0, 0, 0)
@@ -40,12 +40,12 @@ class metadataWidget(Qt.QtWidgets.QWidget):
         self.frame = frame
         self.frame_ids = frame_ids
         self.frames = frames
-        # O4: data_1d lets us pull scan_info for whichever frame is
+        # O4: viewer_rows_1d lets us pull scan_info for whichever frame is
         # currently selected, not the persistent placeholder ``frame``
         # (which stays at its constructor default unless the wrangler
         # happens to repurpose it).  Keeping the placeholder as a
         # fallback for legacy code paths.
-        self.data_1d = data_1d
+        self.viewer_rows_1d = viewer_rows_1d
         self.publication_store = publication_store
         self.data_lock = data_lock if data_lock is not None else threading.RLock()
         self.viewer_mode = None
@@ -83,7 +83,7 @@ class metadataWidget(Qt.QtWidgets.QWidget):
             # the metadata source for every mode now — live integration AND the
             # Image/XYE/NeXus viewers all mirror their selected-row metadata into
             # it.  This frame fallback reads only the in-memory ``frames`` browse
-            # cache; the ``data_1d`` mirror is no longer consulted here.
+            # cache.
             if sel_int in self.frames:
                 return self.frames[sel_int]
         # Fallback to the placeholder if it's been populated for this

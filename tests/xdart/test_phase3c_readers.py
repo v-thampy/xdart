@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Phase 3c: display readers resolve a frame's metadata store-first, with the
-in-memory frames cache then the legacy data_1d mirror as fallbacks."""
+in-memory frames cache and viewer-scoped rows as mode-appropriate fallbacks."""
 from types import SimpleNamespace, MethodType
 
 from xdart.gui.tabs.static_scan.display_plot import DisplayPlotMixin
@@ -28,22 +28,27 @@ def _store_with(label, info):
 def test_frame_scan_info_prefers_the_store():
     h = _holder(publication_store=_store_with(5, {"epoch": 100.0, "th": 0.2}),
                 frames={5: SimpleNamespace(scan_info={"epoch": -1.0})},
-                data_1d={5: SimpleNamespace(scan_info={"epoch": -2.0})})
+                viewer_rows_1d={5: SimpleNamespace(scan_info={"epoch": -2.0})})
     assert h._frame_scan_info(5)["epoch"] == 100.0      # store wins
 
 
-def test_frame_scan_info_falls_back_to_frames_then_data_1d():
+def test_frame_scan_info_falls_back_to_frames_then_viewer_rows_1d():
     # not in store -> in-memory frames cache
     h = _holder(publication_store=PublicationStore(),
                 frames={7: SimpleNamespace(scan_info={"epoch": 9.0})},
-                data_1d={})
+                viewer_rows_1d={})
     assert h._frame_scan_info(7)["epoch"] == 9.0
-    # no store, not in frames -> legacy data_1d mirror
+    # no store, not in frames -> scan mode does not consult viewer rows.
     h2 = _holder(publication_store=None, frames={},
-                 data_1d={9: SimpleNamespace(scan_info={"epoch": 3.0})})
-    assert h2._frame_scan_info(9)["epoch"] == 3.0
+                 viewer_rows_1d={9: SimpleNamespace(scan_info={"epoch": 3.0})})
+    assert h2._frame_scan_info(9) == {}
+
+    # Viewer modes may still consult their own row table.
+    h3 = _holder(publication_store=None, frames={}, viewer_mode="xye",
+                 viewer_rows_1d={9: SimpleNamespace(scan_info={"epoch": 3.0})})
+    assert h3._frame_scan_info(9)["epoch"] == 3.0
 
 
 def test_frame_scan_info_empty_when_nothing_found():
-    h = _holder(publication_store=None, frames={}, data_1d={})
+    h = _holder(publication_store=None, frames={}, viewer_rows_1d={})
     assert h._frame_scan_info(1) == {}

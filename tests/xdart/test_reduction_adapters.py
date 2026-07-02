@@ -896,7 +896,6 @@ def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None
     scan._cached_integrator = _FakeIntegrator()
     scan.global_mask = np.array([3])
 
-    data_1d = {}
     store = PublicationStore()
     thread = integratorThread(
         scan,
@@ -904,8 +903,6 @@ def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None
         None,
         None,
         [0],
-        data_1d,
-        {},
         publication_store=store,
     )
     thread.bai_1d_SI()
@@ -914,7 +911,6 @@ def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None
     assert calls[0][0].integration_1d.monitor_key == "i0"
     assert calls[0][2]["scan_name"] == "scan"
     assert frame.int_1d is not None
-    assert data_1d == {}
     pub = store.get(0)
     assert pub is not None
     np.testing.assert_allclose(pub.view.intensity_1d, frame.int_1d.intensity)
@@ -950,8 +946,6 @@ def test_single_frame_2d_reintegration_is_2d_only(monkeypatch) -> None:
     frame.int_1d = good_1d
     scan = LiveScan("scan", frames=[frame])
     scan._cached_integrator = _FakeIntegrator()
-    data_1d = {}
-    data_2d = {}
     store = PublicationStore()
     thread = integratorThread(
         scan,
@@ -959,8 +953,6 @@ def test_single_frame_2d_reintegration_is_2d_only(monkeypatch) -> None:
         None,
         None,
         [0],
-        data_1d,
-        data_2d,
         publication_store=store,
     )
 
@@ -973,8 +965,6 @@ def test_single_frame_2d_reintegration_is_2d_only(monkeypatch) -> None:
     # The pre-existing good 1D survives untouched; the 2D is fresh.
     assert frame.int_1d is good_1d
     assert frame.int_2d is not None
-    assert data_1d == {}
-    assert data_2d == {}
     pub = store.get(0)
     assert pub is not None
     np.testing.assert_allclose(pub.view.intensity_2d, frame.int_2d.intensity.T)
@@ -1067,7 +1057,7 @@ def test_reintegrate_prep_stamps_uint32_bad_pixel_mask() -> None:
     scan = LiveScan("scan", frames=[frame])
     scan.static = False
     scan.gi = False
-    thread = integratorThread(scan, None, None, None, [0], {}, {})
+    thread = integratorThread(scan, None, None, None, [0])
     # Default: Mask Saturated ON -> the dummy is stamped
     out = thread._prepare_frame_for_headless_reduction(frame)
     assert out.mask is not None
@@ -1112,7 +1102,7 @@ def test_maybe_flag_unsavable_detects_axis_change_at_same_npt() -> None:
 
     scan = LiveScan(
         "scan", frames=[LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())])
-    thread = integratorThread(scan, None, None, None, [0], {}, {})
+    thread = integratorThread(scan, None, None, None, [0])
 
     def _frame_with_axis(lo, hi):
         f = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
@@ -1166,7 +1156,7 @@ def test_reintegrate_all_refreshes_publication_store(monkeypatch) -> None:
     store = PublicationStore()
 
     thread = integratorThread(
-        scan, None, None, None, [0], {}, {},
+        scan, None, None, None, [0],
         publication_store=store,
     )
     thread._prepare_reintegrate_shadow = lambda: None
@@ -1204,8 +1194,6 @@ def test_reintegrate_close_surfaces_write_failure() -> None:
         None,
         None,
         [],
-        {},
-        {},
     )
     messages: list[str] = []
     thread.writeError.connect(messages.append)

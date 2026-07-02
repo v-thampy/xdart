@@ -762,6 +762,8 @@ All four regressions are fixed and gated offscreen; the flip is not declared ful
 cleared until the live checkpoint is rerun.
 
 **What changed in the flip.**
+- H9/8b retired the scan-display `data_1d`/`data_2d`/`hydrated_raw` mirrors; Int
+  display reads are store-only, while Image/XYE/NeXus keep viewer-scoped row stores.
 - The V2-to-legacy Int write-through bridge is retired. Int edits no longer mirror
   into hidden legacy line edits/combos as the state carrier.
 - The embedded legacy Int widgets remain alive only for delegated actions that still

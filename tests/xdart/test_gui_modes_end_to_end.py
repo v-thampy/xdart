@@ -66,9 +66,9 @@ def widget(qapp):
 def _set_image_frame(w, idx, raw):
     """Put one raw frame into the shared viewer dicts + select it."""
     with w.data_lock:
-        w.data_1d.clear()
-        w.data_2d.clear()
-        w.data_2d[idx] = {"map_raw": raw, "bg_raw": 0, "mask": None,
+        w.viewer_rows_1d.clear()
+        w.viewer_rows_2d.clear()
+        w.viewer_rows_2d[idx] = {"map_raw": raw, "bg_raw": 0, "mask": None,
                           "int_2d": None, "gi_2d": {}, "thumbnail": None}
     w.frame_ids[:] = [str(idx)]
     w.displayframe.idxs_2d = [idx]
@@ -124,8 +124,8 @@ def test_xye_to_image_transition_renders(widget):
 
     w._on_viewer_mode_changed("image")
     assert w.displayframe.viewer_mode == "image"
-    # data_2d/frame_ids were cleared by the transition cleanup.
-    assert len(w.data_2d) == 0
+    # viewer_rows_2d/frame_ids were cleared by the transition cleanup.
+    assert len(w.viewer_rows_2d) == 0
 
     raw = np.arange(36, dtype=float).reshape(6, 6)
     _set_image_frame(w, 0, raw)
@@ -143,7 +143,7 @@ def test_image_viewer_idxs_ignore_stale_scan_frames(widget):
     ``len(frame_ids) == len(scan.frames.index)``, which flips
     ``resolve_selection``'s ``overall`` heuristic True and rebases the
     selection onto the stale scan labels.  Those don't intersect the
-    viewer's loaded ``data_2d`` keys, so ``idxs_2d`` comes back empty and
+    viewer's loaded ``viewer_rows_2d`` keys, so ``idxs_2d`` comes back empty and
     the panel renders blank — even though the image loaded fine.  Reached
     any other way (``scan.frames`` empty) it renders, which is the exact
     asymmetry reported.  ``get_idxs`` must ignore ``scan.frames`` in viewer
@@ -163,10 +163,10 @@ def test_image_viewer_idxs_ignore_stale_scan_frames(widget):
     )
     raw = np.arange(36, dtype=float).reshape(6, 6)
     with df.data_lock:
-        df.data_1d.clear()
-        df.data_2d.clear()
+        df.viewer_rows_1d.clear()
+        df.viewer_rows_2d.clear()
         for k in (1, 2, 3):
-            df.data_2d[k] = {"map_raw": raw, "bg_raw": 0, "mask": None,
+            df.viewer_rows_2d[k] = {"map_raw": raw, "bg_raw": 0, "mask": None,
                              "int_2d": None, "gi_2d": {}, "thumbnail": None}
     df.frame_ids[:] = ["1", "2", "3"]
 
@@ -244,8 +244,8 @@ def test_image_viewer_no_selection_clears_panel(widget):
     w._on_viewer_mode_changed("image")
     df = w.displayframe
     with w.data_lock:
-        w.data_1d.clear()
-        w.data_2d.clear()
+        w.viewer_rows_1d.clear()
+        w.viewer_rows_2d.clear()
     w.frame_ids[:] = []
     df.idxs_2d = []
     df.update()
@@ -1240,10 +1240,10 @@ def _set_xye_frames(w, frames):
     ``frames``: list of ``(idx, source_file, radial, intensity)``.
     """
     with w.data_lock:
-        w.data_1d.clear()
-        w.data_2d.clear()
+        w.viewer_rows_1d.clear()
+        w.viewer_rows_2d.clear()
         for idx, src, radial, intensity in frames:
-            w.data_1d[idx] = SimpleNamespace(
+            w.viewer_rows_1d[idx] = SimpleNamespace(
                 int_1d=SimpleNamespace(
                     radial=np.asarray(radial, dtype=float),
                     intensity=np.asarray(intensity, dtype=float)),
@@ -1289,8 +1289,8 @@ def test_xye_viewer_empty_selection_clears_plot(widget):
     assert df.plot_data[1].shape[0] == 1
     # Deselect everything -> the plot must clear (no stale curve).
     with w.data_lock:
-        w.data_1d.clear()
-        w.data_2d.clear()
+        w.viewer_rows_1d.clear()
+        w.viewer_rows_2d.clear()
     w.frame_ids[:] = []
     df.idxs_1d = []
     df.update()
@@ -1473,9 +1473,9 @@ def test_xye_viewer_mixed_units_warns_and_labels_from_first(widget, caplog):
 def _set_nexus_row(w, idx, payload):
     """Load one NeXus preview row + select it."""
     with w.data_lock:
-        w.data_1d.clear()
-        w.data_2d.clear()
-        w.data_1d[idx] = SimpleNamespace(
+        w.viewer_rows_1d.clear()
+        w.viewer_rows_2d.clear()
+        w.viewer_rows_1d[idx] = SimpleNamespace(
             nexus_preview_payload=payload, scan_info={})
     w.frame_ids[:] = [str(idx)]
     w.displayframe.idxs_1d = [idx]
@@ -1529,7 +1529,7 @@ def test_nexus_viewer_metadata_row_clears_both(widget):
 # consistent on every render and the toggle re-renders through the payload.
 
 def _set_int_scan(w, *, n=1, wavelength_m=0.7293e-10):
-    """Populate the real widget for an Int 2D scan: data_2d + data_1d +
+    """Populate the real widget for an Int 2D scan: viewer_rows_2d + viewer_rows_1d +
     publications + a scan stub, selected, in Int 2D mode (non-GI, q-integrated)."""
     import threading
     from xrd_tools.core import IntegrationResult1D, IntegrationResult2D
@@ -1539,8 +1539,8 @@ def _set_int_scan(w, *, n=1, wavelength_m=0.7293e-10):
     chi = np.linspace(-90.0, 90.0, 4)
     w.publication_store.clear()
     with w.data_lock:
-        w.data_1d.clear()
-        w.data_2d.clear()
+        w.viewer_rows_1d.clear()
+        w.viewer_rows_2d.clear()
         for i in range(n):
             f = SimpleNamespace()
             f.idx = i
@@ -1561,9 +1561,9 @@ def _set_int_scan(w, *, n=1, wavelength_m=0.7293e-10):
                 intensity=np.ones((q.size, chi.size)) + i,
                 unit="q_A^-1", azimuthal_unit="chi_deg")
             f._get_incident_angle = lambda: 0.2
-            w.data_2d[i] = {"map_raw": f.map_raw, "bg_raw": 0, "mask": None,
+            w.viewer_rows_2d[i] = {"map_raw": f.map_raw, "bg_raw": 0, "mask": None,
                             "int_2d": f.int_2d, "gi_2d": {}, "thumbnail": None}
-            w.data_1d[i] = f
+            w.viewer_rows_1d[i] = f
             w.publication_store.upsert(publication_from_live_frame(f))
     w.frame_ids[:] = [str(i) for i in range(n)]
     df.idxs_2d = list(range(n))
@@ -1626,21 +1626,21 @@ def test_int2d_cake_clears_without_publication(widget):
     df = _set_int_scan(w, n=1)
     df.update()
     assert df.binned_data is not None
-    w.publication_store.clear()                     # data_2d kept, publications gone
+    w.publication_store.clear()                     # viewer_rows_2d kept, publications gone
     df.update()
     assert df.binned_data is None                   # cake blanked, not stale
 
 
 def test_int_scan_resolves_loaded_rows_from_publication_store(widget):
-    # Phase A: the old data_1d/data_2d mirrors are bounded recent-row caches.
+    # Phase A: the old viewer_rows_1d/viewer_rows_2d mirrors are bounded recent-row caches.
     # A frame still resident in PublicationStore must look loaded even when the
     # legacy mirrors have evicted it, otherwise the update gate would falsely
     # blank a valid scan frame.
     w = widget
     df = _set_int_scan(w, n=2)
     with w.data_lock:
-        w.data_1d.clear()
-        w.data_2d.clear()
+        w.viewer_rows_1d.clear()
+        w.viewer_rows_2d.clear()
 
     w.frame_ids[:] = ["0", "1"]
     df.frame_ids = ["0", "1"]
@@ -1655,28 +1655,24 @@ def test_int_scan_resolves_loaded_rows_from_publication_store(widget):
     assert df.binned_data is not None
 
 
-def test_scan_mode_1d_mirror_and_viewer_rows_are_bounded(widget):
+def test_viewer_rows_are_bounded_and_mode_stable(widget):
     from xdart.gui.tabs.static_scan.static_scan_widget import (
-        _DISPLAY_1D_CACHE_MAX,
-        _DISPLAY_1D_VIEWER_CACHE_MAX,
+        _VIEWER_ROWS_1D_CACHE_MAX,
     )
 
     w = widget
-    assert getattr(w.data_1d, "_max", None) == _DISPLAY_1D_CACHE_MAX
+    assert getattr(w.viewer_rows_1d, "_max", None) == _VIEWER_ROWS_1D_CACHE_MAX
 
-    for i in range(_DISPLAY_1D_CACHE_MAX + 2):
-        w.data_1d[i] = SimpleNamespace(idx=i)
-    assert len(w.data_1d) == _DISPLAY_1D_CACHE_MAX
-    assert 0 not in w.data_1d
+    for i in range(_VIEWER_ROWS_1D_CACHE_MAX + 2):
+        w.viewer_rows_1d[i] = SimpleNamespace(idx=i)
+    assert len(w.viewer_rows_1d) == _VIEWER_ROWS_1D_CACHE_MAX
+    assert 0 not in w.viewer_rows_1d
 
     w._on_viewer_mode_changed("xye")
-    assert getattr(w.data_1d, "_max", None) == _DISPLAY_1D_VIEWER_CACHE_MAX
-    for i in range(_DISPLAY_1D_VIEWER_CACHE_MAX + 2):
-        w.data_1d[i] = SimpleNamespace(idx=i)
-    assert len(w.data_1d) == _DISPLAY_1D_VIEWER_CACHE_MAX
+    assert getattr(w.viewer_rows_1d, "_max", None) == _VIEWER_ROWS_1D_CACHE_MAX
 
     w._on_viewer_mode_changed("")
-    assert getattr(w.data_1d, "_max", None) == _DISPLAY_1D_CACHE_MAX
+    assert getattr(w.viewer_rows_1d, "_max", None) == _VIEWER_ROWS_1D_CACHE_MAX
 
 
 # ── INT 1D plot characterization before update_plot cleanup ────────────────
@@ -1736,21 +1732,21 @@ def test_int_plot_native_update_plot_state(widget, method, frame_ids):
 def test_evicted_whole_scan_aggregate_without_disk_blanks_not_subset(widget, method):
     # Final Role-A cleanup: when the bounded store evicts old frames but no
     # on-disk aggregate exists (this fixture has no data_file), Sum/Average must
-    # NOT fall back to stale data_1d rows or the one store-resident row.  The
+    # NOT fall back to stale viewer_rows_1d rows or the one store-resident row.  The
     # production long-scan path is covered by test_aggregation_wiring.py and
     # routes through _whole_scan_aggregate; this stub-scan path blanks/defer.
     from xdart.modules.frame_publication import _semilight_publication
     w = widget
     df = _set_int_scan(w, n=3)
-    # Evict frames 0,1 from the STORE (drop their 1D arrays) but leave data_1d
-    # intact.  data_1d is now a transitional/viewer mirror, not an integration
+    # Evict frames 0,1 from the STORE (drop their 1D arrays) but leave viewer_rows_1d
+    # intact.  viewer_rows_1d is now a transitional/viewer mirror, not an integration
     # display authority.
     store = df.publication_store
     with store._lock:
         for i in (0, 1):
             store._items[i] = _semilight_publication(store._items[i])
     assert not store.get(0).view.has_1d and not store.get(1).view.has_1d
-    assert df.data_1d[0].int_1d is not None       # stale mirror still has it
+    assert df.viewer_rows_1d[0].int_1d is not None       # stale mirror still has it
 
     df.ui.plotMethod.setCurrentText(method)
     df.ui.plotUnit.setCurrentIndex(0)             # native Q
@@ -1807,7 +1803,7 @@ def test_average_all_nan_column_does_not_warn(widget):
         for i in range(3):
             inten = np.ones_like(q) + i
             inten[2] = np.nan                       # q-bin 2 all-NaN across frames
-            f = w.data_1d[i]
+            f = w.viewer_rows_1d[i]
             f.int_1d = IntegrationResult1D(
                 radial=q, intensity=inten, sigma=np.ones_like(q), unit="q_A^-1")
             w.publication_store.upsert(publication_from_live_frame(f))
@@ -2289,7 +2285,7 @@ def test_cake_radial_entry_converts_q_to_2theta(widget):
     df.ui.plotUnit.setCurrentIndex(0)
     df.ui.plotUnit.blockSignals(False)
 
-    frame, frame_2d = w.data_1d[0], w.data_2d[0]
+    frame, frame_2d = w.viewer_rows_1d[0], w.viewer_rows_2d[0]
     xdata, _ = df.get_int_1d(frame, frame_2d, 0)
     xdata = np.asarray(xdata, dtype=float)
     # Q 3.0 Å⁻¹ at λ=0.7293 Å → 2θ ≈ 20°, NOT the raw 3.0; degrees range is sane.

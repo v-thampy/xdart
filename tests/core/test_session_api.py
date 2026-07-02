@@ -607,7 +607,7 @@ def test_long_live_scan_record_store_plateaus_under_item_bound():
     n_frames = 5000
     heavy_cap = 64
     item_cap = 512
-    retained_kb_per_submitted_frame_budget = 0.25
+    retained_kb_per_submitted_frame_budget = 0.20
     store = FrameRecordStore(
         max_items=item_cap,
         max_heavy_items=heavy_cap,

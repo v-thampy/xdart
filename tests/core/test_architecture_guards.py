@@ -92,6 +92,21 @@ def test_first_party_never_imports_the_shim():
     assert offenders == []
 
 
+def test_static_scan_source_has_no_retired_scan_mirrors():
+    """H9/8b: scan display sources must not reintroduce the retired mirrors."""
+    root = SRC / "xdart" / "gui" / "tabs" / "static_scan"
+    retired = ("data_1d", "data_2d", "hydrated_raw")
+    offenders: list[str] = []
+    for path in root.rglob("*.py"):
+        if "__pycache__" in path.parts:
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for needle in retired:
+            if needle in text:
+                offenders.append(f"{path.relative_to(ROOT)}: {needle}")
+    assert offenders == []
+
+
 def test_core_capability_imports():
     """The load-bearing core symbols the GUI (and users) rely on."""
     from xrd_tools.io.read import relative_source_path, resolve_source_master  # noqa: F401

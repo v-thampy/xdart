@@ -666,9 +666,9 @@ class PublicationDisplayAdapter:
         This is the 1D counterpart to :meth:`_aggregate_cake_payload`: when an
         Overall Sum/Average selection is larger than the bounded heavy store,
         the display must aggregate the complete primary on-disk stack plus the
-        unflushed tail, never the resident subset and never the legacy
-        unbounded ``data_1d`` mirror.  The widget owns async dispatch/caching via
-        ``_whole_scan_aggregate``; ``None`` means "not ready this render".
+        unflushed tail, never the resident subset.  The widget owns async
+        dispatch/caching via ``_whole_scan_aggregate``; ``None`` means "not
+        ready this render".
         """
         if getattr(state, "method", None) not in ("Sum", "Average"):
             return None
@@ -776,7 +776,7 @@ class PublicationDisplayAdapter:
         # Eviction parity (H8): Overall Sum/Average may use the complete
         # on-disk aggregate.  Explicit subsets must hydrate every requested
         # frame or refuse with an empty payload; never aggregate/draw the
-        # resident subset silently, and never fall through to legacy mirrors.
+        # resident subset silently.
         selected_missing = [
             _label_key(label)
             for label in state.selected_ids

@@ -156,7 +156,7 @@ class TestLazyLoadTif:
         preserve ``source_frame_idx``, ``_source_root``, and
         ``is_reload_only`` along with ``source_file``.
 
-        Pre-P4 the 1D-only copies stashed in ``data_1d`` lost three
+        Pre-P4 the 1D-only copies stashed in ``viewer_rows_1d`` lost three
         of those fields, so any later attempt to lazy-reload the raw
         frame (for reintegrate / thumbnail regen / etc.) either
         resolved to frame 0 or to a path that didn't exist.  Locks

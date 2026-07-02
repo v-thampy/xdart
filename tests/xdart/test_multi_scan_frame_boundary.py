@@ -36,7 +36,7 @@ def _boundary_host():
     host = SimpleNamespace(
         scan=scan, _run_saw_frame=False, _pending_frames={}, _scan_info_rows={},
         frames={}, frame_ids=[], publication_store=PublicationStore(),
-        data_lock=RLock(), data_1d={}, data_2d={},
+        data_lock=RLock(), viewer_rows_1d={}, viewer_rows_2d={},
         h5viewer=SimpleNamespace(
             dirname="", live_run_active=False, scan_name="scanA",
             auto_last=False, latest_idx=0,

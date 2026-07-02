@@ -54,7 +54,6 @@ from xrd_tools.core.invalid import (
 )
 
 logger = logging.getLogger(__name__)
-_LEGACY_MIRROR_TELEMETRY: set[tuple[str, str]] = set()
 
 __all__ = [
     "Mode",
@@ -994,18 +993,6 @@ def _scan_mode(value) -> bool:
     return _mode(value) in (Mode.INT_1D, Mode.INT_2D)
 
 
-def _log_legacy_mirror_ignored_once(mode, tier_needed) -> None:
-    key = (str(getattr(_mode(mode), "value", mode)), _tier(tier_needed).value)
-    if key in _LEGACY_MIRROR_TELEMETRY:
-        return
-    _LEGACY_MIRROR_TELEMETRY.add(key)
-    logger.info(
-        "display read ignored legacy mirror for scan mode=%s tier=%s",
-        key[0],
-        key[1],
-    )
-
-
 def _view_has_tier(view, tier_needed):
     if view is None:
         return False
@@ -1044,22 +1031,22 @@ def _publication_raw_flags(publication):
     )
 
 
-def _legacy_data_for_tier(label, tier_needed, data_1d=None, data_2d=None):
+def _viewer_row_for_tier(label, tier_needed, viewer_rows_1d=None, viewer_rows_2d=None):
     key = _label_key(label)
     tier_needed = _tier(tier_needed)
     if tier_needed in (DataTier.ONE_D, DataTier.PUBLICATION):
-        if hasattr(data_1d, "get"):
-            frame = data_1d.get(key)
+        if hasattr(viewer_rows_1d, "get"):
+            frame = viewer_rows_1d.get(key)
             if frame is not None:
                 return frame, False, False
     if tier_needed in (DataTier.TWO_D, DataTier.RAW_OR_THUMBNAIL):
-        if hasattr(data_2d, "get"):
-            frame_2d = data_2d.get(key)
+        if hasattr(viewer_rows_2d, "get"):
+            frame_2d = viewer_rows_2d.get(key)
             if isinstance(frame_2d, dict):
                 if tier_needed is DataTier.TWO_D:
-                    # Legacy readiness treated the presence of a data_2d entry
-                    # as loaded even when it held only raw/thumbnail data.  Keep
-                    # that fallback until the Role-A mirrors are retired.
+                    # Image/NeXus viewer rows are file-browser payloads.  A row
+                    # can be considered loaded even when it carries only raw or
+                    # thumbnail data for the display panel.
                     return frame_2d, False, False
                 else:
                     has_raw = frame_2d.get("map_raw") is not None
@@ -1093,8 +1080,8 @@ def resolve_frame_data(
     *,
     store_first_lookup=None,
     publication_store=None,
-    data_1d=None,
-    data_2d=None,
+    viewer_rows_1d=None,
+    viewer_rows_2d=None,
     include_legacy=True,
     request_hydration=None,
 ):
@@ -1104,8 +1091,8 @@ def resolve_frame_data(
     blocking hydrate method; an unavailable-but-expected frame becomes
     ``EVICTED_HYDRATING`` and the optional request callback is invoked instead.
     Scan displays read store-first accessor -> PublicationStore -> hydration.
-    Viewer modes may still read their file-browser legacy rows.  If a scan
-    mirror row would have been hit, log once as telemetry for the 8b deletion.
+    Viewer modes may still read their file-browser row stores.  Scan modes
+    never consult those rows.
     """
     key = _label_key(label)
     tier_needed = _tier(tier_needed)
@@ -1144,20 +1131,17 @@ def resolve_frame_data(
                 source="publication_store", has_raw=has_raw,
                 has_thumbnail=has_thumbnail)
 
-    if include_legacy:
-        data, has_raw, has_thumbnail = _legacy_data_for_tier(
-            key, tier_needed, data_1d=data_1d, data_2d=data_2d)
+    if include_legacy and not scan_mode:
+        data, has_raw, has_thumbnail = _viewer_row_for_tier(
+            key, tier_needed, viewer_rows_1d=viewer_rows_1d, viewer_rows_2d=viewer_rows_2d)
         if data is not None:
-            if scan_mode:
-                _log_legacy_mirror_ignored_once(mode, tier_needed)
-            else:
-                return ReadResult(
-                    key, tier_needed, ReadStatus.RESIDENT, data,
-                    source="legacy_mirror", has_raw=has_raw,
-                    has_thumbnail=has_thumbnail)
+            return ReadResult(
+                key, tier_needed, ReadStatus.RESIDENT, data,
+                source="viewer_row", has_raw=has_raw,
+                has_thumbnail=has_thumbnail)
 
     # Scan display paths with a store/store-first accessor can expect a later
-    # async completion.  Viewer-only mirror misses are genuinely absent.
+    # async completion.  Viewer-only row misses are genuinely absent.
     can_hydrate = scan_mode and (
         callable(store_first_lookup)
         or publication_store is not None

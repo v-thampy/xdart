@@ -130,9 +130,11 @@ pre-migration reference signature.  Two additive notes:
 6. **Chunked error-path cleanup (D6)** waits out the already-running worker
    tail before releasing image refs, so an error can no longer leave one
    frame's raw pinned until session close.
-7. **Hydrated-raw display LRU (D5)** is shared across all writers (GUI +
-   worker threads), capping full-resolution `map_raw` payloads in `data_2d`
-   regardless of which thread hydrated them.
+7. **Viewer raw-display LRU (D5/H9)** is scoped to Image/XYE/NeXus viewer rows,
+   capping full-resolution `map_raw` payloads without making those rows a scan
+   display authority.  Normal scan display now reads from `FrameRecordStore` /
+   `PublicationStore` and disk hydration; the former `data_1d`/`data_2d`
+   scan-display mirrors are retired.
 8. **Provenance version stamps** follow the new distribution:
    `xdart.__version__` and `entry/reduction/version` report the
    `xrd-tools` version (a clean two-repo-era install recorded the old

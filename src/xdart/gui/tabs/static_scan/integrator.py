@@ -128,8 +128,7 @@ class integratorTree(QtWidgets.QWidget):
     # staticWidget uses it to auto-populate the Mask File field.
     sigMaskCreated = QtCore.Signal(str)
 
-    def __init__(self, scan, frame, file_lock,
-                 frames, frame_ids, data_1d, data_2d, parent=None,
+    def __init__(self, scan, frame, file_lock, frames, frame_ids, parent=None,
                  data_lock=None, publication_store=None):
         super().__init__(parent)
         self.ui = Ui_Form()
@@ -139,11 +138,7 @@ class integratorTree(QtWidgets.QWidget):
         self.file_lock = file_lock
         self.frames = frames
         self.frame_ids = frame_ids
-        self.data_1d = data_1d
-        self.data_2d = data_2d
         self.publication_store = publication_store
-        # Shared lock guarding data_1d / data_2d; falls back to a private lock
-        # when used stand-alone.
         import threading as _threading
         self.data_lock = data_lock if data_lock is not None else _threading.RLock()
         self.parameters = Parameter.create(
@@ -222,7 +217,7 @@ class integratorTree(QtWidgets.QWidget):
 
         self.integrator_thread = integratorThread(
             self.scan, self.frame, self.file_lock,
-            self.frames, self.frame_ids, self.data_1d, self.data_2d,
+            self.frames, self.frame_ids,
             data_lock=self.data_lock,
             publication_store=self.publication_store,
         )
@@ -1436,16 +1431,6 @@ class integratorTree(QtWidgets.QWidget):
             if len(self.scan.frames.index) > 0:
                 self.integrator_thread.method = 'bai_1d_all'
                 self.integrator_thread.reintegrate_live = self._reintegrate_is_live()
-        # N3: clear under data_lock to avoid racing with the
-        # integrator thread's _publish or with the GUI's
-        # _absorb_chunk arrivals (which also write through
-        # data_lock).
-        data_lock = getattr(self.integrator_thread, 'data_lock', None)
-        if data_lock is not None:
-            with data_lock:
-                self.data_1d.clear()
-        else:
-            self.data_1d.clear()
         self.setEnabled(False)
         if not self.integrator_thread.isRunning():
             self.integrator_thread.start()
@@ -1465,16 +1450,6 @@ class integratorTree(QtWidgets.QWidget):
             if len(self.scan.frames.index) > 0:
                 self.integrator_thread.method = 'bai_2d_all'
                 self.integrator_thread.reintegrate_live = self._reintegrate_is_live()
-        # N3: same data_lock discipline as bai_1d above.
-        from .hydrated_raw import clear_hydrated_raw
-        data_lock = getattr(self.integrator_thread, 'data_lock', None)
-        if data_lock is not None:
-            with data_lock:
-                self.data_2d.clear()
-                clear_hydrated_raw(self.data_2d)
-        else:
-            self.data_2d.clear()
-            clear_hydrated_raw(self.data_2d)
         self.setEnabled(False)
         if not self.integrator_thread.isRunning():
             self.integrator_thread.start()

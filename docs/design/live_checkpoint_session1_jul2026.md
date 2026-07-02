@@ -57,8 +57,15 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
       W-backed mode data without recomputation or stale-mode drift.
 - [ ] E4 Explicit subset spanning evicted frames: Sum/Average hydrates every requested frame or
       refuses/blank-awaits; it never draws a resident-only partial subset.
-- [ ] E5 Mirror-read telemetry: during the whole session, `display read ignored legacy mirror`
-      lines are ZERO after normal store-backed display setup (any hit is an 8b follow-up).
+- [ ] E5 Retired mirror telemetry stays absent: during the whole session there are no
+      `display read ignored legacy mirror` lines (any hit means old code resurfaced).
+- [ ] E6 GI sub-mode switching with mirrors gone: live and reload switching both draw the
+      persisted W-backed per-mode data; same `(frame, mode)` view before/after reload.
+- [ ] E7 Live/Append/Reintegrate sanity post-deletion: live run, Append, Reintegrate 1D,
+      and Reintegrate 2D still publish through the store and repaint without scan-display
+      row tables.
+- [ ] E8 Viewer modes unchanged: XYE multi-select, Image Viewer, and NeXus preview keep
+      their viewer-row behavior after the Role-A mirror retirement.
 
 **PASS ⇒ proceed to RC-8** (merge → tag v1.0.0 → publish; recipe in
 `handoff_chunks_jul2026.md`). Any FAIL: stop, report the item + `kill -USR1 <pid>` stack if a

@@ -206,7 +206,7 @@ class imageWrangler(wranglerWidget):
     showLabel = QtCore.Signal(str)
     sigSavePathChanged = QtCore.Signal(str)
 
-    def __init__(self, fname, file_lock, scan, data_1d, data_2d, parent=None):
+    def __init__(self, fname, file_lock, scan, parent=None):
         """fname: str, file path
         file_lock: mp.Condition, process safe lock
         """
@@ -219,8 +219,6 @@ class imageWrangler(wranglerWidget):
         self.motors = []
         self.command = None
         self.scan = scan
-        self.data_1d = data_1d
-        self.data_2d = data_2d
 
         # Setup gui elements
         self.ui = Ui_Form()
@@ -476,8 +474,6 @@ class imageWrangler(wranglerWidget):
             self.gi_mode_2d,
             self.command,
             self.scan,
-            self.data_1d,
-            self.data_2d,
             live_mode=self.live_mode,
             max_cores=self.ui.maxCoresSpinBox.value(),
             parent=self,
@@ -1050,8 +1046,6 @@ class imageWrangler(wranglerWidget):
         self.thread.scan_args = self.scan_args
 
         self.thread.scan = self.scan
-        self.thread.data_1d = self.data_1d
-        self.thread.data_2d = self.data_2d
 
     def _set_wrangler_tooltips(self):
         """Hover tooltips for the wrangler command/run controls."""

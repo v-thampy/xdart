@@ -71,10 +71,10 @@ from xdart.utils.session import load_session, save_session
 from .ui.h5viewerUI import Ui_Form
 from xdart.modules.live import LiveFrame
 from xdart.utils.throttle import Coalescer
-from .hydrated_raw import (
-    HYDRATED_RAW_LIMIT,
-    clear_hydrated_raw,
-    remember_hydrated_raw,
+from .viewer_raw_lru import (
+    VIEWER_RAW_LIMIT,
+    clear_viewer_raw_lru,
+    remember_viewer_raw_lru,
 )
 from .scan_threads import fileHandlerThread
 from .display_logic import xye_unit_from_filename
@@ -117,9 +117,9 @@ QItemSelectionModel = QtCore.QItemSelectionModel
 
 def _clear_raw_cache_for(viewer) -> None:
     """Reset hydrated-raw LRU state on real and lightweight test viewers."""
-    data_2d = getattr(viewer, "data_2d", None)
-    if data_2d is not None:
-        clear_hydrated_raw(data_2d)
+    viewer_rows_2d = getattr(viewer, "viewer_rows_2d", None)
+    if viewer_rows_2d is not None:
+        clear_viewer_raw_lru(viewer_rows_2d)
 
 
 def _clear_publication_store_for(viewer) -> None:
@@ -438,14 +438,14 @@ class H5Viewer(QWidget):
 
     def __init__(self, file_lock, local_path, dirname,
                  scan, frame, frame_ids, frames,
-                 data_1d, data_2d,
+                 viewer_rows_1d, viewer_rows_2d,
                  parent=None, data_lock=None, publication_store=None):
         super().__init__(parent)
         import threading as _threading
         self.data_lock = data_lock if data_lock is not None else _threading.RLock()
         self._init_data_objects(file_lock, local_path, dirname,
                                 scan, frame, frame_ids, frames,
-                                data_1d, data_2d, publication_store)
+                                viewer_rows_1d, viewer_rows_2d, publication_store)
         self._init_ui()
         self._init_toolbar()
         self._connect_signals()
@@ -455,7 +455,7 @@ class H5Viewer(QWidget):
 
     def _init_data_objects(self, file_lock, local_path, dirname,
                            scan, frame, frame_ids, frames,
-                           data_1d, data_2d, publication_store):
+                           viewer_rows_1d, viewer_rows_2d, publication_store):
         """Initialize data references and state flags."""
         self.local_path = local_path
         self.file_lock = file_lock
@@ -464,8 +464,8 @@ class H5Viewer(QWidget):
         self.frame = frame
         self.frame_ids = frame_ids
         self.frames = frames
-        self.data_1d = data_1d
-        self.data_2d = data_2d
+        self.viewer_rows_1d = viewer_rows_1d
+        self.viewer_rows_2d = viewer_rows_2d
         self.publication_store = (
             publication_store if publication_store is not None else PublicationStore()
         )
@@ -716,8 +716,6 @@ class H5Viewer(QWidget):
                                              self.file_lock,
                                              frame_ids=self.frame_ids,
                                              frames=self.frames,
-                                             data_1d=self.data_1d,
-                                             data_2d=self.data_2d,
                                              data_lock=self.data_lock)
         self.file_thread.sigTaskDone.connect(self.thread_finished)
         self.file_thread.sigNewFile.connect(self.sigNewFile.emit)
@@ -1310,7 +1308,7 @@ class H5Viewer(QWidget):
         publication store, so the metadata panel reads it store-first like every
         other mode.  Metadata-only (no 1D/2D arrays) keeps the integration
         display path from ever rendering a browser row; the row itself stays in
-        ``data_1d`` for the viewer controller's own plotting/inspection."""
+        ``viewer_rows_1d`` for the viewer controller's own plotting/inspection."""
         store = getattr(self, "publication_store", None)
         if store is None:
             return
@@ -1329,7 +1327,7 @@ class H5Viewer(QWidget):
     def _load_xye_files(self):
         """Load all selected xye files from listScans for overlay.
 
-        Each file gets a sequential index (1, 2, 3, …) in data_1d.
+        Each file gets a sequential index (1, 2, 3, …) in viewer_rows_1d.
         listData is populated with filenames and all rows are selected
         so the display frame renders every curve.
         """
@@ -1338,8 +1336,8 @@ class H5Viewer(QWidget):
             return
 
         with self.data_lock:
-            self.data_1d.clear()
-            self.data_2d.clear()
+            self.viewer_rows_1d.clear()
+            self.viewer_rows_2d.clear()
             _clear_publication_store_for(self)
             _clear_raw_cache_for(self)
         self.frame_ids.clear()
@@ -1387,23 +1385,23 @@ class H5Viewer(QWidget):
             frame.scan_info = {'source_file': os.path.basename(fpath)}
 
             with self.data_lock:
-                self.data_1d[idx] = frame
+                self.viewer_rows_1d[idx] = frame
             _upsert = getattr(self, '_upsert_viewer_row_publication', None)
             if _upsert is not None:
                 _upsert(idx, frame.scan_info)
             self.frame_ids.append(str(idx))
             idx += 1
 
-        if len(self.data_1d) == 0:
+        if len(self.viewer_rows_1d) == 0:
             return
 
         # Populate listData with loaded filenames (all selected).
         # Display filename but store numeric index in UserRole so
-        # data_changed can map back to data_1d keys.
+        # data_changed can map back to viewer_rows_1d keys.
         self.ui.listData.blockSignals(True)
         self.ui.listData.clear()
-        for key in self.data_1d:
-            frame = self.data_1d[key]
+        for key in self.viewer_rows_1d:
+            frame = self.viewer_rows_1d[key]
             fname = frame.scan_info.get('source_file', f'file_{key}')
             display_name = os.path.basename(fname)
             item = QtWidgets.QListWidgetItem(display_name)
@@ -1423,8 +1421,8 @@ class H5Viewer(QWidget):
         from xrd_tools.io import inspect_nexus
 
         with self.data_lock:
-            self.data_1d.clear()
-            self.data_2d.clear()
+            self.viewer_rows_1d.clear()
+            self.viewer_rows_2d.clear()
             _clear_publication_store_for(self)
             _clear_raw_cache_for(self)
         self.frame_ids.clear()
@@ -1452,13 +1450,13 @@ class H5Viewer(QWidget):
             for row_id, (label, info) in enumerate(rows, start=1):
                 scan_info = dict(info)
                 scan_info.setdefault("source_file", os.path.basename(fpath))
-                self.data_1d[row_id] = _ViewerRow(
+                self.viewer_rows_1d[row_id] = _ViewerRow(
                     idx=row_id,
                     scan_info=scan_info,
                 )
                 nexus_rows.append((row_id, scan_info))
         # Phase 3c: mirror each row's metadata into the publication store so the
-        # metadata panel reads it store-first (the _ViewerRow stays in data_1d
+        # metadata panel reads it store-first (the _ViewerRow stays in viewer_rows_1d
         # for the NeXus inspector controller).
         _upsert = getattr(self, '_upsert_viewer_row_publication', None)
         if _upsert is not None:
@@ -1503,7 +1501,7 @@ class H5Viewer(QWidget):
         if not viewer_path:
             return
         with self.data_lock:
-            frame = self.data_1d.get(row_id)
+            frame = self.viewer_rows_1d.get(row_id)
         if frame is None:
             return
         info = dict(getattr(frame, "scan_info", None) or {})
@@ -1907,8 +1905,8 @@ class H5Viewer(QWidget):
         files, display the image directly.
         """
         with self.data_lock:
-            self.data_1d.clear()
-            self.data_2d.clear()
+            self.viewer_rows_1d.clear()
+            self.viewer_rows_2d.clear()
             _clear_publication_store_for(self)
             _clear_raw_cache_for(self)
         self.frame_ids.clear()
@@ -2048,7 +2046,7 @@ class H5Viewer(QWidget):
     ]
 
     def _load_single_frame(self, fpath, frame_idx=0, frame_id=1):
-        """Load a single frame from an image file into data_2d.
+        """Load a single frame from an image file into viewer_rows_2d.
 
         ``frame_idx`` is the 0-based offset *within the file* (passed to
         ``read_image``); ``frame_id`` is the 1-based id shown in listData
@@ -2076,7 +2074,7 @@ class H5Viewer(QWidget):
             thumb_data = img_data if res.source == 'thumbnail' else None
             scan_info = {'source_file': os.path.basename(fpath)}
             with self.data_lock:
-                self.data_2d[int(frame_id)] = {
+                self.viewer_rows_2d[int(frame_id)] = {
                     'map_raw': img_data,
                     'bg_raw': 0,
                     'mask': None,
@@ -2085,7 +2083,7 @@ class H5Viewer(QWidget):
                     'thumbnail': thumb_data,
                 }
                 frame = _ViewerRow(idx=int(frame_id), scan_info=scan_info)
-                self.data_1d[int(frame_id)] = frame
+                self.viewer_rows_1d[int(frame_id)] = frame
                 store = getattr(self, "publication_store", None)
                 if store is not None:
                     view = FrameView(
@@ -2111,7 +2109,7 @@ class H5Viewer(QWidget):
             # Bound the full-res raws (Image Viewer browsing loaded ~18 MB
             # per file with no ceiling; the LRU keeps the intended ~8).
             # getattr: tests drive this on duck holders.
-            _trim = getattr(self, '_remember_hydrated_raw', None)
+            _trim = getattr(self, '_remember_viewer_raw_lru', None)
             if _trim is not None:
                 _trim(int(frame_id))
             logger.debug(
@@ -2143,7 +2141,7 @@ class H5Viewer(QWidget):
 
         with self.data_lock:
             scan_info = {'source_file': os.path.basename(fpath)}
-            self.data_2d[int(frame_id)] = {
+            self.viewer_rows_2d[int(frame_id)] = {
                 'map_raw': img_data,
                 'bg_raw': 0,
                 'mask': None,
@@ -2151,11 +2149,11 @@ class H5Viewer(QWidget):
                 'gi_2d': {},
                 'thumbnail': None,
             }
-            # Lightweight row marker.  The raw pixels live in data_2d and are
+            # Lightweight row marker.  The raw pixels live in viewer_rows_2d and are
             # reloadable from _viewer_image_path, so never park them in
-            # data_1d/raw_ref.
+            # viewer_rows_1d/raw_ref.
             frame = _ViewerRow(idx=int(frame_id), scan_info=scan_info)
-            self.data_1d[int(frame_id)] = frame
+            self.viewer_rows_1d[int(frame_id)] = frame
             store = getattr(self, "publication_store", None)
             if store is not None:
                 view = FrameView(
@@ -2175,7 +2173,7 @@ class H5Viewer(QWidget):
                 )
         # Bound the full-res raws (Image Viewer browsing loaded ~18 MB per
         # file with no ceiling; the LRU keeps the intended ~8).
-        _trim = getattr(self, '_remember_hydrated_raw', None)
+        _trim = getattr(self, '_remember_viewer_raw_lru', None)
         if _trim is not None:
             _trim(int(frame_id))
         logger.debug(
@@ -2348,7 +2346,7 @@ class H5Viewer(QWidget):
                 loaded_ids = []
                 for idx_str in idxs:
                     idx = int(idx_str)
-                    if idx not in self.data_2d:
+                    if idx not in self.viewer_rows_2d:
                         loaded = self._load_single_frame(
                             viewer_path,
                             frame_idx=idx - 1,  # generic listData is 1-based
@@ -2395,7 +2393,17 @@ class H5Viewer(QWidget):
             if len(int_idxs) == len(self.scan.frames.index):
                 load_2d = False
 
-        keys = self.data_2d.keys() if load_2d else self.data_1d.keys()
+        keys = set()
+        store = getattr(self, "publication_store", None)
+        if store is not None:
+            try:
+                from .display_publication import publication_availability
+                pub_1d, pub_2d, _raw = publication_availability(
+                    store, labels=int_idxs)
+                keys = set(pub_2d if load_2d else pub_1d)
+            except Exception:
+                logger.debug("publication availability lookup failed",
+                             exc_info=True)
         idxs_memory = [i for i in int_idxs if i in keys]
 
         # Multi-frame combination is now done on demand by
@@ -2452,7 +2460,7 @@ class H5Viewer(QWidget):
         # the in-memory per-frame hand-off in static_scan_widget.update_data.
         # This slot is wired to ``sigNewFile``, which the async file-thread
         # ``set_datafile`` emits a few ms after new_scan() — clearing the
-        # freshly-populated data_1d/data_2d/frames before the throttled
+        # freshly-populated viewer_rows_1d/viewer_rows_2d/frames before the throttled
         # refresh can render them.  That is the multi-scan Eiger "plots
         # stay blank" bug.  new_scan() already does the controlled reset
         # the live path needs, so skip the wipe while a run is active.
@@ -2463,8 +2471,8 @@ class H5Viewer(QWidget):
         self.frames.clear()
         self.frame_ids.clear()
         with self.data_lock:
-            self.data_1d.clear()
-            self.data_2d.clear()
+            self.viewer_rows_1d.clear()
+            self.viewer_rows_2d.clear()
             _clear_publication_store_for(self)
             _clear_raw_cache_for(self)
         # Re-arm the raw self-heal: frame indices restart per scan, so a
@@ -2489,8 +2497,8 @@ class H5Viewer(QWidget):
             save_session({'data_dir': dirname})
             self.frames.clear()
             with self.data_lock:
-                self.data_1d.clear()
-                self.data_2d.clear()
+                self.viewer_rows_1d.clear()
+                self.viewer_rows_2d.clear()
                 _clear_publication_store_for(self)
                 _clear_raw_cache_for(self)
             self.new_scan = True
@@ -2646,29 +2654,9 @@ class H5Viewer(QWidget):
                 )
             with self.data_lock:
                 if store is not None:
-                    # Scan display now reads through PublicationStore.  Drop
-                    # any stale legacy mirror rows for this frame so fallback
-                    # paths cannot accidentally see an older payload.
-                    self.data_1d.pop(frame_idx, None)
-                    self.data_2d.pop(frame_idx, None)
+                    self.viewer_rows_1d.pop(frame_idx, None)
+                    self.viewer_rows_2d.pop(frame_idx, None)
                     store.upsert(publication)
-                elif not load_2d:
-                    self.data_1d[frame_idx] = frame.copy_for_display(include_2d=False)
-                else:
-                    self.data_1d[frame_idx] = frame.copy_for_display(include_2d=False)
-                    if not has_2d_error:
-                        self.data_2d[frame_idx] = {
-                            'map_raw': frame.map_raw,
-                            'bg_raw': frame.bg_raw,
-                            'mask': frame.mask,
-                            'int_2d': frame.int_2d,
-                            'gi_2d': frame.gi_2d,
-                            'thumbnail': frame.thumbnail,
-                        }
-                        if frame.map_raw is not None:
-                            self._remember_hydrated_raw(frame_idx)
-                    else:
-                        self.data_2d.pop(frame_idx, None)
             # O6: coalesce display updates while a chunk burst is
             # streaming in.  Schedule (or restart) a debounced emit
             # rather than firing once per chunk.  ``_on_load_worker_finished``
@@ -2678,16 +2666,16 @@ class H5Viewer(QWidget):
         except (AttributeError, RuntimeError) as e:
             logger.debug("absorb_chunk skipped frame %s: %s", idx, e)
 
-    def _remember_hydrated_raw(self, idx: int) -> None:
-        """Retain a bounded LRU of full detector arrays in ``data_2d``.
+    def _remember_viewer_raw_lru(self, idx: int) -> None:
+        """Retain a bounded LRU of full detector arrays in ``viewer_rows_2d``.
 
-        D5: the LRU state lives WITH the shared ``data_2d`` (see
-        ``hydrated_raw.py``) so the worker-thread insert paths trim the
+        D5: the LRU state lives WITH the shared ``viewer_rows_2d`` (see
+        ``viewer_raw_lru.py``) so the worker-thread insert paths trim the
         same cache; this method adds the lock the helper requires
         (re-entrant — callers already inside ``data_lock`` are fine).
         """
         limit = max(1, int(getattr(self, "_raw_cache_limit",
-                                   HYDRATED_RAW_LIMIT)))
+                                   VIEWER_RAW_LIMIT)))
         with self.data_lock:
             keep = ()
             if getattr(self, "viewer_mode", None) == "image":
@@ -2695,29 +2683,29 @@ class H5Viewer(QWidget):
                     int(label) for label in getattr(self, "frame_ids", ())
                     if str(label).lstrip("-").isdigit()
                 )
-            evicted = remember_hydrated_raw(
-                self.data_2d, idx, limit=limit, keep=keep,
+            evicted = remember_viewer_raw_lru(
+                self.viewer_rows_2d, idx, limit=limit, keep=keep,
             )
             if getattr(self, "viewer_mode", None) == "image":
                 keep_set = set(keep)
                 for stale in evicted:
                     if stale in keep_set:
                         continue
-                    self.data_2d.pop(stale, None)
-                    self.data_1d.pop(stale, None)
+                    self.viewer_rows_2d.pop(stale, None)
+                    self.viewer_rows_1d.pop(stale, None)
             else:
-                data_1d = getattr(self, "data_1d", None)
-                if data_1d is None:
+                viewer_rows_1d = getattr(self, "viewer_rows_1d", None)
+                if viewer_rows_1d is None:
                     return
                 for stale in evicted:
-                    frame = data_1d.get(stale)
+                    frame = viewer_rows_1d.get(stale)
                     if frame is not None and hasattr(frame, "map_raw"):
                         frame.map_raw = None
                         if hasattr(frame, "bg_raw"):
                             frame.bg_raw = None
 
     def _clear_raw_cache(self) -> None:
-        """Reset the hydrated-raw LRU after data_2d is cleared."""
+        """Reset the hydrated-raw LRU after viewer_rows_2d is cleared."""
         _clear_raw_cache_for(self)
 
     def _apply_frames_panel_width(self, viewer_mode) -> None:
@@ -2849,8 +2837,8 @@ class H5Viewer(QWidget):
         self.cancel_pending_loads()
 
         with self.data_lock:
-            self.data_1d.clear()
-            self.data_2d.clear()
+            self.viewer_rows_1d.clear()
+            self.viewer_rows_2d.clear()
             _clear_publication_store_for(self)
             self._clear_raw_cache()
         self.frame_ids.clear()
@@ -2957,6 +2945,6 @@ class H5Viewer(QWidget):
     # add_idxs/sub_idxs/sum_int_2d/sum_map_raw machinery: combining 2D
     # data across multiple selected frames is now done on demand by
     # display_data.get_frames_int_2d / get_frames_map_raw, which iterate
-    # the current selection straight from data_2d. The old stateful
+    # the current selection straight from viewer_rows_2d. The old stateful
     # approach was both inconsistent with the 1D path (get_frames_int_1d)
     # and silently dead for sum_map_raw, which was never read anywhere.

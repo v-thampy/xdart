@@ -164,33 +164,32 @@ def test_resolve_frame_data_typed_statuses_and_fallbacks(caplog):
     resident = dl.resolve_frame_data(
         "3", dl.Mode.INT_1D, dl.DataTier.ONE_D,
         publication_store=Store(publication),
-        data_1d={3: "legacy"},
+        viewer_rows_1d={3: "legacy"},
         request_hydration=lambda *a, **k: None,
     )
     assert resident.status is dl.ReadStatus.RESIDENT
     assert resident.source == "publication_store"
     assert resident.data is publication
 
-    legacy = dl.resolve_frame_data(
+    viewer = dl.resolve_frame_data(
         4, dl.Mode.XYE_VIEWER, dl.DataTier.ONE_D,
-        data_1d={4: "legacy-frame"},
+        viewer_rows_1d={4: "legacy-frame"},
     )
-    assert legacy.status is dl.ReadStatus.RESIDENT
-    assert legacy.source == "legacy_mirror"
-    assert legacy.data == "legacy-frame"
+    assert viewer.status is dl.ReadStatus.RESIDENT
+    assert viewer.source == "viewer_row"
+    assert viewer.data == "legacy-frame"
 
     requests = []
-    dl._LEGACY_MIRROR_TELEMETRY.clear()
     with caplog.at_level(logging.INFO):
         ignored = dl.resolve_frame_data(
             6, dl.Mode.INT_1D, dl.DataTier.ONE_D,
-            data_1d={6: "scan-legacy-frame"},
+            viewer_rows_1d={6: "scan-legacy-frame"},
             request_hydration=lambda label, *, purpose="full":
                 requests.append((label, purpose)),
         )
         ignored_again = dl.resolve_frame_data(
             7, dl.Mode.INT_1D, dl.DataTier.ONE_D,
-            data_1d={7: "scan-legacy-frame"},
+            viewer_rows_1d={7: "scan-legacy-frame"},
             request_hydration=lambda label, *, purpose="full":
                 requests.append((label, purpose)),
         )
@@ -198,11 +197,11 @@ def test_resolve_frame_data_typed_statuses_and_fallbacks(caplog):
     assert ignored.source == "hydration"
     assert ignored_again.status is dl.ReadStatus.EVICTED_HYDRATING
     assert requests == [(6, "1d"), (7, "1d")]
-    assert caplog.text.count("ignored legacy mirror") == 1
+    assert "ignored legacy mirror" not in caplog.text
 
     absent = dl.resolve_frame_data(
         5, dl.Mode.XYE_VIEWER, dl.DataTier.ONE_D,
-        data_1d={},
+        viewer_rows_1d={},
     )
     assert absent.status is dl.ReadStatus.ABSENT
 
@@ -987,16 +986,16 @@ class _CountingIndex:
         return iter(self.labels)
 
 
-def _controller_widget(index, *, frame_ids, data_1d=None, data_2d=None):
+def _controller_widget(index, *, frame_ids, viewer_rows_1d=None, viewer_rows_2d=None):
     publication_store = None
-    if data_1d:
+    if viewer_rows_1d:
         import numpy as np
         from xdart.modules.frame_publication import (
             PublicationStore, publication_from_frame_view)
         from xrd_tools.core import Axis, FrameView
 
         publication_store = PublicationStore(max_items=None)
-        for label in data_1d:
+        for label in viewer_rows_1d:
             publication_store.upsert(publication_from_frame_view(
                 FrameView(
                     label=label,
@@ -1013,8 +1012,8 @@ def _controller_widget(index, *, frame_ids, data_1d=None, data_2d=None):
         frame_ids=list(frame_ids),
         publication_store=publication_store,
         data_lock=RLock(),
-        data_1d={} if data_1d is None else data_1d,
-        data_2d={} if data_2d is None else data_2d,
+        viewer_rows_1d={} if viewer_rows_1d is None else viewer_rows_1d,
+        viewer_rows_2d={} if viewer_rows_2d is None else viewer_rows_2d,
         ui=SimpleNamespace(plotMethod=_PlotMethod()),
         overlaid_idxs=(),
         display_generation=0,
@@ -1031,7 +1030,7 @@ def test_scan_controller_does_not_copy_full_index_for_single_frame_render():
     widget = _controller_widget(
         _IndexThatMustNotIterate(10_000),
         frame_ids=[5],
-        data_1d={5: object()},
+        viewer_rows_1d={5: object()},
     )
 
     state = ScanDisplayController().compute_state(widget, dl.Mode.INT_1D)
@@ -1046,7 +1045,7 @@ def test_scan_controller_materializes_full_index_for_overall_render():
     widget = _controller_widget(
         index,
         frame_ids=[0, 1, 2],
-        data_1d={0: object(), 1: object(), 2: object()},
+        viewer_rows_1d={0: object(), 1: object(), 2: object()},
     )
 
     state = ScanDisplayController().compute_state(widget, dl.Mode.INT_1D)

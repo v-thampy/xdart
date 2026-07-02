@@ -54,12 +54,10 @@ def _bind_store_first_methods(host):
         "_active_frame_record_modes",
         "_active_frame_record_store",
         "_publication_frame_view",
-        "_legacy_frame_view",
         "store_first_frame_view",
     ):
         setattr(host, name, MethodType(getattr(staticWidget, name), host))
     host._coerce_frame_label = staticWidget._coerce_frame_label
-    host._mode_result = staticWidget._mode_result
     for name in (
         "_selected_publication_views",
         "_first_present",
@@ -75,7 +73,7 @@ def _bind_store_first_methods(host):
     return host
 
 
-def _host(*, gi=False, store=None, publication_store=None, data_1d=None, data_2d=None):
+def _host(*, gi=False, store=None, publication_store=None, viewer_rows_1d=None, viewer_rows_2d=None):
     scan = SimpleNamespace(
         gi=gi,
         bai_1d_args={"gi_mode_1d": "q_total"} if gi else {},
@@ -84,8 +82,8 @@ def _host(*, gi=False, store=None, publication_store=None, data_1d=None, data_2d
     return _bind_store_first_methods(SimpleNamespace(
         scan=scan,
         data_lock=RLock(),
-        data_1d=data_1d or {},
-        data_2d=data_2d or {},
+        viewer_rows_1d=viewer_rows_1d or {},
+        viewer_rows_2d=viewer_rows_2d or {},
         publication_store=publication_store or PublicationStore(),
         _frame_record_store=store,
         wrangler=None,
@@ -94,7 +92,7 @@ def _host(*, gi=False, store=None, publication_store=None, data_1d=None, data_2d
     ))
 
 
-def test_store_first_frame_view_matches_publication_and_mirror_for_1d():
+def test_store_first_frame_view_matches_publication_and_ignores_viewer_rows_for_1d():
     metadata = {"i0": 2.0}
     view = FrameView.from_results(label=3, result_1d=_r1d(), metadata_raw=metadata)
     store = FrameRecordStore(max_heavy_items=None)
@@ -102,7 +100,7 @@ def test_store_first_frame_view_matches_publication_and_mirror_for_1d():
     publications = PublicationStore(max_heavy_items=None)
     publications.upsert(publication_from_frame_view(view))
     mirror = {3: SimpleNamespace(int_1d=_r1d(), scan_info=metadata)}
-    host = _host(store=store, publication_store=publications, data_1d=mirror)
+    host = _host(store=store, publication_store=publications, viewer_rows_1d=mirror)
 
     assert_frameview_equivalent(host.store_first_frame_view(3), view)
 
@@ -110,10 +108,10 @@ def test_store_first_frame_view_matches_publication_and_mirror_for_1d():
     assert_frameview_equivalent(host.store_first_frame_view(3), view)
 
     host.publication_store.clear()
-    assert_frameview_equivalent(host.store_first_frame_view(3), view)
+    assert host.store_first_frame_view(3) is None
 
 
-def test_store_first_frame_view_matches_publication_and_mirror_for_gi_2d():
+def test_store_first_frame_view_matches_publication_and_ignores_viewer_rows_for_gi_2d():
     metadata = {"i0": 2.0, "incident_angle": 0.18}
     view = FrameView.from_results(
         label=5,
@@ -142,8 +140,8 @@ def test_store_first_frame_view_matches_publication_and_mirror_for_gi_2d():
         gi=True,
         store=store,
         publication_store=publications,
-        data_1d={5: frame_1d},
-        data_2d={5: frame_2d},
+        viewer_rows_1d={5: frame_1d},
+        viewer_rows_2d={5: frame_2d},
     )
 
     assert_frameview_equivalent(
@@ -162,13 +160,11 @@ def test_store_first_frame_view_matches_publication_and_mirror_for_gi_2d():
     )
 
     host.publication_store.clear()
-    assert_frameview_equivalent(
-        host.store_first_frame_view(5, mode_1d="q_total", mode_2d="qip_qoop"),
-        view,
-    )
+    assert host.store_first_frame_view(
+        5, mode_1d="q_total", mode_2d="qip_qoop") is None
 
 
-def test_snapshot_data_uses_store_before_publication_and_mirror():
+def test_snapshot_data_uses_store_before_publication_and_ignores_viewer_rows():
     metadata = {"i0": 1.0}
     store_view = FrameView.from_results(
         label=7, result_1d=_r1d(scale=9.0), metadata_raw=metadata)
@@ -179,7 +175,7 @@ def test_snapshot_data_uses_store_before_publication_and_mirror():
     publications = PublicationStore(max_heavy_items=None)
     publications.upsert(publication_from_frame_view(publication_view))
     mirror = {7: SimpleNamespace(int_1d=_r1d(scale=1.0), scan_info=metadata)}
-    host = _host(store=store, publication_store=publications, data_1d=mirror)
+    host = _host(store=store, publication_store=publications, viewer_rows_1d=mirror)
 
     snapshot = host._snapshot_data([7])
 
@@ -188,3 +184,14 @@ def test_snapshot_data_uses_store_before_publication_and_mirror():
         frame_1d.int_1d.intensity,
         store_view.intensity_1d,
     )
+
+    host._frame_record_store = FrameRecordStore(max_heavy_items=None)
+    snapshot = host._snapshot_data([7])
+    frame_1d, _frame_2d = snapshot[7]
+    np.testing.assert_allclose(
+        frame_1d.int_1d.intensity,
+        publication_view.intensity_1d,
+    )
+
+    host.publication_store.clear()
+    assert host._snapshot_data([7]) == {}

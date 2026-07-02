@@ -253,7 +253,7 @@ def test_get_or_hydrate_rehydrates_tier1_thumbnail():
     # thumbnail is KEPT (semilight, raw_status="thumbnail").  get_or_hydrate MUST
     # rehydrate it.  Regression: the old guard counted the thumbnail as "heavy"
     # (_publication_has_heavy_payload) and short-circuited, so a tier-1 frame was
-    # stuck on its thumbnail forever — the bug data_1d masked until Step 8b.
+    # stuck on its thumbnail forever — the bug viewer_rows_1d masked until Step 8b.
     store = PublicationStore(max_heavy_items=0, max_thumbnail_items=8)
     store.upsert(publication_from_live_frame(DuckFrame(idx=7)))
     pub = store.get(7)
@@ -960,7 +960,7 @@ def test_image_viewer_controller_owns_raw_preview_not_the_adapter():
     class _Widget:
         _viewer_is_xdart = False                      # standalone detector file
         data_lock = RLock()
-        data_2d = {1: {"map_raw": raw, "thumbnail": None}}
+        viewer_rows_2d = {1: {"map_raw": raw, "thumbnail": None}}
         # A monitor (ignored by the raw browser) and a shape-matching Set-Bkg
         # background (now subtracted -- the viewer Set BG feature).
         bkg_map_raw = np.array([[10.0, 10.0], [10.0, 10.0]])

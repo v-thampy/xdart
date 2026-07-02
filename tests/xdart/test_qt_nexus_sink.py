@@ -70,8 +70,8 @@ class _FakeHost:
         self.sigUpdate = SimpleNamespace(emit=lambda idx=None: self._signals.append(idx))
         self._signals = []
         self.xye_written = []
-        self.data_1d = {}
-        self.data_2d = {}
+        self.viewer_rows_1d = {}
+        self.viewer_rows_2d = {}
         self._published_frames = {}
 
     @property
@@ -432,7 +432,7 @@ def test_live_mode_hands_off_via_published_frames(tmp_path):
     """#3 (display contract): in live (non-batch) mode the sink does the
     single-source-of-truth hand-off the serial path uses — it stashes the
     fully-hydrated LiveFrame into host._published_frames and emits a lightweight
-    sigUpdate, doing NO copy_for_display / data_1d / data_2d work on the writer
+    sigUpdate, doing NO copy_for_display / viewer_rows_1d / viewer_rows_2d work on the writer
     thread (the GUI-thread update_data consumer owns that, incl. the publication
     that the cake renders from).  worker_process still KEEPS map_raw for live."""
     from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
@@ -457,8 +457,8 @@ def test_live_mode_hands_off_via_published_frames(tmp_path):
     assert live.int_2d is not None and live.map_raw is not None
     assert 0 in host._signals                   # lightweight queued sigUpdate
     # The writer thread did NO display-cache work — update_data (GUI thread) owns
-    # data_1d / data_2d / publication / scan_data now.
-    assert 0 not in host.data_1d and 0 not in host.data_2d
+    # viewer_rows_1d / viewer_rows_2d / publication / scan_data now.
+    assert 0 not in host.viewer_rows_1d and 0 not in host.viewer_rows_2d
 
 
 def test_sink_xye_only_writes_xye_no_nxs(tmp_path):

@@ -147,8 +147,8 @@ def test_sum_average_state_snapshot_does_not_reenqueue_full_2d_hydration():
         frame_ids=["0", "1", "2"],
         viewer_mode=None,
         publication_store=store,
-        data_1d={},
-        data_2d={},
+        viewer_rows_1d={},
+        viewer_rows_2d={},
         overlaid_idxs=[],
         display_generation=1,
         scan=SimpleNamespace(
@@ -331,8 +331,8 @@ def test_real_widget_overall_aggregate_uses_disk_when_store_evicted(
     df.ui.plotUnit.setCurrentIndex(0)
 
     with w.data_lock:
-        w.data_1d.clear()
-        w.data_2d.clear()
+        w.viewer_rows_1d.clear()
+        w.viewer_rows_2d.clear()
     w.publication_store.clear()
     for i in range(n):
         r1 = IntegrationResult1D(
@@ -380,8 +380,8 @@ def _evict_overall_store(w, q, chi, n):
     from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 
     with w.data_lock:
-        w.data_1d.clear()
-        w.data_2d.clear()
+        w.viewer_rows_1d.clear()
+        w.viewer_rows_2d.clear()
     w.publication_store.clear()
     for i in range(n):
         r1 = IntegrationResult1D(
@@ -992,8 +992,8 @@ def test_overlay_selection_of_evicted_frame_preserves_then_appends():
         publication_store=store,
         viewer_mode=None,
         data_lock=RLock(),
-        data_1d={},
-        data_2d={},
+        viewer_rows_1d={},
+        viewer_rows_2d={},
         frame_ids=["5"],
         overlaid_idxs=list(_history().ids),
         _waterfall_history=_history(),
@@ -1086,8 +1086,8 @@ def test_overlay_many_frame_selection_converges_after_out_of_order_hydration():
         publication_store=store,
         viewer_mode=None,
         data_lock=RLock(),
-        data_1d={},
-        data_2d={},
+        viewer_rows_1d={},
+        viewer_rows_2d={},
         frame_ids=[str(i) for i in range(100)],
         overlaid_idxs=[],
         _waterfall_history=None,
@@ -1177,8 +1177,8 @@ def test_overlay_selection_evicted_hydration_never_decreases_history():
         publication_store=store,
         viewer_mode=None,
         data_lock=RLock(),
-        data_1d={},
-        data_2d={},
+        viewer_rows_1d={},
+        viewer_rows_2d={},
         frame_ids=["331"],
         overlaid_idxs=list(initial_history.ids),
         _waterfall_history=initial_history,

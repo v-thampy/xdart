@@ -18,12 +18,10 @@ import pyFAI
 
 logger = logging.getLogger(__name__)
 
-# Transitional live-display mirrors.  The publication store is the normal scan
-# display source now; these dicts remain as recent-row caches for legacy
-# fallback paths and viewer modes.
-_DISPLAY_1D_CACHE_MAX = 512
-_DISPLAY_1D_VIEWER_CACHE_MAX = 4096
-_DISPLAY_2D_CACHE_MAX = 40
+# Viewer-mode row stores.  Normal scan display reads exclusively from the
+# record/publication stores; these dicts back Image/XYE/NeXus file browsers.
+_VIEWER_ROWS_1D_CACHE_MAX = 4096
+_VIEWER_ROWS_2D_CACHE_MAX = 40
 _LIVE_FLUSH_MIN_MS = 110
 _LIVE_TIMER_MIN_MS = 10
 
@@ -46,7 +44,6 @@ from xdart.modules.frame_publication import (
     publication_has_2d_errors,
 )
 from xdart.modules.wavelength import normalize_wavelength_m
-from xrd_tools.core import FrameView
 from xrd_tools.core.energy import wavelength_m_to_energy_eV
 from .ui.staticUI import Ui_Form
 from .h5viewer import H5Viewer
@@ -290,8 +287,8 @@ class staticWidget(QWidget):
         frame: LiveFrame, currently loaded frame object
         frame_ids: List of LiveFrame indices currently loaded
         frames: Dictionary of currently loaded LiveFrames
-        data_1d: Dictionary object holding all 1D data in memory
-        data_2d: Dictionary object holding all 2D data in memory
+        viewer_rows_1d: Dictionary object holding all 1D data in memory
+        viewer_rows_2d: Dictionary object holding all 2D data in memory
         command_queue: Queue, used to send commands to wrangler
         dirname: str, absolute path of current directory for scan
         file_lock: mp.Condition, process safe lock
@@ -364,7 +361,7 @@ class staticWidget(QWidget):
     def _init_data_objects(self):
         """Initialize data containers, file lock, and directory paths."""
         self.file_lock = threading.Condition()
-        # Reentrant lock guarding concurrent access to data_1d / data_2d from
+        # Reentrant lock guarding concurrent access to viewer_rows_1d / viewer_rows_2d from
         # the GUI thread, integratorThread, and fileHandlerThread. Shared with
         # all child widgets and worker threads. Always the OUTER lock when
         # paired with scan.scan_lock (data_lock → scan_lock).
@@ -387,46 +384,10 @@ class staticWidget(QWidget):
         self.publication_store = PublicationStore()
         self._frame_record_store = None
         self._overlay_flush_last_t = 0.0
-        # Live-browse caches.  Both reset at scan/viewer boundaries and are no
-        # longer authoritative for normal Int 1D/2D readiness; the
-        # PublicationStore is.  The 1D mirror is capped in scan mode to prevent
-        # long live runs from accumulating every old IntegrationResult copy.
-        # Viewer modes use a larger finite 1D cap because data_1d is their row
-        # table for XYE/NeXus previews, not the scan-display mirror. Keep it
-        # bounded so a huge viewer directory cannot grow without limit.
-        #
-        # 2D: bounded at 40.  Each data_2d entry carries the full
-        # ``map_raw`` detector image (~18 MB) plus the cake, so the cap is a
-        # memory ceiling (~40 x 18 MB ≈ 0.7 GB), not a correctness limit.
-        # 40 covers the recent-frame 2D live-browse window for most scans;
-        # raising it is a straight RAM tradeoff.  Older-than-window 2D frames
-        # are available after the run (or while Paused), not mid-run (the
-        # writer-active freeze guard refuses to read the file being appended).
-        self.data_1d = FixSizeOrderedDict(max=_DISPLAY_1D_CACHE_MAX)
-        self.data_2d = FixSizeOrderedDict(max=_DISPLAY_2D_CACHE_MAX)
-
-    def _set_1d_cache_limit(self, limit: int | None) -> None:
-        """Switch the transitional 1D mirror between scan and viewer policy.
-
-        ``FixSizeOrderedDict(max=0)`` means unbounded, so ``None`` is rejected
-        instead of silently disabling eviction.
-        """
-        if limit is None:
-            raise ValueError("1D cache limit must be finite; None disables eviction")
-        cache = getattr(self, "data_1d", None)
-        if cache is None:
-            return
-        max_value = int(limit)
-        if max_value <= 0:
-            raise ValueError("1D cache limit must be positive")
-        if hasattr(cache, "_max"):
-            cache._max = max_value
-        elif hasattr(cache, "max"):
-            cache.max = max_value
-        else:
-            return
-        while len(cache) > max_value:
-            cache.popitem(False)
+        # XYE/NeXus need a 1D row table; Image Viewer needs a bounded 2D raw
+        # table.  Neither participates in scan display readiness.
+        self.viewer_rows_1d = FixSizeOrderedDict(max=_VIEWER_ROWS_1D_CACHE_MAX)
+        self.viewer_rows_2d = FixSizeOrderedDict(max=_VIEWER_ROWS_2D_CACHE_MAX)
 
     @staticmethod
     def _timer_ms_from_env(name, default, *, minimum=_LIVE_TIMER_MIN_MS):
@@ -491,21 +452,6 @@ class staticWidget(QWidget):
         except (TypeError, ValueError):
             return idx
 
-    @staticmethod
-    def _mode_result(mapping, mode, canonicalizer):
-        if not mapping:
-            return None
-        if mode is not None and mode in mapping:
-            return mapping[mode]
-        if mode is not None:
-            for key, value in mapping.items():
-                try:
-                    if canonicalizer(str(key)) == mode:
-                        return value
-                except Exception:
-                    continue
-        return None
-
     def _publication_frame_view(
             self, idx, mode_1d: str | None, mode_2d: str | None,
             *, allow_blocking_read: bool = False):
@@ -530,79 +476,11 @@ class staticWidget(QWidget):
                 pass
         return getattr(publication, "view", None)
 
-    def _legacy_frame_view(self, idx):
-        """Build a ``FrameView`` from the transitional ``data_1d/data_2d`` mirrors."""
-        with self.data_lock:
-            frame_1d = self.data_1d.get(idx)
-            frame_2d = self.data_2d.get(idx, {})
-        if frame_2d is None:
-            frame_2d = {}
-
-        mode_1d, mode_2d = self._active_frame_record_modes()
-        result_1d = getattr(frame_1d, "int_1d", None) if frame_1d is not None else None
-        result_2d = None
-        if isinstance(frame_2d, dict):
-            result_2d = frame_2d.get("int_2d")
-        else:
-            result_2d = getattr(frame_2d, "int_2d", None)
-
-        if frame_1d is not None:
-            mode_result = self._mode_result(
-                getattr(frame_1d, "gi_1d", None) or {},
-                mode_1d,
-                legacy_to_canonical_1d,
-            )
-            if mode_result is not None:
-                result_1d = mode_result
-        gi_2d = {}
-        if isinstance(frame_2d, dict):
-            gi_2d = frame_2d.get("gi_2d", {}) or {}
-        elif frame_2d is not None:
-            gi_2d = getattr(frame_2d, "gi_2d", {}) or {}
-        mode_result = self._mode_result(gi_2d, mode_2d, legacy_to_canonical_2d)
-        if mode_result is not None:
-            result_2d = mode_result
-
-        raw = thumb = None
-        mask = None
-        if isinstance(frame_2d, dict):
-            raw = frame_2d.get("map_raw")
-            thumb = frame_2d.get("thumbnail")
-            mask = frame_2d.get("mask")
-        elif frame_2d is not None:
-            raw = getattr(frame_2d, "map_raw", None)
-            thumb = getattr(frame_2d, "thumbnail", None)
-            mask = getattr(frame_2d, "mask", None)
-        if thumb is None and frame_1d is not None:
-            thumb = getattr(frame_1d, "thumbnail", None)
-        if raw is None and frame_1d is not None:
-            raw = getattr(frame_1d, "map_raw", None)
-
-        if all(value is None for value in (result_1d, result_2d, raw, thumb)):
-            return None
-        metadata = dict(getattr(frame_1d, "scan_info", None) or {})
-        if mask is not None:
-            metadata.setdefault("mask", mask)
-        return FrameView.from_results(
-            label=idx,
-            result_1d=result_1d,
-            result_2d=result_2d,
-            raw=raw,
-            thumbnail=thumb,
-            mask_baked=thumb is not None,
-            metadata_raw=metadata,
-            incident_angle=metadata.get("incident_angle"),
-            source_path=getattr(frame_1d, "source_file", None)
-            if frame_1d is not None else None,
-            source_frame_index=getattr(frame_1d, "source_frame_idx", None)
-            if frame_1d is not None else None,
-        )
-
     def store_first_frame_view(
             self, idx, *, mode_1d: str | None = None,
             mode_2d: str | None = None,
             allow_blocking_read: bool = False):
-        """Return the selected frame view in store -> publication -> mirror order."""
+        """Return the selected scan frame view from the authoritative stores."""
         key = self._coerce_frame_label(idx)
         mode_1d, mode_2d = self._active_frame_record_modes(mode_1d, mode_2d)
 
@@ -636,7 +514,7 @@ class staticWidget(QWidget):
             key, mode_1d, mode_2d, allow_blocking_read=allow_blocking_read)
         if view is not None:
             return view
-        return self._legacy_frame_view(key)
+        return None
 
     def _init_ui(self):
         """Set up the main UI form and detector dialog."""
@@ -651,7 +529,7 @@ class staticWidget(QWidget):
         # H5Viewer
         self.h5viewer = H5Viewer(self.file_lock, self.local_path, self.dirname,
                                  self.scan, self.frame, self.frame_ids, self.frames,
-                                 self.data_1d, self.data_2d,
+                                 self.viewer_rows_1d, self.viewer_rows_2d,
                                  self.ui.hdf5Frame, data_lock=self.data_lock,
                                  publication_store=self.publication_store)
         self.ui.hdf5Frame.setLayout(self.h5viewer.layout)
@@ -660,7 +538,7 @@ class staticWidget(QWidget):
         # DisplayFrame
         self.displayframe = displayFrameWidget(self.scan, self.frame,
                                                self.frame_ids, self.frames,
-                                               self.data_1d, self.data_2d,
+                                               self.viewer_rows_1d, self.viewer_rows_2d,
                                                parent=self.ui.middleFrame,
                                                data_lock=self.data_lock,
                                                publication_store=self.publication_store)
@@ -673,7 +551,7 @@ class staticWidget(QWidget):
         # IntegratorTree
         self.integratorTree = integratorTree(
             self.scan, self.frame, self.file_lock,
-            self.frames, self.frame_ids, self.data_1d, self.data_2d,
+            self.frames, self.frame_ids,
             data_lock=self.data_lock,
             publication_store=self.publication_store)
         # Stitch worker (Stitch 1D / Stitch 2D modes): a one-shot off-thread
@@ -791,7 +669,7 @@ class staticWidget(QWidget):
         # Metadata
         self.metawidget = metadataWidget(self.scan, self.frame,
                                          self.frame_ids, self.frames,
-                                         data_1d=self.data_1d,
+                                         viewer_rows_1d=self.viewer_rows_1d,
                                          publication_store=self.publication_store,
                                          data_lock=self.data_lock)
         # Stage 4 (Direction A): the metadata table is no longer inline in the
@@ -2553,8 +2431,8 @@ class staticWidget(QWidget):
             has_psi_metadata=has_scan_data,
         )
 
-        has_1d = bool(self.data_1d)
-        has_2d = bool(self.data_2d)
+        has_1d = bool(self.viewer_rows_1d)
+        has_2d = bool(self.viewer_rows_2d)
         labels = ()
         try:
             labels = self.publication_store.labels()
@@ -3685,10 +3563,7 @@ class staticWidget(QWidget):
         self.wrangler = wranglerWidget("uninitialized", threading.Condition())
         for name, w in wranglers.items():
             self.ui.wranglerStack.addWidget(
-                w(
-                    self.fname, self.file_lock,
-                    self.scan, self.data_1d, self.data_2d,
-                )
+                w(self.fname, self.file_lock, self.scan)
             )
         self.ui.wranglerStack.currentChanged.connect(self.set_wrangler)
         self.command_queue = Queue()
@@ -4568,7 +4443,7 @@ class staticWidget(QWidget):
                 self.h5viewer, '_viewer_is_xdart', False)
             self.displayframe.update()
             # # if (len(self.frames.keys()) > 0) and (len(self.scan.frames.index) > 0):
-            # if ((len(self.data_1d.keys()) > 0) and
+            # if ((len(self.viewer_rows_1d.keys()) > 0) and
             #         (len(self.frame_ids) > 0) and
             #         (self.frame_ids[0] != 'No data') and
             #         (len(self.scan.frames.index) > 0)):
@@ -5459,7 +5334,7 @@ class staticWidget(QWidget):
             pass
         try:
             with self.data_lock:
-                for cache in (self.data_1d, self.data_2d):
+                for cache in (self.viewer_rows_1d, self.viewer_rows_2d):
                     for k in [k for k in list(cache.keys()) if int(k) not in keep]:
                         cache.pop(k, None)
             # Frame indices restart per scan: re-arm the raw self-heal neg cache.
@@ -5655,7 +5530,7 @@ class staticWidget(QWidget):
         frame.int_1d = frame_data['int_1d']
         frame.int_2d = frame_data['int_2d']
         frame.map_norm = frame_data['map_norm']
-        # self.data_2d[str(frame.idx)] = frame
+        # self.viewer_rows_2d[str(frame.idx)] = frame
 
     def start_wrangler(self):
         """Sets up wrangler, ensures properly synced args, and starts
@@ -5882,11 +5757,6 @@ class staticWidget(QWidget):
         self.h5viewer._suspend_scan_selection_loads = True
         try:
             self.h5viewer.viewer_mode = viewer_mode
-            set_cache_limit = getattr(self, "_set_1d_cache_limit", None)
-            if callable(set_cache_limit):
-                set_cache_limit(
-                    _DISPLAY_1D_VIEWER_CACHE_MAX
-                    if is_viewer else _DISPLAY_1D_CACHE_MAX)
             tree = getattr(self.wrangler, 'tree', None)
             if tree is not None:
                 # Only the actual file-Viewer *processing* modes disable the

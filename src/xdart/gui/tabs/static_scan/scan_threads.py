@@ -28,7 +28,6 @@ from pyqtgraph import Qt
 
 # This module imports
 from xdart.utils import catch_h5py_file as catch
-from .hydrated_raw import clear_hydrated_raw
 
 
 
@@ -69,22 +68,18 @@ class integratorThread(Qt.QtCore.QThread):
     writeError = Qt.QtCore.Signal(str)
 
     def __init__(self, scan, frame, file_lock,
-                 frames, frame_ids, data_1d, data_2d,
-                 parent=None, data_lock=None, publication_store=None):
+                 frames, frame_ids, parent=None, data_lock=None,
+                 publication_store=None):
         super().__init__(parent)
         self.scan = scan
         self.frame = frame
         self.file_lock = file_lock
         self.frames = frames
         self.frame_ids = frame_ids
-        self.data_1d = data_1d
-        self.data_2d = data_2d
         # Shared PublicationStore (same instance as H5Viewer / displayframe).
-        # Reintegration refreshes this store directly; the old data_1d/data_2d
-        # dicts are no longer scan-display mirrors.
+        # Reintegration refreshes this store directly; viewer-row tables are not
+        # part of the scan display path.
         self.publication_store = publication_store
-        # Shared reentrant lock guarding data_1d / data_2d access.  Falls
-        # back to a private lock when constructed without one.
         self.data_lock = data_lock if data_lock is not None else RLock()
         self.method = None
         self.lock = Condition()
@@ -424,10 +419,8 @@ class integratorThread(Qt.QtCore.QThread):
     ) -> None:
         """Refresh the publication store for one reintegrated frame.
 
-        Wave 5: normal scan-display data no longer gets mirrored into
-        ``data_1d``/``data_2d`` here.  The legacy render helpers adapt from the
-        publication store, while the old dicts remain reserved for viewer-mode
-        rows and transition-only fallback.
+        Wave 5: normal scan-display data is published through the store only.
+        Viewer-row tables are reserved for file-browser modes.
         """
         self._upsert_publication_for_frame(frame)
         self.update.emit(int(frame.idx))
@@ -632,12 +625,6 @@ class integratorThread(Qt.QtCore.QThread):
         # whose raw is in hand (see _prepare_frame_for_headless_reduction).
         self._reint_mask_logged = False
         live = bool(getattr(self, 'reintegrate_live', False))
-        with self.data_lock:
-            if do_2d:
-                self.data_2d.clear()
-                clear_hydrated_raw(self.data_2d)
-            else:
-                self.data_1d.clear()
         # Step 6: reset for a same-scan reintegrate.  begin_reintegrate empties
         # _items + bumps the generation exactly like clear() (so the mid-pass
         # display is unchanged: a partial Overall view blanks, a single frame
@@ -1035,28 +1022,21 @@ class fileHandlerThread(Qt.QtCore.QThread):
     
     def __init__(self, scan, frame, file_lock,
                  parent=None, frame_ids=None, frames=None,
-                 data_1d=None, data_2d=None, data_lock=None):
+                 data_lock=None):
         """
         Parameters
         ----------
         file_lock : multiprocessing.Condition
         frame : xdart.modules.live.LiveFrame
         scan : xdart.modules.live.LiveScan
-        data_lock : threading.RLock, optional
-            Shared lock guarding data_1d / data_2d; a private RLock is
-            created when not provided.
-
-        H3: ``frame_ids``, ``data_1d``, ``data_2d`` default to None
-        (was ``[]`` / ``{}`` — mutable defaults shared across all
-        instances that omit the kwarg).
+        H3: ``frame_ids`` defaults to None (was ``[]`` — a mutable default
+        shared across all instances that omit the kwarg).
         """
         super().__init__(parent)
         self.scan = scan
         self.frame = frame
         self.frame_ids = frame_ids if frame_ids is not None else []
         self.frames = frames
-        self.data_1d = data_1d if data_1d is not None else {}
-        self.data_2d = data_2d if data_2d is not None else {}
         self.data_lock = data_lock if data_lock is not None else RLock()
         self.file_lock = file_lock
         self.queue = Queue()

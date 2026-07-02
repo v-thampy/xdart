@@ -8,7 +8,7 @@ display depends on:
 * ``fileHandlerThread.set_datafile`` reloaded the scan from disk,
   replacing ``scan.frames`` with the (lagging) on-disk index.
 * ``H5Viewer.data_reset`` (wired to the async ``sigNewFile``) cleared
-  ``data_1d`` / ``data_2d`` / ``frames``.
+  ``viewer_rows_1d`` / ``viewer_rows_2d`` / ``frames``.
 
 Both are now gated by a live-run flag set for the duration of a
 non-batch wrangler run.  These tests pin that contract.
@@ -113,8 +113,8 @@ def _reset_viewer(live_run_active):
         _h5pool=SimpleNamespace(closed=[]),
         frames=SimpleNamespace(cleared=False),
         frame_ids=SimpleNamespace(cleared=False),
-        data_1d={1: "a", 2: "b"},
-        data_2d={1: "x"},
+        viewer_rows_1d={1: "a", 2: "b"},
+        viewer_rows_2d={1: "x"},
         publication_store=PublicationStore(),
         data_lock=_NullLock(),
         new_scan=False,
@@ -136,8 +136,8 @@ def test_data_reset_suppressed_during_live_run():
 
     viewer.data_reset()
 
-    assert viewer.data_1d == {1: "a", 2: "b"}
-    assert viewer.data_2d == {1: "x"}
+    assert viewer.viewer_rows_1d == {1: "a", 2: "b"}
+    assert viewer.viewer_rows_2d == {1: "x"}
     assert viewer.publication_store.generation == 0
     assert viewer.frames.cleared is False
     assert viewer.frame_ids.cleared is False
@@ -152,8 +152,8 @@ def test_data_reset_clears_when_not_live():
 
     viewer.data_reset()
 
-    assert viewer.data_1d == {}
-    assert viewer.data_2d == {}
+    assert viewer.viewer_rows_1d == {}
+    assert viewer.viewer_rows_2d == {}
     assert viewer.publication_store.generation == 1
     assert viewer.frames.cleared is True
     assert viewer.frame_ids.cleared is True
@@ -178,8 +178,8 @@ def _frame_select_viewer(run_writing=False, selected=('5',), cached_2d=()):
         viewer_mode=None,                       # normal/integration mode
         frame_ids=[],
         update_2d=True,
-        data_1d={},
-        data_2d={int(i): 'x' for i in cached_2d},
+        viewer_rows_1d={},
+        viewer_rows_2d={int(i): 'x' for i in cached_2d},
         scan=SimpleNamespace(frames=SimpleNamespace(index=list(range(100)))),
         ui=SimpleNamespace(listData=SimpleNamespace(selectedItems=lambda: items)),
         sigUpdate=SimpleNamespace(emit=lambda: calls.__setitem__('sig', calls['sig'] + 1)),

@@ -91,7 +91,7 @@ class DisplayDataMixin:
     Expects the host widget to expose at least:
 
     - ``self.scan``, ``self.frame``, ``self.frames``
-    - ``self.frame_ids``, ``self.data_1d``, ``self.data_2d``
+    - ``self.frame_ids``, ``self.viewer_rows_1d``, ``self.viewer_rows_2d``
     - ``self.data_lock`` (threading.RLock guarding the dicts)
     - ``self.idxs``, ``self.idxs_1d``, ``self.idxs_2d``, ``self.overall``
     - ``self.ui`` (the Ui_Form instance)
@@ -101,7 +101,7 @@ class DisplayDataMixin:
     Locking contract (M3)
     =====================
 
-    ``data_1d`` and ``data_2d`` are shared between the wrangler
+    ``viewer_rows_1d`` and ``viewer_rows_2d`` are shared between the wrangler
     thread, the integrator thread, the fileHandlerThread / the M1
     LoadFramesWorker, and the GUI thread.  All **mutating** access
     (assignment, ``del``, ``clear``, ``pop``) goes through
@@ -111,9 +111,9 @@ class DisplayDataMixin:
     lock-free.
 
     The CPython GIL makes single ``dict[k]`` lookups atomic, so
-    direct cache-hit reads like ``self.data_1d.get(idx)`` are still
+    direct cache-hit reads like ``self.viewer_rows_1d.get(idx)`` are still
     safe.  The unsafe pattern was *iterating* the dicts (``for k, v
-    in self.data_2d.items():`` or ``list(self.data_2d.keys())``)
+    in self.viewer_rows_2d.items():`` or ``list(self.viewer_rows_2d.keys())``)
     without a lock — a concurrent writer can mutate the dict
     mid-iteration and raise RuntimeError ("dictionary changed size
     during iteration").  Use ``_snapshot_data`` for those paths.
@@ -135,7 +135,7 @@ class DisplayDataMixin:
 
         Viewer modes keep using their row/file-browser caches.  Normal Int 1D/2D
         display paths read the bounded store/projection and queue hydration on a
-        miss; Role-A mirrors are written for rollback until H9 but not read here.
+        miss.
         """
         if getattr(self, "viewer_mode", None) is not None:
             return None
@@ -297,9 +297,9 @@ class DisplayDataMixin:
         """Wrap a selected ``FrameView`` in the GUI publication envelope.
 
         The session store owns integration arrays; GUI-only raw artifacts may
-        still live in the PublicationStore while mirrors remain.  Borrow raw /
-        thumbnail / raw_ref from the publication fallback when the store view is
-        intentionally integration-only, preserving current raw-panel behavior.
+        still live in the PublicationStore.  Borrow raw / thumbnail / raw_ref
+        from the publication fallback when the store view is intentionally
+        integration-only, preserving current raw-panel behavior.
         """
         if view is None:
             return None
@@ -398,15 +398,15 @@ class DisplayDataMixin:
             with self.data_lock:
                 for key in missing:
                     snapshot[key] = (
-                        self.data_1d.get(key),
-                        self.data_2d.get(key, {}),
+                        self.viewer_rows_1d.get(key),
+                        self.viewer_rows_2d.get(key, {}),
                     )
         return snapshot
 
     def _hydrate_frame_from_disk(self, idx, *, allow_blocking_read=True):
-        """Lazy-load a frame from the scan for a ``data_2d`` cache miss.
+        """Lazy-load a frame from the scan for a ``viewer_rows_2d`` cache miss.
 
-        ``data_2d`` is a bounded window (``FixSizeOrderedDict(max=20)``), so a
+        ``viewer_rows_2d`` is a bounded window (``FixSizeOrderedDict(max=20)``), so a
         cross-frame 2D selection larger than the window would otherwise drop the
         evicted frames silently.  This pulls the missing frame from the in-memory
         series (``scan.frames`` — itself a 64-deep cache that lazy-reloads from
@@ -634,7 +634,7 @@ class DisplayDataMixin:
             bg = frame_2d.get('bg_raw', 0)
             if bg is None:                  # LRU eviction nulls bg_raw
                 bg = 0
-            # Try thumbnail from data_2d, then fall back to data_1d
+            # Try thumbnail from viewer_rows_2d, then fall back to viewer_rows_1d
             thumb = frame_2d.get('thumbnail')
             if thumb is None and frame_1d is not None:
                 thumb = getattr(frame_1d, 'thumbnail', None)
@@ -793,15 +793,15 @@ class DisplayDataMixin:
         """Return 2D frame data for multiple frames (averaged).
 
         Mirrors :meth:`get_frames_map_raw` / :meth:`get_frames_int_1d`:
-        accumulates per-frame normalized intensity from ``data_2d`` and
+        accumulates per-frame normalized intensity from ``viewer_rows_2d`` and
         averages on the fly. No external state required — always reflects
-        the current selection in ``data_2d``.
+        the current selection in ``viewer_rows_2d``.
 
         Returns ``(intensity, xdata, ydata)`` or ``(None, None, None)``
         if nothing usable is loaded.
 
         M3: uses ``_snapshot_data`` for a stable view of the
-        requested idxs; concurrent writes to ``data_1d``/``data_2d``
+        requested idxs; concurrent writes to ``viewer_rows_1d``/``viewer_rows_2d``
         no longer race this iteration.
         """
         if idxs is None:
@@ -825,7 +825,7 @@ class DisplayDataMixin:
         for idx in idxs:
             frame_1d, frame_2d = snapshot.get(int(idx), (None, None))
             if frame_2d is None or frame_2d.get('int_2d') is None:
-                # data_2d cache miss (frame outside the bounded 20-deep window):
+                # viewer_rows_2d cache miss (frame outside the bounded 20-deep window):
                 # hydrate the cake from the on-disk integrated_2d stack so a
                 # selection larger than the cache averages ALL selected frames,
                 # not just the cached subset (the silent-partial bug).
@@ -960,9 +960,7 @@ class DisplayDataMixin:
             if frame_1d is None or getattr(frame_1d, 'int_1d', None) is None:
                 # Publication-store miss (or no store on a lightweight test
                 # host): hydrate from disk so a 1D sum/average / Set-Bkg over
-                # the whole scan covers ALL selected frames.  Do not fall back
-                # to the legacy mirrors in normal scan mode; those are no
-                # longer authoritative and may contain stale rows.
+                # the whole scan covers ALL selected frames.
                 lf = self._hydrate_frame_from_disk(
                     int(idx), allow_blocking_read=should_block)
                 if lf is None or getattr(lf, 'int_1d', None) is None:
@@ -1166,7 +1164,7 @@ class DisplayDataMixin:
         differs from the integration unit stored in int_1d.
 
         args:
-            frame: LiveFrame copy (data_1d entry) holding int_1d and gi_1d
+            frame: LiveFrame copy (viewer_rows_1d entry) holding int_1d and gi_1d
 
         returns:
             xdata: numpy array, x axis data for plot.
@@ -1503,7 +1501,7 @@ class DisplayDataMixin:
             try:
                 import fabio
                 with self.data_lock:
-                    _d2 = self.data_2d.get(self.idxs_2d[0]) or {}
+                    _d2 = self.viewer_rows_2d.get(self.idxs_2d[0]) or {}
                 raw = np.asarray(_d2.get('map_raw'), dtype=np.float32)
                 tif_path = os.path.join(directory, f'{base_name}_npy.tif')
                 fabio.tifimage.TifImage(data=raw).write(tif_path)

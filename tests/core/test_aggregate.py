@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Headless whole-scan aggregation (Step 7b core): xrd_tools.io.aggregate.
 
-Covers the data_1d-replacement contract: aggregate over the COMPLETE on-disk
+Covers the viewer_rows_1d-replacement contract: aggregate over the COMPLETE on-disk
 primary stack (the >64-frame coverage gate — the bug 7/8 exist to kill), the
 on-disk ⊕ in-memory-tail combine (deduped by label), and NaN handling.
 """

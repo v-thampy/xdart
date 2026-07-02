@@ -293,8 +293,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         frame: LiveFrame, currently loaded frame object
         frame_ids: List of LiveFrame indices currently loaded
         frames: Dictionary of currently loaded LiveFrames
-        data_1d: Dictionary object holding all 1D data in memory
-        data_2d: Dictionary object holding all 2D data in memory
+        viewer_rows_1d: Dictionary object holding all 1D data in memory
+        viewer_rows_2d: Dictionary object holding all 2D data in memory
         ui: Ui_Form from qtdesigner
 
     methods:
@@ -307,7 +307,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         update_plot: Updates plot data based on selections
     """
 
-    def __init__(self, scan, frame, frame_ids, frames, data_1d, data_2d,
+    def __init__(self, scan, frame, frame_ids, frames, viewer_rows_1d, viewer_rows_2d,
                  parent=None, data_lock=None, publication_store=None):
         super().__init__(parent)
         self.ui = Ui_Form()
@@ -411,11 +411,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self._logBtn.setChecked(self.ui.scale.currentText() == 'Log')
             self._logBtn.blockSignals(False)
         self.ui.scale.currentIndexChanged.connect(_sync_log_btn)
-        # Shared reentrant lock guarding data_1d / data_2d.  When created
+        # Shared reentrant lock guarding viewer_rows_1d / viewer_rows_2d.  When created
         # standalone (tests, viewer mode) fall back to a private lock.
         self.data_lock = data_lock if data_lock is not None else threading.RLock()
         self.publication_store = publication_store
-        self._init_data_objects(scan, frame, frame_ids, frames, data_1d, data_2d)
+        self._init_data_objects(scan, frame, frame_ids, frames, viewer_rows_1d, viewer_rows_2d)
         self._init_display_panes()
         self._init_plot_panes()
         self._connect_signals()
@@ -613,7 +613,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         except RuntimeError:
             pass
 
-    def _init_data_objects(self, scan, frame, frame_ids, frames, data_1d, data_2d):
+    def _init_data_objects(self, scan, frame, frame_ids, frames, viewer_rows_1d, viewer_rows_2d):
         """Initialize data references, plotting state, and index tracking."""
         self.ui.slice.setText(Chi)
 
@@ -641,8 +641,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # until the render path delegates to it (stage 3/4); reset at the same
         # accumulator-lifecycle sites (new_scan, clear_overlay).
         self._waterfall_history = None
-        self.data_1d = data_1d
-        self.data_2d = data_2d
+        self.viewer_rows_1d = viewer_rows_1d
+        self.viewer_rows_2d = viewer_rows_2d
         self.bkg_1d = 0.
         self.bkg_2d = 0.
         self.bkg_map_raw = 0.
@@ -915,9 +915,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def get_idxs(self):
         """ Return selected frame indices.
 
-        Thread-safety: snapshots of data_1d / data_2d keys are taken under
-        ``data_lock`` to avoid racing with integrator / file-handler worker
-        threads that mutate these dicts concurrently.
+        Thread-safety: viewer-row key snapshots are taken under ``data_lock`` to
+        avoid racing with viewer loaders that mutate those dicts concurrently.
         """
         self.idxs, self.idxs_1d, self.idxs_2d = [], [], []
         if len(self.frame_ids) == 0 or self.frame_ids[0] == 'No data':
@@ -941,8 +940,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 return
             self.overall = False
             with self.data_lock:
-                data_1d_keys = set(self.data_1d.keys())
-                data_2d_keys = set(self.data_2d.keys())
+                viewer_rows_1d_keys = set(self.viewer_rows_1d.keys())
+                viewer_rows_2d_keys = set(self.viewer_rows_2d.keys())
         else:
             with self.data_lock:
                 with self.scan.scan_lock:
@@ -956,30 +955,26 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
             store = getattr(self, 'publication_store', None)
             if store is not None:
-                data_1d_keys = set()
-                data_2d_keys = set()
+                viewer_rows_1d_keys = set()
+                viewer_rows_2d_keys = set()
                 try:
                     from .display_publication import publication_availability
                     pub_1d, pub_2d, _raw = publication_availability(
                         store, labels=ids)
-                    data_1d_keys |= set(pub_1d)
-                    data_2d_keys |= set(pub_2d)
+                    viewer_rows_1d_keys |= set(pub_1d)
+                    viewer_rows_2d_keys |= set(pub_2d)
                 except Exception:
                     logger.debug("publication availability lookup failed",
                                  exc_info=True)
             else:
-                with self.data_lock:
-                    # Legacy/test-host path only: normal scan display no longer
-                    # treats these mirrors as loaded when a publication store is
-                    # present.
-                    data_1d_keys = set(self.data_1d.keys())
-                    data_2d_keys = set(self.data_2d.keys())
+                viewer_rows_1d_keys = set()
+                viewer_rows_2d_keys = set()
 
         self.idxs = list(ids)
         # ``ids`` is already the effective set (all-or-selected), so intersect
         # it directly with the loaded keys for each panel.
-        self.idxs_1d = list(resolve_render_ids(ids, False, (), data_1d_keys))
-        self.idxs_2d = list(resolve_render_ids(ids, False, (), data_2d_keys))
+        self.idxs_1d = list(resolve_render_ids(ids, False, (), viewer_rows_1d_keys))
+        self.idxs_2d = list(resolve_render_ids(ids, False, (), viewer_rows_2d_keys))
 
     # ── Display generation (Stage 2) ──────────────────────────────────
 
@@ -1644,11 +1639,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if self.viewer_mode is not None:
             if len(self.frame_ids) == 0:
                 return False
-            if self.viewer_mode == 'image' and len(self.data_2d) == 0:
+            if self.viewer_mode == 'image' and len(self.viewer_rows_2d) == 0:
                 return False
-            if self.viewer_mode == 'xye' and len(self.data_1d) == 0:
+            if self.viewer_mode == 'xye' and len(self.viewer_rows_1d) == 0:
                 return False
-            if self.viewer_mode == 'nexus' and len(self.data_1d) == 0:
+            if self.viewer_mode == 'nexus' and len(self.viewer_rows_1d) == 0:
                 return False
             return True
 
@@ -1685,13 +1680,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 logger.debug("publication-store readiness check failed",
                              exc_info=True)
 
-        if len(self.idxs_1d) == 0:
-            return False
-
-        if len(self.data_1d) == 0:
-            return False
-
-        return True
+        return len(self.idxs_1d) > 0
 
     def update(self, *, expected_generation=None):
         """Re-entrancy-guarded panel update.
@@ -1749,14 +1738,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             )
             if scan_store_active:
                 # Normal scan mode now treats PublicationStore as the
-                # authoritative display source.  Old data_1d/data_2d mirrors
-                # may still exist as transitional/viewer storage, but they must
-                # not keep stale plots/cakes alive when the store says the
-                # selected scan rows are missing.
+                # authoritative display source.  Viewer-row stores must not keep
+                # stale scan plots/cakes alive when the store says the selected
+                # rows are missing.
+                has_cached = False
+            elif getattr(self, "viewer_mode", None) is None:
                 has_cached = False
             else:
                 with self.data_lock:
-                    has_cached = bool(self.data_1d) or bool(self.data_2d)
+                    has_cached = bool(self.viewer_rows_1d) or bool(self.viewer_rows_2d)
             # Panel-consistency: while a run is active, keep the current display
             # instead of blanking when there's nothing new to draw.  A silent
             # batch run populates the GUI caches only at the end, so without this
@@ -3305,9 +3295,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     self.clear_image_view()
                 return
 
-            # Apply Mask — store first (A3/A4).  The bounded mirror remains a
-            # transition fallback, but normal scan display should not need it to
-            # know the current frame's detector mask.
+            # Apply Mask — scan display reads the store; viewer modes can use
+            # their row table.
             frame_2d = None
             try:
                 pub = self._publication_from_store_for_display(
@@ -3316,9 +3305,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     _frame_1d, frame_2d = self._publication_legacy_parts(pub)
             except Exception:
                 logger.debug("store mask lookup failed", exc_info=True)
-            if not frame_2d:
+            if not frame_2d and getattr(self, "viewer_mode", None) is not None:
                 with self.data_lock:
-                    frame_2d = self.data_2d.get(self.idxs_2d[0])
+                    frame_2d = self.viewer_rows_2d.get(self.idxs_2d[0])
             mask = frame_2d.get('mask') if frame_2d is not None else None
         # Capture the saturation ceiling from the RAW integer dtype (iinfo.max)
         # BEFORE the float conversion loses it — the display then learns the
@@ -3557,7 +3546,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     def _viewer_raw_for(self, label):
         """The selected viewer frame's raw array (full or thumbnail), sourced like
-        _image_viewer_raw_payload: publication store first, then the data_2d
+        _image_viewer_raw_payload: publication store first, then the viewer_rows_2d
         mirror."""
         store = getattr(self, 'publication_store', None)
         if store is not None:
@@ -3572,7 +3561,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 if raw is not None:
                     return raw
         with self.data_lock:
-            frame_2d = self.data_2d.get(label)
+            frame_2d = self.viewer_rows_2d.get(label)
         if frame_2d is not None:
             raw = frame_2d.get('map_raw')
             if raw is None:
@@ -3631,7 +3620,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     def _viewer_xye_for(self, label):
         """The selected XYE frame's (x, y), sourced like _xye_plot_payload:
-        publication store first, then the data_1d mirror."""
+        publication store first, then the viewer row table."""
         store = getattr(self, 'publication_store', None)
         if store is not None:
             pub = store.get(label)
@@ -3641,7 +3630,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 return (np.asarray(pub.view.axis_1d.values, dtype=float),
                         np.asarray(pub.view.intensity_1d, dtype=float))
         with self.data_lock:
-            fr = self.data_1d.get(label)
+            fr = self.viewer_rows_1d.get(label)
         int_1d = getattr(fr, 'int_1d', None) if fr is not None else None
         if int_1d is None:
             return None
@@ -4096,7 +4085,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         idx0 = idxs[0]
         src = ''
         with self.data_lock:
-            d1 = self.data_1d.get(idx0)
+            d1 = self.viewer_rows_1d.get(idx0)
         if d1 is not None:
             info = getattr(d1, 'scan_info', None) or {}
             src = info.get('source_file', '') or ''
@@ -4209,9 +4198,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if idx is None:
             return
 
-        # Try the publication store first.  The old data_1d/data_2d mirrors are
-        # still used by viewer modes, but integration previews should survive
-        # once Role-A mirror writes are gone.
+        # Try the publication store first.  Viewer rows are used only by file
+        # browser modes; integration previews are store-only.
         thumb = None
         full_res = False
         try:
@@ -4233,18 +4221,18 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         except Exception:
             logger.debug("store image-preview lookup failed", exc_info=True)
 
-        if thumb is None:
+        if thumb is None and getattr(self, "viewer_mode", None) is not None:
             with self.data_lock:
-                frame = self.data_1d.get(int(idx))
+                frame = self.viewer_rows_1d.get(int(idx))
             if frame is not None:
                 thumb = getattr(frame, 'thumbnail', None)
 
         # Fall back to 2D data dict.  Snapshot under data_lock: a concurrent
         # eviction between an `in` check and the read raised KeyError on the
         # GUI thread.
-        if thumb is None:
+        if thumb is None and getattr(self, "viewer_mode", None) is not None:
             with self.data_lock:
-                d2 = self.data_2d.get(int(idx))
+                d2 = self.viewer_rows_2d.get(int(idx))
             if d2 is not None:
                 thumb = d2.get('map_raw')
                 full_res = thumb is not None

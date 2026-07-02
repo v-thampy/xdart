@@ -380,7 +380,6 @@ class imageThread(wranglerThread):
         timeout: float or int, how long to continue checking for new
             data.
         command: command passed to start, stop etc.
-        data_1d/2d: Dictionaries to store processed data for plotting
 
     signals:
         showLabel: str, sends out text to be used in specLabel
@@ -430,8 +429,6 @@ class imageThread(wranglerThread):
             gi_mode_2d,
             command,
             scan,
-            data_1d,
-            data_2d,
             live_mode=False,
             max_cores=1,
             parent=None):
@@ -495,8 +492,6 @@ class imageThread(wranglerThread):
         self.max_cores = max_cores
         self.command = command
         self.scan = scan
-        self.data_1d = data_1d
-        self.data_2d = data_2d
 
         self.user = None
         self.mask = None
@@ -2175,9 +2170,7 @@ class imageThread(wranglerThread):
 
         # ── GUI data (skip in batch mode — no one is looking) ────────────
         # Wave 5: live scan display is published through _published_frames and
-        # consumed by static_scan_widget.update_data into PublicationStore.  Do
-        # not mirror scan-mode rows into data_1d/data_2d here; those dicts are
-        # now viewer-mode / transition-only state.
+        # consumed by static_scan_widget.update_data into PublicationStore.
         _t_h5_total = _t_h5_wait = _t_h5_write = 0.0
 
         # ── In-memory accumulation (no disk I/O — batch flush handles that) ──

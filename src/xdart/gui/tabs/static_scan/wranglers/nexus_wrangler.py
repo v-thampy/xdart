@@ -108,14 +108,12 @@ class nexusWrangler(wranglerWidget):
     """
     showLabel = QtCore.Signal(str)
 
-    def __init__(self, fname, file_lock, scan, data_1d, data_2d, parent=None):
+    def __init__(self, fname, file_lock, scan, parent=None):
         super().__init__(fname, file_lock, parent)
 
         self.poni = None
         self.command = None
         self.scan = scan
-        self.data_1d = data_1d
-        self.data_2d = data_2d
 
         # Attributes
         self.nexus_file = ''
@@ -275,8 +273,6 @@ class nexusWrangler(wranglerWidget):
             self.gi_mode_2d,
             self.command,
             self.scan,
-            self.data_1d,
-            self.data_2d,
             entry=self.entry,
             parent=self,
         )
@@ -565,8 +561,6 @@ class nexusWrangler(wranglerWidget):
             self.gi_mode_2d,
             self.command,
             self.scan,
-            self.data_1d,
-            self.data_2d,
             entry=self.entry,
             parent=self,
         )
@@ -580,8 +574,6 @@ class nexusWrangler(wranglerWidget):
         self.thread.file_lock = self.file_lock
         self.thread.scan_args = self.scan_args
         self.thread.scan = self.scan
-        self.thread.data_1d = self.data_1d
-        self.thread.data_2d = self.data_2d
         self.thread.command = self.command
         # R3-B: the freshly-recreated thread defaults mask_sentinel=True; push
         # the UI's value so the NeXus opt-out actually reaches _resolve_frame_mask.

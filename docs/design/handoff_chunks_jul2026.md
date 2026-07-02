@@ -50,7 +50,7 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 |----|-------|--------|------|---------|---------|-------|
 | H6 (W) | Per-mode subgroup writes, GUI+headless via one path; production multi-mode spine gate | M | med | Round-11 durability closed; multi-mode seam real | RC-3✓, H1✓ | **DONE** `c0b80b02` |
 | H8 (8a) | PublicationStore → bounded projection; delete legacy fallback; explicit-subset gate | M/L | med (was high; H7✓+H1✓+H6✓ de-risked) | triple-store divergence class impossible | H6✓, H7✓, Session-1 §E live gate | **DONE** this commit + `e509094c` (H2/H3 commit-0; Wave-3 retry-counter carry-in) |
-| H9 (8b) | Delete Role-A `data_1d/data_2d/hydrated_raw` (~76 refs; keep Role-B) | M | med | **greenfield done-test**; ~0.5-1GB mirrors gone; H7b completes | H8 | **QUEUED** (Wave 5a, `h9_8b_retire_mirrors.md` — pulled PRE-tag) |
+| H9 (8b) | Delete Role-A `data_1d/data_2d/hydrated_raw` (~76 refs; keep Role-B) | M | med | **greenfield done-test**; ~0.5-1GB mirrors gone; H7b completes | H8 | **DONE** this commit |
 | H10 (7c) | Cadence/eviction policy → session + `max_heavy_bytes` | M | low-med | second-sink recipe; detector-aware caps | H9, ADR-0005 reaffirm | open (ADR decision owed) |
 | H2 | Thin-tail axis-interning / max_items | S | low | long-scan memory bounded | — | **DONE** `e509094c` |
 | H3 | Memory-plateau acceptance gate | S | low | boundedness regression-detected | — | **DONE** `e509094c` |
@@ -198,9 +198,9 @@ Lane D (tests/bounds):  {H2, H3, H4, H5} — anytime, no dependencies
 | H5 | Stage-6 parity test (A8) | S | — | open |
 | H6 | W: per-mode subgroup write wiring + production multi-mode spine gate (A2) | M | H1, RC-3 | done (this commit) |
 | H7a | Typed read result + policy table + render authority (display-side, fallbacks KEPT) (A3) | M | round-2 fix — **PULLED FORWARD pre-release** after 3 live bugs of this class; `codex_tasks/h7_typed_reads_render_authority.md` | done |
-| H7b | Remove the fallback tiers behind the H7a accessor | S | H7a; rides 8a | partial: scan read-tier removed; Role-A deletion at H9/8b |
+| H7b | Remove the fallback tiers behind the H7a accessor | S | H7a; rides 8a | **DONE** this commit |
 | H8 | 8a flip: PublicationStore→bounded projection; remove update_plot fallback; §0.4 blockers; explicit-subset hydrate-all-or-refuse gate | M/L | H6, H7, H13; live-gated (Session 1 §E) | done this commit |
-| H9 | 8b delete Role-A `data_1d/data_2d/hydrated_raw` (keep Role-B `_ViewerRows`); greenfield done-test | M | H8 | open |
+| H9 | 8b delete Role-A `data_1d/data_2d/hydrated_raw` (keep Role-B `_ViewerRows`); greenfield done-test | M | H8 | **DONE** this commit |
 | H10 | 7c cadence→session per ADR decision + optional `max_heavy_bytes` budget | M | H9, ADR decision | open |
 | H11 | ViewerModeHandler seam (rides inside H8/H9 commits) | M | with H8/H9 | open |
 | H12 | Liveness step 5: render-leg instrumentation, then level-reuse/subsampled percentiles (`image_widget.py`) | M | — | open |
@@ -320,5 +320,5 @@ git -C ~/repos/xrd-tools push origin main --follow-tags     # release.yml builds
 #    git fetch --prune
 ```
 
-**Session 2 (post-H8/H9):** 8a scroll-back latency budget · 8b done-test spot checks · 7c ·
+**Session 2 (post-H9):** 8a scroll-back latency budget · 8b done-test spot checks · 7c ·
 Phase 8 retirement gate · ADR-0006 STEP 2 confirm (if beamline time allows).

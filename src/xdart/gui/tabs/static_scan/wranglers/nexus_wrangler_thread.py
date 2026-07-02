@@ -111,8 +111,6 @@ class nexusThread(wranglerThread):
             gi_mode_2d,
             command,
             scan,
-            data_1d,
-            data_2d,
             entry='entry',
             parent=None):
 
@@ -129,8 +127,6 @@ class nexusThread(wranglerThread):
         self.gi_mode_2d = gi_mode_2d
         self.command = command
         self.scan = scan
-        self.data_1d = data_1d
-        self.data_2d = data_2d
         self.entry = entry
         # N1: project root for portable @source_base; set from the wrangler in
         # setup() (None -> absolute raw paths, back-compat).
@@ -334,10 +330,9 @@ class nexusThread(wranglerThread):
                         self._xye_buffer.append((frame.idx, frame))
 
                 # ── Serial accumulation into the scan ─────────────
-                # scan.add_frame / data_1d / data_2d mutations and
-                # the sigUpdate emit happen serially; scan isn't
-                # thread-safe for concurrent writes, and the GUI
-                # widgets it feeds aren't either.
+                # scan.add_frame and the sigUpdate emit happen serially; scan
+                # isn't thread-safe for concurrent writes, and the GUI widgets
+                # it feeds aren't either.
                 for frame in frames:
                     if frame is None:
                         continue
@@ -510,12 +505,9 @@ class nexusThread(wranglerThread):
         ``scan.add_frame`` is serialised — scan isn't thread-safe
         for concurrent writes.
 
-        After D1 (unified handoff): we no longer write
-        ``self.data_1d``/``self.data_2d`` directly.  Instead we leave
-        the frame in ``self._published_frames[frame.idx]`` and emit
-        ``sigUpdate``; ``static_scan_widget.update_data`` pops it and
-        owns the dict updates + bounded eviction.  Same single
-        source-of-truth contract that imageThread's live path uses.
+        After D1 (unified handoff): we leave the frame in
+        ``self._published_frames[frame.idx]`` and emit ``sigUpdate``;
+        ``static_scan_widget.update_data`` publishes it into the shared store.
         """
         # In-memory accumulate only — the chunked flush at the end of
         # the dispatch loop (and the final ``save_to_nexus(finalize=True)``

@@ -166,7 +166,7 @@ class DisplayPlotMixin:
     Expects the host widget to expose at least:
 
     - ``self.ui`` (the Ui_Form instance)
-    - ``self.scan``, ``self.frame_ids``, ``self.data_1d``, ``self.data_2d``
+    - ``self.scan``, ``self.frame_ids``, ``self.viewer_rows_1d``, ``self.viewer_rows_2d``
     - ``self.idxs``, ``self.idxs_1d``
     - ``self.plot``, ``self.plot_win``, ``self.plot_layout``
     - ``self.wf_widget``, ``self.wf_*`` (waterfall state)
@@ -436,13 +436,15 @@ class DisplayPlotMixin:
             slice_suffix = ''
         if hasattr(self, "_snapshot_data"):
             snapshot = self._snapshot_data(idxs)
-        else:
-            data_1d = getattr(self, "data_1d", {}) or {}
-            data_2d = getattr(self, "data_2d", {}) or {}
+        elif getattr(self, "viewer_mode", None) is not None:
+            viewer_rows_1d = getattr(self, "viewer_rows_1d", {}) or {}
+            viewer_rows_2d = getattr(self, "viewer_rows_2d", {}) or {}
             snapshot = {
-                int(idx): (data_1d.get(int(idx)), data_2d.get(int(idx), {}))
+                int(idx): (viewer_rows_1d.get(int(idx)), viewer_rows_2d.get(int(idx), {}))
                 for idx in idxs
             }
+        else:
+            snapshot = {}
         for idx in idxs:
             idx = int(idx)
             frame_1d, frame_2d = snapshot.get(idx, (None, None))
@@ -830,7 +832,14 @@ class DisplayPlotMixin:
         if (
             len(self.frame_ids) == 0
             or (
-                len(self.data_1d) == 0
+                getattr(self, "viewer_mode", None) is not None
+                and
+                len(self.viewer_rows_1d) == 0
+                and not using_publication
+                and not has_store_rows
+            )
+            or (
+                getattr(self, "viewer_mode", None) is None
                 and not using_publication
                 and not has_store_rows
             )
@@ -990,8 +999,8 @@ class DisplayPlotMixin:
 
         Reads the publication's ``metadata_raw`` (the store holds every frame's
         1D publication in its unbounded light tier, so a whole-scan waterfall is
-        covered), falling back to the in-memory ``frames`` browse cache then the
-        legacy ``data_1d`` mirror.  Returns ``{}`` when nothing is found."""
+        covered), falling back to the in-memory ``frames`` browse cache. Viewer
+        mode may consult its row table. Returns ``{}`` when nothing is found."""
         idx = int(idx)
         store = getattr(self, 'publication_store', None)
         if store is not None:
@@ -1000,8 +1009,8 @@ class DisplayPlotMixin:
                 return pub.metadata_raw
         frames = getattr(self, 'frames', None)
         fr = frames.get(idx) if hasattr(frames, 'get') else None
-        if fr is None:
-            d1 = getattr(self, 'data_1d', None)
+        if fr is None and getattr(self, "viewer_mode", None) is not None:
+            d1 = getattr(self, 'viewer_rows_1d', None)
             fr = d1.get(idx) if hasattr(d1, 'get') else None
         return getattr(fr, 'scan_info', None) or {}
 
@@ -1564,9 +1573,9 @@ class DisplayPlotMixin:
             _range = np.array([cen - wid, cen + wid])
 
             # Phase 3c: wavelength is a scan constant, so source the frame for
-            # _get_wavelength from the in-memory frames cache (not data_1d); it
+            # _get_wavelength from the in-memory frames cache (not viewer_rows_1d); it
             # falls back to the scan-level / NeXus wavelength when the frame
-            # isn't resident, so no per-frame data_1d entry is needed.
+            # isn't resident, so no per-frame viewer_rows_1d entry is needed.
             if not self.idxs_1d:
                 self.update()
                 return
