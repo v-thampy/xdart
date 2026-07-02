@@ -1251,6 +1251,20 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
     else:
         primary = render_1d if mode in _PLOT_PRIMARY_MODES else render_2d
 
+    # Overlay/Waterfall preserve (Phase-5 cap-store regression fix): when the 1D
+    # accumulator already holds frames but THIS selection's 1D read is empty (the
+    # selected frame is evicted past the store cap, awaiting async hydration), keep
+    # PLOT_1D drawable so the overlay is NOT wiped — _overlay_waterfall_payload
+    # re-emits the existing accumulator and the evicted frame backfills on a later
+    # hydration tick.  The 2D panels stay blank (render_2d empty).  Clearing still
+    # happens on Clear / a mode change / a new scan (those empty prev_overlaid_ids
+    # or change the reset_key).  overlay_read_failure_action encodes the policy.
+    _overlay_preserve_1d = (
+        mode in _SCAN_MODES
+        and not render_1d
+        and overlay_read_failure_action(method, bool(prev_overlaid_ids)) == 'preserve'
+    )
+
     x_label, _sym = x_axis_for_unit(plot_unit)
 
     # Failed load -> ERROR with a message; never a half-populated display
@@ -1265,6 +1279,11 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
         error_message = None
         render_ids = primary
         if render_ids:
+            load_status = LoadStatus.READY
+        elif _overlay_preserve_1d:
+            # Keep the state READY so PLOT_1D draws + re-emits the 1D overlay
+            # accumulator; the 2D panels stay blank (render_2d empty -> has_data
+            # False), and the evicted frame backfills on a later hydration tick.
             load_status = LoadStatus.READY
         elif loading:
             load_status = LoadStatus.LOADING
@@ -1300,7 +1319,11 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
         visible=True, has_data=(raw_src is not RawSource.NONE),
         source=raw_src, apply_mask=apply_mask_for(raw_src))
     cake_panel = PanelPlan(visible=True, has_data=ready and bool(render_2d))
-    plot_panel = PanelPlan(visible=True, has_data=ready and bool(render_1d))
+    # PLOT_1D draws on the normal READY path OR the Overlay/Waterfall preserve path
+    # (accumulator kept alive though this frame's 1D read was empty).
+    plot_panel = PanelPlan(
+        visible=True,
+        has_data=(ready and bool(render_1d)) or _overlay_preserve_1d)
 
     raw_key = PanelKey(PanelRole.RAW_2D)
     cake_key = PanelKey(PanelRole.CAKE_2D)
