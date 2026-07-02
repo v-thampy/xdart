@@ -7,6 +7,8 @@
 
 # Other imports
 import logging
+import os
+import time
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -46,6 +48,44 @@ from xrd_tools.core.invalid import (
 #: legacy GUI fallback when the raw integer dtype was lost upstream (float
 #: frame); core never hardcodes 65535.
 _DEFAULT_SAT_CEIL = 65535.0
+_LEVEL_SUBSAMPLE_STRIDE = 4
+_LEVEL_SUBSAMPLE_MIN_PIXELS = 4096
+_LEVEL_CACHE_TTL_S = 1.0
+
+
+def _subsample_for_levels(arr, mask=None):
+    arr = np.asarray(arr)
+    if arr.ndim >= 2 and arr.size > _LEVEL_SUBSAMPLE_MIN_PIXELS:
+        slices = (slice(None, None, _LEVEL_SUBSAMPLE_STRIDE),
+                  slice(None, None, _LEVEL_SUBSAMPLE_STRIDE))
+        if arr.ndim > 2:
+            slices = slices + (slice(None),) * (arr.ndim - 2)
+        sampled = arr[slices]
+        if mask is None:
+            return sampled, True
+        sampled_mask = np.asarray(mask)[slices]
+        if np.any(sampled_mask):
+            return (sampled, sampled_mask), True
+    if mask is None:
+        return arr, False
+    return (arr, np.asarray(mask)), False
+
+
+def _level_population(displayed, pop_mask):
+    (sample, sample_mask), _ = _subsample_for_levels(displayed, pop_mask)
+    return sample[sample_mask]
+
+
+def _finite_minmax(arr):
+    sample, sampled = _subsample_for_levels(arr)
+    finite = np.isfinite(sample)
+    if not np.any(finite) and sampled:
+        sample = np.asarray(arr)
+        finite = np.isfinite(sample)
+    if not np.any(finite):
+        return 0.0, 1.0
+    values = sample[finite]
+    return float(np.nanmin(values)), float(np.nanmax(values))
 
 
 def _ceiling_safe_levels(displayed, raw, pct):
@@ -63,7 +103,7 @@ def _ceiling_safe_levels(displayed, raw, pct):
     ceiling (an all-/mostly-saturated frame), avoiding NaN levels and the
     'autoscale to data min/max' regression.
     """
-    disp = np.asarray(displayed, dtype=float)
+    disp = np.asarray(displayed)
     finite = np.isfinite(disp)
     if not finite.any():
         return (0.0, 1.0)
@@ -72,13 +112,12 @@ def _ceiling_safe_levels(displayed, raw, pct):
     sat_ceil = _integer_saturation_ceiling(raw_arr)
     if sat_ceil is None:
         sat_ceil = _DEFAULT_SAT_CEIL
-    raw_a = raw_arr.astype(float)
-    if raw_a.shape == disp.shape:
-        ceiling = np.isfinite(raw_a) & (
-            (raw_a == sat_ceil) | (raw_a >= _UINT32_CEIL))
+    if raw_arr.shape == disp.shape:
+        ceiling = np.isfinite(raw_arr) & (
+            (raw_arr == sat_ceil) | (raw_arr >= _UINT32_CEIL))
         if ceiling.any() and (finite & ~ceiling).any():
             pop_mask = finite & ~ceiling
-    lo, hi = np.nanpercentile(disp[pop_mask], pct)
+    lo, hi = np.nanpercentile(_level_population(disp, pop_mask), pct)
     return (float(lo), float(hi))
 
 
@@ -187,6 +226,7 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
 
         self.raw_image = np.zeros(0)
         self.displayed_image = np.zeros(0)
+        self._level_cache = None
         self.show()
 
     def make_pos_label(self, itemPos=(1, 0), parentPos=(1, 1), offset=(0, -20)):
@@ -205,8 +245,36 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
     def setRect(self, rect):
         self.imageItem.setRect(rect)
 
+    def _display_array_for_scale(self, scale):
+        if scale == 'Linear':
+            return np.asarray(self.raw_image)
+        return np.array(self.raw_image, dtype=float, copy=True)
+
+    def _cached_levels(self, scale, cmap, pct):
+        raw = np.asarray(self.raw_image)
+        displayed = np.asarray(self.displayed_image)
+        key = (
+            scale,
+            cmap,
+            tuple(pct),
+            tuple(displayed.shape),
+            str(displayed.dtype),
+            str(raw.dtype),
+        )
+        now = time.perf_counter()
+        cached = self._level_cache
+        if (cached is not None and cached.get("key") == key
+                and now - cached.get("time", 0.0) <= _LEVEL_CACHE_TTL_S):
+            return cached["levels"], True
+        levels = _ceiling_safe_levels(displayed, raw, pct)
+        self._level_cache = {"key": key, "time": now, "levels": levels}
+        return levels, False
+
     def update_image(self, scale='Linear', cmap='viridis', **kwargs):
-        self.displayed_image = np.asarray(np.copy(self.raw_image), dtype=float)
+        perf = bool(os.environ.get("XDART_PERF"))
+        t0 = time.perf_counter() if perf else 0.0
+        self.displayed_image = self._display_array_for_scale(scale)
+        t_copy = time.perf_counter() if perf else 0.0
         # All-NaN / empty images poison every nanpercentile below (RuntimeWarning
         # + NaN levels -> pyqtgraph autoscale weirdness).  Higher layers normally
         # block these, but the widget guards itself: show the raw image with no
@@ -214,6 +282,15 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
         if (self.displayed_image.size == 0
                 or not np.isfinite(self.displayed_image).any()):
             self.imageItem.setImage(self.displayed_image)
+            if perf:
+                logger.info(
+                    "[PERF] image_widget render: copy=%.0fms transform=0ms "
+                    "levels=0ms setImage=%.0fms hist=0ms total=%.0fms "
+                    "level_cache=skip",
+                    (t_copy - t0) * 1000,
+                    (time.perf_counter() - t_copy) * 1000,
+                    (time.perf_counter() - t0) * 1000,
+                )
             return
 
         cmap = 'viridis' if cmap == 'Default' else cmap
@@ -226,9 +303,7 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
                 self.displayed_image -= (min_val - 1)
             self.displayed_image = np.log10(self.displayed_image)
 
-            levels = _ceiling_safe_levels(self.displayed_image, self.raw_image,
-                                          (0.1, 99.9))
-            self.imageItem.setImage(self.displayed_image, levels=levels, **kwargs)
+            pct = (0.1, 99.9)
 
             self.histogram.axis.setLogMode(True)
         elif scale == 'Sqrt':
@@ -240,9 +315,7 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
             else:
                 self.displayed_image = np.sqrt(self.displayed_image)
 
-            levels = _ceiling_safe_levels(self.displayed_image, self.raw_image,
-                                          (0.5, 99.9))
-            self.imageItem.setImage(self.displayed_image, levels=levels, **kwargs)
+            pct = (0.5, 99.9)
 
         else:
             # Linear autoscale: clip the top/bottom a bit harder than the old
@@ -251,25 +324,38 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
             # _ceiling_safe_levels additionally drops exact detector-ceiling
             # (65535 / uint32) pixels from the percentile population so an
             # unmasked saturated block (toggle OFF) can't blow out the scale.
-            levels = _ceiling_safe_levels(self.displayed_image, self.raw_image,
-                                          (2, 98))
-            self.imageItem.setImage(self.displayed_image, levels=levels, **kwargs)
+            pct = (2, 98)
 
             self.histogram.axis.setLogMode(False)
 
+        t_transform = time.perf_counter() if perf else 0.0
+        levels, cache_hit = self._cached_levels(scale, cmap, pct)
+        t_levels = time.perf_counter() if perf else 0.0
+        self.imageItem.setImage(self.displayed_image, levels=levels, **kwargs)
+        t_setimage = time.perf_counter() if perf else 0.0
         self.histogram.setColorMap(cm)
         # Use nan-aware min/max: detector/processed frames carry NaN-masked
         # pixels, and np.min/np.max return NaN there.  NaN colorbar limits make
         # setLevels() clamp the nanpercentile levels to [NaN, NaN], so the image
         # falls back to pyqtgraph autoscale (data min/max) instead of the
         # percentile range — the Image Viewer "scaled to min/max" symptom.
-        if np.isfinite(self.displayed_image).any():
-            low, high = (np.nanmin(self.displayed_image),
-                         np.nanmax(self.displayed_image))
-        else:
-            low, high = 0.0, 1.0
+        low, high = _finite_minmax(self.displayed_image)
         self.histogram.lo_lim, self.histogram.hi_lim = low, high
         self.histogram.setLevels(values=levels)
+        if perf:
+            t_hist = time.perf_counter()
+            logger.info(
+                "[PERF] image_widget render: copy=%.0fms transform=%.0fms "
+                "levels=%.0fms setImage=%.0fms hist=%.0fms total=%.0fms "
+                "level_cache=%s",
+                (t_copy - t0) * 1000,
+                (t_transform - t_copy) * 1000,
+                (t_levels - t_transform) * 1000,
+                (t_setimage - t_levels) * 1000,
+                (t_hist - t_setimage) * 1000,
+                (t_hist - t0) * 1000,
+                "hit" if cache_hit else "miss",
+            )
 
 
 class pgXDImageItem(pg.ImageItem):

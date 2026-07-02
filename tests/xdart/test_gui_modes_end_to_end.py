@@ -973,6 +973,31 @@ def test_image_widget_linear_levels_are_2_98_percentile(qapp):
         lo, hi = w.imageItem.levels
         expected = np.nanpercentile(img, (2, 98))
         assert np.isclose(lo, expected[0]) and np.isclose(hi, expected[1])
+        assert np.shares_memory(w.displayed_image, w.raw_image)
+    finally:
+        w.deleteLater()
+        qapp.processEvents()
+
+
+def test_image_widget_reuses_levels_for_short_live_flush(qapp, monkeypatch):
+    from xdart.gui.widgets import pgImageWidget
+    import xdart.gui.widgets.image_widget as image_widget_mod
+
+    calls = []
+
+    def _levels(displayed, raw, pct):
+        calls.append((tuple(np.asarray(displayed).shape), tuple(pct)))
+        return (0.0, 1.0)
+
+    monkeypatch.setattr(image_widget_mod, "_ceiling_safe_levels", _levels)
+    w = pgImageWidget(lockAspect=True, raw=True)
+    try:
+        img = np.arange(10000, dtype=float).reshape(100, 100)
+        w.setImage(img, scale="Linear", cmap="viridis")
+        w.update_image(scale="Linear", cmap="viridis")
+        w.update_image(scale="Sqrt", cmap="viridis")
+
+        assert calls == [((100, 100), (2, 98)), ((100, 100), (0.5, 99.9))]
     finally:
         w.deleteLater()
         qapp.processEvents()
