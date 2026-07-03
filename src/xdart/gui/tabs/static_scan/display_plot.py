@@ -1268,6 +1268,27 @@ class DisplayPlotMixin:
 
     # ── Curve / layout helpers ────────────────────────────────────
 
+    @staticmethod
+    def _is_live_current_trace(frame_id) -> bool:
+        return "· current" in str(frame_id)
+
+    @staticmethod
+    def _current_trace_color():
+        bg = pg.getConfigOption("background")
+        text = str(bg).strip().lower()
+        if text in {"w", "white", "#fff", "#ffffff"}:
+            return (95, 95, 95)
+        try:
+            if isinstance(bg, (tuple, list)) and len(bg) >= 3:
+                r, g, b = (float(bg[0]), float(bg[1]), float(bg[2]))
+                if max(r, g, b) <= 1.0:
+                    r, g, b = r * 255, g * 255, b * 255
+                luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+                return (95, 95, 95) if luminance > 145 else (170, 170, 170)
+        except Exception:
+            pass
+        return (170, 170, 170)
+
     def setup_curves(self):
         """Initialize curves for line plots
         """
@@ -1282,17 +1303,21 @@ class DisplayPlotMixin:
                 frame_ids += f', {frame_name}'
             frame_ids = [frame_ids + ']']
 
-        colors = self.get_colors()
+        colors = iter(self.get_colors())
         self.curves = []
-        for color, frame_id in zip(colors, frame_ids):
-            pen = color
-            if "· current" in str(frame_id):
-                pen = pg.mkPen(color=color, style=Qt.QtCore.Qt.DashLine)
+        for frame_id in frame_ids:
+            current = self._is_live_current_trace(frame_id)
+            color = self._current_trace_color() if current else next(colors)
+            pen = pg.mkPen(
+                color=color,
+                width=1.0 if current else 1.4,
+                style=Qt.QtCore.Qt.DashLine if current else Qt.QtCore.Qt.SolidLine,
+            )
             self.curves.append(self.plot.plot(
                 pen=pen,
                 symbolBrush=color,
                 symbolPen=color,
-                symbolSize=4,
+                symbolSize=3 if current else 4,
                 name=frame_id,
             ))
 
@@ -1589,9 +1614,14 @@ class DisplayPlotMixin:
                 if hasattr(self, '_plot_axis_info')
                    and 0 <= idx < len(self._plot_axis_info)
                 else None)
+        display_gi = (
+            self._display_gi_enabled(self.scan)
+            if hasattr(self, "_display_gi_enabled")
+            else bool(getattr(self.scan, "gi", False))
+        )
 
         # Determine the slice axis label
-        if (info and not self.scan.gi
+        if (info and not display_gi
                 and info.get('axis') == 'azimuthal'
                 and info['source'] in ('2d', '1d_2d')):
             # Displaying χ (azimuthal) in standard mode: slice along the cake's
@@ -1674,15 +1704,20 @@ class DisplayPlotMixin:
                 if hasattr(self, '_plot_axis_info')
                    and 0 <= plotUnit < len(self._plot_axis_info)
                 else None)
+        display_gi = (
+            self._display_gi_enabled(self.scan)
+            if hasattr(self, "_display_gi_enabled")
+            else bool(getattr(self.scan, "gi", False))
+        )
 
         # In GI mode or when metadata explicitly defines the slice axis,
         # no unit conversion is needed — just refresh
-        if self.scan.gi or (info and info['source'] not in ('2d', '1d_2d')):
+        if display_gi or (info and info['source'] not in ('2d', '1d_2d')):
             self.update()
             return
 
         # Standard mode, chi axis: handle Q ↔ 2θ conversion
-        if not self.scan.gi and info and info.get('axis') == 'azimuthal':
+        if not display_gi and info and info.get('axis') == 'azimuthal':
             imageUnit = self.ui.imageUnit.currentIndex()
             cen = self.ui.slice_center.value()
             wid = self.ui.slice_width.value()

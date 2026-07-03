@@ -83,6 +83,7 @@ from .controls_logic import (
     build_control_panel_state,
     build_native_int_reduction_plan_from_scan,
     coerce_control_edit_value,
+    processing_config_from_scan,
     run_target_readiness_note,
     tool_from_mode_text,
 )
@@ -1157,6 +1158,44 @@ class staticWidget(QWidget):
     def _controls_v2_apply_snapshot_to_scan(self, snapshot: dict, scan=None) -> None:
         scan = scan if scan is not None else getattr(self, "scan", None)
         self._controls_v2_apply_native_int_snapshot_to_scan(snapshot, scan)
+
+    @staticmethod
+    def _scan_data_reduction_config_snapshot(scan) -> dict:
+        if scan is None:
+            return {}
+        try:
+            from xrd_tools.reduction.provenance_config import (
+                build_reduction_config,
+            )
+            config, _inputs = build_reduction_config(scan)
+        except Exception:
+            config = {
+                "bai_1d_args": copy.deepcopy(
+                    getattr(scan, "bai_1d_args", {}) or {}
+                ),
+                "bai_2d_args": copy.deepcopy(
+                    getattr(scan, "bai_2d_args", {}) or {}
+                ),
+            }
+            gic = copy.deepcopy(getattr(scan, "gi_config", {}) or {})
+            if gic:
+                config["gi_config"] = gic
+        config = copy.deepcopy(config)
+        config["gi"] = bool(getattr(scan, "gi", False))
+        return config
+
+    def _stamp_scan_data_reduction_config(self, scan=None) -> None:
+        """Record the config that produced the data currently on display."""
+
+        scan = scan if scan is not None else getattr(self, "scan", None)
+        if scan is None:
+            return
+        config = staticWidget._scan_data_reduction_config_snapshot(scan)
+        try:
+            scan.reduction_config = copy.deepcopy(config)
+            scan._display_reduction_config = copy.deepcopy(config)
+        except Exception:
+            logger.debug("failed to stamp scan reduction config", exc_info=True)
 
     def _controls_v2_push_threshold_to_integrator(self) -> None:
         thread = getattr(getattr(self, "integratorTree", None),
@@ -2495,6 +2534,11 @@ class staticWidget(QWidget):
             run_target = RunTarget.LOADED_SCAN
         else:
             run_target = RunTarget.NONE
+        write_mode = "Append"
+        try:
+            write_mode = self.controls.write_mode()
+        except Exception:
+            pass
         return ControlState(
             tool=tool,
             mode=meas_mode,
@@ -2509,6 +2553,12 @@ class staticWidget(QWidget):
             run_target=run_target,
             loaded_scan_available=loaded_scan_available,
             save_path=str(getattr(getattr(self, "wrangler", None), "h5_dir", "") or ""),
+            write_mode=write_mode,
+            processed_config=processing_config_from_scan(
+                getattr(self, "scan", None),
+                prefer_stored=True,
+            ),
+            current_config=processing_config_from_scan(getattr(self, "scan", None)),
             detector_summary=self._controls_v2_detector_summary(),
             frame_count=display_frame_count,
             processing_mode=mode_text,
@@ -5648,6 +5698,7 @@ class staticWidget(QWidget):
             self.integratorTree.get_args('bai_1d')
             self.integratorTree.get_args('bai_2d')
             self.integratorTree.set_image_units()
+        staticWidget._stamp_scan_data_reduction_config(self)
 
         # ── Panel + cursor: FRAME-STREAM-AUTHORITATIVE ─────────────────────────
         # Only act when this new_scan is IN SYNC with the scan the frame stream is

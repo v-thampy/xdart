@@ -485,6 +485,17 @@
   "shape": [],
   "value": "626ce8741f9d7337"
  },
+ "entry/reduction/config/gi": {
+  "attrs": {},
+  "chunks": null,
+  "compression": null,
+  "compression_opts": null,
+  "dtype": "object",
+  "kind": "dataset",
+  "maxshape": [],
+  "shape": [],
+  "value": "fcbcf165908dd18a"
+ },
  "entry/reduction/date": {
   "attrs": {},
   "chunks": null,

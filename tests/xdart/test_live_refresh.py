@@ -5850,6 +5850,89 @@ def test_standard_plot_axis_defaults_to_integrated_2theta_unit():
     assert "2" in plot_unit.currentText()
 
 
+def test_display_axes_use_stored_standard_config_after_panel_gi_flip():
+    plot_unit = _FakeMutableCombo()
+    image_unit = _FakeMutableCombo()
+    host = SimpleNamespace(
+        scan=SimpleNamespace(
+            gi=True,
+            skip_2d=False,
+            bai_1d_args={"unit": "q_A^-1", "gi_mode_1d": "q_total"},
+            bai_2d_args={"unit": "q_A^-1", "gi_mode_2d": "qip_qoop"},
+            reduction_config={
+                "gi": False,
+                "bai_1d_args": {"unit": "2th_deg", "numpoints": 3000},
+                "bai_2d_args": {
+                    "unit": "q_A^-1",
+                    "npt_rad": 500,
+                    "npt_azim": 500,
+                },
+            },
+        ),
+        ui=SimpleNamespace(plotUnit=plot_unit, imageUnit=image_unit),
+        _plot_axis_info=[],
+        _display_gi_enabled=displayFrameWidget._display_gi_enabled,
+        _display_bai_args=displayFrameWidget._display_bai_args,
+        _on_plotUnit_changed=lambda: None,
+    )
+
+    displayFrameWidget.set_axes(host)
+
+    assert plot_unit.currentIndex() == 1
+    assert "2" in plot_unit.currentText()
+    assert not any("Qip" in item or "Qoop" in item for item in plot_unit._items)
+    assert image_unit.count() == 2
+    assert image_unit._enabled is True
+
+
+def test_live_current_slice_trace_is_gray_lightweight_and_skips_palette():
+    calls = []
+
+    class _Plot:
+        def plot(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace()
+
+    class _Legend:
+        def clear(self):
+            pass
+
+    def _rgb(pen):
+        return pen.color().getRgb()[:3]
+
+    host = SimpleNamespace(
+        curves=[],
+        legend=_Legend(),
+        frame_names=[
+            "scan_1 · q=1",
+            "scan_1 · q=2 · current",
+            "scan_1 · q=3",
+        ],
+        wf_start=None,
+        wf_stop=None,
+        wf_step=None,
+        plotMethod="Overlay",
+        plot=_Plot(),
+        ui=SimpleNamespace(showLegend=_FakeControl(checked=True)),
+        get_colors=lambda: [(10, 20, 30), (40, 50, 60), (70, 80, 90)],
+        _is_live_current_trace=DisplayPlotMixin._is_live_current_trace,
+        _current_trace_color=DisplayPlotMixin._current_trace_color,
+    )
+    host.setup_curves = MethodType(DisplayPlotMixin.setup_curves, host)
+
+    host.setup_curves()
+
+    assert len(calls) == 3
+    assert _rgb(calls[0]["pen"]) == (10, 20, 30)
+    assert _rgb(calls[1]["pen"]) in {(95, 95, 95), (170, 170, 170)}
+    assert calls[1]["pen"].style() == QtCore.Qt.DashLine
+    assert calls[1]["pen"].widthF() == pytest.approx(1.0)
+    assert calls[1]["symbolSize"] == 3
+    assert _rgb(calls[2]["pen"]) == (40, 50, 60)
+    assert calls[2]["pen"].style() == QtCore.Qt.SolidLine
+    assert calls[2]["symbolSize"] == 4
+
+
 class _FakePlot:
     def __init__(self):
         self.link = None

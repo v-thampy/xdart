@@ -1454,6 +1454,35 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self._aggregation_worker = worker
         return self._aggregation_worker
 
+    @staticmethod
+    def _display_reduction_config(scan):
+        cfg = getattr(scan, "reduction_config", None)
+        if isinstance(cfg, dict) and cfg:
+            return cfg
+        cfg = getattr(scan, "_display_reduction_config", None)
+        if isinstance(cfg, dict) and cfg:
+            return cfg
+        return None
+
+    @staticmethod
+    def _display_gi_enabled(scan) -> bool:
+        cfg = displayFrameWidget._display_reduction_config(scan)
+        if cfg is not None:
+            if "gi" in cfg:
+                return bool(cfg.get("gi"))
+            gic = cfg.get("gi_config")
+            if isinstance(gic, dict) and gic:
+                return True
+        return bool(getattr(scan, "gi", False))
+
+    @staticmethod
+    def _display_bai_args(scan, dim: str) -> dict:
+        key = "bai_1d_args" if str(dim) == "1d" else "bai_2d_args"
+        cfg = displayFrameWidget._display_reduction_config(scan)
+        if cfg is not None and isinstance(cfg.get(key), dict):
+            return cfg[key]
+        return getattr(scan, key, {}) or {}
+
     def _aggregate_display_is_primary(self, scan, dim: str) -> bool:
         """True when the displayed mode is the top-level persisted stack.
 
@@ -1464,10 +1493,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         """
         from xdart.modules.scan_aggregate import mode_aggregation_allowed
 
-        if not getattr(scan, "gi", False):
+        if not displayFrameWidget._display_gi_enabled(scan):
             return mode_aggregation_allowed(None, None)
 
-        gi_config = getattr(scan, "gi_config", None) or {}
+        config = displayFrameWidget._display_reduction_config(scan) or {}
+        gi_config = config.get("gi_config") or getattr(scan, "gi_config", None) or {}
         key = "gi_mode_1d" if dim == "1d" else "gi_mode_2d"
         # FAIL CLOSED: a GI scan whose gi_config does not record the primary mode
         # (e.g. a .nxs written before gi_config existed, reloaded) must NOT serve a
@@ -1477,10 +1507,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if key not in gi_config:
             return False
         if dim == "1d":
-            displayed = getattr(scan, "bai_1d_args", {}).get(
+            displayed = displayFrameWidget._display_bai_args(scan, "1d").get(
                 "gi_mode_1d", "q_total")
         else:
-            displayed = getattr(scan, "bai_2d_args", {}).get(
+            displayed = displayFrameWidget._display_bai_args(scan, "2d").get(
                 "gi_mode_2d", "qip_qoop")
         return mode_aggregation_allowed(displayed, gi_config[key])
 
@@ -2138,8 +2168,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         scan = getattr(self, 'scan', None)
         if scan is None:
             return None
-        if getattr(scan, 'gi', False):
-            gi_args = getattr(scan, 'bai_2d_args', {}) or {}
+        if displayFrameWidget._display_gi_enabled(scan):
+            gi_args = displayFrameWidget._display_bai_args(scan, "2d")
             gi_mode_2d = gi_args.get('gi_mode_2d', 'qip_qoop')
             gi_idx = GI_MODES_2D.index(gi_mode_2d) if gi_mode_2d in GI_MODES_2D else 0
             return _axis_key_from_label(
@@ -2972,10 +3002,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # 'source'=='2d' entry.  Int 2D keeps them all.  This replaces the old
         # add-then-remove dance in _apply_1d_only_visibility (one source of truth).
         skip = getattr(self.scan, 'skip_2d', False)
+        display_gi = displayFrameWidget._display_gi_enabled(self.scan)
+        display_1d_args = displayFrameWidget._display_bai_args(self.scan, "1d")
+        display_2d_args = displayFrameWidget._display_bai_args(self.scan, "2d")
 
-        if self.scan.gi:
-            gi_mode_1d = self.scan.bai_1d_args.get('gi_mode_1d', 'q_total')
-            gi_mode_2d = self.scan.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
+        if display_gi:
+            gi_mode_1d = display_1d_args.get('gi_mode_1d', 'q_total')
+            gi_mode_2d = display_2d_args.get('gi_mode_2d', 'qip_qoop')
             idx_1d = GI_MODES_1D.index(gi_mode_1d) if gi_mode_1d in GI_MODES_1D else 0
             idx_2d = GI_MODES_2D.index(gi_mode_2d) if gi_mode_2d in GI_MODES_2D else 0
 
@@ -3031,11 +3064,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.imageUnit.addItem(_translate("Form", gi_imageUnits[idx_2d]))
             self.ui.plotUnit.setEnabled(True)
             self.ui.imageUnit.setEnabled(False)
-            unit_1d = str(self.scan.bai_1d_args.get('unit', '')).lower()
+            unit_1d = str(display_1d_args.get('unit', '')).lower()
             if gi_mode_1d == 'q_total' and '2th' in unit_1d:
                 target_plot_idx = 1
         else:
-            unit_1d = str(self.scan.bai_1d_args.get('unit', '')).lower()
+            unit_1d = str(display_1d_args.get('unit', '')).lower()
             if 'chi' in unit_1d:
                 # Azimuthal-integration mode (I vs χ via integrate_radial).  The
                 # native 1D result IS I(χ), so χ is the default plot axis.  It is
@@ -3548,8 +3581,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.binned_widget, True)
 
         imageUnit = self.ui.imageUnit.currentIndex()
-        if self.scan.gi:
-            gi_mode_2d = self.scan.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
+        if displayFrameWidget._display_gi_enabled(self.scan):
+            gi_mode_2d = displayFrameWidget._display_bai_args(
+                self.scan, "2d").get('gi_mode_2d', 'qip_qoop')
             gi_idx = GI_MODES_2D.index(gi_mode_2d) if gi_mode_2d in GI_MODES_2D else 0
             _xl2 = gi_x_labels_2D[gi_idx]
             _xu2 = gi_x_units_2D[gi_idx]

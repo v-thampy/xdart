@@ -20,6 +20,10 @@ from pyqtgraph.parametertree import ParameterTree, Parameter
 # Project imports
 from xrd_tools.core.containers import PONI
 from xrd_tools.io.metadata import read_image_metadata
+from xrd_tools.session.readiness import (
+    append_config_mismatch_check,
+    processing_config_from_scan,
+)
 # ``_extract_scan_info`` is a private helper but the wrangler uses it
 # to predict whether the SPEC sidecar exists for a given image file —
 # same parser the SSRL reader uses, so the UI's existence check stays
@@ -948,6 +952,23 @@ class imageWrangler(wranglerWidget):
         getter = getattr(controls, 'write_mode', None)
         return getter() if callable(getter) else 'Append'
 
+    def _append_config_mismatch_message(self):
+        scan = getattr(self, "scan", None)
+        if scan is None:
+            return ""
+        active_write_mode = getattr(self, "_active_write_mode", None)
+        write_mode = (
+            active_write_mode()
+            if callable(active_write_mode)
+            else imageWrangler._active_write_mode(self)
+        )
+        check = append_config_mismatch_check(
+            write_mode,
+            processing_config_from_scan(scan, prefer_stored=True),
+            processing_config_from_scan(scan),
+        )
+        return "" if check.ok else check.reason
+
     def setup(self):
         """Sets up the child thread, syncs all parameters.
         """
@@ -1231,6 +1252,10 @@ class imageWrangler(wranglerWidget):
                 self,
                 'Choose an image source to run. Use Reintegrate for a loaded processed scan.',
             )
+            return False
+        mismatch = imageWrangler._append_config_mismatch_message(self)
+        if mismatch:
+            imageWrangler._safe_status_text(self, mismatch)
             return False
         return True
 

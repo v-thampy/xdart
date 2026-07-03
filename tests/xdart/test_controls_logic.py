@@ -23,6 +23,7 @@ from xdart.gui.tabs.static_scan.controls_logic import (
     build_control_panel_state,
     build_control_profile,
     coerce_control_edit_value,
+    processing_config_from_mapping,
     run_target_readiness_note,
     run_blockers_from_fields,
     run_required_fields_for,
@@ -241,6 +242,84 @@ def test_run_blockers_are_derived_from_required_field_statuses():
         "Set/refine UB matrix before RSM.",
         "RSM GUI awaits real-data gate.",
     )
+
+
+def test_append_blocks_loaded_scan_processing_config_mismatch_headless():
+    standard = {
+        "gi": False,
+        "bai_1d_args": {"unit": "q_A^-1", "numpoints": 3000},
+        "bai_2d_args": {"unit": "q_A^-1", "npt_rad": 500, "npt_azim": 500},
+    }
+    grazing = {
+        "gi": True,
+        "bai_1d_args": {
+            "unit": "q_A^-1",
+            "numpoints": 3000,
+            "gi_mode_1d": "q_total",
+        },
+        "bai_2d_args": {
+            "unit": "q_A^-1",
+            "npt_rad": 500,
+            "npt_azim": 500,
+            "gi_mode_2d": "qip_qoop",
+        },
+        "gi_config": {
+            "gi_mode_1d": "q_total",
+            "gi_mode_2d": "qip_qoop",
+            "sample_orientation": 4,
+        },
+    }
+    ready = dict(
+        tool=Tool.INT_2D,
+        mode=MeasMode.GI,
+        source_caps=SourceCaps(has_frames=True, raw_reachable=True),
+        geom=GeomState(
+            calibrated=True,
+            energy_known=True,
+            gi_enabled=True,
+            sample_orientation_known=True,
+        ),
+        run_target=RunTarget.SOURCE,
+    )
+
+    profile = build_control_profile(
+        ControlState(
+            **ready,
+            write_mode="Append",
+            processed_config=processing_config_from_mapping(standard),
+            current_config=processing_config_from_mapping(grazing),
+        )
+    )
+
+    assert not profile.can_run
+    assert profile.run_blockers == (
+        "processed scan: Standard · current: Grazing — switch write mode "
+        "to Replace, or revert settings (checked: mode, 1D axis, 2D axis, "
+        "1D unit, 2D unit, 1D points, 1D oop points, 2D radial points, "
+        "2D azimuth points, 1D radial range, 1D azimuth range, "
+        "2D radial range, 2D azimuth range; differences: mode, 1D axis, "
+        "2D axis).",
+    )
+
+    replace = build_control_profile(
+        ControlState(
+            **ready,
+            write_mode="Overwrite",
+            processed_config=standard,
+            current_config=grazing,
+        )
+    )
+    assert replace.can_run
+
+    matching = build_control_profile(
+        ControlState(
+            **ready,
+            write_mode="Append",
+            processed_config=grazing,
+            current_config=grazing,
+        )
+    )
+    assert matching.can_run
 
 
 def test_run_gate_accepts_configured_source_before_processed_frames():

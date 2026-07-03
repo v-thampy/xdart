@@ -167,7 +167,12 @@ def overlay_axis_kind(widget, axis_info=None, needs_2d=None):
     if needs_2d is None:
         needs_2d = overlay_needs_2d(widget, axis_info)
     scan = getattr(widget, "scan", None)
-    gi = bool(getattr(scan, "gi", False)) if scan is not None else False
+    display_gi = getattr(widget, "_display_gi_enabled", None)
+    gi = (
+        bool(display_gi(scan))
+        if callable(display_gi) and scan is not None
+        else bool(getattr(scan, "gi", False)) if scan is not None else False
+    )
     axis = axis_info.get("axis")
     if needs_2d:
         if gi:
@@ -176,11 +181,21 @@ def overlay_axis_kind(widget, axis_info=None, needs_2d=None):
             return "chi"
         return "radial"
     if gi:
-        args = getattr(scan, "bai_1d_args", {}) or {}
+        args_getter = getattr(widget, "_display_bai_args", None)
+        args = (
+            args_getter(scan, "1d")
+            if callable(args_getter)
+            else getattr(scan, "bai_1d_args", {}) or {}
+        )
         return str(args.get("gi_mode_1d") or _axis_token_from_text(_plot_unit_text(widget)))
     if axis == "azimuthal":
         return "chi"
-    args = getattr(scan, "bai_1d_args", {}) or {}
+    args_getter = getattr(widget, "_display_bai_args", None)
+    args = (
+        args_getter(scan, "1d")
+        if callable(args_getter) and scan is not None
+        else getattr(scan, "bai_1d_args", {}) or {}
+    )
     unit = str(args.get("unit", "") or "").lower()
     if "chigi" in unit:
         return "chi_gi"

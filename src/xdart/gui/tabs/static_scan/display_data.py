@@ -225,11 +225,27 @@ class DisplayDataMixin:
             return (view if view.has_1d else None, view if view.has_2d else None)
 
         scan = getattr(self, "scan", None)
-        is_gi = bool(getattr(scan, "gi", False))
+        display_gi = getattr(self, "_display_gi_enabled", None)
+        is_gi = (
+            bool(display_gi(scan))
+            if callable(display_gi) and scan is not None
+            else bool(getattr(scan, "gi", False))
+        )
         mode_1d = mode_2d = None
         if is_gi:
-            mode_1d = getattr(scan, "bai_1d_args", {}).get("gi_mode_1d", "q_total")
-            mode_2d = getattr(scan, "bai_2d_args", {}).get("gi_mode_2d", "qip_qoop")
+            args_getter = getattr(self, "_display_bai_args", None)
+            a1 = (
+                args_getter(scan, "1d")
+                if callable(args_getter)
+                else getattr(scan, "bai_1d_args", {}) or {}
+            )
+            a2 = (
+                args_getter(scan, "2d")
+                if callable(args_getter)
+                else getattr(scan, "bai_2d_args", {}) or {}
+            )
+            mode_1d = a1.get("gi_mode_1d", "q_total")
+            mode_2d = a2.get("gi_mode_2d", "qip_qoop")
         if is_gi:
             view_1d = record.view_1d(mode_1d)
             view_2d = record.view_2d(mode_2d)
@@ -521,14 +537,30 @@ class DisplayDataMixin:
             # the live/reintegrate upsert sites) so an evicted-then-rehydrated
             # frame's record is consistent with the rest.  .view is unaffected.
             _scan = getattr(self, "scan", None)
-            _is_gi = bool(getattr(_scan, "gi", False))
+            _display_gi = getattr(self, "_display_gi_enabled", None)
+            _is_gi = (
+                bool(_display_gi(_scan))
+                if callable(_display_gi) and _scan is not None
+                else bool(getattr(_scan, "gi", False))
+            )
+            _args_getter = getattr(self, "_display_bai_args", None)
+            _a1 = (
+                _args_getter(_scan, "1d")
+                if callable(_args_getter)
+                else getattr(_scan, "bai_1d_args", {}) or {}
+            )
+            _a2 = (
+                _args_getter(_scan, "2d")
+                if callable(_args_getter)
+                else getattr(_scan, "bai_2d_args", {}) or {}
+            )
             return publication_from_live_frame(
                 lf, generation=generation, include_raw=True,
                 active_mode_1d=(
-                    _scan.bai_1d_args.get("gi_mode_1d", "q_total")
+                    _a1.get("gi_mode_1d", "q_total")
                     if _is_gi else None),
                 active_mode_2d=(
-                    _scan.bai_2d_args.get("gi_mode_2d", "qip_qoop")
+                    _a2.get("gi_mode_2d", "qip_qoop")
                     if _is_gi else None),
             )
         except Exception:
@@ -568,9 +600,19 @@ class DisplayDataMixin:
         store = getattr(self, "publication_store", None)
         generation = store.generation if store is not None else 0
         mode_1d = DEFAULT_MODE_KEY
-        if bool(getattr(scan, "gi", False)):
-            mode_1d = getattr(scan, "bai_1d_args", {}).get(
-                "gi_mode_1d", "q_total")
+        display_gi = getattr(self, "_display_gi_enabled", None)
+        if (
+            bool(display_gi(scan))
+            if callable(display_gi) and scan is not None
+            else bool(getattr(scan, "gi", False))
+        ):
+            args_getter = getattr(self, "_display_bai_args", None)
+            args = (
+                args_getter(scan, "1d")
+                if callable(args_getter)
+                else getattr(scan, "bai_1d_args", {}) or {}
+            )
+            mode_1d = args.get("gi_mode_1d", "q_total")
 
         publications = []
         for result in results:

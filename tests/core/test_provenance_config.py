@@ -125,6 +125,7 @@ def test_headless_nexus_sink_writes_reduction_provenance(
     assert provenance["config"]["bai_1d_args"]["radial_range"] == [0.0, 1.0]
     assert provenance["config"]["bai_1d_args"]["monitor"] == "i0"
     assert provenance["config"]["bai_2d_args"] == {}
+    assert provenance["config"]["gi"] is False
     assert provenance["inputs"]["raw_files"] == [str(raw0), str(raw1)]
 
 

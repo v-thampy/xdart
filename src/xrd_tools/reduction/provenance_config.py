@@ -29,6 +29,11 @@ def build_reduction_config(scan_or_plan: Any) -> tuple[dict[str, Any], dict[str,
     elif plan is not None:
         config.update(_config_from_plan(plan))
 
+    if scan is not None and hasattr(scan, "gi"):
+        config["gi"] = bool(getattr(scan, "gi"))
+    elif plan is not None:
+        config["gi"] = getattr(plan, "gi", None) is not None
+
     if scan is not None and getattr(scan, "gi_config", None):
         config["gi_config"] = dict(getattr(scan, "gi_config"))
     elif plan is not None:

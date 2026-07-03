@@ -43,6 +43,266 @@ LOADED_SCAN_RUN_MESSAGE = (
 )
 
 
+_UNSET = object()
+
+
+_PROCESSING_COMPARED_FIELDS: tuple[tuple[str, str], ...] = (
+    ("mode", "mode"),
+    ("axis_1d", "1D axis"),
+    ("axis_2d", "2D axis"),
+    ("unit_1d", "1D unit"),
+    ("unit_2d", "2D unit"),
+    ("npt_1d", "1D points"),
+    ("npt_oop_1d", "1D oop points"),
+    ("npt_rad_2d", "2D radial points"),
+    ("npt_azim_2d", "2D azimuth points"),
+    ("radial_range_1d", "1D radial range"),
+    ("azimuth_range_1d", "1D azimuth range"),
+    ("radial_range_2d", "2D radial range"),
+    ("azimuth_range_2d", "2D azimuth range"),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessingConfigSignature:
+    """Data-affecting integration config used by Append run gates."""
+
+    mode: MeasMode
+    axis_1d: str
+    axis_2d: str
+    unit_1d: str
+    unit_2d: str
+    npt_1d: int | None
+    npt_oop_1d: int | None
+    npt_rad_2d: int | None
+    npt_azim_2d: int | None
+    radial_range_1d: object
+    azimuth_range_1d: object
+    radial_range_2d: object
+    azimuth_range_2d: object
+
+    @property
+    def display_mode(self) -> str:
+        return "Grazing" if self.mode == MeasMode.GI else "Standard"
+
+    def compared_items(self) -> tuple[tuple[str, object], ...]:
+        return tuple(
+            (field_name, getattr(self, attr))
+            for attr, field_name in _PROCESSING_COMPARED_FIELDS
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AppendConfigCheck:
+    ok: bool
+    reason: str = ""
+    compared_fields: tuple[str, ...] = ()
+    mismatched_fields: tuple[str, ...] = ()
+    processed_label: str = ""
+    current_label: str = ""
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    return {}
+
+
+def _first_value(mapping: Mapping[str, Any], keys: Sequence[str], default: Any) -> Any:
+    for key in keys:
+        if key in mapping:
+            return mapping[key]
+    return default
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _range_or_none(value: Any) -> object:
+    if value is None or value == "" or value == "None":
+        return None
+    try:
+        if len(value) != 2:  # type: ignore[arg-type]
+            return repr(value)
+        lo, hi = value  # type: ignore[misc]
+    except TypeError:
+        return repr(value)
+    if lo is None or hi is None:
+        return None
+    try:
+        return (round(float(lo), 12), round(float(hi), 12))
+    except (TypeError, ValueError):
+        return (str(lo), str(hi))
+
+
+def _standard_axis_from_unit(unit: object, *, dim: str) -> str:
+    text = str(unit or "").lower()
+    if "chi" in text and dim == "1d":
+        return "chi"
+    if "2th" in text or "2θ" in text:
+        return "2theta" if dim == "1d" else "2theta-chi"
+    return "q" if dim == "1d" else "q-chi"
+
+
+def _config_indicates_gi(
+    bai_1d_args: Mapping[str, Any],
+    bai_2d_args: Mapping[str, Any],
+    gi_config: Mapping[str, Any],
+) -> bool:
+    return (
+        bool(gi_config)
+        or "gi_mode_1d" in bai_1d_args
+        or "gi_mode_2d" in bai_2d_args
+        or "npt_oop" in bai_1d_args
+        or "npt_oop" in bai_2d_args
+    )
+
+
+def processing_config_from_args(
+    bai_1d_args: Mapping[str, Any] | None,
+    bai_2d_args: Mapping[str, Any] | None,
+    *,
+    gi_enabled: bool | None = None,
+    gi_config: Mapping[str, Any] | None = None,
+) -> ProcessingConfigSignature:
+    """Return the data-shape/axis signature for an integration setup."""
+
+    a1 = _mapping(bai_1d_args)
+    a2 = _mapping(bai_2d_args)
+    gic = _mapping(gi_config)
+    is_gi = (
+        _config_indicates_gi(a1, a2, gic)
+        if gi_enabled is None
+        else bool(gi_enabled)
+    )
+    mode = MeasMode.GI if is_gi else MeasMode.STANDARD
+    unit_1d = str(a1.get("unit") or "q_A^-1")
+    unit_2d = str(a2.get("unit") or "q_A^-1")
+    if is_gi:
+        axis_1d = str(
+            a1.get("gi_mode_1d")
+            or gic.get("gi_mode_1d")
+            or "q_total"
+        )
+        axis_2d = str(
+            a2.get("gi_mode_2d")
+            or gic.get("gi_mode_2d")
+            or "qip_qoop"
+        )
+    else:
+        axis_1d = _standard_axis_from_unit(unit_1d, dim="1d")
+        axis_2d = _standard_axis_from_unit(unit_2d, dim="2d")
+    return ProcessingConfigSignature(
+        mode=mode,
+        axis_1d=axis_1d,
+        axis_2d=axis_2d,
+        unit_1d=unit_1d,
+        unit_2d=unit_2d,
+        npt_1d=_int_or_none(
+            _first_value(a1, ("npt", "numpoints", "npt_rad"), 3000)
+        ),
+        npt_oop_1d=_int_or_none(a1.get("npt_oop")),
+        npt_rad_2d=_int_or_none(_first_value(a2, ("npt_rad", "npt"), 500)),
+        npt_azim_2d=_int_or_none(a2.get("npt_azim", 500)),
+        radial_range_1d=_range_or_none(a1.get("radial_range")),
+        azimuth_range_1d=_range_or_none(a1.get("azimuth_range")),
+        radial_range_2d=_range_or_none(a2.get("radial_range")),
+        azimuth_range_2d=_range_or_none(a2.get("azimuth_range")),
+    )
+
+
+def processing_config_from_mapping(
+    value: Mapping[str, Any] | ProcessingConfigSignature | None,
+) -> ProcessingConfigSignature | None:
+    if value is None:
+        return None
+    if isinstance(value, ProcessingConfigSignature):
+        return value
+    config = _mapping(value)
+    if "config" in config and "bai_1d_args" not in config:
+        config = _mapping(config.get("config"))
+    gi_marker = config.get("gi", _UNSET)
+    gi_enabled = None if gi_marker is _UNSET else bool(gi_marker)
+    return processing_config_from_args(
+        _mapping(config.get("bai_1d_args")),
+        _mapping(config.get("bai_2d_args")),
+        gi_enabled=gi_enabled,
+        gi_config=_mapping(config.get("gi_config")),
+    )
+
+
+def processing_config_from_scan(
+    scan: Any,
+    *,
+    prefer_stored: bool = False,
+) -> ProcessingConfigSignature | None:
+    """Build an Append/readiness signature from a scan-like object."""
+
+    if scan is None:
+        return None
+    if prefer_stored:
+        for attr in ("reduction_config", "_display_reduction_config"):
+            stored = getattr(scan, attr, None)
+            if isinstance(stored, Mapping) and stored:
+                return processing_config_from_mapping(stored)
+        return None
+    return processing_config_from_args(
+        _mapping(getattr(scan, "bai_1d_args", {}) or {}),
+        _mapping(getattr(scan, "bai_2d_args", {}) or {}),
+        gi_enabled=bool(getattr(scan, "gi", False)),
+        gi_config=_mapping(getattr(scan, "gi_config", {}) or {}),
+    )
+
+
+def append_config_mismatch_check(
+    write_mode: object,
+    processed_config: Mapping[str, Any] | ProcessingConfigSignature | None,
+    current_config: Mapping[str, Any] | ProcessingConfigSignature | None,
+) -> AppendConfigCheck:
+    """Return a fail-closed Append blocker when configs differ."""
+
+    compared_fields = tuple(label for _attr, label in _PROCESSING_COMPARED_FIELDS)
+    if str(write_mode or "").strip().lower() != "append":
+        return AppendConfigCheck(ok=True, compared_fields=compared_fields)
+    processed = processing_config_from_mapping(processed_config)
+    current = processing_config_from_mapping(current_config)
+    if processed is None or current is None:
+        return AppendConfigCheck(ok=True, compared_fields=compared_fields)
+
+    mismatches = tuple(
+        label for attr, label in _PROCESSING_COMPARED_FIELDS
+        if getattr(processed, attr) != getattr(current, attr)
+    )
+    if not mismatches:
+        return AppendConfigCheck(
+            ok=True,
+            compared_fields=compared_fields,
+            processed_label=processed.display_mode,
+            current_label=current.display_mode,
+        )
+
+    reason = (
+        f"processed scan: {processed.display_mode} · "
+        f"current: {current.display_mode} — switch write mode to Replace, "
+        f"or revert settings (checked: {', '.join(compared_fields)}; "
+        f"differences: {', '.join(mismatches)})."
+    )
+    return AppendConfigCheck(
+        ok=False,
+        reason=reason,
+        compared_fields=compared_fields,
+        mismatched_fields=mismatches,
+        processed_label=processed.display_mode,
+        current_label=current.display_mode,
+    )
+
+
 class ProcessingPage(str, Enum):
     INT_1D = "int_1d"
     INT_2D = "int_2d"
@@ -1191,6 +1451,9 @@ class ControlState:
     run_target: RunTarget | str = ""
     loaded_scan_available: bool = False
     save_path: str = ""
+    write_mode: str = "Append"
+    processed_config: ProcessingConfigSignature | Mapping[str, Any] | None = None
+    current_config: ProcessingConfigSignature | Mapping[str, Any] | None = None
     frame_count: int = 0
     processing_mode: str = ""
     real_data_gates: frozenset[str] = field(default_factory=frozenset)
@@ -1907,6 +2170,14 @@ def run_blockers_from_fields(
     if state.tool == Tool.RSM:
         if "rsm_real_data" not in state.real_data_gates:
             blockers.append("RSM GUI awaits real-data gate.")
+    if state.tool in (Tool.INT_1D, Tool.INT_2D) and run_target == RunTarget.SOURCE:
+        append_check = append_config_mismatch_check(
+            state.write_mode,
+            state.processed_config,
+            state.current_config,
+        )
+        if not append_check.ok and append_check.reason:
+            blockers.append(append_check.reason)
     return tuple(dict.fromkeys(blockers))
 
 

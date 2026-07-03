@@ -1,5 +1,6 @@
 import logging
 import os
+import copy
 from threading import Condition, _PyRLock
 
 import numpy as np
@@ -15,6 +16,27 @@ from xdart.modules.wavelength import (
     DEFAULT_WAVELENGTH_SENTINEL_M,
     wavelength_angstrom_to_m,
 )
+
+
+def _reduction_config_indicates_gi(config):
+    if not isinstance(config, dict):
+        return False
+    if "gi" in config:
+        return bool(config["gi"])
+    gic = config.get("gi_config")
+    if isinstance(gic, dict) and gic:
+        return True
+    a1 = config.get("bai_1d_args")
+    a2 = config.get("bai_2d_args")
+    return (
+        isinstance(a1, dict) and (
+            "gi_mode_1d" in a1 or "npt_oop" in a1
+        )
+    ) or (
+        isinstance(a2, dict) and (
+            "gi_mode_2d" in a2 or "npt_oop" in a2
+        )
+    )
 
 
 def _coerce_scan_info(scan_info):
@@ -154,6 +176,8 @@ class LiveScan:
 
         self.bai_1d_args = bai_1d_args
         self.bai_2d_args = bai_2d_args
+        self.reduction_config = {}
+        self._display_reduction_config = {}
         self.scan_lock = Condition(_PyRLock())
 
         # G2: ``overall_raw`` was a sum-of-raw-frames accumulator
@@ -176,6 +200,8 @@ class LiveScan:
                                           static=self.static, gi=self.gi)
             self.global_mask = None
             self.detector_shape = None
+            self.reduction_config = {}
+            self._display_reduction_config = {}
             self._clear_persisted_wavelength()
             # Calibration is per-file identity, like the fields above — a full
             # load (replace=True -> reset) of a DIFFERENT file must not inherit
@@ -824,6 +850,12 @@ class LiveScan:
         # ── wavelength + bai args from reduction config (if present) ─
         reduction = normalize_live_class_names(ds.attrs.get("reduction", {}) or {})
         config = reduction.get("config", {}) or {}
+        if isinstance(config, dict) and (config or not data_only):
+            stored_config = copy.deepcopy(config)
+            stored_config["gi"] = _reduction_config_indicates_gi(stored_config)
+            self.reduction_config = copy.deepcopy(stored_config)
+            self._display_reduction_config = copy.deepcopy(stored_config)
+            self.gi = bool(stored_config["gi"])
         if isinstance(config.get("bai_1d_args"), dict):
             self.bai_1d_args = dict(config["bai_1d_args"])
         if isinstance(config.get("bai_2d_args"), dict):
