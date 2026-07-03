@@ -5,6 +5,7 @@ it emits intent and the active wrangler owns the logic.  These exercise the
 morph + signals + profile in isolation (no wrangler), before any app wiring.
 """
 import os
+import logging
 from types import MethodType, SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -209,7 +210,7 @@ def test_load_save_shortcuts_route_through_existing_actions(qapp):
     assert calls == ["load", "save"]
 
 
-def test_main_window_shortcuts_are_menu_backed(qapp, monkeypatch):
+def test_main_window_shortcuts_are_menu_backed(qapp, monkeypatch, caplog):
     from xdart import _gui_main
 
     class FakeStaticWidget(QtWidgets.QWidget):
@@ -217,6 +218,14 @@ def test_main_window_shortcuts_are_menu_backed(qapp, monkeypatch):
             super().__init__()
             self.calls = []
             self.h5viewer = SimpleNamespace(paramMenu=QtWidgets.QMenu(self))
+            self.ui = SimpleNamespace(
+                leftFrame=QtWidgets.QFrame(self),
+                middleFrame=QtWidgets.QFrame(self),
+                rightFrame=QtWidgets.QFrame(self),
+            )
+            self.ui.leftFrame.setObjectName("leftFrame")
+            self.ui.middleFrame.setObjectName("middleFrame")
+            self.ui.rightFrame.setObjectName("rightFrame")
 
         def enable_async_hydration(self):
             pass
@@ -245,10 +254,15 @@ def test_main_window_shortcuts_are_menu_backed(qapp, monkeypatch):
     try:
         file_actions = [a.text() for a in window.ui.menuFile.actions()]
         run_actions = [a.text() for a in window.ui.menuRun.actions()]
+        config_actions = window.main_widget.h5viewer.paramMenu.actions()
 
         assert "Load Settings" in file_actions
         assert "Save Settings" in file_actions
         assert run_actions == ["Run / Pause", "Stop", "Toggle Append / Replace"]
+        assert window.debugMenu.menuAction() in config_actions
+        assert window.debugMenu.title() == "Debug"
+        assert [a.text() for a in window.debugMenu.actions()] == [
+            "Window State"]
         assert window.actionRunPause.shortcut().toString(
             QtGui.QKeySequence.PortableText) == "Ctrl+R"
         assert window.actionStopRun.shortcut().toString(
@@ -268,6 +282,16 @@ def test_main_window_shortcuts_are_menu_backed(qapp, monkeypatch):
 
         assert window.main_widget.calls == [
             "run", "stop", "toggle", "load", "save"]
+
+        with caplog.at_level(logging.WARNING, logger=_gui_main.__name__):
+            window.actionDebugWindowState.trigger()
+        assert "Window State main:" in caplog.text
+        assert "left browser" in caplog.text
+        assert "middle display" in caplog.text
+        assert "right controls" in caplog.text
+        assert "overrideCursor=" in caplog.text
+        assert "mouseGrabber=" in caplog.text
+        assert "top-level widgets: total=" in caplog.text
     finally:
         window.close()
 

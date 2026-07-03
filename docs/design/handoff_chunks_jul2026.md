@@ -33,6 +33,7 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 | RC-7 | Session-1 live checklist doc | S | none | one artifact discharges all live gates | — | **DONE** `bec431b1` (session PENDING) |
 | Fix series | Freeze/overlay/race/popup/bounce (FS/OV/RN/LD/BR rows) | — | — | see `live_findings_ledger.md` | — | code DONE through Wave 2; live-verify at Session-1 |
 | RN-2 | Bulk 1D overlay hydration locks/chunks `get_1d` reads | S | low-med | 3600-frame overlay no longer holds `.nxs` read-only across writer flush retries | H-hyd, H30 | **DONE** this commit; live-scale overlay verification pending |
+| WM-1 | Window resize state diagnostic action | S | none | captures main/splitter/cursor/top-level state when resize handles stop appearing | — | **DONE** diagnostic this commit; fix deferred until maintainer capture |
 | UI-2 | Fresh-launch χ (c/w) slice toggle crash | S | low | slice controls stay disabled until a cake exists; programmatic no-data toggles no-op instead of unpacking `binned_data=None` | — | fixed-unverified; verify at Session-1 F5-adjacent |
 | H1 | Mode-scoped `mark_persisted` | S | low | no silent multi-mode loss on eviction | — | **DONE** `4d3e2b3c` |
 | H4 | `_set_1d_cache_limit(None)` guard | S | none | unbounded footgun closed | — | **DONE** `4d2f3957` |

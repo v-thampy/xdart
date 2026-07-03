@@ -207,6 +207,115 @@ class Main(QMainWindow):
                     self._set_control_panel_font_size(s))
             font_group.addAction(action)
             font_menu.addAction(action)
+        self.debugMenu = config_menu.addMenu("Debug")
+        self.actionDebugWindowState = QtGui.QAction("Window State", self)
+        self.actionDebugWindowState.triggered.connect(self._log_window_state)
+        self.debugMenu.addAction(self.actionDebugWindowState)
+
+    @staticmethod
+    def _qsize_text(size):
+        try:
+            return f"{size.width()}x{size.height()}"
+        except Exception:
+            return repr(size)
+
+    @staticmethod
+    def _qt_value_text(value):
+        name = getattr(value, "name", None)
+        raw = getattr(value, "value", None)
+        if name is not None and raw is not None:
+            return f"{name}({raw})"
+        return str(value)
+
+    @classmethod
+    def _widget_size_state(cls, widget):
+        return (
+            f"size={cls._qsize_text(widget.size())} "
+            f"minHint={cls._qsize_text(widget.minimumSizeHint())} "
+            f"min={cls._qsize_text(widget.minimumSize())} "
+            f"max={cls._qsize_text(widget.maximumSize())}"
+        )
+
+    @classmethod
+    def _top_level_widget_summary(cls, widget):
+        name = widget.objectName() or "-"
+        title = widget.windowTitle() or "-"
+        return (
+            f"{type(widget).__name__}(name={name!r}, title={title!r}, "
+            f"size={cls._qsize_text(widget.size())})"
+        )
+
+    def _splitter_diagnostic_children(self):
+        ui = getattr(getattr(self, "main_widget", None), "ui", None)
+        labels = (
+            ("left browser", "leftFrame"),
+            ("middle display", "middleFrame"),
+            ("right controls", "rightFrame"),
+        )
+        children = []
+        for label, attr in labels:
+            widget = getattr(ui, attr, None)
+            if widget is not None:
+                children.append((label, widget))
+        if children:
+            return children
+        splitter = getattr(ui, "mainSplitter", None)
+        if splitter is None or not hasattr(splitter, "count"):
+            return []
+        return [
+            (f"mainSplitter[{idx}]", splitter.widget(idx))
+            for idx in range(splitter.count())
+            if splitter.widget(idx) is not None
+        ]
+
+    def _log_window_state(self):
+        """Log resize/cursor state for diagnosing sporadic window lockups."""
+        logger.warning(
+            "Window State main: %s minHint=%s min=%s max=%s flags=%s "
+            "isMaximized=%s isFullScreen=%s",
+            f"size={self._qsize_text(self.size())}",
+            self._qsize_text(self.minimumSizeHint()),
+            self._qsize_text(self.minimumSize()),
+            self._qsize_text(self.maximumSize()),
+            self._qt_value_text(self.windowFlags()),
+            self.isMaximized(),
+            self.isFullScreen(),
+        )
+        for label, widget in self._splitter_diagnostic_children():
+            logger.warning(
+                "Window State splitter child %s: %s",
+                label,
+                self._widget_size_state(widget),
+            )
+        cursor = QtWidgets.QApplication.overrideCursor()
+        cursor_text = "None"
+        if cursor is not None:
+            cursor_text = f"shape={self._qt_value_text(cursor.shape())}"
+        grabber = QtWidgets.QWidget.mouseGrabber()
+        grabber_text = "None"
+        if grabber is not None:
+            grabber_text = self._top_level_widget_summary(grabber)
+        logger.warning(
+            "Window State input: overrideCursor=%s mouseGrabber=%s",
+            cursor_text,
+            grabber_text,
+        )
+        app = QtWidgets.QApplication.instance()
+        top_levels = app.topLevelWidgets() if app is not None else []
+        visible_parentless = [
+            widget for widget in top_levels
+            if widget.parent() is None and widget.isVisible()
+        ]
+        summary = ", ".join(
+            self._top_level_widget_summary(widget)
+            for widget in visible_parentless
+        ) or "none"
+        logger.warning(
+            "Window State top-level widgets: total=%d visible_parentless=%d %s",
+            len(top_levels),
+            len(visible_parentless),
+            summary,
+        )
 
     def _init_shortcut_actions(self):
         """Add discoverable menu actions for the main processing shortcuts."""
