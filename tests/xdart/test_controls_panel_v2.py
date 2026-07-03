@@ -1793,6 +1793,122 @@ def test_controls_panel_v2_raw_source_and_poni_enable_run_with_source_frames(
         widget.deleteLater()
 
 
+def test_controls_panel_v2_append_mismatch_only_blocks_same_target(
+        qapp, monkeypatch, tmp_path):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.io import image as image_io
+
+    widget = staticWidget()
+    try:
+        monkeypatch.setattr(image_io, "count_frames", lambda path: 1)
+        project = tmp_path / "project"
+        project.mkdir()
+        out_dir = project / "xdart_processed_data"
+        out_dir.mkdir()
+        raw_path = project / "raw" / "scan_0001.tif"
+        raw_path.parent.mkdir()
+        raw_path.write_bytes(b"")
+        target = out_dir / "scan.nxs"
+        target.write_bytes(b"")
+        poni_path = project / "cal.poni"
+        PONI(
+            dist=0.1794,
+            poni1=0.0,
+            poni2=0.0,
+            detector="RayonixMx225",
+            wavelength=0.7293e-10,
+        ).to_poni_file(poni_path)
+
+        widget._controls_v2_param(("Project", "project_folder")).setValue(str(project))
+        widget.wrangler.project_folder = str(project)
+        widget._controls_v2_param(("Project", "h5_dir")).setValue(str(out_dir))
+        widget.wrangler.h5_dir = str(out_dir)
+        widget._controls_v2_param(("Signal", "File")).setValue(str(raw_path))
+        widget.wrangler.img_file = str(raw_path)
+        widget._set_poni_field(str(poni_path))
+        widget.controls.set_write_mode("Append")
+        widget.scan.data_file = str(target)
+        widget.scan.reduction_config = {
+            "gi": False,
+            "bai_1d_args": {"unit": "q_A^-1"},
+            "bai_2d_args": {"unit": "q_A^-1"},
+        }
+        widget.scan._display_reduction_config = dict(widget.scan.reduction_config)
+        widget.scan.gi = True
+
+        state = widget._controls_v2_state()
+        profile = build_control_profile(state)
+
+        assert state.processed_config is not None
+        assert profile.can_run is False
+        assert profile.run_blockers
+        assert "processed scan: Standard · current: Grazing" in profile.run_blockers[0]
+        assert "processed scan: Standard · current: Grazing" in (
+            widget.wrangler._append_config_mismatch_message()
+        )
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_append_mismatch_ignores_unrelated_displayed_scan(
+        qapp, monkeypatch, tmp_path):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.io import image as image_io
+
+    widget = staticWidget()
+    try:
+        monkeypatch.setattr(image_io, "count_frames", lambda path: 1)
+        project = tmp_path / "project"
+        project.mkdir()
+        out_dir = project / "xdart_processed_data"
+        out_dir.mkdir()
+        raw_path = project / "raw" / "next_0001.tif"
+        raw_path.parent.mkdir()
+        raw_path.write_bytes(b"")
+        displayed = out_dir / "displayed.nxs"
+        displayed.write_bytes(b"")
+        poni_path = project / "cal.poni"
+        PONI(
+            dist=0.1794,
+            poni1=0.0,
+            poni2=0.0,
+            detector="RayonixMx225",
+            wavelength=0.7293e-10,
+        ).to_poni_file(poni_path)
+
+        widget._controls_v2_param(("Project", "project_folder")).setValue(str(project))
+        widget.wrangler.project_folder = str(project)
+        widget._controls_v2_param(("Project", "h5_dir")).setValue(str(out_dir))
+        widget.wrangler.h5_dir = str(out_dir)
+        widget._controls_v2_param(("Signal", "File")).setValue(str(raw_path))
+        widget.wrangler.img_file = str(raw_path)
+        widget._set_poni_field(str(poni_path))
+        widget.controls.set_write_mode("Append")
+        widget.scan.data_file = str(displayed)
+        widget.scan.reduction_config = {
+            "gi": False,
+            "bai_1d_args": {"unit": "q_A^-1"},
+            "bai_2d_args": {"unit": "q_A^-1"},
+        }
+        widget.scan._display_reduction_config = dict(widget.scan.reduction_config)
+        widget.scan.gi = True
+
+        state = widget._controls_v2_state()
+        profile = build_control_profile(state)
+
+        assert state.processed_config is None
+        assert profile.can_run is True
+        assert widget.wrangler._append_config_mismatch_message() == ""
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
 def test_controls_panel_v2_native_int_uses_binding_table(
         qapp, monkeypatch):
     """All V2 integration fields are harvested through the single binding table,

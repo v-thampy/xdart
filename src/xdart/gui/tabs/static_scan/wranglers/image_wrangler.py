@@ -952,9 +952,67 @@ class imageWrangler(wranglerWidget):
         getter = getattr(controls, 'write_mode', None)
         return getter() if callable(getter) else 'Append'
 
+    def _candidate_append_target_file(self, *, refresh_source=False):
+        """Return the .nxs path this raw-source run would append to, if known."""
+
+        if refresh_source:
+            try:
+                self.get_img_fname()
+            except Exception:
+                logger.debug("append target source refresh failed", exc_info=True)
+        img_file = str(getattr(self, "img_file", "") or "")
+        try:
+            inp_type = str(
+                self.parameters.child("Signal").child("inp_type").value() or ""
+            )
+            if inp_type != "Image Directory":
+                configured = self.parameters.child("Signal").child("File").value()
+                if configured:
+                    img_file = str(configured)
+        except Exception:
+            pass
+        if not img_file:
+            return ""
+        try:
+            scan_name, _img_number = _get_scan_info(img_file)
+        except Exception:
+            logger.debug("append target scan-name parse failed", exc_info=True)
+            return ""
+        if not scan_name:
+            return ""
+        try:
+            h5_dir = self.parameters.child("Project").child("h5_dir").value()
+        except Exception:
+            h5_dir = getattr(self, "h5_dir", "")
+        if not h5_dir:
+            return ""
+        return os.path.abspath(
+            os.path.expanduser(os.path.join(str(h5_dir), scan_name + ".nxs"))
+        )
+
+    def _append_target_matches_scan_file(self, scan, *, refresh_source=False):
+        target = imageWrangler._candidate_append_target_file(
+            self,
+            refresh_source=refresh_source,
+        )
+        data_file = getattr(scan, "data_file", None)
+        if not target or not data_file:
+            return False
+        try:
+            current = os.path.abspath(os.path.expanduser(os.fspath(data_file)))
+        except (TypeError, ValueError):
+            return False
+        return current == target
+
     def _append_config_mismatch_message(self):
         scan = getattr(self, "scan", None)
         if scan is None:
+            return ""
+        if not imageWrangler._append_target_matches_scan_file(
+            self,
+            scan,
+            refresh_source=True,
+        ):
             return ""
         active_write_mode = getattr(self, "_active_write_mode", None)
         write_mode = (

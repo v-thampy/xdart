@@ -2539,6 +2539,10 @@ class staticWidget(QWidget):
             write_mode = self.controls.write_mode()
         except Exception:
             pass
+        compare_append_config = (
+            source_ready
+            and self._controls_v2_append_target_matches_displayed_scan()
+        )
         return ControlState(
             tool=tool,
             mode=meas_mode,
@@ -2554,9 +2558,13 @@ class staticWidget(QWidget):
             loaded_scan_available=loaded_scan_available,
             save_path=str(getattr(getattr(self, "wrangler", None), "h5_dir", "") or ""),
             write_mode=write_mode,
-            processed_config=processing_config_from_scan(
-                getattr(self, "scan", None),
-                prefer_stored=True,
+            processed_config=(
+                processing_config_from_scan(
+                    getattr(self, "scan", None),
+                    prefer_stored=True,
+                )
+                if compare_append_config
+                else None
             ),
             current_config=processing_config_from_scan(getattr(self, "scan", None)),
             detector_summary=self._controls_v2_detector_summary(),
@@ -2680,6 +2688,17 @@ class staticWidget(QWidget):
         if bool(getattr(wrangler, "live_mode", False)):
             return True
         return bool(getattr(getattr(wrangler, "thread", None), "live_mode", False))
+
+    def _controls_v2_append_target_matches_displayed_scan(self) -> bool:
+        wrangler = getattr(self, "wrangler", None)
+        matcher = getattr(wrangler, "_append_target_matches_scan_file", None)
+        if not callable(matcher):
+            return False
+        try:
+            return bool(matcher(getattr(self, "scan", None), refresh_source=False))
+        except Exception:
+            logger.debug("Controls V2 append target match failed", exc_info=True)
+            return False
 
     @classmethod
     def _controls_v2_count_source_frames(
