@@ -67,6 +67,20 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
 - [ ] E8 Viewer modes unchanged: XYE multi-select, Image Viewer, and NeXus preview keep
       their viewer-row behavior after the Role-A mirror retirement.
 
+## F. Late-wave additions (2026-07-02, post-checklist fixes)
+- [ ] F1 BR-1: click between processed .nxs files in the data browser with plots up — nothing
+      blanks until a FRAME of the new scan is clicked; run-start still clears properly.
+- [ ] F2 GI-1 (was P0): χGI axis, Auto range vs explicit −180..180 on the APS SiO2 file —
+      identical 1D profile live (the offscreen gate says byte-equal; eyeball it once).
+- [ ] F3 APS Zoe end-to-end with Meta Type = auto (fresh session default): .tif.metadata
+      discovered, frame processes, metadata viewer POPULATED.
+- [ ] F4 Append on the fully-processed 651-frame Eiger scan: ~instant, INFO (not WARNING)
+      "already processed" line, post-live reconcile runs, viewer loads with last frame selected.
+- [ ] F5 Shortcuts smoke: Cmd+R run/pause (with a focused editor: commits then runs),
+      Cmd+Shift+C stops mid-run, Cmd+O / Cmd+S, Cmd+Shift+A blocked mid-run.
+- [ ] F6 Wrong-file guard (LD-1): sweep onto evicted frames, immediately click a different
+      scan — no frames from the previous file appear.
+
 **PASS ⇒ proceed to RC-8** (merge → tag v1.0.0 → publish; recipe in
 `handoff_chunks_jul2026.md`). Any FAIL: stop, report the item + `kill -USR1 <pid>` stack if a
 freeze, fix-forward on `feature/remediation`, re-run only the failed section.
