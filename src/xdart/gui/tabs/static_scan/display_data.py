@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 
 import numpy as np
@@ -34,6 +35,15 @@ from xrd_tools.core import (
 )
 
 logger = logging.getLogger(__name__)
+
+_BULK_1D_READ_CHUNK = 256
+
+
+def _chunked(values, size):
+    values = tuple(values)
+    size = max(1, int(size))
+    for i in range(0, len(values), size):
+        yield values[i:i + size]
 
 
 def _norm_alias_key(name):
@@ -451,6 +461,29 @@ class DisplayDataMixin:
             logger.debug("hydrate frame %s from disk failed", idx, exc_info=True)
             return None
 
+    @staticmethod
+    def _scan_file_lock(owner, scan=None):
+        """Return the writer-coordinating lock for display-layer .nxs reads."""
+        scan = scan if scan is not None else getattr(owner, "scan", None)
+        frames = getattr(scan, "frames", None)
+        return (
+            getattr(owner, "file_lock", None)
+            or getattr(scan, "file_lock", None)
+            or getattr(frames, "file_lock", None)
+        )
+
+    @contextmanager
+    def _locked_scan_read(self, scan=None):
+        """Context manager for display/hydration reads of live-writable .nxs files.
+
+        Writers hold the same lock around `_save_to_nexus`; every new display
+        reader that opens the processed scan file should enter here first.
+        """
+        lock = DisplayDataMixin._scan_file_lock(self, scan)
+        ctx = lock if lock is not None else nullcontext()
+        with ctx:
+            yield
+
     def _rehydrate_publication(self, label):
         """D2 hydrator for the shared :class:`PublicationStore` (greenfield
         Phase 3): read an evicted frame from ``scan.frames`` / the ``.nxs`` and
@@ -512,23 +545,26 @@ class DisplayDataMixin:
         scan_file = getattr(scan, "data_file", None)
         if not scan_file:
             return ()
+        chunk_size = int(
+            getattr(self, "_bulk_1d_read_chunk", _BULK_1D_READ_CHUNK) or
+            _BULK_1D_READ_CHUNK
+        )
         try:
             from xrd_tools.io import get_1d
-            result = get_1d(scan_file, frame=labels)
         except Exception:
-            logger.debug("batch 1D rehydrate failed for %s", labels, exc_info=True)
+            logger.debug("batch 1D rehydrate import failed", exc_info=True)
+            return ()
+        results = []
+        for chunk in _chunked(labels, chunk_size):
+            try:
+                with DisplayDataMixin._locked_scan_read(self, scan):
+                    results.append(get_1d(scan_file, frame=chunk))
+            except Exception:
+                logger.debug("batch 1D rehydrate failed for %s", chunk,
+                             exc_info=True)
+        if not results:
             return ()
 
-        frames = np.asarray(result.frames).ravel()
-        intensity = np.asarray(result.intensity)
-        if intensity.ndim == 1:
-            intensity = intensity[np.newaxis, :]
-        sigma = result.sigma
-        if sigma is not None:
-            sigma = np.asarray(sigma)
-            if sigma.ndim == 1:
-                sigma = sigma[np.newaxis, :]
-        axis_1d = axis_from_unit(result.q_unit, np.asarray(result.q, dtype=float))
         store = getattr(self, "publication_store", None)
         generation = store.generation if store is not None else 0
         mode_1d = DEFAULT_MODE_KEY
@@ -537,49 +573,61 @@ class DisplayDataMixin:
                 "gi_mode_1d", "q_total")
 
         publications = []
-        for row, frame in enumerate(frames):
-            label = int(frame)
-            existing = store.get(label) if store is not None else None
-            base_view = getattr(existing, "view", None)
-            metadata_raw = dict(
-                getattr(existing, "metadata_raw", None)
-                or getattr(base_view, "metadata_raw", None)
-                or {}
-            )
-            metadata_numeric = dict(
-                getattr(existing, "metadata_numeric", None)
-                or getattr(base_view, "metadata_numeric", None)
-                or numeric_metadata(metadata_raw)
-            )
-            view = FrameView(
-                label=label,
-                axis_1d=axis_1d,
-                intensity_1d=intensity[row],
-                sigma_1d=(None if sigma is None else sigma[row]),
-                thumbnail=getattr(base_view, "thumbnail", None),
-                mask_baked=bool(getattr(base_view, "mask_baked", False)),
-                metadata_raw=metadata_raw,
-                metadata_numeric=metadata_numeric,
-                incident_angle=getattr(base_view, "incident_angle", None),
-                geometry=getattr(base_view, "geometry", None),
-                source_path=getattr(base_view, "source_path", None),
-                source_frame_index=getattr(base_view, "source_frame_index", None),
-                extra=getattr(base_view, "extra", {}),
-            )
-            record = FrameRecord.from_view(view, mode_1d=mode_1d)
-            publications.append(
-                publication_from_frame_view(
-                    view,
-                    record=record,
-                    generation=generation,
-                    source_identity=(
-                        getattr(existing, "source_identity", "")
-                        or str(scan_file)
-                    ),
-                    raw_status="1d-only",
-                    validate=False,
+        for result in results:
+            frames = np.asarray(result.frames).ravel()
+            intensity = np.asarray(result.intensity)
+            if intensity.ndim == 1:
+                intensity = intensity[np.newaxis, :]
+            sigma = result.sigma
+            if sigma is not None:
+                sigma = np.asarray(sigma)
+                if sigma.ndim == 1:
+                    sigma = sigma[np.newaxis, :]
+            axis_1d = axis_from_unit(result.q_unit,
+                                     np.asarray(result.q, dtype=float))
+            for row, frame in enumerate(frames):
+                label = int(frame)
+                existing = store.get(label) if store is not None else None
+                base_view = getattr(existing, "view", None)
+                metadata_raw = dict(
+                    getattr(existing, "metadata_raw", None)
+                    or getattr(base_view, "metadata_raw", None)
+                    or {}
                 )
-            )
+                metadata_numeric = dict(
+                    getattr(existing, "metadata_numeric", None)
+                    or getattr(base_view, "metadata_numeric", None)
+                    or numeric_metadata(metadata_raw)
+                )
+                view = FrameView(
+                    label=label,
+                    axis_1d=axis_1d,
+                    intensity_1d=intensity[row],
+                    sigma_1d=(None if sigma is None else sigma[row]),
+                    thumbnail=getattr(base_view, "thumbnail", None),
+                    mask_baked=bool(getattr(base_view, "mask_baked", False)),
+                    metadata_raw=metadata_raw,
+                    metadata_numeric=metadata_numeric,
+                    incident_angle=getattr(base_view, "incident_angle", None),
+                    geometry=getattr(base_view, "geometry", None),
+                    source_path=getattr(base_view, "source_path", None),
+                    source_frame_index=getattr(base_view, "source_frame_index", None),
+                    extra=getattr(base_view, "extra", {}),
+                )
+                record = FrameRecord.from_view(view, mode_1d=mode_1d)
+                publications.append(
+                    publication_from_frame_view(
+                        view,
+                        record=record,
+                        generation=generation,
+                        source_identity=(
+                            getattr(existing, "source_identity", "")
+                            or str(scan_file)
+                        ),
+                        raw_status="1d-only",
+                        validate=False,
+                    )
+                )
         return tuple(publications)
 
     # ── Raw 2D data access ────────────────────────────────────────

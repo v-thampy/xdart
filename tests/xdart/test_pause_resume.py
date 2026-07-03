@@ -18,6 +18,7 @@ from types import SimpleNamespace, MethodType
 import pytest
 
 import xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread as itmod
+import xdart.gui.tabs.static_scan.wranglers.wrangler_widget as wwmod
 
 imageThread = itmod.imageThread
 
@@ -174,6 +175,108 @@ def test_h5pool_bracket_resumes_even_when_body_raises(monkeypatch):
             raise RuntimeError("boom")
 
     assert events == [('pause', 'x.nxs'), ('resume', 'x.nxs')]   # balanced
+
+
+def test_flush_serial_tail_locks_before_pausing_h5pool(monkeypatch):
+    """Writer must own file_lock before closing pooled read handles.
+
+    A load worker borrows from h5pool while holding this same lock.  Pausing the
+    pool before the lock can close a read handle that is still active, leaving
+    HDF5 to reject the following r+ writer open as "already open read-only".
+    """
+    events = []
+
+    class _TrackingLock:
+        held = False
+
+        def __enter__(self):
+            events.append("lock-enter")
+            self.held = True
+            return self
+
+        def __exit__(self, *_exc):
+            events.append("lock-exit")
+            self.held = False
+            return False
+
+    lock = _TrackingLock()
+
+    class _Pool:
+        def pause(self, path):
+            events.append(("pause", path, lock.held))
+            assert lock.held is True
+
+        def resume(self, path):
+            events.append(("resume", path, lock.held))
+            assert lock.held is True
+
+    monkeypatch.setattr(itmod, '_get_h5pool', lambda: _Pool())
+    scan = SimpleNamespace(
+        data_file='x.nxs',
+        _save_to_nexus=lambda: events.append(("save", lock.held)),
+    )
+    w = SimpleNamespace(
+        xye_only=False, _frames_since_save=1, file_lock=lock,
+        _save_due=lambda scan, force=False: True,
+        _flush_xye_buffer=lambda s: events.append(("xye", lock.held)),
+    )
+    _bind_serial_tail(w)
+
+    assert w.flush_serial_tail(scan, force=True) is True
+    assert events == [
+        "lock-enter",
+        ("pause", "x.nxs", True),
+        ("save", True),
+        ("resume", "x.nxs", True),
+        "lock-exit",
+        ("xye", False),
+    ]
+
+
+def test_base_save_to_disk_locks_before_pausing_h5pool(monkeypatch):
+    events = []
+
+    class _TrackingLock:
+        held = False
+
+        def __enter__(self):
+            events.append("lock-enter")
+            self.held = True
+            return self
+
+        def __exit__(self, *_exc):
+            events.append("lock-exit")
+            self.held = False
+            return False
+
+    lock = _TrackingLock()
+
+    class _Pool:
+        def pause(self, path):
+            events.append(("pause", path, lock.held))
+            assert lock.held is True
+
+        def resume(self, path):
+            events.append(("resume", path, lock.held))
+            assert lock.held is True
+
+    monkeypatch.setattr(wwmod, '_get_h5pool', lambda: _Pool())
+    scan = SimpleNamespace(
+        data_file='x.nxs',
+        _save_to_nexus=lambda: events.append(("save", lock.held)),
+    )
+    w = SimpleNamespace(xye_only=False, file_lock=lock)
+    w._save_to_disk = MethodType(wwmod.wranglerThread._save_to_disk, w)
+
+    w._save_to_disk(scan)
+
+    assert events == [
+        "lock-enter",
+        ("pause", "x.nxs", True),
+        ("save", True),
+        ("resume", "x.nxs", True),
+        "lock-exit",
+    ]
 
 
 def test_flush_serial_tail_persists_before_resetting_counter(monkeypatch):

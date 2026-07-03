@@ -413,8 +413,8 @@ class QtNexusSink:
             # Streaming writer reuses ONLY the host's symmetric h5pool bracket
             # (keeps its own mode= + mark_persisted bookkeeping; not the serial
             # flush_serial_tail).
-            with self._host._h5pool_bracket(self._scan):
-                with self._host.file_lock:
+            with self._host.file_lock:
+                with self._host._h5pool_bracket(self._scan):
                     mode = "w" if self._needs_atomic_first_batch_flush() else "a"
                     # Also marks LiveFrameSeries persisted after a successful save.
                     dropped = self._scan._save_to_nexus(mode=mode)

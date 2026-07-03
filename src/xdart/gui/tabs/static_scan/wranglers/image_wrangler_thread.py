@@ -1973,7 +1973,12 @@ class imageThread(wranglerThread):
         resuming even if the wrapped body raises (the symmetric bracket the .nxs
         single-writer path needs).  Shared by :meth:`flush_serial_tail` and
         ``QtNexusSink.flush`` (the streaming write reuses ONLY this bracket,
-        keeping its own ``mode=`` + bookkeeping)."""
+        keeping its own ``mode=`` + bookkeeping).
+
+        Callers enter this while holding ``file_lock``.  Readers also acquire
+        ``file_lock`` before borrowing from the pool, so pausing under that lock
+        closes only idle cached handles, never a handle in active use.
+        """
         _get_h5pool().pause(scan.data_file)
         try:
             yield
@@ -1997,8 +2002,8 @@ class imageThread(wranglerThread):
         """
         if scan is None or not self._save_due(scan, force=force):
             return False
-        with self._h5pool_bracket(scan):
-            with self.file_lock:
+        with self.file_lock:
+            with self._h5pool_bracket(scan):
                 scan._save_to_nexus()
         self._flush_xye_buffer(scan)
         self._frames_since_save = 0
@@ -3111,8 +3116,8 @@ class imageThread(wranglerThread):
         # the per-batch ``scan._save_to_nexus`` is already gated off for
         # xye_only, so the scan object is used purely in-memory for integration.
         if not self.xye_only:
-            with self._h5pool_bracket(scan):
-                with self.file_lock:
+            with self.file_lock:
+                with self._h5pool_bracket(scan):
                     if write_mode == 'Append':
                         # v2 NeXus loader (the only one we support now).
                         scan.load_from_h5(replace=False, mode='r')

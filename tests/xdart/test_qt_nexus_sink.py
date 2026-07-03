@@ -113,6 +113,72 @@ def _drive(sink, host, n):
     sink.finish(SimpleNamespace(cancelled=False, n_processed=n))
 
 
+def test_qt_sink_flush_locks_before_pausing_h5pool():
+    """Streaming writer excludes active pooled readers before pause/close.
+
+    The load worker borrows the pooled read handle while holding file_lock.  The
+    sink must take that lock first, then pause the pool, then open the writer.
+    """
+    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
+
+    events = []
+
+    class _TrackingLock:
+        held = False
+
+        def __enter__(self):
+            events.append("lock-enter")
+            self.held = True
+            return self
+
+        def __exit__(self, *_exc):
+            events.append("lock-exit")
+            self.held = False
+            return False
+
+    lock = _TrackingLock()
+
+    class _Host:
+        xye_only = False
+        batch_mode = True
+        file_lock = lock
+
+        @contextmanager
+        def _h5pool_bracket(self, scan):
+            events.append(("pause", scan.data_file, lock.held))
+            assert lock.held is True
+            try:
+                yield
+            finally:
+                events.append(("resume", scan.data_file, lock.held))
+                assert lock.held is True
+
+        def _flush_xye_buffer(self, scan, published_idxs=None):
+            events.append(("xye", published_idxs, lock.held))
+
+    scan = SimpleNamespace(
+        data_file="x.nxs",
+        frames=SimpleNamespace(index=[]),
+        _save_to_nexus=lambda mode="a": (
+            events.append(("save", mode, lock.held)) or {}
+        ),
+    )
+    sink = QtNexusSink(_Host(), scan, SimpleNamespace())
+    sink._since_save = 1
+    sink._published = {7}
+
+    sink.flush()
+
+    assert events == [
+        "lock-enter",
+        ("pause", "x.nxs", True),
+        ("save", "a", True),
+        ("resume", "x.nxs", True),
+        "lock-exit",
+        ("xye", {7}, False),
+    ]
+
+
 def test_sink_writes_all_frames_to_nxs_and_pops_register(tmp_path):
     from xdart.modules.ewald import LiveScan
     from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink

@@ -8,6 +8,7 @@ into a heavy publication, (b) the shared store rehydrates through it, and (c)
 the GUI render path only queues a background request when async hydration was
 explicitly enabled (off in headless tests -> synchronous reads preserved)."""
 import logging
+import threading
 from types import SimpleNamespace, MethodType
 
 import numpy as np
@@ -40,6 +41,19 @@ class _DuckFrame:
 
     def _get_incident_angle(self):
         return float(self.scan_info["th"])
+
+
+def _fake_1d_result(frame):
+    frame = tuple(int(label) for label in frame)
+    return SimpleNamespace(
+        q=np.array([0.1, 0.2, 0.3]),
+        intensity=np.vstack([
+            np.full(3, float(label)) for label in frame
+        ]),
+        sigma=None,
+        q_unit="q_A^-1",
+        frames=np.asarray(frame, dtype=np.int64),
+    )
 
 
 def _hydrator_holder(disk_frame, store=None):
@@ -82,15 +96,7 @@ def test_store_get_1d_many_uses_batch_1d_rehydrator(monkeypatch):
 
     def fake_get_1d(path, frame):
         calls.append((path, tuple(frame)))
-        return SimpleNamespace(
-            q=np.array([0.1, 0.2, 0.3]),
-            intensity=np.vstack([
-                np.full(3, float(label)) for label in frame
-            ]),
-            sigma=None,
-            q_unit="q_A^-1",
-            frames=np.asarray(frame, dtype=np.int64),
-        )
+        return _fake_1d_result(frame)
 
     monkeypatch.setattr(xrd_io, "get_1d", fake_get_1d)
     store = PublicationStore(max_heavy_items=0, max_thumbnail_items=0)
@@ -110,6 +116,158 @@ def test_store_get_1d_many_uses_batch_1d_rehydrator(monkeypatch):
     assert out[3].view.intensity_2d is None
     assert out[3].view.raw is None
     assert out[3].raw_status == "1d-only"
+
+
+def test_batch_1d_rehydrator_serializes_with_writer_file_lock(monkeypatch):
+    import xrd_tools.io as xrd_io
+
+    file_lock = threading.Lock()
+    entered = threading.Event()
+
+    def fake_get_1d(path, frame):
+        entered.set()
+        return _fake_1d_result(frame)
+
+    monkeypatch.setattr(xrd_io, "get_1d", fake_get_1d)
+    store = PublicationStore(max_heavy_items=0, max_thumbnail_items=0)
+    h = SimpleNamespace(
+        publication_store=store,
+        scan=SimpleNamespace(data_file="scan.nxs", gi=False, file_lock=file_lock),
+    )
+    h._rehydrate_publications_1d = MethodType(
+        DisplayDataMixin._rehydrate_publications_1d, h)
+
+    file_lock.acquire()
+    result = []
+    thread = threading.Thread(
+        target=lambda: result.extend(h._rehydrate_publications_1d((3, 4))))
+    thread.start()
+    try:
+        assert not entered.wait(0.1), "bulk 1D read overlapped writer lock"
+    finally:
+        file_lock.release()
+    thread.join(2.0)
+
+    assert not thread.is_alive()
+    assert entered.is_set()
+    assert {publication.label for publication in result} == {3, 4}
+
+
+def test_batch_1d_rehydrator_reads_default_chunks_under_file_lock(monkeypatch):
+    import xrd_tools.io as xrd_io
+
+    calls = []
+
+    class _TrackingLock:
+        held = False
+
+        def __enter__(self):
+            self.held = True
+            return self
+
+        def __exit__(self, *_exc):
+            self.held = False
+            return False
+
+    file_lock = _TrackingLock()
+
+    def fake_get_1d(path, frame):
+        assert file_lock.held is True
+        calls.append(tuple(frame))
+        return _fake_1d_result(frame)
+
+    monkeypatch.setattr(xrd_io, "get_1d", fake_get_1d)
+    store = PublicationStore(max_heavy_items=0, max_thumbnail_items=0)
+    h = SimpleNamespace(
+        publication_store=store,
+        scan=SimpleNamespace(data_file="scan.nxs", gi=False, file_lock=file_lock),
+    )
+    h._rehydrate_publications_1d = MethodType(
+        DisplayDataMixin._rehydrate_publications_1d, h)
+
+    out = h._rehydrate_publications_1d(range(600))
+
+    assert [len(call) for call in calls] == [256, 256, 88]
+    assert len(out) == 600
+
+
+def test_writer_can_interleave_between_bulk_1d_hydration_chunks(monkeypatch):
+    import xrd_tools.io as xrd_io
+
+    class _FairLock:
+        def __init__(self):
+            self._cond = threading.Condition()
+            self._held = False
+            self._writer_pending = False
+            self.writer_pending_seen = threading.Event()
+            self.events = []
+
+        def __enter__(self):
+            with self._cond:
+                while self._held or self._writer_pending:
+                    self._cond.wait()
+                self._held = True
+                self.events.append("read-enter")
+                return self
+
+        def __exit__(self, *_exc):
+            with self._cond:
+                self.events.append("read-exit")
+                self._held = False
+                self._cond.notify_all()
+                return False
+
+        def writer_flush(self):
+            with self._cond:
+                self._writer_pending = True
+                self.writer_pending_seen.set()
+                self._cond.notify_all()
+                while self._held:
+                    self._cond.wait()
+                self.events.append("writer-enter")
+                self._held = True
+                self._writer_pending = False
+                self._cond.notify_all()
+                self.events.append("writer-exit")
+                self._held = False
+                self._cond.notify_all()
+
+    file_lock = _FairLock()
+    writer_thread = []
+    calls = []
+
+    def fake_get_1d(path, frame):
+        calls.append(tuple(frame))
+        if len(calls) == 1:
+            thread = threading.Thread(target=file_lock.writer_flush)
+            writer_thread.append(thread)
+            thread.start()
+            assert file_lock.writer_pending_seen.wait(1.0)
+        return _fake_1d_result(frame)
+
+    monkeypatch.setattr(xrd_io, "get_1d", fake_get_1d)
+    store = PublicationStore(max_heavy_items=0, max_thumbnail_items=0)
+    h = SimpleNamespace(
+        publication_store=store,
+        _bulk_1d_read_chunk=2,
+        scan=SimpleNamespace(data_file="scan.nxs", gi=False, file_lock=file_lock),
+    )
+    h._rehydrate_publications_1d = MethodType(
+        DisplayDataMixin._rehydrate_publications_1d, h)
+
+    out = h._rehydrate_publications_1d((1, 2, 3, 4, 5))
+    writer_thread[0].join(2.0)
+
+    assert not writer_thread[0].is_alive()
+    assert [len(call) for call in calls] == [2, 2, 1]
+    assert {publication.label for publication in out} == {1, 2, 3, 4, 5}
+    assert file_lock.events[:5] == [
+        "read-enter",
+        "read-exit",
+        "writer-enter",
+        "writer-exit",
+        "read-enter",
+    ]
 
 
 def test_request_frame_hydration_respects_enabled_flag():

@@ -51,6 +51,35 @@ paint; smoothing only helps the fast-scan case where frames pile up per window.
 | 4 | **SKIPPED** | — | maintainer: waterfall throttle is not an issue |
 | 5 | **DONE — fixed-unverified** | this commit | render-leg smoothing: Linear scale now uses the raw array view instead of copying, `_ceiling_safe_levels` no longer makes a second full float copy, large autoscale populations are sampled at stride 4, and levels are reused for ~1 s unless scale/cmap/shape/dtype/pct changes. `XDART_PERF=1` now logs copy/transform/levels/setImage/hist/total for live A6 validation. |
 
+## H30 render authority note
+The display-generation scheduler is now the single paint authority for heavy render entries.
+`staticWidget._request_render(reason)` delegates to `displayframe.request_current_selection_repaint`,
+while `_flush_pending_update` remains the heavy live-drain client: if the selection generation changes
+as the flush fires, it re-arms the timer and leaves `_pending_frames` intact so the next admitted flush
+still drains every frame. The fast `_list_timer` path intentionally remains outside the heavy painter.
+
+H30 live-output HDF5 hotfix: writer flushes now take `file_lock` before pausing/closing the shared
+read-only H5 pool. The load worker borrows pooled handles under the same lock; this order prevents a
+writer from closing an actively-used read handle and then failing its `r+` open with "file is already
+open for read-only" during long Eiger overlay stress tests.
+
+RN-2 bulk-1D hydration hotfix: `_rehydrate_publications_1d()` now reads selected 1D rows through
+`DisplayDataMixin._locked_scan_read()` in chunks of at most 256 labels. This is the approved helper
+for new display/hydration-layer `.nxs` readers; it resolves the writer lock from `self.file_lock`,
+`scan.file_lock`, then `scan.frames.file_lock`.
+
+Display/hydration `.nxs` reader audit:
+
+| Reader | Path | Discipline |
+|---|---|---|
+| Bulk 1D overlay hydration | `display_data._rehydrate_publications_1d` → `xrd_tools.io.get_1d` | **RN-2 fixed:** `_locked_scan_read`, <=256 labels per lock hold |
+| Full frame hydration | `display_data._hydrate_frame_from_disk` → `scan.frames[idx]` | Active runs serve resident frames only; idle reads flow through `LiveFrameSeries.__getitem__` under `file_lock` |
+| Record-store hydration | `image_wrangler_thread._record_store_hydrator` → `read_frame_view` | Locked under writer `file_lock` (`084f3410`) |
+| H5Viewer load worker | `_LoadFramesWorker` → H5 pool + `_load_frame_v2` | `pool.get` and frame read occur under `file_lock`; writer now locks before pool pause |
+| Whole-scan aggregation | `scan_aggregate.whole_scan_aggregate_*` | Worker thread; aggregate read wrapped in scan/series `file_lock` |
+| Wavelength fallback | `display_data._get_wavelength` → direct `h5py.File` | Skipped while `_run_writing`; cached including negative result |
+| Source Eiger reads | `image_wrangler_thread` persistent Eiger master handle | Source-file read handle, not the live output `.nxs` writer target |
+
 ## Terminal-tunable knobs (sweep live, no rebuild)
 - `XDART_FLUSH_MS` (default **150**, floor **110**) — the heavy image-update quantum (`_update_timer`).
   Values below 110 ms are clamped with a warning. Keep ≥ the 100 ms user-selection debounce and the

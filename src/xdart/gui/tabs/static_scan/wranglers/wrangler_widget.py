@@ -816,9 +816,9 @@ class wranglerThread(Qt.QtCore.QThread):
         """
         if self.xye_only:
             return
-        _get_h5pool().pause(scan.data_file)
-        try:
-            with self.file_lock:
+        with self.file_lock:
+            _get_h5pool().pause(scan.data_file)
+            try:
                 scan._save_to_nexus()
-        finally:
-            _get_h5pool().resume(scan.data_file)
+            finally:
+                _get_h5pool().resume(scan.data_file)

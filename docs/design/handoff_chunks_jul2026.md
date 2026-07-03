@@ -13,7 +13,7 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
   ledger (the repo convention), in the same commit.
 - Do NOT touch `static_scan_widget.py` unless the chunk says so — one chunk at a time owns it.
 - Refuted findings (do not "fix"): per-run wrangler-thread leak, set_wrangler accumulation,
-  H5FilePool race, GI-2D freeze hole.
+  GI-2D freeze hole.
 
 ---
 
@@ -32,6 +32,7 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 | RC-6 | Doc-ledger truth fixes + FLOOR salvage | S | none | agents read true state | — | **DONE** `ddacbc0e` |
 | RC-7 | Session-1 live checklist doc | S | none | one artifact discharges all live gates | — | **DONE** `bec431b1` (session PENDING) |
 | Fix series | Freeze/overlay/race/popup/bounce (FS/OV/RN/LD/BR rows) | — | — | see `live_findings_ledger.md` | — | code DONE through Wave 2; live-verify at Session-1 |
+| RN-2 | Bulk 1D overlay hydration locks/chunks `get_1d` reads | S | low-med | 3600-frame overlay no longer holds `.nxs` read-only across writer flush retries | H-hyd, H30 | **DONE** this commit; live-scale overlay verification pending |
 | H1 | Mode-scoped `mark_persisted` | S | low | no silent multi-mode loss on eviction | — | **DONE** `4d3e2b3c` |
 | H4 | `_set_1d_cache_limit(None)` guard | S | none | unbounded footgun closed | — | **DONE** `4d2f3957` |
 | H7a | Typed read contract + policy table | M | low | one read policy | — | **DONE** `03492440` |
