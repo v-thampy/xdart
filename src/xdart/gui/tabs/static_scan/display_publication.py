@@ -39,6 +39,13 @@ from .display_logic import (
     waterfall_display_rows,
 )
 from .display_constants import AA_inv, Deg, Th, x_labels_2D, x_units_2D
+from .display_overlay_utils import (
+    current_axis_info as _overlay_current_axis_info,
+    overlay_grid_key_for_widget,
+    overlay_grid_keys_match,
+    overlay_identity_for_widget,
+    slice_enabled as _overlay_slice_enabled,
+)
 
 MAX_WATERFALL_PAYLOAD_ROWS = 256
 
@@ -858,7 +865,7 @@ class PublicationDisplayAdapter:
     # from the store each render -- the store evicts past its cap, so a per-render
     # rebuild would re-introduce the cap-truncation regression.  This builds the
     # resident 1D frames onto a shared ref grid (mirroring integration_plot_payload)
-    # and ACCUMULATES them into the generation-keyed WaterfallHistory.  The widget
+    # and ACCUMULATES them into the grid-keyed WaterfallHistory.  The widget
     # owns the prior history: read here, stored back by the renderer (_draw_payload)
     # after a successful draw, so the next render appends onto it.  render_display +
     # _draw_payload then draw it via the shared update_plot_view (curves/waterfall),
@@ -868,46 +875,31 @@ class PublicationDisplayAdapter:
         """Accumulate the resident 1D frames into the WaterfallHistory and return a
         PlotPayload carrying it.  Preserves the legacy invariants: a render with no
         resident 1D frames PRESERVES the prior accumulator (never wipes -- the
-        failed-read invariant); a scan/source change (``reset_key``) resets it; a
-        plotUnit Q<->2theta toggle relabels the grid in place (handled in
-        accumulate_waterfall).  The accumulator is keyed on a STABLE scan/source
-        identity, NOT state.generation -- the generation bumps every tick as live
-        auto-last grows the selection, so keying on it would reset each tick and
-        rebuild from only the un-evicted frames (cap-truncation).  Returns ``None``
-        only when there is nothing to show and no prior accumulator."""
+        failed-read invariant); an incompatible grid/source change
+        (``reset_key``) resets it; a plotUnit Q<->2theta toggle relabels the grid
+        in place (handled in accumulate_waterfall).  The accumulator is keyed on a
+        STABLE grid identity, NOT state.generation -- the generation bumps every
+        tick as live auto-last grows the selection, so keying on it would reset
+        each tick and rebuild from only the un-evicted frames (cap-truncation).
+        Returns ``None`` only when there is nothing to show and no prior
+        accumulator."""
         widget = self._widget
         prior = getattr(widget, "_waterfall_history", None)
 
         # Full parity with integration_plot_payload's per-frame build: a 2D-slice
         # source (cake-projected 1D, or an active chi/q slice) builds each row via
         # _slice_1d_from_2d; otherwise the native 1D view with on-the-fly Q↔2θ.
-        axis_info = _current_axis_info(widget)
+        axis_info = _overlay_current_axis_info(widget)
         source = axis_info.get("source", "1d")
         needs_2d = (source == "2d") or (
-            source == "1d_2d" and _slice_enabled(widget)
+            source == "1d_2d" and _overlay_slice_enabled(widget)
         )
-        # Reset identity: a new scan, or a 1D<->2D-slice source change (which alters
-        # each row's CONTENT), resets the accumulator.  A unit toggle and selection
-        # growth do NOT change it (relabel / append).
-        scan = getattr(widget, "scan", None)
-        scan_id = (getattr(scan, "data_file", None)
-                   or getattr(scan, "name", None)) if scan is not None else None
-        slice_key = None
-        if needs_2d:
-            try:
-                slice_key = (
-                    float(widget.ui.slice_center.value()),
-                    float(widget.ui.slice_width.value()),
-                ) if _slice_enabled(widget) else (None, None)
-            except Exception:
-                slice_key = (None, None)
-        reset_key = (
-            (scan_id, True, slice_key) if needs_2d else (scan_id, False)
-        )
+        planned_reset_key = overlay_grid_key_for_widget(widget, axis_info=axis_info)
 
         ref_x = None
         axis = None
-        ids, names, rows = [], [], []
+        reset_key = None
+        ids, names, rows, metadata = [], [], [], []
         for label in state.render_ids:
             pub = self._items.get(_label_key(label))
             if pub is None:
@@ -938,16 +930,21 @@ class PublicationDisplayAdapter:
             elif x.shape != ref_x.shape or not np.allclose(x, ref_x, equal_nan=True):
                 y = np.interp(ref_x, x, y)
                 x = ref_x
-            ids.append(int(label))
+            row_grid_key, row_id = overlay_identity_for_widget(
+                widget, label, npt=np.asarray(ref_x).size, axis_info=axis_info)
+            if reset_key is None:
+                reset_key = row_grid_key
+            ids.append(row_id)
             names.append(_trace_name(pub, widget))
             rows.append(y)
+            metadata.append(dict(pub.metadata_raw or {}))
 
         if ref_x is None:
             # No resident 1D frame this render: PRESERVE the prior accumulator (the
             # append-only / failed-read invariant) -- never wipe it.  Re-emit its
             # payload when it belongs to the current accumulation identity, else
             # nothing (a different scan/source must not show stale curves).
-            if (prior is not None and prior.reset_key == reset_key
+            if (prior is not None and overlay_grid_keys_match(prior.reset_key, planned_reset_key)
                     and prior.count):
                 return self._history_to_payload(prior)
             return None
@@ -956,7 +953,8 @@ class PublicationDisplayAdapter:
         label = str(getattr(axis, "label", "") or "")
         history = accumulate_waterfall(
             prior, reset_key=reset_key, unit=unit, label=label,
-            x=ref_x, rows=np.asarray(rows, dtype=float), ids=ids, names=names)
+            x=ref_x, rows=np.asarray(rows, dtype=float), ids=ids, names=names,
+            metadata=metadata)
         return self._history_to_payload(history)
 
     def _history_to_payload(self, history):
@@ -970,9 +968,9 @@ class PublicationDisplayAdapter:
         axis = Axis(label, history.unit)
         rows, display_ids, _stride = waterfall_display_rows(
             history.rows, history.ids, MAX_WATERFALL_PAYLOAD_ROWS)
-        name_by_id = {int(i): n for i, n in zip(history.ids, history.names)}
+        name_by_id = {i: n for i, n in zip(history.ids, history.names)}
         traces = tuple(
-            Trace(label=name_by_id.get(int(display_ids[k]), str(display_ids[k])),
+            Trace(label=name_by_id.get(display_ids[k], str(display_ids[k])),
                   x=history.x, y=rows[k])
             for k in range(len(display_ids)))
         return PlotPayload(axis_x=axis, traces=traces,

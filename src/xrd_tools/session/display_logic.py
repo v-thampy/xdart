@@ -38,6 +38,7 @@ import logging
 import warnings
 from dataclasses import dataclass
 from enum import Enum
+from types import MappingProxyType
 
 import numpy as np  # allowed: the purity guard forbids only Qt/pyqtgraph/h5py/pyFAI/fabio
 
@@ -72,6 +73,11 @@ __all__ = [
     "Trace",
     "PlotPayload",
     "WaterfallHistory",
+    "overlay_grid_reset_key",
+    "overlay_grid_keys_compatible",
+    "qualified_frame_id",
+    "frame_index_from_qualified_id",
+    "scan_key_from_qualified_id",
     "accumulate_waterfall",
     "waterfall_display_rows",
     "ImagePayload",
@@ -417,21 +423,22 @@ class WaterfallHistory:
     cap, so a per-render rebuild from the store would re-introduce the cap-truncation
     regression.  The accumulator instead retains every row it has captured.
 
-    ``reset_key`` is the accumulation IDENTITY (scan + 1D/2D source) -- the ONLY
-    reset trigger.  It is deliberately NOT the display generation: the display
+    ``reset_key`` is the accumulation GRID identity (axis kind + point count +
+    1D/2D source) -- the ONLY automatic reset trigger.  It is deliberately NOT
+    the scan id and NOT the display generation: the display
     generation bumps on every effective-selection change, and live auto-last GROWS
     the selection every tick, so keying the reset on it would reset the accumulator
     each tick and rebuild from only the resident (un-evicted) frames -- the exact
-    cap-truncation this design exists to prevent.  Scan/source changes change the
-    key (reset); selection growth and a Q<->2theta unit toggle do not (append /
-    relabel in place).
+    cap-truncation this design exists to prevent.  Incompatible grid/source
+    changes change the key (reset); compatible scan boundaries, selection growth
+    and a Q<->2theta unit toggle do not (append / relabel in place).
 
     All rows live on ONE shared sample grid (``x``); the adapter interpolates each
     incoming frame onto it before accumulating.  ``rows[k]`` is frame ``ids[k]`` /
     ``names[k]`` -- maintained row-for-row.  ``unit`` is the radial unit the grid is
     currently labelled in (a Q<->2theta toggle relabels ``x`` in place, since the
     intensities are unit-invariant)."""
-    reset_key: "object"      # accumulation identity (scan, source); reset on change
+    reset_key: "object"      # accumulation identity (grid, source); reset on change
     unit: str
     x: "np.ndarray"          # shared radial sample grid (1-D, in `unit`)
     rows: "np.ndarray"       # (n, len(x)) stacked intensities; row order == ids
@@ -440,36 +447,125 @@ class WaterfallHistory:
     label: str = ""          # x-axis label for `unit` (carried, not re-derived:
     #                          the display unit doesn't always round-trip through
     #                          x_axis_for_unit, e.g. the 2θ conversion's symbol)
+    metadata: tuple = ()     # per-row scan metadata, row order == ids
 
     @property
     def count(self) -> int:
         return len(self.ids)
 
 
-def _dedup_first(ids, names, rows):
+def qualified_frame_id(scan_key, frame_idx):
+    """Return the scan-qualified row id used by Overlay/Waterfall histories."""
+    try:
+        frame_idx = int(frame_idx)
+    except (TypeError, ValueError):
+        pass
+    return (scan_key, frame_idx)
+
+
+def frame_index_from_qualified_id(row_id):
+    """Return the numeric frame index from a legacy or scan-qualified row id."""
+    if isinstance(row_id, tuple) and len(row_id) == 2:
+        row_id = row_id[1]
+    return int(row_id)
+
+
+def scan_key_from_qualified_id(row_id):
+    """Return the scan key from a scan-qualified row id, else ``None``."""
+    if isinstance(row_id, tuple) and len(row_id) == 2:
+        return row_id[0]
+    return None
+
+
+def overlay_grid_reset_key(axis_kind, npt, needs_2d, slice_key=None):
+    """Canonical Overlay/Waterfall reset identity.
+
+    The key names the grid family, not the scan.  ``npt=None`` means the caller
+    does not yet know the point count (for example, no resident rows during an
+    evicted-frame repaint); compatibility checks treat it as a wildcard, while
+    persisted histories should carry a concrete count once a row is captured.
+    """
+    axis = str(axis_kind or "unknown")
+    try:
+        count = None if npt is None else int(npt)
+    except (TypeError, ValueError):
+        count = None
+    if needs_2d:
+        return (axis, count, True, slice_key)
+    return (axis, count, False)
+
+
+def overlay_grid_keys_compatible(left, right):
+    """Return True when two grid reset keys can share one accumulator."""
+    if left is None or right is None:
+        return False
+    left = tuple(left)
+    right = tuple(right)
+    if len(left) < 3 or len(right) < 3:
+        return left == right
+    left_axis, left_npt, left_2d = left[:3]
+    right_axis, right_npt, right_2d = right[:3]
+    if left_axis != right_axis or bool(left_2d) != bool(right_2d):
+        return False
+    if left_npt is not None and right_npt is not None:
+        try:
+            if int(left_npt) != int(right_npt):
+                return False
+        except (TypeError, ValueError):
+            return False
+    if bool(left_2d):
+        return (left[3] if len(left) > 3 else None) == (right[3] if len(right) > 3 else None)
+    return True
+
+
+def _dedup_key(value):
+    try:
+        hash(value)
+        return value
+    except TypeError:
+        return repr(value)
+
+
+def _freeze_metadata(meta):
+    if isinstance(meta, MappingProxyType):
+        return meta
+    if isinstance(meta, dict):
+        return MappingProxyType(dict(meta))
+    if meta is None:
+        return MappingProxyType({})
+    try:
+        return MappingProxyType(dict(meta))
+    except (TypeError, ValueError):
+        return MappingProxyType({})
+
+
+def _dedup_first(ids, names, rows, metadata=None):
     """Keep the FIRST occurrence of each id (arrival order)."""
     seen = set()
-    ki, kn, kr = [], [], []
-    for i, n, r in zip(ids, names, rows):
-        ii = int(i)
-        if ii in seen:
+    ki, kn, kr, km = [], [], [], []
+    if metadata is None:
+        metadata = [None] * len(ids)
+    for i, n, r, m in zip(ids, names, rows, metadata):
+        key = _dedup_key(i)
+        if key in seen:
             continue
-        seen.add(ii)
-        ki.append(ii)
+        seen.add(key)
+        ki.append(i)
         kn.append(n)
         kr.append(r)
-    return ki, kn, kr
+        km.append(_freeze_metadata(m))
+    return ki, kn, kr, km
 
 
-def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names, label=""):
+def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names, label="", metadata=None):
     """Pure, append-only Overlay/Waterfall accumulator keyed on ``reset_key`` (the
     payload-owned successor to ``update_plot_accumulator`` + the widget triple).
 
     Append-only WITHIN one ``reset_key``: a partial / out-of-order / re-delivered
     read can only ADD frames not yet captured -- it never shrinks the stack or
     re-stacks a frame (the collapse/restack class, structurally precluded).  A
-    ``reset_key`` change (a new scan, or a 1D<->2D-slice source change -- NOT a mere
-    selection change) is the ONLY reset.
+    ``reset_key`` change (an incompatible grid, or a 1D<->2D-slice source change
+    -- NOT a mere selection change or compatible scan boundary) is the ONLY reset.
 
     Crucially the key is NOT the display generation: that bumps on every
     effective-selection change, and live auto-last grows the selection each tick, so
@@ -489,18 +585,23 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names, label
     """
     x = np.asarray(x, dtype=float).ravel()
     rows = np.atleast_2d(np.asarray(rows, dtype=float))
-    ids = [int(i) for i in ids]
+    ids = list(ids)
     names = list(names)
+    metadata = list(metadata) if metadata is not None else []
+    if len(metadata) < len(ids):
+        metadata.extend([None] * (len(ids) - len(metadata)))
+    metadata = [_freeze_metadata(m) for m in metadata[:len(ids)]]
 
-    # RESET: new accumulation identity (scan/source change), no prior history, or an
-    # empty incoming grid (nothing to anchor on -- keep the incoming as-is).
+    # RESET: new accumulation identity (incompatible grid/source), no prior
+    # history, or an empty incoming grid (nothing to anchor on -- keep the
+    # incoming as-is).
     if history is None or history.reset_key != reset_key or x.size == 0:
-        ki, kn, kr = _dedup_first(ids, names, rows)
+        ki, kn, kr, km = _dedup_first(ids, names, rows, metadata)
         return WaterfallHistory(
             reset_key=reset_key, unit=unit, label=label, x=x,
             rows=(np.asarray(kr, dtype=float) if kr
                   else np.empty((0, x.size), dtype=float)),
-            ids=tuple(ki), names=tuple(kn))
+            ids=tuple(ki), names=tuple(kn), metadata=tuple(km))
 
     # Same identity: keep the accumulated rows; relabel the grid on a unit toggle
     # (incoming x is the same sample grid in the new unit), then append new ids.
@@ -509,15 +610,21 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names, label
     base_rows = history.rows
     out_ids = list(history.ids)
     out_names = list(history.names)
-    have = set(history.ids)
+    out_meta = list(getattr(history, "metadata", ()) or ())
+    if len(out_meta) < len(out_ids):
+        out_meta.extend(_freeze_metadata(None) for _ in range(len(out_ids) - len(out_meta)))
+    have = {_dedup_key(i) for i in history.ids}
 
     add = []
-    for i, n, r in zip(ids, names, rows):
-        if i in have:
+    add_meta = []
+    for i, n, r, m in zip(ids, names, rows, metadata):
+        key = _dedup_key(i)
+        if key in have:
             continue
-        have.add(i)
+        have.add(key)
         out_ids.append(i)
         out_names.append(n)
+        add_meta.append(m)
         # The incoming row is on the shared grid already; reinterp defensively only
         # if the grid sample-count differs (e.g. a mid-generation Npts hiccup).
         r = np.asarray(r, dtype=float)
@@ -533,7 +640,8 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names, label
 
     return WaterfallHistory(
         reset_key=reset_key, unit=unit, label=label, x=base_x, rows=new_rows,
-        ids=tuple(out_ids), names=tuple(out_names))
+        ids=tuple(out_ids), names=tuple(out_names),
+        metadata=tuple([*out_meta, *add_meta]))
 
 
 def waterfall_display_rows(rows, ids, max_rows):
@@ -1556,8 +1664,9 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
     # PLOT_1D drawable so the overlay is NOT wiped — _overlay_waterfall_payload
     # re-emits the existing accumulator and the evicted frame backfills on a later
     # hydration tick.  The 2D panels stay blank (render_2d empty).  Clearing still
-    # happens on Clear / a mode change / a new scan (those empty prev_overlaid_ids
-    # or change the reset_key).  overlay_read_failure_action encodes the policy.
+    # happens on Clear / a mode change / an incompatible grid-source change (those
+    # empty prev_overlaid_ids or change the reset_key).  overlay_read_failure_action
+    # encodes the policy.
     _overlay_preserve_1d = (
         mode in _SCAN_MODES
         and not render_1d

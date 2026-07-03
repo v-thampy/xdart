@@ -831,7 +831,7 @@ def test_overlay_waterfall_payload_accumulates_in_payload_across_renders():
     # each render (which the cap would truncate).  Verifies: cross-render append;
     # a render with no resident frames PRESERVES the accumulator; a display
     # generation bump (selection growth) does NOT reset (the cap-truncation fix);
-    # a scan change DOES reset.
+    # an incompatible grid DOES reset.
     from xdart.gui.tabs.static_scan.display_publication import (
         PublicationDisplayAdapter)
     from xdart.modules.frame_publication import (
@@ -872,21 +872,35 @@ def test_overlay_waterfall_payload_accumulates_in_payload_across_renders():
             widget._waterfall_history = p.plot_history
         return p
 
+    q = lambda scan, idx: (scan, idx)
+
     p1 = render([0, 1])
-    assert p1 is not None and p1.plot_history.ids == (0, 1)
+    assert p1 is not None and p1.plot_history.ids == (q("scan", 0), q("scan", 1))
     assert len(p1.traces) == 2
     p2 = render([2])
-    assert p2.plot_history.ids == (0, 1, 2)        # accumulated across renders
+    assert p2.plot_history.ids == (q("scan", 0), q("scan", 1), q("scan", 2))
     p3 = render([])                               # no resident frames -> preserve
-    assert p3 is not None and p3.plot_history.ids == (0, 1, 2)
+    assert p3 is not None and p3.plot_history.ids == (
+        q("scan", 0), q("scan", 1), q("scan", 2))
     # A display-generation bump (selection growth) must NOT reset -- the accumulator
-    # is keyed on the scan/source identity, not the generation.
+    # is keyed on the grid/source identity, not the generation.
     p4 = render([0], generation=2)
-    assert p4.plot_history.ids == (0, 1, 2)
-    # A scan change DOES reset the accumulator.
+    assert p4.plot_history.ids == (q("scan", 0), q("scan", 1), q("scan", 2))
+    # A compatible scan change APPENDS.  Frame 0 in scan2 is distinct from frame 0
+    # in scan because ids are scan-qualified.
     widget.scan = SimpleNamespace(name="scan2", gi=False, bai_1d_args={}, bai_2d_args={})
     p5 = render([0])
-    assert p5.plot_history.ids == (0,)
+    assert p5.plot_history.ids == (
+        q("scan", 0), q("scan", 1), q("scan", 2), q("scan2", 0))
+
+    frame = SimpleNamespace(
+        idx=4, int_1d=_ir1d(4, nq=7), int_2d=None, map_raw=None, mask=None,
+        gi=False, gi_2d={}, thumbnail=None, bg_raw=0, scan_info={},
+        source_file="f4.tif", source_frame_idx=4)
+    store.upsert(publication_from_live_frame(frame))
+    widget.scan = SimpleNamespace(name="scan3", gi=False, bai_1d_args={}, bai_2d_args={})
+    p6 = render([4])
+    assert p6.plot_history.ids == (q("scan3", 4),)
 
 
 def test_plot_payload_routes_overlay_waterfall_through_accumulator():
@@ -935,10 +949,11 @@ def test_plot_payload_routes_overlay_waterfall_through_accumulator():
     # Overlay routes to the accumulator and accumulates across renders.
     p1 = adapter.plot_payload(state("Overlay", [0, 1]))
     assert p1 is not None and p1.plot_history is not None
-    assert p1.plot_history.ids == (0, 1) and p1.overlaid_ids == (0, 1)
+    assert p1.plot_history.ids == (("scan", 0), ("scan", 1))
+    assert p1.overlaid_ids == (("scan", 0), ("scan", 1))
     widget._waterfall_history = p1.plot_history          # renderer stores it back
     p2 = adapter.plot_payload(state("Waterfall", [2]))
-    assert p2.plot_history.ids == (0, 1, 2)              # appended, not reset
+    assert p2.plot_history.ids == (("scan", 0), ("scan", 1), ("scan", 2))
 
     # Single/Sum/Average keep the integration payload, NO accumulator carried.
     widget._waterfall_history = None
@@ -976,15 +991,16 @@ def test_overlay_selection_of_evicted_frame_preserves_then_appends():
     assert store.get(99).view.has_1d
 
     def _history():
-        ids = tuple(range(36, 100))
+        frame_ids = tuple(range(36, 100))
+        ids = tuple(("scan", i) for i in frame_ids)
         return WaterfallHistory(
-            reset_key=("scan.nxs", False),
+            reset_key=("radial", len(x), False),
             unit="Å⁻¹",
             label="Q",
             x=x,
-            rows=np.vstack([np.full(x.shape, float(i)) for i in ids]),
+            rows=np.vstack([np.full(x.shape, float(i)) for i in frame_ids]),
             ids=ids,
-            names=tuple(f"scan_{i}" for i in ids),
+            names=tuple(f"scan_{i}" for i in frame_ids),
         )
 
     queued = []
@@ -1028,12 +1044,12 @@ def test_overlay_selection_of_evicted_frame_preserves_then_appends():
     assert tuple(state.render_ids) == ()
     assert queued == [5]
     assert payload is not None
-    assert payload.plot_history.ids == tuple(range(36, 100))
+    assert payload.plot_history.ids == _history().ids
 
     store.upsert(publication_from_live_frame(_frame(5)))
     state, payload = render()
     assert tuple(state.render_ids) == (5,)
-    assert payload.plot_history.ids == tuple(range(36, 100)) + (5,)
+    assert payload.plot_history.ids == _history().ids + (("scan", 5),)
 
     queued.clear()
     widget._waterfall_history = _history()
@@ -1042,13 +1058,13 @@ def test_overlay_selection_of_evicted_frame_preserves_then_appends():
     state, payload = render()
     assert tuple(state.render_ids) == (99,)
     assert queued == [6]
-    assert payload.plot_history.ids == tuple(range(36, 100))
+    assert payload.plot_history.ids == _history().ids
 
     store.upsert(publication_from_live_frame(_frame(6)))
     state, payload = render()
     assert tuple(state.render_ids) == (6, 99)
     assert payload.plot_history.count == 65
-    assert set(payload.plot_history.ids) >= {6, 99}
+    assert set(payload.plot_history.ids) >= {("scan", 6), ("scan", 99)}
 
 
 def test_overlay_many_frame_selection_converges_after_out_of_order_hydration():
@@ -1130,7 +1146,7 @@ def test_overlay_many_frame_selection_converges_after_out_of_order_hydration():
         assert payload is not None and payload.plot_history is not None
 
     assert payload.plot_history.count == 100
-    assert set(payload.plot_history.ids) == set(range(100))
+    assert set(payload.plot_history.ids) == {("scan", i) for i in range(100)}
 
 
 def test_overlay_selection_evicted_hydration_never_decreases_history():
@@ -1161,15 +1177,16 @@ def test_overlay_selection_evicted_hydration_never_decreases_history():
         store.upsert(publication_from_live_frame(_frame(i)))
     assert not store.get(331).view.has_1d
 
-    initial_ids = tuple(range(320, 331))
+    initial_frames = tuple(range(320, 331))
+    initial_ids = tuple(("scan", i) for i in initial_frames)
     initial_history = WaterfallHistory(
-        reset_key=("scan.nxs", False),
+        reset_key=("radial", len(x), False),
         unit="Å⁻¹",
         label="Q",
         x=x,
-        rows=np.vstack([np.full(x.shape, float(i)) for i in initial_ids]),
+        rows=np.vstack([np.full(x.shape, float(i)) for i in initial_frames]),
         ids=initial_ids,
-        names=tuple(f"scan_{i}" for i in initial_ids),
+        names=tuple(f"scan_{i}" for i in initial_frames),
     )
     queued = []
     plot_unit = {"text": "Q (Å⁻¹)", "index": 0}
@@ -1243,7 +1260,7 @@ def test_overlay_selection_evicted_hydration_never_decreases_history():
 
     assert tuple(state.render_ids) == (331,)
     assert counts == [11, 11, 11, 11, 11, 12]
-    assert payload.plot_history.ids == initial_ids + (331,)
+    assert payload.plot_history.ids == initial_ids + (("scan", 331),)
 
     widget.clear_overlay = MethodType(displayFrameWidget.clear_overlay, widget)
     widget.clear_overlay()
@@ -1261,7 +1278,7 @@ def test_waterfall_history_payload_decimates_display_rows_only():
     x = np.linspace(0.5, 5.0, 8)
     ids = tuple(range(700))
     history = WaterfallHistory(
-        reset_key=("scan", False),
+        reset_key=("radial", len(x), False),
         unit="Å⁻¹",
         label="Q",
         x=x,

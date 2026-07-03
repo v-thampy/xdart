@@ -1131,7 +1131,6 @@ def test_update_plot_preserves_overlay_accumulator_on_failed_read():
         overlaid_idxs=[0, 1, 2],
         idxs_1d=[3],                       # a new 'missing' frame -> the
                                            # already-covered early-return is skipped
-        _overlay_scan_key="scanA",         # same scan -> no boundary reset
         _last_plot_unit=0,
         _payload_x_axis_label="stale",
         _payload_y_axis_label="stale",
@@ -1163,7 +1162,6 @@ def test_update_plot_clears_when_no_overlay_accumulator_and_read_fails():
         frame_ids=[0, 1, 2, 3],
         overlaid_idxs=[],                  # nothing accumulated yet
         idxs_1d=[0, 1, 2, 3],
-        _overlay_scan_key="scanA",
         _last_plot_unit=0,
         _payload_x_axis_label=None,
         _payload_y_axis_label=None,
@@ -2872,15 +2870,16 @@ def test_update_store_evicted_overlay_selection_preserves_history_and_hydrates()
     store.upsert(publication_from_live_frame(_frame(11)))
     assert store.get(10) is not None and not store.get(10).view.has_1d
 
-    initial_ids = (8, 9)
+    initial_frames = (8, 9)
+    initial_ids = tuple(("scan", i) for i in initial_frames)
     initial_history = WaterfallHistory(
-        reset_key=("scan.nxs", False),
+        reset_key=("radial", len(x), False),
         unit="Å⁻¹",
         label="Q",
         x=x,
-        rows=np.vstack([np.full(x.shape, float(i)) for i in initial_ids]),
+        rows=np.vstack([np.full(x.shape, float(i)) for i in initial_frames]),
         ids=initial_ids,
-        names=tuple(f"scan_{i}" for i in initial_ids),
+        names=tuple(f"scan_{i}" for i in initial_frames),
     )
     calls = []
     queued = []
@@ -2975,15 +2974,16 @@ def test_update_empty_selection_overlay_preserves_history_on_control_repaint():
     from xdart.modules.frame_publication import PublicationStore
 
     x = np.linspace(0.5, 5.0, 8, dtype=np.float32)
-    initial_ids = (8, 9)
+    initial_frames = (8, 9)
+    initial_ids = tuple(("scan", i) for i in initial_frames)
     initial_history = WaterfallHistory(
-        reset_key=("scan.nxs", False),
+        reset_key=("radial", len(x), False),
         unit="Å⁻¹",
         label="Q",
         x=x,
-        rows=np.vstack([np.full(x.shape, float(i)) for i in initial_ids]),
+        rows=np.vstack([np.full(x.shape, float(i)) for i in initial_frames]),
         ids=initial_ids,
-        names=tuple(f"scan_{i}" for i in initial_ids),
+        names=tuple(f"scan_{i}" for i in initial_frames),
     )
     calls = []
     host = SimpleNamespace(
@@ -3139,7 +3139,7 @@ def test_plot_payload_all_nan_overlay_history_does_not_clear_accumulator():
     host.bkg_1d = None
     x = np.array([0.0, 1.0])
     history = dl.WaterfallHistory(
-        reset_key=("scan.nxs", False),
+        reset_key=("radial", len(x), False),
         unit="Å⁻¹",
         label="Q",
         x=x,
@@ -5025,8 +5025,8 @@ def test_overlay_history_reset_key_includes_active_slice_range():
     center["value"] = 5.0
     key2 = host._overlay_history_reset_key()
 
-    assert key1 == ("scan.nxs", True, (0.0, 1.0))
-    assert key2 == ("scan.nxs", True, (5.0, 1.0))
+    assert key1 == ("radial", None, True, (0.0, 1.0))
+    assert key2 == ("radial", None, True, (5.0, 1.0))
     assert key1 != key2
 
 
@@ -5072,7 +5072,9 @@ def test_overlay_live_tail_rows_keep_matching_tail_labels_after_store_cap():
 
     host.update_plot()
 
-    assert host.overlaid_idxs == list(range(1, 101))
+    assert host.overlaid_idxs == list(range(1, 37)) + [
+        ("scan", i) for i in range(37, 101)
+    ]
     assert host.frame_names[-1] == "scan_100"
     assert host.plot_data[1].shape[0] == 100
     np.testing.assert_allclose(host.plot_data[1][-1], [100.0, 100.5])
@@ -5117,7 +5119,7 @@ def test_waterfall_y_axis_uses_decimated_row_ids_and_full_time_baseline():
 
     np.testing.assert_allclose(
         DisplayPlotMixin._wf_y_axis(host, display_ids),
-        np.asarray(display_ids, dtype=float),
+        np.asarray([idx - 99 for idx in display_ids], dtype=float),
     )
 
     host.wf_yaxis = "Time (s)"
@@ -5420,7 +5422,7 @@ def test_overlay_mode_entry_seeds_history_from_displayed_single_trace():
 
     assert host._waterfall_history is not None
     assert host._waterfall_history.count == 1
-    assert host._waterfall_history.ids == (1,)
+    assert host._waterfall_history.ids == (("scan", 1),)
 
 
 def test_overlay_unit_switch_rebuilds_all_accumulated_curves():
@@ -5432,7 +5434,7 @@ def test_overlay_unit_switch_rebuilds_all_accumulated_curves():
 
     assert host.plot_data[1].shape == (3, 2)
     assert host.frame_names == ["scan_1", "scan_2", "scan_3"]
-    assert host.overlaid_idxs == [1, 2, 3]
+    assert host.overlaid_idxs == [("scan", 1), ("scan", 2), ("scan", 3)]
 
     host.ui.plotUnit.setCurrentIndex(1)
     host.idxs = [3]
@@ -5441,42 +5443,49 @@ def test_overlay_unit_switch_rebuilds_all_accumulated_curves():
 
     assert host.plot_data[1].shape == (3, 2)
     assert host.frame_names == ["scan_1", "scan_2", "scan_3"]
-    assert host.overlaid_idxs == [1, 2, 3]
+    assert host.overlaid_idxs == [("scan", 1), ("scan", 2), ("scan", 3)]
     np.testing.assert_array_equal(host.plot_data[0], np.array([10.0, 11.0]))
 
 
-def test_overlay_new_scan_resets_accumulator_not_stale_or_appended():
-    # REGRESSION (this session): processing a NEW scan in Overlay/Waterfall mode
-    # must RESET the accumulator to the new scan's frames -- not show the previous
-    # scan's stale curves (the new scan's ids are a SUBSET of the old, so the
-    # end-of-scan catch-up SKIP wrongly fired) and not append across scans (a new
-    # scan may have different integration params / GI / axis).  update_plot
-    # self-heals on a scan-identity change.  Consistent for <15 and >15 frames
-    # (the reset is method-gated, independent of the auto-waterfall threshold).
+def test_overlay_compatible_new_scan_appends_and_incompatible_grid_resets():
+    # OV-6: a compatible scan boundary APPENDS for cross-scan comparison, with
+    # scan-qualified ids preserving frame-number collisions.  Only an incompatible
+    # grid/source boundary resets.
     host = _plot_host("Overlay")
-    host.scan.data_file = "scanA.nxs"
+    host.scan.name = "scanA"
     for idx in (1, 2, 3):
         host.idxs = [idx]
         host.idxs_1d = [idx]
         host.update_plot()
-    assert host.overlaid_idxs == [1, 2, 3]
-    assert host._overlay_scan_key == "scanA.nxs"
+    assert host.overlaid_idxs == [("scanA", 1), ("scanA", 2), ("scanA", 3)]
 
-    # New scan: different file, ids that are a SUBSET of the previous scan's.
-    host.scan.data_file = "scanB.nxs"
+    # Compatible new scan: frame 1 is a collision but keeps a distinct row.
+    host.scan.name = "scanB"
     host.idxs = [1]
     host.idxs_1d = [1]
     host.update_plot()
 
-    assert host._overlay_scan_key == "scanB.nxs"
-    assert host.overlaid_idxs == [1]                 # reset (not stale [1,2,3], not appended)
-    assert np.atleast_2d(host.plot_data[1]).shape[0] == 1
+    assert host.overlaid_idxs == [
+        ("scanA", 1), ("scanA", 2), ("scanA", 3), ("scanB", 1)
+    ]
+    assert np.atleast_2d(host.plot_data[1]).shape[0] == 4
 
-    # Same-scan render still APPENDS within the scan (reset is scan-boundary only).
+    # Same compatible scan continues appending.
     host.idxs = [2]
     host.idxs_1d = [2]
     host.update_plot()
-    assert host.overlaid_idxs == [1, 2]
+    assert host.overlaid_idxs == [
+        ("scanA", 1), ("scanA", 2), ("scanA", 3), ("scanB", 1), ("scanB", 2)
+    ]
+
+    # Incompatible grid: different point count resets.
+    host.get_frames_int_1d = lambda idxs=None, rv="all", *, require_all=False, allow_blocking_read=None: (
+        np.array([9.0, 9.5, 10.0]), np.array([0.0, 0.5, 1.0]))
+    host.scan.name = "scanC"
+    host.idxs = [1]
+    host.idxs_1d = [1]
+    host.update_plot()
+    assert host.overlaid_idxs == [("scanC", 1)]
 
 
 def test_waterfall_unit_switch_rebuilds_all_accumulated_curves():
@@ -5527,7 +5536,7 @@ def test_overlay_append_skips_empty_incoming_grid_without_crash():
 
     assert host.plot_data[1].shape == (1, 2)        # frame 2 skipped
     assert "scan_2" not in host.frame_names
-    assert host.overlaid_idxs == [1]
+    assert host.overlaid_idxs == [("scan", 1)]
 
 
 def test_overlay_append_empty_accumulator_seeds_fresh_grid():
@@ -5546,7 +5555,7 @@ def test_overlay_append_empty_accumulator_seeds_fresh_grid():
     assert host.plot_data[0].size == 2              # grid seeded
     assert host.plot_data[1].shape == (1, 2)
     assert host.frame_names == ["scan_1"]
-    assert host.overlaid_idxs == [1]
+    assert host.overlaid_idxs == [("scan", 1)]
 
 
 def test_xye_single_method_change_clears_accumulated_traces_immediately():

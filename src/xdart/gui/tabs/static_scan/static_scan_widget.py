@@ -48,6 +48,10 @@ from xrd_tools.core.energy import wavelength_m_to_energy_eV
 from .ui.staticUI import Ui_Form
 from .h5viewer import H5Viewer
 from .display_frame_widget import displayFrameWidget
+from .display_overlay_utils import (
+    overlay_grid_key_for_widget,
+    overlay_grid_keys_match,
+)
 from .integrator import (
     GI_LABELS_1D,
     GI_LABELS_2D,
@@ -4038,7 +4042,7 @@ class staticWidget(QWidget):
                 _key = _scan_key_from_source(getattr(_peek, "source_file", ""))
                 _cur = getattr(self.scan, "name", None)
                 if _key and _key != _cur and _cur != "null_main":
-                    self._rescope_frame_panel_to(_key)
+                    self._rescope_frame_panel_to(_key, first_frame=_peek)
                     # Tell new_scan a frame ALREADY rescoped THIS run, so its late
                     # signal skips the (now-destructive) clear.  A consumed flag —
                     # NOT a name match — so a same-name re-run (where no frame has
@@ -4469,6 +4473,10 @@ class staticWidget(QWidget):
                 return
             self.h5viewer._browser_scan_reset_pending = False
             try:
+                maybe_clear_overlay = getattr(
+                    self, "_maybe_clear_overlay_for_browser_boundary", None)
+                if callable(maybe_clear_overlay):
+                    maybe_clear_overlay()
                 self.displayframe.set_axes()
                 self._clear_frame_record_store()   # A-Step (Phase 5): reset the store
                 self.displayframe._clear_bkg()
@@ -5321,7 +5329,46 @@ class staticWidget(QWidget):
         self._stitch_status(f'Stitch failed: {msg}')
         logger.error("Stitch error: %s", msg)
 
-    def _rescope_frame_panel_to(self, name):
+    def _overlay_clear_needed_for_scan_boundary(self, first_frame=None):
+        """Return whether a scan boundary should drop Overlay/Waterfall history."""
+        df = getattr(self, "displayframe", None)
+        if df is None:
+            return True
+        try:
+            method = df.ui.plotMethod.currentText()
+        except Exception:
+            method = None
+        history = getattr(df, "_waterfall_history", None)
+        if method not in ("Overlay", "Waterfall") or not getattr(history, "count", 0):
+            return True
+        new_key = overlay_grid_key_for_widget(df, first_frame=first_frame)
+        keep = overlay_grid_keys_match(getattr(history, "reset_key", None), new_key)
+        if os.environ.get("XDART_PERF"):
+            logger.info(
+                "[PERF] scan boundary overlay rows=%d keep=%s old_key=%r new_key=%r",
+                getattr(history, "count", 0),
+                keep,
+                getattr(history, "reset_key", None),
+                new_key,
+            )
+        return not keep
+
+    def _maybe_clear_overlay_for_browser_boundary(self):
+        """Apply the OV-6 grid rule to a deferred browser first-frame reset."""
+        df = getattr(self, "displayframe", None)
+        if df is None:
+            return
+        try:
+            method = df.ui.plotMethod.currentText()
+        except Exception:
+            method = None
+        history = getattr(df, "_waterfall_history", None)
+        if method not in ("Overlay", "Waterfall") or not getattr(history, "count", 0):
+            return
+        if self._overlay_clear_needed_for_scan_boundary(first_frame=None):
+            df.clear_overlay()
+
+    def _rescope_frame_panel_to(self, name, first_frame=None):
         """Reset the Frames-panel / display state to a NEW scan identity.
 
         The scan boundary is FRAME-DRIVEN: update_data() detects a source_file scan
@@ -5358,14 +5405,19 @@ class staticWidget(QWidget):
         # Undrained stash + scan_data row cache from the previous scan.
         self._pending_frames = {}
         self._scan_info_rows = {}
-        # Reset the Overlay/Waterfall accumulator (a new scan may use different
-        # params / GI / axis; appending its traces across scans would mix data).
+        # Reset the Overlay/Waterfall accumulator only for incompatible grids.
+        # Compatible scan boundaries append by design: cross-scan comparison is the
+        # point of Overlay, while Clear remains the explicit relief valve.
         try:
             self.displayframe._clear_wavelength_cache()
-            self.displayframe.clear_overlay()
         except Exception:
-            logger.debug("display cache reset on scan rescope failed",
+            logger.debug("display wavelength cache reset on scan rescope failed",
                          exc_info=True)
+        try:
+            if self._overlay_clear_needed_for_scan_boundary(first_frame=first_frame):
+                self.displayframe.clear_overlay()
+        except Exception:
+            logger.debug("display overlay reset on scan rescope failed", exc_info=True)
         try:
             import pandas as pd
             with self.scan.scan_lock:

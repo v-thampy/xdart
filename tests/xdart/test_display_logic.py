@@ -300,31 +300,31 @@ def test_accumulate_waterfall_partial_read_never_shrinks_or_restacks():
 def test_accumulate_waterfall_reset_key_change_resets():
     np = pytest.importorskip("numpy")
     x = np.array([0.0, 1.0, 2.0])
-    h = dl.accumulate_waterfall(None, reset_key="scanA", unit="q", x=x,
+    h = dl.accumulate_waterfall(None, reset_key="gridA", unit="q", x=x,
                                 rows=np.ones((1, 3)), ids=[7], names=["s7"])
-    h = dl.accumulate_waterfall(h, reset_key="scanB", unit="q", x=x,  # new scan/source
+    h = dl.accumulate_waterfall(h, reset_key="gridB", unit="q", x=x,
                                 rows=np.full((1, 3), 9.0), ids=[0], names=["s0"])
-    assert h.reset_key == "scanB" and h.ids == (0,) and h.count == 1
+    assert h.reset_key == "gridB" and h.ids == (0,) and h.count == 1
     np.testing.assert_array_equal(h.rows[0], [9, 9, 9])
 
 
 def test_accumulate_waterfall_selection_growth_does_not_reset():
     # Regression for the per-tick reset bug: live auto-last GROWS the selection each
-    # tick (which bumps the display generation), but the accumulator is keyed on the
-    # STABLE scan/source reset_key -- so a growing selection APPENDS and frames since
+    # tick (which bumps the display generation), but the accumulator is keyed on
+    # the STABLE grid reset_key -- so a growing selection APPENDS and frames since
     # evicted past the store cap are RETAINED, not truncated.
     np = pytest.importorskip("numpy")
     x = np.array([0.0, 1.0, 2.0])
     h = None
     # Ticks 0,1: frames 0,1 captured while resident.
     for i in range(2):
-        h = dl.accumulate_waterfall(h, reset_key=("scanA", False), unit="q", x=x,
+        h = dl.accumulate_waterfall(h, reset_key=("radial", 3, False), unit="q", x=x,
                                     rows=np.full((1, 3), float(i)), ids=[i], names=[f"s{i}"])
     assert h.ids == (0, 1)
     # Tick 2: frame 0 has been EVICTED (no longer resident -> not in the incoming
-    # build); only frames 1,2 come in.  The reset_key is unchanged (same scan), so
+    # build); only frames 1,2 come in.  The reset_key is unchanged, so
     # frame 0's captured row is RETAINED.
-    h = dl.accumulate_waterfall(h, reset_key=("scanA", False), unit="q", x=x,
+    h = dl.accumulate_waterfall(h, reset_key=("radial", 3, False), unit="q", x=x,
                                 rows=np.vstack([np.full(3, 1.0), np.full(3, 2.0)]),
                                 ids=[1, 2], names=["s1", "s2"])
     assert h.ids == (0, 1, 2) and h.count == 3      # frame 0 NOT lost to eviction
@@ -340,7 +340,7 @@ def test_accumulate_waterfall_retains_long_live_stack_across_flushes():
     for start in range(0, 700, 25):
         ids = list(range(start, min(start + 25, 700)))
         h = dl.accumulate_waterfall(
-            h, reset_key=("scanA", False), unit="q", x=x,
+            h, reset_key=("radial", 3, False), unit="q", x=x,
             rows=np.vstack([np.full(3, float(i)) for i in ids]),
             ids=ids, names=[f"s{i}" for i in ids],
         )
@@ -348,7 +348,7 @@ def test_accumulate_waterfall_retains_long_live_stack_across_flushes():
     assert h.count == 700
     assert h.ids == tuple(range(700))
     h2 = dl.accumulate_waterfall(
-        h, reset_key=("scanA", False), unit="q", x=x,
+        h, reset_key=("radial", 3, False), unit="q", x=x,
         rows=np.full((1, 3), 699.0), ids=[699], names=["s699"],
     )
     assert h2.count == 700

@@ -80,6 +80,12 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
       Cmd+Shift+C stops mid-run, Cmd+O / Cmd+S, Cmd+Shift+A blocked mid-run.
 - [ ] F6 Wrong-file guard (LD-1): sweep onto evicted frames, immediately click a different
       scan — no frames from the previous file appear.
+- [ ] F7 OV-6 live cross-scan overlay: Overlay/Waterfall scan A, then run/load scan B with the
+      same 1D axis kind + npt — A traces stay and B traces append; frame-number collisions show
+      both scan-qualified traces. Repeat with a different npt or axis kind — accumulator resets.
+- [ ] F8 OV-6 browser judgment: with an overlay up, click a compatible processed `.nxs` in the
+      data browser, then click a frame — prior traces stay and the clicked frame appends. Note
+      whether this browsing behavior is desired long-term.
 
 **PASS ⇒ proceed to RC-8** (merge → tag v1.0.0 → publish; recipe in
 `handoff_chunks_jul2026.md`). Any FAIL: stop, report the item + `kill -USR1 <pid>` stack if a

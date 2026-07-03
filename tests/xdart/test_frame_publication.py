@@ -1282,7 +1282,8 @@ def test_plot_payload_routes_overlay_waterfall_through_accumulator_after_flip():
     for method in ("Overlay", "Waterfall"):
         payload = adapter.plot_payload(_int_state(store, ids=(9,), method=method))
         assert payload is not None
-        assert payload.plot_history is not None and payload.overlaid_ids == (9,)
+        assert payload.plot_history is not None
+        assert payload.overlaid_ids == (("scan", 9),)
 
 
 def test_overlay_waterfall_payload_reset_key_includes_active_slice_range():
@@ -1302,8 +1303,8 @@ def test_overlay_waterfall_payload_reset_key_includes_active_slice_range():
 
     assert p1 is not None and p1.plot_history is not None
     assert p2 is not None and p2.plot_history is not None
-    assert p1.plot_history.reset_key == ("scan", True, (0.0, 1.0))
-    assert p2.plot_history.reset_key == ("scan", True, (90.0, 1.0))
+    assert p1.plot_history.reset_key == ("radial", 4, True, (0.0, 1.0))
+    assert p2.plot_history.reset_key == ("radial", 4, True, (90.0, 1.0))
     assert p1.plot_history.reset_key != p2.plot_history.reset_key
 
 

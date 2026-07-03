@@ -272,6 +272,7 @@ class Main(QMainWindow):
     def _main_widget_shortcut(self, method_name):
         method = getattr(getattr(self, "main_widget", None), method_name, None)
         if method is None:
+            logger.warning("Shortcut target missing on main_widget: %s", method_name)
             return
         try:
             method()

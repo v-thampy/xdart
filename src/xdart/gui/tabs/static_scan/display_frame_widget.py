@@ -637,9 +637,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.frame_names = []
         self.overlaid_idxs = []
         # Flip stage 2: the payload-carried Overlay/Waterfall accumulator
-        # (generation-keyed WaterfallHistory). Lives alongside the legacy triple
-        # until the render path delegates to it (stage 3/4); reset at the same
-        # accumulator-lifecycle sites (new_scan, clear_overlay).
+        # (grid-keyed WaterfallHistory). Lives alongside the legacy triple until
+        # the render path delegates to it; reset at accumulator-lifecycle sites
+        # such as clear_overlay and incompatible grid changes.
         self._waterfall_history = None
         self.viewer_rows_1d = viewer_rows_1d
         self.viewer_rows_2d = viewer_rows_2d
@@ -3737,9 +3737,6 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.frame_names = []
         self.overlaid_idxs = []
         self._waterfall_history = None
-        # Forget which scan the (now empty) accumulator belonged to, so the next
-        # render re-stamps it for the current scan.
-        self._overlay_scan_key = None
 
     # ── Panel clears (safety net for empty selections) ────────────
     # When a render path has no data for the current selection it must

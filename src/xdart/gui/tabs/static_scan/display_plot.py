@@ -33,6 +33,13 @@ from .display_logic import (
     resample_image_axis_to_uniform,
     waterfall_display_rows,
 )
+from .display_overlay_utils import (
+    frame_index_from_row_id,
+    overlay_grid_key_for_widget,
+    overlay_grid_keys_match,
+    overlay_identity_for_widget,
+    row_id_belongs_to_widget_scan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -92,12 +99,12 @@ def update_plot_accumulator(
     new_x = np.asarray(new_x, dtype=float)
     new_y = _as_plot_rows(new_y)
     names = list(prev_names or [])
-    ids = [int(i) for i in (prev_ids or [])]
+    ids = list(prev_ids or [])
 
     overlay_action, _ = plan_overlay(
         method, unit_changed,
         has_existing=len(ids) > 0,
-        new_ids=tuple(int(i) for i in new_ids),
+        new_ids=tuple(new_ids),
         prev_overlaid_ids=tuple(ids),
     )
 
@@ -110,16 +117,17 @@ def update_plot_accumulator(
         # back partial/holey and prefix-MISLABELED (e.g. resident frames 37..100
         # shown as scan_1..scan_64).  Reject it and KEEP the prior accumulator
         # rather than shrink+relabel the visible stack (the intermittent
-        # collapse-and-restack regression).  Legitimate resets (Clear / new scan /
-        # mode switch) go through clear_overlay -> prev ids empty -> plan_overlay
-        # returns REPLACE (not REBUILD), so they never reach this guard.  A genuine
-        # same-unit-count Q<->2theta re-express reproduces the id set and passes.
-        if set(int(i) for i in new_ids) != set(ids):
+        # collapse-and-restack regression).  Legitimate resets (Clear /
+        # incompatible grid-source / mode switch) go through clear_overlay ->
+        # prev ids empty -> plan_overlay returns REPLACE (not REBUILD), so they
+        # never reach this guard.  A genuine same-unit-count Q<->2theta
+        # re-express reproduces the id set and passes.
+        if set(new_ids) != set(ids):
             return list(prev_plot_data), list(names), list(ids)
-        return [new_x, new_y], list(new_names), [int(i) for i in new_ids]
+        return [new_x, new_y], list(new_names), list(new_ids)
 
     if overlay_action is not OverlayAction.APPEND:
-        return [new_x, new_y], list(new_names), [int(i) for i in new_ids]
+        return [new_x, new_y], list(new_names), list(new_ids)
 
     prev_x, prev_y = prev_plot_data
     prev_x = np.asarray(prev_x, dtype=float)
@@ -155,7 +163,7 @@ def update_plot_accumulator(
             new_row = _reinterp_plot_row(new_x, row, merged_x)
             plot_data = [merged_x, np.vstack((new_old, new_row))]
         names.append(frame_name)
-        ids.append(int(idx))
+        ids.append(idx)
 
     return plot_data, names, ids
 
@@ -264,8 +272,17 @@ class DisplayPlotMixin:
             # evicted frames -- they arrive via the next append.  require_all is
             # False so a partial read appends what it can instead of blanking.
             selection = [int(i) for i in (self.idxs if idle else self.idxs_1d)]
-            have = {int(i) for i in (getattr(self, "overlaid_idxs", []) or [])}
-            missing = [i for i in selection if i not in have]
+            history = getattr(self, "_waterfall_history", None)
+            have_rows = (
+                tuple(getattr(history, "ids", ()) or ())
+                or tuple(getattr(self, "overlaid_idxs", []) or [])
+            )
+            have = set(have_rows)
+            missing = []
+            for i in selection:
+                _grid_key, qid = overlay_identity_for_widget(self, i)
+                if qid not in have and i not in have:
+                    missing.append(i)
             idxs = missing if (have and missing) else selection
             require_all = False
             # NEVER block-read on the GUI thread for an accumulating display.
@@ -500,34 +517,45 @@ class DisplayPlotMixin:
         # already in plot_data from live accumulation, so a reload (empty
         # accumulator) still falls through to read from disk once.
         method = self.ui.plotMethod.currentText()
-        # NEW-SCAN BOUNDARY RESET: the Overlay/Waterfall accumulator is stamped
-        # with the scan it was built from.  When the current scan differs, drop it
-        # so the new scan plots FRESH -- a new scan may use different integration
-        # params / GI / a different axis, so appending across scans would mix
-        # incompatible data (Vivek-confirmed: reset, don't append).  Self-heals any
-        # scan-swap path that didn't route through new_scan's clear_overlay, and is
-        # consistent for <15 (curves) and >15 (waterfall).  Same-scan renders
-        # (incl. the in-scan end-of-scan catch-up skip below) are untouched.
-        _scan_key = getattr(self.scan, "data_file", None) or getattr(
-            self.scan, "name", None)
+        # GRID BOUNDARY RESET: Overlay/Waterfall can append across scan
+        # boundaries, but only while the integration axis kind + point count + source
+        # are compatible.  Unit relabels and compatible scan boundaries keep the
+        # accumulator; incompatible grid/source changes drop it.
+        reset_key_fn = getattr(self, "_overlay_history_reset_key", None)
+        _grid_key = (
+            reset_key_fn() if callable(reset_key_fn)
+            else overlay_grid_key_for_widget(self)
+        )
+        _history = getattr(self, "_waterfall_history", None)
         if (method in ("Overlay", "Waterfall")
-                and getattr(self, "overlaid_idxs", None)
-                and getattr(self, "_overlay_scan_key", None) not in (None, _scan_key)):
-            # New-scan boundary: drop the stale accumulator.  Inline (clear_overlay
+                and getattr(_history, "count", 0)
+                and not overlay_grid_keys_match(getattr(_history, "reset_key", None), _grid_key)):
+            # Incompatible grid/source boundary: drop the stale accumulator.  Inline (clear_overlay
             # is a displayFrameWidget method; update_plot is a shared mixin method
             # also exercised by duck-host tests).  plot_data_range is recomputed by
             # compute_plot_range on the next draw.
             self.plot_data = [np.zeros(0), np.zeros(0)]
             self.frame_names = []
             self.overlaid_idxs = []
-        self._overlay_scan_key = _scan_key
+            self._waterfall_history = None
 
         if (method in ("Overlay", "Waterfall")
                 and getattr(self, "overlaid_idxs", None)
                 and self.ui.plotUnit.currentIndex()
                 == getattr(self, "_last_plot_unit", -1)):
-            sel = {int(i) for i in self.idxs_1d}
-            if sel and sel <= {int(i) for i in self.overlaid_idxs}:
+            sel = {overlay_identity_for_widget(self, i)[1] for i in self.idxs_1d}
+            have_rows = (
+                set(getattr(getattr(self, "_waterfall_history", None), "ids", ()) or ())
+                or set(getattr(self, "overlaid_idxs", None) or ())
+            )
+            legacy_have = set()
+            for row_id in have_rows:
+                try:
+                    if row_id_belongs_to_widget_scan(self, row_id):
+                        legacy_have.add(frame_index_from_row_id(row_id))
+                except (TypeError, ValueError):
+                    pass
+            if sel and (sel <= have_rows or {int(i) for i in self.idxs_1d} <= legacy_have):
                 self.draw_plot_state()
                 return
 
@@ -549,6 +577,19 @@ class DisplayPlotMixin:
             else:
                 self.clear_plot_view()
             return
+
+        if method in ("Overlay", "Waterfall") and np.asarray(xdata).size > 0:
+            current_grid_key = overlay_grid_key_for_widget(
+                self, npt=np.asarray(xdata).size)
+            prior_grid_key = getattr(self, "_overlay_legacy_grid_key", None)
+            if (getattr(self, "overlaid_idxs", None)
+                    and prior_grid_key is not None
+                    and not overlay_grid_keys_match(prior_grid_key, current_grid_key)):
+                self.plot_data = [np.zeros(0), np.zeros(0)]
+                self.frame_names = []
+                self.overlaid_idxs = []
+                self._waterfall_history = None
+            self._overlay_legacy_grid_key = current_grid_key
 
         row_ids = list(getattr(self, "_plot_row_ids", self.idxs_1d))
         row_count = _as_plot_rows(ydata).shape[0]
@@ -578,10 +619,20 @@ class DisplayPlotMixin:
         # is the pure plan_overlay (unit-tested headlessly); the branch
         # bodies below still own the array work + eviction filtering.
         current_method = self.ui.plotMethod.currentText()
+        accumulating_method = current_method in ("Overlay", "Waterfall")
+        plan_new_ids = (
+            tuple(overlay_identity_for_widget(self, idx)[1] for idx in self.idxs_1d)
+            if accumulating_method else tuple(self.idxs_1d)
+        )
+        accum_row_ids = (
+            tuple(overlay_identity_for_widget(self, idx, npt=np.asarray(xdata).size)[1]
+                  for idx in row_ids)
+            if accumulating_method else tuple(row_ids)
+        )
         overlay_action, _ = plan_overlay(
             current_method, unit_changed,
             has_existing=len(self.overlaid_idxs) > 0,
-            new_ids=tuple(self.idxs_1d),
+            new_ids=plan_new_ids,
             prev_overlaid_ids=tuple(self.overlaid_idxs),
         )
 
@@ -596,7 +647,15 @@ class DisplayPlotMixin:
                 # overlaid_idxs are untouched.
                 pass
             else:
-                rebuild_idxs = list(self.overlaid_idxs)
+                rebuild_rows = (
+                    tuple(getattr(getattr(self, "_waterfall_history", None), "ids", ()) or ())
+                    or tuple(self.overlaid_idxs)
+                )
+                rebuild_idxs = [
+                    frame_index_from_row_id(row_id)
+                    for row_id in rebuild_rows
+                    if row_id_belongs_to_widget_scan(self, row_id)
+                ]
                 # Fallback (non-pure-radial change, no resident frame, missing
                 # wavelength): re-express by re-reading, but WITHOUT block-reading
                 # the whole scan on the GUI thread (the unit-switch freeze).
@@ -614,6 +673,10 @@ class DisplayPlotMixin:
                     y_new = self.apply_plot_background(y_new)
                     kept = rebuild_idxs[:_as_plot_rows(y_new).shape[0]]
                     kept_names = self.build_plot_names(kept)
+                    kept_accum_ids = tuple(
+                        overlay_identity_for_widget(
+                            self, idx, npt=np.asarray(x_new).size)[1]
+                        for idx in kept)
                     self.plot_data, self.frame_names, self.overlaid_idxs = (
                         update_plot_accumulator(
                             self.plot_data,
@@ -622,7 +685,7 @@ class DisplayPlotMixin:
                             x_new,
                             y_new,
                             kept_names,
-                            kept,
+                            kept_accum_ids,
                             current_method,
                             unit_changed,
                         )
@@ -636,7 +699,7 @@ class DisplayPlotMixin:
                             xdata,
                             ydata,
                             frame_names,
-                            row_ids,
+                            accum_row_ids,
                             current_method,
                             unit_changed,
                         )
@@ -650,7 +713,7 @@ class DisplayPlotMixin:
                     xdata,
                     ydata,
                     frame_names,
-                    row_ids,
+                    accum_row_ids,
                     current_method,
                     unit_changed,
                 )
@@ -665,7 +728,7 @@ class DisplayPlotMixin:
                     xdata,
                     ydata,
                     frame_names,
-                    row_ids,
+                    accum_row_ids,
                     current_method,
                     unit_changed,
                 )
@@ -732,37 +795,9 @@ class DisplayPlotMixin:
             self._seed_overlay_history_from_plot_state()
             self.draw_plot_state()
 
-    def _overlay_history_reset_key(self):
+    def _overlay_history_reset_key(self, *, npt=None, first_frame=None):
         """Return the reset identity used by the publication overlay payload."""
-        axis_info = {}
-        try:
-            idx = int(self.ui.plotUnit.currentIndex())
-            info = getattr(self, "_plot_axis_info", ())
-            if 0 <= idx < len(info):
-                axis_info = info[idx] or {}
-        except Exception:
-            axis_info = {}
-        source = axis_info.get("source", "1d")
-        try:
-            sliced = bool(self.ui.slice.isChecked())
-        except Exception:
-            sliced = False
-        needs_2d = (source == "2d") or (source == "1d_2d" and sliced)
-        scan = getattr(self, "scan", None)
-        scan_id = (
-            getattr(scan, "data_file", None)
-            or getattr(scan, "name", None)
-        ) if scan is not None else None
-        slice_key = None
-        if needs_2d:
-            try:
-                slice_key = (
-                    float(self.ui.slice_center.value()),
-                    float(self.ui.slice_width.value()),
-                ) if bool(self.ui.slice.isChecked()) else (None, None)
-            except Exception:
-                slice_key = (None, None)
-        return (scan_id, True, slice_key) if needs_2d else (scan_id, False)
+        return overlay_grid_key_for_widget(self, npt=npt, first_frame=first_frame)
 
     def _seed_overlay_history_from_plot_state(self):
         """Seed WaterfallHistory from the current plot before Overlay entry."""
@@ -782,21 +817,33 @@ class DisplayPlotMixin:
         row_count = min(len(ids), rows.shape[0])
         if row_count <= 0:
             return False
-        ids = tuple(int(i) for i in ids[:row_count])
+        ids = tuple(
+            row_id if isinstance(row_id, tuple)
+            else overlay_identity_for_widget(self, row_id, npt=x.size)[1]
+            for row_id in ids[:row_count]
+        )
         rows = rows[:row_count]
         names = tuple(getattr(self, "frame_names", ())[:row_count])
         if len(names) < row_count:
             scan_name = getattr(getattr(self, "scan", None), "name", "scan")
-            names = tuple(f"{scan_name}_{i}" for i in ids)
+            names = tuple(f"{scan_name}_{frame_index_from_row_id(i)}" for i in ids)
         label, unit = self._current_plot_axis_label()
+        metadata = []
+        for row_id in ids:
+            try:
+                metadata.append(dict(self._frame_scan_info(row_id) or {}))
+            except Exception:
+                metadata.append({})
         self._waterfall_history = WaterfallHistory(
-            reset_key=self._overlay_history_reset_key(),
+            reset_key=overlay_identity_for_widget(
+                self, frame_index_from_row_id(ids[0]), npt=x.size)[0],
             unit=unit,
             label=label,
             x=x,
             rows=rows,
             ids=ids,
             names=names,
+            metadata=tuple(metadata),
         )
         return True
 
@@ -1001,7 +1048,14 @@ class DisplayPlotMixin:
         1D publication in its unbounded light tier, so a whole-scan waterfall is
         covered), falling back to the in-memory ``frames`` browse cache. Viewer
         mode may consult its row table. Returns ``{}`` when nothing is found."""
-        idx = int(idx)
+        history = getattr(self, "_waterfall_history", None)
+        if history is not None:
+            meta = getattr(history, "metadata", ()) or ()
+            if len(meta) == len(getattr(history, "ids", ()) or ()):
+                for row_id, info in zip(history.ids, meta):
+                    if row_id == idx and info:
+                        return dict(info)
+        idx = frame_index_from_row_id(idx)
         store = getattr(self, 'publication_store', None)
         if store is not None:
             pub = store.get(idx)
@@ -1024,7 +1078,7 @@ class DisplayPlotMixin:
 
         ``self.wf_yaxis`` selects the source:
 
-        * ``'Frame #'`` → the displayed row ids.
+        * ``'Frame #'`` → the trace number (accumulation order).
         * ``'Time (s)'`` / ``'Time (minutes)'`` →
           ``scan_info['epoch']`` minus its own minimum (relative).
         * anything else → ``scan_info[wf_yaxis]`` directly.
@@ -1038,10 +1092,14 @@ class DisplayPlotMixin:
         rows.  Use ``overlaid_idxs`` (it is maintained row-for-row with
         ``plot_data``), falling back to ``_plot_row_ids`` / ``self.idxs``.
         """
-        full_row_ids = (getattr(self, 'overlaid_idxs', None)
-                        or getattr(self, '_plot_row_ids', None)
-                        or self.idxs)
-        full_row_ids = [int(i) for i in full_row_ids]
+        history = getattr(self, "_waterfall_history", None)
+        full_row_ids = (
+            tuple(getattr(history, "ids", ()) or ())
+            or tuple(getattr(self, 'overlaid_idxs', None) or ())
+            or tuple(getattr(self, '_plot_row_ids', None) or ())
+            or tuple(self.idxs)
+        )
+        full_row_ids = list(full_row_ids)
         legacy_count = None
         if isinstance(row_ids, (int, np.integer)):
             legacy_count = int(row_ids)
@@ -1049,7 +1107,7 @@ class DisplayPlotMixin:
             row_ids = row_ids[self.wf_start:self.wf_stop:self.wf_step]
             row_ids = row_ids[:legacy_count]
         else:
-            row_ids = [int(i) for i in row_ids]
+            row_ids = list(row_ids)
         if not row_ids:
             return np.asarray([], dtype=float)
         if not full_row_ids:
@@ -1058,7 +1116,12 @@ class DisplayPlotMixin:
             if legacy_count is not None:
                 return np.asarray(np.arange(legacy_count) + self.wf_start + 1,
                                   dtype=float)
-            return np.asarray(row_ids, dtype=float)
+            pos_by_id = {row_id: pos + 1 for pos, row_id in enumerate(full_row_ids)}
+            return np.asarray(
+                [pos_by_id.get(row_id, offset + 1)
+                 for offset, row_id in enumerate(row_ids)],
+                dtype=float,
+            )
         try:
             if self.wf_yaxis == 'Time (s)':
                 baseline = min(
@@ -1113,7 +1176,7 @@ class DisplayPlotMixin:
         row_ids = (getattr(self, 'overlaid_idxs', None)
                    or getattr(self, '_plot_row_ids', None)
                    or self.idxs)
-        row_ids = tuple(int(i) for i in row_ids)
+        row_ids = tuple(row_ids)
         data = data[self.wf_start:self.wf_stop:self.wf_step, :]
         row_ids = row_ids[self.wf_start:self.wf_stop:self.wf_step]
         data, row_ids, _stride = waterfall_display_rows(
