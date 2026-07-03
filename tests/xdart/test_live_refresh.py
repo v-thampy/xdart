@@ -7358,6 +7358,157 @@ def _wrangler_host(mode_text, *, live=False, batch=False):
     return host
 
 
+class _FakeRunControls:
+    def __init__(self, mode="Append"):
+        self.mode = mode
+
+    def write_mode(self):
+        return self.mode
+
+    def set_write_mode(self, mode):
+        self.mode = mode
+
+
+def _append_modal_scan(*, data_file, processed_gi=False, current_gi=True,
+                       frame_count=3):
+    processed = {
+        "gi": bool(processed_gi),
+        "bai_1d_args": {"unit": "q_A^-1"},
+        "bai_2d_args": {"unit": "q_A^-1"},
+    }
+    if processed_gi:
+        processed["bai_1d_args"]["gi_mode_1d"] = "q_total"
+        processed["bai_2d_args"]["gi_mode_2d"] = "qip_qoop"
+        processed["gi_config"] = {"gi_mode_1d": "q_total",
+                                  "gi_mode_2d": "qip_qoop"}
+    current_1d = {"unit": "q_A^-1"}
+    current_2d = {"unit": "q_A^-1"}
+    gi_config = {}
+    if current_gi:
+        current_1d["gi_mode_1d"] = "q_total"
+        current_2d["gi_mode_2d"] = "qip_qoop"
+        gi_config = {"gi_mode_1d": "q_total", "gi_mode_2d": "qip_qoop"}
+    return SimpleNamespace(
+        data_file=str(data_file),
+        reduction_config=processed,
+        _display_reduction_config=dict(processed),
+        bai_1d_args=current_1d,
+        bai_2d_args=current_2d,
+        gi=bool(current_gi),
+        gi_config=gi_config,
+        frames=SimpleNamespace(index=list(range(frame_count))),
+        skip_2d=False,
+    )
+
+
+def _append_modal_host(tmp_path, *, raw_name="scan_0001.tif",
+                       target_name="scan.nxs", processed_gi=False,
+                       current_gi=True, frame_count=3):
+    host = _wrangler_host("Int 2D", live=False, batch=True)
+    raw = tmp_path / raw_name
+    raw.write_bytes(b"")
+    target = tmp_path / target_name
+    host.img_file = str(raw)
+    host.h5_dir = str(tmp_path)
+    host.scan = _append_modal_scan(
+        data_file=target,
+        processed_gi=processed_gi,
+        current_gi=current_gi,
+        frame_count=frame_count,
+    )
+    host._controls = _FakeRunControls("Append")
+    return host
+
+
+def test_append_config_mismatch_run_click_cancel_stops_before_start(tmp_path):
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    host = _append_modal_host(tmp_path, processed_gi=False, current_gi=True,
+                              frame_count=651)
+    prompts = []
+
+    def _cancel(check, processed, current):
+        prompts.append((check, processed.display_mode, current.display_mode))
+        return False
+
+    host._confirm_append_config_replace = _cancel
+
+    imageWrangler._on_start_clicked(host)
+
+    assert len(prompts) == 1
+    assert prompts[0][0].ok is False
+    assert prompts[0][1:] == ("Standard", "Grazing")
+    assert host.sigStart.emitted == []
+    assert host._controls.write_mode() == "Append"
+    assert getattr(host, "command", None) != "start"
+
+
+def test_append_config_mismatch_run_click_replace_flips_mode_and_starts(tmp_path):
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    host = _append_modal_host(tmp_path, processed_gi=False, current_gi=True)
+    prompts = []
+    host._confirm_append_config_replace = (
+        lambda check, processed, current:
+        prompts.append((processed.display_mode, current.display_mode)) or True
+    )
+
+    imageWrangler._on_start_clicked(host)
+
+    assert prompts == [("Standard", "Grazing")]
+    assert host._controls.write_mode() == "Overwrite"
+    assert host.write_mode == "Overwrite"
+    assert host.thread.write_mode == "Overwrite"
+    assert host.sigStart.emitted == [()]
+
+
+def test_append_config_mismatch_modal_symmetric_gi_to_standard(tmp_path):
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    host = _append_modal_host(tmp_path, processed_gi=True, current_gi=False)
+    prompts = []
+    host._confirm_append_config_replace = (
+        lambda check, processed, current:
+        prompts.append((processed.display_mode, current.display_mode)) or False
+    )
+
+    imageWrangler._on_start_clicked(host)
+
+    assert prompts == [("Grazing", "Standard")]
+    assert host.sigStart.emitted == []
+
+
+def test_append_config_matching_run_click_skips_modal_and_starts(tmp_path):
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    host = _append_modal_host(tmp_path, processed_gi=False, current_gi=False)
+    host._confirm_append_config_replace = (
+        lambda *_: (_ for _ in ()).throw(AssertionError("no modal expected"))
+    )
+
+    imageWrangler._on_start_clicked(host)
+
+    assert host._controls.write_mode() == "Append"
+    assert host.sigStart.emitted == [()]
+
+
+def test_append_target_identity_strips_eiger_master_suffix(tmp_path):
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    host = _append_modal_host(
+        tmp_path,
+        raw_name="eiger_S069Ta_redo_eta2p0_1_scan001_master.h5",
+        target_name="eiger_S069Ta_redo_eta2p0_1_scan001.nxs",
+        processed_gi=False,
+        current_gi=True,
+    )
+
+    assert imageWrangler._candidate_append_target_file(host) == str(
+        tmp_path / "eiger_S069Ta_redo_eta2p0_1_scan001.nxs"
+    )
+    assert imageWrangler._append_config_mismatch_message(host)
+
+
 def test_wrangler_enabled_reapplies_viewer_mode_controls():
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
 
@@ -7967,7 +8118,7 @@ def test_streaming_dispatch_series_average_submits_one_mean_frame(monkeypatch):
     )
     for name in ("_build_batch_frames", "_dispatch_batch_streaming",
                  "_get_streaming_session", "_record_store_hydrator",
-                 "_on_qt_gui_thread"):
+                 "_on_qt_gui_thread", "_heavy_staging_window"):
         setattr(host, name, MethodType(getattr(imageThread, name), host))
 
     pending = [

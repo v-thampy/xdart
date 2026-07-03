@@ -974,7 +974,7 @@ class imageWrangler(wranglerWidget):
         if not img_file:
             return ""
         try:
-            scan_name, _img_number = _get_scan_info(img_file)
+            scan_name = imageWrangler._append_scan_name_for_source(img_file)
         except Exception:
             logger.debug("append target scan-name parse failed", exc_info=True)
             return ""
@@ -990,6 +990,19 @@ class imageWrangler(wranglerWidget):
             os.path.expanduser(os.path.join(str(h5_dir), scan_name + ".nxs"))
         )
 
+    @staticmethod
+    def _append_scan_name_for_source(path):
+        """Mirror imageThread's output scan-name derivation for Append targets."""
+
+        source = Path(str(path))
+        stem = source.stem
+        ext = source.suffix.lower().lstrip(".")
+        if stem.lower().endswith("_master"):
+            return stem[:-7]
+        if ext in ("h5", "hdf5", "nxs"):
+            return stem
+        return _get_scan_info(source)[0]
+
     def _append_target_matches_scan_file(self, scan, *, refresh_source=False):
         target = imageWrangler._candidate_append_target_file(
             self,
@@ -1004,28 +1017,177 @@ class imageWrangler(wranglerWidget):
             return False
         return current == target
 
-    def _append_config_mismatch_message(self):
+    def _append_config_mismatch_details(self):
         scan = getattr(self, "scan", None)
         if scan is None:
-            return ""
+            return None, None, None
         if not imageWrangler._append_target_matches_scan_file(
             self,
             scan,
             refresh_source=True,
         ):
-            return ""
+            return None, None, None
         active_write_mode = getattr(self, "_active_write_mode", None)
         write_mode = (
             active_write_mode()
             if callable(active_write_mode)
             else imageWrangler._active_write_mode(self)
         )
+        processed = processing_config_from_scan(scan, prefer_stored=True)
+        current = processing_config_from_scan(scan)
         check = append_config_mismatch_check(
             write_mode,
-            processing_config_from_scan(scan, prefer_stored=True),
-            processing_config_from_scan(scan),
+            processed,
+            current,
         )
+        return check, processed, current
+
+    def _append_config_mismatch_message(self):
+        check, _processed, _current = imageWrangler._append_config_mismatch_details(
+            self
+        )
+        if check is None:
+            return ""
         return "" if check.ok else check.reason
+
+    @staticmethod
+    def _format_append_axis(axis):
+        text = str(axis or "").strip()
+        lookup = {
+            "q": "Q",
+            "q-chi": "Q-Chi",
+            "2theta": "2theta",
+            "2theta-chi": "2theta-Chi",
+            "chi": "Chi",
+            "q_total": "Q",
+            "q_ip": "Qip",
+            "q_oop": "Qoop",
+            "qip_qoop": "Qip-Qoop",
+            "qip_exit": "Qip-Exit",
+            "qoop_exit": "Qoop-Exit",
+        }
+        return lookup.get(text, text.replace("_", "-") or "data grid")
+
+    @staticmethod
+    def _format_append_range(value):
+        if value is None:
+            return ""
+        try:
+            lo, hi = value
+        except (TypeError, ValueError):
+            return ""
+        try:
+            return f" {float(lo):g}-{float(hi):g}"
+        except (TypeError, ValueError):
+            return f" {lo}-{hi}"
+
+    @staticmethod
+    def _format_append_config(sig):
+        if sig is None:
+            return "unknown"
+        axis = (
+            sig.axis_2d
+            if getattr(sig, "axis_2d", None) not in (None, "", "q-chi")
+            else getattr(sig, "axis_1d", "")
+        )
+        axis_text = imageWrangler._format_append_axis(axis)
+        range_value = (
+            getattr(sig, "radial_range_2d", None)
+            or getattr(sig, "radial_range_1d", None)
+        )
+        return (
+            f"{sig.display_mode}, "
+            f"{axis_text}{imageWrangler._format_append_range(range_value)}"
+        )
+
+    def _append_replace_frame_count(self):
+        scan = getattr(self, "scan", None)
+        try:
+            index = getattr(getattr(scan, "frames", None), "index", None)
+            count = len(index) if index is not None else 0
+        except Exception:
+            count = 0
+        if count:
+            return count
+        try:
+            return int(getattr(self, "_source_frame_count", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _append_config_mismatch_modal_text(self, processed, current):
+        frame_count = imageWrangler._append_replace_frame_count(self)
+        if frame_count > 0:
+            consequence = (
+                f"Replace will re-integrate all {frame_count} frames and "
+                "overwrite the existing output."
+            )
+        else:
+            consequence = (
+                "Replace will re-integrate the source frames and overwrite the "
+                "existing output."
+            )
+        return (
+            "Append cannot add rows with different integration settings.\n\n"
+            f"Processed: {imageWrangler._format_append_config(processed)}\n"
+            f"Current: {imageWrangler._format_append_config(current)}\n\n"
+            f"{consequence}"
+        )
+
+    def _confirm_append_config_replace(self, check, processed, current):
+        parent = self if isinstance(self, QtWidgets.QWidget) else None
+        box = QMessageBox(parent)
+        try:
+            box.setIcon(QMessageBox.Warning)
+        except Exception:
+            pass
+        box.setWindowTitle("Replace existing integration?")
+        box.setText(imageWrangler._append_config_mismatch_modal_text(
+            self, processed, current))
+        box.setInformativeText(
+            "Cancel keeps the existing processed scan unchanged."
+        )
+        replace = box.addButton(
+            "Replace & re-integrate",
+            QMessageBox.DestructiveRole,
+        )
+        cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        box.exec()
+        return box.clickedButton() is replace
+
+    def _set_active_write_mode(self, mode):
+        controls = getattr(self, "_controls", None)
+        setter = getattr(controls, "set_write_mode", None)
+        if callable(setter):
+            setter(mode)
+        else:
+            button = getattr(controls, "writeModeButton", None)
+            if button is not None and hasattr(button, "setChecked"):
+                button.setChecked(str(mode) == "Overwrite")
+        self.write_mode = mode
+        thread = getattr(self, "thread", None)
+        if thread is not None:
+            thread.write_mode = mode
+
+    def _confirm_or_cancel_append_mismatch(self):
+        check, processed, current = imageWrangler._append_config_mismatch_details(
+            self
+        )
+        if check is None or check.ok:
+            return True
+        confirm = getattr(self, "_confirm_append_config_replace", None)
+        accepted = (
+            confirm(check, processed, current)
+            if callable(confirm)
+            else imageWrangler._confirm_append_config_replace(
+                self, check, processed, current)
+        )
+        if not accepted:
+            imageWrangler._safe_status_text(self, check.reason)
+            return False
+        imageWrangler._set_active_write_mode(self, "Overwrite")
+        return True
 
     def setup(self):
         """Sets up the child thread, syncs all parameters.
@@ -1311,9 +1473,7 @@ class imageWrangler(wranglerWidget):
                 'Choose an image source to run. Use Reintegrate for a loaded processed scan.',
             )
             return False
-        mismatch = imageWrangler._append_config_mismatch_message(self)
-        if mismatch:
-            imageWrangler._safe_status_text(self, mismatch)
+        if not imageWrangler._confirm_or_cancel_append_mismatch(self):
             return False
         return True
 

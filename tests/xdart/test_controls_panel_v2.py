@@ -1793,7 +1793,7 @@ def test_controls_panel_v2_raw_source_and_poni_enable_run_with_source_frames(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_append_mismatch_only_blocks_same_target(
+def test_controls_panel_v2_append_mismatch_same_target_stays_clickable(
         qapp, monkeypatch, tmp_path):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -1841,10 +1841,8 @@ def test_controls_panel_v2_append_mismatch_only_blocks_same_target(
         state = widget._controls_v2_state()
         profile = build_control_profile(state)
 
-        assert state.processed_config is not None
-        assert profile.can_run is False
-        assert profile.run_blockers
-        assert "processed scan: Standard · current: Grazing" in profile.run_blockers[0]
+        assert state.processed_config is None
+        assert profile.can_run is True
         assert "processed scan: Standard · current: Grazing" in (
             widget.wrangler._append_config_mismatch_message()
         )

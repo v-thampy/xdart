@@ -824,6 +824,32 @@ def test_qt_sink_abort_flushes_completed_frames(tmp_path):
     assert reloaded.frames[0].int_1d is not None
 
 
+def test_qt_sink_abort_append_axis_mismatch_logs_clean_once(
+        tmp_path, monkeypatch, caplog):
+    from xdart.modules.ewald import LiveScan
+    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
+
+    scan = LiveScan(data_file=str(tmp_path / "append_mismatch.nxs"))
+    host = _FakeHost(batch_mode=True, live_save_interval=1000)
+    sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+    sink._registry[1] = object()
+
+    def _raise_append_mismatch(*, force=False):
+        raise ValueError(
+            "Integration settings changed during append. Reintegrate and save "
+            "the complete scan so persisted rows share one axis."
+        )
+
+    monkeypatch.setattr(sink, "flush", _raise_append_mismatch)
+
+    with caplog.at_level(logging.ERROR):
+        sink.abort(SimpleNamespace(cancelled=True, n_processed=7))
+
+    assert sink._registry == {}
+    assert "skipped incompatible final append flush" in caplog.text
+    assert "Traceback" not in caplog.text
+
+
 def test_qt_sink_persist_before_evict_threshold(tmp_path, monkeypatch):
     """The save cadence fires BEFORE LiveFrameSeries could evict an unsaved
     frame: with cap C, the flush threshold is C - 8 (the margin), so the

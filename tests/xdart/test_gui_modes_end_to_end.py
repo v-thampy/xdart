@@ -2898,6 +2898,13 @@ def test_slice_controls_wait_for_binned_data(widget):
     df.show_slice_overlay()
     assert df.overlay is not None
 
+    df.binned_data = None
+    df.update_binned_view()
+    assert not df.ui.slice.isEnabled()
+    assert not df.ui.slice_center.isEnabled()
+    assert not df.ui.slice_width.isEnabled()
+    assert not df.ui.pinSlice.isEnabled()
+
 
 def test_gi_1d_npts_defaults_and_per_axis_memory(widget):
     """1-D Pts: fiber axes (Qip/Qoop/Exit) default to 1000/1000, q_total

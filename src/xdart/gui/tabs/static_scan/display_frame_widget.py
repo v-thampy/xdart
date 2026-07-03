@@ -3569,6 +3569,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     def update_binned_view(self):
         if self.binned_data is None:
+            _opu = getattr(self, '_on_plotUnit_changed', None)
+            if _opu is not None:
+                _opu()
             return                      # no cake drawn yet (e.g. Int 1D mode)
         data, rect = self.binned_data
         if data is None or rect is None:

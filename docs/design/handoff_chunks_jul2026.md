@@ -86,6 +86,8 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 | UX-1 | Menu-backed keyboard shortcuts for run/stop/load/save/write-mode toggle | S | low | fast operator loop without bypassing button locks | — | **DONE** this commit |
 | GI-1 | Auto χ/χGI full-range determinism for 1D integrations | S | med | Auto writes match explicit `-180..180`; χGI boundary scans stable | — | **DONE** this commit |
 | CF-1 | Append config mismatch blocker + data-authoritative display units | S | low-med | Append cannot silently no-op after Standard↔Grazing/settings changes; loaded data keeps its stored units until Replace/new processing | Controls V2/readiness | fixed-unverified; verify Session-1 Append Standard↔Grazing |
+| CF-2 | Append mismatch Run-click modal + Eiger target identity | S | med | Append mismatch is handled before the run with Cancel or Replace & re-integrate; Eiger `_master` source names resolve to the same target as the writer; writer-backstop abort cleanup avoids duplicate tracebacks | CF-1 | fixed-unverified; verify Session-1 Append Standard↔Grazing |
+| UI-3 | Slice c/w + Pin gate follows cake data presence | S | low | append-loaded/browser-loaded Int 2D data re-enables χ/q slice controls after `binned_data` arrives; clears disable them again | UI-2, OV-7 | fixed-unverified; verify Session-1 F5-adjacent |
 | H23 | nexus_writer schema convergence | M/L | med | one on-disk-contract owner | H6 | open |
 | H25 | Placement ratchet + xrd_tools/gui disposition | S | low | shell can't re-thicken silently | — | open |
 | H28 | ADR-0006 STEP 2 prepass deletion | M | med | dual-prepass risk retired | live gate slot | open |

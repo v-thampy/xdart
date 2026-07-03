@@ -40,6 +40,12 @@ from xrd_tools.reduction import FlushPolicy
 
 logger = logging.getLogger(__name__)
 
+_APPEND_AXIS_MISMATCH = "Integration settings changed during append"
+
+
+def _is_append_axis_mismatch(exc) -> bool:
+    return _APPEND_AXIS_MISMATCH in str(exc)
+
 # Margin below the LiveFrameSeries write-side staging cap at which the sink
 # forces a save, so an unsaved staged frame is never evicted (data-loss
 # invariant). The FrameRecordStore owns display-heavy eviction/hydration.
@@ -246,8 +252,14 @@ class QtNexusSink:
         # the live .nxs incrementally, not a temp file.
         try:
             self.flush(force=True)
-        except Exception:
-            logger.exception("QtNexusSink.abort flush failed")
+        except Exception as exc:
+            if _is_append_axis_mismatch(exc):
+                logger.error(
+                    "QtNexusSink.abort: skipped incompatible final append flush; "
+                    "existing .nxs file preserved."
+                )
+            else:
+                logger.exception("QtNexusSink.abort flush failed")
         self._registry.clear()     # T0-8: see finish()
 
     # -- internals --------------------------------------------------------
