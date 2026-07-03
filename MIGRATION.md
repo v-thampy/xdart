@@ -85,6 +85,13 @@ pre-migration reference signature.  Two additive notes:
 
 ## Behavior changes to know about
 
+
+* **Auto χ / χGI ranges are now deterministic (v1.0):** with the 1-D axis set to χ or χGI and
+  Auto range enabled, integrations previously used pyFAI's implicit geometry-derived azimuth
+  extent — the written 1D axis/intensities could differ from an explicit `-180..180` range.
+  Auto now always uses/clamps to the full `-180..180` convention and is byte-equal to the
+  explicit full range. Files processed with Auto χ/χGI by OLDER builds should be re-integrated
+  before comparing against new outputs.
 * `resolve_monitor_norm` now treats zero or negative monitor values as
   no-normalization.
 * `resolve_incident_angle` now falls back to metadata when the GI motor field
