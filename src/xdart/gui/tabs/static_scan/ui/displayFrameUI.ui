@@ -892,7 +892,10 @@
              </size>
             </property>
             <property name="text">
-             <string>X Range</string>
+             <string>χ (c/w)</string>
+            </property>
+            <property name="toolTip">
+             <string>integration window over χ (the other 2D axis): center / width</string>
             </property>
            </widget>
           </item>
@@ -906,18 +909,18 @@
             </property>
             <property name="minimumSize">
              <size>
-              <width>70</width>
+              <width>60</width>
               <height>0</height>
              </size>
             </property>
             <property name="maximumSize">
              <size>
-              <width>70</width>
+              <width>60</width>
               <height>16777215</height>
              </size>
             </property>
             <property name="toolTip">
-             <string comment="Center" extracomment="Center"/>
+             <string>slice center</string>
             </property>
             <property name="toolTipDuration">
              <number>2</number>
@@ -952,18 +955,18 @@
             </property>
             <property name="minimumSize">
              <size>
-              <width>70</width>
+              <width>60</width>
               <height>0</height>
              </size>
             </property>
             <property name="maximumSize">
              <size>
-              <width>70</width>
+              <width>60</width>
               <height>16777215</height>
              </size>
             </property>
             <property name="toolTip">
-             <string extracomment="Half Width"/>
+             <string>slice width</string>
             </property>
             <property name="minimum">
              <double>0.000000000000000</double>

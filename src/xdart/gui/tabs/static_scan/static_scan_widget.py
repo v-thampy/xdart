@@ -574,13 +574,13 @@ class staticWidget(QWidget):
                 total = sum(self.ui.mainSplitter.sizes()) or 1000
                 # Controls (right) and data-browser (left) columns start at the
                 # SAME width; the middle display panels take the rest (Vivek).
-                # The side columns are 10% narrower than before (0.28 -> 0.252)
+                # The side columns are 10% narrower than before (0.252 -> 0.227)
                 # so the central display isn't squished; the freed space goes to
                 # the middle.  Min/max widths are untouched (set elsewhere) --
                 # this only moves the default/initial split.  User-resizable via
                 # the splitter (re-asserted only during the first-3s launch storm).
                 self.ui.mainSplitter.setSizes(
-                    [int(total * f) for f in (0.252, 0.496, 0.252)])
+                    [int(total * f) for f in (0.227, 0.546, 0.227)])
                 self.ui.mainSplitter.setStretchFactor(1, 1)
                 # Left column: the Tools card is now a compact 3-button panel, so
                 # give it only a small share (~18%) and let the data browser take
@@ -4259,6 +4259,89 @@ class staticWidget(QWidget):
             else:
                 self.h5viewer.data_changed()
 
+    def _request_render(self, reason=None, *, generation=None) -> bool:
+        """Request a current-selection paint through the display authority."""
+        df = getattr(self, "displayframe", None)
+        if df is None:
+            return False
+        request = getattr(df, "request_current_selection_repaint", None)
+        if callable(request):
+            accepted = bool(request(generation=generation, reason=reason))
+            flush = getattr(df, "_flush_current_selection_repaint", None)
+            if accepted and callable(flush):
+                try:
+                    flush()
+                except Exception:
+                    logger.debug("render-authority flush failed for %s", reason,
+                                 exc_info=True)
+            return accepted
+        update = getattr(df, "update", None)
+        if not callable(update):
+            return False
+        try:
+            update(expected_generation=generation)
+        except TypeError:
+            update()
+        return True
+
+    def _render_authority_stale_for_flush(self):
+        """Return True when selection generation changed as this flush fired."""
+        df = getattr(self, "displayframe", None)
+        if df is None:
+            return False
+        before_generation = getattr(df, "display_generation", None)
+        signature = getattr(df, "_selection_generation_signature", None)
+        before_signature = None
+        if callable(signature):
+            try:
+                before_signature = signature()
+            except Exception:
+                logger.debug("render-authority signature snapshot failed",
+                             exc_info=True)
+        sync = getattr(df, "_sync_selection_generation", None)
+        if not callable(sync):
+            return False
+        try:
+            current_generation = sync()
+        except Exception:
+            logger.debug("render-authority sync failed", exc_info=True)
+            return False
+        current_signature = before_signature
+        if callable(signature):
+            try:
+                current_signature = signature()
+            except Exception:
+                logger.debug("render-authority signature refresh failed",
+                             exc_info=True)
+        stale = current_generation != before_generation
+        if stale and os.environ.get("XDART_PERF"):
+            logger.info(
+                "[PERF] flush stale selection: gen=%r->%r sig=%r->%r",
+                before_generation, current_generation,
+                before_signature, current_signature,
+            )
+        return stale
+
+    def _rearm_stale_flush(self) -> bool:
+        """Re-arm a stale heavy flush, bounded so churn eventually converges."""
+        count = int(getattr(self, "_render_authority_rearms", 0) or 0) + 1
+        self._render_authority_rearms = count
+        max_rearms = int(getattr(self, "_render_authority_max_rearms", 3) or 3)
+        if count > max_rearms:
+            logger.debug("render-authority stale flush forced after %d rearm(s)",
+                         count - 1)
+            self._render_authority_rearms = 0
+            return False
+        timer = getattr(self, "_update_timer", None)
+        trigger = getattr(timer, "trigger", None)
+        if callable(trigger):
+            trigger()
+        else:
+            start = getattr(timer, "start", None)
+            if callable(start):
+                start()
+        return True
+
     def _flush_pending_update(self):
         """Render the most recently received wrangler update.
 
@@ -4277,6 +4360,10 @@ class staticWidget(QWidget):
         """
         if self._pending_update_idx is None:
             return
+        if staticWidget._render_authority_stale_for_flush(self):
+            if staticWidget._rearm_stale_flush(self):
+                return
+        self._render_authority_rearms = 0
         self._pending_update_idx = None
         # Optional per-flush profiling: set XDART_PERF=1 in the shell to log the
         # drain / list-widget / render split at INFO so the dominant GUI-thread leg
@@ -4485,7 +4572,7 @@ class staticWidget(QWidget):
                     self.h5viewer.frame_ids[:] = selected_ids
                 except TypeError:
                     self.h5viewer.frame_ids = list(selected_ids)
-                self.h5viewer.data_changed()
+                staticWidget._h5viewer_data_changed_now(self)
                 return
             except Exception:
                 logger.debug("deferred browser-select reset failed", exc_info=True)
@@ -4500,7 +4587,7 @@ class staticWidget(QWidget):
             # their baked NaN mask (the inverse of the intended behaviour).
             self.displayframe._viewer_is_xdart = getattr(
                 self.h5viewer, '_viewer_is_xdart', False)
-            self.displayframe.update()
+            staticWidget._request_render(self, "h5viewer-selection")
             # # if (len(self.frames.keys()) > 0) and (len(self.scan.frames.index) > 0):
             # if ((len(self.viewer_rows_1d.keys()) > 0) and
             #         (len(self.frame_ids) > 0) and
@@ -4540,7 +4627,7 @@ class staticWidget(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        # Keep the default 19/57/24 split through the launch-time window-
+        # Keep the fresh-session default split through the launch-time window-
         # manager resize storm (first 3s); afterwards the splitter is the
         # user's.
         import time as _time
@@ -5128,7 +5215,7 @@ class staticWidget(QWidget):
         if self.h5viewer.auto_last:
             self.latest_frame()
 
-        self.displayframe.update()
+        staticWidget._request_render(self, "update-all")
         self.metawidget.update()
 
     def integrator_thread_update(self, idx):
@@ -5162,7 +5249,7 @@ class staticWidget(QWidget):
         live_reint = bool(getattr(it, 'reintegrate_live', False))
         if self.h5viewer.auto_last or live_reint:
             self.latest_frame()
-        self.displayframe.update()
+        staticWidget._request_render(self, "reintegrate-flush")
         self.metawidget.update()
 
     def integrator_thread_finished(self):
@@ -5955,9 +6042,9 @@ class staticWidget(QWidget):
         ``H5Viewer.update_data``.  Without the block, the
         ``ClearAndSelect`` cursor move would fire
         ``itemSelectionChanged`` → ``data_changed`` → ``sigUpdate`` →
-        ``set_data`` → a redundant ``displayframe.update()`` on top of
-        whatever the caller does next (every call site that drives
-        ``latest_frame`` follows it with its own display refresh).
+        ``set_data`` → a redundant render-authority request on top of whatever
+        the caller does next (every call site that drives ``latest_frame`` follows
+        it with its own display refresh).
         """
         self.h5viewer.auto_last = True
         if self.h5viewer.ui.listData.count() <= 1:

@@ -440,9 +440,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             'plotUnit': '1D plot x-axis (Q, 2θ, or χ from the 2D cake).',
             'plotMethod': 'Combine frames: Single / Overlay / Waterfall / '
                           'Sum / Average.',
-            'slice': 'Restrict the 1D pattern to a χ range (needs 2D data).',
-            'slice_center': 'Center of the χ slice (degrees).',
-            'slice_width': 'Width of the χ slice (degrees).',
+            'slice': 'integration window over χ (the other 2D axis): center / width',
+            'slice_center': 'slice center',
+            'slice_width': 'slice width',
             'wf_options': 'Waterfall / Overlay / Legend options.',
             'clear_1D': 'Clear accumulated overlay/waterfall curves.',
         }
@@ -616,6 +616,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def _init_data_objects(self, scan, frame, frame_ids, frames, viewer_rows_1d, viewer_rows_2d):
         """Initialize data references, plotting state, and index tracking."""
         self.ui.slice.setText(Chi)
+        self.ui.slice.setToolTip(
+            'integration window over χ (the other 2D axis): center / width')
+        self.ui.slice_center.setToolTip('slice center')
+        self.ui.slice_width.setToolTip('slice width')
 
         # Plotting parameters
         self.ui.cmap.clear()
@@ -3019,7 +3023,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 # Azimuthal-integration mode (I vs χ via integrate_radial).  The
                 # native 1D result IS I(χ), so χ is the default plot axis.  It is
                 # source='1d_2d': the bare readout is the pooled I(χ), but the
-                # user can also restrict it to a Q band by ticking X Range
+                # user can also restrict it to a Q band by ticking the slice
+                # center/width control
                 # (slicing the cake along its RADIAL axis).  Q and 2θ are derived
                 # from the 2D cake (source='2d', Int 2D only) by slicing along χ.
                 # This makes χ-mode symmetric with Q-mode -- Q/2θ projections, the
@@ -3103,15 +3108,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # Slicing requires 2D data and the axis must come from 2D
         can_slice = (not skip_2d) and info['source'] in ('2d', '1d_2d')
 
-        # The X Range button is available when slicing is possible; the
-        # center/width spinboxes are only live once X Range is *checked*.
+        # The slice button is available when slicing is possible; the center/width
+        # spinboxes are only live once it is *checked*.
         self.ui.slice.setEnabled(can_slice)
         if not can_slice:
             self.ui.slice.setChecked(False)
             self.clear_slice_overlay()
         self._sync_slice_controls()
 
-        # R2-1: refresh the X-Range label + bounds to the *complementary* 2D
+        # R2-1: refresh the slice label + bounds to the *complementary* 2D
         # axis for this plotUnit (read from _plot_axis_info[idx].slice_axis —
         # Q_ip→Q_oop, Q→χ), driven from here so it tracks plotUnit AND mode/GI
         # changes (set_axes ends by calling this) — not lazily on first click.

@@ -1585,7 +1585,10 @@ class DisplayPlotMixin:
 
         if is_q_like and not is_angle:
             # Q-type axis (Å⁻¹)
-            self.ui.slice.setText(f'{short_label} Range')
+            self.ui.slice.setText(f'{short_label} (c/w)')
+            self.ui.slice.setToolTip(
+                f'integration window over {short_label} '
+                '(the other 2D axis): center / width')
             self.ui.slice_center.setRange(0, 25)
             self.ui.slice_width.setRange(0, 30)
             self.ui.slice_center.setSingleStep(0.1)
@@ -1595,7 +1598,10 @@ class DisplayPlotMixin:
                 self.ui.slice_width.setValue(0.5)
         else:
             # Angle-type axis (degrees)
-            self.ui.slice.setText(f'{short_label} Range')
+            self.ui.slice.setText(f'{short_label} (c/w)')
+            self.ui.slice.setToolTip(
+                f'integration window over {short_label} '
+                '(the other 2D axis): center / width')
             self.ui.slice_center.setRange(-180, 180)
             self.ui.slice_width.setRange(0, 270)
             self.ui.slice_center.setSingleStep(1)
@@ -1650,12 +1656,13 @@ class DisplayPlotMixin:
                 self.update()
                 return
 
+            slice_axis = re.sub(r'\s*\(c/w\)\s*$', '', self.ui.slice.text()).strip()
             if imageUnit == 0:
-                if self.ui.slice.text() == f'2{Th} Range':
+                if slice_axis == f'2{Th}':
                     _range = ((4 * np.pi / (wavelength * 1e10))
                               * np.sin(np.radians(_range / 2)))
             else:
-                if self.ui.slice.text() == 'Q Range':
+                if slice_axis == 'Q':
                     _range = (2 * np.degrees(
                         np.arcsin(_range * (wavelength * 1e10) / (4 * np.pi))))
 

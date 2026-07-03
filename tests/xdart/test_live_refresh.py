@@ -763,6 +763,85 @@ def test_flush_pending_update_owns_single_repaint():
     ]
 
 
+def test_flush_pending_update_rearms_stale_selection_without_dropping_pending_frames():
+    calls = []
+
+    class Timer:
+        def __init__(self):
+            self.triggers = 0
+
+        def trigger(self):
+            self.triggers += 1
+
+    timer = Timer()
+    display = SimpleNamespace(
+        display_generation=3,
+        _last_selection_sig=((1,), False),
+        frame_ids=["2"],
+        overall=False,
+        _hydration_pending_labels=set(),
+        _hydration_failure_counts={},
+        _hydration_failure_logged=set(),
+        _pending_hydration_render=False,
+        _pending_hydration_generation=None,
+        _current_selection_repaint_generation=None,
+        _current_selection_repaint_pending=False,
+    )
+    display._bump_display_generation = MethodType(
+        displayFrameWidget._bump_display_generation, display)
+    display._selection_generation_signature = MethodType(
+        displayFrameWidget._selection_generation_signature, display)
+    display._sync_selection_generation = MethodType(
+        displayFrameWidget._sync_selection_generation, display)
+    widget = SimpleNamespace(
+        _pending_update_idx=5,
+        _pending_frames={5: object()},
+        _update_timer=timer,
+        _drain_pending_frames=lambda: calls.append("drain"),
+        h5viewer=SimpleNamespace(
+            auto_last=False,
+            update_data=lambda **kwargs: calls.append(("update_data", kwargs)),
+            data_changed=lambda **kwargs: calls.append(("data_changed", kwargs)),
+        ),
+        displayframe=display,
+    )
+
+    staticWidget._flush_pending_update(widget)
+
+    assert display.display_generation == 4
+    assert timer.triggers == 1
+    assert widget._pending_update_idx == 5
+    assert set(widget._pending_frames) == {5}
+    assert calls == []
+
+    staticWidget._flush_pending_update(widget)
+
+    assert widget._pending_update_idx is None
+    assert calls == [
+        "drain",
+        ("update_data", {"emit_update": False}),
+        ("data_changed", {"show_all": False}),
+    ]
+
+
+def test_request_render_delegates_to_display_generation_scheduler():
+    calls = []
+    flushed = []
+    host = SimpleNamespace(
+        displayframe=SimpleNamespace(
+            request_current_selection_repaint=(
+                lambda *, generation=None, reason=None:
+                    calls.append((generation, reason)) or True
+            ),
+            _flush_current_selection_repaint=lambda: flushed.append(True),
+        )
+    )
+
+    assert staticWidget._request_render(host, "unit-test", generation=11) is True
+    assert calls == [(11, "unit-test")]
+    assert flushed == [True]
+
+
 def test_flush_pending_update_bypasses_user_selection_debounce():
     calls = []
     widget = SimpleNamespace(

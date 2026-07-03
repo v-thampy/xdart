@@ -1840,7 +1840,7 @@ def test_int_plot_accumulating_modes_characterize_update_plot_state(widget, meth
     state = _plot_state(df)
     assert state["names"] == ("scan_0", "scan_1", "scan_2")
     assert state["y"].shape == (3, 5)
-    assert df.overlaid_idxs == [0, 1, 2]
+    assert df.overlaid_idxs == [("scan", 0), ("scan", 1), ("scan", 2)]
 
     df.ui.plotUnit.setCurrentIndex(1)   # unit-switch rebuild, not last-only
     w.frame_ids[:] = ["2"]
@@ -1850,7 +1850,7 @@ def test_int_plot_accumulating_modes_characterize_update_plot_state(widget, meth
     rebuilt = _plot_state(df)
     assert rebuilt["names"] == ("scan_0", "scan_1", "scan_2")
     assert rebuilt["y"].shape == (3, 5)
-    assert df.overlaid_idxs == [0, 1, 2]
+    assert df.overlaid_idxs == [("scan", 0), ("scan", 1), ("scan", 2)]
     assert rebuilt["x_axis"][0].startswith("2")
 
 
@@ -2391,7 +2391,7 @@ def test_plot_method_change_autoranges_view(widget):
     assert vx[0] < 50.0                            # refit to the Q data (~0.5..3)
 
 
-# ── R2-1: slice X-Range label = complementary 2D axis, refreshed on change ──
+# ── R2-1: slice c/w label = complementary 2D axis, refreshed on change ──
 
 def test_slice_range_label_tracks_plotunit_and_mode(widget):
     from xdart.gui.tabs.static_scan.display_constants import Chi
@@ -2409,11 +2409,11 @@ def test_slice_range_label_tracks_plotunit_and_mode(widget):
                   if info["source"] == "2d")
     df.ui.plotUnit.setCurrentIndex(gi_idx)
     df._on_plotUnit_changed()
-    assert df.ui.slice.text().endswith("Range")
+    assert df.ui.slice.text().endswith("(c/w)")
     assert Chi not in df.ui.slice.text()           # GI axis, not χ
 
     # GI -> non-GI: set_axes rebuilds (plotUnit Q over a Q-χ cake) and the label
-    # must refresh to "χ Range" immediately — not stay the stale GI label.
+    # must refresh to "χ (c/w)" immediately — not stay the stale GI label.
     df.scan.gi = False
     df.set_axes()
     assert Chi in df.ui.slice.text()               # refreshed, no click needed
