@@ -38,6 +38,11 @@ from xrd_tools.core.containers import (
     PONI,
 )
 from xrd_tools.core.filters import compile_filter
+from xrd_tools.core.staging import (
+    heavy_window,
+    heavy_window_log_line,
+    total_physical_ram_bytes,
+)
 from xrd_tools.core.invalid import (
     UINT32_CEILING,
     integer_saturation_ceiling,
@@ -117,6 +122,9 @@ __all__ = [
     "IntegrationResult1D",
     "IntegrationResult2D",
     "PONI",
+    "heavy_window",
+    "heavy_window_log_line",
+    "total_physical_ram_bytes",
     "Axis",
     "FrameGeometry",
     "ViewFrameGeometry",

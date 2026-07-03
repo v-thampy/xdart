@@ -519,6 +519,12 @@ def _same_source(a: FramePublication, b: FramePublication) -> bool:
     return _same_source_id(a.source_identity, b.source_identity)
 
 
+# MEM-2: sentinel so an unspecified heavy cap resolves to the RAM-aware window
+# at construction (frame shape is unknown here → the coarse RAM tier; the
+# wrangler resizes staging + record to the frame-precise window at run start).
+_AUTO_HEAVY_WINDOW = object()
+
+
 class PublicationStore:
     """Small generation-aware store for frame publications.
 
@@ -526,15 +532,19 @@ class PublicationStore:
     label, metadata, source identity, and diagnostics in the store.  Full
     source/NeXus rehydration is intentionally deferred; this protects long live
     scans from unbounded memory growth without changing the publication API.
+    Left unspecified, it defaults to the RAM-aware :func:`heavy_window` (MEM-2).
     """
 
     def __init__(
         self,
         *,
         max_items: int | None = DEFAULT_PUBLICATION_MAX_ITEMS,
-        max_heavy_items: int | None = 64,
+        max_heavy_items=_AUTO_HEAVY_WINDOW,
         max_thumbnail_items: int | None = 512,
     ) -> None:
+        if max_heavy_items is _AUTO_HEAVY_WINDOW:
+            from xrd_tools.core import heavy_window
+            max_heavy_items = heavy_window()
         if max_items is not None and max_items < 1:
             raise ValueError("max_items must be positive or None")
         if max_heavy_items is not None and max_heavy_items < 0:

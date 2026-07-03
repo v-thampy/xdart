@@ -2289,6 +2289,30 @@ class imageThread(wranglerThread):
 
         return hydrate
 
+    def _heavy_staging_window(self, scan):
+        """MEM-2: the RAM-aware size for the live heavy caps.
+
+        One number, consumed by all three heavy caps (LiveFrameSeries staging,
+        FrameRecordStore + PublicationStore ``max_heavy_items``).  ~25% of TOTAL
+        physical RAM / the as-stored per-frame heavy cost (raw is float64-upcast
+        today → 8 B/px), clamped [16, 64]; env ``XDART_HEAVY_WINDOW`` pins it.
+        Computed at run start (detector shape known); cached + logged once.
+        """
+        cached = getattr(self, "_heavy_window", None)
+        if cached is not None:
+            return cached
+        from xrd_tools.core import heavy_window, heavy_window_log_line
+        shape = getattr(self, "detector_shape", None)
+        frame_bytes = None
+        if shape and len(shape) >= 2:
+            frame_bytes = int(shape[0]) * int(shape[1]) * 8   # float64 as-stored
+        window = heavy_window(frame_bytes)
+        self._heavy_window = window
+        logger.info(heavy_window_log_line(
+            window, frame_bytes,
+            overridden=bool(os.environ.get("XDART_HEAVY_WINDOW"))))
+        return window
+
     def _get_streaming_session(self, scan, frames):
         """Build (once per scan) or return the persistent streaming session +
         its ``QtNexusSink``.  Returns ``(None, None)`` if the GI freeze scout
@@ -2308,10 +2332,17 @@ class imageThread(wranglerThread):
         _default_freeze = ("scout_union" if self.batch_mode else "first_frame") \
             if self.gi else None
         gi_freeze_mode = getattr(self, "gi_freeze_mode", _default_freeze)
-        frame_cap = getattr(getattr(scan, "frames", None), "_in_memory_cap", 64)
+        # MEM-2: RAM-aware heavy window feeds all three heavy caps.  Set the
+        # LiveFrameSeries staging cap here so the record store (which mirrors it)
+        # and the GUI's PublicationStore (which reads self._heavy_window) all
+        # take the same value.
+        window = self._heavy_staging_window(scan)
+        frames_obj = getattr(scan, "frames", None)
+        if frames_obj is not None:
+            frames_obj._in_memory_cap = window
         record_store = FrameRecordStore(
             max_items=_LIVE_RECORD_STORE_MAX_ITEMS,
-            max_heavy_items=frame_cap,
+            max_heavy_items=window,
         )
         self._streaming_record_store = record_store
         sink = QtNexusSink(
