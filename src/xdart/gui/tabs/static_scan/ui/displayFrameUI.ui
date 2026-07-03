@@ -983,6 +983,37 @@
            </widget>
           </item>
           <item>
+           <widget class="QPushButton" name="pinSlice">
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
+            </property>
+            <property name="minimumSize">
+             <size>
+              <width>48</width>
+              <height>0</height>
+             </size>
+            </property>
+            <property name="maximumSize">
+             <size>
+              <width>56</width>
+              <height>16777215</height>
+             </size>
+            </property>
+            <property name="focusPolicy">
+             <enum>Qt::StrongFocus</enum>
+            </property>
+            <property name="text">
+             <string>Pin</string>
+            </property>
+            <property name="toolTip">
+             <string>Pin the current slice cut into the overlay.</string>
+            </property>
+           </widget>
+          </item>
+          <item>
            <spacer name="horizontalSpacer_4">
             <property name="orientation">
              <enum>Qt::Horizontal</enum>
@@ -1146,6 +1177,7 @@
   <tabstop>plotUnit</tabstop>
   <tabstop>slice_center</tabstop>
   <tabstop>slice_width</tabstop>
+  <tabstop>pinSlice</tabstop>
   <tabstop>plotMethod</tabstop>
   <tabstop>yOffset</tabstop>
   <tabstop>save_1D</tabstop>

@@ -121,6 +121,7 @@ def _shortcut_host(**attrs):
         "shortcut_run_pause",
         "shortcut_stop",
         "shortcut_toggle_write_mode",
+        "shortcut_pin_slice_cut",
         "shortcut_load_settings",
         "shortcut_save_settings",
     ):
@@ -210,6 +211,19 @@ def test_load_save_shortcuts_route_through_existing_actions(qapp):
     assert calls == ["load", "save"]
 
 
+def test_pin_slice_shortcut_routes_to_displayframe(qapp):
+    calls = []
+    host = _shortcut_host(
+        displayframe=SimpleNamespace(
+            pin_current_slice_cut=lambda: calls.append("pin")
+        )
+    )
+
+    host.shortcut_pin_slice_cut()
+
+    assert calls == ["pin"]
+
+
 def test_main_window_shortcuts_are_menu_backed(qapp, monkeypatch, caplog):
     from xdart import _gui_main
 
@@ -242,6 +256,9 @@ def test_main_window_shortcuts_are_menu_backed(qapp, monkeypatch, caplog):
         def shortcut_toggle_write_mode(self):
             self.calls.append("toggle")
 
+        def shortcut_pin_slice_cut(self):
+            self.calls.append("pin")
+
         def shortcut_load_settings(self):
             self.calls.append("load")
 
@@ -258,7 +275,8 @@ def test_main_window_shortcuts_are_menu_backed(qapp, monkeypatch, caplog):
 
         assert "Load Settings" in file_actions
         assert "Save Settings" in file_actions
-        assert run_actions == ["Run / Pause", "Stop", "Toggle Append / Replace"]
+        assert run_actions == [
+            "Run / Pause", "Stop", "Toggle Append / Replace", "Pin Slice Cut"]
         assert window.debugMenu.menuAction() in config_actions
         assert window.debugMenu.title() == "Debug"
         assert [a.text() for a in window.debugMenu.actions()] == [
@@ -269,6 +287,8 @@ def test_main_window_shortcuts_are_menu_backed(qapp, monkeypatch, caplog):
             QtGui.QKeySequence.PortableText) == "Ctrl+Shift+C"
         assert window.actionToggleWriteMode.shortcut().toString(
             QtGui.QKeySequence.PortableText) == "Ctrl+Shift+A"
+        assert window.actionPinSliceCut.shortcut().toString(
+            QtGui.QKeySequence.PortableText) == "Ctrl+P"
         assert window.actionLoadSettings.shortcut().toString(
             QtGui.QKeySequence.PortableText) == "Ctrl+O"
         assert window.actionSaveSettings.shortcut().toString(
@@ -277,11 +297,12 @@ def test_main_window_shortcuts_are_menu_backed(qapp, monkeypatch, caplog):
         window.actionRunPause.trigger()
         window.actionStopRun.trigger()
         window.actionToggleWriteMode.trigger()
+        window.actionPinSliceCut.trigger()
         window.actionLoadSettings.trigger()
         window.actionSaveSettings.trigger()
 
         assert window.main_widget.calls == [
-            "run", "stop", "toggle", "load", "save"]
+            "run", "stop", "toggle", "pin", "load", "save"]
 
         with caplog.at_level(logging.WARNING, logger=_gui_main.__name__):
             window.actionDebugWindowState.trigger()

@@ -16,6 +16,9 @@ from .display_logic import (
     scan_key_from_qualified_id,
 )
 
+LIVE_SLICE_PROJECTION_ID = "__live_slice__"
+PROJECTION_ROUND_DIGITS = 6
+
 
 def current_scan_key(widget):
     """Stable scan key for row identity; prefer the visible scan name."""
@@ -85,11 +88,56 @@ def overlay_slice_key(widget, needs_2d):
         return (None, None)
 
 
+def _strip_axis_label(text):
+    text = re.sub(r"\s*\(c/w\)\s*$", "", str(text or "")).strip()
+    text = re.sub(r"\s*\(.*?\)\s*$", "", text).strip()
+    return text
+
+
+def _short_axis_label_from_text(text):
+    raw = str(text or "")
+    label = _strip_axis_label(raw)
+    lowered = raw.lower()
+    if Qip_s.lower() in lowered or "qip" in lowered or "q_ip" in lowered:
+        return Qip_s
+    if Qoop_s.lower() in lowered or "qoop" in lowered or "q_oop" in lowered:
+        return Qoop_s
+    if Qtot_s.lower() in lowered or "qtot" in lowered or "q_total" in lowered:
+        return "q"
+    if "exit" in lowered:
+        return "exit"
+    if f"{Chi.lower()}gi" in lowered or "chigi" in lowered:
+        return f"{Chi}GI"
+    if Chi in raw or "chi" in lowered:
+        return Chi
+    if Th in raw or "2th" in lowered or "theta" in lowered:
+        return f"2{Th}"
+    if "q" in lowered:
+        return "q"
+    return label or "axis"
+
+
 def _plot_unit_text(widget):
     try:
         return str(widget.ui.plotUnit.currentText())
     except Exception:
         return ""
+
+
+def _slice_control_text(widget):
+    try:
+        text = widget.ui.slice.text()
+    except Exception:
+        text = ""
+    return str(text or "")
+
+
+def _image_unit_text(widget):
+    try:
+        text = widget.ui.imageUnit.currentText()
+    except Exception:
+        text = ""
+    return str(text or "")
 
 
 def _axis_token_from_text(text):
@@ -139,6 +187,81 @@ def overlay_axis_kind(widget, axis_info=None, needs_2d=None):
     if "chi" in unit:
         return "chi"
     return "radial"
+
+
+def overlay_slice_axis_kind(widget, axis_info=None):
+    axis_info = axis_info or current_axis_info(widget)
+    text = axis_info.get("slice_axis")
+    if not text and axis_info.get("axis") == "azimuthal":
+        text = _image_unit_text(widget).split("-")[0]
+    if not text:
+        text = _slice_control_text(widget)
+    return _axis_token_from_text(text or "unknown")
+
+
+def overlay_projection_id_for_widget(
+    widget,
+    axis_info=None,
+    *,
+    center=None,
+    width=None,
+    live=False,
+):
+    axis_info = axis_info or current_axis_info(widget)
+    needs_2d = overlay_needs_2d(widget, axis_info)
+    if not needs_2d or not slice_enabled(widget):
+        return None
+    slice_axis = overlay_slice_axis_kind(widget, axis_info)
+    if live:
+        return (LIVE_SLICE_PROJECTION_ID, slice_axis)
+    if center is None:
+        try:
+            center = float(widget.ui.slice_center.value())
+        except Exception:
+            center = 0.0
+    if width is None:
+        try:
+            width = float(widget.ui.slice_width.value())
+        except Exception:
+            width = 0.0
+    return (
+        slice_axis,
+        round(float(center), PROJECTION_ROUND_DIGITS),
+        round(float(width), PROJECTION_ROUND_DIGITS),
+    )
+
+
+def overlay_slice_legend_suffix(
+    widget,
+    axis_info=None,
+    *,
+    center=None,
+    width=None,
+    live=False,
+):
+    axis_info = axis_info or current_axis_info(widget)
+    needs_2d = overlay_needs_2d(widget, axis_info)
+    if not needs_2d or not slice_enabled(widget):
+        return ""
+    if center is None:
+        try:
+            center = float(widget.ui.slice_center.value())
+        except Exception:
+            center = 0.0
+    if width is None:
+        try:
+            width = float(widget.ui.slice_width.value())
+        except Exception:
+            width = 0.0
+    projection_axis = _short_axis_label_from_text(_plot_unit_text(widget))
+    slice_text = _slice_control_text(widget) or axis_info.get("slice_axis")
+    if not slice_text and axis_info.get("axis") == "azimuthal":
+        slice_text = _image_unit_text(widget).split("-")[0]
+    slice_axis = _short_axis_label_from_text(slice_text)
+    suffix = f" · {projection_axis}@{slice_axis}={float(center):.2f}±{float(width):.2f}"
+    if live:
+        suffix = f"{suffix} · current"
+    return suffix
 
 
 def _positive_int(value):
@@ -204,21 +327,40 @@ def overlay_grid_key_for_widget(widget, *, npt=None, first_frame=None, axis_info
         overlay_axis_kind(widget, axis_info, needs_2d),
         npt,
         needs_2d,
-        overlay_slice_key(widget, needs_2d),
     )
 
 
-def overlay_identity_for_widget(widget, frame_idx, *, npt=None, first_frame=None, axis_info=None):
+def overlay_identity_for_widget(
+    widget,
+    frame_idx,
+    *,
+    npt=None,
+    first_frame=None,
+    axis_info=None,
+    projection_id=None,
+    live_slice=False,
+):
     """Return ``(grid_key, row_id)`` for one Overlay/Waterfall row.
 
-    Slice identity is intentionally isolated here: OV-6 still keeps slice range in
-    the grid key (matching the current reset behavior), while OV-7 can move that
-    component into ``row_id`` locally without touching payload/seeding call sites.
+    Slice identity is isolated here: the reset key names only the compatible grid
+    family, while active slice center/width live in the row identity.  The live
+    unpinned slice uses a stable projection id so spinbox stepping replaces its
+    own row instead of accumulating.
     """
     axis_info = axis_info or current_axis_info(widget)
     grid_key = overlay_grid_key_for_widget(
         widget, npt=npt, first_frame=first_frame, axis_info=axis_info)
-    row_id = qualified_row_id_for_widget(widget, frame_idx)
+    if projection_id is None:
+        projection_id = overlay_projection_id_for_widget(
+            widget, axis_info, live=live_slice)
+    if projection_id is None:
+        row_id = qualified_row_id_for_widget(widget, frame_idx)
+    else:
+        try:
+            frame_idx = int(frame_idx)
+        except (TypeError, ValueError):
+            pass
+        row_id = (current_scan_key(widget), frame_idx, projection_id)
     return grid_key, row_id
 
 

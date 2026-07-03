@@ -297,6 +297,31 @@ def test_accumulate_waterfall_partial_read_never_shrinks_or_restacks():
     assert h2.ids == (0, 1, 2, 3, 4) and h2.rows.shape == (5, 3)
 
 
+def test_accumulate_waterfall_replaces_explicit_live_slice_row_only():
+    np = pytest.importorskip("numpy")
+    x = np.array([0.0, 1.0, 2.0])
+    live_id = ("scan", 1, ("__live_slice__", "chi"))
+    h = dl.accumulate_waterfall(
+        None, reset_key=("radial", 3, True), unit="q", x=x,
+        rows=np.array([[1.0, 1.0, 1.0], [9.0, 9.0, 9.0]]),
+        ids=[live_id, ("scan", 1, ("chi", 0.0, 1.0))],
+        names=["live", "pin"],
+    )
+
+    h2 = dl.accumulate_waterfall(
+        h, reset_key=("radial", 3, True), unit="q", x=x,
+        rows=np.array([[2.0, 2.0, 2.0], [8.0, 8.0, 8.0]]),
+        ids=[live_id, ("scan", 1, ("chi", 0.0, 1.0))],
+        names=["live moved", "pin duplicate"],
+        replace_ids=[live_id],
+    )
+
+    assert h2.ids == h.ids
+    assert h2.names == ("live moved", "pin")
+    np.testing.assert_array_equal(h2.rows[0], [2.0, 2.0, 2.0])
+    np.testing.assert_array_equal(h2.rows[1], [9.0, 9.0, 9.0])
+
+
 def test_accumulate_waterfall_reset_key_change_resets():
     np = pytest.importorskip("numpy")
     x = np.array([0.0, 1.0, 2.0])

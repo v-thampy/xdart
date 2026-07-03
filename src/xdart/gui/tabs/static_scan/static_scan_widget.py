@@ -3688,6 +3688,14 @@ class staticWidget(QWidget):
         if button is not None and button.isEnabled():
             button.click()
 
+    def shortcut_pin_slice_cut(self):
+        """Cmd+P handler: pin the current slice cut when the display allows it."""
+        self._commit_shortcut_focus()
+        pin = getattr(getattr(self, "displayframe", None),
+                      "pin_current_slice_cut", None)
+        if callable(pin):
+            pin()
+
     def shortcut_load_settings(self):
         """Cmd+O handler: route through the existing Config -> Load action."""
         action = getattr(getattr(self, "h5viewer", None), "actionLoadParams", None)

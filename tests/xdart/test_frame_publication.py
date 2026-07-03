@@ -1122,17 +1122,19 @@ from types import SimpleNamespace  # noqa: E402
 
 
 def _int_widget(*, plot_unit_text="q (Å⁻¹)", source="1d", axis="radial",
-                slice_on=False, center=0.0, width=1.0, wavelength_m=1e-10, gi=False):
+                slice_axis=None, slice_on=False, center=0.0, width=1.0,
+                wavelength_m=1e-10, gi=False):
     ui = SimpleNamespace(
         plotUnit=SimpleNamespace(currentIndex=lambda: 0,
                                  currentText=lambda: plot_unit_text),
         slice=SimpleNamespace(isChecked=lambda: slice_on),
         slice_center=SimpleNamespace(value=lambda: center),
         slice_width=SimpleNamespace(value=lambda: width),
+        imageUnit=SimpleNamespace(currentText=lambda: "Q-Chi"),
     )
     return SimpleNamespace(
         scan=SimpleNamespace(name="scan", gi=gi),
-        _plot_axis_info=[{"source": source, "slice_axis": None, "axis": axis}],
+        _plot_axis_info=[{"source": source, "slice_axis": slice_axis, "axis": axis}],
         ui=ui,
         normalize=lambda data, md: np.asarray(data, dtype=float)
         / ((md or {}).get("monitor", 1.0) or 1.0),
@@ -1242,7 +1244,7 @@ def test_integration_payload_2d_slice_window_and_label():
     w = _int_widget(source="2d", axis="radial", slice_on=True, center=0.5, width=0.6)
     payload = _adapter(store, w).integration_plot_payload(state)
     np.testing.assert_allclose(payload.traces[0].y, np.full(4, 0.5))
-    assert "[" in payload.traces[0].label and "±" in payload.traces[0].label
+    assert "·" in payload.traces[0].label and "±" in payload.traces[0].label
 
 
 def test_integration_payload_azimuthal_axis():
@@ -1286,7 +1288,7 @@ def test_plot_payload_routes_overlay_waterfall_through_accumulator_after_flip():
         assert payload.overlaid_ids == (("scan", 9),)
 
 
-def test_overlay_waterfall_payload_reset_key_includes_active_slice_range():
+def test_overlay_waterfall_payload_reset_key_excludes_active_slice_range():
     frame = DuckFrame(idx=9)
     store = PublicationStore()
     store.upsert(publication_from_live_frame(frame))
@@ -1303,9 +1305,75 @@ def test_overlay_waterfall_payload_reset_key_includes_active_slice_range():
 
     assert p1 is not None and p1.plot_history is not None
     assert p2 is not None and p2.plot_history is not None
-    assert p1.plot_history.reset_key == ("radial", 4, True, (0.0, 1.0))
-    assert p2.plot_history.reset_key == ("radial", 4, True, (90.0, 1.0))
-    assert p1.plot_history.reset_key != p2.plot_history.reset_key
+    assert p1.plot_history.reset_key == ("radial", 4, True)
+    assert p2.plot_history.reset_key == ("radial", 4, True)
+    assert p1.plot_history.reset_key == p2.plot_history.reset_key
+
+
+def test_overlay_pinned_slice_recipe_and_live_cut_converge_in_one_history():
+    from xdart.gui.tabs.static_scan.display_overlay_utils import (
+        overlay_identity_for_widget,
+        overlay_projection_id_for_widget,
+        overlay_slice_legend_suffix,
+    )
+
+    frame = DuckFrame(idx=10)
+    frame.scan_info = {"monitor": 1.0}
+    frame.int_2d = IntegrationResult2D(
+        radial=np.linspace(0.5, 3.0, 4),
+        azimuthal=np.array([0.0, 1.0, 2.0, 3.0]),
+        intensity=np.tile(np.arange(4.0).reshape(1, 4), (4, 1)),
+        unit="q_A^-1",
+        azimuthal_unit="chi_deg",
+    )
+    store = PublicationStore()
+    store.upsert(publication_from_live_frame(frame))
+
+    center = {"value": 0.5}
+    widget = _int_widget(
+        source="2d", axis="radial", slice_axis="χ (°)",
+        slice_on=True, center=0.5, width=0.6,
+    )
+    widget.ui.slice_center = SimpleNamespace(value=lambda: center["value"])
+    axis_info = widget._plot_axis_info[0]
+    projection_id = overlay_projection_id_for_widget(
+        widget, axis_info, center=0.5, width=0.6)
+    reset_key, row_id = overlay_identity_for_widget(
+        widget, 10, axis_info=axis_info, projection_id=projection_id)
+    recipe = {
+        "label": 10,
+        "frame_idx": 10,
+        "axis_info": dict(axis_info),
+        "center": 0.5,
+        "width": 0.6,
+        "projection_id": projection_id,
+        "row_id": row_id,
+        "reset_key": reset_key,
+        "name": "scan_10" + overlay_slice_legend_suffix(
+            widget, axis_info, center=0.5, width=0.6),
+    }
+    widget._waterfall_history = None
+    widget._pinned_slice_cut_recipes = lambda: (recipe,)
+    widget._clear_pinned_slice_cuts = lambda clear_history=True: None
+
+    state = _int_state(store, mode=Mode.INT_2D, method="Overlay", ids=(10,))
+    adapter = _adapter(store, widget)
+    p1 = adapter.plot_payload(state)
+    widget._waterfall_history = p1.plot_history
+
+    assert p1.plot_history.count == 2
+    assert p1.plot_history.reset_key == ("radial", 4, True)
+    assert "q@χ=0.50±0.60" in p1.traces[0].label
+    assert "current" in p1.traces[1].label
+    np.testing.assert_allclose(p1.plot_history.rows[0], np.full(4, 0.5))
+
+    center["value"] = 2.5
+    p2 = adapter.plot_payload(state)
+
+    assert p2.plot_history.ids == p1.plot_history.ids
+    assert p2.plot_history.count == 2
+    np.testing.assert_allclose(p2.plot_history.rows[0], np.full(4, 0.5))
+    np.testing.assert_allclose(p2.plot_history.rows[1], np.full(4, 2.5))
 
 
 def test_plot_payload_sum_average_emit_n_traces_collapsed_at_render():

@@ -61,6 +61,12 @@ from .display_logic import (
     stitch_plot_payload, stitch_image_payload,
 )
 from .display_controllers import register_default_controllers
+from .display_overlay_utils import (
+    current_axis_info as overlay_current_axis_info,
+    overlay_identity_for_widget,
+    overlay_projection_id_for_widget,
+    overlay_slice_legend_suffix,
+)
 from xdart.utils.throttle import Coalescer
 
 QFileDialog = QtWidgets.QFileDialog
@@ -443,6 +449,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             'slice': 'integration window over χ (the other 2D axis): center / width',
             'slice_center': 'slice center',
             'slice_width': 'slice width',
+            'pinSlice': 'Pin the current slice cut into the overlay.',
             'wf_options': 'Waterfall / Overlay / Legend options.',
             'clear_1D': 'Clear accumulated overlay/waterfall curves.',
         }
@@ -485,7 +492,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         # Move the remaining 1D controls out of the bottom bar.
         ones = (self.ui.plotUnit, self.ui.slice, self.ui.slice_center,
-                self.ui.slice_width, self.ui.plotMethod, self.ui.wf_options,
+                self.ui.slice_width, self.ui.pinSlice,
+                self.ui.plotMethod, self.ui.wf_options,
                 self.ui.clear_1D)
         for w in ones:
             bot.removeWidget(w)
@@ -532,8 +540,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         (the slice is computed from the 2D cake).  The plain 1D controls
         (unit, Single/Overlay, Options, Legend, Clear) stay visible."""
         for w in (self.ui.shareAxis, self.ui.imageUnit, self.ui.slice,
-                  self.ui.slice_center, self.ui.slice_width):
-            w.setVisible(visible)
+                  self.ui.slice_center, self.ui.slice_width,
+                  getattr(self.ui, "pinSlice", None)):
+            if w is not None:
+                w.setVisible(visible)
 
     def _set_middle_1d_controls_visible(self, visible: bool):
         """Show/hide toolbar controls that are analysis controls, not viewer
@@ -645,6 +655,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # the render path delegates to it; reset at accumulator-lifecycle sites
         # such as clear_overlay and incompatible grid changes.
         self._waterfall_history = None
+        self._pinned_slice_cuts = {}
         self.viewer_rows_1d = viewer_rows_1d
         self.viewer_rows_2d = viewer_rows_2d
         self.bkg_1d = 0.
@@ -852,6 +863,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.slice.toggled.connect(self._update_slice_range)
         self.ui.slice_center.valueChanged.connect(self.update_plot_range)
         self.ui.slice_width.valueChanged.connect(self.update_plot_range)
+        pin_button = getattr(self.ui, "pinSlice", None)
+        if pin_button is not None:
+            pin_button.clicked.connect(self.pin_current_slice_cut)
         self._connect_wf_options_button()
 
         # Action buttons.  (The in-panel Save buttons were removed — use
@@ -3131,9 +3145,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.slice.setToolTip(tip)
             self.ui.slice_center.setToolTip(tip)
             self.ui.slice_width.setToolTip(tip)
+            if hasattr(self.ui, "pinSlice"):
+                self.ui.pinSlice.setToolTip(tip)
         else:
             self.ui.slice_center.setToolTip('slice center')
             self.ui.slice_width.setToolTip('slice width')
+            if hasattr(self.ui, "pinSlice"):
+                self.ui.pinSlice.setToolTip(
+                    'Pin the current slice cut into the overlay.')
 
         # Share Axis is keyed to the cake x-axis unit, not the currently
         # selected plotUnit row.  That lets it switch a χ plot back to Q/2θ/qip
@@ -3147,11 +3166,111 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                   and self._slice_2d_data_ready())
         self.ui.slice_center.setEnabled(active)
         self.ui.slice_width.setEnabled(active)
+        if hasattr(self.ui, "pinSlice"):
+            self.ui.pinSlice.setEnabled(active)
         if self.ui.slice.isChecked() and not self._slice_2d_data_ready():
             tip = self._slice_no_2d_tooltip()
             self.ui.slice.setToolTip(tip)
             self.ui.slice_center.setToolTip(tip)
             self.ui.slice_width.setToolTip(tip)
+            if hasattr(self.ui, "pinSlice"):
+                self.ui.pinSlice.setToolTip(tip)
+
+    def _slice_pin_selection(self):
+        ids = list(getattr(self, "idxs_1d", None) or getattr(self, "frame_ids", None) or [])
+        out = []
+        seen = set()
+        for idx in ids:
+            try:
+                idx = int(idx)
+            except (TypeError, ValueError):
+                continue
+            if idx in seen:
+                continue
+            seen.add(idx)
+            out.append(idx)
+        return tuple(out)
+
+    def _slice_pin_trace_name(self, frame_idx, axis_info, center, width):
+        scan = getattr(self, "scan", None)
+        scan_name = getattr(scan, "name", "") or "scan"
+        if getattr(scan, "series_average", False):
+            base = scan_name
+        elif scan_name and scan_name != "null_main":
+            base = f"{scan_name}_{frame_idx}"
+        else:
+            base = str(frame_idx)
+        return base + overlay_slice_legend_suffix(
+            self, axis_info, center=center, width=width, live=False)
+
+    def _pinned_slice_cut_recipes(self):
+        return tuple((getattr(self, "_pinned_slice_cuts", None) or {}).values())
+
+    def _clear_pinned_slice_cuts(self, *, clear_history=True):
+        registry = getattr(self, "_pinned_slice_cuts", None)
+        if registry is not None:
+            registry.clear()
+        if clear_history:
+            self._waterfall_history = None
+
+    def pin_current_slice_cut(self):
+        """Freeze the current slice center/width as overlay recipe rows."""
+        if not (getattr(self.ui, "slice", None) is not None
+                and self.ui.slice.isEnabled()
+                and self.ui.slice.isChecked()
+                and self._slice_2d_data_ready()):
+            return False
+        try:
+            method = self.ui.plotMethod.currentText()
+        except Exception:
+            method = ""
+        if method not in ("Overlay", "Waterfall"):
+            return False
+        frame_idxs = self._slice_pin_selection()
+        if not frame_idxs:
+            return False
+        axis_info = overlay_current_axis_info(self)
+        try:
+            center = float(self.ui.slice_center.value())
+            width = float(self.ui.slice_width.value())
+        except Exception:
+            return False
+        projection_id = overlay_projection_id_for_widget(
+            self, axis_info, center=center, width=width, live=False)
+        if projection_id is None:
+            return False
+        registry = getattr(self, "_pinned_slice_cuts", None)
+        if registry is None:
+            registry = {}
+            self._pinned_slice_cuts = registry
+        added = False
+        for frame_idx in frame_idxs:
+            reset_key, row_id = overlay_identity_for_widget(
+                self, frame_idx, axis_info=axis_info,
+                projection_id=projection_id)
+            if row_id in registry:
+                continue
+            registry[row_id] = {
+                "label": frame_idx,
+                "frame_idx": frame_idx,
+                "axis_info": dict(axis_info or {}),
+                "center": center,
+                "width": width,
+                "projection_id": projection_id,
+                "row_id": row_id,
+                "reset_key": reset_key,
+                "name": self._slice_pin_trace_name(
+                    frame_idx, axis_info, center, width),
+            }
+            added = True
+        if not added:
+            return False
+        request = getattr(self, "request_current_selection_repaint", None)
+        if callable(request):
+            request(reason="pin-slice")
+        else:
+            self.update()
+        return True
 
     def _on_share_axis_changed(self, checked):
         """Apply a Share Axis toggle: the full render + relink + the bottom-panel
@@ -3766,6 +3885,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.frame_names = []
         self.overlaid_idxs = []
         self._waterfall_history = None
+        clear_pins = getattr(self, "_clear_pinned_slice_cuts", None)
+        if callable(clear_pins):
+            clear_pins(clear_history=False)
 
     # ── Panel clears (safety net for empty selections) ────────────
     # When a render path has no data for the current selection it must

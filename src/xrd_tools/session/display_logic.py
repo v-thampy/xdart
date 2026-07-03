@@ -465,14 +465,14 @@ def qualified_frame_id(scan_key, frame_idx):
 
 def frame_index_from_qualified_id(row_id):
     """Return the numeric frame index from a legacy or scan-qualified row id."""
-    if isinstance(row_id, tuple) and len(row_id) == 2:
+    if isinstance(row_id, tuple) and len(row_id) >= 2:
         row_id = row_id[1]
     return int(row_id)
 
 
 def scan_key_from_qualified_id(row_id):
     """Return the scan key from a scan-qualified row id, else ``None``."""
-    if isinstance(row_id, tuple) and len(row_id) == 2:
+    if isinstance(row_id, tuple) and len(row_id) >= 2:
         return row_id[0]
     return None
 
@@ -490,9 +490,7 @@ def overlay_grid_reset_key(axis_kind, npt, needs_2d, slice_key=None):
         count = None if npt is None else int(npt)
     except (TypeError, ValueError):
         count = None
-    if needs_2d:
-        return (axis, count, True, slice_key)
-    return (axis, count, False)
+    return (axis, count, bool(needs_2d))
 
 
 def overlay_grid_keys_compatible(left, right):
@@ -513,9 +511,15 @@ def overlay_grid_keys_compatible(left, right):
                 return False
         except (TypeError, ValueError):
             return False
-    if bool(left_2d):
-        return (left[3] if len(left) > 3 else None) == (right[3] if len(right) > 3 else None)
     return True
+
+
+def _reset_keys_compatible(left, right):
+    if left == right:
+        return True
+    if isinstance(left, (tuple, list)) and isinstance(right, (tuple, list)):
+        return overlay_grid_keys_compatible(left, right)
+    return False
 
 
 def _dedup_key(value):
@@ -557,15 +561,19 @@ def _dedup_first(ids, names, rows, metadata=None):
     return ki, kn, kr, km
 
 
-def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names, label="", metadata=None):
+def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
+                         label="", metadata=None, replace_ids=()):
     """Pure, append-only Overlay/Waterfall accumulator keyed on ``reset_key`` (the
     payload-owned successor to ``update_plot_accumulator`` + the widget triple).
 
-    Append-only WITHIN one ``reset_key``: a partial / out-of-order / re-delivered
-    read can only ADD frames not yet captured -- it never shrinks the stack or
-    re-stacks a frame (the collapse/restack class, structurally precluded).  A
-    ``reset_key`` change (an incompatible grid, or a 1D<->2D-slice source change
-    -- NOT a mere selection change or compatible scan boundary) is the ONLY reset.
+    Append-only WITHIN one ``reset_key`` except for explicit ``replace_ids``: a
+    partial / out-of-order / re-delivered read can only ADD frames not yet
+    captured -- it never shrinks the stack or re-stacks a frame (the
+    collapse/restack class, structurally precluded).  ``replace_ids`` is reserved
+    for live mutable slice projections: the current unpinned cut updates in place
+    while pinned projections and ordinary frames remain append/dedupe-only.  A
+    ``reset_key`` change (an incompatible grid, or a 1D<->2D source change -- NOT
+    a mere selection change or compatible scan boundary) is the ONLY reset.
 
     Crucially the key is NOT the display generation: that bumps on every
     effective-selection change, and live auto-last grows the selection each tick, so
@@ -591,11 +599,14 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names, label
     if len(metadata) < len(ids):
         metadata.extend([None] * (len(ids) - len(metadata)))
     metadata = [_freeze_metadata(m) for m in metadata[:len(ids)]]
+    replace_keys = {_dedup_key(i) for i in (replace_ids or ())}
 
     # RESET: new accumulation identity (incompatible grid/source), no prior
     # history, or an empty incoming grid (nothing to anchor on -- keep the
     # incoming as-is).
-    if history is None or history.reset_key != reset_key or x.size == 0:
+    if (history is None
+            or not _reset_keys_compatible(history.reset_key, reset_key)
+            or x.size == 0):
         ki, kn, kr, km = _dedup_first(ids, names, rows, metadata)
         return WaterfallHistory(
             reset_key=reset_key, unit=unit, label=label, x=x,
@@ -613,35 +624,37 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names, label
     out_meta = list(getattr(history, "metadata", ()) or ())
     if len(out_meta) < len(out_ids):
         out_meta.extend(_freeze_metadata(None) for _ in range(len(out_ids) - len(out_meta)))
-    have = {_dedup_key(i) for i in history.ids}
+    out_rows = list(np.atleast_2d(base_rows).copy()) if base_rows.size else []
+    index_by_key = {_dedup_key(i): pos for pos, i in enumerate(out_ids)}
 
-    add = []
-    add_meta = []
     for i, n, r, m in zip(ids, names, rows, metadata):
         key = _dedup_key(i)
-        if key in have:
-            continue
-        have.add(key)
-        out_ids.append(i)
-        out_names.append(n)
-        add_meta.append(m)
         # The incoming row is on the shared grid already; reinterp defensively only
         # if the grid sample-count differs (e.g. a mid-generation Npts hiccup).
         r = np.asarray(r, dtype=float)
         if r.size != base_x.size and x.size == r.size and x.size > 0:
             r = np.interp(base_x, x, r)
-        add.append(r)
+        if key in index_by_key:
+            if key in replace_keys:
+                pos = index_by_key[key]
+                if 0 <= pos < len(out_rows):
+                    out_rows[pos] = r
+                    out_names[pos] = n
+                    out_meta[pos] = m
+            continue
+        index_by_key[key] = len(out_ids)
+        out_ids.append(i)
+        out_names.append(n)
+        out_meta.append(m)
+        out_rows.append(r)
 
-    if add:
-        add = np.atleast_2d(np.asarray(add, dtype=float))
-        new_rows = (np.vstack([base_rows, add]) if base_rows.size else add)
-    else:
-        new_rows = base_rows
+    new_rows = (np.atleast_2d(np.asarray(out_rows, dtype=float))
+                if out_rows else np.empty((0, base_x.size), dtype=float))
 
     return WaterfallHistory(
         reset_key=reset_key, unit=unit, label=label, x=base_x, rows=new_rows,
         ids=tuple(out_ids), names=tuple(out_names),
-        metadata=tuple([*out_meta, *add_meta]))
+        metadata=tuple(out_meta))
 
 
 def waterfall_display_rows(rows, ids, max_rows):

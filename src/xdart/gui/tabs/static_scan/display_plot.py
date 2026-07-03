@@ -38,6 +38,7 @@ from .display_overlay_utils import (
     overlay_grid_key_for_widget,
     overlay_grid_keys_match,
     overlay_identity_for_widget,
+    overlay_slice_legend_suffix,
     row_id_belongs_to_widget_scan,
 )
 
@@ -90,6 +91,7 @@ def update_plot_accumulator(
     new_ids,
     method,
     unit_changed,
+    replace_ids=(),
 ):
     """Pure Overlay/Waterfall plot accumulator transform.
 
@@ -100,6 +102,7 @@ def update_plot_accumulator(
     new_y = _as_plot_rows(new_y)
     names = list(prev_names or [])
     ids = list(prev_ids or [])
+    replace_set = set(replace_ids or ())
 
     overlay_action, _ = plan_overlay(
         method, unit_changed,
@@ -135,13 +138,23 @@ def update_plot_accumulator(
     plot_data = [prev_x, prev_y]
 
     for idx, frame_name, row in zip(new_ids, new_names, new_y):
-        if frame_name in names:
-            continue
         # Skip an empty-grid incoming frame: it carries no usable x axis and
         # would poison the accumulator.
         if np.size(new_x) == 0:
             continue
         old_x = np.asarray(plot_data[0], dtype=float)
+        if idx in ids:
+            if idx in replace_set:
+                pos = ids.index(idx)
+                if old_x.shape == new_x.shape and np.allclose(old_x, new_x):
+                    old_y = _as_plot_rows(plot_data[1]).copy()
+                    if 0 <= pos < old_y.shape[0]:
+                        old_y[pos] = row
+                        plot_data[1] = old_y
+                        names[pos] = frame_name
+            continue
+        if frame_name in names:
+            continue
         if np.size(old_x) == 0:
             # An empty x grid means the visible accumulator was cleared or never
             # initialized.  Start a fresh, internally consistent history instead
@@ -340,9 +353,7 @@ class DisplayPlotMixin:
         # When slicing is active, include slice parameters in frame names
         # so the same image with different slice ranges can be overlaid.
         if self.ui.slice.isEnabled() and self.ui.slice.isChecked():
-            center = self.ui.slice_center.value()
-            width = self.ui.slice_width.value()
-            suffix = f' [{center:.1f}\u00b1{width:.1f}]'
+            suffix = overlay_slice_legend_suffix(self)
             frame_names = [n + suffix for n in frame_names]
         return frame_names
 
@@ -620,15 +631,22 @@ class DisplayPlotMixin:
         # bodies below still own the array work + eviction filtering.
         current_method = self.ui.plotMethod.currentText()
         accumulating_method = current_method in ("Overlay", "Waterfall")
+        live_slice = bool(accumulating_method
+                          and self.ui.slice.isEnabled()
+                          and self.ui.slice.isChecked())
         plan_new_ids = (
-            tuple(overlay_identity_for_widget(self, idx)[1] for idx in self.idxs_1d)
+            tuple(overlay_identity_for_widget(self, idx, live_slice=live_slice)[1]
+                  for idx in self.idxs_1d)
             if accumulating_method else tuple(self.idxs_1d)
         )
         accum_row_ids = (
-            tuple(overlay_identity_for_widget(self, idx, npt=np.asarray(xdata).size)[1]
+            tuple(overlay_identity_for_widget(
+                self, idx, npt=np.asarray(xdata).size,
+                live_slice=live_slice)[1]
                   for idx in row_ids)
             if accumulating_method else tuple(row_ids)
         )
+        replace_accum_ids = accum_row_ids if live_slice else ()
         overlay_action, _ = plan_overlay(
             current_method, unit_changed,
             has_existing=len(self.overlaid_idxs) > 0,
@@ -675,8 +693,10 @@ class DisplayPlotMixin:
                     kept_names = self.build_plot_names(kept)
                     kept_accum_ids = tuple(
                         overlay_identity_for_widget(
-                            self, idx, npt=np.asarray(x_new).size)[1]
+                            self, idx, npt=np.asarray(x_new).size,
+                            live_slice=live_slice)[1]
                         for idx in kept)
+                    kept_replace_ids = kept_accum_ids if live_slice else ()
                     self.plot_data, self.frame_names, self.overlaid_idxs = (
                         update_plot_accumulator(
                             self.plot_data,
@@ -688,6 +708,7 @@ class DisplayPlotMixin:
                             kept_accum_ids,
                             current_method,
                             unit_changed,
+                            replace_ids=kept_replace_ids,
                         )
                     )
                 else:
@@ -702,6 +723,7 @@ class DisplayPlotMixin:
                             accum_row_ids,
                             current_method,
                             unit_changed,
+                            replace_ids=replace_accum_ids,
                         )
                     )
         elif overlay_action is OverlayAction.APPEND:
@@ -716,6 +738,7 @@ class DisplayPlotMixin:
                     accum_row_ids,
                     current_method,
                     unit_changed,
+                    replace_ids=replace_accum_ids,
                 )
             )
         else:
@@ -731,6 +754,7 @@ class DisplayPlotMixin:
                     accum_row_ids,
                     current_method,
                     unit_changed,
+                    replace_ids=replace_accum_ids,
                 )
             )
 
@@ -1259,13 +1283,18 @@ class DisplayPlotMixin:
             frame_ids = [frame_ids + ']']
 
         colors = self.get_colors()
-        self.curves = [self.plot.plot(
-            pen=color,
-            symbolBrush=color,
-            symbolPen=color,
-            symbolSize=4,
-            name=frame_id,
-        ) for (color, frame_id) in zip(colors, frame_ids)]
+        self.curves = []
+        for color, frame_id in zip(colors, frame_ids):
+            pen = color
+            if "· current" in str(frame_id):
+                pen = pg.mkPen(color=color, style=Qt.QtCore.Qt.DashLine)
+            self.curves.append(self.plot.plot(
+                pen=pen,
+                symbolBrush=color,
+                symbolPen=color,
+                symbolSize=4,
+                name=frame_id,
+            ))
 
         if not self.ui.showLegend.isChecked():
             self.legend.clear()

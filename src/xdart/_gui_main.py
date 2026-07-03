@@ -377,6 +377,13 @@ class Main(QMainWindow):
             QtGui.QKeySequence("Ctrl+Shift+A"),
             self._shortcut_toggle_write_mode,
         )
+        self.actionPinSliceCut = _menu_action(
+            self.ui.menuRun,
+            "actionPinSliceCut",
+            "Pin Slice Cut",
+            QtGui.QKeySequence("Ctrl+P"),
+            self._shortcut_pin_slice_cut,
+        )
 
     def _main_widget_shortcut(self, method_name):
         method = getattr(getattr(self, "main_widget", None), method_name, None)
@@ -396,6 +403,9 @@ class Main(QMainWindow):
 
     def _shortcut_toggle_write_mode(self):
         self._main_widget_shortcut("shortcut_toggle_write_mode")
+
+    def _shortcut_pin_slice_cut(self):
+        self._main_widget_shortcut("shortcut_pin_slice_cut")
 
     def _shortcut_load_settings(self):
         self._main_widget_shortcut("shortcut_load_settings")

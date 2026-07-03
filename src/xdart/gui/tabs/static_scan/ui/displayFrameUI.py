@@ -354,6 +354,16 @@ class Ui_Form(object):
 
         self.horizontalLayout.addWidget(self.slice_width)
 
+        self.pinSlice = QPushButton(self.plotToolBar)
+        self.pinSlice.setObjectName(u"pinSlice")
+        sizePolicy1.setHeightForWidth(self.pinSlice.sizePolicy().hasHeightForWidth())
+        self.pinSlice.setSizePolicy(sizePolicy1)
+        self.pinSlice.setMinimumSize(QSize(48, 0))
+        self.pinSlice.setMaximumSize(QSize(56, 16777215))
+        self.pinSlice.setFocusPolicy(Qt.StrongFocus)
+
+        self.horizontalLayout.addWidget(self.pinSlice)
+
         self.horizontalSpacer_4 = QSpacerItem(80, 20, QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Minimum)
 
         self.horizontalLayout.addItem(self.horizontalSpacer_4)
@@ -424,7 +434,8 @@ class Ui_Form(object):
         QWidget.setTabOrder(self.imageUnit, self.plotUnit)
         QWidget.setTabOrder(self.plotUnit, self.slice_center)
         QWidget.setTabOrder(self.slice_center, self.slice_width)
-        QWidget.setTabOrder(self.slice_width, self.plotMethod)
+        QWidget.setTabOrder(self.slice_width, self.pinSlice)
+        QWidget.setTabOrder(self.pinSlice, self.plotMethod)
         QWidget.setTabOrder(self.plotMethod, self.yOffset)
 
         self.retranslateUi(Form)
@@ -483,6 +494,10 @@ class Ui_Form(object):
 #endif // QT_CONFIG(accessibility)
 #if QT_CONFIG(tooltip)
         self.slice_width.setToolTip(QCoreApplication.translate("Form", u"slice width", None))
+#endif // QT_CONFIG(tooltip)
+        self.pinSlice.setText(QCoreApplication.translate("Form", u"Pin", None))
+#if QT_CONFIG(tooltip)
+        self.pinSlice.setToolTip(QCoreApplication.translate("Form", u"Pin the current slice cut into the overlay.", None))
 #endif // QT_CONFIG(tooltip)
         self.plotMethod.setItemText(0, QCoreApplication.translate("Form", u"Single", None))
         self.plotMethod.setItemText(1, QCoreApplication.translate("Form", u"Overlay", None))

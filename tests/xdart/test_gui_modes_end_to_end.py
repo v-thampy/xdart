@@ -1877,7 +1877,7 @@ def test_int_plot_slice_characterizes_update_plot_state(widget):
     df.update()
 
     state = _plot_state(df)
-    assert state["names"] == ("scan_0 [0.0±10.0]",)
+    assert state["names"] == ("scan_0 · χ@q=0.00±10.00",)
     assert state["y"].shape == (1, 4)
     assert state["x_axis"][0] == "χ"
 
@@ -2880,6 +2880,7 @@ def test_slice_controls_wait_for_binned_data(widget):
     assert "no 2D data yet" in df.ui.slice.toolTip()
     assert not df.ui.slice_center.isEnabled()
     assert not df.ui.slice_width.isEnabled()
+    assert not df.ui.pinSlice.isEnabled()
 
     # A restored/session-driven checked state before the cake exists must no-op,
     # not unpack binned_data=None.
@@ -2892,6 +2893,7 @@ def test_slice_controls_wait_for_binned_data(widget):
     assert df.ui.slice.isEnabled()
     assert df.ui.slice_center.isEnabled()
     assert df.ui.slice_width.isEnabled()
+    assert df.ui.pinSlice.isEnabled()
 
     df.show_slice_overlay()
     assert df.overlay is not None

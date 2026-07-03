@@ -44,6 +44,7 @@ from .display_overlay_utils import (
     overlay_grid_key_for_widget,
     overlay_grid_keys_match,
     overlay_identity_for_widget,
+    overlay_slice_legend_suffix,
     slice_enabled as _overlay_slice_enabled,
 )
 
@@ -250,6 +251,22 @@ class PublicationDisplayAdapter:
     def _empty_plot_payload(self) -> PlotPayload:
         return PlotPayload(axis_x=Axis(label="", unit=""), traces=())
 
+    def _publication_for_label(self, label):
+        key = _label_key(label)
+        publication = self._items.get(key)
+        if publication is not None:
+            return publication
+        store = self._store
+        if store is None:
+            return None
+        try:
+            publication = store.get(key)
+        except Exception:
+            publication = None
+        if publication is not None:
+            self._items[key] = publication
+        return publication
+
     def _plot_publication_missing(self, publication, *, needs_2d: bool) -> bool:
         if publication is None:
             return True
@@ -284,7 +301,7 @@ class PublicationDisplayAdapter:
             _label_key(label)
             for label in labels
             if self._plot_publication_missing(
-                self._items.get(_label_key(label)),
+                self._publication_for_label(label),
                 needs_2d=needs_2d,
             )
         ]
@@ -307,7 +324,7 @@ class PublicationDisplayAdapter:
         still_missing = [
             label for label in missing
             if self._plot_publication_missing(
-                self._items.get(label),
+                self._publication_for_label(label),
                 needs_2d=needs_2d,
             )
         ]
@@ -894,24 +911,60 @@ class PublicationDisplayAdapter:
         needs_2d = (source == "2d") or (
             source == "1d_2d" and _overlay_slice_enabled(widget)
         )
+        slice_active = bool(needs_2d and _overlay_slice_enabled(widget))
         planned_reset_key = overlay_grid_key_for_widget(widget, axis_info=axis_info)
+
+        if (prior is not None
+                and not overlay_grid_keys_match(prior.reset_key, planned_reset_key)):
+            clear_pins = getattr(widget, "_clear_pinned_slice_cuts", None)
+            if callable(clear_pins):
+                clear_pins(clear_history=False)
+
+        pinned_recipes = tuple(
+            getattr(widget, "_pinned_slice_cut_recipes", lambda: ())()
+        )
+        if pinned_recipes:
+            incompatible_pin = any(
+                recipe.get("reset_key") is not None
+                and not overlay_grid_keys_match(
+                    recipe.get("reset_key"), planned_reset_key)
+                for recipe in pinned_recipes
+            )
+            if incompatible_pin:
+                clear_pins = getattr(widget, "_clear_pinned_slice_cuts", None)
+                if callable(clear_pins):
+                    clear_pins(clear_history=False)
+                pinned_recipes = ()
+
+        hydrate_labels = list(state.render_ids)
+        hydrate_labels.extend(recipe.get("label") for recipe in pinned_recipes)
+        if hydrate_labels:
+            self._hydrate_missing_plot_subset(hydrate_labels, needs_2d=needs_2d)
 
         ref_x = None
         axis = None
         reset_key = None
         ids, names, rows, metadata = [], [], [], []
-        for label in state.render_ids:
-            pub = self._items.get(_label_key(label))
+
+        def append_row(label, *, recipe=None, live=False):
+            nonlocal ref_x, axis, reset_key
+            pub = self._publication_for_label(label)
             if pub is None:
-                continue
+                return None
             view = pub.view
-            if not needs_2d:
+            row_axis_info = recipe.get("axis_info", axis_info) if recipe else axis_info
+            row_center = recipe.get("center") if recipe else None
+            row_width = recipe.get("width") if recipe else None
+            row_needs_2d = needs_2d
+            if recipe is not None:
+                row_needs_2d = True
+            if not row_needs_2d:
                 if not view.has_1d or publication_has_1d_errors(pub):
-                    continue
+                    return None
                 x = np.asarray(view.axis_1d.values, dtype=float)
                 y = np.asarray(view.intensity_1d, dtype=float)
                 if x.shape != y.shape:
-                    continue
+                    return None
                 y = self._normalize(y, pub.metadata_raw)
                 x, conv_axis = self._apply_plot_unit_1d(
                     x, str(getattr(view.axis_1d, "unit", "") or ""), pub)
@@ -919,10 +972,12 @@ class PublicationDisplayAdapter:
                              else _axis_for_publication(view.axis_1d))
             else:
                 if not view.has_2d or publication_has_2d_errors(pub):
-                    continue
-                projected = self._slice_1d_from_2d(view, pub, axis_info)
+                    return None
+                projected = self._slice_1d_from_2d(
+                    view, pub, row_axis_info,
+                    slice_center=row_center, slice_width=row_width)
                 if projected is None:
-                    continue
+                    return None
                 x, y, this_axis = projected
             if ref_x is None:
                 ref_x = x
@@ -930,14 +985,44 @@ class PublicationDisplayAdapter:
             elif x.shape != ref_x.shape or not np.allclose(x, ref_x, equal_nan=True):
                 y = np.interp(ref_x, x, y)
                 x = ref_x
-            row_grid_key, row_id = overlay_identity_for_widget(
-                widget, label, npt=np.asarray(ref_x).size, axis_info=axis_info)
+            if recipe is not None:
+                row_id = recipe.get("row_id")
+                projection_id = recipe.get("projection_id")
+            else:
+                projection_id = None
+                row_id = None
+            row_grid_key, computed_row_id = overlay_identity_for_widget(
+                widget, label, npt=np.asarray(ref_x).size,
+                axis_info=row_axis_info, projection_id=projection_id,
+                live_slice=bool(live and slice_active))
+            if row_id is None:
+                row_id = computed_row_id
             if reset_key is None:
                 reset_key = row_grid_key
             ids.append(row_id)
-            names.append(_trace_name(pub, widget))
+            if recipe is not None and recipe.get("name"):
+                name = recipe["name"]
+            elif recipe is not None or (row_needs_2d and _overlay_slice_enabled(widget)):
+                name = _trace_name(pub, widget) + overlay_slice_legend_suffix(
+                    widget, row_axis_info, center=row_center, width=row_width,
+                    live=live)
+            else:
+                name = _trace_name(pub, widget)
+            names.append(name)
             rows.append(y)
             metadata.append(dict(pub.metadata_raw or {}))
+            return row_id
+
+        for recipe in pinned_recipes:
+            label = recipe.get("label")
+            if label is not None:
+                append_row(label, recipe=recipe, live=False)
+
+        replace_ids = []
+        for label in state.render_ids:
+            row_id = append_row(label, live=slice_active)
+            if row_id is not None and slice_active:
+                replace_ids.append(row_id)
 
         if ref_x is None:
             # No resident 1D frame this render: PRESERVE the prior accumulator (the
@@ -954,7 +1039,7 @@ class PublicationDisplayAdapter:
         history = accumulate_waterfall(
             prior, reset_key=reset_key, unit=unit, label=label,
             x=ref_x, rows=np.asarray(rows, dtype=float), ids=ids, names=names,
-            metadata=metadata)
+            metadata=metadata, replace_ids=replace_ids)
         return self._history_to_payload(history)
 
     def _history_to_payload(self, history):
@@ -1017,7 +1102,15 @@ class PublicationDisplayAdapter:
         idx = 1 if want_tth else 0
         return new_values, Axis(label=x_labels_2D[idx], unit=x_units_2D[idx])
 
-    def _slice_1d_from_2d(self, view, publication, axis_info):
+    def _slice_1d_from_2d(
+        self,
+        view,
+        publication,
+        axis_info,
+        *,
+        slice_center=None,
+        slice_width=None,
+    ):
         """Project a 1D curve from the active-mode 2D cake (the legacy
         ``get_int_1d`` 2D path), reducing over the slice axis.
 
@@ -1043,13 +1136,21 @@ class PublicationDisplayAdapter:
             convert = True
         x = np.asarray(getattr(x_axis, "values", None), dtype=float)
         inds: Any = slice(None)
-        if _slice_enabled(self._widget) and slice_vals is not None:
+        if (_slice_enabled(self._widget) or slice_center is not None
+                or slice_width is not None) and slice_vals is not None:
             slice_vals = np.asarray(slice_vals, dtype=float)
-            try:
-                center = float(self._widget.ui.slice_center.value())
-                width = float(self._widget.ui.slice_width.value())
-            except Exception:
-                center = width = None
+            if slice_center is None:
+                try:
+                    slice_center = float(self._widget.ui.slice_center.value())
+                except Exception:
+                    slice_center = None
+            if slice_width is None:
+                try:
+                    slice_width = float(self._widget.ui.slice_width.value())
+                except Exception:
+                    slice_width = None
+            center = slice_center
+            width = slice_width
             if center is not None and width is not None and slice_vals.size:
                 inds = (center - width <= slice_vals) & (slice_vals <= center + width)
         # nanmean_slice: None when the slice selects 0 bins, and no
@@ -1071,19 +1172,22 @@ class PublicationDisplayAdapter:
             return None
         return x, y, this_axis
 
-    def _integration_trace_label(self, publication, axis_info) -> str:
+    def _integration_trace_label(
+        self,
+        publication,
+        axis_info,
+        *,
+        slice_center=None,
+        slice_width=None,
+        live=False,
+    ) -> str:
         """Trace name with the legacy slice-range suffix when slicing a 2D
         projection (``build_plot_names`` parity)."""
         name = _trace_name(publication, self._widget)
         if _slice_enabled(self._widget) and axis_info.get("source") in ("2d", "1d_2d"):
-            try:
-                c = float(self._widget.ui.slice_center.value())
-                w = float(self._widget.ui.slice_width.value())
-                # Match the legacy build_plot_names / _loaded_1d_overlay_labels
-                # suffix EXACTLY: one decimal, U+00B1 (e.g. " [0.0±10.0]").
-                name = f"{name} [{c:.1f}±{w:.1f}]"
-            except Exception:
-                pass
+            name = name + overlay_slice_legend_suffix(
+                self._widget, axis_info, center=slice_center,
+                width=slice_width, live=live)
         return name
 
     def _can_use_native_1d_axis(self, state) -> bool:

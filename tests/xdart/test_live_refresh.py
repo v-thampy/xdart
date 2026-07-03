@@ -5090,7 +5090,7 @@ def _plot_host(method="Overlay"):
     return host
 
 
-def test_overlay_history_reset_key_includes_active_slice_range():
+def test_overlay_history_reset_key_excludes_active_slice_range():
     center = {"value": 0.0}
     width = {"value": 1.0}
     host = _plot_host("Overlay")
@@ -5104,9 +5104,62 @@ def test_overlay_history_reset_key_includes_active_slice_range():
     center["value"] = 5.0
     key2 = host._overlay_history_reset_key()
 
-    assert key1 == ("radial", None, True, (0.0, 1.0))
-    assert key2 == ("radial", None, True, (5.0, 1.0))
-    assert key1 != key2
+    assert key1 == ("radial", None, True)
+    assert key2 == ("radial", None, True)
+    assert key1 == key2
+
+
+def test_pin_current_slice_cut_dedupes_projection_and_requests_repaint():
+    class _Slice:
+        def __init__(self):
+            self._checked = True
+            self._enabled = True
+
+        def isChecked(self):
+            return self._checked
+
+        def isEnabled(self):
+            return self._enabled
+
+        def text(self):
+            return "χ (c/w)"
+
+    center = {"value": 0.0}
+    repaint = []
+    host = SimpleNamespace(
+        scan=SimpleNamespace(name="scan", series_average=False, gi=False),
+        idxs_1d=[3],
+        frame_ids=["3"],
+        _pinned_slice_cuts={},
+        _plot_axis_info=[{"source": "2d", "slice_axis": "χ (°)", "axis": "radial"}],
+        ui=SimpleNamespace(
+            plotUnit=SimpleNamespace(currentIndex=lambda: 0,
+                                     currentText=lambda: "q (Å⁻¹)"),
+            imageUnit=SimpleNamespace(currentText=lambda: "Q-Chi"),
+            plotMethod=SimpleNamespace(currentText=lambda: "Overlay"),
+            slice=_Slice(),
+            slice_center=SimpleNamespace(value=lambda: center["value"]),
+            slice_width=SimpleNamespace(value=lambda: 0.5),
+        ),
+        _slice_2d_data_ready=lambda: True,
+        request_current_selection_repaint=lambda **_: repaint.append("paint"),
+    )
+    for name in (
+        "_slice_pin_selection",
+        "_slice_pin_trace_name",
+        "_pinned_slice_cut_recipes",
+        "_clear_pinned_slice_cuts",
+        "pin_current_slice_cut",
+    ):
+        setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
+
+    assert host.pin_current_slice_cut() is True
+    assert host.pin_current_slice_cut() is False
+    center["value"] = 1.0
+    assert host.pin_current_slice_cut() is True
+
+    assert len(host._pinned_slice_cuts) == 2
+    assert repaint == ["paint", "paint"]
 
 
 def test_update_plot_accumulator_replaces_for_single_sum_average():
@@ -5478,6 +5531,36 @@ def test_norm_update_real_channel_change_resets_overlay_history():
     assert host.frame_names == []
     assert host.overlaid_idxs == []
     assert host._waterfall_history is None
+
+
+def test_norm_update_real_channel_change_preserves_pinned_slice_registry():
+    calls = []
+
+    class _Column:
+        def sum(self):
+            return 10.0
+
+    pins = {("scan", 1, ("chi", 0.0, 1.0)): {"label": 1}}
+    host = SimpleNamespace(
+        normChannel=None,
+        _last_applied_norm_channel=None,
+        get_normChannel=lambda: "I0",
+        scan=SimpleNamespace(scan_data={"I0": _Column()}),
+        plot_data=[np.array([0.0, 1.0]), np.ones((1, 2))],
+        frame_names=["scan_1"],
+        overlaid_idxs=[1],
+        _waterfall_history=SimpleNamespace(count=1),
+        _pinned_slice_cuts=pins,
+        update=lambda: calls.append("update"),
+    )
+    host.normUpdate = MethodType(displayFrameWidget.normUpdate, host)
+
+    host.normUpdate()
+
+    assert calls == ["update"]
+    assert host._waterfall_history is None
+    assert host._pinned_slice_cuts is pins
+    assert len(host._pinned_slice_cuts) == 1
 
 
 def test_overlay_mode_entry_seeds_history_from_displayed_single_trace():
