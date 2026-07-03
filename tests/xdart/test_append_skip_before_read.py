@@ -392,6 +392,47 @@ def test_zero_processed_already_processed_frames_logs_info(caplog, tmp_path):
     assert labels == [expected]
 
 
+# ── MEM-1c: series-average + Append must not silently produce nothing ────────
+def test_series_average_append_refuses_when_averaged_output_exists(
+        monkeypatch, tmp_path):
+    worker = _bare_worker(tmp_path)
+    worker.series_average = True           # collapses every source frame -> #1
+    monkeypatch.setattr(worker, "_append_run_start_scan_names", lambda: ["scan"])
+    worker._append_skip_frames_by_scan = {"scan": {1}}   # averaged output on disk
+
+    blocker = worker._series_average_append_blocker()
+    assert blocker is not None
+    assert "already exists" in blocker
+    assert "Replace" in blocker            # actionable remedy
+
+
+def test_series_average_append_allowed_when_output_absent(monkeypatch, tmp_path):
+    worker = _bare_worker(tmp_path)
+    worker.series_average = True
+    monkeypatch.setattr(worker, "_append_run_start_scan_names", lambda: ["scan"])
+    worker._append_skip_frames_by_scan = {"scan": set()}  # fresh target
+
+    assert worker._series_average_append_blocker() is None
+
+
+def test_non_series_average_append_never_blocked(monkeypatch, tmp_path):
+    worker = _bare_worker(tmp_path)        # series_average=False (default)
+    monkeypatch.setattr(worker, "_append_run_start_scan_names", lambda: ["scan"])
+    worker._append_skip_frames_by_scan = {"scan": {1, 2, 3}}
+
+    assert worker._series_average_append_blocker() is None
+
+
+def test_series_average_replace_mode_not_blocked(monkeypatch, tmp_path):
+    worker = _bare_worker(tmp_path)
+    worker.series_average = True
+    worker.write_mode = "Overwrite"        # not Append => append-skip disabled
+    monkeypatch.setattr(worker, "_append_run_start_scan_names", lambda: ["scan"])
+    worker._append_skip_frames_by_scan = {"scan": {1}}
+
+    assert worker._series_average_append_blocker() is None
+
+
 def test_zero_processed_real_failure_still_warns(caplog, tmp_path):
     worker = _bare_worker(tmp_path)
     labels = []

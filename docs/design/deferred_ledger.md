@@ -440,3 +440,37 @@ wants a visual regression pass at all three presets.
 **STATUS (Jun 30): DEFERRED** — logged from the pill/status-font session; the
 readiness-bar specificity + the pill rounding were fixed point-wise, the uniform
 scale is the follow-up.
+
+## MEM-1 memory-load review — post-tag deferred findings (Jul 3, 2026)
+
+From the 2026-07-02 high-load memory review (`~/repos/perf/remediation_memory_load_review_2026-07-02.md`).
+MEM-1a–d (the OOM triad + GI cake leak + series-avg data-loss + viewer select-all
+OOM) landed this cycle (see `live_findings_ledger.md`).  The findings below are
+**deferred post-tag** — real, but either CPU/latency (not OOM) or a lower-severity
+retention that does not gate the release:
+
+- **[4] O(n²) waterfall accumulator** — `xrd_tools/session/display_logic.py`
+  `accumulate_waterfall` `np.vstack([base_rows, add])` re-copies the whole
+  trace stack every flush (~40–200 MB re-copy near frame 5000).  Trace-sized, a
+  late-scan GUI-thread stutter, NOT OOM.  Fix: geometric-growth / preallocated
+  ring buffer, stack once at render.
+- **[5] 4× float64 raw upcast at ingest** — `image_wrangler_thread.get_next_image`
+  reads each raw as `np.asarray(read_image(...), dtype=float)`, quadrupling an
+  18 MB uint16 frame to ~64 MB the instant it enters the pipeline (amplifies
+  every in-flight/retained raw, incl. the MEM-1a window).  Fix: keep native
+  dtype; let pyFAI upcast internally in the integrator.
+- **[14] O(n²) `_data_snapshot` probes on "Overall"** — once live auto-last
+  grows the selection to the whole scan, `display_controllers._data_snapshot`
+  probes the store for EVERY frame each tick → O(n) probes × n ticks.  CPU/
+  latency, worsens late-scan; not OOM.
+- **[15] PublicationStore tier-0 eviction ignores persist-before-evict** —
+  `frame_publication.py` tier-0 `_max_items` pops `next(iter(_items))` with no
+  persisted/heavy check, so past 512 live frames it can drop a not-yet-saved
+  publication → a blank/undisplayable frame on scroll-back (display-cache gap,
+  not OOM).  Fix: honor the persisted gate like the other two stores.
+
+**Note:** MEM-1a's peak-RSS win is only visible UNDER BACKPRESSURE (GUI drain
+behind the producer).  A headless benchmark that keeps the GUI pacing shows
+steady-state peak ~9 GB largely unchanged; the bound is demonstrated by the
+stalled-drain unit test (`test_mem1_oom_bounds`), and the real live win needs a
+sustained fast live run to confirm.

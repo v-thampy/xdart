@@ -63,10 +63,18 @@ def remember_viewer_raw_lru(
     keep_set = {int(k) for k in keep}
     evicted = []
     while len(order) > limit:
+        # Prefer to evict the oldest NON-kept payload so a currently displayed
+        # label survives.
         stale = next((candidate for candidate in order
                       if candidate not in keep_set), None)
         if stale is None:
-            break
+            # MEM-1d: every remaining entry is in the keep-set yet we are STILL
+            # over the cap — e.g. Cmd+A select-all on a 5000-frame stack makes
+            # the keep-set cover everything, which would disable eviction and
+            # hydrate ~64 MB/frame until OOM.  The cap WINS: drop the oldest kept
+            # label.  It renders from whatever is resident and re-hydrates on
+            # scroll (the store-first path), instead of OOMing on one keystroke.
+            stale = order[0]
         order.remove(stale)
         payload = viewer_rows_2d.get(stale)
         if payload is not None:

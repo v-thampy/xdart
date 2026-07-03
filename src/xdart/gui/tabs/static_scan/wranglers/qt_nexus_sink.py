@@ -358,12 +358,22 @@ class QtNexusSink:
         return dropped_1d, dropped_2d
 
     def _record_store_mode_groups(self, labels, dropped=None):
+        """Split each frame's modes into (persisted_groups, dropped_groups).
+
+        Persisted groups are the modes actually written this flush.  Dropped
+        groups are modes the publication gate intentionally did NOT write (e.g.
+        an all-dummy GI 2D cake below the critical angle).  The two are handled
+        differently downstream: persisted modes are hydratable from disk;
+        dropped modes must be marked DROPPED (heavy payload released, NOT marked
+        persisted — there is nothing on disk to hydrate).  MEM-1b.
+        """
         frames = getattr(self._scan, "frames", None)
         if frames is None:
-            return {}
+            return {}, {}
         mode_1d, mode_2d = self._active_mode_keys()
         dropped_1d, dropped_2d = self._dropped_labels_by_dimension(dropped)
-        groups: dict[tuple[tuple[str, str], ...], list[int]] = {}
+        persisted: dict[tuple[tuple[str, str], ...], list[int]] = {}
+        discarded: dict[tuple[tuple[str, str], ...], list[int]] = {}
         from xrd_tools.io.nexus_record import frame_record_from_live_frame
         for label in labels:
             try:
@@ -373,7 +383,6 @@ class QtNexusSink:
                 logger.debug("could not inspect persisted frame %s", label,
                              exc_info=True)
                 continue
-            modes: list[tuple[str, str]] = []
             try:
                 record = frame_record_from_live_frame(
                     live, active_mode_1d=mode_1d, active_mode_2d=mode_2d,
@@ -382,21 +391,30 @@ class QtNexusSink:
                 logger.debug("could not build persisted-mode record for %s", label,
                              exc_info=True)
                 continue
-            if idx not in dropped_1d:
-                modes.extend(("1d", mode) for mode in record.results_1d)
-            if idx not in dropped_2d:
-                modes.extend(("2d", mode) for mode in record.results_2d)
-            if modes:
-                groups.setdefault(tuple(modes), []).append(idx)
-        return groups
+            kept: list[tuple[str, str]] = []
+            gone: list[tuple[str, str]] = []
+            (gone if idx in dropped_1d else kept).extend(
+                ("1d", mode) for mode in record.results_1d)
+            (gone if idx in dropped_2d else kept).extend(
+                ("2d", mode) for mode in record.results_2d)
+            if kept:
+                persisted.setdefault(tuple(kept), []).append(idx)
+            if gone:
+                discarded.setdefault(tuple(gone), []).append(idx)
+        return persisted, discarded
 
     def _mark_record_store_persisted(self, labels, dropped=None) -> None:
         if not labels or self._record_store is None:
             return
-        for modes, mode_labels in self._record_store_mode_groups(
+        persisted, discarded = self._record_store_mode_groups(
             labels, dropped=dropped,
-        ).items():
+        )
+        for modes, mode_labels in persisted.items():
             self._record_store.mark_persisted(mode_labels, modes=modes)
+        # MEM-1b: consciously-dropped modes release their heavy payload without
+        # ever being promised as persisted/hydratable.
+        for modes, mode_labels in discarded.items():
+            self._record_store.mark_dropped(mode_labels, modes=modes)
 
     def flush(self, *, force=False) -> None:
         """Persist buffered output: h5pool-bracketed ``_save_to_nexus`` (skipped

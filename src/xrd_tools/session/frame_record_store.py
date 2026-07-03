@@ -96,6 +96,23 @@ def _thin_record(record: FrameRecord) -> FrameRecord:
     )
 
 
+def _thin_modes(record: FrameRecord, modes: set[_ModeKey]) -> FrameRecord:
+    """Drop the array payloads of ONLY ``modes``; every other mode is kept as-is."""
+    return FrameRecord(
+        label=record.label,
+        results_1d={
+            mode: (_thin_view(view) if ("1d", mode) in modes else view)
+            for mode, view in record.results_1d.items()
+        },
+        results_2d={
+            mode: (_thin_view(view) if ("2d", mode) in modes else view)
+            for mode, view in record.results_2d.items()
+        },
+        active_mode_1d=record.active_mode_1d,
+        active_mode_2d=record.active_mode_2d,
+    )
+
+
 def _merge_records(existing: FrameRecord, incoming: FrameRecord) -> FrameRecord:
     if existing.label != incoming.label:
         raise ValueError(
@@ -262,6 +279,45 @@ class FrameRecordStore:
                     persisted.update(requested_modes.intersection(valid_modes))
                 if not persisted:
                     self._persisted_modes.pop(label, None)
+            self._enforce_bounds_locked()
+
+    def mark_dropped(
+        self,
+        labels: Iterable[int | str] | int | str,
+        *,
+        modes: Iterable[_ModeKey] | _ModeKey,
+    ) -> None:
+        """Mark ``modes`` on ``labels`` as CONSCIOUSLY DISCARDED at write (MEM-1b).
+
+        Unlike :meth:`mark_persisted`, this makes NO promise that the mode is on
+        disk — it was intentionally not written (e.g. an all-dummy GI 2D cake
+        below the critical angle), so hydration must never be attempted for it
+        and it is NEVER added to ``_persisted_modes`` (``is_persisted`` stays
+        honest).  It drops that mode's heavy array payload from the record right
+        away: otherwise the cake would pin forever, because
+        ``_label_heavy_payload_persisted_locked`` can never clear a mode that is
+        not — and must not be — persisted (the leak).  Light labels/axes/
+        metadata and every other mode on the frame are left intact.
+        """
+        if isinstance(labels, (str, bytes)):
+            iterable = (labels,)
+        else:
+            try:
+                iterable = tuple(labels)  # type: ignore[arg-type]
+            except TypeError:
+                iterable = (labels,)  # type: ignore[assignment]
+        requested = _normalize_mode_keys(modes)
+        if not requested:
+            return
+        with self._lock:
+            for label in iterable:
+                record = self._records.get(label)
+                if record is None:
+                    continue
+                thinned = _thin_modes(record, requested)
+                self._records[label] = thinned
+                if not _has_heavy_payload(thinned):
+                    self._drop_heavy_label_locked(label)
             self._enforce_bounds_locked()
 
     def get(self, label: int | str) -> FrameRecord | None:

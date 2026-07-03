@@ -398,10 +398,14 @@ def test_qt_sink_marks_only_written_record_store_modes(tmp_path, monkeypatch):
 
     class _Store:
         def __init__(self):
-            self.calls = []
+            self.persisted = []
+            self.dropped = []
 
         def mark_persisted(self, labels, *, modes=None):
-            self.calls.append((tuple(labels), tuple(modes or ())))
+            self.persisted.append((tuple(labels), tuple(modes or ())))
+
+        def mark_dropped(self, labels, *, modes=None):
+            self.dropped.append((tuple(labels), tuple(modes or ())))
 
     monkeypatch.setattr(iwt, "_get_h5pool", lambda: _Pool())
 
@@ -424,7 +428,11 @@ def test_qt_sink_marks_only_written_record_store_modes(tmp_path, monkeypatch):
     monkeypatch.setattr(scan, "_save_to_nexus", fake_save)
     sink.flush(force=True)
 
-    assert store.calls == [((0,), (("1d", "default"),))]
+    # Only the WRITTEN 1D is promised persisted (hydratable)...
+    assert store.persisted == [((0,), (("1d", "default"),))]
+    # ...and the publication-DROPPED 2D cake is marked DROPPED (MEM-1b): its
+    # heavy payload is released without ever promising a hydratable on-disk copy.
+    assert store.dropped == [((0,), (("2d", "default"),))]
 
 
 def test_sink_persist_before_evict_no_unsaved_eviction(tmp_path):

@@ -918,6 +918,31 @@ class imageThread(wranglerThread):
                 self._warn_append_snapshot_failed(scan_name, out_path, exc)
                 cache[scan_name] = set()
 
+    def _series_average_append_blocker(self):
+        """MEM-1c: refuse a silently-empty series-average Append run.
+
+        ``_append_output_number`` collapses EVERY source frame of a series
+        average to output frame 1.  In Append mode, if that averaged output
+        already exists on disk, ``_should_skip_before_read`` would skip every
+        source frame and the run would produce NOTHING — a silent no-op that
+        only logs a benign INFO line and looks like success.  Detect it up
+        front (the append-skip snapshots are already primed) and return an
+        actionable reason so the run is refused loudly instead.  Returns the
+        user-facing message, or ``None`` when the run may proceed.
+        """
+        if not (getattr(self, "series_average", False)
+                and self._append_skip_enabled()):
+            return None
+        collapsed = self._append_output_number(None)   # series-average => 1
+        for scan_name in self._append_run_start_scan_names():
+            if collapsed in self._append_skip_snapshot(scan_name):
+                return (
+                    f"Averaged output already exists for '{scan_name}' — the "
+                    "whole series would be skipped and nothing written.  "
+                    "Switch write mode to Replace, or clear the target, before "
+                    "running a series average.")
+        return None
+
     def _append_skip_snapshot(self, scan_name):
         """Return this run's append-skip frame snapshot for *scan_name*.
 
@@ -1006,6 +1031,24 @@ class imageThread(wranglerThread):
         logger.debug('Execution policy: batch_mode=%s  batch=streaming  live=%s',
                      self.batch_mode, self._live_execution())
         self._prime_append_skip_snapshots_for_run()
+
+        # MEM-1c: refuse a series-average Append run whose averaged output
+        # already exists (would silently skip everything and write nothing).
+        # Only series-average runs can collapse this way, so gate the check on
+        # it (also keeps non-series-average paths free of the lookup).
+        _blocker = (self._series_average_append_blocker()
+                    if getattr(self, "series_average", False) else None)
+        if _blocker:
+            logger.error("run refused: %s", _blocker)
+            _emit = getattr(getattr(self, "showLabel", None), "emit", None)
+            if callable(_emit):
+                try:
+                    _emit(_blocker)
+                except Exception:
+                    logger.debug("showLabel emit failed for run blocker",
+                                 exc_info=True)
+            self.command = 'stop'
+            return
 
         # ── Phase 1 & 2: collect then process all existing images ─────────────
         pending = []  # [(img_file, img_number, img_data, img_meta, bg_raw)]

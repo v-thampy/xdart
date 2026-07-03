@@ -25,6 +25,51 @@ from xrd_tools.io.export import write_xye
 logger = logging.getLogger(__name__)
 
 
+# MEM-1a: the wrangler→GUI live display hand-off (``_published_frames``) stashes
+# one fully-hydrated LiveFrame per frame for the GUI's ``update_data`` to pop.
+# In live mode each retained frame still holds its ~18 MB raw (upcast ~64 MB
+# float64) until it leaves the write-side staging window, so if the GUI thread
+# falls behind the producer an *unbounded* dict grows to tens of GB → OOM.
+# Bounding it with DROP-OLDEST is safe post-8a: the frame is already durable via
+# the sink write, and the display re-hydrates any evicted label on demand (the
+# store-first path).  The dropped entry is always the OLDEST undrained frame —
+# never the freshly-signalled idx the GUI is about to consume next.
+_PUBLISHED_FRAMES_CAP = 128
+
+
+class _BoundedFrameHandoff(dict):
+    """Insertion-ordered dict capped at ``cap`` entries (drop-oldest on insert).
+
+    A plain ``dict`` with a size guard: every ``__setitem__`` that pushes past
+    ``cap`` evicts the oldest key(s).  ``pop``/``get``/``clear`` are inherited
+    unchanged, so the existing consumer (``update_data``: ``pop(idx, None)``,
+    ``get(idx)``) keeps working — a dropped idx simply reads back as ``None``,
+    which the consumer already tolerates.
+    """
+
+    def __init__(self, *args, cap: int = _PUBLISHED_FRAMES_CAP, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cap = max(1, int(cap))
+        self._drop_warned = False
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        over = len(self) - self._cap
+        if over > 0:
+            for stale in list(self.keys())[:over]:
+                super().__delitem__(stale)
+            if not self._drop_warned:
+                self._drop_warned = True
+                logger.warning(
+                    "GUI behind producer: dropping oldest display hand-offs "
+                    "(cap=%d); frames remain on disk and re-hydrate on demand",
+                    self._cap)
+
+    def clear(self):
+        super().clear()
+        self._drop_warned = False
+
+
 # Sentinel used by ``_apply_threshold_inline`` to mark out-of-band
 # pixels.  pyFAI's CSR integrator auto-skips NaN at integrate time
 # without invalidating the mask CRC, so the per-frame threshold
@@ -427,7 +472,7 @@ class wranglerThread(Qt.QtCore.QThread):
         # In-memory hand-off of just-integrated frames to the main
         # thread so it doesn't have to round-trip through disk.  The
         # main thread's update_data consumes this dict.
-        self._published_frames: dict = {}
+        self._published_frames: dict = _BoundedFrameHandoff()
 
         # Threshold filtering — subclass sets these from its UI; the
         # base default is "no threshold" so nexus / other wranglers

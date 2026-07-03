@@ -472,6 +472,25 @@ class LiveFrameSeries:
                 self.__setitem__(a.idx, a, h5file=h5file)
         self._i = 0
 
+    def _evict_from_memory(self, idx) -> None:
+        """Pop ``idx`` from the staging cache and release its raw (MEM-1a).
+
+        In live mode the ~18 MB ``map_raw`` is kept on the LiveFrame for the
+        display after the writer is done, so without freeing it here the raw of
+        every staged frame would accumulate (≈cap×64 MB once upcast to float64).
+        Eviction only ever drops *persisted* frames and ``free_raw`` only
+        releases when the raw is losslessly reloadable from disk, so this is
+        safe — a later viewer / reintegration read re-hydrates it on demand.  In
+        batch mode the raw is already freed, so this is a cheap no-op.
+        """
+        gone = self._in_memory.pop(idx, None)
+        if gone is not None:
+            try:
+                gone.free_raw()
+            except Exception:
+                logger.debug("free_raw on eviction of %s failed", idx,
+                             exc_info=True)
+
     def stash(self, frame):
         """Keep ``frame`` in memory so the writer can read it next flush.
 
@@ -503,7 +522,7 @@ class LiveFrameSeries:
                     if evicted >= excess:
                         break
                     if idx in self._persisted:
-                        self._in_memory.pop(idx, None)
+                        self._evict_from_memory(idx)
                         evicted += 1
 
     def mark_persisted(self, idxs) -> None:
@@ -562,7 +581,7 @@ class LiveFrameSeries:
                 if evicted >= excess:
                     break
                 if idx in self._persisted:
-                    self._in_memory.pop(idx, None)
+                    self._evict_from_memory(idx)
                     evicted += 1
             return evicted
 
