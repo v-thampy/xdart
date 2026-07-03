@@ -140,6 +140,7 @@ class Main(QMainWindow):
         except Exception:
             pass
         self._init_theme_menu()
+        self._init_shortcut_actions()
 
         # Default size: 90% of the available screen, centered (was a fixed
         # 1600x920, whose width clamped the middle display panels below
@@ -206,6 +207,91 @@ class Main(QMainWindow):
                     self._set_control_panel_font_size(s))
             font_group.addAction(action)
             font_menu.addAction(action)
+
+    def _init_shortcut_actions(self):
+        """Add discoverable menu actions for the main processing shortcuts."""
+
+        def _menu_action(menu, object_name, text, shortcut, slot, before=None):
+            action = QtGui.QAction(text, self)
+            action.setObjectName(object_name)
+            action.setShortcut(shortcut)
+            action.setShortcutContext(QtCore.Qt.WindowShortcut)
+            action.triggered.connect(slot)
+            if before is None:
+                menu.addAction(action)
+            else:
+                menu.insertAction(before, action)
+            self.addAction(action)
+            return action
+
+        file_menu = self.ui.menuFile
+        file_menu.insertSeparator(self.ui.actionExit)
+        self.actionLoadSettings = _menu_action(
+            file_menu,
+            "actionLoadSettings",
+            "Load Settings",
+            QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Open),
+            self._shortcut_load_settings,
+            before=self.ui.actionExit,
+        )
+        self.actionSaveSettings = _menu_action(
+            file_menu,
+            "actionSaveSettings",
+            "Save Settings",
+            QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Save),
+            self._shortcut_save_settings,
+            before=self.ui.actionExit,
+        )
+
+        self.ui.menuRun = QtWidgets.QMenu(self.ui.menubar)
+        self.ui.menuRun.setObjectName("menuRun")
+        self.ui.menuRun.setTitle("Run")
+        self.ui.menubar.addAction(self.ui.menuRun.menuAction())
+        self.actionRunPause = _menu_action(
+            self.ui.menuRun,
+            "actionRunPause",
+            "Run / Pause",
+            QtGui.QKeySequence("Ctrl+R"),
+            self._shortcut_run_pause,
+        )
+        self.actionStopRun = _menu_action(
+            self.ui.menuRun,
+            "actionStopRun",
+            "Stop",
+            QtGui.QKeySequence("Ctrl+Shift+C"),
+            self._shortcut_stop,
+        )
+        self.actionToggleWriteMode = _menu_action(
+            self.ui.menuRun,
+            "actionToggleWriteMode",
+            "Toggle Append / Replace",
+            QtGui.QKeySequence("Ctrl+Shift+A"),
+            self._shortcut_toggle_write_mode,
+        )
+
+    def _main_widget_shortcut(self, method_name):
+        method = getattr(getattr(self, "main_widget", None), method_name, None)
+        if method is None:
+            return
+        try:
+            method()
+        except Exception:
+            logger.exception("Error handling shortcut %s", method_name)
+
+    def _shortcut_run_pause(self):
+        self._main_widget_shortcut("shortcut_run_pause")
+
+    def _shortcut_stop(self):
+        self._main_widget_shortcut("shortcut_stop")
+
+    def _shortcut_toggle_write_mode(self):
+        self._main_widget_shortcut("shortcut_toggle_write_mode")
+
+    def _shortcut_load_settings(self):
+        self._main_widget_shortcut("shortcut_load_settings")
+
+    def _shortcut_save_settings(self):
+        self._main_widget_shortcut("shortcut_save_settings")
 
     def _set_theme(self, name):
         """Apply theme ``name`` live and persist the choice."""

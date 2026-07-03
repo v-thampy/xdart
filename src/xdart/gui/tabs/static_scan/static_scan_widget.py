@@ -3645,6 +3645,57 @@ class staticWidget(QWidget):
         except Exception:
             logger.debug("fit controls height failed", exc_info=True)
 
+    def _commit_shortcut_focus(self):
+        """Commit focused editors before a command-key action reads controls."""
+        app = QtWidgets.QApplication.instance()
+        widget = app.focusWidget() if app is not None else None
+        if widget is None:
+            return
+        try:
+            if isinstance(widget, QtWidgets.QAbstractSpinBox):
+                widget.interpretText()
+                widget.clearFocus()
+            elif isinstance(widget, QtWidgets.QLineEdit):
+                widget.clearFocus()
+        except Exception:
+            logger.debug("shortcut focus commit failed", exc_info=True)
+            return
+        try:
+            QtWidgets.QApplication.processEvents()
+        except Exception:
+            pass
+
+    def shortcut_run_pause(self):
+        """Cmd+R handler: press the shared Run/Pause/Resume button if enabled."""
+        self._commit_shortcut_focus()
+        button = getattr(getattr(self, "controls", None), "startButton", None)
+        if button is not None and button.isEnabled():
+            button.click()
+
+    def shortcut_stop(self):
+        """Cmd+Shift+C handler: press the shared Stop button if enabled."""
+        button = getattr(getattr(self, "controls", None), "stopButton", None)
+        if button is not None and button.isEnabled():
+            button.click()
+
+    def shortcut_toggle_write_mode(self):
+        """Cmd+Shift+A handler: toggle Append/Replace if the mode row is open."""
+        button = getattr(getattr(self, "controls", None), "writeModeButton", None)
+        if button is not None and button.isEnabled():
+            button.click()
+
+    def shortcut_load_settings(self):
+        """Cmd+O handler: route through the existing Config -> Load action."""
+        action = getattr(getattr(self, "h5viewer", None), "actionLoadParams", None)
+        if action is not None and action.isEnabled():
+            action.trigger()
+
+    def shortcut_save_settings(self):
+        """Cmd+S handler: route through the existing Config -> Save action."""
+        action = getattr(getattr(self, "h5viewer", None), "actionSaveParams", None)
+        if action is not None and action.isEnabled():
+            action.trigger()
+
     def set_wrangler(self, qint):
         """Sets the wrangler based on the selected item in the dropdown.
         Syncs the wrangler's attributes and wires signals as needed.

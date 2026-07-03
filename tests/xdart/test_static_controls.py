@@ -5,13 +5,14 @@ it emits intent and the active wrangler owns the logic.  These exercise the
 morph + signals + profile in isolation (no wrangler), before any app wiring.
 """
 import os
+from types import MethodType, SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 
 pytest.importorskip("pyqtgraph")
-from pyqtgraph import QtWidgets
+from pyqtgraph import QtCore, QtGui, QtWidgets
 
 from xdart.gui.tabs.static_scan.ui.static_controls import StaticControls
 
@@ -108,6 +109,167 @@ def test_mode_row_enabled_locks_mode_batch_cores(qapp):
     assert c.modeCombo.isEnabled()
     assert c.batchButton.isEnabled()
     assert c.writeModeButton.isEnabled()
+
+
+def _shortcut_host(**attrs):
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    host = SimpleNamespace(**attrs)
+    for name in (
+        "_commit_shortcut_focus",
+        "shortcut_run_pause",
+        "shortcut_stop",
+        "shortcut_toggle_write_mode",
+        "shortcut_load_settings",
+        "shortcut_save_settings",
+    ):
+        setattr(host, name, MethodType(getattr(staticWidget, name), host))
+    return host
+
+
+def test_run_shortcut_commits_line_edit_before_click(qapp):
+    c = StaticControls()
+    host = _shortcut_host(controls=c)
+    order = []
+    c.startButton.clicked.connect(lambda: order.append("run"))
+
+    editor = QtWidgets.QLineEdit()
+    editor.show()
+    editor.setText("5")
+    editor.setModified(True)
+    editor.editingFinished.connect(lambda: order.append("commit"))
+    editor.activateWindow()
+    editor.setFocus(QtCore.Qt.OtherFocusReason)
+    qapp.processEvents()
+    assert qapp.focusWidget() is editor
+
+    host.shortcut_run_pause()
+
+    assert order == ["commit", "run"]
+
+
+def test_run_shortcut_noops_when_start_disabled(qapp):
+    c = StaticControls()
+    host = _shortcut_host(controls=c)
+    clicks = []
+    c.startButton.clicked.connect(lambda: clicks.append("run"))
+    c.startButton.setEnabled(False)
+
+    host.shortcut_run_pause()
+
+    assert clicks == []
+
+
+def test_stop_shortcut_stays_available_when_mode_row_locked(qapp):
+    c = StaticControls()
+    host = _shortcut_host(controls=c)
+    clicks = []
+    c.stopButton.clicked.connect(lambda: clicks.append("stop"))
+    c.set_mode_row_enabled(False)
+    c.set_stop_enabled(True)
+
+    host.shortcut_stop()
+
+    assert clicks == ["stop"]
+
+
+def test_toggle_write_mode_shortcut_respects_run_lock(qapp):
+    c = StaticControls()
+    host = _shortcut_host(controls=c)
+    changes = []
+    c.writeModeChanged.connect(changes.append)
+
+    c.set_mode_row_enabled(False)
+    host.shortcut_toggle_write_mode()
+    assert c.write_mode() == "Append"
+    assert changes == []
+
+    c.set_mode_row_enabled(True)
+    host.shortcut_toggle_write_mode()
+    assert c.write_mode() == "Overwrite"
+    assert changes == ["Overwrite"]
+
+
+def test_load_save_shortcuts_route_through_existing_actions(qapp):
+    load = QtGui.QAction()
+    save = QtGui.QAction()
+    calls = []
+    load.triggered.connect(lambda: calls.append("load"))
+    save.triggered.connect(lambda: calls.append("save"))
+    host = _shortcut_host(
+        h5viewer=SimpleNamespace(
+            actionLoadParams=load,
+            actionSaveParams=save,
+        )
+    )
+
+    host.shortcut_load_settings()
+    host.shortcut_save_settings()
+
+    assert calls == ["load", "save"]
+
+
+def test_main_window_shortcuts_are_menu_backed(qapp, monkeypatch):
+    from xdart import _gui_main
+
+    class FakeStaticWidget(QtWidgets.QWidget):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+            self.h5viewer = SimpleNamespace(paramMenu=QtWidgets.QMenu(self))
+
+        def enable_async_hydration(self):
+            pass
+
+        def open_file(self):
+            self.calls.append("open_file")
+
+        def shortcut_run_pause(self):
+            self.calls.append("run")
+
+        def shortcut_stop(self):
+            self.calls.append("stop")
+
+        def shortcut_toggle_write_mode(self):
+            self.calls.append("toggle")
+
+        def shortcut_load_settings(self):
+            self.calls.append("load")
+
+        def shortcut_save_settings(self):
+            self.calls.append("save")
+
+    monkeypatch.setattr(
+        _gui_main.tabs.static_scan, "staticWidget", FakeStaticWidget)
+    window = _gui_main.Main()
+    try:
+        file_actions = [a.text() for a in window.ui.menuFile.actions()]
+        run_actions = [a.text() for a in window.ui.menuRun.actions()]
+
+        assert "Load Settings" in file_actions
+        assert "Save Settings" in file_actions
+        assert run_actions == ["Run / Pause", "Stop", "Toggle Append / Replace"]
+        assert window.actionRunPause.shortcut().toString(
+            QtGui.QKeySequence.PortableText) == "Ctrl+R"
+        assert window.actionStopRun.shortcut().toString(
+            QtGui.QKeySequence.PortableText) == "Ctrl+Shift+C"
+        assert window.actionToggleWriteMode.shortcut().toString(
+            QtGui.QKeySequence.PortableText) == "Ctrl+Shift+A"
+        assert window.actionLoadSettings.shortcut().toString(
+            QtGui.QKeySequence.PortableText) == "Ctrl+O"
+        assert window.actionSaveSettings.shortcut().toString(
+            QtGui.QKeySequence.PortableText) == "Ctrl+S"
+
+        window.actionRunPause.trigger()
+        window.actionStopRun.trigger()
+        window.actionToggleWriteMode.trigger()
+        window.actionLoadSettings.trigger()
+        window.actionSaveSettings.trigger()
+
+        assert window.main_widget.calls == [
+            "run", "stop", "toggle", "load", "save"]
+    finally:
+        window.close()
 
 
 def test_run_row_visibility_can_collapse_to_mode_only(qapp):

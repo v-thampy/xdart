@@ -25,6 +25,7 @@ _DEFAULT_DATA = Path(__file__).resolve().parents[3] / "test_data"
 DATA = Path(os.environ.get("XDART_TEST_DATA", _DEFAULT_DATA))
 TIFF = DATA / "Tiff"
 EIGER = DATA / "eiger"
+APS_ZOE = DATA / "APS_Zoe"
 
 pytestmark = pytest.mark.skipif(
     not TIFF.exists(), reason=f"detector test data not found at {DATA}",
@@ -39,6 +40,8 @@ _TIFF_FRAMES = [
     "Combi4_Angledependence_samz_4p9_03271002_0001.tif",  # th=0.15
     "Combi4_Angledependence_samz_4p9_03271002_0005.tif",  # th=0.35
 ]
+_APS_ZOE_IMAGE = "SiO2_eta0p025_scan1_d1200-00000.tif"
+_APS_ZOE_PONI = "CeO2_d1200.poni"
 
 # Mirror xdart.gui.tabs.static_scan.integrator.GI_MODES_1D / GI_MODES_2D
 # (kept local so the parametrize lists don't pull the Qt integrator module
@@ -80,6 +83,19 @@ def _tiff_mask(img):
     import fabio
     mask_edf = fabio.open(str(TIFF / "mask.edf")).data
     return ((mask_edf != 0) | (img < 0)).astype(np.int8)
+
+
+def _load_aps_zoe_frame():
+    import fabio
+    from xrd_tools.core.containers import PONI
+
+    image_path = APS_ZOE / _APS_ZOE_IMAGE
+    poni_path = APS_ZOE / _APS_ZOE_PONI
+    if not image_path.exists() or not poni_path.exists():
+        pytest.skip(f"APS_Zoe repro data not found at {APS_ZOE}")
+    img = fabio.open(str(image_path)).data.astype(np.float32)
+    poni = PONI.from_poni_file(str(poni_path))
+    return poni, img
 
 
 def _load_tiff_frame0():
@@ -497,6 +513,66 @@ def _assert_good_gi_publication_passes(frame, *, min_dummy_headroom=0.05):
     assert publication.diagnostics.ok
     assert publication.diagnostics.dummy_fraction_2d is not None
     assert publication.diagnostics.dummy_fraction_2d < (0.95 - min_dummy_headroom)
+
+
+def _assert_result_1d_byte_equal(left, right):
+    np.testing.assert_allclose(
+        left.radial, right.radial, rtol=0, atol=0, equal_nan=True)
+    np.testing.assert_allclose(
+        left.intensity, right.intensity, rtol=0, atol=0, equal_nan=True)
+    if left.sigma is None or right.sigma is None:
+        assert left.sigma is None and right.sigma is None
+    else:
+        np.testing.assert_allclose(
+            left.sigma, right.sigma, rtol=0, atol=0, equal_nan=True)
+    assert left.unit == right.unit
+
+
+def test_standard_chi_auto_matches_explicit_full_range_aps_zoe():
+    from xrd_tools.integrate.calibration import poni_to_integrator
+    from xrd_tools.integrate.single import integrate_radial
+
+    poni, img = _load_aps_zoe_frame()
+    ai = poni_to_integrator(poni)
+    kwargs = {
+        "npt": 2000,
+        "npt_rad": 2000,
+        "radial_unit": "q_A^-1",
+        "method": "no",
+        "radial_range": (0.0, 5.0),
+    }
+
+    auto = integrate_radial(img, ai, **kwargs)
+    explicit = integrate_radial(img, ai, azimuth_range=(-180.0, 180.0), **kwargs)
+
+    _assert_result_1d_byte_equal(auto, explicit)
+
+
+def test_gi_chigi_auto_matches_explicit_full_range_aps_zoe():
+    from xrd_tools.integrate.gid import (
+        create_fiber_integrator,
+        integrate_gi_azimuthal_1d,
+    )
+
+    poni, img = _load_aps_zoe_frame()
+    fi = create_fiber_integrator(
+        poni,
+        incident_angle=0.1,
+        sample_orientation=4,
+        angle_unit="deg",
+    )
+    kwargs = {
+        "npt": 2000,
+        "npt_q": 2000,
+        "method": "no",
+        "radial_range": (0.0, 5.0),
+    }
+
+    auto = integrate_gi_azimuthal_1d(img, fi, **kwargs)
+    explicit = integrate_gi_azimuthal_1d(
+        img, fi, azimuth_range=(-180.0, 180.0), **kwargs)
+
+    _assert_result_1d_byte_equal(auto, explicit)
 
 
 def test_batch_parallel_tiff_cakes_nondegenerate_and_match_serial():

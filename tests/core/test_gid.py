@@ -288,6 +288,17 @@ def test_freeze_common_axis_qtotal_floor_at_zero():
     assert lo_ip < 0.0
 
 
+def test_freeze_common_axis_clamps_chigi_to_rendered_domain():
+    scout = _r1d(np.linspace(-180.0, 180.0, 2000))
+
+    key, (lo, hi) = freeze_common_axis(
+        scout, gi_mode_1d="chi_gi", pad_fraction=0.02)
+
+    assert key == "azimuth_range"
+    assert lo == -180.0
+    assert hi == 180.0
+
+
 def test_freeze_common_axis_union_covers_both_drifted_scouts():
     """The crux: two scouts at different incidences have DRIFTED output extents;
     the frozen range must be the padded UNION covering BOTH — and a single scout

@@ -151,6 +151,11 @@ def integrate_radial(
     # applied.  Drop the integrate1d-only kwargs.
     for _unsupported in ("safe", "error_model", "chi_offset"):
         extra.pop(_unsupported, None)
+    if extra.get("azimuth_range") is None:
+        # The GUI renders detector chi on the full -180..180 degree domain.
+        # pyFAI's implicit extent is geometry-derived and can shift slightly,
+        # so "Auto" must be made explicit to match the displayed convention.
+        extra["azimuth_range"] = (-180.0, 180.0)
     result = ai.integrate_radial(
         image,
         npt,

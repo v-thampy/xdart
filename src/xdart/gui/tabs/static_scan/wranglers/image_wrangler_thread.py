@@ -273,12 +273,15 @@ def _freeze_gi_1d_range_from_result(args, result, gi_mode_1d=None):
     """Freeze the missing GI 1D *output-axis* range from one scout result so all
     frames share one axis.  Picks radial_range vs azimuth_range by mode (see
     :func:`_gi_1d_output_range_key`)."""
-    key = _gi_1d_output_range_key(gi_mode_1d)
+    mode = gi_mode_1d if gi_mode_1d is not None else args.get('gi_mode_1d')
+    key = _gi_1d_output_range_key(mode)
     if args.get(key) is not None:
         return False
     rng = _padded_axis_range(getattr(result, 'radial', None))
     if rng is None:
         return False
+    if mode in ('exit_angle', 'chi_gi'):
+        rng = (max(float(rng[0]), -180.0), min(float(rng[1]), 180.0))
     args[key] = rng
     return True
 

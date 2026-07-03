@@ -732,6 +732,15 @@ def integrate_gi_azimuthal_1d(
     """
     inc, tilt, orient = _effective_gi_params(
         fi, incident_angle, tilt_angle, sample_orientation)
+    if azimuth_range is None:
+        # Match the GUI/rendered chi_GI convention for Auto.  Leaving this as
+        # None lets pyFAI choose a geometry-derived extent that does not
+        # reproduce an explicit full-range (-180..180) reduction.
+        azimuth_range = (-180.0, 180.0)
+    else:
+        # pyFAI wraps out-of-domain polar requests instead of clamping.
+        azimuth_range = (max(float(azimuth_range[0]), -180.0),
+                         min(float(azimuth_range[1]), 180.0))
     result = fi.integrate1d_polar(
         data=image,
         radial_integration=True,        # -> I vs χ_GI (not I vs q_total)
@@ -929,9 +938,9 @@ def freeze_common_axis(results, *, gi_mode_1d: str | None = None,
         without the margin the frozen range would CLIP that real data (see
         tests/.../test_gi_freeze_covers_last_frame_extent).  The margin makes
         empty bins beyond the real data; those should be filled with NaN (not a
-        spurious dummy) so they are not plotted — see the q_total floor below
-        and the NaN-empty follow-up.  For ``q_total`` the low margin is clamped
-        to 0 (a magnitude can't be negative).
+        spurious dummy) so they are not plotted — see the q_total floor below,
+        angular clamp below, and the NaN-empty follow-up.  For ``q_total`` the
+        low margin is clamped to 0 (a magnitude can't be negative).
 
     Returns
     -------
@@ -955,6 +964,8 @@ def freeze_common_axis(results, *, gi_mode_1d: str | None = None,
     # freeze_common_axes_2d (which keeps angular ranges within [-180, 180]).
     if rng is not None and gi_mode_1d in (None, 'q_total'):
         rng = (max(0.0, float(rng[0])), float(rng[1]))
+    if rng is not None and gi_mode_1d in ('exit_angle', 'chi_gi'):
+        rng = (max(float(rng[0]), -180.0), min(float(rng[1]), 180.0))
     return key, rng
 
 

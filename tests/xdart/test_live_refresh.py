@@ -6675,6 +6675,23 @@ def test_gi_1d_auto_range_freezes_from_scout_result():
     assert args["radial_range"] == (1.88, 8.12)
 
 
+def test_gi_1d_auto_range_rekeys_after_chigi_mode_switch():
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
+        _freeze_gi_1d_range_from_result,
+    )
+
+    args = {
+        "gi_mode_1d": "chi_gi",
+        "radial_range": (0.0, 5.0),
+        "azimuth_range": None,
+    }
+    result = SimpleNamespace(radial=np.array([-180.0, 180.0]))
+
+    assert _freeze_gi_1d_range_from_result(args, result) is True
+    assert args["radial_range"] == (0.0, 5.0)
+    assert args["azimuth_range"] == (-180.0, 180.0)
+
+
 def test_raw_preview_does_not_lazy_load_on_gui_data_access():
     calls = []
     frame = SimpleNamespace(
@@ -7534,6 +7551,7 @@ def test_batch_process_scan_dispatches_each_frame_as_read():
         get_background=lambda *_: 0.0,
         _flush_xye_buffer=lambda *_args, **_kw: None,
         _save_due=lambda scan, force=False: False,   # frames=0 -> nothing due
+        _prime_append_skip_snapshots_for_run=lambda: None,
     )
 
     def dispatch(scan, pending, *, force_save=False):
