@@ -85,6 +85,7 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 | H23 | nexus_writer schema convergence | M/L | med | one on-disk-contract owner | H6 | open |
 | H25 | Placement ratchet + xrd_tools/gui disposition | S | low | shell can't re-thicken silently | — | open |
 | H28 | ADR-0006 STEP 2 prepass deletion | M | med | dual-prepass risk retired | live gate slot | open |
+| H30 | Unify ALL paint triggers under the generation scheduler (live flush `_flush_pending_update`, reintegrate idx==-1 path — completions already unified in 8d35a37c) | M | med | closes the theoretical interleave class from the 2026-07-02 codex review (findings 1-2, no repro; Session-1 A4/F6 is the empirical arbiter) | post-tag; after a live soak | open |
 | H13(rest) | Config stash-restore; click-latency shed; reintegrate debounce-stack; update_scans memoize | S ea | med/low | UX niceties | live repro in hand | open |
 
 **Sequencing spine:** RC-FV → Session-1 → RC-8 (tag) → H6 → H8 → H9 (Session-2) → {H10, H18} → {H15, H19, H20} ∥ lanes → H21 (live gate) → next-cycle table.
