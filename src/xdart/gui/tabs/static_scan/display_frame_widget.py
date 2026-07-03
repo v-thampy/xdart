@@ -2012,6 +2012,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.image_data = (image, rect)
         else:
             self.binned_data = (image, rect)
+            _opu = getattr(self, '_on_plotUnit_changed', None)
+            if _opu is not None:
+                _opu()
             # Re-attach the slice-band ROI on the cake.  Legacy update_binned_view
             # did this at its tail (line ~1799); the Step-3 cake-payload flip
             # dropped it and it survived only as a side effect of the legacy
@@ -3106,12 +3109,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         info = self._plot_axis_info[idx]
         skip_2d = getattr(self.scan, 'skip_2d', False)
         # Slicing requires 2D data and the axis must come from 2D
-        can_slice = (not skip_2d) and info['source'] in ('2d', '1d_2d')
+        can_slice_axis = (not skip_2d) and info['source'] in ('2d', '1d_2d')
+        data_ready = bool(self._slice_2d_data_ready())
+        can_slice = can_slice_axis and data_ready
 
         # The slice button is available when slicing is possible; the center/width
         # spinboxes are only live once it is *checked*.
         self.ui.slice.setEnabled(can_slice)
-        if not can_slice:
+        if not can_slice_axis:
             self.ui.slice.setChecked(False)
             self.clear_slice_overlay()
         self._sync_slice_controls()
@@ -3121,6 +3126,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # Q_ip→Q_oop, Q→χ), driven from here so it tracks plotUnit AND mode/GI
         # changes (set_axes ends by calling this) — not lazily on first click.
         self._set_slice_range()
+        if can_slice_axis and not data_ready:
+            tip = self._slice_no_2d_tooltip()
+            self.ui.slice.setToolTip(tip)
+            self.ui.slice_center.setToolTip(tip)
+            self.ui.slice_width.setToolTip(tip)
+        else:
+            self.ui.slice_center.setToolTip('slice center')
+            self.ui.slice_width.setToolTip('slice width')
 
         # Share Axis is keyed to the cake x-axis unit, not the currently
         # selected plotUnit row.  That lets it switch a χ plot back to Q/2θ/qip
@@ -3128,11 +3141,17 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._apply_share_axis_state()
 
     def _sync_slice_controls(self, _=None):
-        """Enable the slice center/width spinboxes only while the X Range
-        button is both available and checked."""
-        active = self.ui.slice.isEnabled() and self.ui.slice.isChecked()
+        """Enable the slice center/width spinboxes only while slice is active."""
+        active = (self.ui.slice.isEnabled()
+                  and self.ui.slice.isChecked()
+                  and self._slice_2d_data_ready())
         self.ui.slice_center.setEnabled(active)
         self.ui.slice_width.setEnabled(active)
+        if self.ui.slice.isChecked() and not self._slice_2d_data_ready():
+            tip = self._slice_no_2d_tooltip()
+            self.ui.slice.setToolTip(tip)
+            self.ui.slice_center.setToolTip(tip)
+            self.ui.slice_width.setToolTip(tip)
 
     def _on_share_axis_changed(self, checked):
         """Apply a Share Axis toggle: the full render + relink + the bottom-panel
@@ -3400,6 +3419,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if self.binned_data is None:
             return                      # no cake drawn yet (e.g. Int 1D mode)
         data, rect = self.binned_data
+        if data is None or rect is None:
+            return
 
         display_data = _downsample_for_display(data, self.binned_widget)
         self.binned_widget.setImage(display_data, scale=self.scale, cmap=self.cmap)
@@ -3423,6 +3444,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.binned_widget.image_plot.setLabel("bottom", _xl2, units=pretty_unit(_xu2))
         self.binned_widget.image_plot.setLabel("left", _yl2, units=pretty_unit(_yu2))
 
+        _opu = getattr(self, '_on_plotUnit_changed', None)
+        if _opu is not None:
+            _opu()
         self.show_slice_overlay()
         return data
 
@@ -3821,6 +3845,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             _cso = getattr(self, 'clear_slice_overlay', None)
             if _cso is not None:
                 _cso()
+            _opu = getattr(self, '_on_plotUnit_changed', None)
+            if _opu is not None:
+                _opu()
         except Exception:
             logger.debug("clear_binned_view failed", exc_info=True)
 

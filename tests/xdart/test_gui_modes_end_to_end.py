@@ -2865,6 +2865,38 @@ def test_scale_switch_without_2d_panels_does_not_crash(widget):
     df.update_binned_view()
 
 
+def test_slice_controls_wait_for_binned_data(widget):
+    from PySide6 import QtCore
+
+    df = widget.displayframe
+    df.scan.skip_2d = False
+    df.scan.gi = False
+    df.binned_data = None
+    df.clear_slice_overlay()
+    df.ui.plotUnit.setCurrentIndex(2)       # χ: slice along the cake radial axis
+    df._on_plotUnit_changed()
+
+    assert not df.ui.slice.isEnabled()
+    assert "no 2D data yet" in df.ui.slice.toolTip()
+    assert not df.ui.slice_center.isEnabled()
+    assert not df.ui.slice_width.isEnabled()
+
+    # A restored/session-driven checked state before the cake exists must no-op,
+    # not unpack binned_data=None.
+    df.ui.slice.setChecked(True)
+    df.show_slice_overlay()
+    assert df.overlay is None
+
+    df.binned_data = (np.ones((16, 16)), QtCore.QRectF(0.0, -180.0, 25.0, 360.0))
+    df._on_plotUnit_changed()
+    assert df.ui.slice.isEnabled()
+    assert df.ui.slice_center.isEnabled()
+    assert df.ui.slice_width.isEnabled()
+
+    df.show_slice_overlay()
+    assert df.overlay is not None
+
+
 def test_gi_1d_npts_defaults_and_per_axis_memory(widget):
     """1-D Pts: fiber axes (Qip/Qoop/Exit) default to 1000/1000, q_total
     ('Q'/'Chi', plain pyFAI) and standard mode to 2000; a user-chosen value

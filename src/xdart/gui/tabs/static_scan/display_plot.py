@@ -1533,6 +1533,20 @@ class DisplayPlotMixin:
 
     # ── Slice overlay ─────────────────────────────────────────────
 
+    def _slice_2d_data_ready(self):
+        """True when the cake panel has drawable data and a plot rectangle."""
+        binned = getattr(self, "binned_data", None)
+        if binned is None:
+            return False
+        try:
+            data, rect = binned
+        except (TypeError, ValueError):
+            return False
+        return data is not None and rect is not None
+
+    def _slice_no_2d_tooltip(self):
+        return "no 2D data yet"
+
     def _set_slice_range(self, _=None, initialize=False):
         """Configure the slice label, range, and step size based on
         which axis is being sliced along.
@@ -1621,6 +1635,10 @@ class DisplayPlotMixin:
         if not self.ui.slice.isChecked():
             self.clear_slice_overlay()
             return
+        if not self._slice_2d_data_ready():
+            self.clear_slice_overlay()
+            self._sync_slice_controls()
+            return
 
         plotUnit = self.ui.plotUnit.currentIndex()
         info = (self._plot_axis_info[plotUnit]
@@ -1687,6 +1705,8 @@ class DisplayPlotMixin:
 
         if not self.ui.slice.isChecked():
             return
+        if not self._slice_2d_data_ready():
+            return
 
         idx = self.ui.plotUnit.currentIndex()
         info = (self._plot_axis_info[idx]
@@ -1702,7 +1722,10 @@ class DisplayPlotMixin:
         width = self.ui.slice_width.value()
         _range = [center - width, center + width]
 
-        binned_data, rect = self.binned_data
+        try:
+            binned_data, rect = self.binned_data
+        except (TypeError, ValueError):
+            return
 
         if rect is None:
             return
