@@ -40,3 +40,23 @@ MONOTONIC through every step of: Overlay-mode entry (seeded with the displayed t
 resident click → evicted click → deselect-all → unit toggle → hydration completion → repaint.
 Only `Clear`, an incompatible grid/source (`reset_key`), reintegrate-finish, or a REAL norm-channel
 change may reset it. CROSS-SCAN (OV-6): a scan boundary with a COMPATIBLE grid (same integration axis kind + npt) must NOT reset — only Clear or an incompatible grid may. SLICE IDENTITY (OV-7): slice center/width now live in row identity for pinned cuts, while the reset key keeps only projection axis kind + npt + 2D source.
+
+## BL-6 incompatible-grid guard (`a7851fc3` on `laneB-blocker-wave`) — **OBE, do NOT port** (2026-07-04)
+The adversarial review found `test_overlay_waterfall_payload_accumulates_in_payload_across_renders`
+red on `laneB-blocker-wave`: an incompatible grid (npt 5 → 7) APPENDED instead of RESETTING because
+my BL-6 `prior_x_seed` adoption force-interped the frame onto the prior grid without a size check. I
+fixed it on my branch in `a7851fc3` with an `x.shape == prior_x_seed.shape` seed guard.
+
+**Resolved by PROOF against integrate HEAD, not just my branch.** Branched a worktree off
+`feature/remediation` HEAD `93997bea` (which carries codex's `6f0b726f` `append_row` restructure AND
+the ports of my S-14/S-16/BL-6) and ran the npt-5→7 reset test there with `PYTHONPATH=<worktree>/src`
+(defeating the editable-install-points-at-MAIN trap): **it PASSES** (`test_aggregation_wiring` 42✓,
+`test_frame_publication` 75✓; the `p6.plot_history.ids == (('scan3',4),)` reset assertion holds).
+HEAD's `append_row` computes `row_grid_key` from the ACTUAL frame and gates `use_prior_seed` on
+`overlay_grid_keys_match(prior.reset_key, row_grid_key)` — a full-grid-key guard that SUBSUMES my
+`x.shape` check, so the incompatible frame never adopts the prior seed and the reset fires.
+
+⇒ The regression does NOT exist at HEAD; the port ordering is safe. `a7851fc3`'s
+`display_publication.py` hunk (the `x.shape` guard + the S-16 comment re-scope) is **OBE** and
+conflicts structurally with the reshaped site — **do not port it**. No code change is needed at HEAD;
+the ported test already covers and enforces the reset.
