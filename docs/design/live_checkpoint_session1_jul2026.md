@@ -129,6 +129,11 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
       offset). Repro: pin χ=18±10 ⇒ TWO traces, not three. Spin the c/w to a new value ⇒ the
       live "current" cut REAPPEARS; re-dial back to a pinned value ⇒ it disappears again. The
       live current renders as a gray DASHED line only (no markers), ~50% opacity, "· current".
+- [ ] G14 S-14/S-18 overlay identity: (S-14) RE-RUN the same scan (same name) while overlaid —
+      the new run's curves REPLACE the old (not dropped as stale under the old labels); a boundary
+      to a DIFFERENT compatible scan still APPENDS (OV-6). (S-18) Pin a slice cut, then load a
+      different scan — the pin does NOT rematerialize on the new scan's frame N under the old
+      legend.
 
 **PASS ⇒ proceed to RC-8** (merge → tag v1.0.0 → publish; recipe in
 `handoff_chunks_jul2026.md`). Any FAIL: stop, report the item + `kill -USR1 <pid>` stack if a

@@ -5540,6 +5540,9 @@ class staticWidget(QWidget):
         _scan_info_rows alongside the index is required — otherwise a late new_scan
         (or this call) would strand the new scan's undrained frames.
         """
+        # S-14: capture the PREVIOUS scan identity before overwriting it, so a
+        # same-name re-run can be told apart from a boundary to a different scan.
+        prev_scan_key = getattr(self, "_frame_driven_scan_key", None)
         self.scan.name = name
         # Wire the viewer to THIS scan's output HERE (driven by the frame stream),
         # NOT from the new_scan signal — set_file queues an async set_datafile that
@@ -5565,6 +5568,18 @@ class staticWidget(QWidget):
         # Undrained stash + scan_data row cache from the previous scan.
         self._pending_frames = {}
         self._scan_info_rows = {}
+        # S-14: a re-run of the SAME scan name reuses the (name, frame_idx) row
+        # identities, so the append-only overlay accumulator's first-occurrence
+        # dedup would DROP every new frame -- leaving the previous run's curves
+        # under the new labels.  A compatible boundary to a DIFFERENT scan still
+        # appends (OV-6 cross-scan comparison); a same-name re-run must CLEAR the
+        # accumulator + pins so the new run's data renders.
+        if prev_scan_key is not None and prev_scan_key == name:
+            try:
+                self.displayframe._clear_pinned_slice_cuts(clear_history=True)
+            except Exception:
+                logger.debug("S-14 same-name re-run accumulator clear failed",
+                             exc_info=True)
         # Reset the Overlay/Waterfall accumulator only for incompatible grids.
         # Compatible scan boundaries append by design: cross-scan comparison is the
         # point of Overlay, while Clear remains the explicit relief valve.

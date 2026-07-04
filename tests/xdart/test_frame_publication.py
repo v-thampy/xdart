@@ -1387,6 +1387,57 @@ def test_overlay_current_cut_absorbed_by_matching_pin_ov7b():
     assert not any("current" in t.label for t in p3.traces)
 
 
+def test_pinned_cut_pruned_on_scan_change_s18():
+    # S-18: a pin belongs to the scan it was taken on.  After a compatible-grid
+    # boundary to a DIFFERENT scan, the pin must NOT rematerialize from the new
+    # scan's frame N under the old legend -- prune it from render AND registry.
+    from xdart.gui.tabs.static_scan.display_overlay_utils import (
+        overlay_identity_for_widget,
+        overlay_projection_id_for_widget,
+        overlay_slice_legend_suffix,
+    )
+
+    frame = DuckFrame(idx=10)
+    frame.scan_info = {"monitor": 1.0}
+    frame.int_2d = IntegrationResult2D(
+        radial=np.linspace(0.5, 3.0, 4),
+        azimuthal=np.array([0.0, 1.0, 2.0, 3.0]),
+        intensity=np.tile(np.arange(4.0).reshape(1, 4), (4, 1)),
+        unit="q_A^-1", azimuthal_unit="chi_deg")
+    store = PublicationStore()
+    store.upsert(publication_from_live_frame(frame))
+
+    widget = _int_widget(source="2d", axis="radial", slice_axis="χ (°)",
+                         slice_on=True, center=0.5, width=0.6)
+    widget.scan.name = "scanA"                 # pin is taken on scanA
+    axis_info = widget._plot_axis_info[0]
+    projection_id = overlay_projection_id_for_widget(
+        widget, axis_info, center=0.5, width=0.6)
+    reset_key, row_id = overlay_identity_for_widget(
+        widget, 10, axis_info=axis_info, projection_id=projection_id)
+    assert row_id[0] == "scanA"                # scan identity is embedded
+    recipe = {
+        "label": 10, "frame_idx": 10, "axis_info": dict(axis_info),
+        "center": 0.5, "width": 0.6, "projection_id": projection_id,
+        "row_id": row_id, "reset_key": reset_key,
+        "name": "scanA_10" + overlay_slice_legend_suffix(
+            widget, axis_info, center=0.5, width=0.6)}
+    registry = {row_id: recipe}
+    widget._pinned_slice_cuts = registry
+    widget._pinned_slice_cut_recipes = lambda: tuple(registry.values())
+    widget._clear_pinned_slice_cuts = lambda clear_history=True: None
+    widget._waterfall_history = None
+
+    widget.scan.name = "scanB"                 # a DIFFERENT scan is now loaded
+    state = _int_state(store, mode=Mode.INT_2D, method="Overlay", ids=(10,))
+    payload = _adapter(store, widget).plot_payload(state)
+
+    assert row_id not in registry, "stale pin must be pruned from the registry"
+    if payload is not None:
+        assert not any("scanA_10" in t.label for t in payload.traces), \
+            "a stale pin must not render under the new scan"
+
+
 def test_plot_payload_sum_average_emit_n_traces_collapsed_at_render():
     # Sum/Average go through the payload (NOT None): integration_plot_payload
     # emits one Trace per frame (un-reduced), exactly like legacy

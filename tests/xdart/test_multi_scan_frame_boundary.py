@@ -27,6 +27,7 @@ from xdart.modules.frame_publication import PublicationStore
 
 
 def _boundary_host():
+    pin_clears = []          # S-14: records displayframe._clear_pinned_slice_cuts calls
     scan = SimpleNamespace(
         name="scanA", gi=False, incidence_motor="th", single_img=False,
         series_average=False, global_mask=None, scan_lock=RLock(),
@@ -53,7 +54,8 @@ def _boundary_host():
             set_axes=lambda: None, clear_overlay=lambda: None,
             idxs=[], idxs_1d=[], idxs_2d=[],
             _raw_resolve_failed=set(), _raw_full_shape=None,
-            stitch_display_mode=None),
+            stitch_display_mode=None,
+            _clear_pinned_slice_cuts=lambda **k: pin_clears.append(k)),
         _controls_v2_enabled=lambda: False,
         _refresh_controls_v2_profile=lambda *a, **k: None,
         _fit_controls_height=lambda *a, **k: None,
@@ -62,6 +64,7 @@ def _boundary_host():
     for m in ("update_data", "new_scan", "_rescope_frame_panel_to",
               "_sync_h5viewer_save_dir"):
         setattr(host, m, MethodType(getattr(staticWidget, m), host))
+    host._pin_clears = pin_clears
     return host, scan
 
 
@@ -134,9 +137,28 @@ def test_same_scan_rerun_clears_panel():
     for i in range(1, 6):
         _arrive(host, i, "scanA")
     assert list(scan.frames.index) == [1, 2, 3, 4, 5]
+    host._pin_clears.clear()   # ignore any clears from the first scan boundary
     # RE-RUN scanA — same name — must clear (no frame has rescoped this run).
     host.new_scan("scanA", "/data/scanA_master.h5", False, "th", False, False)
     assert list(scan.frames.index) == [], "same-name re-run must clear the panel"
+    # S-14: the re-run also clears the overlay accumulator + pins, so the new
+    # run's frames are not dropped by (name, frame_idx) first-occurrence dedup
+    # against the previous run (which left its stale intensities under the labels).
+    assert any(c.get("clear_history") for c in host._pin_clears), \
+        "same-name re-run must clear the overlay accumulator (S-14)"
+
+
+def test_different_scan_boundary_keeps_overlay_s14():
+    # S-14 must NOT over-fire: a frame-driven boundary to DIFFERENT scans appends
+    # (OV-6 cross-scan comparison), so it must not clear the overlay accumulator.
+    host, scan = _boundary_host()
+    for i in (1, 2):
+        _arrive(host, i, "scanB")          # first rescope (prev key None)
+    for i in (1, 2):
+        _arrive(host, i, "scanC")          # boundary scanB -> scanC (prev != name)
+    assert scan.name == "scanC"
+    assert not any(c.get("clear_history") for c in host._pin_clears), \
+        "a different-scan boundary must NOT clear the overlay (OV-6 append)"
 
 
 def test_batch_mode_never_frame_rescopes():

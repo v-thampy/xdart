@@ -41,6 +41,7 @@ from .display_logic import (
 from .display_constants import AA_inv, Deg, Th, x_labels_2D, x_units_2D
 from .display_overlay_utils import (
     current_axis_info as _overlay_current_axis_info,
+    current_scan_key as _overlay_current_scan_key,
     overlay_grid_key_for_widget,
     overlay_grid_keys_match,
     overlay_identity_for_widget,
@@ -50,6 +51,18 @@ from .display_overlay_utils import (
 )
 
 MAX_WATERFALL_PAYLOAD_ROWS = 256
+
+
+def _recipe_scan_key(recipe):
+    """Scan identity a pinned slice-cut recipe belongs to (S-18): the explicit
+    ``scan_key`` stamp if present, else the leading element of its
+    ``(scan_key, frame_idx, projection_id)`` row id."""
+    if "scan_key" in recipe:
+        return recipe.get("scan_key")
+    rid = recipe.get("row_id")
+    if isinstance(rid, tuple) and rid:
+        return rid[0]
+    return None
 
 
 def _label_key(label: Any) -> Any:
@@ -936,6 +949,24 @@ class PublicationDisplayAdapter:
                 if callable(clear_pins):
                     clear_pins(clear_history=False)
                 pinned_recipes = ()
+
+        if pinned_recipes:
+            # S-18: a pin belongs to the scan it was taken on.  A compatible-grid
+            # boundary to a DIFFERENT scan (or a same-name re-run) must not
+            # rematerialize the pin from the NEW scan's frame N under the old
+            # legend -- drop pins whose scan identity no longer matches, both from
+            # this render and from the registry.
+            cur_scan = _overlay_current_scan_key(widget)
+            stale = [r for r in pinned_recipes
+                     if _recipe_scan_key(r) not in (None, cur_scan)]
+            if stale:
+                registry = getattr(widget, "_pinned_slice_cuts", None)
+                if isinstance(registry, dict):
+                    for r in stale:
+                        registry.pop(r.get("row_id"), None)
+                stale_ids = {id(r) for r in stale}
+                pinned_recipes = tuple(
+                    r for r in pinned_recipes if id(r) not in stale_ids)
 
         hydrate_labels = list(state.render_ids)
         hydrate_labels.extend(recipe.get("label") for recipe in pinned_recipes)
