@@ -47,6 +47,21 @@ def _name_filter(expr):
                            "NO names until it is corrected", expr, exc)
         return lambda name: False
 
+
+def _nexus_integrated_frame_count(path, *, entry="entry"):
+    """Return the number of unique integrated frame labels already on disk."""
+    labels = set()
+    with h5py.File(path, "r") as h5:
+        if entry not in h5:
+            raise ValueError(f"{path} has no {entry!r} group")
+        e = h5[entry]
+        for group_name in ("integrated_1d", "integrated_2d"):
+            group = e.get(group_name)
+            if group is None or "frame_index" not in group:
+                continue
+            labels.update(int(v) for v in np.asarray(group["frame_index"][()]).ravel())
+    return len(labels)
+
 # pyFAI / fabio / h5py
 import fabio
 import h5py
@@ -3214,9 +3229,28 @@ class imageThread(wranglerThread):
                         for (k, v) in self.scan_args.items():
                             setattr(scan, k, v)
                         self._remember_append_skip_snapshot(scan.name, scan=scan)
-                        existing_frames = scan.frames.index
+                        existing_frames = list(scan.frames.index)
                         if len(existing_frames) == 0:
+                            try:
+                                disk_frame_count = _nexus_integrated_frame_count(fname)
+                            except Exception as exc:
+                                raise RuntimeError(
+                                    "Append target could not be verified after "
+                                    "loading zero frames; existing file preserved: "
+                                    f"{fname}"
+                                ) from exc
+                            if disk_frame_count:
+                                raise RuntimeError(
+                                    "Append target load returned zero frames, but "
+                                    f"{disk_frame_count} integrated frame(s) are "
+                                    "already on disk; existing file preserved: "
+                                    f"{fname}"
+                                )
                             scan.save_to_nexus(replace=True)
+                        else:
+                            mark = getattr(scan.frames, "mark_persisted", None)
+                            if callable(mark):
+                                mark(existing_frames)
                     else:
                         scan.save_to_nexus(replace=True)
 

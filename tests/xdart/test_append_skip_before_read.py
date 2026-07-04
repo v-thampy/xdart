@@ -6,6 +6,7 @@ import queue
 import threading
 import importlib.util
 from collections import Counter, deque
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import numpy as np
@@ -66,6 +67,51 @@ def _bare_worker(tmp_path):
     worker._skip_reason_counts = Counter()
     worker._append_skip_snapshot_warnings = set()
     return worker
+
+
+def _write_minimal_integrated_nxs(path, labels):
+    import h5py
+
+    labels = np.asarray(labels, dtype=np.int64)
+    q = np.linspace(0.1, 1.0, 4, dtype=np.float32)
+    with h5py.File(path, "w") as h5:
+        entry = h5.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        g1 = entry.create_group("integrated_1d")
+        g1.attrs["NX_class"] = "NXdata"
+        g1.attrs["signal"] = "intensity"
+        g1.attrs["axes"] = ["frame_index", "q"]
+        g1.create_dataset("frame_index", data=labels)
+        q_ds = g1.create_dataset("q", data=q)
+        q_ds.attrs["units"] = "q_A^-1"
+        g1.create_dataset(
+            "intensity",
+            data=np.arange(labels.size * q.size, dtype=np.float32).reshape(
+                labels.size, q.size
+            ),
+        )
+
+
+def _initialize_scan_worker(tmp_path, *, write_mode="Append"):
+    worker = _bare_worker(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir(exist_ok=True)
+    worker.h5_dir = str(out)
+    worker.scan_name = "scan"
+    worker.write_mode = write_mode
+    worker.scan = SimpleNamespace(
+        skip_2d=True,
+        bai_1d_args={"unit": "q_A^-1"},
+        bai_2d_args={},
+    )
+    worker.sigUpdateFile = SimpleNamespace(emit=lambda *_: None)
+
+    @contextmanager
+    def _noop_h5pool_bracket(_scan):
+        yield
+
+    worker._h5pool_bracket = _noop_h5pool_bracket
+    return worker, out / "scan.nxs"
 
 
 class _FakeSnapshotScan:
@@ -371,6 +417,40 @@ def test_append_snapshot_failure_warns_once_and_skips_nothing(
         if "append skip snapshot unavailable" in rec.message
     ]
     assert len(warnings) == 1
+
+
+def test_append_initialize_abort_preserves_target_on_degraded_load(
+        monkeypatch, tmp_path):
+    import xrd_tools.io.nexus as nexus_mod
+
+    worker, target = _initialize_scan_worker(tmp_path)
+    _write_minimal_integrated_nxs(target, [1, 2, 3])
+    before = target.read_bytes()
+
+    def fail_read_scan_metadata(*_args, **_kwargs):
+        raise OSError("transient metadata read failure")
+
+    monkeypatch.setattr(
+        nexus_mod, "read_scan_metadata", fail_read_scan_metadata)
+
+    with pytest.raises(RuntimeError, match="existing file preserved"):
+        worker.initialize_scan()
+
+    assert target.read_bytes() == before
+
+
+def test_append_initialize_marks_loaded_rows_persisted(tmp_path):
+    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
+
+    worker, target = _initialize_scan_worker(tmp_path)
+    _write_minimal_integrated_nxs(target, [1, 2, 3])
+
+    scan = worker.initialize_scan()
+
+    assert scan.frames.index == [1, 2, 3]
+    assert set(scan.frames._persisted) == {1, 2, 3}
+    sink = QtNexusSink(SimpleNamespace(batch_mode=True), scan, object())
+    assert sink._needs_atomic_first_batch_flush() is False
 
 
 def test_zero_processed_already_processed_frames_logs_info(caplog, tmp_path):

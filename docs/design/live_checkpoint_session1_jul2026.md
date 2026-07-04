@@ -107,9 +107,12 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
 - [ ] G6 MEM-1c series-average Append onto existing output is BLOCKED with actionable message
       (not silent no-op).
 - [ ] G7 MEM-1d Image Viewer Cmd+A select-all on a large stack stays bounded (LRU cap wins).
-- [ ] G8 MEM-2 heavy-window sanity (`XDART_HEAVY_WINDOW` override respected; small-RAM tier).
-- [ ] G9 MEM-3 651-frame baseline stays ~25-26 s at the new default worker cap.
-- [ ] G10 RN-2 live-scale bulk overlay: 3600-frame overlay hydration does not hold `.nxs`
+- [ ] G8 BW-A2 Append degraded-load drill: simulate/force an Append target read failure on an
+      already-integrated `.nxs`; Run aborts before processing/writing, the target file remains
+      byte-identical, and a normal Append load does not full-rewrite prior rows on first flush.
+- [ ] G9 MEM-2 heavy-window sanity (`XDART_HEAVY_WINDOW` override respected; small-RAM tier).
+- [ ] G10 MEM-3 651-frame baseline stays ~25-26 s at the new default worker cap.
+- [ ] G11 RN-2 live-scale bulk overlay: 3600-frame overlay hydration does not hold `.nxs`
       read-only across writer flush retries.
 
 **PASS ⇒ proceed to RC-8** (merge → tag v1.0.0 → publish; recipe in
