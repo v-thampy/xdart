@@ -1826,7 +1826,7 @@ def test_controls_panel_v2_raw_source_and_poni_enable_run_with_source_frames(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_append_mismatch_same_target_blocks_run(
+def test_controls_panel_v2_append_mismatch_same_target_stays_clickable(
         qapp, monkeypatch, tmp_path):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -1875,17 +1875,42 @@ def test_controls_panel_v2_append_mismatch_same_target_blocks_run(
         profile = build_control_profile(state)
 
         assert state.processed_config is not None
-        assert profile.can_run is False
-        assert any(
-            "processed: Standard · current: Grazing" in blocker
-            for blocker in profile.run_blockers
+        assert profile.can_run is True
+        assert profile.run_blockers == ()
+        assert "processed: Standard · current: Grazing" in (
+            profile.append_confirm_reason
         )
         widget._refresh_controls_v2_profile_now()
-        assert widget.controls.actionRow.isEnabled() is False
-        assert widget.controls.startButton.isEnabled() is False
+        assert widget.controls.actionRow.isEnabled() is True
+        assert widget.controls.startButton.isEnabled() is True
+        assert "Confirm overwrite" in widget.controls.readinessLabel.text()
+        assert "processed: Standard · current: Grazing" in (
+            widget.controls.readinessLabel.toolTip()
+        )
         assert "processed: Standard · current: Grazing" in (
             widget.wrangler._append_config_mismatch_message()
         )
+
+        prompts = []
+
+        def _cancel(check, processed, current):
+            prompts.append((
+                check.reason,
+                processed.display_mode,
+                current.display_mode,
+            ))
+            return False
+
+        widget.wrangler._confirm_append_config_replace = _cancel
+        widget.controls.startButton.click()
+        qapp.processEvents()
+
+        assert prompts == [(
+            profile.append_confirm_reason,
+            "Standard",
+            "Grazing",
+        )]
+        assert getattr(widget.wrangler, "command", None) != "start"
     finally:
         widget.close()
         widget.deleteLater()

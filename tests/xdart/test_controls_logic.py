@@ -247,7 +247,7 @@ def test_run_blockers_are_derived_from_required_field_statuses():
     )
 
 
-def test_append_blocks_loaded_scan_processing_config_mismatch_headless(caplog):
+def test_append_loaded_scan_processing_config_mismatch_requests_confirmation(caplog):
     standard = {
         "gi": False,
         "bai_1d_args": {"unit": "q_A^-1", "numpoints": 3000},
@@ -295,12 +295,13 @@ def test_append_blocks_loaded_scan_processing_config_mismatch_headless(caplog):
             )
         )
 
-    assert not profile.can_run
-    assert profile.run_blockers == (
+    assert profile.can_run
+    assert profile.run_blockers == ()
+    assert profile.append_confirm_reason == (
         "processed: Standard · current: Grazing — switch write mode "
-        "to Replace, or revert settings",
+        "to Replace, or revert settings"
     )
-    assert "checked: mode" not in profile.run_blockers[0]
+    assert "checked: mode" not in profile.append_confirm_reason
     assert any("checked=" in rec.getMessage() for rec in caplog.records)
 
     replace = build_control_profile(
@@ -312,6 +313,7 @@ def test_append_blocks_loaded_scan_processing_config_mismatch_headless(caplog):
         )
     )
     assert replace.can_run
+    assert replace.append_confirm_reason == ""
 
     matching = build_control_profile(
         ControlState(
@@ -322,6 +324,7 @@ def test_append_blocks_loaded_scan_processing_config_mismatch_headless(caplog):
         )
     )
     assert matching.can_run
+    assert matching.append_confirm_reason == ""
 
 
 def test_append_config_match_canonicalizes_defaults_and_string_forms():

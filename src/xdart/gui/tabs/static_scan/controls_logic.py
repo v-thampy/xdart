@@ -42,6 +42,7 @@ from xrd_tools.session.readiness import (
     _range_axis_labels_1d,
     _range_axis_labels_2d,
     append_config_mismatch_check,
+    append_confirm_reason_for,
     build_analysis_launchers,
     build_bound_control_state,
     build_control_panel_state,

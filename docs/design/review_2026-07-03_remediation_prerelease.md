@@ -422,11 +422,10 @@ Two verification agents + orchestrator spot-checks of the material claims agains
 - **[MINOR] `accumulate_waterfall` empty-x history append** (display_logic.py:630-631): adopt the
   incoming x when `history.x.size == 0`. Also hoist the loop-invariant `allclose(x, base_x)` out
   of the per-row loop.
-- **[NOTE] v2 controls now HARD-BLOCK Run on append mismatch** (test renamed
-  `_stays_clickable` → `_blocks_run`; the previously-dead
-  `_controls_v2_append_target_matches_displayed_scan` got wired). This inverts the original CF-2
-  keep-clickable-modal design; legacy panel keeps the modal. Deliberate per the re-pinned tests —
-  **maintainer should confirm the divergence is intended.**
+- **[RESOLVED] v2 Append mismatch uses the shared Run-click modal again.**
+  The temporary hard-block was reverted: readiness reports
+  `ControlProfile.append_confirm_reason`, keeps Run clickable, and the real v2
+  Run button reaches the same Yes/No modal path as the legacy panel.
 - **[NOTE] legacy files without stored reduction config pass the worker guard silently**
   (`processed None → ok`) — only the axis backstop guards those appends; add a MIGRATION line.
 - **[NOTE] ledger rows cite pre-port lane SHAs** (`63a248d9`/`74818d9b`) instead of the ported

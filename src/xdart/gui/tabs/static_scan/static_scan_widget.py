@@ -2365,7 +2365,13 @@ class staticWidget(QWidget):
         if str(getattr(getattr(profile, "processing_page", None), "value", "")) == "viewer":
             return "", False, ""
         ready = bool(getattr(profile, "can_run", False))
-        status = "Ready" if ready else "Needs setup"
+        append_confirm_reason = str(
+            getattr(profile, "append_confirm_reason", "") or "")
+        status = (
+            "Confirm overwrite"
+            if append_confirm_reason and ready else
+            "Ready" if ready else "Needs setup"
+        )
         mode = str(getattr(state, "processing_mode", "") or "").strip()
         if not mode:
             page = getattr(getattr(profile, "processing_page", None),
@@ -2374,7 +2380,10 @@ class staticWidget(QWidget):
         blockers = tuple(getattr(profile, "run_blockers", ()) or ())
         parts = [status]
         note = run_target_readiness_note(state, ready=ready).rstrip(".")
-        if not ready:
+        if append_confirm_reason and ready:
+            parts.append(staticWidget._controls_v2_visible_run_blocker(
+                append_confirm_reason))
+        elif not ready:
             if blockers:
                 parts.append(
                     staticWidget._controls_v2_visible_run_blocker(blockers[0]))
@@ -2386,10 +2395,11 @@ class staticWidget(QWidget):
         if ready and frame_count:
             plural = "" if frame_count == 1 else "s"
             parts.append(f"{frame_count} frame{plural}")
-        tooltip_parts = [str(b) for b in blockers[:3]]
+        tooltip_parts = [str(append_confirm_reason)] if append_confirm_reason else []
+        tooltip_parts.extend(str(b) for b in blockers[:3])
         if note and note not in tooltip_parts:
             tooltip_parts.append(note)
-        tooltip = "" if ready else "; ".join(tooltip_parts)
+        tooltip = "; ".join(tooltip_parts) if tooltip_parts else ""
         return " · ".join(parts), ready, tooltip
 
     @staticmethod

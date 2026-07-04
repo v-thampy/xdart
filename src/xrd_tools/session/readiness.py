@@ -373,7 +373,7 @@ def append_config_mismatch_check(
     processed_config: Mapping[str, Any] | ProcessingConfigSignature | None,
     current_config: Mapping[str, Any] | ProcessingConfigSignature | None,
 ) -> AppendConfigCheck:
-    """Return a fail-closed Append blocker when configs differ."""
+    """Return the Append config comparison result when configs differ."""
 
     compared_fields = tuple(label for _attr, label in _PROCESSING_COMPARED_FIELDS)
     if str(write_mode or "").strip().lower() != "append":
@@ -1590,6 +1590,7 @@ class ControlProfile:
     processing_page: ProcessingPage
     run_enabled: bool
     run_blockers: tuple[str, ...] = ()
+    append_confirm_reason: str = ""
     valid_modes: frozenset[MeasMode] = field(
         default_factory=lambda: frozenset(MeasMode)
     )
@@ -2294,15 +2295,23 @@ def run_blockers_from_fields(
     if state.tool == Tool.RSM:
         if "rsm_real_data" not in state.real_data_gates:
             blockers.append("RSM GUI awaits real-data gate.")
-    if state.tool in (Tool.INT_1D, Tool.INT_2D) and run_target == RunTarget.SOURCE:
-        append_check = append_config_mismatch_check(
-            state.write_mode,
-            state.processed_config,
-            state.current_config,
-        )
-        if not append_check.ok and append_check.reason:
-            blockers.append(append_check.reason)
     return tuple(dict.fromkeys(blockers))
+
+
+def append_confirm_reason_for(state: ControlState) -> str:
+    """Return the non-blocking Append overwrite confirmation reason, if any."""
+
+    run_target = effective_run_target(state)
+    if state.tool not in (Tool.INT_1D, Tool.INT_2D) or run_target != RunTarget.SOURCE:
+        return ""
+    append_check = append_config_mismatch_check(
+        state.write_mode,
+        state.processed_config,
+        state.current_config,
+    )
+    if append_check.ok:
+        return ""
+    return str(append_check.reason or "")
 
 
 def valid_modes_for(tool: Tool) -> frozenset[MeasMode]:
@@ -2324,10 +2333,12 @@ def build_control_profile(state: ControlState) -> ControlProfile:
     viewer = page == ProcessingPage.VIEWER
     fields = build_field_statuses(state)
     blockers = run_blockers_from_fields(state, fields)
+    append_confirm_reason = append_confirm_reason_for(state)
     return ControlProfile(
         processing_page=page,
         run_enabled=not blockers and not viewer,
         run_blockers=blockers,
+        append_confirm_reason=append_confirm_reason,
         valid_modes=valid_modes_for(state.tool),
         backend_required=backend_required_for(state),
         fields=fields,
