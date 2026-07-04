@@ -147,7 +147,8 @@ pre-migration reference signature.  Two additive notes:
    `xrd-tools` version (a clean two-repo-era install recorded the old
    `xdart` dist version; a monorepo install without this fix recorded
    `''`/`0.0.0+unknown`).
-9. **Detector-saturation masking ("Mask Saturated", default ON).** Pixels at
+9. **Detector-saturation masking (the Auto toggle in the pixel-rejection row,
+   "Auto Mask Saturated", default ON).** Pixels at
    the integer detector ceiling (`np.iinfo(dtype).max` — 65535 for uint16,
    derived from the raw dtype) are masked from BOTH the raw display and the
    INTEGRATION, when at least `1e-4` of the frame sits exactly at the ceiling
@@ -155,12 +156,15 @@ pre-migration reference signature.  Two additive notes:
    dead/overflowed block is).  This is a behavior change for uint16 detectors
    that emit 65535 as an overflow sentinel: their integrated patterns no longer
    carry that contamination by default.  Saturated counts are clipped/unreliable
-   anyway, but if you need them included, untick the **Mask Saturated** group
-   header checkbox — available for both image-series and NeXus sources (R3-B).
-   Non-finite and the uint32 ceiling (Eiger dummy)
-   stay always-masked; negatives are masked on the RAW frame before background
-   subtraction only.  Applied identically across live/batch/reload (one
-   `_resolve_frame_mask`, spine-verified).
+   anyway, but if you need them included, untick the **Auto** toggle in the
+   pixel-rejection row ("Auto Mask Saturated") — available for both image-series
+   and NeXus sources (R3-B).
+   In the headless/core readers the uint32 ceiling (Eiger dummy) and non-finite
+   values stay always-masked; in the xdart GUI the toggle is fully authoritative
+   — OFF integrates the raw frame as-is, including the uint32 sentinel. Negatives
+   are masked on the RAW frame before background subtraction only. Applied
+   identically across live/batch/reload (one `_resolve_frame_mask`,
+   spine-verified).
 10. **GI 1D empty bins are NaN** (not 0).  The GI output-axis freeze keeps a
    small coverage pad; the empty bins it (or a masked gap) creates are now
    NaN-filled — so they don't plot/aggregate as a spurious flat line at the
@@ -192,16 +196,15 @@ pre-migration reference signature.  Two additive notes:
 Done in 1.0: 6a complete-v2-record orchestration into core (incl. headless
 sink record + byte-compat gate), 6b schema-as-code starter, 6c API renames
 (list above), 6d single LiveScan→core adapter + single TwoDKind classifier
-(+ import-light `xrd_tools.core`), 6e cleanups + S8 + D6 + D5 + F1.
+(+ import-light `xrd_tools.core`), 6e cleanups + S8 + D1 + D6 + D5 + F1.
 
 Deferred (tracked in
 `docs/design/deferred_ledger.md`):
-D1 re-integrate RAM rework (re-expose the buttons with a replace-aware
-sink), D2 thumbnail LRU + lazy reload (analyzed Jun 2026; lands with the
-publication-store migration), F2 outside-project Save Path consent design,
-F3 ROI selection + per-scan ROI statistics (**likely first post-design
-priority**), F4 embed-full-raw flag + outside-project consent popup,
-F5 Set Bkg button in all display modes.
+D2 thumbnail LRU + lazy-thumbnail reload (distinct from the landed
+publication-store hydration worker), F2 outside-project Save Path consent
+design, F3 ROI selection + per-scan ROI statistics (**likely first post-design
+priority**), F4 embed-full-raw flag + outside-project consent popup, F5 Set Bkg
+button in all display modes.
 
 ## For maintainers
 
@@ -212,10 +215,11 @@ F5 Set Bkg button in all display modes.
 * The old repos should be archived with a pointer here once the release is
   cut.
 
-## Post-v1.0 — Plan B item 3 (headless contracts, on `feature/remediation`)
+## Shipped in v1.0.0 — Plan B item 3 (headless contracts)
 
-These land after the v1.0 tag (headless source/capability/provenance extraction). Two
-behavior notes for downstream users:
+Originally slated post-tag, these landed on `feature/remediation` and ship in
+v1.0.0 (headless source/capability/provenance extraction). Two behavior notes
+for downstream users:
 
 * **Headless runs now emit `/entry/reduction/`.** A purely headless `run_reduction` /
   `NexusSink` now writes the same `NXprocess` reduction-provenance group the GUI writer

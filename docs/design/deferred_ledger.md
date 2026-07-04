@@ -443,7 +443,9 @@ scale is the follow-up.
 
 ## MEM-1 memory-load review — post-tag deferred findings (Jul 3, 2026)
 
-From the 2026-07-02 high-load memory review (`~/repos/perf/remediation_memory_load_review_2026-07-02.md`).
+From the 2026-07-02 high-load memory review
+(`docs/design/review_2026-07-02_memory_load.md`; external draft:
+`~/repos/perf/remediation_memory_load_review_2026-07-02.md`).
 MEM-1a–d (the OOM triad + GI cake leak + series-avg data-loss + viewer select-all
 OOM) landed this cycle (see `live_findings_ledger.md`).  The findings below are
 **deferred post-tag** — real, but either CPU/latency (not OOM) or a lower-severity

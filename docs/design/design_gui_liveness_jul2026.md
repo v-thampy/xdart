@@ -50,6 +50,7 @@ paint; smoothing only helps the fast-scan case where frames pile up per window.
 | 3 | **DONE + LIVE-VALIDATED** | this commit | live heavy-render quantum + fast list timer, terminal-tunable and **now defaulting to flush=150 / list=60 ms** (the maintainer's validated sweet spot; was 100/70). Measure-gated: keep flush ≥ median flush total (~70–90 ms) or the loop re-saturates. Also disabled the **Append/Replace** (writeModeButton) mid-run via `set_mode_row_enabled` — can't switch write mode during a scan. |
 | 4 | **SKIPPED** | — | maintainer: waterfall throttle is not an issue |
 | 5 | **DONE — fixed-unverified** | this commit | render-leg smoothing: Linear scale now uses the raw array view instead of copying, `_ceiling_safe_levels` no longer makes a second full float copy, large autoscale populations are sampled at stride 4, and levels are reused for ~1 s unless scale/cmap/shape/dtype/pct changes. `XDART_PERF=1` now logs copy/transform/levels/setImage/hist/total for live A6 validation. |
+| 6 | **PARTIAL — H13(a-c) DONE `b8e62542` (timer safety, LD-1/BR-1 fixed-unverified); H13(rest) open post-tag (incl. the step-1 config-stash-restore follow-up)** | see handoff_chunks master table | Load-debounce cancel, alias fix, reintegrate-timer stop, pool race, non-blocking teardown, XYE cache, and BR-1 landed pre-tag. Config stash-restore, click-latency shed, reintegrate debounce-stack, and update_scans memoize stay open. |
 
 ## H30 render authority note
 The display-generation scheduler is now the single paint authority for heavy render entries.

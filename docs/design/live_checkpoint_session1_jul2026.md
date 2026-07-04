@@ -47,6 +47,8 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
 - [ ] D2 N2 batch submit-per-read cadence sanity (followup §0.1).
 - [ ] D3 Share-Axis link visual pass; ROI stats dialog §10 visual eyeball.
 - [ ] D4 Timer floor: `XDART_FLUSH_MS=80` now clamps (warning logged, render keeps working).
+- [ ] D5 MS-1: pause mid-run — dispatch/processed/indexed counts reconcile in the post-live
+      index line (no silent drop).
 
 ## E. H8/8a store-flip live checks
 - [ ] E1 Store-only display sanity: reloaded scan draws Single, Overlay, Waterfall, Sum, and
@@ -86,6 +88,26 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
 - [ ] F8 OV-6 browser judgment: with an overlay up, click a compatible processed `.nxs` in the
       data browser, then click a frame — prior traces stay and the clicked frame appends. Note
       whether this browsing behavior is desired long-term.
+
+## G. Final fixed-unverified additions (2026-07-03)
+- [ ] G1 CF-1/CF-2 Append config-mismatch BOTH ways: load Standard, flip to Grazing, Run in
+      Append -> Run-click modal appears; Cancel does not run; Replace flips to Replace and
+      re-integrates. Repeat Grazing->Standard. Eiger `_master` target resolves to the same file;
+      loaded data keeps stored units until Replace.
+- [ ] G2 UI-2/UI-3 fresh-launch χ (c/w) slice toggle no-crash with no data + slice c/w + Pin
+      re-enable after append/browser-loaded Int 2D cake arrives and disable again on clear.
+- [ ] G3 OV-7 texture-cut workflow: Pin two χ/q centers on one frame, move live c/w — pinned cuts
+      survive norm/BG/unit rebuilds; live current cut is styled gray/lightweight and does NOT
+      consume palette colors.
+- [ ] G4 MEM-1a long fast live run — peak RSS bounded, dropped labels re-hydrate.
+- [ ] G5 MEM-1b GI scan RSS bounded, reload shows 1D present / dropped 2D ABSENT.
+- [ ] G6 MEM-1c series-average Append onto existing output is BLOCKED with actionable message
+      (not silent no-op).
+- [ ] G7 MEM-1d Image Viewer Cmd+A select-all on a large stack stays bounded (LRU cap wins).
+- [ ] G8 MEM-2 heavy-window sanity (`XDART_HEAVY_WINDOW` override respected; small-RAM tier).
+- [ ] G9 MEM-3 651-frame baseline stays ~25-26 s at the new default worker cap.
+- [ ] G10 RN-2 live-scale bulk overlay: 3600-frame overlay hydration does not hold `.nxs`
+      read-only across writer flush retries.
 
 **PASS ⇒ proceed to RC-8** (merge → tag v1.0.0 → publish; recipe in
 `handoff_chunks_jul2026.md`). Any FAIL: stop, report the item + `kill -USR1 <pid>` stack if a

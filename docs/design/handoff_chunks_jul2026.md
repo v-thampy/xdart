@@ -17,7 +17,7 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 
 ---
 
-## MASTER STATUS TABLE (2026-07-02) — the status authority; agents update THIS table
+## MASTER STATUS TABLE (2026-07-03) — the status authority; agents update THIS table
 *(The per-wave tables further below are frozen history; briefs for each ID live below them and in
 `codex_tasks/`. Bug-level status lives in `live_findings_ledger.md`. Effort: S≤2h · M≤1day · L=days.)*
 
@@ -44,6 +44,9 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 | H12 | Liveness step-5 render leg (level-reuse, subsampled percentile) | M | low | last big live-smoothness lever | — | **DONE** `7fb20748` (A6 live-verify pending) |
 | H13(a-c) | Timer safety: LD-1 load-debounce cancel, alias fix, reint-timer stop, pool race, non-blocking teardown, XYE cache, **BR-1** browser-select no-clear | S×7 | low-med | wrong-file pollute + last stalls + BR-1 | Wave 1 | **DONE** `b8e62542` (LD-1/BR-1 live-verify pending) |
 | H-hyd | Hydration purpose-scoping residuals (full→1d leaks, dedupe key, Sum/Avg churn) | S×4 | low | no 60MB/frame churn loops | H7-gate | **DONE** `cba5995c` |
+| MEM-1 | OOM triad: bounded `_published_frames` handoff + free raw on staging eviction + `mark_dropped` release + viewer LRU cap wins (MEM-1a-d) | M | med | live-mode OOM class closed | review_2026-07-02_memory_load [1][2][3][12] | **DONE** `30eeab4e`; live-verify Session-1 (RSS bounds) |
+| MEM-2 | RAM-aware heavy window: `heavy_window(frame_bytes)=clamp(25% RAM/frame_bytes,16,64)`, `XDART_HEAVY_WINDOW` override; all three caps consume it | S | low | small-RAM boxes stop thrashing; 64-cap becomes budget-derived | MEM-1 | **DONE** `fb074d6f` |
+| MEM-3 | Reduction pool cap `min(4,cpu)` + memory-aware floor + `XDART_REDUCTION_WORKERS` + honest Cores knob | S | low-med | ~-3 GB peak at same speed; small-RAM floor | MEM-2 | **IN FLIGHT** (mem2 worktree; port pending) |
 | RC-FV | Final verification (full suite, strict-tree, build, staging) | S | none | certifies the tag commit | Waves 1-3 | **QUEUED** (`release_final_verification.md`) |
 | RC-7s | Maintainer live Session-1 | — | — | closes every fixed-unverified row | RC-FV | **PENDING** (maintainer) |
 | RC-8 | Merge → tag v1.0.0 → publish + stubs + branch cleanup | S | low | **v1.0.0 on PyPI** | RC-7s, repo-public decision | **PENDING** (maintainer) |
@@ -85,9 +88,9 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 | MD-2 | Meta Type auto default + explicit none/off boundary | S | low | fresh sessions discover sidecars by default; disabled metadata never calls the reader | MD-1 | **DONE** this commit |
 | UX-1 | Menu-backed keyboard shortcuts for run/stop/load/save/write-mode toggle | S | low | fast operator loop without bypassing button locks | — | **DONE** this commit |
 | GI-1 | Auto χ/χGI full-range determinism for 1D integrations | S | med | Auto writes match explicit `-180..180`; χGI boundary scans stable | — | **DONE** this commit |
-| CF-1 | Append config mismatch blocker + data-authoritative display units | S | low-med | Append cannot silently no-op after Standard↔Grazing/settings changes; loaded data keeps its stored units until Replace/new processing | Controls V2/readiness | fixed-unverified; verify Session-1 Append Standard↔Grazing |
-| CF-2 | Append mismatch Run-click modal + Eiger target identity | S | med | Append mismatch is handled before the run with Cancel or Replace & re-integrate; Eiger `_master` source names resolve to the same target as the writer; writer-backstop abort cleanup avoids duplicate tracebacks | CF-1 | fixed-unverified; verify Session-1 Append Standard↔Grazing |
-| UI-3 | Slice c/w + Pin gate follows cake data presence | S | low | append-loaded/browser-loaded Int 2D data re-enables χ/q slice controls after `binned_data` arrives; clears disable them again | UI-2, OV-7 | fixed-unverified; verify Session-1 F5-adjacent |
+| CF-1 | Append config mismatch blocker + data-authoritative display units | S | low-med | Append cannot silently no-op after Standard↔Grazing/settings changes; loaded data keeps its stored units until Replace/new processing | Controls V2/readiness | fixed-unverified (`0c0b4da6`+`14efca96`); verify Session-1 Append Standard↔Grazing |
+| CF-2 | Append mismatch Run-click modal + Eiger target identity | S | med | Append mismatch is handled before the run with Cancel or Replace & re-integrate; Eiger `_master` source names resolve to the same target as the writer; writer-backstop abort cleanup avoids duplicate tracebacks | CF-1 | fixed-unverified (`031c134c`); verify Session-1 Append Standard↔Grazing |
+| UI-3 | Slice c/w + Pin gate follows cake data presence | S | low | append-loaded/browser-loaded Int 2D data re-enables χ/q slice controls after `binned_data` arrives; clears disable them again | UI-2, OV-7 | fixed-unverified (`031c134c`); verify Session-1 F5-adjacent |
 | H23 | nexus_writer schema convergence | M/L | med | one on-disk-contract owner | H6 | open |
 | H25 | Placement ratchet + xrd_tools/gui disposition | S | low | shell can't re-thicken silently | — | open |
 | H28 | ADR-0006 STEP 2 prepass deletion | M | med | dual-prepass risk retired | live gate slot | open |

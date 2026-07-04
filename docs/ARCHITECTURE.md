@@ -26,7 +26,7 @@ shim.  What remains: moving the GI whole-scan freeze into core.
 ## North star
 
 (Full version: `design/roadmap_2026-06-10.md`; the plan that executed the
-from-scratch framing: `design/CC_greenfield_implementation_plan_2026-06-12.md`.)
+from-scratch framing was a local-only CC_ note, not published.)
 
 1. **Headless-first** — everything below the GUI is fully usable with no
    Qt installed; a notebook, CLI batch job, or autonomous agent drives the
@@ -72,8 +72,10 @@ from-scratch framing: `design/CC_greenfield_implementation_plan_2026-06-12.md`.)
   the immutable, round-trippable unit — integration results + source ref
   + geometry + diagnostics.  Phase 5 A-Steps A/B/C have LANDED: the
   `FrameRecordStore` is wired into the live path, owns eviction + worker-thread
-  hydration, and reads are store-first (`record_store → publication →
-  data_1d/2d` fallback), with `LiveFrameSeries` demoted to write-side staging.
+  hydration, and reads are store-only: `record_store → bounded publication
+  projection → disk hydration` (the Role-A `data_1d`/`data_2d` mirrors are
+  retired; viewer rows stay viewer-scoped), with `LiveFrameSeries` demoted to
+  write-side staging.
   N1 portability: raw-source paths are stored
   relative to `entry/@source_base` (design:
   `design/design_project_root_paths_jun2026.md`).
@@ -83,8 +85,9 @@ from-scratch framing: `design/CC_greenfield_implementation_plan_2026-06-12.md`.)
 Background threads write data → the GUI computes *what to show* as
 immutable state → a thin renderer draws it, all generation-stamped
 (`display_logic.py` is the pure, Qt-free decision core; a purity guard
-enforces it).  The `PublicationStore` is becoming the sole display
-contract (Phase 3); `data_1d`/`data_2d` are interim hydration mirrors.
+enforces it). The session `FrameRecordStore` is the authoritative store;
+`PublicationStore` is a bounded derived projection (H8), and the legacy
+`data_1d`/`data_2d` mirrors are deleted (H9).
 
 ## Acceptance gates (non-negotiable)
 

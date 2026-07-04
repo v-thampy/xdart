@@ -100,7 +100,7 @@ modest for batch / pipeline / CI use:
 | `[gui]`      | the `xdart` desktop GUI                                  | PySide6, pyqtgraph, qtawesome, imagecodecs, imageio         |
 | `[fitting]`  | `analysis.fitting.*` — peak / phase / strain fitting     | lmfit, pymatgen                                             |
 | `[rsm]`      | `rsm.*` — reciprocal-space mapping, VTK export           | xrayutilities, pyevtk                                       |
-| `[notebook]` | self-contained Jupyter environment                       | ipywidgets, anywidget, ipyfilechooser, ipykernel, jupyterlab |
+| `[notebook]` | self-contained Jupyter environment                       | ipywidgets, anywidget, ipyfilechooser, ipykernel, ipympl, jupyterlab |
 | `[all]`      | everything except dev                                    | `xrd-tools[fitting,rsm,gui,notebook]`                       |
 | `[dev]`      | test / build / release tooling                           | pytest, pytest-timeout, build, twine, tifffile              |
 
@@ -219,7 +219,8 @@ raw = get_raw_frame("processed/scan1.nxs", 0)      # resolves the source pointer
 > Rietveld/LeBail refinement, automated phase matching against structure
 > databases, additional standalone correction modules. The corresponding
 > `analysis/texture.py`, `analysis/refinement.py` entries are placeholders
-> reserved for these features.
+> reserved for these features. Likewise `xrd_tools.gui.main` is a reserved
+> standalone-launcher entry point (raises `NotImplementedError`) — use `xdart`.
 
 ---
 
@@ -394,10 +395,10 @@ critical angle αc = √2δ, with exit angle αf = arcsin(qz/k − sin αi)):
   **Yoneda band**. Measured intensity carries |T(αi)|²|T(αf)|²; dividing it out removes the
   Yoneda enhancement and recovers the true scattering.
 
-Design: [`docs/design/design_intensity_corrections_jun2026.md`](docs/design/design_intensity_corrections_jun2026.md)
+Design: [`docs/design/design_intensity_corrections_jun2026.md`](https://github.com/v-thampy/xrd-tools/blob/main/docs/design/design_intensity_corrections_jun2026.md)
 (per-pixel weight stack at the accumulator seam — solid-angle/polarization reuse pyFAI arrays,
 the GI stack uses `xu.materials`). Interactive demo with on/off toggles, an αi slider and a
-material selector: `examples/.../Stitching/Multi120_GI_Corrections_Explorer.ipynb`.
+material selector: `examples/notebooks/02_multigeometry_stitching.ipynb`.
 
 ---
 
@@ -431,6 +432,15 @@ the `.nxs` at end-of-batch.
 - **Masking tools** for bad pixels, beamstop shadows, and detector edges.
 - **Calibration management** via PONI files with visual feedback.
 - **Raw-image preview thumbnails** for quick file browsing.
+- **Automatic metadata discovery** — the Meta Type selector defaults to `auto`:
+  per-image sidecar metadata (`.txt`, `.pdi`, QXRD-style
+  `image.tif.metadata`, and other structured name=value sidecars) is found and
+  parsed automatically; choose `none` to disable or `spec` for SPEC files.
+- **Overlay / Waterfall comparison across scans** — overlay 1D patterns and
+  slice cuts from multiple frames, and **pin** the current slice cut (Cmd+P)
+  to keep it on the plot for comparison; the overlay survives compatible scan
+  boundaries, so cuts from successive scans (e.g. a chi-texture series) can be
+  compared directly.
 
 ### GUI quick start
 
@@ -474,6 +484,17 @@ Results are saved as NeXus HDF5 files (`.nxs`) in the output directory. Batch
 mode is a performance switch: it runs silently (no per-frame display refresh),
 then the GUI reloads from the `.nxs` at end-of-batch.
 
+#### Append vs Replace
+
+The write-mode toggle (Cmd+Shift+A) controls whether a run **appends** new
+frames to the existing processed `.nxs` or **replaces** it. Re-running Append
+on an already-processed scan is near-instant: frames already in the output are
+skipped without re-reading the raw data. If the current processing
+configuration no longer matches the existing scan (e.g. you switched Standard
+<-> Grazing), Run shows a **Replace existing integration?** dialog —
+*Replace & re-integrate* re-processes all frames under the new configuration;
+*Cancel* leaves the existing scan untouched.
+
 #### Live mode (Live 1D, Live 2D)
 
 Monitor a directory for new image files and integrate them as they arrive —
@@ -486,6 +507,17 @@ real-time feedback during an active beamline experiment.
 
 Live and Batch are pure mode toggles; the single **Start** button morphs
 green → orange (Pause / Resume).
+
+#### Keyboard shortcuts
+
+All shortcuts are also discoverable in the File and Run menus (Cmd on macOS,
+Ctrl on Linux/Windows):
+
+- **Cmd+R** — Run / Pause / Resume the current processing run.
+- **Cmd+Shift+C** — Stop the run.
+- **Cmd+Shift+A** — toggle the write mode between Append and Replace.
+- **Cmd+P** — pin the current slice cut (adds it to the Overlay).
+- **Cmd+O** / **Cmd+S** — load / save the xdart settings (Config).
 
 #### Viewer mode
 
@@ -532,11 +564,14 @@ parameters:
 - **Radial range**: manually clip the Q or 2θ range (overrides auto-detection).
 - **Azimuthal range**: select only certain χ sectors.
 
-> **Auto Mask Saturated** is the authoritative toggle for saturated-pixel
-> masking (kept equal across live and reintegrate). OFF masks **nothing** —
-> the raw frame, including the uint32-max sentinel, passes through; ON masks
-> dead/saturated pixels. Strong Bragg peaks legitimately saturate, so the
-> toggle never auto-masks them away — keep it OFF when you want to retain them.
+> **Auto Mask Saturated** (the "Auto" toggle in the pixel-rejection row,
+> default **ON**) is the authoritative toggle for saturated-pixel masking,
+> applied identically across live, batch, and reintegrate. ON masks negatives,
+> the uint32 dead/hot sentinel (Eiger), and the integer-dtype saturation
+> ceiling — but the ceiling mask only fires when a whole block of the frame
+> (>=1e-4 of pixels) sits at the ceiling, so a handful of legitimately
+> saturated strong Bragg pixels are kept. OFF masks nothing — the raw frame,
+> including the uint32-max sentinel, passes straight through to the integration.
 
 #### Background subtraction
 
@@ -627,15 +662,21 @@ Verify the PONI file is text-based `key=value` pairs and that paths are
 absolute or relative to the working directory.
 
 **Re-Integrate memory use (sizing a low-RAM machine):**
-The 2D browse cache is a fixed steady-state ceiling of about **0.7 GB**
-(40 frames × ~18 MB), independent of scan length and core count. A
-Re-Integrate pass adds a *transient* raw-frame peak on top of that, about
-**2 × (cores) × ~18 MB** — roughly **0.6 GB at 16 cores**, **1.15 GB at 32
-cores**. That peak is bounded by the number of worker cores, **not** by the
-scan length (raw frames are freed between chunks), so a long scan does not
-grow it. On a low-RAM machine, **lower the core count** in the GUI before a
-large Re-Integrate to cap the transient peak — there is no separate memory
-knob yet; it tracks the cores selector.
+The 2D display/staging window is RAM-aware: xdart keeps up to
+`clamp(0.25 x total_RAM / frame_size, 16, 64)` frames of heavy data in memory
+(64 on a large-RAM machine; 16 on a small one), logged at run start as
+`heavy window: N frames (...)`. Set `XDART_HEAVY_WINDOW=<n>` (8-128) to pin
+it. A Re-Integrate pass adds a transient raw-frame peak of about
+`2 x (cores) x ~18 MB`, bounded by worker cores, not scan length; on a
+low-RAM machine lower the core count and/or set a smaller
+`XDART_HEAVY_WINDOW`.
+
+**Environment variables:**
+`XDART_FLUSH_MS` (default 150, floor 110) controls the heavy image-update
+quantum during live runs; `XDART_LIST_MS` (default 60) controls the fast
+frame-list/cursor refresh; `XDART_PERF=1` logs per-flush display-pipeline
+timings; `XDART_HEAVY_WINDOW=<n>` (8-128) pins the RAM-aware in-memory
+heavy-frame window.
 
 ---
 
@@ -659,10 +700,15 @@ need Qt belongs in `xrd_tools` ("keep xdart thin").
   `frame_view.py` (`read_frame_view` / `read_frame_views`), `image.py`,
   `image_source.py`, `spec.py`, `metadata.py`, `nexus_inspect.py`, `export.py`,
   `tiled.py`.
+- **`sources/`** — source-readiness and capability contracts, including
+  `describe_source_readiness`, shared by headless callers and xdart run gating.
 - **`reduction/`** — the streaming spine. `ReductionSession` (parallel workers
   + single writer thread, bounded in-flight, fail-loud `finish()`),
   `run_reduction`, sinks (`NexusSink`, `XYESink`, `MemorySink`,
   `CompositeSink`), GI freeze policies, `FlushPolicy`.
+- **`session/`** — headless session/display contracts: readiness, display
+  decision logic, frame records, publication projections, and shared staging
+  budgets used by the GUI.
 - **`integrate/`** — pyFAI integration + GI (`integrate_1d/2d`,
   `create_fiber_integrator`, `integrate_gi_*`, `stitch_1d/2d`,
   calibration: `load_poni` / `poni_to_integrator` / `poni_to_fiber_integrator`),
@@ -676,6 +722,10 @@ need Qt belongs in `xrd_tools` ("keep xdart thin").
   (sin²ψ).
 - **`corrections/`** — intensity-correction modules (see above).
 - **`viz/`** — matplotlib/plotly headless plotting (no Qt).
+- **`gui/`** — Jupyter-widget viewers for notebooks (`powder_1d_viewer`,
+  `powder_2d_viewer`, `rsm_viewer`, `napari_viewer`). `gui.main` is a reserved
+  entry point only — it raises `NotImplementedError`; the desktop GUI is
+  `xdart`.
 
 ### `xdart` — Qt GUI (thin consumer)
 
@@ -691,7 +741,7 @@ need Qt belongs in `xrd_tools` ("keep xdart thin").
   (`display_controllers.py`). Viewer controllers resolve files through the
   headless `xrd_tools.io` APIs — xdart never opens HDF5 to guess.
 
-Layer map: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Layer map: [`docs/ARCHITECTURE.md`](https://github.com/v-thampy/xrd-tools/blob/main/docs/ARCHITECTURE.md).
 
 ---
 
@@ -719,8 +769,10 @@ open an issue on the GitHub repository.
 
 ## License
 
-Released under the **MIT License**. See the [LICENSE](LICENSE) file for
-details.
+First-party code is released under the **MIT License** (see
+[LICENSE](https://github.com/v-thampy/xrd-tools/blob/main/LICENSE)); code
+inherited from `ssrl_xrd_tools` is BSD-3-Clause (see
+`licenses/LICENSE-ssrl_xrd_tools`). SPDX: `MIT AND BSD-3-Clause`.
 
 ## Citation
 

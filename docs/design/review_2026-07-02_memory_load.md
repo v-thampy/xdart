@@ -3,6 +3,11 @@
 > (findings [1],[2],[3],[12]); coupled perf work in `codex_tasks/perf_regression_651.md`.
 > Post-tag items ([4],[5],[14],[15] + medium/low tail) are ledgered via MEM-1's commit.
 > This document is the reference map of the live-mode memory economy.
+>
+> **Addendum (2026-07-03):** findings [1],[2],[3],[12] fixed in `30eeab4e`
+> (MEM-1a-d); RAM-aware heavy window landed in `fb074d6f` (MEM-2).
+> [4],[5],[14],[15] remain deferred post-tag (`deferred_ledger.md`). MEM-3
+> worker-cap census pending.
 
 # xrd-tools `feature/remediation` — Memory-Pressure & High-Load Review
 
