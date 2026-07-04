@@ -2323,8 +2323,16 @@ class imageThread(wranglerThread):
         if self._streaming_session is not None:   # a different scan started
             self._close_reduction_session()
         standard_plan = self._plan_cache.get(scan, integrate_2d=not scan.skip_2d)
-        n_workers = max(1, self.max_cores)
-        executor = n_workers if n_workers > 1 else None
+        # MEM-3: map Cores honestly to the reduction pool, capped at the
+        # throughput knee (memory-aware) and NEVER to None — the old
+        # ``n_workers==1 -> None`` silently built a ~20-worker default pool
+        # (20 integrator deepcopies), the opposite of the requested serial run.
+        from xrd_tools.core import (
+            reduction_worker_cap, reduction_worker_cap_log_line)
+        executor = reduction_worker_cap(self.max_cores)
+        logger.info(reduction_worker_cap_log_line(
+            executor, requested=self.max_cores,
+            overridden=bool(os.environ.get("XDART_REDUCTION_WORKERS"))))
         cancel_token = self._cancel_token() if hasattr(self, "_cancel_token") else None
         # Batch brackets all frames (scout_union over first+last of the chunk);
         # live has no last frame at session open, so it freezes from the first
@@ -2335,8 +2343,15 @@ class imageThread(wranglerThread):
         # MEM-2: RAM-aware heavy window feeds all three heavy caps.  Set the
         # LiveFrameSeries staging cap here so the record store (which mirrors it)
         # and the GUI's PublicationStore (which reads self._heavy_window) all
-        # take the same value.
-        window = self._heavy_staging_window(scan)
+        # take the same value.  Defensive getattr: reduction-session tests drive
+        # this through a minimal host double without the wrangler's method — fall
+        # back to the pure RAM-aware default (MEM-3 fix for a MEM-2 test gap).
+        _hsw = getattr(self, "_heavy_staging_window", None)
+        if callable(_hsw):
+            window = _hsw(scan)
+        else:
+            from xrd_tools.core import heavy_window
+            window = heavy_window()
         frames_obj = getattr(scan, "frames", None)
         if frames_obj is not None:
             frames_obj._in_memory_cap = window

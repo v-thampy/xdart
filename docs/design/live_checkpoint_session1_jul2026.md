@@ -91,9 +91,12 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
 
 ## G. Final fixed-unverified additions (2026-07-03)
 - [ ] G1 CF-1/CF-2 Append config-mismatch BOTH ways: load Standard, flip to Grazing, Run in
-      Append -> Run-click modal appears; Cancel does not run; Replace flips to Replace and
+      Append -> Run-click modal appears; No does not run; Yes flips to Replace and
       re-integrates. Repeat Grazing->Standard. Eiger `_master` target resolves to the same file;
-      loaded data keeps stored units until Replace.
+      loaded data keeps stored units until Yes/Replace. CF-3 cold path: fresh xdart launch with NO
+      viewer-loaded scan, partial Standard target already on disk (e.g. 210/651), panel = Grazing,
+      Run in Append -> same modal appears before any frame processes; No leaves the file
+      untouched and produces no duplicate writer traceback.
 - [ ] G2 UI-2/UI-3 fresh-launch χ (c/w) slice toggle no-crash with no data + slice c/w + Pin
       re-enable after append/browser-loaded Int 2D cake arrives and disable again on clear.
 - [ ] G3 OV-7 texture-cut workflow: Pin two χ/q centers on one frame, move live c/w — pinned cuts

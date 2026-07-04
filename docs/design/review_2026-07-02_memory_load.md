@@ -707,3 +707,54 @@ Magnitude at 5000 frames: genuine per-frame Qt-object accumulation (scenario d),
 </details>
 
 ---
+
+## Addendum (2026-07-03) — the 9 GB floor solved (2.3a) + worker-scaling
+
+Follow-up profiling closed out "where is the 9 GB floor." It is **not** the raw
+window (the numpy census finds ~0 live arrays at any point) and **not** pyFAI's
+base cost (standalone: `load` + `integrate1d(10000)` + `integrate2d(500)` =
+**1.96 GB**; split mode nearly irrelevant — no-split 0.97 / bbox 1.96 / full
+1.97). It is **per-worker integrator geometry**:
+
+- pyFAI `AzimuthalIntegrator`s are not thread-safe, so
+  `_ReductionIntegratorProvider` `copy.deepcopy`s the whole integrator (geometry
+  + CSR LUT ≈ 0.8 GB) **per worker thread** — a deliberate thread-safety choice,
+  **not** an ADR-0007 violation (ADR-0007 mandates scan-level sharing; the
+  per-worker copy is inside that).
+- Live-array census at the 5.14 GB setup point: `{'AzimuthalIntegrator': 6,...}`
+  — 6 integrators before the first `integrate2d`, climbing as workers spin up.
+  `gc.collect` frees none (held C-level → numpy census reads ~0 GB).
+
+### Worker-count scaling (651-frame Eiger, measured)
+
+| workers | peak RSS | time | speedup | note |
+|---|---|---|---|---|
+| 2 | 6.0 GB | 36.5 s | 1.75× | |
+| **4** | **9.1 GB** | **25.0 s** | **2.53×** | throughput knee + production default |
+| 8 | 13.7 GB | 26.1 s | 2.50× | +0 speed, +4.6 GB |
+| 16 | 19.3 GB | 26.8 s | 2.42× | slower, +10 GB |
+
+Memory ≈ 4 GB base + ~1 GB/worker; **throughput saturates at 4** (the serial
+writer thread + GIL-held Python glue are the ceiling, not the 16 cores).
+
+### Correction to the earlier draft
+
+An earlier note claimed "4 workers = full speed AND −3 GB vs the default." Wrong:
+it came from the benchmark accidentally running `max_cores=1` (→ the latent
+20-worker default pool). The **UI Cores default is 4** (`specUI.py:100`
+`min(cpu-1, 4)`, applied in live too), so **production already runs 4 workers ≈
+9 GB** — the cap does not lower the common-case floor.
+
+### MEM-3 (implemented) and the deep fix (scoped)
+
+- **MEM-3 guardrail:** `reduction_worker_cap()` (`staging.py`, sharing the MEM-2
+  RAM budget) caps the default/fallback pool at the knee (4, floor 2 on <16 GiB),
+  maps Cores **honestly** to the pool (fixing the latent `Cores=1 → None → 20`
+  bug), env `XDART_REDUCTION_WORKERS`. Effect: prevents the 8/16-worker 14–19 GB
+  blowup for zero throughput; the common-case default (4) is unchanged.
+- **Deep fix (deferred):** share integrator geometry read-only across workers —
+  the only lever that lowers the 4-worker floor at full speed (~3 GB). Declined
+  pre-tag on thread-safety / equivalence-spine / pyFAI-coupling risk; scoped in
+  `design_reduction_integrator_sharing.md`.
+- Cheaper same-floor lever without those risks: finding **[5]** (kill the float64
+  ingest upcast) halves the in-flight-scratch half of the per-worker cost.

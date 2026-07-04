@@ -21,6 +21,7 @@ from pyqtgraph.parametertree import Parameter
 # This module imports
 from xdart.utils.h5pool import get_pool as _get_h5pool
 from xrd_tools.io.export import write_xye
+from .qt_nexus_sink import _is_append_axis_mismatch
 
 logger = logging.getLogger(__name__)
 
@@ -622,8 +623,18 @@ class wranglerThread(Qt.QtCore.QThread):
                     _report_result(sess, res)
                 except Exception as exc:
                     errors.append(exc)
-                    logger.error("reduction session WRITE FAILED on close: %s",
-                                 exc, exc_info=True)
+                    if _is_append_axis_mismatch(exc):
+                        logger.debug(
+                            "append mismatch already reported by sink abort; "
+                            "suppressing duplicate traceback",
+                            exc_info=True,
+                        )
+                    else:
+                        logger.error(
+                            "reduction session WRITE FAILED on close: %s",
+                            exc,
+                            exc_info=True,
+                        )
         if errors:
             self._reduction_write_error = errors[0]
             msg = (f"Save FAILED — output .nxs may be incomplete: {errors[0]}")

@@ -32,6 +32,7 @@ from xrd_tools.io.metadata import _extract_scan_info
 from .wrangler_widget import wranglerWidget
 from .image_wrangler_thread import imageThread, _get_scan_info  # noqa: F401
 from .ui.specUI import Ui_Form
+from xdart.modules.live import LiveScan
 from xdart.utils import get_fname_dir, match_img_detector
 from xdart.utils.session import load_session, save_session
 
@@ -1017,23 +1018,81 @@ class imageWrangler(wranglerWidget):
             return False
         return current == target
 
+    def _append_target_snapshot_scan(self, target):
+        """Read the append target's stored processing config without displaying it."""
+
+        if not target or not os.path.exists(target):
+            return None
+        scan_name = Path(str(target)).stem
+        try:
+            scan = LiveScan(
+                scan_name,
+                data_file=str(target),
+                static=True,
+                file_lock=getattr(self, "file_lock", None),
+            )
+            scan.load_from_h5(replace=False, mode="r")
+            return scan
+        except Exception:
+            logger.warning(
+                "append target config check could not read %s; proceeding "
+                "without pre-run mismatch modal",
+                target,
+                exc_info=True,
+            )
+            return None
+
     def _append_config_mismatch_details(self):
         scan = getattr(self, "scan", None)
-        if scan is None:
-            return None, None, None
-        if not imageWrangler._append_target_matches_scan_file(
-            self,
-            scan,
-            refresh_source=True,
-        ):
-            return None, None, None
         active_write_mode = getattr(self, "_active_write_mode", None)
         write_mode = (
             active_write_mode()
             if callable(active_write_mode)
             else imageWrangler._active_write_mode(self)
         )
-        processed = processing_config_from_scan(scan, prefer_stored=True)
+        if str(write_mode or "").strip().lower() != "append":
+            return None, None, None
+
+        target = imageWrangler._candidate_append_target_file(
+            self,
+            refresh_source=True,
+        )
+        processed = None
+        if target and os.path.exists(target):
+            # Cold-launch path (CF-3): no viewer-loaded scan yet, but Append is
+            # about to target an existing .nxs. Read the target's stored config
+            # before any frame can process so the overwrite modal fires pre-run
+            # instead of relying on the writer's mid-run backstop. This
+            # disk config is authoritative when the append target already exists.
+            target_scan = imageWrangler._append_target_snapshot_scan(self, target)
+            if target_scan is not None:
+                processed = processing_config_from_scan(
+                    target_scan,
+                    prefer_stored=True,
+                )
+                try:
+                    index = getattr(
+                        getattr(target_scan, "frames", None),
+                        "index",
+                        None,
+                    )
+                    self._append_target_frame_count = (
+                        len(index) if index is not None else 0
+                    )
+                except Exception:
+                    self._append_target_frame_count = 0
+
+        if (
+            processed is None
+            and scan is not None
+            and imageWrangler._append_target_matches_scan_file(self, scan)
+        ):
+            # Fast path/fallback: when the viewer-loaded scan is the same file
+            # this run would append to, use its already-restored reduction config.
+            processed = processing_config_from_scan(scan, prefer_stored=True)
+
+        if processed is None or scan is None:
+            return None, None, None
         current = processing_config_from_scan(scan)
         check = append_config_mismatch_check(
             write_mode,
@@ -1100,37 +1159,12 @@ class imageWrangler(wranglerWidget):
             f"{axis_text}{imageWrangler._format_append_range(range_value)}"
         )
 
-    def _append_replace_frame_count(self):
-        scan = getattr(self, "scan", None)
-        try:
-            index = getattr(getattr(scan, "frames", None), "index", None)
-            count = len(index) if index is not None else 0
-        except Exception:
-            count = 0
-        if count:
-            return count
-        try:
-            return int(getattr(self, "_source_frame_count", 0) or 0)
-        except (TypeError, ValueError):
-            return 0
-
     def _append_config_mismatch_modal_text(self, processed, current):
-        frame_count = imageWrangler._append_replace_frame_count(self)
-        if frame_count > 0:
-            consequence = (
-                f"Replace will re-integrate all {frame_count} frames and "
-                "overwrite the existing output."
-            )
-        else:
-            consequence = (
-                "Replace will re-integrate the source frames and overwrite the "
-                "existing output."
-            )
         return (
-            "Append cannot add rows with different integration settings.\n\n"
+            "Scan already integrated with different integration settings.\n\n"
             f"Processed: {imageWrangler._format_append_config(processed)}\n"
             f"Current: {imageWrangler._format_append_config(current)}\n\n"
-            f"{consequence}"
+            "Overwrite processed data with new settings?"
         )
 
     def _confirm_append_config_replace(self, check, processed, current):
@@ -1143,18 +1177,12 @@ class imageWrangler(wranglerWidget):
         box.setWindowTitle("Replace existing integration?")
         box.setText(imageWrangler._append_config_mismatch_modal_text(
             self, processed, current))
-        box.setInformativeText(
-            "Cancel keeps the existing processed scan unchanged."
-        )
-        replace = box.addButton(
-            "Replace & re-integrate",
-            QMessageBox.DestructiveRole,
-        )
-        cancel = box.addButton("Cancel", QMessageBox.RejectRole)
-        box.setDefaultButton(cancel)
-        box.setEscapeButton(cancel)
+        yes = box.addButton("Yes", QMessageBox.DestructiveRole)
+        no = box.addButton("No", QMessageBox.RejectRole)
+        box.setDefaultButton(no)
+        box.setEscapeButton(no)
         box.exec()
-        return box.clickedButton() is replace
+        return box.clickedButton() is yes
 
     def _set_active_write_mode(self, mode):
         controls = getattr(self, "_controls", None)

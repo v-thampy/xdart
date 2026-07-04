@@ -1055,8 +1055,13 @@ class ReductionSession:
         """
         if self._worker is None:
             # Streaming needs a real pool; build a default owned one when the
-            # caller passed executor=None/False.
-            self._worker, self._owns_worker = ThreadPoolExecutor(), True
+            # caller passed executor=None/False.  MEM-3: cap it at the RAM-aware
+            # throughput knee (~4) instead of Python's ``min(32, cpu+4)`` default
+            # — each worker deep-copies the integrator, so an unbounded default
+            # pool duplicated the geometry ~20x for no throughput gain.
+            from xrd_tools.core import reduction_worker_cap
+            self._worker = ThreadPoolExecutor(max_workers=reduction_worker_cap())
+            self._owns_worker = True
         n_workers = getattr(self._worker, "_max_workers", None) or 4
         bound = (
             self.inflight_max
@@ -2242,7 +2247,9 @@ def _coerce_executor(executor: Any | None):
     if executor is None or executor is False:
         return None, False
     if executor is True:
-        return ThreadPoolExecutor(), True
+        # MEM-3: cap the "just give me a pool" default at the RAM-aware knee.
+        from xrd_tools.core import reduction_worker_cap
+        return ThreadPoolExecutor(max_workers=reduction_worker_cap()), True
     if isinstance(executor, int):
         if executor <= 0:
             raise ValueError(f"executor worker count must be > 0; got {executor}")

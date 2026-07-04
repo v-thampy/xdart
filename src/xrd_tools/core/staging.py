@@ -115,12 +115,84 @@ def heavy_window_log_line(
     return f"heavy window: {window} frames ({ram}, {frame}){tag}"
 
 
+# ── MEM-3: reduction worker-pool sizing ─────────────────────────────────────
+#: measured throughput knee — past ~4 workers each one adds ~1 GB (an integrator
+#: deepcopy + its in-flight scratch) for ~0 speed (651-frame Eiger: 4w=25.0s,
+#: 8w=26.1s, 16w=26.8s; peak RSS 9/14/19 GB).
+DEFAULT_REDUCTION_WORKERS = 4
+MAX_REDUCTION_WORKERS = 16
+REDUCTION_WORKERS_ENV = "XDART_REDUCTION_WORKERS"
+#: below this TOTAL RAM the pool is floored to 2 (each worker ~1 GB of
+#: duplicated integrator geometry — the budget pressure heavy_window responds to).
+_SMALL_RAM_FLOOR_BYTES = 16 * _GIB
+
+
+def reduction_worker_cap(
+    requested: int | None = None,
+    *,
+    total_ram_bytes: int | None = None,
+    env=None,
+) -> int:
+    """Number of reduction worker threads.
+
+    Each worker deep-copies the pyFAI integrator (thread-safety workaround), so
+    the pool is a memory consumer sharing the same RAM pressure as the heavy
+    staging window.  Resolution:
+
+    1. ``XDART_REDUCTION_WORKERS`` pins it, clamped ``[1, 16]``.
+    2. an explicit ``requested`` count (the user's Cores) wins, clamped to
+       ``[1, min(16, cpu)]`` — the cap replaces only the silent default, never a
+       deliberate user choice.
+    3. else the default knee ``min(4, cpu)``.
+    4. a small-RAM box (< 16 GiB total) floors the result to 2.
+
+    ALWAYS returns >= 1 — never ``None`` (the ``None`` path was the latent
+    20-worker-default bug: ``n_workers==1 -> executor=None ->`` a
+    ``min(32, cpu+4)`` pool).
+    """
+    source = env if env is not None else os.environ
+    raw = source.get(REDUCTION_WORKERS_ENV)
+    if raw is not None and str(raw).strip():
+        try:
+            return _clamp(int(str(raw).strip()), 1, MAX_REDUCTION_WORKERS)
+        except (TypeError, ValueError):
+            pass  # malformed override → fall through
+
+    cpu = os.cpu_count() or DEFAULT_REDUCTION_WORKERS
+    hard = min(MAX_REDUCTION_WORKERS, cpu)
+    if requested is not None and int(requested) > 0:
+        want = min(int(requested), hard)              # user's Cores wins
+    else:
+        want = min(DEFAULT_REDUCTION_WORKERS, cpu)     # the knee
+
+    total = (
+        total_ram_bytes
+        if total_ram_bytes is not None
+        else total_physical_ram_bytes()
+    )
+    if total and total < _SMALL_RAM_FLOOR_BYTES:
+        want = min(want, 2)
+    return max(1, want)
+
+
+def reduction_worker_cap_log_line(workers, requested=None, *, overridden=False):
+    """One-line run-start summary of the reduction pool size."""
+    tag = " [XDART_REDUCTION_WORKERS override]" if overridden else ""
+    req = f" (Cores requested {requested})" if requested else ""
+    return f"reduction workers: {workers}{req}{tag}"
+
+
 __all__ = [
     "heavy_window",
     "heavy_window_log_line",
     "total_physical_ram_bytes",
+    "reduction_worker_cap",
+    "reduction_worker_cap_log_line",
     "DEFAULT_WINDOW",
     "MIN_WINDOW",
     "MAX_WINDOW",
     "ENV_OVERRIDE",
+    "DEFAULT_REDUCTION_WORKERS",
+    "MAX_REDUCTION_WORKERS",
+    "REDUCTION_WORKERS_ENV",
 ]

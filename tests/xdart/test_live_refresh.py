@@ -7401,6 +7401,26 @@ def _append_modal_scan(*, data_file, processed_gi=False, current_gi=True,
     )
 
 
+class _FakeAppendTargetScan:
+    load_calls = []
+    reduction_config = {}
+    frame_index = []
+
+    def __init__(self, name, data_file=None, file_lock=None, **_kwargs):
+        self.name = name
+        self.data_file = str(data_file)
+        self.file_lock = file_lock
+        self.frames = SimpleNamespace(index=[])
+        self.reduction_config = {}
+        self._display_reduction_config = {}
+
+    def load_from_h5(self, replace=False, mode="r"):
+        self.load_calls.append((self.name, self.data_file, replace, mode))
+        self.frames.index = list(self.frame_index)
+        self.reduction_config = dict(self.__class__.reduction_config)
+        self._display_reduction_config = dict(self.__class__.reduction_config)
+
+
 def _append_modal_host(tmp_path, *, raw_name="scan_0001.tif",
                        target_name="scan.nxs", processed_gi=False,
                        current_gi=True, frame_count=3):
@@ -7420,6 +7440,46 @@ def _append_modal_host(tmp_path, *, raw_name="scan_0001.tif",
     return host
 
 
+def _append_cold_target_host(tmp_path, *, raw_name="scan_0001.tif",
+                             target_name="scan.nxs", current_gi=True,
+                             target_exists=True):
+    host = _wrangler_host("Int 2D", live=False, batch=True)
+    raw = tmp_path / raw_name
+    raw.write_bytes(b"")
+    target = tmp_path / target_name
+    if target_exists:
+        target.write_bytes(b"sentinel")
+    current_1d = {"unit": "q_A^-1"}
+    current_2d = {"unit": "q_A^-1"}
+    gi_config = {}
+    if current_gi:
+        current_1d["gi_mode_1d"] = "q_total"
+        current_2d["gi_mode_2d"] = "qip_qoop"
+        gi_config = {"gi_mode_1d": "q_total", "gi_mode_2d": "qip_qoop"}
+    host.img_file = str(raw)
+    host.h5_dir = str(tmp_path)
+    host.scan = SimpleNamespace(
+        data_file=None,
+        bai_1d_args=current_1d,
+        bai_2d_args=current_2d,
+        gi=bool(current_gi),
+        gi_config=gi_config,
+        frames=SimpleNamespace(index=[]),
+        skip_2d=False,
+    )
+    host._controls = _FakeRunControls("Append")
+    return host, target
+
+
+def _expected_append_mismatch_modal_text(processed, current):
+    return (
+        "Scan already integrated with different integration settings.\n\n"
+        f"Processed: {processed}\n"
+        f"Current: {current}\n\n"
+        "Overwrite processed data with new settings?"
+    )
+
+
 def test_append_config_mismatch_run_click_cancel_stops_before_start(tmp_path):
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
 
@@ -7428,7 +7488,13 @@ def test_append_config_mismatch_run_click_cancel_stops_before_start(tmp_path):
     prompts = []
 
     def _cancel(check, processed, current):
-        prompts.append((check, processed.display_mode, current.display_mode))
+        prompts.append((
+            check,
+            processed.display_mode,
+            current.display_mode,
+            imageWrangler._append_config_mismatch_modal_text(
+                host, processed, current),
+        ))
         return False
 
     host._confirm_append_config_replace = _cancel
@@ -7437,10 +7503,90 @@ def test_append_config_mismatch_run_click_cancel_stops_before_start(tmp_path):
 
     assert len(prompts) == 1
     assert prompts[0][0].ok is False
-    assert prompts[0][1:] == ("Standard", "Grazing")
+    assert prompts[0][1:3] == ("Standard", "Grazing")
+    assert prompts[0][3] == _expected_append_mismatch_modal_text(
+        "Standard, Q",
+        "Grazing, Qip-Qoop",
+    )
     assert host.sigStart.emitted == []
     assert host._controls.write_mode() == "Append"
     assert getattr(host, "command", None) != "start"
+
+
+def test_append_config_mismatch_cold_partial_target_cancel_stops_before_start(
+        monkeypatch, tmp_path):
+    from xdart.gui.tabs.static_scan.wranglers import image_wrangler as iw_mod
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    host, target = _append_cold_target_host(
+        tmp_path,
+        current_gi=True,
+        target_exists=True,
+    )
+    _FakeAppendTargetScan.load_calls = []
+    _FakeAppendTargetScan.frame_index = list(range(1, 211))  # partial 210/651
+    _FakeAppendTargetScan.reduction_config = {
+        "gi": False,
+        "bai_1d_args": {"unit": "q_A^-1"},
+        "bai_2d_args": {"unit": "q_A^-1"},
+    }
+    monkeypatch.setattr(iw_mod, "LiveScan", _FakeAppendTargetScan)
+    prompts = []
+
+    def _cancel(check, processed, current):
+        prompts.append((
+            check,
+            processed.display_mode,
+            current.display_mode,
+            imageWrangler._append_config_mismatch_modal_text(
+                host, processed, current),
+        ))
+        return False
+
+    host._confirm_append_config_replace = _cancel
+
+    imageWrangler._on_start_clicked(host)
+
+    assert _FakeAppendTargetScan.load_calls == [
+        ("scan", str(target), False, "r")
+    ]
+    assert len(prompts) == 1
+    assert prompts[0][0].ok is False
+    assert prompts[0][1:3] == ("Standard", "Grazing")
+    assert prompts[0][3] == _expected_append_mismatch_modal_text(
+        "Standard, Q",
+        "Grazing, Qip-Qoop",
+    )
+    assert host.sigStart.emitted == []
+    assert host._controls.write_mode() == "Append"
+    assert getattr(host, "command", None) != "start"
+    assert target.read_bytes() == b"sentinel"
+
+
+def test_append_config_mismatch_no_target_skips_modal_and_starts(
+        monkeypatch, tmp_path):
+    from xdart.gui.tabs.static_scan.wranglers import image_wrangler as iw_mod
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    host, target = _append_cold_target_host(
+        tmp_path,
+        current_gi=True,
+        target_exists=False,
+    )
+    host._confirm_append_config_replace = (
+        lambda *_: (_ for _ in ()).throw(AssertionError("no modal expected"))
+    )
+
+    def fail_live_scan(*_args, **_kwargs):
+        pytest.fail("missing append target should not be opened")
+
+    monkeypatch.setattr(iw_mod, "LiveScan", fail_live_scan)
+
+    imageWrangler._on_start_clicked(host)
+
+    assert not target.exists()
+    assert host._controls.write_mode() == "Append"
+    assert host.sigStart.emitted == [()]
 
 
 def test_append_config_mismatch_run_click_replace_flips_mode_and_starts(tmp_path):
@@ -7469,13 +7615,94 @@ def test_append_config_mismatch_modal_symmetric_gi_to_standard(tmp_path):
     prompts = []
     host._confirm_append_config_replace = (
         lambda check, processed, current:
-        prompts.append((processed.display_mode, current.display_mode)) or False
+        prompts.append((
+            processed.display_mode,
+            current.display_mode,
+            imageWrangler._append_config_mismatch_modal_text(
+                host, processed, current),
+        )) or False
     )
 
     imageWrangler._on_start_clicked(host)
 
-    assert prompts == [("Grazing", "Standard")]
+    assert prompts == [(
+        "Grazing",
+        "Standard",
+        _expected_append_mismatch_modal_text(
+            "Grazing, Qip-Qoop",
+            "Standard, Q",
+        ),
+    )]
     assert host.sigStart.emitted == []
+
+
+def test_append_config_mismatch_modal_uses_yes_no_with_no_default(
+        monkeypatch, tmp_path):
+    from xdart.gui.tabs.static_scan.wranglers import image_wrangler as iw_mod
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    host = _append_modal_host(tmp_path, processed_gi=False, current_gi=True)
+    check, processed, current = imageWrangler._append_config_mismatch_details(host)
+    boxes = []
+
+    class _FakeMessageBox:
+        Warning = object()
+        DestructiveRole = object()
+        RejectRole = object()
+
+        def __init__(self, parent=None):
+            self.parent = parent
+            self.buttons = []
+            self.default_button = None
+            self.escape_button = None
+            self.clicked_button = None
+            boxes.append(self)
+
+        def setIcon(self, icon):
+            self.icon = icon
+
+        def setWindowTitle(self, title):
+            self.title = title
+
+        def setText(self, text):
+            self.text = text
+
+        def addButton(self, text, role):
+            button = SimpleNamespace(text=text, role=role)
+            self.buttons.append(button)
+            if text == "No":
+                self.clicked_button = button
+            return button
+
+        def setDefaultButton(self, button):
+            self.default_button = button
+
+        def setEscapeButton(self, button):
+            self.escape_button = button
+
+        def exec(self):
+            return 0
+
+        def clickedButton(self):
+            return self.clicked_button
+
+    monkeypatch.setattr(iw_mod, "QMessageBox", _FakeMessageBox)
+
+    assert imageWrangler._confirm_append_config_replace(
+        host, check, processed, current) is False
+
+    assert len(boxes) == 1
+    box = boxes[0]
+    assert [(button.text, button.role) for button in box.buttons] == [
+        ("Yes", _FakeMessageBox.DestructiveRole),
+        ("No", _FakeMessageBox.RejectRole),
+    ]
+    assert box.default_button.text == "No"
+    assert box.escape_button.text == "No"
+    assert box.text == _expected_append_mismatch_modal_text(
+        "Standard, Q",
+        "Grazing, Qip-Qoop",
+    )
 
 
 def test_append_config_matching_run_click_skips_modal_and_starts(tmp_path):

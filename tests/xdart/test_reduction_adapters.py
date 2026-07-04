@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import numpy as np
 import pandas as pd
 import pytest
@@ -1208,6 +1209,46 @@ def test_reintegrate_close_surfaces_write_failure() -> None:
     assert "disk full" in messages[0]
     assert thread._reduction_session is None
     assert thread._reduction_session_key is None
+
+
+def test_reduction_close_append_mismatch_suppresses_duplicate_traceback(
+        caplog) -> None:
+    from types import MethodType, SimpleNamespace
+
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
+
+    class BadSession:
+        def finish(self, **_kwargs):
+            raise ValueError(
+                "Integration settings changed during append. Reintegrate and "
+                "save the complete scan so persisted rows share one axis."
+            )
+
+    holder = SimpleNamespace(
+        _reduction_session=BadSession(),
+        _reduction_session_key="scan",
+        _streaming_session=None,
+        _streaming_sink=None,
+        _streaming_scan_id=None,
+        _streaming_record_store=None,
+        _scan_session_adapter=None,
+        _gi_prepass_scan_id=None,
+        _reduction_write_error=None,
+        command="start",
+        command_lock=None,
+        showLabel=None,
+    )
+    holder._close_reduction_session = MethodType(
+        wranglerThread._close_reduction_session,
+        holder,
+    )
+
+    with caplog.at_level(logging.ERROR):
+        holder._close_reduction_session()
+
+    assert isinstance(holder._reduction_write_error, ValueError)
+    assert holder.command == "stop"
+    assert "Traceback" not in caplog.text
 
 
 def test_show_reintegration_write_error_forwards_to_wrangler_status() -> None:

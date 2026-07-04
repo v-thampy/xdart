@@ -54,7 +54,7 @@ One monorepo, two packages, five north-star goals (roadmap_2026-06-10):
 - **Sources & metadata:** TIFF/EDF/CBF series, Eiger master, HDF5/NeXus, SPEC; `-`/`_` frame
   indices; Meta Type **auto** (SSRL `.txt`, QXRD `.tif.metadata`, generic name=value sidecars).
 - **Controls V2:** native Int panel, readiness row with named blockers, config-mismatch
-  **Replace/Cancel modal** on Append, data-derived display units (panel toggles never relabel
+  **Yes/No overwrite modal** on Append, data-derived display units (panel toggles never relabel
   loaded data).
 - **Shortcuts:** Cmd+R run/pause · Cmd+Shift+C stop · Cmd+O/Cmd+S load/save · Cmd+Shift+A
   append/replace · Cmd+P pin.
