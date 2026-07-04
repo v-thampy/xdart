@@ -66,7 +66,7 @@ Blocker wave COMPLETE (~30 commits: BL-1..6 · S-3..S-21 · BW-A1..A5 · MEM-3 �
 modal unify; BL-6 x-grid regression proven absent at HEAD, `5a12f096`). Remaining: full
 core+offscreen gate at the frozen SHA → RC-FV final verification → maintainer live Session-1
 (closes every fixed-unverified ledger row; S-4 χ real-data validation = G18) →
-snapshot-publish (docs/design stripped) + tag v1.0.0 → PyPI.
+snapshot-publish (docs/design + docs/history stripped) + tag v1.0.0 → PyPI.
 
 ## Direction (post-1.0, from the master table — priority order)
 1. **7c + ADR decision** (H10): cadence/eviction policy → session; enables second sinks

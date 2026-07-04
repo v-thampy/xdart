@@ -233,11 +233,15 @@ pre-migration reference signature.  Two additive notes:
    both the modal and the axis backstop).  The check is BACKWARD-TOLERANT: a
    field absent from a pre-upgrade stored config is treated as unknown and never
    false-triggers.
-18. **Explicit out-of-domain χ ranges are clamped (S-4).**  With the standard-
-   mode Mode-A χ input-shift (item below / On-disk §S-4), an explicit χ range
-   that, after the −`chi_offset` shift, falls partly outside pyFAI's raw
-   −180..180 χ domain is clamped to the valid domain rather than wrapping — so an
-   edge range integrates the in-domain bins, not a wrapped sliver.
+18. **Explicit out-of-domain χ ranges are passed through after the S-4 input
+   shift.**  With the standard-mode Mode-A χ input-shift (item below /
+   On-disk §S-4), an explicit panel-frame χ range is shifted by
+   −`chi_offset` before it reaches pyFAI.  v1.0 does **not** add a second
+   xrd-tools clamp for ranges that shift partly outside pyFAI's raw
+   −180..180 χ domain; use Auto/full-range, or keep explicit edge ranges inside
+   the shifted domain, when byte-stable edge behavior matters.  Session-1's G18
+   validator pins the observed behavior; explicit clamping is deferred rather
+   than silently promised here.
 19. **Legacy no-config env fallback.**  `XDART_CONTROLS_PANEL_V2=0` /
    `XDART_CONTROLS_V2_NATIVE_RUN_PLAN=0` route runs through the legacy
    `plan_from_live_scan` builder, which does NOT persist the full

@@ -40,7 +40,7 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 | H7a | Typed read contract + policy table | M | low | one read policy | — | **DONE** `03492440` |
 | H7-gate | Entry gate + accumulator lifecycle split (OV-5) | S+M | med | wipe class structurally closed | H7a | **DONE** `5a7736ee`+`031ab9bf` |
 | H14 | Waterfall accumulator bounding | S/M | low | O(N²) repaint gone | — | **DONE** `084f3410` |
-| MS-1 | Run-end count reconciliation + counter fix + shadow-drop lock | S | low | silent in-flight drop now visible | — | **DONE** `4d3e2b3c` |
+| MS-1 | Run-end count reconciliation + counter fix + shadow-drop lock | S | low | silent in-flight drop now visible | — | fixed-unverified (`4d3e2b3c`); verify Session-1 D5 count reconciliation |
 | H12 | Liveness step-5 render leg (level-reuse, subsampled percentile) | M | low | last big live-smoothness lever | — | **DONE** `7fb20748` (A6 live-verify pending) |
 | H13(a-c) | Timer safety: LD-1 load-debounce cancel, alias fix, reint-timer stop, pool race, non-blocking teardown, XYE cache, **BR-1** browser-select no-clear | S×7 | low-med | wrong-file pollute + last stalls + BR-1 | Wave 1 | **DONE** `b8e62542` (LD-1/BR-1 live-verify pending) |
 | H-hyd | Hydration purpose-scoping residuals (full→1d leaks, dedupe key, Sum/Avg churn) | S×4 | low | no 60MB/frame churn loops | H7-gate | **DONE** `cba5995c` |
@@ -49,7 +49,7 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 | MEM-3 | Reduction pool cap `min(4,cpu)` + memory-aware floor + `XDART_REDUCTION_WORKERS` + honest Cores knob | S | low-med | ~-3 GB peak at same speed; small-RAM floor | MEM-2 | **DONE** `e75c1a80` |
 | RC-FV | Final verification (full suite, strict-tree, build, staging) | S | none | certifies the tag commit | Waves 1-3 | **QUEUED** (`release_final_verification.md`) |
 | RC-7s | Maintainer live Session-1 | — | — | closes every fixed-unverified row | RC-FV | **PENDING** (maintainer) |
-| RC-8 | Merge → tag v1.0.0 → publish + stubs + branch cleanup | S | low | **v1.0.0 on PyPI** | RC-7s, repo-public decision | **PENDING** (maintainer) |
+| RC-8 | Snapshot-publish → tag v1.0.0 → publish + stubs + branch cleanup | S | low | **v1.0.0 on PyPI** with `docs/design` and `docs/history` stripped from public main | RC-7s, repo-public decision | **PENDING** (maintainer) |
 
 ### Greenfield (store/session collapse) — H6/H8/H9/H22 pulled PRE-tag (2026-07-02); only H10/H11/H29/H24 remain post-tag
 | ID | Chunk | Effort | Risk | Payback | Prereqs | State |
@@ -91,6 +91,7 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 | CF-1 | Append config mismatch confirmation + data-authoritative display units | S | low-med | Append cannot silently no-op after Standard↔Grazing/settings changes; loaded data keeps its stored units until Replace/new processing | Controls V2/readiness | fixed-unverified (`0c0b4da6`+`14efca96` + BW-A3 worker backstop + modal-unify); verify Session-1 Append Standard↔Grazing |
 | CF-2 | Append mismatch Run-click modal + Eiger target identity | S | med | Append mismatch is handled before the run with No or Yes (replace/re-integrate); Eiger `_master` source names resolve to the same target as the writer; writer-backstop abort cleanup avoids duplicate tracebacks | CF-1 | fixed-unverified (`031c134c`); verify Session-1 Append Standard↔Grazing |
 | CF-3 | Append mismatch cold-target modal | S | med | fresh-launch Append reads the target `.nxs` stored processing config before any frame processes, so partial Standard targets prompt before a GI append run; writer backstop no longer dumps duplicate tracebacks | CF-2 | fixed-unverified (this commit); verify Session-1 fresh-launch partial-target Standard→Grazing |
+| CF-4 | Append config signature mask/PONI follow-up | S/M | med | decide and implement mask path+mtime and PONI content-signature matching, or write an ADR/disclosure for deliberately fail-open legacy behavior | CF-3 | open |
 | UI-3 | Slice c/w + Pin gate follows cake data presence | S | low | append-loaded/browser-loaded Int 2D data re-enables χ/q slice controls after `binned_data` arrives; clears disable them again | UI-2, OV-7 | fixed-unverified (`031c134c`); verify Session-1 F5-adjacent |
 | UI-4 | Readiness blocker text cannot widen the window | S | low | bottom readiness row elides long blocker labels with the full text in the tooltip; Append mismatch UI text is concise, non-blocking, and moves checked-field details to DEBUG logs | BW-A3 | fixed-unverified (BW-A3 bounce fix + modal-unify); gate: 500-char blocker sizeHint/elide regression + Append clickable-modal check |
 | BW-A1 | Blocker wave lane A step 1: BL-4 + S-1 + BL-5 | S | high | GUI handoff eviction cannot crash when the GUI pop races drop-oldest; dropped-mode writer reports reach QtNexusSink/FrameRecordStore through the real save path; prerelease red tests stabilized | MEM-1a/b, BL-5 | fixed-unverified (this commit); gates: MEM-1 bounds, Qt sink, filter-sites, series-average dispatch |
@@ -326,28 +327,42 @@ frame, overlay preserve, >64-frame Overall) · N2 batch cadence · serial-XYE fl
 ROI §10 visual · the 2026-07-01 freeze fixes (`c89fa406`, `5c10e190`) + waterfall decimation (H14)
 · RC-2 flush-floor sanity. PASS → RC-8.
 
-**RC-8 verified recipe** (dry-run-verified in a scratch clone; merge is conflict-free, main is a
-strict ancestor of remediation, 61 files +5864/−2521; GitHub has ONLY `main` @ `a2211ef4` and zero
-tags; worktrees pin their branches so remove worktrees before `branch -d`):
+**RC-8 plain merge recipe is SUPERSEDED.**  Do not merge+push the full
+remediation history to public `main`: it retains internal `docs/design/` and
+`docs/history/` records.  Publish a single release snapshot commit instead
+(dry-run in a scratch clone recommended; remove release worktrees before branch
+cleanup):
 ```
-# 0) salvage FLOOR docs (also in RC-6): git -C ~/repos/xrd-tools-floor diff > /tmp/floor.patch
-#    apply+commit in INT; then checkout -- the floor files
-# 1) optional tie-off (makes branch -d honest; tree-identical, verified):
-git -C ~/repos/xrd-tools-integrate merge --no-ff feature/gui-liveness -m "Tie off gui-liveness"
-# 2) release merge + tag (MAIN worktree; main not checked out anywhere, same tip as cp2):
-git -C ~/repos/xrd-tools checkout main
-git -C ~/repos/xrd-tools merge --no-ff feature/remediation -m "Merge feature/remediation: v1.0.0"
-#    → final gates HERE: full offscreen tests/xdart (pr.yml exit-139-retry pattern) +
-#      release.py check v1.0.0 --strict-tree (after tagging) from a venv with this content installed
-git -C ~/repos/xrd-tools tag -a v1.0.0 -m "xrd-tools v1.0.0"
-git -C ~/repos/xrd-tools push origin main --follow-tags     # release.yml builds + checks on tag
-# 3) publish (manual upload is the designed path): python -m build && twine check dist/* &&
+# 0) final gates at the frozen remediation SHA:
+#    full offscreen tests/xdart (with the pr.yml exit-139 retry pattern),
+#    tests/core, full GI spine 71/71, scripts/release.py check v1.0.0 --strict-tree
+
+# 1) build a public snapshot from the final remediation content:
+git -C ~/repos/xrd-tools-integrate switch --detach feature/remediation
+git -C ~/repos/xrd-tools-integrate switch --orphan release/v1.0.0-snapshot
+rm -rf ~/repos/xrd-tools-integrate/docs/design \
+       ~/repos/xrd-tools-integrate/docs/history \
+       ~/repos/xrd-tools-integrate/build \
+       ~/repos/xrd-tools-integrate/dist
+git -C ~/repos/xrd-tools-integrate add -A
+git -C ~/repos/xrd-tools-integrate commit -m "Release v1.0.0 public snapshot"
+
+# 2) tag and force-publish the snapshot as public main:
+git -C ~/repos/xrd-tools-integrate tag -a v1.0.0 -m "xrd-tools v1.0.0"
+git -C ~/repos/xrd-tools-integrate push --force-with-lease origin HEAD:main --follow-tags
+git -C ~/repos/xrd-tools-integrate fetch origin main
+test "$(git -C ~/repos/xrd-tools-integrate ls-tree -r origin/main |
+        grep -cE 'docs/(design|history)')" = "0"
+
+# 3) publish artifacts manually: python -m build && twine check dist/* &&
 #    twine upload dist/*   (TestPyPI dry-run first if desired)
-# 4) post-publish: upload the RC-5b stub dists (xdart 0.41.0, ssrl_xrd_tools 0.42.0), archive the
-#    old PyPI projects; cleanup: git worktree remove xrd-tools-{integrate,gui,floor} →
-#    branch -d feature/{remediation,remediation-floor,controls-panel-v2,gui-liveness} →
-#    git fetch --prune
+# 4) post-publish: upload the RC-5b stub dists (xdart 0.41.0,
+#    ssrl_xrd_tools 0.42.0), archive the old PyPI projects; cleanup worktrees and
+#    feature branches, then git fetch --prune.
 ```
+Force-pushing the snapshot removes these docs from branch tips but does not purge
+old GitHub objects already reachable by SHA; accept that explicitly or recreate
+the public repository before upload.
 
 **Session 2 (post-H9):** 8a scroll-back latency budget · 8b done-test spot checks · 7c ·
 Phase 8 retirement gate · ADR-0006 STEP 2 confirm (if beamline time allows).

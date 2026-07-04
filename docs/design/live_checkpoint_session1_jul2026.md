@@ -115,9 +115,9 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
       byte-identical, and a normal Append load does not full-rewrite prior rows on first flush.
 - [ ] G9 MEM-2 heavy-window sanity (`XDART_HEAVY_WINDOW` override respected; small-RAM tier).
 - [ ] G10 MEM-3 651-frame baseline stays ~25-26 s at the new default worker cap.
-- [ ] G11 RN-2 live-scale bulk overlay: 3600-frame overlay hydration does not hold `.nxs`
+- [ ] G11a RN-2 live-scale bulk overlay: 3600-frame overlay hydration does not hold `.nxs`
       read-only across writer flush retries.
-- [ ] G11 BL-3 metadata auto-sidecar: with a junk companion present (a per-frame `.poni` /
+- [ ] G11b BL-3 metadata auto-sidecar: with a junk companion present (a per-frame `.poni` /
       `.tif.log` / oversize / binary alongside the real `.tif.metadata`), the run locks onto the
       REAL sidecar — log shows `metadata: auto locked onto ...` for the right file, and motors/
       counters in the `.nxs` are correct (not junk). A 1-2 field explicit sidecar loads.
@@ -161,7 +161,8 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
       **AMENDED (round-4): include a q/2θ-axis 1D explicit wedge using the same panel χ range**
       (for example q-axis 1D with χ 0–90° and chi_offset=90°) and compare it to the 2D cake's
       matching wedge.  This catches the q/2θ branch's input-shift regression; no 1D χ output
-      relabel is involved.
+      relabel is involved.  Harness: `scripts/g18_s4_chi_validation.py` (use
+      `--reference-chi` when running against the team absolute χ reference).
 - [ ] G19 OV-7c waterfall slot: in Overlay+slice with 2 pins, the live "current" cut renders one
       step ABOVE the last pin (slot 2 = n_pins), not buried under pin #1's baseline. Pin it ⇒ the
       new pinned trace stays at the SAME y (no jump); the next current appears one slot higher.
