@@ -2420,7 +2420,7 @@ def _reduce_frame(
                     method=p1.method,
                     mask=mask,
                     radial_range=p1.radial_range,
-                    azimuth_range=p1.azimuth_range,
+                    azimuth_range=_integration_azimuth_range(p1),
                     error_model=p1.error_model,
                     polarization_factor=p1.polarization_factor,
                     normalization_factor=_normalization_for(

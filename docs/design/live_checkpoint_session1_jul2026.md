@@ -158,6 +158,10 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
       Auto / full −180..180) — auto & full-domain masked the input-shift bug, so an auto-only
       validation would pass a broken build.  Verify the 1D peak at a known χ falls at the SAME χ
       in the 1D profile and the 2D cake (both offset-applied) for that partial range.
+      **AMENDED (round-4): include a q/2θ-axis 1D explicit wedge using the same panel χ range**
+      (for example q-axis 1D with χ 0–90° and chi_offset=90°) and compare it to the 2D cake's
+      matching wedge.  This catches the q/2θ branch's input-shift regression; no 1D χ output
+      relabel is involved.
 - [ ] G19 OV-7c waterfall slot: in Overlay+slice with 2 pins, the live "current" cut renders one
       step ABOVE the last pin (slot 2 = n_pins), not buried under pin #1's baseline. Pin it ⇒ the
       new pinned trace stays at the SAME y (no jump); the next current appears one slot higher.

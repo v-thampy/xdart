@@ -574,6 +574,66 @@ def test_non_gi_chi_explicit_partial_range_shifts_input_s4(monkeypatch):
     np.testing.assert_allclose(result.frames[0].result_1d.radial, [80.0, 100.0])
 
 
+@pytest.mark.slow
+def test_non_gi_q_wedge_explicit_range_shifts_input_s4(ai_fixture):
+    """S-4 round 4: q/2theta 1D wedges also read panel-frame chi ranges.
+
+    With chi_offset=90, panel chi (0, 90) maps to raw pyFAI chi (-90, 0).
+    The chi-output branch already made that input shift; the q/2theta branch
+    must do the same without relabeling the q output axis.  Drive the real
+    pyFAI reduction path and compare against the simultaneously computed 2D
+    cake for the same panel wedge.
+    """
+    shape = ai_fixture.detector.shape
+    chi = np.rad2deg(ai_fixture.chiArray(shape))
+    q = ai_fixture.qArray(shape) / 10.0  # pyFAI qArray is nm^-1; plans use A^-1.
+    radial = 200.0 + 200.0 * np.exp(-((q - 2.0) / 0.4) ** 2)
+    # Make the raw wedge that should be selected after the -90 input shift
+    # unmistakably brighter than the unshifted raw (0, 90) wedge.
+    sector = np.where(
+        (chi >= -90.0) & (chi <= 0.0),
+        5.0,
+        np.where((chi >= 0.0) & (chi <= 90.0), 0.2, 1.0),
+    )
+    image = radial * sector
+    plan = ReductionPlan(
+        integration_1d=Integration1DPlan(
+            npt=80,
+            unit="q_A^-1",
+            method="csr",
+            radial_range=(0.5, 5.0),
+            azimuth_range=(0.0, 90.0),
+            azimuth_offset=90.0,
+            extra={"correctSolidAngle": False},
+        ),
+        integration_2d=Integration2DPlan(
+            npt_rad=80,
+            npt_azim=1,
+            unit="q_A^-1",
+            method="csr",
+            radial_range=(0.5, 5.0),
+            azimuth_range=(0.0, 90.0),
+            azimuth_offset=90.0,
+            extra={"correctSolidAngle": False},
+        ),
+    )
+
+    frame = run_reduction(
+        plan,
+        Scan("q-wedge", [Frame(0, image=image)], integrator=ai_fixture),
+    ).frames[0]
+
+    one_d = frame.result_1d
+    two_d = frame.result_2d
+    assert one_d.unit == two_d.unit == "q_A^-1"
+    np.testing.assert_allclose(one_d.radial, two_d.radial, rtol=1e-6, atol=1e-8)
+    np.testing.assert_allclose(two_d.azimuthal, [45.0], rtol=1e-6, atol=1e-8)
+    assert np.nanmean(one_d.intensity) == pytest.approx(
+        np.nanmean(two_d.intensity[:, 0]),
+        rel=0.05,
+    )
+
+
 def test_chunked_error_clear_waits_for_running_tail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
