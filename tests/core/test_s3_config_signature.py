@@ -72,3 +72,17 @@ def test_npt_change_still_blocks():
 def test_non_append_mode_never_blocks():
     assert append_config_mismatch_check(
         "Replace", _cfg({"chi_offset": 0.0}), _cfg({"chi_offset": 90.0})).ok
+
+
+def test_gi_chi_offset_change_does_not_block_append():
+    # Review follow-up: chi_offset is INERT for GI (S-4 zeroes the GI
+    # azimuth_offset; GI chi uses FiberIntegrator's own convention), so changing
+    # it on a GI scan must NOT trip the Append modal -- it does not alter written
+    # GI data.  Standard mode still blocks (test_chi_offset_change_blocks_append).
+    stored = {"bai_1d_args": {"unit": "q_A^-1", "chi_offset": 0.0},
+              "bai_2d_args": {"unit": "q_A^-1"}, "gi": True,
+              "gi_config": {"th_val": 0.2}}
+    current = {"bai_1d_args": {"unit": "q_A^-1", "chi_offset": 90.0},
+               "bai_2d_args": {"unit": "q_A^-1"}, "gi": True,
+               "gi_config": {"th_val": 0.2}}
+    assert append_config_mismatch_check("Append", stored, current).ok

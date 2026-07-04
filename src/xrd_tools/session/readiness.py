@@ -312,8 +312,14 @@ def processing_config_from_args(
         azimuth_range_1d=_range_or_none(a1.get("azimuth_range")),
         radial_range_2d=_range_or_none(a2.get("radial_range")),
         azimuth_range_2d=_range_or_none(a2.get("azimuth_range")),
-        chi_offset_1d=_num_or_unset(a1, ("chi_offset",)),
-        chi_offset_2d=_num_or_unset(a2, ("azimuth_offset", "chi_offset")),
+        # chi_offset is INERT for GI (S-4 zeroes the GI azimuth_offset; GI chi
+        # goes to FiberIntegrator's own convention), so comparing it on a GI scan
+        # trips a FALSE Append modal for a change that does not alter written GI
+        # data.  Leave it unknown for GI; standard mode still compares it (it does
+        # move the written chi axis).  [review follow-up]
+        chi_offset_1d=(_UNSET if is_gi else _num_or_unset(a1, ("chi_offset",))),
+        chi_offset_2d=(_UNSET if is_gi
+                       else _num_or_unset(a2, ("azimuth_offset", "chi_offset"))),
         monitor_1d=_str_or_unset(a1, ("monitor",)),
         monitor_2d=_str_or_unset(a2, ("monitor",)),
         polarization_1d=_num_or_unset(a1, ("polarization_factor", "polarization")),
