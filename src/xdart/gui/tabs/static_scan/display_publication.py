@@ -52,6 +52,8 @@ from .display_overlay_utils import (
 
 MAX_WATERFALL_PAYLOAD_ROWS = 256
 
+_UNSET = object()   # S-16: "no norm channel recorded yet" sentinel
+
 
 def _recipe_scan_key(recipe):
     """Scan identity a pinned slice-cut recipe belongs to (S-18): the explicit
@@ -916,6 +918,20 @@ class PublicationDisplayAdapter:
         accumulator."""
         widget = self._widget
         prior = getattr(widget, "_waterfall_history", None)
+
+        # S-16: reset the accumulator when the normalization CHANNEL actually
+        # changes between renders (refresh_norm_channels can silently reset the
+        # combo cross-scan).  Without this the append-only history permanently
+        # MIXES normalized and un-normalized rows with no reset.  Record the
+        # channel that WILL be applied this render (read once, the same source the
+        # per-row _normalize uses) on the widget, parallel to _waterfall_history.
+        _get_norm = getattr(widget, "get_normChannel", None)
+        cur_norm = _get_norm() if callable(_get_norm) else None
+        prev_norm = getattr(widget, "_overlay_accum_norm_channel", _UNSET)
+        if prior is not None and prev_norm is not _UNSET and prev_norm != cur_norm:
+            prior = None
+        if widget is not None:
+            widget._overlay_accum_norm_channel = cur_norm
 
         # Full parity with integration_plot_payload's per-frame build: a 2D-slice
         # source (cake-projected 1D, or an active chi/q slice) builds each row via

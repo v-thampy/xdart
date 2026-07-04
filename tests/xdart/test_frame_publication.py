@@ -1438,6 +1438,37 @@ def test_pinned_cut_pruned_on_scan_change_s18():
             "a stale pin must not render under the new scan"
 
 
+def test_norm_channel_change_resets_accumulator_s16():
+    # S-16: when the normalization channel actually changes, the overlay
+    # accumulator RESETS -- it must never permanently mix normalized and
+    # un-normalized rows.  Drives the real plot_payload accumulator path.
+    store = PublicationStore()
+    for i in (10, 11):
+        f = DuckFrame(idx=i)
+        f.scan_info = {"monitor": 1.0}
+        store.upsert(publication_from_live_frame(f))
+
+    norm = {"ch": "i0"}
+    widget = _int_widget()          # 1D overlay
+    widget.get_normChannel = lambda: norm["ch"]
+    widget._waterfall_history = None
+    adapter = _adapter(store, widget)
+
+    p1 = adapter.plot_payload(_int_state(store, ids=(10,), method="Overlay"))
+    widget._waterfall_history = p1.plot_history
+    assert p1.plot_history.count == 1
+
+    # same channel -> frame 11 APPENDS onto frame 10
+    p2 = adapter.plot_payload(_int_state(store, ids=(10, 11), method="Overlay"))
+    widget._waterfall_history = p2.plot_history
+    assert p2.plot_history.count == 2
+
+    # channel change -> RESET (frame 10's row dropped, only the current render)
+    norm["ch"] = "i1"
+    p3 = adapter.plot_payload(_int_state(store, ids=(11,), method="Overlay"))
+    assert p3.plot_history.count == 1
+
+
 def test_plot_payload_sum_average_emit_n_traces_collapsed_at_render():
     # Sum/Average go through the payload (NOT None): integration_plot_payload
     # emits one Trace per frame (un-reduced), exactly like legacy

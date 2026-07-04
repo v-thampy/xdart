@@ -138,6 +138,9 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
       frozen range set — the new mode is NOT clipped to a stale wedge (the range re-derives);
       switching q↔2θ in standard mode re-keys the radial range. (S-6, headless) a scan with a
       MIXED-CASE monitor key writes NORMALIZED data (map_norm matches the values).
+- [ ] G16 S-16 norm-channel reset: in Overlay, change the Norm Channel mid-overlay — the
+      accumulator RESETS (the previously-accumulated curves clear) so normalized and
+      un-normalized traces are never mixed on one plot.
 
 **PASS ⇒ proceed to RC-8** (merge → tag v1.0.0 → publish; recipe in
 `handoff_chunks_jul2026.md`). Any FAIL: stop, report the item + `kill -USR1 <pid>` stack if a
