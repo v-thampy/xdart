@@ -134,6 +134,10 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
       to a DIFFERENT compatible scan still APPENDS (OV-6). (S-18) Pin a slice cut, then load a
       different scan — the pin does NOT rematerialize on the new scan's frame N under the old
       legend.
+- [ ] G15 S-5/S-6 config re-key: (S-5, GI) switch the 1D GI mode (e.g. Qoop → χGI) with a
+      frozen range set — the new mode is NOT clipped to a stale wedge (the range re-derives);
+      switching q↔2θ in standard mode re-keys the radial range. (S-6, headless) a scan with a
+      MIXED-CASE monitor key writes NORMALIZED data (map_norm matches the values).
 
 **PASS ⇒ proceed to RC-8** (merge → tag v1.0.0 → publish; recipe in
 `handoff_chunks_jul2026.md`). Any FAIL: stop, report the item + `kill -USR1 <pid>` stack if a

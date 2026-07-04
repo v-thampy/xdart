@@ -267,6 +267,18 @@ def _scan_key_from_source(src):
     return _get_scan_info(src)[0] or None
 
 
+def _drop_output_axis_ranges(args):
+    """S-5: drop the output-axis RANGE keys from a native-int arg dict.
+
+    The GI 1D modes q_oop/exit_angle/chi_gi share ``azimuth_range`` in DIFFERENT
+    units (q_ip uses ``radial_range``), so a frozen/hydrated range from a prior
+    mode would silently clip the new mode (e.g. χGI to a ~4° wedge) and be
+    written.  Called only on an ACTUAL mode change, so a hydration-to-same-mode
+    keeps its restored range."""
+    args.pop("azimuth_range", None)
+    args.pop("radial_range", None)
+
+
 class staticWidget(QWidget):
     """Tab for integrating data collected by a scanning area detector.
     As of current version, only handles a single angle (2-theta).
@@ -1380,24 +1392,36 @@ class staticWidget(QWidget):
         text = str(value or "")
         if bool(getattr(scan, "gi", False)):
             if root == "Int1D":
+                old_mode = a1.get("gi_mode_1d")
                 try:
                     a1["gi_mode_1d"] = GI_MODES_1D[GI_LABELS_1D.index(text)]
                 except ValueError:
                     a1["gi_mode_1d"] = "q_total"
+                if a1["gi_mode_1d"] != old_mode:
+                    _drop_output_axis_ranges(a1)
                 if self._controls_v2_npts_oop_visible():
                     a1.setdefault("npt_oop", int(a1.get("numpoints", 3000)))
             else:
+                old_mode = a2.get("gi_mode_2d")
                 try:
                     a2["gi_mode_2d"] = GI_MODES_2D[GI_LABELS_2D.index(text)]
                 except ValueError:
                     a2["gi_mode_2d"] = "qip_qoop"
+                if a2["gi_mode_2d"] != old_mode:
+                    _drop_output_axis_ranges(a2)
             a1["unit"] = "q_A^-1"
             a2["unit"] = "q_A^-1"
             return
         if root == "Int1D":
+            old_unit = a1.get("unit")
             a1["unit"] = self._controls_v2_unit_code(text, dim="1d")
+            if a1["unit"] != old_unit:
+                a1.pop("radial_range", None)   # S-5: q<->2theta invalidates the range
         else:
+            old_unit = a2.get("unit")
             a2["unit"] = "2th_deg" if text.startswith("2") else "q_A^-1"
+            if a2["unit"] != old_unit:
+                a2.pop("radial_range", None)
 
     def _controls_v2_default_range(self, root: str, axis: str):
         self._controls_v2_ensure_native_int_defaults()
