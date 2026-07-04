@@ -106,8 +106,10 @@ def pdi_meta_file_minimal(tmp_path: Path) -> Path:
 @pytest.fixture
 def clear_auto_sidecar_cache():
     metadata_module._AUTO_SIDECAR_CACHE.clear()
+    metadata_module._DIR_LISTING_CACHE.clear()
     yield
     metadata_module._AUTO_SIDECAR_CACHE.clear()
+    metadata_module._DIR_LISTING_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -195,11 +197,14 @@ class TestReadPdiMetadata:
         assert "i0" not in result
         assert "i1" not in result
 
-    def test_minimal_fallback_last_resort(self, pdi_meta_file_minimal: Path) -> None:
-        result = read_pdi_metadata(pdi_meta_file_minimal)
-
-        assert result["TwoTheta"] == pytest.approx(0.0)
-        assert result["Theta"] == pytest.approx(0.0)
+    def test_minimal_unparseable_is_rejected_not_fabricated(
+        self, pdi_meta_file_minimal: Path
+    ) -> None:
+        # BW / .pdi junk-latch: unparseable content must return {}.  The old
+        # last-resort fabricated {'TwoTheta': 0.0, 'Theta': 0.0} for ANY garbage,
+        # which is non-empty -> a junk .pdi latched as valid metadata and bypassed
+        # every BL-3 gate.  Reject, never invent.
+        assert read_pdi_metadata(pdi_meta_file_minimal) == {}
 
     def test_missing_file(self, tmp_path: Path) -> None:
         result = read_pdi_metadata(tmp_path / "nonexistent.pdi")
@@ -265,7 +270,11 @@ class TestReadImageMetadata:
         found = _find_sidecar(image, "txt")
         result = read_image_metadata(image, meta_format="txt")
 
-        assert found == sidecar
+        # S-20: on a case-sensitive FS `found` is the actual-case scan_0001.TXT;
+        # on a case-insensitive FS the exact-case is_file() fast path returns the
+        # queried scan_0001.txt.  Both resolve to the same file.
+        assert found is not None and found.exists()
+        assert found.name.lower() == sidecar.name.lower()
         assert result["i0"] == pytest.approx(1000.0)
 
     def test_replaced_extension_takes_priority(self, tmp_path: Path) -> None:
@@ -427,10 +436,12 @@ class TestReadImageMetadata:
         result = read_image_metadata(image, meta_format="auto")
 
         assert result["sampleName"] == "upper"
-        assert metadata_module._AUTO_SIDECAR_CACHE[(tmp_path, ".tif")] == (
-            "append",
-            ".METADATA",
-        )
+        # S-20: the cached suffix case is FS-dependent (actual case on a
+        # case-sensitive FS; the queried lower case on a case-insensitive FS) --
+        # both reconstruct the same file.  Assert the convention + case-folded ext.
+        convention, suffix = metadata_module._AUTO_SIDECAR_CACHE[(tmp_path, ".tif")]
+        assert convention == "append"
+        assert suffix.lower() == ".metadata"
 
     def test_auto_metadata_discovers_ssrl_txt_sidecar(
         self,

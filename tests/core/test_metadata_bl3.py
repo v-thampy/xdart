@@ -18,8 +18,10 @@ from xrd_tools.io.metadata import read_image_metadata
 @pytest.fixture(autouse=True)
 def _reset_auto_cache():
     metadata._AUTO_SIDECAR_CACHE.clear()
+    metadata._DIR_LISTING_CACHE.clear()
     yield
     metadata._AUTO_SIDECAR_CACHE.clear()
+    metadata._DIR_LISTING_CACHE.clear()
 
 
 def _image(tmp_path):
@@ -105,3 +107,43 @@ def test_explicit_metadata_format_still_bypasses_allow_list_and_threshold(tmp_pa
     result = read_image_metadata(img, meta_format="custommeta")
 
     assert result == {"only_one": 5}
+
+
+def test_auto_discovery_lists_directory_at_most_once_s20(tmp_path, monkeypatch):
+    # S-20: the exact-case is_file() fast path finds a correctly-cased sidecar
+    # WITHOUT re-listing the directory per candidate.  The first BL-3 rewrite did
+    # ~16 iterdir/frame (2 per _existing_path_case_insensitive x 8 candidates) --
+    # worse than the single iterdir it replaced.  Now <= 1 (the misses before the
+    # hit share one mtime-cached listing; a first-extension hit needs 0).
+    import pathlib
+
+    _image(tmp_path)
+    (tmp_path / "scan_0001.tif.metadata").write_text("i0=1\nth=2\nchi=3\n")
+
+    calls = {"n": 0}
+    real = pathlib.Path.iterdir
+
+    def counting(self):
+        calls["n"] += 1
+        return real(self)
+
+    monkeypatch.setattr(pathlib.Path, "iterdir", counting)
+    result = read_image_metadata(tmp_path / "scan_0001.tif", meta_format="auto")
+
+    assert result == {"i0": 1, "th": 2, "chi": 3}
+    assert calls["n"] <= 1, f"expected <=1 directory listing, got {calls['n']}"
+
+
+def test_junk_pdi_is_rejected_not_fabricated_bw(tmp_path):
+    # BW / .pdi junk-latch: a junk .pdi (no recognizable section) must return {}
+    # -- the old last-resort fabricated {TwoTheta:0.0, Theta:0.0}, so a junk .pdi
+    # latched as valid metadata and bypassed every BL-3 gate.
+    from xrd_tools.io.metadata import read_pdi_metadata
+
+    (tmp_path / "junk.pdi").write_text("this is not a pdi file at all\n")
+    assert read_pdi_metadata(tmp_path / "junk.pdi") == {}
+
+    # and auto discovery does not latch a junk .pdi companion
+    img = _image(tmp_path)
+    (tmp_path / "scan_0001.tif.pdi").write_text("garbage;;not;a;pdi;file\n")
+    assert read_image_metadata(img, meta_format="auto") == {}

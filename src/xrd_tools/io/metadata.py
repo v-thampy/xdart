@@ -210,21 +210,42 @@ def _read_structured_metadata(path: Path | str) -> tuple[dict[str, MetadataValue
     return _parse_structured_metadata(text)
 
 
-def _existing_path_case_insensitive(candidate: Path) -> Path | None:
-    """Return an existing sibling matching *candidate.name* case-insensitively."""
-    target = candidate.name.lower()
+# S-20: per-directory listing cache for the case-insensitive FALLBACK only,
+# keyed by the directory's mtime so it invalidates when files are added.  With
+# the exact-case is_file() fast path below, a directory is listed at most ONCE
+# per (dir, mtime) -- not ~16x/frame as the first BL-3 rewrite did (worse than
+# the single iterdir it replaced).
+_DIR_LISTING_CACHE: dict[Path, tuple[float, dict[str, Path]]] = {}
+
+
+def _dir_listing_lower(directory: Path) -> dict[str, Path]:
+    """``{lowercased-name: path}`` for *directory*, cached until its mtime bumps."""
     try:
-        for sibling in candidate.parent.iterdir():
-            if sibling.name == candidate.name and sibling.is_file():
-                return sibling
-        for sibling in candidate.parent.iterdir():
-            if sibling.name.lower() == target and sibling.is_file():
-                return sibling
+        mtime = directory.stat().st_mtime
     except OSError:
-        pass
-    if candidate.exists():
-        return candidate
-    return None
+        return {}
+    cached = _DIR_LISTING_CACHE.get(directory)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    try:
+        listing = {p.name.lower(): p for p in directory.iterdir() if p.is_file()}
+    except OSError:
+        listing = {}
+    _DIR_LISTING_CACHE[directory] = (mtime, listing)
+    return listing
+
+
+def _existing_path_case_insensitive(candidate: Path) -> Path | None:
+    """Return an existing sibling matching *candidate.name*, exact case first."""
+    # S-20: exact-case fast path -- ONE stat, no directory listing (the common
+    # case: sidecars are correctly cased).
+    try:
+        if candidate.is_file():
+            return candidate
+    except OSError:
+        return None
+    # Case-insensitive fallback via the per-directory listing cache.
+    return _dir_listing_lower(candidate.parent).get(candidate.name.lower())
 
 
 def _find_sidecar(image_path: Path, ext: str) -> Path | None:
@@ -553,7 +574,15 @@ def read_pdi_metadata(path: Path | str) -> dict[str, float]:
                 if "2Theta" in motors:
                     motors["TwoTheta"] = motors["2Theta"]
             except (AttributeError, KeyError):
-                motors = {"TwoTheta": 0.0, "Theta": 0.0}
+                # BW / .pdi junk-latch: do NOT fabricate motor values from
+                # unparseable content.  The old last-resort returned
+                # {'TwoTheta': 0.0, 'Theta': 0.0} for ANY garbage, which is
+                # non-empty -> a junk `.pdi` latched as valid metadata and
+                # bypassed every BL-3 gate.  Reject: no recognizable section.
+                logger.warning(
+                    "read_pdi_metadata: no recognizable Counters/Motors or "
+                    "Diffractometer section in %s", path)
+                return {}
             counters = {}
 
         # --- epoch ---
