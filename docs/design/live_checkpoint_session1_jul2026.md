@@ -102,8 +102,9 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
 - [ ] G2 UI-2/UI-3 fresh-launch χ (c/w) slice toggle no-crash with no data + slice c/w + Pin
       re-enable after append/browser-loaded Int 2D cake arrives and disable again on clear.
 - [ ] G3 OV-7 texture-cut workflow: Pin two χ/q centers on one frame, move live c/w — pinned cuts
-      survive norm/BG/unit rebuilds; live current cut is styled gray/lightweight and does NOT
-      consume palette colors.
+      survive norm/BG/unit rebuilds; live current cut is styled gray/lightweight at ~75% opacity
+      and does NOT consume palette colors; the live current sits one y-offset slot above the last
+      pin, and Pin freezes it exactly there. In Single mode, Pin stays disabled.
 - [ ] G4 MEM-1a long fast live run — peak RSS bounded, dropped labels re-hydrate.
 - [ ] G5 MEM-1b GI scan RSS bounded, reload shows 1D present / dropped 2D ABSENT.
 - [ ] G6 MEM-1c series-average Append onto existing output is BLOCKED with actionable message
@@ -128,7 +129,9 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
       then Pin the CURRENT c/w — it becomes exactly ONE new pinned trace (no duplicate, no extra
       offset). Repro: pin χ=18±10 ⇒ TWO traces, not three. Spin the c/w to a new value ⇒ the
       live "current" cut REAPPEARS; re-dial back to a pinned value ⇒ it disappears again. The
-      live current renders as a gray DASHED line only (no markers), ~50% opacity, "· current".
+      live current renders as a gray DASHED line only (no markers), ~75% opacity, "· current".
+      OV-7c: with two pins, the current previews slot 2; Pin turns it solid/color in that same
+      slot; the next moved current appears at slot 3.
 - [ ] G14 S-14/S-18 overlay identity: (S-14) RE-RUN the same scan (same name) while overlaid —
       the new run's curves REPLACE the old (not dropped as stale under the old labels); a boundary
       to a DIFFERENT compatible scan still APPENDS (OV-6). (S-18) Pin a slice cut, then load a
