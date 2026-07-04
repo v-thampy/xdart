@@ -621,6 +621,14 @@ class PublicationStore:
         with self._lock:
             self._carryover.clear()
 
+    def set_max_heavy_items(self, max_heavy_items: int | None) -> None:
+        """Resize the heavy-array retention window and enforce it immediately."""
+        if max_heavy_items is not None and max_heavy_items < 0:
+            raise ValueError("max_heavy_items must be non-negative or None")
+        with self._lock:
+            self._max_heavy_items = max_heavy_items
+            self._enforce_bounds_locked()
+
     def invalidate(self, labels) -> None:
         """Drop store entries for ``labels`` so display re-hydrates from disk.
 

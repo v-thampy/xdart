@@ -6677,8 +6677,63 @@ def test_drop_reintegrate_shadow_holds_writer_file_lock(monkeypatch):
     import xdart.modules.ewald.nexus_writer as nw
     from xdart.gui.tabs.static_scan.scan_threads import integratorThread
 
-    monkeypatch.setattr(h5pool, "get_pool", lambda: SimpleNamespace(
-        pause=lambda *a, **k: None, resume=lambda *a, **k: None))
+    events = []
+
+    class _Lock:
+        held = False
+
+        def __enter__(self):
+            events.append("enter")
+            self.held = True
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("exit")
+            self.held = False
+
+    lock = _Lock()
+
+    class _Pool:
+        def pause(self, path):
+            events.append(("pause", path, lock.held))
+            assert lock.held is True
+
+        def resume(self, path):
+            events.append(("resume", path, lock.held))
+            assert lock.held is True
+
+    monkeypatch.setattr(h5pool, "get_pool", lambda: _Pool())
+
+    def _drop(*_args, **_kwargs):
+        events.append(("drop", lock.held))
+
+    monkeypatch.setattr(nw, "drop_reintegrate_shadow_groups", _drop)
+    scan = SimpleNamespace(data_file="x.nxs", frames=SimpleNamespace())
+    host = SimpleNamespace(
+        file_lock=lock, scan=scan, publication_store=None,
+        _reint_published_idxs=set(), _reintegrate_shadow_active=True)
+    host._drop_reintegrate_shadow = MethodType(
+        integratorThread._drop_reintegrate_shadow, host)
+
+    host._drop_reintegrate_shadow()
+
+    assert events == [
+        "enter",
+        ("pause", "x.nxs", True),
+        ("drop", True),
+        ("resume", "x.nxs", True),
+        "exit",
+    ]
+    assert host._reintegrate_shadow_active is False
+
+
+def test_reintegrate_shadow_writers_pause_pool_under_file_lock(monkeypatch):
+    from contextlib import contextmanager
+    from types import MethodType, SimpleNamespace
+
+    import xdart.gui.tabs.static_scan.scan_threads as scan_threads
+    import xdart.modules.ewald.nexus_writer as nw
+    import xdart.utils.h5pool as h5pool
+    from xdart.gui.tabs.static_scan.scan_threads import integratorThread
 
     events = []
 
@@ -6695,21 +6750,72 @@ def test_drop_reintegrate_shadow_holds_writer_file_lock(monkeypatch):
 
     lock = _Lock()
 
-    def _drop(*_args, **_kwargs):
-        events.append(("drop", lock.held))
+    class _Pool:
+        def pause(self, path):
+            events.append(("pause", path, lock.held))
+            assert lock.held is True
 
-    monkeypatch.setattr(nw, "drop_reintegrate_shadow_groups", _drop)
-    scan = SimpleNamespace(data_file="x.nxs", frames=SimpleNamespace())
+        def resume(self, path):
+            events.append(("resume", path, lock.held))
+            assert lock.held is True
+
+    @contextmanager
+    def _catch(path, mode):
+        events.append(("open", path, mode, lock.held))
+        assert lock.held is True
+        yield object()
+
+    def _cleanup(*_args, **_kwargs):
+        events.append(("cleanup", lock.held))
+
+    def _save(*_args, **_kwargs):
+        events.append(("save", lock.held))
+        return {}
+
+    def _finalize(*_args, **_kwargs):
+        events.append(("finalize", lock.held))
+
+    monkeypatch.setattr(h5pool, "get_pool", lambda: _Pool())
+    monkeypatch.setattr(scan_threads, "catch", _catch)
+    monkeypatch.setattr(nw, "cleanup_reintegrate_shadow_groups", _cleanup)
+    monkeypatch.setattr(nw, "save_scan_to_nexus", _save)
+    monkeypatch.setattr(nw, "finalize_reintegrated_groups", _finalize)
+
+    frames = SimpleNamespace(
+        mark_persisted=lambda idxs: events.append(("mark", tuple(idxs), lock.held)),
+        evict_persisted_beyond_cap=lambda: 0,
+    )
+    scan = SimpleNamespace(
+        data_file="x.nxs",
+        scan_lock=RLock(),
+        frames=frames,
+    )
     host = SimpleNamespace(
-        file_lock=lock, scan=scan, publication_store=None,
-        _reint_published_idxs=set(), _reintegrate_shadow_active=True)
-    host._drop_reintegrate_shadow = MethodType(
-        integratorThread._drop_reintegrate_shadow, host)
+        file_lock=lock,
+        scan=scan,
+        _reintegrate_shadow_active=False,
+    )
+    for name in (
+        "_prepare_reintegrate_shadow",
+        "_write_reintegrate_shadow_batch",
+        "_finalize_reintegrate_shadow",
+    ):
+        setattr(host, name, MethodType(getattr(integratorThread, name), host))
 
-    host._drop_reintegrate_shadow()
+    host._prepare_reintegrate_shadow()
+    host._write_reintegrate_shadow_batch([2], do_2d=False, label="1d")
+    host._finalize_reintegrate_shadow(do_2d=False, expected_indices=[2])
 
-    assert events == ["enter", ("drop", True), "exit"]
-    assert host._reintegrate_shadow_active is False
+    pause_events = [event for event in events if isinstance(event, tuple)
+                    and event[0] == "pause"]
+    assert pause_events == [
+        ("pause", "x.nxs", True),
+        ("pause", "x.nxs", True),
+        ("pause", "x.nxs", True),
+    ]
+    assert ("cleanup", True) in events
+    assert ("save", True) in events
+    assert ("finalize", True) in events
 
 
 def test_reintegrate_run_finally_drops_active_shadow_on_unexpected_error():
@@ -8260,6 +8366,7 @@ def test_series_average_pending_tracks_running_mean():
 
 def test_streaming_dispatch_series_average_submits_one_mean_frame(monkeypatch):
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+    from xdart.modules.frame_publication import PublicationStore
     from xdart.modules.live import LiveScan
     from xdart.modules.reduction import StandardPlanCache
     from xrd_tools.reduction import Integration1DPlan, ReductionPlan
@@ -8349,6 +8456,7 @@ def test_streaming_dispatch_series_average_submits_one_mean_frame(monkeypatch):
         _resolve_frame_mask=lambda _scan, _img: None,
         _gi_freeze_whole_scan_prepass=lambda _scan: True,
         _cancel_token=lambda: None,
+        publication_store=PublicationStore(max_heavy_items=1),
     )
     for name in ("_build_batch_frames", "_dispatch_batch_streaming",
                  "_get_streaming_session", "_record_store_hydrator",
@@ -8370,6 +8478,7 @@ def test_streaming_dispatch_series_average_submits_one_mean_frame(monkeypatch):
     assert opened_kwargs[0]["record_store"] is sink_kwargs[0]["record_store"]
     assert host._streaming_record_store is opened_kwargs[0]["record_store"]
     assert host._streaming_record_store._max_heavy_items == 64
+    assert host.publication_store._max_heavy_items == 64
     assert host._streaming_record_store._max_items == 512
     assert host._streaming_record_store._hydrator is not None
     assert len(registered) == 1

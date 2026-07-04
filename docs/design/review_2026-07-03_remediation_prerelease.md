@@ -355,3 +355,115 @@ live-source escape hatch both sides; refresh perf discipline.
 Ledger rows to reopen/annotate: CF-1, CF-2 (S-2/S-3), GI-1 (S-4/S-5), PF-2 (S-8), MS-1
 (reconciliation is log-only; batch runs get no indexed-vs-processed check), MEM-1b (S-1), MEM-2
 (S-11), OV-6 (BL-6), OV-7 (S-18).
+
+---
+
+# ADDENDUM — Fix-wave re-review (2026-07-04, tip `1da29875`)
+
+Re-review of the blocker wave: Lane A (MEM-3 `e75c1a80`, BW-A1 `41cd5f11`, BW-A2 `769360e3`,
+BW-A1b `d7d87051`, BW-A3 `947750b6`+`9a7cdf82`) and the Lane-B port (`db2b5d16`..`1da29875`).
+Two verification agents + orchestrator spot-checks of the material claims against source.
+
+## Verdicts per original finding
+
+| Finding | Verdict | Notes |
+|---|---|---|
+| BL-1 Append truncate on degraded load | **CLOSED** (`769360e3`) | `_nexus_integrated_frame_count` disk probe; non-zero or probe-failure → loud RuntimeError, file untouched; legit empty skeleton still allowed; partial-degraded load fail-loud via the append-axis guard |
+| BL-2 first-flush atomic `"w"` | **CLOSED** (`769360e3`) | `mark_persisted` after Append load (truthful); predicate unchanged; fresh Overwrite still gets atomic first flush; stitched/multi-mode/foreign groups survive |
+| BL-3 sidecar junk latch | **CLOSED** (`db2b5d16`) with 2 residuals below | allow-list + ranking + binary rejection + 1 MiB cap + convention log + `.txt` generic fallback + explicit-format bypass, all empirically confirmed |
+| BL-4 handoff KeyError race | **CLOSED** (`41cd5f11`) | `super().pop(stale, None)` |
+| BL-5 red suite | **LANDED** (`41cd5f11`) | `img_ext="h5"` stub + `XDART_HEAVY_WINDOW=64` pin; NOT executed in sandbox — certify at frozen SHA on the Mac |
+| BL-6 + S-17 overlay x-grid | **CLOSED** (`552365eb`) | prior.x seeding + value-mismatch reinterp + empty-row skip; unit-relabel path verified uncorrupted |
+| S-1 dropped-report dead | **CLOSED** (`41cd5f11`) | return propagated both levels; test now production-wired (monkeypatch deleted, asserts on-disk 2D absence) |
+| S-2 CF-1 gate dead / scoping | **CLOSED** (`947750b6`+`9a7cdf82`) | worker-side guard in `initialize_scan` reads stored `/entry/reduction` config, fail-loud pre-run; covers unloaded target, empty img_file, Eiger `_master`; canonicalization survived 13 adversarial probes (no false negatives OR positives found); Append-only scoping correct |
+| S-5 range re-key | **CLOSED** (`67b103a3`) | real mode/unit change only; hydration-safe; over-clears in a few safe-direction cases (MINOR) |
+| S-6 monitor-norm canonicals | **CLOSED** (`1c32db6a`) | true delegation; strict/warn-once preserved; MIGRATION disclosure present and honest |
+| S-14 same-name re-run | **PARTIAL** (`7ac91c77`) | immediate A→A closed both directions; **A→B→A residual open (SERIOUS, below)** |
+| S-16 norm-channel reset | **CLOSED as prescribed** (`1da29875`) | 2 scoped residuals below |
+| S-18 pin scan-qualify | **CLOSED** (`7ac91c77`) | pruning + legacy-None tolerance verified |
+| OV-7b Pin absorbs current | **SANE** (`67e115e9`) | 6-digit round both sides (no tolerance hole); palette iterator not advanced for current |
+| MEM-3 | **SANE** (`e75c1a80`) | stdlib-only cap, no written-data impact; explains the 57/71 spine fix; silently bundles the CF-3 cold-launch modal + duplicate-traceback suppression (correct, but un-mentioned in message) |
+
+## NEW / residual findings (orchestrator-verified where noted)
+
+- **[SERIOUS] S-20 is NOT fixed and the BL-3 commit message claims it is.**
+  `_existing_path_case_insensitive` (metadata.py:213-227) still leads with TWO full `iterdir()`
+  sweeps per probe; auto probes 8 candidates → measured 16 full directory listings PER FRAME in a
+  sidecar-less directory (old code: 1 sorted listing) — a ~16× regression on the default path.
+  *(Orchestrator-verified in source.)* **Fix:** exact-case `candidate.is_file()` fast path FIRST,
+  then a per-directory listing cache for the case-insensitive fallback. The declined negative
+  cache stays declined (live-sidecar pickup test is right).
+- **[SERIOUS, low likelihood] junk `.pdi` latch bypasses every BL-3 gate.**
+  `_read_auto_candidate_metadata` (metadata.py:297-299) returns `read_pdi_metadata(path) or None`
+  — no plausibility gate, and the pdi reader's last-resort fallback FABRICATES
+  `{'TwoTheta': 0.0, 'Theta': 0.0}` from garbage (empirically confirmed) → cached convention,
+  fake motors persisted for every frame. **Fix:** reject the fabricated-default result in the
+  auto path (require a real parse).
+- **[SERIOUS] S-14 residual: A→B→A re-run still shows run-1's curves.** The clear fires only on
+  `prev_scan_key == name` (static_scan_widget.py:5609); after an intervening compatible scan B,
+  re-running A collides `(A, idx)` row-ids with run-1 rows → first-occurrence dedup silently
+  drops every new frame. *(Orchestrator-verified in source.)* **Fix:** track scan keys seen since
+  the last accumulator reset and clear when a name RE-ENTERS the set (or the per-rescope nonce
+  from the original review). Same residual applies to run-1 pins. Add to the ledger's
+  acceptance-contract reset list (the contract text wasn't updated for the S-14 path).
+- **[MINOR-SERIOUS] S-16 scope gap: per-row demotion still mixes silently** — `normalize()`
+  skips division when a frame's metadata lacks the key or value ≤0 (display_data.py:1383); a
+  dead/zero monitor mid-scan mixes rows with no reset (the widget-level channel record can't see
+  row-level demotion). Record the applied channel per-row on the history if this matters.
+- **[MINOR] boundary norm-combo race:** `refresh_norm_channels` with scan_data cleared at rescope
+  can clear the combo and never re-select → silent de-normalization + (with S-16) a spurious
+  wipe; narrow window (user repaint between rescope and first drain).
+- **[MINOR] BW-A2 probe blind spot:** an Append target whose every prior frame was
+  publication-dropped (per-frame groups present, integrated groups absent) still counts 0 →
+  skeleton rewrite discards those groups. Cheap hardening: probe per-frame payload too, or warn.
+- **[MINOR] new pre-run RuntimeErrors (BW-A2/A3) escape `imageThread.run()`** with no
+  showLabel/status emit — surfaced only via the global excepthook dialog. Catch around
+  `initialize_scan` → `showLabel.emit` + log, mirroring the MEM-1c blocker pattern.
+- **[MINOR] `accumulate_waterfall` empty-x history append** (display_logic.py:630-631): adopt the
+  incoming x when `history.x.size == 0`. Also hoist the loop-invariant `allclose(x, base_x)` out
+  of the per-row loop.
+- **[NOTE] v2 controls now HARD-BLOCK Run on append mismatch** (test renamed
+  `_stays_clickable` → `_blocks_run`; the previously-dead
+  `_controls_v2_append_target_matches_displayed_scan` got wired). This inverts the original CF-2
+  keep-clickable-modal design; legacy panel keeps the modal. Deliberate per the re-pinned tests —
+  **maintainer should confirm the divergence is intended.**
+- **[NOTE] legacy files without stored reduction config pass the worker guard silently**
+  (`processed None → ok`) — only the axis backstop guards those appends; add a MIGRATION line.
+- **[NOTE] ledger rows cite pre-port lane SHAs** (`63a248d9`/`74818d9b`) instead of the ported
+  `db2b5d16`/`552365eb`; INFO re-log of run caps per batch chunk on long runs (cosmetic); the
+  false PublicationStore comment at image_wrangler_thread.py:2384 survives as the S-11 marker.
+
+## Decisions requested — recommendations
+
+- **S-3 (CF signature gaps): take (A), scoped.** Extend the signature with the silent-wrong-data
+  fields (mask path+mtime, PONI content signature, chi_offset, polarization, monitor key,
+  th_val) — (B) documents the hole the CF work exists to close. Two constraints: per-field
+  FAIL-OPEN when the stored config predates the field (else every legacy append bounces), and a
+  MIGRATION line for the stricter gate. The canonicalization layer from 9a7cdf82 already gives
+  the comparison machinery.
+- **S-7 (config/gi byte drift): take (A)** — gi-bearing parity fixture + MIGRATION note. The
+  field is useful provenance (the reload heuristic already prefers it) and (B) would re-fork the
+  GUI vs headless schema, against the H6/H23 one-writer direction. The byte gate is already
+  re-pinned; just make the fixture honest and disclose.
+- **S-4 (1D χ chi_offset): endorse the proposed direction** — `azimuth_offset` on
+  `Integration1DPlan`, drop the readiness-layer range shift, re-add the offset on the 1D χ output
+  mirroring the 2D path (core.py:~2440), so 1D≡2D is headless-testable. Spine-touching: own
+  commit, byte-compat + spine gates, and real-data validation of the absolute χ frame against the
+  team reference exactly like gi_real_data_validation. Do NOT ship blind.
+
+## Remaining before tag (updated)
+
+1. S-20 stat-first (real fix this time) + `.pdi` plausibility gate — same file, one commit.
+2. S-14 A→B→A (nonce or seen-set) + contract-text update.
+3. S-12 five pause-before-lock sites (template: wrangler_widget.py:877-878).
+4. S-8 parsed `(scan,index)` first_img filter (+ the zero-discovered warning).
+5. S-11 heavy-window → PublicationStore wiring + detector-switch cache key (MEM-3 did NOT change
+   this picture — confirmed) + delete the false comment.
+6. S-4 with validation harness; S-3(A); S-7(A).
+7. MIGRATION sweep (review S-21: CF-1/CF-2 modal+hard-block, MEM-1c, PF-2 grouping change,
+   config/gi, legacy-no-config append note, "Post-v1.0" header).
+8. Optional small: BW-A2 blind spot, run()-level catch, S-16 residuals, CP-v2 batch from the
+   original review (run-lock hole, Advanced-dialog escape, frame-count mtime, H5 parity test).
+9. Full gate (core + full offscreen xdart + spine 71 + byte-compat) at the frozen candidate SHA
+   on the Mac — sandbox cannot execute the GUI suites.
+10. Session-1 live checklist (now G1–G16) → tag.

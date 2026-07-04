@@ -7,6 +7,7 @@ import threading
 import importlib.util
 from collections import Counter, deque
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -175,6 +176,41 @@ def test_append_image_series_skips_before_reader_and_metadata(monkeypatch, tmp_p
     assert read_calls == [str(paths[2])]
     assert meta_calls == [str(paths[2])]
     assert worker._append_skip_without_reading == 2
+
+
+def test_image_series_start_filter_uses_parsed_frame_index(monkeypatch, tmp_path):
+    """Unpadded/dash-index filenames must not be filtered by path text order."""
+    paths = [
+        tmp_path / "scan_1.tif",
+        tmp_path / "scan-2.tif",
+        tmp_path / "scan_10.tif",
+    ]
+    for path in paths:
+        path.touch()
+
+    worker = _bare_worker(tmp_path)
+    worker.inp_type = "Image Series"
+    worker.img_file = str(paths[1])
+    worker.img_dir = str(tmp_path)
+    worker.img_ext = "tif"
+    worker.scan_name = "scan"
+    worker.img_fnames = []
+    worker.processed = []
+
+    read_calls = []
+
+    def fake_read(path):
+        read_calls.append(Path(path).name)
+        return np.ones((2, 2), dtype=float)
+
+    monkeypatch.setattr(iwt, "read_image", fake_read)
+
+    first = worker.get_next_image()
+    second = worker.get_next_image()
+
+    assert (Path(first[0]).name, first[2]) == ("scan-2.tif", 2)
+    assert (Path(second[0]).name, second[2]) == ("scan_10.tif", 10)
+    assert read_calls == ["scan-2.tif", "scan_10.tif"]
 
 
 def test_single_image_append_skip_emits_update_without_reader(monkeypatch, tmp_path):
@@ -568,6 +604,27 @@ def test_zero_processed_already_processed_frames_logs_info(caplog, tmp_path):
         if rec.levelno >= logging.WARNING and expected in rec.message
     ]
     assert labels == [expected]
+
+
+def test_zero_processed_no_discovered_frames_warns_with_source_details(
+        caplog, tmp_path):
+    worker = _bare_worker(tmp_path)
+    labels = []
+    worker.showLabel = SimpleNamespace(emit=labels.append)
+    worker.img_dir = str(tmp_path / "empty")
+    worker.img_ext = "TIF"
+    worker.file_filter = "scan | sample"
+
+    with caplog.at_level(logging.WARNING):
+        worker._report_run_skip_summary(0)
+
+    assert labels
+    message = labels[0]
+    assert "No frames discovered" in message
+    assert f"directory: {tmp_path / 'empty'}" in message
+    assert "ext: .TIF" in message
+    assert "pattern: scan | sample" in message
+    assert message in caplog.text
 
 
 # ── MEM-1c: series-average + Append must not silently produce nothing ────────

@@ -124,6 +124,104 @@ def test_widget_async_aggregate_none_is_retryable(tmp_path):
     assert len(calls) == 2
 
 
+def test_active_aggregate_pending_survives_selection_generation_bumps(tmp_path):
+    scan, _, _ = _split_scan_2d(tmp_path, n=12)
+    calls = []
+
+    class FakeWorker:
+        def request(self, *args):
+            calls.append(args)
+
+    duck = _duck_widget(
+        scan,
+        _async_hydration_enabled=True,
+        _processing_active=True,
+        _aggregate_live_scan=scan,
+        _agg_pending=set(),
+        _agg_generation=0,
+        _agg_signature_by_key={},
+    )
+    duck._ensure_aggregation_worker = lambda: FakeWorker()
+
+    assert _call_whole_scan_aggregate(duck, dim="2d", method="average") is None
+    duck.display_generation += 1
+    assert _call_whole_scan_aggregate(duck, dim="2d", method="average") is None
+
+    assert len(calls) == 1
+    assert calls[0][1] == 1
+
+
+def test_active_aggregate_cache_invalidates_only_on_flush_signature(
+        tmp_path, monkeypatch):
+    from xrd_tools.io.aggregate import Aggregated2D
+    import xdart.modules.scan_aggregate as scan_aggregate_mod
+
+    scan, q, chi = _split_scan_2d(tmp_path, n=12)
+    calls = []
+
+    def fake_aggregate(scan_arg, *, method, norm_channel=None):
+        calls.append((scan_arg, method, norm_channel))
+        return Aggregated2D(
+            q=q, chi=chi,
+            intensity=np.full((chi.size, q.size), float(len(calls))),
+            q_unit="q_A^-1", chi_unit="chi_deg", n_frames=12,
+        )
+
+    monkeypatch.setattr(
+        scan_aggregate_mod, "whole_scan_aggregate_2d", fake_aggregate)
+    duck = _duck_widget(
+        scan,
+        _processing_active=True,
+        _aggregate_live_scan=scan,
+        _agg_generation=0,
+        _agg_signature_by_key={},
+    )
+
+    first = _call_whole_scan_aggregate(duck, dim="2d", method="average")
+    duck.display_generation += 1
+    second = _call_whole_scan_aggregate(duck, dim="2d", method="average")
+    scan.frames.mark_persisted([999])
+    third = _call_whole_scan_aggregate(duck, dim="2d", method="average")
+
+    assert len(calls) == 2
+    assert first.intensity[0, 0] == 1.0
+    assert second.intensity[0, 0] == 1.0
+    assert third.intensity[0, 0] == 2.0
+
+
+def test_active_aggregate_uses_worker_scan_for_unflushed_tail(tmp_path, monkeypatch):
+    from xrd_tools.io.aggregate import Aggregated2D
+    import xdart.modules.scan_aggregate as scan_aggregate_mod
+
+    display_scan, q, chi = _split_scan_2d(tmp_path, n=12)
+    live_scan = SimpleNamespace(
+        data_file=display_scan.data_file,
+        frames=display_scan.frames,
+        gi=getattr(display_scan, "gi", False),
+    )
+    seen = []
+
+    def fake_aggregate(scan_arg, *, method, norm_channel=None):
+        seen.append(scan_arg)
+        return Aggregated2D(
+            q=q, chi=chi, intensity=np.ones((chi.size, q.size)),
+            q_unit="q_A^-1", chi_unit="chi_deg", n_frames=12,
+        )
+
+    monkeypatch.setattr(
+        scan_aggregate_mod, "whole_scan_aggregate_2d", fake_aggregate)
+    duck = _duck_widget(
+        display_scan,
+        _processing_active=True,
+        _aggregate_live_scan=live_scan,
+        _agg_generation=0,
+        _agg_signature_by_key={},
+    )
+
+    assert _call_whole_scan_aggregate(duck, dim="2d", method="average") is not None
+    assert seen == [live_scan]
+
+
 def test_sum_average_state_snapshot_does_not_reenqueue_full_2d_hydration():
     from xdart.gui.tabs.static_scan.display_controllers import ScanDisplayController
     from xdart.gui.tabs.static_scan.display_logic import Mode

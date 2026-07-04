@@ -1041,22 +1041,6 @@ class PublicationDisplayAdapter:
                 x, y, this_axis = projected
             if np.asarray(x).size == 0:   # S-17: an empty grid carries no trace
                 return None
-            if ref_x is None:
-                ref_x = x
-                axis = this_axis
-                # BL-6: adopt the compatible prior grid (SAME unit only, so a
-                # Q<->2theta toggle is not misread) so this and every later row
-                # land on the existing overlay x.
-                if (prior_x_seed is not None
-                        and str(getattr(this_axis, "unit", "") or "")
-                        == str(getattr(prior, "unit", "") or "")):
-                    if (x.shape != prior_x_seed.shape
-                            or not np.allclose(x, prior_x_seed, equal_nan=True)):
-                        y = np.interp(prior_x_seed, x, y)
-                    ref_x = prior_x_seed
-            elif x.shape != ref_x.shape or not np.allclose(x, ref_x, equal_nan=True):
-                y = np.interp(ref_x, x, y)
-                x = ref_x
             if recipe is not None:
                 row_id = recipe.get("row_id")
                 projection_id = recipe.get("projection_id")
@@ -1064,13 +1048,52 @@ class PublicationDisplayAdapter:
                 projection_id = None
                 row_id = None
             row_grid_key, computed_row_id = overlay_identity_for_widget(
-                widget, label, npt=np.asarray(ref_x).size,
+                widget, label, npt=np.asarray(x).size,
                 axis_info=row_axis_info, projection_id=projection_id,
                 live_slice=bool(live and slice_active))
             if row_id is None:
                 row_id = computed_row_id
-            if reset_key is None:
+
+            use_prior_seed = (
+                prior_x_seed is not None
+                and prior is not None
+                and overlay_grid_keys_match(prior.reset_key, row_grid_key)
+                and str(getattr(this_axis, "unit", "") or "")
+                == str(getattr(prior, "unit", "") or "")
+            )
+            if ref_x is None:
+                ref_x = x
+                axis = this_axis
                 reset_key = row_grid_key
+                # BL-6: adopt the compatible prior grid (SAME unit only, so a
+                # Q<->2theta toggle is not misread) so this and every later row
+                # land on the existing overlay x.
+                if use_prior_seed:
+                    if (x.shape != prior_x_seed.shape
+                            or not np.allclose(x, prior_x_seed, equal_nan=True)):
+                        y = np.interp(prior_x_seed, x, y)
+                    ref_x = prior_x_seed
+            elif not overlay_grid_keys_match(reset_key, row_grid_key):
+                # A render batch can briefly contain rows from different concrete
+                # grids while the selection/model is settling.  The accumulator can
+                # represent only one grid family, so the latest incompatible row
+                # starts a fresh batch instead of being interpolated into stale
+                # history.
+                ids.clear()
+                names.clear()
+                rows.clear()
+                metadata.clear()
+                ref_x = x
+                axis = this_axis
+                reset_key = row_grid_key
+                if use_prior_seed:
+                    if (x.shape != prior_x_seed.shape
+                            or not np.allclose(x, prior_x_seed, equal_nan=True)):
+                        y = np.interp(prior_x_seed, x, y)
+                    ref_x = prior_x_seed
+            elif x.shape != ref_x.shape or not np.allclose(x, ref_x, equal_nan=True):
+                y = np.interp(ref_x, x, y)
+                x = ref_x
             ids.append(row_id)
             if recipe is not None and recipe.get("name"):
                 name = recipe["name"]

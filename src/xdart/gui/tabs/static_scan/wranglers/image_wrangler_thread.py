@@ -179,6 +179,25 @@ def _get_scan_info(fname):
     return _split_scan_suffix(Path(fname).stem)
 
 
+def _series_frame_sort_key(path):
+    scan_name, img_number = _get_scan_info(path)
+    number_key = -1 if img_number is None else img_number
+    return str(scan_name), number_key, natural_keys_int(str(path))
+
+
+def _same_series_at_or_after(path, first_path):
+    """Return True when *path* is in first_path's parsed series at/after it."""
+    first_scan, first_number = _get_scan_info(first_path)
+    scan_name, img_number = _get_scan_info(path)
+    if scan_name != first_scan:
+        return False
+    if first_number is None:
+        return True
+    if img_number is None:
+        return False
+    return img_number >= first_number
+
+
 def _split_scan_suffix(stem):
     match = _FRAME_SUFFIX_PATTERN.match(stem)
     if not match:
@@ -999,6 +1018,18 @@ class imageThread(wranglerThread):
             parts.append(f"{reason} ({count})" if count != 1 else reason)
         return "; ".join(parts)
 
+    def _format_no_frames_discovered_message(self):
+        directory = getattr(self, "img_dir", None) or (
+            str(Path(getattr(self, "img_file", "")).parent)
+            if getattr(self, "img_file", None) else "")
+        ext = (getattr(self, "img_ext", "") or "").lstrip(".") or "<any>"
+        pattern = getattr(self, "file_filter", "") or "<none>"
+        return (
+            "No frames discovered"
+            f" (directory: {directory or '<unknown>'}, "
+            f"ext: .{ext}, pattern: {pattern})"
+        )
+
     def _report_run_skip_summary(self, files_processed):
         skipped = getattr(self, "_append_skip_without_reading", 0)
         if skipped:
@@ -1008,8 +1039,19 @@ class imageThread(wranglerThread):
             )
 
         discovered = getattr(self, "_discovered_frame_count", 0)
-        if (discovered <= 0 or files_processed >= discovered
-                or getattr(self, "command", None) == 'stop'):
+        if getattr(self, "command", None) == 'stop':
+            return
+        if discovered <= 0:
+            if files_processed <= 0:
+                msg = self._format_no_frames_discovered_message()
+                logger.warning(msg)
+                try:
+                    self.showLabel.emit(msg)
+                except Exception:
+                    logger.debug("showLabel emit failed for no-frame warning",
+                                 exc_info=True)
+            return
+        if files_processed >= discovered:
             return
         if getattr(self, "series_average", False) and files_processed > 0:
             return
@@ -2318,13 +2360,23 @@ class imageThread(wranglerThread):
         Computed at run start (detector shape known); cached but logged whenever
         the run/session start path consults it.
         """
-        frame_bytes = self._heavy_window_frame_bytes()
+        frame_bytes = imageThread._heavy_window_frame_bytes(self)
+        shape = getattr(self, "detector_shape", None)
+        try:
+            shape_key = (
+                tuple(int(dim) for dim in shape[:2])
+                if shape and len(shape) >= 2 else None
+            )
+        except (TypeError, ValueError):
+            shape_key = None
+        cache_key = (shape_key, frame_bytes, os.environ.get("XDART_HEAVY_WINDOW"))
         cached = getattr(self, "_heavy_window", None)
-        if cached is None:
+        if cached is None or getattr(self, "_heavy_window_key", None) != cache_key:
             from xrd_tools.core import heavy_window
             cached = heavy_window(frame_bytes)
             self._heavy_window = cached
-        self._log_heavy_staging_window(cached, frame_bytes)
+            self._heavy_window_key = cache_key
+        imageThread._log_heavy_staging_window(self, cached, frame_bytes)
         return cached
 
     def _heavy_window_frame_bytes(self):
@@ -2341,6 +2393,12 @@ class imageThread(wranglerThread):
         logger.info(heavy_window_log_line(
             window, frame_bytes,
             overridden=bool(os.environ.get("XDART_HEAVY_WINDOW"))))
+
+    def _resize_publication_store_heavy_window(self, window):
+        store = getattr(self, "publication_store", None)
+        resize = getattr(store, "set_max_heavy_items", None)
+        if callable(resize):
+            resize(window)
 
     def _log_reduction_worker_cap(self, workers):
         from xrd_tools.core import reduction_worker_cap_log_line
@@ -2359,7 +2417,8 @@ class imageThread(wranglerThread):
                 imageThread._log_reduction_worker_cap(self, workers)
             _hsw = getattr(self, "_heavy_staging_window", None)
             if callable(_hsw):
-                _hsw(scan)
+                window = _hsw(scan)
+                imageThread._resize_publication_store_heavy_window(self, window)
             return self._streaming_session, self._streaming_sink
         if self._streaming_session is not None:   # a different scan started
             self._close_reduction_session()
@@ -2394,6 +2453,7 @@ class imageThread(wranglerThread):
         frames_obj = getattr(scan, "frames", None)
         if frames_obj is not None:
             frames_obj._in_memory_cap = window
+        imageThread._resize_publication_store_heavy_window(self, window)
         record_store = FrameRecordStore(
             max_items=_LIVE_RECORD_STORE_MAX_ITEMS,
             max_heavy_items=window,
@@ -3127,10 +3187,15 @@ class imageThread(wranglerThread):
                 self.img_fnames = (p for p in candidates
                                    if match(p.name[:-len(suffix)]))
 
-            self.img_fnames = [str(f) for f in self.img_fnames if
-                               (str(f) >= first_img) and (str(f) not in self.processed)]
+            processed = set(str(f) for f in self.processed)
+            self.img_fnames = [
+                str(f) for f in self.img_fnames
+                if str(f) not in processed
+                and (not first_img or _same_series_at_or_after(f, first_img))
+            ]
 
-            self.img_fnames = deque(natural_sort_ints(self.img_fnames))
+            self.img_fnames = deque(sorted(
+                self.img_fnames, key=_series_frame_sort_key))
 
         img_file, scan_name, img_number, img_data, img_meta = None, None, 1, None, {}
         n = 0

@@ -279,6 +279,59 @@ def test_base_save_to_disk_locks_before_pausing_h5pool(monkeypatch):
     ]
 
 
+def test_nexus_final_save_locks_before_pausing_h5pool(monkeypatch):
+    import xdart.gui.tabs.static_scan.wranglers.nexus_wrangler_thread as nxmod
+    from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler_thread import (
+        nexusThread)
+
+    events = []
+
+    class _TrackingLock:
+        held = False
+
+        def __enter__(self):
+            events.append("lock-enter")
+            self.held = True
+            return self
+
+        def __exit__(self, *_exc):
+            events.append("lock-exit")
+            self.held = False
+            return False
+
+    lock = _TrackingLock()
+
+    class _Pool:
+        def pause(self, path):
+            events.append(("pause", path, lock.held))
+            assert lock.held is True
+
+        def resume(self, path):
+            events.append(("resume", path, lock.held))
+            assert lock.held is True
+
+    monkeypatch.setattr(nxmod, '_get_h5pool', lambda: _Pool())
+    scan = SimpleNamespace(
+        data_file='x.nxs',
+        default_geometry=lambda: events.append(("geometry", lock.held)),
+        save_to_nexus=lambda replace=False, finalize=True: events.append(
+            ("save", replace, finalize, lock.held)),
+    )
+    w = SimpleNamespace(xye_only=False, command='stop', file_lock=lock)
+    w._final_save_to_nexus = MethodType(nexusThread._final_save_to_nexus, w)
+
+    w._final_save_to_nexus(scan, 3)
+
+    assert events == [
+        "lock-enter",
+        ("pause", "x.nxs", True),
+        ("geometry", True),
+        ("save", False, False, True),
+        ("resume", "x.nxs", True),
+        "lock-exit",
+    ]
+
+
 def test_flush_serial_tail_persists_before_resetting_counter(monkeypatch):
     """persist-before-evict: ``_save_to_nexus`` (which marks frames persisted)
     completes BEFORE ``_frames_since_save`` is reset — the save sees the

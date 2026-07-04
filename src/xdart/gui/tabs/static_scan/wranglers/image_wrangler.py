@@ -1237,6 +1237,7 @@ class imageWrangler(wranglerWidget):
         # Signal
         self.file_filter = self.parameters.child('Signal').child('Filter').value()
         self.thread.file_filter = self.file_filter
+        self.thread.publication_store = getattr(self, "publication_store", None)
 
         self.inp_type = self.parameters.child('Signal').child('inp_type').value()
         self.thread.inp_type = self.inp_type

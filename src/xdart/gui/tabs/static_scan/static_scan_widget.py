@@ -3811,6 +3811,9 @@ class staticWidget(QWidget):
         self.wrangler.input_q = self.command_queue
         self.wrangler.fname = self.fname
         self.wrangler.file_lock = self.file_lock
+        self.wrangler.publication_store = self.publication_store
+        if hasattr(self.wrangler, "thread"):
+            self.wrangler.thread.publication_store = self.publication_store
         self.wrangler.sigStart.connect(self.start_wrangler)
         if hasattr(self.wrangler, 'sigStitchRequested'):
             self.wrangler.sigStitchRequested.connect(self.start_stitch)
@@ -4472,6 +4475,11 @@ class staticWidget(QWidget):
         # Build + store publications + scan_data for every frame stashed since the
         # last flush (the coalesced heavy work, off the per-frame GUI event loop).
         self._drain_pending_frames()
+        try:
+            self.displayframe._aggregate_live_scan = getattr(
+                getattr(self.wrangler, "thread", None), "_active_scan", None)
+        except Exception:
+            logger.debug("aggregate live-scan handoff failed", exc_info=True)
         _t1 = _t.perf_counter() if _perf else 0.0
         # Heavy list-widget refresh first — auto-last cursor needs the
         # list to contain the new index before it can select it.

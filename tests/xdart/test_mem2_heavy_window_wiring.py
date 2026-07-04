@@ -34,6 +34,32 @@ def test_thread_heavy_window_uses_override_and_caches(monkeypatch):
     win = imageThread._heavy_staging_window(worker, scan)
     assert win == 32
     assert worker._heavy_window == 32                 # cached
+    assert worker._heavy_window_key[0] == (2167, 2070)
+
+
+def test_thread_heavy_window_cache_is_detector_shape_scoped(monkeypatch):
+    monkeypatch.delenv("XDART_HEAVY_WINDOW", raising=False)
+    import xrd_tools.core as core
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
+        imageThread)
+
+    calls = []
+
+    def fake_heavy_window(frame_bytes=None):
+        calls.append(frame_bytes)
+        return 64 if frame_bytes < 1000 else 16
+
+    monkeypatch.setattr(core, "heavy_window", fake_heavy_window)
+    worker = imageThread.__new__(imageThread)
+    scan = SimpleNamespace(frames=None)
+
+    worker.detector_shape = (10, 10)
+    assert imageThread._heavy_staging_window(worker, scan) == 64
+    assert imageThread._heavy_staging_window(worker, scan) == 64
+    worker.detector_shape = (20, 20)
+    assert imageThread._heavy_staging_window(worker, scan) == 16
+
+    assert calls == [800, 3200]
 
 
 def test_thread_heavy_window_logs_when_cache_reused(monkeypatch, caplog):

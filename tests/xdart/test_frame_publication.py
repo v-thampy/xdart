@@ -177,6 +177,20 @@ def test_publication_store_bounds_heavy_payloads_but_keeps_metadata():
     assert store.get(3).view.has_2d
 
 
+def test_publication_store_heavy_window_resize_evicts_existing_payloads():
+    store = PublicationStore(max_heavy_items=2, max_thumbnail_items=None)
+    for idx in (1, 2):
+        store.upsert(publication_from_live_frame(DuckFrame(idx=idx)))
+
+    store.set_max_heavy_items(1)
+
+    assert store._max_heavy_items == 1
+    assert store.get(1).raw_ref is None
+    assert not store.get(1).view.has_2d
+    assert store.get(1).raw_status == "thumbnail"
+    assert store.get(2).view.has_2d
+
+
 def test_publication_store_thumbnail_tier_has_its_own_bound():
     """Tier 2: thumbnails outlive the heavy bound but have their own
     (larger) bound; past it the publication drops to metadata-only."""

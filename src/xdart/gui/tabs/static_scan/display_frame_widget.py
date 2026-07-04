@@ -724,6 +724,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._aggregation_worker = None
         self._agg_cache: dict = {}
         self._agg_pending: set = set()
+        self._agg_generation = 0
+        self._agg_signature_by_key: dict = {}
+        self._aggregate_live_scan = None
         if self.publication_store is not None:
             try:
                 self.publication_store.set_hydrator(self._rehydrate_publication)
@@ -1047,9 +1050,6 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         cancel = getattr(worker, "cancel_stale_before", None)
         if callable(cancel):
             cancel(self.display_generation)
-        pending = getattr(self, "_agg_pending", None)
-        if pending is not None:
-            pending.clear()
         return self.display_generation
 
     def _sync_selection_generation(self):
@@ -1514,6 +1514,59 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 "gi_mode_2d", "qip_qoop")
         return mode_aggregation_allowed(displayed, gi_config[key])
 
+    def _aggregate_source_scan(self):
+        """Return the scan whose disk prefix + live tail should be aggregated."""
+        scan = getattr(self, "scan", None)
+        if not getattr(self, "_processing_active", False):
+            return scan
+        live_scan = getattr(self, "_aggregate_live_scan", None)
+        if live_scan is None:
+            return scan
+        live_file = getattr(live_scan, "data_file", None)
+        scan_file = getattr(scan, "data_file", None)
+        try:
+            if live_file and scan_file and os.path.abspath(live_file) != os.path.abspath(scan_file):
+                return scan
+        except Exception:
+            return scan
+        return live_scan
+
+    @staticmethod
+    def _aggregate_data_signature(scan, *, active=False):
+        frames = getattr(scan, "frames", None)
+        data_file = getattr(scan, "data_file", None)
+        if active:
+            persisted = getattr(frames, "_persisted", None)
+            if persisted is not None:
+                try:
+                    return (data_file, "persisted", tuple(sorted(int(i) for i in persisted)))
+                except Exception:
+                    pass
+        try:
+            index = tuple(int(i) for i in getattr(frames, "index", ()) or ())
+        except Exception:
+            index = tuple(getattr(frames, "index", ()) or ())
+        return (data_file, "index", index)
+
+    def _aggregate_generation_for(self, key, scan):
+        """Version aggregate data by disk-flush signature, not selection repaint."""
+        signature = displayFrameWidget._aggregate_data_signature(
+            scan, active=bool(getattr(self, "_processing_active", False)))
+        signatures = getattr(self, "_agg_signature_by_key", None)
+        if signatures is None:
+            signatures = {}
+            self._agg_signature_by_key = signatures
+        if signatures.get(key) != signature:
+            self._agg_generation = int(getattr(self, "_agg_generation", 0)) + 1
+            signatures[key] = signature
+            pending = getattr(self, "_agg_pending", None)
+            if pending is not None:
+                pending.difference_update(
+                    item for item in tuple(pending)
+                    if item[0] == key and item[1] != self._agg_generation
+                )
+        return int(getattr(self, "_agg_generation", 0))
+
     def _whole_scan_aggregate(self, *, dim, method):
         """Return the whole-scan Sum/Average for the current Overall selection as
         an ``Aggregated1D``/``Aggregated2D``, or ``None`` when it isn't available
@@ -1525,7 +1578,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         aggregating a partial stack or a bounded in-memory subset.
         Async (live): dispatch to the worker and return None now (re-render on
         completion).  Sync (headless): compute inline."""
-        scan = getattr(self, "scan", None)
+        source_scan = getattr(self, "_aggregate_source_scan", None)
+        if source_scan is None:
+            source_scan = displayFrameWidget._aggregate_source_scan.__get__(
+                self, type(self))
+        if callable(source_scan):
+            scan = source_scan()
+        else:
+            scan = getattr(self, "scan", None)
         if scan is None:
             return None
         gate = getattr(self, "_aggregate_display_is_primary", None)
@@ -1539,8 +1599,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             norm_channel = self.get_normChannel() or None
         except Exception:
             norm_channel = None
-        generation = self.display_generation
         key = (dim, method, norm_channel)
+        gen_for = getattr(self, "_aggregate_generation_for", None)
+        if gen_for is None:
+            gen_for = displayFrameWidget._aggregate_generation_for.__get__(
+                self, type(self))
+        if callable(gen_for):
+            generation = gen_for(key, scan)
+        else:
+            generation = getattr(self, "display_generation", 0)
         cached = self._agg_cache.get(key)
         if cached is not None and cached[0] == generation:
             return cached[1]
@@ -1566,9 +1633,24 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     def _on_aggregated(self, key, generation, result) -> None:
         """A background aggregate finished: cache it (on the GUI thread) and
-        re-render, unless a newer generation has superseded it."""
-        self._agg_pending.discard((key, int(generation)))
-        if int(generation) != self.display_generation:
+        re-render, unless a newer aggregate data generation has superseded it."""
+        generation = int(generation)
+        self._agg_pending.discard((key, generation))
+        source_scan = getattr(self, "_aggregate_source_scan", None)
+        if source_scan is None:
+            source_scan = displayFrameWidget._aggregate_source_scan.__get__(
+                self, type(self))
+        scan = source_scan() if callable(source_scan) else getattr(self, "scan", None)
+        gen_for = getattr(self, "_aggregate_generation_for", None)
+        if gen_for is None:
+            gen_for = displayFrameWidget._aggregate_generation_for.__get__(
+                self, type(self))
+        current_generation = (
+            gen_for(key, scan)
+            if callable(gen_for) and scan is not None
+            else getattr(self, "display_generation", 0)
+        )
+        if generation != int(current_generation):
             return
         if result is None:
             # None means "not ready / unavailable for this attempt", not a
@@ -1578,7 +1660,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._agg_cache[key] = (generation, result)
         request = getattr(self, "request_current_selection_repaint", None)
         if callable(request):
-            request(generation=generation, reason="aggregation")
+            request(reason="aggregation")
             return
         try:
             self.update()
@@ -4049,6 +4131,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         active = bool(active)
         self._processing_active = active
         self._run_writing = active
+        if not active:
+            self._aggregate_live_scan = None
         if was_writing and not active:
             clear_wavelength = getattr(self, "_clear_wavelength_cache", None)
             if callable(clear_wavelength):

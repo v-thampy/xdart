@@ -439,29 +439,31 @@ class integratorThread(Qt.QtCore.QThread):
         )
         from xdart.utils.h5pool import get_pool as _get_h5pool
 
-        _get_h5pool().pause(self.scan.data_file)
-        try:
-            with self.file_lock:
+        with self.file_lock:
+            pool = _get_h5pool()
+            pool.pause(self.scan.data_file)
+            try:
                 with catch(self.scan.data_file, "a") as f:
                     cleanup_reintegrate_shadow_groups(f, entry="entry")
-            self._reintegrate_shadow_active = True
-        finally:
-            _get_h5pool().resume(self.scan.data_file)
+                self._reintegrate_shadow_active = True
+            finally:
+                pool.resume(self.scan.data_file)
 
     def _drop_reintegrate_shadow(self) -> None:
         """Delete active reintegration shadows after stop/error."""
         from xdart.modules.ewald.nexus_writer import drop_reintegrate_shadow_groups
         from xdart.utils.h5pool import get_pool as _get_h5pool
 
-        _get_h5pool().pause(self.scan.data_file)
-        try:
-            with self.file_lock:
+        with self.file_lock:
+            pool = _get_h5pool()
+            pool.pause(self.scan.data_file)
+            try:
                 drop_reintegrate_shadow_groups(self.scan.data_file, entry="entry")
-        except Exception:
-            logger.debug("[REINT] shadow cleanup failed", exc_info=True)
-        finally:
-            self._reintegrate_shadow_active = False
-            _get_h5pool().resume(self.scan.data_file)
+            except Exception:
+                logger.debug("[REINT] shadow cleanup failed", exc_info=True)
+            finally:
+                self._reintegrate_shadow_active = False
+                pool.resume(self.scan.data_file)
         # Reconcile the in-session state to the prior canonical result.  The
         # shadow's recomputed rows are gone, so for EVERY frame the pass
         # displayed: undo any mark_persisted (they are not on canonical), drop
@@ -510,10 +512,11 @@ class integratorThread(Qt.QtCore.QThread):
 
         shadow_1d = reintegrate_shadow_group_name(INTEGRATED_1D_GROUP)
         shadow_2d = reintegrate_shadow_group_name(INTEGRATED_2D_GROUP)
-        _get_h5pool().pause(self.scan.data_file)
-        try:
-            dropped_map = None
-            with self.file_lock:
+        with self.file_lock:
+            pool = _get_h5pool()
+            pool.pause(self.scan.data_file)
+            try:
+                dropped_map = None
                 with self.scan.scan_lock:
                     dropped_map = save_scan_to_nexus(
                         self.scan,
@@ -533,32 +536,33 @@ class integratorThread(Qt.QtCore.QThread):
                         write_reduction=False,
                         recover_shadow_groups=False,
                     )
-            try:
-                self.scan.frames.mark_persisted(frame_indices)
-                n_evicted = self.scan.frames.evict_persisted_beyond_cap()
-                if n_evicted:
-                    logger.info(
-                        "[REINT] %s shadow-persisted %s frame(s), evicted %s.",
-                        label, len(frame_indices), n_evicted,
-                    )
-            except Exception:
-                logger.debug("[REINT] post-shadow eviction skipped",
-                             exc_info=True)
-            # Only this pass's active dimension is written to a shadow group, so
-            # the union over the returned dict is that dimension's drops.
-            return {int(i) for _vals in (dropped_map or {}).values()
-                    for i in _vals}
-        finally:
-            _get_h5pool().resume(self.scan.data_file)
+                try:
+                    self.scan.frames.mark_persisted(frame_indices)
+                    n_evicted = self.scan.frames.evict_persisted_beyond_cap()
+                    if n_evicted:
+                        logger.info(
+                            "[REINT] %s shadow-persisted %s frame(s), evicted %s.",
+                            label, len(frame_indices), n_evicted,
+                        )
+                except Exception:
+                    logger.debug("[REINT] post-shadow eviction skipped",
+                                 exc_info=True)
+                # Only this pass's active dimension is written to a shadow group,
+                # so the union over the returned dict is that dimension's drops.
+                return {int(i) for _vals in (dropped_map or {}).values()
+                        for i in _vals}
+            finally:
+                pool.resume(self.scan.data_file)
 
     def _finalize_reintegrate_shadow(self, *, do_2d: bool, expected_indices) -> None:
         """Swap the completed shadow into place and stamp reduction settings."""
         from xdart.modules.ewald.nexus_writer import finalize_reintegrated_groups
         from xdart.utils.h5pool import get_pool as _get_h5pool
 
-        _get_h5pool().pause(self.scan.data_file)
-        try:
-            with self.file_lock:
+        with self.file_lock:
+            pool = _get_h5pool()
+            pool.pause(self.scan.data_file)
+            try:
                 with self.scan.scan_lock:
                     finalize_reintegrated_groups(
                         self.scan,
@@ -568,9 +572,9 @@ class integratorThread(Qt.QtCore.QThread):
                         swap_2d=do_2d,
                         expected_frame_indices=expected_indices,
                     )
-            self._reintegrate_shadow_active = False
-        finally:
-            _get_h5pool().resume(self.scan.data_file)
+                self._reintegrate_shadow_active = False
+            finally:
+                pool.resume(self.scan.data_file)
 
     def bai_2d_all(self):
         """Integrates all frames 2d.  Thin wrapper over _reintegrate_all."""

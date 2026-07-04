@@ -150,6 +150,28 @@ class nexusThread(wranglerThread):
         # chunks within a single run.
         self._plan_cache = StandardPlanCache()
 
+    def _final_save_to_nexus(self, scan, files_processed):
+        """Persist the final NeXus tail with writer-lock-before-pool-pause."""
+        if files_processed <= 0 or self.xye_only:
+            return
+        is_finalize = (self.command != 'stop')
+        with self.file_lock:
+            pool = _get_h5pool()
+            pool.pause(scan.data_file)
+            try:
+                scan.default_geometry()
+                scan.save_to_nexus(
+                    replace=False, finalize=is_finalize,
+                )
+            finally:
+                pool.resume(scan.data_file)
+        if not is_finalize:
+            logger.info(
+                '[NEXUS] Stop tail-flushed %d frames; .nxs is '
+                'a partial result (no finalize stamp).',
+                files_processed,
+            )
+
     # ── Main entry point ─────────────────────────────────────────────────
 
     def run(self):
@@ -400,26 +422,11 @@ class nexusThread(wranglerThread):
         # the scan didn't actually complete and the file should be
         # marked as a partial result.
         #
-        # N7 — dropped the outer ``with self.file_lock:`` because
-        # ``scan.save_to_nexus`` already takes the lock internally
-        # (J2 made the locks the same Condition, so the nested
-        # acquire was reentrant + redundant rather than a deadlock).
-        if files_processed > 0 and not self.xye_only:
-            is_finalize = (self.command != 'stop')
-            _get_h5pool().pause(scan.data_file)
-            try:
-                scan.default_geometry()
-                scan.save_to_nexus(
-                    replace=False, finalize=is_finalize,
-                )
-            finally:
-                _get_h5pool().resume(scan.data_file)
-            if not is_finalize:
-                logger.info(
-                    '[NEXUS] Stop tail-flushed %d frames; .nxs is '
-                    'a partial result (no finalize stamp).',
-                    files_processed,
-                )
+        # H30/RN-2: take the writer file_lock before pausing the pooled reader.
+        # ``scan.save_to_nexus`` also takes this same reentrant lock internally;
+        # the outer hold is the ordering guard that prevents pause/close from
+        # racing a load worker that borrowed a pooled read handle under file_lock.
+        self._final_save_to_nexus(scan, files_processed)
 
         self.showLabel.emit(f'Done — {files_processed} frames processed')
         logger.info(
