@@ -476,3 +476,12 @@ behind the producer).  A headless benchmark that keeps the GUI pacing shows
 steady-state peak ~9 GB largely unchanged; the bound is demonstrated by the
 stalled-drain unit test (`test_mem1_oom_bounds`), and the real live win needs a
 sustained fast live run to confirm.
+
+## DECLINED with measurement — worker frame-count threshold (2026-07-04)
+Proposal: spin up multiple reduction workers only when frames > N. MEASURED and DECLINED:
+integrator copies are LAZY (deepcopy itself 23 ms; the ~784 ms LUT builds run concurrently),
+so over-provisioning 4 workers on a 1-4-frame scan costs only ~0.05-0.15 s and a transient
+copy that frees at scan end. Crossover is ~6-8 frames and the system already lands on the
+right side of it for free. A threshold would add real complexity + a live-mode special case
+(unknown frame count) for ~100 ms on tiny scans. The ~1.1 s single-frame floor is the one-time
+LUT build - irreducible, worker-count-independent. Do not re-propose without new data.

@@ -1,0 +1,357 @@
+# Deep review — feature/remediation pre-release (2026-07-03)
+
+**Scope:** the full `main..feature/remediation` diff (77 commits @ `031c134c`, re-verified where
+noted at tip `59f9c6c0` after MEM-3 landed mid-review), reviewed by six parallel adversarial
+agents (headless core / memory+store / GUI display+liveness / run-path+wranglers /
+controls-panel-v2 / release-readiness+test-run) with top findings re-verified against source by
+the orchestrator. Convention severity: BLOCKER / SERIOUS / MINOR / NOTE.
+
+**Verdict: NOT tag-ready yet — but close.** The architecture work (H6/H8/H9/H22, headless
+contracts Stages 1–5, MEM-1/2) is demonstrably faithful and well-gated. What blocks the tag is a
+short list: two Append data-destruction paths, the auto-sidecar junk latch (worsened by the new
+`auto` default), one thread-race crash, a red test suite at tip, and the OV-6 cross-scan misgrid.
+Most fixes are small (several are one-liners). Ledger rows CF-1, CF-2, GI-1, PF-2, MS-1, MEM-1b,
+OV-6 should NOT be closed as-is.
+
+Cross-confirmation note: four findings were found independently by two agents each (GI mode-switch
+range re-key; pool-pause-outside-file_lock; MEM-2 publication-store wiring gap; sidecar junk
+latch) — treat those as high-confidence.
+
+---
+
+## BLOCKERS (fix before tag)
+
+### BL-1. Append truncates the whole existing file when the target's metadata read degrades
+`image_wrangler_thread.py:3215-3221`: Append does `scan.load_from_h5(replace=False, mode='r')`
+then `if len(scan.frames.index) == 0: scan.save_to_nexus(replace=True)`. `_load_from_nexus_v2`
+(`scan.py` ~792-802, ~994-999) swallows read failures (`logger.exception; return`) leaving the
+index empty — a transient read hiccup on a 651-frame file makes Append conclude "empty file" and
+atomically rewrite it as an empty skeleton. Silent destruction of all prior data in the flagship
+workflow. **Fix:** distinguish "load failed" from "genuinely frame-less" — probe
+`entry/integrated_1d` row count on disk before `save_to_nexus(replace=True)`; abort loudly on
+load failure. *(Verified by orchestrator.)*
+
+### BL-2. First flush of an Append run silently full-rewrites the file
+`qt_nexus_sink.py:316-337` (`_needs_atomic_first_batch_flush`): predicate is `not persisted`, but
+an Append-loaded scan has `frames.index` populated while `LiveFrameSeries._persisted` stays empty
+(lazy read marks persisted only on access). First flush takes `mode="w"`: stitched groups
+(finalize-only), nested multi-mode GI subgroups from prior runs, and any foreign groups are absent
+from the rewrite; the append-axis backstop is bypassed (tmp file is empty). **Fix:** tighten the
+predicate to "no integrated rows on disk", or `frames.mark_persisted(frames.index)` right after
+the Append load (which is truthful — those frames ARE on disk). *(Verified by orchestrator.)*
+
+### BL-3. MD-1 auto-sidecar discovery can latch a junk companion and poison scan_data — and `auto` is now the default
+`xrd_tools/io/metadata.py:269-294` (`_iter_auto_sidecar_candidates`), `:235-239`, `:320-327`
+(min-pairs=3 at `:17`). Candidates are ANY non-image `image.name.*`/`image.stem.*` file, tried in
+alphabetical order, accepted on ≥3 loose `key=value`/`key: value` pairs. A per-frame `.poni`
+(colon-separated — a real artifact of this project's own stitching workflow) sorts before `.txt`
+and WINS; `img.tif.log` beats `img.tif.txt`; pretty-printed JSON passes. The winning convention is
+cached per `(dir, image_suffix)` and applied to every frame → wrong motors/counters (incl. GI
+incidence) persisted into the `.nxs`. Commit `3e11ed82` makes `auto` the out-of-box default.
+**Fix:** extension allow-list for auto candidates (`txt`, `pdi`, `metadata`, `inf`); rank known
+metadata extensions first; harden plausibility (reject `�`/control chars); cap candidate file
+size; log which convention auto locked onto. Related SERIOUS: auto's `.txt` route is
+SSRL-format-only (generic `name=value` .txt yields `{}` → a worse candidate latches); explicit
+`metadata` format is gated by the auto min-pairs threshold (1–2-pair sidecars silently dropped
+with a misleading "unknown format" warning).
+
+### BL-4. `_BoundedFrameHandoff` eviction races the GUI pop → KeyError kills the run
+`wrangler_widget.py:56-63`: drop-oldest snapshots `list(self.keys())[:over]` then
+`super().__delitem__(stale)`. Writer thread inserts (`_publish_display`), GUI thread pops
+(`update_data` `pop(idx, None)`) — and eviction fires exactly when the GUI is ≥128 behind, i.e.
+when its queued pops target the same oldest keys. A pop between snapshot and delete raises
+KeyError out of `QtNexusSink.write()` → run recorded as failed. MEM-1a exists to make overload
+survivable; this converts it into a crash. **Fix (one line):** `super().pop(stale, None)`.
+*(Verified by orchestrator.)*
+
+### BL-5. Test suite red at tip (must be green at the tag SHA)
+- `test_filter_sites::test_eiger_master_queue_applies_filter_to_stem` fails deterministically:
+  `3e11ed82` added an `img_ext` early-return to `_eiger_refill_master_queue`
+  (`image_wrangler_thread.py:2700-2702`); the test's `SimpleNamespace` holder lacks `img_ext`.
+  Product path fine; add `img_ext="h5"` to the holder.
+- `test_live_refresh::test_streaming_dispatch_series_average_submits_one_mean_frame` is
+  RAM-dependent: binds the real `_heavy_staging_window` with no detector shape and asserts
+  `_max_heavy_items == 64`, but MEM-2's shape-unknown tier returns 16/32 below 32 GiB — fails on
+  16 GB CI runners. Pin `XDART_HEAVY_WINDOW=64` in the test.
+- Full state at tip `59f9c6c0`: core 1468 pass / 3 env-skips; xdart offscreen ~1552 pass / 2 fail
+  (above) / 6 skip; guards + purity green; one known exit-139 teardown flake. GI spine 71/71 at
+  tip (was 57/71 red at `031c134c`; MEM-3 `59f9c6c0` fixed it, matching its message).
+- Re-run the full gate at the frozen tag SHA — the tree moved twice during verification.
+
+### BL-6. OV-6 compatible cross-scan append plots traces at the WRONG x
+`display_publication.py:982-987` seeds `ref_x` from the current render (new scan's grid), never
+from `prior.x`; `xrd_tools/session/display_logic.py:633-636` appends against `history.x` (OLD
+scan's grid) and reinterps ONLY if sample-count differs. Two scans with same axis kind + npt but
+different `radial_range` (recalibration, edited range — the very cross-scan-comparison workflow
+OV-6 exists for) are "compatible" by the grid key (range deliberately excluded), so scan B's
+intensities render at scan A's x positions. Silent misgridded overlay; the legacy accumulator
+grid-merged via `np.union1d`. **Fix:** seed `ref_x = prior.x` when prior is compatible and unit
+unchanged, and/or in `accumulate_waterfall` reinterp when sizes match but
+`not np.allclose(x, base_x)`. Surfaces at Session-1 F7/F8. *(Verified by orchestrator.)*
+
+---
+
+## SERIOUS
+
+### Data correctness (written .nxs)
+- **S-1. Dropped-modes report wired dead (one-line fix).** `scan.py::_save_to_nexus` never
+  `return`s the `save_scan_to_nexus(...)` result; the sink does
+  `dropped = self._scan._save_to_nexus(mode=mode)` (`qt_nexus_sink.py:450`) → always `None` →
+  gate-dropped GI 2D modes are marked persisted → wrong `is_persisted`, evict-then-fail-hydrate
+  loops. The MEM-1b `mark_dropped` fix is dead code in production; tests pass via a monkeypatched
+  fake. **Fix:** propagate the return through `_save_to_nexus`/`save_to_nexus` + one
+  non-monkeypatched test. *(Verified by orchestrator.)*
+- **S-2. CF-1's headless blocker is wired dead; the modal's scoping leaves ungated Append paths.**
+  `static_scan_widget.py:2557` passes `processed_config=None`, so
+  `append_config_mismatch_check` never fires in production — only the Run-click modal enforces.
+  The `14efca96` scoping returns "ok" when the predicted target ≠ loaded file — which includes (a)
+  Append onto an existing-but-not-loaded `.nxs`, and (b) live runs where `img_file` is empty at
+  Run click. There the only guard is the writer backstop, which compares AXIS VALUES — a config
+  change producing an identical grid appends silently mixed data. **Fix:** thread-side check in
+  `initialize_scan`'s Append branch comparing the target file's stored reduction-config signature
+  vs run args (fail-loud); populate `processed_config` from the loaded scan.
+- **S-3. CF-1 signature omits value-affecting, grid-preserving params:** mask file, PONI /
+  calibration, `chi_offset`, polarization, monitor normalization, error model, manual GI `th_val`
+  (`readiness.py:40-63`). Changing any passes both the modal and the axis backstop → mixed
+  provenance rows under a `/entry/reduction` that claims the first run's config. Extend the
+  signature (mask path+mtime, poni signature, chi_offset, polarization, monitor, th_val) or ADR +
+  MIGRATION-disclose the acceptance.
+- **S-4. GI-1 "auto ≡ explicit −180..180" fails in STANDARD mode through the real GUI pipeline
+  because of `chi_offset` (default 90°).** Auto injects (−180,180) in pyFAI's raw χ frame
+  (`integrate/single.py:154-158`) but GUI-explicit ranges are shifted by −chi_offset first
+  (`readiness.py:1154-1156`); the written 1D χ axis is 90° out of frame with the 2D cake χ (the 2D
+  branch re-adds the offset, the 1D branch never does). GI mode unaffected — which is why the live
+  χGI repro passed. The new byte-equality tests call the integrate functions directly and miss it.
+- **S-5. GI mode-switch range re-key does NOT exist** (two agents independently; the
+  commit/ledger description doesn't match code). `q_oop`/`exit_angle`/`chi_gi` share the
+  `azimuth_range` key in different units; a frozen/hydrated explicit range survives
+  `_controls_v2_axis_to_native` (`static_scan_widget.py:1376-1400`, only `gi_mode_1d` changes) →
+  next run silently clips χGI to a ~4° wedge and WRITES it. **Fix:** clear (or re-freeze) the
+  output-axis range keys on `gi_mode_*`/unit change.
+- **S-6. Two divergent monitor-norm "canonicals" post-Stage-5.** The reduction spine's
+  `_normalization_for` (`reduction/core.py:2837-2883`; exact/upper/lower lookup, accepts negative)
+  vs the new `core.metadata.resolve_monitor_norm` (case-insensitive scan, rejects ≤0) now used by
+  the GUI mirror — mixed-case keys → spine writes UN-normalized data while the file's `map_norm`
+  claims normalization. **Fix:** make `_normalization_for` delegate lookup/guard to the canonical
+  resolver.
+- **S-7. Stage-4 "byte-identical shim" is false:** every GUI-written file gains
+  `/entry/reduction/config/gi` (fixture re-pin admits it: the only content change in
+  `v2_record_signature_pre6a.json` is that dataset); the parity test uses a `.gi`-less
+  SimpleNamespace so it can't notice. Reload stays compatible. **Fix:** gi-bearing parity fixture +
+  MIGRATION disclosure (or gate off the GUI path).
+- **S-8. PF-2: lexicographic `>= first_img` filter drops series members**
+  (`image_wrangler_thread.py:3075-3076`): `'-' < '_'` so mixed dash/underscore series (which the
+  new `[_-]` parser deliberately unifies) silently exclude members; unpadded series (`frame_2` vs
+  `frame_10`) drop numerically-later frames. Dropped files never reach discovery, so the new
+  warning can't fire. **Fix:** filter by parsed `(scan_name, index)`. Companion: the
+  zero-processed warning early-returns on `discovered <= 0` (`:991-994`) — the original PF-2
+  symptom shape still ends with only "Total Files Processed: 0"; warn with directory/pattern/ext.
+- **S-9. Live whole-scan Overall Sum/Average silently omits the writer's unflushed tail.**
+  `scan_aggregate.py` reads disk ⊕ `_unflushed_tail(scan)` — but the scan passed is the GUI-side
+  `LiveScan` whose staging is never populated during live; the tail is always empty → up to
+  cap−margin newest frames missing from the rendered aggregate during a run (self-heals at flush).
+  The exact "silent subset" P1 class H8 set out to kill; the module docstring's invariant is false
+  for the object passed. **Fix:** fetch the tail from the wrangler thread's scan, fold in the
+  resident publication tail, or annotate the trace as partial during runs.
+- **S-10. Live Overall+Average triggers continuous full-stack HDF5 re-reads under the shared
+  `file_lock`** (generation signature bumps per drain tick → cache invalidated ~5/s; each
+  aggregation holds `file_lock` for the whole chunked read; the writer's flush blocks behind it →
+  backpressure → handoff drops). **Fix:** recompute at flush boundaries only during
+  `_processing_active` (disk only changes at flush), and/or chunk the lock hold.
+
+### MEM-2 wiring
+- **S-11. The frame-precise heavy window is never applied to the GUI `PublicationStore`** (built
+  once at app start with the coarse RAM-tier default; the code comment claiming it "reads
+  `self._heavy_window`" is false), and **the cached `_heavy_window` is never invalidated on
+  detector switch** (`image_wrangler_thread.py:2301-2310`: compute with Pilatus → window 64; switch
+  to Eiger-16M same session → 64 × ~144 MB ≈ 9 GB on a 16 GB box — the exact OOM MEM-2 prevents).
+  All four wiring tests pin `XDART_HEAVY_WINDOW`, forcing the caps equal by construction. **Fix:**
+  key the cache by detector shape; resize the publication store at `_get_streaming_session` time;
+  one test asserting the real topology without the env override. Note: MEM-3 (`59f9c6c0`) landed
+  after review start — re-check whether it addresses any of this before fixing.
+
+### Locking / lifetime (GUI)
+- **S-12. Five writer sites pause the H5 pool BEFORE taking `file_lock`,** violating the
+  documented H30 invariant (`image_wrangler_thread.py:2021-2023`): `scan_threads.py:442/456/513/559`
+  (reintegrate-shadow writers) + `nexus_wrangler_thread.py:409` (Stop tail flush). `pause()` closes
+  handles unconditionally → can close a handle under a mid-read load worker → silently lost/partial
+  loads (RN-1's failure family). Two agents independently. **Fix:** swap the nesting (file_lock
+  outer) or reuse `_h5pool_bracket` under the lock at all five sites.
+- **S-13. Close-during-run qFatal, two paths:** (a) `_teardown_load_worker` timeout branch
+  (`h5viewer.py:2894-2906`) returns without `setParent(None)`/retain — likely during live close
+  (final flush holds `file_lock` seconds; worker blocks; `wait(2000)` times out; parented running
+  QThread destroyed → process abort). Mirror the retire path (3 lines). (b) `stitch_thread` never
+  stopped/waited in `staticWidget.close()` (created `:565`, started `:5409`; close waits for
+  everything else). Same class.
+- **S-14. Same-name re-run: overlay permanently shows the PREVIOUS run's curves.** Row identity is
+  `(scan.name, frame_idx)`; compatible-grid rescope keeps history; first-occurrence dedupe drops
+  every new frame → stale intensities under live labels for the whole run. **Fix:** per-rescope
+  nonce in `current_scan_key` or clear on same-name re-run.
+- **S-15. H12 level-reuse cache never invalidated** (`image_widget.py:253-271`): key omits scan
+  identity; `_clear_image_widget` leaves it → scan A's contrast applied to scan B within the TTL,
+  and a cache-hit as last render leaves wrong levels indefinitely. **Fix:** null in
+  `_clear_image_widget` + scan token in key.
+- **S-16. Norm-channel wipe detection desyncs from application** (`display_frame_widget.py:3698`
+  keys on `_last_applied_norm_channel`; per-row normalization reads the live combo;
+  `refresh_norm_channels` can silently reset the combo cross-scan) → permanently mixed
+  normalized/unnormalized accumulator with no reset. Record the channel actually applied on the
+  history; any difference ⇒ reset.
+- **S-17. One empty-grid publication wipes the accumulator (first row) or raises uncaught
+  `np.interp` ValueError (later row)** (`display_publication.py:964-967`,
+  `display_logic.py:604-615`). Skip `x.size == 0` rows.
+- **S-18. Pinned slice-cut recipes are scan-unqualified at rematerialization** — pins survive
+  boundaries/norm resets; recipe stores a bare frame int → rebuilt from the CURRENT scan's frame N
+  under the old legend. Stamp `current_scan_key` into the recipe at pin time; prune on mismatch.
+
+### Perf (headless, silent O(N)/O(N²))
+- **S-19. `provenance_config._inputs_from_scan` frame-walk hydrates every evicted frame from HDF5
+  for a guaranteed-empty result** (xdart `LiveFrame` has no `source_path`) — on every replace-mode
+  save and reintegrate swap: O(N) full-frame reads per batch, against MEM-1/2's goals. Gate the
+  walk to spine `Scan` objects or read `source_file` without hydration.
+- **S-20. Per-frame O(directory) sidecar lookups** (`metadata.py:179-196` case-insensitive probe
+  does up to two full `iterdir()` sweeps per frame; auto negatives never cached; GUI seed probe
+  makes O(N²·logN) per parameter edit). Beamline-NFS-hostile. Stat-first + per-dir listing cache +
+  negative-cache TTL.
+
+### Release packaging/docs
+- **S-21. MIGRATION.md gaps:** missing CF-1/CF-2 (Append now blocked with modal — was silent
+  no-op), MEM-1c (series-average Append refusal — data-loss-class fix), PF-2 dash-index convention
+  (also changes scan grouping: `LaB6-1..60.tif` = 60 scans before, ONE scan now), the
+  `/entry/reduction/config/gi` dataset (S-7), explicit out-of-domain χ range clamping. And the
+  "Post-v1.0 — Plan B item 3" header is false — those notes ship IN 1.0.0; reword before tag.
+
+---
+
+## MINOR (fix opportunistically; none tag-blocking alone)
+
+Core/metadata: `read_image_metadata(meta_format=None)` now means auto-discover, not off (public
+API trap — keep `None` → `{}`); string metadata values crash the series-average worker
+(`image_wrangler_thread.py:3113-3117` catches only TypeError — add ValueError/KeyError, average
+numerics only); BOM/UTF-16 sidecars (`utf-8-sig`); auto-vs-explicit sidecar precedence inverted;
+stale `== "None"` vs lowercase `'none'` at `static_scan_widget.py:3018` (probe-only); SPEC reader
+clamps out-of-range frame numbers to last scan point silently.
+
+Writer/store: H6 stale extra-mode subgroups survive a mode-set-changing reintegrate and stay
+listed in `multi_result_modes`; `mark_dropped` frames permanently exempt from the `max_items`
+bound (thin-record growth on long GI scans); `get_or_hydrate` persisted-set TOCTOU (stale
+`prev_persisted` re-applied after a concurrent flush); cross-scan publication ghost re-stamped to
+current generation; H3 plateau gate runs `record_store_persisted_on_write=True` while production
+wires False (flush-marked path outside the gate); `catch_h5py_file` erases errno/exception
+subclass (public API); `setBkg` guards 2D/raw with `require_all` but not `bkg_1d`.
+
+GUI: stale `_browser_scan_reset_pending` fires deferred reset mid-reintegrate (clear in
+`_enter_run_state`); `open_folder` misses the LD-1 `cancel_pending_loads`; planned-npt drift wipes
+pins on a `numpoints` edit; overlay seed double-subtracts background at Overlay entry with Set-Bkg
+active; all-NaN image → NaN autoLevels + stale colorbar (`update_wf_pmesh` misses all H12 guards);
+Pin button enabled-but-inert outside Overlay/Waterfall; CF-2 modal's "re-integrate all N frames"
+overstates (Replace uses the `>= first_img` filter); duplicate tracebacks for one writer failure
++ short-run abort never prints the preservation line; `x_0001.tif` vs `x-0001.tif` collide on one
+label (silent last-wins); `.nxs` directory sweep can ingest xdart's own processed outputs as raw
+with Include-Subdir (skip files carrying `entry/reduction`); streaming `replace` never passes
+`replace_frame_indices` to a flush (unreachable today; landmine); bulk 1D hydration: one missing
+label poisons its ≤256-frame chunk; skipped single-image emits phantom `sigUpdate`.
+
+Release: stale `build/` dir in worktree (add `rm -rf build/` to RC-8); README license line says
+MIT only (metadata is `MIT AND BSD-3-Clause`); dangling `release_final_verification.md` citation;
+`_gui_main.run()` discards `app.exec()` return (always exit 0); `test_image_widget.py` is a
+manual script with a `test_` name; env knobs undocumented outside design docs; a few ledger rows
+say "DONE this commit" without SHA.
+
+GI residuals: fully out-of-domain explicit range clamps to an inverted pair (validate lo<hi,
+raise); `integrate_radial` doesn't clamp explicit ranges (inconsistent with `gid.py`); no test
+pins that the default radial grid spans ±180.
+
+---
+
+## Controls-panel-v2 — small pre-tag robustness wins (ranked, ≈1 day total)
+
+1. **Run-lock hole (S, ~1-2h):** V2 `ActionButton`s + GI `…` popup + Source-energy `…` stay LIVE
+   during a run — `CHOOSE_SOURCE/CHOOSE_PROJECT/CHOOSE_OUTPUT` call wrangler browse methods
+   directly with no run guards; GI popup rows are built from pre-run snapshots with
+   `enabled=True` and write `scan.gi_config` mid-run. Extend
+   `_set_controls_v2_current_fields_enabled` to ActionButtons + More-buttons; early-return in
+   `_on_controls_v2_action`/`_on_controls_v2_field_changed` when run-active. (Calibrate/Make
+   Mask/Reintegrate are accidentally safe — they delegate to disabled legacy buttons.)
+2. **Advanced dialog escapes the run lock via reparenting (S, ~30min):** the combined dialog
+   reparents `advancedWidget1D/2D.tree` into itself, so disabling the advancedWidgets no longer
+   reaches the trees; edits mid-run silently stick for the next run. Disable
+   `_integ_adv_combined_dlg` in `_enter_run_state` (4 lines).
+3. **Stale frame-count cache can hold Run disabled forever (S, ~1h):**
+   `_v2_frame_count_cache` never invalidates on filesystem change — an initially-empty directory
+   stays "Choose a frame source" as frames arrive. Fold `st_mtime_ns` into the cache key (same
+   for the metadata probe cache).
+4. **H5 parity test (S/M, test-only):** inline GUI `SourceCaps`
+   (`static_scan_widget.py:2466-2475`, collapses `has_frames=has_raw=raw_reachable=source_ready`)
+   vs headless `describe_source_readiness` — zero tests compare them today. Fixture-matrix
+   equality test with the two deliberate divergences documented. The pre-tag substitute for H18.
+5. **Append-mismatch readiness note (S, optional):** readiness bar says "Ready" until the CF-2
+   modal. Add a non-blocking "Append target config differs — Run will prompt" tooltip using the
+   already-written-but-DEAD `_controls_v2_append_target_matches_displayed_scan()` (`:2681` — wired
+   to nobody; if not wiring it, delete it). Keep Run clickable — the pinned CF-2 tests require it.
+6. **Hygiene (S each):** browse-cancel clobbers `img_dir`/`mask_file` outside the `if path != ''`
+   guard (`image_wrangler.py:1836-1838, 2074-2076`); duplicate `_controls_v2_positive_float`
+   definition (`static_scan_widget.py:2866` and `:2945` — second silently overrides);
+   refresh-failure `except Exception: logger.debug` → warn-once (a persistent failure freezes the
+   readiness row at its last value, possibly "Ready"); clamp npt ≥1 at the four leaves.
+
+Already solid (verified): signal-loop guards throughout; session-blob restore fully defensive;
+run-gating single-sourced from field statuses; StaticControls run bar hard-locks; PONI gating;
+live-source escape hatch both sides; refresh perf discipline.
+
+---
+
+## Explicitly verified CLEAN (high-value assurances)
+
+- **Move fidelity:** Stage 1 `controls_logic` → `session/readiness.py` = exactly one changed line;
+  H22 `display_logic` move byte-identical (1963 lines); masks byte-identical; shims cover every
+  name imported anywhere in xdart/tests; zero Qt/xdart imports in `xrd_tools`; purity guards real.
+- **H6 writer:** non-GI single-mode path structurally unchanged; fixture re-pin adds only the
+  storage-metadata fields + the S-7 `gi` dataset (no numeric drift); compat gate drives the real
+  GUI writer end-to-end.
+- **H9 deletion complete:** only 3 explanatory comments reference data_1d/data_2d/hydrated_raw;
+  Role-B `_ViewerRows` survives as designed; no dead imports.
+- **H8 aggregation guards:** explicit Sum/Average subsets hydrate-or-refuse (never silent
+  resident-subset averages); disk⊕tail dedup by label prevents double-count — the P1 truncation
+  class is closed except S-9's live-tail gap.
+- **Lock graph:** no deadlock cycle found; `file_lock → pool/scan_lock` hierarchy holds at all
+  wrangler write sites; stores release locks across hydrator I/O; persist-before-evict invariant
+  holds under any MEM-2 window; RN-2 chunking correct and worker-thread-only.
+- **No cross-thread QTimer starts** (the 0.37.1 class); generation scheduler drops no frames at
+  run end; LD-1 covers all real file-swap paths except `open_folder`.
+- **CF-1 core compare** robust to float roundtrip/aliases/ordering; Replace truly
+  truncates-then-reintegrates (no mixing); modal Cancel doesn't run; provenance written after
+  validation.
+- **PF-1:** snapshot mode='r' primed once; per-frame checks in-memory; MEM-1c blocker scoped
+  correctly (no false blocking of legit partial appends); all-skipped reload works.
+- **GI-1 core:** auto injection only when range is None (explicit q/2θ data unchanged); freeze
+  clamp makes scout==per-frame==explicit in GI; MIGRATION discloses the auto change.
+- **UX-1 shortcuts** gate on `isEnabled()` and route through `button.click()`.
+- **Packaging:** version 1.0.0; PEP-639 `MIT AND BSD-3-Clause` + license-files in wheel METADATA;
+  wheel+sdist build, twine check PASSED; base `import xrd_tools` pulls zero Qt AND zero heavy
+  modules; `ssrl_xrd_tools` shim one DeprecationWarning, true module identity; all versions
+  dynamic from dist metadata; `.ui` files packaged.
+- **Refuted findings honored** (per-run wrangler-thread leak, set_wrangler accumulation, GI-2D
+  freeze hole — not re-raised).
+
+---
+
+## Suggested sequencing
+
+1. **One-liners first:** BL-4 (`pop(stale, None)`), S-1 (return the drop report), BL-5 test fixes.
+2. **Append integrity commit:** BL-1 + BL-2 (+ mark_persisted-after-load), M-item duplicate
+   tracebacks if convenient. These are the tag-gating data-destruction paths.
+3. **Sidecar hardening commit:** BL-3 + the `.txt` route + explicit-format threshold (S-5-adjacent)
+   + perf S-20 stat-first.
+4. **Overlay/x-grid commit:** BL-6 + S-14 (+ S-17 empty-row skip) — same code region.
+5. **CF/GI truth commit:** S-2 (thread-side Append signature check), S-3 (extend signature or
+   ADR+disclose), S-4/S-5 (chi_offset 1D consistency + range re-key on mode switch).
+6. **Lock/lifetime commit:** S-12 (five pause sites), S-13 (two teardown paths).
+7. **MEM-2 follow-up:** S-11 (check MEM-3 first), S-9/S-10 (live aggregate tail + throttle).
+8. **MIGRATION pass:** S-21 + README license + "Post-v1.0" header.
+9. **CP-v2 batch:** wins 1+2 (run-lock story), 3, 6 (hygiene), 4 (test-only), 5 optional.
+10. Re-run the full gate at the frozen tag SHA; then RC-7s Session-1 (add BL-6/S-14 overlay
+    scenarios and an Append-degraded-load drill to the checklist), then RC-8.
+
+Ledger rows to reopen/annotate: CF-1, CF-2 (S-2/S-3), GI-1 (S-4/S-5), PF-2 (S-8), MS-1
+(reconciliation is log-only; batch runs get no indexed-vs-processed check), MEM-1b (S-1), MEM-2
+(S-11), OV-6 (BL-6), OV-7 (S-18).
