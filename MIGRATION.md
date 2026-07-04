@@ -81,7 +81,17 @@ pre-migration reference signature.  Two additive notes:
   default (`complete_record=True`): per-frame raw-source pointers (relative
   to `@source_base` when `source_base=` is given — N1-portable), thumbnails,
   and finish-time per-frame geometry.  Pass `complete_record=False` for the
-  minimal pre-1.0 output.
+  minimal pre-1.0 output;
+* **(S-7 disclosure)** newly written records carry the reduction PROVENANCE
+  under `/entry/reduction/config` — including a `gi` flag (and, for grazing-
+  incidence scans, a `gi_config` group with the mode + frozen-range diagnostic).
+  This block is **additive** and did not exist in the earliest pre-6a writer, so
+  a strict byte-for-byte diff against a pre-6a capture would show it; the
+  committed `v2_record_signature_pre6a.json` fixture was re-pinned to include it.
+  Reload is unaffected (readers that don't know the block ignore it), and CF-3's
+  target-config read + the data-derived units depend on it — so it is disclosed,
+  not removed.  `test_v2_record_gi_scan_writes_gi_provenance` exercises the GI
+  branch the non-GI parity fixture cannot.
 
 ## Behavior changes to know about
 

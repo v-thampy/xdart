@@ -101,3 +101,38 @@ def test_v2_record_integrated_stacks_compress(tmp_path, monkeypatch):
     with h5py.File(out, "r") as f:
         for p in stacks:
             assert f[p].compression not in (None, "lzf"), f"{p}: lost default compression"
+
+
+def test_v2_record_gi_scan_writes_gi_provenance(tmp_path):
+    """S-7: a GI scan's written .nxs carries the data-derived GI provenance under
+    /entry/reduction/config (gi=True, + gi_config for the freeze/mode).  The
+    pre-6a parity fixture uses a NON-GI reference scan (gi=False), so it never
+    exercised this branch and its "byte-identical to pre-6a" claim silently
+    ignored the added block -- this asserts the gi-bearing write explicitly (the
+    block is ADDITIVE provenance; reload stays compatible; MIGRATION discloses it).
+    """
+    import h5py
+    from tests.core._v2_record_fixture import write_reference_scan
+    from tests.xdart.test_nexus_writer_roundtrip import _DuckArch, _DuckSphere
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+
+    def _gi_flag(f):
+        # the flag is persisted as a string ("true"/"false"), not an h5 bool
+        v = f["entry/reduction/config/gi"][()]
+        if isinstance(v, bytes):
+            v = v.decode()
+        return str(v).strip().lower() in ("true", "1")
+
+    frames = [_DuckArch(idx=i, seed=7) for i in range(2)]
+    out = str(tmp_path / "gi.nxs")
+    save_scan_to_nexus(_DuckSphere(frames, gi=True), out, mode="w", finalize=True)
+    with h5py.File(out, "r") as f:
+        assert "entry/reduction/config/gi" in f, "GI scan lost /reduction/config/gi"
+        assert _gi_flag(f) is True
+
+    # the non-GI reference records gi=False (present, not absent) -> a reader can
+    # always tell GI from standard.
+    ref = write_reference_scan(str(tmp_path / "std.nxs"), str(tmp_path / "sp"))
+    with h5py.File(ref, "r") as f:
+        assert "entry/reduction/config/gi" in f
+        assert _gi_flag(f) is False
