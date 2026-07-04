@@ -33,7 +33,7 @@ from xrd_tools.core.containers import (
     PONI,
 )
 from xrd_tools.core.frame_view import DEFAULT_MODE_KEY
-from xrd_tools.core.metadata import ScanMetadata
+from xrd_tools.core.metadata import ScanMetadata, resolve_monitor_norm
 from xrd_tools.core.scan import (
     FrameSource as CoreFrameSource,
     ImageLoader,
@@ -2852,17 +2852,16 @@ def _normalization_for(
         return float(frame.normalization_factor)
     if plan.monitor_key is not None:
         key = plan.monitor_key
-        value = frame.metadata.get(key)
-        if value is None:
-            value = frame.metadata.get(key.upper())
-        if value is None:
-            value = frame.metadata.get(key.lower())
-        try:
-            norm = float(value)
-        except (TypeError, ValueError):
-            norm = None
-        if norm is not None and np.isfinite(norm) and norm != 0:
+        # S-6: delegate lookup + guard to the ONE canonical resolver
+        # (case-insensitive; rejects missing/zero/negative/non-finite) so the
+        # reduction spine and the GUI mirror never disagree about whether a frame
+        # is normalized.  The exact/upper/lower lookup here missed MIXED-case
+        # monitor keys -> the spine wrote UN-normalized data while ``map_norm``
+        # claimed normalization (and it accepted negatives the resolver rejects).
+        norm = resolve_monitor_norm(frame.metadata, key)
+        if norm is not None:
             return norm
+        value = _metadata_get_case_insensitive(frame.metadata, key)
         # S8: the monitor was configured but unusable — the frame is about to
         # be written UN-normalized.  D7 loud: RAISE so a scripted/batch run
         # fails instead of silently persisting un-normalized data; graceful
