@@ -7,7 +7,7 @@ gates scattered across panel-v2 §14, steps7_8 A-Step-C, the fix handoffs, roadm
 the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 800+-frame scan.
 
 ## A. Freeze/display fixes (this week's commits: 084f3410, efa0b396, 8d35a37c, 03492440, 4d2f3957)
-- [ ] A1 Shift+arrow sweep, Single AND Overlay, ~800-frame scan, IDLE: no beachball, no floating
+- [c] A1 Shift+arrow sweep, Single AND Overlay, ~800-frame scan, IDLE: no beachball, no floating
       plot window, final selection fully rendered.
 - [ ] A2 Same sweep DURING a live run: no beachball, no run abort (hydration↔writer lock), live
       display keeps updating.

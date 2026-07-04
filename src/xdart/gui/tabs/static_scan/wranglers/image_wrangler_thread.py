@@ -132,7 +132,10 @@ if _LIVE_EXECUTION not in ("serial", "streaming"):
                    "using 'streaming'.", _LIVE_EXECUTION)
     _LIVE_EXECUTION = "streaming"
 
-_LIVE_RECORD_STORE_MAX_ITEMS = 512
+# 1D records are ~16-64 KB each: 4096 is <=256 MB and makes whole multi-thousand-frame
+# scans resident post-run (gap-free overlay browsing); the heavy 2D/raw window stays
+# separately RAM-aware (16-64).
+_LIVE_RECORD_STORE_MAX_ITEMS = 4096
 
 
 # ---------------------------------------------------------------------------
