@@ -533,3 +533,125 @@ Commits verified: `6f0b726f` (BW-A4 bundle: S-9/S-10/S-12 + unbilled S-8/S-11), 
    row; nexusThread S-11 resize check; delete `_native_offset_range`; Addendum-1 minors
    (BW-A2 blind spot, run()-catch, S-16 residuals); CP-v2 small-win batch.
 8. Full gate on the Mac at the frozen SHA → Session-1 (G1–G18, G18 amended) → tag.
+
+---
+
+# ADDENDUM 3 — Round-4 verification at the frozen RC (2026-07-04, `2bf996ea`)
+
+Scope: the 13 commits `a1cc7b4a..2bf996ea` (Lane-B completion wave + BW-A5 + modal unify + docs
+sync), three agents (core data-correctness / GUI lane / release-docs-publish), top findings
+re-verified by the orchestrator.
+
+## Headline: one NEW blocker, one thrice-flagged one-liner still missing
+
+- **[BLOCKER] q/2θ-axis 1D explicit azimuth wedge lost its input shift — silent wrong-wedge
+  regression introduced by the S-4 pair.** The pre-wave builders shifted `azimuth_range_1d` by
+  −chi_offset UNCONDITIONALLY on unit (`if chi_offset_1d and not gi_enabled`, removed in
+  `c79a7434`); the reinstated input shift covers only the `chi_deg` Mode-A branch
+  (core.py:2396-2398), while the q/2θ branch passes `azimuth_range=p1.azimuth_range` RAW
+  (core.py:2423) and never reads `azimuth_offset`. With default chi_offset=90, a q-axis 1D
+  restricted to panel χ (0,90) — read off the offset-labeled cake — now integrates raw (0,90) =
+  panel (90,180): 90° off the 2D, off the 1D-χ path, and off ALL pre-wave releases. Auto wedges
+  mask it; no committed test catches it. *(Orchestrator-verified: old readiness hunk + current
+  else-branch.)* **Fix (1 line + test):** `azimuth_range=_integration_azimuth_range(p1)` in the
+  q-branch — no output relabel needed (output axis is q/2θ) — + a q-wedge explicit-range case in
+  the G18 harness. Restores pre-wave bytes for that config.
+- **[SERIOUS] nexusThread `_active_scan = scan` STILL not landed** (third flag; two agents
+  independently confirmed zero references in nexus_wrangler_thread.py at `2bf996ea`). Live NeXus
+  Overall aggregate computes once and never refreshes for the whole run (worse than pre-wave).
+  BW-A4's ledger row overclaims S-9; no G-item exercises live NeXus Overall. Land the 1-liner or
+  waive explicitly and fix the row.
+
+## Verdicts (wave commits)
+
+- **S-20 + .pdi — CLOSES** (`8cc38072` + `f7af7c12`): exact-case `is_file()` fast path; per-dir
+  listing cache keyed `(dir, mtime)`; ≤1 iterdir per (dir,mtime) TEST-PINNED; late-sidecar pickup
+  preserved via the fresh stat; fabricated pdi default gone; epoch-only latch closed; 1 MiB cap
+  now ahead of dispatch on all four auto routes. NOTEs: coarse-mtime case-mismatch race;
+  unbounded module cache.
+- **S-4 completion — chi path CORRECT, no double-shift** (`f52de457`): shared
+  `_integration_azimuth_range` at Mode-A input + output relabel; readiness shift deleted;
+  `plan_from_live_scan` ported (no pre-shift, offset carried, GI zero); stale adapter pin
+  updated; explicit-partial pin test mirrors the 2D's; MIGRATION §S-4 discloses axis change +
+  append bounce; dead helpers deleted. BUT see the q-branch BLOCKER above, and:
+  **[SERIOUS-disclosure] MIGRATION item 18's "clamped" is implemented NOWHERE** —
+  `_integration_azimuth_range` just subtracts; pyFAI's out-of-domain behavior for standard
+  integrate1d/2d/radial is unpinned (the repo's own gid.py:476-478 says pyFAI WRAPS and clamps
+  manually). Implement the clamp (mirror gid.py:477) or pin actual behavior at G18 and reword.
+- **S-3 GI-inert chi_offset — CLOSES** (`ca43b543`): single constructor → both sides agree by
+  construction; mixed standard↔GI still bounces on `mode`; only chi_offset, only under gi.
+  MINOR: MIGRATION item 17 wording now over-broad (says chi_offset trips unconditionally).
+- **S-14 A→B→A — CLOSES** (`ae939fd1`): accumulator-derived seen-set (better than the proposed
+  nonce — self-clearing on any reset); browsing/pause/reintegrate false-positive audit clean;
+  run-1 pins clear too. MINORs: ledger acceptance-contract text STILL not updated (2nd request);
+  pin-survival hole via the two history-only wipes (norm-change + method-switch null history but
+  keep pins → re-run pins rematerialize from run-2 data under run-1 legend) — route both through
+  `_clear_pinned_slice_cuts(clear_history=True)`.
+- **BL-6 regression story — final state CORRECT** (`8cc38072..5a12f096`): the team's own
+  full-suite runner caught the append-instead-of-reset regression; final gating
+  (`use_prior_seed` requires grid-key match on the row's real npt) subsumes the shape guard;
+  `5a12f096` is docs-only OBE record; the red test lives (aggregation_wiring p6 reset pin).
+- **MODAL UNIFY — CLOSES** (`c048527d`): v2 hard-block reverted; one keep-clickable modal flow
+  through the wrangler start(); non-blocking `append_confirm_reason` in the readiness bar;
+  Cancel doesn't run, Yes flips to Overwrite and runs; tests re-pinned coherently; BW-A3 worker
+  guard remains the backstop. Resolves the Addendum-1 divergence note the right way.
+- **OV-7c — SANE** (`0bc21183`): live sentinel ids disjoint from pin ids; slot preview correct.
+  MINOR: stale "· current" sentinel can linger when its frame leaves the selection (pre-existing
+  OV-7b class).
+- **UI-5 — styling-only, verified** (`93997bea`).
+- **BW-A5 — MOSTLY CLOSES** (`17932582`): S-13 both named paths detach+retain (tests);
+  S-15 levels cache scan/generation-scoped, TTL immortality fixed; CP-v2 run-lock (buttons,
+  popups, Advanced reparent escape), mtime cache keys, npt clamps, warn-once — all with tests.
+  **[SERIOUS] browse-cancel fix incomplete: `set_bg_file`/`set_bg_dir`
+  (image_wrangler.py:2137-2151) still wipe on cancel** → silent loss of background subtraction;
+  same one-line fix + test as the siblings. **[SERIOUS] close() still destroys two running
+  threads on wait-timeout: wrangler (static_scan_widget.py:4870-4873) and integrator
+  (:4885-4887)** — same qFatal class S-13 fixed; apply the detach+retain 3-liner to both.
+  MINORs: waterfall + raw-preview popup render without the levels token (≤1s cross-scan reuse);
+  include_subdir mtime blind spot.
+
+## Release/docs/publish (at `2bf996ea`)
+
+- **MIGRATION: functionally complete** — all required disclosures present; item 18 accuracy gap
+  (above), item 17 over-broad, item 19 missing the "no-config appends pass the worker guard
+  silently" sentence.
+- **Docs sync truthful** (counts match the gate table; MEM-3/H14 rows real; README modal wording
+  matches code; zero docs/design README links; faulthandler convention documented with the real
+  rationale). **[MINOR] `.github/workflows/pr.yml:45` runs tests/xdart WITHOUT
+  `-p no:faulthandler`** — if the cp2 segfault is deterministic with the plugin, PR CI is
+  predictably red post-publish.
+- **Ledger truth gaps:** MS-1 reopen annotation silently dropped (review line 355); three
+  reopened rows cite wrong lane SHAs (GI-1→`9be5f148`, OV-6→`63a248d9`, OV-7→`74818d9b` — all
+  off-by-one down the lane); BW-A4 overclaims S-9; duplicate G11 numbering; mask/PONI follow-up
+  row still absent. **G18 amendment PRESENT** (explicit-partial χ mandatory) but the harness
+  script it references does not exist yet — write it before Session-1 (and add the q-wedge case).
+- **Snapshot-publish plan:** preserves README/MIGRATION/licenses, strips docs/design (this review
+  doc included) ✓, `rm -rf build/` ✓, sdist empirically leak-free (no docs/tests; note
+  MIGRATION.md is not in the sdist — consider adding). **[SERIOUS] `docs/history/` (14 internal
+  review/planning docs) is NOT in the strip** — add it (decide deliberately on docs/decisions
+  ADRs). **[SERIOUS] the TRACKED RC-8 recipe (handoff_chunks ~line 330) still says plain
+  merge+push with full history** — anyone executing it leaks everything; mark SUPERSEDED and
+  bring the snapshot rule into the tracked tree. **[NOTE] force-push does not purge old objects
+  on GitHub** — `a2211ef4`'s June docs remain SHA-addressable (and are already public); if that
+  matters, delete-and-recreate the repo, else accept explicitly.
+- Packaging re-verified green (1.0.0, build+twine PASSED, import purity, entry point); repo
+  hygiene clean; gate-table counts statically plausible across all 15 suites (no gross
+  mismatches).
+
+## MUST before tag (round-4)
+
+1. q/2θ 1D wedge input shift (BLOCKER) + test + G18 q-wedge case → re-freeze + re-run battery.
+2. nexusThread `_active_scan` one-liner (or explicit waiver + honest ledger row).
+3. `set_bg_file`/`set_bg_dir` cancel-wipe + tests.
+4. wrangler/integrator close-timeout detach+retain.
+5. MIGRATION item 18: implement the clamp or pin+reword.
+6. Publish safety: docs/history into the strip; supersede the tracked merge+push recipe; decide
+   the old-objects question.
+7. Ledger truth pass (MS-1, three SHAs, BW-A4/S-9, G11 dup) + write the G18 harness script.
+
+Nice-to-have: the MINORs above + the carried Addendum-1/2 minors (S-16 residuals, BW-A2 blind
+spot, run()-catch, M1/M2/M5/M6/M7, plan-emitter chi_offset, aggregate lock chunking,
+`_cache_lock` signature read, pr.yml faulthandler, MIGRATION into sdist).
+
+Everything else in the wave is verified genuine: S-20/.pdi, S-4-χ, S-3, S-14, BL-6-final,
+MODAL-UNIFY, OV-7c, UI-5, S-13/S-15, the CP-v2 batch, MIGRATION sweep, docs sync, packaging.
