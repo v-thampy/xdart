@@ -1190,15 +1190,6 @@ def _native_strip_nonstandard_args(args: dict[str, Any]) -> None:
         args.pop(key, None)
 
 
-def _native_offset_range(
-    value: tuple[float, float] | list[float] | None,
-    offset: float,
-) -> tuple[float, float] | None:
-    if value is None:
-        return None
-    return float(value[0]) - offset, float(value[1]) - offset
-
-
 def _native_gi_1d_unit_default(unit: Any, mode: str, *, is_gi: bool) -> str:
     if not is_gi:
         return str(unit or "q_A^-1")

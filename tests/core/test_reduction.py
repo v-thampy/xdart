@@ -545,6 +545,35 @@ def test_non_gi_chi_reduction_reapplies_chi_offset_s4(ai_fixture, synthetic_imag
                                rtol=1e-6, atol=1e-8, equal_nan=True)
 
 
+def test_non_gi_chi_explicit_partial_range_shifts_input_s4(monkeypatch):
+    # S-4 (INPUT half, the mirror of the 2D test above): an explicit PARTIAL chi
+    # range is shifted by -azimuth_offset into the raw pyFAI frame BEFORE
+    # integrating -- exactly like the 2D (80,100)->(-10,10) -- and re-added at
+    # output.  Auto/full-domain masked this (no shift); passing the raw range
+    # straight through integrated 90deg off the 2D for the default offset.
+    captured: dict = {}
+
+    def fake_radial(image, ai, **kwargs):
+        captured.update(kwargs)
+        return IntegrationResult1D(
+            radial=np.array([-10.0, 10.0]),      # raw pyFAI chi frame
+            intensity=np.array([1.0, 2.0]), sigma=None, unit="chi_deg")
+
+    monkeypatch.setattr(reduction_core, "integrate_radial", fake_radial)
+    plan = ReductionPlan(
+        integration_1d=Integration1DPlan(
+            npt=13, unit="chi_deg", method="csr", radial_range=(0.5, 5.0),
+            azimuth_range=(80.0, 100.0), azimuth_offset=90.0),
+        integration_2d=None)
+    result = run_reduction(
+        plan, Scan("chi", [Frame(0, image=np.ones((4, 4)))], integrator=object()))
+
+    # INPUT shifted by -90 -> integrates the SAME raw bins as the 2D
+    assert captured["azimuth_range"] == (-10.0, 10.0)
+    # OUTPUT re-labeled +90 (back to the panel/display frame the user asked for)
+    np.testing.assert_allclose(result.frames[0].result_1d.radial, [80.0, 100.0])
+
+
 def test_chunked_error_clear_waits_for_running_tail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

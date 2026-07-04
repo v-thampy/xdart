@@ -302,12 +302,17 @@ def plan_from_live_scan(
     monitor_key_2d = _pop_first(args_2d, ("monitor",), None)
     chi_offset_1d = _pop_first(args_1d, ("chi_offset",), 0.0)
     chi_offset_2d = _pop_first(args_2d, ("chi_offset",), 0.0)
-    if chi_offset_1d and not bool(getattr(live_scan, "gi", False)):
-        # Transmission-only: the chi offset rotates the standard cake's chi
-        # origin, so the 1D chi-slice is pre-shifted to match.  In GI the
-        # slice goes to FiberIntegrator's own polar convention unshifted --
-        # shifting it displaced the window out of the wedge (zero counts).
-        azimuth_range_1d = _offset_range(azimuth_range_1d, float(chi_offset_1d))
+    # S-4 (ported to the legacy env fallback): carry chi_offset as the 1D plan's
+    # azimuth_offset -- the reduction shifts the input by -offset and re-adds it
+    # at OUTPUT (mirroring the 2D) -- instead of pre-shifting the input range here
+    # and leaving the written 1D chi axis in the raw pyFAI frame 90deg off the 2D.
+    # GI keeps offset 0 (its chi goes to FiberIntegrator's own polar convention
+    # unshifted).  Without this, flipping XDART_CONTROLS_PANEL_V2 /
+    # ..._NATIVE_RUN_PLAN to "0" silently changed written 1D chi data.
+    azimuth_offset_1d = (
+        float(chi_offset_1d)
+        if chi_offset_1d and not bool(getattr(live_scan, "gi", False))
+        else 0.0)
     error_model = _pop_first(args_1d, ("error_model",), None)
     error_model_2d = _pop_first(args_2d, ("error_model",), None)
     polarization_factor = _pop_first(args_1d, ("polarization_factor",), None)
@@ -416,6 +421,7 @@ def plan_from_live_scan(
                 method=method_1d,
                 radial_range=radial_range,
                 azimuth_range=azimuth_range_1d,
+                azimuth_offset=azimuth_offset_1d,
                 monitor_key=monitor_key,
                 error_model=error_model,
                 polarization_factor=polarization_factor,
@@ -1105,15 +1111,6 @@ def _pop_first(args: dict[str, Any], keys: tuple[str, ...], default: Any) -> Any
 def _strip_nonstandard_args(args: dict[str, Any]) -> None:
     for key in _GI_ONLY_ARGS:
         args.pop(key, None)
-
-
-def _offset_range(
-    value: tuple[float, float] | list[float] | None,
-    offset: float,
-) -> tuple[float, float] | None:
-    if value is None:
-        return None
-    return float(value[0]) - offset, float(value[1]) - offset
 
 
 def _gi_1d_unit_default(unit: Any, mode: str, *, is_gi: bool) -> str:

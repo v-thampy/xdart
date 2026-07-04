@@ -2387,8 +2387,15 @@ def _reduce_frame(
             chi_extra = dict(p1.extra)
             chi_extra.pop("error_model", None)
             chi_extra.pop("variance", None)
-            if p1.azimuth_range is not None:
-                chi_extra.setdefault("azimuth_range", p1.azimuth_range)
+            # S-4 (input half): shift an explicit chi range by -azimuth_offset into
+            # the raw pyFAI frame BEFORE integrating -- the exact mirror of the 2D
+            # (_integration_azimuth_range) -- so an explicit panel-frame range read
+            # off the offset-labeled axes integrates the SAME bins as the 2D.  The
+            # output axis is relabeled +offset below.  (Raw range passed straight
+            # through would integrate 90deg off the 2D for the default offset.)
+            _chi_azimuth_range = _integration_azimuth_range(p1)
+            if _chi_azimuth_range is not None:
+                chi_extra.setdefault("azimuth_range", _chi_azimuth_range)
             r1d = integrate_radial(
                 image,
                 ai,
@@ -2522,8 +2529,11 @@ def _subtract_background(
 
 
 def _integration_azimuth_range(
-    plan: Integration2DPlan,
+    plan: "Integration1DPlan | Integration2DPlan",
 ) -> tuple[float, float] | None:
+    # S-4: shared by the 2D cake and the 1D Mode-A chi branch -- both carry
+    # azimuth_range + azimuth_offset, and both shift the input by -offset (raw
+    # frame) and re-add +offset at output.
     if plan.azimuth_range is None:
         return None
     if not plan.azimuth_offset:

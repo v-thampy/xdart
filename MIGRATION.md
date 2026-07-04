@@ -91,7 +91,18 @@ pre-migration reference signature.  Two additive notes:
   Reload is unaffected (readers that don't know the block ignore it), and CF-3's
   target-config read + the data-derived units depend on it — so it is disclosed,
   not removed.  `test_v2_record_gi_scan_writes_gi_provenance` exercises the GI
-  branch the non-GI parity fixture cannot.
+  branch the non-GI parity fixture cannot;
+* **(S-4 disclosure — changed χ axis)** for a STANDARD-mode Mode-A (I-vs-χ,
+  `unit=chi_deg`) reduction with a non-zero `chi_offset` (default 90°), the
+  WRITTEN 1D χ axis now matches the 2D cake χ (offset-applied) instead of the raw
+  pyFAI frame it landed in before — the same frame the input range is interpreted
+  in, so an explicit partial χ range integrates the intended bins.  Intensities
+  are unchanged (axis relabel only); auto / full-domain reductions are unaffected;
+  GI is unchanged.  **Consequence for Append:** appending a NEW run onto a
+  **pre-S-4 χ file** whose stored 1D χ axis is in the old raw frame will BOUNCE at
+  the writer's axis-value backstop (the axes no longer match) — switch that scan
+  to **Replace**, or re-reduce the old file.  This is a deliberate refuse-not-mix,
+  not a regression.
 
 ## Behavior changes to know about
 

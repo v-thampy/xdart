@@ -154,6 +154,14 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
       del-only data before shipping S-4 — a written-data frame fix must not land on user files
       blind (mirror the GI-convention validation discipline). Headless 1D↔2D consistency is
       already green; this gate is the ABSOLUTE frame.
+      **AMENDED (round-3): the harness MUST use an EXPLICIT PARTIAL χ range** (e.g. 0–90°, not
+      Auto / full −180..180) — auto & full-domain masked the input-shift bug, so an auto-only
+      validation would pass a broken build.  Verify the 1D peak at a known χ falls at the SAME χ
+      in the 1D profile and the 2D cake (both offset-applied) for that partial range.
+- [ ] G19 OV-7c waterfall slot: in Overlay+slice with 2 pins, the live "current" cut renders one
+      step ABOVE the last pin (slot 2 = n_pins), not buried under pin #1's baseline. Pin it ⇒ the
+      new pinned trace stays at the SAME y (no jump); the next current appears one slot higher.
+      Zero pins ⇒ current at slot 0.
 
 **PASS ⇒ proceed to RC-8** (merge → tag v1.0.0 → publish; recipe in
 `handoff_chunks_jul2026.md`). Any FAIL: stop, report the item + `kill -USR1 <pid>` stack if a

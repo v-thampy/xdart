@@ -355,7 +355,11 @@ def test_plan_from_live_scan_maps_integration_settings() -> None:
     assert plan.integration_2d.method == "csr"
     assert plan.integration_1d.radial_range == (1.0, 2.0)
     assert plan.integration_2d.radial_range is None
-    assert plan.integration_1d.azimuth_range == (-20.0, 20.0)
+    # S-4 (ported to plan_from_live_scan): the 1D input range is NO LONGER
+    # pre-shifted; chi_offset is carried as azimuth_offset and the reduction
+    # shifts input + re-adds output (mirroring the 2D).
+    assert plan.integration_1d.azimuth_range == (70.0, 110.0)
+    assert plan.integration_1d.azimuth_offset == 90.0
     assert plan.integration_2d.azimuth_range == (-10.0, 10.0)
     assert plan.integration_1d.monitor_key == "i0"
     assert plan.integration_2d.monitor_key == "i1"
