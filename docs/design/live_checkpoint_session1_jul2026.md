@@ -96,7 +96,9 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
       loaded data keeps stored units until Yes/Replace. CF-3 cold path: fresh xdart launch with NO
       viewer-loaded scan, partial Standard target already on disk (e.g. 210/651), panel = Grazing,
       Run in Append -> same modal appears before any frame processes; No leaves the file
-      untouched and produces no duplicate writer traceback.
+      untouched and produces no duplicate writer traceback. Also run the worker-backstop variant
+      with the source path not yet known/live-empty: it must abort before frame 1, preserving the
+      existing target.
 - [ ] G2 UI-2/UI-3 fresh-launch χ (c/w) slice toggle no-crash with no data + slice c/w + Pin
       re-enable after append/browser-loaded Int 2D cake arrives and disable again on clear.
 - [ ] G3 OV-7 texture-cut workflow: Pin two χ/q centers on one frame, move live c/w — pinned cuts

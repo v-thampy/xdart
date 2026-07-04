@@ -69,8 +69,9 @@ def _bare_worker(tmp_path):
     return worker
 
 
-def _write_minimal_integrated_nxs(path, labels):
+def _write_minimal_integrated_nxs(path, labels, *, reduction_config=None):
     import h5py
+    from xrd_tools.core.provenance import write_provenance
 
     labels = np.asarray(labels, dtype=np.int64)
     q = np.linspace(0.1, 1.0, 4, dtype=np.float32)
@@ -90,6 +91,8 @@ def _write_minimal_integrated_nxs(path, labels):
                 labels.size, q.size
             ),
         )
+        if reduction_config is not None:
+            write_provenance(h5, config=reduction_config, host="")
 
 
 def _initialize_scan_worker(tmp_path, *, write_mode="Append"):
@@ -101,8 +104,10 @@ def _initialize_scan_worker(tmp_path, *, write_mode="Append"):
     worker.write_mode = write_mode
     worker.scan = SimpleNamespace(
         skip_2d=True,
+        gi=False,
         bai_1d_args={"unit": "q_A^-1"},
         bai_2d_args={},
+        gi_config={},
     )
     worker.sigUpdateFile = SimpleNamespace(emit=lambda *_: None)
 
@@ -451,6 +456,34 @@ def test_append_initialize_marks_loaded_rows_persisted(tmp_path):
     assert set(scan.frames._persisted) == {1, 2, 3}
     sink = QtNexusSink(SimpleNamespace(batch_mode=True), scan, object())
     assert sink._needs_atomic_first_batch_flush() is False
+
+
+def test_append_initialize_config_mismatch_aborts_with_empty_img_file(tmp_path):
+    worker, target = _initialize_scan_worker(tmp_path)
+    _write_minimal_integrated_nxs(
+        target,
+        [1, 2, 3],
+        reduction_config={
+            "gi": False,
+            "bai_1d_args": {"unit": "q_A^-1"},
+            "bai_2d_args": {"unit": "q_A^-1"},
+        },
+    )
+    before = target.read_bytes()
+    worker.img_file = ""  # live/cold path: Run click may not know the source yet.
+    worker.gi = True
+    worker.scan.gi = True
+    worker.scan.bai_1d_args = {"unit": "q_A^-1", "gi_mode_1d": "q_total"}
+    worker.scan.bai_2d_args = {"unit": "q_A^-1", "gi_mode_2d": "qip_qoop"}
+    worker.scan.gi_config = {
+        "gi_mode_1d": "q_total",
+        "gi_mode_2d": "qip_qoop",
+    }
+
+    with pytest.raises(RuntimeError, match="processed scan: Standard .* current: Grazing"):
+        worker.initialize_scan()
+
+    assert target.read_bytes() == before
 
 
 def test_zero_processed_already_processed_frames_logs_info(caplog, tmp_path):

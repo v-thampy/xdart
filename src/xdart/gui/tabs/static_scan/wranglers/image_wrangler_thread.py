@@ -83,6 +83,10 @@ from xrd_tools.reduction import (
     prepare_gi_freeze,
 )
 from xrd_tools.session import FrameRecordStore
+from xrd_tools.session.readiness import (
+    append_config_mismatch_check,
+    processing_config_from_scan,
+)
 from xrd_tools.sources.image import ImageFileSource, TiffSeriesSource
 from xrd_tools.io.image import read_image, count_frames
 from xrd_tools.io.export import write_xye
@@ -3246,6 +3250,17 @@ class imageThread(wranglerThread):
                     if write_mode == 'Append':
                         # v2 NeXus loader (the only one we support now).
                         scan.load_from_h5(replace=False, mode='r')
+                        processed_config = processing_config_from_scan(
+                            scan, prefer_stored=True)
+                        current_config = processing_config_from_scan(self.scan)
+                        append_check = append_config_mismatch_check(
+                            write_mode, processed_config, current_config)
+                        if not append_check.ok:
+                            raise RuntimeError(
+                                f"{append_check.reason} Existing append target "
+                                "preserved; switch write mode to Replace to "
+                                "re-integrate with the current settings."
+                            )
                         scan.skip_2d = self.scan.skip_2d
                         for (k, v) in self.scan_args.items():
                             setattr(scan, k, v)

@@ -2539,6 +2539,13 @@ class staticWidget(QWidget):
             write_mode = self.controls.write_mode()
         except Exception:
             pass
+        scan = getattr(self, "scan", None)
+        processed_config = None
+        if self._controls_v2_append_target_matches_displayed_scan():
+            processed_config = processing_config_from_scan(
+                scan,
+                prefer_stored=True,
+            )
         return ControlState(
             tool=tool,
             mode=meas_mode,
@@ -2554,8 +2561,8 @@ class staticWidget(QWidget):
             loaded_scan_available=loaded_scan_available,
             save_path=str(getattr(getattr(self, "wrangler", None), "h5_dir", "") or ""),
             write_mode=write_mode,
-            processed_config=None,
-            current_config=processing_config_from_scan(getattr(self, "scan", None)),
+            processed_config=processed_config,
+            current_config=processing_config_from_scan(scan),
             detector_summary=self._controls_v2_detector_summary(),
             frame_count=display_frame_count,
             processing_mode=mode_text,
