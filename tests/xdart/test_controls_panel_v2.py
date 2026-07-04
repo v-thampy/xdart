@@ -449,6 +449,139 @@ def test_controls_panel_v2_int_advanced_rows_are_collapsed(qapp, monkeypatch):
         widget.deleteLater()
 
 
+def test_controls_panel_v2_run_lock_disables_buttons_and_ignores_signals(
+        qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    calls = []
+    try:
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        widget._refresh_controls_v2_profile_now()
+        more_button = _find_more_button(widget)
+        source_energy_button = _find_source_energy_button(widget)
+        assert more_button is not None
+        assert source_energy_button is not None
+        more_button.click()
+        source_energy_button.click()
+        qapp.processEvents()
+        gi_popup = widget.controls_v2._gi_options_popup
+        energy_popup = widget.controls_v2._source_energy_popup
+        assert gi_popup is not None
+        assert energy_popup is not None
+
+        monkeypatch.setattr(
+            widget,
+            "_controls_v2_choose_source",
+            lambda: calls.append("source"),
+        )
+        monkeypatch.setattr(
+            widget.wrangler,
+            "set_img_file",
+            lambda: calls.append("browse"),
+        )
+        before = widget.integratorTree.get_gi_config()["sample_orientation"]
+
+        widget._enter_run_state()
+
+        locked = [
+            button for button in widget.controls_v2.findChildren(QtWidgets.QAbstractButton)
+            if button.objectName() in {
+                "controlsV2ActionButton",
+                "controlsV2MoreButton",
+            }
+        ]
+        assert locked
+        assert not any(button.isEnabled() for button in locked)
+        assert not any(edit.isEnabled() for edit in gi_popup.findChildren(QtWidgets.QLineEdit))
+        assert not any(
+            button.isEnabled()
+            for button in energy_popup.findChildren(QtWidgets.QAbstractButton)
+        )
+
+        widget._on_controls_v2_action(ControlAction.CHOOSE_SOURCE)
+        widget._on_controls_v2_field_browse(("Signal", "File"))
+        widget._on_controls_v2_field_changed(("GI", "sample_orientation"), "9")
+
+        assert calls == []
+        assert widget.integratorTree.get_gi_config()["sample_orientation"] == before
+    finally:
+        widget._exit_run_state()
+        _reset_controls_v2_gi(widget)
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_combined_advanced_dialog_locked_during_run(
+        qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget._show_integration_advanced()
+        dlg = widget._integ_adv_combined_dlg
+        assert dlg.isEnabled()
+
+        widget._enter_run_state()
+        assert not dlg.isEnabled()
+        widget._show_integration_advanced()
+        assert not dlg.isEnabled()
+
+        widget._exit_run_state()
+        assert dlg.isEnabled()
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_point_counts_clamp_to_one(qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget._on_controls_v2_field_changed(("Int1D", "points"), "0")
+        widget._on_controls_v2_field_changed(("Int1D", "points_oop"), "-4")
+        widget._on_controls_v2_field_changed(("Int2D", "radial_points"), "0")
+        widget._on_controls_v2_field_changed(("Int2D", "azim_points"), "-9")
+
+        assert widget.scan.bai_1d_args["numpoints"] == 1
+        assert widget.scan.bai_1d_args["npt_oop"] == 1
+        assert widget.scan.bai_2d_args["npt_rad"] == 1
+        assert widget.scan.bai_2d_args["npt_azim"] == 1
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_refresh_failure_warns_once(qapp, monkeypatch, caplog):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        monkeypatch.setattr(
+            widget,
+            "_controls_v2_state",
+            lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        caplog.set_level("WARNING")
+
+        widget._refresh_controls_v2_profile_now()
+        widget._refresh_controls_v2_profile_now()
+
+        warnings = [
+            rec for rec in caplog.records
+            if "Controls Panel V2 profile refresh failed" in rec.getMessage()
+        ]
+        assert len(warnings) == 1
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
 def test_controls_panel_v2_native_int_advanced_rows_write_through_and_match_plan(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
@@ -1663,6 +1796,126 @@ def test_controls_panel_v2_source_frame_count_is_unknown_in_live_mode(tmp_path):
         staticWidget._controls_v2_source_frame_count, host)
 
     assert host._controls_v2_source_frame_count() is None
+
+
+def test_controls_panel_v2_frame_count_cache_tracks_directory_mtime(tmp_path):
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    values = {
+        ("Signal", "inp_type"): "Image Directory",
+        ("Signal", "File"): "",
+        ("Signal", "img_dir"): str(tmp_path),
+        ("NeXus File", "nexus_file"): "",
+        ("Signal", "img_ext"): "tif",
+        ("Signal", "include_subdir"): False,
+        ("Signal", "Filter"): "",
+    }
+    host = SimpleNamespace(
+        _v2_frame_count_cache=None,
+        _controls_v2_param_value=lambda path, default="": values.get(tuple(path), default),
+        _controls_v2_live_source_active=lambda: False,
+        _controls_v2_source_cache_stamp=staticWidget._controls_v2_source_cache_stamp,
+        _controls_v2_count_source_frames=staticWidget._controls_v2_count_source_frames,
+    )
+    host._controls_v2_source_frame_count = MethodType(
+        staticWidget._controls_v2_source_frame_count, host)
+
+    assert host._controls_v2_source_frame_count() == 0
+    (tmp_path / "scan_0001.tif").write_bytes(b"")
+    stamp = tmp_path.stat().st_mtime_ns + 1_000_000
+    os.utime(tmp_path, ns=(stamp, stamp))
+
+    assert host._controls_v2_source_frame_count() == 1
+
+
+def test_controls_panel_v2_metadata_probe_cache_tracks_directory_mtime(tmp_path):
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    values = {
+        ("Signal", "inp_type"): "Image Directory",
+        ("Signal", "img_dir"): str(tmp_path),
+        ("Signal", "img_ext"): "tif",
+        ("Signal", "Filter"): "",
+        ("Signal", "include_subdir"): False,
+    }
+    host = SimpleNamespace(
+        wrangler=SimpleNamespace(img_file=""),
+        _controls_v2_metadata_probe_cache=None,
+        _controls_v2_param_value=lambda path, default="": values.get(tuple(path), default),
+        _controls_v2_source_cache_stamp=staticWidget._controls_v2_source_cache_stamp,
+    )
+    host._controls_v2_first_metadata_file = MethodType(
+        staticWidget._controls_v2_first_metadata_file, host)
+
+    assert host._controls_v2_first_metadata_file() == ""
+    raw = tmp_path / "scan_0001.tif"
+    raw.write_bytes(b"")
+    stamp = tmp_path.stat().st_mtime_ns + 1_000_000
+    os.utime(tmp_path, ns=(stamp, stamp))
+
+    assert host._controls_v2_first_metadata_file() == str(raw)
+
+
+def test_controls_panel_v2_source_caps_match_headless_bridge_with_documented_divergences():
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.core.scan import SourceCapabilities, SourceKind
+    from xrd_tools.sources.readiness import describe_source_readiness
+
+    class _Source:
+        kind = SourceKind.NEXUS_STACK
+        capabilities = SourceCapabilities(
+            has_metadata=True,
+            has_geometry=True,
+            has_raw_references=True,
+        )
+        frame_indices = [0, 1]
+        motors = {"omega": [0.1, 0.2]}
+
+        def load_frame(self, index):
+            return np.ones((2, 2))
+
+        def metadata_for(self, index):
+            return {"energy_keV": 12.0, "psi": 0.3}
+
+    headless = describe_source_readiness(_Source())
+    gui, ready = staticWidget._controls_v2_source_caps(
+        source_label="/data/scan.nxs",
+        frame_count=2,
+        live_unknown=False,
+        has_metadata=headless.has_metadata,
+        has_motors=headless.has_motors,
+        has_energy=headless.has_energy,
+        has_geometry=headless.has_geometry,
+        has_psi_metadata=headless.has_psi_metadata,
+    )
+
+    assert ready is True
+    assert gui == headless
+
+    # Deliberate GUI divergences: the panel owns energy authority and loaded
+    # calibration state, so those two caps may differ from source-only metadata.
+    source_only = describe_source_readiness(
+        SimpleNamespace(
+            kind=SourceKind.NEXUS_STACK,
+            capabilities=SourceCapabilities(has_geometry=True),
+            frame_indices=[0],
+            load_frame=lambda index: np.ones((2, 2)),
+            metadata_for=lambda index: {},
+        )
+    )
+    gui_panel, _ready = staticWidget._controls_v2_source_caps(
+        source_label="/data/scan.nxs",
+        frame_count=1,
+        live_unknown=False,
+        has_metadata=source_only.has_metadata,
+        has_motors=source_only.has_motors,
+        has_energy=True,
+        has_geometry=False,
+        has_psi_metadata=source_only.has_psi_metadata,
+    )
+
+    assert gui_panel.has_energy is True and source_only.has_energy is False
+    assert gui_panel.has_geometry is False and source_only.has_geometry is True
 
 
 def test_controls_panel_v2_source_label_uses_configured_raw_source(

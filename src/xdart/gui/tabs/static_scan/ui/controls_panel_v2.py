@@ -1220,6 +1220,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
         btn.setObjectName("controlsV2MoreButton")
         btn.setProperty("role", "sourceEnergy")
         btn.setToolTip("Energy source")
+        btn.setEnabled(bool(field.enabled))
         btn.clicked.connect(
             lambda _=False, f=field: self._open_source_energy_popup(f))
         return btn
@@ -1373,6 +1374,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
             more.setText("…")
             more.setObjectName("controlsV2MoreButton")
             more.setToolTip("More GI options: Orientation, Tilt Angle")
+            more.setEnabled(any(field.enabled for field in popup_fields))
             more.clicked.connect(
                 lambda _=False, f=tuple(popup_fields): self._open_gi_more_popup(f))
             lay.addWidget(more, 0)

@@ -36,7 +36,18 @@ _DATA = Path(os.environ.get("XDART_TEST_DATA",
 def qapp():
     from PySide6 import QtWidgets
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    yield app
+    try:
+        yield app
+    finally:
+        for top in list(app.topLevelWidgets()):
+            try:
+                top.close()
+                top.deleteLater()
+            except Exception:
+                pass
+        for _ in range(5):
+            app.processEvents()
+        app.quit()
 
 
 @pytest.fixture
@@ -54,6 +65,10 @@ def widget(qapp):
     finally:
         try:
             w.close()
+        except Exception:
+            pass
+        try:
+            w.deleteLater()
         except Exception:
             pass
         for _ in range(3):
@@ -998,6 +1013,47 @@ def test_image_widget_reuses_levels_for_short_live_flush(qapp, monkeypatch):
         w.update_image(scale="Sqrt", cmap="viridis")
 
         assert calls == [((100, 100), (2, 98)), ((100, 100), (0.5, 99.9))]
+    finally:
+        w.deleteLater()
+        qapp.processEvents()
+
+
+def test_image_widget_level_cache_is_scoped_by_scan_token(qapp, monkeypatch):
+    from xdart.gui.widgets import pgImageWidget
+    import xdart.gui.widgets.image_widget as image_widget_mod
+
+    calls = []
+
+    def _levels(displayed, raw, pct):
+        calls.append((float(np.asarray(raw).ravel()[0]), tuple(pct)))
+        return (0.0, 1.0)
+
+    monkeypatch.setattr(image_widget_mod, "_ceiling_safe_levels", _levels)
+    w = pgImageWidget(lockAspect=True, raw=True)
+    try:
+        first = np.ones((20, 20), dtype=float)
+        second_same_scan = np.full((20, 20), 2.0)
+        third_new_scan = np.full((20, 20), 3.0)
+
+        w.setImage(first, scale="Linear", cmap="viridis",
+                   level_scan_token=("scan-a", 1))
+        w.setImage(second_same_scan, scale="Linear", cmap="viridis",
+                   level_scan_token=("scan-a", 1))
+        w.setImage(third_new_scan, scale="Linear", cmap="viridis",
+                   level_scan_token=("scan-b", 1))
+
+        assert calls == [((1.0), (2, 98)), ((3.0), (2, 98))]
+
+        fourth_unscoped = np.full((20, 20), 4.0)
+        fifth_unscoped = np.full((20, 20), 5.0)
+        w.setImage(fourth_unscoped, scale="Linear", cmap="viridis")
+        w.setImage(fifth_unscoped, scale="Linear", cmap="viridis")
+
+        assert calls == [
+            (1.0, (2, 98)),
+            (3.0, (2, 98)),
+            (4.0, (2, 98)),
+        ]
     finally:
         w.deleteLater()
         qapp.processEvents()

@@ -1864,7 +1864,7 @@ class imageWrangler(wranglerWidget):
         )
         if path != '':
             self.parameters.child('Signal').child('img_dir').setValue(path)
-        self.img_dir = path
+            self.img_dir = path
 
     def _find_image_directory_seed(self, match, suffix):
         """Return the first usable image-directory frame with a short cache.
@@ -2102,7 +2102,7 @@ class imageWrangler(wranglerWidget):
         )
         if fname != '':
             self.parameters.child('Signal').child('mask_file').setValue(fname)
-        self.mask_file = fname
+            self.mask_file = fname
 
     def set_bg_type(self):
         """Change Parameter Names depending on BG Type

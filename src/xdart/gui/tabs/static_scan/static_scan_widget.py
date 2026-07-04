@@ -17,6 +17,25 @@ import imageio
 import pyFAI
 
 logger = logging.getLogger(__name__)
+_ORPHANED_STITCH_THREADS = []
+
+
+def _retain_orphaned_stitch_thread(thread) -> None:
+    """Keep a slow stitch QThread wrapper alive until Qt finishes it."""
+    if thread in _ORPHANED_STITCH_THREADS:
+        return
+    _ORPHANED_STITCH_THREADS.append(thread)
+
+    def _forget_thread():
+        try:
+            _ORPHANED_STITCH_THREADS.remove(thread)
+        except ValueError:
+            pass
+
+    try:
+        thread.finished.connect(_forget_thread)
+    except Exception:
+        pass
 
 # Viewer-mode row stores.  Normal scan display reads exclusively from the
 # record/publication stores; these dicts back Image/XYE/NeXus file browsers.
@@ -805,6 +824,9 @@ class staticWidget(QWidget):
 
     def _on_controls_v2_action(self, action) -> None:
         """Route Controls V2 preview actions through existing production hooks."""
+        if self._controls_v2_run_active():
+            logger.debug("Ignoring Controls V2 action during active run: %s", action)
+            return
         if action == ControlAction.CHOOSE_SOURCE:
             self._controls_v2_choose_source()
         elif action == ControlAction.CHOOSE_PROJECT:
@@ -965,11 +987,14 @@ class staticWidget(QWidget):
             return float(default)
 
     @staticmethod
-    def _controls_v2_int(value, default=0) -> int:
+    def _controls_v2_int(value, default=0, *, minimum=None) -> int:
         try:
-            return int(float(value))
+            out = int(float(value))
         except (TypeError, ValueError):
-            return int(default)
+            out = int(default)
+        if minimum is not None:
+            out = max(int(minimum), out)
+        return out
 
     @staticmethod
     def _controls_v2_bool(value) -> bool:
@@ -1730,16 +1755,16 @@ class staticWidget(QWidget):
         elif leaf == "axis":
             self._controls_v2_axis_to_native(root, value)
         elif leaf == "points":
-            args["numpoints"] = self._controls_v2_int(value, 3000)
+            args["numpoints"] = self._controls_v2_int(value, 3000, minimum=1)
             if self._controls_v2_npts_oop_visible():
                 args.setdefault("npt_oop", args["numpoints"])
         elif leaf == "points_oop":
             args["npt_oop"] = self._controls_v2_int(
-                value, args.get("numpoints", 3000))
+                value, args.get("numpoints", 3000), minimum=1)
         elif leaf == "radial_points":
-            args["npt_rad"] = self._controls_v2_int(value, 500)
+            args["npt_rad"] = self._controls_v2_int(value, 500, minimum=1)
         elif leaf == "azim_points":
-            args["npt_azim"] = self._controls_v2_int(value, 500)
+            args["npt_azim"] = self._controls_v2_int(value, 500, minimum=1)
         elif leaf == "radial_auto":
             self._controls_v2_set_range_auto(root, "radial", self._controls_v2_bool(value))
         elif leaf == "azim_auto":
@@ -1972,6 +1997,9 @@ class staticWidget(QWidget):
                 cache.plan_builder = builder
 
     def _on_controls_v2_field_changed(self, path, value) -> None:
+        if self._controls_v2_run_active():
+            logger.debug("Ignoring Controls V2 edit during active run: %s", path)
+            return
         path = tuple(path)
         if path and path[0] in {"Signal", "Source"}:
             self._controls_v2_source_energy_cache = None
@@ -1980,6 +2008,9 @@ class staticWidget(QWidget):
         self._refresh_controls_v2_profile(immediate=True)
 
     def _on_controls_v2_field_browse(self, path) -> None:
+        if self._controls_v2_run_active():
+            logger.debug("Ignoring Controls V2 browse during active run: %s", path)
+            return
         path = tuple(path)
         wrangler = getattr(self, "wrangler", None)
         if wrangler is None:
@@ -2202,6 +2233,7 @@ class staticWidget(QWidget):
                 not force_refresh
                 and signature == getattr(self, "_controls_v2_last_signature", None)
             ):
+                self._controls_v2_refresh_failure_warned = False
                 self._note_controls_v2_refresh(
                     "noop", (_time.perf_counter() - _t0) * 1000)
                 return
@@ -2215,6 +2247,7 @@ class staticWidget(QWidget):
                     self._cancel_deferred_controls_v2_refresh()
                     self._controls_v2_last_signature = signature
                     self._controls_v2_last_schema_signature = schema_signature
+                    self._controls_v2_refresh_failure_warned = False
                     self._note_controls_v2_refresh(
                         "in_place", (_time.perf_counter() - _t0) * 1000)
                     return
@@ -2234,6 +2267,7 @@ class staticWidget(QWidget):
                 and isinstance(editor, QtWidgets.QLineEdit)
             ):
                 self._defer_controls_v2_refresh_until_commit(editor)
+                self._controls_v2_refresh_failure_warned = False
                 self._note_controls_v2_refresh(
                     "deferred_focus", (_time.perf_counter() - _t0) * 1000)
                 return
@@ -2241,11 +2275,19 @@ class staticWidget(QWidget):
             panel.set_state(render_state)
             self._controls_v2_last_signature = signature
             self._controls_v2_last_schema_signature = schema_signature
+            self._controls_v2_refresh_failure_warned = False
             self._note_controls_v2_refresh(
                 "full_rebuild", (_time.perf_counter() - _t0) * 1000)
         except Exception:
-            logger.debug("Controls Panel V2 profile refresh failed",
-                         exc_info=True)
+            if not getattr(self, "_controls_v2_refresh_failure_warned", False):
+                self._controls_v2_refresh_failure_warned = True
+                logger.warning(
+                    "Controls Panel V2 profile refresh failed; readiness may be stale",
+                    exc_info=True,
+                )
+            else:
+                logger.debug("Controls Panel V2 profile refresh failed",
+                             exc_info=True)
 
     def _note_controls_v2_refresh(self, kind: str, elapsed_ms: float = 0.0) -> None:
         stats = getattr(self, "_controls_v2_refresh_stats", None)
@@ -2494,13 +2536,10 @@ class staticWidget(QWidget):
             calibration_energy_eV is not None
             or source_energy_eV is not None
         )
-        source_ready = bool(source_label) and (
-            source_live_unknown or frame_count > 0
-        )
-        source_caps = SourceCaps(
-            has_frames=source_ready,
-            has_raw=source_ready,
-            raw_reachable=source_ready,
+        source_caps, source_ready = self._controls_v2_source_caps(
+            source_label=source_label,
+            frame_count=frame_count,
+            live_unknown=source_live_unknown,
             has_metadata=has_scan_data or bool(getattr(wrangler, "scan_args", None)),
             has_motors=has_motors,
             has_energy=energy_known,
@@ -2604,6 +2643,35 @@ class staticWidget(QWidget):
             controls_locked=run_active,
         )
 
+    @staticmethod
+    def _controls_v2_source_caps(
+        *,
+        source_label: str,
+        frame_count: int,
+        live_unknown: bool,
+        has_metadata: bool,
+        has_motors: bool,
+        has_energy: bool,
+        has_geometry: bool,
+        has_psi_metadata: bool,
+    ) -> tuple[SourceCaps, bool]:
+        source_ready = bool(source_label) and (
+            bool(live_unknown) or int(frame_count or 0) > 0
+        )
+        return (
+            SourceCaps(
+                has_frames=source_ready,
+                has_raw=source_ready,
+                raw_reachable=source_ready,
+                has_metadata=bool(has_metadata),
+                has_motors=bool(has_motors),
+                has_energy=bool(has_energy),
+                has_geometry=bool(has_geometry),
+                has_psi_metadata=bool(has_psi_metadata),
+            ),
+            source_ready,
+        )
+
     def _controls_v2_source_label(self) -> str:
         return self._controls_v2_configured_source_label()
 
@@ -2682,6 +2750,7 @@ class staticWidget(QWidget):
             img_ext,
             include_subdir,
             file_filter,
+            self._controls_v2_source_cache_stamp(source_path),
         )
         cached = getattr(self, "_v2_frame_count_cache", None)
         if cached is not None and cached[0] == key:
@@ -2697,6 +2766,15 @@ class staticWidget(QWidget):
         )
         self._v2_frame_count_cache = (key, count)
         return count
+
+    @staticmethod
+    def _controls_v2_source_cache_stamp(path) -> int | None:
+        if not path:
+            return None
+        try:
+            return Path(str(path)).expanduser().stat().st_mtime_ns
+        except OSError:
+            return None
 
     def _controls_v2_param_value(self, path, default=""):
         param = self._controls_v2_param(tuple(path))
@@ -2983,18 +3061,6 @@ class staticWidget(QWidget):
                 mg_args.get("wavelength"))
         return None
 
-    @staticmethod
-    def _controls_v2_positive_float(value) -> float | None:
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            return None
-        if number != number or number <= 0:
-            return None
-        if number in (float("inf"), float("-inf")):
-            return None
-        return number
-
     @classmethod
     def _controls_v2_extract_energy_eV(cls, mapping) -> float | None:
         if not hasattr(mapping, "items"):
@@ -3112,7 +3178,13 @@ class staticWidget(QWidget):
                 candidates = (
                     base.rglob(pattern) if include_subdir else base.glob(pattern)
                 )
-                cache_key = (str(base), img_ext, filter_text, include_subdir)
+                cache_key = (
+                    str(base),
+                    img_ext,
+                    filter_text,
+                    include_subdir,
+                    self._controls_v2_source_cache_stamp(base),
+                )
                 cached = getattr(self, "_controls_v2_metadata_probe_cache", None)
                 if cached is not None and cached[0] == cache_key:
                     return cached[1]
@@ -4816,6 +4888,10 @@ class staticWidget(QWidget):
         except Exception:
             logger.debug("stopping integrator thread on close failed",
                          exc_info=True)
+        # Stitch is also a one-shot QThread parented to this widget.  It can be
+        # inside a long MultiGeometry call at app close, so request stop for the
+        # pre-start window and bound-wait like the other run threads.
+        self._stop_stitch_thread_on_close()
         # Stop the viewer's long-running background threads BEFORE teardown so
         # the persistent fileHandlerThread / async load worker aren't destroyed
         # while running ("QThread: Destroyed while thread is still running") on
@@ -4857,9 +4933,28 @@ class staticWidget(QWidget):
 
         gc.collect()
 
+    def _stop_stitch_thread_on_close(self):
+        try:
+            st = getattr(self, 'stitch_thread', None)
+            if st is not None and st.isRunning():
+                st.stop_requested = True
+                if not st.wait(15000):
+                    logger.warning("stitch thread still running at close after 15s")
+                    try:
+                        st.setParent(None)
+                    except Exception:
+                        logger.debug("detaching slow stitch thread failed",
+                                     exc_info=True)
+                    _retain_orphaned_stitch_thread(st)
+        except Exception:
+            logger.debug("stopping stitch thread on close failed", exc_info=True)
+
     def _show_integration_advanced(self):
         """Show a combined dialog with the integratorTree's existing
         1D and 2D advanced parameter widgets."""
+        if self._controls_v2_run_active():
+            logger.debug("Ignoring advanced integration dialog during active run")
+            return
         self._controls_v2_hydrate_advanced_from_scan()
         if not hasattr(self, '_integ_adv_combined_dlg'):
             dlg = QtWidgets.QDialog(self)
@@ -5032,6 +5127,13 @@ class staticWidget(QWidget):
         for row in panel.findChildren(SegmentedControl):
             for _value, button in getattr(row, "_segments", ()):
                 button.setEnabled(enabled)
+        if not enabled:
+            for button in panel.findChildren(QtWidgets.QAbstractButton):
+                if button.objectName() in {
+                    "controlsV2ActionButton",
+                    "controlsV2MoreButton",
+                }:
+                    button.setEnabled(False)
 
     def _session_run_active(self):
         """4d: True iff a streaming session is open AND reports it is running.
@@ -5160,6 +5262,13 @@ class staticWidget(QWidget):
             adv = getattr(itree, name, None)
             if adv is not None:
                 adv.setEnabled(False)
+        dlg = getattr(self, '_integ_adv_combined_dlg', None)
+        if dlg is not None:
+            try:
+                dlg.setEnabled(False)
+            except Exception:
+                logger.debug("disable combined advanced dialog failed",
+                             exc_info=True)
 
     def _exit_run_state(self):
         """Single owner of run END (task #68): mark the run finished.
@@ -5183,6 +5292,13 @@ class staticWidget(QWidget):
         # Re-enable the tree (restores the auto-range field gating) then overlay
         # the mode-correct state (run_active is now False).
         self.enable_integration(True)
+        dlg = getattr(self, '_integ_adv_combined_dlg', None)
+        if dlg is not None:
+            try:
+                dlg.setEnabled(True)
+            except Exception:
+                logger.debug("re-enable combined advanced dialog failed",
+                             exc_info=True)
         self._invalidate_controls_v2_render_cache()
         self._controls_v2_unlocking_run = True
         try:

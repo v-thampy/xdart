@@ -227,6 +227,7 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
         self.raw_image = np.zeros(0)
         self.displayed_image = np.zeros(0)
         self._level_cache = None
+        self._level_scan_token = None
         self.show()
 
     def make_pos_label(self, itemPos=(1, 0), parentPos=(1, 1), offset=(0, -20)):
@@ -237,6 +238,7 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
     def setImage(self, image, rect=None,
                  scale='Linear', cmap='viridis',
                  **kwargs):
+        self._level_scan_token = kwargs.pop("level_scan_token", None)
         self.raw_image = image[()]
         self.update_image(scale, cmap, **kwargs)
         if rect is not None:
@@ -260,6 +262,7 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
             tuple(displayed.shape),
             str(displayed.dtype),
             str(raw.dtype),
+            getattr(self, "_level_scan_token", None),
         )
         now = time.perf_counter()
         cached = self._level_cache

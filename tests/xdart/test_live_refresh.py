@@ -720,6 +720,110 @@ def test_shutdown_threads_discards_stale_file_thread_work():
     assert ft.sigUpdate.disconnected
 
 
+def test_close_helper_waits_for_running_stitch_thread():
+    class _StitchThread:
+        def __init__(self):
+            self.stop_requested = False
+            self.wait_calls = []
+
+        def isRunning(self):
+            return True
+
+        def wait(self, timeout_ms):
+            self.wait_calls.append(timeout_ms)
+            return True
+
+    stitch = _StitchThread()
+    host = SimpleNamespace(stitch_thread=stitch)
+
+    staticWidget._stop_stitch_thread_on_close(host)
+
+    assert stitch.stop_requested is True
+    assert stitch.wait_calls == [15000]
+
+
+def test_close_helper_detaches_slow_stitch_thread(monkeypatch):
+    from xdart.gui.tabs.static_scan import static_scan_widget as ssw_mod
+
+    retained = []
+
+    class _StitchThread:
+        def __init__(self):
+            self.stop_requested = False
+            self.wait_calls = []
+            self.parent = "host"
+
+        def isRunning(self):
+            return True
+
+        def wait(self, timeout_ms):
+            self.wait_calls.append(timeout_ms)
+            return False
+
+        def setParent(self, parent):
+            self.parent = parent
+
+    stitch = _StitchThread()
+    host = SimpleNamespace(stitch_thread=stitch)
+    monkeypatch.setattr(
+        ssw_mod, "_retain_orphaned_stitch_thread",
+        lambda thread: retained.append(thread),
+    )
+
+    staticWidget._stop_stitch_thread_on_close(host)
+
+    assert stitch.stop_requested is True
+    assert stitch.wait_calls == [15000]
+    assert stitch.parent is None
+    assert retained == [stitch]
+
+
+def test_image_wrangler_browse_cancel_preserves_directory_and_mask(monkeypatch):
+    from xdart.gui.tabs.static_scan.wranglers import image_wrangler as iw_mod
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    set_values = []
+
+    class _Param:
+        def __init__(self, name="root"):
+            self.name = name
+
+        def child(self, name):
+            return _Param(name)
+
+        def setValue(self, value):
+            set_values.append((self.name, value))
+
+    host = SimpleNamespace(
+        img_dir="/old/images",
+        mask_file="/old/mask.edf",
+        parameters=_Param(),
+        _browse_dir=lambda value: value,
+    )
+
+    class _Dialog:
+        ShowDirsOnly = object()
+
+        def getExistingDirectory(self, *args, **kwargs):
+            return ""
+
+        def getOpenFileName(self, *args, **kwargs):
+            return ("", "")
+
+    monkeypatch.setattr(
+        iw_mod,
+        "QFileDialog",
+        _Dialog,
+    )
+
+    imageWrangler.set_img_dir(host)
+    imageWrangler.set_mask_file(host)
+
+    assert host.img_dir == "/old/images"
+    assert host.mask_file == "/old/mask.edf"
+    assert set_values == []
+
+
 def test_live_flush_timer_env_clamps_below_selection_debounce(monkeypatch, caplog):
     caplog.set_level(logging.WARNING)
     monkeypatch.setenv("XDART_FLUSH_MS", "80")
@@ -3781,6 +3885,47 @@ def test_load_worker_reselection_retirement_does_not_wait(monkeypatch):
     assert viewer._load_thread is None
 
 
+def test_load_worker_teardown_timeout_orphans_running_thread(monkeypatch):
+    import xdart.gui.tabs.static_scan.h5viewer as h5viewer_mod
+
+    retained = []
+    monkeypatch.setattr(h5viewer_mod, "_qt_isvalid", lambda obj: obj is not None)
+    monkeypatch.setattr(
+        h5viewer_mod, "_retain_orphaned_load_worker",
+        lambda worker, thread: retained.append((worker, thread)),
+    )
+
+    class _SlowThread:
+        def __init__(self):
+            self.quit_calls = 0
+            self.parent = object()
+
+        def isRunning(self):
+            return True
+
+        def quit(self):
+            self.quit_calls += 1
+
+        def wait(self, _ms):
+            return False
+
+        def setParent(self, parent):
+            self.parent = parent
+
+    worker = _FakeWorker()
+    thread = _SlowThread()
+    viewer = SimpleNamespace(_load_worker=worker, _load_thread=thread)
+
+    H5Viewer._teardown_load_worker(viewer)
+
+    assert worker.cancelled is True
+    assert thread.quit_calls == 1
+    assert thread.parent is None
+    assert retained == [(worker, thread)]
+    assert viewer._load_worker is None
+    assert viewer._load_thread is None
+
+
 def test_load_worker_gets_pool_handle_under_file_lock(monkeypatch):
     import xdart.gui.tabs.static_scan.h5viewer as h5viewer_mod
     import xdart.modules.ewald.frame_series as frame_series_mod
@@ -4885,12 +5030,16 @@ def test_refresh_norm_channels_populates_combo_from_scan_data_aliases():
 
 def test_empty_image_clear_hides_colorbar_without_zero_paint():
     widget = _FakeImageWidget()
+    widget._level_cache = {"levels": (0, 1)}
+    widget._level_scan_token = ("scan-a", 1)
 
     displayFrameWidget._clear_image_widget(widget)
 
     assert widget.imageItem.cleared is True
     assert widget.histogram.visible is False
     assert widget.images == []
+    assert widget._level_cache is None
+    assert widget._level_scan_token is None
 
 
 def test_processed_image_viewer_keeps_baked_nan_mask_visible():

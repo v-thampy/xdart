@@ -62,6 +62,7 @@ from .display_logic import (
 )
 from .display_controllers import register_default_controllers
 from .display_overlay_utils import (
+    current_scan_key as overlay_current_scan_key,
     current_axis_info as overlay_current_axis_info,
     overlay_identity_for_widget,
     overlay_projection_id_for_widget,
@@ -2107,7 +2108,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         rect = get_rect(x, y)
         widget = self.image_widget if role is PanelRole.RAW_2D else self.binned_widget
         display_data = _downsample_for_display(image, widget)
-        widget.setImage(display_data, scale=self.scale, cmap=self.cmap)
+        widget.setImage(
+            display_data, scale=self.scale, cmap=self.cmap,
+            level_scan_token=self._image_level_scan_token(),
+        )
         widget.setRect(rect)
         if role is not PanelRole.RAW_2D:
             # Display-only trim: cut the cake's visible axes to the data's
@@ -3650,7 +3654,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         data, rect = self.image_data
 
         display_data = _downsample_for_display(data, self.image_widget)
-        self.image_widget.setImage(display_data, scale=self.scale, cmap=self.cmap)
+        self.image_widget.setImage(
+            display_data, scale=self.scale, cmap=self.cmap,
+            level_scan_token=self._image_level_scan_token(),
+        )
         self.image_widget.setRect(rect)
         displayFrameWidget._set_image_widget_colorbar_visible(
             self.image_widget, True)
@@ -3673,7 +3680,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             return
 
         display_data = _downsample_for_display(data, self.binned_widget)
-        self.binned_widget.setImage(display_data, scale=self.scale, cmap=self.cmap)
+        self.binned_widget.setImage(
+            display_data, scale=self.scale, cmap=self.cmap,
+            level_scan_token=self._image_level_scan_token(),
+        )
         self.binned_widget.setRect(rect)
         displayFrameWidget._set_image_widget_colorbar_visible(
             self.binned_widget, True)
@@ -4033,6 +4043,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         try:
             widget.raw_image = np.zeros(0)
             widget.displayed_image = np.zeros(0)
+            widget._level_cache = None
+            widget._level_scan_token = None
         except Exception:
             pass
         item = getattr(widget, "imageItem", None)
@@ -4044,6 +4056,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         except Exception:
             logger.debug("image widget clear failed", exc_info=True)
         displayFrameWidget._set_image_widget_colorbar_visible(widget, False)
+
+    def _image_level_scan_token(self):
+        return (
+            overlay_current_scan_key(self),
+            getattr(self, "display_generation", None),
+        )
 
     @staticmethod
     def _set_image_widget_colorbar_visible(widget, visible):

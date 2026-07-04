@@ -2899,8 +2899,15 @@ class H5Viewer(QWidget):
                     # posted deleteLater and exit before we release the ref.
                     if not thread.wait(2000):
                         logger.warning(
-                            "load thread did not exit within 2s; leaving "
-                            "refs for its finished-slot to clear")
+                            "load thread did not exit within 2s; retaining "
+                            "orphaned worker until it finishes")
+                        try:
+                            thread.setParent(None)
+                        except (RuntimeError, AttributeError):
+                            pass
+                        _retain_orphaned_load_worker(worker, thread)
+                        self._load_worker = None
+                        self._load_thread = None
                         return
             except (RuntimeError, AttributeError):
                 pass
