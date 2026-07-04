@@ -984,7 +984,13 @@ class PublicationDisplayAdapter:
                 pinned_recipes = tuple(
                     r for r in pinned_recipes if id(r) not in stale_ids)
 
-        hydrate_labels = list(state.render_ids)
+        pending_overlay_appends = tuple(
+            getattr(widget, "_overlay_hydrated_pending_append_labels", ()) or ()
+        )
+        render_labels = list(pending_overlay_appends)
+        render_labels.extend(state.render_ids)
+
+        hydrate_labels = list(render_labels)
         hydrate_labels.extend(recipe.get("label") for recipe in pinned_recipes)
         if hydrate_labels:
             self._hydrate_missing_plot_subset(hydrate_labels, needs_2d=needs_2d)
@@ -1137,11 +1143,24 @@ class PublicationDisplayAdapter:
                         drop_ids.append(live_rid)
 
         replace_ids = []
+        consumed_pending_appends = []
         if not suppress_current:
-            for label in state.render_ids:
+            for label in render_labels:
                 row_id = append_row(label, live=slice_active)
+                if row_id is not None and label in pending_overlay_appends:
+                    consumed_pending_appends.append(label)
                 if row_id is not None and slice_active:
                     replace_ids.append(row_id)
+
+        if consumed_pending_appends:
+            pending_queue = getattr(
+                widget, "_overlay_hydrated_pending_append_labels", None)
+            if pending_queue is not None:
+                consumed = set(consumed_pending_appends)
+                pending_queue.clear()
+                pending_queue.extend(
+                    label for label in pending_overlay_appends
+                    if label not in consumed)
 
         if ref_x is None:
             # No resident 1D frame this render: PRESERVE the prior accumulator (the

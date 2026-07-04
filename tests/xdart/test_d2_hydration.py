@@ -9,12 +9,14 @@ the GUI render path only queues a background request when async hydration was
 explicitly enabled (off in headless tests -> synchronous reads preserved)."""
 import logging
 import threading
+from collections import deque
 from types import SimpleNamespace, MethodType
 
 import numpy as np
 
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xdart.gui.tabs.static_scan.display_data import DisplayDataMixin
+from xdart.gui.tabs.static_scan.display_logic import ConsumerKind
 from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
 from xdart.modules.frame_publication import PublicationStore
 
@@ -337,6 +339,29 @@ def test_repeated_failed_hydration_suppresses_until_generation_bump(caplog):
     assert calls[-1] == (8, 6, "1d")
 
 
+def test_overlay_1d_pending_marker_does_not_block_retry():
+    calls = []
+    fake_worker = SimpleNamespace(
+        request=lambda label, gen, *, purpose="full", **kwargs: calls.append(
+            (label, gen, purpose, kwargs.get("consumer"))))
+    h = SimpleNamespace(
+        _async_hydration_enabled=True,
+        display_generation=5,
+        _hydration_pending_labels={(8, "1d", ConsumerKind.OVERLAY_1D.value)},
+        _hydration_failure_counts={},
+        ui=SimpleNamespace(
+            plotMethod=SimpleNamespace(currentText=lambda: "Overlay")
+        ),
+    )
+    h._ensure_hydration_worker = lambda: fake_worker
+    h._request_frame_hydration = MethodType(
+        displayFrameWidget._request_frame_hydration, h)
+
+    h._request_frame_hydration(8, purpose="1d")
+
+    assert calls == [(8, 5, "1d", ConsumerKind.OVERLAY_1D)]
+
+
 def test_legacy_1d_catchup_requests_1d_hydration_purpose():
     calls = []
     def request(idx, *, purpose="full"):
@@ -408,6 +433,61 @@ def test_on_frame_hydrated_drops_stale_generation():
     assert rendered == []
     h._on_frame_hydrated(4, 7)                 # current -> re-render
     assert rendered == [True]
+
+
+def test_on_frame_hydrated_stale_overlay_1d_queues_append_repaint():
+    requests = []
+    h = SimpleNamespace(
+        display_generation=8,
+        _hydration_pending_labels={(4, "1d", ConsumerKind.OVERLAY_1D.value)},
+        _overlay_hydrated_pending_append_labels=deque(),
+        _pending_hydration_render=False,
+        _pending_hydration_generation=None,
+    )
+    h.request_current_selection_repaint = (
+        lambda *, generation=None, reason=None:
+            requests.append((generation, reason)) or True
+    )
+    h._sync_selection_generation = lambda: 8
+    h._hydration_purpose_resident = lambda label, purpose: True
+    h._record_hydration_completion = (
+        lambda label, purpose, *, success, generation: None
+    )
+    h._flush_hydration_render = MethodType(
+        displayFrameWidget._flush_hydration_render, h)
+    h._on_frame_hydrated = MethodType(
+        displayFrameWidget._on_frame_hydrated, h)
+
+    h._on_frame_hydrated(4, 7)
+
+    assert list(h._overlay_hydrated_pending_append_labels) == [4]
+    assert h._hydration_pending_labels == set()
+    assert requests == [(8, "hydration")]
+
+
+def test_on_frame_hydrated_stale_overlay_after_reset_is_cancelled():
+    requests = []
+    h = SimpleNamespace(
+        display_generation=8,
+        _hydration_pending_labels=set(),   # reset/scan-switch cleared it
+        _overlay_hydrated_pending_append_labels=deque(),
+        _pending_hydration_render=False,
+        _pending_hydration_generation=None,
+    )
+    h.request_current_selection_repaint = (
+        lambda *, generation=None, reason=None:
+            requests.append((generation, reason)) or True
+    )
+    h._sync_selection_generation = lambda: 8
+    h._flush_hydration_render = MethodType(
+        displayFrameWidget._flush_hydration_render, h)
+    h._on_frame_hydrated = MethodType(
+        displayFrameWidget._on_frame_hydrated, h)
+
+    h._on_frame_hydrated(4, 7)
+
+    assert list(h._overlay_hydrated_pending_append_labels) == []
+    assert requests == []
 
 
 def test_on_frame_hydrated_accepts_batched_1d_labels():

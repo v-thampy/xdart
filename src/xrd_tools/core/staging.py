@@ -28,6 +28,18 @@ OVERRIDE_MAX = 128
 RAM_FRACTION = 0.25
 ENV_OVERRIDE = "XDART_HEAVY_WINDOW"
 
+#: 1D records are cheap relative to raw/cake frames, so keep many resident.
+#: The byte budget is intentionally separate from the heavy 2D/raw window:
+#: 5% of RAM capped at 2 GiB, with a hard floor of 4096 traces.
+LIVE_RECORD_MIN_ITEMS = 4096
+LIVE_RECORD_RAM_FRACTION = 0.05
+LIVE_RECORD_MAX_BYTES = 2 * 1024 ** 3
+LIVE_RECORD_FALLBACK_NPT = 3000
+# Conservative per-point budget for a stored 1D trace.  A record can carry the
+# axis, intensity, uncertainty, and per-mode copies/projections; nine float64
+# arrays keeps the 10k x 3000-pt design point inside the 2 GiB budget.
+LIVE_RECORD_FLOAT64_ARRAYS_PER_POINT = 9
+
 _GIB = 1024 ** 3
 
 
@@ -93,6 +105,44 @@ def heavy_window(
     if gib < 32:
         return 32
     return DEFAULT_WINDOW
+
+
+def live_record_trace_bytes(npt: int | None = None) -> int:
+    """Estimated bytes for one resident 1D trace record.
+
+    ``npt`` is known at run start from the reduction plan.  If not, fall back to
+    the long-standing 3000-point planning size.
+    """
+    try:
+        points = int(npt)
+    except (TypeError, ValueError):
+        points = LIVE_RECORD_FALLBACK_NPT
+    if points <= 0:
+        points = LIVE_RECORD_FALLBACK_NPT
+    return points * 8 * LIVE_RECORD_FLOAT64_ARRAYS_PER_POINT
+
+
+def live_record_store_max_items(
+    npt: int | None = None,
+    *,
+    total_ram_bytes: int | None = None,
+) -> int:
+    """Return the live 1D record-store residency cap.
+
+    Formula (BW-A6): ``max(4096, int(min(2 GiB, 0.05 * total_RAM) /
+    trace_bytes))``.  ``trace_bytes`` is derived from the run's 1D ``npt`` with
+    a 3000-point fallback.  RAM detection failure falls back to the floor.
+    """
+    trace_bytes = live_record_trace_bytes(npt)
+    total = (
+        total_ram_bytes
+        if total_ram_bytes is not None
+        else total_physical_ram_bytes()
+    )
+    if not total or total <= 0 or trace_bytes <= 0:
+        return LIVE_RECORD_MIN_ITEMS
+    budget = min(LIVE_RECORD_MAX_BYTES, LIVE_RECORD_RAM_FRACTION * total)
+    return max(LIVE_RECORD_MIN_ITEMS, int(budget / trace_bytes))
 
 
 def heavy_window_log_line(
@@ -185,6 +235,8 @@ def reduction_worker_cap_log_line(workers, requested=None, *, overridden=False):
 __all__ = [
     "heavy_window",
     "heavy_window_log_line",
+    "live_record_store_max_items",
+    "live_record_trace_bytes",
     "total_physical_ram_bytes",
     "reduction_worker_cap",
     "reduction_worker_cap_log_line",
@@ -192,6 +244,8 @@ __all__ = [
     "MIN_WINDOW",
     "MAX_WINDOW",
     "ENV_OVERRIDE",
+    "LIVE_RECORD_MIN_ITEMS",
+    "LIVE_RECORD_FALLBACK_NPT",
     "DEFAULT_REDUCTION_WORKERS",
     "MAX_REDUCTION_WORKERS",
     "REDUCTION_WORKERS_ENV",

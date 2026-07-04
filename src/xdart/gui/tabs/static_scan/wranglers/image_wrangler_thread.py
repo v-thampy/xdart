@@ -71,7 +71,11 @@ from pyqtgraph import Qt
 
 # Project imports
 from xdart.modules.live import LiveFrame, LiveScan, IncidenceAngleUnresolved
-from xrd_tools.core import DEFAULT_MODE_KEY, FrameRecord
+from xrd_tools.core import (
+    DEFAULT_MODE_KEY,
+    FrameRecord,
+    live_record_store_max_items,
+)
 from xrd_tools.integrate.gid import gi_1d_output_axis_key
 from xrd_tools.integrate.calibration import poni_to_integrator, get_detector
 from xrd_tools.reduction import (
@@ -131,12 +135,6 @@ if _LIVE_EXECUTION not in ("serial", "streaming"):
     logger.warning("XDART_LIVE_EXECUTION=%r is not 'serial' or 'streaming'; "
                    "using 'streaming'.", _LIVE_EXECUTION)
     _LIVE_EXECUTION = "streaming"
-
-# 1D records are ~16-64 KB each: 4096 is <=256 MB and makes whole multi-thousand-frame
-# scans resident post-run (gap-free overlay browsing); the heavy 2D/raw window stays
-# separately RAM-aware (16-64).
-_LIVE_RECORD_STORE_MAX_ITEMS = 4096
-
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -2397,6 +2395,11 @@ class imageThread(wranglerThread):
             window, frame_bytes,
             overridden=bool(os.environ.get("XDART_HEAVY_WINDOW"))))
 
+    def _live_record_store_max_items(self, plan=None):
+        integration_1d = getattr(plan, "integration_1d", None)
+        npt = getattr(integration_1d, "npt", None)
+        return live_record_store_max_items(npt)
+
     def _resize_publication_store_heavy_window(self, window):
         store = getattr(self, "publication_store", None)
         resize = getattr(store, "set_max_heavy_items", None)
@@ -2457,8 +2460,10 @@ class imageThread(wranglerThread):
         if frames_obj is not None:
             frames_obj._in_memory_cap = window
         imageThread._resize_publication_store_heavy_window(self, window)
+        record_store_max_items = imageThread._live_record_store_max_items(
+            self, standard_plan)
         record_store = FrameRecordStore(
-            max_items=_LIVE_RECORD_STORE_MAX_ITEMS,
+            max_items=record_store_max_items,
             max_heavy_items=window,
         )
         self._streaming_record_store = record_store

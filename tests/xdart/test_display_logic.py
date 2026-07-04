@@ -31,6 +31,7 @@ import textwrap
 from threading import RLock
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 import xdart.gui.tabs.static_scan.display_logic as dl
@@ -268,6 +269,27 @@ def test_read_policy_table_enumerates_consumers_and_statuses():
     ) is dl.ReadPolicyAction.BLANK_AWAIT
 
 
+def test_hydration_supersede_policy_keeps_overlay_selection_only():
+    assert dl.hydration_supersede_action(
+        dl.ConsumerKind.OVERLAY_1D,
+        dl.SupersedeReason.SELECTION,
+    ) is dl.HydrationSupersedeAction.COMPLETE_AND_APPEND
+
+    for reason in (
+        dl.SupersedeReason.RESET,
+        dl.SupersedeReason.SCAN_SWITCH,
+        dl.SupersedeReason.GENERATION,
+    ):
+        assert dl.hydration_supersede_action(
+            dl.ConsumerKind.OVERLAY_1D, reason
+        ) is dl.HydrationSupersedeAction.CANCEL
+
+    assert dl.hydration_supersede_action(
+        dl.ConsumerKind.PLOT_1D,
+        dl.SupersedeReason.SELECTION,
+    ) is dl.HydrationSupersedeAction.CANCEL
+
+
 def test_accumulate_waterfall_builds_and_appends_monotonically():
     np = pytest.importorskip("numpy")
     x = np.array([0.0, 1.0, 2.0])
@@ -434,6 +456,140 @@ def test_accumulate_waterfall_unit_toggle_with_evicted_frames_keeps_full_stack()
         ids=[2, 3], names=["s2", "s3"])
     assert h2.count == 4                                   # nothing lost
     np.testing.assert_array_equal(h2.x, xtth)
+
+
+def _legacy_accumulate_waterfall(
+        history, *, reset_key, unit, x, rows, ids, names, label="",
+        metadata=None, replace_ids=(), drop_ids=()):
+    x = np.asarray(x, dtype=float).ravel()
+    rows = np.atleast_2d(np.asarray(rows, dtype=float))
+    ids = list(ids)
+    names = list(names)
+    metadata = list(metadata) if metadata is not None else []
+    if len(metadata) < len(ids):
+        metadata.extend([None] * (len(ids) - len(metadata)))
+    metadata = [dl._freeze_metadata(m) for m in metadata[:len(ids)]]
+    replace_keys = {dl._dedup_key(i) for i in (replace_ids or ())}
+    drop_keys = {dl._dedup_key(i) for i in (drop_ids or ())}
+
+    if x.size == 0:
+        if history is not None and dl._reset_keys_compatible(
+                history.reset_key, reset_key):
+            return history
+        return SimpleNamespace(
+            reset_key=reset_key, unit=unit, label=label, x=x,
+            rows=np.empty((0, 0), dtype=float), ids=(), names=(),
+            metadata=(), count=0)
+
+    if history is None or not dl._reset_keys_compatible(
+            history.reset_key, reset_key):
+        ki, kn, kr, km = dl._dedup_first(ids, names, rows, metadata)
+        rows_out = (np.asarray(kr, dtype=float)
+                    if kr else np.empty((0, x.size), dtype=float))
+        return SimpleNamespace(
+            reset_key=reset_key, unit=unit, label=label, x=x, rows=rows_out,
+            ids=tuple(ki), names=tuple(kn), metadata=tuple(km),
+            count=len(ki))
+
+    base_x = (x if history.unit != unit and x.size == history.x.size
+              else history.x)
+    out_ids = list(history.ids)
+    out_names = list(history.names)
+    out_meta = list(getattr(history, "metadata", ()) or ())
+    if len(out_meta) < len(out_ids):
+        out_meta.extend(
+            dl._freeze_metadata(None) for _ in range(len(out_ids) - len(out_meta)))
+    base_rows = np.asarray(history.rows, dtype=float)
+    out_rows = list(np.atleast_2d(base_rows).copy()) if base_rows.size else []
+    index_by_key = {dl._dedup_key(i): pos for pos, i in enumerate(out_ids)}
+
+    for i, n, r, m in zip(ids, names, rows, metadata):
+        key = dl._dedup_key(i)
+        r = np.asarray(r, dtype=float)
+        if (x.size == r.size and x.size > 0 and base_x.size > 0
+                and (x.size != base_x.size
+                     or not np.allclose(x, base_x, equal_nan=True))):
+            r = np.interp(base_x, x, r)
+        if key in index_by_key:
+            if key in replace_keys:
+                pos = index_by_key[key]
+                if 0 <= pos < len(out_rows):
+                    out_rows[pos] = r
+                    out_names[pos] = n
+                    out_meta[pos] = m
+            continue
+        index_by_key[key] = len(out_ids)
+        out_ids.append(i)
+        out_names.append(n)
+        out_meta.append(m)
+        out_rows.append(r)
+
+    if drop_keys:
+        keep = [j for j, i in enumerate(out_ids)
+                if dl._dedup_key(i) not in drop_keys]
+        out_ids = [out_ids[j] for j in keep]
+        out_names = [out_names[j] for j in keep]
+        out_meta = [out_meta[j] for j in keep]
+        out_rows = [out_rows[j] for j in keep]
+
+    rows_out = (np.atleast_2d(np.asarray(out_rows, dtype=float))
+                if out_rows else np.empty((0, base_x.size), dtype=float))
+    return SimpleNamespace(
+        reset_key=reset_key, unit=unit, label=label, x=base_x,
+        rows=rows_out, ids=tuple(out_ids), names=tuple(out_names),
+        metadata=tuple(out_meta), count=len(out_ids))
+
+
+def test_accumulate_waterfall_geometric_buffer_matches_legacy_byte_for_byte():
+    rng = np.random.default_rng(20260704)
+    old = None
+    new = None
+    x_by_unit = {
+        "q_A^-1": np.array([0.1, 0.2, 0.4, 0.8], dtype=float),
+        "2th_deg": np.array([1.0, 2.0, 4.0, 8.0], dtype=float),
+    }
+    live_ids = [("scan", i, "__live__") for i in range(5)]
+
+    for step in range(160):
+        reset_key = ("radial", 4, bool(rng.integers(0, 2)))
+        if rng.random() < 0.12:
+            reset_key = ("azimuthal", 4, bool(rng.integers(0, 2)))
+        unit = "2th_deg" if rng.random() < 0.25 else "q_A^-1"
+        x = x_by_unit[unit]
+        n_rows = int(rng.integers(0, 5))
+        row_ids = []
+        for _ in range(n_rows):
+            if rng.random() < 0.2:
+                row_ids.append(live_ids[int(rng.integers(0, len(live_ids)))])
+            else:
+                row_ids.append(int(rng.integers(0, 24)))
+        rows = rng.normal(size=(n_rows, x.size)) if n_rows else np.empty((0, x.size))
+        names = [f"s{idx}" for idx in row_ids]
+        metadata = [{"epoch": float(step), "row": pos} for pos in range(n_rows)]
+        replace_ids = row_ids[:1] if row_ids and rng.random() < 0.35 else ()
+        existing_ids = tuple(getattr(new, "ids", ()) or ())
+        drop_ids = existing_ids[:1] if existing_ids and rng.random() < 0.10 else ()
+
+        old = _legacy_accumulate_waterfall(
+            old, reset_key=reset_key, unit=unit, x=x, rows=rows,
+            ids=row_ids, names=names, label="Q", metadata=metadata,
+            replace_ids=replace_ids, drop_ids=drop_ids)
+        new = dl.accumulate_waterfall(
+            new, reset_key=reset_key, unit=unit, x=x, rows=rows,
+            ids=row_ids, names=names, label="Q", metadata=metadata,
+            replace_ids=replace_ids, drop_ids=drop_ids)
+
+        assert new.reset_key == old.reset_key
+        assert new.unit == old.unit
+        assert new.label == old.label
+        assert new.ids == old.ids
+        assert new.names == old.names
+        assert tuple(dict(m) for m in new.metadata) == tuple(
+            dict(m) for m in old.metadata)
+        np.testing.assert_array_equal(new.x, old.x)
+        np.testing.assert_array_equal(new.rows, old.rows)
+        assert new.rows.shape[0] == new.count
+        assert getattr(new, "_row_capacity", new.count) >= new.count
 
 
 def test_gi_axes_uniform_detects_mismatch():

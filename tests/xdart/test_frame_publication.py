@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import deque
+
 import numpy as np
 import pytest
 import h5py
@@ -1300,6 +1302,35 @@ def test_plot_payload_routes_overlay_waterfall_through_accumulator_after_flip():
         assert payload is not None
         assert payload.plot_history is not None
         assert payload.overlaid_ids == (("scan", 9),)
+
+
+def test_overlay_payload_appends_stale_hydrated_selection_queue_in_order():
+    store = PublicationStore()
+    for idx in range(21):
+        frame = DuckFrame(idx=idx)
+        frame.scan_info = {"monitor": 1.0}
+        frame.int_1d = IntegrationResult1D(
+            radial=np.linspace(0.5, 3.0, 6),
+            intensity=np.full(6, float(idx)),
+            sigma=np.ones(6),
+            unit="q_A^-1",
+        )
+        store.upsert(publication_from_live_frame(frame))
+
+    widget = _int_widget()
+    widget._waterfall_history = None
+    widget._overlay_hydrated_pending_append_labels = deque(range(21))
+    state = _int_state(store, ids=(), method="Overlay")
+
+    payload = _adapter(store, widget).plot_payload(state)
+
+    assert payload is not None
+    assert payload.plot_history is not None
+    assert payload.plot_history.ids == tuple(("scan", idx) for idx in range(21))
+    assert [trace.label for trace in payload.traces] == [
+        f"scan_{idx}" for idx in range(21)
+    ]
+    assert list(widget._overlay_hydrated_pending_append_labels) == []
 
 
 def test_overlay_waterfall_payload_reset_key_excludes_active_slice_range():

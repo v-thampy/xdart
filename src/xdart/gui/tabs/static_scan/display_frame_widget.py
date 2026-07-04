@@ -16,6 +16,7 @@ import os
 import re
 import threading
 import time
+from collections import deque
 
 logger = logging.getLogger(__name__)
 _HYDRATION_FAILURE_LIMIT = 3
@@ -59,6 +60,7 @@ from .display_logic import (
     default_plot_unit, pretty_unit, sentinel_mask, integer_saturation_ceiling,
     combine_flat_masks, nan_gaps_in_thumbnail,
     stitch_plot_payload, stitch_image_payload,
+    ConsumerKind, SupersedeReason,
 )
 from .display_controllers import register_default_controllers
 from .display_overlay_utils import (
@@ -699,6 +701,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._hydration_worker = None
         self._async_hydration_enabled = False
         self._hydration_pending_labels = set()
+        self._overlay_hydrated_pending_append_labels = deque()
         self._hydration_failure_counts = {}
         self._hydration_failure_logged = set()
         self._pending_hydration_render = False
@@ -1025,14 +1028,34 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 norm_ids.append(str(idx))
         return (tuple(norm_ids), bool(getattr(self, "overall", False)))
 
-    def _bump_display_generation(self):
+    def _bump_display_generation(self, *, reason=SupersedeReason.RESET):
         """Advance the monotonic display generation.  A render/worker result
         stamped with an older generation is stale and may be dropped (full
         enforcement: Stage 5)."""
+        if not isinstance(reason, SupersedeReason):
+            try:
+                reason = SupersedeReason(str(reason))
+            except ValueError:
+                reason = SupersedeReason.RESET
         self.display_generation += 1
         pending_hydration = getattr(self, "_hydration_pending_labels", None)
         if pending_hydration is not None:
-            pending_hydration.clear()
+            if reason is SupersedeReason.SELECTION:
+                pending_hydration.intersection_update(
+                    key for key in tuple(pending_hydration)
+                    if (
+                        isinstance(key, tuple)
+                        and len(key) >= 3
+                        and key[2] == ConsumerKind.OVERLAY_1D.value
+                    )
+                )
+            else:
+                pending_hydration.clear()
+        if reason is not SupersedeReason.SELECTION:
+            pending_overlay = getattr(
+                self, "_overlay_hydrated_pending_append_labels", None)
+            if pending_overlay is not None:
+                pending_overlay.clear()
         failures = getattr(self, "_hydration_failure_counts", None)
         if failures is not None:
             failures.clear()
@@ -1050,7 +1073,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         worker = getattr(self, "_hydration_worker", None)
         cancel = getattr(worker, "cancel_stale_before", None)
         if callable(cancel):
-            cancel(self.display_generation)
+            cancel(self.display_generation, reason=reason)
         return self.display_generation
 
     def _sync_selection_generation(self):
@@ -1069,7 +1092,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         sig = signature()
         if sig != getattr(self, "_last_selection_sig", None):
             if getattr(self, "_last_selection_sig", None) is not None:
-                self._bump_display_generation()
+                self._bump_display_generation(reason=SupersedeReason.SELECTION)
             self._last_selection_sig = sig
         return self.display_generation
 
@@ -1310,16 +1333,34 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             return
         worker = self._ensure_hydration_worker()
         if worker is not None:
+            consumer = ConsumerKind.PLOT_1D
+            if purpose_key == "1d":
+                try:
+                    method = self.ui.plotMethod.currentText()
+                except Exception:
+                    method = None
+                if method in ("Overlay", "Waterfall"):
+                    consumer = ConsumerKind.OVERLAY_1D
             pending = getattr(self, "_hydration_pending_labels", None)
             if pending is None:
                 pending = set()
                 self._hydration_pending_labels = pending
-            pending_key = (label_key, purpose_key)
-            if pending_key in pending:
+            pending_key = (
+                (label_key, purpose_key, consumer.value)
+                if consumer is ConsumerKind.OVERLAY_1D
+                else (label_key, purpose_key)
+            )
+            if pending_key in pending and consumer is not ConsumerKind.OVERLAY_1D:
                 return
             pending.add(pending_key)
-            worker.request(
-                label_key, self.display_generation, purpose=purpose_key)
+            try:
+                worker.request(
+                    label_key, self.display_generation, purpose=purpose_key,
+                    consumer=consumer,
+                    supersede_reason=SupersedeReason.SELECTION)
+            except TypeError:
+                worker.request(
+                    label_key, self.display_generation, purpose=purpose_key)
 
     def _flush_hydration_render(self) -> None:
         if not getattr(self, "_pending_hydration_render", False):
@@ -1385,8 +1426,6 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             pass
         sync = getattr(self, "_sync_selection_generation", None)
         current_generation = sync() if callable(sync) else self.display_generation
-        if generation != current_generation:
-            return
         resident = getattr(self, "_hydration_purpose_resident", None)
         if resident is None:
             resident = displayFrameWidget._hydration_purpose_resident.__get__(
@@ -1395,7 +1434,47 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if record is None:
             record = displayFrameWidget._record_hydration_completion.__get__(
                 self, type(self))
-        for label_key, purpose_key in completed_pending_keys:
+        completed_parts = []
+        for pending_key in completed_pending_keys:
+            if not isinstance(pending_key, tuple) or len(pending_key) < 2:
+                continue
+            label_key, purpose_key = pending_key[:2]
+            consumer_key = pending_key[2] if len(pending_key) >= 3 else None
+            completed_parts.append((label_key, purpose_key, consumer_key))
+
+        recorded_stale_overlay = set()
+        if generation != current_generation:
+            overlay_labels = []
+            for label_key, purpose_key, consumer_key in completed_parts:
+                if consumer_key != ConsumerKind.OVERLAY_1D.value:
+                    continue
+                success = bool(resident(label_key, purpose_key))
+                record(
+                    label_key,
+                    purpose_key,
+                    success=success,
+                    generation=current_generation,
+                )
+                recorded_stale_overlay.add((label_key, purpose_key))
+                if success:
+                    overlay_labels.append(label_key)
+            if not overlay_labels:
+                return
+            append_queue = getattr(
+                self, "_overlay_hydrated_pending_append_labels", None)
+            if append_queue is None:
+                append_queue = deque()
+                self._overlay_hydrated_pending_append_labels = append_queue
+            queued = set(append_queue)
+            for label_key in label_keys:
+                if label_key in overlay_labels and label_key not in queued:
+                    append_queue.append(label_key)
+                    queued.add(label_key)
+            generation = current_generation
+
+        for label_key, purpose_key, _consumer_key in completed_parts:
+            if (label_key, purpose_key) in recorded_stale_overlay:
+                continue
             record(
                 label_key,
                 purpose_key,
@@ -4027,6 +4106,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.frame_names = []
         self.overlaid_idxs = []
         self._waterfall_history = None
+        pending_overlay = getattr(self, "_overlay_hydrated_pending_append_labels", None)
+        if pending_overlay is not None:
+            pending_overlay.clear()
         clear_pins = getattr(self, "_clear_pinned_slice_cuts", None)
         if callable(clear_pins):
             clear_pins(clear_history=False)

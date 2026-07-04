@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import logging
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
 
@@ -63,6 +63,8 @@ __all__ = [
     "DataTier",
     "ReadStatus",
     "ReadPolicyAction",
+    "HydrationSupersedeAction",
+    "SupersedeReason",
     "ConsumerKind",
     "LoadStatus",
     "PanelRole",
@@ -95,6 +97,7 @@ __all__ = [
     "resolve_render_ids",
     "resolve_frame_data",
     "read_policy_action",
+    "hydration_supersede_action",
     "choose_raw_source",
     "apply_mask_for",
     "x_axis_for_unit",
@@ -329,8 +332,21 @@ class ReadPolicyAction(Enum):
     ANNOTATE = "annotate"
 
 
+class HydrationSupersedeAction(Enum):
+    CANCEL = "cancel"
+    COMPLETE_AND_APPEND = "complete-and-append"
+
+
+class SupersedeReason(Enum):
+    SELECTION = "selection"
+    RESET = "reset"
+    SCAN_SWITCH = "scan-switch"
+    GENERATION = "generation"
+
+
 class ConsumerKind(Enum):
     PLOT_1D = "plot_1d"
+    OVERLAY_1D = "overlay_1d"
     RAW_2D = "raw_2d"
     CAKE_2D = "cake_2d"
     IMAGE_VIEWER = "image_viewer"
@@ -448,6 +464,8 @@ class WaterfallHistory:
     #                          the display unit doesn't always round-trip through
     #                          x_axis_for_unit, e.g. the 2θ conversion's symbol)
     metadata: tuple = ()     # per-row scan metadata, row order == ids
+    _row_buffer: "np.ndarray | None" = field(default=None, repr=False, compare=False)
+    _row_capacity: int = field(default=0, repr=False, compare=False)
 
     @property
     def count(self) -> int:
@@ -561,6 +579,48 @@ def _dedup_first(ids, names, rows, metadata=None):
     return ki, kn, kr, km
 
 
+def _waterfall_capacity(required):
+    required = max(0, int(required))
+    if required <= 0:
+        return 0
+    capacity = 1
+    while capacity < required:
+        capacity *= 2
+    return capacity
+
+
+def _new_waterfall_row_buffer(count, width):
+    capacity = _waterfall_capacity(count)
+    if capacity <= 0:
+        return np.empty((0, int(width)), dtype=float)
+    return np.empty((capacity, int(width)), dtype=float)
+
+
+def _history_row_buffer(history, width):
+    count = len(getattr(history, "ids", ()) or ())
+    buffer = getattr(history, "_row_buffer", None)
+    if (
+        buffer is None
+        or getattr(buffer, "ndim", 0) != 2
+        or int(buffer.shape[1]) != int(width)
+        or int(buffer.shape[0]) < count
+    ):
+        buffer = _new_waterfall_row_buffer(count, width)
+        rows = np.asarray(getattr(history, "rows", ()), dtype=float)
+        if count and rows.size:
+            buffer[:count] = np.atleast_2d(rows)[:count]
+    return buffer
+
+
+def _waterfall_history_from_buffer(
+        *, reset_key, unit, label, x, row_buffer, count, ids, names, metadata):
+    rows = row_buffer[:count]
+    return WaterfallHistory(
+        reset_key=reset_key, unit=unit, label=label, x=x, rows=rows,
+        ids=tuple(ids), names=tuple(names), metadata=tuple(metadata),
+        _row_buffer=row_buffer, _row_capacity=int(row_buffer.shape[0]))
+
+
 def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
                          label="", metadata=None, replace_ids=(), drop_ids=()):
     """Pure, append-only Overlay/Waterfall accumulator keyed on ``reset_key`` (the
@@ -619,24 +679,33 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
     if (history is None
             or not _reset_keys_compatible(history.reset_key, reset_key)):
         ki, kn, kr, km = _dedup_first(ids, names, rows, metadata)
-        return WaterfallHistory(
+        count = len(ki)
+        row_buffer = _new_waterfall_row_buffer(count, x.size)
+        if count:
+            row_buffer[:count] = np.asarray(kr, dtype=float)
+        return _waterfall_history_from_buffer(
             reset_key=reset_key, unit=unit, label=label, x=x,
-            rows=(np.asarray(kr, dtype=float) if kr
-                  else np.empty((0, x.size), dtype=float)),
-            ids=tuple(ki), names=tuple(kn), metadata=tuple(km))
+            row_buffer=row_buffer, count=count, ids=ki, names=kn,
+            metadata=km)
 
     # Same identity: keep the accumulated rows; relabel the grid on a unit toggle
     # (incoming x is the same sample grid in the new unit), then append new ids.
     base_x = (x if history.unit != unit and x.size == history.x.size
               else history.x)
-    base_rows = history.rows
     out_ids = list(history.ids)
     out_names = list(history.names)
     out_meta = list(getattr(history, "metadata", ()) or ())
     if len(out_meta) < len(out_ids):
         out_meta.extend(_freeze_metadata(None) for _ in range(len(out_ids) - len(out_meta)))
-    out_rows = list(np.atleast_2d(base_rows).copy()) if base_rows.size else []
+    count = len(out_ids)
+    row_buffer = _history_row_buffer(history, base_x.size)
     index_by_key = {_dedup_key(i): pos for pos, i in enumerate(out_ids)}
+    required = count + len(ids)
+    if required > row_buffer.shape[0]:
+        new_buffer = _new_waterfall_row_buffer(required, base_x.size)
+        if count:
+            new_buffer[:count] = row_buffer[:count]
+        row_buffer = new_buffer
 
     for i, n, r, m in zip(ids, names, rows, metadata):
         key = _dedup_key(i)
@@ -654,16 +723,22 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
         if key in index_by_key:
             if key in replace_keys:
                 pos = index_by_key[key]
-                if 0 <= pos < len(out_rows):
-                    out_rows[pos] = r
+                if 0 <= pos < count:
+                    row_buffer[pos] = r
                     out_names[pos] = n
                     out_meta[pos] = m
             continue
-        index_by_key[key] = len(out_ids)
+        if count >= row_buffer.shape[0]:
+            new_buffer = _new_waterfall_row_buffer(max(1, count + 1), base_x.size)
+            if count:
+                new_buffer[:count] = row_buffer[:count]
+            row_buffer = new_buffer
+        index_by_key[key] = count
         out_ids.append(i)
         out_names.append(n)
         out_meta.append(m)
-        out_rows.append(r)
+        row_buffer[count] = r
+        count += 1
 
     # OV-7b: drop the requested rows (the absorbed live "current" cut) so it does
     # not linger in the append-only accumulator as a duplicate of its pin.
@@ -672,15 +747,14 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
         out_ids = [out_ids[j] for j in keep]
         out_names = [out_names[j] for j in keep]
         out_meta = [out_meta[j] for j in keep]
-        out_rows = [out_rows[j] for j in keep]
+        if keep:
+            row_buffer[:len(keep)] = row_buffer[keep]
+        count = len(keep)
 
-    new_rows = (np.atleast_2d(np.asarray(out_rows, dtype=float))
-                if out_rows else np.empty((0, base_x.size), dtype=float))
-
-    return WaterfallHistory(
-        reset_key=reset_key, unit=unit, label=label, x=base_x, rows=new_rows,
-        ids=tuple(out_ids), names=tuple(out_names),
-        metadata=tuple(out_meta))
+    return _waterfall_history_from_buffer(
+        reset_key=reset_key, unit=unit, label=label, x=base_x,
+        row_buffer=row_buffer, count=count, ids=out_ids, names=out_names,
+        metadata=out_meta)
 
 
 def waterfall_display_rows(rows, ids, max_rows):
@@ -1302,19 +1376,33 @@ def resolve_frame_data(
     return ReadResult(key, tier_needed, ReadStatus.ABSENT, source="absent")
 
 
-def read_policy_action(consumer_kind, status, *, method=None, has_accumulator=False):
-    """Single display policy table for typed read outcomes."""
-    if isinstance(consumer_kind, PanelRole):
-        consumer_kind = {
+def _consumer_kind(value):
+    if isinstance(value, PanelRole):
+        return {
             PanelRole.PLOT_1D: ConsumerKind.PLOT_1D,
             PanelRole.RAW_2D: ConsumerKind.RAW_2D,
             PanelRole.CAKE_2D: ConsumerKind.CAKE_2D,
-        }.get(consumer_kind, ConsumerKind.PLOT_1D)
-    elif not isinstance(consumer_kind, ConsumerKind):
-        try:
-            consumer_kind = ConsumerKind(str(consumer_kind))
-        except ValueError:
-            consumer_kind = ConsumerKind.PLOT_1D
+        }.get(value, ConsumerKind.PLOT_1D)
+    if isinstance(value, ConsumerKind):
+        return value
+    try:
+        return ConsumerKind(str(value))
+    except ValueError:
+        return ConsumerKind.PLOT_1D
+
+
+def _supersede_reason(value):
+    if isinstance(value, SupersedeReason):
+        return value
+    try:
+        return SupersedeReason(str(value))
+    except ValueError:
+        return SupersedeReason.GENERATION
+
+
+def read_policy_action(consumer_kind, status, *, method=None, has_accumulator=False):
+    """Single display policy table for typed read outcomes."""
+    consumer_kind = _consumer_kind(consumer_kind)
     if not isinstance(status, ReadStatus):
         status = ReadStatus(str(status))
 
@@ -1330,6 +1418,25 @@ def read_policy_action(consumer_kind, status, *, method=None, has_accumulator=Fa
     if consumer_kind in (ConsumerKind.IMAGE_VIEWER, ConsumerKind.NEXUS_VIEWER):
         return ReadPolicyAction.ANNOTATE if status is ReadStatus.ABSENT else ReadPolicyAction.BLANK_AWAIT
     return ReadPolicyAction.BLANK_AWAIT
+
+
+def hydration_supersede_action(consumer_kind, reason):
+    """Policy for queued async hydrations when a newer display generation exists.
+
+    Ordinary consumers are latest-wins: stale queued work is cancelled.  Overlay
+    1D is additive, so a request made by a previous selection is still wanted by
+    the accumulator and must finish in request order.  Hard boundaries (reset,
+    scan switch, explicit generation cancellation) still cancel it so old scans
+    cannot append after the display identity changed.
+    """
+    consumer_kind = _consumer_kind(consumer_kind)
+    reason = _supersede_reason(reason)
+    if (
+        consumer_kind is ConsumerKind.OVERLAY_1D
+        and reason is SupersedeReason.SELECTION
+    ):
+        return HydrationSupersedeAction.COMPLETE_AND_APPEND
+    return HydrationSupersedeAction.CANCEL
 
 
 def overlay_read_failure_action(method, has_accumulator):

@@ -18,11 +18,29 @@ the late result.  The worker itself never reaches into GUI state.
 
 import logging
 from collections import deque
+from dataclasses import dataclass
 from threading import Condition
 
 from pyqtgraph import Qt
 
+from .display_logic import (
+    ConsumerKind,
+    HydrationSupersedeAction,
+    SupersedeReason,
+    hydration_supersede_action,
+)
+
 logger = logging.getLogger(__name__)
+
+_MAX_PENDING_REQUESTS = 64
+
+
+@dataclass
+class _HydrationRequest:
+    labels: tuple
+    generation: int
+    purpose: str
+    consumer: ConsumerKind
 
 
 class FrameHydrationWorker(Qt.QtCore.QThread):
@@ -49,7 +67,7 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
         self._store = store
         self._cond = Condition()
         self._queue: deque = deque()
-        self._queued: set[tuple[object, int, str]] = set()
+        self._queued: set[tuple[object, int, str, ConsumerKind]] = set()
         self._newest_gen = -1        # highest generation ever requested (P3)
         self._stop = False
 
@@ -66,61 +84,102 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
             return (source,)
         return tuple(store for store in source if store is not None)
 
-    def _drain_stale_locked(self) -> None:
+    @staticmethod
+    def _consumer(value):
+        if isinstance(value, ConsumerKind):
+            return value
+        try:
+            return ConsumerKind(str(value))
+        except ValueError:
+            return ConsumerKind.PLOT_1D
+
+    @staticmethod
+    def _reason(value):
+        if isinstance(value, SupersedeReason):
+            return value
+        try:
+            return SupersedeReason(str(value))
+        except ValueError:
+            return SupersedeReason.GENERATION
+
+    @staticmethod
+    def _token(label, generation, purpose, consumer):
+        return (label, int(generation), str(purpose or "full"), consumer)
+
+    def _discard_locked(self, request: _HydrationRequest) -> None:
+        for label in request.labels:
+            self._queued.discard(
+                self._token(label, request.generation,
+                            request.purpose, request.consumer))
+
+    def _drain_stale_locked(self, reason=SupersedeReason.GENERATION) -> None:
         if not self._queue:
             return
-        self._queue = deque(
-            token for token in self._queue if int(token[1]) >= self._newest_gen
-        )
-        self._queued = set(self._queue)
+        reason = self._reason(reason)
+        keep = deque()
+        for request in self._queue:
+            if int(request.generation) >= self._newest_gen:
+                keep.append(request)
+                continue
+            action = hydration_supersede_action(request.consumer, reason)
+            if action is HydrationSupersedeAction.COMPLETE_AND_APPEND:
+                keep.append(request)
+            else:
+                self._discard_locked(request)
+        self._queue = keep
 
-    def cancel_stale_before(self, generation: int) -> None:
+    def _trim_pending_locked(self) -> None:
+        while len(self._queue) > _MAX_PENDING_REQUESTS:
+            self._discard_locked(self._queue.popleft())
+
+    def cancel_stale_before(
+            self, generation: int,
+            *, reason=SupersedeReason.GENERATION) -> None:
         """Drop queued work from generations older than ``generation``."""
         generation = int(generation)
         with self._cond:
             if generation > self._newest_gen:
                 self._newest_gen = generation
-            self._drain_stale_locked()
+            self._drain_stale_locked(reason)
             self._cond.notify()
 
-    def request(self, label, generation: int, *, purpose: str = "full") -> None:
+    def request(
+            self, label, generation: int, *, purpose: str = "full",
+            consumer=ConsumerKind.PLOT_1D,
+            supersede_reason=SupersedeReason.SELECTION) -> None:
         """Enqueue a hydration request (non-blocking; returns immediately)."""
         generation = int(generation)
         purpose = str(purpose or "full")
+        consumer = self._consumer(consumer)
+        supersede_reason = self._reason(supersede_reason)
         with self._cond:
             if self._stop:
                 return
             if generation > self._newest_gen:
                 self._newest_gen = generation
-                self._drain_stale_locked()
-            token = (label, generation, purpose)
+                self._drain_stale_locked(supersede_reason)
+            token = self._token(label, generation, purpose, consumer)
             if token in self._queued:
                 return
             self._queued.add(token)
-            self._queue.append(token)
+            if (
+                purpose == "1d"
+                and self._queue
+                and self._queue[-1].generation == generation
+                and self._queue[-1].purpose == purpose
+                and self._queue[-1].consumer is consumer
+            ):
+                self._queue[-1].labels = (*self._queue[-1].labels, label)
+            else:
+                self._queue.append(
+                    _HydrationRequest((label,), generation, purpose, consumer))
+            self._trim_pending_locked()
             self._cond.notify()
 
     def _pop_batch_locked(self):
-        label, generation, purpose = self._queue.popleft()
-        self._queued.discard((label, generation, purpose))
-        labels = [label]
-        if purpose != "1d":
-            return labels, generation, purpose
-
-        keep = deque()
-        while self._queue:
-            next_label, next_generation, next_purpose = self._queue.popleft()
-            token = (next_label, next_generation, next_purpose)
-            if next_generation < self._newest_gen:
-                self._queued.discard(token)
-                continue
-            if next_generation == generation and next_purpose == purpose:
-                labels.append(next_label)
-                self._queued.discard(token)
-                continue
-            keep.append(token)
-        self._queue = keep
-        return labels, generation, purpose
+        request = self._queue.popleft()
+        self._discard_locked(request)
+        return list(request.labels), request.generation, request.purpose, request.consumer
 
     def _hydrate_full(self, label) -> bool:
         hydrated = False
@@ -155,9 +214,14 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
                     self._cond.wait()
                 if self._stop:
                     return
-                labels, generation, purpose = self._pop_batch_locked()
+                labels, generation, purpose, consumer = self._pop_batch_locked()
                 newest = self._newest_gen
-            if generation < newest:
+            if (
+                generation < newest
+                and hydration_supersede_action(
+                    consumer, SupersedeReason.SELECTION
+                ) is HydrationSupersedeAction.CANCEL
+            ):
                 # P3 coalesce: a newer selection/mode superseded this request,
                 # so don't even hit disk for a frame the user already scrolled
                 # past — the GUI would drop the result anyway.

@@ -7,6 +7,7 @@ frame shape is unknown, and a detection-failure fallback to today's 64.
 
 import xrd_tools.core.staging as hw
 from xrd_tools.core import heavy_window, heavy_window_log_line
+from xrd_tools.core import live_record_store_max_items, live_record_trace_bytes
 
 GiB = 1024 ** 3
 MiB = 1024 ** 2
@@ -92,6 +93,36 @@ def test_shape_unknown_uses_ram_tiers():
 
 def test_zero_or_negative_frame_bytes_falls_to_tiers():
     assert heavy_window(0, total_ram_bytes=8 * GiB, env={}) == 16
+
+
+# ── BW-A6: byte-budgeted live 1D record-store count ─────────────────────────
+def test_live_record_store_count_uses_two_gib_cap():
+    trace = live_record_trace_bytes(3000)
+    assert trace == 3000 * 8 * 9
+    assert live_record_store_max_items(
+        3000, total_ram_bytes=128 * GiB
+    ) == max(4096, int((2 * GiB) / trace))
+
+
+def test_live_record_store_count_uses_five_percent_ram_budget():
+    trace = live_record_trace_bytes(3000)
+    assert live_record_store_max_items(
+        3000, total_ram_bytes=24 * GiB
+    ) == max(4096, int((0.05 * 24 * GiB) / trace))
+
+
+def test_live_record_store_count_keeps_4096_floor():
+    assert live_record_store_max_items(
+        30000, total_ram_bytes=4 * GiB
+    ) == 4096
+    assert live_record_store_max_items(
+        3000, total_ram_bytes=None
+    ) >= 4096
+
+
+def test_live_record_trace_bytes_falls_back_to_3000_points():
+    assert live_record_trace_bytes(None) == live_record_trace_bytes(3000)
+    assert live_record_trace_bytes(-1) == live_record_trace_bytes(3000)
 
 
 # ── the run-start log line ──────────────────────────────────────────────────

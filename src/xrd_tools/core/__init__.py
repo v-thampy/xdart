@@ -41,6 +41,8 @@ from xrd_tools.core.filters import compile_filter
 from xrd_tools.core.staging import (
     heavy_window,
     heavy_window_log_line,
+    live_record_store_max_items,
+    live_record_trace_bytes,
     reduction_worker_cap,
     reduction_worker_cap_log_line,
     total_physical_ram_bytes,

@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from pyqtgraph import Qt
+from xdart.gui.tabs.static_scan.display_logic import ConsumerKind, SupersedeReason
 from xdart.gui.tabs.static_scan.frame_hydration_worker import FrameHydrationWorker
 from xrd_tools.core import (
     FrameRecord,
@@ -158,6 +159,91 @@ def test_worker_batches_same_generation_1d_requests(qapp):
         worker.stop()
     assert calls == [(1, 2, 3)]
     assert emitted == [((1, 2, 3), 5)]
+
+
+def test_worker_overlay_1d_keeps_selection_superseded_requests_in_order(qapp):
+    calls = []
+    emitted = []
+    done = threading.Event()
+
+    class Store:
+        def get_1d_many_or_hydrate(self, labels):
+            calls.extend(labels)
+            if len(calls) >= 21:
+                done.set()
+            return {label: {"label": label} for label in labels}
+
+    worker = FrameHydrationWorker(Store())
+    worker.sigHydrated.connect(
+        lambda label, gen: emitted.append((label, gen)), _DIRECT)
+    for label in range(21):
+        worker.request(
+            label, label, purpose="1d", consumer=ConsumerKind.OVERLAY_1D,
+            supersede_reason=SupersedeReason.SELECTION)
+    worker.start()
+    try:
+        assert done.wait(5.0)
+        time.sleep(0.1)
+    finally:
+        worker.stop()
+
+    assert calls == list(range(21))
+    assert emitted == [((label,), label) for label in range(21)]
+
+
+def test_worker_overlay_1d_scan_switch_cancels_old_pending(qapp):
+    calls = []
+    done = threading.Event()
+
+    class Store:
+        def get_1d_many_or_hydrate(self, labels):
+            calls.extend(labels)
+            done.set()
+            return {label: {"label": label} for label in labels}
+
+    worker = FrameHydrationWorker(Store())
+    for label in range(5):
+        worker.request(
+            label, 1, purpose="1d", consumer=ConsumerKind.OVERLAY_1D,
+            supersede_reason=SupersedeReason.SELECTION)
+    worker.cancel_stale_before(2, reason=SupersedeReason.SCAN_SWITCH)
+    worker.request(
+        99, 2, purpose="1d", consumer=ConsumerKind.OVERLAY_1D,
+        supersede_reason=SupersedeReason.SELECTION)
+    worker.start()
+    try:
+        assert done.wait(5.0)
+        time.sleep(0.1)
+    finally:
+        worker.stop()
+
+    assert calls == [99]
+
+
+def test_worker_compacts_large_same_generation_1d_burst(qapp):
+    calls = []
+    done = threading.Event()
+
+    class Store:
+        def get_1d_many_or_hydrate(self, labels):
+            calls.append(tuple(labels))
+            done.set()
+            return {label: {"label": label} for label in labels}
+
+    worker = FrameHydrationWorker(Store())
+    for label in range(3621):
+        worker.request(
+            label, 7, purpose="1d", consumer=ConsumerKind.OVERLAY_1D,
+            supersede_reason=SupersedeReason.SELECTION)
+
+    assert len(worker._queue) == 1
+    worker.start()
+    try:
+        assert done.wait(5.0)
+    finally:
+        worker.stop()
+
+    assert calls == [tuple(range(3621))]
 
 
 def test_worker_emits_when_hydrate_yields_none(qapp):
