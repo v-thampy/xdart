@@ -1310,7 +1310,11 @@ def test_overlay_waterfall_payload_reset_key_excludes_active_slice_range():
     assert p1.plot_history.reset_key == p2.plot_history.reset_key
 
 
-def test_overlay_pinned_slice_recipe_and_live_cut_converge_in_one_history():
+def test_overlay_current_cut_absorbed_by_matching_pin_ov7b():
+    # OV-7b: the live "current" slice cut renders ONLY while its c/w differs from
+    # EVERY pin.  When it matches a pin it is ABSORBED (no duplicate trace, no
+    # extra offset slot); it REAPPEARS when the c/w moves to a new value, and is
+    # absorbed AGAIN (with the stale sentinel row dropped) when re-dialed back.
     from xdart.gui.tabs.static_scan.display_overlay_utils import (
         overlay_identity_for_widget,
         overlay_projection_id_for_widget,
@@ -1358,22 +1362,29 @@ def test_overlay_pinned_slice_recipe_and_live_cut_converge_in_one_history():
 
     state = _int_state(store, mode=Mode.INT_2D, method="Overlay", ids=(10,))
     adapter = _adapter(store, widget)
+
+    # current c/w (0.5) == the pinned cut -> ABSORBED: only the pin renders.
     p1 = adapter.plot_payload(state)
     widget._waterfall_history = p1.plot_history
-
-    assert p1.plot_history.count == 2
+    assert p1.plot_history.count == 1                       # not 2 -- no duplicate
     assert p1.plot_history.reset_key == ("radial", 4, True)
     assert "q@χ=0.50±0.60" in p1.traces[0].label
-    assert "current" in p1.traces[1].label
+    assert not any("current" in t.label for t in p1.traces)
     np.testing.assert_allclose(p1.plot_history.rows[0], np.full(4, 0.5))
 
+    # move the c/w to a NEW value (2.5) -> the current REAPPEARS beside the pin.
     center["value"] = 2.5
     p2 = adapter.plot_payload(state)
-
-    assert p2.plot_history.ids == p1.plot_history.ids
+    widget._waterfall_history = p2.plot_history
     assert p2.plot_history.count == 2
-    np.testing.assert_allclose(p2.plot_history.rows[0], np.full(4, 0.5))
-    np.testing.assert_allclose(p2.plot_history.rows[1], np.full(4, 2.5))
+    assert any("current" in t.label for t in p2.traces)
+
+    # re-dial the c/w BACK to the pinned value -> absorbed again, the stale
+    # sentinel row DROPPED from the accumulator (no lingering duplicate).
+    center["value"] = 0.5
+    p3 = adapter.plot_payload(state)
+    assert p3.plot_history.count == 1
+    assert not any("current" in t.label for t in p3.traces)
 
 
 def test_plot_payload_sum_average_emit_n_traces_collapsed_at_render():

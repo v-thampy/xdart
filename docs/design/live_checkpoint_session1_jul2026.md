@@ -124,6 +124,11 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
       axis+npt but a DIFFERENT radial_range (recalibrate or edit the range) — scan B's peaks
       render at their CORRECT q/2θ (aligned to scan A's grid), not shifted; a frame with an empty
       grid does not blank the overlay.
+- [ ] G13 OV-7b Pin-absorbs-current: in Overlay+slice, pin a couple of χ/q cuts on one frame,
+      then Pin the CURRENT c/w — it becomes exactly ONE new pinned trace (no duplicate, no extra
+      offset). Repro: pin χ=18±10 ⇒ TWO traces, not three. Spin the c/w to a new value ⇒ the
+      live "current" cut REAPPEARS; re-dial back to a pinned value ⇒ it disappears again. The
+      live current renders as a gray DASHED line only (no markers), ~50% opacity, "· current".
 
 **PASS ⇒ proceed to RC-8** (merge → tag v1.0.0 → publish; recipe in
 `handoff_chunks_jul2026.md`). Any FAIL: stop, report the item + `kill -USR1 <pid>` stack if a

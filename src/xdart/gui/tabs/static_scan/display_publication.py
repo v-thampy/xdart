@@ -44,6 +44,7 @@ from .display_overlay_utils import (
     overlay_grid_key_for_widget,
     overlay_grid_keys_match,
     overlay_identity_for_widget,
+    overlay_projection_id_for_widget,
     overlay_slice_legend_suffix,
     slice_enabled as _overlay_slice_enabled,
 )
@@ -1042,11 +1043,35 @@ class PublicationDisplayAdapter:
             if label is not None:
                 append_row(label, recipe=recipe, live=False)
 
+        # OV-7b: the live "current" cut uses a SENTINEL projection_id, so it never
+        # matched a pin and always rendered a duplicate (and an extra waterfall
+        # offset slot) when its c/w equalled a pinned cut.  Suppress it whenever
+        # its CONCRETE (axis, center, width) projection_id is already pinned --
+        # which also makes Pin ABSORB the current (pinning c/w X suppresses the
+        # current at X until the spinners move to a new value).
+        suppress_current = False
+        drop_ids = []
+        if slice_active:
+            current_pid = overlay_projection_id_for_widget(
+                widget, axis_info, live=False)
+            if current_pid is not None:
+                pinned_pids = {r.get("projection_id") for r in pinned_recipes}
+                suppress_current = current_pid in pinned_pids
+                if suppress_current:
+                    # Remove any already-accumulated live-cut sentinel rows so the
+                    # absorbed current does not linger as a duplicate of the pin.
+                    for lbl in state.render_ids:
+                        _, live_rid = overlay_identity_for_widget(
+                            widget, lbl, axis_info=axis_info,
+                            projection_id=None, live_slice=True)
+                        drop_ids.append(live_rid)
+
         replace_ids = []
-        for label in state.render_ids:
-            row_id = append_row(label, live=slice_active)
-            if row_id is not None and slice_active:
-                replace_ids.append(row_id)
+        if not suppress_current:
+            for label in state.render_ids:
+                row_id = append_row(label, live=slice_active)
+                if row_id is not None and slice_active:
+                    replace_ids.append(row_id)
 
         if ref_x is None:
             # No resident 1D frame this render: PRESERVE the prior accumulator (the
@@ -1055,6 +1080,13 @@ class PublicationDisplayAdapter:
             # nothing (a different scan/source must not show stale curves).
             if (prior is not None and overlay_grid_keys_match(prior.reset_key, planned_reset_key)
                     and prior.count):
+                if suppress_current and drop_ids:
+                    # OV-7b: still drop the absorbed live cut from the carried prior.
+                    prior = accumulate_waterfall(
+                        prior, reset_key=prior.reset_key, unit=prior.unit,
+                        label=prior.label, x=prior.x,
+                        rows=np.empty((0, np.asarray(prior.x).size), dtype=float),
+                        ids=[], names=[], drop_ids=drop_ids)
                 return self._history_to_payload(prior)
             return None
 
@@ -1063,7 +1095,7 @@ class PublicationDisplayAdapter:
         history = accumulate_waterfall(
             prior, reset_key=reset_key, unit=unit, label=label,
             x=ref_x, rows=np.asarray(rows, dtype=float), ids=ids, names=names,
-            metadata=metadata, replace_ids=replace_ids)
+            metadata=metadata, replace_ids=replace_ids, drop_ids=drop_ids)
         return self._history_to_payload(history)
 
     def _history_to_payload(self, history):

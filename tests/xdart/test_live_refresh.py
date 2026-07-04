@@ -5924,10 +5924,16 @@ def test_live_current_slice_trace_is_gray_lightweight_and_skips_palette():
 
     assert len(calls) == 3
     assert _rgb(calls[0]["pen"]) == (10, 20, 30)
+    assert calls[0]["pen"].style() == QtCore.Qt.SolidLine
+    assert calls[0]["symbolSize"] == 4
+    # OV-7b (c): the "· current" cut is a gray DASHED LINE ONLY (no marker) at
+    # ~50% opacity, and it SKIPS the palette (so calls[2] gets the 2nd color).
     assert _rgb(calls[1]["pen"]) in {(95, 95, 95), (170, 170, 170)}
     assert calls[1]["pen"].style() == QtCore.Qt.DashLine
     assert calls[1]["pen"].widthF() == pytest.approx(1.0)
-    assert calls[1]["symbolSize"] == 3
+    assert calls[1]["pen"].color().alpha() == 127          # 50% opacity
+    assert calls[1].get("symbol") is None                  # markersize 0
+    assert "symbolSize" not in calls[1]                    # no marker at all
     assert _rgb(calls[2]["pen"]) == (40, 50, 60)
     assert calls[2]["pen"].style() == QtCore.Qt.SolidLine
     assert calls[2]["symbolSize"] == 4

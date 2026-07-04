@@ -1307,19 +1307,22 @@ class DisplayPlotMixin:
         self.curves = []
         for frame_id in frame_ids:
             current = self._is_live_current_trace(frame_id)
-            color = self._current_trace_color() if current else next(colors)
-            pen = pg.mkPen(
-                color=color,
-                width=1.0 if current else 1.4,
-                style=Qt.QtCore.Qt.DashLine if current else Qt.QtCore.Qt.SolidLine,
-            )
-            self.curves.append(self.plot.plot(
-                pen=pen,
-                symbolBrush=color,
-                symbolPen=color,
-                symbolSize=3 if current else 4,
-                name=frame_id,
-            ))
+            if current:
+                # OV-7b (c): the live "current" cut is a dashed LINE ONLY (no
+                # markers), palette-neutral gray at 50% opacity, "... · current".
+                base = self._current_trace_color()
+                color = (base[0], base[1], base[2], 127)  # 50% opacity
+                pen = pg.mkPen(color=color, width=1.0,
+                               style=Qt.QtCore.Qt.DashLine)
+                self.curves.append(self.plot.plot(
+                    pen=pen, symbol=None, name=frame_id))
+            else:
+                color = next(colors)
+                pen = pg.mkPen(color=color, width=1.4,
+                               style=Qt.QtCore.Qt.SolidLine)
+                self.curves.append(self.plot.plot(
+                    pen=pen, symbolBrush=color, symbolPen=color,
+                    symbolSize=4, name=frame_id))
 
         if not self.ui.showLegend.isChecked():
             self.legend.clear()

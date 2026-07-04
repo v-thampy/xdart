@@ -562,7 +562,7 @@ def _dedup_first(ids, names, rows, metadata=None):
 
 
 def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
-                         label="", metadata=None, replace_ids=()):
+                         label="", metadata=None, replace_ids=(), drop_ids=()):
     """Pure, append-only Overlay/Waterfall accumulator keyed on ``reset_key`` (the
     payload-owned successor to ``update_plot_accumulator`` + the widget triple).
 
@@ -600,6 +600,10 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
         metadata.extend([None] * (len(ids) - len(metadata)))
     metadata = [_freeze_metadata(m) for m in metadata[:len(ids)]]
     replace_keys = {_dedup_key(i) for i in (replace_ids or ())}
+    # OV-7b: rows to REMOVE from the accumulator this render -- the live "current"
+    # slice cut once its c/w matches a pin (the transient sentinel row must not
+    # linger as a duplicate of the pin).  Empty by default => no behaviour change.
+    drop_keys = {_dedup_key(i) for i in (drop_ids or ())}
 
     # S-17: an empty incoming grid carries nothing to accumulate -- it must never
     # WIPE a compatible accumulator (the "one empty publication blanks the
@@ -660,6 +664,15 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
         out_names.append(n)
         out_meta.append(m)
         out_rows.append(r)
+
+    # OV-7b: drop the requested rows (the absorbed live "current" cut) so it does
+    # not linger in the append-only accumulator as a duplicate of its pin.
+    if drop_keys:
+        keep = [j for j, i in enumerate(out_ids) if _dedup_key(i) not in drop_keys]
+        out_ids = [out_ids[j] for j in keep]
+        out_names = [out_names[j] for j in keep]
+        out_meta = [out_meta[j] for j in keep]
+        out_rows = [out_rows[j] for j in keep]
 
     new_rows = (np.atleast_2d(np.asarray(out_rows, dtype=float))
                 if out_rows else np.empty((0, base_x.size), dtype=float))
