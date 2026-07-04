@@ -467,3 +467,70 @@ Two verification agents + orchestrator spot-checks of the material claims agains
 9. Full gate (core + full offscreen xdart + spine 71 + byte-compat) at the frozen candidate SHA
    on the Mac — sandbox cannot execute the GUI suites.
 10. Session-1 live checklist (now G1–G16) → tag.
+
+---
+
+# ADDENDUM 2 — Round-3 verification (2026-07-04, tip `c79a7434`)
+
+Commits verified: `6f0b726f` (BW-A4 bundle: S-9/S-10/S-12 + unbilled S-8/S-11), `0c378f46` (S-3),
+`457dcf53` (S-7), `c79a7434` (S-4).
+
+## Verdicts
+- **S-12 CLOSES** — all five sites lock-outer (order-asserting tests added); full pause-caller
+  audit clean, no inversion remains.
+- **S-8 CLOSES** — parsed `(scan_name, index)` filter + zero-discovered warning, trap-pinning
+  tests (`'-'<'_'`, `frame_2`/`frame_10`).
+- **S-11 CLOSES for the image wrangler** — `set_max_heavy_items` wired at session create AND
+  reuse; heavy-window cache keyed by `(detector_shape, frame_bytes, env)` (Pilatus→Eiger closed);
+  env-override-free test. Verify the nexusThread session path also resizes the store.
+- **S-10 CLOSES starvation** — recompute keyed to the persisted-set signature (fires per flush,
+  not per drain tick). Residual [MINOR-SERIOUS]: the `file_lock` hold is still monolithic for the
+  whole full-stack read (`scan_aggregate.py:243-267`) — multi-second writer stall once per flush
+  per key on huge 2D scans; chunk the lock if Session-1 shows stutter.
+- **S-9 PARTIAL** — image wrangler closed (`_active_scan` handoff, `_cache_lock`-snapshotted
+  tail, data_file guard, cleared on run end). **[SERIOUS] NeXus wrangler still open AND now
+  frozen:** `nexusThread` never sets `_active_scan` → tail falls back to the GUI scan (empty) AND
+  the new persisted-set generation signature is CONSTANT on the GUI scan → a live NeXus Overall
+  aggregate computes once and never refreshes for the whole run (pre-commit it at least tracked
+  flushes). **Fix (1 line):** set `self._active_scan = scan` in nexusThread's `initialize_scan`.
+  [MINOR] GUI-side `_aggregate_data_signature` reads `frames._persisted` without `_cache_lock`.
+- **S-3 CLOSES as scoped** — chi_offset/monitor/polarization/error_model ×(1d,2d) + gi_incidence,
+  per-field `_UNSET` fail-open both sides, float round-12, monitor case-insensitive; written
+  config carries the fields (not permanently fail-open); no byte-compat impact. Gaps: mask+PONI
+  omission is rationalized only in the commit message — add a ledger row for the follow-up; the
+  required MIGRATION line for the stricter gate is NOT yet in MIGRATION.md (riding S-21).
+- **S-7 CLOSES** — gi-bearing scan through the real writer, `config/gi` asserted both ways,
+  honest MIGRATION disclosure. [NOTE] assertion test, not a byte-parity pin of gi_config content.
+- **S-4 PARTIAL — one NEW BLOCKER-class finding.**
+  The output half is right (Integration1DPlan.azimuth_offset; readiness stops shifting; reduction
+  relabels `r1d.radial` for chi_deg only; GI zeroed; G18 ship-gate honestly tracked). But the
+  input half of the 2D mirror is MISSING: the 2D shifts an explicit panel-frame `azimuth_range`
+  by −offset at input (`_integration_azimuth_range`, core.py:2524-2533) and re-adds at output;
+  the new 1D Mode-A branch passes `p1.azimuth_range` RAW into `integrate_radial`
+  (core.py:2390-2391) then relabels output +offset. With default chi_offset=90 an explicit χ
+  range (0,90) read off the offset-labeled axes now integrates raw (0,90) = panel (90,180) — 90°
+  from the 2D, from pre-fix behavior, and from the user's intent. Auto and full-domain are
+  unaffected — which is exactly why every committed test AND an auto-only G18 validation would
+  miss it. *(Orchestrator-verified in source.)* **Fix:** 1D analogue of
+  `_integration_azimuth_range` in the Mode-A branch + a mirror of the 2D test
+  (test_reduction.py:387/409) + include an EXPLICIT PARTIAL range in the G18 real-data harness.
+  **[SERIOUS] legacy plan builder diverges:** `plan_from_live_scan`
+  (xdart/modules/reduction.py:303-310) still pre-shifts the 1D input and never sets
+  azimuth_offset — flipping `XDART_CONTROLS_PANEL_V2`/`XDART_CONTROLS_V2_NATIVE_RUN_PLAN` to "0"
+  silently changes written 1D χ data; `test_reduction_adapters.py:358` pins the stale behavior.
+  Port the fix or hard-deprecate the fallback. [SERIOUS-disclosure] changed written χ axes +
+  Append-onto-pre-S-4-χ-file backstop bounce undisclosed — MIGRATION sweep. [NOTE]
+  `_native_offset_range` (readiness.py:1193) now dead.
+
+## Remaining before tag (round-3 update)
+1. S-4 input-shift half + explicit-partial-range test + G18 harness amendment (blocker-class).
+2. Port S-4 to `plan_from_live_scan` (or kill the env fallback) + fix the stale adapter pin.
+3. nexusThread `_active_scan = scan` (1 line).
+4. S-20 stat-first + `.pdi` plausibility gate (still open from Addendum 1).
+5. S-14 A→B→A nonce/seen-set + contract text (still open).
+6. MIGRATION sweep: S-21 set + S-3 gate line + S-4 χ disclosure + legacy-no-config note + the
+   false "Post-v1.0" header.
+7. Optional: chunk the aggregate lock hold; `_cache_lock` on the signature read; mask/PONI ledger
+   row; nexusThread S-11 resize check; delete `_native_offset_range`; Addendum-1 minors
+   (BW-A2 blind spot, run()-catch, S-16 residuals); CP-v2 small-win batch.
+8. Full gate on the Mac at the frozen SHA → Session-1 (G1–G18, G18 amended) → tag.
