@@ -3266,8 +3266,16 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.slice_center.setToolTip('slice center')
             self.ui.slice_width.setToolTip('slice width')
             if hasattr(self.ui, "pinSlice"):
-                self.ui.pinSlice.setToolTip(
-                    'Pin the current slice cut into the overlay.')
+                try:
+                    method = self.ui.plotMethod.currentText()
+                except Exception:
+                    method = ""
+                tip = (
+                    'Pin the current slice cut into the overlay.'
+                    if method in ("Overlay", "Waterfall")
+                    else 'Pin is available in Overlay or Waterfall mode.'
+                )
+                self.ui.pinSlice.setToolTip(tip)
 
         # Share Axis is keyed to the cake x-axis unit, not the currently
         # selected plotUnit row.  That lets it switch a χ plot back to Q/2θ/qip
@@ -3282,7 +3290,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.slice_center.setEnabled(active)
         self.ui.slice_width.setEnabled(active)
         if hasattr(self.ui, "pinSlice"):
-            self.ui.pinSlice.setEnabled(active)
+            try:
+                method = self.ui.plotMethod.currentText()
+            except Exception:
+                method = ""
+            self.ui.pinSlice.setEnabled(
+                active and method in ("Overlay", "Waterfall"))
         if self.ui.slice.isChecked() and not self._slice_2d_data_ready():
             tip = self._slice_no_2d_tooltip()
             self.ui.slice.setToolTip(tip)

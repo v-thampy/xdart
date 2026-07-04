@@ -1060,6 +1060,172 @@ def test_plot_payload_routes_overlay_waterfall_through_accumulator():
     assert ps.plot_history is None and ps.overlaid_ids is None
 
 
+def test_ov7c_live_current_uses_next_pin_slot_and_pin_freezes_in_place():
+    from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
+    from xdart.gui.tabs.static_scan.display_overlay_utils import (
+        LIVE_SLICE_PROJECTION_ID,
+        overlay_identity_for_widget,
+    )
+    from xdart.gui.tabs.static_scan.display_publication import (
+        PublicationDisplayAdapter)
+    from xdart.gui.tabs.static_scan.display_logic import WaterfallHistory
+    from xdart.modules.frame_publication import (
+        PublicationStore, publication_from_frame_view)
+    from xrd_tools.core import FrameView
+    from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+
+    class _Control:
+        def __init__(self, *, text="", value=None, checked=False, enabled=True):
+            self._text = text
+            self._value = value
+            self._checked = checked
+            self._enabled = enabled
+
+        def currentText(self):
+            return self._text
+
+        def currentIndex(self):
+            return 0
+
+        def text(self):
+            return self._text
+
+        def value(self):
+            return self._value["value"] if isinstance(self._value, dict) else self._value
+
+        def isChecked(self):
+            return self._checked
+
+        def isEnabled(self):
+            return self._enabled
+
+    q = np.linspace(0.5, 3.0, 6, dtype=np.float32)
+    chi = np.asarray([-20.0, -10.0, 0.0, 10.0, 20.0], dtype=np.float32)
+    intensity = np.arange(q.size * chi.size, dtype=np.float32).reshape(q.size, chi.size)
+    view = FrameView.from_results(
+        label=1,
+        result_1d=IntegrationResult1D(
+            radial=q, intensity=np.ones(q.shape, dtype=np.float32),
+            sigma=None, unit="q_A^-1"),
+        result_2d=IntegrationResult2D(
+            radial=q, azimuthal=chi, intensity=intensity,
+            unit="q_A^-1", azimuthal_unit="chi_deg"),
+    )
+    store = PublicationStore(max_heavy_items=None)
+    store.upsert(publication_from_frame_view(view))
+
+    center = {"value": -10.0}
+    axis_info = {"source": "2d", "axis": "radial", "slice_axis": "chi"}
+    repaint_reasons = []
+    widget = SimpleNamespace(
+        scan=SimpleNamespace(name="scan", gi=False, bai_1d_args={}, bai_2d_args={}),
+        normChannel=None,
+        _waterfall_history=None,
+        overlaid_idxs=[],
+        idxs_1d=[1],
+        frame_ids=["1"],
+        _plot_axis_info=(axis_info,),
+        _slice_2d_data_ready=lambda: True,
+        request_current_selection_repaint=lambda **kw: repaint_reasons.append(kw),
+        ui=SimpleNamespace(
+            plotMethod=_Control(text="Overlay"),
+            plotUnit=_Control(text="Q (Å⁻¹)"),
+            imageUnit=_Control(text="χ-Q"),
+            slice=_Control(text="χ (c/w)", checked=True, enabled=True),
+            slice_center=_Control(value=center),
+            slice_width=_Control(value={"value": 2.0}),
+        ),
+    )
+    widget._slice_pin_selection = MethodType(
+        displayFrameWidget._slice_pin_selection, widget)
+    widget._slice_pin_trace_name = MethodType(
+        displayFrameWidget._slice_pin_trace_name, widget)
+    widget.pin_current_slice_cut = MethodType(
+        displayFrameWidget.pin_current_slice_cut, widget)
+    widget._pinned_slice_cut_recipes = lambda: tuple(
+        (getattr(widget, "_pinned_slice_cuts", None) or {}).values())
+
+    def render():
+        state = SimpleNamespace(
+            render_ids=(1,), selected_ids=(1,), generation=1,
+            method="Overlay", overall=False)
+        payload = PublicationDisplayAdapter(
+            store, widget=widget, labels=(1,))._overlay_waterfall_payload(state)
+        assert payload is not None and payload.plot_history is not None
+        widget._waterfall_history = payload.plot_history
+        widget.overlaid_idxs = list(payload.overlaid_ids)
+        return payload
+
+    def pin_at(value):
+        center["value"] = value
+        assert widget.pin_current_slice_cut() is True
+
+    def live_positions(history):
+        return [
+            pos for pos, row_id in enumerate(history.ids)
+            if isinstance(row_id, tuple)
+            and len(row_id) >= 3
+            and row_id[2][0] == LIVE_SLICE_PROJECTION_ID
+        ]
+
+    def pinned_position(history, value):
+        for pos, row_id in enumerate(history.ids):
+            if not (isinstance(row_id, tuple) and len(row_id) >= 3):
+                continue
+            projection = row_id[2]
+            if (isinstance(projection, tuple)
+                    and projection[0] == "chi"
+                    and projection[1] == pytest.approx(value)):
+                return pos
+        raise AssertionError(f"missing pinned center {value}")
+
+    pin_at(-10.0)
+    pin_at(0.0)
+    assert repaint_reasons
+
+    pinned_recipes = tuple(widget._pinned_slice_cuts.values())
+    pinned_ids = tuple(recipe["row_id"] for recipe in pinned_recipes)
+    pinned_names = tuple(recipe["name"] for recipe in pinned_recipes)
+    _grid_key, live_row_id = overlay_identity_for_widget(
+        widget, 1, axis_info=axis_info, projection_id=None, live_slice=True)
+    # Seed the exact residual shape OV-7c closes: a transient live current row
+    # stranded below the pins.  The renderer's y offset is row_index*offset_value,
+    # so the live row must move from slot 0 to slot 2 before it is visible.
+    widget._waterfall_history = WaterfallHistory(
+        reset_key=pinned_recipes[0]["reset_key"],
+        unit="q_A^-1",
+        label="Q",
+        x=q,
+        rows=np.vstack([
+            np.full(q.shape, 90.0),
+            np.full(q.shape, 10.0),
+            np.full(q.shape, 20.0),
+        ]),
+        ids=(live_row_id, *pinned_ids),
+        names=("scan_1 · Q@χ=old · current", *pinned_names),
+        metadata=({}, {}, {}),
+    )
+    widget.overlaid_idxs = list(widget._waterfall_history.ids)
+
+    offset_value = 7.5
+    center["value"] = 10.0
+    payload = render()
+    assert live_positions(payload.plot_history) == [2]
+    assert live_positions(payload.plot_history)[0] * offset_value == pytest.approx(
+        2 * offset_value)
+
+    before_pin_slot = live_positions(payload.plot_history)[0]
+    pin_at(10.0)
+    payload = render()
+    assert live_positions(payload.plot_history) == []
+    assert pinned_position(payload.plot_history, 10.0) == before_pin_slot
+    assert "current" not in payload.plot_history.names[before_pin_slot]
+
+    center["value"] = 20.0
+    payload = render()
+    assert live_positions(payload.plot_history) == [3]
+
+
 def test_overlay_selection_of_evicted_frame_preserves_then_appends():
     from xdart.gui.tabs.static_scan.display_controllers import ScanDisplayController
     from xdart.gui.tabs.static_scan.display_logic import Mode, WaterfallHistory

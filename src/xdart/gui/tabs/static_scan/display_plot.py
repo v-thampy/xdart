@@ -781,6 +781,9 @@ class DisplayPlotMixin:
             self.sigPlotMethodChanged.emit(new_method)
         except Exception:
             logger.debug("sigPlotMethodChanged emit failed", exc_info=True)
+        sync_slice = getattr(self, "_sync_slice_controls", None)
+        if callable(sync_slice):
+            sync_slice()
 
         if getattr(self, 'viewer_mode', None) == 'xye':
             if new_method in ('Single', 'Sum', 'Average'):
@@ -1308,11 +1311,11 @@ class DisplayPlotMixin:
         for frame_id in frame_ids:
             current = self._is_live_current_trace(frame_id)
             if current:
-                # OV-7b (c): the live "current" cut is a dashed LINE ONLY (no
-                # markers), palette-neutral gray at 50% opacity, "... · current".
+                # OV-7b/7c: the live "current" cut is a dashed LINE ONLY (no
+                # markers), palette-neutral gray at 75% opacity, "... · current".
                 base = self._current_trace_color()
-                color = (base[0], base[1], base[2], 127)  # 50% opacity
-                pen = pg.mkPen(color=color, width=1.0,
+                color = (base[0], base[1], base[2], 191)  # 75% opacity
+                pen = pg.mkPen(color=color, width=1.5,
                                style=Qt.QtCore.Qt.DashLine)
                 self.curves.append(self.plot.plot(
                     pen=pen, symbol=None, name=frame_id))

@@ -2873,6 +2873,7 @@ def test_slice_controls_wait_for_binned_data(widget):
     df.scan.gi = False
     df.binned_data = None
     df.clear_slice_overlay()
+    df.ui.plotMethod.setCurrentText("Single")
     df.ui.plotUnit.setCurrentIndex(2)       # χ: slice along the cake radial axis
     df._on_plotUnit_changed()
 
@@ -2893,6 +2894,11 @@ def test_slice_controls_wait_for_binned_data(widget):
     assert df.ui.slice.isEnabled()
     assert df.ui.slice_center.isEnabled()
     assert df.ui.slice_width.isEnabled()
+    assert not df.ui.pinSlice.isEnabled()
+    assert "Overlay or Waterfall" in df.ui.pinSlice.toolTip()
+
+    df.ui.plotMethod.setCurrentText("Overlay")
+    df._on_plotMethod_changed()
     assert df.ui.pinSlice.isEnabled()
 
     df.show_slice_overlay()

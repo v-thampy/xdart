@@ -1162,6 +1162,22 @@ class PublicationDisplayAdapter:
 
         unit = str(getattr(axis, "unit", "") or "")
         label = str(getattr(axis, "label", "") or "")
+        if (slice_active and not suppress_current and replace_ids
+                and prior is not None
+                and overlay_grid_keys_match(prior.reset_key, reset_key)):
+            # OV-7c: the dashed live "current" cut previews the NEXT free
+            # waterfall/overlay offset slot above all pins.  Replacing its
+            # sentinel id in place can strand it in an old slot (for example a
+            # current row that existed before pins were added), so remove any
+            # previous transient row before appending this render's current row.
+            # Pin absorption (suppress_current=True) intentionally does NOT take
+            # this path: the new solid pin appends after the old current and the
+            # drop below removes the current, leaving the pin in the same slot.
+            prior = accumulate_waterfall(
+                prior, reset_key=prior.reset_key, unit=prior.unit,
+                label=prior.label, x=prior.x,
+                rows=np.empty((0, np.asarray(prior.x).size), dtype=float),
+                ids=[], names=[], drop_ids=replace_ids)
         history = accumulate_waterfall(
             prior, reset_key=reset_key, unit=unit, label=label,
             x=ref_x, rows=np.asarray(rows, dtype=float), ids=ids, names=names,
