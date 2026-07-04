@@ -483,10 +483,14 @@ class TestReadImageMetadata:
 
         assert result["sampleName"] == "none-auto"
 
-    def test_structured_metadata_junk_below_threshold_returns_empty(
+    def test_explicit_format_accepts_one_or_two_field_sidecar(
         self,
         tmp_path: Path,
     ) -> None:
+        # BL-3: an EXPLICIT meta_format is a deliberate user choice, so a 1-2
+        # field sidecar must NOT be silently dropped by the AUTO min-pairs=3
+        # plausibility gate (it used to return {} with a misleading "unknown
+        # meta_format" warning).
         image = tmp_path / "scan_0001.tif"
         image.touch()
         sidecar = tmp_path / "scan_0001.metadata"
@@ -494,7 +498,7 @@ class TestReadImageMetadata:
 
         result = read_image_metadata(image, meta_format="metadata")
 
-        assert result == {}
+        assert result == {"alpha": 1, "beta": 2}
 
     def test_structured_metadata_reads_undecodable_values_with_replacement(
         self,

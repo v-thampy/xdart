@@ -16,6 +16,15 @@ MetadataValue = int | float | str
 
 _STRUCTURED_SIDECAR_MIN_PAIRS = 3
 _AUTO_SIDECAR_CACHE: dict[tuple[Path, str], tuple[str, str]] = {}
+# BL-3: auto sidecar discovery considers ONLY these extensions, in this
+# priority order.  Before this, ANY non-image companion (a per-frame ``.poni``
+# with colon pairs, an ``img.tif.log``, pretty-printed JSON) could latch as the
+# metadata sidecar and poison scan_data — and it sorted alphabetically, so junk
+# beat the real ``.txt``.  Explicit ``meta_format`` bypasses this allow-list.
+_AUTO_SIDECAR_EXTENSIONS = ("txt", "pdi", "metadata", "inf")
+# A metadata sidecar is small; anything larger is not one (and reading it wastes
+# I/O + risks parsing binary garbage into ≥3 spurious pairs).
+_AUTO_SIDECAR_MAX_BYTES = 1 << 20  # 1 MiB
 _IMAGE_EXTENSIONS = {
     ".bmp",
     ".cbf",
@@ -164,15 +173,40 @@ def _parse_structured_metadata(text: str) -> tuple[dict[str, MetadataValue], int
     return _parse_linewise_metadata(text)
 
 
+def _looks_like_text(text: str) -> bool:
+    """Reject binary content read with ``errors='replace'`` (BL-3 plausibility).
+
+    Binary bytes decode to U+FFFD and non-printable control chars pile up; a
+    real metadata sidecar has at most a stray one (e.g. a latin-1 µ in a value).
+    So this rejects on a HIGH RATIO of replacement/control chars, not on a single
+    bad byte — a plausible text file with one undecodable value still reads."""
+    if not text:
+        return False
+    n = len(text)
+    bad = text.count("�") + sum(
+        1 for ch in text if ord(ch) < 32 and ch not in "\t\n\r")
+    return bad <= max(4, n // 20)   # tolerate ~5% + a small fixed slack
+
+
 def _read_structured_metadata(path: Path | str) -> tuple[dict[str, MetadataValue], int]:
     """Read a generic structured sidecar with replacement decoding."""
     path = Path(path)
     try:
+        # BL-3: cap size (a metadata sidecar is small) before reading.
+        if path.stat().st_size > _AUTO_SIDECAR_MAX_BYTES:
+            logger.debug("_read_structured_metadata: %s over %d bytes; skipping",
+                         path, _AUTO_SIDECAR_MAX_BYTES)
+            return {}, 0
         text = path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         logger.warning("_read_structured_metadata: failed to read %s", path, exc_info=True)
         return {}, 0
 
+    # BL-3: reject binary content that replacement-decoding would otherwise let
+    # parse into spurious pairs.
+    if not _looks_like_text(text):
+        logger.debug("_read_structured_metadata: %s is not text; skipping", path)
+        return {}, 0
     return _parse_structured_metadata(text)
 
 
@@ -232,9 +266,17 @@ def _find_sidecar(image_path: Path, ext: str) -> Path | None:
     return None
 
 
-def _parse_structured_sidecar_if_plausible(path: Path) -> dict[str, MetadataValue] | None:
+def _parse_structured_sidecar_if_plausible(
+    path: Path, *, min_pairs: int = _STRUCTURED_SIDECAR_MIN_PAIRS,
+) -> dict[str, MetadataValue] | None:
+    """Parse a structured ``name=value`` sidecar if it yields ``>= min_pairs``.
+
+    ``min_pairs`` defaults to the AUTO plausibility threshold (3, so a random
+    companion isn't mistaken for metadata).  An EXPLICIT ``meta_format`` passes
+    ``min_pairs=1`` — a 1–2 field sidecar the user asked for must not be silently
+    dropped (BL-3)."""
     metadata, pair_count = _read_structured_metadata(path)
-    if pair_count >= _STRUCTURED_SIDECAR_MIN_PAIRS:
+    if pair_count >= min_pairs:
         return metadata
     return None
 
@@ -244,8 +286,13 @@ def _read_auto_candidate_metadata(path: Path) -> dict[str, MetadataValue] | None
     ext = path.suffix.lower().lstrip(".")
 
     if ext == "txt":
-        metadata = read_txt_metadata(path)
-        return metadata or None
+        metadata = read_txt_metadata(path)       # SSRL # Counters / # Motors
+        if metadata:
+            return metadata
+        # BL-3: the SSRL .txt parser returns {} for a generic name=value .txt,
+        # which would let a WORSE candidate latch — fall back to the structured
+        # parser so a plausible generic .txt still wins.
+        return _parse_structured_sidecar_if_plausible(path)
 
     if ext == "pdi":
         metadata = read_pdi_metadata(path)
@@ -267,31 +314,28 @@ def _is_non_image_companion(path: Path, image_path: Path) -> bool:
 
 
 def _iter_auto_sidecar_candidates(image_path: Path):
-    """Yield auto sidecar candidates as appended-name, then replaced-stem."""
-    try:
-        entries = sorted(image_path.parent.iterdir(), key=lambda p: p.name)
-    except OSError:
-        return
+    """Yield auto sidecar candidates: allow-listed extensions ONLY, ranked by
+    :data:`_AUTO_SIDECAR_EXTENSIONS`, append-form (``image.tif.<ext>``) before
+    replace-form (``image.<ext>``).
 
+    BL-3: this replaces the old alphabetical scan of EVERY non-image companion
+    (where a per-frame ``.poni`` / ``img.tif.log`` / JSON could sort first and
+    latch as the metadata sidecar).  It also stats the specific candidate paths
+    rather than listing the whole directory (S-20 stat-first)."""
     seen: set[Path] = set()
-    appended_prefix = (image_path.name + ".").lower()
-    for candidate in entries:
-        if (
-            candidate.name.lower().startswith(appended_prefix)
-            and _is_non_image_companion(candidate, image_path)
+    for ext in _AUTO_SIDECAR_EXTENSIONS:
+        append = _existing_path_case_insensitive(Path(str(image_path) + f".{ext}"))
+        replace = _existing_path_case_insensitive(image_path.with_suffix(f".{ext}"))
+        # Preserve the on-disk case in the cached suffix (reconstruction is
+        # case-insensitive either way, but keep it faithful).
+        for candidate, convention, start in (
+            (append, "append", len(image_path.name)),
+            (replace, "replace", len(image_path.stem)),
         ):
-            seen.add(candidate)
-            yield candidate, "append", candidate.name[len(image_path.name):]
-
-    replaced_prefix = (image_path.stem + ".").lower()
-    for candidate in entries:
-        if candidate in seen:
-            continue
-        if (
-            candidate.name.lower().startswith(replaced_prefix)
-            and _is_non_image_companion(candidate, image_path)
-        ):
-            yield candidate, "replace", candidate.name[len(image_path.stem):]
+            if (candidate is not None and candidate not in seen
+                    and _is_non_image_companion(candidate, image_path)):
+                seen.add(candidate)
+                yield candidate, convention, candidate.name[start:]
 
 
 def _auto_sidecar_from_cache(image_path: Path) -> Path | None:
@@ -340,8 +384,12 @@ def _read_auto_metadata(image_path: Path) -> dict[str, MetadataValue]:
         logger.debug("read_image_metadata: no auto sidecar found for %s", image_path)
         return {}
 
-    _, convention, suffix, metadata = discovered
+    candidate, convention, suffix, metadata = discovered
     _AUTO_SIDECAR_CACHE[_auto_cache_key(image_path)] = (convention, suffix)
+    # BL-3: log the convention auto locked onto so a wrong latch is visible in
+    # the run log (it is then applied to EVERY frame via the cache).
+    logger.info("metadata: auto locked onto %s-form '*%s' (%d fields, e.g. %s)",
+                convention, suffix, len(metadata), candidate.name)
     return metadata
 
 
@@ -592,17 +640,21 @@ def read_image_metadata(
         )
         return _read_spec_metadata(image_path, search_dir=search_dir)
 
+    # Any other value is treated as a generic structured-sidecar extension.
     sidecar = _find_sidecar(image_path, meta_format_norm)
-    if sidecar is not None:
-        metadata = _parse_structured_sidecar_if_plausible(sidecar)
-        if metadata is not None:
-            return metadata
-        logger.debug(
-            "read_image_metadata: %s did not look like structured metadata",
-            sidecar,
-        )
-
-    logger.warning("read_image_metadata: unknown meta_format %r", meta_format)
+    if sidecar is None:
+        logger.debug("read_image_metadata: no %r sidecar found for %s",
+                     meta_format, image_path)
+        return {}
+    # BL-3: an EXPLICIT format is a deliberate user choice — accept a 1-2 field
+    # sidecar (the AUTO min-pairs=3 plausibility gate does NOT apply here; before
+    # this, 1-2-pair explicit sidecars were silently dropped with a misleading
+    # "unknown meta_format" warning).
+    metadata = _parse_structured_sidecar_if_plausible(sidecar, min_pairs=1)
+    if metadata is not None:
+        return metadata
+    logger.warning("read_image_metadata: %s (format %r) had no readable "
+                   "key=value fields", sidecar, meta_format)
     return {}
 
 

@@ -116,6 +116,10 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
 - [ ] G10 MEM-3 651-frame baseline stays ~25-26 s at the new default worker cap.
 - [ ] G11 RN-2 live-scale bulk overlay: 3600-frame overlay hydration does not hold `.nxs`
       read-only across writer flush retries.
+- [ ] G11 BL-3 metadata auto-sidecar: with a junk companion present (a per-frame `.poni` /
+      `.tif.log` / oversize / binary alongside the real `.tif.metadata`), the run locks onto the
+      REAL sidecar — log shows `metadata: auto locked onto ...` for the right file, and motors/
+      counters in the `.nxs` are correct (not junk). A 1-2 field explicit sidecar loads.
 
 **PASS ⇒ proceed to RC-8** (merge → tag v1.0.0 → publish; recipe in
 `handoff_chunks_jul2026.md`). Any FAIL: stop, report the item + `kill -USR1 <pid>` stack if a
