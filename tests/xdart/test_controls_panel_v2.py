@@ -1445,6 +1445,39 @@ def test_controls_panel_v2_readiness_summary_shows_only_top_blocker():
     assert "Run needs a frame source" in tooltip
 
 
+def test_run_readiness_label_elides_without_widening_controls(qapp):
+    from xdart.gui.tabs.static_scan.ui.static_controls import StaticControls
+
+    controls = StaticControls()
+    try:
+        controls.set_readiness_summary(
+            "Needs setup · short blocker",
+            ready=False,
+            tooltip="short blocker",
+        )
+        controls.resize(360, controls.sizeHint().height())
+        controls.show()
+        qapp.processEvents()
+        short_hint = controls.sizeHint().width()
+
+        long_reason = "Needs setup · " + ("blocked configuration detail " * 20)
+        controls.set_readiness_summary(
+            long_reason,
+            ready=False,
+            tooltip=long_reason,
+        )
+        controls.resize(360, controls.sizeHint().height())
+        qapp.processEvents()
+
+        assert controls.sizeHint().width() == short_hint
+        assert controls.readinessLabel.text() != long_reason
+        assert controls.readinessLabel.text().endswith("…")
+        assert controls.readinessLabel.toolTip() == long_reason
+    finally:
+        controls.close()
+        controls.deleteLater()
+
+
 def test_controls_panel_v2_cached_scan_poni_satisfies_calibration(
         qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
@@ -1844,10 +1877,13 @@ def test_controls_panel_v2_append_mismatch_same_target_blocks_run(
         assert state.processed_config is not None
         assert profile.can_run is False
         assert any(
-            "processed scan: Standard · current: Grazing" in blocker
+            "processed: Standard · current: Grazing" in blocker
             for blocker in profile.run_blockers
         )
-        assert "processed scan: Standard · current: Grazing" in (
+        widget._refresh_controls_v2_profile_now()
+        assert widget.controls.actionRow.isEnabled() is False
+        assert widget.controls.startButton.isEnabled() is False
+        assert "processed: Standard · current: Grazing" in (
             widget.wrangler._append_config_mismatch_message()
         )
     finally:

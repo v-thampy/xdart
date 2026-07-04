@@ -19,6 +19,51 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 _CPU = os.cpu_count() or 1
 
 
+class _ElidingLabel(QtWidgets.QLabel):
+    """Single-line label whose text never contributes horizontal size pressure."""
+
+    def __init__(self, text='', parent=None):
+        super().__init__(text, parent)
+        self._full_text = str(text or '')
+        self.setMinimumWidth(0)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Ignored,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
+
+    def set_full_text(self, text):
+        self._full_text = str(text or '')
+        self._refresh_elide()
+
+    def full_text(self):
+        return self._full_text
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh_elide()
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        hint.setWidth(0)
+        return hint
+
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        hint.setWidth(0)
+        return hint
+
+    def _refresh_elide(self):
+        width = max(0, self.contentsRect().width() - 2)
+        metrics = self.fontMetrics()
+        text = metrics.elidedText(
+            self._full_text,
+            QtCore.Qt.TextElideMode.ElideRight,
+            width,
+        )
+        if self.text() != text:
+            super().setText(text)
+
+
 class StaticControls(QtWidgets.QWidget):
     """Mode selector + Batch + cores + Live + Start/Pause/Resume + Stop."""
 
@@ -74,7 +119,7 @@ class StaticControls(QtWidgets.QWidget):
         self.readinessDot.setObjectName('runReadinessDot')
         self.readinessDot.setAlignment(QtCore.Qt.AlignCenter)
         readiness.addWidget(self.readinessDot)
-        self.readinessLabel = QtWidgets.QLabel('')
+        self.readinessLabel = _ElidingLabel('')
         self.readinessLabel.setObjectName('runReadinessLabel')
         readiness.addWidget(self.readinessLabel, 1)
         self.readinessRow.hide()
@@ -196,7 +241,11 @@ class StaticControls(QtWidgets.QWidget):
         was_hidden = self.readinessRow.isHidden()
         self.readinessRow.setVisible(bool(text))
         self.readinessDot.setProperty('ready', bool(ready))
-        self.readinessLabel.setText(text)
+        setter = getattr(self.readinessLabel, 'set_full_text', None)
+        if callable(setter):
+            setter(text)
+        else:
+            self.readinessLabel.setText(text)
         self.readinessLabel.setToolTip(tooltip or text)
         self.readinessDot.style().unpolish(self.readinessDot)
         self.readinessDot.style().polish(self.readinessDot)

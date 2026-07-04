@@ -1,3 +1,5 @@
+import logging
+
 from xdart.gui.tabs.static_scan.controls_logic import (
     AnalysisTool,
     BOUND_CONTROL_PATHS,
@@ -17,6 +19,7 @@ from xdart.gui.tabs.static_scan.controls_logic import (
     Tool,
     GeomState,
     INTEGRATION_CONTROL_PATHS,
+    append_config_mismatch_check,
     build_field_statuses,
     build_analysis_launchers,
     build_bound_control_state,
@@ -244,7 +247,7 @@ def test_run_blockers_are_derived_from_required_field_statuses():
     )
 
 
-def test_append_blocks_loaded_scan_processing_config_mismatch_headless():
+def test_append_blocks_loaded_scan_processing_config_mismatch_headless(caplog):
     standard = {
         "gi": False,
         "bai_1d_args": {"unit": "q_A^-1", "numpoints": 3000},
@@ -282,24 +285,23 @@ def test_append_blocks_loaded_scan_processing_config_mismatch_headless():
         run_target=RunTarget.SOURCE,
     )
 
-    profile = build_control_profile(
-        ControlState(
-            **ready,
-            write_mode="Append",
-            processed_config=processing_config_from_mapping(standard),
-            current_config=processing_config_from_mapping(grazing),
+    with caplog.at_level(logging.DEBUG, logger="xrd_tools.session.readiness"):
+        profile = build_control_profile(
+            ControlState(
+                **ready,
+                write_mode="Append",
+                processed_config=processing_config_from_mapping(standard),
+                current_config=processing_config_from_mapping(grazing),
+            )
         )
-    )
 
     assert not profile.can_run
     assert profile.run_blockers == (
-        "processed scan: Standard · current: Grazing — switch write mode "
-        "to Replace, or revert settings (checked: mode, 1D axis, 2D axis, "
-        "1D unit, 2D unit, 1D points, 1D oop points, 2D radial points, "
-        "2D azimuth points, 1D radial range, 1D azimuth range, "
-        "2D radial range, 2D azimuth range; differences: mode, 1D axis, "
-        "2D axis).",
+        "processed: Standard · current: Grazing — switch write mode "
+        "to Replace, or revert settings",
     )
+    assert "checked: mode" not in profile.run_blockers[0]
+    assert any("checked=" in rec.getMessage() for rec in caplog.records)
 
     replace = build_control_profile(
         ControlState(
@@ -320,6 +322,42 @@ def test_append_blocks_loaded_scan_processing_config_mismatch_headless():
         )
     )
     assert matching.can_run
+
+
+def test_append_config_match_canonicalizes_defaults_and_string_forms():
+    processed = {
+        "gi": "False",
+        "bai_1d_args": {
+            "unit": " q_A^-1 ",
+            "numpoints": None,
+            "radial_range": "[0.1, 6.0]",
+        },
+        "bai_2d_args": {
+            "unit": "q_A^-1",
+            "npt_rad": "500.0",
+            "npt_azim": "",
+            "radial_range": ["0.1000000000001", "6.0"],
+            "azimuth_range": "(-90.0, 90.0)",
+        },
+    }
+    current = {
+        "gi": False,
+        "bai_1d_args": {
+            "unit": "q_A^-1",
+            "radial_range": (0.1, 6.0),
+        },
+        "bai_2d_args": {
+            "unit": "q_A^-1",
+            "npt_rad": 500,
+            "radial_range": (0.1, 6.0),
+            "azimuth_range": (-90, 90),
+        },
+    }
+
+    check = append_config_mismatch_check("Append", processed, current)
+
+    assert check.ok
+    assert check.mismatched_fields == ()
 
 
 def test_run_gate_accepts_configured_source_before_processed_frames():

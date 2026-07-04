@@ -480,10 +480,75 @@ def test_append_initialize_config_mismatch_aborts_with_empty_img_file(tmp_path):
         "gi_mode_2d": "qip_qoop",
     }
 
-    with pytest.raises(RuntimeError, match="processed scan: Standard .* current: Grazing"):
+    with pytest.raises(RuntimeError, match="processed: Standard .* current: Grazing"):
         worker.initialize_scan()
 
     assert target.read_bytes() == before
+
+
+def test_append_initialize_same_config_canonical_noise_passes(tmp_path):
+    worker, target = _initialize_scan_worker(tmp_path)
+    _write_minimal_integrated_nxs(
+        target,
+        [1, 2, 3],
+        reduction_config={
+            "gi": "False",
+            "bai_1d_args": {
+                "unit": " q_A^-1 ",
+                "numpoints": None,
+                "radial_range": "[0.1, 6.0]",
+            },
+            "bai_2d_args": {
+                "unit": "q_A^-1",
+                "npt_rad": "500.0",
+                "npt_azim": "",
+                "radial_range": ["0.1000000000001", "6.0"],
+                "azimuth_range": "(-90.0, 90.0)",
+            },
+        },
+    )
+    worker.img_file = ""
+    worker.scan.gi = False
+    worker.scan.bai_1d_args = {
+        "unit": "q_A^-1",
+        "radial_range": (0.1, 6.0),
+    }
+    worker.scan.bai_2d_args = {
+        "unit": "q_A^-1",
+        "npt_rad": 500,
+        "radial_range": (0.1, 6.0),
+        "azimuth_range": (-90, 90),
+    }
+
+    scan = worker.initialize_scan()
+
+    assert scan.frames.index == [1, 2, 3]
+
+
+def test_append_initialize_mismatch_ignored_in_overwrite_mode(tmp_path):
+    worker, target = _initialize_scan_worker(tmp_path, write_mode="Overwrite")
+    _write_minimal_integrated_nxs(
+        target,
+        [1, 2, 3],
+        reduction_config={
+            "gi": False,
+            "bai_1d_args": {"unit": "q_A^-1"},
+            "bai_2d_args": {"unit": "q_A^-1"},
+        },
+    )
+    worker.img_file = ""
+    worker.gi = True
+    worker.scan.gi = True
+    worker.scan.bai_1d_args = {"unit": "q_A^-1", "gi_mode_1d": "q_total"}
+    worker.scan.bai_2d_args = {"unit": "q_A^-1", "gi_mode_2d": "qip_qoop"}
+    worker.scan.gi_config = {
+        "gi_mode_1d": "q_total",
+        "gi_mode_2d": "qip_qoop",
+    }
+
+    scan = worker.initialize_scan()
+
+    assert scan.frames.index == []
 
 
 def test_zero_processed_already_processed_frames_logs_info(caplog, tmp_path):

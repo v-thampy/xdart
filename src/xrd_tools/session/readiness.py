@@ -10,11 +10,15 @@ run buttons gated until their real-data acceptance checks land.
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field
 from enum import Enum
+import logging
 import math
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
+
+logger = logging.getLogger(__name__)
 
 
 class Tool(str, Enum):
@@ -108,9 +112,17 @@ def _mapping(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _is_empty_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in ("", "none", "null")
+    return False
+
+
 def _first_value(mapping: Mapping[str, Any], keys: Sequence[str], default: Any) -> Any:
     for key in keys:
-        if key in mapping:
+        if key in mapping and not _is_empty_value(mapping[key]):
             return mapping[key]
     return default
 
@@ -124,9 +136,42 @@ def _int_or_none(value: Any) -> int | None:
         return None
 
 
-def _range_or_none(value: Any) -> object:
-    if value is None or value == "" or value == "None":
+def _int_or_default(value: Any, default: int) -> int | None:
+    if _is_empty_value(value):
+        return default
+    return _int_or_none(value)
+
+
+def _bool_or_none(value: Any) -> bool | None:
+    if _is_empty_value(value):
         return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("1", "true", "t", "yes", "y", "on", "gi", "grazing"):
+        return True
+    if text in ("0", "false", "f", "no", "n", "off", "standard"):
+        return False
+    return None
+
+
+def _text_or_default(value: Any, default: str) -> str:
+    if _is_empty_value(value):
+        return default
+    return str(value).strip()
+
+
+def _range_or_none(value: Any) -> object:
+    if _is_empty_value(value):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            value = ast.literal_eval(text)
+        except (SyntaxError, ValueError):
+            return text
     try:
         if len(value) != 2:  # type: ignore[arg-type]
             return repr(value)
@@ -182,18 +227,20 @@ def processing_config_from_args(
         else bool(gi_enabled)
     )
     mode = MeasMode.GI if is_gi else MeasMode.STANDARD
-    unit_1d = str(a1.get("unit") or "q_A^-1")
-    unit_2d = str(a2.get("unit") or "q_A^-1")
+    unit_1d = _text_or_default(a1.get("unit"), "q_A^-1")
+    unit_2d = _text_or_default(a2.get("unit"), "q_A^-1")
     if is_gi:
-        axis_1d = str(
+        axis_1d = _text_or_default(
             a1.get("gi_mode_1d")
             or gic.get("gi_mode_1d")
-            or "q_total"
+            or None,
+            "q_total",
         )
-        axis_2d = str(
+        axis_2d = _text_or_default(
             a2.get("gi_mode_2d")
             or gic.get("gi_mode_2d")
-            or "qip_qoop"
+            or None,
+            "qip_qoop",
         )
     else:
         axis_1d = _standard_axis_from_unit(unit_1d, dim="1d")
@@ -209,7 +256,7 @@ def processing_config_from_args(
         ),
         npt_oop_1d=_int_or_none(a1.get("npt_oop")),
         npt_rad_2d=_int_or_none(_first_value(a2, ("npt_rad", "npt"), 500)),
-        npt_azim_2d=_int_or_none(a2.get("npt_azim", 500)),
+        npt_azim_2d=_int_or_default(a2.get("npt_azim"), 500),
         radial_range_1d=_range_or_none(a1.get("radial_range")),
         azimuth_range_1d=_range_or_none(a1.get("azimuth_range")),
         radial_range_2d=_range_or_none(a2.get("radial_range")),
@@ -228,7 +275,7 @@ def processing_config_from_mapping(
     if "config" in config and "bai_1d_args" not in config:
         config = _mapping(config.get("config"))
     gi_marker = config.get("gi", _UNSET)
-    gi_enabled = None if gi_marker is _UNSET else bool(gi_marker)
+    gi_enabled = None if gi_marker is _UNSET else _bool_or_none(gi_marker)
     return processing_config_from_args(
         _mapping(config.get("bai_1d_args")),
         _mapping(config.get("bai_2d_args")),
@@ -287,11 +334,17 @@ def append_config_mismatch_check(
             current_label=current.display_mode,
         )
 
+    logger.debug(
+        "append config mismatch: processed=%s current=%s checked=%s "
+        "differences=%s",
+        processed.compared_items(),
+        current.compared_items(),
+        compared_fields,
+        mismatches,
+    )
     reason = (
-        f"processed scan: {processed.display_mode} · "
-        f"current: {current.display_mode} — switch write mode to Replace, "
-        f"or revert settings (checked: {', '.join(compared_fields)}; "
-        f"differences: {', '.join(mismatches)})."
+        f"processed: {processed.display_mode} · current: {current.display_mode} "
+        "— switch write mode to Replace, or revert settings"
     )
     return AppendConfigCheck(
         ok=False,

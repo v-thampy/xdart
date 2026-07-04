@@ -2356,7 +2356,7 @@ class imageThread(wranglerThread):
                 and self._streaming_scan_id == id(scan)):
             workers = getattr(self, "_streaming_executor_workers", None)
             if workers is not None:
-                self._log_reduction_worker_cap(workers)
+                imageThread._log_reduction_worker_cap(self, workers)
             _hsw = getattr(self, "_heavy_staging_window", None)
             if callable(_hsw):
                 _hsw(scan)
@@ -2371,7 +2371,7 @@ class imageThread(wranglerThread):
         from xrd_tools.core import reduction_worker_cap
         executor = reduction_worker_cap(self.max_cores)
         self._streaming_executor_workers = executor
-        self._log_reduction_worker_cap(executor)
+        imageThread._log_reduction_worker_cap(self, executor)
         cancel_token = self._cancel_token() if hasattr(self, "_cancel_token") else None
         # Batch brackets all frames (scout_union over first+last of the chunk);
         # live has no last frame at session open, so it freezes from the first
@@ -3257,9 +3257,8 @@ class imageThread(wranglerThread):
                             write_mode, processed_config, current_config)
                         if not append_check.ok:
                             raise RuntimeError(
-                                f"{append_check.reason} Existing append target "
-                                "preserved; switch write mode to Replace to "
-                                "re-integrate with the current settings."
+                                f"{append_check.reason}. Existing append target "
+                                "preserved."
                             )
                         scan.skip_2d = self.scan.skip_2d
                         for (k, v) in self.scan_args.items():

@@ -22,7 +22,19 @@ def _reduction_config_indicates_gi(config):
     if not isinstance(config, dict):
         return False
     if "gi" in config:
-        return bool(config["gi"])
+        value = config["gi"]
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in ("1", "true", "t", "yes", "y", "on", "gi", "grazing"):
+            return True
+        if text in ("0", "false", "f", "no", "n", "off", "standard", ""):
+            return False
+        return bool(value)
     gic = config.get("gi_config")
     if isinstance(gic, dict) and gic:
         return True
