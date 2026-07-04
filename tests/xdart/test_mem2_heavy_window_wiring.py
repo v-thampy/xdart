@@ -8,6 +8,7 @@ this checks the three consumers actually take it:
 all resolve to the same window.  ``XDART_HEAVY_WINDOW`` pins it for determinism.
 """
 
+import logging
 import threading
 from types import SimpleNamespace
 
@@ -33,6 +34,52 @@ def test_thread_heavy_window_uses_override_and_caches(monkeypatch):
     win = imageThread._heavy_staging_window(worker, scan)
     assert win == 32
     assert worker._heavy_window == 32                 # cached
+
+
+def test_thread_heavy_window_logs_when_cache_reused(monkeypatch, caplog):
+    monkeypatch.setenv("XDART_HEAVY_WINDOW", "32")
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
+        imageThread)
+    worker = imageThread.__new__(imageThread)
+    worker.detector_shape = (2167, 2070)
+    scan = SimpleNamespace(frames=None)
+
+    with caplog.at_level(
+        logging.INFO,
+        logger="xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread",
+    ):
+        assert imageThread._heavy_staging_window(worker, scan) == 32
+        assert imageThread._heavy_staging_window(worker, scan) == 32
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert sum("heavy window: 32 frames" in msg for msg in messages) == 2
+
+
+def test_streaming_session_reuse_logs_run_caps(monkeypatch, caplog):
+    monkeypatch.setenv("XDART_HEAVY_WINDOW", "24")
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
+        imageThread)
+    scan = SimpleNamespace(frames=None)
+    session = object()
+    sink = object()
+    worker = imageThread.__new__(imageThread)
+    worker.detector_shape = (2167, 2070)
+    worker.max_cores = 8
+    worker._streaming_session = session
+    worker._streaming_sink = sink
+    worker._streaming_scan_id = id(scan)
+    worker._streaming_executor_workers = 3
+
+    with caplog.at_level(
+        logging.INFO,
+        logger="xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread",
+    ):
+        assert imageThread._get_streaming_session(worker, scan, []) == (session, sink)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("reduction workers: 3 (Cores requested 8)" in msg
+               for msg in messages)
+    assert any("heavy window: 24 frames" in msg for msg in messages)
 
 
 def test_all_three_caps_share_the_same_window(monkeypatch):

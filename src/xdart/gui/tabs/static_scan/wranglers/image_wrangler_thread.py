@@ -2311,22 +2311,38 @@ class imageThread(wranglerThread):
         FrameRecordStore + PublicationStore ``max_heavy_items``).  ~25% of TOTAL
         physical RAM / the as-stored per-frame heavy cost (raw is float64-upcast
         today → 8 B/px), clamped [16, 64]; env ``XDART_HEAVY_WINDOW`` pins it.
-        Computed at run start (detector shape known); cached + logged once.
+        Computed at run start (detector shape known); cached but logged whenever
+        the run/session start path consults it.
         """
+        frame_bytes = self._heavy_window_frame_bytes()
         cached = getattr(self, "_heavy_window", None)
-        if cached is not None:
-            return cached
-        from xrd_tools.core import heavy_window, heavy_window_log_line
+        if cached is None:
+            from xrd_tools.core import heavy_window
+            cached = heavy_window(frame_bytes)
+            self._heavy_window = cached
+        self._log_heavy_staging_window(cached, frame_bytes)
+        return cached
+
+    def _heavy_window_frame_bytes(self):
         shape = getattr(self, "detector_shape", None)
-        frame_bytes = None
         if shape and len(shape) >= 2:
-            frame_bytes = int(shape[0]) * int(shape[1]) * 8   # float64 as-stored
-        window = heavy_window(frame_bytes)
-        self._heavy_window = window
+            try:
+                return int(shape[0]) * int(shape[1]) * 8   # float64 as-stored
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _log_heavy_staging_window(self, window, frame_bytes=None):
+        from xrd_tools.core import heavy_window_log_line
         logger.info(heavy_window_log_line(
             window, frame_bytes,
             overridden=bool(os.environ.get("XDART_HEAVY_WINDOW"))))
-        return window
+
+    def _log_reduction_worker_cap(self, workers):
+        from xrd_tools.core import reduction_worker_cap_log_line
+        logger.info(reduction_worker_cap_log_line(
+            workers, requested=self.max_cores,
+            overridden=bool(os.environ.get("XDART_REDUCTION_WORKERS"))))
 
     def _get_streaming_session(self, scan, frames):
         """Build (once per scan) or return the persistent streaming session +
@@ -2334,6 +2350,12 @@ class imageThread(wranglerThread):
         fails (the batch is skipped with an advisory, as in the chunked path)."""
         if (self._streaming_session is not None
                 and self._streaming_scan_id == id(scan)):
+            workers = getattr(self, "_streaming_executor_workers", None)
+            if workers is not None:
+                self._log_reduction_worker_cap(workers)
+            _hsw = getattr(self, "_heavy_staging_window", None)
+            if callable(_hsw):
+                _hsw(scan)
             return self._streaming_session, self._streaming_sink
         if self._streaming_session is not None:   # a different scan started
             self._close_reduction_session()
@@ -2342,12 +2364,10 @@ class imageThread(wranglerThread):
         # throughput knee (memory-aware) and NEVER to None — the old
         # ``n_workers==1 -> None`` silently built a ~20-worker default pool
         # (20 integrator deepcopies), the opposite of the requested serial run.
-        from xrd_tools.core import (
-            reduction_worker_cap, reduction_worker_cap_log_line)
+        from xrd_tools.core import reduction_worker_cap
         executor = reduction_worker_cap(self.max_cores)
-        logger.info(reduction_worker_cap_log_line(
-            executor, requested=self.max_cores,
-            overridden=bool(os.environ.get("XDART_REDUCTION_WORKERS"))))
+        self._streaming_executor_workers = executor
+        self._log_reduction_worker_cap(executor)
         cancel_token = self._cancel_token() if hasattr(self, "_cancel_token") else None
         # Batch brackets all frames (scout_union over first+last of the chunk);
         # live has no last frame at session open, so it freezes from the first
@@ -2411,6 +2431,7 @@ class imageThread(wranglerThread):
             self._streaming_sink = None
             self._streaming_scan_id = None
             self._streaming_record_store = None
+            self._streaming_executor_workers = None
             self._scan_session_adapter = None
             return None, None
         self._streaming_session = session
