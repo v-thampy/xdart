@@ -55,6 +55,7 @@ def _boundary_host():
             idxs=[], idxs_1d=[], idxs_2d=[],
             _raw_resolve_failed=set(), _raw_full_shape=None,
             stitch_display_mode=None,
+            _waterfall_history=None,   # S-14: tests set .ids to seed the accumulator
             _clear_pinned_slice_cuts=lambda **k: pin_clears.append(k)),
         _controls_v2_enabled=lambda: False,
         _refresh_controls_v2_profile=lambda *a, **k: None,
@@ -127,38 +128,48 @@ def test_out_of_sync_new_scan_defers_to_frame_stream():
 
 
 def test_same_scan_rerun_clears_panel():
-    # Regression (the second bug): RE-RUNNING the same scan (same name) must clear
-    # the panel.  A bare name-match "already scoped" test wrongly skipped the clear
-    # because the stamp still held the previous run's name.  The consumed
-    # _frame_driven_rescoped_pending flag (False here — no frame rescoped this run)
-    # makes new_scan clear.
+    # RE-RUNNING the same scan (same name) must clear the panel AND the overlay
+    # accumulator, else the new run's (name, idx) row-ids collide with the old
+    # run's and get first-occurrence-dedup dropped (stale curves under new labels).
     host, scan = _boundary_host()
     host.new_scan("scanA", "/data/scanA_master.h5", False, "th", False, False)
     for i in range(1, 6):
         _arrive(host, i, "scanA")
     assert list(scan.frames.index) == [1, 2, 3, 4, 5]
-    host._pin_clears.clear()   # ignore any clears from the first scan boundary
-    # RE-RUN scanA — same name — must clear (no frame has rescoped this run).
+    # the overlay accumulator now holds scanA rows
+    host.displayframe._waterfall_history = SimpleNamespace(
+        ids=[("scanA", i) for i in range(1, 6)])
+    host._pin_clears.clear()
+    # RE-RUN scanA
     host.new_scan("scanA", "/data/scanA_master.h5", False, "th", False, False)
     assert list(scan.frames.index) == [], "same-name re-run must clear the panel"
-    # S-14: the re-run also clears the overlay accumulator + pins, so the new
-    # run's frames are not dropped by (name, frame_idx) first-occurrence dedup
-    # against the previous run (which left its stale intensities under the labels).
     assert any(c.get("clear_history") for c in host._pin_clears), \
         "same-name re-run must clear the overlay accumulator (S-14)"
 
 
-def test_different_scan_boundary_keeps_overlay_s14():
-    # S-14 must NOT over-fire: a frame-driven boundary to DIFFERENT scans appends
-    # (OV-6 cross-scan comparison), so it must not clear the overlay accumulator.
+def test_abab_rerun_clears_overlay_s14():
+    # S-14 COMPLETION: A->B->A.  The prev==name guard missed this (prev=B != A);
+    # deriving 'seen names' from the accumulator ITSELF catches it -- scanA
+    # already has rows, so re-scoping to scanA must clear (else scanA's new frames
+    # are dropped by dedup against the first scanA run).
     host, scan = _boundary_host()
-    for i in (1, 2):
-        _arrive(host, i, "scanB")          # first rescope (prev key None)
-    for i in (1, 2):
-        _arrive(host, i, "scanC")          # boundary scanB -> scanC (prev != name)
-    assert scan.name == "scanC"
+    host.displayframe._waterfall_history = SimpleNamespace(
+        ids=[("scanA", 1), ("scanA", 2), ("scanB", 1)])
+    host._pin_clears.clear()
+    host._rescope_frame_panel_to("scanA")     # re-run scanA, already accumulated
+    assert any(c.get("clear_history") for c in host._pin_clears), \
+        "A->B->A re-run must clear the overlay accumulator (S-14 completion)"
+
+
+def test_different_scan_boundary_keeps_overlay_s14():
+    # S-14 must NOT over-fire: a boundary to a name NOT yet in the accumulator
+    # appends (OV-6 cross-scan comparison), so it must not clear.
+    host, scan = _boundary_host()
+    host.displayframe._waterfall_history = SimpleNamespace(ids=[("scanA", 1)])
+    host._pin_clears.clear()
+    host._rescope_frame_panel_to("scanC")     # a NEW name, not in the accumulator
     assert not any(c.get("clear_history") for c in host._pin_clears), \
-        "a different-scan boundary must NOT clear the overlay (OV-6 append)"
+        "a boundary to a NEW name must NOT clear the overlay (OV-6 append)"
 
 
 def test_batch_mode_never_frame_rescopes():
