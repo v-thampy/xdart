@@ -512,7 +512,7 @@ class LiveScan:
 
     def save_to_nexus(self, *, entry: str = "entry", finalize: bool = False,
                       replace: bool = False,
-                      replace_frame_indices=None) -> None:
+                      replace_frame_indices=None) -> dict[str, list[int]]:
         """Save scan state into a v2 NeXus file.  Idempotent across calls.
 
         Two modes — see :func:`nexus_writer.save_scan_to_nexus` for
@@ -530,14 +530,14 @@ class LiveScan:
         """
         mode = 'w' if replace else 'a'
         with self.file_lock:
-            self._save_to_nexus(
+            return self._save_to_nexus(
                 mode=mode, entry=entry, finalize=finalize,
                 replace_frame_indices=replace_frame_indices,
             )
 
     def _save_to_nexus(self, *, mode: str = "a", entry: str = "entry",
                        finalize: bool = False,
-                       replace_frame_indices=None) -> None:
+                       replace_frame_indices=None) -> dict[str, list[int]]:
         """Inner v2 writer; delegates to ``nexus_writer.save_scan_to_nexus``.
 
         Opens the file at ``self.data_file`` internally.  Callers must
@@ -546,7 +546,7 @@ class LiveScan:
         """
         from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
         with self.scan_lock:
-            save_scan_to_nexus(
+            dropped = save_scan_to_nexus(
                 self, self.data_file, mode=mode,
                 entry=entry, finalize=finalize,
                 replace_frame_indices=replace_frame_indices,
@@ -560,6 +560,7 @@ class LiveScan:
             mark = getattr(self.frames, "mark_persisted", None)
             if callable(mark):
                 mark(list(self.frames.index))
+            return dropped
 
     def load_from_h5(self, replace=True, mode='r', *args, **kwargs):
         """Load scan state from a v2 NeXus file.

@@ -388,6 +388,7 @@ def test_qt_sink_marks_only_written_record_store_modes(tmp_path, monkeypatch):
     from xdart.modules.ewald import LiveScan
     from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
     import xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread as iwt
+    import h5py
 
     class _Pool:
         def pause(self, path):
@@ -419,13 +420,9 @@ def test_qt_sink_marks_only_written_record_store_modes(tmp_path, monkeypatch):
     sink.begin(scan, _minimal_plan())
     live = _live_frame(0)
     sink.register(live)
-    sink.write(_headless(0), _reduction(0, with_2d=True))
-
-    def fake_save(*, mode="a", **kwargs):
-        scan.frames.mark_persisted(scan.frames.index)
-        return {"entry/integrated_2d": [0]}
-
-    monkeypatch.setattr(scan, "_save_to_nexus", fake_save)
+    reduction = _reduction(0, with_2d=True)
+    reduction.result_2d.intensity[:] = np.nan
+    sink.write(_headless(0), reduction)
     sink.flush(force=True)
 
     # Only the WRITTEN 1D is promised persisted (hydratable)...
@@ -433,6 +430,9 @@ def test_qt_sink_marks_only_written_record_store_modes(tmp_path, monkeypatch):
     # ...and the publication-DROPPED 2D cake is marked DROPPED (MEM-1b): its
     # heavy payload is released without ever promising a hydratable on-disk copy.
     assert store.dropped == [((0,), (("2d", "default"),))]
+    with h5py.File(scan.data_file, "r") as h5:
+        assert "integrated_1d" in h5["entry"]
+        assert "integrated_2d" not in h5["entry"]
 
 
 def test_sink_persist_before_evict_no_unsaved_eviction(tmp_path):

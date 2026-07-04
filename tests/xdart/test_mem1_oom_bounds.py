@@ -44,6 +44,29 @@ def test_default_handoff_cap_is_enforced():
     assert len(d) == _PUBLISHED_FRAMES_CAP
 
 
+def test_bounded_frame_handoff_tolerates_gui_pop_during_eviction():
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import (
+        _BoundedFrameHandoff)
+
+    class RacingHandoff(_BoundedFrameHandoff):
+        def __init__(self):
+            super().__init__(cap=1)
+            self._race_once = True
+
+        def keys(self):
+            keys = list(super().keys())
+            if self._race_once and keys:
+                self._race_once = False
+                super().pop(keys[0], None)
+            return keys
+
+    d = RacingHandoff()
+    d[0] = "old"
+    d[1] = "new"
+
+    assert d == {1: "new"}
+
+
 # ── raw freed on staging-window eviction (MEM-1a step 2) ─────────────────────
 class _FakeFrame:
     """Stand-in for a LiveFrame: only ``idx`` + ``free_raw`` are used by the

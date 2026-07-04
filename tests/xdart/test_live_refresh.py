@@ -8259,6 +8259,7 @@ def test_streaming_dispatch_series_average_submits_one_mean_frame(monkeypatch):
     from xrd_tools.reduction import Integration1DPlan, ReductionPlan
     import xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread as module
 
+    monkeypatch.setenv("XDART_HEAVY_WINDOW", "64")
     submitted = []
     opened = []
     opened_kwargs = []

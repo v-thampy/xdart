@@ -58,7 +58,7 @@ class _BoundedFrameHandoff(dict):
         over = len(self) - self._cap
         if over > 0:
             for stale in list(self.keys())[:over]:
-                super().__delitem__(stale)
+                super().pop(stale, None)
             if not self._drop_warned:
                 self._drop_warned = True
                 logger.warning(

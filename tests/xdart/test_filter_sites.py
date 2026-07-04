@@ -37,6 +37,7 @@ def test_eiger_master_queue_applies_filter_to_stem(tmp_path):
 
     holder = SimpleNamespace(
         img_dir=str(tmp_path),
+        img_ext="h5",
         include_subdir=False,
         file_filter="scan001 | scan003",
         _eiger_master_queue=[],
