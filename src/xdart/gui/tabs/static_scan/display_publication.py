@@ -942,6 +942,18 @@ class PublicationDisplayAdapter:
             self._hydrate_missing_plot_subset(hydrate_labels, needs_2d=needs_2d)
 
         ref_x = None
+        # BL-6: when the existing overlay history is grid-compatible, anchor NEW
+        # rows to ITS grid (prior.x) so a cross-scan append with a different
+        # radial_range but the same axis+npt reinterps onto ONE x -- otherwise
+        # scan B's intensities render at scan A's x positions.  A plotUnit toggle
+        # is guarded in append_row (adopt only when the first row's axis unit ==
+        # prior.unit); accumulate_waterfall is the belt-and-suspenders reinterp.
+        prior_x_seed = None
+        if (prior is not None
+                and overlay_grid_keys_match(prior.reset_key, planned_reset_key)
+                and getattr(prior, "x", None) is not None
+                and np.asarray(prior.x).size > 0):
+            prior_x_seed = np.asarray(prior.x, dtype=float)
         axis = None
         reset_key = None
         ids, names, rows, metadata = [], [], [], []
@@ -979,9 +991,21 @@ class PublicationDisplayAdapter:
                 if projected is None:
                     return None
                 x, y, this_axis = projected
+            if np.asarray(x).size == 0:   # S-17: an empty grid carries no trace
+                return None
             if ref_x is None:
                 ref_x = x
                 axis = this_axis
+                # BL-6: adopt the compatible prior grid (SAME unit only, so a
+                # Q<->2theta toggle is not misread) so this and every later row
+                # land on the existing overlay x.
+                if (prior_x_seed is not None
+                        and str(getattr(this_axis, "unit", "") or "")
+                        == str(getattr(prior, "unit", "") or "")):
+                    if (x.shape != prior_x_seed.shape
+                            or not np.allclose(x, prior_x_seed, equal_nan=True)):
+                        y = np.interp(prior_x_seed, x, y)
+                    ref_x = prior_x_seed
             elif x.shape != ref_x.shape or not np.allclose(x, ref_x, equal_nan=True):
                 y = np.interp(ref_x, x, y)
                 x = ref_x

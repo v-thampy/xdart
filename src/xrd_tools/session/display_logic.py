@@ -601,12 +601,19 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
     metadata = [_freeze_metadata(m) for m in metadata[:len(ids)]]
     replace_keys = {_dedup_key(i) for i in (replace_ids or ())}
 
-    # RESET: new accumulation identity (incompatible grid/source), no prior
-    # history, or an empty incoming grid (nothing to anchor on -- keep the
-    # incoming as-is).
+    # S-17: an empty incoming grid carries nothing to accumulate -- it must never
+    # WIPE a compatible accumulator (the "one empty publication blanks the
+    # overlay" bug), nor reach the np.interp below with an empty x.
+    if x.size == 0:
+        if history is not None and _reset_keys_compatible(history.reset_key, reset_key):
+            return history
+        return WaterfallHistory(
+            reset_key=reset_key, unit=unit, label=label, x=x,
+            rows=np.empty((0, 0), dtype=float), ids=(), names=(), metadata=())
+
+    # RESET: new accumulation identity (incompatible grid/source) or no prior.
     if (history is None
-            or not _reset_keys_compatible(history.reset_key, reset_key)
-            or x.size == 0):
+            or not _reset_keys_compatible(history.reset_key, reset_key)):
         ki, kn, kr, km = _dedup_first(ids, names, rows, metadata)
         return WaterfallHistory(
             reset_key=reset_key, unit=unit, label=label, x=x,
@@ -629,10 +636,16 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
 
     for i, n, r, m in zip(ids, names, rows, metadata):
         key = _dedup_key(i)
-        # The incoming row is on the shared grid already; reinterp defensively only
-        # if the grid sample-count differs (e.g. a mid-generation Npts hiccup).
+        # BL-6: align the incoming row (on grid ``x``) to the accumulated
+        # ``base_x`` whenever they differ -- by sample-count OR by VALUES.  Two
+        # scans with the same axis+npt but a different radial_range (recalibration,
+        # an edited range) are grid-COMPATIBLE (range is excluded from the reset
+        # key on purpose) yet have DIFFERENT x, so without the value check scan B's
+        # intensities render at scan A's x positions.
         r = np.asarray(r, dtype=float)
-        if r.size != base_x.size and x.size == r.size and x.size > 0:
+        if (x.size == r.size and x.size > 0 and base_x.size > 0
+                and (x.size != base_x.size
+                     or not np.allclose(x, base_x, equal_nan=True))):
             r = np.interp(base_x, x, r)
         if key in index_by_key:
             if key in replace_keys:

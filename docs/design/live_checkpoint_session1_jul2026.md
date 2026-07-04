@@ -120,6 +120,10 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
       `.tif.log` / oversize / binary alongside the real `.tif.metadata`), the run locks onto the
       REAL sidecar — log shows `metadata: auto locked onto ...` for the right file, and motors/
       counters in the `.nxs` are correct (not junk). A 1-2 field explicit sidecar loads.
+- [ ] G12 BL-6/S-17 overlay x-grid (F7/F8): overlay scan A, then run/load scan B with the SAME
+      axis+npt but a DIFFERENT radial_range (recalibrate or edit the range) — scan B's peaks
+      render at their CORRECT q/2θ (aligned to scan A's grid), not shifted; a frame with an empty
+      grid does not blank the overlay.
 
 **PASS ⇒ proceed to RC-8** (merge → tag v1.0.0 → publish; recipe in
 `handoff_chunks_jul2026.md`). Any FAIL: stop, report the item + `kill -USR1 <pid>` stack if a
