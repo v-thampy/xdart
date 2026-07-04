@@ -184,6 +184,11 @@ class Integration1DPlan:
     # q (or 2theta) band the I-vs-chi profile is pooled over.  ``npt`` is the
     # chi-bin count; this is the band resolution.  Ignored by the radial path.
     npt_rad: int = 1000
+    # S-4: chi_offset re-added to the chi OUTPUT axis of a Mode-A (chi_deg)
+    # reduction, mirroring Integration2DPlan.azimuth_offset -- so the written 1D
+    # chi axis matches the 2D cake chi instead of the raw pyFAI frame.  Ignored by
+    # the radial (q/2theta) path.
+    azimuth_offset: float = 0.0
     extra: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -2417,6 +2422,15 @@ def _reduce_frame(
                 )
                 if p1 is not None else None
             )
+        # S-4: re-add chi_offset to the 1D chi OUTPUT axis (mirror the 2D
+        # r2d.azimuthal += azimuth_offset below), so the written Mode-A (chi_deg)
+        # chi axis matches the 2D cake chi instead of staying in the raw pyFAI
+        # frame 90deg out.  Standard mode only (GI keeps azimuth_offset 0).
+        if (r1d is not None and p1 is not None
+                and str(getattr(p1, "unit", "") or "").lower() == "chi_deg"
+                and getattr(p1, "azimuth_offset", 0.0)):
+            r1d.radial = (np.asarray(r1d.radial, dtype=float)
+                          + float(p1.azimuth_offset))
         r2d = (
             integrate_2d(
                 image,

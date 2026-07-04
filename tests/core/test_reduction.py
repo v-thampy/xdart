@@ -514,6 +514,37 @@ def test_run_reduction_non_gi_chi_matches_integrate_radial(
     )
 
 
+def test_non_gi_chi_reduction_reapplies_chi_offset_s4(ai_fixture, synthetic_image):
+    """S-4: a Mode-A (chi_deg) 1D reduction re-adds chi_offset to the OUTPUT chi
+    axis (mirroring Integration2DPlan.azimuth_offset), so the written 1D chi axis
+    matches the 2D cake chi instead of staying in the raw pyFAI frame.  The
+    INTENSITIES are unchanged (only the axis is relabeled).  1D<->2D CONSISTENCY
+    is verified here; the ABSOLUTE frame is the maintainer's real-data validation
+    against the team chi reference (the ship gate)."""
+    from xrd_tools.integrate.single import integrate_radial
+
+    OFFSET = 90.0
+    plan = ReductionPlan(
+        integration_1d=Integration1DPlan(
+            npt=72, unit="chi_deg", method="csr", radial_range=(0.5, 5.0),
+            azimuth_offset=OFFSET, extra={"correctSolidAngle": False}),
+        integration_2d=None,
+    )
+    scan = Scan("chi", [Frame(0, image=synthetic_image)], integrator=ai_fixture)
+    result = run_reduction(plan, scan)
+
+    raw = integrate_radial(  # the raw pyFAI chi frame (no offset)
+        synthetic_image, ai_fixture, npt=72, radial_unit="q_A^-1", method="csr",
+        radial_range=(0.5, 5.0), correctSolidAngle=False)
+
+    actual = result.frames[0].result_1d
+    assert actual.unit == "chi_deg"
+    np.testing.assert_allclose(actual.radial, raw.radial + OFFSET,
+                               rtol=1e-6, atol=1e-8)
+    np.testing.assert_allclose(actual.intensity, raw.intensity,
+                               rtol=1e-6, atol=1e-8, equal_nan=True)
+
+
 def test_chunked_error_clear_waits_for_running_tail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

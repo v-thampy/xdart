@@ -145,6 +145,12 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
       monitor / polarization / error model / GI incidence) but NOT the axis/npt/range — the
       Run-click modal now BLOCKS it (was silently mixed). Verify NO false modal when Appending onto
       a PRE-UPGRADE .nxs (written before this field existed) with an unchanged grid.
+- [ ] G18 **S-4 SHIP GATE (written-data): real-data χ validation.** In STANDARD mode with a
+      Mode-A (I-vs-χ) reduction + a non-zero chi_offset (default 90°), the written 1D χ axis must
+      match the 2D cake χ AND the team χ reference. Run the `scripts/` validator against real
+      del-only data before shipping S-4 — a written-data frame fix must not land on user files
+      blind (mirror the GI-convention validation discipline). Headless 1D↔2D consistency is
+      already green; this gate is the ABSOLUTE frame.
 
 **PASS ⇒ proceed to RC-8** (merge → tag v1.0.0 → publish; recipe in
 `handoff_chunks_jul2026.md`). Any FAIL: stop, report the item + `kill -USR1 <pid>` stack if a

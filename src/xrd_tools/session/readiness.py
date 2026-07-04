@@ -1271,8 +1271,12 @@ def build_native_int_reduction_plan_from_args(
         _native_pop_first(args_2d, ("azimuth_offset", "chi_offset"), 0.0) or 0.0
     )
     chi_offset_1d = float(_native_pop_first(args_1d, ("chi_offset",), 0.0) or 0.0)
-    if chi_offset_1d and not gi_enabled:
-        azimuth_range_1d = _native_offset_range(azimuth_range_1d, chi_offset_1d)
+    # S-4: carry chi_offset as the 1D plan's azimuth_offset and re-add it to the
+    # OUTPUT chi axis (in reduction), mirroring the 2D EXACTLY -- instead of
+    # shifting the INPUT range and leaving the written 1D chi axis in the raw
+    # pyFAI frame 90deg out of frame with the 2D cake chi.  GI keeps offset 0
+    # (its chi handling is separate; the 2D also zeroes azimuth_offset for GI).
+    azimuth_offset_1d = chi_offset_1d if not gi_enabled else 0.0
 
     monitor_1d = _native_pop_first(args_1d, ("monitor",), None)
     monitor_2d = _native_pop_first(args_2d, ("monitor",), None)
@@ -1336,6 +1340,7 @@ def build_native_int_reduction_plan_from_args(
             monitor_key=monitor_1d,
             error_model=error_1d,
             polarization_factor=pol_1d,
+            azimuth_offset=azimuth_offset_1d,
             extra=args_1d,
         )
 
