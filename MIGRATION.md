@@ -211,6 +211,39 @@ pre-migration reference signature.  Two additive notes:
 13. **Fresh xdart sessions default Meta Type to `auto`.** Auto discovers `.txt`,
    `.metadata`, and structured name=value sidecars; choose `none`/blank to
    disable metadata, or `spec` for SPEC files.
+14. **Append config-mismatch is now a Run-click MODAL (CF-1/CF-2), not a silent
+   no-op.** Appending into an existing `.nxs` with a reduction config that
+   differs from the stored one now prompts (proceed / switch to Replace) instead
+   of silently mixing differently-reduced rows under a `/entry/reduction` that
+   claims the first run's config.
+15. **Series-average Append onto an existing averaged output is REFUSED
+   (MEM-1c), not a silent no-op.**  Every source frame collapsed to output #1,
+   which the skip-before-read path skipped, so the whole run wrote NOTHING with
+   only a benign INFO line.  The run now refuses at start with an actionable
+   message — a data-loss-class change from silent to loud.
+16. **Dash/underscore filename index convention unified (`[_-]`), which CHANGES
+   SCAN GROUPING (PF-2).**  A dash-separated frame index is now parsed like an
+   underscore one, so `LaB6-1.tif … LaB6-60.tif` is ONE 60-frame scan (`LaB6`)
+   where it was previously 60 separate single-frame scans.  Re-index any pipeline
+   that relied on the old per-file grouping.
+17. **Append blocks on value-affecting, grid-preserving config changes (S-3).**
+   Changing `chi_offset`, monitor normalization, polarization, error model, or
+   the manual GI incidence — which change the written NUMBERS while leaving the
+   axis/npt/range grid identical — now trips the Append modal (they used to pass
+   both the modal and the axis backstop).  The check is BACKWARD-TOLERANT: a
+   field absent from a pre-upgrade stored config is treated as unknown and never
+   false-triggers.
+18. **Explicit out-of-domain χ ranges are clamped (S-4).**  With the standard-
+   mode Mode-A χ input-shift (item below / On-disk §S-4), an explicit χ range
+   that, after the −`chi_offset` shift, falls partly outside pyFAI's raw
+   −180..180 χ domain is clamped to the valid domain rather than wrapping — so an
+   edge range integrates the in-domain bins, not a wrapped sliver.
+19. **Legacy no-config env fallback.**  `XDART_CONTROLS_PANEL_V2=0` /
+   `XDART_CONTROLS_V2_NATIVE_RUN_PLAN=0` route runs through the legacy
+   `plan_from_live_scan` builder, which does NOT persist the full
+   `/entry/reduction/config` block the default v2 path writes (and predates the
+   S-4 χ fix, now ported to it).  Prefer the default (flags unset); the fallback
+   is retained only for parity debugging.
 
 ## Stage-6 redesign items: done vs deferred
 
