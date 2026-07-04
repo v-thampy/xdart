@@ -2136,7 +2136,7 @@ class imageWrangler(wranglerWidget):
         )
         if fname != '':
             self.parameters.child('BG').child('File').setValue(fname)
-        self.bg_file = fname
+            self.bg_file = fname
 
     def set_bg_dir(self):
         """Opens file dialogue and sets the background folder
@@ -2148,7 +2148,7 @@ class imageWrangler(wranglerWidget):
         )
         if path != '':
             self.parameters.child('BG').child('Match').child('bg_dir').setValue(path)
-        self.bg_dir = path
+            self.bg_dir = path
 
     def set_h5_dir(self):
         """Opens file dialogue and sets the path where processed data is stored

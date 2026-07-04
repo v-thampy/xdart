@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 _ORPHANED_STITCH_THREADS = []
 
 
-def _retain_orphaned_stitch_thread(thread) -> None:
-    """Keep a slow stitch QThread wrapper alive until Qt finishes it."""
+def _retain_orphaned_close_thread(thread) -> None:
+    """Keep a slow close-time QThread wrapper alive until Qt finishes it."""
     if thread in _ORPHANED_STITCH_THREADS:
         return
     _ORPHANED_STITCH_THREADS.append(thread)
@@ -36,6 +36,11 @@ def _retain_orphaned_stitch_thread(thread) -> None:
         thread.finished.connect(_forget_thread)
     except Exception:
         pass
+
+
+def _retain_orphaned_stitch_thread(thread) -> None:
+    """Keep a slow stitch QThread wrapper alive until Qt finishes it."""
+    _retain_orphaned_close_thread(thread)
 
 # Viewer-mode row stores.  Normal scan display reads exclusively from the
 # record/publication stores; these dicts back Image/XYE/NeXus file browsers.
@@ -4856,38 +4861,12 @@ class staticWidget(QWidget):
         # wait so run() returns and the QThread isn't "destroyed while running".
         # Setting command='stop' (the universal run-end signal) exits the pause
         # wait from any state; bound-wait the thread so teardown is clean.
-        try:
-            w = getattr(self, 'wrangler', None)
-            wt = getattr(w, 'thread', None) if w is not None else None
-            if wt is not None and wt.isRunning():
-                w.command = 'stop'
-                wt.command = 'stop'
-                # The run() finally performs the end-of-run session finish
-                # (writer join up to 60s) + final .nxs flush -- 5s routinely
-                # lost that race and Qt aborted on the still-running thread,
-                # killing the very flush that protects the data.  30s covers
-                # everything but a wedged NFS write.
-                if not wt.wait(30000):
-                    logger.warning("wrangler thread still finishing at "
-                                   "close after 30s; final flush may be "
-                                   "incomplete")
-        except Exception:
-            logger.debug("stopping wrangler thread on close failed", exc_info=True)
+        self._stop_wrangler_thread_on_close()
         # Reintegration thread: request a between-batches stop and wait --
         # close() never touched it, so a multi-minute reintegrate-all
         # running at close was destroyed mid-loop (Qt6 qFatal) with its
         # cached reduction session never finished.
-        try:
-            it = getattr(getattr(self, 'integratorTree', None),
-                         'integrator_thread', None)
-            if it is not None and it.isRunning():
-                it.stop_requested = True
-                if not it.wait(15000):
-                    logger.warning("integrator thread still running at "
-                                   "close after 15s")
-        except Exception:
-            logger.debug("stopping integrator thread on close failed",
-                         exc_info=True)
+        self._stop_integrator_thread_on_close()
         # Stitch is also a one-shot QThread parented to this widget.  It can be
         # inside a long MultiGeometry call at app close, so request stop for the
         # pre-start window and bound-wait like the other run threads.
@@ -4932,6 +4911,51 @@ class staticWidget(QWidget):
         super().close()
 
         gc.collect()
+
+    def _detach_and_retain_slow_close_thread(self, thread, label):
+        try:
+            thread.setParent(None)
+        except Exception:
+            logger.debug("detaching slow %s thread failed", label,
+                         exc_info=True)
+        _retain_orphaned_close_thread(thread)
+
+    def _stop_wrangler_thread_on_close(self):
+        try:
+            w = getattr(self, 'wrangler', None)
+            wt = getattr(w, 'thread', None) if w is not None else None
+            if wt is not None and wt.isRunning():
+                w.command = 'stop'
+                wt.command = 'stop'
+                # The run() finally performs the end-of-run session finish
+                # (writer join up to 60s) + final .nxs flush -- 5s routinely
+                # lost that race and Qt aborted on the still-running thread,
+                # killing the very flush that protects the data.  30s covers
+                # everything but a wedged NFS write.
+                if not wt.wait(30000):
+                    logger.warning("wrangler thread still finishing at "
+                                   "close after 30s; final flush may be "
+                                   "incomplete")
+                    staticWidget._detach_and_retain_slow_close_thread(
+                        self, wt, "wrangler")
+        except Exception:
+            logger.debug("stopping wrangler thread on close failed",
+                         exc_info=True)
+
+    def _stop_integrator_thread_on_close(self):
+        try:
+            it = getattr(getattr(self, 'integratorTree', None),
+                         'integrator_thread', None)
+            if it is not None and it.isRunning():
+                it.stop_requested = True
+                if not it.wait(15000):
+                    logger.warning("integrator thread still running at "
+                                   "close after 15s")
+                    staticWidget._detach_and_retain_slow_close_thread(
+                        self, it, "integrator")
+        except Exception:
+            logger.debug("stopping integrator thread on close failed",
+                         exc_info=True)
 
     def _stop_stitch_thread_on_close(self):
         try:

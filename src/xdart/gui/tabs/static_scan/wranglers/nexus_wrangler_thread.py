@@ -448,6 +448,7 @@ class nexusThread(wranglerThread):
         # The abspath at frame.source_file stays as-is; the writer relativizes it
         # against source_base at write time.
         self.scan.source_base = getattr(self, "source_base", None)
+        self._active_scan = self.scan
         return self.scan
 
     def _frame_meta(self, scan_meta, base_meta, frame_idx):

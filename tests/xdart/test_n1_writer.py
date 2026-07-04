@@ -199,14 +199,18 @@ def test_nexus_wrangler_thread_initialize_scan_sets_source_base():
     from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler_thread import nexusThread
 
     scan = SimpleNamespace(name=None, gi=None, static=None)
-    t = SimpleNamespace(scan=scan, gi=True, source_base="/proj")
+    t = SimpleNamespace(scan=scan, gi=True, source_base="/proj",
+                        _active_scan=None)
     t._initialize_scan = MethodType(nexusThread._initialize_scan, t)
     assert t._initialize_scan("s").source_base == "/proj"
+    assert t._active_scan is scan
 
     # No source_base on the worker -> None (back-compat, absolute paths).
-    t2 = SimpleNamespace(scan=SimpleNamespace(name=None, gi=None, static=None), gi=False)
+    scan2 = SimpleNamespace(name=None, gi=None, static=None)
+    t2 = SimpleNamespace(scan=scan2, gi=False, _active_scan=None)
     t2._initialize_scan = MethodType(nexusThread._initialize_scan, t2)
     assert getattr(t2._initialize_scan("s"), "source_base", "X") is None
+    assert t2._active_scan is scan2
 
 
 def test_nexus_wrangler_compute_source_base(tmp_path):

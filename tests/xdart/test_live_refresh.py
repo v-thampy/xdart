@@ -778,7 +778,81 @@ def test_close_helper_detaches_slow_stitch_thread(monkeypatch):
     assert retained == [stitch]
 
 
-def test_image_wrangler_browse_cancel_preserves_directory_and_mask(monkeypatch):
+def test_close_helper_detaches_slow_wrangler_thread(monkeypatch):
+    from xdart.gui.tabs.static_scan import static_scan_widget as ssw_mod
+
+    retained = []
+
+    class _RunThread:
+        def __init__(self):
+            self.command = "start"
+            self.wait_calls = []
+            self.parent = "host"
+
+        def isRunning(self):
+            return True
+
+        def wait(self, timeout_ms):
+            self.wait_calls.append(timeout_ms)
+            return False
+
+        def setParent(self, parent):
+            self.parent = parent
+
+    thread = _RunThread()
+    host = SimpleNamespace(wrangler=SimpleNamespace(command="start", thread=thread))
+    monkeypatch.setattr(
+        ssw_mod, "_retain_orphaned_close_thread",
+        lambda slow_thread: retained.append(slow_thread),
+    )
+
+    staticWidget._stop_wrangler_thread_on_close(host)
+
+    assert host.wrangler.command == "stop"
+    assert thread.command == "stop"
+    assert thread.wait_calls == [30000]
+    assert thread.parent is None
+    assert retained == [thread]
+
+
+def test_close_helper_detaches_slow_integrator_thread(monkeypatch):
+    from xdart.gui.tabs.static_scan import static_scan_widget as ssw_mod
+
+    retained = []
+
+    class _RunThread:
+        def __init__(self):
+            self.stop_requested = False
+            self.wait_calls = []
+            self.parent = "host"
+
+        def isRunning(self):
+            return True
+
+        def wait(self, timeout_ms):
+            self.wait_calls.append(timeout_ms)
+            return False
+
+        def setParent(self, parent):
+            self.parent = parent
+
+    thread = _RunThread()
+    host = SimpleNamespace(
+        integratorTree=SimpleNamespace(integrator_thread=thread))
+    monkeypatch.setattr(
+        ssw_mod, "_retain_orphaned_close_thread",
+        lambda slow_thread: retained.append(slow_thread),
+    )
+
+    staticWidget._stop_integrator_thread_on_close(host)
+
+    assert thread.stop_requested is True
+    assert thread.wait_calls == [15000]
+    assert thread.parent is None
+    assert retained == [thread]
+
+
+def test_image_wrangler_browse_cancel_preserves_paths(monkeypatch):
     from xdart.gui.tabs.static_scan.wranglers import image_wrangler as iw_mod
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
 
@@ -797,6 +871,9 @@ def test_image_wrangler_browse_cancel_preserves_directory_and_mask(monkeypatch):
     host = SimpleNamespace(
         img_dir="/old/images",
         mask_file="/old/mask.edf",
+        bg_file="/old/background.tif",
+        bg_dir="/old/backgrounds",
+        img_ext="tif",
         parameters=_Param(),
         _browse_dir=lambda value: value,
     )
@@ -818,9 +895,13 @@ def test_image_wrangler_browse_cancel_preserves_directory_and_mask(monkeypatch):
 
     imageWrangler.set_img_dir(host)
     imageWrangler.set_mask_file(host)
+    imageWrangler.set_bg_file(host)
+    imageWrangler.set_bg_dir(host)
 
     assert host.img_dir == "/old/images"
     assert host.mask_file == "/old/mask.edf"
+    assert host.bg_file == "/old/background.tif"
+    assert host.bg_dir == "/old/backgrounds"
     assert set_values == []
 
 
