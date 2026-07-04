@@ -64,6 +64,21 @@ _PROCESSING_COMPARED_FIELDS: tuple[tuple[str, str], ...] = (
     ("azimuth_range_1d", "1D azimuth range"),
     ("radial_range_2d", "2D radial range"),
     ("azimuth_range_2d", "2D azimuth range"),
+    # S-3: value-affecting, GRID-PRESERVING params.  These change the written
+    # numbers while leaving the axis/npt/range grid identical, so they pass both
+    # the modal and the axis backstop -> mixed provenance under a /entry/reduction
+    # that claims the first run's config.  Compared BACKWARD-TOLERANTLY: a field
+    # absent from a pre-upgrade stored config is _UNSET and skipped (no
+    # false-positive modal on every existing .nxs).
+    ("chi_offset_1d", "1D chi offset"),
+    ("chi_offset_2d", "2D chi offset"),
+    ("monitor_1d", "1D monitor"),
+    ("monitor_2d", "2D monitor"),
+    ("polarization_1d", "1D polarization"),
+    ("polarization_2d", "2D polarization"),
+    ("error_model_1d", "1D error model"),
+    ("error_model_2d", "2D error model"),
+    ("gi_incidence", "GI incidence angle"),
 )
 
 
@@ -84,6 +99,18 @@ class ProcessingConfigSignature:
     azimuth_range_1d: object
     radial_range_2d: object
     azimuth_range_2d: object
+    # S-3 value-affecting/grid-preserving.  Default _UNSET == "not present in this
+    # config"; the comparison skips any field that is _UNSET on either side, so a
+    # pre-upgrade stored config (missing these keys) never triggers a modal.
+    chi_offset_1d: object = _UNSET
+    chi_offset_2d: object = _UNSET
+    monitor_1d: object = _UNSET
+    monitor_2d: object = _UNSET
+    polarization_1d: object = _UNSET
+    polarization_2d: object = _UNSET
+    error_model_1d: object = _UNSET
+    error_model_2d: object = _UNSET
+    gi_incidence: object = _UNSET
 
     @property
     def display_mode(self) -> str:
@@ -186,6 +213,30 @@ def _range_or_none(value: Any) -> object:
         return (str(lo), str(hi))
 
 
+def _num_or_unset(mapping: Mapping[str, Any], keys: Sequence[str]) -> object:
+    """S-3: a numeric config value, or ``_UNSET`` when NONE of the keys is
+    present (so a pre-upgrade config that never stored the field is skipped)."""
+    for key in keys:
+        if key in mapping:
+            value = mapping[key]
+            if value is None or value == "":
+                return None
+            try:
+                return round(float(value), 12)
+            except (TypeError, ValueError):
+                return str(value)
+    return _UNSET
+
+
+def _str_or_unset(mapping: Mapping[str, Any], keys: Sequence[str]) -> object:
+    """S-3: a string-valued config field, or ``_UNSET`` when absent."""
+    for key in keys:
+        if key in mapping:
+            value = mapping[key]
+            return None if value is None else str(value).strip().lower()
+    return _UNSET
+
+
 def _standard_axis_from_unit(unit: object, *, dim: str) -> str:
     text = str(unit or "").lower()
     if "chi" in text and dim == "1d":
@@ -261,6 +312,16 @@ def processing_config_from_args(
         azimuth_range_1d=_range_or_none(a1.get("azimuth_range")),
         radial_range_2d=_range_or_none(a2.get("radial_range")),
         azimuth_range_2d=_range_or_none(a2.get("azimuth_range")),
+        chi_offset_1d=_num_or_unset(a1, ("chi_offset",)),
+        chi_offset_2d=_num_or_unset(a2, ("azimuth_offset", "chi_offset")),
+        monitor_1d=_str_or_unset(a1, ("monitor",)),
+        monitor_2d=_str_or_unset(a2, ("monitor",)),
+        polarization_1d=_num_or_unset(a1, ("polarization_factor", "polarization")),
+        polarization_2d=_num_or_unset(a2, ("polarization_factor", "polarization")),
+        error_model_1d=_str_or_unset(a1, ("error_model",)),
+        error_model_2d=_str_or_unset(a2, ("error_model",)),
+        gi_incidence=_num_or_unset(
+            gic, ("th_val", "incidence", "incident_angle", "incidence_angle")),
     )
 
 
@@ -322,9 +383,14 @@ def append_config_mismatch_check(
     if processed is None or current is None:
         return AppendConfigCheck(ok=True, compared_fields=compared_fields)
 
+    # S-3 backward-tolerant: skip any field that is _UNSET on EITHER side (a
+    # pre-upgrade stored config that never recorded it, or a run that doesn't set
+    # it) -- comparing it would raise a false modal on every existing .nxs.
     mismatches = tuple(
         label for attr, label in _PROCESSING_COMPARED_FIELDS
-        if getattr(processed, attr) != getattr(current, attr)
+        if getattr(processed, attr) is not _UNSET
+        and getattr(current, attr) is not _UNSET
+        and getattr(processed, attr) != getattr(current, attr)
     )
     if not mismatches:
         return AppendConfigCheck(

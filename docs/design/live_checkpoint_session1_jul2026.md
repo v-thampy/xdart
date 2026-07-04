@@ -141,6 +141,10 @@ the 2026-06 visual passes). Data: the 651-frame Eiger baseline + the Eiger_TiN 8
 - [ ] G16 S-16 norm-channel reset: in Overlay, change the Norm Channel mid-overlay — the
       accumulator RESETS (the previously-accumulated curves clear) so normalized and
       un-normalized traces are never mixed on one plot.
+- [ ] G17 S-3 Append signature: Append onto an existing scan after changing chi_offset (or
+      monitor / polarization / error model / GI incidence) but NOT the axis/npt/range — the
+      Run-click modal now BLOCKS it (was silently mixed). Verify NO false modal when Appending onto
+      a PRE-UPGRADE .nxs (written before this field existed) with an unchanged grid.
 
 **PASS ⇒ proceed to RC-8** (merge → tag v1.0.0 → publish; recipe in
 `handoff_chunks_jul2026.md`). Any FAIL: stop, report the item + `kill -USR1 <pid>` stack if a
