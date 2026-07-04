@@ -377,7 +377,10 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         self.plot.addItem(self.region)
         self.plot.setLabel("bottom", self._x_label)
         self.plot.setLabel("left", "Intensity")
-        self.plot.plot(self._x, self._y, pen=pg.mkPen((210, 210, 220), width=1),
+        # UI-5: DATA is markers only (no connecting line), marker size 4 to match
+        # the display widget's 1D plots.
+        self.plot.plot(self._x, self._y, pen=None, symbol='o', symbolSize=4,
+                       symbolBrush=(210, 210, 220), symbolPen=(210, 210, 220),
                        name="data")
         # Region bounds = data extent; keep the chosen window across reloads.
         lo_ext, hi_ext = self._data_extent()
@@ -548,15 +551,22 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         self.plot.addItem(self.region)
         self.plot.setLabel("bottom", self._x_label)
         self.plot.setLabel("left", "Intensity")
-        self.plot.plot(self._x, self._y, pen=pg.mkPen((210, 210, 220), width=1),
+        # UI-5: DATA is markers only (no connecting line) so the fit curve reads
+        # ON TOP of the points, not under a coincident line; marker size matches
+        # the display widget's 1D plots (4).
+        self.plot.plot(self._x, self._y, pen=None, symbol='o', symbolSize=4,
+                       symbolBrush=(210, 210, 220), symbolPen=(210, 210, 220),
                        name="data")
         ox = overlay.x
         if "fit" in overlay.traces:
+            # UI-5: the TOTAL fit stays SOLID.
             self.plot.plot(ox, overlay.traces["fit"],
                            pen=pg.mkPen((189, 147, 249), width=2), name="fit")
         if "background" in overlay.traces:
+            # UI-5: every component except the total fit is DASHED; background
+            # line width +30% (was near-invisible).
             self.plot.plot(ox, overlay.traces["background"],
-                           pen=pg.mkPen((130, 200, 160), width=1,
+                           pen=pg.mkPen((130, 200, 160), width=1.3,
                                         style=QtCore.Qt.PenStyle.DashLine),
                            name="background")
         self._clear_fit()
