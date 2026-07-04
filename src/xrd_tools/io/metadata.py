@@ -306,6 +306,20 @@ def _read_auto_candidate_metadata(path: Path) -> dict[str, MetadataValue] | None
     """Try the appropriate parser for an auto-discovered sidecar."""
     ext = path.suffix.lower().lstrip(".")
 
+    # Defensive cap (review follow-up): the .txt / .pdi primary parsers read the
+    # WHOLE file (path.read_text()) on EVERY frame; the 1 MiB cap previously
+    # guarded only the generic-structured route.  Bound the two first-class auto
+    # routes the same way so a pathological/accidentally-huge companion cannot pin
+    # memory or stall per-frame discovery (a real .pdi/.txt sidecar is a few KB).
+    try:
+        if path.stat().st_size > _AUTO_SIDECAR_MAX_BYTES:
+            logger.warning(
+                "auto metadata: skipping oversize sidecar %s (> %d-byte cap)",
+                path, _AUTO_SIDECAR_MAX_BYTES)
+            return None
+    except OSError:
+        return None
+
     if ext == "txt":
         metadata = read_txt_metadata(path)       # SSRL # Counters / # Motors
         if metadata:
@@ -593,6 +607,18 @@ def read_pdi_metadata(path: Path | str) -> dict[str, float]:
                 extras["epoch"] = float(tail)
             except ValueError:
                 pass
+
+        # BW junk-latch (primary path, review follow-up): the section markers can
+        # match while their captured groups hold only non-float tokens, leaving
+        # counters AND motors empty.  A float epoch tail then made the result
+        # non-empty ({'epoch': ...}) -> a junk .pdi still latched as valid metadata
+        # (the earlier fix only closed the Diffractometer FALLBACK branch).  An
+        # epoch alone is not metadata: require at least one real counter/motor.
+        if not counters and not motors:
+            logger.warning(
+                "read_pdi_metadata: markers matched but no parseable "
+                "counters/motors (epoch-only) in %s -- rejecting", path)
+            return {}
 
         return {**counters, **motors, **extras}
 

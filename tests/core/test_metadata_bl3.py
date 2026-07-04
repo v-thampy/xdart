@@ -147,3 +147,40 @@ def test_junk_pdi_is_rejected_not_fabricated_bw(tmp_path):
     img = _image(tmp_path)
     (tmp_path / "scan_0001.tif.pdi").write_text("garbage;;not;a;pdi;file\n")
     assert read_image_metadata(img, meta_format="auto") == {}
+
+
+def test_epoch_only_pdi_is_rejected_bw(tmp_path):
+    # Review follow-up: the primary-regex path could match the section markers
+    # while their captured groups held only non-float tokens (counters+motors
+    # empty), and a float epoch tail then made the result non-empty ({'epoch':..})
+    # -> a junk .pdi latched.  An epoch alone is not metadata: reject.
+    from xrd_tools.io.metadata import read_pdi_metadata
+
+    content = ("All Counters\njunk data here\n\n# All Motors\nmore junk\n#\n"
+               "1706000000.0")
+    (tmp_path / "epoch.pdi").write_text(content)
+    assert read_pdi_metadata(tmp_path / "epoch.pdi") == {}
+
+    # and auto discovery does not latch such a companion
+    img = _image(tmp_path)
+    (tmp_path / "scan_0001.tif.pdi").write_text(content)
+    assert read_image_metadata(img, meta_format="auto") == {}
+
+
+def test_oversize_pdi_and_txt_auto_routes_are_skipped_bw(tmp_path):
+    # Review follow-up: the 1 MiB cap guarded only the generic-structured route;
+    # the .pdi / .txt primary parsers read the WHOLE file per frame.  An oversize
+    # companion on either first-class auto route must be skipped, not read+parsed.
+    img = _image(tmp_path)
+    big = "All Counters\n" + ("x=1.0\n" * 200_000) + "# All Motors\ny=2.0\n#\n1.0"
+    assert len(big.encode()) > (1 << 20)
+    (tmp_path / "scan_0001.tif.pdi").write_text(big)
+    assert read_image_metadata(img, meta_format="auto") == {}
+
+    # same for an oversize .txt companion
+    import xrd_tools.io.metadata as _m
+    _m._AUTO_SIDECAR_CACHE.clear(); _m._DIR_LISTING_CACHE.clear()
+    (tmp_path / "scan_0001.tif.pdi").unlink()
+    (tmp_path / "scan_0001.tif.txt").write_text(
+        "# Counters\n" + ("a 1.0\n" * 200_000))
+    assert read_image_metadata(img, meta_format="auto") == {}
