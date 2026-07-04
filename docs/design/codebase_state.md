@@ -1,6 +1,6 @@
 # xrd-tools — Codebase State
 
-**Updated:** 2026-07-03 (pre-v1.0.0 merge) · **Convention:** this is the ALTITUDE view — health,
+**Updated:** 2026-07-04 (pre-v1.0.0 merge, post blocker-wave) · **Convention:** this is the ALTITUDE view — health,
 direction, features. Update at every release and major merge. Chunk-level execution lives in the
 MASTER TABLE (`handoff_chunks_jul2026.md`); bug-level truth in `live_findings_ledger.md`.
 
@@ -14,10 +14,10 @@ One monorepo, two packages, five north-star goals (roadmap_2026-06-10):
 ## Health dashboard (v1.0.0 candidate)
 | Signal | State |
 |---|---|
-| Core suite | ~1467 passed (grows weekly; includes byte-compat + schema + purity + architecture guards) |
-| Offscreen GUI suite | ~1300+ across files; known: run `test_gui_modes_end_to_end.py` with `-p no:faulthandler` (152 ✓); exit 133/139 at teardown is a known PySide artifact — read the `N passed` line |
+| Core suite | ~1513 passed (grows weekly; includes byte-compat + schema + purity + architecture guards) |
+| Offscreen GUI suite | ~1300+ across files; known: gui_modes exits cleanly natively since the Qt-fixture teardown fix (153 ✓, true exit 0); `test_controls_panel_v2.py` still segfaults WITH the pytest-faulthandler plugin (plugin↔Qt teardown interaction) — run offscreen suites with `-p no:faulthandler` (cp2 100 ✓, live_refresh 248 ✓) |
 | Equivalence spine | `test_gi_batch_real_data.py` — 71 incl. production multi-mode; the live≡batch≡reload guarantee |
-| Perf baseline | 651-frame Eiger Int-2D live ≈ 25 s at the measured 4-worker knee (worker sweep 2026-07-03: speed saturates at 4; ~1 GB RSS per extra worker). Making that knee the default cap is MEM-3, still in flight. |
+| Perf baseline | 651-frame Eiger Int-2D live ≈ 25 s at the measured 4-worker knee (worker sweep 2026-07-03: speed saturates at 4; ~1 GB RSS per extra worker). That knee is now the default reduction-pool cap (MEM-3, `e75c1a80`: `min(4,cpu)` + RAM floor + honest Cores knob + `XDART_REDUCTION_WORKERS`). |
 | Memory | Peak RSS ≈ 9 GB, FULLY ACCOUNTED (pyFAI ~2 GB + ~4 integrator copies ~3-4 GB + transient high-water; see `review_2026-07-02_memory_load.md` + addendum). Plateaus — not a leak. Steady-state observed ~3.5 GB (macOS compressed-memory accounting differs from RSS). Windows are RAM-aware (16–64 frames, `XDART_HEAVY_WINDOW`) |
 | Structural guards | One-store done-test grep-guard · monotonic overlay-accumulator test · memory plateau gate · readiness purity · placement/import guards · MS-1 run-end reconciliation |
 | Live tunables | `XDART_FLUSH_MS` (150, floor 110) · `XDART_LIST_MS` (60) · `XDART_PERF=1` per-leg timings · `kill -USR1` all-thread stack dump |
@@ -46,7 +46,7 @@ One monorepo, two packages, five north-star goals (roadmap_2026-06-10):
 
 ## Current features (v1.0.0, user-facing)
 - **Processing:** Int 1D/2D, Standard + Grazing; streaming live/batch with parallel reduction
-  (measured 4-worker knee; default cap pending MEM-3) + single fail-loud writer; Append with instant already-done skip;
+  (4-worker knee, the MEM-3 default cap) + single fail-loud writer; Append with instant already-done skip;
   series-average; Reintegrate 1D/2D; per-mode durable GI results (survive reload).
 - **Display:** Single / Overlay / Waterfall with CROSS-SCAN comparison (grid-keyed identity),
   PINNED SLICE CUTS (Pin button / Cmd+P — χ-cuts at multiple q per frame; texture workflow),
@@ -62,9 +62,11 @@ One monorepo, two packages, five north-star goals (roadmap_2026-06-10):
   cross-process file-conflict hints; one-modal error dialog (app stays up).
 
 ## In flight (pre-tag)
-MEM-3 worker-pool guardrail (honest Cores knob, warn >knee, RAM floor) → RC-FV final
-verification → maintainer live Session-1 (closes every fixed-unverified ledger row) → RC-8
-merge → tag → PyPI.
+Blocker wave COMPLETE (~30 commits: BL-1..6 · S-3..S-21 · BW-A1..A5 · MEM-3 · OV-7b/c · UI-5 ·
+modal unify; BL-6 x-grid regression proven absent at HEAD, `5a12f096`). Remaining: full
+core+offscreen gate at the frozen SHA → RC-FV final verification → maintainer live Session-1
+(closes every fixed-unverified ledger row; S-4 χ real-data validation = G18) →
+snapshot-publish (docs/design stripped) + tag v1.0.0 → PyPI.
 
 ## Direction (post-1.0, from the master table — priority order)
 1. **7c + ADR decision** (H10): cadence/eviction policy → session; enables second sinks

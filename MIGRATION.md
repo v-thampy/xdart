@@ -213,7 +213,7 @@ pre-migration reference signature.  Two additive notes:
    disable metadata, or `spec` for SPEC files.
 14. **Append config-mismatch is now a Run-click MODAL (CF-1/CF-2), not a silent
    no-op.** Appending into an existing `.nxs` with a reduction config that
-   differs from the stored one now prompts (proceed / switch to Replace) instead
+   differs from the stored one now prompts (Yes = switch to Replace and re-integrate, No = leave untouched) instead
    of silently mixing differently-reduced rows under a `/entry/reduction` that
    claims the first run's config.
 15. **Series-average Append onto an existing averaged output is REFUSED

@@ -17,7 +17,7 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 
 ---
 
-## MASTER STATUS TABLE (2026-07-03) — the status authority; agents update THIS table
+## MASTER STATUS TABLE (2026-07-04) — the status authority; agents update THIS table
 *(The per-wave tables further below are frozen history; briefs for each ID live below them and in
 `codex_tasks/`. Bug-level status lives in `live_findings_ledger.md`. Effort: S≤2h · M≤1day · L=days.)*
 
@@ -46,7 +46,7 @@ dispatch surface: each chunk below is a self-contained brief for a hand-off agen
 | H-hyd | Hydration purpose-scoping residuals (full→1d leaks, dedupe key, Sum/Avg churn) | S×4 | low | no 60MB/frame churn loops | H7-gate | **DONE** `cba5995c` |
 | MEM-1 | OOM triad: bounded `_published_frames` handoff + free raw on staging eviction + `mark_dropped` release + viewer LRU cap wins (MEM-1a-d) | M | med | live-mode OOM class closed | review_2026-07-02_memory_load [1][2][3][12] | **DONE** `30eeab4e`; live-verify Session-1 (RSS bounds) |
 | MEM-2 | RAM-aware heavy window: `heavy_window(frame_bytes)=clamp(25% RAM/frame_bytes,16,64)`, `XDART_HEAVY_WINDOW` override; all three caps consume it | S | low | small-RAM boxes stop thrashing; 64-cap becomes budget-derived | MEM-1 | **DONE** `fb074d6f` + S-11 wiring (PublicationStore resizes at streaming-session create/reuse; detector-shape cache key) |
-| MEM-3 | Reduction pool cap `min(4,cpu)` + memory-aware floor + `XDART_REDUCTION_WORKERS` + honest Cores knob | S | low-med | ~-3 GB peak at same speed; small-RAM floor | MEM-2 | **IN FLIGHT** (mem2 worktree; port pending) |
+| MEM-3 | Reduction pool cap `min(4,cpu)` + memory-aware floor + `XDART_REDUCTION_WORKERS` + honest Cores knob | S | low-med | ~-3 GB peak at same speed; small-RAM floor | MEM-2 | **DONE** `e75c1a80` |
 | RC-FV | Final verification (full suite, strict-tree, build, staging) | S | none | certifies the tag commit | Waves 1-3 | **QUEUED** (`release_final_verification.md`) |
 | RC-7s | Maintainer live Session-1 | — | — | closes every fixed-unverified row | RC-FV | **PENDING** (maintainer) |
 | RC-8 | Merge → tag v1.0.0 → publish + stubs + branch cleanup | S | low | **v1.0.0 on PyPI** | RC-7s, repo-public decision | **PENDING** (maintainer) |
@@ -229,7 +229,7 @@ Lane D (tests/bounds):  {H2, H3, H4, H5} — anytime, no dependencies
 | H11 | ViewerModeHandler seam (rides inside H8/H9 commits) | M | with H8/H9 | open |
 | H12 | Liveness step 5: render-leg instrumentation, then level-reuse/subsampled percentiles (`image_widget.py`) | M | — | open |
 | H13 | Liveness step 6 bundle: viewer-mode off-thread loads + coalesced emits (verify `c89fa406` scope first), `_teardown_load_worker` non-blocking retirement, `update_scans` memoize/offload, config-panel stash-restore. *(Item (d) `_get_wavelength` cache moved PRE-release into `codex_tasks/fix_fastselect_sweep_beachball_and_popup.md`.)* | M | before H8 | open |
-| H14 | Waterfall accumulator bounding (geometric growth + cap/decimation) | S/M | bundle with H12 | **in progress (maintainer, uncommitted WIP 2026-07-01)** |
+| H14 | Waterfall accumulator bounding (geometric growth + cap/decimation) | S/M | bundle with H12 | **DONE** `084f3410` (see master table) |
 | H15 | CP2 Phase 5: ToolDescriptor/PageDescriptor refactor (FIRST commit) + native Stitch/RSM pages | L | H6 (persistence) | open |
 | H16 | Extract xdart dotted-path entry points from `readiness.py:1587-1663` → GUI-side AnalysisContext binding | S | before Phase 6 launchers | open |
 | H17 | Source-registry seam tests + SourceKind extension-policy note (Bluesky) | S | — | open |

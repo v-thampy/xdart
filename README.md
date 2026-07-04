@@ -395,9 +395,8 @@ critical angle αc = √2δ, with exit angle αf = arcsin(qz/k − sin αi)):
   **Yoneda band**. Measured intensity carries |T(αi)|²|T(αf)|²; dividing it out removes the
   Yoneda enhancement and recovers the true scattering.
 
-Design: [`docs/design/design_intensity_corrections_jun2026.md`](https://github.com/v-thampy/xrd-tools/blob/main/docs/design/design_intensity_corrections_jun2026.md)
-(per-pixel weight stack at the accumulator seam — solid-angle/polarization reuse pyFAI arrays,
-the GI stack uses `xu.materials`). Interactive demo with on/off toggles, an αi slider and a
+Implemented as a per-pixel weight stack at the accumulator seam — solid-angle/polarization
+reuse pyFAI arrays, the GI stack uses `xu.materials`. Interactive demo with on/off toggles, an αi slider and a
 material selector: `examples/notebooks/02_multigeometry_stitching.ipynb`.
 
 ---
@@ -492,8 +491,9 @@ on an already-processed scan is near-instant: frames already in the output are
 skipped without re-reading the raw data. If the current processing
 configuration no longer matches the existing scan (e.g. you switched Standard
 <-> Grazing), Run shows a **Replace existing integration?** dialog —
-*Replace & re-integrate* re-processes all frames under the new configuration;
-*Cancel* leaves the existing scan untouched.
+click **Yes** to switch to Replace and re-process all frames under the new
+configuration, or **No** to leave the existing scan untouched (the run does
+not start).
 
 #### Live mode (Live 1D, Live 2D)
 
