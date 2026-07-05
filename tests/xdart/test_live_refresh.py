@@ -2172,6 +2172,11 @@ def test_live_new_scan_invalidates_publication_store():
     host._rescope_frame_panel_to = MethodType(
         staticWidget._rescope_frame_panel_to, host,
     )
+    # new_scan's rescope tail seeds append-skipped processed frames; this host's
+    # wrangler thread has no write_mode ("Append"), so the real method no-ops.
+    host._seed_append_processed_frame_browser = MethodType(
+        staticWidget._seed_append_processed_frame_browser, host,
+    )
 
     # Same-name re-run (name matches scan.name="old") -> IN SYNC with the frame
     # stream -> new_scan performs the destructive clear + store invalidation.  (A
