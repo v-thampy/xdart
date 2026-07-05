@@ -233,7 +233,7 @@ def _decimate_display_ids(ids, max_rows=MAX_WATERFALL_PAYLOAD_ROWS) -> tuple:
     return ids[::stride]
 
 
-def _display_ids_for_2d(state) -> tuple:
+def _display_ids_for_2d(state, widget=None) -> tuple:
     """Frames the 2D cake / raw panel should render (Vivek's contract).
 
     Only Sum/Average AGGREGATE the whole selection; Single/Overlay/Waterfall show
@@ -243,6 +243,13 @@ def _display_ids_for_2d(state) -> tuple:
     ids = tuple(state.render_ids)
     if getattr(state, "method", None) in ("Sum", "Average"):
         return ids
+    anchor = getattr(widget, "_browse_one_shot_anchor_label", None)
+    try:
+        anchor = int(anchor)
+    except (TypeError, ValueError):
+        anchor = None
+    if anchor is not None and anchor in {_label_key(label) for label in ids}:
+        return (anchor,)
     return ids[-1:]
 
 
@@ -406,7 +413,8 @@ class PublicationDisplayAdapter:
         accum = None
         count = 0
         mask_parts = []   # per-frame detector masks, for the thumbnail gap re-bake
-        display_ids = _display_ids_for_2d(state)   # current frame, or all for Sum/Average
+        display_ids = _display_ids_for_2d(
+            state, self._widget)   # current frame, or all for Sum/Average
         for label in display_ids:
             publication = self._items.get(_label_key(label))
             if publication is None:
@@ -529,7 +537,7 @@ class PublicationDisplayAdapter:
 
         # The cake renders the CURRENT frame for Single/Overlay/Waterfall and the
         # aggregate only for Sum/Average (Vivek's contract, _display_ids_for_2d).
-        display_ids = _display_ids_for_2d(state)
+        display_ids = _display_ids_for_2d(state, self._widget)
 
         # Eviction guard.  For Sum/Average the cake aggregates the WHOLE intended
         # set, so check store residency against selected_ids and serve the on-disk

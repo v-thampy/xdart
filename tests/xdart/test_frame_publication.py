@@ -1417,6 +1417,55 @@ def test_browse_one_shot_snapshot_builds_payload_past_store_caps():
     assert len(payload.plot.traces) == 5
 
 
+def test_browse_one_shot_anchor_supplies_2d_while_plot_uses_full_selection():
+    from threading import RLock
+
+    from xdart.gui.tabs.static_scan.display_controllers import ScanDisplayController
+
+    store = PublicationStore(max_items=None, max_heavy_items=1)
+    publications = {}
+    for idx in range(1, 33):
+        frame = DuckFrame(idx=idx)
+        publications[idx] = publication_from_live_frame(
+            frame,
+            include_2d=False,
+            include_thumbnail=False,
+            retain_raw_ref=False,
+        )
+    anchor_frame = DuckFrame(idx=17)
+    anchor_frame.thumbnail = np.full((2, 2), 17.0)
+    publications[17] = publication_from_live_frame(anchor_frame)
+    store.upsert(publications[17])
+
+    widget = _int_widget()
+    widget.viewer_mode = None
+    widget.frame_ids = [str(i) for i in range(1, 33)]
+    widget.publication_store = store
+    widget._browse_one_shot_target_labels = tuple(range(1, 33))
+    widget._browse_one_shot_publications = publications
+    widget._browse_one_shot_anchor_label = 17
+    widget.scan = SimpleNamespace(
+        name="scan",
+        gi=False,
+        scan_lock=RLock(),
+        frames=SimpleNamespace(index=list(range(1, 33))),
+    )
+    widget.ui.plotMethod = SimpleNamespace(currentText=lambda: "Single")
+    widget.overlaid_idxs = ()
+    widget.display_generation = store.generation
+    widget._raw_full_shape = None
+
+    controller = ScanDisplayController()
+    state = controller.compute_state(widget, Mode.INT_2D)
+    payload = controller.build_payload(widget, state)
+
+    assert state.render_ids == tuple(range(1, 33))
+    assert payload.plot is not None
+    assert len(payload.plot.traces) == 32
+    assert payload.raw_image is not None
+    assert payload.cake_image is not None
+
+
 def test_overlay_payload_appends_stale_hydrated_selection_queue_in_order():
     store = PublicationStore()
     for idx in range(21):

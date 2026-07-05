@@ -4812,6 +4812,8 @@ class staticWidget(QWidget):
                 getattr(self.h5viewer, "_browse_one_shot_publications", {})
                 or {}
             )
+            self.displayframe._browse_one_shot_anchor_label = getattr(
+                self.h5viewer, "_browse_one_shot_anchor_label", None)
             overlay_pending = list(
                 getattr(self.h5viewer, "_overlay_hydrated_pending_append_labels", ())
                 or ()

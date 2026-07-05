@@ -30,6 +30,7 @@ import numpy as np
 
 from .display_logic import (
     Axis,
+    ConsumerKind,
     DataTier,
     DisplayPayload,
     ImagePayload,
@@ -52,6 +53,7 @@ from .display_logic import (
 from .display_publication import (
     PublicationDisplayAdapter,
 )
+from .browse_debug import browse_debug_log, sequence_summary
 
 logger = logging.getLogger(__name__)
 
@@ -122,8 +124,26 @@ class _FrameIndexCount:
         raise RuntimeError("frame labels were requested from a count-only index")
 
 
-def _data_snapshot(widget, *, mode, labels=None, include_legacy=True,
-                   request_2d_hydration=True):
+def _browse_one_shot_anchor_label(widget, selected_ids=()):
+    if getattr(widget, "viewer_mode", None) is not None:
+        return None
+    anchor = getattr(widget, "_browse_one_shot_anchor_label", None)
+    try:
+        anchor = int(anchor)
+    except (TypeError, ValueError):
+        return None
+    target = set(_label_keys(
+        getattr(widget, "_browse_one_shot_target_labels", ()) or ()))
+    selected = set(_label_keys(selected_ids or ()))
+    if target and anchor not in target:
+        return None
+    if selected and anchor not in selected:
+        return None
+    return anchor
+
+
+def _data_snapshot(widget, *, mode, labels=None, two_d_labels=None,
+                   include_legacy=True, request_2d_hydration=True):
     """Snapshot loaded keys + per-frame raw/thumbnail availability.
 
     X1 (Phase 3a): the PublicationStore is the primary source.  Viewer modes
@@ -134,6 +154,9 @@ def _data_snapshot(widget, *, mode, labels=None, include_legacy=True,
     loaded_1d, loaded_2d, raw_avail = set(), set(), {}
     if labels is None:
         labels = ()
+    label_keys = _label_keys(labels)
+    two_d_keys = _label_keys(labels if two_d_labels is None else two_d_labels)
+    two_d_key_set = set(two_d_keys)
     snapshot_items = _browse_one_shot_publication_items(widget, labels)
     for label, publication in snapshot_items.items():
         view = getattr(publication, "view", None)
@@ -142,14 +165,17 @@ def _data_snapshot(widget, *, mode, labels=None, include_legacy=True,
         key = _label_key(label)
         if getattr(view, "has_1d", False):
             loaded_1d.add(key)
-        if getattr(view, "has_2d", False):
+        if key in two_d_key_set and getattr(view, "has_2d", False):
             loaded_2d.add(key)
-        if getattr(view, "raw", None) is not None or getattr(view, "thumbnail", None) is not None:
+        if key in two_d_key_set and (
+            getattr(view, "raw", None) is not None
+            or getattr(view, "thumbnail", None) is not None
+        ):
             raw_avail[key] = {
                 "has_raw": getattr(view, "raw", None) is not None,
                 "has_thumbnail": getattr(view, "thumbnail", None) is not None,
             }
-    for label in _label_keys(labels):
+    for label in two_d_keys:
         if mode in (Mode.INT_2D, Mode.IMAGE_VIEWER, Mode.NEXUS_VIEWER):
             r_2d = resolve_frame_data_for_widget(
                 widget, label, mode, DataTier.TWO_D,
@@ -159,6 +185,34 @@ def _data_snapshot(widget, *, mode, labels=None, include_legacy=True,
                 widget, label, mode, DataTier.RAW_OR_THUMBNAIL,
                 include_legacy=include_legacy,
                 request_hydration=request_2d_hydration)
+            browse_debug_log(
+                logger,
+                "panel_2d_resolution",
+                requested_frame=label,
+                consumer=ConsumerKind.CAKE_2D.value,
+                tier=DataTier.TWO_D.value,
+                read_status=getattr(r_2d.status, "value", str(r_2d.status)),
+                source=r_2d.source,
+                painted_or_blanked=(
+                    "candidate" if r_2d.status is ReadStatus.RESIDENT
+                    else "blank_await"
+                ),
+            )
+            browse_debug_log(
+                logger,
+                "panel_2d_resolution",
+                requested_frame=label,
+                consumer=ConsumerKind.RAW_2D.value,
+                tier=DataTier.RAW_OR_THUMBNAIL.value,
+                read_status=getattr(r_raw.status, "value", str(r_raw.status)),
+                source=r_raw.source,
+                has_raw=bool(r_raw.has_raw),
+                has_thumbnail=bool(r_raw.has_thumbnail),
+                painted_or_blanked=(
+                    "candidate" if r_raw.status is ReadStatus.RESIDENT
+                    else "blank_await"
+                ),
+            )
             if r_2d.status is ReadStatus.RESIDENT:
                 loaded_2d.add(_label_key(label))
             if r_raw.status is ReadStatus.RESIDENT:
@@ -166,6 +220,7 @@ def _data_snapshot(widget, *, mode, labels=None, include_legacy=True,
                     "has_raw": bool(r_raw.has_raw),
                     "has_thumbnail": bool(r_raw.has_thumbnail),
                 }
+    for label in label_keys:
         if mode in (Mode.INT_1D, Mode.INT_2D, Mode.XYE_VIEWER, Mode.NEXUS_VIEWER):
             r_1d = resolve_frame_data_for_widget(
                 widget, label, mode, DataTier.ONE_D,
@@ -338,6 +393,16 @@ class _BaseController:
         labels = _candidate_labels(mode, selected_ids, all_index)
         store = getattr(widget, "publication_store", None)
         method = widget.ui.plotMethod.currentText()
+        browse_anchor = (
+            _browse_one_shot_anchor_label(widget, selected_ids)
+            if (
+                mode is Mode.INT_2D
+                and method in ("Single", "Overlay", "Waterfall")
+                and len(selected_ids) > 1
+            )
+            else None
+        )
+        two_d_labels = (browse_anchor,) if browse_anchor is not None else labels
         aggregate_owns_2d = (
             mode is Mode.INT_2D
             and method in ("Sum", "Average")
@@ -349,8 +414,10 @@ class _BaseController:
             widget,
             mode=mode,
             labels=labels,
+            two_d_labels=two_d_labels,
             include_legacy=mode not in (Mode.INT_1D, Mode.INT_2D),
-            request_2d_hydration=not aggregate_owns_2d,
+            request_2d_hydration=(
+                not aggregate_owns_2d and browse_anchor is None),
         )
         return compute_display_state(
             mode=mode,

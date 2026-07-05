@@ -4043,6 +4043,7 @@ def test_browse_missing_selection_waits_for_bulk_load_before_render():
     assert list_data.selected_calls == 1
     assert viewer._pending_load_ids == list(range(1, 74))
     assert viewer._pending_load_2d is False
+    assert viewer._browse_one_shot_anchor_label == 73
     assert load_timer.started == 1
     assert update_timer.started == 0
 
@@ -4079,6 +4080,7 @@ def test_show_all_selects_all_and_waits_for_one_bulk_render():
     assert len(list_data.selectedItems()) == 3621
     assert viewer._pending_load_ids == list(range(1, 3622))
     assert viewer._pending_load_2d is False
+    assert viewer._browse_one_shot_anchor_label == 3621
     assert load_timer.started == 1
     assert update_timer.started == 0
 
@@ -4201,6 +4203,43 @@ def test_overlay_visit_completion_hands_append_queue_to_final_render():
 
     assert emitted == ["update"]
     assert viewer._overlay_hydrated_pending_append_labels == [1, 2, 3]
+
+
+def test_browse_one_shot_completion_schedules_one_heavy_anchor_load():
+    thread = object()
+    emitted = []
+    heavy_loads = []
+    viewer = SimpleNamespace(
+        _load_generation=5,
+        _browse_one_shot_load_generation=5,
+        _browse_one_shot_pending_render=True,
+        _browse_gesture_active=False,
+        _browse_one_shot_anchor_label=32,
+        _browse_anchor_heavy_after_next_render=None,
+        _browse_anchor_heavy_inflight_label=None,
+        _browse_one_shot_publications={},
+        _overlay_visit_inflight_labels=(),
+        _overlay_hydrated_pending_append_labels=[],
+        _update_coalesce_timer=_FakeTimer(active=False),
+        _load_thread=thread,
+        _load_worker=object(),
+        _run_writing=False,
+        _plot_method="Single",
+        ui=SimpleNamespace(plotMethod=SimpleNamespace(currentText=lambda: "Single")),
+        publication_store=None,
+        sender=lambda: thread,
+        sigUpdate=SimpleNamespace(emit=lambda: emitted.append("update")),
+    )
+    viewer.load_frames_data = lambda ids, load_2d: heavy_loads.append(
+        (list(ids), bool(load_2d)))
+    viewer._clear_load_worker_refs = MethodType(
+        H5Viewer._clear_load_worker_refs, viewer)
+
+    viewer._clear_load_worker_refs()
+
+    assert emitted == ["update"]
+    assert heavy_loads == [([32], True)]
+    assert viewer._browse_anchor_heavy_inflight_label == 32
 
 
 def test_browse_bulk_absorb_publishes_light_1d_rows_outside_heavy_window():

@@ -194,6 +194,29 @@ def _browse_debug_mode(viewer) -> str:
         return str(getattr(viewer, "_plot_method", ""))
 
 
+def _current_selected_frame_label(viewer, candidates=()):
+    candidate_values = []
+    for candidate in candidates or ():
+        try:
+            candidate_values.append(int(candidate))
+        except (TypeError, ValueError):
+            continue
+    candidate_set = set(candidate_values)
+    item = None
+    try:
+        item = viewer.ui.listData.currentItem()
+    except Exception:
+        item = None
+    if item is not None:
+        try:
+            label = int(item.text())
+        except (TypeError, ValueError):
+            label = None
+        if label is not None and (not candidate_set or label in candidate_set):
+            return label
+    return candidate_values[-1] if candidate_values else None
+
+
 @dataclass
 class _ViewerRow:
     """Lightweight row used by Image/XYE/NeXus viewer modes.
@@ -834,6 +857,9 @@ class H5Viewer(QWidget):
         self._browse_one_shot_target_labels = ()
         self._browse_one_shot_publications = {}
         self._browse_one_shot_signature = None
+        self._browse_one_shot_anchor_label = None
+        self._browse_anchor_heavy_after_next_render = None
+        self._browse_anchor_heavy_inflight_label = None
         self._browse_last_selection_signature = None
         self._overlay_visit_intent_labels = []
         self._overlay_visit_inflight_labels = ()
@@ -2455,6 +2481,8 @@ class H5Viewer(QWidget):
         )
         if granted:
             self.sigUpdate.emit()
+            H5Viewer._drain_browse_anchor_heavy_after_render(
+                self, requestor=requestor)
 
     def _emit_file_thread_update(self) -> None:
         self._emit_render_update("h5viewer.file_thread")
@@ -2488,6 +2516,9 @@ class H5Viewer(QWidget):
         self._browse_one_shot_target_labels = ()
         self._browse_one_shot_publications = {}
         self._browse_one_shot_signature = None
+        self._browse_one_shot_anchor_label = None
+        self._browse_anchor_heavy_after_next_render = None
+        self._browse_anchor_heavy_inflight_label = None
 
     def _prime_browse_one_shot_snapshot(self, labels, store=None):
         target = tuple(int(label) for label in labels)
@@ -2504,6 +2535,86 @@ class H5Viewer(QWidget):
         self._browse_one_shot_target_labels = target
         self._browse_one_shot_publications = publications
         return publications
+
+    def _browse_anchor_has_2d_payload(self, label) -> bool:
+        try:
+            label_key = int(label)
+        except (TypeError, ValueError):
+            return False
+        snapshot = getattr(self, "_browse_one_shot_publications", None) or {}
+        publication = snapshot.get(label_key)
+        if publication is None:
+            store = getattr(self, "publication_store", None)
+            get = getattr(store, "get", None)
+            if callable(get):
+                try:
+                    publication = get(label_key)
+                except Exception:
+                    publication = None
+        view = getattr(publication, "view", None)
+        if view is None or not getattr(view, "has_2d", False):
+            return False
+        return (
+            getattr(view, "raw", None) is not None
+            or getattr(view, "thumbnail", None) is not None
+        )
+
+    def _queue_browse_anchor_heavy_after_render(self, *, reason: str) -> None:
+        if _browse_debug_mode(self) not in ("Single", "Overlay", "Waterfall"):
+            return
+        label = getattr(self, "_browse_one_shot_anchor_label", None)
+        if label is None:
+            return
+        try:
+            label = int(label)
+        except (TypeError, ValueError):
+            return
+        if H5Viewer._browse_anchor_has_2d_payload(self, label):
+            return
+        self._browse_anchor_heavy_after_next_render = label
+        browse_debug_log(
+            logger,
+            "browse_anchor_heavy_queued",
+            mode=_browse_debug_mode(self),
+            reason=reason,
+            labels=sequence_summary((label,)),
+        )
+
+    def _drain_browse_anchor_heavy_after_render(self, *, requestor: str) -> None:
+        label = getattr(self, "_browse_anchor_heavy_after_next_render", None)
+        if label is None:
+            return
+        self._browse_anchor_heavy_after_next_render = None
+        H5Viewer._schedule_browse_anchor_heavy_load(
+            self, label, requestor=requestor)
+
+    def _schedule_browse_anchor_heavy_load(self, label, *, requestor: str) -> None:
+        try:
+            label = int(label)
+        except (TypeError, ValueError):
+            return
+        if getattr(self, "_run_writing", False):
+            browse_debug_log(
+                logger,
+                "browse_anchor_heavy_suppressed",
+                mode=_browse_debug_mode(self),
+                reason="run_writing",
+                labels=sequence_summary((label,)),
+            )
+            return
+        if H5Viewer._browse_anchor_has_2d_payload(self, label):
+            return
+        if getattr(self, "_browse_anchor_heavy_inflight_label", None) == label:
+            return
+        self._browse_anchor_heavy_inflight_label = label
+        browse_debug_log(
+            logger,
+            "browse_anchor_heavy_scheduled",
+            mode=_browse_debug_mode(self),
+            requestor=requestor,
+            labels=sequence_summary((label,)),
+        )
+        self.load_frames_data([label], True)
 
     def _capture_overlay_visit_intent(self) -> None:
         if getattr(self, "viewer_mode", None) in ("image", "xye", "nexus"):
@@ -2700,6 +2811,8 @@ class H5Viewer(QWidget):
 
         signature = (tuple(int_idxs), bool(load_2d), _browse_debug_mode(self))
         if browse_bulk_one_shot:
+            self._browse_one_shot_anchor_label = _current_selected_frame_label(
+                self, int_idxs)
             if (not show_all
                     and signature == getattr(
                         self, "_browse_last_selection_signature", None)):
@@ -2820,6 +2933,9 @@ class H5Viewer(QWidget):
             if overlay_visit_labels:
                 self._overlay_hydrated_pending_append_labels = list(
                     overlay_visit_labels)
+            elif browse_bulk_one_shot:
+                H5Viewer._queue_browse_anchor_heavy_after_render(
+                    self, reason="resident_one_shot")
         browse_debug_log(
             logger,
             "render_request",
@@ -3092,6 +3208,20 @@ class H5Viewer(QWidget):
                             snapshot = {}
                             self._browse_one_shot_publications = snapshot
                         snapshot[frame_idx] = publication
+                elif load_2d:
+                    anchor = getattr(self, "_browse_one_shot_anchor_label", None)
+                    try:
+                        anchor = int(anchor)
+                    except (TypeError, ValueError):
+                        anchor = None
+                    if frame_idx == anchor:
+                        snapshot = getattr(
+                            self, "_browse_one_shot_publications", None)
+                        if not isinstance(snapshot, dict):
+                            snapshot = {}
+                            self._browse_one_shot_publications = snapshot
+                        snapshot[frame_idx] = publication
+                        self._browse_anchor_heavy_inflight_label = None
             browse_debug_log(
                 logger,
                 "bulk_hydration_chunk_completed",
@@ -3439,6 +3569,9 @@ class H5Viewer(QWidget):
                     self._overlay_hydrated_pending_append_labels = list(
                         overlay_labels)
                     self._overlay_visit_inflight_labels = ()
+                else:
+                    H5Viewer._queue_browse_anchor_heavy_after_render(
+                        self, reason="one_shot_worker_finished")
                 self._browse_one_shot_pending_render = False
                 self._browse_one_shot_load_generation = None
                 if getattr(self, "_browse_gesture_active", False):
@@ -3454,6 +3587,8 @@ class H5Viewer(QWidget):
                         suppressed_by="active_browse_gesture",
                     )
                     return
+            else:
+                self._browse_anchor_heavy_inflight_label = None
             emit_render = getattr(self, "_emit_render_update", None)
             if callable(emit_render):
                 emit_render(
@@ -3462,6 +3597,8 @@ class H5Viewer(QWidget):
                 )
             else:
                 self.sigUpdate.emit()
+                H5Viewer._drain_browse_anchor_heavy_after_render(
+                    self, requestor="h5viewer.load_worker_finished")
 
     # Removed legacy load_frame_data — all reads now go through
     # LiveFrame.load_from_nexus via load_frames_data above.

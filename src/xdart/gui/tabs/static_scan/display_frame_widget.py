@@ -702,6 +702,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._hydration_worker = None
         self._async_hydration_enabled = False
         self._hydration_pending_labels = set()
+        self._browse_one_shot_anchor_label = None
         self._overlay_hydrated_pending_append_labels = deque()
         self._hydration_failure_counts = {}
         self._hydration_failure_logged = set()
@@ -4020,6 +4021,19 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         method = getattr(self, 'plotMethod', '') or ''
         if (method not in ('Sum', 'Average') and not self.scan.single_img
                 and not getattr(self.scan, 'series_average', False)):
+            anchor = getattr(self, "_browse_one_shot_anchor_label", None)
+            try:
+                anchor = int(anchor)
+            except (TypeError, ValueError):
+                anchor = None
+            if anchor is not None:
+                try:
+                    selected = {int(i) for i in getattr(self, "frame_ids", ())}
+                except (TypeError, ValueError):
+                    selected = set()
+                if anchor in selected:
+                    self.ui.labelCurrent.setText(f'{label}_{anchor}')
+                    return
             idxs = getattr(self, 'idxs_2d', None) or getattr(self, 'idxs_1d', None) or []
             if idxs:
                 self.ui.labelCurrent.setText(f'{label}_{idxs[-1]}')
