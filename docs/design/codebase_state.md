@@ -83,6 +83,11 @@ snapshot-publish (docs/design + docs/history stripped) + tag v1.0.0 → PyPI.
 7. **Memory (declined-for-now, priced):** shared read-only pyFAI geometry (−3-4 GB at the knee;
    thread-safety/spine/pyFAI-coupling risks — build only if the 9 GB peak demonstrably hurts);
    native-dtype raw ([5]); `frame.py` npt=10000 default landmine.
+8. **Overlay/waterfall completeness (PERF-3 residual, scoped 2026-07-05):** run-end backfill of the
+   live-lagged tail. Option A (ending scan, order-safe append) may land pre-tag; Option B (complete
+   earlier directory scans via ordered rebuild OR append/paint decoupling — keep all 1D in the
+   accumulator during the run) is v1.1. See `~/repos/codex_tasks/perf3_runend_backfill_scope.md`
+   and PERF-3 in the ledger. UI-6 (blink >70 multi-select) remains v1.1 alongside.
 
 ## Doc map
 `handoff_chunks_jul2026.md` (MASTER TABLE — chunk tracker) · `live_findings_ledger.md` (bug
