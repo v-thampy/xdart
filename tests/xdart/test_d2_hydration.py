@@ -324,7 +324,7 @@ def test_repeated_failed_hydration_suppresses_until_generation_bump(caplog):
     h._on_frame_hydrated = MethodType(
         displayFrameWidget._on_frame_hydrated, h)
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.DEBUG):
         for _ in range(5):
             before = len(calls)
             h._request_frame_hydration(8, purpose="1d")
@@ -333,6 +333,7 @@ def test_repeated_failed_hydration_suppresses_until_generation_bump(caplog):
 
     assert calls == [(8, 5, "1d")] * 3
     assert caplog.text.count("suppressing repeated hydration requests") == 1
+    assert not [record for record in caplog.records if record.levelno >= logging.INFO]
 
     h.display_generation = 6
     h._request_frame_hydration(8, purpose="1d")

@@ -1360,7 +1360,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             log_key = (key[0], key[1], generation)
             if log_key not in logged:
                 logged.add(log_key)
-                logger.warning(
+                logger.debug(
                     "suppressing repeated hydration requests for frame %s "
                     "purpose %s after %s failures",
                     key[0],
