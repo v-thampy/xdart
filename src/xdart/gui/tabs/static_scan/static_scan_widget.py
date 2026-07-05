@@ -16,7 +16,7 @@ import gc
 import imageio
 import pyFAI
 
-from .browse_debug import browse_debug_log, sequence_summary
+from .browse_debug import browse_debug_enabled, browse_debug_log, sequence_summary
 
 logger = logging.getLogger(__name__)
 _ORPHANED_STITCH_THREADS = []
@@ -43,6 +43,29 @@ def _retain_orphaned_close_thread(thread) -> None:
 def _retain_orphaned_stitch_thread(thread) -> None:
     """Keep a slow stitch QThread wrapper alive until Qt finishes it."""
     _retain_orphaned_close_thread(thread)
+
+
+def _runend_waterfall_history_fields(displayframe) -> dict:
+    history = getattr(displayframe, "_waterfall_history", None)
+    ids = tuple(getattr(history, "ids", ()) or ())
+    return {
+        "waterfall_count": int(getattr(history, "count", 0) or 0),
+        "waterfall_tail": list(ids[-3:]),
+    }
+
+
+def _runend_callsite() -> str | None:
+    if not browse_debug_enabled():
+        return None
+    try:
+        import inspect
+        frame = inspect.currentframe()
+        caller = frame.f_back.f_back if frame and frame.f_back else None
+        if caller is None:
+            return None
+        return f"{caller.f_code.co_name}:{caller.f_lineno}"
+    except Exception:
+        return None
 
 # Viewer-mode row stores.  Normal scan display reads exclusively from the
 # record/publication stores; these dicts back Image/XYE/NeXus file browsers.
@@ -4639,7 +4662,24 @@ class staticWidget(QWidget):
         scan = getattr(self, "scan", None)
         viewer = getattr(self, "h5viewer", None)
         if scan is None or viewer is None:
+            browse_debug_log(
+                logger,
+                "runend_reconcile_skip",
+                reason="missing_scan_or_viewer",
+                written_file=written_file,
+                **_runend_waterfall_history_fields(
+                    getattr(self, "displayframe", None)),
+            )
             return 0
+        browse_debug_log(
+            logger,
+            "runend_reconcile_enter",
+            written_file=written_file,
+            scan=getattr(scan, "name", None),
+            method=staticWidget._overlay_plot_method(self),
+            auto_last=getattr(viewer, "auto_last", None),
+            **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
+        )
 
         import time as _time
         _perf = bool(os.environ.get("XDART_PERF"))
@@ -4656,6 +4696,14 @@ class staticWidget(QWidget):
                             indexed,
                             os.path.basename(written_file),
                         )
+                    browse_debug_log(
+                        logger,
+                        "runend_reconcile_index_loaded",
+                        written_file=written_file,
+                        indexed=indexed,
+                        **_runend_waterfall_history_fields(
+                            getattr(self, "displayframe", None)),
+                    )
                 except Exception:
                     logger.warning(
                         "post-live frame-index populate failed",
@@ -4681,8 +4729,41 @@ class staticWidget(QWidget):
                 bool(getattr(viewer, "new_scan_loaded", False))
                 or visible != expected
             )
+            browse_debug_log(
+                logger,
+                "runend_reconcile_before_update_data",
+                indexed=indexed,
+                latest_idx=getattr(viewer, "latest_idx", None),
+                visible=sequence_summary(visible),
+                expected=sequence_summary(expected),
+                force_rebuild=force_rebuild,
+                **_runend_waterfall_history_fields(
+                    getattr(self, "displayframe", None)),
+            )
             viewer.update_data(emit_update=False, force_rebuild=force_rebuild)
-            staticWidget._render_overlay_full_scan(self)
+            list_widget = getattr(getattr(viewer, "ui", None), "listData", None)
+            visible_after = []
+            if list_widget is not None:
+                visible_after = [
+                    list_widget.item(row).text()
+                    for row in range(list_widget.count())
+                ]
+            browse_debug_log(
+                logger,
+                "runend_reconcile_after_update_data",
+                latest_idx=getattr(viewer, "latest_idx", None),
+                visible=sequence_summary(visible_after),
+                **_runend_waterfall_history_fields(
+                    getattr(self, "displayframe", None)),
+            )
+            rendered = staticWidget._render_overlay_full_scan(self)
+            browse_debug_log(
+                logger,
+                "runend_reconcile_after_render",
+                render_owned=rendered,
+                **_runend_waterfall_history_fields(
+                    getattr(self, "displayframe", None)),
+            )
             if _perf:
                 logger.info(
                     "[PERF] post-live frame-list reconcile: indexed=%d "
@@ -4692,6 +4773,20 @@ class staticWidget(QWidget):
                 )
         except Exception:
             logger.debug("post-live frame-list rebuild failed", exc_info=True)
+            browse_debug_log(
+                logger,
+                "runend_reconcile_exception",
+                level="warning",
+                indexed=indexed,
+                **_runend_waterfall_history_fields(
+                    getattr(self, "displayframe", None)),
+            )
+        browse_debug_log(
+            logger,
+            "runend_reconcile_exit",
+            indexed=indexed,
+            **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
+        )
         return indexed
 
     def _overlay_plot_method(self):
@@ -4708,15 +4803,48 @@ class staticWidget(QWidget):
         render.
         """
         method = staticWidget._overlay_plot_method(self) if method is None else method
+        caller = _runend_callsite()
+        browse_debug_log(
+            logger,
+            "runend_render_overlay_full_scan_enter",
+            caller=caller,
+            method=method,
+            auto_last=getattr(getattr(self, "h5viewer", None), "auto_last", None),
+            **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
+        )
         if not (self.h5viewer.auto_last and method in ("Overlay", "Waterfall")):
+            browse_debug_log(
+                logger,
+                "runend_render_overlay_full_scan_skip",
+                caller=caller,
+                reason="not_auto_last_overlay",
+                method=method,
+                auto_last=getattr(self.h5viewer, "auto_last", None),
+                **_runend_waterfall_history_fields(
+                    getattr(self, "displayframe", None)),
+            )
             return False
         with self.scan.scan_lock:
             selected = [str(int(i)) for i in self.scan.frames.index]
+        browse_debug_log(
+            logger,
+            "runend_render_overlay_full_scan_selection",
+            caller=caller,
+            selected=sequence_summary(selected),
+            **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
+        )
         if selected:
             self.h5viewer.frame_ids[:] = selected
             staticWidget._h5viewer_data_changed_now(self, show_all=True)
         else:
             staticWidget._h5viewer_data_changed_now(self)
+        browse_debug_log(
+            logger,
+            "runend_render_overlay_full_scan_exit",
+            caller=caller,
+            selected=sequence_summary(selected),
+            **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
+        )
         return True
 
     def disable_auto_last(self, q):
@@ -5574,6 +5702,11 @@ class staticWidget(QWidget):
         """Function connected to threadFinished signals for
         integratorThread
         """
+        browse_debug_log(
+            logger,
+            "runend_integrator_finished_enter",
+            **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
+        )
         self.thread_state_changed()
         # End the run through the single run-state owner (task #68) BEFORE the
         # final refresh so the 2D panels resume normal blank-on-missing for the
@@ -5585,17 +5718,45 @@ class staticWidget(QWidget):
         # exit the shared run-state then (mirrors the wrangler-enable guard
         # below).
         wrangler_running = self._wrangler_run_active()
+        browse_debug_log(
+            logger,
+            "runend_integrator_finished_state",
+            wrangler_running=wrangler_running,
+            **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
+        )
         if not wrangler_running:
             self._exit_run_state()
         self.h5viewer.set_open_enabled(True)
         try:
+            browse_debug_log(
+                logger,
+                "runend_integrator_before_clear_overlay",
+                **_runend_waterfall_history_fields(
+                    getattr(self, "displayframe", None)),
+            )
             self.displayframe.clear_overlay()
+            browse_debug_log(
+                logger,
+                "runend_integrator_after_clear_overlay",
+                **_runend_waterfall_history_fields(
+                    getattr(self, "displayframe", None)),
+            )
         except Exception:
             logger.debug("display overlay reset after reintegrate failed",
                          exc_info=True)
         self.update_all()
+        browse_debug_log(
+            logger,
+            "runend_integrator_after_update_all",
+            **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
+        )
         if not wrangler_running:
             self.wrangler.enabled(True)
+        browse_debug_log(
+            logger,
+            "runend_integrator_finished_exit",
+            **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
+        )
 
     # ── Stitch (Stitch 1D / Stitch 2D modes) ───────────────────────────
     def _stitch_status(self, msg):
@@ -6156,8 +6317,24 @@ class staticWidget(QWidget):
         # force a reload of a possibly half-written file (review finding — the
         # internal=True auto-loads below bypass the _run_writing guard).
         _reintegrate_running = self.integratorTree.integrator_thread.isRunning()
+        browse_debug_log(
+            logger,
+            "runend_wrangler_finished_enter",
+            reintegrate_running=_reintegrate_running,
+            run_saw_frame=getattr(self, "_run_saw_frame", None),
+            pending_update_idx=getattr(self, "_pending_update_idx", None),
+            method=staticWidget._overlay_plot_method(self),
+            auto_last=getattr(self.h5viewer, "auto_last", None),
+            **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
+        )
         if not _reintegrate_running:
             self._exit_run_state()
+            browse_debug_log(
+                logger,
+                "runend_wrangler_after_exit_run_state",
+                **_runend_waterfall_history_fields(
+                    getattr(self, "displayframe", None)),
+            )
 
         # Flush any pending coalesced update so the final frame is shown.
         self._update_timer.stop()
@@ -6165,7 +6342,19 @@ class staticWidget(QWidget):
         timer = getattr(self, "_reint_update_timer", None)
         if timer is not None:
             timer.stop()
+        browse_debug_log(
+            logger,
+            "runend_wrangler_before_pending_flush",
+            pending_update_idx=getattr(self, "_pending_update_idx", None),
+            **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
+        )
         self._flush_pending_update()
+        browse_debug_log(
+            logger,
+            "runend_wrangler_after_pending_flush",
+            pending_update_idx=getattr(self, "_pending_update_idx", None),
+            **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
+        )
 
         # End the live-run window before the end-of-batch reload below:
         # the auto-load set_file(generated_file) must run the full
@@ -6177,6 +6366,11 @@ class staticWidget(QWidget):
         # Clear the XYE-only no-load flag so the end-of-batch auto-load (and any
         # later normal file open) reads the .nxs from disk again.
         self.h5viewer.file_thread.no_nxs = False
+        browse_debug_log(
+            logger,
+            "runend_wrangler_after_live_flags_cleared",
+            **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
+        )
 
         self.thread_state_changed()
         self.wrangler.stop()
@@ -6206,6 +6400,16 @@ class staticWidget(QWidget):
             getattr(thread, "write_mode", None) == 'Append'
             and processed_count == 0
             and append_skipped > 0
+        )
+        browse_debug_log(
+            logger,
+            "runend_wrangler_counts",
+            is_batch=is_batch,
+            is_xye_only=is_xye_only,
+            processed_count=processed_count,
+            append_skipped=append_skipped,
+            all_skipped_append=all_skipped_append,
+            **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
         )
 
         if is_batch and not is_xye_only and not _reintegrate_running:
@@ -6270,7 +6474,24 @@ class staticWidget(QWidget):
                 and getattr(self, '_run_saw_frame', True)):
             written = (getattr(self.wrangler.thread, 'fname', None)
                        or getattr(self.wrangler, 'fname', None))
+            browse_debug_log(
+                logger,
+                "runend_wrangler_before_live_reconcile",
+                written_file=written,
+                processed_count=processed_count,
+                **_runend_waterfall_history_fields(
+                    getattr(self, "displayframe", None)),
+            )
             indexed = self._reconcile_h5viewer_frame_list_after_run(written)
+            browse_debug_log(
+                logger,
+                "runend_wrangler_after_live_reconcile",
+                written_file=written,
+                indexed=indexed,
+                processed_count=processed_count,
+                **_runend_waterfall_history_fields(
+                    getattr(self, "displayframe", None)),
+            )
             if processed_count is not None and indexed < processed_count:
                 logger.warning(
                     "post-live indexed fewer frames than processed: "
@@ -6289,7 +6510,19 @@ class staticWidget(QWidget):
         # the reintegrate completes.
         if (self.scan.name == self.wrangler.scan_name
                 and not self.integratorTree.integrator_thread.isRunning()):
+            browse_debug_log(
+                logger,
+                "runend_wrangler_before_integrator_finished_delegate",
+                **_runend_waterfall_history_fields(
+                    getattr(self, "displayframe", None)),
+            )
             self.integrator_thread_finished()
+            browse_debug_log(
+                logger,
+                "runend_wrangler_after_integrator_finished_delegate",
+                **_runend_waterfall_history_fields(
+                    getattr(self, "displayframe", None)),
+            )
         else:
             self.wrangler.enabled(True)
 
@@ -6319,8 +6552,13 @@ class staticWidget(QWidget):
                         xye_dir)
             except Exception:
                 logger.debug(
-                    'Could not show XYE output folder after batch',
-                    exc_info=True)
+                        'Could not show XYE output folder after batch',
+                        exc_info=True)
+        browse_debug_log(
+            logger,
+            "runend_wrangler_finished_exit",
+            **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
+        )
 
     def _on_viewer_mode_changed(self, viewer_mode_str):
         """Enable or disable the integrator panel and update h5viewer for viewer mode.

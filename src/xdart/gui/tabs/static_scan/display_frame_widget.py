@@ -63,7 +63,7 @@ from .display_logic import (
     ConsumerKind, SupersedeReason,
 )
 from .display_controllers import register_default_controllers
-from .browse_debug import browse_debug_log, sequence_summary
+from .browse_debug import browse_debug_enabled, browse_debug_log, sequence_summary
 from .display_overlay_utils import (
     current_scan_key as overlay_current_scan_key,
     current_axis_info as overlay_current_axis_info,
@@ -83,6 +83,29 @@ formats = [
     str(f.data(), encoding='utf-8').lower() for f in
     Qt.QtGui.QImageReader.supportedImageFormats()
 ]
+
+
+def _runend_clear_caller() -> str | None:
+    if not browse_debug_enabled():
+        return None
+    try:
+        import inspect
+        frame = inspect.currentframe()
+        caller = frame.f_back.f_back if frame and frame.f_back else None
+        if caller is None:
+            return None
+        return f"{caller.f_code.co_name}:{caller.f_lineno}"
+    except Exception:
+        return None
+
+
+def _runend_waterfall_history_fields(displayframe) -> dict:
+    history = getattr(displayframe, "_waterfall_history", None)
+    ids = tuple(getattr(history, "ids", ()) or ())
+    return {
+        "waterfall_count": int(getattr(history, "count", 0) or 0),
+        "waterfall_tail": list(ids[-3:]),
+    }
 
 
 def _axis_key_from_label(label):
@@ -4288,6 +4311,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     def clear_overlay(self):
         """Drop accumulated overlay curves + names."""
+        caller = _runend_clear_caller()
+        browse_debug_log(
+            logger,
+            "runend_clear_overlay_before",
+            caller=caller,
+            generation=getattr(self, "display_generation", None),
+            selected=sequence_summary(getattr(self, "frame_ids", ())),
+            mode=(
+                self.ui.plotMethod.currentText()
+                if hasattr(self, "ui") and hasattr(self.ui, "plotMethod")
+                else None
+            ),
+            **_runend_waterfall_history_fields(self),
+        )
         self.plot_data = [np.zeros(0), np.zeros(0)]
         self.plot_data_range = [[0, 0], [0, 0]]
         self.frame_names = []
@@ -4299,6 +4336,19 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         clear_pins = getattr(self, "_clear_pinned_slice_cuts", None)
         if callable(clear_pins):
             clear_pins(clear_history=False)
+        browse_debug_log(
+            logger,
+            "runend_clear_overlay_after",
+            caller=caller,
+            generation=getattr(self, "display_generation", None),
+            selected=sequence_summary(getattr(self, "frame_ids", ())),
+            mode=(
+                self.ui.plotMethod.currentText()
+                if hasattr(self, "ui") and hasattr(self.ui, "plotMethod")
+                else None
+            ),
+            **_runend_waterfall_history_fields(self),
+        )
 
     # ── Panel clears (safety net for empty selections) ────────────
     # When a render path has no data for the current selection it must
