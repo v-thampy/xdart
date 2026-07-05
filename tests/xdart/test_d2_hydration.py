@@ -611,3 +611,66 @@ def test_hydration_completion_stream_coalesces_rerenders():
     assert len(rendered) == 1
     h._flush_hydration_render()
     assert len(rendered) == 2
+
+
+def test_full_raw_thumbnail_only_hydration_self_suppresses_rl1():
+    """RL-1 run-end treadmill: the last frame's full raw was evicted during live;
+    only a THUMBNAIL persisted.  The render re-requests purpose="full"; the
+    hydration "completes" with only the thumbnail resident.  The OLD
+    _view_has_hydration_payload counted a thumbnail as satisfying "full" ->
+    success=True -> the failure count never reached the limit ->
+    _hydration_request_suppressed never tripped -> the run-end display re-requested
+    "full" forever.  After the tier-accurate fix a thumbnail does NOT satisfy
+    "full" -> success=False -> suppression trips after <=3 completions -> bounded.
+
+    Spins-before / terminates-after: on pre-fix code len(calls) reaches the loop
+    bound (8, unbounded); after the fix it stops at _HYDRATION_FAILURE_LIMIT (3).
+    """
+    from xdart.gui.tabs.static_scan.display_frame_widget import (
+        _HYDRATION_FAILURE_LIMIT)
+    calls = []
+    fake_worker = SimpleNamespace(
+        request=lambda label, gen, *, purpose="full", **kw: calls.append(
+            (label, gen, purpose)))
+    # a store item whose view has a THUMBNAIL but NO full raw and NO 2d payload
+    view = SimpleNamespace(
+        raw=None, thumbnail=np.zeros((2, 2), dtype=float),
+        has_2d=False, intensity_2d=None, has_1d=False, intensity_1d=None)
+    item = SimpleNamespace(view=view)
+    store = SimpleNamespace(get=lambda label: item)
+    h = SimpleNamespace(
+        _async_hydration_enabled=True,
+        display_generation=5,
+        _hydration_pending_labels=set(),
+        _hydration_failure_counts={},
+        _hydration_failure_logged=set(),
+        _pending_hydration_render=False,
+        _pending_hydration_generation=None,
+        _hydration_stores=lambda: (store,),
+    )
+    h.update = lambda: None
+    h._ensure_hydration_worker = lambda: fake_worker
+    for name in ("_request_frame_hydration", "_flush_hydration_render",
+                 "_on_frame_hydrated", "_hydration_request_suppressed",
+                 "_hydration_purpose_resident", "_view_has_hydration_payload",
+                 "_hydration_item_views", "_record_hydration_completion"):
+        setattr(h, name, MethodType(getattr(displayFrameWidget, name), h))
+
+    LABEL = 3621
+    # Simulate the render->hydrate->complete->repaint->render cycle: request the
+    # full raw, and whenever a worker request is actually issued, drive its
+    # completion (as _on_frame_hydrated would on sigHydrated).
+    for _ in range(8):
+        before = len(calls)
+        h._request_frame_hydration(LABEL, purpose="full")
+        if len(calls) > before:
+            h._on_frame_hydrated(LABEL, 5)
+
+    assert len(calls) <= _HYDRATION_FAILURE_LIMIT, (
+        f"treadmill: full-raw hydration re-requested {len(calls)}x unbounded "
+        "(thumbnail-only mis-scored as a successful full hydration)")
+    assert h._hydration_request_suppressed(LABEL, "full") is True
+    # a further render-driven re-request issues NO new worker request
+    before = len(calls)
+    h._request_frame_hydration(LABEL, purpose="full")
+    assert len(calls) == before, "suppressed request must not reach the worker"

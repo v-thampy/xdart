@@ -1270,21 +1270,34 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         return self._hydration_worker
 
     def _view_has_hydration_payload(self, view, purpose) -> bool:
+        # TIER-ACCURATE residency (RL-1 fix): a hydration is "resident/succeeded"
+        # only when the payload of the REQUESTED tier actually became resident.
+        # The old permissive branch counted a persisted THUMBNAIL (or a stray 1d)
+        # as satisfying a full-raw "full" request -> a thumbnail-only frame whose
+        # full raw was evicted during live was mis-scored as a SUCCESSFUL hydration
+        # every render, so its _hydration_failure_counts never reached the limit,
+        # _hydration_request_suppressed never tripped, and the run-end display
+        # re-requested purpose="full" forever (the treadmill).  Scoring a
+        # thumbnail-only full-raw hydration as a FAILURE lets the backoff self-
+        # suppress after _HYDRATION_FAILURE_LIMIT; the panel keeps showing the
+        # thumbnail via the SEPARATE resolve_frame_data RESIDENT path, so this is
+        # graceful, not a blank.
         if view is None:
             return False
+        purpose = str(purpose or "full")
         if purpose == "1d":
             return bool(
                 getattr(view, "has_1d", False)
                 or getattr(view, "intensity_1d", None) is not None
             )
-        return bool(
-            getattr(view, "has_2d", False)
-            or getattr(view, "intensity_2d", None) is not None
-            or getattr(view, "raw", None) is not None
-            or getattr(view, "thumbnail", None) is not None
-            or getattr(view, "has_1d", False)
-            or getattr(view, "intensity_1d", None) is not None
-        )
+        if purpose == "2d":
+            return bool(
+                getattr(view, "has_2d", False)
+                or getattr(view, "intensity_2d", None) is not None
+            )
+        # "full" / "raw" (and any other non-1d/2d purpose): the FULL raw must have
+        # actually become resident.  A thumbnail does NOT satisfy a full-raw request.
+        return getattr(view, "raw", None) is not None
 
     def _hydration_item_views(self, item):
         views = []
@@ -1405,7 +1418,16 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if suppressed is None:
             suppressed = displayFrameWidget._hydration_request_suppressed.__get__(
                 self, type(self))
-        if suppressed(label_key, purpose_key):
+        is_suppressed = bool(suppressed(label_key, purpose_key))
+        if browse_debug_enabled():
+            _fc = getattr(self, "_hydration_failure_counts", {}) or {}
+            _entry = _fc.get((label_key, purpose_key))
+            browse_debug_log(
+                logger, "hydration_request",
+                label=label_key, purpose=purpose_key, suppressed=is_suppressed,
+                failure_count=(_entry[1] if _entry else 0),
+                generation=getattr(self, "display_generation", None))
+        if is_suppressed:
             return
         worker = self._ensure_hydration_worker()
         if worker is not None:
@@ -1548,15 +1570,28 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     queued.add(label_key)
             generation = current_generation
 
+        _completion_debug = []
         for label_key, purpose_key, _consumer_key in completed_parts:
             if (label_key, purpose_key) in recorded_stale_overlay:
                 continue
+            _ok = bool(resident(label_key, purpose_key))
             record(
                 label_key,
                 purpose_key,
-                success=bool(resident(label_key, purpose_key)),
+                success=_ok,
                 generation=generation,
             )
+            if browse_debug_enabled():
+                _completion_debug.append(
+                    {"label": label_key, "purpose": purpose_key, "success": _ok})
+        if browse_debug_enabled():
+            browse_debug_log(
+                logger, "hydration_complete",
+                generation=generation, mode=(
+                    self.ui.plotMethod.currentText()
+                    if hasattr(self, "ui") else None),
+                completions=_completion_debug,
+                stale_overlay=len(recorded_stale_overlay))
         self._pending_hydration_render = True
         self._pending_hydration_generation = generation
         quiet = getattr(self, "_hydration_quiet_timer", None)
