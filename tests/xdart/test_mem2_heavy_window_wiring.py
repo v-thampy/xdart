@@ -71,7 +71,7 @@ def test_thread_heavy_window_logs_when_cache_reused(monkeypatch, caplog):
     scan = SimpleNamespace(frames=None)
 
     with caplog.at_level(
-        logging.INFO,
+        logging.DEBUG,
         logger="xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread",
     ):
         assert imageThread._heavy_staging_window(worker, scan) == 32
@@ -97,7 +97,7 @@ def test_streaming_session_reuse_does_not_repeat_worker_cap_log(monkeypatch, cap
     worker._streaming_executor_workers = 3
 
     with caplog.at_level(
-        logging.INFO,
+        logging.DEBUG,
         logger="xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread",
     ):
         assert imageThread._get_streaming_session(worker, scan, []) == (session, sink)

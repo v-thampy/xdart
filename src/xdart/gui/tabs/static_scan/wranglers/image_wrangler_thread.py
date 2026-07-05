@@ -2391,7 +2391,7 @@ class imageThread(wranglerThread):
 
     def _log_heavy_staging_window(self, window, frame_bytes=None):
         from xrd_tools.core import heavy_window_log_line
-        logger.info(heavy_window_log_line(
+        logger.debug(heavy_window_log_line(
             window, frame_bytes,
             overridden=bool(os.environ.get("XDART_HEAVY_WINDOW"))))
 
