@@ -983,6 +983,8 @@ class LiveScan:
         # no ``frame`` dim — start with an empty index in that case.
         # Don't raise: the wrangler immediately follows with new frames.
         try:
+            transient_reads = bool(getattr(
+                getattr(self, "frames", None), "_integrated_reads_transient", False))
             frame_indices = []
             for coord_name in ("frame", "frame_2d"):
                 if coord_name in ds.coords:
@@ -994,6 +996,7 @@ class LiveScan:
                 self.data_file, self.file_lock,
                 static=self.static, gi=self.gi,
             )
+            empty_series.set_integrated_reads_transient(transient_reads)
             for idx in frame_indices:
                 if idx not in empty_series.index:
                     empty_series.index.append(idx)
@@ -1052,6 +1055,9 @@ class LiveScan:
                 from xrd_tools.io.nexus import read_scan as _read
             try:
                 ds = _read(self.data_file)
+                transient_reads = bool(getattr(
+                    getattr(self, "frames", None),
+                    "_integrated_reads_transient", False))
                 frame_indices = []
                 for coord_name in ("frame", "frame_2d"):
                     if coord_name in ds.coords:
@@ -1061,6 +1067,7 @@ class LiveScan:
                 series = LiveFrameSeries(
                     self.data_file, self.file_lock,
                     static=self.static, gi=self.gi)
+                series.set_integrated_reads_transient(transient_reads)
                 for idx in frame_indices:
                     if idx not in series.index:
                         series.index.append(idx)

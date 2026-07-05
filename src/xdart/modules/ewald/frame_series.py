@@ -465,6 +465,7 @@ class LiveFrameSeries:
         # (the disk lazy-load finds nothing).  The writer marks frames here via
         # ``mark_persisted`` after a successful save.
         self._persisted: set[int] = set()
+        self._integrated_reads_transient = False
         # Guards the _in_memory + _persisted mutations.  These are touched by
         # the wrangler thread (stash/mark_persisted under the scan's scan_lock)
         # AND the GUI thread (``__getitem__`` lazy-load marking persisted, e.g.
@@ -477,6 +478,10 @@ class LiveFrameSeries:
             for a in frames:
                 self.__setitem__(a.idx, a, h5file=h5file)
         self._i = 0
+
+    def set_integrated_reads_transient(self, active: bool) -> None:
+        """Mark missing integrated rows as expected during an active rewrite."""
+        self._integrated_reads_transient = bool(active)
 
     def _evict_from_memory(self, idx) -> None:
         """Pop ``idx`` from the staging cache and release its raw (MEM-1a).
@@ -625,11 +630,17 @@ class LiveFrameSeries:
         # legitimately partial/old file still opens.
         if frame is not None and frame.int_1d is None and frame.int_2d is None \
                 and not getattr(frame, "gi_1d", None) and not getattr(frame, "gi_2d", None):
-            logger.error(
-                "frame %s is indexed but has no integrated data on disk; it may "
-                "have been evicted before it was saved (persist-before-evict "
-                "guard) or the .nxs is truncated.", idx,
-            )
+            if getattr(self, "_integrated_reads_transient", False):
+                logger.debug(
+                    "frame %s is indexed but has no integrated data on disk yet; "
+                    "an active write/rewrite may not have flushed that row.", idx,
+                )
+            else:
+                logger.error(
+                    "frame %s is indexed but has no integrated data on disk; it may "
+                    "have been evicted before it was saved (persist-before-evict "
+                    "guard) or the .nxs is truncated.", idx,
+                )
         # A frame just read back from disk is by definition persisted.  Guard
         # the shared-set mutation (this runs on the GUI thread for display-cache
         # hydration, concurrent with the wrangler's stash), and re-check that the
@@ -670,6 +681,7 @@ class LiveFrameSeries:
         frames._in_memory = dict(self._in_memory)
         frames._in_memory_cap = self._in_memory_cap
         frames._persisted = set(self._persisted)
+        frames._integrated_reads_transient = self._integrated_reads_transient
         if isinstance(frame, Series):
             _frame = frame.iloc[0]
         else:
@@ -690,6 +702,7 @@ class LiveFrameSeries:
         frames._in_memory = dict(self._in_memory)
         frames._in_memory_cap = self._in_memory_cap
         frames._persisted = set(self._persisted)
+        frames._integrated_reads_transient = self._integrated_reads_transient
         return frames
 
     def __next__(self):

@@ -1317,6 +1317,50 @@ def test_run_end_reconciles_partial_frame_browser_from_written_index(tmp_path):
     assert calls == []
 
 
+def test_append_run_start_seeds_processed_frame_browser_without_render():
+    list_data = _FakeListWidget([])
+    scan = SimpleNamespace(
+        name="scan",
+        scan_lock=RLock(),
+        frames=SimpleNamespace(index=[]),
+    )
+    calls = []
+    viewer = SimpleNamespace(
+        scan=scan,
+        ui=SimpleNamespace(listData=list_data),
+        new_scan_loaded=False,
+        frame_ids=[],
+        auto_last=True,
+        latest_idx=None,
+        data_changed=lambda *args, **kwargs: calls.append((args, kwargs)),
+        _displayed_list_count=0,
+        _displayed_last_label=None,
+    )
+    viewer.set_current_frame = MethodType(H5Viewer.set_current_frame, viewer)
+    viewer._remember_displayed_frames = MethodType(
+        H5Viewer._remember_displayed_frames, viewer)
+    viewer.update_data = MethodType(H5Viewer.update_data, viewer)
+    thread = SimpleNamespace(
+        write_mode="Append",
+        xye_only=False,
+        _append_skip_snapshot=lambda name: {1, 2, 3},
+    )
+    host = SimpleNamespace(
+        scan=scan,
+        h5viewer=viewer,
+        wrangler=SimpleNamespace(thread=thread),
+    )
+
+    seeded = staticWidget._seed_append_processed_frame_browser(host, "scan")
+
+    assert seeded == 3
+    assert list(scan.frames.index) == [1, 2, 3]
+    assert _labels(list_data) == ["1", "2", "3"]
+    assert viewer.latest_idx == 3
+    assert [item.text() for item in list_data.selectedItems()] == ["3"]
+    assert calls == []
+
+
 def test_run_end_reconcile_skips_forced_rebuild_when_list_is_current():
     list_data = _FakeListWidget([1, 2, 3])
     scan = SimpleNamespace(

@@ -5263,6 +5263,12 @@ class staticWidget(QWidget):
         ).lower()
         return command in {'start', 'pause'}
 
+    def _set_scan_integrated_reads_transient(self, active):
+        frames = getattr(getattr(self, "scan", None), "frames", None)
+        setter = getattr(frames, "set_integrated_reads_transient", None)
+        if callable(setter):
+            setter(active)
+
     def _enter_run_state(self):
         """Single owner of run START (task #68): mark a wrangler/integrator run
         in progress.  Idempotent — re-entry while already active is a no-op so
@@ -5292,6 +5298,7 @@ class staticWidget(QWidget):
         # can still show the scan's last frame at the end (visual confirmation
         # that something happened).  Reset per run start.
         self._run_saw_frame = False
+        self._set_scan_integrated_reads_transient(True)
         self.displayframe.set_processing_active(True)
         # Same run-state, pushed to the h5viewer so the frame-selection disk-load
         # guard (data_changed) and the reader-side hydration guard
@@ -5361,6 +5368,7 @@ class staticWidget(QWidget):
         if not self._run_active:
             return
         self._run_active = False
+        self._set_scan_integrated_reads_transient(False)
         self.displayframe.set_processing_active(False)
         # File is idle again: clear the disk-load guard.  set_run_writing(False)
         # also re-fires the standing frame selection so any frame skipped during
@@ -5490,6 +5498,7 @@ class staticWidget(QWidget):
         a frame skipped during the run now loads from the quiesced file."""
         if not self._run_active:
             return                       # not in a run; nothing to lift
+        self._set_scan_integrated_reads_transient(False)
         self.displayframe.set_processing_active(False)
         self.h5viewer.set_run_writing(False)
 
@@ -5501,6 +5510,7 @@ class staticWidget(QWidget):
         from the wrangler's sigResuming, ahead of the command flip."""
         if not self._run_active:
             return
+        self._set_scan_integrated_reads_transient(True)
         self.h5viewer.set_run_writing(True)
         self.displayframe.set_processing_active(True)
 
@@ -5861,6 +5871,50 @@ class staticWidget(QWidget):
         self.h5viewer.scan_name = name
         self.h5viewer.auto_last = True
         self.h5viewer.latest_idx = 1
+        self._seed_append_processed_frame_browser(name)
+
+    def _seed_append_processed_frame_browser(self, name):
+        """Show append-skipped processed frames as soon as a run starts.
+
+        Append mode already primes a read-only snapshot of the target file so
+        the worker can skip processed rows before reading source images. Reuse
+        that in-memory label set to seed the GUI frame list; no 1D/2D payloads
+        are loaded here.
+        """
+        thread = getattr(getattr(self, "wrangler", None), "thread", None)
+        if thread is None or getattr(thread, "write_mode", None) != "Append":
+            return 0
+        if getattr(thread, "xye_only", False):
+            return 0
+        snapshot = getattr(thread, "_append_skip_snapshot", None)
+        try:
+            existing = snapshot(name) if callable(snapshot) else (
+                getattr(thread, "_append_skip_frames_by_scan", {}) or {}
+            ).get(str(name), ())
+            labels = sorted({int(label) for label in (existing or ())})
+        except Exception:
+            logger.debug("append frame-list seed failed for %s", name,
+                         exc_info=True)
+            return 0
+        if not labels:
+            return 0
+        try:
+            with self.scan.scan_lock:
+                index = self.scan.frames.index
+                added = 0
+                for label in labels:
+                    if label not in index:
+                        index.append(label)
+                        added += 1
+                if added:
+                    index.sort()
+            self.h5viewer.latest_idx = labels[-1]
+            self.h5viewer.update_data(emit_update=False, force_rebuild=True)
+            return len(labels)
+        except Exception:
+            logger.debug("append frame-list seed skipped for %s", name,
+                         exc_info=True)
+            return 0
 
     def new_scan(self, name, fname, gi, incidence_motor, single_img,
                  series_average):

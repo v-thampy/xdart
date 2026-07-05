@@ -15,6 +15,7 @@ a save before the unsaved set reaches the cap (see ``_save_due``).
 from __future__ import annotations
 
 import threading
+import logging
 
 import numpy as np
 import pytest
@@ -245,6 +246,46 @@ class TestLoadFrameIndexOnly:
         scan = LiveScan(data_file=None)
         assert scan.load_frame_index_only(str(tmp_path / "nope.nxs")) == 0
         assert not scan.frames.index
+
+
+def test_missing_integrated_row_logs_error_when_file_idle(tmp_path, caplog):
+    import h5py
+    from xdart.modules.ewald.frame_series import LiveFrameSeries
+
+    nxs = tmp_path / "partial.nxs"
+    with h5py.File(nxs, "w") as f:
+        g = f.create_group("entry/integrated_1d")
+        g.create_dataset("frame_index", data=np.array([1], dtype=np.int64))
+
+    fs = LiveFrameSeries(str(nxs), threading.RLock())
+    fs.index.append(1)
+
+    with caplog.at_level(logging.ERROR, logger="xdart.modules.ewald.frame_series"):
+        frame = fs[1]
+
+    assert frame.idx == 1
+    assert "indexed but has no integrated data on disk" in caplog.text
+
+
+def test_missing_integrated_row_is_debug_while_rewrite_active(tmp_path, caplog):
+    import h5py
+    from xdart.modules.ewald.frame_series import LiveFrameSeries
+
+    nxs = tmp_path / "rewriting.nxs"
+    with h5py.File(nxs, "w") as f:
+        g = f.create_group("entry/integrated_1d")
+        g.create_dataset("frame_index", data=np.array([1], dtype=np.int64))
+
+    fs = LiveFrameSeries(str(nxs), threading.RLock())
+    fs.index.append(1)
+    fs.set_integrated_reads_transient(True)
+
+    with caplog.at_level(logging.DEBUG, logger="xdart.modules.ewald.frame_series"):
+        frame = fs[1]
+
+    assert frame.idx == 1
+    assert "no integrated data on disk yet" in caplog.text
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
 
 
 def test_reload_probe_resolves_relative_source_against_source_base(tmp_path):
