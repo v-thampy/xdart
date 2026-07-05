@@ -131,6 +131,7 @@ def _clear_publication_store_for(viewer) -> None:
 
 
 _BROWSE_ONE_SHOT_METHODS = ("Single", "Overlay", "Waterfall", "Sum", "Average")
+_BROWSE_ANCHOR_HEAVY_ATTEMPT_LIMIT = 3
 
 
 def _qt_enum_value(value, default: int = 0) -> int:
@@ -860,6 +861,9 @@ class H5Viewer(QWidget):
         self._browse_one_shot_anchor_label = None
         self._browse_anchor_heavy_after_next_render = None
         self._browse_anchor_heavy_inflight_label = None
+        self._browse_anchor_heavy_attempt_key = None
+        self._browse_anchor_heavy_attempt_count = 0
+        self._browse_anchor_heavy_attempt_logged = False
         self._browse_last_selection_signature = None
         self._overlay_visit_intent_labels = []
         self._overlay_visit_inflight_labels = ()
@@ -2520,6 +2524,83 @@ class H5Viewer(QWidget):
         self._browse_anchor_heavy_after_next_render = None
         self._browse_anchor_heavy_inflight_label = None
 
+    def _browse_anchor_heavy_key(self, label):
+        try:
+            label = int(label)
+        except (TypeError, ValueError):
+            return None
+        signature = getattr(self, "_browse_one_shot_signature", None)
+        active_key = getattr(self, "_browse_anchor_heavy_attempt_key", None)
+        if signature is None and isinstance(active_key, tuple):
+            try:
+                if int(active_key[0]) == label:
+                    return active_key
+            except (TypeError, ValueError, IndexError):
+                pass
+        return (label, signature)
+
+    def _start_browse_anchor_heavy_attempt_window(self, label, signature) -> None:
+        key = H5Viewer._browse_anchor_heavy_key(self, label)
+        if key is None:
+            return
+        # The signature may not have been assigned to the snapshot yet when the
+        # data_changed path chooses its anchor.  Use the just-computed signature
+        # so one bulk browse gesture gets one stable retry budget.
+        key = (key[0], signature)
+        if getattr(self, "_browse_anchor_heavy_attempt_key", None) == key:
+            return
+        self._browse_anchor_heavy_attempt_key = key
+        self._browse_anchor_heavy_attempt_count = 0
+        self._browse_anchor_heavy_attempt_logged = False
+
+    def _clear_browse_anchor_heavy_attempt_window(self) -> None:
+        self._browse_anchor_heavy_attempt_key = None
+        self._browse_anchor_heavy_attempt_count = 0
+        self._browse_anchor_heavy_attempt_logged = False
+
+    def _claim_browse_anchor_heavy_attempt(self, label, *, requestor: str) -> bool:
+        key = H5Viewer._browse_anchor_heavy_key(self, label)
+        if key is None:
+            return False
+        if getattr(self, "_browse_anchor_heavy_attempt_key", None) != key:
+            self._browse_anchor_heavy_attempt_key = key
+            self._browse_anchor_heavy_attempt_count = 0
+            self._browse_anchor_heavy_attempt_logged = False
+        try:
+            limit = int(getattr(
+                self,
+                "_browse_anchor_heavy_attempt_limit",
+                _BROWSE_ANCHOR_HEAVY_ATTEMPT_LIMIT,
+            ) or 0)
+        except (TypeError, ValueError):
+            limit = _BROWSE_ANCHOR_HEAVY_ATTEMPT_LIMIT
+        count = int(getattr(self, "_browse_anchor_heavy_attempt_count", 0) or 0)
+        if limit > 0 and count >= limit:
+            if not getattr(self, "_browse_anchor_heavy_attempt_logged", False):
+                browse_debug_log(
+                    logger,
+                    "browse_anchor_heavy_suppressed",
+                    mode=_browse_debug_mode(self),
+                    reason="attempt_limit",
+                    requestor=requestor,
+                    attempts=count,
+                    limit=limit,
+                    labels=sequence_summary((label,)),
+                )
+                self._browse_anchor_heavy_attempt_logged = True
+            return False
+        self._browse_anchor_heavy_attempt_count = count + 1
+        browse_debug_log(
+            logger,
+            "browse_anchor_heavy_attempt",
+            mode=_browse_debug_mode(self),
+            requestor=requestor,
+            attempt=count + 1,
+            limit=limit,
+            labels=sequence_summary((label,)),
+        )
+        return True
+
     def _prime_browse_one_shot_snapshot(self, labels, store=None):
         target = tuple(int(label) for label in labels)
         publications = {}
@@ -2570,6 +2651,7 @@ class H5Viewer(QWidget):
         except (TypeError, ValueError):
             return
         if H5Viewer._browse_anchor_has_2d_payload(self, label):
+            H5Viewer._clear_browse_anchor_heavy_attempt_window(self)
             return
         self._browse_anchor_heavy_after_next_render = label
         browse_debug_log(
@@ -2603,8 +2685,12 @@ class H5Viewer(QWidget):
             )
             return
         if H5Viewer._browse_anchor_has_2d_payload(self, label):
+            H5Viewer._clear_browse_anchor_heavy_attempt_window(self)
             return
         if getattr(self, "_browse_anchor_heavy_inflight_label", None) == label:
+            return
+        if not H5Viewer._claim_browse_anchor_heavy_attempt(
+                self, label, requestor=requestor):
             return
         self._browse_anchor_heavy_inflight_label = label
         browse_debug_log(
@@ -2827,6 +2913,8 @@ class H5Viewer(QWidget):
                 )
                 return
             self._browse_last_selection_signature = signature
+            H5Viewer._start_browse_anchor_heavy_attempt_window(
+                self, self._browse_one_shot_anchor_label, signature)
         else:
             self._browse_last_selection_signature = None
             if not browse_one_shot:
@@ -3222,6 +3310,9 @@ class H5Viewer(QWidget):
                             self._browse_one_shot_publications = snapshot
                         snapshot[frame_idx] = publication
                         self._browse_anchor_heavy_inflight_label = None
+                        if getattr(publication.view, "has_2d", False):
+                            H5Viewer._clear_browse_anchor_heavy_attempt_window(
+                                self)
             browse_debug_log(
                 logger,
                 "bulk_hydration_chunk_completed",

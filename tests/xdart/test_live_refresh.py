@@ -4289,6 +4289,52 @@ def test_browse_one_shot_completion_schedules_one_heavy_anchor_load():
     assert emitted == ["update"]
     assert heavy_loads == [([32], True)]
     assert viewer._browse_anchor_heavy_inflight_label == 32
+    assert viewer._browse_anchor_heavy_attempt_count == 1
+
+
+def test_runend_anchor_heavy_missing_file_retry_budget_terminates(tmp_path):
+    from xdart.modules.frame_publication import PublicationStore
+
+    _ensure_qapp()
+    scan = SimpleNamespace(
+        data_file=str(tmp_path / "run_still_finalizing.nxs"),
+        gi=False,
+        frames=SimpleNamespace(index=[1]),
+    )
+    viewer = H5Viewer(
+        RLock(),
+        str(tmp_path),
+        str(tmp_path),
+        scan,
+        SimpleNamespace(),
+        [],
+        [],
+        {},
+        {},
+        data_lock=RLock(),
+        publication_store=PublicationStore(),
+    )
+    try:
+        viewer._plot_method = "Overlay"
+        viewer._browse_anchor_heavy_attempt_limit = 3
+        viewer._browse_one_shot_anchor_label = 1
+        signature = ((1,), False, "Overlay")
+        viewer._browse_one_shot_signature = signature
+        H5Viewer._start_browse_anchor_heavy_attempt_window(
+            viewer, 1, signature)
+
+        for _ in range(10):
+            viewer._browse_anchor_heavy_after_next_render = 1
+            H5Viewer._emit_render_update(viewer, "test.runend_refire")
+
+        assert viewer._browse_anchor_heavy_attempt_count == 3
+        # load_frames_data() hits the missing-file path and calls the real
+        # cancel_pending_loads(); without the fixed point this generation bump
+        # advances once per render forever.
+        assert viewer._load_generation == 3
+    finally:
+        viewer.shutdown_threads()
+        viewer.deleteLater()
 
 
 def test_browse_bulk_absorb_publishes_light_1d_rows_outside_heavy_window():
