@@ -277,7 +277,7 @@ def test_explicit_sum_subset_missing_frames_hydrates_or_refuses():
         PublicationDisplayAdapter)
     from xdart.modules.frame_publication import (
         PublicationStore, publication_from_live_frame)
-    from xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 
     x = np.linspace(0.5, 5.0, 6, dtype=np.float32)
 
@@ -287,7 +287,12 @@ def test_explicit_sum_subset_missing_frames_hydrates_or_refuses():
             int_1d=IntegrationResult1D(
                 radial=x, intensity=np.full(x.shape, float(i), dtype=np.float32),
                 sigma=np.ones_like(x), unit="q_A^-1"),
-            int_2d=None, map_raw=None, mask=None, gi=False, gi_2d={},
+            int_2d=IntegrationResult2D(
+                radial=np.linspace(0.5, 5.0, 4, dtype=np.float32),
+                azimuthal=np.linspace(-90.0, 90.0, 3, dtype=np.float32),
+                intensity=np.full((4, 3), float(i), dtype=np.float32),
+                unit="q_A^-1", azimuthal_unit="chi_deg"),
+            map_raw=None, mask=None, gi=False, gi_2d={},
             thumbnail=None, bg_raw=0, scan_info={}, source_file=f"f{i}.tif",
             source_frame_idx=i,
         )
@@ -934,7 +939,7 @@ def test_overlay_waterfall_payload_accumulates_in_payload_across_renders():
         PublicationDisplayAdapter)
     from xdart.modules.frame_publication import (
         PublicationStore, publication_from_live_frame)
-    from xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 
     def _ir1d(v, nq=5):
         return IntegrationResult1D(
@@ -1010,7 +1015,7 @@ def test_plot_payload_routes_overlay_waterfall_through_accumulator():
     from xdart.gui.tabs.static_scan.display_logic import Mode
     from xdart.modules.frame_publication import (
         PublicationStore, publication_from_live_frame)
-    from xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 
     def _ir1d(v, nq=5):
         return IntegrationResult1D(
@@ -1233,7 +1238,7 @@ def test_overlay_selection_of_evicted_frame_preserves_then_appends():
         PublicationDisplayAdapter)
     from xdart.modules.frame_publication import (
         PublicationStore, publication_from_live_frame)
-    from xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 
     x = np.linspace(0.5, 5.0, 8, dtype=np.float32)
 
@@ -1243,7 +1248,12 @@ def test_overlay_selection_of_evicted_frame_preserves_then_appends():
             int_1d=IntegrationResult1D(
                 radial=x, intensity=np.full(x.shape, float(i), dtype=np.float32),
                 sigma=np.ones_like(x), unit="q_A^-1"),
-            int_2d=None, map_raw=None, mask=None, gi=False, gi_2d={},
+            int_2d=IntegrationResult2D(
+                radial=np.linspace(0.5, 5.0, 4, dtype=np.float32),
+                azimuthal=np.linspace(-90.0, 90.0, 3, dtype=np.float32),
+                intensity=np.full((4, 3), float(i), dtype=np.float32),
+                unit="q_A^-1", azimuthal_unit="chi_deg"),
+            map_raw=None, mask=None, gi=False, gi_2d={},
             thumbnail=None, bg_raw=0, scan_info={}, source_file=f"f{i}.tif",
             source_frame_idx=i,
         )
@@ -1338,7 +1348,7 @@ def test_overlay_many_frame_selection_converges_after_out_of_order_hydration():
         PublicationDisplayAdapter)
     from xdart.modules.frame_publication import (
         PublicationStore, publication_from_live_frame)
-    from xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 
     x = np.linspace(0.5, 5.0, 8, dtype=np.float32)
 
@@ -1348,7 +1358,12 @@ def test_overlay_many_frame_selection_converges_after_out_of_order_hydration():
             int_1d=IntegrationResult1D(
                 radial=x, intensity=np.full(x.shape, float(i), dtype=np.float32),
                 sigma=np.ones_like(x), unit="q_A^-1"),
-            int_2d=None, map_raw=None, mask=None, gi=False, gi_2d={},
+            int_2d=IntegrationResult2D(
+                radial=np.linspace(0.5, 5.0, 4, dtype=np.float32),
+                azimuthal=np.linspace(-90.0, 90.0, 3, dtype=np.float32),
+                intensity=np.full((4, 3), float(i), dtype=np.float32),
+                unit="q_A^-1", azimuthal_unit="chi_deg"),
+            map_raw=None, mask=None, gi=False, gi_2d={},
             thumbnail=None, bg_raw=0, scan_info={}, source_file=f"f{i}.tif",
             source_frame_idx=i,
         )
@@ -1421,7 +1436,7 @@ def test_overlay_selection_evicted_hydration_never_decreases_history():
         PublicationDisplayAdapter)
     from xdart.modules.frame_publication import (
         PublicationStore, publication_from_live_frame)
-    from xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 
     x = np.linspace(0.5, 5.0, 8, dtype=np.float32)
 
@@ -1431,7 +1446,12 @@ def test_overlay_selection_evicted_hydration_never_decreases_history():
             int_1d=IntegrationResult1D(
                 radial=x, intensity=np.full(x.shape, float(i), dtype=np.float32),
                 sigma=np.ones_like(x), unit="q_A^-1"),
-            int_2d=None, map_raw=None, mask=None, gi=False, gi_2d={},
+            int_2d=IntegrationResult2D(
+                radial=np.linspace(0.5, 5.0, 4, dtype=np.float32),
+                azimuthal=np.linspace(-90.0, 90.0, 3, dtype=np.float32),
+                intensity=np.full((4, 3), float(i), dtype=np.float32),
+                unit="q_A^-1", azimuthal_unit="chi_deg"),
+            map_raw=None, mask=None, gi=False, gi_2d={},
             thumbnail=None, bg_raw=0, scan_info={}, source_file=f"f{i}.tif",
             source_frame_idx=i,
         )

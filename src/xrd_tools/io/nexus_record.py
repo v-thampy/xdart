@@ -133,6 +133,8 @@ def frame_record_from_live_frame(
     active_mode_1d: str | None = None,
     active_mode_2d: str | None = None,
     include_raw: bool = False,
+    include_2d: bool = True,
+    include_thumbnail: bool = True,
 ) -> FrameRecord:
     """Build the durable multi-mode :class:`FrameRecord` for a LiveFrame-like
     object.
@@ -150,8 +152,8 @@ def frame_record_from_live_frame(
         except Exception:
             incident_angle = None
     result_1d = getattr(frame, "int_1d", None)
-    result_2d = getattr(frame, "int_2d", None)
-    thumbnail = getattr(frame, "thumbnail", None)
+    result_2d = getattr(frame, "int_2d", None) if include_2d else None
+    thumbnail = getattr(frame, "thumbnail", None) if include_thumbnail else None
     common = dict(
         metadata_raw=metadata_raw,
         metadata_numeric=metadata_num,
@@ -170,7 +172,7 @@ def frame_record_from_live_frame(
     )
 
     gi_1d = getattr(frame, "gi_1d", None) or {}
-    gi_2d = getattr(frame, "gi_2d", None) or {}
+    gi_2d = (getattr(frame, "gi_2d", None) or {}) if include_2d else {}
     if not gi_1d and not gi_2d:
         return FrameRecord.from_view(
             view,

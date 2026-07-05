@@ -134,6 +134,21 @@ def _data_snapshot(widget, *, mode, labels=None, include_legacy=True,
     loaded_1d, loaded_2d, raw_avail = set(), set(), {}
     if labels is None:
         labels = ()
+    snapshot_items = _browse_one_shot_publication_items(widget, labels)
+    for label, publication in snapshot_items.items():
+        view = getattr(publication, "view", None)
+        if view is None:
+            continue
+        key = _label_key(label)
+        if getattr(view, "has_1d", False):
+            loaded_1d.add(key)
+        if getattr(view, "has_2d", False):
+            loaded_2d.add(key)
+        if getattr(view, "raw", None) is not None or getattr(view, "thumbnail", None) is not None:
+            raw_avail[key] = {
+                "has_raw": getattr(view, "raw", None) is not None,
+                "has_thumbnail": getattr(view, "thumbnail", None) is not None,
+            }
     for label in _label_keys(labels):
         if mode in (Mode.INT_2D, Mode.IMAGE_VIEWER, Mode.NEXUS_VIEWER):
             r_2d = resolve_frame_data_for_widget(
@@ -172,6 +187,26 @@ def _store_first_lookup(widget):
     return lookup
 
 
+def _browse_one_shot_publication_items(widget, labels):
+    if getattr(widget, "viewer_mode", None) is not None:
+        return {}
+    if labels is None:
+        return {}
+    snapshot = getattr(widget, "_browse_one_shot_publications", None) or {}
+    if not snapshot:
+        return {}
+    target = set(_label_keys(
+        getattr(widget, "_browse_one_shot_target_labels", ()) or ()))
+    items = {}
+    for label in _label_keys(labels):
+        if target and label not in target:
+            continue
+        publication = snapshot.get(label)
+        if publication is not None:
+            items[label] = publication
+    return items
+
+
 def resolve_frame_data_for_widget(
         widget, label, mode, tier_needed, *, include_legacy=True,
         request_hydration=True):
@@ -202,8 +237,10 @@ def _store_first_publication_items(widget, labels):
         return None
     if labels is None:
         return None
-    items = {}
+    items = dict(_browse_one_shot_publication_items(widget, labels))
     for label in _label_keys(labels):
+        if label in items:
+            continue
         result = resolve_frame_data_for_widget(
             widget, label, Mode.INT_2D, DataTier.PUBLICATION,
             include_legacy=False, request_hydration=False)
@@ -333,7 +370,11 @@ class _BaseController:
 
     def build_payload(self, widget, state):
         store = getattr(widget, "publication_store", None)
-        labels = tuple(dict.fromkeys((*state.selected_ids, *state.render_ids)))
+        pending_overlay = tuple(
+            getattr(widget, "_overlay_hydrated_pending_append_labels", ()) or ()
+        )
+        labels = tuple(dict.fromkeys(
+            (*pending_overlay, *state.selected_ids, *state.render_ids)))
         items = _store_first_publication_items(widget, labels)
         if items is not None:
             adapter = PublicationDisplayAdapter(

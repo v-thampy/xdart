@@ -63,6 +63,7 @@ from .display_logic import (
     ConsumerKind, SupersedeReason,
 )
 from .display_controllers import register_default_controllers
+from .browse_debug import browse_debug_log, sequence_summary
 from .display_overlay_utils import (
     current_scan_key as overlay_current_scan_key,
     current_axis_info as overlay_current_axis_info,
@@ -1038,6 +1039,18 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             except ValueError:
                 reason = SupersedeReason.RESET
         self.display_generation += 1
+        browse_debug_log(
+            logger,
+            "generation_bump",
+            cause=getattr(reason, "value", str(reason)),
+            generation=self.display_generation,
+            selected=sequence_summary(getattr(self, "frame_ids", ())),
+            mode=(
+                self.ui.plotMethod.currentText()
+                if hasattr(self, "ui") and hasattr(self.ui, "plotMethod")
+                else None
+            ),
+        )
         pending_hydration = getattr(self, "_hydration_pending_labels", None)
         if pending_hydration is not None:
             if reason is SupersedeReason.SELECTION:
@@ -1117,9 +1130,29 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             except (TypeError, ValueError):
                 pass
             if generation != current_generation:
+                browse_debug_log(
+                    logger,
+                    "render_request",
+                    requestor="displayFrame.request_current_selection_repaint",
+                    reason=reason,
+                    generation=generation,
+                    current_generation=current_generation,
+                    selected=sequence_summary(getattr(self, "frame_ids", ())),
+                    granted=False,
+                    suppressed_by="stale_generation",
+                )
                 return False
         self._current_selection_repaint_generation = current_generation
         self._current_selection_repaint_pending = True
+        browse_debug_log(
+            logger,
+            "render_request",
+            requestor="displayFrame.request_current_selection_repaint",
+            reason=reason,
+            generation=current_generation,
+            selected=sequence_summary(getattr(self, "frame_ids", ())),
+            granted=True,
+        )
         timer = getattr(self, "_current_selection_repaint_timer", None)
         if timer is not None:
             try:
@@ -1143,10 +1176,29 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             except (TypeError, ValueError):
                 pass
             if generation != self.display_generation:
+                browse_debug_log(
+                    logger,
+                    "render_request",
+                    requestor="displayFrame.flush_current_selection_repaint",
+                    generation=generation,
+                    current_generation=self.display_generation,
+                    selected=sequence_summary(getattr(self, "frame_ids", ())),
+                    granted=False,
+                    suppressed_by="stale_flush_generation",
+                )
                 return True
         update = getattr(self, "update", None)
         if not callable(update):
             return True
+        browse_debug_log(
+            logger,
+            "render_request",
+            requestor="displayFrame.flush_current_selection_repaint",
+            generation=generation,
+            current_generation=self.display_generation,
+            selected=sequence_summary(getattr(self, "frame_ids", ())),
+            granted=True,
+        )
         try:
             return update(expected_generation=generation)
         except TypeError:
@@ -1907,9 +1959,38 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             except (TypeError, ValueError):
                 pass
             if expected_generation != self.display_generation:
+                browse_debug_log(
+                    logger,
+                    "render_request",
+                    requestor="displayFrame.update",
+                    generation=expected_generation,
+                    current_generation=self.display_generation,
+                    selected=sequence_summary(getattr(self, "frame_ids", ())),
+                    granted=False,
+                    suppressed_by="expected_generation_mismatch",
+                )
                 return True
         if getattr(self, "_in_update", False):
+            browse_debug_log(
+                logger,
+                "render_request",
+                requestor="displayFrame.update",
+                generation=expected_generation,
+                current_generation=self.display_generation,
+                selected=sequence_summary(getattr(self, "frame_ids", ())),
+                granted=False,
+                suppressed_by="reentrant_update",
+            )
             return True
+        browse_debug_log(
+            logger,
+            "render_request",
+            requestor="displayFrame.update",
+            generation=expected_generation,
+            current_generation=self.display_generation,
+            selected=sequence_summary(getattr(self, "frame_ids", ())),
+            granted=True,
+        )
         self._in_update = True
         try:
             return self._update_impl()
@@ -1966,8 +2047,27 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             # data lands, so they persist together.
             if has_cached or (getattr(self, 'PERSIST_2D_DURING_PROCESSING', True)
                               and getattr(self, '_processing_active', False)):
+                browse_debug_log(
+                    logger,
+                    "render_request",
+                    requestor="displayFrame._update_impl",
+                    generation=self.display_generation,
+                    selected=sequence_summary(getattr(self, "frame_ids", ())),
+                    granted=False,
+                    suppressed_by="not_updated_keep_cached",
+                )
                 return True
             empty = empty_display_state(self._live_mode(), self.display_generation)
+            browse_debug_log(
+                logger,
+                "render_request",
+                requestor="displayFrame._update_impl",
+                generation=self.display_generation,
+                selected=sequence_summary(getattr(self, "frame_ids", ())),
+                granted=True,
+                suppressed_by=None,
+                empty_state=True,
+            )
             result = self.render_display(empty, None)
             self._display_blanked = True
             return result
@@ -1984,6 +2084,33 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             if _ass is not None:
                 _ass()
         payload = ctrl.build_payload(self, state)  # store=None ⇒ delegate draws
+        plot_payload = getattr(payload, "plot", None)
+        plot_traces = tuple(getattr(plot_payload, "traces", ()) or ())
+        history = getattr(plot_payload, "plot_history", None)
+        history_count = getattr(history, "count", None)
+        selected_count = len(getattr(state, "selected_ids", ()) or ())
+        browse_debug_log(
+            logger,
+            "render_payload",
+            generation=state.generation,
+            mode=str(getattr(state, "method", "")),
+            selected=sequence_summary(getattr(state, "selected_ids", ())),
+            render_ids=sequence_summary(getattr(state, "render_ids", ())),
+            plot_trace_count=len(plot_traces),
+            accumulator_row_count=history_count,
+            has_raw=bool(getattr(payload, "raw_image", None) is not None),
+            has_cake=bool(getattr(payload, "cake_image", None) is not None),
+        )
+        if selected_count and plot_payload is not None and len(plot_traces) == 0:
+            browse_debug_log(
+                logger,
+                "empty_plot_payload",
+                level="error",
+                generation=state.generation,
+                mode=str(getattr(state, "method", "")),
+                selected=sequence_summary(getattr(state, "selected_ids", ())),
+                render_ids=sequence_summary(getattr(state, "render_ids", ())),
+            )
         result = self.render_display(state, payload)
         self._display_blanked = False
         return result
@@ -2073,6 +2200,17 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         traces = tuple(getattr(payload_value, "traces", ()) or ())
         if not traces:
+            browse_debug_log(
+                logger,
+                "accumulator_rows",
+                generation=getattr(state, "generation", None),
+                mode=str(getattr(state, "method", "")),
+                selected=sequence_summary(getattr(state, "selected_ids", ())),
+                render_ids=sequence_summary(getattr(state, "render_ids", ())),
+                plot_trace_count=0,
+                accumulator_row_count=getattr(
+                    getattr(payload_value, "plot_history", None), "count", None),
+            )
             self.clear_plot_view()
             return True
 
@@ -2088,6 +2226,18 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             names.append(str(trace.label))
 
         ydata = np.vstack(rows)
+        browse_debug_log(
+            logger,
+            "accumulator_rows",
+            generation=getattr(state, "generation", None),
+            mode=str(getattr(state, "method", "")),
+            selected=sequence_summary(getattr(state, "selected_ids", ())),
+            render_ids=sequence_summary(getattr(state, "render_ids", ())),
+            plot_trace_count=len(traces),
+            row_count=int(ydata.shape[0]),
+            accumulator_row_count=getattr(
+                getattr(payload_value, "plot_history", None), "count", None),
+        )
         if self.bkg_1d is not None:
             try:
                 ydata = ydata - self.bkg_1d
@@ -2778,9 +2928,32 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             # it over the current state (§8 generation invariant).
             logger.debug("render: dropping stale payload gen=%s vs state gen=%s",
                          getattr(payload, 'generation', None), state.generation)
+            browse_debug_log(
+                logger,
+                "render_request",
+                requestor="displayFrame.render_display",
+                generation=getattr(payload, "generation", None),
+                current_generation=getattr(state, "generation", None),
+                selected=sequence_summary(getattr(state, "selected_ids", ())),
+                granted=False,
+                suppressed_by="render_plan_drop",
+            )
             return True
 
         mode = state.mode
+        plot_payload = getattr(payload, "plot", None)
+        history = getattr(plot_payload, "plot_history", None)
+        browse_debug_log(
+            logger,
+            "render_request",
+            requestor="displayFrame.render_display",
+            generation=getattr(payload, "generation", None),
+            current_generation=getattr(state, "generation", None),
+            selected=sequence_summary(getattr(state, "selected_ids", ())),
+            render_ids=sequence_summary(getattr(state, "render_ids", ())),
+            granted=True,
+            accumulator_row_count=getattr(history, "count", None),
+        )
 
         # Normal-mode input prep: Share-Axis link + 1D-only panel visibility.
         if mode in (Mode.INT_1D, Mode.INT_2D):

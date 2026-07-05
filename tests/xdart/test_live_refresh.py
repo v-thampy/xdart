@@ -13,7 +13,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from pyqtgraph.Qt import QtCore
+from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from xdart.gui.tabs.static_scan.h5viewer import H5Viewer
 from xdart.gui.tabs.static_scan.display_data import (
@@ -447,6 +447,13 @@ class _ManualDebounce(_FakeTimer):
         if self.active:
             self.active = False
             self.callback()
+
+
+def _ensure_qapp():
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        app = QtWidgets.QApplication([])
+    return app
 
 
 class _FakeWorker:
@@ -3104,7 +3111,7 @@ def test_update_store_evicted_overlay_selection_preserves_history_and_hydrates()
         PublicationStore,
         publication_from_live_frame,
     )
-    from xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 
     x = np.linspace(0.5, 5.0, 8, dtype=np.float32)
 
@@ -3117,7 +3124,13 @@ def test_update_store_evicted_overlay_selection_preserves_history_and_hydrates()
                 sigma=np.ones_like(x),
                 unit="q_A^-1",
             ),
-            int_2d=None,
+            int_2d=IntegrationResult2D(
+                radial=np.linspace(0.5, 5.0, 4, dtype=np.float32),
+                azimuthal=np.linspace(-90.0, 90.0, 3, dtype=np.float32),
+                intensity=np.full((4, 3), float(i), dtype=np.float32),
+                unit="q_A^-1",
+                azimuthal_unit="chi_deg",
+            ),
             map_raw=None,
             mask=None,
             gi=False,
@@ -3832,6 +3845,422 @@ def test_fast_selection_sweep_debounces_whole_normal_mode_body():
     assert load_calls == []
 
 
+def test_browse_key_event_filter_accepts_real_pyside_shift_modifier():
+    _ensure_qapp()
+    list_data = QtWidgets.QListWidget()
+    list_data.addItems([str(i) for i in range(1, 74)])
+    list_data.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+    calls = []
+    viewer = SimpleNamespace(
+        ui=SimpleNamespace(listData=list_data, listScans=QtWidgets.QListWidget()),
+        viewer_mode=None,
+        _plot_method="Overlay",
+        _run_writing=False,
+        _browse_gesture_active=False,
+        _browse_pending_data_changed=False,
+        _selection_coalesce_timer=_FakeTimer(active=False),
+        _load_coalesce_timer=_FakeTimer(active=False),
+        _update_coalesce_timer=_FakeTimer(active=False),
+        data_changed=lambda: calls.append("data_changed"),
+    )
+
+    press = QtGui.QKeyEvent(
+        QtCore.QEvent.Type.KeyPress,
+        QtCore.Qt.Key.Key_Down,
+        QtCore.Qt.KeyboardModifier.ShiftModifier,
+    )
+    release = QtGui.QKeyEvent(
+        QtCore.QEvent.Type.KeyRelease,
+        QtCore.Qt.Key.Key_Down,
+        QtCore.Qt.KeyboardModifier.ShiftModifier,
+    )
+
+    assert H5Viewer.eventFilter(viewer, list_data, press) is False
+    assert viewer._browse_gesture_active is True
+    assert H5Viewer.eventFilter(viewer, list_data, release) is False
+
+    assert viewer._browse_gesture_active is False
+    assert calls == ["data_changed"]
+
+
+def test_xye_overlay_filter_accepts_real_pyside_shift_modifier():
+    from xdart.gui.tabs.static_scan.static_scan_widget import _XyeOverlayInputFilter
+
+    _ensure_qapp()
+    event = QtGui.QKeyEvent(
+        QtCore.QEvent.Type.KeyPress,
+        QtCore.Qt.Key.Key_Down,
+        QtCore.Qt.KeyboardModifier.ShiftModifier,
+    )
+
+    assert _XyeOverlayInputFilter._meaningful_modifiers(event) == (True, False)
+
+
+def test_active_browse_key_gesture_suppresses_selection_work():
+    class CountingList(_FakeListWidget):
+        def __init__(self, items=()):
+            super().__init__(items)
+            self.selected_calls = 0
+
+        def selectedItems(self):
+            self.selected_calls += 1
+            return super().selectedItems()
+
+    list_data = CountingList(range(1, 22))
+    for row in range(list_data.count()):
+        list_data.item(row).setSelected(True)
+    selection_timer = _FakeTimer(active=False)
+    viewer = SimpleNamespace(
+        viewer_mode=None,
+        _plot_method="Overlay",
+        _run_writing=False,
+        _browse_gesture_active=True,
+        _browse_pending_data_changed=False,
+        frame_ids=[],
+        ui=SimpleNamespace(listData=list_data),
+        scan=SimpleNamespace(frames=SimpleNamespace(index=list(range(1, 22)))),
+        update_2d=True,
+        publication_store=None,
+        _pending_load_ids=None,
+        _pending_load_2d=True,
+        _update_coalesce_timer=_FakeTimer(active=False),
+        _load_coalesce_timer=_FakeTimer(active=False),
+        _selection_coalesce_timer=selection_timer,
+    )
+    viewer.data_changed = MethodType(H5Viewer.data_changed, viewer)
+
+    viewer.data_changed()
+
+    assert list_data.selected_calls == 0
+    assert selection_timer.started == 0
+    assert viewer._browse_pending_data_changed is True
+
+
+def test_overlay_plain_step_captures_visit_before_debounce_without_loading():
+    list_data = _FakeListWidget(range(1, 22))
+    list_data.setCurrentRow(4)
+    selection_timer = _FakeTimer(active=False)
+    load_timer = _FakeTimer(active=False)
+    update_timer = _FakeTimer(active=False)
+    viewer = SimpleNamespace(
+        viewer_mode=None,
+        _plot_method="Overlay",
+        _run_writing=False,
+        _browse_gesture_active=False,
+        _browse_pending_data_changed=False,
+        _overlay_visit_intent_labels=[],
+        frame_ids=[],
+        ui=SimpleNamespace(listData=list_data),
+        scan=SimpleNamespace(frames=SimpleNamespace(index=list(range(1, 22)))),
+        update_2d=True,
+        publication_store=None,
+        _pending_load_ids=None,
+        _pending_load_2d=True,
+        _update_coalesce_timer=update_timer,
+        _load_coalesce_timer=load_timer,
+        _selection_coalesce_timer=selection_timer,
+    )
+    viewer.data_changed = MethodType(H5Viewer.data_changed, viewer)
+
+    viewer.data_changed()
+
+    assert viewer._overlay_visit_intent_labels == [5]
+    assert selection_timer.started == 1
+    assert load_timer.started == 0
+    assert update_timer.started == 0
+
+
+def test_overlay_plain_step_drains_all_visit_intents_as_one_1d_batch():
+    list_data = _FakeListWidget(range(1, 22))
+    list_data.setCurrentRow(20)
+    load_timer = _FakeTimer(active=False)
+    update_timer = _FakeTimer(active=False)
+    viewer = SimpleNamespace(
+        viewer_mode=None,
+        _plot_method="Overlay",
+        _run_writing=False,
+        _browse_gesture_active=False,
+        _browse_pending_data_changed=False,
+        _overlay_visit_intent_labels=list(range(1, 22)),
+        _overlay_visit_inflight_labels=(),
+        _overlay_hydrated_pending_append_labels=[],
+        frame_ids=[],
+        ui=SimpleNamespace(listData=list_data),
+        scan=SimpleNamespace(frames=SimpleNamespace(index=list(range(1, 22)))),
+        update_2d=True,
+        publication_store=None,
+        _pending_load_ids=None,
+        _pending_load_2d=True,
+        _update_coalesce_timer=update_timer,
+        _load_coalesce_timer=load_timer,
+    )
+    viewer._data_changed_now = MethodType(H5Viewer._data_changed_now, viewer)
+
+    viewer._data_changed_now()
+
+    assert viewer._pending_load_ids == list(range(1, 22))
+    assert viewer._pending_load_2d is False
+    assert viewer._overlay_visit_inflight_labels == tuple(range(1, 22))
+    assert load_timer.started == 1
+    assert update_timer.started == 0
+
+
+def test_browse_missing_selection_waits_for_bulk_load_before_render():
+    class CountingList(_FakeListWidget):
+        def __init__(self, items=()):
+            super().__init__(items)
+            self.selected_calls = 0
+
+        def selectedItems(self):
+            self.selected_calls += 1
+            return super().selectedItems()
+
+    list_data = CountingList(range(1, 74))
+    for row in range(list_data.count()):
+        list_data.item(row).setSelected(True)
+    update_timer = _FakeTimer(active=False)
+    load_timer = _FakeTimer(active=False)
+    viewer = SimpleNamespace(
+        viewer_mode=None,
+        _plot_method="Overlay",
+        frame_ids=[],
+        ui=SimpleNamespace(listData=list_data),
+        scan=SimpleNamespace(frames=SimpleNamespace(index=list(range(1, 74)))),
+        update_2d=True,
+        publication_store=None,
+        _run_writing=False,
+        _browse_gesture_active=False,
+        _browse_pending_data_changed=False,
+        _pending_load_ids=None,
+        _pending_load_2d=True,
+        _update_coalesce_timer=update_timer,
+        _load_coalesce_timer=load_timer,
+    )
+    viewer._data_changed_now = MethodType(H5Viewer._data_changed_now, viewer)
+
+    viewer._data_changed_now()
+
+    assert list_data.selected_calls == 1
+    assert viewer._pending_load_ids == list(range(1, 74))
+    assert viewer._pending_load_2d is False
+    assert load_timer.started == 1
+    assert update_timer.started == 0
+
+
+def test_show_all_selects_all_and_waits_for_one_bulk_render():
+    list_data = _FakeListWidget(range(1, 3622))
+    update_timer = _FakeTimer(active=False)
+    load_timer = _FakeTimer(active=False)
+    viewer = SimpleNamespace(
+        viewer_mode=None,
+        _plot_method="Overlay",
+        frame_ids=[],
+        ui=SimpleNamespace(listData=list_data),
+        scan=SimpleNamespace(frames=SimpleNamespace(index=list(range(1, 3622)))),
+        update_2d=True,
+        publication_store=None,
+        _run_writing=False,
+        _browse_gesture_active=False,
+        _browse_pending_data_changed=False,
+        _pending_load_ids=None,
+        _pending_load_2d=True,
+        _pending_data_changed=False,
+        _selection_coalesce_timer=_FakeTimer(active=False),
+        _update_coalesce_timer=update_timer,
+        _load_coalesce_timer=load_timer,
+        new_scan=True,
+    )
+    viewer.data_changed = MethodType(H5Viewer.data_changed, viewer)
+    viewer._data_changed_now = MethodType(H5Viewer._data_changed_now, viewer)
+    viewer.show_all = MethodType(H5Viewer.show_all, viewer)
+
+    viewer.show_all()
+
+    assert len(list_data.selectedItems()) == 3621
+    assert viewer._pending_load_ids == list(range(1, 3622))
+    assert viewer._pending_load_2d is False
+    assert load_timer.started == 1
+    assert update_timer.started == 0
+
+    viewer._data_changed_now(show_all=False)
+
+    assert load_timer.started == 1
+    assert update_timer.started == 0
+
+
+def test_single_mode_multiselect_uses_same_browse_one_shot_path():
+    list_data = _FakeListWidget(range(1, 31))
+    for row in range(list_data.count()):
+        list_data.item(row).setSelected(True)
+    update_timer = _FakeTimer(active=False)
+    load_timer = _FakeTimer(active=False)
+    viewer = SimpleNamespace(
+        viewer_mode=None,
+        _plot_method="Single",
+        frame_ids=[],
+        ui=SimpleNamespace(listData=list_data),
+        scan=SimpleNamespace(frames=SimpleNamespace(index=list(range(1, 31)))),
+        update_2d=True,
+        publication_store=None,
+        _run_writing=False,
+        _browse_gesture_active=False,
+        _browse_pending_data_changed=False,
+        _pending_load_ids=None,
+        _pending_load_2d=True,
+        _update_coalesce_timer=update_timer,
+        _load_coalesce_timer=load_timer,
+    )
+    viewer._data_changed_now = MethodType(H5Viewer._data_changed_now, viewer)
+
+    viewer._data_changed_now()
+
+    assert viewer._pending_load_ids == list(range(1, 31))
+    assert viewer._pending_load_2d is False
+    assert load_timer.started == 1
+    assert update_timer.started == 0
+
+
+def test_browse_one_shot_chunks_do_not_repaint_until_worker_finishes():
+    from xdart.modules.frame_publication import PublicationStore
+    from xrd_tools.core.containers import IntegrationResult1D
+
+    x = np.linspace(0.5, 3.0, 6)
+
+    def _frame(idx):
+        return SimpleNamespace(
+            idx=idx,
+            gi=False,
+            scan_info={},
+            int_1d=IntegrationResult1D(
+                radial=x,
+                intensity=np.full(x.shape, float(idx)),
+                sigma=np.ones_like(x),
+                unit="q_A^-1",
+            ),
+            int_2d=None,
+            map_raw=None,
+            thumbnail=None,
+            source_file=f"frame_{idx}.tif",
+            source_frame_idx=idx,
+        )
+
+    emitted = []
+    update_timer = _FakeTimer(active=False)
+    thread = object()
+    viewer = SimpleNamespace(
+        _load_generation=12,
+        _browse_one_shot_load_generation=12,
+        _browse_one_shot_pending_render=True,
+        _browse_one_shot_target_labels=(1, 2, 3),
+        _browse_one_shot_publications={},
+        _update_coalesce_timer=update_timer,
+        _load_thread=thread,
+        _load_worker=object(),
+        sender=lambda: thread,
+        sigUpdate=SimpleNamespace(emit=lambda: emitted.append("update")),
+        data_lock=RLock(),
+        viewer_rows_1d={},
+        viewer_rows_2d={},
+        publication_store=PublicationStore(),
+    )
+    viewer._absorb_chunk = MethodType(H5Viewer._absorb_chunk, viewer)
+    viewer._clear_load_worker_refs = MethodType(
+        H5Viewer._clear_load_worker_refs, viewer)
+
+    for idx in (1, 2, 3):
+        viewer._absorb_chunk(12, idx, _frame(idx), False)
+
+    assert update_timer.started == 0
+
+    viewer._clear_load_worker_refs()
+
+    assert emitted == ["update"]
+    assert viewer._browse_one_shot_pending_render is False
+
+
+def test_overlay_visit_completion_hands_append_queue_to_final_render():
+    emitted = []
+    thread = object()
+    viewer = SimpleNamespace(
+        _load_generation=5,
+        _browse_one_shot_load_generation=5,
+        _browse_one_shot_pending_render=True,
+        _browse_gesture_active=False,
+        _overlay_visit_inflight_labels=(1, 2, 3),
+        _overlay_hydrated_pending_append_labels=[],
+        _update_coalesce_timer=_FakeTimer(active=False),
+        _load_thread=thread,
+        _load_worker=object(),
+        sender=lambda: thread,
+        sigUpdate=SimpleNamespace(emit=lambda: emitted.append("update")),
+    )
+    viewer._clear_load_worker_refs = MethodType(
+        H5Viewer._clear_load_worker_refs, viewer)
+
+    viewer._clear_load_worker_refs()
+
+    assert emitted == ["update"]
+    assert viewer._overlay_hydrated_pending_append_labels == [1, 2, 3]
+
+
+def test_browse_bulk_absorb_publishes_light_1d_rows_outside_heavy_window():
+    from xdart.modules.frame_publication import PublicationStore
+    from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+
+    x = np.linspace(0.5, 3.0, 6)
+    chi = np.linspace(-10.0, 10.0, 3)
+
+    def _frame(idx):
+        return SimpleNamespace(
+            idx=idx,
+            gi=False,
+            scan_info={},
+            int_1d=IntegrationResult1D(
+                radial=x,
+                intensity=np.full(x.shape, float(idx)),
+                sigma=np.ones_like(x),
+                unit="q_A^-1",
+            ),
+            int_2d=IntegrationResult2D(
+                radial=x,
+                azimuthal=chi,
+                intensity=np.ones((x.size, chi.size)),
+                unit="q_A^-1",
+                azimuthal_unit="chi_deg",
+            ),
+            map_raw=None,
+            thumbnail=np.ones((2, 2)),
+            source_file=f"frame_{idx}.tif",
+            source_frame_idx=idx,
+        )
+
+    store = PublicationStore(max_items=None, max_heavy_items=1, max_thumbnail_items=1)
+    viewer = SimpleNamespace(
+        _load_generation=3,
+        _browse_one_shot_load_generation=3,
+        _browse_one_shot_pending_render=True,
+        _browse_one_shot_target_labels=tuple(range(1, 70)),
+        _browse_one_shot_publications={},
+        _update_coalesce_timer=_FakeTimer(active=False),
+        data_lock=RLock(),
+        viewer_rows_1d={},
+        viewer_rows_2d={},
+        publication_store=store,
+    )
+    viewer._absorb_chunk = MethodType(H5Viewer._absorb_chunk, viewer)
+
+    for idx in range(1, 70):
+        viewer._absorb_chunk(3, idx, _frame(idx), False)
+
+    resident = store.get_many(range(1, 70))
+    assert len(resident) == 69
+    assert list(store._heavy_labels) == []
+    assert len(viewer._browse_one_shot_publications) == 69
+    assert all(pub.view.has_1d for pub in resident.values())
+    assert all(not pub.view.has_2d for pub in resident.values())
+    assert all(pub.raw_ref is None for pub in resident.values())
+
+
 def test_cancel_pending_loads_invalidates_late_chunks():
     calls = []
     timer = _FakeTimer(active=True)
@@ -4028,6 +4457,7 @@ def test_load_worker_gets_pool_handle_under_file_lock(monkeypatch):
             return False
 
     lock = _TrackingLock()
+    load_opts = []
 
     class _Pool:
         def get(self, _path):
@@ -4040,8 +4470,9 @@ def test_load_worker_gets_pool_handle_under_file_lock(monkeypatch):
     monkeypatch.setattr(
         frame_series_mod,
         "_load_frame_v2",
-        lambda _file, _idx, static, gi: (
+        lambda _file, _idx, static, gi, **_opts: (
             assert_lock_held(lock),
+            load_opts.append(_opts),
             calls.append("load-frame"),
             frame,
         )[-1],
@@ -4059,6 +4490,49 @@ def test_load_worker_gets_pool_handle_under_file_lock(monkeypatch):
     worker.run()
 
     assert calls[:4] == ["lock-enter", "pool-get", "load-frame", "lock-exit"]
+    assert load_opts == [{"include_2d": True, "include_thumbnail": True}]
+
+
+def test_load_worker_honors_load_2d_false_in_loader(monkeypatch):
+    import xdart.gui.tabs.static_scan.h5viewer as h5viewer_mod
+    import xdart.modules.ewald.frame_series as frame_series_mod
+    from xdart.gui.tabs.static_scan.h5viewer import _LoadFramesWorker
+
+    class _Lock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    class _Pool:
+        def get(self, _path):
+            return object()
+
+    load_opts = []
+    frame = SimpleNamespace(map_raw=None)
+    monkeypatch.setattr(h5viewer_mod, "get_pool", lambda: _Pool())
+    monkeypatch.setattr(
+        frame_series_mod,
+        "_load_frame_v2",
+        lambda _file, _idx, static, gi, **_opts: (
+            load_opts.append(_opts),
+            frame,
+        )[-1],
+    )
+
+    worker = _LoadFramesWorker(
+        data_file="/data/file.nxs",
+        file_lock=_Lock(),
+        gi=False,
+        frame_ids=[1],
+        load_2d=False,
+        generation=1,
+        hydrate_raw=True,
+    )
+    worker.run()
+
+    assert load_opts == [{"include_2d": False, "include_thumbnail": False}]
 
 
 def assert_lock_held(lock):
@@ -5976,7 +6450,7 @@ def test_xye_single_method_change_clears_accumulated_traces_immediately():
     assert host.overlaid_idxs == []
 
 
-def test_overlay_to_single_collapses_selection_and_refreshes_frame_ids():
+def test_overlay_to_single_preserves_multiselection_and_refreshes_frame_ids():
     list_data = _FakeListWidget(["1", "2", "3", "4", "5"])
     list_data.selectAll()
     list_data._current_row = 2
@@ -5995,9 +6469,10 @@ def test_overlay_to_single_collapses_selection_and_refreshes_frame_ids():
 
     H5Viewer.set_data_selection_mode(viewer, "Single")
 
-    assert calls == [("3",)]
-    assert viewer.frame_ids == ["3"]
-    assert [item.text() for item in list_data.selectedItems()] == ["3"]
+    assert calls == [("1", "2", "3", "4", "5")]
+    assert viewer.frame_ids == ["1", "2", "3", "4", "5"]
+    assert [item.text() for item in list_data.selectedItems()] == [
+        "1", "2", "3", "4", "5"]
 
 
 def test_xye_axis_label_uses_file_unit_not_hidden_transform_combo():

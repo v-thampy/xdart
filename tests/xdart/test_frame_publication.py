@@ -77,6 +77,32 @@ def test_publication_from_live_frame_keeps_raw_lazy_by_default():
     assert publication.diagnostics.ok
 
 
+def test_publication_from_live_frame_can_publish_1d_light_rows():
+    from xdart.modules.frame_publication import _publication_has_heavy_payload
+
+    store = PublicationStore(max_items=None, max_heavy_items=1, max_thumbnail_items=1)
+
+    for idx in range(1, 70):
+        publication = publication_from_live_frame(
+            DuckFrame(idx=idx),
+            include_2d=False,
+            include_thumbnail=False,
+            retain_raw_ref=False,
+        )
+        assert publication.view.has_1d
+        assert not publication.view.has_2d
+        assert publication.view.thumbnail is None
+        assert publication.raw_ref is None
+        assert publication.raw_status == "1d-only"
+        assert not _publication_has_heavy_payload(publication)
+        store.upsert(publication)
+
+    resident = store.get_many(range(1, 70))
+    assert len(resident) == 69
+    assert all(pub.view.has_1d for pub in resident.values())
+    assert list(store._heavy_labels) == []
+
+
 def test_gi_dummy_publication_is_flagged_before_display_or_save():
     frame = DuckFrame(idx=4, gi=True)
     frame.int_2d = IntegrationResult2D(
@@ -191,6 +217,24 @@ def test_publication_store_heavy_window_resize_evicts_existing_payloads():
     assert not store.get(1).view.has_2d
     assert store.get(1).raw_status == "thumbnail"
     assert store.get(2).view.has_2d
+
+
+def test_publication_store_heavy_window_does_not_evict_1d_only_rows():
+    store = PublicationStore(max_heavy_items=1, max_thumbnail_items=0)
+    first = DuckFrame(idx=1)
+    first.int_2d = None
+    first.map_raw = None
+    first.thumbnail = None
+    store.upsert(publication_from_live_frame(first))
+
+    for idx in range(2, 66):
+        store.upsert(publication_from_live_frame(DuckFrame(idx=idx)))
+
+    retained = store.get(1)
+    assert retained is not None
+    assert retained.view.has_1d
+    assert retained.raw_ref is first
+    assert retained.raw_status == "missing"
 
 
 def test_publication_store_thumbnail_tier_has_its_own_bound():
@@ -1302,6 +1346,75 @@ def test_plot_payload_routes_overlay_waterfall_through_accumulator_after_flip():
         assert payload is not None
         assert payload.plot_history is not None
         assert payload.overlaid_ids == (("scan", 9),)
+
+
+def test_single_multiselect_payload_keeps_full_selected_set_for_waterfall():
+    store = PublicationStore(max_heavy_items=None)
+    for idx in range(300):
+        frame = DuckFrame(idx=idx)
+        frame.int_1d = IntegrationResult1D(
+            radial=np.linspace(0.5, 3.0, 6),
+            intensity=np.full(6, float(idx)),
+            sigma=np.ones(6),
+            unit="q_A^-1",
+        )
+        frame.int_2d = None
+        frame.map_raw = None
+        frame.thumbnail = None
+        store.upsert(publication_from_live_frame(frame))
+
+    payload = _adapter(store, _int_widget()).plot_payload(
+        _int_state(store, ids=tuple(range(300)), method="Single")
+    )
+
+    assert payload is not None
+    assert len(payload.traces) == 300
+    assert payload.display_ids == tuple(range(300))
+
+
+def test_browse_one_shot_snapshot_builds_payload_past_store_caps():
+    from threading import RLock
+
+    from xdart.gui.tabs.static_scan.display_controllers import ScanDisplayController
+
+    store = PublicationStore(max_items=2, max_heavy_items=0, max_thumbnail_items=0)
+    publications = {}
+    for idx in range(1, 6):
+        frame = DuckFrame(idx=idx)
+        publications[idx] = publication_from_live_frame(
+            frame,
+            include_2d=False,
+            include_thumbnail=False,
+            retain_raw_ref=False,
+        )
+    for idx in (4, 5):
+        store.upsert(publications[idx])
+
+    widget = _int_widget()
+    widget.viewer_mode = None
+    widget.frame_ids = [str(i) for i in range(1, 6)]
+    widget.publication_store = store
+    widget._browse_one_shot_target_labels = tuple(range(1, 6))
+    widget._browse_one_shot_publications = publications
+    widget.scan = SimpleNamespace(
+        name="scan",
+        gi=False,
+        scan_lock=RLock(),
+        frames=SimpleNamespace(index=list(range(1, 6))),
+    )
+    widget.ui.plotMethod = SimpleNamespace(currentText=lambda: "Single")
+    widget.overlaid_idxs = ()
+    widget.display_generation = store.generation
+
+    controller = ScanDisplayController()
+    state = controller.compute_state(widget, Mode.INT_2D)
+    payload = controller.build_payload(widget, state)
+
+    assert state.render_ids == tuple(range(1, 6))
+    assert payload.raw_image is None
+    assert payload.cake_image is None
+    assert payload.plot is not None
+    assert len(payload.plot.traces) == 5
 
 
 def test_overlay_payload_appends_stale_hydrated_selection_queue_in_order():

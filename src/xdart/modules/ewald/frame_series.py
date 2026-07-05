@@ -251,14 +251,17 @@ def _load_scan_info(h5file, idx: int) -> dict:
 
 
 def _load_frame_v2(h5file, idx: int, *, static: bool, gi: bool,
-                  source_root: str | None = None) -> LiveFrame:
+                  source_root: str | None = None, include_2d: bool = True,
+                  include_thumbnail: bool = True) -> LiveFrame:
     """Build a :class:`LiveFrame` for ``idx`` from the v2 stacked arrays.
 
     Reads:
 
     * 1D: ``intensity_1d[i]``, ``sigma_1d[i]`` (if present), ``q``
     * 2D: ``intensity_2d[i]``, ``q`` (= ``q_2d``), ``chi``
-    * thumbnail: ``frames/frame_NNNN/thumbnail`` (optional)
+      unless ``include_2d`` is false
+    * thumbnail: ``frames/frame_NNNN/thumbnail`` (optional, unless
+      ``include_thumbnail`` is false)
 
     Falls back to a minimal frame (just ``idx`` set) if any section is
     missing — callers should still get a usable object.
@@ -271,7 +274,10 @@ def _load_frame_v2(h5file, idx: int, *, static: bool, gi: bool,
     frame.scan_info = _load_scan_info(h5file, idx)
 
     pos_1d = _frame_position(h5file, idx, "integrated_1d")
-    pos_2d = _frame_position(h5file, idx, "integrated_2d")
+    pos_2d = (
+        _frame_position(h5file, idx, "integrated_2d")
+        if include_2d else None
+    )
 
     # ── 1D ────────────────────────────────────────────────────────
     g1 = h5file.get("entry/integrated_1d") if pos_1d is not None else None
@@ -323,7 +329,7 @@ def _load_frame_v2(h5file, idx: int, *, static: bool, gi: bool,
     fg_key = f"entry/frames/frame_{idx:04d}"
     fg = h5file.get(fg_key)
     if fg is not None:
-        if "thumbnail" in fg:
+        if include_thumbnail and "thumbnail" in fg:
             try:
                 frame.thumbnail = np.asarray(fg["thumbnail"][()])
             except (KeyError, ValueError, TypeError, OSError) as e:

@@ -16,6 +16,8 @@ import gc
 import imageio
 import pyFAI
 
+from .browse_debug import browse_debug_log, sequence_summary
+
 logger = logging.getLogger(__name__)
 _ORPHANED_STITCH_THREADS = []
 
@@ -70,7 +72,7 @@ from xdart.modules.frame_publication import (
 from xdart.modules.wavelength import normalize_wavelength_m
 from xrd_tools.core.energy import wavelength_m_to_energy_eV
 from .ui.staticUI import Ui_Form
-from .h5viewer import H5Viewer
+from .h5viewer import H5Viewer, _qt_enum_value
 from .display_frame_widget import displayFrameWidget
 from .display_overlay_utils import (
     overlay_grid_key_for_widget,
@@ -198,12 +200,12 @@ class _XyeOverlayInputFilter(QtCore.QObject):
         stray flag, notably on macOS), so coerce to int and mask to the only
         modifiers we care about.  Returns ``(has_shift, has_toggle_mod)``."""
         try:
-            mods = int(event.modifiers())
-        except (TypeError, ValueError):
+            mods = _qt_enum_value(event.modifiers())
+        except Exception:
             return False, False
-        shift_bit = int(QtCore.Qt.ShiftModifier)
-        ctrl_bit = int(QtCore.Qt.ControlModifier)
-        meta_bit = int(QtCore.Qt.MetaModifier)
+        shift_bit = _qt_enum_value(QtCore.Qt.ShiftModifier)
+        ctrl_bit = _qt_enum_value(QtCore.Qt.ControlModifier)
+        meta_bit = _qt_enum_value(QtCore.Qt.MetaModifier)
         return bool(mods & shift_bit), bool(mods & (ctrl_bit | meta_bit))
 
     def _on_click(self, event):
@@ -4454,6 +4456,18 @@ class staticWidget(QWidget):
         request = getattr(df, "request_current_selection_repaint", None)
         if callable(request):
             accepted = bool(request(generation=generation, reason=reason))
+            browse_debug_log(
+                logger,
+                "render_request",
+                requestor="staticWidget._request_render",
+                reason=reason,
+                generation=generation,
+                display_generation=getattr(df, "display_generation", None),
+                selected=sequence_summary(
+                    getattr(getattr(self, "h5viewer", None), "frame_ids", ())),
+                granted=accepted,
+                suppressed_by=None if accepted else "display_authority",
+            )
             flush = getattr(df, "_flush_current_selection_repaint", None)
             if accepted and callable(flush):
                 try:
@@ -4465,6 +4479,17 @@ class staticWidget(QWidget):
         update = getattr(df, "update", None)
         if not callable(update):
             return False
+        browse_debug_log(
+            logger,
+            "render_request",
+            requestor="staticWidget._request_render.legacy_update",
+            reason=reason,
+            generation=generation,
+            display_generation=getattr(df, "display_generation", None),
+            selected=sequence_summary(
+                getattr(getattr(self, "h5viewer", None), "frame_ids", ())),
+            granted=True,
+        )
         try:
             update(expected_generation=generation)
         except TypeError:
@@ -4779,6 +4804,32 @@ class staticWidget(QWidget):
             # their baked NaN mask (the inverse of the intended behaviour).
             self.displayframe._viewer_is_xdart = getattr(
                 self.h5viewer, '_viewer_is_xdart', False)
+            self.displayframe._browse_one_shot_target_labels = tuple(
+                getattr(self.h5viewer, "_browse_one_shot_target_labels", ())
+                or ()
+            )
+            self.displayframe._browse_one_shot_publications = dict(
+                getattr(self.h5viewer, "_browse_one_shot_publications", {})
+                or {}
+            )
+            overlay_pending = list(
+                getattr(self.h5viewer, "_overlay_hydrated_pending_append_labels", ())
+                or ()
+            )
+            if overlay_pending:
+                append_queue = getattr(
+                    self.displayframe,
+                    "_overlay_hydrated_pending_append_labels",
+                    None,
+                )
+                if append_queue is not None:
+                    append_queue.clear()
+                    append_queue.extend(overlay_pending)
+                else:
+                    self.displayframe._overlay_hydrated_pending_append_labels = (
+                        overlay_pending
+                    )
+                self.h5viewer._overlay_hydrated_pending_append_labels = []
             staticWidget._request_render(self, "h5viewer-selection")
             # # if (len(self.frames.keys()) > 0) and (len(self.scan.frames.index) > 0):
             # if ((len(self.viewer_rows_1d.keys()) > 0) and

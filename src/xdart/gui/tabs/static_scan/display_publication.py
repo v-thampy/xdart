@@ -8,6 +8,7 @@ the existing ``DisplayPayload`` shapes used by the static-scan renderer.
 
 from __future__ import annotations
 
+import logging
 import os
 from types import SimpleNamespace
 from typing import Any
@@ -49,10 +50,12 @@ from .display_overlay_utils import (
     overlay_slice_legend_suffix,
     slice_enabled as _overlay_slice_enabled,
 )
+from .browse_debug import browse_debug_log, sequence_summary
 
 MAX_WATERFALL_PAYLOAD_ROWS = 256
 
 _UNSET = object()   # S-16: "no norm channel recorded yet" sentinel
+logger = logging.getLogger(__name__)
 
 
 def _recipe_scan_key(recipe):
@@ -313,17 +316,33 @@ class PublicationDisplayAdapter:
                 continue
 
     def _hydrate_missing_plot_subset(self, labels, *, needs_2d: bool) -> None:
+        label_list = tuple(labels)
         missing = [
             _label_key(label)
-            for label in labels
+            for label in label_list
             if self._plot_publication_missing(
                 self._publication_for_label(label),
                 needs_2d=needs_2d,
             )
         ]
+        widget = self._widget
+        try:
+            mode = widget.ui.plotMethod.currentText()
+        except Exception:
+            mode = None
+        browse_debug_log(
+            logger,
+            "resident_vs_missing",
+            requestor="DisplayPublicationAdapter._hydrate_missing_plot_subset",
+            mode=mode,
+            selected_count=len(label_list),
+            resident_1d_count=max(0, len(label_list) - len(missing)),
+            missing_1d_count=len(missing),
+            needs_2d=bool(needs_2d),
+            missing=sequence_summary(missing),
+        )
         if not missing:
             return
-        widget = self._widget
         async_enabled = bool(getattr(widget, "_async_hydration_enabled", False))
         store = self._store
         if not async_enabled and store is not None:
@@ -849,8 +868,6 @@ class PublicationDisplayAdapter:
                 return None
 
         render_ids = tuple(state.render_ids)
-        if state.method == "Single" and len(render_ids) > 15:
-            render_ids = _decimate_display_ids(render_ids)
 
         traces = []
         axis = None

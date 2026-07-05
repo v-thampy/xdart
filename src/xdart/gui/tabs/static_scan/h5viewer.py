@@ -77,6 +77,7 @@ from .viewer_raw_lru import (
     remember_viewer_raw_lru,
 )
 from .scan_threads import fileHandlerThread
+from .browse_debug import browse_debug_log, sequence_summary
 from .display_logic import xye_unit_from_filename
 from .display_controllers import ImageViewerController
 from xrd_tools.io import ImageSourceKind
@@ -127,6 +128,70 @@ def _clear_publication_store_for(viewer) -> None:
     store = getattr(viewer, "publication_store", None)
     if store is not None:
         store.clear()
+
+
+_BROWSE_ONE_SHOT_METHODS = ("Single", "Overlay", "Waterfall", "Sum", "Average")
+
+
+def _qt_enum_value(value, default: int = 0) -> int:
+    """Return the integer payload for Qt enums/flags across PyQt/PySide."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raw = getattr(value, "value", None)
+        while raw is not None and raw is not value:
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                next_raw = getattr(raw, "value", None)
+                if next_raw is raw:
+                    break
+                raw = next_raw
+        try:
+            return int(value.__index__())
+        except Exception:
+            return default
+
+
+def _qt_has_modifier(modifiers, modifier) -> bool:
+    return bool(_qt_enum_value(modifiers) & _qt_enum_value(modifier))
+
+
+def _frame_label_sort_key(value):
+    text = value.text() if hasattr(value, "text") else value
+    text = str(text)
+    try:
+        return (0, int(text))
+    except (TypeError, ValueError):
+        return (1, text)
+
+
+def _browse_one_shot_enabled(viewer) -> bool:
+    if getattr(viewer, "viewer_mode", None) in ("image", "xye", "nexus"):
+        return False
+    if getattr(viewer, "_run_writing", False):
+        return False
+    return getattr(viewer, "_plot_method", None) in _BROWSE_ONE_SHOT_METHODS
+
+
+def _browse_bulk_selection_enabled(viewer, selected_ids, *, show_all=False) -> bool:
+    """True for browse gestures that should render from one selected-set batch."""
+    if not _browse_one_shot_enabled(viewer):
+        return False
+    try:
+        count = len(selected_ids)
+    except TypeError:
+        count = 0
+    if show_all:
+        return count > 1
+    return count > 1
+
+
+def _browse_debug_mode(viewer) -> str:
+    try:
+        return str(viewer.ui.plotMethod.currentText())
+    except Exception:
+        return str(getattr(viewer, "_plot_method", ""))
 
 
 @dataclass
@@ -261,8 +326,14 @@ class _LoadFramesWorker(QtCore.QObject):
                                 self.generation, idx,
                             )
                             break
-                        frame = _load_frame_v2(file, idx, static=True,
-                                             gi=self.gi)
+                        frame = _load_frame_v2(
+                            file,
+                            idx,
+                            static=True,
+                            gi=self.gi,
+                            include_2d=bool(self.load_2d),
+                            include_thumbnail=bool(self.load_2d),
+                        )
                 except (KeyError, IndexError, OSError, ValueError) as e:
                     logger.debug("load worker: frame %s skipped: %s",
                                  idx, e)
@@ -315,8 +386,8 @@ class _AccumulatingClickFilter(QtCore.QObject):
        every platform regardless of which physical key the user
        presses.
     2. PySide6's flag-enum comparisons (``mods != Qt.NoModifier``)
-       can be unreliable across versions. We coerce modifiers to
-       ``int`` and check bits explicitly.
+       can be unreliable across versions. Modifiers go through the
+       shared enum helper used by the keyboard path.
 
     Decision matrix (left-button press only — everything else passes
     through):
@@ -362,17 +433,11 @@ class _AccumulatingClickFilter(QtCore.QObject):
         if btn != QtCore.Qt.LeftButton:
             return False
 
-        # Coerce modifier flags to int so bitwise checks are immune
-        # to PySide6 enum/flag comparison quirks.
-        try:
-            mods = int(mods_obj)
-        except (TypeError, ValueError):
-            return False
-        ctrl_bit = int(QtCore.Qt.ControlModifier)
-        shift_bit = int(QtCore.Qt.ShiftModifier)
-        meta_bit = int(QtCore.Qt.MetaModifier)
-        has_shift = bool(mods & shift_bit)
-        has_toggle_mod = bool(mods & (ctrl_bit | meta_bit))
+        has_shift = _qt_has_modifier(mods_obj, QtCore.Qt.ShiftModifier)
+        has_toggle_mod = (
+            _qt_has_modifier(mods_obj, QtCore.Qt.ControlModifier)
+            or _qt_has_modifier(mods_obj, QtCore.Qt.MetaModifier)
+        )
 
         # Shift-range select is delegated to Qt — it walks from the
         # current/anchor item through the clicked item and replaces
@@ -654,6 +719,7 @@ class H5Viewer(QWidget):
         self.ui.listScans.itemSelectionChanged.connect(self._scans_selection_changed)
         self.ui.listScans.installEventFilter(self)
         self.ui.listData.itemSelectionChanged.connect(self.data_changed)
+        self.ui.listData.installEventFilter(self)
         # listData stays in ExtendedSelection at all times so all
         # standard selection behaviors (arrow keys, shift-range,
         # ctrl-toggle) work consistently across modes. The click
@@ -678,31 +744,21 @@ class H5Viewer(QWidget):
         selection when switching between modes.
 
         listData stays in ExtendedSelection at all times. When the
-        user enters ``Single`` mode from a multi-selection state,
-        this method collapses the selection down to the most recently
-        focused item so the next click behaves naturally. The click
+        user enters ``Single`` mode from a multi-selection state, the
+        selected set is preserved and rendered through the same
+        multi-frame path as Overlay. Plain clicks still replace the
+        selection in Single mode, while Cmd/Ctrl clicks can deselect
+        individual rows. The click
         filter consults ``self._plot_method`` to decide how to handle
         plain clicks.
         """
         prev_method = self._plot_method
         self._plot_method = plot_method
         if plot_method == 'Single' and prev_method != 'Single':
-            lw = self.ui.listData
-            current = lw.currentItem() if hasattr(lw, 'currentItem') else None
-            selected = lw.selectedItems()
-            if len(selected) > 1:
-                lw.blockSignals(True)
-                try:
-                    lw.clearSelection()
-                    keep = current if current in selected else selected[-1]
-                    if keep is not None:
-                        keep.setSelected(True)
-                        lw.setCurrentItem(keep)
-                finally:
-                    lw.blockSignals(False)
-            # Always refresh frame_ids when leaving an accumulating mode.  The
-            # visible plot can otherwise rebuild from the old Overlay selection
-            # until another frame click arrives.
+            # Single mode now plots a multi-selection exactly like Overlay; the
+            # only Single-specific affordance is that plain clicks replace while
+            # Cmd/Ctrl clicks can remove rows.  Keep any existing selection when
+            # switching modes and just refresh the display model.
             self.data_changed()
 
     def _init_file_thread(self):
@@ -719,7 +775,7 @@ class H5Viewer(QWidget):
                                              data_lock=self.data_lock)
         self.file_thread.sigTaskDone.connect(self.thread_finished)
         self.file_thread.sigNewFile.connect(self.sigNewFile.emit)
-        self.file_thread.sigUpdate.connect(self.sigUpdate.emit)
+        self.file_thread.sigUpdate.connect(self._emit_file_thread_update)
         self._file_thread_shutdown = False
         self._h5pool = get_pool()
         # M1: handle for the per-selection LoadFramesWorker.  None
@@ -749,7 +805,8 @@ class H5Viewer(QWidget):
         # contract; _on_load_worker_finished force-flushes the tail).
         self._update_coalesce_timer = Coalescer(100, mode="debounce",
                                                 parent=self)
-        self._update_coalesce_timer.triggered.connect(self.sigUpdate.emit)
+        self._update_coalesce_timer.triggered.connect(
+            self._emit_coalesced_update)
         # FREEZE FIX (part 2): debounce the DISK LOAD too.  data_changed runs fully
         # per selection event, and its load_frames_data does a blocking
         # _teardown_load_worker (thread.wait ~2 s) — so a rapid shift/ctrl /
@@ -770,6 +827,17 @@ class H5Viewer(QWidget):
                                                   parent=self)
         self._selection_coalesce_timer.triggered.connect(
             self._flush_pending_data_changed)
+        self._browse_gesture_active = False
+        self._browse_pending_data_changed = False
+        self._browse_one_shot_pending_render = False
+        self._browse_one_shot_load_generation = None
+        self._browse_one_shot_target_labels = ()
+        self._browse_one_shot_publications = {}
+        self._browse_one_shot_signature = None
+        self._browse_last_selection_signature = None
+        self._overlay_visit_intent_labels = []
+        self._overlay_visit_inflight_labels = ()
+        self._overlay_hydrated_pending_append_labels = []
 
     def _ensure_file_thread_running(self) -> None:
         """Start the persistent file loader on first real file operation."""
@@ -1142,7 +1210,20 @@ class H5Viewer(QWidget):
 
         if len(self.scan.frames.index) > 0:
             self.frame_ids.clear()
-            self.frame_ids += self.scan.frames.index
+            self.frame_ids += [str(idx) for idx in self.scan.frames.index]
+            lw = self.ui.listData
+            was_blocked = lw.blockSignals(True)
+            try:
+                lw.selectAll()
+            finally:
+                lw.blockSignals(was_blocked)
+            browse_debug_log(
+                logger,
+                "gesture_settle",
+                trigger_source="Show All",
+                mode=_browse_debug_mode(self),
+                selected=sequence_summary(self.frame_ids),
+            )
 
         self.new_scan = False
         self.data_changed(show_all=True)
@@ -1221,8 +1302,96 @@ class H5Viewer(QWidget):
         if has_files:
             self._load_xye_files()
 
+    def _browse_bulk_keys(self):
+        return {
+            _qt_enum_value(QtCore.Qt.Key_Up),
+            _qt_enum_value(QtCore.Qt.Key_Down),
+            _qt_enum_value(QtCore.Qt.Key_PageUp),
+            _qt_enum_value(QtCore.Qt.Key_PageDown),
+            _qt_enum_value(QtCore.Qt.Key_Home),
+            _qt_enum_value(QtCore.Qt.Key_End),
+        }
+
+    def _begin_browse_gesture(self) -> None:
+        self._browse_gesture_active = True
+        self._browse_pending_data_changed = False
+        browse_debug_log(
+            logger,
+            "gesture_begin",
+            trigger_source="arrow-press",
+            mode=_browse_debug_mode(self),
+            selected=sequence_summary(getattr(self, "frame_ids", ())),
+        )
+        for attr in (
+            "_selection_coalesce_timer",
+            "_load_coalesce_timer",
+            "_update_coalesce_timer",
+        ):
+            timer = getattr(self, attr, None)
+            if timer is not None and timer.isActive():
+                timer.stop()
+
+    def _finish_browse_gesture(self) -> None:
+        if not getattr(self, "_browse_gesture_active", False):
+            return
+        self._browse_gesture_active = False
+        self._browse_pending_data_changed = False
+        browse_debug_log(
+            logger,
+            "gesture_settle",
+            trigger_source="arrow-release",
+            mode=_browse_debug_mode(self),
+            selected=sequence_summary(getattr(self, "frame_ids", ())),
+        )
+        self.data_changed()
+
+    def _handle_browse_key_event(self, event) -> bool:
+        """Track held Shift+navigation gestures without doing browse work.
+
+        The QListWidget still owns selection mechanics; this method only
+        brackets the burst so itemSelectionChanged signals cannot hydrate or
+        repaint until the key is released.
+        """
+        if not _browse_one_shot_enabled(self):
+            return False
+        try:
+            event_type = event.type()
+            key = _qt_enum_value(event.key())
+        except AttributeError:
+            return False
+        key_press = QtCore.QEvent.Type.KeyPress
+        key_release = QtCore.QEvent.Type.KeyRelease
+        if event_type not in (key_press, key_release):
+            return False
+
+        bulk_keys = H5Viewer._browse_bulk_keys(self)
+        shift_key = _qt_enum_value(QtCore.Qt.Key_Shift)
+        try:
+            is_auto_repeat = bool(event.isAutoRepeat())
+        except AttributeError:
+            is_auto_repeat = False
+
+        if event_type == key_press:
+            if key in bulk_keys and _qt_has_modifier(
+                    event.modifiers(), QtCore.Qt.ShiftModifier):
+                H5Viewer._begin_browse_gesture(self)
+                return True
+            return False
+
+        if not getattr(self, "_browse_gesture_active", False):
+            return False
+        if is_auto_repeat:
+            return True
+        if key in bulk_keys or key == shift_key:
+            H5Viewer._finish_browse_gesture(self)
+            return True
+        return False
+
     def eventFilter(self, obj, event):
         """Handle Enter/Return key on listScans to navigate into folders."""
+        if obj is self.ui.listData:
+            H5Viewer._handle_browse_key_event(self, event)
+            return False
         if obj is self.ui.listScans and event.type() == event.Type.KeyPress:
             from PySide6.QtCore import Qt
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -2270,6 +2439,29 @@ class H5Viewer(QWidget):
             # disk-load guard in data_changed is now open).
             self.data_changed()
 
+    def _emit_render_update(self, requestor: str, *, generation=None,
+                            labels=None, granted=True, suppressed_by=None) -> None:
+        browse_debug_log(
+            logger,
+            "render_request",
+            requestor=requestor,
+            mode=_browse_debug_mode(self),
+            generation=generation,
+            load_generation=getattr(self, "_load_generation", None),
+            selected=sequence_summary(
+                labels if labels is not None else getattr(self, "frame_ids", ())),
+            granted=bool(granted),
+            suppressed_by=suppressed_by,
+        )
+        if granted:
+            self.sigUpdate.emit()
+
+    def _emit_file_thread_update(self) -> None:
+        self._emit_render_update("h5viewer.file_thread")
+
+    def _emit_coalesced_update(self) -> None:
+        self._emit_render_update("h5viewer.update_coalesce")
+
     def _flush_pending_load(self):
         """Fire the debounced disk load for the final selection of a rapid burst
         (see _load_coalesce_timer).  One load -> one blocking _teardown_load_worker
@@ -2277,6 +2469,13 @@ class H5Viewer(QWidget):
         ids = self._pending_load_ids
         if ids and not getattr(self, '_run_writing', False):
             self._pending_load_ids = None
+            browse_debug_log(
+                logger,
+                "bulk_hydration_flush",
+                mode=_browse_debug_mode(self),
+                labels=sequence_summary(ids),
+                load_2d=bool(getattr(self, "_pending_load_2d", True)),
+            )
             self.load_frames_data(ids, self._pending_load_2d)
 
     def _flush_pending_data_changed(self):
@@ -2285,6 +2484,66 @@ class H5Viewer(QWidget):
         self._pending_data_changed = False
         H5Viewer._data_changed_now(self, show_all=False)
 
+    def _clear_browse_one_shot_snapshot(self):
+        self._browse_one_shot_target_labels = ()
+        self._browse_one_shot_publications = {}
+        self._browse_one_shot_signature = None
+
+    def _prime_browse_one_shot_snapshot(self, labels, store=None):
+        target = tuple(int(label) for label in labels)
+        publications = {}
+        if store is not None:
+            try:
+                for label, publication in (store.get_many(target) or {}).items():
+                    view = getattr(publication, "view", None)
+                    if view is not None and getattr(view, "has_1d", False):
+                        publications[int(label)] = publication
+            except Exception:
+                logger.debug("browse one-shot resident snapshot failed",
+                             exc_info=True)
+        self._browse_one_shot_target_labels = target
+        self._browse_one_shot_publications = publications
+        return publications
+
+    def _capture_overlay_visit_intent(self) -> None:
+        if getattr(self, "viewer_mode", None) in ("image", "xye", "nexus"):
+            return
+        if getattr(self, "_run_writing", False):
+            return
+        if getattr(self, "_plot_method", None) not in ("Overlay", "Waterfall"):
+            return
+        item = None
+        try:
+            item = self.ui.listData.currentItem()
+        except Exception:
+            item = None
+        if item is None:
+            try:
+                selected = self.ui.listData.selectedItems()
+                item = selected[-1] if selected else None
+            except Exception:
+                item = None
+        if item is None:
+            return
+        try:
+            label = int(item.text())
+        except (TypeError, ValueError):
+            return
+        intents = getattr(self, "_overlay_visit_intent_labels", None)
+        if not isinstance(intents, list):
+            intents = []
+            self._overlay_visit_intent_labels = intents
+        if intents and intents[-1] == label:
+            return
+        intents.append(label)
+        browse_debug_log(
+            logger,
+            "overlay_visit_intent",
+            mode=_browse_debug_mode(self),
+            labels=sequence_summary((label,)),
+            pending_count=len(intents),
+        )
+
     def data_changed(self, show_all=False):
         """Connected to itemSelectionChanged signal of listData.
 
@@ -2292,6 +2551,22 @@ class H5Viewer(QWidget):
         selected frame on demand.  Otherwise falls through to the
         normal HDF5-based loading.
         """
+        if (not show_all
+                and getattr(self, "_browse_gesture_active", False)
+                and _browse_one_shot_enabled(self)):
+            self._browse_pending_data_changed = True
+            browse_debug_log(
+                logger,
+                "render_request",
+                requestor="h5viewer.selection_changed",
+                mode=_browse_debug_mode(self),
+                generation=getattr(self, "_load_generation", None),
+                selected=sequence_summary(getattr(self, "frame_ids", ())),
+                granted=False,
+                suppressed_by="active_browse_gesture",
+            )
+            return
+
         if show_all:
             timer = getattr(self, "_selection_coalesce_timer", None)
             if timer is not None and timer.isActive():
@@ -2301,9 +2576,19 @@ class H5Viewer(QWidget):
             return
 
         if getattr(self, "viewer_mode", None) not in ("image", "xye", "nexus"):
+            H5Viewer._capture_overlay_visit_intent(self)
             timer = getattr(self, "_selection_coalesce_timer", None)
             if timer is not None:
                 self._pending_data_changed = True
+                browse_debug_log(
+                    logger,
+                    "render_request",
+                    requestor="h5viewer.selection_changed",
+                    mode=_browse_debug_mode(self),
+                    selected=sequence_summary(getattr(self, "frame_ids", ())),
+                    granted=False,
+                    suppressed_by="selection_debounce",
+                )
                 timer.start()
                 return
 
@@ -2317,15 +2602,19 @@ class H5Viewer(QWidget):
                 # XYE viewer stores the int key in UserRole
                 self.frame_ids += sorted(
                     [str(item.data(QtCore.Qt.UserRole)) for item in items
-                     if item.data(QtCore.Qt.UserRole) is not None])
+                     if item.data(QtCore.Qt.UserRole) is not None],
+                    key=_frame_label_sort_key)
             elif self.viewer_mode == 'nexus':
                 # NeXus viewer rows are schema/preview records, not scan
                 # frame labels; keep their stable numeric ids in UserRole.
                 self.frame_ids += sorted(
                     [str(item.data(QtCore.Qt.UserRole)) for item in items
-                     if item.data(QtCore.Qt.UserRole) is not None])
+                     if item.data(QtCore.Qt.UserRole) is not None],
+                    key=_frame_label_sort_key)
             else:
-                self.frame_ids += sorted([str(item.text()) for item in items])
+                self.frame_ids += sorted(
+                    [str(item.text()) for item in items],
+                    key=_frame_label_sort_key)
             idxs = self.frame_ids
         else:
             idxs = self.frame_ids
@@ -2383,8 +2672,19 @@ class H5Viewer(QWidget):
                 int_idxs.append(int(idx))
             except (TypeError, ValueError):
                 continue
+        browse_debug_log(
+            logger,
+            "selected_set",
+            trigger_source="Show All" if show_all else "debounce",
+            mode=_browse_debug_mode(self),
+            selected=sequence_summary(int_idxs),
+        )
         if not int_idxs:
-            self.sigUpdate.emit()
+            emit_render = getattr(self, "_emit_render_update", None)
+            if callable(emit_render):
+                emit_render("h5viewer.no_valid_integer_selection", labels=idxs)
+            else:
+                self.sigUpdate.emit()
             return
 
         load_2d = self.update_2d
@@ -2392,6 +2692,48 @@ class H5Viewer(QWidget):
         if len(self.scan.frames.index) > 1:
             if len(int_idxs) == len(self.scan.frames.index):
                 load_2d = False
+        browse_bulk_one_shot = _browse_bulk_selection_enabled(
+            self, int_idxs, show_all=show_all)
+        browse_one_shot = browse_bulk_one_shot
+        if browse_one_shot:
+            load_2d = False
+
+        signature = (tuple(int_idxs), bool(load_2d), _browse_debug_mode(self))
+        if browse_bulk_one_shot:
+            if (not show_all
+                    and signature == getattr(
+                        self, "_browse_last_selection_signature", None)):
+                browse_debug_log(
+                    logger,
+                    "render_request",
+                    requestor="h5viewer.data_changed_now",
+                    mode=_browse_debug_mode(self),
+                    selected=sequence_summary(int_idxs),
+                    granted=False,
+                    suppressed_by="duplicate_selection_snapshot",
+                )
+                return
+            self._browse_last_selection_signature = signature
+        else:
+            self._browse_last_selection_signature = None
+            if not browse_one_shot:
+                H5Viewer._clear_browse_one_shot_snapshot(self)
+
+        overlay_visit_labels = ()
+        if (
+            not browse_bulk_one_shot
+            and not show_all
+            and getattr(self, "_plot_method", None) in ("Overlay", "Waterfall")
+        ):
+            intents = tuple(
+                getattr(self, "_overlay_visit_intent_labels", ()) or ())
+            if intents:
+                overlay_visit_labels = tuple(dict.fromkeys(intents))
+                self._overlay_visit_intent_labels = []
+                browse_one_shot = True
+                load_2d = False
+
+        read_idxs = tuple(overlay_visit_labels or int_idxs)
 
         keys = set()
         store = getattr(self, "publication_store", None)
@@ -2399,18 +2741,29 @@ class H5Viewer(QWidget):
             try:
                 from .display_publication import publication_availability
                 pub_1d, pub_2d, _raw = publication_availability(
-                    store, labels=int_idxs)
+                    store, labels=read_idxs)
                 keys = set(pub_2d if load_2d else pub_1d)
             except Exception:
                 logger.debug("publication availability lookup failed",
                              exc_info=True)
-        idxs_memory = [i for i in int_idxs if i in keys]
+        idxs_memory = [i for i in read_idxs if i in keys]
 
         # Multi-frame combination is now done on demand by
         # get_frames_int_2d / get_frames_map_raw — no shared accumulator
         # state to maintain here. Just figure out which frames still
         # need to be loaded from disk.
-        frame_ids = [i for i in int_idxs if i not in idxs_memory]
+        frame_ids = [i for i in read_idxs if i not in idxs_memory]
+        browse_debug_log(
+            logger,
+            "resident_vs_missing",
+            mode=_browse_debug_mode(self),
+            selected_count=len(int_idxs),
+            resident_1d_count=len(idxs_memory),
+            missing_1d_count=len(frame_ids),
+            load_2d=bool(load_2d),
+            resident=sequence_summary(idxs_memory),
+            missing=sequence_summary(frame_ids),
+        )
 
         # While ANY run is writing the .nxs, reading it here contends on
         # file_lock/h5pool with the writer and, worse, drags the GUI thread into
@@ -2423,12 +2776,29 @@ class H5Viewer(QWidget):
         # hydration, so the two guards can't drift across live/batch/reintegrate).
         # Cached frames display instantly; evicted frames repaint when the run
         # ends (set_run_writing(False) re-fires this handler).
+        if browse_one_shot:
+            H5Viewer._prime_browse_one_shot_snapshot(self, read_idxs, store=store)
+            self._browse_one_shot_signature = signature
         if frame_ids and not getattr(self, '_run_writing', False):
             # Debounce the disk load (see _load_coalesce_timer): coalesce a rapid
             # selection burst to ONE load for the final selection, so the blocking
             # _teardown_load_worker wait can't flood the GUI thread (beachball).
             self._pending_load_ids = frame_ids
             self._pending_load_2d = load_2d
+            if browse_one_shot:
+                self._browse_one_shot_pending_render = True
+                self._browse_one_shot_load_generation = None
+                if overlay_visit_labels:
+                    self._overlay_visit_inflight_labels = tuple(read_idxs)
+                browse_debug_log(
+                    logger,
+                    "bulk_hydration_scheduled",
+                    mode=_browse_debug_mode(self),
+                    labels=sequence_summary(frame_ids),
+                    load_2d=bool(load_2d),
+                )
+                self._load_coalesce_timer.start()
+                return
             self._load_coalesce_timer.start()
         elif frame_ids:
             logger.debug(
@@ -2444,6 +2814,21 @@ class H5Viewer(QWidget):
         # selection debounce via ``_data_changed_now``; this debounce is for
         # user-driven frame-list sweeps only.  Viewer-mode single-frame emits above
         # stay direct (not the freeze driver + want an immediate paint).
+        if browse_one_shot:
+            self._browse_one_shot_pending_render = False
+            self._browse_one_shot_load_generation = None
+            if overlay_visit_labels:
+                self._overlay_hydrated_pending_append_labels = list(
+                    overlay_visit_labels)
+        browse_debug_log(
+            logger,
+            "render_request",
+            requestor="h5viewer.data_changed_now",
+            mode=_browse_debug_mode(self),
+            selected=sequence_summary(int_idxs),
+            granted=False,
+            suppressed_by="update_coalesce_pending",
+        )
         self._update_coalesce_timer.start()
 
     def closeEvent(self, event):
@@ -2572,6 +2957,19 @@ class H5Viewer(QWidget):
         # so any chunk queued from the old selection is rejected immediately.
         self._load_generation += 1
         gen = self._load_generation
+        browse_debug_log(
+            logger,
+            "generation_bump",
+            cause="load_frames_data",
+            generation=gen,
+            mode=_browse_debug_mode(self),
+            labels=sequence_summary(frame_ids),
+        )
+        if (getattr(self, "_browse_one_shot_pending_render", False)
+                and _browse_one_shot_enabled(self)):
+            self._browse_one_shot_load_generation = gen
+        else:
+            self._browse_one_shot_load_generation = None
         self._retire_load_worker_for_reselection()
 
         # Spin up the new worker.  Lives on its own QThread; both get
@@ -2613,6 +3011,14 @@ class H5Viewer(QWidget):
 
         self._load_worker = worker
         self._load_thread = thread
+        browse_debug_log(
+            logger,
+            "bulk_hydration_chunk_issued",
+            mode=_browse_debug_mode(self),
+            generation=gen,
+            labels=sequence_summary(frame_ids),
+            load_2d=bool(load_2d),
+        )
         thread.start()
 
     def _absorb_chunk(self, generation, idx, frame, load_2d) -> None:
@@ -2637,12 +3043,25 @@ class H5Viewer(QWidget):
                 "(current gen=%s)",
                 idx, generation, self._load_generation,
             )
+            browse_debug_log(
+                logger,
+                "bulk_hydration_chunk_completed",
+                mode=_browse_debug_mode(self),
+                generation=generation,
+                labels=sequence_summary((idx,)),
+                granted=False,
+                suppressed_by="stale_load_generation",
+                current_generation=getattr(self, "_load_generation", None),
+            )
             return
         try:
             store = getattr(self, "publication_store", None)
             publication = publication_from_live_frame(
                 frame,
                 generation=(store.generation if store is not None else 0),
+                include_2d=bool(load_2d),
+                include_thumbnail=bool(load_2d),
+                retain_raw_ref=bool(load_2d),
             )
             frame_idx = int(idx)
             has_2d_error = publication_has_2d_errors(publication)
@@ -2656,12 +3075,61 @@ class H5Viewer(QWidget):
                 if store is not None:
                     self.viewer_rows_1d.pop(frame_idx, None)
                     self.viewer_rows_2d.pop(frame_idx, None)
-                    store.upsert(publication)
+                    if not load_2d:
+                        store.invalidate([frame_idx])
+                    publication = store.upsert(publication)
+                if (
+                    not load_2d
+                    and getattr(self, "_browse_one_shot_load_generation", None)
+                    == generation
+                ):
+                    target = set(getattr(
+                        self, "_browse_one_shot_target_labels", ()) or ())
+                    if frame_idx in target:
+                        snapshot = getattr(
+                            self, "_browse_one_shot_publications", None)
+                        if not isinstance(snapshot, dict):
+                            snapshot = {}
+                            self._browse_one_shot_publications = snapshot
+                        snapshot[frame_idx] = publication
+            browse_debug_log(
+                logger,
+                "bulk_hydration_chunk_completed",
+                mode=_browse_debug_mode(self),
+                generation=generation,
+                labels=sequence_summary((idx,)),
+                granted=True,
+                has_1d=bool(publication.view.has_1d),
+                has_2d=bool(publication.view.has_2d),
+            )
             # O6: coalesce display updates while a chunk burst is
             # streaming in.  Schedule (or restart) a debounced emit
             # rather than firing once per chunk.  ``_on_load_worker_finished``
             # forces a final emit so the burst's last paint is
             # guaranteed even if the timer is still pending.
+            if (getattr(self, "_browse_one_shot_pending_render", False)
+                    and getattr(self, "_browse_one_shot_load_generation", None) == generation):
+                browse_debug_log(
+                    logger,
+                    "render_request",
+                    requestor="h5viewer.absorb_chunk",
+                    mode=_browse_debug_mode(self),
+                    generation=generation,
+                    selected=sequence_summary(getattr(self, "frame_ids", ())),
+                    granted=False,
+                    suppressed_by="browse_one_shot_wait_for_worker_finished",
+                )
+                return
+            browse_debug_log(
+                logger,
+                "render_request",
+                requestor="h5viewer.absorb_chunk",
+                mode=_browse_debug_mode(self),
+                generation=generation,
+                selected=sequence_summary(getattr(self, "frame_ids", ())),
+                granted=False,
+                suppressed_by="update_coalesce_pending",
+            )
             self._update_coalesce_timer.start()
         except (AttributeError, RuntimeError) as e:
             logger.debug("absorb_chunk skipped frame %s: %s", idx, e)
@@ -2736,6 +3204,14 @@ class H5Viewer(QWidget):
         # Bump first so any chunk still queued from the outgoing worker is
         # dropped by the generation gate in _absorb_chunk.
         self._load_generation += 1
+        browse_debug_log(
+            logger,
+            "generation_bump",
+            cause="cancel_pending_loads",
+            generation=self._load_generation,
+            mode=_browse_debug_mode(self),
+            labels=sequence_summary(getattr(self, "frame_ids", ())),
+        )
         # Validity-guarded, deterministic teardown (cancel + quit + wait +
         # null) — never touch or GC-delete a half-deleted moveToThread'd
         # worker.
@@ -2747,6 +3223,14 @@ class H5Viewer(QWidget):
         if timer is not None and timer.isActive():
             timer.stop()
         self._pending_load_ids = None
+        self._browse_one_shot_pending_render = False
+        self._browse_one_shot_load_generation = None
+        H5Viewer._clear_browse_one_shot_snapshot(self)
+        self._overlay_visit_intent_labels = []
+        self._overlay_visit_inflight_labels = ()
+        self._overlay_hydrated_pending_append_labels = []
+        self._browse_gesture_active = False
+        self._browse_pending_data_changed = False
         timer = getattr(self, '_selection_coalesce_timer', None)
         if timer is not None and timer.isActive():
             timer.stop()
@@ -2935,6 +3419,11 @@ class H5Viewer(QWidget):
         """
         sender = self.sender()
         if sender is not None and sender is self._load_thread:
+            one_shot = (
+                getattr(self, "_browse_one_shot_pending_render", False)
+                and getattr(self, "_browse_one_shot_load_generation", None)
+                == getattr(self, "_load_generation", None)
+            )
             self._load_worker = None
             self._load_thread = None
             # O6: force one final sigUpdate so the burst's final
@@ -2943,7 +3432,36 @@ class H5Viewer(QWidget):
             # last chunk arrived but the worker has now terminated.
             if self._update_coalesce_timer.isActive():
                 self._update_coalesce_timer.stop()
-            self.sigUpdate.emit()
+            if one_shot:
+                overlay_labels = tuple(
+                    getattr(self, "_overlay_visit_inflight_labels", ()) or ())
+                if overlay_labels:
+                    self._overlay_hydrated_pending_append_labels = list(
+                        overlay_labels)
+                    self._overlay_visit_inflight_labels = ()
+                self._browse_one_shot_pending_render = False
+                self._browse_one_shot_load_generation = None
+                if getattr(self, "_browse_gesture_active", False):
+                    self._browse_pending_data_changed = True
+                    browse_debug_log(
+                        logger,
+                        "render_request",
+                        requestor="h5viewer.load_worker_finished",
+                        mode=_browse_debug_mode(self),
+                        generation=getattr(self, "_load_generation", None),
+                        selected=sequence_summary(getattr(self, "frame_ids", ())),
+                        granted=False,
+                        suppressed_by="active_browse_gesture",
+                    )
+                    return
+            emit_render = getattr(self, "_emit_render_update", None)
+            if callable(emit_render):
+                emit_render(
+                    "h5viewer.load_worker_finished",
+                    generation=getattr(self, "_load_generation", None),
+                )
+            else:
+                self.sigUpdate.emit()
 
     # Removed legacy load_frame_data — all reads now go through
     # LiveFrame.load_from_nexus via load_frames_data above.

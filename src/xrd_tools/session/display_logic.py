@@ -1801,6 +1801,13 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
     render_2d = resolve_render_ids(ids, overall, all_frame_index, loaded_2d)
     if mode is Mode.NEXUS_VIEWER:
         primary = render_2d if render_2d else render_1d
+    elif (
+        mode is Mode.INT_2D
+        and method in ("Single", "Overlay", "Waterfall")
+        and render_1d
+        and (not render_2d or len(render_1d) > len(render_2d))
+    ):
+        primary = render_1d
     else:
         primary = render_1d if mode in _PLOT_PRIMARY_MODES else render_2d
 

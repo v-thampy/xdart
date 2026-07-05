@@ -207,6 +207,9 @@ def publication_from_live_frame(
     generation: int = 0,
     source_identity: str | None = None,
     include_raw: bool = False,
+    include_2d: bool = True,
+    include_thumbnail: bool = True,
+    retain_raw_ref: bool = True,
     validate: bool = True,
     active_mode_1d: str | None = None,
     active_mode_2d: str | None = None,
@@ -218,7 +221,8 @@ def publication_from_live_frame(
     which ``gi_*`` entry IS ``int_*`` (identity).  ``view`` is unchanged."""
 
     metadata_raw = dict(getattr(frame, "scan_info", None) or {})
-    result_2d = getattr(frame, "int_2d", None)
+    result_2d = getattr(frame, "int_2d", None) if include_2d else None
+    thumbnail = getattr(frame, "thumbnail", None) if include_thumbnail else None
     incident_angle = None
     if getattr(frame, "gi", False):
         try:
@@ -231,8 +235,8 @@ def publication_from_live_frame(
         result_1d=getattr(frame, "int_1d", None),
         result_2d=result_2d,
         raw=(getattr(frame, "map_raw", None) if include_raw else None),
-        thumbnail=getattr(frame, "thumbnail", None),
-        mask_baked=getattr(frame, "thumbnail", None) is not None,
+        thumbnail=thumbnail,
+        mask_baked=thumbnail is not None,
         metadata_raw=metadata_raw,
         metadata_numeric=numeric_metadata(metadata_raw),
         incident_angle=incident_angle,
@@ -244,7 +248,18 @@ def publication_from_live_frame(
         active_mode_1d=active_mode_1d,
         active_mode_2d=active_mode_2d,
         include_raw=include_raw,
+        include_2d=include_2d,
+        include_thumbnail=include_thumbnail,
     )
+    raw_ref = frame if retain_raw_ref else None
+    if retain_raw_ref:
+        raw_status = (
+            "ready" if getattr(frame, "map_raw", None) is not None else "missing"
+        )
+    elif not include_2d and getattr(frame, "int_1d", None) is not None:
+        raw_status = "1d-only"
+    else:
+        raw_status = "missing"
     publication = FramePublication(
         view=view,
         record=record,
@@ -254,8 +269,8 @@ def publication_from_live_frame(
             else str(getattr(frame, "source_file", "") or getattr(frame, "idx", ""))
         ),
         generation=generation,
-        raw_ref=frame,
-        raw_status=("ready" if getattr(frame, "map_raw", None) is not None else "missing"),
+        raw_ref=raw_ref,
+        raw_status=raw_status,
         metadata_raw=metadata_raw,
         metadata_numeric=numeric_metadata(metadata_raw),
     )
@@ -341,8 +356,20 @@ def _view_has_heavy_arrays(view: FrameView) -> bool:
     )
 
 
+def _raw_ref_has_heavy_arrays(raw_ref: Any | None) -> bool:
+    if raw_ref is None:
+        return False
+    for name in ("int_2d", "map_raw", "thumbnail"):
+        if getattr(raw_ref, name, None) is not None:
+            return True
+    bg_raw = getattr(raw_ref, "bg_raw", None)
+    if bg_raw is not None and np.asarray(bg_raw).ndim > 0:
+        return True
+    return False
+
+
 def _publication_has_heavy_payload(publication: FramePublication) -> bool:
-    if publication.raw_ref is not None:
+    if _raw_ref_has_heavy_arrays(publication.raw_ref):
         return True
     if _view_has_heavy_arrays(publication.view):
         return True
