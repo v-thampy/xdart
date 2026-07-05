@@ -93,6 +93,9 @@ headless_contracts) · ADRs in `docs/decisions/` · handoff briefs in `~/repos/c
 (outside the repo).
 
 ## Process (why this worked)
+**THE TWO-ITERATION RULE (maintainer law, 2026-07-05): a bug that survives two fix attempts
+gets env-gated debug logging and a diagnosed root cause before any third attempt** — the BR-3
+overlay treadmill burned five blind patches; one instrumented run found the cause. ·
 Handoff briefs with file-ownership + gates per chunk · one agent per file-set at a time ·
 ledger updates in the same commit · orchestrator reviews every commit with independent gates ·
 live verification is the ONLY thing that closes a bug row · design checkpoints need maintainer
