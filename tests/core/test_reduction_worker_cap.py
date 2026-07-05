@@ -7,7 +7,7 @@ silently built a ~20-worker default pool).
 """
 
 import xrd_tools.core.staging as st
-from xrd_tools.core import reduction_worker_cap
+from xrd_tools.core import reduction_worker_cap, reduction_worker_cap_log_line
 
 GiB = 1024 ** 3
 BIG = 137 * GiB      # roomy workstation
@@ -95,3 +95,11 @@ def test_ram_detection_failure_still_returns_knee(monkeypatch):
     monkeypatch.setattr(st, "total_physical_ram_bytes", lambda: None)
     # total unknown -> no small-RAM floor -> the knee
     assert reduction_worker_cap(None, env={}) == 4
+
+
+def test_worker_cap_log_omits_redundant_requested_parenthetical():
+    assert reduction_worker_cap_log_line(4, requested=4) == "reduction workers: 4"
+    assert (
+        reduction_worker_cap_log_line(3, requested=8)
+        == "reduction workers: 3 (Cores requested 8)"
+    )

@@ -2418,9 +2418,6 @@ class imageThread(wranglerThread):
         fails (the batch is skipped with an advisory, as in the chunked path)."""
         if (self._streaming_session is not None
                 and self._streaming_scan_id == id(scan)):
-            workers = getattr(self, "_streaming_executor_workers", None)
-            if workers is not None:
-                imageThread._log_reduction_worker_cap(self, workers)
             _hsw = getattr(self, "_heavy_staging_window", None)
             if callable(_hsw):
                 window = _hsw(scan)

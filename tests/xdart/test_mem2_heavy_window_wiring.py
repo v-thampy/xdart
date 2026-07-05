@@ -81,7 +81,7 @@ def test_thread_heavy_window_logs_when_cache_reused(monkeypatch, caplog):
     assert sum("heavy window: 32 frames" in msg for msg in messages) == 2
 
 
-def test_streaming_session_reuse_logs_run_caps(monkeypatch, caplog):
+def test_streaming_session_reuse_does_not_repeat_worker_cap_log(monkeypatch, caplog):
     monkeypatch.setenv("XDART_HEAVY_WINDOW", "24")
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
         imageThread)
@@ -103,8 +103,7 @@ def test_streaming_session_reuse_logs_run_caps(monkeypatch, caplog):
         assert imageThread._get_streaming_session(worker, scan, []) == (session, sink)
 
     messages = [record.getMessage() for record in caplog.records]
-    assert any("reduction workers: 3 (Cores requested 8)" in msg
-               for msg in messages)
+    assert not any("reduction workers:" in msg for msg in messages)
     assert any("heavy window: 24 frames" in msg for msg in messages)
 
 

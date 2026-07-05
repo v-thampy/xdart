@@ -228,7 +228,14 @@ def reduction_worker_cap(
 def reduction_worker_cap_log_line(workers, requested=None, *, overridden=False):
     """One-line run-start summary of the reduction pool size."""
     tag = " [XDART_REDUCTION_WORKERS override]" if overridden else ""
-    req = f" (Cores requested {requested})" if requested else ""
+    req = ""
+    if requested:
+        try:
+            show_requested = int(requested) != int(workers)
+        except (TypeError, ValueError):
+            show_requested = True
+        if show_requested:
+            req = f" (Cores requested {requested})"
     return f"reduction workers: {workers}{req}{tag}"
 
 

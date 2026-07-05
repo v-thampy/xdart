@@ -430,6 +430,12 @@ class PublicationDisplayAdapter:
                 data, mask_saturation=bool(getattr(_scan, "mask_sentinel", True)),
             )
             if data.ndim != 2:
+                if data.ndim == 0:
+                    logger.warning(
+                        "raw frame %s resolved to scalar display data; "
+                        "2D repaint payload skipped",
+                        label,
+                    )
                 continue
             # Cache the full-resolution detector shape from any resident full
             # raw so a thumbnail-only render can map the flat gap mask into
@@ -449,9 +455,9 @@ class PublicationDisplayAdapter:
                 data = self._apply_detector_mask(data, publication)
                 data = self._subtract_if_shape_matches(data, bg, "raw frame background")
             else:
-                # Thumbnail source: subtract the per-frame background only when its
-                # shape matches (or it is a scalar) -- never resize a possibly
-                # incompatible background onto the thumbnail.
+                # Thumbnail source: subtract the per-frame background only when
+                # its shape matches -- never resize a possibly incompatible
+                # background onto the thumbnail.
                 data = self._subtract_if_shape_matches(
                     data, bg, "raw frame background (thumbnail)")
             data = self._normalize(data, publication.metadata_raw)
@@ -470,8 +476,8 @@ class PublicationDisplayAdapter:
 
         image = accum / count
         # The user-set raw background (Set BG -> bkg_map_raw): subtract only when
-        # its shape matches the displayed image (or it is a scalar) -- a full-res
-        # background does not subtract from a thumbnail, by design.
+        # its shape matches the displayed image -- a full-res background does not
+        # subtract from a thumbnail, by design.
         image = self._subtract_if_shape_matches(
             image,
             getattr(self._widget, "bkg_map_raw", 0),
@@ -568,6 +574,12 @@ class PublicationDisplayAdapter:
             view = publication.view
             data = np.asarray(view.intensity_2d, dtype=float)
             if data.ndim != 2:
+                if data.ndim == 0:
+                    logger.warning(
+                        "cake frame %s resolved to scalar display data; "
+                        "2D repaint payload skipped",
+                        label,
+                    )
                 continue
             data = self._normalize(data, publication.metadata_raw)
             if accum is None:
@@ -1469,10 +1481,30 @@ class PublicationDisplayAdapter:
 
     @staticmethod
     def _subtract_if_shape_matches(data, background, label):
-        data = np.asarray(data, dtype=float)
-        bg = np.asarray(background)
-        if bg.shape == () or bg.shape == data.shape:
-            return data - background
+        try:
+            data = np.asarray(data, dtype=float)
+        except (TypeError, ValueError):
+            logger.warning(
+                "%s received non-array display data of type %s; "
+                "background subtraction skipped",
+                label,
+                type(data).__name__,
+            )
+            return data
+        if data.shape == ():
+            logger.warning(
+                "%s received scalar display data; background subtraction skipped",
+                label,
+            )
+            return data
+        if background is None:
+            return data
+        try:
+            bg = np.asarray(background)
+        except (TypeError, ValueError):
+            return data
+        if bg.shape != () and bg.shape == data.shape:
+            return data - bg
         return data
 
 

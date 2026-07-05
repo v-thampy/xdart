@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import logging
 
 import numpy as np
 import pytest
@@ -547,22 +548,68 @@ def test_publication_display_adapter_builds_raw_and_cake_image_payloads():
     cake = adapter.cake_image(state)
 
     # Universal raw-display policy: the raw panel is display-only and renders the
-    # (precomputed, ~70x smaller) THUMBNAIL, not the full-res map_raw -- so the
-    # payload is the 2x2 thumbnail, with the per-frame background (bg_raw=1.0)
-    # subtracted then normalized then flipped (the thumbnail path now honors the
-    # background, like the full-res path).  (Rect-scaling the thumbnail's axes to
-    # the true detector extent is covered by
+    # (precomputed, ~70x smaller) THUMBNAIL, not the full-res map_raw. Scalar
+    # placeholder backgrounds are now ignored; real shape-matched array
+    # subtraction is covered below. (Rect-scaling the thumbnail's axes to the
+    # true detector extent is covered by
     # test_raw_image_thumbnail_axes_span_true_detector_extent.)
-    expected_raw = ((np.asarray(frame.thumbnail, dtype=float) - 1.0) / 10.0)[::-1, :]
+    expected_raw = (np.asarray(frame.thumbnail, dtype=float) / 10.0)[::-1, :]
     assert raw is not None
     assert raw.image.shape == frame.thumbnail.shape          # thumbnail, not full-res
     np.testing.assert_allclose(raw.image, expected_raw, equal_nan=True)
     assert raw.axis_x.label == "x"
     assert raw.axis_y.label == "y"
 
-    expected_cake = frame.int_2d.intensity.T / 10.0 - 0.5
+    expected_cake = frame.int_2d.intensity.T / 10.0
     assert cake is not None
     np.testing.assert_allclose(cake.image, expected_cake)
+
+
+def test_background_subtraction_requires_matching_arrays_and_warns_scalar(caplog):
+    data = np.arange(4, dtype=float).reshape(2, 2)
+    bg = np.ones((2, 2), dtype=float)
+
+    np.testing.assert_allclose(
+        PublicationDisplayAdapter._subtract_if_shape_matches(data, bg, "test"),
+        data - bg,
+    )
+    np.testing.assert_allclose(
+        PublicationDisplayAdapter._subtract_if_shape_matches(data, None, "test"),
+        data,
+    )
+    np.testing.assert_allclose(
+        PublicationDisplayAdapter._subtract_if_shape_matches(data, 1.0, "test"),
+        data,
+    )
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger="xdart.gui.tabs.static_scan.display_publication",
+    ):
+        scalar = PublicationDisplayAdapter._subtract_if_shape_matches(
+            1.0, bg, "raw frame background")
+
+    assert np.asarray(scalar).shape == ()
+    assert any("scalar display data" in record.getMessage()
+               for record in caplog.records)
+
+
+def test_live_repaint_without_background_no_exception():
+    frame = DuckFrame(idx=12)
+    frame.bg_raw = None
+    store = PublicationStore()
+    store.upsert(publication_from_live_frame(frame))
+    widget = _int_widget()
+    widget.bkg_map_raw = None
+    widget.bkg_2d = None
+    state = _int_state(store, mode=Mode.INT_2D, ids=(12,))
+    adapter = _adapter(store, widget)
+
+    raw = adapter.raw_image(state)
+    cake = adapter.cake_image(state)
+
+    assert raw is not None
+    assert cake is not None
 
 
 def _cake_state(store, idx):
