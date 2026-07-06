@@ -6065,6 +6065,15 @@ class staticWidget(QWidget):
             return 0
         if not labels:
             return 0
+        # Kickoff perf (XDART_PERF): split the MAIN-THREAD seed cost into the
+        # index seed-loop (O(1) membership via _IndexedList + one O(N log N) sort)
+        # vs update_data(force_rebuild=True) (a full Qt listData clear + re-insert
+        # of N items).  This pins which dominates the run-start beachball on a
+        # many-thousand-frame Append.  (The append-skip snapshot priming runs off
+        # the main thread in the wrangler, so it is not measured here.)
+        import time as _time
+        _perf = bool(os.environ.get("XDART_PERF"))
+        _t0 = _time.perf_counter() if _perf else 0.0
         try:
             with self.scan.scan_lock:
                 index = self.scan.frames.index
@@ -6075,8 +6084,19 @@ class staticWidget(QWidget):
                         added += 1
                 if added:
                     index.sort()
+            _t_seed = _time.perf_counter() if _perf else 0.0
             self.h5viewer.latest_idx = labels[-1]
             self.h5viewer.update_data(emit_update=False, force_rebuild=True)
+            if _perf:
+                _t_end = _time.perf_counter()
+                logger.info(
+                    "[PERF] append seed: n=%d added=%d seed_loop=%.0fms "
+                    "update_data_rebuild=%.0fms total=%.0fms",
+                    len(labels), added,
+                    (_t_seed - _t0) * 1000.0,
+                    (_t_end - _t_seed) * 1000.0,
+                    (_t_end - _t0) * 1000.0,
+                )
             return len(labels)
         except Exception:
             logger.debug("append frame-list seed skipped for %s", name,
