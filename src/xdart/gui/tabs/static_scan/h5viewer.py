@@ -3150,10 +3150,25 @@ class H5Viewer(QWidget):
         if not frame_ids:
             return
         data_file = getattr(self.scan, 'data_file', None)
-        if not data_file or not os.path.exists(os.fspath(data_file)):
+        _df_exists = bool(data_file) and os.path.exists(os.fspath(data_file))
+        if not _df_exists:
             logger.debug(
                 "Skipping background frame load; data file is unavailable: %s",
                 data_file,
+            )
+            # RL-1 diagnostic: reveal WHY load_frames_data cancels (and thus bumps
+            # the generation, invalidating hydration and re-arming the render).  If
+            # this fires repeatedly on a completed browsed scan, data_file is
+            # missing/None -> the generation-churn driver; if it never fires, the
+            # Show All loop is the store-cap (512 < selection) eviction thrash.
+            browse_debug_log(
+                logger,
+                "load_frames_data_cancel",
+                data_file=str(data_file),
+                data_file_set=bool(data_file),
+                exists=_df_exists,
+                frame_count=len(frame_ids),
+                mode=_browse_debug_mode(self),
             )
             self.cancel_pending_loads()
             return
