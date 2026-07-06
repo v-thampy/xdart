@@ -2830,6 +2830,40 @@ def test_wrangler_finished_with_frames_does_not_reload(
     assert loaded == []                          # no append-feedback reload
 
 
+def test_run_end_backfills_overlay_after_integrator_finished_clear(
+        widget, monkeypatch, tmp_path):
+    """Item 2 (PERF-3 Option A): at run end the full-index Overlay backfill must
+    run AFTER integrator_thread_finished(), whose clear_overlay would otherwise
+    wipe an earlier render -- so the Waterfall reaches N without the user
+    clicking Show All."""
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    w = widget
+    _set_processing_mode(w, 'Int 2D')
+    w.displayframe.ui.plotMethod.setCurrentText("Overlay")
+    w.h5viewer.auto_last = True
+    w._enter_run_state()
+    w._run_saw_frame = True                       # LIVE branch (frames displayed)
+    nxs = tmp_path / "scan.nxs"
+    nxs.write_text("x")
+    _stub_wrangler_finish_collaborators(w, monkeypatch, nxs)
+    w.scan.name = w.wrangler.scan_name            # take the delegate branch
+
+    order = []
+    monkeypatch.setattr(w, 'integrator_thread_finished',
+                        lambda: order.append('integrator_finished'))
+    monkeypatch.setattr(
+        staticWidget, '_render_overlay_full_scan',
+        lambda self, **k: (order.append('overlay_backfill'), True)[1])
+
+    w.wrangler_finished()
+
+    # a backfill fires AFTER the integrator-finished clear_overlay (the fix); any
+    # earlier reconcile render (which clear_overlay wipes) may also appear first.
+    assert 'integrator_finished' in order, order
+    assert 'overlay_backfill' in order[order.index('integrator_finished') + 1:], \
+        f"overlay backfill did not run after integrator_thread_finished: {order}"
+
+
 def test_shutdown_threads_stops_file_thread(widget):
     """Production teardown must stop the persistent fileHandlerThread so it is
     not 'destroyed while running' on tab/app close.  Idempotent."""

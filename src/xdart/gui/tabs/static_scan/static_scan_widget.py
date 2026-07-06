@@ -6529,6 +6529,19 @@ class staticWidget(QWidget):
                 **_runend_waterfall_history_fields(
                     getattr(self, "displayframe", None)),
             )
+            # Item 2 (PERF-3 Option A): the live incremental paint can lag, so the
+            # Overlay/Waterfall ends short (e.g. 3476/3621).  Now that the run has
+            # exited its run-state and the on-disk index is reconciled, do ONE
+            # full-index Show-All-equivalent render so the accumulator reaches N
+            # WITHOUT the user clicking Show All.  Placed AFTER
+            # integrator_thread_finished() so its clear_overlay does not destroy
+            # it (the earlier render inside _reconcile_..._after_run runs BEFORE
+            # the delegate and is wiped).  _render_overlay_full_scan APPENDS into
+            # the scan-qualified accumulator (never clear/rebuild) and no-ops
+            # unless auto_last is on and the method is Overlay/Waterfall.  Synergy
+            # with Item 1: the 1 GiB cap keeps the frames resident, so this is a
+            # cheap in-memory reselect (no disk re-read).
+            staticWidget._render_overlay_full_scan(self)
         else:
             self.wrangler.enabled(True)
 
