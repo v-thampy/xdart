@@ -6603,7 +6603,23 @@ class staticWidget(QWidget):
         else:
             self.wrangler.enabled(True)
 
-        gc.collect()
+        # Kickoff/teardown perf (XDART_PERF): this forced full gc.collect() at
+        # run-finish is the strong suspect for the Replace-only run-end beachball.
+        # In Replace the prior scan's display caches are reset, dereferencing its
+        # whole frame graph (amplified by the 1 GiB browse cap holding N frames vs
+        # 512), so this synchronous cycle collection walks+frees N frames on the
+        # GUI thread (the update_all note removed exactly this anti-pattern for the
+        # same UI-stutter reason).  Append PRESERVES the caches, so the graph stays
+        # referenced and there is nothing to collect -> fast.  Timed to confirm.
+        if os.environ.get("XDART_PERF"):
+            import time as _time
+            _gc_t0 = _time.perf_counter()
+            _gc_n = gc.collect()
+            logger.info(
+                "[PERF] wrangler_finished gc.collect: elapsed=%.0fms collected=%d",
+                (_time.perf_counter() - _gc_t0) * 1000.0, _gc_n)
+        else:
+            gc.collect()
 
         # XYE-only batch (Int 1D (XYE)): there is no .nxs to auto-load, so the
         # block above skipped the end-of-batch reload.  Show the folder of
