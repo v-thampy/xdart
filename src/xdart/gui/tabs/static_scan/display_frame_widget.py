@@ -1434,6 +1434,25 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             resident_fn = displayFrameWidget._hydration_purpose_resident.__get__(
                 self, type(self))
         already_resident = bool(resident_fn(label_key, purpose_key))
+        # RL-1 (Show All / bulk-selection thrash): do NOT re-request a tier whose
+        # hydration already SUCCEEDED this display generation.  Show All selects
+        # more frames than the store's item cap, so a frame that hydrated
+        # successfully is soon EVICTED and reads non-resident again; the render
+        # re-requests it, it hydrates SUCCESS again, and the success re-arms the
+        # hydration repaint -> re-request -> ... a success-treadmill the failure
+        # backoff cannot stop (it is a SUCCESS) and the resident-guard cannot stop
+        # (the frame IS non-resident by re-request time).  The plot renders such
+        # frames from the bulk 1d/.nxs path regardless, so ONE successful store
+        # hydration per generation is enough -- record it and skip further requests
+        # until the selection (hence the generation) changes.
+        gen = getattr(self, "display_generation", 0)
+        succeeded = getattr(self, "_hydration_success_labels", None)
+        if succeeded is None or getattr(
+                self, "_hydration_success_generation", None) != gen:
+            succeeded = set()
+            self._hydration_success_labels = succeeded
+            self._hydration_success_generation = gen
+        already_succeeded = (label_key, purpose_key) in succeeded
         if browse_debug_enabled():
             _fc = getattr(self, "_hydration_failure_counts", {}) or {}
             _entry = _fc.get((label_key, purpose_key))
@@ -1441,9 +1460,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 logger, "hydration_request",
                 label=label_key, purpose=purpose_key, suppressed=is_suppressed,
                 already_resident=already_resident,
+                already_succeeded=already_succeeded,
                 failure_count=(_entry[1] if _entry else 0),
-                generation=getattr(self, "display_generation", None))
-        if is_suppressed or already_resident:
+                generation=gen)
+        if is_suppressed or already_resident or already_succeeded:
             return
         worker = self._ensure_hydration_worker()
         if worker is not None:
@@ -1587,6 +1607,17 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             generation = current_generation
 
         _completion_debug = []
+        # RL-1 (Show All): record a SUCCESSFUL hydration in the current generation's
+        # success-set so _request_frame_hydration will not re-request it after the
+        # store evicts it (the plot reads it from the bulk path).  Keyed by the
+        # current display generation -- a selection change resets it.
+        _succ_gen = getattr(self, "display_generation", 0)
+        _succ = getattr(self, "_hydration_success_labels", None)
+        if _succ is None or getattr(
+                self, "_hydration_success_generation", None) != _succ_gen:
+            _succ = set()
+            self._hydration_success_labels = _succ
+            self._hydration_success_generation = _succ_gen
         for label_key, purpose_key, _consumer_key in completed_parts:
             if (label_key, purpose_key) in recorded_stale_overlay:
                 continue
@@ -1597,6 +1628,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 success=_ok,
                 generation=generation,
             )
+            if _ok:
+                _succ.add((label_key, purpose_key))
             if browse_debug_enabled():
                 _completion_debug.append(
                     {"label": label_key, "purpose": purpose_key, "success": _ok})

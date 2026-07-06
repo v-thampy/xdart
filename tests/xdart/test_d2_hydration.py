@@ -713,3 +713,53 @@ def test_resident_tier_hydration_request_is_skipped_rl1_overlay():
         h._hydration_pending_labels.clear()
     assert calls == [], \
         "a resident tier must not be re-requested (RL-1 overlay treadmill)"
+
+
+def test_succeeded_frame_not_re_requested_after_eviction_rl1_show_all():
+    """RL-1 Show All: a frame that hydrated SUCCESSFULLY must not be re-requested
+    after the store EVICTS it (Show All selects more frames than the store cap, so
+    a hydrated frame soon reads non-resident again).  Without the success-set guard
+    this is a success-treadmill neither the failure backoff (it's a success) nor
+    the resident-guard (it's non-resident by then) can stop; the plot renders such
+    frames from the bulk path anyway, so ONE successful store hydration per
+    generation suffices.
+    """
+    calls = []
+    fake_worker = SimpleNamespace(
+        request=lambda label, gen, *, purpose="full", **kw: calls.append(
+            (label, gen, purpose)))
+    view = SimpleNamespace(
+        raw=None, thumbnail=None, has_2d=False, intensity_2d=None,
+        has_1d=False, intensity_1d=None)
+    item = SimpleNamespace(view=view)
+    store = SimpleNamespace(get=lambda label: item)
+    h = SimpleNamespace(
+        _async_hydration_enabled=True, display_generation=3,
+        _hydration_pending_labels=set(), _hydration_failure_counts={},
+        _hydration_failure_logged=set(),
+        _pending_hydration_render=False, _pending_hydration_generation=None,
+        _hydration_stores=lambda: (store,))
+    h.update = lambda: None
+    h._ensure_hydration_worker = lambda: fake_worker
+    for name in ("_request_frame_hydration", "_flush_hydration_render",
+                 "_on_frame_hydrated", "_hydration_request_suppressed",
+                 "_hydration_purpose_resident", "_view_has_hydration_payload",
+                 "_hydration_item_views", "_record_hydration_completion"):
+        setattr(h, name, MethodType(getattr(displayFrameWidget, name), h))
+
+    LABEL = 3600
+    # cycle 1: not resident -> request issued
+    h._request_frame_hydration(LABEL, purpose="1d")
+    assert calls == [(LABEL, 3, "1d")]
+    view.has_1d = True                              # hydration made it resident
+    h._on_frame_hydrated(LABEL, 3)                  # SUCCESS -> success-set
+    view.has_1d = False                             # store evicts it (cap pressure)
+    for _ in range(5):                              # render loop re-requests it
+        h._hydration_pending_labels.clear()
+        h._request_frame_hydration(LABEL, purpose="1d")
+    assert calls == [(LABEL, 3, "1d")], \
+        "an already-succeeded frame must not be re-requested after eviction"
+    # a selection change (new generation) allows a fresh request
+    h.display_generation = 4
+    h._request_frame_hydration(LABEL, purpose="1d")
+    assert calls[-1] == (LABEL, 4, "1d")
