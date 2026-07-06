@@ -976,6 +976,19 @@ class H5Viewer(QWidget):
                         item.setSelected(True)
                     if item.text() == current_name:
                         lw.setCurrentItem(item, QItemSelectionModel.NoUpdate)
+            elif getattr(self, "scan_name", None):
+                # Normal mode: follow the CURRENTLY-loaded scan.  A new-scan
+                # boundary rebuilds this list, and clear() drops the old
+                # selection, so the Scans panel showed nothing / the stale prior
+                # scan while the display had already moved to the new one.  Select
+                # the .nxs entry that matches the current scan_name (signals
+                # blocked, so this does not re-trigger a load).
+                target = "%s.nxs" % self.scan_name
+                for row in range(lw.count()):
+                    item = lw.item(row)
+                    if item.text() == target:
+                        lw.setCurrentItem(item, QItemSelectionModel.ClearAndSelect)
+                        break
         finally:
             lw.blockSignals(was_blocked)
 

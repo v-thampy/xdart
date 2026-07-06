@@ -2898,6 +2898,29 @@ def test_update_data_selection_restore_is_linear_not_quadratic(widget):
         f"selection restore too slow ({elapsed_ms:.0f}ms) -- O(N^2) regression?"
 
 
+def test_update_scans_follows_current_scan_in_normal_mode(widget, tmp_path):
+    """The Scans panel must highlight the CURRENTLY-loaded scan after a rebuild.
+    A new-scan boundary repopulates listScans (clear drops the old selection), so
+    the panel used to show the stale prior scan while the display had moved to the
+    newly-processed one."""
+    w = widget
+    hv = w.h5viewer
+    (tmp_path / "Eiger_long.nxs").write_text("x")
+    (tmp_path / "Combi4_new.nxs").write_text("x")
+    hv.dirname = str(tmp_path)
+    hv.viewer_mode = 'normal'
+    # simulate the old stale state: Eiger selected
+    hv.scan_name = "Eiger_long"
+    hv.update_scans()
+    assert hv.ui.listScans.currentItem().text() == "Eiger_long.nxs"
+    # process/load a new scan -> scan_name moves; the panel must follow
+    hv.scan_name = "Combi4_new"
+    hv.update_scans()
+    cur = hv.ui.listScans.currentItem()
+    assert cur is not None and cur.text() == "Combi4_new.nxs", \
+        f"Scans panel did not follow the new scan: {cur.text() if cur else None}"
+
+
 def test_shutdown_threads_stops_file_thread(widget):
     """Production teardown must stop the persistent fileHandlerThread so it is
     not 'destroyed while running' on tab/app close.  Idempotent."""
