@@ -6224,6 +6224,15 @@ class staticWidget(QWidget):
                         len(getattr(getattr(self.scan, "frames", None), "index", []) or []))
         if not _in_sync:
             return
+        # Kickoff perf (XDART_PERF): time the MAIN-THREAD new_scan boundary reset
+        # (rescope + list/scan rebuild + display/metadata refresh) over the full
+        # index.  If this is small on the 3621 scan, the run-start beachball is NOT
+        # the main thread -- it is the first-frame reduction warm-up (the
+        # [DISPATCH] dispatch=~1s line, in the reduction thread), which is inherent
+        # pyFAI integrator init, not a fixable O(N) here.
+        import time as _time
+        _perf = bool(os.environ.get("XDART_PERF"))
+        _perf_t0 = _time.perf_counter() if _perf else 0.0
         # In sync: flush the previous scan's throttled update, then reset the panel.
         self._update_timer.stop()
         self._list_timer.stop()
@@ -6249,6 +6258,13 @@ class staticWidget(QWidget):
         self.h5viewer.update()
         # Refresh the metadata panel when a new scan starts.
         self.metawidget.update()
+        if _perf:
+            logger.info(
+                "[PERF] new_scan boundary reset: elapsed=%.0fms index_len=%d",
+                (_time.perf_counter() - _perf_t0) * 1000.0,
+                len(getattr(getattr(self.scan, "frames", None), "index", [])
+                    or []),
+            )
 
     def update_scattering_geometry(self, gi):
         """Connected to sigUpdateGI from wrangler. Called when scattering
