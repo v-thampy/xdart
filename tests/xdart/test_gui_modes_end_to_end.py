@@ -2898,6 +2898,26 @@ def test_update_data_selection_restore_is_linear_not_quadratic(widget):
         f"selection restore too slow ({elapsed_ms:.0f}ms) -- O(N^2) regression?"
 
 
+def test_run_end_reselects_scans_panel(widget, monkeypatch, tmp_path):
+    """scans_select_after_run: wrangler_finished must re-run update_scans in the
+    LIVE saw-frames branch (post-write), so the Scans panel follows to the newly-
+    processed scan.  update_scans at scan START ran before the writer created
+    <name>.nxs -> nothing to select, so the panel kept the prior scan."""
+    w = widget
+    _set_processing_mode(w, 'Int 2D')
+    w._enter_run_state()
+    w._run_saw_frame = True                       # LIVE saw-frames branch
+    nxs = tmp_path / "scan.nxs"
+    nxs.write_text("x")
+    _stub_wrangler_finish_collaborators(w, monkeypatch, nxs)
+    calls = []
+    monkeypatch.setattr(w.h5viewer, 'update_scans', lambda: calls.append(True))
+
+    w.wrangler_finished()
+
+    assert calls, "wrangler_finished did not re-select the Scans panel (update_scans)"
+
+
 def test_update_scans_follows_current_scan_in_normal_mode(widget, tmp_path):
     """The Scans panel must highlight the CURRENTLY-loaded scan after a rebuild.
     A new-scan boundary repopulates listScans (clear drops the old selection), so

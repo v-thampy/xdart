@@ -6564,6 +6564,14 @@ class staticWidget(QWidget):
                 )
             if indexed:
                 self._apply_integration_control_state()
+            # scans_select_after_run: update_scans's select-by-scan_name path runs
+            # at scan START, before the writer created <name>.nxs -> nothing to
+            # select, so the Scans panel kept the PRIOR scan highlighted.  Re-run
+            # it here (post-write, LIVE saw-frames branch): scan_name is the
+            # finished scan and its .nxs now exists, so the highlight follows to
+            # the newly-processed scan.  update_scans blocks signals, so this
+            # re-select does not re-trigger a load.
+            self.h5viewer.update_scans()
 
         # The scan-matches branch delegates to integrator_thread_finished() to
         # run the post-integration UI enable + exit the run-state.  Skip it when
