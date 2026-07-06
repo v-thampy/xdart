@@ -1419,15 +1419,31 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             suppressed = displayFrameWidget._hydration_request_suppressed.__get__(
                 self, type(self))
         is_suppressed = bool(suppressed(label_key, purpose_key))
+        # RL-1 (Overlay driver): never re-request a tier that is ALREADY resident.
+        # The overlay/raw render can re-issue _request_frame_hydration(purpose) for
+        # the CURRENT frame on every repaint even when that tier is resident (e.g.
+        # the last frame at run-end whose full raw IS present).  The worker then
+        # "completes" it with success=True, which schedules another hydration
+        # repaint -> re-request -> ... a treadmill the failure-count backoff CANNOT
+        # stop because each completion is a SUCCESS, not a failure.  A resident
+        # tier needs no hydration, so skip the worker entirely.  (Compatible with
+        # the tier-accurate residency fix: a thumbnail-only frame is NOT resident
+        # for a "full" purpose, so it is still requested -> fails -> suppresses.)
+        resident_fn = getattr(self, "_hydration_purpose_resident", None)
+        if resident_fn is None:
+            resident_fn = displayFrameWidget._hydration_purpose_resident.__get__(
+                self, type(self))
+        already_resident = bool(resident_fn(label_key, purpose_key))
         if browse_debug_enabled():
             _fc = getattr(self, "_hydration_failure_counts", {}) or {}
             _entry = _fc.get((label_key, purpose_key))
             browse_debug_log(
                 logger, "hydration_request",
                 label=label_key, purpose=purpose_key, suppressed=is_suppressed,
+                already_resident=already_resident,
                 failure_count=(_entry[1] if _entry else 0),
                 generation=getattr(self, "display_generation", None))
-        if is_suppressed:
+        if is_suppressed or already_resident:
             return
         worker = self._ensure_hydration_worker()
         if worker is not None:

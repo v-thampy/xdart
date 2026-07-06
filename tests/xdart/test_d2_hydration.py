@@ -674,3 +674,42 @@ def test_full_raw_thumbnail_only_hydration_self_suppresses_rl1():
     before = len(calls)
     h._request_frame_hydration(LABEL, purpose="full")
     assert len(calls) == before, "suppressed request must not reach the worker"
+
+
+def test_resident_tier_hydration_request_is_skipped_rl1_overlay():
+    """RL-1 OVERLAY driver (distinct from the Single thumbnail-mis-scoring bug):
+    the render re-issues _request_frame_hydration for the current frame on every
+    repaint even when its tier is ALREADY resident (the last frame at run-end
+    whose full raw IS present).  The worker "completes" it success=True ->
+    schedules a hydration repaint -> re-request -> a treadmill the failure-count
+    backoff CANNOT stop (each completion is a SUCCESS).  A resident tier must be
+    skipped so NO worker request is issued.
+    """
+    calls = []
+    fake_worker = SimpleNamespace(
+        request=lambda label, gen, *, purpose="full", **kw: calls.append(
+            (label, gen, purpose)))
+    view = SimpleNamespace(                       # full raw RESIDENT
+        raw=np.zeros((2, 2)), thumbnail=np.zeros((2, 2)),
+        has_2d=True, intensity_2d=np.zeros((2, 2)),
+        has_1d=True, intensity_1d=np.zeros(2))
+    item = SimpleNamespace(view=view)
+    store = SimpleNamespace(get=lambda label: item)
+    h = SimpleNamespace(
+        _async_hydration_enabled=True, display_generation=7,
+        _hydration_pending_labels=set(), _hydration_failure_counts={},
+        _hydration_stores=lambda: (store,))
+    h._ensure_hydration_worker = lambda: fake_worker
+    for name in ("_request_frame_hydration", "_hydration_request_suppressed",
+                 "_hydration_purpose_resident", "_view_has_hydration_payload",
+                 "_hydration_item_views"):
+        setattr(h, name, MethodType(getattr(displayFrameWidget, name), h))
+
+    # Drive the render loop: request "full" each cycle, clearing pending between
+    # (as _on_frame_hydrated's completion does).  Pre-fix this issues one worker
+    # request per cycle (unbounded); after the resident-guard it issues NONE.
+    for _ in range(5):
+        h._request_frame_hydration(651, purpose="full")
+        h._hydration_pending_labels.clear()
+    assert calls == [], \
+        "a resident tier must not be re-requested (RL-1 overlay treadmill)"
