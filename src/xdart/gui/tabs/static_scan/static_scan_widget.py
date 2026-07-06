@@ -6310,9 +6310,18 @@ class staticWidget(QWidget):
         """
         # i_qChi = np.zeros((1000, 1000), dtype=float)
 
+        # Kickoff perf (XDART_PERF): the run-start beachball is the MAIN-THREAD
+        # work here (Run click -> thread.start), and it scales with the PREVIOUS
+        # (loaded) scan -- teardown of a long scan.  Split it so the offending
+        # phase (controls run-state / wrangler.setup / enter_run_state) is named.
+        import time as _time
+        _perf = bool(os.environ.get("XDART_PERF"))
+        _t0 = _time.perf_counter() if _perf else 0.0
         self._apply_controls_v2_run_state()
+        _t1 = _time.perf_counter() if _perf else 0.0
         self.wrangler.enabled(False)
         self.wrangler.setup()
+        _t2 = _time.perf_counter() if _perf else 0.0
         self._configure_controls_v2_native_run_plan()
         self.h5viewer.auto_last = True
 
@@ -6337,7 +6346,20 @@ class staticWidget(QWidget):
         # AND the integration controls are disabled for the run (task #71).
         # Called synchronously here (GUI thread) so the controls lock before the
         # thread starts.  Cleared in wrangler_finished.
+        _t3 = _time.perf_counter() if _perf else 0.0
         self._enter_run_state()
+        if _perf:
+            _t4 = _time.perf_counter()
+            logger.info(
+                "[PERF] start_wrangler: apply_run_state=%.0fms setup=%.0fms "
+                "configure=%.0fms enter_run_state=%.0fms total=%.0fms "
+                "prev_index_len=%d",
+                (_t1 - _t0) * 1000.0, (_t2 - _t1) * 1000.0,
+                (_t3 - _t2) * 1000.0, (_t4 - _t3) * 1000.0,
+                (_t4 - _t0) * 1000.0,
+                len(getattr(getattr(self.scan, "frames", None), "index", [])
+                    or []),
+            )
 
         self.wrangler.thread.start()
 
