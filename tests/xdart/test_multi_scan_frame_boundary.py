@@ -183,3 +183,15 @@ def test_batch_mode_never_frame_rescopes():
     _arrive(host, 4, "scanB")
     assert scan.name == "scanA"
     assert list(scan.frames.index) == [1, 2, 3, 4]
+
+
+def test_rescope_follows_scans_panel_on_first_frame():
+    # scans_select_after_run (early): the Scans panel must follow the new scan as
+    # soon as its frames rescope the panel (first-frame boundary) -- not wait for
+    # wrangler_finished.  The writer opened <name>.nxs at run start, so it is
+    # already listed by now.
+    host, scan = _boundary_host()
+    scans_updates = []
+    host.h5viewer.update_scans = lambda: scans_updates.append(True)
+    host._rescope_frame_panel_to("scanB")
+    assert scans_updates, "rescope did not re-select the Scans panel on the boundary"

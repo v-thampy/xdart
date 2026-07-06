@@ -6039,6 +6039,12 @@ class staticWidget(QWidget):
         self.h5viewer.auto_last = True
         self.h5viewer.latest_idx = 1
         self._seed_append_processed_frame_browser(name)
+        # Follow the Scans panel to the new scan AS SOON AS its frames appear (not
+        # only at run-finish): the writer opened <name>.nxs at run start, so it is
+        # already in the directory listing by this first-frame boundary.
+        # update_scans re-runs its select-by-scan_name path (signals blocked, so no
+        # re-load).  wrangler_finished re-runs it too as a fallback.
+        self.h5viewer.update_scans()
 
     def _seed_append_processed_frame_browser(self, name):
         """Show append-skipped processed frames as soon as a run starts.
