@@ -417,6 +417,8 @@ def test_on_run_paused_lifts_guard_but_keeps_run_active():
         h5viewer=SimpleNamespace(
             set_run_writing=lambda v: calls.append(('write', v))),
     )
+    w._set_scan_integrated_reads_transient = MethodType(
+        staticWidget._set_scan_integrated_reads_transient, w)  # no-op: host has no scan
     staticWidget._on_run_paused(w)
     assert ('proc', False) in calls and ('write', False) in calls   # guard LIFTED
     assert w._run_active is True            # run still active, just frozen
@@ -432,6 +434,8 @@ def test_on_run_resuming_reengages_guard_before_resume():
         h5viewer=SimpleNamespace(
             set_run_writing=lambda v: calls.append(('write', v))),
     )
+    w._set_scan_integrated_reads_transient = MethodType(
+        staticWidget._set_scan_integrated_reads_transient, w)  # no-op: host has no scan
     staticWidget._on_run_resuming(w)
     assert ('write', True) in calls and ('proc', True) in calls     # guard RE-ENGAGED
 

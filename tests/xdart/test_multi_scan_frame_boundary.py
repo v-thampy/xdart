@@ -63,7 +63,7 @@ def _boundary_host():
         metawidget=SimpleNamespace(update=lambda: None),
     )
     for m in ("update_data", "new_scan", "_rescope_frame_panel_to",
-              "_sync_h5viewer_save_dir"):
+              "_sync_h5viewer_save_dir", "_seed_append_processed_frame_browser"):
         setattr(host, m, MethodType(getattr(staticWidget, m), host))
     host._pin_clears = pin_clears
     return host, scan
