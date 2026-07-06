@@ -88,7 +88,9 @@ from xdart.modules.frame_publication import (
     publication_from_live_frame,
     publication_has_2d_errors,
 )
-from xrd_tools.core import FrameView, numeric_metadata
+from xrd_tools.core import (
+    FrameView, numeric_metadata, browse_publication_max_items,
+)
 from ...widgets import defaultWidget
 from xdart import utils
 from xdart.utils import catch_h5py_file as catch
@@ -556,7 +558,8 @@ class H5Viewer(QWidget):
         self.viewer_rows_1d = viewer_rows_1d
         self.viewer_rows_2d = viewer_rows_2d
         self.publication_store = (
-            publication_store if publication_store is not None else PublicationStore()
+            publication_store if publication_store is not None
+            else PublicationStore(max_items=browse_publication_max_items())
         )
         self.new_scan = True
         self.update_2d = True

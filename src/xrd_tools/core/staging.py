@@ -42,6 +42,13 @@ LIVE_RECORD_FLOAT64_ARRAYS_PER_POINT = 9
 
 _GIB = 1024 ** 3
 
+#: Browse 1D publications use a more CONSERVATIVE 1 GiB ceiling (vs the 2 GiB
+#: live record budget): browsing accumulates across a Show-All + cross-scan, so
+#: the ceiling is tighter, and the clear-on-boundary keeps real usage far below
+#: it.  Heavy raw/2D stays separately capped (max_heavy_items / heavy_window),
+#: so this only grows the count of cheap 1D-light items -- MEM-1 is preserved.
+BROWSE_PUBLICATION_MAX_BYTES = 1 * _GIB
+
 
 def _clamp(value: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(value)))
@@ -126,12 +133,15 @@ def live_record_store_max_items(
     npt: int | None = None,
     *,
     total_ram_bytes: int | None = None,
+    max_bytes: int = LIVE_RECORD_MAX_BYTES,
 ) -> int:
     """Return the live 1D record-store residency cap.
 
-    Formula (BW-A6): ``max(4096, int(min(2 GiB, 0.05 * total_RAM) /
+    Formula (BW-A6): ``max(4096, int(min(max_bytes, 0.05 * total_RAM) /
     trace_bytes))``.  ``trace_bytes`` is derived from the run's 1D ``npt`` with
     a 3000-point fallback.  RAM detection failure falls back to the floor.
+    ``max_bytes`` is the byte ceiling (default 2 GiB for the live store;
+    :func:`browse_publication_max_items` passes the 1 GiB browse ceiling).
     """
     trace_bytes = live_record_trace_bytes(npt)
     total = (
@@ -141,8 +151,30 @@ def live_record_store_max_items(
     )
     if not total or total <= 0 or trace_bytes <= 0:
         return LIVE_RECORD_MIN_ITEMS
-    budget = min(LIVE_RECORD_MAX_BYTES, LIVE_RECORD_RAM_FRACTION * total)
+    budget = min(max_bytes, LIVE_RECORD_RAM_FRACTION * total)
     return max(LIVE_RECORD_MIN_ITEMS, int(budget / trace_bytes))
+
+
+def browse_publication_max_items(
+    npt: int | None = None,
+    *,
+    total_ram_bytes: int | None = None,
+) -> int:
+    """Return the BROWSE 1D publication-store residency cap (item count).
+
+    Same shape as :func:`live_record_store_max_items` but with the more
+    conservative 1 GiB ``BROWSE_PUBLICATION_MAX_BYTES`` ceiling.  Sizes the
+    ``PublicationStore(max_items=...)`` so a large Show-All keeps every cheap
+    1D-light publication RESIDENT (no disk re-read on later per-frame browsing)
+    -- for the 3000-pt fallback this is ~20-40k items, so every realistic scan
+    fits with no eviction.  Heavy raw/2D residency is governed separately by
+    ``max_heavy_items`` / ``heavy_window``, so MEM-1 is unaffected.
+    """
+    return live_record_store_max_items(
+        npt,
+        total_ram_bytes=total_ram_bytes,
+        max_bytes=BROWSE_PUBLICATION_MAX_BYTES,
+    )
 
 
 def heavy_window_log_line(
@@ -243,6 +275,7 @@ __all__ = [
     "heavy_window",
     "heavy_window_log_line",
     "live_record_store_max_items",
+    "browse_publication_max_items",
     "live_record_trace_bytes",
     "total_physical_ram_bytes",
     "reduction_worker_cap",

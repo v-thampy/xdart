@@ -93,6 +93,7 @@ from xdart.modules.frame_publication import (
     publication_has_2d_errors,
 )
 from xdart.modules.wavelength import normalize_wavelength_m
+from xrd_tools.core import browse_publication_max_items
 from xrd_tools.core.energy import wavelength_m_to_energy_eV
 from .ui.staticUI import Ui_Form
 from .h5viewer import H5Viewer, _qt_enum_value
@@ -447,7 +448,12 @@ class staticWidget(QWidget):
         self.frame = LiveFrame(static=True, gi=self.scan.gi)
         self.frame_ids = []
         self.frames = OrderedDict()
-        self.publication_store = PublicationStore()
+        # Browse 1D residency: hold up to a ~1 GiB byte budget (item 1) so a large
+        # Show-All keeps every cheap 1D-light publication resident (no disk re-read
+        # on later per-frame browsing).  Heavy raw/2D stays capped by
+        # max_heavy_items/heavy_window (default), so MEM-1 is preserved.
+        self.publication_store = PublicationStore(
+            max_items=browse_publication_max_items())
         self._frame_record_store = None
         self._overlay_flush_last_t = 0.0
         # XYE/NeXus need a 1D row table; Image Viewer needs a bounded 2D raw
