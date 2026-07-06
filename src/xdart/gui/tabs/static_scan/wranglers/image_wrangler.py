@@ -830,20 +830,26 @@ class imageWrangler(wranglerWidget):
                     is_batch = False
 
             # Sync cores enabled state with batch checkbox
-            self.ui.coresLabel.setEnabled(is_batch)
-            self.ui.maxCoresSpinBox.setEnabled(is_batch)
+            # Cores drives the reduction worker pool for BOTH batch (parallel
+            # reprocess) and LIVE (the streaming acquisition pool reads
+            # max_cores at run start), so enable it for either.
+            _cores_active = is_batch or self.ui.liveCheckBox.isChecked()
+            self.ui.coresLabel.setEnabled(_cores_active)
+            self.ui.maxCoresSpinBox.setEnabled(_cores_active)
 
         self.ui.liveCheckBox.blockSignals(False)
         self.ui.batchCheckBox.blockSignals(False)
 
-        # Cores only matters for parallel batch processing — hide it
-        # entirely unless batch is active (XYE forces batch on).
+        # Cores drives the reduction worker pool for batch (parallel reprocess)
+        # AND live (streaming acquisition pool) — show it for either (XYE forces
+        # batch on).
         if is_viewer:
             cores_visible = False
         elif is_xye:
             cores_visible = True
         else:
-            cores_visible = self.ui.batchCheckBox.isChecked()
+            cores_visible = (self.ui.batchCheckBox.isChecked()
+                             or self.ui.liveCheckBox.isChecked())
         self.ui.coresLabel.setVisible(cores_visible)
         self.ui.maxCoresSpinBox.setVisible(cores_visible)
 
@@ -1367,8 +1373,8 @@ class imageWrangler(wranglerWidget):
                             'they arrive.',
             'batchCheckBox': 'Process all frames as a batch (parallel across '
                              'Cores) instead of one-at-a-time.',
-            'maxCoresSpinBox': 'CPU cores for parallel batch processing.',
-            'coresLabel': 'CPU cores for parallel batch processing.',
+            'maxCoresSpinBox': 'CPU cores for parallel batch/live processing.',
+            'coresLabel': 'CPU cores for parallel batch/live processing.',
             'advancedButton': 'Advanced integration / detector options.',
             'startButton': 'Start processing with the current settings.',
             'stopButton': 'Stop the running process.',
