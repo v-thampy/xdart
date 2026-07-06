@@ -979,16 +979,38 @@ class H5Viewer(QWidget):
             elif getattr(self, "scan_name", None):
                 # Normal mode: follow the CURRENTLY-loaded scan.  A new-scan
                 # boundary rebuilds this list, and clear() drops the old
-                # selection, so the Scans panel showed nothing / the stale prior
-                # scan while the display had already moved to the new one.  Select
-                # the .nxs entry that matches the current scan_name (signals
-                # blocked, so this does not re-trigger a load).
-                target = "%s.nxs" % self.scan_name
+                # selection, so the Scans panel showed the stale prior scan while
+                # the display had already moved to the new one.  Select the entry
+                # for the current scan_name (signals blocked, so no re-load).
+                sname = str(self.scan_name)
+                target = "%s.nxs" % sname
+                matched_row = None
+                fuzzy_row = None
                 for row in range(lw.count()):
-                    item = lw.item(row)
-                    if item.text() == target:
-                        lw.setCurrentItem(item, QItemSelectionModel.ClearAndSelect)
+                    text = lw.item(row).text()
+                    if text == target:                  # exact <scan_name>.nxs
+                        matched_row = row
                         break
+                    # Tolerate a scan_name that carries a frame-count/display
+                    # suffix the file stem does not (e.g. "<scan>_5" vs the file
+                    # "<scan>.nxs"), and the "<scan>/" directory form.
+                    if text.endswith(".nxs"):
+                        stem = text[:-4]
+                    elif text.endswith((".h5", ".hdf5")):
+                        stem = text.rsplit(".", 1)[0]
+                    else:
+                        stem = text.rstrip("/")
+                    if stem and (stem == sname or sname.startswith(stem + "_")):
+                        fuzzy_row = row
+                sel_row = matched_row if matched_row is not None else fuzzy_row
+                if sel_row is not None:
+                    lw.setCurrentItem(lw.item(sel_row),
+                                      QItemSelectionModel.ClearAndSelect)
+                if os.environ.get("XDART_PERF"):
+                    logger.info(
+                        "[PERF] update_scans select: scan_name=%r target=%r "
+                        "exact=%s fuzzy=%s n_items=%d",
+                        sname, target, matched_row, fuzzy_row, lw.count())
         finally:
             lw.blockSignals(was_blocked)
 

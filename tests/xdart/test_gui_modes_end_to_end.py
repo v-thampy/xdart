@@ -2919,6 +2919,13 @@ def test_update_scans_follows_current_scan_in_normal_mode(widget, tmp_path):
     cur = hv.ui.listScans.currentItem()
     assert cur is not None and cur.text() == "Combi4_new.nxs", \
         f"Scans panel did not follow the new scan: {cur.text() if cur else None}"
+    # scan_name may carry a frame-count/display suffix the file stem does not
+    # ("<scan>_5" vs "<scan>.nxs") -- must still follow.
+    hv.scan_name = "Combi4_new_5"
+    hv.update_scans()
+    cur = hv.ui.listScans.currentItem()
+    assert cur is not None and cur.text() == "Combi4_new.nxs", \
+        f"Scans panel did not follow a suffixed scan_name: {cur.text() if cur else None}"
 
 
 def test_shutdown_threads_stops_file_thread(widget):
