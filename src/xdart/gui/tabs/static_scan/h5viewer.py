@@ -612,6 +612,16 @@ class H5Viewer(QWidget):
         self.ui.refresh = QtWidgets.QPushButton('Refresh')
         self.ui.refresh.setObjectName('refresh')
         self.ui.refresh.setMaximumSize(QtCore.QSize(16777215, 25))
+        # date_sort_scans: a CHECKABLE "Date" toggle sits to the LEFT of Refresh;
+        # when checked, listScans sorts by last-modified (newest first) instead of
+        # the natural-name order.  Toggling re-reads + re-sorts via
+        # refresh_directory.  Its checked state is the only state (read live in
+        # update_scans), so it persists across Refresh automatically.
+        self.ui.dateSort = QtWidgets.QPushButton('Date')
+        self.ui.dateSort.setObjectName('dateSort')
+        self.ui.dateSort.setCheckable(True)
+        self.ui.dateSort.setMaximumSize(QtCore.QSize(16777215, 25))
+        self.ui.dateSort.toggled.connect(self.refresh_directory)
         # Refresh is placed on the RIGHT of the DATA BROWSER header row (built in
         # _init_toolbar, below the File/Config toolbar).  The bottom row below the
         # lists holds Show All / Auto Last / Metadata.
@@ -726,6 +736,8 @@ class H5Viewer(QWidget):
         self.dataBrowserHeader.setObjectName('dataBrowserHeader')
         _db.addWidget(self.dataBrowserHeader)
         _db.addStretch(1)
+        if hasattr(self.ui, 'dateSort'):
+            _db.addWidget(self.ui.dateSort)     # left of Refresh
         if hasattr(self.ui, 'refresh'):
             _db.addWidget(self.ui.refresh)
 
@@ -946,7 +958,19 @@ class H5Viewer(QWidget):
             # dirs, and every saved stat is a network round-trip on the SSRL NFS
             # deployment.  is_dir() follows symlinks by default, matching isdir.
             with os.scandir(self.dirname) as it:
-                entries = sorted(it, key=lambda e: self._natural_sort_key(e.name))
+                entries = list(it)
+            # date_sort_scans: honor the "Date" toggle (checked -> newest first by
+            # mtime), else the natural-name sort.  Read the toggle state LIVE here.
+            if (getattr(self.ui, 'dateSort', None) is not None
+                    and self.ui.dateSort.isChecked()):
+                def _safe_mtime(e):
+                    try:
+                        return e.stat().st_mtime
+                    except OSError:
+                        return 0.0        # a vanished/again entry sorts last
+                entries.sort(key=_safe_mtime, reverse=True)
+            else:
+                entries.sort(key=lambda e: self._natural_sort_key(e.name))
             for entry in entries:
                 name = entry.name
                 if entry.is_dir():

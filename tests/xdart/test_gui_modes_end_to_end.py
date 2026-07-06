@@ -2898,6 +2898,40 @@ def test_update_data_selection_restore_is_linear_not_quadratic(widget):
         f"selection restore too slow ({elapsed_ms:.0f}ms) -- O(N^2) regression?"
 
 
+def test_date_sort_toggle_orders_scans_by_mtime(widget, tmp_path):
+    """date_sort_scans: the checkable Date toggle sorts listScans by mtime
+    (newest first); unchecked restores the natural-name order."""
+    import os
+    w = widget
+    hv = w.h5viewer
+    hv.viewer_mode = 'normal'
+    hv.scan_name = None                           # avoid the follow-select path
+    # ascending by NAME, ascending by mtime -> the two orders are reverses
+    for i, name in enumerate(["a_scan.nxs", "b_scan.nxs", "c_scan.nxs"]):
+        p = tmp_path / name
+        p.write_text("x")
+        os.utime(p, (1000 + i, 1000 + i))         # a oldest .. c newest
+    hv.dirname = str(tmp_path)
+    assert hv.ui.dateSort.isCheckable()
+
+    def _nxs_order():
+        return [hv.ui.listScans.item(r).text()
+                for r in range(hv.ui.listScans.count())
+                if hv.ui.listScans.item(r).text().endswith('.nxs')]
+
+    hv.ui.dateSort.blockSignals(True)
+    hv.ui.dateSort.setChecked(False)
+    hv.ui.dateSort.blockSignals(False)
+    hv.update_scans()
+    assert _nxs_order() == ["a_scan.nxs", "b_scan.nxs", "c_scan.nxs"]  # name
+
+    hv.ui.dateSort.blockSignals(True)
+    hv.ui.dateSort.setChecked(True)
+    hv.ui.dateSort.blockSignals(False)
+    hv.update_scans()
+    assert _nxs_order() == ["c_scan.nxs", "b_scan.nxs", "a_scan.nxs"]  # mtime desc
+
+
 def test_run_end_reselects_scans_panel(widget, monkeypatch, tmp_path):
     """scans_select_after_run: wrangler_finished must re-run update_scans in the
     LIVE saw-frames branch (post-write), so the Scans panel follows to the newly-
