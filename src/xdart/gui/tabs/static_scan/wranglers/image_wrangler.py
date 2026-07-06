@@ -829,27 +829,20 @@ class imageWrangler(wranglerWidget):
                     self.ui.batchCheckBox.setChecked(False)
                     is_batch = False
 
-            # Sync cores enabled state with batch checkbox
             # Cores drives the reduction worker pool for BOTH batch (parallel
-            # reprocess) and LIVE (the streaming acquisition pool reads
-            # max_cores at run start), so enable it for either.
-            _cores_active = is_batch or self.ui.liveCheckBox.isChecked()
-            self.ui.coresLabel.setEnabled(_cores_active)
-            self.ui.maxCoresSpinBox.setEnabled(_cores_active)
+            # reprocess) and LIVE (the streaming acquisition pool reads max_cores
+            # at run start), so keep it usable in any normal processing mode.
+            self.ui.coresLabel.setEnabled(True)
+            self.ui.maxCoresSpinBox.setEnabled(True)
 
         self.ui.liveCheckBox.blockSignals(False)
         self.ui.batchCheckBox.blockSignals(False)
 
-        # Cores drives the reduction worker pool for batch (parallel reprocess)
-        # AND live (streaming acquisition pool) — show it for either (XYE forces
-        # batch on).
-        if is_viewer:
-            cores_visible = False
-        elif is_xye:
-            cores_visible = True
-        else:
-            cores_visible = (self.ui.batchCheckBox.isChecked()
-                             or self.ui.liveCheckBox.isChecked())
+        # Cores applies to ANY processing mode (batch parallel reprocess or the
+        # live streaming pool), so it is visible in general — hidden ONLY in the
+        # file viewers (Image/XYE/NeXus viewer) where the whole processing row is
+        # hidden.
+        cores_visible = not is_viewer
         self.ui.coresLabel.setVisible(cores_visible)
         self.ui.maxCoresSpinBox.setVisible(cores_visible)
 

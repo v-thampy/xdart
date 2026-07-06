@@ -2898,29 +2898,32 @@ def test_update_data_selection_restore_is_linear_not_quadratic(widget):
         f"selection restore too slow ({elapsed_ms:.0f}ms) -- O(N^2) regression?"
 
 
-def test_cores_spin_enabled_and_visible_in_live_mode(widget, monkeypatch):
+def test_cores_spin_visible_in_processing_hidden_in_viewers(widget, monkeypatch):
     """Item 4 (browse_1d_cap_raise): the Cores spinbox drives the LIVE streaming
-    reduction pool (max_cores is read at run start), so it must be enabled +
-    visible in live mode -- it was only cosmetically gated to batch."""
+    reduction pool AND batch reprocess, so it is visible+enabled in ANY processing
+    mode -- hidden ONLY in the file viewers (was cosmetically batch-only)."""
     wr = widget.wrangler
     vis = {}
     monkeypatch.setattr(wr.ui.maxCoresSpinBox, 'setVisible',
                         lambda v: vis.__setitem__('cores', v))
-    # live checked, batch unchecked
-    wr.ui.liveCheckBox.blockSignals(True); wr.ui.liveCheckBox.setChecked(True)
-    wr.ui.liveCheckBox.blockSignals(False)
-    wr.ui.batchCheckBox.blockSignals(True); wr.ui.batchCheckBox.setChecked(False)
-    wr.ui.batchCheckBox.blockSignals(False)
-    wr._on_mode_changed()
-    assert wr.ui.maxCoresSpinBox.isEnabled(), "Cores spin disabled in live mode"
-    assert wr.ui.coresLabel.isEnabled()
-    assert vis.get('cores') is True, "Cores spin hidden in live mode"
-    # neither live nor batch -> hidden
-    vis.clear()
-    wr.ui.liveCheckBox.blockSignals(True); wr.ui.liveCheckBox.setChecked(False)
-    wr.ui.liveCheckBox.blockSignals(False)
-    wr._on_mode_changed()
-    assert vis.get('cores') is False
+
+    def _mode(text, live=False, batch=False):
+        wr.ui.processingModeCombo.setCurrentText(text)
+        for cb, val in ((wr.ui.liveCheckBox, live), (wr.ui.batchCheckBox, batch)):
+            cb.blockSignals(True); cb.setChecked(val); cb.blockSignals(False)
+        vis.clear()
+        wr._on_mode_changed()
+
+    # live processing -> enabled + visible
+    _mode('Int 2D', live=True)
+    assert wr.ui.maxCoresSpinBox.isEnabled() and vis.get('cores') is True
+    # processing mode, NEITHER checked -> STILL visible + enabled (the ask)
+    _mode('Int 2D', live=False, batch=False)
+    assert vis.get('cores') is True, "Cores hidden in a processing mode"
+    assert wr.ui.maxCoresSpinBox.isEnabled()
+    # a file viewer -> hidden (whole processing row is hidden)
+    _mode('Image Viewer')
+    assert vis.get('cores') is False, "Cores visible in a viewer mode"
 
 
 def test_date_sort_toggle_orders_scans_by_mtime(widget, tmp_path):
