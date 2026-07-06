@@ -2864,6 +2864,40 @@ def test_run_end_backfills_overlay_after_integrator_finished_clear(
         f"overlay backfill did not run after integrator_thread_finished: {order}"
 
 
+def test_update_data_selection_restore_is_linear_not_quadratic(widget):
+    """The full-rebuild selection restore must be O(N), not O(N^2).  After Show
+    All on a long scan EVERY id is selected, so the old findItems()-per-id restore
+    was O(N^2) (3621 x 3621 ~ 13M main-thread ops) -- a multi-second freeze when a
+    large, all-selected scan is rebuilt/reloaded.  Now a text->item map makes it
+    O(N)."""
+    import time
+    w = widget
+    lw = w.h5viewer.ui.listData
+    N = 3000
+    lw.clear()
+    lw.addItems([str(i) for i in range(1, N + 1)])
+    for r in range(N):
+        lw.item(r).setSelected(True)
+    assert len(lw.selectedItems()) == N          # Show-All state
+    idx = w.scan.frames.index
+    idx.clear()
+    for i in range(1, N + 1):
+        idx.append(i)
+    w.h5viewer.new_scan_loaded = False
+    w.h5viewer.auto_last = False
+
+    t0 = time.perf_counter()
+    w.h5viewer.update_data(emit_update=False, force_rebuild=True)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    assert lw.count() == N
+    assert len(lw.selectedItems()) == N          # selection restored correctly
+    # O(N) map restore is single-digit ms; the old O(N^2) findItems loop measured
+    # ~150 ms+ at N=3000 -> a generous 100 ms ceiling catches a regression.
+    assert elapsed_ms < 100.0, \
+        f"selection restore too slow ({elapsed_ms:.0f}ms) -- O(N^2) regression?"
+
+
 def test_shutdown_threads_stops_file_thread(widget):
     """Production teardown must stop the persistent fileHandlerThread so it is
     not 'destroyed while running' on tab/app close.  Idempotent."""

@@ -1223,9 +1223,20 @@ class H5Viewer(QWidget):
         # use the fragile row index.  Fall back to the row only when nothing was
         # selected (or the selected frame no longer exists).
         if previous_sel:
+            # O(N) restore: build a text->item map ONCE instead of an O(N)
+            # findItems() per selected text.  After Show All on a long scan
+            # previous_sel holds every id, so the old findItems-per-id was
+            # O(N^2) (3621 x 3621 ~ 13M main-thread ops) -- the multi-second
+            # run-start beachball when tearing down a long, all-selected scan.
+            # Frame ids are unique, so first-match-wins is equivalent.
+            _text_to_item = {}
+            for _row in range(self.ui.listData.count()):
+                _it = self.ui.listData.item(_row)
+                _text_to_item.setdefault(_it.text(), _it)
             current_item = None
             for text in previous_sel:
-                for item in self.ui.listData.findItems(text, QtCore.Qt.MatchExactly):
+                item = _text_to_item.get(text)
+                if item is not None:
                     item.setSelected(True)
                     if current_item is None:
                         current_item = item
