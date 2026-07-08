@@ -45,6 +45,10 @@ jobs:
 
       - name: Build (rattler-build, noarch)
         run: |
+          # rattler-build links a large (~250-pkg) env to run the recipe tests and
+          # opens hundreds of files in parallel; raise the fd limit as insurance
+          # (ubuntu runners are usually fine, macOS defaults to 256 -> os error 24).
+          ulimit -n 4096 || true
           pixi exec rattler-build build \
             --recipe recipe/recipe.yaml \
             --channel conda-forge \

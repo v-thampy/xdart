@@ -12,6 +12,12 @@ schema_version: 1
 #
 # Deps verified against conda-forge 2026-07-08.  See
 # docs/design/plan_conda_package_v1.1_jul2026.md.
+#
+# Local build (macOS): raise the file-descriptor limit first — rattler-build's
+# ~250-package test env opens hundreds of files and macOS defaults to 256
+# (`os error 24`):
+#     ulimit -n 10240
+#     pixi exec rattler-build build --recipe recipe/recipe.yaml -c conda-forge
 
 context:
   name: xrd-tools
