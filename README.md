@@ -72,9 +72,9 @@ pixi global install -c https://prefix.dev/xrd-tools -c conda-forge xrd-tools
 Launch with `xdart` (or the shortcut). Upgrade with `pixi global update xrd-tools`
 (or from the app: **Help → Check for Updates…**).
 
-> **v1.1** — the conda package publishes with the v1.1 release tag. Until it is
-> live on the channel, use the one-line installer script below (it needs nothing
-> preinstalled — not even pixi).
+> The conda package is published with the release tag. Until it is live on the
+> channel, use the one-line installer script below (it needs nothing preinstalled
+> — not even pixi).
 
 ### One-line installer script (no conda or pixi needed)
 

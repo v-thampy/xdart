@@ -17,7 +17,7 @@ context:
   name: xrd-tools
   # Keep in sync with pyproject [project].version; the publish-on-tag Action
   # (.github/workflows/conda-publish.yml) verifies recipe==pyproject==tag.
-  version: "1.1.0"
+  version: "1.0.0"
   python_min: "3.11"
 
 package:
