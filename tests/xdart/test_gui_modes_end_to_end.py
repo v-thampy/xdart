@@ -2872,10 +2872,14 @@ def test_wrangler_finished_with_frames_does_not_reload(
 
 def test_run_end_backfills_overlay_after_integrator_finished_clear(
         widget, monkeypatch, tmp_path):
-    """Item 2 (PERF-3 Option A): at run end the full-index Overlay backfill must
-    run AFTER integrator_thread_finished(), whose clear_overlay would otherwise
-    wipe an earlier render -- so the Waterfall reaches N without the user
-    clicking Show All."""
+    """PERF-3 Option A: at run end the one-shot overlay catch-up must be ARMED
+    AFTER integrator_thread_finished(), whose clear_overlay would otherwise wipe
+    an earlier render.  This locks the run-end WIRING + ordering; the catch-up's
+    own guard/decision logic (post-quiescence show_all of the non-resident tail)
+    is unit-tested in test_runend_overlay_catchup.py.  (Superseded the failed
+    Item-2 test that asserted a direct _render_overlay_full_scan fired -- the
+    mechanism-not-outcome trap; the direct reselect could not paint the never-
+    published tail.)"""
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
     w = widget
     _set_processing_mode(w, 'Int 2D')
@@ -2892,16 +2896,16 @@ def test_run_end_backfills_overlay_after_integrator_finished_clear(
     monkeypatch.setattr(w, 'integrator_thread_finished',
                         lambda: order.append('integrator_finished'))
     monkeypatch.setattr(
-        staticWidget, '_render_overlay_full_scan',
-        lambda self, **k: (order.append('overlay_backfill'), True)[1])
+        staticWidget, '_arm_runend_overlay_catchup',
+        lambda self: order.append('overlay_catchup_armed'))
 
     w.wrangler_finished()
 
-    # a backfill fires AFTER the integrator-finished clear_overlay (the fix); any
-    # earlier reconcile render (which clear_overlay wipes) may also appear first.
+    # the catch-up is ARMED AFTER the integrator-finished clear_overlay (so the
+    # post-quiescence show_all runs against a settled, cleared accumulator).
     assert 'integrator_finished' in order, order
-    assert 'overlay_backfill' in order[order.index('integrator_finished') + 1:], \
-        f"overlay backfill did not run after integrator_thread_finished: {order}"
+    assert 'overlay_catchup_armed' in order[order.index('integrator_finished') + 1:], \
+        f"overlay catch-up not armed after integrator_thread_finished: {order}"
 
 
 def test_update_data_selection_restore_is_linear_not_quadratic(widget):

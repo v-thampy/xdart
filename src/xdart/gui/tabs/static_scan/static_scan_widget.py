@@ -99,8 +99,10 @@ from .ui.staticUI import Ui_Form
 from .h5viewer import H5Viewer, _qt_enum_value
 from .display_frame_widget import displayFrameWidget
 from .display_overlay_utils import (
+    frame_index_from_row_id,
     overlay_grid_key_for_widget,
     overlay_grid_keys_match,
+    row_id_belongs_to_widget_scan,
 )
 from .integrator import (
     GI_LABELS_1D,
@@ -4878,6 +4880,120 @@ class staticWidget(QWidget):
         )
         return True
 
+    def _arm_runend_overlay_catchup(self):
+        """PERF-3 Option A — one-shot run-end overlay catch-up.
+
+        After a live run the Overlay/Waterfall can end short: the lagged tail
+        frames were dropped at the cap-128 display hand-off and NEVER published,
+        so no in-memory reselect can paint them (Item-2's "cheap in-memory
+        reselect" premise was false).  Recovery needs a REAL async disk load ==
+        a manual Show All.  Arm a ONE-SHOT catch-up that waits out the run-end
+        debounce cascade (the ``set_run_writing(False)`` + auto-last selection-
+        collapse echoes) and then calls ``show_all()`` ONCE.  Replaces the failed
+        Item-2 ``_render_overlay_full_scan`` call.  No-op unless Overlay/Waterfall
+        + auto_last.
+
+        Cancellation deliberately does NOT gate on ``display_generation``: the
+        automatic run-end selection-collapse echoes bump it via
+        ``_sync_selection_generation`` (SELECTION), so a generation-equality gate
+        would false-abort and the fix would silently never fire (the Item-2 trap).
+        The real user gestures are caught by the robust signals in the callback:
+        auto_last off (frame click -> ``disable_auto_last``), scan.name changed
+        (new scan/file), token cleared (new run, ``_enter_run_state``).
+        """
+        method = staticWidget._overlay_plot_method(self)
+        viewer = getattr(self, "h5viewer", None)
+        if not (getattr(viewer, "auto_last", False)
+                and method in ("Overlay", "Waterfall")):
+            self._runend_catchup_token = None
+            return
+        self._runend_catchup_token = getattr(self.scan, "name", None)
+        self._runend_catchup_tries = 0
+        browse_debug_log(logger, "runend_overlay_catchup_armed",
+                         token=self._runend_catchup_token)
+        QtCore.QTimer.singleShot(
+            250, lambda: staticWidget._runend_overlay_catchup(self))
+
+    def _runend_catchup_busy(self) -> bool:
+        """True while the run-end debounce cascade / a disk load is still in
+        flight — fire the catch-up only once the GUI has quiesced."""
+        viewer = getattr(self, "h5viewer", None)
+        if viewer is None:
+            return False
+        if getattr(viewer, "_load_worker", None) is not None:
+            return True
+        for name in ("_selection_coalesce_timer", "_load_coalesce_timer",
+                     "_update_coalesce_timer"):
+            timer = getattr(viewer, name, None)
+            if timer is not None and timer.is_pending():
+                return True
+        return bool(getattr(viewer, "_browse_one_shot_pending_render", False))
+
+    def _runend_overlay_missing_ids(self) -> set:
+        """Frame indices in the current scan NOT yet in the waterfall accumulator.
+
+        Length-tolerant id decode: slice-mode rows are 3-tuples
+        ``(scan_key, frame_idx, projection_id)``, so never destructure the row id
+        directly (a literal ``(skey, fidx)`` unpack ValueErrors).  A cleared
+        accumulator (``None`` after ``clear_overlay``) reads as all-missing, which
+        correctly triggers a full rebuild.
+        """
+        df = getattr(self, "displayframe", None)
+        history = getattr(df, "_waterfall_history", None)
+        with self.scan.scan_lock:
+            full = {int(i) for i in self.scan.frames.index}
+        if not full:
+            return set()
+        have = set()
+        for row_id in (getattr(history, "ids", ()) or ()):
+            if row_id_belongs_to_widget_scan(df, row_id):
+                have.add(frame_index_from_row_id(row_id))
+        return full - have
+
+    def _runend_overlay_catchup(self):
+        """One-shot post-quiescence auto-Show-All (see _arm_runend_overlay_catchup)."""
+        if getattr(self, "_runend_catchup_token", None) is None:
+            return                                   # cleared by a new run / reset
+        df = getattr(self, "displayframe", None)
+        viewer = getattr(self, "h5viewer", None)
+        method = staticWidget._overlay_plot_method(self)
+        # Guard 1 — cancellation (robust; NOT generation-gated, see arm docstring).
+        if (viewer is None
+                or not getattr(viewer, "auto_last", False)
+                or self._runend_catchup_token != getattr(self.scan, "name", None)
+                or method not in ("Overlay", "Waterfall")):
+            self._runend_catchup_token = None
+            return
+        # Guard 2 — quiescence: re-arm (bounded ~2 s) until the debounce cascade
+        # and any load worker settle, then give up silently (degrades to the
+        # user's manual Show All).
+        if staticWidget._runend_catchup_busy(self):
+            self._runend_catchup_tries = getattr(self, "_runend_catchup_tries", 0) + 1
+            if self._runend_catchup_tries <= 8:
+                QtCore.QTimer.singleShot(
+                    250, lambda: staticWidget._runend_overlay_catchup(self))
+            else:
+                self._runend_catchup_token = None
+                browse_debug_log(logger, "runend_overlay_catchup_giveup")
+            return
+        # Guard 3 — missing set.  Empty -> already complete -> idempotent no-op.
+        missing = staticWidget._runend_overlay_missing_ids(self)
+        if not missing:
+            self._runend_catchup_token = None
+            return
+        # Guard 4 — fire once.  The click path (show_all) does the rest: select
+        # all, split resident/missing, ONE _LoadFramesWorker for the missing tail,
+        # generation-gated absorb, append into the carried accumulator.
+        self._runend_catchup_token = None
+        logger.info(
+            "[PERF] run-end overlay catch-up: %d missing frame(s) -> show_all()",
+            len(missing))
+        browse_debug_log(logger, "runend_overlay_catchup_fire", missing=len(missing))
+        try:
+            self.h5viewer.show_all()
+        except Exception:
+            logger.debug("run-end overlay catch-up show_all failed", exc_info=True)
+
     def disable_auto_last(self, q):
         """
         Parameters
@@ -5457,6 +5573,8 @@ class staticWidget(QWidget):
         # can still show the scan's last frame at the end (visual confirmation
         # that something happened).  Reset per run start.
         self._run_saw_frame = False
+        # A new run supersedes any pending run-end overlay catch-up from the last.
+        self._runend_catchup_token = None
         self._set_scan_integrated_reads_transient(True)
         self.displayframe.set_processing_active(True)
         # Start the main-thread liveness window for this run (XDART_PERF only).
@@ -6408,6 +6526,13 @@ class staticWidget(QWidget):
             gap_ms = (now - last) * 1000.0
             if gap_ms > self._perf_hb_max_gap_ms:
                 self._perf_hb_max_gap_ms = gap_ms
+            # Log large stalls AS THEY HAPPEN, with elapsed-since-run-start, so the
+            # window can be pinned (kickoff vs mid-run vs teardown) -- "max over
+            # the run" alone can't locate a one-off freeze.
+            if gap_ms >= 500.0:
+                logger.info(
+                    "[PERF] main-thread stall: gap=%.0f ms at t+%.1fs into the run",
+                    gap_ms, now - getattr(self, "_perf_hb_window_t0", now))
 
     def _perf_hb_start_window(self):
         # Begin accumulating the max event-loop gap for a run (XDART_PERF only;
@@ -6417,6 +6542,7 @@ class staticWidget(QWidget):
         import time
         self._perf_hb_max_gap_ms = 0.0
         self._perf_hb_last = time.perf_counter()
+        self._perf_hb_window_t0 = self._perf_hb_last
         self._perf_hb_active = True
 
     def _perf_hb_end_window(self):
@@ -6663,19 +6789,16 @@ class staticWidget(QWidget):
                 **_runend_waterfall_history_fields(
                     getattr(self, "displayframe", None)),
             )
-            # Item 2 (PERF-3 Option A): the live incremental paint can lag, so the
-            # Overlay/Waterfall ends short (e.g. 3476/3621).  Now that the run has
-            # exited its run-state and the on-disk index is reconciled, do ONE
-            # full-index Show-All-equivalent render so the accumulator reaches N
-            # WITHOUT the user clicking Show All.  Placed AFTER
-            # integrator_thread_finished() so its clear_overlay does not destroy
-            # it (the earlier render inside _reconcile_..._after_run runs BEFORE
-            # the delegate and is wiped).  _render_overlay_full_scan APPENDS into
-            # the scan-qualified accumulator (never clear/rebuild) and no-ops
-            # unless auto_last is on and the method is Overlay/Waterfall.  Synergy
-            # with Item 1: the 1 GiB cap keeps the frames resident, so this is a
-            # cheap in-memory reselect (no disk re-read).
-            staticWidget._render_overlay_full_scan(self)
+            # PERF-3 Option A (was Item 2): the live incremental paint can lag, so
+            # the Overlay/Waterfall ends short (e.g. 3476/3621).  Item-2's direct
+            # _render_overlay_full_scan reselect FAILED — the lagged tail frames
+            # were dropped at the cap-128 hand-off and never published, so a
+            # resident reselect can't paint them, and the run-end selection-collapse
+            # echoes killed its deferred render.  Instead arm a ONE-SHOT post-
+            # quiescence catch-up that waits out those echoes and does ONE real
+            # show_all() (async disk load of the missing tail).  See
+            # docs/design/runend_overlay_catchup_spec_jul2026.md.
+            staticWidget._arm_runend_overlay_catchup(self)
         else:
             self.wrangler.enabled(True)
 

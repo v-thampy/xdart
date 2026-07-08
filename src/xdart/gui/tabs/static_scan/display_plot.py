@@ -1198,6 +1198,17 @@ class DisplayPlotMixin:
 
         self.setup_wf_layout()
 
+        # PERF-3 Part 2 diagnostic (XDART_PERF): time the render and log it against
+        # the FULL accumulated row count, so a live 3600-frame run reveals whether
+        # render_ms tracks N (the copy/bookkeeping IS the bottleneck -> adaptive
+        # cadence pays) or plateaus (the 256-row decimated paint dominates -> the
+        # slowdown is elsewhere).  See docs/design/runend_overlay_catchup_spec_jul2026.md.
+        import os as _os
+        _perf_t0 = None
+        if _os.environ.get("XDART_PERF"):
+            import time as _pt
+            _perf_t0 = _pt.perf_counter()
+
         xdata_, data_ = self.plot_data
         s_xdata, data = xdata_.copy(), data_.copy()
         row_ids = (getattr(self, 'overlaid_idxs', None)
@@ -1219,6 +1230,15 @@ class DisplayPlotMixin:
 
         self.wf_widget.setImage(data.T, scale=self.scale, cmap=self.cmap)
         self.wf_widget.setRect(rect)
+
+        if _perf_t0 is not None:
+            import time as _pt
+            logger.info(
+                "[PERF] overlay render: render_ms=%.1f rows=%d drawn=%d live=%s",
+                (_pt.perf_counter() - _perf_t0) * 1000.0,
+                int(getattr(data_, "shape", (0,))[0] or 0),
+                int(getattr(data, "shape", (0,))[0] or 0),
+                bool(getattr(self, "_processing_active", False)))
 
         _xl, _xu = self._current_plot_axis_label()
         self.wf_widget.image_plot.setLabel("bottom", _xl, units=_xu)

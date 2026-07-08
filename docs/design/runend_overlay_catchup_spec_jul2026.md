@@ -110,6 +110,19 @@ failure degrades to current behavior. Safe pre-tag ONLY with a live 3600-frame v
 
 ## Part 2 — overlay/waterfall live processing overhead (125 s → 180 s, progressive)
 
+> **MEASURED 2026-07-07 — Part 2 hypothesis REFUTED; adaptive cadence NOT worth building.**
+> Instrumented `update_wf` (`[PERF] overlay render: render_ms=… rows=… drawn=…`) on a live 3621-frame
+> Overlay run: `render_ms` is FLAT ~2–3.5 ms independent of `rows`, and `rows`/`drawn` plateau at
+> ~248–253 (the payload/`MAX_WF_ROWS` decimation), never approaching 3621. So the overlay render is
+> NOT the slowdown and lever-1 (adaptive cadence) would save ~nothing — dropped. **The real issue the
+> heartbeat surfaced instead:** recurring ~3 s MAIN-THREAD stalls in the LAST ~15 s of the run
+> (`[PERF] main-thread stall: gap≈3000ms at t+143…159s`, max 6132 ms), worsening as N grows,
+> UNINSTRUMENTED (the flushes around them are only ~100–180 ms). NOT the run-end explicit gc.collect
+> (70 ms, 0 collected). A GC timing probe (`[PERF] gc:` in `_gui_main.run`, XDART_PERF) + a faulthandler
+> SIGUSR1 dump during a stall will pin it (GC vs an O(N) per-flush op at N≈3400). This end-of-run freeze
+> is now the tracked PERF item; it likely also drives the Part-1 tail gap (a frozen GUI drops hand-offs).
+
+
 Mechanism (HYPOTHESIS — must be confirmed with one instrumented run; NOT statically proven): the
 live overlay render is throttled to a FIXED cadence (≤2 Hz while `_processing_active`, confirmed:
 `display_plot.py:1195` + the SSW flush throttle, no row-count scaling). **Correction:** the render

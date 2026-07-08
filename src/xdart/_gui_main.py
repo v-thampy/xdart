@@ -496,6 +496,33 @@ def _apply_cli_session_args(argv):
 def run():
     argv = _apply_cli_session_args(sys.argv)
     app = QtWidgets.QApplication(argv)
+    # PERF-3 diagnostic (XDART_PERF only): time garbage collections.  CPython 3.12
+    # GC is stop-the-world, so a gen-2 sweep over the large frame/publication graph
+    # could freeze the GUI -- a candidate for the end-of-run ~3s recurring stalls
+    # the heartbeat catches.  Logs each non-trivial collection's duration so ONE
+    # run confirms or refutes GC (a STW pause is exactly what a stack sampler reads
+    # ambiguously).  Registered only in the real app, behind the flag.
+    if os.environ.get("XDART_PERF"):
+        import time as _time
+        _gc_t0 = [0.0]
+
+        def _gc_perf_probe(phase, info):
+            try:
+                if phase == "start":
+                    _gc_t0[0] = _time.perf_counter()
+                elif phase == "stop":
+                    dt_ms = (_time.perf_counter() - _gc_t0[0]) * 1000.0
+                    gen = info.get("generation", -1)
+                    if dt_ms >= 100.0 or gen >= 2:
+                        logger.info(
+                            "[PERF] gc: gen=%d elapsed=%.0fms collected=%d "
+                            "uncollectable=%d", gen, dt_ms,
+                            info.get("collected", 0),
+                            info.get("uncollectable", 0))
+            except Exception:
+                pass
+
+        gc.callbacks.append(_gc_perf_probe)
     # Install the keep-alive excepthook only when the GUI is actually launched —
     # never as an import-time side effect (importing this module must not hijack
     # the process-global sys.excepthook for tests / headless / embedding hosts).
