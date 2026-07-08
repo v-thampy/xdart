@@ -256,7 +256,7 @@ class Main(QMainWindow):
                 "updater.")
             return
         self._update_kind = kind
-        self._update_meta = updater.find_install_meta()
+        self._update_meta = updater.resolve_update_meta(kind)
         # Fetch the latest version off the GUI thread; never block the event loop.
         self._update_thread = _UpdateCheckThread(self)
         self._update_thread.result_ready.connect(self._on_update_check_result)

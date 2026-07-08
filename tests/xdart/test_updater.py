@@ -64,7 +64,53 @@ def test_install_kind_pixi_when_meta_present(monkeypatch):
 def test_install_kind_managed_when_no_meta(monkeypatch):
     monkeypatch.setattr(updater, "is_editable_install", lambda: False)
     monkeypatch.setattr(updater, "find_install_meta", lambda: None)
+    monkeypatch.setattr(updater, "detect_pixi_global_env", lambda: False)
     assert updater.install_kind() == "managed"
+
+
+# ── pixi-global flavor (v1.1 conda package) ───────────────────────────────────
+
+def test_detect_pixi_global_env_by_path(tmp_path, monkeypatch):
+    monkeypatch.delenv("PIXI_HOME", raising=False)
+    # <root>/.pixi/envs/xrd-tools  -> pixi-global
+    good = tmp_path / ".pixi" / "envs" / "xrd-tools"
+    good.mkdir(parents=True)
+    assert updater.detect_pixi_global_env(prefix=str(good)) is True
+    # a normal venv/conda prefix -> not pixi-global
+    other = tmp_path / "envs2" / "myenv"
+    other.mkdir(parents=True)
+    assert updater.detect_pixi_global_env(prefix=str(other)) is False
+
+
+def test_detect_pixi_global_env_honors_pixi_home(tmp_path, monkeypatch):
+    home = tmp_path / "custom-pixi"
+    env = home / "envs" / "xrd-tools"
+    env.mkdir(parents=True)
+    monkeypatch.setenv("PIXI_HOME", str(home))
+    assert updater.detect_pixi_global_env(prefix=str(env)) is True
+
+
+def test_install_kind_pixi_global(monkeypatch):
+    monkeypatch.setattr(updater, "is_editable_install", lambda: False)
+    monkeypatch.setattr(updater, "detect_pixi_global_env", lambda: True)
+    assert updater.install_kind() == "pixi-global"
+
+
+def test_pixi_global_meta_builds_update_command(monkeypatch, tmp_path):
+    monkeypatch.setenv("PIXI_HOME", str(tmp_path))
+    meta = updater.pixi_global_meta()
+    assert meta["flavor"] == "pixi-global"
+    assert meta["update_cmd"][-3:] == ["global", "update", "xrd-tools"]
+    assert meta["relaunch_cmd"]                      # a launch command exists
+
+
+def test_resolve_update_meta_by_kind(monkeypatch):
+    monkeypatch.setattr(updater, "pixi_global_meta", lambda: {"flavor": "pixi-global"})
+    monkeypatch.setattr(updater, "find_install_meta", lambda: {"flavor": "pixi-workspace"})
+    assert updater.resolve_update_meta("pixi-global")["flavor"] == "pixi-global"
+    assert updater.resolve_update_meta("pixi")["flavor"] == "pixi-workspace"
+    assert updater.resolve_update_meta("managed") is None
+    assert updater.resolve_update_meta("editable") is None
 
 
 # ── PyPI fetch (injected opener; never touches the network) ────────────────────

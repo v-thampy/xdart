@@ -59,7 +59,24 @@ works as a **deprecation shim** that re-exports the real `xrd_tools` modules
 
 ## Install
 
-### Quick install (recommended)
+### Quick install — `pixi global` (recommended)
+
+If you have [pixi](https://pixi.sh), one command installs xdart, puts it on your
+PATH, and adds a Start-menu / Applications shortcut — with the whole fast
+conda-forge I/O stack:
+
+```bash
+pixi global install -c https://prefix.dev/<channel> -c conda-forge xrd-tools
+```
+
+Launch with `xdart` (or the shortcut). Upgrade with `pixi global update xrd-tools`
+(or from the app: **Help → Check for Updates…**).
+
+> **v1.1** — replace `<channel>` with the published channel name once the conda
+> package is live. Until then, use the one-line installer script below (it needs
+> nothing preinstalled — not even pixi).
+
+### One-line installer script (no conda or pixi needed)
 
 Installs everything — Python, the fast HDF5/compression stack, and xdart — in one
 step, into its own folder, without touching any existing Python or conda setup.
