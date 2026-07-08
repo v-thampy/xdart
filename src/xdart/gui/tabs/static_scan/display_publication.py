@@ -1052,6 +1052,9 @@ class PublicationDisplayAdapter:
         def append_row(label, *, recipe=None, live=False):
             nonlocal ref_x, axis, reset_key
             pub = self._publication_for_label(label)
+            if os.environ.get("XDART_DIAG"):   # nightly pollution diagnosis (opt-in)
+                logger.warning("[DIAG append_row] label=%r pub=%s",
+                               label, "None" if pub is None else "ok")
             if pub is None:
                 return None
             view = pub.view
@@ -1238,6 +1241,13 @@ class PublicationDisplayAdapter:
             prior, reset_key=reset_key, unit=unit, label=label,
             x=ref_x, rows=np.asarray(rows, dtype=float), ids=ids, names=names,
             metadata=metadata, replace_ids=replace_ids, drop_ids=drop_ids)
+        if os.environ.get("XDART_DIAG"):   # nightly pollution diagnosis (opt-in)
+            logger.warning(
+                "[DIAG overlay] pending=%s render_labels=%s appended_ids=%s "
+                "history.ids=%s reset_key=%s",
+                list(pending_overlay_appends), list(render_labels), list(ids),
+                list(getattr(history, "ids", ())),
+                getattr(history, "reset_key", None))
         return self._history_to_payload(history)
 
     def _history_to_payload(self, history):

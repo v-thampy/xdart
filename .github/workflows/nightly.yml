@@ -3,6 +3,11 @@ on:
   schedule:
     - cron: "17 9 * * *"   # 09:17 UTC daily
   workflow_dispatch:
+    inputs:
+      diag:
+        description: "Pollution diagnosis: run tests/xdart verbose + XDART_DIAG label dump"
+        type: boolean
+        default: false
 
 jobs:
   full:
@@ -17,11 +22,17 @@ jobs:
       - run: pytest tests/core -q --timeout=600
       - env:
           QT_QPA_PLATFORM: offscreen
+          # Opt-in via `workflow_dispatch` (diag=true): verbose run + the payload
+          # [DIAG] label dump, to name the tests/xdart cross-test polluter. Empty
+          # (falsy) on scheduled runs, so normal nightlies are unaffected.
+          XDART_DIAG: ${{ inputs.diag && '1' || '' }}
         # Retry ONLY on the offscreen-pyqtgraph segfault (exit 139); any real
         # test failure still fails fast (see pr.yml for the rationale).
         run: |
+          verbose=""
+          [ "${{ inputs.diag }}" = "true" ] && verbose="-v"
           for attempt in 1 2 3; do
-            pytest tests/xdart -q --timeout=900 --junitxml="xdart-attempt-$attempt.xml"
+            pytest tests/xdart -q $verbose --timeout=900 --junitxml="xdart-attempt-$attempt.xml"
             code=$?
             [ "$code" -eq 0 ] && exit 0
             # A real test failure/error must fail fast even when the process ALSO
