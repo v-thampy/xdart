@@ -2,7 +2,7 @@ name: conda-publish
 
 # Build the noarch conda package with rattler-build and upload it to our
 # prefix.dev channel on a version tag — enabling
-#   pixi global install -c https://prefix.dev/<channel> -c conda-forge xrd-tools
+#   pixi global install -c https://prefix.dev/xrd-tools -c conda-forge xrd-tools
 # See docs/design/plan_conda_package_v1.1_jul2026.md.
 #
 # One-time setup (maintainer): create the prefix.dev channel, then add repo

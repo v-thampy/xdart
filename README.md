@@ -66,15 +66,15 @@ PATH, and adds a Start-menu / Applications shortcut — with the whole fast
 conda-forge I/O stack:
 
 ```bash
-pixi global install -c https://prefix.dev/<channel> -c conda-forge xrd-tools
+pixi global install -c https://prefix.dev/xrd-tools -c conda-forge xrd-tools
 ```
 
 Launch with `xdart` (or the shortcut). Upgrade with `pixi global update xrd-tools`
 (or from the app: **Help → Check for Updates…**).
 
-> **v1.1** — replace `<channel>` with the published channel name once the conda
-> package is live. Until then, use the one-line installer script below (it needs
-> nothing preinstalled — not even pixi).
+> **v1.1** — the conda package publishes with the v1.1 release tag. Until it is
+> live on the channel, use the one-line installer script below (it needs nothing
+> preinstalled — not even pixi).
 
 ### One-line installer script (no conda or pixi needed)
 
