@@ -1384,6 +1384,11 @@ class DisplayDataMixin:
             wl = getattr(ai, 'wavelength', None) if ai else None
             wl = normalize_wavelength_m(wl, allow_default_sentinel=True)
             if wl is not None:
+                # F1: cache a REAL run wavelength (reject the 1e-10 constructor
+                # sentinel) for hydrated rows this run; reset each run boundary.
+                _real = normalize_wavelength_m(wl)
+                if _real is not None:
+                    self._run_wavelength_m = _real
                 return wl
             poni = getattr(frame, 'poni', None)
             wl = normalize_wavelength_m(
@@ -1391,7 +1396,24 @@ class DisplayDataMixin:
                 allow_default_sentinel=True,
             )
             if wl is not None:
+                # F1: cache a REAL run wavelength (reject the 1e-10 constructor
+                # sentinel) for hydrated rows this run; reset each run boundary.
+                _real = normalize_wavelength_m(wl)
+                if _real is not None:
+                    self._run_wavelength_m = _real
                 return wl
+
+        # 1.5 (F1): the run-scoped wavelength, stamped above from the first
+        # frame-backed row's integrator THIS run.  Hydrated rows (raw_ref=None)
+        # have no frame mid-run, and _persisted_wavelength_m / the HDF5 fallback
+        # (below) are unavailable while ``_run_writing`` -> without this the same
+        # append batch mixes units (Q for frame-backed rows, unconvertible for
+        # hydrated -> the blank-band / stale-combo regression).  Only trusted
+        # during a run; reset at each run boundary in ``set_processing_active``.
+        if getattr(self, '_run_writing', False):
+            run_wl = getattr(self, '_run_wavelength_m', None)
+            if run_wl:
+                return run_wl
 
         # 2. From scan.mg_args (loaded when NXS is opened). Reject the
         # historical 1e-10 m constructor sentinel rather than using it for

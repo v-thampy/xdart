@@ -575,18 +575,20 @@ Overlay payload (the accumulator already holds the rest) — INCREMENTAL, not fu
 Needs care (display pipeline; the OV family burned this project 12x/5wk) + an outcome test.
 
 ### F1-F4 unit-flip regression — VERIFIED verdict (apply the CORRECTED forms, not the doc text)
-- **F1 (keystone, apply-now, widget-scoped variant only):** the doc's literal "consult run wavelength
-  before the `_run_writing` early-return" is a NO-OP — that consult already exists
-  (display_data.py ~1319-1327, reads `scan._persisted_wavelength_m`). The real fix is a run-START
-  STAMP of a REAL wavelength: widget `_run_wavelength_m` set in `set_processing_active(True)` from the
-  PONI/first-frame integrator via `normalize_wavelength_m` WITHOUT `allow_default_sentinel` (reject the
-  1e-10 placeholder), cleared on `active=False`, consulted as source #2.5 AFTER the frame integrator.
-  Do NOT use the `scan._persisted_wavelength_m` stamp variant (read by nexus_writer.py:1755 -> written
-  to disk mid-run: real blast radius). Note ship-delta: the 2D cake radial axis now converts where it
-  showed raw Q (intended).
-- **F4 (apply-now, mirror-ONLY):** set `_last_plot_unit` in the share-axis `was_checked` branch
-  (~:2667). OMIT the doc's follow-up render — `_in_update` does NOT drop a `singleShot(0, update)`
-  (runs post-unwind), so an unconditional follow-up is an INFINITE 0-ms cascade (soft freeze).
+- **F1 (keystone) — LANDED 2026-07-07 (fixed-unverified).** Widget-scoped `_run_wavelength_m`,
+  display-only, never persisted. DEVIATION from the doc's literal "stamp at `set_processing_active`
+  from a PONI accessor" (the run-start PONI accessor is non-obvious/risky): instead stamped LAZILY in
+  `_get_wavelength` from the first frame-backed row's integrator (source #1, guaranteed correct — the
+  same wavelength that source) via `normalize_wavelength_m` WITHOUT `allow_default_sentinel` (rejects
+  the 1e-10 placeholder), consulted as source #2.5 (gated on `_run_writing`) for hydrated rows, and
+  RESET at each run boundary in `set_processing_active`. NOT the `scan._persisted_wavelength_m` stamp
+  variant (writes to disk). Tests: `test_unit_flip_wavelength.py`. Ship-delta unchanged: the 2D cake
+  radial axis now converts mid-run where it showed raw Q for hydrated rows (intended). The doc's
+  literal "consult before the early-return" was a no-op (that consult already exists).
+- **F4 — LANDED 2026-07-07 (fixed-unverified).** `_last_plot_unit` mirrored in the share-axis
+  `was_checked` branch (`_apply_share_axis_state`), mirror-ONLY: the doc's follow-up render was OMITTED
+  — `_in_update` does NOT drop a `singleShot(0, update)` (runs post-unwind), so it would be an INFINITE
+  0-ms cascade. Test: `test_unit_flip_wavelength.py::test_share_axis_silent_switch_mirrors_last_plot_unit`.
 - **F3 (apply-with-care, after F1):** stash `ImagePayload.axis_x` (the rendered cake axis) + skip the
   Share-Axis align when rendered cake unit != 1D rendered unit (low risk). Part (b) rekeying
   `_current_image_axis_key` off the stash is MED risk (feeds the gate every render; MUST fall back to

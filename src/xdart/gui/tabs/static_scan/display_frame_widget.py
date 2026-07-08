@@ -2666,6 +2666,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             return False
         if was_checked:
             self._set_plot_unit_index_silently(target_idx)
+            # F4: the silent switch bypasses the plotUnit signal, so mirror
+            # _last_plot_unit here (as the normal setter does) -- otherwise it
+            # stays stale and reads as a Q-vs-2θ combo mismatch (the stale-combo
+            # signature).  NO follow-up render: an unconditional singleShot(0,
+            # update) is NOT dropped by _in_update (it runs post-unwind) and would
+            # cascade; the in-flight render already sees the updated value.
+            self._last_plot_unit = self.ui.plotUnit.currentIndex()
             self.ui.plotUnit.setEnabled(False)
             displayFrameWidget._set_share_link(self, True)
             return True
@@ -4565,6 +4572,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         active = bool(active)
         self._processing_active = active
         self._run_writing = active
+        # F1: reset the run-scoped display wavelength at every run boundary; it is
+        # re-stamped from the first frame-backed row's integrator during the run
+        # and consulted for hydrated rows that lack a frame (mixed-unit fix).
+        self._run_wavelength_m = None
         if not active:
             self._aggregate_live_scan = None
         if was_writing and not active:
