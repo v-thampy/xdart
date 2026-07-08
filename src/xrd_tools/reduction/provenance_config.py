@@ -238,7 +238,18 @@ def _raw_files_from_scan(scan: Any) -> list[str]:
     # has no ``_in_memory`` and iterates unchanged.  Written provenance is byte-
     # identical either way -- GUI stays [], headless keeps its real raw_files.
     resident = getattr(frames, "_in_memory", None)
-    frame_iter = resident.values() if resident is not None else frames
+    if resident is not None:
+        # Snapshot the resident map under its cache lock: the GUI thread stashes
+        # into ``_in_memory`` during a streaming flush, and iterating a live dict
+        # raises "dictionary changed size during iteration" on the writer thread.
+        lock = getattr(frames, "_cache_lock", None)
+        if lock is not None:
+            with lock:
+                frame_iter = list(resident.values())
+        else:
+            frame_iter = list(resident.values())
+    else:
+        frame_iter = frames
     out: list[str] = []
     seen: set[str] = set()
     for frame in frame_iter:

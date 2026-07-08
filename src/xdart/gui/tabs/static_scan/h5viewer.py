@@ -3026,7 +3026,17 @@ class H5Viewer(QWidget):
         # get_frames_int_2d / get_frames_map_raw — no shared accumulator
         # state to maintain here. Just figure out which frames still
         # need to be loaded from disk.
-        frame_ids = [i for i in read_idxs if i not in idxs_memory]
+        #
+        # PERF (faulthandler-confirmed root cause of the end-of-run Overlay
+        # freeze): ``idxs_memory`` is a LIST, so ``i not in idxs_memory`` was
+        # O(len) per element -> O(N^2) over ``read_idxs``.  The live Overlay path
+        # (_flush_pending_update -> _render_overlay_full_scan) reselects ALL N
+        # frames and calls this on EVERY flush, so at N~3400 it ran ~11.5M list-
+        # membership checks per flush == a recurring ~3 s main-thread stall (which
+        # also stole the GIL from the reduction threads -> the 125->180 s slowdown,
+        # and starved the display hand-off -> the tail gap).  A set makes it O(N).
+        _resident = set(idxs_memory)
+        frame_ids = [i for i in read_idxs if i not in _resident]
         browse_debug_log(
             logger,
             "resident_vs_missing",
