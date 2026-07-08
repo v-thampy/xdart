@@ -1855,9 +1855,13 @@ def test_integrated_compression_env_override(monkeypatch):
     from xdart.modules.ewald import nexus_writer as nw
     monkeypatch.delenv("XDART_INTEGRATED_COMPRESSION", raising=False)
     assert nw._resolve_integrated_compression() in ("lz4", "gzip")  # unset -> default
-    for off in ("none", "None", "OFF", "0", "false", "no", "", "  none  "):
+    for off in ("none", "None", "OFF", "0", "false", "no", "  none  "):
         monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", off)
         assert nw._resolve_integrated_compression() is None, off
+    # An EMPTY value is treated as UNSET -> default (not off): a stale empty
+    # `export XDART_INTEGRATED_COMPRESSION=` must never silently disable compression.
+    monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "")
+    assert nw._resolve_integrated_compression() in ("lz4", "gzip")
     monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "gzip")
     assert nw._resolve_integrated_compression() == "gzip"
     monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "blosc")     # unknown -> gzip
