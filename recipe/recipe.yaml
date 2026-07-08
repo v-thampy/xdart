@@ -15,8 +15,12 @@ schema_version: 1
 
 context:
   name: xrd-tools
-  # Keep in sync with pyproject [project].version; the publish-on-tag Action
-  # (.github/workflows/conda-publish.yml) verifies recipe==pyproject==tag.
+  # Tracks the PyPI version: the publish Action (conda-publish.yml) SYNCS this
+  # from pyproject [project].version before building, so you bump ONE place
+  # (pyproject) and both channels move together.  This literal is just the
+  # convenience value for a local `rattler-build build`; keep it == pyproject.
+  # (load_from_file would auto-read it, but that needs rattler-build
+  # --experimental, so we sync in CI instead.)
   version: "1.0.0"
   python_min: "3.11"
 

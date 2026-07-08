@@ -20,15 +20,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify version consistency (tag == pyproject == recipe)
+      - name: Sync recipe version from pyproject (single source of truth)
+        run: |
+          v=$(grep -m1 '^version' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          # Only the quoted context.version literal — NOT package.version's ${{ version }}.
+          sed -i -E "s/^  version: \"[^\"]*\"/  version: \"$v\"/" recipe/recipe.yaml
+          echo "recipe version synced from pyproject: $v"
+
+      - name: Verify tag matches pyproject
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           tag="${GITHUB_REF_NAME#v}"
           pyproject=$(grep -m1 '^version' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          recipe=$(grep -m1 '^  version:' recipe/recipe.yaml | sed -E 's/.*"([^"]+)".*/\1/')
-          echo "tag=$tag  pyproject=$pyproject  recipe=$recipe"
-          if [ "$tag" != "$pyproject" ] || [ "$tag" != "$recipe" ]; then
-            echo "::error::version mismatch — tag/pyproject/recipe must all agree"
+          echo "tag=$tag  pyproject=$pyproject"
+          if [ "$tag" != "$pyproject" ]; then
+            echo "::error::tag ($tag) does not match pyproject version ($pyproject)"
             exit 1
           fi
 
