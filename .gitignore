@@ -29,3 +29,6 @@ docs/design/
 docs/history/
 docs/legacy/
 docs/perf_baseline_*.md
+
+# rattler-build local output
+/output/
