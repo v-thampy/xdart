@@ -27,6 +27,22 @@ if (-not (Test-Path $Pixi)) {
 }
 
 # --- workspace manifest ----------------------------------------------------------
+# XDART_LOCAL_SOURCE=C:\path\to\checkout installs from a local tree (pre-release
+# testing / development) instead of PyPI -- mirrors install_xdart.sh.
+if ($env:XDART_LOCAL_SOURCE) {
+    $SrcPath = ($env:XDART_LOCAL_SOURCE -replace '\\', '/')   # TOML-safe path
+    $PypiDep = "xrd-tools = { path = `"$SrcPath`", extras = [$ExtrasToml] }"
+    $GuiFallback = ""
+    if ($ExtrasToml -match '"gui"') {
+        # Belt-and-suspenders: extras on a path dep are the least-exercised
+        # pixi/uv corner; list the gui stack explicitly (keep in sync with
+        # pyproject [gui]).  Harmless duplication -- same versions resolve.
+        $GuiFallback = "pyside6 = `">=6.5`"`npyqtgraph = `">=0.13.7`"`nqtawesome = `"*`"`nimagecodecs = `"*`"`nimageio = `"*`""
+    }
+} else {
+    $PypiDep = "xrd-tools = { version = `">=1,<2`", extras = [$ExtrasToml] }"
+    $GuiFallback = ""
+}
 @"
 [workspace]
 name = "xdart"
@@ -45,7 +61,8 @@ c-blosc2 = "*"
 lz4-c = "*"
 
 [pypi-dependencies]
-xrd-tools = { version = ">=1,<2", extras = [$ExtrasToml] }
+$PypiDep
+$GuiFallback
 "@ | Set-Content -Encoding UTF8 "$AppRoot\pixi.toml"
 
 Write-Host "==> Solving + installing (conda-forge stack + xrd-tools[gui], one solve)"
