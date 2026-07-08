@@ -461,7 +461,7 @@ retention that does not gate the release:
   18 MB uint16 frame to ~64 MB the instant it enters the pipeline (amplifies
   every in-flight/retained raw, incl. the MEM-1a window).  Fix: keep native
   dtype; let pyFAI upcast internally in the integrator.
-- **[14] O(N) `_data_snapshot` per-tick sweep — FIXED 2026-07-07 via O(NEW) TICK (fixed-unverified).**
+- **[14] O(N) `_data_snapshot` per-tick sweep — FIXED 2026-07-07 via O(NEW) TICK -- LIVE-VERIFIED 2026-07-08 (maintainer: "very smooth and all frames plotted; no beachball").**
   Once live auto-last grew the selection to the whole scan, `_data_snapshot` (~1.9s)
   + `_store_first_publication_items` (~0.6s) resolved+validated a publication for
   EVERY frame each tick → the end-of-run ~3s freeze (leg-timer confirmed: constant
