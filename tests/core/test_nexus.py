@@ -731,11 +731,27 @@ class TestResolveStackCompression:
         assert resolve_stack_compression(default=None) is None
 
     @pytest.mark.parametrize(
-        "val", ["none", "off", "0", "false", "no", "", "NONE", "  none  "]
+        "val", ["none", "off", "0", "false", "no", "NONE", "  none  "]
     )
     def test_falsey_values_disable_compression(self, monkeypatch, val):
         monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", val)
         assert resolve_stack_compression() is None
+
+    def test_empty_env_is_treated_as_unset_not_off(self, monkeypatch):
+        # A stale ``export XDART_INTEGRATED_COMPRESSION=`` must NOT silently
+        # disable compression: empty == unset -> default (lz4), not off.
+        monkeypatch.setattr(_nexus_io, "_native_filter_unsafe", lambda: False)
+        monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "")
+        assert resolve_stack_compression() == "lz4"
+
+    def test_explicit_env_disable_warns(self, monkeypatch, caplog):
+        # Opting into uncompressed output via the env var is loud (WARNING), so a
+        # ~4x-bigger-file surprise is visible in the log.
+        import logging
+        monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "none")
+        with caplog.at_level(logging.WARNING):
+            assert resolve_stack_compression() is None
+        assert any("DISABLED" in r.getMessage() for r in caplog.records)
 
     @pytest.mark.parametrize("val", ["gzip", "GZIP", "lzf", "  gzip  "])
     def test_gzip_and_lzf_alias_to_portable_gzip(self, monkeypatch, val):

@@ -921,7 +921,10 @@ def resolve_stack_compression(default: "str | None" = "lz4") -> "str | None":
     (read per call -- set it in the shell before launching xdart, or before a
     headless run).  Case-insensitive values:
 
-    * ``none`` / ``off`` / ``0`` / ``false`` / ``no`` / empty -> ``None`` (uncompressed)
+    * ``none`` / ``off`` / ``0`` / ``false`` / ``no`` -> ``None`` (uncompressed); when
+      it comes from the env var this WARNS (opting into ~4x larger files).  An EMPTY
+      value is treated as UNSET -> ``default`` (a stale empty export must not
+      silently disable compression).
     * ``lz4`` -> fast hdf5plugin LZ4+shuffle (THE DEFAULT): fast writes, gzip-class
       ratio; the reader needs hdf5plugin (a base dep of xrd-tools).  Falls back to
       gzip only when hdf5plugin is not importable.
@@ -934,11 +937,26 @@ def resolve_stack_compression(default: "str | None" = "lz4") -> "str | None":
     explicit ``compression=`` to the sink/writer bypass this entirely.
     """
     raw = os.environ.get("XDART_INTEGRATED_COMPRESSION")
+    # An empty value (e.g. a stale ``export XDART_INTEGRATED_COMPRESSION=``) means
+    # UNSET -> default, NOT uncompressed: a leftover empty export must never
+    # silently disable compression (~4x larger integrated .nxs -- observed live).
+    if raw is not None and raw.strip() == "":
+        raw = None
+    # An EXPLICIT disable from the env var is LOUD (WARNING): the user is opting
+    # into uncompressed output and should see it.  (A ``default=None`` from a
+    # headless caller is intentional and stays silent below.)
+    if raw is not None and raw.strip().lower() in (
+            "none", "off", "0", "false", "no"):
+        logger.warning(
+            "integrated-stack compression DISABLED via XDART_INTEGRATED_COMPRESSION"
+            "=%r -- integrated .nxs will be UNCOMPRESSED (~4x larger). Unset the "
+            "variable to restore the lz4 default.", raw)
+        return None
     val = raw if raw is not None else default
     if val is None:
         return None
     v = str(val).strip().lower()
-    if v in ("", "none", "off", "0", "false", "no"):
+    if v in ("none", "off", "0", "false", "no"):
         return None
     if v in ("gzip", "lzf"):
         return "gzip"
