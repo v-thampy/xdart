@@ -54,6 +54,7 @@ from .display_publication import (
     PublicationDisplayAdapter,
 )
 from .browse_debug import browse_debug_log, sequence_summary
+from .display_overlay_utils import frame_index_from_row_id
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,46 @@ def _candidate_labels(mode, selected_ids, all_frame_index):
         except TypeError:
             pass
     return tuple(selected_ids)
+
+
+def _accumulated_frame_indices(widget):
+    """Frame indices already in the live Waterfall accumulator (append-only)."""
+    history = getattr(widget, "_waterfall_history", None)
+    ids = getattr(history, "ids", None) if history is not None else None
+    if not ids:
+        return None
+    out = set()
+    for r in ids:
+        try:
+            out.add(frame_index_from_row_id(r))
+        except (TypeError, ValueError):
+            pass
+    return out or None
+
+
+def _live_overlay_render_labels(widget, labels):
+    """PERF-3 O(new) tick: during a LIVE Overlay/Waterfall run, resolve only the
+    NOT-yet-accumulated frames.  ``accumulate_waterfall`` is append-only and
+    already owns the other N rows, so re-resolving all N publications every tick
+    (the ~1.9 s ``_data_snapshot`` + ~0.6 s ``_store_first_publication_items``
+    sweep at N~3400 -- leg-timer confirmed) is pure waste and IS the end-of-run
+    freeze.  Full-selection resolution still happens at mode entry / reset (empty
+    accumulator -> full reseed) and at run end (the run-end catch-up owns
+    completion).  Overlay/Waterfall ONLY -- Sum/Average keep their full-selection
+    aggregation guards untouched, and no accumulator reset/append semantics
+    change, so the OV contract is preserved."""
+    if not getattr(widget, "_processing_active", False):
+        return labels
+    try:
+        method = widget.ui.plotMethod.currentText()
+    except Exception:
+        return labels
+    if method not in ("Overlay", "Waterfall"):
+        return labels
+    accumulated = _accumulated_frame_indices(widget)
+    if not accumulated:
+        return labels                      # mode entry / reset -> full reseed
+    return tuple(l for l in labels if _label_key(l) not in accumulated)
 
 
 class _FrameIndexCount:
@@ -424,6 +465,10 @@ class _BaseController:
         labels = _candidate_labels(mode, selected_ids, all_index)
         store = getattr(widget, "publication_store", None)
         method = widget.ui.plotMethod.currentText()
+        # PERF-3 O(new) tick: during a live Overlay/Waterfall run, resolve only
+        # the not-yet-accumulated frames (the accumulator owns the rest).  No-op
+        # off-Overlay / not-processing / empty-accumulator (mode entry, reset).
+        snapshot_labels = _live_overlay_render_labels(widget, labels)
         browse_anchor = (
             _browse_one_shot_anchor_label(widget, selected_ids)
             if (
@@ -433,7 +478,7 @@ class _BaseController:
             )
             else None
         )
-        two_d_labels = (browse_anchor,) if browse_anchor is not None else labels
+        two_d_labels = (browse_anchor,) if browse_anchor is not None else snapshot_labels
         aggregate_owns_2d = (
             mode is Mode.INT_2D
             and method in ("Sum", "Average")
@@ -444,7 +489,7 @@ class _BaseController:
         loaded_1d, loaded_2d, raw_avail = _data_snapshot(
             widget,
             mode=mode,
-            labels=labels,
+            labels=snapshot_labels,
             two_d_labels=two_d_labels,
             include_legacy=mode not in (Mode.INT_1D, Mode.INT_2D),
             request_2d_hydration=(
@@ -473,14 +518,21 @@ class _BaseController:
         )
         labels = tuple(dict.fromkeys(
             (*pending_overlay, *state.selected_ids, *state.render_ids)))
-        items = _store_first_publication_items(widget, labels)
+        # PERF-3 O(new): during a live Overlay/Waterfall run, resolve publications
+        # only for the not-yet-accumulated frames (pending appends survive the
+        # scope by construction -- they are not in the accumulator).  The
+        # accumulator already carries the other N rows; accumulate_waterfall
+        # merges the new payload in (append-only).
+        resolve_labels = _live_overlay_render_labels(widget, labels)
+        items = _store_first_publication_items(widget, resolve_labels)
         if items is not None:
             adapter = PublicationDisplayAdapter(
                 store=None, widget=widget, items=items)
         else:
             adapter = (
                 None if store is None
-                else PublicationDisplayAdapter(store, widget=widget, labels=labels)
+                else PublicationDisplayAdapter(
+                    store, widget=widget, labels=resolve_labels)
             )
         return build_payload(state, adapter)
 

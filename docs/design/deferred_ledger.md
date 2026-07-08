@@ -461,17 +461,26 @@ retention that does not gate the release:
   18 MB uint16 frame to ~64 MB the instant it enters the pipeline (amplifies
   every in-flight/retained raw, incl. the MEM-1a window).  Fix: keep native
   dtype; let pyFAI upcast internally in the integrator.
-- **[14] O(n²) `_data_snapshot` probes on "Overall" — FIXED 2026-07-07 (fixed-unverified).**
-  Once live auto-last grew the selection to the whole scan, `_data_snapshot` +
-  `_store_first_publication_items` rebuilt+validated a publication for EVERY frame
-  each tick → the end-of-run ~3s freeze (faulthandler-confirmed; GC ruled out).
-  Fix: read-path MEMOIZATION in `display_data._store_first_publication_for_display`
-  keyed by the backing record/publication IDENTITY (+ modes), so only NEW/changed
-  labels rebuild → O(k)/tick; generation re-stamped cheaply on a hit; cache dropped
-  on store-generation change (scan boundary/eviction).  Tests:
-  `tests/xdart/test_store_first_memo.py` (resolver-count O(k) + byte-equivalence).
-  Verify live: 3621 Overlay run — heartbeat max gap < ~300 ms, total time ~125-130s,
-  waterfall reaches N without Show All (or the catch-up fires with a logged reason).
+- **[14] O(N) `_data_snapshot` per-tick sweep — FIXED 2026-07-07 via O(NEW) TICK (fixed-unverified).**
+  Once live auto-last grew the selection to the whole scan, `_data_snapshot` (~1.9s)
+  + `_store_first_publication_items` (~0.6s) resolved+validated a publication for
+  EVERY frame each tick → the end-of-run ~3s freeze (leg-timer confirmed: constant
+  ~0.6+0.19 ms/label × N; faulthandler misled as a single hot spot; GC ruled out).
+  FIRST attempt (a read-path memoization, commit `9bcbc9c5`) was **prod-dead**:
+  `memo_hits=+0 memo_misses=+0` every tick — its identity lookup returned (None,None)
+  on the real widget so the memo path never activated (test-green/prod-dead; the
+  `_pub_memo_hits/misses` counters exposed it).  REAL FIX: make the live tick
+  **O(new)** — `_live_overlay_render_labels` scopes both legs to only the
+  not-yet-accumulated frames during a live Overlay/Waterfall run; the append-only
+  `accumulate_waterfall` already owns the rest.  Full reseed only at mode entry/
+  reset (empty accumulator) + run end (the catch-up owns completion).  Overlay/
+  Waterfall ONLY; Sum/Average keep full-selection guards.  Test:
+  `tests/xdart/test_o_new_tick.py` (live tick receives O(drain) not O(index) +
+  slice-mode 3-tuple decode + reseed/off-live cases).  FOLLOW-UP: the dead [14] memo
+  is now moot for the live path (harmless no-op) but is a standing hazard — root-cause
+  or remove; the memo counters make its liveness assertable.
+  Verify live: 3621 Overlay — heartbeat max < ~300 ms, `_data_snapshot labels` ≈
+  drain (~70) not 3400, total ~125-130s, waterfall reaches N live or via the catch-up.
 - **[15] PublicationStore tier-0 eviction ignores persist-before-evict** —
   `frame_publication.py` tier-0 `_max_items` pops `next(iter(_items))` with no
   persisted/heavy check, so past 512 live frames it can drop a not-yet-saved
