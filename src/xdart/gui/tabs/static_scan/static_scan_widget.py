@@ -4903,14 +4903,20 @@ class staticWidget(QWidget):
         """
         method = staticWidget._overlay_plot_method(self)
         viewer = getattr(self, "h5viewer", None)
+        # Log arm/skip at INFO (not just debug): the catch-up is a safety net, so
+        # a run-end must show whether it armed -- silence otherwise reads
+        # ambiguously as "not needed" vs "never ran".
         if not (getattr(viewer, "auto_last", False)
                 and method in ("Overlay", "Waterfall")):
+            logger.info(
+                "[PERF] run-end overlay catch-up: not armed (auto_last=%s mode=%s)",
+                getattr(viewer, "auto_last", None), method)
             self._runend_catchup_token = None
             return
         self._runend_catchup_token = getattr(self.scan, "name", None)
         self._runend_catchup_tries = 0
-        browse_debug_log(logger, "runend_overlay_catchup_armed",
-                         token=self._runend_catchup_token)
+        logger.info("[PERF] run-end overlay catch-up: armed (scan=%r)",
+                    self._runend_catchup_token)
         QtCore.QTimer.singleShot(
             250, lambda: staticWidget._runend_overlay_catchup(self))
 
