@@ -256,8 +256,7 @@ sink record + byte-compat gate), 6b schema-as-code starter, 6c API renames
 (list above), 6d single LiveScan→core adapter + single TwoDKind classifier
 (+ import-light `xrd_tools.core`), 6e cleanups + S8 + D1 + D6 + D5 + F1.
 
-Deferred (tracked in
-`docs/design/deferred_ledger.md`):
+Deferred to a later release:
 D2 thumbnail LRU + lazy-thumbnail reload (distinct from the landed
 publication-store hydration worker), F2 outside-project Save Path consent
 design, F3 ROI selection + per-scan ROI statistics (**likely first post-design

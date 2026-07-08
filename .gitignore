@@ -21,9 +21,11 @@ test.hdf5
 # for development, not part of the published repo.
 /CLAUDE.md
 /AGENTS.md
-docs/design/CC_*.md
-docs/design/deep_review_*.md
-docs/history/CC_monorepo_handoff.md
-docs/design/ui/
-docs/design/notes/
-docs/design/remediation_*.md
+# Internal design/planning/history notes — kept on disk for development, out of
+# the published tree going forward (retires the snapshot-publish recipe; handoff
+# design_install_and_update_jul2026 §5.1).  Public architecture lives in
+# docs/decisions/ (ADRs), docs/ARCHITECTURE.md, docs/core/schema_v2.md.
+docs/design/
+docs/history/
+docs/legacy/
+docs/perf_baseline_*.md
