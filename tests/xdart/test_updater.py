@@ -6,6 +6,7 @@ Spec: docs/design/design_install_and_update_jul2026.md section 4.
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
@@ -211,7 +212,12 @@ def test_update_check_runs_off_the_gui_thread():
 def test_helper_main_parses_args_and_runs(tmp_path, monkeypatch):
     # end-to-end arg parsing with the wait + update injected out.
     seen = {}
-    monkeypatch.setattr(helper, "wait_for_exit", lambda pid, **k: seen.setdefault("pid", pid))
+
+    def fake_wait(pid, **k):
+        seen["pid"] = pid
+        return True                                    # parent exited
+
+    monkeypatch.setattr(helper, "wait_for_exit", fake_wait)
     monkeypatch.setattr(helper, "run_update",
                         lambda uc, rc, lp, **k: seen.update(uc=uc, rc=rc, lp=lp))
     rc = helper.main([str(4321), str(tmp_path),
@@ -220,3 +226,32 @@ def test_helper_main_parses_args_and_runs(tmp_path, monkeypatch):
     assert rc == 0
     assert seen["pid"] == 4321
     assert seen["uc"] == ["pixi", "update"] and seen["rc"] == ["xdart"]
+
+
+def test_helper_main_aborts_update_if_parent_survives(tmp_path, monkeypatch):
+    # S1: if the app does NOT exit within the timeout, the helper must NOT update
+    # (its env files are in use) -- log + bail, leave the app running.
+    ran = {"update": False}
+    monkeypatch.setattr(helper, "wait_for_exit", lambda pid, **k: False)  # timed out
+    monkeypatch.setattr(helper, "run_update",
+                        lambda *a, **k: ran.__setitem__("update", True))
+    log = tmp_path / "u.log"
+    rc = helper.main([str(999999), str(tmp_path), "[]", "[]", str(log)])
+    assert rc == 1
+    assert ran["update"] is False                      # update was NOT run
+    assert "ABORTED" in log.read_text()
+
+
+def test_updater_helper_imports_no_qt():
+    # S2: `python -m xdart._updater` must pull ZERO Qt (importing it runs
+    # xdart/__init__ + the stdlib-only helper) -- otherwise the update locks
+    # .pyd/.dll on Windows.  Checked in a fresh subprocess (this process already
+    # has Qt loaded from other tests).
+    import subprocess
+    code = ("import sys, xdart._updater; "
+            "print([m for m in sys.modules "
+            "if 'PySide' in m or 'shiboken' in m or 'pyqtgraph' in m])")
+    out = subprocess.run([sys.executable, "-c", code],
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "[]", "helper pulled Qt: " + out.stdout

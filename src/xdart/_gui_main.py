@@ -275,20 +275,34 @@ class Main(QMainWindow):
                 self, "Check for Updates",
                 f"xdart is up to date (version {current}).")
             return
-        if getattr(self, "_update_kind", "managed") == "managed":
+        kind = getattr(self, "_update_kind", "managed")
+        meta = getattr(self, "_update_meta", None) or {}
+        # Update-on-exit is POSIX-only in v1.0: on Windows the env's .pyd/.dll are
+        # locked under a live app and the PID probe differs (B2), so Windows -- and
+        # any pip/conda-managed install on every platform -- gets a COPYABLE
+        # command instead of the in-app update-on-exit.
+        if kind == "managed" or sys.platform.startswith("win"):
+            cmd = (" ".join(str(c) for c in (meta.get("update_cmd") or []))
+                   or 'pip install -U "xrd-tools[gui]"')
             QtWidgets.QMessageBox.information(
                 self, "Update available",
                 f"xdart {latest} is available (you have {current}).\n\n"
-                "This install is managed by pip/conda — update it with:\n\n"
-                "    pip install -U \"xrd-tools[gui]\"\n\n"
-                "then restart xdart.")
+                f"Update it with:\n\n    {cmd}\n\nthen restart xdart.")
             return
         resp = QtWidgets.QMessageBox.question(
             self, "Update available",
             f"xdart {latest} is available (you have {current}).\n\n"
             "Update and restart now?")
-        if resp == QtWidgets.QMessageBox.StandardButton.Yes:
-            self._launch_updater_and_close()
+        if resp != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        # S3: a processing run may have started during the async PyPI fetch or
+        # while this dialog was open -- never rewrite the env under a live run.
+        if self._run_active():
+            QtWidgets.QMessageBox.information(
+                self, "Check for Updates",
+                "A processing run is now active — try again after it finishes.")
+            return
+        self._launch_updater_and_close()
 
     def _launch_updater_and_close(self):
         import json
@@ -307,7 +321,17 @@ class Main(QMainWindow):
                 "Could not launch the updater. Update manually with:\n\n"
                 f"    {' '.join(str(c) for c in update_cmd)}")
             return
-        self.close()
+        # B1: the check thread's run() may still be returning; wait for it so it is
+        # not destroyed mid-flight, then exit via the HARDENED teardown
+        # (Main.exit -> main_widget.close joins the reduction QThreads).  Bare
+        # self.close() skips that teardown and crashes on the running QThreads.
+        thread = getattr(self, "_update_thread", None)
+        if thread is not None:
+            try:
+                thread.wait(3000)
+            except Exception:
+                pass
+        self.exit()
 
     @staticmethod
     def _qsize_text(size):
