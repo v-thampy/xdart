@@ -61,9 +61,22 @@ works as a **deprecation shim** that re-exports the real `xrd_tools` modules
 
 ### Quick install — `pixi global` (recommended)
 
-If you have [pixi](https://pixi.sh), one command installs xdart, puts it on your
-PATH, and adds a Start-menu / Applications shortcut — with the whole fast
-conda-forge I/O stack:
+[pixi](https://pixi.sh) is a fast, self-contained package manager — no conda or
+Python needed first. **Install pixi once** ([more install options](https://pixi.sh/latest/)):
+
+```bash
+# macOS / Linux
+curl -fsSL https://pixi.sh/install.sh | sh
+```
+
+```powershell
+# Windows (PowerShell) — or: winget install prefix-dev.pixi
+powershell -ExecutionPolicy Bypass -c "irm -useb https://pixi.sh/install.ps1 | iex"
+```
+
+Open a new terminal so `~/.pixi/bin` is on your PATH, then **one command** installs
+xdart, puts it on your PATH, and adds a Start-menu / Applications shortcut — with
+the whole fast conda-forge I/O stack:
 
 ```bash
 pixi global install -c https://prefix.dev/xrd-tools -c conda-forge xrd-tools
@@ -105,17 +118,32 @@ powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/v-t
 - If `xdart` launches an old version, run `hash -r` (or open a new terminal) — the
   installer prints the specifics when it detects a shadowing install.
 
-### Using conda / mamba (existing setups)
+### Using conda / mamba
 
-Already working in conda/mamba? Install the same layering by hand — the conda-forge
-compiled I/O stack plus `xrd-tools` from PyPI:
+The classic path: a **fresh conda environment** with the conda-forge compiled I/O
+stack, plus `xrd-tools` from PyPI. No conda yet? Install one first (pick either):
+
+- **[Miniforge](https://github.com/conda-forge/miniforge)** — recommended;
+  conda-forge by default, smaller, ships `mamba`.
+- **[Miniconda](https://www.anaconda.com/download/success)** — Anaconda's minimal
+  distribution.
+
+On Windows, open the "Miniforge Prompt" / "Anaconda Prompt" the installer created;
+on macOS / Linux, open a regular terminal (the installer wires `conda`/`mamba` into
+your shell).
 
 ```bash
-conda install -c conda-forge h5py hdf5plugin fabio hdf5 blosc c-blosc2 lz4-c
+# 1. create + activate a fresh env (use `conda` in place of `mamba` if you prefer —
+#    mamba is just the faster solver)
+mamba create -n xrd python=3.12 -y
+mamba activate xrd
+
+# 2. the conda-forge fast I/O stack, then the xdart GUI from PyPI
+mamba install -c conda-forge h5py hdf5plugin fabio hdf5 blosc c-blosc2 lz4-c
 pip install "xrd-tools[gui]"
 ```
 
-then launch with `xdart`.
+then launch with `xdart`. (Already have an environment? Just run step 2 in it.)
 
 ### Using pip / uv
 
