@@ -59,16 +59,61 @@ works as a **deprecation shim** that re-exports the real `xrd_tools` modules
 
 ## Install
 
-Requires **Python ≥ 3.11**.
+### Quick install (recommended)
 
-**xdart (the GUI)** — the common install:
+Installs everything — Python, the fast HDF5/compression stack, and xdart — in one
+step, into its own folder, without touching any existing Python or conda setup.
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/v-thampy/xrd-tools/main/scripts/install_xdart.sh | bash
+```
+
+```powershell
+# Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/v-thampy/xrd-tools/main/scripts/install_xdart.ps1 | iex"
+```
+
+- **Needs nothing preinstalled** — no conda, no Python. It bootstraps a
+  self-contained [pixi](https://pixi.sh) workspace under `~/.local/share/xdart`
+  (`%LOCALAPPDATA%\xdart` on Windows) and never edits your shell config or an
+  existing conda install.
+- **Fast by construction** — it uses the conda-forge builds of the HDF5/compression
+  stack (the fastest Eiger bitshuffle/LZ4 decode) plus `xrd-tools[gui]` from PyPI,
+  resolved in one solve with a lockfile. This is the same layering the manual
+  conda steps below do — only assembled for you.
+- **Launch** with `xdart`. **Upgrade** by re-running the same line.
+- **Extras**: set `XDART_EXTRAS` before the command, e.g.
+  `XDART_EXTRAS="gui,fitting" curl -fsSL … | bash`.
+- If `xdart` launches an old version, run `hash -r` (or open a new terminal) — the
+  installer prints the specifics when it detects a shadowing install.
+
+### Using conda / mamba (existing setups)
+
+Already working in conda/mamba? Install the same layering by hand — the conda-forge
+compiled I/O stack plus `xrd-tools` from PyPI:
+
+```bash
+conda install -c conda-forge h5py hdf5plugin fabio hdf5 blosc c-blosc2 lz4-c
+pip install "xrd-tools[gui]"
+```
+
+then launch with `xdart`.
+
+### Using pip / uv
+
+Requires **Python ≥ 3.11**. `xrd-tools` is a normal PyPI package and installs
+anywhere:
 
 ```bash
 pip install "xrd-tools[gui]"          # the xdart GUI + reduction core
 uv tool install "xrd-tools[gui]"      # isolated GUI install
 ```
 
-then launch with `xdart`.
+then launch with `xdart`. Note the Eiger bitshuffle/LZ4 decode is measurably slower
+with the pure-pip HDF5 wheels than the conda-forge builds
+([see below](#performance-install-the-hdf5-stack-from-conda-forge)), and
+lz4-compressed outputs need `hdf5plugin` (a base dep) to read outside xrd-tools.
 
 **Headless core only** (no Qt anywhere, `import xrd_tools`):
 
@@ -86,6 +131,45 @@ pip install xrd-tools
 > Then install `xrd-tools` as above. See
 > [`MIGRATION.md`](https://github.com/v-thampy/xrd-tools/blob/main/MIGRATION.md)
 > for the full import-name migration.
+
+### Headless / notebooks with pixi
+
+For notebook analysis or batch scripts, a pixi workspace gives you the same fast
+stack **plus a lockfile** that makes the environment reproducible — a drop-in
+replacement for a per-project conda/mamba env. Existing conda envs keep working;
+this is an option, not a migration.
+
+```bash
+mkdir my-analysis && cd my-analysis
+pixi init
+pixi add python=3.13 h5py hdf5plugin fabio hdf5 blosc c-blosc2 lz4-c jupyterlab
+pixi add --pypi "xrd-tools[notebook,fitting]"
+pixi run jupyter lab
+```
+
+- The env lives in `./.pixi/` next to the notebooks; commit `pixi.toml` +
+  `pixi.lock` and anyone (including future-you) reproduces the exact env with one
+  `pixi install`.
+- Add `[rsm]` via conda where possible — `pixi add xrayutilities` (conda-forge)
+  avoids the missing macOS-arm64 PyPI wheels.
+- `pixi run python script.py` runs a headless batch script; `pixi shell` in the
+  workspace is the equivalent of `conda activate`.
+
+**Shared beamline environment (VS Code).** A pixi env is a normal prefix
+(`<workspace>/.pixi/envs/default/bin/python`), so the one-shared-env /
+many-user-directories pattern maps 1:1. Put **one** pixi workspace at a shared path
+(e.g. `/shared/xrd-env/` — its `pixi.toml`, `pixi.lock`, and `.pixi/`); users open
+their own notebook folders in VS Code and select that env's `bin/python` as the
+interpreter/kernel (VS Code auto-discovers pixi envs; "Enter interpreter path"
+always works). Register it by name once so it appears in every kernel picker:
+
+```bash
+cd /shared/xrd-env && pixi run python -m ipykernel install --prefix /usr/local \
+    --name xrd-tools --display-name "XRD Tools (shared)"
+```
+
+Admins update the shared env with `pixi update` in that directory; the lockfile
+rebuilds it identically on a new machine (`pixi install`).
 
 ### Extras
 
