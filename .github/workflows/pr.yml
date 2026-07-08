@@ -42,10 +42,18 @@ jobs:
         # failure (any other non-zero) still fails fast and is never masked.
         run: |
           for attempt in 1 2 3; do
-            pytest tests/xdart -q --timeout=600 && exit 0
+            pytest tests/xdart -q --timeout=600 --junitxml="xdart-attempt-$attempt.xml"
             code=$?
+            [ "$code" -eq 0 ] && exit 0
+            # A real test failure/error must fail fast even when the process ALSO
+            # segfaults on teardown (exit 139 masks pytest's exit 1). Trust the
+            # JUnit report, not just the exit code.
+            if grep -qE '(failures|errors)="[1-9][0-9]*"' "xdart-attempt-$attempt.xml" 2>/dev/null; then
+              echo "::error::pytest tests/xdart reported real failures (not a segfault flake)"
+              exit 1
+            fi
             if [ "$code" -ne 139 ]; then exit "$code"; fi
-            echo "::warning::pytest tests/xdart segfaulted (139) on attempt $attempt; retrying"
+            echo "::warning::pytest tests/xdart segfaulted (139), no reported failures, on attempt $attempt; retrying"
           done
           exit 139
 
