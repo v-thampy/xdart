@@ -4958,15 +4958,24 @@ class staticWidget(QWidget):
         viewer = getattr(self, "h5viewer", None)
         method = staticWidget._overlay_plot_method(self)
         # Guard 1 — cancellation (robust; NOT generation-gated, see arm docstring).
+        # Abort reasons are logged at INFO (not debug): a run-end no-fire should be
+        # visible in the log you're already reading, not hidden behind a flag.
         if (viewer is None
                 or not getattr(viewer, "auto_last", False)
                 or self._runend_catchup_token != getattr(self.scan, "name", None)
                 or method not in ("Overlay", "Waterfall")):
+            reason = (
+                "no-viewer" if viewer is None
+                else "auto_last-off (user clicked a frame)"
+                if not getattr(viewer, "auto_last", False)
+                else "scan-changed"
+                if self._runend_catchup_token != getattr(self.scan, "name", None)
+                else "mode=%s" % method)
+            logger.info("[PERF] run-end overlay catch-up: aborted (%s)", reason)
             self._runend_catchup_token = None
             return
         # Guard 2 — quiescence: re-arm (bounded ~2 s) until the debounce cascade
-        # and any load worker settle, then give up silently (degrades to the
-        # user's manual Show All).
+        # and any load worker settle, then give up (degrades to manual Show All).
         if staticWidget._runend_catchup_busy(self):
             self._runend_catchup_tries = getattr(self, "_runend_catchup_tries", 0) + 1
             if self._runend_catchup_tries <= 8:
@@ -4974,11 +4983,13 @@ class staticWidget(QWidget):
                     250, lambda: staticWidget._runend_overlay_catchup(self))
             else:
                 self._runend_catchup_token = None
-                browse_debug_log(logger, "runend_overlay_catchup_giveup")
+                logger.info("[PERF] run-end overlay catch-up: gave up after 8 tries "
+                            "(GUI never quiesced); use Show All")
             return
         # Guard 3 — missing set.  Empty -> already complete -> idempotent no-op.
         missing = staticWidget._runend_overlay_missing_ids(self)
         if not missing:
+            logger.info("[PERF] run-end overlay catch-up: already complete, no-op")
             self._runend_catchup_token = None
             return
         # Guard 4 — fire once.  The click path (show_all) does the rest: select

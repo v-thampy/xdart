@@ -461,10 +461,17 @@ retention that does not gate the release:
   18 MB uint16 frame to ~64 MB the instant it enters the pipeline (amplifies
   every in-flight/retained raw, incl. the MEM-1a window).  Fix: keep native
   dtype; let pyFAI upcast internally in the integrator.
-- **[14] O(n²) `_data_snapshot` probes on "Overall"** — once live auto-last
-  grows the selection to the whole scan, `display_controllers._data_snapshot`
-  probes the store for EVERY frame each tick → O(n) probes × n ticks.  CPU/
-  latency, worsens late-scan; not OOM.
+- **[14] O(n²) `_data_snapshot` probes on "Overall" — FIXED 2026-07-07 (fixed-unverified).**
+  Once live auto-last grew the selection to the whole scan, `_data_snapshot` +
+  `_store_first_publication_items` rebuilt+validated a publication for EVERY frame
+  each tick → the end-of-run ~3s freeze (faulthandler-confirmed; GC ruled out).
+  Fix: read-path MEMOIZATION in `display_data._store_first_publication_for_display`
+  keyed by the backing record/publication IDENTITY (+ modes), so only NEW/changed
+  labels rebuild → O(k)/tick; generation re-stamped cheaply on a hit; cache dropped
+  on store-generation change (scan boundary/eviction).  Tests:
+  `tests/xdart/test_store_first_memo.py` (resolver-count O(k) + byte-equivalence).
+  Verify live: 3621 Overlay run — heartbeat max gap < ~300 ms, total time ~125-130s,
+  waterfall reaches N without Show All (or the catch-up fires with a logged reason).
 - **[15] PublicationStore tier-0 eviction ignores persist-before-evict** —
   `frame_publication.py` tier-0 `_max_items` pops `next(iter(_items))` with no
   persisted/heavy check, so past 512 live frames it can drop a not-yet-saved
@@ -553,7 +560,9 @@ structural analysis: F-A..F-F fragilities, F1-F4 unit-flip regression fixes, V1-
 It was ADVERSARIALLY VERIFIED against the code this pass (5-agent workflow); apply the corrected
 forms below, NOT the doc's literal wording:
 
-### PERF (confirmed, faulthandler) — end-of-run recurring ~3s GUI freeze on a long Overlay run
+### PERF (confirmed, faulthandler) — end-of-run recurring ~3s GUI freeze — FIXED 2026-07-07 (see [14] above)
+FIXED via the `_store_first_publication_for_display` memoization (fixed-unverified; resolver-count +
+byte-equivalence tests). Original diagnosis retained below.
 Root cause is the DEFERRED **MEM-1 finding [14]**: `display_controllers._data_snapshot` (~:223) and
 `_store_first_publication_items` (~:296) loop over EVERY selected label and call `resolve_frame_data`
 -> build+validate a publication per frame (numpy `isclose` in `validate_publication` + `frame_view`

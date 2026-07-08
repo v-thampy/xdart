@@ -36,6 +36,10 @@ from xrd_tools.core import (
 
 logger = logging.getLogger(__name__)
 
+# Sentinel for the MEM-1[14] store-first publication memo generation tracking
+# (distinct from any real store generation, incl. None).
+_STORE_FIRST_UNSET = object()
+
 _BULK_1D_READ_CHUNK = 256
 
 
@@ -369,10 +373,84 @@ class DisplayDataMixin:
         lookup = getattr(self, "store_first_frame_view", None)
         if lookup is None:
             return None
+        # MEM-1[14]: the live render resolves EVERY selected label per tick
+        # (display_controllers._data_snapshot + _store_first_publication_items).
+        # On an auto-last Overlay run the selection is the whole scan, so this
+        # rebuilds O(N) publications (view projection + validate) per tick -- the
+        # end-of-run ~3s main-thread freeze.  Memoize the build keyed by the
+        # backing store record/publication IDENTITY (held by reference so an
+        # id() can't be reused; changes only when a frame is re-published or
+        # hydrated) plus the active projection modes, so only NEW/changed labels
+        # rebuild -> O(k) per tick.  The generation stamp is re-applied cheaply on
+        # a hit (replace() does not re-validate).  Blocking reads (user gestures)
+        # bypass the cache and always resolve fresh.  The cache is dropped whenever
+        # the store generation changes (scan boundary / eviction).
+        if not allow_blocking_read and callable(
+                getattr(self, "_store_first_cache_ident", None)):
+            rec, pub, m1, m2 = self._store_first_cache_ident(idx)
+            if rec is not None or pub is not None:
+                cache = self._store_first_pub_cache()
+                key = self._coerce_frame_label(idx)
+                hit = cache.get(key)
+                if (hit is not None and hit[0] is rec and hit[1] is pub
+                        and hit[2] == m1 and hit[3] == m2):
+                    built = hit[4]
+                    gen = int(getattr(self, "display_generation", 0) or 0)
+                    if getattr(built, "generation", None) != gen:
+                        built = replace(built, generation=gen)
+                    return built
+                view = lookup(idx, allow_blocking_read=False)
+                if view is None:
+                    return None
+                built = self._display_publication_from_view(idx, view)
+                if built is not None:
+                    cache[key] = (rec, pub, m1, m2, built)
+                return built
         view = lookup(idx, allow_blocking_read=bool(allow_blocking_read))
         if view is None:
             return None
         return self._display_publication_from_view(idx, view)
+
+    def _store_first_pub_cache(self) -> dict:
+        """Per-label memo for :meth:`_store_first_publication_for_display`
+        (MEM-1[14]).  Reset whenever the publication store's generation changes
+        (scan boundary / eviction) so stale cross-epoch entries can't survive."""
+        store = getattr(self, "publication_store", None)
+        gen = getattr(store, "generation", None) if store is not None else None
+        if getattr(self, "_store_first_pub_cache_gen", _STORE_FIRST_UNSET) != gen:
+            self._store_first_pub_cache_d = {}
+            self._store_first_pub_cache_gen = gen
+        return self._store_first_pub_cache_d
+
+    def _store_first_cache_ident(self, idx):
+        """Cheap per-label invalidation identities: the backing FrameRecord and
+        FramePublication objects (compared by identity) + the active projection
+        modes.  Returns ``(None, None, m1, m2)`` when the frame is absent."""
+        try:
+            key = self._coerce_frame_label(idx)
+        except Exception:
+            return None, None, None, None
+        rec = None
+        rec_store_fn = getattr(self, "_active_frame_record_store", None)
+        if callable(rec_store_fn):
+            try:
+                s = rec_store_fn()
+                rec = s.get(key) if s is not None else None
+            except Exception:
+                rec = None
+        pub = None
+        pstore = getattr(self, "publication_store", None)
+        if pstore is not None:
+            try:
+                pub = pstore.get(key)
+            except Exception:
+                pub = None
+        modes_fn = getattr(self, "_active_frame_record_modes", None)
+        try:
+            m1, m2 = modes_fn(None, None) if callable(modes_fn) else (None, None)
+        except Exception:
+            m1, m2 = None, None
+        return rec, pub, m1, m2
 
     def _snapshot_data(self, idxs, *, allow_blocking_read=None):
         """Return a small {idx: (frame_1d, frame_2d_dict)} dict for
