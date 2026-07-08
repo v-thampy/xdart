@@ -568,10 +568,14 @@ class Main(QMainWindow):
         finally:
             self.close()
             gc.collect()
-            try:
-                os.killpg(os.getpid(), signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+            # os.killpg is POSIX-only; on Windows it raises AttributeError, which
+            # would escape and skip sys.exit(0) (matters now that exit() is also
+            # the in-app updater's teardown path).
+            if hasattr(os, "killpg"):
+                try:
+                    os.killpg(os.getpid(), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
             sys.exit(0)
 
     def openFile(self):

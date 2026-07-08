@@ -6782,6 +6782,14 @@ class staticWidget(QWidget):
             # finished scan and its .nxs now exists, so the highlight follows to
             # the newly-processed scan.  update_scans blocks signals, so this
             # re-select does not re-trigger a load.
+            # Point scan_name at the finished/displayed scan first: in
+            # append/directory mode it was not re-pointed per sub-scan, so the
+            # LAST scan's frames showed but its Scans row stayed unselected.
+            # (Replace already has scan_name == this, so it is a no-op there.)
+            try:
+                self.h5viewer.scan_name = self.scan.name
+            except Exception:
+                logger.debug("run-end scan_name follow skipped", exc_info=True)
             self.h5viewer.update_scans()
 
         # The scan-matches branch delegates to integrator_thread_finished() to
