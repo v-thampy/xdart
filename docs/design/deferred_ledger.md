@@ -545,3 +545,50 @@ Created ONLY under the env flag → zero production behavior change. Test:
 `tests/xdart/test_gui_modes_end_to_end.py::test_perf_heartbeat_records_event_loop_stall` (drives the
 real widget methods with an injected 1 s stall, asserts it's recorded + logged). Complements the
 faulthandler stack capture — the heartbeat says WHEN and for how long; faulthandler says WHERE.
+
+## GUI display robustness + end-of-run PERF root cause (2026-07-07)
+
+Companion design doc: **`design_gui_display_robustness_jul2026.md`** (the OV/display-family
+structural analysis: F-A..F-F fragilities, F1-F4 unit-flip regression fixes, V1-V6 v1.1 redesign).
+It was ADVERSARIALLY VERIFIED against the code this pass (5-agent workflow); apply the corrected
+forms below, NOT the doc's literal wording:
+
+### PERF (confirmed, faulthandler) — end-of-run recurring ~3s GUI freeze on a long Overlay run
+Root cause is the DEFERRED **MEM-1 finding [14]**: `display_controllers._data_snapshot` (~:223) and
+`_store_first_publication_items` (~:296) loop over EVERY selected label and call `resolve_frame_data`
+-> build+validate a publication per frame (numpy `isclose` in `validate_publication` + `frame_view`
+dataclass construction). Under auto-last Overlay the selection is the whole scan, so at N~3400 this
+rebuilds thousands of publications PER render tick == the recurring ~2.8-3.2s main-thread stalls in
+the last ~15s (heartbeat: max 3-6s). GC is RULED OUT (probe: gen-2 = 58-103ms). The `f5a8768f`
+O(N^2) set-membership fix trimmed a sibling path (flush render 35->4ms) but not this. v1.x fix
+direction: cache resolved publications by (label, generation) / resolve only NEW frames for the live
+Overlay payload (the accumulator already holds the rest) — INCREMENTAL, not full re-resolve per tick.
+Needs care (display pipeline; the OV family burned this project 12x/5wk) + an outcome test.
+
+### F1-F4 unit-flip regression — VERIFIED verdict (apply the CORRECTED forms, not the doc text)
+- **F1 (keystone, apply-now, widget-scoped variant only):** the doc's literal "consult run wavelength
+  before the `_run_writing` early-return" is a NO-OP — that consult already exists
+  (display_data.py ~1319-1327, reads `scan._persisted_wavelength_m`). The real fix is a run-START
+  STAMP of a REAL wavelength: widget `_run_wavelength_m` set in `set_processing_active(True)` from the
+  PONI/first-frame integrator via `normalize_wavelength_m` WITHOUT `allow_default_sentinel` (reject the
+  1e-10 placeholder), cleared on `active=False`, consulted as source #2.5 AFTER the frame integrator.
+  Do NOT use the `scan._persisted_wavelength_m` stamp variant (read by nexus_writer.py:1755 -> written
+  to disk mid-run: real blast radius). Note ship-delta: the 2D cake radial axis now converts where it
+  showed raw Q (intended).
+- **F4 (apply-now, mirror-ONLY):** set `_last_plot_unit` in the share-axis `was_checked` branch
+  (~:2667). OMIT the doc's follow-up render — `_in_update` does NOT drop a `singleShot(0, update)`
+  (runs post-unwind), so an unconditional follow-up is an INFINITE 0-ms cascade (soft freeze).
+- **F3 (apply-with-care, after F1):** stash `ImagePayload.axis_x` (the rendered cake axis) + skip the
+  Share-Axis align when rendered cake unit != 1D rendered unit (low risk). Part (b) rekeying
+  `_current_image_axis_key` off the stash is MED risk (feeds the gate every render; MUST fall back to
+  combo on GI + no-cake bootstrap) — its own gated step.
+- **F2 (HOLD):** site attribution wrong (the DL:718-722 gate is inert; the real clamp is
+  `append_row` ~:1138), and the load-bearing append_row unit-skip carries the OV-contract trap
+  (compare to the BATCH first-row `axis.unit` via `_canonical_axis_unit`, never history/accumulator
+  unit, or a clean Q<->2θ flip skips every row and freezes the overlay). Graduate only after F1 +
+  the shared offscreen outcome test + a clean-flip-count-constant assertion.
+
+Shared offscreen test (all four): interleave frame-backed (`raw_ref`+wavelength) and hydrated
+(`raw_ref=None`) publications in one `_run_writing=True` batch, flip `imageUnit` mid-stream; assert
+`history.x` strictly monotonic + single-unit, every row `np.ptp>0`; sentinel-only -> cache stays empty.
+Keep `test_bl6_overlay_xgrid.py` green.
