@@ -720,8 +720,20 @@ class H5Viewer(QWidget):
         self.paramButton.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         self.paramButton.setMenu(self.paramMenu)
 
+        # Help menu — a top-level group next to Config.  Left empty here; the main
+        # window fills it (Check for Updates…, and help-doc links later), the same
+        # way it populates the Config (paramMenu) group.
+        self.helpMenu = QtWidgets.QMenu()
+        self.helpMenu.setTitle('Help')
+        self.helpButton = QtWidgets.QToolButton()
+        self.helpButton.setObjectName('helpMenuButton')
+        self.helpButton.setText('Help')
+        self.helpButton.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self.helpButton.setMenu(self.helpMenu)
+
         self.toolbar.addWidget(self.fileButton)
         self.toolbar.addWidget(self.paramButton)
+        self.toolbar.addWidget(self.helpButton)
 
         # DATA BROWSER header row, sitting just BELOW the File/Config toolbar: a
         # section title on the left, Refresh on the right.  Stacked with the

@@ -65,6 +65,7 @@ gui = [
     "qtawesome",
     "imagecodecs",
     "imageio",
+    "packaging",         # Help → Check for Updates… version comparison (updater.py)
 ]
 notebook = ["ipywidgets", "anywidget", "ipyfilechooser", "ipykernel", "ipympl", "jupyterlab"]
 all = ["xrd-tools[fitting,rsm,gui,notebook]"]

@@ -37,7 +37,7 @@ if ($env:XDART_LOCAL_SOURCE) {
         # Belt-and-suspenders: extras on a path dep are the least-exercised
         # pixi/uv corner; list the gui stack explicitly (keep in sync with
         # pyproject [gui]).  Harmless duplication -- same versions resolve.
-        $GuiFallback = "pyside6 = `">=6.5`"`npyqtgraph = `">=0.13.7`"`nqtawesome = `"*`"`nimagecodecs = `"*`"`nimageio = `"*`""
+        $GuiFallback = "pyside6 = `">=6.5`"`npyqtgraph = `">=0.13.7`"`nqtawesome = `"*`"`nimagecodecs = `"*`"`nimageio = `"*`"`npackaging = `"*`""
     }
 } else {
     $PypiDep = "xrd-tools = { version = `">=1,<2`", extras = [$ExtrasToml] }"

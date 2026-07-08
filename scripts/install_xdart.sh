@@ -53,7 +53,7 @@ if [ -n "${XDART_LOCAL_SOURCE:-}" ]; then
     # duplication is harmless — same versions resolve).  Keep in sync with
     # pyproject [gui].
     case ",${XDART_EXTRAS:-gui}," in *,gui,*)
-        GUI_FALLBACK=$'pyside6 = ">=6.5"\npyqtgraph = ">=0.13.7"\nqtawesome = "*"\nimagecodecs = "*"\nimageio = "*"' ;;
+        GUI_FALLBACK=$'pyside6 = ">=6.5"\npyqtgraph = ">=0.13.7"\nqtawesome = "*"\nimagecodecs = "*"\nimageio = "*"\npackaging = "*"' ;;
     esac
 else
     PYPI_DEP="xrd-tools = { version = \">=1,<2\", extras = [$EXTRAS_TOML] }"
