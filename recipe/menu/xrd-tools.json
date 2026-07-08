@@ -8,11 +8,12 @@
       "command": ["{{ PYTHON }}", "-m", "xdart.xdart_main"],
       "activate": true,
       "platforms": {
-        "linux": {},
-        "osx": {},
+        "linux": {"icon": "{{ MENU_DIR }}/xdart.png"},
+        "osx": {"icon": "{{ MENU_DIR }}/xdart.icns"},
         "win": {
           "command": ["{{ PYTHONW }}", "-m", "xdart.xdart_main"],
-          "desktop": true
+          "desktop": true,
+          "icon": "{{ MENU_DIR }}/xdart.ico"
         }
       }
     }

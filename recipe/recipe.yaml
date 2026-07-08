@@ -48,6 +48,9 @@ build:
     # shell copy is fine and the JSON is consumed per-platform at install.)
     - mkdir -p "${PREFIX}/Menu"
     - cp "${RECIPE_DIR}/menu/xrd-tools.json" "${PREFIX}/Menu/xrd-tools.json"
+    - cp "${RECIPE_DIR}/menu/xdart.png"  "${PREFIX}/Menu/xdart.png"   # linux
+    - cp "${RECIPE_DIR}/menu/xdart.icns" "${PREFIX}/Menu/xdart.icns"  # macOS
+    - cp "${RECIPE_DIR}/menu/xdart.ico"  "${PREFIX}/Menu/xdart.ico"   # windows
   python:
     entry_points:
       - xdart = xdart.xdart_main:main
