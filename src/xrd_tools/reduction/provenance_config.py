@@ -11,12 +11,23 @@ from collections.abc import Mapping
 from typing import Any
 
 
-def build_reduction_config(scan_or_plan: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+def build_reduction_config(
+    scan_or_plan: Any, *, include_inputs: bool = True
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return ``(config, inputs)`` for ``write_provenance``.
 
     ``scan_or_plan`` may be a GUI-style scan with ``bai_1d_args`` /
     ``bai_2d_args``, a headless ``ReductionPlan``, a ``(scan, plan)`` tuple, or
     an object exposing ``scan``/``plan`` attributes.
+
+    ``include_inputs`` gates the (potentially expensive) raw-input enumeration.
+    ``_inputs_from_scan`` may walk the ENTIRE frame series to collect source
+    paths, and for a GUI ``LiveFrameSeries`` each non-resident frame triggers a
+    disk read under ``file_lock`` (``__getitem__``) -- ruinous on the GUI thread
+    while a live run holds that same lock.  Callers that only need the
+    integration ``config`` (e.g. the display-provenance snapshot, which discards
+    ``inputs``) pass ``include_inputs=False`` to skip the walk; the authoritative
+    provenance writers (nexus writer, headless core) keep the default.
     """
 
     scan, plan = _split_scan_plan(scan_or_plan)
@@ -53,7 +64,7 @@ def build_reduction_config(scan_or_plan: Any) -> tuple[dict[str, Any], dict[str,
         if geom is not None:
             config["geometry"] = _geometry_config(geom)
 
-    return config, _inputs_from_scan(scan)
+    return config, (_inputs_from_scan(scan) if include_inputs else {})
 
 
 def _split_scan_plan(value: Any) -> tuple[Any | None, Any | None]:

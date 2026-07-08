@@ -1240,7 +1240,15 @@ class staticWidget(QWidget):
             from xrd_tools.reduction.provenance_config import (
                 build_reduction_config,
             )
-            config, _inputs = build_reduction_config(scan)
+            # Display provenance needs only the integration ``config``; the
+            # ``inputs`` (raw_files/meta_file) are discarded below.  Computing
+            # them walks the ENTIRE frame series with a per-frame disk read under
+            # ``file_lock`` (frame_series.__getitem__), which on the GUI thread
+            # freezes the UI for the whole run when a large scan is loaded --
+            # every non-resident frame contends with the live reduction pipeline
+            # for the same lock.  The authoritative raw_files provenance is still
+            # written by the nexus writer / headless core on background threads.
+            config, _inputs = build_reduction_config(scan, include_inputs=False)
         except Exception:
             config = {
                 "bai_1d_args": copy.deepcopy(

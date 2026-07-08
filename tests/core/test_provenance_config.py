@@ -129,6 +129,45 @@ def test_headless_nexus_sink_writes_reduction_provenance(
     assert provenance["inputs"]["raw_files"] == [str(raw0), str(raw1)]
 
 
+class _ExplodingFrames:
+    """Frame series that raises if anything iterates it.
+
+    Mirrors the GUI ``LiveFrameSeries`` failure mode: walking it triggers a
+    per-frame disk read under ``file_lock``.  Used here as an observable
+    sentinel to prove whether ``build_reduction_config`` touches the series.
+    """
+
+    def __iter__(self):
+        raise RuntimeError(
+            "frame series walked for raw-input enumeration on the display path"
+        )
+
+
+def test_display_snapshot_skips_frame_walk() -> None:
+    # A scan with no cheap raw_files / metadata source: the ONLY way to build
+    # ``inputs`` is to walk ``frames`` -- which is exactly the GUI-thread freeze
+    # (frame_series.__getitem__ disk-read under file_lock, once per frame).
+    scan = SimpleNamespace(
+        bai_1d_args={"numpoints": 3000, "unit": "q_A^-1"},
+        bai_2d_args={"npt_rad": 500},
+        gi=False,
+        frames=_ExplodingFrames(),
+    )
+
+    # The display-provenance path (include_inputs=False) must NOT touch frames.
+    config, inputs = build_reduction_config(scan, include_inputs=False)
+    assert inputs == {}
+    assert config["bai_1d_args"] == {"numpoints": 3000, "unit": "q_A^-1"}
+    assert config["bai_2d_args"] == {"npt_rad": 500}
+
+    # Guard: the default (authoritative) path DOES walk the series, so the skip
+    # above is a real avoidance of the disk-walk, not a vacuous no-op.
+    import pytest
+
+    with pytest.raises(RuntimeError):
+        build_reduction_config(scan)
+
+
 def test_build_reduction_config_import_is_qt_xdart_pure() -> None:
     root = os.fspath(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
     src = os.path.join(root, "src")
