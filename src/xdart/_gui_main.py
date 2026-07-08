@@ -267,8 +267,10 @@ class Main(QMainWindow):
         from xdart.modules import updater
         current = updater.current_version()
         if latest is None:
+            # None = network failure OR PyPI has no such release yet (404).
             self.statusBar().showMessage(
-                "Could not check for updates (offline?).", 6000)
+                "Could not check for updates (offline, or no release published "
+                "on PyPI yet).", 8000)
             return
         if not updater.update_available(current, latest):
             QtWidgets.QMessageBox.information(

@@ -362,10 +362,11 @@ QToolButton:hover {
 QToolButton:pressed, QToolButton:checked {
     background-color: $field_border;
 }
-/* File / Config open their menu on click (InstantPopup) — the oversized
+/* File / Config / Help open their menu on click (InstantPopup) — the oversized
    down-arrow menu-indicator is redundant noise, so drop it entirely. */
 QToolButton#fileMenuButton::menu-indicator,
-QToolButton#configMenuButton::menu-indicator {
+QToolButton#configMenuButton::menu-indicator,
+QToolButton#helpMenuButton::menu-indicator {
     image: none;
     width: 0px;
 }
