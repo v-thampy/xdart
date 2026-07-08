@@ -10,6 +10,8 @@ import gc
 import os
 import signal
 import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 import faulthandler
 faulthandler.enable()  # Print Python traceback on bus error / segfault
 if hasattr(signal, "SIGUSR1"):
@@ -43,6 +45,60 @@ logging.getLogger('pyFAI.gui.matplotlib').setLevel(logging.ERROR)
 # Suppress silx's "pyOpenCL has been imported but can't be used here"
 # warning — OpenCL is optional and the message has no user action.
 logging.getLogger('silx.opencl').setLevel(logging.ERROR)
+
+
+def _resolve_log_file():
+    """Discoverable, platform-appropriate path for the rotating log file.
+
+    Overridable with ``XDART_LOG_FILE`` (full path) or ``XDART_LOG_DIR`` (dir).
+    Defaults follow each OS's convention so the file is easy to find and tail:
+    macOS ``~/Library/Logs/xdart``, Windows ``%LOCALAPPDATA%\\xdart\\Logs``,
+    Linux ``$XDG_STATE_HOME/xdart`` (else ``~/.local/state/xdart``).
+    """
+    override = os.environ.get('XDART_LOG_FILE')
+    if override:
+        return Path(override).expanduser()
+    base = os.environ.get('XDART_LOG_DIR')
+    if base:
+        d = Path(base).expanduser()
+    elif sys.platform == 'darwin':
+        d = Path.home() / 'Library' / 'Logs' / 'xdart'
+    elif os.name == 'nt':
+        d = Path(os.environ.get('LOCALAPPDATA') or Path.home()) / 'xdart' / 'Logs'
+    else:
+        d = Path(os.environ.get('XDG_STATE_HOME')
+                 or (Path.home() / '.local' / 'state')) / 'xdart'
+    return d / 'xdart.log'
+
+
+#: Absolute path of the active rotating log file, set by
+#: :func:`_install_file_log_handler` (None if it could not be created).  The
+#: Help ▸ Open Log Location action and the startup banner read this.
+LOG_FILE_PATH = None
+
+
+def _install_file_log_handler():
+    """Route root logging to a rotating file so output survives a windowless
+    launch (``pixi global`` / the menuinst shortcut have no attached terminal,
+    so the stderr StreamHandler goes nowhere).  Best-effort: any failure here
+    must never stop the GUI from starting."""
+    global LOG_FILE_PATH
+    if LOG_FILE_PATH is not None:                 # idempotent
+        return LOG_FILE_PATH
+    try:
+        path = _resolve_log_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8')
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter(
+            '%(asctime)s %(levelname)s %(name)s: %(message)s'))
+        logging.getLogger().addHandler(handler)
+        LOG_FILE_PATH = path
+    except Exception:
+        logging.getLogger(__name__).warning(
+            'could not open a log file for writing', exc_info=True)
+    return LOG_FILE_PATH
 
 # pyqtgraph's log-axis tick painter computes 10**range while the histogram
 # axis still holds the previous LINEAR image's extent for one paint after a
@@ -229,8 +285,34 @@ class Main(QMainWindow):
             update_action = QtGui.QAction("Check for Updates…", self)
             update_action.triggered.connect(self._check_for_updates)
             help_menu.addAction(update_action)
+            log_action = QtGui.QAction("Open Log Location", self)
+            log_action.triggered.connect(self._open_log_location)
+            help_menu.addAction(log_action)
         except Exception:
             logger.exception("Could not set up the Help menu")
+
+    def _open_log_location(self):
+        """Help ▸ Open Log Location — reveal the rotating log file in the OS file
+        manager (macOS Finder / Windows Explorer / Linux folder), falling back to
+        a dialog that shows the path so it is always copyable + tail-able."""
+        import subprocess
+        path = LOG_FILE_PATH
+        if path is None or not os.path.exists(path):
+            QtWidgets.QMessageBox.information(
+                self, "Log Location",
+                "No log file has been created yet." if path is None
+                else "Log file (not written yet):\n%s" % path)
+            return
+        try:
+            p = str(path)
+            if sys.platform == "darwin":
+                subprocess.run(["open", "-R", p], check=False)
+            elif os.name == "nt":
+                subprocess.run(["explorer", "/select,", p], check=False)
+            else:
+                subprocess.run(["xdg-open", str(path.parent)], check=False)
+        except Exception:
+            QtWidgets.QMessageBox.information(self, "Log Location", str(path))
 
     # ── In-app updater (Help → Check for Updates…) — spec section 4 ───────────
     def _run_active(self):
@@ -654,6 +736,13 @@ def run():
     # never as an import-time side effect (importing this module must not hijack
     # the process-global sys.excepthook for tests / headless / embedding hosts).
     sys.excepthook = _xdart_excepthook
+    # File logging: a windowless launch (pixi global / menuinst shortcut) has no
+    # terminal, so the console handler goes nowhere.  Route logs to a rotating
+    # file too -- same "only when the GUI is actually launched, never on import"
+    # rule as the excepthook above.
+    log_path = _install_file_log_handler()
+    if log_path is not None:
+        logger.info("xdart logging to %s", log_path)
     # N8: apply the saved theme before any widget construction so
     # pyqtgraph plot backgrounds are set in time (pyqtgraph
     # snapshots the config at widget creation).
