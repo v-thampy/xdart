@@ -6574,6 +6574,22 @@ class staticWidget(QWidget):
             "%.0f ms (probe interval 250 ms)",
             getattr(self, "_perf_hb_max_gap_ms", 0.0))
 
+    def _select_finished_scan_row(self, nxs_file):
+        """Point the Scans panel at the finished scan and re-run update_scans'
+        select-by-scan_name path.  The .nxs FILE just written/displayed is the
+        authoritative scan identity -- self.scan can lag the display in directory
+        mode, and update_scans matches scan_name against the "<stem>.nxs" list
+        entries (exact or "<stem>_N" fuzzy).  Best-effort; update_scans blocks
+        signals so this re-select never triggers a reload."""
+        try:
+            if not nxs_file:
+                return
+            self.h5viewer.scan_name = os.path.splitext(
+                os.path.basename(nxs_file))[0]
+            self.h5viewer.update_scans()
+        except Exception:
+            logger.debug("run-end scan-row select skipped", exc_info=True)
+
     def wrangler_finished(self):
         """Called by the wrangler finished signal. If current scan
         matches the wrangler scan, allows for integration.
@@ -6715,6 +6731,10 @@ class staticWidget(QWidget):
                     self._reconcile_h5viewer_frame_list_after_run(generated_file)
                 self.h5viewer._auto_select_last_on_finish = True
                 self.h5viewer.set_file(generated_file, internal=True)
+                # Select the scan ROW too: batch shows the last FRAME, but the
+                # Scans panel otherwise followed only when the directory changed
+                # (and to a possibly-stale scan_name in directory batch).
+                self._select_finished_scan_row(generated_file)
 
         # Append-mode feedback: a NON-batch run that processed 0 new frames
         # (Append over an already-complete scan/directory) displayed nothing
@@ -6737,6 +6757,11 @@ class staticWidget(QWidget):
                 # reload past the same-file dedupe (the run wired file_thread.fname
                 # to this file) so the last-frame select-last actually fires.
                 self.h5viewer.set_file(existing_file, internal=True)
+                # THE 0-new-frames append fix: this branch showed the last FRAME but
+                # never selected the scan ROW -- the scans_select for a live run is
+                # gated on _run_saw_frame (False here), so nothing followed the Scans
+                # panel to the finished scan.  Select it by the displayed file.
+                self._select_finished_scan_row(existing_file)
 
         # Live run (saw frames): the streaming path can leave the lazy frame index
         # empty OR partial if frame production outruns the GUI coalescer.  Now that
@@ -6775,22 +6800,12 @@ class staticWidget(QWidget):
                 )
             if indexed:
                 self._apply_integration_control_state()
-            # scans_select_after_run: update_scans's select-by-scan_name path runs
-            # at scan START, before the writer created <name>.nxs -> nothing to
-            # select, so the Scans panel kept the PRIOR scan highlighted.  Re-run
-            # it here (post-write, LIVE saw-frames branch): scan_name is the
-            # finished scan and its .nxs now exists, so the highlight follows to
-            # the newly-processed scan.  update_scans blocks signals, so this
+            # scans_select_after_run: update_scans' select-by-scan_name path ran at
+            # scan START (before <name>.nxs existed), so the Scans panel kept the
+            # PRIOR scan highlighted.  Re-select the finished scan by the file just
+            # written -- its .nxs now exists.  update_scans blocks signals, so this
             # re-select does not re-trigger a load.
-            # Point scan_name at the finished/displayed scan first: in
-            # append/directory mode it was not re-pointed per sub-scan, so the
-            # LAST scan's frames showed but its Scans row stayed unselected.
-            # (Replace already has scan_name == this, so it is a no-op there.)
-            try:
-                self.h5viewer.scan_name = self.scan.name
-            except Exception:
-                logger.debug("run-end scan_name follow skipped", exc_info=True)
-            self.h5viewer.update_scans()
+            self._select_finished_scan_row(written)
 
         # The scan-matches branch delegates to integrator_thread_finished() to
         # run the post-integration UI enable + exit the run-state.  Skip it when

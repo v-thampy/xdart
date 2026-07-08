@@ -2851,6 +2851,12 @@ def test_wrangler_finished_append_zero_new_frames_shows_last_frame(
 
     assert loaded == [str(nxs)]                  # existing scan reloaded
     assert w.h5viewer._auto_select_last_on_finish is True
+    # The 0-new-frames append fix: the Scans panel must now FOLLOW to the finished
+    # scan (previously only the last FRAME was selected, not the scan ROW -- the
+    # scans_select for a live run is gated on _run_saw_frame, False here).
+    assert w.h5viewer.scan_name == "scan"        # pointed at the finished .nxs stem
+    selected = w.h5viewer.ui.listScans.currentItem()
+    assert selected is not None and selected.text() == "scan.nxs"
 
 
 def test_wrangler_finished_with_frames_does_not_reload(
