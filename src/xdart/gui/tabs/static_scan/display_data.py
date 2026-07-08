@@ -398,6 +398,7 @@ class DisplayDataMixin:
                     gen = int(getattr(self, "display_generation", 0) or 0)
                     if getattr(built, "generation", None) != gen:
                         built = replace(built, generation=gen)
+                    self._pub_memo_hits = getattr(self, "_pub_memo_hits", 0) + 1
                     return built
                 view = lookup(idx, allow_blocking_read=False)
                 if view is None:
@@ -405,6 +406,7 @@ class DisplayDataMixin:
                 built = self._display_publication_from_view(idx, view)
                 if built is not None:
                     cache[key] = (rec, pub, m1, m2, built)
+                self._pub_memo_misses = getattr(self, "_pub_memo_misses", 0) + 1
                 return built
         view = lookup(idx, allow_blocking_read=bool(allow_blocking_read))
         if view is None:

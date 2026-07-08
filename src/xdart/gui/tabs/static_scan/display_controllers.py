@@ -152,6 +152,16 @@ def _data_snapshot(widget, *, mode, labels=None, two_d_labels=None,
     rows into readiness.
     """
     loaded_1d, loaded_2d, raw_avail = set(), set(), {}
+    # PERF-3 attribution (XDART_PERF): time this per-tick leg + count publication
+    # memo hits/misses.  If memo_misses ~= labels every tick, the [14] memo is
+    # DEAD in production (find out why); if hits dominate but elapsed is still
+    # large, the cost is the per-label resolve overhead, not the build.
+    _perf = os.environ.get("XDART_PERF")
+    if _perf:
+        import time as _t
+        _t0 = _t.perf_counter()
+        _h0 = getattr(widget, "_pub_memo_hits", 0)
+        _m0 = getattr(widget, "_pub_memo_misses", 0)
     if labels is None:
         labels = ()
     label_keys = _label_keys(labels)
@@ -227,6 +237,13 @@ def _data_snapshot(widget, *, mode, labels=None, two_d_labels=None,
                 include_legacy=include_legacy)
             if r_1d.status is ReadStatus.RESIDENT:
                 loaded_1d.add(_label_key(label))
+    if _perf:
+        logger.info(
+            "[PERF] _data_snapshot: elapsed=%.0fms labels=%d "
+            "memo_hits=+%d memo_misses=+%d",
+            (_t.perf_counter() - _t0) * 1000.0, len(label_keys),
+            getattr(widget, "_pub_memo_hits", 0) - _h0,
+            getattr(widget, "_pub_memo_misses", 0) - _m0)
     return loaded_1d, loaded_2d, raw_avail
 
 
@@ -293,7 +310,14 @@ def _store_first_publication_items(widget, labels):
     if labels is None:
         return None
     items = dict(_browse_one_shot_publication_items(widget, labels))
-    for label in _label_keys(labels):
+    _perf = os.environ.get("XDART_PERF")
+    _keys = _label_keys(labels)
+    if _perf:
+        import time as _t
+        _t0 = _t.perf_counter()
+        _h0 = getattr(widget, "_pub_memo_hits", 0)
+        _m0 = getattr(widget, "_pub_memo_misses", 0)
+    for label in _keys:
         if label in items:
             continue
         result = resolve_frame_data_for_widget(
@@ -301,6 +325,13 @@ def _store_first_publication_items(widget, labels):
             include_legacy=False, request_hydration=False)
         if result.status is ReadStatus.RESIDENT and result.data is not None:
             items[_label_key(label)] = result.data
+    if _perf:
+        logger.info(
+            "[PERF] _store_first_publication_items: elapsed=%.0fms labels=%d "
+            "memo_hits=+%d memo_misses=+%d",
+            (_t.perf_counter() - _t0) * 1000.0, len(_keys),
+            getattr(widget, "_pub_memo_hits", 0) - _h0,
+            getattr(widget, "_pub_memo_misses", 0) - _m0)
     if items or getattr(widget, "publication_store", None) is not None:
         return items
     return None
