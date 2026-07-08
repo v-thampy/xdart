@@ -485,3 +485,44 @@ copy that frees at scan end. Crossover is ~6-8 frames and the system already lan
 right side of it for free. A threshold would add real complexity + a live-mode special case
 (unknown frame count) for ~100 ms on tiny scans. The ~1.1 s single-frame floor is the one-time
 LUT build - irreducible, worker-count-independent. Do not re-propose without new data.
+
+## Run-start beachball (BB-1) fix — residual + structural follow-ups (2026-07-07)
+
+BB-1 (run-start / whole-run GUI freeze when a large scan is loaded, Replace mode) was ROOT-CAUSED
+and FIXED pre-tag (`40040aa8`): `new_scan`'s display-provenance snapshot
+(`_stamp_scan_data_reduction_config` → `build_reduction_config` → `_raw_files_from_scan`) walked the
+ENTIRE frame series on the GUI thread, disk-reading each non-resident frame under `file_lock` — the
+same lock the live run's reduction/writer/prefetch threads saturate. Fix:
+`build_reduction_config(..., include_inputs=False)` for the display snapshot (which discarded
+`inputs`/raw_files anyway). Full write-up: `live_findings_ledger.md` BB-1 row. Stack was captured with
+`faulthandler.dump_traceback_later` (no sudo; py-spy needs `task_for_pid` on macOS) — see memory
+`xrd-tools-faulthandler-stack-capture`. The following are deliberately-deferred follow-ups (real, not
+blockers):
+
+### BB-1a — Writer-side authoritative provenance walk is still O(frames) INSIDE the writer's lock hold (v1.1)
+The authoritative `raw_files` provenance (nexus writer `nexus_writer.py:716`, headless core
+`core.py:738`) still calls `build_reduction_config(scan)` with the default `include_inputs=True`, so
+`_raw_files_from_scan` walks the whole frame series on EVERY replace-save — and it does so INSIDE the
+writer's own `file_lock` hold, lengthening every flush hold. That is exactly the lock contention that
+amplified BB-1 into a whole-run freeze; the GUI is now off that path (no beachball) but the writer
+still pays it. **Cheap cure:** populate the metadata fast path (`metadata.image_paths` /
+`metadata.h5_path`, or a top-level `scan.raw_files`) on the wrangler's scan at setup so
+`_raw_files_from_scan` takes its O(1) fast path and NEVER falls through to the frame walk; OR cache the
+raw-file list incrementally as frames are processed. Either makes the authoritative provenance O(1)
+and shortens the flush hold.
+
+### BB-1b — Per-file lock registry keyed on `data_file` (structural, own branch — v1.1)
+The real structural fix for the whole false-sharing family: a per-file lock registry keyed on
+`data_file`, so readers of the OLD (loaded) file never serialize against the writer of the NEW file.
+One shared `file_lock` today means any reader of scan A can block behind scan B's writer. This
+dissolves the family (also the S-10 monolithic aggregate hold). **Plus a guard rule worth a test:**
+the GUI thread must NEVER blocking-acquire `file_lock` while a run is active (`_processing_active`) —
+a debug assert at `file_lock` acquisition (the `_scan_file_lock`/`catch` path) would have caught BB-1
+years earlier. Ship the assert with the registry.
+
+### BB-1c — Main-thread liveness heartbeat instrumentation (v1.1)
+Add an `XDART_PERF` main-thread heartbeat: a `QTimer` at ~250 ms that logs the MAX event-loop gap
+since the last tick. Any future "the handler timings all look fine but the GUI is frozen" case then
+becomes a one-run diagnosis (the gap spikes to the freeze duration and pins the window).  Natural home:
+`design_gui_liveness_jul2026.md`.  Complements the faulthandler stack capture — the heartbeat says
+WHEN and for how long; faulthandler says WHERE.
