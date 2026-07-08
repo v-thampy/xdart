@@ -89,6 +89,46 @@ def _set_image_frame(w, idx, raw):
     w.displayframe.idxs_2d = [idx]
 
 
+def test_perf_heartbeat_records_event_loop_stall(qapp, monkeypatch, caplog):
+    """Item 5: the XDART_PERF main-thread heartbeat records the worst event-loop
+    gap during a run and logs it at run end.  Drives the REAL widget methods on a
+    REAL staticWidget (constructed with the env flag so the timer is created)."""
+    import logging
+    monkeypatch.setenv("XDART_PERF", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    for _ in range(3):
+        qapp.processEvents()
+    w = staticWidget()
+    try:
+        # The heartbeat timer is created under XDART_PERF; stop it so only our
+        # deterministic manual ticks count (no reliance on wall-clock timer firing).
+        assert w._perf_hb_timer is not None
+        w._perf_hb_timer.stop()
+
+        w._perf_hb_start_window()
+        # Inject a 1.0 s stall: pretend the last tick was 1 s ago, then tick once.
+        w._perf_hb_last -= 1.0
+        w._perf_heartbeat_tick()
+        assert w._perf_hb_max_gap_ms >= 900.0        # the stall was detected
+
+        caplog.set_level(logging.INFO)
+        w._perf_hb_end_window()
+        assert any("max event-loop gap during run" in r.getMessage()
+                   for r in caplog.records)          # logged at run end
+        assert w._perf_hb_active is False            # window closed
+
+        # Sanity: without XDART_PERF the timer is never created (no-op methods).
+    finally:
+        try:
+            w.close()
+            w.deleteLater()
+        except Exception:
+            pass
+        for _ in range(3):
+            qapp.processEvents()
+        gc.collect()
+
+
 def test_image_viewer_processed_nxs_preserves_baked_mask(widget):
     # P0: a processed-xdart frame's baked NaN mask must survive the real
     # H5Viewer→set_data→displayframe wire.  If _viewer_is_xdart is not

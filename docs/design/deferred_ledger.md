@@ -499,19 +499,23 @@ same lock the live run's reduction/writer/prefetch threads saturate. Fix:
 `xrd-tools-faulthandler-stack-capture`. The following are deliberately-deferred follow-ups (real, not
 blockers):
 
-### BB-1a — Writer-side authoritative provenance walk is still O(frames) INSIDE the writer's lock hold (v1.1)
-The authoritative `raw_files` provenance (nexus writer `nexus_writer.py:716`, headless core
-`core.py:738`) still calls `build_reduction_config(scan)` with the default `include_inputs=True`, so
-`_raw_files_from_scan` walks the whole frame series on EVERY replace-save — and it does so INSIDE the
-writer's own `file_lock` hold, lengthening every flush hold. That is exactly the lock contention that
-amplified BB-1 into a whole-run freeze; the GUI is now off that path (no beachball) but the writer
-still pays it. **Cheap cure:** populate the metadata fast path (`metadata.image_paths` /
-`metadata.h5_path`, or a top-level `scan.raw_files`) on the wrangler's scan at setup so
-`_raw_files_from_scan` takes its O(1) fast path and NEVER falls through to the frame walk; OR cache the
-raw-file list incrementally as frames are processed. Either makes the authoritative provenance O(1)
-and shortens the flush hold.
+### BB-1a — Writer-side authoritative provenance walk (Item 3) — MINIMAL TIER DONE; fancier tier v1.1
+**MINIMAL TIER DONE (2026-07-07):** the writer's `build_reduction_config(scan)` (nexus writer
+`nexus_writer.py:716`, headless core `core.py:738`, default `include_inputs=True`) used to walk the
+WHOLE frame series on every replace-save INSIDE the writer's `file_lock` hold — and for xdart ewald
+scans that hydrated every non-resident frame from disk, lengthening the flush hold (the very lock
+contention that amplified BB-1). Because xdart `LiveFrame` carries no `source_path` (S-19), that walk
+returned `[]` anyway, so `_raw_files_from_scan` now iterates only the lazy series' already-resident
+`_in_memory` frames (a plain list — the headless `Scan` — is unchanged). This changes ZERO written
+bytes (GUI files already had empty `inputs.raw_files`; headless keeps its real list) and removes the
+per-save frame walk from the lock hold. Test: `tests/core/test_provenance_config.py::
+test_writer_provenance_does_not_hydrate_lazy_series` (asserts no hydration + empty raw_files).
+**FANCIER TIER (v1.1, changes written output → needs a MIGRATION note):** actually populate the
+metadata fast path (`metadata.image_paths`/`metadata.h5_path`, or a top-level `scan.raw_files`) on the
+wrangler's scan at setup so GUI-written `.nxs` files gain REAL raw-file provenance (today they have
+none). That is the M-tier change deferred to v1.1.
 
-### BB-1b — Per-file lock registry keyed on `data_file` (structural, own branch — v1.1)
+### BB-1b — Per-file lock registry keyed on `data_file` (Item 4 — structural, own branch, v1.1; do NOT do in a frozen RC)
 The real structural fix for the whole false-sharing family: a per-file lock registry keyed on
 `data_file`, so readers of the OLD (loaded) file never serialize against the writer of the NEW file.
 One shared `file_lock` today means any reader of scan A can block behind scan B's writer. This
@@ -519,10 +523,25 @@ dissolves the family (also the S-10 monolithic aggregate hold). **Plus a guard r
 the GUI thread must NEVER blocking-acquire `file_lock` while a run is active (`_processing_active`) —
 a debug assert at `file_lock` acquisition (the `_scan_file_lock`/`catch` path) would have caught BB-1
 years earlier. Ship the assert with the registry.
+**Why NOT now (L, HIGH risk):** the shared `file_lock` reaches ~10 holders (LiveScan, frame_series,
+h5viewer workers, fileHandler, integrator, wranglers, sink, aggregation, display reads) and several
+hard-won invariants are keyed to lock IDENTITY — the J2 shared-lock design, the Condition-over-RLock
+re-entrancy assumptions, and the lock→pool-pause ordering just fixed at five sites (S-12) with tests
+asserting those orderings. Splitting per-file is a concurrency-spine rewire that needs its own branch,
+a design checkpoint, and a live soak; landing it in a frozen RC would invalidate four rounds of review
+coverage. The BB-1 fix already removed the dominant victim. **Surgical pre-tag alternative IF a
+residual beachball appears in verification:** the `set_fname` non-blocking-acquire fix is S (~30 min,
+low risk) and can ride pre-tag — do that instead of item 4 if needed. Park item 4 on the v1.1 board
+next to the aggregate lock-chunking so one branch absorbs the whole false-sharing family with soak time.
 
-### BB-1c — Main-thread liveness heartbeat instrumentation (v1.1)
-Add an `XDART_PERF` main-thread heartbeat: a `QTimer` at ~250 ms that logs the MAX event-loop gap
-since the last tick. Any future "the handler timings all look fine but the GUI is frozen" case then
-becomes a one-run diagnosis (the gap spikes to the freeze duration and pins the window).  Natural home:
-`design_gui_liveness_jul2026.md`.  Complements the faulthandler stack capture — the heartbeat says
-WHEN and for how long; faulthandler says WHERE.
+### BB-1c — Main-thread liveness heartbeat instrumentation (Item 5) — DONE (2026-07-07)
+**DONE:** an `XDART_PERF`-gated main-thread heartbeat — a parented `QTimer(self)` at 250 ms
+(`static_scan_widget._perf_heartbeat_tick`) records the MAX event-loop gap during a run and logs it at
+run end (`wrangler_finished` → `_perf_hb_end_window`; window opened at run start next to
+`set_processing_active(True)`). A frozen GUI can't service the timer, so the tick-to-tick gap balloons
+to the freeze duration — turning any future "handler timings all fast but GUI frozen" into a one-run
+diagnosis (BB-1 survived multiple instrumentation passes precisely because this metric didn't exist).
+Created ONLY under the env flag → zero production behavior change. Test:
+`tests/xdart/test_gui_modes_end_to_end.py::test_perf_heartbeat_records_event_loop_stall` (drives the
+real widget methods with an injected 1 s stall, asserts it's recorded + logged). Complements the
+faulthandler stack capture — the heartbeat says WHEN and for how long; faulthandler says WHERE.

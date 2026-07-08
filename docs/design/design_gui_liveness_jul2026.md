@@ -92,6 +92,19 @@ Display/hydration `.nxs` reader audit:
 - Both timers logged at startup under `XDART_PERF` (`[PERF] live timers: flush=… list=…`). Example sweep:
   `XDART_PERF=1 XDART_FLUSH_MS=110 XDART_LIST_MS=40 PYTHONPATH=$PWD/src xdart`.
 
+## Main-thread liveness heartbeat (XDART_PERF) — added 2026-07-07 (BB-1c / deferred_ledger Item 5)
+A parented `QTimer(self)` at **250 ms** (`static_scan_widget._perf_heartbeat_tick`) records the MAX
+gap between successive ticks during a run and logs it at run end:
+`[PERF] main-thread heartbeat: max event-loop gap during run = N ms (probe interval 250 ms)`.
+The window opens at run start (next to `set_processing_active(True)`) and closes in `wrangler_finished`.
+Because a frozen GUI cannot service the timer, the tick-to-tick gap balloons to the freeze duration —
+so a large N with all `[PERF] flush:` legs measuring fast is the fingerprint of a **blocking call on
+the GUI thread** (exactly BB-1, whose blocking `_raw_files_from_scan` walk was in an UNinstrumented
+path — every handler timing looked fine). Created ONLY under `XDART_PERF`, so zero production cost.
+This is the WHEN/how-long complement to the `faulthandler` stack capture, which gives the WHERE (see
+memory `xrd-tools-faulthandler-stack-capture`). Test:
+`tests/xdart/test_gui_modes_end_to_end.py::test_perf_heartbeat_records_event_loop_stall`.
+
 ## Measurement protocol (live — the maintainer runs)
 `conda activate xrd_test && XDART_PERF=1 xdart`, point at the 651-frame eiger dir (Image Directory,
 live), run Int 1D + Int 2D, and capture the `[PERF] flush: drain= list= render= total=` lines

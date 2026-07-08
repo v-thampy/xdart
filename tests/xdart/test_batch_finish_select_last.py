@@ -91,6 +91,10 @@ def _finish_host(tmp_path, *, batch, saw_frame, xye_only=False,
     # mocked scan receives a populated frame index.
     host._reconcile_h5viewer_frame_list_after_run = MethodType(
         staticWidget._reconcile_h5viewer_frame_list_after_run, host)
+    # wrangler_finished ends the XDART_PERF main-thread heartbeat window; bind the
+    # real method (a no-op here: the bare host has no _perf_hb_active, so it
+    # returns early) so the mock drives the production run-end path unchanged.
+    host._perf_hb_end_window = MethodType(staticWidget._perf_hb_end_window, host)
     return host, h5viewer, str(nxs), calls
 
 

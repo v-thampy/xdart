@@ -168,6 +168,44 @@ def test_display_snapshot_skips_frame_walk() -> None:
         build_reduction_config(scan)
 
 
+class _LazyExplodingSeries:
+    """Mimics xdart ``LiveFrameSeries``: iterating it lazy-loads from disk (here
+    it explodes), but ``_in_memory`` holds already-resident frames.  xdart
+    ``LiveFrame`` carries ``source_file``/``_source_root`` but NO ``source_path``
+    (S-19), so the provenance walk returns [] for it -- the short-circuit's job is
+    to reach that [] WITHOUT hydrating.
+    """
+
+    def __init__(self, resident):
+        self._in_memory = resident
+
+    def __iter__(self):
+        raise RuntimeError("lazy frame series was hydrated (disk walk) for provenance")
+
+
+class _LiveFrameLike:
+    # LiveFrame shape: has source_file, NOT source_path.
+    source_file = "raw_0000.tif"
+
+
+def test_writer_provenance_does_not_hydrate_lazy_series() -> None:
+    scan = SimpleNamespace(
+        bai_1d_args={"numpoints": 3000, "unit": "q_A^-1"},
+        bai_2d_args={},
+        gi=False,
+        frames=_LazyExplodingSeries({0: _LiveFrameLike(), 1: _LiveFrameLike()}),
+    )
+
+    # The authoritative writer path (default include_inputs=True) must NOT hydrate
+    # the lazy series (that raises) -- it reads only the resident _in_memory frames.
+    config, inputs = build_reduction_config(scan)
+
+    # xdart LiveFrames have no source_path -> raw_files stays empty, exactly as in
+    # files written today: the short-circuit changes ZERO written bytes.
+    assert "raw_files" not in inputs
+    assert config["bai_1d_args"] == {"numpoints": 3000, "unit": "q_A^-1"}
+
+
 def test_build_reduction_config_import_is_qt_xdart_pure() -> None:
     root = os.fspath(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
     src = os.path.join(root, "src")

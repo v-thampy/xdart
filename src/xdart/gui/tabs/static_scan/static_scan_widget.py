@@ -3825,6 +3825,23 @@ class staticWidget(QWidget):
         _list_ms = staticWidget._timer_ms_from_env("XDART_LIST_MS", 60)
         if os.environ.get("XDART_PERF"):
             logger.info("[PERF] live timers: flush=%dms list=%dms", _flush_ms, _list_ms)
+        # Main-thread liveness heartbeat (XDART_PERF only): a parented QTimer that
+        # records the MAX event-loop gap seen during a run, logged at run end.  A
+        # frozen GUI can't service the timer, so the tick-to-tick gap balloons to
+        # the freeze duration -- turning "every handler measures fast but the GUI
+        # is frozen" into a one-run diagnosis.  BB-1 survived multiple
+        # instrumentation passes precisely because this metric did not exist.
+        # Created ONLY under the env flag -> zero production behavior change.
+        # See docs/design/design_gui_liveness_jul2026.md.
+        self._perf_hb_timer = None
+        self._perf_hb_active = False
+        self._perf_hb_last = 0.0
+        self._perf_hb_max_gap_ms = 0.0
+        if os.environ.get("XDART_PERF"):
+            self._perf_hb_timer = QtCore.QTimer(self)
+            self._perf_hb_timer.setInterval(250)
+            self._perf_hb_timer.timeout.connect(self._perf_heartbeat_tick)
+            self._perf_hb_timer.start()
         self._update_timer = Coalescer(_flush_ms, mode="throttle", parent=self)
         self._update_timer.triggered.connect(self._flush_pending_update)
         self._list_timer = Coalescer(_list_ms, mode="throttle", parent=self)
@@ -5442,6 +5459,8 @@ class staticWidget(QWidget):
         self._run_saw_frame = False
         self._set_scan_integrated_reads_transient(True)
         self.displayframe.set_processing_active(True)
+        # Start the main-thread liveness window for this run (XDART_PERF only).
+        self._perf_hb_start_window()
         # Same run-state, pushed to the h5viewer so the frame-selection disk-load
         # guard (data_changed) and the reader-side hydration guard
         # (_processing_active, just set above) share one source of truth and can't
@@ -6377,6 +6396,41 @@ class staticWidget(QWidget):
 
         self.wrangler.thread.start()
 
+    def _perf_heartbeat_tick(self):
+        # Update the max event-loop gap.  The gap between successive ~250ms ticks
+        # is how long the GUI thread could not service the timer == how long the
+        # event loop was blocked.  (XDART_PERF only; timer created in __init__.)
+        import time
+        now = time.perf_counter()
+        last = self._perf_hb_last
+        self._perf_hb_last = now
+        if self._perf_hb_active and last and now > last:
+            gap_ms = (now - last) * 1000.0
+            if gap_ms > self._perf_hb_max_gap_ms:
+                self._perf_hb_max_gap_ms = gap_ms
+
+    def _perf_hb_start_window(self):
+        # Begin accumulating the max event-loop gap for a run (XDART_PERF only;
+        # no-op when the heartbeat timer was not created).
+        if getattr(self, "_perf_hb_timer", None) is None:
+            return
+        import time
+        self._perf_hb_max_gap_ms = 0.0
+        self._perf_hb_last = time.perf_counter()
+        self._perf_hb_active = True
+
+    def _perf_hb_end_window(self):
+        # Log the worst event-loop stall observed during the run (XDART_PERF only).
+        # A large value here with all handler timings fast is the fingerprint of a
+        # blocking call on the GUI thread (as in BB-1).
+        if not getattr(self, "_perf_hb_active", False):
+            return
+        self._perf_hb_active = False
+        logger.info(
+            "[PERF] main-thread heartbeat: max event-loop gap during run = "
+            "%.0f ms (probe interval 250 ms)",
+            getattr(self, "_perf_hb_max_gap_ms", 0.0))
+
     def wrangler_finished(self):
         """Called by the wrangler finished signal. If current scan
         matches the wrangler scan, allows for integration.
@@ -6642,6 +6696,10 @@ class staticWidget(QWidget):
                 (_time.perf_counter() - _gc_t0) * 1000.0, _gc_n)
         else:
             gc.collect()
+
+        # Run-end liveness readout (XDART_PERF): report the worst event-loop stall
+        # seen during this run (placed after teardown so it captures it too).
+        self._perf_hb_end_window()
 
         # XYE-only batch (Int 1D (XYE)): there is no .nxs to auto-load, so the
         # block above skipped the end-of-batch reload.  Show the folder of

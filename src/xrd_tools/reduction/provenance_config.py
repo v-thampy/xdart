@@ -227,9 +227,21 @@ def _raw_files_from_scan(scan: Any) -> list[str]:
         return [str(h5_path)]
 
     frames = getattr(scan, "frames", None) or ()
+    # Do NOT hydrate a lazy frame series (xdart ``LiveFrameSeries``) just to read
+    # source paths.  Iterating it triggers a per-frame disk load under
+    # ``file_lock`` (``__getitem__``), and an xdart ``LiveFrame`` carries no
+    # ``source_path`` -- so this walk hydrates every frame and returns [] today
+    # (S-19).  On the WRITER thread that lengthens the flush's lock hold, which is
+    # exactly the contention that amplified BB-1.  A lazy series exposes an
+    # ``_in_memory`` map of already-resident frames: iterate THOSE (no disk I/O).
+    # A plain list (headless ``Scan``, whose ``Frame``s DO carry ``source_path``)
+    # has no ``_in_memory`` and iterates unchanged.  Written provenance is byte-
+    # identical either way -- GUI stays [], headless keeps its real raw_files.
+    resident = getattr(frames, "_in_memory", None)
+    frame_iter = resident.values() if resident is not None else frames
     out: list[str] = []
     seen: set[str] = set()
-    for frame in frames:
+    for frame in frame_iter:
         source_path = getattr(frame, "source_path", None)
         if source_path is None:
             continue
