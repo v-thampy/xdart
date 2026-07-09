@@ -3348,8 +3348,16 @@ class staticWidget(QWidget):
 
     def _current_pattern_for_fit(self):
         """Return ``(x, y, x_label)`` for the SELECTED frame's 1-D pattern, or
-        ``None`` — so a fit always matches what the user is looking at."""
-        idxs = getattr(self, 'frame_ids', None) or []
+        ``None`` — so a fit always matches what the user is looking at.
+
+        The live frame selection is ``h5viewer.frame_ids`` (what the 1-D plot
+        draws); the staticWidget's own ``frame_ids`` is never populated in the
+        real GUI, so reading only it left the fit popup permanently on "No frame
+        selected".  Prefer ``self.frame_ids`` (tests set it), fall back to the
+        h5viewer selection.
+        """
+        idxs = (getattr(self, 'frame_ids', None)
+                or getattr(self.h5viewer, 'frame_ids', None) or [])
         if not idxs:
             return None
         return self._pattern_for_frame(idxs[0])
@@ -3368,7 +3376,9 @@ class staticWidget(QWidget):
             frame_pattern_provider=self._pattern_for_frame,
             scan_uri_provider=self._current_scan_uri,
             mask_provider=self._scan_plot_mask_provider,
-            frame_labels_provider=lambda: tuple(getattr(self, 'frame_ids', ()) or ()),
+            frame_labels_provider=lambda: tuple(
+                getattr(self, 'frame_ids', ())
+                or getattr(self.h5viewer, 'frame_ids', ()) or ()),
             metadata_provider=lambda: {})
 
     def _open_peak_fit_dialog(self):

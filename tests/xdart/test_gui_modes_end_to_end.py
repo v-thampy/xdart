@@ -2876,6 +2876,27 @@ def test_wrangler_finished_with_frames_does_not_reload(
     assert loaded == []                          # no append-feedback reload
 
 
+def test_current_pattern_for_fit_reads_h5viewer_frame_selection(widget, monkeypatch):
+    """The fit popup's current-pattern provider must read the LIVE frame
+    selection (h5viewer.frame_ids — what the 1-D plot draws), not the
+    staticWidget's own never-populated frame_ids, or the popup is stuck on
+    "No frame selected". Regression for the manual-Reload/static fit path."""
+    w = widget
+    seen = {}
+
+    def _fake_pattern(idx):
+        seen['idx'] = idx
+        return ([1.0, 2.0], [3.0, 4.0], 'q')
+
+    monkeypatch.setattr(w, '_pattern_for_frame', _fake_pattern)
+    w.h5viewer.frame_ids[:] = [7]              # the frame the user is looking at
+    assert w._current_pattern_for_fit() == ([1.0, 2.0], [3.0, 4.0], 'q')
+    assert seen['idx'] == 7
+    # empty selection -> None (the correct "No frame selected" case)
+    w.h5viewer.frame_ids[:] = []
+    assert w._current_pattern_for_fit() is None
+
+
 def test_run_end_backfills_overlay_after_integrator_finished_clear(
         widget, monkeypatch, tmp_path):
     """PERF-3 Option A: at run end the one-shot overlay catch-up must be ARMED
