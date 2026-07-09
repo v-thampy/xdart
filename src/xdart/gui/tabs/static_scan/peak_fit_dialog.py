@@ -327,6 +327,15 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         return lo, hi
 
     # ---- data + fit -----------------------------------------------------
+    def keyPressEvent(self, event):
+        # Esc must not discard the fit setup (model/peaks/range/results); the
+        # default QDialog Esc -> reject closes the popup.  Match the metadata
+        # plotter.  Other keys pass through.
+        if event.key() == QtCore.Qt.Key.Key_Escape:
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def refresh_pattern(self):
         """Re-grab the active frame's pattern, draw the raw data, reset the fit."""
         self._clear_fit()

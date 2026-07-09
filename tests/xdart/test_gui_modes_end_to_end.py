@@ -2876,25 +2876,48 @@ def test_wrangler_finished_with_frames_does_not_reload(
     assert loaded == []                          # no append-feedback reload
 
 
-def test_current_pattern_for_fit_reads_h5viewer_frame_selection(widget, monkeypatch):
-    """The fit popup's current-pattern provider must read the LIVE frame
-    selection (h5viewer.frame_ids — what the 1-D plot draws), not the
-    staticWidget's own never-populated frame_ids, or the popup is stuck on
-    "No frame selected". Regression for the manual-Reload/static fit path."""
+def test_current_pattern_for_fit_reads_drawn_1d_frames(widget, monkeypatch):
+    """The fit provider must read the DRAWN 1-D frames (displayframe.idxs_1d --
+    what the plot shows and what get_frames_int_1d defaults to), because the
+    staticWidget/h5viewer frame_ids are NOT populated on a manual frame click,
+    which left the popup stuck on "No frame selected"."""
+    w = widget
+    seen = {}
+    monkeypatch.setattr(
+        w, '_pattern_for_frame',
+        lambda idx: (seen.setdefault('idx', idx), ([1.0], [2.0], 'q'))[1])
+    w.frame_ids = []
+    try:
+        w.h5viewer.frame_ids[:] = []
+    except Exception:
+        pass
+    w.displayframe.idxs_1d[:] = [5]           # the frame the 1-D plot draws
+    assert w._current_pattern_for_fit() == ([1.0], [2.0], 'q')
+    assert seen['idx'] == 5
+    # nothing drawn + no selection -> None (the correct "No frame selected" case)
+    w.displayframe.idxs_1d[:] = []
+    assert w._current_pattern_for_fit() is None
+
+
+def test_pattern_for_frame_uses_idle_gated_blocking_read(widget, monkeypatch):
+    """A non-resident frame's per-frame read must be a store-MISS BLOCKING read on
+    an idle scan (Set-Bkg precedent) so the 1-D actually loads -- else the popup
+    lies "No frame selected". During a run it must NOT block (live push feeds it)."""
     w = widget
     seen = {}
 
-    def _fake_pattern(idx):
-        seen['idx'] = idx
-        return ([1.0, 2.0], [3.0, 4.0], 'q')
+    def _spy(idxs, rv='all', allow_blocking_read=None):
+        seen['idxs'] = list(idxs)
+        seen['blocking'] = allow_blocking_read
+        return ([[10.0, 20.0, 30.0]], [0.1, 0.2, 0.3])   # (ydata, xdata)
 
-    monkeypatch.setattr(w, '_pattern_for_frame', _fake_pattern)
-    w.h5viewer.frame_ids[:] = [7]              # the frame the user is looking at
-    assert w._current_pattern_for_fit() == ([1.0, 2.0], [3.0, 4.0], 'q')
-    assert seen['idx'] == 7
-    # empty selection -> None (the correct "No frame selected" case)
-    w.h5viewer.frame_ids[:] = []
-    assert w._current_pattern_for_fit() is None
+    monkeypatch.setattr(w.displayframe, 'get_frames_int_1d', _spy)
+    w.displayframe._processing_active = False
+    assert w._pattern_for_frame(4) is not None
+    assert seen == {'idxs': [4], 'blocking': True}       # idle -> block-and-read
+    w.displayframe._processing_active = True
+    w._pattern_for_frame(4)
+    assert seen['blocking'] is False                     # mid-run -> no contention
 
 
 def test_run_end_backfills_overlay_after_integrator_finished_clear(

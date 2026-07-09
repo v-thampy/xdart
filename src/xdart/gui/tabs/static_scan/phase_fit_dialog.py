@@ -249,6 +249,15 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
             self._phases.pop(row)
 
     # ---- data + fit -----------------------------------------------------
+    def keyPressEvent(self, event):
+        # Esc must not discard the fit setup (phases/range/results); the default
+        # QDialog Esc -> reject closes the popup.  Match the metadata plotter.
+        # Other keys pass through.
+        if event.key() == QtCore.Qt.Key.Key_Escape:
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def refresh_pattern(self):
         """Re-grab the active frame's pattern, draw it, reset the fit/trend."""
         self._clear_fit()

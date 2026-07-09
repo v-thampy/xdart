@@ -3327,7 +3327,15 @@ class staticWidget(QWidget):
         except (TypeError, ValueError):
             return None
         try:
-            ydata, xdata = self.displayframe.get_frames_int_1d([idx], rv='all')
+            # Block-and-read on a store MISS so a non-resident frame's 1D
+            # actually loads (else the read returns None -> the popup lies "No
+            # frame selected").  Idle-gated exactly like Set-Bkg
+            # (display_frame_widget Set-Bkg precedent): during a run the live
+            # push path feeds the dialog, so don't contend with the writer.
+            ydata, xdata = self.displayframe.get_frames_int_1d(
+                [idx], rv='all',
+                allow_blocking_read=not getattr(
+                    self.displayframe, '_processing_active', False))
         except Exception:
             logger.exception("peak-fit: get_frames_int_1d failed")
             return None
@@ -3350,14 +3358,23 @@ class staticWidget(QWidget):
         """Return ``(x, y, x_label)`` for the SELECTED frame's 1-D pattern, or
         ``None`` — so a fit always matches what the user is looking at.
 
-        The live frame selection is ``h5viewer.frame_ids`` (what the 1-D plot
-        draws); the staticWidget's own ``frame_ids`` is never populated in the
-        real GUI, so reading only it left the fit popup permanently on "No frame
-        selected".  Prefer ``self.frame_ids`` (tests set it), fall back to the
-        h5viewer selection.
+        The authoritative "what the 1-D plot draws" is ``displayframe.idxs_1d``
+        -- the very list ``get_frames_int_1d`` defaults to and ``set_data``
+        populates on every frame show.  The staticWidget's own ``frame_ids`` is
+        never populated in the real GUI, so reading it (or h5viewer.frame_ids,
+        which isn't set on a manual frame click either) left the fit popup stuck
+        on "No frame selected".  Prefer ``self.frame_ids`` (tests set it), then
+        the drawn 1-D frames, then the h5viewer selection.
         """
         idxs = (getattr(self, 'frame_ids', None)
+                or list(getattr(self.displayframe, 'idxs_1d', None) or [])
                 or getattr(self.h5viewer, 'frame_ids', None) or [])
+        if os.environ.get("XDART_DIAG"):
+            logger.warning(
+                "[DIAG fit-src] frame_ids=%r idxs_1d=%r h5.frame_ids=%r -> %r",
+                getattr(self, 'frame_ids', None),
+                getattr(self.displayframe, 'idxs_1d', None),
+                getattr(self.h5viewer, 'frame_ids', None), idxs)
         if not idxs:
             return None
         return self._pattern_for_frame(idxs[0])
@@ -3378,6 +3395,7 @@ class staticWidget(QWidget):
             mask_provider=self._scan_plot_mask_provider,
             frame_labels_provider=lambda: tuple(
                 getattr(self, 'frame_ids', ())
+                or (getattr(self.displayframe, 'idxs_1d', None) or ())
                 or getattr(self.h5viewer, 'frame_ids', ()) or ()),
             metadata_provider=lambda: {})
 
