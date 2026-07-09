@@ -1514,7 +1514,12 @@ def test_browse_one_shot_anchor_supplies_2d_while_plot_uses_full_selection():
 
 
 def test_overlay_payload_appends_stale_hydrated_selection_queue_in_order():
-    store = PublicationStore()
+    # max_heavy_items=None: this test needs all 21 frames RESIDENT (has_1d).
+    # The default heavy window is RAM-aware (staging.heavy_window: <16 GiB -> 16),
+    # so on a low-RAM CI runner the default store thinned the oldest 5 frames to
+    # thumbnails (has_1d=False) and the overlay dropped them -- the nightly-only
+    # failure. Pin it so the test is RAM-independent (repro: XDART_HEAVY_WINDOW=16).
+    store = PublicationStore(max_heavy_items=None)
     for idx in range(21):
         frame = DuckFrame(idx=idx)
         frame.scan_info = {"monitor": 1.0}
