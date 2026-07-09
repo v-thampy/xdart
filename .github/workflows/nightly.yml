@@ -29,10 +29,12 @@ jobs:
         # Retry ONLY on the offscreen-pyqtgraph segfault (exit 139); any real
         # test failure still fails fast (see pr.yml for the rationale).
         run: |
-          verbose=""
+          # -q normally; -v under diag (NOT "-q -v" -- they cancel to net verbosity 0,
+          # hiding the per-test order that names the cross-test polluter).
+          verbose="-q"
           [ "${{ inputs.diag }}" = "true" ] && verbose="-v"
           for attempt in 1 2 3; do
-            pytest tests/xdart -q $verbose --timeout=900 --junitxml="xdart-attempt-$attempt.xml"
+            pytest tests/xdart $verbose --timeout=900 --junitxml="xdart-attempt-$attempt.xml"
             code=$?
             [ "$code" -eq 0 ] && exit 0
             # A real test failure/error must fail fast even when the process ALSO
