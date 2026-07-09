@@ -87,6 +87,13 @@ requirements:
     - imageio
     - packaging
     - menuinst                    # creates the Start-menu/Applications shortcut
+    # GUI analysis tools the Tools menu + the Grazing/GI workflow surface -- ship
+    # them so nothing fails with an "optional dependency" prompt out of the box
+    # ([fitting] + [rsm] extras; this package IS the full GUI).
+    - lmfit                       # Peak / Phase Fitting
+    - pymatgen                    # Phase Fitting (CIF / structure)
+    - xrayutilities               # Grazing/GI corrections + RSM geometry/gridding
+    - pyevtk                      # RSM VTK export
 
 tests:
   - python:

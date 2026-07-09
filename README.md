@@ -226,14 +226,16 @@ modest for batch / pipeline / CI use:
 | Extra        | What it enables                                          | Packages                                                    |
 | ------------ | -------------------------------------------------------- | ----------------------------------------------------------- |
 | *(base)*     | `core`, `io`, `integrate`, `viz` — headless / batch      | numpy, scipy, pandas, xarray, h5py, hdf5plugin, nexusformat, fabio, silx, pyFAI, pyyaml, joblib, natsort, matplotlib, plotly |
-| `[gui]`      | the `xdart` desktop GUI                                  | PySide6, pyqtgraph, qtawesome, imagecodecs, imageio         |
+| `[gui]`      | the `xdart` desktop GUI **+ its analysis tools** (bundles `[fitting]` + `[rsm]`) | PySide6, pyqtgraph, qtawesome, imagecodecs, imageio, lmfit, pymatgen, xrayutilities, pyevtk |
 | `[fitting]`  | `analysis.fitting.*` — peak / phase / strain fitting     | lmfit, pymatgen                                             |
 | `[rsm]`      | `rsm.*` — reciprocal-space mapping, VTK export           | xrayutilities, pyevtk                                       |
 | `[notebook]` | self-contained Jupyter environment                       | ipywidgets, anywidget, ipyfilechooser, ipykernel, ipympl, jupyterlab |
 | `[all]`      | everything except dev                                    | `xrd-tools[fitting,rsm,gui,notebook]`                       |
 | `[dev]`      | test / build / release tooling                           | pytest, pytest-timeout, build, twine, tifffile              |
 
-Extras compose, e.g. `pip install "xrd-tools[gui,fitting,rsm]"`.
+Extras compose. `[gui]` already bundles `[fitting]` + `[rsm]` — the GUI surfaces
+Peak/Phase Fitting and the Grazing/GI/RSM workflow — so `pip install "xrd-tools[gui]"`
+(and the conda package) give you the **complete** GUI with no missing-dependency prompts.
 
 > **Tip — use [`uv`](https://docs.astral.sh/uv/) if you have it.** It is a
 > drop-in pip replacement that is typically 10–100× faster on cold installs.

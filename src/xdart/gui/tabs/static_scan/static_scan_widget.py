@@ -3369,12 +3369,6 @@ class staticWidget(QWidget):
         idxs = (getattr(self, 'frame_ids', None)
                 or list(getattr(self.displayframe, 'idxs_1d', None) or [])
                 or getattr(self.h5viewer, 'frame_ids', None) or [])
-        if os.environ.get("XDART_DIAG"):
-            logger.warning(
-                "[DIAG fit-src] frame_ids=%r idxs_1d=%r h5.frame_ids=%r -> %r",
-                getattr(self, 'frame_ids', None),
-                getattr(self.displayframe, 'idxs_1d', None),
-                getattr(self.h5viewer, 'frame_ids', None), idxs)
         if not idxs:
             return None
         return self._pattern_for_frame(idxs[0])
