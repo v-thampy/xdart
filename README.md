@@ -135,7 +135,7 @@ your shell).
 ```bash
 # 1. create + activate a fresh env (use `conda` in place of `mamba` if you prefer —
 #    mamba is just the faster solver)
-mamba create -n xrd python=3.12 -y
+mamba create -n xrd python=3.13 -y
 mamba activate xrd
 
 # 2. the conda-forge fast I/O stack, then the xdart GUI from PyPI
