@@ -1052,9 +1052,6 @@ class PublicationDisplayAdapter:
         def append_row(label, *, recipe=None, live=False):
             nonlocal ref_x, axis, reset_key
             pub = self._publication_for_label(label)
-            if os.environ.get("XDART_DIAG"):   # nightly pollution diagnosis (opt-in)
-                logger.warning("[DIAG append_row] label=%r pub=%s",
-                               label, "None" if pub is None else "ok")
             if pub is None:
                 return None
             view = pub.view
@@ -1065,20 +1062,11 @@ class PublicationDisplayAdapter:
             if recipe is not None:
                 row_needs_2d = True
             if not row_needs_2d:
-                if os.environ.get("XDART_DIAG"):   # pollution diagnosis (opt-in)
-                    _ax = getattr(view, "axis_1d", None)
-                    logger.warning(
-                        "[DIAG 1d] label=%r has_1d=%s errs1d=%s npt=%s",
-                        label, view.has_1d, publication_has_1d_errors(pub),
-                        None if _ax is None else np.asarray(_ax.values).size)
                 if not view.has_1d or publication_has_1d_errors(pub):
                     return None
                 x = np.asarray(view.axis_1d.values, dtype=float)
                 y = np.asarray(view.intensity_1d, dtype=float)
                 if x.shape != y.shape:
-                    if os.environ.get("XDART_DIAG"):
-                        logger.warning("[DIAG 1d] label=%r DROP shape x=%s y=%s",
-                                       label, x.shape, y.shape)
                     return None
                 y = self._normalize(y, pub.metadata_raw)
                 x, conv_axis = self._apply_plot_unit_1d(
@@ -1250,13 +1238,6 @@ class PublicationDisplayAdapter:
             prior, reset_key=reset_key, unit=unit, label=label,
             x=ref_x, rows=np.asarray(rows, dtype=float), ids=ids, names=names,
             metadata=metadata, replace_ids=replace_ids, drop_ids=drop_ids)
-        if os.environ.get("XDART_DIAG"):   # nightly pollution diagnosis (opt-in)
-            logger.warning(
-                "[DIAG overlay] pending=%s render_labels=%s appended_ids=%s "
-                "history.ids=%s reset_key=%s",
-                list(pending_overlay_appends), list(render_labels), list(ids),
-                list(getattr(history, "ids", ())),
-                getattr(history, "reset_key", None))
         return self._history_to_payload(history)
 
     def _history_to_payload(self, history):
