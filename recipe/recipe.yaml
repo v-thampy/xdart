@@ -28,7 +28,7 @@ context:
   # (load_from_file would auto-read it, but that needs rattler-build
   # --experimental, so we sync in CI instead.)
   version: "1.0.0"
-  python_min: "3.11"
+  python_min: "3.13"
 
 package:
   name: ${{ name }}
