@@ -65,11 +65,11 @@ def check_version(tag: str | None) -> bool:
 
     try:
         from importlib.metadata import version as pkg_version
-        dist = pkg_version("xrd-tools")
+        dist = pkg_version("xdart")
         ok &= (_ok if dist == pp else _fail)(
             f"installed dist {dist} == pyproject {pp}")
     except Exception as exc:  # not installed — CI installs before checking
-        ok &= _fail(f"xrd-tools not importable for version check: {exc}")
+        ok &= _fail(f"xdart dist not importable for version check: {exc}")
 
     try:
         import xdart

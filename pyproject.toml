@@ -3,7 +3,7 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "xrd-tools"
+name = "xdart"
 version = "1.0.0"
 description = "SSRL X-ray diffraction toolkit: headless reduction core (xrd_tools) + Qt GUI (xdart)"
 readme = "README.md"
@@ -28,7 +28,7 @@ classifiers = [
 ]
 # Slim base: heavy analysis deps stay in extras (pymatgen drags
 # sympy/spglib/monty; xrayutilities is compiled).  Lazy imports give the
-# friendly "pip install xrd-tools[fitting]" error instead.
+# friendly "pip install xdart[fitting]" error instead.
 dependencies = [
     "numpy",
     "scipy",
@@ -69,10 +69,10 @@ gui = [
     # GUI analysis tools: Peak/Phase Fitting (lmfit, pymatgen) + the Grazing/GI/RSM
     # workflow (xrayutilities, pyevtk).  The GUI surfaces these from the Tools menu
     # and the Grazing corrections path, so a `[gui]` install ships them.
-    "xrd-tools[fitting,rsm]",
+    "xdart[fitting,rsm]",
 ]
 notebook = ["ipywidgets", "anywidget", "ipyfilechooser", "ipykernel", "ipympl", "jupyterlab"]
-all = ["xrd-tools[fitting,rsm,gui,notebook]"]
+all = ["xdart[fitting,rsm,gui,notebook]"]
 dev = ["pytest", "pytest-timeout", "build", "twine", "tifffile"]  # tifffile: test fixtures write TIFFs
 
 [project.scripts]
