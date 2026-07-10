@@ -35,6 +35,7 @@ them.
 from __future__ import annotations
 
 import logging
+import os
 import warnings
 from dataclasses import dataclass, field
 from enum import Enum
@@ -692,6 +693,25 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
     # (incoming x is the same sample grid in the new unit), then append new ids.
     base_x = (x if history.unit != unit and x.size == history.x.size
               else history.x)
+    # QW-4 tripwire (XDART_DEBUG_DISPLAY=1 only; zero production cost):
+    # incoming rows in a DIFFERENT unit than the accumulator with the relabel
+    # NOT engaged (grid sizes differ) would reach the BL-6 np.interp below and
+    # interpolate across disjoint domains (Q ~1-8 A^-1 vs 2theta ~10-55 deg),
+    # clamping to a constant and permanently appending blank bands.  Under the
+    # debug flag: log ERROR once and SKIP the batch (the rows re-arrive
+    # converted on a later render — the S-17 empty-row policy).
+    _cross_unit_no_relabel = (
+        history.unit != unit and base_x is history.x
+        and bool(os.environ.get("XDART_DEBUG_DISPLAY")))
+    if _cross_unit_no_relabel and ids:
+        logger.error(
+            "accumulate_waterfall: %d cross-unit row(s) (incoming unit=%r, "
+            "accumulator unit=%r) with the relabel not engaged "
+            "(x.size=%d vs history %d) — skipping this batch instead of "
+            "interpolating across disjoint domains [XDART_DEBUG_DISPLAY "
+            "tripwire]", len(ids), unit, history.unit, x.size,
+            history.x.size)
+        ids, names, rows, metadata = ids[:0], names[:0], rows[:0], metadata[:0]
     out_ids = list(history.ids)
     out_names = list(history.names)
     out_meta = list(getattr(history, "metadata", ()) or ())

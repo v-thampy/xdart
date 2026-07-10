@@ -43,6 +43,29 @@ _STORE_FIRST_UNSET = object()
 _BULK_1D_READ_CHUNK = 256
 
 
+def _tripwire_gui_thread_file_lock(owner):
+    """QW-4 tripwire #2 (XDART_DEBUG_DISPLAY=1 only): the GUI thread must
+    never blocking-acquire ``file_lock`` while a run is active — the
+    reduction/writer/prefetch threads saturate that lock, so a GUI-thread
+    acquire is a beachball in waiting (the BB-1 class; this assert would
+    have caught it years early).  Logs ERROR with the acquiring stack; never
+    raises (a live diagnosis run must not crash the app)."""
+    if not getattr(owner, "_processing_active", False):
+        return
+    try:
+        from pyqtgraph.Qt import QtCore, QtWidgets
+        app = QtWidgets.QApplication.instance()
+        if app is None or QtCore.QThread.currentThread() is not app.thread():
+            return
+    except Exception:
+        return
+    logger.error(
+        "XDART_DEBUG_DISPLAY tripwire: GUI thread blocking-acquiring "
+        "file_lock while a run is active (_processing_active) — the BB-1 "
+        "false-sharing class; move this read to a background worker",
+        stack_info=True)
+
+
 def _chunked(values, size):
     values = tuple(values)
     size = max(1, int(size))
@@ -600,6 +623,8 @@ class DisplayDataMixin:
         reader that opens the processed scan file should enter here first.
         """
         lock = DisplayDataMixin._scan_file_lock(self, scan)
+        if lock is not None and os.environ.get("XDART_DEBUG_DISPLAY"):
+            _tripwire_gui_thread_file_lock(self)
         ctx = lock if lock is not None else nullcontext()
         with ctx:
             yield
