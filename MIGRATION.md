@@ -293,6 +293,18 @@ for downstream users:
   case-mismatched monitor key will integrate to different (correct) numbers. Re-reduce such
   datasets if exact reproduction of the old (un-normalized) values matters.
 
+## Fixes in v1.0.2
+
+* **The Windows Start-menu shortcut launches again.** The conda shortcut runs
+  xdart under `pythonw.exe` (the no-console interpreter), where `sys.stderr` is
+  None — startup's very first call, `faulthandler.enable()`, raised
+  `RuntimeError` there and the app closed before its window could appear (the
+  shortcut flashed and vanished; running `xdart` from a PowerShell prompt
+  worked). Startup now installs the rotating file log first and faulthandler
+  falls back to a dedicated `faulthandler.log` side file next to it (or stays
+  off if neither stderr nor a log directory is usable) — it never aborts the
+  launch. Affected v1.0.0 and v1.0.1 equally.
+
 ## Fixes in v1.0.1
 
 Patch release completing the `xrd-tools` → `xdart` distribution rename. v1.0.0

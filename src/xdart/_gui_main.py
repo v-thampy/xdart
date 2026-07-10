@@ -28,10 +28,19 @@ import faulthandler
 # currently uses, so basicConfig(INFO) is enough to surface them.
 # The DEBUG line below opts specific loggers into more verbose output;
 # the basicConfig must happen first so the handler's threshold is open.
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(levelname)s:%(name)s:%(message)s',
-)
+if sys.stderr is not None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(levelname)s:%(name)s:%(message)s',
+    )
+else:
+    # pythonw (the Windows no-console interpreter, used by the Start-menu
+    # shortcut) sets sys.stderr to None.  basicConfig would then build a
+    # StreamHandler whose stream is None, and every root record would be
+    # eaten by that broken handler's error path.  Skip the console handler
+    # entirely and just open the root at INFO so records reach the rotating
+    # file handler installed in run().
+    logging.getLogger().setLevel(logging.INFO)
 
 # Suppress pyFAI INFO logs (e.g. "No sensor configuration provided").
 logging.getLogger('pyFAI').setLevel(logging.WARNING)
@@ -93,6 +102,78 @@ def _install_file_log_handler():
         logging.getLogger(__name__).warning(
             'could not open a log file for writing', exc_info=True)
     return LOG_FILE_PATH
+
+
+#: Open handle of the faulthandler side file used on windowless launches.
+#: Module global ON PURPOSE: faulthandler keeps writing to this fd for the
+#: rest of the process, so the file object must never be garbage-collected
+#: (a collected handle closes the fd and the next crash dump goes nowhere).
+_FAULTHANDLER_FILE = None
+
+
+def _stderr_has_fileno():
+    """True when ``sys.stderr`` exists and exposes a real OS fd.
+
+    pythonw (the Windows no-console interpreter) sets it to None; captured /
+    in-memory stderrs (pytest capsys, StringIO) raise on ``fileno()``.  Both
+    are unusable for faulthandler, which writes straight to the fd."""
+    stderr = sys.stderr
+    if stderr is None:
+        return False
+    try:
+        stderr.fileno()
+    except Exception:
+        return False
+    return True
+
+
+def _enable_faulthandler():
+    """Enable faulthandler (crash tracebacks + the SIGUSR1 stack dump) without
+    EVER raising — a diagnostic must never stop the GUI from starting.
+
+    Normal console: plain ``faulthandler.enable()`` to stderr, as before.
+    Windowless launch (the Windows Start-menu shortcut runs ``pythonw.exe``,
+    whose ``sys.stderr`` is None — bare ``enable()`` raises RuntimeError there
+    and killed the app before the QApplication existed): dump to a dedicated
+    ``faulthandler.log`` next to the rotating log file, truncated per launch.
+    Deliberately NOT the RotatingFileHandler's own stream — rotation closes
+    that fd underneath faulthandler.  No usable stderr and no log dir: skip.
+    """
+    global _FAULTHANDLER_FILE
+    try:
+        side_file = None                       # None -> dump to real stderr
+        if not _stderr_has_fileno():
+            if LOG_FILE_PATH is None:
+                logger.debug(
+                    "faulthandler disabled: no usable stderr and no log file")
+                return
+            side_file = open(Path(LOG_FILE_PATH).parent / 'faulthandler.log',
+                             'w', encoding='utf-8')
+        if side_file is None:
+            faulthandler.enable()
+        else:
+            faulthandler.enable(file=side_file)
+        if hasattr(signal, "SIGUSR1"):
+            # Live-freeze diagnostic (POSIX-only): `kill -USR1 <pid>` dumps
+            # every thread's Python stack — to stderr, or to the side file on
+            # a windowless launch — even while the GUI thread is busy (the
+            # dump runs in the C signal handler, no GIL needed).  No root
+            # required, unlike py-spy on macOS.
+            if side_file is None:
+                faulthandler.register(signal.SIGUSR1, all_threads=True)
+            else:
+                faulthandler.register(signal.SIGUSR1, file=side_file,
+                                      all_threads=True)
+        old = _FAULTHANDLER_FILE
+        _FAULTHANDLER_FILE = side_file
+        if old is not None and old is not side_file:
+            try:
+                old.close()                    # re-enable (tests): drop the stale handle
+            except Exception:
+                pass
+    except Exception:
+        logger.debug("could not enable faulthandler", exc_info=True)
+
 
 # pyqtgraph's log-axis tick painter computes 10**range while the histogram
 # axis still holds the previous LINEAR image's extent for one paint after a
@@ -698,13 +779,18 @@ def _apply_cli_session_args(argv):
 
 def run():
     # Process-global state claimed HERE, at real GUI launch — never on import.
-    faulthandler.enable()  # Print Python traceback on bus error / segfault
-    if hasattr(signal, "SIGUSR1"):
-        # Live-freeze diagnostic: `kill -USR1 <pid>` dumps every thread's
-        # Python stack to stderr, even while the GUI thread is busy (the dump
-        # runs in the C signal handler, no GIL needed).  No root required,
-        # unlike py-spy on macOS.
-        faulthandler.register(signal.SIGUSR1, all_threads=True)
+    # File logging FIRST: a windowless launch (the pythonw Start-menu
+    # shortcut, pixi global) has no terminal, so everything below — the
+    # faulthandler side-file fallback and any startup traceback — must land
+    # in the rotating file, which exists for exactly this case.
+    log_path = _install_file_log_handler()
+    if log_path is not None:
+        logger.info("xdart logging to %s", log_path)
+    # Python traceback on bus error / segfault (+ the SIGUSR1 stack dump).
+    # Never raises: under pythonw sys.stderr is None and a bare
+    # faulthandler.enable() would RuntimeError before the QApplication exists
+    # (the v1.0.0/v1.0.1 Start-menu flash-and-close crash).
+    _enable_faulthandler()
     # Hard-pin the Qt binding for pyqtgraph and export MPLBACKEND so child
     # processes (e.g. pyFAI-calib2) inherit the Qt6 backend.
     os.environ['PYQTGRAPH_QT_LIB'] = 'PySide6'
@@ -745,13 +831,6 @@ def run():
     # never as an import-time side effect (importing this module must not hijack
     # the process-global sys.excepthook for tests / headless / embedding hosts).
     sys.excepthook = _xdart_excepthook
-    # File logging: a windowless launch (pixi global / menuinst shortcut) has no
-    # terminal, so the console handler goes nowhere.  Route logs to a rotating
-    # file too -- same "only when the GUI is actually launched, never on import"
-    # rule as the excepthook above.
-    log_path = _install_file_log_handler()
-    if log_path is not None:
-        logger.info("xdart logging to %s", log_path)
     # N8: apply the saved theme before any widget construction so
     # pyqtgraph plot backgrounds are set in time (pyqtgraph
     # snapshots the config at widget creation).

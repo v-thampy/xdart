@@ -101,9 +101,10 @@ def run_update(update_cmd, relaunch_cmd, log_path, *, runner=None, launcher=None
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if len(argv) < 4:
-        sys.stderr.write(
-            "usage: python -m xdart._updater PARENT_PID APP_ROOT "
-            "UPDATE_CMD_JSON RELAUNCH_CMD_JSON [LOG_PATH]\n")
+        if sys.stderr is not None:   # None under pythonw (detached from the GUI)
+            sys.stderr.write(
+                "usage: python -m xdart._updater PARENT_PID APP_ROOT "
+                "UPDATE_CMD_JSON RELAUNCH_CMD_JSON [LOG_PATH]\n")
         return 2
     try:
         parent_pid = int(argv[0])
