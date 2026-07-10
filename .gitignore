@@ -13,6 +13,8 @@ build/
 .env
 .venv
 *.log
+# pixi dev workspace: ignore the env dir; DO commit pixi.lock for reproducibility
+.pixi/
 .claude/
 claude_prompts*.md
 test.hdf5
