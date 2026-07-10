@@ -412,6 +412,62 @@ def test_accumulate_waterfall_row_meta_replace_drop_and_reset():
     assert h4.row_meta == (m_new,)
 
 
+def test_accumulate_waterfall_d1_canonicalizes_cross_native_unit_rows():
+    # V1 Stage 3 (D1): a grid-compatible append whose NATIVE unit is the
+    # other member of the Q↔2θ pair converts its x with each row's OWN
+    # carried wavelength, then the BL-6 value interp aligns it — the
+    # accumulator grid/unit stay the history's, and the peak lands at the
+    # correct PHYSICAL q.
+    np = pytest.importorskip("numpy")
+    lam = 1e-10
+    xq = np.linspace(1.0, 5.0, 200)
+    hist = dl.accumulate_waterfall(
+        None, reset_key="grid", unit="q_A^-1", x=xq,
+        rows=[np.linspace(1.0, 2.0, 200)], ids=[("A", 0)], names=["A/0"],
+        row_meta=[dl.RowMeta(source_unit="q_A^-1", wavelength_m=lam)])
+    # Scan B integrated natively in 2θ over a shifted physical range
+    # (q 1.5..5.5), same npt (grid-compatible by key), peak at q = 3.0.
+    x_tth = dl.convert_2d_radial(
+        np.linspace(1.5, 5.5, 200), data_unit="q_A^-1",
+        want_tth=True, want_q=False, wavelength_m=lam)
+    peak_tth = float(dl.convert_2d_radial(
+        np.asarray([3.0]), data_unit="q_A^-1", want_tth=True, want_q=False,
+        wavelength_m=lam)[0])
+    row_b = np.zeros_like(x_tth)
+    row_b[int(np.argmin(np.abs(x_tth - peak_tth)))] = 100.0
+    out = dl.accumulate_waterfall(
+        hist, reset_key="grid", unit="2th_deg", x=x_tth,
+        rows=[row_b], ids=[("B", 0)], names=["B/0"],
+        row_meta=[dl.RowMeta(source_unit="2th_deg", wavelength_m=lam)])
+    assert list(out.ids) == [("A", 0), ("B", 0)]
+    assert out.unit == "q_A^-1"                     # grid/unit stay native
+    np.testing.assert_array_equal(np.asarray(out.x), xq)
+    b_row = np.asarray(out.rows)[1]
+    peak_q = float(out.x[int(np.argmax(b_row))])
+    assert abs(peak_q - 3.0) < 2 * float(xq[1] - xq[0])
+    assert np.ptp(b_row[np.isfinite(b_row)]) > 0    # no disjoint-domain clamp
+
+
+def test_accumulate_waterfall_d1_lambda_less_cross_unit_batch_skipped():
+    # V1 Stage 3 (D1): the same cross-native-unit append with NO carried
+    # wavelength cannot canonicalize; with the relabel unable to engage
+    # (different grid size) the batch is SKIPPED with an ERROR — the
+    # production QW-4 tripwire (no env gate).
+    np = pytest.importorskip("numpy")
+    import logging as _logging
+    xq = np.linspace(1.0, 5.0, 200)
+    hist = dl.accumulate_waterfall(
+        None, reset_key="grid", unit="q_A^-1", x=xq,
+        rows=[np.linspace(1.0, 2.0, 200)], ids=[("A", 0)], names=["A/0"])
+    x_tth = np.linspace(10.0, 55.0, 128)
+    out = dl.accumulate_waterfall(
+        hist, reset_key="grid", unit="2th_deg", x=x_tth,
+        rows=[np.linspace(5.0, 6.0, 128)], ids=[("B", 0)], names=["B/0"],
+        row_meta=[dl.RowMeta(source_unit="2th_deg", wavelength_m=None)])
+    assert list(out.ids) == [("A", 0)]              # skipped, nothing lost
+    assert out.unit == "q_A^-1"                     # the axis never lies
+
+
 def test_accumulate_waterfall_reset_key_change_resets():
     np = pytest.importorskip("numpy")
     x = np.array([0.0, 1.0, 2.0])

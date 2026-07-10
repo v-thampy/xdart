@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-"""V1 Stage-1 RowMeta capture, production-wired (canonical-grid plan §Stage-1).
+"""V1 RowMeta capture, production-wired (canonical-grid plan §Stage-1/3).
 
 Drives the REAL adapter → ``append_row`` → ``accumulate_waterfall`` path via
 :mod:`tests.xdart.ov_harness` and asserts the per-row transform provenance
 (``WaterfallHistory.row_meta``) is captured on a real append: the
-acquisition-native ``source_unit`` (read BEFORE the plotUnit conversion), the
-row's wavelength, and the norm channel + monitor value actually applied.
-Stage 1 is dual-write: rows are still stored post-transform, so nothing here
-asserts display output — only that the carried provenance is present and
-id-aligned (what the Stage-3 flip will consume).
+acquisition-native ``source_unit``, the row's wavelength, and the norm
+channel + monitor value.  Since Stage 3 the rows themselves are stored
+acquisition-NATIVE and the provenance is capture-only (norm/conversion run
+at draw), so nothing here asserts display output — only that the carried
+provenance is present and id-aligned (what the draw-time render consumes).
 """
 
 from __future__ import annotations
@@ -27,13 +27,13 @@ def test_row_meta_captured_on_real_append():
     assert meta is not None
     assert meta.source_unit == "q_A^-1"
     assert meta.wavelength_m == pytest.approx(1e-10)
-    # No norm channel selected: channel/value record "none applied".
+    # No norm channel selected: channel/value record "none would apply".
     assert meta.norm_channel is None and meta.norm_value is None
     assert meta.bkg_token is None and meta.projection_id is None
-    assert meta.native_x is None and meta.native_y is None   # Stage-2 slots
 
     # A REAL channel change (S-16 rebuild) re-captures under the new channel;
-    # the value is the row's own monitor reading from metadata_raw.
+    # the value is the row's own monitor reading from metadata_raw
+    # (PROVENANCE only since Stage 3 — the stored row stays un-normed).
     h.norm_change(real=True, channel="i0")
     h.publish(1)
     hist = h.history
@@ -45,14 +45,15 @@ def test_row_meta_captured_on_real_append():
 def test_row_meta_source_unit_stays_native_across_unit_flip():
     h = OVHarness()
     h.publish(0)
-    h.unit_toggle()                       # display Q→2θ: a relabel
-    h.publish(1)                          # this row arrives converted to 2θ
+    h.unit_toggle()                       # display Q→2θ: a draw-time relabel
+    h.publish(1)                          # arrives + is STORED native (Stage 3)
     hist = h.history
     assert hist.count == 2 and len(hist.row_meta) == 2
-    # source_unit is captured BEFORE _apply_plot_unit_1d, so it names the
-    # acquisition-native unit even when the display (history.unit) does not.
+    # source_unit names the acquisition-native unit; since Stage 3 the
+    # history itself is native too — the display flip never touches storage
+    # (history.unit == the native token regardless of the combo).
     assert [m.source_unit for m in hist.row_meta] == ["q_A^-1", "q_A^-1"]
-    assert hist.unit != "q_A^-1"
+    assert hist.unit == "q_A^-1"
 
 
 def test_row_meta_projection_id_rides_pinned_cut():

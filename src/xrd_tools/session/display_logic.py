@@ -35,7 +35,6 @@ them.
 from __future__ import annotations
 
 import logging
-import os
 import warnings
 from dataclasses import dataclass, field
 from enum import Enum
@@ -436,23 +435,22 @@ class PlotPayload:
 @dataclass(frozen=True)
 class RowMeta:
     """Per-row transform provenance for the Overlay/Waterfall accumulator
-    (V1 canonical-grid, Stage 1 — dual-write).
+    (V1 canonical-grid; storage is acquisition-NATIVE since Stage 3).
 
-    Rows are still stored post-transform; each field records the ambient
-    input (F-E) that produced the stored row, captured AT APPEND TIME, so the
-    Stage-3 flip can re-apply norm/unit conversion at draw from carried
-    values instead of ambient lookups.  ``native_x``/``native_y`` are
-    reserved for the Stage-2 dual-capture equivalence scaffolding and stay
-    ``None`` until then (excluded from equality: ndarray ``==`` is not a
-    bool)."""
-    source_unit: str = ""                   # axis unit BEFORE the plotUnit conversion
+    Rows are stored acquisition-native; each field records the ambient input
+    (F-E) captured AT APPEND TIME so the draw-time render
+    (:func:`render_waterfall_view`) works from carried values instead of
+    ambient lookups.  ``norm_channel``/``norm_value`` are provenance-only —
+    captured, NOT applied to the stored row (normalization happens at draw,
+    against the CURRENT channel).  ``wavelength_m`` is the row's own λ: it
+    drives both the D1 append-time canonicalization of cross-native-unit
+    rows and the D2 draw-time Q↔2θ conversion."""
+    source_unit: str = ""                   # the row's acquisition-native axis unit
     wavelength_m: "float | None" = None
-    norm_channel: "str | None" = None
+    norm_channel: "str | None" = None       # provenance-only: captured, not applied
     norm_value: "float | None" = None       # the row's monitor value for norm_channel
     bkg_token: "object | None" = None       # opaque bkg recipe identity (draw-time apply)
     projection_id: "object | None" = None   # slice projection, duplicated from the row id
-    native_x: "np.ndarray | None" = field(default=None, repr=False, compare=False)
-    native_y: "np.ndarray | None" = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -686,10 +684,18 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
     therefore APPENDS (same key), retaining rows for frames since evicted past the
     store cap.
 
-    A plotUnit Q<->2theta toggle does NOT change ``reset_key``, so ``unit`` changes
-    while ``reset_key`` does not: the accumulated rows are unit-invariant, so we
-    RELABEL the grid to the incoming (new-unit) ``x`` in place -- no re-read, no loss
-    of evicted frames -- keeping every captured row.
+    V1 Stage 3 (canonical grid): rows are stored acquisition-NATIVE, so
+    ``unit`` names the incoming rows' native integration unit and
+    ``history.unit`` the grid's — a plotUnit Q<->2theta toggle no longer
+    reaches this function at all (the display conversion happens at draw,
+    :func:`render_waterfall_view`).  A CROSS-NATIVE-UNIT append (scan A
+    integrated in q, scan B in 2theta — the reset key is unit-blind on
+    purpose) canonicalizes the incoming grid onto the history's native unit
+    with each row's own carried wavelength (D1), then the BL-6 value-drift
+    interp aligns it; rows with no carried wavelength are SKIPPED for the
+    render with an ERROR rather than mixed across disjoint domains.  The
+    legacy same-size display-relabel branch remains for pre-flip callers
+    until Stage 4 deletes it.
 
     ``x`` / ``rows`` / ``ids`` / ``names`` are the incoming frames, already on the
     one shared grid (the adapter interpolated them).  Returns the next
@@ -740,30 +746,63 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
             row_buffer=row_buffer, count=count, ids=ki, names=kn,
             metadata=km, row_meta=krm)
 
-    # Same identity: keep the accumulated rows; relabel the grid on a unit toggle
-    # (incoming x is the same sample grid in the new unit), then append new ids.
+    # Same identity: keep the accumulated rows.  Cross-unit incoming batches
+    # (V1 Stage 3 — storage is acquisition-NATIVE, so ``unit`` names the
+    # incoming rows' native unit and ``history.unit`` the grid's) resolve in
+    # priority order:
+    #
+    # 1. D1 canonicalization: a cross-scan append whose NATIVE unit is the
+    #    other member of the Q↔2θ pair converts its grid with each row's own
+    #    carried wavelength (``row_meta``), then falls through to the BL-6
+    #    value-drift interp below — the accumulator grid/unit stay the
+    #    history's.  Fires only when EVERY incoming row carries a λ.
+    # 2. Legacy display-relabel (same grid size): a pre-flip caller
+    #    relabeling the grid in place on a display-unit toggle.  Production
+    #    no longer reaches this (a plotUnit toggle is draw-time now);
+    #    Stage 4 deletes it.
+    # 3. Otherwise the batch cannot be represented on this grid: SKIP it
+    #    this render with an ERROR (the QW-4 tripwire, production behavior
+    #    since Stage 3 — previously XDART_DEBUG_DISPLAY-gated).  The rows
+    #    re-arrive on a later render (the S-17 re-arrival policy) instead of
+    #    np.interp-ing across disjoint domains (Q ~1-8 A^-1 vs 2theta
+    #    ~10-55 deg), which clamps to a constant and permanently appends
+    #    blank bands.
+    canon_x = None
+    if ids and history.unit != unit:
+        have_kind = _radial_kind(history.unit)
+        in_kind = _radial_kind(unit)
+        if (have_kind is not None and in_kind is not None
+                and have_kind != in_kind
+                and not is_gi_2d_units(history.unit, "")
+                and not is_gi_2d_units(unit, "")):
+            lams = [getattr(rm, "wavelength_m", None) for rm in row_meta]
+            if all(lam and lam > 0 for lam in lams):
+                want_tth = have_kind == "tth"
+                canon_x = [
+                    convert_2d_radial(
+                        x, data_unit=unit, want_tth=want_tth,
+                        want_q=not want_tth, wavelength_m=lam)
+                    for lam in lams]
+                unit = history.unit
+                label = history.label
     base_x = (x if history.unit != unit and x.size == history.x.size
               else history.x)
-    # QW-4 tripwire (XDART_DEBUG_DISPLAY=1 only; zero production cost):
-    # incoming rows in a DIFFERENT unit than the accumulator with the relabel
-    # NOT engaged (grid sizes differ) would reach the BL-6 np.interp below and
-    # interpolate across disjoint domains (Q ~1-8 A^-1 vs 2theta ~10-55 deg),
-    # clamping to a constant and permanently appending blank bands.  Under the
-    # debug flag: log ERROR once and SKIP the batch (the rows re-arrive
-    # converted on a later render — the S-17 empty-row policy).
-    _cross_unit_no_relabel = (
-        history.unit != unit and base_x is history.x
-        and bool(os.environ.get("XDART_DEBUG_DISPLAY")))
+    _cross_unit_no_relabel = (history.unit != unit and base_x is history.x)
     if _cross_unit_no_relabel and ids:
         logger.error(
             "accumulate_waterfall: %d cross-unit row(s) (incoming unit=%r, "
-            "accumulator unit=%r) with the relabel not engaged "
-            "(x.size=%d vs history %d) — skipping this batch instead of "
-            "interpolating across disjoint domains [XDART_DEBUG_DISPLAY "
-            "tripwire]", len(ids), unit, history.unit, x.size,
+            "accumulator unit=%r) with no carried wavelength to canonicalize "
+            "and the relabel not engaged (x.size=%d vs history %d) — "
+            "skipping this batch instead of interpolating across disjoint "
+            "domains [QW-4 tripwire]", len(ids), unit, history.unit, x.size,
             history.x.size)
         ids, names, rows, metadata, row_meta = (
             ids[:0], names[:0], rows[:0], metadata[:0], row_meta[:0])
+        # The skipped batch contributes nothing: the emitted history keeps
+        # its own unit/label (emitting the incoming unit over the unchanged
+        # native grid would relabel without converting — the axis would lie).
+        unit = history.unit
+        label = history.label
     out_ids = list(history.ids)
     out_names = list(history.names)
     out_meta = list(getattr(history, "metadata", ()) or ())
@@ -782,19 +821,22 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
             new_buffer[:count] = row_buffer[:count]
         row_buffer = new_buffer
 
-    for i, n, r, m, rm in zip(ids, names, rows, metadata, row_meta):
+    for j, (i, n, r, m, rm) in enumerate(zip(ids, names, rows, metadata,
+                                             row_meta)):
         key = _dedup_key(i)
-        # BL-6: align the incoming row (on grid ``x``) to the accumulated
-        # ``base_x`` whenever they differ -- by sample-count OR by VALUES.  Two
-        # scans with the same axis+npt but a different radial_range (recalibration,
-        # an edited range) are grid-COMPATIBLE (range is excluded from the reset
-        # key on purpose) yet have DIFFERENT x, so without the value check scan B's
-        # intensities render at scan A's x positions.
+        # BL-6: align the incoming row (on its grid ``xi`` — the shared ``x``,
+        # or its D1-canonicalized form) to the accumulated ``base_x`` whenever
+        # they differ -- by sample-count OR by VALUES.  Two scans with the
+        # same axis+npt but a different radial_range (recalibration, an
+        # edited range) are grid-COMPATIBLE (range is excluded from the reset
+        # key on purpose) yet have DIFFERENT x, so without the value check
+        # scan B's intensities render at scan A's x positions.
+        xi = canon_x[j] if canon_x is not None else x
         r = np.asarray(r, dtype=float)
-        if (x.size == r.size and x.size > 0 and base_x.size > 0
-                and (x.size != base_x.size
-                     or not np.allclose(x, base_x, equal_nan=True))):
-            r = np.interp(base_x, x, r)
+        if (xi.size == r.size and xi.size > 0 and base_x.size > 0
+                and (xi.size != base_x.size
+                     or not np.allclose(xi, base_x, equal_nan=True))):
+            r = np.interp(base_x, xi, r)
         if key in index_by_key:
             if key in replace_keys:
                 pos = index_by_key[key]
@@ -856,17 +898,18 @@ def waterfall_display_rows(rows, ids, max_rows):
     return rows[::stride], ids[::stride], stride
 
 
-# ── V1 Stage-2: pure draw-time transforms (canonical-grid plan) ───────
+# ── V1: pure draw-time transforms (canonical-grid plan, Stage 2/3) ────
 #
 # These three functions are the draw-time half of the V1 flip: given a
 # WaterfallHistory whose rows are stored acquisition-NATIVE (Stage-3
 # semantics: ``history.unit`` is the native integration unit, per-row
 # transform provenance rides in ``history.row_meta``), they produce the
 # display view — decimate, then normalize, then unit-convert — from
-# carried per-row values only, never ambient widget state.  In Stage 2
-# nothing calls them from production; the equivalence suite
-# (test_v1_draw_equivalence.py) proves stored_row ≈ render(native_row)
-# before Stage 3 rewires ``_history_to_payload`` onto them.
+# carried per-row values only, never ambient widget state.  Since Stage 3
+# this IS the production draw path: ``_history_to_payload`` renders every
+# Overlay/Waterfall payload through :func:`render_waterfall_view`; the
+# equivalence suite (test_v1_draw_equivalence.py) pins rendered output
+# against first-principles expected curves.
 
 
 def _radial_kind(unit):
@@ -930,12 +973,21 @@ def _display_grid_for_rows(x, unit, label, row_meta, *, want_unit):
     axis is kept (no conversion fired)."""
     x = np.asarray(x, dtype=float)
     unit = str(unit or "")
-    # The native display axis mirrors _history_to_payload: the carried label
-    # (or the table label for a known unit), and the display symbol for a
-    # native pyFAI token (pretty_unit is the identity on already-display
-    # units, so today's display-space histories pass through unchanged).
+    # The native display axis: the carried label (or the table label for a
+    # known unit), and the display symbol for a native pyFAI token.
+    # pretty_unit resolves table units; off-table units take the same
+    # heuristics as the adapter's _display_unit_symbol (Å⁻¹ for any inverse-
+    # Ångström spelling, ° for any *_deg) so the rendered axis matches what
+    # the pre-flip _axis_for_publication emitted for them.
+    disp_unit = pretty_unit(unit)
+    if disp_unit == unit and unit:
+        low = unit.lower()
+        if "a^-1" in low or "angstrom" in low:
+            disp_unit = _AA_INV
+        elif "deg" in low:
+            disp_unit = _DEG
     native_axis = Axis(label=(label or x_axis_for_unit(unit)[0]),
-                       unit=pretty_unit(unit))
+                       unit=disp_unit)
     no_interp = (False,) * len(row_meta)
     if x.size == 0:
         return x, native_axis, no_interp, None, None
@@ -1016,11 +1068,15 @@ def render_waterfall_view(history, *, want_unit, norm_channel=None,
     (≤ ``max_rows``) rows, never the full accumulation.
 
     Returns ``(x_display, rows_display, ids_display, axis)`` where ``axis``
-    is the display :class:`Axis` (label + unit symbol).  ``rows_display`` is
-    always a NEW array; the history buffer is never touched.  Rows flagged by
-    D2 (per-row wavelength ≠ λ_ref) are individually converted with their own
-    wavelength and ``np.interp``-ed onto ``x_display`` — the draw-time
-    equivalent of today's per-row build-time convert+interp."""
+    is the display :class:`Axis` (label + unit symbol).  ``rows_display``
+    NEVER aliases-and-mutates the history buffer: a copy is made exactly
+    when a transform writes (norm channel set, or a D2 per-row interp) —
+    the no-transform render returns a read-only view so the per-repaint
+    cost stays at the Stage-0 payload-build level (measured, plan §3).
+    Rows flagged by D2 (per-row wavelength ≠ λ_ref) are individually
+    converted with their own wavelength and ``np.interp``-ed onto
+    ``x_display`` — the draw-time equivalent of the pre-flip per-row
+    build-time convert+interp."""
     rows, ids, stride = waterfall_display_rows(
         history.rows, history.ids, max_rows)
     n_rows = len(getattr(history, "ids", ()) or ())
@@ -1034,12 +1090,17 @@ def render_waterfall_view(history, *, want_unit, norm_channel=None,
     # stay row-aligned with the decimated rows/ids.
     metadata = metadata[::stride] if stride > 1 else metadata[:n_rows]
     row_meta = row_meta[::stride] if stride > 1 else row_meta[:n_rows]
-    rows = normalize_rows(rows, metadata, norm_channel)
+    if norm_channel:
+        rows = normalize_rows(rows, metadata, norm_channel)   # a new array
+    else:
+        rows = np.atleast_2d(np.asarray(rows, dtype=float))   # view: no copy
     x_display, axis, needs_interp, _lam_ref, want_kind = (
         _display_grid_for_rows(
             history.x, history.unit, history.label, row_meta,
             want_unit=want_unit))
     if want_kind is not None and any(needs_interp):
+        if not norm_channel:
+            rows = rows.copy()      # about to write per-row: detach the view
         want_tth = want_kind == "tth"
         x_native = np.asarray(history.x, dtype=float)
         for k, flagged in enumerate(needs_interp):

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -37,6 +38,7 @@ from .display_logic import (
     convert_2d_radial,
     is_gi_2d_units,
     nanmean_slice,
+    render_waterfall_view,
     resample_cake_to_unit,
     waterfall_display_rows,
 )
@@ -947,8 +949,10 @@ class PublicationDisplayAdapter:
         PlotPayload carrying it.  Preserves the legacy invariants: a render with no
         resident 1D frames PRESERVES the prior accumulator (never wipes -- the
         failed-read invariant); an incompatible grid/source change
-        (``reset_key``) resets it; a plotUnit Q<->2theta toggle relabels the grid
-        in place (handled in accumulate_waterfall).  The accumulator is keyed on a
+        (``reset_key``) resets it; a plotUnit Q<->2theta toggle is a pure
+        draw-time relabel (V1 Stage 3: rows are stored acquisition-native and
+        the display conversion runs in _history_to_payload -- the stored
+        history does not change at all).  The accumulator is keyed on a
         STABLE grid identity, NOT state.generation -- the generation bumps every
         tick as live auto-last grows the selection, so keying on it would reset
         each tick and rebuild from only the un-evicted frames (cap-truncation).
@@ -959,10 +963,14 @@ class PublicationDisplayAdapter:
 
         # S-16: reset the accumulator when the normalization CHANNEL actually
         # changes between renders (refresh_norm_channels can silently reset the
-        # combo cross-scan).  Without this the append-only history permanently
-        # MIXES normalized and un-normalized rows with no reset.  Record the
-        # channel that WILL be applied this render (read once, the same source the
-        # per-row _normalize uses) on the widget, parallel to _waterfall_history.
+        # combo cross-scan).  V1 Stage 3: rows are stored native and the norm
+        # applies at DRAW, so this wipe is no longer needed for row
+        # correctness -- it is deliberately KEPT this stage so the norm-change
+        # contract (reset at the same cause) is unchanged; Stage 4 deletes it
+        # (S-16 dissolves into re-render-no-reset).  Record the channel that
+        # will be applied at draw (read once, the same source
+        # _history_to_payload uses) on the widget, parallel to
+        # _waterfall_history.
         _get_norm = getattr(widget, "get_normChannel", None)
         cur_norm = _get_norm() if callable(_get_norm) else None
         prev_norm = getattr(widget, "_overlay_accum_norm_channel", _UNSET)
@@ -1037,9 +1045,11 @@ class PublicationDisplayAdapter:
         # BL-6: when the existing overlay history is grid-compatible, anchor NEW
         # rows to ITS grid (prior.x) so a cross-scan append with a different
         # radial_range but the same axis+npt reinterps onto ONE x -- otherwise
-        # scan B's intensities render at scan A's x positions.  A plotUnit toggle
-        # is guarded in append_row (adopt only when the first row's axis unit ==
-        # prior.unit); accumulate_waterfall is the belt-and-suspenders reinterp.
+        # scan B's intensities render at scan A's x positions.  Adoption is
+        # guarded in append_row on the row's NATIVE unit == prior.unit (V1
+        # Stage 3: both are native tokens; a cross-NATIVE-unit append instead
+        # canonicalizes inside accumulate_waterfall, D1); accumulate_waterfall
+        # is the belt-and-suspenders reinterp.
         prior_x_seed = None
         if (prior is not None
                 and overlay_grid_keys_match(prior.reset_key, planned_reset_key)
@@ -1049,12 +1059,6 @@ class PublicationDisplayAdapter:
         axis = None
         reset_key = None
         ids, names, rows, metadata, row_meta = [], [], [], [], []
-        # V1 Stage-2 equivalence scaffolding (tests only): under
-        # XDART_OV_DUALCAPTURE=1 each row's PRE-transform (native_x, native_y)
-        # is stashed in its RowMeta so the equivalence suite can prove
-        # stored_row ≈ draw-time render(native).  Read once per render; when
-        # the env is unset the per-row cost is one falsy branch (no copies).
-        dualcapture = bool(os.environ.get("XDART_OV_DUALCAPTURE"))
 
         def append_row(label, *, recipe=None, live=False):
             nonlocal ref_x, axis, reset_key
@@ -1068,7 +1072,6 @@ class PublicationDisplayAdapter:
             row_needs_2d = needs_2d
             if recipe is not None:
                 row_needs_2d = True
-            native_x = native_y = None   # XDART_OV_DUALCAPTURE only
             if not row_needs_2d:
                 if not view.has_1d or publication_has_1d_errors(pub):
                     return None
@@ -1076,39 +1079,35 @@ class PublicationDisplayAdapter:
                 y = np.asarray(view.intensity_1d, dtype=float)
                 if x.shape != y.shape:
                     return None
-                # V1 RowMeta: the acquisition-native unit, read BEFORE the
-                # plotUnit conversion overwrites the axis.
+                # V1 Stage 3 (THE FLIP): the stored row is acquisition-NATIVE.
+                # No norm, no plotUnit conversion here — both run at draw
+                # (_history_to_payload → render_waterfall_view) from the
+                # carried per-row metadata/row_meta.  The axis carries the
+                # native unit TOKEN so the accumulator grid is self-
+                # describing (history.unit is the native unit since Stage 3).
                 source_unit = str(getattr(view.axis_1d, "unit", "") or "")
-                if dualcapture:
-                    # PRE-transform: before norm and the plotUnit conversion.
-                    native_x = np.array(x, dtype=float)
-                    native_y = np.array(y, dtype=float)
-                y = self._normalize(y, pub.metadata_raw)
-                x, conv_axis = self._apply_plot_unit_1d(x, source_unit, pub)
-                this_axis = (conv_axis if conv_axis is not None
-                             else _axis_for_publication(view.axis_1d))
+                this_axis = Axis(
+                    label=_axis_for_publication(view.axis_1d).label,
+                    unit=source_unit)
             else:
                 if not view.has_2d or publication_has_2d_errors(pub):
                     return None
                 # V1 RowMeta: the native unit of the slice x-axis (mirrors
-                # _slice_1d_from_2d's axis selection, pre-conversion).
+                # _slice_1d_from_2d's axis selection).
                 src_axis = (view.axis_2d_y
                             if row_axis_info.get("axis") == "azimuthal"
                             else view.axis_2d_x)
                 source_unit = str(getattr(src_axis, "unit", "") or "")
+                # V1 Stage 3: the (irreversible) 2D→1D projection stays
+                # build-time; norm + Q↔2θ conversion move to draw, so the
+                # projected row is stored acquisition-native.
                 projected = self._slice_1d_from_2d(
                     view, pub, row_axis_info,
-                    slice_center=row_center, slice_width=row_width)
+                    slice_center=row_center, slice_width=row_width,
+                    apply_display_transforms=False)
                 if projected is None:
                     return None
                 x, y, this_axis = projected
-                if dualcapture:
-                    # PRE-transform slice, stashed by _slice_1d_from_2d after
-                    # the (irreversible) projection but before norm + the
-                    # unit conversion it bakes in.
-                    native_x, native_y = getattr(
-                        self, "_dualcapture_native", None) or (None, None)
-                    self._dualcapture_native = None
             if np.asarray(x).size == 0:   # S-17: an empty grid carries no trace
                 return None
             if recipe is not None:
@@ -1135,8 +1134,9 @@ class PublicationDisplayAdapter:
                 ref_x = x
                 axis = this_axis
                 reset_key = row_grid_key
-                # BL-6: adopt the compatible prior grid (SAME unit only, so a
-                # Q<->2theta toggle is not misread) so this and every later row
+                # BL-6: adopt the compatible prior grid (same NATIVE unit
+                # only; a cross-native-unit row canonicalizes in
+                # accumulate_waterfall instead) so this and every later row
                 # land on the existing overlay x.
                 if use_prior_seed:
                     if (x.shape != prior_x_seed.shape
@@ -1177,10 +1177,12 @@ class PublicationDisplayAdapter:
             names.append(name)
             rows.append(y)
             metadata.append(dict(pub.metadata_raw or {}))
-            # V1 Stage-1 dual-write: the ambient transform inputs this stored
-            # (post-transform) row was built from, captured per row so the
-            # Stage-3 flip can re-derive the display from carried values.
-            # _get_wavelength is defensive: duck-widget hosts may lack it.
+            # V1 RowMeta: the ambient transform inputs captured per row —
+            # PROVENANCE ONLY since Stage 3 (rows are stored native; the
+            # draw-time render re-derives norm/conversion from these carried
+            # values).  norm_channel/value record what WOULD apply, not what
+            # was applied.  _get_wavelength is defensive: duck-widget hosts
+            # may lack it.
             try:
                 _get_wl = getattr(widget, "_get_wavelength", None)
                 row_wavelength = (_get_wl(getattr(pub, "raw_ref", None))
@@ -1201,8 +1203,6 @@ class PublicationDisplayAdapter:
                 norm_value=row_norm_value,
                 bkg_token=getattr(widget, "_bkg_token", None),
                 projection_id=projection_id,
-                native_x=native_x,
-                native_y=native_y,
             ))
             return row_id
 
@@ -1300,17 +1300,42 @@ class PublicationDisplayAdapter:
         """Project a :class:`WaterfallHistory` into a :class:`PlotPayload` -- one
         layered :class:`Trace` per accumulated frame, plus the carried accumulator
         (``overlaid_ids`` / ``plot_history``) so the renderer + the next render
-        read it back.  The axis label is the one CARRIED in the history (set from
-        the conversion's Axis), not re-derived from the unit -- the display unit
-        symbol does not always round-trip through x_axis_for_unit (e.g. 2θ)."""
-        label = history.label or x_axis_for_unit(history.unit)[0]
-        axis = Axis(label, history.unit)
-        rows, display_ids, _stride = waterfall_display_rows(
-            history.rows, history.ids, MAX_WATERFALL_PAYLOAD_ROWS)
+        read it back.
+
+        V1 Stage 3 (THE FLIP): the history is acquisition-NATIVE
+        (``history.unit`` is the native integration unit; rows are un-normed,
+        un-converted), so the DISPLAY view is rendered here through the pure
+        :func:`render_waterfall_view` -- decimate first, then normalize by the
+        CURRENT channel (``get_normChannel``, over the carried per-row
+        metadata), then convert to the CURRENT plotUnit (carried per-row
+        wavelengths, decisions D1/D2).  The payload's ``axis_x`` is the
+        rendered DISPLAY axis; ``plot_history`` stays the native history the
+        next render appends onto."""
+        widget = self._widget
+        try:
+            want_unit = str(widget.ui.plotUnit.currentText())
+        except Exception:
+            want_unit = ""
+        _get_norm = getattr(widget, "get_normChannel", None)
+        norm_channel = _get_norm() if callable(_get_norm) else None
+        # V1 perf instrument (plan §3): the draw-time transform cost lands
+        # here, bounded by the ≤MAX_WATERFALL_PAYLOAD_ROWS decimated rows.
+        _perf_t0 = (time.perf_counter()
+                    if os.environ.get("XDART_PERF") else None)
+        x_disp, rows, display_ids, axis = render_waterfall_view(
+            history, want_unit=want_unit, norm_channel=norm_channel,
+            max_rows=MAX_WATERFALL_PAYLOAD_ROWS)
+        if _perf_t0 is not None:
+            logger.info(
+                "[PERF] overlay payload: render_ms=%.1f rows=%d drawn=%d "
+                "unit=%r norm=%r",
+                (time.perf_counter() - _perf_t0) * 1000.0,
+                int(history.count), int(rows.shape[0]),
+                want_unit, norm_channel)
         name_by_id = {i: n for i, n in zip(history.ids, history.names)}
         traces = tuple(
             Trace(label=name_by_id.get(display_ids[k], str(display_ids[k])),
-                  x=history.x, y=rows[k])
+                  x=x_disp, y=rows[k])
             for k in range(len(display_ids)))
         return PlotPayload(axis_x=axis, traces=traces,
                            overlaid_ids=tuple(history.ids),
@@ -1364,6 +1389,7 @@ class PublicationDisplayAdapter:
         *,
         slice_center=None,
         slice_width=None,
+        apply_display_transforms=True,
     ):
         """Project a 1D curve from the active-mode 2D cake (the legacy
         ``get_int_1d`` 2D path), reducing over the slice axis.
@@ -1371,7 +1397,13 @@ class PublicationDisplayAdapter:
         FrameView stores ``intensity_2d`` as ``(axis_2d_y=azimuthal,
         axis_2d_x=radial)`` whereas the legacy ``IntegrationResult2D.intensity``
         was ``(radial, azimuthal)`` — so the reduce-axis is FLIPPED here.  Only
-        the radial display axis gets the Q↔2θ conversion (never χ)."""
+        the radial display axis gets the Q↔2θ conversion (never χ).
+
+        ``apply_display_transforms=False`` (V1 Stage 3, the Overlay/Waterfall
+        accumulator's append path) returns the projected curve
+        acquisition-NATIVE: no norm, no Q↔2θ conversion — both run at draw —
+        with the axis carrying the native unit token.  The (irreversible)
+        2D→1D projection itself always stays build-time."""
         if not view.has_2d or publication_has_2d_errors(publication):
             return None
         intensity = np.asarray(view.intensity_2d, dtype=float)
@@ -1415,13 +1447,13 @@ class PublicationDisplayAdapter:
             y = nanmean_slice(intensity[:, inds], 1)
         if y is None:
             return None
-        if os.environ.get("XDART_OV_DUALCAPTURE"):
-            # V1 Stage-2 equivalence scaffolding (tests only): the
-            # PRE-transform slice — after the irreversible 2D→1D projection
-            # (which stays build-time), before the norm + unit conversion
-            # baked in below.  Consumed by append_row into RowMeta.
-            self._dualcapture_native = (np.array(x, dtype=float),
-                                        np.array(y, dtype=float))
+        if not apply_display_transforms:
+            if x.shape[0] != y.shape[0]:
+                return None
+            native_axis = Axis(
+                label=_axis_for_publication(x_axis).label,
+                unit=str(getattr(x_axis, "unit", "") or ""))
+            return x, y, native_axis
         y = self._normalize(y, publication.metadata_raw)
         this_axis = None
         if convert:

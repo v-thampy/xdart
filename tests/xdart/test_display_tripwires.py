@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
-"""QW-4 debug tripwires (XDART_DEBUG_DISPLAY=1 only; zero production cost).
+"""QW-4 tripwires.
 
-1. accumulate_waterfall assert-on-mix: a cross-unit batch with the relabel
-   NOT engaged must be skipped (never np.interp'd across disjoint domains —
-   the constant-clamp/blank-band failure), with an ERROR naming the units.
-2. GUI-thread file_lock assert: the GUI thread blocking-acquiring the
-   writer-coordinating lock while a run is active is the BB-1 beachball
-   class; the tripwire logs ERROR with the acquiring stack.
+1. accumulate_waterfall skip-on-mix: a cross-unit batch that can neither
+   canonicalize (no carried per-row wavelength) nor relabel (grid sizes
+   differ) is skipped (never np.interp'd across disjoint domains — the
+   constant-clamp/blank-band failure), with an ERROR naming the units.
+   PRODUCTION behavior since V1 Stage 3 (previously XDART_DEBUG_DISPLAY-
+   gated); both the flag-on and flag-off paths are pinned below.
+2. GUI-thread file_lock assert (XDART_DEBUG_DISPLAY=1 only): the GUI thread
+   blocking-acquiring the writer-coordinating lock while a run is active is
+   the BB-1 beachball class; the tripwire logs ERROR with the acquiring
+   stack.
 """
 import logging
 import threading
@@ -40,17 +44,26 @@ def test_cross_unit_no_relabel_is_skipped_under_debug(monkeypatch, caplog):
     assert any("cross-unit" in r.message for r in caplog.records)
 
 
-def test_cross_unit_no_relabel_legacy_when_flag_off(monkeypatch):
+def test_cross_unit_no_relabel_skips_in_production_flag_off(
+        monkeypatch, caplog):
+    # V1 Stage 3: the skip IS production behavior (no env gate).  A λ-less
+    # cross-unit batch that cannot relabel (grid sizes differ) is dropped
+    # for this render with an ERROR instead of being appended unconverted —
+    # the conscious flip of the pre-V1 "appended (known hazard)" default,
+    # per the canonical-grid plan's D1 policy.
     monkeypatch.delenv("XDART_DEBUG_DISPLAY", raising=False)
     hist = _hist(unit="q_A^-1", n=128)
     x2 = np.linspace(10.0, 55.0, 200)
-    out = accumulate_waterfall(
-        hist, reset_key="grid", unit="2th_deg", x=x2,
-        rows=[np.linspace(5.0, 6.0, 200)], ids=[("A", 1)], names=["A/1"])
-    # Production behavior unchanged: the row is appended (the known hazard
-    # the tripwire exists to expose; pinned here so flipping the default
-    # someday is a conscious decision, not an accident).
-    assert list(out.ids) == [("A", 0), ("A", 1)]
+    with caplog.at_level(logging.ERROR):
+        out = accumulate_waterfall(
+            hist, reset_key="grid", unit="2th_deg", x=x2,
+            rows=[np.linspace(5.0, 6.0, 200)], ids=[("A", 1)], names=["A/1"])
+    assert list(out.ids) == [("A", 0)]          # batch skipped, nothing lost
+    assert np.asarray(out.rows).shape[0] == 1
+    # The emitted history keeps its OWN unit — the axis never lies about
+    # unconverted values.
+    assert out.unit == "q_A^-1"
+    assert any("cross-unit" in r.message for r in caplog.records)
 
 
 def test_unit_relabel_still_engages_under_debug(monkeypatch):

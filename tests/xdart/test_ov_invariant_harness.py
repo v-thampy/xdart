@@ -275,20 +275,28 @@ def test_unit_flip_relabels_never_resets():
     unit_q = h.history.unit
     ids_q = _ids(h)
 
-    h.unit_toggle()                        # Q → 2θ
+    _state, payload = h.unit_toggle()      # Q → 2θ
     hist = h.history
     assert hist.count == 2                 # count unchanged: no reset
     assert tuple(hist.ids) == ids_q
-    assert hist.unit != unit_q             # ... but the axis is RELABELED
-    # λ = 1 Å: 2θ = 2·asin(qλ/4π) in degrees — the grid converts physically.
+    # V1 Stage 3: relabel-not-reset is STRUCTURAL — storage is acquisition-
+    # native, so the flip touches NOTHING in the stored history ...
+    assert hist.unit == unit_q
+    np.testing.assert_allclose(np.asarray(hist.x), x_q, rtol=0)
+    # ... and the RELABEL lives in the rendered payload: λ = 1 Å ⇒
+    # 2θ = 2·asin(qλ/4π) in degrees — the display grid converts physically.
     expected = np.degrees(2.0 * np.arcsin(x_q / (4.0 * np.pi)))
-    np.testing.assert_allclose(np.asarray(hist.x), expected, rtol=1e-6)
+    np.testing.assert_allclose(
+        np.asarray(payload.traces[0].x), expected, rtol=1e-6)
+    assert "°" in str(payload.axis_x.unit)             # degrees on screen
 
-    h.unit_toggle()                        # 2θ → Q round-trips
+    _state, payload = h.unit_toggle()      # 2θ → Q round-trips
     hist = h.history
     assert hist.count == 2
     assert hist.unit == unit_q
-    np.testing.assert_allclose(np.asarray(hist.x), x_q, rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(hist.x), x_q, rtol=0)
+    np.testing.assert_allclose(np.asarray(payload.traces[0].x), x_q, rtol=0)
+    assert "°" not in str(payload.axis_x.unit)         # back to Å⁻¹
     assert h.resets_observed == []
 
 

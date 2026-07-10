@@ -231,8 +231,12 @@ class OVHarness:
             frames=SimpleNamespace(index=[]),
         )
 
-    def _configure_scan(self, name, *, npt, x_range):
-        self._grid[name] = {"npt": int(npt), "x_range": tuple(x_range)}
+    def _configure_scan(self, name, *, npt, x_range, unit="q_A^-1"):
+        # ``unit`` is the scan's acquisition-NATIVE integration unit;
+        # ``x_range`` (and ``peak``) are expressed in it.  V1 D1: cross-scan
+        # native units may differ while the reset key stays unit-blind.
+        self._grid[name] = {"npt": int(npt), "x_range": tuple(x_range),
+                            "unit": str(unit)}
 
     def _normalize(self, data, metadata):
         """Monitor normalization keyed on the CURRENT channel — the same
@@ -252,11 +256,12 @@ class OVHarness:
         grid = self._grid[self.widget.scan.name]
         npt = int(npt if npt is not None else grid["npt"])
         x_range = tuple(x_range if x_range is not None else grid["x_range"])
+        unit = grid.get("unit", "q_A^-1")
         if empty:
             radial = np.zeros(0, dtype=np.float32)
             int_1d = IntegrationResult1D(
                 radial=radial, intensity=radial.copy(), sigma=None,
-                unit="q_A^-1")
+                unit=unit)
             int_2d = None
         else:
             radial = np.linspace(x_range[0], x_range[1], npt)
@@ -273,7 +278,7 @@ class OVHarness:
                 radial=radial.astype(np.float32),
                 intensity=profile.astype(np.float32),
                 sigma=np.ones(npt, dtype=np.float32),
-                unit="q_A^-1")
+                unit=unit)
             chi = np.asarray([-20.0, -10.0, 0.0, 10.0, 20.0],
                              dtype=np.float32)
             # (radial, azimuthal) orientation; per-χ scaling keeps every slice
@@ -283,7 +288,7 @@ class OVHarness:
             int_2d = IntegrationResult2D(
                 radial=radial.astype(np.float32), azimuthal=chi,
                 intensity=cake.astype(np.float32),
-                unit="q_A^-1", azimuthal_unit="chi_deg")
+                unit=unit, azimuthal_unit="chi_deg")
         return SimpleNamespace(
             idx=int(label), int_1d=int_1d, int_2d=int_2d,
             map_raw=None, mask=None, gi=False, gi_2d={}, thumbnail=None,
@@ -525,27 +530,34 @@ class OVHarness:
         return self._step("norm_change(real=False)")
 
     def rescope(self, new_scan, *, compatible=True, npt=None, x_range=None,
-                clear_store=True):
+                native_unit=None, clear_store=True):
         """Scan boundary.  The store resets (production scan boundary);
         the accumulator must NOT — unless the NEW grid is incompatible, in
         which case the reset happens at the first new-grid row and is
-        allowed (OV-6)."""
+        allowed (OV-6).  ``native_unit`` sets the new scan's acquisition-
+        native integration unit (default: inherit the current scan's) —
+        with a matching npt the reset key stays compatible and the V1 D1
+        canonicalization path is exercised; ``x_range`` must then be given
+        in that unit."""
         grid = self._grid[self.widget.scan.name]
         if npt is None:
             npt = grid["npt"] if compatible else grid["npt"] + 7
         if x_range is None:
             x_range = grid["x_range"]
+        if native_unit is None:
+            native_unit = grid.get("unit", "q_A^-1")
         if clear_store:
             self.store.clear()
         self.widget.scan = self._make_scan(new_scan)
-        self._configure_scan(new_scan, npt=npt, x_range=x_range)
+        self._configure_scan(new_scan, npt=npt, x_range=x_range,
+                             unit=native_unit)
         self.widget.frame_ids[:] = []
         self.widget.display_generation += 1
         if not compatible:
             self.expect_reset(INCOMPATIBLE_GRID)
         return self._step(
             f"rescope(scan={new_scan}, compatible={compatible}, npt={npt}, "
-            f"x_range={tuple(x_range)})")
+            f"x_range={tuple(x_range)}, native_unit={native_unit})")
 
     def reintegrate_finish(self, *, npt=None):
         """Same-scan reintegrate pass completing: the store resets and every
