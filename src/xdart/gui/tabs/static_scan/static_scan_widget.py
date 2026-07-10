@@ -4150,6 +4150,11 @@ class staticWidget(QWidget):
         user clicks a frame — ``set_data`` runs it then.  Runs immediately for the
         run path (new_scan's set_file(internal=True)) and viewer modes, which never
         set the flag."""
+        # A new file supersedes any pending run-end overlay catch-up (the spec's
+        # set_file/data_reset clear): sigNewFile rides every set_datafile, and
+        # the deferred browser-select case must cancel too — so clear BEFORE the
+        # early-return below.
+        self._runend_catchup_token = None
         if getattr(self.h5viewer, "_browser_scan_reset_pending", False):
             return
         self.displayframe.set_axes()
@@ -4960,7 +4965,9 @@ class staticWidget(QWidget):
         would false-abort and the fix would silently never fire (the Item-2 trap).
         The real user gestures are caught by the robust signals in the callback:
         auto_last off (frame click -> ``disable_auto_last``), scan.name changed
-        (new scan/file), token cleared (new run, ``_enter_run_state``).
+        (new scan/file), token cleared (new run via ``_enter_run_state``; new
+        file via ``_on_new_file_display_reset`` on the set_file/data_reset
+        cascade).
         """
         method = staticWidget._overlay_plot_method(self)
         viewer = getattr(self, "h5viewer", None)
@@ -5049,9 +5056,12 @@ class staticWidget(QWidget):
                 QtCore.QTimer.singleShot(
                     250, lambda: staticWidget._runend_overlay_catchup(self))
             else:
+                # Give up SILENTLY (spec): degrading to today's manual Show All
+                # is not an error, so a permanently-busy GUI must not add run-end
+                # noise louder than debug.
                 self._runend_catchup_token = None
-                logger.info("[PERF] run-end overlay catch-up: gave up after 8 tries "
-                            "(GUI never quiesced); use Show All")
+                logger.debug("[PERF] run-end overlay catch-up: gave up after 8 "
+                             "tries (GUI never quiesced); use Show All")
             return
         # Guard 3 — missing set.  Empty -> already complete -> idempotent no-op.
         missing = staticWidget._runend_overlay_missing_ids(self)
@@ -6910,7 +6920,14 @@ class staticWidget(QWidget):
             # quiescence catch-up that waits out those echoes and does ONE real
             # show_all() (async disk load of the missing tail).  See
             # docs/design/runend_overlay_catchup_spec_jul2026.md.
-            staticWidget._arm_runend_overlay_catchup(self)
+            # LIVE saw-frames runs only (the spec's hook — same guard cluster as
+            # the reconcile above): batch/XYE and the 0-new-frames append end
+            # with their own reload + select-last recovery, and arming there
+            # would flip the end-of-run selection to all frames for runs that
+            # never had a lagged live paint to catch up.
+            if (not is_batch and not is_xye_only
+                    and getattr(self, '_run_saw_frame', True)):
+                staticWidget._arm_runend_overlay_catchup(self)
         else:
             self.wrangler.enabled(True)
 
