@@ -9,8 +9,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with: {python-version: "3.12"}
       - run: pip install -e ".[dev,fitting,rsm]"
       - run: pytest tests/core -q -m "not slow" --timeout=300
@@ -19,8 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with: {python-version: "3.12"}
       - run: pip install -e ".[dev]"
       - run: pytest tests/core/test_architecture_guards.py tests/core/test_ssrl_shim.py -q --timeout=120
@@ -29,31 +29,36 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with: {python-version: "3.12"}
       - run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0
       - run: pip install -e ".[gui,dev,fitting,rsm]"
       - env:
           QT_QPA_PLATFORM: offscreen
-        # The offscreen pyqtgraph backend intermittently segfaults (exit 139)
-        # while constructing PlotItems under repeated widget creation — a Qt/GL
-        # teardown flake, not a test failure. Retry ONLY on 139 so a real test
-        # failure (any other non-zero) still fails fast and is never masked.
+        # scripts/ci_pytest.py hard-exits with pytest's own verdict as soon as
+        # the run completes: the offscreen PySide6/pyqtgraph object graph
+        # deterministically SIGSEGVs (exit 139) during *interpreter shutdown* —
+        # after "N passed" and a clean JUnit — and skipping teardown is the
+        # standard Qt-in-CI practice (pyqtgraph ships pg.exit() for exactly
+        # this).  A mid-run crash still exits 139 here and still fails; retry
+        # ONLY that case (the historical PlotItem-construction GL flake).  A
+        # real test failure fails fast: any other non-zero exit, or failures
+        # recorded in the JUnit even when a segfault masks pytest's exit 1.
+        # NB `|| code=$?`: GitHub runs bash with -e, so the previous bare
+        # `pytest; code=$?` aborted the step on the first non-zero exit and
+        # this loop's retry/guard logic never executed at all.
         run: |
           for attempt in 1 2 3; do
-            pytest tests/xdart -q --timeout=600 --junitxml="xdart-attempt-$attempt.xml"
-            code=$?
+            code=0
+            python scripts/ci_pytest.py tests/xdart -q --timeout=600 --junitxml="xdart-attempt-$attempt.xml" || code=$?
             [ "$code" -eq 0 ] && exit 0
-            # A real test failure/error must fail fast even when the process ALSO
-            # segfaults on teardown (exit 139 masks pytest's exit 1). Trust the
-            # JUnit report, not just the exit code.
             if grep -qE '(failures|errors)="[1-9][0-9]*"' "xdart-attempt-$attempt.xml" 2>/dev/null; then
               echo "::error::pytest tests/xdart reported real failures (not a segfault flake)"
               exit 1
             fi
             if [ "$code" -ne 139 ]; then exit "$code"; fi
-            echo "::warning::pytest tests/xdart segfaulted (139), no reported failures, on attempt $attempt; retrying"
+            echo "::warning::pytest tests/xdart segfaulted mid-run (139), no reported failures, on attempt $attempt; retrying"
           done
           exit 139
 
@@ -64,8 +69,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with: {python-version: "3.12"}
       # base+dev suffices: `import xdart` resolves without the gui extra, and the
       # schema check's two test files need only io (h5py, pyFAI is a base dep) + pytest.

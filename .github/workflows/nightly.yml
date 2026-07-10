@@ -3,39 +3,72 @@ on:
   schedule:
     - cron: "17 9 * * *"   # 09:17 UTC daily
   workflow_dispatch:
+    inputs:
+      diag:
+        description: "Teardown-crash diagnosis: also run tests/xdart WITHOUT the hard-exit wrapper, under gdb, and upload the native backtrace"
+        type: boolean
+        default: false
 
 jobs:
   full:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with: {python-version: "3.12"}
       - run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0
       - run: pip install -e ".[gui,dev,fitting,rsm]"
       - run: pytest tests/core -q --timeout=600
       - env:
           QT_QPA_PLATFORM: offscreen
-        # Retry ONLY on the offscreen-pyqtgraph segfault (exit 139); any real
-        # test failure still fails fast (see pr.yml for the rationale).
+        # scripts/ci_pytest.py hard-exits with pytest's own verdict, skipping
+        # the interpreter teardown where the deterministic offscreen segfault
+        # (exit 139, post-summary) lives — see pr.yml for the full rationale.
+        # Retry only a mid-run 139 (the historical GL flake); a real test
+        # failure fails fast via the exit code or the JUnit guard.
+        # NB `|| code=$?`: GitHub runs bash with -e, so the previous bare
+        # `pytest; code=$?` aborted the step on the first non-zero exit and
+        # this loop's retry/guard logic never executed at all.
         run: |
           for attempt in 1 2 3; do
-            pytest tests/xdart -q --timeout=900 --junitxml="xdart-attempt-$attempt.xml"
-            code=$?
+            code=0
+            python scripts/ci_pytest.py tests/xdart -q --timeout=900 --junitxml="xdart-attempt-$attempt.xml" || code=$?
             [ "$code" -eq 0 ] && exit 0
-            # A real test failure/error must fail fast even when the process ALSO
-            # segfaults on teardown (exit 139 masks pytest's exit 1) -- Nightly #18
-            # burned all three retries on a genuine failure that segfaulted after.
-            # Trust the JUnit report, not just the exit code.
             if grep -qE '(failures|errors)="[1-9][0-9]*"' "xdart-attempt-$attempt.xml" 2>/dev/null; then
               echo "::error::pytest tests/xdart reported real failures (not a segfault flake)"
               exit 1
             fi
             if [ "$code" -ne 139 ]; then exit "$code"; fi
-            echo "::warning::pytest tests/xdart segfaulted (139), no reported failures, on attempt $attempt; retrying"
+            echo "::warning::pytest tests/xdart segfaulted mid-run (139), no reported failures, on attempt $attempt; retrying"
           done
           exit 139
+      # ── Teardown-crash diagnosis (opt-in via workflow_dispatch diag=true) ──
+      # Runs the suite WITHOUT the hard-exit wrapper so the interpreter-teardown
+      # SIGSEGV actually fires, under gdb, and uploads the native backtrace.
+      # This is the capture step for the structural fix: the crashing frames
+      # name the guilty library (libQt6*/shiboken/pyqtgraph/hdf5/OpenCL).
+      # Never fails the job — it exists only to produce the artifact.
+      - if: ${{ inputs.diag }}
+        continue-on-error: true
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONFAULTHANDLER: "1"
+        run: |
+          sudo apt-get install -y gdb
+          code=0
+          gdb -batch \
+            -ex "handle SIGSEGV stop nopass" \
+            -ex run \
+            -ex "thread apply all bt" \
+            --args python -m pytest tests/xdart -q --timeout=900 2>&1 | tee gdb-teardown.log || code=$?
+          echo "diagnosis run exited $code (informational only)"
+      - if: ${{ inputs.diag }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: teardown-backtrace
+          path: gdb-teardown.log
       # The GI live==batch==reload equivalence spine needs the real
       # detector test data; runs on self-hosted/local checkouts where
       # XDART_TEST_DATA points at it.  Kept here as a reminder job step:
