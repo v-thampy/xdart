@@ -17,16 +17,20 @@ from importlib.metadata import PackageNotFoundError, distribution
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
 
-PYPI_JSON_URL = "https://pypi.org/pypi/xrd-tools/json"
+PYPI_JSON_URL = "https://pypi.org/pypi/xdart/json"
 _META_FILENAME = "install_meta.json"
 
 
 def current_version():
-    """The running xrd-tools version, or None if metadata is unavailable."""
+    """The running xdart version, or None if metadata is unavailable."""
     try:
-        return _pkg_version("xrd-tools")
+        return _pkg_version("xdart")
     except PackageNotFoundError:
-        return None
+        try:
+            # pre-1.0 conda builds shipped under the old distribution name
+            return _pkg_version("xrd-tools")
+        except PackageNotFoundError:
+            return None
 
 
 def _load_meta(path):
@@ -64,12 +68,15 @@ def find_install_meta(*, prefix=None, env_override=None):
 
 
 def is_editable_install():
-    """True if xrd-tools is an editable/development checkout, via the dist-info
+    """True if xdart is an editable/development checkout, via the dist-info
     ``direct_url.json`` ``dir_info.editable`` flag (PEP 610/660).  Never raises."""
     try:
-        raw = distribution("xrd-tools").read_text("direct_url.json")
+        raw = distribution("xdart").read_text("direct_url.json")
     except (PackageNotFoundError, OSError):
-        return False
+        try:
+            raw = distribution("xrd-tools").read_text("direct_url.json")
+        except (PackageNotFoundError, OSError):
+            return False
     if not raw:
         return False
     try:
@@ -108,14 +115,14 @@ def detect_pixi_global_env(prefix=None):
 
 def pixi_global_meta():
     """Synthesize updater meta for a ``pixi global`` install (no
-    ``install_meta.json``): update via ``pixi global update xrd-tools`` and
+    ``install_meta.json``): update via ``pixi global update xdart`` and
     relaunch the exposed ``xdart`` trampoline."""
     import shutil
     home = _pixi_home()
     pixi = shutil.which("pixi") or os.path.join(home, "bin", "pixi")
     xdart = shutil.which("xdart") or os.path.join(home, "bin", "xdart")
     return {"flavor": "pixi-global", "app_root": home,
-            "update_cmd": [pixi, "global", "update", "xrd-tools"],
+            "update_cmd": [pixi, "global", "update", "xdart"],
             "relaunch_cmd": [xdart]}
 
 
@@ -147,7 +154,7 @@ def resolve_update_meta(kind=None):
 
 
 def fetch_latest_pypi(*, timeout=3.0, opener=None):
-    """Latest xrd-tools version string from PyPI, or None on ANY failure (offline,
+    """Latest xdart version string from PyPI, or None on ANY failure (offline,
     timeout, malformed JSON).  Never raises.  ``opener`` is injectable for tests:
     a callable ``(url, timeout) -> bytes``.
     """

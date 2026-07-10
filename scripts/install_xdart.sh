@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # xdart one-line installer (macOS / Linux)
 #
-#   curl -fsSL https://raw.githubusercontent.com/ORG/xrd-tools/main/scripts/install_xdart.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/ORG/xdart/main/scripts/install_xdart.sh | bash
 #
 # Design (docs/design/design_install_and_update_jul2026.md): a pixi WORKSPACE in a
 # private app root — conda-forge supplies the compiled I/O stack (the builds
-# measured fastest for Eiger bitshuffle/LZ4 decode), PyPI supplies xrd-tools[gui],
+# measured fastest for Eiger bitshuffle/LZ4 decode), PyPI supplies xdart[gui],
 # both resolved in ONE solve with a lockfile.  Nothing is assumed on the machine
 # (no conda/mamba/python needed); nothing touches an existing conda setup.
 # Re-running this script upgrades in place; so does `pixi update` in the app root.
@@ -47,7 +47,7 @@ done
 [ -n "$EXTRAS_TOML" ] || EXTRAS_TOML='"gui"'
 GUI_FALLBACK=""
 if [ -n "${XDART_LOCAL_SOURCE:-}" ]; then
-    PYPI_DEP="xrd-tools = { path = \"$XDART_LOCAL_SOURCE\", extras = [$EXTRAS_TOML] }"
+    PYPI_DEP="xdart = { path = \"$XDART_LOCAL_SOURCE\", extras = [$EXTRAS_TOML] }"
     # Belt-and-suspenders: list the gui stack explicitly for local-source
     # installs (extras on path deps are the least-exercised pixi/uv corner; the
     # duplication is harmless — same versions resolve).  Keep in sync with
@@ -56,7 +56,7 @@ if [ -n "${XDART_LOCAL_SOURCE:-}" ]; then
         GUI_FALLBACK=$'pyside6 = ">=6.5"\npyqtgraph = ">=0.13.7"\nqtawesome = "*"\nimagecodecs = "*"\nimageio = "*"\npackaging = "*"' ;;
     esac
 else
-    PYPI_DEP="xrd-tools = { version = \">=1,<2\", extras = [$EXTRAS_TOML] }"
+    PYPI_DEP="xdart = { version = \">=1,<2\", extras = [$EXTRAS_TOML] }"
 fi
 cat > "$APP_ROOT/pixi.toml" <<EOF
 [workspace]
@@ -80,7 +80,7 @@ $PYPI_DEP
 $GUI_FALLBACK
 EOF
 
-echo "==> Solving + installing (conda-forge stack + xrd-tools[gui], one solve)"
+echo "==> Solving + installing (conda-forge stack + xdart[gui], one solve)"
 "$PIXI" install --manifest-path "$APP_ROOT/pixi.toml"
 
 # Sanity: h5py from the pixi env AND a real LZ4 write/read round-trip through
@@ -141,7 +141,7 @@ case ":$PATH:" in
             echo "      If 'xdart' launches the wrong one:"
             echo "        1. run 'hash -r' (or open a new terminal) — clears the shell's cache;"
             echo "        2. still wrong? that install is earlier on PATH — launch"
-            echo "           $BIN_DIR/xdart directly, or 'pip uninstall xrd-tools' in the old env."
+            echo "           $BIN_DIR/xdart directly, or 'pip uninstall xdart' (or the legacy 'xrd-tools') in the old env."
         fi ;;
     *) echo "NOTE: add $BIN_DIR to your PATH, e.g.:  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc" ;;
 esac

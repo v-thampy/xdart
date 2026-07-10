@@ -12,8 +12,13 @@ Import from submodules directly:
 from importlib.metadata import version as _pkg_version, PackageNotFoundError
 
 try:
-    __version__ = _pkg_version("xrd-tools")
-except PackageNotFoundError:  # pragma: no cover — source checkout without install
-    __version__ = "0.0.0+unknown"
+    # the shipped distribution is "xdart"; "xrd-tools" is the pre-1.0 legacy
+    # dist name (some conda builds still install under it).
+    __version__ = _pkg_version("xdart")
+except PackageNotFoundError:
+    try:
+        __version__ = _pkg_version("xrd-tools")
+    except PackageNotFoundError:  # pragma: no cover — source checkout without install
+        __version__ = "0.0.0+unknown"
 
 del _pkg_version, PackageNotFoundError

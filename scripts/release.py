@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Release pre-flight for xrd-tools (Phase 1b of the greenfield plan).
+"""Release pre-flight for xdart (Phase 1b of the greenfield plan).
 
 The two-repo era enforced publish order and version floors by runbook;
 the monorepo enforces them by script.  Run everything before tagging:

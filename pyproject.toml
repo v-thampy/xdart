@@ -79,10 +79,10 @@ dev = ["pytest", "pytest-timeout", "build", "twine", "tifffile"]  # tifffile: te
 xdart = "xdart.xdart_main:main"
 
 [project.urls]
-Homepage = "https://github.com/v-thampy/xrd-tools"
-Repository = "https://github.com/v-thampy/xrd-tools"
-Issues = "https://github.com/v-thampy/xrd-tools/issues"
-Changelog = "https://github.com/v-thampy/xrd-tools/blob/main/MIGRATION.md"
+Homepage = "https://github.com/v-thampy/xdart"
+Repository = "https://github.com/v-thampy/xdart"
+Issues = "https://github.com/v-thampy/xdart/issues"
+Changelog = "https://github.com/v-thampy/xdart/blob/main/MIGRATION.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]

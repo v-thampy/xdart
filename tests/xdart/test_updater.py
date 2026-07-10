@@ -59,6 +59,7 @@ def test_install_kind_editable(monkeypatch):
 
 def test_install_kind_pixi_when_meta_present(monkeypatch):
     monkeypatch.setattr(updater, "is_editable_install", lambda: False)
+    monkeypatch.setattr(updater, "detect_pixi_global_env", lambda: False)
     assert updater.install_kind(meta={"app_root": "x"}) == "pixi"
 
 
@@ -101,7 +102,7 @@ def test_pixi_global_meta_builds_update_command(monkeypatch, tmp_path):
     monkeypatch.setenv("PIXI_HOME", str(tmp_path))
     meta = updater.pixi_global_meta()
     assert meta["flavor"] == "pixi-global"
-    assert meta["update_cmd"][-3:] == ["global", "update", "xrd-tools"]
+    assert meta["update_cmd"][-3:] == ["global", "update", "xdart"]
     assert meta["relaunch_cmd"]                      # a launch command exists
 
 

@@ -1,12 +1,12 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/prefix-dev/recipe-format/main/schema.json
 schema_version: 1
 
-# rattler-build recipe for the xrd-tools conda package (v1.1 plan).
+# rattler-build recipe for the xdart conda package (v1.1 plan).
 #
-# Purpose: make `pixi global install -c <our-channel> -c conda-forge xrd-tools`
+# Purpose: make `pixi global install -c <our-channel> -c conda-forge xdart`
 # THE install command — no script, `xdart` auto-exposed on PATH, and a
 # Start-menu/Applications shortcut for free (menuinst).  noarch:python = ONE
-# build for every platform.  Only xrd-tools lives on our channel; every run dep
+# build for every platform.  Only xdart lives on our channel; every run dep
 # resolves from conda-forge in the same solve, so the PyPI-vs-conda fast-stack
 # layering problem (the reason scripts/install_xdart.sh exists) dissolves here.
 #
@@ -47,7 +47,7 @@ build:
     # time from $PREFIX/Menu/*.json.  (noarch builds run on one platform; the
     # shell copy is fine and the JSON is consumed per-platform at install.)
     - mkdir -p "${PREFIX}/Menu"
-    - cp "${RECIPE_DIR}/menu/xrd-tools.json" "${PREFIX}/Menu/xrd-tools.json"
+    - cp "${RECIPE_DIR}/menu/xdart.json" "${PREFIX}/Menu/xdart.json"
     - cp "${RECIPE_DIR}/menu/xdart.png"  "${PREFIX}/Menu/xdart.png"   # linux
     - cp "${RECIPE_DIR}/menu/xdart.icns" "${PREFIX}/Menu/xdart.icns"  # macOS
     - cp "${RECIPE_DIR}/menu/xdart.ico"  "${PREFIX}/Menu/xdart.ico"   # windows
@@ -79,7 +79,7 @@ requirements:
     - matplotlib-base             # leaner core: no competing Qt binding (we bring pyside6)
     - plotly
     # xdart GUI ([gui] extra, carried unconditionally — this package IS the GUI
-    # one-liner; a separate GUI-less xrd-tools-core noarch can come later)
+    # one-liner; a separate GUI-less headless-core noarch can come later)
     - pyside6 >=6.5
     - pyqtgraph >=0.13.7
     - qtawesome
@@ -106,19 +106,19 @@ tests:
   # clean-machine smoke gate (plan item 7).
 
 about:
-  homepage: https://github.com/v-thampy/xrd-tools
-  repository: https://github.com/v-thampy/xrd-tools
-  documentation: https://github.com/v-thampy/xrd-tools#readme
+  homepage: https://github.com/v-thampy/xdart
+  repository: https://github.com/v-thampy/xdart
+  documentation: https://github.com/v-thampy/xdart#readme
   license: MIT AND BSD-3-Clause
   license_file:
     - LICENSE
     - licenses/
   summary: Headless XRD/GIWAXS reduction core (xrd_tools) + the xdart Qt GUI.
   description: |
-    xrd-tools is a monorepo: `xrd_tools`, a headless XRD/GIWAXS reduction and
-    NeXus I/O core (no Qt), and `xdart`, a thin PySide6 GUI over it for the
-    Eiger live/batch reduction workflow.  Installing this package gives you the
-    `xdart` command and a desktop shortcut.
+    xdart is a monorepo distribution: `xrd_tools`, a headless XRD/GIWAXS
+    reduction and NeXus I/O core (no Qt), and `xdart`, a thin PySide6 GUI over
+    it for the Eiger live/batch reduction workflow.  Installing this package
+    gives you the `xdart` command and a desktop shortcut.
 
 extra:
   recipe-maintainers:

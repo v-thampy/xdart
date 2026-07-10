@@ -1,7 +1,7 @@
 # xdart
 
 <!-- After the repo is pushed, point the badge at the real org/name:
-[![PR checks](https://github.com/<org>/xrd-tools/actions/workflows/pr.yml/badge.svg)](https://github.com/<org>/xrd-tools/actions/workflows/pr.yml) -->
+[![PR checks](https://github.com/<org>/xdart/actions/workflows/pr.yml/badge.svg)](https://github.com/<org>/xdart/actions/workflows/pr.yml) -->
 
 **SSRL X-ray diffraction toolkit — one distribution, two import packages.**
 
@@ -20,7 +20,7 @@ real-time Qt GUI). It ships **two import packages** from one wheel:
 
 The two former repositories were merged **with full git histories**
 (`git log --follow` works across the boundary); see
-[`MIGRATION.md`](https://github.com/v-thampy/xrd-tools/blob/main/MIGRATION.md).
+[`MIGRATION.md`](https://github.com/v-thampy/xdart/blob/main/MIGRATION.md).
 The old `ssrl_xrd_tools` import name still
 works as a **deprecation shim** that re-exports the real `xrd_tools` modules
 — update imports to `xrd_tools` at your convenience.
@@ -96,12 +96,12 @@ step, into its own folder, without touching any existing Python or conda setup.
 
 ```bash
 # macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/v-thampy/xrd-tools/main/scripts/install_xdart.sh | bash
+curl -fsSL https://raw.githubusercontent.com/v-thampy/xdart/main/scripts/install_xdart.sh | bash
 ```
 
 ```powershell
 # Windows (PowerShell)
-powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/v-thampy/xrd-tools/main/scripts/install_xdart.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/v-thampy/xdart/main/scripts/install_xdart.ps1 | iex"
 ```
 
 - **Needs nothing preinstalled** — no conda, no Python. It bootstraps a
@@ -174,7 +174,7 @@ pip install xdart
 > ```
 >
 > Then install `xdart` as above. See
-> [`MIGRATION.md`](https://github.com/v-thampy/xrd-tools/blob/main/MIGRATION.md)
+> [`MIGRATION.md`](https://github.com/v-thampy/xdart/blob/main/MIGRATION.md)
 > for the full import-name migration.
 
 ### Headless / notebooks with pixi
@@ -872,14 +872,14 @@ need Qt belongs in `xrd_tools` ("keep xdart thin").
   (`display_controllers.py`). Viewer controllers resolve files through the
   headless `xrd_tools.io` APIs — xdart never opens HDF5 to guess.
 
-Layer map: [`docs/ARCHITECTURE.md`](https://github.com/v-thampy/xrd-tools/blob/main/docs/ARCHITECTURE.md).
+Layer map: [`docs/ARCHITECTURE.md`](https://github.com/v-thampy/xdart/blob/main/docs/ARCHITECTURE.md).
 
 ---
 
 ## Development
 
 ```bash
-git clone https://github.com/v-thampy/xrd-tools.git && cd xrd-tools
+git clone https://github.com/v-thampy/xdart.git && cd xdart
 python -m venv .venv && . .venv/bin/activate
 pip install -e ".[gui,dev,fitting,rsm]"
 
@@ -901,7 +901,7 @@ open an issue on the GitHub repository.
 ## License
 
 First-party code is released under the **MIT License** (see
-[LICENSE](https://github.com/v-thampy/xrd-tools/blob/main/LICENSE)); code
+[LICENSE](https://github.com/v-thampy/xdart/blob/main/LICENSE)); code
 inherited from `ssrl_xrd_tools` is BSD-3-Clause (see
 `licenses/LICENSE-ssrl_xrd_tools`). SPDX: `MIT AND BSD-3-Clause`.
 
@@ -911,7 +911,7 @@ If you use `xdart` (`xrd_tools` / `xdart`) in your research, please cite:
 
 ```
 xdart: SSRL X-ray diffraction toolkit (headless reduction core + xdart GUI)
-https://github.com/v-thampy/xrd-tools
+https://github.com/v-thampy/xdart
 ```
 
 (Formal publication citation coming soon.)

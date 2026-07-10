@@ -1,10 +1,10 @@
 # xdart one-line installer (Windows, PowerShell)
 #
-#   powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/ORG/xrd-tools/main/scripts/install_xdart.ps1 | iex"
+#   powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/ORG/xdart/main/scripts/install_xdart.ps1 | iex"
 #
 # Same design as install_xdart.sh (docs/design/design_install_and_update_jul2026.md):
 # a pixi workspace in a private app root — conda-forge compiled I/O stack +
-# PyPI xrd-tools[gui] in one solve.  Nothing assumed on the machine.  Re-run to upgrade.
+# PyPI xdart[gui] in one solve.  Nothing assumed on the machine.  Re-run to upgrade.
 $ErrorActionPreference = "Stop"
 
 $AppRoot   = if ($env:XDART_INSTALL_ROOT) { $env:XDART_INSTALL_ROOT } else { "$env:LOCALAPPDATA\xdart" }
@@ -31,7 +31,7 @@ if (-not (Test-Path $Pixi)) {
 # testing / development) instead of PyPI -- mirrors install_xdart.sh.
 if ($env:XDART_LOCAL_SOURCE) {
     $SrcPath = ($env:XDART_LOCAL_SOURCE -replace '\\', '/')   # TOML-safe path
-    $PypiDep = "xrd-tools = { path = `"$SrcPath`", extras = [$ExtrasToml] }"
+    $PypiDep = "xdart = { path = `"$SrcPath`", extras = [$ExtrasToml] }"
     $GuiFallback = ""
     if ($ExtrasToml -match '"gui"') {
         # Belt-and-suspenders: extras on a path dep are the least-exercised
@@ -40,7 +40,7 @@ if ($env:XDART_LOCAL_SOURCE) {
         $GuiFallback = "pyside6 = `">=6.5`"`npyqtgraph = `">=0.13.7`"`nqtawesome = `"*`"`nimagecodecs = `"*`"`nimageio = `"*`"`npackaging = `"*`""
     }
 } else {
-    $PypiDep = "xrd-tools = { version = `">=1,<2`", extras = [$ExtrasToml] }"
+    $PypiDep = "xdart = { version = `">=1,<2`", extras = [$ExtrasToml] }"
     $GuiFallback = ""
 }
 @"
@@ -65,7 +65,7 @@ $PypiDep
 $GuiFallback
 "@ | Set-Content -Encoding UTF8 "$AppRoot\pixi.toml"
 
-Write-Host "==> Solving + installing (conda-forge stack + xrd-tools[gui], one solve)"
+Write-Host "==> Solving + installing (conda-forge stack + xdart[gui], one solve)"
 & $Pixi install --manifest-path "$AppRoot\pixi.toml"
 if ($LASTEXITCODE -ne 0) { throw "pixi install failed" }
 

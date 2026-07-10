@@ -16,13 +16,13 @@ _os.environ.setdefault("QT_API", "PySide6")
 from importlib.metadata import version as _pkg_version, PackageNotFoundError
 
 try:
-    # the monorepo distribution is "xrd-tools"; "xdart" is only the import
-    # package.  Fall back to the legacy dist name so a pre-1.0 install
-    # still reports something truthful.
-    __version__ = _pkg_version("xrd-tools")
+    # the shipped monorepo distribution is "xdart".  Fall back to the
+    # pre-1.0 legacy dist name so an old install still reports something
+    # truthful.
+    __version__ = _pkg_version("xdart")
 except PackageNotFoundError:
     try:
-        __version__ = _pkg_version("xdart")
+        __version__ = _pkg_version("xrd-tools")
     except PackageNotFoundError:  # pragma: no cover — source checkout
         __version__ = "0.0.0+unknown"
 
