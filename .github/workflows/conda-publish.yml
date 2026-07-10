@@ -2,7 +2,7 @@ name: conda-publish
 
 # Build the noarch conda package with rattler-build and upload it to our
 # prefix.dev channel on a version tag — enabling
-#   pixi global install -c https://prefix.dev/xrd-tools -c conda-forge xrd-tools
+#   pixi global install -c https://prefix.dev/xrd-tools -c conda-forge xdart
 # See docs/design/plan_conda_package_v1.1_jul2026.md.
 #
 # One-time setup (maintainer): create the prefix.dev channel, then add repo
@@ -23,7 +23,9 @@ jobs:
       - name: Sync recipe version from pyproject (single source of truth)
         run: |
           v=$(grep -m1 '^version' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          # Only the quoted context.version literal — NOT package.version's ${{ version }}.
+          # Only the quoted context.version literal, not the templated package.version.
+          # (Do NOT write the GitHub-expression form here -- Actions parses it even
+          #  inside a shell comment and rejects the whole workflow at startup.)
           sed -i -E "s/^  version: \"[^\"]*\"/  version: \"$v\"/" recipe/recipe.yaml
           echo "recipe version synced from pyproject: $v"
 

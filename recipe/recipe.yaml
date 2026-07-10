@@ -20,7 +20,7 @@ schema_version: 1
 #     pixi exec rattler-build build --recipe recipe/recipe.yaml -c conda-forge
 
 context:
-  name: xrd-tools
+  name: xdart
   # Tracks the PyPI version: the publish Action (conda-publish.yml) SYNCS this
   # from pyproject [project].version before building, so you bump ONE place
   # (pyproject) and both channels move together.  This literal is just the

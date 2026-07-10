@@ -1,11 +1,11 @@
-# xrd-tools
+# xdart
 
 <!-- After the repo is pushed, point the badge at the real org/name:
 [![PR checks](https://github.com/<org>/xrd-tools/actions/workflows/pr.yml/badge.svg)](https://github.com/<org>/xrd-tools/actions/workflows/pr.yml) -->
 
 **SSRL X-ray diffraction toolkit — one distribution, two import packages.**
 
-`xrd-tools` (version 1.0.0) is the merged successor to the former
+`xdart` (version 1.0.0) is the merged successor to the former
 `ssrl_xrd_tools` (the headless reduction + I/O library) and `xdart` (the
 real-time Qt GUI). It ships **two import packages** from one wheel:
 
@@ -79,10 +79,10 @@ xdart, puts it on your PATH, and adds a Start-menu / Applications shortcut — w
 the whole fast conda-forge I/O stack:
 
 ```bash
-pixi global install -c https://prefix.dev/xrd-tools -c conda-forge xrd-tools
+pixi global install -c https://prefix.dev/xrd-tools -c conda-forge xdart
 ```
 
-Launch with `xdart` (or the shortcut). Upgrade with `pixi global update xrd-tools`
+Launch with `xdart` (or the shortcut). Upgrade with `pixi global update xdart`
 (or from the app: **Help → Check for Updates…**).
 
 > The conda package is published with the release tag. Until it is live on the
@@ -109,7 +109,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/v-t
   (`%LOCALAPPDATA%\xdart` on Windows) and never edits your shell config or an
   existing conda install.
 - **Fast by construction** — it uses the conda-forge builds of the HDF5/compression
-  stack (the fastest Eiger bitshuffle/LZ4 decode) plus `xrd-tools[gui]` from PyPI,
+  stack (the fastest Eiger bitshuffle/LZ4 decode) plus `xdart[gui]` from PyPI,
   resolved in one solve with a lockfile. This is the same layering the manual
   conda steps below do — only assembled for you.
 - **Launch** with `xdart`. **Upgrade** by re-running the same line.
@@ -121,7 +121,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/v-t
 ### Using conda / mamba
 
 The classic path: a **fresh conda environment** with the conda-forge compiled I/O
-stack, plus `xrd-tools` from PyPI. No conda yet? Install one first (pick either):
+stack, plus `xdart` from PyPI. No conda yet? Install one first (pick either):
 
 - **[Miniforge](https://github.com/conda-forge/miniforge)** — recommended;
   conda-forge by default, smaller, ships `mamba`.
@@ -140,40 +140,40 @@ mamba activate xrd
 
 # 2. the conda-forge fast I/O stack, then the xdart GUI from PyPI
 mamba install -c conda-forge h5py hdf5plugin fabio hdf5 blosc c-blosc2 lz4-c
-pip install "xrd-tools[gui]"
+pip install "xdart[gui]"
 ```
 
 then launch with `xdart`. (Already have an environment? Just run step 2 in it.)
 
 ### Using pip / uv
 
-Requires **Python ≥ 3.11**. `xrd-tools` is a normal PyPI package and installs
+Requires **Python ≥ 3.11**. `xdart` is a normal PyPI package and installs
 anywhere:
 
 ```bash
-pip install "xrd-tools[gui]"          # the xdart GUI + reduction core
-uv tool install "xrd-tools[gui]"      # isolated GUI install
+pip install "xdart[gui]"          # the xdart GUI + reduction core
+uv tool install "xdart[gui]"      # isolated GUI install
 ```
 
 then launch with `xdart`. Note the Eiger bitshuffle/LZ4 decode is measurably slower
 with the pure-pip HDF5 wheels than the conda-forge builds
 ([see below](#performance-install-the-hdf5-stack-from-conda-forge)), and
-lz4-compressed outputs need `hdf5plugin` (a base dep) to read outside xrd-tools.
+lz4-compressed outputs need `hdf5plugin` (a base dep) to read outside xdart.
 
 **Headless core only** (no Qt anywhere, `import xrd_tools`):
 
 ```bash
-pip install xrd-tools
+pip install xdart
 ```
 
 > **Upgrading from the old `xdart` / `ssrl_xrd_tools`?** Uninstall the legacy
-> packages first so their entry points and shims don't shadow `xrd-tools`:
+> packages first so their entry points and shims don't shadow `xdart`:
 >
 > ```bash
 > pip uninstall -y xdart ssrl_xrd_tools
 > ```
 >
-> Then install `xrd-tools` as above. See
+> Then install `xdart` as above. See
 > [`MIGRATION.md`](https://github.com/v-thampy/xrd-tools/blob/main/MIGRATION.md)
 > for the full import-name migration.
 
@@ -188,7 +188,7 @@ this is an option, not a migration.
 mkdir my-analysis && cd my-analysis
 pixi init
 pixi add python=3.13 h5py hdf5plugin fabio hdf5 blosc c-blosc2 lz4-c jupyterlab
-pixi add --pypi "xrd-tools[notebook,fitting]"
+pixi add --pypi "xdart[notebook,fitting]"
 pixi run jupyter lab
 ```
 
@@ -210,7 +210,7 @@ always works). Register it by name once so it appears in every kernel picker:
 
 ```bash
 cd /shared/xrd-env && pixi run python -m ipykernel install --prefix /usr/local \
-    --name xrd-tools --display-name "XRD Tools (shared)"
+    --name xdart --display-name "XRD Tools (shared)"
 ```
 
 Admins update the shared env with `pixi update` in that directory; the lockfile
@@ -230,11 +230,11 @@ modest for batch / pipeline / CI use:
 | `[fitting]`  | `analysis.fitting.*` — peak / phase / strain fitting     | lmfit, pymatgen                                             |
 | `[rsm]`      | `rsm.*` — reciprocal-space mapping, VTK export           | xrayutilities, pyevtk                                       |
 | `[notebook]` | self-contained Jupyter environment                       | ipywidgets, anywidget, ipyfilechooser, ipykernel, ipympl, jupyterlab |
-| `[all]`      | everything except dev                                    | `xrd-tools[fitting,rsm,gui,notebook]`                       |
+| `[all]`      | everything except dev                                    | `xdart[fitting,rsm,gui,notebook]`                       |
 | `[dev]`      | test / build / release tooling                           | pytest, pytest-timeout, build, twine, tifffile              |
 
 Extras compose. `[gui]` already bundles `[fitting]` + `[rsm]` — the GUI surfaces
-Peak/Phase Fitting and the Grazing/GI/RSM workflow — so `pip install "xrd-tools[gui]"`
+Peak/Phase Fitting and the Grazing/GI/RSM workflow — so `pip install "xdart[gui]"`
 (and the conda package) give you the **complete** GUI with no missing-dependency prompts.
 
 > **Tip — use [`uv`](https://docs.astral.sh/uv/) if you have it.** It is a
@@ -262,11 +262,11 @@ This only affects raw-frame read speed — pyFAI integration and the writer are
 unchanged. A pure-pip install works correctly, just slower on compressed
 detector data.
 
-### Output compression (lz4 default — reading `.nxs` outside xrd-tools)
+### Output compression (lz4 default — reading `.nxs` outside xdart)
 
 xdart writes the integrated 1D/2D stacks with **lz4+shuffle** by default (fast,
 hdf5plugin filter 32004; ~gzip-class size). **Reading those `.nxs` files requires
-`hdf5plugin`** — a base dependency, so any xrd-tools/xdart environment reads them
+`hdf5plugin`** — a base dependency, so any xdart environment reads them
 fine. To read them with **stock h5py elsewhere** (a collaborator's plain notebook,
 a third-party tool, long-term archival) either install `hdf5plugin`, or write
 portable files by setting the compression before launch:
@@ -907,10 +907,10 @@ inherited from `ssrl_xrd_tools` is BSD-3-Clause (see
 
 ## Citation
 
-If you use `xrd-tools` (`xrd_tools` / `xdart`) in your research, please cite:
+If you use `xdart` (`xrd_tools` / `xdart`) in your research, please cite:
 
 ```
-xrd-tools: SSRL X-ray diffraction toolkit (headless reduction core + xdart GUI)
+xdart: SSRL X-ray diffraction toolkit (headless reduction core + xdart GUI)
 https://github.com/v-thampy/xrd-tools
 ```
 
