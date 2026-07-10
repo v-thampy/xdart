@@ -119,16 +119,19 @@ class InvariantViolation(AssertionError):
 
 class _Ctl:
     """Mutable stand-in for the one Qt combo/spinbox/checkbox surface the
-    adapter reads (currentText/currentIndex/value/isChecked/isEnabled/text).
+    adapter reads (currentText/currentIndex/value/isChecked/isEnabled/text,
+    plus the combo-item surface the V3 Share-Axis chain drives:
+    count/itemText/setCurrentIndex/blockSignals/setEnabled/setChecked).
     Ambient context only — never the seam under test."""
 
     def __init__(self, *, text="", index=0, value=0.0, checked=False,
-                 enabled=True):
+                 enabled=True, items=None):
         self._text = text
         self._index = index
         self._value = value
         self._checked = checked
         self._enabled = enabled
+        self._items = list(items) if items is not None else None
 
     def currentText(self):
         return self._text
@@ -147,6 +150,53 @@ class _Ctl:
 
     def isEnabled(self):
         return self._enabled
+
+    # ── combo-item surface (V3 Share-Axis chain) ──
+    def count(self):
+        return len(self._items) if self._items is not None else 0
+
+    def itemText(self, index):
+        if self._items is not None and 0 <= int(index) < len(self._items):
+            return self._items[int(index)]
+        return ""
+
+    def setCurrentIndex(self, index):
+        self._index = int(index)
+        if self._items is not None and 0 <= self._index < len(self._items):
+            self._text = self._items[self._index]
+
+    def blockSignals(self, block):
+        return False
+
+    def setEnabled(self, enabled):
+        self._enabled = bool(enabled)
+
+    def setChecked(self, checked):
+        self._checked = bool(checked)
+
+
+class _RecordingPlot:
+    """Recording stand-in for the bottom 1D plot the Share-Axis align
+    touches.  The align/skip DECISION under test is the real
+    ``displayFrameWidget._align_plot_under_cake`` (bound onto the harness
+    widget); this records what it does to the panel — ``enableAutoRange``
+    re-arms and ``setXRange`` impositions — so sequences can assert the 1D
+    never takes a foreign range.  The geometry legs beyond the identity
+    guard early-return on the duck (no cake window), which is exactly the
+    scope of the harness: identity, not pixels."""
+
+    def __init__(self):
+        self.autorange_calls = []
+        self.xrange_calls = []
+
+    def enableAutoRange(self, *args, **kwargs):
+        self.autorange_calls.append((args, dict(kwargs)))
+
+    def setXRange(self, *args, **kwargs):
+        self.xrange_calls.append((args, dict(kwargs)))
+
+    def getViewBox(self):
+        return self
 
 
 def _is_live_sentinel(row_id):
@@ -177,11 +227,16 @@ class OVHarness:
     NPT = 48
     X_RANGE = (1.0, 5.0)
 
-    def __init__(self, *, method="Overlay", slice_mode=False,
+    def __init__(self, *, method="Overlay", slice_mode=False, cake_mode=False,
                  max_heavy_items=None, max_items=None, wavelength_m=1e-10,
                  scan_name="scanA"):
-        self.mode = Mode.INT_2D if slice_mode else Mode.INT_1D
+        # cake_mode: INT_2D layout WITHOUT the live slice — the plain
+        # cake-over-1D arrangement the V3 Share-Axis identity sequences
+        # drive (the cake payload builds; the 1D stays the radial overlay).
+        self.mode = (Mode.INT_2D if (slice_mode or cake_mode)
+                     else Mode.INT_1D)
         self.slice_mode = bool(slice_mode)
+        self.cake_mode = bool(cake_mode)
         self._wavelength_m = wavelength_m
         self._heavy_cap = max_heavy_items
         self._norm = {"channel": None}
@@ -190,6 +245,7 @@ class OVHarness:
         self.trace = []
         self.hydration_requests = []
         self.repaint_requests = []
+        self.last_cake_payload = None       # V3: last-built cake ImagePayload
         self._pending_reset = None          # armed allowed-reset cause or None
         self.resets_observed = []           # [(cause, event, site)] owner-logged
         self.resets_cancelled = []          # explicitly retired armed windows
@@ -208,12 +264,19 @@ class OVHarness:
         if self.slice_mode:
             axis_entry = {"source": "2d", "axis": "radial",
                           "slice_axis": "χ (°)"}
+        elif self.cake_mode:
+            # INT_2D radial rows are '1d_2d' (1D result + cake radial merge)
+            # when the slice is off — the production set_axes shape.
+            axis_entry = {"source": "1d_2d", "axis": "radial",
+                          "slice_axis": "χ (°)"}
         else:
             axis_entry = {"source": "1d", "axis": "radial", "slice_axis": None}
         ui = SimpleNamespace(
             plotMethod=_Ctl(text="Overlay"),
-            plotUnit=_Ctl(text=plotUnits[0], index=0),
+            plotUnit=_Ctl(text=plotUnits[0], index=0,
+                          items=[plotUnits[0], plotUnits[1]]),
             imageUnit=_Ctl(text=imageUnits[0]),
+            shareAxis=_Ctl(checked=False),
             slice=_Ctl(text="χ (c/w)", checked=self.slice_mode, enabled=True),
             slice_center=_Ctl(value=0.0),
             slice_width=_Ctl(value=1.0),
@@ -237,7 +300,24 @@ class OVHarness:
             scan=self._make_scan(scan_name),
             ui=ui,
             # A Q↔2θ plot-unit flip needs both combo entries resolvable.
-            _plot_axis_info=(dict(axis_entry), dict(axis_entry)),
+            # The explicit unit_key per row feeds the real _plot_axis_key
+            # (production populates it lazily; the read exists at
+            # DFW._plot_axis_key) so _share_axis_plot_index can match the
+            # cake's rendered key without Qt combo internals.
+            _plot_axis_info=(
+                dict(axis_entry, unit_key="q_A^-1"),
+                dict(axis_entry, unit_key="2th_deg"),
+            ),
+            # V3 Share-Axis identity surface: rendered-payload stashes (the
+            # renderer store-backs mirrored in _render_once) + the recording
+            # bottom plot the real align acts on.
+            _payload_x_axis_label=None,
+            _cake_rendered_axis_key=None,
+            _cake_rendered_axis_labels=None,
+            _share_link_on=False,
+            _share_axis_syncing=False,
+            _last_plot_unit=0,
+            plot=_RecordingPlot(),
             _overlay_hydrated_pending_append_labels=deque(),
             _pinned_slice_cuts={},
             _slice_2d_data_ready=lambda: True,
@@ -251,10 +331,19 @@ class OVHarness:
         )
         widget.normalize = self._normalize
         # The lifecycle seams are the REAL widget methods, bound unbound-style
-        # exactly like the ledgered OV-7b/7c tests.
+        # exactly like the ledgered OV-7b/7c tests.  The V3 Share-Axis chain
+        # (identity key → plot-index match → silent re-point → align guard)
+        # is likewise the REAL methods: the seam under test is the
+        # payload-identity decision, driven end-to-end.
         for name in ("pin_current_slice_cut", "_slice_pin_selection",
                      "_slice_pin_trace_name", "_pinned_slice_cut_recipes",
-                     "_clear_pinned_slice_cuts", "clear_overlay"):
+                     "_clear_pinned_slice_cuts", "clear_overlay",
+                     "_current_image_axis_key", "_plot_axis_key",
+                     "_share_axis_plot_index", "_set_plot_unit_index_silently",
+                     "_apply_share_axis_state",
+                     "_share_axis_rendered_units_agree",
+                     "_align_plot_under_cake", "_active_bottom_plot",
+                     "_active_bottom_window"):
             setattr(widget, name,
                     MethodType(getattr(displayFrameWidget, name), widget))
         return widget
@@ -345,6 +434,11 @@ class OVHarness:
         return self._step(f"render({reason})")
 
     def _render_once(self):
+        # Pre-build Share-Axis sync — the production order (_update_impl
+        # calls _apply_share_axis_state BEFORE build_payload for INT modes)
+        # so a checked Share-Axis silently re-points plotUnit off the CAKE
+        # payload identity before the 1D payload is built.
+        self.widget._apply_share_axis_state()
         state = ScanDisplayController().compute_state(self.widget, self.mode)
         pending = tuple(
             self.widget._overlay_hydrated_pending_append_labels or ())
@@ -363,6 +457,29 @@ class OVHarness:
             history = getattr(payload, "plot_history", None)
             if history is not None:
                 self.widget._waterfall_history = history
+            if getattr(payload, "traces", ()):
+                axis = payload.axis_x
+                # V3: the rendered 1D identity store-back (_draw_payload).
+                self.widget._payload_x_axis_label = (axis.label, axis.unit)
+        # V3: the 2D panel — build the cake payload through the same real
+        # adapter and mirror _draw_image_payload's rendered-identity
+        # store-back (INT_2D states carry a CAKE_2D panel; INT_1D states
+        # yield None and, matching render's clear delegate, drop the stash).
+        cake = adapter.cake_image(state)
+        self.last_cake_payload = cake
+        if cake is not None:
+            self.widget._cake_rendered_axis_key = getattr(
+                cake, "rendered_axis_key", None)
+            ax, ay = cake.axis_x, cake.axis_y
+            self.widget._cake_rendered_axis_labels = (
+                (ax.label, ax.unit), (ay.label, ay.unit))
+            # _draw_image_payload tail: _on_plotUnit_changed re-applies the
+            # share state after the cake identity store-back.
+            self.widget._apply_share_axis_state()
+        else:
+            # clear_binned_view resets the stash when the cake blanks.
+            self.widget._cake_rendered_axis_key = None
+            self.widget._cake_rendered_axis_labels = None
         return state, payload
 
     def _step(self, event):
@@ -592,7 +709,21 @@ class OVHarness:
         ui.imageUnit._text = (
             imageUnits[1] if ui.imageUnit._text == imageUnits[0]
             else imageUnits[0])
+        ui.imageUnit._index = imageUnits.index(ui.imageUnit._text)
         return self._step(f"image_unit_toggle(→ {ui.imageUnit._text})")
+
+    def share_axis(self, on=True):
+        """Check/uncheck Share Axis.  The chain under test is the REAL V3
+        one: ``_apply_share_axis_state`` (run by every render, production
+        order) keys the silent plotUnit re-point off the CAKE payload's
+        rendered identity via ``_current_image_axis_key``, and the real
+        ``_align_plot_under_cake`` (drivable directly on ``widget``) only
+        engages when the rendered payload identities agree.  The geometric
+        link itself (``_set_share_link``) early-returns on the duck (no Qt
+        viewbox); sequences model the linked state with
+        ``widget._share_link_on = True``."""
+        self.widget.ui.shareAxis._checked = bool(on)
+        return self._step(f"share_axis(on={bool(on)})")
 
     def norm_change(self, *, real, channel=None):
         """Normalization event.  ``real=True`` switches the channel — since

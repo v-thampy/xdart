@@ -38,7 +38,7 @@ from ...gui_utils import RectViewBox, get_rect
 from ...widgets import pgImageWidget, pmeshImageWidget
 from .integrator import GI_LABELS_1D, GI_LABELS_2D
 from .display_constants import (
-    AA_inv, Th, Chi, Deg, Qip_s, Qoop_s, Qtot_s,
+    Th, Chi, Deg,
     plotUnits, imageUnits,
     x_labels_1D, x_units_1D, x_labels_2D, x_units_2D,
     y_labels_2D, y_units_2D,
@@ -57,6 +57,7 @@ from .display_logic import (
     build_payload, render_plan, controller_for, ImagePayload,
     empty_display_state, PANEL_LAYOUT,
     AccumulatorLifecycle, LifecycleCause,
+    canonical_axis_key,
     resolve_selection, resolve_render_ids,
     default_plot_unit, pretty_unit, sentinel_mask, integer_saturation_ceiling,
     combine_flat_masks, nan_gaps_in_thumbnail,
@@ -110,24 +111,12 @@ def _runend_waterfall_history_fields(displayframe) -> dict:
 
 
 def _axis_key_from_label(label):
-    """Canonical key for matching plot/cake axes without relying on row order."""
-    text = str(label or '')
-    lower = text.lower()
-    if Qoop_s in text or 'qoop' in lower or 'q_oop' in lower:
-        return 'qoop_A^-1'
-    if Qip_s in text or 'qip' in lower or 'q_ip' in lower:
-        return 'qip_A^-1'
-    if 'exit' in lower:
-        return 'exit_angle_deg'
-    if '2th' in lower or f'2{Th}' in text:
-        return '2th_deg'
-    if (Chi in text or 'chi' in lower) and 'gi' in lower:
-        return 'chigi_deg'
-    if Chi in text or 'chi' in lower:
-        return 'chi_deg'
-    if 'q' in lower or AA_inv in text:
-        return 'q_A^-1'
-    return lower.strip()
+    """Canonical key for matching plot/cake axes without relying on row order.
+
+    V3: the classifier moved headless (``display_logic.canonical_axis_key``)
+    so payload builders stamp the same key the widget compares against; this
+    alias keeps the historical name for the widget-side call sites."""
+    return canonical_axis_key(label)
 
 
 def _combo_text(combo, index):
@@ -812,6 +801,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._payload_y_axis_label = None
         self._using_publication_plot_payload = False
         self._plot_autorange_requested = False
+        # V3 rendered identity of the LAST DRAWN cake payload (what is
+        # actually on the 2D panel): (canonical radial key, ((xl, xu),
+        # (yl, yu)) labels).  Written only by _draw_image_payload /
+        # clear_binned_view — the 2D analog of _payload_x_axis_label.
+        self._cake_rendered_axis_key = None
+        self._cake_rendered_axis_labels = None
 
         # Cached display data
         self.image_data = (None, None)
@@ -2505,6 +2500,17 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.image_data = (image, rect)
         else:
             self.binned_data = (image, rect)
+            # V3: carry the payload's RENDERED identity onto the widget —
+            # the 2D analog of the 1D _payload_x_axis_label store-back.
+            # Share-Axis (_current_image_axis_key / the align guards) and
+            # the update_binned_view re-draw labels read THIS, never a
+            # combo, so "what unit is on the 2D panel" always describes
+            # the pixels actually drawn.
+            self._cake_rendered_axis_key = getattr(
+                payload, 'rendered_axis_key', None)
+            ax, ay = payload.axis_x, payload.axis_y
+            self._cake_rendered_axis_labels = (
+                (ax.label, ax.unit), (ay.label, ay.unit))
             _opu = getattr(self, '_on_plotUnit_changed', None)
             if _opu is not None:
                 _opu()
@@ -2613,7 +2619,28 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             logger.debug("cake view trim skipped", exc_info=True)
 
     def _current_image_axis_key(self):
-        """Canonical key for the current 2D cake x-axis."""
+        """Canonical key for the current 2D cake x-axis.
+
+        V3 (F-B structural fix): the RENDERED cake payload's identity is the
+        authority — ``_draw_image_payload`` stashes ``rendered_axis_key``
+        from every drawn cake payload, and this method returns it, so the
+        Share-Axis chain keys off what is actually ON the panel, never a
+        combo read that can be stale relative to the drawn pixels (e.g. the
+        no-wavelength cake that stays Q while the combo says 2θ).
+
+        DOCUMENTED FALLBACK (intent, not identity): before the FIRST cake
+        payload draws (and after a clear), the stash is ``None`` —
+        ``_apply_share_axis_state`` runs BEFORE ``build_payload`` on every
+        render (and again inside it), so on the GI / no-cake bootstrap a
+        ``None`` here would make ``_share_axis_plot_index`` return ``None``,
+        which force-UNCHECKS the Share-Axis box and wedges the gate (the
+        user's toggle is lost before the panel ever draws).  For exactly
+        that window we keep the pre-V3 derivation — GI-args key in GI mode,
+        the imageUnit combo otherwise — as a user-intent proxy; the first
+        drawn payload replaces it with rendered truth."""
+        key = getattr(self, '_cake_rendered_axis_key', None)
+        if key:
+            return key
         scan = getattr(self, 'scan', None)
         if scan is None:
             return None
@@ -2691,16 +2718,34 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.plotUnit.setEnabled(True)
             return False
         if was_checked:
+            prev_idx = self.ui.plotUnit.currentIndex()
             self._set_plot_unit_index_silently(target_idx)
-            # F4: the silent switch bypasses the plotUnit signal, so mirror
-            # _last_plot_unit here (as the normal setter does) -- otherwise it
-            # stays stale and reads as a Q-vs-2θ combo mismatch (the stale-combo
-            # signature).  NO follow-up render: an unconditional singleShot(0,
-            # update) is NOT dropped by _in_update (it runs post-unwind) and would
-            # cascade; the in-flight render already sees the updated value.
+            # F4 (kept under V3): the silent switch bypasses the plotUnit
+            # signal, so mirror _last_plot_unit here (as the normal setter
+            # does) -- otherwise it stays stale and reads as a Q-vs-2θ combo
+            # mismatch on the LEGACY update_plot path (DPl reads it for its
+            # freeze-fix short-circuit and APPEND-vs-REBUILD choice), which
+            # remains this mirror's consumer after the payload rewire.
             self._last_plot_unit = self.ui.plotUnit.currentIndex()
             self.ui.plotUnit.setEnabled(False)
             displayFrameWidget._set_share_link(self, True)
+            if prev_idx != target_idx:
+                # V3: the cake's RENDERED identity changed under a shared
+                # axis (an imageUnit flip drew the cake in a new unit while
+                # this render's 1D was built against the old one).  One
+                # CHANGE-GATED follow-up render re-builds the 1D in the new
+                # unit.  This cannot cascade: the follow-up render re-points
+                # to the SAME target (the stashed rendered key only moves
+                # when a cake draws with a different key), so prev == target
+                # there and no further render is scheduled — unlike the
+                # unconditional singleShot the F4 ledger note rejected.
+                _upd = getattr(self, 'update', None)
+                if _upd is not None:
+                    try:
+                        Qt.QtCore.QTimer.singleShot(0, _upd)
+                    except Exception:
+                        logger.debug("share-axis follow-up render skipped",
+                                     exc_info=True)
             return True
         displayFrameWidget._set_share_link(self, False)
         self.ui.plotUnit.setEnabled(True)
@@ -2878,6 +2923,25 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         right = win.mapToGlobal(win.mapFromScene(r.bottomRight())).x()
         return float(left), float(right)
 
+    def _share_axis_rendered_units_agree(self):
+        """Do the two panels' RENDERED axis identities agree? (V3, F-B.)
+
+        Compares the cake payload's stashed ``rendered_axis_key`` against the
+        canonical key of the 1D payload's rendered axis
+        (``_payload_x_axis_label`` — authoritative since V1 Stage 3).  Both
+        stashes describe pixels actually on screen, so the comparison is
+        exactly the align question: may the cake's numeric x-range be imposed
+        on the 1D?  Returns ``True``/``False`` when BOTH identities are
+        known, ``None`` when either panel has not rendered a payload yet
+        (bootstrap / legacy draw) — the caller then proceeds as before V3."""
+        cake_key = getattr(self, '_cake_rendered_axis_key', None)
+        plot_axis = getattr(self, '_payload_x_axis_label', None)
+        if not cake_key or not plot_axis:
+            return None
+        plot_key = _axis_key_from_label(
+            f"{plot_axis[0]} ({plot_axis[1]})")
+        return plot_key == cake_key
+
     def _align_plot_under_cake(self) -> None:
         """Set the 1D plot's x-RANGE so the shared Q values land at the same screen
         columns as the cake, WITHOUT moving the 1D's y-axis (no margin changes).
@@ -2889,6 +2953,30 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         so re-running on every cake range change / resize is safe."""
         try:
             if not getattr(self, '_share_link_on', False):
+                return
+            # V3 structural guard (the F3(a) rule): the align engages ONLY
+            # when the two panels' rendered payload identities agree.  On
+            # disagreement (e.g. the cake flipped to 2θ while the 1D still
+            # shows Q, or a no-wavelength cake stayed Q under a 2θ combo)
+            # imposing the cake's numeric range would pin the 1D to a
+            # foreign-unit window (the ledgered Q-panel-±70°-range bug), so
+            # skip and re-enable x-autorange — the 1D keeps/regains its own
+            # data span until the identities re-agree (the change-gated
+            # follow-up render in _apply_share_axis_state reconverges them).
+            if displayFrameWidget._share_axis_rendered_units_agree(
+                    self) is False:
+                bottom_plot = self._active_bottom_plot()
+                if bottom_plot is not None:
+                    self._share_axis_syncing = True
+                    try:
+                        bottom_plot.enableAutoRange(x=True)
+                    finally:
+                        self._share_axis_syncing = False
+                logger.debug(
+                    "share-axis align skipped: rendered units disagree "
+                    "(cake=%r, 1d=%r)",
+                    getattr(self, '_cake_rendered_axis_key', None),
+                    getattr(self, '_payload_x_axis_label', None))
                 return
             bw = getattr(self, 'binned_widget', None)
             cake_win = getattr(bw, 'image_win', None)
@@ -2959,6 +3047,16 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         forward align, so it terminates and never fights the forward direction."""
         try:
             if not getattr(self, '_share_link_on', False):
+                return
+            # V3 structural guard, mirroring _align_plot_under_cake: never
+            # impose the 1D's numeric range on a cake whose rendered unit
+            # disagrees.  Skip only — the cake keeps its own range (no
+            # autorange fiddling: the user's cake zoom must survive).
+            if displayFrameWidget._share_axis_rendered_units_agree(
+                    self) is False:
+                logger.debug(
+                    "share-axis inverse align skipped: rendered units "
+                    "disagree")
                 return
             bw = getattr(self, 'binned_widget', None)
             cake_win = getattr(bw, 'image_win', None)
@@ -4171,8 +4269,16 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         displayFrameWidget._set_image_widget_colorbar_visible(
             self.binned_widget, True)
 
-        imageUnit = self.ui.imageUnit.currentIndex()
-        if displayFrameWidget._display_gi_enabled(self.scan):
+        # V3: this method re-pushes the STASHED cake (Log/colormap redraws of
+        # binned_data), so its axis labels must describe those stashed pixels
+        # — the rendered identity carried off the payload that drew them —
+        # not the combo's CURRENT intent, which may have moved since.  The
+        # combo/GI-args derivation remains only as the no-stash fallback
+        # (binned_data populated by a pre-payload legacy path).
+        _rendered = getattr(self, '_cake_rendered_axis_labels', None)
+        if _rendered:
+            (_xl2, _xu2), (_yl2, _yu2) = _rendered
+        elif displayFrameWidget._display_gi_enabled(self.scan):
             gi_mode_2d = displayFrameWidget._display_bai_args(
                 self.scan, "2d").get('gi_mode_2d', 'qip_qoop')
             gi_idx = GI_MODES_2D.index(gi_mode_2d) if gi_mode_2d in GI_MODES_2D else 0
@@ -4181,6 +4287,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             _yl2 = gi_y_labels_2D[gi_idx]
             _yu2 = gi_y_units_2D[gi_idx]
         else:
+            imageUnit = self.ui.imageUnit.currentIndex()
             _xl2 = x_labels_2D[imageUnit] if imageUnit < len(x_labels_2D) else x_labels_2D[0]
             _xu2 = x_units_2D[imageUnit] if imageUnit < len(x_units_2D) else x_units_2D[0]
             _yl2 = y_labels_2D[imageUnit] if imageUnit < len(y_labels_2D) else y_labels_2D[0]
@@ -4658,6 +4765,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         """Blank the 2D cake panel."""
         try:
             self.binned_data = None
+            # V3: a blanked cake has no rendered identity — drop the stash so
+            # _current_image_axis_key falls back to the documented intent
+            # (combo/GI-args) derivation until the next cake payload draws.
+            self._cake_rendered_axis_key = None
+            self._cake_rendered_axis_labels = None
             self._clear_image_widget(self.binned_widget)
             # A blanked cake must not keep a stale slice-band ROI floating over
             # the empty panel.  Pre Step-5 the legacy get_int_1d re-attached the

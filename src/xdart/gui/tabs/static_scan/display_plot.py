@@ -21,7 +21,6 @@ from pyqtgraph.Qt import QtWidgets
 
 from .display_constants import (
     AA_inv, Th, Chi, Deg,
-    x_labels_1D, x_units_1D,
 )
 from .display_logic import (
     AccumulatorLifecycle,
@@ -1299,11 +1298,11 @@ class DisplayPlotMixin:
         rect = get_rect(s_xdata[:, 0], s_ydata[0])
         self.wf_widget.setRect(rect)
 
-        if getattr(self, 'viewer_mode', None) == 'xye':
-            _xl, _xu = self._current_plot_axis_label()
-        else:
-            plotUnit = self.ui.plotUnit.currentIndex()
-            _xl, _xu = x_labels_1D[plotUnit], x_units_1D[plotUnit]
+        # V3: label from the rendered payload identity (_current_plot_axis_label
+        # is payload-first with a combo-parse fallback), never a render-time
+        # combo-table read — same rule as update_wf.  (This pmesh variant is
+        # currently caller-less; kept consistent for any rollback use.)
+        _xl, _xu = self._current_plot_axis_label()
         self.wf_widget.image_plot.setLabel("bottom", _xl, units=_xu)
         self.wf_widget.image_plot.setLabel("left", self.wf_yaxis)
 

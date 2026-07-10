@@ -562,3 +562,132 @@ def test_armed_window_is_explicit_never_silent():
     h.assert_lifecycle_settled()
     h.render("after cancel")               # and the contract still holds
     assert h.persistent_count == 1
+
+
+# ── V3 (Stage 6): payloads carry rendered identity — Share-Axis sequences ──
+#
+# The Share-Axis chain under test is the REAL displayFrameWidget methods
+# bound onto the harness widget: _current_image_axis_key (payload-first),
+# _apply_share_axis_state (silent re-point off the CAKE payload identity),
+# _share_axis_rendered_units_agree and _align_plot_under_cake (the align
+# engages ONLY when the rendered payload identities agree; on disagreement
+# it re-arms x-autorange and never imposes the cake's range).
+
+
+def test_cake_payload_carries_rendered_identity():
+    # The 2D payload is self-describing: canonical radial key + two_d_kind.
+    h = OVHarness(cake_mode=True)
+    h.publish(0, select="only")
+    cake = h.last_cake_payload
+    assert cake is not None
+    assert cake.rendered_axis_key == "q_A^-1"
+    assert cake.rendered_kind == "q_chi"
+
+    # imageUnit flip with a wavelength: the cake resamples to 2θ and the
+    # payload identity follows the RENDERED axis.
+    h.image_unit_toggle()
+    cake = h.last_cake_payload
+    assert cake.rendered_axis_key == "2th_deg"
+    assert cake.rendered_kind == "q_chi"
+    assert "2" in str(cake.axis_x.label)
+
+    # And the accumulator survived the 2D flip (OV-5 repaint contract).
+    assert h.persistent_count == 1
+    assert h.resets_observed == []
+
+
+def test_cake_payload_identity_stays_honest_without_wavelength():
+    # THE F-B case: the combo says 2θ but the cake cannot convert (no λ) —
+    # the payload identity stays native Q, so every payload consumer sees
+    # the truth the combo would have lied about.
+    h = OVHarness(cake_mode=True, wavelength_m=None)
+    h.publish(0, select="only")
+    h.image_unit_toggle()                     # combo → 2θ-χ, but no λ
+    cake = h.last_cake_payload
+    assert cake is not None
+    assert cake.rendered_axis_key == "q_A^-1"     # honest: still Q
+    # ... and the widget's Share-Axis key reads the payload, not the combo.
+    assert h.widget._current_image_axis_key() == "q_A^-1"
+
+
+def test_share_axis_unit_flip_aligns_only_when_payload_units_agree():
+    # The composed V3 sequence: share on → imageUnit flip → the one-render
+    # stale window is guarded (align skipped + x-autorange re-armed, the 1D
+    # NEVER takes the foreign range) → the follow-up render reconverges.
+    h = OVHarness(cake_mode=True)
+    h.publish(0, peak=2.0)
+    h.publish(1, peak=3.0)
+    assert h.widget._cake_rendered_axis_key == "q_A^-1"
+
+    h.share_axis(True)
+    # Both panels rendered in Q: identities agree, plotUnit pinned to Q.
+    assert h.widget._share_axis_rendered_units_agree() is True
+    assert h.widget.ui.plotUnit.currentIndex() == 0
+    assert h.widget._last_plot_unit == 0          # F4 mirror, kept under V3
+
+    # Model the engaged geometric link (the real _set_share_link needs a Qt
+    # viewbox; the align/skip decision is what V3 owns).
+    h.widget._share_link_on = True
+    plot = h.widget.plot
+    h.widget._align_plot_under_cake()
+    # Identities agree → the guard passes; the duck has no cake window so
+    # the geometry leg exits without touching the panel: NO skip re-arm.
+    assert plot.autorange_calls == []
+    assert plot.xrange_calls == []
+
+    # imageUnit flip: THIS render's 1D was built against the old cake
+    # identity, the cake re-rendered in 2θ — the stale window.
+    h.image_unit_toggle()
+    assert h.last_cake_payload.rendered_axis_key == "2th_deg"
+    assert h.widget._share_axis_rendered_units_agree() is False
+    # The align must SKIP and re-arm x-autorange — never impose the cake's
+    # 2θ numeric range on the Q-rendered 1D (the ledgered ±70-range bug).
+    h.widget._align_plot_under_cake()
+    assert plot.xrange_calls == []                    # no foreign range, ever
+    assert plot.autorange_calls == [((), {"x": True})]
+    # The silent re-point moved plotUnit to the cake's new identity (the
+    # change-gated follow-up render's job in production).
+    assert h.widget.ui.plotUnit.currentIndex() == 1
+    assert h.widget._last_plot_unit == 1              # F4 mirror follows
+
+    # Follow-up render: the 1D rebuilds in 2θ → identities agree again and
+    # the align re-engages (guard passes; no further autorange re-arm).
+    h.render("share-axis follow-up")
+    assert h.widget._share_axis_rendered_units_agree() is True
+    h.widget._align_plot_under_cake()
+    assert plot.autorange_calls == [((), {"x": True})]    # unchanged
+    assert plot.xrange_calls == []
+
+    # The whole sequence never reset the accumulator (relabel contract).
+    assert h.persistent_count == 2
+    assert h.resets_observed == []
+    h.assert_lifecycle_settled()
+
+
+def test_gi_no_cake_bootstrap_share_axis_falls_back_to_intent():
+    # The DOCUMENTED fallback: before any cake payload renders, the
+    # rendered-identity stash is None — _current_image_axis_key falls back
+    # to the GI-args / combo INTENT derivation so _apply_share_axis_state
+    # does not force-uncheck the box (the wedge the ledger warned about).
+    h = OVHarness(cake_mode=True)
+    h.widget.scan.gi = True
+    h.widget.scan.bai_2d_args = {"gi_mode_2d": "qip_qoop"}
+    assert h.widget._cake_rendered_axis_key is None
+    # GI intent key, from the scan args — no payload, no combo.
+    assert h.widget._current_image_axis_key() == "qip_A^-1"
+
+    # GI polar (q_chi) intent keys as plain Q and MATCHES a plot row → the
+    # share gate stays enabled through the no-cake bootstrap.
+    h.widget.scan.bai_2d_args = {"gi_mode_2d": "q_chi"}
+    assert h.widget._current_image_axis_key() == "q_A^-1"
+    h.share_axis(True)
+    assert h.widget.ui.shareAxis.isChecked() is True      # NOT wedged
+    assert h.widget.ui.shareAxis.isEnabled() is True
+
+    # First cake payload arrives → rendered truth replaces the intent proxy.
+    h.publish(0, select="only")
+    assert h.widget._cake_rendered_axis_key == "q_A^-1"
+    assert h.last_cake_payload.rendered_kind == "q_chi"
+    assert h.widget._current_image_axis_key() == "q_A^-1"
+    assert h.widget.ui.shareAxis.isChecked() is True      # still engaged
+    h.assert_lifecycle_settled()

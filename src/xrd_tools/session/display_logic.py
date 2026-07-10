@@ -110,6 +110,7 @@ __all__ = [
     "apply_mask_for",
     "x_axis_for_unit",
     "pretty_unit",
+    "canonical_axis_key",
     "xye_unit_from_filename",
     "xye_prefix_for_unit",
     "default_plot_unit",
@@ -1239,12 +1240,27 @@ class ImagePayload:
     for both the full-res and the thumbnail source (the latter via
     :func:`nan_gaps_in_thumbnail`).  The fields let a consumer know where the
     gaps are without re-deriving them; they stay ``None`` for cake/viewer images.
+
+    ``rendered_axis_key`` / ``rendered_kind`` are the V3 rendered identity
+    (design_gui_display_robustness §5, F-B): stamped by the CAKE builder at
+    payload-build time, they describe what is actually ON the 2D panel —
+    never a combo read at render time.  ``rendered_axis_key`` is the
+    canonical radial-axis key AS RENDERED (:func:`canonical_axis_key` over
+    the rendered unit token: the imageUnit Q↔2θ resample target when the
+    conversion fired, else the publication's native token — so an
+    unconvertible cake, e.g. no wavelength, is honestly keyed native even
+    while the combo says otherwise).  ``rendered_kind`` is the
+    ``two_d_kind`` classifier output (``'q_chi'`` / ``'qip_qoop'`` /
+    ``'qtot_chigi'`` / ``'exit_angles'``), so GI panels are fully
+    self-describing.  Both stay ``None`` for raw-pixel/viewer images.
     """
     image: "np.ndarray"
     axis_x: Axis = Axis("x", "")
     axis_y: Axis = Axis("y", "")
     gap_mask_indices: "np.ndarray | None" = None
     raw_full_shape: "tuple | None" = None
+    rendered_axis_key: "str | None" = None
+    rendered_kind: "str | None" = None
 
 
 def combine_flat_masks(*masks, size=None):
@@ -1512,6 +1528,51 @@ def pretty_unit(unit):
         return unit
     symbol = _X_AXIS_TABLE.get(unit, (None, None))[1]
     return symbol if symbol else unit
+
+
+# GI subscript spellings (display_constants.Qip_s / Qoop_s), inlined so the
+# canonical-key classifier stays headless (xrd_tools cannot import xdart).
+_QIP_S = u'Qᵢₚ'          # Q_ip subscript (Qᵢₚ)
+_QOOP_S = u'Qₒₒₚ'   # Q_oop subscript (Qₒₒₚ)
+
+
+def canonical_axis_key(text):
+    """Canonical axis-identity key for a plot/cake axis (V3 rendered identity).
+
+    Accepts any axis spelling in circulation — pyFAI unit tokens
+    (``'q_A^-1'``, ``'2th_deg'``, ``'qip_A^-1'``), combo labels
+    (``'Q (Å⁻¹)'``, ``'2θ (°)'``), rendered-axis label+symbol pairs, the GI
+    unicode subscripts and the ``_X_AXIS_TABLE`` HTML ``<sub>`` labels — and
+    maps them all onto ONE comparable vocabulary: ``'qoop_A^-1'`` /
+    ``'qip_A^-1'`` / ``'exit_angle_deg'`` / ``'2th_deg'`` / ``'chigi_deg'``
+    / ``'chi_deg'`` / ``'q_A^-1'`` (q_total deliberately keys as
+    ``'q_A^-1'`` — GI polar pairs with the plain Q plot axis).  Unknown
+    axes return their lowercased text; empty input returns ``''``.
+
+    This is THE key both sides of the Share-Axis identity comparison use:
+    the cake payload's ``rendered_axis_key`` is stamped with it at build,
+    and the widget derives the 1D key from the rendered plot payload axis
+    with it (the former ``displayFrameWidget._axis_key_from_label``, moved
+    headless so payload builders can stamp identity without Qt)."""
+    text = str(text or '')
+    # Normalize the HTML subscript spellings ('Q<sub>ip</sub>') so they
+    # classify like their plain forms ('Qip').
+    lower = text.replace('<sub>', '').replace('</sub>', '').lower()
+    if _QOOP_S in text or 'qoop' in lower or 'q_oop' in lower:
+        return 'qoop_A^-1'
+    if _QIP_S in text or 'qip' in lower or 'q_ip' in lower:
+        return 'qip_A^-1'
+    if 'exit' in lower:
+        return 'exit_angle_deg'
+    if '2th' in lower or f'2{_TH}' in text:
+        return '2th_deg'
+    if (_CHI in text or 'chi' in lower) and 'gi' in lower:
+        return 'chigi_deg'
+    if _CHI in text or 'chi' in lower:
+        return 'chi_deg'
+    if 'q' in lower or _AA_INV in text:
+        return 'q_A^-1'
+    return lower.strip()
 
 
 #: TwoDKind -> the display layer's legacy kind strings.  GI polar

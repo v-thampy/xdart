@@ -33,6 +33,7 @@ from .display_logic import (
     RowMeta,
     Trace,
     accumulate_waterfall,
+    canonical_axis_key,
     combine_flat_masks,
     nan_gaps_in_thumbnail,
     sentinel_mask,
@@ -42,6 +43,7 @@ from .display_logic import (
     nanmean_slice,
     render_waterfall_view,
     resample_cake_to_unit,
+    two_d_kind_from_units,
     waterfall_display_rows,
 )
 from .display_constants import AA_inv, Deg, Th, x_labels_2D, x_units_2D
@@ -115,6 +117,25 @@ def _image_axis_for_publication(axis, *, fallback_label: str) -> Axis:
         unit = _display_unit_symbol(getattr(axis, "unit", "") or "")
     values = getattr(axis, "values", None)
     return Axis(label=label, unit=unit, values=None if values is None else np.asarray(values, dtype=float))
+
+
+def _rendered_cake_kind(ref_view) -> "str | None":
+    """The ``two_d_kind`` classifier output for a built cake payload (V3
+    rendered identity).  Prefers the view's own explicit ``two_d_kind``
+    (FrameView carries it); classifies from the axis unit strings otherwise
+    (the aggregate fallback path, whose ref is a bare axis holder).  The
+    kind names the PANEL FAMILY (``q_chi`` / ``qip_qoop`` / ``qtot_chigi``
+    / ``exit_angles``) — an imageUnit Q↔2θ resample changes the rendered
+    radial key, never the kind."""
+    if ref_view is None:
+        return None
+    kind = getattr(ref_view, "two_d_kind", None)
+    if kind is None:
+        kind = two_d_kind_from_units(
+            str(getattr(getattr(ref_view, "axis_2d_x", None), "unit", "") or ""),
+            str(getattr(getattr(ref_view, "axis_2d_y", None), "unit", "") or ""),
+        )
+    return getattr(kind, "value", str(kind)) if kind is not None else None
 
 
 def _two_d_axes_match(ref_view, view, *, rtol=1e-5, atol=1e-8) -> bool:
@@ -618,9 +639,16 @@ class PublicationDisplayAdapter:
         )
         if image.size == 0 or not np.isfinite(image).any():
             return None
-        image, axis_x = self._apply_image_unit_2d(
+        image, axis_x, rendered_unit = self._apply_image_unit_2d(
             image, axis_x, ref_view, ref_publication)
-        return ImagePayload(image=image, axis_x=axis_x, axis_y=axis_y)
+        # V3: the payload carries the identity it was RENDERED with — the
+        # canonical key of the unit token actually on the panel plus the
+        # two_d_kind family — so Share-Axis and every "what unit is on the
+        # 2D panel" consumer reads the payload, never a combo.
+        return ImagePayload(
+            image=image, axis_x=axis_x, axis_y=axis_y,
+            rendered_axis_key=canonical_axis_key(rendered_unit) or None,
+            rendered_kind=_rendered_cake_kind(ref_view))
 
     def _apply_image_unit_2d(self, image, axis_x, ref_view, ref_publication):
         """Apply the 2D-unit (imageUnit) Q↔2θ toggle to cake image + axis.
@@ -632,33 +660,44 @@ class PublicationDisplayAdapter:
         onto a grid uniform in the display unit and relabels the radial axis.
         A pyqtgraph ImageItem has one linear rect, so changing only the axis
         values would place interior peaks at the wrong 2θ.  GI cakes are left
-        verbatim (their imageUnit combo is disabled)."""
+        verbatim (their imageUnit combo is disabled).
+
+        Returns ``(image, axis_x, rendered_unit)`` — the third element is
+        the radial unit TOKEN actually rendered (V3 identity source): the
+        resample target when the conversion fired, else the publication's
+        native token.  An unconvertible cake (no wavelength) is therefore
+        honestly keyed native even while the imageUnit combo says otherwise
+        — exactly the stale-combo case the payload identity exists to
+        expose.  The imageUnit combo read here is USER INTENT (what unit to
+        render THIS build), not a render-time identity read."""
         widget = self._widget
+        native_unit = str(
+            getattr(getattr(ref_view, "axis_2d_x", None), "unit", "") or "")
         if (widget is None or axis_x is None or axis_x.values is None
                 or ref_view is None):
-            return image, axis_x
-        data_unit = str(getattr(ref_view.axis_2d_x, "unit", "") or "")
+            return image, axis_x, native_unit
+        data_unit = native_unit
         az_unit = str(getattr(getattr(ref_view, "axis_2d_y", None), "unit", "") or "")
         scan = getattr(widget, "scan", None)
         if getattr(scan, "gi", False) or is_gi_2d_units(data_unit, az_unit):
-            return image, axis_x
+            return image, axis_x, data_unit
         try:
             image_label = widget.ui.imageUnit.currentText()
         except Exception:
-            return image, axis_x
+            return image, axis_x, data_unit
         want_tth = Th in image_label
         want_q = AA_inv in image_label
         have_tth = "2th" in data_unit
         # Nothing to do when the selection already matches the data's unit.
         if not ((want_tth and not have_tth) or (want_q and have_tth)):
-            return image, axis_x
+            return image, axis_x, data_unit
         try:
             wavelength_m = widget._get_wavelength(
                 getattr(ref_publication, "raw_ref", None))
         except Exception:
             wavelength_m = None
         if not wavelength_m or wavelength_m <= 0:
-            return image, axis_x
+            return image, axis_x, data_unit
         image, new_values = resample_cake_to_unit(
             image,
             axis_x.values,
@@ -669,8 +708,10 @@ class PublicationDisplayAdapter:
             axis=1,
         )
         idx = 1 if want_tth else 0
-        return image, Axis(label=x_labels_2D[idx], unit=x_units_2D[idx],
-                           values=new_values)
+        return (image,
+                Axis(label=x_labels_2D[idx], unit=x_units_2D[idx],
+                     values=new_values),
+                "2th_deg" if want_tth else "q_A^-1")
 
     def _aggregate_display_is_primary(self, dim: str) -> bool:
         widget = self._widget
@@ -732,16 +773,24 @@ class PublicationDisplayAdapter:
         if image.size == 0 or not np.isfinite(image).any():
             return None
         if ref_view is not None:
-            image, axis_x = self._apply_image_unit_2d(
+            image, axis_x, rendered_unit = self._apply_image_unit_2d(
                 image, axis_x, ref_view, ref_publication)
         else:
-            image, axis_x = self._apply_image_unit_2d(
+            ref_view = SimpleNamespace(
+                axis_2d_x=SimpleNamespace(unit=agg.q_unit),
+                axis_2d_y=SimpleNamespace(unit=agg.chi_unit),
+            )
+            image, axis_x, rendered_unit = self._apply_image_unit_2d(
                 image,
                 axis_x,
-                SimpleNamespace(axis_2d_x=axis_x, axis_2d_y=axis_y),
+                ref_view,
                 SimpleNamespace(raw_ref=None),
             )
-        return ImagePayload(image=image, axis_x=axis_x, axis_y=axis_y)
+        # V3 rendered identity — same stamp as cake_image.
+        return ImagePayload(
+            image=image, axis_x=axis_x, axis_y=axis_y,
+            rendered_axis_key=canonical_axis_key(rendered_unit) or None,
+            rendered_kind=_rendered_cake_kind(ref_view))
 
     def _aggregate_plot_payload(self, state):
         """Whole-scan 1D Sum/Average from the on-disk aggregate (Step 7b).
