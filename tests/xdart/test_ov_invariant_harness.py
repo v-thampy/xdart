@@ -15,13 +15,21 @@ Ledger: live_findings_ledger.md rows OV-1..OV-7c, S-16, S-17, BL-6 and the
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from tests.xdart.ov_harness import (
     CLEAR,
     INCOMPATIBLE_GRID,
+    METHOD_SWITCH,
     REINTEGRATE,
+    SAME_NAME_RERUN,
+    InvariantViolation,
     OVHarness,
     _is_live_sentinel,
+)
+from xdart.gui.tabs.static_scan.display_logic import (
+    AccumulatorLifecycle,
+    LifecycleCause,
 )
 
 
@@ -144,6 +152,10 @@ def test_ov6_compatible_cross_scan_appends_incompatible_resets():
     h.publish(0)
     h.assert_reset_observed(INCOMPATIBLE_GRID)
     assert _ids(h) == (("scanC", 0),)
+    # Stage 5: the reset is owner-logged at the accumulate gate (exact
+    # code-site attribution), and the sequence ends settled.
+    assert h.resets_observed[-1][2].startswith("_overlay_waterfall_payload")
+    h.assert_lifecycle_settled()
 
 
 # ── BL-6: same axis+npt, different radial_range → reinterp onto one grid ──
@@ -355,6 +367,8 @@ def test_clear_resets_history_and_pins_together():
     h.assert_reset_observed(CLEAR)
     assert h.persistent_count == 0
     assert h.widget._pinned_slice_cuts == {}   # reset TOGETHER (round-4 hole)
+    assert len(h.widget._overlay_hydrated_pending_append_labels) == 0
+    h.assert_lifecycle_settled()
 
 
 # ── reintegrate-finish: allowed to reset (regrid); dedupes when identical ──
@@ -370,15 +384,25 @@ def test_reintegrate_finish_regrid_is_an_allowed_reset():
     assert h.persistent_count == 1         # rebuilt from the current render
     assert _ids(h) == (("scanA", 2),)
     assert np.asarray(h.history.x).size == 64
+    h.assert_lifecycle_settled()
 
 
-def test_reintegrate_finish_same_grid_keeps_rows():
+def test_reintegrate_finish_same_grid_rebuilds_with_owner_logged_reset():
+    # Stage 5 renegotiation (soundness gap a closed): production
+    # integrator_thread_finished ALWAYS resets through the owner
+    # (clear_overlay(REINTEGRATE)) and the follow-up render rebuilds from
+    # the current selection — an identical regrid lands back on the SAME
+    # count, and the pre-Stage-5 harness left its window ambiguously armed
+    # ("allowed ≠ required").  The owner log now proves the reset fired:
+    # the window is consumed EXACTLY even though the count never shrank.
     h = OVHarness()
     for i in range(3):
         h.publish(i)
-    h.reintegrate_finish()                 # identical grid: rows dedupe
-    assert h.persistent_count == 3         # allowed ≠ required: no shrink
-    assert h.pending_reset == REINTEGRATE  # the window was never needed
+    h.reintegrate_finish()                 # identical grid: reset + rebuild
+    h.assert_reset_observed(REINTEGRATE)   # consumed via the owner LOG
+    assert h.persistent_count == 3         # rebuilt to the same count
+    assert set(_ids(h)) == {("scanA", i) for i in range(3)}
+    h.assert_lifecycle_settled()
 
 
 # ── the ledger's canonical composed sequence ───────────────────────────────
@@ -410,3 +434,131 @@ def test_composed_canonical_ledger_sequence():
     assert h.persistent_count == 10
     assert set(_ids(h)) == {("scanA", i) for i in range(10)}
     assert h.resets_observed == []         # nothing was allowed to reset
+
+
+# ── SAME_NAME_RERUN (S-14): re-running an accumulated name resets ──────────
+
+
+def test_same_name_rerun_resets_with_exact_cause():
+    # Consecutive A→A: re-scoping to a name that already has rows resets
+    # through the owner with SAME_NAME_RERUN, so the new run's
+    # (name, frame_idx) row-ids never collide with (and get dedup-dropped
+    # against) the old run's.
+    h = OVHarness()
+    for i in range(3):
+        h.publish(i)
+    h.rescope("scanA", compatible=True)    # same name re-run
+    h.assert_reset_observed(SAME_NAME_RERUN)
+    assert h.persistent_count == 0
+    h.publish(0)
+    assert _ids(h) == (("scanA", 0),)      # the NEW run's row appended
+    h.assert_lifecycle_settled()
+
+
+def test_abab_same_name_rerun_resets_but_new_name_appends():
+    # A→B→A: the seen-set derives from the accumulator ITSELF, so the
+    # return to scanA resets even though the immediately-previous scan was
+    # B; a boundary to a NEW name (B) appends (OV-6 cross-scan comparison).
+    h = OVHarness()
+    h.publish(0)
+    h.publish(1)
+    h.rescope("scanB", compatible=True)    # NEW name: appends, no reset
+    h.publish(0)
+    assert h.persistent_count == 3
+    assert ("scanA", 0) in _ids(h) and ("scanB", 0) in _ids(h)
+    h.rescope("scanA", compatible=True)    # back to an accumulated name
+    h.assert_reset_observed(SAME_NAME_RERUN)
+    assert h.persistent_count == 0
+    h.publish(0)
+    assert _ids(h) == (("scanA", 0),)
+    h.assert_lifecycle_settled()
+
+
+# ── METHOD_SWITCH: leaving Overlay/Waterfall drops the trio together ───────
+
+
+def test_method_switch_resets_and_reentry_starts_fresh():
+    h = OVHarness()
+    for i in range(3):
+        h.publish(i)
+    h.method_switch("Single")              # non-accumulating method
+    h.assert_reset_observed(METHOD_SWITCH)
+    assert h.persistent_count == 0
+    assert h.resets_observed[-1][2] == "plot_payload[non-accumulating method]"
+    h.method_switch("Overlay")             # re-entry: FRESH accumulation
+    assert h.persistent_count == 3         # rebuilt from the live selection
+    assert set(_ids(h)) == {("scanA", i) for i in range(3)}
+    h.assert_lifecycle_settled()
+
+
+def test_method_switch_clears_pins_history_and_queue_together():
+    # The round-4 closure at the method-switch site: pins + history + the
+    # pending-append queue all reset TOGETHER through the owner (pre-Stage-5
+    # the plot_payload wipe nulled ONLY the history, stranding pins/queue).
+    h = OVHarness(slice_mode=True)
+    h.publish(0, select="only")
+    h.move_live_cut(-10.0, 2.0)
+    h.pin_current_cut()
+    h.move_live_cut(0.0)
+    assert h.widget._pinned_slice_cuts
+    h.method_switch("Sum")
+    h.assert_reset_observed(METHOD_SWITCH)
+    assert h.persistent_count == 0
+    assert h.widget._pinned_slice_cuts == {}
+    assert len(h.widget._overlay_hydrated_pending_append_labels) == 0
+    h.assert_lifecycle_settled()
+
+
+# ── Stage-5 soundness closures as executable proofs ────────────────────────
+
+
+def test_unowned_wipe_is_flagged_as_inv1_violation():
+    # Gap (a)/(b) backstop: a rogue direct `_waterfall_history = None` (the
+    # pattern the src ratchet forbids) has NO owner-logged cause, so the
+    # first render that cannot rebuild every row trips INV-1 exactly.
+    h = OVHarness(max_heavy_items=4)
+    for i in range(10):
+        h.publish(i)
+    h.widget._waterfall_history = None     # rogue wipe, bypassing the owner
+    with pytest.raises(InvariantViolation, match="no owner-logged cause"):
+        h.render("rogue direct wipe")
+
+
+def test_owner_reset_without_armed_expectation_is_flagged():
+    # Every reset must be EXPECTED as well as caused: an owner reset the
+    # sequence never armed fails the step check.
+    h = OVHarness()
+    h.publish(0)
+    AccumulatorLifecycle(h.widget).reset(
+        LifecycleCause.CLEAR, site="test[unexpected]")
+    with pytest.raises(InvariantViolation, match="NO armed expectation"):
+        h.render("unexpected owner reset")
+
+
+def test_armed_cause_must_match_owner_logged_cause():
+    # Gap (b): attribution is by the cause the code site LOGGED, never by
+    # arming order — a mismatched window is a violation, not a consumption.
+    h = OVHarness()
+    h.publish(0)
+    h.expect_reset(CLEAR)
+    AccumulatorLifecycle(h.widget).reset(
+        LifecycleCause.METHOD_SWITCH, site="test[mismatch]")
+    with pytest.raises(InvariantViolation, match="attribution mismatch"):
+        h.render("mismatched cause")
+
+
+def test_armed_window_is_explicit_never_silent():
+    # Gap (a): windows cannot stack, cannot linger silently — either the
+    # owner consumes them or the sequence cancels them explicitly.
+    h = OVHarness()
+    h.publish(0)
+    h.expect_reset(CLEAR)
+    with pytest.raises(AssertionError, match="still armed"):
+        h.expect_reset(REINTEGRATE)        # double-arm forbidden
+    with pytest.raises(AssertionError, match="never consumed"):
+        h.assert_lifecycle_settled()
+    h.cancel_expected_reset()              # explicit retirement
+    assert h.resets_cancelled == [CLEAR]
+    h.assert_lifecycle_settled()
+    h.render("after cancel")               # and the contract still holds
+    assert h.persistent_count == 1

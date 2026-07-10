@@ -22,8 +22,10 @@ from xdart.modules.frame_publication import (
 )
 
 from .display_logic import (
+    AccumulatorLifecycle,
     Axis,
     ImagePayload,
+    LifecycleCause,
     Mode,
     PanelRole,
     PlotPayload,
@@ -795,9 +797,12 @@ class PublicationDisplayAdapter:
             # A non-accumulating method (Single/Sum/Average) drops any overlay
             # accumulator, so switching back to Overlay/Waterfall starts fresh
             # (legacy _on_plotMethod_changed reset parity) rather than resurrecting
-            # a stale stack from before the switch.
-            if getattr(self._widget, "_waterfall_history", None) is not None:
-                self._widget._waterfall_history = None
+            # a stale stack from before the switch.  V2: through the owner —
+            # pins + history + pending queue reset TOGETHER under
+            # METHOD_SWITCH (a no-op that logs nothing once already empty).
+            AccumulatorLifecycle(self._widget).reset(
+                LifecycleCause.METHOD_SWITCH,
+                site="plot_payload[non-accumulating method]")
             return self.integration_plot_payload(state)
         # Overlay/Waterfall outside the integration modes have no payload owner yet.
         if state.method in ("Overlay", "Waterfall"):
@@ -986,7 +991,7 @@ class PublicationDisplayAdapter:
                 and not overlay_grid_keys_match(prior.reset_key, planned_reset_key)):
             clear_pins = getattr(widget, "_clear_pinned_slice_cuts", None)
             if callable(clear_pins):
-                clear_pins(clear_history=False)
+                clear_pins()
 
         pinned_recipes = tuple(
             getattr(widget, "_pinned_slice_cut_recipes", lambda: ())()
@@ -1001,7 +1006,7 @@ class PublicationDisplayAdapter:
             if incompatible_pin:
                 clear_pins = getattr(widget, "_clear_pinned_slice_cuts", None)
                 if callable(clear_pins):
-                    clear_pins(clear_history=False)
+                    clear_pins()
                 pinned_recipes = ()
 
         if pinned_recipes:
@@ -1147,7 +1152,12 @@ class PublicationDisplayAdapter:
                 # grids while the selection/model is settling.  The accumulator can
                 # represent only one grid family, so the latest incompatible row
                 # starts a fresh batch instead of being interpolated into stale
-                # history.
+                # history.  Only BATCH-LOCAL lists are cleared here — no
+                # accumulator state is touched (a settling batch may land
+                # back on the stored grid); when the batch SETTLES on a grid
+                # the stored accumulator cannot represent, the owner gate
+                # before the final accumulate_waterfall call performs the
+                # actual reset (V2, cause=INCOMPATIBLE_GRID).
                 ids.clear()
                 names.clear()
                 rows.clear()
@@ -1288,6 +1298,20 @@ class PublicationDisplayAdapter:
                 label=prior.label, x=prior.x,
                 rows=np.empty((0, np.asarray(prior.x).size), dtype=float),
                 ids=[], names=[], row_meta=(), drop_ids=replace_ids)
+        if (prior is not None and getattr(prior, "count", 0)
+                and not overlay_grid_keys_match(prior.reset_key, reset_key)):
+            # V2 owner gate: the batch settled on a grid the stored
+            # accumulator cannot represent (an incompatible boundary that
+            # reached the render, or the in-batch settle above), so this
+            # render RESETS it.  Route the discard through the owner so pins
+            # + the pending-append queue reset together and the reset is
+            # logged with its cause; with ``prior=None`` the
+            # accumulate_waterfall call below fresh-builds from the batch —
+            # identical to its own reset branch.
+            AccumulatorLifecycle(widget).reset(
+                LifecycleCause.INCOMPATIBLE_GRID,
+                site="_overlay_waterfall_payload[batch grid vs accumulator]")
+            prior = None
         history = accumulate_waterfall(
             prior, reset_key=reset_key, unit=unit, label=label,
             x=ref_x, rows=np.asarray(rows, dtype=float), ids=ids, names=names,

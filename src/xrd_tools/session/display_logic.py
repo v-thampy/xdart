@@ -83,6 +83,10 @@ __all__ = [
     "scan_key_from_qualified_id",
     "accumulate_waterfall",
     "waterfall_display_rows",
+    "LifecycleCause",
+    "LifecycleReset",
+    "AccumulatorLifecycle",
+    "accumulator_clearable",
     "normalize_rows",
     "display_grid_for_history",
     "render_waterfall_view",
@@ -895,6 +899,116 @@ def waterfall_display_rows(rows, ids, max_rows):
         return rows, ids, 1
     stride = int(np.ceil(n_rows / max_rows))
     return rows[::stride], ids[::stride], stride
+
+
+# ── V2: the single AccumulatorLifecycle owner (canonical-grid plan, Stage 5) ──
+#
+# CONVENTION (grep ratchet: tests/xdart/test_display_logic.py::
+# test_lifecycle_owner_convention_no_direct_history_wipes):
+# :meth:`AccumulatorLifecycle.reset` is the ONLY code allowed to null a
+# widget's ``_waterfall_history``.  The sanctioned NON-owner assignments are
+# (a) the renderer store-back of :func:`accumulate_waterfall`'s own return
+# (``payload.plot_history`` → ``widget._waterfall_history``), (b) the guarded
+# Overlay-entry seed (``_seed_overlay_history_from_plot_state``, which only
+# ever CREATES a history when none has rows — it never discards one), and
+# (c) attribute initialization tagged ``# lifecycle: init-only``.  A direct
+# ``_waterfall_history = None`` wipe anywhere else is forbidden: name the
+# cause in :class:`LifecycleCause` and call the owner instead, so pins +
+# history + the pending-append queue reset TOGETHER (the round-4
+# pin-survival hole, closed by construction) and the reset carries an
+# attributable cause the OV harness accounts exactly.
+
+
+class LifecycleCause(str, Enum):
+    """The explicit causes under which the Overlay/Waterfall accumulator may
+    reset (design §5 V2; the OV harness adopts these 1:1).
+
+    ``NORM_CHANGE`` is deliberately ABSENT: V1 Stage 4 dissolved S-16 — a
+    real norm-channel change re-scales at draw and never resets — and the
+    harness docstring forbids its return.  ``METHOD_SWITCH`` is its own
+    cause (not ``CLEAR``): it fires on a different user gesture (entering a
+    non-accumulating plot method, not the explicit Clear button) at distinct
+    code sites on both the payload and legacy paths, and exact code-site
+    attribution is the point of the cause vocabulary."""
+
+    CLEAR = "CLEAR"                        # the explicit Clear button / clear_1D
+    INCOMPATIBLE_GRID = "INCOMPATIBLE_GRID"  # reset_key change (OV-6, batch settle)
+    REINTEGRATE = "REINTEGRATE"            # same-scan reintegrate pass finished
+    SAME_NAME_RERUN = "SAME_NAME_RERUN"    # S-14: re-run of a name already accumulated
+    METHOD_SWITCH = "METHOD_SWITCH"        # Overlay/Waterfall → Single/Sum/Average
+
+
+@dataclass(frozen=True)
+class LifecycleReset:
+    """One owner-performed accumulator reset: the cause + the code site."""
+    cause: LifecycleCause
+    site: str = ""
+
+
+def accumulator_clearable(widget) -> bool:
+    """True when the widget holds observable accumulator state — history
+    rows (live sentinels included), pinned-cut recipes, or pending-append
+    labels.  The owner logs a :class:`LifecycleReset` exactly when this is
+    true at reset time; the OV harness arms its expectation windows off the
+    SAME predicate so armed windows and logged resets can never drift."""
+    history = getattr(widget, "_waterfall_history", None)
+    if history is not None and len(getattr(history, "ids", ()) or ()):
+        return True
+    if getattr(widget, "_pinned_slice_cuts", None):
+        return True
+    if getattr(widget, "_overlay_hydrated_pending_append_labels", None):
+        return True
+    return False
+
+
+class AccumulatorLifecycle:
+    """THE single owner of every Overlay/Waterfall accumulator reset (V2).
+
+    Pure and Qt-free: operates on the duck-typed display widget's
+    accumulator attributes only.  ``reset(cause)`` clears the trio TOGETHER
+    — ``_waterfall_history`` (the accumulator), ``_pinned_slice_cuts`` (the
+    pinned-cut recipes) and ``_overlay_hydrated_pending_append_labels`` (the
+    pending-append queue) — and, when there was anything observable to
+    clear, appends a :class:`LifecycleReset` to the widget's
+    ``_accumulator_lifecycle_log`` so every reset carries an exact,
+    code-site-attributable cause.  Widget-side display mirrors
+    (``plot_data`` / ``frame_names`` / ``overlaid_idxs`` / ranges) are NOT
+    accumulator state and stay with the call sites, which wipe whatever
+    site-specific subset they always did."""
+
+    #: widget attribute carrying the bounded reset log (newest last).
+    LOG_ATTR = "_accumulator_lifecycle_log"
+    #: production bound on retained entries (debug/attribution aid only).
+    LOG_LIMIT = 256
+
+    def __init__(self, widget):
+        self._widget = widget
+
+    def reset(self, cause, *, site: str = "") -> bool:
+        """Reset pins + history + pending-append queue together for
+        ``cause`` (a :class:`LifecycleCause`; unknown causes raise
+        ``ValueError``).  Returns True when an observable reset occurred
+        (and was logged); False for a no-op on an already-empty
+        accumulator, which logs nothing."""
+        cause = LifecycleCause(cause)
+        widget = self._widget
+        cleared = accumulator_clearable(widget)
+        # The owner nulling site — see the CONVENTION comment above.
+        widget._waterfall_history = None
+        pins = getattr(widget, "_pinned_slice_cuts", None)
+        if pins is not None:
+            pins.clear()
+        queue = getattr(widget, "_overlay_hydrated_pending_append_labels", None)
+        if queue is not None:
+            queue.clear()
+        if cleared:
+            log = getattr(widget, self.LOG_ATTR, None)
+            if log is None:
+                log = []
+                setattr(widget, self.LOG_ATTR, log)
+            log.append(LifecycleReset(cause=cause, site=str(site)))
+            del log[:-self.LOG_LIMIT]
+        return cleared
 
 
 # ── V1: pure draw-time transforms (canonical-grid plan, Stage 2/3) ────

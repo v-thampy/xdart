@@ -25,12 +25,14 @@ After EVERY event the harness renders and asserts the OV acceptance contract
 
 INV-1  Accumulator row count is MONOTONIC non-decreasing, except at an
        explicitly-allowed reset cause: CLEAR, INCOMPATIBLE_GRID (reset_key
-       change), REINTEGRATE.  A display-unit flip RELABELS, never resets;
-       a REAL norm-channel change RE-SCALES at draw, never resets (V1
-       Stage 4: S-16 dissolved — NORM_CHANGE is retired as a cause).  The
-       transient live slice "current" cut (the OV-7b/7c sentinel row) is
-       excluded from the count: it is a preview that pin-absorption
-       legitimately drops.
+       change), REINTEGRATE, SAME_NAME_RERUN, METHOD_SWITCH — the
+       :class:`~xrd_tools.session.display_logic.LifecycleCause` enum of
+       V2's single ``AccumulatorLifecycle`` owner, adopted 1:1.  A
+       display-unit flip RELABELS, never resets; a REAL norm-channel change
+       RE-SCALES at draw, never resets (V1 Stage 4: S-16 dissolved —
+       NORM_CHANGE stays retired and must not return).  The transient live
+       slice "current" cut (the OV-7b/7c sentinel row) is excluded from the
+       count: it is a preview that pin-absorption legitimately drops.
 INV-2  ``history.x`` is one strictly-monotonic grid, row width == len(x),
        one unit at a time.
 INV-3  No constant-clamped rows: ``np.ptp(row) > 0`` for every accumulated
@@ -41,17 +43,33 @@ INV-4  Pinned slice cuts ⊆ history rows; pins and history reset TOGETHER.
 
 A violation raises :class:`InvariantViolation` carrying the full numbered
 event trace, so a failure names the exact step sequence — the substrate the
-future V6 fuzzer shrinks on.  The allowed-reset causes are named with the V2
-lifecycle-cause vocabulary (``CLEAR`` / ``INCOMPATIBLE_GRID`` /
-``REINTEGRATE``) so V2's single AccumulatorLifecycle owner can adopt this
-harness's cause accounting unchanged.
+future V6 fuzzer shrinks on.
 
-FOR V2 (cause-vocabulary history): ``NORM_CHANGE`` was RETIRED at V1 Stage 4
-— since the canonical-grid flip the accumulator stores acquisition-native
-rows and the norm divides at draw, so a REAL channel change re-renders with
-the new scaling and never resets (S-16 dissolved); it must NOT return as an
-allowed reset cause and needs no lifecycle enum member.  ``SAME_NAME_RERUN``
-joins the vocabulary when V2's AccumulatorLifecycle owner lands.
+RESET ACCOUNTING (V2, exact — the two QW-3 soundness gaps are CLOSED):
+every owner reset appends a ``LifecycleReset(cause, site)`` to the widget's
+``_accumulator_lifecycle_log``; after EVERY event the harness drains that
+log and
+
+* (gap b — attribution by code-site, not arming order) each drained entry
+  must match the ONE armed ``expect_reset`` window — the armed cause is
+  checked against the cause the owner actually LOGGED at the code site, so
+  a reset can never be mis-attributed to whichever expectation happened to
+  be armed first;
+* (gap a — armed ≠ consumed windows are no longer silent) a count decrease
+  with no logged cause is an INV-1 violation (an un-owned wipe), a logged
+  reset with no armed window is a violation, and an armed window is either
+  consumed by its logged reset or must be explicitly retired via
+  :meth:`OVHarness.cancel_expected_reset` (sequences end with
+  :meth:`OVHarness.assert_lifecycle_settled`).  Because the owner logs even
+  when a follow-up render rebuilds the accumulator to its prior count (an
+  identical-grid reintegrate), "allowed ≠ required" ambiguity is gone: the
+  log proves whether the reset fired.
+
+NORM_CHANGE (cause-vocabulary history): RETIRED at V1 Stage 4 — since the
+canonical-grid flip the accumulator stores acquisition-native rows and the
+norm divides at draw, so a REAL channel change re-renders with the new
+scaling and never resets (S-16 dissolved); it must NOT return as an allowed
+reset cause and has no lifecycle enum member.
 
 NOT a test module — import it: ``from tests.xdart.ov_harness import OVHarness``.
 """
@@ -72,7 +90,12 @@ from xdart.modules.frame_publication import (
 )
 from xdart.gui.tabs.static_scan.display_constants import plotUnits, imageUnits
 from xdart.gui.tabs.static_scan.display_controllers import ScanDisplayController
-from xdart.gui.tabs.static_scan.display_logic import Mode
+from xdart.gui.tabs.static_scan.display_logic import (
+    AccumulatorLifecycle,
+    LifecycleCause,
+    Mode,
+    accumulator_clearable,
+)
 from xdart.gui.tabs.static_scan.display_overlay_utils import (
     LIVE_SLICE_PROJECTION_ID,
 )
@@ -80,13 +103,14 @@ from xdart.gui.tabs.static_scan.display_publication import (
     PublicationDisplayAdapter,
 )
 
-# V2 lifecycle-cause names (design §5 V2): the only causes allowed to shrink
-# the accumulator.  SAME_NAME_RERUN arrives with V2; NORM_CHANGE was retired
-# at V1 Stage 4 (see the module docstring); the harness models the three
-# causes the current code exercises.
-CLEAR = "CLEAR"
-INCOMPATIBLE_GRID = "INCOMPATIBLE_GRID"
-REINTEGRATE = "REINTEGRATE"
+# V2 lifecycle causes — the owner's enum adopted 1:1 (design §5 V2): the only
+# causes allowed to shrink the accumulator.  NORM_CHANGE stays retired (V1
+# Stage 4) and must not return.
+CLEAR = LifecycleCause.CLEAR
+INCOMPATIBLE_GRID = LifecycleCause.INCOMPATIBLE_GRID
+REINTEGRATE = LifecycleCause.REINTEGRATE
+SAME_NAME_RERUN = LifecycleCause.SAME_NAME_RERUN
+METHOD_SWITCH = LifecycleCause.METHOD_SWITCH
 
 
 class InvariantViolation(AssertionError):
@@ -142,8 +166,10 @@ class OVHarness:
     One harness instance = one scripted sequence.  Every event method mutates
     the widget/store exactly the way the production event does, then renders
     through the real controller→adapter→accumulator path and re-checks the
-    acceptance contract.  ``expect_reset(cause)`` arms the ONE allowance under
-    which the next observed count decrease is legal; anything else raises.
+    acceptance contract.  ``expect_reset(cause)`` arms the ONE window under
+    which an owner-logged reset is legal; the logged cause must MATCH the
+    armed cause (exact code-site attribution — see the module docstring),
+    and anything else raises.
     """
 
     #: default synthetic grid (npt chosen small for speed; > any decimation
@@ -165,7 +191,8 @@ class OVHarness:
         self.hydration_requests = []
         self.repaint_requests = []
         self._pending_reset = None          # armed allowed-reset cause or None
-        self.resets_observed = []           # [(cause, event)] consumed windows
+        self.resets_observed = []           # [(cause, event, site)] owner-logged
+        self.resets_cancelled = []          # explicitly retired armed windows
         self._persistent_floor = 0
         self._grid = {}                     # per-scan publish defaults
         self.widget = self._build_widget(scan_name)
@@ -203,6 +230,7 @@ class OVHarness:
             plot_data=[np.zeros(0), np.zeros(0)],
             plot_data_range=[[0, 0], [0, 0]],
             _waterfall_history=None,
+            _accumulator_lifecycle_log=[],   # V2 owner reset log (drained per event)
             display_generation=1,
             _processing_active=False,
             normChannel=None,
@@ -365,29 +393,55 @@ class OVHarness:
 
     @property
     def pending_reset(self):
-        """The armed-but-unconsumed allowed-reset cause (or ``None``).  An
-        allowed cause is permitted to reset, not required to — e.g. a
-        same-grid reintegrate dedupes instead of shrinking, leaving its
-        window armed.  Sequences end (or assert on this) before relying on
-        INV-1 again."""
+        """The armed-but-unconsumed allowed-reset cause (or ``None``).
+        Windows are consumed by OWNER-LOGGED resets whose cause matches
+        (exact attribution), not by count arithmetic; a window whose site
+        never fires stays armed and must be retired explicitly via
+        :meth:`cancel_expected_reset` — sequences end with
+        :meth:`assert_lifecycle_settled`."""
         return self._pending_reset
 
+    def _accumulator_clearable(self):
+        """Observable accumulator state exists — THE owner's own predicate
+        (imported), so armed windows can never drift from logged resets."""
+        return accumulator_clearable(self.widget)
+
     def expect_reset(self, cause):
-        """Arm ONE allowed-reset window (ledger causes only).  The next count
-        decrease consumes it; an unconsumed window is reported by
-        :meth:`assert_reset_observed`."""
-        assert cause in (CLEAR, INCOMPATIBLE_GRID, REINTEGRATE), (
-            f"not a ledger-allowed reset cause: {cause!r}")
+        """Arm ONE allowed-reset window (a :class:`LifecycleCause` member).
+        The next owner-logged reset must carry exactly this cause; arming a
+        second window over an unconsumed one raises (consume or
+        :meth:`cancel_expected_reset` first)."""
+        cause = LifecycleCause(cause)
+        assert self._pending_reset is None, (
+            f"expect_reset({cause}): window {self._pending_reset} is still "
+            f"armed — consume it or cancel_expected_reset() first")
         self._pending_reset = cause
 
+    def cancel_expected_reset(self):
+        """Explicitly retire an armed-but-unneeded window (soundness gap a:
+        'allowed ≠ required' is never silent — a sequence either observes
+        its owner-logged reset or cancels the expectation)."""
+        assert self._pending_reset is not None, (
+            "cancel_expected_reset(): no armed reset window")
+        self.resets_cancelled.append(self._pending_reset)
+        self._pending_reset = None
+
     def assert_reset_observed(self, cause):
-        """The armed ``cause`` actually reset the accumulator (an allowed
-        cause is permitted to reset — sequences assert it DID)."""
+        """The armed ``cause`` actually reset the accumulator — consumed by
+        the owner-logged entry from the code site (an allowed cause is
+        permitted to reset; sequences assert it DID)."""
+        cause = LifecycleCause(cause)
         assert self._pending_reset is None, (
             f"expected a {cause} reset but none was observed "
             f"(window still armed)")
         assert self.resets_observed and self.resets_observed[-1][0] == cause, (
             f"last observed reset {self.resets_observed[-1:]} != {cause}")
+
+    def assert_lifecycle_settled(self):
+        """No armed-but-unconsumed reset window remains (sequence end)."""
+        assert self._pending_reset is None, (
+            f"armed reset window {self._pending_reset} was never consumed "
+            f"nor cancelled (soundness gap a)")
 
     def check_invariants(self, event="explicit check"):
         """Public step-hook (also callable mid-test)."""
@@ -420,17 +474,34 @@ class OVHarness:
                         event,
                         f"INV-3: constant/empty row for id {history.ids[k]} "
                         f"(disjoint-domain clamp?)")
-        # INV-1: monotonic persistent count except one armed allowed cause.
+        # INV-1 (V2 exact accounting): drain the owner's reset log; every
+        # logged reset must consume the ONE armed window with a MATCHING
+        # cause (attribution by code site), and any count decrease must be
+        # backed by a logged reset — an un-owned wipe is a violation.
+        log = getattr(self.widget, "_accumulator_lifecycle_log", None)
+        entries = list(log or ())
+        if entries:
+            del log[:]
         count = self.persistent_count
-        if count < self._persistent_floor:
-            if self._pending_reset is not None:
-                self.resets_observed.append((self._pending_reset, event))
-                self._pending_reset = None
-            else:
+        for entry in entries:
+            if self._pending_reset is None:
                 self._fail(
                     event,
-                    f"INV-1: accumulator shrank {self._persistent_floor} → "
-                    f"{count} with no allowed reset cause armed")
+                    f"owner reset {entry.cause} at site {entry.site!r} "
+                    f"with NO armed expectation")
+            if entry.cause != self._pending_reset:
+                self._fail(
+                    event,
+                    f"armed {self._pending_reset} but the owner logged "
+                    f"{entry.cause} at site {entry.site!r} (attribution "
+                    f"mismatch)")
+            self.resets_observed.append((entry.cause, event, entry.site))
+            self._pending_reset = None
+        if count < self._persistent_floor and not entries:
+            self._fail(
+                event,
+                f"INV-1: accumulator shrank {self._persistent_floor} → "
+                f"{count} with no owner-logged cause (un-owned wipe)")
         self._persistent_floor = count
         # INV-4: pins ⊆ history (and they reset together).
         pin_ids = set(self.widget._pinned_slice_cuts or {})
@@ -544,11 +615,16 @@ class OVHarness:
         """Scan boundary.  The store resets (production scan boundary);
         the accumulator must NOT — unless the NEW grid is incompatible, in
         which case the reset happens at the first new-grid row and is
-        allowed (OV-6).  ``native_unit`` sets the new scan's acquisition-
-        native integration unit (default: inherit the current scan's) —
-        with a matching npt the reset key stays compatible and the V1 D1
-        canonicalization path is exercised; ``x_range`` must then be given
-        in that unit."""
+        allowed (OV-6), or the new name ALREADY has rows in the accumulator
+        (consecutive A→A or A→B→A), in which case the S-14 rule resets
+        through the owner NOW with SAME_NAME_RERUN so the new run's
+        (name, frame_idx) row-ids never collide with the old run's —
+        mirroring ``_rescope_frame_panel_to``'s seen-set derivation from
+        the accumulator itself.  ``native_unit`` sets the new scan's
+        acquisition-native integration unit (default: inherit the current
+        scan's) — with a matching npt the reset key stays compatible and
+        the V1 D1 canonicalization path is exercised; ``x_range`` must then
+        be given in that unit."""
         grid = self._grid[self.widget.scan.name]
         if npt is None:
             npt = grid["npt"] if compatible else grid["npt"] + 7
@@ -558,22 +634,40 @@ class OVHarness:
             native_unit = grid.get("unit", "q_A^-1")
         if clear_store:
             self.store.clear()
+        # S-14 (production order: before the OV-6 grid rule): seen names come
+        # from the accumulator ITSELF, catching A→B→A.
+        _hist = self.widget._waterfall_history
+        _seen = {i[0] for i in (getattr(_hist, "ids", ()) or ())
+                 if isinstance(i, tuple) and i}
+        same_name_rerun = new_scan in _seen and self._accumulator_clearable()
+        if same_name_rerun:
+            self.expect_reset(SAME_NAME_RERUN)
+            AccumulatorLifecycle(self.widget).reset(
+                LifecycleCause.SAME_NAME_RERUN,
+                site="harness.rescope[S-14 same-name re-run]")
         self.widget.scan = self._make_scan(new_scan)
         self._configure_scan(new_scan, npt=npt, x_range=x_range,
                              unit=native_unit)
         self.widget.frame_ids[:] = []
         self.widget.display_generation += 1
-        if not compatible:
+        if not compatible and not same_name_rerun:
+            # The S-14 reset (if any) already emptied the accumulator, so an
+            # incompatible grid then builds fresh without a second reset.
             self.expect_reset(INCOMPATIBLE_GRID)
         return self._step(
             f"rescope(scan={new_scan}, compatible={compatible}, npt={npt}, "
-            f"x_range={tuple(x_range)}, native_unit={native_unit})")
+            f"x_range={tuple(x_range)}, native_unit={native_unit}, "
+            f"same_name_rerun={same_name_rerun})")
 
     def reintegrate_finish(self, *, npt=None):
         """Same-scan reintegrate pass completing: the store resets and every
-        indexed frame republishes recomputed (production Step-6 shape).  An
-        ALLOWED reset cause — a regrid (npt change) resets; an identical
-        regrid may keep the rows (dedupe)."""
+        indexed frame republishes recomputed, then the accumulator resets
+        through the REAL owner site — ``clear_overlay(REINTEGRATE)``, the
+        exact call ``integrator_thread_finished`` makes — and the follow-up
+        render rebuilds from the CURRENT selection.  V2: the reset is
+        owner-logged, so an identical regrid that rebuilds straight back to
+        the same count still consumes its window exactly (gap a closed: the
+        log proves the reset fired even without a net count decrease)."""
         if npt is not None:
             self._grid[self.widget.scan.name]["npt"] = int(npt)
         self.store.begin_reintegrate()
@@ -584,7 +678,9 @@ class OVHarness:
         finally:
             self.store.end_reintegrate()
         self.widget.display_generation += 1
-        self.expect_reset(REINTEGRATE)
+        if self._accumulator_clearable():
+            self.expect_reset(REINTEGRATE)
+        self.widget.clear_overlay(LifecycleCause.REINTEGRATE)
         return self._step(f"reintegrate_finish(npt={npt})")
 
     def hydration_complete(self, label, *, stale=False):
@@ -615,9 +711,29 @@ class OVHarness:
             self.widget.ui.slice_width._value = float(width)
         return self._step(f"move_live_cut(center={center}, width={width})")
 
+    def method_switch(self, method):
+        """Flip the plotMethod combo.  Leaving Overlay/Waterfall for a
+        non-accumulating method (Single/Sum/Average) drops the accumulator
+        trio — history + pins + pending queue TOGETHER — through the owner
+        on the next render (METHOD_SWITCH: the ``plot_payload``
+        non-accumulating branch; the legacy ``_on_plotMethod_changed``
+        wipes carry the same cause).  Switching back re-enters accumulation
+        FRESH from the current selection — never resurrecting the
+        pre-switch stack."""
+        ui = self.widget.ui
+        prev = ui.plotMethod._text
+        ui.plotMethod._text = str(method)
+        if (str(method) not in ("Overlay", "Waterfall")
+                and prev in ("Overlay", "Waterfall")
+                and self._accumulator_clearable()):
+            self.expect_reset(METHOD_SWITCH)
+        return self._step(f"method_switch({prev} → {method})")
+
     def clear(self):
-        """The Clear button — the REAL ``clear_overlay`` (history + pins +
-        pending queue), the canonical allowed reset."""
+        """The Clear button — the REAL ``clear_overlay`` through the V2
+        owner (history + pins + pending queue together), the canonical
+        allowed reset."""
+        if self._accumulator_clearable():
+            self.expect_reset(CLEAR)
         self.widget.clear_overlay()
-        self.expect_reset(CLEAR)
         return self._step("clear()")

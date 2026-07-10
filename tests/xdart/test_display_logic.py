@@ -1904,3 +1904,153 @@ def test_render_waterfall_view_interps_rows_with_their_own_wavelength():
     assert abs(peak_at - expected_tth) < 2 * dx
     # The λ_ref row is a pure relabel: values untouched.
     assert np.array_equal(out[0], row0)
+
+
+# ── V2 (Stage 5): the single AccumulatorLifecycle owner ───────────────
+
+
+def _lifecycle_widget(*, with_state=True):
+    """Duck widget carrying the accumulator trio the owner resets."""
+    from collections import deque
+
+    if with_state:
+        history = dl.WaterfallHistory(
+            reset_key=("radial", 4, False), unit="q_A^-1", label="Q",
+            x=np.linspace(1.0, 4.0, 4), rows=np.ones((1, 4)),
+            ids=(("scanA", 0),), names=("scanA_0",))
+        pins = {("scanA", 0, ("chi", 0.0, 1.0)): {"label": 0}}
+        queue = deque([7, 8])
+    else:
+        history, pins, queue = None, {}, deque()
+    return SimpleNamespace(
+        _waterfall_history=history,
+        _pinned_slice_cuts=pins,
+        _overlay_hydrated_pending_append_labels=queue,
+    )
+
+
+def test_lifecycle_cause_vocabulary_norm_change_stays_retired():
+    assert [c.name for c in dl.LifecycleCause] == [
+        "CLEAR", "INCOMPATIBLE_GRID", "REINTEGRATE", "SAME_NAME_RERUN",
+        "METHOD_SWITCH",
+    ]
+    # S-16 dissolved at V1 Stage 4: norm change re-renders, never resets.
+    assert "NORM_CHANGE" not in dl.LifecycleCause.__members__
+
+
+def test_lifecycle_reset_clears_trio_together_for_every_cause():
+    # The round-4 pin-survival hole, closed by construction: EVERY cause
+    # resets history + pins + pending-append queue TOGETHER and logs the
+    # cause + code site.
+    for cause in dl.LifecycleCause:
+        widget = _lifecycle_widget()
+        cleared = dl.AccumulatorLifecycle(widget).reset(
+            cause, site=f"test[{cause.name}]")
+        assert cleared is True
+        assert widget._waterfall_history is None
+        assert widget._pinned_slice_cuts == {}
+        assert len(widget._overlay_hydrated_pending_append_labels) == 0
+        (entry,) = widget._accumulator_lifecycle_log
+        assert entry.cause is cause
+        assert entry.site == f"test[{cause.name}]"
+
+
+def test_lifecycle_reset_unknown_cause_raises():
+    widget = _lifecycle_widget()
+    with pytest.raises(ValueError):
+        dl.AccumulatorLifecycle(widget).reset("NORM_CHANGE")
+    with pytest.raises(ValueError):
+        dl.AccumulatorLifecycle(widget).reset(None)
+    # A failed reset must not have touched anything.
+    assert widget._waterfall_history is not None
+    assert widget._pinned_slice_cuts
+    assert len(widget._overlay_hydrated_pending_append_labels) == 2
+
+
+def test_lifecycle_noop_reset_logs_nothing():
+    # Resetting an already-empty accumulator clears defensively but logs no
+    # entry — the log carries only OBSERVABLE resets, so the OV harness can
+    # require every logged entry to match an armed expectation exactly.
+    widget = _lifecycle_widget(with_state=False)
+    cleared = dl.AccumulatorLifecycle(widget).reset(dl.LifecycleCause.CLEAR)
+    assert cleared is False
+    assert widget._waterfall_history is None
+    assert getattr(widget, "_accumulator_lifecycle_log", []) == []
+
+
+def test_lifecycle_reset_is_defensive_on_bare_ducks():
+    # Shared-mixin duck hosts may lack pins/queue attributes entirely.
+    widget = SimpleNamespace(_waterfall_history=None)
+    assert dl.AccumulatorLifecycle(widget).reset(
+        dl.LifecycleCause.METHOD_SWITCH) is False
+    assert widget._waterfall_history is None
+
+
+def test_lifecycle_accumulator_clearable_predicate():
+    assert dl.accumulator_clearable(_lifecycle_widget()) is True
+    assert dl.accumulator_clearable(_lifecycle_widget(with_state=False)) is False
+    # Each leg alone suffices: pins-only / queue-only / rows-only.
+    w = _lifecycle_widget(with_state=False)
+    w._pinned_slice_cuts[("s", 0, ())] = {}
+    assert dl.accumulator_clearable(w) is True
+    w = _lifecycle_widget(with_state=False)
+    w._overlay_hydrated_pending_append_labels.append(3)
+    assert dl.accumulator_clearable(w) is True
+    w = _lifecycle_widget()
+    w._pinned_slice_cuts.clear()
+    w._overlay_hydrated_pending_append_labels.clear()
+    assert dl.accumulator_clearable(w) is True   # history rows remain
+
+
+def test_lifecycle_log_is_bounded():
+    widget = _lifecycle_widget()
+    owner = dl.AccumulatorLifecycle(widget)
+    for k in range(owner.LOG_LIMIT + 50):
+        # Re-arm observable state so every reset logs.
+        widget._overlay_hydrated_pending_append_labels.append(k)
+        owner.reset(dl.LifecycleCause.CLEAR, site=f"n{k}")
+    log = widget._accumulator_lifecycle_log
+    assert len(log) == owner.LOG_LIMIT
+    assert log[-1].site == f"n{owner.LOG_LIMIT + 49}"
+
+
+def test_lifecycle_owner_convention_no_direct_history_wipes():
+    # Placement ratchet (the test_architecture_guards pattern): outside the
+    # owner module, no first-party code may null `_waterfall_history`
+    # directly — the only sanctioned non-owner line is attribute
+    # initialization tagged `lifecycle: init-only`.  New wipe sites must
+    # name a LifecycleCause and call AccumulatorLifecycle.reset instead.
+    import re
+
+    # Derive the repo root from the known display_logic shim path
+    # (src/xdart/gui/tabs/static_scan/display_logic.py → 6 levels up).
+    repo_root = _DISPLAY_LOGIC_PATH
+    for _ in range(6):
+        repo_root = os.path.dirname(repo_root)
+    src_root = os.path.join(repo_root, "src")
+    owner_module = os.path.join(
+        repo_root, "src", "xrd_tools", "session", "display_logic.py")
+    pattern = re.compile(r"_waterfall_history\s*=\s*None")
+    offenders = []
+    for dirpath, _dirs, files in os.walk(src_root):
+        if "__pycache__" in dirpath:
+            continue
+        for name in files:
+            if not name.endswith(".py"):
+                continue
+            path = os.path.join(dirpath, name)
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for lineno, line in enumerate(fh, 1):
+                    if not pattern.search(line):
+                        continue
+                    if line.lstrip().startswith("#"):
+                        continue
+                    if os.path.abspath(path) == os.path.abspath(owner_module):
+                        continue
+                    if "lifecycle: init-only" in line:
+                        continue
+                    offenders.append(
+                        f"{os.path.relpath(path, repo_root)}:{lineno}")
+    assert offenders == [], (
+        "direct `_waterfall_history = None` wipes outside the "
+        f"AccumulatorLifecycle owner: {offenders}")

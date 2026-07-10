@@ -20,6 +20,7 @@ from types import SimpleNamespace, MethodType
 
 import pandas as pd
 
+from xdart.gui.tabs.static_scan.display_logic import LifecycleCause
 from xdart.gui.tabs.static_scan.static_scan_widget import (
     staticWidget, _scan_key_from_source,
 )
@@ -27,7 +28,7 @@ from xdart.modules.frame_publication import PublicationStore
 
 
 def _boundary_host():
-    pin_clears = []          # S-14: records displayframe._clear_pinned_slice_cuts calls
+    pin_clears = []          # S-18 pin-only drops (render-path compat clears)
     scan = SimpleNamespace(
         name="scanA", gi=False, incidence_motor="th", single_img=False,
         series_average=False, global_mask=None, scan_lock=RLock(),
@@ -51,11 +52,12 @@ def _boundary_host():
         _list_timer=SimpleNamespace(stop=lambda: None, trigger=lambda: None),
         _flush_pending_update=lambda: None,
         displayframe=SimpleNamespace(
-            set_axes=lambda: None, clear_overlay=lambda: None,
+            set_axes=lambda: None, clear_overlay=lambda *a, **k: None,
             idxs=[], idxs_1d=[], idxs_2d=[],
             _raw_resolve_failed=set(), _raw_full_shape=None,
             stitch_display_mode=None,
             _waterfall_history=None,   # S-14: tests set .ids to seed the accumulator
+            _accumulator_lifecycle_log=[],   # V2 owner log (S-14 observation)
             _clear_pinned_slice_cuts=lambda **k: pin_clears.append(k)),
         _controls_v2_enabled=lambda: False,
         _refresh_controls_v2_profile=lambda *a, **k: None,
@@ -169,12 +171,16 @@ def test_same_scan_rerun_clears_panel():
     # the overlay accumulator now holds scanA rows
     host.displayframe._waterfall_history = SimpleNamespace(
         ids=[("scanA", i) for i in range(1, 6)])
-    host._pin_clears.clear()
     # RE-RUN scanA
     host.new_scan("scanA", "/data/scanA_master.h5", False, "th", False, False)
     assert list(scan.frames.index) == [], "same-name re-run must clear the panel"
-    assert any(c.get("clear_history") for c in host._pin_clears), \
+    # V2 (Stage 5): the S-14 reset goes through the single owner — history
+    # nulled AND the reset logged with the exact cause + code site.
+    assert host.displayframe._waterfall_history is None, \
         "same-name re-run must clear the overlay accumulator (S-14)"
+    log = host.displayframe._accumulator_lifecycle_log
+    assert [e.cause for e in log] == [LifecycleCause.SAME_NAME_RERUN]
+    assert "S-14" in log[-1].site
 
 
 def test_abab_rerun_clears_overlay_s14():
@@ -185,10 +191,11 @@ def test_abab_rerun_clears_overlay_s14():
     host, scan = _boundary_host()
     host.displayframe._waterfall_history = SimpleNamespace(
         ids=[("scanA", 1), ("scanA", 2), ("scanB", 1)])
-    host._pin_clears.clear()
     host._rescope_frame_panel_to("scanA")     # re-run scanA, already accumulated
-    assert any(c.get("clear_history") for c in host._pin_clears), \
+    assert host.displayframe._waterfall_history is None, \
         "A->B->A re-run must clear the overlay accumulator (S-14 completion)"
+    log = host.displayframe._accumulator_lifecycle_log
+    assert [e.cause for e in log] == [LifecycleCause.SAME_NAME_RERUN]
 
 
 def test_different_scan_boundary_keeps_overlay_s14():
@@ -196,10 +203,11 @@ def test_different_scan_boundary_keeps_overlay_s14():
     # appends (OV-6 cross-scan comparison), so it must not clear.
     host, scan = _boundary_host()
     host.displayframe._waterfall_history = SimpleNamespace(ids=[("scanA", 1)])
-    host._pin_clears.clear()
     host._rescope_frame_panel_to("scanC")     # a NEW name, not in the accumulator
-    assert not any(c.get("clear_history") for c in host._pin_clears), \
+    assert host.displayframe._waterfall_history is not None, \
         "a boundary to a NEW name must NOT clear the overlay (OV-6 append)"
+    assert host.displayframe._accumulator_lifecycle_log == [], \
+        "no owner reset may be logged for an OV-6 append boundary"
 
 
 def test_batch_mode_never_frame_rescopes():

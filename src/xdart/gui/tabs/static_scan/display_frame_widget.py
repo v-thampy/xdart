@@ -56,6 +56,7 @@ from .display_logic import (
     Mode, LoadStatus, PanelRole, compute_display_state,
     build_payload, render_plan, controller_for, ImagePayload,
     empty_display_state, PANEL_LAYOUT,
+    AccumulatorLifecycle, LifecycleCause,
     resolve_selection, resolve_render_ids,
     default_plot_unit, pretty_unit, sentinel_mask, integer_saturation_ceiling,
     combine_flat_masks, nan_gaps_in_thumbnail,
@@ -689,9 +690,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.overlaid_idxs = []
         # Flip stage 2: the payload-carried Overlay/Waterfall accumulator
         # (grid-keyed WaterfallHistory). Lives alongside the legacy triple until
-        # the render path delegates to it; reset at accumulator-lifecycle sites
-        # such as clear_overlay and incompatible grid changes.
-        self._waterfall_history = None
+        # the render path delegates to it; every reset goes through the single
+        # AccumulatorLifecycle owner (V2) with an explicit cause.
+        self._waterfall_history = None  # lifecycle: init-only (resets go through AccumulatorLifecycle)
         self._pinned_slice_cuts = {}
         self.viewer_rows_1d = viewer_rows_1d
         self.viewer_rows_2d = viewer_rows_2d
@@ -3817,12 +3818,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def _pinned_slice_cut_recipes(self):
         return tuple((getattr(self, "_pinned_slice_cuts", None) or {}).values())
 
-    def _clear_pinned_slice_cuts(self, *, clear_history=True):
+    def _clear_pinned_slice_cuts(self):
+        """Drop the pinned-cut RECIPES only (the S-18 stale-pin / grid-compat
+        drops on the render path).  Accumulator resets — pins + history +
+        pending-append queue together — go through the single
+        ``AccumulatorLifecycle`` owner with an explicit cause, never through
+        this helper."""
         registry = getattr(self, "_pinned_slice_cuts", None)
         if registry is not None:
             registry.clear()
-        if clear_history:
-            self._waterfall_history = None
 
     def pin_current_slice_cut(self):
         """Freeze the current slice center/width as overlay recipe rows."""
@@ -4515,13 +4519,21 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     # ── Viewer modes ──────────────────────────────────────────────
 
-    def clear_overlay(self):
-        """Drop accumulated overlay curves + names."""
+    def clear_overlay(self, cause=LifecycleCause.CLEAR, *, site=""):
+        """Drop accumulated overlay curves + names.
+
+        V2 (Stage 5): the widget-side owner method.  The accumulator trio —
+        history + pinned-cut recipes + the pending-append queue — resets
+        TOGETHER through the single ``AccumulatorLifecycle`` owner with the
+        explicit ``cause`` (default ``CLEAR``, the Clear button; lifecycle
+        callers pass ``REINTEGRATE`` / ``INCOMPATIBLE_GRID``); this method
+        additionally wipes the widget-side display mirrors."""
         caller = _runend_clear_caller()
         browse_debug_log(
             logger,
             "runend_clear_overlay_before",
             caller=caller,
+            cause=str(getattr(cause, "value", cause)),
             generation=getattr(self, "display_generation", None),
             selected=sequence_summary(getattr(self, "frame_ids", ())),
             mode=(
@@ -4531,17 +4543,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             ),
             **_runend_waterfall_history_fields(self),
         )
+        AccumulatorLifecycle(self).reset(
+            cause, site=site or "displayFrameWidget.clear_overlay")
         self.plot_data = [np.zeros(0), np.zeros(0)]
         self.plot_data_range = [[0, 0], [0, 0]]
         self.frame_names = []
         self.overlaid_idxs = []
-        self._waterfall_history = None
-        pending_overlay = getattr(self, "_overlay_hydrated_pending_append_labels", None)
-        if pending_overlay is not None:
-            pending_overlay.clear()
-        clear_pins = getattr(self, "_clear_pinned_slice_cuts", None)
-        if callable(clear_pins):
-            clear_pins(clear_history=False)
         browse_debug_log(
             logger,
             "runend_clear_overlay_after",

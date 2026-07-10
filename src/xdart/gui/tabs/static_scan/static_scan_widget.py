@@ -136,6 +136,7 @@ from xrd_tools.core.energy import wavelength_m_to_energy_eV
 from .ui.staticUI import Ui_Form
 from .h5viewer import H5Viewer, _qt_enum_value
 from .display_frame_widget import displayFrameWidget
+from .display_logic import AccumulatorLifecycle, LifecycleCause
 from .display_overlay_utils import (
     frame_index_from_row_id,
     overlay_grid_key_for_widget,
@@ -6563,7 +6564,9 @@ class staticWidget(QWidget):
                     **_runend_waterfall_history_fields(
                         getattr(self, "displayframe", None)),
                 )
-                self.displayframe.clear_overlay()
+                self.displayframe.clear_overlay(
+                    LifecycleCause.REINTEGRATE,
+                    site=f"{origin}_thread_finished[reintegrate finish]")
                 browse_debug_log(
                     logger,
                     f"runend_{origin}_after_clear_overlay",
@@ -6769,7 +6772,9 @@ class staticWidget(QWidget):
         if method not in ("Overlay", "Waterfall") or not getattr(history, "count", 0):
             return
         if self._overlay_clear_needed_for_scan_boundary(first_frame=None):
-            df.clear_overlay()
+            df.clear_overlay(
+                LifecycleCause.INCOMPATIBLE_GRID,
+                site="_maybe_clear_overlay_for_browser_boundary[OV-6]")
 
     def _rescope_frame_panel_to(self, name, first_frame=None):
         """Reset the Frames-panel / display state to a NEW scan identity.
@@ -6821,7 +6826,14 @@ class staticWidget(QWidget):
                  if isinstance(i, tuple) and i}
         if name in _seen:
             try:
-                self.displayframe._clear_pinned_slice_cuts(clear_history=True)
+                # V2 owner: SAME_NAME_RERUN resets pins + history + the
+                # pending-append queue together (the queue could otherwise
+                # replay old-run labels against the new run's store).  The
+                # display mirrors deliberately stay: the outgoing curves
+                # linger until the new run's first frame draws.
+                AccumulatorLifecycle(self.displayframe).reset(
+                    LifecycleCause.SAME_NAME_RERUN,
+                    site="_rescope_frame_panel_to[S-14 same-name re-run]")
             except Exception:
                 logger.debug("S-14 re-run accumulator clear failed", exc_info=True)
         # Reset the Overlay/Waterfall accumulator only for incompatible grids.
@@ -6834,7 +6846,9 @@ class staticWidget(QWidget):
                          exc_info=True)
         try:
             if self._overlay_clear_needed_for_scan_boundary(first_frame=first_frame):
-                self.displayframe.clear_overlay()
+                self.displayframe.clear_overlay(
+                    LifecycleCause.INCOMPATIBLE_GRID,
+                    site="_rescope_frame_panel_to[OV-6 scan boundary]")
         except Exception:
             logger.debug("display overlay reset on scan rescope failed", exc_info=True)
         try:

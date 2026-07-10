@@ -3534,7 +3534,9 @@ def test_reintegrate_finished_resets_overlay_before_refresh():
         h5viewer=SimpleNamespace(
             set_open_enabled=lambda enabled: calls.append(("open", enabled))),
         displayframe=SimpleNamespace(
-            clear_overlay=lambda: calls.append("clear_overlay")),
+            # V2 (Stage 5): the reintegrate-finish site passes an explicit
+            # LifecycleCause + site to the widget-side owner method.
+            clear_overlay=lambda *a, **k: calls.append("clear_overlay")),
         update_all=lambda: calls.append("update_all"),
         wrangler=SimpleNamespace(enabled=lambda enabled: calls.append(("wrangler", enabled))),
     )

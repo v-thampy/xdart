@@ -24,6 +24,8 @@ from .display_constants import (
     x_labels_1D, x_units_1D,
 )
 from .display_logic import (
+    AccumulatorLifecycle,
+    LifecycleCause,
     plan_overlay,
     overlay_read_failure_action,
     OverlayAction,
@@ -541,14 +543,18 @@ class DisplayPlotMixin:
         if (method in ("Overlay", "Waterfall")
                 and getattr(_history, "count", 0)
                 and not overlay_grid_keys_match(getattr(_history, "reset_key", None), _grid_key)):
-            # Incompatible grid/source boundary: drop the stale accumulator.  Inline (clear_overlay
-            # is a displayFrameWidget method; update_plot is a shared mixin method
-            # also exercised by duck-host tests).  plot_data_range is recomputed by
+            # Incompatible grid/source boundary: drop the stale accumulator
+            # through the V2 owner (pins + history + pending queue together;
+            # the owner's attribute handling is defensive, so the shared-mixin
+            # duck-host tests keep working).  The display mirrors are wiped
+            # inline exactly as before; plot_data_range is recomputed by
             # compute_plot_range on the next draw.
+            AccumulatorLifecycle(self).reset(
+                LifecycleCause.INCOMPATIBLE_GRID,
+                site="update_plot[legacy grid boundary]")
             self.plot_data = [np.zeros(0), np.zeros(0)]
             self.frame_names = []
             self.overlaid_idxs = []
-            self._waterfall_history = None
 
         if (method in ("Overlay", "Waterfall")
                 and getattr(self, "overlaid_idxs", None)
@@ -596,10 +602,14 @@ class DisplayPlotMixin:
             if (getattr(self, "overlaid_idxs", None)
                     and prior_grid_key is not None
                     and not overlay_grid_keys_match(prior_grid_key, current_grid_key)):
+                # Same rule as above, discovered from the re-read data: V2
+                # owner reset + the inline display-mirror wipes.
+                AccumulatorLifecycle(self).reset(
+                    LifecycleCause.INCOMPATIBLE_GRID,
+                    site="update_plot[legacy re-read grid change]")
                 self.plot_data = [np.zeros(0), np.zeros(0)]
                 self.frame_names = []
                 self.overlaid_idxs = []
-                self._waterfall_history = None
             self._overlay_legacy_grid_key = current_grid_key
 
         row_ids = list(getattr(self, "_plot_row_ids", self.idxs_1d))
@@ -787,7 +797,7 @@ class DisplayPlotMixin:
 
         if getattr(self, 'viewer_mode', None) == 'xye':
             if new_method in ('Single', 'Sum', 'Average'):
-                self.clear_overlay()
+                self.clear_overlay(LifecycleCause.METHOD_SWITCH)
             # Re-render through the payload path (XYEViewerController.build_payload);
             # Overlay/Waterfall accumulation lives there now, keyed off the
             # widget's plot_data/frame_names (which clear_overlay resets above).
@@ -797,7 +807,13 @@ class DisplayPlotMixin:
 
         self.request_plot_autorange()
         if new_method == 'Single':
-            # Reset accumulated data — rebuild from current selection
+            # Reset accumulated data — rebuild from current selection.  V2:
+            # the accumulator trio resets through the owner (METHOD_SWITCH,
+            # matching the payload path's plot_payload wipe); the display
+            # mirrors reset inline as before.
+            AccumulatorLifecycle(self).reset(
+                LifecycleCause.METHOD_SWITCH,
+                site="_on_plotMethod_changed[Single]")
             self.plot_data = [np.array([]), np.array([])]
             self.frame_names = []
             self.overlaid_idxs = []
@@ -806,7 +822,11 @@ class DisplayPlotMixin:
             self.update()
         elif new_method in ('Sum', 'Average'):
             # No accumulation needed: aggregation happens inside
-            # update_1d_view() based on the current selection.
+            # update_1d_view() based on the current selection.  V2 owner
+            # reset as in the Single branch.
+            AccumulatorLifecycle(self).reset(
+                LifecycleCause.METHOD_SWITCH,
+                site="_on_plotMethod_changed[Sum/Average]")
             self.plot_data = [np.array([]), np.array([])]
             self.frame_names = []
             self.overlaid_idxs = []
@@ -1354,8 +1374,12 @@ class DisplayPlotMixin:
         """Initialize curves for line plots
         """
         if hasattr(self, "clear_overlay"):
-            self.clear_overlay()
+            self.clear_overlay(LifecycleCause.CLEAR)
         else:
+            # Duck hosts without the widget-side owner method: same reset,
+            # straight through the V2 owner + the inline mirror wipes.
+            AccumulatorLifecycle(self).reset(
+                LifecycleCause.CLEAR, site="clear_1D[fallback]")
             self.frame_names.clear()
             self.plot_data = [np.zeros(0), np.zeros(0)]
             self.plot_data_range = [[0, 0], [0, 0]]
