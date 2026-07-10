@@ -1661,3 +1661,176 @@ def test_stitch_modes_have_panel_layout_geometry():
     # STITCH_1D is plot-only (2D pane collapsed); STITCH_2D collapses the 1D plot.
     assert dl.PANEL_LAYOUT[dl.Mode.STITCH_1D].twoDWindow_h == (0, 0)
     assert dl.PANEL_LAYOUT[dl.Mode.STITCH_2D].plotWindow_h == (0, 0)
+
+
+# ── V1 Stage-2: pure draw-time transform functions ─────────────────────────
+# normalize_rows / display_grid_for_history / render_waterfall_view — the
+# draw-time half of the canonical-grid flip, unit-tested headlessly against
+# NATIVE-grid histories (Stage-3 semantics: history.unit is the pyFAI token,
+# per-row provenance in row_meta).  The production equivalence proof lives in
+# test_v1_draw_equivalence.py.
+
+_Q_UNIT = "q_A^-1"
+_PLOT_Q = "Q (Å⁻¹)"       # plotUnits[0]
+_PLOT_TTH = "2θ (°)"           # plotUnits[1]
+
+
+def _native_hist(rows, *, x, metas=None, wavelengths=None, unit=_Q_UNIT):
+    """Build a native-grid WaterfallHistory through the real accumulator."""
+    n = len(rows)
+    metas = metas if metas is not None else [None] * n
+    wavelengths = wavelengths if wavelengths is not None else [1e-10] * n
+    row_meta = [
+        dl.RowMeta(source_unit=unit, wavelength_m=wavelengths[k])
+        for k in range(n)
+    ]
+    return dl.accumulate_waterfall(
+        None, reset_key="grid", unit=unit, x=x, rows=rows,
+        ids=[("A", k) for k in range(n)],
+        names=[f"A/{k}" for k in range(n)],
+        metadata=metas, row_meta=row_meta)
+
+
+def test_normalize_rows_divides_only_positive_finite_channel_values():
+    rows = np.array([[2.0, 4.0], [6.0, 8.0], [3.0, 5.0], [7.0, 9.0]])
+    metas = [{"i0": 2.0}, {"i0": 0.0}, {"i0": float("nan")}, {}]
+    out = dl.normalize_rows(rows, metas, "i0")
+    assert np.array_equal(out[0], [1.0, 2.0])       # divided by 2.0
+    assert np.array_equal(out[1], rows[1])          # 0 monitor: untouched
+    assert np.array_equal(out[2], rows[2])          # NaN monitor: untouched
+    assert np.array_equal(out[3], rows[3])          # missing key: untouched
+    assert np.array_equal(rows[0], [2.0, 4.0])      # input never mutated
+
+
+def test_normalize_rows_no_channel_returns_untouched_copy():
+    rows = np.array([[1.0, np.nan, 3.0]])
+    out = dl.normalize_rows(rows, [{"i0": 2.0}], None)
+    assert out is not rows
+    assert np.array_equal(out, rows, equal_nan=True)   # NaN-safe passthrough
+    out[0, 0] = 99.0
+    assert rows[0, 0] == 1.0                            # a NEW array
+
+
+def test_normalize_rows_matches_channel_key_case_insensitively():
+    # get_normChannel resolves per-row keys case-insensitively; the vector
+    # form keeps that so a row with 'I0' still normalizes under channel 'i0'.
+    rows = np.array([[4.0, 8.0]])
+    out = dl.normalize_rows(rows, [{"I0": 4.0}], "i0")
+    assert np.array_equal(out[0], [1.0, 2.0])
+
+
+def test_display_grid_native_passthrough_same_unit():
+    x = np.linspace(1.0, 5.0, 32)
+    hist = _native_hist([np.ones_like(x)], x=x)
+    x_disp, axis, needs = dl.display_grid_for_history(hist, want_unit=_PLOT_Q)
+    assert np.array_equal(x_disp, x)
+    assert (axis.label, axis.unit) == dl.x_axis_for_unit(_Q_UNIT)  # ('Q','Å⁻¹')
+    assert needs == (False,)
+
+
+def test_display_grid_converts_q_to_tth_with_lambda_ref():
+    x = np.linspace(1.0, 5.0, 32)
+    hist = _native_hist([np.ones_like(x), 2 * np.ones_like(x)], x=x)
+    expected = dl.convert_2d_radial(
+        x, data_unit=_Q_UNIT, want_tth=True, want_q=False,
+        wavelength_m=1e-10)
+    for want in (_PLOT_TTH, "2th_deg"):    # combo text AND pyFAI token
+        x_disp, axis, needs = dl.display_grid_for_history(
+            hist, want_unit=want)
+        assert np.array_equal(x_disp, expected)
+        assert (axis.label, axis.unit) == dl.x_axis_for_unit("2th_deg")
+        assert needs == (False, False)     # one λ: pure x-relabel, no interp
+
+
+def test_display_grid_flags_rows_whose_wavelength_differs():
+    x = np.linspace(1.0, 5.0, 32)
+    hist = _native_hist(
+        [np.ones_like(x), np.ones_like(x)], x=x,
+        wavelengths=[1e-10, 1.2e-10])
+    x_disp, _axis, needs = dl.display_grid_for_history(
+        hist, want_unit=_PLOT_TTH)
+    # λ_ref is the FIRST row's carried wavelength (D2).
+    assert np.array_equal(x_disp, dl.convert_2d_radial(
+        x, data_unit=_Q_UNIT, want_tth=True, want_q=False,
+        wavelength_m=1e-10))
+    assert needs == (False, True)
+
+
+def test_display_grid_without_any_wavelength_keeps_native_axis_honestly():
+    # D2: conversion requested but NO row carries λ → the native axis is
+    # returned as-is (never a 2θ label over unconverted Q values).
+    x = np.linspace(1.0, 5.0, 32)
+    hist = _native_hist([np.ones_like(x)], x=x, wavelengths=[None])
+    x_disp, axis, needs = dl.display_grid_for_history(
+        hist, want_unit=_PLOT_TTH)
+    assert np.array_equal(x_disp, x)
+    assert (axis.label, axis.unit) == dl.x_axis_for_unit(_Q_UNIT)
+    assert needs == (False,)
+
+
+def test_display_grid_gi_units_pass_through_verbatim():
+    # The is_gi_2d_units guard, mirroring _apply_plot_unit_1d: a qip axis is
+    # never Q↔2θ-converted no matter what the combo asks for.
+    x = np.linspace(-2.0, 2.0, 16)
+    hist = _native_hist([np.ones_like(x)], x=x, unit="qip_A^-1")
+    x_disp, axis, needs = dl.display_grid_for_history(
+        hist, want_unit=_PLOT_TTH)
+    assert np.array_equal(x_disp, x)
+    assert axis.unit == dl.pretty_unit("qip_A^-1")
+    assert needs == (False,)
+
+
+def test_render_waterfall_view_decimates_before_norm_and_keeps_alignment():
+    # 10 rows, max_rows=5 → stride 2.  Each row's monitor differs, so any
+    # misalignment between the decimated rows and their metadata shows up as
+    # a wrong scale factor.
+    x = np.linspace(1.0, 5.0, 16)
+    rows = [np.full_like(x, 10.0) for _ in range(10)]
+    metas = [{"i0": float(k + 1)} for k in range(10)]
+    hist = _native_hist(rows, x=x, metas=metas)
+    x_disp, out, ids, axis = dl.render_waterfall_view(
+        hist, want_unit=_PLOT_Q, norm_channel="i0", max_rows=5)
+    assert ids == tuple(("A", k) for k in range(0, 10, 2))
+    assert out.shape == (5, x.size)
+    for pos, k in enumerate(range(0, 10, 2)):
+        assert np.allclose(out[pos], 10.0 / (k + 1))
+    assert np.array_equal(x_disp, x)
+    assert (axis.label, axis.unit) == dl.x_axis_for_unit(_Q_UNIT)
+
+
+def test_render_waterfall_view_composes_norm_then_conversion_exactly():
+    # One λ + a norm channel: the view is rows/monitor on the converted grid
+    # — rows are never resampled (pure x-relabel), so equality is EXACT.
+    x = np.linspace(1.0, 5.0, 24)
+    row = np.linspace(3.0, 7.0, 24)
+    hist = _native_hist([row], x=x, metas=[{"i0": 2.0}])
+    x_disp, out, ids, axis = dl.render_waterfall_view(
+        hist, want_unit=_PLOT_TTH, norm_channel="i0", max_rows=None)
+    assert np.array_equal(out[0], row / 2.0)
+    assert np.array_equal(x_disp, dl.convert_2d_radial(
+        x, data_unit=_Q_UNIT, want_tth=True, want_q=False,
+        wavelength_m=1e-10))
+    assert (axis.label, axis.unit) == dl.x_axis_for_unit("2th_deg")
+    assert ids == (("A", 0),)
+
+
+def test_render_waterfall_view_interps_rows_with_their_own_wavelength():
+    # D2 per-row leg: a row carrying a DIFFERENT λ is converted with its own
+    # wavelength and interp'd onto the display grid, so its peak lands at the
+    # 2θ its λ implies — not λ_ref's.
+    x = np.linspace(1.0, 5.0, 200)
+    lam_ref, lam_row = 1e-10, 1.3e-10
+    peak_q = 3.0
+    row0 = np.exp(-0.5 * ((x - 2.0) / 0.1) ** 2)
+    row1 = np.exp(-0.5 * ((x - peak_q) / 0.1) ** 2)
+    hist = _native_hist([row0, row1], x=x, wavelengths=[lam_ref, lam_row])
+    x_disp, out, _ids, _axis = dl.render_waterfall_view(
+        hist, want_unit=_PLOT_TTH, norm_channel=None, max_rows=None)
+    expected_tth = float(dl.convert_2d_radial(
+        np.asarray([peak_q]), data_unit=_Q_UNIT, want_tth=True,
+        want_q=False, wavelength_m=lam_row)[0])
+    peak_at = float(x_disp[int(np.argmax(out[1]))])
+    dx = float(np.max(np.diff(x_disp)))
+    assert abs(peak_at - expected_tth) < 2 * dx
+    # The λ_ref row is a pure relabel: values untouched.
+    assert np.array_equal(out[0], row0)

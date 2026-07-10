@@ -1049,6 +1049,12 @@ class PublicationDisplayAdapter:
         axis = None
         reset_key = None
         ids, names, rows, metadata, row_meta = [], [], [], [], []
+        # V1 Stage-2 equivalence scaffolding (tests only): under
+        # XDART_OV_DUALCAPTURE=1 each row's PRE-transform (native_x, native_y)
+        # is stashed in its RowMeta so the equivalence suite can prove
+        # stored_row ≈ draw-time render(native).  Read once per render; when
+        # the env is unset the per-row cost is one falsy branch (no copies).
+        dualcapture = bool(os.environ.get("XDART_OV_DUALCAPTURE"))
 
         def append_row(label, *, recipe=None, live=False):
             nonlocal ref_x, axis, reset_key
@@ -1062,6 +1068,7 @@ class PublicationDisplayAdapter:
             row_needs_2d = needs_2d
             if recipe is not None:
                 row_needs_2d = True
+            native_x = native_y = None   # XDART_OV_DUALCAPTURE only
             if not row_needs_2d:
                 if not view.has_1d or publication_has_1d_errors(pub):
                     return None
@@ -1072,6 +1079,10 @@ class PublicationDisplayAdapter:
                 # V1 RowMeta: the acquisition-native unit, read BEFORE the
                 # plotUnit conversion overwrites the axis.
                 source_unit = str(getattr(view.axis_1d, "unit", "") or "")
+                if dualcapture:
+                    # PRE-transform: before norm and the plotUnit conversion.
+                    native_x = np.array(x, dtype=float)
+                    native_y = np.array(y, dtype=float)
                 y = self._normalize(y, pub.metadata_raw)
                 x, conv_axis = self._apply_plot_unit_1d(x, source_unit, pub)
                 this_axis = (conv_axis if conv_axis is not None
@@ -1091,6 +1102,13 @@ class PublicationDisplayAdapter:
                 if projected is None:
                     return None
                 x, y, this_axis = projected
+                if dualcapture:
+                    # PRE-transform slice, stashed by _slice_1d_from_2d after
+                    # the (irreversible) projection but before norm + the
+                    # unit conversion it bakes in.
+                    native_x, native_y = getattr(
+                        self, "_dualcapture_native", None) or (None, None)
+                    self._dualcapture_native = None
             if np.asarray(x).size == 0:   # S-17: an empty grid carries no trace
                 return None
             if recipe is not None:
@@ -1183,6 +1201,8 @@ class PublicationDisplayAdapter:
                 norm_value=row_norm_value,
                 bkg_token=getattr(widget, "_bkg_token", None),
                 projection_id=projection_id,
+                native_x=native_x,
+                native_y=native_y,
             ))
             return row_id
 
@@ -1395,6 +1415,13 @@ class PublicationDisplayAdapter:
             y = nanmean_slice(intensity[:, inds], 1)
         if y is None:
             return None
+        if os.environ.get("XDART_OV_DUALCAPTURE"):
+            # V1 Stage-2 equivalence scaffolding (tests only): the
+            # PRE-transform slice — after the irreversible 2D→1D projection
+            # (which stays build-time), before the norm + unit conversion
+            # baked in below.  Consumed by append_row into RowMeta.
+            self._dualcapture_native = (np.array(x, dtype=float),
+                                        np.array(y, dtype=float))
         y = self._normalize(y, publication.metadata_raw)
         this_axis = None
         if convert:

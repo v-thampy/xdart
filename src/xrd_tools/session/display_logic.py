@@ -84,6 +84,9 @@ __all__ = [
     "scan_key_from_qualified_id",
     "accumulate_waterfall",
     "waterfall_display_rows",
+    "normalize_rows",
+    "display_grid_for_history",
+    "render_waterfall_view",
     "ImagePayload",
     "ResultsView",
     "DisplayState",
@@ -851,6 +854,203 @@ def waterfall_display_rows(rows, ids, max_rows):
         return rows, ids, 1
     stride = int(np.ceil(n_rows / max_rows))
     return rows[::stride], ids[::stride], stride
+
+
+# ── V1 Stage-2: pure draw-time transforms (canonical-grid plan) ───────
+#
+# These three functions are the draw-time half of the V1 flip: given a
+# WaterfallHistory whose rows are stored acquisition-NATIVE (Stage-3
+# semantics: ``history.unit`` is the native integration unit, per-row
+# transform provenance rides in ``history.row_meta``), they produce the
+# display view — decimate, then normalize, then unit-convert — from
+# carried per-row values only, never ambient widget state.  In Stage 2
+# nothing calls them from production; the equivalence suite
+# (test_v1_draw_equivalence.py) proves stored_row ≈ render(native_row)
+# before Stage 3 rewires ``_history_to_payload`` onto them.
+
+
+def _radial_kind(unit):
+    """Classify a radial unit/label as ``'tth'`` / ``'q'`` / ``None``.
+
+    Accepts both the canonical pyFAI tokens (``'2th_deg'``, ``'q_A^-1'``)
+    and the display combo labels (``'2θ (°)'``, ``'Q (Å⁻¹)'``) so the
+    draw-time caller can pass ``ui.plotUnit.currentText()`` verbatim —
+    the same two probes ``_apply_plot_unit_1d`` uses (``Th in label`` /
+    ``AA_inv in label``).  Anything else (χ, exit-angle, unknown) is
+    ``None``: not Q↔2θ-convertible."""
+    text = str(unit or "")
+    if "2th" in text or _TH in text:
+        return "tth"
+    if _AA_INV in text or text.lower().startswith("q"):
+        return "q"
+    return None
+
+
+def normalize_rows(rows, metadata, channel):
+    """Vector form of ``DisplayDataMixin.normalize`` over accumulator rows.
+
+    Divides ``rows[k]`` by ``metadata[k][channel]`` when the channel is set
+    and the row's monitor value is finite and ``> 0`` (the production rule:
+    a zero/negative/NaN/missing monitor leaves the row unscaled, it never
+    poisons it).  The channel key is matched exactly, then case-insensitively
+    (``get_normChannel`` resolves per-row keys case-insensitively).  NaN-safe:
+    NaNs in the data pass through untouched.  Always returns a NEW (n, npt)
+    float array — the caller's rows (the immutable history buffer) are never
+    mutated."""
+    rows = np.atleast_2d(np.asarray(rows, dtype=float)).copy()
+    if not channel:
+        return rows
+    channel = str(channel)
+    lowered = channel.lower()
+    metadata = list(metadata) if metadata is not None else []
+    for k in range(rows.shape[0]):
+        info = metadata[k] if k < len(metadata) else None
+        if not info or not hasattr(info, "get"):
+            continue
+        value = info.get(channel)
+        if value is None:
+            for key in info.keys():
+                if str(key).lower() == lowered:
+                    value = info[key]
+                    break
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(value) and value > 0:
+            rows[k] /= value
+    return rows
+
+
+def _display_grid_for_rows(x, unit, label, row_meta, *, want_unit):
+    """Shared core of :func:`display_grid_for_history` /
+    :func:`render_waterfall_view`.  ``row_meta`` is the (already decimated,
+    row-aligned) RowMeta sequence.  Returns ``(x_display, axis, needs_interp,
+    lam_ref, want_kind)`` where ``want_kind`` is ``None`` whenever the native
+    axis is kept (no conversion fired)."""
+    x = np.asarray(x, dtype=float)
+    unit = str(unit or "")
+    # The native display axis mirrors _history_to_payload: the carried label
+    # (or the table label for a known unit), and the display symbol for a
+    # native pyFAI token (pretty_unit is the identity on already-display
+    # units, so today's display-space histories pass through unchanged).
+    native_axis = Axis(label=(label or x_axis_for_unit(unit)[0]),
+                       unit=pretty_unit(unit))
+    no_interp = (False,) * len(row_meta)
+    if x.size == 0:
+        return x, native_axis, no_interp, None, None
+    # GI reciprocal-space axes pass through verbatim — the same
+    # is_gi_2d_units guard _apply_plot_unit_1d applies per row.
+    if is_gi_2d_units(unit, ""):
+        return x, native_axis, no_interp, None, None
+    want_kind = _radial_kind(want_unit)
+    have_kind = _radial_kind(unit)
+    # Conversion fires only across the Q↔2θ pair (χ/exit/unknown axes are
+    # never converted — _slice_1d_from_2d passes convert=False for them).
+    if want_kind is None or have_kind is None or want_kind == have_kind:
+        return x, native_axis, no_interp, None, None
+    wavelengths = [getattr(m, "wavelength_m", None) for m in row_meta]
+    lam_ref = next((w for w in wavelengths if w and w > 0), None)
+    if lam_ref is None:
+        # D2: no row carries a wavelength — keep the native axis and label it
+        # honestly (today's per-row "no wavelength ⇒ no conversion" rule,
+        # applied stack-wide so the axis never lies about unconverted values).
+        return x, native_axis, no_interp, None, None
+    want_tth = want_kind == "tth"
+    x_display = convert_2d_radial(
+        x, data_unit=unit, want_tth=want_tth, want_q=not want_tth,
+        wavelength_m=lam_ref)
+    # The converted display axis: the same (label, symbol) pair
+    # _apply_plot_unit_1d emits (x_labels_2D/x_units_2D ≡ this table).
+    axis = Axis(*x_axis_for_unit("2th_deg" if want_tth else "q_A^-1"))
+    # D2: rows whose carried wavelength differs from λ_ref need a per-row
+    # convert + interp onto the display grid.  λ-less rows sit on the shared
+    # native grid and take λ_ref implicitly (the closest draw-time analog of
+    # today's mixed-append behavior).
+    needs_interp = tuple(
+        bool(w and w > 0
+             and not np.isclose(w, lam_ref, rtol=1e-9, atol=0.0))
+        for w in wavelengths)
+    return x_display, axis, needs_interp, lam_ref, want_kind
+
+
+def display_grid_for_history(history, *, want_unit):
+    """D2 display grid for a native-grid :class:`WaterfallHistory`.
+
+    Returns ``(x_display, axis, per_row_needs_interp)``:
+
+    * ``x_display`` — ``convert_2d_radial(history.x, λ_ref)`` with λ_ref =
+      the first row's carried wavelength (first ``row_meta`` entry with one)
+      when a Q↔2θ conversion is requested by ``want_unit`` and the history's
+      unit is the other member of the pair; otherwise ``history.x`` verbatim.
+    * ``axis`` — the display :class:`Axis` (label + unit symbol): the
+      conversion target's pair when the conversion fires, else the native
+      axis.  When conversion is requested but NO row carries a wavelength,
+      the native axis is returned honestly (the axis never lies).
+    * ``per_row_needs_interp`` — one bool per history row: True for rows
+      whose carried wavelength differs from λ_ref (they need a per-row
+      convert + interp onto ``x_display`` at draw).
+
+    ``want_unit`` accepts the plotUnit combo text or a pyFAI unit token
+    (see :func:`_radial_kind`).  GI reciprocal-space histories pass through
+    verbatim (the ``is_gi_2d_units`` guard, mirroring ``_apply_plot_unit_1d``).
+    Intended for Stage-3 native histories (``history.unit`` = the native
+    integration unit)."""
+    n = len(getattr(history, "ids", ()) or ())
+    row_meta = list(getattr(history, "row_meta", ()) or ())
+    if len(row_meta) < n:
+        row_meta.extend([None] * (n - len(row_meta)))
+    x_display, axis, needs_interp, _lam_ref, _kind = _display_grid_for_rows(
+        history.x, history.unit, history.label, row_meta[:n],
+        want_unit=want_unit)
+    return x_display, axis, needs_interp
+
+
+def render_waterfall_view(history, *, want_unit, norm_channel=None,
+                          max_rows=None):
+    """Compose the full draw-time Overlay/Waterfall view from a native-grid
+    :class:`WaterfallHistory`: :func:`waterfall_display_rows` decimation
+    FIRST, then normalization (:func:`normalize_rows` over the carried
+    per-row ``metadata``), then unit conversion (:func:`display_grid_for_history`,
+    decisions D1/D2) — so the transform cost is bounded by the decimated
+    (≤ ``max_rows``) rows, never the full accumulation.
+
+    Returns ``(x_display, rows_display, ids_display, axis)`` where ``axis``
+    is the display :class:`Axis` (label + unit symbol).  ``rows_display`` is
+    always a NEW array; the history buffer is never touched.  Rows flagged by
+    D2 (per-row wavelength ≠ λ_ref) are individually converted with their own
+    wavelength and ``np.interp``-ed onto ``x_display`` — the draw-time
+    equivalent of today's per-row build-time convert+interp."""
+    rows, ids, stride = waterfall_display_rows(
+        history.rows, history.ids, max_rows)
+    n_rows = len(getattr(history, "ids", ()) or ())
+    metadata = list(getattr(history, "metadata", ()) or ())
+    if len(metadata) < n_rows:
+        metadata.extend([None] * (n_rows - len(metadata)))
+    row_meta = list(getattr(history, "row_meta", ()) or ())
+    if len(row_meta) < n_rows:
+        row_meta.extend([None] * (n_rows - len(row_meta)))
+    # The SAME stride waterfall_display_rows applied, so the per-row columns
+    # stay row-aligned with the decimated rows/ids.
+    metadata = metadata[::stride] if stride > 1 else metadata[:n_rows]
+    row_meta = row_meta[::stride] if stride > 1 else row_meta[:n_rows]
+    rows = normalize_rows(rows, metadata, norm_channel)
+    x_display, axis, needs_interp, _lam_ref, want_kind = (
+        _display_grid_for_rows(
+            history.x, history.unit, history.label, row_meta,
+            want_unit=want_unit))
+    if want_kind is not None and any(needs_interp):
+        want_tth = want_kind == "tth"
+        x_native = np.asarray(history.x, dtype=float)
+        for k, flagged in enumerate(needs_interp):
+            if not flagged or k >= rows.shape[0]:
+                continue
+            x_row = convert_2d_radial(
+                x_native, data_unit=history.unit,
+                want_tth=want_tth, want_q=not want_tth,
+                wavelength_m=row_meta[k].wavelength_m)
+            rows[k] = np.interp(x_display, x_row, rows[k])
+    return x_display, rows, tuple(ids), axis
 
 
 @dataclass(frozen=True)
