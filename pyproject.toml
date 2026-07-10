@@ -103,3 +103,34 @@ filterwarnings = [
     # (NumPy 2.4 deprecation).  Not actionable here.
     "ignore:Setting the strides on a NumPy array has been deprecated:DeprecationWarning:pyFAI",
 ]
+
+# ---------------------------------------------------------------------------
+# Pixi dev workspace (optional; the `[tool.pixi.*]` tables are ignored by the
+# build backend, so they do NOT affect the sdist/wheel or the conda package).
+#
+#   pixi install       # create ./.pixi env: conda python + THIS project editable
+#   pixi run xdart      # launch the EDITABLE build -- src/ changes are live
+#   pixi run test       # headless core tests
+#
+# `pixi run xdart` runs this editable install, NOT a pixi-global `xdart`, so a
+# dev build and the released global stop shadowing each other (which is what
+# made `which xdart` resolve to the global binary during development).
+#
+# The GUI/analysis stack resolves from the project's own [gui]+[dev] extras
+# (PyPI wheels); if you'd rather have conda-forge binaries for the heavy libs
+# (pyFAI, PySide6, silx, h5py), add them under [tool.pixi.dependencies].
+# ---------------------------------------------------------------------------
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64"]
+
+[tool.pixi.dependencies]
+python = "3.13.*"
+
+[tool.pixi.pypi-dependencies]
+xdart = { path = ".", editable = true, extras = ["gui", "dev"] }
+
+[tool.pixi.tasks]
+xdart = "xdart"
+test = { cmd = "pytest tests/core -q", description = "run the headless core tests" }
+gui-test = { cmd = "pytest tests/xdart -q -p no:faulthandler", env = { QT_QPA_PLATFORM = "offscreen" }, description = "run the offscreen GUI tests" }
