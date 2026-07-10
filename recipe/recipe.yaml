@@ -113,12 +113,23 @@ about:
   license_file:
     - LICENSE
     - licenses/
-  summary: Headless XRD/GIWAXS reduction core (xrd_tools) + the xdart Qt GUI.
+  summary: XRD/GIWAXS reduction GUI (xdart) + headless reduction core (xrd_tools).
   description: |
-    xdart is a monorepo distribution: `xrd_tools`, a headless XRD/GIWAXS
-    reduction and NeXus I/O core (no Qt), and `xdart`, a thin PySide6 GUI over
-    it for the Eiger live/batch reduction workflow.  Installing this package
-    gives you the `xdart` command and a desktop shortcut.
+    xdart — XRD/GIWAXS data reduction: a PySide6 GUI (`xdart`) over a
+    headless reduction + NeXus I/O core (`xrd_tools`, no Qt), for the
+    live/batch beamline reduction workflow.
+
+    GUI install (recommended — puts the `xdart` command on PATH and adds a
+    desktop/menu shortcut):
+
+        pixi global install -c https://prefix.dev/xrd-tools -c conda-forge xdart
+
+    Update later with `pixi global update xdart`.
+
+    Use `pixi add xdart` / `conda install` only to add the package as a
+    dependency INSIDE an existing project or environment (e.g. scripting
+    against the headless `xrd_tools` core) — same package, no global
+    launcher or shortcut.
 
 extra:
   recipe-maintainers:
