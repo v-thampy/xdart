@@ -75,6 +75,7 @@ __all__ = [
     "Axis",
     "Trace",
     "PlotPayload",
+    "RowMeta",
     "WaterfallHistory",
     "overlay_grid_reset_key",
     "overlay_grid_keys_compatible",
@@ -430,6 +431,28 @@ class PlotPayload:
 
 
 @dataclass(frozen=True)
+class RowMeta:
+    """Per-row transform provenance for the Overlay/Waterfall accumulator
+    (V1 canonical-grid, Stage 1 — dual-write).
+
+    Rows are still stored post-transform; each field records the ambient
+    input (F-E) that produced the stored row, captured AT APPEND TIME, so the
+    Stage-3 flip can re-apply norm/unit conversion at draw from carried
+    values instead of ambient lookups.  ``native_x``/``native_y`` are
+    reserved for the Stage-2 dual-capture equivalence scaffolding and stay
+    ``None`` until then (excluded from equality: ndarray ``==`` is not a
+    bool)."""
+    source_unit: str = ""                   # axis unit BEFORE the plotUnit conversion
+    wavelength_m: "float | None" = None
+    norm_channel: "str | None" = None
+    norm_value: "float | None" = None       # the row's monitor value for norm_channel
+    bkg_token: "object | None" = None       # opaque bkg recipe identity (draw-time apply)
+    projection_id: "object | None" = None   # slice projection, duplicated from the row id
+    native_x: "np.ndarray | None" = field(default=None, repr=False, compare=False)
+    native_y: "np.ndarray | None" = field(default=None, repr=False, compare=False)
+
+
+@dataclass(frozen=True)
 class WaterfallHistory:
     """Immutable Overlay/Waterfall accumulator carried IN the payload
     (``PlotPayload.plot_history``) -- the payload-owned successor to the legacy
@@ -465,6 +488,9 @@ class WaterfallHistory:
     #                          the display unit doesn't always round-trip through
     #                          x_axis_for_unit, e.g. the 2θ conversion's symbol)
     metadata: tuple = ()     # per-row scan metadata, row order == ids
+    row_meta: tuple = ()     # per-row RowMeta (or None), row order == ids —
+    #                          additive V1 column; `metadata` above stays the
+    #                          scan_info consumers (_wf_y_axis) index
     _row_buffer: "np.ndarray | None" = field(default=None, repr=False, compare=False)
     _row_capacity: int = field(default=0, repr=False, compare=False)
 
@@ -562,13 +588,21 @@ def _freeze_metadata(meta):
         return MappingProxyType({})
 
 
-def _dedup_first(ids, names, rows, metadata=None):
-    """Keep the FIRST occurrence of each id (arrival order)."""
+def _dedup_first(ids, names, rows, metadata=None, row_meta=None):
+    """Keep the FIRST occurrence of each id (arrival order).
+
+    The ``row_meta`` column is returned (as a 5th element) only when a
+    sequence is passed: the 4-tuple shape is pinned by the BW-A6 legacy
+    replica in test_display_logic, which snapshots the pre-buffer caller.
+    """
     seen = set()
-    ki, kn, kr, km = [], [], [], []
+    ki, kn, kr, km, krm = [], [], [], [], []
+    with_row_meta = row_meta is not None
     if metadata is None:
         metadata = [None] * len(ids)
-    for i, n, r, m in zip(ids, names, rows, metadata):
+    if row_meta is None:
+        row_meta = [None] * len(ids)
+    for i, n, r, m, rm in zip(ids, names, rows, metadata, row_meta):
         key = _dedup_key(i)
         if key in seen:
             continue
@@ -577,6 +611,9 @@ def _dedup_first(ids, names, rows, metadata=None):
         kn.append(n)
         kr.append(r)
         km.append(_freeze_metadata(m))
+        krm.append(rm)
+    if with_row_meta:
+        return ki, kn, kr, km, krm
     return ki, kn, kr, km
 
 
@@ -614,16 +651,19 @@ def _history_row_buffer(history, width):
 
 
 def _waterfall_history_from_buffer(
-        *, reset_key, unit, label, x, row_buffer, count, ids, names, metadata):
+        *, reset_key, unit, label, x, row_buffer, count, ids, names, metadata,
+        row_meta=()):
     rows = row_buffer[:count]
     return WaterfallHistory(
         reset_key=reset_key, unit=unit, label=label, x=x, rows=rows,
         ids=tuple(ids), names=tuple(names), metadata=tuple(metadata),
+        row_meta=tuple(row_meta),
         _row_buffer=row_buffer, _row_capacity=int(row_buffer.shape[0]))
 
 
 def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
-                         label="", metadata=None, replace_ids=(), drop_ids=()):
+                         label="", metadata=None, row_meta=None,
+                         replace_ids=(), drop_ids=()):
     """Pure, append-only Overlay/Waterfall accumulator keyed on ``reset_key`` (the
     payload-owned successor to ``update_plot_accumulator`` + the widget triple).
 
@@ -660,6 +700,12 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
     if len(metadata) < len(ids):
         metadata.extend([None] * (len(ids) - len(metadata)))
     metadata = [_freeze_metadata(m) for m in metadata[:len(ids)]]
+    # V1 row_meta rides row-for-row with `metadata`; None pads keep alignment
+    # for callers that don't capture it (default keeps them byte-identical).
+    row_meta = list(row_meta) if row_meta is not None else []
+    if len(row_meta) < len(ids):
+        row_meta.extend([None] * (len(ids) - len(row_meta)))
+    row_meta = row_meta[:len(ids)]
     replace_keys = {_dedup_key(i) for i in (replace_ids or ())}
     # OV-7b: rows to REMOVE from the accumulator this render -- the live "current"
     # slice cut once its c/w matches a pin (the transient sentinel row must not
@@ -674,12 +720,14 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
             return history
         return WaterfallHistory(
             reset_key=reset_key, unit=unit, label=label, x=x,
-            rows=np.empty((0, 0), dtype=float), ids=(), names=(), metadata=())
+            rows=np.empty((0, 0), dtype=float), ids=(), names=(),
+            metadata=(), row_meta=())
 
     # RESET: new accumulation identity (incompatible grid/source) or no prior.
     if (history is None
             or not _reset_keys_compatible(history.reset_key, reset_key)):
-        ki, kn, kr, km = _dedup_first(ids, names, rows, metadata)
+        ki, kn, kr, km, krm = _dedup_first(ids, names, rows, metadata,
+                                           row_meta)
         count = len(ki)
         row_buffer = _new_waterfall_row_buffer(count, x.size)
         if count:
@@ -687,7 +735,7 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
         return _waterfall_history_from_buffer(
             reset_key=reset_key, unit=unit, label=label, x=x,
             row_buffer=row_buffer, count=count, ids=ki, names=kn,
-            metadata=km)
+            metadata=km, row_meta=krm)
 
     # Same identity: keep the accumulated rows; relabel the grid on a unit toggle
     # (incoming x is the same sample grid in the new unit), then append new ids.
@@ -711,12 +759,16 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
             "interpolating across disjoint domains [XDART_DEBUG_DISPLAY "
             "tripwire]", len(ids), unit, history.unit, x.size,
             history.x.size)
-        ids, names, rows, metadata = ids[:0], names[:0], rows[:0], metadata[:0]
+        ids, names, rows, metadata, row_meta = (
+            ids[:0], names[:0], rows[:0], metadata[:0], row_meta[:0])
     out_ids = list(history.ids)
     out_names = list(history.names)
     out_meta = list(getattr(history, "metadata", ()) or ())
     if len(out_meta) < len(out_ids):
         out_meta.extend(_freeze_metadata(None) for _ in range(len(out_ids) - len(out_meta)))
+    out_rmeta = list(getattr(history, "row_meta", ()) or ())
+    if len(out_rmeta) < len(out_ids):
+        out_rmeta.extend([None] * (len(out_ids) - len(out_rmeta)))
     count = len(out_ids)
     row_buffer = _history_row_buffer(history, base_x.size)
     index_by_key = {_dedup_key(i): pos for pos, i in enumerate(out_ids)}
@@ -727,7 +779,7 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
             new_buffer[:count] = row_buffer[:count]
         row_buffer = new_buffer
 
-    for i, n, r, m in zip(ids, names, rows, metadata):
+    for i, n, r, m, rm in zip(ids, names, rows, metadata, row_meta):
         key = _dedup_key(i)
         # BL-6: align the incoming row (on grid ``x``) to the accumulated
         # ``base_x`` whenever they differ -- by sample-count OR by VALUES.  Two
@@ -747,6 +799,7 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
                     row_buffer[pos] = r
                     out_names[pos] = n
                     out_meta[pos] = m
+                    out_rmeta[pos] = rm
             continue
         if count >= row_buffer.shape[0]:
             new_buffer = _new_waterfall_row_buffer(max(1, count + 1), base_x.size)
@@ -757,6 +810,7 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
         out_ids.append(i)
         out_names.append(n)
         out_meta.append(m)
+        out_rmeta.append(rm)
         row_buffer[count] = r
         count += 1
 
@@ -767,6 +821,7 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
         out_ids = [out_ids[j] for j in keep]
         out_names = [out_names[j] for j in keep]
         out_meta = [out_meta[j] for j in keep]
+        out_rmeta = [out_rmeta[j] for j in keep]
         if keep:
             row_buffer[:len(keep)] = row_buffer[keep]
         count = len(keep)
@@ -774,7 +829,7 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
     return _waterfall_history_from_buffer(
         reset_key=reset_key, unit=unit, label=label, x=base_x,
         row_buffer=row_buffer, count=count, ids=out_ids, names=out_names,
-        metadata=out_meta)
+        metadata=out_meta, row_meta=out_rmeta)
 
 
 def waterfall_display_rows(rows, ids, max_rows):

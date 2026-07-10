@@ -344,6 +344,74 @@ def test_accumulate_waterfall_replaces_explicit_live_slice_row_only():
     np.testing.assert_array_equal(h2.rows[1], [9.0, 9.0, 9.0])
 
 
+def test_accumulate_waterfall_row_meta_rides_append_and_dedup():
+    # V1 Stage-1 (canonical grid): the additive row_meta column rides
+    # row-for-row with ids through append and first-occurrence dedup;
+    # meta-less callers stay aligned via None pads (byte-identical default).
+    np = pytest.importorskip("numpy")
+    x = np.array([0.0, 1.0, 2.0])
+    m0 = dl.RowMeta(source_unit="q_A^-1", wavelength_m=1e-10)
+    m1 = dl.RowMeta(source_unit="q_A^-1", norm_channel="i0", norm_value=2.0)
+    h = dl.accumulate_waterfall(None, reset_key="A", unit="q", x=x,
+                                rows=np.ones((2, 3)), ids=[0, 1],
+                                names=["s0", "s1"], row_meta=[m0, m1])
+    assert h.row_meta == (m0, m1)
+    # Re-delivery dedups: the FIRST captured meta is kept, like the row.
+    m1b = dl.RowMeta(source_unit="2th_deg")
+    m2 = dl.RowMeta(source_unit="q_A^-1", bkg_token="tok")
+    h = dl.accumulate_waterfall(h, reset_key="A", unit="q", x=x,
+                                rows=np.full((2, 3), 2.0), ids=[1, 2],
+                                names=["s1", "s2"], row_meta=[m1b, m2])
+    assert h.ids == (0, 1, 2)
+    assert h.row_meta == (m0, m1, m2)
+    # A meta-less append pads with None, keeping row_meta == count aligned.
+    h = dl.accumulate_waterfall(h, reset_key="A", unit="q", x=x,
+                                rows=np.full((1, 3), 3.0), ids=[3],
+                                names=["s3"])
+    assert h.row_meta == (m0, m1, m2, None)
+    assert len(h.row_meta) == h.count
+
+
+def test_accumulate_waterfall_row_meta_replace_drop_and_reset():
+    # V1 Stage-1: row_meta stays id-aligned through the explicit
+    # replace_ids in-place update, the OV-7b drop_ids removal, and a
+    # reset_key rebuild (meta restarts from the incoming batch).
+    np = pytest.importorskip("numpy")
+    x = np.array([0.0, 1.0, 2.0])
+    live_id = ("scan", 1, ("__live_slice__", "chi"))
+    pin_id = ("scan", 1, ("chi", 0.0, 1.0))
+    m_live = dl.RowMeta(projection_id=("__live_slice__", "chi"))
+    m_pin = dl.RowMeta(projection_id=("chi", 0.0, 1.0))
+    h = dl.accumulate_waterfall(
+        None, reset_key=("radial", 3, True), unit="q", x=x,
+        rows=np.ones((2, 3)), ids=[live_id, pin_id], names=["live", "pin"],
+        row_meta=[m_live, m_pin])
+
+    m_live2 = dl.RowMeta(projection_id=("__live_slice__", "chi"),
+                         norm_channel="i1")
+    h2 = dl.accumulate_waterfall(
+        h, reset_key=("radial", 3, True), unit="q", x=x,
+        rows=np.full((1, 3), 2.0), ids=[live_id], names=["live moved"],
+        row_meta=[m_live2], replace_ids=[live_id])
+    assert h2.ids == h.ids
+    assert h2.row_meta == (m_live2, m_pin)
+
+    h3 = dl.accumulate_waterfall(
+        h2, reset_key=("radial", 3, True), unit="q", x=x,
+        rows=np.empty((0, 3)), ids=[], names=[], row_meta=(),
+        drop_ids=[live_id])
+    assert h3.ids == (pin_id,)
+    assert h3.row_meta == (m_pin,)
+
+    m_new = dl.RowMeta(source_unit="2th_deg")
+    h4 = dl.accumulate_waterfall(
+        h3, reset_key=("radial", 4, True), unit="q",
+        x=np.array([0.0, 1.0, 2.0, 3.0]), rows=np.ones((1, 4)),
+        ids=[("scan", 5)], names=["s5"], row_meta=[m_new])
+    assert h4.ids == (("scan", 5),)
+    assert h4.row_meta == (m_new,)
+
+
 def test_accumulate_waterfall_reset_key_change_resets():
     np = pytest.importorskip("numpy")
     x = np.array([0.0, 1.0, 2.0])

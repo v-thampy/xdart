@@ -27,6 +27,7 @@ from .display_logic import (
     PanelRole,
     PlotPayload,
     RawSource,
+    RowMeta,
     Trace,
     accumulate_waterfall,
     combine_flat_masks,
@@ -1047,7 +1048,7 @@ class PublicationDisplayAdapter:
             prior_x_seed = np.asarray(prior.x, dtype=float)
         axis = None
         reset_key = None
-        ids, names, rows, metadata = [], [], [], []
+        ids, names, rows, metadata, row_meta = [], [], [], [], []
 
         def append_row(label, *, recipe=None, live=False):
             nonlocal ref_x, axis, reset_key
@@ -1068,14 +1069,22 @@ class PublicationDisplayAdapter:
                 y = np.asarray(view.intensity_1d, dtype=float)
                 if x.shape != y.shape:
                     return None
+                # V1 RowMeta: the acquisition-native unit, read BEFORE the
+                # plotUnit conversion overwrites the axis.
+                source_unit = str(getattr(view.axis_1d, "unit", "") or "")
                 y = self._normalize(y, pub.metadata_raw)
-                x, conv_axis = self._apply_plot_unit_1d(
-                    x, str(getattr(view.axis_1d, "unit", "") or ""), pub)
+                x, conv_axis = self._apply_plot_unit_1d(x, source_unit, pub)
                 this_axis = (conv_axis if conv_axis is not None
                              else _axis_for_publication(view.axis_1d))
             else:
                 if not view.has_2d or publication_has_2d_errors(pub):
                     return None
+                # V1 RowMeta: the native unit of the slice x-axis (mirrors
+                # _slice_1d_from_2d's axis selection, pre-conversion).
+                src_axis = (view.axis_2d_y
+                            if row_axis_info.get("axis") == "azimuthal"
+                            else view.axis_2d_x)
+                source_unit = str(getattr(src_axis, "unit", "") or "")
                 projected = self._slice_1d_from_2d(
                     view, pub, row_axis_info,
                     slice_center=row_center, slice_width=row_width)
@@ -1126,6 +1135,7 @@ class PublicationDisplayAdapter:
                 names.clear()
                 rows.clear()
                 metadata.clear()
+                row_meta.clear()
                 ref_x = x
                 axis = this_axis
                 reset_key = row_grid_key
@@ -1149,6 +1159,31 @@ class PublicationDisplayAdapter:
             names.append(name)
             rows.append(y)
             metadata.append(dict(pub.metadata_raw or {}))
+            # V1 Stage-1 dual-write: the ambient transform inputs this stored
+            # (post-transform) row was built from, captured per row so the
+            # Stage-3 flip can re-derive the display from carried values.
+            # _get_wavelength is defensive: duck-widget hosts may lack it.
+            try:
+                _get_wl = getattr(widget, "_get_wavelength", None)
+                row_wavelength = (_get_wl(getattr(pub, "raw_ref", None))
+                                  if callable(_get_wl) else None)
+            except Exception:
+                row_wavelength = None
+            row_norm_value = None
+            if cur_norm:
+                try:
+                    row_norm_value = float(
+                        (pub.metadata_raw or {}).get(cur_norm))
+                except (TypeError, ValueError):
+                    row_norm_value = None
+            row_meta.append(RowMeta(
+                source_unit=source_unit,
+                wavelength_m=row_wavelength,
+                norm_channel=cur_norm,
+                norm_value=row_norm_value,
+                bkg_token=getattr(widget, "_bkg_token", None),
+                projection_id=projection_id,
+            ))
             return row_id
 
         for recipe in pinned_recipes:
@@ -1212,7 +1247,7 @@ class PublicationDisplayAdapter:
                         prior, reset_key=prior.reset_key, unit=prior.unit,
                         label=prior.label, x=prior.x,
                         rows=np.empty((0, np.asarray(prior.x).size), dtype=float),
-                        ids=[], names=[], drop_ids=drop_ids)
+                        ids=[], names=[], row_meta=(), drop_ids=drop_ids)
                 return self._history_to_payload(prior)
             return None
 
@@ -1233,11 +1268,12 @@ class PublicationDisplayAdapter:
                 prior, reset_key=prior.reset_key, unit=prior.unit,
                 label=prior.label, x=prior.x,
                 rows=np.empty((0, np.asarray(prior.x).size), dtype=float),
-                ids=[], names=[], drop_ids=replace_ids)
+                ids=[], names=[], row_meta=(), drop_ids=replace_ids)
         history = accumulate_waterfall(
             prior, reset_key=reset_key, unit=unit, label=label,
             x=ref_x, rows=np.asarray(rows, dtype=float), ids=ids, names=names,
-            metadata=metadata, replace_ids=replace_ids, drop_ids=drop_ids)
+            metadata=metadata, row_meta=row_meta,
+            replace_ids=replace_ids, drop_ids=drop_ids)
         return self._history_to_payload(history)
 
     def _history_to_payload(self, history):

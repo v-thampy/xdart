@@ -702,6 +702,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # The viewer files have per-file grids, so unlike the scan-grid bkg_1d the
         # XYE bkg carries its own x and is interpolated onto each trace at render.
         self._bkg_xye = None
+        # V1 RowMeta provenance: opaque background-recipe identity, bumped on
+        # every set/clear so accumulator rows captured under different
+        # backgrounds are distinguishable at draw time (application stays at
+        # draw — this token is never dereferenced).
+        self._bkg_token = None
         self._norm_channel_map = {}
         self._last_applied_norm_channel = None
         self._clear_wavelength_cache()
@@ -4307,6 +4312,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.bkg_2d = 0.
         self.bkg_map_raw = 0.
         self._bkg_xye = None
+        self._bkg_token = object()   # V1 RowMeta: the bkg recipe changed
         self.ui.setBkg.setText('Set BG')
 
     def _viewer_selection(self):
@@ -4433,11 +4439,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # Viewer modes own their own background sourcing (no scan-frame integration).
         if self.viewer_mode == 'image':
             if self._set_bkg_image_viewer():
+                self._bkg_token = object()   # V1 RowMeta: new bkg recipe
                 self.ui.setBkg.setText('Clear BG')
             self.update()
             return
         if self.viewer_mode == 'xye':
             if self._set_bkg_xye_viewer():
+                self._bkg_token = object()   # V1 RowMeta: new bkg recipe
                 self.ui.setBkg.setText('Clear BG')
             self.update()
             return
@@ -4501,6 +4509,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 "access to the original source files."
             )
             self.bkg_map_raw = 0.
+        self._bkg_token = object()   # V1 RowMeta: new bkg recipe
         self.ui.setBkg.setText('Clear BG')
         self.update()
         return
