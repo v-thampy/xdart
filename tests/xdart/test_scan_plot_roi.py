@@ -780,3 +780,36 @@ def test_dialogs_swallow_escape(qapp):
         assert roi.isVisible()
     finally:
         roi.close()
+
+
+# ── close() shuts down the source-probe executor ──────────────────────────
+
+
+def test_dialog_close_shuts_down_probe_executor(qapp, tmp_path):
+    """Qt never delivers closeEvent to CHILD widgets, so the dialog's own
+    closeEvent must stop the source widget's probe executor explicitly — a
+    probe in flight at close otherwise survives as a live non-daemon thread
+    that concurrent.futures joins only at interpreter exit (post-summary CI
+    hang; app-exit hang live).  Real dialog, real widget, real probe on a
+    real TIFF."""
+    import fabio.tifimage
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+
+    tif = tmp_path / "close_probe_0000.tif"
+    fabio.tifimage.TifImage(data=np.ones((6, 6), dtype=np.int32)).write(
+        str(tif))
+
+    dlg = ScanPlotDialog()
+    sw = dlg.source_widget
+    # The dialog constructs its source widget with the async flag off today;
+    # flip the constructor flag so the REAL async probe path (executor +
+    # worker thread + done-callback) runs — that is the path close() guards.
+    sw._async_probe = True
+    sw.set_uri(str(tif))
+    assert _pump(qapp, lambda: sw._probe_executor is not None, timeout=5.0), \
+        "async probe never started — set_uri produced no candidate?"
+
+    dlg.close()
+    qapp.processEvents()
+    assert sw._probe_executor is None, \
+        "closeEvent did not shut down the probe executor"

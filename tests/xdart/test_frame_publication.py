@@ -2096,3 +2096,61 @@ def test_same_source_id_suffix_match_rejects_different_dir():
     assert not _same_source_id("/data/run1/frame_0001.tif", "/data/run2/frame_0001.tif")
     assert not _same_source_id("", "frame_0001.tif")                             # known beats unknown
     assert _same_source_id("", "")                                               # transition unknown+unknown
+
+
+def test_tier0_eviction_honors_persist_gate_mem1_15():
+    """MEM1-15: with the evictability probe wired (the live widget wires it to
+    the active FrameRecordStore), tier-0 eviction drops only labels whose
+    records are PERSISTED; an unsaved ("owed") publication pins memory instead
+    of being dropped — dropping it would blank the frame on scroll-back
+    because this store is the cake's only render source.  Real record store
+    on the probe side, real publications throughout."""
+    from xrd_tools.session.frame_record_store import FrameRecordStore
+
+    records = FrameRecordStore(max_items=None, max_heavy_items=None)
+    store = PublicationStore(max_items=2, max_heavy_items=None)
+
+    def evictable(label):
+        if records.get(label) is None:
+            return True
+        return records.is_persisted(label)
+
+    store.set_evictable_probe(evictable)
+
+    for idx in (1, 2, 3):
+        pub = publication_from_live_frame(DuckFrame(idx=idx))
+        assert pub.record is not None
+        records.upsert(pub.record)
+        store.upsert(pub)
+
+    # Nothing persisted yet: every label is owed -> the store EXCEEDS its cap
+    # rather than dropping an unsaved frame.
+    assert store.labels() == (1, 2, 3)
+
+    # The writer's flush marks 1 persisted -> the next enforce evicts label 1
+    # (oldest evictable) and ONLY label 1.
+    records.mark_persisted(1)
+    pub4 = publication_from_live_frame(DuckFrame(idx=4))
+    records.upsert(pub4.record)
+    store.upsert(pub4)
+    assert store.labels() == (2, 3, 4)   # 1 evicted; 2,3 still owed -> pinned
+
+    # Once everything persists, the bound is enforced normally again.
+    records.mark_persisted([2, 3, 4])
+    pub5 = publication_from_live_frame(DuckFrame(idx=5))
+    records.upsert(pub5.record)
+    store.upsert(pub5)
+    assert store.labels() == (4, 5)
+
+    # A label the record store never saw is NOT an owed live frame: it stays
+    # evictable (no permanent pinning for untracked labels).
+    store.upsert(publication_from_live_frame(DuckFrame(idx=99)))
+    assert 99 in store.labels() and len(store.labels()) == 2
+
+
+def test_tier0_eviction_without_probe_keeps_legacy_behavior():
+    """No probe registered (viewer/browse stores) -> unchanged oldest-drop."""
+    store = PublicationStore(max_items=2, max_heavy_items=None)
+    for idx in (1, 2, 3):
+        store.upsert(publication_from_live_frame(DuckFrame(idx=idx)))
+    assert store.labels() == (2, 3)

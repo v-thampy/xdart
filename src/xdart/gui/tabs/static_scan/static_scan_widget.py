@@ -457,6 +457,13 @@ class staticWidget(QWidget):
         self.publication_store = PublicationStore(
             max_items=browse_publication_max_items())
         self._frame_record_store = None
+        # MEM1-15: tier-0 eviction honors persist-before-evict — an unsaved
+        # publication pins memory instead of being dropped (the store is the
+        # cake's only render source; dropping an unsaved one blanks the frame
+        # on scroll-back).  Resolves the ACTIVE record store at eviction time
+        # (it is per-run and lazily created).
+        self.publication_store.set_evictable_probe(
+            self._publication_label_evictable)
         self._overlay_flush_last_t = 0.0
         # XYE/NeXus need a 1D row table; Image Viewer needs a bounded 2D raw
         # table.  Neither participates in scan display readiness.
@@ -504,6 +511,27 @@ class staticWidget(QWidget):
             self._frame_record_store = store
             return store
         return getattr(self, "_frame_record_store", None)
+
+    def _publication_label_evictable(self, label):
+        """MEM1-15 persist gate for the publication store's tier-0 eviction.
+
+        True = safe to drop the label's publication.  Only a label the active
+        record store TRACKS as not-yet-persisted is pinned ("owed" — dropping
+        it would blank the frame on scroll-back until the save lands).  A
+        label with no record at all is NOT an owed live frame, so it stays
+        evictable — otherwise it could pin forever.  With no record store in
+        play (loaded-scan/viewer sessions) everything is evictable — the
+        legacy behavior.  Called under the publication store's lock: keep it
+        cheap and never touch the publication store from here."""
+        store = self._active_frame_record_store()
+        if store is None:
+            return True
+        try:
+            if store.get(label) is None:
+                return True
+            return bool(store.is_persisted(label))
+        except Exception:
+            return True
 
     def _clear_frame_record_store(self, *_args):
         self._frame_record_store = None
@@ -618,6 +646,11 @@ class staticWidget(QWidget):
                                                publication_store=self.publication_store)
         self.displayframe.store_first_frame_view = self.store_first_frame_view
         self.displayframe.frame_record_store = self._active_frame_record_store
+        # The MEM-1[14] memo keys on the active GI projection modes so a
+        # sub-mode switch invalidates memoized publications; the resolver
+        # lives here, the memo on the displayframe.
+        self.displayframe._active_frame_record_modes = \
+            self._active_frame_record_modes
         # Back-ref so h5viewer.data_reset can re-arm display-side caches.
         self.h5viewer.displayframe = self.displayframe
         self.ui.middleFrame.setLayout(self.displayframe.ui.layout)
@@ -673,9 +706,15 @@ class staticWidget(QWidget):
         import time as _time
         self._split_until = _time.monotonic() + 3.0
         self._apply_default_split = _default_split
-        QtCore.QTimer.singleShot(0, _default_split)
-        QtCore.QTimer.singleShot(1000, _default_split)
-        QtCore.QTimer.singleShot(2500, _default_split)
+        # Receiver-context overload: the Qt-internal single-shot timers die
+        # with this widget.  The parentless form outlives close()+deleteLater()
+        # (the dispatcher owns the timer), so every unfired timer pinned an
+        # ENTIRE staticWidget graph alive into interpreter teardown — at
+        # offscreen-suite scale (74 constructions) that graph made the linux
+        # exit-SIGSEGV deterministic.
+        QtCore.QTimer.singleShot(0, self, _default_split)
+        QtCore.QTimer.singleShot(1000, self, _default_split)
+        QtCore.QTimer.singleShot(2500, self, _default_split)
         self.ui.integratorFrame.setLayout(self.integratorTree.ui.verticalLayout)
         if len(self.scan.frames.index) > 0:
             self.integratorTree.update()
@@ -5271,6 +5310,17 @@ class staticWidget(QWidget):
         except Exception:
             logger.debug("analysis-worker shutdown on close failed",
                          exc_info=True)
+        # Close the scan-plot dialog EXPLICITLY: Qt does not deliver closeEvent
+        # to children on parent close, and the dialog's closeEvent is what
+        # stops its ROI worker, redraw timer, and the source-probe executor
+        # (a non-daemon thread that otherwise outlives the app).
+        try:
+            dlg = getattr(self, '_scan_plot_dialog', None)
+            if dlg is not None:
+                self._scan_plot_dialog = None
+                dlg.close()
+        except Exception:
+            logger.debug("scan-plot dialog close failed", exc_info=True)
         del self.scan
         del self.displayframe.scan
         del self.frame

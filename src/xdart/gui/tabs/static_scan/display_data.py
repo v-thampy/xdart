@@ -413,6 +413,17 @@ class DisplayDataMixin:
             return None
         return self._display_publication_from_view(idx, view)
 
+    @staticmethod
+    def _coerce_frame_label(idx):
+        """Store label for a display idx — same coercion staticWidget uses.
+        The memo's original form assumed this existed on the displayframe (it
+        was staticWidget-only); every ident lookup raised AttributeError into
+        the silent except and the memo never engaged (MEM-1[14] follow-up)."""
+        try:
+            return int(idx)
+        except (TypeError, ValueError):
+            return idx
+
     def _store_first_pub_cache(self) -> dict:
         """Per-label memo for :meth:`_store_first_publication_for_display`
         (MEM-1[14]).  Reset whenever the publication store's generation changes
@@ -427,17 +438,30 @@ class DisplayDataMixin:
     def _store_first_cache_ident(self, idx):
         """Cheap per-label invalidation identities: the backing FrameRecord and
         FramePublication objects (compared by identity) + the active projection
-        modes.  Returns ``(None, None, m1, m2)`` when the frame is absent."""
+        modes.  Returns ``(None, None, m1, m2)`` when the frame is absent.
+
+        NB the record store is reached through ``self.frame_record_store`` —
+        the displayframe's provider attribute (staticWidget assigns its bound
+        ``_active_frame_record_store`` accessor there; same idiom as
+        ``_hydration_stores``).  The memo's original form looked up
+        ``_active_frame_record_store`` on ``self`` — a STATICWIDGET attribute
+        that does not exist on the displayframe — so the identity was always
+        ``(None, None)`` and the memo never engaged on the real widget
+        (test-green/prod-dead, MEM-1[14] follow-up)."""
         try:
             key = self._coerce_frame_label(idx)
         except Exception:
             return None, None, None, None
         rec = None
-        rec_store_fn = getattr(self, "_active_frame_record_store", None)
-        if callable(rec_store_fn):
+        rec_store = getattr(self, "frame_record_store", None)
+        if callable(rec_store):
             try:
-                s = rec_store_fn()
-                rec = s.get(key) if s is not None else None
+                rec_store = rec_store()
+            except Exception:
+                rec_store = None
+        if rec_store is not None:
+            try:
+                rec = rec_store.get(key)
             except Exception:
                 rec = None
         pub = None

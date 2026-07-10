@@ -593,6 +593,15 @@ class PublicationStore:
         # paintable meanwhile).
         self._hydrator = None
         self._hydrator_1d_many = None
+        # MEM1-15: optional evictability probe (label -> bool).  When set,
+        # tier-0 eviction honors the persist-before-evict invariant the other
+        # stores already keep: an unpersisted ("owed") publication PINS memory
+        # instead of being dropped — dropping it would blank the frame on
+        # scroll-back because this store is the cake's only render source.
+        # The live widget wires this to FrameRecordStore.is_persisted; the
+        # probe must be cheap, lock-safe to call under this store's lock, and
+        # must never call back into this store.
+        self._evictable = None
         # Step 6: prior-pass (record, source_identity) carried across a same-scan
         # reintegrate so a re-upsert MERGES the recomputed mode into the frame's
         # accumulated record (begin_reintegrate populates it; upsert consumes per
@@ -849,13 +858,45 @@ class PublicationStore:
         except ValueError:
             pass
 
+    def set_evictable_probe(self, probe) -> None:
+        """Register the MEM1-15 persist gate: ``probe(label) -> bool``.
+
+        ``True`` means the label is safe to drop from tier 0 (its record is
+        persisted — rehydratable from disk).  ``False`` pins it ("owed",
+        never lost).  ``None`` restores the ungated legacy behavior (viewer
+        stores, whose publications come FROM disk, keep it unset)."""
+        with self._lock:
+            self._evictable = probe
+
     def _enforce_bounds_locked(self) -> None:
         if self._max_items is not None:
-            while len(self._items) > self._max_items:
-                label = next(iter(self._items))
-                self._items.pop(label, None)
-                self._drop_heavy_label_locked(label)
-                self._drop_thumb_label_locked(label)
+            probe = self._evictable
+            if probe is None:
+                while len(self._items) > self._max_items:
+                    label = next(iter(self._items))
+                    self._items.pop(label, None)
+                    self._drop_heavy_label_locked(label)
+                    self._drop_thumb_label_locked(label)
+            else:
+                # Persist-gated (MEM1-15): evict the oldest EVICTABLE labels.
+                # Unpersisted publications pin memory rather than being
+                # dropped — the store may transiently exceed max_items while
+                # a save is in flight (the writer's flush marks persisted
+                # every ~150 ms, so pinning is short-lived).
+                over = len(self._items) - self._max_items
+                if over > 0:
+                    for label in list(self._items):
+                        if over <= 0:
+                            break
+                        try:
+                            if not probe(label):
+                                continue
+                        except Exception:
+                            continue
+                        self._items.pop(label, None)
+                        self._drop_heavy_label_locked(label)
+                        self._drop_thumb_label_locked(label)
+                        over -= 1
 
         # tier 1 (D2): over the heavy bound -> drop arrays, KEEP thumbnail
         if self._max_heavy_items is not None:

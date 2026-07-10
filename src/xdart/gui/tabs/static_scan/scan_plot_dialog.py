@@ -714,6 +714,13 @@ class ScanPlotDialog(QtWidgets.QDialog):
         if self._roi_dialog is not None:
             self._roi_dialog.close()
             self._roi_dialog = None
+        # The source widget's probe executor is a NON-daemon thread and Qt
+        # never delivers closeEvent to child widgets — without this, a probe
+        # in flight at close survives as a live thread that concurrent.futures
+        # joins at interpreter exit (post-summary hang in tests; app-exit hang
+        # live) and whose done-callback then signals into a destroyed widget.
+        if hasattr(self, "source_widget"):
+            self.source_widget.shutdown_probe_worker()
         super().closeEvent(event)
 
     def _csv_columns(self):

@@ -13,22 +13,16 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import faulthandler
-faulthandler.enable()  # Print Python traceback on bus error / segfault
-if hasattr(signal, "SIGUSR1"):
-    # Live-freeze diagnostic: `kill -USR1 <pid>` dumps every thread's Python
-    # stack to stderr, even while the GUI thread is busy (the dump runs in the
-    # C signal handler, no GIL needed).  No root required, unlike py-spy on macOS.
-    faulthandler.register(signal.SIGUSR1, all_threads=True)
 
-# Set PySide6 as the Qt binding for pyqtgraph before any Qt imports.
-# Also export MPLBACKEND so child processes (e.g. pyFAI-calib2) inherit it.
-os.environ['PYQTGRAPH_QT_LIB'] = 'PySide6'
-os.environ['MPLBACKEND'] = 'QtAgg'
-
-# Set matplotlib backend before any matplotlib import can occur.
-# Use QtAgg (the Qt6 backend) to match pyqtgraph's choice.
-import matplotlib
-matplotlib.use('QtAgg')
+# NOTE: no import-time side effects here.  faulthandler.enable(), the SIGUSR1
+# stack-dump hook, the MPLBACKEND/QtAgg backend flip, and the hard
+# PYQTGRAPH_QT_LIB pin all moved into run() — importing this module (tests,
+# headless tools, embedding hosts) must not hijack process-global state.  The
+# QtAgg flip at import broke headless CI collection outright ("Cannot load
+# backend 'QtAgg' ... as 'headless' is currently running"), and a mid-session
+# import flipped the whole remaining offscreen suite from Agg to QtAgg.
+# pyqtgraph binding safety on import is already covered by xdart/__init__'s
+# setdefault pins.
 
 # Default root logging level — INFO is what every wrangler log line
 # currently uses, so basicConfig(INFO) is enough to surface them.
@@ -703,6 +697,21 @@ def _apply_cli_session_args(argv):
 
 
 def run():
+    # Process-global state claimed HERE, at real GUI launch — never on import.
+    faulthandler.enable()  # Print Python traceback on bus error / segfault
+    if hasattr(signal, "SIGUSR1"):
+        # Live-freeze diagnostic: `kill -USR1 <pid>` dumps every thread's
+        # Python stack to stderr, even while the GUI thread is busy (the dump
+        # runs in the C signal handler, no GIL needed).  No root required,
+        # unlike py-spy on macOS.
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+    # Hard-pin the Qt binding for pyqtgraph and export MPLBACKEND so child
+    # processes (e.g. pyFAI-calib2) inherit the Qt6 backend.
+    os.environ['PYQTGRAPH_QT_LIB'] = 'PySide6'
+    os.environ['MPLBACKEND'] = 'QtAgg'
+    # QtAgg to match pyqtgraph's binding; set before any pyplot figure exists.
+    import matplotlib
+    matplotlib.use('QtAgg')
     argv = _apply_cli_session_args(sys.argv)
     app = QtWidgets.QApplication(argv)
     # PERF-3 diagnostic (XDART_PERF only): time garbage collections.  CPython 3.12
