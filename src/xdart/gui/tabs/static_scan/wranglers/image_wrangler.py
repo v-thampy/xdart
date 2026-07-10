@@ -217,8 +217,6 @@ class imageWrangler(wranglerWidget):
             see LiveScan.
         thread: wranglerThread or subclass, QThread for controlling
             processes
-        timeout: int, how long before thread stops looking for new
-            data.
         tree: pyqtgraph ParameterTree, stores and organizes parameters
         ui: Ui_Form from qtdesigner
 

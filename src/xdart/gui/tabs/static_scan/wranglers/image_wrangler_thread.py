@@ -136,6 +136,32 @@ if _LIVE_EXECUTION not in ("serial", "streaming"):
                    "using 'streaming'.", _LIVE_EXECUTION)
     _LIVE_EXECUTION = "streaming"
 
+# Live/network-share partial-write tolerance (get_next_image).  When the glob
+# picks up a detector image the instrument is still flushing to disk (esp. an
+# SMB/NFS beamline share), fabio hits a truncated/empty file and raises "Could
+# not interpret magic string" -- which, unhandled, escaped run() and KILLED the
+# live thread (looked like a silent timeout).  Tolerance has two layers so a
+# slow write is NEVER dropped yet a corrupt file can't wedge live:
+#   * per-call retry budget -- a single read attempt retries briefly to absorb
+#     a file that finishes flushing within ~a second (no re-poll needed);
+#   * cross-sweep deadline -- a file still unreadable after the budget is left
+#     in the queue (NOT committed to self.processed) and re-polled on later
+#     LIVE watch sweeps, so an eventually-completing write is read, not lost;
+#     only once it has been unreadable this long since first seen is it treated
+#     as genuinely corrupt and skipped, so a bad file can't wedge the watch.
+# (This replaces an earlier size-stability heuristic that could false-drop a
+# frame whose write plateaued >grace on a stalling share -- see WS-X reviews.)
+# Env overrides for a laggy share; clamped to sane ranges.
+def _env_float(name: str, default: float, lo: float, hi: float) -> float:
+    try:
+        v = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return min(max(v, lo), hi)
+
+_FRAME_READ_RETRY_BUDGET = _env_float("XDART_FRAME_READ_RETRY", 1.0, 0.0, 30.0)
+_FRAME_READ_DEADLINE = _env_float("XDART_FRAME_READ_DEADLINE", 30.0, 1.0, 600.0)
+
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
@@ -432,8 +458,6 @@ class imageThread(wranglerThread):
         signal_q: mp.Queue, queue for commands sent from process
         scan_args: dict, used as **kwargs in scan initialization.
             see LiveScan.
-        timeout: float or int, how long to continue checking for new
-            data.
         command: command passed to start, stop etc.
 
     signals:
@@ -554,6 +578,9 @@ class imageThread(wranglerThread):
         self.detector = None
         self.img_fnames = []
         self.processed = []
+        # fname -> monotonic time first seen unreadable, for the live
+        # cross-sweep re-poll deadline (see _read_frame_tolerant / get_next_image).
+        self._frame_read_clocks = {}
         self.processed_scans = []
         # Eiger HDF5 lazy frame state
         self._eiger_master_path = None
@@ -616,6 +643,7 @@ class imageThread(wranglerThread):
 
         self.img_fnames.clear()
         self.processed.clear()
+        self._frame_read_clocks.clear()
         self.processed_scans.clear()
         # Pause: start each run with a fresh serial-flush handle + save counter
         # so an early pause of THIS run can never flush a prior (stopped) run's
@@ -2855,10 +2883,19 @@ class imageThread(wranglerThread):
             try:
                 item = self._prefetch_queue.get(timeout=0.25)
             except queue.Empty:
-                # If the worker is gone and queue is drained, fall through
-                # with an end-of-stream sentinel so the caller can exit.
+                # Worker drained and gone.  In a LIVE run this may just be an
+                # empty/partial master so far (the split second before the
+                # detector writes nimages, or between scans): reset the
+                # prefetcher so the NEXT poll starts a fresh one and re-checks
+                # (re-opening a growing master / picking up new masters), and
+                # hand back an end-of-stream sentinel now so the watch loop
+                # backs off between polls -- never a tight restart spin.  In
+                # batch, a drained worker is the genuine end of the finite scan.
                 if (self._prefetch_thread is None
                         or not self._prefetch_thread.is_alive()):
+                    if (not self.batch_mode) and self.command != 'stop':
+                        self._prefetch_queue = None
+                        self._prefetch_thread = None
                     return (None, None, 1, None, {})
                 continue
             # O8: surface a worker-failure sentinel as a user-visible
@@ -3054,6 +3091,67 @@ class imageThread(wranglerThread):
                     pass
             self._prefetch_thread.join(timeout=2.0)
 
+    def _read_eiger_frame_tolerant(self, frame_idx):
+        """Read one Eiger frame, tolerating a data file that lags the master.
+
+        An Eiger master declares ``nimages`` up front (written at scan start),
+        but the per-frame data files stream in as the detector writes them;
+        reading a frame whose data has not landed yet raises.  Unhandled, that
+        set ``img_data=None``, which the prefetch worker took as END-OF-STREAM
+        and exited -> live Eiger stalled the moment a data file lagged the
+        master.  Here we retry (blocking only the background prefetch thread,
+        never the GUI), refreshing the handle so newly written data files
+        become visible, until the frame reads or a bounded deadline passes; then
+        we return ``None`` so the caller skips just that one frame (not the
+        whole stream).  Batch reads once (files already complete); Stop returns
+        at once."""
+        deadline = getattr(self, "FRAME_READ_DEADLINE", _FRAME_READ_DEADLINE)
+        stop_evt = getattr(self, '_prefetch_stop_evt', None)
+        waited = 0.0
+        delay = 0.1
+        while True:
+            if (getattr(self, 'command', None) == 'stop'
+                    or (stop_evt is not None and stop_evt.is_set())):
+                return None
+            try:
+                if self._eiger_fabio_handle is not None:
+                    _raw = (self._eiger_fabio_handle.data if frame_idx == 0
+                            else self._eiger_fabio_handle.get_frame(frame_idx).data)
+                    return np.asarray(_raw)
+                if self._eiger_h5_dataset is not None:
+                    return np.asarray(self._eiger_h5_dataset[frame_idx])
+                with fabio.open(self._eiger_master_path) as _img:
+                    _raw = (_img.data if frame_idx == 0
+                            else _img.get_frame(frame_idx).data)
+                return np.asarray(_raw)
+            except Exception as e:
+                if getattr(self, 'batch_mode', False) or waited >= deadline:
+                    logger.error('Error reading frame %d from %s: %s',
+                                 frame_idx, self._eiger_master_path, e)
+                    return None
+                time.sleep(delay)
+                waited += delay
+                delay = min(delay * 1.5, 0.5)
+                # Pick up data files written since the handle was opened.
+                self._eiger_refresh_master_handle()
+
+    def _eiger_refresh_master_handle(self):
+        """Reopen/refresh the open Eiger handle so a subsequent read sees
+        per-frame data files written since it was opened (the master is written
+        up front; the data streams in after).  Best-effort -- a refresh failure
+        must never crash the read."""
+        try:
+            if self._eiger_fabio_handle is not None:
+                self._eiger_fabio_handle.close()
+                self._eiger_fabio_handle = fabio.open(self._eiger_master_path)
+                self._eiger_nframes = self._eiger_fabio_handle.nframes
+            elif self._eiger_h5_dataset is not None:
+                self._eiger_h5_dataset.id.refresh()
+                self._eiger_nframes = self._eiger_h5_dataset.shape[0]
+        except Exception as e:
+            logger.debug("Failed to refresh Eiger handle for %s: %s",
+                         getattr(self, "_eiger_master_path", None), e)
+
     def _get_next_eiger_frame_sync(self):
         """Return the next frame from Eiger HDF5 master file(s), one at a time.
 
@@ -3126,30 +3224,87 @@ class imageThread(wranglerThread):
             if self._should_skip_before_read(scan_name, img_number):
                 continue
 
-            try:
-                if self._eiger_fabio_handle is not None:
-                    # Primary: persistent fabio handle
-                    _raw = (self._eiger_fabio_handle.data if frame_idx == 0
-                            else self._eiger_fabio_handle.get_frame(frame_idx).data)
-                    img_data = np.asarray(_raw)
-                elif self._eiger_h5_dataset is not None:
-                    # Fallback: h5py dataset
-                    img_data = np.asarray(self._eiger_h5_dataset[frame_idx])
-                else:
-                    # Should not happen, but safety net
-                    with fabio.open(self._eiger_master_path) as _img:
-                        _raw = _img.data if frame_idx == 0 else _img.get_frame(frame_idx).data
-                    img_data = np.asarray(_raw)
-            except Exception as e:
-                logger.error('Error reading frame %d from %s: %s', frame_idx, self._eiger_master_path, e)
+            img_data = self._read_eiger_frame_tolerant(frame_idx)
+            if img_data is None:
+                stop_evt = getattr(self, '_prefetch_stop_evt', None)
+                if (getattr(self, 'command', None) == 'stop'
+                        or (stop_evt is not None and stop_evt.is_set())):
+                    return None, None, 1, None, {}     # genuine stop -> end of stream
+                # A frame the master DECLARES (nimages) but whose data file
+                # never became readable within the deadline (an aborted/dropped
+                # frame): skip just this one and read on.  Do NOT emit an
+                # end-of-stream sentinel for a mid-scan frame -- that made the
+                # live worker exit on the first data file that lagged the master
+                # and the watch stall forever.
                 self._record_skip_reason("unreadable or empty image data")
-                img_data = None
+                continue
 
             meta = self._read_eiger_metadata(self._eiger_master_path)
 
             return self._eiger_master_path, scan_name, img_number, img_data, meta
 
     # ── Image iteration ──────────────────────────────────────────────────
+
+    def _read_frame_tolerant(self, fname):
+        """Read one detector frame WITHOUT letting a partial-file read escape
+        ``run()`` (an unhandled fabio error on a still-being-written file used
+        to KILL the live QThread -- live processing stopped dead, looking like a
+        timeout).
+
+        Short bounded retry (``_FRAME_READ_RETRY_BUDGET`` s) absorbs a file that
+        finishes flushing within ~a second.  If it is still unreadable, returns
+        ``None`` and lets the caller decide: ``get_next_image`` re-polls it on a
+        later LIVE sweep (never committing/dropping it until it reads or the
+        cross-sweep deadline passes) or skips it in batch.  A good file reads on
+        the first try with no added latency; a Stop between retries returns at
+        once."""
+        budget = getattr(self, "FRAME_READ_RETRY_BUDGET", _FRAME_READ_RETRY_BUDGET)
+        waited = 0.0
+        delay = 0.1
+        while True:
+            if self.command == 'stop':
+                return None
+            try:
+                return np.asarray(read_image(fname), dtype=float)
+            except Exception:
+                if waited >= budget:
+                    return None
+                time.sleep(delay)
+                waited += delay
+                delay = min(delay * 1.5, 0.5)
+
+    def _commit_frame(self, fname):
+        """Mark a frame consumed for this run: record it processed, drop it from
+        the pending queue, count it discovered.  Deferred until a DECISIVE read
+        outcome (read succeeded, or gave up past the deadline) so a still-writing
+        frame we re-poll isn't prematurely excluded by the next re-glob."""
+        self.processed.append(fname)
+        if self.img_fnames and self.img_fnames[0] == fname:
+            self.img_fnames.popleft()
+        self._frame_read_clock_map().pop(fname, None)
+        self._record_discovered_frame()
+
+    def _frame_read_clock_map(self):
+        """The fname -> first-unreadable-time map, lazily created (some test
+        doubles build the thread via __new__ and skip __init__)."""
+        clocks = getattr(self, "_frame_read_clocks", None)
+        if clocks is None:
+            clocks = self._frame_read_clocks = {}
+        return clocks
+
+    def _frame_read_deadline_reached(self, fname):
+        """True once a present-but-unreadable LIVE frame has been unreadable for
+        ``_FRAME_READ_DEADLINE`` s since first seen, so the caller stops
+        re-polling and skips it -- a genuinely corrupt file can't wedge the live
+        watch.  The first unreadable sighting starts the clock (returns False)."""
+        clocks = self._frame_read_clock_map()
+        first = clocks.get(fname)
+        now = time.monotonic()
+        if first is None:
+            clocks[fname] = now
+            return False
+        return (now - first) >= getattr(
+            self, "FRAME_READ_DEADLINE", _FRAME_READ_DEADLINE)
 
     def get_next_image(self):
         """Gets next image in image series or in directory to process."""
@@ -3161,7 +3316,9 @@ class imageThread(wranglerThread):
             if self._should_skip_before_read(scan_name, img_number):
                 self.sigUpdate.emit(self._append_output_number(img_number))
                 return None, scan_name, img_number, None, {}
-            img_data = np.asarray(read_image(self.img_file), dtype=float)
+            img_data = self._read_frame_tolerant(self.img_file)
+            if img_data is None:
+                return None, scan_name, img_number, None, {}
             meta = read_image_metadata(self.img_file, meta_format=self.meta_ext, meta_dir=self.meta_dir) if self.meta_ext else {}
             return self.img_file, scan_name, img_number, img_data, meta
 
@@ -3211,15 +3368,25 @@ class imageThread(wranglerThread):
             if (n > 0) and (scan_name != sname):
                 break
 
-            self.processed.append(fname)
-            self.img_fnames.popleft()
-            self._record_discovered_frame()
-
             if self._should_skip_before_read(sname, snumber):
+                self._commit_frame(fname)
                 continue
 
-            data = np.asarray(read_image(fname), dtype=float)
-            if data is None or not np.isfinite(data).any():
+            data = self._read_frame_tolerant(fname)
+            if data is None:
+                # File is present but not readable yet.  In LIVE mode it may
+                # still be flushing to disk: leave it at the head of the queue
+                # and re-poll on the next sweep (never dropped) until the
+                # cross-sweep deadline; only then -- or in batch, where every
+                # file is already complete -- give up and skip it.
+                if (not self.batch_mode) and not self._frame_read_deadline_reached(fname):
+                    return None, sname, snumber, None, {}
+                self._commit_frame(fname)
+                self._record_skip_reason("unreadable image (gave up after deadline)")
+                continue
+
+            self._commit_frame(fname)
+            if not np.isfinite(data).any():
                 self._record_skip_reason("unreadable or empty image data")
                 continue
 
