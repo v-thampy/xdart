@@ -95,6 +95,12 @@ def _finish_host(tmp_path, *, batch, saw_frame, xye_only=False,
     # real method (a no-op here: the bare host has no _perf_hb_active, so it
     # returns early) so the mock drives the production run-end path unchanged.
     host._perf_hb_end_window = MethodType(staticWidget._perf_hb_end_window, host)
+    # wrangler_finished now follows the Scans panel to the finished scan via
+    # _select_finished_scan_row (the 0-new-frames / batch scan-row-follow fix);
+    # bind the real method so the mock exercises it (sets h5viewer.scan_name from
+    # the .nxs stem + calls the update_scans stub).
+    host._select_finished_scan_row = MethodType(
+        staticWidget._select_finished_scan_row, host)
     return host, h5viewer, str(nxs), calls
 
 
@@ -104,6 +110,8 @@ def test_batch_finish_forces_internal_reload_and_select_last(tmp_path):
     # exactly one reload, forced internal (past the same-file dedupe)
     assert calls == [(nxs, True)], f"expected one internal reload; got {calls}"
     assert h5viewer._auto_select_last_on_finish is True   # select-last armed
+    # ...and the Scans panel now follows to the finished scan (row, not just frame)
+    assert h5viewer.scan_name == "scan"
     assert host._reint_update_timer.stopped == 1
 
 

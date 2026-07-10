@@ -3327,7 +3327,15 @@ class staticWidget(QWidget):
         except (TypeError, ValueError):
             return None
         try:
-            ydata, xdata = self.displayframe.get_frames_int_1d([idx], rv='all')
+            # Block-and-read on a store MISS so a non-resident frame's 1D
+            # actually loads (else the read returns None -> the popup lies "No
+            # frame selected").  Idle-gated exactly like Set-Bkg
+            # (display_frame_widget Set-Bkg precedent): during a run the live
+            # push path feeds the dialog, so don't contend with the writer.
+            ydata, xdata = self.displayframe.get_frames_int_1d(
+                [idx], rv='all',
+                allow_blocking_read=not getattr(
+                    self.displayframe, '_processing_active', False))
         except Exception:
             logger.exception("peak-fit: get_frames_int_1d failed")
             return None
@@ -3348,8 +3356,19 @@ class staticWidget(QWidget):
 
     def _current_pattern_for_fit(self):
         """Return ``(x, y, x_label)`` for the SELECTED frame's 1-D pattern, or
-        ``None`` — so a fit always matches what the user is looking at."""
-        idxs = getattr(self, 'frame_ids', None) or []
+        ``None`` — so a fit always matches what the user is looking at.
+
+        The authoritative "what the 1-D plot draws" is ``displayframe.idxs_1d``
+        -- the very list ``get_frames_int_1d`` defaults to and ``set_data``
+        populates on every frame show.  The staticWidget's own ``frame_ids`` is
+        never populated in the real GUI, so reading it (or h5viewer.frame_ids,
+        which isn't set on a manual frame click either) left the fit popup stuck
+        on "No frame selected".  Prefer ``self.frame_ids`` (tests set it), then
+        the drawn 1-D frames, then the h5viewer selection.
+        """
+        idxs = (getattr(self, 'frame_ids', None)
+                or list(getattr(self.displayframe, 'idxs_1d', None) or [])
+                or getattr(self.h5viewer, 'frame_ids', None) or [])
         if not idxs:
             return None
         return self._pattern_for_frame(idxs[0])
@@ -3368,7 +3387,10 @@ class staticWidget(QWidget):
             frame_pattern_provider=self._pattern_for_frame,
             scan_uri_provider=self._current_scan_uri,
             mask_provider=self._scan_plot_mask_provider,
-            frame_labels_provider=lambda: tuple(getattr(self, 'frame_ids', ()) or ()),
+            frame_labels_provider=lambda: tuple(
+                getattr(self, 'frame_ids', ())
+                or (getattr(self.displayframe, 'idxs_1d', None) or ())
+                or getattr(self.h5viewer, 'frame_ids', ()) or ()),
             metadata_provider=lambda: {})
 
     def _open_peak_fit_dialog(self):
@@ -6574,6 +6596,22 @@ class staticWidget(QWidget):
             "%.0f ms (probe interval 250 ms)",
             getattr(self, "_perf_hb_max_gap_ms", 0.0))
 
+    def _select_finished_scan_row(self, nxs_file):
+        """Point the Scans panel at the finished scan and re-run update_scans'
+        select-by-scan_name path.  The .nxs FILE just written/displayed is the
+        authoritative scan identity -- self.scan can lag the display in directory
+        mode, and update_scans matches scan_name against the "<stem>.nxs" list
+        entries (exact or "<stem>_N" fuzzy).  Best-effort; update_scans blocks
+        signals so this re-select never triggers a reload."""
+        try:
+            if not nxs_file:
+                return
+            self.h5viewer.scan_name = os.path.splitext(
+                os.path.basename(nxs_file))[0]
+            self.h5viewer.update_scans()
+        except Exception:
+            logger.debug("run-end scan-row select skipped", exc_info=True)
+
     def wrangler_finished(self):
         """Called by the wrangler finished signal. If current scan
         matches the wrangler scan, allows for integration.
@@ -6715,6 +6753,10 @@ class staticWidget(QWidget):
                     self._reconcile_h5viewer_frame_list_after_run(generated_file)
                 self.h5viewer._auto_select_last_on_finish = True
                 self.h5viewer.set_file(generated_file, internal=True)
+                # Select the scan ROW too: batch shows the last FRAME, but the
+                # Scans panel otherwise followed only when the directory changed
+                # (and to a possibly-stale scan_name in directory batch).
+                self._select_finished_scan_row(generated_file)
 
         # Append-mode feedback: a NON-batch run that processed 0 new frames
         # (Append over an already-complete scan/directory) displayed nothing
@@ -6737,6 +6779,11 @@ class staticWidget(QWidget):
                 # reload past the same-file dedupe (the run wired file_thread.fname
                 # to this file) so the last-frame select-last actually fires.
                 self.h5viewer.set_file(existing_file, internal=True)
+                # THE 0-new-frames append fix: this branch showed the last FRAME but
+                # never selected the scan ROW -- the scans_select for a live run is
+                # gated on _run_saw_frame (False here), so nothing followed the Scans
+                # panel to the finished scan.  Select it by the displayed file.
+                self._select_finished_scan_row(existing_file)
 
         # Live run (saw frames): the streaming path can leave the lazy frame index
         # empty OR partial if frame production outruns the GUI coalescer.  Now that
@@ -6775,14 +6822,12 @@ class staticWidget(QWidget):
                 )
             if indexed:
                 self._apply_integration_control_state()
-            # scans_select_after_run: update_scans's select-by-scan_name path runs
-            # at scan START, before the writer created <name>.nxs -> nothing to
-            # select, so the Scans panel kept the PRIOR scan highlighted.  Re-run
-            # it here (post-write, LIVE saw-frames branch): scan_name is the
-            # finished scan and its .nxs now exists, so the highlight follows to
-            # the newly-processed scan.  update_scans blocks signals, so this
+            # scans_select_after_run: update_scans' select-by-scan_name path ran at
+            # scan START (before <name>.nxs existed), so the Scans panel kept the
+            # PRIOR scan highlighted.  Re-select the finished scan by the file just
+            # written -- its .nxs now exists.  update_scans blocks signals, so this
             # re-select does not re-trigger a load.
-            self.h5viewer.update_scans()
+            self._select_finished_scan_row(written)
 
         # The scan-matches branch delegates to integrator_thread_finished() to
         # run the post-integration UI enable + exit the run-state.  Skip it when

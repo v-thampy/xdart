@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schemas.conda.org/menuinst/menuinst-2-0-0.schema.json",
+  "menu_name": "XRD Tools",
+  "menu_items": [
+    {
+      "name": "xdart",
+      "description": "XRD / GIWAXS reduction GUI (xdart)",
+      "command": ["{{ PYTHON }}", "-m", "xdart.xdart_main"],
+      "activate": true,
+      "platforms": {
+        "linux": {"icon": "{{ MENU_DIR }}/xdart.png"},
+        "osx": {"icon": "{{ MENU_DIR }}/xdart.icns"},
+        "win": {
+          "command": ["{{ PYTHONW }}", "-m", "xdart.xdart_main"],
+          "desktop": true,
+          "icon": "{{ MENU_DIR }}/xdart.ico"
+        }
+      }
+    }
+  ]
+}

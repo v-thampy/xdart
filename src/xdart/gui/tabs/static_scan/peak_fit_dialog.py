@@ -25,6 +25,13 @@ logger = logging.getLogger(__name__)
 
 _MAX_PEAKS = 12
 
+# Auto-detect prominence floor: a candidate must rise at least this many
+# robust noise-sigmas above the local floor to count as a peak.  Keeps
+# peakless/diffuse scatter (e.g. a grazing-incidence cut with no rings in
+# range) from latching onto noise spikes and grinding a doomed 12-component
+# fit — instead it auto-detects nothing and says so immediately.
+_NOISE_SIGMA = 5.0
+
 # (display label, fit_peaks model string)
 _MODELS = [
     ("Pseudo-Voigt", "pseudovoigt"),
@@ -327,6 +334,15 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         return lo, hi
 
     # ---- data + fit -----------------------------------------------------
+    def keyPressEvent(self, event):
+        # Esc must not discard the fit setup (model/peaks/range/results); the
+        # default QDialog Esc -> reject closes the popup.  Match the metadata
+        # plotter.  Other keys pass through.
+        if event.key() == QtCore.Qt.Key.Key_Escape:
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def refresh_pattern(self):
         """Re-grab the active frame's pattern, draw the raw data, reset the fit."""
         self._clear_fit()
@@ -401,13 +417,38 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
     def _detect_peaks(self, x, y):
         """Auto-detect peak centers in (x, y) via scipy.signal.find_peaks.
 
-        Returns up to ``_MAX_PEAKS`` most-prominent centers (sorted by x)."""
+        Returns up to ``_MAX_PEAKS`` most-prominent centers (sorted by x).
+
+        The prominence floor is the LARGER of a fraction of the data range
+        and a robust multiple of the noise level, so peakless/diffuse scatter
+        auto-detects NOTHING (caller then shows the clean "no peaks" hint)
+        rather than latching onto noise spikes and grinding a doomed fit.
+        ``y`` is already range- and NaN-masked by the caller, so its indices
+        align with ``x``."""
         from scipy.signal import find_peaks
+        y = np.asarray(y, dtype=float)
         rng = float(np.nanmax(y) - np.nanmin(y))
         if not np.isfinite(rng) or rng <= 0:
             return []
+        # Robust noise estimate: MAD of successive differences.  Real peaks
+        # are sparse so they barely perturb it; diff doubles i.i.d. variance
+        # (=> /sqrt(2)) and 1.4826 rescales MAD to a Gaussian sigma.
+        d = np.diff(y)
+        mad = float(np.median(np.abs(d - np.median(d)))) if d.size else 0.0
+        noise = 1.4826 * mad / np.sqrt(2.0)
+        prominence = max(0.04 * rng, _NOISE_SIGMA * noise)
+        # Light boxcar smoothing collapses 1-2 sample noise spikes -- their
+        # prominence drops below the noise floor -- while barely touching a
+        # real, multi-sample peak.  Detect on the smoothed trace so peakless
+        # scatter finds NOTHING (clean "no peaks" hint) instead of fitting a
+        # spike as garbage or grinding a doomed 12-component fit.
+        w = max(3, (y.size // 150) | 1)          # odd window, >= 3 samples
+        ys = np.convolve(y, np.ones(w) / w, mode="same")
+        # width >= 2 samples is a second guard against single-sample spikes:
+        # a real diffraction peak is broader than one point, a noise outlier
+        # is not.
         idx, props = find_peaks(
-            y, prominence=0.04 * rng, distance=max(1, y.size // 80))
+            ys, prominence=prominence, distance=max(1, y.size // 80), width=2)
         if idx.size == 0:
             return []
         proms = props.get("prominences", np.ones(idx.size))

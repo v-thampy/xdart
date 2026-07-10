@@ -8422,11 +8422,18 @@ def _append_cold_target_host(tmp_path, *, raw_name="scan_0001.tif",
     return host, target
 
 
-def _expected_append_mismatch_modal_text(processed, current):
+def _expected_append_mismatch_modal_text(processed_sig, current_sig, mismatched=()):
+    # Reconstruct via the real formatter so the assertion tracks the config
+    # summary; validates the modal TEMPLATE (Processed/Current alignment + the
+    # optional Different: line).
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+    diff = ", ".join(str(f) for f in (mismatched or ()))
+    diff_line = f"Different: {diff}\n\n" if diff else ""
     return (
         "Scan already integrated with different integration settings.\n\n"
-        f"Processed: {processed}\n"
-        f"Current: {current}\n\n"
+        f"Processed: {imageWrangler._format_append_config(processed_sig)}\n"
+        f"Current:   {imageWrangler._format_append_config(current_sig)}\n\n"
+        f"{diff_line}"
         "Overwrite processed data with new settings?"
     )
 
@@ -8445,6 +8452,7 @@ def test_append_config_mismatch_run_click_cancel_stops_before_start(tmp_path):
             current.display_mode,
             imageWrangler._append_config_mismatch_modal_text(
                 host, processed, current),
+            processed, current,
         ))
         return False
 
@@ -8456,12 +8464,36 @@ def test_append_config_mismatch_run_click_cancel_stops_before_start(tmp_path):
     assert prompts[0][0].ok is False
     assert prompts[0][1:3] == ("Standard", "Grazing")
     assert prompts[0][3] == _expected_append_mismatch_modal_text(
-        "Standard, Q",
-        "Grazing, Qip-Qoop",
+        prompts[0][4], prompts[0][5],
     )
     assert host.sigStart.emitted == []
     assert host._controls.write_mode() == "Append"
     assert getattr(host, "command", None) != "start"
+
+
+def test_append_mismatch_modal_names_the_differences(tmp_path):
+    # The modal must tell the user WHAT differs (the fix: two identical-looking
+    # "Grazing, Qip-Qoop" lines were unhelpful) -- a "Different: <fields>" line
+    # built from check.mismatched_fields.
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    host = _append_modal_host(tmp_path, processed_gi=False, current_gi=True,
+                              frame_count=651)
+    captured = {}
+
+    def _cancel(check, processed, current):
+        captured["fields"] = check.mismatched_fields
+        captured["text"] = imageWrangler._append_config_mismatch_modal_text(
+            host, processed, current, check.mismatched_fields)
+        return False
+
+    host._confirm_append_config_replace = _cancel
+    imageWrangler._on_start_clicked(host)
+
+    assert captured["fields"]                       # configs genuinely differ
+    assert "Different: " in captured["text"]
+    for label in captured["fields"]:                # each named in the modal
+        assert label in captured["text"]
 
 
 def test_append_config_mismatch_cold_partial_target_cancel_stops_before_start(
@@ -8491,6 +8523,7 @@ def test_append_config_mismatch_cold_partial_target_cancel_stops_before_start(
             current.display_mode,
             imageWrangler._append_config_mismatch_modal_text(
                 host, processed, current),
+            processed, current,
         ))
         return False
 
@@ -8505,8 +8538,7 @@ def test_append_config_mismatch_cold_partial_target_cancel_stops_before_start(
     assert prompts[0][0].ok is False
     assert prompts[0][1:3] == ("Standard", "Grazing")
     assert prompts[0][3] == _expected_append_mismatch_modal_text(
-        "Standard, Q",
-        "Grazing, Qip-Qoop",
+        prompts[0][4], prompts[0][5],
     )
     assert host.sigStart.emitted == []
     assert host._controls.write_mode() == "Append"
@@ -8571,19 +8603,17 @@ def test_append_config_mismatch_modal_symmetric_gi_to_standard(tmp_path):
             current.display_mode,
             imageWrangler._append_config_mismatch_modal_text(
                 host, processed, current),
+            processed, current,
         )) or False
     )
 
     imageWrangler._on_start_clicked(host)
 
-    assert prompts == [(
-        "Grazing",
-        "Standard",
-        _expected_append_mismatch_modal_text(
-            "Grazing, Qip-Qoop",
-            "Standard, Q",
-        ),
-    )]
+    assert len(prompts) == 1
+    assert prompts[0][:2] == ("Grazing", "Standard")
+    assert prompts[0][2] == _expected_append_mismatch_modal_text(
+        prompts[0][3], prompts[0][4],
+    )
     assert host.sigStart.emitted == []
 
 
@@ -8651,8 +8681,7 @@ def test_append_config_mismatch_modal_uses_yes_no_with_no_default(
     assert box.default_button.text == "No"
     assert box.escape_button.text == "No"
     assert box.text == _expected_append_mismatch_modal_text(
-        "Standard, Q",
-        "Grazing, Qip-Qoop",
+        processed, current, check.mismatched_fields,
     )
 
 

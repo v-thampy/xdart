@@ -1,0 +1,65 @@
+name: conda-publish
+
+# Build the noarch conda package with rattler-build and upload it to our
+# prefix.dev channel on a version tag — enabling
+#   pixi global install -c https://prefix.dev/xrd-tools -c conda-forge xrd-tools
+# See docs/design/plan_conda_package_v1.1_jul2026.md.
+#
+# One-time setup (maintainer): create the prefix.dev channel, then add repo
+# secret  PREFIX_API_KEY  and repo variable  PREFIX_CHANNEL  (the channel name).
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}          # manual runs build only (no tag → no version check)
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest       # noarch: one build serves every platform
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync recipe version from pyproject (single source of truth)
+        run: |
+          v=$(grep -m1 '^version' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          # Only the quoted context.version literal — NOT package.version's ${{ version }}.
+          sed -i -E "s/^  version: \"[^\"]*\"/  version: \"$v\"/" recipe/recipe.yaml
+          echo "recipe version synced from pyproject: $v"
+
+      - name: Verify tag matches pyproject
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pyproject=$(grep -m1 '^version' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "tag=$tag  pyproject=$pyproject"
+          if [ "$tag" != "$pyproject" ]; then
+            echo "::error::tag ($tag) does not match pyproject version ($pyproject)"
+            exit 1
+          fi
+
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          run-install: false
+
+      - name: Build (rattler-build, noarch)
+        run: |
+          # rattler-build links a large (~250-pkg) env to run the recipe tests and
+          # opens hundreds of files in parallel; raise the fd limit as insurance
+          # (ubuntu runners are usually fine, macOS defaults to 256 -> os error 24).
+          ulimit -n 4096 || true
+          pixi exec rattler-build build \
+            --recipe recipe/recipe.yaml \
+            --channel conda-forge \
+            --output-dir ./output
+
+      - name: Upload to prefix.dev
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          PREFIX_API_KEY: ${{ secrets.PREFIX_API_KEY }}
+          PREFIX_CHANNEL: ${{ vars.PREFIX_CHANNEL }}
+        run: |
+          pixi exec rattler-build upload prefix \
+            --channel "$PREFIX_CHANNEL" \
+            ./output/noarch/*.conda

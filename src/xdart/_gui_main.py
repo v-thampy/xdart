@@ -10,6 +10,8 @@ import gc
 import os
 import signal
 import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 import faulthandler
 faulthandler.enable()  # Print Python traceback on bus error / segfault
 if hasattr(signal, "SIGUSR1"):
@@ -43,6 +45,60 @@ logging.getLogger('pyFAI.gui.matplotlib').setLevel(logging.ERROR)
 # Suppress silx's "pyOpenCL has been imported but can't be used here"
 # warning — OpenCL is optional and the message has no user action.
 logging.getLogger('silx.opencl').setLevel(logging.ERROR)
+
+
+def _resolve_log_file():
+    """Discoverable, platform-appropriate path for the rotating log file.
+
+    Overridable with ``XDART_LOG_FILE`` (full path) or ``XDART_LOG_DIR`` (dir).
+    Defaults follow each OS's convention so the file is easy to find and tail:
+    macOS ``~/Library/Logs/xdart``, Windows ``%LOCALAPPDATA%\\xdart\\Logs``,
+    Linux ``$XDG_STATE_HOME/xdart`` (else ``~/.local/state/xdart``).
+    """
+    override = os.environ.get('XDART_LOG_FILE')
+    if override:
+        return Path(override).expanduser()
+    base = os.environ.get('XDART_LOG_DIR')
+    if base:
+        d = Path(base).expanduser()
+    elif sys.platform == 'darwin':
+        d = Path.home() / 'Library' / 'Logs' / 'xdart'
+    elif os.name == 'nt':
+        d = Path(os.environ.get('LOCALAPPDATA') or Path.home()) / 'xdart' / 'Logs'
+    else:
+        d = Path(os.environ.get('XDG_STATE_HOME')
+                 or (Path.home() / '.local' / 'state')) / 'xdart'
+    return d / 'xdart.log'
+
+
+#: Absolute path of the active rotating log file, set by
+#: :func:`_install_file_log_handler` (None if it could not be created).  The
+#: Help ▸ Open Log Location action and the startup banner read this.
+LOG_FILE_PATH = None
+
+
+def _install_file_log_handler():
+    """Route root logging to a rotating file so output survives a windowless
+    launch (``pixi global`` / the menuinst shortcut have no attached terminal,
+    so the stderr StreamHandler goes nowhere).  Best-effort: any failure here
+    must never stop the GUI from starting."""
+    global LOG_FILE_PATH
+    if LOG_FILE_PATH is not None:                 # idempotent
+        return LOG_FILE_PATH
+    try:
+        path = _resolve_log_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8')
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter(
+            '%(asctime)s %(levelname)s %(name)s: %(message)s'))
+        logging.getLogger().addHandler(handler)
+        LOG_FILE_PATH = path
+    except Exception:
+        logging.getLogger(__name__).warning(
+            'could not open a log file for writing', exc_info=True)
+    return LOG_FILE_PATH
 
 # pyqtgraph's log-axis tick painter computes 10**range while the histogram
 # axis still holds the previous LINEAR image's extent for one paint after a
@@ -229,8 +285,34 @@ class Main(QMainWindow):
             update_action = QtGui.QAction("Check for Updates…", self)
             update_action.triggered.connect(self._check_for_updates)
             help_menu.addAction(update_action)
+            log_action = QtGui.QAction("Open Log Location", self)
+            log_action.triggered.connect(self._open_log_location)
+            help_menu.addAction(log_action)
         except Exception:
             logger.exception("Could not set up the Help menu")
+
+    def _open_log_location(self):
+        """Help ▸ Open Log Location — reveal the rotating log file in the OS file
+        manager (macOS Finder / Windows Explorer / Linux folder), falling back to
+        a dialog that shows the path so it is always copyable + tail-able."""
+        import subprocess
+        path = LOG_FILE_PATH
+        if path is None or not os.path.exists(path):
+            QtWidgets.QMessageBox.information(
+                self, "Log Location",
+                "No log file has been created yet." if path is None
+                else "Log file (not written yet):\n%s" % path)
+            return
+        try:
+            p = str(path)
+            if sys.platform == "darwin":
+                subprocess.run(["open", "-R", p], check=False)
+            elif os.name == "nt":
+                subprocess.run(["explorer", "/select,", p], check=False)
+            else:
+                subprocess.run(["xdg-open", str(path.parent)], check=False)
+        except Exception:
+            QtWidgets.QMessageBox.information(self, "Log Location", str(path))
 
     # ── In-app updater (Help → Check for Updates…) — spec section 4 ───────────
     def _run_active(self):
@@ -256,7 +338,7 @@ class Main(QMainWindow):
                 "updater.")
             return
         self._update_kind = kind
-        self._update_meta = updater.find_install_meta()
+        self._update_meta = updater.resolve_update_meta(kind)
         # Fetch the latest version off the GUI thread; never block the event loop.
         self._update_thread = _UpdateCheckThread(self)
         self._update_thread.result_ready.connect(self._on_update_check_result)
@@ -267,28 +349,44 @@ class Main(QMainWindow):
         from xdart.modules import updater
         current = updater.current_version()
         if latest is None:
+            # None = network failure OR PyPI has no such release yet (404).
             self.statusBar().showMessage(
-                "Could not check for updates (offline?).", 6000)
+                "Could not check for updates (offline, or no release published "
+                "on PyPI yet).", 8000)
             return
         if not updater.update_available(current, latest):
             QtWidgets.QMessageBox.information(
                 self, "Check for Updates",
                 f"xdart is up to date (version {current}).")
             return
-        if getattr(self, "_update_kind", "managed") == "managed":
+        kind = getattr(self, "_update_kind", "managed")
+        meta = getattr(self, "_update_meta", None) or {}
+        # Update-on-exit is POSIX-only in v1.0: on Windows the env's .pyd/.dll are
+        # locked under a live app and the PID probe differs (B2), so Windows -- and
+        # any pip/conda-managed install on every platform -- gets a COPYABLE
+        # command instead of the in-app update-on-exit.
+        if kind == "managed" or sys.platform.startswith("win"):
+            cmd = (" ".join(str(c) for c in (meta.get("update_cmd") or []))
+                   or 'pip install -U "xrd-tools[gui]"')
             QtWidgets.QMessageBox.information(
                 self, "Update available",
                 f"xdart {latest} is available (you have {current}).\n\n"
-                "This install is managed by pip/conda — update it with:\n\n"
-                "    pip install -U \"xrd-tools[gui]\"\n\n"
-                "then restart xdart.")
+                f"Update it with:\n\n    {cmd}\n\nthen restart xdart.")
             return
         resp = QtWidgets.QMessageBox.question(
             self, "Update available",
             f"xdart {latest} is available (you have {current}).\n\n"
             "Update and restart now?")
-        if resp == QtWidgets.QMessageBox.StandardButton.Yes:
-            self._launch_updater_and_close()
+        if resp != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        # S3: a processing run may have started during the async PyPI fetch or
+        # while this dialog was open -- never rewrite the env under a live run.
+        if self._run_active():
+            QtWidgets.QMessageBox.information(
+                self, "Check for Updates",
+                "A processing run is now active — try again after it finishes.")
+            return
+        self._launch_updater_and_close()
 
     def _launch_updater_and_close(self):
         import json
@@ -307,7 +405,17 @@ class Main(QMainWindow):
                 "Could not launch the updater. Update manually with:\n\n"
                 f"    {' '.join(str(c) for c in update_cmd)}")
             return
-        self.close()
+        # B1: the check thread's run() may still be returning; wait for it so it is
+        # not destroyed mid-flight, then exit via the HARDENED teardown
+        # (Main.exit -> main_widget.close joins the reduction QThreads).  Bare
+        # self.close() skips that teardown and crashes on the running QThreads.
+        thread = getattr(self, "_update_thread", None)
+        if thread is not None:
+            try:
+                thread.wait(3000)
+            except Exception:
+                pass
+        self.exit()
 
     @staticmethod
     def _qsize_text(size):
@@ -542,10 +650,14 @@ class Main(QMainWindow):
         finally:
             self.close()
             gc.collect()
-            try:
-                os.killpg(os.getpid(), signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+            # os.killpg is POSIX-only; on Windows it raises AttributeError, which
+            # would escape and skip sys.exit(0) (matters now that exit() is also
+            # the in-app updater's teardown path).
+            if hasattr(os, "killpg"):
+                try:
+                    os.killpg(os.getpid(), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
             sys.exit(0)
 
     def openFile(self):
@@ -624,6 +736,13 @@ def run():
     # never as an import-time side effect (importing this module must not hijack
     # the process-global sys.excepthook for tests / headless / embedding hosts).
     sys.excepthook = _xdart_excepthook
+    # File logging: a windowless launch (pixi global / menuinst shortcut) has no
+    # terminal, so the console handler goes nowhere.  Route logs to a rotating
+    # file too -- same "only when the GUI is actually launched, never on import"
+    # rule as the excepthook above.
+    log_path = _install_file_log_handler()
+    if log_path is not None:
+        logger.info("xdart logging to %s", log_path)
     # N8: apply the saved theme before any widget construction so
     # pyqtgraph plot backgrounds are set in time (pyqtgraph
     # snapshots the config at widget creation).

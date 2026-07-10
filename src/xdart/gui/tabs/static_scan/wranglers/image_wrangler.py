@@ -217,8 +217,6 @@ class imageWrangler(wranglerWidget):
             see LiveScan.
         thread: wranglerThread or subclass, QThread for controlling
             processes
-        timeout: int, how long before thread stops looking for new
-            data.
         tree: pyqtgraph ParameterTree, stores and organizes parameters
         ui: Ui_Form from qtdesigner
 
@@ -1143,26 +1141,31 @@ class imageWrangler(wranglerWidget):
     def _format_append_config(sig):
         if sig is None:
             return "unknown"
-        axis = (
-            sig.axis_2d
-            if getattr(sig, "axis_2d", None) not in (None, "", "q-chi")
-            else getattr(sig, "axis_1d", "")
-        )
-        axis_text = imageWrangler._format_append_axis(axis)
-        range_value = (
-            getattr(sig, "radial_range_2d", None)
-            or getattr(sig, "radial_range_1d", None)
-        )
-        return (
-            f"{sig.display_mode}, "
-            f"{axis_text}{imageWrangler._format_append_range(range_value)}"
-        )
+        parts = [str(getattr(sig, "display_mode", "") or "").strip()]
+        # Show BOTH legs with their point counts -- the difference is often in the
+        # 1D config (axis/npt), which the old 2D-only summary hid, so the two
+        # lines looked identical.
+        ax1 = imageWrangler._format_append_axis(getattr(sig, "axis_1d", ""))
+        if ax1 and ax1 != "data grid":
+            n1 = getattr(sig, "npt_1d", None)
+            parts.append(f"1D {ax1}" + (f" ({n1} pts)" if n1 else ""))
+        ax2 = getattr(sig, "axis_2d", None)
+        if ax2 not in (None, "", "q-chi"):
+            nr = getattr(sig, "npt_rad_2d", None)
+            na = getattr(sig, "npt_azim_2d", None)
+            pts2 = f" ({nr}×{na} pts)" if nr and na else ""
+            parts.append(f"2D {imageWrangler._format_append_axis(ax2)}{pts2}")
+        return ", ".join(p for p in parts if p) or "unknown"
 
-    def _append_config_mismatch_modal_text(self, processed, current):
+    def _append_config_mismatch_modal_text(self, processed, current,
+                                           mismatched_fields=()):
+        diff = ", ".join(str(f) for f in (mismatched_fields or ()))
+        diff_line = f"Different: {diff}\n\n" if diff else ""
         return (
             "Scan already integrated with different integration settings.\n\n"
             f"Processed: {imageWrangler._format_append_config(processed)}\n"
-            f"Current: {imageWrangler._format_append_config(current)}\n\n"
+            f"Current:   {imageWrangler._format_append_config(current)}\n\n"
+            f"{diff_line}"
             "Overwrite processed data with new settings?"
         )
 
@@ -1175,7 +1178,8 @@ class imageWrangler(wranglerWidget):
             pass
         box.setWindowTitle("Replace existing integration?")
         box.setText(imageWrangler._append_config_mismatch_modal_text(
-            self, processed, current))
+            self, processed, current,
+            getattr(check, "mismatched_fields", ())))
         yes = box.addButton("Yes", QMessageBox.DestructiveRole)
         no = box.addButton("No", QMessageBox.RejectRole)
         box.setDefaultButton(no)

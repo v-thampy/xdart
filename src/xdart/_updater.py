@@ -20,9 +20,24 @@ from pathlib import Path
 
 
 def _pid_alive(pid):
-    """True while process ``pid`` exists (signal 0 probe; no signal sent)."""
+    """True while process ``pid`` exists.  POSIX uses a signal-0 probe; Windows
+    uses an OpenProcess/WaitForSingleObject handle probe -- ``os.kill(pid, 0)`` on
+    Windows calls ``TerminateProcess``, NOT a probe (B2), so it must never run
+    there."""
     if pid <= 0:
         return False
+    if sys.platform.startswith("win"):             # pragma: no cover - windows
+        import ctypes
+        SYNCHRONIZE = 0x00100000
+        WAIT_TIMEOUT = 0x00000102
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
+        if not handle:
+            return False
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -99,8 +114,18 @@ def main(argv=None):
     relaunch_cmd = json.loads(argv[3]) if argv[3] else []
     log_path = argv[4] if len(argv) > 4 and argv[4] else str(
         Path(app_root or ".") / "update.log")
-    if parent_pid > 0:
-        wait_for_exit(parent_pid)
+    if parent_pid > 0 and not wait_for_exit(parent_pid):
+        # S1: the app is still alive after the timeout -- do NOT run the update
+        # (its env files are in use; updating under it corrupts the running app).
+        # Log and bail; the app keeps running on the old version.
+        try:
+            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(log_path).write_text(
+                f"xdart update-on-exit ABORTED: parent pid {parent_pid} still "
+                "alive after timeout; environment left untouched.")
+        except OSError:
+            pass
+        return 1
     run_update(update_cmd, relaunch_cmd, log_path)
     return 0
 

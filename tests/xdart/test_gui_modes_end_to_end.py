@@ -2851,6 +2851,12 @@ def test_wrangler_finished_append_zero_new_frames_shows_last_frame(
 
     assert loaded == [str(nxs)]                  # existing scan reloaded
     assert w.h5viewer._auto_select_last_on_finish is True
+    # The 0-new-frames append fix: the Scans panel must now FOLLOW to the finished
+    # scan (previously only the last FRAME was selected, not the scan ROW -- the
+    # scans_select for a live run is gated on _run_saw_frame, False here).
+    assert w.h5viewer.scan_name == "scan"        # pointed at the finished .nxs stem
+    selected = w.h5viewer.ui.listScans.currentItem()
+    assert selected is not None and selected.text() == "scan.nxs"
 
 
 def test_wrangler_finished_with_frames_does_not_reload(
@@ -2868,6 +2874,50 @@ def test_wrangler_finished_with_frames_does_not_reload(
     w.wrangler_finished()
 
     assert loaded == []                          # no append-feedback reload
+
+
+def test_current_pattern_for_fit_reads_drawn_1d_frames(widget, monkeypatch):
+    """The fit provider must read the DRAWN 1-D frames (displayframe.idxs_1d --
+    what the plot shows and what get_frames_int_1d defaults to), because the
+    staticWidget/h5viewer frame_ids are NOT populated on a manual frame click,
+    which left the popup stuck on "No frame selected"."""
+    w = widget
+    seen = {}
+    monkeypatch.setattr(
+        w, '_pattern_for_frame',
+        lambda idx: (seen.setdefault('idx', idx), ([1.0], [2.0], 'q'))[1])
+    w.frame_ids = []
+    try:
+        w.h5viewer.frame_ids[:] = []
+    except Exception:
+        pass
+    w.displayframe.idxs_1d[:] = [5]           # the frame the 1-D plot draws
+    assert w._current_pattern_for_fit() == ([1.0], [2.0], 'q')
+    assert seen['idx'] == 5
+    # nothing drawn + no selection -> None (the correct "No frame selected" case)
+    w.displayframe.idxs_1d[:] = []
+    assert w._current_pattern_for_fit() is None
+
+
+def test_pattern_for_frame_uses_idle_gated_blocking_read(widget, monkeypatch):
+    """A non-resident frame's per-frame read must be a store-MISS BLOCKING read on
+    an idle scan (Set-Bkg precedent) so the 1-D actually loads -- else the popup
+    lies "No frame selected". During a run it must NOT block (live push feeds it)."""
+    w = widget
+    seen = {}
+
+    def _spy(idxs, rv='all', allow_blocking_read=None):
+        seen['idxs'] = list(idxs)
+        seen['blocking'] = allow_blocking_read
+        return ([[10.0, 20.0, 30.0]], [0.1, 0.2, 0.3])   # (ydata, xdata)
+
+    monkeypatch.setattr(w.displayframe, 'get_frames_int_1d', _spy)
+    w.displayframe._processing_active = False
+    assert w._pattern_for_frame(4) is not None
+    assert seen == {'idxs': [4], 'blocking': True}       # idle -> block-and-read
+    w.displayframe._processing_active = True
+    w._pattern_for_frame(4)
+    assert seen['blocking'] is False                     # mid-run -> no contention
 
 
 def test_run_end_backfills_overlay_after_integrator_finished_clear(

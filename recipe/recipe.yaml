@@ -1,0 +1,125 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/prefix-dev/recipe-format/main/schema.json
+schema_version: 1
+
+# rattler-build recipe for the xrd-tools conda package (v1.1 plan).
+#
+# Purpose: make `pixi global install -c <our-channel> -c conda-forge xrd-tools`
+# THE install command — no script, `xdart` auto-exposed on PATH, and a
+# Start-menu/Applications shortcut for free (menuinst).  noarch:python = ONE
+# build for every platform.  Only xrd-tools lives on our channel; every run dep
+# resolves from conda-forge in the same solve, so the PyPI-vs-conda fast-stack
+# layering problem (the reason scripts/install_xdart.sh exists) dissolves here.
+#
+# Deps verified against conda-forge 2026-07-08.  See
+# docs/design/plan_conda_package_v1.1_jul2026.md.
+#
+# Local build (macOS): raise the file-descriptor limit first — rattler-build's
+# ~250-package test env opens hundreds of files and macOS defaults to 256
+# (`os error 24`):
+#     ulimit -n 10240
+#     pixi exec rattler-build build --recipe recipe/recipe.yaml -c conda-forge
+
+context:
+  name: xrd-tools
+  # Tracks the PyPI version: the publish Action (conda-publish.yml) SYNCS this
+  # from pyproject [project].version before building, so you bump ONE place
+  # (pyproject) and both channels move together.  This literal is just the
+  # convenience value for a local `rattler-build build`; keep it == pyproject.
+  # (load_from_file would auto-read it, but that needs rattler-build
+  # --experimental, so we sync in CI instead.)
+  version: "1.0.0"
+  python_min: "3.13"
+
+package:
+  name: ${{ name }}
+  version: ${{ version }}
+
+source:
+  # recipe/ sits one level below the project root (the dir with pyproject.toml).
+  path: ../
+
+build:
+  number: 1
+  noarch: python
+  script:
+    - python -m pip install . -vv --no-deps --no-build-isolation
+    # Ship the menuinst shortcut: pixi global / conda create the entry at install
+    # time from $PREFIX/Menu/*.json.  (noarch builds run on one platform; the
+    # shell copy is fine and the JSON is consumed per-platform at install.)
+    - mkdir -p "${PREFIX}/Menu"
+    - cp "${RECIPE_DIR}/menu/xrd-tools.json" "${PREFIX}/Menu/xrd-tools.json"
+    - cp "${RECIPE_DIR}/menu/xdart.png"  "${PREFIX}/Menu/xdart.png"   # linux
+    - cp "${RECIPE_DIR}/menu/xdart.icns" "${PREFIX}/Menu/xdart.icns"  # macOS
+    - cp "${RECIPE_DIR}/menu/xdart.ico"  "${PREFIX}/Menu/xdart.ico"   # windows
+  python:
+    entry_points:
+      - xdart = xdart.xdart_main:main
+
+requirements:
+  host:
+    - python ${{ python_min }}.*
+    - pip
+    - setuptools
+  run:
+    - python >=${{ python_min }}
+    # headless core — conda-forge fast I/O stack
+    - numpy
+    - scipy
+    - pandas
+    - xarray
+    - h5py
+    - hdf5plugin
+    - nexusformat
+    - fabio
+    - silx
+    - pyfai >=2025.3,<2025.12     # conda-forge lowercase; window selects 2025.3.0
+    - pyyaml
+    - joblib
+    - natsort
+    - matplotlib-base             # leaner core: no competing Qt binding (we bring pyside6)
+    - plotly
+    # xdart GUI ([gui] extra, carried unconditionally — this package IS the GUI
+    # one-liner; a separate GUI-less xrd-tools-core noarch can come later)
+    - pyside6 >=6.5
+    - pyqtgraph >=0.13.7
+    - qtawesome
+    - imagecodecs
+    - imageio
+    - packaging
+    - menuinst                    # creates the Start-menu/Applications shortcut
+    # GUI analysis tools the Tools menu + the Grazing/GI workflow surface -- ship
+    # them so nothing fails with an "optional dependency" prompt out of the box
+    # ([fitting] + [rsm] extras; this package IS the full GUI).
+    - lmfit                       # Peak / Phase Fitting
+    - pymatgen                    # Phase Fitting (CIF / structure)
+    - xrayutilities               # Grazing/GI corrections + RSM geometry/gridding
+    - pyevtk                      # RSM VTK export
+
+tests:
+  - python:
+      imports:
+        - xrd_tools               # headless core (import-light)
+        - xdart                   # GUI package imports without a display
+      pip_check: true             # every declared dep resolves in the solved env
+  # NB: `xdart --help` is intentionally NOT tested — xdart_main launches the GUI
+  # (no arg parsing), which would hang a headless build.  A real launch is the
+  # clean-machine smoke gate (plan item 7).
+
+about:
+  homepage: https://github.com/v-thampy/xrd-tools
+  repository: https://github.com/v-thampy/xrd-tools
+  documentation: https://github.com/v-thampy/xrd-tools#readme
+  license: MIT AND BSD-3-Clause
+  license_file:
+    - LICENSE
+    - licenses/
+  summary: Headless XRD/GIWAXS reduction core (xrd_tools) + the xdart Qt GUI.
+  description: |
+    xrd-tools is a monorepo: `xrd_tools`, a headless XRD/GIWAXS reduction and
+    NeXus I/O core (no Qt), and `xdart`, a thin PySide6 GUI over it for the
+    Eiger live/batch reduction workflow.  Installing this package gives you the
+    `xdart` command and a desktop shortcut.
+
+extra:
+  recipe-maintainers:
+    - v-thampy

@@ -79,17 +79,71 @@ def is_editable_install():
     return bool(info.get("dir_info", {}).get("editable", False))
 
 
+def _pixi_home():
+    return os.environ.get("PIXI_HOME") or os.path.join(
+        os.path.expanduser("~"), ".pixi")
+
+
+def detect_pixi_global_env(prefix=None):
+    """True if the running interpreter is a ``pixi global`` env -- ``sys.prefix``
+    is ``<PIXI_HOME>/envs/<name>`` (parent dir ``envs``, grandparent the
+    ``.pixi``/``PIXI_HOME`` root).  ``pixi global`` installs carry no
+    ``install_meta.json`` (pixi owns the env), so they need this path probe."""
+    try:
+        p = Path(prefix if prefix is not None else sys.prefix).resolve()
+    except OSError:
+        return False
+    if p.parent.name != "envs":
+        return False
+    root = p.parent.parent
+    home = os.environ.get("PIXI_HOME")
+    if home:
+        try:
+            if root == Path(home).resolve():
+                return True
+        except OSError:
+            pass
+    return root.name == ".pixi"
+
+
+def pixi_global_meta():
+    """Synthesize updater meta for a ``pixi global`` install (no
+    ``install_meta.json``): update via ``pixi global update xrd-tools`` and
+    relaunch the exposed ``xdart`` trampoline."""
+    import shutil
+    home = _pixi_home()
+    pixi = shutil.which("pixi") or os.path.join(home, "bin", "pixi")
+    xdart = shutil.which("xdart") or os.path.join(home, "bin", "xdart")
+    return {"flavor": "pixi-global", "app_root": home,
+            "update_cmd": [pixi, "global", "update", "xrd-tools"],
+            "relaunch_cmd": [xdart]}
+
+
 def install_kind(meta=None):
     """Classify the install for update handling:
 
-    * ``"editable"`` -- a dev checkout; refuse (use git).
-    * ``"pixi"``     -- installer ``install_meta.json`` present; update-on-exit.
-    * ``"managed"``  -- pip/conda, no meta; show a copyable command, never auto-run.
+    * ``"editable"``    -- a dev checkout; refuse (use git).
+    * ``"pixi-global"`` -- ``pixi global install``ed; ``pixi global update``.
+    * ``"pixi"``        -- script-installer ``install_meta.json`` present.
+    * ``"managed"``     -- pip/conda, no meta; copyable command, never auto-run.
     """
     if is_editable_install():
         return "editable"
+    if detect_pixi_global_env():
+        return "pixi-global"
     resolved = meta if meta is not None else find_install_meta()
     return "pixi" if resolved is not None else "managed"
+
+
+def resolve_update_meta(kind=None):
+    """The update-on-exit meta (update_cmd/relaunch_cmd/app_root) for the given
+    install kind, or None for editable/managed (no in-app auto-update)."""
+    kind = kind or install_kind()
+    if kind == "pixi-global":
+        return pixi_global_meta()
+    if kind == "pixi":
+        return find_install_meta()
+    return None
 
 
 def fetch_latest_pypi(*, timeout=3.0, opener=None):

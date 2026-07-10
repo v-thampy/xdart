@@ -292,3 +292,32 @@ for downstream users:
   left un-normalized (factor 1.0) and now resolves and normalizes — so a dataset with a
   case-mismatched monitor key will integrate to different (correct) numbers. Re-reduce such
   datasets if exact reproduction of the old (un-normalized) values matters.
+
+## Fixes in v1.0.0
+
+* **Live mode no longer stops after idle gaps.** In ≤0.40.0 the live watch loop
+  ended via a hidden `Timeout` parameter (default 1 second, not shown in the GUI):
+  any pause longer than that with no new image — a detector-readout pause, a motor
+  move between scan points, the gap between scans — quietly ended live processing
+  (the only trace was a brief "Timeout occurred" in the status bar). The v1.0 watch
+  loop polls indefinitely with adaptive backoff (0.1→2 s) and exits only on Stop
+  (or Pause→Stop), so live keeps processing across arbitrary idle gaps.
+* **Live mode no longer crashes on a partially-written detector image.** On a
+  network share (SMB/NFS) the detector often creates an image file before its bytes
+  are flushed; the glob would pick it up and fabio would raise on the truncated file
+  (`Could not interpret magic string`). That exception was unhandled and escaped the
+  worker thread's `run()`, silently killing live processing (it looked like a
+  timeout). The frame read now tolerates this: a file that is present but not yet
+  readable is re-polled on later sweeps (never dropped) until it finishes writing, or
+  skipped after a bounded deadline (`XDART_FRAME_READ_DEADLINE`, default 30 s) so a
+  genuinely corrupt file can't wedge the watch — the read never crashes the thread.
+  The same tolerance covers Eiger: the master declares `nimages` up front but the
+  per-frame data files stream in after, so a frame whose data has not landed yet is
+  now waited for (refreshing the handle) instead of being read as end-of-stream and
+  stalling the live acquisition.
+* **Auto peak-detection ignores peakless/diffuse scatter.** Fitting a 1D with no
+  real peak in range (e.g. a grazing-incidence cut off the rings) used to latch onto
+  noise spikes, then grind a doomed many-component fit ending in a bare "Fit failed:".
+  Detection now applies a robust noise-floor + width gate (light smoothing + a peak
+  must rise several noise-sigma over a multi-sample span), so peakless data detects
+  nothing and shows the clean "no peaks auto-detected" hint immediately.

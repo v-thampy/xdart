@@ -66,6 +66,10 @@ gui = [
     "imagecodecs",
     "imageio",
     "packaging",         # Help → Check for Updates… version comparison (updater.py)
+    # GUI analysis tools: Peak/Phase Fitting (lmfit, pymatgen) + the Grazing/GI/RSM
+    # workflow (xrayutilities, pyevtk).  The GUI surfaces these from the Tools menu
+    # and the Grazing corrections path, so a `[gui]` install ships them.
+    "xrd-tools[fitting,rsm]",
 ]
 notebook = ["ipywidgets", "anywidget", "ipyfilechooser", "ipykernel", "ipympl", "jupyterlab"]
 all = ["xrd-tools[fitting,rsm,gui,notebook]"]
