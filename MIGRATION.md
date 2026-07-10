@@ -293,6 +293,40 @@ for downstream users:
   case-mismatched monitor key will integrate to different (correct) numbers. Re-reduce such
   datasets if exact reproduction of the old (un-normalized) values matters.
 
+## Fixes in v1.0.1
+
+Patch release completing the `xrd-tools` → `xdart` distribution rename. v1.0.0
+shipped with three leftovers from the rename, all fixed here:
+
+* **Correct version reporting and provenance stamps.** In v1.0.0,
+  `xrd_tools.__version__` resolved the retired `xrd-tools` distribution name and
+  reported `0.0.0+unknown` on a fresh install — the same value stamped into every
+  written `.nxs` provenance record (`/entry/reduction/` program version, and an
+  empty `versions/xrd-tools` entry). Both lookups now resolve `xdart` first with
+  `xrd-tools` as the legacy fallback. Data written by v1.0.0 is otherwise
+  unaffected — only the provenance version strings were wrong.
+* **Help → Check for Updates works.** v1.0.0's updater polled a PyPI project
+  name that does not exist (`xrd-tools`), so it always reported "could not check
+  for updates" and would never have discovered this release. It now polls
+  `pypi.org/pypi/xdart`; the pixi-global flavor's update command is likewise
+  `pixi global update xdart`. **v1.0.0 installs cannot self-discover updates —
+  update manually once**: `pip install -U xdart` (pip) or
+  `pixi global update xdart` (conda/pixi).
+* **The one-line installers solve again.** `install_xdart.sh`/`.ps1` declared a
+  PyPI dependency on the nonexistent `xrd-tools` distribution and failed at the
+  pixi solve. (These scripts are fetched from `main`, so they were fixed for new
+  installs as soon as the fix was pushed; the pinned dependency in released
+  metadata is corrected here.)
+
+Also in this release: linux CI teardown-robustness fixes in the GUI (parentless
+single-shot timers now die with their widget; the scan-plot dialog shuts down
+its source-probe worker on close; importing `xdart._gui_main` no longer flips
+the process-wide matplotlib backend — that now happens only at real GUI
+launch), a persist-gate on the display cache so an unsaved frame is never
+evicted into a blank scroll-back (MEM1-15), and the run-end Overlay/Waterfall
+catch-up is now armed only for live runs and covered by an outcome-asserting
+test (PERF-3).
+
 ## Fixes in v1.0.0
 
 * **Live mode no longer stops after idle gaps.** In ≤0.40.0 the live watch loop

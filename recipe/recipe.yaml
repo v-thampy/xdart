@@ -27,7 +27,7 @@ context:
   # convenience value for a local `rattler-build build`; keep it == pyproject.
   # (load_from_file would auto-read it, but that needs rattler-build
   # --experimental, so we sync in CI instead.)
-  version: "1.0.0"
+  version: "1.0.1"
   python_min: "3.13"
 
 package:
