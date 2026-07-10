@@ -4297,13 +4297,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if norm_channel == previous:
             return
         self._last_applied_norm_channel = norm_channel
-        # A real norm-channel change invalidates every accumulated intensity row;
-        # no-op calls (notably None->None during selection refresh) must not wipe
-        # Overlay/Waterfall history.
-        self.plot_data = [np.zeros(0), np.zeros(0)]
-        self.frame_names = []
-        self.overlaid_idxs = []
-        self._waterfall_history = None
+        # V1 Stage 4 (S-16 dissolved): a REAL norm-channel change is a pure
+        # re-render -- the Overlay/Waterfall accumulator stores acquisition-
+        # native rows and the norm divides at draw (_history_to_payload →
+        # render_waterfall_view), so NOTHING is wiped here; the repaint below
+        # re-scales every accumulated row under the new channel.  No-op calls
+        # (notably None->None during selection refresh) return above.
         self.update()
 
     def _clear_bkg(self):

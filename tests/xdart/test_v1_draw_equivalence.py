@@ -157,18 +157,22 @@ def test_unit_flip_q_to_tth_and_back_is_pure_draw_relabel():
 def test_norm_channel_applies_at_draw_only():
     h = OVHarness()
     h.publish(0)
-    h.norm_change(real=True, channel="i0")   # S-16 reset (kept in Stage 3)
+    h.norm_change(real=True, channel="i0")   # re-render, no reset (Stage 4)
     _state, payload = h.publish(1)
     x_q, prof0 = native_profile(0)
     _, prof1 = native_profile(1)
     # Storage stays UN-normed; the channel/monitor ride as provenance.
+    # Stage 4 (S-16 dissolved): the channel change PRESERVED frame 0's row,
+    # so its RowMeta keeps the provenance captured at ITS append (no channel
+    # yet); frame 1, appended after the change, records "i0".  The draw-time
+    # norm reads the CURRENT channel + per-row `metadata`, never RowMeta.
     assert_native_storage(h)
     np.testing.assert_array_equal(
         np.atleast_2d(np.asarray(h.history.rows, dtype=float)),
         np.vstack([prof0, prof1]))
-    for meta in h.history.row_meta:
-        assert meta.norm_channel == "i0" and meta.norm_value == 2.0
-    # Display: divided by the i0 monitor (2.0) at draw.
+    assert [m.norm_channel for m in h.history.row_meta] == [None, "i0"]
+    assert [m.norm_value for m in h.history.row_meta] == [None, 2.0]
+    # Display: BOTH rows divided by the i0 monitor (2.0) at draw.
     assert_rendered(payload, h, x=x_q, rows=[prof0 / 2.0, prof1 / 2.0],
                     axis=_AXIS_Q)
 

@@ -1697,10 +1697,14 @@ def test_pinned_cut_pruned_on_scan_change_s18():
             "a stale pin must not render under the new scan"
 
 
-def test_norm_channel_change_resets_accumulator_s16():
-    # S-16: when the normalization channel actually changes, the overlay
-    # accumulator RESETS -- it must never permanently mix normalized and
-    # un-normalized rows.  Drives the real plot_payload accumulator path.
+def test_norm_channel_change_preserves_accumulator_s16_dissolved():
+    # S-16 DISSOLVED (V1 Stage 4): the accumulator stores acquisition-native
+    # (un-normed) rows and the norm divides at draw, so a REAL channel change
+    # is a pure re-render -- the accumulator is PRESERVED.  Mixing normalized
+    # and un-normalized rows (the bug S-16's reset guarded against) is now
+    # impossible by construction.  Pre-Stage-4 this test pinned the reset
+    # (count 2 -> 1 on the channel change); the flip below IS the contract
+    # change.  Drives the real plot_payload accumulator path.
     store = PublicationStore()
     for i in (10, 11):
         f = DuckFrame(idx=i)
@@ -1722,10 +1726,13 @@ def test_norm_channel_change_resets_accumulator_s16():
     widget._waterfall_history = p2.plot_history
     assert p2.plot_history.count == 2
 
-    # channel change -> RESET (frame 10's row dropped, only the current render)
+    # channel change -> re-render, NO reset: frame 10's row is retained and
+    # both accumulated rows still render (re-scaled at draw).
     norm["ch"] = "i1"
     p3 = adapter.plot_payload(_int_state(store, ids=(11,), method="Overlay"))
-    assert p3.plot_history.count == 1
+    assert p3.plot_history.count == 2
+    assert p3.plot_history.ids == p2.plot_history.ids
+    assert len(p3.traces) == 2
 
 
 def test_plot_payload_sum_average_emit_n_traces_collapsed_at_render():

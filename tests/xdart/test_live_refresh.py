@@ -6377,13 +6377,19 @@ def test_norm_update_noop_preserves_overlay_history():
     assert host._waterfall_history is history
 
 
-def test_norm_update_real_channel_change_resets_overlay_history():
+def test_norm_update_real_channel_change_preserves_overlay_history():
+    # V1 Stage 4 (S-16 dissolved): a REAL channel change keeps the channel
+    # bookkeeping and repaints (update()), but PRESERVES the accumulator and
+    # plot state — the norm divides at draw, so nothing is wiped.  Before
+    # Stage 4 this sequence pinned the wipe (plot_data/frame_names/
+    # overlaid_idxs cleared, _waterfall_history = None).
     calls = []
 
     class _Column:
         def sum(self):
             return 10.0
 
+    history = SimpleNamespace(count=3)
     host = SimpleNamespace(
         normChannel=None,
         _last_applied_norm_channel=None,
@@ -6392,7 +6398,7 @@ def test_norm_update_real_channel_change_resets_overlay_history():
         plot_data=[np.array([0.0, 1.0]), np.ones((3, 2))],
         frame_names=["scan_1", "scan_2", "scan_3"],
         overlaid_idxs=[1, 2, 3],
-        _waterfall_history=SimpleNamespace(count=3),
+        _waterfall_history=history,
         update=lambda: calls.append("update"),
     )
     host.normUpdate = MethodType(displayFrameWidget.normUpdate, host)
@@ -6402,13 +6408,16 @@ def test_norm_update_real_channel_change_resets_overlay_history():
     assert calls == ["update"]
     assert host.normChannel == "I0"
     assert host._last_applied_norm_channel == "I0"
-    assert host.plot_data[0].size == 0
-    assert host.frame_names == []
-    assert host.overlaid_idxs == []
-    assert host._waterfall_history is None
+    assert host.plot_data[1].shape == (3, 2)
+    assert host.frame_names == ["scan_1", "scan_2", "scan_3"]
+    assert host.overlaid_idxs == [1, 2, 3]
+    assert host._waterfall_history is history
 
 
 def test_norm_update_real_channel_change_preserves_pinned_slice_registry():
+    # Pins AND history both survive a real channel change (V1 Stage 4:
+    # nothing is wiped, so INV-4 "pins ⊆ history" holds trivially; before
+    # Stage 4 this pinned pins-survive-the-wipe).
     calls = []
 
     class _Column:
@@ -6416,6 +6425,7 @@ def test_norm_update_real_channel_change_preserves_pinned_slice_registry():
             return 10.0
 
     pins = {("scan", 1, ("chi", 0.0, 1.0)): {"label": 1}}
+    history = SimpleNamespace(count=1)
     host = SimpleNamespace(
         normChannel=None,
         _last_applied_norm_channel=None,
@@ -6424,7 +6434,7 @@ def test_norm_update_real_channel_change_preserves_pinned_slice_registry():
         plot_data=[np.array([0.0, 1.0]), np.ones((1, 2))],
         frame_names=["scan_1"],
         overlaid_idxs=[1],
-        _waterfall_history=SimpleNamespace(count=1),
+        _waterfall_history=history,
         _pinned_slice_cuts=pins,
         update=lambda: calls.append("update"),
     )
@@ -6433,7 +6443,7 @@ def test_norm_update_real_channel_change_preserves_pinned_slice_registry():
     host.normUpdate()
 
     assert calls == ["update"]
-    assert host._waterfall_history is None
+    assert host._waterfall_history is history
     assert host._pinned_slice_cuts is pins
     assert len(host._pinned_slice_cuts) == 1
 

@@ -19,7 +19,6 @@ import numpy as np
 from tests.xdart.ov_harness import (
     CLEAR,
     INCOMPATIBLE_GRID,
-    NORM_CHANGE,
     REINTEGRATE,
     OVHarness,
     _is_live_sentinel,
@@ -300,25 +299,43 @@ def test_unit_flip_relabels_never_resets():
     assert h.resets_observed == []
 
 
-# ── S-16 class: real norm change resets; norm repaint does not ─────────────
+# ── S-16 DISSOLVED (V1 Stage 4): norm change preserves + re-scales at draw ─
 
 
-def test_s16_norm_change_classes():
+def test_s16_dissolved_norm_change_preserves_and_rescales_at_draw():
+    # Before Stage 4 this sequence pinned the S-16 contract: a REAL channel
+    # change was an allowed reset (with the narrowed selection, the
+    # accumulator rebuilt to 1 row).  Since Stage 4 the rows are stored
+    # acquisition-native and the norm divides at draw, so the SAME sequence
+    # now proves the flip: count PRESERVED, ids untouched, every rendered
+    # row re-scaled by the new channel's per-row monitor value.
     h = OVHarness()
     h.publish(0)
-    h.publish(1)
-    h.norm_change(real=False)              # repaint echo: NO reset
+    _state, payload = h.publish(1)
+    base = [np.asarray(t.y, dtype=float).copy() for t in payload.traces]
+    h.norm_change(real=False)              # repaint echo: no change at all
     assert h.persistent_count == 2
 
     h.click(1)                             # selection narrows (still 2 rows)
     assert h.persistent_count == 2
-    h.norm_change(real=True)               # REAL channel change: allowed reset
-    h.assert_reset_observed(NORM_CHANGE)
-    assert h.persistent_count == 1         # rebuilt from the current render
-    assert _ids(h) == (("scanA", 1),)
+    # REAL channel change → re-render, NEVER a reset (pre-Stage-4 this
+    # dropped frame 0's row; INV-1 would now flag that shrink as a bug).
+    _state, payload = h.norm_change(real=True, channel="i1")
+    assert h.persistent_count == 2         # PRESERVED (S-16 dissolved)
+    assert _ids(h) == (("scanA", 0), ("scanA", 1))
+    assert len(payload.traces) == 2        # both rows still render
+    for before, trace in zip(base, payload.traces):
+        # harness frames carry scan_info {"i0": 2.0, "i1": 4.0, ...}: the
+        # draw-time norm divides each row by ITS monitor value for "i1".
+        np.testing.assert_allclose(
+            np.asarray(trace.y, dtype=float), before / 4.0)
 
-    h.click(0)                             # re-accumulates under the new norm
+    _state, payload = h.norm_change(real=True, channel="i0")   # switch again
     assert h.persistent_count == 2
+    for before, trace in zip(base, payload.traces):
+        np.testing.assert_allclose(
+            np.asarray(trace.y, dtype=float), before / 2.0)
+    assert h.resets_observed == []         # NOTHING reset across all of it
 
 
 # ── Clear: the canonical allowed reset — history AND pins together ────────

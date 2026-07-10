@@ -450,9 +450,9 @@ def test_accumulate_waterfall_d1_canonicalizes_cross_native_unit_rows():
 
 def test_accumulate_waterfall_d1_lambda_less_cross_unit_batch_skipped():
     # V1 Stage 3 (D1): the same cross-native-unit append with NO carried
-    # wavelength cannot canonicalize; with the relabel unable to engage
-    # (different grid size) the batch is SKIPPED with an ERROR — the
-    # production QW-4 tripwire (no env gate).
+    # wavelength cannot canonicalize, so the batch is SKIPPED with an ERROR
+    # — the production QW-4 tripwire (no env gate; since Stage 4 grid size
+    # is irrelevant: the same-size relabel fallback is deleted).
     np = pytest.importorskip("numpy")
     import logging as _logging
     xq = np.linspace(1.0, 5.0, 200)
@@ -543,30 +543,35 @@ def test_waterfall_display_rows_decimates_rows_and_ids_together():
     assert display_ids == ids[::3]
 
 
-def test_accumulate_waterfall_unit_toggle_relabels_grid_keeps_rows():
-    # A Q<->2theta toggle does NOT change the reset_key: the rows are unit-invariant,
-    # so the grid is RELABELLED in place (incoming x in the new unit) and every
-    # captured row is kept -- no re-read, no loss.
+def test_accumulate_waterfall_lambda_less_cross_unit_same_size_batch_skipped():
+    # V1 Stage 4: the legacy same-size relabel branch is DELETED — a display
+    # Q<->2theta toggle converts at draw and never reaches the accumulator,
+    # so a same-size cross-unit batch can only be a cross-NATIVE-unit append.
+    # Without carried wavelengths it cannot canonicalize (D1) and is SKIPPED
+    # (pre-Stage-4 the same call relabelled the grid in place to the incoming
+    # unit): the history keeps its grid, unit and every row.
     np = pytest.importorskip("numpy")
     xq = np.array([1.0, 2.0, 3.0])
     h = None
     for i in range(3):
         h = dl.accumulate_waterfall(h, reset_key="A", unit="q_A^-1", x=xq,
                                     rows=np.full((1, 3), float(i)), ids=[i], names=[f"s{i}"])
-    xtth = np.array([5.0, 10.0, 15.0])     # the same samples re-expressed in 2theta
+    xtth = np.array([5.0, 10.0, 15.0])     # same size -> relabel used to engage
     h2 = dl.accumulate_waterfall(
         h, reset_key="A", unit="2th_deg", x=xtth,
-        rows=np.vstack([np.full(3, float(i)) for i in range(3)]),
-        ids=[0, 1, 2], names=["s0", "s1", "s2"])
-    assert h2.count == 3 and h2.unit == "2th_deg"
-    np.testing.assert_array_equal(h2.x, xtth)              # grid relabelled in place
+        rows=np.full((1, 3), 9.0), ids=[3], names=["s3"])
+    assert h2.count == 3 and h2.unit == "q_A^-1"           # batch skipped
+    assert h2.ids == (0, 1, 2)                             # new row NOT appended
+    np.testing.assert_array_equal(h2.x, xq)                # grid NOT relabelled
     np.testing.assert_array_equal(h2.rows[0], [0, 0, 0])   # rows unchanged
     np.testing.assert_array_equal(h2.rows[2], [2, 2, 2])
 
 
-def test_accumulate_waterfall_unit_toggle_with_evicted_frames_keeps_full_stack():
-    # Unit toggle where only the resident tail comes in (older frames evicted past
-    # the store cap): the accumulator keeps the FULL stack and relabels the grid.
+def test_accumulate_waterfall_cross_unit_with_evicted_frames_keeps_full_stack():
+    # λ-less cross-unit batch where only the resident tail comes in (older
+    # frames evicted past the store cap): the batch is skipped (Stage 4 — no
+    # relabel fallback) and the accumulator keeps the FULL stack on its own
+    # native grid (pre-Stage-4 the same call relabelled the grid to xtth).
     np = pytest.importorskip("numpy")
     xq = np.array([1.0, 2.0, 3.0])
     h = None
@@ -579,7 +584,8 @@ def test_accumulate_waterfall_unit_toggle_with_evicted_frames_keeps_full_stack()
         rows=np.vstack([np.full(3, 2.0), np.full(3, 3.0)]),
         ids=[2, 3], names=["s2", "s3"])
     assert h2.count == 4                                   # nothing lost
-    np.testing.assert_array_equal(h2.x, xtth)
+    assert h2.unit == "q_A^-1"                             # native unit kept
+    np.testing.assert_array_equal(h2.x, xq)                # grid NOT relabelled
 
 
 def _legacy_accumulate_waterfall(
@@ -615,8 +621,16 @@ def _legacy_accumulate_waterfall(
             ids=tuple(ki), names=tuple(kn), metadata=tuple(km),
             count=len(ki))
 
-    base_x = (x if history.unit != unit and x.size == history.x.size
-              else history.x)
+    # V1 Stage 4 semantics, mirrored: no same-size relabel — a cross-unit
+    # batch that cannot canonicalize (this reference carries no row_meta/λ,
+    # so D1 never fires) is SKIPPED and the history keeps its own unit/label.
+    if history.unit != unit:
+        if ids:
+            ids, names, rows, metadata = (
+                ids[:0], names[:0], rows[:0], metadata[:0])
+        unit = history.unit
+        label = history.label
+    base_x = history.x
     out_ids = list(history.ids)
     out_names = list(history.names)
     out_meta = list(getattr(history, "metadata", ()) or ())

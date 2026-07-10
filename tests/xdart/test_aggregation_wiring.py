@@ -1269,7 +1269,11 @@ def test_overlay_selection_of_evicted_frame_preserves_then_appends():
         ids = tuple(("scan", i) for i in frame_ids)
         return WaterfallHistory(
             reset_key=("radial", len(x), False),
-            unit="Å⁻¹",
+            # history.unit is the acquisition-NATIVE token since V1 Stage 3
+            # (pre-flip this fixture carried the display symbol "Å⁻¹"; the
+            # legacy same-size relabel branch silently absorbed the mismatch
+            # until Stage 4 deleted it).
+            unit="q_A^-1",
             label="Q",
             x=x,
             rows=np.vstack([np.full(x.shape, float(i)) for i in frame_ids]),
@@ -1465,7 +1469,9 @@ def test_overlay_selection_evicted_hydration_never_decreases_history():
     initial_ids = tuple(("scan", i) for i in initial_frames)
     initial_history = WaterfallHistory(
         reset_key=("radial", len(x), False),
-        unit="Å⁻¹",
+        # native token since V1 Stage 3 (was the display symbol "Å⁻¹"; the
+        # deleted same-size relabel branch used to absorb the mismatch).
+        unit="q_A^-1",
         label="Q",
         x=x,
         rows=np.vstack([np.full(x.shape, float(i)) for i in initial_frames]),

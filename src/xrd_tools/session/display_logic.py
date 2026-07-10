@@ -472,13 +472,14 @@ class WaterfallHistory:
     each tick and rebuild from only the resident (un-evicted) frames -- the exact
     cap-truncation this design exists to prevent.  Incompatible grid/source
     changes change the key (reset); compatible scan boundaries, selection growth
-    and a Q<->2theta unit toggle do not (append / relabel in place).
+    and a Q<->2theta display toggle do not (append / draw-time relabel).
 
     All rows live on ONE shared sample grid (``x``); the adapter interpolates each
     incoming frame onto it before accumulating.  ``rows[k]`` is frame ``ids[k]`` /
-    ``names[k]`` -- maintained row-for-row.  ``unit`` is the radial unit the grid is
-    currently labelled in (a Q<->2theta toggle relabels ``x`` in place, since the
-    intensities are unit-invariant)."""
+    ``names[k]`` -- maintained row-for-row.  ``unit`` is the grid's
+    acquisition-NATIVE radial unit (V1 Stage 3: rows are stored native; a
+    Q<->2theta display toggle converts at draw, :func:`render_waterfall_view`,
+    and never touches the stored history)."""
     reset_key: "object"      # accumulation identity (grid, source); reset on change
     unit: str
     x: "np.ndarray"          # shared radial sample grid (1-D, in `unit`)
@@ -693,9 +694,11 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
     purpose) canonicalizes the incoming grid onto the history's native unit
     with each row's own carried wavelength (D1), then the BL-6 value-drift
     interp aligns it; rows with no carried wavelength are SKIPPED for the
-    render with an ERROR rather than mixed across disjoint domains.  The
-    legacy same-size display-relabel branch remains for pre-flip callers
-    until Stage 4 deletes it.
+    render with an ERROR rather than mixed across disjoint domains (the
+    QW-4 tripwire).  Stage 4 deleted the legacy same-size display-relabel
+    branch: a display toggle never reaches this function, so there is no
+    in-place grid relabel — canonicalize or skip are the only cross-unit
+    outcomes.
 
     ``x`` / ``rows`` / ``ids`` / ``names`` are the incoming frames, already on the
     one shared grid (the adapter interpolated them).  Returns the next
@@ -749,18 +752,16 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
     # Same identity: keep the accumulated rows.  Cross-unit incoming batches
     # (V1 Stage 3 — storage is acquisition-NATIVE, so ``unit`` names the
     # incoming rows' native unit and ``history.unit`` the grid's) resolve in
-    # priority order:
+    # priority order (Stage 4 deleted the legacy same-size display-relabel
+    # branch that used to sit between these — a display toggle is draw-time
+    # now and never reaches this function):
     #
     # 1. D1 canonicalization: a cross-scan append whose NATIVE unit is the
     #    other member of the Q↔2θ pair converts its grid with each row's own
     #    carried wavelength (``row_meta``), then falls through to the BL-6
     #    value-drift interp below — the accumulator grid/unit stay the
     #    history's.  Fires only when EVERY incoming row carries a λ.
-    # 2. Legacy display-relabel (same grid size): a pre-flip caller
-    #    relabeling the grid in place on a display-unit toggle.  Production
-    #    no longer reaches this (a plotUnit toggle is draw-time now);
-    #    Stage 4 deletes it.
-    # 3. Otherwise the batch cannot be represented on this grid: SKIP it
+    # 2. Otherwise the batch cannot be represented on this grid: SKIP it
     #    this render with an ERROR (the QW-4 tripwire, production behavior
     #    since Stage 3 — previously XDART_DEBUG_DISPLAY-gated).  The rows
     #    re-arrive on a later render (the S-17 re-arrival policy) instead of
@@ -785,24 +786,22 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
                     for lam in lams]
                 unit = history.unit
                 label = history.label
-    base_x = (x if history.unit != unit and x.size == history.x.size
-              else history.x)
-    _cross_unit_no_relabel = (history.unit != unit and base_x is history.x)
-    if _cross_unit_no_relabel and ids:
-        logger.error(
-            "accumulate_waterfall: %d cross-unit row(s) (incoming unit=%r, "
-            "accumulator unit=%r) with no carried wavelength to canonicalize "
-            "and the relabel not engaged (x.size=%d vs history %d) — "
-            "skipping this batch instead of interpolating across disjoint "
-            "domains [QW-4 tripwire]", len(ids), unit, history.unit, x.size,
-            history.x.size)
-        ids, names, rows, metadata, row_meta = (
-            ids[:0], names[:0], rows[:0], metadata[:0], row_meta[:0])
+    if history.unit != unit:
+        if ids:
+            logger.error(
+                "accumulate_waterfall: %d cross-unit row(s) (incoming "
+                "unit=%r, accumulator unit=%r) with no carried wavelength "
+                "to canonicalize — skipping this batch instead of "
+                "interpolating across disjoint domains [QW-4 tripwire]",
+                len(ids), unit, history.unit)
+            ids, names, rows, metadata, row_meta = (
+                ids[:0], names[:0], rows[:0], metadata[:0], row_meta[:0])
         # The skipped batch contributes nothing: the emitted history keeps
         # its own unit/label (emitting the incoming unit over the unchanged
         # native grid would relabel without converting — the axis would lie).
         unit = history.unit
         label = history.label
+    base_x = history.x
     out_ids = list(history.ids)
     out_names = list(history.names)
     out_meta = list(getattr(history, "metadata", ()) or ())

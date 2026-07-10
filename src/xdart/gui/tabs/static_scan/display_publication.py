@@ -57,7 +57,6 @@ from .browse_debug import browse_debug_log, sequence_summary
 
 MAX_WATERFALL_PAYLOAD_ROWS = 256
 
-_UNSET = object()   # S-16: "no norm channel recorded yet" sentinel
 logger = logging.getLogger(__name__)
 
 
@@ -950,9 +949,10 @@ class PublicationDisplayAdapter:
         resident 1D frames PRESERVES the prior accumulator (never wipes -- the
         failed-read invariant); an incompatible grid/source change
         (``reset_key``) resets it; a plotUnit Q<->2theta toggle is a pure
-        draw-time relabel (V1 Stage 3: rows are stored acquisition-native and
-        the display conversion runs in _history_to_payload -- the stored
-        history does not change at all).  The accumulator is keyed on a
+        draw-time relabel and a norm-channel change a pure draw-time re-scale
+        (V1 Stage 3/4: rows are stored acquisition-native and both transforms
+        run in _history_to_payload -- the stored history does not change at
+        all).  The accumulator is keyed on a
         STABLE grid identity, NOT state.generation -- the generation bumps every
         tick as live auto-last grows the selection, so keying on it would reset
         each tick and rebuild from only the un-evicted frames (cap-truncation).
@@ -961,23 +961,15 @@ class PublicationDisplayAdapter:
         widget = self._widget
         prior = getattr(widget, "_waterfall_history", None)
 
-        # S-16: reset the accumulator when the normalization CHANNEL actually
-        # changes between renders (refresh_norm_channels can silently reset the
-        # combo cross-scan).  V1 Stage 3: rows are stored native and the norm
-        # applies at DRAW, so this wipe is no longer needed for row
-        # correctness -- it is deliberately KEPT this stage so the norm-change
-        # contract (reset at the same cause) is unchanged; Stage 4 deletes it
-        # (S-16 dissolves into re-render-no-reset).  Record the channel that
-        # will be applied at draw (read once, the same source
-        # _history_to_payload uses) on the widget, parallel to
-        # _waterfall_history.
+        # The channel that will apply at DRAW (read once -- the same source
+        # _history_to_payload uses), captured per row below as RowMeta
+        # provenance.  V1 Stage 4: a REAL channel change is a pure re-render
+        # -- the norm divides at draw over the carried per-row metadata --
+        # so the S-16 accumulator reset (prior = None on channel change, the
+        # _overlay_accum_norm_channel stamp) is DELETED: S-16 dissolves into
+        # re-render-no-reset, the one deliberate user-visible change of V1.
         _get_norm = getattr(widget, "get_normChannel", None)
         cur_norm = _get_norm() if callable(_get_norm) else None
-        prev_norm = getattr(widget, "_overlay_accum_norm_channel", _UNSET)
-        if prior is not None and prev_norm is not _UNSET and prev_norm != cur_norm:
-            prior = None
-        if widget is not None:
-            widget._overlay_accum_norm_channel = cur_norm
 
         # Full parity with integration_plot_payload's per-frame build: a 2D-slice
         # source (cake-projected 1D, or an active chi/q slice) builds each row via
@@ -1046,10 +1038,17 @@ class PublicationDisplayAdapter:
         # rows to ITS grid (prior.x) so a cross-scan append with a different
         # radial_range but the same axis+npt reinterps onto ONE x -- otherwise
         # scan B's intensities render at scan A's x positions.  Adoption is
-        # guarded in append_row on the row's NATIVE unit == prior.unit (V1
-        # Stage 3: both are native tokens; a cross-NATIVE-unit append instead
-        # canonicalizes inside accumulate_waterfall, D1); accumulate_waterfall
-        # is the belt-and-suspenders reinterp.
+        # guarded in append_row on the row's NATIVE unit == prior.unit: a
+        # cross-NATIVE-unit row must reach accumulate_waterfall unseeded, on
+        # its own native grid, so the D1 canonicalization (carried λ) can
+        # align it there.  NOTE (Stage 4 deviation): the plan slated this
+        # guard for deletion as dead ("both sides are native"), but it is
+        # load-bearing for D1 -- the reset key is unit-blind, so a same-npt
+        # cross-native-unit prior IS grid-compatible, and seeding such a row
+        # would np.interp across disjoint domains (q ~1-8 vs 2θ ~10-55: the
+        # INV-3 constant clamp; verified against
+        # test_d1_cross_native_unit_append_canonicalizes_with_carried_lambda).
+        # accumulate_waterfall is the belt-and-suspenders reinterp.
         prior_x_seed = None
         if (prior is not None
                 and overlay_grid_keys_match(prior.reset_key, planned_reset_key)
@@ -1135,9 +1134,9 @@ class PublicationDisplayAdapter:
                 axis = this_axis
                 reset_key = row_grid_key
                 # BL-6: adopt the compatible prior grid (same NATIVE unit
-                # only; a cross-native-unit row canonicalizes in
-                # accumulate_waterfall instead) so this and every later row
-                # land on the existing overlay x.
+                # only -- see the D1 note above; a cross-native-unit row
+                # canonicalizes in accumulate_waterfall instead) so this and
+                # every later row land on the existing overlay x.
                 if use_prior_seed:
                     if (x.shape != prior_x_seed.shape
                             or not np.allclose(x, prior_x_seed, equal_nan=True)):

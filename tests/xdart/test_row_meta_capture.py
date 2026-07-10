@@ -31,15 +31,18 @@ def test_row_meta_captured_on_real_append():
     assert meta.norm_channel is None and meta.norm_value is None
     assert meta.bkg_token is None and meta.projection_id is None
 
-    # A REAL channel change (S-16 rebuild) re-captures under the new channel;
-    # the value is the row's own monitor reading from metadata_raw
-    # (PROVENANCE only since Stage 3 — the stored row stays un-normed).
+    # A REAL channel change is a re-render since Stage 4 (S-16 dissolved):
+    # frame 0's accumulated row is PRESERVED, so its RowMeta keeps the
+    # provenance captured at ITS append (no channel yet); frame 1, appended
+    # after the change, records the new channel + its own monitor reading
+    # from metadata_raw (PROVENANCE only — the stored rows stay un-normed;
+    # the draw-time norm reads the CURRENT channel + per-row `metadata`).
     h.norm_change(real=True, channel="i0")
     h.publish(1)
     hist = h.history
     assert hist.count == 2 and len(hist.row_meta) == 2
-    assert [m.norm_channel for m in hist.row_meta] == ["i0", "i0"]
-    assert [m.norm_value for m in hist.row_meta] == [2.0, 2.0]
+    assert [m.norm_channel for m in hist.row_meta] == [None, "i0"]
+    assert [m.norm_value for m in hist.row_meta] == [None, 2.0]
 
 
 def test_row_meta_source_unit_stays_native_across_unit_flip():

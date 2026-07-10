@@ -25,10 +25,12 @@ After EVERY event the harness renders and asserts the OV acceptance contract
 
 INV-1  Accumulator row count is MONOTONIC non-decreasing, except at an
        explicitly-allowed reset cause: CLEAR, INCOMPATIBLE_GRID (reset_key
-       change), REINTEGRATE, NORM_CHANGE (a REAL channel change).  A
-       display-unit flip RELABELS, never resets.  The transient live slice
-       "current" cut (the OV-7b/7c sentinel row) is excluded from the count:
-       it is a preview that pin-absorption legitimately drops.
+       change), REINTEGRATE.  A display-unit flip RELABELS, never resets;
+       a REAL norm-channel change RE-SCALES at draw, never resets (V1
+       Stage 4: S-16 dissolved — NORM_CHANGE is retired as a cause).  The
+       transient live slice "current" cut (the OV-7b/7c sentinel row) is
+       excluded from the count: it is a preview that pin-absorption
+       legitimately drops.
 INV-2  ``history.x`` is one strictly-monotonic grid, row width == len(x),
        one unit at a time.
 INV-3  No constant-clamped rows: ``np.ptp(row) > 0`` for every accumulated
@@ -40,9 +42,16 @@ INV-4  Pinned slice cuts ⊆ history rows; pins and history reset TOGETHER.
 A violation raises :class:`InvariantViolation` carrying the full numbered
 event trace, so a failure names the exact step sequence — the substrate the
 future V6 fuzzer shrinks on.  The allowed-reset causes are named with the V2
-lifecycle-cause vocabulary (``CLEAR`` / ``INCOMPATIBLE_GRID`` / ``REINTEGRATE``
-/ ``NORM_CHANGE``) so V2's single AccumulatorLifecycle owner can adopt this
+lifecycle-cause vocabulary (``CLEAR`` / ``INCOMPATIBLE_GRID`` /
+``REINTEGRATE``) so V2's single AccumulatorLifecycle owner can adopt this
 harness's cause accounting unchanged.
+
+FOR V2 (cause-vocabulary history): ``NORM_CHANGE`` was RETIRED at V1 Stage 4
+— since the canonical-grid flip the accumulator stores acquisition-native
+rows and the norm divides at draw, so a REAL channel change re-renders with
+the new scaling and never resets (S-16 dissolved); it must NOT return as an
+allowed reset cause and needs no lifecycle enum member.  ``SAME_NAME_RERUN``
+joins the vocabulary when V2's AccumulatorLifecycle owner lands.
 
 NOT a test module — import it: ``from tests.xdart.ov_harness import OVHarness``.
 """
@@ -72,12 +81,12 @@ from xdart.gui.tabs.static_scan.display_publication import (
 )
 
 # V2 lifecycle-cause names (design §5 V2): the only causes allowed to shrink
-# the accumulator.  SAME_NAME_RERUN arrives with V2; the harness models the
-# four causes the current code exercises.
+# the accumulator.  SAME_NAME_RERUN arrives with V2; NORM_CHANGE was retired
+# at V1 Stage 4 (see the module docstring); the harness models the three
+# causes the current code exercises.
 CLEAR = "CLEAR"
 INCOMPATIBLE_GRID = "INCOMPATIBLE_GRID"
 REINTEGRATE = "REINTEGRATE"
-NORM_CHANGE = "NORM_CHANGE"
 
 
 class InvariantViolation(AssertionError):
@@ -367,7 +376,7 @@ class OVHarness:
         """Arm ONE allowed-reset window (ledger causes only).  The next count
         decrease consumes it; an unconsumed window is reported by
         :meth:`assert_reset_observed`."""
-        assert cause in (CLEAR, INCOMPATIBLE_GRID, REINTEGRATE, NORM_CHANGE), (
+        assert cause in (CLEAR, INCOMPATIBLE_GRID, REINTEGRATE), (
             f"not a ledger-allowed reset cause: {cause!r}")
         self._pending_reset = cause
 
@@ -515,16 +524,17 @@ class OVHarness:
         return self._step(f"image_unit_toggle(→ {ui.imageUnit._text})")
 
     def norm_change(self, *, real, channel=None):
-        """Normalization event.  ``real=True`` switches the channel — the ONE
-        norm event allowed to reset (S-16).  ``real=False`` is the repaint
-        echo (refresh_norm_channels re-applying the same channel) — never a
-        reset."""
+        """Normalization event.  ``real=True`` switches the channel — since
+        V1 Stage 4 a pure re-render: the accumulator is PRESERVED and every
+        row re-scales at draw under the new channel (S-16 dissolved;
+        NORM_CHANGE is retired as a reset cause, so INV-1 now enforces
+        no-shrink across it).  ``real=False`` is the repaint echo
+        (refresh_norm_channels re-applying the same channel)."""
         if real:
             previous = self._norm["channel"]
             if channel is None:
                 channel = "i1" if previous != "i1" else "i0"
             self._norm["channel"] = channel
-            self.expect_reset(NORM_CHANGE)
             return self._step(
                 f"norm_change(real=True, {previous!r} → {channel!r})")
         return self._step("norm_change(real=False)")
