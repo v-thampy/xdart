@@ -615,6 +615,8 @@ class imageThread(wranglerThread):
         self._append_skip_without_reading = 0
         self._discovered_frame_count = 0
         self._skip_reason_counts = Counter()
+        self.files_processed_by_output = {}
+        self._last_files_processed_by_output = {}
 
     # ── Display helpers ──────────────────────────────────────────────────
 
@@ -680,6 +682,8 @@ class imageThread(wranglerThread):
         self._append_skip_without_reading = 0
         self._discovered_frame_count = 0
         self._skip_reason_counts = Counter()
+        self.files_processed_by_output = {}
+        self._last_files_processed_by_output = {}
         # Per-run perf accumulators -> [PERF-SUMMARY] at end of run.  Breaks the
         # worker time into consumer read(queue-wait)/integrate/write + the actual
         # background prefetch I/O, so ONE run shows the bottleneck (read vs
@@ -1127,6 +1131,21 @@ class imageThread(wranglerThread):
         """
         scan = None
         files_processed = 0
+        files_processed_by_output = Counter()
+
+        def record_processed(scan_obj, count):
+            nonlocal files_processed
+            count = int(count or 0)
+            files_processed += count
+            output = getattr(scan_obj, "data_file", None)
+            if count > 0 and output:
+                try:
+                    key = os.path.normcase(os.path.abspath(os.fspath(output)))
+                except (TypeError, ValueError):
+                    logger.debug("invalid processed output path: %r", output)
+                else:
+                    files_processed_by_output[key] += count
+
         _cached_poni = None
         is_eiger = _is_eiger_master(self.img_file) if self.img_file else False
         # One-time visibility into which execution path this run takes (so the
@@ -1227,9 +1246,10 @@ class imageThread(wranglerThread):
             # got data.
             if (scan is None) or (scan_name != scan.name):
                 if pending:
-                    files_processed += self._dispatch_batch(
+                    dispatched = self._dispatch_batch(
                         scan, pending, force_save=True,
                     )
+                    record_processed(scan, dispatched)
                     pending = []
                     pending_avg_count = 0
                 # Catch the case where pending was already drained by
@@ -1300,7 +1320,7 @@ class imageThread(wranglerThread):
                     )
                 _t_disp = time.time()
                 dispatched = self._dispatch_batch(scan, pending)
-                files_processed += dispatched
+                record_processed(scan, dispatched)
                 _disp_dt = time.time() - _t_disp
                 _perf = getattr(self, '_perf', None)
                 if _perf is not None:
@@ -1323,7 +1343,7 @@ class imageThread(wranglerThread):
             dispatched = self._dispatch_batch(
                 scan, pending, force_save=True,
             )
-            files_processed += dispatched
+            record_processed(scan, dispatched)
             pending_avg_count = 0
             _disp_dt = time.time() - _t_disp
             _perf = getattr(self, '_perf', None)
@@ -1401,7 +1421,7 @@ class imageThread(wranglerThread):
                 # _process_one uses add_frame(batch_save=True), so the
                 # disk save still rides on _frames_since_save below.
                 self._process_one(scan, img_file, img_number, img_data, img_meta, bg_raw)
-                files_processed += 1
+                record_processed(scan, 1)
                 self._frames_since_save += 1
                 if self.xye_only:
                     # No .nxs save in this mode -- drain the XYE buffer per
@@ -1418,6 +1438,8 @@ class imageThread(wranglerThread):
         # In batch mode, emit a single final signal so the GUI can refresh
         self.files_processed = files_processed
         self._last_files_processed = files_processed
+        self.files_processed_by_output = dict(files_processed_by_output)
+        self._last_files_processed_by_output = dict(files_processed_by_output)
         if self.batch_mode and files_processed > 0:
             self.sigUpdate.emit(-1)
         report_skip_summary = getattr(self, "_report_run_skip_summary", None)

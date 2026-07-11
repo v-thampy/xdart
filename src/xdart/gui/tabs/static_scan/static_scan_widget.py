@@ -54,6 +54,42 @@ def _runend_waterfall_history_fields(displayframe) -> dict:
     }
 
 
+def _processed_count_for_output(thread, output_file, run_total):
+    """Return the processed count scoped to ``output_file`` when available."""
+    counts = None
+    for attr in ("files_processed_by_output",
+                 "_last_files_processed_by_output"):
+        value = getattr(thread, attr, None)
+        if value is not None:
+            counts = value
+            break
+    if counts is None:
+        return run_total
+    try:
+        target = os.path.normcase(os.path.abspath(os.fspath(output_file)))
+    except (TypeError, ValueError):
+        return None
+    try:
+        items = counts.items()
+    except AttributeError:
+        logger.debug("invalid files_processed_by_output value: %r", counts)
+        return None
+    for path, value in items:
+        try:
+            key = os.path.normcase(os.path.abspath(os.fspath(path)))
+        except (TypeError, ValueError):
+            continue
+        if key != target:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            logger.debug("invalid per-output processed count: %r", value)
+            return None
+    logger.debug("no processed count recorded for output %s", output_file)
+    return None
+
+
 def _runend_callsite() -> str | None:
     if not browse_debug_enabled():
         return None
@@ -6896,11 +6932,17 @@ class staticWidget(QWidget):
                 and getattr(self, '_run_saw_frame', True)):
             written = (getattr(self.wrangler.thread, 'fname', None)
                        or getattr(self.wrangler, 'fname', None))
+            output_processed_count = _processed_count_for_output(
+                thread,
+                written,
+                processed_count,
+            )
             browse_debug_log(
                 logger,
                 "runend_wrangler_before_live_reconcile",
                 written_file=written,
                 processed_count=processed_count,
+                output_processed_count=output_processed_count,
                 **_runend_waterfall_history_fields(
                     getattr(self, "displayframe", None)),
             )
@@ -6911,14 +6953,16 @@ class staticWidget(QWidget):
                 written_file=written,
                 indexed=indexed,
                 processed_count=processed_count,
+                output_processed_count=output_processed_count,
                 **_runend_waterfall_history_fields(
                     getattr(self, "displayframe", None)),
             )
-            if processed_count is not None and indexed < processed_count:
+            if (output_processed_count is not None
+                    and indexed < output_processed_count):
                 logger.warning(
                     "post-live indexed fewer frames than processed: "
                     "indexed=%d processed=%d file=%s",
-                    indexed, processed_count, written,
+                    indexed, output_processed_count, written,
                 )
             if indexed:
                 self._apply_integration_control_state()

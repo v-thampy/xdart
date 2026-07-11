@@ -148,14 +148,31 @@ def test_nonbatch_run_that_saw_frames_does_not_reload(tmp_path):
 
 
 def test_post_live_warns_when_indexed_less_than_processed(tmp_path, caplog):
-    host, _h5viewer, _nxs, _calls = _finish_host(
+    host, _h5viewer, nxs, _calls = _finish_host(
         tmp_path, batch=False, saw_frame=True)
     host.wrangler.thread.files_processed = 5
+    host.wrangler.thread.files_processed_by_output = {nxs: 5}
 
     with caplog.at_level(logging.WARNING):
         host.wrangler_finished()
 
     assert "indexed fewer frames than processed" in caplog.text
+
+
+def test_post_live_uses_final_output_count_for_multi_scan_run(tmp_path, caplog):
+    """A directory run total must not be compared with its final one-frame file."""
+    host, _h5viewer, nxs, _calls = _finish_host(
+        tmp_path, batch=False, saw_frame=True, indexed_count=1)
+    host.wrangler.thread.files_processed = 6
+    host.wrangler.thread.files_processed_by_output = {
+        str(tmp_path / "prior_scan.nxs"): 5,
+        nxs: 1,
+    }
+
+    with caplog.at_level(logging.WARNING):
+        host.wrangler_finished()
+
+    assert "indexed fewer frames than processed" not in caplog.text
 
 
 def test_batch_finish_skips_reload_while_reintegrate_running(tmp_path):

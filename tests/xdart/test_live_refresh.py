@@ -9127,9 +9127,9 @@ def test_batch_process_scan_dispatches_each_frame_as_read():
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
 
     queue = [
-        ("/tmp/scan_0001.tif", "scan", 1, np.ones((2, 2)), {"i0": 1.0}),
-        ("/tmp/scan_0002.tif", "scan", 2, np.ones((2, 2)), {"i0": 2.0}),
-        ("/tmp/scan_0003.tif", "scan", 3, np.ones((2, 2)), {"i0": 3.0}),
+        ("/tmp/scan_a_0001.tif", "scan_a", 1, np.ones((2, 2)), {"i0": 1.0}),
+        ("/tmp/scan_a_0002.tif", "scan_a", 2, np.ones((2, 2)), {"i0": 2.0}),
+        ("/tmp/scan_b_0000.tif", "scan_b", 0, np.ones((2, 2)), {"i0": 3.0}),
     ]
     dispatched = []
     final_updates = []
@@ -9141,10 +9141,10 @@ def test_batch_process_scan_dispatches_each_frame_as_read():
 
     def make_scan():
         return SimpleNamespace(
-            name="scan",
+            name=host.scan_name,
             frames=SimpleNamespace(index=[]),
             skip_2d=False,
-            data_file="/tmp/out.nxs",
+            data_file=f"/tmp/{host.scan_name}.nxs",
         )
 
     host = SimpleNamespace(
@@ -9153,9 +9153,9 @@ def test_batch_process_scan_dispatches_each_frame_as_read():
         live_mode=False,
         single_img=False,
         xye_only=False,
-        img_file="/tmp/scan_0001.tif",
+        img_file="/tmp/scan_a_0001.tif",
         poni=None,
-        scan_name="scan",
+        scan_name="scan_a",
         _frames_since_save=0,
         _active_scan=None,
         _perf=None,
@@ -9184,8 +9184,13 @@ def test_batch_process_scan_dispatches_each_frame_as_read():
 
     MethodType(imageThread.process_scan, host)()
 
-    assert dispatched == [((1,), False), ((2,), False), ((3,), False)]
+    assert dispatched == [((1,), False), ((2,), False), ((0,), False)]
     assert final_updates == [-1]
+    assert host.files_processed == 3
+    assert host.files_processed_by_output == {
+        "/tmp/scan_a.nxs": 2,
+        "/tmp/scan_b.nxs": 1,
+    }
 
 
 def test_batch_single_frame_still_routes_to_streaming_when_live_policy_serial():
