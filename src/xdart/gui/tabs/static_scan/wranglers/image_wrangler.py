@@ -192,11 +192,10 @@ params = [
 ctr = 1
 
 
-# Default-select order for the GI incidence motor (case-insensitive); the FIRST
-# that exists in the scan's motor keys wins, else the first available, else
-# Manual.  Keep in sync with integrator._GI_MOTOR_PREFERENCE so the wrangler's
-# th_motor param and the integrator's gi_motor combo auto-pick the same motor.
-_GI_MOTOR_PREFERENCE = ('th', 'eta', 'theta', 'gonth', 'halpha')
+# The GI incidence-motor SHOW-all + default-select policy is shared with the
+# integrator combo so the wrangler's th_motor param and the integrator's
+# gi_motor combo never disagree (see gi_motor_defaults.pick_default_gi_motor).
+from ..gi_motor_defaults import pick_default_gi_motor
 
 # HDF5 container extensions that may embed their own scan metadata (Bluesky/
 # NXWriter).  Only these are probed for embedded motors/counters; every other
@@ -2319,12 +2318,10 @@ class imageWrangler(wranglerWidget):
         metadata — Manual is the default, since there's no ``th`` to read.
         """
         pars = [p for p in self.motors if not any(x.lower() in p.lower() for x in ['ROI', 'PD'])]
-        # Default-select by preference order (case-insensitive); else the first
-        # available motor; else Manual (no metadata, e.g. Eiger).  Matches the
-        # integrator's gi_motor combo so the two never disagree on the auto-pick.
-        _lower = {p.lower(): p for p in pars}
-        value = next((_lower[p] for p in _GI_MOTOR_PREFERENCE if p in _lower),
-                     pars[0] if pars else 'Manual')
+        # Default-select by the shared policy: named preference (th/eta/halpha/
+        # gonth/theta) if present, else a rotation-sounding motor, else Manual.
+        # Matches the integrator's gi_motor combo so the two never disagree.
+        value = pick_default_gi_motor(pars)
 
         pars = ['Manual'] + pars
 
@@ -2393,15 +2390,19 @@ class imageWrangler(wranglerWidget):
         try:
             import h5py
             from xrd_tools.io.bluesky_nexus import (
+                bluesky_all_motor_names,
                 bluesky_counters,
-                bluesky_motor_names,
                 is_bluesky_nxwriter,
                 resolve_nxentry,
             )
             with h5py.File(img_file, 'r') as h5:
                 entry = resolve_nxentry(h5)
                 if entry is not None and is_bluesky_nxwriter(entry):
-                    motors = list(bluesky_motor_names(entry))
+                    # ALL motors (scanned + baseline-fixed), so the GI θ-motor
+                    # dropdown offers every real motor of the file — beamlines use
+                    # oddly-named incidence axes; the default-pick chooses among
+                    # them (see set_gi_motor_options / pick_default_gi_motor).
+                    motors = list(bluesky_all_motor_names(entry))
                     counters = list(bluesky_counters(entry).keys())
                     result = (motors, counters)
         except Exception:

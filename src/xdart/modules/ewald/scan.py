@@ -214,6 +214,15 @@ class LiveScan:
             self.detector_shape = None
             self.reduction_config = {}
             self._display_reduction_config = {}
+            # GI config is per-file identity, like reduction_config above: a full
+            # load (replace=True -> reset) must NOT inherit the previous file's
+            # saved GI settings.  Without this, the single reused LiveScan carries
+            # a stale gi_config (e.g. incidence_motor='th' from an earlier scan /
+            # the scratch default) across loads, and integrator.hydrate_from_scan
+            # re-injects that dead motor into the θ-motor dropdown AFTER the new
+            # source scoped it to its real motors.  Cleared here, then re-read
+            # from disk at _load_from_nexus_v2 only if the file carries one.
+            self.gi_config = {}
             self._clear_persisted_wavelength()
             # Calibration is per-file identity, like the fields above — a full
             # load (replace=True -> reset) of a DIFFERENT file must not inherit

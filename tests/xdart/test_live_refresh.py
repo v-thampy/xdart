@@ -2371,10 +2371,11 @@ def test_gi_motor_options_default_manual_when_no_metadata():
 
 
 def test_gi_motor_options_default_select_follows_preference_order():
-    """The GI incidence motor default-selects by preference order
-    (th, eta, theta, gonth, halpha; case-insensitive): the first present wins,
-    else the first available motor, else Manual.  ALL motor columns are offered
-    so a non-default motor is still pickable."""
+    """The GI incidence motor default-selects by the shared policy: the first
+    present of the named preference (th, eta, halpha, gonth, theta;
+    case-insensitive) wins, else the first motor whose name sounds like a
+    rotation axis, else Manual.  ALL motor columns are offered so a non-default
+    motor is still pickable."""
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
 
     class _P:
@@ -2415,9 +2416,14 @@ def test_gi_motor_options_default_select_follows_preference_order():
     value, _ = _select(["i0", "TH", "eta"])
     assert value == "TH"
 
-    # No preferred motor present -> first available motor (still pickable list).
+    # No named preference present -> the first ROTATION-sounding motor wins over a
+    # non-rotation one (chi is an axis; mu is not in the hint set).
     value, _ = _select(["mu", "chi"])
-    assert value == "mu"
+    assert value == "chi"
+
+    # Nothing looks like a rotation axis -> Manual (never a translation stage).
+    value, _ = _select(["detx", "dety"])
+    assert value == "Manual"
 
 
 def test_get_img_fname_clears_motors_when_source_switch_resolves_no_file():

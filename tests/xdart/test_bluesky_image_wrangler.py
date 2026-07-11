@@ -165,16 +165,17 @@ def test_gui_bluesky_populates_gi_motor_and_norm(bluesky_file):
     assert "hy" in values
     assert "Manual" in values
     assert "th" not in values
-    # Exactly one motor -> default the selection to it (leaves Manual available).
-    assert th_motor.value() == "hy"
-    assert holder.incidence_motor == "hy"
+    # 'hy' is a HEIGHT motor, not a named preference nor a rotation-sounding axis,
+    # so the default is Manual (the user enters the incidence angle) rather than
+    # silently treating a translation stage as the incidence motor.
+    assert th_motor.value() == "Manual"
 
     # Counters become Normalize options.
     norm_values = list(root.child("BG").child("norm_channel").opts["limits"])
     for counter in ("i0", "i1", "i2", "pd"):
         assert counter in norm_values
 
-    # The integrator's GI-motor combo receives the motor list too.
+    # The integrator's GI-motor combo still receives the file's real motor list.
     assert holder.sigGIMotorOptions.emitted == [(["hy"],)]
 
 
@@ -194,6 +195,33 @@ def test_gui_fixed_incidence_motor_in_options(fixed_incidence_file):
     # halpha is in the GI-motor preference order -> auto-selected as incidence.
     assert th_motor.value() == "halpha"
     assert holder.incidence_motor == "halpha"
+
+
+def test_gui_gi_dropdown_lists_all_motors(baseline_only_file):
+    """The GI θ-motor dropdown offers EVERY real motor (scanned + baseline-fixed),
+    not just the scanned one — beamlines use oddly-named incidence axes — and
+    default-selects the named-preference motor (halpha)."""
+    holder, root = _wrangler_holder()
+    _select_image_file(holder, root, baseline_only_file)
+
+    th_motor = root.child("GI").child("th_motor")
+    values = list(th_motor.opts["limits"])
+    # All three real motors of the file (halpha scanned; detx/sbsx baseline-fixed)
+    # plus Manual — and NOT the legacy hardcoded 'th'.
+    for motor in ("halpha", "detx", "sbsx"):
+        assert motor in values
+    assert "Manual" in values
+    assert "th" not in values
+    # No scaler / EpicsMotor field-spray leaks in as a "motor".
+    assert "i0" not in values
+    assert not any(v.startswith(("detx_", "sbsx_")) for v in values)
+    # halpha is the named-preference incidence axis -> the default selection.
+    assert th_motor.value() == "halpha"
+    assert holder.incidence_motor == "halpha"
+    # The integrator combo receives the same full motor list.
+    assert holder.sigGIMotorOptions.emitted
+    emitted_motors = holder.sigGIMotorOptions.emitted[-1][0]
+    assert set(emitted_motors) == {"halpha", "detx", "sbsx"}
 
 
 def test_thread_fixed_incidence_constant_across_frames(fixed_incidence_file):
@@ -345,9 +373,11 @@ real_data = pytest.mark.skipif(
 def test_real_gui_motor_options():
     holder, root = _wrangler_holder()
     _select_image_file(holder, root, _REAL)
-    values = list(root.child("GI").child("th_motor").opts["limits"])
+    th_motor = root.child("GI").child("th_motor")
+    values = list(th_motor.opts["limits"])
     assert "hy" in values and "Manual" in values and "th" not in values
-    assert holder.incidence_motor == "hy"
+    # 'hy' (height) is neither a named preference nor rotation-sounding -> Manual.
+    assert th_motor.value() == "Manual"
     norm_values = list(root.child("BG").child("norm_channel").opts["limits"])
     assert {"i0", "i1", "i2", "pd"} <= set(norm_values)
 

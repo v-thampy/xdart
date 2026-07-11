@@ -31,6 +31,7 @@ from pyqtgraph.parametertree import Parameter
 # This module imports
 from .ui.integratorUI import Ui_Form
 
+from .gi_motor_defaults import GI_MOTOR_PREFERENCE, pick_default_gi_motor
 from .scan_threads import integratorThread
 from xdart.utils.session import save_session, load_session
 
@@ -1454,10 +1455,9 @@ class integratorTree(QtWidgets.QWidget):
         if not self.integrator_thread.isRunning():
             self.integrator_thread.start()
 
-    # Default-select order for the GI incidence motor when the current selection
-    # isn't in the loaded scan's motor list (case-insensitive).  Keep in sync
-    # with image_wrangler._GI_MOTOR_PREFERENCE (the wrangler th_motor default).
-    _GI_MOTOR_PREFERENCE = ('th', 'eta', 'theta', 'gonth', 'halpha')
+    # Default-select policy for the GI incidence motor, shared with the wrangler
+    # th_motor default so the two dropdowns never disagree (see gi_motor_defaults).
+    _GI_MOTOR_PREFERENCE = GI_MOTOR_PREFERENCE
 
     def set_gi_motor_options(self, motors):
         """Populate the GI motor dropdown from the active wrangler's available
@@ -1477,16 +1477,14 @@ class integratorTree(QtWidgets.QWidget):
         #     (F3).  The initial *default* 'Manual' is not deliberate, so it
         #     falls through to the preference order below (auto-select th).
         #  2. Otherwise keep a still-present real motor the user already has.
-        #  3. Else default by _GI_MOTOR_PREFERENCE, then first motor, then Manual.
-        lower = {m.lower(): m for m in motors}
+        #  3. Else the shared default policy: named preference (th/eta/halpha/
+        #     gonth/theta) if present, else a rotation-sounding motor, else Manual.
         if getattr(self, '_gi_motor_user_choice', None) == 'Manual':
             target = 'Manual'
         elif current in motors and current != 'Manual':
             target = current
         else:
-            target = next((lower[p] for p in self._GI_MOTOR_PREFERENCE
-                           if p in lower),
-                          motors[0] if motors else 'Manual')
+            target = pick_default_gi_motor(motors)
         idx = self.ui.gi_motor.findText(target)
         if idx >= 0:
             self.ui.gi_motor.setCurrentIndex(idx)
