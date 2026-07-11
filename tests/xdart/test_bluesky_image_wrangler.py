@@ -355,6 +355,51 @@ def test_thread_scan_info_carries_fixed_motors_and_counting_time(baseline_only_f
     assert not any(k.startswith(("detx_", "sbsx_")) for k in si0)
 
 
+# ---------------------------------------------------------------------------
+# Image DIRECTORY mode over a folder of Bluesky .nxs masters (bl17-2 closed
+# loop): each .nxs is a self-contained master, discovered + processed like a
+# directory of Eiger masters.  Pins that .nxs rides the master path — discovery,
+# the append-skip cursor, and the seed's GI motor columns.
+# ---------------------------------------------------------------------------
+
+def test_directory_of_nxs_masters(tmp_path):
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
+        _paths_with_suffix, imageThread)
+
+    d = tmp_path / "series"
+    d.mkdir()
+    stems = ["pos0_scan0001", "pos0_scan0002", "pos0_scan0003"]
+    for stem in stems:
+        _write_bluesky_nxwriter(d / f"{stem}.nxs")
+
+    # Discovery: the same '.nxs' suffix glob the read path uses
+    # (_eiger_refill_master_queue) finds every master.
+    found = sorted(p.name for p in _paths_with_suffix(d, ".nxs"))
+    assert found == [f"{s}.nxs" for s in stems]
+
+    # Append-skip priming enumerates each .nxs as its OWN output scan (regression:
+    # this branch used to exclude '.nxs', so append re-runs re-read every frame).
+    t = imageThread.__new__(imageThread)
+    t.write_mode = "Append"
+    t.xye_only = False
+    t.inp_type = "Image Directory"
+    t.img_dir = str(d)
+    t.img_ext = "nxs"
+    t.img_file = str(d / "pos0_scan0001.nxs")
+    t.file_filter = ""
+    t.include_subdir = False
+    assert sorted(t._append_run_start_scan_names()) == stems
+
+    # The seed (first .nxs) yields the GI motor + counter columns that populate
+    # the θ-motor / Normalize dropdowns in directory mode.
+    holder, _root = _wrangler_holder()
+    cols = holder._read_bluesky_source_columns(str(d / "pos0_scan0001.nxs"))
+    assert cols is not None
+    motors, counters = cols
+    assert "hy" in motors
+    assert {"i0", "i1", "i2", "pd"} <= set(counters)
+
+
 # ===========================================================================
 # Real-file assertions (shipped Pt_10nm_00013.nxs; skip without test data)
 # ===========================================================================

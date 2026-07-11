@@ -934,15 +934,21 @@ class imageThread(wranglerThread):
             match = _name_filter(getattr(self, "file_filter", ""))
             root = Path(img_dir)
             include_subdir = bool(getattr(self, "include_subdir", False))
-            if img_ext in ('h5', 'hdf5'):
-                suffix = f'_master.{img_ext}'
+            if img_ext in ('h5', 'hdf5', 'nxs'):
+                # Self-contained masters — one output scan per file.  An Eiger
+                # master carries a '_master' infix; a Bluesky/NXWriter '.nxs'
+                # does not.  Mirror the read path's suffix rule exactly
+                # (_eiger_refill_master_queue) so the append-skip cursor matches
+                # the files the run actually discovers + the scan names it writes.
+                suffix = (f'_master.{img_ext}'
+                          if img_ext in ('h5', 'hdf5') else f'.{img_ext}')
                 candidates = _paths_with_suffix(
                     root, suffix, recursive=include_subdir)
                 for path in natural_sort_ints([str(p) for p in candidates]):
                     p = Path(path)
                     if match(p.name[:-len(suffix)]):
                         add(self._eiger_scan_name(p))
-            elif img_ext and img_ext not in ('nxs',):
+            elif img_ext:
                 suffix = f'.{img_ext}'
                 candidates = _paths_with_suffix(
                     root, suffix, recursive=include_subdir)
