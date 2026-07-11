@@ -597,6 +597,9 @@ class imageThread(wranglerThread):
         self._eiger_h5_dataset = None    # dataset reference inside the open file
         self._eiger_fabio_handle = None  # persistent fabio.EigerImage fallback
         self._eiger_metadata_cache = {}  # master metadata is stable across frames
+        # Bluesky/NXWriter embedded per-frame table + wavelength, per master
+        # (see _bluesky_source_for) — caches None for non-Bluesky masters too.
+        self._bluesky_source_cache = {}
         # Background prefetch state (populated on demand)
         self._prefetch_queue = None      # queue.Queue of frame tuples or None sentinel
         self._prefetch_thread = None     # threading.Thread running the reader
@@ -661,6 +664,7 @@ class imageThread(wranglerThread):
         self._eiger_master_queue.clear()
         self._eiger_done_masters.clear()
         self._eiger_metadata_cache.clear()
+        self._bluesky_source_cache.clear()
         # Start each run with an empty producer->consumer display slot so a frame
         # the GUI never popped (a missed/raced consume, or a frame published after
         # the final flush) can't leak a whole LiveFrame (~18 MB raw) into the next
@@ -2861,6 +2865,132 @@ class imageThread(wranglerThread):
             )
         return dict(self._eiger_metadata_cache[key])
 
+    # ── Bluesky/NXWriter embedded per-frame metadata ─────────────────────
+    #
+    # A Bluesky (apstools ``NXWriter``) ``.nxs`` image stack carries its scan
+    # motors + counters PER FRAME inside the HDF5 tree (``entry/data/<name>``)
+    # rather than in a sidecar.  These helpers surface that table so each frame's
+    # ``scan_info`` gets the real motor/counter values — the GI incidence angle
+    # then resolves from the file's motor, the counters normalize, and the
+    # written output carries them.  Every path is guarded so a non-Bluesky source
+    # (Eiger master, plain NeXus, TIFF series, SPEC sidecar) is untouched.
+
+    def _bluesky_source_for(self, master_path):
+        """Read + cache a Bluesky/NXWriter source's per-frame table + wavelength.
+
+        Returns ``{'table': {col: np.ndarray}, 'constants': {motor: float},
+        'wavelength_A': float | None}`` for a Bluesky ``.nxs`` master, else
+        ``None`` (``constants`` holds FIXED-motor values broadcast per frame).
+        Read once per master and cached (including the ``None`` for a non-Bluesky
+        source), so a plain Eiger master or a non-``.nxs`` source keeps the
+        sidecar path unchanged and never re-opens the file per frame."""
+        if not master_path:
+            return None
+        cache = getattr(self, '_bluesky_source_cache', None)
+        if cache is None:
+            cache = self._bluesky_source_cache = {}
+        key = os.path.abspath(str(master_path))
+        if key in cache:
+            return cache[key]
+        info = None
+        try:
+            if Path(master_path).suffix.lower() in ('.nxs', '.h5', '.hdf5'):
+                import h5py
+                from xrd_tools.io.bluesky_nexus import (
+                    bluesky_fixed_motor_values,
+                    bluesky_per_frame_table,
+                    bluesky_wavelength,
+                    is_bluesky_nxwriter,
+                    resolve_nxentry,
+                )
+                with h5py.File(master_path, 'r') as h5:
+                    entry = resolve_nxentry(h5)
+                    if entry is not None and is_bluesky_nxwriter(entry):
+                        table = {
+                            k: np.asarray(v)
+                            for k, v in bluesky_per_frame_table(entry).items()
+                        }
+                        # A FIXED GI incidence motor (halpha held constant) is
+                        # not a per-frame entry/data column — its value lives in
+                        # the baseline stream / positioners.  Broadcast it across
+                        # every frame so incidence resolves whether the motor was
+                        # scanned OR fixed.
+                        constants = bluesky_fixed_motor_values(
+                            entry, exclude=table.keys())
+                        wl = bluesky_wavelength(entry)
+                        info = {
+                            'table': table,
+                            'constants': constants,
+                            'wavelength_A': (
+                                float(wl) if np.isfinite(wl) else None),
+                        }
+        except Exception:
+            logger.debug("Bluesky source read failed for %s",
+                         master_path, exc_info=True)
+            info = None
+        cache[key] = info
+        return info
+
+    def _bluesky_frame_row(self, master_path, frame_idx):
+        """Per-frame motor + counter values for a Bluesky ``.nxs`` frame.
+
+        Returns ``{col: float}`` sliced from the embedded per-frame table
+        (motors + counters + ``EPOCH``) at the 0-based *frame_idx*, or ``{}``
+        when the master is not a Bluesky file / the index is out of range."""
+        info = self._bluesky_source_for(master_path)
+        if not info:
+            return {}
+        row = {}
+        for col, arr in info['table'].items():
+            try:
+                if 0 <= frame_idx < len(arr):
+                    row[col] = float(arr[frame_idx])
+            except (TypeError, ValueError, IndexError):
+                continue
+        # Fixed motors (e.g. a constant GI incidence angle) broadcast the same
+        # value to every frame; setdefault so a scanned column always wins.
+        for col, val in info.get('constants', {}).items():
+            row.setdefault(col, float(val))
+        return row
+
+    def _frame_scan_info(self, master_path, frame_idx):
+        """The frame's ``scan_info``: the sidecar/scalar metadata (unchanged)
+        overlaid with the Bluesky per-frame motor + counter row when the master
+        is a Bluesky ``.nxs``.  For any other source this is exactly
+        :meth:`_read_eiger_metadata` (frame_idx ignored)."""
+        base = self._read_eiger_metadata(master_path)
+        row = self._bluesky_frame_row(master_path, frame_idx)
+        if row:
+            base.update(row)
+        return base
+
+    def _stamp_bluesky_wavelength(self, scan):
+        """Record a Bluesky/NXWriter source's embedded wavelength on *scan* as a
+        LOW-precedence provenance fallback (metres), so the processed output —
+        and the run-end reload — carries a real wavelength instead of NaN.
+
+        The PONI-derived integrator wavelength still wins for geometry (see
+        nexus_writer._write_instrument's precedence order); this only fills
+        ``mg_args`` when it still holds the constructor sentinel / no real value,
+        so a PONI-supplied wavelength is never overridden.  Guarded: a
+        non-Bluesky source or any read failure is a silent no-op."""
+        try:
+            info = self._bluesky_source_for(getattr(self, 'img_file', None))
+            if not info:
+                return
+            wl_A = info.get('wavelength_A')
+            if wl_A is None or not np.isfinite(wl_A) or wl_A <= 0:
+                return
+            mg = getattr(scan, 'mg_args', None)
+            if not isinstance(mg, dict):
+                return
+            from xdart.modules.wavelength import is_default_wavelength_sentinel_m
+            cur = mg.get('wavelength')
+            if cur is None or is_default_wavelength_sentinel_m(cur):
+                mg['wavelength'] = float(wl_A) * 1e-10
+        except Exception:
+            logger.debug("Bluesky wavelength stamp skipped", exc_info=True)
+
     @staticmethod
     def _eiger_scan_name(master_path):
         master_stem = Path(master_path).stem
@@ -3020,7 +3150,6 @@ class imageThread(wranglerThread):
                     if not to_read:
                         continue
 
-                    meta = self._read_eiger_metadata(self._eiger_master_path)
                     groups = []
                     for frame_idx in to_read:
                         if not groups or frame_idx != groups[-1][1]:
@@ -3067,7 +3196,12 @@ class imageThread(wranglerThread):
                                 scan_name,
                                 frame_idx + 1,   # 1-based img_number
                                 block[offset],
-                                meta,
+                                # Per-frame scan_info: the sidecar/scalar
+                                # metadata overlaid with the Bluesky per-frame
+                                # motor + counter row (so each frame carries its
+                                # own hy/i0.. values, not a shared master dict).
+                                self._frame_scan_info(
+                                    self._eiger_master_path, frame_idx),
                             )
                             if not self._push_frame_to_queue(item):
                                 return
@@ -3263,7 +3397,7 @@ class imageThread(wranglerThread):
                 self._record_skip_reason("unreadable or empty image data")
                 continue
 
-            meta = self._read_eiger_metadata(self._eiger_master_path)
+            meta = self._frame_scan_info(self._eiger_master_path, frame_idx)
 
             return self._eiger_master_path, scan_name, img_number, img_data, meta
 
@@ -3516,6 +3650,11 @@ class imageThread(wranglerThread):
         # incidence ← the resolved sample-tilt motor).  Override later from the
         # geometry UI panel when the user picks a different convention.
         scan.default_geometry()
+        # Bluesky/NXWriter source: stamp the embedded wavelength as a low-
+        # precedence provenance fallback so the processed output (and its
+        # run-end reload) has a real wavelength instead of NaN.  No-op for any
+        # other source; PONI geometry still wins (see _stamp_bluesky_wavelength).
+        self._stamp_bluesky_wavelength(scan)
 
         write_mode = self.write_mode
         if not os.path.exists(fname):

@@ -198,6 +198,12 @@ ctr = 1
 # th_motor param and the integrator's gi_motor combo auto-pick the same motor.
 _GI_MOTOR_PREFERENCE = ('th', 'eta', 'theta', 'gonth', 'halpha')
 
+# HDF5 container extensions that may embed their own scan metadata (Bluesky/
+# NXWriter).  Only these are probed for embedded motors/counters; every other
+# source (TIFF/EDF/CBF/…) skips the probe entirely, so the sidecar path — and
+# the light-holder tests that bind only the metadata methods — are untouched.
+_EMBEDDED_META_EXTS = ('.nxs', '.h5', '.hdf5')
+
 
 class imageWrangler(wranglerWidget):
     """Widget for integrating detector image files (TIFF/EDF/CBF/Eiger
@@ -347,6 +353,9 @@ class imageWrangler(wranglerWidget):
         self.include_subdir = self.parameters.child('Signal').child('include_subdir').value()
         self.img_ext = self.parameters.child('Signal').child('img_ext').value()
         self._img_dir_probe_cache = (None, None, 0.0)
+        # Cache for the Bluesky/NXWriter embedded-metadata probe (see
+        # _read_bluesky_source_columns): (key, result), key=(path, mtime, size).
+        self._bluesky_cols_cache = None
         self.single_img = True if self.inp_type == 'Single Image' else False
         self.file_filter = self.parameters.child('Signal').child('Filter').value()
         self.series_average = self.parameters.child('Signal').child('series_average').value()
@@ -1988,6 +1997,14 @@ class imageWrangler(wranglerWidget):
             if (self.meta_ext and self.img_file
                     and self.exists_meta_file(self.img_file)):
                 self.set_pars_from_meta()
+            elif (self.img_file
+                  and Path(self.img_file).suffix.lower() in _EMBEDDED_META_EXTS
+                  and self._read_bluesky_source_columns(self.img_file) is not None):
+                # Embedded-metadata source (Bluesky/apstools NXWriter .nxs): no
+                # sidecar, but the motors + counters live in the HDF5 tree.
+                # Drive the SAME option-refresh path as a sidecar — get_scan_
+                # parameters harvests them from the file (see that method).
+                self.set_pars_from_meta()
             else:
                 # No sidecar metadata (e.g. Eiger) OR no file resolved yet (the
                 # source just switched, nothing chosen): clear the previous
@@ -2345,10 +2362,75 @@ class imageWrangler(wranglerWidget):
             th_val.setOpts(visible=False)
             self.incidence_motor = th_motor
 
+    def _read_bluesky_source_columns(self, img_file):
+        """Return ``(motor_names, counter_names)`` when *img_file* is a Bluesky/
+        apstools ``NXWriter`` ``.nxs`` whose scan motors + counters are embedded
+        in the HDF5 tree; ``None`` for any other source.
+
+        The image half of a ``.nxs`` already reads via ``read_image``; this
+        surfaces the embedded metadata the sidecar reader can't see — motors ->
+        the GI Theta-Motor dropdown, counters -> Normalize / BG Match.  Defensive
+        by contract: a non-``.nxs``/``.h5`` extension, a non-Bluesky HDF5 (plain
+        NeXus, xdart-processed, or a bare Eiger master), a locked/corrupt file,
+        or a missing reader all return ``None`` so the historical sidecar path is
+        completely unaffected.  Cached on ``(path, mtime, size)`` so the
+        detection in :meth:`get_img_fname` and the harvest in
+        :meth:`get_scan_parameters` share one open per file selection.
+        """
+        if not img_file:
+            return None
+        if Path(img_file).suffix.lower() not in _EMBEDDED_META_EXTS:
+            return None
+        try:
+            st = os.stat(img_file)
+            key = (os.path.abspath(img_file), st.st_mtime, st.st_size)
+        except OSError:
+            return None
+        cache = getattr(self, '_bluesky_cols_cache', None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        result = None
+        try:
+            import h5py
+            from xrd_tools.io.bluesky_nexus import (
+                bluesky_counters,
+                bluesky_motor_names,
+                is_bluesky_nxwriter,
+                resolve_nxentry,
+            )
+            with h5py.File(img_file, 'r') as h5:
+                entry = resolve_nxentry(h5)
+                if entry is not None and is_bluesky_nxwriter(entry):
+                    motors = list(bluesky_motor_names(entry))
+                    counters = list(bluesky_counters(entry).keys())
+                    result = (motors, counters)
+        except Exception:
+            logger.debug("Bluesky source column read failed for %s",
+                         img_file, exc_info=True)
+            result = None
+        self._bluesky_cols_cache = (key, result)
+        return result
+
     def get_scan_parameters(self):
         """ Reads image metadata to populate matching parameters
         """
         if not self.img_file:
+            return
+        # A Bluesky/apstools NXWriter .nxs embeds its scan motors + counters in
+        # the HDF5 tree (no sidecar).  Harvest them directly so the GI Theta
+        # Motor, Normalize, and BG-Match dropdowns show the file's real columns
+        # (e.g. 'hy', 'i0'..'pd') instead of collapsing to 'th'/'Manual'.
+        # Guarded: a non-Bluesky / unreadable / non-HDF5 source returns None and
+        # the sidecar path below is byte-identical to before.  The extension
+        # fast-path means non-HDF5 sources never invoke the probe at all.
+        bluesky_cols = None
+        if Path(self.img_file).suffix.lower() in _EMBEDDED_META_EXTS:
+            bluesky_cols = self._read_bluesky_source_columns(self.img_file)
+        if bluesky_cols is not None:
+            motors, counters = bluesky_cols
+            self.motors = list(motors)
+            self.counters = list(counters)
+            self.scan_parameters = list(motors) + list(counters)
             return
         if not self.meta_ext:
             # GUI "none"/blank means metadata OFF.  Do not pass Python None to

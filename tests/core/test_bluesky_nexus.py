@@ -242,6 +242,139 @@ def test_plain_nexus_stack_has_no_bluesky_columns(plain_nexus_file):
     assert src.metadata_for(0) == {}
 
 
+# ---------------------------------------------------------------------------
+# FIXED (non-scanned) GI incidence motor: value in positioners + baseline,
+# NOT a per-frame entry/data column (the usual GI acquisition — the incidence
+# angle is held constant while something else, or nothing, is scanned).
+# ---------------------------------------------------------------------------
+
+HALPHA_FIXED = 0.2000  # value_start (the acquisition incidence angle)
+HALPHA_END = 0.2003    # value_end differs slightly -> logged, value_start used
+
+
+def _write_bluesky_fixed_incidence(path: Path, *, n: int = NFRAMES) -> Path:
+    """A Bluesky NXWriter file where ``hy`` is scanned per-frame but the GI
+    incidence motor ``halpha`` is FIXED — recorded ONLY in the baseline stream
+    (``value_start``/``value_end``, with an EpicsMotor field-spray sibling to
+    prove it is filtered) and ``positioners/halpha/value``, never in
+    ``entry/data``."""
+    hy = np.linspace(11.0, 11.6, n).astype(np.float64)
+    with h5py.File(path, "w") as f:
+        f.attrs["creator"] = "NXWriter"
+        entry = f.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+
+        inst = entry.create_group("instrument")
+        inst.attrs["NX_class"] = "NXinstrument"
+        bluesky = inst.create_group("bluesky")
+        bluesky.attrs["NX_class"] = "NXnote"
+        md = bluesky.create_group("metadata")
+        md.create_dataset("motors", data=b"!!python/tuple\n- hy\n")
+        eiger_cfg = md.create_group("configuration/eiger/data")
+        eiger_cfg.create_dataset("eiger_cam_wavelength", data=np.float64(WAVELENGTH))
+
+        # Baseline stream: value_start/value_end scalars per signal.
+        baseline = bluesky.create_group("streams/baseline")
+        h_grp = baseline.create_group("halpha")
+        h_grp.create_dataset("value_start", data=np.float64(HALPHA_FIXED))
+        h_grp.create_dataset("value_end", data=np.float64(HALPHA_END))
+        # EpicsMotor field spray — must NOT be surfaced as a motor.
+        for spray, val in (("halpha_hlm", 5.0), ("halpha_llm", -5.0),
+                           ("halpha_dial", 0.9), ("halpha_user_setpoint", 0.2)):
+            g = baseline.create_group(spray)
+            g.create_dataset("value_start", data=np.float64(val))
+            g.create_dataset("value_end", data=np.float64(val))
+
+        # positioners: BOTH the scanned hy and the fixed halpha are groups here
+        # (the authoritative motor-name source).
+        positioners = inst.create_group("positioners")
+        positioners.attrs["NX_class"] = "NXnote"
+        hy_grp = positioners.create_group("hy")
+        hy_grp.attrs["NX_class"] = "NXpositioner"
+        hy_grp.create_dataset("value", data=hy)
+        ha_grp = positioners.create_group("halpha")
+        ha_grp.attrs["NX_class"] = "NXpositioner"
+        ha_grp.create_dataset("value", data=np.float64(HALPHA_FIXED))
+
+        data = entry.create_group("data")
+        data.attrs["NX_class"] = "NXdata"
+        data.attrs["signal"] = "hy"
+        data.create_dataset("hy", data=hy)          # scanned; halpha is NOT here
+        images = np.arange(
+            n * IMG_SHAPE[0] * IMG_SHAPE[1], dtype=np.uint32
+        ).reshape((n, *IMG_SHAPE))
+        img = data.create_dataset("eiger_image", data=images)
+        img.attrs["signal_type"] = "detector"
+    return path
+
+
+@pytest.fixture
+def fixed_incidence_file(tmp_path) -> Path:
+    return _write_bluesky_fixed_incidence(tmp_path / "fixed_incidence_00001.nxs")
+
+
+def test_fixed_motor_appears_in_motor_names(fixed_incidence_file):
+    """Both the scanned and the FIXED motor are offered (positioners/*); the
+    EpicsMotor field-spray fields are not."""
+    from xrd_tools.io.bluesky_nexus import bluesky_motor_names
+
+    with h5py.File(fixed_incidence_file, "r") as f:
+        names = bluesky_motor_names(f["entry"])
+    assert set(names) == {"hy", "halpha"}
+    assert not any(s in names for s in ("halpha_hlm", "halpha_llm",
+                                        "halpha_dial", "halpha_user_setpoint"))
+
+
+def test_fixed_motor_value_from_baseline_value_start(fixed_incidence_file):
+    from xrd_tools.io.bluesky_nexus import bluesky_fixed_motor_values
+
+    with h5py.File(fixed_incidence_file, "r") as f:
+        entry = f["entry"]
+        # Exclude the scanned column: only the FIXED halpha remains.
+        fixed = bluesky_fixed_motor_values(entry, exclude={"hy"})
+    assert set(fixed) == {"halpha"}
+    assert fixed["halpha"] == pytest.approx(HALPHA_FIXED)   # value_start, not _end
+    # Field-spray fields are never surfaced.
+    assert "halpha_hlm" not in fixed and "halpha_dial" not in fixed
+
+
+def test_scanned_motor_is_not_in_fixed_values(fixed_incidence_file):
+    """A per-frame scanned motor stays per-frame, never broadcast as a constant."""
+    from xrd_tools.io.bluesky_nexus import bluesky_fixed_motor_values
+
+    with h5py.File(fixed_incidence_file, "r") as f:
+        fixed = bluesky_fixed_motor_values(
+            f["entry"], exclude={"hy", "i0", "i1", "i2", "pd", "EPOCH"})
+    assert "hy" not in fixed
+
+
+def test_baseline_values_raw_includes_field_spray(fixed_incidence_file):
+    """The RAW baseline reader returns value_start for EVERY signal (incl. the
+    EpicsMotor field spray) — which is exactly why the motor-filtered
+    :func:`bluesky_fixed_motor_values` exists."""
+    from xrd_tools.io.bluesky_nexus import bluesky_baseline_values
+
+    with h5py.File(fixed_incidence_file, "r") as f:
+        raw = bluesky_baseline_values(f["entry"])
+    assert raw["halpha"] == pytest.approx(HALPHA_FIXED)  # value_start, not value_end
+    assert "halpha_hlm" in raw and "halpha_dial" in raw  # raw keeps the spray
+
+
+def test_fixed_value_falls_back_to_positioner_without_baseline(tmp_path):
+    """No baseline -> the positioner's constant ``value`` supplies the angle."""
+    from xrd_tools.io.bluesky_nexus import bluesky_fixed_motor_values
+
+    p = _write_bluesky_nxwriter(tmp_path / "nb_00001.nxs")
+    # Add a fixed positioner with a constant value, no baseline.
+    with h5py.File(p, "a") as f:
+        ha = f["entry/instrument/positioners"].create_group("halpha")
+        ha.attrs["NX_class"] = "NXpositioner"
+        ha.create_dataset("value", data=np.float64(0.35))
+    with h5py.File(p, "r") as f:
+        fixed = bluesky_fixed_motor_values(f["entry"], exclude={"hy"})
+    assert fixed["halpha"] == pytest.approx(0.35)
+
+
 # ===========================================================================
 # Real-file assertions (shipped Pt_10nm_00013.nxs; skip without test data)
 # ===========================================================================

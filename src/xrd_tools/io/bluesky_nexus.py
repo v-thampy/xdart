@@ -33,7 +33,7 @@ Import-light: depends only on :mod:`h5py`, :mod:`numpy`, stdlib — so
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Iterable
 
 import h5py
 import numpy as np
@@ -46,6 +46,9 @@ __all__ = [
     "bluesky_motor_names",
     "bluesky_angles",
     "bluesky_counters",
+    "bluesky_positioner_values",
+    "bluesky_baseline_values",
+    "bluesky_fixed_motor_values",
     "bluesky_wavelength",
     "bluesky_energy_kev",
     "bluesky_per_frame_table",
@@ -282,6 +285,153 @@ def bluesky_per_frame_table(entry: h5py.Group) -> dict[str, np.ndarray]:
         if epoch is not None:
             table["EPOCH"] = epoch
     return table
+
+
+# ---------------------------------------------------------------------------
+# fixed (non-scanned) motor values — positioners + baseline
+# ---------------------------------------------------------------------------
+#
+# A GI incidence motor is usually held FIXED while something else (or nothing)
+# is scanned, so its angle is NOT an ``entry/data/<motor>`` per-frame column.
+# apstools records a fixed device's value in ``positioners/<motor>/value`` and/or
+# the baseline stream (``…/bluesky/streams/baseline``, read once at scan
+# start/end).  These harvesters expose those constants so the chosen incidence
+# motor resolves even when it was never scanned (broadcast across all frames).
+
+def _first_numeric(ds: h5py.Dataset) -> float | None:
+    """First element of a dataset as a float (a fixed motor's constant value)."""
+    try:
+        arr = np.asarray(ds, dtype=float).ravel()
+    except (TypeError, ValueError, OSError):
+        return None
+    return float(arr[0]) if arr.size else None
+
+
+def bluesky_positioner_values(entry: h5py.Group) -> dict[str, float]:
+    """Constant value of each positioner from ``positioners/<motor>/value``.
+
+    Returns ``{motor: first_value}`` for every ``NXpositioner`` group child of
+    ``entry/instrument/positioners``.  For a scanned motor this is just the
+    first frame's value; the fixed-motor use (:func:`bluesky_fixed_motor_values`)
+    excludes the scanned columns so only genuinely-fixed motors are broadcast.
+    """
+    pos = entry.get("instrument/positioners")
+    out: dict[str, float] = {}
+    if not isinstance(pos, h5py.Group):
+        return out
+    for name in pos:
+        grp = pos.get(name)
+        if not isinstance(grp, h5py.Group):
+            continue
+        ds = grp.get("value")
+        if isinstance(ds, h5py.Dataset):
+            val = _first_numeric(ds)
+            if val is not None:
+                out[name] = val
+    return out
+
+
+def _baseline_group(entry: h5py.Group) -> h5py.Group | None:
+    base = entry.get("instrument/bluesky/streams/baseline")
+    return base if isinstance(base, h5py.Group) else None
+
+
+def bluesky_baseline_values(entry: h5py.Group) -> dict[str, float]:
+    """RAW baseline-stream constants: ``{signal: value_start}`` for every signal
+    in ``entry/instrument/bluesky/streams/baseline`` (``value_start`` preferred,
+    else ``value_end``/``value``).
+
+    apstools writes each baseline signal as a subgroup with ``value_start`` +
+    ``value_end`` scalars (the device read once at scan start/end).  This is the
+    FULL set — it includes the ``EpicsMotor`` field spray (``<m>_hlm`` /
+    ``<m>_llm`` / ``<m>_dial`` / …); use :func:`bluesky_fixed_motor_values` for
+    the motor-filtered incidence values (only authoritative positioner names).
+    """
+    base = _baseline_group(entry)
+    out: dict[str, float] = {}
+    if base is None:
+        return out
+    for name in base:
+        obj = base.get(name)
+        if isinstance(obj, h5py.Group):
+            for field in ("value_start", "value_end", "value"):
+                ds = obj.get(field)
+                if isinstance(ds, h5py.Dataset):
+                    val = _first_numeric(ds)
+                    if val is not None:
+                        out[name] = val
+                        break
+        elif isinstance(obj, h5py.Dataset):
+            val = _first_numeric(obj)
+            if val is not None:
+                out[name] = val
+    return out
+
+
+def _baseline_motor_value(entry: h5py.Group, motor: str) -> float | None:
+    """``value_start`` of a motor's USER-POSITION baseline signal, or *None*.
+
+    Tries the authoritative motor name then the readback aliases — the motor
+    VALUE is the bare ``<m>`` (or ``<m>_user_readback`` / ``<m>_rbv``), NEVER the
+    limit/dial/alarm fields.  ``value_start`` (the position at scan start) is the
+    acquisition condition; a materially different ``value_end`` is logged at
+    debug but ``value_start`` is still returned.
+    """
+    base = _baseline_group(entry)
+    if base is None:
+        return None
+    for signal in (motor, f"{motor}_user_readback", f"{motor}_rbv",
+                   f"{motor}_readback"):
+        grp = base.get(signal)
+        if isinstance(grp, h5py.Dataset):          # flat, no start/end split
+            return _first_numeric(grp)
+        if not isinstance(grp, h5py.Group):
+            continue
+        start = None
+        for field in ("value_start", "value_end", "value"):
+            ds = grp.get(field)
+            if isinstance(ds, h5py.Dataset):
+                start = _first_numeric(ds)
+                if start is not None:
+                    break
+        if start is None:
+            continue
+        end_ds = grp.get("value_end")
+        end = _first_numeric(end_ds) if isinstance(end_ds, h5py.Dataset) else None
+        if end is not None and abs(end - start) > 1e-9 * max(1.0, abs(start)):
+            logger.debug("Bluesky baseline motor %r moved during scan "
+                         "(value_start=%g, value_end=%g); using value_start",
+                         motor, start, end)
+        return start
+    return None
+
+
+def bluesky_fixed_motor_values(entry: h5py.Group,
+                               exclude: Iterable[str] = ()) -> dict[str, float]:
+    """Constant per-scan values for FIXED positioner motors (not scanned per
+    frame).
+
+    For each motor in :func:`bluesky_motor_names` (authoritative
+    ``entry/instrument/positioners/*``) NOT in *exclude* (the scanned
+    ``entry/data`` columns), resolves its constant angle from — in order — the
+    baseline user-position ``value_start`` (:func:`_baseline_motor_value`), then
+    ``positioners/<m>/value``.  A FIXED GI incidence motor (e.g. ``halpha`` held
+    constant) lands here so its value broadcasts across every frame for incidence
+    resolution; the ``EpicsMotor`` limit/dial/alarm field spray is never
+    surfaced because only positioner names are considered.
+    """
+    skip = {str(x) for x in exclude}
+    pos_vals = bluesky_positioner_values(entry)
+    out: dict[str, float] = {}
+    for motor in bluesky_motor_names(entry):
+        if motor in skip:
+            continue
+        val = _baseline_motor_value(entry, motor)
+        if val is None:
+            val = pos_vals.get(motor)
+        if val is not None:
+            out[motor] = val
+    return out
 
 
 # ---------------------------------------------------------------------------
