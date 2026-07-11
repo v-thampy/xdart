@@ -1336,6 +1336,42 @@ def test_controls_panel_v2_gi_motor_never_shows_phantom_th(qapp, monkeypatch):
         widget.deleteLater()
 
 
+def test_controls_panel_v2_gi_motor_is_a_pure_view_of_the_single_source(qapp, monkeypatch):
+    """GUARD against the phantom-'th' bug CLASS (Controls-V2 field forking its
+    source): the θ-motor row must be a pure VIEW of the single source of truth —
+    the integrator ``gi_motor`` combo for the CHOICES and the shared
+    ``pick_default_gi_motor`` for the DEFAULT — never a re-implementation.  For
+    every motor list the V2 rendered choices equal the integrator combo's items
+    and the V2 default equals the shared policy over those motors.  The phantom
+    'th' was exactly a violation of this invariant (V2 had its own 'th'-first
+    preference + hardcoded fallbacks); a future re-fork of any V2 native field's
+    source of truth fails here.  (Design: design_controls_panel_v2_jun2026.md
+    §10 — 'One source of truth per field — never a hand-set label / forked state'.)"""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xdart.gui.tabs.static_scan.gi_motor_defaults import pick_default_gi_motor
+
+    widget = staticWidget()
+    try:
+        it = widget.integratorTree
+        for motors in (["halpha", "detx", "dety"], ["th", "eta", "i0"],
+                       ["samphi", "detx"], ["detx", "dety"], ["gonth", "hy"]):
+            it.set_gi_motor_options(motors)
+            # CHOICES: V2 renders EXACTLY the integrator combo's items (pure view).
+            v2_choices = list(
+                widget._controls_v2_native_int_choices().get(("GI", "th_motor"), ()))
+            combo_items = [it.ui.gi_motor.itemText(i)
+                           for i in range(it.ui.gi_motor.count())]
+            assert v2_choices == combo_items, (motors, v2_choices, combo_items)
+            # DEFAULT: V2 uses the shared policy over the real motors (no fork).
+            assert widget._controls_v2_default_gi_motor() == pick_default_gi_motor(
+                motors), motors
+    finally:
+        _reset_controls_v2_gi(widget)
+        widget.close()
+        widget.deleteLater()
+
+
 def test_controls_panel_v2_grazing_roundtrips_scan_gi_and_config(qapp, monkeypatch):
     """P2: the V2 Grazing path must flip scan.gi AND land sample facts in
     get_gi_config() (the reintegrate source), independent of the legacy toggle —
