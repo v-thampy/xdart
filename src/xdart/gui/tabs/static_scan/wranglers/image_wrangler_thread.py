@@ -2878,9 +2878,10 @@ class imageThread(wranglerThread):
     def _bluesky_source_for(self, master_path):
         """Read + cache a Bluesky/NXWriter source's per-frame table + wavelength.
 
-        Returns ``{'table': {col: np.ndarray}, 'constants': {motor: float},
+        Returns ``{'table': {col: np.ndarray}, 'constants': {name: float},
         'wavelength_A': float | None}`` for a Bluesky ``.nxs`` master, else
-        ``None`` (``constants`` holds FIXED-motor values broadcast per frame).
+        ``None`` (``constants`` holds per-scan values — fixed motors + the eiger
+        counting time — broadcast to every frame).
         Read once per master and cached (including the ``None`` for a non-Bluesky
         source), so a plain Eiger master or a non-``.nxs`` source keeps the
         sidecar path unchanged and never re-opens the file per frame."""
@@ -2897,7 +2898,7 @@ class imageThread(wranglerThread):
             if Path(master_path).suffix.lower() in ('.nxs', '.h5', '.hdf5'):
                 import h5py
                 from xrd_tools.io.bluesky_nexus import (
-                    bluesky_fixed_motor_values,
+                    bluesky_constant_metadata,
                     bluesky_per_frame_table,
                     bluesky_wavelength,
                     is_bluesky_nxwriter,
@@ -2910,12 +2911,12 @@ class imageThread(wranglerThread):
                             k: np.asarray(v)
                             for k, v in bluesky_per_frame_table(entry).items()
                         }
-                        # A FIXED GI incidence motor (halpha held constant) is
-                        # not a per-frame entry/data column — its value lives in
-                        # the baseline stream / positioners.  Broadcast it across
-                        # every frame so incidence resolves whether the motor was
-                        # scanned OR fixed.
-                        constants = bluesky_fixed_motor_values(
+                        # Per-scan CONSTANTS broadcast to every frame: the FIXED
+                        # (non-scanned) motors — incl. a held-constant GI incidence
+                        # motor, so incidence resolves whether scanned OR fixed —
+                        # plus the eiger counting time.  Their values live in the
+                        # baseline stream / detector config, not per-frame data.
+                        constants = bluesky_constant_metadata(
                             entry, exclude=table.keys())
                         wl = bluesky_wavelength(entry)
                         info = {

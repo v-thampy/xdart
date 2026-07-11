@@ -44,11 +44,14 @@ __all__ = [
     "is_bluesky_nxwriter",
     "resolve_nxentry",
     "bluesky_motor_names",
+    "bluesky_all_motor_names",
     "bluesky_angles",
     "bluesky_counters",
     "bluesky_positioner_values",
     "bluesky_baseline_values",
     "bluesky_fixed_motor_values",
+    "bluesky_eiger_count_time",
+    "bluesky_constant_metadata",
     "bluesky_wavelength",
     "bluesky_energy_kev",
     "bluesky_per_frame_table",
@@ -65,6 +68,21 @@ _XDART_SCHEMA_ATTR = "ssrl_schema"
 # Default norm-channel counters (ion chambers + photodiode).  ``gate`` and
 # ``eiger`` from ``…/metadata/detectors`` are excluded (a timer and the image).
 _DEFAULT_BLUESKY_COUNTERS = ("i0", "i1", "i2", "pd")
+
+# Per-frame counting time (gate/timer channel in ``entry/data``).
+_BLUESKY_COUNT_TIME_COL = "gate_actual_counting_time"
+
+# An ``EpicsMotor`` baseline signal ``<m>`` sprays companion sub-signals
+# (``<m>_user_setpoint``, ``<m>_rbv``, dial/limit fields, …).  The presence of
+# ANY of these setpoint/readback companions is what positively marks a bare
+# baseline name as a MOTOR — cleanly excluding scaler counters (``i0``), the
+# detector (``eiger``), the timer (``gate``) and the field-spray sub-signals
+# themselves (``detx_hlm`` has no ``detx_hlm_user_setpoint``).  Both EpicsMotor
+# variants at bl11-3 are covered: ``*_user_setpoint``/``*_rbv`` and the
+# ``*_readback``/``*_dial_readback`` class.
+_MOTOR_COMPANION_SUFFIXES = (
+    "_user_setpoint", "_rbv", "_user_readback", "_dial_readback", "_readback",
+)
 
 _EIGER_CONFIG_BASE = "instrument/bluesky/metadata/configuration"
 
@@ -214,6 +232,34 @@ def bluesky_motor_names(entry: h5py.Group) -> list[str]:
     return names or parsed
 
 
+def bluesky_all_motor_names(entry: h5py.Group) -> list[str]:
+    """EVERY motor present in the scan — scanned AND held-fixed.
+
+    :func:`bluesky_motor_names` returns only the SCANNED motors (the
+    ``positioners`` groups), which is right for the GI incidence dropdown and
+    per-frame angle columns.  But a Bluesky scan also records every FIXED motor's
+    position once, in the baseline stream — and those are real motors the user
+    wants to see in the metadata table (``detx``, ``dety``, ``hx``/``hy``/``hz``,
+    …).  This returns the union: the scanned positioners first (stable order),
+    then the baseline motors, identified by their ``EpicsMotor`` setpoint/readback
+    companion sub-signals (:data:`_MOTOR_COMPANION_SUFFIXES`) so scaler counters,
+    the detector, the timer and the limit/dial field-spray are all excluded.
+    """
+    names = list(bluesky_motor_names(entry))
+    seen = set(names)
+    base = _baseline_group(entry)
+    if isinstance(base, h5py.Group):
+        signals = set(base.keys())
+        for name in sorted(signals):
+            if name in seen:
+                continue
+            if any(f"{name}{suffix}" in signals
+                   for suffix in _MOTOR_COMPANION_SUFFIXES):
+                names.append(name)
+                seen.add(name)
+    return names
+
+
 def _data_group(entry: h5py.Group) -> h5py.Group | None:
     d = entry.get("data")
     return d if isinstance(d, h5py.Group) else None
@@ -271,19 +317,22 @@ def bluesky_counters(entry: h5py.Group,
 
 
 def bluesky_per_frame_table(entry: h5py.Group) -> dict[str, np.ndarray]:
-    """The plottable per-frame metadata table: motors + counters + ``EPOCH``.
+    """The plottable per-frame metadata table: motors + counters + counting time
+    + ``EPOCH``.
 
     This is the ``scan_data``-equivalent surfaced to Plot Metadata and
-    :func:`xrd_tools.io.read.get_metadata`.
+    :func:`xrd_tools.io.read.get_metadata`.  ``gate_actual_counting_time`` (the
+    per-frame gate/timer dwell in seconds) is included when present.
     """
     table: dict[str, np.ndarray] = {}
     table.update(bluesky_angles(entry))
     table.update(bluesky_counters(entry))
     data = _data_group(entry)
     if data is not None:
-        epoch = _read_1d_numeric(data, "EPOCH")
-        if epoch is not None:
-            table["EPOCH"] = epoch
+        for extra in (_BLUESKY_COUNT_TIME_COL, "EPOCH"):
+            arr = _read_1d_numeric(data, extra)
+            if arr is not None:
+                table[extra] = arr
     return table
 
 
@@ -411,19 +460,20 @@ def bluesky_fixed_motor_values(entry: h5py.Group,
     """Constant per-scan values for FIXED positioner motors (not scanned per
     frame).
 
-    For each motor in :func:`bluesky_motor_names` (authoritative
-    ``entry/instrument/positioners/*``) NOT in *exclude* (the scanned
-    ``entry/data`` columns), resolves its constant angle from — in order — the
-    baseline user-position ``value_start`` (:func:`_baseline_motor_value`), then
-    ``positioners/<m>/value``.  A FIXED GI incidence motor (e.g. ``halpha`` held
-    constant) lands here so its value broadcasts across every frame for incidence
-    resolution; the ``EpicsMotor`` limit/dial/alarm field spray is never
-    surfaced because only positioner names are considered.
+    For each motor in :func:`bluesky_all_motor_names` (scanned positioners PLUS
+    the baseline motors) NOT in *exclude* (the scanned ``entry/data`` columns),
+    resolves its constant value from — in order — the baseline user-position
+    ``value_start`` (:func:`_baseline_motor_value`), then ``positioners/<m>/value``.
+    A FIXED GI incidence motor (e.g. ``halpha`` held constant) lands here so its
+    value broadcasts across every frame for incidence resolution, AND so do the
+    other held-fixed motors (``detx``/``dety``/``hx``/``hy``/``hz``/…) for the
+    metadata table; the ``EpicsMotor`` limit/dial/alarm field spray is never
+    surfaced because only motor names are considered.
     """
     skip = {str(x) for x in exclude}
     pos_vals = bluesky_positioner_values(entry)
     out: dict[str, float] = {}
-    for motor in bluesky_motor_names(entry):
+    for motor in bluesky_all_motor_names(entry):
         if motor in skip:
             continue
         val = _baseline_motor_value(entry, motor)
@@ -431,6 +481,47 @@ def bluesky_fixed_motor_values(entry: h5py.Group,
             val = pos_vals.get(motor)
         if val is not None:
             out[motor] = val
+    return out
+
+
+def bluesky_eiger_count_time(entry: h5py.Group) -> float:
+    """Eiger detector counting time in seconds, or NaN when no eiger is present.
+
+    Read from the detector configuration — ``eiger_cam_acquire_time`` (the
+    exposure), falling back to ``eiger_cam_acquire_period``.  Returned separately
+    from the gate/timer dwell (:data:`_BLUESKY_COUNT_TIME_COL`) so both the
+    detector exposure and the per-frame gate time are available.
+    """
+    for field in ("eiger_cam_acquire_time", "eiger_cam_acquire_period"):
+        ds = _eiger_config_field(entry, field)
+        if ds is not None:
+            try:
+                v = float(_scalar(ds))
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(v):
+                return v
+    return float(np.nan)
+
+
+def bluesky_constant_metadata(entry: h5py.Group,
+                              exclude: Iterable[str] = ()) -> dict[str, float]:
+    """Per-scan CONSTANT metadata columns to broadcast across every frame.
+
+    The fixed (non-scanned) motor positions (:func:`bluesky_fixed_motor_values`)
+    plus the eiger detector counting time (``eiger_count_time``) when an eiger is
+    present.  This is the DISPLAY overlay for the per-frame table — it keeps the
+    detector counting time out of the motor-only paths (the GI dropdown / angle
+    columns) while still surfacing it in Plot Metadata and the frame-metadata
+    table.  Names already in *exclude* (e.g. per-frame ``entry/data`` columns)
+    are skipped so a scanned column always wins.
+    """
+    skip = {str(x) for x in exclude}
+    out: dict[str, float] = dict(bluesky_fixed_motor_values(entry, exclude=skip))
+    if "eiger_count_time" not in skip:
+        ct = bluesky_eiger_count_time(entry)
+        if np.isfinite(ct):
+            out["eiger_count_time"] = float(ct)
     return out
 
 

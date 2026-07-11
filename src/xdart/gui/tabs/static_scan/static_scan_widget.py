@@ -3634,10 +3634,17 @@ class staticWidget(QWidget):
 
     def _current_scan_uri(self):
         """Best-effort path to the currently-loaded scan (for Scan Plot's default
-        source); None when nothing real is loaded (the dialog starts blank)."""
+        source); None when nothing real is loaded (the dialog starts blank).
+
+        Falls back to the active image wrangler's ``img_file`` so a RAW image
+        series being browsed (e.g. a Bluesky ``.nxs`` whose per-frame metadata
+        lives in the file itself) auto-loads into Scan Plot rather than opening
+        blank when no processed scan has been saved yet."""
         import os
-        for cand in (getattr(self.scan, 'data_file', None),
-                     getattr(self, 'fname', None)):
+        candidates = [getattr(self.scan, 'data_file', None),
+                      getattr(self, 'fname', None),
+                      getattr(getattr(self, 'wrangler', None), 'img_file', None)]
+        for cand in candidates:
             try:
                 if cand and os.path.exists(str(cand)):
                     return str(cand)

@@ -34,10 +34,15 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # The committable synthetic apstools-NXWriter fixture lives with the core reader
 # tests; reuse it here so the GUI test drives the SAME structure the readers pin.
 from tests.core.test_bluesky_nexus import (  # noqa: E402
+    DETX_FIXED,
+    EIGER_TIME,
+    GATE_TIME,
     HALPHA_FIXED,
     IMG_SHAPE,
     NFRAMES,
+    SBSX_FIXED,
     WAVELENGTH,
+    _write_bluesky_baseline_only_motors,
     _write_bluesky_fixed_incidence,
     _write_bluesky_nxwriter,
 )
@@ -62,6 +67,13 @@ def fixed_incidence_file(tmp_path) -> Path:
     """hy scanned per-frame; halpha the FIXED GI incidence motor (baseline +
     positioners, not in entry/data)."""
     return _write_bluesky_fixed_incidence(tmp_path / "fixed_incidence_00001.nxs")
+
+
+@pytest.fixture
+def baseline_only_file(tmp_path) -> Path:
+    """halpha scanned per-frame; detx/sbsx fixed motors recorded ONLY in the
+    baseline (not positioners); per-frame gate + eiger counting times."""
+    return _write_bluesky_baseline_only_motors(tmp_path / "baseline_only_00001.nxs")
 
 
 @pytest.fixture
@@ -293,6 +305,26 @@ def test_thread_bluesky_shapes(bluesky_file):
     assert info["table"]["hy"].shape == (NFRAMES,)
     assert info["wavelength_A"] == pytest.approx(WAVELENGTH)
     assert IMG_SHAPE  # fixture sanity
+
+
+def test_thread_scan_info_carries_fixed_motors_and_counting_time(baseline_only_file):
+    """The frame-metadata scan_info surfaces the baseline-only FIXED motors
+    (detx/sbsx) as constants AND both counting times — this is exactly what the
+    Frame metadata popup / Plot Metadata show for a Bluesky file."""
+    worker = _bare_thread(baseline_only_file)
+    si0 = worker._frame_scan_info(str(baseline_only_file), 0)
+    si_last = worker._frame_scan_info(str(baseline_only_file), NFRAMES - 1)
+
+    # Fixed motors broadcast constant across every frame.
+    for si in (si0, si_last):
+        assert si["detx"] == pytest.approx(DETX_FIXED)
+        assert si["sbsx"] == pytest.approx(SBSX_FIXED)
+        assert si["eiger_count_time"] == pytest.approx(EIGER_TIME)
+        assert si["gate_actual_counting_time"] == pytest.approx(GATE_TIME)
+    # The scanned motor stays per-frame (not broadcast as a constant).
+    assert si0["halpha"] != si_last["halpha"]
+    # The EpicsMotor field-spray is never surfaced as a column.
+    assert not any(k.startswith(("detx_", "sbsx_")) for k in si0)
 
 
 # ===========================================================================

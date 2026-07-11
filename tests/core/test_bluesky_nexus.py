@@ -375,6 +375,174 @@ def test_fixed_value_falls_back_to_positioner_without_baseline(tmp_path):
     assert fixed["halpha"] == pytest.approx(0.35)
 
 
+# ---------------------------------------------------------------------------
+# BASELINE-ONLY fixed motors: the writer records held-fixed motors in the
+# baseline stream but NOT as positioners (only the scanned motor is a
+# positioner).  The metadata table must still surface them — plus the per-frame
+# gate counting time and the eiger detector counting time.  Mirrors the shipped
+# ``LaB6_0710_1025pm_00005.nxs`` (halpha scanned; detx/dety/hx/hz/… fixed).
+# ---------------------------------------------------------------------------
+
+DETX_FIXED = 53.0     # EpicsMotor class A: <m>_user_setpoint / <m>_rbv companions
+SBSX_FIXED = -4.0     # EpicsMotor class B: <m>_readback / <m>_dial_readback only
+GATE_TIME = 2.0       # per-frame gate_actual_counting_time (s)
+EIGER_TIME = 1.5      # eiger_cam_acquire_time (s)
+
+
+def _write_bluesky_baseline_only_motors(path: Path, *, n: int = NFRAMES) -> Path:
+    """A Bluesky NXWriter file where ONLY the scan motor ``halpha`` is a
+    positioner; the fixed motors ``detx`` (EpicsMotor with setpoint/rbv) and
+    ``sbsx`` (readback/dial-readback variant) live solely in the baseline, and a
+    scaler ``i0`` sits in the baseline WITHOUT any motor companion (must not be
+    mistaken for a motor).  Per-frame ``gate_actual_counting_time`` and an
+    eiger ``eiger_cam_acquire_time`` are present."""
+    halpha = np.linspace(3.0, 3.4, n).astype(np.float64)
+    with h5py.File(path, "w") as f:
+        f.attrs["creator"] = "NXWriter"
+        entry = f.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+
+        inst = entry.create_group("instrument")
+        inst.attrs["NX_class"] = "NXinstrument"
+        bluesky = inst.create_group("bluesky")
+        bluesky.attrs["NX_class"] = "NXnote"
+        md = bluesky.create_group("metadata")
+        md.create_dataset("motors", data=b"!!python/tuple\n- halpha\n")
+        eiger_cfg = md.create_group("configuration/eiger/data")
+        eiger_cfg.create_dataset("eiger_cam_wavelength", data=np.float64(WAVELENGTH))
+        eiger_cfg.create_dataset("eiger_cam_acquire_time", data=np.float64(EIGER_TIME))
+        eiger_cfg.create_dataset("eiger_cam_acquire_period", data=np.float64(EIGER_TIME))
+
+        baseline = bluesky.create_group("streams/baseline")
+
+        def _baseline_signal(name, value):
+            g = baseline.create_group(name)
+            g.create_dataset("value_start", data=np.float64(value))
+            g.create_dataset("value_end", data=np.float64(value))
+
+        # detx: class-A motor (bare + _user_setpoint + _rbv) + a limit spray field
+        _baseline_signal("detx", DETX_FIXED)
+        _baseline_signal("detx_user_setpoint", DETX_FIXED)
+        _baseline_signal("detx_rbv", DETX_FIXED)
+        _baseline_signal("detx_hlm", 500.0)         # spray: NOT a motor
+        # sbsx: class-B motor (bare + _readback + _dial_readback, NO _rbv)
+        _baseline_signal("sbsx", SBSX_FIXED)
+        _baseline_signal("sbsx_readback", SBSX_FIXED)
+        _baseline_signal("sbsx_dial_readback", SBSX_FIXED)
+        _baseline_signal("sbsx_velo", 1.0)          # spray: NOT a motor
+        # halpha: the SCAN motor also appears in the baseline (as apstools writes)
+        _baseline_signal("halpha", halpha[0])
+        _baseline_signal("halpha_user_setpoint", halpha[0])
+        # i0: a scaler channel in the baseline with NO motor companion
+        _baseline_signal("i0", 12345.0)
+
+        # positioners: ONLY the scanned motor is a positioner here.
+        positioners = inst.create_group("positioners")
+        positioners.attrs["NX_class"] = "NXnote"
+        ha_grp = positioners.create_group("halpha")
+        ha_grp.attrs["NX_class"] = "NXpositioner"
+        ha_grp.create_dataset("value", data=halpha)
+
+        data = entry.create_group("data")
+        data.attrs["NX_class"] = "NXdata"
+        data.attrs["signal"] = "halpha"
+        data.create_dataset("halpha", data=halpha)
+        for name, arr in (("i0", np.linspace(30000, 31000, n)),
+                          ("i1", np.linspace(20000, 20500, n)),
+                          ("i2", np.linspace(150, 200, n)),
+                          ("pd", np.linspace(0, 4, n))):
+            data.create_dataset(name, data=arr)
+        data.create_dataset("EPOCH", data=np.linspace(0.0, 4.0, n))
+        data.create_dataset("gate_actual_counting_time", data=np.full(n, GATE_TIME))
+        images = np.arange(
+            n * IMG_SHAPE[0] * IMG_SHAPE[1], dtype=np.uint32
+        ).reshape((n, *IMG_SHAPE))
+        img = data.create_dataset("eiger_image", data=images)
+        img.attrs["signal_type"] = "detector"
+    return path
+
+
+@pytest.fixture
+def baseline_only_file(tmp_path) -> Path:
+    return _write_bluesky_baseline_only_motors(tmp_path / "baseline_only_00001.nxs")
+
+
+def test_all_motor_names_includes_baseline_only_motors(baseline_only_file):
+    """Baseline-recorded motors that are NOT positioners are still discovered —
+    identified by their setpoint/readback companion (both EpicsMotor variants) —
+    while scalers and the EpicsMotor field spray are excluded."""
+    from xrd_tools.io.bluesky_nexus import (bluesky_all_motor_names,
+                                            bluesky_motor_names)
+
+    with h5py.File(baseline_only_file, "r") as f:
+        entry = f["entry"]
+        scanned = set(bluesky_motor_names(entry))   # unchanged: positioners only
+        allm = set(bluesky_all_motor_names(entry))
+    assert scanned == {"halpha"}                     # GI dropdown source unchanged
+    assert allm == {"halpha", "detx", "sbsx"}        # + baseline-only fixed motors
+    assert "i0" not in allm                          # scaler, not a motor
+    assert not (allm & {"detx_hlm", "detx_rbv", "detx_user_setpoint",
+                        "sbsx_readback", "sbsx_dial_readback", "sbsx_velo"})
+
+
+def test_fixed_motor_values_from_baseline_only(baseline_only_file):
+    from xrd_tools.io.bluesky_nexus import (bluesky_fixed_motor_values,
+                                            bluesky_per_frame_table)
+
+    with h5py.File(baseline_only_file, "r") as f:
+        entry = f["entry"]
+        table = bluesky_per_frame_table(entry)
+        fixed = bluesky_fixed_motor_values(entry, exclude=table.keys())
+    assert set(fixed) == {"detx", "sbsx"}            # halpha is per-frame (excluded)
+    assert fixed["detx"] == pytest.approx(DETX_FIXED)
+    assert fixed["sbsx"] == pytest.approx(SBSX_FIXED)
+
+
+def test_per_frame_table_includes_gate_counting_time(baseline_only_file):
+    from xrd_tools.io.bluesky_nexus import bluesky_per_frame_table
+
+    with h5py.File(baseline_only_file, "r") as f:
+        table = bluesky_per_frame_table(f["entry"])
+    assert "gate_actual_counting_time" in table
+    assert np.allclose(table["gate_actual_counting_time"], GATE_TIME)
+
+
+def test_eiger_count_time(baseline_only_file):
+    from xrd_tools.io.bluesky_nexus import bluesky_eiger_count_time
+
+    with h5py.File(baseline_only_file, "r") as f:
+        ct = bluesky_eiger_count_time(f["entry"])
+    assert ct == pytest.approx(EIGER_TIME)
+
+
+def test_constant_metadata_bundles_fixed_motors_and_count_time(baseline_only_file):
+    """The display overlay = fixed motors + eiger counting time, keyed together
+    and keeping the counting time OUT of the motor-name discovery."""
+    from xrd_tools.io.bluesky_nexus import (bluesky_all_motor_names,
+                                            bluesky_constant_metadata,
+                                            bluesky_per_frame_table)
+
+    with h5py.File(baseline_only_file, "r") as f:
+        entry = f["entry"]
+        table = bluesky_per_frame_table(entry)
+        const = bluesky_constant_metadata(entry, exclude=table.keys())
+        allm = bluesky_all_motor_names(entry)
+    assert set(const) == {"detx", "sbsx", "eiger_count_time"}
+    assert const["eiger_count_time"] == pytest.approx(EIGER_TIME)
+    assert "eiger_count_time" not in allm            # not a motor name
+
+
+def test_nexus_stack_source_surfaces_fixed_motors_and_times(baseline_only_file):
+    """The Scan Plot / metadata path (NexusStackSource.metadata_for) broadcasts
+    the fixed motors + counting times as constant per-frame columns."""
+    md0 = NexusStackSource(baseline_only_file).metadata_for(0)
+    assert md0["detx"] == pytest.approx(DETX_FIXED)
+    assert md0["sbsx"] == pytest.approx(SBSX_FIXED)
+    assert md0["eiger_count_time"] == pytest.approx(EIGER_TIME)
+    assert md0["gate_actual_counting_time"] == pytest.approx(GATE_TIME)
+    assert md0["i0"] != 12345.0                      # per-frame i0, not the baseline
+
+
 # ===========================================================================
 # Real-file assertions (shipped Pt_10nm_00013.nxs; skip without test data)
 # ===========================================================================
@@ -415,3 +583,50 @@ def test_real_get_metadata_columns():
     assert "hy" in src.motors
     md0 = src.metadata_for(0)
     assert "i0" in md0 and isinstance(md0["i0"], float)
+
+
+# --- LaB6 file with baseline-recorded fixed motors + counting times ---------
+_REAL_LAB6 = _DATA / "nexus" / "LaB6_0710_1025pm_00005.nxs"
+
+real_lab6 = pytest.mark.skipif(
+    not _REAL_LAB6.exists(),
+    reason=f"real baseline-motor test file not found: {_REAL_LAB6}",
+)
+
+_LAB6_MOTORS = {"halpha", "detx", "dety", "hx", "hy", "hz", "sbsx", "sbsy", "sfpx"}
+_LAB6_FIXED = _LAB6_MOTORS - {"halpha"}   # halpha is the scanned motor
+
+
+@real_lab6
+def test_real_lab6_fixed_motors_and_counting_time():
+    from xrd_tools.io.bluesky_nexus import (bluesky_all_motor_names,
+                                            bluesky_constant_metadata,
+                                            bluesky_eiger_count_time,
+                                            bluesky_motor_names,
+                                            bluesky_per_frame_table)
+
+    with h5py.File(_REAL_LAB6, "r") as f:
+        entry = f["entry"]
+        scanned = set(bluesky_motor_names(entry))
+        allm = set(bluesky_all_motor_names(entry))
+        table = bluesky_per_frame_table(entry)
+        const = bluesky_constant_metadata(entry, exclude=table.keys())
+        ct = bluesky_eiger_count_time(entry)
+    assert scanned == {"halpha"}                        # GI dropdown: scan motor only
+    assert _LAB6_MOTORS <= allm                         # all 9 real motors discovered
+    assert "gate_actual_counting_time" in table         # per-frame gate dwell
+    assert _LAB6_FIXED <= set(const)                    # 8 fixed motors as constants
+    assert "halpha" not in const                        # scanned stays per-frame
+    assert const["eiger_count_time"] == pytest.approx(1.999997, rel=1e-5)
+    assert ct == pytest.approx(1.999997, rel=1e-5)
+
+
+@real_lab6
+def test_real_lab6_scan_plot_table_columns():
+    """The Scan Plot metadata path surfaces every real column."""
+    src = NexusStackSource(_REAL_LAB6)
+    md0 = src.metadata_for(0)
+    assert md0["detx"] == pytest.approx(53.0, abs=0.05)
+    assert md0["hz"] == pytest.approx(-6.0, abs=0.05)
+    assert md0["eiger_count_time"] == pytest.approx(1.999997, rel=1e-5)
+    assert md0["gate_actual_counting_time"] == pytest.approx(2.0, abs=0.05)

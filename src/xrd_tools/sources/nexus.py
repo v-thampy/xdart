@@ -75,6 +75,7 @@ class NexusStackSource(BaseFrameSource):
 
             from xrd_tools.io.bluesky_nexus import (
                 bluesky_angles,
+                bluesky_constant_metadata,
                 bluesky_per_frame_table,
                 is_bluesky_nxwriter,
                 resolve_nxentry,
@@ -82,11 +83,16 @@ class NexusStackSource(BaseFrameSource):
             with h5py.File(self.path, "r") as f:
                 e = resolve_nxentry(f, self.entry)
                 if e is not None and is_bluesky_nxwriter(e):
+                    table = {k: np.asarray(v)
+                             for k, v in bluesky_per_frame_table(e).items()}
                     result = {
                         "motors": {k: np.asarray(v)
                                    for k, v in bluesky_angles(e).items()},
-                        "table": {k: np.asarray(v)
-                                  for k, v in bluesky_per_frame_table(e).items()},
+                        "table": table,
+                        # Held-fixed motors + eiger counting time broadcast as
+                        # constant columns (see bluesky_constant_metadata).
+                        "constants": bluesky_constant_metadata(
+                            e, exclude=table.keys()),
                     }
         except Exception:
             result = None
@@ -116,6 +122,10 @@ class NexusStackSource(BaseFrameSource):
                     out[name] = float(arr[pos])
                 except (TypeError, ValueError):
                     pass
+        # Constant per-scan columns (fixed motors + eiger count time) broadcast
+        # to every frame; setdefault so a per-frame column always wins.
+        for name, val in cols.get("constants", {}).items():
+            out.setdefault(name, float(val))
         return out
 
 

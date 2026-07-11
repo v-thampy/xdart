@@ -659,6 +659,7 @@ def _bluesky_metadata(entry) -> dict:
     from the Bluesky harvesters (motors + counters + eiger config)."""
     from xrd_tools.io.bluesky_nexus import (
         bluesky_angles,
+        bluesky_constant_metadata,
         bluesky_energy_kev,
         bluesky_per_frame_table,
         bluesky_scalar_metadata,
@@ -677,6 +678,13 @@ def _bluesky_metadata(entry) -> dict:
         break
     if n == 0 and "num_points" in scalars:
         n = int(scalars["num_points"])
+
+    # Held-fixed motors + eiger counting time are per-scan constants: broadcast
+    # each across all n frames so Plot Metadata / scan_data shows them as columns.
+    if n:
+        for name, val in bluesky_constant_metadata(
+                entry, exclude=scan_data.keys()).items():
+            scan_data[name] = np.full(n, float(val), dtype=float)
 
     return {
         "frames": np.arange(n, dtype=np.int64),
