@@ -292,7 +292,11 @@ class integratorTree(QtWidgets.QWidget):
         self.ui.gi_motor_label = QtWidgets.QLabel('Motor')
         self.ui.gi_motor = QtWidgets.QComboBox()
         self.ui.gi_motor.setObjectName('gi_motor')
-        self.ui.gi_motor.addItems(['th', 'Manual'])
+        # Only 'Manual' at construction — a phantom 'th' here (before any source
+        # is loaded) leaked into the GI θ-motor dropdown for files that have no
+        # 'th' motor.  Real motors are added by set_gi_motor_options once a source
+        # is selected; 'th' appears only if it's an actual motor of that source.
+        self.ui.gi_motor.addItems(['Manual'])
         self.ui.gi_motor.setMaximumWidth(110)
 
         self.ui.gi_motor_value_label = QtWidgets.QLabel('Value')

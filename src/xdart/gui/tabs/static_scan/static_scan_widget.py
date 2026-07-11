@@ -1172,12 +1172,15 @@ class staticWidget(QWidget):
                     pass
 
     def _controls_v2_default_gi_motor(self) -> str:
+        # SINGLE source of truth for the GI incidence-motor default — the shared
+        # policy (named preference th/eta/halpha/gonth/theta if present, else a
+        # rotation-sounding motor, else Manual).  Do NOT re-implement a local
+        # preference list here (it used to hard-prefer 'th' and fall back to the
+        # first motor, re-injecting a phantom 'th' into the Controls-V2 θ-motor
+        # row even after the wrangler/integrator combos were scoped correctly).
+        from .gi_motor_defaults import pick_default_gi_motor
         choices = self._controls_v2_native_int_choices().get(("GI", "th_motor"), ())
-        for preferred in ("th", "eta", "theta", "gonth", "halpha"):
-            for choice in choices:
-                if str(choice).lower() == preferred:
-                    return str(choice)
-        return str(choices[0]) if choices else "Manual"
+        return pick_default_gi_motor([c for c in choices if str(c) != "Manual"])
 
     def _controls_v2_gi_config(self) -> dict:
         scan = getattr(self, "scan", None)
@@ -1196,6 +1199,16 @@ class staticWidget(QWidget):
                 motor = "Manual"
             except (TypeError, ValueError):
                 motor = str(motor)
+                # A stale/legacy incidence motor carried on the scan (notably the
+                # 'th' default from LiveScan) that is NOT one of the loaded
+                # source's real motors must not be shown — fall to the shared
+                # default policy over the actual choices.  A genuine saved motor
+                # (present in the choices) or 'Manual' is kept as-is.
+                if motor != "Manual":
+                    choices = self._controls_v2_native_int_choices().get(
+                        ("GI", "th_motor"), ())
+                    if motor not in choices:
+                        motor = self._controls_v2_default_gi_motor()
         sample_orientation = gic.get("sample_orientation", None)
         if sample_orientation is None:
             sample_orientation = getattr(scan, "sample_orientation", None)
@@ -1758,12 +1771,28 @@ class staticWidget(QWidget):
                 return ()
             return tuple(combo.itemText(i) for i in range(combo.count()))
 
+        def _gi_motor_choices():
+            """θ-motor choices: the integrator combo's items, but fall back to the
+            active wrangler's freshly-discovered motors when that combo hasn't
+            been repopulated yet (e.g. a session-restored source, where the
+            sigGIMotorOptions handshake hasn't fired).  Keeps 'Manual' always
+            offered and never invents a motor the source doesn't have."""
+            items = _combo_choices("gi_motor")
+            if any(str(c) != "Manual" for c in items):
+                return items
+            wr = getattr(self, "wrangler", None)
+            wr_motors = [
+                str(m) for m in (getattr(wr, "motors", None) or [])
+                if not any(x in str(m).lower() for x in ("roi", "pd"))
+            ]
+            return tuple(["Manual"] + wr_motors) if wr_motors else (items or ("Manual",))
+
         choices = {
             ("Int1D", "unit"): tuple(Units),
             ("Int2D", "unit"): tuple(Units[:2]),
             ("Int1D", "axis"): tuple(GI_LABELS_1D if gi else Units),
             ("Int2D", "axis"): tuple(GI_LABELS_2D if gi else ("Q-χ", "2θ-χ")),
-            ("GI", "th_motor"): _combo_choices("gi_motor") or ("Manual", "th"),
+            ("GI", "th_motor"): _gi_motor_choices(),
         }
         for spec in INTEGRATOR_BACKED_CONTROL_SPECS:
             if spec.kind.value == "combo" and spec.parameter_name:

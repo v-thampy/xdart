@@ -1283,11 +1283,53 @@ def test_controls_panel_v2_gi_detail_fields_inline_only_in_grazing(qapp, monkeyp
         assert _find_more_button(widget) is None
 
         # Grazing mode -> θ motor inline + the '…' GI-options button (progressive
-        # disclosure, gated in controls_logic on the Grazing state).
+        # disclosure, gated in controls_logic on the Grazing state).  With no
+        # source loaded there is no real motor, so the θ-motor defaults to Manual
+        # (not a phantom 'th'), which correctly reveals the manual θ-value input
+        # inline alongside the motor selector.
         widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
         widget._refresh_controls_v2_profile_now()
-        assert _gi_detail_rows(widget) == {("GI", "th_motor")}
+        assert _gi_detail_rows(widget) == {("GI", "th_motor"), ("GI", "th_val")}
         assert _find_more_button(widget) is not None
+    finally:
+        _reset_controls_v2_gi(widget)
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_gi_motor_never_shows_phantom_th(qapp, monkeypatch):
+    """The Controls-V2 θ-motor row must never inject a phantom 'th': a fresh
+    widget (no source) defaults to Manual, and a stale ``scan.incidence_motor ==
+    'th'`` carried from the LiveScan default is dropped in favour of the shared
+    default policy over the source's REAL motors.  'th' appears only when it is an
+    actual motor of the loaded source.  (Regression: the V2 panel had its own
+    'th'-first preference + a hardcoded ('Manual','th') fallback that bypassed the
+    wrangler/integrator scoping.)"""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        # 1. Fresh widget, no motors -> Manual default, no phantom 'th' offered.
+        choices = widget._controls_v2_native_int_choices().get(("GI", "th_motor"), ())
+        assert "th" not in choices
+        assert widget._controls_v2_default_gi_motor() == "Manual"
+
+        # 2. A source offers real motors (none named 'th'); a stale incidence_motor
+        #    of 'th' on the scan must NOT be shown — pick the preference motor.
+        widget.integratorTree.set_gi_motor_options(["halpha", "detx", "dety"])
+        widget.scan.incidence_motor = "th"       # legacy default carried on scan
+        widget.scan.gi_config = {}
+        cfg = widget._controls_v2_gi_config()
+        assert cfg["incidence_motor"] == "halpha"   # named preference, not 'th'
+        choices = widget._controls_v2_native_int_choices().get(("GI", "th_motor"), ())
+        assert "th" not in choices
+        assert set(choices) >= {"Manual", "halpha", "detx", "dety"}
+
+        # 3. When 'th' IS a real motor of the source it is offered + preferred.
+        widget.integratorTree.set_gi_motor_options(["th", "eta", "i0"])
+        choices = widget._controls_v2_native_int_choices().get(("GI", "th_motor"), ())
+        assert "th" in choices
     finally:
         _reset_controls_v2_gi(widget)
         widget.close()
