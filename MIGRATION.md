@@ -293,8 +293,24 @@ for downstream users:
   case-mismatched monitor key will integrate to different (correct) numbers. Re-reduce such
   datasets if exact reproduction of the old (un-normalized) values matters.
 
-## Fixes in v1.0.2
+## What's new in v1.1.0
 
+* **Read Bluesky / apstools NXWriter `.nxs` acquisition files.** xdart now reads
+  the NeXus files written by Bluesky (SSRL bl11-3's acquisition format,
+  `creator="NXWriter"`) — both to **view** frames in the Data Browser and to
+  **process** them as a source. Previously these files couldn't be displayed
+  (the viewer grabbed a scalar counter instead of the detector image), their
+  motors weren't read (the Grazing incidence motor wrongly defaulted to `th`),
+  and Plot Metadata showed only `frame_index`. xdart now detects the format and
+  reads the embedded detector frames, the real motors (from
+  `entry/instrument/positioners`), the ion-chamber/photodiode counters
+  (`i0/i1/i2/pd`) as normalization channels, the wavelength/energy from the
+  detector config, and surfaces the per-frame columns (motors + counters +
+  `EPOCH`) in Plot Metadata. The Grazing incidence-motor dropdown is populated
+  from the file's real motors — pick the correct one rather than accepting a
+  default. Read-side only; existing `.nxs`/Eiger workflows are unchanged. Also a
+  general robustness fix: a NeXus image dataset must be 2-D+ (a scalar/1-D
+  "signal" can no longer be mistaken for the detector frame).
 * **The Windows Start-menu shortcut launches again.** The conda shortcut runs
   xdart under `pythonw.exe` (the no-console interpreter), where `sys.stderr` is
   None — startup's very first call, `faulthandler.enable()`, raised
