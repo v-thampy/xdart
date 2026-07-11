@@ -1,4 +1,23 @@
-"""Source factory and lightweight registry."""
+"""Source factory and lightweight registry.
+
+Extension policy (how a new detector/acquisition format is added — the seam the
+post-v1.1 plug-and-play source registry generalises):
+
+1. Add a :class:`~xrd_tools.core.scan.SourceKind` member if the format is a new
+   *kind* of source (``NEXUS_STACK`` already covers Bluesky/NXWriter + Eiger
+   masters; ``TILED`` is reserved for a Tiled client).
+2. Teach :func:`guess_source_kind` to map the URI (directory / extension /
+   sniffed content) to that kind — extension-family first, content-sniff only
+   for the ambiguous cases (SPEC files are extensionless, so they are sniffed).
+3. Provide the opener EITHER as a built-in arm in :func:`open_source` (in-tree
+   formats) OR via :func:`register_source(kind, factory)` (out-of-tree / plugin
+   formats).  The registry is consulted BEFORE the built-in dispatch, so a
+   registered factory OVERRIDES the built-in opener for that kind.
+
+The seam is pinned by ``tests/core/test_source_registry_seam.py`` (H17): adding a
+format is a registration + one classification arm, never a rewrite of
+``open_source``.
+"""
 
 from __future__ import annotations
 
