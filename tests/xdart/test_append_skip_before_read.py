@@ -516,9 +516,23 @@ def test_append_initialize_config_mismatch_aborts_with_empty_img_file(tmp_path):
         "gi_mode_2d": "qip_qoop",
     }
 
-    with pytest.raises(RuntimeError, match="processed: Standard .* current: Grazing"):
+    with pytest.raises(RuntimeError, match="Integration settings changed mid-run") as excinfo:
         worker.initialize_scan()
 
+    # TYPED (still a RuntimeError subclass) so run()/process_scan can stop the
+    # run cleanly instead of crashing the QThread; carries the check and names
+    # the differing fields + the preserved target in the user-facing message.
+    from xrd_tools.session.readiness import AppendConfigMismatchError
+
+    err = excinfo.value
+    assert isinstance(err, AppendConfigMismatchError)
+    assert err.check.ok is False
+    assert err.check.mismatched_fields
+    assert (err.check.processed_label, err.check.current_label) == (
+        "Standard", "Grazing")
+    for label in err.check.mismatched_fields:
+        assert label in str(err)
+    assert "scan.nxs was preserved" in str(err)
     assert target.read_bytes() == before
 
 

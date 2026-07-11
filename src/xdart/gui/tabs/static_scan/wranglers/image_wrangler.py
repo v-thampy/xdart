@@ -518,6 +518,11 @@ class imageWrangler(wranglerWidget):
         )
 
         self.thread.showLabel.connect(self._set_status_text)
+        # Mid-run Append config mismatch: the worker stopped the run cleanly
+        # (target preserved) — surface the one-modal warning here, because the
+        # Run-click mismatch modal (_confirm_append_config_replace) only fires
+        # at Run-click and a MID-RUN settings change bypasses it.
+        self.thread.sigAppendMismatch.connect(self._on_append_mismatch)
         self.thread.sigUpdateFile.connect(self.sigUpdateFile.emit)
         self.thread.finished.connect(self.finished.emit)
         self.thread.sigUpdate.connect(self.sigUpdateData.emit)
@@ -1186,6 +1191,27 @@ class imageWrangler(wranglerWidget):
         box.setEscapeButton(no)
         box.exec()
         return box.clickedButton() is yes
+
+    def _on_append_mismatch(self, message):
+        """Mid-run Append config mismatch: the worker already stopped the run
+        cleanly and preserved the append target — tell the user WHY the run
+        stopped.  Counterpart of the Run-click ``_confirm_append_config_replace``
+        modal (which cannot fire for a mid-run settings change); informational
+        only, so a single-button warning instead of Yes/No.
+        """
+        parent = self if isinstance(self, QtWidgets.QWidget) else None
+        box = QMessageBox(parent)
+        try:
+            box.setIcon(QMessageBox.Warning)
+        except Exception:
+            pass
+        box.setWindowTitle("Integration settings changed mid-run")
+        box.setText(message)
+        box.exec()
+        # AFTER the modal: wrangler_finished → stop() clears the status label
+        # while the modal is up (its queued delivery runs inside the modal's
+        # event loop), so assert the stop reason once the box is dismissed.
+        imageWrangler._safe_status_text(self, message)
 
     def _set_active_write_mode(self, mode):
         controls = getattr(self, "_controls", None)

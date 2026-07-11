@@ -298,7 +298,8 @@ def test_append_loaded_scan_processing_config_mismatch_requests_confirmation(cap
     assert profile.can_run
     assert profile.run_blockers == ()
     assert profile.append_confirm_reason == (
-        "processed: Standard · current: Grazing — switch write mode "
+        "processed: Standard · current: Grazing "
+        "(differs: mode, 1D axis, 2D axis) — switch write mode "
         "to Replace, or revert settings"
     )
     assert "checked: mode" not in profile.append_confirm_reason

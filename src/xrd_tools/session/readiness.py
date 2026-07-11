@@ -133,6 +133,26 @@ class AppendConfigCheck:
     current_label: str = ""
 
 
+class AppendConfigMismatchError(RuntimeError):
+    """An Append target's stored config differs from the current run config.
+
+    Raised by run paths (e.g. the xdart image wrangler's ``initialize_scan``)
+    when :func:`append_config_mismatch_check` fails after the Run-click modal
+    can no longer intervene — a mid-run settings change, or a later
+    auto-discovered scan of a directory run.  Subclasses ``RuntimeError`` so
+    pre-existing broad handlers keep working, while run loops can catch THIS
+    mismatch specifically and stop cleanly instead of crashing the worker
+    thread.  Carries the :class:`AppendConfigCheck` (``reason``,
+    ``mismatched_fields``, ``processed_label``/``current_label``) so the GUI
+    can name what changed without re-deriving the comparison.  The append
+    target itself is untouched — the guard preserved it.
+    """
+
+    def __init__(self, message: str, check: AppendConfigCheck):
+        super().__init__(message)
+        self.check = check
+
+
 def _mapping(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
@@ -414,8 +434,12 @@ def append_config_mismatch_check(
         compared_fields,
         mismatches,
     )
+    # Name WHAT changed: display_mode only carries the GI/Standard axis, so a
+    # same-mode mismatch (e.g. a mid-run Int 1D -> Int 2D settings change) used
+    # to read "processed: Standard · current: Standard" — true but useless.
     reason = (
         f"processed: {processed.display_mode} · current: {current.display_mode} "
+        f"(differs: {', '.join(mismatches)}) "
         "— switch write mode to Replace, or revert settings"
     )
     return AppendConfigCheck(

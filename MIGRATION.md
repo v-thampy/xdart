@@ -304,6 +304,19 @@ for downstream users:
   falls back to a dedicated `faulthandler.log` side file next to it (or stays
   off if neither stderr nor a log directory is usable) — it never aborts the
   launch. Affected v1.0.0 and v1.0.1 equally.
+* **An Append run over targets written with different integration settings now
+  stops cleanly instead of crashing.** Re-running a directory in Append mode
+  after changing integration settings (e.g. an Int 1D pass, Stop, switch to
+  Int 2D, re-run) correctly refuses to mix the two configs into one append
+  file — but the refusal escaped the processing thread as an unhandled
+  exception ("Unhandled exception in xdart GUI") and killed the run with no
+  explanation. The run now stops cleanly (same teardown as pressing Stop), a
+  warning dialog explains what happened, and the message names the actual
+  setting(s) that differ (previously it only showed the Grazing/Standard mode,
+  which reads "Standard · Standard" when a 1D/2D grid setting is what changed).
+  The existing append target is preserved either way — switch write mode to
+  Replace, or revert the settings, to continue. Affected v1.0.0 and v1.0.1
+  equally.
 
 ## Fixes in v1.0.1
 

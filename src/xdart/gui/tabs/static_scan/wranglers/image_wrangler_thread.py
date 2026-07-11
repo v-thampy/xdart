@@ -88,6 +88,7 @@ from xrd_tools.reduction import (
 )
 from xrd_tools.session import FrameRecordStore
 from xrd_tools.session.readiness import (
+    AppendConfigMismatchError,
     append_config_mismatch_check,
     processing_config_from_scan,
 )
@@ -471,6 +472,10 @@ class imageThread(wranglerThread):
     # in-flight window + flushed the sink to .nxs at a frame boundary -- the GUI
     # slot then lifts the freeze guard, race-safely (writer is provably quiet).
     sigPaused = Qt.QtCore.Signal()
+    # Mid-run Append config mismatch (guard held, target preserved, run
+    # stopping cleanly): carries the user-facing message for the GUI's
+    # one-modal warning + status text — see _handle_append_config_mismatch.
+    sigAppendMismatch = Qt.QtCore.Signal(str)
 
     def __init__(
             self,
@@ -739,6 +744,11 @@ class imageThread(wranglerThread):
 
         try:
             self.process_scan()
+        except AppendConfigMismatchError as exc:
+            # Backstop: process_scan handles this at its initialize_scan call
+            # sites; nothing may escape run() as an unhandled QThread
+            # exception (the v1.0.1 mid-run mode-change beamline crash).
+            self._handle_append_config_mismatch(exc)
         finally:
             self._close_reduction_session()
             # Stop background prefetcher from the main thread BEFORE closing the
@@ -1231,7 +1241,14 @@ class imageThread(wranglerThread):
                             '[SAVE-ON-SWAP] %d frames flushed for %s',
                             _n_swap, scan.name,
                         )
-                scan = self.initialize_scan()
+                try:
+                    scan = self.initialize_scan()
+                except AppendConfigMismatchError as exc:
+                    # `scan` still refers to the PREVIOUS scan (already
+                    # flushed above); stop cleanly through the shared
+                    # end-of-run tail — same path as a user Stop.
+                    self._handle_append_config_mismatch(exc)
+                    break
                 self._active_scan = scan      # Pause: serial-flush handle
                 _cached_poni = None
 
@@ -1355,7 +1372,14 @@ class imageThread(wranglerThread):
                 self.scan_name = scan_name
 
                 if (scan is None) or (scan_name != scan.name):
-                    scan = self.initialize_scan()
+                    try:
+                        scan = self.initialize_scan()
+                    except AppendConfigMismatchError as exc:
+                        # `scan` stays the previous scan; the final force
+                        # flush below persists its tail, exactly like a
+                        # user Stop while watching.
+                        self._handle_append_config_mismatch(exc)
+                        break
                     self._active_scan = scan  # Pause: serial-flush handle
                     _cached_poni = None
 
@@ -3435,6 +3459,26 @@ class imageThread(wranglerThread):
         except ValueError:
             pass
 
+    def _handle_append_config_mismatch(self, exc):
+        """Stop the run CLEANLY on a mid-run Append config mismatch.
+
+        The guard in ``initialize_scan`` is CORRECT — 1D and 2D configs must
+        not mix into one append file, and the target was preserved.  The
+        DELIVERY used to be the bug: the bare RuntimeError escaped ``run()``
+        (try/…/finally, no except) as an unhandled QThread exception and
+        killed the run through the GUI excepthook.  Instead: the same clean
+        stop as a user Stop (``command='stop'`` → the shared end-of-run tail
+        still force-flushes the previous scan; ``run()``'s finally releases
+        the reduction session, prefetcher and Eiger handle) plus
+        ``sigAppendMismatch`` so the GUI surfaces the one-modal warning.
+        """
+        logger.error("run stopped: %s", exc)
+        self.command = 'stop'
+        try:
+            self.sigAppendMismatch.emit(str(exc))
+        except Exception:
+            logger.debug("sigAppendMismatch emit failed", exc_info=True)
+
     def initialize_scan(self):
         """If scan changes, initialize new LiveScan object.
         If mode is overwrite, replace existing HDF5 file, else append to it.
@@ -3493,9 +3537,21 @@ class imageThread(wranglerThread):
                         append_check = append_config_mismatch_check(
                             write_mode, processed_config, current_config)
                         if not append_check.ok:
-                            raise RuntimeError(
-                                f"{append_check.reason}. Existing append target "
-                                "preserved."
+                            # TYPED so process_scan can stop the run cleanly
+                            # and surface a modal instead of letting a bare
+                            # RuntimeError escape the QThread (the v1.0.1
+                            # mid-run Int 1D -> Int 2D beamline crash).  The
+                            # Run-click mismatch modal (CF-2/CF-3) only fires
+                            # at Run-click, so a mid-run settings change (or a
+                            # later auto-discovered scan) lands HERE.
+                            fields = ", ".join(append_check.mismatched_fields)
+                            raise AppendConfigMismatchError(
+                                f"Integration settings changed mid-run "
+                                f"({fields}); the append target "
+                                f"{os.path.basename(fname)} was preserved. "
+                                "Switch write mode to Replace, or revert "
+                                "settings, to continue.",
+                                append_check,
                             )
                         scan.skip_2d = self.scan.skip_2d
                         for (k, v) in self.scan_args.items():

@@ -10,7 +10,10 @@ existing .nxs).  Production-wired: the real append_config_mismatch_check on real
 config mappings, no monkeypatch.
 """
 
-from xrd_tools.session.readiness import append_config_mismatch_check
+from xrd_tools.session.readiness import (
+    AppendConfigMismatchError,
+    append_config_mismatch_check,
+)
 
 
 def _cfg(a1=None, a2=None):
@@ -72,6 +75,38 @@ def test_npt_change_still_blocks():
 def test_non_append_mode_never_blocks():
     assert append_config_mismatch_check(
         "Replace", _cfg({"chi_offset": 0.0}), _cfg({"chi_offset": 90.0})).ok
+
+
+# ── mid-run delivery: the typed error + a reason that names WHAT changed ─────
+def test_mismatch_reason_names_the_differing_fields():
+    # The beamline case: Int 1D -> Int 2D mid-run, BOTH sides Standard mode.
+    # display_mode alone read "processed: Standard · current: Standard" — true
+    # but useless; the reason must name the actual differing field(s).
+    check = append_config_mismatch_check(
+        "Append", _cfg(a2={"npt_rad": 500}), _cfg(a2={"npt_rad": 1000}))
+
+    assert check.ok is False
+    assert check.mismatched_fields == ("2D radial points",)
+    assert (check.processed_label, check.current_label) == (
+        "Standard", "Standard")
+    for label in check.mismatched_fields:
+        assert label in check.reason
+    assert "switch write mode to Replace" in check.reason
+
+
+def test_append_config_mismatch_error_carries_check():
+    # The typed error the run loop catches to stop cleanly (instead of a bare
+    # RuntimeError escaping the worker thread): still a RuntimeError subclass
+    # for pre-existing broad handlers, and it carries the full check so the
+    # GUI can name the differing fields without re-deriving the comparison.
+    check = append_config_mismatch_check(
+        "Append", _cfg(a2={"npt_rad": 500}), _cfg(a2={"npt_rad": 1000}))
+    err = AppendConfigMismatchError(check.reason, check)
+
+    assert isinstance(err, RuntimeError)
+    assert err.check is check
+    assert err.check.mismatched_fields == ("2D radial points",)
+    assert "2D radial points" in str(err)
 
 
 def test_gi_chi_offset_change_does_not_block_append():
