@@ -67,13 +67,38 @@ def test_analysis_launchers_carry_context_contract_metadata():
     roi = _launcher(specs, AnalysisTool.ROI_STATS)
     scan_plot = _launcher(specs, AnalysisTool.SCAN_PLOT)
 
-    assert peak.entry_point.endswith("peak_fit_dialog:PeakFitDialog")
+    # H16: the headless spec carries only headless facts (caps/deps/singleton);
+    # the GUI dialog dotted-path lives GUI-side, not on the spec.
+    assert not hasattr(peak, "entry_point")
     assert peak.required_caps == frozenset({ResultCap.HAS_1D})
     assert peak.optional_deps == frozenset({"fitting"})
     assert peak.singleton_key == AnalysisTool.PEAK_FIT.value
     assert roi.required_caps == frozenset({ResultCap.RAW_REACHABLE})
     assert roi.singleton_key == "roi_stats"
     assert scan_plot.required_caps == frozenset({ResultCap.SCAN_METADATA})
+
+
+def test_analysis_launcher_entry_points_are_bound_gui_side():
+    """H16 layering contract: the headless module names WHICH tools exist; the
+    GUI binds each to its dialog.  Every tool the headless builder emits must
+    have a GUI-side entry point (a `module:Class` dotted path under `xdart.gui`),
+    so adding a launcher is a GUI-side addition and the headless core never
+    import-names a GUI class."""
+    from xdart.gui.tabs.static_scan.analysis_launchers import (
+        ANALYSIS_LAUNCHER_ENTRY_POINTS,
+        analysis_launcher_entry_point,
+    )
+
+    specs = build_analysis_launchers(
+        ResultCaps(has_1d=True, raw_reachable=True, has_scan_metadata=True))
+    for spec in specs:
+        ep = analysis_launcher_entry_point(spec.tool)
+        assert ep is not None, spec.tool
+        assert ep.startswith("xdart.gui.") and ":" in ep, (spec.tool, ep)
+    # The binding is exactly the tools the builder emits — no stale/missing keys.
+    assert set(ANALYSIS_LAUNCHER_ENTRY_POINTS) == {s.tool for s in specs}
+    assert analysis_launcher_entry_point(AnalysisTool.PEAK_FIT).endswith(
+        "peak_fit_dialog:PeakFitDialog")
 
 
 def test_future_analysis_tools_are_present_but_gated_by_data():

@@ -647,7 +647,6 @@ class AnalysisLauncherSpec:
     live_capable: bool = False
     batch_capable: bool = False
     production_ready: bool = True
-    entry_point: str = ""
     required_caps: frozenset[ResultCap] = field(default_factory=frozenset)
     optional_deps: frozenset[str] = field(default_factory=frozenset)
     singleton_key: str = ""
@@ -1955,7 +1954,6 @@ def build_field_statuses(state: ControlState) -> Mapping[FieldId, FieldStatus]:
 def _disabled(tool: AnalysisTool, label: str, reason: str, *,
               live: bool = False, batch: bool = False,
               production_ready: bool = True,
-              entry_point: str = "",
               required_caps: frozenset[ResultCap] | None = None,
               optional_deps: frozenset[str] | None = None,
               singleton_key: str = "") -> AnalysisLauncherSpec:
@@ -1963,7 +1961,6 @@ def _disabled(tool: AnalysisTool, label: str, reason: str, *,
         tool=tool, label=label, enabled=False, reason=reason,
         live_capable=live, batch_capable=batch,
         production_ready=production_ready,
-        entry_point=entry_point,
         required_caps=required_caps or frozenset(),
         optional_deps=optional_deps or frozenset(),
         singleton_key=singleton_key or tool.value)
@@ -1972,7 +1969,6 @@ def _disabled(tool: AnalysisTool, label: str, reason: str, *,
 def _enabled(tool: AnalysisTool, label: str, *,
              reason: str = "", live: bool = False, batch: bool = False,
              production_ready: bool = True,
-             entry_point: str = "",
              required_caps: frozenset[ResultCap] | None = None,
              optional_deps: frozenset[str] | None = None,
              singleton_key: str = "") -> AnalysisLauncherSpec:
@@ -1980,7 +1976,6 @@ def _enabled(tool: AnalysisTool, label: str, *,
         tool=tool, label=label, enabled=True, reason=reason,
         live_capable=live, batch_capable=batch,
         production_ready=production_ready,
-        entry_point=entry_point,
         required_caps=required_caps or frozenset(),
         optional_deps=optional_deps or frozenset(),
         singleton_key=singleton_key or tool.value)
@@ -1995,32 +1990,26 @@ def build_analysis_launchers(caps: ResultCaps) -> tuple[AnalysisLauncherSpec, ..
     """
 
     peak_caps = frozenset({ResultCap.HAS_1D})
-    peak_entry = "xdart.gui.tabs.static_scan.peak_fit_dialog:PeakFitDialog"
     peak = (_enabled(AnalysisTool.PEAK_FIT, "Peak Fitting",
                      reason="Waiting for a 1D pattern." if not caps.has_1d else "",
                      live=True, batch=True,
-                     entry_point=peak_entry,
                      required_caps=peak_caps,
                      optional_deps=frozenset({"fitting"}))
             if caps.has_optional_dep("fitting")
             else _disabled(AnalysisTool.PEAK_FIT, "Peak Fitting",
                            "Install fitting dependencies.", live=True, batch=True,
-                           entry_point=peak_entry,
                            required_caps=peak_caps,
                            optional_deps=frozenset({"fitting"})))
 
     phase_caps = frozenset({ResultCap.HAS_1D})
-    phase_entry = "xdart.gui.tabs.static_scan.phase_fit_dialog:PhaseFitDialog"
     phase = (_enabled(AnalysisTool.PHASE_FIT, "Phase Fitting",
                       reason="Waiting for a 1D pattern." if not caps.has_1d else "",
                       batch=True,
-                      entry_point=phase_entry,
                       required_caps=phase_caps,
                       optional_deps=frozenset({"fitting"}))
              if caps.has_optional_dep("fitting")
              else _disabled(AnalysisTool.PHASE_FIT, "Phase Fitting",
                             "Install fitting dependencies.", batch=True,
-                            entry_point=phase_entry,
                             required_caps=phase_caps,
                             optional_deps=frozenset({"fitting"})))
 
@@ -2028,7 +2017,6 @@ def build_analysis_launchers(caps: ResultCaps) -> tuple[AnalysisLauncherSpec, ..
         AnalysisTool.SCAN_PLOT, "Plot Metadata",
         reason="" if caps.has_scan_metadata else "Choose a scan/source in the dialog.",
         batch=True,
-        entry_point="xdart.gui.tabs.static_scan.scan_plot_dialog:ScanPlotDialog",
         required_caps=frozenset({ResultCap.SCAN_METADATA}),
         singleton_key="scan_plot")
 
@@ -2045,7 +2033,6 @@ def build_analysis_launchers(caps: ResultCaps) -> tuple[AnalysisLauncherSpec, ..
         live_capable=roi.live_capable,
         batch_capable=roi.batch_capable,
         production_ready=roi.production_ready,
-        entry_point="xdart.gui.tabs.static_scan.scan_plot_dialog:ScanPlotDialog",
         required_caps=frozenset({ResultCap.RAW_REACHABLE}),
         singleton_key="roi_stats",
     )
@@ -2053,7 +2040,6 @@ def build_analysis_launchers(caps: ResultCaps) -> tuple[AnalysisLauncherSpec, ..
     strain_ready = caps.has_1d and caps.has_psi_metadata
     strain = (_enabled(AnalysisTool.SIN2PSI, "Strain / sin²ψ",
                        live=False, batch=True, production_ready=False,
-                       entry_point="xdart.gui.tabs.static_scan.strain_dialog:StrainDialog",
                        required_caps=frozenset({
                            ResultCap.HAS_1D,
                            ResultCap.PSI_METADATA,
@@ -2063,7 +2049,6 @@ def build_analysis_launchers(caps: ResultCaps) -> tuple[AnalysisLauncherSpec, ..
               else _disabled(AnalysisTool.SIN2PSI, "Strain / sin²ψ",
                              "Needs 1D patterns with ψ metadata.",
                              batch=True, production_ready=False,
-                             entry_point="xdart.gui.tabs.static_scan.strain_dialog:StrainDialog",
                              required_caps=frozenset({
                                  ResultCap.HAS_1D,
                                  ResultCap.PSI_METADATA,
@@ -2073,14 +2058,12 @@ def build_analysis_launchers(caps: ResultCaps) -> tuple[AnalysisLauncherSpec, ..
     texture_ready = caps.has_1d or caps.has_phase_result
     texture = (_enabled(AnalysisTool.TEXTURE, "Texture / Orientation",
                         batch=True, production_ready=False,
-                        entry_point="xdart.gui.tabs.static_scan.texture_dialog:TextureDialog",
                         required_caps=frozenset({ResultCap.PHASE_RESULT}),
                         singleton_key="texture")
                if texture_ready
                else _disabled(AnalysisTool.TEXTURE, "Texture / Orientation",
                               "Needs fitted phases or suitable 1D patterns.",
                               batch=True, production_ready=False,
-                              entry_point="xdart.gui.tabs.static_scan.texture_dialog:TextureDialog",
                               required_caps=frozenset({ResultCap.PHASE_RESULT}),
                               singleton_key="texture"))
     return peak, phase, scan_plot, roi, strain, texture
