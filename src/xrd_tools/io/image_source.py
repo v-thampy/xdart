@@ -45,11 +45,14 @@ __all__ = [
 _HDF5_SUFFIXES = (".h5", ".hdf5", ".nxs", ".cxi")
 
 # Raw-detector dataset candidates (mirrors the GUI's old _is_xdart_processed).
+# ``entry/data/eiger_image`` is the embedded Bluesky/apstools NXWriter detector
+# stack (the NXdata ``@signal`` there points at a scalar counter, not the image).
 _RAW_DATASET_CANDIDATES = (
     "entry/instrument/detector/data",
     "entry/instrument/detector/data_000001",
     "entry/data/data",
     "entry/measurement/data",
+    "entry/data/eiger_image",
     "entry/data",
 )
 
@@ -205,6 +208,16 @@ def classify_image_source(path) -> ImageSourceInfo:
                             kind=ImageSourceKind.RAW_MASTER, path=str(p),
                             frame_labels=tuple(range(int(n))),
                             has_raw=True, has_thumbnail=False)
+                # Bluesky/NXWriter (or any file) flagging pixels with
+                # ``@signal_type='detector'`` under a non-canonical name.
+                from xrd_tools.io.bluesky_nexus import find_detector_signal_dataset
+                det = find_detector_signal_dataset(f)
+                if det is not None and det.ndim >= 2:
+                    n = det.shape[0] if det.ndim >= 3 else 1
+                    return ImageSourceInfo(
+                        kind=ImageSourceKind.RAW_MASTER, path=str(p),
+                        frame_labels=tuple(range(int(n))),
+                        has_raw=True, has_thumbnail=False)
 
             labels = _frame_labels_from_groups(entry) if entry is not None else []
 

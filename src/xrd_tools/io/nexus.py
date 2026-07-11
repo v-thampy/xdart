@@ -578,6 +578,16 @@ def find_nexus_image_dataset_in_open_file(
             if inner in h5f and isinstance(h5f[inner], h5py.Dataset) and h5f[inner].ndim == 3:
                 return f"/{inner}"
 
+    # Bluesky / apstools NXWriter: the NXdata ``@signal`` points at a scalar
+    # counter, so the detector pixels are flagged ``@signal_type='detector'``
+    # instead (on ``entry/data/eiger_image`` etc.).  Prefer that explicit marker
+    # over the weak largest-3D fallback below — the same convention the viewer
+    # resolver in ``image.py`` uses.
+    from xrd_tools.io.bluesky_nexus import find_detector_signal_dataset
+    det = find_detector_signal_dataset(grp)
+    if det is not None:
+        return det.name
+
     best_path: str | None = None
     best_size = 0
 
@@ -2736,6 +2746,12 @@ def _scalar_or_first(ds: h5py.Dataset) -> float:
 
 def _read_energy(grp: h5py.Group) -> float:
     """Extract beam energy (keV) from the monochromator group."""
+    from xrd_tools.io.bluesky_nexus import bluesky_energy_kev, is_bluesky_nxwriter
+    if is_bluesky_nxwriter(grp):
+        # Bluesky/NXWriter: energy lives in the eiger detector config (in eV).
+        ev = bluesky_energy_kev(grp)
+        if np.isfinite(ev):
+            return ev
     path = "instrument/monochromator/energy"
     if path in grp:
         try:
@@ -2748,6 +2764,12 @@ def _read_energy(grp: h5py.Group) -> float:
 
 def _read_wavelength(grp: h5py.Group, energy: float) -> float:
     """Extract wavelength (Å) or derive from energy."""
+    from xrd_tools.io.bluesky_nexus import bluesky_wavelength, is_bluesky_nxwriter
+    if is_bluesky_nxwriter(grp):
+        # Bluesky/NXWriter: eiger config records the wavelength directly (Å).
+        wl = bluesky_wavelength(grp)
+        if np.isfinite(wl):
+            return wl
     path = "instrument/monochromator/wavelength"
     if path in grp:
         try:
@@ -2815,6 +2837,22 @@ def _read_data_group(
     """
     angles: dict[str, np.ndarray] = {}
     counters: dict[str, np.ndarray] = {}
+
+    # Bluesky / apstools NXWriter branch: motors are the authoritative
+    # ``instrument/positioners`` group names (NOT the 80 flat ``entry/data``
+    # columns), counters are the ion-chamber/photodiode channels, both read as
+    # per-frame arrays from ``entry/data/<name>``.  Keeps the dtype.kind guard +
+    # frame_index skip inside the harvesters.  Without this, ``meta.angles`` is
+    # polluted with EPICS/stats columns and the scan motor (``hy``) is buried.
+    from xrd_tools.io.bluesky_nexus import (
+        bluesky_angles,
+        bluesky_counters,
+        is_bluesky_nxwriter,
+    )
+    if is_bluesky_nxwriter(grp):
+        angles = bluesky_angles(grp, motor_names)
+        counters = bluesky_counters(grp, counter_names)
+        return angles, counters
 
     counter_set: frozenset[str] = (
         frozenset(counter_names) if counter_names is not None
@@ -2917,14 +2955,24 @@ def _dataset_to_native_array(ds: h5py.Dataset) -> np.ndarray:
 
 
 def _read_positioners(grp: h5py.Group) -> dict[str, np.ndarray]:
-    """Read NXpositioner children of an NXcollection into a dict (v2)."""
+    """Read NXpositioner children of an NXcollection into a dict (v2).
+
+    Handles two ``value`` shapes: xdart's flat ``<motor>/value`` dataset, and
+    Bluesky/NXWriter's nested ``<motor>/value`` NXdata group whose own ``value``
+    child holds the per-frame array."""
     out: dict[str, np.ndarray] = {}
     for k, item in grp.items():
         if k == "frame_index":
             continue
         if isinstance(item, h5py.Group):
-            if "value" in item:
-                out[k] = np.asarray(item["value"][()])
+            value = item.get("value")
+            if isinstance(value, h5py.Dataset):
+                out[k] = np.asarray(value[()])
+            elif isinstance(value, h5py.Group):
+                # Bluesky positioner: value is an NXdata group -> its 'value' array.
+                inner = value.get("value")
+                if isinstance(inner, h5py.Dataset):
+                    out[k] = np.asarray(inner[()])
         elif isinstance(item, h5py.Dataset):
             out[k] = np.asarray(item[()])
     return out
@@ -3060,6 +3108,7 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
         for category, path_in in [
             ("sample", "sample/positioners"),
             ("detector", "instrument/detector/positioners"),
+            ("instrument", "instrument/positioners"),
         ]:
             if path_in in e:
                 pos = _read_positioners(e[path_in])
@@ -3232,6 +3281,7 @@ def read_scan_metadata(
         for category, path_in in [
             ("sample", "sample/positioners"),
             ("detector", "instrument/detector/positioners"),
+            ("instrument", "instrument/positioners"),
         ]:
             if path_in in e:
                 pos = _read_positioners(e[path_in])

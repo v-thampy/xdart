@@ -52,11 +52,71 @@ class NexusStackSource(BaseFrameSource):
     def frame_for(self, index: int) -> ScanFrame:
         return ScanFrame(
             index=int(index),
+            metadata=dict(self.metadata_for(index)),
             source_path=self.path,
             source_frame_index=int(index),
             loader=lambda frame: self.load_frame(frame.source_frame_index or 0),
             source_identity=str(self.path),
         )
+
+    # -- Bluesky / apstools NXWriter per-frame metadata --------------------
+    # A Bluesky ``.nxs`` classifies as a NEXUS_STACK (raw image stack), so its
+    # per-frame scan columns (motors + ion-chamber/photodiode counters + EPOCH)
+    # would otherwise be invisible to Plot Metadata.  Surface them here (motors
+    # as whole-array columns via ``motors``; counters/EPOCH per-frame via
+    # ``metadata_for``).  Guarded + cached so a plain image stack is untouched.
+    def _bluesky_columns(self) -> dict | None:
+        cache = getattr(self, "_bluesky_cache", "unset")
+        if cache != "unset":
+            return cache
+        result: dict | None = None
+        try:
+            import h5py
+
+            from xrd_tools.io.bluesky_nexus import (
+                bluesky_angles,
+                bluesky_per_frame_table,
+                is_bluesky_nxwriter,
+                resolve_nxentry,
+            )
+            with h5py.File(self.path, "r") as f:
+                e = resolve_nxentry(f, self.entry)
+                if e is not None and is_bluesky_nxwriter(e):
+                    result = {
+                        "motors": {k: np.asarray(v)
+                                   for k, v in bluesky_angles(e).items()},
+                        "table": {k: np.asarray(v)
+                                  for k, v in bluesky_per_frame_table(e).items()},
+                    }
+        except Exception:
+            result = None
+        self._bluesky_cache = result
+        return result
+
+    @property
+    def motors(self) -> dict[str, np.ndarray]:
+        cols = self._bluesky_columns()
+        return dict(cols["motors"]) if cols else {}
+
+    def metadata_for(self, index: int) -> Mapping[str, Any]:
+        cols = self._bluesky_columns()
+        if not cols:
+            return {}
+        table, motors = cols["table"], cols["motors"]
+        try:
+            pos = self._frame_indices.index(int(index))
+        except ValueError:
+            return {}
+        out: dict[str, Any] = {}
+        for name, arr in table.items():
+            if name in motors:
+                continue  # motors already surface as whole-array columns
+            if 0 <= pos < len(arr):
+                try:
+                    out[name] = float(arr[pos])
+                except (TypeError, ValueError):
+                    pass
+        return out
 
 
 class ProcessedNexusSource(BaseFrameSource):

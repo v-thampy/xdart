@@ -618,6 +618,16 @@ def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
             if isinstance(obj, h5py.Dataset) and obj.ndim >= 2:
                 return obj  # type: ignore[return-value]
 
+    # --- 1b. Bluesky / apstools NXWriter detector marker ---------------------
+    # Bluesky points the NXdata ``@signal`` at a scalar counter, so the image
+    # pixels are flagged ``@signal_type='detector'`` instead.  Prefer that
+    # explicit marker BEFORE the generic ``@signal`` search below (which would
+    # otherwise latch onto the counter / miss the image).
+    from xrd_tools.io.bluesky_nexus import find_detector_signal_dataset
+    det = find_detector_signal_dataset(f)
+    if det is not None:
+        return det  # type: ignore[return-value]
+
     # --- 2. NXdata groups (signal attribute) ---------------------------------
     def _search_nxdata(grp: h5py.Group) -> h5py.Dataset | None:
         for name, item in grp.items():

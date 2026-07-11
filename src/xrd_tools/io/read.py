@@ -654,6 +654,46 @@ def _raw_frame_or_thumbnail(
     )
 
 
+def _bluesky_metadata(entry) -> dict:
+    """Build the :func:`get_metadata` dict for a Bluesky/NXWriter file directly
+    from the Bluesky harvesters (motors + counters + eiger config)."""
+    from xrd_tools.io.bluesky_nexus import (
+        bluesky_angles,
+        bluesky_energy_kev,
+        bluesky_per_frame_table,
+        bluesky_scalar_metadata,
+        bluesky_wavelength,
+    )
+
+    angles = bluesky_angles(entry)
+    scan_data = bluesky_per_frame_table(entry)
+    scalars = bluesky_scalar_metadata(entry)
+    wl = bluesky_wavelength(entry)
+    en = bluesky_energy_kev(entry)
+
+    n = 0
+    for arr in scan_data.values():
+        n = int(np.asarray(arr).shape[0])
+        break
+    if n == 0 and "num_points" in scalars:
+        n = int(scalars["num_points"])
+
+    return {
+        "frames": np.arange(n, dtype=np.int64),
+        "n_frames": n,
+        "has_1d": False,
+        "has_2d": False,
+        "sample_name": str(scalars.get("title", "") or ""),
+        "energy_keV": float(en) if np.isfinite(en) else None,
+        "wavelength_A": float(wl) if np.isfinite(wl) else None,
+        "ub_matrix": None,
+        "capabilities": [],
+        "positioners": angles,
+        "scan_data": scan_data,
+        "reduction": {"bluesky": scalars},
+    }
+
+
 def get_metadata(scan_file: str | Path, *, entry: str = "entry") -> dict:
     """Return a flat dict of scan-level metadata (no heavy intensity arrays).
 
@@ -670,6 +710,16 @@ def get_metadata(scan_file: str | Path, *, entry: str = "entry") -> dict:
     per-frame metadata table (i0, monitor, temperature, …) is in
     ``scan_data``.
     """
+    # Bluesky / apstools NXWriter acquisition files are NOT xdart-processed
+    # (no integrated stacks / scan_data group).  Build the metadata straight
+    # from the Bluesky harvesters so Plot Metadata sees the real per-frame
+    # columns (hy, i0..pd, EPOCH) instead of an empty table.
+    from xrd_tools.io.bluesky_nexus import is_bluesky_nxwriter, resolve_nxentry
+    with h5py.File(Path(scan_file), "r") as _bf:
+        _be = resolve_nxentry(_bf, entry)
+        if _be is not None and is_bluesky_nxwriter(_be):
+            return _bluesky_metadata(_be)
+
     # Reuse the canonical metadata-only reader for axes / positioners /
     # provenance, then add the instrument/sample scalars it doesn't carry.
     from xrd_tools.io.nexus import (
@@ -698,7 +748,8 @@ def get_metadata(scan_file: str | Path, *, entry: str = "entry") -> dict:
         e = _entry(f, entry)
         positioners: dict = {}
         for path_in in ("sample/positioners",
-                        "instrument/detector/positioners"):
+                        "instrument/detector/positioners",
+                        "instrument/positioners"):
             if path_in in e:
                 positioners.update(_read_positioners(e[path_in]))
         # #78: the io.read boundary reports "absent" as None, never NaN —
