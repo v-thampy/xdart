@@ -4360,6 +4360,11 @@ class staticWidget(QWidget):
                 _key = _scan_key_from_source(getattr(_peek, "source_file", ""))
                 _cur = getattr(self.scan, "name", None)
                 if _key and _key != _cur and _cur != "null_main":
+                    # Directory scans can be shorter than the heavy-render cadence
+                    # (often one frame per scan).  Publish + accumulate the outgoing
+                    # scan before rescope clears its pending/store state; otherwise
+                    # a fast boundary silently drops that scan from Overlay/Waterfall.
+                    staticWidget._flush_overlay_before_frame_rescope(self)
                     self._rescope_frame_panel_to(_key, first_frame=_peek)
                     # Tell new_scan a frame ALREADY rescoped THIS run, so its late
                     # signal skips the (now-destructive) clear.  A consumed flag —
@@ -4683,7 +4688,23 @@ class staticWidget(QWidget):
                 start()
         return True
 
-    def _flush_pending_update(self):
+    def _flush_overlay_before_frame_rescope(self):
+        """Force an outgoing Overlay/Waterfall tick before destructive rescope."""
+        if staticWidget._overlay_plot_method(self) not in ("Overlay", "Waterfall"):
+            return False
+        if getattr(self, "_pending_update_idx", None) is None:
+            return False
+        self._update_timer.stop()
+        self._list_timer.stop()
+        self._flush_pending_update(force=True)
+        # _flush_pending_update updates the selection through H5Viewer, whose
+        # terminal sigUpdate is normally coalesced by another 100 ms timer.  A
+        # scan boundary cannot wait for that timer because rescope clears the
+        # outgoing PublicationStore immediately; render through the authority now.
+        staticWidget._request_render(self, "scan-boundary-overlay-flush")
+        return True
+
+    def _flush_pending_update(self, *, force=False):
         """Render the most recently received wrangler update.
 
         Called by _update_timer at the configured flush interval.  Coalesces
@@ -4701,7 +4722,7 @@ class staticWidget(QWidget):
         """
         if self._pending_update_idx is None:
             return
-        if staticWidget._render_authority_stale_for_flush(self):
+        if not force and staticWidget._render_authority_stale_for_flush(self):
             if staticWidget._rearm_stale_flush(self):
                 return
         self._render_authority_rearms = 0
@@ -5955,13 +5976,16 @@ class staticWidget(QWidget):
         staticWidget._request_render(self, "reintegrate-flush")
         self.metawidget.update()
 
-    def integrator_thread_finished(self):
-        """Function connected to threadFinished signals for
-        integratorThread
+    def _finalize_processing_run(self, *, reset_overlay, origin):
+        """Finish shared run UI state, optionally resetting plot history.
+
+        Overlay history belongs to the acquisition run and must survive normal
+        wrangler completion.  A true reintegration invalidates that history, so
+        only its finished slot requests the reset.
         """
         browse_debug_log(
             logger,
-            "runend_integrator_finished_enter",
+            f"runend_{origin}_finalize_enter",
             **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
         )
         self.thread_state_changed()
@@ -5977,42 +6001,51 @@ class staticWidget(QWidget):
         wrangler_running = self._wrangler_run_active()
         browse_debug_log(
             logger,
-            "runend_integrator_finished_state",
+            f"runend_{origin}_finalize_state",
             wrangler_running=wrangler_running,
             **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
         )
         if not wrangler_running:
             self._exit_run_state()
         self.h5viewer.set_open_enabled(True)
-        try:
-            browse_debug_log(
-                logger,
-                "runend_integrator_before_clear_overlay",
-                **_runend_waterfall_history_fields(
-                    getattr(self, "displayframe", None)),
-            )
-            self.displayframe.clear_overlay()
-            browse_debug_log(
-                logger,
-                "runend_integrator_after_clear_overlay",
-                **_runend_waterfall_history_fields(
-                    getattr(self, "displayframe", None)),
-            )
-        except Exception:
-            logger.debug("display overlay reset after reintegrate failed",
-                         exc_info=True)
+        if reset_overlay:
+            try:
+                browse_debug_log(
+                    logger,
+                    f"runend_{origin}_before_clear_overlay",
+                    **_runend_waterfall_history_fields(
+                        getattr(self, "displayframe", None)),
+                )
+                self.displayframe.clear_overlay()
+                browse_debug_log(
+                    logger,
+                    f"runend_{origin}_after_clear_overlay",
+                    **_runend_waterfall_history_fields(
+                        getattr(self, "displayframe", None)),
+                )
+            except Exception:
+                logger.debug("display overlay reset after reintegrate failed",
+                             exc_info=True)
         self.update_all()
         browse_debug_log(
             logger,
-            "runend_integrator_after_update_all",
+            f"runend_{origin}_finalize_after_update_all",
             **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
         )
         if not wrangler_running:
             self.wrangler.enabled(True)
         browse_debug_log(
             logger,
-            "runend_integrator_finished_exit",
+            f"runend_{origin}_finalize_exit",
             **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
+        )
+
+    def integrator_thread_finished(self):
+        """Finish a true reintegration and invalidate prior overlay history."""
+        staticWidget._finalize_processing_run(
+            self,
+            reset_overlay=True,
+            origin="integrator",
         )
 
     # ── Stitch (Stitch 1D / Stitch 2D modes) ───────────────────────────
@@ -6896,25 +6929,25 @@ class staticWidget(QWidget):
             # re-select does not re-trigger a load.
             self._select_finished_scan_row(written)
 
-        # The scan-matches branch delegates to integrator_thread_finished() to
-        # run the post-integration UI enable + exit the run-state.  Skip it when
-        # a real reintegrate is still running (the overlap case): calling it
-        # would exit the shared run-state and re-enable the controls mid-
-        # reintegrate.  In that case just re-enable the wrangler (its run IS
-        # done); the integrator's own finished handler exits the run-state when
-        # the reintegrate completes.
+        # Finalize shared run UI state when this scan owns the display.  A normal
+        # wrangler finish must preserve Overlay/Waterfall history; only a true
+        # reintegration invalidates it.  Skip finalization while reintegration is
+        # still running so controls remain locked until its own finished slot.
         if (self.scan.name == self.wrangler.scan_name
                 and not self.integratorTree.integrator_thread.isRunning()):
             browse_debug_log(
                 logger,
-                "runend_wrangler_before_integrator_finished_delegate",
+                "runend_wrangler_before_finalize",
                 **_runend_waterfall_history_fields(
                     getattr(self, "displayframe", None)),
             )
-            self.integrator_thread_finished()
+            self._finalize_processing_run(
+                reset_overlay=False,
+                origin="wrangler",
+            )
             browse_debug_log(
                 logger,
-                "runend_wrangler_after_integrator_finished_delegate",
+                "runend_wrangler_after_finalize",
                 **_runend_waterfall_history_fields(
                     getattr(self, "displayframe", None)),
             )

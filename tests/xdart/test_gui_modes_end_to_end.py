@@ -1950,6 +1950,110 @@ def test_int_plot_accumulating_modes_characterize_update_plot_state(widget, meth
     assert rebuilt["x_axis"][0].startswith("2")
 
 
+def test_directory_overlay_accumulates_reused_zero_index_at_live_cadence(
+        widget, qapp):
+    """Sixteen one-frame directory scans survive boundaries and auto-waterfall.
+
+    Arrivals are 40 ms apart, faster than both the 150 ms heavy-flush timer and
+    the 500 ms full-overlay paint cadence.  This drives the production handoff,
+    frame-driven rescope, publication store, controller, accumulator and Qt
+    coalescers, so it covers both the scan-qualified O(new) filter and the
+    cadence-sensitive outgoing-frame flush.
+    """
+    from PySide6 import QtTest
+    from xrd_tools.core import IntegrationResult1D
+
+    w = widget
+    df = w.displayframe
+    _set_processing_mode(w, "Int 1D")
+    df.ui.plotMethod.setCurrentText("Overlay")
+    df.ui.plotUnit.setCurrentIndex(0)
+    w.h5viewer.auto_last = True
+    w.h5viewer.live_run_active = True
+    w.h5viewer.file_thread.live_run = True
+    w._enter_run_state()
+
+    thread = w.wrangler.thread
+    thread.batch_mode = False
+    thread.mask = None
+    q = np.linspace(0.5, 3.0, 32)
+
+    def arrive(scan_number):
+        scan_name = f"SLP_position00_scan{scan_number:04d}"
+        source = f"/data/{scan_name}_0000.tif"
+        frame = SimpleNamespace(
+            idx=0,
+            gi=False,
+            scan_info={"mon": float(scan_number)},
+            source_file=source,
+            source_frame_idx=0,
+            map_raw=None,
+            bg_raw=0,
+            mask=None,
+            thumbnail=None,
+            int_1d=IntegrationResult1D(
+                radial=q,
+                intensity=np.full_like(q, float(scan_number)),
+                sigma=np.ones_like(q),
+                unit="q_A^-1",
+            ),
+            int_2d=None,
+            gi_1d={},
+            gi_2d={},
+        )
+        w.new_scan(
+            scan_name,
+            f"/tmp/{scan_name}.nxs",
+            False,
+            "th",
+            False,
+            False,
+        )
+        thread._published_frames[0] = frame
+        w.update_data(0)
+        QtTest.QTest.qWait(40)
+
+    try:
+        for scan_number in range(1, 16):
+            arrive(scan_number)
+        QtTest.QTest.qWait(600)
+
+        history = df._waterfall_history
+        assert history.count == 15
+        assert history.ids == tuple(
+            (f"SLP_position00_scan{scan_number:04d}", 0)
+            for scan_number in range(1, 16)
+        )
+        assert len(df.curves) == 15
+        assert not df._waterfall_active()
+
+        arrive(16)
+        QtTest.QTest.qWait(600)
+
+        history = df._waterfall_history
+        assert history.count == 16
+        assert history.ids[-1] == ("SLP_position00_scan0016", 0)
+        assert df._waterfall_active()
+        assert df.wf_widget.isVisible()
+
+        # Normal acquisition completion shares the run-state finalizer with
+        # reintegration, but must not inherit reintegration's history reset.
+        type(w)._finalize_processing_run(
+            w,
+            reset_overlay=False,
+            origin="wrangler",
+        )
+        QtTest.QTest.qWait(600)
+        assert df._waterfall_history.count == 16
+        assert df._waterfall_history.ids[-1] == ("SLP_position00_scan0016", 0)
+    finally:
+        w._update_timer.stop()
+        w._list_timer.stop()
+        w.h5viewer.live_run_active = False
+        w.h5viewer.file_thread.live_run = False
+        w._exit_run_state()
+
+
 def test_int_plot_slice_characterizes_update_plot_state(widget):
     # Slice-derived 1D is update_plot-live: it projects from the cake and
     # includes the slice parameters in the trace name.
@@ -2789,9 +2893,8 @@ def test_integrator_finish_while_wrangler_running_keeps_controls_locked(widget, 
 
 def test_wrangler_finish_while_reintegrate_running_keeps_controls_locked(widget, monkeypatch):
     """Mirror overlap guard: a wrangler started mid-reintegrate can FINISH first.
-    wrangler_finished must NOT exit the shared run-state (directly OR via the
-    scan-matches delegation to integrator_thread_finished) while the reintegrate
-    is still running — otherwise the controls re-enable mid-reintegrate."""
+    wrangler_finished must NOT run the shared finalizer while the reintegrate is
+    still running — otherwise the controls re-enable mid-reintegrate."""
     w = widget
     _set_processing_mode(w, 'Int 2D')
     w._enter_run_state()
@@ -2802,20 +2905,23 @@ def test_wrangler_finish_while_reintegrate_running_keeps_controls_locked(widget,
     monkeypatch.setattr(w.wrangler.thread, 'isRunning', lambda: False)
     monkeypatch.setattr(w.wrangler.thread, 'batch_mode', False, raising=False)
     monkeypatch.setattr(w.wrangler.thread, 'xye_only', False, raising=False)
-    # Force the scan-matches branch so the delegation guard (not the name check)
+    # Force the scan-matches branch so the overlap guard (not the name check)
     # is what prevents the exit.
     monkeypatch.setattr(w.wrangler, 'scan_name', w.scan.name, raising=False)
     # Stub the heavy collaborators wrangler_finished would otherwise drive.
     monkeypatch.setattr(w, '_flush_pending_update', lambda: None)
     monkeypatch.setattr(w.wrangler, 'stop', lambda: None)
-    delegated = []
-    monkeypatch.setattr(w, 'integrator_thread_finished',
-                        lambda: delegated.append(1))
+    finalized = []
+    monkeypatch.setattr(
+        w,
+        '_finalize_processing_run',
+        lambda **kwargs: finalized.append(kwargs),
+    )
 
     w.wrangler_finished()
 
     assert w._run_active is True, "run-state exited while reintegrate still running"
-    assert delegated == [], "delegated to integrator_thread_finished mid-reintegrate"
+    assert finalized == [], "finalized the wrangler while reintegrate still ran"
     assert not any(_proc_controls(w).values()), "controls re-enabled mid-reintegrate"
 
 
@@ -2826,7 +2932,7 @@ def _stub_wrangler_finish_collaborators(w, monkeypatch, nxs):
     monkeypatch.setattr(w.integratorTree.integrator_thread, 'isRunning', lambda: False)
     monkeypatch.setattr(w, '_flush_pending_update', lambda: None)
     monkeypatch.setattr(w.wrangler, 'stop', lambda: None)
-    monkeypatch.setattr(w, 'integrator_thread_finished', lambda: None)
+    monkeypatch.setattr(w, '_finalize_processing_run', lambda **kwargs: None)
     w.h5viewer.dirname = str(nxs.parent)         # skip the update_scans branch
     loaded = []
     monkeypatch.setattr(w.h5viewer, 'set_file',
@@ -2920,16 +3026,9 @@ def test_pattern_for_frame_uses_idle_gated_blocking_read(widget, monkeypatch):
     assert seen['blocking'] is False                     # mid-run -> no contention
 
 
-def test_run_end_backfills_overlay_after_integrator_finished_clear(
+def test_run_end_preserves_overlay_then_arms_optional_catchup(
         widget, monkeypatch, tmp_path):
-    """PERF-3 Option A: at run end the one-shot overlay catch-up must be ARMED
-    AFTER integrator_thread_finished(), whose clear_overlay would otherwise wipe
-    an earlier render.  This locks the run-end WIRING + ordering; the catch-up's
-    own guard/decision logic (post-quiescence show_all of the non-resident tail)
-    is unit-tested in test_runend_overlay_catchup.py.  (Superseded the failed
-    Item-2 test that asserted a direct _render_overlay_full_scan fired -- the
-    mechanism-not-outcome trap; the direct reselect could not paint the never-
-    published tail.)"""
+    """Normal run end preserves history before arming optional disk catch-up."""
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
     w = widget
     _set_processing_mode(w, 'Int 2D')
@@ -2943,19 +3042,21 @@ def test_run_end_backfills_overlay_after_integrator_finished_clear(
     w.scan.name = w.wrangler.scan_name            # take the delegate branch
 
     order = []
-    monkeypatch.setattr(w, 'integrator_thread_finished',
-                        lambda: order.append('integrator_finished'))
+    monkeypatch.setattr(
+        w,
+        '_finalize_processing_run',
+        lambda **kwargs: order.append(('finalize', kwargs)),
+    )
     monkeypatch.setattr(
         staticWidget, '_arm_runend_overlay_catchup',
         lambda self: order.append('overlay_catchup_armed'))
 
     w.wrangler_finished()
 
-    # the catch-up is ARMED AFTER the integrator-finished clear_overlay (so the
-    # post-quiescence show_all runs against a settled, cleared accumulator).
-    assert 'integrator_finished' in order, order
-    assert 'overlay_catchup_armed' in order[order.index('integrator_finished') + 1:], \
-        f"overlay catch-up not armed after integrator_thread_finished: {order}"
+    expected = ('finalize', {'reset_overlay': False, 'origin': 'wrangler'})
+    assert expected in order, order
+    assert 'overlay_catchup_armed' in order[order.index(expected) + 1:], \
+        f"overlay catch-up not armed after wrangler finalization: {order}"
 
 
 def test_update_data_selection_restore_is_linear_not_quadratic(widget):

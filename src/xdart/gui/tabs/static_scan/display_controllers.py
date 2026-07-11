@@ -54,7 +54,10 @@ from .display_publication import (
     PublicationDisplayAdapter,
 )
 from .browse_debug import browse_debug_log, sequence_summary
-from .display_overlay_utils import frame_index_from_row_id
+from .display_overlay_utils import (
+    frame_index_from_row_id,
+    row_id_belongs_to_widget_scan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +109,7 @@ def _candidate_labels(mode, selected_ids, all_frame_index):
 
 
 def _accumulated_frame_indices(widget):
-    """Frame indices already in the live Waterfall accumulator (append-only)."""
+    """Current-scan frame indices already in the append-only accumulator."""
     history = getattr(widget, "_waterfall_history", None)
     ids = getattr(history, "ids", None) if history is not None else None
     if not ids:
@@ -114,6 +117,8 @@ def _accumulated_frame_indices(widget):
     out = set()
     for r in ids:
         try:
+            if not row_id_belongs_to_widget_scan(widget, r):
+                continue
             out.add(frame_index_from_row_id(r))
         except (TypeError, ValueError):
             pass

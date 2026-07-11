@@ -12,12 +12,13 @@ from xdart.gui.tabs.static_scan.display_controllers import (
 )
 
 
-def _widget(*, processing, method, accumulated_ids):
+def _widget(*, processing, method, accumulated_ids, scan_name="scan"):
     history = (
         SimpleNamespace(ids=list(accumulated_ids))
         if accumulated_ids is not None else None)
     return SimpleNamespace(
         _processing_active=processing,
+        scan=SimpleNamespace(name=scan_name),
         ui=SimpleNamespace(plotMethod=SimpleNamespace(currentText=lambda: method)),
         _waterfall_history=history,
     )
@@ -39,6 +40,29 @@ def test_waterfall_slice_mode_3tuple_ids_decode():
     acc = [("scan", i, "qz") for i in range(1, 4)]      # 1,2,3 accumulated
     w = _widget(processing=True, method="Waterfall", accumulated_ids=acc)
     assert set(_live_overlay_render_labels(w, labels)) == {4, 5}
+
+
+def test_live_overlay_tick_does_not_confuse_reused_index_across_scans():
+    """Directory scans commonly restart at frame 0; scan A's row is not scan B's."""
+    w = _widget(
+        processing=True,
+        method="Overlay",
+        accumulated_ids=[("scanA", 0)],
+        scan_name="scanB",
+    )
+
+    assert _live_overlay_render_labels(w, (0,)) == (0,)
+
+
+def test_live_overlay_tick_still_filters_reused_index_in_current_scan():
+    w = _widget(
+        processing=True,
+        method="Overlay",
+        accumulated_ids=[("scanA", 0), ("scanB", 0)],
+        scan_name="scanB",
+    )
+
+    assert _live_overlay_render_labels(w, (0,)) == ()
 
 
 def test_full_reseed_when_accumulator_empty_or_absent():
