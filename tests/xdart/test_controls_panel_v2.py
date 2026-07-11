@@ -1372,6 +1372,74 @@ def test_controls_panel_v2_gi_motor_is_a_pure_view_of_the_single_source(qapp, mo
         widget.deleteLater()
 
 
+def test_controls_panel_v2_every_combo_value_is_within_its_own_choices(qapp, monkeypatch):
+    """GUARD generalising the phantom-'th' invariant to EVERY Controls-V2 combo
+    field: a combo's rendered VALUE must always be a member of its rendered
+    CHOICES.  Phantom-'th' was exactly a violation — the θ-motor field showed
+    'th' while its choice list was {Manual, <real motors>} (value ∉ choices),
+    because V2 forked its value/default derivation away from its choice
+    derivation.  Value and choices flow through DIFFERENT code paths
+    (_controls_v2_native_int_values vs _controls_v2_native_int_choices), so a
+    future re-fork of ANY combo field — unit, axis, method, th_motor — where the
+    two paths disagree fails here.  Held across GI on/off, several θ-motor lists,
+    and both integration dims.  (Design: design_controls_panel_v2_jun2026.md §10
+    — 'One source of truth per field — never a hand-set label / forked state'.)"""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        it = widget.integratorTree
+        for gi in (False, True):
+            widget._on_controls_v2_field_changed(("GI", "Grazing"), gi)
+            for motors in (["halpha", "detx"], ["th", "eta", "i0"],
+                           ["detx", "dety"]):
+                it.set_gi_motor_options(motors)
+                values = widget._controls_v2_native_int_values()
+                choices = widget._controls_v2_native_int_choices()
+                # Every rendered combo (a path that has a choice list) whose value
+                # is currently shown must render a value drawn from that list.
+                for path, opts in choices.items():
+                    if path not in values:
+                        continue  # field is mode-gated off right now (e.g. gi_mode)
+                    assert values[path] in opts, (gi, motors, path, values[path], opts)
+    finally:
+        _reset_controls_v2_gi(widget)
+        widget.close()
+        widget.deleteLater()
+
+
+def test_controls_panel_v2_unit_choices_mirror_the_legacy_unit_combos(qapp, monkeypatch):
+    """GUARD: the V2 1D/2D UNIT fields are a pure VIEW of the legacy integrator
+    unit combos (unit_1D / unit_2D) — same items, same order — never a forked
+    hardcoded list.  Extends the phantom-'th' parity guard to the unit fields
+    per the H21/Phase-8 scoping (the safe in-sequence increment toward retiring
+    the duplicate state).
+
+    AXIS is deliberately excluded: V2 renders the real GI/standard axis labels
+    while the legacy axis combos are degenerate placeholders (axis1D shows only
+    'Radial'), so V2 is authoritative there, not a view — axis is covered
+    instead by the value-in-choices guard above."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        ui = widget.integratorTree.ui
+        for gi in (False, True):
+            widget._on_controls_v2_field_changed(("GI", "Grazing"), gi)
+            choices = widget._controls_v2_native_int_choices()
+            for path, name in ((("Int1D", "unit"), "unit_1D"),
+                               (("Int2D", "unit"), "unit_2D")):
+                combo = getattr(ui, name)
+                legacy = tuple(combo.itemText(i) for i in range(combo.count()))
+                assert tuple(choices[path]) == legacy, (gi, path, choices[path], legacy)
+    finally:
+        _reset_controls_v2_gi(widget)
+        widget.close()
+        widget.deleteLater()
+
+
 def test_controls_panel_v2_grazing_roundtrips_scan_gi_and_config(qapp, monkeypatch):
     """P2: the V2 Grazing path must flip scan.gi AND land sample facts in
     get_gi_config() (the reintegrate source), independent of the legacy toggle —
