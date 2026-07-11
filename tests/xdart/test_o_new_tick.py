@@ -65,6 +65,19 @@ def test_live_overlay_tick_still_filters_reused_index_in_current_scan():
     assert _live_overlay_render_labels(w, (0,)) == ()
 
 
+def test_live_overlay_tick_uses_frame_source_when_scan_identity_is_unset():
+    """Pre-scan capture must not collapse two source scans to ``(None, 0)``."""
+    w = _widget(
+        processing=True,
+        method="Overlay",
+        accumulated_ids=[("scanA", 0)],
+        scan_name=None,
+    )
+    w.frame = SimpleNamespace(source_file="/data/scanB_0000.tif")
+
+    assert _live_overlay_render_labels(w, (0,)) == (0,)
+
+
 def test_full_reseed_when_accumulator_empty_or_absent():
     labels = tuple(range(1, 11))
     # Mode entry / reset: accumulator empty -> full reseed (one hit, by design).

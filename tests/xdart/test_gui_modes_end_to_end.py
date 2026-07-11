@@ -1951,16 +1951,15 @@ def test_int_plot_accumulating_modes_characterize_update_plot_state(widget, meth
 
 
 def test_directory_overlay_accumulates_reused_zero_index_at_live_cadence(
-        widget, qapp):
+        widget):
     """Sixteen one-frame directory scans survive boundaries and auto-waterfall.
 
-    Arrivals are 40 ms apart, faster than both the 150 ms heavy-flush timer and
-    the 500 ms full-overlay paint cadence.  This drives the production handoff,
-    frame-driven rescope, publication store, controller, accumulator and Qt
-    coalescers, so it covers both the scan-qualified O(new) filter and the
-    cadence-sensitive outgoing-frame flush.
+    Each next frame drives the production frame-boundary handoff, whose
+    synchronous outgoing-scan flush is the behavior under test.  Assert after
+    every boundary instead of waiting for the 150/500 ms paint timers: those
+    waits made the test depend on host load and do not add product coverage.
+    The normal, non-forced run-end flush then commits scan 16.
     """
-    from PySide6 import QtTest
     from xrd_tools.core import IntegrationResult1D
 
     w = widget
@@ -2011,12 +2010,22 @@ def test_directory_overlay_accumulates_reused_zero_index_at_live_cadence(
         )
         thread._published_frames[0] = frame
         w.update_data(0)
-        QtTest.QTest.qWait(40)
 
     try:
-        for scan_number in range(1, 16):
+        for scan_number in range(1, 17):
             arrive(scan_number)
-        QtTest.QTest.qWait(600)
+
+            # Arrival N synchronously flushes outgoing scan N-1 before the
+            # destructive rescope.  The current scan remains pending for the
+            # next real frame boundary or normal run-end flush.
+            expected_count = scan_number - 1
+            history = df._waterfall_history
+            if expected_count:
+                assert history.count == expected_count
+                assert history.ids == tuple(
+                    (f"SLP_position00_scan{number:04d}", 0)
+                    for number in range(1, scan_number)
+                )
 
         history = df._waterfall_history
         assert history.count == 15
@@ -2027,8 +2036,19 @@ def test_directory_overlay_accumulates_reused_zero_index_at_live_cadence(
         assert len(df.curves) == 15
         assert not df._waterfall_active()
 
-        arrive(16)
-        QtTest.QTest.qWait(600)
+        # Production run-end invokes this normal callback once after stopping
+        # the timer.  Calling it directly controls cadence without force-rendering
+        # or waiting on a starvable Qt timeout.
+        w._exit_run_state()
+        w._update_timer.stop()
+        df._sync_selection_generation()
+        w._flush_pending_update()
+        type(w)._request_render(w, "test-runend-overlay-flush")
+        type(w)._finalize_processing_run(
+            w,
+            reset_overlay=False,
+            origin="wrangler",
+        )
 
         history = df._waterfall_history
         assert history.count == 16
@@ -2036,14 +2056,7 @@ def test_directory_overlay_accumulates_reused_zero_index_at_live_cadence(
         assert df._waterfall_active()
         assert df.wf_widget.isVisible()
 
-        # Normal acquisition completion shares the run-state finalizer with
-        # reintegration, but must not inherit reintegration's history reset.
-        type(w)._finalize_processing_run(
-            w,
-            reset_overlay=False,
-            origin="wrangler",
-        )
-        QtTest.QTest.qWait(600)
+        # Normal acquisition completion must retain the rendered history.
         assert df._waterfall_history.count == 16
         assert df._waterfall_history.ids[-1] == ("SLP_position00_scan0016", 0)
     finally:

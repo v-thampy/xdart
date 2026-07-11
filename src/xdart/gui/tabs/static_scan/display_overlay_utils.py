@@ -21,14 +21,32 @@ PROJECTION_ROUND_DIGITS = 6
 
 
 def current_scan_key(widget):
-    """Stable scan key for row identity; prefer the visible scan name."""
+    """Stable scan key for row identity; prefer the visible scan name.
+
+    During idle/pre-first-scan display setup the scan object can briefly lack a
+    usable name even though its current frame already identifies the source.
+    Use the wrangler's source-name parser in that narrow window so two scans
+    which both start at frame zero cannot be captured as the same ``(None, 0)``
+    row.  Normal live runs continue to use the visible scan name.
+    """
     scan = getattr(widget, "scan", None)
-    if scan is None:
-        return None
-    name = getattr(scan, "name", None)
-    if name not in (None, "", "null_main"):
-        return name
-    return getattr(scan, "data_file", None) or name
+    if scan is not None:
+        name = getattr(scan, "name", None)
+        if name not in (None, "", "null_main"):
+            return name
+        data_file = getattr(scan, "data_file", None)
+        if data_file:
+            return data_file
+
+    frame = getattr(widget, "frame", None)
+    source_file = getattr(frame, "source_file", None)
+    if source_file:
+        # Lazy import keeps this pure helper import-light and avoids pulling the
+        # wrangler module into every display-overlay import.
+        from .wranglers.image_wrangler_thread import _get_scan_info
+
+        return _get_scan_info(source_file)[0] or None
+    return None
 
 
 def qualified_row_id_for_widget(widget, frame_idx):
