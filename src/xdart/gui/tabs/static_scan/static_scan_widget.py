@@ -1260,6 +1260,26 @@ class staticWidget(QWidget):
         cfg = self._controls_v2_gi_config()
         if leaf == "Grazing":
             cfg["gi"] = self._controls_v2_bool(value)
+            # Live-found 2026-07-12 (LaB6, halpha in the list but Manual
+            # selected): enabling GI with NO saved gi_config means this
+            # 'Manual' is a LEFTOVER — a session-restored default or the
+            # scan-carried numeric theta — not a deliberate choice.  Apply the
+            # shared default policy so a present preference motor
+            # (th/halpha/…) wins.  A real saved gi_config (deliberate Manual
+            # + its theta) is honored untouched.
+            if (cfg["gi"] and cfg["incidence_motor"] == "Manual"
+                    and not dict(getattr(scan, "gi_config", {}) or {})):
+                picked = self._controls_v2_default_gi_motor()
+                if picked != "Manual":
+                    cfg["incidence_motor"] = picked
+                    # Keep the integrator combo equal (the two θ-motor
+                    # surfaces must never disagree — CLAUDE.md GI rule).
+                    it = getattr(self, "integratorTree", None)
+                    combo = getattr(getattr(it, "ui", None), "gi_motor", None)
+                    if combo is not None:
+                        idx = combo.findText(picked)
+                        if idx >= 0:
+                            combo.setCurrentIndex(idx)
         elif leaf == "th_motor":
             cfg["incidence_motor"] = str(value)
         elif leaf == "th_val":

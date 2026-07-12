@@ -1519,6 +1519,22 @@ class integratorTree(QtWidgets.QWidget):
         ``update_scattering_geometry`` seam the wrangler checkbox used (sets
         scan.gi + refreshes the panel's axis units/labels).  The GI detail fields
         render inline in Controls Panel V2; there is no popup to open."""
+        # Live-found 2026-07-12: enabling GI applies the shared default policy
+        # when the current 'Manual' is NOT a deliberate pick this session —
+        # session-restored state never went through set_gi_motor_options, so a
+        # preference motor (th/halpha/…) sitting in the list would otherwise
+        # stay unselected behind a leftover Manual.
+        if (checked
+                and self.ui.gi_motor.currentText() == 'Manual'
+                and getattr(self, '_gi_motor_user_choice', None) != 'Manual'):
+            motors = [self.ui.gi_motor.itemText(i)
+                      for i in range(self.ui.gi_motor.count())
+                      if self.ui.gi_motor.itemText(i) != 'Manual']
+            target = pick_default_gi_motor(motors)
+            if target != 'Manual':
+                idx = self.ui.gi_motor.findText(target)
+                if idx >= 0:
+                    self.ui.gi_motor.setCurrentIndex(idx)
         self._update_gi_section_visibility()
         scan = getattr(self, 'scan', None)
         if scan is not None:

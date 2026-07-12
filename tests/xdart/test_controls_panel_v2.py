@@ -1359,6 +1359,50 @@ def test_controls_panel_v2_gi_motor_never_shows_phantom_th(qapp, monkeypatch):
         widget.deleteLater()
 
 
+def test_gi_enable_repicks_default_over_leftover_manual(qapp, monkeypatch):
+    """Live-found 2026-07-12 (LaB6, halpha listed but Manual selected): session
+    restore writes the θ-motor VALUE programmatically without ever running
+    set_gi_motor_options, so the default policy never fired — and enabling
+    Grazing didn't re-evaluate it.  Enabling GI must apply the shared policy
+    over the current choices when 'Manual' is a leftover; a DELIBERATE user
+    Manual stays sticky."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        it = widget.integratorTree
+        it.set_gi_motor_options(["halpha", "detx", "dety", "hx"])
+        # _load_from_session's exact write: programmatic index set, no user pick.
+        it.ui.gi_motor.setCurrentIndex(it.ui.gi_motor.findText("Manual"))
+        widget.scan.incidence_motor = "0.1"   # stale numeric-theta carry
+        widget.scan.gi_config = {}
+
+        # The V2 Grazing pill: cfg, scan AND the integrator combo all re-pick.
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        cfg = widget._controls_v2_gi_config()
+        assert cfg["incidence_motor"] == "halpha"
+        assert widget.scan.gi_config["incidence_motor"] == "halpha"
+        assert it.ui.gi_motor.currentText() == "halpha"  # surfaces stay equal
+
+        # The integrator checkbox path in isolation re-picks too.
+        it.ui.gi_enable.setChecked(False)
+        it.ui.gi_motor.setCurrentIndex(it.ui.gi_motor.findText("Manual"))
+        it.ui.gi_enable.setChecked(True)
+        assert it.ui.gi_motor.currentText() == "halpha"
+
+        # A DELIBERATE user Manual survives the toggle (F3 sticky rule).
+        it.ui.gi_enable.setChecked(False)
+        it.ui.gi_motor.setCurrentIndex(it.ui.gi_motor.findText("Manual"))
+        it._on_gi_motor_user_pick()
+        it.ui.gi_enable.setChecked(True)
+        assert it.ui.gi_motor.currentText() == "Manual"
+    finally:
+        _reset_controls_v2_gi(widget)
+        widget.close()
+        widget.deleteLater()
+
+
 def test_controls_panel_v2_gi_motor_is_a_pure_view_of_the_single_source(qapp, monkeypatch):
     """GUARD against the phantom-'th' bug CLASS (Controls-V2 field forking its
     source): the θ-motor row must be a pure VIEW of the single source of truth —
