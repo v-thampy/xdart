@@ -42,8 +42,10 @@ _ROTATION_AFFIX_HINTS = (
 
 #: Incidence-axis names matched only as a WHOLE token (``sample_mu`` yes,
 #: ``muffin_x`` no).  Kept equality-only because ``mu`` is 2 chars and
-#: ``alpha`` as an affix would over-match.
-_ROTATION_TOKEN_ALIASES = ("mu", "alpha", "alphai", "incidence")
+#: ``alpha`` as an affix would over-match.  ``halpha`` (the bl11-3 incidence
+#: axis) is recognized here too so DECORATED forms (``sam_halpha``,
+#: ``halpha2``) are caught — the bare name already wins via the preference.
+_ROTATION_TOKEN_ALIASES = ("mu", "alpha", "alphai", "halpha", "incidence")
 
 #: camelCase boundary (lower/digit → upper), applied before lowercasing.
 _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")

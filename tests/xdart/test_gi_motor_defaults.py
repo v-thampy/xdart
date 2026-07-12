@@ -96,6 +96,14 @@ def test_f3_original_preference_outranks_new_aliases():
     assert pick_default_gi_motor(["mu", "theta"]) == "theta"
 
 
+def test_f3_decorated_halpha_recognized():
+    # Bare 'halpha' wins via the preference; decorated forms must be caught by
+    # the token fallback too (maintainer request 2026-07-12).
+    assert pick_default_gi_motor(["detx", "sam_halpha"]) == "sam_halpha"
+    assert pick_default_gi_motor(["detx", "halpha2"]) == "halpha2"
+    assert pick_default_gi_motor(["HALPHA", "detx"]) == "HALPHA"
+
+
 def test_manual_when_empty():
     assert pick_default_gi_motor([]) == "Manual"
     assert pick_default_gi_motor(None) == "Manual"
