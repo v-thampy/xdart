@@ -267,8 +267,9 @@ button in all display modes.
 
 * Tag `v1.0.0` when ready — the migration deliberately ships untagged.
 * CI: `.github/workflows/pr.yml` (core + guards + offscreen xdart),
-  `nightly.yml` (full suites), `release.yml` (build + twine check, no
-  auto-publish).
+  `nightly.yml` (full suites), `release.yml` (build + twine check + tag-gated
+  PyPI Trusted-Publishing since v1.1.1), `conda-publish.yml` (tag-gated
+  prefix.dev upload) — one `v*` tag ships pip + conda together.
 * The old repos should be archived with a pointer here once the release is
   cut.
 
@@ -292,6 +293,44 @@ for downstream users:
   left un-normalized (factor 1.0) and now resolves and normalizes — so a dataset with a
   case-mismatched monitor key will integrate to different (correct) numbers. Re-reduce such
   datasets if exact reproduction of the old (un-normalized) values matters.
+
+## Fixes in v1.1.1
+
+The first 1.1.x that reaches **PyPI** (v1.1.0 was tagged and published to
+conda but never uploaded to PyPI, so pip users go straight from 1.0.x to
+1.1.1). From this release the `v*` tag publishes **PyPI and conda together**:
+`release.yml` gained a tag-gated Trusted-Publishing (OIDC, no stored secret)
+job symmetric with `conda-publish.yml` — channel parity is automatic.
+
+All verified findings from the v1.1.0 external review:
+
+* **Live directory watch: every intermediate scan is saved (P1).** A
+  scan-boundary swap in the live watch replaced the outgoing scan without
+  force-saving its serial tail, so short scans (under the save interval)
+  between the first and last of a run shipped as EMPTY `.nxs` files while the
+  run counters claimed their frames. Both boundaries now share one flush.
+* **Numeric container names keep their identity.** `Pt_10nm_00013.nxs` and
+  `..._00014.nxs` are two scans, not one merged "Pt_10nm": one canonical
+  `scan_name_from_source()` (container `.nxs`/`.h5`/`.hdf5` keeps the FULL
+  stem) is shared by the worker, the GUI scan keying, and append naming —
+  plot titles and legends show the `00013` again.
+* **GI motor default: the substring leak is gone (sci-integrity).** The
+  rotation-name fallback matched `th`/`om` anywhere in a name, so a source
+  with no named incidence axis silently defaulted to a translation stage
+  (`slit_wid`**`th`**, `sample_h`**`om`**`e`). Matching is now token-aware,
+  the 2-char hints are dropped, and `alpha_i`/`mu`/`incidence` are recognized
+  incidence names; anything unrecognized falls to `Manual`.
+* **The live watch defers an in-progress NXWriter `.nxs`.** A container still
+  being written (no `entry/end_time` yet, or not yet readable) is no longer
+  consumed and permanently retired early — it is re-checked every poll and
+  processed in full the moment the run closes. Plain (non-Bluesky) containers
+  are never deferred.
+* **A single-frame 2-D detector `.nxs` opens headlessly.** `open_source` now
+  normalizes a lone 2-D detector dataset to a one-frame `(1, H, W)` stack,
+  matching what the viewer already displayed instead of raising.
+* **Plot Metadata is O(n).** The per-frame metadata lookup no longer does an
+  O(n) label scan per row (the all-frames sweep was O(n²): ~2.5 s at 30k
+  frames).
 
 ## What's new in v1.1.0
 
