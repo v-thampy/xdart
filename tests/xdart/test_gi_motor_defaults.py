@@ -96,6 +96,40 @@ def test_f3_original_preference_outranks_new_aliases():
     assert pick_default_gi_motor(["mu", "theta"]) == "theta"
 
 
+def test_f3_token_edge_false_positives_rejected():
+    """wf_3614041c review: a single equals/starts/ends affix rule still fired
+    THROUGH unrelated words at token edges. chi is now suffix-only, gon is
+    prefix-only, eta/ang are exact-token-only."""
+    assert pick_default_gi_motor(["chiller_x", "detx"]) == "Manual"
+    assert pick_default_gi_motor(["hexagon_x", "detx"]) == "Manual"
+    assert pick_default_gi_motor(["angstrom_offset", "detx"]) == "Manual"
+    assert pick_default_gi_motor(["meta_x", "detx"]) == "Manual"
+
+
+def test_f3_beta_zeta_are_not_incidence_axes():
+    # beta is conventionally the EXIT angle at GI beamlines; zeta likewise is
+    # not an incidence axis — Manual is safer than silently picking either.
+    assert pick_default_gi_motor(["detx", "beta"]) == "Manual"
+    assert pick_default_gi_motor(["detx", "zeta"]) == "Manual"
+
+
+def test_f3_genuine_edge_names_still_caught():
+    # The per-hint tightening must not lose real rotation-axis spellings.
+    assert pick_default_gi_motor(["detx", "samchi"]) == "samchi"      # chi suffix
+    assert pick_default_gi_motor(["detx", "xrot"]) == "xrot"          # rot affix
+    assert pick_default_gi_motor(["detx", "twotheta"]) == "twotheta"  # theta affix
+    assert pick_default_gi_motor(["detx", "angle"]) == "angle"        # angle affix
+    assert pick_default_gi_motor(["detx", "sam_eta"]) == "sam_eta"    # eta exact-token
+
+
+def test_f3_bare_om_is_an_omega_axis():
+    """Exact-token 'om' (the SPEC omega name) stays recognized: the F3 ban
+    covers the mid-word 'om' SUBSTRING (h**om**e), not the real axis."""
+    assert pick_default_gi_motor(["detx", "om"]) == "om"
+    assert pick_default_gi_motor(["detx", "sample_om"]) == "sample_om"
+    assert pick_default_gi_motor(["sample_home", "detx"]) == "Manual"  # still dead
+
+
 def test_f3_decorated_halpha_recognized():
     # Bare 'halpha' wins via the preference; decorated forms must be caught by
     # the token fallback too (maintainer request 2026-07-12).

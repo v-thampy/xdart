@@ -30,22 +30,31 @@ GI_MOTOR_PREFERENCE = (
     "th", "eta", "halpha", "gonth", "theta", "alpha_i", "mu", "incidence",
 )
 
-#: Rotation / incidence hints matched as token AFFIXES (a name token equal to,
-#: starting with, or ending with one of these reads as a rotation axis).  All
-#: are >= 3 chars — the 2-char ``th``/``om`` hints were dropped (F3): they only
-#: ever matched through the middle of unrelated words (wid**th**, h**om**e),
-#: and every genuine ``th``-family axis is covered by :data:`GI_MOTOR_PREFERENCE`
-#: or by ``theta``/``gon`` here.
-_ROTATION_AFFIX_HINTS = (
-    "eta", "theta", "omega", "phi", "chi", "gon", "rot", "ang",
-)
+#: Rotation hints with PER-HINT affix rules (review wf_3614041c: a single
+#: equals/starts/ends rule still fired through unrelated words at token EDGES —
+#: **chi**ller, hexa**gon**, **ang**strom, m**eta** — re-creating the F3 leak).
+#:
+#: Both affixes — no realistic English-word collision at either token edge:
+#: two**theta**/``thetaz``, sam**omega**, sam**phi``/``phiz``, x**rot**/``rotz``,
+#: ``angle(s)``.
+_ROTATION_HINTS_AFFIX = ("theta", "omega", "phi", "rot", "angle")
+#: PREFIX-only: ``gonio``/``goniometer`` yes, hexa**gon** no.
+_ROTATION_HINTS_PREFIX = ("gon",)
+#: SUFFIX-only: ``samchi`` yes, **chi**ller no.
+_ROTATION_HINTS_SUFFIX = ("chi",)
 
-#: Incidence-axis names matched only as a WHOLE token (``sample_mu`` yes,
-#: ``muffin_x`` no).  Kept equality-only because ``mu`` is 2 chars and
-#: ``alpha`` as an affix would over-match.  ``halpha`` (the bl11-3 incidence
-#: axis) is recognized here too so DECORATED forms (``sam_halpha``,
-#: ``halpha2``) are caught — the bare name already wins via the preference.
-_ROTATION_TOKEN_ALIASES = ("mu", "alpha", "alphai", "halpha", "incidence")
+#: Incidence/rotation names matched only as a WHOLE token (``sample_mu`` yes,
+#: ``muffin_x`` no).  ``mu``/``om`` are 2 chars and ``alpha``/``eta``/``ang``
+#: as affixes would over-match (h**alpha** is fine but alph**a**bet is not;
+#: m**eta**/b**eta** are NOT incidence axes — beta is conventionally the EXIT
+#: angle, and Manual is safer).  ``om`` here is the exact SPEC omega name: the
+#: F3 ban covers the mid-word ``om`` SUBSTRING (h**om**e), not the real axis.
+#: ``halpha`` (the bl11-3 incidence axis) is listed so DECORATED forms
+#: (``sam_halpha``, ``halpha2``) are caught — bare names in
+#: :data:`GI_MOTOR_PREFERENCE` already win via the preference pass.
+_ROTATION_TOKEN_ALIASES = (
+    "mu", "om", "eta", "ang", "alpha", "alphai", "halpha", "incidence",
+)
 
 #: camelCase boundary (lower/digit → upper), applied before lowercasing.
 _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
@@ -74,7 +83,11 @@ def _looks_like_rotation(name: str) -> bool:
     for tok in _tokens(name):
         if tok in _ROTATION_TOKEN_ALIASES:
             return True
-        for hint in _ROTATION_AFFIX_HINTS:
+        if any(tok.startswith(h) for h in _ROTATION_HINTS_PREFIX):
+            return True
+        if any(tok.endswith(h) for h in _ROTATION_HINTS_SUFFIX):
+            return True
+        for hint in _ROTATION_HINTS_AFFIX:
             if tok.startswith(hint) or tok.endswith(hint):
                 return True
     return False
