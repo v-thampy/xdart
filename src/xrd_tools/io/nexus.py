@@ -329,10 +329,14 @@ class NexusImageStack:
 
     * a single 3D dataset (e.g. ``/entry/instrument/detector/data``),
       in which case this proxy is functionally equivalent to the
-      dataset itself; or
+      dataset itself;
+    * a single 2-D detector dataset (a one-frame acquisition, e.g. a
+      Bluesky/NXWriter count with one exposure), exposed as a logical
+      ``(1, H, W)`` stack — the same normalization the display readers
+      (``classify_image_source`` / ``read_image``) already apply; or
     * a sorted sequence of Eiger external-link datasets
       ``/entry/data/data_000001``, ``data_000002``, …, concatenated
-      logically along axis 0.
+      logically along axis 0 (always strict-3D).
 
     Provides the subset of the h5py.Dataset interface the wranglers
     actually use: :attr:`shape`, :attr:`dtype`, :attr:`ndim`,
@@ -353,23 +357,31 @@ class NexusImageStack:
     """
 
     __slots__ = ("_h5", "_paths", "_dsets", "_offsets", "shape",
-                 "dtype", "ndim")
+                 "dtype", "ndim", "_squeeze2d")
 
     def __init__(self, h5f: h5py.File, paths: list[str]):
         if not paths:
             raise ValueError("NexusImageStack requires at least one path")
+        # F6: a SINGLE 2-D detector dataset is a one-frame stack (the finder /
+        # classifier already accept ndim >= 2); normalize it to (1, H, W) here
+        # instead of raising.  Multi-segment (Eiger links) stays strict-3D.
+        squeeze2d = False
         dsets = []
         for p in paths:
             obj = h5f[p]
             if not isinstance(obj, h5py.Dataset):
                 raise TypeError(f"{p} is not a Dataset (got {type(obj).__name__})")
-            if obj.ndim != 3:
+            if obj.ndim == 2 and len(paths) == 1:
+                squeeze2d = True
+            elif obj.ndim != 3:
                 raise ValueError(
-                    f"{p} is {obj.ndim}-D; NexusImageStack expects 3-D"
+                    f"{p} is {obj.ndim}-D; NexusImageStack expects 3-D "
+                    f"(or a single 2-D detector frame)"
                 )
             dsets.append(obj)
 
-        per_frame_shapes = {d.shape[1:] for d in dsets}
+        per_frame_shapes = ({dsets[0].shape} if squeeze2d
+                            else {d.shape[1:] for d in dsets})
         if len(per_frame_shapes) > 1:
             raise ValueError(
                 f"Inconsistent per-frame shapes across segments: "
@@ -377,7 +389,7 @@ class NexusImageStack:
             )
         # Offsets[i] = global index where segment i starts.
         # Offsets[-1] = total number of frames.
-        lengths = [int(d.shape[0]) for d in dsets]
+        lengths = [1] if squeeze2d else [int(d.shape[0]) for d in dsets]
         offsets = [0]
         for n in lengths:
             offsets.append(offsets[-1] + n)
@@ -386,7 +398,8 @@ class NexusImageStack:
         self._paths = list(paths)
         self._dsets = dsets
         self._offsets = offsets
-        self.shape = (offsets[-1],) + dsets[0].shape[1:]
+        self._squeeze2d = squeeze2d
+        self.shape = (offsets[-1],) + per_frame_shapes.pop()
         self.dtype = dsets[0].dtype
         self.ndim = 3
 
@@ -417,6 +430,9 @@ class NexusImageStack:
                 i += n
             if not 0 <= i < n:
                 raise IndexError(f"frame index {key} out of range [0, {n})")
+            if self._squeeze2d:
+                # The lone 2-D dataset IS frame 0.
+                return self._dsets[0][()]
             seg, local = self._locate(i)
             return self._dsets[seg][local]
         if isinstance(key, slice):
@@ -468,6 +484,9 @@ class NexusImageStack:
     def _read_range(self, start: int, stop: int) -> np.ndarray:
         if start >= stop:
             return np.empty((0,) + self.shape[1:], dtype=self.dtype)
+        if self._squeeze2d:
+            # Single logical frame: any non-empty range is exactly [0, 1).
+            return np.asarray(self._dsets[0])[None]
         offs = self._offsets
         # Locate first and last segments touched by [start, stop).
         first_seg, _ = self._locate(start)
@@ -493,7 +512,8 @@ def open_nexus_image_stack(
     """Open a NeXus file and return a :class:`NexusImageStack` proxy.
 
     Resolves the image dataset(s) under ``/{entry}/`` and wraps them
-    in a single logical 3D stack.  The proxy owns the underlying
+    in a single logical 3D stack (a lone 2-D detector frame becomes a
+    ``(1, H, W)`` stack).  The proxy owns the underlying
     ``h5py.File``; use it as a context manager.
 
     Resolution order:
@@ -523,7 +543,7 @@ def open_nexus_image_stack(
     FileNotFoundError
         If the file does not exist.
     KeyError
-        If no 3D image dataset is found.
+        If no image dataset is found.
     """
     p = Path(path)
     if not p.exists():
@@ -538,7 +558,7 @@ def open_nexus_image_stack(
         single = find_nexus_image_dataset_in_open_file(h5f, entry)
         if single is None:
             raise KeyError(
-                f"No 3-D image dataset found in {p}:{entry}"
+                f"No image dataset found in {p}:{entry}"
             )
         return NexusImageStack(h5f, [single])
     except Exception:
@@ -560,12 +580,17 @@ def find_nexus_image_dataset_in_open_file(
         return None
     grp = h5f[entry]
 
+    # Canonical detector locations accept 2-D as a one-frame acquisition (F6:
+    # same ndim >= 2 contract as classify_image_source / read_image; the stack
+    # proxy normalizes to (1, H, W)).  The weak largest-dataset fallback below
+    # stays strict-3D — a lone 2-D array of unknown provenance is more likely a
+    # table than a detector frame.
     candidate = f"{entry}/instrument/detector/data"
-    if candidate in h5f and isinstance(h5f[candidate], h5py.Dataset) and h5f[candidate].ndim == 3:
+    if candidate in h5f and isinstance(h5f[candidate], h5py.Dataset) and h5f[candidate].ndim in (2, 3):
         return f"/{candidate}"
 
     candidate = f"{entry}/data/data"
-    if candidate in h5f and isinstance(h5f[candidate], h5py.Dataset) and h5f[candidate].ndim == 3:
+    if candidate in h5f and isinstance(h5f[candidate], h5py.Dataset) and h5f[candidate].ndim in (2, 3):
         return f"/{candidate}"
 
     if "instrument" in grp:
@@ -575,7 +600,7 @@ def find_nexus_image_dataset_in_open_file(
             if not isinstance(sub, h5py.Group):
                 continue
             inner = f"{entry}/instrument/{subname}/data"
-            if inner in h5f and isinstance(h5f[inner], h5py.Dataset) and h5f[inner].ndim == 3:
+            if inner in h5f and isinstance(h5f[inner], h5py.Dataset) and h5f[inner].ndim in (2, 3):
                 return f"/{inner}"
 
     # Bluesky / apstools NXWriter: the NXdata ``@signal`` points at a scalar

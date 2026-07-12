@@ -405,6 +405,51 @@ class TestNexusImageStack:
             out = stack[5:5]
             assert out.shape == (0,) + stack.shape[1:]
 
+    def test_single_2d_detector_frame_is_a_one_frame_stack(self, tmp_path):
+        """F6 (Codex review): a lone 2-D detector dataset (one-exposure
+        acquisition) must open as a logical (1, H, W) stack — the classifier
+        and display reader already accept ndim >= 2; this used to raise
+        '... is 2-D; NexusImageStack expects 3-D'."""
+        img = np.arange(63, dtype=np.uint32).reshape(7, 9)
+        p = tmp_path / "single.nxs"
+        with h5py.File(p, "w") as f:
+            e = f.create_group("entry")
+            e.attrs["NX_class"] = "NXentry"
+            d = e.create_group("data")
+            d.attrs["NX_class"] = "NXdata"
+            d.create_dataset("data", data=img)
+        with open_nexus_image_stack(p) as stack:
+            assert stack.shape == (1, 7, 9)
+            assert stack.ndim == 3
+            assert len(stack) == 1
+            assert np.array_equal(np.asarray(stack[0]), img)
+            assert np.array_equal(np.asarray(stack[-1]), img)
+            with pytest.raises(IndexError):
+                stack[1]
+            block = np.asarray(stack[0:1])
+            assert block.shape == (1, 7, 9)
+            assert np.array_equal(block[0], img)
+            assert stack[1:1].shape == (0, 7, 9)
+            frames = [np.asarray(fr) for fr in stack]
+            assert len(frames) == 1
+            assert np.array_equal(frames[0], img)
+
+    def test_multi_segment_2d_still_rejected(self, tmp_path):
+        """The (1, H, W) normalization is single-dataset only — a 2-D dataset
+        among Eiger external-link segments remains a hard error."""
+        a = tmp_path / "a.h5"
+        b = tmp_path / "b.h5"
+        for path in (a, b):
+            with h5py.File(path, "w") as f:
+                f.create_dataset("data", data=np.zeros((10, 10), dtype=np.uint16))
+        master = tmp_path / "master.h5"
+        with h5py.File(master, "w") as mf:
+            d = mf.create_group("entry").create_group("data")
+            d["data_000001"] = h5py.ExternalLink(a.name, "/data")
+            d["data_000002"] = h5py.ExternalLink(b.name, "/data")
+        with pytest.raises(ValueError, match="expects 3-D"):
+            open_nexus_image_stack(master)
+
     def test_inconsistent_per_frame_shapes_raise(self, tmp_path):
         """Mismatched (H, W) across segments must be rejected."""
         # Two data files: one (4, 10, 10), the other (4, 12, 10).
@@ -455,7 +500,9 @@ class TestNexusImageStack:
         with h5py.File(p, "w") as f:
             e = f.create_group("entry")
             e.create_dataset("scalar", data=1.0)
-        with pytest.raises(KeyError, match="No 3-D image dataset"):
+        # (message wording updated with F6: 2-D single frames now count, so the
+        # error no longer claims a "3-D" requirement)
+        with pytest.raises(KeyError, match="No image dataset"):
             open_nexus_image_stack(p)
 
 
