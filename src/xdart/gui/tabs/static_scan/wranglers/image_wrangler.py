@@ -1003,16 +1003,10 @@ class imageWrangler(wranglerWidget):
 
     @staticmethod
     def _append_scan_name_for_source(path):
-        """Mirror imageThread's output scan-name derivation for Append targets."""
-
-        source = Path(str(path))
-        stem = source.stem
-        ext = source.suffix.lower().lstrip(".")
-        if stem.lower().endswith("_master"):
-            return stem[:-7]
-        if ext in ("h5", "hdf5", "nxs"):
-            return stem
-        return _get_scan_info(source)[0]
+        """Mirror imageThread's output scan-name derivation for Append targets —
+        delegates to the ONE canonical ``scan_name_from_source`` (Codex F2)."""
+        from .image_wrangler_thread import scan_name_from_source
+        return scan_name_from_source(path)
 
     def _append_target_matches_scan_file(self, scan, *, refresh_source=False):
         target = imageWrangler._candidate_append_target_file(

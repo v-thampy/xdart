@@ -207,6 +207,30 @@ def _get_scan_info(fname):
     return _split_scan_suffix(Path(fname).stem)
 
 
+def scan_name_from_source(path):
+    """THE canonical source-file → scan-name rule (Codex F2).
+
+    Container files (`.nxs` / `.h5` / `.hdf5`) keep the **FULL stem** — the numeric
+    suffix is part of the scan identity: `LaB6_0710_1025pm_00005.nxs` stays
+    `LaB6_0710_1025pm_00005`.  That is what the processed `.nxs` filename AND the
+    plot titles / legend labels must show (dropping the `00005` was the bug).  An
+    Eiger `_master` HDF5 strips only the `_master` tag; a per-file image series
+    (`.tif`, …) strips the trailing `_<digits>` frame index.
+
+    Shared by the worker (`_eiger_scan_name`), the GUI frame-boundary parser
+    (`_scan_key_from_source`), the append-target resolver
+    (`_append_scan_name_for_source`) and the overlay helper so they can never
+    disagree again — the three-way divergence F2 fixed.  Pure string parse, no I/O.
+    """
+    p = Path(str(path))
+    stem = p.stem
+    if stem.lower().endswith("_master"):
+        return stem[:-7]
+    if p.suffix.lower() in (".h5", ".hdf5", ".nxs"):
+        return stem
+    return _get_scan_info(path)[0]
+
+
 def _series_frame_sort_key(path):
     scan_name, img_number = _get_scan_info(path)
     number_key = -1 if img_number is None else img_number
@@ -3044,8 +3068,9 @@ class imageThread(wranglerThread):
 
     @staticmethod
     def _eiger_scan_name(master_path):
-        master_stem = Path(master_path).stem
-        return master_stem[:-7] if master_stem.lower().endswith('_master') else master_stem
+        # Canonical rule (Codex F2): container .nxs/.h5 keeps the FULL stem,
+        # '_master' is stripped — one shared source-of-truth with the GUI.
+        return scan_name_from_source(master_path)
 
     def _eiger_refill_master_queue(self):
         """Queue matching HDF5 master / NeXus files not yet processed."""

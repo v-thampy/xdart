@@ -338,21 +338,17 @@ def scanlocked(func):
 def _scan_key_from_source(src):
     """Derive the wrangler's scan name from a frame's ``source_file``.
 
-    Matches ``image_wrangler_thread``'s own naming EXACTLY so the GUI can attribute
-    each frame to its scan without the mis-timed ``new_scan`` signal: strip a
-    trailing ``_master`` (Eiger HDF5), else fall back to ``_get_scan_info`` (which
-    strips a trailing ``_<digits>`` from the stem — the per-file series case).
-    Returns ``None`` for an empty/missing source (treated as "no scan change").
-    Pure string parse (no I/O) — safe to call per frame on the GUI thread.
+    Delegates to the ONE canonical ``scan_name_from_source`` (Codex F2) so the GUI
+    attributes each frame to EXACTLY the scan the worker wrote — including keeping
+    the FULL stem for a container ``.nxs``/``.h5``/``.hdf5`` (the numeric suffix is
+    part of the identity; dropping it garbled the plot title / legend and merged
+    distinct numeric ``.nxs`` scans).  Returns ``None`` for an empty/missing source
+    (treated as "no scan change").  Pure string parse, no I/O.
     """
     if not src:
         return None
-    from pathlib import Path
-    stem = Path(src).stem
-    if stem.endswith("_master"):
-        return stem[:-7]
-    from .wranglers.image_wrangler_thread import _get_scan_info
-    return _get_scan_info(src)[0] or None
+    from .wranglers.image_wrangler_thread import scan_name_from_source
+    return scan_name_from_source(src) or None
 
 
 def _drop_output_axis_ranges(args):
