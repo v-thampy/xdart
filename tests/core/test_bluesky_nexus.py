@@ -170,6 +170,37 @@ def test_is_bluesky_nxwriter_false_when_xdart_schema(tmp_path):
         assert is_bluesky_nxwriter(f) is False
 
 
+def test_is_unfinalized_nxwriter_lifecycle(tmp_path):
+    """F5: an NXWriter container without ``entry/end_time`` is mid-run (defer);
+    stamping ``end_time`` finalizes it."""
+    from xrd_tools.io.bluesky_nexus import is_unfinalized_nxwriter
+
+    p = _write_bluesky_nxwriter(tmp_path / "run_00001.nxs")
+    assert is_unfinalized_nxwriter(p) is False        # finalized fixture
+    with h5py.File(p, "r+") as f:
+        del f["entry/end_time"]
+    assert is_unfinalized_nxwriter(p) is True         # mid-run
+    with h5py.File(p, "r+") as f:
+        f["entry"].create_dataset("end_time", data=b"2026-07-12T00:01:00")
+    assert is_unfinalized_nxwriter(p) is False        # run closed
+
+
+def test_is_unfinalized_nxwriter_never_defers_plain(plain_nexus_file):
+    """A non-Bluesky container has no end_time contract — never deferred."""
+    from xrd_tools.io.bluesky_nexus import is_unfinalized_nxwriter
+
+    assert is_unfinalized_nxwriter(plain_nexus_file) is False
+
+
+def test_is_unfinalized_nxwriter_defers_unreadable(tmp_path):
+    """A half-written/torn HDF5 (h5py cannot open it) is mid-write — defer."""
+    from xrd_tools.io.bluesky_nexus import is_unfinalized_nxwriter
+
+    torn = tmp_path / "torn_00001.nxs"
+    torn.write_bytes(b"\x89HDF\r\n partial garbage")
+    assert is_unfinalized_nxwriter(torn) is True
+
+
 # ---------------------------------------------------------------------------
 # motors / counters / wavelength via read_nexus
 # ---------------------------------------------------------------------------

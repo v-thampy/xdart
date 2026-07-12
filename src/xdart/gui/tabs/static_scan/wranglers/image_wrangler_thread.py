@@ -3087,8 +3087,22 @@ class imageThread(wranglerThread):
         queued = set(self._eiger_master_queue)
         for mf in master_files:
             mf_str = str(mf)
-            if mf_str not in self._eiger_done_masters and mf_str not in queued:
-                self._eiger_master_queue.append(mf_str)
+            if mf_str in self._eiger_done_masters or mf_str in queued:
+                continue
+            # F5: an apstools/NXWriter .nxs is finalized-at-close (entry/end_time
+            # stamped when the run stops).  Never queue an in-progress container:
+            # once consumed it is exhausted-and-RETIRED into _eiger_done_masters,
+            # permanently losing every frame written after the one-shot growth
+            # re-check.  Deferring here is loss-free — the file is re-checked on
+            # every refill poll and queued the moment it finalizes.  Plain
+            # (non-Bluesky) .nxs files are never deferred.
+            if suffix == '.nxs':
+                from xrd_tools.io.bluesky_nexus import is_unfinalized_nxwriter
+                if is_unfinalized_nxwriter(mf_str):
+                    logger.debug('Deferring unfinalized NXWriter container: %s',
+                                 mf_str)
+                    continue
+            self._eiger_master_queue.append(mf_str)
 
     def _get_next_eiger_frame(self):
         """Return the next frame from Eiger / NeXus HDF5 file(s).
