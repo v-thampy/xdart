@@ -193,12 +193,22 @@ def find_nexus_image_dataset(
     """
     Return the HDF5 internal path to the image dataset, or *None*.
 
-    Search order:
+    Search order (the Eiger external-link arm first, then ONE shared
+    implementation with :func:`find_nexus_image_dataset_in_open_file` — the two
+    finders drifted once (F6/wf_3614041c: only the open-file variant learned the
+    single-2-D-frame acceptance, so the live watch silently dropped one-exposure
+    ``.nxs`` files the headless seam opened fine); delegating kills that class):
 
-    1. ``/{entry}/instrument/detector/data``
-    2. ``/{entry}/data/data``
-    3. ``/{entry}/instrument/*/data``  (any detector sub-group)
-    4. Largest 3D dataset anywhere under ``/{entry}/``
+    1. Eiger external-link pattern ``/{entry}/data/data_NNNNNN`` (the first
+       link path is returned so the caller can enumerate siblings — the same
+       precedence :func:`open_nexus_image_stack` applies)
+    2. ``/{entry}/instrument/detector/data`` (3-D)
+    3. ``/{entry}/data/data`` (3-D)
+    4. ``/{entry}/instrument/*/data``  (any detector sub-group, 3-D)
+    5. A dataset flagged ``@signal_type='detector'`` (Bluesky/NXWriter)
+    6. Largest 3-D dataset anywhere under ``/{entry}/``
+    7. Last resort: a single 2-D detector frame at a canonical location
+       (a one-exposure acquisition; normalized to ``(1, H, W)`` downstream)
 
     Parameters
     ----------
@@ -221,71 +231,23 @@ def find_nexus_image_dataset(
         if entry not in f:
             logger.warning("Entry %r not found in %s", entry, p)
             return None
-        grp = f[entry]
 
-        # 1. Canonical detector location
-        candidate = f"{entry}/instrument/detector/data"
-        if candidate in f and isinstance(f[candidate], h5py.Dataset) and f[candidate].ndim == 3:
-            return f"/{candidate}"
+        # Eiger external-link pattern: /entry/data/data_NNNNNN.  Return the
+        # *first* link path so the caller can enumerate siblings to build the
+        # full stack.  (External target files may be missing mid-transfer, so
+        # the resolution is guarded.)
+        ext_paths = _find_eiger_external_link_paths(f, entry)
+        if ext_paths:
+            try:
+                ds = f[ext_paths[0]]
+                if isinstance(ds, h5py.Dataset) and ds.ndim == 3:
+                    logger.debug("Found Eiger external-link dataset: %s",
+                                 ext_paths[0])
+                    return ext_paths[0]
+            except Exception:
+                pass
 
-        # 2. /data/data
-        candidate = f"{entry}/data/data"
-        if candidate in f and isinstance(f[candidate], h5py.Dataset) and f[candidate].ndim == 3:
-            return f"/{candidate}"
-
-        # 3. Any detector sub-group under instrument/
-        if "instrument" in grp:
-            instr = grp["instrument"]
-            for subname in instr:
-                sub = instr[subname]
-                if not isinstance(sub, h5py.Group):
-                    continue
-                inner = f"{entry}/instrument/{subname}/data"
-                if inner in f and isinstance(f[inner], h5py.Dataset) and f[inner].ndim == 3:
-                    return f"/{inner}"
-
-        # 4. Eiger external-link pattern: /entry/data/data_NNNNNN
-        #    Eiger master files store external links named data_000001,
-        #    data_000002, … that point to _data_*.h5 files.  Each link
-        #    resolves to a 3D dataset.  Return the *first* link path so
-        #    the caller can enumerate siblings to build the full stack.
-        if "data" in grp and isinstance(grp["data"], h5py.Group):
-            data_grp = grp["data"]
-            ext_keys = sorted(
-                k for k in data_grp
-                if data_grp.get(k, getlink=True).__class__.__name__ == "ExternalLink"
-            )
-            if ext_keys:
-                first_key = ext_keys[0]
-                try:
-                    ds = data_grp[first_key]
-                    if isinstance(ds, h5py.Dataset) and ds.ndim == 3:
-                        logger.debug(
-                            "Found Eiger external-link dataset: /%s/data/%s",
-                            entry, first_key,
-                        )
-                        return f"/{entry}/data/{first_key}"
-                except Exception:
-                    # External target file may be missing
-                    pass
-
-        # 5. Fallback: largest 3D dataset anywhere under the entry
-        best_path: str | None = None
-        best_size = 0
-
-        def _visit(name: str, obj: Any) -> None:
-            nonlocal best_path, best_size
-            if not isinstance(obj, h5py.Dataset) or obj.ndim != 3:
-                return
-            size = int(np.prod(obj.shape))
-            if size > best_size:
-                best_size = size
-                best_path = f"/{entry}/{name}"
-
-        grp.visititems(_visit)
-        if best_path:
-            logger.debug("Found image dataset by fallback scan: %s", best_path)
-        return best_path
+        return find_nexus_image_dataset_in_open_file(f, entry)
 
 
 def _find_eiger_external_link_paths(
@@ -580,17 +542,19 @@ def find_nexus_image_dataset_in_open_file(
         return None
     grp = h5f[entry]
 
-    # Canonical detector locations accept 2-D as a one-frame acquisition (F6:
-    # same ndim >= 2 contract as classify_image_source / read_image; the stack
-    # proxy normalizes to (1, H, W)).  The weak largest-dataset fallback below
-    # stays strict-3D — a lone 2-D array of unknown provenance is more likely a
-    # table than a detector frame.
+    # 3-D resolution keeps its FULL pre-F6 precedence: every arm below runs
+    # before any 2-D acceptance, so a lone 2-D non-image dataset (an MCA/spectra
+    # table at entry/data/data, a small per-frame array under instrument/*) can
+    # never shadow a real 3-D stack that used to resolve (review-caught
+    # regression, wf_3614041c).  A single 2-D detector FRAME (F6: one-exposure
+    # acquisition) is accepted by the canonical-location LAST-RESORT pass at the
+    # bottom, only when nothing else resolves.
     candidate = f"{entry}/instrument/detector/data"
-    if candidate in h5f and isinstance(h5f[candidate], h5py.Dataset) and h5f[candidate].ndim in (2, 3):
+    if candidate in h5f and isinstance(h5f[candidate], h5py.Dataset) and h5f[candidate].ndim == 3:
         return f"/{candidate}"
 
     candidate = f"{entry}/data/data"
-    if candidate in h5f and isinstance(h5f[candidate], h5py.Dataset) and h5f[candidate].ndim in (2, 3):
+    if candidate in h5f and isinstance(h5f[candidate], h5py.Dataset) and h5f[candidate].ndim == 3:
         return f"/{candidate}"
 
     if "instrument" in grp:
@@ -600,7 +564,7 @@ def find_nexus_image_dataset_in_open_file(
             if not isinstance(sub, h5py.Group):
                 continue
             inner = f"{entry}/instrument/{subname}/data"
-            if inner in h5f and isinstance(h5f[inner], h5py.Dataset) and h5f[inner].ndim in (2, 3):
+            if inner in h5f and isinstance(h5f[inner], h5py.Dataset) and h5f[inner].ndim == 3:
                 return f"/{inner}"
 
     # Bluesky / apstools NXWriter: the NXdata ``@signal`` points at a scalar
@@ -626,7 +590,28 @@ def find_nexus_image_dataset_in_open_file(
             best_path = f"/{entry}/{name}"
 
     grp.visititems(_visit)
-    return best_path
+    if best_path is not None:
+        return best_path
+
+    # F6 LAST RESORT: a single 2-D detector frame at a canonical location (a
+    # one-exposure acquisition; classify_image_source / read_image accept it,
+    # and NexusImageStack normalizes it to (1, H, W)).  Runs only when NOTHING
+    # 3-D or detector-flagged resolved above, so a 2-D table can never shadow a
+    # real stack.  The largest-dataset fallback stays strict-3D — a lone 2-D
+    # array of unknown provenance is more likely a table than a frame.
+    for cand in (f"{entry}/instrument/detector/data", f"{entry}/data/data"):
+        if cand in h5f and isinstance(h5f[cand], h5py.Dataset) and h5f[cand].ndim == 2:
+            return f"/{cand}"
+    if "instrument" in grp:
+        instr = grp["instrument"]
+        for subname in instr:
+            sub = instr[subname]
+            if not isinstance(sub, h5py.Group):
+                continue
+            inner = f"{entry}/instrument/{subname}/data"
+            if inner in h5f and isinstance(h5f[inner], h5py.Dataset) and h5f[inner].ndim == 2:
+                return f"/{inner}"
+    return None
 
 
 def list_entries(path: Path | str) -> list[str]:

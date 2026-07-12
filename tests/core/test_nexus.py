@@ -13,6 +13,7 @@ from xrd_tools.io.nexus import (
     _require_uniform_axes_1d,
     _require_uniform_axes_2d,
     find_nexus_image_dataset,
+    find_nexus_image_dataset_in_open_file,
     list_entries,
     open_nexus_image_stack,
     open_nexus_writer,
@@ -433,6 +434,75 @@ class TestNexusImageStack:
             frames = [np.asarray(fr) for fr in stack]
             assert len(frames) == 1
             assert np.array_equal(frames[0], img)
+
+    def test_2d_table_never_shadows_a_real_3d_stack(self, tmp_path):
+        """wf_3614041c P2 (review-caught regression): a lone 2-D NON-image
+        dataset at a canonical location (an MCA/spectra table at
+        entry/data/data) must never shadow a real 3-D detector stack found by a
+        later arm — 3-D keeps its full pre-F6 precedence; 2-D acceptance is a
+        LAST resort."""
+        p = tmp_path / "mixed.nxs"
+        with h5py.File(p, "w") as f:
+            e = f.create_group("entry")
+            # 2-D spectra table at the canonical /data/data location…
+            e.create_group("data").create_dataset(
+                "data", data=np.zeros((50, 1024), dtype=np.float32))
+            # …and the REAL detector stack under instrument/<sub>/data.
+            e.create_group("instrument").create_group("pilatus").create_dataset(
+                "data", data=np.zeros((5, 10, 12), dtype=np.uint16))
+        assert find_nexus_image_dataset(p) == "/entry/instrument/pilatus/data"
+        with open_nexus_image_stack(p) as stack:
+            assert stack.shape == (5, 10, 12)
+
+    def test_2d_at_each_canonical_location_resolves_when_alone(self, tmp_path):
+        """The 2-D last-resort pass covers ALL canonical arms (review
+        test-integrity finding: instrument/detector/data and
+        instrument/<sub>/data were untested — a targeted revert passed the
+        suite)."""
+        for loc in ("instrument/detector", "data", "instrument/pilatus"):
+            p = tmp_path / f"single_{loc.replace('/', '_')}.nxs"
+            with h5py.File(p, "w") as f:
+                grp = f.create_group("entry")
+                for part in loc.split("/"):
+                    grp = grp.create_group(part)
+                grp.create_dataset(
+                    "data", data=np.arange(12, dtype=np.uint16).reshape(3, 4))
+            assert find_nexus_image_dataset(p) == f"/entry/{loc}/data", loc
+            with open_nexus_image_stack(p) as stack:
+                assert stack.shape == (1, 3, 4), loc
+
+    def test_path_and_open_file_finder_variants_agree(self, tmp_path):
+        """The two finder variants drifted once (wf_3614041c P2: only the
+        open-file variant learned the single-2-D-frame acceptance, so the live
+        watch dropped files the headless seam opened fine).  The path variant
+        now DELEGATES — pin agreement across layouts so they cannot fork
+        again."""
+        def _flag_detector(ds):
+            ds.attrs["signal_type"] = "detector"
+            return ds
+
+        layouts = {
+            "canon3d.nxs": lambda e: e.create_group("instrument")
+            .create_group("detector")
+            .create_dataset("data", data=np.zeros((4, 5, 6), dtype=np.uint16)),
+            "canon2d.nxs": lambda e: e.create_group("data")
+            .create_dataset("data", data=np.zeros((5, 6), dtype=np.uint16)),
+            "bluesky2d.nxs": lambda e: _flag_detector(
+                e.create_group("data")
+                .create_dataset("eiger_image", data=np.zeros((5, 6), dtype=np.uint16))),
+            "largest3d.nxs": lambda e: e.create_group("misc")
+            .create_dataset("stack", data=np.zeros((3, 5, 6), dtype=np.uint16)),
+            "none.nxs": lambda e: e.create_dataset("scalar", data=1.0),
+        }
+
+        for name, build in layouts.items():
+            p = tmp_path / name
+            with h5py.File(p, "w") as f:
+                build(f.create_group("entry"))
+            via_path = find_nexus_image_dataset(p)
+            with h5py.File(p, "r") as f:
+                via_open = find_nexus_image_dataset_in_open_file(f, "entry")
+            assert via_path == via_open, (name, via_path, via_open)
 
     def test_multi_segment_2d_still_rejected(self, tmp_path):
         """The (1, H, W) normalization is single-dataset only — a 2-D dataset

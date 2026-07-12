@@ -532,6 +532,59 @@ def test_f5_refill_defers_only_unfinalized_bluesky(tmp_path):
     assert str(inprog) in t._eiger_master_queue
 
 
+# ---------------------------------------------------------------------------
+# F6 live-watch half (review wf_3614041c P2): the path-variant finder was
+# strict-3D, so a one-exposure 2-D NXWriter .nxs opened fine through the
+# HEADLESS seam but the live watch read ZERO frames (fabio can't read Bluesky
+# layouts) and silently retired the file after a 30 s stall.
+# ---------------------------------------------------------------------------
+
+def _write_single_exposure_bluesky(path):
+    """A one-exposure NXWriter count: the detector image is a lone 2-D dataset
+    flagged @signal_type='detector' (finalized — end_time present)."""
+    import h5py
+
+    img = np.arange(16, dtype=np.uint32).reshape(4, 4)
+    with h5py.File(path, "w") as f:
+        f.attrs["creator"] = "NXWriter"
+        entry = f.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.attrs["default"] = "data"
+        entry.create_dataset("start_time", data=b"2026-07-12T00:00:00")
+        entry.create_dataset("end_time", data=b"2026-07-12T00:00:01")
+        data = entry.create_group("data")
+        data.attrs["NX_class"] = "NXdata"
+        data.attrs["signal"] = "gate"
+        data.create_dataset("gate", data=np.array([0.5]))
+        det = data.create_dataset("eiger_image", data=img)
+        det.attrs["signal_type"] = "detector"
+    return img
+
+
+def test_f6_single_exposure_2d_nxs_consumed_by_live_watch(tmp_path):
+    """The watch must read the one frame — the FULL 2-D image, never a row of
+    it — and only then retire the master."""
+    watch = tmp_path / "watch"
+    watch.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
+    p = watch / "single_00001.nxs"
+    img = _write_single_exposure_bluesky(p)
+
+    t = _real_dir_watch_thread(watch, out)
+    item = t._get_next_eiger_frame_sync()
+    assert item[3] is not None, "single 2-D exposure must yield a frame"
+    assert item[1] == "single_00001"
+    assert item[2] == 1
+    frame = np.asarray(item[3])
+    assert frame.shape == img.shape           # the frame, not a (W,) row
+    assert np.array_equal(frame, img)
+
+    item = t._get_next_eiger_frame_sync()
+    assert item[3] is None                    # exactly one frame, then done
+    assert str(p) in t._eiger_done_masters
+
+
 # ===========================================================================
 # Real-file assertions (shipped Pt_10nm_00013.nxs; skip without test data)
 # ===========================================================================

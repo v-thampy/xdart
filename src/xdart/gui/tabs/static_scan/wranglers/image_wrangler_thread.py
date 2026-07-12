@@ -2896,17 +2896,28 @@ class imageThread(wranglerThread):
         try:
             ds_path = find_nexus_image_dataset(master_path)
             if ds_path is None:
-                logger.warning('Could not find 3D image dataset in %s', master_path)
+                logger.warning('Could not find image dataset in %s', master_path)
                 self._eiger_close_master()
                 self._eiger_nframes = 0
                 return
             self._eiger_h5_handle = h5py.File(master_path, 'r')
             self._eiger_h5_dataset = self._eiger_h5_handle[ds_path]
-            self._eiger_nframes = self._eiger_h5_dataset.shape[0]
+            self._eiger_nframes = self._h5_stack_nframes(self._eiger_h5_dataset)
         except Exception as e:
             logger.error('Error opening HDF5/NeXus file %s: %s', master_path, e)
             self._eiger_close_master()
             self._eiger_nframes = 0
+
+    @staticmethod
+    def _h5_stack_nframes(dset):
+        """Logical frame count of an h5py image dataset.
+
+        A 2-D dataset is a SINGLE-exposure detector frame — one logical frame
+        (the same (1, H, W) normalization NexusImageStack applies, F6) — never
+        ``shape[0]`` rows.  Every ``_eiger_nframes`` assignment from a live
+        h5py dataset must come through here (the growth re-checks included), or
+        a one-frame ``.nxs`` would be re-counted as H "frames" of rows."""
+        return 1 if dset.ndim == 2 else int(dset.shape[0])
 
     def _eiger_close_master(self):
         """Close persistent Eiger handles (fabio and/or h5py)."""
@@ -3367,6 +3378,10 @@ class imageThread(wranglerThread):
                             else self._eiger_fabio_handle.get_frame(frame_idx).data)
                     return np.asarray(_raw)
                 if self._eiger_h5_dataset is not None:
+                    if self._eiger_h5_dataset.ndim == 2:
+                        # F6: the lone 2-D dataset IS frame 0 (never index a
+                        # row out of a single-exposure frame).
+                        return np.asarray(self._eiger_h5_dataset[()])
                     return np.asarray(self._eiger_h5_dataset[frame_idx])
                 with fabio.open(self._eiger_master_path) as _img:
                     _raw = (_img.data if frame_idx == 0
@@ -3395,7 +3410,7 @@ class imageThread(wranglerThread):
                 self._eiger_nframes = self._eiger_fabio_handle.nframes
             elif self._eiger_h5_dataset is not None:
                 self._eiger_h5_dataset.id.refresh()
-                self._eiger_nframes = self._eiger_h5_dataset.shape[0]
+                self._eiger_nframes = self._h5_stack_nframes(self._eiger_h5_dataset)
         except Exception as e:
             logger.debug("Failed to refresh Eiger handle for %s: %s",
                          getattr(self, "_eiger_master_path", None), e)
@@ -3438,7 +3453,7 @@ class imageThread(wranglerThread):
                 elif self._eiger_h5_dataset is not None:
                     try:
                         self._eiger_h5_dataset.id.refresh()
-                        self._eiger_nframes = self._eiger_h5_dataset.shape[0]
+                        self._eiger_nframes = self._h5_stack_nframes(self._eiger_h5_dataset)
                     except (IOError, OSError, KeyError) as e:
                         logger.debug("Failed to refresh h5 dataset for %s: %s", self._eiger_master_path, e)
                         self._eiger_nframes = self._get_nframes(self._eiger_master_path)
