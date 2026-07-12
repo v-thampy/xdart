@@ -1262,15 +1262,7 @@ class imageThread(wranglerThread):
                 # the per-iteration dispatch cadence below: the old
                 # scan may have integrated-but-unsaved frames in
                 # memory whose save_to_nexus call never fired.
-                if (scan is not None
-                        and not self.xye_only
-                        and self._frames_since_save > 0):
-                    _n_swap = self._frames_since_save     # reset by the tail
-                    if self.flush_serial_tail(scan, force=True):
-                        logger.info(
-                            '[SAVE-ON-SWAP] %d frames flushed for %s',
-                            _n_swap, scan.name,
-                        )
+                self._flush_outgoing_scan(scan)
                 try:
                     scan = self.initialize_scan()
                 except AppendConfigMismatchError as exc:
@@ -1402,6 +1394,12 @@ class imageThread(wranglerThread):
                 self.scan_name = scan_name
 
                 if (scan is None) or (scan_name != scan.name):
+                    # SAVE-ON-SWAP (F1): persist the OUTGOING scan's
+                    # integrated-but-unsaved serial tail before switching, so a
+                    # sub-LIVE_SAVE_INTERVAL live scan (A→B→C single-frame
+                    # masters) is not counted-as-processed yet shipped empty.
+                    # Symmetric with the initial-collection boundary above.
+                    self._flush_outgoing_scan(scan)
                     try:
                         scan = self.initialize_scan()
                     except AppendConfigMismatchError as exc:
@@ -2173,6 +2171,30 @@ class imageThread(wranglerThread):
             yield
         finally:
             _get_h5pool().resume(scan.data_file)
+
+    def _flush_outgoing_scan(self, scan) -> None:
+        """Force-save the OUTGOING scan's integrated-but-unsaved serial tail at a
+        scan-boundary swap, before it is replaced by ``initialize_scan()``.
+
+        Shared by BOTH scan-swap paths — the initial-collection loop and the
+        Phase-3 live-watch boundary — because that is exactly where data can
+        vanish: a sub-``LIVE_SAVE_INTERVAL`` scan (e.g. A→B→C single-frame
+        masters) is ``record_processed``-counted but its ``.nxs`` never
+        force-saves, so it ships empty while ``files_processed_by_output`` claims
+        its frames.  The bug recurred once already because the two boundaries had
+        DUPLICATED this flush and only one was fixed — keep it here, called from
+        both, so they can never diverge again.  No-op for ``scan is None`` /
+        ``xye_only`` (xye is drained per-frame, has no .nxs tail).
+        """
+        if (scan is not None
+                and not self.xye_only
+                and self._frames_since_save > 0):
+            _n_swap = self._frames_since_save     # reset by the tail
+            if self.flush_serial_tail(scan, force=True):
+                logger.info(
+                    '[SAVE-ON-SWAP] %d frames flushed for %s',
+                    _n_swap, scan.name,
+                )
 
     def flush_serial_tail(self, scan, *, force=False) -> bool:
         """The serial save tail (the DRYed copy-paste idiom).

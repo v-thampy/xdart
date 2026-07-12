@@ -287,6 +287,7 @@ def test_live_watch_append_mismatch_stops_cleanly(tmp_path):
 
     host._h5pool_bracket = _noop_bracket
     host.flush_serial_tail = MethodType(imageThread.flush_serial_tail, host)
+    host._flush_outgoing_scan = MethodType(imageThread._flush_outgoing_scan, host)
     host._handle_append_config_mismatch = MethodType(
         imageThread._handle_append_config_mismatch, host)
 
@@ -355,3 +356,91 @@ def test_wrangler_widget_surfaces_one_warning_modal_and_status():
     assert box.text == message
     assert box.execs == 1
     assert statuses[-1] == message              # reason survives the modal
+
+
+def test_live_watch_saves_every_intermediate_scan(tmp_path):
+    """F1 (P1 data-loss): in the Phase-3 live watch, EACH scan-boundary swap must
+    force-save the OUTGOING scan's tail.  Otherwise sub-LIVE_SAVE_INTERVAL scans
+    (A->B->C single-frame masters) are record_processed-counted but only the LAST
+    scan is force-saved at run end, so A.nxs / B.nxs ship EMPTY while the run
+    reports all three processed.  Drives the REAL process_scan +
+    _flush_outgoing_scan + flush_serial_tail; only the frame source (an input)
+    and _save_to_nexus (observed output) are instrumented, never the save seam.
+    Pre-fix this asserts ['c']; post-fix ['a','b','c']."""
+    saves = []
+
+    def _mk_scan(name):
+        return SimpleNamespace(
+            name=name,
+            data_file=str(tmp_path / f"{name}.nxs"),
+            frames=SimpleNamespace(index=[]),
+            skip_2d=False,
+            _save_to_nexus=(lambda n=name: saves.append(n)),
+        )
+
+    scans = {n: _mk_scan(n) for n in ("a", "b", "c")}
+    init_order = ["a", "b", "c"]
+    init_calls = []
+
+    def initialize_scan():
+        name = init_order[len(init_calls)]
+        init_calls.append(name)
+        return scans[name]
+
+    img = np.ones((2, 2))
+    frame_queue = [
+        ("/tmp/a_0001.tif", "a", 1, img, {}),  # Phase 1&2: establishes scan A
+        (None, None, None, None, None),        # glob exhausted -> Phase 3 (scan=A)
+        ("/tmp/b_0001.tif", "b", 1, img, {}),  # Phase 3 boundary: A saved, init B
+        ("/tmp/c_0001.tif", "c", 1, img, {}),  # Phase 3 boundary -> FORCE-SAVE B
+    ]
+
+    host = SimpleNamespace(
+        command="start", batch_mode=False, live_mode=True, single_img=False,
+        xye_only=False, img_file="/tmp/a_0001.tif", poni=None, scan_name="a",
+        file_lock=threading.RLock(), _frames_since_save=0, _active_scan=None,
+        _perf=None, _live_execution=lambda: "serial",
+        showLabel=SimpleNamespace(emit=lambda *_: None),
+        sigUpdate=SimpleNamespace(emit=lambda *_: None),
+        sigAppendMismatch=SimpleNamespace(emit=lambda *_: None),
+        _wait_if_paused=lambda: None,
+        _middle_truncate=lambda text, max_len=40: text,
+        initialize_scan=initialize_scan,
+        get_background=lambda *_: 0.0,
+        _flush_xye_buffer=lambda *_a, **_k: None,
+        _save_due=(lambda scan, force=False: bool(force)),   # only FORCE saves
+        _prime_append_skip_snapshots_for_run=lambda: None,
+        _process_one=lambda *a, **k: None,
+        _install_run_integrator=lambda *a, **k: None,
+    )
+
+    # Mirror the real dispatch's side effect: processing frames advances the
+    # per-save counter, so the OUTGOING scan has an unsaved tail at a swap.
+    def _dispatch_batch(scan, pending, force_save=False):
+        host._frames_since_save += len(pending)
+        return len(pending)
+
+    host._dispatch_batch = _dispatch_batch
+
+    def next_image():
+        if frame_queue:
+            return frame_queue.pop(0)
+        host.command = "stop"       # after C is processed, end the watch
+        return None, None, None, None, None
+
+    host.get_next_image = next_image
+
+    @contextmanager
+    def _noop_bracket(_scan):
+        yield
+
+    host._h5pool_bracket = _noop_bracket
+    host.flush_serial_tail = MethodType(imageThread.flush_serial_tail, host)
+    host._flush_outgoing_scan = MethodType(imageThread._flush_outgoing_scan, host)
+
+    MethodType(imageThread.process_scan, host)()
+
+    assert init_calls == ["a", "b", "c"]
+    # Every scan's tail persisted at its boundary — NOT just the last one
+    # (pre-fix behavior was ["c"]: A and B lost).
+    assert saves == ["a", "b", "c"], saves
