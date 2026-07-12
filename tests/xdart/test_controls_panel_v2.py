@@ -372,7 +372,13 @@ def test_controls_panel_v2_int_inventory_includes_units_and_advanced_rows():
         assert specs[path].parameter_group == expected_group
 
 
-def test_controls_panel_v2_int_advanced_rows_are_collapsed(qapp, monkeypatch):
+def test_controls_panel_v2_advanced_rows_not_rendered_inline(qapp, monkeypatch):
+    """The Advanced (parameter_group-backed) params have ONE editing surface:
+    the "Advanced" button on the Reintegrate row → the "Integration — Advanced
+    Settings" dialog.  The old collapsed "Advanced" sub-panel duplicated that
+    dialog field-for-field (maintainer decision 2026-07-12: removed) — no
+    Advanced subsection renders, no advanced path leaks into the inline
+    groups, and the button remains."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -401,13 +407,12 @@ def test_controls_panel_v2_int_advanced_rows_are_collapsed(qapp, monkeypatch):
         widget._refresh_controls_v2_profile_now()
 
         sections = _subsections(widget)
-        assert {"1-D", "2-D", "Advanced"} <= set(sections)
-        assert sections["Advanced"]._collapsed is True
-        assert sections["Advanced"].body.isVisible() is False
+        assert {"1-D", "2-D"} <= set(sections)
+        assert "Advanced" not in sections
 
         one_d_paths = _paths(sections["1-D"])
         two_d_paths = _paths(sections["2-D"])
-        advanced_paths = _paths(sections["Advanced"])
+        all_rendered = set().union(*(_paths(sub) for sub in sections.values()))
 
         assert {
             ("Int1D", "axis"),
@@ -431,19 +436,37 @@ def test_controls_panel_v2_int_advanced_rows_are_collapsed(qapp, monkeypatch):
             ("Int2D", "azim_high"),
         } <= two_d_paths
 
-        moved_paths = {
+        # Dialog-only params never render inline anywhere in the panel.
+        advanced_only_paths = {
             ("Int1D", "unit"),
             ("Int2D", "unit"),
             ("Int1D", "method"),
             ("Int2D", "method"),
             ("Int1D", "correctSolidAngle"),
             ("Int2D", "correctSolidAngle"),
+            ("Int1D", "apply_polarization"),
+            ("Int2D", "apply_polarization"),
+            ("Int1D", "polarization_factor"),
+            ("Int2D", "polarization_factor"),
+            ("Int1D", "dummy"),
+            ("Int2D", "dummy"),
+            ("Int1D", "delta_dummy"),
+            ("Int2D", "delta_dummy"),
+            ("Int1D", "chi_offset"),
+            ("Int2D", "chi_offset"),
             ("Int1D", "safe"),
             ("Int2D", "safe"),
         }
-        assert not (moved_paths & one_d_paths)
-        assert not (moved_paths & two_d_paths)
-        assert moved_paths <= advanced_paths
+        assert not (advanced_only_paths & all_rendered)
+
+        # The dialog entry point survives: the Advanced action button is still
+        # on the Reintegrate row.
+        action_labels = {
+            btn.text()
+            for btn in widget.controls_v2.processing_card.body.findChildren(
+                QtWidgets.QPushButton)
+        }
+        assert "Advanced" in action_labels
     finally:
         widget.close()
         widget.deleteLater()
