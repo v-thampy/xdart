@@ -10,10 +10,12 @@ recurring; extended 2026-07-12 for Codex review F3):
 2. Default-select, case-insensitively, the first *named* preference that is
    actually present: ``th, eta, halpha, gonth, theta, alpha_i, mu, incidence``.
 3. Else the first motor whose name *sounds like* a rotation / incidence axis —
-   matched TOKEN-AWARE (word boundaries), never substring-anywhere: the 2-char
+   matched TOKEN-AWARE (word boundaries), never substring-anywhere: as bare
    substrings ``th``/``om`` wrongly claimed ``slit_wid**th**`` and
    ``sample_h**om**e`` (the F3 leak), silently defaulting to a translation
-   stage.  A genuine bare ``th`` axis is still caught by rule 2's exact match.
+   stage.  ``th``/``om`` themselves are real, common beamline axes and stay
+   fully recognized — as whole TOKENS here (``sam_th``, ``th2``, ``om``) and
+   ``th`` at the top of rule 2's preference.
 4. Else ``Manual`` (no motor looks like an incidence axis — safer to make the
    user type the angle than to silently pick a translation stage).
 
@@ -44,16 +46,17 @@ _ROTATION_HINTS_PREFIX = ("gon",)
 _ROTATION_HINTS_SUFFIX = ("chi",)
 
 #: Incidence/rotation names matched only as a WHOLE token (``sample_mu`` yes,
-#: ``muffin_x`` no).  ``mu``/``om`` are 2 chars and ``alpha``/``eta``/``ang``
-#: as affixes would over-match (h**alpha** is fine but alph**a**bet is not;
-#: m**eta**/b**eta** are NOT incidence axes — beta is conventionally the EXIT
-#: angle, and Manual is safer).  ``om`` here is the exact SPEC omega name: the
-#: F3 ban covers the mid-word ``om`` SUBSTRING (h**om**e), not the real axis.
-#: ``halpha`` (the bl11-3 incidence axis) is listed so DECORATED forms
-#: (``sam_halpha``, ``halpha2``) are caught — bare names in
-#: :data:`GI_MOTOR_PREFERENCE` already win via the preference pass.
+#: ``muffin_x`` no).  ``th``/``om``/``mu`` are REAL, common beamline axes
+#: (maintainer clarification 2026-07-12: they were never banned — F3 only
+#: stopped mid-word SUBSTRING matching, wid**th**/h**om**e); whole-token
+#: matching keeps them while staying leak-free, and catches decorated forms
+#: (``sam_th``, ``th2``, ``sample_om``).  ``alpha``/``eta``/``ang`` as affixes
+#: would over-match (m**eta**/b**eta** are NOT incidence axes — beta is
+#: conventionally the EXIT angle, and Manual is safer).  ``halpha`` (the
+#: bl11-3 incidence axis) is listed so decorated forms are caught — bare
+#: names in :data:`GI_MOTOR_PREFERENCE` already win via the preference pass.
 _ROTATION_TOKEN_ALIASES = (
-    "mu", "om", "eta", "ang", "alpha", "alphai", "halpha", "incidence",
+    "th", "om", "mu", "eta", "ang", "alpha", "alphai", "halpha", "incidence",
 )
 
 #: camelCase boundary (lower/digit → upper), applied before lowercasing.

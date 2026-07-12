@@ -122,12 +122,19 @@ def test_f3_genuine_edge_names_still_caught():
     assert pick_default_gi_motor(["detx", "sam_eta"]) == "sam_eta"    # eta exact-token
 
 
-def test_f3_bare_om_is_an_omega_axis():
-    """Exact-token 'om' (the SPEC omega name) stays recognized: the F3 ban
-    covers the mid-word 'om' SUBSTRING (h**om**e), not the real axis."""
+def test_f3_th_and_om_are_real_axes_token_matched():
+    """Maintainer clarification 2026-07-12: th/om were NEVER banned — they are
+    real, common beamline axes. F3 only stopped mid-word SUBSTRING matching
+    (wid**th**/h**om**e). Bare th wins via the preference (it is #1); decorated
+    th/om forms and bare om are caught as whole tokens in the fallback."""
+    assert pick_default_gi_motor(["detx", "th"]) == "th"              # preference #1
+    assert pick_default_gi_motor(["detx", "th2"]) == "th2"            # token + digit strip
+    assert pick_default_gi_motor(["detx", "sam_th"]) == "sam_th"      # token
     assert pick_default_gi_motor(["detx", "om"]) == "om"
     assert pick_default_gi_motor(["detx", "sample_om"]) == "sample_om"
-    assert pick_default_gi_motor(["sample_home", "detx"]) == "Manual"  # still dead
+    # ...while the mid-word substrings stay dead.
+    assert pick_default_gi_motor(["slit_width", "detx"]) == "Manual"
+    assert pick_default_gi_motor(["sample_home", "detx"]) == "Manual"
 
 
 def test_f3_decorated_halpha_recognized():
