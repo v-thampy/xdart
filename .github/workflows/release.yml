@@ -20,4 +20,27 @@ jobs:
       - run: twine check dist/*
       - uses: actions/upload-artifact@v7
         with: {name: dist, path: dist/}
-      # No auto-publish: the maintainer uploads manually.
+
+  # Publish the dist/ built above to PyPI via OIDC Trusted Publishing (no
+  # stored secret) — symmetric with conda-publish.yml, so one
+  # `git tag vX.Y.Z && git push origin vX.Y.Z` ships pip + conda together
+  # (v1.1.0 never reached PyPI because this step was manual and skipped).
+  #
+  # One-time setup (maintainer):
+  #   1. pypi.org → project 'xdart' → Publishing → add a GitHub publisher:
+  #      owner v-thampy, repo xdart, workflow release.yml, environment pypi.
+  #   2. GitHub repo → Settings → Environments → create 'pypi' (optionally
+  #      restrict to protected tags).
+  pypi-publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/p/xdart
+    permissions:
+      id-token: write   # the OIDC token IS the credential (Trusted Publishing)
+    steps:
+      - uses: actions/download-artifact@v7
+        with: {name: dist, path: dist/}
+      - uses: pypa/gh-action-pypi-publish@release/v1
