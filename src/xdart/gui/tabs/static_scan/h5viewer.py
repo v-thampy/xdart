@@ -3209,12 +3209,14 @@ class H5Viewer(QWidget):
     def open_folder(self):
         """Changes the directory being displayed in the file explorer.
         """
+        from xdart.utils.browse import browse_start_dir, remember_browse_path
         dirname = QFileDialog().getExistingDirectory(
             caption='Choose Directory',
-            dir='',
+            dir=browse_start_dir(getattr(self, 'dirname', '') or ''),
             options=QFileDialog.ShowDirsOnly
         )
         if os.path.exists(dirname):
+            remember_browse_path(dirname)
             self.dirname = dirname
             save_session({'data_dir': dirname})
             self.frames.clear()
@@ -3242,7 +3244,10 @@ class H5Viewer(QWidget):
         """Saves all data to hdf5 file. Also sets fname to be the
         selected file.
         """
-        fname, _ = QFileDialog.getSaveFileName()
+        from xdart.utils.browse import browse_start_dir, remember_browse_path
+        fname, _ = QFileDialog.getSaveFileName(dir=browse_start_dir())
+        if fname:
+            remember_browse_path(fname)
         with self.file_thread.lock:
             self.file_thread.new_fname = fname
             self._ensure_file_thread_running()
@@ -3252,7 +3257,10 @@ class H5Viewer(QWidget):
     def new_file(self):
         """Calls file dialog and sets the file name.
         """
-        fname, _ = QFileDialog.getSaveFileName()
+        from xdart.utils.browse import browse_start_dir, remember_browse_path
+        fname, _ = QFileDialog.getSaveFileName(dir=browse_start_dir())
+        if fname:
+            remember_browse_path(fname)
         self.set_file(fname)
 
     def load_frames_data(self, frame_ids, load_2d):

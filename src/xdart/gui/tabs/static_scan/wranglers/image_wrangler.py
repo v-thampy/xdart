@@ -34,6 +34,7 @@ from .image_wrangler_thread import imageThread, _get_scan_info  # noqa: F401
 from .ui.specUI import Ui_Form
 from xdart.modules.live import LiveScan
 from xdart.utils import get_fname_dir, match_img_detector
+from xdart.utils.browse import browse_start_dir, remember_browse_path
 from xdart.utils.session import load_session, save_session
 
 
@@ -1708,17 +1709,11 @@ class imageWrangler(wranglerWidget):
         self.thread.live_mode = False
 
     def _browse_dir(self, current: str = '') -> str:
-        """Start directory for the file dialogs: the current field's folder
-        when it exists, else the Project Folder, else Qt's last-used ('').
-        Without this, browsing for e.g. the PONI after changing the Project
-        Folder opened wherever the previous session left off."""
-        cur = (current or '').strip()
-        if cur:
-            d = cur if os.path.isdir(cur) else os.path.dirname(cur)
-            if d and os.path.isdir(d):
-                return d
-        pf = os.path.expanduser((self.project_folder or '').strip())
-        return pf if pf and os.path.isdir(pf) else ''
+        """Start directory for the file dialogs: the LAST successful pick --
+        any field, any wrangler, persisted across sessions (maintainer rule,
+        2026-07-13; ``xdart.utils.browse``) -- else the current field's folder,
+        else the Project Folder, else Qt's default ("")."""
+        return browse_start_dir(current, fallback=self.project_folder or '')
 
     def set_poni_file(self):
         """Opens file dialogue and sets the calibration file
@@ -1728,6 +1723,7 @@ class imageWrangler(wranglerWidget):
             filter="PONI (*.poni *.PONI)"
         )
         if fname != '':
+            remember_browse_path(fname)
             self.parameters.child('Signal').child('poni_file').setValue(fname)
             self.poni_file = fname
             self._save_to_session()
@@ -1892,6 +1888,7 @@ class imageWrangler(wranglerWidget):
             filter="Images (*.tiff *.tif *.h5 *.hdf5 *.nxs *.raw *.mar3450)"
         )
         if fname != '':
+            remember_browse_path(fname)
             self.parameters.child('Signal').child('File').setValue(fname)
 
     def set_img_dir(self):
@@ -1903,6 +1900,7 @@ class imageWrangler(wranglerWidget):
             options=QFileDialog.ShowDirsOnly
         )
         if path != '':
+            remember_browse_path(path)
             self.parameters.child('Signal').child('img_dir').setValue(path)
             self.img_dir = path
 
@@ -2057,6 +2055,7 @@ class imageWrangler(wranglerWidget):
             options=QFileDialog.ShowDirsOnly,
         )
         if path:
+            remember_browse_path(path)
             self.parameters.child('Signal').child('meta_dir').setValue(path)
             self.meta_dir = path
 
@@ -2149,6 +2148,7 @@ class imageWrangler(wranglerWidget):
             filter="Mask files (*.edf *.npy);;EDF (*.edf);;NumPy (*.npy)"
         )
         if fname != '':
+            remember_browse_path(fname)
             self.parameters.child('Signal').child('mask_file').setValue(fname)
             self.mask_file = fname
 
@@ -2183,6 +2183,7 @@ class imageWrangler(wranglerWidget):
             filter=f"Images (*.{self.img_ext})"
         )
         if fname != '':
+            remember_browse_path(fname)
             self.parameters.child('BG').child('File').setValue(fname)
             self.bg_file = fname
 
@@ -2195,6 +2196,7 @@ class imageWrangler(wranglerWidget):
             options=QFileDialog.ShowDirsOnly
         )
         if path != '':
+            remember_browse_path(path)
             self.parameters.child('BG').child('Match').child('bg_dir').setValue(path)
             self.bg_dir = path
 
@@ -2207,6 +2209,7 @@ class imageWrangler(wranglerWidget):
             options=QFileDialog.ShowDirsOnly
         )
         if path != '':
+            remember_browse_path(path)
             Path(path).mkdir(parents=True, exist_ok=True)
             self.parameters.child('Project').child('h5_dir').setValue(path)
             self._sync_h5_dir_from_parameters()
@@ -2243,6 +2246,7 @@ class imageWrangler(wranglerWidget):
             options=QFileDialog.ShowDirsOnly
         )
         if path != '':
+            remember_browse_path(path)
             self.parameters.child('Project').child('project_folder').setValue(path)
 
     def _on_project_folder_changed(self, *args):

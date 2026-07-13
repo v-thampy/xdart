@@ -1829,14 +1829,17 @@ class integratorTree(QtWidgets.QWidget):
     # @staticmethod
     def run_pyfai_drawmask(self):
         filters = f'Images (*.tif *tiff)'
+        from xdart.utils.browse import browse_start_dir, remember_browse_path
         processFile, _ = QFileDialog().getOpenFileName(
             filter=filters,
             caption='Choose Image File',
+            dir=browse_start_dir(),
             options=QFileDialog.DontUseNativeDialog
         )
         if not os.path.exists(processFile):
             logger.info('No image chosen for mask creation')
             return
+        remember_browse_path(processFile)
 
         outfile = os.path.splitext(processFile)[0] + "-mask.edf"
         prev_mtime = os.path.getmtime(outfile) if os.path.exists(outfile) else None

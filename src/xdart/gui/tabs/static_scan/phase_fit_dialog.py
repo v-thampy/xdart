@@ -223,8 +223,12 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
                 "`pip install \"xrd-tools[fitting]\"`, then reopen.")
             return
         from xrd_tools.analysis.phase import PhaseModel
+        from xdart.utils.browse import browse_start_dir, remember_browse_path
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
-            self, "Add CIF phase(s)", "", "CIF files (*.cif);;All files (*)")
+            self, "Add CIF phase(s)", browse_start_dir(),
+            "CIF files (*.cif);;All files (*)")
+        if paths:
+            remember_browse_path(paths[0])
         for path in paths:
             try:
                 phase = PhaseModel.from_cif(path)

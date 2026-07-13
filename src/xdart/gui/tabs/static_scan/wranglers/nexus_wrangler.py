@@ -30,6 +30,7 @@ from xrd_tools.core.containers import PONI
 from .wrangler_widget import wranglerWidget
 from .nexus_wrangler_thread import nexusThread
 from xdart.utils import get_fname_dir
+from xdart.utils.browse import browse_start_dir, remember_browse_path
 from xdart.utils.session import load_session, save_session
 
 QFileDialog = QtWidgets.QFileDialog
@@ -428,8 +429,11 @@ class nexusWrangler(wranglerWidget):
     def browse_project_folder(self):
         """Browse for the N1 Project Folder; setting it makes the processed
         ``.nxs`` store raw source paths RELATIVE to this root (portable)."""
-        folder = QFileDialog.getExistingDirectory(self, 'Choose Project Folder', '')
+        folder = QFileDialog.getExistingDirectory(
+            self, 'Choose Project Folder',
+            browse_start_dir(self.project_folder))
         if folder:
+            remember_browse_path(folder)
             self.parameters.child('Project').child('project_folder').setValue(folder)
             self.project_folder = folder
             self.source_base = self._compute_source_base()
@@ -437,8 +441,10 @@ class nexusWrangler(wranglerWidget):
 
     def browse_poni(self):
         poni_file, _ = QFileDialog.getOpenFileName(
-            self, 'Select PONI file', '', 'PONI files (*.poni);;All files (*)')
+            self, 'Select PONI file', browse_start_dir(self.poni_file),
+            'PONI files (*.poni);;All files (*)')
         if poni_file:
+            remember_browse_path(poni_file)
             self.parameters.child('Calibration').child('poni_file').setValue(poni_file)
             self.poni_file = poni_file
             self.poni = PONI.from_poni_file(poni_file)
@@ -447,9 +453,10 @@ class nexusWrangler(wranglerWidget):
     def browse_nexus(self):
         nexus_file, _ = QFileDialog.getOpenFileName(
             self, 'Select NeXus/HDF5 file',
-            os.path.dirname(self.nexus_file) if self.nexus_file else '',
+            browse_start_dir(self.nexus_file),
             'HDF5 files (*.h5 *.hdf5 *.nxs);;All files (*)')
         if nexus_file:
+            remember_browse_path(nexus_file)
             self.parameters.child('NeXus File').child('nexus_file').setValue(nexus_file)
             self.nexus_file = nexus_file
             self._save_to_session()
@@ -480,8 +487,10 @@ class nexusWrangler(wranglerWidget):
 
     def browse_mask(self):
         mask_file, _ = QFileDialog.getOpenFileName(
-            self, 'Select mask file', '', 'Image files (*.tif *.edf *.npy);;All files (*)')
+            self, 'Select mask file', browse_start_dir(self.mask_file),
+            'Image files (*.tif *.edf *.npy);;All files (*)')
         if mask_file:
+            remember_browse_path(mask_file)
             self.parameters.child('Signal').child('mask_file').setValue(mask_file)
             self.mask_file = mask_file
             self._save_to_session()
@@ -489,8 +498,9 @@ class nexusWrangler(wranglerWidget):
     def browse_h5_dir(self):
         h5_dir = QFileDialog.getExistingDirectory(
             self, 'Select output directory',
-            self.h5_dir, QFileDialog.ShowDirsOnly)
+            browse_start_dir(self.h5_dir), QFileDialog.ShowDirsOnly)
         if h5_dir:
+            remember_browse_path(h5_dir)
             self.parameters.child('Output').child('h5_dir').setValue(h5_dir)
             self.h5_dir = h5_dir
             self._save_to_session()

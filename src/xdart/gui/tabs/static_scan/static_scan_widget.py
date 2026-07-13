@@ -7417,13 +7417,16 @@ class staticWidget(QWidget):
         self.detector = pyFAI.detector_factory(name=detector_name)
         self.detector_dialog.close()
 
+        from xdart.utils.browse import browse_start_dir, remember_browse_path
         rawFile, _ = QFileDialog().getOpenFileName(
             filter='RAW (*.raw)',
             caption='Choose Raw File',
+            dir=browse_start_dir(),
             options=QFileDialog.DontUseNativeDialog
         )
 
         if os.path.isfile(rawFile):
+            remember_browse_path(rawFile)
             img = get_img_data(rawFile, self.detector, return_float=False)
             if img is not None:
                 tifFile = os.path.splitext(rawFile)[0] + '.tif'
