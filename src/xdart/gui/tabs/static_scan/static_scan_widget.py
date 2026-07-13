@@ -790,6 +790,9 @@ class staticWidget(QWidget):
         self._fit_controls_height()
         self.controls.modeCombo.currentTextChanged.connect(
             self._on_processing_mode_changed)
+        # The readiness bar's "Live" chip follows the toggle immediately.
+        self.controls.liveToggled.connect(
+            lambda *_: self._refresh_controls_v2_profile(immediate=True))
         # Single owner of the shared Stop button: dispatch to whichever run is
         # active — a reintegrate (integrator thread) takes priority, else the
         # wrangler.  The wranglers no longer connect Stop directly, so a Stop
@@ -2569,14 +2572,55 @@ class staticWidget(QWidget):
         )
 
     def _controls_v2_update_run_summary(self, state: ControlState, profile) -> None:
-        setter = getattr(getattr(self, "controls", None),
-                         "set_readiness_summary", None)
+        controls = getattr(self, "controls", None)
+        setter = getattr(controls, "set_readiness_summary", None)
         text, ready, tooltip = self._controls_v2_run_summary(state, profile)
+        live_btn = getattr(controls, "liveButton", None)
+        live = bool(live_btn is not None and live_btn.isChecked()
+                    and live_btn.isVisibleTo(controls))
+        # A live watch that is idling between files keeps its waiting text
+        # against profile-refresh repaints (maintainer, 2026-07-13).
+        if (text and getattr(self, "_live_waiting_status", False)
+                and self._controls_v2_run_active()):
+            text = "Waiting for new images…"
+            ready, tooltip, live = True, "Live watch: no new files yet", True
         if callable(setter):
-            changed = setter(text, ready=ready, tooltip=tooltip)
+            changed = setter(text, ready=ready, tooltip=tooltip, live=live)
             if changed:
                 self._fit_controls_height()
         self._controls_v2_sync_run_row(profile)
+
+    def _on_wrangler_status_text(self, text) -> None:
+        """Mirror the live-watch state into the readiness summary (maintainer,
+        2026-07-13): while a live run idles waiting for new files the bar says
+        so; any other wrangler status restores the normal summary."""
+        waiting = str(text or "").startswith("Watching for new files")
+        if waiting == getattr(self, "_live_waiting_status", False):
+            return
+        self._live_waiting_status = waiting
+        setter = getattr(getattr(self, "controls", None),
+                         "set_readiness_summary", None)
+        if not callable(setter):
+            return
+        if waiting and self._controls_v2_run_active():
+            setter("Waiting for new images…", ready=True,
+                   tooltip="Live watch: no new files yet", live=True)
+        else:
+            # Restore the normal summary DIRECTLY: mid-run the throttled
+            # profile rebuild defers (_controls_v2_batch_run_active), so it
+            # would never repaint over the waiting text.
+            try:
+                state = self._controls_v2_state()
+                render_state = build_control_panel_state(
+                    state,
+                    self._controls_v2_field_values(),
+                    self._controls_v2_field_choices(),
+                )
+                self._controls_v2_update_run_summary(
+                    state, render_state.profile)
+            except Exception:
+                logger.debug("live-watch summary restore failed",
+                             exc_info=True)
 
     def _controls_v2_sync_run_row(self, profile) -> None:
         controls = getattr(self, "controls", None)
@@ -4255,6 +4299,18 @@ class staticWidget(QWidget):
                     and callable(getattr(self.wrangler,
                                          'set_gi_motor_options', None))):
                 self.wrangler.set_gi_motor_options()
+        # Live-watch status → readiness bar ("Waiting for new images…").  The
+        # watching message is emitted by the THREAD's showLabel; connect both
+        # levels idempotently (set_wrangler re-runs on every swap).
+        for sig_owner in (self.wrangler, getattr(self.wrangler, 'thread', None)):
+            sig = getattr(sig_owner, 'showLabel', None)
+            if sig is None:
+                continue
+            try:
+                sig.disconnect(self._on_wrangler_status_text)
+            except (TypeError, RuntimeError):
+                pass
+            sig.connect(self._on_wrangler_status_text)
         self.wrangler.started.connect(self.thread_state_changed)
         self.wrangler.finished.connect(self.wrangler_finished)
         # Pause/Resume (Phase B): lift the freeze guard once paused (frozen at a

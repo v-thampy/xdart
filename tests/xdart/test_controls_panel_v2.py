@@ -4471,3 +4471,40 @@ def test_fresh_scan_polarization_defaults_on_at_099(qapp, monkeypatch):
     finally:
         widget.close()
         widget.deleteLater()
+
+
+# ── Live chip + waiting status in the readiness bar (2026-07-13) ────────────
+
+
+def test_readiness_bar_live_chip_and_waiting_status(qapp, monkeypatch):
+    """Maintainer (2026-07-13): the readiness bar shows a bold colored 'Live'
+    chip while the Live toggle is on, and reads "Waiting for new images…"
+    while a live run idles between files (the thread's 'Watching for new
+    files...' status), restoring the normal summary on any other status."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        controls = widget.controls
+        assert controls.readinessLive.isHidden()
+
+        # Toggling Live on re-renders the summary with the chip; off hides it.
+        controls.liveButton.setChecked(True)
+        assert not controls.readinessLive.isHidden()
+        controls.liveButton.setChecked(False)
+        assert controls.readinessLive.isHidden()
+
+        # Live watch idling: the thread's watching status flips the bar to the
+        # waiting text (chip on); any other status restores the summary.
+        controls.liveButton.setChecked(True)
+        monkeypatch.setattr(widget, "_controls_v2_run_active", lambda: True)
+        widget._on_wrangler_status_text("Watching for new files...")
+        assert "Waiting for new images" in controls.readinessLabel._full_text
+        assert not controls.readinessLive.isHidden()
+
+        widget._on_wrangler_status_text("frame_0001.tif")
+        assert "Waiting for new images" not in controls.readinessLabel._full_text
+    finally:
+        widget.close()
+        widget.deleteLater()
