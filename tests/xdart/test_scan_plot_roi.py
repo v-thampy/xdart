@@ -813,3 +813,114 @@ def test_dialog_close_shuts_down_probe_executor(qapp, tmp_path):
     qapp.processEvents()
     assert sw._probe_executor is None, \
         "closeEvent did not shut down the probe executor"
+
+
+# ── X1-6: processed-.nxs reads take the writer-coordinating lock ──────────
+
+
+def _write_processed_nxs_with_scan_data(path):
+    """A real minimal processed .nxs: integrated_1d (classifies the file as
+    PROCESSED_XDART) + a scan_data group (what read_scan_data returns)."""
+    import h5py
+
+    labels = np.asarray([1, 2, 3], dtype=np.int64)
+    q = np.linspace(0.1, 1.0, 4, dtype=np.float32)
+    with h5py.File(path, "w") as h5:
+        entry = h5.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        g1 = entry.create_group("integrated_1d")
+        g1.attrs["NX_class"] = "NXdata"
+        g1.attrs["signal"] = "intensity"
+        g1.attrs["axes"] = ["frame_index", "q"]
+        g1.create_dataset("frame_index", data=labels)
+        q_ds = g1.create_dataset("q", data=q)
+        q_ds.attrs["units"] = "q_A^-1"
+        g1.create_dataset(
+            "intensity",
+            data=np.arange(labels.size * q.size, dtype=np.float32).reshape(
+                labels.size, q.size))
+        sd = entry.create_group("scan_data")
+        sd.attrs["NX_class"] = "NXcollection"
+        sd.create_dataset("frame_index", data=labels)
+        sd.create_dataset("i0", data=np.asarray([10.0, 20.0, 30.0]))
+
+
+class _RecordingRLock:
+    """A real re-entrant lock that counts acquisitions — the observation point
+    for the X1-6 seam (the dialog code path itself stays fully production)."""
+
+    def __init__(self):
+        import threading
+        self._lock = threading.RLock()
+        self.enter_count = 0
+
+    def __enter__(self):
+        self._lock.acquire()
+        self.enter_count += 1
+        return self
+
+    def __exit__(self, *exc):
+        self._lock.release()
+        return False
+
+
+def test_scan_plot_processed_reads_take_writer_lock_x16(qapp, tmp_path):
+    """X1-6 GUARD: the Scan Plot dialog's .nxs reads (scan_data table +
+    positioners) must enter the provider's writer-coordinating lock when the
+    picked source is the loaded scan's data file — the unlocked read raced a
+    live writer's `r+` saves (the RN-1 family; every other display reader goes
+    through _locked_scan_read)."""
+    import os
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+
+    p = tmp_path / "processed_scan.nxs"
+    _write_processed_nxs_with_scan_data(p)
+
+    rec = _RecordingRLock()
+
+    def lock_provider(uri):
+        same = os.path.realpath(str(uri)) == os.path.realpath(str(p))
+        return rec if same else None
+
+    dlg = ScanPlotDialog(lock_provider=lock_provider)
+    try:
+        dlg.load_uri(str(p))
+        assert "i0" in dlg._columns, (
+            "fixture did not load as a processed scan_data table — "
+            f"columns: {dlg._columns}")
+        # Both PROCESSED_NEXUS reads (read_scan_data + get_metadata) locked.
+        assert rec.enter_count >= 2, (
+            f"processed .nxs reads ran without the writer lock "
+            f"(acquisitions: {rec.enter_count})")
+    finally:
+        dlg.close()
+
+
+def test_static_widget_read_lock_provider_matches_loaded_scan_only_x16(
+        qapp, tmp_path, monkeypatch):
+    """X1-6 GUARD (wiring half): the analysis context hands popups the loaded
+    scan's file_lock for the loaded data file ONLY — an arbitrary other file
+    has no in-process writer, so it reads unlocked (None)."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xdart.gui.tabs.static_scan.display_data import DisplayDataMixin
+
+    loaded = tmp_path / "loaded_scan.nxs"
+    _write_processed_nxs_with_scan_data(loaded)
+    other = tmp_path / "other_scan.nxs"
+    _write_processed_nxs_with_scan_data(other)
+
+    widget = staticWidget()
+    try:
+        widget.scan.data_file = str(loaded)
+        ctx = widget._analysis_context()
+        expected = DisplayDataMixin._scan_file_lock(widget)
+        assert expected is not None, "loaded scan carries no file_lock?"
+        assert ctx.read_lock_for_uri(str(loaded)) is expected
+        assert ctx.read_lock_for_uri(str(other)) is None
+        # uri=None means "the current scan" (the mask_for_scan_uri semantic):
+        # with a loaded data file it resolves to that scan's lock.
+        assert ctx.read_lock_for_uri(None) is expected
+    finally:
+        widget.close()
+        widget.deleteLater()
