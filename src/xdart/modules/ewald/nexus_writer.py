@@ -413,6 +413,41 @@ def _open_with_retry(path: Union[str, "Path"], mode: str,
     raise RuntimeError("unreachable")
 
 
+_REPLACE_RETRIES = 10
+_REPLACE_RETRY_DELAY_S = 0.25
+
+
+def _replace_with_retry(tmp_path, path):
+    """``os.replace`` with a bounded retry on sharing violations (DIR-3).
+
+    On Windows the destination cannot be renamed over while ANY handle is
+    open on it (h5py never requests FILE_SHARE_DELETE) — antivirus, the
+    Search indexer, an Explorer preview pane or another SMB client on a
+    network share can hold one briefly.  Every file OPEN in this writer
+    already retries transient contention (the NFS recipe above); give the
+    rename the same tolerance, then fail loud with an actionable message.
+    The destination is never touched by a failed replace, so the existing
+    processed file survives intact.
+    """
+    for attempt in range(1, _REPLACE_RETRIES + 1):
+        try:
+            os.replace(tmp_path, path)
+            return
+        except PermissionError as exc:
+            if attempt == _REPLACE_RETRIES:
+                raise PermissionError(
+                    f"could not replace '{path}': the file is held open by "
+                    "another program (on Windows an open handle blocks the "
+                    "rename — antivirus, search indexing, a preview pane, or "
+                    "another viewer on the network share). The existing file "
+                    "was left untouched; stop the other program and re-run."
+                ) from exc
+            logger.warning(
+                "save: destination busy, retrying replace (%d/%d): %s",
+                attempt, _REPLACE_RETRIES, path)
+            time.sleep(_REPLACE_RETRY_DELAY_S)
+
+
 def _h5(f) -> h5py.File:
     """Reach the underlying ``h5py.File`` from an ``NXroot`` returned by
     :func:`_open_with_retry`.
@@ -509,7 +544,7 @@ def save_scan_to_nexus(
                 recover_shadow_groups=recover_shadow_groups,
                 _atomic_write=False,
             )
-            os.replace(tmp_path, path)
+            _replace_with_retry(tmp_path, path)
         except Exception:
             try:
                 tmp_path.unlink()

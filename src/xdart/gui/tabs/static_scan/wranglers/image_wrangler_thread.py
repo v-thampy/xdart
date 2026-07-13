@@ -781,6 +781,19 @@ class imageThread(wranglerThread):
             # sites; nothing may escape run() as an unhandled QThread
             # exception (the v1.0.1 mid-run mode-change beamline crash).
             self._handle_append_config_mismatch(exc)
+        except Exception as exc:
+            # GENERIC backstop for the same invariant (DIR-3: a Windows
+            # replace-save PermissionError escaped run() and killed the
+            # whole directory run through the GUI excepthook).  Fail loud
+            # per RUN, not per process: log with traceback, tell the user,
+            # stop cleanly — the finally below still releases the reduction
+            # session, prefetcher and Eiger handle.
+            logger.exception("run stopped by unhandled error")
+            self.command = 'stop'
+            try:
+                self.showLabel.emit(f"Run stopped: {exc} (see log)")
+            except Exception:
+                logger.debug("showLabel emit failed", exc_info=True)
         finally:
             self._close_reduction_session()
             # Stop background prefetcher from the main thread BEFORE closing the
@@ -1295,6 +1308,13 @@ class imageThread(wranglerThread):
                     # end-of-run tail — same path as a user Stop.
                     self._handle_append_config_mismatch(exc)
                     break
+                except OSError as exc:
+                    # DIR-3: e.g. a Windows replace-save blocked by an
+                    # external handle (WinError 5) after the retry budget.
+                    # The destination file is untouched; stop cleanly
+                    # instead of killing the QThread.
+                    self._handle_initialize_scan_write_error(exc)
+                    break
                 self._active_scan = scan      # Pause: serial-flush handle
                 _cached_poni = None
 
@@ -1431,6 +1451,11 @@ class imageThread(wranglerThread):
                         # flush below persists its tail, exactly like a
                         # user Stop while watching.
                         self._handle_append_config_mismatch(exc)
+                        break
+                    except OSError as exc:
+                        # DIR-3: locked destination after the replace-retry
+                        # budget — stop cleanly, never kill the QThread.
+                        self._handle_initialize_scan_write_error(exc)
                         break
                     self._active_scan = scan  # Pause: serial-flush handle
                     _cached_poni = None
@@ -3728,6 +3753,25 @@ class imageThread(wranglerThread):
             self.sigAppendMismatch.emit(str(exc))
         except Exception:
             logger.debug("sigAppendMismatch emit failed", exc_info=True)
+
+    def _handle_initialize_scan_write_error(self, exc):
+        """Stop the run CLEANLY when the output file cannot be (re)written.
+
+        DIR-3 (bl17-2, Windows/SMB): the replace-save's ``os.replace`` can
+        fail with WinError 5 when an external program (antivirus, indexer,
+        preview pane, another share client) holds the destination open — the
+        writer retried and preserved the existing file; the DELIVERY must be
+        the same clean stop as :meth:`_handle_append_config_mismatch`, never
+        an unhandled QThread exception that kills the whole directory run.
+        """
+        logger.exception("run stopped: output file not writable: %s", exc)
+        self.command = 'stop'
+        try:
+            self.showLabel.emit(
+                "Run stopped: output file is locked by another program; "
+                "the existing file was preserved (see log)")
+        except Exception:
+            logger.debug("showLabel emit failed", exc_info=True)
 
     def initialize_scan(self):
         """If scan changes, initialize new LiveScan object.
