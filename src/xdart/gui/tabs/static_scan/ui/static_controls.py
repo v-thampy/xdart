@@ -119,6 +119,16 @@ class StaticControls(QtWidgets.QWidget):
         self.readinessDot.setObjectName('runReadinessDot')
         self.readinessDot.setAlignment(QtCore.Qt.AlignCenter)
         readiness.addWidget(self.readinessDot)
+        # "Live" chip (maintainer, 2026-07-13): shown while the Live toggle is
+        # on so the readiness line reads "● Live Ready · Int 2D · N frames".
+        # A separate label because the summary label ELIDES plain text (UI-4)
+        # and cannot carry rich-text styling mid-string.
+        self.readinessLive = QtWidgets.QLabel('Live')
+        self.readinessLive.setObjectName('runReadinessLive')
+        self.readinessLive.setStyleSheet(
+            'QLabel#runReadinessLive { color: #ffb86c; font-weight: 700; }')
+        self.readinessLive.hide()
+        readiness.addWidget(self.readinessLive)
         self.readinessLabel = _ElidingLabel('')
         self.readinessLabel.setObjectName('runReadinessLabel')
         readiness.addWidget(self.readinessLabel, 1)
@@ -236,10 +246,12 @@ class StaticControls(QtWidgets.QWidget):
     def action_phase(self):
         return self._run_phase
 
-    def set_readiness_summary(self, text='', *, ready=True, tooltip=''):
+    def set_readiness_summary(self, text='', *, ready=True, tooltip='',
+                              live=False):
         text = str(text or '').strip()
         was_hidden = self.readinessRow.isHidden()
         self.readinessRow.setVisible(bool(text))
+        self.readinessLive.setVisible(bool(text) and bool(live))
         self.readinessDot.setProperty('ready', bool(ready))
         setter = getattr(self.readinessLabel, 'set_full_text', None)
         if callable(setter):
