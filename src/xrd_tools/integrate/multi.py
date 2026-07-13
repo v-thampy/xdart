@@ -22,6 +22,7 @@ from xrd_tools.core.containers import (
     IntegrationResult1D,
     IntegrationResult2D,
 )
+from xrd_tools.integrate.detector_mask import mask_with_detector
 from xrd_tools.integrate.calibration import poni_to_integrator
 
 if TYPE_CHECKING:
@@ -240,7 +241,10 @@ def stitch_1d(
     from pyFAI.multi_geometry import MultiGeometry
 
     img_list = _prepare_images(images, normalization)
-    lst_mask = [mask] * len(img_list) if mask is not None else None
+    # Geometric gaps stay masked per-integrator even with an explicit mask
+    # (with lst_mask=None pyFAI already falls back to each detector mask).
+    lst_mask = ([mask_with_detector(ai, mask) for ai in integrators]
+                if mask is not None else None)
 
     mg = MultiGeometry(integrators, unit=unit, radial_range=radial_range)
     result = mg.integrate1d(img_list, npt, lst_mask=lst_mask, method=method, **kwargs)
@@ -309,7 +313,10 @@ def stitch_2d(
     from pyFAI.multi_geometry import MultiGeometry
 
     img_list = _prepare_images(images, normalization)
-    lst_mask = [mask] * len(img_list) if mask is not None else None
+    # Geometric gaps stay masked per-integrator even with an explicit mask
+    # (with lst_mask=None pyFAI already falls back to each detector mask).
+    lst_mask = ([mask_with_detector(ai, mask) for ai in integrators]
+                if mask is not None else None)
 
     mg = MultiGeometry(
         integrators,

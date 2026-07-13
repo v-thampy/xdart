@@ -331,6 +331,16 @@ All verified findings from the v1.1.0 external review:
 * **Plot Metadata is O(n).** The per-frame metadata lookup no longer does an
   O(n) label scan per row (the all-frames sweep was O(n²): ~2.5 s at 30k
   frames).
+* **Module gaps are always masked (numeric change in affected scenarios).**
+  The detector's geometric mask (`calc_mask()` — module gaps, i.e. non-pixels)
+  is now unioned into every pyFAI integration, regardless of the "Auto Mask
+  Saturated" toggle, which continues to govern value-based masking only.
+  Previously an explicit mask REPLACED pyFAI's detector mask, so gap pixels
+  survived on their sentinel values alone — and integrated as zeros (smooth
+  1-D dips at the gap radii) whenever the data zero-fills gaps or a scan
+  reintegrated without its stored mask. Scenarios that previously integrated
+  gap pixels now exclude them — those numbers change (correctly). Detectors
+  without a geometric mask (Rayonix, Perkin) are bit-for-bit unchanged.
 * **Mixed directories (alignment + data scans) process without a filter.**
   An imageless container (a diode/alignment `.nxs` with no detector data)
   used to END a directory-mode run when it sorted first — "Total Files
