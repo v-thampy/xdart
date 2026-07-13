@@ -46,7 +46,17 @@ def build_reduction_config(
         config["gi"] = getattr(plan, "gi", None) is not None
 
     if scan is not None and getattr(scan, "gi_config", None):
-        config["gi_config"] = dict(getattr(scan, "gi_config"))
+        gi_config = dict(getattr(scan, "gi_config"))
+        # gi_mode lives authoritatively in bai_*_args (the GUI Axis field edits
+        # them directly); the scan-carried copy can lag an edit.  Reconcile so
+        # one written config can never contradict itself — a no-op whenever the
+        # two already agree.
+        for mode_key, args_key in (("gi_mode_1d", "bai_1d_args"),
+                                   ("gi_mode_2d", "bai_2d_args")):
+            mode = (config.get(args_key) or {}).get(mode_key)
+            if mode is not None and mode_key in gi_config:
+                gi_config[mode_key] = mode
+        config["gi_config"] = gi_config
     elif plan is not None:
         gi_config = _gi_config_from_plan(plan)
         if gi_config:
