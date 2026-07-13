@@ -173,11 +173,19 @@ def test_meta_ext_fresh_default_is_auto(qapp):
     [
         ("txt", "txt", "txt"),
         ("SPEC", "spec", "spec"),
-        (None, "none", None),
+        # A saved literal 'none' is a DELIBERATE post-MD-2 off — honored.
+        ("none", "none", None),
+        # Legacy sessions (pre-'auto') encoded "never set" as None/'' — the
+        # old metadata-off default, not a choice.  Restore migrates them to
+        # the modern default instead of cementing a permanent 'none'
+        # (maintainer, 2026-07-13: Meta Type should be auto by default).
+        (None, "auto", "auto"),
+        ("", "auto", "auto"),
     ],
 )
 def test_meta_ext_session_restore_keeps_saved_value(qapp, monkeypatch, saved, param_value, attr_value):
-    """Only fresh sessions get auto; restored sessions keep their saved Meta Type."""
+    """Restored sessions keep a deliberately saved Meta Type; legacy-unset
+    encodings (None/'') migrate to the modern 'auto' default."""
     from xdart.gui.tabs.static_scan.wranglers import image_wrangler as iw
 
     class _Combo:
