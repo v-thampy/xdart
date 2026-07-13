@@ -621,6 +621,10 @@ class H5Viewer(QWidget):
         self.ui.dateSort.setObjectName('dateSort')
         self.ui.dateSort.setCheckable(True)
         self.ui.dateSort.setMaximumSize(QtCore.QSize(16777215, 25))
+        # The label clips on Windows (different font metrics): reserve the
+        # size hint + 10% (maintainer request 2026-07-12).
+        self.ui.dateSort.setMinimumWidth(
+            int(self.ui.dateSort.sizeHint().width() * 1.1))
         self.ui.dateSort.toggled.connect(self.refresh_directory)
         # Refresh is placed on the RIGHT of the DATA BROWSER header row (built in
         # _init_toolbar, below the File/Config toolbar).  The bottom row below the
@@ -664,15 +668,23 @@ class H5Viewer(QWidget):
         self.update_scans()
 
     @staticmethod
-    def _truncate_path_label(path, max_len: int = 40) -> str:
+    def _truncate_path_label(path, max_len: int = 34) -> str:
         """Middle-truncate *path* for the Scans header (maintainer spec
-        2026-07-12): beyond *max_len* chars show the first 7, an ellipsis,
-        and the last 30 — the tail (the informative part of a beamline data
-        path) stays readable."""
+        2026-07-12, tightened same day): beyond *max_len* chars show the
+        first 6, ``..``, and the last 26 — and snap the tail forward to the
+        nearest path-separator so it starts on a WHOLE component
+        (``/Users../test_data/xdart_processed_data`` reads better than a cut
+        landing mid-word).  The full path rides on the tooltip."""
         p = str(path or "")
         if len(p) <= max_len:
             return p
-        return p[:7] + "…" + p[-30:]
+        head, tail = p[:6], p[-(max_len - 8):]
+        # Snap to a component boundary when one falls early in the tail.
+        for i, ch in enumerate(tail[:10]):
+            if ch in "/\\":
+                tail = tail[i:]
+                break
+        return head + ".." + tail
 
     def _update_scans_header(self) -> None:
         """Show the browsed directory next to the 'Scans' header label,
