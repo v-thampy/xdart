@@ -3980,12 +3980,18 @@ def test_scans_header_shows_browsed_path(widget, tmp_path):
     assert label.text() == "  Scans  [/data/scan_test]"
     assert label.toolTip() == "/data/scan_test"
 
-    # Long existing path -> middle truncation, full path on the tooltip.
+    # Long existing path -> 6 + '..' + tail (<=34), full path on the tooltip.
     long_dir = tmp_path / ("a" * 60)
     long_dir.mkdir()
     v.dirname = str(long_dir)
     v.update_scans()
     p = str(long_dir)
-    assert label.text() == f"  Scans  [{p[:7]}…{p[-30:]}]"
-    assert len(f"{p[:7]}…{p[-30:]}") <= 40
+    assert label.text() == f"  Scans  [{p[:6]}..{'a' * 26}]"
     assert label.toolTip() == p
+
+    # The tail snaps forward to a path-component boundary when one falls
+    # nearby, so the visible tail is WHOLE directory names.
+    v.dirname = "/Users/vthampy/repos/test_data/xdart_processed_data"
+    v.update_scans()
+    assert label.text() == "  Scans  [/Users../xdart_processed_data]"
+    assert len("/Users../xdart_processed_data") <= 34
