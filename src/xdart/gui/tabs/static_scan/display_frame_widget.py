@@ -150,6 +150,8 @@ class _IntensityRangeSlider(QtWidgets.QWidget):
     """Small two-handle horizontal range slider for display intensity."""
 
     sigRangeChanged = Qt.QtCore.Signal(float, float)
+    #: double-click: open the compact type-in popup (exact min/max entry).
+    sigEditRequested = Qt.QtCore.Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -161,7 +163,8 @@ class _IntensityRangeSlider(QtWidgets.QWidget):
         self.setMinimumSize(Qt.QtCore.QSize(150, 24))
         self.setMaximumHeight(28)
         self.setFocusPolicy(pyQt.StrongFocus)
-        self.setToolTip("Manual intensity range.")
+        self.setToolTip("Manual intensity range — drag the handles, or "
+                        "double-click to type exact min/max values.")
 
     def values(self):
         return self._lo, self._hi
@@ -267,6 +270,11 @@ class _IntensityRangeSlider(QtWidgets.QWidget):
 
     def mouseReleaseEvent(self, event):
         self._drag = None
+
+    def mouseDoubleClickEvent(self, event):
+        if self.isEnabled():
+            self._drag = None
+            self.sigEditRequested.emit()
 
     def _move_handle(self, x):
         value = self._value_for_x(x)
@@ -611,6 +619,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._move_intensity_controls_for_mode(Mode.INT_1D)
         self._intensityWidget.setVisible(False)
         self._intensitySlider.sigRangeChanged.connect(self._on_intensity_range_changed)
+        self._intensitySlider.sigEditRequested.connect(
+            self._open_intensity_entry_popup)
         self._intensityAuto.toggled.connect(self._on_intensity_autoscale_toggled)
 
     def _move_intensity_controls_for_mode(self, mode):
@@ -3275,13 +3285,32 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             )
             return
 
-        self._intensitySlider.setDomain(
-            domain[0], domain[1], preserve_fraction=True, emit=False)
+        # Manual levels are ABSOLUTE: a frame step / live repaint must not
+        # silently re-map the user's window onto the new frame's min/max (the
+        # old preserve_fraction re-map — the "flaky manual range" symptom).
+        # Widen the slider span to keep the window representable rather than
+        # clip-ratcheting it.  Only when the display re-united itself
+        # (Linear<->Log/Sqrt rescales the whole axis, so the old window has no
+        # overlap with the new domain) fall back to the proportional carry.
+        prior_lo, prior_hi = self._intensitySlider.values()
+        dmin, dmax = float(domain[0]), float(domain[1])
+        overlap = min(prior_hi, dmax) - max(prior_lo, dmin)
+        if (self._intensitySlider.has_valid_domain()
+                and np.isfinite(overlap) and overlap > 0):
+            self._intensitySlider.setDomain(
+                min(dmin, prior_lo), max(dmax, prior_hi),
+                lower=prior_lo, upper=prior_hi,
+                preserve_fraction=False, emit=False)
+        else:
+            self._intensitySlider.setDomain(
+                dmin, dmax, preserve_fraction=True, emit=False)
         lo, hi = self._intensitySlider.values()
         self._apply_intensity_range(mode, lo, hi)
 
     def _on_intensity_autoscale_toggled(self, checked):
         mode = self._live_mode()
+        logger.debug("intensity autoscale toggled -> %s (mode=%s)",
+                     checked, mode)
         if checked:
             try:
                 target, obj = self._intensity_target_for_mode(mode)
@@ -3331,6 +3360,74 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     plot.setYRange(float(lo), float(hi), padding=0)
                 except Exception:
                     logger.debug("manual plot y-range failed", exc_info=True)
+
+    def _open_intensity_entry_popup(self):
+        """Compact type-in popup (double-click on the intensity slider): two
+        line edits for exact display min/max.  Applying switches to manual.
+        Values are in DISPLAYED units — what the slider handles mean and what
+        the hover readout shows (log10 units under Log scale)."""
+        slider = self._intensitySlider
+        if not slider.isEnabled() or not slider.has_valid_domain():
+            return
+        popup = getattr(self, "_intensity_entry_popup", None)
+        if popup is None:
+            popup = QtWidgets.QFrame(
+                self, pyQt.WindowType.Popup
+                if hasattr(pyQt, "WindowType") else pyQt.Popup)
+            popup.setObjectName("intensityEntryPopup")
+            popup.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
+            lay = QtWidgets.QHBoxLayout(popup)
+            lay.setContentsMargins(8, 6, 8, 6)
+            lay.setSpacing(6)
+            lo_edit = QtWidgets.QLineEdit(popup)
+            hi_edit = QtWidgets.QLineEdit(popup)
+            for edit in (lo_edit, hi_edit):
+                edit.setFixedWidth(92)
+            apply_btn = QtWidgets.QPushButton("Apply", popup)
+            apply_btn.setDefault(True)
+            lay.addWidget(QtWidgets.QLabel("Min", popup))
+            lay.addWidget(lo_edit)
+            lay.addWidget(QtWidgets.QLabel("Max", popup))
+            lay.addWidget(hi_edit)
+            lay.addWidget(apply_btn)
+            popup._lo_edit, popup._hi_edit = lo_edit, hi_edit
+            apply_btn.clicked.connect(self._apply_intensity_entry)
+            lo_edit.returnPressed.connect(self._apply_intensity_entry)
+            hi_edit.returnPressed.connect(self._apply_intensity_entry)
+            self._intensity_entry_popup = popup
+        lo, hi = slider.values()
+        popup._lo_edit.setText(f"{lo:g}")
+        popup._hi_edit.setText(f"{hi:g}")
+        popup.move(slider.mapToGlobal(Qt.QtCore.QPoint(0, slider.height())))
+        popup.show()
+        popup._lo_edit.setFocus()
+        popup._lo_edit.selectAll()
+
+    def _apply_intensity_entry(self):
+        """Apply the popup's typed min/max: manual mode, exact values (the
+        slider span widens to keep them representable, never clips them)."""
+        popup = getattr(self, "_intensity_entry_popup", None)
+        if popup is None:
+            return
+        try:
+            lo = float(popup._lo_edit.text())
+            hi = float(popup._hi_edit.text())
+        except (TypeError, ValueError):
+            return   # leave the popup up for a correction
+        if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+            return
+        popup.hide()
+        if self._intensityAuto.isChecked():
+            # Unchecking seeds manual mode from the screen; the explicit
+            # window below then overrides that seed.
+            self._intensityAuto.setChecked(False)
+        slider = self._intensitySlider
+        if slider.has_valid_domain():
+            dmin, dmax = slider.domain()
+            slider.setDomain(min(dmin, lo), max(dmax, hi),
+                             lower=lo, upper=hi,
+                             preserve_fraction=False, emit=False)
+        self._apply_intensity_range(self._live_mode(), lo, hi)
 
     # ── 1D-only visibility ────────────────────────────────────────
 
