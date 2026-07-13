@@ -331,6 +331,14 @@ All verified findings from the v1.1.0 external review:
 * **Plot Metadata is O(n).** The per-frame metadata lookup no longer does an
   O(n) label scan per row (the all-frames sweep was O(n²): ~2.5 s at 30k
   frames).
+* **Directory mode no longer freezes the GUI counting container frames.**
+  Selecting a directory of `.nxs`/`.h5` files swept every container
+  synchronously on the GUI thread to fill the "N frames" status line —
+  minutes of freeze on a beamline network share, re-run whenever the
+  directory changed during acquisition. Large directories now count on a
+  background worker (the status updates when the sweep lands), unchanged
+  files are never re-opened (per-file cache), and `.nxs` counting goes
+  straight to h5py instead of failing slowly through fabio first.
 
 ## What's new in v1.1.0
 
