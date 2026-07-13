@@ -684,7 +684,16 @@ class imageWrangler(wranglerWidget):
                     continue
                 val = session.get(key)
                 if key == 'meta_ext':
-                    val = _meta_ext_parameter_value(val)
+                    # Legacy sessions (pre-'auto') encoded "never set" as
+                    # None/'' — the OLD metadata-off default, not a deliberate
+                    # choice.  Modern saves write the literal dropdown string,
+                    # so only a saved 'none' is an explicit off (MD-2 boundary).
+                    # Migrate the legacy-unset encodings to the modern default
+                    # instead of resurrecting them as a permanent 'none'.
+                    if val is None or str(val).strip() == '':
+                        val = def_meta_ext
+                    else:
+                        val = _meta_ext_parameter_value(val)
                 elif val is None:
                     continue
                 if is_path and not Path(val).exists():
