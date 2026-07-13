@@ -664,6 +664,71 @@ def test_controls_panel_v2_native_int_advanced_rows_write_through_and_match_plan
         widget.deleteLater()
 
 
+def test_advanced_polarization_none_survives_dialog_round_trip_s10(
+        qapp, monkeypatch):
+    """S10-1 GUARD (§10 fork class): ``polarization_factor=None`` (correction
+    OFF — the args-side encoding V2 and ``_params_to_args`` both use) must
+    survive the Advanced-dialog round trip.
+
+    ``bai_*_args`` owns the fact; the 'Apply polarization factor' checkbox is a
+    rendered VIEW of its None-encoding.  The regression: ``_args_to_params``
+    rendered None as CHECKED, and because the V2 hydrate runs without the
+    legacy disconnect bracket, the ``treeChangeBlocker`` exit fired
+    ``process_change → sigUpdateArgs → get_args → _params_to_args`` — so
+    merely OPENING the Advanced dialog (or editing any unrelated advanced
+    field) silently rewrote ``polarization_factor`` from None to the tree's
+    numeric value, enabling a correction the user never asked for and changing
+    written data.
+    """
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        integrator = widget.integratorTree
+        # Polarization OFF is the fresh-scan default; pin the precondition.
+        widget.scan.bai_1d_args["polarization_factor"] = None
+        widget.scan.bai_2d_args["polarization_factor"] = None
+
+        # The REAL dialog-open path: builds the dialog and hydrates the live
+        # advanced trees from the scan args.
+        widget._show_integration_advanced()
+
+        # The checkbox must render the None-encoding as unchecked...
+        assert integrator.bai_1d_pars.child(
+            "Apply polarization factor").value() is False
+        assert integrator.bai_2d_pars.child(
+            "Apply polarization factor").value() is False
+        # ...and opening the dialog alone must not have rewritten the args.
+        assert widget.scan.bai_1d_args["polarization_factor"] is None
+        assert widget.scan.bai_2d_args["polarization_factor"] is None
+
+        # Edit an UNRELATED advanced field through the real tree-change path
+        # (sigTreeStateChanged → process_change → sigUpdateArgs → get_args).
+        integrator.bai_1d_pars.child("dummy").setValue(-7.0)
+        integrator.bai_2d_pars.child("dummy").setValue(-9.0)
+        assert widget.scan.bai_1d_args["dummy"] == pytest.approx(-7.0)
+        assert widget.scan.bai_2d_args["dummy"] == pytest.approx(-9.0)
+        assert widget.scan.bai_1d_args["polarization_factor"] is None
+        assert widget.scan.bai_2d_args["polarization_factor"] is None
+
+        # A deliberate ON round-trips its numeric value unchanged.
+        widget.scan.bai_1d_args["polarization_factor"] = 0.5
+        widget._controls_v2_hydrate_advanced_from_scan()
+        assert integrator.bai_1d_pars.child(
+            "Apply polarization factor").value() is True
+        assert integrator.bai_1d_pars.child(
+            "polarization_factor").value() == pytest.approx(0.5)
+        integrator.bai_1d_pars.child("dummy").setValue(-8.0)
+        assert widget.scan.bai_1d_args["polarization_factor"] == (
+            pytest.approx(0.5))
+        # The 2D dim was left OFF and must stay OFF through the same edit.
+        assert widget.scan.bai_2d_args["polarization_factor"] is None
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
 def test_controls_panel_v2_renders_blockers_and_launchers(qapp):
     profile = ControlProfile(
         processing_page=ProcessingPage.RSM,
