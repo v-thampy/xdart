@@ -493,11 +493,13 @@ def test_f5_unfinalized_nxs_deferred_then_consumed_in_full(tmp_path):
     assert str(p) in t._eiger_done_masters           # retired only after finalize+drain
 
 
-def test_f5_refill_defers_only_unfinalized_bluesky(tmp_path):
-    """The defer-guard is scoped: finalized Bluesky and PLAIN (non-Bluesky)
-    .nxs queue immediately — a plain container has no end_time contract and
-    must never be deferred forever — while an unreadable (mid-copy/torn) one
-    waits."""
+def test_f5_pop_defers_only_unfinalized_bluesky(tmp_path):
+    """DIR-2 moved the F5 finalized-at-close check from REFILL (one HDF5 open
+    per file per poll — the bl17-2 24.5 s first-dispatch stall) to POP time.
+    Same safety pins: finalized Bluesky and PLAIN .nxs flow immediately; an
+    in-progress or unreadable (mid-copy/torn) container is deferred — dropped
+    from the queue, neither consumed nor retired — and flows the moment it
+    finalizes.  Refill itself is now name-only (no opens)."""
     import h5py
 
     watch = tmp_path / "watch"
@@ -521,23 +523,80 @@ def test_f5_refill_defers_only_unfinalized_bluesky(tmp_path):
     torn.write_bytes(b"\x89HDF\r\n partial garbage")
 
     t = _real_dir_watch_thread(watch, out)
-    t._eiger_refill_master_queue()
-    assert sorted(t._eiger_master_queue) == [str(done), str(plain)]
-    assert not t._eiger_done_masters             # nothing retired by discovery
 
-    # end_time lands -> the very next refill poll picks the deferred file up.
-    with h5py.File(inprog, "r+") as f:
-        f["entry"].create_dataset("end_time", data=b"2026-07-12T00:01:00")
-    t._eiger_refill_master_queue()
-    assert str(inprog) in t._eiger_master_queue
+    # Refill is name-only: EVERYTHING queues without a single open.
+    from xrd_tools.io import bluesky_nexus as bn
+    opens = []
+    real_check = bn.is_unfinalized_nxwriter
+    bn_patch = lambda p: (opens.append(str(p)), real_check(p))[1]
+    orig = bn.is_unfinalized_nxwriter
+    bn.is_unfinalized_nxwriter = bn_patch
+    try:
+        t._eiger_refill_master_queue()
+        assert sorted(t._eiger_master_queue) == sorted(
+            [str(done), str(inprog), str(plain), str(torn)])
+        assert opens == []                       # zero opens at refill
+
+        # Pop-time: finalized + plain flow; unfinalized + torn are deferred
+        # (dropped, not retired) — exactly one check per popped candidate.
+        popped = []
+        while True:
+            nxt = t._eiger_pop_next_master()
+            if nxt is None:
+                break
+            popped.append(nxt)
+        assert sorted(popped) == sorted([str(done), str(plain)])
+        assert not t._eiger_done_masters         # nothing retired by popping
+        assert len(t._eiger_master_queue) == 0   # deferred are re-polled
+
+        # end_time lands -> the next refill+pop picks the deferred file up.
+        with h5py.File(inprog, "r+") as f:
+            f["entry"].create_dataset("end_time", data=b"2026-07-12T00:01:00")
+        t._eiger_refill_master_queue()
+        assert str(inprog) in t._eiger_master_queue
+        remaining = []
+        while True:
+            nxt = t._eiger_pop_next_master()
+            if nxt is None:
+                break
+            remaining.append(nxt)
+        assert str(inprog) in remaining
+    finally:
+        bn.is_unfinalized_nxwriter = orig
 
 
-# ---------------------------------------------------------------------------
-# F6 live-watch half (review wf_3614041c P2): the path-variant finder was
-# strict-3D, so a one-exposure 2-D NXWriter .nxs opened fine through the
-# HEADLESS seam but the live watch read ZERO frames (fabio can't read Bluesky
-# layouts) and silently retired the file after a 30 s stall.
-# ---------------------------------------------------------------------------
+def test_dir2b_bluesky_master_h5_reads_via_h5py_fallback(tmp_path):
+    """DIR-2b (bl17-2 live): a Bluesky NXWriter file NAMED *_master.h5 is
+    rejected by fabio's EigerImage (NotGoodReader, a RuntimeError) — that
+    used to escape _eiger_open_master's (IOError, OSError) catch, crash the
+    prefetch worker and END the whole directory run ('No frames discovered').
+    It must fall back to the same h5py reader the .nxs branch uses and serve
+    every frame."""
+    watch = tmp_path / "watch"
+    watch.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
+    p = watch / "num_0_align_00001_master.h5"
+    _write_bluesky_nxwriter(p, n=3)
+
+    t = _real_dir_watch_thread(watch, out)
+    t.img_ext = "h5"
+
+    frames = []
+    for _ in range(6):
+        item = t._get_next_eiger_frame_sync()
+        if item[3] is None:
+            break
+        frames.append(item)
+    assert len(frames) == 3, "fabio-rejected master.h5 must read via h5py"
+    assert [it[2] for it in frames] == [1, 2, 3]
+
+    # count_frames on the same file: the master arm now has the h5py
+    # fallback too, so growth re-checks can't return 0 and retire a
+    # growing container.
+    from xrd_tools.io.image import count_frames
+    assert count_frames(p) == 3
+
 
 def _write_single_exposure_bluesky(path):
     """A one-exposure NXWriter count: the detector image is a lone 2-D dataset

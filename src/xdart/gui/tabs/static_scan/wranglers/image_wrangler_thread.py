@@ -2913,8 +2913,19 @@ class imageThread(wranglerThread):
                 self._eiger_fabio_handle = fabio.open(master_path)
                 self._eiger_nframes = self._eiger_fabio_handle.nframes
                 return
-            except (IOError, OSError) as e:
-                logger.debug("Failed to open %s with fabio: %s, trying h5py", master_path, e)
+            except Exception as e:
+                # DIR-2b: fabio's EigerImage rejects non-Eiger-shaped HDF5
+                # (Bluesky NXWriter files named *_master.h5, or masters
+                # with unreachable external links) with NotGoodReader — a
+                # RuntimeError, NOT an IOError — which used to escape
+                # here, crash the prefetch worker and END the whole
+                # directory run ('No frames discovered').  Fall through
+                # to the same h5py reader the .nxs branch uses; a truly
+                # unreadable file yields nframes=0 and the existing
+                # retire-and-advance skips it per file.
+                logger.warning(
+                    "fabio could not open %s (%s); falling back to h5py",
+                    master_path, e)
                 self._eiger_fabio_handle = None
 
         # h5py path (primary for .nxs, fallback for .h5/.hdf5 master files)
@@ -3125,20 +3136,42 @@ class imageThread(wranglerThread):
             mf_str = str(mf)
             if mf_str in self._eiger_done_masters or mf_str in queued:
                 continue
-            # F5: an apstools/NXWriter .nxs is finalized-at-close (entry/end_time
-            # stamped when the run stops).  Never queue an in-progress container:
-            # once consumed it is exhausted-and-RETIRED into _eiger_done_masters,
-            # permanently losing every frame written after the one-shot growth
-            # re-check.  Deferring here is loss-free — the file is re-checked on
-            # every refill poll and queued the moment it finalizes.  Plain
-            # (non-Bluesky) .nxs files are never deferred.
-            if suffix == '.nxs':
-                from xrd_tools.io.bluesky_nexus import is_unfinalized_nxwriter
-                if is_unfinalized_nxwriter(mf_str):
-                    logger.debug('Deferring unfinalized NXWriter container: %s',
-                                 mf_str)
-                    continue
+            # DIR-2: refill is NAME-ONLY.  The F5 finalized-at-close check
+            # used to run here — one HDF5 open per not-yet-queued file, i.e.
+            # hundreds of opens over a beamline share before the FIRST frame
+            # could be read (the bl17-2 24.5 s first-dispatch stall).  It
+            # now runs once per file at POP time (_eiger_pop_next_master),
+            # which preserves the loss-free guarantee: the check still
+            # happens before a container is consumed and retired.
             self._eiger_master_queue.append(mf_str)
+
+    def _eiger_pop_next_master(self):
+        """Pop the next master, deferring unfinalized NXWriter containers.
+
+        F5 moved here from refill time (DIR-2): one finalized-at-close
+        check per file at consumption, instead of one HDF5 open per file
+        per refill poll.  A deferred (in-progress or unreadable/torn)
+        container is dropped from the queue — it is neither consumed nor
+        retired, so the next refill poll re-discovers it and it flows the
+        moment it finalizes.  Applies to every container kind (post
+        DIR-2b, *_master.h5 NXWriter files are readable too); plain
+        non-NXWriter files are never deferred
+        (``is_unfinalized_nxwriter`` answers False for them).
+        """
+        from xrd_tools.io.bluesky_nexus import is_unfinalized_nxwriter
+        while self._eiger_master_queue:
+            cand = self._eiger_master_queue.popleft()
+            try:
+                unfinalized = is_unfinalized_nxwriter(cand)
+            except Exception:
+                # Unreadable / mid-copy: defer, never consume-and-retire.
+                unfinalized = True
+            if unfinalized:
+                logger.debug(
+                    'Deferring unfinalized NXWriter container: %s', cand)
+                continue
+            return cand
+        return None
 
     def _get_next_eiger_frame(self):
         """Return the next frame from Eiger / NeXus HDF5 file(s).
@@ -3452,9 +3485,10 @@ class imageThread(wranglerThread):
             if self._eiger_master_path is None:
                 if self.inp_type == 'Image Directory':
                     self._eiger_refill_master_queue()
-                    if not self._eiger_master_queue:
+                    next_master = self._eiger_pop_next_master()
+                    if next_master is None:
                         return None, None, 1, None, {}
-                    self._eiger_master_path = self._eiger_master_queue.popleft()
+                    self._eiger_master_path = next_master
                 else:
                     self._eiger_master_path = self.img_file
                 self._eiger_frame_idx = 0
@@ -3499,9 +3533,10 @@ class imageThread(wranglerThread):
                     self._eiger_close_master()
                     if not self._eiger_master_queue:
                         self._eiger_refill_master_queue()
-                    if not self._eiger_master_queue:
+                    next_master = self._eiger_pop_next_master()
+                    if next_master is None:
                         return None, None, 1, None, {}
-                    self._eiger_master_path = self._eiger_master_queue.popleft()
+                    self._eiger_master_path = next_master
                     self._eiger_frame_idx = 0
                     self._eiger_open_master(self._eiger_master_path)
                     if self._eiger_nframes == 0:

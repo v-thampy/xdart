@@ -1424,16 +1424,11 @@ def test_controls_panel_v2_gi_motor_never_shows_phantom_th(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_dir_container_count_sweeps_off_the_gui_thread(qapp, monkeypatch, tmp_path):
-    """bl17-2 live-found (2026-07-12): directory mode + nxs swept count_frames
-    over EVERY container synchronously on the GUI thread (~0.7 s/file over the
-    beamline share -> minutes-long freeze, re-run whenever the directory
-    changed).  Large directories must sweep on a worker: the GUI-thread call
-    returns immediately, the real total lands via the queued signal, and a
-    live-growing directory only re-counts files that actually CHANGED."""
-    import threading as _threading
-    import time as _time
-
+def test_dir_container_count_is_file_count_no_hdf5_opens(qapp, monkeypatch, tmp_path):
+    """DIR-2 (maintainer, 2026-07-13): a container DIRECTORY reports the FILE
+    count immediately — no per-file HDF5 open, ever (the old sweep cost
+    ~0.5-1 s/file over a beamline share and one WARNING per unreadable file).
+    True frame counts appear as the run opens each file (that path is lazy)."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
     from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter
@@ -1441,58 +1436,50 @@ def test_dir_container_count_sweeps_off_the_gui_thread(qapp, monkeypatch, tmp_pa
 
     d = tmp_path / "watch"
     d.mkdir()
-    n_files = 12          # > _V2_DIR_COUNT_SYNC_MAX
+    n_files = 12
     for i in range(n_files):
         _write_bluesky_nxwriter(d / f"scan_{i:05d}.nxs", n=2)
 
-    calls = []            # (thread_ident, path) — observation only, real fn runs
-    real_count = image_io.count_frames
     monkeypatch.setattr(
         image_io, "count_frames",
-        lambda path: (calls.append((_threading.get_ident(), str(path))),
-                      real_count(path))[1])
+        lambda path: pytest.fail(
+            f"container directory listing opened a file: {path}"))
 
     widget = staticWidget()
     try:
-        gui_ident = _threading.get_ident()
         sig = widget.wrangler.parameters.child("Signal")
         sig.child("inp_type").setValue("Image Directory")
         sig.child("img_dir").setValue(str(d))
         sig.child("img_ext").setValue("nxs")
 
-        def _wait_landed():
-            deadline = _time.monotonic() + 15
-            while widget._v2_dir_count_pending is not None:
-                qapp.processEvents()
-                assert _time.monotonic() < deadline, "async count never landed"
-                _time.sleep(0.01)
-            qapp.processEvents()
+        assert widget._controls_v2_source_frame_count() == n_files
+        assert widget._v2_source_count_is_files is True
 
-        # Phase 1: the count lands correct, and NO file was ever opened on
-        # the GUI thread (param-change handlers may kick the sweep early, so
-        # judge the whole call record rather than a cleared window).
-        widget._controls_v2_source_frame_count()
-        _wait_landed()
-        assert widget._controls_v2_source_frame_count() == 2 * n_files
-        assert calls, "the sweep must actually count files"
-        assert all(c[0] != gui_ident for c in calls)
-
-        # A file arrives (live acquisition): ONLY the new file is counted —
-        # the per-file memo answers for the unchanged ones.
+        # A new file arrives (live acquisition): the count follows the glob,
+        # still without opening anything.
         _write_bluesky_nxwriter(d / f"scan_{n_files:05d}.nxs", n=5)
-        calls.clear()
-        widget._controls_v2_source_frame_count()
-        _wait_landed()
-        assert widget._controls_v2_source_frame_count() == 2 * n_files + 5
-        assert {c[1] for c in calls} == {str(d / f"scan_{n_files:05d}.nxs")}
+        widget._v2_frame_count_cache = None
+        assert widget._controls_v2_source_frame_count() == n_files + 1
+
+        # The summary chip renders FILES, not frames.
+        state = widget._controls_v2_state()
+        assert state.frame_count_is_files is True
+        from xdart.gui.tabs.static_scan.controls_logic import (
+            build_control_profile,
+        )
+        profile = build_control_profile(state)
+        text, _ready, _tooltip = staticWidget._controls_v2_run_summary(
+            state, profile)
+        if str(state.frame_count) in text:
+            assert "file" in text and "frame" not in text
     finally:
         widget.close()
         widget.deleteLater()
 
 
-def test_dir_container_count_small_dir_still_counts_inline(qapp, monkeypatch, tmp_path):
-    """At or under the sync bound the count stays immediate (no worker, no
-    stale 0) — the bounded inline path small local dirs rely on."""
+def test_dir_container_count_small_dir_is_file_count_too(qapp, monkeypatch, tmp_path):
+    """No small-directory exception: every container directory is a file
+    count (DIR-2)."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
     from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter
@@ -1508,8 +1495,8 @@ def test_dir_container_count_small_dir_still_counts_inline(qapp, monkeypatch, tm
         sig.child("inp_type").setValue("Image Directory")
         sig.child("img_dir").setValue(str(d))
         sig.child("img_ext").setValue("nxs")
-        assert widget._controls_v2_source_frame_count() == 6
-        assert widget._v2_dir_count_pending is None
+        assert widget._controls_v2_source_frame_count() == 3
+        assert widget._v2_source_count_is_files is True
     finally:
         widget.close()
         widget.deleteLater()
@@ -2089,8 +2076,10 @@ def test_controls_panel_v2_source_count_uses_container_frame_count(
     assert count == 50
 
 
-def test_controls_panel_v2_source_count_sums_directory_masters(
+def test_controls_panel_v2_source_count_directory_masters_is_file_count(
         monkeypatch, tmp_path):
+    """DIR-2: a directory of masters reports the FILE count (2) — count_frames
+    is never called for a container directory."""
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
     from xrd_tools.io import image as image_io
 
@@ -2100,10 +2089,9 @@ def test_controls_panel_v2_source_count_sums_directory_masters(
     for path in (first, second, ignored):
         path.write_bytes(b"")
 
-    def _count(path):
-        return {first.name: 50, second.name: 30}.get(Path(path).name, 999)
-
-    monkeypatch.setattr(image_io, "count_frames", _count)
+    monkeypatch.setattr(
+        image_io, "count_frames",
+        lambda path: pytest.fail("container directory count opened a file"))
 
     count = staticWidget._controls_v2_count_source_frames(
         source_type="Image Directory",
@@ -2114,7 +2102,7 @@ def test_controls_panel_v2_source_count_sums_directory_masters(
         file_filter="",
     )
 
-    assert count == 80
+    assert count == 2
 
 
 def test_controls_panel_v2_source_count_counts_single_image_files(

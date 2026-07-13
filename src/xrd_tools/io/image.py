@@ -498,11 +498,26 @@ def count_frames(path: Path | str) -> int:
                 with h5py.File(path, "r") as f:
                     ds = _find_hdf5_image_dataset(f)
                     return ds.shape[0] if ds.ndim >= 3 else 1
+        elif ext in {".h5", ".hdf5", ".nxs"}:
+            # Eiger-master-named HDF5: fabio first, h5py fallback — the
+            # bl17-2 *_master.h5 NXWriter files are not Eiger-shaped and
+            # fabio rejects them (DIR-2b); the h5py finder reads them.
+            try:
+                with fabio.open(path) as f:
+                    return f.nframes
+            except Exception:
+                with h5py.File(path, "r") as f:
+                    ds = _find_hdf5_image_dataset(f)
+                    return ds.shape[0] if ds.ndim >= 3 else 1
         else:
             with fabio.open(path) as f:
                 return f.nframes
     except Exception:
+        # exc_info at DEBUG so a beamtime recurrence is diagnosable from
+        # the log (the WARNING alone cannot distinguish locking vs broken
+        # links vs a processed-output file swept into the source tree).
         logger.warning("Could not determine frame count for %s", path)
+        logger.debug("count_frames failed for %s", path, exc_info=True)
         return 0
 
 
