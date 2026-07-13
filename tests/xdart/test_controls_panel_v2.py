@@ -4423,3 +4423,51 @@ def test_axis_edit_keeps_gi_config_mode_in_sync_sw8(qapp, monkeypatch):
         _reset_controls_v2_gi(widget)
         widget.close()
         widget.deleteLater()
+
+
+# ── POL-1: fresh-scan polarization default ON at 0.99 ──────────────────────
+
+
+def test_fresh_scan_polarization_defaults_on_at_099(qapp, monkeypatch):
+    """POL-1 (maintainer decision, 2026-07-13): fresh scans apply the
+    polarization correction by default at DEFAULT_POLARIZATION_FACTOR — SSRL
+    beams are strongly horizontally polarized.  Deliberate OFF still encodes
+    as ``polarization_factor=None`` (the S10-1 contract), and re-enabling
+    lands the default factor, not 0.0."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.integrator import (
+        DEFAULT_POLARIZATION_FACTOR,
+    )
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        integrator = widget.integratorTree
+        # The real dialog-open path seeds + hydrates the trees from scan args.
+        widget._show_integration_advanced()
+        a1 = widget.scan.bai_1d_args
+        a2 = widget.scan.bai_2d_args
+        assert a1["polarization_factor"] == pytest.approx(
+            DEFAULT_POLARIZATION_FACTOR)
+        assert a2["polarization_factor"] == pytest.approx(
+            DEFAULT_POLARIZATION_FACTOR)
+        assert integrator.bai_1d_pars.child(
+            "Apply polarization factor").value() is True
+        assert integrator.bai_1d_pars.child(
+            "polarization_factor").value() == pytest.approx(
+                DEFAULT_POLARIZATION_FACTOR)
+        assert integrator.bai_2d_pars.child(
+            "Apply polarization factor").value() is True
+
+        # Deliberate OFF encodes as None (and survives — the S10-1 guard).
+        widget._on_controls_v2_field_changed(
+            ("Int1D", "apply_polarization"), False)
+        assert a1["polarization_factor"] is None
+        # Re-enabling restores the default factor, not 0.0.
+        widget._on_controls_v2_field_changed(
+            ("Int1D", "apply_polarization"), True)
+        assert a1["polarization_factor"] == pytest.approx(
+            DEFAULT_POLARIZATION_FACTOR)
+    finally:
+        widget.close()
+        widget.deleteLater()

@@ -141,6 +141,7 @@ from .display_overlay_utils import (
     row_id_belongs_to_widget_scan,
 )
 from .integrator import (
+    DEFAULT_POLARIZATION_FACTOR,
     GI_LABELS_1D,
     GI_LABELS_2D,
     GI_MODES_1D,
@@ -1500,7 +1501,8 @@ class staticWidget(QWidget):
             "dummy": -1.0,
             "delta_dummy": 0.0,
             "chi_offset": 90.0,
-            "polarization_factor": None,
+            # ON by default (maintainer, 2026-07-13); None = deliberate off.
+            "polarization_factor": DEFAULT_POLARIZATION_FACTOR,
             "method": "csr",
             "safe": True,
         }
@@ -1514,7 +1516,8 @@ class staticWidget(QWidget):
             "dummy": -1.0,
             "delta_dummy": 0.0,
             "chi_offset": 90.0,
-            "polarization_factor": None,
+            # ON by default (maintainer, 2026-07-13); None = deliberate off.
+            "polarization_factor": DEFAULT_POLARIZATION_FACTOR,
             "method": "csr",
             "safe": True,
         }
@@ -1964,12 +1967,14 @@ class staticWidget(QWidget):
         elif leaf == "apply_polarization":
             if self._controls_v2_bool(value):
                 args["polarization_factor"] = self._controls_v2_float(
-                    args.get("polarization_factor"), 0.0)
+                    args.get("polarization_factor"),
+                    DEFAULT_POLARIZATION_FACTOR)
             else:
                 args["polarization_factor"] = None
             self._controls_v2_sync_advanced_parameter(path)
         elif leaf == "polarization_factor":
-            args["polarization_factor"] = self._controls_v2_float(value, 0.0)
+            args["polarization_factor"] = self._controls_v2_float(
+                value, DEFAULT_POLARIZATION_FACTOR)
             self._controls_v2_sync_advanced_parameter(path)
         elif leaf in {"correctSolidAngle", "safe"}:
             args[leaf] = self._controls_v2_bool(value)
