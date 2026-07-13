@@ -1,6 +1,18 @@
 import h5py
+import os
 import threading
 from collections import Counter, OrderedDict
+
+
+def _pool_key(path):
+    """Canonical pool key: case- and separator-normalized ABSOLUTE path.
+
+    Keys used to be raw ``str(path)``, so on Windows a case/slash variant of
+    one file cached under a second key — and ``pause()`` then closed NOTHING
+    while the stale read handle stayed open, defeating the writer's
+    ``os.replace`` (DIR-3, WinError 5).  ``normcase`` is a no-op on POSIX.
+    """
+    return os.path.normcase(os.path.abspath(str(path)))
 
 
 # Module-level singleton — import and use this from anywhere that needs
@@ -42,7 +54,7 @@ class H5FilePool:
 
         Opens the file if needed, evicts LRU if at capacity.
         """
-        key = str(path)
+        key = _pool_key(path)
         with self._lock:
             if self._paused[key]:        # Counter: 0 (falsey) for an unpaused key
                 return None
@@ -64,7 +76,7 @@ class H5FilePool:
 
     def close(self, path):
         """Close a cached read handle (e.g. before writing)."""
-        key = str(path)
+        key = _pool_key(path)
         with self._lock:
             if key in self._files:
                 try:
@@ -78,7 +90,7 @@ class H5FilePool:
         Call this before opening a file for writing.  Refcounted: nested/
         concurrent pauses stack and each must be matched by a ``resume``.
         """
-        key = str(path)
+        key = _pool_key(path)
         with self._lock:
             self._paused[key] += 1
             if key in self._files:
@@ -90,7 +102,7 @@ class H5FilePool:
     def resume(self, path):
         """Drop one pause; allow ``get()`` to reopen only once ALL pauses for
         this path have been resumed (refcount hits zero)."""
-        key = str(path)
+        key = _pool_key(path)
         with self._lock:
             depth = self._paused.get(key, 0)
             if depth <= 1:
