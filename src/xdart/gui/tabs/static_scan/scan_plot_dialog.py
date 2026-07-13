@@ -87,7 +87,8 @@ def _numeric_columns(table):
 class ScanPlotDialog(QtWidgets.QDialog):
     """Plot scan metadata columns vs each other, overlaid, with normalization."""
 
-    def __init__(self, default_uri=None, mask_provider=None, parent=None):
+    def __init__(self, default_uri=None, mask_provider=None, lock_provider=None,
+                 parent=None):
         super().__init__(parent)
         self._table = {}
         self._columns = []
@@ -97,6 +98,11 @@ class ScanPlotDialog(QtWidgets.QDialog):
         # stats for that source (e.g. the loaded scan's global_mask when the
         # picked source IS the loaded scan), or None.
         self._mask_provider = mask_provider
+        # ``lock_provider(uri)`` returns the writer-coordinating file_lock when
+        # the picked source IS the loaded (possibly live-writing) scan's .nxs,
+        # else None — the dialog's .nxs reads enter it so they cannot race the
+        # live writer's `r+` saves (the display readers' _locked_scan_read rule).
+        self._lock_provider = lock_provider
         self._source = None
         self._source_uri = None
         self._scan_identity = None          # (uri, scan, entry) of the loaded scan
@@ -249,8 +255,21 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.set_table(label, table)
         self._update_roi_button()
 
-    @staticmethod
-    def _table_for(selection):
+    def _read_locked(self, uri):
+        """Context for a ``.nxs`` read of ``uri`` — the provider's
+        writer-coordinating lock when ``uri`` is the loaded scan's data file,
+        else a no-op."""
+        from contextlib import nullcontext
+        lock = None
+        if self._lock_provider is not None:
+            try:
+                lock = self._lock_provider(str(uri))
+            except Exception:
+                logger.debug("scan-plot: lock provider failed", exc_info=True)
+                lock = None
+        return lock if lock is not None else nullcontext()
+
+    def _table_for(self, selection):
         """Per-frame metadata table for a selection — the full ``scan_data`` for a
         processed NeXus, else the source's own per-frame metadata (which is just
         ``frame_index`` for a metadata-less image stack)."""
@@ -260,7 +279,8 @@ class ScanPlotDialog(QtWidgets.QDialog):
         if spec is not None and spec.kind is SourceKind.PROCESSED_NEXUS:
             from xrd_tools.io import read_scan_data
             try:
-                table = read_scan_data(spec.uri)
+                with self._read_locked(spec.uri):
+                    table = read_scan_data(spec.uri)
             except Exception:
                 logger.exception("scan-plot: read_scan_data failed")
                 table = {}
@@ -268,8 +288,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
             table = _table_from_source(source)
         return selection.label, table
 
-    @staticmethod
-    def _positioners_for(selection):
+    def _positioners_for(self, selection):
         """Scanned-motor names for the X default.  For a processed NeXus these
         are the recorded NXpositioner motors (``get_metadata`` — intentionally
         narrow to the diffractometer/scanned motors); for other sources they are
@@ -280,7 +299,8 @@ class ScanPlotDialog(QtWidgets.QDialog):
         if spec is not None and spec.kind is SourceKind.PROCESSED_NEXUS:
             from xrd_tools.io import get_metadata
             try:
-                positioners = get_metadata(spec.uri).get("positioners") or {}
+                with self._read_locked(spec.uri):
+                    positioners = get_metadata(spec.uri).get("positioners") or {}
                 return [str(k) for k in positioners]
             except Exception:
                 logger.exception("scan-plot: reading positioners failed")

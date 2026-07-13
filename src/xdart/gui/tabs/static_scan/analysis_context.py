@@ -22,6 +22,7 @@ PatternProvider = Callable[[], PatternTuple | None]
 FramePatternProvider = Callable[[int], PatternTuple | None]
 ScanUriProvider = Callable[[], str | None]
 MaskProvider = Callable[[str | None], Any]
+ReadLockProvider = Callable[[str | None], Any]
 FrameLabelsProvider = Callable[[], Sequence[Any]]
 MetadataProvider = Callable[[], Mapping[str, Any]]
 
@@ -72,6 +73,7 @@ class AnalysisContext:
     frame_pattern_provider: FramePatternProvider = lambda _idx: None
     scan_uri_provider: ScanUriProvider = lambda: None
     mask_provider: MaskProvider = lambda _uri: None
+    read_lock_provider: ReadLockProvider = lambda _uri: None
     frame_labels_provider: FrameLabelsProvider = tuple
     metadata_provider: MetadataProvider = dict
     extras: Mapping[str, Any] = field(default_factory=dict)
@@ -98,6 +100,12 @@ class AnalysisContext:
 
     def mask_for_scan_uri(self, uri: str | None = None) -> Any:
         return self.mask_provider(uri if uri is not None else self.current_scan_uri())
+
+    def read_lock_for_uri(self, uri: str | None = None) -> Any:
+        """Writer-coordinating lock for reading ``uri``, or None when no
+        in-process writer shares that file (dialogs then read unlocked)."""
+        return self.read_lock_provider(
+            uri if uri is not None else self.current_scan_uri())
 
     def frame_labels(self) -> tuple[Any, ...]:
         try:

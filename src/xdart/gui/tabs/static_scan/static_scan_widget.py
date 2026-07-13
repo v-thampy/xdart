@@ -3592,6 +3592,7 @@ class staticWidget(QWidget):
             frame_pattern_provider=self._pattern_for_frame,
             scan_uri_provider=self._current_scan_uri,
             mask_provider=self._scan_plot_mask_provider,
+            read_lock_provider=self._scan_read_lock_provider,
             frame_labels_provider=lambda: tuple(
                 getattr(self, 'frame_ids', ())
                 or (getattr(self.displayframe, 'idxs_1d', None) or ())
@@ -3832,6 +3833,24 @@ class staticWidget(QWidget):
             same = False
         return getattr(self.scan, 'global_mask', None) if same else None
 
+    def _scan_read_lock_provider(self, uri):
+        """The loaded scan's writer-coordinating ``file_lock`` — but ONLY when
+        ``uri`` IS that scan's data file (the one file a live run's writer
+        holds the lock around; ``_locked_scan_read`` is the display-side
+        counterpart).  An arbitrary other file has no in-process writer to
+        coordinate with, so dialogs read it unlocked (None)."""
+        import os
+        data_file = getattr(self.scan, 'data_file', None)
+        try:
+            same = bool(data_file and uri and os.path.realpath(str(uri))
+                        == os.path.realpath(str(data_file)))
+        except (TypeError, ValueError):
+            same = False
+        if not same:
+            return None
+        from .display_data import DisplayDataMixin
+        return DisplayDataMixin._scan_file_lock(self)
+
     def _open_scan_plot_dialog(self):
         """Open (or re-show) the Scan Plot popup — lazy, single-instance,
         non-modal.  Starts on the currently-loaded scan (or blank)."""
@@ -3840,7 +3859,8 @@ class staticWidget(QWidget):
             ctx = self._analysis_context()
             self._scan_plot_dialog = ScanPlotDialog(
                 default_uri=ctx.current_scan_uri(),
-                mask_provider=ctx.mask_for_scan_uri, parent=self)
+                mask_provider=ctx.mask_for_scan_uri,
+                lock_provider=ctx.read_lock_for_uri, parent=self)
         dlg = self._scan_plot_dialog
         dlg.show()
         dlg.raise_()
