@@ -771,10 +771,13 @@ class ScanPlotDialog(QtWidgets.QDialog):
     def _save_csv(self):
         if not self._table:
             return
+        from xdart.utils.browse import remember_browse_path, suggest_save_path
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save scan table", "scan_table.csv", "CSV files (*.csv)")
+            self, "Save scan table", suggest_save_path("scan_table.csv"),
+            "CSV files (*.csv)")
         if not path:
             return
+        remember_browse_path(path)
         try:
             self._write_csv(path)
             self.status.setText(f"Saved {path}")

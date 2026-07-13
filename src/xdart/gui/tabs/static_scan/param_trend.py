@@ -162,11 +162,14 @@ class ParamTrendMixin:
     def _save_param_csv(self):
         if not self._param_accumulator:
             return
+        from xdart.utils.browse import remember_browse_path, suggest_save_path
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save parameters vs frame", "fit_params_vs_frame.csv",
+            self, "Save parameters vs frame",
+            suggest_save_path("fit_params_vs_frame.csv"),
             "CSV files (*.csv)")
         if not path:
             return
+        remember_browse_path(path)
         labels, columns = accumulator_to_table(self._param_accumulator)
         keys = list(columns)
         try:

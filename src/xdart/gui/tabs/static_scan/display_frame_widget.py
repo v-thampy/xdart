@@ -4119,10 +4119,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def update_2d_label(self):
         """Updates 2D Label
         """
-        # Sets title text
+        # Sets title text (max 55 chars — maintainer, 2026-07-13)
         label = self.scan.name
-        if len(label) > 40:
-            label = f'{label[:18]}...{label[-18:]}'
+        if len(label) > 55:
+            label = f'{label[:26]}...{label[-26:]}'
 
         # Single/Overlay/Waterfall: the cake + raw show the CURRENT (latest-
         # selected) frame (see _display_ids_for_2d), so the title shows that

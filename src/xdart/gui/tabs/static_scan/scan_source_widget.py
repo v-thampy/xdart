@@ -210,20 +210,28 @@ class ScanSourceWidget(QtWidgets.QWidget):
 
     # ---- picking --------------------------------------------------------
     def _choose(self):
+        from xdart.utils.browse import browse_start_dir, remember_browse_path
+        start = browse_start_dir(self.path_edit.text())
         if self.dir_check.isChecked():
-            path = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose a folder")
+            path = QtWidgets.QFileDialog.getExistingDirectory(
+                self, "Choose a folder", start)
         else:
             # All files first/default — SPEC scan files are extensionless.
             path, _ = QtWidgets.QFileDialog.getOpenFileName(
-                self, "Choose a scan", "",
+                self, "Choose a scan", start,
                 "All files (*);;Scans (*.nxs *.h5 *.hdf5 *.cxi *.tif *.tiff)")
         if path:
+            remember_browse_path(path)
             self.path_edit.setText(path)
             self._refresh_candidates()
 
     def _choose_image_dir(self):
-        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose image folder")
+        from xdart.utils.browse import browse_start_dir, remember_browse_path
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Choose image folder",
+            browse_start_dir(self.image_dir_edit.text()))
         if path:
+            remember_browse_path(path)
             self.image_dir_edit.setText(path)
             self._emit_selection()
 

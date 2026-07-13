@@ -1700,15 +1700,18 @@ class DisplayDataMixin:
         for f in formats:
             ext_filter += "*." + f + " "
 
+        from xdart.utils.browse import browse_start_dir, remember_browse_path
         dialog = QFileDialog()
         fname, _ = dialog.getSaveFileName(
             dialog,
+            dir=browse_start_dir(),
             filter=ext_filter,
             caption='Save as...',
             options=QFileDialog.DontUseNativeDialog
         )
         if fname == '':
             return
+        remember_browse_path(fname)
 
         # Choose the right widget depending on viewer mode
         if self.viewer_mode == 'image':
@@ -1763,12 +1766,17 @@ class DisplayDataMixin:
 
         fname = f'{self.scan.name}'
         if not auto:
+            from xdart.utils.browse import (
+                browse_start_dir, remember_browse_path,
+            )
             path = QFileDialog.getExistingDirectory(
                 self,
                 caption="Select Directory to Save Images",
-                dir="",
+                dir=browse_start_dir(),
                 options=(QFileDialog.ShowDirsOnly | QFileDialog.DontUseNativeDialog)
             )
+            if path:
+                remember_browse_path(path)
 
             inp_dialog = QtWidgets.QInputDialog()
             suffix, ok = inp_dialog.getText(inp_dialog, 'Enter Suffix to be added to File Name', 'Suffix', text='')
