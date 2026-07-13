@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.integrate.detector_mask import mask_with_detector
 from xrd_tools.integrate.gid import (  # shared count==0 -> NaN helpers
     _nan_empty_1d,
     _nan_empty_2d,
@@ -81,6 +82,9 @@ def integrate_1d(
         extra["polarization_factor"] = polarization_factor
     if normalization_factor is not None:
         extra["normalization_factor"] = normalization_factor
+    # Always-on geometric detector mask (module gaps are non-pixels) —
+    # an explicit pyFAI mask otherwise REPLACES detector.calc_mask().
+    mask = mask_with_detector(ai, mask)
     result = ai.integrate1d(
         image,
         npt,
@@ -243,6 +247,9 @@ def integrate_2d(
         extra["polarization_factor"] = polarization_factor
     if normalization_factor is not None:
         extra["normalization_factor"] = normalization_factor
+    # Always-on geometric detector mask (module gaps are non-pixels) —
+    # an explicit pyFAI mask otherwise REPLACES detector.calc_mask().
+    mask = mask_with_detector(ai, mask)
     result = ai.integrate2d(
         image,
         npt_rad,

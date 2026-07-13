@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from xrd_tools.core.containers import PONI, IntegrationResult1D, IntegrationResult2D
+from xrd_tools.integrate.detector_mask import mask_with_detector
 from xrd_tools.integrate.calibration import poni_to_integrator
 
 if TYPE_CHECKING:
@@ -316,6 +317,7 @@ def integrate_gi_1d(
     unit_ip = kwargs.pop("unit_ip", _DEFAULT_UNIT_IP)
     _npt_oop = npt_oop if npt_oop is not None else npt
 
+    mask = mask_with_detector(fi, mask)   # geometric gaps: always-on
     result = fi.integrate1d_grazing_incidence(
         image,
         npt_ip=npt,
@@ -401,6 +403,7 @@ def integrate_gi_2d(
     inc, tilt, orient = _effective_gi_params(fi, incident_angle, tilt_angle, sample_orientation)
     unit_oop = kwargs.pop("unit_oop", _DEFAULT_UNIT_OOP)
 
+    mask = mask_with_detector(fi, mask)   # geometric gaps: always-on
     result = fi.integrate2d_grazing_incidence(
         image,
         npt_ip=npt_rad,
@@ -477,6 +480,7 @@ def integrate_gi_polar(
         azimuth_range = (max(float(azimuth_range[0]), -180.0),
                          min(float(azimuth_range[1]), 180.0))
 
+    mask = mask_with_detector(fi, mask)   # geometric gaps: always-on
     result = fi.integrate2d_polar(
         polar_degrees=True,
         radial_unit=radial_unit,
@@ -552,6 +556,7 @@ def integrate_gi_exitangles(
     inc, tilt, orient = _effective_gi_params(fi, incident_angle, tilt_angle, sample_orientation)
     angle_degrees = kwargs.pop("angle_degrees", True)
 
+    mask = mask_with_detector(fi, mask)   # geometric gaps: always-on
     result = fi.integrate2d_exitangles(
         angle_degrees=angle_degrees,
         data=image,
@@ -647,6 +652,7 @@ def integrate_gi_polar_1d(
         }
         std_kwargs = {k: v for k, v in kwargs.items() if k not in _fiber_only}
         std_unit = f"q_{radial_unit}"
+        mask = mask_with_detector(fi, mask)   # geometric gaps: always-on
         result = fi.integrate1d(
             data=image,
             npt=npt,
@@ -665,6 +671,7 @@ def integrate_gi_polar_1d(
         )
 
     # --- slow path: restricted χ wedge → polar method -----------------------
+    mask = mask_with_detector(fi, mask)   # geometric gaps: always-on
     result = fi.integrate1d_polar(
         polar_degrees=True,
         radial_unit=radial_unit,
@@ -741,6 +748,7 @@ def integrate_gi_azimuthal_1d(
         # pyFAI wraps out-of-domain polar requests instead of clamping.
         azimuth_range = (max(float(azimuth_range[0]), -180.0),
                          min(float(azimuth_range[1]), 180.0))
+    mask = mask_with_detector(fi, mask)   # geometric gaps: always-on
     result = fi.integrate1d_polar(
         data=image,
         radial_integration=True,        # -> I vs χ_GI (not I vs q_total)

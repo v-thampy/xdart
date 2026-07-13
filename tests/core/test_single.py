@@ -261,3 +261,73 @@ def test_integrate_1d_normalization_factor(ai_fixture, synthetic_image):
     )
 
     np.testing.assert_allclose(norm2.intensity, norm1.intensity / 2.0, rtol=1e-6, atol=1e-8)
+
+
+# ---------------------------------------------------------------------------
+# Always-on geometric detector mask (bl17-2, 2026-07-12)
+# ---------------------------------------------------------------------------
+
+def _eiger1m_ai():
+    """A REAL pyFAI integrator for a detector WITH a geometric gap mask."""
+    import pyFAI
+    from pyFAI.detectors import Eiger1M
+
+    ai = pyFAI.load({"dist": 0.2, "poni1": 0.04, "poni2": 0.05,
+                     "rot1": 0.0, "rot2": 0.0, "rot3": 0.0,
+                     "detector": "Eiger1M", "wavelength": 1e-10})
+    assert isinstance(ai.detector, Eiger1M)
+    assert ai.detector.calc_mask() is not None
+    return ai
+
+
+def test_geometric_gap_mask_unioned_into_explicit_mask_1d():
+    """pyFAI applies detector.calc_mask() only for mask=None, and xrd-tools
+    ALWAYS passes an explicit mask — so ZERO-filled module gaps were averaged
+    into the radial bins (the bl17-2 smooth dips).  A flat frame with
+    zero-filled gaps must integrate FLAT even with an explicit 'mask nothing'
+    mask: the integrator's own geometric mask is unioned in, always."""
+    ai = _eiger1m_ai()
+    gaps = ai.detector.calc_mask().astype(bool)
+    img = np.full(ai.detector.shape, 100.0)
+    img[gaps] = 0.0                                   # zero-filled gaps
+    nothing = np.zeros(ai.detector.shape, dtype=bool)  # what xdart sends
+
+    res = integrate_1d(img, ai, npt=500, unit="q_A^-1",
+                       mask=nothing, correctSolidAngle=False)
+    finite = res.intensity[np.isfinite(res.intensity) & (res.intensity > 0)]
+    assert finite.size > 400
+    # Unfixed: bins containing gap pixels dip well below 100 (measured ~0.64x
+    # on real Eiger geometry).  Fixed: flat within numerical noise.
+    assert float(finite.min()) > 99.0, float(finite.min())
+
+
+def test_geometric_gap_mask_unioned_into_explicit_mask_2d():
+    """Same guarantee for integrate_2d: gap bins come back EMPTY (NaN), never
+    as finite zero-averaged intensity."""
+    ai = _eiger1m_ai()
+    gaps = ai.detector.calc_mask().astype(bool)
+    img = np.full(ai.detector.shape, 100.0)
+    img[gaps] = 0.0
+    nothing = np.zeros(ai.detector.shape, dtype=bool)
+
+    res = integrate_2d(img, ai, npt_rad=200, npt_azim=90, unit="q_A^-1",
+                       mask=nothing, correctSolidAngle=False)
+    vals = res.intensity[np.isfinite(res.intensity)]
+    assert vals.size > 0
+    assert float(vals.min()) > 99.0, float(vals.min())
+
+
+def test_geometric_gap_mask_no_op_without_detector_mask():
+    """Detectors WITHOUT a geometric mask (Rayonix/Perkin — the
+    equivalence-spine detectors) are untouched BIT-FOR-BIT: the union returns
+    the very same explicit-mask object, so spine numbers cannot move."""
+    import pyFAI
+
+    from xrd_tools.integrate.detector_mask import mask_with_detector
+
+    ai = pyFAI.load({"dist": 0.3, "poni1": 0.1, "poni2": 0.1,
+                     "rot1": 0.0, "rot2": 0.0, "rot3": 0.0,
+                     "detector": "RayonixMx225", "wavelength": 1e-10})
+    assert ai.detector.calc_mask() is None
+    nothing = np.zeros(ai.detector.shape, dtype=bool)
+    assert mask_with_detector(ai, nothing) is nothing
