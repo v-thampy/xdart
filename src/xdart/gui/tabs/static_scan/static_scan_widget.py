@@ -4231,6 +4231,16 @@ class staticWidget(QWidget):
             # it's a no-op when the motor list is unchanged.
             self.wrangler.sigGIMotorOptions.connect(
                 self._on_gi_motor_options_changed)
+            # §10/SW-7: the integrator combo mirrors the ACTIVE wrangler's motor
+            # discovery — a swap must not leave the previous wrangler's list
+            # showing.  Ask the new wrangler to re-announce what it already
+            # knows through the same signal that populates the combo.  Gated on
+            # a non-empty discovery: an empty announce would wipe session-
+            # restored choices before this wrangler's own discovery fires.
+            if (getattr(self.wrangler, 'motors', None)
+                    and callable(getattr(self.wrangler,
+                                         'set_gi_motor_options', None))):
+                self.wrangler.set_gi_motor_options()
         self.wrangler.started.connect(self.thread_state_changed)
         self.wrangler.finished.connect(self.wrangler_finished)
         # Pause/Resume (Phase B): lift the freeze guard once paused (frozen at a
