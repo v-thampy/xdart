@@ -3436,6 +3436,14 @@ class imageThread(wranglerThread):
                 self._eiger_open_master(self._eiger_master_path)
                 if self._eiger_nframes == 0:
                     self._eiger_close_master()
+                    if self.inp_type == 'Image Directory':
+                        # An imageless container (a diode/alignment scan in a
+                        # mixed beamline directory) must not END the stream —
+                        # loop back so the exhaustion branch retires it and
+                        # advances to the next master (bl17-2 2026-07-12: one
+                        # alignment file sorting FIRST killed the whole batch
+                        # run with 'Total Files Processed: 0').
+                        continue
                     return None, None, 1, None, {}
 
             # ── Current master exhausted?  Try to advance ────────────────────
@@ -3472,8 +3480,11 @@ class imageThread(wranglerThread):
                     self._eiger_frame_idx = 0
                     self._eiger_open_master(self._eiger_master_path)
                     if self._eiger_nframes == 0:
+                        # Imageless container mid-queue: retire-and-advance via
+                        # the exhaustion branch, never end the stream (see the
+                        # init-branch note).
                         self._eiger_close_master()
-                        return None, None, 1, None, {}
+                        continue
                 else:
                     self._eiger_close_master()
                     return None, None, 1, None, {}

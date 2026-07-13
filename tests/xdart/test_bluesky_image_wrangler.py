@@ -585,6 +585,51 @@ def test_f6_single_exposure_2d_nxs_consumed_by_live_watch(tmp_path):
     assert str(p) in t._eiger_done_masters
 
 
+# ---------------------------------------------------------------------------
+# bl17-2 (2026-07-12): a mixed beamline directory — diode/alignment scans with
+# NO image dataset alongside real data scans.  An imageless container sorting
+# FIRST used to return the end-of-stream sentinel; in batch that ended the run
+# with 'Total Files Processed: 0' unless the user knew to add a name filter.
+# ---------------------------------------------------------------------------
+
+def test_imageless_containers_are_skipped_not_stream_ending(tmp_path):
+    """Imageless containers must be retired-and-skipped; every image frame in
+    the directory must still flow, in order, with no sentinel in between."""
+    import h5py
+
+    watch = tmp_path / "watch"
+    watch.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
+
+    # Three imageless alignment scans that SORT FIRST…
+    for i in range(1, 4):
+        with h5py.File(watch / f"align_{i:05d}.nxs", "w") as f:
+            e = f.create_group("entry")
+            e.attrs["NX_class"] = "NXentry"
+            d = e.create_group("data")
+            d.create_dataset("i0", data=np.linspace(0.0, 1.0, 11))
+            d.create_dataset("EPOCH", data=np.linspace(0.0, 10.0, 11))
+    # …then two real data scans.
+    _write_bluesky_nxwriter(watch / "combi_data_00001.nxs", n=2)
+    _write_bluesky_nxwriter(watch / "combi_data_00002.nxs", n=3)
+
+    t = _real_dir_watch_thread(watch, out)
+    frames = []
+    for _ in range(12):
+        item = t._get_next_eiger_frame_sync()
+        if item[3] is None:
+            break
+        frames.append((item[1], item[2]))
+    assert frames == [
+        ("combi_data_00001", 1), ("combi_data_00001", 2),
+        ("combi_data_00002", 1), ("combi_data_00002", 2),
+        ("combi_data_00002", 3),
+    ]
+    for i in range(1, 4):
+        assert str(watch / f"align_{i:05d}.nxs") in t._eiger_done_masters
+
+
 # ===========================================================================
 # Real-file assertions (shipped Pt_10nm_00013.nxs; skip without test data)
 # ===========================================================================

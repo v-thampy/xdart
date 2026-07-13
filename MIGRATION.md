@@ -331,6 +331,11 @@ All verified findings from the v1.1.0 external review:
 * **Plot Metadata is O(n).** The per-frame metadata lookup no longer does an
   O(n) label scan per row (the all-frames sweep was O(n²): ~2.5 s at 30k
   frames).
+* **Mixed directories (alignment + data scans) process without a filter.**
+  An imageless container (a diode/alignment `.nxs` with no detector data)
+  used to END a directory-mode run when it sorted first — "Total Files
+  Processed: 0" unless a name filter excluded it. Imageless containers are
+  now retired and skipped; every image-bearing file still processes.
 * **Directory mode no longer freezes the GUI counting container frames.**
   Selecting a directory of `.nxs`/`.h5` files swept every container
   synchronously on the GUI thread to fill the "N frames" status line —
