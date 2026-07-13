@@ -2416,9 +2416,14 @@ def test_gi_motor_options_default_select_follows_preference_order():
     value, _ = _select(["i0", "TH", "eta"])
     assert value == "TH"
 
-    # No named preference present -> the first ROTATION-sounding motor wins over a
-    # non-rotation one (chi is an axis; mu is not in the hint set).
+    # 'mu' is a NAMED preference since F3 (maintainer decision 2026-07-12), so
+    # it outranks the rotation heuristic.
     value, _ = _select(["mu", "chi"])
+    assert value == "mu"
+
+    # No named preference present -> the ROTATION-sounding motor wins over a
+    # translation stage.
+    value, _ = _select(["detx", "chi"])
     assert value == "chi"
 
     # Nothing looks like a rotation axis -> Manual (never a translation stage).
@@ -9180,6 +9185,9 @@ def test_batch_process_scan_dispatches_each_frame_as_read():
     # run()'s final-flush tail now always calls flush_serial_tail (the gate is
     # inside it); bind it + the bracket on the stand-in.
     host.flush_serial_tail = MethodType(imageThread.flush_serial_tail, host)
+    # F1 (a8107bc4): the scan-boundary swap force-saves the outgoing scan
+    # through the shared helper — bind the real one on the stand-in too.
+    host._flush_outgoing_scan = MethodType(imageThread._flush_outgoing_scan, host)
     host._h5pool_bracket = MethodType(imageThread._h5pool_bracket, host)
 
     MethodType(imageThread.process_scan, host)()
