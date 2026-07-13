@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "is_bluesky_nxwriter",
+    "is_unfinalized_nxwriter",
     "resolve_nxentry",
     "bluesky_motor_names",
     "bluesky_all_motor_names",
@@ -183,6 +184,37 @@ def is_bluesky_nxwriter(h5_or_entry: h5py.File | h5py.Group) -> bool:
         creator = ""
     has_bluesky = entry is not None and "instrument/bluesky" in entry
     return creator == "NXWriter" or bool(has_bluesky)
+
+
+def is_unfinalized_nxwriter(path) -> bool:
+    """True when *path* is a Bluesky/apstools ``NXWriter`` container that is
+    still being written — i.e. NOT yet safe to consume-and-retire.
+
+    The NXWriter lifecycle stamps ``entry/end_time`` when the run closes, so a
+    Bluesky container WITHOUT it is in-progress: a live directory watch must
+    DEFER it (re-check on the next poll) rather than read it, or the reader
+    exhausts the partial file and permanently retires it while frames are still
+    arriving (v1.1.1 F5).  Also reported unfinalized:
+
+    * an UNREADABLE file (h5py cannot open a half-written HDF5 — the same
+      mid-write state, observed earlier), and
+    * an NXWriter file whose entry has not been created yet (root
+      ``creator='NXWriter'`` is stamped before the tree is populated).
+
+    A non-Bluesky container is NEVER deferred — it has no ``end_time``
+    contract, and deferring it would silently exclude plain ``.nxs``/``.h5``
+    stacks from directory watches forever.
+    """
+    try:
+        with h5py.File(path, "r") as f:
+            if not is_bluesky_nxwriter(f):
+                return False
+            entry = resolve_nxentry(f)
+            return entry is None or "end_time" not in entry
+    except Exception:
+        logger.debug("is_unfinalized_nxwriter: %s unreadable -> defer",
+                     path, exc_info=True)
+        return True
 
 
 # ---------------------------------------------------------------------------

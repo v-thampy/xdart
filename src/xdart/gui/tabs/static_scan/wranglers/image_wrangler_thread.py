@@ -207,6 +207,30 @@ def _get_scan_info(fname):
     return _split_scan_suffix(Path(fname).stem)
 
 
+def scan_name_from_source(path):
+    """THE canonical source-file → scan-name rule (Codex F2).
+
+    Container files (`.nxs` / `.h5` / `.hdf5`) keep the **FULL stem** — the numeric
+    suffix is part of the scan identity: `LaB6_0710_1025pm_00005.nxs` stays
+    `LaB6_0710_1025pm_00005`.  That is what the processed `.nxs` filename AND the
+    plot titles / legend labels must show (dropping the `00005` was the bug).  An
+    Eiger `_master` HDF5 strips only the `_master` tag; a per-file image series
+    (`.tif`, …) strips the trailing `_<digits>` frame index.
+
+    Shared by the worker (`_eiger_scan_name`), the GUI frame-boundary parser
+    (`_scan_key_from_source`), the append-target resolver
+    (`_append_scan_name_for_source`) and the overlay helper so they can never
+    disagree again — the three-way divergence F2 fixed.  Pure string parse, no I/O.
+    """
+    p = Path(str(path))
+    stem = p.stem
+    if stem.lower().endswith("_master"):
+        return stem[:-7]
+    if p.suffix.lower() in (".h5", ".hdf5", ".nxs"):
+        return stem
+    return _get_scan_info(path)[0]
+
+
 def _series_frame_sort_key(path):
     scan_name, img_number = _get_scan_info(path)
     number_key = -1 if img_number is None else img_number
@@ -1262,15 +1286,7 @@ class imageThread(wranglerThread):
                 # the per-iteration dispatch cadence below: the old
                 # scan may have integrated-but-unsaved frames in
                 # memory whose save_to_nexus call never fired.
-                if (scan is not None
-                        and not self.xye_only
-                        and self._frames_since_save > 0):
-                    _n_swap = self._frames_since_save     # reset by the tail
-                    if self.flush_serial_tail(scan, force=True):
-                        logger.info(
-                            '[SAVE-ON-SWAP] %d frames flushed for %s',
-                            _n_swap, scan.name,
-                        )
+                self._flush_outgoing_scan(scan)
                 try:
                     scan = self.initialize_scan()
                 except AppendConfigMismatchError as exc:
@@ -1402,6 +1418,12 @@ class imageThread(wranglerThread):
                 self.scan_name = scan_name
 
                 if (scan is None) or (scan_name != scan.name):
+                    # SAVE-ON-SWAP (F1): persist the OUTGOING scan's
+                    # integrated-but-unsaved serial tail before switching, so a
+                    # sub-LIVE_SAVE_INTERVAL live scan (A→B→C single-frame
+                    # masters) is not counted-as-processed yet shipped empty.
+                    # Symmetric with the initial-collection boundary above.
+                    self._flush_outgoing_scan(scan)
                     try:
                         scan = self.initialize_scan()
                     except AppendConfigMismatchError as exc:
@@ -2174,6 +2196,30 @@ class imageThread(wranglerThread):
         finally:
             _get_h5pool().resume(scan.data_file)
 
+    def _flush_outgoing_scan(self, scan) -> None:
+        """Force-save the OUTGOING scan's integrated-but-unsaved serial tail at a
+        scan-boundary swap, before it is replaced by ``initialize_scan()``.
+
+        Shared by BOTH scan-swap paths — the initial-collection loop and the
+        Phase-3 live-watch boundary — because that is exactly where data can
+        vanish: a sub-``LIVE_SAVE_INTERVAL`` scan (e.g. A→B→C single-frame
+        masters) is ``record_processed``-counted but its ``.nxs`` never
+        force-saves, so it ships empty while ``files_processed_by_output`` claims
+        its frames.  The bug recurred once already because the two boundaries had
+        DUPLICATED this flush and only one was fixed — keep it here, called from
+        both, so they can never diverge again.  No-op for ``scan is None`` /
+        ``xye_only`` (xye is drained per-frame, has no .nxs tail).
+        """
+        if (scan is not None
+                and not self.xye_only
+                and self._frames_since_save > 0):
+            _n_swap = self._frames_since_save     # reset by the tail
+            if self.flush_serial_tail(scan, force=True):
+                logger.info(
+                    '[SAVE-ON-SWAP] %d frames flushed for %s',
+                    _n_swap, scan.name,
+                )
+
     def flush_serial_tail(self, scan, *, force=False) -> bool:
         """The serial save tail (the DRYed copy-paste idiom).
 
@@ -2850,17 +2896,28 @@ class imageThread(wranglerThread):
         try:
             ds_path = find_nexus_image_dataset(master_path)
             if ds_path is None:
-                logger.warning('Could not find 3D image dataset in %s', master_path)
+                logger.warning('Could not find image dataset in %s', master_path)
                 self._eiger_close_master()
                 self._eiger_nframes = 0
                 return
             self._eiger_h5_handle = h5py.File(master_path, 'r')
             self._eiger_h5_dataset = self._eiger_h5_handle[ds_path]
-            self._eiger_nframes = self._eiger_h5_dataset.shape[0]
+            self._eiger_nframes = self._h5_stack_nframes(self._eiger_h5_dataset)
         except Exception as e:
             logger.error('Error opening HDF5/NeXus file %s: %s', master_path, e)
             self._eiger_close_master()
             self._eiger_nframes = 0
+
+    @staticmethod
+    def _h5_stack_nframes(dset):
+        """Logical frame count of an h5py image dataset.
+
+        A 2-D dataset is a SINGLE-exposure detector frame — one logical frame
+        (the same (1, H, W) normalization NexusImageStack applies, F6) — never
+        ``shape[0]`` rows.  Every ``_eiger_nframes`` assignment from a live
+        h5py dataset must come through here (the growth re-checks included), or
+        a one-frame ``.nxs`` would be re-counted as H "frames" of rows."""
+        return 1 if dset.ndim == 2 else int(dset.shape[0])
 
     def _eiger_close_master(self):
         """Close persistent Eiger handles (fabio and/or h5py)."""
@@ -3022,8 +3079,9 @@ class imageThread(wranglerThread):
 
     @staticmethod
     def _eiger_scan_name(master_path):
-        master_stem = Path(master_path).stem
-        return master_stem[:-7] if master_stem.lower().endswith('_master') else master_stem
+        # Canonical rule (Codex F2): container .nxs/.h5 keeps the FULL stem,
+        # '_master' is stripped — one shared source-of-truth with the GUI.
+        return scan_name_from_source(master_path)
 
     def _eiger_refill_master_queue(self):
         """Queue matching HDF5 master / NeXus files not yet processed."""
@@ -3040,8 +3098,22 @@ class imageThread(wranglerThread):
         queued = set(self._eiger_master_queue)
         for mf in master_files:
             mf_str = str(mf)
-            if mf_str not in self._eiger_done_masters and mf_str not in queued:
-                self._eiger_master_queue.append(mf_str)
+            if mf_str in self._eiger_done_masters or mf_str in queued:
+                continue
+            # F5: an apstools/NXWriter .nxs is finalized-at-close (entry/end_time
+            # stamped when the run stops).  Never queue an in-progress container:
+            # once consumed it is exhausted-and-RETIRED into _eiger_done_masters,
+            # permanently losing every frame written after the one-shot growth
+            # re-check.  Deferring here is loss-free — the file is re-checked on
+            # every refill poll and queued the moment it finalizes.  Plain
+            # (non-Bluesky) .nxs files are never deferred.
+            if suffix == '.nxs':
+                from xrd_tools.io.bluesky_nexus import is_unfinalized_nxwriter
+                if is_unfinalized_nxwriter(mf_str):
+                    logger.debug('Deferring unfinalized NXWriter container: %s',
+                                 mf_str)
+                    continue
+            self._eiger_master_queue.append(mf_str)
 
     def _get_next_eiger_frame(self):
         """Return the next frame from Eiger / NeXus HDF5 file(s).
@@ -3306,6 +3378,10 @@ class imageThread(wranglerThread):
                             else self._eiger_fabio_handle.get_frame(frame_idx).data)
                     return np.asarray(_raw)
                 if self._eiger_h5_dataset is not None:
+                    if self._eiger_h5_dataset.ndim == 2:
+                        # F6: the lone 2-D dataset IS frame 0 (never index a
+                        # row out of a single-exposure frame).
+                        return np.asarray(self._eiger_h5_dataset[()])
                     return np.asarray(self._eiger_h5_dataset[frame_idx])
                 with fabio.open(self._eiger_master_path) as _img:
                     _raw = (_img.data if frame_idx == 0
@@ -3334,7 +3410,7 @@ class imageThread(wranglerThread):
                 self._eiger_nframes = self._eiger_fabio_handle.nframes
             elif self._eiger_h5_dataset is not None:
                 self._eiger_h5_dataset.id.refresh()
-                self._eiger_nframes = self._eiger_h5_dataset.shape[0]
+                self._eiger_nframes = self._h5_stack_nframes(self._eiger_h5_dataset)
         except Exception as e:
             logger.debug("Failed to refresh Eiger handle for %s: %s",
                          getattr(self, "_eiger_master_path", None), e)
@@ -3377,7 +3453,7 @@ class imageThread(wranglerThread):
                 elif self._eiger_h5_dataset is not None:
                     try:
                         self._eiger_h5_dataset.id.refresh()
-                        self._eiger_nframes = self._eiger_h5_dataset.shape[0]
+                        self._eiger_nframes = self._h5_stack_nframes(self._eiger_h5_dataset)
                     except (IOError, OSError, KeyError) as e:
                         logger.debug("Failed to refresh h5 dataset for %s: %s", self._eiger_master_path, e)
                         self._eiger_nframes = self._get_nframes(self._eiger_master_path)

@@ -4,12 +4,18 @@
 Both the image-wrangler ``GI/th_motor`` param and the integrator panel's
 ``gi_motor`` combo must SHOW every real motor of the source and DEFAULT-select
 the same incidence axis, so the two never disagree.  The rule (maintainer spec,
-recurring):
+recurring; extended 2026-07-12 for Codex review F3):
 
 1. Show every real motor (not counters) + ``Manual``.
 2. Default-select, case-insensitively, the first *named* preference that is
-   actually present: ``th, eta, halpha, gonth, theta``.
-3. Else the first motor whose name *sounds like* a rotation / incidence axis.
+   actually present: ``th, eta, halpha, gonth, theta, alpha_i, mu, incidence``.
+3. Else the first motor whose name *sounds like* a rotation / incidence axis —
+   matched TOKEN-AWARE (word boundaries), never substring-anywhere: as bare
+   substrings ``th``/``om`` wrongly claimed ``slit_wid**th**`` and
+   ``sample_h**om**e`` (the F3 leak), silently defaulting to a translation
+   stage.  ``th``/``om`` themselves are real, common beamline axes and stay
+   fully recognized — as whole TOKENS here (``sam_th``, ``th2``, ``om``) and
+   ``th`` at the top of rule 2's preference.
 4. Else ``Manual`` (no motor looks like an incidence axis — safer to make the
    user type the angle than to silently pick a translation stage).
 
@@ -19,14 +25,75 @@ Never inject a preference/heuristic name that is not a real motor of the source
 
 from __future__ import annotations
 
-#: Named incidence-motor preference, highest first (case-insensitive equality).
-GI_MOTOR_PREFERENCE = ("th", "eta", "halpha", "gonth", "theta")
+import re
 
-#: Substrings that mark a motor name as a rotation / incidence axis (fallback
-#: when none of :data:`GI_MOTOR_PREFERENCE` is present).  Case-insensitive.
-_ROTATION_HINTS = (
-    "th", "eta", "theta", "omega", "om", "phi", "chi", "gon", "rot", "ang",
+#: Named incidence-motor preference, highest first (case-insensitive equality).
+GI_MOTOR_PREFERENCE = (
+    "th", "eta", "halpha", "gonth", "theta", "alpha_i", "mu", "incidence",
 )
+
+#: Rotation hints with PER-HINT affix rules (review wf_3614041c: a single
+#: equals/starts/ends rule still fired through unrelated words at token EDGES —
+#: **chi**ller, hexa**gon**, **ang**strom, m**eta** — re-creating the F3 leak).
+#:
+#: Both affixes — no realistic English-word collision at either token edge:
+#: two**theta**/``thetaz``, sam**omega**, sam**phi``/``phiz``, x**rot**/``rotz``,
+#: ``angle(s)``.
+_ROTATION_HINTS_AFFIX = ("theta", "omega", "phi", "rot", "angle")
+#: PREFIX-only: ``gonio``/``goniometer`` yes, hexa**gon** no.
+_ROTATION_HINTS_PREFIX = ("gon",)
+#: SUFFIX-only: ``samchi`` yes, **chi**ller no.
+_ROTATION_HINTS_SUFFIX = ("chi",)
+
+#: Incidence/rotation names matched only as a WHOLE token (``sample_mu`` yes,
+#: ``muffin_x`` no).  ``th``/``om``/``mu`` are REAL, common beamline axes
+#: (maintainer clarification 2026-07-12: they were never banned — F3 only
+#: stopped mid-word SUBSTRING matching, wid**th**/h**om**e); whole-token
+#: matching keeps them while staying leak-free, and catches decorated forms
+#: (``sam_th``, ``th2``, ``sample_om``).  ``alpha``/``eta``/``ang`` as affixes
+#: would over-match (m**eta**/b**eta** are NOT incidence axes — beta is
+#: conventionally the EXIT angle, and Manual is safer).  ``halpha`` (the
+#: bl11-3 incidence axis) is listed so decorated forms are caught — bare
+#: names in :data:`GI_MOTOR_PREFERENCE` already win via the preference pass.
+_ROTATION_TOKEN_ALIASES = (
+    "th", "om", "mu", "eta", "ang", "alpha", "alphai", "halpha", "incidence",
+)
+
+#: camelCase boundary (lower/digit → upper), applied before lowercasing.
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+#: Token separators after lowercasing: any run of non-alphanumerics.
+_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
+
+def _tokens(name: str) -> list[str]:
+    """Split a motor name into lowercase word tokens.
+
+    Boundaries are non-alphanumeric runs AND camelCase transitions; trailing
+    digits are stripped per token so ``theta2``/``phi1`` read as their axis.
+    """
+    spaced = _CAMEL_BOUNDARY.sub(" ", str(name))
+    out: list[str] = []
+    for tok in _NON_ALNUM.split(spaced.lower()):
+        tok = tok.rstrip("0123456789")
+        if tok:
+            out.append(tok)
+    return out
+
+
+def _looks_like_rotation(name: str) -> bool:
+    """True when *name* reads as a rotation / incidence axis, token-aware."""
+    for tok in _tokens(name):
+        if tok in _ROTATION_TOKEN_ALIASES:
+            return True
+        if any(tok.startswith(h) for h in _ROTATION_HINTS_PREFIX):
+            return True
+        if any(tok.endswith(h) for h in _ROTATION_HINTS_SUFFIX):
+            return True
+        for hint in _ROTATION_HINTS_AFFIX:
+            if tok.startswith(hint) or tok.endswith(hint):
+                return True
+    return False
 
 
 def pick_default_gi_motor(motors) -> str:
@@ -44,7 +111,6 @@ def pick_default_gi_motor(motors) -> str:
         if pref in lower:
             return lower[pref]
     for m in names:
-        ml = m.lower()
-        if any(hint in ml for hint in _ROTATION_HINTS):
+        if _looks_like_rotation(m):
             return m
     return "Manual"

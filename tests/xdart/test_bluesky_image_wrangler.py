@@ -400,6 +400,191 @@ def test_directory_of_nxs_masters(tmp_path):
     assert {"i0", "i1", "i2", "pd"} <= set(counters)
 
 
+# ---------------------------------------------------------------------------
+# F5 (Codex review 2026-07-11, maintainer decision: finalized-.nxs-only): the
+# live directory watch must DEFER an in-progress NXWriter container instead of
+# consuming it — a partial .nxs used to be exhausted and permanently RETIRED
+# into _eiger_done_masters, silently losing every frame written afterwards.
+# ---------------------------------------------------------------------------
+
+def _real_dir_watch_thread(watch_dir, out_dir):
+    """A REAL imageThread (full __init__) watching a directory of .nxs masters."""
+    import threading
+    from queue import Queue
+
+    from xrd_tools.core.containers import PONI
+    from xdart.modules.live import LiveScan
+
+    scan = LiveScan("scan", data_file=str(out_dir / "scan.nxs"), static=True)
+    return imageThread(
+        Queue(),                     # command_queue
+        {},                          # scan_args
+        threading.RLock(),           # file_lock
+        "",                          # fname
+        str(out_dir),                # h5_dir
+        "scan",                      # scan_name
+        False,                       # single_img
+        PONI(dist=0.2, poni1=0.1, poni2=0.1, wavelength=1e-10),
+        "Image Directory",           # inp_type
+        "",                          # img_file
+        str(watch_dir),              # img_dir
+        False,                       # include_subdir
+        "nxs",                       # img_ext
+        False,                       # series_average
+        None,                        # meta_ext
+        "",                          # file_filter
+        None,                        # mask_file
+        "Full",                      # write_mode
+        "None",                      # bg_type
+        "",                          # bg_file
+        "",                          # bg_dir
+        None,                        # bg_matching_par
+        "",                          # bg_match_fname
+        "",                          # bg_file_filter
+        1.0,                         # bg_scale
+        None,                        # bg_norm_channel
+        False,                       # gi
+        None,                        # th_mtr
+        1,                           # sample_orientation
+        0.0,                         # tilt_angle
+        "q_total",                   # gi_mode_1d
+        "qip_qoop",                  # gi_mode_2d
+        "start",                     # command
+        scan,                        # scan
+        live_mode=True,
+        max_cores=1,
+    )
+
+
+def test_f5_unfinalized_nxs_deferred_then_consumed_in_full(tmp_path):
+    """Mid-run NXWriter .nxs (no entry/end_time): the watch defers it — sentinel,
+    NOT retired.  Once finalized, EVERY frame is consumed (none lost to the
+    partial-read-then-retire path this fix kills)."""
+    import h5py
+
+    watch = tmp_path / "watch"
+    watch.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
+    p = watch / "grow_00001.nxs"
+    # Mid-run state: the NXWriter tree with only 2 frames flushed, no end_time.
+    _write_bluesky_nxwriter(p, n=2)
+    with h5py.File(p, "r+") as f:
+        del f["entry/end_time"]
+
+    t = _real_dir_watch_thread(watch, out)
+    item = t._get_next_eiger_frame_sync()
+    assert item[3] is None                       # deferred: end-of-stream sentinel
+    assert str(p) not in t._eiger_done_masters   # NOT retired (the F5 data-loss)
+    assert len(t._eiger_master_queue) == 0       # not queued either — re-polled
+
+    # The run closes: NXWriter finalizes the SAME path with all 5 frames.
+    _write_bluesky_nxwriter(p, n=5)
+
+    frames = []
+    for _ in range(10):
+        item = t._get_next_eiger_frame_sync()
+        if item[3] is None:
+            break
+        frames.append(item)
+    assert len(frames) == 5                          # every frame, none lost
+    assert {it[1] for it in frames} == {"grow_00001"}
+    assert [it[2] for it in frames] == [1, 2, 3, 4, 5]
+    assert str(p) in t._eiger_done_masters           # retired only after finalize+drain
+
+
+def test_f5_refill_defers_only_unfinalized_bluesky(tmp_path):
+    """The defer-guard is scoped: finalized Bluesky and PLAIN (non-Bluesky)
+    .nxs queue immediately — a plain container has no end_time contract and
+    must never be deferred forever — while an unreadable (mid-copy/torn) one
+    waits."""
+    import h5py
+
+    watch = tmp_path / "watch"
+    watch.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
+
+    done = watch / "done_00001.nxs"
+    _write_bluesky_nxwriter(done)
+    inprog = watch / "inprog_00001.nxs"
+    _write_bluesky_nxwriter(inprog)
+    with h5py.File(inprog, "r+") as f:
+        del f["entry/end_time"]
+    plain = watch / "plain_00001.nxs"
+    with h5py.File(plain, "w") as f:
+        e = f.create_group("entry")
+        e.attrs["NX_class"] = "NXentry"
+        e.create_group("data").create_dataset(
+            "data", data=np.zeros((3, 4, 4), dtype=np.uint32))
+    torn = watch / "torn_00001.nxs"
+    torn.write_bytes(b"\x89HDF\r\n partial garbage")
+
+    t = _real_dir_watch_thread(watch, out)
+    t._eiger_refill_master_queue()
+    assert sorted(t._eiger_master_queue) == [str(done), str(plain)]
+    assert not t._eiger_done_masters             # nothing retired by discovery
+
+    # end_time lands -> the very next refill poll picks the deferred file up.
+    with h5py.File(inprog, "r+") as f:
+        f["entry"].create_dataset("end_time", data=b"2026-07-12T00:01:00")
+    t._eiger_refill_master_queue()
+    assert str(inprog) in t._eiger_master_queue
+
+
+# ---------------------------------------------------------------------------
+# F6 live-watch half (review wf_3614041c P2): the path-variant finder was
+# strict-3D, so a one-exposure 2-D NXWriter .nxs opened fine through the
+# HEADLESS seam but the live watch read ZERO frames (fabio can't read Bluesky
+# layouts) and silently retired the file after a 30 s stall.
+# ---------------------------------------------------------------------------
+
+def _write_single_exposure_bluesky(path):
+    """A one-exposure NXWriter count: the detector image is a lone 2-D dataset
+    flagged @signal_type='detector' (finalized — end_time present)."""
+    import h5py
+
+    img = np.arange(16, dtype=np.uint32).reshape(4, 4)
+    with h5py.File(path, "w") as f:
+        f.attrs["creator"] = "NXWriter"
+        entry = f.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.attrs["default"] = "data"
+        entry.create_dataset("start_time", data=b"2026-07-12T00:00:00")
+        entry.create_dataset("end_time", data=b"2026-07-12T00:00:01")
+        data = entry.create_group("data")
+        data.attrs["NX_class"] = "NXdata"
+        data.attrs["signal"] = "gate"
+        data.create_dataset("gate", data=np.array([0.5]))
+        det = data.create_dataset("eiger_image", data=img)
+        det.attrs["signal_type"] = "detector"
+    return img
+
+
+def test_f6_single_exposure_2d_nxs_consumed_by_live_watch(tmp_path):
+    """The watch must read the one frame — the FULL 2-D image, never a row of
+    it — and only then retire the master."""
+    watch = tmp_path / "watch"
+    watch.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
+    p = watch / "single_00001.nxs"
+    img = _write_single_exposure_bluesky(p)
+
+    t = _real_dir_watch_thread(watch, out)
+    item = t._get_next_eiger_frame_sync()
+    assert item[3] is not None, "single 2-D exposure must yield a frame"
+    assert item[1] == "single_00001"
+    assert item[2] == 1
+    frame = np.asarray(item[3])
+    assert frame.shape == img.shape           # the frame, not a (W,) row
+    assert np.array_equal(frame, img)
+
+    item = t._get_next_eiger_frame_sync()
+    assert item[3] is None                    # exactly one frame, then done
+    assert str(p) in t._eiger_done_masters
+
+
 # ===========================================================================
 # Real-file assertions (shipped Pt_10nm_00013.nxs; skip without test data)
 # ===========================================================================

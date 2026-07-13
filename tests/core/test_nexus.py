@@ -13,6 +13,7 @@ from xrd_tools.io.nexus import (
     _require_uniform_axes_1d,
     _require_uniform_axes_2d,
     find_nexus_image_dataset,
+    find_nexus_image_dataset_in_open_file,
     list_entries,
     open_nexus_image_stack,
     open_nexus_writer,
@@ -405,6 +406,120 @@ class TestNexusImageStack:
             out = stack[5:5]
             assert out.shape == (0,) + stack.shape[1:]
 
+    def test_single_2d_detector_frame_is_a_one_frame_stack(self, tmp_path):
+        """F6 (Codex review): a lone 2-D detector dataset (one-exposure
+        acquisition) must open as a logical (1, H, W) stack — the classifier
+        and display reader already accept ndim >= 2; this used to raise
+        '... is 2-D; NexusImageStack expects 3-D'."""
+        img = np.arange(63, dtype=np.uint32).reshape(7, 9)
+        p = tmp_path / "single.nxs"
+        with h5py.File(p, "w") as f:
+            e = f.create_group("entry")
+            e.attrs["NX_class"] = "NXentry"
+            d = e.create_group("data")
+            d.attrs["NX_class"] = "NXdata"
+            d.create_dataset("data", data=img)
+        with open_nexus_image_stack(p) as stack:
+            assert stack.shape == (1, 7, 9)
+            assert stack.ndim == 3
+            assert len(stack) == 1
+            assert np.array_equal(np.asarray(stack[0]), img)
+            assert np.array_equal(np.asarray(stack[-1]), img)
+            with pytest.raises(IndexError):
+                stack[1]
+            block = np.asarray(stack[0:1])
+            assert block.shape == (1, 7, 9)
+            assert np.array_equal(block[0], img)
+            assert stack[1:1].shape == (0, 7, 9)
+            frames = [np.asarray(fr) for fr in stack]
+            assert len(frames) == 1
+            assert np.array_equal(frames[0], img)
+
+    def test_2d_table_never_shadows_a_real_3d_stack(self, tmp_path):
+        """wf_3614041c P2 (review-caught regression): a lone 2-D NON-image
+        dataset at a canonical location (an MCA/spectra table at
+        entry/data/data) must never shadow a real 3-D detector stack found by a
+        later arm — 3-D keeps its full pre-F6 precedence; 2-D acceptance is a
+        LAST resort."""
+        p = tmp_path / "mixed.nxs"
+        with h5py.File(p, "w") as f:
+            e = f.create_group("entry")
+            # 2-D spectra table at the canonical /data/data location…
+            e.create_group("data").create_dataset(
+                "data", data=np.zeros((50, 1024), dtype=np.float32))
+            # …and the REAL detector stack under instrument/<sub>/data.
+            e.create_group("instrument").create_group("pilatus").create_dataset(
+                "data", data=np.zeros((5, 10, 12), dtype=np.uint16))
+        assert find_nexus_image_dataset(p) == "/entry/instrument/pilatus/data"
+        with open_nexus_image_stack(p) as stack:
+            assert stack.shape == (5, 10, 12)
+
+    def test_2d_at_each_canonical_location_resolves_when_alone(self, tmp_path):
+        """The 2-D last-resort pass covers ALL canonical arms (review
+        test-integrity finding: instrument/detector/data and
+        instrument/<sub>/data were untested — a targeted revert passed the
+        suite)."""
+        for loc in ("instrument/detector", "data", "instrument/pilatus"):
+            p = tmp_path / f"single_{loc.replace('/', '_')}.nxs"
+            with h5py.File(p, "w") as f:
+                grp = f.create_group("entry")
+                for part in loc.split("/"):
+                    grp = grp.create_group(part)
+                grp.create_dataset(
+                    "data", data=np.arange(12, dtype=np.uint16).reshape(3, 4))
+            assert find_nexus_image_dataset(p) == f"/entry/{loc}/data", loc
+            with open_nexus_image_stack(p) as stack:
+                assert stack.shape == (1, 3, 4), loc
+
+    def test_path_and_open_file_finder_variants_agree(self, tmp_path):
+        """The two finder variants drifted once (wf_3614041c P2: only the
+        open-file variant learned the single-2-D-frame acceptance, so the live
+        watch dropped files the headless seam opened fine).  The path variant
+        now DELEGATES — pin agreement across layouts so they cannot fork
+        again."""
+        def _flag_detector(ds):
+            ds.attrs["signal_type"] = "detector"
+            return ds
+
+        layouts = {
+            "canon3d.nxs": lambda e: e.create_group("instrument")
+            .create_group("detector")
+            .create_dataset("data", data=np.zeros((4, 5, 6), dtype=np.uint16)),
+            "canon2d.nxs": lambda e: e.create_group("data")
+            .create_dataset("data", data=np.zeros((5, 6), dtype=np.uint16)),
+            "bluesky2d.nxs": lambda e: _flag_detector(
+                e.create_group("data")
+                .create_dataset("eiger_image", data=np.zeros((5, 6), dtype=np.uint16))),
+            "largest3d.nxs": lambda e: e.create_group("misc")
+            .create_dataset("stack", data=np.zeros((3, 5, 6), dtype=np.uint16)),
+            "none.nxs": lambda e: e.create_dataset("scalar", data=1.0),
+        }
+
+        for name, build in layouts.items():
+            p = tmp_path / name
+            with h5py.File(p, "w") as f:
+                build(f.create_group("entry"))
+            via_path = find_nexus_image_dataset(p)
+            with h5py.File(p, "r") as f:
+                via_open = find_nexus_image_dataset_in_open_file(f, "entry")
+            assert via_path == via_open, (name, via_path, via_open)
+
+    def test_multi_segment_2d_still_rejected(self, tmp_path):
+        """The (1, H, W) normalization is single-dataset only — a 2-D dataset
+        among Eiger external-link segments remains a hard error."""
+        a = tmp_path / "a.h5"
+        b = tmp_path / "b.h5"
+        for path in (a, b):
+            with h5py.File(path, "w") as f:
+                f.create_dataset("data", data=np.zeros((10, 10), dtype=np.uint16))
+        master = tmp_path / "master.h5"
+        with h5py.File(master, "w") as mf:
+            d = mf.create_group("entry").create_group("data")
+            d["data_000001"] = h5py.ExternalLink(a.name, "/data")
+            d["data_000002"] = h5py.ExternalLink(b.name, "/data")
+        with pytest.raises(ValueError, match="expects 3-D"):
+            open_nexus_image_stack(master)
+
     def test_inconsistent_per_frame_shapes_raise(self, tmp_path):
         """Mismatched (H, W) across segments must be rejected."""
         # Two data files: one (4, 10, 10), the other (4, 12, 10).
@@ -455,7 +570,9 @@ class TestNexusImageStack:
         with h5py.File(p, "w") as f:
             e = f.create_group("entry")
             e.create_dataset("scalar", data=1.0)
-        with pytest.raises(KeyError, match="No 3-D image dataset"):
+        # (message wording updated with F6: 2-D single frames now count, so the
+        # error no longer claims a "3-D" requirement)
+        with pytest.raises(KeyError, match="No image dataset"):
             open_nexus_image_stack(p)
 
 

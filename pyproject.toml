@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xdart"
-version = "1.1.0"
+version = "1.1.1"
 description = "SSRL X-ray diffraction toolkit: headless reduction core (xrd_tools) + Qt GUI (xdart)"
 readme = "README.md"
 # SPDX expression (PEP 639): first-party code is MIT (see LICENSE); the
@@ -126,6 +126,27 @@ platforms = ["osx-arm64", "linux-64"]
 
 [tool.pixi.dependencies]
 python = "3.13.*"
+# Conda-forge NATIVE builds for the hot Eiger decode/reduce chain — the PyPI
+# wheels for these are measurably slower on macOS arm64 (isolated fabio decode
+# benchmark 2026-07-12: 29.8 ms/frame from wheels vs 19.4 from conda-forge —
+# the whole pixi-vs-xrd_test perf gap).  pixi maps these conda packages to
+# their PyPI names, so the editable install below sees its requirements as
+# already satisfied and does NOT re-install wheel copies.
+numpy = "*"
+h5py = "*"
+hdf5plugin = "*"
+fabio = "*"
+pyfai = ">=2025.3,<2025.12"
+silx = "*"
+# The Qt binding must come from the SAME provenance as the natives above: the
+# PySide6 wheel SIGABRTs when loaded into a process already holding
+# conda-forge libs (caught by pytest tests/core after the switch — pyFAI's
+# import chain reaches PySide6.QtCore).
+pyside6 = "*"
+# Same rule for xrayutilities: its wheel bundles a second OpenMP runtime,
+# which aborts the process once conda-forge llvm-openmp is already loaded
+# (caught by test_circle_angles' pixel_q -> xrayutilities.area call).
+xrayutilities = "*"
 
 [tool.pixi.pypi-dependencies]
 xdart = { path = ".", editable = true, extras = ["gui", "dev"] }

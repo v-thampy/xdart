@@ -138,3 +138,47 @@ def test_guess_source_kind_bluesky_nxs_is_a_nexus_stack():
     assert guess_source_kind(_REAL) is SourceKind.NEXUS_STACK
     src = open_source(SourceSpec(_REAL, SourceKind.NEXUS_STACK, entry="entry"))
     assert len(list(src.frame_indices)) == 3
+
+
+# ---- F6 (Codex review 2026-07-11): single-frame 2-D detector dataset -------
+
+def test_open_source_single_frame_2d_detector_nxs(tmp_path):
+    """A .nxs whose only image dataset is a single 2-D detector frame (the
+    Bluesky/NXWriter one-exposure convention: NXdata @signal is a scalar
+    counter, pixels flagged @signal_type='detector') must open through the
+    headless seam as a one-frame source — classify_image_source and read_image
+    already accepted it (ndim >= 2), but open_source used to raise
+    ValueError('... is 2-D; NexusImageStack expects 3-D')."""
+    import h5py
+
+    from xrd_tools.io import ImageSourceKind, classify_image_source
+
+    H, W = 7, 9
+    img = np.arange(H * W, dtype=np.uint32).reshape(H, W)
+    p = tmp_path / "single_00001.nxs"
+    with h5py.File(p, "w") as f:
+        entry = f.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.attrs["default"] = "data"
+        data = entry.create_group("data")
+        data.attrs["NX_class"] = "NXdata"
+        data.attrs["signal"] = "gate"          # scalar counter is the @signal
+        data.create_dataset("gate", data=np.array([0.5]))
+        det = data.create_dataset("eiger_image", data=img)
+        det.attrs["signal_type"] = "detector"
+
+    # The display classifier accepts this file as a one-frame RAW_MASTER…
+    info = classify_image_source(p)
+    assert info.kind is ImageSourceKind.RAW_MASTER
+    assert info.frame_labels == (0,)
+
+    # …and the headless FrameSource contract must agree with it.
+    src = open_source(SourceSpec(p, SourceKind.NEXUS_STACK, entry="entry"))
+    assert list(src.frame_indices) == [0]
+    frame = src.load_frame(0)
+    assert frame.shape == (H, W)
+    assert np.array_equal(frame, img)
+    (block, labels), = list(src.iter_chunks(8))
+    assert block.shape == (1, H, W)
+    assert list(labels) == [0]
+    assert np.array_equal(block[0], img)

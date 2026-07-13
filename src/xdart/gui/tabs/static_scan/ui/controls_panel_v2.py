@@ -1416,8 +1416,12 @@ class ControlsPanelV2(QtWidgets.QWidget):
         profile: ControlProfile,
         fields: tuple[ControlFormField, ...],
     ) -> None:
+        # Advanced (parameter_group-backed) fields are NOT rendered inline:
+        # the "Advanced" button on the Reintegrate row opens the
+        # "Integration — Advanced Settings" dialog, the SINGLE editing surface
+        # for the bai_1d/2d parameter trees (maintainer decision 2026-07-12 —
+        # the collapsed sub-panel duplicated that dialog field-for-field).
         inline_fields = [field for field in fields if not field.parameter_group]
-        advanced_fields = [field for field in fields if field.parameter_group]
         groups: dict[str, list[ControlFormField]] = {
             "1-D": [],
             "2-D": [],
@@ -1437,16 +1441,6 @@ class ControlsPanelV2(QtWidgets.QWidget):
             sub = SubsectionCard(name, accent="processing",
                                  status=self._group_status(group_fields))
             self._render_processing_group_rows(sub, group_fields)
-            self.processing_card.add_row(sub)
-
-        if advanced_fields:
-            sub = SubsectionCard(
-                "Advanced",
-                accent="processing",
-                status=self._group_status(advanced_fields),
-            )
-            self._render_processing_group_rows(sub, advanced_fields)
-            sub.set_collapsed(True)
             self.processing_card.add_row(sub)
 
         self._add_actions(

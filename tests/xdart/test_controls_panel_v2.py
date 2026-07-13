@@ -372,7 +372,13 @@ def test_controls_panel_v2_int_inventory_includes_units_and_advanced_rows():
         assert specs[path].parameter_group == expected_group
 
 
-def test_controls_panel_v2_int_advanced_rows_are_collapsed(qapp, monkeypatch):
+def test_controls_panel_v2_advanced_rows_not_rendered_inline(qapp, monkeypatch):
+    """The Advanced (parameter_group-backed) params have ONE editing surface:
+    the "Advanced" button on the Reintegrate row → the "Integration — Advanced
+    Settings" dialog.  The old collapsed "Advanced" sub-panel duplicated that
+    dialog field-for-field (maintainer decision 2026-07-12: removed) — no
+    Advanced subsection renders, no advanced path leaks into the inline
+    groups, and the button remains."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -401,13 +407,12 @@ def test_controls_panel_v2_int_advanced_rows_are_collapsed(qapp, monkeypatch):
         widget._refresh_controls_v2_profile_now()
 
         sections = _subsections(widget)
-        assert {"1-D", "2-D", "Advanced"} <= set(sections)
-        assert sections["Advanced"]._collapsed is True
-        assert sections["Advanced"].body.isVisible() is False
+        assert {"1-D", "2-D"} <= set(sections)
+        assert "Advanced" not in sections
 
         one_d_paths = _paths(sections["1-D"])
         two_d_paths = _paths(sections["2-D"])
-        advanced_paths = _paths(sections["Advanced"])
+        all_rendered = set().union(*(_paths(sub) for sub in sections.values()))
 
         assert {
             ("Int1D", "axis"),
@@ -431,19 +436,37 @@ def test_controls_panel_v2_int_advanced_rows_are_collapsed(qapp, monkeypatch):
             ("Int2D", "azim_high"),
         } <= two_d_paths
 
-        moved_paths = {
+        # Dialog-only params never render inline anywhere in the panel.
+        advanced_only_paths = {
             ("Int1D", "unit"),
             ("Int2D", "unit"),
             ("Int1D", "method"),
             ("Int2D", "method"),
             ("Int1D", "correctSolidAngle"),
             ("Int2D", "correctSolidAngle"),
+            ("Int1D", "apply_polarization"),
+            ("Int2D", "apply_polarization"),
+            ("Int1D", "polarization_factor"),
+            ("Int2D", "polarization_factor"),
+            ("Int1D", "dummy"),
+            ("Int2D", "dummy"),
+            ("Int1D", "delta_dummy"),
+            ("Int2D", "delta_dummy"),
+            ("Int1D", "chi_offset"),
+            ("Int2D", "chi_offset"),
             ("Int1D", "safe"),
             ("Int2D", "safe"),
         }
-        assert not (moved_paths & one_d_paths)
-        assert not (moved_paths & two_d_paths)
-        assert moved_paths <= advanced_paths
+        assert not (advanced_only_paths & all_rendered)
+
+        # The dialog entry point survives: the Advanced action button is still
+        # on the Reintegrate row.
+        action_labels = {
+            btn.text()
+            for btn in widget.controls_v2.processing_card.body.findChildren(
+                QtWidgets.QPushButton)
+        }
+        assert "Advanced" in action_labels
     finally:
         widget.close()
         widget.deleteLater()
@@ -1330,6 +1353,50 @@ def test_controls_panel_v2_gi_motor_never_shows_phantom_th(qapp, monkeypatch):
         widget.integratorTree.set_gi_motor_options(["th", "eta", "i0"])
         choices = widget._controls_v2_native_int_choices().get(("GI", "th_motor"), ())
         assert "th" in choices
+    finally:
+        _reset_controls_v2_gi(widget)
+        widget.close()
+        widget.deleteLater()
+
+
+def test_gi_enable_repicks_default_over_leftover_manual(qapp, monkeypatch):
+    """Live-found 2026-07-12 (LaB6, halpha listed but Manual selected): session
+    restore writes the θ-motor VALUE programmatically without ever running
+    set_gi_motor_options, so the default policy never fired — and enabling
+    Grazing didn't re-evaluate it.  Enabling GI must apply the shared policy
+    over the current choices when 'Manual' is a leftover; a DELIBERATE user
+    Manual stays sticky."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        it = widget.integratorTree
+        it.set_gi_motor_options(["halpha", "detx", "dety", "hx"])
+        # _load_from_session's exact write: programmatic index set, no user pick.
+        it.ui.gi_motor.setCurrentIndex(it.ui.gi_motor.findText("Manual"))
+        widget.scan.incidence_motor = "0.1"   # stale numeric-theta carry
+        widget.scan.gi_config = {}
+
+        # The V2 Grazing pill: cfg, scan AND the integrator combo all re-pick.
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        cfg = widget._controls_v2_gi_config()
+        assert cfg["incidence_motor"] == "halpha"
+        assert widget.scan.gi_config["incidence_motor"] == "halpha"
+        assert it.ui.gi_motor.currentText() == "halpha"  # surfaces stay equal
+
+        # The integrator checkbox path in isolation re-picks too.
+        it.ui.gi_enable.setChecked(False)
+        it.ui.gi_motor.setCurrentIndex(it.ui.gi_motor.findText("Manual"))
+        it.ui.gi_enable.setChecked(True)
+        assert it.ui.gi_motor.currentText() == "halpha"
+
+        # A DELIBERATE user Manual survives the toggle (F3 sticky rule).
+        it.ui.gi_enable.setChecked(False)
+        it.ui.gi_motor.setCurrentIndex(it.ui.gi_motor.findText("Manual"))
+        it._on_gi_motor_user_pick()
+        it.ui.gi_enable.setChecked(True)
+        assert it.ui.gi_motor.currentText() == "Manual"
     finally:
         _reset_controls_v2_gi(widget)
         widget.close()

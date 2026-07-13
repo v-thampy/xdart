@@ -47,6 +47,7 @@ def test_eiger_metadata_is_cached_per_master(monkeypatch, tmp_path):
 def test_sync_eiger_read_keeps_native_dataset_dtype(tmp_path):
     class FakeDataset:
         shape = (1, 2, 2)
+        ndim = 3     # a real h5py.Dataset always carries ndim (F6 2-D branch)
 
         def __getitem__(self, key):
             assert key == 0
@@ -71,6 +72,7 @@ def test_sync_eiger_read_keeps_native_dataset_dtype(tmp_path):
 def test_prefetch_bulk_read_keeps_native_dataset_dtype(tmp_path):
     class FakeDataset:
         shape = (3, 2, 2)
+        ndim = 3     # a real h5py.Dataset always carries ndim (F6 2-D branch)
 
         def __getitem__(self, key):
             if isinstance(key, slice):

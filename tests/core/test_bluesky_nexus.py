@@ -171,6 +171,88 @@ def test_is_bluesky_nxwriter_false_when_xdart_schema(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# F7a (Codex review 2026-07-11): metadata_for must be O(1) per frame
+# ---------------------------------------------------------------------------
+
+def test_f7a_metadata_for_parity_and_bounds(tmp_path):
+    """The O(1) positional lookup must agree with the per-frame table for every
+    label, return {} out of range, and NEVER python-wrap a negative index onto
+    the last frame's row (wrong metadata would be silent sci-corruption)."""
+    p = _write_bluesky_nxwriter(tmp_path / "par_00001.nxs")
+    src = NexusStackSource(p)
+    with h5py.File(p, "r") as f:
+        i0 = np.asarray(f["entry/data/i0"])
+        pd_col = np.asarray(f["entry/data/pd"])
+    for i in range(NFRAMES):
+        md = src.metadata_for(i)
+        assert md["i0"] == pytest.approx(float(i0[i]))
+        assert md["pd"] == pytest.approx(float(pd_col[i]))
+    assert src.metadata_for(NFRAMES) == {}
+    assert src.metadata_for(NFRAMES + 100) == {}
+    assert src.metadata_for(-1) == {}      # no negative wrap onto frame n-1
+
+
+def test_f7a_metadata_for_sweep_scales_linearly(tmp_path):
+    """Machine-independent perf bar: 4x the frames must cost ~4x the sweep, not
+    ~16x — the old list.index-per-frame O(n²) fails this (measured 6k→24k ratio
+    ≈ 14–16 unfixed vs ≈ 4 fixed)."""
+    import time
+
+    small = NexusStackSource(
+        _write_bluesky_nxwriter(tmp_path / "small_00001.nxs", n=6000))
+    big = NexusStackSource(
+        _write_bluesky_nxwriter(tmp_path / "big_00001.nxs", n=24000))
+
+    def sweep_seconds(src):
+        idxs = list(src.frame_indices)
+        src.metadata_for(0)              # hydrate the Bluesky column cache
+        t0 = time.perf_counter()
+        for i in idxs:
+            src.metadata_for(i)
+        return time.perf_counter() - t0
+
+    ratios = []
+    for _ in range(2):                   # one retry absorbs a timing hiccup
+        t_small = sweep_seconds(small)
+        t_big = sweep_seconds(big)
+        ratios.append(t_big / max(t_small, 1e-6))
+        if ratios[-1] < 8:
+            break
+    assert min(ratios) < 8, f"sweep no longer linear: ratios={ratios}"
+
+
+def test_is_unfinalized_nxwriter_lifecycle(tmp_path):
+    """F5: an NXWriter container without ``entry/end_time`` is mid-run (defer);
+    stamping ``end_time`` finalizes it."""
+    from xrd_tools.io.bluesky_nexus import is_unfinalized_nxwriter
+
+    p = _write_bluesky_nxwriter(tmp_path / "run_00001.nxs")
+    assert is_unfinalized_nxwriter(p) is False        # finalized fixture
+    with h5py.File(p, "r+") as f:
+        del f["entry/end_time"]
+    assert is_unfinalized_nxwriter(p) is True         # mid-run
+    with h5py.File(p, "r+") as f:
+        f["entry"].create_dataset("end_time", data=b"2026-07-12T00:01:00")
+    assert is_unfinalized_nxwriter(p) is False        # run closed
+
+
+def test_is_unfinalized_nxwriter_never_defers_plain(plain_nexus_file):
+    """A non-Bluesky container has no end_time contract — never deferred."""
+    from xrd_tools.io.bluesky_nexus import is_unfinalized_nxwriter
+
+    assert is_unfinalized_nxwriter(plain_nexus_file) is False
+
+
+def test_is_unfinalized_nxwriter_defers_unreadable(tmp_path):
+    """A half-written/torn HDF5 (h5py cannot open it) is mid-write — defer."""
+    from xrd_tools.io.bluesky_nexus import is_unfinalized_nxwriter
+
+    torn = tmp_path / "torn_00001.nxs"
+    torn.write_bytes(b"\x89HDF\r\n partial garbage")
+    assert is_unfinalized_nxwriter(torn) is True
+
+
+# ---------------------------------------------------------------------------
 # motors / counters / wavelength via read_nexus
 # ---------------------------------------------------------------------------
 

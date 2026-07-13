@@ -338,21 +338,17 @@ def scanlocked(func):
 def _scan_key_from_source(src):
     """Derive the wrangler's scan name from a frame's ``source_file``.
 
-    Matches ``image_wrangler_thread``'s own naming EXACTLY so the GUI can attribute
-    each frame to its scan without the mis-timed ``new_scan`` signal: strip a
-    trailing ``_master`` (Eiger HDF5), else fall back to ``_get_scan_info`` (which
-    strips a trailing ``_<digits>`` from the stem — the per-file series case).
-    Returns ``None`` for an empty/missing source (treated as "no scan change").
-    Pure string parse (no I/O) — safe to call per frame on the GUI thread.
+    Delegates to the ONE canonical ``scan_name_from_source`` (Codex F2) so the GUI
+    attributes each frame to EXACTLY the scan the worker wrote — including keeping
+    the FULL stem for a container ``.nxs``/``.h5``/``.hdf5`` (the numeric suffix is
+    part of the identity; dropping it garbled the plot title / legend and merged
+    distinct numeric ``.nxs`` scans).  Returns ``None`` for an empty/missing source
+    (treated as "no scan change").  Pure string parse, no I/O.
     """
     if not src:
         return None
-    from pathlib import Path
-    stem = Path(src).stem
-    if stem.endswith("_master"):
-        return stem[:-7]
-    from .wranglers.image_wrangler_thread import _get_scan_info
-    return _get_scan_info(src)[0] or None
+    from .wranglers.image_wrangler_thread import scan_name_from_source
+    return scan_name_from_source(src) or None
 
 
 def _drop_output_axis_ranges(args):
@@ -1264,6 +1260,26 @@ class staticWidget(QWidget):
         cfg = self._controls_v2_gi_config()
         if leaf == "Grazing":
             cfg["gi"] = self._controls_v2_bool(value)
+            # Live-found 2026-07-12 (LaB6, halpha in the list but Manual
+            # selected): enabling GI with NO saved gi_config means this
+            # 'Manual' is a LEFTOVER — a session-restored default or the
+            # scan-carried numeric theta — not a deliberate choice.  Apply the
+            # shared default policy so a present preference motor
+            # (th/halpha/…) wins.  A real saved gi_config (deliberate Manual
+            # + its theta) is honored untouched.
+            if (cfg["gi"] and cfg["incidence_motor"] == "Manual"
+                    and not dict(getattr(scan, "gi_config", {}) or {})):
+                picked = self._controls_v2_default_gi_motor()
+                if picked != "Manual":
+                    cfg["incidence_motor"] = picked
+                    # Keep the integrator combo equal (the two θ-motor
+                    # surfaces must never disagree — CLAUDE.md GI rule).
+                    it = getattr(self, "integratorTree", None)
+                    combo = getattr(getattr(it, "ui", None), "gi_motor", None)
+                    if combo is not None:
+                        idx = combo.findText(picked)
+                        if idx >= 0:
+                            combo.setCurrentIndex(idx)
         elif leaf == "th_motor":
             cfg["incidence_motor"] = str(value)
         elif leaf == "th_val":

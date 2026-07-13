@@ -109,9 +109,13 @@ class NexusStackSource(BaseFrameSource):
         if not cols:
             return {}
         table, motors = cols["table"], cols["motors"]
-        try:
-            pos = self._frame_indices.index(int(index))
-        except ValueError:
+        # F7a: labels are the contiguous ``range(n)`` built in ``__init__``, so
+        # the label IS the table position — O(1).  ``list.index`` was an O(n)
+        # scan per frame, turning the Plot-Metadata all-frames sweep into
+        # O(n²) (~2.5 s at 30k frames).  Bounds-checked, never negative-wrapped:
+        # an out-of-range label returns {} exactly as the old ValueError did.
+        pos = int(index)
+        if not 0 <= pos < len(self._frame_indices):
             return {}
         out: dict[str, Any] = {}
         for name, arr in table.items():

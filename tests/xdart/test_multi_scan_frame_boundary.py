@@ -85,6 +85,36 @@ def test_scan_key_from_source():
     assert _scan_key_from_source(None) is None
 
 
+def test_numeric_nxs_keeps_full_stem_for_titles_and_legends():
+    """F2 (maintainer decision, 2026-07-12): a numeric `.nxs`/`.h5`/`.hdf5`
+    container keeps its FULL stem as the scan identity — the trailing `00005` is
+    part of the name and MUST show in plot titles / legend labels (and must NOT
+    merge two numeric `.nxs` into one scan).  Only Eiger `_master` and per-file
+    image series (`.tif`) drop a suffix."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
+        scan_name_from_source, imageThread)
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    # The reported case: the numeric suffix survives (was being dropped).
+    assert _scan_key_from_source("/d/LaB6_0710_1025pm_00005.nxs") == "LaB6_0710_1025pm_00005"
+    assert _scan_key_from_source("/d/Pt_10nm_00013.nxs") == "Pt_10nm_00013"
+    # ... while series / master / plain still behave:
+    assert scan_name_from_source("/d/foo_0001.tif") == "foo"
+    assert scan_name_from_source("/d/eiger_2_master.h5") == "eiger_2"
+    assert scan_name_from_source("/d/LaB6.nxs") == "LaB6"
+
+    # PARITY GUARD: the worker, the GUI boundary parser, and the append-target
+    # resolver must derive the SAME name for every source, so titles/legends,
+    # written filenames, overlays and run-end catch-up never disagree (the
+    # three-way divergence F2 fixed).
+    for path in ("LaB6_0710_1025pm_00005.nxs", "Pt_10nm_00013.nxs",
+                 "x_00013.h5", "x_00013_master.h5", "foo_0001.tif", "LaB6.nxs"):
+        canonical = scan_name_from_source(path)
+        assert _scan_key_from_source(path) == canonical, path
+        assert imageWrangler._append_scan_name_for_source(path) == canonical, path
+        assert imageThread._eiger_scan_name(path) == canonical, path
+
+
 def test_frame_driven_boundary_survives_late_new_scan():
     host, scan = _boundary_host()
     # scanA frames 1..3 (name already scanA -> no rescope, just append)
