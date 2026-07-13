@@ -4333,3 +4333,52 @@ def test_controls_panel_v2_static_widget_routes_actions(qapp, monkeypatch):
     finally:
         widget.close()
         widget.deleteLater()
+
+
+# ── SW-7 (§10): wrangler swap resyncs the θ-motor choices to the owner ─────
+
+
+def test_wrangler_swap_resyncs_gi_motor_choices_sw7(qapp, monkeypatch):
+    """SW-7 GUARD (§10 fork class): the θ-motor CHOICES list is owned by the
+    ACTIVE wrangler's motor discovery; the integrator combo (and the V2
+    dropdown reading it) is a mirror.  The regression: after a wrangler swap
+    the stale non-Manual combo list WON over the new wrangler's already-
+    discovered motors (the `_gi_motor_choices` fallback only engaged on a
+    Manual-only combo), so the V2 dropdown kept offering the previous source's
+    motor names until the next discovery emit happened to fire."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        integrator = widget.integratorTree
+        # The previous source's discovery left ITS motors in the combo (this is
+        # the real handshake target the wrangler signal drives).
+        integrator.set_gi_motor_options(["old_th", "detx"])
+        stale = widget._controls_v2_native_int_choices()[("GI", "th_motor")]
+        assert "old_th" in stale
+
+        # The image wrangler has already discovered its own motors; swapping to
+        # it must re-announce them over the stale list through the production
+        # sigGIMotorOptions path.
+        wr = widget.ui.wranglerStack.widget(0)
+        wr.motors = ["halpha", "hy"]
+        widget.set_wrangler(0)
+        choices = widget._controls_v2_native_int_choices()[("GI", "th_motor")]
+        assert "old_th" not in choices, (
+            f"stale previous-source motors survived the wrangler swap: {choices}")
+        assert "halpha" in choices and "Manual" in choices
+        items = [integrator.ui.gi_motor.itemText(i)
+                 for i in range(integrator.ui.gi_motor.count())]
+        assert items == ["Manual", "halpha", "hy"]
+
+        # An EMPTY discovery must not wipe: session-restored choices stay until
+        # this wrangler's own discovery fires.
+        wr.motors = []
+        integrator.set_gi_motor_options(["restored_th"])
+        widget.set_wrangler(0)
+        keep = widget._controls_v2_native_int_choices()[("GI", "th_motor")]
+        assert "restored_th" in keep
+    finally:
+        widget.close()
+        widget.deleteLater()
