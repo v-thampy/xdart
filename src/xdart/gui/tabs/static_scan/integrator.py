@@ -967,8 +967,12 @@ class integratorTree(QtWidgets.QWidget):
                 elif key == 'npt_azim':
                     self._set_npts_azim_2D()
                 elif key == 'polarization_factor':
+                    # None means "no polarization correction" everywhere else
+                    # (_params_to_args unchecked→None; Controls V2 derives
+                    # apply from value-is-not-None), so the checkbox must
+                    # render None as unchecked — args are the one owner.
                     if val is None:
-                        tree.child('Apply polarization factor').setValue(True)
+                        tree.child('Apply polarization factor').setValue(False)
                     else:
                         tree.child('Apply polarization factor').setValue(True)
                         tree.child(key).setValue(val)
