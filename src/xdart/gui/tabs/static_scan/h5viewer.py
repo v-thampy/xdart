@@ -663,6 +663,28 @@ class H5Viewer(QWidget):
         """
         self.update_scans()
 
+    @staticmethod
+    def _truncate_path_label(path, max_len: int = 40) -> str:
+        """Middle-truncate *path* for the Scans header (maintainer spec
+        2026-07-12): beyond *max_len* chars show the first 7, an ellipsis,
+        and the last 30 — the tail (the informative part of a beamline data
+        path) stays readable."""
+        p = str(path or "")
+        if len(p) <= max_len:
+            return p
+        return p[:7] + "…" + p[-30:]
+
+    def _update_scans_header(self) -> None:
+        """Show the browsed directory next to the 'Scans' header label,
+        middle-truncated; the FULL path rides on the tooltip."""
+        label = getattr(self.ui, "label_3", None)
+        if label is None:
+            return
+        full = str(self.dirname or "")
+        shown = self._truncate_path_label(full)
+        label.setText(f"  Scans  [{shown}]" if shown else "  Scans")
+        label.setToolTip(full)
+
     def _init_toolbar(self):
         """Create toolbar with File and Config menus."""
         self.toolbar = QtWidgets.QToolBar('Tools')
@@ -940,6 +962,10 @@ class H5Viewer(QWidget):
         In xye viewer mode, shows xye files and directories.
         In nexus viewer mode, shows HDF5/NeXus files and directories.
         """
+        # Always reflect the browsed directory in the header, even when the
+        # path has vanished (network share dropped) — the user can still see
+        # WHERE the panel is pointed (maintainer request 2026-07-12).
+        self._update_scans_header()
         if not os.path.exists(self.dirname):
             return
 

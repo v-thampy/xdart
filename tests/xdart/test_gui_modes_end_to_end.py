@@ -3960,3 +3960,32 @@ def test_gi_mode_blocks_stitch_with_message(widget):
     w.scan.gi = False
     w.start_stitch('1d')
     assert started, "stitch should start when GI is off"
+
+
+# ---------------------------------------------------------------------------
+# Scans-header path display (maintainer request 2026-07-12)
+# ---------------------------------------------------------------------------
+
+def test_scans_header_shows_browsed_path(widget, tmp_path):
+    """The Scans header shows WHERE the panel is pointed: the full path when
+    short, first-7 + ellipsis + last-30 beyond 40 chars, and the full path
+    always on the tooltip — including for a vanished directory (dropped
+    network share)."""
+    v = widget.h5viewer
+    label = v.ui.label_3
+
+    # Short path (may not exist — the header must still reflect it).
+    v.dirname = "/data/scan_test"
+    v.update_scans()
+    assert label.text() == "  Scans  [/data/scan_test]"
+    assert label.toolTip() == "/data/scan_test"
+
+    # Long existing path -> middle truncation, full path on the tooltip.
+    long_dir = tmp_path / ("a" * 60)
+    long_dir.mkdir()
+    v.dirname = str(long_dir)
+    v.update_scans()
+    p = str(long_dir)
+    assert label.text() == f"  Scans  [{p[:7]}…{p[-30:]}]"
+    assert len(f"{p[:7]}…{p[-30:]}") <= 40
+    assert label.toolTip() == p
