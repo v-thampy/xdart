@@ -1595,6 +1595,15 @@ class staticWidget(QWidget):
                     _drop_output_axis_ranges(a2)
             a1["unit"] = "q_A^-1"
             a2["unit"] = "q_A^-1"
+            # §10/SW-8: gi_mode lives authoritatively in bai_*_args; the
+            # scan-carried gi_config COPY (persisted, pushed to the wrangler,
+            # and fed verbatim into written provenance by
+            # build_reduction_config) must not lag an Axis edit — the only
+            # gi_mode edit path that does not re-stamp gi_config.
+            gic = getattr(scan, "gi_config", None)
+            if gic:
+                gic["gi_mode_1d"] = str(a1.get("gi_mode_1d", "q_total"))
+                gic["gi_mode_2d"] = str(a2.get("gi_mode_2d", "qip_qoop"))
             return
         if root == "Int1D":
             old_unit = a1.get("unit")

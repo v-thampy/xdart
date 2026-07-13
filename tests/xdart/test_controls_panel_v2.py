@@ -4382,3 +4382,44 @@ def test_wrangler_swap_resyncs_gi_motor_choices_sw7(qapp, monkeypatch):
     finally:
         widget.close()
         widget.deleteLater()
+
+
+# ── SW-8 (§10): Axis edits keep the gi_config mode copy in sync ─────────────
+
+
+def test_axis_edit_keeps_gi_config_mode_in_sync_sw8(qapp, monkeypatch):
+    """SW-8 GUARD (§10 fork class): gi_mode lives authoritatively in
+    ``scan.bai_*_args``; ``scan.gi_config`` carries a persisted COPY that
+    ``build_reduction_config`` feeds verbatim into written provenance.  The
+    regression: an Axis edit updated the authority but never re-stamped the
+    copy — the ONLY gi_mode edit path that didn't — so recorded provenance
+    (and anything reading gi_config's mode) contradicted the args that
+    actually integrate."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.integrator import GI_LABELS_1D, GI_LABELS_2D
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        assert widget.scan.gi_config["gi_mode_1d"] == "q_total"
+
+        widget._on_controls_v2_field_changed(
+            ("Int1D", "axis"), GI_LABELS_1D[1])          # Qip -> q_ip
+        widget._on_controls_v2_field_changed(
+            ("Int2D", "axis"), GI_LABELS_2D[1])          # Q-χ -> q_chi
+        assert widget.scan.bai_1d_args["gi_mode_1d"] == "q_ip"
+        assert widget.scan.bai_2d_args["gi_mode_2d"] == "q_chi"
+        # The persisted copy followed the authority...
+        assert widget.scan.gi_config["gi_mode_1d"] == "q_ip"
+        assert widget.scan.gi_config["gi_mode_2d"] == "q_chi"
+        # ...and the recorded display provenance cannot contradict itself.
+        cfg = staticWidget._scan_data_reduction_config_snapshot(widget.scan)
+        assert (cfg["gi_config"]["gi_mode_1d"]
+                == cfg["bai_1d_args"]["gi_mode_1d"] == "q_ip")
+        assert (cfg["gi_config"]["gi_mode_2d"]
+                == cfg["bai_2d_args"]["gi_mode_2d"] == "q_chi")
+    finally:
+        _reset_controls_v2_gi(widget)
+        widget.close()
+        widget.deleteLater()

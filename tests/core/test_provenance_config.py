@@ -238,3 +238,24 @@ if forbidden:
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_build_reduction_config_reconciles_gi_mode_with_bai_args() -> None:
+    """SW-8: the scan-carried gi_config copy of gi_mode can lag the
+    ``bai_*_args`` authority (the GUI Axis field edits the args directly);
+    the built config must never contradict itself.  Geometry facts that live
+    only in gi_config are untouched."""
+    scan = SimpleNamespace(
+        bai_1d_args={"unit": "q_A^-1", "gi_mode_1d": "q_ip"},
+        bai_2d_args={"npt_rad": 500, "gi_mode_2d": "q_chi"},
+        gi=True,
+        gi_config={"gi_mode_1d": "q_total", "gi_mode_2d": "qip_qoop",
+                   "incidence_motor": "th", "th_val": 0.12},
+    )
+
+    config, _inputs = build_reduction_config(scan, include_inputs=False)
+
+    assert config["gi_config"]["gi_mode_1d"] == "q_ip"
+    assert config["gi_config"]["gi_mode_2d"] == "q_chi"
+    assert config["gi_config"]["incidence_motor"] == "th"
+    assert config["gi_config"]["th_val"] == 0.12
