@@ -1359,6 +1359,97 @@ def test_controls_panel_v2_gi_motor_never_shows_phantom_th(qapp, monkeypatch):
         widget.deleteLater()
 
 
+def test_dir_container_count_sweeps_off_the_gui_thread(qapp, monkeypatch, tmp_path):
+    """bl17-2 live-found (2026-07-12): directory mode + nxs swept count_frames
+    over EVERY container synchronously on the GUI thread (~0.7 s/file over the
+    beamline share -> minutes-long freeze, re-run whenever the directory
+    changed).  Large directories must sweep on a worker: the GUI-thread call
+    returns immediately, the real total lands via the queued signal, and a
+    live-growing directory only re-counts files that actually CHANGED."""
+    import threading as _threading
+    import time as _time
+
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter
+    from xrd_tools.io import image as image_io
+
+    d = tmp_path / "watch"
+    d.mkdir()
+    n_files = 12          # > _V2_DIR_COUNT_SYNC_MAX
+    for i in range(n_files):
+        _write_bluesky_nxwriter(d / f"scan_{i:05d}.nxs", n=2)
+
+    calls = []            # (thread_ident, path) — observation only, real fn runs
+    real_count = image_io.count_frames
+    monkeypatch.setattr(
+        image_io, "count_frames",
+        lambda path: (calls.append((_threading.get_ident(), str(path))),
+                      real_count(path))[1])
+
+    widget = staticWidget()
+    try:
+        gui_ident = _threading.get_ident()
+        sig = widget.wrangler.parameters.child("Signal")
+        sig.child("inp_type").setValue("Image Directory")
+        sig.child("img_dir").setValue(str(d))
+        sig.child("img_ext").setValue("nxs")
+
+        def _wait_landed():
+            deadline = _time.monotonic() + 15
+            while widget._v2_dir_count_pending is not None:
+                qapp.processEvents()
+                assert _time.monotonic() < deadline, "async count never landed"
+                _time.sleep(0.01)
+            qapp.processEvents()
+
+        # Phase 1: the count lands correct, and NO file was ever opened on
+        # the GUI thread (param-change handlers may kick the sweep early, so
+        # judge the whole call record rather than a cleared window).
+        widget._controls_v2_source_frame_count()
+        _wait_landed()
+        assert widget._controls_v2_source_frame_count() == 2 * n_files
+        assert calls, "the sweep must actually count files"
+        assert all(c[0] != gui_ident for c in calls)
+
+        # A file arrives (live acquisition): ONLY the new file is counted —
+        # the per-file memo answers for the unchanged ones.
+        _write_bluesky_nxwriter(d / f"scan_{n_files:05d}.nxs", n=5)
+        calls.clear()
+        widget._controls_v2_source_frame_count()
+        _wait_landed()
+        assert widget._controls_v2_source_frame_count() == 2 * n_files + 5
+        assert {c[1] for c in calls} == {str(d / f"scan_{n_files:05d}.nxs")}
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_dir_container_count_small_dir_still_counts_inline(qapp, monkeypatch, tmp_path):
+    """At or under the sync bound the count stays immediate (no worker, no
+    stale 0) — the bounded inline path small local dirs rely on."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter
+
+    d = tmp_path / "small"
+    d.mkdir()
+    for i in range(3):
+        _write_bluesky_nxwriter(d / f"scan_{i:05d}.nxs", n=2)
+
+    widget = staticWidget()
+    try:
+        sig = widget.wrangler.parameters.child("Signal")
+        sig.child("inp_type").setValue("Image Directory")
+        sig.child("img_dir").setValue(str(d))
+        sig.child("img_ext").setValue("nxs")
+        assert widget._controls_v2_source_frame_count() == 6
+        assert widget._v2_dir_count_pending is None
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
 def test_gi_enable_repicks_default_over_leftover_manual(qapp, monkeypatch):
     """Live-found 2026-07-12 (LaB6, halpha listed but Manual selected): session
     restore writes the θ-motor VALUE programmatically without ever running

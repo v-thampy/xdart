@@ -475,8 +475,22 @@ def count_frames(path: Path | str) -> int:
     path = Path(path)
     ext = path.suffix.lower()
     try:
-        if ext in {".h5", ".hdf5", ".nxs"} and not _is_eiger_master(path):
-            # Non-Eiger HDF5 / NeXus — try fabio, fall back to h5py
+        if ext == ".nxs" and not _is_eiger_master(path):
+            # .nxs: h5py FIRST — fabio has no reader for NeXus container
+            # layouts (Bluesky/NXWriter, beamline scan files) and fails
+            # SLOWLY (a full per-format parse attempt, ~0.5 s/file on a
+            # network share — the bl17-2 directory-mode freeze, 2026-07-12),
+            # while the h5py finder answers in milliseconds.  Same rationale
+            # as the wrangler's _eiger_open_master.
+            try:
+                with h5py.File(path, "r") as f:
+                    ds = _find_hdf5_image_dataset(f)
+                    return ds.shape[0] if ds.ndim >= 3 else 1
+            except Exception:
+                with fabio.open(path) as f:
+                    return f.nframes
+        elif ext in {".h5", ".hdf5"} and not _is_eiger_master(path):
+            # Non-Eiger HDF5 — try fabio, fall back to h5py
             try:
                 with fabio.open(path) as f:
                     return f.nframes

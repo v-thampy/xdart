@@ -221,6 +221,22 @@ def test_f7a_metadata_for_sweep_scales_linearly(tmp_path):
     assert min(ratios) < 8, f"sweep no longer linear: ratios={ratios}"
 
 
+def test_count_frames_nxs_resolves_via_h5py_without_fabio(tmp_path, monkeypatch):
+    """bl17-2 freeze (2026-07-12): fabio-first on .nxs failed SLOWLY per file
+    (~0.5 s of parse attempts on a network share, × hundreds of files).  A
+    .nxs must count via h5py without fabio ever being attempted."""
+    from xrd_tools.io import image as image_io
+
+    p = _write_bluesky_nxwriter(tmp_path / "count_00001.nxs")
+    seen = []
+    real_open = image_io.fabio.open
+    monkeypatch.setattr(
+        image_io.fabio, "open",
+        lambda *a, **k: (seen.append(a), real_open(*a, **k))[1])
+    assert image_io.count_frames(p) == NFRAMES
+    assert not seen, "fabio.open must not be attempted for a countable .nxs"
+
+
 def test_is_unfinalized_nxwriter_lifecycle(tmp_path):
     """F5: an NXWriter container without ``entry/end_time`` is mid-run (defer);
     stamping ``end_time`` finalizes it."""
