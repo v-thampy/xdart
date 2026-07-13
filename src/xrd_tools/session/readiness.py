@@ -1599,6 +1599,9 @@ class ControlState:
     processed_config: ProcessingConfigSignature | Mapping[str, Any] | None = None
     current_config: ProcessingConfigSignature | Mapping[str, Any] | None = None
     frame_count: int = 0
+    #: DIR-2: container directories report a FILE count, not frames —
+    #: the summary chip renders 'N files' instead of 'N frames'.
+    frame_count_is_files: bool = False
     processing_mode: str = ""
     real_data_gates: frozenset[str] = field(default_factory=frozenset)
     controls_locked: bool = False

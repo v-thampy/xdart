@@ -417,14 +417,10 @@ class staticWidget(QWidget):
     #: Worker → GUI handoff for the async directory frame count (bl17-2
     #: freeze, 2026-07-12): emitted from the sweep thread; the cross-thread
     #: connection queues delivery onto the GUI thread.
-    _sigV2DirCountReady = QtCore.Signal(object, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._v2_dir_count_pending = None
-        self._v2_dir_count_last = 0
-        self._v2_file_count_memo = {}
-        self._sigV2DirCountReady.connect(self._on_v2_dir_count_ready)
+        self._v2_source_count_is_files = False
         self._init_data_objects()
         self._init_ui()
         self._init_child_widgets()
@@ -2668,8 +2664,10 @@ class staticWidget(QWidget):
             parts.append(mode)
         frame_count = int(getattr(state, "frame_count", 0) or 0)
         if ready and frame_count:
+            unit = ("file" if getattr(state, "frame_count_is_files", False)
+                    else "frame")
             plural = "" if frame_count == 1 else "s"
-            parts.append(f"{frame_count} frame{plural}")
+            parts.append(f"{frame_count} {unit}{plural}")
         tooltip_parts = [str(append_confirm_reason)] if append_confirm_reason else []
         tooltip_parts.extend(str(b) for b in blockers[:3])
         if note and note not in tooltip_parts:
@@ -2752,6 +2750,9 @@ class staticWidget(QWidget):
             source_frame_count = 0
         source_live_unknown = source_frame_count is None
         frame_count = 0 if source_live_unknown else int(source_frame_count or 0)
+        frame_count_is_files = bool(
+            getattr(self, "_v2_source_count_is_files", False)
+            and not source_live_unknown)
         project_root = str(getattr(getattr(self, "wrangler", None), "project_folder", "") or "")
         project_root_valid = bool(
             project_root and os.path.isdir(os.path.expanduser(project_root))
@@ -2871,6 +2872,7 @@ class staticWidget(QWidget):
             current_config=processing_config_from_scan(scan),
             detector_summary=self._controls_v2_detector_summary(),
             frame_count=display_frame_count,
+            frame_count_is_files=frame_count_is_files,
             processing_mode=mode_text,
             real_data_gates=frozenset(),
             controls_locked=run_active,
@@ -2987,13 +2989,18 @@ class staticWidget(QWidget):
         )
         cached = getattr(self, "_v2_frame_count_cache", None)
         if cached is not None and cached[0] == key:
+            self._v2_source_count_is_files = bool(
+                cached[2] if len(cached) > 2 else False)
             return cached[1]
+        self._v2_source_count_is_files = False
 
-        # Directories of CONTAINER files need one HDF5 open per file — on a
-        # beamline network share that is ~0.5-1 s/file, and during acquisition
-        # the directory mtime churns so the sweep would re-run every refresh:
-        # the bl17-2 GUI freeze (2026-07-12).  Sweep anything beyond a handful
-        # of files on a worker thread (per-file memo, stale-while-counting).
+        # Directories of CONTAINER files: DO NOT pre-count frames
+        # (maintainer, 2026-07-13 / DIR-2).  A per-file count needs one
+        # HDF5 open (~0.5-1 s each on a beamline share) over potentially
+        # hundreds of files, and every failed count logged a WARNING.  A
+        # FILE count serves everything this feeds — the readiness gate
+        # only needs '>0' and the chip renders 'N files'; true frame
+        # counts appear as the run opens each file (that path is lazy).
         if source_type == "Image Directory":
             ext = str(img_ext or "").lstrip(".").lower()
             if ext in {"h5", "hdf5", "nxs"}:
@@ -3003,8 +3010,10 @@ class staticWidget(QWidget):
                     return 0
                 files = self._controls_v2_container_directory_files(
                     base, ext, include_subdir, _name_filter(file_filter))
-                if len(files) > self._V2_DIR_COUNT_SYNC_MAX:
-                    return self._controls_v2_dir_count_async(key, files)
+                count = len(files)
+                self._v2_source_count_is_files = True
+                self._v2_frame_count_cache = (key, count, True)
+                return count
 
         count = self._controls_v2_count_source_frames(
             source_type=source_type,
@@ -3014,67 +3023,8 @@ class staticWidget(QWidget):
             include_subdir=include_subdir,
             file_filter=file_filter,
         )
-        self._v2_frame_count_cache = (key, count)
+        self._v2_frame_count_cache = (key, count, False)
         return count
-
-    #: Container directories up to this size are counted inline (bounded
-    #: worst-case even on a slow share); larger ones sweep on a worker.
-    _V2_DIR_COUNT_SYNC_MAX = 8
-
-    def _controls_v2_dir_count_async(self, key, files) -> int:
-        """Count a large container directory on a worker thread.
-
-        Returns the LAST KNOWN total immediately (stale-while-counting) and
-        kicks a single daemon sweep for *key*; the result lands via the
-        queued :attr:`_sigV2DirCountReady` → cache → profile refresh.  A
-        per-file memo keyed on (size, mtime_ns) means a live-growing
-        directory only pays for files that actually changed — unchanged
-        files are never re-opened."""
-        if getattr(self, "_v2_dir_count_pending", None) == key:
-            return int(getattr(self, "_v2_dir_count_last", 0))
-        self._v2_dir_count_pending = key
-        memo = getattr(self, "_v2_file_count_memo", None)
-        if memo is None:
-            memo = self._v2_file_count_memo = {}
-        if len(memo) > 4096:
-            memo.clear()
-        files = tuple(files)
-
-        def _sweep():
-            from xrd_tools.io import image as image_io
-            total = 0
-            for path in files:
-                try:
-                    st = path.stat()
-                    stamp = (int(st.st_size), int(st.st_mtime_ns))
-                    hit = memo.get(str(path))
-                    if hit is not None and hit[0] == stamp:
-                        total += hit[1]
-                        continue
-                    n = int(image_io.count_frames(path) or 0)
-                    memo[str(path)] = (stamp, n)
-                    total += n
-                except Exception:
-                    continue
-            try:
-                self._sigV2DirCountReady.emit(key, int(total))
-            except RuntimeError:
-                pass  # widget torn down mid-sweep
-
-        threading.Thread(target=_sweep, daemon=True,
-                         name="v2-dir-frame-count").start()
-        return int(getattr(self, "_v2_dir_count_last", 0))
-
-    def _on_v2_dir_count_ready(self, key, total) -> None:
-        """GUI-thread landing for the async directory count."""
-        if getattr(self, "_tearing_down", False):
-            return
-        # A STALE sweep (superseded key) must not clear a newer sweep's gate.
-        if getattr(self, "_v2_dir_count_pending", None) == key:
-            self._v2_dir_count_pending = None
-        self._v2_dir_count_last = int(total)
-        self._v2_frame_count_cache = (key, int(total))
-        self._refresh_controls_v2_profile(immediate=False)
 
     @staticmethod
     def _controls_v2_source_cache_stamp(path) -> int | None:
@@ -3140,10 +3090,11 @@ class staticWidget(QWidget):
                     return 0
                 match = _name_filter(file_filter)
                 if ext in container_exts:
+                    # DIR-2 (maintainer, 2026-07-13): container directories
+                    # report the FILE count — never one HDF5 open per file.
                     files = cls._controls_v2_container_directory_files(
                         base, ext, include_subdir, match)
-                    return sum(int(image_io.count_frames(path) or 0)
-                               for path in files)
+                    return len(files)
                 pattern = f"*.{ext}" if ext else "*"
                 candidates = (
                     base.rglob(pattern) if include_subdir else base.glob(pattern)
