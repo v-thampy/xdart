@@ -55,6 +55,12 @@ GI_LABELS_1D = ["Q", "Qip", "Qoop", "Exit", f"{Chi}GI"]
 GI_MODES_2D = ['qip_qoop', 'q_chi', 'exit_angles']
 GI_LABELS_2D = ["Qip-Qoop", f"Q-{Chi}", "Exit"]
 
+# The ONE fresh-scan default for the polarization correction (maintainer
+# decision 2026-07-13: ON at 0.99 — SSRL beams are strongly horizontally
+# polarized; deliberate OFF stays available via the Advanced dialog, encoded
+# as polarization_factor=None in bai_*_args).
+DEFAULT_POLARIZATION_FACTOR = 0.99
+
 params = [
     {'name': 'Default', 'type': 'group', 'children': [
             {'name': 'Integrate 1D', 'type': 'group', 'children': [
@@ -62,9 +68,9 @@ params = [
                 {'name': 'dummy', 'type': 'float', 'value': -1.0},
                 {'name': 'delta_dummy', 'type': 'float', 'value': 0.0},
                 {'name': 'chi_offset', 'type': 'float', 'value': 90.0},
-                {'name': 'Apply polarization factor', 'type': 'bool', 'value': False},
-                {'name': 'polarization_factor', 'type': 'float', 'value': 0,
-                    'limits': (-1, 1)},
+                {'name': 'Apply polarization factor', 'type': 'bool', 'value': True},
+                {'name': 'polarization_factor', 'type': 'float',
+                    'value': DEFAULT_POLARIZATION_FACTOR, 'limits': (-1, 1)},
                 {'name': 'method', 'type': 'list', 'values': [
                         "numpy", "cython", "BBox", "splitpixel", "lut", "csr",
                         "nosplit_csr", "full_csr", "lut_ocl", "csr_ocl"
@@ -79,9 +85,9 @@ params = [
                 {'name': 'dummy', 'type': 'float', 'value': -1.0},
                 {'name': 'delta_dummy', 'type': 'float', 'value': 0.0},
                 {'name': 'chi_offset', 'type': 'float', 'value': 90.0},
-                {'name': 'Apply polarization factor', 'type': 'bool', 'value': False},
-                {'name': 'polarization_factor', 'type': 'float', 'value': 0,
-                    'limits': (-1, 1)},
+                {'name': 'Apply polarization factor', 'type': 'bool', 'value': True},
+                {'name': 'polarization_factor', 'type': 'float',
+                    'value': DEFAULT_POLARIZATION_FACTOR, 'limits': (-1, 1)},
                 {'name': 'method', 'type': 'list', 'values': [
                         "numpy", "cython", "BBox", "splitpixel", "lut",
                         "csr", "lut_ocl", "csr_ocl"

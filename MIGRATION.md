@@ -294,6 +294,24 @@ for downstream users:
   case-mismatched monitor key will integrate to different (correct) numbers. Re-reduce such
   datasets if exact reproduction of the old (un-normalized) values matters.
 
+## Unreleased (next version)
+
+- **Polarization correction is ON by default for fresh scans** (factor 0.99 —
+  SSRL beams are strongly horizontally polarized).  Previously no polarization
+  correction was applied unless you enabled it in the Advanced dialog, so
+  intensities written by default-configured runs will differ from earlier
+  versions.  To reproduce old results, uncheck "Apply polarization factor" in
+  the Advanced dialog (this encodes `polarization_factor=None`, the deliberate
+  off, which is honored everywhere).  Appending to files processed with the old
+  default will surface the config-mismatch confirmation — that is the guard
+  working, not a bug.  Loaded/existing scans keep their stored configuration.
+- **Meta Type: legacy sessions no longer restore as `none`.**  Sessions saved
+  before the `auto` option existed encoded "never set" as an empty value; those
+  now restore to `auto` (metadata auto-discovery, the modern default).  A Meta
+  Type you explicitly set — including `none` — is honored as before.  If your
+  session already shows `none` and you never chose it, flip the dropdown to
+  `auto` once; it persists from then on.
+
 ## Fixes in v1.1.1
 
 The first 1.1.x that reaches **PyPI** (v1.1.0 was tagged and published to
