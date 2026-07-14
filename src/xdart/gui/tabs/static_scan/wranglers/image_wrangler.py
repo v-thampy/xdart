@@ -691,7 +691,12 @@ class imageWrangler(wranglerWidget):
                     # so only a saved 'none' is an explicit off (MD-2 boundary).
                     # Migrate the legacy-unset encodings to the modern default
                     # instead of resurrecting them as a permanent 'none'.
-                    if val is None or str(val).strip() == '':
+                    # AND (maintainer, 2026-07-13): a stored literal 'none'
+                    # does not persist either — the old nxs sync force-wrote
+                    # 'none' into sessions for weeks, so it cannot be trusted
+                    # as deliberate.  Metadata-off stays selectable PER
+                    # SESSION; every restore comes back at the 'auto' default.
+                    if _normalize_meta_ext(val) is None:
                         val = def_meta_ext
                     else:
                         val = _meta_ext_parameter_value(val)
@@ -2060,27 +2065,26 @@ class imageWrangler(wranglerWidget):
             self.meta_dir = path
 
     def _sync_meta_ext_to_img_ext(self):
-        """Force meta_ext='none' and HIDE it when the image type is NeXus.
+        """Keep the Meta File row visible and NEVER touch its value.
 
-        NeXus/.nxs files embed their own metadata (motors, counters, energy)
-        inside the HDF5 tree, so no sidecar file is needed — per the scan
-        taxonomy the Meta File field is irrelevant for nxs and should not be
-        shown at all (it was previously just made readonly).  Re-shown when
-        the image type changes back to a sidecar-based format.
+        This used to force meta_ext='none' and hide the row when the image
+        type was NeXus (on the theory that .nxs embeds its metadata).  Live
+        bl17-2 (maintainer, 2026-07-13): that silently overwrote the user's
+        'auto' after every run, and weeks of force-writes contaminated saved
+        sessions with a 'none' nobody chose.  The rule now: the value is the
+        USER'S — 'auto' by default, changed only by an explicit edit — and
+        the row stays visible so its state is never hidden while it still
+        matters ('auto' additionally probes sidecars, harmless for nxs; the
+        embedded Bluesky metadata is read regardless of this setting).
+
+        setOpts, NOT show(): pyqtgraph's show/hide emit sigOptionsChanged
+        UNCONDITIONALLY (even when visible is unchanged), and this runs
+        inside setup() which is wired to sigTreeStateChanged — an
+        unconditional emit is an infinite setup() recursion (RecursionError
+        at app start, Jun 10).  setOpts skips unchanged values.
         """
         meta_param = self.parameters.child('Signal').child('meta_ext')
-        # setOpts, NOT show()/hide(): pyqtgraph's show/hide emit
-        # sigOptionsChanged UNCONDITIONALLY (even when visible is unchanged),
-        # and this method runs inside setup() which is wired to
-        # sigTreeStateChanged — an unconditional emit here is an infinite
-        # setup() recursion (RecursionError at app start, Jun 10).  setOpts
-        # skips unchanged values, breaking the cycle.
-        if (self.img_ext or '').lower() == 'nxs':
-            if _normalize_meta_ext(meta_param.value()) is not None:
-                meta_param.setValue('none')    # fires set_meta_ext
-            meta_param.setOpts(visible=False)
-        else:
-            meta_param.setOpts(visible=True)
+        meta_param.setOpts(visible=True)
 
     def exists_meta_file(self, img_file):
         """Checks for existence of meta file for image file"""
