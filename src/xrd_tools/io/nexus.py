@@ -206,6 +206,13 @@ def find_nexus_image_dataset(
     3. ``/{entry}/data/data`` (3-D)
     4. ``/{entry}/instrument/*/data``  (any detector sub-group, 3-D)
     5. A dataset flagged ``@signal_type='detector'`` (Bluesky/NXWriter)
+
+    Before the weak largest-3-D fallback, a processed xdart scan file is
+    rejected with :class:`~xrd_tools.io.processed_scan_id.ProcessedXdartInputError`
+    (it carries only reduced ``integrated_1d`` / ``integrated_2d`` stacks, never a
+    raw detector frame), so its integrated cake can never be re-ingested as raw
+    input.
+
     6. Largest 3-D dataset anywhere under ``/{entry}/``
     7. Last resort: a single 2-D detector frame at a canonical location
        (a one-exposure acquisition; normalized to ``(1, H, W)`` downstream)
@@ -576,6 +583,27 @@ def find_nexus_image_dataset_in_open_file(
     det = find_detector_signal_dataset(grp)
     if det is not None:
         return det.name
+
+    # F-NXS-2: a processed xdart scan file has NO raw detector data, only the
+    # reduced ``integrated_1d`` / ``integrated_2d`` stacks.  The largest-3-D
+    # fallback below would otherwise select ``/entry/integrated_2d/intensity``
+    # (a 3-D cake) and hand back an integrated pattern as a detector frame.
+    # Reject BEFORE that fallback so a processed output can never be re-ingested
+    # as raw input.  Arms 1-5 above (explicit detector paths / signal_type) still
+    # win when — impossibly for a real processed file — a true detector dataset
+    # is also present.  A raw acquisition never carries these groups, so raw
+    # resolution is unaffected.
+    from xrd_tools.io.processed_scan_id import (
+        ProcessedXdartInputError,
+        is_processed_xdart_file,
+    )
+    if is_processed_xdart_file(h5f, entry):
+        raise ProcessedXdartInputError(
+            f"{getattr(h5f, 'filename', '<file>')} is a processed xdart scan "
+            "file (integrated results, no raw detector image); it cannot be read "
+            "as a raw detector container. Use xrd_tools.io.read.get_raw_frame to "
+            "read the original raw frames via the stored source pointer."
+        )
 
     best_path: str | None = None
     best_size = 0

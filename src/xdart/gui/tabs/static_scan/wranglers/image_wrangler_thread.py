@@ -96,6 +96,11 @@ from xrd_tools.sources.image import ImageFileSource, TiffSeriesSource
 from xrd_tools.io.image import read_image, count_frames
 from xrd_tools.io.export import write_xye
 from xrd_tools.io.nexus import find_nexus_image_dataset
+from xrd_tools.io.output_safety import (
+    OutputCollisionError,
+    check_output_not_source,
+)
+from xrd_tools.io.processed_scan_id import ProcessedXdartInputError
 from xrd_tools.io.metadata import read_image_metadata
 from xdart.utils import get_series_avg
 from xdart.utils.h5pool import get_pool as _get_h5pool
@@ -1286,6 +1291,14 @@ class imageThread(wranglerThread):
                 self._flush_outgoing_scan(scan)
                 try:
                     scan = self.initialize_scan()
+                except OutputCollisionError as exc:
+                    # F-NXS-1: the derived output would overwrite / be
+                    # re-ingested as a raw source; the guard fired BEFORE any
+                    # write, so source + destination bytes are untouched.
+                    # `scan` is still the PREVIOUS (already-flushed) scan — stop
+                    # cleanly, like a user Stop.
+                    self._handle_output_collision(exc)
+                    break
                 except AppendConfigMismatchError as exc:
                     # `scan` still refers to the PREVIOUS scan (already
                     # flushed above); stop cleanly through the shared
@@ -1430,6 +1443,12 @@ class imageThread(wranglerThread):
                     self._flush_outgoing_scan(scan)
                     try:
                         scan = self.initialize_scan()
+                    except OutputCollisionError as exc:
+                        # F-NXS-1: unsafe Save Path caught before any write;
+                        # source + destination preserved.  Stop cleanly, like a
+                        # user Stop while watching.
+                        self._handle_output_collision(exc)
+                        break
                     except AppendConfigMismatchError as exc:
                         # `scan` stays the previous scan; the final force
                         # flush below persists its tail, exactly like a
@@ -2936,6 +2955,20 @@ class imageThread(wranglerThread):
             self._eiger_h5_dataset = self._eiger_h5_handle[ds_path]
             self._eiger_nframes = self._h5_stack_nframes(self._eiger_h5_dataset)
             self._emit_container_count(master_path, self._eiger_nframes)
+        except ProcessedXdartInputError:
+            # F-NXS-2: a processed xdart output was swept into the raw source
+            # tree.  It carries only integrated results, never a detector frame,
+            # so the finder refuses it BEFORE the largest-3D fallback could hand
+            # back /entry/integrated_2d/intensity (a cake) as a detector stack.
+            # Skip it per file (nframes=0 -> the caller's retire-and-advance
+            # path) so the directory worker continues to the next valid raw
+            # acquisition instead of re-ingesting an integrated pattern or
+            # ending the stream.
+            logger.info('Skipping processed xdart output (not a raw '
+                        'acquisition): %s', master_path)
+            self._record_skip_reason('processed xdart output')
+            self._eiger_close_master()
+            self._eiger_nframes = 0
         except Exception as e:
             logger.error('Error opening HDF5/NeXus file %s: %s', master_path, e)
             self._eiger_close_master()
@@ -3812,12 +3845,82 @@ class imageThread(wranglerThread):
         except Exception:
             logger.debug("showLabel emit failed", exc_info=True)
 
+    def _output_safety_args(self):
+        """Assemble the source/output collision-guard inputs from run config.
+
+        Shared by the run-start preflight (fail loud before any read) and the
+        per-scan guard in :meth:`initialize_scan` (the last checkpoint before a
+        writer opens), so both consult ONE headless owner
+        (:func:`xrd_tools.io.output_safety.check_output_not_source`).  Pure
+        assembly — no I/O.
+        """
+        inp_type = getattr(self, "inp_type", None)
+        img_ext = (getattr(self, "img_ext", "") or "").lower().lstrip(".")
+        img_file = getattr(self, "img_file", "") or ""
+        is_dir = inp_type == 'Image Directory'
+        # Self-contained container input (kept independent of the output suffix,
+        # per the safety contract): a directory File Type of nxs/h5/hdf5, or a
+        # single container/Eiger-master input file.
+        container = (
+            img_ext in ('h5', 'hdf5', 'nxs')
+            or (bool(img_file) and _is_eiger_master(img_file))
+            or (bool(img_file)
+                and Path(img_file).suffix.lower() in ('.h5', '.hdf5', '.nxs'))
+        )
+        watched = ([getattr(self, "img_dir", "")]
+                   if is_dir and getattr(self, "img_dir", "") else [])
+        # Known source file(s): the explicit input, and (best effort) the
+        # container currently open.  Directory-mode same-file overwrite is caught
+        # structurally by the watched-dir check, so a raced/prefetched master
+        # here can only ever ADD a true collision, never mask one.
+        inputs = []
+        if img_file:
+            inputs.append(img_file)
+        cur = getattr(self, "_eiger_master_path", None)
+        if cur:
+            inputs.append(cur)
+        return dict(
+            input_files=inputs,
+            watched_dirs=watched,
+            recursive=bool(getattr(self, "include_subdir", False)),
+            container_directory_mode=bool(container),
+        )
+
+    def _handle_output_collision(self, exc):
+        """Stop the run CLEANLY when the output path would destroy/re-ingest its
+        own input (F-NXS-1).
+
+        The guard fires BEFORE any writer opens, so the raw source and any
+        existing destination are untouched.  Delivery mirrors
+        :meth:`_handle_initialize_scan_write_error`: the same clean stop as a
+        user Stop plus an actionable operator message, never an unhandled QThread
+        exception that would kill the whole directory run.
+        """
+        logger.error("run stopped: unsafe output path: %s", exc)
+        self.command = 'stop'
+        try:
+            self.showLabel.emit(f"Run stopped: {exc}")
+        except Exception:
+            logger.debug("showLabel emit failed", exc_info=True)
+
     def initialize_scan(self):
         """If scan changes, initialize new LiveScan object.
         If mode is overwrite, replace existing HDF5 file, else append to it.
         """
-        Path(self.h5_dir).mkdir(parents=True, exist_ok=True)
         fname = os.path.join(self.h5_dir, self.scan_name + '.nxs')
+        # F-NXS-1: refuse to (over)write when the derived output collides with a
+        # raw source — Save Path == the watched raw directory makes source ==
+        # output for a same-stem container, which overwrote a 1.8 MB raw
+        # acquisition with a 26 KB empty processed container before any frame was
+        # reduced.  This is the LAST checkpoint before any writer opens; raised
+        # BEFORE mkdir/replace-save so both the raw source and any existing
+        # destination keep their bytes.  Caught at the initialize_scan call sites
+        # for a clean run stop (like the DIR-3 locked-destination handling).
+        # Skipped for Int-1D/XYE, which writes only .xye files into a
+        # <scan_name>/ subfolder and never replaces this .nxs (no collision).
+        if not self.xye_only:
+            check_output_not_source(fname, **self._output_safety_args())
+        Path(self.h5_dir).mkdir(parents=True, exist_ok=True)
         # Eiger master files are pre-processed with the trailing
         # ``_master`` suffix stripped from scan_name (see
         # _get_next_eiger_frame). Without this sync, the wrangler

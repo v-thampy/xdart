@@ -540,22 +540,27 @@ def _read_fabio_stack(path: Path) -> np.ndarray:
 
 
 def _reject_if_processed_xdart(path: Path) -> None:
-    """Raise ``ValueError`` if ``path`` is a processed xdart v2 scan file.
+    """Raise :class:`ProcessedXdartInputError` if ``path`` is a processed xdart
+    scan file.
 
     Such files store reduced data (``integrated_1d``/``integrated_2d`` are
     ndim>=2 NXData) and no raw detector frames — reading them as images
     would silently return an integrated-pattern stack.  Raw frames live in
-    the original master; use ``io.read.get_raw_frame``.
+    the original master; use ``io.read.get_raw_frame``.  Classification is the
+    canonical schema/content test in :mod:`xrd_tools.io.processed_scan_id`
+    (shared with the directory-watch NeXus resolver).
     """
+    from xrd_tools.io.processed_scan_id import (
+        ProcessedXdartInputError,
+        is_processed_xdart_file,
+    )
     try:
         with h5py.File(path, "r") as f:
-            processed = any(
-                p in f for p in ("entry/integrated_1d", "entry/integrated_2d")
-            )
+            processed = is_processed_xdart_file(f)
     except OSError:
         return  # not openable as HDF5 here — let the normal path report it
     if processed:
-        raise ValueError(
+        raise ProcessedXdartInputError(
             f"{path} is a processed xdart scan file (no raw detector image "
             "inside); use io.read.get_raw_frame to read raw frames via the "
             "stored source pointer."
@@ -622,9 +627,14 @@ def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
     # caller would display an integrated-pattern stack as if it were an
     # image.  Raw frames for such a file live in the original detector
     # master; use ``xrd_tools.io.read.get_raw_frame`` (it resolves the
-    # per-frame source pointer) instead.
-    if any(p in f for p in ("entry/integrated_1d", "entry/integrated_2d")):
-        raise ValueError(
+    # per-frame source pointer) instead.  Same canonical classifier as the
+    # directory-watch NeXus resolver (xrd_tools.io.processed_scan_id).
+    from xrd_tools.io.processed_scan_id import (
+        ProcessedXdartInputError,
+        is_processed_xdart_file,
+    )
+    if is_processed_xdart_file(f):
+        raise ProcessedXdartInputError(
             f"{f.filename} is a processed xdart scan file (no raw detector "
             "image inside); use io.read.get_raw_frame to read raw frames via "
             "the stored source pointer."
