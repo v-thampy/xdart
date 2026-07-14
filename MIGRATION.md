@@ -316,9 +316,11 @@ for downstream users:
   is refreshed after the first XYE file in each scan directory is successfully
   written, rather than only at the pre-write new-scan boundary. A bounded,
   parent-owned retry handles stale SMB directory listings, and background
-  refreshes preserve the operator's current selection. The notification is
-  emitted once per directory per Run, so high-rate acquisitions do not add a
-  per-frame GUI refresh.
+  refreshes preserve the operator's current selection. Fresh projects follow
+  the configured output root after its first write only while the browser is
+  still at the recorded fallback. Notifications are emitted once per directory
+  per Run and coalesced on a 50 ms GUI timer, so high-rate acquisitions do not
+  add a per-frame browser rebuild.
 
 ## What's new in v1.1.4
 

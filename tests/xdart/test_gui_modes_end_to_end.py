@@ -1644,6 +1644,9 @@ def test_live_xye_last_folder_appears_after_first_write(
         assert not writer.is_alive()
         for _ in range(3):
             qapp.processEvents()
+        if w._pending_xye_output_dirs:
+            w._xye_refresh_timer.stop()
+            w._retry_pending_xye_output_refreshes()
 
         listed = {
             w.h5viewer.ui.listScans.item(row).text()
@@ -1654,7 +1657,7 @@ def test_live_xye_last_folder_appears_after_first_write(
 
 
 def test_live_xye_folder_retries_one_stale_smb_listing(
-        tmp_path, widget, qapp, monkeypatch):
+        tmp_path, widget, monkeypatch):
     w = widget
     save_dir = tmp_path / "processed"
     save_dir.mkdir()
@@ -1675,13 +1678,19 @@ def test_live_xye_folder_retries_one_stale_smb_listing(
 
     monkeypatch.setattr(w.h5viewer, "update_scans", stale_once)
     w.wrangler.thread.sigXyeOutputReady.emit(str(scan_dir))
-    qapp.processEvents()
 
+    assert calls == []
+    assert w._pending_xye_output_dirs
+    assert w._xye_refresh_timer.isActive()
+
+    # Initial debounced listing is stale; the owned timer schedules a retry.
+    w._xye_refresh_timer.stop()
+    w._retry_pending_xye_output_refreshes()
     assert calls == [True]
     assert w._pending_xye_output_dirs
     assert w._xye_refresh_timer.isActive()
 
-    # Drive the owned timer callback deterministically; no wall-clock polling.
+    # Drive the retry deterministically; no wall-clock polling.
     w._xye_refresh_timer.stop()
     w._retry_pending_xye_output_refreshes()
     assert calls == [True, True]
@@ -1724,6 +1733,88 @@ def test_directory_refresh_failure_keeps_existing_selection(
         for row in range(viewer.ui.listScans.count())
     ] == before
     assert viewer.ui.listScans.currentItem().text() == "older_scan.nxs"
+
+
+def test_live_xye_fresh_output_root_follows_recorded_fallback_only(
+        tmp_path, widget, qapp):
+    w = widget
+    project = tmp_path / "project"
+    project.mkdir()
+    output_root = project / "processed"
+    w._sync_h5viewer_save_dir(str(output_root))
+    assert w.h5viewer.dirname == str(project)
+
+    frame = SimpleNamespace(int_1d=SimpleNamespace(
+        unit="q_A^-1",
+        radial=np.array([1.0, 2.0]),
+        intensity=np.array([10.0, 20.0]),
+    ))
+    scan = SimpleNamespace(
+        name="first_scan",
+        data_file=str(output_root / "first_scan.nxs"),
+    )
+    w.wrangler.thread._xye_buffer = [(0, frame)]
+    writer = threading.Thread(
+        target=w.wrangler.thread._flush_xye_buffer,
+        args=(scan,), daemon=True)
+    writer.start()
+    writer.join(timeout=5.0)
+    assert not writer.is_alive()
+    for _ in range(3):
+        qapp.processEvents()
+
+    assert w.h5viewer.dirname == str(output_root)
+    if w._pending_xye_output_dirs:
+        w._xye_refresh_timer.stop()
+        w._retry_pending_xye_output_refreshes()
+    assert "first_scan/" in {
+        w.h5viewer.ui.listScans.item(row).text()
+        for row in range(w.h5viewer.ui.listScans.count())
+    }
+
+    # The same fallback must not pull the browser back after explicit navigation.
+    second_root = project / "second_processed"
+    w._sync_h5viewer_save_dir(str(second_root))
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    w.h5viewer.dirname = str(elsewhere)
+    second_dir = second_root / "second_scan"
+    second_dir.mkdir(parents=True)
+    w.wrangler.thread.sigXyeOutputReady.emit(str(second_dir))
+    assert w.h5viewer.dirname == str(elsewhere)
+    assert not w._pending_xye_output_dirs
+
+
+def test_live_xye_output_notifications_coalesce_directory_rebuilds(
+        tmp_path, widget, monkeypatch):
+    w = widget
+    save_dir = tmp_path / "processed"
+    save_dir.mkdir()
+    w.h5viewer.dirname = str(save_dir)
+    w.h5viewer.viewer_mode = None
+    w.h5viewer.update_scans()
+    output_dirs = [save_dir / "scan_0001", save_dir / "scan_0002"]
+    for output_dir in output_dirs:
+        output_dir.mkdir()
+        (output_dir / f"iq_{output_dir.name}_0000.xye").write_text("1 2 1\n")
+
+    real_update = w.h5viewer.update_scans
+    calls = []
+
+    def count_update(*, preserve_selection=False):
+        calls.append(preserve_selection)
+        return real_update(preserve_selection=preserve_selection)
+
+    monkeypatch.setattr(w.h5viewer, "update_scans", count_update)
+    for output_dir in output_dirs:
+        w.wrangler.thread.sigXyeOutputReady.emit(str(output_dir))
+
+    assert calls == []
+    assert len(w._pending_xye_output_dirs) == 2
+    w._xye_refresh_timer.stop()
+    w._retry_pending_xye_output_refreshes()
+    assert calls == [True]
+    assert not w._pending_xye_output_dirs
 
 
 def test_recreated_nexus_thread_forwards_xye_output_ready(widget, qapp):

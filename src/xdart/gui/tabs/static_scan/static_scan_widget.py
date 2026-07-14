@@ -20,6 +20,7 @@ from .browse_debug import browse_debug_enabled, browse_debug_log, sequence_summa
 
 logger = logging.getLogger(__name__)
 _ORPHANED_STITCH_THREADS = []
+_XYE_REFRESH_COALESCE_MS = 50
 _XYE_REFRESH_RETRY_MS = (150, 500, 1500, 3000, 7000)
 
 
@@ -4687,13 +4688,14 @@ class staticWidget(QWidget):
         """Point the Scans browser at the active processed-output directory."""
         if not path:
             return
-        path = os.path.abspath(os.path.expanduser(str(path)))
+        target_path = os.path.abspath(os.path.expanduser(str(path)))
+        self._h5viewer_save_target = target_path
         # If the processed-data dir doesn't exist yet (fresh project, no run
         # has created it), browse the nearest existing ancestor -- typically
         # the project folder -- instead of an empty nonexistent path.  Once
         # the first run creates xdart_processed_data, the next save-path
         # signal re-points the browser at it.
-        probe = path
+        probe = target_path
         while probe and not os.path.isdir(probe):
             parent = os.path.dirname(probe)
             if parent == probe:
@@ -4701,6 +4703,12 @@ class staticWidget(QWidget):
             probe = parent
         if probe and os.path.isdir(probe):
             path = probe
+        else:
+            path = target_path
+        self._h5viewer_save_fallback = (
+            path if os.path.normcase(path) != os.path.normcase(target_path)
+            else None
+        )
         self.dirname = path
         self.h5viewer.dirname = path
         if refresh:
@@ -4727,12 +4735,32 @@ class staticWidget(QWidget):
                 output_key,
                 os.path.normcase(os.path.dirname(output_dir)),
             }
-            if os.path.normcase(current_dir) not in visible_dirs:
-                return
+            current_key = os.path.normcase(current_dir)
+            if current_key not in visible_dirs:
+                output_parent = os.path.dirname(output_dir)
+                target = getattr(self, '_h5viewer_save_target', None)
+                fallback = getattr(self, '_h5viewer_save_fallback', None)
+                follows_fresh_target = (
+                    target and fallback
+                    and os.path.normcase(output_parent) == os.path.normcase(target)
+                    and current_key == os.path.normcase(fallback)
+                )
+                if not follows_fresh_target:
+                    return
+                # The first durable XYE created the intended root. Repoint only
+                # when the browser is still at the exact fallback recorded by
+                # _sync_h5viewer_save_dir; explicit user navigation always wins.
+                self.dirname = output_parent
+                self.h5viewer.dirname = output_parent
+                self._h5viewer_save_fallback = None
             self._pending_xye_output_dirs[output_key] = output_dir
+            was_retrying = self._xye_refresh_retry_index > 0
             self._xye_refresh_retry_index = 0
-            self._xye_refresh_timer.stop()
-            self._refresh_pending_xye_output_dirs()
+            # Throttle one-frame scan bursts into at most one rebuild per 50 ms
+            # without starving a continuous stream. A new output also pulls a
+            # long stale-listing retry back to this short initial edge.
+            if was_retrying or not self._xye_refresh_timer.isActive():
+                self._xye_refresh_timer.start(_XYE_REFRESH_COALESCE_MS)
         except Exception:
             logger.debug(
                 'Could not refresh browser for XYE output %s', output_dir,
