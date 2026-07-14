@@ -48,8 +48,14 @@ def _name_filter(expr):
         return lambda name: False
 
 
-def _nexus_integrated_frame_count(path, *, entry="entry"):
-    """Return the number of unique integrated frame labels already on disk."""
+def _nexus_integrated_frame_labels(path, *, entry="entry"):
+    """Return the unique integrated frame labels already on disk.
+
+    This intentionally reads only the two small ``frame_index`` datasets.  The
+    append-resume path needs no axes, provenance, detector calibration, or
+    frame payloads, so constructing a ``LiveScan`` here turns a cheap cursor
+    lookup into a full processed-scan hydration.
+    """
     labels = set()
     with h5py.File(path, "r") as h5:
         if entry not in h5:
@@ -60,7 +66,12 @@ def _nexus_integrated_frame_count(path, *, entry="entry"):
             if group is None or "frame_index" not in group:
                 continue
             labels.update(int(v) for v in np.asarray(group["frame_index"][()]).ravel())
-    return len(labels)
+    return labels
+
+
+def _nexus_integrated_frame_count(path, *, entry="entry"):
+    """Return the number of unique integrated frame labels already on disk."""
+    return len(_nexus_integrated_frame_labels(path, entry=entry))
 
 # pyFAI / fabio / h5py
 import fabio
@@ -673,6 +684,25 @@ class imageThread(wranglerThread):
         if self.poni is None or (self.img_file == ''):
             return
 
+        # This must be the FIRST stateful operation of a new Run.  A prior
+        # generation can outlive the bounded Stop join while blocked in HDF5;
+        # clearing any cursor/cache before deciding to refuse the restart would
+        # corrupt that old reader while it unwinds.
+        if not self._prefetch_stop_prior():
+            message = "Previous detector reader is still stopping; retry Run shortly"
+            logger.warning(message)
+            self.command = 'stop'
+            try:
+                self.showLabel.emit(message)
+            except Exception:
+                logger.debug("showLabel emit failed for lingering reader",
+                             exc_info=True)
+            return
+        # A timed-out prior cleanup intentionally leaves its HDF5 handle open.
+        # Once the reader is confirmed dead, close it before clearing/reusing
+        # any detector state for this generation.
+        self._eiger_close_master()
+
         self.img_fnames.clear()
         self.processed.clear()
         self._frame_read_clocks.clear()
@@ -698,7 +728,6 @@ class imageThread(wranglerThread):
         # run.  Safe to clear here: the prior run's consumer is done and this run
         # hasn't published yet.
         self._published_frames.clear()
-        self._prefetch_stop_prior()     # tear down any lingering prefetcher
         self._prefetch_queue = None
         self._prefetch_thread = None
         self._prefetch_stop_evt = None
@@ -802,8 +831,13 @@ class imageThread(wranglerThread):
             # prefetch worker when switching masters, so triggering a stop from
             # there would self-join — only the main thread should tear down the
             # prefetcher.
-            self._prefetch_stop_prior()
-            self._eiger_close_master()  # ensure Eiger handle is released
+            prefetch_stopped = self._prefetch_stop_prior()
+            if prefetch_stopped:
+                self._eiger_close_master()  # ensure Eiger handle is released
+            else:
+                logger.warning(
+                    "detector reader is still unwinding after Stop; its HDF5 "
+                    "handle will be closed before the next Run")
         logger.info('Total Time: %.2fs', time.time() - t0)
         _perf = getattr(self, '_perf', None)
         if _perf and (_perf['dispatch_frames'] or _perf['prefetch_frames'] or _perf['n']):
@@ -1006,46 +1040,52 @@ class imageThread(wranglerThread):
             add(getattr(self, "scan_name", None))
         return names
 
-    def _new_append_scan_for_snapshot(self, scan_name, out_path):
-        return LiveScan(
-            scan_name,
-            data_file=out_path,
-            static=True,
-            gi=getattr(self, "gi", False),
-            incidence_motor=getattr(self, "incidence_motor", None),
-            series_average=getattr(self, "series_average", False),
-            single_img=getattr(self, "single_img", False),
-            global_mask=getattr(self, "mask", None),
-            detector_shape=getattr(self, "detector_shape", None),
-            file_lock=getattr(self, "file_lock", None),
-            **(getattr(self, "scan_args", {}) or {}),
-        )
+    def _load_append_skip_snapshot(self, scan_name):
+        """Load one scan's append cursor, once, without hydrating a LiveScan.
 
-    def _prime_append_skip_snapshots_for_run(self):
-        if not self._append_skip_enabled():
-            return
+        Normal directory runs call this lazily when the reader reaches a scan.
+        That keeps Run and Stop responsive in a directory containing hundreds
+        of processed outputs while preserving the skip-before-raw-read contract.
+        """
+        if not self._append_skip_enabled() or scan_name is None:
+            return set()
         cache = getattr(self, "_append_skip_frames_by_scan", None)
         if cache is None:
             cache = {}
             self._append_skip_frames_by_scan = cache
+        key = str(scan_name)
+        if key in cache:
+            return cache[key]
+        if getattr(self, "command", None) == "stop":
+            return set()
 
+        out_path = self._append_output_path(key)
+        if not os.path.exists(out_path):
+            cache[key] = set()
+            return cache[key]
+
+        try:
+            with self._optional_lock(getattr(self, "file_lock", None)):
+                existing = _nexus_integrated_frame_labels(out_path)
+        except Exception as exc:
+            self._warn_append_snapshot_failed(key, out_path, exc)
+            existing = set()
+        cache[key] = existing
+        return cache[key]
+
+    def _prime_append_skip_snapshots_for_run(self):
+        """Eagerly prime cursors for the series-average no-op safeguard only.
+
+        Normal runs load one cursor lazily in ``_append_skip_snapshot``.  Keep
+        this all-scan variant for series averaging, where an existing frame 1
+        must refuse the run before any source frame is consumed.
+        """
+        if not self._append_skip_enabled():
+            return
         for scan_name in self._append_run_start_scan_names():
-            if scan_name in cache:
-                continue
-            out_path = self._append_output_path(scan_name)
-            # The finish handler uses thread.fname even when every frame was
-            # skipped before initialize_scan() could run.
-            self.fname = out_path
-            if not os.path.exists(out_path):
-                cache[scan_name] = set()
-                continue
-            try:
-                scan = self._new_append_scan_for_snapshot(scan_name, out_path)
-                scan.load_from_h5(replace=False, mode='r')
-                self._remember_append_skip_snapshot(scan_name, scan=scan)
-            except Exception as exc:
-                self._warn_append_snapshot_failed(scan_name, out_path, exc)
-                cache[scan_name] = set()
+            if getattr(self, "command", None) == "stop":
+                break
+            self._load_append_skip_snapshot(scan_name)
 
     def _series_average_append_blocker(self):
         """MEM-1c: refuse a silently-empty series-average Append run.
@@ -1075,9 +1115,8 @@ class imageThread(wranglerThread):
     def _append_skip_snapshot(self, scan_name):
         """Return this run's append-skip frame snapshot for *scan_name*.
 
-        Run start primes this cache from disk in read-only mode.  The per-frame
-        path is intentionally a pure in-memory lookup: no HDF5 open, no writer
-        mode, and no exception that can kill the run.
+        The first lookup for a scan reads only its on-disk ``frame_index``
+        datasets; subsequent per-frame lookups are pure in-memory operations.
         """
         if not self._append_skip_enabled() or scan_name is None:
             return set()
@@ -1088,8 +1127,7 @@ class imageThread(wranglerThread):
             self._append_skip_frames_by_scan = cache
         if key in cache:
             return cache[key]
-        cache[key] = set()
-        return cache[key]
+        return self._load_append_skip_snapshot(key)
 
     def _should_skip_before_read(self, scan_name, img_number):
         output_img_number = self._append_output_number(img_number)
@@ -1197,14 +1235,15 @@ class imageThread(wranglerThread):
         # DEBUG: developer diagnostics, not run output.
         logger.debug('Execution policy: batch_mode=%s  batch=streaming  live=%s',
                      self.batch_mode, self._live_execution())
-        self._prime_append_skip_snapshots_for_run()
-
         # MEM-1c: refuse a series-average Append run whose averaged output
         # already exists (would silently skip everything and write nothing).
-        # Only series-average runs can collapse this way, so gate the check on
-        # it (also keeps non-series-average paths free of the lookup).
-        _blocker = (self._series_average_append_blocker()
-                    if getattr(self, "series_average", False) else None)
+        # Only this special case needs an eager all-scan cursor pass.  Ordinary
+        # Append runs load one tiny cursor lazily as each scan is reached.
+        if getattr(self, "series_average", False):
+            self._prime_append_skip_snapshots_for_run()
+            _blocker = self._series_average_append_blocker()
+        else:
+            _blocker = None
         if _blocker:
             logger.error("run refused: %s", _blocker)
             _emit = getattr(getattr(self, "showLabel", None), "emit", None)
@@ -3266,9 +3305,14 @@ class imageThread(wranglerThread):
         suffix = f'_master.{img_ext}' if img_ext in ('h5', 'hdf5') else f'.{img_ext}'
         candidates = _paths_with_suffix(
             Path(self.img_dir), suffix, recursive=self.include_subdir)
-        master_files = sorted(
-            p for p in candidates if match(p.name[:-len(suffix)])
-        )
+        # Human/numeric order, shared with the image-series path: plain string
+        # sorting puts scan_10 before scan_2 and makes a directory run appear to
+        # jump backwards.  Keep Path objects after sorting for the queue logic.
+        master_files = [
+            Path(path) for path in natural_sort_ints([
+                str(p) for p in candidates if match(p.name[:-len(suffix)])
+            ])
+        ]
         queued = set(self._eiger_master_queue)
         retries = getattr(self, "_eiger_retry_after", None)
         if retries is None:
@@ -3381,30 +3425,42 @@ class imageThread(wranglerThread):
         """Spin up the background prefetch thread (idempotent)."""
         if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
             return
-        self._prefetch_queue = queue.Queue(maxsize=_PREFETCH_QUEUE_SIZE)
-        self._prefetch_stop_evt = threading.Event()
+        prefetch_queue = queue.Queue(maxsize=_PREFETCH_QUEUE_SIZE)
+        stop_evt = threading.Event()
+        self._prefetch_queue = prefetch_queue
+        self._prefetch_stop_evt = stop_evt
         self._prefetch_thread = threading.Thread(
             target=self._prefetch_worker,
+            args=(prefetch_queue, stop_evt),
             name='eiger-prefetch',
             daemon=True,
         )
         self._prefetch_thread.start()
 
-    def _push_frame_to_queue(self, item):
+    def _push_frame_to_queue(self, item, prefetch_queue=None, stop_evt=None):
         """Put *item* onto the prefetch queue, cooperating with stop.
 
         Returns True if the item was queued, False if the worker was
         cancelled while blocking on a full queue.
         """
-        while not self._prefetch_stop_evt.is_set() and self.command != 'stop':
+        # Snapshot-compatible defaults keep direct unit-test calls working.
+        # A real worker receives generation-owned objects from
+        # _start_prefetcher: cleanup may replace the public attributes after a
+        # bounded join, but it must never invalidate a still-unwinding worker.
+        prefetch_queue = (self._prefetch_queue
+                          if prefetch_queue is None else prefetch_queue)
+        stop_evt = (self._prefetch_stop_evt if stop_evt is None else stop_evt)
+        if prefetch_queue is None or stop_evt is None:
+            return False
+        while not stop_evt.is_set() and self.command != 'stop':
             try:
-                self._prefetch_queue.put(item, timeout=0.25)
+                prefetch_queue.put(item, timeout=0.25)
                 return True
             except queue.Full:
                 continue
         return False
 
-    def _prefetch_worker(self):
+    def _prefetch_worker(self, prefetch_queue=None, stop_evt=None):
         """Read frames sequentially and push them onto the bounded queue.
 
         Uses bulk HDF5 slices (`dset[i:i+N]`) where possible so each chunk
@@ -3421,14 +3477,20 @@ class imageThread(wranglerThread):
         Exceptions are logged and a sentinel tuple is pushed so the
         consumer can terminate cleanly.
         """
+        prefetch_queue = (self._prefetch_queue
+                          if prefetch_queue is None else prefetch_queue)
+        stop_evt = (self._prefetch_stop_evt if stop_evt is None else stop_evt)
+        if prefetch_queue is None or stop_evt is None:
+            return
         sentinel_pushed = False
         try:
-            while not self._prefetch_stop_evt.is_set() and self.command != 'stop':
+            while not stop_evt.is_set() and self.command != 'stop':
                 # Always fetch the first frame of (the next) master through
                 # the sync reader — it handles master-queue advancement,
                 # handle opening, and frame-count refresh.
                 item = self._get_next_eiger_frame_sync()
-                if not self._push_frame_to_queue(item):
+                if not self._push_frame_to_queue(
+                        item, prefetch_queue=prefetch_queue, stop_evt=stop_evt):
                     return
                 if item[3] is None:
                     # End of stream; worker is done — sentinel already queued.
@@ -3439,7 +3501,7 @@ class imageThread(wranglerThread):
                 # the h5py dataset.  Skipped when fabio is primary (fabio
                 # handles its own per-frame decoding) or when we're near
                 # the tail of a live-growing file.
-                while (not self._prefetch_stop_evt.is_set()
+                while (not stop_evt.is_set()
                        and self.command != 'stop'
                        and self._eiger_fabio_handle is None
                        and self._eiger_h5_dataset is not None
@@ -3501,7 +3563,7 @@ class imageThread(wranglerThread):
 
                         for offset, frame_idx in enumerate(
                                 range(group_start, group_end)):
-                            if (self._prefetch_stop_evt.is_set()
+                            if (stop_evt.is_set()
                                     or self.command == 'stop'):
                                 return
                             item = (
@@ -3516,7 +3578,9 @@ class imageThread(wranglerThread):
                                 self._frame_scan_info(
                                     self._eiger_master_path, frame_idx),
                             )
-                            if not self._push_frame_to_queue(item):
+                            if not self._push_frame_to_queue(
+                                    item, prefetch_queue=prefetch_queue,
+                                    stop_evt=stop_evt):
                                 return
                     if bulk_failed:
                         break
@@ -3533,7 +3597,7 @@ class imageThread(wranglerThread):
             # (stop event, command=='stop', exception, or normal return).
             if not sentinel_pushed:
                 try:
-                    self._prefetch_queue.put(
+                    prefetch_queue.put(
                         (None, None, 1, None, {}), timeout=1.0,
                     )
                 except queue.Full:
@@ -3541,26 +3605,35 @@ class imageThread(wranglerThread):
                     # thread has already seen stop, so dropping a queued
                     # frame is fine.
                     try:
-                        self._prefetch_queue.get_nowait()
-                        self._prefetch_queue.put_nowait(
+                        prefetch_queue.get_nowait()
+                        prefetch_queue.put_nowait(
                             (None, None, 1, None, {}),
                         )
                     except (queue.Empty, queue.Full):
                         pass
 
     def _prefetch_stop_prior(self):
-        """Cancel any prior prefetch thread and drain its queue."""
-        if self._prefetch_stop_evt is not None:
-            self._prefetch_stop_evt.set()
-        if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
+        """Cancel a prefetch generation; return True once it has stopped.
+
+        A slow HDF5/network read may outlive the bounded join.  Callers must not
+        clear the generation's shared detector state or start its successor
+        until this returns True.
+        """
+        stop_evt = self._prefetch_stop_evt
+        prefetch_thread = self._prefetch_thread
+        prefetch_queue = self._prefetch_queue
+        if stop_evt is not None:
+            stop_evt.set()
+        if prefetch_thread is not None and prefetch_thread.is_alive():
             # Drain to unblock the worker on a full queue
-            if self._prefetch_queue is not None:
+            if prefetch_queue is not None:
                 try:
                     while True:
-                        self._prefetch_queue.get_nowait()
+                        prefetch_queue.get_nowait()
                 except queue.Empty:
                     pass
-            self._prefetch_thread.join(timeout=2.0)
+            prefetch_thread.join(timeout=2.0)
+        return prefetch_thread is None or not prefetch_thread.is_alive()
 
     def _read_eiger_frame_tolerant(self, frame_idx):
         """Read one Eiger frame, tolerating a data file that lags the master.

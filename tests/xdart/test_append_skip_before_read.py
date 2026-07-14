@@ -120,22 +120,6 @@ def _initialize_scan_worker(tmp_path, *, write_mode="Append"):
     return worker, out / "scan.nxs"
 
 
-class _FakeSnapshotScan:
-    frame_index = [1, 2]
-    load_calls = []
-
-    def __init__(self, name, data_file=None, file_lock=None, **_kwargs):
-        self.name = name
-        self.data_file = data_file
-        self.file_lock = file_lock
-        self.scan_lock = threading.RLock()
-        self.frames = SimpleNamespace(index=[])
-
-    def load_from_h5(self, replace=False, mode="r"):
-        self.load_calls.append((self.name, self.data_file, replace, mode))
-        self.frames.index = list(self.frame_index)
-
-
 def test_append_image_series_skips_before_reader_and_metadata(monkeypatch, tmp_path):
     paths = [tmp_path / f"scan_{idx:04d}.tif" for idx in (1, 2, 3)]
     for path in paths:
@@ -318,19 +302,98 @@ def test_eiger_prefetch_skips_indexed_frames_without_dataset_read(tmp_path):
     assert worker._append_skip_without_reading == 3
 
 
-def test_append_skip_snapshot_lookup_never_opens_disk(monkeypatch, tmp_path):
+def test_append_skip_snapshot_lazily_reads_only_current_frame_index(
+        monkeypatch, tmp_path):
     worker = _bare_worker(tmp_path)
     out = tmp_path / "out"
     out.mkdir()
-    (out / "scan.nxs").touch()
+    output = out / "scan.nxs"
+    _write_minimal_integrated_nxs(output, [1, 2])
 
     def fail_live_scan(*_args, **_kwargs):
-        pytest.fail("per-frame append skip lookup opened the .nxs")
+        pytest.fail("append cursor must not hydrate a LiveScan")
 
     monkeypatch.setattr(iwt, "LiveScan", fail_live_scan)
 
+    assert worker._should_skip_before_read("scan", 1) is True
+    assert worker._append_skip_frames_by_scan == {"scan": {1, 2}}
+
+
+def test_append_skip_snapshot_opens_each_reached_output_once(monkeypatch, tmp_path):
+    worker = _bare_worker(tmp_path)
+    worker.fname = str(tmp_path / "out" / "current.nxs")
+    out = tmp_path / "out"
+    out.mkdir()
+    for name in ("scan_1", "scan_2", "scan_10"):
+        (out / f"{name}.nxs").touch()
+
+    calls = []
+
+    def frame_labels(path):
+        calls.append(Path(path).name)
+        return {1}
+
+    monkeypatch.setattr(iwt, "_nexus_integrated_frame_labels", frame_labels)
+
+    assert worker._should_skip_before_read("scan_2", 1) is True
+    assert worker._should_skip_before_read("scan_2", 1) is True
+    assert calls == ["scan_2.nxs"]
+    assert set(worker._append_skip_frames_by_scan) == {"scan_2"}
+    assert Path(worker.fname).name == "current.nxs"
+
+
+def test_append_skip_snapshot_stop_does_not_open_output(monkeypatch, tmp_path):
+    worker = _bare_worker(tmp_path)
+    worker.command = "stop"
+
+    monkeypatch.setattr(
+        iwt,
+        "_nexus_integrated_frame_labels",
+        lambda _path: pytest.fail("Stop must not start an append cursor read"),
+    )
+
     assert worker._should_skip_before_read("scan", 1) is False
-    assert worker._append_skip_frames_by_scan == {"scan": set()}
+    assert worker._append_skip_frames_by_scan == {}
+
+
+def test_stop_during_append_cursor_read_prevents_next_output_open(
+        monkeypatch, tmp_path):
+    worker = _bare_worker(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    for name in ("scan_1", "scan_2"):
+        (out / f"{name}.nxs").touch()
+    calls = []
+
+    def first_cursor_then_stop(path):
+        calls.append(Path(path).name)
+        worker.command = "stop"
+        return {1}
+
+    monkeypatch.setattr(
+        iwt, "_nexus_integrated_frame_labels", first_cursor_then_stop)
+
+    assert worker._should_skip_before_read("scan_1", 1) is True
+    assert worker._should_skip_before_read("scan_2", 1) is False
+    assert calls == ["scan_1.nxs"]
+
+
+def test_normal_append_process_start_never_primes_whole_directory(tmp_path):
+    worker = _bare_worker(tmp_path)
+    worker.batch_mode = True
+    worker.live_mode = False
+    worker._frames_since_save = 0
+    worker.get_next_image = lambda: (None, None, 1, None, {})
+    worker._wait_if_paused = lambda: None
+    worker.flush_serial_tail = lambda *_args, **_kwargs: None
+    worker._prime_append_skip_snapshots_for_run = lambda: pytest.fail(
+        "ordinary Append startup performed an all-directory output sweep"
+    )
+    worker.sigUpdate = SimpleNamespace(emit=lambda *_: None)
+
+    worker.process_scan()
+
+    assert worker.files_processed == 0
 
 
 def test_append_skip_snapshot_primes_once_read_only(monkeypatch, tmp_path):
@@ -342,20 +405,20 @@ def test_append_skip_snapshot_primes_once_read_only(monkeypatch, tmp_path):
     out = tmp_path / "out"
     out.mkdir()
     output = out / "scan.nxs"
-    output.touch()
+    _write_minimal_integrated_nxs(output, [1, 2])
+    calls = []
 
-    _FakeSnapshotScan.load_calls = []
-    _FakeSnapshotScan.frame_index = [1, 2]
-    monkeypatch.setattr(iwt, "LiveScan", _FakeSnapshotScan)
+    def frame_labels(path):
+        calls.append(str(path))
+        return {1, 2}
+
+    monkeypatch.setattr(iwt, "_nexus_integrated_frame_labels", frame_labels)
 
     worker._prime_append_skip_snapshots_for_run()
     worker._prime_append_skip_snapshots_for_run()
 
-    assert _FakeSnapshotScan.load_calls == [
-        ("scan", str(output), False, "r")
-    ]
+    assert calls == [str(output)]
     assert worker._append_skip_frames_by_scan == {"scan": {1, 2}}
-    assert worker.fname == str(output)
     assert worker._should_skip_before_read("scan", 2) is True
 
 
@@ -369,27 +432,11 @@ def test_append_snapshot_primes_with_read_handle_open(monkeypatch, tmp_path):
     out = tmp_path / "out"
     out.mkdir()
     output = out / "scan.nxs"
-    with h5py.File(output, "w") as h5:
-        h5.create_group("entry")
-
-    class H5OpeningSnapshotScan(_FakeSnapshotScan):
-        frame_index = [4, 5]
-
-        def load_from_h5(self, replace=False, mode="r"):
-            self.load_calls.append((self.name, self.data_file, replace, mode))
-            with h5py.File(self.data_file, mode):
-                pass
-            self.frames.index = list(self.frame_index)
-
-    H5OpeningSnapshotScan.load_calls = []
-    monkeypatch.setattr(iwt, "LiveScan", H5OpeningSnapshotScan)
+    _write_minimal_integrated_nxs(output, [4, 5])
 
     with h5py.File(output, "r"):
         worker._prime_append_skip_snapshots_for_run()
 
-    assert H5OpeningSnapshotScan.load_calls == [
-        ("scan", str(output), False, "r")
-    ]
     assert worker._append_skip_frames_by_scan == {"scan": {4, 5}}
 
 
@@ -407,8 +454,8 @@ def test_append_fresh_scan_primes_empty_and_reads_all(monkeypatch, tmp_path):
     worker.img_fnames = []
     worker.processed = []
 
-    def fail_live_scan(*_args, **_kwargs):
-        pytest.fail("fresh append snapshot should not load a missing .nxs")
+    def fail_snapshot(*_args, **_kwargs):
+        pytest.fail("fresh append snapshot should not open a missing .nxs")
 
     read_calls = []
 
@@ -416,14 +463,13 @@ def test_append_fresh_scan_primes_empty_and_reads_all(monkeypatch, tmp_path):
         read_calls.append(os.fspath(path))
         return np.ones((2, 2), dtype=float)
 
-    monkeypatch.setattr(iwt, "LiveScan", fail_live_scan)
+    monkeypatch.setattr(iwt, "_nexus_integrated_frame_labels", fail_snapshot)
     monkeypatch.setattr(iwt, "read_image", fake_read)
 
     worker._prime_append_skip_snapshots_for_run()
     img_file, scan_name, img_number, img_data, _meta = worker.get_next_image()
 
     assert worker._append_skip_frames_by_scan == {"scan": set()}
-    assert worker.fname == str(tmp_path / "out" / "scan.nxs")
     assert img_file == str(paths[0])
     assert scan_name == "scan"
     assert img_number == 1
@@ -441,11 +487,11 @@ def test_append_snapshot_failure_warns_once_and_skips_nothing(
     out.mkdir()
     (out / "scan.nxs").touch()
 
-    class BrokenSnapshotScan(_FakeSnapshotScan):
-        def load_from_h5(self, replace=False, mode="r"):
-            raise OSError("held read handle")
-
-    monkeypatch.setattr(iwt, "LiveScan", BrokenSnapshotScan)
+    monkeypatch.setattr(
+        iwt,
+        "_nexus_integrated_frame_labels",
+        lambda _path: (_ for _ in ()).throw(OSError("held read handle")),
+    )
 
     with caplog.at_level(logging.WARNING):
         worker._prime_append_skip_snapshots_for_run()
@@ -458,6 +504,21 @@ def test_append_snapshot_failure_warns_once_and_skips_nothing(
         if "append skip snapshot unavailable" in rec.message
     ]
     assert len(warnings) == 1
+
+
+def test_nexus_integrated_frame_labels_unions_1d_and_2d(tmp_path):
+    import h5py
+
+    output = tmp_path / "scan.nxs"
+    with h5py.File(output, "w") as h5:
+        entry = h5.create_group("entry")
+        entry.create_group("integrated_1d").create_dataset(
+            "frame_index", data=np.asarray([1, 3], dtype=np.int64))
+        entry.create_group("integrated_2d").create_dataset(
+            "frame_index", data=np.asarray([2, 3], dtype=np.int64))
+
+    assert iwt._nexus_integrated_frame_labels(output) == {1, 2, 3}
+    assert iwt._nexus_integrated_frame_count(output) == 3
 
 
 def test_append_initialize_abort_preserves_target_on_degraded_load(

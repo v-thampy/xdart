@@ -494,6 +494,55 @@ def test_f5_unfinalized_nxs_deferred_then_consumed_in_full(tmp_path):
     assert str(p) in t._eiger_done_masters           # retired only after finalize+drain
 
 
+def test_ready_nexus_scans_pop_in_natural_order(tmp_path):
+    watch = tmp_path / "watch"
+    watch.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
+    for stem in ("scan_10", "scan_2", "scan_1"):
+        _write_bluesky_nxwriter(watch / f"{stem}.nxs")
+
+    t = _real_dir_watch_thread(watch, out)
+    t._eiger_refill_master_queue()
+    popped = []
+    while True:
+        path = t._eiger_pop_next_master()
+        if path is None:
+            break
+        popped.append(Path(path).name)
+
+    assert popped == ["scan_1.nxs", "scan_2.nxs", "scan_10.nxs"]
+
+
+def test_unfinished_earlier_scan_does_not_block_ready_later_scan(tmp_path):
+    import h5py
+
+    watch = tmp_path / "watch"
+    watch.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
+    earlier = watch / "scan_1.nxs"
+    later = watch / "scan_2.nxs"
+    _write_bluesky_nxwriter(earlier)
+    _write_bluesky_nxwriter(later)
+    with h5py.File(earlier, "r+") as h5:
+        del h5["entry/end_time"]
+
+    t = _real_dir_watch_thread(watch, out)
+    t._eiger_refill_master_queue()
+    assert Path(t._eiger_pop_next_master()).name == "scan_2.nxs"
+    # _eiger_pop_next_master only selects; the real reader retires after drain.
+    t._eiger_done_masters.add(str(later))
+    assert t._eiger_pop_next_master() is None
+
+    with h5py.File(earlier, "r+") as h5:
+        h5["entry"].create_dataset(
+            "end_time", data=b"2026-07-14T00:01:00")
+    t._eiger_refill_master_queue()
+    assert Path(t._eiger_pop_next_master()).name == "scan_1.nxs"
+    assert t._eiger_pop_next_master() is None
+
+
 def test_live_zero_frame_shell_is_retried_without_blocking_ready_scan(tmp_path):
     """A just-created HDF5 shell is not a permanently imageless scan.
 

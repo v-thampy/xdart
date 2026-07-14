@@ -127,6 +127,30 @@ def test_classify_unknown(tmp_path):
     assert info.kind is ImageSourceKind.UNKNOWN
 
 
+def test_detectorless_nexus_counts_zero_without_warning(tmp_path, caplog):
+    from xrd_tools.io.image import count_frames
+
+    p = tmp_path / "align_00020.nxs"
+    with h5py.File(p, "w") as f:
+        entry = f.create_group("entry")
+        entry.create_dataset("end_time", data=b"2026-07-14T00:00:00")
+        entry.create_dataset("diode", data=np.arange(5, dtype=float))
+
+    assert count_frames(p) == 0
+    assert "Could not determine frame count" not in caplog.text
+
+
+def test_torn_nexus_count_still_warns(tmp_path, caplog):
+    from xrd_tools.io.image import count_frames
+
+    p = tmp_path / "torn.nxs"
+    p.write_bytes(b"\x89HDF\r\n partial")
+
+    with caplog.at_level("WARNING"):
+        assert count_frames(p) == 0
+    assert f"Could not determine frame count for {p}" in caplog.text
+
+
 def test_reduction_only_file_is_unknown(tmp_path):
     p = tmp_path / "reduction_only.nxs"
     with h5py.File(p, "w") as f:

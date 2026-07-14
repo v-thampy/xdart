@@ -486,6 +486,15 @@ def count_frames(path: Path | str) -> int:
                 with h5py.File(path, "r") as f:
                     ds = _find_hdf5_image_dataset(f)
                     return ds.shape[0] if ds.ndim >= 3 else 1
+            except ValueError as exc:
+                # A readable detectorless NeXus file is a valid zero-frame
+                # source.  Preserve this typed result for the outer handler;
+                # fabio cannot add information for a NeXus tree with no 2-D
+                # dataset and would replace it with a misleading reader error.
+                if str(exc).startswith("No 2-D+ dataset found"):
+                    raise
+                with fabio.open(path) as f:
+                    return f.nframes
             except Exception:
                 with fabio.open(path) as f:
                     return f.nframes
@@ -512,6 +521,19 @@ def count_frames(path: Path | str) -> int:
         else:
             with fabio.open(path) as f:
                 return f.nframes
+    except ValueError as exc:
+        # A valid HDF5/NeXus acquisition may intentionally contain no detector
+        # frames (alignment/diode-only scans are common in mixed beamline
+        # directories).  That is a normal zero-frame classification, not a
+        # damaged file.  Keep genuinely unreadable/torn containers on the
+        # warning path below.
+        if (ext in {".h5", ".hdf5", ".nxs"}
+                and str(exc).startswith("No 2-D+ dataset found")):
+            logger.debug("No detector image dataset in %s", path)
+            return 0
+        logger.warning("Could not determine frame count for %s", path)
+        logger.debug("count_frames failed for %s", path, exc_info=True)
+        return 0
     except Exception:
         # exc_info at DEBUG so a beamtime recurrence is diagnosable from
         # the log (the WARNING alone cannot distinguish locking vs broken

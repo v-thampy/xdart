@@ -48,3 +48,25 @@ def test_eiger_master_queue_applies_filter_to_stem(tmp_path):
     holder._eiger_refill_master_queue()
     names = sorted(Path(p).name for p in holder._eiger_master_queue)
     assert names == ["Eiger_scan001_master.h5", "Eiger_scan003_master.h5"]
+
+
+def test_nexus_directory_queue_uses_natural_scan_order(tmp_path):
+    for stem in ("scan_10", "scan_2", "scan_1"):
+        (tmp_path / f"{stem}.nxs").touch()
+
+    holder = SimpleNamespace(
+        img_dir=str(tmp_path),
+        img_ext="nxs",
+        include_subdir=False,
+        file_filter="",
+        _eiger_master_queue=[],
+        _eiger_done_masters=set(),
+    )
+    holder._eiger_refill_master_queue = MethodType(
+        iwt.imageThread._eiger_refill_master_queue, holder)
+
+    holder._eiger_refill_master_queue()
+
+    assert [Path(path).name for path in holder._eiger_master_queue] == [
+        "scan_1.nxs", "scan_2.nxs", "scan_10.nxs",
+    ]
