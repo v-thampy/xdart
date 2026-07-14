@@ -137,24 +137,27 @@ def test_folder_change_inert_during_restore(qapp):
     assert h.poni_file == ""
 
 
-def test_meta_ext_hidden_for_nxs_image_type(qapp):
-    """Scan taxonomy (Vivek, Jun 2026): a .nxs embeds its own metadata, so the
-    Meta File field is irrelevant for nxs and must be HIDDEN (it was
-    previously only made readonly)."""
+def test_meta_ext_stays_visible_and_untouched_for_nxs(qapp):
+    """bl17-2 live (maintainer, 2026-07-13): the old rule FORCED meta_ext to
+    'none' and hid the row for nxs — silently overwriting the user's 'auto'
+    after every run and contaminating saved sessions.  The row now stays
+    VISIBLE and the value is never touched by an image-type change."""
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import params as wparams
 
     root = Parameter.create(name="p", type="group", children=wparams)
     h = types.SimpleNamespace(parameters=root, img_ext="nxs")
     sync = MethodType(imageWrangler._sync_meta_ext_to_img_ext, h)
+    meta = root.child("Signal").child("meta_ext")
+    assert meta.value() == "auto"            # fresh default
 
     sync()
-    meta = root.child("Signal").child("meta_ext")
-    assert meta.opts.get("visible") is False
-    assert meta.value() == "none"
+    assert meta.opts.get("visible", True) is True
+    assert meta.value() == "auto"            # NEVER forced to 'none'
 
     h.img_ext = "tif"
     sync()
     assert meta.opts.get("visible", True) is True
+    assert meta.value() == "auto"
 
 
 def test_meta_ext_fresh_default_is_auto(qapp):
@@ -173,8 +176,10 @@ def test_meta_ext_fresh_default_is_auto(qapp):
     [
         ("txt", "txt", "txt"),
         ("SPEC", "spec", "spec"),
-        # A saved literal 'none' is a DELIBERATE post-MD-2 off — honored.
-        ("none", "none", None),
+        # A stored 'none' does NOT persist (2026-07-13): the old nxs sync
+        # force-wrote 'none' into sessions for weeks, so it cannot be
+        # trusted as deliberate; metadata-off stays selectable per session.
+        ("none", "auto", "auto"),
         # Legacy sessions (pre-'auto') encoded "never set" as None/'' — the
         # old metadata-off default, not a choice.  Restore migrates them to
         # the modern default instead of cementing a permanent 'none'
@@ -184,8 +189,8 @@ def test_meta_ext_fresh_default_is_auto(qapp):
     ],
 )
 def test_meta_ext_session_restore_keeps_saved_value(qapp, monkeypatch, saved, param_value, attr_value):
-    """Restored sessions keep a deliberately saved Meta Type; legacy-unset
-    encodings (None/'') migrate to the modern 'auto' default."""
+    """Restored sessions keep a deliberately saved sidecar Meta Type; the
+    off/unset encodings ('none', None, '') all restore to 'auto'."""
     from xdart.gui.tabs.static_scan.wranglers import image_wrangler as iw
 
     class _Combo:
@@ -223,7 +228,7 @@ def test_sync_meta_ext_is_idempotent_no_reemit(qapp):
     sigOptionsChanged UNCONDITIONALLY, and _sync_meta_ext_to_img_ext runs
     inside setup() (wired to sigTreeStateChanged) — an unconditional emit
     there is an infinite setup() recursion (RecursionError at app start).
-    A second sync with unchanged state must emit NOTHING."""
+    Repeated syncs (any img_ext) must emit NOTHING once settled."""
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import params as wparams
 
     root = Parameter.create(name="p", type="group", children=wparams)
@@ -231,18 +236,16 @@ def test_sync_meta_ext_is_idempotent_no_reemit(qapp):
     sync = MethodType(imageWrangler._sync_meta_ext_to_img_ext, h)
     meta = root.child("Signal").child("meta_ext")
 
-    sync()                                   # settle to the tif state
+    sync()                                   # settle
     events = []
     meta.sigOptionsChanged.connect(lambda *a: events.append(a))
     sync()                                   # unchanged -> must not emit
     assert events == []
 
     h.img_ext = "nxs"
-    sync()                                   # real change -> emits (hide)
-    assert events
-    n = len(events)
-    sync()                                   # unchanged nxs state -> silent
-    assert len(events) == n
+    sync()                                   # nxs no longer hides/forces
+    assert events == []
+    assert meta.value() == "auto"
 
 
 def test_apply_disclosure_is_idempotent_no_reemit(qapp):

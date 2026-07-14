@@ -3121,6 +3121,11 @@ class imageThread(wranglerThread):
         match = _name_filter(self.file_filter)
         img_ext = (getattr(self, 'img_ext', '') or '').lower().lstrip('.')
         if not img_ext:
+            # Never skip discovery SILENTLY — an unset extension here reads
+            # as "found nothing" with no clue why (bl17-2, 2026-07-13).
+            logger.warning(
+                'directory discovery skipped: no File Type extension set '
+                '(directory: %s)', getattr(self, 'img_dir', ''))
             return
         suffix = f'_master.{img_ext}' if img_ext in ('h5', 'hdf5') else f'.{img_ext}'
         candidates = _paths_with_suffix(

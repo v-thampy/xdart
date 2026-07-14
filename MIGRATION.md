@@ -294,6 +294,17 @@ for downstream users:
   case-mismatched monitor key will integrate to different (correct) numbers. Re-reduce such
   datasets if exact reproduction of the old (un-normalized) values matters.
 
+## Unreleased (next version)
+
+- **Meta Type is never changed behind your back.**  Selecting the NeXus image
+  type used to force Meta Type to `none` (and hide the row); that silently
+  overwrote a user's `auto` after every directory run.  The row now stays
+  visible and keeps whatever you set.  Because that bug wrote unwanted
+  `none` values into saved sessions, a stored `none` no longer persists
+  across restarts: every session starts at `auto` (metadata-off remains
+  selectable for the session).  Sidecar formats (`txt`, `pdi`, …) persist
+  as before.
+
 ## What's new in v1.1.2
 
 - **Polarization correction is ON by default for fresh scans** (factor 0.99 —
