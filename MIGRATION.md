@@ -294,6 +294,18 @@ for downstream users:
   case-mismatched monitor key will integrate to different (correct) numbers. Re-reduce such
   datasets if exact reproduction of the old (un-normalized) values matters.
 
+## What's new in v1.1.4
+
+- **NeXus Directory mode finds raw files with `Meta Type = auto`.** The v1.1.3
+  metadata-default correction exposed an older GUI seed check that required a
+  sidecar before accepting a directory candidate. Raw `.nxs`, `.h5`, and
+  `.hdf5` containers are now discovered independently of sidecar availability;
+  embedded and optional sidecar metadata are still harvested after discovery.
+- **Nascent containers survive a stale beamline mtime on first sighting.** A
+  newly visible zero-frame container now receives a readiness retry before its
+  wall-clock age can retire it. This covers preserved timestamps and modest
+  server/client clock skew while retaining the bounded retry policy.
+
 ## What's new in v1.1.3
 
 - **Meta Type is never changed behind your back.**  Selecting the NeXus image
