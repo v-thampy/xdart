@@ -177,6 +177,7 @@ class nexusThread(wranglerThread):
 
     def run(self):
         """QThread entry: run the integration body."""
+        self._reset_xye_output_notifications()
         try:
             self._run_impl()
         finally:

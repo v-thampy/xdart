@@ -9249,6 +9249,74 @@ def test_batch_single_frame_still_routes_to_streaming_when_live_policy_serial():
     assert calls == [("streaming", (1,))]
 
 
+def test_xye_flush_announces_first_durable_file_once_per_run(tmp_path):
+    """The browser edge must follow the write and stay O(scans), not O(frames)."""
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
+
+    thread = wranglerThread(Queue(), {}, str(tmp_path / "unused.nxs"), None)
+    output_root = tmp_path / "processed"
+    scan = SimpleNamespace(
+        name="last_scan",
+        data_file=str(output_root / "last_scan.nxs"),
+    )
+
+    def frame(value):
+        return SimpleNamespace(int_1d=SimpleNamespace(
+            unit="q_A^-1",
+            radial=np.array([1.0, 2.0]),
+            intensity=np.array([value, value + 1.0]),
+        ))
+
+    notifications = []
+
+    def on_ready(path):
+        notifications.append((path, sorted(os.listdir(path))))
+
+    thread.sigXyeOutputReady.connect(on_ready)
+    try:
+        thread._xye_buffer = [(0, frame(10.0))]
+        thread._flush_xye_buffer(scan)
+
+        xye_dir = output_root / "last_scan"
+        assert notifications == [(
+            str(xye_dir.resolve()),
+            ["iq_last_scan_0000.xye"],
+        )]
+
+        # More frames in the same scan do not generate high-rate GUI signals.
+        thread._xye_buffer = [(1, frame(20.0))]
+        thread._flush_xye_buffer(scan)
+        assert len(notifications) == 1
+
+        # A restarted Run must re-arm the notification even when the folder
+        # already exists from the previous attempt.
+        thread._reset_xye_output_notifications()
+        thread._xye_buffer = [(2, frame(30.0))]
+        thread._flush_xye_buffer(scan)
+        assert len(notifications) == 2
+        assert notifications[-1][1][-1] == "iq_last_scan_0002.xye"
+    finally:
+        thread.deleteLater()
+
+
+def test_xye_output_ready_does_not_redirect_unrelated_browser(tmp_path):
+    save_dir = tmp_path / "processed"
+    output_dir = save_dir / "new_scan"
+    output_dir.mkdir(parents=True)
+    elsewhere = tmp_path / "older_scan"
+    elsewhere.mkdir()
+    refreshes = []
+    host = SimpleNamespace(h5viewer=SimpleNamespace(
+        dirname=str(elsewhere),
+        update_scans=lambda: refreshes.append(True),
+    ))
+
+    staticWidget._on_xye_output_ready(host, str(output_dir))
+
+    assert host.h5viewer.dirname == str(elsewhere)
+    assert refreshes == []
+
+
 def test_series_average_pending_tracks_running_mean():
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
 

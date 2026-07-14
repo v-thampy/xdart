@@ -702,6 +702,7 @@ class imageThread(wranglerThread):
         # Once the reader is confirmed dead, close it before clearing/reusing
         # any detector state for this generation.
         self._eiger_close_master()
+        self._reset_xye_output_notifications()
 
         self.img_fnames.clear()
         self.processed.clear()

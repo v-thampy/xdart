@@ -312,6 +312,11 @@ for downstream users:
   alignment/diode-only containers no longer emit a misleading frame-count
   warning, while torn or unreadable files still warn and processed xdart outputs
   remain explicitly rejected as raw sources.
+- **The final live XYE output folder appears without Pause/Resume.** The browser
+  is refreshed after the first XYE file in each scan directory is successfully
+  written, rather than only at the pre-write new-scan boundary. The notification
+  is emitted once per directory per Run, so high-rate acquisitions do not add a
+  per-frame GUI refresh.
 
 ## What's new in v1.1.4
 

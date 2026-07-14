@@ -4362,6 +4362,7 @@ class staticWidget(QWidget):
             self.wrangler.sigStitchRequested.connect(self.start_stitch)
         self.wrangler.sigUpdateData.connect(self.update_data)
         self.wrangler.sigUpdateFile.connect(self.new_scan)
+        self.wrangler.sigXyeOutputReady.connect(self._on_xye_output_ready)
         # self.wrangler.sigUpdateFrame.connect(self.new_frame)
         self.wrangler.sigUpdateGI.connect(self.update_scattering_geometry)
         # GI move (Stage B): the wrangler hands its available SPEC motor columns
@@ -4557,6 +4558,7 @@ class staticWidget(QWidget):
         signals = [self.wrangler.sigStart,
                    self.wrangler.sigUpdateData,
                    self.wrangler.sigUpdateFile,
+                   self.wrangler.sigXyeOutputReady,
                    self.wrangler.finished,
                    self.wrangler.sigPaused,
                    self.wrangler.sigResuming]
@@ -4693,6 +4695,35 @@ class staticWidget(QWidget):
         self.h5viewer.dirname = path
         if refresh:
             self.h5viewer.update_scans()
+
+    def _on_xye_output_ready(self, output_dir):
+        """Refresh a visible XYE location after its first file is durable.
+
+        ``sigUpdateFile`` announces a scan before ``save_1d`` creates
+        ``<save-dir>/<scan-name>``.  Without this post-write edge, every scan
+        except the last is discovered incidentally at the next scan boundary;
+        the final folder remains absent until Pause/Refresh.  Do not redirect
+        the browser when the user has navigated elsewhere during a live run.
+        """
+        if not output_dir:
+            return
+        try:
+            output_dir = os.path.abspath(os.path.expanduser(str(output_dir)))
+            current_dir = os.path.abspath(os.path.expanduser(
+                str(getattr(self.h5viewer, 'dirname', '') or '')
+            ))
+            visible_dirs = {
+                os.path.normcase(output_dir),
+                os.path.normcase(os.path.dirname(output_dir)),
+            }
+            if os.path.normcase(current_dir) not in visible_dirs:
+                return
+            self.h5viewer.update_scans()
+        except Exception:
+            logger.debug(
+                'Could not refresh browser for XYE output %s', output_dir,
+                exc_info=True,
+            )
 
     def thread_state_changed(self):
         """Called whenever a thread is started or finished.

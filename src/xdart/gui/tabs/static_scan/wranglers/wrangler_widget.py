@@ -141,6 +141,10 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
     # sigUpdateFrame = Qt.QtCore.Signal(dict)
     sigUpdateFile = Qt.QtCore.Signal(str, str, bool, str, bool, bool)
     sigUpdateGI = Qt.QtCore.Signal(bool)
+    # Emitted after the first XYE file in a scan directory is durable.  The
+    # static widget uses this to refresh the browser after save_1d creates the
+    # directory (sigUpdateFile necessarily fires before that directory exists).
+    sigXyeOutputReady = Qt.QtCore.Signal(str)
     # GI move (Stage B): hands the available SPEC incidence-motor columns to the
     # integrator panel's GI motor dropdown (the integrator owns the selection).
     sigGIMotorOptions = Qt.QtCore.Signal(list)
@@ -173,6 +177,7 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         self.thread.sigUpdate.connect(self.sigUpdateData.emit)
         # self.thread.sigUpdateFrame.connect(self.sigUpdateFrame.emit)
         self.thread.sigUpdateGI.connect(self.sigUpdateGI.emit)
+        self.thread.sigXyeOutputReady.connect(self.sigXyeOutputReady.emit)
 
         # Shared run-controls (CONTROLS section): the staticWidget owns one
         # StaticControls widget and ATTACHES it to the active wrangler, which
@@ -417,6 +422,7 @@ class wranglerThread(Qt.QtCore.QThread):
     # sigUpdateFrame = Qt.QtCore.Signal(dict)
     sigUpdateFile = Qt.QtCore.Signal(str, str, bool, str, bool, bool)
     sigUpdateGI = Qt.QtCore.Signal(bool)
+    sigXyeOutputReady = Qt.QtCore.Signal(str)
 
     # Save cadence (frames between disk flushes), mode-aware: a 1D-only run
     # (``scan.skip_2d``) flushes every ``_LIVE_SAVE_INTERVAL_1D`` frames; a 2D
@@ -465,6 +471,7 @@ class wranglerThread(Qt.QtCore.QThread):
         # workers; drained at end of batch by _flush_xye_buffer.
         self._xye_buffer: list = []
         self._xye_lock = threading.Lock()
+        self._xye_ready_dirs: set[str] = set()
 
         # Per-batch save cadence counter.  Wraps to zero each time
         # _save_to_disk fires.
@@ -829,13 +836,37 @@ class wranglerThread(Qt.QtCore.QThread):
                     'XYE: dropped %d unpublished entries (Stop mid-batch)',
                     len(dropped),
                 )
+        ready_dirs = []
         for img_number, frame in buf:
             try:
-                self.save_1d(scan, frame, img_number)
+                fname = self.save_1d(scan, frame, img_number)
             except Exception as e:
                 logger.warning(
                     'XYE write failed for frame %s: %s', img_number, e,
                 )
+                continue
+            if not fname:
+                continue
+            output_dir = os.path.dirname(os.path.abspath(fname))
+            output_key = os.path.normcase(output_dir)
+            with self._xye_lock:
+                if output_key in self._xye_ready_dirs:
+                    continue
+                self._xye_ready_dirs.add(output_key)
+            ready_dirs.append(output_dir)
+        for output_dir in ready_dirs:
+            try:
+                self.sigXyeOutputReady.emit(output_dir)
+            except Exception:
+                logger.debug(
+                    'XYE output-ready emit failed for %s', output_dir,
+                    exc_info=True,
+                )
+
+    def _reset_xye_output_notifications(self):
+        """Re-arm first-durable-file notifications for a new Run."""
+        with self._xye_lock:
+            self._xye_ready_dirs.clear()
 
     @staticmethod
     def save_1d(scan, frame, idx):
@@ -863,6 +894,7 @@ class wranglerThread(Qt.QtCore.QThread):
         )
         write_xye(fname, r1d.radial, r1d.intensity,
                   np.sqrt(np.abs(r1d.intensity)))
+        return fname
 
     def _save_to_disk(self, scan):
         """Persist scan state to its .nxs file (intermediate save).

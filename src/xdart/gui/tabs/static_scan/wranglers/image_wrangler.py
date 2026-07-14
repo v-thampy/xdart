@@ -537,6 +537,7 @@ class imageWrangler(wranglerWidget):
         self.thread.sigUpdate.connect(self.sigUpdateData.emit)
         # self.thread.sigUpdateFrame.connect(self.sigUpdateFrame.emit)
         self.thread.sigUpdateGI.connect(self.sigUpdateGI.emit)
+        self.thread.sigXyeOutputReady.connect(self.sigXyeOutputReady.emit)
         # Pause (Phase B): the worker emits sigPaused once it has drained+flushed
         # at a frame boundary.  Morph the action button to Resume here AND
         # re-emit at the wrangler level so the host (staticWidget) can lift the

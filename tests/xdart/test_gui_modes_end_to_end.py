@@ -1597,6 +1597,34 @@ def test_xye_live_refresh_preserves_multiselection(tmp_path, widget):
     assert {i.text() for i in lw.selectedItems()} == {"iq_a.xye", "iq_b.xye"}
 
 
+def test_live_xye_last_folder_appears_after_first_write(
+        tmp_path, widget, qapp):
+    """No next-scan or Pause edge is required to discover the final folder."""
+    w = widget
+    save_dir = tmp_path / "processed"
+    save_dir.mkdir()
+    w.h5viewer.dirname = str(save_dir)
+    w.h5viewer.viewer_mode = None
+    w.h5viewer.update_scans()
+
+    scan_dir = save_dir / "scan_0002"
+    assert "scan_0002/" not in {
+        w.h5viewer.ui.listScans.item(row).text()
+        for row in range(w.h5viewer.ui.listScans.count())
+    }
+
+    scan_dir.mkdir()
+    (scan_dir / "iq_scan_0002_0000.xye").write_text("1 2 1\n")
+    # Exercise the production thread -> wrangler -> static-widget signal chain.
+    w.wrangler.thread.sigXyeOutputReady.emit(str(scan_dir))
+    qapp.processEvents()
+
+    assert "scan_0002/" in {
+        w.h5viewer.ui.listScans.item(row).text()
+        for row in range(w.h5viewer.ui.listScans.count())
+    }
+
+
 def test_xye_viewer_mixed_units_warns_and_labels_from_first(widget, caplog):
     import logging
     w = widget
