@@ -4496,3 +4496,59 @@ def test_readiness_bar_live_chip_and_waiting_status(qapp, monkeypatch):
     finally:
         widget.close()
         widget.deleteLater()
+
+
+# ── DIR-1: the outgoing scan's frame list paints before the boundary clear ──
+
+
+def test_frame_boundary_paints_outgoing_list_before_rescope_dir1(
+        qapp, monkeypatch):
+    """DIR-1 GUARD (bl17-2): per-frame updates only ARM the throttled list
+    timer (no leading-edge fire), so with back-to-back short container scans
+    the frame-driven boundary used to clear ``scan.frames.index`` before the
+    outgoing scan's tail ever painted — the Frames panel showed 1-2 of 5
+    frames and jumped to the next scan.  The boundary must run the LIGHT list
+    flush for the outgoing scan (all 5 rows, one paint) before rescoping."""
+    from types import MethodType, SimpleNamespace
+
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xdart.modules.live import LiveFrame
+
+    widget = staticWidget()
+    try:
+        # Scan A processed 5 frames; the throttled list flush never fired, so
+        # the h5viewer list is stale (this is the burst-inside-one-window
+        # state the boundary races).
+        widget.scan.name = "scanA"
+        with widget.scan.scan_lock:
+            widget.scan.frames.index.extend([1, 2, 3, 4, 5])
+
+        paints = []
+        real_update = widget.h5viewer.update_data
+
+        def recording_update(self_h5, *a, **k):
+            paints.append((widget.scan.name,
+                           len(widget.scan.frames.index)))
+            return real_update(*a, **k)
+
+        widget.h5viewer.update_data = MethodType(recording_update,
+                                                 widget.h5viewer)
+
+        # Scan B's first frame arrives (the frame-driven boundary).
+        frame_b = LiveFrame(idx=1)
+        frame_b.source_file = "/data/scanB_00001.nxs"
+        frame_b.source_frame_idx = 0
+        widget.wrangler.thread._published_frames = {1: frame_b}
+        widget.wrangler.thread.batch_mode = False
+
+        widget.update_data(1)
+
+        # The OUTGOING scan's complete list painted BEFORE the rescope...
+        assert ("scanA", 5) in paints, (
+            f"outgoing scan's full list never painted; paints={paints}")
+        # ...and the panel then rescoped to the new scan.
+        assert widget.scan.name.startswith("scanB")
+    finally:
+        widget.close()
+        widget.deleteLater()
