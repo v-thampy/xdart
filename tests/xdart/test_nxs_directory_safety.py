@@ -251,6 +251,36 @@ def test_processed_and_imageless_mixed_skip_raw_flows(tmp_path):
     assert str(watch / "02_processed_00001.nxs") in t._eiger_done_masters
 
 
+def test_single_file_nexus_wrangler_rejects_processed_cleanly(tmp_path):
+    """Sibling caller of the shared finder: the single-file NeXus reduction
+    wrangler (`open_nexus_image_stack`) must reject a processed xdart file with a
+    clean, actionable stop — NOT let the finder's new ProcessedXdartInputError
+    (a ValueError) escape run()'s try/finally as an uncaught QThread exception."""
+    from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler_thread import (
+        nexusThread,
+    )
+    proc = _write_processed_xdart(tmp_path / "prev_run_00001.nxs")
+    out = tmp_path / "out"
+    out.mkdir()
+    scan = LiveScan("scan", data_file=str(out / "scan.nxs"), static=True)
+    t = nexusThread(
+        Queue(), {}, threading.RLock(), str(out / "scan.nxs"),
+        str(proc),                       # nexus_file — the processed output
+        PONI(dist=0.2, poni1=0.1, poni2=0.1, wavelength=1e-10),
+        None,                            # mask_file
+        False, None, 1, 0.0,             # gi, th_mtr, sample_orientation, tilt
+        "q_total", "qip_qoop",           # gi modes
+        "start", scan,
+    )
+    labels = []
+    t.showLabel.connect(labels.append)
+    # Must return cleanly (before the diff: uncaught ProcessedXdartInputError).
+    t._run_impl()
+    assert any("processed xdart" in m.lower() for m in labels), labels
+    # No output was written on rejection (rejection precedes any reduction/save).
+    assert not (out / "scan.nxs").exists()
+
+
 def test_processed_file_never_resolves_integrated_2d_via_worker(tmp_path):
     """Direct pin: opening a processed container through the worker's open path
     resolves NO dataset (nframes=0), never /entry/integrated_2d/intensity."""

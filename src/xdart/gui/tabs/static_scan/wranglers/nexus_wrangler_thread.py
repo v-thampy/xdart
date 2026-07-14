@@ -53,6 +53,7 @@ from xrd_tools.integrate.calibration import poni_to_integrator, get_detector
 from xrd_tools.reduction import GIFreezeError
 from xrd_tools.io.nexus import open_nexus_image_stack, read_nexus
 from xrd_tools.io.image import read_image
+from xrd_tools.io.processed_scan_id import ProcessedXdartInputError
 from xrd_tools.io.export import write_xye
 from xdart.utils.h5pool import get_pool as _get_h5pool
 from xdart.modules.reduction import (
@@ -239,6 +240,17 @@ class nexusThread(wranglerThread):
         # object, so chunked reads can cross file boundaries.
         try:
             ds_cm = open_nexus_image_stack(self.nexus_file, self.entry)
+        except ProcessedXdartInputError:
+            # F-NXS-2: the selected file is a processed xdart output (integrated
+            # results, no raw detector frames).  The shared finder now rejects it
+            # before the largest-3D fallback could return an integrated cake as a
+            # raw stack; surface a clear message and stop cleanly instead of
+            # letting the ValueError escape run()'s try/finally as an uncaught
+            # QThread exception (mirrors the image wrangler's processed-skip).
+            self.showLabel.emit(
+                'Selected file is a processed xdart output, not a raw NeXus '
+                'acquisition; open it in the viewer instead of reducing it.')
+            return
         except (KeyError, FileNotFoundError) as exc:
             self.showLabel.emit(f'No image dataset found in NeXus file: {exc}')
             return
