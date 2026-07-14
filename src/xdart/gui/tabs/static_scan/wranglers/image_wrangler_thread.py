@@ -642,29 +642,6 @@ class imageThread(wranglerThread):
         self.files_processed_by_output = {}
         self._last_files_processed_by_output = {}
 
-    # ── Display helpers ──────────────────────────────────────────────────
-
-    @staticmethod
-    def _middle_truncate(text, max_len=40, ellipsis='...'):
-        """Shorten ``text`` to at most ``max_len`` chars by elliding the middle.
-
-        ``"Combi4_Angledependence_samz_4p9_03271002_0001"`` →
-        ``"Combi4_Angledep..._4p9_03271002_0001"``
-
-        Keeps the head and tail roughly balanced so the most identifying parts
-        of long filenames (prefix + frame number suffix) stay visible.
-        """
-        if text is None:
-            return ''
-        if len(text) <= max_len:
-            return text
-        keep = max_len - len(ellipsis)
-        if keep <= 0:
-            return ellipsis[:max_len]
-        head = (keep + 1) // 2  # bias the head slightly longer on odd splits
-        tail = keep - head
-        return f'{text[:head]}{ellipsis}{text[-tail:]}' if tail else f'{text[:head]}{ellipsis}'
-
     # ── Main entry point ─────────────────────────────────────────────────
 
     def run(self):
@@ -1243,9 +1220,12 @@ class imageThread(wranglerThread):
                 # include the frame index so progress is visible.
                 _ext = Path(img_file).suffix.lower()
                 _multi = _ext in ('.h5', '.hdf5', '.nxs') or _is_eiger_master(img_file)
-                _label = (f'Collecting {self._middle_truncate(fname)} [frame {img_number}]'
+                # Full name, untruncated (maintainer, 2026-07-13): the status
+                # bar has the room, and QStatusBar/showMessage never forces
+                # window width.
+                _label = (f'Collecting {fname} [frame {img_number}]'
                           if _multi else
-                          f'Collecting {self._middle_truncate(fname)}')
+                          f'Collecting {fname}')
                 if self.batch_mode:
                     # Batch: the label is the only progress feedback while the
                     # whole pending set is read up front.
@@ -2686,11 +2666,9 @@ class imageThread(wranglerThread):
         # can see the frame index advancing during the scan.
         _ext = Path(img_file).suffix.lower()
         if _ext in ('.h5', '.hdf5', '.nxs') or _is_eiger_master(img_file):
-            self.showLabel.emit(
-                f'{self._middle_truncate(fname)} [frame {img_number}]'
-            )
+            self.showLabel.emit(f'{fname} [frame {img_number}]')
         else:
-            self.showLabel.emit(self._middle_truncate(fname))
+            self.showLabel.emit(fname)
 
         _t1 = time.time()
         # Threshold via dummy sentinel + stable cached mask — see
