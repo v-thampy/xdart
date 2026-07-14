@@ -6303,7 +6303,19 @@ class staticWidget(QWidget):
             return                       # not in a run; nothing to lift
         self._set_scan_integrated_reads_transient(False)
         self.displayframe.set_processing_active(False)
+        invalidate_levels = getattr(
+            self.displayframe, "invalidate_image_level_caches", None)
+        if callable(invalidate_levels):
+            invalidate_levels()
         self.h5viewer.set_run_writing(False)
+        request_repaint = getattr(
+            self.displayframe, "request_current_selection_repaint", None)
+        if callable(request_repaint):
+            request_repaint(
+                generation=getattr(
+                    self.displayframe, "display_generation", None),
+                reason="pause",
+            )
 
     def _on_run_resuming(self):
         """Resume (Phase B): RE-ENGAGE the freeze guard BEFORE the worker flips

@@ -175,6 +175,11 @@ class XDImageWidget(Qt.QtWidgets.QWidget):
     def setRect(self, rect):
         self.imageItem.setRect(rect)
 
+    def invalidate_level_cache(self):
+        """Forget autoscale state without clearing the displayed image."""
+        self._level_cache = None
+        self._level_scan_token = None
+
     def update_image(self, q=None):
         self.displayed_image = np.copy(self.raw_image)
         if self.ui.logButton.isChecked():
@@ -252,7 +257,7 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
             return np.asarray(self.raw_image)
         return np.array(self.raw_image, dtype=float, copy=True)
 
-    def _cached_levels(self, scale, cmap, pct):
+    def _cached_levels(self, scale, cmap, pct, data_range):
         raw = np.asarray(self.raw_image)
         displayed = np.asarray(self.displayed_image)
         key = (
@@ -263,6 +268,7 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
             str(displayed.dtype),
             str(raw.dtype),
             getattr(self, "_level_scan_token", None),
+            tuple(data_range),
         )
         now = time.perf_counter()
         cached = self._level_cache
@@ -300,6 +306,7 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
         cm = pg.colormap.getFromMatplotlib(cmap)  # prepare a linear color map
         self.histogram.axis.setLogMode(False)
 
+        linear_pct = tuple(kwargs.pop("linear_percentiles", (2, 98)))
         if scale == 'Log':
             min_val = np.nanmin(self.displayed_image)
             if min_val < 1:
@@ -321,18 +328,24 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
             pct = (0.5, 99.9)
 
         else:
-            # Linear autoscale: clip the top/bottom a bit harder than the old
-            # (1, 99) so saturated tiff pixels don't wash the image out (R2-4).
-            # Shared by the raw / cake / waterfall panels.  Log/Sqrt unchanged.
+            # Linear autoscale percentiles are selected by the panel owner.
+            # Detector previews use a tighter ceiling-safe policy than cakes.
+            # Log/Sqrt are unchanged.
             # _ceiling_safe_levels additionally drops exact detector-ceiling
             # (65535 / uint32) pixels from the percentile population so an
             # unmasked saturated block (toggle OFF) can't blow out the scale.
-            pct = (2, 98)
+            pct = linear_pct
 
             self.histogram.axis.setLogMode(False)
 
         t_transform = time.perf_counter() if perf else 0.0
-        levels, cache_hit = self._cached_levels(scale, cmap, pct)
+        # This min/max is also needed for the colorbar limits below. Include it
+        # in the short-lived cache key so an async replacement or reused frame
+        # label with a radically different intensity range cannot inherit stale
+        # levels for the rest of the pause/scan. Identical re-renders still hit.
+        low, high = _finite_minmax(self.displayed_image)
+        levels, cache_hit = self._cached_levels(
+            scale, cmap, pct, (low, high))
         t_levels = time.perf_counter() if perf else 0.0
         self.imageItem.setImage(self.displayed_image, levels=levels, **kwargs)
         t_setimage = time.perf_counter() if perf else 0.0
@@ -342,7 +355,6 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
         # setLevels() clamp the nanpercentile levels to [NaN, NaN], so the image
         # falls back to pyqtgraph autoscale (data min/max) instead of the
         # percentile range — the Image Viewer "scaled to min/max" symptom.
-        low, high = _finite_minmax(self.displayed_image)
         self.histogram.lo_lim, self.histogram.hi_lim = low, high
         self.histogram.setLevels(values=levels)
         if perf:

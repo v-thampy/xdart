@@ -2008,6 +2008,32 @@ def test_display_generation_bumps_on_mode_switch_and_selection():
     assert host.display_generation == 3
 
 
+def test_display_generation_bumps_when_scan_changes_with_reused_frame_label():
+    """Directory scans commonly restart at frame 1; scan identity is part of
+    the visible selection even when the integer label is unchanged."""
+    host = SimpleNamespace(
+        display_generation=4,
+        _last_selection_sig=None,
+        frame_ids=[1],
+        overall=False,
+        scan=SimpleNamespace(name="scan-a"),
+    )
+    host._selection_generation_signature = MethodType(
+        displayFrameWidget._selection_generation_signature, host)
+    host._bump_display_generation = MethodType(
+        displayFrameWidget._bump_display_generation, host)
+    host._sync_selection_generation = MethodType(
+        displayFrameWidget._sync_selection_generation, host)
+
+    host._sync_selection_generation()
+    assert host.display_generation == 4
+
+    host.scan.name = "scan-b"
+    host._sync_selection_generation()
+
+    assert host.display_generation == 5
+
+
 def test_select_last_scan_entry_picks_last_file_row():
     # End-of-(XYE)-batch auto-select: select the last data-file row in
     # listScans (most recent output), skipping '..' and directories.

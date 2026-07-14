@@ -1129,6 +1129,33 @@ class H5Viewer(QWidget):
             lw.setCurrentRow(best_row, QItemSelectionModel.ClearAndSelect)
         return best_row
 
+    def _restore_loaded_scan_selection(self):
+        """Make the Scans highlight agree with the file actually loaded.
+
+        Used after a browse click is rejected during an active write. Signals
+        stay blocked so restoring visual truth cannot enqueue another load.
+        """
+        lw = self.ui.listScans
+        fname = getattr(getattr(self, "file_thread", None), "fname", None)
+        target = os.path.basename(fname) if fname else None
+        if not target:
+            scan_name = getattr(self, "scan_name", None)
+            target = f"{scan_name}.nxs" if scan_name else None
+        if not target:
+            return False
+        was_blocked = lw.blockSignals(True)
+        try:
+            lw.clearSelection()
+            for row in range(lw.count()):
+                item = lw.item(row)
+                if item.text() == target:
+                    lw.setCurrentItem(
+                        item, QItemSelectionModel.ClearAndSelect)
+                    return True
+        finally:
+            lw.blockSignals(was_blocked)
+        return False
+
     # ── Selection helper ──────────────────────────────────────────────
     def set_current_frame(self, item_or_row):
         """Advance the listData cursor *and narrow the selection* to a
@@ -1613,8 +1640,21 @@ class H5Viewer(QWidget):
             # still populates + deselects).  Only reached in normal mode — the
             # viewer branches above return first, keeping their auto-first-frame.
             current_fname = getattr(getattr(self, 'file_thread', None), 'fname', None)
-            if (getattr(self, '_run_writing', False)
-                    or (fpath and fpath == current_fname)):
+            if getattr(self, '_run_writing', False):
+                # The normal Int browser and the live display still share one
+                # mutable Scan. Repointing it while the writer is active can
+                # mix live publications with a browsed file, so reject the
+                # operation visibly: restore the actually loaded scan instead
+                # of leaving a misleading highlight on a file we did not load.
+                logger.info(
+                    "Pause the active run before browsing processed scan %s",
+                    os.path.basename(fpath),
+                )
+                restore = getattr(self, "_restore_loaded_scan_selection", None)
+                if callable(restore):
+                    restore()
+                return
+            if fpath and fpath == current_fname:
                 self.set_file(fpath)
                 return
             self._browser_scan_reset_pending = True

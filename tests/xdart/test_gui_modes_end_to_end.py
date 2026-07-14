@@ -1034,6 +1034,26 @@ def test_image_widget_linear_levels_are_2_98_percentile(qapp):
         qapp.processEvents()
 
 
+def test_image_widget_accepts_cake_specific_linear_percentiles(qapp):
+    from xdart.gui.widgets import pgImageWidget
+    w = pgImageWidget(lockAspect=True, raw=False)
+    try:
+        img = np.arange(1000, dtype=float).reshape(20, 50)
+        w.setImage(
+            img,
+            scale="Linear",
+            cmap="viridis",
+            linear_percentiles=(0.5, 99.5),
+        )
+        assert np.allclose(
+            w.imageItem.levels,
+            np.nanpercentile(img, (0.5, 99.5)),
+        )
+    finally:
+        w.deleteLater()
+        qapp.processEvents()
+
+
 def test_image_widget_reuses_levels_for_short_live_flush(qapp, monkeypatch):
     from xdart.gui.widgets import pgImageWidget
     import xdart.gui.widgets.image_widget as image_widget_mod
@@ -1058,7 +1078,8 @@ def test_image_widget_reuses_levels_for_short_live_flush(qapp, monkeypatch):
         qapp.processEvents()
 
 
-def test_image_widget_level_cache_is_scoped_by_scan_token(qapp, monkeypatch):
+def test_image_widget_level_cache_is_scoped_by_scan_token_and_data_range(
+        qapp, monkeypatch):
     from xdart.gui.widgets import pgImageWidget
     import xdart.gui.widgets.image_widget as image_widget_mod
 
@@ -1072,17 +1093,24 @@ def test_image_widget_level_cache_is_scoped_by_scan_token(qapp, monkeypatch):
     w = pgImageWidget(lockAspect=True, raw=True)
     try:
         first = np.ones((20, 20), dtype=float)
+        first_repeat = first.copy()
         second_same_scan = np.full((20, 20), 2.0)
         third_new_scan = np.full((20, 20), 3.0)
 
         w.setImage(first, scale="Linear", cmap="viridis",
+                   level_scan_token=("scan-a", 1))
+        w.setImage(first_repeat, scale="Linear", cmap="viridis",
                    level_scan_token=("scan-a", 1))
         w.setImage(second_same_scan, scale="Linear", cmap="viridis",
                    level_scan_token=("scan-a", 1))
         w.setImage(third_new_scan, scale="Linear", cmap="viridis",
                    level_scan_token=("scan-b", 1))
 
-        assert calls == [((1.0), (2, 98)), ((3.0), (2, 98))]
+        assert calls == [
+            (1.0, (2, 98)),
+            (2.0, (2, 98)),
+            (3.0, (2, 98)),
+        ]
 
         fourth_unscoped = np.full((20, 20), 4.0)
         fifth_unscoped = np.full((20, 20), 5.0)
@@ -1091,9 +1119,31 @@ def test_image_widget_level_cache_is_scoped_by_scan_token(qapp, monkeypatch):
 
         assert calls == [
             (1.0, (2, 98)),
+            (2.0, (2, 98)),
             (3.0, (2, 98)),
             (4.0, (2, 98)),
+            (5.0, (2, 98)),
         ]
+    finally:
+        w.deleteLater()
+        qapp.processEvents()
+
+
+def test_image_widget_recomputes_levels_across_twenty_fold_intensity_drop(qapp):
+    from xdart.gui.widgets import pgImageWidget
+    w = pgImageWidget(lockAspect=True, raw=True)
+    try:
+        high = np.linspace(0.0, 8000.0, 400).reshape(20, 20)
+        low = np.linspace(0.0, 400.0, 400).reshape(20, 20)
+        token = ("directory-scan", 1)
+
+        w.setImage(
+            high, scale="Linear", cmap="viridis", level_scan_token=token)
+        w.setImage(
+            low, scale="Linear", cmap="viridis", level_scan_token=token)
+
+        assert np.allclose(w.imageItem.levels, np.nanpercentile(low, (2, 98)))
+        assert w.imageItem.levels[1] < 400.0
     finally:
         w.deleteLater()
         qapp.processEvents()

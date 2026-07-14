@@ -413,7 +413,11 @@ def test_on_run_paused_lifts_guard_but_keeps_run_active():
     w = SimpleNamespace(
         _run_active=True,
         displayframe=SimpleNamespace(
-            set_processing_active=lambda v: calls.append(('proc', v))),
+            display_generation=9,
+            set_processing_active=lambda v: calls.append(('proc', v)),
+            invalidate_image_level_caches=lambda: calls.append(('levels', None)),
+            request_current_selection_repaint=lambda **kwargs:
+                calls.append(('repaint', kwargs))),
         h5viewer=SimpleNamespace(
             set_run_writing=lambda v: calls.append(('write', v))),
     )
@@ -421,6 +425,8 @@ def test_on_run_paused_lifts_guard_but_keeps_run_active():
         staticWidget._set_scan_integrated_reads_transient, w)  # no-op: host has no scan
     staticWidget._on_run_paused(w)
     assert ('proc', False) in calls and ('write', False) in calls   # guard LIFTED
+    assert ('levels', None) in calls
+    assert ('repaint', {'generation': 9, 'reason': 'pause'}) in calls
     assert w._run_active is True            # run still active, just frozen
 
 

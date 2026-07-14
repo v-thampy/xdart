@@ -262,6 +262,7 @@ def _scan_click_viewer(*, current_file="/data/old.nxs", run_writing=False,
         new_scan_loaded=False,
         file_thread=SimpleNamespace(fname=current_file),
         set_file=lambda fpath: calls.append(fpath),
+        _restore_loaded_scan_selection=lambda: calls.append("restore"),
     )
     viewer.scans_clicked = MethodType(H5Viewer.scans_clicked, viewer)
     return viewer, calls
@@ -308,6 +309,6 @@ def test_run_guarded_browser_click_does_not_arm_deferred_reset():
 
     viewer.scans_clicked(_ScanItem("new.nxs"))
 
-    assert calls == ["/data/new.nxs"]
+    assert calls == ["restore"]
     assert viewer._browser_scan_reset_pending is False
     assert viewer.new_scan_loaded is False

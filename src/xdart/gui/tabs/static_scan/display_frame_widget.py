@@ -1061,7 +1061,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 norm_ids.append(int(idx))
             except (TypeError, ValueError):
                 norm_ids.append(str(idx))
-        return (tuple(norm_ids), bool(getattr(self, "overall", False)))
+        base = (tuple(norm_ids), bool(getattr(self, "overall", False)))
+        scan_key = overlay_current_scan_key(self)
+        # Keep duck-widget compatibility when no scan identity exists, while
+        # making a real Directory A/frame-1 -> B/frame-1 transition a distinct
+        # selection.  The generation then cancels stale hydration/render work.
+        return (scan_key, *base) if scan_key is not None else base
 
     def _bump_display_generation(self, *, reason=SupersedeReason.RESET):
         """Advance the monotonic display generation.  A render/worker result
@@ -2457,7 +2462,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         display_data = _downsample_for_display(image, widget)
         widget.setImage(
             display_data, scale=self.scale, cmap=self.cmap,
-            level_scan_token=self._image_level_scan_token(),
+            level_scan_token=self._image_level_scan_token(role=role, state=state),
+            # Detector previews retain the ceiling-safe 2/98 policy. Cakes do
+            # not contain detector saturation sentinels; 98% clipped real peak
+            # area too aggressively and made browsed cakes look oversaturated.
+            linear_percentiles=(2, 98) if role is PanelRole.RAW_2D
+            else (0.5, 99.5),
         )
         widget.setRect(rect)
         if role is not PanelRole.RAW_2D:
@@ -4564,11 +4574,29 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             logger.debug("image widget clear failed", exc_info=True)
         displayFrameWidget._set_image_widget_colorbar_visible(widget, False)
 
-    def _image_level_scan_token(self):
+    def _image_level_scan_token(self, *, role=None, state=None):
+        render_ids = tuple(getattr(state, "render_ids", ()) or ()) \
+            if state is not None else ()
+        role_key = getattr(role, "value", role)
         return (
+            role_key,
             overlay_current_scan_key(self),
             getattr(self, "display_generation", None),
+            render_ids,
         )
+
+    def invalidate_image_level_caches(self):
+        """Drop display-only autoscale state without clearing image pixels."""
+        for widget in (
+            getattr(self, "image_widget", None),
+            getattr(self, "binned_widget", None),
+            getattr(self, "wf_widget", None),
+        ):
+            if widget is None:
+                continue
+            invalidate = getattr(widget, "invalidate_level_cache", None)
+            if callable(invalidate):
+                invalidate()
 
     @staticmethod
     def _set_image_widget_colorbar_visible(widget, visible):
