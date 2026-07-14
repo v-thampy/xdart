@@ -966,7 +966,7 @@ class H5Viewer(QWidget):
         return [int(c) if c.isdigit() else c.lower()
                 for c in re.split(r'(\d+)', text)]
 
-    def update_scans(self):
+    def update_scans(self, *, preserve_selection=False):
         """Populate listScans with files in the current directory.
 
         In normal mode, shows HDF5 files and directories.
@@ -981,6 +981,22 @@ class H5Viewer(QWidget):
         if not os.path.exists(self.dirname):
             return
 
+        # Read and sort the directory before mutating the widget. A transient
+        # SMB/NFS enumeration failure must leave the operator's current list and
+        # selection intact so a later retry can recover cleanly.
+        with os.scandir(self.dirname) as it:
+            entries = list(it)
+        if (getattr(self.ui, 'dateSort', None) is not None
+                and self.ui.dateSort.isChecked()):
+            def _safe_mtime(e):
+                try:
+                    return e.stat().st_mtime
+                except OSError:
+                    return 0.0        # a vanished/again entry sorts last
+            entries.sort(key=_safe_mtime, reverse=True)
+        else:
+            entries.sort(key=lambda e: self._natural_sort_key(e.name))
+
         lw = self.ui.listScans
         was_blocked = lw.blockSignals(True)
         try:
@@ -989,7 +1005,12 @@ class H5Viewer(QWidget):
             # the current selection by name so we can restore it after the
             # rebuild — otherwise the overlay resets every time a file is written
             # (the crux of the real-time compare/track workflow).
-            preserve_selection = self.viewer_mode == 'xye'
+            # XYE overlay refreshes always preserve its multi-selection.  Other
+            # callers may opt in when a background filesystem notification is
+            # only adding an entry and must not move the operator's selection.
+            preserve_selection = (
+                self.viewer_mode == 'xye' or bool(preserve_selection)
+            )
             selected_names = (
                 {item.text() for item in lw.selectedItems()}
                 if preserve_selection else set()
@@ -1003,24 +1024,8 @@ class H5Viewer(QWidget):
             lw.addItem('..')
 
             # os.scandir exposes d_type from the single readdir, so entry.is_dir()
-            # needs no extra stat() per entry (unlike os.path.isdir).  This is the
-            # hot path on Refresh / folder navigation / browsing large raw-image
-            # dirs, and every saved stat is a network round-trip on the SSRL NFS
-            # deployment.  is_dir() follows symlinks by default, matching isdir.
-            with os.scandir(self.dirname) as it:
-                entries = list(it)
-            # date_sort_scans: honor the "Date" toggle (checked -> newest first by
-            # mtime), else the natural-name sort.  Read the toggle state LIVE here.
-            if (getattr(self.ui, 'dateSort', None) is not None
-                    and self.ui.dateSort.isChecked()):
-                def _safe_mtime(e):
-                    try:
-                        return e.stat().st_mtime
-                    except OSError:
-                        return 0.0        # a vanished/again entry sorts last
-                entries.sort(key=_safe_mtime, reverse=True)
-            else:
-                entries.sort(key=lambda e: self._natural_sort_key(e.name))
+            # needs no extra stat() per entry (unlike os.path.isdir). This is the
+            # hot path on Refresh and every saved stat is a network round-trip.
             for entry in entries:
                 name = entry.name
                 if entry.is_dir():

@@ -20,6 +20,7 @@ from .browse_debug import browse_debug_enabled, browse_debug_log, sequence_summa
 
 logger = logging.getLogger(__name__)
 _ORPHANED_STITCH_THREADS = []
+_XYE_REFRESH_RETRY_MS = (150, 500, 1500, 3000, 7000)
 
 
 def _retain_orphaned_close_thread(thread) -> None:
@@ -4254,6 +4255,15 @@ class staticWidget(QWidget):
         self._pending_reint_idx = None
         self._reint_update_timer = Coalescer(200, mode="throttle", parent=self)
         self._reint_update_timer.triggered.connect(self._flush_reintegrate_update)
+        # A newly-created SMB directory can remain absent from one or more
+        # cached listings. Keep retries on one parented, single-shot timer so
+        # they cannot outlive the widget or multiply per frame.
+        self._xye_refresh_timer = QtCore.QTimer(self)
+        self._xye_refresh_timer.setSingleShot(True)
+        self._xye_refresh_timer.timeout.connect(
+            self._retry_pending_xye_output_refreshes)
+        self._pending_xye_output_dirs = {}
+        self._xye_refresh_retry_index = 0
         # Per-frame work is COALESCED off the GUI event loop: update_data only
         # POPs the freshly-integrated frame (cheap) into _pending_frames; the
         # heavy build/upsert/scan_data runs once per ~200 ms flush over ALL frames
@@ -4712,18 +4722,87 @@ class staticWidget(QWidget):
             current_dir = os.path.abspath(os.path.expanduser(
                 str(getattr(self.h5viewer, 'dirname', '') or '')
             ))
+            output_key = os.path.normcase(output_dir)
             visible_dirs = {
-                os.path.normcase(output_dir),
+                output_key,
                 os.path.normcase(os.path.dirname(output_dir)),
             }
             if os.path.normcase(current_dir) not in visible_dirs:
                 return
-            self.h5viewer.update_scans()
+            self._pending_xye_output_dirs[output_key] = output_dir
+            self._xye_refresh_retry_index = 0
+            self._xye_refresh_timer.stop()
+            self._refresh_pending_xye_output_dirs()
         except Exception:
             logger.debug(
                 'Could not refresh browser for XYE output %s', output_dir,
                 exc_info=True,
             )
+
+    def _retry_pending_xye_output_refreshes(self):
+        """Owned-timer callback for a listing that was stale on SMB/NFS."""
+        self._refresh_pending_xye_output_dirs()
+
+    def _refresh_pending_xye_output_dirs(self):
+        pending = getattr(self, '_pending_xye_output_dirs', None)
+        if not pending:
+            return
+        current_dir = os.path.abspath(os.path.expanduser(
+            str(getattr(self.h5viewer, 'dirname', '') or '')
+        ))
+        current_key = os.path.normcase(current_dir)
+
+        # Navigation wins over background refresh. A later scan notification or
+        # explicit Refresh will rebuild the location if the user returns.
+        for key, output_dir in list(pending.items()):
+            if current_key not in {
+                    key, os.path.normcase(os.path.dirname(output_dir))}:
+                pending.pop(key, None)
+        if not pending:
+            self._xye_refresh_timer.stop()
+            self._xye_refresh_retry_index = 0
+            return
+
+        try:
+            self.h5viewer.update_scans(preserve_selection=True)
+        except Exception:
+            logger.debug("XYE output directory refresh failed", exc_info=True)
+
+        list_widget = self.h5viewer.ui.listScans
+        listed = {
+            list_widget.item(row).text()
+            for row in range(list_widget.count())
+        }
+        viewer_mode = getattr(self.h5viewer, 'viewer_mode', None)
+        for key, output_dir in list(pending.items()):
+            if current_key == os.path.normcase(os.path.dirname(output_dir)):
+                visible = os.path.basename(output_dir) + '/' in listed
+            elif viewer_mode == 'xye':
+                visible = any(name.lower().endswith('.xye') for name in listed)
+            else:
+                # Normal mode intentionally hides XYE files inside the folder;
+                # the refresh itself is the only observable action there.
+                visible = True
+            if visible:
+                pending.pop(key, None)
+
+        if not pending:
+            self._xye_refresh_timer.stop()
+            self._xye_refresh_retry_index = 0
+            return
+
+        retry_index = self._xye_refresh_retry_index
+        if retry_index >= len(_XYE_REFRESH_RETRY_MS):
+            logger.warning(
+                "XYE output folder not visible after bounded refresh retries: %s",
+                ', '.join(sorted(pending.values())),
+            )
+            pending.clear()
+            self._xye_refresh_timer.stop()
+            self._xye_refresh_retry_index = 0
+            return
+        self._xye_refresh_retry_index += 1
+        self._xye_refresh_timer.start(_XYE_REFRESH_RETRY_MS[retry_index])
 
     def thread_state_changed(self):
         """Called whenever a thread is started or finished.
