@@ -72,6 +72,7 @@ class StaticControls(QtWidgets.QWidget):
     modeChanged = QtCore.Signal(str)
     batchToggled = QtCore.Signal(bool)
     liveToggled = QtCore.Signal(bool)
+    readinessSummaryClicked = QtCore.Signal()
     writeModeChanged = QtCore.Signal(str)    # 'Append' / 'Overwrite' (output mode)
 
     # Phase-B action-button morph table (text, runPhase property, enabled).
@@ -131,6 +132,11 @@ class StaticControls(QtWidgets.QWidget):
         readiness.addWidget(self.readinessLive)
         self.readinessLabel = _ElidingLabel('')
         self.readinessLabel.setObjectName('runReadinessLabel')
+        # Click-to-count (DIR-2 convergence): a click on the summary is
+        # surfaced as a signal; the owner decides whether it means
+        # anything (it does only while the chip shows a FILE count).
+        self.readinessLabel.mousePressEvent = (
+            lambda _ev: self.readinessSummaryClicked.emit())
         readiness.addWidget(self.readinessLabel, 1)
         self.readinessRow.hide()
         outer.addWidget(self.readinessRow)

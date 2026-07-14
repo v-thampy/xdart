@@ -1623,6 +1623,9 @@ class ControlProfile:
         field(default_factory=dict)
     )
     analysis_launchers: tuple[AnalysisLauncherSpec, ...] = ()
+    #: DIR-2: the source count is FILES (container directory, frame
+    #: counts not yet known) — displays render 'files' not 'frames'.
+    frame_count_is_files: bool = False
     show_experiment_card: bool = True
     show_processing_card: bool = True
     detector_summary: str = ""
@@ -2351,6 +2354,8 @@ def build_control_profile(state: ControlState) -> ControlProfile:
         fields=fields,
         section_actions=build_section_actions(state),
         analysis_launchers=build_analysis_launchers(state.result_caps),
+        frame_count_is_files=bool(
+            getattr(state, "frame_count_is_files", False)),
         show_experiment_card=True,
         show_processing_card=not viewer,
         detector_summary=state.detector_summary)

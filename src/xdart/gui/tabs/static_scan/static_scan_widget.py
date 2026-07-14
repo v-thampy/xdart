@@ -365,6 +365,8 @@ def _drop_output_axis_ranges(args):
 
 
 class staticWidget(QWidget):
+    # DIR-2 lazy convergence: queued landing for container frame counts
+    _sigV2CountLanded = QtCore.Signal(str, int)
     """Tab for integrating data collected by a scanning area detector.
     As of current version, only handles a single angle (2-theta).
     Displays raw images, stitched Q Chi arrays, and integrated I Q
@@ -421,6 +423,12 @@ class staticWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._v2_source_count_is_files = False
+        # DIR-2 lazy convergence: {path: ((size, mtime_ns), nframes)} —
+        # filled by the run as containers open (sigContainerCount) and by
+        # the click-to-count sweep; a stale stamp invalidates the entry.
+        self._v2_container_count_memo = {}
+        self._v2_count_sweep_active = False
+        self._sigV2CountLanded.connect(self._on_container_count_landed)
         self._init_data_objects()
         self._init_ui()
         self._init_child_widgets()
@@ -789,6 +797,9 @@ class staticWidget(QWidget):
         # The readiness bar's "Live" chip follows the toggle immediately.
         self.controls.liveToggled.connect(
             lambda *_: self._refresh_controls_v2_profile(immediate=True))
+        # Click-to-count on the 'N files' chip (DIR-2 convergence).
+        self.controls.readinessSummaryClicked.connect(
+            self._on_readiness_summary_clicked)
         # Single owner of the shared Stop button: dispatch to whichever run is
         # active — a reintegrate (integrator thread) takes priority, else the
         # wrangler.  The wranglers no longer connect Stop directly, so a Stop
@@ -2580,10 +2591,23 @@ class staticWidget(QWidget):
                 and self._controls_v2_run_active()):
             text = "Waiting for new images…"
             ready, tooltip, live = True, "Live watch: no new files yet", True
+        files_mode = bool(getattr(state, "frame_count_is_files", False)
+                          and text)
+        if files_mode:
+            hint = "Click to count frames in all files"
+            tooltip = f"{tooltip}; {hint}" if tooltip else hint
         if callable(setter):
             changed = setter(text, ready=ready, tooltip=tooltip, live=live)
             if changed:
                 self._fit_controls_height()
+        try:
+            label = getattr(controls, "readinessLabel", None)
+            if label is not None:
+                label.setCursor(
+                    QtCore.Qt.PointingHandCursor if files_mode
+                    else QtCore.Qt.ArrowCursor)
+        except Exception:
+            logger.debug("readiness cursor update failed", exc_info=True)
         self._controls_v2_sync_run_row(profile)
 
     def _on_wrangler_status_text(self, text) -> None:
@@ -3010,6 +3034,15 @@ class staticWidget(QWidget):
                     return 0
                 files = self._controls_v2_container_directory_files(
                     base, ext, include_subdir, _name_filter(file_filter))
+                # Lazy convergence: once EVERY file's frame count is
+                # known (landed by the run as it opened each container,
+                # or by the click-to-count sweep) the chip shows real
+                # frames; until then it shows the file count.
+                total = self._v2_memoized_frame_total(files)
+                if total is not None:
+                    self._v2_source_count_is_files = False
+                    self._v2_frame_count_cache = (key, total, False)
+                    return total
                 count = len(files)
                 self._v2_source_count_is_files = True
                 self._v2_frame_count_cache = (key, count, True)
@@ -3025,6 +3058,108 @@ class staticWidget(QWidget):
         )
         self._v2_frame_count_cache = (key, count, False)
         return count
+
+    @staticmethod
+    def _v2_file_stamp(path):
+        st = os.stat(path)
+        return (int(st.st_size), int(st.st_mtime_ns))
+
+    def _v2_memoized_frame_total(self, files):
+        """Sum of memoized frame counts when EVERY file has a fresh entry
+        (stamp-matching), else None.  Empty file lists stay None so a bare
+        directory keeps the 0-files chip."""
+        if not files:
+            return None
+        memo = getattr(self, "_v2_container_count_memo", None) or {}
+        total = 0
+        for path in files:
+            hit = memo.get(str(path))
+            if hit is None:
+                return None
+            try:
+                if hit[0] != staticWidget._v2_file_stamp(path):
+                    return None
+            except OSError:
+                return None
+            total += int(hit[1])
+        return total
+
+    def _on_container_count_landed(self, path, nframes) -> None:
+        """GUI-thread landing for a container's frame count (from the run's
+        sigContainerCount or the click-to-count sweep)."""
+        if getattr(self, "_tearing_down", False):
+            return
+        try:
+            stamp = staticWidget._v2_file_stamp(path)
+        except OSError:
+            return
+        self._v2_container_count_memo[str(path)] = (stamp, int(nframes))
+        if len(self._v2_container_count_memo) > 8192:
+            self._v2_container_count_memo.clear()
+        self._v2_frame_count_cache = None
+        if not self._controls_v2_run_active():
+            self._refresh_controls_v2_profile(immediate=False)
+
+    def _on_readiness_summary_clicked(self) -> None:
+        """Click-to-count (maintainer, 2026-07-13): while the chip shows a
+        FILE count, one click kicks a background frame-count sweep; each
+        file's count lands via _sigV2CountLanded and the chip converges to
+        real frames."""
+        if getattr(self, "_v2_source_count_is_files", False):
+            self._controls_v2_kick_container_count_sweep()
+
+    def _controls_v2_kick_container_count_sweep(self) -> None:
+        if getattr(self, "_v2_count_sweep_active", False):
+            return
+        source_type = str(
+            self._controls_v2_param_value(("Signal", "inp_type")) or "")
+        img_dir = str(self._controls_v2_param_value(("Signal", "img_dir")) or "")
+        img_ext = str(self._controls_v2_param_value(("Signal", "img_ext")) or "")
+        include_subdir = bool(
+            self._controls_v2_param_value(("Signal", "include_subdir"), False))
+        file_filter = str(
+            self._controls_v2_param_value(("Signal", "Filter")) or "")
+        ext = img_ext.lstrip(".").lower()
+        if source_type != "Image Directory" or ext not in {"h5", "hdf5", "nxs"}:
+            return
+        base = Path(img_dir or "").expanduser()
+        if not base.is_dir():
+            return
+        from .wranglers.image_wrangler_thread import _name_filter
+        files = self._controls_v2_container_directory_files(
+            base, ext, include_subdir, _name_filter(file_filter))
+        memo = self._v2_container_count_memo
+        todo = []
+        for path in files:
+            hit = memo.get(str(path))
+            try:
+                if hit is not None and hit[0] == staticWidget._v2_file_stamp(path):
+                    continue
+            except OSError:
+                continue
+            todo.append(path)
+        if not todo:
+            self._refresh_controls_v2_profile(immediate=False)
+            return
+        self._v2_count_sweep_active = True
+
+        def _sweep():
+            from xrd_tools.io import image as image_io
+            try:
+                for path in todo:
+                    try:
+                        n = int(image_io.count_frames(path) or 0)
+                    except Exception:
+                        continue
+                    try:
+                        self._sigV2CountLanded.emit(str(path), n)
+                    except RuntimeError:
+                        return          # widget torn down mid-sweep
+            finally:
+                self._v2_count_sweep_active = False
+
+        threading.Thread(target=_sweep, daemon=True,
+                         name="v2-count-on-demand").start()
 
     @staticmethod
     def _controls_v2_source_cache_stamp(path) -> int | None:
@@ -4252,16 +4387,43 @@ class staticWidget(QWidget):
                 self.wrangler.set_gi_motor_options()
         # Live-watch status → readiness bar ("Waiting for new images…").  The
         # watching message is emitted by the THREAD's showLabel; connect both
-        # levels idempotently (set_wrangler re-runs on every swap).
-        for sig_owner in (self.wrangler, getattr(self.wrangler, 'thread', None)):
-            sig = getattr(sig_owner, 'showLabel', None)
-            if sig is None:
-                continue
+        # levels once per signal OBJECT (set_wrangler re-runs on every swap;
+        # tracking avoids duplicate connections and PySide's noisy
+        # failed-disconnect warning).
+        prev_status_sigs = getattr(self, '_v2_status_sigs_connected', ())
+        status_sigs = tuple(
+            sig for sig in (
+                getattr(self.wrangler, 'showLabel', None),
+                getattr(getattr(self.wrangler, 'thread', None),
+                        'showLabel', None))
+            if sig is not None)
+        for sig in prev_status_sigs:
+            if sig not in status_sigs:
+                try:
+                    sig.disconnect(self._on_wrangler_status_text)
+                except (TypeError, RuntimeError):
+                    pass
+        for sig in status_sigs:
+            if sig not in prev_status_sigs:
+                sig.connect(self._on_wrangler_status_text)
+        self._v2_status_sigs_connected = status_sigs
+        # DIR-2 lazy convergence: the run's per-container frame counts
+        # land in the memo as each file is opened/retired.  Track the
+        # connected signal OBJECT so a swap back to the same wrangler
+        # neither duplicates the connection nor trips PySide's
+        # failed-disconnect warning.
+        count_sig = getattr(getattr(self.wrangler, 'thread', None),
+                            'sigContainerCount', None)
+        prev_sig = getattr(self, '_v2_count_sig_connected', None)
+        if prev_sig is not None and prev_sig is not count_sig:
             try:
-                sig.disconnect(self._on_wrangler_status_text)
+                prev_sig.disconnect(self._on_container_count_landed)
             except (TypeError, RuntimeError):
                 pass
-            sig.connect(self._on_wrangler_status_text)
+            self._v2_count_sig_connected = None
+        if count_sig is not None and prev_sig is not count_sig:
+            count_sig.connect(self._on_container_count_landed)
+            self._v2_count_sig_connected = count_sig
         self.wrangler.started.connect(self.thread_state_changed)
         self.wrangler.finished.connect(self.wrangler_finished)
         # Pause/Resume (Phase B): lift the freeze guard once paused (frozen at a
