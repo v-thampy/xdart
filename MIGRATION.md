@@ -294,7 +294,7 @@ for downstream users:
   case-mismatched monitor key will integrate to different (correct) numbers. Re-reduce such
   datasets if exact reproduction of the old (un-normalized) values matters.
 
-## Unreleased (next version)
+## What's new in v1.1.3
 
 - **Meta Type is never changed behind your back.**  Selecting the NeXus image
   type used to force Meta Type to `none` (and hide the row); that silently
@@ -304,6 +304,30 @@ for downstream users:
   across restarts: every session starts at `auto` (metadata-off remains
   selectable for the session).  Sidecar formats (`txt`, `pdi`, …) persist
   as before.
+- **Directory NeXus input cannot overwrite or re-ingest raw data.** Before any
+  writer opens, xdart now rejects an output path that aliases a raw container
+  or can be rediscovered beneath the watched input tree. Processed xdart
+  products are classified before detector-dataset fallback, so an integrated
+  2D cake can no longer be mistaken for a detector stack. Mixed directories
+  skip those products and continue to valid raw scans; single-file input stops
+  cleanly with an actionable error.
+- **Live Directory mode recovers newly created container shells.** A readable
+  `.nxs`, `.h5`, or `.hdf5` path may appear before its detector dataset and
+  NXWriter markers are committed. Such a young zero-frame container is now
+  retried without blocking later ready scans instead of being permanently
+  classified as imageless for that run. Pause or Stop/Run is no longer needed
+  to discover the completed scan.
+- **Directory raw and cake previews remain scan-correct.** Reused frame labels
+  across scans now advance display generation, and cached image levels are
+  admitted only for a compatible panel, frame selection, and finite data
+  range. A large intensity drop no longer leaves the raw panel apparently
+  blank, while integrated cakes use a less aggressive linear percentile range
+  to avoid clipping real peak area.
+- **Browsing during a live write is explicit.** Until acquisition and browse
+  cursors become independent, selecting another processed scan while the
+  shared scan is being written is rejected and the browser restores the file
+  actually displayed. Pause first to browse safely; pausing invalidates stale
+  display levels and schedules a repaint.
 
 ## What's new in v1.1.2
 
