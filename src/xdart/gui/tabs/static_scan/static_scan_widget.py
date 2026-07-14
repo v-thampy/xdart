@@ -4577,6 +4577,24 @@ class staticWidget(QWidget):
                 _key = _scan_key_from_source(getattr(_peek, "source_file", ""))
                 _cur = getattr(self.scan, "name", None)
                 if _key and _key != _cur and _cur != "null_main":
+                    # DIR-1 (bl17-2): paint the OUTGOING scan's complete frame
+                    # list before the rescope clears it.  Per-frame updates
+                    # only ARM the throttled list timer (no leading-edge
+                    # fire), so a 5-frame container often bursts entirely
+                    # inside one ~60 ms window and the boundary used to clear
+                    # the index before the tail ever painted ("shows 1-2
+                    # frames then jumps to the next scan").  LIGHT legs only
+                    # (list + cursor, O(new)) — the heavy drain/render below
+                    # stays Overlay/Waterfall-gated (re-saturating the GUI
+                    # thread per ~1 s boundary is the failure mode the
+                    # liveness arc engineered away).
+                    try:
+                        self.h5viewer.update_data(emit_update=False)
+                        if self.h5viewer.auto_last:
+                            self.latest_frame(emit_update=False)
+                    except Exception:
+                        logger.debug("pre-rescope list flush failed",
+                                     exc_info=True)
                     # Directory scans can be shorter than the heavy-render cadence
                     # (often one frame per scan).  Publish + accumulate the outgoing
                     # scan before rescope clears its pending/store state; otherwise
