@@ -500,6 +500,10 @@ class imageThread(wranglerThread):
     # stopping cleanly): carries the user-facing message for the GUI's
     # one-modal warning + status text — see _handle_append_config_mismatch.
     sigAppendMismatch = Qt.QtCore.Signal(str)
+    # DIR-2 lazy convergence: (path, nframes) as each container is opened
+    # and again with the final count when it is retired — the GUI memoizes
+    # them so the 'N files' chip converges to real frames.
+    sigContainerCount = Qt.QtCore.Signal(str, int)
 
     def __init__(
             self,
@@ -2863,6 +2867,18 @@ class imageThread(wranglerThread):
         """Return frame count for a master file, 0 on failure."""
         return count_frames(master_path)
 
+    def _emit_container_count(self, path, nframes):
+        """DIR-2 lazy convergence: hand the GUI a container's frame
+        count the moment it is known (open / retire).  getattr-guarded:
+        duck-typed test hosts carry no Qt signal."""
+        sig = getattr(self, 'sigContainerCount', None)
+        if sig is None or not nframes:
+            return
+        try:
+            sig.emit(str(path), int(nframes))
+        except Exception:
+            logger.debug('sigContainerCount emit failed', exc_info=True)
+
     def _eiger_open_master(self, master_path):
         """Open (or switch to) an Eiger / NeXus HDF5 file, keeping the handle.
 
@@ -2890,6 +2906,8 @@ class imageThread(wranglerThread):
                 # Primary: fabio (handles all Eiger layouts)
                 self._eiger_fabio_handle = fabio.open(master_path)
                 self._eiger_nframes = self._eiger_fabio_handle.nframes
+                self._emit_container_count(master_path,
+                                           self._eiger_nframes)
                 return
             except Exception as e:
                 # DIR-2b: fabio's EigerImage rejects non-Eiger-shaped HDF5
@@ -2917,6 +2935,7 @@ class imageThread(wranglerThread):
             self._eiger_h5_handle = h5py.File(master_path, 'r')
             self._eiger_h5_dataset = self._eiger_h5_handle[ds_path]
             self._eiger_nframes = self._h5_stack_nframes(self._eiger_h5_dataset)
+            self._emit_container_count(master_path, self._eiger_nframes)
         except Exception as e:
             logger.error('Error opening HDF5/NeXus file %s: %s', master_path, e)
             self._eiger_close_master()
@@ -3508,6 +3527,8 @@ class imageThread(wranglerThread):
             if self._eiger_frame_idx >= self._eiger_nframes:
                 if self.inp_type == 'Image Directory':
                     self._eiger_done_masters.add(self._eiger_master_path)
+                    self._emit_container_count(self._eiger_master_path,
+                                               self._eiger_nframes)
                     self._eiger_close_master()
                     if not self._eiger_master_queue:
                         self._eiger_refill_master_queue()

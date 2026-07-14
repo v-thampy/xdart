@@ -1642,7 +1642,9 @@ class ControlsPanelV2(QtWidgets.QWidget):
             kind = str(bound_state.value_for(("Signal", "inp_type"), "") or "")
         parts = []
         if frame_status is not None and frame_status.value:
-            parts.append(f"{frame_status.value} frames")
+            unit = ("files" if getattr(profile, "frame_count_is_files",
+                                       False) else "frames")
+            parts.append(f"{frame_status.value} {unit}")
         if kind:
             parts.append(kind)
         if (
