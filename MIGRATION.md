@@ -294,6 +294,25 @@ for downstream users:
   case-mismatched monitor key will integrate to different (correct) numbers. Re-reduce such
   datasets if exact reproduction of the old (un-normalized) values matters.
 
+## What's new in v1.1.5
+
+- **NeXus Directory + Append starts without hydrating every old output.**
+  Append resume now reads only the small frame-index datasets for each scan as
+  that scan is reached. It no longer constructs a full processed scan for every
+  file before the first raw frame, eliminating the long
+  `[REINTEGRATE-CAL] restored calibration` startup flood.
+- **Stop/restart cannot invalidate a detector reader that is still unwinding.**
+  Prefetch queues and stop events are generation-owned. If a network/HDF5 read
+  outlives the bounded Stop join, a new Run is refused cleanly until that reader
+  exits; its cursor, caches, queue, and handle remain intact in the meantime.
+- **Ready NeXus files use natural numeric order.** Files ready together process
+  as `scan_1`, `scan_2`, `scan_10`. A still-open earlier NXWriter file remains
+  deferred so it cannot stall later ready data; it is processed after finalizing.
+- **Detectorless alignment NeXus files are quiet zero-frame inputs.** Readable
+  alignment/diode-only containers no longer emit a misleading frame-count
+  warning, while torn or unreadable files still warn and processed xdart outputs
+  remain explicitly rejected as raw sources.
+
 ## What's new in v1.1.4
 
 - **NeXus Directory mode finds raw files with `Meta Type = auto`.** The v1.1.3
