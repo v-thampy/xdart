@@ -294,7 +294,7 @@ for downstream users:
   case-mismatched monitor key will integrate to different (correct) numbers. Re-reduce such
   datasets if exact reproduction of the old (un-normalized) values matters.
 
-## Unreleased (next version)
+## What's new in v1.1.2
 
 - **Polarization correction is ON by default for fresh scans** (factor 0.99 —
   SSRL beams are strongly horizontally polarized).  Previously no polarization
