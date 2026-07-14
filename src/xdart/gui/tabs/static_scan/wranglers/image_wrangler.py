@@ -1951,7 +1951,17 @@ class imageWrangler(wranglerWidget):
                     continue
                 if not match_img_detector(fname, self.poni):
                     continue
-                if self.meta_ext and not self.exists_meta_file(fname):
+                # Container inputs are self-describing raw sources.  Metadata
+                # mode may enrich them with a sidecar, but the absence of one
+                # must never hide a valid .nxs/.h5 detector file from the
+                # directory worker.  This gate became a release blocker when
+                # v1.1.3 made ``auto`` the NeXus default: every sidecar-free raw
+                # container was rejected before processing could start.
+                needs_sidecar = (
+                    self.meta_ext
+                    and Path(fname).suffix.lower() not in _EMBEDDED_META_EXTS
+                )
+                if needs_sidecar and not self.exists_meta_file(fname):
                     continue
                 found = fname
                 break

@@ -103,3 +103,31 @@ def test_negative_result_is_not_poison_cached(monkeypatch, tmp_path):
     found = image_wrangler.imageWrangler._find_image_directory_seed(holder, match, ".tif")
     assert calls == [str(tmp_path), str(tmp_path)]
     assert found is not None
+
+
+def test_nexus_seed_discovery_does_not_require_sidecar_metadata(
+        monkeypatch, tmp_path):
+    """Meta Type enriches a raw container; it must not gate its discovery.
+
+    NeXus files carry detector data and may carry embedded motor/counter
+    metadata without any sidecar.  With the GUI defaulting to ``auto``, the old
+    seed probe rejected every such file before the directory worker could see
+    it.
+    """
+    from xdart.gui.tabs.static_scan.wranglers import image_wrangler
+
+    source = tmp_path / "raw_00001.nxs"
+    source.write_bytes(b"not-a-real-nexus")
+    monkeypatch.setattr(image_wrangler, "match_img_detector", lambda *_: True)
+
+    holder = _holder(
+        tmp_path,
+        meta_ext="auto",
+        exists_meta_file=lambda _fname: False,
+    )
+    match = lambda _stem: True  # noqa: E731
+
+    found = image_wrangler.imageWrangler._find_image_directory_seed(
+        holder, match, ".nxs")
+
+    assert found == str(source)

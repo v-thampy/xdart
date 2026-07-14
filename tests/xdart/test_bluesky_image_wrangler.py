@@ -531,6 +531,43 @@ def test_live_zero_frame_shell_is_retried_without_blocking_ready_scan(tmp_path):
     assert frames == [("01_shell_00001", 1), ("01_shell_00001", 2)]
 
 
+def test_live_stale_mtime_shell_gets_a_retry_before_retirement(tmp_path):
+    """A beamline clock offset must not make first sighting permanently fatal.
+
+    Network filesystems can expose a new path with an mtime that is already old
+    according to the client clock.  The path still deserves one readiness retry:
+    its detector tree may become visible on the next poll even though wall-clock
+    age exceeds the normal deadline.
+    """
+    import h5py
+
+    watch = tmp_path / "watch"
+    watch.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
+    shell = watch / "stale_clock_00001.nxs"
+    with h5py.File(shell, "w"):
+        pass
+    old = time.time() - 120.0
+    os.utime(shell, (old, old))
+
+    t = _real_dir_watch_thread(watch, out)
+    t.CONTAINER_READY_RETRY = 0.01
+
+    first = t._get_next_eiger_frame_sync()
+    assert first[3] is None
+    assert str(shell) not in t._eiger_done_masters
+
+    _write_bluesky_nxwriter(shell, n=2)
+    time.sleep(0.02)
+    frames = []
+    for _ in range(6):
+        item = t._get_next_eiger_frame_sync()
+        if item[3] is not None:
+            frames.append((item[1], item[2]))
+    assert frames == [("stale_clock_00001", 1), ("stale_clock_00001", 2)]
+
+
 def test_live_prefetch_finds_shell_populated_after_idle_sentinel(tmp_path):
     """The production prefetch lifecycle recovers without Pause or Stop/Run."""
     import h5py

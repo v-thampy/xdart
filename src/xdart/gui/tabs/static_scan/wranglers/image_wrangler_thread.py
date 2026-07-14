@@ -3213,11 +3213,18 @@ class imageThread(wranglerThread):
         if zero_seen is None:
             zero_seen = self._eiger_zero_frame_seen = {}
         observed = zero_seen.get(path)
-        if observed is None or observed[0] != stamp:
+        first_observation = observed is None or observed[0] != stamp
+        if first_observation:
             observed = (stamp, now)
             zero_seen[path] = observed
         stable_for = now - observed[1]
-        if deadline <= 0.0 or max(age, stable_for) >= deadline:
+        # A newly visible path always earns one readiness retry.  Beamline
+        # shares may preserve an old writer mtime or have server/client clock
+        # skew; using wall-clock age on the first observation permanently
+        # retired a nascent container before its detector tree became visible.
+        if (deadline <= 0.0
+                or (not first_observation
+                    and max(age, stable_for) >= deadline)):
             zero_seen.pop(path, None)
             return False
         retries = getattr(self, "_eiger_retry_after", None)
