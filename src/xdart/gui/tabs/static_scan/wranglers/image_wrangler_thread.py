@@ -168,6 +168,15 @@ def _env_float(name: str, default: float, lo: float, hi: float) -> float:
 _FRAME_READ_RETRY_BUDGET = _env_float("XDART_FRAME_READ_RETRY", 1.0, 0.0, 30.0)
 _FRAME_READ_DEADLINE = _env_float("XDART_FRAME_READ_DEADLINE", 30.0, 1.0, 600.0)
 
+# A container path can become visible before its detector dataset and even its
+# NXWriter markers are committed. A zero-frame open is provisional while the
+# file is young. Retry it without blocking later ready candidates; only a
+# stable old file is retired as genuinely imageless.
+_CONTAINER_READY_RETRY = _env_float(
+    "XDART_CONTAINER_READY_RETRY", 0.5, 0.05, 5.0)
+_CONTAINER_READY_DEADLINE = _env_float(
+    "XDART_CONTAINER_READY_DEADLINE", 30.0, 1.0, 600.0)
+
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
@@ -626,6 +635,9 @@ class imageThread(wranglerThread):
         self._eiger_nframes = 0
         self._eiger_master_queue = deque()
         self._eiger_done_masters = set()
+        self._eiger_retry_after = {}
+        self._eiger_zero_frame_seen = {}
+        self._eiger_open_state = None
         self._eiger_h5_handle = None     # persistent h5py.File for Eiger reads
         self._eiger_h5_dataset = None    # dataset reference inside the open file
         self._eiger_fabio_handle = None  # persistent fabio.EigerImage fallback
@@ -675,6 +687,9 @@ class imageThread(wranglerThread):
         self._eiger_nframes = 0
         self._eiger_master_queue.clear()
         self._eiger_done_masters.clear()
+        self._eiger_retry_after.clear()
+        self._eiger_zero_frame_seen.clear()
+        self._eiger_open_state = None
         self._eiger_metadata_cache.clear()
         self._bluesky_source_cache.clear()
         # Start each run with an empty producer->consumer display slot so a frame
@@ -2916,6 +2931,7 @@ class imageThread(wranglerThread):
                dataset via ``find_nexus_image_dataset``.
         """
         self._eiger_close_master()
+        self._eiger_open_state = "opening"
 
         ext = Path(master_path).suffix.lower()
         is_nexus = ext == '.nxs'
@@ -2925,6 +2941,7 @@ class imageThread(wranglerThread):
                 # Primary: fabio (handles all Eiger layouts)
                 self._eiger_fabio_handle = fabio.open(master_path)
                 self._eiger_nframes = self._eiger_fabio_handle.nframes
+                self._eiger_open_state = "ready"
                 self._emit_container_count(master_path,
                                            self._eiger_nframes)
                 return
@@ -2934,10 +2951,9 @@ class imageThread(wranglerThread):
                 # with unreachable external links) with NotGoodReader — a
                 # RuntimeError, NOT an IOError — which used to escape
                 # here, crash the prefetch worker and END the whole
-                # directory run ('No frames discovered').  Fall through
-                # to the same h5py reader the .nxs branch uses; a truly
-                # unreadable file yields nframes=0 and the existing
-                # retire-and-advance skips it per file.
+                # directory run ('No frames discovered'). Fall through
+                # to the same h5py reader the .nxs branch uses; a young
+                # zero-frame fallback is retried by the directory reader.
                 logger.warning(
                     "fabio could not open %s (%s); falling back to h5py",
                     master_path, e)
@@ -2947,13 +2963,18 @@ class imageThread(wranglerThread):
         try:
             ds_path = find_nexus_image_dataset(master_path)
             if ds_path is None:
-                logger.warning('Could not find image dataset in %s', master_path)
+                log = (logger.debug if getattr(self, "live_mode", False)
+                       and getattr(self, "inp_type", None) == "Image Directory"
+                       else logger.warning)
+                log('Could not find image dataset in %s', master_path)
+                self._eiger_open_state = "no detector dataset"
                 self._eiger_close_master()
                 self._eiger_nframes = 0
                 return
             self._eiger_h5_handle = h5py.File(master_path, 'r')
             self._eiger_h5_dataset = self._eiger_h5_handle[ds_path]
             self._eiger_nframes = self._h5_stack_nframes(self._eiger_h5_dataset)
+            self._eiger_open_state = "ready"
             self._emit_container_count(master_path, self._eiger_nframes)
         except ProcessedXdartInputError:
             # F-NXS-2: a processed xdart output was swept into the raw source
@@ -2967,10 +2988,12 @@ class imageThread(wranglerThread):
             logger.info('Skipping processed xdart output (not a raw '
                         'acquisition): %s', master_path)
             self._record_skip_reason('processed xdart output')
+            self._eiger_open_state = "processed xdart output"
             self._eiger_close_master()
             self._eiger_nframes = 0
         except Exception as e:
             logger.error('Error opening HDF5/NeXus file %s: %s', master_path, e)
+            self._eiger_open_state = "open error"
             self._eiger_close_master()
             self._eiger_nframes = 0
 
@@ -3149,6 +3172,79 @@ class imageThread(wranglerThread):
         # '_master' is stripped — one shared source-of-truth with the GUI.
         return scan_name_from_source(master_path)
 
+    def _eiger_retire_master(self, path):
+        """Retire a completed or stably imageless path for this run."""
+        if not path:
+            return
+        done = getattr(self, "_eiger_done_masters", None)
+        if done is None:
+            done = self._eiger_done_masters = set()
+        retries = getattr(self, "_eiger_retry_after", None)
+        if retries is not None:
+            retries.pop(path, None)
+        zero_seen = getattr(self, "_eiger_zero_frame_seen", None)
+        if zero_seen is not None:
+            zero_seen.pop(path, None)
+        done.add(path)
+
+    def _eiger_defer_zero_frame_master(self, path):
+        """Retry a young zero-frame container without blocking later scans."""
+        if (not getattr(self, "live_mode", False)
+                or getattr(self, "inp_type", None) != "Image Directory"
+                or getattr(self, "_eiger_open_state", None)
+                == "processed xdart output"):
+            return False
+        try:
+            stat = os.stat(path)
+            age = max(0.0, time.time() - stat.st_mtime)
+            stamp = (
+                int(getattr(stat, "st_dev", 0)),
+                int(getattr(stat, "st_ino", 0)),
+                int(stat.st_size),
+                int(stat.st_mtime_ns),
+            )
+        except OSError:
+            age = 0.0
+            stamp = None
+        deadline = float(getattr(
+            self, "CONTAINER_READY_DEADLINE", _CONTAINER_READY_DEADLINE))
+        now = time.monotonic()
+        zero_seen = getattr(self, "_eiger_zero_frame_seen", None)
+        if zero_seen is None:
+            zero_seen = self._eiger_zero_frame_seen = {}
+        observed = zero_seen.get(path)
+        if observed is None or observed[0] != stamp:
+            observed = (stamp, now)
+            zero_seen[path] = observed
+        stable_for = now - observed[1]
+        if deadline <= 0.0 or max(age, stable_for) >= deadline:
+            zero_seen.pop(path, None)
+            return False
+        retries = getattr(self, "_eiger_retry_after", None)
+        if retries is None:
+            retries = self._eiger_retry_after = {}
+        retry_s = max(0.01, float(getattr(
+            self, "CONTAINER_READY_RETRY", _CONTAINER_READY_RETRY)))
+        retries[path] = now + retry_s
+        logger.debug(
+            "Deferring young zero-frame container for retry in %.2fs "
+            "(age %.2fs, stable %.2fs, state=%s): %s",
+            retry_s, age, stable_for,
+            getattr(self, "_eiger_open_state", None), path,
+        )
+        return True
+
+    def _eiger_close_or_defer_zero_frame_master(self):
+        """Close a zero-frame open and clear its identity when deferred."""
+        path = self._eiger_master_path
+        self._eiger_close_master()
+        if not self._eiger_defer_zero_frame_master(path):
+            return False
+        self._eiger_master_path = None
+        self._eiger_frame_idx = 0
+        self._eiger_nframes = 0
+        return True
+
     def _eiger_refill_master_queue(self):
         """Queue matching HDF5 master / NeXus files not yet processed."""
         match = _name_filter(self.file_filter)
@@ -3167,9 +3263,25 @@ class imageThread(wranglerThread):
             p for p in candidates if match(p.name[:-len(suffix)])
         )
         queued = set(self._eiger_master_queue)
+        retries = getattr(self, "_eiger_retry_after", None)
+        if retries is None:
+            retries = self._eiger_retry_after = {}
+        zero_seen = getattr(self, "_eiger_zero_frame_seen", None)
+        if zero_seen is None:
+            zero_seen = self._eiger_zero_frame_seen = {}
+        candidate_names = {str(path) for path in master_files}
+        for stale_path in set(retries) - candidate_names:
+            retries.pop(stale_path, None)
+            zero_seen.pop(stale_path, None)
+        now = time.monotonic()
         for mf in master_files:
             mf_str = str(mf)
-            if mf_str in self._eiger_done_masters or mf_str in queued:
+            if mf_str in self._eiger_done_masters:
+                continue
+            if retries.get(mf_str, 0.0) > now:
+                continue
+            retries.pop(mf_str, None)
+            if mf_str in queued:
                 continue
             # DIR-2: refill is NAME-ONLY.  The F5 finalized-at-close check
             # used to run here — one HDF5 open per not-yet-queued file, i.e.
@@ -3529,7 +3641,7 @@ class imageThread(wranglerThread):
                 self._eiger_frame_idx = 0
                 self._eiger_open_master(self._eiger_master_path)
                 if self._eiger_nframes == 0:
-                    self._eiger_close_master()
+                    self._eiger_close_or_defer_zero_frame_master()
                     if self.inp_type == 'Image Directory':
                         # An imageless container (a diode/alignment scan in a
                         # mixed beamline directory) must not END the stream —
@@ -3564,7 +3676,7 @@ class imageThread(wranglerThread):
 
             if self._eiger_frame_idx >= self._eiger_nframes:
                 if self.inp_type == 'Image Directory':
-                    self._eiger_done_masters.add(self._eiger_master_path)
+                    self._eiger_retire_master(self._eiger_master_path)
                     self._emit_container_count(self._eiger_master_path,
                                                self._eiger_nframes)
                     self._eiger_close_master()
@@ -3572,6 +3684,9 @@ class imageThread(wranglerThread):
                         self._eiger_refill_master_queue()
                     next_master = self._eiger_pop_next_master()
                     if next_master is None:
+                        self._eiger_master_path = None
+                        self._eiger_frame_idx = 0
+                        self._eiger_nframes = 0
                         return None, None, 1, None, {}
                     self._eiger_master_path = next_master
                     self._eiger_frame_idx = 0
@@ -3580,7 +3695,7 @@ class imageThread(wranglerThread):
                         # Imageless container mid-queue: retire-and-advance via
                         # the exhaustion branch, never end the stream (see the
                         # init-branch note).
-                        self._eiger_close_master()
+                        self._eiger_close_or_defer_zero_frame_master()
                         continue
                 else:
                     self._eiger_close_master()

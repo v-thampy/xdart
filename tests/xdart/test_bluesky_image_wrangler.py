@@ -22,6 +22,7 @@ Real-file assertions run only when ``$XDART_TEST_DATA`` points at the shipped
 from __future__ import annotations
 
 import os
+import time
 import types
 from pathlib import Path
 from types import MethodType
@@ -493,6 +494,76 @@ def test_f5_unfinalized_nxs_deferred_then_consumed_in_full(tmp_path):
     assert str(p) in t._eiger_done_masters           # retired only after finalize+drain
 
 
+def test_live_zero_frame_shell_is_retried_without_blocking_ready_scan(tmp_path):
+    """A just-created HDF5 shell is not a permanently imageless scan.
+
+    Some acquisition writers expose the path before detector data or NXWriter
+    markers land. The live watch must let later ready scans flow, then retry the
+    same path after it is populated without requiring Stop/Run.
+    """
+    import h5py
+
+    watch = tmp_path / "watch"
+    watch.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
+
+    shell = watch / "01_shell_00001.nxs"
+    with h5py.File(shell, "w"):
+        pass
+    ready = watch / "02_ready_00001.nxs"
+    _write_bluesky_nxwriter(ready, n=1)
+
+    t = _real_dir_watch_thread(watch, out)
+    t.CONTAINER_READY_RETRY = 0.01
+
+    first = t._get_next_eiger_frame_sync()
+    assert first[1:3] == ("02_ready_00001", 1)
+    assert str(shell) not in t._eiger_done_masters
+
+    _write_bluesky_nxwriter(shell, n=2)
+    time.sleep(0.02)
+    frames = []
+    for _ in range(6):
+        item = t._get_next_eiger_frame_sync()
+        if item[3] is not None:
+            frames.append((item[1], item[2]))
+    assert frames == [("01_shell_00001", 1), ("01_shell_00001", 2)]
+
+
+def test_live_prefetch_finds_shell_populated_after_idle_sentinel(tmp_path):
+    """The production prefetch lifecycle recovers without Pause or Stop/Run."""
+    import h5py
+
+    watch = tmp_path / "watch"
+    watch.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
+    shell = watch / "late_00001.nxs"
+    with h5py.File(shell, "w"):
+        pass
+
+    t = _real_dir_watch_thread(watch, out)
+    t.CONTAINER_READY_RETRY = 0.01
+    try:
+        assert t._get_next_eiger_frame()[3] is None
+        assert str(shell) not in t._eiger_done_masters
+
+        _write_bluesky_nxwriter(shell, n=2)
+        deadline = time.monotonic() + 3.0
+        frames = []
+        while time.monotonic() < deadline and len(frames) < 2:
+            item = t._get_next_eiger_frame()
+            if item[3] is not None:
+                frames.append((item[1], item[2]))
+            else:
+                time.sleep(0.02)
+        assert frames == [("late_00001", 1), ("late_00001", 2)]
+    finally:
+        t.command = "stop"
+        t._prefetch_stop_prior()
+
+
 def test_f5_pop_defers_only_unfinalized_bluesky(tmp_path):
     """DIR-2 moved the F5 finalized-at-close check from REFILL (one HDF5 open
     per file per poll — the bl17-2 24.5 s first-dispatch stall) to POP time.
@@ -674,6 +745,9 @@ def test_imageless_containers_are_skipped_not_stream_ending(tmp_path):
     _write_bluesky_nxwriter(watch / "combi_data_00002.nxs", n=3)
 
     t = _real_dir_watch_thread(watch, out)
+    # This test models completed, known-imageless history rather than a path
+    # that has only just appeared and may still receive its detector dataset.
+    t.CONTAINER_READY_DEADLINE = 0.0
     frames = []
     for _ in range(12):
         item = t._get_next_eiger_frame_sync()
