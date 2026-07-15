@@ -8,6 +8,7 @@ switch and paths for real data.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from textwrap import dedent
 
@@ -31,7 +32,9 @@ def notebook(cells: list):
         "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
         "language_info": {"name": "python", "version": "3"},
     }
-    for cell in nb.cells:
+    for index, cell in enumerate(nb.cells):
+        identity = f"{index}\0{cell.cell_type}\0{cell.source}".encode()
+        cell.id = hashlib.sha256(identity).hexdigest()[:8]
         if cell.cell_type == "code":
             cell.execution_count = None
             cell.outputs = []

@@ -6,6 +6,8 @@ import argparse
 import os
 from pathlib import Path
 import re
+import subprocess
+import sys
 import tempfile
 import time
 
@@ -48,12 +50,28 @@ def validate_notebook(path: Path):
     return nb
 
 
+def regenerate_and_check() -> None:
+    """Build from source and reject generated JSON drift before execution."""
+    repository = ROOT.parents[1]
+    subprocess.run([sys.executable, str(ROOT / "_build_notebooks.py")], check=True)
+    result = subprocess.run(
+        ["git", "diff", "--exit-code", "--", "examples/notebooks"],
+        cwd=repository,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        raise AssertionError("generated notebooks drifted from _build_notebooks.py\n" + result.stdout)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--timeout", type=int, default=120)
     args = parser.parse_args()
 
+    regenerate_and_check()
     actual = sorted(path.name for path in ROOT.glob("*.ipynb"))
     if actual != EXPECTED:
         raise AssertionError(f"Expected {EXPECTED}; found {actual}")
