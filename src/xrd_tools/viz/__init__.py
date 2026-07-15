@@ -22,9 +22,12 @@ from __future__ import annotations
 
 from xrd_tools.viz.mpl import plot_1d, plot_image
 from xrd_tools.viz.plotly import (
+    plot_peak_fit_frame,
     plot_pattern_fit,
     plot_phase_fractions,
     plot_peak_fit,
+    plot_thermal_history,
+    plot_time_resolved_waterfall,
 )
 
 __all__ = [
@@ -33,4 +36,7 @@ __all__ = [
     "plot_pattern_fit",
     "plot_phase_fractions",
     "plot_peak_fit",
+    "plot_time_resolved_waterfall",
+    "plot_peak_fit_frame",
+    "plot_thermal_history",
 ]

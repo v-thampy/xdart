@@ -71,7 +71,7 @@ gui = [
     # and the Grazing corrections path, so a `[gui]` install ships them.
     "xdart[fitting,rsm]",
 ]
-notebook = ["ipywidgets", "anywidget", "ipyfilechooser", "ipykernel", "ipympl", "jupyterlab"]
+notebook = ["ipywidgets", "anywidget", "ipyfilechooser", "ipykernel", "ipympl", "jupyterlab", "nbformat"]
 all = ["xdart[fitting,rsm,gui,notebook]"]
 dev = ["pytest", "pytest-timeout", "build", "twine", "tifffile"]  # tifffile: test fixtures write TIFFs
 

@@ -212,6 +212,14 @@ class PeakFitAnalyzer:
 
 def _peak_params(payload: Any) -> "dict[str, float]":
     out: "dict[str, float]" = {}
+    fit_result = getattr(payload, "fit_result", None)
+    for name in ("redchi", "chisqr", "aic", "bic"):
+        value = getattr(fit_result, name, None)
+        if value is not None:
+            try:
+                out[name] = float(value)
+            except (TypeError, ValueError):
+                pass
     centers = list(payload.peak_centers or [])
     sigmas = list(payload.peak_sigmas or [])
     amps = list(payload.peak_amplitudes or [])

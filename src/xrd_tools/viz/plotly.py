@@ -27,7 +27,14 @@ from typing import Any, Iterable, Sequence
 
 import numpy as np
 
-__all__ = ["plot_pattern_fit", "plot_phase_fractions", "plot_peak_fit"]
+__all__ = [
+    "plot_pattern_fit",
+    "plot_phase_fractions",
+    "plot_peak_fit",
+    "plot_time_resolved_waterfall",
+    "plot_peak_fit_frame",
+    "plot_thermal_history",
+]
 
 
 # Default colour cycle — matches ``gui.widgets.pattern_viewer``.
@@ -47,6 +54,170 @@ def _import_go():
             "Install with `conda install -c conda-forge plotly`."
         ) from exc
     return go
+
+
+def plot_time_resolved_waterfall(
+    dataset: Any,
+    *,
+    intensity_var: str | None = None,
+    time_coord: str = "time",
+    log_intensity: bool = False,
+    color_percentiles: tuple[float, float] = (1.0, 99.5),
+    colorscale: str = "Viridis",
+    title: str | None = None,
+    height: int = 620,
+):
+    """Interactive q-versus-time heatmap from a time-resolved Dataset."""
+    go = _import_go()
+    if intensity_var is None:
+        intensity_var = (
+            "intensity_normalized"
+            if "intensity_normalized" in dataset else "intensity")
+    q = np.asarray(dataset.coords["q"].values, dtype=float)
+    time = np.asarray(dataset.coords[time_coord].values, dtype=float)
+    values = np.asarray(dataset[intensity_var].values, dtype=float)
+    shown = values
+    color_title = intensity_var
+    if log_intensity:
+        positive = values[values > 0]
+        floor = float(np.nanpercentile(positive, 0.1)) if positive.size else 1.0
+        shown = np.log10(np.clip(values, floor, None))
+        color_title = f"log10({intensity_var})"
+    finite = shown[np.isfinite(shown)]
+    if finite.size:
+        zmin, zmax = np.nanpercentile(finite, color_percentiles)
+    else:
+        zmin = zmax = None
+    time_unit = str(dataset.coords[time_coord].attrs.get("units", ""))
+    q_unit = str(dataset.coords["q"].attrs.get("units", ""))
+    fig = go.Figure(go.Heatmap(
+        x=q,
+        y=time,
+        z=shown,
+        zmin=zmin,
+        zmax=zmax,
+        colorscale=colorscale,
+        colorbar=dict(title=color_title),
+        hovertemplate=(
+            "q=%{x:.5g}<br>time=%{y:.6g}<br>intensity=%{z:.5g}<extra></extra>"),
+    ))
+    fig.update_layout(
+        height=height,
+        title=title or f"Time-resolved XRD: {intensity_var}",
+        xaxis_title=f"q ({q_unit})" if q_unit else "q",
+        yaxis_title=f"time ({time_unit})" if time_unit else time_coord,
+        margin=dict(l=70, r=30, t=55, b=60),
+    )
+    return fig
+
+
+def plot_peak_fit_frame(
+    fit_dataset: Any,
+    fit_index: int,
+    *,
+    title: str | None = None,
+    height: int = 600,
+):
+    """Interactive data/fit/residual review for one fitted pattern."""
+    go = _import_go()
+    from plotly.subplots import make_subplots
+
+    pos = int(fit_index)
+    q = np.asarray(fit_dataset.coords["q_fit"].values, dtype=float)
+    fit = np.asarray(fit_dataset["fit"].isel(fit_pattern=pos).values, dtype=float)
+    residual = np.asarray(
+        fit_dataset["residual"].isel(fit_pattern=pos).values, dtype=float)
+    data = fit + residual
+    background = (
+        np.asarray(fit_dataset["background"].isel(fit_pattern=pos).values, dtype=float)
+        if "background" in fit_dataset else None)
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        row_heights=[0.76, 0.24],
+        vertical_spacing=0.04,
+    )
+    fig.add_trace(go.Scattergl(
+        x=q, y=data, mode="lines", name="data", line=dict(color="#222", width=1)),
+        row=1, col=1)
+    fig.add_trace(go.Scattergl(
+        x=q, y=fit, mode="lines", name="fit", line=dict(color="#d62728", width=2)),
+        row=1, col=1)
+    if background is not None and np.any(np.isfinite(background)):
+        fig.add_trace(go.Scattergl(
+            x=q, y=background, mode="lines", name="background",
+            line=dict(color="#777", width=1, dash="dash")), row=1, col=1)
+    fig.add_trace(go.Scattergl(
+        x=q, y=residual, mode="lines", name="residual",
+        line=dict(color="#1f77b4", width=1), showlegend=False), row=2, col=1)
+    for name in sorted(n for n in fit_dataset.data_vars if n.startswith("center_")):
+        if "err" in name:
+            continue
+        center = float(fit_dataset[name].isel(fit_pattern=pos).values)
+        if np.isfinite(center):
+            fig.add_vline(x=center, line_width=1, line_dash="dot",
+                          line_color="#2ca02c", row=1, col=1)
+    source_pattern = (
+        int(fit_dataset.coords["pattern"].values[pos])
+        if "pattern" in fit_dataset.coords else pos)
+    ok = bool(fit_dataset["fit_success"].values[pos])
+    fig.update_layout(
+        height=height,
+        title=title or f"Pattern {source_pattern} fit ({'OK' if ok else 'check'})",
+        hovermode="x unified",
+        margin=dict(l=65, r=25, t=55, b=55),
+    )
+    fig.update_yaxes(title_text="Intensity", row=1, col=1)
+    fig.update_yaxes(title_text="Residual", row=2, col=1)
+    fig.update_xaxes(title_text="q", row=2, col=1)
+    return fig
+
+
+def plot_thermal_history(
+    dataset: Any,
+    *,
+    time_coord: str = "time",
+    title: str | None = None,
+    height: int = 760,
+):
+    """Plot lattice, inferred temperature, and heating/cooling rate."""
+    go = _import_go()
+    from plotly.subplots import make_subplots
+
+    time = np.asarray(dataset.coords[time_coord].values, dtype=float)
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05)
+    if "lattice_A" in dataset:
+        for reflection in dataset.coords["reflection"].values:
+            y = dataset["lattice_A"].sel(reflection=reflection).values
+            fig.add_trace(go.Scattergl(
+                x=time, y=y, mode="lines", name=f"a {reflection}"), row=1, col=1)
+    if "lattice_mean_A" in dataset:
+        fig.add_trace(go.Scattergl(
+            x=time, y=dataset["lattice_mean_A"].values, mode="lines",
+            name="a combined", line=dict(color="#111", width=2)), row=1, col=1)
+    temperature_name = (
+        "temperature_smoothed_K"
+        if "temperature_smoothed_K" in dataset else "temperature_K")
+    fig.add_trace(go.Scattergl(
+        x=time, y=dataset[temperature_name].values, mode="lines",
+        name="temperature", line=dict(color="#d62728", width=2)), row=2, col=1)
+    fig.add_trace(go.Scattergl(
+        x=time, y=dataset["temperature_rate_K_per_s"].values, mode="lines",
+        name="dT/dt", line=dict(color="#1f77b4", width=1.5)), row=3, col=1)
+    time_unit = str(dataset.coords[time_coord].attrs.get("units", ""))
+    fig.update_yaxes(title_text="Lattice a (A)", row=1, col=1)
+    fig.update_yaxes(title_text="Temperature (K)", row=2, col=1)
+    fig.update_yaxes(title_text="Rate (K/s)", row=3, col=1)
+    fig.update_xaxes(
+        title_text=f"time ({time_unit})" if time_unit else time_coord, row=3, col=1)
+    fig.update_layout(
+        height=height,
+        title=title or "Lattice and thermal history",
+        hovermode="x unified",
+        margin=dict(l=75, r=25, t=55, b=60),
+    )
+    return fig
 
 
 # ---------------------------------------------------------------------------

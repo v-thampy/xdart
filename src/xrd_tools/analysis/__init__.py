@@ -63,6 +63,38 @@ _EXPORTS = {
     "PhaseFitAnalyzer": ("xrd_tools.analysis.runner", "PhaseFitAnalyzer"),
     "run_batch": ("xrd_tools.analysis.runner", "run_batch"),
     "batch_params_table": ("xrd_tools.analysis.runner", "batch_params_table"),
+    # Time-resolved series, preprocessing, fitting and thermal metrology.
+    "FrameLocator": ("xrd_tools.analysis.time_resolved", "FrameLocator"),
+    "TimeResolvedSeries": (
+        "xrd_tools.analysis.time_resolved", "TimeResolvedSeries"),
+    "LinearThermalExpansion": (
+        "xrd_tools.analysis.time_resolved", "LinearThermalExpansion"),
+    "TabulatedThermalExpansion": (
+        "xrd_tools.analysis.time_resolved", "TabulatedThermalExpansion"),
+    "discover_processed_scans": (
+        "xrd_tools.analysis.time_resolved", "discover_processed_scans"),
+    "load_time_resolved_series": (
+        "xrd_tools.analysis.time_resolved", "load_time_resolved_series"),
+    "normalize_reference_band": (
+        "xrd_tools.analysis.time_resolved", "normalize_reference_band"),
+    "flag_normalization_outliers": (
+        "xrd_tools.analysis.time_resolved", "flag_normalization_outliers"),
+    "bin_time_resolved": (
+        "xrd_tools.analysis.time_resolved", "bin_time_resolved"),
+    "select_time_zero": (
+        "xrd_tools.analysis.time_resolved", "select_time_zero"),
+    "fit_peak_series": (
+        "xrd_tools.analysis.time_resolved", "fit_peak_series"),
+    "flag_fit_quality": (
+        "xrd_tools.analysis.time_resolved", "flag_fit_quality"),
+    "lattice_from_q": (
+        "xrd_tools.analysis.time_resolved", "lattice_from_q"),
+    "add_lattice_results": (
+        "xrd_tools.analysis.time_resolved", "add_lattice_results"),
+    "temperature_rate": (
+        "xrd_tools.analysis.time_resolved", "temperature_rate"),
+    "add_temperature_results": (
+        "xrd_tools.analysis.time_resolved", "add_temperature_results"),
 }
 
 __all__ = sorted(_EXPORTS)
