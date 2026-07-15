@@ -184,25 +184,67 @@ def _period_for_path(
     return period
 
 
-def _time_from_scan_data(scan_data: Mapping[str, Any], n_frames: int):
-    priorities = (
-        "time",
-        "elapsed_time",
-        "time_s",
-        "gate_start_time",
-        "EPOCH",
-        "timestamp",
-    )
-    for key in priorities:
-        if key not in scan_data:
-            continue
-        values = np.asarray(scan_data[key], dtype=float).reshape(-1)
-        if len(values) != n_frames or not np.all(np.isfinite(values)):
-            continue
-        values = values - values[0]
-        if n_frames < 2 or np.all(np.diff(values) >= 0):
-            return values, key
-    return None, None
+_SECONDS_PER_TIME_UNIT = {
+    "s": 1.0,
+    "second": 1.0,
+    "seconds": 1.0,
+    "ms": 1e-3,
+    "millisecond": 1e-3,
+    "milliseconds": 1e-3,
+    "us": 1e-6,
+    "microsecond": 1e-6,
+    "microseconds": 1e-6,
+    "ns": 1e-9,
+    "nanosecond": 1e-9,
+    "nanoseconds": 1e-9,
+}
+
+
+def _per_path_option(
+    value: str | Mapping[str, str] | None,
+    path: Path,
+    *,
+    name: str,
+) -> str | None:
+    """Resolve a scalar or path-keyed explicit loading option."""
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        candidates = (str(path), str(path.resolve()), path.name, path.stem)
+        resolved = next((value[key] for key in candidates if key in value), None)
+        return None if resolved is None else str(resolved)
+    return str(value)
+
+
+def _time_from_scan_data(
+    scan_data: Mapping[str, Any],
+    n_frames: int,
+    *,
+    time_key: str | None,
+    time_unit: str | None,
+) -> tuple[np.ndarray | None, str | None]:
+    """Return explicit persisted physical time in seconds, never guessed time."""
+    if time_key is None:
+        return None, None
+    if time_unit is None:
+        raise ValueError(
+            f"time_key={time_key!r} requires an explicit time_unit; "
+            "numeric scan-data columns carry no trusted unit metadata")
+    unit_key = time_unit.strip().lower()
+    factor = _SECONDS_PER_TIME_UNIT.get(unit_key)
+    if factor is None:
+        raise ValueError(
+            f"time_unit={time_unit!r} is not a documented physical-time unit; "
+            f"choose one of {sorted(_SECONDS_PER_TIME_UNIT)}")
+    if time_key not in scan_data:
+        raise KeyError(f"selected time_key {time_key!r} is absent from scan_data")
+    values = np.asarray(scan_data[time_key], dtype=float).reshape(-1)
+    if len(values) != n_frames or not np.all(np.isfinite(values)):
+        raise ValueError(f"time_key {time_key!r} is not finite and frame-aligned")
+    values = (values - values[0]) * factor
+    if n_frames > 1 and np.any(np.diff(values) < 0):
+        raise ValueError(f"time_key {time_key!r} must be monotonic within each scan")
+    return values, f"scan_data:{time_key}[{unit_key}]"
 
 
 def _interpolate_rows(rows: np.ndarray, old_q: np.ndarray, new_q: np.ndarray) -> np.ndarray:
@@ -225,6 +267,8 @@ def load_time_resolved_series(
     paths: str | Path | Sequence[str | Path],
     *,
     frame_period_s: float | Mapping[str, float] | None = None,
+    time_key: str | Mapping[str, str] | None = None,
+    time_unit: str | Mapping[str, str] | None = None,
     q_policy: str = "strict",
     reference_q: np.ndarray | None = None,
     metadata_keys: Sequence[str] = (),
@@ -238,8 +282,14 @@ def load_time_resolved_series(
         A processed file, a directory of ``*.nxs`` files, or explicit files.
     frame_period_s
         Scalar period for every file, a mapping keyed by full path/name/stem,
-        or ``None``. Persisted per-frame time metadata wins when present. If
-        neither exists, time coordinates are expressed in frame units.
+        or ``None``. It is used only when explicit persisted timing is not
+        selected with ``time_key`` and ``time_unit``.
+    time_key, time_unit
+        Explicit persisted scan-data column and its proven physical unit. Both
+        accept a scalar or a mapping keyed by full path/name/stem. Numeric
+        columns are never treated as seconds based on their names. If neither
+        explicit timing nor ``frame_period_s`` is supplied, time is expressed
+        in frame-index units and rates are unavailable.
     q_policy
         ``"strict"`` requires identical q grids. ``"interpolate"`` maps each
         scan onto ``reference_q`` or the first scan's grid.
@@ -328,7 +378,14 @@ def load_time_resolved_series(
                 sigma_rows = _interpolate_rows(sigma_rows, q, target_q)
 
         scan_data = read_scan_data(path, frames)
-        scan_time, time_source = _time_from_scan_data(scan_data, len(frames))
+        selected_time_key = _per_path_option(time_key, path, name="time_key")
+        selected_time_unit = _per_path_option(time_unit, path, name="time_unit")
+        scan_time, time_source = _time_from_scan_data(
+            scan_data,
+            len(frames),
+            time_key=selected_time_key,
+            time_unit=selected_time_unit,
+        )
         if scan_time is None:
             period = _period_for_path(frame_period_s, path)
             if period is None:
@@ -368,26 +425,32 @@ def load_time_resolved_series(
     n_patterns = len(intensity_stack)
     if all_seconds:
         time_values = np.asarray(physical_times, dtype=float)
-        sequence_values: list[float] = []
+        sequence_values = np.full(n_patterns, np.nan, dtype=float)
         offset = 0.0
+        sequence_is_known = True
         for scan_index in range(len(scan_paths)):
             positions = np.flatnonzero(np.asarray(scan_indices) == scan_index)
             values = time_values[positions]
+            if not sequence_is_known:
+                continue
             if values.size > 1:
                 step = float(np.nanmedian(np.diff(values)))
-                step = step if np.isfinite(step) and step > 0 else 1.0
+                step = step if np.isfinite(step) and step > 0 else None
             else:
                 period = _period_for_path(frame_period_s, scan_paths[scan_index])
-                step = period if period is not None else 1.0
-            sequence_values.extend((values + offset).tolist())
-            offset = float(values[-1] + offset + step) if values.size else offset
-        time_unit = "s"
+                step = period
+            sequence_values[positions] = values + offset
+            if step is None:
+                sequence_is_known = False
+            elif values.size:
+                offset = float(values[-1] + offset + step)
+        time_coordinate_unit = "s"
     else:
         # Retain physical values separately while exposing only unambiguous
         # frame-based coordinates when even one scan lacks physical timing.
         time_values = np.asarray(frame_in_scan, dtype=float)
         sequence_values = np.arange(n_patterns, dtype=float).tolist()
-        time_unit = "frame"
+        time_coordinate_unit = "frame"
 
     coords: dict[str, Any] = {
         "pattern": np.arange(n_patterns, dtype=np.int64),
@@ -398,7 +461,7 @@ def load_time_resolved_series(
         "frame_label": ("pattern", np.asarray(frame_labels, dtype=np.int64)),
         "frame_in_scan": ("pattern", np.asarray(frame_in_scan, dtype=np.int64)),
         "time": ("pattern", time_values),
-        "sequence_time": ("pattern", np.asarray(sequence_values, dtype=float)),
+        "sequence_time": ("pattern", sequence_values),
         "time_seconds": ("pattern", np.asarray(physical_times, dtype=float)),
         "time_source": ("pattern", np.asarray(time_sources, dtype=str)),
         "q_interpolated": ("pattern", np.asarray(scan_interpolated, dtype=bool)),
@@ -412,8 +475,10 @@ def load_time_resolved_series(
         data_vars["sigma"] = (("pattern", "q"), sigma_stack)
     ds = xr.Dataset(data_vars=data_vars, coords=coords)
     ds.coords["q"].attrs["units"] = q_unit or ""
-    ds.coords["time"].attrs["units"] = time_unit
-    ds.coords["sequence_time"].attrs["units"] = time_unit
+    ds.coords["time"].attrs["units"] = time_coordinate_unit
+    ds.coords["sequence_time"].attrs["units"] = time_coordinate_unit
+    ds.coords["sequence_time"].attrs["availability"] = (
+        "nan after a scan boundary whose physical cadence is unknown")
     ds.coords["time_seconds"].attrs.update({
         "units": "s",
         "availability": "nan for scans without physical timing",
@@ -422,8 +487,14 @@ def load_time_resolved_series(
         "source_files": [str(path) for path in scan_paths],
         "q_policy": q_policy,
         "q_unit": q_unit or "",
-        "time_units": time_unit,
+        "time_units": time_coordinate_unit,
         "time_has_mixed_sources": not all_seconds,
+        "time_contract": {
+            "time_key": time_key,
+            "time_unit": time_unit,
+            "frame_period_s": frame_period_s,
+            "numeric_column_units_inferred": False,
+        },
         "metadata_keys": list(metadata_keys),
         "q_interpolation": {
             "target": "q coordinate",
@@ -863,8 +934,39 @@ def flag_fit_quality(
     return out
 
 
-def lattice_from_q(q_peak: Any, hkl: Sequence[int]) -> np.ndarray:
-    """Return cubic lattice parameter in angstrom from q and ``(h, k, l)``."""
+_INVERSE_ANGSTROM_UNITS = {
+    "q_a^-1",
+    "q_a-1",
+    "a^-1",
+    "a-1",
+    "1/a",
+    "1/angstrom",
+    "angstrom^-1",
+    "angstrom-1",
+    "inverse_angstrom",
+}
+
+
+def _require_inverse_angstrom(q_unit: str | None) -> str:
+    """Validate the unit required by the cubic q-to-lattice equation."""
+    normalized = str(q_unit or "").strip().lower().replace(" ", "")
+    normalized = normalized.replace("å", "angstrom")
+    if normalized not in _INVERSE_ANGSTROM_UNITS:
+        raise ValueError(
+            "q-to-lattice conversion requires an explicit inverse-angstrom q "
+            f"unit; got {q_unit or 'unspecified'!r}. Convert 2-theta or "
+            "inverse-nanometre axes to q_A^-1 before fitting.")
+    return normalized
+
+
+def lattice_from_q(
+    q_peak: Any,
+    hkl: Sequence[int],
+    *,
+    q_unit: str | None,
+) -> np.ndarray:
+    """Return cubic lattice parameter in angstrom from inverse-angstrom q."""
+    _require_inverse_angstrom(q_unit)
     if len(hkl) != 3:
         raise ValueError("hkl must contain exactly three indices")
     norm = float(np.sqrt(sum(float(v) ** 2 for v in hkl)))
@@ -879,10 +981,15 @@ def add_lattice_results(
     *,
     hkls: Sequence[Sequence[int]],
 ) -> xr.Dataset:
-    """Convert fitted peak centers to cubic lattice parameters."""
+    """Convert fitted inverse-angstrom q centers to cubic lattice parameters."""
     hkls = tuple(tuple(int(v) for v in hkl) for hkl in hkls)
     if not hkls:
         raise ValueError("at least one reflection is required")
+    q_unit = (
+        fit_dataset.coords["q_fit"].attrs.get("units")
+        if "q_fit" in fit_dataset.coords else None
+    )
+    _require_inverse_angstrom(q_unit)
     lattice_rows = []
     error_rows = []
     for i, hkl in enumerate(hkls):
@@ -890,7 +997,7 @@ def add_lattice_results(
         if center_name not in fit_dataset:
             raise KeyError(f"fit dataset has no {center_name!r}")
         q = np.asarray(fit_dataset[center_name].values, dtype=float)
-        a = lattice_from_q(q, hkl)
+        a = lattice_from_q(q, hkl, q_unit=q_unit)
         error_name = f"center_err_{i}"
         if error_name in fit_dataset:
             q_err = np.asarray(fit_dataset[error_name].values, dtype=float)
@@ -927,6 +1034,7 @@ def add_lattice_results(
     out.coords["reflection"].attrs["hkls"] = hkls
     out["lattice_A"].attrs["units"] = "angstrom"
     out["lattice_mean_A"].attrs["units"] = "angstrom"
+    out.attrs["lattice_q_unit"] = q_unit
     return out
 
 

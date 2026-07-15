@@ -5,6 +5,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 import pytest
+import xarray as xr
 
 from xrd_tools.analysis.plans import PeakFitPlan
 from xrd_tools.analysis.time_resolved import (
@@ -38,6 +39,7 @@ def _write_scan(
     frame_start: int = 1,
     include_2d: bool = False,
     scan_data: dict[str, np.ndarray] | None = None,
+    q_unit: str = "q_A^-1",
 ) -> Path:
     frames = np.arange(frame_start, frame_start + len(intensity), dtype=np.int64)
     with h5py.File(path, "w") as h5:
@@ -45,7 +47,7 @@ def _write_scan(
         g1 = entry.create_group("integrated_1d")
         g1.create_dataset("frame_index", data=frames)
         q_ds = g1.create_dataset("q", data=np.asarray(q, dtype=np.float32))
-        q_ds.attrs["units"] = "q_A^-1"
+        q_ds.attrs["units"] = q_unit
         g1.create_dataset("intensity", data=np.asarray(intensity, dtype=np.float32))
         g1.create_dataset(
             "sigma", data=np.sqrt(np.maximum(intensity, 0)).astype(np.float32))
@@ -159,7 +161,11 @@ def test_mixed_timing_is_explicit_and_rate_requires_seconds(tmp_path):
     )
     untimed = _write_scan(
         tmp_path / "untimed.nxs", q=q, intensity=np.ones((2, len(q))))
-    ds = load_time_resolved_series([timed, untimed]).dataset
+    ds = load_time_resolved_series(
+        [timed, untimed],
+        time_key={timed.name: "elapsed_time"},
+        time_unit={timed.name: "s"},
+    ).dataset
     assert ds.coords["time"].attrs["units"] == "frame"
     np.testing.assert_allclose(ds.coords["time"], [0, 1, 0, 1])
     np.testing.assert_allclose(ds.coords["time_seconds"].values[:2], [0.0, 0.2])
@@ -174,6 +180,44 @@ def test_mixed_timing_is_explicit_and_rate_requires_seconds(tmp_path):
             LinearThermalExpansion(3.9, 300.0, 1e-5),
             time_coord="time",
         )
+
+
+def test_time_columns_require_selected_units_and_one_frame_does_not_invent_cadence(tmp_path):
+    q = np.linspace(1.0, 5.0, 9)
+    milliseconds = _write_scan(
+        tmp_path / "milliseconds.nxs",
+        q=q,
+        intensity=np.ones((2, len(q))),
+        scan_data={"elapsed": np.array([10.0, 12.0])},
+    )
+
+    # A suggestive name is not evidence that the values are seconds.
+    unknown = load_time_resolved_series(milliseconds).dataset
+    assert unknown.coords["time"].attrs["units"] == "frame"
+    assert np.isnan(unknown.coords["time_seconds"]).all()
+    with pytest.raises(ValueError, match="explicit time_unit"):
+        load_time_resolved_series(milliseconds, time_key="elapsed")
+
+    explicit = load_time_resolved_series(
+        milliseconds, time_key="elapsed", time_unit="ms").dataset
+    np.testing.assert_allclose(explicit.coords["time"], [0.0, 0.002])
+    assert explicit.coords["time"].attrs["units"] == "s"
+    assert explicit.coords["time_source"].values.tolist() == [
+        "scan_data:elapsed[ms]", "scan_data:elapsed[ms]"]
+
+    first = _write_scan(
+        tmp_path / "first.nxs", q=q, intensity=np.ones((1, len(q))),
+        scan_data={"clock": np.array([50.0])},
+    )
+    second = _write_scan(
+        tmp_path / "second.nxs", q=q, intensity=np.ones((1, len(q))),
+        scan_data={"clock": np.array([100.0])},
+    )
+    one_frame_scans = load_time_resolved_series(
+        [first, second], time_key="clock", time_unit="ms").dataset
+    np.testing.assert_allclose(one_frame_scans.coords["time"], [0.0, 0.0])
+    assert one_frame_scans.coords["sequence_time"].values[0] == 0.0
+    assert np.isnan(one_frame_scans.coords["sequence_time"].values[1])
 
 
 def test_time_resolved_raw_accessor_is_strict_and_qualified(scan_pair, monkeypatch):
@@ -293,3 +337,25 @@ def test_peak_series_lattice_temperature_and_rate(tmp_path):
     )
     assert paths["netcdf"].is_file() and paths["csv"].is_file()
     assert "center_0" in (tmp_path / "results.csv").read_text()
+
+
+@pytest.mark.parametrize("unit", ["2th_deg", "q_nm^-1", "", None])
+def test_lattice_conversion_rejects_non_inverse_angstrom_axes(unit):
+    fits = xr.Dataset(
+        {"center_0": ("fit_pattern", np.array([2.76]))},
+        coords={"fit_pattern": [0], "q_fit": np.linspace(2.6, 2.9, 9)},
+    )
+    if unit is not None:
+        fits.coords["q_fit"].attrs["units"] = unit
+    with pytest.raises(ValueError, match="inverse-angstrom"):
+        add_lattice_results(fits, hkls=((1, 1, 1),))
+
+
+def test_lattice_conversion_accepts_documented_inverse_angstrom_aliases():
+    fits = xr.Dataset(
+        {"center_0": ("fit_pattern", np.array([2.76]))},
+        coords={"fit_pattern": [0], "q_fit": np.linspace(2.6, 2.9, 9)},
+    )
+    fits.coords["q_fit"].attrs["units"] = "1/angstrom"
+    lattice = add_lattice_results(fits, hkls=((1, 1, 1),))
+    assert lattice["lattice_A"].values[0, 0] == pytest.approx(3.943, rel=1e-3)
