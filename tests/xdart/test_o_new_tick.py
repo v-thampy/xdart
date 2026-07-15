@@ -7,8 +7,13 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from xdart.gui.tabs.static_scan.display_controllers import (
     _live_overlay_render_labels,
+)
+from xdart.gui.tabs.static_scan.display_overlay_utils import (
+    overlay_identity_for_widget,
 )
 
 
@@ -76,6 +81,18 @@ def test_live_overlay_tick_uses_frame_source_when_scan_identity_is_unset():
     w.frame = SimpleNamespace(source_file="/data/scanB_0000.tif")
 
     assert _live_overlay_render_labels(w, (0,)) == (0,)
+
+
+def test_overlay_capture_rejects_unqualified_scan_identity():
+    w = SimpleNamespace(
+        scan=SimpleNamespace(name=None, data_file=None),
+        frame=None,
+        ui=SimpleNamespace(
+            plotUnit=SimpleNamespace(currentIndex=lambda: 0)),
+    )
+
+    with pytest.raises(ValueError, match="stable scan identity"):
+        overlay_identity_for_widget(w, 0)
 
 
 def test_full_reseed_when_accumulator_empty_or_absent():

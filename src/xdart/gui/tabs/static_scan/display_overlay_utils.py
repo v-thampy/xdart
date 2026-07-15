@@ -49,8 +49,17 @@ def current_scan_key(widget):
     return None
 
 
+def _require_scan_key(widget):
+    """Return a stable key or reject an unqualified capture explicitly."""
+    key = current_scan_key(widget)
+    if key is None:
+        raise ValueError(
+            "cannot capture Overlay/Waterfall row without stable scan identity")
+    return key
+
+
 def qualified_row_id_for_widget(widget, frame_idx):
-    return qualified_frame_id(current_scan_key(widget), frame_idx)
+    return qualified_frame_id(_require_scan_key(widget), frame_idx)
 
 
 def qualified_row_ids_for_widget(widget, frame_idxs):
@@ -381,19 +390,20 @@ def overlay_identity_for_widget(
     own row instead of accumulating.
     """
     axis_info = axis_info or current_axis_info(widget)
+    scan_key = _require_scan_key(widget)
     grid_key = overlay_grid_key_for_widget(
         widget, npt=npt, first_frame=first_frame, axis_info=axis_info)
     if projection_id is None:
         projection_id = overlay_projection_id_for_widget(
             widget, axis_info, live=live_slice)
     if projection_id is None:
-        row_id = qualified_row_id_for_widget(widget, frame_idx)
+        row_id = qualified_frame_id(scan_key, frame_idx)
     else:
         try:
             frame_idx = int(frame_idx)
         except (TypeError, ValueError):
             pass
-        row_id = (current_scan_key(widget), frame_idx, projection_id)
+        row_id = (scan_key, frame_idx, projection_id)
     return grid_key, row_id
 
 
