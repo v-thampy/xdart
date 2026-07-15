@@ -55,6 +55,23 @@ def test_dot_nexus_output_extension_is_excluded_from_raw_candidates(tmp_path):
     assert [c.path.name for c in candidates] == ["raw.nxs"]
 
 
+def test_r1r4_cxi_is_a_nexus_family_candidate_but_nexus_is_not(tmp_path):
+    """Gate 7: .cxi is a NeXus-family raw candidate (parity with
+    guess_source_kind/discover_scans/_NEXUS_EXTS — the held defect returned 0
+    .cxi candidates); .nexus stays excluded from raw discovery."""
+    _touch(tmp_path / "scan.cxi")
+    _touch(tmp_path / "raw.nxs")
+    _touch(tmp_path / "out.nexus")
+
+    candidates = enumerate_candidates(tmp_path)
+
+    assert {c.path.name for c in candidates} == {"scan.cxi", "raw.nxs"}
+    assert {c.adapter_id for c in candidates} == {"nexus_hdf5"}
+    # the .cxi candidate is owned by the nexus adapter, same as .nxs/.h5/.hdf5
+    cxi = next(c for c in candidates if c.path.name == "scan.cxi")
+    assert cxi.adapter_id == "nexus_hdf5"
+
+
 def test_eiger_data_sidecar_excluded_but_master_included(tmp_path):
     _touch(tmp_path / "run_data_000001.h5")
     _touch(tmp_path / "run_master.h5")

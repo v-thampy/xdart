@@ -147,9 +147,17 @@ def open_source(uri_or_spec: str | Path | SourceSpec | FrameSource, **opts: Any)
 # lazy, inside each callable, matching the rest of this package).
 # ---------------------------------------------------------------------------
 
+#: Raw-readable NeXus-family container extensions.  ``.cxi`` is included for
+#: parity with the existing guess_source_kind()/discover_scans() rules and
+#: discover._NEXUS_EXTS (R1-R4); ``.nexus`` is deliberately ABSENT — it is a
+#: reserved output-only extension, openable explicitly but excluded from raw
+#: directory discovery (see guess_source_kind and discover.enumerate_candidates).
+_NEXUS_CANDIDATE_EXTS = {".nxs", ".h5", ".hdf5", ".cxi"}
+
+
 def _nexus_is_candidate(path: Path) -> bool:
     path = Path(path)
-    if path.suffix.lower() not in {".nxs", ".h5", ".hdf5"}:
+    if path.suffix.lower() not in _NEXUS_CANDIDATE_EXTS:
         return False
     from xrd_tools.io.image import _is_eiger_master
     # An Eiger _data_NNNNNN.h5 sidecar is not its own candidate — its frames
@@ -353,7 +361,7 @@ def _register_builtin_adapters() -> None:
         open=_nexus_open,
         finalization_policy=nxwriter_finalization_policy,
         is_output_format=True,
-    ))
+    ), builtin=True)
     register_adapter(SourceFormatAdapter(
         id="image_file",
         kinds=(SourceKind.IMAGE_FILE,),
@@ -361,7 +369,7 @@ def _register_builtin_adapters() -> None:
         scan_name=_image_scan_name,
         probe=_image_probe,
         open=_image_open,
-    ))
+    ), builtin=True)
     register_adapter(SourceFormatAdapter(
         id="tiff_series",
         kinds=(SourceKind.TIFF_SERIES,),
@@ -369,7 +377,7 @@ def _register_builtin_adapters() -> None:
         scan_name=_tiff_series_scan_name,
         probe=_tiff_series_probe,
         open=_tiff_series_open,
-    ))
+    ), builtin=True)
     register_adapter(SourceFormatAdapter(
         id="spec",
         kinds=(SourceKind.SPEC,),
@@ -377,7 +385,7 @@ def _register_builtin_adapters() -> None:
         scan_name=_spec_scan_name,
         probe=_spec_probe,
         open=_spec_open,
-    ))
+    ), builtin=True)
     register_adapter(SourceFormatAdapter(
         id="live",
         kinds=(SourceKind.LIVE,),
@@ -385,7 +393,7 @@ def _register_builtin_adapters() -> None:
         scan_name=_live_scan_name,
         probe=_live_probe,
         open=_live_open,
-    ))
+    ), builtin=True)
 
 
 _register_builtin_adapters()

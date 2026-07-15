@@ -10,10 +10,13 @@ R2 will add one-open HDF5 cursors that CONSUME these candidates; this module
 does not anticipate that shape.
 
 Every :meth:`DirectoryIndex.poll` call is a plain, synchronous, name-only
-:func:`~xrd_tools.sources.discover.enumerate_candidates` sweep — zero HDF5
-opens, on both the first poll and every unchanged one after it.  An unchanged
-poll returns the *same* :class:`Snapshot` object (not a new-but-equal one) so
-a caller never re-sorts or reconstructs an unchanged candidate list.
+candidate scan — zero HDF5 opens, on both the first poll and every unchanged
+one after it.  It splits the CHEAP unordered collect+compare
+(:func:`~xrd_tools.sources.discover.collect_candidates`) from the expensive
+natural sort: an unchanged poll returns the *same* :class:`Snapshot` object
+without a single ``os_sorted`` call, so a caller never re-sorts or
+reconstructs an unchanged candidate list; the sort runs only when the
+candidate map actually changed.
 
 :meth:`DirectoryIndex.record_probe` layers BOUNDED RETRY on top of an
 explicit, caller-invoked probe (:mod:`xrd_tools.sources.adapters`,
@@ -21,8 +24,13 @@ explicit, caller-invoked probe (:mod:`xrd_tools.sources.adapters`,
 "newly readable HDF5 shell... remains provisional... not permanently retired
 as imageless" policy: a fresh IN_PROGRESS/IMAGELESS verdict is held as
 IN_PROGRESS for up to ``retry_deadline`` seconds (an injectable clock, no
-wall-clock sleeps in tests) before the raw verdict is trusted, and the window
-resets whenever the candidate's file stamp changes.
+wall-clock sleeps in tests) before the raw verdict is trusted.  Once the
+window resolves to a terminal verdict, that verdict is STICKY for the
+candidate's current version stamp — repeated probes of the same stamp return
+it without opening a new window — until a size/mtime change, removal, or
+reconfiguration clears the resolution and permits a fresh bounded window.
+This stamp-qualified resolution is a tiny value map (path -> stamp + verdict);
+it is deliberately not a metadata cache.
 """
 
 from __future__ import annotations
@@ -33,10 +41,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from xrd_tools.sources.discover import Candidate, enumerate_candidates
+from xrd_tools.sources.discover import Candidate, collect_candidates, sort_candidates
 from xrd_tools.sources.probe import ProbeResult, ProbeState
 
 _UNSET: Any = object()
+
+_Stamp = tuple[int, int]
 
 #: Probe states that leave a candidate's finality in doubt — the ONLY states
 #: DirectoryIndex tracks bounded retry for (handoff: "retry state associated
@@ -53,12 +63,24 @@ DEFAULT_RETRY_DEADLINE = 30.0
 
 @dataclass(frozen=True, slots=True)
 class RetryState:
-    """Bounded-retry bookkeeping for one provisional candidate."""
+    """Bounded-retry bookkeeping for one provisional candidate.
+
+    ``imageless_result`` remembers the most recent IMAGELESS observation seen
+    ANYWHERE in the window, not just the last probe: IMAGELESS means the file
+    was READABLE (just carried no detector dataset), a strictly more-resolved
+    state than IN_PROGRESS (not-yet-readable / unfinalized).  A window that was
+    readable-but-imageless even once is a genuine imageless shell and resolves
+    to IMAGELESS at exhaustion; only a window that was NEVER once readable (all
+    IN_PROGRESS) escalates to INVALID.  Without this, a single transient
+    IN_PROGRESS (a momentary lock/network stall — exactly what the window
+    exists to absorb) landing on the deadline would wrongly condemn a good
+    zero-frame file to permanent INVALID."""
 
     first_seen_at: float
     stamp: tuple[int, int] | None
     attempts: int
     last_result: ProbeResult
+    imageless_result: ProbeResult | None = None
 
     def elapsed(self, *, now: float) -> float:
         return now - self.first_seen_at
@@ -127,7 +149,14 @@ class DirectoryIndex:
         self._retry_deadline = float(retry_deadline)
         self._snapshot = Snapshot(0, (), self._root, self._recursive, self._name_filter)
         self._last_delta = _EMPTY_DELTA
+        # ACTIVE provisional retry windows only — retry_state() reflects exactly
+        # this dict, so a resolved candidate never lingers here.
         self._retries: dict[Path, RetryState] = {}
+        # Stamp-qualified TERMINAL resolutions (path -> (stamp, verdict)), kept
+        # separate from _retries so a settled IMAGELESS/INVALID/READY verdict is
+        # sticky for its stamp without reopening a window.  A tiny value map,
+        # not a metadata cache; cleared per-path on change/removal/reconfigure.
+        self._terminal: dict[Path, tuple[_Stamp, ProbeResult]] = {}
 
     @property
     def snapshot(self) -> Snapshot:
@@ -179,51 +208,66 @@ class DirectoryIndex:
             self._snapshot.generation + 1, (), self._root, self._recursive, self._name_filter)
         self._last_delta = _EMPTY_DELTA
         self._retries.clear()
+        self._terminal.clear()
         return True
 
     def poll(self) -> Snapshot:
-        """Enumerate candidates now (name-only, zero HDF5 opens) and return
-        the resulting :class:`Snapshot`.
+        """Scan candidates now (name-only, zero HDF5 opens) and return the
+        resulting :class:`Snapshot`.
 
-        When nothing changed since the prior poll (same candidate identities
-        and version stamps, in the same order), returns the SAME ``Snapshot``
-        object — no new tuple, no re-sort of anything beyond the plain
-        filesystem walk :func:`enumerate_candidates` itself always performs.
+        Collects candidates UNORDERED and cheaply (directory listing + one
+        ``stat()`` per match, no natural sort), then compares the fresh
+        candidate map against the prior snapshot's by full candidate identity
+        — path, owning ``adapter_id``, and ``(size, mtime_ns)`` stamp.  When
+        they are equal, returns the SAME prior ``Snapshot`` object with an
+        empty delta and performs NO natural sort (R1-R5).  Only when the map
+        actually changed does it sort once (from the already-collected list)
+        and build a new generation.
+
+        ``changed`` includes a candidate whose OWNING ADAPTER flipped for an
+        unchanged path+stamp (a registration change), not just a byte change
+        (R1-R3); provisional and terminal state for every changed/removed path
+        is cleared, since the tracked file no longer matches what is on disk.
         """
-        fresh = tuple(enumerate_candidates(
-            self._root, recursive=self._recursive, name_filter=self._name_filter))
+        fresh_list = collect_candidates(
+            self._root, recursive=self._recursive, name_filter=self._name_filter)
+        fresh_by_path = {c.path: c for c in fresh_list}
         prior = self._snapshot
+        prior_by_path = prior.by_path()
 
-        if fresh == prior.candidates:
+        # Order-independent unchanged check on the cheap map — no sort.  Candidate
+        # equality is full (path/adapter_id/size/mtime_ns), so an owner-only flip
+        # makes the maps unequal and is never mistaken for "unchanged".
+        if fresh_by_path == prior_by_path:
             self._last_delta = _EMPTY_DELTA
             return prior
 
-        prior_by_path = prior.by_path()
-        fresh_by_path = {c.path: c for c in fresh}
-
-        added = tuple(c for c in fresh if c.path not in prior_by_path)
+        added = tuple(c for c in fresh_list if c.path not in prior_by_path)
         changed = tuple(
-            c for c in fresh
-            if c.path in prior_by_path
-            and prior_by_path[c.path].version_stamp != c.version_stamp
+            c for c in fresh_list
+            if c.path in prior_by_path and prior_by_path[c.path] != c
         )
         removed = tuple(p for p in prior_by_path if p not in fresh_by_path)
 
-        # A changed or removed candidate's prior retry window is stale — the
-        # file that was tracked no longer matches what is now on disk (or is
-        # gone).  record_probe() below will open a FRESH window from the next
-        # explicit probe, rather than silently reusing old timing.
+        # A changed (bytes OR owner) or removed candidate's prior state no longer
+        # describes what is on disk — clear BOTH the active retry window and any
+        # sticky terminal resolution for that path so the next explicit probe
+        # opens a fresh bounded window rather than reusing stale timing/verdict.
         for c in changed:
             self._retries.pop(c.path, None)
+            self._terminal.pop(c.path, None)
         for p in removed:
             self._retries.pop(p, None)
+            self._terminal.pop(p, None)
 
+        fresh = tuple(sort_candidates(fresh_list))  # sort ONLY on real change
         self._snapshot = Snapshot(
             prior.generation + 1, fresh, self._root, self._recursive, self._name_filter)
         self._last_delta = IndexDelta(added=added, changed=changed, removed=removed)
         return self._snapshot
 
     def record_probe(self, path: str | Path, result: ProbeResult, *,
+                      expected_stamp: _Stamp | None = None,
                       retry_deadline: float | None = None) -> ProbeResult:
         """Record an explicit probe result for the candidate at *path* and
         return the EFFECTIVE result a caller should treat it as.
@@ -233,57 +277,92 @@ class DirectoryIndex:
         the index what it found, so the index can apply the bounded-
         readiness policy on top:
 
-        * a terminal result (READY / PROCESSED_OUTPUT / INVALID) clears any
-          retry tracking for *path* and is returned unchanged;
-        * a provisional result (IN_PROGRESS / IMAGELESS) starts or continues
-          a bounded retry window keyed to the candidate's CURRENT version
-          stamp — a stamp change (caught here or already cleared by
-          :meth:`poll`) always starts a fresh window — and is surfaced as
-          IN_PROGRESS while the window is open;
+        * a result for a *path* that is NOT a current candidate — absent from
+          the snapshot, or (when ``expected_stamp`` is given) computed against
+          a stamp that no longer matches the current candidate — is a stale or
+          unknown late completion.  It is IGNORED: returned unchanged, with NO
+          retry or terminal state created (R1-R6);
+        * a stamp already resolved to a TERMINAL verdict returns that sticky
+          verdict without reopening a window (R1-R1);
+        * a terminal result (READY / PROCESSED_OUTPUT / INVALID) resolves the
+          stamp terminally, clears any active retry window, and is returned
+          unchanged;
+        * a provisional result (IN_PROGRESS / IMAGELESS) starts or continues a
+          bounded retry window keyed to the candidate's current stamp and is
+          surfaced as IN_PROGRESS while the window is open;
         * once the window exceeds ``retry_deadline`` (or the constructor
-          default): an IMAGELESS raw verdict is now trusted and returned
-          as-is (a stable, old, zero-detector-frame shell is a genuine
-          "no images here" classification — the wrangler's own "only a
-          stable old file is retired as genuinely imageless" policy); an
-          IN_PROGRESS raw verdict — meaning the file was still unreadable
-          or an unfinalized NXWriter run for the WHOLE window, never once
-          resolving — escalates to INVALID instead of retrying forever, so
-          a genuinely stuck/corrupt file eventually surfaces as a problem
-          rather than an indefinite silent retry.
+          default) it resolves TERMINALLY and sticks for the stamp: a window
+          that was ever readable-but-imageless resolves to IMAGELESS (a
+          stable, zero-detector-frame shell — the wrangler's "only a stable
+          old file is retired as genuinely imageless" policy); a window that
+          was NEVER once readable (all IN_PROGRESS — still unreadable /
+          unfinalized the whole time) escalates to INVALID rather than
+          retrying forever.  The escalation keys on whether the file EVER
+          resolved during the window, not on the single last sample, so a lone
+          transient IN_PROGRESS on the deadline cannot condemn a genuine
+          imageless shell.
         """
         path = Path(path)
         deadline = self._retry_deadline if retry_deadline is None else retry_deadline
         candidate = self._snapshot.by_path().get(path)
-        stamp = candidate.version_stamp if candidate is not None else None
+
+        # R1-R6: unknown/stale completion — never create state for a path the
+        # index does not currently own, or for a stamp that has moved on.
+        if candidate is None:
+            return result
+        stamp = candidate.version_stamp
+        if expected_stamp is not None and expected_stamp != stamp:
+            return result
+
+        # R1-R1: a stamp already resolved terminally stays terminal — no new
+        # window.  poll() clears this on any change/removal for the path.
+        settled = self._terminal.get(path)
+        if settled is not None and settled[0] == stamp:
+            return settled[1]
+
         now = self._clock()
 
         if result.state not in _PROVISIONAL_STATES:
             self._retries.pop(path, None)
+            self._terminal[path] = (stamp, result)
             return result
 
+        this_imageless = result if result.state is ProbeState.IMAGELESS else None
         prior = self._retries.get(path)
         if prior is None or prior.stamp != stamp:
             self._retries[path] = RetryState(
-                first_seen_at=now, stamp=stamp, attempts=1, last_result=result)
+                first_seen_at=now, stamp=stamp, attempts=1, last_result=result,
+                imageless_result=this_imageless)
             return ProbeResult(ProbeState.IN_PROGRESS, reason=result.reason)
 
+        # Carry the most-resolved observation forward: an IMAGELESS seen
+        # anywhere in the window survives a later transient IN_PROGRESS.
+        imageless_seen = this_imageless or prior.imageless_result
         entry = RetryState(
             first_seen_at=prior.first_seen_at, stamp=stamp,
-            attempts=prior.attempts + 1, last_result=result)
+            attempts=prior.attempts + 1, last_result=result,
+            imageless_result=imageless_seen)
         if entry.exhausted(now=now, deadline=deadline):
             self._retries.pop(path, None)
-            if result.state is ProbeState.IN_PROGRESS:
-                return ProbeResult(
+            if imageless_seen is not None:
+                # readable-but-imageless at least once -> genuine imageless shell
+                resolved = imageless_seen
+            else:
+                # never once readable the whole window -> stuck/corrupt
+                resolved = ProbeResult(
                     ProbeState.INVALID,
                     reason=f"{result.reason} (exceeded {deadline:g}s retry window)",
                 )
-            return result
+            self._terminal[path] = (stamp, resolved)
+            return resolved
         self._retries[path] = entry
         return ProbeResult(ProbeState.IN_PROGRESS, reason=result.reason)
 
     def retry_state(self, path: str | Path) -> RetryState | None:
-        """The active :class:`RetryState` for *path*, if it is currently
-        tracked as provisional (``None`` otherwise)."""
+        """The active :class:`RetryState` for *path* — an OPEN provisional
+        retry window only.  A terminally resolved candidate (settled
+        IMAGELESS/INVALID/READY) is not a provisional window and returns
+        ``None`` here even though its verdict is still sticky."""
         return self._retries.get(Path(path))
 
     def probe_candidate(self, candidate: Candidate, *,
@@ -291,17 +370,34 @@ class DirectoryIndex:
         """Explicitly probe ONE candidate through its owning adapter and
         record the result via :meth:`record_probe`.
 
-        This is the ONLY method on this class that may open a file's
-        content, and it is never called by :meth:`poll` or
-        :func:`~xrd_tools.sources.discover.enumerate_candidates` — a caller
+        This is the ONLY method on this class that may open a file's content,
+        and it is never called by :meth:`poll` or
+        :func:`~xrd_tools.sources.discover.collect_candidates` — a caller
         decides which candidates are worth the I/O, one at a time (e.g. only
-        the newest few, or only ones the GUI is about to display)."""
+        the newest few, or only ones the GUI is about to display).
+
+        Rejects a STALE *candidate* object — one whose path/adapter/stamp no
+        longer matches the current snapshot (removed, byte-changed, or
+        owner-flipped since it was enumerated) — with a :class:`ValueError`,
+        BEFORE opening the file, so a late consumer of an old snapshot never
+        probes or records state for a candidate the index no longer owns
+        (R1-R6).
+        """
+        current = self._snapshot.by_path().get(candidate.path)
+        if (current is None
+                or current.version_stamp != candidate.version_stamp
+                or current.adapter_id != candidate.adapter_id):
+            raise ValueError(
+                f"stale candidate {candidate.path} no longer matches the current "
+                "snapshot; re-poll before probing")
         from xrd_tools.sources.adapters import get_adapter
         adapter = get_adapter(candidate.adapter_id)
         if adapter is None:
             raise LookupError(f"no adapter registered for id {candidate.adapter_id!r}")
         raw = adapter.probe(candidate.path)
-        return self.record_probe(candidate.path, raw, retry_deadline=retry_deadline)
+        return self.record_probe(
+            candidate.path, raw, expected_stamp=candidate.version_stamp,
+            retry_deadline=retry_deadline)
 
     def poll_forever(self, *, interval: float,
                      should_stop: Callable[[], bool] = lambda: False,

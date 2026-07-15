@@ -47,15 +47,18 @@ def test_ready_result_is_returned_unchanged_and_not_tracked(tmp_path):
 
 
 def test_processed_output_and_invalid_are_terminal_too(tmp_path):
-    _touch(tmp_path / "a.nxs")
-    index = DirectoryIndex(tmp_path, clock=_FakeClock())
-    index.poll()
-
-    for state in (ProbeState.PROCESSED_OUTPUT, ProbeState.INVALID):
+    # One file per state: a terminal verdict is sticky for its stamp (R1-R1),
+    # so probing two different terminal states on the SAME path would return
+    # the first (sticky) verdict, not the second — use distinct paths.
+    for i, state in enumerate((ProbeState.PROCESSED_OUTPUT, ProbeState.INVALID)):
+        name = f"f{i}.nxs"
+        _touch(tmp_path / name)
+        index = DirectoryIndex(tmp_path, clock=_FakeClock())
+        index.poll()
         result = ProbeResult(state, reason="terminal")
-        effective = index.record_probe(tmp_path / "a.nxs", result)
+        effective = index.record_probe(tmp_path / name, result)
         assert effective is result
-        assert index.retry_state(tmp_path / "a.nxs") is None
+        assert index.retry_state(tmp_path / name) is None
 
 
 # ---- provisional results: bounded retry window ------------------------------
@@ -236,3 +239,214 @@ def test_poll_forever_stops_immediately_when_should_stop_is_already_true(tmp_pat
     snapshots = list(index.poll_forever(
         interval=1.0, should_stop=lambda: True, sleep=lambda s: None))
     assert snapshots == []
+
+
+# ===========================================================================
+# R1-R1 — exhausted retry is TERMINAL for the unchanged stamp (gates 1 + 2)
+# ===========================================================================
+
+def test_r1r1_exhausted_imageless_stays_terminal_on_repeated_probes(tmp_path):
+    """Gate 1: after the window exhausts to IMAGELESS, repeated probes of the
+    SAME stamp keep returning IMAGELESS — they must NOT reopen a fresh window
+    (the held defect was in_progress -> imageless -> in_progress)."""
+    _touch(tmp_path / "shell.nxs")
+    clock = _FakeClock()
+    index = DirectoryIndex(tmp_path, clock=clock, retry_deadline=10.0)
+    index.poll()
+    raw = ProbeResult(ProbeState.IMAGELESS, reason="no det")
+    p = tmp_path / "shell.nxs"
+
+    assert index.record_probe(p, raw).state is ProbeState.IN_PROGRESS
+    clock.advance(11.0)
+    assert index.record_probe(p, raw).state is ProbeState.IMAGELESS   # exhausted
+    # Repeated probes of the same stamp stay terminal, never in_progress:
+    for _ in range(3):
+        assert index.record_probe(p, raw).state is ProbeState.IMAGELESS
+        assert index.retry_state(p) is None   # no reopened window
+
+
+def test_r1r1_exhausted_in_progress_stays_terminal_invalid_on_repeated_probes(tmp_path):
+    """Gate 1 (INVALID variant): a never-resolving IN_PROGRESS escalates to
+    INVALID at exhaustion and STAYS INVALID on repeated same-stamp probes."""
+    _touch(tmp_path / "stuck.nxs")
+    clock = _FakeClock()
+    index = DirectoryIndex(tmp_path, clock=clock, retry_deadline=5.0)
+    index.poll()
+    raw = ProbeResult(ProbeState.IN_PROGRESS, reason="still writing")
+    p = tmp_path / "stuck.nxs"
+
+    index.record_probe(p, raw)
+    clock.advance(6.0)
+    assert index.record_probe(p, raw).state is ProbeState.INVALID
+    for _ in range(3):
+        assert index.record_probe(p, raw).state is ProbeState.INVALID
+        assert index.retry_state(p) is None
+
+
+def test_r1r1_stamp_change_clears_terminal_and_opens_one_fresh_window(tmp_path):
+    """Gate 2: a size/mtime change after a terminal resolution clears it and
+    permits exactly ONE fresh bounded window (back to IN_PROGRESS)."""
+    p = _touch(tmp_path / "shell.nxs", data=b"short")
+    clock = _FakeClock()
+    index = DirectoryIndex(tmp_path, clock=clock, retry_deadline=10.0)
+    index.poll()
+    raw = ProbeResult(ProbeState.IMAGELESS, reason="no det")
+
+    index.record_probe(p, raw)
+    clock.advance(11.0)
+    assert index.record_probe(p, raw).state is ProbeState.IMAGELESS   # terminal
+
+    # bytes change -> poll sees it -> terminal resolution cleared
+    p.write_bytes(b"a longer payload now")
+    index.poll()
+    assert index.retry_state(p) is None
+
+    # fresh window opens; NOT immediately terminal again
+    eff = index.record_probe(p, raw)
+    assert eff.state is ProbeState.IN_PROGRESS
+    assert index.retry_state(p).attempts == 1
+
+
+def test_r1r1_reconfigure_clears_terminal_resolution(tmp_path):
+    """Gate 2 (reconfigure variant): a reconfiguration also clears a terminal
+    resolution, so the candidate can open a fresh window after re-poll."""
+    _touch(tmp_path / "shell.nxs")
+    clock = _FakeClock()
+    index = DirectoryIndex(tmp_path, clock=clock, retry_deadline=10.0)
+    index.poll()
+    raw = ProbeResult(ProbeState.IMAGELESS, reason="no det")
+    p = tmp_path / "shell.nxs"
+    index.record_probe(p, raw)
+    clock.advance(11.0)
+    assert index.record_probe(p, raw).state is ProbeState.IMAGELESS
+
+    index.reconfigure(name_filter="")   # any real change (whitespace filter matches all)
+    index.poll()
+    assert index.record_probe(p, raw).state is ProbeState.IN_PROGRESS   # fresh window
+
+
+def test_r1r1_terminal_resolution_survives_an_unchanged_poll(tmp_path):
+    """A terminal resolution must persist across an unchanged poll — the
+    R1-R5 unchanged-poll early-return must not touch _terminal."""
+    _touch(tmp_path / "shell.nxs")
+    clock = _FakeClock()
+    index = DirectoryIndex(tmp_path, clock=clock, retry_deadline=10.0)
+    index.poll()
+    raw = ProbeResult(ProbeState.IMAGELESS, reason="no det")
+    p = tmp_path / "shell.nxs"
+    index.record_probe(p, raw)
+    clock.advance(11.0)
+    assert index.record_probe(p, raw).state is ProbeState.IMAGELESS
+
+    index.poll()   # unchanged
+    assert index.last_delta.unchanged is True
+    assert index.record_probe(p, raw).state is ProbeState.IMAGELESS   # still sticky
+
+
+def test_r1r1_transient_in_progress_on_the_deadline_does_not_condemn_an_imageless_shell(tmp_path):
+    """A stable readable-but-imageless shell probed IMAGELESS several times,
+    then a lone TRANSIENT IN_PROGRESS (a momentary lock/stall) landing on the
+    deadline, must still resolve to IMAGELESS — NOT be condemned to INVALID.
+    The escalation keys on whether the file was EVER readable in the window,
+    not on the single last sample (adversarial BUG-1)."""
+    _touch(tmp_path / "shell.nxs")
+    clock = _FakeClock()
+    index = DirectoryIndex(tmp_path, clock=clock, retry_deadline=10.0)
+    index.poll()
+    p = tmp_path / "shell.nxs"
+    imageless = ProbeResult(ProbeState.IMAGELESS, reason="no det")
+    transient = ProbeResult(ProbeState.IN_PROGRESS, reason="momentary lock")
+
+    assert index.record_probe(p, imageless).state is ProbeState.IN_PROGRESS  # window opens
+    clock.advance(3.0)
+    assert index.record_probe(p, imageless).state is ProbeState.IN_PROGRESS  # readable again
+    clock.advance(8.0)   # t=11 >= 10: exhausts, but on a transient IN_PROGRESS
+    resolved = index.record_probe(p, transient)
+    assert resolved.state is ProbeState.IMAGELESS   # NOT INVALID
+    # and it stays IMAGELESS (sticky) on repeat
+    assert index.record_probe(p, transient).state is ProbeState.IMAGELESS
+
+
+def test_r1r1_never_readable_window_still_escalates_to_invalid(tmp_path):
+    """The converse: a window that was NEVER once readable (all IN_PROGRESS)
+    still escalates to INVALID — the imageless-carry-forward must not weaken
+    the genuine stuck/corrupt-file escalation."""
+    _touch(tmp_path / "stuck.nxs")
+    clock = _FakeClock()
+    index = DirectoryIndex(tmp_path, clock=clock, retry_deadline=5.0)
+    index.poll()
+    p = tmp_path / "stuck.nxs"
+    raw = ProbeResult(ProbeState.IN_PROGRESS, reason="never readable")
+
+    index.record_probe(p, raw)
+    clock.advance(2.0)
+    index.record_probe(p, raw)
+    clock.advance(4.0)   # t=6 >= 5
+    assert index.record_probe(p, raw).state is ProbeState.INVALID
+
+
+# ===========================================================================
+# R1-R6 — stale / unknown probe completions create NO state (gate 9)
+# ===========================================================================
+
+def test_r1r6_unknown_path_probe_creates_no_state(tmp_path):
+    """Gate 9: record_probe for a path absent from the current snapshot is
+    ignored — returned unchanged, with no retry/terminal state created."""
+    _touch(tmp_path / "a.nxs")
+    index = DirectoryIndex(tmp_path, clock=_FakeClock())
+    index.poll()
+    ghost = tmp_path / "ghost.nxs"
+    raw = ProbeResult(ProbeState.IN_PROGRESS, reason="late")
+
+    eff = index.record_probe(ghost, raw)
+    assert eff is raw                       # returned unchanged
+    assert index.retry_state(ghost) is None  # no window created
+
+
+def test_r1r6_stale_stamp_probe_creates_no_state(tmp_path):
+    """Gate 9: a completion whose expected_stamp no longer matches the current
+    candidate (a late result for an older version) creates no state."""
+    p = _touch(tmp_path / "a.nxs", data=b"one")
+    index = DirectoryIndex(tmp_path, clock=_FakeClock())
+    index.poll()
+    stale_stamp = (999, 999)   # never the real stamp
+    raw = ProbeResult(ProbeState.IN_PROGRESS, reason="late")
+
+    eff = index.record_probe(p, raw, expected_stamp=stale_stamp)
+    assert eff is raw
+    assert index.retry_state(p) is None
+
+
+def test_r1r6_probe_candidate_rejects_a_removed_candidate(tmp_path):
+    """Gate 9: probe_candidate on a candidate whose file was removed since the
+    snapshot raises ValueError and records no state — before any file open."""
+    import pytest
+    a = _touch(tmp_path / "a.nxs")
+    index = DirectoryIndex(tmp_path, clock=_FakeClock())
+    index.poll()
+    candidate = index.snapshot.candidates[0]
+
+    a.unlink()
+    index.poll()   # candidate now removed from snapshot
+
+    with pytest.raises(ValueError):
+        index.probe_candidate(candidate)
+    assert index.retry_state(a) is None
+
+
+def test_r1r6_probe_candidate_rejects_a_reconfigured_away_candidate(tmp_path):
+    """Gate 9: probe_candidate on a candidate filtered out by a reconfigure
+    (no longer in the snapshot) raises ValueError and records no state."""
+    import pytest
+    _touch(tmp_path / "sample_bg.nxs")
+    index = DirectoryIndex(tmp_path, clock=_FakeClock())
+    index.poll()
+    candidate = index.snapshot.candidates[0]
+
+    index.reconfigure(name_filter="-bg")   # excludes sample_bg
+    index.poll()
+    assert index.snapshot.candidates == ()
+
+    with pytest.raises(ValueError):
+        index.probe_candidate(candidate)
+    assert index.retry_state(candidate.path) is None

@@ -167,14 +167,27 @@ def test_all_five_states_are_pairwise_distinct():
 # ---- probe_candidate is the only I/O-performing DirectoryIndex method -------
 
 
-def test_probe_candidate_raises_for_an_unknown_adapter_id(tmp_path):
-    from xrd_tools.sources.discover import Candidate
+def test_probe_candidate_raises_for_an_unregistered_adapter_id(tmp_path):
+    """A FRESH candidate whose owning adapter was unregistered between poll and
+    probe raises LookupError.  (A stale candidate absent from the snapshot is a
+    different rejection — ValueError — checked in test_directory_index_retry.py;
+    the freshness check runs first, so this test keeps the candidate fresh and
+    removes only its adapter.)"""
+    import pytest
 
+    from xrd_tools.sources import adapters as A
+
+    _nxs_ready(tmp_path / "a.nxs")
     index = DirectoryIndex(tmp_path, clock=_FakeClock())
-    ghost = Candidate(tmp_path / "ghost.nxs", "no_such_adapter", 0, 0)
+    index.poll()
+    candidate = _candidate_for(tmp_path, "a.nxs")
+    assert candidate.adapter_id == "nexus_hdf5"
+
+    saved = dict(A._ADAPTERS)
     try:
-        index.probe_candidate(ghost)
-    except LookupError:
-        pass
-    else:
-        raise AssertionError("expected LookupError for an unregistered adapter id")
+        del A._ADAPTERS["nexus_hdf5"]   # adapter gone, candidate still fresh
+        with pytest.raises(LookupError):
+            index.probe_candidate(candidate)
+    finally:
+        A._ADAPTERS.clear()
+        A._ADAPTERS.update(saved)

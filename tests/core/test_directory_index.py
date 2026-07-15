@@ -221,3 +221,132 @@ def test_snapshot_and_delta_are_the_documented_types(tmp_path):
     index = DirectoryIndex(tmp_path)
     assert isinstance(index.snapshot, Snapshot)
     assert isinstance(index.last_delta, IndexDelta)
+
+
+# ===========================================================================
+# R1-R3 — an adapter-OWNER change (same bytes) emits a changed delta
+# ===========================================================================
+
+import contextlib
+
+from xrd_tools.core.scan import SourceKind
+from xrd_tools.sources.adapters import (
+    SourceFormatAdapter, _ADAPTERS, register_adapter)
+from xrd_tools.sources.probe import ProbeResult, ProbeState
+
+
+@contextlib.contextmanager
+def _isolated_adapters():
+    saved = dict(_ADAPTERS)
+    try:
+        yield
+    finally:
+        _ADAPTERS.clear()
+        _ADAPTERS.update(saved)
+
+
+def _widget_adapter(idn: str) -> SourceFormatAdapter:
+    return SourceFormatAdapter(
+        id=idn, kinds=(SourceKind.TILED,),
+        is_candidate=lambda p: p.suffix == ".widget",
+        scan_name=lambda p: p.stem,
+        probe=lambda p: ProbeResult(ProbeState.READY, reason=idn, kind=SourceKind.TILED),
+        open=lambda spec: None)
+
+
+class _FakeClock:
+    def __init__(self, t=0.0):
+        self._t = t
+
+    def __call__(self):
+        return self._t
+
+    def advance(self, dt):
+        self._t += dt
+
+
+def test_r1r3_owner_change_on_unchanged_bytes_emits_one_changed_delta(tmp_path):
+    """Gate 6: registering a higher-precedence adapter flips a candidate's
+    owner without changing its bytes; poll() must emit exactly one `changed`
+    (not an empty delta), bump the generation by one, and clear that path's
+    provisional/terminal state."""
+    with _isolated_adapters():
+        register_adapter(_widget_adapter("owner_a"))
+        (tmp_path / "x.widget").write_bytes(b"x")
+        clock = _FakeClock()
+        index = DirectoryIndex(tmp_path, clock=clock, retry_deadline=10.0)
+        first = index.poll()
+        assert first.candidates[0].adapter_id == "owner_a"
+        g1 = first.generation
+
+        # open a provisional window on the path so we can prove it is cleared
+        p = tmp_path / "x.widget"
+        index.record_probe(p, ProbeResult(ProbeState.IN_PROGRESS, reason="w"))
+        assert index.retry_state(p) is not None
+
+        # flip ownership with NO byte change (last-registered external wins)
+        register_adapter(_widget_adapter("owner_b"))
+        second = index.poll()
+
+        assert second.candidates[0].adapter_id == "owner_b"
+        assert second.generation == g1 + 1                     # exactly one bump
+        assert [c.adapter_id for c in index.last_delta.changed] == ["owner_b"]
+        assert index.last_delta.added == ()
+        assert index.last_delta.removed == ()
+        assert index.last_delta.unchanged is False
+        assert index.retry_state(p) is None                    # path state cleared
+
+
+# ===========================================================================
+# R1-R5 — an unchanged poll performs NO additional natural sort
+# ===========================================================================
+
+def test_r1r5_unchanged_poll_adds_no_natural_sort(tmp_path, monkeypatch):
+    """Gate 8: the second (unchanged) poll must not call os_sorted at all —
+    the held defect reported two sort calls across two polls."""
+    import xrd_tools.sources.discover as disc
+
+    _touch(tmp_path / "a.nxs")
+    _touch(tmp_path / "b.nxs")
+
+    calls = {"n": 0}
+    real = disc.os_sorted
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(disc, "os_sorted", counting)
+
+    index = DirectoryIndex(tmp_path)
+    index.poll()                       # first poll: a change from empty -> sorts
+    after_first = calls["n"]
+    assert after_first >= 1
+
+    index.poll()                       # unchanged poll: MUST add zero sorts
+    assert index.last_delta.unchanged is True
+    assert calls["n"] == after_first   # no additional sort
+
+    # a real change re-enables exactly one sort
+    _touch(tmp_path / "c.nxs")
+    index.poll()
+    assert calls["n"] == after_first + 1
+
+
+def test_r1r5_unchanged_poll_still_opens_zero_hdf5_files(tmp_path, monkeypatch):
+    """The R1-R5 refactor must not reintroduce content opens: initial and
+    unchanged polls both open zero HDF5 files."""
+    import h5py
+
+    _touch(tmp_path / "a.nxs")
+    _touch(tmp_path / "b.h5")
+
+    opened = []
+    real = h5py.File
+    monkeypatch.setattr(
+        h5py, "File", lambda *a, **k: (opened.append(a), real(*a, **k))[1])
+
+    index = DirectoryIndex(tmp_path)
+    index.poll()
+    index.poll()
+    assert opened == []

@@ -34,9 +34,17 @@ _NEXUS_EXTS = {".nxs", ".h5", ".hdf5", ".cxi"}
 
 
 def _walk_files(directory: Path, recursive: bool) -> list[Path]:
+    return list(os_sorted(_iter_files_unordered(directory, recursive)))
+
+
+def _iter_files_unordered(directory: Path, recursive: bool) -> list[Path]:
+    """Regular files under *directory* in raw filesystem-enumeration order —
+    no natural sort.  The sort is the expensive part of a poll; splitting it
+    out lets :class:`~xrd_tools.sources.directory_index.DirectoryIndex` detect
+    an unchanged directory (order-independent map comparison) and skip the
+    sort entirely (R1-R5)."""
     it = directory.rglob("*") if recursive else directory.iterdir()
-    files = [p for p in it if p.is_file()]
-    return list(os_sorted(files))
+    return [p for p in it if p.is_file()]
 
 
 def discover_scans(directory, kind, *, recursive: bool = False,
@@ -140,52 +148,79 @@ def _ensure_builtin_adapters_registered() -> None:
     import xrd_tools.sources.registry  # noqa: F401
 
 
-def enumerate_candidates(directory, *, recursive: bool = False,
-                         name_filter: str | None = None) -> list[Candidate]:
-    """Name-only candidate enumeration across every registered format adapter
-    at once (R1).
+def collect_candidates(directory, *, recursive: bool = False,
+                       name_filter: str | None = None) -> list[Candidate]:
+    """Name-only candidate collection in raw filesystem order (UNORDERED).
 
-    Pure filesystem inspection — directory listing, each adapter's filename
-    rule, and one ``stat()`` per matched file.  NEVER opens a file's content
-    (no ``h5py.File``, detector-dataset resolution, metadata harvest, or
-    processed-file classification); that is each adapter's explicit
+    The cheap half of enumeration: directory listing, each candidate's owning
+    adapter (by the shared precedence in
+    :func:`~xrd_tools.sources.adapters.candidate_owner`), and one ``stat()``
+    per matched file.  NEVER opens a file's content (no ``h5py.File``,
+    detector-dataset resolution, metadata harvest, or processed-file
+    classification); that is each adapter's explicit
     :meth:`~xrd_tools.sources.adapters.SourceFormatAdapter.probe`, called only
     when a caller asks to probe one specific candidate.
 
-    A file matched by more than one adapter's ``is_candidate`` keeps the
-    FIRST match in registration order (the built-in adapters partition
-    filenames by extension so this never happens for them; an out-of-tree
-    adapter that wants priority over a built-in should register after it —
-    :func:`~xrd_tools.sources.adapters.adapter_for_kind`'s "last registered
-    wins" is a *kind* lookup and does not apply to candidate ownership).
-
-    Deterministic natural order, independent of filesystem enumeration order
-    (:func:`natsort.os_sorted`, matching :func:`discover_scans`)."""
+    Ownership follows ONE precedence rule shared with ``adapter_for_kind``
+    (R1-R2): an externally registered adapter outranks a built-in regardless
+    of import order, and within a tier the most recently registered adapter
+    wins.  The discovered candidate records its owning adapter's id and is
+    always probed through THAT adapter (never re-resolved by kind), so
+    discovery and probe never disagree; see
+    :func:`~xrd_tools.sources.adapters.candidate_owner` for how candidate
+    ownership relates to (and can legitimately differ from) kind ownership.
+    :func:`~xrd_tools.sources.directory_index.DirectoryIndex` calls this
+    directly and sorts only when the candidate map actually changed;
+    :func:`enumerate_candidates` sorts unconditionally for its public
+    naturally-ordered contract."""
     directory = Path(directory)
     if not directory.is_dir():
         return []
-    files = _walk_files(directory, recursive)
 
     name_ok = compile_filter(name_filter)
 
     _ensure_builtin_adapters_registered()
-    from xrd_tools.sources.adapters import all_adapters
-    adapters = all_adapters()
+    from xrd_tools.sources.adapters import candidate_owner
 
     out: list[Candidate] = []
-    for f in files:
+    for f in _iter_files_unordered(directory, recursive):
         if not name_ok(f.name):
             continue
-        for adapter in adapters:
-            if not adapter.is_candidate(f):
-                continue
-            try:
-                stat = f.stat()
-            except OSError:
-                break  # vanished mid-walk; not a candidate this poll
-            out.append(Candidate(f, adapter.id, stat.st_size, stat.st_mtime_ns))
-            break
+        owner = candidate_owner(f)
+        if owner is None:
+            continue
+        try:
+            stat = f.stat()
+        except OSError:
+            continue  # vanished mid-walk; not a candidate this poll
+        out.append(Candidate(f, owner.id, stat.st_size, stat.st_mtime_ns))
     return out
 
 
-__all__ = ["Candidate", "discover_scans", "enumerate_candidates"]
+def sort_candidates(candidates: list[Candidate]) -> list[Candidate]:
+    """Naturally order *candidates* by path (``natsort.os_sorted``), matching
+    :func:`discover_scans`'s file ordering — the byte-identical order the
+    pre-split :func:`enumerate_candidates` produced by sorting files first."""
+    return list(os_sorted(candidates, key=lambda c: c.path))
+
+
+def enumerate_candidates(directory, *, recursive: bool = False,
+                         name_filter: str | None = None) -> list[Candidate]:
+    """Name-only candidate enumeration across every registered format adapter
+    at once, in deterministic natural order (R1).
+
+    Equivalent to :func:`sort_candidates` of :func:`collect_candidates`; see
+    those for the ownership-precedence and no-content-open guarantees.  The
+    natural order is independent of filesystem enumeration order
+    (:func:`natsort.os_sorted`, matching :func:`discover_scans`)."""
+    return sort_candidates(
+        collect_candidates(directory, recursive=recursive, name_filter=name_filter))
+
+
+__all__ = [
+    "Candidate",
+    "collect_candidates",
+    "discover_scans",
+    "enumerate_candidates",
+    "sort_candidates",
+]
