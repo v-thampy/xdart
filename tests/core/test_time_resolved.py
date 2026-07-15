@@ -272,12 +272,14 @@ def test_peak_series_lattice_temperature_and_rate(tmp_path):
     assert np.isnan(table.temperature([3.90])).all()
     np.testing.assert_allclose(table.temperature_derivative_per_A([3.92, 3.93]), [30000, 15000])
 
+    original = ds.copy(deep=True)
     waterfall = plot_time_resolved_waterfall(ds)
     fit_figure = plot_peak_fit_frame(thermal, 0)
     thermal_figure = plot_thermal_history(thermal)
     assert len(waterfall.data) == 1
     assert len(fit_figure.data) >= 3
     assert len(thermal_figure.data) >= 4
+    assert ds.identical(original)
 
     with pytest.raises(ValueError, match="no patterns"):
         fit_peak_series(ds, plan, pattern_indices=[])
