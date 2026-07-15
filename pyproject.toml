@@ -149,7 +149,7 @@ pyside6 = "*"
 xrayutilities = "*"
 
 [tool.pixi.pypi-dependencies]
-xdart = { path = ".", editable = true, extras = ["gui", "dev"] }
+xdart = { path = ".", editable = true, extras = ["gui", "dev", "notebook"] }
 
 [tool.pixi.tasks]
 xdart = "xdart"
