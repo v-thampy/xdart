@@ -125,6 +125,31 @@ def test_synthetic_format_is_named_probed_and_opened_through_the_seam(tmp_path):
         assert np.array_equal(source.load_frame(0), np.zeros((2, 2)))
 
 
+def test_synthetic_format_is_discovered_through_the_real_enumeration_and_index_path(tmp_path):
+    """Same synthetic format, but driven through enumerate_candidates() and
+    DirectoryIndex.poll() end-to-end -- not just the is_candidate predicate
+    in isolation -- proving a new format needs zero changes to either."""
+    from xrd_tools.sources.directory_index import DirectoryIndex
+    from xrd_tools.sources.discover import enumerate_candidates
+
+    with _isolated_adapter_registry():
+        register_adapter(_synthetic_adapter())
+        (tmp_path / "run_0007.widget").write_text("not real data")
+        (tmp_path / "unrelated.txt").write_text("ignore me")
+
+        candidates = enumerate_candidates(tmp_path)
+        assert [c.path.name for c in candidates] == ["run_0007.widget"]
+        assert candidates[0].adapter_id == "synthetic_widget"
+
+        index = DirectoryIndex(tmp_path)
+        snapshot = index.poll()
+        assert [c.path.name for c in snapshot.candidates] == ["run_0007.widget"]
+
+        result = index.probe_candidate(snapshot.candidates[0])
+        assert result.state is ProbeState.READY
+        assert result.kind is SourceKind.TILED
+
+
 def test_synthetic_adapter_overrides_legacy_register_source_kind_symmetrically():
     """The adapter seam and the legacy register_source() seam both work for
     the SAME kind; register_source (checked first in open_source) still wins
