@@ -365,3 +365,96 @@ def test_r1r2_candidate_owner_and_kind_owner_answer_different_questions(tmp_path
         # READY); the point is the reason/verdict comes from image_file, the
         # recorded owner, not from xyz_plugin.
         assert index.probe_candidate(c).reason != "xyz_plugin"
+
+
+# ===========================================================================
+# R1-R8 — path-based open_source prefers the adapter that CLAIMS the path
+# ===========================================================================
+
+def _marker_adapter(idn: str, kinds, suffix: str) -> SourceFormatAdapter:
+    """Adapter whose open() returns a ('OPENED_BY', id) marker so the test can
+    see which adapter actually opened a spec."""
+    return SourceFormatAdapter(
+        id=idn, kinds=kinds,
+        is_candidate=lambda p: p.suffix.lower() == suffix,
+        scan_name=lambda p: p.stem,
+        probe=lambda p: ProbeResult(ProbeState.READY, reason=idn, kind=kinds[0]),
+        open=lambda spec: ("OPENED_BY", idn))
+
+
+def test_r1r8_narrow_external_predicate_cannot_hijack_open_of_an_unclaimed_path(tmp_path):
+    """Gate 4: an external adapter owning IMAGE_FILE for *.xyz must NOT hijack
+    explicit opening of a .tif that the built-in image_file adapter claims —
+    the held defect resolved open_owner=xyz_plugin for candidate_owner=image_file."""
+    with _isolated_adapter_registry():
+        # external plugin owns IMAGE_FILE kind, claims only .xyz
+        register_adapter(_marker_adapter("xyz_plugin", (SourceKind.IMAGE_FILE,), ".xyz"))
+
+        tif = tmp_path / "a.tif"
+        tif.write_bytes(b"x")
+        assert candidate_owner(tif).id == "image_file"          # built-in claims .tif
+        # explicit open of the .tif must go through image_file, NOT xyz_plugin
+        opened = open_source(SourceSpec(tif, SourceKind.IMAGE_FILE))
+        from xrd_tools.sources.image import ImageFileSource
+        assert isinstance(opened, ImageFileSource)
+
+        # while the .xyz the plugin DOES claim opens through the plugin
+        xyz = tmp_path / "b.xyz"
+        xyz.write_bytes(b"x")
+        assert candidate_owner(xyz).id == "xyz_plugin"
+        assert open_source(SourceSpec(xyz, SourceKind.IMAGE_FILE)) == ("OPENED_BY", "xyz_plugin")
+
+
+def test_r1r8_fully_overlapping_adapters_open_through_the_precedence_winner(tmp_path):
+    """Gate 5: when two adapters share BOTH the kind and the predicate,
+    discovery, probe, and open all use the last-registered winner."""
+    with _isolated_adapter_registry():
+        register_adapter(_marker_adapter("first_w", (SourceKind.TILED,), ".widget"))
+        register_adapter(_marker_adapter("second_w", (SourceKind.TILED,), ".widget"))
+
+        w = tmp_path / "x.widget"
+        w.write_bytes(b"x")
+        assert candidate_owner(w).id == "second_w"
+        assert adapter_for_kind(SourceKind.TILED).id == "second_w"
+        assert open_source(SourceSpec(w, SourceKind.TILED)) == ("OPENED_BY", "second_w")
+
+
+def test_r1r8_legacy_register_source_still_wins_as_first_global_override(tmp_path):
+    """The path-claim preference sits AFTER the legacy register_source(kind,
+    factory) override, which remains the first global kind override."""
+    from xrd_tools.sources.registry import _REGISTRY, register_source
+
+    with _isolated_adapter_registry():
+        register_adapter(_marker_adapter("claimer", (SourceKind.IMAGE_FILE,), ".tif"))
+        saved = dict(_REGISTRY)
+        try:
+            register_source(SourceKind.IMAGE_FILE, lambda spec: ("LEGACY", "wins"))
+            tif = tmp_path / "a.tif"
+            tif.write_bytes(b"x")
+            assert open_source(SourceSpec(tif, SourceKind.IMAGE_FILE)) == ("LEGACY", "wins")
+        finally:
+            _REGISTRY.clear()
+            _REGISTRY.update(saved)
+
+
+def test_r1r8_incompatible_claimer_falls_through_to_kind_owner(tmp_path):
+    """When the path-claiming adapter is NOT compatible with the explicitly
+    requested kind, opening falls through to the kind owner (the caller's
+    explicit kind wins) — e.g. force-open a .tif as NEXUS_STACK."""
+    tif = tmp_path / "a.tif"
+    tif.write_bytes(b"x")
+    # image_file claims .tif but does not declare NEXUS_STACK; nexus_hdf5 owns
+    # NEXUS_STACK and opens it (and then fails to read the bogus file, which is
+    # the expected downstream error, not a routing error).
+    import pytest
+    with pytest.raises(Exception):
+        open_source(SourceSpec(tif, SourceKind.NEXUS_STACK))
+
+
+def test_r1r8_virtual_and_output_only_sources_use_the_kind_owner():
+    """A virtual (non-path) uri and output-only .nexus have no path-claiming
+    adapter, so they open through the kind owner as before."""
+    from xrd_tools.sources.memory import LiveFrameSource
+    # LIVE virtual uri -> no candidate claims it -> kind owner (live adapter)
+    live = open_source(SourceSpec("live-run-1", SourceKind.LIVE))
+    assert isinstance(live, LiveFrameSource)

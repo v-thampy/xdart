@@ -450,3 +450,94 @@ def test_r1r6_probe_candidate_rejects_a_reconfigured_away_candidate(tmp_path):
     with pytest.raises(ValueError):
         index.probe_candidate(candidate)
     assert index.retry_state(candidate.path) is None
+
+
+# ===========================================================================
+# R1-R7 — full candidate identity rejects an old-owner late completion
+# ===========================================================================
+import contextlib
+
+from xrd_tools.core.scan import SourceKind
+from xrd_tools.sources.adapters import (
+    SourceFormatAdapter, _ADAPTERS, register_adapter)
+
+
+@contextlib.contextmanager
+def _isolated_adapters():
+    saved = dict(_ADAPTERS)
+    try:
+        yield
+    finally:
+        _ADAPTERS.clear()
+        _ADAPTERS.update(saved)
+
+
+def _widget_adapter(idn):
+    return SourceFormatAdapter(
+        id=idn, kinds=(SourceKind.TILED,),
+        is_candidate=lambda p: p.suffix == ".widget",
+        scan_name=lambda p: p.stem,
+        probe=lambda p: ProbeResult(ProbeState.READY, reason=idn, kind=SourceKind.TILED),
+        open=lambda spec: None)
+
+
+def test_r1r7_late_completion_from_old_owner_is_rejected_after_owner_flip(tmp_path):
+    """An owner flip A->B on unchanged bytes shares the stamp.  A late result
+    from A, delivered with A's Candidate identity, must be rejected: no retry
+    or terminal state created, returned unchanged.  A subsequent probe through
+    B then returns B's real result — not A's stale sticky verdict."""
+    with _isolated_adapters():
+        register_adapter(_widget_adapter("owner_a"))
+        p = tmp_path / "x.widget"
+        p.write_bytes(b"x")
+        index = DirectoryIndex(tmp_path, clock=_FakeClock())
+        index.poll()
+        cand_a = index.snapshot.candidates[0]
+        assert cand_a.adapter_id == "owner_a"
+
+        register_adapter(_widget_adapter("owner_b"))   # flip precedence, same bytes
+        index.poll()
+        assert index.snapshot.candidates[0].adapter_id == "owner_b"
+
+        # A's late result, carrying A's identity (path+stamp+adapter_id):
+        a_result = ProbeResult(ProbeState.READY, reason="owner_a late", kind=SourceKind.TILED)
+        effective = index.record_probe(cand_a, a_result)
+
+        assert effective is a_result                 # ignored, returned unchanged
+        assert index.retry_state(p) is None          # no window
+        assert index._terminal.get(p) is None        # no sticky terminal
+
+        # B's real result is what the current candidate resolves to
+        cand_b = index.snapshot.candidates[0]
+        b_result = ProbeResult(ProbeState.READY, reason="owner_b", kind=SourceKind.TILED)
+        assert index.record_probe(cand_b, b_result).reason == "owner_b"
+
+
+def test_r1r7_record_probe_rejects_explicit_mismatched_adapter_id(tmp_path):
+    """The bare-path form gains an expected_adapter_id guard: a completion
+    tagged for an owner that is not the current owner creates no state."""
+    with _isolated_adapters():
+        register_adapter(_widget_adapter("owner_b"))
+        p = tmp_path / "x.widget"
+        p.write_bytes(b"x")
+        index = DirectoryIndex(tmp_path, clock=_FakeClock())
+        index.poll()
+        assert index.snapshot.candidates[0].adapter_id == "owner_b"
+
+        eff = index.record_probe(
+            p, ProbeResult(ProbeState.IN_PROGRESS, reason="from A"),
+            expected_adapter_id="owner_a")   # A is not the current owner
+        assert eff.reason == "from A"        # ignored
+        assert index.retry_state(p) is None
+
+
+def test_r1r7_probe_candidate_still_works_for_a_current_candidate(tmp_path):
+    """No false rejection: probe_candidate on a fresh, current candidate
+    records normally (the full-identity check must not over-reject)."""
+    with _isolated_adapters():
+        register_adapter(_widget_adapter("owner_a"))
+        (tmp_path / "x.widget").write_bytes(b"x")
+        index = DirectoryIndex(tmp_path, clock=_FakeClock())
+        index.poll()
+        c = index.snapshot.candidates[0]
+        assert index.probe_candidate(c).reason == "owner_a"

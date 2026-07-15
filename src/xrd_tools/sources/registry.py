@@ -39,7 +39,7 @@ from typing import Any
 
 from xrd_tools.core.scan import FrameSource, SourceKind, SourceSpec, coerce_source_kind
 from xrd_tools.io.image_source import ImageSourceKind, classify_image_source
-from xrd_tools.sources.adapters import adapter_for_kind
+from xrd_tools.sources.adapters import adapter_for_kind, candidate_owner
 from xrd_tools.sources.image import ImageFileSource, TiffSeriesSource
 from xrd_tools.sources.memory import LiveFrameSource, MemoryFrameSource
 from xrd_tools.sources.nexus import NexusStackSource, ProcessedNexusSource
@@ -81,8 +81,29 @@ def guess_source_kind(uri: str | Path) -> SourceKind:
     return SourceKind.IMAGE_FILE if info.kind is ImageSourceKind.RAW_MASTER else SourceKind.UNKNOWN
 
 
+def _path_candidate_owner(uri: str | Path) -> "Any | None":
+    """The adapter that claims *uri* as a name-only candidate, or ``None``.
+
+    Name-only (suffix/stem inspection via each adapter's ``is_candidate``) — no
+    file is opened and existence is not required.  Returns ``None`` for a
+    virtual/non-path uri (no adapter's predicate matches) and for a directory
+    or output-only ``.nexus`` (also unclaimed), so :func:`open_source` cleanly
+    falls through to the kind lookup for those."""
+    try:
+        return candidate_owner(Path(uri))
+    except Exception:
+        return None
+
+
 def open_source(uri_or_spec: str | Path | SourceSpec | FrameSource, **opts: Any) -> FrameSource:
-    """Open a source from a URI/spec or return an existing FrameSource."""
+    """Open a source from a URI/spec or return an existing FrameSource.
+
+    Dispatch order: (1) a legacy :func:`register_source` factory for the kind
+    (first global override); (2) R1-R8 — the adapter that CLAIMS the path, when
+    compatible with the requested kind, so a discovered candidate opens through
+    the same adapter that discovered and probed it; (3) the kind-owning adapter
+    (:func:`~xrd_tools.sources.adapters.adapter_for_kind`) for virtual/non-path
+    sources and output-only ``.nexus``; (4) the built-in if-chain fallback."""
 
     if hasattr(uri_or_spec, "frame_indices") and hasattr(uri_or_spec, "load_frame"):
         return uri_or_spec  # type: ignore[return-value]
@@ -95,22 +116,36 @@ def open_source(uri_or_spec: str | Path | SourceSpec | FrameSource, **opts: Any)
             kind = guess_source_kind(uri_or_spec)
         spec = SourceSpec(uri_or_spec, kind, options=opts)
 
+    # 1) Legacy register_source(kind, factory): the FIRST global kind override,
+    #    preserved exactly (a site can still swap an implementation by kind).
     factory = _REGISTRY.get(coerce_source_kind(spec.kind))
     if factory is not None:
         return factory(spec)
 
-    # R1 adapter seam: consulted after the legacy register_source() override
-    # (above, preserved exactly) and before the built-in if-chain below, so a
-    # registered adapter opens its kind the same way a built-in one does —
-    # built-ins are themselves registered through this seam (see
-    # _register_builtin_adapters), so for every kind covered today this branch
-    # reproduces the if-chain's own construction and the chain below becomes a
-    # dead-but-harmless fallback for any kind nothing has adapted yet.
+    # 2) R1-R8 path-based ownership: prefer the adapter that CLAIMS this path
+    #    (its is_candidate) when that adapter is compatible with the requested
+    #    kind, so discovery/probe/open all use the one adapter that owns the
+    #    file.  This stops an out-of-tree adapter that declares an existing kind
+    #    for an UNRELATED predicate (e.g. IMAGE_FILE for *.xyz) from hijacking
+    #    the open of a .tif that the built-in image_file adapter claimed.
+    #    Skipped for virtual/non-path uris (no adapter claims them -> owner None)
+    #    and for output-only .nexus (excluded from candidates -> owner None),
+    #    both of which fall through to the kind lookup below.
+    kind = coerce_source_kind(spec.kind)
+    claim_owner = _path_candidate_owner(spec.uri)
+    if claim_owner is not None and kind in claim_owner.kinds:
+        return claim_owner.open(spec)
+
+    # 3) Kind lookup: the adapter that owns the requested kind (external > built-
+    #    in, last-registered wins).  Built-ins are themselves registered through
+    #    this seam, so for every in-tree kind this reproduces the if-chain's own
+    #    construction; the chain below is a dead-but-harmless fallback for any
+    #    kind nothing has adapted yet, and for virtual sources whose owner
+    #    declares the kind without claiming a path.
     adapter = adapter_for_kind(spec.kind)
     if adapter is not None:
         return adapter.open(spec)
 
-    kind = coerce_source_kind(spec.kind)
     if kind is SourceKind.TIFF_SERIES:
         path = Path(spec.uri)
         if path.is_dir():

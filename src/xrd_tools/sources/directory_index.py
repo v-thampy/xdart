@@ -242,9 +242,15 @@ class DirectoryIndex:
             self._last_delta = _EMPTY_DELTA
             return prior
 
-        added = tuple(c for c in fresh_list if c.path not in prior_by_path)
+        fresh = tuple(sort_candidates(fresh_list))  # sort ONCE, only on real change
+
+        # R1-R9: derive the delta queues from the SORTED snapshot, not the raw
+        # filesystem-order list, so a consumer of last_delta.added/changed never
+        # regains unsorted directory order.  ``removed`` follows prior snapshot
+        # order (prior.candidates is already sorted; prior_by_path preserves it).
+        added = tuple(c for c in fresh if c.path not in prior_by_path)
         changed = tuple(
-            c for c in fresh_list
+            c for c in fresh
             if c.path in prior_by_path and prior_by_path[c.path] != c
         )
         removed = tuple(p for p in prior_by_path if p not in fresh_by_path)
@@ -260,28 +266,40 @@ class DirectoryIndex:
             self._retries.pop(p, None)
             self._terminal.pop(p, None)
 
-        fresh = tuple(sort_candidates(fresh_list))  # sort ONLY on real change
         self._snapshot = Snapshot(
             prior.generation + 1, fresh, self._root, self._recursive, self._name_filter)
         self._last_delta = IndexDelta(added=added, changed=changed, removed=removed)
         return self._snapshot
 
-    def record_probe(self, path: str | Path, result: ProbeResult, *,
+    def record_probe(self, target: "str | Path | Candidate", result: ProbeResult, *,
                       expected_stamp: _Stamp | None = None,
+                      expected_adapter_id: str | None = None,
                       retry_deadline: float | None = None) -> ProbeResult:
-        """Record an explicit probe result for the candidate at *path* and
-        return the EFFECTIVE result a caller should treat it as.
+        """Record an explicit probe result for a candidate and return the
+        EFFECTIVE result a caller should treat it as.
+
+        *target* is the candidate the *result* was computed for.  Pass the
+        immutable :class:`~xrd_tools.sources.discover.Candidate` (preferred):
+        its full identity — path, ``adapter_id``, and stamp — is validated
+        against the current snapshot, so a late result cannot be misattributed.
+        A bare ``str``/``Path`` is the narrow same-owner compatibility form
+        (only ``expected_stamp``/``expected_adapter_id`` kwargs, both optional,
+        constrain it); use it only when no adapter-owner change can race the
+        probe, or pass ``expected_adapter_id`` to be safe.
 
         DirectoryIndex never calls a probe itself — this is how a caller
         (having just called the candidate's adapter ``probe`` callable) tells
-        the index what it found, so the index can apply the bounded-
-        readiness policy on top:
+        the index what it found, so the index can apply the bounded-readiness
+        policy on top:
 
-        * a result for a *path* that is NOT a current candidate — absent from
-          the snapshot, or (when ``expected_stamp`` is given) computed against
-          a stamp that no longer matches the current candidate — is a stale or
-          unknown late completion.  It is IGNORED: returned unchanged, with NO
-          retry or terminal state created (R1-R6);
+        * a result whose full identity does NOT match a current candidate —
+          the path absent from the snapshot, or (when given) a ``stamp`` or
+          ``adapter_id`` that no longer matches the current candidate — is a
+          stale or unknown late completion.  It is IGNORED: returned unchanged,
+          with NO retry or terminal state created (R1-R6, R1-R7).  The
+          ``adapter_id`` check catches a late result from an OLD owner after a
+          registration flip left the path's bytes (and thus its stamp)
+          unchanged — a case the stamp check alone cannot see;
         * a stamp already resolved to a TERMINAL verdict returns that sticky
           verdict without reopening a window (R1-R1);
         * a terminal result (READY / PROCESSED_OUTPUT / INVALID) resolves the
@@ -302,16 +320,25 @@ class DirectoryIndex:
           transient IN_PROGRESS on the deadline cannot condemn a genuine
           imageless shell.
         """
-        path = Path(path)
+        if isinstance(target, Candidate):
+            path = target.path
+            expected_stamp = target.version_stamp
+            expected_adapter_id = target.adapter_id
+        else:
+            path = Path(target)
         deadline = self._retry_deadline if retry_deadline is None else retry_deadline
         candidate = self._snapshot.by_path().get(path)
 
-        # R1-R6: unknown/stale completion — never create state for a path the
-        # index does not currently own, or for a stamp that has moved on.
+        # R1-R6/R1-R7: unknown/stale completion — never create state for a path
+        # the index does not currently own, for a stamp that has moved on, or
+        # for a result computed under a DIFFERENT owning adapter (an owner flip
+        # that left the bytes/stamp unchanged).
         if candidate is None:
             return result
         stamp = candidate.version_stamp
         if expected_stamp is not None and expected_stamp != stamp:
+            return result
+        if expected_adapter_id is not None and expected_adapter_id != candidate.adapter_id:
             return result
 
         # R1-R1: a stamp already resolved terminally stays terminal — no new
@@ -395,9 +422,10 @@ class DirectoryIndex:
         if adapter is None:
             raise LookupError(f"no adapter registered for id {candidate.adapter_id!r}")
         raw = adapter.probe(candidate.path)
-        return self.record_probe(
-            candidate.path, raw, expected_stamp=candidate.version_stamp,
-            retry_deadline=retry_deadline)
+        # Pass the full Candidate so record_probe re-validates path+stamp+
+        # adapter_id — a concurrent owner flip between this freshness check and
+        # the record is still caught (R1-R7).
+        return self.record_probe(candidate, raw, retry_deadline=retry_deadline)
 
     def poll_forever(self, *, interval: float,
                      should_stop: Callable[[], bool] = lambda: False,

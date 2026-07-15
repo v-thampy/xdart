@@ -350,3 +350,59 @@ def test_r1r5_unchanged_poll_still_opens_zero_hdf5_files(tmp_path, monkeypatch):
     index.poll()
     index.poll()
     assert opened == []
+
+
+# ===========================================================================
+# R1-R9 — IndexDelta queues follow natural snapshot order (not fs order)
+# ===========================================================================
+
+def test_r1r9_delta_queues_are_naturally_ordered_under_shuffled_walking(tmp_path, monkeypatch):
+    """A shuffled filesystem scan must still yield naturally-ordered snapshot
+    AND delta tuples — a consumer of last_delta.added/changed must never regain
+    unsorted directory order (the held defect exposed fs order in delta_added)."""
+    import xrd_tools.sources.discover as disc
+
+    for n in ("scan_1.nxs", "scan_2.nxs", "scan_10.nxs"):
+        _touch(tmp_path / n)
+
+    real = disc._iter_files_unordered
+    # force a reverse (non-natural) walk order to expose any unsorted delta
+    monkeypatch.setattr(
+        disc, "_iter_files_unordered",
+        lambda d, r: sorted(real(d, r), key=lambda p: p.name, reverse=True))
+
+    natural = ["scan_1.nxs", "scan_2.nxs", "scan_10.nxs"]
+    index = DirectoryIndex(tmp_path)
+    snap = index.poll()
+
+    assert [c.path.name for c in snap.candidates] == natural
+    assert [c.path.name for c in index.last_delta.added] == natural   # NOT fs order
+
+
+def test_r1r9_mixed_delta_added_and_changed_follow_snapshot_order(tmp_path, monkeypatch):
+    """Added and changed queues on a mixed changed poll are both in natural
+    snapshot order; removed follows prior (natural) snapshot order."""
+    import xrd_tools.sources.discover as disc
+    real = disc._iter_files_unordered
+    monkeypatch.setattr(
+        disc, "_iter_files_unordered",
+        lambda d, r: sorted(real(d, r), key=lambda p: p.name, reverse=True))
+
+    a = _touch(tmp_path / "scan_1.nxs", data=b"one")
+    _touch(tmp_path / "scan_2.nxs")
+    b = _touch(tmp_path / "scan_20.nxs")
+    index = DirectoryIndex(tmp_path)
+    index.poll()
+
+    # change scan_1 bytes, add scan_3 + scan_10, remove scan_20
+    a.write_bytes(b"a much longer body")
+    _touch(tmp_path / "scan_3.nxs")
+    _touch(tmp_path / "scan_10.nxs")
+    b.unlink()
+    index.poll()
+
+    assert [c.path.name for c in index.last_delta.added] == ["scan_3.nxs", "scan_10.nxs"]
+    assert [c.path.name for c in index.last_delta.changed] == ["scan_1.nxs"]
+    assert [p.name for p in index.last_delta.removed] == ["scan_20.nxs"]
+    assert [c.path.name for c in index.snapshot.candidates] == [
+        "scan_1.nxs", "scan_2.nxs", "scan_3.nxs", "scan_10.nxs"]
