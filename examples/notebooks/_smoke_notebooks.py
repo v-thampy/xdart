@@ -69,6 +69,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--only", choices=EXPECTED, action="append", help="Execute one named notebook; validation still covers the full public set.")
+    parser.add_argument("--real-data", action="store_true", help="Execute selected notebook(s) with XDART_TEST_DATA instead of synthetic smoke inputs.")
     args = parser.parse_args()
 
     regenerate_and_check()
@@ -80,10 +82,19 @@ def main() -> int:
         print(f"Validated {len(notebooks)} clean public notebooks")
         return 0
 
-    os.environ["XDART_NOTEBOOK_SMOKE"] = "1"
-    os.environ.pop("XDART_TEST_DATA", None)
+    if args.real_data:
+        if not os.environ.get("XDART_TEST_DATA"):
+            raise AssertionError("--real-data requires XDART_TEST_DATA to name the public test-data root")
+        os.environ["XDART_NOTEBOOK_SMOKE"] = "0"
+        os.environ["XDART_NOTEBOOK_AUTORUN"] = "1"
+    else:
+        os.environ["XDART_NOTEBOOK_SMOKE"] = "1"
+        os.environ.pop("XDART_TEST_DATA", None)
+    selected = args.only or EXPECTED
     with tempfile.TemporaryDirectory(prefix="xdart-notebook-smoke-") as tmp:
         for path, nb in notebooks:
+            if path.name not in selected:
+                continue
             started = time.perf_counter()
             # Execute an in-memory notebook so checked-in JSON remains clean.
             NotebookClient(
@@ -94,7 +105,7 @@ def main() -> int:
             ).execute()
             elapsed = time.perf_counter() - started
             print(f"{path.name}: {elapsed:.1f}s")
-    print(f"Executed {len(notebooks)} deterministic public notebooks")
+    print(f"Executed {len(selected)} {'real-data' if args.real_data else 'deterministic public'} notebook(s)")
     return 0
 
 

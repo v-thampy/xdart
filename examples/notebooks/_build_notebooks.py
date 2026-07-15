@@ -269,7 +269,7 @@ NB_PHASE_PEAK = [
                 clear_output(wait=True)
                 try:
                     positions = tuple(params["positions"] or (2.76,))
-                    plan = PeakFitPlan(positions=positions, model=params["model"], background=params["background"] if params["background"] in {"none", "constant", "linear"} else "linear", sigma_init=params["sigma_init"], sigma_bounds=params["sigma_bounds"], center_bounds_delta=params["center_bounds_delta"])
+                    plan = PeakFitPlan(positions=positions, model=params["model"], background=params["background"] if params["background"] in {"none", "constant", "linear"} else "linear", sigma_init=params["sigma_init"], sigma_bounds=params["sigma_bounds"], center_bounds_delta=params["center_bounds_delta"], fit_kwargs={"method": "leastsq"})
                     outcome = PeakFitAnalyzer(plan).analyze(AnalysisInput(label="pilot", x=q, y=intensity, x_unit="q_A^-1"))
                     assert outcome.ok, outcome.message
                     display(plot_peak_fit(q, intensity, outcome.result.payload, title="Pilot peak fit"))
@@ -729,11 +729,13 @@ NB_TIME_RESOLVED = [
                     assert series is not None, "Load processed data first"
                     dataset, fallback = series.dataset, False
                     if monitor_method.value == "monitor":
-                        candidate = normalize_monitor(dataset, monitor_key.value.strip())
-                        if bool(candidate["monitor_normalization_valid"].any()):
-                            dataset = candidate
-                            source_var = "intensity_normalized"
-                        else:
+                        try:
+                            candidate = normalize_monitor(dataset, monitor_key.value.strip())
+                            if bool(candidate["monitor_normalization_valid"].any()):
+                                dataset, source_var = candidate, "intensity_normalized"
+                            else:
+                                fallback, source_var = True, "intensity"
+                        except (KeyError, ValueError):
                             fallback, source_var = True, "intensity"
                     else:
                         source_var = "intensity"
@@ -768,7 +770,7 @@ NB_TIME_RESOLVED = [
 
         def _plan_from_controls(params):
             positions = tuple(params["positions"] or (2.76,))
-            return PeakFitPlan(positions=positions, model=params["model"], background=params["background"] if params["background"] in {"none", "constant", "linear"} else "linear", sigma_init=params["sigma_init"], sigma_bounds=params["sigma_bounds"], center_bounds_delta=params["center_bounds_delta"])
+            return PeakFitPlan(positions=positions, model=params["model"], background=params["background"] if params["background"] in {"none", "constant", "linear"} else "linear", sigma_init=params["sigma_init"], sigma_bounds=params["sigma_bounds"], center_bounds_delta=params["center_bounds_delta"], fit_kwargs={"method": "leastsq"})
 
         def run_pilot(params=None):
             with output:
