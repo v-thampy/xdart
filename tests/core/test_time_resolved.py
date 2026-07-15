@@ -18,6 +18,7 @@ from xrd_tools.analysis.time_resolved import (
     flag_fit_quality,
     flag_normalization_outliers,
     load_time_resolved_series,
+    normalize_monitor,
     normalize_reference_band,
     select_time_zero,
 )
@@ -35,6 +36,7 @@ def _write_scan(
     intensity: np.ndarray,
     frame_start: int = 1,
     include_2d: bool = False,
+    scan_data: dict[str, np.ndarray] | None = None,
 ) -> Path:
     frames = np.arange(frame_start, frame_start + len(intensity), dtype=np.int64)
     with h5py.File(path, "w") as h5:
@@ -46,6 +48,15 @@ def _write_scan(
         g1.create_dataset("intensity", data=np.asarray(intensity, dtype=np.float32))
         g1.create_dataset(
             "sigma", data=np.sqrt(np.maximum(intensity, 0)).astype(np.float32))
+
+        if scan_data:
+            scan_group = entry.create_group("scan_data")
+            scan_group.create_dataset("frame_index", data=frames)
+            for name, values in scan_data.items():
+                values = np.asarray(values)
+                if values.shape != frames.shape:
+                    raise ValueError(f"scan_data {name!r} does not match frame count")
+                scan_group.create_dataset(name, data=values)
 
         if include_2d:
             chi = np.linspace(-20, 20, 5, dtype=np.float32)
@@ -94,14 +105,15 @@ def test_discover_and_load_time_resolved_series(scan_pair, tmp_path):
 
     cake = series.get_cake(0)
     assert cake.intensity.shape == (5, 6)
-    raw = series.get_raw(0)
-    assert raw.shape == (3, 4)
-    np.testing.assert_allclose(raw.ravel()[:2], [10.0, 11.0])
+    thumbnail = series.get_thumbnail(0)
+    assert thumbnail.shape == (3, 4)
+    with pytest.raises(KeyError, match="thumbnail fallback disabled"):
+        series.get_raw(0)
 
 
 def test_load_q_grid_policy_interpolates_or_fails(tmp_path):
     q1 = np.linspace(1.0, 5.0, 81)
-    q2 = np.linspace(1.0, 5.0, 61)
+    q2 = np.linspace(2.0, 4.0, 61)
     a = _write_scan(tmp_path / "a.nxs", q=q1, intensity=np.ones((1, len(q1))))
     b = _write_scan(tmp_path / "b.nxs", q=q2, intensity=np.ones((1, len(q2))) * 2)
 
@@ -110,7 +122,78 @@ def test_load_q_grid_policy_interpolates_or_fails(tmp_path):
 
     ds = load_time_resolved_series([a, b], q_policy="interpolate").dataset
     assert ds["intensity"].shape == (2, len(q1))
-    np.testing.assert_allclose(ds["intensity"].values[1], 2.0)
+    assert ds.coords["q_interpolated"].values.tolist() == [False, True]
+    assert np.isnan(ds["intensity"].values[1, 0])
+    assert np.isnan(ds["intensity"].values[1, -1])
+    np.testing.assert_allclose(ds["intensity"].values[1, 20:-20], 2.0)
+    assert ds.attrs["q_interpolation"]["outside_source_coverage"] == "nan"
+
+
+def test_discovery_ignores_raw_and_monitor_metadata_is_aligned(tmp_path):
+    q = np.linspace(1.0, 5.0, 9)
+    processed = _write_scan(
+        tmp_path / "scan_10.nxs",
+        q=q,
+        intensity=np.vstack([np.ones_like(q) * 2, np.ones_like(q) * 4]),
+        scan_data={"i0": np.array([2.0, 4.0])},
+    )
+    with h5py.File(tmp_path / "raw_2.nxs", "w") as h5:
+        h5.create_group("entry").create_dataset("detector", data=np.ones((2, 3)))
+
+    assert discover_processed_scans(tmp_path) == [processed]
+    series = load_time_resolved_series(tmp_path, metadata_keys=("i0",))
+    np.testing.assert_allclose(series.dataset.coords["i0"], [2.0, 4.0])
+    normalized = normalize_monitor(series.dataset, "i0", target=1.0)
+    np.testing.assert_allclose(normalized["intensity_normalized"], 1.0)
+    assert normalized["monitor_normalization_valid"].values.tolist() == [True, True]
+
+
+def test_mixed_timing_is_explicit_and_rate_requires_seconds(tmp_path):
+    q = np.linspace(1.0, 5.0, 9)
+    timed = _write_scan(
+        tmp_path / "timed.nxs",
+        q=q,
+        intensity=np.ones((2, len(q))),
+        scan_data={"elapsed_time": np.array([4.0, 4.2])},
+    )
+    untimed = _write_scan(
+        tmp_path / "untimed.nxs", q=q, intensity=np.ones((2, len(q))))
+    ds = load_time_resolved_series([timed, untimed]).dataset
+    assert ds.coords["time"].attrs["units"] == "frame"
+    np.testing.assert_allclose(ds.coords["time"], [0, 1, 0, 1])
+    np.testing.assert_allclose(ds.coords["time_seconds"].values[:2], [0.0, 0.2])
+    assert np.isnan(ds.coords["time_seconds"].values[2:]).all()
+    assert ds.attrs["time_has_mixed_sources"] is True
+
+    lattice = ds.isel(pattern=slice(0, 2)).rename({"pattern": "fit_pattern"})
+    lattice["lattice_mean_A"] = ("fit_pattern", np.array([3.9, 3.91]))
+    with pytest.raises(ValueError, match="physical seconds"):
+        add_temperature_results(
+            lattice,
+            LinearThermalExpansion(3.9, 300.0, 1e-5),
+            time_coord="time",
+        )
+
+
+def test_time_resolved_raw_accessor_is_strict_and_qualified(scan_pair, monkeypatch):
+    from xrd_tools.analysis import time_resolved
+
+    series = load_time_resolved_series(scan_pair, frame_period_s=0.002)
+    observed = {}
+
+    def _fake_raw(path, frame, **kwargs):
+        observed.update(path=Path(path), frame=frame, **kwargs)
+        return np.ones((20, 30))
+
+    monkeypatch.setattr(time_resolved, "get_raw_frame", _fake_raw)
+    raw = series.get_raw(3)
+    assert raw.shape == (20, 30)
+    assert observed == {
+        "path": scan_pair[1],
+        "frame": 1,
+        "allow_thumbnail": False,
+        "source_root": None,
+    }
 
 
 def test_normalize_flag_bin_and_time_zero(scan_pair):
@@ -177,12 +260,16 @@ def test_peak_series_lattice_temperature_and_rate(tmp_path):
         lattice, calibration, time_coord="time", smooth_window=None)
     assert thermal["temperature_K"].values[0] == pytest.approx(300.0)
     assert np.nanmax(thermal["temperature_rate_K_per_s"].values) > 0
+    assert "temperature_error_K" in thermal
+    assert thermal.attrs["temperature_uncertainty"] == "propagated from lattice uncertainty"
 
     table = TabulatedThermalExpansion(
         temperature_K=(300.0, 600.0, 900.0),
         lattice_A=(3.92, 3.93, 3.95),
     )
     np.testing.assert_allclose(table.temperature([3.92, 3.93]), [300, 600])
+    assert np.isnan(table.temperature([3.90])).all()
+    np.testing.assert_allclose(table.temperature_derivative_per_A([3.92, 3.93]), [30000, 15000])
 
     waterfall = plot_time_resolved_waterfall(ds)
     fit_figure = plot_peak_fit_frame(thermal, 0)

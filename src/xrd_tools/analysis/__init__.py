@@ -75,6 +75,8 @@ _EXPORTS = {
         "xrd_tools.analysis.time_resolved", "discover_processed_scans"),
     "load_time_resolved_series": (
         "xrd_tools.analysis.time_resolved", "load_time_resolved_series"),
+    "normalize_monitor": (
+        "xrd_tools.analysis.time_resolved", "normalize_monitor"),
     "normalize_reference_band": (
         "xrd_tools.analysis.time_resolved", "normalize_reference_band"),
     "flag_normalization_outliers": (

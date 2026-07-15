@@ -18,7 +18,14 @@ from typing import Any
 import numpy as np
 import xarray as xr
 
-from xrd_tools.io import get_1d, get_2d, get_raw_frame, get_thumbnail, open_scan
+from xrd_tools.io import (
+    get_1d,
+    get_2d,
+    get_metadata,
+    get_raw_frame,
+    get_thumbnail,
+    read_scan_data,
+)
 
 __all__ = [
     "FrameLocator",
@@ -27,6 +34,7 @@ __all__ = [
     "TabulatedThermalExpansion",
     "discover_processed_scans",
     "load_time_resolved_series",
+    "normalize_monitor",
     "normalize_reference_band",
     "flag_normalization_outliers",
     "bin_time_resolved",
@@ -53,12 +61,27 @@ def discover_processed_scans(
     pattern: str = "*.nxs",
     recursive: bool = False,
 ) -> list[Path]:
-    """Return naturally sorted processed NeXus files under ``directory``."""
+    """Return naturally sorted processed 1-D NeXus files under ``directory``.
+
+    Acquisition NeXus files and unrelated ``.nxs`` files can live beside
+    processed results.  Inspect only their lightweight metadata here; the 1-D
+    stacks remain untouched until :func:`load_time_resolved_series` is called.
+    """
     root = Path(directory).expanduser()
     if not root.is_dir():
         raise NotADirectoryError(root)
     paths = root.rglob(pattern) if recursive else root.glob(pattern)
-    return sorted((p for p in paths if p.is_file()), key=_natural_key)
+    processed: list[Path] = []
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            if get_metadata(path).get("has_1d", False):
+                processed.append(path)
+        except (OSError, KeyError, ValueError):
+            # A non-xdart or partially written NeXus file is not a candidate.
+            continue
+    return sorted(processed, key=_natural_key)
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,13 +122,18 @@ class TimeResolvedSeries:
         loc = self._locator(pattern)
         return get_2d(loc.scan_file, frame=loc.frame_label)
 
-    def get_raw(self, pattern: int, *, allow_thumbnail: bool = True) -> np.ndarray:
-        """Read one full raw frame, falling back to its thumbnail when allowed."""
+    def get_raw(self, pattern: int) -> np.ndarray:
+        """Read one full raw detector frame, never a thumbnail substitute.
+
+        :meth:`get_thumbnail` is intentionally the separate access path.  A
+        missing or relocated raw source raises ``KeyError`` rather than quietly
+        returning a small display image with different resolution and range.
+        """
         loc = self._locator(pattern)
         return get_raw_frame(
             loc.scan_file,
             loc.frame_label,
-            allow_thumbnail=allow_thumbnail,
+            allow_thumbnail=False,
             source_root=self.source_root,
         )
 
@@ -126,6 +154,13 @@ def _coerce_paths(paths: str | Path | Sequence[str | Path]) -> list[Path]:
     missing = [path for path in out if not path.is_file()]
     if missing:
         raise FileNotFoundError(missing[0])
+    for path in out:
+        try:
+            is_processed = bool(get_metadata(path).get("has_1d", False))
+        except (OSError, KeyError, ValueError) as exc:
+            raise ValueError(f"{path} is not a readable processed 1-D NeXus file") from exc
+        if not is_processed:
+            raise ValueError(f"{path} is not a processed 1-D NeXus file")
     return out
 
 
@@ -176,12 +211,22 @@ def _interpolate_rows(rows: np.ndarray, old_q: np.ndarray, new_q: np.ndarray) ->
     ])
 
 
+def _validate_q_grid(q: np.ndarray, *, path: Path) -> np.ndarray:
+    q = np.asarray(q, dtype=float)
+    if q.ndim != 1 or q.size < 2 or not np.all(np.isfinite(q)):
+        raise ValueError(f"{path}: q grid must be a finite one-dimensional array")
+    if np.any(np.diff(q) <= 0):
+        raise ValueError(f"{path}: q grid must be strictly increasing")
+    return q
+
+
 def load_time_resolved_series(
     paths: str | Path | Sequence[str | Path],
     *,
     frame_period_s: float | Mapping[str, float] | None = None,
     q_policy: str = "strict",
     reference_q: np.ndarray | None = None,
+    metadata_keys: Sequence[str] = (),
     source_root: str | Path | None = None,
 ) -> TimeResolvedSeries:
     """Load one or more processed scans into a common 1-D xarray Dataset.
@@ -199,6 +244,11 @@ def load_time_resolved_series(
         scan onto ``reference_q`` or the first scan's grid.
     reference_q
         Optional target q grid for interpolation.
+    metadata_keys
+        Persisted numeric per-frame ``scan_data`` columns to retain as
+        pattern-aligned coordinates (for example ``("i0",)`` for monitor
+        normalization). Missing values are represented as ``nan`` so a later
+        normalization can make its own validity decision.
     source_root
         Optional moved-data root used only by lazy raw-frame access.
     """
@@ -206,9 +256,18 @@ def load_time_resolved_series(
     if q_policy not in {"strict", "interpolate"}:
         raise ValueError("q_policy must be 'strict' or 'interpolate'")
 
-    target_q = None if reference_q is None else np.asarray(reference_q, dtype=float)
-    if target_q is not None and (target_q.ndim != 1 or target_q.size < 2):
-        raise ValueError("reference_q must be a one-dimensional grid")
+    target_q = None
+    if reference_q is not None:
+        target_q = _validate_q_grid(np.asarray(reference_q, dtype=float), path=Path("reference_q"))
+    metadata_keys = tuple(dict.fromkeys(str(key) for key in metadata_keys))
+    reserved_metadata = {
+        "pattern", "q", "scan_index", "scan_name", "scan_file",
+        "frame_label", "frame_in_scan", "time", "sequence_time",
+        "time_seconds", "time_source",
+    }
+    collisions = set(metadata_keys) & reserved_metadata
+    if collisions:
+        raise ValueError(f"metadata_keys collide with structural coordinates: {sorted(collisions)}")
 
     intensities: list[np.ndarray] = []
     sigmas: list[np.ndarray] = []
@@ -219,23 +278,30 @@ def load_time_resolved_series(
     scan_files: list[str] = []
     frame_labels: list[int] = []
     frame_in_scan: list[int] = []
-    times: list[float] = []
-    sequence_times: list[float] = []
+    physical_times: list[float] = []
     time_sources: list[str] = []
+    metadata_values: dict[str, list[float]] = {key: [] for key in metadata_keys}
+    scan_interpolated: list[bool] = []
     q_unit = None
-    sequence_offset = 0.0
     all_seconds = True
 
     for scan_index, path in enumerate(scan_paths):
         result = get_1d(path)
-        q = np.asarray(result.q, dtype=float)
-        rows = np.asarray(result.intensity)
+        q = _validate_q_grid(result.q, path=path)
+        current_q_unit = str(result.q_unit or "")
+        if q_unit is not None and current_q_unit and current_q_unit != q_unit:
+            raise ValueError(
+                f"{path}: q unit {current_q_unit!r} differs from reference unit {q_unit!r}"
+            )
+        rows = np.asarray(result.intensity, dtype=float)
         if rows.ndim == 1:
             rows = rows[None, :]
         frames = np.asarray(result.frames, dtype=int).reshape(-1)
         if len(rows) != len(frames):
             raise ValueError(f"{path}: intensity rows do not match frame labels")
 
+        if rows.ndim != 2 or rows.shape[1] != q.size:
+            raise ValueError(f"{path}: intensity must have shape (frame, q)")
         if target_q is None:
             target_q = q.copy()
         compatible = q.shape == target_q.shape and np.allclose(
@@ -252,14 +318,16 @@ def load_time_resolved_series(
             sigma_rows = np.full((len(rows), len(target_q)), np.nan, dtype=float)
         else:
             has_sigma = True
-            sigma_rows = np.asarray(sigma)
+            sigma_rows = np.asarray(sigma, dtype=float)
             if sigma_rows.ndim == 1:
                 sigma_rows = sigma_rows[None, :]
+            if sigma_rows.shape != (len(frames), len(q)):
+                raise ValueError(f"{path}: sigma rows do not match intensity rows and q grid")
             if not compatible:
                 sigma_rows = _interpolate_rows(sigma_rows, q, target_q)
 
-        handle = open_scan(path, source_root=source_root)
-        scan_time, time_source = _time_from_scan_data(handle.scan_data, len(frames))
+        scan_data = read_scan_data(path, frames)
+        scan_time, time_source = _time_from_scan_data(scan_data, len(frames))
         if scan_time is None:
             period = _period_for_path(frame_period_s, path)
             if period is None:
@@ -270,17 +338,18 @@ def load_time_resolved_series(
                 scan_time = np.arange(len(frames), dtype=float) * period
                 time_source = "frame_period_s"
 
-        if len(scan_time) > 1:
-            step = float(np.nanmedian(np.diff(scan_time)))
-            step = step if np.isfinite(step) and step > 0 else 1.0
-        else:
-            period = _period_for_path(frame_period_s, path)
-            step = period if period is not None else 1.0
-        seq = scan_time + sequence_offset
-        sequence_offset = float(seq[-1] + step) if len(seq) else sequence_offset
-
         intensities.append(rows)
         sigmas.append(sigma_rows)
+        scan_interpolated.extend([not compatible] * len(frames))
+        for key in metadata_keys:
+            value = scan_data.get(key)
+            if value is None:
+                metadata_values[key].extend([np.nan] * len(frames))
+                continue
+            value = np.asarray(value, dtype=float).reshape(-1)
+            if value.size != len(frames):
+                raise ValueError(f"{path}: metadata key {key!r} is not frame-aligned")
+            metadata_values[key].extend(value.tolist())
         for row, frame in enumerate(frames):
             locators.append(FrameLocator(path, int(frame)))
             scan_indices.append(scan_index)
@@ -288,15 +357,37 @@ def load_time_resolved_series(
             scan_files.append(str(path))
             frame_labels.append(int(frame))
             frame_in_scan.append(row)
-            times.append(float(scan_time[row]))
-            sequence_times.append(float(seq[row]))
+            physical_times.append(float(scan_time[row]) if time_source != "frame_index" else np.nan)
             time_sources.append(str(time_source))
-        q_unit = q_unit or result.q_unit
+        q_unit = q_unit or current_q_unit
 
     assert target_q is not None
     intensity_stack = np.concatenate(intensities, axis=0)
     sigma_stack = np.concatenate(sigmas, axis=0)
     n_patterns = len(intensity_stack)
+    if all_seconds:
+        time_values = np.asarray(physical_times, dtype=float)
+        sequence_values: list[float] = []
+        offset = 0.0
+        for scan_index in range(len(scan_paths)):
+            positions = np.flatnonzero(np.asarray(scan_indices) == scan_index)
+            values = time_values[positions]
+            if values.size > 1:
+                step = float(np.nanmedian(np.diff(values)))
+                step = step if np.isfinite(step) and step > 0 else 1.0
+            else:
+                period = _period_for_path(frame_period_s, scan_paths[scan_index])
+                step = period if period is not None else 1.0
+            sequence_values.extend((values + offset).tolist())
+            offset = float(values[-1] + offset + step) if values.size else offset
+        time_unit = "s"
+    else:
+        # Retain physical values separately while exposing only unambiguous
+        # frame-based coordinates when even one scan lacks physical timing.
+        time_values = np.asarray(frame_in_scan, dtype=float)
+        sequence_values = np.arange(n_patterns, dtype=float).tolist()
+        time_unit = "frame"
+
     coords: dict[str, Any] = {
         "pattern": np.arange(n_patterns, dtype=np.int64),
         "q": target_q,
@@ -305,31 +396,112 @@ def load_time_resolved_series(
         "scan_file": ("pattern", np.asarray(scan_files, dtype=str)),
         "frame_label": ("pattern", np.asarray(frame_labels, dtype=np.int64)),
         "frame_in_scan": ("pattern", np.asarray(frame_in_scan, dtype=np.int64)),
-        "time": ("pattern", np.asarray(times, dtype=float)),
-        "sequence_time": ("pattern", np.asarray(sequence_times, dtype=float)),
+        "time": ("pattern", time_values),
+        "sequence_time": ("pattern", np.asarray(sequence_values, dtype=float)),
+        "time_seconds": ("pattern", np.asarray(physical_times, dtype=float)),
         "time_source": ("pattern", np.asarray(time_sources, dtype=str)),
+        "q_interpolated": ("pattern", np.asarray(scan_interpolated, dtype=bool)),
     }
+    for key, values in metadata_values.items():
+        coords[key] = ("pattern", np.asarray(values, dtype=float))
     data_vars: dict[str, Any] = {
         "intensity": (("pattern", "q"), intensity_stack),
     }
     if has_sigma:
         data_vars["sigma"] = (("pattern", "q"), sigma_stack)
     ds = xr.Dataset(data_vars=data_vars, coords=coords)
-    time_unit = "s" if all_seconds else "frame"
     ds.coords["q"].attrs["units"] = q_unit or ""
     ds.coords["time"].attrs["units"] = time_unit
     ds.coords["sequence_time"].attrs["units"] = time_unit
+    ds.coords["time_seconds"].attrs.update({
+        "units": "s",
+        "availability": "nan for scans without physical timing",
+    })
     ds.attrs.update({
         "source_files": [str(path) for path in scan_paths],
         "q_policy": q_policy,
         "q_unit": q_unit or "",
         "time_units": time_unit,
+        "time_has_mixed_sources": not all_seconds,
+        "metadata_keys": list(metadata_keys),
+        "q_interpolation": {
+            "target": "q coordinate",
+            "outside_source_coverage": "nan",
+            "interpolated_scan_files": [
+                str(path) for index, path in enumerate(scan_paths)
+                if any(
+                    scan_interpolated[pos]
+                    for pos, scan_index in enumerate(scan_indices)
+                    if scan_index == index
+                )
+            ],
+        },
     })
     return TimeResolvedSeries(
         dataset=ds,
         locators=tuple(locators),
         source_root=None if source_root is None else Path(source_root).expanduser(),
     )
+
+
+def normalize_monitor(
+    dataset: xr.Dataset,
+    monitor: str | Sequence[float] | np.ndarray,
+    *,
+    intensity_var: str = "intensity",
+    output_var: str = "intensity_normalized",
+    target: str | float = "median",
+) -> xr.Dataset:
+    """Normalize each pattern by a persisted monitor or aligned numeric array.
+
+    A string resolves a pattern-aligned coordinate or data variable, typically
+    a key loaded through ``metadata_keys=("i0",)``.  Zero, missing, and
+    non-finite monitor readings leave a ``nan`` row and are recorded in the
+    validity mask; no diffraction profile is pointwise altered or clipped.
+    """
+    values = np.asarray(dataset[intensity_var].values, dtype=float)
+    if values.ndim != 2 or values.shape[0] != dataset.sizes.get("pattern", 0):
+        raise ValueError(f"{intensity_var!r} must have dimensions ('pattern', 'q')")
+    if isinstance(monitor, str):
+        if monitor in dataset.coords:
+            monitor_values = dataset.coords[monitor].values
+        elif monitor in dataset.data_vars:
+            monitor_values = dataset[monitor].values
+        else:
+            raise KeyError(f"monitor {monitor!r} is not present in the dataset")
+        monitor_name = monitor
+    else:
+        monitor_values = monitor
+        monitor_name = "provided_array"
+    factors = np.asarray(monitor_values, dtype=float).reshape(-1)
+    if factors.size != values.shape[0]:
+        raise ValueError("monitor must have one value per pattern")
+    valid = np.isfinite(factors) & (np.abs(factors) > np.finfo(float).eps)
+    if not np.any(valid):
+        raise ValueError("monitor contains no finite, non-zero values")
+    if target == "median":
+        target_value = float(np.nanmedian(factors[valid]))
+    elif isinstance(target, (int, float)):
+        target_value = float(target)
+    else:
+        raise ValueError("target must be 'median' or a numeric value")
+    normalized = np.full_like(values, np.nan, dtype=float)
+    normalized[valid] = values[valid] / factors[valid, None] * target_value
+
+    out = dataset.copy()
+    out["monitor_normalization_factor"] = ("pattern", factors)
+    out["monitor_normalization_valid"] = ("pattern", valid)
+    out[output_var] = (("pattern", "q"), normalized)
+    out["monitor_normalization_factor"].attrs.update({
+        "monitor": monitor_name,
+        "target": target_value,
+    })
+    out[output_var].attrs.update({
+        "method": "monitor",
+        "factor_variable": "monitor_normalization_factor",
+        "source_variable": intensity_var,
+    })
+    return out
 
 
 def normalize_reference_band(
@@ -790,6 +962,15 @@ class LinearThermalExpansion:
         return self.reference_lattice_A * (
             1.0 + self.alpha_per_K * (temperature - self.reference_temperature_K))
 
+    def temperature_derivative_per_A(self, lattice_A: Any) -> np.ndarray:
+        """Return dT/da for uncertainty propagation."""
+        lattice = np.asarray(lattice_A, dtype=float)
+        return np.full_like(
+            lattice,
+            1.0 / (self.reference_lattice_A * self.alpha_per_K),
+            dtype=float,
+        )
+
     def to_dict(self) -> dict[str, float]:
         return asdict(self)
 
@@ -830,6 +1011,24 @@ class TabulatedThermalExpansion:
             left=np.nan,
             right=np.nan,
         )
+
+    def temperature_derivative_per_A(self, lattice_A: Any) -> np.ndarray:
+        """Piecewise dT/da, ``nan`` outside the calibrated lattice range."""
+        lattice = np.asarray(self.lattice_A, dtype=float)
+        temperature = np.asarray(self.temperature_K, dtype=float)
+        if lattice[0] > lattice[-1]:
+            lattice = lattice[::-1]
+            temperature = temperature[::-1]
+        slope = np.diff(temperature) / np.diff(lattice)
+        values = np.asarray(lattice_A, dtype=float)
+        indices = np.searchsorted(lattice, values, side="right") - 1
+        valid = (indices >= 0) & (indices < len(slope))
+        # The upper endpoint belongs to the final finite interval.
+        valid |= values == lattice[-1]
+        indices = np.clip(indices, 0, len(slope) - 1)
+        result = np.full_like(values, np.nan, dtype=float)
+        result[valid] = slope[indices[valid]]
+        return result
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -884,7 +1083,20 @@ def add_temperature_results(
     smooth_window: int | None = None,
     polyorder: int = 2,
 ) -> xr.Dataset:
-    """Add temperature and heating/cooling rate from a lattice calibration."""
+    """Add temperature, optional uncertainty, and rate from a calibration.
+
+    ``time_coord`` must explicitly be in seconds.  The routine does not infer
+    K/s from frame indices, and it records whether a calibration exposed a
+    derivative suitable for propagating lattice uncertainty.
+    """
+    if time_coord not in lattice_dataset.coords:
+        raise KeyError(f"dataset has no {time_coord!r} coordinate")
+    time_units = str(lattice_dataset.coords[time_coord].attrs.get("units", ""))
+    if time_units not in {"s", "second", "seconds"}:
+        raise ValueError(
+            f"{time_coord!r} must have physical seconds units before computing K/s; "
+            f"got {time_units or 'unspecified'!r}"
+        )
     lattice = np.asarray(lattice_dataset[lattice_var].values, dtype=float)
     temperature = calibration.temperature(lattice)
     time = np.asarray(lattice_dataset.coords[time_coord].values, dtype=float)
@@ -896,11 +1108,37 @@ def add_temperature_results(
     out["temperature_C"] = (dim, temperature - 273.15)
     out["temperature_smoothed_K"] = (dim, smooth)
     out["temperature_rate_K_per_s"] = (dim, rate)
+    lattice_error_name = (
+        "lattice_mean_error_A"
+        if lattice_var == "lattice_mean_A" else lattice_var.replace("_A", "_error_A")
+    )
+    derivative = getattr(calibration, "temperature_derivative_per_A", None)
+    if lattice_error_name in lattice_dataset and callable(derivative):
+        lattice_error = np.asarray(lattice_dataset[lattice_error_name].values, dtype=float)
+        temp_error = np.abs(np.asarray(derivative(lattice), dtype=float) * lattice_error)
+        out["temperature_error_K"] = (dim, temp_error)
+        out["temperature_error_K"].attrs.update({
+            "units": "K",
+            "method": "first_order_lattice_uncertainty_propagation",
+            "lattice_error_variable": lattice_error_name,
+        })
     out["temperature_K"].attrs.update({
         "units": "K",
         "calibration": calibration.to_dict(),
-        "warning": "includes thermal and mechanical lattice strain",
+        "warning": (
+            "includes thermal and mechanical/anisotropic lattice strain; "
+            "texture and disagreement among reflections are diagnostics, not noise"
+        ),
     })
     out["temperature_rate_K_per_s"].attrs["units"] = "K/s"
+    out["temperature_rate_K_per_s"].attrs.update({
+        "time_coordinate": time_coord,
+        "smoothing_window": smooth_window,
+        "polyorder": polyorder if smooth_window is not None else None,
+    })
     out.attrs["thermal_calibration"] = calibration.to_dict()
+    out.attrs["temperature_uncertainty"] = (
+        "propagated from lattice uncertainty"
+        if "temperature_error_K" in out else "not available from this calibration/result"
+    )
     return out

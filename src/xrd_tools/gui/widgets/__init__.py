@@ -1,6 +1,7 @@
-"""Reusable GUI widget components for Jupyter notebooks.
+"""Reusable ipywidgets and Plotly components for Jupyter notebooks.
 
-All widgets use Panel + HoloViews (bokeh backend).
+The classes assemble notebook-safe controls around public, headless
+``xrd_tools`` results.  They do not import Qt or own analysis state.
 """
 from xrd_tools.gui.widgets.image_viewer import ImageViewer
 from xrd_tools.gui.widgets.pattern_viewer import PatternViewer
