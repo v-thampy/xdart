@@ -5,10 +5,20 @@ The "Directory" entry mode of the shared source panel: given a directory + a
 scan kind, walk it (optionally recursively) and return one openable
 :class:`SourceSpec` per scan found.  Generalizes
 ``TiffSeriesSource.from_directory`` across kinds.  Pure/Qt-free.
+
+R1 adds :func:`enumerate_candidates`: a NAME-ONLY sweep across every
+registered format adapter at once (vs. :func:`discover_scans`'s single
+explicit ``kind`` per call) — the shape
+:class:`~xrd_tools.sources.directory_index.DirectoryIndex` polls.  It performs
+no HDF5 opens, detector-dataset resolution, or processed-file classification;
+those live behind each adapter's explicit ``probe`` (see
+:mod:`xrd_tools.sources.adapters`).  ``discover_scans`` itself is unchanged —
+the GUI's ``scan_source_widget.py`` still calls it directly.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 # natsort is a hard dependency (pyproject).  Import it at module top and let an
@@ -17,6 +27,7 @@ from pathlib import Path
 # (scan_1, scan_10, scan_2) with no warning, silently corrupting the merge.
 from natsort import os_sorted
 
+from xrd_tools.core.filters import compile_filter
 from xrd_tools.core.scan import SourceKind, SourceSpec, coerce_source_kind
 
 _NEXUS_EXTS = {".nxs", ".h5", ".hdf5", ".cxi"}
@@ -99,4 +110,82 @@ def discover_scans(directory, kind, *, recursive: bool = False,
     raise ValueError(f"discover_scans: unsupported kind {kind.value!r}")
 
 
-__all__ = ["discover_scans"]
+@dataclass(frozen=True, slots=True)
+class Candidate:
+    """One name-only discovered source candidate and its cheap filesystem
+    state.  Produced ONLY by :func:`enumerate_candidates` — never by opening
+    the file.  ``(size, mtime_ns)`` is the cheap version stamp a
+    :class:`~xrd_tools.sources.directory_index.DirectoryIndex` compares
+    across polls to detect added/changed/removed candidates without reading
+    file content."""
+
+    path: Path
+    adapter_id: str
+    size: int
+    mtime_ns: int
+
+    @property
+    def version_stamp(self) -> tuple[int, int]:
+        return (self.size, self.mtime_ns)
+
+
+def _ensure_builtin_adapters_registered() -> None:
+    """Side-effect-only import: ``xrd_tools.sources.registry`` registers the
+    built-in adapters at its own module-import time.  A caller who only ever
+    touches ``discover``/``directory_index`` (never ``open_source`` or
+    ``registry`` directly) would otherwise see an adapter registry with only
+    whatever it registered itself — this guarantees the built-ins are present
+    without making this module import registry's heavier dependency chain
+    (h5py/fabio-touching source classes) at ITS OWN module-import time."""
+    import xrd_tools.sources.registry  # noqa: F401
+
+
+def enumerate_candidates(directory, *, recursive: bool = False,
+                         name_filter: str | None = None) -> list[Candidate]:
+    """Name-only candidate enumeration across every registered format adapter
+    at once (R1).
+
+    Pure filesystem inspection — directory listing, each adapter's filename
+    rule, and one ``stat()`` per matched file.  NEVER opens a file's content
+    (no ``h5py.File``, detector-dataset resolution, metadata harvest, or
+    processed-file classification); that is each adapter's explicit
+    :meth:`~xrd_tools.sources.adapters.SourceFormatAdapter.probe`, called only
+    when a caller asks to probe one specific candidate.
+
+    A file matched by more than one adapter's ``is_candidate`` keeps the
+    FIRST match in registration order (the built-in adapters partition
+    filenames by extension so this never happens for them; an out-of-tree
+    adapter that wants priority over a built-in should register after it —
+    :func:`~xrd_tools.sources.adapters.adapter_for_kind`'s "last registered
+    wins" is a *kind* lookup and does not apply to candidate ownership).
+
+    Deterministic natural order, independent of filesystem enumeration order
+    (:func:`natsort.os_sorted`, matching :func:`discover_scans`)."""
+    directory = Path(directory)
+    if not directory.is_dir():
+        return []
+    files = _walk_files(directory, recursive)
+
+    name_ok = compile_filter(name_filter)
+
+    _ensure_builtin_adapters_registered()
+    from xrd_tools.sources.adapters import all_adapters
+    adapters = all_adapters()
+
+    out: list[Candidate] = []
+    for f in files:
+        if not name_ok(f.name):
+            continue
+        for adapter in adapters:
+            if not adapter.is_candidate(f):
+                continue
+            try:
+                stat = f.stat()
+            except OSError:
+                break  # vanished mid-walk; not a candidate this poll
+            out.append(Candidate(f, adapter.id, stat.st_size, stat.st_mtime_ns))
+            break
+    return out
+
+
+__all__ = ["Candidate", "discover_scans", "enumerate_candidates"]
