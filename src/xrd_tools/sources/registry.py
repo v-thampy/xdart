@@ -27,6 +27,7 @@ from typing import Any
 
 from xrd_tools.core.scan import FrameSource, SourceKind, SourceSpec, coerce_source_kind
 from xrd_tools.io.image_source import ImageSourceKind, classify_image_source
+from xrd_tools.sources.adapters import adapter_for_kind
 from xrd_tools.sources.image import ImageFileSource, TiffSeriesSource
 from xrd_tools.sources.memory import LiveFrameSource, MemoryFrameSource
 from xrd_tools.sources.nexus import NexusStackSource, ProcessedNexusSource
@@ -54,6 +55,13 @@ def guess_source_kind(uri: str | Path) -> SourceKind:
     info = classify_image_source(path)
     if info.kind is ImageSourceKind.PROCESSED_XDART or info.kind is ImageSourceKind.THUMBNAIL_ONLY:
         return SourceKind.PROCESSED_NEXUS
+    if path.suffix.lower() == ".nexus":
+        # Reserved future xdart output extension (O/H23, not yet written by any
+        # producer): structurally a processed-record container, so it opens the
+        # same way a processed .nxs does.  Directory discovery excludes it from
+        # RAW candidates (xrd_tools.sources.discover) — this only governs
+        # explicit open_source()/guess_source_kind() routing.
+        return SourceKind.PROCESSED_NEXUS
     if path.suffix.lower() in {".h5", ".hdf5", ".nxs", ".cxi"}:
         return SourceKind.NEXUS_STACK
     if path.suffix.lower() in {".tif", ".tiff"}:
@@ -78,6 +86,17 @@ def open_source(uri_or_spec: str | Path | SourceSpec | FrameSource, **opts: Any)
     factory = _REGISTRY.get(coerce_source_kind(spec.kind))
     if factory is not None:
         return factory(spec)
+
+    # R1 adapter seam: consulted after the legacy register_source() override
+    # (above, preserved exactly) and before the built-in if-chain below, so a
+    # registered adapter opens its kind the same way a built-in one does —
+    # built-ins are themselves registered through this seam (see
+    # _register_builtin_adapters), so for every kind covered today this branch
+    # reproduces the if-chain's own construction and the chain below becomes a
+    # dead-but-harmless fallback for any kind nothing has adapted yet.
+    adapter = adapter_for_kind(spec.kind)
+    if adapter is not None:
+        return adapter.open(spec)
 
     kind = coerce_source_kind(spec.kind)
     if kind is SourceKind.TIFF_SERIES:
