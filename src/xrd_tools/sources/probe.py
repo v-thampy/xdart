@@ -2,7 +2,39 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from enum import Enum
+
 import numpy as np
+
+from xrd_tools.core.scan import SourceKind
+
+
+class ProbeState(str, Enum):
+    """Typed outcome of an explicit, format-adapter content probe (R1).
+
+    Enumeration (:mod:`xrd_tools.sources.discover`,
+    :mod:`xrd_tools.sources.directory_index`) never produces a
+    :class:`ProbeState` itself — it is name-only and opens nothing.  A state
+    is produced only when a caller explicitly probes one candidate via its
+    adapter's ``probe`` callable.
+    """
+
+    READY = "ready"
+    IN_PROGRESS = "in_progress"
+    PROCESSED_OUTPUT = "processed_output"
+    IMAGELESS = "imageless"
+    INVALID = "invalid"
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeResult:
+    """Result of probing one candidate: its typed state, a disclosed reason,
+    and (when known) the specific :class:`SourceKind` to open it as."""
+
+    state: ProbeState
+    reason: str = ""
+    kind: SourceKind | None = None
 
 
 def probe_first_frame(source):
@@ -38,4 +70,4 @@ def raw_is_reachable(source):
     return probe_first_frame(source)[0]
 
 
-__all__ = ["probe_first_frame", "raw_is_reachable"]
+__all__ = ["ProbeResult", "ProbeState", "probe_first_frame", "raw_is_reachable"]
