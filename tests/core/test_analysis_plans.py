@@ -330,7 +330,7 @@ def test_sin2psi_plan_runs_real_synthetic_map():
         radial=q,
         azimuthal=chi,
         intensity=intensity,
-        unit="q_A^-1",
+        unit="angstrom^-1",
         azimuthal_unit="chi_deg",
     )
 
@@ -352,3 +352,17 @@ def test_sin2psi_plan_runs_real_synthetic_map():
     assert len(result.payload.peak_fits) == 5
     assert np.all(np.isfinite(result.payload.d_values))
     assert result.payload.r_squared > 0.95
+
+
+@pytest.mark.parametrize("unit", (None, "2th_deg", "q_nm^-1"))
+def test_sin2psi_plan_rejects_unproven_q_units_before_fitting(unit):
+    result2d = IntegrationResult2D(
+        radial=np.linspace(1.75, 2.25, 8),
+        azimuthal=np.linspace(-30.0, 30.0, 5),
+        intensity=np.ones((8, 5)),
+        unit=unit,
+        azimuthal_unit="chi_deg",
+    )
+
+    with pytest.raises(ValueError, match="sin2psi analysis requires an explicit inverse-angstrom q unit"):
+        run_sin2psi(Sin2PsiPlan(q_range=(1.9, 2.1)), result2d)

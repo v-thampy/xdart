@@ -18,6 +18,7 @@ from typing import Any
 import numpy as np
 import xarray as xr
 
+from xrd_tools.analysis.axis_units import canonical_q_unit, require_inverse_angstrom
 from xrd_tools.io import (
     get_1d,
     get_2d,
@@ -54,30 +55,6 @@ def _natural_key(path: Path) -> tuple:
         int(part) if part.isdigit() else part.lower()
         for part in re.split(r"(\d+)", path.name)
     )
-
-
-_INVERSE_ANGSTROM_UNITS = {
-    "q_a^-1",
-    "q_a-1",
-    "a^-1",
-    "a-1",
-    "1/a",
-    "1/angstrom",
-    "angstrom^-1",
-    "angstrom-1",
-    "inverse_angstrom",
-}
-
-
-def _canonical_q_unit(q_unit: str | None) -> str:
-    """Return a stable q-unit label without asserting physical compatibility."""
-    raw = str(q_unit or "").strip()
-    if not raw:
-        return ""
-    normalized = raw.lower().replace(" ", "").replace("å", "angstrom")
-    if normalized in _INVERSE_ANGSTROM_UNITS:
-        return "q_A^-1"
-    return normalized
 
 
 def discover_processed_scans(
@@ -363,7 +340,7 @@ def load_time_resolved_series(
     for scan_index, path in enumerate(scan_paths):
         result = get_1d(path)
         q = _validate_q_grid(result.q, path=path)
-        current_q_unit = _canonical_q_unit(result.q_unit)
+        current_q_unit = canonical_q_unit(result.q_unit)
         if q_unit is None:
             q_unit = current_q_unit
         elif not q_unit and not current_q_unit:
@@ -965,17 +942,6 @@ def flag_fit_quality(
     return out
 
 
-def _require_inverse_angstrom(q_unit: str | None) -> str:
-    """Validate the unit required by the cubic q-to-lattice equation."""
-    canonical = _canonical_q_unit(q_unit)
-    if canonical != "q_A^-1":
-        raise ValueError(
-            "q-to-lattice conversion requires an explicit inverse-angstrom q "
-            f"unit; got {q_unit or 'unspecified'!r}. Convert 2-theta or "
-            "inverse-nanometre axes to q_A^-1 before fitting.")
-    return canonical
-
-
 def lattice_from_q(
     q_peak: Any,
     hkl: Sequence[int],
@@ -983,7 +949,7 @@ def lattice_from_q(
     q_unit: str | None,
 ) -> np.ndarray:
     """Return cubic lattice parameter in angstrom from inverse-angstrom q."""
-    _require_inverse_angstrom(q_unit)
+    require_inverse_angstrom(q_unit, operation="q-to-lattice conversion")
     if len(hkl) != 3:
         raise ValueError("hkl must contain exactly three indices")
     norm = float(np.sqrt(sum(float(v) ** 2 for v in hkl)))
@@ -1006,7 +972,7 @@ def add_lattice_results(
         fit_dataset.coords["q_fit"].attrs.get("units")
         if "q_fit" in fit_dataset.coords else None
     )
-    _require_inverse_angstrom(q_unit)
+    require_inverse_angstrom(q_unit, operation="q-to-lattice conversion")
     lattice_rows = []
     error_rows = []
     for i, hkl in enumerate(hkls):

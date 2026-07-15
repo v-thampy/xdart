@@ -30,6 +30,7 @@ from typing import Any
 import numpy as np
 from scipy.stats import linregress
 
+from xrd_tools.analysis.axis_units import require_inverse_angstrom
 from xrd_tools.core.containers import IntegrationResult2D
 
 logger = logging.getLogger(__name__)
@@ -421,6 +422,7 @@ def sin2psi_analysis(
     -------
     Sin2PsiResult
     """
+    require_inverse_angstrom(result2d.unit, operation="sin2psi analysis")
     sectors = extract_chi_sectors(
         result2d,
         chi_centers=chi_centers,

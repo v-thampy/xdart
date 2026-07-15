@@ -14,6 +14,11 @@ _EXPORTS = {
     "fit_line_cut": ("xrd_tools.analysis.fitting", "fit_line_cut"),
     "fit_peaks": ("xrd_tools.analysis.fitting", "fit_peaks"),
     "fit_2d_slice": ("xrd_tools.analysis.fitting", "fit_2d_slice"),
+    "canonical_q_unit": ("xrd_tools.analysis.axis_units", "canonical_q_unit"),
+    "require_inverse_angstrom": (
+        "xrd_tools.analysis.axis_units",
+        "require_inverse_angstrom",
+    ),
     "PeakFitResult1D": ("xrd_tools.analysis.fitting", "PeakFitResult1D"),
     "PhaseModel": ("xrd_tools.analysis.phase", "PhaseModel"),
     "PeakData": ("xrd_tools.analysis.phase", "PeakData"),
