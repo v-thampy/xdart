@@ -164,7 +164,7 @@ class MeasuringSink:
 
     Records the perf-counter timestamp of each real ``write()`` (the first is the
     run's first-write event for first-frame latency), counts writes
-    (frames_written), and times the real ``finish()`` call (session_finish_s).
+    (frames_written), and times the real ``finish()`` call (finish_s).
     All other sink hooks the engine probes (``worker_process``, ``abort``,
     ``replace``, ``flush``, …) delegate straight to the wrapped sink via
     ``__getattr__`` so its behavior is unchanged.

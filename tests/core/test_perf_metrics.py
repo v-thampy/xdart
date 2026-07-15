@@ -281,7 +281,7 @@ def test_invalid_container_not_reported_written_or_durable(tmp_path):
     assert c["frames_durable"] == 0          # no inferred durability
 
 
-# --- 4. session_finish_s measures the real finish interval ------------------
+# --- 4. finish_s measures the real finish interval --------------------------
 
 def test_measuring_sink_times_real_finish():
     h = _load_harness()
