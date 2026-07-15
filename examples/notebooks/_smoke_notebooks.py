@@ -101,6 +101,7 @@ def main() -> int:
                 nb,
                 timeout=args.timeout,
                 kernel_name="python3",
+                shutdown_kernel="immediate",
                 resources={"metadata": {"path": tmp}},
             ).execute()
             elapsed = time.perf_counter() - started
