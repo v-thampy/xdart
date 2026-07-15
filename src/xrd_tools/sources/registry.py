@@ -342,6 +342,8 @@ def _live_open(spec: SourceSpec) -> FrameSource:
 def _register_builtin_adapters() -> None:
     from xrd_tools.sources.adapters import SourceFormatAdapter, register_adapter
 
+    from xrd_tools.sources.readiness import nxwriter_finalization_policy
+
     register_adapter(SourceFormatAdapter(
         id="nexus_hdf5",
         kinds=(SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER, SourceKind.PROCESSED_NEXUS),
@@ -349,6 +351,7 @@ def _register_builtin_adapters() -> None:
         scan_name=_nexus_scan_name,
         probe=_nexus_probe,
         open=_nexus_open,
+        finalization_policy=nxwriter_finalization_policy,
         is_output_format=True,
     ))
     register_adapter(SourceFormatAdapter(

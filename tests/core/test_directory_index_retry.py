@@ -127,7 +127,11 @@ def test_per_call_retry_deadline_overrides_the_constructor_default(tmp_path):
     clock.advance(5.0)
     final = index.record_probe(tmp_path / "a.nxs", raw, retry_deadline=1.0)
 
-    assert final is raw   # exhausted the SHORT per-call deadline, not the 1000s default
+    # Exhausted the SHORT per-call deadline, not the 1000s constructor
+    # default -- an IN_PROGRESS raw verdict that never once resolved
+    # escalates to INVALID rather than retrying forever (see
+    # test_in_progress_exhaustion_escalates_to_invalid).
+    assert final.state is ProbeState.INVALID
 
 
 # ---- reset on file-stamp change ---------------------------------------------

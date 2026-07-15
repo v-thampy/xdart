@@ -20,7 +20,11 @@ from xrd_tools.core.scan import (
 )
 from xrd_tools.session.readiness import ResultCaps, SourceCaps
 
-__all__ = ["describe_source_readiness", "capabilities_for_processed"]
+__all__ = [
+    "describe_source_readiness",
+    "capabilities_for_processed",
+    "nxwriter_finalization_policy",
+]
 
 _ENERGY_KEYS = frozenset({
     "energy",
@@ -288,3 +292,28 @@ def _array_len(value: Any) -> int:
         return int(len(value))
     except Exception:
         return 0
+
+
+# ---------------------------------------------------------------------------
+# R1 — finalized/in-progress readiness rule for the nexus-family format
+# adapter's ``finalization_policy`` hook (see xrd_tools.sources.adapters).
+# Distinct from describe_source_readiness()/SourceCaps above: this answers
+# "is the CONTAINER done being written," not "what capabilities does an
+# already-open source advertise."
+# ---------------------------------------------------------------------------
+
+def nxwriter_finalization_policy(path: str | Path) -> bool:
+    """True iff *path* (a NeXus/HDF5 container) is finalized and safe to
+    consume-and-retire; False means it should still be treated as
+    in-progress/provisional.
+
+    Delegates to :func:`xrd_tools.io.bluesky_nexus.is_unfinalized_nxwriter`:
+    a non-Bluesky container has no ``end_time`` contract and is always
+    finalized; a Bluesky/NXWriter run is finalized once ``end_time`` is
+    stamped; an unreadable file (a half-written HDF5) is NOT finalized.  This
+    is the same "defer, don't retire" rule the live directory watch already
+    relies on — R1 exposes it as a format adapter's explicit policy hook
+    rather than a one-off GUI check.
+    """
+    from xrd_tools.io.bluesky_nexus import is_unfinalized_nxwriter
+    return not is_unfinalized_nxwriter(Path(path))

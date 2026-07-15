@@ -241,8 +241,15 @@ class DirectoryIndex:
           :meth:`poll`) always starts a fresh window — and is surfaced as
           IN_PROGRESS while the window is open;
         * once the window exceeds ``retry_deadline`` (or the constructor
-          default), the raw result is returned and retry tracking clears —
-          the candidate is no longer treated as provisional.
+          default): an IMAGELESS raw verdict is now trusted and returned
+          as-is (a stable, old, zero-detector-frame shell is a genuine
+          "no images here" classification — the wrangler's own "only a
+          stable old file is retired as genuinely imageless" policy); an
+          IN_PROGRESS raw verdict — meaning the file was still unreadable
+          or an unfinalized NXWriter run for the WHOLE window, never once
+          resolving — escalates to INVALID instead of retrying forever, so
+          a genuinely stuck/corrupt file eventually surfaces as a problem
+          rather than an indefinite silent retry.
         """
         path = Path(path)
         deadline = self._retry_deadline if retry_deadline is None else retry_deadline
@@ -265,6 +272,11 @@ class DirectoryIndex:
             attempts=prior.attempts + 1, last_result=result)
         if entry.exhausted(now=now, deadline=deadline):
             self._retries.pop(path, None)
+            if result.state is ProbeState.IN_PROGRESS:
+                return ProbeResult(
+                    ProbeState.INVALID,
+                    reason=f"{result.reason} (exceeded {deadline:g}s retry window)",
+                )
             return result
         self._retries[path] = entry
         return ProbeResult(ProbeState.IN_PROGRESS, reason=result.reason)
@@ -273,6 +285,23 @@ class DirectoryIndex:
         """The active :class:`RetryState` for *path*, if it is currently
         tracked as provisional (``None`` otherwise)."""
         return self._retries.get(Path(path))
+
+    def probe_candidate(self, candidate: Candidate, *,
+                        retry_deadline: float | None = None) -> ProbeResult:
+        """Explicitly probe ONE candidate through its owning adapter and
+        record the result via :meth:`record_probe`.
+
+        This is the ONLY method on this class that may open a file's
+        content, and it is never called by :meth:`poll` or
+        :func:`~xrd_tools.sources.discover.enumerate_candidates` — a caller
+        decides which candidates are worth the I/O, one at a time (e.g. only
+        the newest few, or only ones the GUI is about to display)."""
+        from xrd_tools.sources.adapters import get_adapter
+        adapter = get_adapter(candidate.adapter_id)
+        if adapter is None:
+            raise LookupError(f"no adapter registered for id {candidate.adapter_id!r}")
+        raw = adapter.probe(candidate.path)
+        return self.record_probe(candidate.path, raw, retry_deadline=retry_deadline)
 
     def poll_forever(self, *, interval: float,
                      should_stop: Callable[[], bool] = lambda: False,
