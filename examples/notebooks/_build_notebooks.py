@@ -641,7 +641,7 @@ NB_TIME_RESOLVED = [
             LinearThermalExpansion, PeakFitPlan, add_lattice_results,
             add_temperature_results, bin_time_resolved, fit_peak_series,
             export_time_resolved_results,
-            flag_fit_quality, flag_normalization_outliers, load_time_resolved_series,
+            discover_processed_scans, flag_fit_quality, flag_normalization_outliers, load_time_resolved_series,
             normalize_monitor, normalize_reference_band, select_time_zero,
         )
         from xrd_tools.gui.widgets import ImageViewer, PatternViewer, PeakFitControls
@@ -655,6 +655,9 @@ NB_TIME_RESOLVED = [
         processed_file = widgets.Text(value=str(processed_root / "Pt_test_burst_00007.nxs"), description="processed file")
         processed_folder = widgets.Text(value=str(processed_root), description="processed folder")
         selection_mode = widgets.ToggleButtons(options=("file", "folder"), value="file", description="load")
+        scan_filter = widgets.Text(value="*.nxs", description="scan filter")
+        discover_button = widgets.Button(description="Find processed scans")
+        scan_selection = widgets.SelectMultiple(options=(), description="selected scans", layout=widgets.Layout(width="620px", height="120px"))
         raw_root = widgets.Text(value=str(TEST_DATA) if TEST_DATA.exists() else "", description="raw root")
         time_key = widgets.Text(value="", description="time key")
         time_unit = widgets.Dropdown(options=("s", "ms", "us"), value="s", description="time unit")
@@ -665,6 +668,7 @@ NB_TIME_RESOLVED = [
         bin_size = widgets.BoundedIntText(value=2, min=1, max=100, description="bin size")
         frame_row = widgets.BoundedIntText(value=0, min=0, max=0, description="row")
         batch_limit = widgets.BoundedIntText(value=8, min=1, max=1000, description="batch rows")
+        thermal_time_basis = widgets.Dropdown(options=("automatic", "time", "sequence_time"), value="automatic", description="thermal time")
         load_button = widgets.Button(description="Load processed", button_style="primary")
         preprocess_button = widgets.Button(description="Apply preprocessing")
         inspect_button = widgets.Button(description="Inspect lazy row")
@@ -674,12 +678,12 @@ NB_TIME_RESOLVED = [
         export_directory = Path(os.environ.get("XDART_NOTEBOOK_OUTPUT", tempfile.gettempdir()))
         status = widgets.HTML("<i>Load, preprocess, and fit actions are explicit; row selection only reads cached/lazy data.</i>")
         output = widgets.Output()
-        display(widgets.VBox([selection_mode, processed_file, processed_folder, raw_root, widgets.HBox([time_key, time_unit, frame_period_ms]), widgets.HBox([monitor_method, monitor_key]), q_band, widgets.HBox([bin_size, frame_row, batch_limit]), widgets.HBox([load_button, preprocess_button, inspect_button]), widgets.HBox([pilot_button, batch_button, export_button]), status, output]))
+        display(widgets.VBox([selection_mode, processed_file, processed_folder, widgets.HBox([scan_filter, discover_button]), scan_selection, raw_root, widgets.HBox([time_key, time_unit, frame_period_ms]), widgets.HBox([monitor_method, monitor_key]), q_band, widgets.HBox([bin_size, frame_row, batch_limit, thermal_time_basis]), widgets.HBox([load_button, preprocess_button, inspect_button]), widgets.HBox([pilot_button, batch_button, export_button]), status, output]))
         """
     ),
     code(
         """
-        NOTEBOOK_STATE = {"loads": 0, "preprocesses": 0, "series": None, "prepared": None, "fits": None, "thermal": None, "raw_reads": 0}
+        NOTEBOOK_STATE = {"loads": 0, "preprocesses": 0, "series": None, "prepared": None, "fits": None, "thermal": None, "raw_reads": 0, "discovered_scans": (), "selected_scans": (), "thermal_time_coord": None}
 
         def _smoke_file():
             path = Path(tempfile.gettempdir()) / "xdart_notebook_time_resolved_smoke.nxs"
@@ -699,12 +703,36 @@ NB_TIME_RESOLVED = [
                     groups.create_group(f"frame_{frame:04d}").create_dataset("thumbnail", data=np.ones((8, 8), dtype=np.uint8))
             return path
 
+        def discover_folder_scans(_=None):
+            with output:
+                clear_output(wait=True)
+                try:
+                    assert selection_mode.value == "folder", "Choose folder mode before discovering scans"
+                    root = Path(processed_folder.value).expanduser()
+                    pattern = scan_filter.value.strip() or "*.nxs"
+                    paths = discover_processed_scans(root, pattern=pattern)
+                    assert paths, f"No processed 1-D scans match {pattern!r} under {root}"
+                    scan_selection.options = [(path.name, str(path)) for path in paths]
+                    scan_selection.value = ()
+                    NOTEBOOK_STATE["discovered_scans"] = tuple(paths)
+                    display({"discovered": [path.name for path in paths], "next": "select one or more scans, then load"})
+                    status.value = f"<b>Discovered {len(paths)} naturally sorted processed scans; select the subset to load.</b>"
+                except Exception as exc:
+                    status.value = f"<b>Scan discovery failed:</b> {exc}"
+                    raise
+
         def _selected_paths():
             if SMOKE_MODE:
                 return _smoke_file()
-            candidate = Path(processed_file.value).expanduser() if selection_mode.value == "file" else Path(processed_folder.value).expanduser()
-            assert candidate.exists(), f"Missing processed selection: {candidate}"
-            return candidate
+            if selection_mode.value == "file":
+                candidate = Path(processed_file.value).expanduser()
+                assert candidate.is_file(), f"Missing processed selection: {candidate}"
+                return candidate
+            paths = tuple(Path(value) for value in scan_selection.value)
+            assert paths, "Discover a folder and select one or more processed scans before loading"
+            discovered = set(NOTEBOOK_STATE["discovered_scans"])
+            assert set(paths).issubset(discovered), "Selected scans are not from the current discovered folder"
+            return paths
 
         def load_processed(_=None):
             with output:
@@ -712,11 +740,13 @@ NB_TIME_RESOLVED = [
                 try:
                     selected_key = "elapsed" if SMOKE_MODE else time_key.value.strip() or None
                     selected_unit = "ms" if SMOKE_MODE else (time_unit.value if selected_key else None)
-                    series = load_time_resolved_series(_selected_paths(), frame_period_s=frame_period_ms.value / 1000.0, time_key=selected_key, time_unit=selected_unit, metadata_keys=(monitor_key.value.strip(),) if monitor_key.value.strip() else (), source_root=raw_root.value.strip() or None)
+                    paths = _selected_paths()
+                    selected_names = [paths.name] if isinstance(paths, Path) else [path.name for path in paths]
+                    series = load_time_resolved_series(paths, frame_period_s=frame_period_ms.value / 1000.0, time_key=selected_key, time_unit=selected_unit, metadata_keys=(monitor_key.value.strip(),) if monitor_key.value.strip() else (), source_root=raw_root.value.strip() or None)
                     frame_row.max, frame_row.value = series.dataset.sizes["pattern"] - 1, 0
-                    NOTEBOOK_STATE.update(loads=NOTEBOOK_STATE["loads"] + 1, series=series, prepared=None, fits=None, thermal=None)
-                    status.value = f"<b>Loaded {series.dataset.sizes['pattern']} scan-qualified patterns.</b>"
-                    display({"patterns": series.dataset.sizes["pattern"], "q_points": series.dataset.sizes["q"], "time_units": series.dataset.coords["time"].attrs["units"]})
+                    NOTEBOOK_STATE.update(loads=NOTEBOOK_STATE["loads"] + 1, series=series, prepared=None, fits=None, thermal=None, selected_scans=tuple(selected_names), thermal_time_coord=None)
+                    status.value = f"<b>Loaded {series.dataset.sizes['pattern']} scan-qualified patterns from {len(selected_names)} selected scan(s).</b>"
+                    display({"selected_scans": selected_names, "patterns": series.dataset.sizes["pattern"], "q_points": series.dataset.sizes["q"], "time_units": series.dataset.coords["time"].attrs["units"]})
                 except Exception as exc:
                     status.value = f"<b>Load failed:</b> {exc}"
                     raise
@@ -791,6 +821,19 @@ NB_TIME_RESOLVED = [
         fit_controls.n_peaks.value = 1; fit_controls.peak_positions.value = str(peak_center); fit_controls.peak_model.value = "gaussian"; fit_controls.bg_model.value = "linear"; fit_controls.sigma_init.value = 0.02; fit_controls.q_min.value, fit_controls.q_max.value = peak_center - 0.16, peak_center + 0.16
         display(fit_controls.widget)
 
+        def _thermal_time_coordinate(dataset):
+            scan_count = len(np.unique(dataset.coords["scan_index"].values))
+            requested = thermal_time_basis.value
+            coordinate = requested if requested != "automatic" else ("time" if scan_count == 1 else "sequence_time")
+            values = np.asarray(dataset.coords[coordinate].values, dtype=float)
+            units = str(dataset.coords[coordinate].attrs.get("units", ""))
+            if units not in {"s", "second", "seconds"} or not np.all(np.isfinite(values)) or np.any(np.diff(values) <= 0):
+                raise ValueError(
+                    f"{coordinate!r} is not a finite strictly increasing physical-seconds coordinate; "
+                    "select one scan or provide proven cross-scan cadence before deriving K/s"
+                )
+            return coordinate
+
         def run_bounded_batch(_=None):
             with output:
                 clear_output(wait=True)
@@ -800,10 +843,11 @@ NB_TIME_RESOLVED = [
                     fits = flag_fit_quality(fit_peak_series(prepared, _plan_from_controls(fit_controls.get_params()), intensity_var="intensity_band_normalized", q_range=(fit_controls.q_min.value, fit_controls.q_max.value), pattern_indices=np.arange(min(batch_limit.value, prepared.sizes["pattern"]))), max_center_error=0.02)
                     lattice = add_lattice_results(fits, hkls=((1, 1, 1),))
                     calibration = LinearThermalExpansion(float(lattice.lattice_mean_A.isel(fit_pattern=0)), 300.0, 9e-6)
-                    thermal = add_temperature_results(lattice, calibration, time_coord="time")
-                    NOTEBOOK_STATE.update(fits=fits, thermal=thermal)
+                    time_coordinate = _thermal_time_coordinate(lattice)
+                    thermal = add_temperature_results(lattice, calibration, time_coord=time_coordinate)
+                    NOTEBOOK_STATE.update(fits=fits, thermal=thermal, thermal_time_coord=time_coordinate)
                     display(plot_thermal_history(thermal))
-                    status.value = f"<b>Saved {thermal.sizes['fit_pattern']} bounded fit rows for review.</b>"
+                    status.value = f"<b>Saved {thermal.sizes['fit_pattern']} bounded fit rows using {time_coordinate} for K/s.</b>"
                 except Exception as exc:
                     status.value = f"<b>Batch fit failed:</b> {exc}"
                     raise
@@ -815,9 +859,9 @@ NB_TIME_RESOLVED = [
             status.value = f"<b>Exported compact results to {paths['netcdf'].parent}.</b>"
             return paths
 
-        load_button.on_click(load_processed); preprocess_button.on_click(apply_preprocessing); inspect_button.on_click(inspect_lazy_row); pilot_button.on_click(run_pilot); batch_button.on_click(run_bounded_batch); export_button.on_click(export_compact)
+        discover_button.on_click(discover_folder_scans); load_button.on_click(load_processed); preprocess_button.on_click(apply_preprocessing); inspect_button.on_click(inspect_lazy_row); pilot_button.on_click(run_pilot); batch_button.on_click(run_bounded_batch); export_button.on_click(export_compact)
         frame_row.observe(lambda change: inspect_lazy_row() if NOTEBOOK_STATE["series"] is not None else None, names="value")
-        NOTEBOOK_ACTIONS = {"load_processed": load_processed, "apply_preprocessing": apply_preprocessing, "inspect_lazy_row": inspect_lazy_row, "run_pilot": run_pilot, "run_bounded_batch": run_bounded_batch, "export_compact": export_compact}
+        NOTEBOOK_ACTIONS = {"discover_folder_scans": discover_folder_scans, "load_processed": load_processed, "apply_preprocessing": apply_preprocessing, "inspect_lazy_row": inspect_lazy_row, "run_pilot": run_pilot, "run_bounded_batch": run_bounded_batch, "export_compact": export_compact}
         if SMOKE_MODE or os.environ.get("XDART_NOTEBOOK_AUTORUN") == "1":
             load_processed(); apply_preprocessing(); inspect_lazy_row(); run_pilot(); run_bounded_batch()
         """
