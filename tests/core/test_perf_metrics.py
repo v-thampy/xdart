@@ -414,21 +414,28 @@ def test_duplicate_scan_stems_rejected_before_reduction(tmp_path):
     assert d["runs"][0]["frames_written"] == 0
 
 
-def test_existing_output_rejected(tmp_path):
+@pytest.mark.parametrize("pre", ["repeat_dir", "generated_nxs"])
+def test_preexisting_output_rejected_via_cli(tmp_path, pre):
+    # R2 correction: existing-output rejection must go through the REAL CLI path
+    # (run_once's mkdir(exist_ok=False) previously raised before the guard).
     h = _load_harness()
     src = tmp_path / "src"; src.mkdir()
-    master = _write_raw_container(src / "scan_00001.nxs")
+    raw = _write_raw_container(src / "scan_00001.nxs")
     poni = _write_poni(tmp_path / "cal.poni")
     out_root = tmp_path / "out"
-    repeat_dir = out_root / "repeat_00"
-    repeat_dir.mkdir(parents=True)
-    (repeat_dir / "scan_00001.nxs").write_bytes(b"pre-existing")  # would be clobbered
-    plan = h._build_plan("1d")
-    from xrd_tools.integrate.calibration import load_poni
-    cm = h._bench_container(master, load_poni(poni), repeat_dir, out_root, plan,
-                            1, "entry", None, src, [str(master)], False)
-    assert cm.state == "invalid"
-    assert "already exists" in (cm.skip_reason or "")
+    (out_root / "repeat_00").mkdir(parents=True)
+    guarded = None
+    if pre == "generated_nxs":
+        gen = out_root / "repeat_00" / "scan_00001.nxs"
+        gen.write_bytes(b"pre-existing bytes")
+        guarded = (gen, _sha(gen))
+    before_raw = _sha(raw)
+    rc = h.main(["--source-dir", str(src), "--poni", str(poni),
+                 "--output-dir", str(out_root)])
+    assert rc == 2
+    assert _sha(raw) == before_raw
+    if guarded:
+        assert _sha(guarded[0]) == guarded[1]  # pre-existing bytes untouched
 
 
 # --- 9. repeated runs use unique destinations -------------------------------
@@ -466,3 +473,130 @@ def test_partial_run_writes_valid_and_reports_invalid_truthfully(tmp_path):
     assert bad["state"] == "invalid"
     assert bad["frames_written"] == 0 and bad["frames_durable"] == 0
     assert d["runs"][0]["frames_durable"] == 2   # only the valid container's
+
+
+# ===========================================================================
+# Round-two corrections (M0 review disposition)
+# ===========================================================================
+
+# --- successful-write semantics: a failing wrapped write records nothing -----
+
+def test_failing_wrapped_write_records_nothing():
+    h = _load_harness()
+
+    class FailSink:
+        def begin(self, s, p): pass
+        def write(self, f, r): raise RuntimeError("write boom")
+        def finish(self, result): pass
+
+    ms = h.MeasuringSink(FailSink())
+    ms.begin(None, None)
+    with pytest.raises(RuntimeError):
+        ms.write(type("F", (), {"index": 0})(), None)
+    assert ms.write_times == []          # zero SUCCESSFUL writes
+    assert ms.first_write_ts is None     # no first-write timestamp
+
+
+# --- a later failure preserves the writes/timings already observed -----------
+
+def test_later_failure_preserves_observed_writes(tmp_path, monkeypatch):
+    import xrd_tools.reduction as red
+    from xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.reduction.core import FrameReduction
+
+    h = _load_harness()
+    src = tmp_path / "src"; src.mkdir()
+    _write_raw_container(src / "scan_00001.nxs", nframes=3)
+    poni = _write_poni(tmp_path / "cal.poni")
+
+    def fake_run(plan, scan, sink=None, **k):
+        sink.begin(scan, plan)
+        frame = scan.frames[0]
+        r = FrameReduction(
+            frame_index=int(getattr(frame, "index", 0)),
+            result_1d=IntegrationResult1D(
+                radial=np.linspace(0.5, 5.0, 10, dtype=np.float32),
+                intensity=np.ones(10, dtype=np.float32), unit="q_A^-1"))
+        sink.write(frame, r)                      # ONE successful real write
+        raise RuntimeError("boom after first write")
+
+    monkeypatch.setattr(red, "run_reduction", fake_run)
+    _, d = _run_cli(h, src, poni, tmp_path / "out", cores=1, json_out=tmp_path / "o.json")
+    c = d["runs"][0]["containers"][0]
+    assert c["state"] == "invalid" and c["error"]
+    assert c["frames_written"] == 1            # the observed successful write is preserved
+    assert c["frames_reduced"] is None         # no honest ReductionResult -> not invented
+    assert c["reduce_s"] is not None           # the measured span is kept
+    assert isinstance(c["frames_durable"], int)  # independent on-disk fact, not inferred
+
+
+# --- --json-out colliding with a planned generated output / root / repeat ----
+
+@pytest.mark.parametrize("which", ["generated_nxs", "output_root", "repeat_dir"])
+def test_json_out_collides_with_planned_output_refused(tmp_path, which):
+    h = _load_harness()
+    src = tmp_path / "src"; src.mkdir()
+    raw = _write_raw_container(src / "scan_00001.nxs")
+    poni = _write_poni(tmp_path / "cal.poni")
+    out_root = tmp_path / "out"
+    target = {
+        "generated_nxs": out_root / "repeat_00" / "scan_00001.nxs",
+        "output_root": out_root,
+        "repeat_dir": out_root / "repeat_00",
+    }[which]
+    before = {p: _sha(p) for p in (raw, poni)}
+    rc = h.main(["--source-dir", str(src), "--poni", str(poni),
+                 "--output-dir", str(out_root), "--json-out", str(target)])
+    assert rc == 2, f"--json-out == {which} must be refused"
+    for p, sha in before.items():
+        assert _sha(p) == sha
+    assert not (out_root / "repeat_00").exists()  # no partial benchmark output
+
+
+# --- per-container destination guard receives the real PONI path -------------
+
+def test_per_container_guard_receives_real_poni_path(tmp_path, monkeypatch):
+    import xrd_tools.io.output_safety as osafety
+    from xrd_tools.integrate.calibration import load_poni
+
+    h = _load_harness()
+    src = tmp_path / "src"; src.mkdir()
+    master = _write_raw_container(src / "scan_00001.nxs")
+    poni_path = _write_poni(tmp_path / "cal.poni")
+    poni_obj = load_poni(poni_path)
+    out_root = tmp_path / "out"
+    repeat_dir = out_root / "repeat_00"; repeat_dir.mkdir(parents=True)
+
+    calls: list[tuple[str, list[str]]] = []
+    real = osafety.check_output_not_source
+
+    def spy(output_path, **k):
+        calls.append((str(output_path), [str(x) for x in k.get("input_files", ())]))
+        return real(output_path, **k)
+
+    monkeypatch.setattr(osafety, "check_output_not_source", spy)
+    plan = h._build_plan("1d")
+    h._bench_container(master, poni_obj, poni_path, repeat_dir, out_root, plan,
+                       1, "entry", 1, src, [str(master)], False)
+
+    per_container = [c for c in calls if c[0].endswith("scan_00001.nxs")]
+    assert per_container, "per-container destination guard was not invoked"
+    inputs = per_container[0][1]
+    assert str(poni_path) in inputs                      # the real PONI PATH
+    assert not any(i.startswith("PONI(") for i in inputs)  # not the loaded object
+
+
+# --- observation-source keys name real schema v2 fields ----------------------
+
+def test_observation_keys_match_schema_v2_fields():
+    import dataclasses
+    from xrd_tools.perf.metrics import OBSERVATION_SOURCES
+    fields = ({f.name for f in dataclasses.fields(ContainerMetrics)}
+              | {f.name for f in dataclasses.fields(RunMetrics)})
+    for key in OBSERVATION_SOURCES:
+        base = key.split(".", 1)[0]  # dotted keys (open_counts.source) document sub-categories
+        assert base in fields, f"observation key {key!r} names no schema v2 field"
+    # the corrected finish field names are present; the old wrong name is gone.
+    assert "finish_s" in {f.name for f in dataclasses.fields(ContainerMetrics)}
+    assert "session_finish_total_s" in {f.name for f in dataclasses.fields(RunMetrics)}
+    assert "session_finish_s" not in OBSERVATION_SOURCES

@@ -48,7 +48,9 @@ OBSERVATION_SOURCES: dict[str, str] = {
                       "sink.finish() returns (durability verification)",
     "frames_submitted": "UNOBSERVED: the streaming engine's frame-accept seam is "
                         "not exposed without production runtime edits; left None",
-    "session_finish_s": "wall time measured around the wrapped sink.finish() call",
+    "finish_s": "per-container wall time measured around the wrapped "
+                "sink.finish() call",
+    "session_finish_total_s": "run-level sum of per-container finish_s",
     "first_frame_latency_s": "run clock started BEFORE enumeration -> timestamp "
                              "of the first real sink.write() across the run "
                              "(skipped candidates before it are included)",

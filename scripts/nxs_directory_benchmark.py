@@ -180,11 +180,15 @@ class MeasuringSink:
         return self._real.begin(scan, plan)
 
     def write(self, frame, reduction) -> None:
+        # Only a SUCCESSFUL real write counts: call the wrapped sink FIRST; a
+        # sink that raises records neither a write nor a first-write timestamp
+        # (the exception propagates unchanged).
+        result = self._real.write(frame, reduction)
         ts = time.perf_counter()
         if self.first_write_ts is None:
             self.first_write_ts = ts
         self.write_times.append(ts)
-        return self._real.write(frame, reduction)
+        return result
 
     def finish(self, result) -> None:
         t0 = time.perf_counter()
@@ -293,10 +297,14 @@ def _validate_destination(dest, *, sources, poni, source_dir, recursive):
 # per-container measurement
 # ---------------------------------------------------------------------------
 
-def _bench_container(path, poni, repeat_dir, output_root, plan, cores, entry,
-                     frame_limit, source_dir, source_paths, recursive):
+def _bench_container(path, poni, poni_path, repeat_dir, output_root, plan, cores,
+                     entry, frame_limit, source_dir, source_paths, recursive):
     """Measure one container. Returns the ContainerMetrics (first-write ts is on
-    ``cm.reserved['first_write_ts']`` when a frame was written)."""
+    ``cm.reserved['first_write_ts']`` when a frame was written).
+
+    ``poni`` is the loaded calibration (for the integrator); ``poni_path`` is the
+    real filesystem path threaded into destination safety so the released guard
+    actually checks the PONI file (M0-R4 correction)."""
     from xrd_tools.perf.metrics import ContainerMetrics, Timer
     from xrd_tools.io.nexus import find_nexus_image_dataset
     from xrd_tools.io.output_safety import OutputCollisionError
@@ -332,16 +340,18 @@ def _bench_container(path, poni, repeat_dir, output_root, plan, cores, entry,
             cm.open_s = t.elapsed
             cm.frames_discovered = int(cm.nframes or 0)
 
-            # destination safety BEFORE any write (M0-R4).
+            # destination safety BEFORE any write (M0-R4); the real PONI PATH is
+            # checked here, not the loaded calibration object.
             out_path = repeat_dir / f"{scan_name}.nxs"
             try:
-                _validate_destination(out_path, sources=source_paths, poni=poni,
-                                      source_dir=source_dir, recursive=recursive)
+                _validate_destination(out_path, sources=source_paths,
+                                      poni=poni_path, source_dir=source_dir,
+                                      recursive=recursive)
             except OutputCollisionError as exc:
                 cm.state, cm.skip_reason = "invalid", f"unsafe output: {exc}"
                 cm.open_counts = dict(counter.counts)
                 return cm
-            if out_path.exists():  # fresh per-repeat dir should make this impossible
+            if out_path.exists():  # preflighted in main(); belt-and-suspenders
                 cm.state, cm.skip_reason = "invalid", "output already exists"
                 cm.open_counts = dict(counter.counts)
                 return cm
@@ -352,39 +362,55 @@ def _bench_container(path, poni, repeat_dir, output_root, plan, cores, entry,
                     source.metadata_for(0)
             cm.metadata_s = t.elapsed
 
-            # reduction with EXACTLY ``cores`` harness-owned workers (M0-R1).
             limit = cm.nframes if frame_limit is None else min(frame_limit, cm.nframes)
             integrator = poni_to_integrator(poni)
             scan = source.to_scan(name=scan_name, integrator=integrator)
             if limit < len(scan.frames):
                 scan.frames = scan.frames[:limit]
             cm.frames_input = len(scan.frames)
-            sink = MeasuringSink(NexusSink(path=out_path, overwrite=True,
-                                          source_base=repeat_dir))
-            executor = ThreadPoolExecutor(max_workers=cores)
-            try:
-                with Timer() as t:
-                    result = run_reduction(plan, scan, sink=sink,
-                                           execution="streaming", executor=executor)
-                cm.reduce_s = t.elapsed
-            finally:
-                executor.shutdown(wait=True)  # shutdown belongs to the harness
-            cm.frames_reduced = int(getattr(result, "n_processed", 0))
-            cm.frames_written = len(sink.write_times)
-            cm.finish_s = sink.finish_s
-            if sink.first_write_ts is not None:
-                cm.reserved["first_write_ts"] = sink.first_write_ts
-            if getattr(result, "failed", False):
-                cm.error = getattr(result, "error", None)
+        except Exception as exc:
+            # a SETUP failure (before a sink exists): nothing was written.
+            cm.state = "invalid"
+            cm.error = f"{type(exc).__name__}: {exc}"[:200]
+            cm.skip_reason = cm.skip_reason or "setup error"
+            logger.debug("container setup failed: %s", path, exc_info=True)
+            cm.open_counts = dict(counter.counts)
+            return cm
 
-            # durability: re-count on disk AFTER finish (verification opens).
-            with counter.verification():
-                cm.frames_durable = _durable_frame_count(out_path)
+        # reduction with EXACTLY ``cores`` harness-owned workers (M0-R1).  A
+        # later failure must NOT discard writes/timings already observed: harvest
+        # the wrapped sink in a finally, and leave frames_reduced=None unless an
+        # honest ReductionResult is returned (never inferred).
+        sink = MeasuringSink(NexusSink(path=out_path, overwrite=True,
+                                      source_base=repeat_dir))
+        executor = ThreadPoolExecutor(max_workers=cores)
+        reduce_timer = Timer()
+        result = None
+        try:
+            with reduce_timer:
+                result = run_reduction(plan, scan, sink=sink,
+                                       execution="streaming", executor=executor)
         except Exception as exc:
             cm.state = "invalid"
             cm.error = f"{type(exc).__name__}: {exc}"[:200]
             cm.skip_reason = cm.skip_reason or "reduction error"
-            logger.debug("container failed: %s", path, exc_info=True)
+            logger.debug("reduction failed: %s", path, exc_info=True)
+        finally:
+            executor.shutdown(wait=True)  # shutdown belongs to the harness
+            cm.reduce_s = reduce_timer.elapsed
+            cm.frames_written = len(sink.write_times)   # observed SUCCESSFUL writes
+            cm.finish_s = sink.finish_s
+            if sink.first_write_ts is not None:
+                cm.reserved["first_write_ts"] = sink.first_write_ts
+        if result is not None:
+            cm.frames_reduced = int(getattr(result, "n_processed", 0))
+            if getattr(result, "failed", False):
+                cm.error = cm.error or getattr(result, "error", None)
+        # else: no honest ReductionResult -> frames_reduced stays None.
+
+        # durability: an INDEPENDENT post-finish on-disk fact (verification opens).
+        with counter.verification():
+            cm.frames_durable = _durable_frame_count(out_path)
 
     cm.open_counts = dict(counter.counts)
     return cm
@@ -399,6 +425,7 @@ def run_once(args, poni, plan, repeat_index) -> "object":
 
     source_dir = Path(args.source_dir)
     output_root = Path(args.output_dir)
+    poni_path = Path(args.poni)
     run_start = time.perf_counter()  # BEFORE enumeration (M0-R3)
 
     rm = RunMetrics(
@@ -435,8 +462,8 @@ def run_once(args, poni, plan, repeat_index) -> "object":
                 skip_reason="duplicate canonical scan stem"))
             continue
         cm = _bench_container(
-            path, poni, repeat_dir, output_root, plan, args.cores, args.entry,
-            args.frame_limit, source_dir, source_paths, args.recursive)
+            path, poni, poni_path, repeat_dir, output_root, plan, args.cores,
+            args.entry, args.frame_limit, source_dir, source_paths, args.recursive)
         rm.add(cm)
         fw = cm.reserved.pop("first_write_ts", None)
         if fw is not None:
@@ -518,29 +545,63 @@ def main(argv=None) -> int:
         tmp_ctx = tempfile.TemporaryDirectory(prefix="nxs_bench_out_")
         args.output_dir = tmp_ctx.name
 
-    from xrd_tools.io.output_safety import OutputCollisionError
+    from xrd_tools.io.output_safety import (
+        OutputCollisionError,
+        check_output_not_source,
+        paths_same_file,
+    )
     from xrd_tools.integrate.calibration import load_poni
     from xrd_tools.perf.metrics import summarize_runs, write_json
 
-    # the output ROOT must be entirely OUTSIDE the source tree (M0-R4) — checked
-    # strictly (recursive=True) so a subdirectory of the source is refused too,
-    # regardless of the run's own recursion.
+    output_root = Path(args.output_dir)
+    candidates = _enumerate(source_dir, args.ext, args.recursive)
+    source_paths = [str(p) for p in candidates]
+    scan_names = sorted({_scan_name(p) for p in candidates})
+
+    # Plan EVERY destination for EVERY repeat before the first writer opens
+    # (M0-R4): the output root, each repeat directory, and each generated .nxs.
+    repeat_dirs = [output_root / f"repeat_{i:02d}" for i in range(args.repeat)]
+    generated = [rd / f"{n}.nxs" for rd in repeat_dirs for n in scan_names]
+
+    # 1. output root + every generated output must be OUTSIDE the source tree
+    #    (recursive=True, so a source subdirectory is refused too) and must not
+    #    clobber a source or the PONI path.
     try:
-        _validate_destination(Path(args.output_dir) / "probe.nxs",
-                              sources=[], poni=poni_path, source_dir=source_dir,
-                              recursive=True)
+        for dest in [output_root / "probe.nxs", *generated]:
+            check_output_not_source(
+                str(dest), input_files=[str(poni_path), *source_paths],
+                watched_dirs=[str(source_dir)], recursive=True,
+                container_directory_mode=True)
     except OutputCollisionError as exc:
-        logger.error("REFUSED output dir: %s", exc)
+        logger.error("REFUSED output: %s", exc)
         return 2
 
-    # --json-out must not clobber a source, the PONI, or sit in the source tree.
+    # 2. --json-out must not equal the output root, a planned repeat directory,
+    #    any planned generated .nxs, a source, or the PONI — nor sit in the
+    #    source tree.  A clean refusal writes nothing.
     if args.json_out:
+        jo = Path(args.json_out)
+        forbidden = [output_root, *repeat_dirs, *generated, poni_path,
+                     *(Path(s) for s in source_paths)]
+        if any(paths_same_file(jo, f) for f in forbidden):
+            logger.error("REFUSED --json-out: collides with a planned output / "
+                         "source / PONI: %s", jo)
+            return 2
         try:
-            _validate_destination(Path(args.json_out), sources=_enumerate(
-                source_dir, args.ext, args.recursive) + [poni_path],
-                poni=poni_path, source_dir=source_dir, recursive=True)
+            check_output_not_source(
+                str(jo), input_files=[str(poni_path), *source_paths],
+                watched_dirs=[str(source_dir)], recursive=True,
+                container_directory_mode=True)
         except OutputCollisionError as exc:
             logger.error("REFUSED --json-out: %s", exc)
+            return 2
+
+    # 3. refuse a pre-existing repeat directory or generated output — no clobber,
+    #    no partial outputs; every repeat uses a fresh unique destination (this is
+    #    the existing-output rejection driven through the real CLI path).
+    for existing in [*repeat_dirs, *generated]:
+        if existing.exists():
+            logger.error("REFUSED: benchmark output already exists: %s", existing)
             return 2
 
     poni = load_poni(poni_path)
