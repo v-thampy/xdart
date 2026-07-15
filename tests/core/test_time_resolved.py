@@ -19,6 +19,7 @@ from xrd_tools.analysis.time_resolved import (
     fit_peak_series,
     flag_fit_quality,
     flag_normalization_outliers,
+    lattice_from_q,
     load_time_resolved_series,
     normalize_monitor,
     normalize_reference_band,
@@ -218,6 +219,31 @@ def test_time_columns_require_selected_units_and_one_frame_does_not_invent_caden
     np.testing.assert_allclose(one_frame_scans.coords["time"], [0.0, 0.0])
     assert one_frame_scans.coords["sequence_time"].values[0] == 0.0
     assert np.isnan(one_frame_scans.coords["sequence_time"].values[1])
+
+
+def test_stacked_q_units_are_complete_compatible_and_canonical(tmp_path):
+    q = np.linspace(1.0, 5.0, 9)
+    intensity = np.ones((2, len(q)))
+    canonical = _write_scan(tmp_path / "canonical.nxs", q=q, intensity=intensity, q_unit="q_A^-1")
+    alias = _write_scan(tmp_path / "alias.nxs", q=q, intensity=intensity, q_unit="angstrom^-1")
+    missing = _write_scan(tmp_path / "missing.nxs", q=q, intensity=intensity, q_unit="")
+    inverse_nm = _write_scan(tmp_path / "inverse_nm.nxs", q=q, intensity=intensity, q_unit="q_nm^-1")
+
+    compatible = load_time_resolved_series([canonical, alias]).dataset
+    assert compatible.coords["q"].attrs["units"] == "q_A^-1"
+    assert compatible.attrs["q_unit"] == "q_A^-1"
+
+    with pytest.raises(ValueError, match="every stacked scan"):
+        load_time_resolved_series([canonical, missing])
+    with pytest.raises(ValueError, match="every stacked scan"):
+        load_time_resolved_series([missing, canonical])
+    with pytest.raises(ValueError, match="differs from reference"):
+        load_time_resolved_series([canonical, inverse_nm])
+
+    unknown = load_time_resolved_series([missing, missing]).dataset
+    assert unknown.coords["q"].attrs["units"] == ""
+    with pytest.raises(ValueError, match="inverse-angstrom"):
+        lattice_from_q([2.0], (1, 1, 1), q_unit=unknown.coords["q"].attrs["units"])
 
 
 def test_time_resolved_raw_accessor_is_strict_and_qualified(scan_pair, monkeypatch):

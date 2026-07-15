@@ -56,6 +56,30 @@ def _natural_key(path: Path) -> tuple:
     )
 
 
+_INVERSE_ANGSTROM_UNITS = {
+    "q_a^-1",
+    "q_a-1",
+    "a^-1",
+    "a-1",
+    "1/a",
+    "1/angstrom",
+    "angstrom^-1",
+    "angstrom-1",
+    "inverse_angstrom",
+}
+
+
+def _canonical_q_unit(q_unit: str | None) -> str:
+    """Return a stable q-unit label without asserting physical compatibility."""
+    raw = str(q_unit or "").strip()
+    if not raw:
+        return ""
+    normalized = raw.lower().replace(" ", "").replace("å", "angstrom")
+    if normalized in _INVERSE_ANGSTROM_UNITS:
+        return "q_A^-1"
+    return normalized
+
+
 def discover_processed_scans(
     directory: str | Path,
     *,
@@ -339,8 +363,17 @@ def load_time_resolved_series(
     for scan_index, path in enumerate(scan_paths):
         result = get_1d(path)
         q = _validate_q_grid(result.q, path=path)
-        current_q_unit = str(result.q_unit or "")
-        if q_unit is not None and current_q_unit and current_q_unit != q_unit:
+        current_q_unit = _canonical_q_unit(result.q_unit)
+        if q_unit is None:
+            q_unit = current_q_unit
+        elif not q_unit and not current_q_unit:
+            pass
+        elif not q_unit or not current_q_unit:
+            raise ValueError(
+                f"{path}: every stacked scan must declare a compatible q unit; "
+                f"reference={q_unit or 'unspecified'!r}, current={current_q_unit or 'unspecified'!r}"
+            )
+        elif current_q_unit != q_unit:
             raise ValueError(
                 f"{path}: q unit {current_q_unit!r} differs from reference unit {q_unit!r}"
             )
@@ -417,8 +450,6 @@ def load_time_resolved_series(
             frame_in_scan.append(row)
             physical_times.append(float(scan_time[row]) if time_source != "frame_index" else np.nan)
             time_sources.append(str(time_source))
-        q_unit = q_unit or current_q_unit
-
     assert target_q is not None
     intensity_stack = np.concatenate(intensities, axis=0)
     sigma_stack = np.concatenate(sigmas, axis=0)
@@ -934,29 +965,15 @@ def flag_fit_quality(
     return out
 
 
-_INVERSE_ANGSTROM_UNITS = {
-    "q_a^-1",
-    "q_a-1",
-    "a^-1",
-    "a-1",
-    "1/a",
-    "1/angstrom",
-    "angstrom^-1",
-    "angstrom-1",
-    "inverse_angstrom",
-}
-
-
 def _require_inverse_angstrom(q_unit: str | None) -> str:
     """Validate the unit required by the cubic q-to-lattice equation."""
-    normalized = str(q_unit or "").strip().lower().replace(" ", "")
-    normalized = normalized.replace("å", "angstrom")
-    if normalized not in _INVERSE_ANGSTROM_UNITS:
+    canonical = _canonical_q_unit(q_unit)
+    if canonical != "q_A^-1":
         raise ValueError(
             "q-to-lattice conversion requires an explicit inverse-angstrom q "
             f"unit; got {q_unit or 'unspecified'!r}. Convert 2-theta or "
             "inverse-nanometre axes to q_A^-1 before fitting.")
-    return normalized
+    return canonical
 
 
 def lattice_from_q(
