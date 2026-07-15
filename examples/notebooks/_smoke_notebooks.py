@@ -27,6 +27,10 @@ EXPECTED = [
     "08_time_resolved_xrd_analysis.ipynb",
     "09_reciprocal_space_mapping.ipynb",
 ]
+# NB03 starts a fitting-only kernel before pyFAI starts worker threads in the
+# stitch/reduction kernels.  This avoids an external Jupyter teardown delay;
+# all public notebooks are still validated and executed on every full run.
+EXECUTION_ORDER = ["03_phase_and_peak_fitting.ipynb", *[name for name in EXPECTED if not name.startswith("03_")]]
 FORBIDDEN_IMPORT = re.compile(
     r"^\s*(?:from\s+(?:xdart|ssrl_xrd_tools)(?:\.|\s)|import\s+(?:xdart|ssrl_xrd_tools)(?:\.|\s|$))",
     re.MULTILINE,
@@ -77,7 +81,7 @@ def main() -> int:
     actual = sorted(path.name for path in ROOT.glob("*.ipynb"))
     if actual != EXPECTED:
         raise AssertionError(f"Expected {EXPECTED}; found {actual}")
-    notebooks = [(ROOT / name, validate_notebook(ROOT / name)) for name in EXPECTED]
+    notebooks = {name: (ROOT / name, validate_notebook(ROOT / name)) for name in EXPECTED}
     if args.validate_only:
         print(f"Validated {len(notebooks)} clean public notebooks")
         return 0
@@ -92,9 +96,10 @@ def main() -> int:
         os.environ.pop("XDART_TEST_DATA", None)
     selected = args.only or EXPECTED
     with tempfile.TemporaryDirectory(prefix="xdart-notebook-smoke-") as tmp:
-        for path, nb in notebooks:
-            if path.name not in selected:
+        for name in EXECUTION_ORDER:
+            if name not in selected:
                 continue
+            path, nb = notebooks[name]
             started = time.perf_counter()
             # Execute an in-memory notebook so checked-in JSON remains clean.
             NotebookClient(
