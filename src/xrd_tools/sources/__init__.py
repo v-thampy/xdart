@@ -33,6 +33,7 @@ if TYPE_CHECKING:
         IndexDelta,
         RetryState,
         Snapshot,
+        StaleCandidateError,
     )
     from xrd_tools.sources.discover import Candidate, discover_scans, enumerate_candidates
     from xrd_tools.sources.grouping import flatten_scan_groups, parse_scan_groups
@@ -74,6 +75,7 @@ _LAZY_EXPORTS = {
     "ProcessedNexusSource": "xrd_tools.sources.nexus",
     "RetryState": "xrd_tools.sources.directory_index",
     "Snapshot": "xrd_tools.sources.directory_index",
+    "StaleCandidateError": "xrd_tools.sources.directory_index",
     "SourceFormatAdapter": "xrd_tools.sources.adapters",
     "SpecSource": "xrd_tools.sources.spec",
     "TiffSeriesSource": "xrd_tools.sources.image",
@@ -128,6 +130,7 @@ __all__ = [
     "ProcessedNexusSource",
     "RetryState",
     "Snapshot",
+    "StaleCandidateError",
     "SourceCapabilities",
     "SourceFormatAdapter",
     "SourceKind",

@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from xrd_tools.sources.directory_index import DirectoryIndex, RetryState
+from xrd_tools.sources.directory_index import (
+    DirectoryIndex, RetryState, StaleCandidateError)
+from xrd_tools.sources.discover import Candidate
 from xrd_tools.sources.probe import ProbeResult, ProbeState
 
 
@@ -31,6 +33,18 @@ def _touch(path: Path, data: bytes = b"x") -> Path:
     return path
 
 
+def _rec(index, target, result, **kw):
+    """Record a probe result the SAFE way (R1-R10): via the full Candidate
+    identity.  A :class:`Candidate` is passed through unchanged (so a stale
+    candidate still fails); a bare path is resolved to the index's CURRENT
+    candidate for that path (the sanctioned same-owner recording) before
+    delegating to ``record_probe``."""
+    if isinstance(target, Candidate):
+        return index.record_probe(target, result, **kw)
+    return index.record_probe(
+        index.snapshot.by_path()[Path(target)], result, **kw)
+
+
 # ---- terminal results clear/never start retry tracking ---------------------
 
 
@@ -40,7 +54,7 @@ def test_ready_result_is_returned_unchanged_and_not_tracked(tmp_path):
     index.poll()
 
     result = ProbeResult(ProbeState.READY, reason="ok")
-    effective = index.record_probe(tmp_path / "a.nxs", result)
+    effective = _rec(index, tmp_path / "a.nxs", result)
 
     assert effective is result
     assert index.retry_state(tmp_path / "a.nxs") is None
@@ -56,7 +70,7 @@ def test_processed_output_and_invalid_are_terminal_too(tmp_path):
         index = DirectoryIndex(tmp_path, clock=_FakeClock())
         index.poll()
         result = ProbeResult(state, reason="terminal")
-        effective = index.record_probe(tmp_path / name, result)
+        effective = _rec(index, tmp_path / name, result)
         assert effective is result
         assert index.retry_state(tmp_path / name) is None
 
@@ -71,7 +85,7 @@ def test_in_progress_starts_a_retry_window_and_surfaces_as_in_progress(tmp_path)
     index.poll()
 
     raw = ProbeResult(ProbeState.IN_PROGRESS, reason="still writing")
-    effective = index.record_probe(tmp_path / "a.nxs", raw)
+    effective = _rec(index, tmp_path / "a.nxs", raw)
 
     assert effective.state is ProbeState.IN_PROGRESS
     state = index.retry_state(tmp_path / "a.nxs")
@@ -89,11 +103,11 @@ def test_imageless_shell_stays_provisional_within_the_deadline_not_retired(tmp_p
     index.poll()
 
     raw_imageless = ProbeResult(ProbeState.IMAGELESS, reason="no detector dataset yet")
-    effective = index.record_probe(tmp_path / "a.nxs", raw_imageless)
+    effective = _rec(index, tmp_path / "a.nxs", raw_imageless)
     assert effective.state is ProbeState.IN_PROGRESS   # NOT surfaced as imageless yet
 
     clock.advance(5.0)   # still within the 10s window
-    effective = index.record_probe(tmp_path / "a.nxs", raw_imageless)
+    effective = _rec(index, tmp_path / "a.nxs", raw_imageless)
     assert effective.state is ProbeState.IN_PROGRESS
     assert index.retry_state(tmp_path / "a.nxs").attempts == 2
 
@@ -105,14 +119,14 @@ def test_retry_exhausts_after_the_deadline_and_surfaces_the_raw_verdict(tmp_path
     index.poll()
 
     raw = ProbeResult(ProbeState.IMAGELESS, reason="no detector dataset")
-    index.record_probe(tmp_path / "a.nxs", raw)          # t=0, starts window
+    _rec(index, tmp_path / "a.nxs", raw)          # t=0, starts window
 
     clock.advance(9.0)
-    still_provisional = index.record_probe(tmp_path / "a.nxs", raw)
+    still_provisional = _rec(index, tmp_path / "a.nxs", raw)
     assert still_provisional.state is ProbeState.IN_PROGRESS
 
     clock.advance(2.0)   # t=11 >= 10s deadline
-    final = index.record_probe(tmp_path / "a.nxs", raw)
+    final = _rec(index, tmp_path / "a.nxs", raw)
 
     assert final is raw
     assert final.state is ProbeState.IMAGELESS
@@ -126,9 +140,9 @@ def test_per_call_retry_deadline_overrides_the_constructor_default(tmp_path):
     index.poll()
 
     raw = ProbeResult(ProbeState.IN_PROGRESS, reason="still writing")
-    index.record_probe(tmp_path / "a.nxs", raw)
+    _rec(index, tmp_path / "a.nxs", raw)
     clock.advance(5.0)
-    final = index.record_probe(tmp_path / "a.nxs", raw, retry_deadline=1.0)
+    final = _rec(index, tmp_path / "a.nxs", raw, retry_deadline=1.0)
 
     # Exhausted the SHORT per-call deadline, not the 1000s constructor
     # default -- an IN_PROGRESS raw verdict that never once resolved
@@ -147,9 +161,9 @@ def test_retry_window_resets_when_the_file_stamp_changes_via_record_probe(tmp_pa
     index.poll()
 
     raw = ProbeResult(ProbeState.IN_PROGRESS, reason="still writing")
-    index.record_probe(a, raw)
+    _rec(index, a, raw)
     clock.advance(3.0)
-    index.record_probe(a, raw)
+    _rec(index, a, raw)
     assert index.retry_state(a).attempts == 2
 
     # File content changes -> new version stamp -> poll() picks it up as
@@ -160,7 +174,7 @@ def test_retry_window_resets_when_the_file_stamp_changes_via_record_probe(tmp_pa
     assert index.retry_state(a) is None   # cleared by poll()'s changed-set sweep
 
     clock.advance(1.0)
-    index.record_probe(a, raw)
+    _rec(index, a, raw)
     state = index.retry_state(a)
     assert state.attempts == 1
     assert state.first_seen_at == 4.0   # fresh window, not resumed from t=0
@@ -172,7 +186,7 @@ def test_poll_clears_retry_state_for_removed_candidates(tmp_path):
     index = DirectoryIndex(tmp_path, clock=clock)
     index.poll()
 
-    index.record_probe(a, ProbeResult(ProbeState.IN_PROGRESS, reason="writing"))
+    _rec(index, a, ProbeResult(ProbeState.IN_PROGRESS, reason="writing"))
     assert index.retry_state(a) is not None
 
     a.unlink()
@@ -186,7 +200,7 @@ def test_reconfigure_clears_all_retry_state(tmp_path):
     clock = _FakeClock()
     index = DirectoryIndex(tmp_path, clock=clock)
     index.poll()
-    index.record_probe(a, ProbeResult(ProbeState.IN_PROGRESS, reason="writing"))
+    _rec(index, a, ProbeResult(ProbeState.IN_PROGRESS, reason="writing"))
     assert index.retry_state(a) is not None
 
     index.reconfigure(name_filter="anything")
@@ -204,7 +218,7 @@ def test_retry_tracking_for_one_candidate_does_not_affect_another(tmp_path):
     index = DirectoryIndex(tmp_path, clock=clock)
     index.poll()
 
-    index.record_probe(a, ProbeResult(ProbeState.IN_PROGRESS, reason="writing"))
+    _rec(index, a, ProbeResult(ProbeState.IN_PROGRESS, reason="writing"))
     assert index.retry_state(a) is not None
     assert index.retry_state(b) is None
 
@@ -256,12 +270,12 @@ def test_r1r1_exhausted_imageless_stays_terminal_on_repeated_probes(tmp_path):
     raw = ProbeResult(ProbeState.IMAGELESS, reason="no det")
     p = tmp_path / "shell.nxs"
 
-    assert index.record_probe(p, raw).state is ProbeState.IN_PROGRESS
+    assert _rec(index, p, raw).state is ProbeState.IN_PROGRESS
     clock.advance(11.0)
-    assert index.record_probe(p, raw).state is ProbeState.IMAGELESS   # exhausted
+    assert _rec(index, p, raw).state is ProbeState.IMAGELESS   # exhausted
     # Repeated probes of the same stamp stay terminal, never in_progress:
     for _ in range(3):
-        assert index.record_probe(p, raw).state is ProbeState.IMAGELESS
+        assert _rec(index, p, raw).state is ProbeState.IMAGELESS
         assert index.retry_state(p) is None   # no reopened window
 
 
@@ -275,11 +289,11 @@ def test_r1r1_exhausted_in_progress_stays_terminal_invalid_on_repeated_probes(tm
     raw = ProbeResult(ProbeState.IN_PROGRESS, reason="still writing")
     p = tmp_path / "stuck.nxs"
 
-    index.record_probe(p, raw)
+    _rec(index, p, raw)
     clock.advance(6.0)
-    assert index.record_probe(p, raw).state is ProbeState.INVALID
+    assert _rec(index, p, raw).state is ProbeState.INVALID
     for _ in range(3):
-        assert index.record_probe(p, raw).state is ProbeState.INVALID
+        assert _rec(index, p, raw).state is ProbeState.INVALID
         assert index.retry_state(p) is None
 
 
@@ -292,9 +306,9 @@ def test_r1r1_stamp_change_clears_terminal_and_opens_one_fresh_window(tmp_path):
     index.poll()
     raw = ProbeResult(ProbeState.IMAGELESS, reason="no det")
 
-    index.record_probe(p, raw)
+    _rec(index, p, raw)
     clock.advance(11.0)
-    assert index.record_probe(p, raw).state is ProbeState.IMAGELESS   # terminal
+    assert _rec(index, p, raw).state is ProbeState.IMAGELESS   # terminal
 
     # bytes change -> poll sees it -> terminal resolution cleared
     p.write_bytes(b"a longer payload now")
@@ -302,7 +316,7 @@ def test_r1r1_stamp_change_clears_terminal_and_opens_one_fresh_window(tmp_path):
     assert index.retry_state(p) is None
 
     # fresh window opens; NOT immediately terminal again
-    eff = index.record_probe(p, raw)
+    eff = _rec(index, p, raw)
     assert eff.state is ProbeState.IN_PROGRESS
     assert index.retry_state(p).attempts == 1
 
@@ -316,13 +330,13 @@ def test_r1r1_reconfigure_clears_terminal_resolution(tmp_path):
     index.poll()
     raw = ProbeResult(ProbeState.IMAGELESS, reason="no det")
     p = tmp_path / "shell.nxs"
-    index.record_probe(p, raw)
+    _rec(index, p, raw)
     clock.advance(11.0)
-    assert index.record_probe(p, raw).state is ProbeState.IMAGELESS
+    assert _rec(index, p, raw).state is ProbeState.IMAGELESS
 
     index.reconfigure(name_filter="")   # any real change (whitespace filter matches all)
     index.poll()
-    assert index.record_probe(p, raw).state is ProbeState.IN_PROGRESS   # fresh window
+    assert _rec(index, p, raw).state is ProbeState.IN_PROGRESS   # fresh window
 
 
 def test_r1r1_terminal_resolution_survives_an_unchanged_poll(tmp_path):
@@ -334,13 +348,13 @@ def test_r1r1_terminal_resolution_survives_an_unchanged_poll(tmp_path):
     index.poll()
     raw = ProbeResult(ProbeState.IMAGELESS, reason="no det")
     p = tmp_path / "shell.nxs"
-    index.record_probe(p, raw)
+    _rec(index, p, raw)
     clock.advance(11.0)
-    assert index.record_probe(p, raw).state is ProbeState.IMAGELESS
+    assert _rec(index, p, raw).state is ProbeState.IMAGELESS
 
     index.poll()   # unchanged
     assert index.last_delta.unchanged is True
-    assert index.record_probe(p, raw).state is ProbeState.IMAGELESS   # still sticky
+    assert _rec(index, p, raw).state is ProbeState.IMAGELESS   # still sticky
 
 
 def test_r1r1_transient_in_progress_on_the_deadline_does_not_condemn_an_imageless_shell(tmp_path):
@@ -357,14 +371,14 @@ def test_r1r1_transient_in_progress_on_the_deadline_does_not_condemn_an_imageles
     imageless = ProbeResult(ProbeState.IMAGELESS, reason="no det")
     transient = ProbeResult(ProbeState.IN_PROGRESS, reason="momentary lock")
 
-    assert index.record_probe(p, imageless).state is ProbeState.IN_PROGRESS  # window opens
+    assert _rec(index, p, imageless).state is ProbeState.IN_PROGRESS  # window opens
     clock.advance(3.0)
-    assert index.record_probe(p, imageless).state is ProbeState.IN_PROGRESS  # readable again
+    assert _rec(index, p, imageless).state is ProbeState.IN_PROGRESS  # readable again
     clock.advance(8.0)   # t=11 >= 10: exhausts, but on a transient IN_PROGRESS
-    resolved = index.record_probe(p, transient)
+    resolved = _rec(index, p, transient)
     assert resolved.state is ProbeState.IMAGELESS   # NOT INVALID
     # and it stays IMAGELESS (sticky) on repeat
-    assert index.record_probe(p, transient).state is ProbeState.IMAGELESS
+    assert _rec(index, p, transient).state is ProbeState.IMAGELESS
 
 
 def test_r1r1_never_readable_window_still_escalates_to_invalid(tmp_path):
@@ -378,48 +392,55 @@ def test_r1r1_never_readable_window_still_escalates_to_invalid(tmp_path):
     p = tmp_path / "stuck.nxs"
     raw = ProbeResult(ProbeState.IN_PROGRESS, reason="never readable")
 
-    index.record_probe(p, raw)
+    _rec(index, p, raw)
     clock.advance(2.0)
-    index.record_probe(p, raw)
+    _rec(index, p, raw)
     clock.advance(4.0)   # t=6 >= 5
-    assert index.record_probe(p, raw).state is ProbeState.INVALID
+    assert _rec(index, p, raw).state is ProbeState.INVALID
 
 
 # ===========================================================================
 # R1-R6 — stale / unknown probe completions create NO state (gate 9)
 # ===========================================================================
 
-def test_r1r6_unknown_path_probe_creates_no_state(tmp_path):
-    """Gate 9: record_probe for a path absent from the current snapshot is
-    ignored — returned unchanged, with no retry/terminal state created."""
+def test_r1r6_unknown_path_probe_fails_and_creates_no_state(tmp_path):
+    """Gate 9 / R1-R10: a completion for a path absent from the current
+    snapshot FAILS observably (StaleCandidateError) and creates no state — the
+    stale result never escapes as an effective verdict."""
+    import pytest
     _touch(tmp_path / "a.nxs")
     index = DirectoryIndex(tmp_path, clock=_FakeClock())
     index.poll()
     ghost = tmp_path / "ghost.nxs"
+    ghost_cand = Candidate(ghost, "nexus_hdf5", 0, 0)   # never in the snapshot
     raw = ProbeResult(ProbeState.IN_PROGRESS, reason="late")
 
-    eff = index.record_probe(ghost, raw)
-    assert eff is raw                       # returned unchanged
-    assert index.retry_state(ghost) is None  # no window created
+    with pytest.raises(StaleCandidateError):
+        index.record_probe(ghost_cand, raw)
+    assert index.retry_state(ghost) is None
+    assert index._terminal.get(ghost) is None
 
 
-def test_r1r6_stale_stamp_probe_creates_no_state(tmp_path):
-    """Gate 9: a completion whose expected_stamp no longer matches the current
-    candidate (a late result for an older version) creates no state."""
+def test_r1r6_stale_stamp_probe_fails_and_creates_no_state(tmp_path):
+    """Gate 9 / R1-R10: a completion whose stamp no longer matches the current
+    candidate FAILS observably and creates no state."""
+    import pytest
     p = _touch(tmp_path / "a.nxs", data=b"one")
     index = DirectoryIndex(tmp_path, clock=_FakeClock())
     index.poll()
-    stale_stamp = (999, 999)   # never the real stamp
+    current = index.snapshot.candidates[0]
+    stale = Candidate(p, current.adapter_id, 999, 999)   # wrong stamp
     raw = ProbeResult(ProbeState.IN_PROGRESS, reason="late")
 
-    eff = index.record_probe(p, raw, expected_stamp=stale_stamp)
-    assert eff is raw
+    with pytest.raises(StaleCandidateError):
+        index.record_probe(stale, raw)
     assert index.retry_state(p) is None
+    assert index._terminal.get(p) is None
 
 
 def test_r1r6_probe_candidate_rejects_a_removed_candidate(tmp_path):
     """Gate 9: probe_candidate on a candidate whose file was removed since the
-    snapshot raises ValueError and records no state — before any file open."""
+    snapshot raises StaleCandidateError and records no state — before any open."""
     import pytest
     a = _touch(tmp_path / "a.nxs")
     index = DirectoryIndex(tmp_path, clock=_FakeClock())
@@ -429,14 +450,14 @@ def test_r1r6_probe_candidate_rejects_a_removed_candidate(tmp_path):
     a.unlink()
     index.poll()   # candidate now removed from snapshot
 
-    with pytest.raises(ValueError):
+    with pytest.raises(StaleCandidateError):
         index.probe_candidate(candidate)
     assert index.retry_state(a) is None
 
 
 def test_r1r6_probe_candidate_rejects_a_reconfigured_away_candidate(tmp_path):
     """Gate 9: probe_candidate on a candidate filtered out by a reconfigure
-    (no longer in the snapshot) raises ValueError and records no state."""
+    (no longer in the snapshot) raises StaleCandidateError and records no state."""
     import pytest
     _touch(tmp_path / "sample_bg.nxs")
     index = DirectoryIndex(tmp_path, clock=_FakeClock())
@@ -447,7 +468,7 @@ def test_r1r6_probe_candidate_rejects_a_reconfigured_away_candidate(tmp_path):
     index.poll()
     assert index.snapshot.candidates == ()
 
-    with pytest.raises(ValueError):
+    with pytest.raises(StaleCandidateError):
         index.probe_candidate(candidate)
     assert index.retry_state(candidate.path) is None
 
@@ -483,9 +504,10 @@ def _widget_adapter(idn):
 
 def test_r1r7_late_completion_from_old_owner_is_rejected_after_owner_flip(tmp_path):
     """An owner flip A->B on unchanged bytes shares the stamp.  A late result
-    from A, delivered with A's Candidate identity, must be rejected: no retry
-    or terminal state created, returned unchanged.  A subsequent probe through
-    B then returns B's real result — not A's stale sticky verdict."""
+    from A, delivered with A's Candidate identity, must FAIL observably
+    (StaleCandidateError) — no retry/terminal state, and the stale result never
+    returned.  A subsequent probe through B then returns B's real result."""
+    import pytest
     with _isolated_adapters():
         register_adapter(_widget_adapter("owner_a"))
         p = tmp_path / "x.widget"
@@ -501,9 +523,8 @@ def test_r1r7_late_completion_from_old_owner_is_rejected_after_owner_flip(tmp_pa
 
         # A's late result, carrying A's identity (path+stamp+adapter_id):
         a_result = ProbeResult(ProbeState.READY, reason="owner_a late", kind=SourceKind.TILED)
-        effective = index.record_probe(cand_a, a_result)
-
-        assert effective is a_result                 # ignored, returned unchanged
+        with pytest.raises(StaleCandidateError):
+            index.record_probe(cand_a, a_result)   # A no longer owns the path
         assert index.retry_state(p) is None          # no window
         assert index._terminal.get(p) is None        # no sticky terminal
 
@@ -513,22 +534,63 @@ def test_r1r7_late_completion_from_old_owner_is_rejected_after_owner_flip(tmp_pa
         assert index.record_probe(cand_b, b_result).reason == "owner_b"
 
 
-def test_r1r7_record_probe_rejects_explicit_mismatched_adapter_id(tmp_path):
-    """The bare-path form gains an expected_adapter_id guard: a completion
-    tagged for an owner that is not the current owner creates no state."""
+def test_r1r7_record_probe_rejects_a_mismatched_adapter_identity(tmp_path):
+    """A completion whose adapter_id is not the current owner FAILS (no state).
+    Exercised via a stale Candidate carrying the old owner id."""
+    import pytest
     with _isolated_adapters():
         register_adapter(_widget_adapter("owner_b"))
         p = tmp_path / "x.widget"
         p.write_bytes(b"x")
         index = DirectoryIndex(tmp_path, clock=_FakeClock())
         index.poll()
-        assert index.snapshot.candidates[0].adapter_id == "owner_b"
+        current = index.snapshot.candidates[0]
+        assert current.adapter_id == "owner_b"
 
-        eff = index.record_probe(
-            p, ProbeResult(ProbeState.IN_PROGRESS, reason="from A"),
-            expected_adapter_id="owner_a")   # A is not the current owner
-        assert eff.reason == "from A"        # ignored
+        stale = Candidate(p, "owner_a", current.size, current.mtime_ns)  # wrong owner
+        with pytest.raises(StaleCandidateError):
+            index.record_probe(stale, ProbeResult(ProbeState.IN_PROGRESS, reason="from A"))
         assert index.retry_state(p) is None
+
+
+def test_r1r10_unguarded_bare_path_record_probe_is_rejected(tmp_path):
+    """R1-R10 gate: an unguarded record_probe(path, result) — a bare path with
+    no expected identity — must FAIL, closing the footgun while the API is
+    unshipped.  The safe forms (Candidate, or path + both expected_stamp and
+    expected_adapter_id) still work.  Self-isolated with its own adapter so it
+    never depends on ambient built-in registry state."""
+    import pytest
+    with _isolated_adapters():
+        register_adapter(_widget_adapter("only"))
+        p = tmp_path / "x.widget"
+        p.write_bytes(b"x")
+        index = DirectoryIndex(tmp_path, clock=_FakeClock())
+        index.poll()
+        cand = index.snapshot.candidates[0]
+        raw = ProbeResult(ProbeState.IN_PROGRESS, reason="w")
+
+        # unguarded bare path -> rejected
+        with pytest.raises(ValueError):
+            index.record_probe(p, raw)
+        # bare path with only ONE of the two identity kwargs -> still rejected
+        with pytest.raises(ValueError):
+            index.record_probe(p, raw, expected_stamp=cand.version_stamp)
+        with pytest.raises(ValueError):
+            index.record_probe(p, raw, expected_adapter_id=cand.adapter_id)
+        assert index.retry_state(p) is None
+
+        # safe form: bare path + BOTH kwargs matching the current candidate
+        eff = index.record_probe(
+            p, raw, expected_stamp=cand.version_stamp,
+            expected_adapter_id=cand.adapter_id)
+        assert eff.state is ProbeState.IN_PROGRESS
+        assert index.retry_state(p) is not None
+
+        # and the Candidate form works too
+        index2 = DirectoryIndex(tmp_path, clock=_FakeClock())
+        index2.poll()
+        assert index2.record_probe(
+            index2.snapshot.candidates[0], raw).state is ProbeState.IN_PROGRESS
 
 
 def test_r1r7_probe_candidate_still_works_for_a_current_candidate(tmp_path):
@@ -541,3 +603,45 @@ def test_r1r7_probe_candidate_still_works_for_a_current_candidate(tmp_path):
         index.poll()
         c = index.snapshot.candidates[0]
         assert index.probe_candidate(c).reason == "owner_a"
+
+
+def test_r1r10_toctou_flip_during_probe_raises_and_never_returns_stale_result(tmp_path):
+    """THE R1-R10 gate: ownership flips A->B WHILE A's probe() is running.  A's
+    probe registers B, polls, then returns READY.  probe_candidate must raise
+    StaleCandidateError and NEVER return A's stale READY to the caller — the
+    stale verdict must not escape the consumption boundary."""
+    import pytest
+    with _isolated_adapters():
+        box = {}
+
+        def a_probe(path):
+            # the race: ownership flips to B, and the index re-polls, WHILE A's
+            # probe is running (before A's result is recorded).
+            register_adapter(_widget_adapter("owner_b"))
+            box["index"].poll()
+            return ProbeResult(ProbeState.READY, reason="A stale READY",
+                               kind=SourceKind.TILED)
+
+        register_adapter(SourceFormatAdapter(
+            id="owner_a", kinds=(SourceKind.TILED,),
+            is_candidate=lambda p: p.suffix == ".widget",
+            scan_name=lambda p: p.stem, probe=a_probe, open=lambda spec: None))
+        (tmp_path / "x.widget").write_bytes(b"x")
+        index = DirectoryIndex(tmp_path, clock=_FakeClock())
+        box["index"] = index
+        cand_a = index.poll().candidates[0]
+        assert cand_a.adapter_id == "owner_a"
+
+        # probe_candidate passes A's pre-check, A's probe flips to B mid-run,
+        # then the post-probe record rejects A's completion.
+        with pytest.raises(StaleCandidateError):
+            index.probe_candidate(cand_a)
+
+        # no usable A result reached the caller; no state was created
+        assert index.retry_state(cand_a.path) is None
+        assert index._terminal.get(cand_a.path) is None
+
+        # the new B candidate subsequently returns B's result
+        cand_b = index.snapshot.candidates[0]
+        assert cand_b.adapter_id == "owner_b"
+        assert index.probe_candidate(cand_b).reason == "owner_b"

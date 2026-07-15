@@ -61,6 +61,21 @@ _PROVISIONAL_STATES = frozenset({ProbeState.IN_PROGRESS, ProbeState.IMAGELESS})
 DEFAULT_RETRY_DEADLINE = 30.0
 
 
+class StaleCandidateError(ValueError):
+    """A probe completion no longer matches the current candidate identity.
+
+    Raised by :meth:`DirectoryIndex.record_probe` /
+    :meth:`DirectoryIndex.probe_candidate` when a result's path, version stamp,
+    or owning ``adapter_id`` no longer matches the index's current snapshot —
+    the candidate was removed, its bytes changed, or a registration flip
+    changed its owning adapter since the probe began (R1-R10).  A
+    :class:`ValueError` subclass so existing ``except ValueError`` handling
+    still catches it, while a caller that wants to re-poll and re-probe the new
+    owner can catch it by type.  The stale result is NEVER returned as an
+    effective verdict: the failure is observable at the consumption boundary so
+    a caller cannot act on an old owner's stale ``READY``."""
+
+
 @dataclass(frozen=True, slots=True)
 class RetryState:
     """Bounded-retry bookkeeping for one provisional candidate.
@@ -276,30 +291,34 @@ class DirectoryIndex:
                       expected_adapter_id: str | None = None,
                       retry_deadline: float | None = None) -> ProbeResult:
         """Record an explicit probe result for a candidate and return the
-        EFFECTIVE result a caller should treat it as.
+        EFFECTIVE result a caller should treat as current.
 
         *target* is the candidate the *result* was computed for.  Pass the
         immutable :class:`~xrd_tools.sources.discover.Candidate` (preferred):
-        its full identity — path, ``adapter_id``, and stamp — is validated
-        against the current snapshot, so a late result cannot be misattributed.
-        A bare ``str``/``Path`` is the narrow same-owner compatibility form
-        (only ``expected_stamp``/``expected_adapter_id`` kwargs, both optional,
-        constrain it); use it only when no adapter-owner change can race the
-        probe, or pass ``expected_adapter_id`` to be safe.
+        its full identity — path, ``adapter_id``, and stamp — is checked
+        against the current snapshot.  A bare ``str``/``Path`` is accepted ONLY
+        with BOTH ``expected_stamp`` and ``expected_adapter_id`` supplied; an
+        unguarded ``record_probe(path, result)`` raises :class:`ValueError`,
+        because it cannot verify the completion belongs to the current owner
+        (R1-R10).
 
         DirectoryIndex never calls a probe itself — this is how a caller
         (having just called the candidate's adapter ``probe`` callable) tells
         the index what it found, so the index can apply the bounded-readiness
         policy on top:
 
-        * a result whose full identity does NOT match a current candidate —
-          the path absent from the snapshot, or (when given) a ``stamp`` or
-          ``adapter_id`` that no longer matches the current candidate — is a
-          stale or unknown late completion.  It is IGNORED: returned unchanged,
-          with NO retry or terminal state created (R1-R6, R1-R7).  The
-          ``adapter_id`` check catches a late result from an OLD owner after a
-          registration flip left the path's bytes (and thus its stamp)
-          unchanged — a case the stamp check alone cannot see;
+        * a completion whose full identity does NOT match a current candidate —
+          the path absent from the snapshot, or a ``stamp``/``adapter_id`` that
+          no longer matches the current candidate (a removal, a byte change, or
+          a registration flip that changed the owner while the probe ran) — is
+          a STALE completion.  It RAISES :class:`StaleCandidateError` and
+          creates NO retry or terminal state (R1-R6, R1-R7, R1-R10).  The stale
+          result is never returned as an effective verdict: the failure is
+          observable at the consumption boundary, so a caller cannot act on an
+          old owner's stale ``READY`` — it must re-poll and re-probe the new
+          owner.  The ``adapter_id`` check catches a late result from an OLD
+          owner after a flip left the bytes (and thus the stamp) unchanged — a
+          case the stamp check alone cannot see;
         * a stamp already resolved to a TERMINAL verdict returns that sticky
           verdict without reopening a window (R1-R1);
         * a terminal result (READY / PROCESSED_OUTPUT / INVALID) resolves the
@@ -326,20 +345,32 @@ class DirectoryIndex:
             expected_adapter_id = target.adapter_id
         else:
             path = Path(target)
+            # R1-R10: an unguarded bare-path recording cannot verify the
+            # completion belongs to the current owner — forbid it outright.
+            if expected_stamp is None or expected_adapter_id is None:
+                raise ValueError(
+                    "record_probe requires a Candidate, or BOTH expected_stamp and "
+                    "expected_adapter_id for a bare path; an unguarded "
+                    "record_probe(path, result) cannot verify the completion belongs "
+                    "to the current candidate owner")
         deadline = self._retry_deadline if retry_deadline is None else retry_deadline
         candidate = self._snapshot.by_path().get(path)
 
-        # R1-R6/R1-R7: unknown/stale completion — never create state for a path
-        # the index does not currently own, for a stamp that has moved on, or
-        # for a result computed under a DIFFERENT owning adapter (an owner flip
-        # that left the bytes/stamp unchanged).
+        # R1-R6/R1-R7/R1-R10: a stale/unknown completion FAILS observably (no
+        # state created, stale result never returned) — never silently ignored,
+        # so probe_candidate cannot forward an old owner's verdict as current.
         if candidate is None:
-            return result
+            raise StaleCandidateError(
+                f"{path} is not a current candidate (removed or never discovered)")
         stamp = candidate.version_stamp
-        if expected_stamp is not None and expected_stamp != stamp:
-            return result
-        if expected_adapter_id is not None and expected_adapter_id != candidate.adapter_id:
-            return result
+        if expected_stamp != stamp:
+            raise StaleCandidateError(
+                f"{path} version stamp changed since the probe began "
+                "(bytes changed); re-poll and re-probe")
+        if expected_adapter_id != candidate.adapter_id:
+            raise StaleCandidateError(
+                f"{path} owning adapter changed from {expected_adapter_id!r} to "
+                f"{candidate.adapter_id!r} since the probe began; re-poll and re-probe")
 
         # R1-R1: a stamp already resolved terminally stays terminal — no new
         # window.  poll() clears this on any change/removal for the path.
@@ -405,16 +436,23 @@ class DirectoryIndex:
 
         Rejects a STALE *candidate* object — one whose path/adapter/stamp no
         longer matches the current snapshot (removed, byte-changed, or
-        owner-flipped since it was enumerated) — with a :class:`ValueError`,
-        BEFORE opening the file, so a late consumer of an old snapshot never
-        probes or records state for a candidate the index no longer owns
-        (R1-R6).
+        owner-flipped since it was enumerated) — with a
+        :class:`StaleCandidateError`, BEFORE opening the file, so a late
+        consumer of an old snapshot never probes a candidate the index no
+        longer owns (R1-R6).
+
+        The SAME failure is re-raised at the record step if ownership flips
+        while the adapter's ``probe`` is running (a TOCTOU race): the stale
+        result is NEVER returned as an effective verdict, so a processing
+        caller can never act on an old owner's stale ``READY`` — it must
+        catch :class:`StaleCandidateError`, re-poll, and probe the new owner
+        (R1-R10).
         """
         current = self._snapshot.by_path().get(candidate.path)
         if (current is None
                 or current.version_stamp != candidate.version_stamp
                 or current.adapter_id != candidate.adapter_id):
-            raise ValueError(
+            raise StaleCandidateError(
                 f"stale candidate {candidate.path} no longer matches the current "
                 "snapshot; re-poll before probing")
         from xrd_tools.sources.adapters import get_adapter
@@ -424,7 +462,8 @@ class DirectoryIndex:
         raw = adapter.probe(candidate.path)
         # Pass the full Candidate so record_probe re-validates path+stamp+
         # adapter_id — a concurrent owner flip between this freshness check and
-        # the record is still caught (R1-R7).
+        # the record raises StaleCandidateError rather than returning A's stale
+        # result (R1-R7 kept state clean; R1-R10 makes the failure observable).
         return self.record_probe(candidate, raw, retry_deadline=retry_deadline)
 
     def poll_forever(self, *, interval: float,
@@ -457,4 +496,5 @@ __all__ = [
     "IndexDelta",
     "RetryState",
     "Snapshot",
+    "StaleCandidateError",
 ]

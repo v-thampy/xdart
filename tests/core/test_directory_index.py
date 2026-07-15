@@ -281,7 +281,8 @@ def test_r1r3_owner_change_on_unchanged_bytes_emits_one_changed_delta(tmp_path):
 
         # open a provisional window on the path so we can prove it is cleared
         p = tmp_path / "x.widget"
-        index.record_probe(p, ProbeResult(ProbeState.IN_PROGRESS, reason="w"))
+        index.record_probe(first.candidates[0],
+                           ProbeResult(ProbeState.IN_PROGRESS, reason="w"))
         assert index.retry_state(p) is not None
 
         # flip ownership with NO byte change (last-registered external wins)
