@@ -97,6 +97,8 @@ _EXPORTS = {
         "xrd_tools.analysis.time_resolved", "temperature_rate"),
     "add_temperature_results": (
         "xrd_tools.analysis.time_resolved", "add_temperature_results"),
+    "export_time_resolved_results": (
+        "xrd_tools.analysis.time_resolved", "export_time_resolved_results"),
 }
 
 __all__ = sorted(_EXPORTS)

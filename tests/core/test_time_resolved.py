@@ -14,6 +14,7 @@ from xrd_tools.analysis.time_resolved import (
     add_temperature_results,
     bin_time_resolved,
     discover_processed_scans,
+    export_time_resolved_results,
     fit_peak_series,
     flag_fit_quality,
     flag_normalization_outliers,
@@ -282,3 +283,11 @@ def test_peak_series_lattice_temperature_and_rate(tmp_path):
         fit_peak_series(ds, plan, pattern_indices=[])
     with pytest.raises(IndexError, match="out-of-range"):
         fit_peak_series(ds, plan, pattern_indices=[len(ds.pattern)])
+
+    paths = export_time_resolved_results(
+        thermal,
+        netcdf_path=tmp_path / "results.nc",
+        csv_path=tmp_path / "results.csv",
+    )
+    assert paths["netcdf"].is_file() and paths["csv"].is_file()
+    assert "center_0" in (tmp_path / "results.csv").read_text()

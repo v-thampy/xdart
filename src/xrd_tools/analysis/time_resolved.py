@@ -45,6 +45,7 @@ __all__ = [
     "add_lattice_results",
     "temperature_rate",
     "add_temperature_results",
+    "export_time_resolved_results",
 ]
 
 
@@ -1142,3 +1143,73 @@ def add_temperature_results(
         if "temperature_error_K" in out else "not available from this calibration/result"
     )
     return out
+
+
+def _json_attr(value: Any) -> Any:
+    """Convert an xarray attribute to a NetCDF-safe scalar or JSON string."""
+    if isinstance(value, (str, int, float, np.number, bool)):
+        return value
+    return json.dumps(value, default=str, sort_keys=True)
+
+
+def _netcdf_safe_copy(dataset: xr.Dataset) -> xr.Dataset:
+    """Return a shallow result copy whose attrs can be persisted by xarray."""
+    out = dataset.copy(deep=False)
+    out.attrs = {key: _json_attr(value) for key, value in out.attrs.items()}
+    for variable in out.variables.values():
+        variable.attrs = {key: _json_attr(value) for key, value in variable.attrs.items()}
+    return out
+
+
+def export_time_resolved_results(
+    dataset: xr.Dataset,
+    *,
+    netcdf_path: str | Path | None = None,
+    csv_path: str | Path | None = None,
+    scalar_vars: Sequence[str] | None = None,
+) -> dict[str, Path]:
+    """Explicitly export compact time-resolved results as NetCDF and/or CSV.
+
+    The caller chooses every output path.  This function never reads or copies
+    raw detector frames or 2-D cakes; it only persists the xarray result that
+    the analysis has already constructed.  CSV contains scalar variables on a
+    single ``pattern`` or ``fit_pattern`` axis, while NetCDF retains compact
+    fit/background/residual curves and serializable provenance attrs.
+    """
+    if netcdf_path is None and csv_path is None:
+        raise ValueError("choose netcdf_path and/or csv_path")
+    paths: dict[str, Path] = {}
+    if netcdf_path is not None:
+        path = Path(netcdf_path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        export = _netcdf_safe_copy(dataset)
+        export.attrs.setdefault("export_kind", "time_resolved_compact_results")
+        export.to_netcdf(path)
+        paths["netcdf"] = path
+
+    if csv_path is not None:
+        import pandas as pd
+
+        path = Path(csv_path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        dimensions = [dim for dim in ("fit_pattern", "pattern") if dim in dataset.sizes]
+        if not dimensions:
+            raise ValueError("dataset needs a pattern or fit_pattern dimension for CSV export")
+        dim = dimensions[0]
+        names = list(scalar_vars) if scalar_vars is not None else [
+            name for name, var in dataset.data_vars.items() if var.dims == (dim,)
+        ]
+        missing = [name for name in names if name not in dataset]
+        if missing:
+            raise KeyError(f"dataset has no requested scalar variables: {missing}")
+        columns: dict[str, Any] = {}
+        for name, coord in dataset.coords.items():
+            if coord.dims == (dim,):
+                columns[name] = np.asarray(coord.values)
+        for name in names:
+            if dataset[name].dims != (dim,):
+                raise ValueError(f"{name!r} is not scalar on {dim!r}")
+            columns[name] = np.asarray(dataset[name].values)
+        pd.DataFrame(columns).to_csv(path, index=False)
+        paths["csv"] = path
+    return paths
