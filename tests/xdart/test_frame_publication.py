@@ -1513,6 +1513,73 @@ def test_browse_one_shot_anchor_supplies_2d_while_plot_uses_full_selection():
     assert payload.cake_image is not None
 
 
+def test_overlay_missing_anchor_hydrates_and_renders_last_selected_2d():
+    from threading import RLock
+
+    from xdart.gui.tabs.static_scan.display_controllers import ScanDisplayController
+
+    store = PublicationStore(max_items=None, max_heavy_items=1)
+    publications = {}
+    for idx in range(1, 4):
+        publications[idx] = publication_from_live_frame(
+            DuckFrame(idx=idx),
+            include_2d=False,
+            include_thumbnail=False,
+            retain_raw_ref=False,
+        )
+        store.upsert(publications[idx])
+
+    requested = []
+    widget = _int_widget()
+    widget.viewer_mode = None
+    widget.frame_ids = ["1", "2", "3"]
+    widget.publication_store = store
+    widget._browse_one_shot_target_labels = (1, 2, 3)
+    widget._browse_one_shot_publications = publications
+    widget._browse_one_shot_anchor_label = 3
+    widget._request_frame_hydration = (
+        lambda label, *, purpose="full": requested.append((int(label), purpose)))
+    widget.scan = SimpleNamespace(
+        name="scan",
+        gi=False,
+        scan_lock=RLock(),
+        frames=SimpleNamespace(index=[1, 2, 3]),
+    )
+    widget.ui.plotMethod = SimpleNamespace(currentText=lambda: "Overlay")
+    widget.overlaid_idxs = ()
+    widget.display_generation = store.generation
+    widget._raw_full_shape = None
+
+    controller = ScanDisplayController()
+    state = controller.compute_state(widget, Mode.INT_2D)
+
+    assert state.render_ids == (1, 2, 3)
+    assert {label for label, _purpose in requested} == {3}
+    assert {purpose for _label, purpose in requested} == {"full"}
+
+    anchor = DuckFrame(idx=3)
+    anchor.map_raw = np.full((4, 4), 3.0)
+    anchor.thumbnail = np.full((2, 2), 3.0)
+    anchor.int_2d = IntegrationResult2D(
+        radial=anchor.int_2d.radial,
+        azimuthal=anchor.int_2d.azimuthal,
+        intensity=np.full(anchor.int_2d.intensity.shape, 3.0),
+        unit=anchor.int_2d.unit,
+        azimuthal_unit=anchor.int_2d.azimuthal_unit,
+    )
+    store.upsert(publication_from_live_frame(anchor, include_raw=True))
+
+    state = controller.compute_state(widget, Mode.INT_2D)
+    payload = controller.build_payload(widget, state)
+
+    assert payload.plot is not None
+    assert len(payload.plot.traces) == 3
+    assert payload.raw_image is not None
+    assert payload.cake_image is not None
+    np.testing.assert_allclose(payload.raw_image.image, 0.03)
+    np.testing.assert_allclose(payload.cake_image.image, 0.03)
+
+
 def test_overlay_payload_appends_stale_hydrated_selection_queue_in_order():
     # max_heavy_items=None: this test needs all 21 frames RESIDENT (has_1d).
     # The default heavy window is RAM-aware (staging.heavy_window: <16 GiB -> 16),

@@ -92,6 +92,18 @@ def _label_keys(labels):
     return tuple(keys)
 
 
+def _publication_tiers(publication):
+    view = getattr(publication, "view", None)
+    return (
+        bool(getattr(view, "has_1d", False)),
+        bool(getattr(view, "has_2d", False)),
+        bool(
+            getattr(view, "raw", None) is not None
+            or getattr(view, "thumbnail", None) is not None
+        ),
+    )
+
+
 def _candidate_labels(mode, selected_ids, all_frame_index):
     """Labels whose availability can affect this render.
 
@@ -322,6 +334,28 @@ def _browse_one_shot_publication_items(widget, labels):
         publication = snapshot.get(label)
         if publication is not None:
             items[label] = publication
+    # The bulk browse snapshot intentionally carries lightweight 1D rows.  A
+    # representative-frame hydration completes into the authoritative store,
+    # so refresh only that anchor when the store now has a strict data-tier
+    # superset.  Without this O(1) replacement, Overlay kept rendering the
+    # stale 1D-only snapshot and raw/cake stayed blank after hydration.
+    anchor = _browse_one_shot_anchor_label(widget, labels)
+    store = getattr(widget, "publication_store", None)
+    get = getattr(store, "get", None)
+    if anchor is not None and callable(get):
+        try:
+            candidate = get(anchor)
+        except Exception:
+            candidate = None
+        existing = items.get(anchor)
+        if candidate is not None:
+            old_tiers = _publication_tiers(existing)
+            new_tiers = _publication_tiers(candidate)
+            if existing is None or (
+                new_tiers != old_tiers
+                and all(not old or new for old, new in zip(old_tiers, new_tiers))
+            ):
+                items[anchor] = candidate
     return items
 
 
@@ -497,8 +531,11 @@ class _BaseController:
             labels=snapshot_labels,
             two_d_labels=two_d_labels,
             include_legacy=mode not in (Mode.INT_1D, Mode.INT_2D),
-            request_2d_hydration=(
-                not aggregate_owns_2d and browse_anchor is None),
+            # ``two_d_labels`` is already narrowed to the representative browse
+            # anchor for Single/Overlay/Waterfall.  Keep hydration enabled for
+            # that one frame so raw + cake can follow the latest selection even
+            # when the bulk one-shot snapshot contains only lightweight 1D rows.
+            request_2d_hydration=not aggregate_owns_2d,
         )
         return compute_display_state(
             mode=mode,
