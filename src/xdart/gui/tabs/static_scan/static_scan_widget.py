@@ -92,6 +92,40 @@ def _processed_count_for_output(thread, output_file, run_total):
     return None
 
 
+def _last_processed_output_file(thread, fallback=None):
+    """Return the last output that actually accepted a frame this run.
+
+    A live Directory worker can discover and initialize scan N+1 before Stop
+    lands even though scan N supplied the last processed frame.  ``thread.fname``
+    then names an empty ahead-of-data file.  The per-output accounting map is
+    insertion ordered and records only successful dispatches, so its final
+    positive entry is the authoritative run-end display target.
+    """
+    counts = None
+    for attr in ("files_processed_by_output",
+                 "_last_files_processed_by_output"):
+        value = getattr(thread, attr, None)
+        if value is not None:
+            counts = value
+            break
+    try:
+        items = counts.items()
+    except AttributeError:
+        return fallback
+
+    last = None
+    for path, value in items:
+        try:
+            if int(value) <= 0:
+                continue
+            candidate = os.fspath(path)
+        except (TypeError, ValueError):
+            continue
+        if os.path.exists(candidate):
+            last = candidate
+    return last or fallback
+
+
 def _finished_output_file(thread, wrangler, *, all_skipped_append=False):
     """Resolve the existing processed output owned by a completed run.
 
@@ -7698,8 +7732,18 @@ class staticWidget(QWidget):
         # when the run saw 0 frames (the append-feedback branch already reloaded).
         if (not is_batch and not is_xye_only and not _reintegrate_running
                 and getattr(self, '_run_saw_frame', True)):
-            written = (getattr(self.wrangler.thread, 'fname', None)
-                       or getattr(self.wrangler, 'fname', None))
+            worker_output = (getattr(self.wrangler.thread, 'fname', None)
+                             or getattr(self.wrangler, 'fname', None))
+            written = _last_processed_output_file(thread, worker_output)
+            try:
+                restore_processed_output = (
+                    written is not None
+                    and worker_output is not None
+                    and os.path.normcase(os.path.abspath(os.fspath(written)))
+                    != os.path.normcase(os.path.abspath(os.fspath(worker_output)))
+                )
+            except (TypeError, ValueError):
+                restore_processed_output = False
             output_processed_count = _processed_count_for_output(
                 thread,
                 written,
@@ -7709,6 +7753,8 @@ class staticWidget(QWidget):
                 logger,
                 "runend_wrangler_before_live_reconcile",
                 written_file=written,
+                worker_output=worker_output,
+                restore_processed_output=restore_processed_output,
                 processed_count=processed_count,
                 output_processed_count=output_processed_count,
                 **_runend_waterfall_history_fields(
@@ -7734,6 +7780,20 @@ class staticWidget(QWidget):
                 )
             if indexed:
                 self._apply_integration_control_state()
+            if restore_processed_output and written and os.path.exists(written):
+                # Stop can catch Directory mode after it initialized the next
+                # scan but before that scan processed a frame.  Reconciliation
+                # above restores the final positive output's frame labels
+                # immediately; force one idle-file reload as well so raw/cake
+                # hydrate from that same file instead of the empty ahead scope.
+                logger.info(
+                    "post-live: restoring last processed output %s "
+                    "(worker ended at unprocessed %s)",
+                    os.path.basename(written),
+                    os.path.basename(worker_output),
+                )
+                self.h5viewer._auto_select_last_on_finish = True
+                self.h5viewer.set_file(written, internal=True)
             # scans_select_after_run: update_scans' select-by-scan_name path ran at
             # scan START (before <name>.nxs existed), so the Scans panel kept the
             # PRIOR scan highlighted.  Re-select the finished scan by the file just

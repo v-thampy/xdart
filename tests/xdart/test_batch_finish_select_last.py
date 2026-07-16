@@ -173,6 +173,28 @@ def test_nonbatch_run_that_saw_frames_does_not_reload(tmp_path):
         f"post-live should populate scan.frames once from the .nxs; got {host._loaded_paths}"
 
 
+def test_directory_stop_restores_last_positive_output_when_worker_is_ahead(tmp_path):
+    """Stop may land after Directory mode opened scan N+1 but before a frame.
+
+    The Frames panel and raw/cake must follow scan N, the last output with a
+    successful dispatch, rather than reconciling the empty ahead-of-data file.
+    """
+    host, h5viewer, last_output, calls = _finish_host(
+        tmp_path, batch=False, saw_frame=True, indexed_count=1)
+    ahead = tmp_path / "scan_next.nxs"
+    ahead.write_bytes(b"")
+    host.wrangler.thread.fname = str(ahead)
+    host.wrangler.thread.files_processed_by_output = {last_output: 1}
+    host.wrangler.thread._last_files_processed_by_output = {last_output: 1}
+
+    host.wrangler_finished()
+
+    assert host._loaded_paths == [last_output]
+    assert calls == [(last_output, True)]
+    assert h5viewer._auto_select_last_on_finish is True
+    assert h5viewer.scan_name == "scan"
+
+
 def test_post_live_warns_when_indexed_less_than_processed(tmp_path, caplog):
     host, _h5viewer, nxs, _calls = _finish_host(
         tmp_path, batch=False, saw_frame=True)
