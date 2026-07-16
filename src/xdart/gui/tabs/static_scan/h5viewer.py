@@ -77,7 +77,12 @@ from .viewer_raw_lru import (
     remember_viewer_raw_lru,
 )
 from .scan_threads import fileHandlerThread
-from .browse_debug import browse_debug_log, sequence_summary
+from .browse_debug import (
+    browse_debug_enabled,
+    browse_debug_log,
+    sequence_summary,
+    widget_selection_summary,
+)
 from .display_logic import xye_unit_from_filename
 from .display_controllers import ImageViewerController
 from xrd_tools.io import ImageSourceKind
@@ -195,6 +200,10 @@ def _browse_debug_mode(viewer) -> str:
         return str(viewer.ui.plotMethod.currentText())
     except Exception:
         return str(getattr(viewer, "_plot_method", ""))
+
+
+def _browse_ui_debug(viewer):
+    return widget_selection_summary(viewer) if browse_debug_enabled() else None
 
 
 def _current_selected_frame_label(viewer, candidates=()):
@@ -1497,15 +1506,18 @@ class H5Viewer(QWidget):
             _qt_enum_value(QtCore.Qt.Key_End),
         }
 
-    def _begin_browse_gesture(self) -> None:
+    def _begin_browse_gesture(self, *, key=None) -> None:
         self._browse_gesture_active = True
         self._browse_pending_data_changed = False
+        self._browse_auto_repeat_count = 0
         browse_debug_log(
             logger,
             "gesture_begin",
             trigger_source="arrow-press",
+            key=key,
             mode=_browse_debug_mode(self),
-            selected=sequence_summary(getattr(self, "frame_ids", ())),
+            committed=sequence_summary(getattr(self, "frame_ids", ())),
+            ui=_browse_ui_debug(self),
         )
         for attr in (
             "_selection_coalesce_timer",
@@ -1526,7 +1538,9 @@ class H5Viewer(QWidget):
             "gesture_settle",
             trigger_source="arrow-release",
             mode=_browse_debug_mode(self),
-            selected=sequence_summary(getattr(self, "frame_ids", ())),
+            committed=sequence_summary(getattr(self, "frame_ids", ())),
+            ui=_browse_ui_debug(self),
+            auto_repeat_count=getattr(self, "_browse_auto_repeat_count", 0),
         )
         self.data_changed()
 
@@ -1565,7 +1579,11 @@ class H5Viewer(QWidget):
                 # Shift+arrows: OS repeat intervals can exceed the 100 ms
                 # fallback debounce and otherwise launch intermediate loads.
                 if not getattr(self, "_browse_gesture_active", False):
-                    H5Viewer._begin_browse_gesture(self)
+                    H5Viewer._begin_browse_gesture(self, key=key)
+                elif is_auto_repeat:
+                    self._browse_auto_repeat_count = (
+                        getattr(self, "_browse_auto_repeat_count", 0) + 1
+                    )
                 return True
             return False
 
@@ -2664,6 +2682,10 @@ class H5Viewer(QWidget):
             load_generation=getattr(self, "_load_generation", None),
             selected=sequence_summary(
                 labels if labels is not None else getattr(self, "frame_ids", ())),
+            ui=_browse_ui_debug(self),
+            anchor=getattr(self, "_browse_one_shot_anchor_label", None),
+            browse_one_shot_pending=bool(getattr(
+                self, "_browse_one_shot_pending_render", False)),
             granted=bool(granted),
             suppressed_by=suppressed_by,
         )
@@ -2942,7 +2964,8 @@ class H5Viewer(QWidget):
                 requestor="h5viewer.selection_changed",
                 mode=_browse_debug_mode(self),
                 generation=getattr(self, "_load_generation", None),
-                selected=sequence_summary(getattr(self, "frame_ids", ())),
+                committed=sequence_summary(getattr(self, "frame_ids", ())),
+                ui=_browse_ui_debug(self),
                 granted=False,
                 suppressed_by="active_browse_gesture",
             )
@@ -3059,6 +3082,7 @@ class H5Viewer(QWidget):
             trigger_source="Show All" if show_all else "debounce",
             mode=_browse_debug_mode(self),
             selected=sequence_summary(int_idxs),
+            ui=_browse_ui_debug(self),
         )
         if not int_idxs:
             emit_render = getattr(self, "_emit_render_update", None)

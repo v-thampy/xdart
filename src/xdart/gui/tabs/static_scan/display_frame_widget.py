@@ -14,6 +14,7 @@ update orchestration, viewer modes, and 2D image rendering.
 import logging
 import os
 import re
+import sys
 import threading
 import time
 from collections import deque
@@ -21,6 +22,15 @@ from collections import deque
 logger = logging.getLogger(__name__)
 _HYDRATION_FAILURE_LIMIT = 3
 _HYDRATION_FAILURE_TTL_SECONDS = 30.0
+
+
+def _browse_debug_caller_name():
+    if not browse_debug_enabled():
+        return None
+    try:
+        return sys._getframe(2).f_code.co_name
+    except Exception:
+        return None
 
 # Other imports
 import matplotlib.pyplot as plt
@@ -65,7 +75,12 @@ from .display_logic import (
     ConsumerKind, SupersedeReason,
 )
 from .display_controllers import register_default_controllers
-from .browse_debug import browse_debug_enabled, browse_debug_log, sequence_summary
+from .browse_debug import (
+    browse_debug_enabled,
+    browse_debug_log,
+    image_payload_summary,
+    sequence_summary,
+)
 from .display_overlay_utils import (
     current_scan_key as overlay_current_scan_key,
     current_axis_info as overlay_current_axis_info,
@@ -2224,6 +2239,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             accumulator_row_count=history_count,
             has_raw=bool(getattr(payload, "raw_image", None) is not None),
             has_cake=bool(getattr(payload, "cake_image", None) is not None),
+            raw_payload=image_payload_summary(getattr(payload, "raw_image", None)),
+            cake_payload=image_payload_summary(getattr(payload, "cake_image", None)),
+            idxs_2d=sequence_summary(getattr(self, "idxs_2d", ())),
+            raw_panel_has_data=bool(
+                state.panel(PanelRole.RAW_2D)
+                and state.panel(PanelRole.RAW_2D).has_data),
+            cake_panel_has_data=bool(
+                state.panel(PanelRole.CAKE_2D)
+                and state.panel(PanelRole.CAKE_2D).has_data),
         )
         if selected_count and plot_payload is not None and len(plot_traces) == 0:
             browse_debug_log(
@@ -2434,6 +2458,17 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def _draw_image_payload(self, role, payload, state=None):
         data = np.asarray(payload.image, dtype=float)
         if data.ndim != 2 or data.size == 0 or not np.isfinite(data).any():
+            browse_debug_log(
+                logger,
+                "panel_pixels",
+                generation=getattr(state, "generation", None),
+                role=getattr(role, "value", str(role)),
+                action="clear_invalid_payload",
+                shape=list(data.shape),
+                ndim=int(data.ndim),
+                size=int(data.size),
+                finite=bool(np.isfinite(data).any()) if data.size else False,
+            )
             if role is PanelRole.RAW_2D:
                 self.clear_image_view()
             else:
@@ -2461,9 +2496,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         rect = get_rect(x, y)
         widget = self.image_widget if role is PanelRole.RAW_2D else self.binned_widget
         display_data = _downsample_for_display(image, widget)
+        level_scan_token = self._image_level_scan_token(role=role, state=state)
         widget.setImage(
             display_data, scale=self.scale, cmap=self.cmap,
-            level_scan_token=self._image_level_scan_token(role=role, state=state),
+            level_scan_token=level_scan_token,
             # Detector previews retain the ceiling-safe 2/98 policy. Cakes do
             # not contain detector saturation sentinels; 98% clipped real peak
             # area too aggressively and made browsed cakes look oversaturated.
@@ -2525,6 +2561,23 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             _sso = getattr(self, 'show_slice_overlay', None)
             if _sso is not None:
                 _sso()
+        browse_debug_log(
+            logger,
+            "panel_pixels",
+            generation=getattr(state, "generation", None),
+            role=getattr(role, "value", str(role)),
+            action="paint",
+            source_shape=list(data.shape),
+            display_shape=list(np.shape(display_data)),
+            rect=(
+                [float(rect.x()), float(rect.y()),
+                 float(rect.width()), float(rect.height())]
+                if browse_debug_enabled() else None
+            ),
+            level_scan_token=level_scan_token,
+            scale=self.scale,
+            cmap=self.cmap,
+        )
         return True
 
     def _draw_stitch_plot(self, plot_payload):
@@ -3162,6 +3215,21 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         draw/clear methods; the *decision* lives in render_plan.
         """
         plan = render_plan(state, payload)
+        browse_debug_log(
+            logger,
+            "render_plan",
+            generation=getattr(state, "generation", None),
+            mode=str(getattr(state, "method", "")),
+            selected=sequence_summary(getattr(state, "selected_ids", ())),
+            render_ids=sequence_summary(getattr(state, "render_ids", ())),
+            draw=[getattr(role, "value", str(role)) for role in plan.draw],
+            clear=[getattr(role, "value", str(role)) for role in plan.clear],
+            drop=bool(plan.drop),
+            raw_payload=image_payload_summary(
+                getattr(payload, "raw_image", None) if payload is not None else None),
+            cake_payload=image_payload_summary(
+                getattr(payload, "cake_image", None) if payload is not None else None),
+        )
         if plan.drop:
             # Payload computed against a superseded generation — never render
             # it over the current state (§8 generation invariant).
@@ -3208,6 +3276,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         for role in plan.clear:
             clear = self._clear_delegate(role)
             if clear is not None:
+                browse_debug_log(
+                    logger,
+                    "panel_action",
+                    generation=getattr(state, "generation", None),
+                    role=getattr(role, "value", str(role)),
+                    action="clear",
+                    reason="render_plan_clear",
+                )
                 clear()
 
         # Draw the panels it does want.  Exception handling matches the
@@ -3217,14 +3293,45 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         is_viewer = mode in (Mode.IMAGE_VIEWER, Mode.XYE_VIEWER, Mode.NEXUS_VIEWER)
         for role in plan.draw:
             payload_value = self._payload_for_role(role, payload)
-            if payload_value is not None and self._draw_payload(role, payload_value, state):
-                continue
+            if payload_value is not None:
+                handled = self._draw_payload(role, payload_value, state)
+                browse_debug_log(
+                    logger,
+                    "panel_action",
+                    generation=getattr(state, "generation", None),
+                    role=getattr(role, "value", str(role)),
+                    action="draw_payload" if handled else "payload_unhandled",
+                    payload=(
+                        image_payload_summary(payload_value)
+                        if role in (PanelRole.RAW_2D, PanelRole.CAKE_2D)
+                        else {"present": True}
+                    ),
+                )
+                if handled:
+                    continue
             if role is PanelRole.PLOT_1D:
                 self._payload_x_axis_label = None
                 self._payload_y_axis_label = None
             draw = self._draw_delegate(role, mode)
             if draw is None:
+                browse_debug_log(
+                    logger,
+                    "panel_action",
+                    generation=getattr(state, "generation", None),
+                    role=getattr(role, "value", str(role)),
+                    action="keep_previous",
+                    reason="missing_payload_no_delegate",
+                )
                 continue
+            browse_debug_log(
+                logger,
+                "panel_action",
+                generation=getattr(state, "generation", None),
+                role=getattr(role, "value", str(role)),
+                action="fallback_delegate",
+                reason="missing_or_unhandled_payload",
+                delegate=getattr(draw, "__name__", type(draw).__name__),
+            )
             try:
                 draw()
             except TypeError:
@@ -4756,6 +4863,19 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def clear_image_view(self):
         """Blank the raw 2D image panel."""
         try:
+            browse_debug_log(
+                logger,
+                "panel_pixels",
+                generation=getattr(self, "display_generation", None),
+                role=PanelRole.RAW_2D.value,
+                action="clear",
+                caller=_browse_debug_caller_name(),
+                selected=(
+                    sequence_summary(getattr(self, "frame_ids", ()))
+                    if browse_debug_enabled() else None
+                ),
+                had_image=getattr(self, "image_data", None) is not None,
+            )
             self.image_data = None
             self._clear_image_widget(self.image_widget)
         except Exception:
@@ -4764,6 +4884,19 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def clear_binned_view(self):
         """Blank the 2D cake panel."""
         try:
+            browse_debug_log(
+                logger,
+                "panel_pixels",
+                generation=getattr(self, "display_generation", None),
+                role=PanelRole.CAKE_2D.value,
+                action="clear",
+                caller=_browse_debug_caller_name(),
+                selected=(
+                    sequence_summary(getattr(self, "frame_ids", ()))
+                    if browse_debug_enabled() else None
+                ),
+                had_image=getattr(self, "binned_data", None) is not None,
+            )
             self.binned_data = None
             # V3: a blanked cake has no rendered identity — drop the stash so
             # _current_image_axis_key falls back to the documented intent

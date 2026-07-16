@@ -32,6 +32,55 @@ def sequence_summary(values, *, limit: int = 6) -> dict:
     }
 
 
+def widget_selection_summary(widget) -> dict:
+    """Snapshot the real Qt current/selected rows for a browse trace."""
+    try:
+        list_data = widget.ui.listData
+    except Exception:
+        return {"current": None, "selected": sequence_summary(())}
+
+    try:
+        current = list_data.currentItem()
+        current = current.text() if current is not None else None
+    except Exception:
+        current = None
+    selected = []
+    try:
+        indexes = list_data.selectionModel().selectedIndexes()
+        selected = [list_data.item(index.row()).text() for index in indexes]
+    except Exception:
+        # Lightweight tests do not expose a Qt selection model.  Walk their
+        # rows instead of calling selectedItems(), which is an application API
+        # whose invocation count is itself part of the browse-performance gate.
+        try:
+            selected = [
+                list_data.item(row).text()
+                for row in range(list_data.count())
+                if list_data.item(row).isSelected()
+            ]
+        except Exception:
+            selected = []
+    return {"current": current, "selected": sequence_summary(selected)}
+
+
+def image_payload_summary(payload) -> dict:
+    """Describe a 2D payload without materializing or copying its image."""
+    if payload is None:
+        return {"present": False, "shape": None, "dtype": None}
+    image = getattr(payload, "image", None)
+    shape = getattr(image, "shape", None)
+    try:
+        shape = list(shape) if shape is not None else None
+    except TypeError:
+        shape = str(shape)
+    dtype = getattr(image, "dtype", None)
+    return {
+        "present": image is not None,
+        "shape": shape,
+        "dtype": str(dtype) if dtype is not None else None,
+    }
+
+
 def _jsonable(value):
     if isinstance(value, dict):
         return {str(k): _jsonable(v) for k, v in value.items()}

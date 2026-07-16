@@ -16,6 +16,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from xdart.gui.tabs.static_scan.h5viewer import H5Viewer
+from xdart.gui.tabs.static_scan.browse_debug import (
+    image_payload_summary,
+    widget_selection_summary,
+)
 from xdart.gui.tabs.static_scan.display_data import (
     DisplayDataMixin,
     available_norm_channels,
@@ -3969,6 +3973,28 @@ def test_browse_key_event_filter_accepts_real_pyside_shift_modifier():
 
     assert viewer._browse_gesture_active is False
     assert calls == ["data_changed"]
+
+
+def test_browse_debug_summaries_capture_qt_selection_and_payload_shape():
+    _ensure_qapp()
+    list_data = QtWidgets.QListWidget()
+    list_data.addItems(["11", "12", "13"])
+    list_data.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+    list_data.item(0).setSelected(True)
+    list_data.item(2).setSelected(True)
+    list_data.setCurrentItem(list_data.item(2))
+
+    selection = widget_selection_summary(
+        SimpleNamespace(ui=SimpleNamespace(listData=list_data)))
+    payload = image_payload_summary(
+        SimpleNamespace(image=np.zeros((5, 7), dtype=np.float32)))
+
+    assert selection == {
+        "current": "13",
+        "selected": {"count": 2, "first": "11", "last": "13",
+                     "sample": ["11", "13"]},
+    }
+    assert payload == {"present": True, "shape": [5, 7], "dtype": "float32"}
 
 
 def test_browse_key_event_filter_brackets_plain_held_arrow():

@@ -29,6 +29,7 @@ from .display_logic import (
     SupersedeReason,
     hydration_supersede_action,
 )
+from .browse_debug import browse_debug_log, sequence_summary
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +161,17 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
                 self._drain_stale_locked(supersede_reason)
             token = self._token(label, generation, purpose, consumer)
             if token in self._queued:
+                browse_debug_log(
+                    logger,
+                    "hydration_worker_enqueue",
+                    labels=sequence_summary((label,)),
+                    generation=generation,
+                    purpose=purpose,
+                    consumer=consumer.value,
+                    granted=False,
+                    suppressed_by="duplicate_token",
+                    queue_depth=len(self._queue),
+                )
                 return
             self._queued.add(token)
             if (
@@ -173,6 +185,16 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
             else:
                 self._queue.append(
                     _HydrationRequest((label,), generation, purpose, consumer))
+            browse_debug_log(
+                logger,
+                "hydration_worker_enqueue",
+                labels=sequence_summary((label,)),
+                generation=generation,
+                purpose=purpose,
+                consumer=consumer.value,
+                granted=True,
+                queue_depth=len(self._queue),
+            )
             self._trim_pending_locked()
             self._cond.notify()
 
@@ -225,17 +247,41 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
                 # P3 coalesce: a newer selection/mode superseded this request,
                 # so don't even hit disk for a frame the user already scrolled
                 # past — the GUI would drop the result anyway.
+                browse_debug_log(
+                    logger,
+                    "hydration_worker_result",
+                    labels=sequence_summary(labels),
+                    generation=generation,
+                    newest_generation=newest,
+                    purpose=purpose,
+                    consumer=consumer.value,
+                    success=False,
+                    emitted=False,
+                    suppressed_by="stale_generation",
+                )
                 continue
             if purpose == "1d":
-                self._hydrate_1d_many(tuple(labels))
+                success = self._hydrate_1d_many(tuple(labels))
             else:
+                success = False
                 for label in labels:
-                    self._hydrate_full(label)
+                    success = self._hydrate_full(label) or success
             # The GUI handler still re-checks generation == the live
             # display_generation (a change that landed during the read). Emit
             # even when hydration failed so GUI-side pending dedupe can clear the
             # request key for this generation.
             emitted_label = tuple(labels) if purpose == "1d" else labels[-1]
+            browse_debug_log(
+                logger,
+                "hydration_worker_result",
+                labels=sequence_summary(labels),
+                generation=generation,
+                newest_generation=newest,
+                purpose=purpose,
+                consumer=consumer.value,
+                success=bool(success),
+                emitted=True,
+            )
             self.sigHydrated.emit(emitted_label, generation)
 
     def stop(self, timeout_ms: int = 8000) -> bool:
