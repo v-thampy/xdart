@@ -1,6 +1,7 @@
 """Offscreen tests for the hidden Controls Panel V2 scaffold."""
 
 import gc
+import json
 import os
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -3355,6 +3356,111 @@ def test_controls_panel_v2_native_session_roundtrip_hydrates_visible_rows(
         for widget in widgets:
             widget.close()
             widget.deleteLater()
+
+
+def test_config_save_uses_native_standard_state_not_stale_legacy_tree(
+        qapp, monkeypatch, tmp_path):
+    """Config Save serializes what Controls V2 shows, not a hidden carrier."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.core.containers import PONI
+
+    poni_path = tmp_path / "rayonix.poni"
+    PONI(
+        dist=0.1794,
+        poni1=0.01,
+        poni2=0.02,
+        detector="RayonixMx225",
+    ).to_poni_file(poni_path)
+    config_path = tmp_path / "image-directory.json"
+
+    widget = staticWidget()
+    try:
+        widget._set_poni_field(str(poni_path))
+        legacy_gi = widget.wrangler.parameters.child("GI").child("Grazing")
+        legacy_gi.setValue(True)
+        _apply_v2_edits(widget, (
+            (("GI", "Grazing"), False),
+            (("Int1D", "points"), "432"),
+        ))
+
+        assert legacy_gi.value() is True
+        assert widget.scan.gi is False
+
+        widget.h5viewer.defaultWidget.save_defaults(fname=str(config_path))
+        saved = json.loads(config_path.read_text())
+        active = saved["image_wrangler"]["image_wrangler"]
+        canonical = saved[widget._CONFIG_STATE_KEY]
+
+        assert active["GI"]["Grazing"] is False
+        assert active["Signal"]["poni_file"] == str(poni_path)
+        assert canonical["active_wrangler"] == "image_wrangler"
+        assert canonical["poni_file"] == str(poni_path)
+        assert canonical["controls_v2_int"]["gi"] is False
+        assert canonical["controls_v2_int"]["bai_1d_args"]["numpoints"] == 432
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_config_roundtrip_restores_active_poni_mode_and_native_grid(
+        qapp, monkeypatch, tmp_path):
+    """Loading A after B leaves no B-owned PONI or GI/native state behind."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.core.containers import PONI
+
+    rayonix_path = tmp_path / "rayonix.poni"
+    eiger_path = tmp_path / "eiger.poni"
+    rayonix = PONI(
+        dist=0.1794,
+        poni1=0.01,
+        poni2=0.02,
+        detector="RayonixMx225",
+    )
+    eiger = PONI(
+        dist=0.1385,
+        poni1=0.03,
+        poni2=0.04,
+        detector="Eiger4M",
+    )
+    rayonix.to_poni_file(rayonix_path)
+    eiger.to_poni_file(eiger_path)
+    config_a = tmp_path / "image-directory.json"
+    config_b = tmp_path / "eiger.json"
+
+    widget = staticWidget()
+    try:
+        widget._set_poni_field(str(rayonix_path))
+        _apply_v2_edits(widget, (
+            (("GI", "Grazing"), False),
+            (("Int1D", "points"), "321"),
+        ))
+        widget.h5viewer.defaultWidget.save_defaults(fname=str(config_a))
+
+        widget._set_poni_field(str(eiger_path))
+        _apply_v2_edits(widget, (
+            (("GI", "Grazing"), True),
+            (("Int1D", "points"), "777"),
+        ))
+        widget.h5viewer.defaultWidget.save_defaults(fname=str(config_b))
+
+        widget.h5viewer.defaultWidget.load_defaults(fname=str(config_b))
+        widget.scan._cached_poni = eiger
+        widget.h5viewer.defaultWidget.load_defaults(fname=str(config_a))
+        qapp.processEvents()
+
+        assert widget.scan.gi is False
+        assert widget.wrangler.parameters.child("GI").child("Grazing").value() is False
+        assert widget.scan.bai_1d_args["numpoints"] == 321
+        assert widget._controls_v2_poni_path() == str(rayonix_path)
+        assert widget.wrangler.poni.detector == "RayonixMx225"
+        assert widget._controls_v2_current_poni().detector == "RayonixMx225"
+        assert _visible_control_value(widget, ("GI", "Grazing")) is False
+        assert _visible_control_value(widget, ("Int1D", "points")) == "321"
+    finally:
+        widget.close()
+        widget.deleteLater()
 
 
 def test_controls_panel_v2_native_int_session_roundtrip_feeds_native_plan(

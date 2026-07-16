@@ -46,6 +46,12 @@ class defaultWidget(Qt.QtWidgets.QWidget):
         set_parameters: Sets the list of parameters
     """
     sigSetUserDefaults = Qt.QtCore.Signal()
+    # The parameter trees are now a compatibility surface rather than the
+    # complete GUI state: Controls V2 owns several native values that have no
+    # legacy tree leaf.  Let the host add/apply one canonical snapshot while
+    # keeping this generic widget independent of the static-scan module.
+    sigConfigSaving = Qt.QtCore.Signal(object)
+    sigConfigLoaded = Qt.QtCore.Signal(object)
 
     def __init__(self, parameters=None, parent=None):
         """parameters: dict, parameters to use
@@ -149,6 +155,7 @@ class defaultWidget(Qt.QtWidgets.QWidget):
             jdict[key] = self.param_to_valdict(param)
 
         if fname != "":
+            self.sigConfigSaving.emit(jdict)
             # Ensure the parent directory exists (the config dir, or any path
             # the user picked) so the write can't FileNotFoundError.
             parent = os.path.dirname(fname)
@@ -179,6 +186,7 @@ class defaultWidget(Qt.QtWidgets.QWidget):
                     self.set_defaults(param, valdict[key])
                 except KeyError:
                     logger.warning("load_default: no saved defaults for key %r", key)
+            self.sigConfigLoaded.emit(valdict)
         if emit:
             self.sigSetUserDefaults.emit()
     

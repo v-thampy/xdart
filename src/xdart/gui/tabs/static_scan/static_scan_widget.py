@@ -2084,22 +2084,14 @@ class staticWidget(QWidget):
             "threshold_config": threshold,
         }
 
-    def _restore_controls_v2_int_session_state(self) -> None:
-        """Restore the native Controls V2 Int blob after the legacy fallback."""
+    def _apply_controls_v2_int_state(self, data: dict) -> bool:
+        """Apply a canonical Controls V2 snapshot from session or config."""
 
-        try:
-            from xdart.utils.session import load_session
-            data = (load_session() or {}).get("controls_v2_int")
-        except Exception:
-            logger.debug("Controls V2 native Int session load failed",
-                         exc_info=True)
-            return
         if not isinstance(data, dict):
-            return
-
+            return False
         scan = getattr(self, "scan", None)
         if scan is None:
-            return
+            return False
         try:
             with scan.scan_lock:
                 a1 = data.get("bai_1d_args")
@@ -2114,6 +2106,7 @@ class staticWidget(QWidget):
         except Exception:
             logger.debug("Controls V2 native Int scan restore failed",
                          exc_info=True)
+            return False
 
         self._controls_v2_hydrate_advanced_from_scan()
 
@@ -2140,6 +2133,19 @@ class staticWidget(QWidget):
                     pass
 
         self._refresh_controls_v2_profile(immediate=True)
+        return True
+
+    def _restore_controls_v2_int_session_state(self) -> None:
+        """Restore the native Controls V2 Int blob after the legacy fallback."""
+
+        try:
+            from xdart.utils.session import load_session
+            data = (load_session() or {}).get("controls_v2_int")
+        except Exception:
+            logger.debug("Controls V2 native Int session load failed",
+                         exc_info=True)
+            return
+        self._apply_controls_v2_int_state(data)
 
     def _controls_v2_native_reduction_plan(
         self,
@@ -3366,25 +3372,32 @@ class staticWidget(QWidget):
     def _controls_v2_current_poni(self):
         scan = getattr(self, "scan", None)
         wrangler = getattr(self, "wrangler", None)
+        poni_path = self._controls_v2_poni_path()
+        if poni_path:
+            for candidate in (
+                getattr(wrangler, "poni", None),
+                getattr(getattr(wrangler, "thread", None), "poni", None),
+            ):
+                if candidate is not None:
+                    return candidate
+            if os.path.exists(poni_path):
+                try:
+                    from xrd_tools.core.containers import PONI
+                    return PONI.from_poni_file(poni_path)
+                except Exception:
+                    logger.debug("Controls V2 PONI summary load failed for %s",
+                                 poni_path, exc_info=True)
+            # A configured but invalid source calibration must not silently
+            # display the PONI cached on an unrelated processed scan.
+            return None
+
         for candidate in (
             getattr(scan, "_cached_poni", None),
-            getattr(wrangler, "poni", None),
-            getattr(getattr(wrangler, "thread", None), "poni", None),
             getattr(getattr(self, "integratorTree", None), "_cached_poni", None),
         ):
             if candidate is not None:
                 return candidate
-
-        poni_path = self._controls_v2_poni_path()
-        if not poni_path or not os.path.exists(poni_path):
-            return None
-        try:
-            from xrd_tools.core.containers import PONI
-            return PONI.from_poni_file(poni_path)
-        except Exception:
-            logger.debug("Controls V2 PONI summary load failed for %s",
-                         poni_path, exc_info=True)
-            return None
+        return None
 
     def _controls_v2_poni_path(self) -> str:
         candidates = []
@@ -4229,6 +4242,106 @@ class staticWidget(QWidget):
         self.command_queue = Queue()
         self.set_wrangler(self.ui.wranglerStack.currentIndex())
 
+    _CONFIG_STATE_KEY = "_xdart_static_controls"
+
+    def _augment_config_snapshot(self, document) -> None:
+        """Add the active native-control state to a legacy config document."""
+
+        if not isinstance(document, dict):
+            return
+        wrangler = getattr(self, "wrangler", None)
+        params = getattr(wrangler, "parameters", None)
+        if params is None:
+            return
+        active_name = str(params.name())
+        native = self._controls_v2_int_session_state()
+        gi_fields = self._controls_v2_gi_config()
+        poni_file = self._controls_v2_poni_path()
+        mode = self.controls.modeCombo.currentText()
+        document[self._CONFIG_STATE_KEY] = {
+            "schema_version": 1,
+            "active_wrangler": active_name,
+            "poni_file": poni_file,
+            "processing_mode": mode,
+            "controls_v2_int": native,
+        }
+
+        # Keep the active legacy tree truthful too, so the file degrades well
+        # when opened by a pre-Controls-V2 xdart.  Do not mutate live QObject
+        # parameters merely to save a file.
+        outer = document.get(active_name)
+        tree = outer.get(active_name) if isinstance(outer, dict) else None
+        if not isinstance(tree, dict):
+            return
+        gi = tree.get("GI")
+        if isinstance(gi, dict):
+            gi["Grazing"] = bool(native.get("gi", False))
+            gi["th_motor"] = str(gi_fields.get("incidence_motor", "Manual"))
+            gi["th_val"] = gi_fields.get("th_val", 0.1)
+            gi["sample_orientation"] = int(
+                gi_fields.get("sample_orientation", 4))
+            gi["tilt_angle"] = float(gi_fields.get("tilt_angle", 0.0))
+        for group in ("Signal", "Calibration"):
+            values = tree.get(group)
+            if isinstance(values, dict) and "poni_file" in values:
+                values["poni_file"] = poni_file
+        threshold = native.get("threshold_config")
+        mask = tree.get("Mask")
+        if isinstance(threshold, dict) and isinstance(mask, dict):
+            mask["Threshold"] = bool(threshold.get("apply_threshold", False))
+            mask["min"] = threshold.get("threshold_min", 0.0)
+            mask["max"] = threshold.get("threshold_max", 0.0)
+        mask_sat = tree.get("MaskSat")
+        if isinstance(threshold, dict) and isinstance(mask_sat, dict):
+            mask_sat["mask_sentinel"] = bool(
+                threshold.get("mask_saturation", True))
+
+    def _activate_config_wrangler(self, name: str) -> None:
+        stack = getattr(getattr(self, "ui", None), "wranglerStack", None)
+        if stack is None:
+            return
+        for index in range(stack.count()):
+            candidate = stack.widget(index)
+            params = getattr(candidate, "parameters", None)
+            if params is not None and str(params.name()) == str(name):
+                if stack.currentIndex() != index:
+                    stack.setCurrentIndex(index)
+                return
+
+    def _apply_loaded_config_snapshot(self, document) -> None:
+        """Commit a loaded config after every legacy tree has settled."""
+
+        payload = (
+            document.get(self._CONFIG_STATE_KEY)
+            if isinstance(document, dict) else None
+        )
+        if isinstance(payload, dict):
+            self._activate_config_wrangler(payload.get("active_wrangler", ""))
+            poni_file = payload.get("poni_file")
+            if isinstance(poni_file, str):
+                self._set_poni_field(poni_file)
+            self._apply_controls_v2_int_state(payload.get("controls_v2_int"))
+            self._push_threshold_to_wrangler()
+            self._push_gi_to_wrangler()
+            mode = payload.get("processing_mode")
+            if isinstance(mode, str):
+                combo = self.controls.modeCombo
+                index = combo.findText(mode)
+                if index >= 0:
+                    combo.setCurrentIndex(index)
+        else:
+            # Legacy files have only parameter trees.  Their active wrangler's
+            # value-change signals do the adoption; force one final coherent V2
+            # render after hidden wranglers have also finished loading.
+            try:
+                gi = self.wrangler.parameters.child("GI").child("Grazing").value()
+                self.update_scattering_geometry(bool(gi))
+            except Exception:
+                logger.debug("legacy config GI finalization skipped",
+                             exc_info=True)
+        self._configure_controls_v2_native_run_plan()
+        self._refresh_controls_v2_profile(immediate=True)
+
     def _init_defaults_and_timer(self):
         """Set up default parameters and the coalescing update timer."""
         # Register all parameter trees with the defaultWidget
@@ -4237,6 +4350,10 @@ class staticWidget(QWidget):
             w = self.ui.wranglerStack.widget(i)
             parameters.append(w.parameters)
         self.h5viewer.defaultWidget.set_parameters(parameters)
+        self.h5viewer.defaultWidget.sigConfigSaving.connect(
+            self._augment_config_snapshot)
+        self.h5viewer.defaultWidget.sigConfigLoaded.connect(
+            self._apply_loaded_config_snapshot)
 
         # Single source of truth for "a wrangler/integrator run is in
         # progress" (task #68).  Flipped only by _enter_run_state /
