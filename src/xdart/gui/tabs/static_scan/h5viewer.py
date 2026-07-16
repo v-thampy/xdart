@@ -1531,7 +1531,7 @@ class H5Viewer(QWidget):
         self.data_changed()
 
     def _handle_browse_key_event(self, event) -> bool:
-        """Track held Shift+navigation gestures without doing browse work.
+        """Track held navigation gestures without doing browse work.
 
         The QListWidget still owns selection mechanics; this method only
         brackets the burst so itemSelectionChanged signals cannot hydrate or
@@ -1557,9 +1557,15 @@ class H5Viewer(QWidget):
             is_auto_repeat = False
 
         if event_type == key_press:
-            if key in bulk_keys and _qt_has_modifier(
-                    event.modifiers(), QtCore.Qt.ShiftModifier):
-                H5Viewer._begin_browse_gesture(self)
+            if key in bulk_keys:
+                # One physical hold emits many auto-repeat press/release pairs.
+                # Preserve the first press's gesture state until the final
+                # non-repeat release instead of restarting its pending state on
+                # every repeat.  Plain arrows need the same boundary as
+                # Shift+arrows: OS repeat intervals can exceed the 100 ms
+                # fallback debounce and otherwise launch intermediate loads.
+                if not getattr(self, "_browse_gesture_active", False):
+                    H5Viewer._begin_browse_gesture(self)
                 return True
             return False
 
@@ -2639,6 +2645,16 @@ class H5Viewer(QWidget):
 
     def _emit_render_update(self, requestor: str, *, generation=None,
                             labels=None, granted=True, suppressed_by=None) -> None:
+        if (
+                granted
+                and getattr(self, "_browse_gesture_active", False)
+                and _browse_one_shot_enabled(self)):
+            # A load already in flight can finish while the user is still
+            # stepping through rows.  Defer that repaint to the final key
+            # release so raw/cake and 1-D all resolve from one selection.
+            self._browse_pending_data_changed = True
+            granted = False
+            suppressed_by = suppressed_by or "active_browse_gesture"
         browse_debug_log(
             logger,
             "render_request",

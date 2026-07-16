@@ -3971,6 +3971,61 @@ def test_browse_key_event_filter_accepts_real_pyside_shift_modifier():
     assert calls == ["data_changed"]
 
 
+def test_browse_key_event_filter_brackets_plain_held_arrow():
+    _ensure_qapp()
+    list_data = QtWidgets.QListWidget()
+    list_data.addItems([str(i) for i in range(1, 74)])
+    list_data.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+    calls = []
+    viewer = SimpleNamespace(
+        ui=SimpleNamespace(listData=list_data, listScans=QtWidgets.QListWidget()),
+        viewer_mode=None,
+        _plot_method="Overlay",
+        _run_writing=False,
+        _browse_gesture_active=False,
+        _browse_pending_data_changed=False,
+        _selection_coalesce_timer=_FakeTimer(active=False),
+        _load_coalesce_timer=_FakeTimer(active=False),
+        _update_coalesce_timer=_FakeTimer(active=False),
+        data_changed=lambda: calls.append("data_changed"),
+    )
+
+    press = QtGui.QKeyEvent(
+        QtCore.QEvent.Type.KeyPress,
+        QtCore.Qt.Key.Key_Down,
+        QtCore.Qt.KeyboardModifier.NoModifier,
+    )
+    repeat_release = QtGui.QKeyEvent(
+        QtCore.QEvent.Type.KeyRelease,
+        QtCore.Qt.Key.Key_Down,
+        QtCore.Qt.KeyboardModifier.NoModifier,
+        "",
+        True,
+    )
+    repeat_press = QtGui.QKeyEvent(
+        QtCore.QEvent.Type.KeyPress,
+        QtCore.Qt.Key.Key_Down,
+        QtCore.Qt.KeyboardModifier.NoModifier,
+        "",
+        True,
+    )
+    release = QtGui.QKeyEvent(
+        QtCore.QEvent.Type.KeyRelease,
+        QtCore.Qt.Key.Key_Down,
+        QtCore.Qt.KeyboardModifier.NoModifier,
+    )
+
+    assert H5Viewer.eventFilter(viewer, list_data, press) is False
+    assert viewer._browse_gesture_active is True
+    assert H5Viewer.eventFilter(viewer, list_data, repeat_release) is False
+    assert H5Viewer.eventFilter(viewer, list_data, repeat_press) is False
+    assert viewer._browse_gesture_active is True
+    assert calls == []
+    assert H5Viewer.eventFilter(viewer, list_data, release) is False
+    assert viewer._browse_gesture_active is False
+    assert calls == ["data_changed"]
+
+
 def test_xye_overlay_filter_accepts_real_pyside_shift_modifier():
     from xdart.gui.tabs.static_scan.static_scan_widget import _XyeOverlayInputFilter
 
@@ -4021,6 +4076,26 @@ def test_active_browse_key_gesture_suppresses_selection_work():
 
     assert list_data.selected_calls == 0
     assert selection_timer.started == 0
+    assert viewer._browse_pending_data_changed is True
+
+
+def test_active_browse_key_gesture_suppresses_worker_render_update():
+    signal = _FakeSignal()
+    viewer = SimpleNamespace(
+        viewer_mode=None,
+        _plot_method="Overlay",
+        _run_writing=False,
+        _browse_gesture_active=True,
+        _browse_pending_data_changed=False,
+        _browse_anchor_heavy_after_next_render=None,
+        frame_ids=["20"],
+        sigUpdate=signal,
+    )
+    viewer._emit_render_update = MethodType(H5Viewer._emit_render_update, viewer)
+
+    viewer._emit_render_update("h5viewer.update_coalesce", generation=7)
+
+    assert signal.emitted == []
     assert viewer._browse_pending_data_changed is True
 
 
