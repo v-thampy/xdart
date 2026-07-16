@@ -32,7 +32,10 @@ from typing import Any, Generator, Mapping
 
 #: Bump when a field's *meaning* changes.  v2 = the honest-observation correction
 #: (renamed/redefined lifecycle counts + categorized opens + first-write latency).
-SCHEMA_VERSION = 2
+#: v3 = additive R2 source-cursor observations (cursor opens, block reads, native
+#: logical bytes, retained owner-block peak bytes, metadata reads, read-plan
+#: decisions) — no existing v2 field's meaning changed.
+SCHEMA_VERSION = 3
 
 #: Human-readable provenance of every observed field, surfaced in JSON so a
 #: reader never mistakes an unobserved/None field for zero.
@@ -71,6 +74,18 @@ OBSERVATION_SOURCES: dict[str, str] = {
                          "pipeline these are predominantly libhdf5 external-link "
                          "data-file resolutions of the source surfaced as Python "
                          "File objects; counted but not path-attributable",
+    "cursor_opens": "R2: ContainerCursor opens of the master (one open supplies "
+                    "descriptor + metadata + count + all reads) observed for "
+                    "this container",
+    "block_reads": "R2: number of native-dtype owner-block reads issued through "
+                   "the cursor per the ReadPlan ranges",
+    "source_logical_bytes": "R2: total NATIVE bytes read from the source "
+                            "(sum of owner-block nbytes) — no float64 expansion",
+    "retained_owner_bytes_peak": "R2: peak bytes retained by a SINGLE owner block "
+                                 "(<= ReadPlan.max_owner_bytes; charged once per "
+                                 "block, never per frame view)",
+    "metadata_reads": "R2: number of provider.metadata_for() reads served from "
+                      "the one open cursor handle (no per-read master reopen)",
 }
 
 #: Categories of :attr:`ContainerMetrics.open_counts` / run aggregate.
@@ -227,6 +242,22 @@ class ContainerMetrics:
     #: engine frame-accept is not observable without runtime edits -> None.
     frames_submitted: int | None = None
 
+    # R2 source-cursor observations (None on the non-cursor / skipped paths).
+    #: master opens attributed to the ContainerCursor consumption of this file.
+    cursor_opens: int | None = None
+    #: native-dtype owner-block reads issued through the cursor.
+    block_reads: int | None = None
+    #: total NATIVE bytes read from source (sum of owner-block nbytes).
+    source_logical_bytes: int | None = None
+    #: peak bytes retained by a SINGLE owner block (<= ReadPlan.max_owner_bytes).
+    retained_owner_bytes_peak: int | None = None
+    #: provider.metadata_for() reads served from the one open cursor handle.
+    metadata_reads: int | None = None
+    #: ReadPlan decision facts for this container's real layout.
+    read_plan_block_frames: int | None = None
+    read_plan_chunk_aligned: bool | None = None
+    read_plan_fallback_reason: str | None = None
+
     #: categorized Python-level h5py.File constructions for this container.
     open_counts: dict[str, int] = field(default_factory=new_open_counts)
 
@@ -266,6 +297,13 @@ class RunMetrics:
     frames_submitted: int | None = None
     skipped_by_reason: dict[str, int] = field(default_factory=dict)
 
+    # R2 aggregate source-cursor observations (summed; peak is a MAX).
+    cursor_opens: int = 0
+    block_reads: int = 0
+    source_logical_bytes: int = 0
+    retained_owner_bytes_peak: int = 0
+    metadata_reads: int = 0
+
     #: categorized run-total h5py.File constructions.
     open_counts: dict[str, int] = field(default_factory=new_open_counts)
 
@@ -291,6 +329,18 @@ class RunMetrics:
             self.frames_reduced += container.frames_reduced
         self.frames_written += container.frames_written
         self.frames_durable += container.frames_durable
+        # R2: fold source-cursor observations (sums; peak owner bytes is a MAX).
+        if container.cursor_opens is not None:
+            self.cursor_opens += container.cursor_opens
+        if container.block_reads is not None:
+            self.block_reads += container.block_reads
+        if container.source_logical_bytes is not None:
+            self.source_logical_bytes += container.source_logical_bytes
+        if container.metadata_reads is not None:
+            self.metadata_reads += container.metadata_reads
+        if container.retained_owner_bytes_peak is not None:
+            self.retained_owner_bytes_peak = max(
+                self.retained_owner_bytes_peak, container.retained_owner_bytes_peak)
         for cat in OPEN_CATEGORIES:
             self.open_counts[cat] += int(container.open_counts.get(cat, 0))
         if container.finish_s is not None:
@@ -318,6 +368,8 @@ class RunMetrics:
             f"| h5open master={oc['source']} ext={oc['source_external']} "
             f"other={oc['other']} out={oc['output']} verif={oc['verification']} "
             f"fail={oc['failed']} "
+            f"| cursor opens={self.cursor_opens} blocks={self.block_reads} "
+            f"meta={self.metadata_reads} owner_peak={self.retained_owner_bytes_peak}B "
             f"| enum={_fmt(self.enumerate_s)} reduce={_fmt(self.reduce_total_s)} "
             f"finish={_fmt(self.session_finish_total_s)} "
             f"first_write={_fmt(self.first_frame_latency_s)} total={_fmt(self.total_s)}"
@@ -355,6 +407,10 @@ def summarize_runs(runs: list[RunMetrics]) -> dict[str, Any]:
         "timings": {k: _stats(v) for k, v in keyed.items()},
         "source_opens_median": _median_int(
             [r.open_counts.get("source", 0) for r in runs]),
+        "cursor_opens_median": _median_int([r.cursor_opens for r in runs]),
+        "block_reads_median": _median_int([r.block_reads for r in runs]),
+        "retained_owner_bytes_peak": (
+            max((r.retained_owner_bytes_peak for r in runs), default=0)),
         "frames_written": (runs[0].frames_written if runs else 0),
         "frames_durable": (runs[0].frames_durable if runs else 0),
     }

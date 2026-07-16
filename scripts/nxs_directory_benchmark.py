@@ -216,39 +216,6 @@ def _enumerate(source_dir: Path, ext: str, recursive: bool) -> list[Path]:
     return sorted(files, key=lambda p: p.name)
 
 
-def _probe(path: Path):
-    """Return ``(state, skip_reason)`` by schema/content, no dataset read yet."""
-    from xrd_tools.io.processed_scan_id import is_processed_xdart_path
-    from xrd_tools.io.bluesky_nexus import is_unfinalized_nxwriter
-
-    if is_processed_xdart_path(path):
-        return "processed_output", "processed xdart output"
-    try:
-        if is_unfinalized_nxwriter(path):
-            return "in_progress", "unfinalized NXWriter"
-    except Exception:
-        return "invalid", "unreadable container"
-    return "ready", None
-
-
-def _read_layout(path: Path, ds_path: str):
-    """Return ``(nframes, frame_shape, dtype, chunks)`` from HDF5 METADATA only.
-
-    Reads dataset attributes (shape/dtype/chunks) without decoding a frame
-    (M0-R3): a 2-D dataset is one logical frame, a 3-D dataset is ``shape[0]``.
-    """
-    import h5py
-
-    with h5py.File(path, "r") as h5:
-        ds = h5[ds_path]
-        shape = tuple(int(x) for x in ds.shape)
-        nframes = 1 if len(shape) == 2 else int(shape[0])
-        frame_shape = tuple(int(x) for x in shape[-2:])
-        dtype = str(ds.dtype)
-        chunks = tuple(int(x) for x in ds.chunks) if ds.chunks else None
-    return nframes, frame_shape, dtype, chunks
-
-
 def _durable_frame_count(output_path: Path) -> int:
     """Frames actually on disk after the sink finished (durability, not submit)."""
     import h5py
@@ -305,10 +272,15 @@ def _bench_container(path, poni, poni_path, repeat_dir, output_root, plan, cores
     ``poni`` is the loaded calibration (for the integrator); ``poni_path`` is the
     real filesystem path threaded into destination safety so the released guard
     actually checks the PONI file (M0-R4 correction)."""
+    import numpy as np
+
     from xrd_tools.perf.metrics import ContainerMetrics, Timer
-    from xrd_tools.io.nexus import find_nexus_image_dataset
     from xrd_tools.io.output_safety import OutputCollisionError
-    from xrd_tools.sources.nexus import NexusStackSource
+    from xrd_tools.core.scan import Scan, ScanFrame
+    from xrd_tools.core.staging import source_block_budget_bytes
+    from xrd_tools.sources.cursor import ContainerCursor
+    from xrd_tools.sources.descriptor import describe_container
+    from xrd_tools.sources.read_plan import plan_reads
     from xrd_tools.reduction import run_reduction, NexusSink
     from xrd_tools.integrate.calibration import poni_to_integrator
 
@@ -317,28 +289,30 @@ def _bench_container(path, poni, poni_path, repeat_dir, output_root, plan, cores
     counter = H5FileCounter([path], output_root)
 
     with counter:
+        # EXPLICIT PROBE: one master open builds the descriptor (readiness +
+        # layout facts: frame count, shape, native dtype, chunks) with no pixel
+        # decode.  This one open supersedes the old probe(2 opens) + dataset
+        # resolve(1) + layout(1) — the readiness verdict stays separately
+        # observable in ``probe_s`` and ``state``.
         with Timer() as t:
-            state, reason = _probe(path)
+            descriptor = describe_container(path, entry=entry)
         cm.probe_s = t.elapsed
-        cm.state, cm.skip_reason = state, reason
-        if state != "ready":
+        cm.state = descriptor.state.value
+        cm.nframes = descriptor.frame_count
+        cm.frame_shape = descriptor.frame_shape
+        cm.dtype = None if descriptor.dtype is None else str(descriptor.dtype)
+        cm.chunks = descriptor.chunks
+        if cm.state != "ready":
+            cm.skip_reason = descriptor.reason
             cm.open_counts = dict(counter.counts)
             return cm
+        cm.frames_discovered = int(descriptor.frame_count or 0)
 
         try:
-            with Timer() as t:
-                ds_path = find_nexus_image_dataset(path, entry)
-            cm.dataset_resolve_s = t.elapsed
-            if ds_path is None:
+            if descriptor.dataset_path is None:
                 cm.state, cm.skip_reason = "imageless", "no image dataset"
                 cm.open_counts = dict(counter.counts)
                 return cm
-
-            with Timer() as t:
-                cm.nframes, cm.frame_shape, cm.dtype, cm.chunks = _read_layout(
-                    path, ds_path)
-            cm.open_s = t.elapsed
-            cm.frames_discovered = int(cm.nframes or 0)
 
             # destination safety BEFORE any write (M0-R4); the real PONI PATH is
             # checked here, not the loaded calibration object.
@@ -356,17 +330,55 @@ def _bench_container(path, poni, poni_path, repeat_dir, output_root, plan, cores
                 cm.open_counts = dict(counter.counts)
                 return cm
 
-            source = NexusStackSource(path, entry=entry)
-            with Timer() as t:
-                with contextlib.suppress(Exception):
-                    source.metadata_for(0)
-            cm.metadata_s = t.elapsed
+            limit = (descriptor.frame_count if frame_limit is None
+                     else min(frame_limit, descriptor.frame_count))
+            # Layout-aware, byte-bounded read plan (retires the fixed-16 block).
+            read_plan = plan_reads(
+                descriptor.frame_count, descriptor.frame_shape, descriptor.dtype,
+                descriptor.chunks, source_block_budget_bytes(),
+                frame_interval=(0, limit), two_d=descriptor.is_2d)
+            cm.read_plan_block_frames = read_plan.block_frames
+            cm.read_plan_chunk_aligned = read_plan.chunk_aligned
+            cm.read_plan_fallback_reason = read_plan.fallback_reason or None
 
-            limit = cm.nframes if frame_limit is None else min(frame_limit, cm.nframes)
             integrator = poni_to_integrator(poni)
-            scan = source.to_scan(name=scan_name, integrator=integrator)
-            if limit < len(scan.frames):
-                scan.frames = scan.frames[:limit]
+            frames: list = []
+            block_reads = logical_bytes = owner_peak = metadata_reads = 0
+            # ONE CONSUMPTION CURSOR supplies metadata + all native-dtype block
+            # reads; per-frame images are memory-sharing views into their owner
+            # block (charged once).  No per-frame source-master reopen.
+            src_before_cursor = counter.counts["source"]
+            with Timer() as t:
+                with ContainerCursor(path, entry=entry) as cursor:
+                    provider = cursor.metadata_provider()
+                    for block in cursor.iter_blocks(read_plan):
+                        block_reads += 1
+                        logical_bytes += block.nbytes
+                        owner_peak = max(owner_peak, block.nbytes)
+                        for i in range(block.start, block.stop):
+                            # COPY each frame out of the owner block (native
+                            # dtype) so the block is released before the next is
+                            # read: only ONE owner block is live at a time, so
+                            # ``owner_peak`` truthfully stays within the ReadPlan.
+                            # (The cursor's zero-copy VIEW contract — proven in
+                            # test_container_cursor — is what a streaming consumer
+                            # uses; this eager batch harness materializes a whole
+                            # Scan, so it must not pin every block via a view.)
+                            img = np.array(block.frame(i))
+                            md = provider.metadata_for(i)
+                            metadata_reads += 1
+                            frames.append(ScanFrame(
+                                index=i, image=img, metadata=dict(md),
+                                source_path=path, source_frame_index=i,
+                                source_identity=str(path)))
+            cm.open_s = t.elapsed
+            cm.cursor_opens = counter.counts["source"] - src_before_cursor
+            cm.block_reads = block_reads
+            cm.source_logical_bytes = logical_bytes
+            cm.retained_owner_bytes_peak = owner_peak
+            cm.metadata_reads = metadata_reads
+
+            scan = Scan(name=scan_name, frames=frames, integrator=integrator)
             cm.frames_input = len(scan.frames)
         except Exception as exc:
             # a SETUP failure (before a sink exists): nothing was written.

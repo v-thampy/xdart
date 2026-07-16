@@ -600,3 +600,67 @@ def test_observation_keys_match_schema_v2_fields():
     assert "finish_s" in {f.name for f in dataclasses.fields(ContainerMetrics)}
     assert "session_finish_total_s" in {f.name for f in dataclasses.fields(RunMetrics)}
     assert "session_finish_s" not in OBSERVATION_SOURCES
+
+
+# --- R2: benchmark wired to the ContainerCursor (fail-before/pass-after) ------
+
+def test_schema_bumped_to_v3_for_r2_observations():
+    # v3 adds the additive source-cursor observations (no v2 meaning changed).
+    assert SCHEMA_VERSION == 3
+    from xrd_tools.perf.metrics import OBSERVATION_SOURCES
+    for key in ("cursor_opens", "block_reads", "source_logical_bytes",
+                "retained_owner_bytes_peak", "metadata_reads"):
+        assert key in OBSERVATION_SOURCES
+
+
+def test_run_metrics_folds_r2_cursor_observations():
+    rm = RunMetrics()
+    rm.add(ContainerMetrics(path="a", state="ready", cursor_opens=1, block_reads=2,
+                            source_logical_bytes=100, retained_owner_bytes_peak=50,
+                            metadata_reads=3))
+    rm.add(ContainerMetrics(path="b", state="ready", cursor_opens=1, block_reads=5,
+                            source_logical_bytes=200, retained_owner_bytes_peak=80,
+                            metadata_reads=4))
+    assert rm.cursor_opens == 2          # summed
+    assert rm.block_reads == 7           # summed
+    assert rm.source_logical_bytes == 300
+    assert rm.metadata_reads == 7
+    assert rm.retained_owner_bytes_peak == 80  # a MAX (peak owner block), not a sum
+
+
+def test_cursor_wired_bench_collapses_source_opens(tmp_path):
+    """The R2 headline: one explicit probe open + one consumption cursor open =
+    2/container, down from the M0 7/container, with the R2 observations and the
+    ReadPlan decision recorded and durable frames preserved."""
+    from xrd_tools.integrate.calibration import load_poni
+    from xrd_tools.sources.read_plan import plan_reads
+    from xrd_tools.core.staging import source_block_budget_bytes
+
+    h = _load_harness()
+    src = tmp_path / "src"; src.mkdir()
+    master = _write_raw_container(src / "scan_00001.nxs", nframes=4)
+    poni_path = _write_poni(tmp_path / "cal.poni")
+    poni_obj = load_poni(poni_path)
+    out_root = tmp_path / "out"
+    repeat_dir = out_root / "repeat_00"; repeat_dir.mkdir(parents=True)
+    plan = h._build_plan("1d")
+
+    cm = h._bench_container(master, poni_obj, poni_path, repeat_dir, out_root, plan,
+                            1, "entry", None, src, [str(master)], False)
+
+    assert cm.state == "ready"
+    # exactly one explicit probe open + one consumption cursor open
+    assert cm.open_counts["source"] == 2
+    assert cm.cursor_opens == 1
+    assert cm.block_reads is not None and cm.block_reads >= 1
+    assert cm.metadata_reads == 4            # one provider read per frame
+    assert cm.frames_input == 4
+    assert cm.frames_durable == 4            # reduced + written + on disk
+    assert cm.read_plan_block_frames is not None and cm.read_plan_block_frames >= 1
+    # the per-block source owner peak stays within the ReadPlan's bound
+    rp = plan_reads(cm.nframes, cm.frame_shape, cm.dtype, cm.chunks,
+                    source_block_budget_bytes())
+    assert cm.retained_owner_bytes_peak is not None
+    assert cm.retained_owner_bytes_peak <= rp.max_owner_bytes
+    # native logical bytes read (no float64 expansion): frames * frame_bytes
+    assert cm.source_logical_bytes == 4 * rp.frame_bytes
