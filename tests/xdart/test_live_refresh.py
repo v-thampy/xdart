@@ -1388,6 +1388,54 @@ def test_run_end_reconcile_skips_forced_rebuild_when_list_is_current():
     assert calls == [{"emit_update": False, "force_rebuild": False}]
 
 
+def test_run_end_reconcile_restores_rendered_2d_anchor_after_selection_clear():
+    """Stop must not blank the final raw/cake when the authoritative frame-list
+    rebuild consumes ``new_scan_loaded`` and clears Qt's selection.
+
+    Directory Overlay carries its 1D rows in the accumulator, while raw/cake
+    belong to the last rendered frame.  Restore that exact 2D anchor without
+    turning on Auto Last or disturbing an existing selection.
+    """
+    list_data = _FakeListWidget([0])
+    list_data.setCurrentRow(0)
+    scan = SimpleNamespace(
+        name="scan",
+        frames=SimpleNamespace(index=[0]),
+    )
+    calls = []
+    frame_ids = ["0"]
+    viewer = SimpleNamespace(
+        scan=scan,
+        ui=SimpleNamespace(listData=list_data),
+        new_scan_loaded=True,
+        frame_ids=frame_ids,
+        auto_last=False,
+        latest_idx=None,
+        data_changed=lambda *args, **kwargs: calls.append((args, kwargs)),
+        _displayed_list_count=list_data.count(),
+        _displayed_last_label="0",
+    )
+    viewer.set_current_frame = MethodType(H5Viewer.set_current_frame, viewer)
+    viewer._remember_displayed_frames = MethodType(
+        H5Viewer._remember_displayed_frames, viewer)
+    viewer.update_data = MethodType(H5Viewer.update_data, viewer)
+    host = SimpleNamespace(
+        scan=scan,
+        h5viewer=viewer,
+        displayframe=SimpleNamespace(
+            idxs_2d=[0],
+            ui=SimpleNamespace(plotMethod=_FakeCombo("Waterfall")),
+        ),
+    )
+
+    staticWidget._reconcile_h5viewer_frame_list_after_run(host)
+
+    assert viewer.auto_last is False
+    assert viewer.frame_ids == ["0"]
+    assert [item.text() for item in list_data.selectedItems()] == ["0"]
+    assert calls == [((), {"show_all": False})]
+
+
 def test_drain_pending_frames_builds_store_and_scan_data():
     """#3: _drain_pending_frames builds + upserts a publication for EVERY stashed
     frame (the batched heavy work) and rebuilds scan_data as one DataFrame from the

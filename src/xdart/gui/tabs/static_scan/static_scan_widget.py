@@ -5489,11 +5489,37 @@ class staticWidget(QWidget):
                     getattr(self, "displayframe", None)),
             )
             return 0
+
+        # The frame-index reload below can legitimately rebuild listData and
+        # clear its Qt selection (notably when ``new_scan_loaded`` is still set
+        # for the last one-frame scan in a Directory run).  Remember the frame
+        # that actually owns the visible raw/cake panels so Stop can restore the
+        # same coherent selection after the rebuild.  Prefer rendered 2D state
+        # over the browser cursor: Overlay/Waterfall may carry many 1D rows, but
+        # raw/cake always belong to one representative frame.
+        runend_2d_anchor = None
+        display = getattr(self, "displayframe", None)
+        rendered_2d = list(getattr(display, "idxs_2d", ()) or ())
+        if rendered_2d:
+            runend_2d_anchor = rendered_2d[-1]
+        if runend_2d_anchor is None:
+            list_widget = getattr(getattr(viewer, "ui", None), "listData", None)
+            try:
+                current = list_widget.currentItem() if list_widget is not None else None
+                if current is not None:
+                    runend_2d_anchor = current.text()
+            except Exception:
+                logger.debug("run-end 2D anchor capture skipped", exc_info=True)
+        if runend_2d_anchor is None:
+            selected = list(getattr(viewer, "frame_ids", ()) or ())
+            if selected:
+                runend_2d_anchor = selected[-1]
         browse_debug_log(
             logger,
             "runend_reconcile_enter",
             written_file=written_file,
             scan=getattr(scan, "name", None),
+            runend_2d_anchor=runend_2d_anchor,
             method=staticWidget._overlay_plot_method(self),
             auto_last=getattr(viewer, "auto_last", None),
             **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
@@ -5560,6 +5586,45 @@ class staticWidget(QWidget):
             )
             viewer.update_data(emit_update=False, force_rebuild=force_rebuild)
             list_widget = getattr(getattr(viewer, "ui", None), "listData", None)
+
+            # If the rebuild dropped every selected row, restore the exact
+            # rendered 2D anchor (or the final frame when no rendered anchor is
+            # available).  Do this without enabling Auto Last and publish once
+            # through the immediate selection path so the final update_all()
+            # cannot replace valid raw/cake with an empty payload.  Existing
+            # selections are untouched, including Show-All/Waterfall selections.
+            restored_anchor = None
+            if list_widget is not None:
+                try:
+                    has_selection = bool(list_widget.selectedItems())
+                except Exception:
+                    has_selection = bool(getattr(viewer, "frame_ids", ()))
+                if not has_selection and expected:
+                    candidate = str(runend_2d_anchor)
+                    if runend_2d_anchor is None or candidate not in expected:
+                        candidate = str(expected[-1])
+                    item = None
+                    for row in range(list_widget.count()):
+                        candidate_item = list_widget.item(row)
+                        if candidate_item is not None and candidate_item.text() == candidate:
+                            item = candidate_item
+                            break
+                    if item is not None:
+                        was_blocked = list_widget.blockSignals(True)
+                        try:
+                            setter = getattr(viewer, "set_current_frame", None)
+                            if callable(setter):
+                                setter(item)
+                            else:
+                                list_widget.setCurrentItem(item)
+                            try:
+                                viewer.frame_ids[:] = [candidate]
+                            except (AttributeError, TypeError):
+                                viewer.frame_ids = [candidate]
+                        finally:
+                            list_widget.blockSignals(was_blocked)
+                        restored_anchor = candidate
+                        staticWidget._h5viewer_data_changed_now(self)
             visible_after = []
             if list_widget is not None:
                 visible_after = [
@@ -5571,6 +5636,7 @@ class staticWidget(QWidget):
                 "runend_reconcile_after_update_data",
                 latest_idx=getattr(viewer, "latest_idx", None),
                 visible=sequence_summary(visible_after),
+                restored_anchor=restored_anchor,
                 **_runend_waterfall_history_fields(
                     getattr(self, "displayframe", None)),
             )

@@ -4287,6 +4287,41 @@ def test_controls_panel_v2_auto_rows_disable_range_edits(qapp, monkeypatch):
         widget.deleteLater()
 
 
+def test_controls_panel_v2_auto_stays_visibly_checked_while_run_locked(
+        qapp, monkeypatch):
+    """Auto remains visibly on while disabled during processing.
+
+    The logical checked bit already survived the run lock, but the generic
+    ``:disabled`` QSS rule painted the compact QToolButton like an unchecked
+    control.  Require the more-specific checked+disabled rule in both themes.
+    """
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import RangeRow
+    from xdart.gui.themes import render_qss
+
+    widget = staticWidget()
+    try:
+        widget._on_controls_v2_field_changed(("Int1D", "radial_auto"), True)
+        widget._refresh_controls_v2_profile_now()
+        widget._enter_run_state()
+
+        ranges = {
+            row._low_path: row
+            for row in widget.controls_v2.processing_card.body.findChildren(RangeRow)
+        }
+        auto_button = ranges[("Int1D", "radial_low")]._toggle[1]
+        assert auto_button.isChecked()
+        assert not auto_button.isEnabled()
+        selector = "QToolButton#controlsV2AutoButton:checked:disabled"
+        assert selector in render_qss("dark")
+        assert selector in render_qss("light")
+    finally:
+        widget._exit_run_state()
+        widget.close()
+        widget.deleteLater()
+
+
 def test_controls_panel_v2_pending_manual_range_survives_run_commit(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget

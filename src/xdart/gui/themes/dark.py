@@ -954,6 +954,11 @@ QToolButton#controlsV2AutoButton:checked {
     color: $accent_on_text;
     border-color: $accent;
 }
+QToolButton#controlsV2AutoButton:checked:disabled {
+    background-color: $accent_muted;
+    color: $text_2;
+    border-color: $accent_muted;
+}
 QToolButton#controlsV2AutoButton:disabled {
     background-color: $panel;
     color: $text_muted;
