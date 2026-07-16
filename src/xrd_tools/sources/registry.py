@@ -279,6 +279,22 @@ def _nexus_open(spec: SourceSpec) -> FrameSource:
     return NexusStackSource(spec.uri, entry=spec.entry or "entry")
 
 
+def _nexus_metadata_provider(path: Path) -> Any:
+    """R2 fill of the nexus-family adapter's reserved metadata-provider seam.
+
+    Opens a short-lived :class:`~xrd_tools.sources.cursor.ContainerCursor`, gets
+    its lazy provider, and MATERIALIZES it (so the returned provider holds plain
+    numpy/py values and reopens no master on later reads).  A Bluesky/NXWriter
+    container yields a per-frame provider; every other raw stack yields the
+    empty (sidecar-preserving) provider."""
+    from xrd_tools.sources.cursor import ContainerCursor
+
+    with ContainerCursor(Path(path)) as cursor:
+        provider = cursor.metadata_provider()
+        provider.scan_table()  # materialize while the handle is open
+        return provider
+
+
 def _image_is_candidate(path: Path) -> bool:
     from xrd_tools.io.image import SUPPORTED_EXTS
     ext = Path(path).suffix.lower()
@@ -394,6 +410,7 @@ def _register_builtin_adapters() -> None:
         scan_name=_nexus_scan_name,
         probe=_nexus_probe,
         open=_nexus_open,
+        metadata_provider=_nexus_metadata_provider,
         finalization_policy=nxwriter_finalization_policy,
         is_output_format=True,
     ), builtin=True)

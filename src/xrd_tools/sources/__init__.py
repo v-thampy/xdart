@@ -27,10 +27,20 @@ if TYPE_CHECKING:
     )
     from xrd_tools.sources.base import BaseFrameSource, ensure_frame_source
     from xrd_tools.sources.composite import CompositeFrameSource, concat_sources
+    from xrd_tools.sources.cursor import (
+        ContainerCursor,
+        CursorClosedError,
+        ReadBlock,
+    )
     from xrd_tools.sources.descriptor import (
         ContainerDescriptor,
         describe_container,
         describe_container_from_open,
+    )
+    from xrd_tools.sources.metadata_provider import (
+        BlueskyMetadataProvider,
+        EmptyMetadataProvider,
+        MetadataProvider,
     )
     from xrd_tools.sources.directory_index import (
         DEFAULT_RETRY_DEADLINE,
@@ -67,13 +77,19 @@ if TYPE_CHECKING:
 
 _LAZY_EXPORTS = {
     "BaseFrameSource": "xrd_tools.sources.base",
+    "BlueskyMetadataProvider": "xrd_tools.sources.metadata_provider",
     "Candidate": "xrd_tools.sources.discover",
     "CompositeFrameSource": "xrd_tools.sources.composite",
+    "ContainerCursor": "xrd_tools.sources.cursor",
     "ContainerDescriptor": "xrd_tools.sources.descriptor",
+    "CursorClosedError": "xrd_tools.sources.cursor",
     "DEFAULT_RETRY_DEADLINE": "xrd_tools.sources.directory_index",
     "DirectoryIndex": "xrd_tools.sources.directory_index",
+    "EmptyMetadataProvider": "xrd_tools.sources.metadata_provider",
     "ImageFileSource": "xrd_tools.sources.image",
     "IndexDelta": "xrd_tools.sources.directory_index",
+    "MetadataProvider": "xrd_tools.sources.metadata_provider",
+    "ReadBlock": "xrd_tools.sources.cursor",
     "ReadPlan": "xrd_tools.sources.read_plan",
     "LiveFrameSource": "xrd_tools.sources.memory",
     "MemoryFrameSource": "xrd_tools.sources.memory",
@@ -126,14 +142,20 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "BaseFrameSource",
+    "BlueskyMetadataProvider",
     "Candidate",
     "CompositeFrameSource",
+    "ContainerCursor",
     "ContainerDescriptor",
+    "CursorClosedError",
     "DEFAULT_RETRY_DEADLINE",
     "DirectoryIndex",
+    "EmptyMetadataProvider",
     "FrameSource",
     "ImageFileSource",
     "IndexDelta",
+    "MetadataProvider",
+    "ReadBlock",
     "ReadPlan",
     "LiveFrameSource",
     "MemoryFrameSource",

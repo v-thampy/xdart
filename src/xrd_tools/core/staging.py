@@ -271,6 +271,52 @@ def reduction_worker_cap_log_line(workers, requested=None, *, overridden=False):
     return f"reduction workers: {workers}{req}{tag}"
 
 
+# ── R2: source-block (native-dtype read owner) byte accounting ──────────────
+# One block read returns a native-dtype array of ``block_frames`` frames that
+# many per-frame views share; its retained cost is charged ONCE per owner block,
+# never once per view.  This is a LOCAL source-prefetch byte budget only — H10
+# still owns the global coordinated budget across source prefetch, records,
+# publications, and workers.  Kept numpy-free (stdlib only): callers pass the
+# native ``itemsize`` in bytes (e.g. ``numpy.dtype(...).itemsize``).
+_MIB = 1024 * 1024
+#: Default maximum NATIVE bytes one source read block may retain.  Bounded so a
+#: large-frame Eiger stack reads a few native frames per block instead of the
+#: legacy fixed-16 float-expanded block; small-frame detectors still get a full
+#: native chunk.  Override with ``XDART_SOURCE_BLOCK_BYTES``.
+DEFAULT_SOURCE_BLOCK_BYTES = 64 * _MIB
+SOURCE_BLOCK_BYTES_ENV = "XDART_SOURCE_BLOCK_BYTES"
+
+
+def frame_native_bytes(frame_shape, itemsize: int) -> int:
+    """Native bytes of ONE frame: ``prod(frame_shape) * itemsize`` (exact big
+    ints, overflow-safe).  ``itemsize`` is bytes per element (native dtype)."""
+    n = 1
+    for dim in frame_shape:
+        n *= int(dim)
+    return n * int(itemsize)
+
+
+def source_block_bytes(frame_shape, itemsize: int, block_frames: int) -> int:
+    """Native bytes retained by one owner block of ``block_frames`` frames —
+    the charge-once cost the source prefetch queue must account per block."""
+    return frame_native_bytes(frame_shape, itemsize) * int(block_frames)
+
+
+def source_block_budget_bytes(*, env=None) -> int:
+    """The retained source-block byte budget: ``XDART_SOURCE_BLOCK_BYTES`` when
+    set to a positive integer, else :data:`DEFAULT_SOURCE_BLOCK_BYTES`."""
+    source = env if env is not None else os.environ
+    raw = source.get(SOURCE_BLOCK_BYTES_ENV)
+    if raw is not None and str(raw).strip():
+        try:
+            value = int(str(raw).strip())
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass  # malformed override → fall through to the default
+    return DEFAULT_SOURCE_BLOCK_BYTES
+
+
 __all__ = [
     "heavy_window",
     "heavy_window_log_line",
@@ -280,6 +326,9 @@ __all__ = [
     "total_physical_ram_bytes",
     "reduction_worker_cap",
     "reduction_worker_cap_log_line",
+    "frame_native_bytes",
+    "source_block_bytes",
+    "source_block_budget_bytes",
     "DEFAULT_WINDOW",
     "MIN_WINDOW",
     "MAX_WINDOW",
@@ -289,4 +338,6 @@ __all__ = [
     "DEFAULT_REDUCTION_WORKERS",
     "MAX_REDUCTION_WORKERS",
     "REDUCTION_WORKERS_ENV",
+    "DEFAULT_SOURCE_BLOCK_BYTES",
+    "SOURCE_BLOCK_BYTES_ENV",
 ]

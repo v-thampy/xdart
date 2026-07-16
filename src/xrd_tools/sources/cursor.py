@@ -1,0 +1,282 @@
+# -*- coding: utf-8 -*-
+"""``ContainerCursor`` — one owner-thread, one open handle per container (R2).
+
+The cursor replaces the R1/legacy pattern of reopening a NeXus/Eiger master
+independently for frame count, dataset lookup, wavelength, metadata, and every
+frame read.  ``__enter__`` opens ONE backend handle and resolves the
+entry/dataset once; the descriptor, wavelength, lazy metadata provider, frame
+count, single-frame reads, and byte-bounded block reads all derive from that
+same handle.  ``close()`` is idempotent and runs on success, Stop/cancel, probe
+failure, read failure, generator abandonment, and normal exit; reads after
+close fail clearly and never silently reopen.
+
+Ownership rules (handoff §4.2):
+
+* the cursor is owned and used by ONE thread — never pass its live h5py/dataset
+  objects or a :class:`ReadBlock` view across threads;
+* a 2-D dataset exposes exactly one frame at index 0 and rejects every other
+  index;
+* a stale R1 :class:`~xrd_tools.sources.discover.Candidate` (path/stamp changed
+  since discovery) is rejected with ``StaleCandidateError`` BEFORE the handle is
+  opened, so a late consumer never reads an old owner's bytes;
+* block reads return NATIVE detector dtype (no ``float64`` expansion); frame
+  views share memory with their owner block, which is charged once.
+
+The cursor does not introduce automatic incomplete-file consumption or any new
+SWMR/recovery policy: a provisional (unfinalized) container is described as
+such, and reads of a container with no detector dataset fail clearly.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from xrd_tools.sources.descriptor import (
+    ContainerDescriptor,
+    describe_container_from_open,
+)
+from xrd_tools.sources.metadata_provider import (
+    MetadataProvider,
+    metadata_provider_for_open_entry,
+)
+from xrd_tools.sources.read_plan import ReadPlan
+
+__all__ = ["ContainerCursor", "ReadBlock", "CursorClosedError"]
+
+
+class CursorClosedError(RuntimeError):
+    """Raised when a read is attempted on a closed :class:`ContainerCursor`."""
+
+
+@dataclass(frozen=True, slots=True)
+class ReadBlock:
+    """One native-dtype owner block covering frames ``[start, stop)``.
+
+    ``array`` is the single retained allocation; :meth:`frame` returns a memory
+    SHARING view into it, so many per-frame consumers cost the block once.
+    :attr:`nbytes` is what the queue/consumer must charge exactly once.
+    """
+
+    start: int
+    stop: int
+    array: np.ndarray
+
+    @property
+    def n_frames(self) -> int:
+        return self.stop - self.start
+
+    @property
+    def nbytes(self) -> int:
+        return int(self.array.nbytes)
+
+    def frame(self, index: int) -> np.ndarray:
+        """A memory-sharing view of the frame at absolute ``index``."""
+        offset = int(index) - self.start
+        if not 0 <= offset < self.array.shape[0]:
+            raise IndexError(
+                f"frame {index} not in block [{self.start}, {self.stop})")
+        return self.array[offset]
+
+
+class ContainerCursor:
+    """A context-managed, single-handle cursor over one NeXus/Eiger container."""
+
+    def __init__(self, path: str | Path, *, entry: str = "entry",
+                 candidate: Any = None) -> None:
+        self._path = Path(path)
+        self._entry = entry
+        self._candidate = candidate
+        self._h5: Any = None
+        self._stack: Any = None
+        self._entry_grp: Any = None
+        self._descriptor: ContainerDescriptor | None = None
+        self._provider: MetadataProvider | None = None
+        self._opened = False
+        self._closed = False
+
+    # -- lifecycle ------------------------------------------------------------
+    def __enter__(self) -> "ContainerCursor":
+        return self.open()
+
+    def open(self) -> "ContainerCursor":
+        if self._closed:
+            raise CursorClosedError(
+                f"cursor for {self._path} was already closed; open a new one")
+        if self._opened:
+            return self
+        # Reject a stale candidate BEFORE touching the file (handoff §4.2 / R1).
+        if self._candidate is not None:
+            self._reject_if_stale()
+
+        import h5py
+
+        from xrd_tools.io.bluesky_nexus import resolve_nxentry
+        from xrd_tools.io.nexus import NexusImageStack
+
+        try:
+            self._h5 = h5py.File(self._path, "r")
+        except Exception:
+            self._closed = True
+            raise
+        try:
+            self._descriptor = describe_container_from_open(
+                self._h5, path=self._path, entry=self._entry,
+                candidate=self._candidate)
+            try:
+                self._entry_grp = resolve_nxentry(self._h5, self._entry)
+            except Exception:
+                self._entry_grp = None
+            # Build the read stack over the SAME open handle only when a detector
+            # dataset was resolved; NexusImageStack takes ownership of the file.
+            paths = self._resolved_paths(self._descriptor)
+            if paths:
+                self._stack = NexusImageStack(self._h5, list(paths))
+        except Exception:
+            self.close()
+            raise
+        self._opened = True
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Idempotent close — runs on success, Stop, error, and abandonment."""
+        if self._closed:
+            return
+        self._closed = True
+        self._opened = False
+        stack, self._stack = self._stack, None
+        h5, self._h5 = self._h5, None
+        self._entry_grp = None
+        self._provider = None
+        if stack is not None:
+            try:
+                stack.close()  # NexusImageStack owns and closes the file handle
+            except Exception:
+                pass
+            h5 = None  # already closed via the stack; do not double-close
+        if h5 is not None:
+            try:
+                h5.close()
+            except Exception:
+                pass
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    # -- facts ----------------------------------------------------------------
+    @property
+    def descriptor(self) -> ContainerDescriptor:
+        self._require_open()
+        assert self._descriptor is not None
+        return self._descriptor
+
+    @property
+    def wavelength(self) -> float | None:
+        return self.descriptor.wavelength
+
+    @property
+    def frame_count(self) -> int:
+        return int(self.descriptor.frame_count)
+
+    @property
+    def is_2d(self) -> bool:
+        return bool(self.descriptor.is_2d)
+
+    def metadata_provider(self) -> MetadataProvider:
+        """The lazy metadata provider bound to this cursor's open handle.
+
+        Built once and cached; repeated metadata reads reuse it and open no new
+        master (handoff §4.3).
+        """
+        self._require_open()
+        if self._provider is None:
+            desc = self._descriptor
+            assert desc is not None
+            self._provider = metadata_provider_for_open_entry(
+                self._entry_grp, frame_count=desc.frame_count,
+                wavelength=desc.wavelength, is_bluesky=desc.is_bluesky)
+        return self._provider
+
+    def metadata_for(self, frame_index: int) -> Any:
+        return self.metadata_provider().metadata_for(frame_index)
+
+    # -- reads (native dtype) -------------------------------------------------
+    def read_frame(self, index: int) -> np.ndarray:
+        """Read one frame as a native-dtype array from the open handle."""
+        self._require_readable()
+        idx = int(index)
+        if self.is_2d and idx != 0:
+            raise IndexError(
+                f"2-D detector dataset exposes only frame 0; got {idx}")
+        return np.asarray(self._stack[idx])
+
+    def read_block(self, start: int, stop: int) -> ReadBlock:
+        """Read frames ``[start, stop)`` as one native-dtype owner block."""
+        self._require_readable()
+        s, e = int(start), int(stop)
+        if e <= s:
+            raise ValueError(f"empty block range [{s}, {e})")
+        array = np.asarray(self._stack[s:e])
+        return ReadBlock(start=s, stop=e, array=array)
+
+    def iter_blocks(self, plan: ReadPlan) -> Iterator[ReadBlock]:
+        """Yield each owner block for *plan*'s ranges, one at a time.
+
+        Only one block is live per iteration step; the consumer must charge each
+        :class:`ReadBlock` once and not retain more than the plan's inflight
+        budget.
+        """
+        self._require_readable()
+        for start, stop in plan.ranges:
+            yield self.read_block(start, stop)
+
+    # -- helpers --------------------------------------------------------------
+    @staticmethod
+    def _resolved_paths(descriptor: ContainerDescriptor) -> list[str]:
+        if descriptor.segment_paths:
+            return list(descriptor.segment_paths)
+        if descriptor.dataset_path:
+            return [descriptor.dataset_path]
+        return []
+
+    def _reject_if_stale(self) -> None:
+        from xrd_tools.sources.directory_index import StaleCandidateError
+
+        cand = self._candidate
+        if getattr(cand, "path", self._path) != self._path:
+            raise StaleCandidateError(
+                f"candidate path {getattr(cand, 'path', None)!r} does not match "
+                f"cursor path {self._path!r}")
+        try:
+            st = self._path.stat()
+        except OSError as exc:
+            raise StaleCandidateError(
+                f"{self._path} is no longer present since discovery: {exc}")
+        stamp = getattr(cand, "version_stamp", None)
+        if stamp is not None and (st.st_size, st.st_mtime_ns) != tuple(stamp):
+            raise StaleCandidateError(
+                f"{self._path} changed since discovery (size/mtime stamp "
+                "mismatch); re-poll and re-probe before consuming")
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise CursorClosedError(f"cursor for {self._path} is closed")
+        if not self._opened:
+            raise RuntimeError(
+                f"cursor for {self._path} is not open; use `with` or call open()")
+
+    def _require_readable(self) -> None:
+        self._require_open()
+        if self._stack is None:
+            desc = self._descriptor
+            reason = desc.reason if desc is not None else "no detector dataset"
+            raise ValueError(
+                f"{self._path} has no readable detector dataset ({reason})")

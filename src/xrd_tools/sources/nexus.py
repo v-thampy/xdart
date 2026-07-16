@@ -13,6 +13,9 @@ from xrd_tools.core.scan import ScanFrame, SourceCapabilities, SourceKind, Sourc
 from xrd_tools.io.frame_view import FrameViewReader
 from xrd_tools.io.nexus import open_nexus_image_stack
 from xrd_tools.sources.base import BaseFrameSource
+from xrd_tools.sources.metadata_provider import MetadataProvider
+
+_UNSET: Any = object()
 
 
 class NexusStackSource(BaseFrameSource):
@@ -36,18 +39,31 @@ class NexusStackSource(BaseFrameSource):
             ),
         )
 
+    def open_cursor(self):
+        """A context-managed :class:`~xrd_tools.sources.cursor.ContainerCursor`
+        for sustained consumption: one open handle supplies descriptor,
+        wavelength, metadata, frame count, single-frame reads, and block reads.
+        Sustained consumers (and :meth:`iter_chunks`) use ONE cursor for their
+        whole window; one-off :meth:`load_frame` uses a short-lived cursor."""
+        from xrd_tools.sources.cursor import ContainerCursor
+
+        return ContainerCursor(self.path, entry=self.entry)
+
     def load_frame(self, index: int) -> np.ndarray:
-        with open_nexus_image_stack(self.path, self.entry) as stack:
-            return np.asarray(stack[int(index)])
+        # One-off: a short-lived cursor (one open handle), native dtype.
+        with self.open_cursor() as cursor:
+            return np.asarray(cursor.read_frame(int(index)))
 
     def iter_chunks(self, chunk_size: int) -> Iterator[tuple[np.ndarray, list[int]]]:
         if chunk_size <= 0:
             raise ValueError(f"chunk_size must be > 0; got {chunk_size}")
         labels = self.frame_indices
-        with open_nexus_image_stack(self.path, self.entry) as stack:
+        # ONE cursor for the whole consumption window (no per-chunk reopen).
+        with self.open_cursor() as cursor:
             for start in range(0, len(labels), chunk_size):
                 chunk_labels = labels[start:start + chunk_size]
-                yield np.asarray(stack[start:start + len(chunk_labels)]), chunk_labels
+                block = cursor.read_block(start, start + len(chunk_labels))
+                yield np.asarray(block.array), chunk_labels
 
     def frame_for(self, index: int) -> ScanFrame:
         return ScanFrame(
@@ -62,75 +78,38 @@ class NexusStackSource(BaseFrameSource):
     # -- Bluesky / apstools NXWriter per-frame metadata --------------------
     # A Bluesky ``.nxs`` classifies as a NEXUS_STACK (raw image stack), so its
     # per-frame scan columns (motors + ion-chamber/photodiode counters + EPOCH)
-    # would otherwise be invisible to Plot Metadata.  Surface them here (motors
-    # as whole-array columns via ``motors``; counters/EPOCH per-frame via
-    # ``metadata_for``).  Guarded + cached so a plain image stack is untouched.
-    def _bluesky_columns(self) -> dict | None:
-        cache = getattr(self, "_bluesky_cache", "unset")
-        if cache != "unset":
+    # would otherwise be invisible to Plot Metadata.  Surface them through the
+    # R2 lazy metadata provider (motors as whole-array columns via ``motors``;
+    # counters/EPOCH per-frame via ``metadata_for``): a plain image stack gets an
+    # EmptyMetadataProvider (untouched), a Bluesky stack a BlueskyMetadataProvider
+    # with identical column semantics.  Built once through a short-lived cursor
+    # and MATERIALIZED before the cursor closes, so repeated metadata reads touch
+    # only memory and reopen no master.
+    def _metadata_provider(self) -> MetadataProvider | None:
+        cache = self.__dict__.get("_provider_cache", _UNSET)
+        if cache is not _UNSET:
             return cache
-        result: dict | None = None
+        provider: MetadataProvider | None = None
         try:
-            import h5py
-
-            from xrd_tools.io.bluesky_nexus import (
-                bluesky_angles,
-                bluesky_constant_metadata,
-                bluesky_per_frame_table,
-                is_bluesky_nxwriter,
-                resolve_nxentry,
-            )
-            with h5py.File(self.path, "r") as f:
-                e = resolve_nxentry(f, self.entry)
-                if e is not None and is_bluesky_nxwriter(e):
-                    table = {k: np.asarray(v)
-                             for k, v in bluesky_per_frame_table(e).items()}
-                    result = {
-                        "motors": {k: np.asarray(v)
-                                   for k, v in bluesky_angles(e).items()},
-                        "table": table,
-                        # Held-fixed motors + eiger counting time broadcast as
-                        # constant columns (see bluesky_constant_metadata).
-                        "constants": bluesky_constant_metadata(
-                            e, exclude=table.keys()),
-                    }
+            with self.open_cursor() as cursor:
+                p = cursor.metadata_provider()
+                p.scan_table()  # force materialization while the handle is open
+                provider = p
         except Exception:
-            result = None
-        self._bluesky_cache = result
-        return result
+            provider = None
+        self._provider_cache = provider
+        return provider
 
     @property
     def motors(self) -> dict[str, np.ndarray]:
-        cols = self._bluesky_columns()
-        return dict(cols["motors"]) if cols else {}
+        provider = self._metadata_provider()
+        return dict(provider.motors()) if provider is not None else {}
 
     def metadata_for(self, index: int) -> Mapping[str, Any]:
-        cols = self._bluesky_columns()
-        if not cols:
+        provider = self._metadata_provider()
+        if provider is None:
             return {}
-        table, motors = cols["table"], cols["motors"]
-        # F7a: labels are the contiguous ``range(n)`` built in ``__init__``, so
-        # the label IS the table position — O(1).  ``list.index`` was an O(n)
-        # scan per frame, turning the Plot-Metadata all-frames sweep into
-        # O(n²) (~2.5 s at 30k frames).  Bounds-checked, never negative-wrapped:
-        # an out-of-range label returns {} exactly as the old ValueError did.
-        pos = int(index)
-        if not 0 <= pos < len(self._frame_indices):
-            return {}
-        out: dict[str, Any] = {}
-        for name, arr in table.items():
-            if name in motors:
-                continue  # motors already surface as whole-array columns
-            if 0 <= pos < len(arr):
-                try:
-                    out[name] = float(arr[pos])
-                except (TypeError, ValueError):
-                    pass
-        # Constant per-scan columns (fixed motors + eiger count time) broadcast
-        # to every frame; setdefault so a per-frame column always wins.
-        for name, val in cols.get("constants", {}).items():
-            out.setdefault(name, float(val))
-        return out
+        return dict(provider.metadata_for(int(index)))
 
 
 class ProcessedNexusSource(BaseFrameSource):
