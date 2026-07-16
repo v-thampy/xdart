@@ -2957,6 +2957,11 @@ class H5Viewer(QWidget):
         if (not show_all
                 and getattr(self, "_browse_gesture_active", False)
                 and _browse_one_shot_enabled(self)):
+            # Keep the gesture cheap, but do not lose the rows crossed by OS
+            # key repeat.  Each selection signal contributes only its current
+            # frame label to the ordered intent list; disk I/O, hydration, and
+            # rendering remain deferred until the final key release.
+            H5Viewer._capture_overlay_visit_intent(self)
             self._browse_pending_data_changed = True
             browse_debug_log(
                 logger,

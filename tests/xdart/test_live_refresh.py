@@ -4076,8 +4076,7 @@ def test_active_browse_key_gesture_suppresses_selection_work():
             return super().selectedItems()
 
     list_data = CountingList(range(1, 22))
-    for row in range(list_data.count()):
-        list_data.item(row).setSelected(True)
+    list_data.setCurrentRow(20)
     selection_timer = _FakeTimer(active=False)
     viewer = SimpleNamespace(
         viewer_mode=None,
@@ -4103,6 +4102,43 @@ def test_active_browse_key_gesture_suppresses_selection_work():
     assert list_data.selected_calls == 0
     assert selection_timer.started == 0
     assert viewer._browse_pending_data_changed is True
+
+
+def test_active_overlay_browse_gesture_captures_each_crossed_frame_without_work():
+    list_data = _FakeListWidget(range(1, 22))
+    selection_timer = _FakeTimer(active=False)
+    load_timer = _FakeTimer(active=False)
+    update_timer = _FakeTimer(active=False)
+    viewer = SimpleNamespace(
+        viewer_mode=None,
+        _plot_method="Overlay",
+        _run_writing=False,
+        _browse_gesture_active=True,
+        _browse_pending_data_changed=False,
+        _overlay_visit_intent_labels=[],
+        frame_ids=["21"],
+        ui=SimpleNamespace(listData=list_data),
+        scan=SimpleNamespace(frames=SimpleNamespace(index=list(range(1, 22)))),
+        update_2d=True,
+        publication_store=None,
+        _pending_load_ids=None,
+        _pending_load_2d=True,
+        _update_coalesce_timer=update_timer,
+        _load_coalesce_timer=load_timer,
+        _selection_coalesce_timer=selection_timer,
+    )
+    viewer.data_changed = MethodType(H5Viewer.data_changed, viewer)
+
+    for row in (19, 18, 17):
+        list_data.setCurrentRow(row)
+        viewer.data_changed()
+
+    assert viewer._overlay_visit_intent_labels == [20, 19, 18]
+    assert viewer.frame_ids == ["21"]
+    assert viewer._browse_pending_data_changed is True
+    assert selection_timer.started == 0
+    assert load_timer.started == 0
+    assert update_timer.started == 0
 
 
 def test_active_browse_key_gesture_suppresses_worker_render_update():
