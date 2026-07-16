@@ -27,6 +27,11 @@ if TYPE_CHECKING:
     )
     from xrd_tools.sources.base import BaseFrameSource, ensure_frame_source
     from xrd_tools.sources.composite import CompositeFrameSource, concat_sources
+    from xrd_tools.sources.descriptor import (
+        ContainerDescriptor,
+        describe_container,
+        describe_container_from_open,
+    )
     from xrd_tools.sources.directory_index import (
         DEFAULT_RETRY_DEADLINE,
         DirectoryIndex,
@@ -36,6 +41,7 @@ if TYPE_CHECKING:
         StaleCandidateError,
     )
     from xrd_tools.sources.discover import Candidate, discover_scans, enumerate_candidates
+    from xrd_tools.sources.read_plan import ReadPlan, plan_reads
     from xrd_tools.sources.grouping import flatten_scan_groups, parse_scan_groups
     from xrd_tools.sources.image import ImageFileSource, TiffSeriesSource
     from xrd_tools.sources.memory import LiveFrameSource, MemoryFrameSource
@@ -63,10 +69,12 @@ _LAZY_EXPORTS = {
     "BaseFrameSource": "xrd_tools.sources.base",
     "Candidate": "xrd_tools.sources.discover",
     "CompositeFrameSource": "xrd_tools.sources.composite",
+    "ContainerDescriptor": "xrd_tools.sources.descriptor",
     "DEFAULT_RETRY_DEADLINE": "xrd_tools.sources.directory_index",
     "DirectoryIndex": "xrd_tools.sources.directory_index",
     "ImageFileSource": "xrd_tools.sources.image",
     "IndexDelta": "xrd_tools.sources.directory_index",
+    "ReadPlan": "xrd_tools.sources.read_plan",
     "LiveFrameSource": "xrd_tools.sources.memory",
     "MemoryFrameSource": "xrd_tools.sources.memory",
     "NexusStackSource": "xrd_tools.sources.nexus",
@@ -83,10 +91,13 @@ _LAZY_EXPORTS = {
     "all_adapters": "xrd_tools.sources.adapters",
     "concat_sources": "xrd_tools.sources.composite",
     "capabilities_for_processed": "xrd_tools.sources.readiness",
+    "describe_container": "xrd_tools.sources.descriptor",
+    "describe_container_from_open": "xrd_tools.sources.descriptor",
     "describe_source_readiness": "xrd_tools.sources.readiness",
     "discover_scans": "xrd_tools.sources.discover",
     "enumerate_candidates": "xrd_tools.sources.discover",
     "ensure_frame_source": "xrd_tools.sources.base",
+    "plan_reads": "xrd_tools.sources.read_plan",
     "flatten_scan_groups": "xrd_tools.sources.grouping",
     "get_adapter": "xrd_tools.sources.adapters",
     "guess_source_kind": "xrd_tools.sources.registry",
@@ -117,11 +128,13 @@ __all__ = [
     "BaseFrameSource",
     "Candidate",
     "CompositeFrameSource",
+    "ContainerDescriptor",
     "DEFAULT_RETRY_DEADLINE",
     "DirectoryIndex",
     "FrameSource",
     "ImageFileSource",
     "IndexDelta",
+    "ReadPlan",
     "LiveFrameSource",
     "MemoryFrameSource",
     "NexusStackSource",
@@ -141,10 +154,13 @@ __all__ = [
     "all_adapters",
     "capabilities_for_processed",
     "concat_sources",
+    "describe_container",
+    "describe_container_from_open",
     "describe_source_readiness",
     "discover_scans",
     "enumerate_candidates",
     "ensure_frame_source",
+    "plan_reads",
     "flatten_scan_groups",
     "get_adapter",
     "guess_source_kind",
