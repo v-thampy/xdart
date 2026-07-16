@@ -3147,7 +3147,18 @@ class H5Viewer(QWidget):
                 browse_one_shot = True
                 load_2d = False
 
-        read_idxs = tuple(overlay_visit_labels or int_idxs)
+        if overlay_visit_labels:
+            # A newer selection retires the current disk worker.  Keep every
+            # not-yet-rendered visit in the replacement load so coalescing can
+            # defer paint without turning Overlay into last-selection-wins.
+            pending_appends = tuple(getattr(
+                self, "_overlay_hydrated_pending_append_labels", ()) or ())
+            inflight_appends = tuple(getattr(
+                self, "_overlay_visit_inflight_labels", ()) or ())
+            read_idxs = tuple(dict.fromkeys(
+                pending_appends + inflight_appends + overlay_visit_labels))
+        else:
+            read_idxs = tuple(int_idxs)
         if overlay_visit_labels:
             # The visit batch is loaded as lightweight 1D data, while the
             # display hydrator fetches raw/cake for the final current frame.
@@ -3221,7 +3232,11 @@ class H5Viewer(QWidget):
                 self._browse_one_shot_pending_render = True
                 self._browse_one_shot_load_generation = None
                 if overlay_visit_labels:
-                    self._overlay_visit_inflight_labels = tuple(read_idxs)
+                    self._overlay_visit_inflight_labels = tuple(dict.fromkeys(
+                        tuple(getattr(
+                            self, "_overlay_visit_inflight_labels", ()) or ())
+                        + tuple(read_idxs)
+                    ))
                 browse_debug_log(
                     logger,
                     "bulk_hydration_scheduled",
@@ -3250,8 +3265,17 @@ class H5Viewer(QWidget):
             self._browse_one_shot_pending_render = False
             self._browse_one_shot_load_generation = None
             if overlay_visit_labels:
-                self._overlay_hydrated_pending_append_labels = list(
-                    overlay_visit_labels)
+                pending = getattr(
+                    self, "_overlay_hydrated_pending_append_labels", None)
+                if not isinstance(pending, list):
+                    pending = []
+                    self._overlay_hydrated_pending_append_labels = pending
+                queued = set(pending)
+                for label in read_idxs:
+                    if label not in queued:
+                        pending.append(label)
+                        queued.add(label)
+                self._overlay_visit_inflight_labels = ()
             elif browse_bulk_one_shot:
                 H5Viewer._queue_browse_anchor_heavy_after_render(
                     self, reason="resident_one_shot")
@@ -3911,8 +3935,16 @@ class H5Viewer(QWidget):
                 overlay_labels = tuple(
                     getattr(self, "_overlay_visit_inflight_labels", ()) or ())
                 if overlay_labels:
-                    self._overlay_hydrated_pending_append_labels = list(
-                        overlay_labels)
+                    pending = getattr(
+                        self, "_overlay_hydrated_pending_append_labels", None)
+                    if not isinstance(pending, list):
+                        pending = []
+                        self._overlay_hydrated_pending_append_labels = pending
+                    queued = set(pending)
+                    for label in overlay_labels:
+                        if label not in queued:
+                            pending.append(label)
+                            queued.add(label)
                     self._overlay_visit_inflight_labels = ()
                 else:
                     H5Viewer._queue_browse_anchor_heavy_after_render(

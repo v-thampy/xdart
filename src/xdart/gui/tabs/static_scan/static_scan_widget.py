@@ -5790,8 +5790,11 @@ class staticWidget(QWidget):
                     None,
                 )
                 if append_queue is not None:
-                    append_queue.clear()
-                    append_queue.extend(overlay_pending)
+                    queued = set(append_queue)
+                    for label in overlay_pending:
+                        if label not in queued:
+                            append_queue.append(label)
+                            queued.add(label)
                 else:
                     self.displayframe._overlay_hydrated_pending_append_labels = (
                         overlay_pending
@@ -6484,6 +6487,15 @@ class staticWidget(QWidget):
             self.displayframe, "invalidate_image_level_caches", None)
         if callable(invalidate_levels):
             invalidate_levels()
+        # The live-run file-thread mode deliberately turns set_datafile into a
+        # path-only repoint so a writer flush cannot replace the in-memory live
+        # frame index.  The writer is quiescent now, so manual browser opens must
+        # use the normal full load or the selected scan inherits the paused
+        # run's frame list.  _run_active stays true, which also keeps integrator
+        # hydration and all processing controls locked to the frozen run plan.
+        file_thread = getattr(self.h5viewer, "file_thread", None)
+        if file_thread is not None:
+            file_thread.live_run = False
         self.h5viewer.set_run_writing(False)
         request_repaint = getattr(
             self.displayframe, "request_current_selection_repaint", None)
@@ -6503,6 +6515,13 @@ class staticWidget(QWidget):
         if not self._run_active:
             return
         self._set_scan_integrated_reads_transient(True)
+        # Restore path-only live repoints before re-engaging the writer guard.
+        # The next frame-driven scan rescope can then return the browser to the
+        # active output without reloading a file that has resumed writing.
+        file_thread = getattr(self.h5viewer, "file_thread", None)
+        if file_thread is not None:
+            file_thread.live_run = bool(
+                getattr(self.h5viewer, "live_run_active", False))
         self.h5viewer.set_run_writing(True)
         self.displayframe.set_processing_active(True)
 

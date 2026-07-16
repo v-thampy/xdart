@@ -419,6 +419,7 @@ def test_on_run_paused_lifts_guard_but_keeps_run_active():
             request_current_selection_repaint=lambda **kwargs:
                 calls.append(('repaint', kwargs))),
         h5viewer=SimpleNamespace(
+            file_thread=SimpleNamespace(live_run=True),
             set_run_writing=lambda v: calls.append(('write', v))),
     )
     w._set_scan_integrated_reads_transient = MethodType(
@@ -427,23 +428,94 @@ def test_on_run_paused_lifts_guard_but_keeps_run_active():
     assert ('proc', False) in calls and ('write', False) in calls   # guard LIFTED
     assert ('levels', None) in calls
     assert ('repaint', {'generation': 9, 'reason': 'pause'}) in calls
+    assert w.h5viewer.file_thread.live_run is False
     assert w._run_active is True            # run still active, just frozen
 
 
 def test_on_run_resuming_reengages_guard_before_resume():
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
     calls = []
+    class _FileThread:
+        live_run = False
+
+    file_thread = _FileThread()
     w = SimpleNamespace(
         _run_active=True,
         displayframe=SimpleNamespace(
             set_processing_active=lambda v: calls.append(('proc', v))),
         h5viewer=SimpleNamespace(
-            set_run_writing=lambda v: calls.append(('write', v))),
+            live_run_active=True,
+            file_thread=file_thread,
+            set_run_writing=lambda v: calls.append(
+                ('write', v, file_thread.live_run))),
     )
     w._set_scan_integrated_reads_transient = MethodType(
         staticWidget._set_scan_integrated_reads_transient, w)  # no-op: host has no scan
     staticWidget._on_run_resuming(w)
-    assert ('write', True) in calls and ('proc', True) in calls     # guard RE-ENGAGED
+    assert ('write', True, True) in calls and ('proc', True) in calls
+    assert file_thread.live_run is True
+
+
+def test_active_paused_browse_does_not_hydrate_integrator_settings():
+    """A paused run may load display data, never a browsed scan's run config."""
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    calls = []
+    w = SimpleNamespace(
+        _run_active=True,
+        _controls_v2_enabled=lambda: True,
+        _controls_v2_ensure_native_int_defaults=lambda: calls.append("defaults"),
+        _controls_v2_hydrate_advanced_from_scan=lambda: calls.append("hydrate"),
+        _refresh_controls_v2_profile=lambda **kwargs: calls.append("refresh"),
+        integratorTree=SimpleNamespace(
+            hydrate_from_scan=lambda: calls.append("legacy")),
+    )
+
+    staticWidget._hydrate_integrator_on_load(w, "browsed_scan.nxs")
+
+    assert calls == []
+
+
+def test_paused_transition_enables_full_browser_frame_index_load():
+    """Pause switches the file thread from live repoint to normal scan load."""
+    from xdart.gui.tabs.static_scan.scan_threads import fileHandlerThread
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    loaded = []
+    scan = SimpleNamespace(
+        skip_2d=False,
+        frames=SimpleNamespace(data_file="live_output.nxs"),
+        set_datafile=lambda path: loaded.append(path),
+    )
+    file_thread = SimpleNamespace(
+        scan=scan,
+        fname="browsed_scan.nxs",
+        file_lock=threading.RLock(),
+        live_run=True,
+        no_nxs=False,
+        sigNewFile=SimpleNamespace(emit=lambda *_: None),
+        sigUpdate=SimpleNamespace(emit=lambda *_: None),
+    )
+    w = SimpleNamespace(
+        _run_active=True,
+        displayframe=SimpleNamespace(
+            display_generation=1,
+            set_processing_active=lambda _value: None,
+            invalidate_image_level_caches=lambda: None,
+            request_current_selection_repaint=lambda **_kwargs: None,
+        ),
+        h5viewer=SimpleNamespace(
+            file_thread=file_thread,
+            set_run_writing=lambda _value: None,
+        ),
+    )
+    w._set_scan_integrated_reads_transient = MethodType(
+        staticWidget._set_scan_integrated_reads_transient, w)
+
+    staticWidget._on_run_paused(w)
+    MethodType(fileHandlerThread.set_datafile, file_thread)()
+
+    assert loaded == ["browsed_scan.nxs"]
 
 
 def test_guard_lift_noop_when_not_in_run():

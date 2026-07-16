@@ -250,6 +250,75 @@ def _quiet(w):
 
 # ── production-wired outcome tests ───────────────────────────────────────────
 
+def test_disk_loaded_single_to_overlay_retains_six_rapid_visits(
+        qapp, widget, catchup_nxs):
+    """The Single seed and five disk-backed arrow taps all accumulate."""
+    from PySide6 import QtCore, QtGui
+
+    w = widget
+    w.scan.set_datafile(str(catchup_nxs), name=SCAN_NAME)
+    v = w.h5viewer
+    v.auto_last = False
+    v.new_scan_loaded = False
+    v.update_data(force_rebuild=True)
+    lw = v.ui.listData
+    lw.setCurrentRow(0, QtCore.QItemSelectionModel.ClearAndSelect)
+
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.02)
+        if _quiet(w) and w.displayframe.plot_data[1].shape[0] == 1:
+            break
+
+    w.displayframe.ui.plotMethod.setCurrentText("Overlay")
+    qapp.processEvents()
+    assert _history_ids(w) == ((SCAN_NAME, 1),)
+
+    press = QtGui.QKeyEvent(
+        QtCore.QEvent.Type.KeyPress,
+        QtCore.Qt.Key.Key_Down,
+        QtCore.Qt.KeyboardModifier.NoModifier,
+    )
+    release = QtGui.QKeyEvent(
+        QtCore.QEvent.Type.KeyRelease,
+        QtCore.Qt.Key.Key_Down,
+        QtCore.Qt.KeyboardModifier.NoModifier,
+    )
+    for row in range(1, 6):
+        assert v.eventFilter(lw, press) is False
+        lw.setCurrentRow(row, QtCore.QItemSelectionModel.ClearAndSelect)
+        qapp.processEvents()
+        assert v.eventFilter(lw, release) is False
+        time.sleep(0.19)
+        qapp.processEvents()
+
+    deadline = time.monotonic() + 8.0
+    expected = tuple((SCAN_NAME, label) for label in range(1, 7))
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.02)
+        if _quiet(w) and _history_ids(w) == expected:
+            break
+
+    assert _history_ids(w) == expected
+
+    w.displayframe.clear_1D()
+    assert w.displayframe._waterfall_history is None
+    assert list(w.displayframe._overlay_hydrated_pending_append_labels) == []
+
+    v.show_all()
+    all_rows = tuple((SCAN_NAME, label) for label in range(1, N_FRAMES + 1))
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.02)
+        if _quiet(w) and _history_ids(w) == all_rows:
+            break
+
+    assert _history_ids(w) == all_rows
+
+
 def test_runend_catchup_recovers_non_resident_tail_from_disk(
         qapp, widget, monkeypatch, catchup_nxs, caplog):
     """THE outcome test Item-2 lacked: after a live Overlay run whose tail
