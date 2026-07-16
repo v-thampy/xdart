@@ -303,6 +303,14 @@ def test_accumulate_waterfall_builds_and_appends_monotonically():
     np.testing.assert_array_equal(h.rows[1], [2, 2, 2])
 
 
+def test_canonical_axis_unit_recovers_storage_tokens_from_display_pairs():
+    assert dl.canonical_axis_unit("Q", dl._AA_INV) == "q_A^-1"
+    assert dl.canonical_axis_unit(f"2{dl._TH}", dl._DEG) == "2th_deg"
+    assert dl.canonical_axis_unit("Q<sub>ip</sub>", dl._AA_INV) == "qip_A^-1"
+    assert dl.canonical_axis_unit("Q<sub>total</sub>", dl._AA_INV) == "qtot_A^-1"
+    assert dl.canonical_axis_unit("Q", "q_nm^-1") == "q_nm^-1"
+
+
 def test_accumulate_waterfall_partial_read_never_shrinks_or_restacks():
     # Append-only within one reset_key: a failed/partial/re-delivered read can only
     # ADD frames it hasn't captured -- never shrink the stack or re-stack a frame

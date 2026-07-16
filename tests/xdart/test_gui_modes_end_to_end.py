@@ -2238,6 +2238,37 @@ def test_int_plot_accumulating_modes_characterize_update_plot_state(widget, meth
     assert rebuilt["x_axis"][0].startswith("2")
 
 
+def test_overlay_mode_entry_keeps_canonical_unit_for_next_append(widget, caplog):
+    """A displayed Q symbol and ``q_A^-1`` are the same storage unit.
+
+    Entering Overlay from Single seeds history from the rendered trace.  That
+    seed must retain a canonical axis token; otherwise the next native row is
+    rejected by the cross-unit guard as ``Angstrom^-1`` versus ``q_A^-1``.
+    """
+    w = widget
+    df = _set_int_scan(w, n=2, wavelength_m=None)
+    df.ui.plotMethod.setCurrentText("Single")
+    df.ui.plotUnit.setCurrentIndex(0)
+
+    w.frame_ids[:] = ["0"]
+    df.frame_ids = ["0"]
+    df.idxs_1d = [0]
+    df.idxs_2d = [0]
+    df.update()
+
+    df.ui.plotMethod.setCurrentText("Overlay")
+    assert df._waterfall_history.unit == "q_A^-1"
+
+    w.frame_ids[:] = ["1"]
+    df.frame_ids = ["1"]
+    df.idxs_1d = [1]
+    df.idxs_2d = [1]
+    df.update()
+
+    assert df._waterfall_history.ids == (("scan", 0), ("scan", 1))
+    assert "cross-unit row" not in caplog.text
+
+
 def test_directory_overlay_accumulates_reused_zero_index_at_live_cadence(
         widget):
     """Sixteen one-frame directory scans survive boundaries and auto-waterfall.

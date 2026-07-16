@@ -29,6 +29,7 @@ from .display_logic import (
     overlay_read_failure_action,
     OverlayAction,
     WaterfallHistory,
+    canonical_axis_unit,
     pretty_unit,
     nanmean_slice,
     resample_image_axis_to_uniform,
@@ -873,7 +874,8 @@ class DisplayPlotMixin:
         if len(names) < row_count:
             scan_name = getattr(getattr(self, "scan", None), "name", "scan")
             names = tuple(f"{scan_name}_{frame_index_from_row_id(i)}" for i in ids)
-        label, unit = self._current_plot_axis_label()
+        label, rendered_unit = self._current_plot_axis_label()
+        unit = canonical_axis_unit(label, rendered_unit)
         metadata = []
         for row_id in ids:
             try:

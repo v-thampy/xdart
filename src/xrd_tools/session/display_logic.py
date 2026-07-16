@@ -111,6 +111,7 @@ __all__ = [
     "x_axis_for_unit",
     "pretty_unit",
     "canonical_axis_key",
+    "canonical_axis_unit",
     "xye_unit_from_filename",
     "xye_prefix_for_unit",
     "default_plot_unit",
@@ -1573,6 +1574,40 @@ def canonical_axis_key(text):
     if 'q' in lower or _AA_INV in text:
         return 'q_A^-1'
     return lower.strip()
+
+
+def canonical_axis_unit(label, unit):
+    """Recover a canonical storage token from a rendered axis pair.
+
+    Plot payloads intentionally carry presentation symbols such as ``Å⁻¹``
+    and ``°``.  Accumulator storage must instead retain tokens such as
+    ``q_A^-1`` and ``2th_deg`` so a later native row is not rejected as a
+    cross-unit append.  Prefer an exact reverse lookup through the shared axis
+    table, then classify known display symbols for alternate label spellings
+    (notably GI unicode subscripts).  Unknown and scaled units such as
+    ``q_nm^-1`` pass through unchanged.
+    """
+    label = str(label or "")
+    unit = str(unit or "")
+    if unit in _X_AXIS_TABLE:
+        return unit
+    for token, axis_pair in _X_AXIS_TABLE.items():
+        if axis_pair == (label, unit):
+            return token
+
+    label_text = label.replace("<sub>", "").replace("</sub>", "")
+    label_lower = label_text.lower().replace("_", "")
+    if unit in {_AA_INV, "Å⁻¹", "A^-1", "angstrom^-1"}:
+        if "total" in label_lower or "qtot" in label_lower:
+            return "qtot_A^-1"
+        key = canonical_axis_key(f"{label} ({unit})")
+        if key in {"q_A^-1", "qip_A^-1", "qoop_A^-1"}:
+            return key
+    if unit == _DEG:
+        key = canonical_axis_key(f"{label} ({unit})")
+        if key in {"2th_deg", "chi_deg", "chigi_deg", "exit_angle_deg"}:
+            return key
+    return unit
 
 
 #: TwoDKind -> the display layer's legacy kind strings.  GI polar
