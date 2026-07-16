@@ -3143,6 +3143,14 @@ class H5Viewer(QWidget):
                 load_2d = False
 
         read_idxs = tuple(overlay_visit_labels or int_idxs)
+        if overlay_visit_labels:
+            # The visit batch is loaded as lightweight 1D data, while the
+            # display hydrator fetches raw/cake for the final current frame.
+            # Stamp that frame onto the one-shot snapshot so the display
+            # adapter can promote the richer authoritative publication when
+            # hydration completes instead of retaining the stale 1D row.
+            self._browse_one_shot_anchor_label = _current_selected_frame_label(
+                self, read_idxs)
 
         keys = set()
         store = getattr(self, "publication_store", None)

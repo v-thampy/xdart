@@ -4173,6 +4173,7 @@ def test_overlay_plain_step_drains_all_visit_intents_as_one_1d_batch():
         _overlay_visit_intent_labels=list(range(1, 22)),
         _overlay_visit_inflight_labels=(),
         _overlay_hydrated_pending_append_labels=[],
+        _browse_one_shot_anchor_label=None,
         frame_ids=[],
         ui=SimpleNamespace(listData=list_data),
         scan=SimpleNamespace(frames=SimpleNamespace(index=list(range(1, 22)))),
@@ -4189,6 +4190,7 @@ def test_overlay_plain_step_drains_all_visit_intents_as_one_1d_batch():
 
     assert viewer._pending_load_ids == list(range(1, 22))
     assert viewer._pending_load_2d is False
+    assert viewer._browse_one_shot_anchor_label == 21
     assert viewer._overlay_visit_inflight_labels == tuple(range(1, 22))
     assert load_timer.started == 1
     assert update_timer.started == 0
