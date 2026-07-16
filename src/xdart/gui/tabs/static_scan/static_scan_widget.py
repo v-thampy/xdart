@@ -92,6 +92,44 @@ def _processed_count_for_output(thread, output_file, run_total):
     return None
 
 
+def _finished_output_file(thread, wrangler, *, all_skipped_append=False):
+    """Resolve the existing processed output owned by a completed run.
+
+    Skip-before-read can consume an already-complete container without ever
+    calling ``initialize_scan``.  In that path ``thread.fname`` still contains
+    the provisional raw-derived name (for Eiger, ``*_master.nxs``), while the
+    append cursor records the canonical processed scan name it reached.
+    """
+    if all_skipped_append:
+        snapshots = getattr(thread, "_append_skip_frames_by_scan", None)
+        try:
+            items = list(snapshots.items())
+        except AttributeError:
+            items = []
+        output_path = getattr(thread, "_append_output_path", None)
+        for scan_name, frame_ids in reversed(items):
+            if not frame_ids:
+                continue
+            try:
+                candidate = (output_path(scan_name) if callable(output_path)
+                             else os.path.join(
+                                 os.fspath(getattr(thread, "h5_dir", "")),
+                                 f"{scan_name}.nxs"))
+            except (TypeError, ValueError):
+                continue
+            if candidate and os.path.exists(candidate):
+                return os.fspath(candidate)
+
+    for owner in (thread, wrangler):
+        candidate = getattr(owner, "fname", None)
+        try:
+            if candidate and os.path.exists(candidate):
+                return os.fspath(candidate)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _runend_callsite() -> str | None:
     if not browse_debug_enabled():
         return None
@@ -7375,6 +7413,11 @@ class staticWidget(QWidget):
             and processed_count == 0
             and append_skipped > 0
         )
+        finished_file = _finished_output_file(
+            thread,
+            self.wrangler,
+            all_skipped_append=all_skipped_append,
+        )
         browse_debug_log(
             logger,
             "runend_wrangler_counts",
@@ -7394,8 +7437,7 @@ class staticWidget(QWidget):
             # from eiger master filenames inside the thread, so the
             # widget's fname ends with ``_master.nxs`` but the actual
             # scan output is ``<stem>.nxs``).
-            generated_file = (getattr(self.wrangler.thread, 'fname', None)
-                              or getattr(self.wrangler, 'fname', None))
+            generated_file = finished_file
             if generated_file and os.path.exists(generated_file):
                 # Update directory display to point at the generated folder natively
                 generated_dir = os.path.dirname(generated_file)
@@ -7426,8 +7468,7 @@ class staticWidget(QWidget):
         # auto-loads + selects-last above; XYE-only has no .nxs to load.
         if (not is_batch and not is_xye_only and not _reintegrate_running
                 and not getattr(self, '_run_saw_frame', True)):
-            existing_file = (getattr(self.wrangler.thread, 'fname', None)
-                             or getattr(self.wrangler, 'fname', None))
+            existing_file = finished_file
             if existing_file and os.path.exists(existing_file):
                 existing_dir = os.path.dirname(existing_file)
                 if self.h5viewer.dirname != existing_dir:

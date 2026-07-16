@@ -23,9 +23,12 @@ class _StopTimer:
 
 def _finish_host(tmp_path, *, batch, saw_frame, xye_only=False,
                  reintegrate_running=False, write_mode="Overwrite",
-                 files_processed=None, append_skipped=0, indexed_count=0):
+                 files_processed=None, append_skipped=0, indexed_count=0,
+                 provisional_master=False):
     nxs = tmp_path / "scan.nxs"
     nxs.write_bytes(b"")                         # os.path.exists -> True
+    thread_fname = (tmp_path / "scan_master.nxs"
+                    if provisional_master else nxs)
     calls = []
     file_thread = SimpleNamespace(live_run=True, no_nxs=True, fname=str(nxs))
     h5viewer = SimpleNamespace(
@@ -38,9 +41,12 @@ def _finish_host(tmp_path, *, batch, saw_frame, xye_only=False,
     thread = SimpleNamespace(
         batch_mode=batch,
         xye_only=xye_only,
-        fname=str(nxs),
+        fname=str(thread_fname),
+        h5_dir=str(tmp_path),
         write_mode=write_mode,
         _append_skip_without_reading=append_skipped,
+        _append_skip_frames_by_scan={"scan": set(range(1, indexed_count + 1))},
+        _append_output_path=lambda scan_name: str(tmp_path / f"{scan_name}.nxs"),
     )
     if files_processed is not None:
         thread.files_processed = files_processed
@@ -133,6 +139,26 @@ def test_append_zero_frame_finish_forces_internal_reload(tmp_path):
     host.wrangler_finished()
     assert host._loaded_paths == [nxs]
     assert calls == [(nxs, True)], f"expected one internal reload; got {calls}"
+    assert h5viewer._auto_select_last_on_finish is True
+
+
+def test_append_all_skipped_before_scan_init_resolves_processed_output(tmp_path):
+    """Skip-before-read can consume every Eiger frame before initialize_scan.
+
+    In that path ``thread.fname`` retains its provisional raw-derived
+    ``*_master.nxs`` name.  Run-end recovery must resolve the reached append
+    target from the cursor snapshot instead of silently skipping the reload.
+    """
+    host, h5viewer, nxs, calls = _finish_host(
+        tmp_path, batch=False, saw_frame=False, write_mode="Append",
+        files_processed=0, append_skipped=651, indexed_count=651,
+        provisional_master=True)
+
+    host.wrangler_finished()
+
+    assert host._loaded_paths == [nxs]
+    assert calls == [(nxs, True)]
+    assert h5viewer.scan_name == "scan"
     assert h5viewer._auto_select_last_on_finish is True
 
 
