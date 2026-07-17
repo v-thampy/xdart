@@ -3764,7 +3764,15 @@ class imageThread(wranglerThread):
                                 self._eiger_master_path,
                                 scan_name,
                                 frame_idx + 1,   # 1-based img_number
-                                block[offset],
+                                # R2-R2: COPY the frame out of the owner block so
+                                # the block is released as soon as its frames are
+                                # dispatched.  Queuing a VIEW would pin the whole
+                                # native block while the NEXT block is read — two
+                                # live owner blocks at once, exceeding the
+                                # single-block byte budget.  Only ONE owner block
+                                # is ever live; the queued per-frame copies are a
+                                # separate, bounded (queue-depth x frame) cost.
+                                np.array(block[offset]),
                                 # Per-frame scan_info: the sidecar/scalar
                                 # metadata overlaid with the Bluesky per-frame
                                 # motor + counter row (so each frame carries its

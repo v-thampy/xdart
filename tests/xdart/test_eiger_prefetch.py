@@ -135,6 +135,88 @@ def test_prefetch_bulk_read_keeps_native_dataset_dtype(tmp_path):
     assert queued[2][3].dtype == np.uint16
 
 
+def test_prefetch_retains_at_most_one_owner_block(tmp_path):
+    """R2-R2: the prefetch worker copies each frame out of its native owner
+    block, so the block is released as soon as its frames are dispatched — at
+    most ONE source-owner block is ever live, never two (which would double the
+    single-block byte budget).  Fail-before (queuing views) pinned every block
+    the queue still held, so multiple owner blocks were live at once."""
+    import gc
+    import weakref
+
+    N = 8
+    data = np.arange(N * 4 * 4, dtype=np.uint16).reshape(N, 4, 4)
+    block_refs = []
+
+    class TrackingCursor:
+        frame_count = N
+        is_2d = False
+
+        def read_block(self, start, stop):
+            arr = np.array(data[int(start):int(stop)])   # a fresh native owner block
+            block_refs.append(weakref.ref(arr))
+            return _FakeReadBlock(arr)
+
+        def read_frame(self, idx):
+            return np.array(data[int(idx)])
+
+        def close(self):
+            pass
+
+    worker = _bare_image_thread()
+    worker.command = ""
+    worker._prefetch_stop_evt = threading.Event()
+    # A generous queue with NO consumer is the WORST case for owner retention:
+    # every dispatched frame stays queued, so a view would pin every block.
+    worker._prefetch_queue = queue.Queue(maxsize=1000)
+    worker._prefetch_error = None
+    worker._perf = None
+    worker._eiger_master_path = str(tmp_path / "m.nxs")
+    worker._eiger_frame_idx = 0
+    worker._eiger_nframes = N
+    worker._eiger_cursor = TrackingCursor()
+    worker._eiger_read_plan = SimpleNamespace(block_frames=2)  # 2-frame blocks
+    worker._eiger_provider = None
+    worker._eiger_fabio_handle = None
+
+    calls = {"n": 0}
+
+    def fake_sync():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            worker._eiger_frame_idx = 1
+            return (worker._eiger_master_path, "scan", 1,
+                    np.zeros((4, 4), np.uint16), {})
+        return (None, None, 1, None, {})
+
+    worker._get_next_eiger_frame_sync = fake_sync
+
+    max_live = [0]
+    orig_push = worker._push_frame_to_queue
+
+    def sampling_push(item, **kwargs):
+        gc.collect()
+        n_live = sum(1 for ref in block_refs if ref() is not None)
+        max_live[0] = max(max_live[0], n_live)
+        return orig_push(item, **kwargs)
+
+    worker._push_frame_to_queue = sampling_push
+    worker._prefetch_worker()
+
+    assert max_live[0] <= 1, (
+        f"retained {max_live[0]} simultaneous native owner blocks (budget is one)")
+    # every frame was still dispatched (frame 1 via sync + 2..N via blocks)
+    queued = []
+    while not worker._prefetch_queue.empty():
+        it = worker._prefetch_queue.get_nowait()
+        if it[3] is not None:
+            queued.append(it[2])
+    assert queued == list(range(1, N + 1))
+    # after the worker drains, no owner block is retained at all
+    gc.collect()
+    assert all(ref() is None for ref in block_refs)
+
+
 def test_prefetch_worker_keeps_generation_handles_during_cleanup(tmp_path):
     """A timed-out Stop cleanup may clear public handles while the old reader
     is still returning from HDF5.  The worker must finish through its own event
