@@ -151,16 +151,27 @@ def test_batch_skips_unreadable_frame_without_repoll(tmp_path):
 # exited -> live Eiger stalled.  _read_eiger_frame_tolerant must wait (refreshing
 # the handle) until the data lands, then read it -- exercised on the REAL h5py
 # read path with a resizable dataset that grows to simulate the data landing.
-def _eiger_stub(dset, master_path, *, batch_mode, deadline=30.0, command="live"):
+def _eiger_stub(master_path, *, batch_mode, deadline=30.0, command="live"):
     import threading
+
+    from xrd_tools.sources.cursor import ContainerCursor
+
+    # R2: the h5py-backed read path now goes through the sustained cursor; the
+    # growth-refresh reopens it (reopen-to-refresh, the fabio-reopen analogue).
     stub = types.SimpleNamespace(
         command=command, batch_mode=batch_mode,
         _prefetch_stop_evt=threading.Event(),
-        _eiger_fabio_handle=None, _eiger_h5_dataset=dset,
-        _eiger_master_path=str(master_path), _eiger_nframes=dset.shape[0],
+        _eiger_fabio_handle=None,
+        _eiger_cursor=ContainerCursor(str(master_path)).open(),
+        _eiger_read_plan=None, _eiger_provider=None,
+        _eiger_master_path=str(master_path),
         FRAME_READ_DEADLINE=deadline,
     )
-    stub._eiger_refresh_master_handle = _imageThread()._eiger_refresh_master_handle.__get__(stub)
+    stub._eiger_nframes = stub._eiger_cursor.frame_count
+    stub._eiger_bind_cursor = _imageThread()._eiger_bind_cursor.__get__(stub)
+    stub._eiger_reopen_cursor = _imageThread()._eiger_reopen_cursor.__get__(stub)
+    stub._eiger_refresh_master_handle = (
+        _imageThread()._eiger_refresh_master_handle.__get__(stub))
     return stub
 
 
@@ -173,13 +184,14 @@ def test_eiger_read_waits_for_lagging_data_frame_then_reads(tmp_path, monkeypatc
     h = h5py.File(f, "r+")
     try:
         dset = h["d"]
-        stub = _eiger_stub(dset, f, batch_mode=False, deadline=30.0)
+        stub = _eiger_stub(f, batch_mode=False, deadline=30.0)
 
         import xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread as mod
 
         def fake_sleep(_dt):
             if dset.shape[0] == 3:
                 dset.resize((10, 8, 8))          # the lagging data file lands
+                h.flush()                        # commit so the reopened cursor sees it
         monkeypatch.setattr(mod.time, "sleep", fake_sleep)
 
         arr = it._read_eiger_frame_tolerant(stub, 5)   # frame 5 absent -> wait -> read
@@ -196,7 +208,7 @@ def test_eiger_read_batch_returns_none_without_waiting(tmp_path):
         h.create_dataset("d", data=np.zeros((3, 8, 8), "i4"))
     h = h5py.File(f, "r")
     try:
-        stub = _eiger_stub(h["d"], f, batch_mode=True)
+        stub = _eiger_stub(f, batch_mode=True)
         assert it._read_eiger_frame_tolerant(stub, 5) is None   # missing frame, no retry, no raise
     finally:
         h.close()
@@ -210,7 +222,7 @@ def test_eiger_read_returns_none_on_stop(tmp_path):
         h.create_dataset("d", data=np.zeros((3, 8, 8), "i4"))
     h = h5py.File(f, "r")
     try:
-        stub = _eiger_stub(h["d"], f, batch_mode=False, command="stop", deadline=60.0)
+        stub = _eiger_stub(f, batch_mode=False, command="stop", deadline=60.0)
         assert it._read_eiger_frame_tolerant(stub, 5) is None
     finally:
         h.close()

@@ -3095,10 +3095,8 @@ class imageThread(wranglerThread):
         # per-frame metadata provider + all sustained reads (no repeated
         # per-container traversal).  fabio stays primary for real Eiger above.
         try:
-            from xrd_tools.core.staging import source_block_budget_bytes
             from xrd_tools.sources.cursor import ContainerCursor
             from xrd_tools.sources.probe import ProbeState
-            from xrd_tools.sources.read_plan import plan_reads
 
             cursor = ContainerCursor(master_path, entry='entry').open()
             desc = cursor.descriptor
@@ -3126,20 +3124,7 @@ class imageThread(wranglerThread):
                 self._eiger_close_master()
                 self._eiger_nframes = 0
                 return
-            self._eiger_cursor = cursor
-            self._eiger_nframes = cursor.frame_count
-            # Layout-aware, byte-bounded block plan (retires the fixed-16 block).
-            self._eiger_read_plan = plan_reads(
-                desc.frame_count, desc.frame_shape, desc.dtype, desc.chunks,
-                source_block_budget_bytes(), two_d=desc.is_2d)
-            # Materialize the metadata provider WHILE the handle is open (this
-            # thread), so later per-frame scan_info reopens no master.
-            self._eiger_provider = cursor.metadata_provider()
-            try:
-                self._eiger_provider.scan_table()
-            except Exception:
-                logger.debug('provider materialize skipped for %s',
-                             master_path, exc_info=True)
+            self._eiger_bind_cursor(cursor)
             self._eiger_open_state = "ready"
             self._emit_container_count(master_path, self._eiger_nframes)
         except ProcessedXdartInputError:
@@ -3162,6 +3147,51 @@ class imageThread(wranglerThread):
             self._eiger_open_state = "open error"
             self._eiger_close_master()
             self._eiger_nframes = 0
+
+    def _eiger_bind_cursor(self, cursor):
+        """Adopt an OPEN ``ContainerCursor`` as the active h5py-backed read
+        backend: record the frame count, compute the layout-aware byte-bounded
+        ``ReadPlan``, and MATERIALIZE the metadata provider while the handle is
+        open (this = the prefetch owner thread), so later per-frame reads reopen
+        no master."""
+        from xrd_tools.core.staging import source_block_budget_bytes
+        from xrd_tools.sources.read_plan import plan_reads
+
+        desc = cursor.descriptor
+        self._eiger_cursor = cursor
+        self._eiger_nframes = cursor.frame_count
+        self._eiger_read_plan = plan_reads(
+            desc.frame_count, desc.frame_shape, desc.dtype, desc.chunks,
+            source_block_budget_bytes(), two_d=desc.is_2d)
+        self._eiger_provider = cursor.metadata_provider()
+        try:
+            self._eiger_provider.scan_table()
+        except Exception:
+            logger.debug('provider materialize skipped for %s',
+                         getattr(desc, 'path', None), exc_info=True)
+
+    def _eiger_reopen_cursor(self):
+        """Close and reopen the h5py-backed cursor to pick up frames written
+        since it was opened — the growth-refresh analogue of the fabio reopen
+        (same reopen-to-refresh mechanism, NOT a new SWMR/recovery policy; the
+        pop still defers unfinalized masters).  Best-effort; recomputes the
+        frame count + read plan + provider."""
+        from xrd_tools.sources.cursor import ContainerCursor
+
+        path = self._eiger_master_path
+        if self._eiger_cursor is not None:
+            try:
+                self._eiger_cursor.close()
+            except Exception:
+                pass
+            self._eiger_cursor = None
+        if path is None:
+            return
+        cursor = ContainerCursor(path, entry='entry').open()
+        if cursor.descriptor.dataset_path is None:
+            cursor.close()
+            return
+        self._eiger_bind_cursor(cursor)
 
     @staticmethod
     def _h5_stack_nframes(dset):
@@ -3857,10 +3887,10 @@ class imageThread(wranglerThread):
                 self._eiger_fabio_handle = fabio.open(self._eiger_master_path)
                 self._eiger_nframes = self._eiger_fabio_handle.nframes
             elif self._eiger_cursor is not None:
-                # The R2 cursor is a FINALIZED-container handle (the pop defers
-                # unfinalized masters), so its frame count is stable — no SWMR
-                # growth tracking is introduced.  Re-read it defensively.
-                self._eiger_nframes = self._eiger_cursor.frame_count
+                # Growth-refresh analogue of the fabio reopen: reopen the cursor
+                # so a subsequent read sees frames written since it was opened
+                # (reopen-to-refresh, NOT a new SWMR policy).
+                self._eiger_reopen_cursor()
         except Exception as e:
             logger.debug("Failed to refresh Eiger handle for %s: %s",
                          getattr(self, "_eiger_master_path", None), e)
