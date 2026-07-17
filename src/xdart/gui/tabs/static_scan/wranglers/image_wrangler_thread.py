@@ -3784,6 +3784,18 @@ class imageThread(wranglerThread):
                                     item, prefetch_queue=prefetch_queue,
                                     stop_evt=stop_evt):
                                 return
+                        # R2-R2 (final): EXPLICITLY release this group's owner
+                        # block (and the last dispatched copy) BEFORE the next
+                        # ``read_block`` — Python evaluates that call while a
+                        # still-bound ``block`` owns the PREVIOUS array, so
+                        # without this two owner blocks are live at every read
+                        # boundary, doubling the single-block byte budget.  The
+                        # same release keeps the final block from surviving the
+                        # blocking sync-read wait between masters and the
+                        # read-failure fallback below; the early Stop returns
+                        # free the frame's locals outright.
+                        block = None
+                        item = None
                     if bulk_failed:
                         break
         except Exception as e:
