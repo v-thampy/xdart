@@ -337,12 +337,19 @@ class NexusWriteCursor:
     groups: dict[str, tuple[int, int | None, tuple]] = field(default_factory=dict)
     metadata: tuple[int, int | None, tuple] | None = None
     instrument: tuple | None = None
-    # H1: labels whose row for a given group is permanently unwritable
-    # (publication-gate-rejected, or lazy-reloaded with no result).  Excluded
-    # from append selection so they aren't re-lazy-loaded inside the open
-    # writer handle and re-skipped (with a warning) on every save.
-    # {group_path: set(labels)}
+    # PF-1d: labels whose row for a given group the PUBLICATION GATE
+    # intentionally rejected (e.g. an all-dummy GI 2D row).  Excluded from
+    # append selection so they aren't re-validated and re-skipped (with a
+    # warning) on every save.  A row whose result merely has not been computed
+    # YET is *pending*, never dropped — it must stay eligible for the flush
+    # that runs after its result lands.  {group_path: set(labels)}
     dropped: dict = field(default_factory=dict)
+    # PF-1d: labels selected for the CURRENT save whose frame was resident but
+    # carried no result for that group's mode (skipped this flush as pending).
+    # Rebuilt on every save; consumed by LiveScan._save_to_nexus so the
+    # persist-before-evict marking never promises durability for a mode that
+    # was not committed.  {group_path: set(labels)}
+    pending: dict = field(default_factory=dict)
 
 
 def _write_cursor(scan, h5f) -> NexusWriteCursor:
@@ -577,6 +584,11 @@ def save_scan_to_nexus(
             cleanup_reintegrate_shadow_groups(
                 h5f, entry=entry, spare_active_pid=os.getpid())
         cursor = _write_cursor(scan, h5f)
+        # PF-1d: ``pending`` is per-save state (labels selected this save whose
+        # mode result has not been computed yet) — rebuild it every save so the
+        # persist marking in LiveScan._save_to_nexus sees only THIS save's
+        # deferrals, never a stale prior set.
+        cursor.pending = {}
 
         # 1. Stacked integrated_1d and integrated_2d (delegated to
         #    xrd_tools.io.nexus.write_integrated_stack).  Select and
@@ -697,6 +709,31 @@ def save_scan_to_nexus(
             _write_stitched(f, scan, entry=entry)
             _t0 = _tick("stitched", _t0)
 
+        # PF-1d: honest mode-complete durability accounting at finalize.  A
+        # run summary's "processed N" must not imply N Int 2D-complete frames
+        # when fewer cakes are durable — report per-group on-disk rows and
+        # WARN when an ACTIVE mode is incomplete (skip_2d scans legitimately
+        # have no 2D group; replace/shadow saves have their own coverage
+        # validation above).
+        if finalize and not is_replace:
+            total = len(scan.frames.index)
+            legs = [(integrated_1d_group_name, write_integrated_1d)]
+            if not getattr(scan, "skip_2d", False):
+                legs.append((integrated_2d_group_name, write_integrated_2d))
+            counts = [
+                (gname, _existing_dataset_n(h5f, f"{entry}/{gname}"))
+                for gname, active in legs if active
+            ]
+            summary = ", ".join(f"{g} {n}/{total}" for g, n in counts)
+            incomplete = [g for g, n in counts if n < total]
+            if incomplete:
+                _logger.warning(
+                    "finalize durability: %s — INCOMPLETE mode(s) on disk: %s",
+                    summary, ", ".join(incomplete),
+                )
+            else:
+                _logger.info("finalize durability: %s", summary)
+
     if _verbose:
         _logger.debug("save_scan_to_nexus[close+TOTAL]: %.3fs",
                       time.time() - _t_total)
@@ -804,6 +841,21 @@ def _new_frames_for_write(scan, h5f, group_path: str,
     total_n = len(scan.frames.index)
     if existing_n > total_n:
         return [], -1
+
+    # PF-1d: an append flush writes only rows whose frame is RESIDENT in the
+    # in-memory window.  A label missing from disk whose frame is NOT resident
+    # is *pending* (not computed yet this run, or intentionally
+    # publication-dropped earlier): persist-before-evict guarantees no
+    # unpersisted fresh result is ever evicted, so a non-resident label has
+    # nothing in memory to write — and materializing it here would lazy-reload
+    # it from disk inside the open writer handle on EVERY flush.  This is what
+    # keeps a first Int 2D Append flush from widening a new 2D group to every
+    # label in the loaded union index (the PF-1d interior-prefix data loss).
+    in_memory = getattr(scan.frames, "_in_memory", None)
+
+    def _resident(label) -> bool:
+        return in_memory is None or int(label) in in_memory
+
     if cursor is not None and group_path in cursor.groups:
         cached_n, cached_last, cached_sig = cursor.groups[group_path]
         disk_last = (
@@ -817,7 +869,7 @@ def _new_frames_for_write(scan, h5f, group_path: str,
                 and cached_sig == memory_sig and memory_last == disk_last):
             _drop = cursor.dropped.get(group_path, ()) if cursor else ()
             new_indices = [i for i in scan.frames.index[existing_n:]
-                           if int(i) not in _drop]
+                           if int(i) not in _drop and _resident(i)]
             return [scan.frames[i] for i in new_indices], existing_n
     # Select frames whose *label* isn't already on disk, not a positional
     # tail slice.  A late/out-of-order frame (e.g. frame 1 arriving after
@@ -838,7 +890,8 @@ def _new_frames_for_write(scan, h5f, group_path: str,
             return [], -2
     _drop = cursor.dropped.get(group_path, ()) if cursor else ()
     new_indices = [i for i in scan.frames.index
-                   if int(i) not in on_disk and int(i) not in _drop]
+                   if int(i) not in on_disk and int(i) not in _drop
+                   and _resident(i)]
     new_frames = [scan.frames[i] for i in new_indices]
     return new_frames, existing_n
 
@@ -1209,28 +1262,28 @@ def _prepare_integrated_1d(f, scan, *, entry: str,
     mode_1d, mode_2d = _active_mode_keys(scan)
     results = [getattr(fr, "int_1d", None) for fr in frames]
     if any(r is None for r in results):
-        # H1: drop result-less rows PER FRAME, never the whole save (a frame
-        # lazy-reloaded after its row was publication-dropped has int_1d=None
-        # forever; the old all-or-nothing skip silently truncated every
-        # LATER frame's write too).  Remember the labels on the cursor so
-        # they aren't re-selected (and re-lazy-loaded inside the open
-        # writer) on every subsequent save.
+        # H1 + PF-1d: skip result-less rows PER FRAME, never the whole save —
+        # but a missing result is PENDING (this mode has not been computed for
+        # that frame yet, e.g. an Int 2D Append that has not revisited it), so
+        # it must NOT enter ``cursor.dropped``: that set is reserved for
+        # intentional publication-gate rejections, and dropping here is what
+        # permanently excluded the 1D-only prefix's later-computed rows
+        # (PF-1d).  Selection is resident-only, so a skipped label costs no
+        # lazy reload on the next flush.
         kept = [(fr, i, r) for fr, i, r in zip(frames, indices, results)
                 if r is not None]
         missing = [int(i) for fr, i, r in zip(frames, indices, results)
                    if r is None]
+        if cursor is not None and replace_frame_indices is None and missing:
+            cursor.pending.setdefault(group_path, set()).update(missing)
         if not kept:
             # EVERY selected row lacks a result: structural (this output was
-            # never computed for these frames), not the H1 mixed-drop
-            # pathology -- skip silently and leave the cursor alone (a later
-            # reintegrate may fill them in).
+            # never computed for these frames) -- nothing to write this flush.
             return None
-        if cursor is not None and replace_frame_indices is None:
-            cursor.dropped.setdefault(group_path, set()).update(missing)
-        logger.warning(
-            "integrated_%s: skipping %d frame(s) with no result (%s%s); "
-            "writing the remaining %d.", "1d", len(missing), missing[:8],
-            "..." if len(missing) > 8 else "", len(kept),
+        logger.debug(
+            "integrated_%s: %d selected frame(s) have no result yet (%s%s); "
+            "writing %d and leaving the rest pending.", "1d", len(missing),
+            missing[:8], "..." if len(missing) > 8 else "", len(kept),
         )
         frames = [fr for fr, _i, _r in kept]
         indices = [i for _fr, i, _r in kept]
@@ -1296,28 +1349,29 @@ def _prepare_integrated_2d(f, scan, *, entry: str,
     mode_1d, mode_2d = _active_mode_keys(scan)
     results = [getattr(fr, "int_2d", None) for fr in frames]
     if any(r is None for r in results):
-        # H1: drop result-less rows PER FRAME, never the whole save (a frame
-        # lazy-reloaded after its row was publication-dropped has int_2d=None
-        # forever; the old all-or-nothing skip silently truncated every
-        # LATER frame's write too).  Remember the labels on the cursor so
-        # they aren't re-selected (and re-lazy-loaded inside the open
-        # writer) on every subsequent save.
+        # H1 + PF-1d: skip result-less rows PER FRAME, never the whole save —
+        # but a missing result is PENDING (this mode has not been computed for
+        # that frame yet, e.g. an Int 2D Append that has not revisited it), so
+        # it must NOT enter ``cursor.dropped``: that set is reserved for
+        # intentional publication-gate rejections, and dropping here is what
+        # permanently excluded the 1D-only prefix's later-computed cakes
+        # (PF-1d: 2D held 1..8 + 97..143 while 9..96 stayed absent).
+        # Selection is resident-only, so a skipped label costs no lazy reload
+        # on the next flush.
         kept = [(fr, i, r) for fr, i, r in zip(frames, indices, results)
                 if r is not None]
         missing = [int(i) for fr, i, r in zip(frames, indices, results)
                    if r is None]
+        if cursor is not None and replace_frame_indices is None and missing:
+            cursor.pending.setdefault(group_path, set()).update(missing)
         if not kept:
             # EVERY selected row lacks a result: structural (this output was
-            # never computed for these frames), not the H1 mixed-drop
-            # pathology -- skip silently and leave the cursor alone (a later
-            # reintegrate may fill them in).
+            # never computed for these frames) -- nothing to write this flush.
             return None
-        if cursor is not None and replace_frame_indices is None:
-            cursor.dropped.setdefault(group_path, set()).update(missing)
-        logger.warning(
-            "integrated_%s: skipping %d frame(s) with no result (%s%s); "
-            "writing the remaining %d.", "2d", len(missing), missing[:8],
-            "..." if len(missing) > 8 else "", len(kept),
+        logger.debug(
+            "integrated_%s: %d selected frame(s) have no result yet (%s%s); "
+            "writing %d and leaving the rest pending.", "2d", len(missing),
+            missing[:8], "..." if len(missing) > 8 else "", len(kept),
         )
         frames = [fr for fr, _i, _r in kept]
         indices = [i for _fr, i, _r in kept]

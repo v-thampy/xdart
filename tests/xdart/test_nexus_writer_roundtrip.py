@@ -2529,12 +2529,17 @@ def test_gi_freeze_diagnostic_persisted_in_provenance(tmp_path):
 
 
 def test_one_resultless_frame_does_not_block_later_2d_writes(tmp_path):
-    """H1 (fresh-eyes review): a frame whose int_2d is missing (publication-
-    dropped row lazy-reloaded as None, reload-only frame, ...) must be skipped
+    """H1 (fresh-eyes review): a frame whose int_2d is missing must be skipped
     PER FRAME — the old all-or-nothing check silently skipped the ENTIRE 2D
     write for that save and every save after it (1D complete, 2D truncated,
-    no error).  The dropped label is remembered on the write cursor so later
-    saves don't re-select (and re-lazy-load) it."""
+    no error).
+
+    PF-1d update: a missing result is PENDING, never DROPPED —
+    ``cursor.dropped`` is reserved for intentional publication-gate
+    rejections.  The permanent drop is what excluded an Int 2D Append's
+    later-computed cakes forever (the live 1..8 + 97..143 data loss); a
+    pending label stays eligible, so when its result lands a later save
+    writes it."""
     import h5py
     from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
 
@@ -2550,15 +2555,25 @@ def test_one_resultless_frame_does_not_block_later_2d_writes(tmp_path):
     assert idx_2d == [0, 2], "valid frames' 2D rows must still be written"
     assert idx_1d == [0, 1, 2], "1D unaffected (filtered independently)"
     cursor = scan._nexus_write_cursor
-    assert 1 in cursor.dropped.get("entry/integrated_2d", set())
+    assert 1 not in cursor.dropped.get("entry/integrated_2d", set()), \
+        "a not-yet-computed row is pending, never dropped (PF-1d)"
+    assert 1 in cursor.pending.get("entry/integrated_2d", set())
 
-    # Later frames + a second save: the dropped label is NOT re-selected,
-    # new frames write normally.
+    # Later frames + a second save: the pending label is harmlessly skipped
+    # again (still no result), new frames write normally.
     scan.frames.append(_DuckArch(idx=3))
     save_scan_to_nexus(scan, path, mode="a", finalize=False)
     with h5py.File(path, "r") as f:
         idx_2d = sorted(int(x) for x in f["entry/integrated_2d/frame_index"][()])
     assert idx_2d == [0, 2, 3]
+
+    # ...and when the pending frame's result finally lands, the next save
+    # WRITES it — the exact recovery the permanent drop forbade.
+    scan.frames[1].int_2d = _DuckArch(idx=1).int_2d
+    save_scan_to_nexus(scan, path, mode="a", finalize=False)
+    with h5py.File(path, "r") as f:
+        idx_2d = sorted(int(x) for x in f["entry/integrated_2d/frame_index"][()])
+    assert idx_2d == [0, 1, 2, 3]
 
 
 def test_gi_freeze_diagnostic_persists_on_later_save(tmp_path):

@@ -572,15 +572,24 @@ class LiveScan:
                 entry=entry, finalize=finalize,
                 replace_frame_indices=replace_frame_indices,
             )
-            # Persist-before-evict (data-loss guard): every frame now in the
-            # index is written to disk, so the in-memory cache may evict them.
-            # Until this mark, ``LiveFrameSeries.stash`` refuses to drop them
-            # (their int_1d/int_2d live only on the in-memory LiveFrame). Only
+            # Persist-before-evict (data-loss guard): frames written by this
+            # save may be evicted from the in-memory cache.  Until this mark,
+            # ``LiveFrameSeries.stash`` refuses to drop them (their
+            # int_1d/int_2d live only on the in-memory LiveFrame).  Only
             # reached on a successful save — a raising writer leaves the frames
             # unmarked (and therefore un-evictable).
+            # PF-1d: durability is PER RESULT MODE — a label the writer
+            # deferred as pending for ANY group (a resident frame whose mode
+            # result was not committed this save) must NOT be marked: a
+            # durable 1D row cannot authorize evicting a fresh, not-yet-
+            # durable 2D result.
             mark = getattr(self.frames, "mark_persisted", None)
             if callable(mark):
-                mark(list(self.frames.index))
+                cursor = getattr(self, "_nexus_write_cursor", None)
+                pending: set[int] = set()
+                for labels in (getattr(cursor, "pending", None) or {}).values():
+                    pending.update(int(i) for i in labels)
+                mark([i for i in self.frames.index if int(i) not in pending])
             return dropped
 
     def load_from_h5(self, replace=True, mode='r', *args, **kwargs):
