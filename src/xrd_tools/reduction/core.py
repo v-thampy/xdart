@@ -1806,10 +1806,28 @@ def run_reduction(
             # returns False when it drops a frame (cancel / writer-death mid-
             # wait) — stop feeding promptly rather than spin the remaining frames
             # against a cancelled session.
-            for frame in session.scan:
-                if session.cancel_token.cancelled:
-                    break
-                if not session.submit(frame):
+            #
+            # SOURCE-FED input seam (R2-R1): the pixels come from the ORIGINAL
+            # FrameSource's sustained cursor via ``iter_chunks`` (ONE open handle,
+            # native-dtype reads) on THIS producer thread, and are handed to
+            # ``submit(frame, image)`` as decoded numpy arrays — so no live h5py/
+            # fabio handle ever crosses into a reduction worker and the public
+            # ``open_source(...) -> run_reduction(...)`` path never reopens the
+            # file per frame.  ``submit``'s semaphore bounds in-flight memory, so
+            # the cursor cannot outrun the workers.  A plain ``Scan`` source
+            # yields ``None`` images here and keeps its existing per-frame
+            # (in-memory / lazy) load behavior unchanged.
+            stop = False
+            for chunk_frames, chunk_images in _iter_reduction_chunks(
+                    session.source, session.scan, chunk_size):
+                for frame, image in zip(chunk_frames, chunk_images):
+                    if session.cancel_token.cancelled:
+                        stop = True
+                        break
+                    if not session.submit(frame, image):
+                        stop = True
+                        break
+                if stop:
                     break
         else:
             session.process()
