@@ -2223,6 +2223,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             if _ass is not None:
                 _ass()
         payload = ctrl.build_payload(self, state)  # store=None ⇒ delegate draws
+        if getattr(self, "_overlay_grid_cancel_pending", False):
+            self._overlay_grid_cancel_pending = False
+            cancel = getattr(self, "_cancel_overlay_grid_selection", None)
+            if callable(cancel):
+                cancel()
+            return True
         plot_payload = getattr(payload, "plot", None)
         plot_traces = tuple(getattr(plot_payload, "traces", ()) or ())
         history = getattr(plot_payload, "plot_history", None)

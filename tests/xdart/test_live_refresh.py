@@ -1954,6 +1954,141 @@ def test_set_processing_active_sets_flag():
     assert host._processing_active is False
 
 
+def test_overlay_grid_mismatch_is_nonmodal_during_active_run(caplog):
+    current = {
+        "reset_key": ("q", 1000, False), "axis_kind": "q",
+        "unit": "q_A^-1", "values": np.linspace(1.0, 8.4, 1000),
+    }
+    selected = {
+        "reset_key": ("q", 1000, False), "axis_kind": "q",
+        "unit": "q_A^-1", "values": np.linspace(1.0, 5.1, 1000),
+    }
+    host = SimpleNamespace(
+        _run_active=True,
+        h5viewer=SimpleNamespace(
+            _run_writing=True, _browser_previous_context={"file": "old"}),
+        displayframe=SimpleNamespace(_processing_active=True),
+        _ask_overlay_grid_mismatch=lambda *_args: pytest.fail(
+            "active run must never open the modal"),
+    )
+
+    with caplog.at_level(logging.INFO):
+        decision = staticWidget._resolve_overlay_grid_mismatch(
+            host, current, selected)
+
+    assert decision == "reset"
+    assert host.h5viewer._browser_previous_context == {"file": "old"}
+    assert any("starting a new overlay" in record.message
+               for record in caplog.records)
+
+
+def test_directory_scan_boundary_compares_concrete_first_frame_axis(caplog):
+    from xdart.gui.tabs.static_scan.display_overlay_utils import (
+        overlay_grid_key_for_widget)
+    from xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.session.display_logic import accumulate_waterfall
+
+    old_x = np.linspace(1.0, 8.4, 1000, dtype=np.float32)
+    df = SimpleNamespace(
+        scan=SimpleNamespace(
+            name="scanB", gi=False,
+            bai_1d_args={"numpoints": 1000}, bai_2d_args={}),
+        _plot_axis_info=({"source": "1d", "axis": "radial"},),
+        ui=SimpleNamespace(
+            plotMethod=SimpleNamespace(currentText=lambda: "Overlay"),
+            plotUnit=SimpleNamespace(
+                currentText=lambda: "Q (Å⁻¹)", currentIndex=lambda: 0),
+            slice=SimpleNamespace(
+                isChecked=lambda: False, isEnabled=lambda: False)),
+    )
+    reset_key = overlay_grid_key_for_widget(df, npt=old_x.size)
+    df._waterfall_history = accumulate_waterfall(
+        None, reset_key=reset_key, unit="q_A^-1", x=old_x,
+        rows=[np.ones(old_x.size)], ids=[("scanA", 0)], names=["scanA/0"])
+    host = SimpleNamespace(displayframe=df)
+
+    def frame(radial):
+        return SimpleNamespace(
+            idx=0,
+            int_1d=IntegrationResult1D(
+                radial=np.asarray(radial, dtype=np.float32),
+                intensity=np.ones(len(radial), dtype=np.float32),
+                sigma=None, unit="q_A^-1"),
+            int_2d=None, map_raw=None, mask=None, gi=False, gi_2d={},
+            thumbnail=None, bg_raw=0, scan_info={}, source_file="scanB.tif",
+            source_frame_idx=0)
+
+    assert staticWidget._overlay_clear_needed_for_scan_boundary(
+        host, first_frame=frame(old_x.copy())) is False
+    with caplog.at_level(logging.INFO):
+        assert staticWidget._overlay_clear_needed_for_scan_boundary(
+            host, first_frame=frame(np.linspace(1.0, 5.1, 1000))) is True
+    assert any("starting a new overlay" in record.message
+               for record in caplog.records)
+
+
+def test_overlay_grid_mismatch_manual_choice_is_forwarded_transactionally():
+    current = {
+        "reset_key": ("q", 3, False), "axis_kind": "q",
+        "unit": "q_A^-1", "values": np.asarray([1.0, 2.0, 3.0]),
+    }
+    selected = {
+        "reset_key": ("q", 3, False), "axis_kind": "q",
+        "unit": "q_A^-1", "values": np.asarray([1.0, 2.0, 4.0]),
+    }
+    seen = []
+    host = SimpleNamespace(
+        _run_active=False,
+        h5viewer=SimpleNamespace(
+            _run_writing=False, _browser_previous_context={"file": "old"}),
+        displayframe=SimpleNamespace(_processing_active=False),
+        _ask_overlay_grid_mismatch=lambda old, new: (
+            seen.append((old, new)), "cancel")[-1],
+    )
+
+    assert staticWidget._resolve_overlay_grid_mismatch(
+        host, current, selected) == "cancel"
+    assert seen == [(current, selected)]
+    assert host.h5viewer._browser_previous_context == {"file": "old"}
+
+    host._ask_overlay_grid_mismatch = lambda *_args: "reset"
+    assert staticWidget._resolve_overlay_grid_mismatch(
+        host, current, selected) == "reset"
+    assert host.h5viewer._browser_previous_context is None
+
+
+def test_update_overlay_cancel_restores_selection_before_any_panel_draw(
+        monkeypatch):
+    import xdart.gui.tabs.static_scan.display_frame_widget as dfw
+    from xdart.gui.tabs.static_scan.display_logic import Mode
+
+    events = []
+    state = SimpleNamespace(mode=Mode.INT_1D, generation=3)
+
+    class _Controller:
+        @staticmethod
+        def build_payload(widget, _state):
+            events.append("build")
+            widget._overlay_grid_cancel_pending = True
+            return SimpleNamespace()
+
+    monkeypatch.setattr(dfw, "controller_for", lambda _mode: _Controller())
+    host = SimpleNamespace(
+        get_idxs=lambda: events.append("get_idxs"),
+        _note_selection_generation=lambda: events.append("generation"),
+        _updated=lambda: True,
+        _live_display_state=lambda: state,
+        _apply_share_axis_state=lambda: events.append("share_axis"),
+        _cancel_overlay_grid_selection=lambda: events.append("restore"),
+        render_display=lambda *_args: events.append("render"),
+    )
+
+    assert displayFrameWidget._update_impl(host) is True
+    assert events == [
+        "get_idxs", "generation", "share_axis", "build", "restore"]
+    assert host._overlay_grid_cancel_pending is False
+
+
 def _empty_update_host(processing, persist=True):
     """Host that drives update()'s nothing-to-draw branch with empty caches
     (the silent-batch case): _updated() False, no cached data."""
@@ -4954,6 +5089,50 @@ def test_browser_file_first_frame_disarms_reset_and_reloads_selection():
         "data_reset",
         "data_changed",
     ]
+
+
+def test_cancelled_overlay_browse_restores_prior_file_and_frames():
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    assert app is not None
+    events = []
+    list_data = QtWidgets.QListWidget()
+    list_data.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+    list_data.addItems(["1", "2", "3", "4", "5"])
+    viewer = SimpleNamespace(
+        _browser_previous_context={
+            "file": "/data/old.nxs", "frame_ids": ("2", "4")},
+        _browser_scan_reset_pending=False,
+        _browser_restore_in_progress=False,
+        frame_ids=["9"],
+        ui=SimpleNamespace(listData=list_data),
+        displayframe=SimpleNamespace(
+            set_axes=lambda: events.append("set_axes")),
+        set_file=lambda path, **kwargs: events.append(
+            ("set_file", path, kwargs)),
+        _restore_loaded_scan_selection=lambda: events.append("restore_scan"),
+        update=lambda: events.append("update"),
+        data_changed=lambda: events.append(
+            ("data_changed", tuple(viewer.frame_ids))),
+        sigThreadFinished=SimpleNamespace(
+            emit=lambda: events.append("finished")),
+        _auto_select_last_on_finish=False,
+    )
+
+    assert H5Viewer.restore_browser_context(viewer) is True
+    assert viewer._browser_restore_in_progress is True
+    assert viewer._browser_scan_reset_pending is True
+    assert events[:2] == [
+        ("set_file", "/data/old.nxs", {"internal": True}), "restore_scan"]
+
+    H5Viewer.thread_finished(viewer, "set_datafile")
+
+    assert viewer.frame_ids == ["2", "4"]
+    assert {item.text() for item in list_data.selectedItems()} == {"2", "4"}
+    assert viewer._browser_restore_in_progress is False
+    assert viewer._browser_scan_reset_pending is False
+    assert viewer._browser_previous_context is None
+    assert events[-4:] == [
+        "update", "set_axes", ("data_changed", ("2", "4")), "finished"]
 
 
 def test_viewer_cleanup_stress_drops_stale_chunks_across_mode_switches():

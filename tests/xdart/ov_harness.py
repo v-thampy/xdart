@@ -24,8 +24,9 @@ After EVERY event the harness renders and asserts the OV acceptance contract
 (live_findings_ledger, "Acceptance test that covers the OV family"):
 
 INV-1  Accumulator row count is MONOTONIC non-decreasing, except at an
-       explicitly-allowed reset cause: CLEAR, INCOMPATIBLE_GRID (reset_key
-       change), REINTEGRATE, SAME_NAME_RERUN, METHOD_SWITCH — the
+       explicitly-allowed reset cause: CLEAR, INCOMPATIBLE_GRID (coarse key or
+       concrete sampled-axis change), REINTEGRATE, SAME_NAME_RERUN,
+       METHOD_SWITCH — the
        :class:`~xrd_tools.session.display_logic.LifecycleCause` enum of
        V2's single ``AccumulatorLifecycle`` owner, adopted 1:1.  A
        display-unit flip RELABELS, never resets; a REAL norm-channel change
@@ -781,9 +782,18 @@ class OVHarness:
                              unit=native_unit)
         self.widget.frame_ids[:] = []
         self.widget.display_generation += 1
-        if not compatible and not same_name_rerun:
+        concrete_compatible = bool(
+            compatible
+            and int(npt) == int(grid["npt"])
+            and str(native_unit) == str(grid.get("unit", "q_A^-1"))
+            and np.allclose(
+                np.asarray(x_range, dtype=float),
+                np.asarray(grid["x_range"], dtype=float),
+                rtol=1e-5, atol=1e-8, equal_nan=True)
+        )
+        if not concrete_compatible and not same_name_rerun:
             # The S-14 reset (if any) already emptied the accumulator, so an
-            # incompatible grid then builds fresh without a second reset.
+            # incompatible concrete grid then builds fresh without a second reset.
             self.expect_reset(INCOMPATIBLE_GRID)
         return self._step(
             f"rescope(scan={new_scan}, compatible={compatible}, npt={npt}, "

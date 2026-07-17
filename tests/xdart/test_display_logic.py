@@ -415,7 +415,8 @@ def test_accumulate_waterfall_row_meta_replace_drop_and_reset():
     h4 = dl.accumulate_waterfall(
         h3, reset_key=("radial", 4, True), unit="q",
         x=np.array([0.0, 1.0, 2.0, 3.0]), rows=np.ones((1, 4)),
-        ids=[("scan", 5)], names=["s5"], row_meta=[m_new])
+        ids=[("scan", 5)], names=["s5"], row_meta=[m_new],
+        mismatch_policy=dl.GridMismatchPolicy.RESET)
     assert h4.ids == (("scan", 5),)
     assert h4.row_meta == (m_new,)
 
@@ -423,9 +424,9 @@ def test_accumulate_waterfall_row_meta_replace_drop_and_reset():
 def test_accumulate_waterfall_d1_canonicalizes_cross_native_unit_rows():
     # V1 Stage 3 (D1): a grid-compatible append whose NATIVE unit is the
     # other member of the Q↔2θ pair converts its x with each row's OWN
-    # carried wavelength, then the BL-6 value interp aligns it — the
+    # carried wavelength, then explicit overlap interpolation aligns it — the
     # accumulator grid/unit stay the history's, and the peak lands at the
-    # correct PHYSICAL q.
+    # correct physical q.
     np = pytest.importorskip("numpy")
     lam = 1e-10
     xq = np.linspace(1.0, 5.0, 200)
@@ -446,34 +447,37 @@ def test_accumulate_waterfall_d1_canonicalizes_cross_native_unit_rows():
     out = dl.accumulate_waterfall(
         hist, reset_key="grid", unit="2th_deg", x=x_tth,
         rows=[row_b], ids=[("B", 0)], names=["B/0"],
-        row_meta=[dl.RowMeta(source_unit="2th_deg", wavelength_m=lam)])
+        row_meta=[dl.RowMeta(source_unit="2th_deg", wavelength_m=lam)],
+        mismatch_policy=dl.GridMismatchPolicy.INTERPOLATE_OVERLAP)
     assert list(out.ids) == [("A", 0), ("B", 0)]
     assert out.unit == "q_A^-1"                     # grid/unit stay native
     np.testing.assert_array_equal(np.asarray(out.x), xq)
     b_row = np.asarray(out.rows)[1]
-    peak_q = float(out.x[int(np.argmax(b_row))])
+    peak_q = float(out.x[int(np.nanargmax(b_row))])
     assert abs(peak_q - 3.0) < 2 * float(xq[1] - xq[0])
     assert np.ptp(b_row[np.isfinite(b_row)]) > 0    # no disjoint-domain clamp
 
 
-def test_accumulate_waterfall_d1_lambda_less_cross_unit_batch_skipped():
-    # V1 Stage 3 (D1): the same cross-native-unit append with NO carried
-    # wavelength cannot canonicalize, so the batch is SKIPPED with an ERROR
-    # — the production QW-4 tripwire (no env gate; since Stage 4 grid size
-    # is irrelevant: the same-size relabel fallback is deleted).
+def test_accumulate_waterfall_d1_lambda_less_cross_unit_batch_errors_or_resets():
+    # Without a carried wavelength the cross-native unit cannot canonicalize.
+    # The default fails closed; RESET explicitly starts on the incoming grid.
     np = pytest.importorskip("numpy")
-    import logging as _logging
     xq = np.linspace(1.0, 5.0, 200)
     hist = dl.accumulate_waterfall(
         None, reset_key="grid", unit="q_A^-1", x=xq,
         rows=[np.linspace(1.0, 2.0, 200)], ids=[("A", 0)], names=["A/0"])
     x_tth = np.linspace(10.0, 55.0, 128)
-    out = dl.accumulate_waterfall(
-        hist, reset_key="grid", unit="2th_deg", x=x_tth,
+    kwargs = dict(
+        reset_key="grid", unit="2th_deg", x=x_tth,
         rows=[np.linspace(5.0, 6.0, 128)], ids=[("B", 0)], names=["B/0"],
         row_meta=[dl.RowMeta(source_unit="2th_deg", wavelength_m=None)])
-    assert list(out.ids) == [("A", 0)]              # skipped, nothing lost
-    assert out.unit == "q_A^-1"                     # the axis never lies
+    with pytest.raises(dl.IncompatibleGridError):
+        dl.accumulate_waterfall(hist, **kwargs)
+    out = dl.accumulate_waterfall(
+        hist, **kwargs, mismatch_policy=dl.GridMismatchPolicy.RESET)
+    assert list(out.ids) == [("B", 0)]
+    assert out.unit == "2th_deg"
+    np.testing.assert_array_equal(out.x, x_tth)
 
 
 def test_accumulate_waterfall_reset_key_change_resets():
@@ -482,7 +486,8 @@ def test_accumulate_waterfall_reset_key_change_resets():
     h = dl.accumulate_waterfall(None, reset_key="gridA", unit="q", x=x,
                                 rows=np.ones((1, 3)), ids=[7], names=["s7"])
     h = dl.accumulate_waterfall(h, reset_key="gridB", unit="q", x=x,
-                                rows=np.full((1, 3), 9.0), ids=[0], names=["s0"])
+                                rows=np.full((1, 3), 9.0), ids=[0], names=["s0"],
+                                mismatch_policy=dl.GridMismatchPolicy.RESET)
     assert h.reset_key == "gridB" and h.ids == (0,) and h.count == 1
     np.testing.assert_array_equal(h.rows[0], [9, 9, 9])
 
@@ -551,13 +556,12 @@ def test_waterfall_display_rows_decimates_rows_and_ids_together():
     assert display_ids == ids[::3]
 
 
-def test_accumulate_waterfall_lambda_less_cross_unit_same_size_batch_skipped():
+def test_accumulate_waterfall_lambda_less_cross_unit_same_size_batch_errors():
     # V1 Stage 4: the legacy same-size relabel branch is DELETED — a display
     # Q<->2theta toggle converts at draw and never reaches the accumulator,
     # so a same-size cross-unit batch can only be a cross-NATIVE-unit append.
-    # Without carried wavelengths it cannot canonicalize (D1) and is SKIPPED
-    # (pre-Stage-4 the same call relabelled the grid in place to the incoming
-    # unit): the history keeps its grid, unit and every row.
+    # Without carried wavelengths it cannot canonicalize (D1), so the default
+    # fails closed (pre-Stage-4 the same call relabelled the grid in place).
     np = pytest.importorskip("numpy")
     xq = np.array([1.0, 2.0, 3.0])
     h = None
@@ -565,21 +569,18 @@ def test_accumulate_waterfall_lambda_less_cross_unit_same_size_batch_skipped():
         h = dl.accumulate_waterfall(h, reset_key="A", unit="q_A^-1", x=xq,
                                     rows=np.full((1, 3), float(i)), ids=[i], names=[f"s{i}"])
     xtth = np.array([5.0, 10.0, 15.0])     # same size -> relabel used to engage
-    h2 = dl.accumulate_waterfall(
-        h, reset_key="A", unit="2th_deg", x=xtth,
-        rows=np.full((1, 3), 9.0), ids=[3], names=["s3"])
-    assert h2.count == 3 and h2.unit == "q_A^-1"           # batch skipped
-    assert h2.ids == (0, 1, 2)                             # new row NOT appended
-    np.testing.assert_array_equal(h2.x, xq)                # grid NOT relabelled
-    np.testing.assert_array_equal(h2.rows[0], [0, 0, 0])   # rows unchanged
-    np.testing.assert_array_equal(h2.rows[2], [2, 2, 2])
+    with pytest.raises(dl.IncompatibleGridError):
+        dl.accumulate_waterfall(
+            h, reset_key="A", unit="2th_deg", x=xtth,
+            rows=np.full((1, 3), 9.0), ids=[3], names=["s3"])
+    assert h.count == 3 and h.unit == "q_A^-1"
+    assert h.ids == (0, 1, 2)
 
 
-def test_accumulate_waterfall_cross_unit_with_evicted_frames_keeps_full_stack():
+def test_accumulate_waterfall_cross_unit_with_evicted_frames_fails_closed():
     # λ-less cross-unit batch where only the resident tail comes in (older
-    # frames evicted past the store cap): the batch is skipped (Stage 4 — no
-    # relabel fallback) and the accumulator keeps the FULL stack on its own
-    # native grid (pre-Stage-4 the same call relabelled the grid to xtth).
+    # frames evicted past the store cap): default ERROR must not mutate the
+    # existing full stack.
     np = pytest.importorskip("numpy")
     xq = np.array([1.0, 2.0, 3.0])
     h = None
@@ -587,13 +588,14 @@ def test_accumulate_waterfall_cross_unit_with_evicted_frames_keeps_full_stack():
         h = dl.accumulate_waterfall(h, reset_key="A", unit="q_A^-1", x=xq,
                                     rows=np.full((1, 3), float(i)), ids=[i], names=[f"s{i}"])
     xtth = np.array([5.0, 10.0, 15.0])
-    h2 = dl.accumulate_waterfall(
-        h, reset_key="A", unit="2th_deg", x=xtth,
-        rows=np.vstack([np.full(3, 2.0), np.full(3, 3.0)]),
-        ids=[2, 3], names=["s2", "s3"])
-    assert h2.count == 4                                   # nothing lost
-    assert h2.unit == "q_A^-1"                             # native unit kept
-    np.testing.assert_array_equal(h2.x, xq)                # grid NOT relabelled
+    with pytest.raises(dl.IncompatibleGridError):
+        dl.accumulate_waterfall(
+            h, reset_key="A", unit="2th_deg", x=xtth,
+            rows=np.vstack([np.full(3, 2.0), np.full(3, 3.0)]),
+            ids=[2, 3], names=["s2", "s3"])
+    assert h.count == 4
+    assert h.unit == "q_A^-1"
+    np.testing.assert_array_equal(h.x, xq)
 
 
 def _legacy_accumulate_waterfall(
@@ -690,18 +692,14 @@ def test_accumulate_waterfall_geometric_buffer_matches_legacy_byte_for_byte():
     rng = np.random.default_rng(20260704)
     old = None
     new = None
-    x_by_unit = {
-        "q_A^-1": np.array([0.1, 0.2, 0.4, 0.8], dtype=float),
-        "2th_deg": np.array([1.0, 2.0, 4.0, 8.0], dtype=float),
-    }
+    x = np.array([0.1, 0.2, 0.4, 0.8], dtype=float)
     live_ids = [("scan", i, "__live__") for i in range(5)]
 
     for step in range(160):
         reset_key = ("radial", 4, bool(rng.integers(0, 2)))
         if rng.random() < 0.12:
             reset_key = ("azimuthal", 4, bool(rng.integers(0, 2)))
-        unit = "2th_deg" if rng.random() < 0.25 else "q_A^-1"
-        x = x_by_unit[unit]
+        unit = "q_A^-1"
         n_rows = int(rng.integers(0, 5))
         row_ids = []
         for _ in range(n_rows):
@@ -723,7 +721,8 @@ def test_accumulate_waterfall_geometric_buffer_matches_legacy_byte_for_byte():
         new = dl.accumulate_waterfall(
             new, reset_key=reset_key, unit=unit, x=x, rows=rows,
             ids=row_ids, names=names, label="Q", metadata=metadata,
-            replace_ids=replace_ids, drop_ids=drop_ids)
+            replace_ids=replace_ids, drop_ids=drop_ids,
+            mismatch_policy=dl.GridMismatchPolicy.RESET)
 
         assert new.reset_key == old.reset_key
         assert new.unit == old.unit

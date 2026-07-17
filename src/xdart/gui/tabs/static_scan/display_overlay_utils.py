@@ -10,8 +10,10 @@ import numpy as np
 from .display_constants import Chi, Qip_s, Qoop_s, Qtot_s, Th
 from .display_logic import (
     frame_index_from_qualified_id,
+    overlay_axes_compatible,
     overlay_grid_keys_compatible,
     overlay_grid_reset_key,
+    overlay_grid_summary,
     qualified_frame_id,
     scan_key_from_qualified_id,
 )
@@ -409,3 +411,65 @@ def overlay_identity_for_widget(
 
 def overlay_grid_keys_match(left, right):
     return overlay_grid_keys_compatible(left, right)
+
+
+def overlay_grid_spec_for_view(widget, view, *, axis_info=None):
+    """Return the concrete sampled grid selected from one FrameView."""
+    axis_info = axis_info or current_axis_info(widget)
+    needs_2d = overlay_needs_2d(widget, axis_info)
+    if needs_2d:
+        axis = (
+            getattr(view, "axis_2d_y", None)
+            if axis_info.get("axis") == "azimuthal"
+            else getattr(view, "axis_2d_x", None)
+        )
+    else:
+        axis = getattr(view, "axis_1d", None)
+    values = getattr(axis, "values", None)
+    if values is None:
+        return None
+    values = np.asarray(values, dtype=float).ravel()
+    if values.size == 0:
+        return None
+    reset_key = overlay_grid_key_for_widget(
+        widget, npt=values.size, axis_info=axis_info)
+    return {
+        "reset_key": reset_key,
+        "axis_kind": reset_key[0] if reset_key else None,
+        "unit": str(getattr(axis, "unit", "") or ""),
+        "values": values,
+    }
+
+
+def overlay_grid_spec_for_history(history):
+    if history is None or getattr(history, "x", None) is None:
+        return None
+    reset_key = getattr(history, "reset_key", None)
+    return {
+        "reset_key": reset_key,
+        "axis_kind": (
+            reset_key[0]
+            if isinstance(reset_key, (tuple, list)) and reset_key else None
+        ),
+        "unit": str(getattr(history, "unit", "") or ""),
+        "values": np.asarray(history.x, dtype=float).ravel(),
+    }
+
+
+def overlay_grid_specs_match(left, right):
+    if left is None or right is None:
+        return False
+    if not overlay_grid_keys_match(left.get("reset_key"), right.get("reset_key")):
+        return False
+    return overlay_axes_compatible(
+        left.get("values", ()), left.get("unit", ""),
+        right.get("values", ()), right.get("unit", ""),
+        left_kind=left.get("axis_kind"), right_kind=right.get("axis_kind"),
+    )
+
+
+def overlay_grid_spec_summary(spec):
+    if spec is None:
+        return "Unknown axis"
+    return overlay_grid_summary(
+        spec.get("axis_kind"), spec.get("unit"), spec.get("values", ()))

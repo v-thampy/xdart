@@ -1004,6 +1004,86 @@ def test_overlay_waterfall_payload_accumulates_in_payload_across_renders():
     widget.scan = SimpleNamespace(name="scan3", gi=False, bai_1d_args={}, bai_2d_args={})
     p6 = render([4])
     assert p6.plot_history.ids == (q("scan3", 4),)
+    log = getattr(widget, "_accumulator_lifecycle_log", ())
+    assert len(log) == 1
+    assert log[0].cause.value == "INCOMPATIBLE_GRID"
+    assert log[0].site == "_overlay_waterfall_payload[concrete grid mismatch]"
+
+
+def test_overlay_concrete_grid_mismatch_cancel_preserves_history():
+    from xdart.gui.tabs.static_scan.display_publication import (
+        PublicationDisplayAdapter)
+    from xdart.modules.frame_publication import (
+        PublicationStore, publication_from_live_frame)
+    from xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.session.display_logic import accumulate_waterfall
+
+    old_x = np.linspace(0.5, 5.0, 5, dtype=np.float32)
+    new_x = np.linspace(1.0, 4.0, 5, dtype=np.float32)
+    prior = accumulate_waterfall(
+        None, reset_key=("q", 5, False), unit="q_A^-1", x=old_x,
+        rows=[np.ones(5)], ids=[("old", 0)], names=["old/0"])
+    frame = SimpleNamespace(
+        idx=0,
+        int_1d=IntegrationResult1D(
+            radial=new_x, intensity=np.full(5, 2.0, dtype=np.float32),
+            sigma=None, unit="q_A^-1"),
+        int_2d=None, map_raw=None, mask=None, gi=False, gi_2d={},
+        thumbnail=None, bg_raw=0, scan_info={}, source_file="new.tif",
+        source_frame_idx=0)
+    store = PublicationStore(max_heavy_items=None)
+    store.upsert(publication_from_live_frame(frame))
+    decisions = []
+    widget = SimpleNamespace(
+        scan=SimpleNamespace(
+            name="new", gi=False, bai_1d_args={}, bai_2d_args={}),
+        normChannel=None,
+        _waterfall_history=prior,
+        _resolve_overlay_grid_mismatch=lambda current, selected: (
+            decisions.append((current, selected)), "cancel")[-1],
+        ui=SimpleNamespace(
+            plotUnit=SimpleNamespace(
+                currentText=lambda: "Q (Å⁻¹)", currentIndex=lambda: 0),
+            slice=SimpleNamespace(
+                isChecked=lambda: False, isEnabled=lambda: False)),
+    )
+    state = SimpleNamespace(
+        render_ids=(0,), selected_ids=(0,), generation=1,
+        method="Overlay", overall=False)
+
+    payload = PublicationDisplayAdapter(
+        store, widget=widget, labels=(0,))._overlay_waterfall_payload(state)
+
+    assert payload.plot_history is prior
+    assert payload.plot_history.ids == (("old", 0),)
+    assert widget._overlay_grid_cancel_pending is True
+    assert len(decisions) == 1
+    assert getattr(widget, "_accumulator_lifecycle_log", ()) == ()
+
+
+def test_overlay_grid_specs_compare_canonical_unit_and_sampled_values():
+    from xdart.gui.tabs.static_scan.display_overlay_utils import (
+        overlay_grid_specs_match)
+
+    base = {
+        "reset_key": ("q", 3, False),
+        "axis_kind": "q",
+        "unit": "q_A^-1",
+        "values": np.asarray([1.0, 2.0, 3.0]),
+    }
+    alias_jitter = {
+        **base,
+        "unit": "Å⁻¹",
+        "values": np.asarray([1.0, 2.0 + 1e-10, 3.0]),
+    }
+    assert overlay_grid_specs_match(base, alias_jitter)
+    assert not overlay_grid_specs_match(
+        base, {**base, "values": np.asarray([1.0, 2.0, 4.0])})
+    assert not overlay_grid_specs_match(
+        base, {**base, "unit": "2th_deg"})
+    assert not overlay_grid_specs_match(
+        base, {**base, "reset_key": ("chi", 3, False),
+               "axis_kind": "chi"})
 
 
 def test_plot_payload_routes_overlay_waterfall_through_accumulator():

@@ -52,6 +52,8 @@ from .display_overlay_utils import (
     current_scan_key as _overlay_current_scan_key,
     overlay_grid_key_for_widget,
     overlay_grid_keys_match,
+    overlay_grid_spec_for_history,
+    overlay_grid_specs_match,
     overlay_identity_for_widget,
     overlay_projection_id_for_widget,
     overlay_slice_legend_suffix,
@@ -1088,33 +1090,13 @@ class PublicationDisplayAdapter:
             self._hydrate_missing_plot_subset(hydrate_labels, needs_2d=needs_2d)
 
         ref_x = None
-        # BL-6: when the existing overlay history is grid-compatible, anchor NEW
-        # rows to ITS grid (prior.x) so a cross-scan append with a different
-        # radial_range but the same axis+npt reinterps onto ONE x -- otherwise
-        # scan B's intensities render at scan A's x positions.  Adoption is
-        # guarded in append_row on the row's NATIVE unit == prior.unit: a
-        # cross-NATIVE-unit row must reach accumulate_waterfall unseeded, on
-        # its own native grid, so the D1 canonicalization (carried λ) can
-        # align it there.  NOTE (Stage 4 deviation): the plan slated this
-        # guard for deletion as dead ("both sides are native"), but it is
-        # load-bearing for D1 -- the reset key is unit-blind, so a same-npt
-        # cross-native-unit prior IS grid-compatible, and seeding such a row
-        # would np.interp across disjoint domains (q ~1-8 vs 2θ ~10-55: the
-        # INV-3 constant clamp; verified against
-        # test_d1_cross_native_unit_append_canonicalizes_with_carried_lambda).
-        # accumulate_waterfall is the belt-and-suspenders reinterp.
-        prior_x_seed = None
-        if (prior is not None
-                and overlay_grid_keys_match(prior.reset_key, planned_reset_key)
-                and getattr(prior, "x", None) is not None
-                and np.asarray(prior.x).size > 0):
-            prior_x_seed = np.asarray(prior.x, dtype=float)
+        ref_spec = None
         axis = None
         reset_key = None
         ids, names, rows, metadata, row_meta = [], [], [], [], []
 
         def append_row(label, *, recipe=None, live=False):
-            nonlocal ref_x, axis, reset_key
+            nonlocal ref_x, ref_spec, axis, reset_key
             pub = self._publication_for_label(label)
             if pub is None:
                 return None
@@ -1176,53 +1158,31 @@ class PublicationDisplayAdapter:
             if row_id is None:
                 row_id = computed_row_id
 
-            use_prior_seed = (
-                prior_x_seed is not None
-                and prior is not None
-                and overlay_grid_keys_match(prior.reset_key, row_grid_key)
-                and str(getattr(this_axis, "unit", "") or "")
-                == str(getattr(prior, "unit", "") or "")
-            )
+            row_spec = {
+                "reset_key": row_grid_key,
+                "axis_kind": row_grid_key[0] if row_grid_key else None,
+                "unit": str(getattr(this_axis, "unit", "") or ""),
+                "values": np.asarray(x, dtype=float).ravel(),
+            }
             if ref_x is None:
                 ref_x = x
+                ref_spec = row_spec
                 axis = this_axis
                 reset_key = row_grid_key
-                # BL-6: adopt the compatible prior grid (same NATIVE unit
-                # only -- see the D1 note above; a cross-native-unit row
-                # canonicalizes in accumulate_waterfall instead) so this and
-                # every later row land on the existing overlay x.
-                if use_prior_seed:
-                    if (x.shape != prior_x_seed.shape
-                            or not np.allclose(x, prior_x_seed, equal_nan=True)):
-                        y = np.interp(prior_x_seed, x, y)
-                    ref_x = prior_x_seed
-            elif not overlay_grid_keys_match(reset_key, row_grid_key):
+            elif not overlay_grid_specs_match(ref_spec, row_spec):
                 # A render batch can briefly contain rows from different concrete
-                # grids while the selection/model is settling.  The accumulator can
-                # represent only one grid family, so the latest incompatible row
-                # starts a fresh batch instead of being interpolated into stale
-                # history.  Only BATCH-LOCAL lists are cleared here — no
-                # accumulator state is touched (a settling batch may land
-                # back on the stored grid); when the batch SETTLES on a grid
-                # the stored accumulator cannot represent, the owner gate
-                # before the final accumulate_waterfall call performs the
-                # actual reset (V2, cause=INCOMPATIBLE_GRID).
+                # grids while the selection/model is settling. The latest concrete
+                # grid starts a fresh batch; sampled axes are never silently
+                # interpolated in the GUI default path.
                 ids.clear()
                 names.clear()
                 rows.clear()
                 metadata.clear()
                 row_meta.clear()
                 ref_x = x
+                ref_spec = row_spec
                 axis = this_axis
                 reset_key = row_grid_key
-                if use_prior_seed:
-                    if (x.shape != prior_x_seed.shape
-                            or not np.allclose(x, prior_x_seed, equal_nan=True)):
-                        y = np.interp(prior_x_seed, x, y)
-                    ref_x = prior_x_seed
-            elif x.shape != ref_x.shape or not np.allclose(x, ref_x, equal_nan=True):
-                y = np.interp(ref_x, x, y)
-                x = ref_x
             ids.append(row_id)
             if recipe is not None and recipe.get("name"):
                 name = recipe["name"]
@@ -1347,8 +1307,15 @@ class PublicationDisplayAdapter:
                 label=prior.label, x=prior.x,
                 rows=np.empty((0, np.asarray(prior.x).size), dtype=float),
                 ids=[], names=[], row_meta=(), drop_ids=replace_ids)
+        incoming_spec = {
+            "reset_key": reset_key,
+            "axis_kind": reset_key[0] if reset_key else None,
+            "unit": unit,
+            "values": np.asarray(ref_x, dtype=float).ravel(),
+        }
         if (prior is not None and getattr(prior, "count", 0)
-                and not overlay_grid_keys_match(prior.reset_key, reset_key)):
+                and not overlay_grid_specs_match(
+                    overlay_grid_spec_for_history(prior), incoming_spec)):
             # V2 owner gate: the batch settled on a grid the stored
             # accumulator cannot represent (an incompatible boundary that
             # reached the render, or the in-batch settle above), so this
@@ -1357,9 +1324,17 @@ class PublicationDisplayAdapter:
             # logged with its cause; with ``prior=None`` the
             # accumulate_waterfall call below fresh-builds from the batch —
             # identical to its own reset branch.
+            resolver = getattr(widget, "_resolve_overlay_grid_mismatch", None)
+            decision = (
+                resolver(overlay_grid_spec_for_history(prior), incoming_spec)
+                if callable(resolver) else "reset"
+            )
+            if decision == "cancel":
+                widget._overlay_grid_cancel_pending = True
+                return self._history_to_payload(prior)
             AccumulatorLifecycle(widget).reset(
                 LifecycleCause.INCOMPATIBLE_GRID,
-                site="_overlay_waterfall_payload[batch grid vs accumulator]")
+                site="_overlay_waterfall_payload[concrete grid mismatch]")
             prior = None
         history = accumulate_waterfall(
             prior, reset_key=reset_key, unit=unit, label=label,

@@ -158,23 +158,23 @@ def test_ov6_compatible_cross_scan_appends_incompatible_resets():
     h.assert_lifecycle_settled()
 
 
-# ── BL-6: same axis+npt, different radial_range → reinterp onto one grid ──
+# ── OV-6: same axis+npt, different radial_range → incompatible reset ─────
 
 
-def test_bl6_cross_scan_reinterp_lands_peak_at_physical_position():
+def test_ov6_cross_scan_shifted_range_starts_new_overlay():
     h = OVHarness()
     h.publish(0, peak=2.0)
-    x_a = np.asarray(h.history.x, dtype=float)
     h.rescope("scanB", compatible=True, x_range=(1.5, 5.5))
-    h.publish(0, peak=3.0)                 # same npt, shifted radial_range
+    h.publish(0, peak=3.0)                 # same npt, shifted sampled axis
     hist = h.history
-    np.testing.assert_allclose(np.asarray(hist.x), x_a)   # keeps A's grid
-    row = np.asarray(hist.rows)[list(hist.ids).index(("scanB", 0))]
+    np.testing.assert_allclose(
+        np.asarray(hist.x), np.linspace(1.5, 5.5, hist.x.size))
+    assert hist.ids == (("scanB", 0),)
+    row = np.asarray(hist.rows)[0]
     peak_x = float(hist.x[int(np.argmax(row))])
-    # The peak lands at the correct PHYSICAL q (~3.0), not at scan A's bin
-    # for scan B's index (the OV-6 misgrid BL-6 reopened).
-    assert abs(peak_x - 3.0) < 2 * (x_a[1] - x_a[0])
-    assert h.resets_observed == []
+    assert abs(peak_x - 3.0) < 2 * (hist.x[1] - hist.x[0])
+    h.assert_reset_observed(INCOMPATIBLE_GRID)
+    h.assert_lifecycle_settled()
 
 
 # ── OV-7: pinned cuts survive norm/unit rebuilds ───────────────────────────

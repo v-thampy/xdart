@@ -60,6 +60,8 @@ __all__ = [
     "Mode",
     "RawSource",
     "OverlayAction",
+    "GridMismatchPolicy",
+    "IncompatibleGridError",
     "DataTier",
     "ReadStatus",
     "ReadPolicyAction",
@@ -78,6 +80,8 @@ __all__ = [
     "WaterfallHistory",
     "overlay_grid_reset_key",
     "overlay_grid_keys_compatible",
+    "overlay_axes_compatible",
+    "overlay_grid_summary",
     "qualified_frame_id",
     "frame_index_from_qualified_id",
     "scan_key_from_qualified_id",
@@ -136,6 +140,18 @@ class Mode(Enum):
     NEXUS_VIEWER = "nexus_viewer"
     STITCH_1D = "stitch_1d"      # whole-scan merged 1D pattern (scan.stitched_1d)
     STITCH_2D = "stitch_2d"      # whole-scan merged 2D cake (scan.stitched_2d)
+
+
+class GridMismatchPolicy(str, Enum):
+    """Explicit policy for an incoming Overlay/Waterfall grid mismatch."""
+
+    ERROR = "ERROR"
+    RESET = "RESET"
+    INTERPOLATE_OVERLAP = "INTERPOLATE_OVERLAP"
+
+
+class IncompatibleGridError(ValueError):
+    """Raised when an Overlay/Waterfall append cannot share the current grid."""
 
 
 # ── Panel layout table (Stage 4/5 step 1) ────────────────────────────
@@ -470,18 +486,21 @@ class WaterfallHistory:
     cap, so a per-render rebuild from the store would re-introduce the cap-truncation
     regression.  The accumulator instead retains every row it has captured.
 
-    ``reset_key`` is the accumulation GRID identity (axis kind + point count +
-    1D/2D source) -- the ONLY automatic reset trigger.  It is deliberately NOT
+    ``reset_key`` is the coarse accumulation GRID identity (axis kind + point
+    count + 1D/2D source); sampled coordinates and canonical unit complete the
+    concrete identity.  It is deliberately NOT
     the scan id and NOT the display generation: the display
     generation bumps on every effective-selection change, and live auto-last GROWS
     the selection every tick, so keying the reset on it would reset the accumulator
     each tick and rebuild from only the resident (un-evicted) frames -- the exact
     cap-truncation this design exists to prevent.  Incompatible grid/source
-    changes change the key (reset); compatible scan boundaries, selection growth
-    and a Q<->2theta display toggle do not (append / draw-time relabel).
+    changes are resolved by an explicit mismatch policy; compatible scan
+    boundaries, selection growth and a Q<->2theta display toggle do not reset
+    (append / draw-time relabel).
 
-    All rows live on ONE shared sample grid (``x``); the adapter interpolates each
-    incoming frame onto it before accumulating.  ``rows[k]`` is frame ``ids[k]`` /
+    All rows live on ONE shared sample grid (``x``).  Exact-grid append is the
+    default; overlap-only interpolation is explicit and leaves unsupported tails
+    missing.  ``rows[k]`` is frame ``ids[k]`` /
     ``names[k]`` -- maintained row-for-row.  ``unit`` is the grid's
     acquisition-NATIVE radial unit (V1 Stage 3: rows are stored native; a
     Q<->2theta display toggle converts at draw, :func:`render_waterfall_view`,
@@ -565,6 +584,56 @@ def overlay_grid_keys_compatible(left, right):
         except (TypeError, ValueError):
             return False
     return True
+
+
+def overlay_axes_compatible(
+        left_x, left_unit, right_x, right_unit, *,
+        left_kind=None, right_kind=None, rtol=1e-5, atol=1e-8):
+    """Return whether two sampled axes can share one accumulator unchanged.
+
+    Compatibility is deliberately stricter than shape equality: physical axis
+    kind, canonical unit, point count, and every sampled coordinate must agree.
+    Small floating-point integration jitter is tolerated.  Q/2theta conversion
+    is not implicit here; callers that carry a wavelength must convert first.
+    """
+    left = np.asarray(left_x, dtype=float).ravel()
+    right = np.asarray(right_x, dtype=float).ravel()
+    if left.size != right.size:
+        return False
+    if left_kind is not None and right_kind is not None:
+        if str(left_kind) != str(right_kind):
+            return False
+    if canonical_axis_key(left_unit) != canonical_axis_key(right_unit):
+        return False
+    if left.size == 0:
+        return True
+    return bool(np.allclose(
+        left, right, rtol=float(rtol), atol=float(atol), equal_nan=True))
+
+
+def overlay_grid_summary(axis_kind, unit, values) -> str:
+    """Compact user-facing description of one sampled overlay axis."""
+    values = np.asarray(values, dtype=float).ravel()
+    label, symbol = x_axis_for_unit(unit)
+    if label == "x":
+        key = canonical_axis_key(axis_kind or unit)
+        label = {
+            "q_A^-1": "Q",
+            "2th_deg": f"2{_TH}",
+            "chi_deg": _CHI,
+            "chigi_deg": f"{_CHI}GI",
+            "qip_A^-1": "Q_ip",
+            "qoop_A^-1": "Q_oop",
+            "exit_angle_deg": "Exit angle",
+        }.get(key, str(axis_kind or unit or "Axis"))
+        symbol = pretty_unit(unit)
+    finite = values[np.isfinite(values)]
+    extent = "no finite range"
+    if finite.size:
+        extent = f"{float(np.nanmin(finite)):.2f}-{float(np.nanmax(finite)):.2f}"
+        if symbol:
+            extent = f"{extent} {symbol}"
+    return f"{label}, {values.size} points, {extent}"
 
 
 def _reset_keys_compatible(left, right):
@@ -669,9 +738,47 @@ def _waterfall_history_from_buffer(
         _row_buffer=row_buffer, _row_capacity=int(row_buffer.shape[0]))
 
 
+def _fresh_waterfall_history(
+        *, reset_key, unit, label, x, rows, ids, names, metadata, row_meta):
+    ki, kn, kr, km, krm = _dedup_first(
+        ids, names, rows, metadata, row_meta)
+    count = len(ki)
+    row_buffer = _new_waterfall_row_buffer(count, np.asarray(x).size)
+    if count:
+        row_buffer[:count] = np.asarray(kr, dtype=float)
+    return _waterfall_history_from_buffer(
+        reset_key=reset_key, unit=unit, label=label, x=np.asarray(x, dtype=float),
+        row_buffer=row_buffer, count=count, ids=ki, names=kn,
+        metadata=km, row_meta=krm)
+
+
+def _interp_overlap(target_x, source_x, row):
+    """Interpolate only where the source axis has support; tails stay missing."""
+    target_x = np.asarray(target_x, dtype=float)
+    source_x = np.asarray(source_x, dtype=float)
+    row = np.asarray(row, dtype=float)
+    valid = np.isfinite(source_x) & np.isfinite(row)
+    if not np.any(valid):
+        return np.full(target_x.shape, np.nan, dtype=float)
+    source_x = source_x[valid]
+    row = row[valid]
+    order = np.argsort(source_x, kind="stable")
+    source_x = source_x[order]
+    row = row[order]
+    source_x, unique_idx = np.unique(source_x, return_index=True)
+    row = row[unique_idx]
+    if source_x.size == 1:
+        out = np.full(target_x.shape, np.nan, dtype=float)
+        out[np.isclose(target_x, source_x[0], rtol=1e-5, atol=1e-8)] = row[0]
+        return out
+    return np.interp(
+        target_x, source_x, row, left=np.nan, right=np.nan)
+
+
 def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
                          label="", metadata=None, row_meta=None,
-                         replace_ids=(), drop_ids=()):
+                         replace_ids=(), drop_ids=(),
+                         mismatch_policy=GridMismatchPolicy.ERROR):
     """Pure, append-only Overlay/Waterfall accumulator keyed on ``reset_key`` (the
     payload-owned successor to ``update_plot_accumulator`` + the widget triple).
 
@@ -681,8 +788,9 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
     collapse/restack class, structurally precluded).  ``replace_ids`` is reserved
     for live mutable slice projections: the current unpinned cut updates in place
     while pinned projections and ordinary frames remain append/dedupe-only.  A
-    ``reset_key`` change (an incompatible grid, or a 1D<->2D source change -- NOT
-    a mere selection change or compatible scan boundary) is the ONLY reset.
+    ``reset_key`` or concrete sampled-axis mismatch is resolved by
+    ``mismatch_policy``; a mere selection change or compatible scan boundary is
+    never a reset.
 
     Crucially the key is NOT the display generation: that bumps on every
     effective-selection change, and live auto-last grows the selection each tick, so
@@ -698,20 +806,23 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
     :func:`render_waterfall_view`).  A CROSS-NATIVE-UNIT append (scan A
     integrated in q, scan B in 2theta — the reset key is unit-blind on
     purpose) canonicalizes the incoming grid onto the history's native unit
-    with each row's own carried wavelength (D1), then the BL-6 value-drift
-    interp aligns it; rows with no carried wavelength are SKIPPED for the
-    render with an ERROR rather than mixed across disjoint domains (the
-    QW-4 tripwire).  Stage 4 deleted the legacy same-size display-relabel
-    branch: a display toggle never reaches this function, so there is no
-    in-place grid relabel — canonicalize or skip are the only cross-unit
-    outcomes.
+    with each row's own carried wavelength (D1).  The converted coordinates
+    must still match unless ``INTERPOLATE_OVERLAP`` is requested.  Rows with no
+    carried wavelength raise :class:`IncompatibleGridError` under the default
+    ``ERROR`` policy; ``RESET`` instead starts a new history.  Stage 4 deleted
+    the legacy same-size display-relabel branch: a display toggle never reaches
+    this function, so there is no in-place grid relabel.
 
-    ``x`` / ``rows`` / ``ids`` / ``names`` are the incoming frames, already on the
-    one shared grid (the adapter interpolated them).  Returns the next
-    :class:`WaterfallHistory`.
+    ``x`` / ``rows`` / ``ids`` / ``names`` are the incoming frames.  Returns the
+    next :class:`WaterfallHistory`.
     """
+    mismatch_policy = GridMismatchPolicy(mismatch_policy)
     x = np.asarray(x, dtype=float).ravel()
     rows = np.atleast_2d(np.asarray(rows, dtype=float))
+    incoming_unit = unit
+    incoming_label = label
+    incoming_x = x
+    incoming_rows = rows
     ids = list(ids)
     names = list(names)
     metadata = list(metadata) if metadata is not None else []
@@ -734,26 +845,27 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
     # WIPE a compatible accumulator (the "one empty publication blanks the
     # overlay" bug), nor reach the np.interp below with an empty x.
     if x.size == 0:
-        if history is not None and _reset_keys_compatible(history.reset_key, reset_key):
+        if history is not None:
             return history
         return WaterfallHistory(
             reset_key=reset_key, unit=unit, label=label, x=x,
             rows=np.empty((0, 0), dtype=float), ids=(), names=(),
             metadata=(), row_meta=())
 
-    # RESET: new accumulation identity (incompatible grid/source) or no prior.
-    if (history is None
-            or not _reset_keys_compatible(history.reset_key, reset_key)):
-        ki, kn, kr, km, krm = _dedup_first(ids, names, rows, metadata,
-                                           row_meta)
-        count = len(ki)
-        row_buffer = _new_waterfall_row_buffer(count, x.size)
-        if count:
-            row_buffer[:count] = np.asarray(kr, dtype=float)
-        return _waterfall_history_from_buffer(
-            reset_key=reset_key, unit=unit, label=label, x=x,
-            row_buffer=row_buffer, count=count, ids=ki, names=kn,
-            metadata=km, row_meta=krm)
+    if history is not None and not _reset_keys_compatible(
+            history.reset_key, reset_key):
+        if mismatch_policy is GridMismatchPolicy.ERROR:
+            raise IncompatibleGridError(
+                "overlay grid identity does not match the current accumulator")
+        if mismatch_policy is GridMismatchPolicy.INTERPOLATE_OVERLAP:
+            raise IncompatibleGridError(
+                "cannot interpolate across different physical grid identities")
+        history = None
+
+    if history is None:
+        return _fresh_waterfall_history(
+            reset_key=reset_key, unit=unit, label=label, x=x, rows=rows,
+            ids=ids, names=names, metadata=metadata, row_meta=row_meta)
 
     # Same identity: keep the accumulated rows.  Cross-unit incoming batches
     # (V1 Stage 3 — storage is acquisition-NATIVE, so ``unit`` names the
@@ -764,21 +876,19 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
     #
     # 1. D1 canonicalization: a cross-scan append whose NATIVE unit is the
     #    other member of the Q↔2θ pair converts its grid with each row's own
-    #    carried wavelength (``row_meta``), then falls through to the BL-6
-    #    value-drift interp below — the accumulator grid/unit stay the
-    #    history's.  Fires only when EVERY incoming row carries a λ.
-    # 2. Otherwise the batch cannot be represented on this grid: SKIP it
-    #    this render with an ERROR (the QW-4 tripwire, production behavior
-    #    since Stage 3 — previously XDART_DEBUG_DISPLAY-gated).  The rows
-    #    re-arrive on a later render (the S-17 re-arrival policy) instead of
-    #    np.interp-ing across disjoint domains (Q ~1-8 A^-1 vs 2theta
-    #    ~10-55 deg), which clamps to a constant and permanently appends
-    #    blank bands.
+    #    carried wavelength (``row_meta``). The concrete sampled coordinates
+    #    must then match, or the caller must explicitly request overlap-only
+    #    interpolation. Fires only when EVERY incoming row carries a wavelength.
+    # 2. Otherwise the batch cannot be represented on this grid: ERROR fails
+    #    closed; RESET starts a new history on the incoming grid.
     canon_x = None
     if ids and history.unit != unit:
         have_kind = _radial_kind(history.unit)
         in_kind = _radial_kind(unit)
-        if (have_kind is not None and in_kind is not None
+        if canonical_axis_key(history.unit) == canonical_axis_key(unit):
+            unit = history.unit
+            label = history.label
+        elif (have_kind is not None and in_kind is not None
                 and have_kind != in_kind
                 and not is_gi_2d_units(history.unit, "")
                 and not is_gi_2d_units(unit, "")):
@@ -793,21 +903,37 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
                 unit = history.unit
                 label = history.label
     if history.unit != unit:
-        if ids:
-            logger.error(
-                "accumulate_waterfall: %d cross-unit row(s) (incoming "
-                "unit=%r, accumulator unit=%r) with no carried wavelength "
-                "to canonicalize — skipping this batch instead of "
-                "interpolating across disjoint domains [QW-4 tripwire]",
-                len(ids), unit, history.unit)
-            ids, names, rows, metadata, row_meta = (
-                ids[:0], names[:0], rows[:0], metadata[:0], row_meta[:0])
-        # The skipped batch contributes nothing: the emitted history keeps
-        # its own unit/label (emitting the incoming unit over the unchanged
-        # native grid would relabel without converting — the axis would lie).
-        unit = history.unit
-        label = history.label
+        if mismatch_policy is GridMismatchPolicy.RESET:
+            return _fresh_waterfall_history(
+                reset_key=reset_key, unit=incoming_unit, label=incoming_label,
+                x=incoming_x, rows=incoming_rows, ids=ids, names=names,
+                metadata=metadata, row_meta=row_meta)
+        raise IncompatibleGridError(
+            "incoming axis unit cannot be represented on the current overlay grid")
+
     base_x = history.x
+    incoming_axes = [
+        canon_x[j] if canon_x is not None else x for j in range(len(ids))]
+    mismatched = [
+        xi for xi in incoming_axes
+        if not overlay_axes_compatible(
+            base_x, history.unit, xi, unit,
+            left_kind=(
+                history.reset_key[0]
+                if isinstance(history.reset_key, (tuple, list)) else None),
+            right_kind=(
+                reset_key[0]
+                if isinstance(reset_key, (tuple, list)) else None))
+    ]
+    if mismatched:
+        if mismatch_policy is GridMismatchPolicy.ERROR:
+            raise IncompatibleGridError(
+                "incoming sampled axis does not match the current overlay grid")
+        if mismatch_policy is GridMismatchPolicy.RESET:
+            return _fresh_waterfall_history(
+                reset_key=reset_key, unit=incoming_unit, label=incoming_label,
+                x=incoming_x, rows=incoming_rows, ids=ids, names=names,
+                metadata=metadata, row_meta=row_meta)
     out_ids = list(history.ids)
     out_names = list(history.names)
     out_meta = list(getattr(history, "metadata", ()) or ())
@@ -829,19 +955,12 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
     for j, (i, n, r, m, rm) in enumerate(zip(ids, names, rows, metadata,
                                              row_meta)):
         key = _dedup_key(i)
-        # BL-6: align the incoming row (on its grid ``xi`` — the shared ``x``,
-        # or its D1-canonicalized form) to the accumulated ``base_x`` whenever
-        # they differ -- by sample-count OR by VALUES.  Two scans with the
-        # same axis+npt but a different radial_range (recalibration, an
-        # edited range) are grid-COMPATIBLE (range is excluded from the reset
-        # key on purpose) yet have DIFFERENT x, so without the value check
-        # scan B's intensities render at scan A's x positions.
+        # Explicit overlap interpolation is the only path that may align a row
+        # to an existing concrete grid. Unsupported tails remain NaN.
         xi = canon_x[j] if canon_x is not None else x
         r = np.asarray(r, dtype=float)
-        if (xi.size == r.size and xi.size > 0 and base_x.size > 0
-                and (xi.size != base_x.size
-                     or not np.allclose(xi, base_x, equal_nan=True))):
-            r = np.interp(base_x, xi, r)
+        if not overlay_axes_compatible(base_x, history.unit, xi, unit):
+            r = _interp_overlap(base_x, xi, r)
         if key in index_by_key:
             if key in replace_keys:
                 pos = index_by_key[key]

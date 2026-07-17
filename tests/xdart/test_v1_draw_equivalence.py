@@ -11,17 +11,13 @@ so this suite pins the flipped world directly (canonical-grid plan §Stage-3):
   (float32 acquisition store, float64 accumulation).
 * The RENDERED payload (``_history_to_payload`` → ``render_waterfall_view``,
   the real adapter path via :mod:`tests.xdart.ov_harness`) equals
-  first-principles EXPECTED CURVES: norm = row / monitor, conversion =
-  ``convert_2d_radial`` with the carried λ, BL-6 drift = the same
-  ``np.interp`` operands.  Equality is EXACT (``assert_array_equal``)
-  everywhere — the Stage-2 convert/interp ordering tolerance dissolved with
-  the flip (drift alignment and display conversion both run in native
-  space now) — plus physical peak-position assertions (the
-  test_bl6_overlay_xgrid pattern) wherever an interp or conversion fires.
-* The D1 policy is exercised through the harness: a cross-scan append whose
-  NATIVE unit differs (scan B integrated in 2θ onto a q accumulator)
-  canonicalizes with the row's own carried wavelength and renders at the
-  correct physical position in BOTH display units.
+  first-principles EXPECTED CURVES: norm = row / monitor and conversion =
+  ``convert_2d_radial`` with the carried wavelength. Equality is exact, plus
+  physical peak-position assertions wherever a conversion fires.
+* Concrete sampled-axis or native-unit changes reset the GUI history; carried
+  wavelength still renders the newly seeded native history correctly in both
+  display units. Explicit scientific overlap interpolation is tested in the
+  headless accumulator contract instead of being the GUI default.
 
 A failure here is a transform bug or an unplanned storage-semantics change —
 do NOT bend the expectations (mark xfail(strict=True) and report instead).
@@ -37,7 +33,7 @@ from xrd_tools.session.display_logic import (
     x_axis_for_unit,
 )
 
-from tests.xdart.ov_harness import OVHarness
+from tests.xdart.ov_harness import INCOMPATIBLE_GRID, OVHarness
 
 _LAM = 1e-10                     # the harness default wavelength (1 Å)
 _NPT = OVHarness.NPT
@@ -190,27 +186,23 @@ def test_norm_plus_unit_flip_compose_exact():
     assert_rendered(payload, h, x=q_to_tth(x_q), rows=rows, axis=_AXIS_TTH)
 
 
-# ── BL-6 drift + cross-scan appends ────────────────────────────────────────
+# ── Concrete-grid boundaries + compatible cross-scan appends ──────────────
 
 
-def test_bl6_drift_grid_same_unit_renders_interped_row_exact():
+def test_shifted_range_same_unit_starts_fresh_native_history():
     h = OVHarness()
     h.publish(0)
     h.publish(1)
     h.rescope("scanB", compatible=True, x_range=(1.5, 5.5))
     _state, payload = h.publish(2, peak=3.0)
-    x_a, prof0 = native_profile(0)
-    _, prof1 = native_profile(1)
     x_b, prof2 = native_profile(2, x_range=(1.5, 5.5), peak=3.0)
-    # The drift row is aligned onto scan A's grid by the SAME np.interp the
-    # accumulator runs (native space) — bitwise-reproducible.
-    exp2 = np.interp(x_a, x_b, prof2)
     assert_native_storage(h)
-    np.testing.assert_array_equal(np.asarray(h.history.x), x_a)
-    assert_rendered(payload, h, x=x_a, rows=[prof0, prof1, exp2],
-                    axis=_AXIS_Q)
-    dx = float(np.max(np.diff(x_a)))
-    assert abs(_peak_x(x_a, payload.traces[2].y) - 3.0) < 2 * dx
+    np.testing.assert_array_equal(np.asarray(h.history.x), x_b)
+    assert h.history.ids == (("scanB", 2),)
+    assert_rendered(payload, h, x=x_b, rows=[prof2], axis=_AXIS_Q)
+    dx = float(np.max(np.diff(x_b)))
+    assert abs(_peak_x(x_b, payload.traces[0].y) - 3.0) < 2 * dx
+    h.assert_reset_observed(INCOMPATIBLE_GRID)
 
 
 def test_cross_scan_compatible_append_renders_exact():
@@ -226,40 +218,36 @@ def test_cross_scan_compatible_append_renders_exact():
     assert_rendered(payload, h, x=x_q, rows=rows, axis=_AXIS_Q)
 
 
-def test_bl6_drift_under_conversion_is_exact_since_the_flip():
-    """Drift grid + active Q→2θ display — Stage 2's ONE tolerance case.
-
-    Post-flip both the BL-6 alignment (append) and the display conversion
-    (draw) run in NATIVE q space, so the ordering ambiguity is gone and the
-    rendered drift row is bitwise ``np.interp``-in-q relabeled to 2θ."""
+def test_shifted_range_reset_then_draw_time_conversion_is_exact():
+    """A concrete-grid reset preserves draw-time Q→2θ conversion."""
     h = OVHarness()
     h.publish(0)
     h.publish(1)
     h.unit_toggle()                                   # display 2θ from here
     h.rescope("scanB", compatible=True, x_range=(1.5, 5.5))
     _state, payload = h.publish(2, peak=3.0)
-    x_a, prof0 = native_profile(0)
-    _, prof1 = native_profile(1)
     x_b, prof2 = native_profile(2, x_range=(1.5, 5.5), peak=3.0)
-    exp2 = np.interp(x_a, x_b, prof2)
-    assert_native_storage(h)                          # storage still native q
-    assert_rendered(payload, h, x=q_to_tth(x_a), rows=[prof0, prof1, exp2],
-                    axis=_AXIS_TTH)
+    assert_native_storage(h)
+    assert h.history.ids == (("scanB", 2),)
+    assert_rendered(
+        payload, h, x=q_to_tth(x_b), rows=[prof2], axis=_AXIS_TTH)
     # Physical: the peak sits at 2θ(q=3.0, λ) on the display grid.
-    x_disp = q_to_tth(x_a)
+    x_disp = q_to_tth(x_b)
     expected_tth = float(q_to_tth([3.0])[0])
     dx = float(np.max(np.diff(x_disp)))
-    assert abs(_peak_x(x_disp, payload.traces[2].y) - expected_tth) < 2 * dx
+    assert abs(_peak_x(x_disp, payload.traces[0].y) - expected_tth) < 2 * dx
+    h.assert_reset_observed(INCOMPATIBLE_GRID)
 
 
 # ── D1: cross-NATIVE-unit appends (the new Stage-3 code path) ──────────────
 
 
-def test_d1_cross_native_unit_append_canonicalizes_with_carried_lambda():
-    """Scan A integrated natively in q; scan B natively in 2θ, same npt (the
-    reset key is unit-blind).  The incoming rows canonicalize onto the q
-    accumulator with their OWN carried λ, then BL-6-interp — and render at
-    the correct physical position in BOTH display units."""
+def test_cross_native_unit_gui_default_resets_and_converts_at_draw():
+    """GUI default treats a native-unit change as a concrete-grid boundary.
+
+    The new history stays native to scan B and carried wavelength still makes
+    both display-unit views exact at draw time.
+    """
     h = OVHarness()
     h.publish(0)
     h.publish(1)
@@ -269,34 +257,25 @@ def test_d1_cross_native_unit_append_canonicalizes_with_carried_lambda():
               x_range=tth_range)
     _state, payload = h.publish(2, peak=peak_tth)
 
-    x_a, prof0 = native_profile(0)
-    _, prof1 = native_profile(1)
     x_b_tth, prof2 = native_profile(2, x_range=tth_range, peak=peak_tth)
-    # The canonicalization the accumulator runs: scan B's 2θ grid → q with
-    # the row's carried λ, then interp onto scan A's grid — same operands.
     x_b_q = convert_2d_radial(
         x_b_tth, data_unit="2th_deg", want_tth=False, want_q=True,
         wavelength_m=_LAM)
-    exp2 = np.interp(x_a, x_b_q, prof2)
 
     hist = h.history
-    assert hist.count == 3
-    assert_native_storage(h, unit="q_A^-1")           # grid stays scan A's
-    np.testing.assert_array_equal(np.asarray(hist.x), x_a)
-    assert [m.source_unit for m in hist.row_meta] == [
-        "q_A^-1", "q_A^-1", "2th_deg"]                # provenance kept
-    assert_rendered(payload, h, x=x_a, rows=[prof0, prof1, exp2],
-                    axis=_AXIS_Q)
-    dx = float(np.max(np.diff(x_a)))
-    assert abs(_peak_x(x_a, payload.traces[2].y) - 3.0) < 2 * dx
-    assert h.resets_observed == []                    # append, never reset
+    assert hist.count == 1
+    assert_native_storage(h, unit="2th_deg")
+    np.testing.assert_array_equal(np.asarray(hist.x), x_b_tth)
+    assert [m.source_unit for m in hist.row_meta] == ["2th_deg"]
+    assert_rendered(payload, h, x=x_b_q, rows=[prof2], axis=_AXIS_Q)
+    dx = float(np.max(np.diff(x_b_q)))
+    assert abs(_peak_x(x_b_q, payload.traces[0].y) - 3.0) < 2 * dx
+    h.assert_reset_observed(INCOMPATIBLE_GRID)
 
     _state, payload = h.unit_toggle()                 # display 2θ
-    x_disp = q_to_tth(x_a)
-    assert_rendered(payload, h, x=x_disp, rows=[prof0, prof1, exp2],
-                    axis=_AXIS_TTH)
-    dx = float(np.max(np.diff(x_disp)))
-    assert abs(_peak_x(x_disp, payload.traces[2].y) - peak_tth) < 2 * dx
+    assert_rendered(payload, h, x=x_b_tth, rows=[prof2], axis=_AXIS_TTH)
+    dx = float(np.max(np.diff(x_b_tth)))
+    assert abs(_peak_x(x_b_tth, payload.traces[0].y) - peak_tth) < 2 * dx
 
 
 # ── slice projections (2D→1D stays build-time) ─────────────────────────────

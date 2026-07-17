@@ -582,6 +582,8 @@ class H5Viewer(QWidget):
         # blanking.  Consumed by staticWidget.set_data on the first frame-click.
         # (Image/XYE/NeXus viewers auto-display frame 0 and never set this.)
         self._browser_scan_reset_pending = False
+        self._browser_previous_context = None
+        self._browser_restore_in_progress = False
         self.viewer_mode = None
         # True only while a live (non-batch) wrangler run is in progress.
         # Suppresses ``data_reset`` (wired to the async ``sigNewFile``)
@@ -1424,6 +1426,34 @@ class H5Viewer(QWidget):
 
     def thread_finished(self, task):
         self.update()
+        if getattr(self, "_browser_restore_in_progress", False):
+            context = getattr(self, "_browser_previous_context", None) or {}
+            labels = tuple(context.get("frame_ids", ()))
+            lw = self.ui.listData
+            was_blocked = lw.blockSignals(True)
+            try:
+                lw.clearSelection()
+                current = None
+                wanted = {str(label) for label in labels}
+                for row in range(lw.count()):
+                    item = lw.item(row)
+                    if item.text() in wanted:
+                        item.setSelected(True)
+                        current = item
+                if current is not None:
+                    lw.setCurrentItem(current, QItemSelectionModel.NoUpdate)
+            finally:
+                lw.blockSignals(was_blocked)
+            self.frame_ids[:] = [str(label) for label in labels]
+            self._browser_restore_in_progress = False
+            self._browser_scan_reset_pending = False
+            self._browser_previous_context = None
+            display = getattr(self, "displayframe", None)
+            set_axes = getattr(display, "set_axes", None)
+            if callable(set_axes):
+                set_axes()
+            if labels:
+                self.data_changed()
         if getattr(self, '_auto_select_last_on_finish', False):
             self._auto_select_last_on_finish = False
             if self.ui.listData.count() > 0:
@@ -1686,6 +1716,18 @@ class H5Viewer(QWidget):
             if fpath and fpath == current_fname:
                 self.set_file(fpath)
                 return
+            if not getattr(self, "_browser_scan_reset_pending", False):
+                selected = tuple(getattr(self, "frame_ids", ()) or ())
+                if not selected:
+                    try:
+                        selected = tuple(
+                            item.text() for item in self.ui.listData.selectedItems())
+                    except Exception:
+                        selected = ()
+                self._browser_previous_context = {
+                    "file": current_fname,
+                    "frame_ids": selected,
+                }
             self._browser_scan_reset_pending = True
             self.set_file(fpath)
             self.new_scan_loaded = True
@@ -2614,6 +2656,7 @@ class H5Viewer(QWidget):
             if getattr(self, '_run_writing', False):
                 logger.debug("set_file ignored during active run: %s", fname)
                 return
+
             # Same-file dedupe: a fresh single click fires currentItemChanged
             # (press) AND itemClicked (release), both routed here -- without
             # this the .nxs loaded twice per click (three times on a
@@ -2642,6 +2685,21 @@ class H5Viewer(QWidget):
             except Exception:
                 logger.exception("Failed to set file: %s", fname)
                 return
+
+    def restore_browser_context(self):
+        """Restore the file/frame selection saved before a rejected browse."""
+        context = getattr(self, "_browser_previous_context", None) or {}
+        previous_file = context.get("file")
+        if not previous_file:
+            self._browser_scan_reset_pending = False
+            self._browser_restore_in_progress = False
+            self._restore_loaded_scan_selection()
+            return False
+        self._browser_restore_in_progress = True
+        self._browser_scan_reset_pending = True
+        self.set_file(previous_file, internal=True)
+        self._restore_loaded_scan_selection()
+        return True
 
     def set_run_writing(self, active):
         """Single switch (driven by the run-state owner ``_enter``/``_exit_run_

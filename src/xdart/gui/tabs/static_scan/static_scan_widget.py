@@ -213,6 +213,10 @@ from .display_overlay_utils import (
     frame_index_from_row_id,
     overlay_grid_key_for_widget,
     overlay_grid_keys_match,
+    overlay_grid_spec_for_history,
+    overlay_grid_spec_for_view,
+    overlay_grid_spec_summary,
+    overlay_grid_specs_match,
     row_id_belongs_to_widget_scan,
 )
 from .integrator import (
@@ -767,6 +771,10 @@ class staticWidget(QWidget):
                                                publication_store=self.publication_store)
         self.displayframe.store_first_frame_view = self.store_first_frame_view
         self.displayframe.frame_record_store = self._active_frame_record_store
+        self.displayframe._resolve_overlay_grid_mismatch = (
+            self._resolve_overlay_grid_mismatch)
+        self.displayframe._cancel_overlay_grid_selection = (
+            self._cancel_overlay_grid_selection)
         # The MEM-1[14] memo keys on the active GI projection modes so a
         # sub-mode switch invalidates memoized publications; the resolver
         # lives here, the memo on the displayframe.
@@ -5934,6 +5942,8 @@ class staticWidget(QWidget):
         """Connected to h5viewer, sets the data in displayframe based
         on the selected image or overall data.
         """
+        if getattr(self.h5viewer, "_browser_restore_in_progress", False):
+            return
         # Deferred browser-select reset (Int 1D/2D): a manual .nxs select left the
         # display + caches untouched (see _on_new_file_display_reset).  Now that a
         # frame is actually clicked, run that reset — clear the previous scan's
@@ -5959,10 +5969,6 @@ class staticWidget(QWidget):
                 return
             self.h5viewer._browser_scan_reset_pending = False
             try:
-                maybe_clear_overlay = getattr(
-                    self, "_maybe_clear_overlay_for_browser_boundary", None)
-                if callable(maybe_clear_overlay):
-                    maybe_clear_overlay()
                 self.displayframe.set_axes()
                 self._clear_frame_record_store()   # A-Step (Phase 5): reset the store
                 self.displayframe._clear_bkg()
@@ -7023,6 +7029,28 @@ class staticWidget(QWidget):
             return True
         new_key = overlay_grid_key_for_widget(df, first_frame=first_frame)
         keep = overlay_grid_keys_match(getattr(history, "reset_key", None), new_key)
+        old_spec = overlay_grid_spec_for_history(history)
+        new_spec = None
+        if first_frame is not None:
+            try:
+                publication = publication_from_live_frame(
+                    first_frame, include_raw=False, include_2d=True,
+                    include_thumbnail=False, retain_raw_ref=False,
+                    validate=False,
+                )
+                new_spec = overlay_grid_spec_for_view(df, publication.view)
+                if keep and new_spec is not None:
+                    keep = overlay_grid_specs_match(old_spec, new_spec)
+            except Exception:
+                logger.debug("scan-boundary concrete-grid probe failed",
+                             exc_info=True)
+        if not keep and new_spec is not None:
+            logger.info(
+                "Overlay axis changed during live processing; starting a new "
+                "overlay. Current: %s; Selected: %s",
+                overlay_grid_spec_summary(old_spec),
+                overlay_grid_spec_summary(new_spec),
+            )
         if os.environ.get("XDART_PERF"):
             logger.info(
                 "[PERF] scan boundary overlay rows=%d keep=%s old_key=%r new_key=%r",
@@ -7033,22 +7061,48 @@ class staticWidget(QWidget):
             )
         return not keep
 
-    def _maybe_clear_overlay_for_browser_boundary(self):
-        """Apply the OV-6 grid rule to a deferred browser first-frame reset."""
-        df = getattr(self, "displayframe", None)
-        if df is None:
-            return
-        try:
-            method = df.ui.plotMethod.currentText()
-        except Exception:
-            method = None
-        history = getattr(df, "_waterfall_history", None)
-        if method not in ("Overlay", "Waterfall") or not getattr(history, "count", 0):
-            return
-        if self._overlay_clear_needed_for_scan_boundary(first_frame=None):
-            df.clear_overlay(
-                LifecycleCause.INCOMPATIBLE_GRID,
-                site="_maybe_clear_overlay_for_browser_boundary[OV-6]")
+    def _ask_overlay_grid_mismatch(self, current_spec, selected_spec):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Axes do not match")
+        box.setText("Axes do not match the current overlay")
+        box.setInformativeText(
+            "Current: %s\nSelected: %s" % (
+                overlay_grid_spec_summary(current_spec),
+                overlay_grid_spec_summary(selected_spec),
+            ))
+        start = box.addButton(
+            "Start New Overlay", QMessageBox.ButtonRole.AcceptRole)
+        cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        box.exec()
+        return "reset" if box.clickedButton() is start else "cancel"
+
+    def _resolve_overlay_grid_mismatch(self, current_spec, selected_spec):
+        """Choose the GUI policy without ever blocking an unattended run."""
+        automatic = bool(
+            getattr(self, "_run_active", False)
+            or getattr(getattr(self, "h5viewer", None), "_run_writing", False)
+            or getattr(getattr(self, "displayframe", None),
+                       "_processing_active", False)
+        )
+        if automatic:
+            logger.info(
+                "Overlay axis changed during live processing; starting a new "
+                "overlay. Current: %s; Selected: %s",
+                overlay_grid_spec_summary(current_spec),
+                overlay_grid_spec_summary(selected_spec),
+            )
+            return "reset"
+        decision = self._ask_overlay_grid_mismatch(current_spec, selected_spec)
+        if decision == "reset":
+            self.h5viewer._browser_previous_context = None
+        return decision
+
+    def _cancel_overlay_grid_selection(self):
+        restore = getattr(self.h5viewer, "restore_browser_context", None)
+        if callable(restore):
+            restore()
 
     def _rescope_frame_panel_to(self, name, first_frame=None):
         """Reset the Frames-panel / display state to a NEW scan identity.
