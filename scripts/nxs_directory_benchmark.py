@@ -330,6 +330,10 @@ def _bench_container(path, poni, poni_path, repeat_dir, output_root, plan, cores
         with Timer() as t:
             descriptor = describe_container(path, entry=entry)
         cm.probe_s = t.elapsed
+        # v4 has one descriptor probe rather than the old separate dataset
+        # resolve open.  Keep both published timing fields populated without
+        # inventing a second source open: they are the same measured window.
+        cm.dataset_resolve_s = cm.probe_s
         cm.state = descriptor.state.value
         cm.nframes = descriptor.frame_count
         cm.frame_shape = descriptor.frame_shape

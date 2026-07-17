@@ -656,7 +656,9 @@ def test_cursor_wired_bench_streams_public_source_route(tmp_path):
 
     assert cm.state == "ready"
     assert all(value is not None for value in (
-        cm.probe_s, cm.open_s, cm.metadata_s, cm.reduce_s, cm.finish_s))
+        cm.probe_s, cm.dataset_resolve_s, cm.open_s, cm.metadata_s,
+        cm.reduce_s, cm.finish_s))
+    assert cm.dataset_resolve_s == cm.probe_s
     # One descriptor probe plus one owner-thread cursor that supplies source
     # metadata and the public streamed consumption, independent of frame count.
     assert cm.open_counts["source"] == 2

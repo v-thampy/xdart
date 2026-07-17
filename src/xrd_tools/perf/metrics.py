@@ -61,8 +61,9 @@ OBSERVATION_SOURCES: dict[str, str] = {
                              "(skipped candidates before it are included)",
     "probe_s": "ContainerDescriptor readiness/layout probe over a short-lived "
                "HDF5 handle; no detector pixels are decoded",
-    "dataset_resolve_s": "UNOBSERVED in v4: descriptor resolution is included "
-                         "in probe_s rather than timed as a second open",
+    "dataset_resolve_s": "v4: descriptor resolution is coalesced with the "
+                         "single probe open, so this equals probe_s rather "
+                         "than causing a second source open",
     "open_s": "FrameSource construction only; it observes layout facts and "
               "never decodes detector pixels",
     "metadata_s": "FrameSource metadata provider materialization before public "
