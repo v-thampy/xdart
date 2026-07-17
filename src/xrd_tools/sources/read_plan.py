@@ -152,6 +152,12 @@ def plan_reads(
     for dim in fshape:
         n_pixels *= int(dim)
     frame_bytes = n_pixels * itemsize
+    # Rule 6 (deterministic): a zero-area frame shape has no valid block-byte
+    # arithmetic (the ``budget // frame_bytes`` fallback below would divide by
+    # zero).  Reject it explicitly, matching the frame_count/budget guards —
+    # a real detector dimension is never 0 (``frame_shape=None`` -> 1 pixel).
+    if frame_bytes <= 0:
+        raise ValueError(f"frame_shape must have positive pixel area; got {frame_shape!r}")
 
     # Resolve the requested half-open window, clamped into [0, frame_count].
     if frame_interval is None:
@@ -229,11 +235,17 @@ def plan_reads(
             raise ValueError(
                 f"requested_block_frames must be >= 1; got {requested_block_frames}")
         if cap < block_frames:
+            # Refresh the reason for EVERY path (aligned OR already-unaligned)
+            # so the reported "why" always names the final capped block, never a
+            # stale pre-cap frame count.
             if chunk_aligned:
-                chunk_aligned = False
                 fallback_reason = (
                     f"native cadence {block_frames} capped to requested "
                     f"{cap} frames")
+            else:
+                fallback_reason = (
+                    f"{fallback_reason}; capped to requested {cap} frames")
+            chunk_aligned = False
             block_frames = cap
 
     ranges = tuple(

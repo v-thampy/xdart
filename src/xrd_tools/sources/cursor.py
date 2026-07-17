@@ -154,6 +154,13 @@ class ContainerCursor:
         stack, self._stack = self._stack, None
         h5, self._h5 = self._h5, None
         self._entry_grp = None
+        # Seal a lazy provider that never materialized so a post-close metadata
+        # read fails clearly instead of silently returning empty (§4.2.5).
+        if self._provider is not None:
+            try:
+                self._provider.mark_source_closed()
+            except Exception:
+                pass
         self._provider = None
         if stack is not None:
             try:
@@ -219,13 +226,21 @@ class ContainerCursor:
         return np.asarray(self._stack[idx])
 
     def read_block(self, start: int, stop: int) -> ReadBlock:
-        """Read frames ``[start, stop)`` as one native-dtype owner block."""
+        """Read frames ``[start, stop)`` as one native-dtype owner block.
+
+        ``stop`` is clamped to the frame count and the returned block's ``stop``
+        reflects the frames ACTUALLY read, so ``ReadBlock.n_frames`` can never
+        overstate the array (an out-of-range ``stop`` would otherwise slice-clamp
+        silently and leave ``n_frames`` lying about the block extent)."""
         self._require_readable()
-        s, e = int(start), int(stop)
+        s = int(start)
+        e = min(int(stop), self.frame_count)
         if e <= s:
-            raise ValueError(f"empty block range [{s}, {e})")
+            raise ValueError(
+                f"empty block range [{s}, {stop}) for frame_count {self.frame_count}")
         array = np.asarray(self._stack[s:e])
-        return ReadBlock(start=s, stop=e, array=array)
+        actual_stop = s + int(array.shape[0])
+        return ReadBlock(start=s, stop=actual_stop, array=array)
 
     def iter_blocks(self, plan: ReadPlan) -> Iterator[ReadBlock]:
         """Yield each owner block for *plan*'s ranges, one at a time.

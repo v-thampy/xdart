@@ -246,3 +246,16 @@ def test_matching_candidate_opens_normally(tmp_path):
     with ContainerCursor(p, candidate=fresh) as cur:
         assert cur.descriptor.adapter_id == "nexus_hdf5"
         np.testing.assert_array_equal(cur.read_frame(0), data[0])
+
+
+def test_read_block_beyond_frame_count_does_not_overstate(tmp_path):
+    # A stop past the frame count must clamp so n_frames never overstates the
+    # array (h5py silently clamps the slice; the block extent must not lie).
+    p, data = _stack(tmp_path / "clamp.nxs", shape=(5, 16, 16))
+    with ContainerCursor(p) as cur:
+        assert cur.frame_count == 5
+        block = cur.read_block(3, 20)          # stop 20 >> 5 frames
+        assert block.array.shape[0] == 2       # only frames 3,4 exist
+        assert block.stop == 5                 # clamped to what was read
+        assert block.n_frames == 2             # not 17
+        np.testing.assert_array_equal(block.frame(4), data[4])

@@ -170,6 +170,19 @@ def test_wavelength_available_without_table_build(tmp_path):
 # --------------------------------------------------------------------------- #
 # plain NeXus stack keeps sidecar behavior (empty provider)
 # --------------------------------------------------------------------------- #
+def test_provider_read_after_close_before_materialize_fails_clearly(tmp_path):
+    """If the owning cursor closes before the provider materializes, a later
+    read must FAIL CLEARLY (not silently return empty) — handoff §4.2.5."""
+    from xrd_tools.sources.metadata_provider import MetadataSourceClosedError
+
+    p, *_ = _bluesky(tmp_path / "close_before_mat.nxs")
+    cur = ContainerCursor(p).open()
+    provider = cur.metadata_provider()  # obtained but NOT materialized
+    cur.close()
+    with pytest.raises(MetadataSourceClosedError):
+        provider.metadata_for(0)
+
+
 def test_plain_stack_gets_empty_provider(tmp_path):
     p = _plain(tmp_path / "plain.nxs")
     with ContainerCursor(p) as cur:

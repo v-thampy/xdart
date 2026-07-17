@@ -190,7 +190,19 @@ def resolve_stack_paths(h5f: Any, entry: str) -> tuple[list[str], bool]:
         return list(links), False
     path = find_nexus_image_dataset_in_open_file(h5f, entry)
     if path is None:
-        return [], False
+        # The entry-scoped reader found nothing.  Fall back to R1's WHOLE-FILE
+        # resolver (the one the authoritative _nexus_probe uses) so a detector
+        # at a non-entry location (e.g. a root ``/data``) is still found and the
+        # descriptor's readiness agrees with R1 by construction.  Use the
+        # dataset's own path so the cursor's NexusImageStack can open it.
+        # ProcessedXdartInputError propagates (processed output); a genuine
+        # "no detector dataset" ValueError resolves to IMAGELESS.
+        from xrd_tools.io.image import _find_hdf5_image_dataset
+        try:
+            ds = _find_hdf5_image_dataset(h5f)
+        except ValueError:
+            return [], False
+        path = ds.name
     ds = h5f[path]
     return [path], bool(getattr(ds, "ndim", 0) == 2)
 
@@ -287,6 +299,18 @@ def describe_container_from_open(
             has_end = "end_time" in entry_grp
         except Exception:
             has_end = False
+    else:
+        # No NXentry resolved yet.  A still-writing NXWriter run stamps the root
+        # ``creator='NXWriter'`` attribute BEFORE its entry tree exists, so a
+        # nascent shell must be detected at the FILE level — otherwise it would
+        # read as finalized/IMAGELESS instead of IN_PROGRESS and a consumer
+        # could prematurely consume-and-retire a still-writing run (agree with
+        # R1 is_unfinalized_nxwriter).
+        try:
+            is_bluesky = bool(is_bluesky_nxwriter(h5f))
+        except Exception:
+            is_bluesky = False
+        has_end = False  # no entry -> no end_time yet
     finalized = (not is_bluesky) or has_end
     scan_name = _scan_name(path)
 

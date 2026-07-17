@@ -218,3 +218,23 @@ def test_negative_frame_count_rejected():
 def test_requested_block_frames_must_be_positive():
     with pytest.raises(ValueError):
         plan_reads(5, (4, 4), np.uint16, (2, 4, 4), 10_000, requested_block_frames=0)
+
+
+def test_zero_area_frame_shape_rejected():
+    # A zero-area frame would make budget // frame_bytes divide by zero; reject
+    # it deterministically (rule 6) rather than crash with ZeroDivisionError.
+    with pytest.raises(ValueError):
+        plan_reads(3, (0, 16), np.uint16, None, 1000)
+
+
+def test_cap_on_unaligned_block_reason_names_the_cap():
+    # A contiguous (unaligned) block lowered by requested_block_frames must
+    # report the FINAL capped count in fallback_reason, not the pre-cap count.
+    plan = plan_reads(
+        50, (10, 10), np.uint32, chunks=None, max_block_bytes=10 * 400,
+        requested_block_frames=4)
+    assert plan.block_frames == 4
+    assert plan.chunk_aligned is False
+    assert "capped to requested 4 frames" in plan.fallback_reason
+    # the stale pre-cap "10 frames" must NOT be the trailing claim
+    assert not plan.fallback_reason.endswith("fallback of 10 frames")

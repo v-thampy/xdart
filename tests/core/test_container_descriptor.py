@@ -292,3 +292,34 @@ def test_descriptor_is_frozen(tmp_path):
     with pytest.raises(Exception):
         d.frame_count = 999  # type: ignore[misc]
     assert isinstance(d, ContainerDescriptor)
+
+
+# --------------------------------------------------------------------------- #
+# audit fixes: nascent NXWriter shell + non-entry detector location
+# --------------------------------------------------------------------------- #
+def test_nascent_nxwriter_shell_is_in_progress(tmp_path):
+    """A still-writing NXWriter run stamps root creator='NXWriter' before its
+    entry tree exists; it must read IN_PROGRESS (agree with R1
+    is_unfinalized_nxwriter), never finalized/IMAGELESS."""
+    from xrd_tools.io.bluesky_nexus import is_unfinalized_nxwriter
+
+    p = tmp_path / "nascent_00001.nxs"
+    with h5py.File(p, "w") as f:
+        f.attrs["creator"] = "NXWriter"  # creator stamped, NO entry group yet
+    d = describe_container(p)
+    assert d.state is ProbeState.IN_PROGRESS
+    assert d.is_bluesky is True
+    assert d.finalized is False
+    assert is_unfinalized_nxwriter(p) is True  # R1 agrees
+
+
+def test_detector_at_non_entry_location_is_found(tmp_path):
+    """A detector dataset at a non-entry location (root /data) is still found
+    via R1's whole-file resolver, so readiness agrees with R1 by construction."""
+    p = tmp_path / "rootdata.h5"
+    with h5py.File(p, "w") as f:
+        f.create_dataset("data", data=np.zeros((3, 8, 8), np.uint16))  # /data, no entry
+    d = describe_container(p)
+    assert d.state is ProbeState.READY
+    assert d.dataset_path == "/data"
+    assert d.frame_count == 3

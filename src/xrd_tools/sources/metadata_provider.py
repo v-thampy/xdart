@@ -33,8 +33,19 @@ __all__ = [
     "MetadataProvider",
     "BlueskyMetadataProvider",
     "EmptyMetadataProvider",
+    "MetadataSourceClosedError",
     "metadata_provider_for_open_entry",
 ]
+
+#: Sentinel marking a provider whose owning cursor closed before its table was
+#: ever materialized — the live handle is gone, so reads must fail clearly.
+_SOURCE_CLOSED: Any = object()
+
+
+class MetadataSourceClosedError(RuntimeError):
+    """A lazy provider was read after its owning cursor closed before the
+    per-frame table was materialized (handoff §4.2.5: reads after close fail
+    clearly, they do not silently return empty)."""
 
 
 class MetadataProvider:
@@ -54,6 +65,13 @@ class MetadataProvider:
 
     def wavelength(self) -> float | None:
         return None
+
+    def mark_source_closed(self) -> None:
+        """Notify the provider that its owning cursor's handle has closed.
+
+        A materialized or handle-free provider (all numpy) ignores this; a lazy
+        provider that never materialized seals itself so a later read fails
+        clearly instead of silently returning empty (handoff §4.2.5)."""
 
 
 class EmptyMetadataProvider(MetadataProvider):
@@ -90,6 +108,12 @@ class BlueskyMetadataProvider(MetadataProvider):
         self._motors: dict[str, np.ndarray] | None = None
         self._constants: dict[str, float] | None = None
 
+    def mark_source_closed(self) -> None:
+        # Seal only when never materialized; a materialized provider is pure
+        # numpy and stays fully usable after its cursor closes.
+        if self._table is None:
+            self._entry = _SOURCE_CLOSED
+
     def _ensure_table(self) -> None:
         if self._table is not None:
             return
@@ -100,6 +124,10 @@ class BlueskyMetadataProvider(MetadataProvider):
         )
 
         entry = self._entry
+        if entry is _SOURCE_CLOSED:
+            raise MetadataSourceClosedError(
+                "metadata provider read after its cursor closed before the "
+                "per-frame table was materialized; open a fresh cursor")
         if entry is None:
             # Materialized already but table missing (defensive): empty.
             self._table, self._motors, self._constants = {}, {}, {}
