@@ -188,3 +188,97 @@ def test_public_route_no_open_handle_leaks_after_reduction(tmp_path, monkeypatch
     # a fresh writable open proves no reader handle is still holding the file
     with h5py.File(p, "r+") as f:
         assert "entry" in f
+
+
+def test_preopened_cursor_streams_public_source_and_closes_once(tmp_path, monkeypatch):
+    """A same-thread pre-opened cursor serves source metadata and all reads."""
+    from xrd_tools.sources.cursor import ContainerCursor
+    from xrd_tools.sources.nexus import NexusStackSource
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", _fake_1d)
+    p = _write_stack(tmp_path / "prepared_00001.nxs", 4)
+    cursor = ContainerCursor(p).open()
+    source = NexusStackSource(p, cursor=cursor)
+    source.integrator = object()
+    result = run_reduction(
+        ReductionPlan(integration_1d=Integration1DPlan(npt=2)), source,
+        NexusSink(path=str(tmp_path / "prepared_out.nxs"), overwrite=True))
+
+    assert result.n_processed == 4
+    assert cursor.closed is True
+
+
+def test_huge_consumer_chunk_is_capped_by_source_read_plan(tmp_path, monkeypatch):
+    """A caller's progress chunk cannot bypass the source byte budget."""
+    from xrd_tools.core import staging
+    from xrd_tools.sources.cursor import ContainerCursor
+
+    p = _write_stack(tmp_path / "bounded_00001.nxs", 7, chunks=(4, 8, 8))
+    frame_bytes = 8 * 8 * np.dtype(np.uint16).itemsize
+    monkeypatch.setattr(staging, "source_block_budget_bytes", lambda: 2 * frame_bytes)
+    calls = []
+    real_read_block = ContainerCursor.read_block
+
+    def spy_read_block(self, start, stop):
+        block = real_read_block(self, start, stop)
+        calls.append((int(start), int(stop), block.nbytes, block.array.dtype))
+        return block
+
+    monkeypatch.setattr(ContainerCursor, "read_block", spy_read_block)
+    src = open_source(SourceSpec(p, SourceKind.NEXUS_STACK))
+    chunks = list(src.iter_chunks(10_000))
+
+    assert [label for _images, labels in chunks for label in labels] == list(range(7))
+    assert [(start, stop) for start, stop, _nbytes, _dtype in calls] == [
+        (0, 2), (2, 4), (4, 6), (6, 7)]
+    assert all(nbytes <= 2 * frame_bytes for _s, _e, nbytes, _d in calls)
+    assert all(dtype == np.dtype(np.uint16) for _s, _e, _n, dtype in calls)
+
+
+def test_public_submit_seam_receives_native_dtype_under_huge_chunk(
+        tmp_path, monkeypatch):
+    """Native source arrays reach ``ReductionSession.submit`` before workers.
+
+    This guards the real producer-to-session boundary; an upcast inside
+    ``_chunk_images_as_list`` would fail here even if the integrator later hid
+    it by converting to float internally.
+    """
+    from xrd_tools.core import staging
+    from xrd_tools.sources.cursor import ContainerCursor
+    from xrd_tools.reduction.core import ReductionSession
+
+    p = _write_stack(tmp_path / "submit_00001.nxs", 5, chunks=(4, 8, 8))
+    frame_bytes = 8 * 8 * np.dtype(np.uint16).itemsize
+    monkeypatch.setattr(staging, "source_block_budget_bytes", lambda: 2 * frame_bytes)
+    monkeypatch.setattr(reduction_core, "integrate_1d", _fake_1d)
+    seen = []
+    owner_blocks = []
+    real_submit = ReductionSession.submit
+    real_read_block = ContainerCursor.read_block
+
+    def spy_read_block(self, start, stop):
+        block = real_read_block(self, start, stop)
+        owner_blocks.append(block.array)
+        return block
+
+    def spy_submit(self, frame, image=None):
+        assert image is not None
+        # The producer sends a view of the source owner block, not a hidden
+        # float/copy allocation; copies are therefore separately zero here.
+        assert any(np.shares_memory(np.asarray(image), owner)
+                   for owner in owner_blocks)
+        seen.append((int(frame.index), np.asarray(image).dtype))
+        return real_submit(self, frame, image)
+
+    monkeypatch.setattr(ContainerCursor, "read_block", spy_read_block)
+    monkeypatch.setattr(ReductionSession, "submit", spy_submit)
+    src = open_source(SourceSpec(p, SourceKind.NEXUS_STACK))
+    src.integrator = object()
+    result = run_reduction(
+        ReductionPlan(integration_1d=Integration1DPlan(npt=2)), src,
+        NexusSink(path=str(tmp_path / "submit_out.nxs"), overwrite=True),
+        chunk_size=10_000, inflight_max=1, executor=1)
+
+    assert result.n_processed == 5
+    assert [index for index, _dtype in seen] == list(range(5))
+    assert {dtype for _index, dtype in seen} == {np.dtype(np.uint16)}

@@ -40,17 +40,32 @@ from xrd_tools.sources.descriptor import (
     ContainerDescriptor,
     describe_container_from_open,
 )
+from xrd_tools.sources.probe import ProbeState
 from xrd_tools.sources.metadata_provider import (
     MetadataProvider,
     metadata_provider_for_open_entry,
 )
 from xrd_tools.sources.read_plan import ReadPlan
 
-__all__ = ["ContainerCursor", "ReadBlock", "CursorClosedError"]
+__all__ = [
+    "ContainerCursor",
+    "ReadBlock",
+    "CursorClosedError",
+    "ContainerNotReadyError",
+]
 
 
 class CursorClosedError(RuntimeError):
     """Raised when a read is attempted on a closed :class:`ContainerCursor`."""
+
+
+class ContainerNotReadyError(RuntimeError):
+    """A valid container is still provisional; close it and retry later.
+
+    This is intentionally a typed, retry-later outcome for callers that need
+    an open cursor.  Use :func:`describe_container` when a provisional
+    descriptor value is sufficient for a polling/readiness decision.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +142,15 @@ class ContainerCursor:
             self._descriptor = describe_container_from_open(
                 self._h5, path=self._path, entry=self._entry,
                 candidate=self._candidate)
+            # A finalized-link gap has no dataset to bind, so an open cursor
+            # must return the typed retry-later result.  An NXWriter file may
+            # legitimately expose a complete detector stack before it writes
+            # ``end_time``; that existing live-append route stays readable.
+            if (self._descriptor.state is ProbeState.IN_PROGRESS
+                    and self._descriptor.dataset_path is None):
+                raise ContainerNotReadyError(
+                    f"{self._path} is not ready for cursor reads: "
+                    f"{self._descriptor.reason}")
             try:
                 self._entry_grp = resolve_nxentry(self._h5, self._entry)
             except Exception:

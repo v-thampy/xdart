@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from xrd_tools.sources.composite import CompositeFrameSource, concat_sources
     from xrd_tools.sources.cursor import (
         ContainerCursor,
+        ContainerNotReadyError,
         CursorClosedError,
         ReadBlock,
     )
@@ -82,6 +83,7 @@ _LAZY_EXPORTS = {
     "CompositeFrameSource": "xrd_tools.sources.composite",
     "ContainerCursor": "xrd_tools.sources.cursor",
     "ContainerDescriptor": "xrd_tools.sources.descriptor",
+    "ContainerNotReadyError": "xrd_tools.sources.cursor",
     "CursorClosedError": "xrd_tools.sources.cursor",
     "DEFAULT_RETRY_DEADLINE": "xrd_tools.sources.directory_index",
     "DirectoryIndex": "xrd_tools.sources.directory_index",
@@ -147,6 +149,7 @@ __all__ = [
     "CompositeFrameSource",
     "ContainerCursor",
     "ContainerDescriptor",
+    "ContainerNotReadyError",
     "CursorClosedError",
     "DEFAULT_RETRY_DEADLINE",
     "DirectoryIndex",

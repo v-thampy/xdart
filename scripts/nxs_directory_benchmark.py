@@ -264,6 +264,42 @@ def _validate_destination(dest, *, sources, poni, source_dir, recursive):
 # per-container measurement
 # ---------------------------------------------------------------------------
 
+def _measured_nexus_stack_source(path, *, entry, metrics, cursor=None):
+    """Build an instrumented public source without retaining detector arrays.
+
+    The harness observes values at the source's real ``metadata_for`` and
+    ``iter_chunks`` seams.  It deliberately wraps no reduction implementation:
+    production still owns cursor lifetime, planning, decode, submit, and sink
+    ordering.
+    """
+
+    from xrd_tools.sources.nexus import NexusStackSource
+
+    class MeasuredNexusStackSource(NexusStackSource):
+        def __init__(self, path, *, entry, metrics):
+            self._metrics = metrics
+            self.cursor_consumptions = 0
+            super().__init__(path, entry=entry, cursor=cursor)
+
+        def metadata_for(self, index):
+            self._metrics.metadata_reads = (
+                int(self._metrics.metadata_reads or 0) + 1)
+            return super().metadata_for(index)
+
+        def iter_chunks(self, chunk_size):
+            self.cursor_consumptions += 1
+            for images, labels in super().iter_chunks(chunk_size):
+                nbytes = int(getattr(images, "nbytes", 0))
+                self._metrics.block_reads = (
+                    int(self._metrics.block_reads or 0) + 1)
+                self._metrics.source_logical_bytes = (
+                    int(self._metrics.source_logical_bytes or 0) + nbytes)
+                self._metrics.retained_owner_bytes_peak = max(
+                    int(self._metrics.retained_owner_bytes_peak or 0), nbytes)
+                yield images, labels
+
+    return MeasuredNexusStackSource(path, entry=entry, metrics=metrics)
+
 def _bench_container(path, poni, poni_path, repeat_dir, output_root, plan, cores,
                      entry, frame_limit, source_dir, source_paths, recursive):
     """Measure one container. Returns the ContainerMetrics (first-write ts is on
@@ -272,11 +308,8 @@ def _bench_container(path, poni, poni_path, repeat_dir, output_root, plan, cores
     ``poni`` is the loaded calibration (for the integrator); ``poni_path`` is the
     real filesystem path threaded into destination safety so the released guard
     actually checks the PONI file (M0-R4 correction)."""
-    import numpy as np
-
     from xrd_tools.perf.metrics import ContainerMetrics, Timer
     from xrd_tools.io.output_safety import OutputCollisionError
-    from xrd_tools.core.scan import Scan, ScanFrame
     from xrd_tools.core.staging import source_block_budget_bytes
     from xrd_tools.sources.cursor import ContainerCursor
     from xrd_tools.sources.descriptor import describe_container
@@ -332,7 +365,9 @@ def _bench_container(path, poni, poni_path, repeat_dir, output_root, plan, cores
 
             limit = (descriptor.frame_count if frame_limit is None
                      else min(frame_limit, descriptor.frame_count))
-            # Layout-aware, byte-bounded read plan (retires the fixed-16 block).
+            # The source computes this same layout-aware plan at its actual
+            # consumption seam.  Recording the expected decision here provides
+            # per-container observability without opening or decoding pixels.
             read_plan = plan_reads(
                 descriptor.frame_count, descriptor.frame_shape, descriptor.dtype,
                 descriptor.chunks, source_block_budget_bytes(),
@@ -342,45 +377,34 @@ def _bench_container(path, poni, poni_path, repeat_dir, output_root, plan, cores
             cm.read_plan_fallback_reason = read_plan.fallback_reason or None
 
             integrator = poni_to_integrator(poni)
-            frames: list = []
-            block_reads = logical_bytes = owner_peak = metadata_reads = 0
-            # ONE CONSUMPTION CURSOR supplies metadata + all native-dtype block
-            # reads; per-frame images are memory-sharing views into their owner
-            # block (charged once).  No per-frame source-master reopen.
-            src_before_cursor = counter.counts["source"]
+            # Construct the real public source.  It only gathers source facts;
+            # the streamed reduction below owns the live cursor and reads one
+            # bounded owner block at a time.  No ``ScanFrame.image`` list is
+            # assembled here, so RSS cannot grow with detector frame count.
+            source_cursor = None
             with Timer() as t:
-                with ContainerCursor(path, entry=entry) as cursor:
-                    provider = cursor.metadata_provider()
-                    for block in cursor.iter_blocks(read_plan):
-                        block_reads += 1
-                        logical_bytes += block.nbytes
-                        owner_peak = max(owner_peak, block.nbytes)
-                        for i in range(block.start, block.stop):
-                            # COPY each frame out of the owner block (native
-                            # dtype) so the block is released before the next is
-                            # read: only ONE owner block is live at a time, so
-                            # ``owner_peak`` truthfully stays within the ReadPlan.
-                            # (The cursor's zero-copy VIEW contract — proven in
-                            # test_container_cursor — is what a streaming consumer
-                            # uses; this eager batch harness materializes a whole
-                            # Scan, so it must not pin every block via a view.)
-                            img = np.array(block.frame(i))
-                            md = provider.metadata_for(i)
-                            metadata_reads += 1
-                            frames.append(ScanFrame(
-                                index=i, image=img, metadata=dict(md),
-                                source_path=path, source_frame_index=i,
-                                source_identity=str(path)))
+                source_cursor = ContainerCursor(path, entry=entry).open()
+                source = _measured_nexus_stack_source(
+                    path, entry=entry, metrics=cm, cursor=source_cursor)
+                source.name = scan_name
+                source.integrator = integrator
+                # ``NexusStackSource`` has contiguous 0-based labels.  Limit
+                # its source manifest before run_reduction materializes frames;
+                # its read plan uses the same [0, limit) interval.
+                source._frame_indices = source._frame_indices[:limit]
             cm.open_s = t.elapsed
-            cm.cursor_opens = counter.counts["source"] - src_before_cursor
-            cm.block_reads = block_reads
-            cm.source_logical_bytes = logical_bytes
-            cm.retained_owner_bytes_peak = owner_peak
-            cm.metadata_reads = metadata_reads
-
-            scan = Scan(name=scan_name, frames=frames, integrator=integrator)
-            cm.frames_input = len(scan.frames)
+            # Keep the v2 timing boundary honest: materialize metadata before
+            # reduction, but leave pixels to the public streaming producer.
+            # The source caches this provider, so the later canonical Scan
+            # construction incurs no per-frame master reopen.
+            with Timer() as t:
+                if limit:
+                    source.metadata_for(0)
+            cm.metadata_s = t.elapsed
+            cm.frames_input = int(limit)
         except Exception as exc:
+            if "source_cursor" in locals() and source_cursor is not None:
+                source_cursor.close()
             # a SETUP failure (before a sink exists): nothing was written.
             cm.state = "invalid"
             cm.error = f"{type(exc).__name__}: {exc}"[:200]
@@ -400,8 +424,9 @@ def _bench_container(path, poni, poni_path, repeat_dir, output_root, plan, cores
         result = None
         try:
             with reduce_timer:
-                result = run_reduction(plan, scan, sink=sink,
-                                       execution="streaming", executor=executor)
+                result = run_reduction(
+                    plan, source, sink=sink, execution="streaming",
+                    chunk_size=read_plan.block_frames, executor=executor)
         except Exception as exc:
             cm.state = "invalid"
             cm.error = f"{type(exc).__name__}: {exc}"[:200]
@@ -409,11 +434,13 @@ def _bench_container(path, poni, poni_path, repeat_dir, output_root, plan, cores
             logger.debug("reduction failed: %s", path, exc_info=True)
         finally:
             executor.shutdown(wait=True)  # shutdown belongs to the harness
+            source.close()
             cm.reduce_s = reduce_timer.elapsed
             cm.frames_written = len(sink.write_times)   # observed SUCCESSFUL writes
             cm.finish_s = sink.finish_s
             if sink.first_write_ts is not None:
                 cm.reserved["first_write_ts"] = sink.first_write_ts
+            cm.cursor_opens = int(source.cursor_consumptions)
         if result is not None:
             cm.frames_reduced = int(getattr(result, "n_processed", 0))
             if getattr(result, "failed", False):

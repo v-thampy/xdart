@@ -970,3 +970,204 @@ def test_r2_cursor_closed_on_stop_and_clean_rerun(tmp_path):
     assert item2[3] is not None
     assert t._eiger_cursor is not None
     assert t._eiger_cursor is not cursor  # a NEW cursor, not the stopped one
+
+
+def test_r2_bind_cursor_uses_actual_descriptor_read_plan_inputs(
+        bluesky_file, monkeypatch):
+    """The GUI binding cannot silently substitute plan shape/chunks/budget."""
+    from xrd_tools.core import staging
+    from xrd_tools.sources.cursor import ContainerCursor
+    from xrd_tools.sources import read_plan as read_plan_module
+
+    worker = _bare_thread(bluesky_file)
+    worker._eiger_cursor = None
+    worker._eiger_descriptor = None
+    worker._eiger_read_plan = None
+    worker._eiger_provider = None
+    worker._eiger_fabio_handle = None
+    budget = 2 * np.dtype(np.uint32).itemsize * np.prod(IMG_SHAPE)
+    monkeypatch.setattr(staging, "source_block_budget_bytes", lambda: budget)
+    real_plan_reads = read_plan_module.plan_reads
+    seen = {}
+
+    def spy_plan_reads(*args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return real_plan_reads(*args, **kwargs)
+
+    monkeypatch.setattr(read_plan_module, "plan_reads", spy_plan_reads)
+    cursor = ContainerCursor(bluesky_file).open()
+    try:
+        descriptor = cursor.descriptor
+        worker._eiger_bind_cursor(cursor)
+        assert seen["args"] == (
+            descriptor.frame_count, descriptor.frame_shape, descriptor.dtype,
+            descriptor.chunks, budget)
+        assert seen["kwargs"] == {"two_d": descriptor.is_2d}
+        assert worker._eiger_descriptor is descriptor
+        assert worker._eiger_read_plan == real_plan_reads(
+            descriptor.frame_count, descriptor.frame_shape, descriptor.dtype,
+            descriptor.chunks, budget, two_d=descriptor.is_2d)
+        assert worker._eiger_provider is cursor.metadata_provider()
+    finally:
+        worker._eiger_close_master()
+
+
+def test_r2_cursor_refresh_failure_preserves_binding_then_recovers(tmp_path, monkeypatch):
+    """A failed replacement retains the old coherent cursor for a later retry."""
+    from xrd_tools.sources.cursor import ContainerCursor
+
+    watch = tmp_path / "watch"; watch.mkdir()
+    out = tmp_path / "out"; out.mkdir()
+    path = watch / "refresh_00001.nxs"
+    _write_bluesky_nxwriter(path, n=NFRAMES)
+
+    worker = _real_dir_watch_thread(watch, out)
+    assert worker._get_next_eiger_frame_sync()[3] is not None
+    old_cursor = worker._eiger_cursor
+    old_descriptor = worker._eiger_descriptor
+    old_plan = worker._eiger_read_plan
+    old_provider = worker._eiger_provider
+    assert old_cursor is not None
+
+    real_open = ContainerCursor.open
+
+    def transient_open(self):
+        if self._path == path:  # noqa: SLF001 - exact reopened source path
+            raise OSError("transient mid-write read failure")
+        return real_open(self)
+
+    monkeypatch.setattr(ContainerCursor, "open", transient_open)
+    worker._eiger_refresh_master_handle()
+    assert worker._eiger_cursor is old_cursor and old_cursor.closed is False
+    assert worker._eiger_descriptor is old_descriptor
+    assert worker._eiger_read_plan is old_plan
+    assert worker._eiger_provider is old_provider
+
+    monkeypatch.setattr(ContainerCursor, "open", real_open)
+    worker._eiger_refresh_master_handle()
+    assert worker._eiger_cursor is not None and worker._eiger_cursor is not old_cursor
+    assert old_cursor.closed is True
+    assert worker._eiger_descriptor is worker._eiger_cursor.descriptor
+    assert worker._eiger_provider is not old_provider
+    worker._eiger_close_master()
+
+
+def test_r2_cursor_refresh_imageless_replacement_keeps_old_binding(
+        tmp_path, monkeypatch):
+    """A replacement with no dataset never publishes a mixed old/new binding."""
+    import h5py
+    import xrd_tools.sources.cursor as cursor_module
+
+    from xrd_tools.sources.cursor import ContainerCursor
+
+    watch = tmp_path / "watch"; watch.mkdir()
+    out = tmp_path / "out"; out.mkdir()
+    path = watch / "binding_00001.nxs"
+    _write_bluesky_nxwriter(path, n=NFRAMES)
+    imageless = tmp_path / "imageless.nxs"
+    with h5py.File(imageless, "w") as h5:
+        entry = h5.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.create_group("instrument")
+
+    worker = _real_dir_watch_thread(watch, out)
+    assert worker._get_next_eiger_frame_sync()[3] is not None
+    old = (worker._eiger_cursor, worker._eiger_descriptor,
+           worker._eiger_read_plan, worker._eiger_provider)
+
+    monkeypatch.setattr(
+        cursor_module, "ContainerCursor",
+        lambda *_args, **_kwargs: ContainerCursor(imageless))
+    assert worker._eiger_reopen_cursor() is False
+    assert (worker._eiger_cursor, worker._eiger_descriptor,
+            worker._eiger_read_plan, worker._eiger_provider) == old
+    assert old[0] is not None and old[0].closed is False
+    worker._eiger_close_master()
+
+
+def test_r2_cursor_backed_rows_overlay_scanned_motors_and_preserve_order(tmp_path):
+    """The real folder read carries motors, counters, constants, and EPOCH."""
+    import h5py
+
+    watch = tmp_path / "watch"; watch.mkdir()
+    out = tmp_path / "out"; out.mkdir()
+    path = watch / "rows_00001.nxs"
+    _write_bluesky_baseline_only_motors(path, n=NFRAMES)
+    with h5py.File(path, "r+") as h5:
+        h5["entry"].create_dataset("end_time", data=np.bytes_("2026-07-17"))
+
+    worker = _real_dir_watch_thread(watch, out)
+    rows = []
+    for _ in range(NFRAMES):
+        item = worker._get_next_eiger_frame_sync()
+        assert item[3] is not None
+        rows.append(item)
+
+    assert [item[2] for item in rows] == list(range(1, NFRAMES + 1))
+    for item in rows:
+        row = item[4]
+        assert {"halpha", "i0", "i1", "i2", "pd", "EPOCH", "detx",
+                "sbsx", "eiger_count_time"} <= set(row)
+        assert resolve_incident_angle(row, "halpha") == pytest.approx(row["halpha"])
+    assert rows[0][4]["halpha"] != rows[-1][4]["halpha"]
+    legacy = _bare_thread(path)._frame_scan_info(str(path), 0)
+    assert rows[0][4] == legacy
+    assert worker._eiger_descriptor.wavelength == pytest.approx(WAVELENGTH)
+    worker._eiger_close_master()
+
+
+def test_r2_append_skip_avoids_real_cursor_reads_and_metadata(tmp_path, monkeypatch):
+    """Append skips are decided before real sync/bulk cursor reads or metadata."""
+    import queue
+    import threading
+
+    from xrd_tools.sources.cursor import ContainerCursor
+    from xrd_tools.sources.metadata_provider import BlueskyMetadataProvider
+
+    watch = tmp_path / "watch"; watch.mkdir()
+    out = tmp_path / "out"; out.mkdir()
+    path = watch / "append_00001.nxs"
+    _write_bluesky_nxwriter(path, n=NFRAMES)
+
+    read_indices = []
+    block_ranges = []
+    metadata_indices = []
+    real_read = ContainerCursor.read_frame
+    real_block = ContainerCursor.read_block
+    real_metadata = BlueskyMetadataProvider.metadata_for
+
+    def spy_read(self, index):
+        read_indices.append(int(index))
+        return real_read(self, index)
+
+    def spy_metadata(self, index):
+        metadata_indices.append(int(index))
+        return real_metadata(self, index)
+
+    def spy_block(self, start, stop):
+        block_ranges.append((int(start), int(stop)))
+        return real_block(self, start, stop)
+
+    monkeypatch.setattr(ContainerCursor, "read_frame", spy_read)
+    monkeypatch.setattr(ContainerCursor, "read_block", spy_block)
+    monkeypatch.setattr(BlueskyMetadataProvider, "metadata_for", spy_metadata)
+
+    worker = _real_dir_watch_thread(watch, out)
+    worker.write_mode = "Append"
+    worker._append_skip_frames_by_scan = {"append_00001": {1, 3}}
+    worker._prefetch_queue = queue.Queue(maxsize=NFRAMES + 1)
+    worker._prefetch_stop_evt = threading.Event()
+    worker._prefetch_worker()
+    items = []
+    while not worker._prefetch_queue.empty():
+        item = worker._prefetch_queue.get_nowait()
+        if item[3] is not None:
+            items.append(item)
+
+    assert [item[2] for item in items] == [2, 4, 5]
+    assert read_indices == [1]
+    assert block_ranges == [(3, 5)]
+    assert metadata_indices == [1, 3, 4]
+    assert worker._prefetch_error is None
+    worker._eiger_close_master()

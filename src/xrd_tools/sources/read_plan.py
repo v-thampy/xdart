@@ -197,13 +197,18 @@ def plan_reads(
             oversize = True
     elif frame_bytes > budget:
         # Rule 2: a single frame exceeds the budget -> read exactly one frame
-        # and disclose the oversize fact.
+        # and disclose the oversize fact.  A one-frame native HDF5 chunk still
+        # has exact native cadence even when that one frame is necessarily over
+        # budget; ``chunk_aligned`` describes cadence, not budget compliance.
         block_frames = 1
-        chunk_aligned = False
+        chunk_aligned = native == 1
         oversize = True
-        fallback_reason = (
-            f"single frame {frame_bytes}B exceeds budget {budget}B; "
-            "reading one frame per block")
+        if chunk_aligned:
+            fallback_reason = ""
+        else:
+            fallback_reason = (
+                f"single frame {frame_bytes}B exceeds budget {budget}B; "
+                "reading one frame per block")
     else:
         max_by_budget = budget // frame_bytes  # >= 1 since frame_bytes <= budget
         if native is not None:

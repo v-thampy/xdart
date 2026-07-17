@@ -23,11 +23,24 @@ class NexusStackSource(BaseFrameSource):
 
     kind = SourceKind.NEXUS_STACK
 
-    def __init__(self, path: str | Path, *, entry: str = "entry") -> None:
+    def __init__(self, path: str | Path, *, entry: str = "entry",
+                 cursor: Any | None = None) -> None:
         self.path = Path(path)
         self.entry = entry
-        with open_nexus_image_stack(self.path, entry) as stack:
-            n = int(stack.shape[0])
+        # ``cursor`` is an owner-thread-only handoff for a caller that already
+        # opened the sustained source cursor (the benchmark's descriptor ->
+        # metadata -> public-streaming route).  It is consumed and closed by
+        # iter_chunks()/close(); no h5py object leaves the producer thread.
+        self._consumption_cursor = cursor
+        if cursor is None:
+            with open_nexus_image_stack(self.path, entry) as stack:
+                n = int(stack.shape[0])
+        else:
+            descriptor = cursor.descriptor
+            if descriptor.path != self.path:
+                raise ValueError(
+                    f"cursor path {descriptor.path} does not match source {self.path}")
+            n = int(descriptor.frame_count)
         super().__init__(
             name=self.path.stem,
             frame_indices=range(n),
@@ -54,16 +67,61 @@ class NexusStackSource(BaseFrameSource):
         with self.open_cursor() as cursor:
             return np.asarray(cursor.read_frame(int(index)))
 
+    def close(self) -> None:
+        """Release an optional owner-thread consumption cursor early."""
+        cursor, self._consumption_cursor = self._consumption_cursor, None
+        if cursor is not None:
+            cursor.close()
+
     def iter_chunks(self, chunk_size: int) -> Iterator[tuple[np.ndarray, list[int]]]:
+        """Yield source-owner blocks bounded by the descriptor's ``ReadPlan``.
+
+        ``chunk_size`` remains a consumer/progress cap, never permission to
+        decode a larger source block than the native-byte budget permits.
+        """
         if chunk_size <= 0:
             raise ValueError(f"chunk_size must be > 0; got {chunk_size}")
-        labels = self.frame_indices
+
+        cursor = self._consumption_cursor
+        if cursor is not None:
+            self._consumption_cursor = None
+            try:
+                yield from self._iter_cursor_chunks(cursor, chunk_size)
+            finally:
+                cursor.close()
+            return
+
         # ONE cursor for the whole consumption window (no per-chunk reopen).
         with self.open_cursor() as cursor:
-            for start in range(0, len(labels), chunk_size):
-                chunk_labels = labels[start:start + chunk_size]
-                block = cursor.read_block(start, start + len(chunk_labels))
-                yield np.asarray(block.array), chunk_labels
+            yield from self._iter_cursor_chunks(cursor, chunk_size)
+
+    def _iter_cursor_chunks(self, cursor, chunk_size: int) -> Iterator[
+            tuple[np.ndarray, list[int]]]:
+        """Yield a byte-planned sequence from an open owner-thread cursor."""
+        from xrd_tools.core.staging import source_block_budget_bytes
+        from xrd_tools.sources.read_plan import plan_reads
+
+        labels = self.frame_indices
+        if len(labels) != cursor.frame_count:
+            # A source can only trim its contiguous tail for a bounded public
+            # run; arbitrary label selection would need an explicit range map.
+            if labels != list(range(len(labels))):
+                raise ValueError(
+                    "NexusStackSource cursor consumption requires contiguous "
+                    "0-based frame labels")
+        desc = cursor.descriptor
+        read_plan = plan_reads(
+            desc.frame_count,
+            desc.frame_shape,
+            desc.dtype,
+            desc.chunks,
+            source_block_budget_bytes(),
+            frame_interval=(0, len(labels)),
+            requested_block_frames=chunk_size,
+            two_d=desc.is_2d,
+        )
+        for block in cursor.iter_blocks(read_plan):
+            yield np.asarray(block.array), labels[block.start:block.stop]
 
     def frame_for(self, index: int) -> ScanFrame:
         return ScanFrame(
@@ -91,10 +149,16 @@ class NexusStackSource(BaseFrameSource):
             return cache
         provider: MetadataProvider | None = None
         try:
-            with self.open_cursor() as cursor:
+            cursor = self._consumption_cursor
+            if cursor is not None:
                 p = cursor.metadata_provider()
-                p.scan_table()  # force materialization while the handle is open
+                p.scan_table()  # materialize before this cursor is consumed
                 provider = p
+            else:
+                with self.open_cursor() as cursor:
+                    p = cursor.metadata_provider()
+                    p.scan_table()  # force materialization while the handle is open
+                    provider = p
         except Exception:
             provider = None
         self._provider_cache = provider

@@ -192,6 +192,115 @@ def test_multi_segment_eiger_concatenates_frames(tmp_path):
         "/entry/data/data_000001", "/entry/data/data_000002")
 
 
+def _missing_link_master(path, target_name="late_data_000001.h5"):
+    """An Eiger master published before its external data file arrives."""
+    with h5py.File(path, "w") as h5:
+        entry = h5.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        data = entry.create_group("data")
+        data.attrs["NX_class"] = "NXdata"
+        data["data_000001"] = h5py.ExternalLink(target_name, "/entry/data/data")
+    return path
+
+
+def _late_eiger_data(path):
+    with h5py.File(path, "w") as h5:
+        data = h5.create_group("entry/data")
+        data.create_dataset("data", data=np.ones((3, 8, 8), np.uint16),
+                            chunks=(1, 8, 8))
+
+
+def _missing_detector_link_master(path, target_name="late_detector.h5"):
+    with h5py.File(path, "w") as h5:
+        entry = h5.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        detector = entry.create_group("instrument/detector")
+        detector["data"] = h5py.ExternalLink(target_name, "/data")
+    return path
+
+
+def _late_detector_data(path):
+    with h5py.File(path, "w") as h5:
+        h5.create_dataset("data", data=np.ones((2, 8, 8), np.uint16),
+                          chunks=(1, 8, 8))
+
+
+def test_missing_eiger_external_link_is_provisional_then_ready(tmp_path):
+    """A normal data-file arrival race is retryable, not a descriptor crash."""
+    from xrd_tools.sources.cursor import ContainerCursor, ContainerNotReadyError
+
+    master = _missing_link_master(tmp_path / "late_master.h5")
+    provisional = describe_container(master)
+    assert provisional.state is ProbeState.IN_PROGRESS
+    assert provisional.kind is SourceKind.EIGER_MASTER
+    assert provisional.finalized is False
+    assert "retry later" in provisional.reason
+
+    cursor = ContainerCursor(master)
+    with pytest.raises(ContainerNotReadyError, match="not ready"):
+        cursor.open()
+    assert cursor.closed is True
+
+    _late_eiger_data(tmp_path / "late_data_000001.h5")
+    ready = describe_container(master)
+    assert ready.state is ProbeState.READY
+    assert ready.frame_count == 3
+    with ContainerCursor(master) as cursor:
+        np.testing.assert_array_equal(cursor.read_frame(0), np.ones((8, 8), np.uint16))
+
+
+def test_missing_detector_group_external_link_is_provisional_then_ready(tmp_path):
+    """The same descriptor boundary covers canonical detector-group links."""
+    from xrd_tools.sources.cursor import ContainerCursor, ContainerNotReadyError
+
+    master = _missing_detector_link_master(tmp_path / "detector_master.h5")
+    assert describe_container(master).state is ProbeState.IN_PROGRESS
+    with pytest.raises(ContainerNotReadyError):
+        ContainerCursor(master).open()
+
+    _late_detector_data(tmp_path / "late_detector.h5")
+    assert describe_container(master).state is ProbeState.READY
+    with ContainerCursor(master) as cursor:
+        assert cursor.frame_count == 2
+
+
+def test_missing_link_candidate_stamp_change_stays_fail_closed(tmp_path):
+    """The descriptor correction does not weaken R1 candidate identity checks."""
+    from xrd_tools.sources.cursor import ContainerCursor
+    from xrd_tools.sources.directory_index import StaleCandidateError
+    from xrd_tools.sources.discover import Candidate
+
+    master = _missing_link_master(tmp_path / "stamp_master.h5")
+    stat = master.stat()
+    candidate = Candidate(master, "nexus_hdf5", stat.st_size, stat.st_mtime_ns)
+    master.touch()
+    with pytest.raises(StaleCandidateError):
+        ContainerCursor(master, candidate=candidate).open()
+
+
+def test_directory_index_promotes_late_external_link_on_reprobe(tmp_path):
+    """The R1 provisional window accepts the same master's READY re-probe."""
+    from xrd_tools.sources.directory_index import DirectoryIndex
+    from xrd_tools.sources.probe import ProbeResult
+
+    master = _missing_link_master(tmp_path / "index_master.h5")
+    index = DirectoryIndex(tmp_path, retry_deadline=30.0)
+    candidate = next(c for c in index.poll().candidates if c.path == master)
+
+    first = describe_container(master, candidate=candidate)
+    held = index.record_probe(
+        candidate, ProbeResult(first.state, reason=first.reason, kind=first.kind))
+    assert held.state is ProbeState.IN_PROGRESS
+    assert index.retry_state(master) is not None
+
+    _late_eiger_data(tmp_path / "late_data_000001.h5")
+    second = describe_container(master, candidate=candidate)
+    settled = index.record_probe(
+        candidate, ProbeResult(second.state, reason=second.reason, kind=second.kind))
+    assert settled.state is ProbeState.READY
+    assert index.retry_state(master) is None
+
+
 # --------------------------------------------------------------------------- #
 # Bluesky finalized / unfinalized
 # --------------------------------------------------------------------------- #

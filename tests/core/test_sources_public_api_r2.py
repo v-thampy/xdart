@@ -9,6 +9,7 @@ import xrd_tools.sources as sources
 
 _R2_NAMES = (
     "ContainerDescriptor",
+    "ContainerNotReadyError",
     "describe_container",
     "describe_container_from_open",
     "ReadPlan",
@@ -31,6 +32,12 @@ def test_container_descriptor_same_class_via_package_and_submodule():
     from xrd_tools.sources.descriptor import ContainerDescriptor as _Direct
 
     assert sources.ContainerDescriptor is _Direct
+
+
+def test_container_not_ready_error_is_public():
+    from xrd_tools.sources.cursor import ContainerNotReadyError as _Direct
+
+    assert sources.ContainerNotReadyError is _Direct
 
 
 def test_plan_reads_same_function_via_package_and_submodule():

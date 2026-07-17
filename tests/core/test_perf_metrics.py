@@ -509,7 +509,11 @@ def test_later_failure_preserves_observed_writes(tmp_path, monkeypatch):
     _write_raw_container(src / "scan_00001.nxs", nframes=3)
     poni = _write_poni(tmp_path / "cal.poni")
 
-    def fake_run(plan, scan, sink=None, **k):
+    def fake_run(plan, source, sink=None, **k):
+        # The benchmark must exercise the public FrameSource route, never an
+        # eager Scan carrying decoded detector images.
+        assert not hasattr(source, "frames")
+        scan = source.to_scan()
         sink.begin(scan, plan)
         frame = scan.frames[0]
         r = FrameReduction(
@@ -604,9 +608,9 @@ def test_observation_keys_match_schema_v2_fields():
 
 # --- R2: benchmark wired to the ContainerCursor (fail-before/pass-after) ------
 
-def test_schema_bumped_to_v3_for_r2_observations():
-    # v3 adds the additive source-cursor observations (no v2 meaning changed).
-    assert SCHEMA_VERSION == 3
+def test_schema_bumped_to_v4_for_streamed_r2_benchmark():
+    # v4 retires v3's eager-frame timing/RSS behavior for the public source route.
+    assert SCHEMA_VERSION == 4
     from xrd_tools.perf.metrics import OBSERVATION_SOURCES
     for key in ("cursor_opens", "block_reads", "source_logical_bytes",
                 "retained_owner_bytes_peak", "metadata_reads"):
@@ -628,10 +632,12 @@ def test_run_metrics_folds_r2_cursor_observations():
     assert rm.retained_owner_bytes_peak == 80  # a MAX (peak owner block), not a sum
 
 
-def test_cursor_wired_bench_collapses_source_opens(tmp_path):
-    """The R2 headline: one explicit probe open + one consumption cursor open =
-    2/container, down from the M0 7/container, with the R2 observations and the
-    ReadPlan decision recorded and durable frames preserved."""
+def test_cursor_wired_bench_streams_public_source_route(tmp_path):
+    """The R2 benchmark records source observations from the real public route.
+
+    The source does bounded metadata materialization and one sustained cursor
+    consumption instead of accumulating detector arrays in an eager Scan.
+    """
     from xrd_tools.integrate.calibration import load_poni
     from xrd_tools.sources.read_plan import plan_reads
     from xrd_tools.core.staging import source_block_budget_bytes
@@ -649,11 +655,14 @@ def test_cursor_wired_bench_collapses_source_opens(tmp_path):
                             1, "entry", None, src, [str(master)], False)
 
     assert cm.state == "ready"
-    # exactly one explicit probe open + one consumption cursor open
+    assert all(value is not None for value in (
+        cm.probe_s, cm.open_s, cm.metadata_s, cm.reduce_s, cm.finish_s))
+    # One descriptor probe plus one owner-thread cursor that supplies source
+    # metadata and the public streamed consumption, independent of frame count.
     assert cm.open_counts["source"] == 2
     assert cm.cursor_opens == 1
     assert cm.block_reads is not None and cm.block_reads >= 1
-    assert cm.metadata_reads == 4            # one provider read per frame
+    assert cm.metadata_reads == 5            # preflight + one read per frame
     assert cm.frames_input == 4
     assert cm.frames_durable == 4            # reduced + written + on disk
     assert cm.read_plan_block_frames is not None and cm.read_plan_block_frames >= 1

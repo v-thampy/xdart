@@ -34,8 +34,10 @@ from typing import Any, Generator, Mapping
 #: (renamed/redefined lifecycle counts + categorized opens + first-write latency).
 #: v3 = additive R2 source-cursor observations (cursor opens, block reads, native
 #: logical bytes, retained owner-block peak bytes, metadata reads, read-plan
-#: decisions) — no existing v2 field's meaning changed.
-SCHEMA_VERSION = 3
+#: decisions).  v4 retires the v3 benchmark's eager ``ScanFrame.image`` list:
+#: reduction timing now includes production ``FrameSource`` streaming and its
+#: bounded source-owner blocks.  v3 timing/RSS comparisons are not comparable.
+SCHEMA_VERSION = 4
 
 #: Human-readable provenance of every observed field, surfaced in JSON so a
 #: reader never mistakes an unobserved/None field for zero.
@@ -57,6 +59,16 @@ OBSERVATION_SOURCES: dict[str, str] = {
     "first_frame_latency_s": "run clock started BEFORE enumeration -> timestamp "
                              "of the first real sink.write() across the run "
                              "(skipped candidates before it are included)",
+    "probe_s": "ContainerDescriptor readiness/layout probe over a short-lived "
+               "HDF5 handle; no detector pixels are decoded",
+    "dataset_resolve_s": "UNOBSERVED in v4: descriptor resolution is included "
+                         "in probe_s rather than timed as a second open",
+    "open_s": "FrameSource construction only; it observes layout facts and "
+              "never decodes detector pixels",
+    "metadata_s": "FrameSource metadata provider materialization before public "
+                  "run_reduction; detector pixels are not decoded in this span",
+    "reduce_s": "wall time of public run_reduction, including streamed source "
+                "owner-block reads, submit/integration, write, and finish",
     "open_counts": "Python-level h5py.File construction attempts, categorized by "
                    "resolved path, plus failed constructions; a WRAPPER-VISIBLE "
                    "PROXY — low-level libhdf5 external-link/data-file opens may "
@@ -74,9 +86,8 @@ OBSERVATION_SOURCES: dict[str, str] = {
                          "pipeline these are predominantly libhdf5 external-link "
                          "data-file resolutions of the source surfaced as Python "
                          "File objects; counted but not path-attributable",
-    "cursor_opens": "R2: ContainerCursor opens of the master (one open supplies "
-                    "descriptor + metadata + count + all reads) observed for "
-                    "this container",
+    "cursor_opens": "R2/v4: sustained ContainerCursor consumption passes from "
+                    "the public FrameSource.iter_chunks route",
     "block_reads": "R2: number of native-dtype owner-block reads issued through "
                    "the cursor per the ReadPlan ranges",
     "source_logical_bytes": "R2: total NATIVE bytes read from the source "
@@ -84,8 +95,9 @@ OBSERVATION_SOURCES: dict[str, str] = {
     "retained_owner_bytes_peak": "R2: peak bytes retained by a SINGLE owner block "
                                  "(<= ReadPlan.max_owner_bytes; charged once per "
                                  "block, never per frame view)",
-    "metadata_reads": "R2: number of provider.metadata_for() reads served from "
-                      "the one open cursor handle (no per-read master reopen)",
+    "metadata_reads": "R2/v4: number of FrameSource metadata_for() calls while "
+                      "run_reduction materializes its canonical frame records; "
+                      "the source provider is cached after materialization",
 }
 
 #: Categories of :attr:`ContainerMetrics.open_counts` / run aggregate.

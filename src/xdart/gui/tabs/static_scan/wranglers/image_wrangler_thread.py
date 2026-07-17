@@ -679,6 +679,7 @@ class imageThread(wranglerThread):
         # raw persistent h5py.File/dataset for NeXus/Bluesky reads.  fabio stays
         # PRIMARY for real external-link Eiger masters.
         self._eiger_cursor = None        # xrd_tools ContainerCursor (h5py path)
+        self._eiger_descriptor = None    # descriptor paired with the cursor
         self._eiger_read_plan = None     # layout-aware, byte-bounded block plan
         self._eiger_provider = None      # materialized per-frame metadata provider
         self._eiger_fabio_handle = None  # persistent fabio.EigerImage (primary Eiger)
@@ -3148,27 +3149,41 @@ class imageThread(wranglerThread):
             self._eiger_close_master()
             self._eiger_nframes = 0
 
-    def _eiger_bind_cursor(self, cursor):
-        """Adopt an OPEN ``ContainerCursor`` as the active h5py-backed read
-        backend: record the frame count, compute the layout-aware byte-bounded
-        ``ReadPlan``, and MATERIALIZE the metadata provider while the handle is
-        open (this = the prefetch owner thread), so later per-frame reads reopen
-        no master."""
+    def _eiger_cursor_binding(self, cursor):
+        """Build, but do not install, a coherent open-cursor binding.
+
+        Refresh prepares this complete tuple before replacing anything, so a
+        transient read/open failure keeps the old cursor and its matching
+        descriptor, read plan, and metadata provider available for retry.
+        """
         from xrd_tools.core.staging import source_block_budget_bytes
         from xrd_tools.sources.read_plan import plan_reads
 
         desc = cursor.descriptor
-        self._eiger_cursor = cursor
-        self._eiger_nframes = cursor.frame_count
-        self._eiger_read_plan = plan_reads(
+        read_plan = plan_reads(
             desc.frame_count, desc.frame_shape, desc.dtype, desc.chunks,
             source_block_budget_bytes(), two_d=desc.is_2d)
-        self._eiger_provider = cursor.metadata_provider()
+        provider = cursor.metadata_provider()
         try:
-            self._eiger_provider.scan_table()
+            provider.scan_table()
         except Exception:
             logger.debug('provider materialize skipped for %s',
                          getattr(desc, 'path', None), exc_info=True)
+        return desc, int(cursor.frame_count), read_plan, provider
+
+    def _eiger_install_cursor_binding(self, cursor, binding):
+        """Publish one fully prepared cursor binding on the owner thread."""
+        desc, nframes, read_plan, provider = binding
+        self._eiger_cursor = cursor
+        self._eiger_descriptor = desc
+        self._eiger_nframes = nframes
+        self._eiger_read_plan = read_plan
+        self._eiger_provider = provider
+
+    def _eiger_bind_cursor(self, cursor):
+        """Adopt an OPEN cursor after its plan and provider are ready."""
+        self._eiger_install_cursor_binding(
+            cursor, self._eiger_cursor_binding(cursor))
 
     def _eiger_reopen_cursor(self):
         """Close and reopen the h5py-backed cursor to pick up frames written
@@ -3179,19 +3194,30 @@ class imageThread(wranglerThread):
         from xrd_tools.sources.cursor import ContainerCursor
 
         path = self._eiger_master_path
-        if self._eiger_cursor is not None:
-            try:
-                self._eiger_cursor.close()
-            except Exception:
-                pass
-            self._eiger_cursor = None
         if path is None:
-            return
-        cursor = ContainerCursor(path, entry='entry').open()
-        if cursor.descriptor.dataset_path is None:
-            cursor.close()
-            return
-        self._eiger_bind_cursor(cursor)
+            return False
+        old_cursor = self._eiger_cursor
+        replacement = None
+        try:
+            replacement = ContainerCursor(path, entry='entry').open()
+            if replacement.descriptor.dataset_path is None:
+                replacement.close()
+                return False
+            binding = self._eiger_cursor_binding(replacement)
+        except Exception:
+            if replacement is not None:
+                replacement.close()
+            raise
+
+        # Swap the coherent binding first.  Only the successful replacement can
+        # release the old source owner; this keeps transient failures retryable.
+        self._eiger_install_cursor_binding(replacement, binding)
+        if old_cursor is not None and old_cursor is not replacement:
+            try:
+                old_cursor.close()
+            except Exception:
+                logger.debug('Failed to close replaced Eiger cursor', exc_info=True)
+        return True
 
     @staticmethod
     def _h5_stack_nframes(dset):
@@ -3215,6 +3241,7 @@ class imageThread(wranglerThread):
         is a no-op when the worker already closed on switch."""
         self._eiger_read_plan = None
         self._eiger_provider = None
+        self._eiger_descriptor = None
         if self._eiger_fabio_handle is not None:
             try:
                 self._eiger_fabio_handle.close()
@@ -3358,7 +3385,18 @@ class imageThread(wranglerThread):
                 and os.path.abspath(str(master_path))
                 == os.path.abspath(str(current))):
             try:
-                return dict(provider.metadata_for(frame_idx))
+                row = dict(provider.metadata_for(frame_idx))
+                # ``metadata_for`` deliberately omits scanned motor columns.
+                # A wrangler frame row is the complete per-frame record, so
+                # append indexed motors after constants; scanned values win.
+                for name, values in provider.motors().items():
+                    try:
+                        value = values[int(frame_idx)]
+                    except (IndexError, KeyError, TypeError):
+                        continue
+                    row[str(name)] = (
+                        value.item() if isinstance(value, np.generic) else value)
+                return row
             except Exception:
                 logger.debug('cursor provider metadata_for failed for %s',
                              master_path, exc_info=True)

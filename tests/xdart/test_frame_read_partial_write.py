@@ -168,6 +168,10 @@ def _eiger_stub(master_path, *, batch_mode, deadline=30.0, command="live"):
         FRAME_READ_DEADLINE=deadline,
     )
     stub._eiger_nframes = stub._eiger_cursor.frame_count
+    stub._eiger_cursor_binding = (
+        _imageThread()._eiger_cursor_binding.__get__(stub))
+    stub._eiger_install_cursor_binding = (
+        _imageThread()._eiger_install_cursor_binding.__get__(stub))
     stub._eiger_bind_cursor = _imageThread()._eiger_bind_cursor.__get__(stub)
     stub._eiger_reopen_cursor = _imageThread()._eiger_reopen_cursor.__get__(stub)
     stub._eiger_refresh_master_handle = (

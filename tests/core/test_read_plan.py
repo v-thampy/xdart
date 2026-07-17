@@ -113,6 +113,17 @@ def test_one_frame_over_budget_reads_exactly_one():
     assert plan.max_owner_bytes == 40000
 
 
+def test_oversize_single_frame_native_chunk_remains_chunk_aligned():
+    """Oversize is a byte-budget fact, not a loss of one-frame cadence."""
+    plan = plan_reads(
+        frame_count=3, frame_shape=(100, 100), dtype=np.uint32,
+        chunks=(1, 100, 100), max_block_bytes=10_000)
+    assert plan.oversize_frame is True
+    assert plan.block_frames == 1
+    assert plan.chunk_aligned is True
+    assert plan.fallback_reason == ""
+
+
 def test_two_d_always_one_frame():
     plan = plan_reads(
         frame_count=1, frame_shape=(64, 64), dtype=np.uint16,

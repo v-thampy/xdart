@@ -332,14 +332,42 @@ def describe_container_from_open(
             reason="processed xdart record (integrated_1d/2d or schema stamp)",
             **common)
 
+    kind = SourceKind.EIGER_MASTER if _is_eiger_master(path) else SourceKind.NEXUS_STACK
+
     try:
         paths, _ = resolve_stack_paths(h5f, entry_name)
     except ProcessedXdartInputError:
         return ContainerDescriptor(
             state=ProbeState.PROCESSED_OUTPUT, kind=SourceKind.PROCESSED_NEXUS,
             reason="processed xdart record", **common)
+    except (KeyError, OSError) as exc:
+        return ContainerDescriptor(
+            state=ProbeState.IN_PROGRESS,
+            kind=kind,
+            reason=("detector dataset link target is not yet available; "
+                    f"retry later: {exc}"),
+            **(common | {"finalized": False}),
+        )
 
-    kind = SourceKind.EIGER_MASTER if _is_eiger_master(path) else SourceKind.NEXUS_STACK
+    # Eiger masters are commonly visible before their externally linked data
+    # files land.  Resolving such a link raises KeyError from h5py even though
+    # the master itself is valid and should remain eligible for a later retry.
+    # Keep that normal acquisition state distinct from an imageless, finalized
+    # container.  This is deliberately at the descriptor boundary; the older
+    # low-level finder keeps its existing behavior.
+    try:
+        if not paths:
+            facts = None
+        else:
+            facts = _stack_facts(h5f, paths)
+    except (KeyError, OSError) as exc:
+        return ContainerDescriptor(
+            state=ProbeState.IN_PROGRESS,
+            kind=kind,
+            reason=("detector dataset link target is not yet available; "
+                    f"retry later: {exc}"),
+            **(common | {"finalized": False}),
+        )
 
     if not paths:
         if is_bluesky and not has_end:
@@ -349,7 +377,7 @@ def describe_container_from_open(
             state, reason = ProbeState.IMAGELESS, "no 2-D+ detector dataset found"
         return ContainerDescriptor(state=state, kind=kind, reason=reason, **common)
 
-    facts = _stack_facts(h5f, paths)
+    assert facts is not None
     wavelength: float | None = None
     if entry_grp is not None:
         try:
