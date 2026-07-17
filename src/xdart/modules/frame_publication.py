@@ -400,18 +400,30 @@ def publication_raw_recoverable(publication: FramePublication) -> bool:
     """True when the FULL raw is absent but lazily recoverable from source.
 
     PF-1e: an old Append row may carry only a valid ``source`` reference — no
-    stored thumbnail (``raw_status`` ``"missing"``/``"unknown"``) and no live
-    ``raw_ref``.  Its raw detector image is still recoverable on demand
-    through the registered hydrator's lazy source fallback (the same
-    ``load_processed_raw_or_thumbnail`` route the headless readers use), so a
-    full-purpose hydration must be ELIGIBLE for it.  Thumbnail backfill stays
-    optional; this is what keeps the raw panel non-blank for source-only rows.
+    stored thumbnail (``raw_status`` ``"missing"``/``"unknown"``).  A live
+    publication can also retain its lightweight ``LiveFrame`` as ``raw_ref``
+    after ``free_raw`` has released ``raw_ref.map_raw``.  The reference object
+    is not itself a resident raw payload; both states remain recoverable on
+    demand through the registered hydrator's lazy source fallback (the same
+    ``load_processed_raw_or_thumbnail`` route the headless readers use).
+    Thumbnail backfill stays optional.
     """
     view = publication.view
+    raw_ref = publication.raw_ref
+    raw_ref_value = (
+        getattr(raw_ref, "map_raw", None) if raw_ref is not None else None
+    )
+    raw_ref_source = (
+        getattr(raw_ref, "source_file", None) if raw_ref is not None else None
+    )
+    source_path = (
+        getattr(view, "source_path", None)
+        or raw_ref_source
+    )
     return (
         view.raw is None
-        and publication.raw_ref is None
-        and bool(getattr(view, "source_path", None))
+        and raw_ref_value is None
+        and bool(source_path)
     )
 
 

@@ -103,6 +103,53 @@ def test_source_only_row_hydrates_raw_through_worker_route(tmp_path):
     assert _scored_full_resident(got_new.view)
 
 
+def test_live_publication_with_retained_empty_raw_ref_hydrates_source(tmp_path):
+    """Live Append keeps a lightweight ``raw_ref`` after ``map_raw`` is
+    released.  The reference object is not itself a resident raw payload: a
+    source-backed publication in this state must still enter the hydrator.
+
+    This is the production shape that the first PF-1e correction missed.  Its
+    browser-seeded test used ``raw_ref=None``, while the real live publication
+    had ``raw_ref is not None`` and ``raw_ref.map_raw is None``.
+    """
+    from xdart.gui.tabs.static_scan.display_data import DisplayDataMixin
+    from xdart.modules.ewald import LiveScan
+    from xdart.modules.frame_publication import (
+        PublicationStore,
+        publication_from_live_frame,
+    )
+
+    nxs = _completed_target(tmp_path)
+    scan = LiveScan(data_file=nxs)
+    scan.load_from_h5()
+    light_frame = scan.frames[3]
+    assert light_frame.map_raw is None
+    assert light_frame.source_file
+
+    publication = publication_from_live_frame(light_frame)
+    assert publication.raw_ref is light_frame
+    assert publication.raw_ref.map_raw is None
+    assert publication.view.raw is None
+
+    class _Host(DisplayDataMixin):
+        def __init__(self, scan, store):
+            self.scan = scan
+            self.publication_store = store
+            self._processing_active = False
+
+    store = PublicationStore()
+    host = _Host(scan, store)
+    store.set_hydrator(host._rehydrate_publication)
+    store.upsert(publication)
+
+    hydrated = store.get_or_hydrate(3)
+    assert hydrated is not None
+    assert hydrated.view.raw is not None, (
+        "a retained lightweight raw_ref must not suppress lazy source hydration"
+    )
+    assert _scored_full_resident(hydrated.view)
+
+
 def test_fix_gates_on_source_recoverability(tmp_path, monkeypatch):
     """Fail-before pin: with the PF-1e eligibility removed (the 121bc438
     predicate), the worker route returns the light item un-hydrated and the
