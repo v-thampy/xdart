@@ -67,10 +67,18 @@ def _bare_worker(tmp_path):
     worker._discovered_frame_count = 0
     worker._skip_reason_counts = Counter()
     worker._append_skip_snapshot_warnings = set()
+    worker.scan = SimpleNamespace(
+        skip_2d=True,
+        gi=False,
+        bai_1d_args={"unit": "q_A^-1"},
+        bai_2d_args={},
+        gi_config={},
+    )
     return worker
 
 
-def _write_minimal_integrated_nxs(path, labels, *, reduction_config=None):
+def _write_minimal_integrated_nxs(
+        path, labels, *, labels_2d=None, reduction_config=None):
     import h5py
     from xrd_tools.core.provenance import write_provenance
 
@@ -92,6 +100,10 @@ def _write_minimal_integrated_nxs(path, labels, *, reduction_config=None):
                 labels.size, q.size
             ),
         )
+        if labels_2d is not None:
+            g2 = entry.create_group("integrated_2d")
+            g2.create_dataset(
+                "frame_index", data=np.asarray(labels_2d, dtype=np.int64))
         if reduction_config is not None:
             write_provenance(h5, config=reduction_config, host="")
 
@@ -319,6 +331,76 @@ def test_append_skip_snapshot_lazily_reads_only_current_frame_index(
     assert worker._append_skip_frames_by_scan == {"scan": {1, 2}}
 
 
+def test_int_2d_append_does_not_skip_frame_with_only_1d_output(tmp_path):
+    worker = _bare_worker(tmp_path)
+    worker.scan.skip_2d = False
+    out = tmp_path / "out"
+    out.mkdir()
+    _write_minimal_integrated_nxs(out / "scan.nxs", [0])
+
+    assert worker._should_skip_before_read("scan", 0) is False
+    assert worker._append_skip_frames_by_scan == {"scan": set()}
+
+
+def test_int_2d_append_completion_is_1d_2d_intersection(tmp_path):
+    worker = _bare_worker(tmp_path)
+    worker.scan.skip_2d = False
+    out = tmp_path / "out"
+    out.mkdir()
+    _write_minimal_integrated_nxs(
+        out / "scan.nxs", [1, 2], labels_2d=[2, 3])
+
+    assert worker._should_skip_before_read("scan", 1) is False
+    assert worker._should_skip_before_read("scan", 2) is True
+    assert worker._should_skip_before_read("scan", 3) is False
+    assert worker._append_skip_frames_by_scan == {"scan": {2}}
+
+
+def test_int_1d_append_completion_requires_only_1d_output(tmp_path):
+    worker = _bare_worker(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    _write_minimal_integrated_nxs(out / "scan.nxs", [0])
+
+    assert worker._should_skip_before_read("scan", 0) is True
+
+
+def test_append_dispatch_guard_uses_mode_aware_cursor_not_union_index(tmp_path):
+    worker = _bare_worker(tmp_path)
+    worker.scan.skip_2d = False
+    worker._append_skip_frames_by_scan = {"scan": set()}
+    loaded_scan = SimpleNamespace(frames=SimpleNamespace(index=[0]))
+
+    assert worker._append_frame_complete("scan", 0, loaded_scan) is False
+
+
+def test_append_cursor_rejects_reached_target_config_before_skip(tmp_path):
+    from xrd_tools.session.readiness import AppendConfigMismatchError
+
+    worker = _bare_worker(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    _write_minimal_integrated_nxs(
+        out / "scan.nxs",
+        [0],
+        reduction_config={
+            "gi": False,
+            "bai_1d_args": {"unit": "q_A^-1", "numpoints": 1000},
+            "bai_2d_args": {"unit": "q_A^-1"},
+        },
+    )
+    worker.scan.bai_1d_args = {"unit": "q_A^-1", "numpoints": 500}
+
+    with pytest.raises(AppendConfigMismatchError) as excinfo:
+        worker._should_skip_before_read("scan", 0)
+
+    message = str(excinfo.value)
+    assert "Changed settings:\n- 1D points: existing 1000; current 500" in message
+    assert "\n\nThe append target scan.nxs was preserved.\n\n" in message
+    assert "Switch output mode to Replace" in message
+    assert worker._append_skip_frames_by_scan == {}
+
+
 def test_append_skip_snapshot_opens_each_reached_output_once(monkeypatch, tmp_path):
     worker = _bare_worker(tmp_path)
     worker.fname = str(tmp_path / "out" / "current.nxs")
@@ -329,11 +411,11 @@ def test_append_skip_snapshot_opens_each_reached_output_once(monkeypatch, tmp_pa
 
     calls = []
 
-    def frame_labels(path):
+    def append_cursor(path, *, require_2d):
         calls.append(Path(path).name)
-        return {1}
+        return {1}, {}
 
-    monkeypatch.setattr(iwt, "_nexus_integrated_frame_labels", frame_labels)
+    monkeypatch.setattr(iwt, "_nexus_append_cursor", append_cursor)
 
     assert worker._should_skip_before_read("scan_2", 1) is True
     assert worker._should_skip_before_read("scan_2", 1) is True
@@ -348,8 +430,9 @@ def test_append_skip_snapshot_stop_does_not_open_output(monkeypatch, tmp_path):
 
     monkeypatch.setattr(
         iwt,
-        "_nexus_integrated_frame_labels",
-        lambda _path: pytest.fail("Stop must not start an append cursor read"),
+        "_nexus_append_cursor",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Stop must not start an append cursor read"),
     )
 
     assert worker._should_skip_before_read("scan", 1) is False
@@ -365,13 +448,13 @@ def test_stop_during_append_cursor_read_prevents_next_output_open(
         (out / f"{name}.nxs").touch()
     calls = []
 
-    def first_cursor_then_stop(path):
+    def first_cursor_then_stop(path, *, require_2d):
         calls.append(Path(path).name)
         worker.command = "stop"
-        return {1}
+        return {1}, {}
 
     monkeypatch.setattr(
-        iwt, "_nexus_integrated_frame_labels", first_cursor_then_stop)
+        iwt, "_nexus_append_cursor", first_cursor_then_stop)
 
     assert worker._should_skip_before_read("scan_1", 1) is True
     assert worker._should_skip_before_read("scan_2", 1) is False
@@ -408,11 +491,11 @@ def test_append_skip_snapshot_primes_once_read_only(monkeypatch, tmp_path):
     _write_minimal_integrated_nxs(output, [1, 2])
     calls = []
 
-    def frame_labels(path):
+    def append_cursor(path, *, require_2d):
         calls.append(str(path))
-        return {1, 2}
+        return {1, 2}, {}
 
-    monkeypatch.setattr(iwt, "_nexus_integrated_frame_labels", frame_labels)
+    monkeypatch.setattr(iwt, "_nexus_append_cursor", append_cursor)
 
     worker._prime_append_skip_snapshots_for_run()
     worker._prime_append_skip_snapshots_for_run()
@@ -463,7 +546,7 @@ def test_append_fresh_scan_primes_empty_and_reads_all(monkeypatch, tmp_path):
         read_calls.append(os.fspath(path))
         return np.ones((2, 2), dtype=float)
 
-    monkeypatch.setattr(iwt, "_nexus_integrated_frame_labels", fail_snapshot)
+    monkeypatch.setattr(iwt, "_nexus_append_cursor", fail_snapshot)
     monkeypatch.setattr(iwt, "read_image", fake_read)
 
     worker._prime_append_skip_snapshots_for_run()
@@ -489,8 +572,9 @@ def test_append_snapshot_failure_warns_once_and_skips_nothing(
 
     monkeypatch.setattr(
         iwt,
-        "_nexus_integrated_frame_labels",
-        lambda _path: (_ for _ in ()).throw(OSError("held read handle")),
+        "_nexus_append_cursor",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("held read handle")),
     )
 
     with caplog.at_level(logging.WARNING):

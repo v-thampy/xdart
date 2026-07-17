@@ -2057,6 +2057,39 @@ def test_overlay_grid_mismatch_manual_choice_is_forwarded_transactionally():
     assert host.h5viewer._browser_previous_context is None
 
 
+def test_overlay_grid_mismatch_paused_run_uses_manual_dialog():
+    current = {
+        "reset_key": ("q", 3, False), "axis_kind": "q",
+        "unit": "q_A^-1", "values": np.asarray([1.0, 2.0, 3.0]),
+    }
+    selected = {
+        "reset_key": ("q", 3, False), "axis_kind": "q",
+        "unit": "q_A^-1", "values": np.asarray([1.0, 2.0, 4.0]),
+    }
+    prompts = []
+    host = SimpleNamespace(
+        _run_active=True,
+        h5viewer=SimpleNamespace(
+            _run_writing=False,
+            _browser_previous_context={"file": "paused-run-scan"},
+        ),
+        displayframe=SimpleNamespace(_processing_active=False),
+        _ask_overlay_grid_mismatch=lambda old, new: (
+            prompts.append((old, new)), "cancel")[-1],
+    )
+
+    assert staticWidget._resolve_overlay_grid_mismatch(
+        host, current, selected) == "cancel"
+    assert prompts == [(current, selected)]
+    assert host.h5viewer._browser_previous_context == {
+        "file": "paused-run-scan"}
+
+    host._ask_overlay_grid_mismatch = lambda *_args: "reset"
+    assert staticWidget._resolve_overlay_grid_mismatch(
+        host, current, selected) == "reset"
+    assert host.h5viewer._browser_previous_context is None
+
+
 def test_update_overlay_cancel_restores_selection_before_any_panel_draw(
         monkeypatch):
     import xdart.gui.tabs.static_scan.display_frame_widget as dfw
@@ -8838,18 +8871,24 @@ def _append_cold_target_host(tmp_path, *, raw_name="scan_0001.tif",
 
 
 def _expected_append_mismatch_modal_text(processed_sig, current_sig, mismatched=()):
-    # Reconstruct via the real formatter so the assertion tracks the config
-    # summary; validates the modal TEMPLATE (Processed/Current alignment + the
-    # optional Different: line).
+    # Reconstruct via the real value formatter while independently validating
+    # the modal's paragraphs and action wording.
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
-    diff = ", ".join(str(f) for f in (mismatched or ()))
-    diff_line = f"Different: {diff}\n\n" if diff else ""
+    from xrd_tools.session.readiness import append_config_difference_lines
+    details = append_config_difference_lines(
+        processed_sig, current_sig, mismatched)
+    detail_text = "\n".join(f"- {line}" for line in details)
+    if not detail_text:
+        detail_text = "- Stored and current integration settings differ."
     return (
-        "Scan already integrated with different integration settings.\n\n"
-        f"Processed: {imageWrangler._format_append_config(processed_sig)}\n"
-        f"Current:   {imageWrangler._format_append_config(current_sig)}\n\n"
-        f"{diff_line}"
-        "Overwrite processed data with new settings?"
+        "The existing processed scan was created with integration settings "
+        "that do not match the current run.\n\n"
+        f"Changed settings:\n{detail_text}\n\n"
+        f"Existing scan: {imageWrangler._format_append_config(processed_sig)}\n"
+        f"Current run: {imageWrangler._format_append_config(current_sig)}\n\n"
+        "Append cannot combine data produced with different settings.\n\n"
+        "Choose Replace to overwrite the existing processed data using the "
+        "current settings, or Cancel to leave it unchanged."
     )
 
 
@@ -8906,7 +8945,7 @@ def test_append_mismatch_modal_names_the_differences(tmp_path):
     imageWrangler._on_start_clicked(host)
 
     assert captured["fields"]                       # configs genuinely differ
-    assert "Different: " in captured["text"]
+    assert "Changed settings:\n" in captured["text"]
     for label in captured["fields"]:                # each named in the modal
         assert label in captured["text"]
 
@@ -9032,7 +9071,7 @@ def test_append_config_mismatch_modal_symmetric_gi_to_standard(tmp_path):
     assert host.sigStart.emitted == []
 
 
-def test_append_config_mismatch_modal_uses_yes_no_with_no_default(
+def test_append_config_mismatch_modal_uses_replace_cancel_with_cancel_default(
         monkeypatch, tmp_path):
     from xdart.gui.tabs.static_scan.wranglers import image_wrangler as iw_mod
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
@@ -9066,7 +9105,7 @@ def test_append_config_mismatch_modal_uses_yes_no_with_no_default(
         def addButton(self, text, role):
             button = SimpleNamespace(text=text, role=role)
             self.buttons.append(button)
-            if text == "No":
+            if text == "Cancel":
                 self.clicked_button = button
             return button
 
@@ -9090,11 +9129,11 @@ def test_append_config_mismatch_modal_uses_yes_no_with_no_default(
     assert len(boxes) == 1
     box = boxes[0]
     assert [(button.text, button.role) for button in box.buttons] == [
-        ("Yes", _FakeMessageBox.DestructiveRole),
-        ("No", _FakeMessageBox.RejectRole),
+        ("Replace", _FakeMessageBox.DestructiveRole),
+        ("Cancel", _FakeMessageBox.RejectRole),
     ]
-    assert box.default_button.text == "No"
-    assert box.escape_button.text == "No"
+    assert box.default_button.text == "Cancel"
+    assert box.escape_button.text == "Cancel"
     assert box.text == _expected_append_mismatch_modal_text(
         processed, current, check.mismatched_fields,
     )
@@ -9579,6 +9618,7 @@ def test_batch_process_scan_dispatches_each_frame_as_read():
         _flush_xye_buffer=lambda *_args, **_kw: None,
         _save_due=lambda scan, force=False: False,   # frames=0 -> nothing due
         _prime_append_skip_snapshots_for_run=lambda: None,
+        _append_frame_complete=lambda _name, idx, scan: idx in scan.frames.index,
     )
 
     def dispatch(scan, pending, *, force_save=False):

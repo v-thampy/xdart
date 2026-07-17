@@ -268,25 +268,41 @@ def read_provenance(
     """
     import h5py
 
-    out: dict[str, Any] = {}
     with h5py.File(path, "r") as h5f:
-        if entry not in h5f or "reduction" not in h5f[entry]:
-            return out
-        red = h5f[f"{entry}/reduction"]
+        return read_provenance_from_handle(h5f, entry=entry)
 
-        for key, item in red.items():
-            if isinstance(item, h5py.Dataset):
-                v = _decode(item[()])
-                if isinstance(v, str):
-                    # Try JSON-decode; fall back to raw string
-                    try:
-                        out[key] = json.loads(v)
-                    except (json.JSONDecodeError, TypeError):
-                        out[key] = v
-                else:
+
+def read_provenance_from_handle(
+    h5f: "h5py.File",
+    *,
+    entry: str = "entry",
+) -> dict[str, Any]:
+    """Read provenance through an already-open HDF5 handle.
+
+    Cursor-style consumers often need a few small datasets and the reduction
+    signature together.  Accepting their existing handle keeps that operation
+    to one file open, which matters on beamline network shares.  The returned
+    structure is identical to :func:`read_provenance`.
+    """
+    import h5py
+
+    out: dict[str, Any] = {}
+    if entry not in h5f or "reduction" not in h5f[entry]:
+        return out
+    red = h5f[f"{entry}/reduction"]
+
+    for key, item in red.items():
+        if isinstance(item, h5py.Dataset):
+            v = _decode(item[()])
+            if isinstance(v, str):
+                try:
+                    out[key] = json.loads(v)
+                except (json.JSONDecodeError, TypeError):
                     out[key] = v
-            elif isinstance(item, h5py.Group):
-                out[key] = _read_group(item)
+            else:
+                out[key] = v
+        elif isinstance(item, h5py.Group):
+            out[key] = _read_group(item)
     return out
 
 
@@ -320,5 +336,6 @@ __all__ = [
     "CANONICAL_PACKAGES",
     "capture_versions",
     "read_provenance",
+    "read_provenance_from_handle",
     "write_provenance",
 ]

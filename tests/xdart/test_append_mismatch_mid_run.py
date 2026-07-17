@@ -276,6 +276,7 @@ def test_live_watch_append_mismatch_stops_cleanly(tmp_path):
         _flush_xye_buffer=lambda *_args, **_kw: None,
         _save_due=lambda scan, force=False: force,
         _prime_append_skip_snapshots_for_run=lambda: None,
+        _append_frame_complete=lambda _name, idx, scan: idx in scan.frames.index,
         _dispatch_batch=lambda scan, pending, force_save=False: dispatched.append(
             tuple(item[1] for item in pending)) or len(pending),
         _process_one=lambda *a, **k: None,
@@ -408,9 +409,10 @@ def test_live_watch_saves_every_intermediate_scan(tmp_path):
         initialize_scan=initialize_scan,
         get_background=lambda *_: 0.0,
         _flush_xye_buffer=lambda *_a, **_k: None,
-        _save_due=(lambda scan, force=False: bool(force)),   # only FORCE saves
-        _prime_append_skip_snapshots_for_run=lambda: None,
-        _process_one=lambda *a, **k: None,
+            _save_due=(lambda scan, force=False: bool(force)),   # only FORCE saves
+            _prime_append_skip_snapshots_for_run=lambda: None,
+            _append_frame_complete=lambda _name, idx, scan: idx in scan.frames.index,
+            _process_one=lambda *a, **k: None,
         _install_run_integrator=lambda *a, **k: None,
     )
 

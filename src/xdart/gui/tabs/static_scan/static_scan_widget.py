@@ -7079,10 +7079,15 @@ class staticWidget(QWidget):
         return "reset" if box.clickedButton() is start else "cancel"
 
     def _resolve_overlay_grid_mismatch(self, current_spec, selected_spec):
-        """Choose the GUI policy without ever blocking an unattended run."""
+        """Prompt manual selections; keep unattended acquisition non-blocking.
+
+        ``_run_active`` deliberately does not participate: it remains true while
+        paused, when browser selections are explicitly user-driven and must get
+        the same transactional warning as idle browsing.  The two writer/display
+        flags describe actual automated publication, not merely run ownership.
+        """
         automatic = bool(
-            getattr(self, "_run_active", False)
-            or getattr(getattr(self, "h5viewer", None), "_run_writing", False)
+            getattr(getattr(self, "h5viewer", None), "_run_writing", False)
             or getattr(getattr(self, "displayframe", None),
                        "_processing_active", False)
         )
@@ -7703,6 +7708,8 @@ class staticWidget(QWidget):
             and processed_count == 0
             and append_skipped > 0
         )
+        append_config_failed = bool(
+            getattr(thread, "_append_config_mismatch", False))
         finished_file = _finished_output_file(
             thread,
             self.wrangler,
@@ -7716,10 +7723,13 @@ class staticWidget(QWidget):
             processed_count=processed_count,
             append_skipped=append_skipped,
             all_skipped_append=all_skipped_append,
+            append_config_failed=append_config_failed,
             **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
         )
 
-        if is_batch and not is_xye_only and not _reintegrate_running:
+        if (is_batch and not is_xye_only and not _reintegrate_running
+                and not (append_config_failed
+                         and not getattr(self, '_run_saw_frame', True))):
             # Prefer the thread's fname — it's the source of truth for
             # where data was actually written. The widget-level
             # wrangler.fname is set in setup() before the thread runs
@@ -7757,7 +7767,8 @@ class staticWidget(QWidget):
         # the user gets visual confirmation the run actually ran.  Batch already
         # auto-loads + selects-last above; XYE-only has no .nxs to load.
         if (not is_batch and not is_xye_only and not _reintegrate_running
-                and not getattr(self, '_run_saw_frame', True)):
+                and not getattr(self, '_run_saw_frame', True)
+                and not append_config_failed):
             existing_file = finished_file
             if existing_file and os.path.exists(existing_file):
                 existing_dir = os.path.dirname(existing_file)

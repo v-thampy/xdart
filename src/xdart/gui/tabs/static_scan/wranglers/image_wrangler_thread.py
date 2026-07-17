@@ -56,17 +56,37 @@ def _nexus_integrated_frame_labels(path, *, entry="entry"):
     frame payloads, so constructing a ``LiveScan`` here turns a cheap cursor
     lookup into a full processed-scan hydration.
     """
-    labels = set()
     with h5py.File(path, "r") as h5:
         if entry not in h5:
             raise ValueError(f"{path} has no {entry!r} group")
-        e = h5[entry]
-        for group_name in ("integrated_1d", "integrated_2d"):
-            group = e.get(group_name)
-            if group is None or "frame_index" not in group:
-                continue
-            labels.update(int(v) for v in np.asarray(group["frame_index"][()]).ravel())
-    return labels
+        labels_1d, labels_2d = _nexus_integrated_frame_sets(h5, entry=entry)
+    return labels_1d | labels_2d
+
+
+def _nexus_integrated_frame_sets(h5, *, entry="entry"):
+    """Return separate 1D and 2D frame-label sets from an open handle."""
+    if entry not in h5:
+        raise ValueError(f"HDF5 file has no {entry!r} group")
+    groups = h5[entry]
+    result = []
+    for group_name in ("integrated_1d", "integrated_2d"):
+        group = groups.get(group_name)
+        if group is None or "frame_index" not in group:
+            result.append(set())
+            continue
+        result.append({
+            int(v) for v in np.asarray(group["frame_index"][()]).ravel()
+        })
+    return tuple(result)
+
+
+def _nexus_append_cursor(path, *, require_2d, entry="entry"):
+    """Read mode-aware completion labels and provenance in one file open."""
+    with h5py.File(path, "r") as h5:
+        labels_1d, labels_2d = _nexus_integrated_frame_sets(h5, entry=entry)
+        provenance = read_provenance_from_handle(h5, entry=entry)
+    completed = labels_1d & labels_2d if require_2d else labels_1d
+    return completed, provenance
 
 
 def _nexus_integrated_frame_count(path, *, entry="entry"):
@@ -87,6 +107,7 @@ from xrd_tools.core import (
     FrameRecord,
     live_record_store_max_items,
 )
+from xrd_tools.core.provenance import read_provenance_from_handle
 from xrd_tools.integrate.gid import gi_1d_output_axis_key
 from xrd_tools.integrate.calibration import poni_to_integrator, get_detector
 from xrd_tools.reduction import (
@@ -100,7 +121,9 @@ from xrd_tools.reduction import (
 from xrd_tools.session import FrameRecordStore
 from xrd_tools.session.readiness import (
     AppendConfigMismatchError,
+    append_config_difference_lines,
     append_config_mismatch_check,
+    processing_config_from_mapping,
     processing_config_from_scan,
 )
 from xrd_tools.sources.image import ImageFileSource, TiffSeriesSource
@@ -669,6 +692,7 @@ class imageThread(wranglerThread):
         self._plan_cache = StandardPlanCache()
         self._append_skip_frames_by_scan = {}
         self._append_skip_without_reading = 0
+        self._append_config_mismatch = False
         self._discovered_frame_count = 0
         self._skip_reason_counts = Counter()
         self.files_processed_by_output = {}
@@ -735,6 +759,7 @@ class imageThread(wranglerThread):
         self._prefetch_error = None
         self._append_skip_frames_by_scan = {}
         self._append_skip_without_reading = 0
+        self._append_config_mismatch = False
         self._discovered_frame_count = 0
         self._skip_reason_counts = Counter()
         self.files_processed_by_output = {}
@@ -968,6 +993,13 @@ class imageThread(wranglerThread):
         if cache is None:
             cache = {}
             self._append_skip_frames_by_scan = cache
+        key = str(scan_name)
+        # The lightweight cursor owns Append completion.  A loaded LiveScan's
+        # frame index is the union of its 1D and 2D labels, which is not enough
+        # to prove an Int 2D frame is complete.  Do not replace a mode-aware
+        # cursor that was already established before the raw read.
+        if key in cache:
+            return
         try:
             existing = (self._scan_frame_index_snapshot(scan)
                         if scan is not None
@@ -976,7 +1008,7 @@ class imageThread(wranglerThread):
             out_path = self._append_output_path(scan_name)
             self._warn_append_snapshot_failed(scan_name, out_path, exc)
             existing = set()
-        cache[str(scan_name)] = existing
+        cache[key] = existing
 
     def _append_output_path(self, scan_name):
         return os.path.join(getattr(self, "h5_dir", ""), str(scan_name) + '.nxs')
@@ -1067,7 +1099,19 @@ class imageThread(wranglerThread):
 
         try:
             with self._optional_lock(getattr(self, "file_lock", None)):
-                existing = _nexus_integrated_frame_labels(out_path)
+                existing, provenance = _nexus_append_cursor(
+                    out_path,
+                    require_2d=not bool(getattr(self.scan, "skip_2d", False)),
+                )
+            processed_config = processing_config_from_mapping(provenance)
+            current_config = processing_config_from_scan(self.scan)
+            append_check = append_config_mismatch_check(
+                self.write_mode, processed_config, current_config)
+            if not append_check.ok:
+                raise self._append_config_mismatch_error(
+                    out_path, append_check, processed_config, current_config)
+        except AppendConfigMismatchError:
+            raise
         except Exception as exc:
             self._warn_append_snapshot_failed(key, out_path, exc)
             existing = set()
@@ -1138,6 +1182,35 @@ class imageThread(wranglerThread):
             self._record_skip_reason("already processed")
             return True
         return False
+
+    def _append_frame_complete(self, scan_name, img_number, scan):
+        """Use the same mode-aware cursor at raw-read and dispatch boundaries."""
+        if self._append_skip_enabled():
+            return img_number in self._append_skip_snapshot(scan_name)
+        return img_number in getattr(getattr(scan, "frames", None), "index", ())
+
+    @staticmethod
+    def _append_config_mismatch_error(
+            out_path, check, processed_config, current_config):
+        details = append_config_difference_lines(
+            processed_config,
+            current_config,
+            getattr(check, "mismatched_fields", ()),
+        )
+        detail_text = "\n".join(f"- {line}" for line in details)
+        if not detail_text:
+            detail_text = "- Stored and current integration settings differ."
+        name = os.path.basename(os.fspath(out_path))
+        message = (
+            "Integration settings changed mid-run.\n\n"
+            f"Append stopped before modifying {name} because the existing "
+            "processed scan was created with different settings.\n\n"
+            f"Changed settings:\n{detail_text}\n\n"
+            f"The append target {name} was preserved.\n\n"
+            "Switch output mode to Replace and run again, or restore the "
+            "previous integration settings."
+        )
+        return AppendConfigMismatchError(message, check)
 
     def _format_skip_reasons(self):
         reasons = getattr(self, "_skip_reason_counts", Counter())
@@ -1378,7 +1451,8 @@ class imageThread(wranglerThread):
 
             series_average = bool(getattr(self, "series_average", False))
             output_img_number = 1 if series_average else img_number
-            if output_img_number in scan.frames.index:
+            if self._append_frame_complete(
+                    scan.name, output_img_number, scan):
                 self._record_skip_reason("already processed at dispatch")
                 if self.single_img and not is_eiger:
                     self.sigUpdate.emit(img_number)
@@ -1523,7 +1597,9 @@ class imageThread(wranglerThread):
                     _cached_poni = self.poni
                     self._cached_gi_incident_angle = None
 
-                if img_number in scan.frames.index:
+                output_img_number = 1 if series_average else img_number
+                if self._append_frame_complete(
+                        scan.name, output_img_number, scan):
                     self._record_skip_reason("already processed at dispatch")
                     continue
 
@@ -4016,6 +4092,7 @@ class imageThread(wranglerThread):
         ``sigAppendMismatch`` so the GUI surfaces the one-modal warning.
         """
         logger.error("run stopped: %s", exc)
+        self._append_config_mismatch = True
         self.command = 'stop'
         try:
             self.sigAppendMismatch.emit(str(exc))
@@ -4163,6 +4240,10 @@ class imageThread(wranglerThread):
         # the per-batch ``scan._save_to_nexus`` is already gated off for
         # xye_only, so the scan object is used purely in-memory for integration.
         if not self.xye_only:
+            if write_mode == 'Append':
+                # Usually populated before the raw read.  Keep direct entry
+                # paths safe too; when cached this performs no file I/O.
+                self._load_append_skip_snapshot(self.scan_name)
             with self.file_lock:
                 with self._h5pool_bracket(scan):
                     if write_mode == 'Append':
@@ -4181,14 +4262,11 @@ class imageThread(wranglerThread):
                             # Run-click mismatch modal (CF-2/CF-3) only fires
                             # at Run-click, so a mid-run settings change (or a
                             # later auto-discovered scan) lands HERE.
-                            fields = ", ".join(append_check.mismatched_fields)
-                            raise AppendConfigMismatchError(
-                                f"Integration settings changed mid-run "
-                                f"({fields}); the append target "
-                                f"{os.path.basename(fname)} was preserved. "
-                                "Switch write mode to Replace, or revert "
-                                "settings, to continue.",
+                            raise self._append_config_mismatch_error(
+                                fname,
                                 append_check,
+                                processed_config,
+                                current_config,
                             )
                         scan.skip_2d = self.scan.skip_2d
                         for (k, v) in self.scan_args.items():

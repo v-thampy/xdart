@@ -21,6 +21,7 @@ from pyqtgraph.parametertree import ParameterTree, Parameter
 from xrd_tools.core.containers import PONI
 from xrd_tools.io.metadata import read_image_metadata
 from xrd_tools.session.readiness import (
+    append_config_difference_lines,
     append_config_mismatch_check,
     processing_config_from_scan,
 )
@@ -1182,14 +1183,20 @@ class imageWrangler(wranglerWidget):
 
     def _append_config_mismatch_modal_text(self, processed, current,
                                            mismatched_fields=()):
-        diff = ", ".join(str(f) for f in (mismatched_fields or ()))
-        diff_line = f"Different: {diff}\n\n" if diff else ""
+        details = append_config_difference_lines(
+            processed, current, mismatched_fields)
+        detail_text = "\n".join(f"- {line}" for line in details)
+        if not detail_text:
+            detail_text = "- Stored and current integration settings differ."
         return (
-            "Scan already integrated with different integration settings.\n\n"
-            f"Processed: {imageWrangler._format_append_config(processed)}\n"
-            f"Current:   {imageWrangler._format_append_config(current)}\n\n"
-            f"{diff_line}"
-            "Overwrite processed data with new settings?"
+            "The existing processed scan was created with integration settings "
+            "that do not match the current run.\n\n"
+            f"Changed settings:\n{detail_text}\n\n"
+            f"Existing scan: {imageWrangler._format_append_config(processed)}\n"
+            f"Current run: {imageWrangler._format_append_config(current)}\n\n"
+            "Append cannot combine data produced with different settings.\n\n"
+            "Choose Replace to overwrite the existing processed data using "
+            "the current settings, or Cancel to leave it unchanged."
         )
 
     def _confirm_append_config_replace(self, check, processed, current):
@@ -1203,12 +1210,12 @@ class imageWrangler(wranglerWidget):
         box.setText(imageWrangler._append_config_mismatch_modal_text(
             self, processed, current,
             getattr(check, "mismatched_fields", ())))
-        yes = box.addButton("Yes", QMessageBox.DestructiveRole)
-        no = box.addButton("No", QMessageBox.RejectRole)
-        box.setDefaultButton(no)
-        box.setEscapeButton(no)
+        replace = box.addButton("Replace", QMessageBox.DestructiveRole)
+        cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
         box.exec()
-        return box.clickedButton() is yes
+        return box.clickedButton() is replace
 
     def _on_append_mismatch(self, message):
         """Mid-run Append config mismatch: the worker already stopped the run

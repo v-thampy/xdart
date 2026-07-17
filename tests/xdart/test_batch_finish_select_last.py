@@ -24,7 +24,7 @@ class _StopTimer:
 def _finish_host(tmp_path, *, batch, saw_frame, xye_only=False,
                  reintegrate_running=False, write_mode="Overwrite",
                  files_processed=None, append_skipped=0, indexed_count=0,
-                 provisional_master=False):
+                 provisional_master=False, append_config_mismatch=False):
     nxs = tmp_path / "scan.nxs"
     nxs.write_bytes(b"")                         # os.path.exists -> True
     thread_fname = (tmp_path / "scan_master.nxs"
@@ -45,6 +45,7 @@ def _finish_host(tmp_path, *, batch, saw_frame, xye_only=False,
         h5_dir=str(tmp_path),
         write_mode=write_mode,
         _append_skip_without_reading=append_skipped,
+        _append_config_mismatch=append_config_mismatch,
         _append_skip_frames_by_scan={"scan": set(range(1, indexed_count + 1))},
         _append_output_path=lambda scan_name: str(tmp_path / f"{scan_name}.nxs"),
     )
@@ -140,6 +141,23 @@ def test_append_zero_frame_finish_forces_internal_reload(tmp_path):
     assert host._loaded_paths == [nxs]
     assert calls == [(nxs, True)], f"expected one internal reload; got {calls}"
     assert h5viewer._auto_select_last_on_finish is True
+
+
+def test_append_config_mismatch_before_first_frame_preserves_display(tmp_path):
+    host, h5viewer, _nxs, calls = _finish_host(
+        tmp_path,
+        batch=False,
+        saw_frame=False,
+        write_mode="Append",
+        files_processed=0,
+        append_config_mismatch=True,
+    )
+
+    host.wrangler_finished()
+
+    assert calls == []
+    assert host._loaded_paths == []
+    assert h5viewer._auto_select_last_on_finish is False
 
 
 def test_append_all_skipped_before_scan_init_resolves_processed_output(tmp_path):

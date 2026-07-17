@@ -394,6 +394,51 @@ def processing_config_from_scan(
     )
 
 
+def _format_processing_config_value(attr: str, value: object) -> str:
+    if value is _UNSET:
+        return "not recorded"
+    if value is None:
+        return "Auto" if "range" in attr else "not set"
+    if attr == "mode":
+        try:
+            return "Grazing" if MeasMode(value) == MeasMode.GI else "Standard"
+        except (TypeError, ValueError):
+            return str(value)
+    if isinstance(value, tuple) and len(value) == 2:
+        def _part(item: object) -> str:
+            return f"{item:g}" if isinstance(item, (int, float)) else str(item)
+        return f"{_part(value[0])} to {_part(value[1])}"
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
+def append_config_difference_lines(
+    processed_config: Mapping[str, Any] | ProcessingConfigSignature | None,
+    current_config: Mapping[str, Any] | ProcessingConfigSignature | None,
+    mismatched_fields: Sequence[str] = (),
+) -> tuple[str, ...]:
+    """Describe each Append mismatch with its existing and current values."""
+    processed = processing_config_from_mapping(processed_config)
+    current = processing_config_from_mapping(current_config)
+    if processed is None or current is None:
+        return ()
+    requested = set(mismatched_fields)
+    lines = []
+    for attr, label in _PROCESSING_COMPARED_FIELDS:
+        if requested and label not in requested:
+            continue
+        old = getattr(processed, attr)
+        new = getattr(current, attr)
+        if old is _UNSET or new is _UNSET or old == new:
+            continue
+        lines.append(
+            f"{label}: existing {_format_processing_config_value(attr, old)}; "
+            f"current {_format_processing_config_value(attr, new)}"
+        )
+    return tuple(lines)
+
+
 def append_config_mismatch_check(
     write_mode: object,
     processed_config: Mapping[str, Any] | ProcessingConfigSignature | None,

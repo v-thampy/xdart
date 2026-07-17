@@ -17,6 +17,7 @@ from xrd_tools.core.provenance import (
     CANONICAL_PACKAGES,
     capture_versions,
     read_provenance,
+    read_provenance_from_handle,
     write_provenance,
 )
 
@@ -77,6 +78,17 @@ class TestWriteRead:
         # Versions captured from importlib.metadata
         assert "versions" in out
         assert "python" in out["versions"]
+
+    def test_open_handle_reader_matches_path_reader(self, fresh_h5):
+        with h5py.File(fresh_h5, "w") as f:
+            write_provenance(
+                f,
+                config={"bai_1d_args": {"numpoints": 1000}},
+                host="",
+            )
+        expected = read_provenance(fresh_h5)
+        with h5py.File(fresh_h5, "r") as f:
+            assert read_provenance_from_handle(f) == expected
 
     def test_nxprocess_attr_set(self, fresh_h5):
         with h5py.File(fresh_h5, "w") as f:
