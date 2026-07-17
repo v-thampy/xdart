@@ -136,6 +136,11 @@ class ContainerCursor:
             paths = self._resolved_paths(self._descriptor)
             if paths:
                 self._stack = NexusImageStack(self._h5, list(paths))
+            # Revalidate the FULL identity AFTER inspection: a path/stamp/owner/
+            # removal race during the open must fail closed, never return a
+            # usable cursor attributed to a stale owner.
+            if self._candidate is not None:
+                self._check_identity(when="after inspection")
         except Exception:
             self.close()
             raise
@@ -263,9 +268,22 @@ class ContainerCursor:
         return []
 
     def _reject_if_stale(self) -> None:
+        """Fail closed BEFORE opening the file when the candidate's R1 identity no
+        longer matches (zero source opens on a stale candidate)."""
+        self._check_identity(when="before opening")
+
+    def _check_identity(self, *, when: str) -> None:
+        """Validate the candidate's FULL R1 identity — path, ``(size, mtime)``
+        stamp, AND owning adapter id — against the current filesystem/registry
+        state.  Reuses the R1 registry seam (``candidate_owner``); an owner flip
+        with unchanged bytes, a byte change, or a removal all fail closed.  Run
+        both before the open and again after inspection so a path/stamp/owner/
+        removal race cannot return a usable cursor result."""
         from xrd_tools.sources.directory_index import StaleCandidateError
 
         cand = self._candidate
+        if cand is None:
+            return
         if getattr(cand, "path", self._path) != self._path:
             raise StaleCandidateError(
                 f"candidate path {getattr(cand, 'path', None)!r} does not match "
@@ -274,12 +292,25 @@ class ContainerCursor:
             st = self._path.stat()
         except OSError as exc:
             raise StaleCandidateError(
-                f"{self._path} is no longer present since discovery: {exc}")
+                f"{self._path} is no longer present ({when}): {exc}")
         stamp = getattr(cand, "version_stamp", None)
         if stamp is not None and (st.st_size, st.st_mtime_ns) != tuple(stamp):
             raise StaleCandidateError(
-                f"{self._path} changed since discovery (size/mtime stamp "
-                "mismatch); re-poll and re-probe before consuming")
+                f"{self._path} bytes changed since discovery ({when}); re-poll "
+                "and re-probe before consuming")
+        adapter_id = getattr(cand, "adapter_id", None)
+        if adapter_id is not None:
+            # Ensure the built-in adapters are registered so the owner lookup is
+            # authoritative (a candidate produced by discovery already did this).
+            import xrd_tools.sources.registry  # noqa: F401
+            from xrd_tools.sources.adapters import candidate_owner
+
+            owner = candidate_owner(self._path)
+            current_id = owner.id if owner is not None else None
+            if current_id != adapter_id:
+                raise StaleCandidateError(
+                    f"{self._path} owning adapter changed from {adapter_id!r} to "
+                    f"{current_id!r} ({when}); re-poll and re-probe the new owner")
 
     def _require_open(self) -> None:
         if self._closed:

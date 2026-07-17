@@ -10,6 +10,8 @@ block, and that a stale R1 candidate is rejected BEFORE the file is opened.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import h5py
 import numpy as np
 import pytest
@@ -246,6 +248,71 @@ def test_matching_candidate_opens_normally(tmp_path):
     with ContainerCursor(p, candidate=fresh) as cur:
         assert cur.descriptor.adapter_id == "nexus_hdf5"
         np.testing.assert_array_equal(cur.read_frame(0), data[0])
+
+
+# --------------------------------------------------------------------------- #
+# R2-R3: full R1 identity — reject an adapter-owner flip (unchanged bytes)
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def _restore_adapters():
+    import xrd_tools.sources.adapters as am
+    saved = dict(am._ADAPTERS)  # noqa: SLF001
+    try:
+        yield
+    finally:
+        am._ADAPTERS.clear()  # noqa: SLF001
+        am._ADAPTERS.update(saved)  # noqa: SLF001
+
+
+def _register_usurper(adapter_id="usurper_test"):
+    from xrd_tools.core.scan import SourceKind
+    from xrd_tools.sources.adapters import SourceFormatAdapter, register_adapter
+    register_adapter(SourceFormatAdapter(
+        id=adapter_id, kinds=(SourceKind.NEXUS_STACK,),
+        is_candidate=lambda p: str(p).endswith(".nxs"),
+        scan_name=lambda p: p.stem, probe=lambda p: None,
+        open=lambda s: None), builtin=False)  # external -> outranks built-in
+
+
+def test_stale_adapter_owner_rejected_before_open(tmp_path, monkeypatch, _restore_adapters):
+    from xrd_tools.sources.discover import collect_candidates
+    from xrd_tools.sources.directory_index import StaleCandidateError
+
+    p, _ = _stack(tmp_path / "owner.nxs")
+    cand = [c for c in collect_candidates(tmp_path) if c.path == p][0]
+    assert cand.adapter_id == "nexus_hdf5"
+    _register_usurper()  # higher-precedence owner registered AFTER discovery
+    opens = _count_h5_opens(monkeypatch)
+    with pytest.raises(StaleCandidateError):
+        with ContainerCursor(p, candidate=cand):
+            pass
+    assert opens.count(str(p)) == 0  # owner flip failed closed with zero opens
+
+
+def test_owner_flip_during_inspection_fails_closed(tmp_path, monkeypatch):
+    """A race that flips the owner AFTER the pre-open check but during the open
+    must still fail closed (the post-inspection revalidation)."""
+    from xrd_tools.sources.discover import collect_candidates
+    from xrd_tools.sources.directory_index import StaleCandidateError
+    import xrd_tools.sources.adapters as am
+
+    p, _ = _stack(tmp_path / "race.nxs")
+    cand = [c for c in collect_candidates(tmp_path) if c.path == p][0]
+
+    calls = {"n": 0}
+    real_owner = am.candidate_owner
+
+    def racing_owner(path):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_owner(path)                 # pre-open: still the owner
+        return SimpleNamespace(id="someone_else")   # post-open: flipped
+
+    monkeypatch.setattr(am, "candidate_owner", racing_owner)
+    # cursor.py imports candidate_owner lazily from the module, so patch there too
+    with pytest.raises(StaleCandidateError):
+        with ContainerCursor(p, candidate=cand):
+            pass
 
 
 def test_read_block_beyond_frame_count_does_not_overstate(tmp_path):
