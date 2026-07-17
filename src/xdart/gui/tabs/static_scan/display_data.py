@@ -205,8 +205,12 @@ class DisplayDataMixin:
                     )
             return None
         # Do not synchronously open the NeXus file from the GUI thread.  Queue
-        # full-payload hydration when the selected publication has been thinned.
-        if getattr(publication, "raw_status", None) in ("evicted", "thumbnail"):
+        # full-payload hydration when the selected publication has been thinned
+        # — or (PF-1e) when it is a source-only row whose raw is absent but
+        # lazily recoverable from its source reference.
+        from xdart.modules.frame_publication import publication_raw_recoverable
+        if (getattr(publication, "raw_status", None) in ("evicted", "thumbnail")
+                or publication_raw_recoverable(publication)):
             request = getattr(self, "_request_frame_hydration", None)
             if request is not None:
                 try:

@@ -396,6 +396,25 @@ def _view_has_data_arrays(view: FrameView) -> bool:
     )
 
 
+def publication_raw_recoverable(publication: FramePublication) -> bool:
+    """True when the FULL raw is absent but lazily recoverable from source.
+
+    PF-1e: an old Append row may carry only a valid ``source`` reference — no
+    stored thumbnail (``raw_status`` ``"missing"``/``"unknown"``) and no live
+    ``raw_ref``.  Its raw detector image is still recoverable on demand
+    through the registered hydrator's lazy source fallback (the same
+    ``load_processed_raw_or_thumbnail`` route the headless readers use), so a
+    full-purpose hydration must be ELIGIBLE for it.  Thumbnail backfill stays
+    optional; this is what keeps the raw panel non-blank for source-only rows.
+    """
+    view = publication.view
+    return (
+        view.raw is None
+        and publication.raw_ref is None
+        and bool(getattr(view, "source_path", None))
+    )
+
+
 def _publication_has_full_payload(publication: FramePublication) -> bool:
     """True if the publication has its data payload (so there is nothing to
     rehydrate): a live raw_ref, real data arrays in the active view, or any
@@ -712,10 +731,20 @@ class PublicationStore:
         # evicted), keyed on real DATA arrays — NOT _publication_has_heavy_payload,
         # which counts the thumbnail as heavy and so wrongly short-circuited a
         # tier-1 (semilight) frame, leaving it stuck on the thumbnail forever.
-        if publication is not None and (
-                _publication_has_full_payload(publication)
-                or publication.raw_status not in ("evicted", "thumbnail", "1d-only")):
-            return publication
+        # PF-1e: ALSO rehydrate when the full raw is absent but recoverable
+        # from the row's source reference — a source-only row (no stored
+        # thumbnail -> raw_status "missing") otherwise short-circuited here
+        # forever: the worker reported success (a resident lighter item),
+        # the full-purpose residency check scored it false, and the raw
+        # panel stayed blank while the headless source fallback could read
+        # the image the whole time.
+        if publication is not None:
+            payload_gone = (
+                not _publication_has_full_payload(publication)
+                and publication.raw_status in ("evicted", "thumbnail", "1d-only")
+            )
+            if not payload_gone and not publication_raw_recoverable(publication):
+                return publication
         if hydrator is None:
             return publication
         try:
