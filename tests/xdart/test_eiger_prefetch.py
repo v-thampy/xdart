@@ -21,6 +21,30 @@ def _bare_image_thread():
     return worker
 
 
+class _FakeReadBlock:
+    def __init__(self, array):
+        self.array = array
+
+
+class _FakeCursor:
+    """Minimal stand-in for the R2 ContainerCursor read backend (the wrangler's
+    h5py-backed read path now goes through the cursor, not a raw dataset)."""
+
+    def __init__(self, data, is_2d=False):
+        self._data = np.asarray(data)
+        self.frame_count = int(self._data.shape[0])
+        self.is_2d = is_2d
+
+    def read_frame(self, idx):
+        return np.asarray(self._data[int(idx)])
+
+    def read_block(self, start, stop):
+        return _FakeReadBlock(np.asarray(self._data[int(start):int(stop)]))
+
+    def close(self):
+        pass
+
+
 def test_eiger_metadata_is_cached_per_master(monkeypatch, tmp_path):
     from xdart.gui.tabs.static_scan.wranglers import image_wrangler_thread
 
@@ -46,23 +70,17 @@ def test_eiger_metadata_is_cached_per_master(monkeypatch, tmp_path):
 
 
 def test_sync_eiger_read_keeps_native_dataset_dtype(tmp_path):
-    class FakeDataset:
-        shape = (1, 2, 2)
-        ndim = 3     # a real h5py.Dataset always carries ndim (F6 2-D branch)
-
-        def __getitem__(self, key):
-            assert key == 0
-            return np.arange(4, dtype=np.uint16).reshape(2, 2)
-
     worker = _bare_image_thread()
     worker._eiger_master_path = str(tmp_path / "scan_master.h5")
     worker._eiger_frame_idx = 0
     worker._eiger_nframes = 1
     worker._eiger_master_queue = deque()
     worker._eiger_done_masters = set()
-    worker._eiger_h5_handle = None
-    worker._eiger_h5_dataset = FakeDataset()
     worker._eiger_fabio_handle = None
+    # R2: the h5py-backed single-frame read now goes through the cursor.
+    worker._eiger_cursor = _FakeCursor(
+        np.arange(4, dtype=np.uint16).reshape(1, 2, 2))
+    worker._eiger_provider = None
     worker.inp_type = "Image File"
 
     _path, _scan_name, _number, image, _meta = worker._get_next_eiger_frame_sync()
@@ -71,19 +89,6 @@ def test_sync_eiger_read_keeps_native_dataset_dtype(tmp_path):
 
 
 def test_prefetch_bulk_read_keeps_native_dataset_dtype(tmp_path):
-    class FakeDataset:
-        shape = (3, 2, 2)
-        ndim = 3     # a real h5py.Dataset always carries ndim (F6 2-D branch)
-
-        def __getitem__(self, key):
-            if isinstance(key, slice):
-                frames = [
-                    np.full((2, 2), value, dtype=np.uint16)
-                    for value in range(key.start, key.stop)
-                ]
-                return np.stack(frames, axis=0)
-            return np.full((2, 2), key, dtype=np.uint16)
-
     worker = _bare_image_thread()
     worker.command = ""
     worker._prefetch_stop_evt = threading.Event()
@@ -93,7 +98,12 @@ def test_prefetch_bulk_read_keeps_native_dataset_dtype(tmp_path):
     worker._eiger_master_path = str(tmp_path / "scan_master.h5")
     worker._eiger_frame_idx = 0
     worker._eiger_nframes = 3
-    worker._eiger_h5_dataset = FakeDataset()
+    # R2: the bulk read now goes through the cursor's read_block, sized by the
+    # ReadPlan's block_frames instead of the retired fixed-16 constant.
+    worker._eiger_cursor = _FakeCursor(
+        np.stack([np.full((2, 2), v, dtype=np.uint16) for v in range(3)]))
+    worker._eiger_read_plan = SimpleNamespace(block_frames=16)
+    worker._eiger_provider = None
     worker._eiger_fabio_handle = None
 
     calls = 0

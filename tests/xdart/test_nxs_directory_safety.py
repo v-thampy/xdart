@@ -293,5 +293,5 @@ def test_processed_file_never_resolves_integrated_2d_via_worker(tmp_path):
     t = _make_thread(watch, out)
     t._eiger_open_master(str(proc))
     assert t._eiger_nframes == 0
-    assert t._eiger_h5_dataset is None
+    assert t._eiger_cursor is None
     assert t._skip_reason_counts.get("processed xdart output", 0) == 1

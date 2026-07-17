@@ -456,12 +456,14 @@ try:
 except (TypeError, ValueError):
     _PREFETCH_QUEUE_SIZE = 4
 
-# How many frames the prefetcher reads from HDF5 in a single slice.  HDF5
-# chunks are typically sized so that one decompression produces multiple
-# frames, so reading N frames as `dset[i:i+N]` decompresses each chunk once
-# instead of N times.  Frames are then dispatched one-by-one to the
-# consumer queue, so downstream consumers are unaffected.
-_PREFETCH_READ_CHUNK = 16
+# R2: the prefetcher's HDF5 bulk-read block size is no longer a fixed 16 frames.
+# It is now the layout-aware, byte-bounded ``ReadPlan.block_frames`` computed per
+# master from the detector's native chunk cadence + dtype + a source-block byte
+# budget (``xrd_tools.sources.read_plan.plan_reads`` /
+# ``xrd_tools.core.staging.source_block_budget_bytes``): a native two-frame
+# Eiger cadence instead of an arbitrary 16-frame block, and the 32-frame Bluesky
+# decode floor bounded to the byte budget — bounding the prefetch's retained
+# memory that the 651-frame Int 2D case is sensitive to.
 
 # File extensions whose raw image data already lives in the source file
 # — no need to duplicate `map_raw` into the output scan HDF5.  This is
@@ -672,9 +674,14 @@ class imageThread(wranglerThread):
         self._eiger_retry_after = {}
         self._eiger_zero_frame_seen = {}
         self._eiger_open_state = None
-        self._eiger_h5_handle = None     # persistent h5py.File for Eiger reads
-        self._eiger_h5_dataset = None    # dataset reference inside the open file
-        self._eiger_fabio_handle = None  # persistent fabio.EigerImage fallback
+        # R2: one sustained ContainerCursor per h5py-backed master (created,
+        # read, and closed entirely on the prefetch owner thread) replaces the
+        # raw persistent h5py.File/dataset for NeXus/Bluesky reads.  fabio stays
+        # PRIMARY for real external-link Eiger masters.
+        self._eiger_cursor = None        # xrd_tools ContainerCursor (h5py path)
+        self._eiger_read_plan = None     # layout-aware, byte-bounded block plan
+        self._eiger_provider = None      # materialized per-frame metadata provider
+        self._eiger_fabio_handle = None  # persistent fabio.EigerImage (primary Eiger)
         self._eiger_metadata_cache = {}  # master metadata is stable across frames
         # Bluesky/NXWriter embedded per-frame table + wavelength, per master
         # (see _bluesky_source_for) — caches None for non-Bluesky masters too.
@@ -3034,17 +3041,24 @@ class imageThread(wranglerThread):
 
         Strategy
         --------
-        - ``.nxs`` files → skip fabio and go straight to h5py using
-          ``find_nexus_image_dataset`` to locate the 3D image dataset.
-          fabio's EigerImage is tuned for Eiger master layouts and does
-          not reliably find image arrays in Bluesky-style NeXus files.
+        - ``.nxs`` files → skip fabio and open the R2 ``ContainerCursor`` (one
+          sustained h5py handle that resolves the detector dataset + frame count
+          + wavelength + the metadata provider once).  fabio's EigerImage is
+          tuned for Eiger master layouts and does not reliably find image arrays
+          in Bluesky-style NeXus files.
         - Otherwise (``_master.h5`` etc.):
             1. **Persistent fabio handle (primary)** — ``fabio.EigerImage``
                is purpose-built for Eiger master files and handles all
                firmware variants, external-link layouts (``_data_*.h5``),
                and frame indexing natively.
-            2. **h5py fallback** — if fabio fails, locate the 3D image
-               dataset via ``find_nexus_image_dataset``.
+            2. **ContainerCursor fallback** — if fabio fails (e.g. a
+               Bluesky ``*_master.h5``), the cursor resolves and reads the
+               stack through the headless h5py path.
+
+        The cursor is created here, read by the prefetch worker, and closed by
+        :meth:`_eiger_close_master` — all on the prefetch owner thread (the same
+        ownership the raw h5py handle used); its ``ReadPlan`` sizes the bulk
+        block and its provider serves per-frame metadata.
         """
         self._eiger_close_master()
         self._eiger_open_state = "opening"
@@ -3075,10 +3089,35 @@ class imageThread(wranglerThread):
                     master_path, e)
                 self._eiger_fabio_handle = None
 
-        # h5py path (primary for .nxs, fallback for .h5/.hdf5 master files)
+        # h5py path (primary for .nxs, fallback for .h5/.hdf5 master files) via
+        # the R2 ContainerCursor — one open handle, created HERE on the prefetch
+        # owner thread, supplies descriptor + frame count + wavelength + the
+        # per-frame metadata provider + all sustained reads (no repeated
+        # per-container traversal).  fabio stays primary for real Eiger above.
         try:
-            ds_path = find_nexus_image_dataset(master_path)
-            if ds_path is None:
+            from xrd_tools.core.staging import source_block_budget_bytes
+            from xrd_tools.sources.cursor import ContainerCursor
+            from xrd_tools.sources.probe import ProbeState
+            from xrd_tools.sources.read_plan import plan_reads
+
+            cursor = ContainerCursor(master_path, entry='entry').open()
+            desc = cursor.descriptor
+            if desc.state is ProbeState.PROCESSED_OUTPUT:
+                # F-NXS-2: a processed xdart output was swept into the raw source
+                # tree.  It carries only integrated results, never a detector
+                # frame, so skip it per file (nframes=0 -> the caller's
+                # retire-and-advance path) instead of re-ingesting an integrated
+                # pattern or ending the stream.
+                cursor.close()
+                logger.info('Skipping processed xdart output (not a raw '
+                            'acquisition): %s', master_path)
+                self._record_skip_reason('processed xdart output')
+                self._eiger_open_state = "processed xdart output"
+                self._eiger_close_master()
+                self._eiger_nframes = 0
+                return
+            if desc.dataset_path is None:
+                cursor.close()
                 log = (logger.debug if getattr(self, "live_mode", False)
                        and getattr(self, "inp_type", None) == "Image Directory"
                        else logger.warning)
@@ -3087,9 +3126,20 @@ class imageThread(wranglerThread):
                 self._eiger_close_master()
                 self._eiger_nframes = 0
                 return
-            self._eiger_h5_handle = h5py.File(master_path, 'r')
-            self._eiger_h5_dataset = self._eiger_h5_handle[ds_path]
-            self._eiger_nframes = self._h5_stack_nframes(self._eiger_h5_dataset)
+            self._eiger_cursor = cursor
+            self._eiger_nframes = cursor.frame_count
+            # Layout-aware, byte-bounded block plan (retires the fixed-16 block).
+            self._eiger_read_plan = plan_reads(
+                desc.frame_count, desc.frame_shape, desc.dtype, desc.chunks,
+                source_block_budget_bytes(), two_d=desc.is_2d)
+            # Materialize the metadata provider WHILE the handle is open (this
+            # thread), so later per-frame scan_info reopens no master.
+            self._eiger_provider = cursor.metadata_provider()
+            try:
+                self._eiger_provider.scan_table()
+            except Exception:
+                logger.debug('provider materialize skipped for %s',
+                             master_path, exc_info=True)
             self._eiger_open_state = "ready"
             self._emit_container_count(master_path, self._eiger_nframes)
         except ProcessedXdartInputError:
@@ -3125,20 +3175,28 @@ class imageThread(wranglerThread):
         return 1 if dset.ndim == 2 else int(dset.shape[0])
 
     def _eiger_close_master(self):
-        """Close persistent Eiger handles (fabio and/or h5py)."""
-        self._eiger_h5_dataset = None
+        """Close the active master's handles (fabio and/or the R2 cursor).
+
+        Called on master-switch and imageless/processed skip (prefetch thread),
+        and once more at run-start/run-end after ``_prefetch_stop_prior`` has
+        confirmed the prefetch worker is dead — the same proven ownership the
+        raw h5py handle used, so no live handle is ever touched across threads.
+        ``ContainerCursor.close()`` is idempotent, so the post-death safety call
+        is a no-op when the worker already closed on switch."""
+        self._eiger_read_plan = None
+        self._eiger_provider = None
         if self._eiger_fabio_handle is not None:
             try:
                 self._eiger_fabio_handle.close()
             except (IOError, OSError) as e:
                 logger.debug("Failed to close fabio handle: %s", e)
             self._eiger_fabio_handle = None
-        if self._eiger_h5_handle is not None:
+        if self._eiger_cursor is not None:
             try:
-                self._eiger_h5_handle.close()
-            except (IOError, OSError) as e:
-                logger.debug("Failed to close h5py handle: %s", e)
-            self._eiger_h5_handle = None
+                self._eiger_cursor.close()
+            except Exception as e:
+                logger.debug("Failed to close Eiger cursor: %s", e)
+            self._eiger_cursor = None
 
     def _read_eiger_metadata(self, master_path):
         """Read per-master metadata once, returning a per-frame copy."""
@@ -3250,10 +3308,32 @@ class imageThread(wranglerThread):
         is a Bluesky ``.nxs``.  For any other source this is exactly
         :meth:`_read_eiger_metadata` (frame_idx ignored)."""
         base = self._read_eiger_metadata(master_path)
-        row = self._bluesky_frame_row(master_path, frame_idx)
+        row = self._bluesky_row(master_path, frame_idx)
         if row:
             base.update(row)
         return base
+
+    def _bluesky_row(self, master_path, frame_idx):
+        """Per-frame Bluesky motor+counter row for *master_path*.
+
+        Prefers the SUSTAINED cursor's MATERIALIZED metadata provider when
+        *master_path* is the master the cursor is open on — the R2 collapse of
+        the repeated per-container traversal, served from the one open handle
+        with no per-frame reopen.  Falls back to the legacy per-master cached
+        reader for the fabio-primary Eiger path (no cursor) or any other master
+        (and for duck-typed test hosts with no cursor)."""
+        provider = getattr(self, '_eiger_provider', None)
+        current = getattr(self, '_eiger_master_path', None)
+        if (provider is not None and current is not None
+                and os.path.abspath(str(master_path))
+                == os.path.abspath(str(current))):
+            try:
+                return dict(provider.metadata_for(frame_idx))
+            except Exception:
+                logger.debug('cursor provider metadata_for failed for %s',
+                             master_path, exc_info=True)
+                return {}
+        return self._bluesky_frame_row(master_path, frame_idx)
 
     def _stamp_bluesky_wavelength(self, scan):
         """Record a Bluesky/NXWriter source's embedded wavelength on *scan* as a
@@ -3581,11 +3661,16 @@ class imageThread(wranglerThread):
                 while (not stop_evt.is_set()
                        and self.command != 'stop'
                        and self._eiger_fabio_handle is None
-                       and self._eiger_h5_dataset is not None
+                       and self._eiger_cursor is not None
                        and self._eiger_frame_idx < self._eiger_nframes):
 
                     start = self._eiger_frame_idx
-                    end = min(start + _PREFETCH_READ_CHUNK, self._eiger_nframes)
+                    # R2: the layout-aware ReadPlan sizes the bulk window
+                    # (byte-bounded, native-chunk-aligned) instead of the fixed
+                    # 16-frame block — bounding the prefetch's retained memory.
+                    plan = self._eiger_read_plan
+                    block_frames = plan.block_frames if plan is not None else 1
+                    end = min(start + max(1, block_frames), self._eiger_nframes)
                     scan_name = self._eiger_scan_name(self._eiger_master_path)
 
                     # Advance the shared frame cursor *before* dispatching so
@@ -3613,8 +3698,10 @@ class imageThread(wranglerThread):
                     for group_start, group_end in groups:
                         _t_blk = time.time()
                         try:
+                            # Native-dtype owner block via the sustained cursor.
                             block = np.asarray(
-                                self._eiger_h5_dataset[group_start:group_end])
+                                self._eiger_cursor.read_block(
+                                    group_start, group_end).array)
                         except Exception as e:
                             logger.warning(
                                 'Bulk read failed (start=%d end=%d): %s; '
@@ -3739,12 +3826,11 @@ class imageThread(wranglerThread):
                     _raw = (self._eiger_fabio_handle.data if frame_idx == 0
                             else self._eiger_fabio_handle.get_frame(frame_idx).data)
                     return np.asarray(_raw)
-                if self._eiger_h5_dataset is not None:
-                    if self._eiger_h5_dataset.ndim == 2:
-                        # F6: the lone 2-D dataset IS frame 0 (never index a
-                        # row out of a single-exposure frame).
-                        return np.asarray(self._eiger_h5_dataset[()])
-                    return np.asarray(self._eiger_h5_dataset[frame_idx])
+                if self._eiger_cursor is not None:
+                    # F6: the cursor maps a lone 2-D dataset to frame 0 (never
+                    # indexes a row out of a single-exposure frame).
+                    idx = 0 if self._eiger_cursor.is_2d else frame_idx
+                    return np.asarray(self._eiger_cursor.read_frame(idx))
                 with fabio.open(self._eiger_master_path) as _img:
                     _raw = (_img.data if frame_idx == 0
                             else _img.get_frame(frame_idx).data)
@@ -3770,9 +3856,11 @@ class imageThread(wranglerThread):
                 self._eiger_fabio_handle.close()
                 self._eiger_fabio_handle = fabio.open(self._eiger_master_path)
                 self._eiger_nframes = self._eiger_fabio_handle.nframes
-            elif self._eiger_h5_dataset is not None:
-                self._eiger_h5_dataset.id.refresh()
-                self._eiger_nframes = self._h5_stack_nframes(self._eiger_h5_dataset)
+            elif self._eiger_cursor is not None:
+                # The R2 cursor is a FINALIZED-container handle (the pop defers
+                # unfinalized masters), so its frame count is stable — no SWMR
+                # growth tracking is introduced.  Re-read it defensively.
+                self._eiger_nframes = self._eiger_cursor.frame_count
         except Exception as e:
             logger.debug("Failed to refresh Eiger handle for %s: %s",
                          getattr(self, "_eiger_master_path", None), e)
@@ -3821,12 +3909,14 @@ class imageThread(wranglerThread):
                     except (IOError, OSError) as e:
                         logger.debug("Failed to reopen fabio handle for %s: %s", self._eiger_master_path, e)
                         self._eiger_nframes = self._get_nframes(self._eiger_master_path)
-                elif self._eiger_h5_dataset is not None:
+                elif self._eiger_cursor is not None:
+                    # Finalized-container cursor: a stable frame count (no SWMR
+                    # growth tracking).  Re-read defensively; fall back to a
+                    # fresh count only if the cursor is unexpectedly unusable.
                     try:
-                        self._eiger_h5_dataset.id.refresh()
-                        self._eiger_nframes = self._h5_stack_nframes(self._eiger_h5_dataset)
-                    except (IOError, OSError, KeyError) as e:
-                        logger.debug("Failed to refresh h5 dataset for %s: %s", self._eiger_master_path, e)
+                        self._eiger_nframes = self._eiger_cursor.frame_count
+                    except Exception as e:
+                        logger.debug("Failed to read cursor frame count for %s: %s", self._eiger_master_path, e)
                         self._eiger_nframes = self._get_nframes(self._eiger_master_path)
                 else:
                     self._eiger_nframes = self._get_nframes(self._eiger_master_path)

@@ -891,3 +891,82 @@ def test_real_thread_per_frame_and_wavelength():
     )
     worker._stamp_bluesky_wavelength(scan)
     assert scan.mg_args["wavelength"] == pytest.approx(1.033201653610002e-10, rel=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# R2 — production-wired ContainerCursor read path (through the REAL thread)
+# ---------------------------------------------------------------------------
+
+def test_r2_cursor_backed_read_one_open_native_dtype_and_provider(tmp_path, monkeypatch):
+    """One sustained ContainerCursor supplies frame count + ReadPlan + provider +
+    native-dtype reads with no per-frame master reopen; it closes on drain."""
+    import h5py
+
+    watch = tmp_path / "watch"; watch.mkdir()
+    out = tmp_path / "out"; out.mkdir()
+    p = watch / "cur_00001.nxs"
+    _write_bluesky_nxwriter(p, n=NFRAMES)
+
+    opens = []
+    orig = h5py.File.__init__
+
+    def counting(self, name, *a, **k):
+        opens.append(os.path.abspath(str(name)))
+        return orig(self, name, *a, **k)
+
+    monkeypatch.setattr(h5py.File, "__init__", counting)
+
+    t = _real_dir_watch_thread(watch, out)
+    frames = []
+    for _ in range(NFRAMES + 3):
+        item = t._get_next_eiger_frame_sync()
+        if item[3] is None:
+            break
+        # the cursor + read plan are live while the master is being read
+        assert t._eiger_cursor is not None
+        assert t._eiger_read_plan is not None and t._eiger_read_plan.block_frames >= 1
+        frames.append(item)
+
+    assert [f[2] for f in frames] == list(range(1, NFRAMES + 1))
+    # native detector dtype preserved end-to-end (no float64 upcast in source)
+    assert all(f[3].dtype == np.uint32 for f in frames)
+    # per-frame Bluesky metadata served from the cursor's materialized provider
+    assert all("i0" in f[4] for f in frames)
+
+    # the sustained cursor collapses the repeated traversal: the master is opened
+    # at most twice (pop-time readiness probe + one consumption cursor), NEVER
+    # once per frame.
+    master_opens = opens.count(os.path.abspath(str(p)))
+    assert master_opens <= 2, f"expected <=2 master opens, got {master_opens}"
+
+    # fully drained -> the sync reader retired + closed the cursor
+    assert t._eiger_cursor is None
+
+
+def test_r2_cursor_closed_on_stop_and_clean_rerun(tmp_path):
+    """Stop closes the sustained cursor; an immediate rerun reads fresh with no
+    stale cursor/handle."""
+    watch = tmp_path / "watch"; watch.mkdir()
+    out = tmp_path / "out"; out.mkdir()
+    _write_bluesky_nxwriter(watch / "s_00001.nxs", n=NFRAMES)
+
+    t = _real_dir_watch_thread(watch, out)
+    item = t._get_next_eiger_frame_sync()
+    assert item[3] is not None
+    cursor = t._eiger_cursor
+    assert cursor is not None and cursor.closed is False
+
+    # Stop closes the active master (prefetch owner thread's close path)
+    t.command = "stop"
+    t._eiger_close_master()
+    assert t._eiger_cursor is None
+    assert cursor.closed is True
+
+    # immediate rerun: fresh read, no stale-handle error
+    t.command = "start"
+    t._eiger_master_path = None
+    t._eiger_frame_idx = 0
+    item2 = t._get_next_eiger_frame_sync()
+    assert item2[3] is not None
+    assert t._eiger_cursor is not None
+    assert t._eiger_cursor is not cursor  # a NEW cursor, not the stopped one
