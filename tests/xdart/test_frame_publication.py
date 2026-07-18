@@ -294,7 +294,8 @@ def test_get_or_hydrate_uses_registered_hydrator():
 
     def hydrator(label):
         calls.append(label)
-        return publication_from_live_frame(DuckFrame(idx=int(label)))
+        return publication_from_live_frame(
+            DuckFrame(idx=int(label)), include_raw=True)
 
     store.set_hydrator(hydrator)
     fresh = store.get_or_hydrate(5)
@@ -303,9 +304,10 @@ def test_get_or_hydrate_uses_registered_hydrator():
     # a hydrated publication short-circuits (bounds permitting)
     store2 = PublicationStore()
     store2.set_hydrator(hydrator)
-    store2.upsert(publication_from_live_frame(DuckFrame(idx=6)))
+    store2.upsert(publication_from_live_frame(
+        DuckFrame(idx=6), include_raw=True))
     calls.clear()
-    assert store2.get_or_hydrate(6).view.has_1d
+    assert store2.get_or_hydrate(6).view.raw is not None
     assert calls == []                            # no needless reload
 
 

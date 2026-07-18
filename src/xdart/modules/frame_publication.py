@@ -397,16 +397,17 @@ def _view_has_data_arrays(view: FrameView) -> bool:
 
 
 def publication_raw_recoverable(publication: FramePublication) -> bool:
-    """True when the FULL raw is absent but lazily recoverable from source.
+    """True when the FULL raw is absent but can be made view-resident.
 
     PF-1e: an old Append row may carry only a valid ``source`` reference — no
     stored thumbnail (``raw_status`` ``"missing"``/``"unknown"``).  A live
-    publication can also retain its lightweight ``LiveFrame`` as ``raw_ref``
-    after ``free_raw`` has released ``raw_ref.map_raw``.  The reference object
-    is not itself a resident raw payload; both states remain recoverable on
-    demand through the registered hydrator's lazy source fallback (the same
-    ``load_processed_raw_or_thumbnail`` route the headless readers use).
-    Thumbnail backfill stays optional.
+    publication can also borrow pixels from its mutable ``LiveFrame`` through
+    ``raw_ref.map_raw`` while its immutable view still has ``raw=None``.  That
+    borrowed array can be released by the live-memory bound between eligibility
+    and render, so it must be promoted into the view just like a source-only
+    row.  If it was already released, the registered hydrator falls back to the
+    same lazy source route used by the headless readers.  Thumbnail backfill
+    stays optional.
     """
     view = publication.view
     raw_ref = publication.raw_ref
@@ -422,8 +423,7 @@ def publication_raw_recoverable(publication: FramePublication) -> bool:
     )
     return (
         view.raw is None
-        and raw_ref_value is None
-        and bool(source_path)
+        and (raw_ref_value is not None or bool(source_path))
     )
 
 

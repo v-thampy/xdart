@@ -150,6 +150,59 @@ def test_live_publication_with_retained_empty_raw_ref_hydrates_source(tmp_path):
     assert _scored_full_resident(hydrated.view)
 
 
+def test_live_publication_snapshots_resident_raw_before_raw_ref_release(tmp_path):
+    """A live publication may borrow raw pixels through ``raw_ref`` while its
+    immutable view still has ``raw=None``.  That borrowed array can be released
+    by the live-memory bound at any time, so it must not suppress full-purpose
+    hydration.  Hydration snapshots the array into the published view before
+    the mutable ``LiveFrame`` is freed.
+
+    This is the intermittent cake-present/raw-blank shape seen after an Int 2D
+    Append: eligibility observes a populated ``raw_ref.map_raw``, then the live
+    frame is thinned before the selected publication is rendered.
+    """
+    from xdart.gui.tabs.static_scan.display_data import DisplayDataMixin
+    from xdart.modules.ewald import LiveScan
+    from xdart.modules.frame_publication import (
+        PublicationStore,
+        publication_from_live_frame,
+    )
+
+    nxs = _completed_target(tmp_path)
+    scan = LiveScan(data_file=nxs)
+    scan.load_from_h5()
+    live_frame = scan.frames[3]
+    assert live_frame.map_raw is None
+    live_frame._lazy_load_raw()
+    expected = np.asarray(live_frame.map_raw).copy()
+
+    publication = publication_from_live_frame(live_frame, include_raw=False)
+    assert publication.raw_ref is live_frame
+    assert publication.raw_ref.map_raw is not None
+    assert publication.view.raw is None
+
+    class _Host(DisplayDataMixin):
+        def __init__(self, scan, store):
+            self.scan = scan
+            self.publication_store = store
+            self._processing_active = False
+
+    store = PublicationStore()
+    host = _Host(scan, store)
+    store.set_hydrator(host._rehydrate_publication)
+    store.upsert(publication)
+
+    hydrated = store.get_or_hydrate(3)
+    assert hydrated is not None
+    assert hydrated.view.raw is not None, (
+        "borrowed live raw must be promoted into the immutable publication view"
+    )
+    assert live_frame.free_raw()
+    assert live_frame.map_raw is None
+    np.testing.assert_array_equal(np.asarray(hydrated.view.raw), expected)
+    assert _scored_full_resident(hydrated.view)
+
+
 def test_fix_gates_on_source_recoverability(tmp_path, monkeypatch):
     """Fail-before pin: with the PF-1e eligibility removed (the 121bc438
     predicate), the worker route returns the light item un-hydrated and the
