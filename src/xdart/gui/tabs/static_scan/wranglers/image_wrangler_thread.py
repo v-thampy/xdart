@@ -129,7 +129,6 @@ from xrd_tools.session.readiness import (
 from xrd_tools.sources.image import ImageFileSource, TiffSeriesSource
 from xrd_tools.io.image import read_image, count_frames
 from xrd_tools.io.export import write_xye
-from xrd_tools.io.nexus import find_nexus_image_dataset
 from xrd_tools.io.output_safety import (
     OutputCollisionError,
     check_output_not_source,
