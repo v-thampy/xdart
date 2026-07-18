@@ -5254,6 +5254,10 @@ class staticWidget(QWidget):
                     generation=self.publication_store.generation,
                     active_mode_1d=active_1d,
                     active_mode_2d=active_2d,
+                    # map_raw is already resident here. Publishing the same
+                    # ndarray reference avoids a needless HDF5 hydration pass;
+                    # bounded-store eviction releases both references together.
+                    include_raw=True,
                 )
                 if not skip_2d and publication_has_2d_errors(publication):
                     logger.warning(

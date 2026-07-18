@@ -55,9 +55,8 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
     dedupe.  ``stop()`` drains and joins; safe to call once at teardown.
 
     ``store`` may also be a zero-arg provider returning one store or an iterable
-    of stores.  The live app uses that to hydrate the authoritative
-    ``FrameRecordStore`` first while the transitional ``PublicationStore`` still
-    exists as a fallback projection.
+    of stores.  Stores may expose ``hydration_purposes`` so a raw-preview request
+    does not wake an integrated-results-only disk hydrator.
     """
 
     #: (label, generation) — label echoes the request; generation gates staleness.
@@ -203,9 +202,16 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
         self._discard_locked(request)
         return list(request.labels), request.generation, request.purpose, request.consumer
 
-    def _hydrate_full(self, label) -> bool:
+    @staticmethod
+    def _store_supports_purpose(store, purpose: str) -> bool:
+        purposes = getattr(store, "hydration_purposes", None)
+        return purposes is None or purpose in purposes
+
+    def _hydrate_full(self, label, purpose: str) -> bool:
         hydrated = False
         for store in self._stores():
+            if not self._store_supports_purpose(store, purpose):
+                continue
             getter = getattr(store, "get_or_hydrate", None)
             if getter is None:
                 continue
@@ -265,7 +271,7 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
             else:
                 success = False
                 for label in labels:
-                    success = self._hydrate_full(label) or success
+                    success = self._hydrate_full(label, purpose) or success
             # The GUI handler still re-checks generation == the live
             # display_generation (a change that landed during the read). Emit
             # even when hydration failed so GUI-side pending dedupe can clear the

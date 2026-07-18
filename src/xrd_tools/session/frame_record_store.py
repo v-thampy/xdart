@@ -164,6 +164,10 @@ class FrameRecordStore:
     flushed frames.
     """
 
+    # The registered disk hydrator reads integrated results from the processed
+    # container. Detector raw pixels belong to PublicationStore/source fallback.
+    hydration_purposes = frozenset({"1d", "2d", "record"})
+
     def __init__(
         self,
         *,

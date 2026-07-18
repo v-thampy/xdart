@@ -1481,6 +1481,9 @@ def test_drain_pending_frames_builds_store_and_scan_data():
 
     assert host._pending_frames == {}                     # drained
     assert len(store) == 3                                # all built + upserted
+    assert all(
+        store.get(idx).view.raw is frames[idx].map_raw for idx in frames
+    ), "live drain must publish resident raw without background HDF5 hydration"
     assert list(host.scan.scan_data.index) == [0, 1, 2]
     assert list(host.scan.scan_data["temp"]) == [0.0, 10.0, 20.0]
 

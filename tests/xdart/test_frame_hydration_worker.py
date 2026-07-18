@@ -304,6 +304,43 @@ def test_worker_hydrates_each_store_from_provider(qapp):
     assert calls == [("record", 4), ("publication", 4)]
 
 
+def test_full_raw_request_skips_store_without_raw_hydration_capability(qapp):
+    """A full/raw preview request must not wake the authoritative record-store
+    hydrator: that hydrator rereads integrated 1D/2D from the processed HDF5
+    file and cannot supply detector raw.  The publication store owns this tier.
+
+    The live crash signature had the worker inside ``read_frame_view`` while the
+    GUI was repainting after post-live.  Calling both stores for every purpose
+    made that HDF5 read unnecessary as well as unsafe at this boundary.
+    """
+    calls = []
+    done = threading.Event()
+
+    class RecordStore:
+        hydration_purposes = frozenset({"1d", "2d", "record"})
+
+        def get_or_hydrate(self, label):
+            calls.append(("record", label))
+            return {"label": label}
+
+    class PublicationStore:
+        def get_or_hydrate(self, label):
+            calls.append(("publication", label))
+            return {"label": label}
+
+    worker = FrameHydrationWorker(
+        lambda: (RecordStore(), PublicationStore()))
+    worker.sigHydrated.connect(lambda _label, _gen: done.set(), _DIRECT)
+    worker.start()
+    try:
+        worker.request(148, 1, purpose="full")
+        assert done.wait(5.0)
+    finally:
+        worker.stop()
+
+    assert calls == [("publication", 148)]
+
+
 def test_request_after_stop_is_a_noop(qapp):
     class FakeStore:
         def get_or_hydrate(self, label):
@@ -363,7 +400,7 @@ def test_record_store_rehydrates_evicted_frame_on_worker_thread(qapp, tmp_path):
     worker.sigHydrated.connect(lambda label, gen: done.set(), _DIRECT)
     worker.start()
     try:
-        worker.request(1, 1)
+        worker.request(1, 1, purpose="2d")
         assert done.wait(5.0), "record-store hydration did not finish"
     finally:
         worker.stop()
