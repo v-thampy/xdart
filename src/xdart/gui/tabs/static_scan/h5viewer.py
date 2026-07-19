@@ -991,12 +991,15 @@ class H5Viewer(QWidget):
     def _date_sort_mtime(self, entry):
         """Effective Date-sort timestamp for one browser entry.
 
-        Files use their own mtime. Directories use the newest mtime among the
-        directory and its immediate children, which matches the operator's
+        Files use their own mtime. Nonempty directories use the newest mtime
+        among their immediate children, which matches the operator's
         expectation for scan/XYE output folders without recursively walking a
-        potentially huge tree or network share. Repeated live refreshes use a
-        short bounded cache; a structural directory change invalidates its
-        entry immediately and the Refresh button clears all entries.
+        potentially huge tree or network share. The directory's own mtime is
+        only an empty/unreadable fallback and a cache-invalidation stamp, so a
+        recently created folder cannot outweigh its contents. Repeated live
+        refreshes use a short bounded cache; a structural directory change
+        invalidates its entry immediately and the Refresh button clears all
+        entries.
         """
         try:
             # Match the browser's existing display semantics: a top-level
@@ -1019,7 +1022,7 @@ class H5Viewer(QWidget):
                     and now - checked_at < self._DATE_SORT_CACHE_TTL_S):
                 return effective_mtime_ns
 
-        effective_mtime_ns = own_mtime_ns
+        effective_mtime_ns = None
         try:
             with os.scandir(entry.path) as children:
                 for child in children:
@@ -1028,12 +1031,18 @@ class H5Viewer(QWidget):
                             child.stat(follow_symlinks=False).st_mtime_ns)
                     except OSError:
                         continue
-                    effective_mtime_ns = max(
-                        effective_mtime_ns, child_mtime_ns)
+                    if effective_mtime_ns is None:
+                        effective_mtime_ns = child_mtime_ns
+                    else:
+                        effective_mtime_ns = max(
+                            effective_mtime_ns, child_mtime_ns)
         except OSError:
             # A transiently unreadable directory still has its own useful
             # timestamp. Do not cache the partial observation.
             return own_mtime_ns
+
+        if effective_mtime_ns is None:
+            effective_mtime_ns = own_mtime_ns
 
         if len(self._date_sort_dir_cache) >= self._DATE_SORT_CACHE_MAX:
             self._date_sort_dir_cache.pop(

@@ -3506,8 +3506,9 @@ def test_date_sort_uses_newest_immediate_child_for_directories(
     old_child.write_text("old")
     new_child.write_text("new")
 
-    # Directory mtimes say scan_2 is newer; child mtimes say scan_10 is newer.
-    os.utime(older_contents, (4000, 4000))
+    # Directory mtimes say scan_2 is newest by far; only child mtimes should
+    # determine the order for these nonempty folders.
+    os.utime(older_contents, (9000, 9000))
     os.utime(newer_contents, (2000, 2000))
     os.utime(old_child, (1000, 1000))
     os.utime(new_child, (5000, 5000))
