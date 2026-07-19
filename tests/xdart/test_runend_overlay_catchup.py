@@ -645,3 +645,114 @@ def test_catchup_rearms_while_busy_then_gives_up(qapp):
     staticWidget._runend_overlay_catchup(host)
     assert calls == []
     assert host._runend_catchup_token is None
+
+
+ALIAS_N = 651
+ALIAS_TAIL = 19          # non-resident cadence-shaped tail (on disk only)
+
+
+@pytest.fixture(scope="module")
+def alias_651_nxs(tmp_path_factory):
+    """A real 651-frame .nxs with the CANONICAL output name (production
+    writer), for the Eiger ``_master`` alias run-end case (H18-R8)."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    scan = _DuckScan([_DuckFrame(i) for i in range(1, ALIAS_N + 1)])
+    path = tmp_path_factory.mktemp("alias651") / f"{SCAN_NAME}.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+    return path
+
+
+def _canonical_key(name):
+    from xdart.gui.tabs.static_scan.static_scan_widget import (
+        _scan_key_from_source,
+    )
+    return _scan_key_from_source(str(name)) or str(name)
+
+
+def _decoded_canonical(w):
+    target = _canonical_key(SCAN_NAME)
+    return {frame_index_from_qualified_id(r) for r in _history_ids(w)
+            if _canonical_key(scan_key_from_qualified_id(r)) == target}
+
+
+def test_eiger_master_alias_arms_and_completes_651_frames(
+        qapp, widget, monkeypatch, alias_651_nxs, caplog):
+    """H18-R8: the widget owner retains the pre-canonical ``*_master`` scan
+    spelling while the worker/output canonicalized it — run ownership must
+    resolve through the canonical run identity, shared finalization and the
+    one-shot catch-up must still run exactly once, and catch-up completion is
+    an IDENTITY outcome: the accumulator's scan-qualified set equals the
+    authoritative finished frame index (651/651, no reset), through the
+    normal coalescing path."""
+    w = widget
+    _publish_head(w, ALIAS_N - ALIAS_TAIL)
+    _wire_live_run_end(w, monkeypatch, alias_651_nxs)
+    # THE ALIAS: widget owner keeps the pre-canonical Eiger spelling.
+    w.scan.name = f"{SCAN_NAME}_master"
+    caplog.set_level(logging.INFO)
+
+    # H18-R8(b) preface: a mid-run PROGRAMMATIC crop (mode projection /
+    # cadence render) — NOT a genuine user zoom — must not survive run end.
+    plot = w.displayframe._active_bottom_plot()
+    if plot is not None:
+        try:
+            plot.setRange(xRange=(0.0, 3.0), padding=0)   # disables auto-range
+        except Exception:
+            plot = None
+
+    w.wrangler_finished()
+
+    assert w._runend_catchup_token is not None, \
+        "the aliased owner must still arm the run-end catch-up (H18-R8)"
+    arms = [r for r in caplog.records
+            if "run-end overlay catch-up: armed" in r.getMessage()]
+    assert len(arms) == 1
+
+    expected = {int(i) for i in w.scan.frames.index}
+    assert expected == set(range(1, ALIAS_N + 1))
+    counts = []
+    deadline = time.monotonic() + 25.0
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.02)
+        counts.append(len(_history_ids(w)))
+        if (w._runend_catchup_token is None and _quiet(w)
+                and _decoded_canonical(w) == expected):
+            break
+    settle = time.monotonic() + 0.6
+    while time.monotonic() < settle:
+        qapp.processEvents()
+        time.sleep(0.02)
+        counts.append(len(_history_ids(w)))
+
+    assert w._runend_catchup_token is None, "catch-up never fired/consumed"
+    missing = expected - _decoded_canonical(w)
+    assert not missing, (
+        f"accumulator identity short of the finished index: "
+        f"{len(missing)} missing (e.g. {sorted(missing)[:8]})")
+    assert all(b >= a for a, b in zip(counts, counts[1:])), \
+        f"accumulator shrank after arming (reset): {counts}"
+    fires = [r for r in caplog.records if "-> show_all()" in r.getMessage()]
+    assert len(fires) <= 1, "catch-up must fire at most once"
+
+    # H18-R8(b): full-history auto-fit after the automatic run-end reseed —
+    # no genuine user zoom was recorded, so the programmatic crop must not
+    # persist (auto-range re-armed on the active bottom plot).
+    if plot is not None:
+        auto = plot.getViewBox().autoRangeEnabled()
+        assert auto[0] or auto[1], \
+            "run-end reseed must auto-fit unless a genuine user zoom is recorded"
+
+
+def test_runend_autofit_respects_genuine_user_zoom(qapp, widget):
+    """H18-R8(b) negative: a recorded genuine user zoom is preserved."""
+    w = widget
+    w.displayframe._wf_user_zoomed = True
+    plot = w.displayframe._active_bottom_plot()
+    if plot is None:
+        pytest.skip("no active bottom plot in this configuration")
+    plot.setRange(xRange=(1.0, 2.0), padding=0)
+    staticWidget._runend_waterfall_autofit(w)
+    auto = plot.getViewBox().autoRangeEnabled()
+    assert auto[0] is False, \
+        "a genuine user zoom must survive the run-end auto-fit (x stays pinned)"

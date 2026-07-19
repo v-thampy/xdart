@@ -6128,6 +6128,82 @@ class staticWidget(QWidget):
         )
         return True
 
+    def _owns_finished_run(self) -> bool:
+        """H18-R8: run ownership by CANONICAL run identity, never display
+        filename spelling.  Eiger ``*_master.h5`` processing canonicalizes
+        the worker/output name by stripping ``_master`` while the widget
+        owner can retain the pre-canonical spelling; the literal name
+        comparison then skipped shared finalization AND the run-end overlay
+        catch-up for the run's own display (the 651-frame waterfall that
+        ended at 635 identities).  Compare through the one canonical
+        ``scan_name_from_source`` (the same identity run-end reconciliation
+        and scan-qualified rows use) so legitimate aliases still own their
+        finish exactly once."""
+        scan_name = str(getattr(getattr(self, "scan", None), "name", "") or "")
+        wrangler_name = str(getattr(self.wrangler, "scan_name", "") or "")
+        if scan_name == wrangler_name:
+            return True
+        if not scan_name or not wrangler_name:
+            return False
+        return ((_scan_key_from_source(scan_name) or scan_name)
+                == (_scan_key_from_source(wrangler_name) or wrangler_name))
+
+    @staticmethod
+    def _canonical_run_token(name):
+        """Canonical catch-up token (H18-R8): the token must survive a
+        post-arm rename to/from an alias spelling of the SAME run."""
+        if not name:
+            return None
+        return _scan_key_from_source(str(name)) or str(name)
+
+    def _hook_waterfall_zoom_recording(self):
+        """H18-R8(b): record GENUINE user zooms on the active bottom plot
+        (``sigRangeChangedManually`` fires only for mouse/keyboard range
+        changes, never for programmatic ``setRange``), so the run-end
+        auto-fit can distinguish an operator's zoom from a mid-run
+        programmatic crop.  Idempotent."""
+        df = getattr(self, "displayframe", None)
+        if df is None or getattr(df, "_wf_zoom_hooked", False):
+            return
+        try:
+            plot = df._active_bottom_plot()
+            if plot is None:
+                return
+            viewbox = plot.getViewBox()
+            viewbox.sigRangeChangedManually.connect(
+                lambda *_: setattr(df, "_wf_user_zoomed", True))
+            df._wf_zoom_hooked = True
+        except Exception:
+            logger.debug("waterfall zoom hook failed", exc_info=True)
+
+    def _runend_waterfall_autofit(self):
+        """H18-R8(b): full-history auto-fit after the automatic run-end
+        reseed/catch-up UNLESS a genuine user zoom is recorded — a mid-run
+        programmatic crop (mode projection, cadence render) must not leave
+        the finished waterfall viewport stuck at a partial window."""
+        df = getattr(self, "displayframe", None)
+        if df is None or getattr(df, "_wf_user_zoomed", False):
+            return
+        try:
+            plot = df._active_bottom_plot()
+            if plot is None:
+                return
+            plot.autoRange()
+            plot.enableAutoRange()
+        except Exception:
+            logger.debug("run-end waterfall auto-fit failed", exc_info=True)
+
+    def _runend_autofit_when_quiet(self):
+        """Bounded post-catch-up poll: fit once the disk load has settled."""
+        if staticWidget._runend_catchup_busy(self):
+            tries = getattr(self, "_runend_autofit_tries", 0) + 1
+            self._runend_autofit_tries = tries
+            if tries <= 8:
+                QtCore.QTimer.singleShot(
+                    250, lambda: staticWidget._runend_autofit_when_quiet(self))
+            return
+        staticWidget._runend_waterfall_autofit(self)
+
     def _arm_runend_overlay_catchup(self):
         """PERF-3 Option A — one-shot run-end overlay catch-up.
 
@@ -6163,8 +6239,13 @@ class staticWidget(QWidget):
                 getattr(viewer, "auto_last", None), method)
             self._runend_catchup_token = None
             return
-        self._runend_catchup_token = getattr(self.scan, "name", None)
+        # H18-R8: the token is the CANONICAL run identity so a post-arm
+        # rename between alias spellings of the SAME run (e.g. *_master vs
+        # canonical output) cannot false-cancel the catch-up.
+        self._runend_catchup_token = staticWidget._canonical_run_token(
+            getattr(self.scan, "name", None))
         self._runend_catchup_tries = 0
+        staticWidget._hook_waterfall_zoom_recording(self)
         logger.info("[PERF] run-end overlay catch-up: armed (scan=%r)",
                     self._runend_catchup_token)
         QtCore.QTimer.singleShot(
@@ -6216,16 +6297,18 @@ class staticWidget(QWidget):
         # Guard 1 — cancellation (robust; NOT generation-gated, see arm docstring).
         # Abort reasons are logged at INFO (not debug): a run-end no-fire should be
         # visible in the log you're already reading, not hidden behind a flag.
+        current_token = staticWidget._canonical_run_token(
+            getattr(self.scan, "name", None))
         if (viewer is None
                 or not getattr(viewer, "auto_last", False)
-                or self._runend_catchup_token != getattr(self.scan, "name", None)
+                or self._runend_catchup_token != current_token
                 or method not in ("Overlay", "Waterfall")):
             reason = (
                 "no-viewer" if viewer is None
                 else "auto_last-off (user clicked a frame)"
                 if not getattr(viewer, "auto_last", False)
                 else "scan-changed"
-                if self._runend_catchup_token != getattr(self.scan, "name", None)
+                if self._runend_catchup_token != current_token
                 else "mode=%s" % method)
             logger.info("[PERF] run-end overlay catch-up: aborted (%s)", reason)
             self._runend_catchup_token = None
@@ -6250,6 +6333,7 @@ class staticWidget(QWidget):
         if not missing:
             logger.info("[PERF] run-end overlay catch-up: already complete, no-op")
             self._runend_catchup_token = None
+            staticWidget._runend_waterfall_autofit(self)     # H18-R8(b)
             return
         # Guard 4 — fire once.  The click path (show_all) does the rest: select
         # all, split resident/missing, ONE _LoadFramesWorker for the missing tail,
@@ -6263,6 +6347,11 @@ class staticWidget(QWidget):
             self.h5viewer.show_all()
         except Exception:
             logger.debug("run-end overlay catch-up show_all failed", exc_info=True)
+        # H18-R8(b): once the disk load settles, auto-fit the full history
+        # unless a genuine user zoom was recorded.
+        self._runend_autofit_tries = 0
+        QtCore.QTimer.singleShot(
+            250, lambda: staticWidget._runend_autofit_when_quiet(self))
 
     def disable_auto_last(self, q):
         """
@@ -6839,6 +6928,12 @@ class staticWidget(QWidget):
         """
         if self._run_active:
             return
+        # H18-R8(b): a new run opens a fresh genuine-zoom window — zooms
+        # recorded during THIS run survive the run-end auto-fit; older ones
+        # don't pin the next run's finished viewport.
+        df = getattr(self, "displayframe", None)
+        if df is not None:
+            df._wf_user_zoomed = False
         self._run_active = True
         # Frame-driven scan-boundary flag: clear it at run START so the first
         # new_scan of THIS run always clears the panel (fixes a same-name re-run
@@ -8225,7 +8320,7 @@ class staticWidget(QWidget):
         # wrangler finish must preserve Overlay/Waterfall history; only a true
         # reintegration invalidates it.  Skip finalization while reintegration is
         # still running so controls remain locked until its own finished slot.
-        if (self.scan.name == self.wrangler.scan_name
+        if (staticWidget._owns_finished_run(self)
                 and not self.integratorTree.integrator_thread.isRunning()):
             browse_debug_log(
                 logger,
