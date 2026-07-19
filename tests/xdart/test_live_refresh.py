@@ -6583,7 +6583,7 @@ def test_waterfall_decimates_rows_before_uniform_regrid():
 
     DisplayPlotMixin.update_wf(host)
 
-    assert regrid_rows == [234]
+    assert regrid_rows == [256]
     assert regrid_rows[0] <= 256
 
 

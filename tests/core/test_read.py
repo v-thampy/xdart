@@ -729,3 +729,49 @@ def test_scan_data_duplicate_labels_rejected(tmp_path):
 
     with pytest.raises(ValueError, match="duplicate labels"):
         read_scan(p, groups=("1d",))
+
+
+def _provenance_record(path, groups):
+    with h5py.File(path, "w") as handle:
+        entry = handle.create_group("entry")
+        frames = entry.create_group("frames")
+        for name, source_path in groups:
+            source = frames.create_group(name).create_group("source")
+            source.create_dataset("path", data=np.bytes_(str(source_path)))
+            source.create_dataset("frame_index", data=0)
+
+
+def test_resolved_raw_source_handles_unpadded_and_five_digit_labels(tmp_path):
+    from xrd_tools.io.read import resolved_raw_source
+
+    raw_2 = tmp_path / "raw_2.h5"
+    raw_10 = tmp_path / "raw_10.h5"
+    raw_10000 = tmp_path / "raw_10000.h5"
+    for path in (raw_2, raw_10, raw_10000):
+        path.touch()
+    record = tmp_path / "record.nxs"
+    _provenance_record(record, (
+        ("frame_10", raw_10),
+        ("frame_2", raw_2),
+        ("frame_10000", raw_10000),
+    ))
+
+    assert resolved_raw_source(record) == raw_2.resolve()
+    assert resolved_raw_source(record, frame=10) == raw_10.resolve()
+    assert resolved_raw_source(record, frame=10000) == raw_10000.resolve()
+
+
+def test_strong_provenance_rejects_basename_recovery_fallback(tmp_path):
+    from xrd_tools.io.read import resolve_source_master, resolved_raw_source
+
+    decoy = tmp_path / "scan_master.h5"
+    decoy.touch()
+    record = tmp_path / "record.nxs"
+    stored = "missing/tree/scan_master.h5"
+    _provenance_record(record, (("frame_0001", stored),))
+
+    # Pixel recovery remains backward compatible for a moved/flattened tree.
+    assert resolve_source_master(stored, scan_file=record) == decoy.resolve()
+    # Capability identity is stricter: a same-basename decoy cannot authorize
+    # raw-dependent analysis for this processed record.
+    assert resolved_raw_source(record, frame=1) is None

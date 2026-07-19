@@ -40,6 +40,7 @@ from __future__ import annotations
 import logging
 from collections import namedtuple
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Sequence
 
@@ -76,6 +77,9 @@ __all__ = [
     "read_scan_data",
     "open_scan",
     "ProcessedScan",
+    "RawSourceObservation",
+    "observe_resolved_raw_source",
+    "resolved_raw_source",
     "Scan",
 ]
 
@@ -392,6 +396,7 @@ def resolve_source_master(
     scan_file: str | Path,
     source_base: str | None = None,
     source_root: str | Path | None = None,
+    allow_basename_fallbacks: bool = True,
 ) -> "Path | None":
     """Resolve a stored frame ``source/path`` to an EXISTING raw master (N1).
 
@@ -435,13 +440,16 @@ def resolve_source_master(
         for root in (source_root, source_base, scan_dir, scan_dir.parent):
             if root:
                 candidates.append(Path(root).expanduser() / rel_path)
-        # Moved/flattened tree: the raw next to the .nxs, under the .nxs's
-        # project root, or directly under an explicit root, by basename.
-        candidates.append(scan_dir / rel_path.name)
-        candidates.append(scan_dir.parent / rel_path.name)
-        if source_root:
-            candidates.append(Path(source_root).expanduser() / rel_path.name)
-        candidates.append(rel_path)          # cwd-relative, last resort
+        if allow_basename_fallbacks:
+            # Display/back-compat recovery for moved or flattened trees.  This
+            # is deliberately excluded from strong provenance observations:
+            # a same-basename file elsewhere may help a user recover pixels,
+            # but cannot authorize ROI controls for a processed record.
+            candidates.append(scan_dir / rel_path.name)
+            candidates.append(scan_dir.parent / rel_path.name)
+            if source_root:
+                candidates.append(Path(source_root).expanduser() / rel_path.name)
+            candidates.append(rel_path)          # cwd-relative, last resort
 
     seen: set[Path] = set()
     for cand in candidates:
@@ -460,13 +468,22 @@ def resolve_source_master(
 _OUTSIDE_ROOT_WARNED: set = set()    # (source_dir, root) pairs already warned
 
 
-def resolved_raw_source(
+@dataclass(frozen=True)
+class RawSourceObservation:
+    """Typed, pixel-free processed-record provenance observation."""
+
+    source: Path | None
+    definitive: bool
+    detail: str = ""
+
+
+def observe_resolved_raw_source(
     scan_file,
     frame: int | None = None,
     *,
     entry: str = "entry",
     source_root=None,
-):
+) -> RawSourceObservation:
     """Resolve one frame's stored raw-source provenance WITHOUT loading pixels.
 
     H18-R9: record identity for capability decisions — returns the absolute
@@ -481,35 +498,52 @@ def resolved_raw_source(
     label stays an exact lookup and fails closed when that label has no
     stored source.
     """
+    from xrd_tools.sources.probe import TRANSIENT_PROBE_ERRORS
+
     scan_file = Path(scan_file)
     try:
         with h5py.File(scan_file, "r") as f:
             entry_grp = _entry(f, entry)
-            label = frame
-            if label is None:
-                frames_grp = entry_grp.get("frames")
-                if not isinstance(frames_grp, h5py.Group):
-                    return None
-                for name in sorted(frames_grp):
-                    if not name.startswith("frame_"):
-                        continue
-                    group = frames_grp.get(name)
-                    if not isinstance(group, h5py.Group) or "source" not in group:
-                        continue
-                    try:
-                        label = int(name.rsplit("_", 1)[-1])
-                    except ValueError:
-                        continue
-                    break
-                if label is None:
-                    return None
-            master, _idx, _thumb = _raw_frame_parts_from_entry(
-                scan_file, entry_grp, int(label), scan=None,
+            if frame is None:
+                frame_group = _first_source_frame_group(entry_grp)
+            else:
+                frame_group = _frame_group_for_label(entry_grp, int(frame))
+            if frame_group is None:
+                return RawSourceObservation(None, True, "no source frame")
+            master, _idx, _thumb = _raw_frame_parts_from_group(
+                scan_file,
+                entry_grp,
+                frame_group,
                 source_root=source_root,
+                allow_basename_fallbacks=False,
             )
-    except Exception:
-        return None
-    return master
+    except TRANSIENT_PROBE_ERRORS as exc:
+        return RawSourceObservation(
+            None, False, f"transient provenance read error: {exc}")
+    except Exception as exc:
+        return RawSourceObservation(None, True, f"provenance unavailable: {exc}")
+    return RawSourceObservation(master, True, "resolved provenance")
+
+
+def resolved_raw_source(
+    scan_file,
+    frame: int | None = None,
+    *,
+    entry: str = "entry",
+    source_root=None,
+):
+    """Return strict stored raw provenance, or ``None``.
+
+    Unlike pixel-loading recovery, this identity accessor never uses basename
+    or cwd fallbacks.  Use :func:`observe_resolved_raw_source` when transient
+    sharing failures must be retried instead of collapsed to ``None``.
+    """
+    return observe_resolved_raw_source(
+        scan_file,
+        frame,
+        entry=entry,
+        source_root=source_root,
+    ).source
 
 
 def relative_source_path(src, root=None) -> str:
@@ -638,21 +672,94 @@ def _raw_frame_parts_from_entry(
     ``None`` is the flat single-scan record (``frames/frame_NNNN``).
     """
 
+    frame_group = _frame_group_for_label(entry_group, frame, scan=scan)
+    if frame_group is None:
+        raise KeyError(
+            f"No frame group for frame {frame}"
+            f"{f' (scan {scan})' if scan is not None else ''} in {scan_file}")
+    return _raw_frame_parts_from_group(
+        scan_file,
+        entry_group,
+        frame_group,
+        source_root=source_root,
+    )
+
+
+def _frame_group_for_label(
+    entry_group: h5py.Group,
+    frame: int,
+    *,
+    scan: str | int | None = None,
+) -> h5py.Group | None:
+    """Resolve a stored frame label without assuming zero-padding width."""
+    from xrd_tools.io.nexus_record import frame_record_key  # noqa: PLC0415
+
+    frames = entry_group.get("frames")
+    if not isinstance(frames, h5py.Group):
+        return None
+    parent = frames
+    if scan is not None:
+        parent = frames.get(f"scan_{scan}")
+        if not isinstance(parent, h5py.Group):
+            return None
+    expected = frame_record_key(None, frame)
+    direct = parent.get(expected)
+    if isinstance(direct, h5py.Group):
+        return direct
+    matches = []
+    for name in parent:
+        if not name.startswith("frame_"):
+            continue
+        try:
+            if int(name.removeprefix("frame_")) == int(frame):
+                matches.append(name)
+        except ValueError:
+            continue
+    if len(matches) != 1:
+        return None
+    group = parent.get(matches[0])
+    return group if isinstance(group, h5py.Group) else None
+
+
+def _first_source_frame_group(entry_group: h5py.Group) -> h5py.Group | None:
+    """First source-bearing flat frame group in numeric label order."""
+    frames = entry_group.get("frames")
+    if not isinstance(frames, h5py.Group):
+        return None
+    candidates = []
+    for name in frames:
+        if not name.startswith("frame_"):
+            continue
+        group = frames.get(name)
+        if not isinstance(group, h5py.Group) or "source" not in group:
+            continue
+        try:
+            label = int(name.removeprefix("frame_"))
+        except ValueError:
+            continue
+        candidates.append((label, name, group))
+    return min(candidates, key=lambda item: (item[0], item[1]))[2] \
+        if candidates else None
+
+
+def _raw_frame_parts_from_group(
+    scan_file: Path,
+    entry_group: h5py.Group,
+    frame_group: h5py.Group,
+    *,
+    source_root: str | Path | None = None,
+    allow_basename_fallbacks: bool = True,
+) -> tuple[Path | None, int, np.ndarray | None]:
+    """Resolve raw parts from an already-selected stored frame group."""
     source_base = (
         _decode(entry_group.attrs["source_base"])
         if "source_base" in entry_group.attrs
         else None
     )
-    from xrd_tools.io.nexus_record import frame_record_key  # noqa: PLC0415
-    fg = entry_group.get(f"frames/{frame_record_key(scan, frame)}")
-    if fg is None:
-        raise KeyError(
-            f"No frame group for frame {frame}"
-            f"{f' (scan {scan})' if scan is not None else ''} in {scan_file}")
 
     master: Path | None = None
     src_frame_idx = 0
-    src = fg.get("source")
+    src = frame_group.get("source")
     if src is not None and "path" in src:
         rel = _decode(src["path"][()])
         if "frame_index" in src:
@@ -662,10 +769,11 @@ def _raw_frame_parts_from_entry(
             scan_file=scan_file,
             source_base=source_base,
             source_root=source_root,
+            allow_basename_fallbacks=allow_basename_fallbacks,
         )
 
     thumb: np.ndarray | None = None
-    thumb_ds = fg.get("thumbnail")
+    thumb_ds = frame_group.get("thumbnail")
     if thumb_ds is not None:
         thumb = _dequantize_thumbnail(thumb_ds)
 

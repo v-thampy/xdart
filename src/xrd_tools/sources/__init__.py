@@ -64,9 +64,11 @@ if TYPE_CHECKING:
         raw_is_reachable,
     )
     from xrd_tools.sources.readiness import (
+        SourceReadinessObservation,
         capabilities_for_processed,
         describe_source_readiness,
         nxwriter_finalization_policy,
+        observe_source_readiness,
     )
     from xrd_tools.sources.registry import (
         guess_source_kind,
@@ -103,6 +105,7 @@ _LAZY_EXPORTS = {
     "Snapshot": "xrd_tools.sources.directory_index",
     "StaleCandidateError": "xrd_tools.sources.directory_index",
     "SourceFormatAdapter": "xrd_tools.sources.adapters",
+    "SourceReadinessObservation": "xrd_tools.sources.readiness",
     "SpecSource": "xrd_tools.sources.spec",
     "TiffSeriesSource": "xrd_tools.sources.image",
     "adapter_for_kind": "xrd_tools.sources.adapters",
@@ -112,6 +115,7 @@ _LAZY_EXPORTS = {
     "describe_container": "xrd_tools.sources.descriptor",
     "describe_container_from_open": "xrd_tools.sources.descriptor",
     "describe_source_readiness": "xrd_tools.sources.readiness",
+    "observe_source_readiness": "xrd_tools.sources.readiness",
     "discover_scans": "xrd_tools.sources.discover",
     "enumerate_candidates": "xrd_tools.sources.discover",
     "ensure_frame_source": "xrd_tools.sources.base",
@@ -171,6 +175,7 @@ __all__ = [
     "StaleCandidateError",
     "SourceCapabilities",
     "SourceFormatAdapter",
+    "SourceReadinessObservation",
     "SourceKind",
     "SourceSpec",
     "SpecSource",
@@ -182,6 +187,7 @@ __all__ = [
     "describe_container",
     "describe_container_from_open",
     "describe_source_readiness",
+    "observe_source_readiness",
     "discover_scans",
     "enumerate_candidates",
     "ensure_frame_source",

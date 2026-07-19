@@ -369,9 +369,17 @@ def test_runend_catchup_recovers_non_resident_tail_from_disk(
     # mid-catch-up would repeat the Item-2 failure shape).
     assert all(b >= a for a, b in zip(counts, counts[1:])), (
         f"accumulator row count decreased after arming: {counts}")
-    # One-shot: exactly one fire, no treadmill re-arm after firing.
+    # One-shot: at most one fire.  On a fast machine the browser's own
+    # post-live disk load may complete the tail before this callback runs; in
+    # that valid race the catch-up must take its idempotent already-complete
+    # path instead of issuing a redundant Show All.
     fires = [r for r in caplog.records if "-> show_all()" in r.getMessage()]
-    assert len(fires) == 1 and fires[0].levelno == logging.INFO
+    assert len(fires) <= 1
+    if fires:
+        assert fires[0].levelno == logging.INFO
+    else:
+        assert any("already complete, no-op" in r.getMessage()
+                   for r in caplog.records)
     # The tail became resident via the disk load (not some in-memory source).
     assert set(range(N_FRAMES - N_TAIL + 1, N_FRAMES + 1)) <= {
         int(i) for i in store.labels() if isinstance(i, int)}
@@ -496,13 +504,13 @@ def test_already_complete_accumulator_is_idempotent(
 
 def test_never_quiescent_gives_up_quietly_after_bounded_tries(
         qapp, widget, monkeypatch, catchup_nxs, caplog):
-    """Quiescence never reached (a coalesce timer stays active): the callback
-    re-arms at most 8 times, then gives up SILENTLY — token cleared, show_all
-    never called, and nothing louder than debug logged for the give-up."""
+    """Quiescence never reached: the deadline bounds polling and reports that
+    the displayed waterfall may be incomplete."""
     w = widget
     _publish_head(w, N_FRAMES - N_TAIL)
     _wire_live_run_end(w, monkeypatch, catchup_nxs)
     caplog.set_level(logging.DEBUG)
+    w._runend_catchup_timeout_s = 1.0
 
     w.wrangler_finished()
     assert w._runend_catchup_token == SCAN_NAME
@@ -518,11 +526,11 @@ def test_never_quiescent_gives_up_quietly_after_bounded_tries(
         time.sleep(0.02)
 
     assert w._runend_catchup_token is None, "never gave up"
-    assert w._runend_catchup_tries == 9          # 8 re-arms, then give up
+    assert w._runend_catchup_tries >= 2
     assert calls == []
     loud = [r for r in caplog.records[n_records_at_arm:]
-            if "catch-up" in r.getMessage() and r.levelno > logging.DEBUG]
-    assert loud == [], [r.getMessage() for r in loud]
+            if "catch-up timed out" in r.getMessage()]
+    assert len(loud) == 1
     _pump(qapp, 1.0)                             # let the held-back load settle
 
 
@@ -573,6 +581,7 @@ def _host(*, index, have_ids, method="Overlay", auto_last=True,
         ),
         _runend_catchup_token=token,
         _runend_catchup_tries=0,
+        _runend_catchup_deadline=time.monotonic() + 60.0,
     )
     return host, show_all_calls
 
@@ -636,15 +645,43 @@ def test_catchup_skips_on_cancellation(kwargs):
 def test_catchup_rearms_while_busy_then_gives_up(qapp):
     host, calls = _host(index=[1, 2, 3, 4],
                         have_ids=[_q("test_scan", 1)], busy=True)
-    # Each call while busy re-arms (bounded to 8), never fires.
-    for _ in range(8):
+    # Busy callbacks retain ownership until the absolute deadline.
+    for _ in range(12):
         staticWidget._runend_overlay_catchup(host)
         assert calls == []
         assert host._runend_catchup_token == "test_scan"
-    # 9th call: tries now exceeds 8 -> give up, clear the token, still no fire.
+    host._runend_catchup_deadline = time.monotonic() - 1.0
     staticWidget._runend_overlay_catchup(host)
     assert calls == []
     assert host._runend_catchup_token is None
+
+
+def test_numeric_container_suffixes_remain_distinct_run_owners():
+    assert staticWidget._canonical_run_token("sample_00005.nxs") == \
+        "sample_00005"
+    assert staticWidget._canonical_run_token("sample_00006.nxs") == \
+        "sample_00006"
+    assert staticWidget._canonical_run_token("sample_00005_master.h5") == \
+        "sample_00005"
+
+
+def test_stale_autofit_generation_cannot_touch_a_new_run(monkeypatch):
+    calls = []
+    host = SimpleNamespace(
+        _runend_generation=3,
+        _runend_autofit_generation=2,
+        _run_active=True,
+    )
+    monkeypatch.setattr(
+        staticWidget,
+        "_runend_waterfall_autofit",
+        lambda self: calls.append("fit"),
+    )
+
+    staticWidget._runend_autofit_when_quiet(
+        host, generation=2, deadline=time.monotonic() + 10.0)
+
+    assert calls == []
 
 
 ALIAS_N = 651

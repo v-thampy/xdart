@@ -518,6 +518,67 @@ def test_transient_raw_probe_failure_debounces_and_retries(
     assert calls["n"] == 2
 
 
+def test_transient_provenance_read_retries_without_caching_unavailable(
+        widget, tmp_path, monkeypatch):
+    import xrd_tools.io.read as read_module
+
+    processed = _processed_nxs(tmp_path, raw_reachable=True)
+    real = read_module.observe_resolved_raw_source
+    calls = {"count": 0}
+
+    def once_transient(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return read_module.RawSourceObservation(
+                None, False, "writer sharing violation")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(
+        read_module, "observe_resolved_raw_source", once_transient)
+    widget._v2_result_caps_retry_delay = 0.0
+
+    first = widget._controls_v2_loaded_result_caps(str(processed))
+    second = widget._controls_v2_loaded_result_caps(str(processed))
+
+    assert first is None
+    assert second is not None and second.raw_reachable is True
+    assert calls["count"] == 2
+
+
+def test_active_run_output_keeps_resident_raw_after_writer_stamp_change(
+        widget, tmp_path):
+    """A run's own output is identified by its frozen source and announced
+    result path, so an append cannot disable ROI while paused."""
+    raw_root = tmp_path / "raw_tree"
+    out_dir = tmp_path / "processed_out"
+    out_dir.mkdir()
+    record = _relative_source_nxs(out_dir, raw_root, first_label=1)
+    master = raw_root / "raw" / "scan_master.h5"
+
+    widget.wrangler.project_folder = str(raw_root)
+    _configure_source(widget, master)
+    widget.scan.name = "browsed"
+    widget.scan.data_file = str(record)
+    widget._enter_run_state()
+    try:
+        widget.new_scan("browsed", str(record), False, None, False, False)
+        _raw_publication(
+            widget.publication_store,
+            source_identity=str(master),
+            raw=np.ones((4, 4), dtype=np.uint16),
+        )
+
+        stamp = os.stat(record).st_mtime_ns + 1_000_000
+        os.utime(record, ns=(stamp, stamp))
+
+        state = widget._controls_v2_state()
+        assert state.result_caps.has_raw is True
+        assert state.result_caps.raw_reachable is True
+        assert _roi_enabled(state.result_caps) is True
+    finally:
+        widget._exit_run_state()
+
+
 # ── H18-R9: cross-root identity ───────────────────────────────────────────
 
 def test_same_stem_cross_root_publication_is_rejected(

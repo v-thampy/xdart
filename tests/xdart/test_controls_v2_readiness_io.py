@@ -336,3 +336,52 @@ def test_observation_suppression_is_thread_scoped(caplog):
                   if "readiness observation for" in r.getMessage()]
     assert any("/A/master.h5" in r.getMessage() for r in contextual)
     assert any("/A/nested.h5" in r.getMessage() for r in contextual)
+
+
+def test_transient_source_observation_is_retried_not_cached(
+        widget, tmp_path, monkeypatch):
+    """A temporary sharing denial may debounce, but it must never strand an
+    unchanged source at all-False readiness."""
+    from importlib import import_module
+
+    from xrd_tools.session.readiness import SourceCaps
+    from xrd_tools.sources.readiness import SourceReadinessObservation
+
+    module = import_module(
+        "xdart.gui.tabs.static_scan.static_scan_widget")
+    source = _eiger_master(tmp_path)
+    calls = {"count": 0}
+
+    def once_transient(value):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return SourceReadinessObservation(
+                SourceCaps(), False, "sharing violation")
+        return SourceReadinessObservation(
+            SourceCaps(has_frames=True, has_raw=True, raw_reachable=True),
+            True,
+            "ready",
+        )
+
+    monkeypatch.setattr(module, "observe_source_readiness", once_transient)
+    widget._v2_source_caps_retry_delay = 0.0
+
+    first = widget._controls_v2_headless_source_caps(str(source), live=False)
+    second = widget._controls_v2_headless_source_caps(str(source), live=False)
+
+    assert first == SourceCaps()
+    assert second.raw_reachable is True
+    assert calls["count"] == 2
+
+
+def test_source_identity_stamp_has_owner_on_first_call(tmp_path):
+    """The registry is bootstrapped before the adapter owner becomes part of
+    the cache key, so the first and second keys cannot flap."""
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    source = _eiger_master(tmp_path)
+    first = staticWidget._controls_v2_source_identity_stamp(str(source))
+    second = staticWidget._controls_v2_source_identity_stamp(str(source))
+
+    assert first == second
+    assert first is not None and first[2] == "nexus_hdf5"

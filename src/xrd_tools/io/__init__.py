@@ -59,6 +59,7 @@ from xrd_tools.io.read import (
     Integrated1D,
     Integrated2D,
     ProcessedScan,
+    RawSourceObservation,
     Scan,  # deprecated alias for ProcessedScan (S5 rename)
     get_1d,
     get_2d,
@@ -67,9 +68,11 @@ from xrd_tools.io.read import (
     get_raw_frame,
     get_thumbnail,
     open_scan,
+    observe_resolved_raw_source,
     read_scan_data,
     relative_source_path,
     resolve_source_master,
+    resolved_raw_source,
 )
 from xrd_tools.io.aggregate import (
     Aggregated1D,

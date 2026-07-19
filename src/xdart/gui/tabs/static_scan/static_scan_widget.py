@@ -211,6 +211,7 @@ from xrd_tools.sources.readiness import (
     capabilities_for_processed,
     describe_source_readiness,
     observe_raw_reachability,
+    observe_source_readiness,
     quiet_capability_observation,
 )
 
@@ -3164,7 +3165,20 @@ class staticWidget(QWidget):
             key = (label, self._controls_v2_source_identity_stamp(expanded))
             if cached is not None and cached[0] == key:
                 return cached[1]
-            caps = describe_source_readiness(label)
+            retry = getattr(self, "_v2_source_caps_retry", None)
+            if (retry is not None and retry[0] == key
+                    and time.monotonic() < retry[1]):
+                return SourceCaps()
+            observation = observe_source_readiness(label)
+            if not observation.definitive:
+                self._v2_source_caps_retry = (
+                    key,
+                    time.monotonic() + float(getattr(
+                        self, "_v2_source_caps_retry_delay", 2.0)),
+                )
+                return SourceCaps()
+            caps = observation.caps
+            self._v2_source_caps_retry = None
             self._v2_source_caps_cache = (key, caps)
             return caps
         except Exception:
@@ -3184,12 +3198,19 @@ class staticWidget(QWidget):
         except OSError:
             return None
         try:
+            # Importing the registry installs the built-in adapters.  Looking
+            # up candidate ownership before that bootstrap made an unchanged
+            # file's cache key flap from owner=None to owner=nexus_hdf5 on its
+            # first readiness call.
+            import xrd_tools.sources.registry  # noqa: F401, PLC0415
             from xrd_tools.sources.adapters import candidate_owner
             owner = candidate_owner(Path(path))
             adapter_id = getattr(owner, "id", None)
         except Exception:
             adapter_id = None
         return (int(st.st_size), int(st.st_mtime_ns), adapter_id)
+
+    _v2_source_caps_retry_delay = 2.0
 
     def _controls_v2_loaded_scan_file(
             self, *, loaded_frame_count: int, labels) -> str:
@@ -3233,7 +3254,8 @@ class staticWidget(QWidget):
         if not text:
             return ""
         try:
-            return os.path.normpath(os.path.abspath(os.path.expanduser(text)))
+            return os.path.normcase(os.path.realpath(
+                os.path.abspath(os.path.expanduser(text))))
         except OSError:
             return ""
 
@@ -3258,6 +3280,17 @@ class staticWidget(QWidget):
                        os.path.expanduser(str(loaded_scan_file))), root)
             if ident_cache[0] == key:
                 identities.add(ident_cache[1])
+        # During Run/Pause, the writer changes its own output stamp.  The
+        # record path remains the same run identity, and manual browsing is
+        # distinguishable because only outputs announced by THIS run are in
+        # the frozen set.  Let the configured acquisition source prove only
+        # those exact active outputs; an unrelated paused browse target stays
+        # fail-closed.
+        active_outputs = getattr(self, "_v2_active_result_paths", set())
+        if self._controls_v2_run_active() and path in active_outputs:
+            active_source = getattr(self, "_v2_active_source_identity", "")
+            if active_source:
+                identities.add(active_source)
         return identities
 
     def _controls_v2_resident_selected_raw(
@@ -3299,8 +3332,11 @@ class staticWidget(QWidget):
                 getattr(pub, "source_identity", ""))
             if not ident:
                 continue
+            target_dirs = tuple(
+                target + os.sep for target in targets if os.path.isdir(target))
             if ident not in targets and not (
-                    dir_prefix and ident.startswith(dir_prefix)):
+                    (dir_prefix and ident.startswith(dir_prefix))
+                    or any(ident.startswith(prefix) for prefix in target_dirs)):
                 continue
             raw = getattr(getattr(pub, "view", None), "raw", None)
             if raw is not None and getattr(raw, "size", 0):
@@ -3379,12 +3415,17 @@ class staticWidget(QWidget):
             # processed output across directories.  Resolution failure
             # contributes nothing (fail closed).
             try:
-                from xrd_tools.io.read import resolved_raw_source
+                from xrd_tools.io.read import observe_resolved_raw_source
 
                 with quiet_capability_observation(
                         path, "selected processed result"):
-                    raw_src = resolved_raw_source(
+                    provenance = observe_resolved_raw_source(
                         path, source_root=root or None)
+                if not provenance.definitive:
+                    raise _TransientReadinessObservation(provenance.detail)
+                raw_src = provenance.source
+            except _TransientReadinessObservation:
+                raise
             except Exception:
                 raw_src = None
             self._v2_result_source_ident = (
@@ -5170,6 +5211,7 @@ class staticWidget(QWidget):
         # the deferred browser-select case must cancel too — so clear BEFORE the
         # early-return below.
         self._runend_catchup_token = None
+        self._runend_generation = getattr(self, "_runend_generation", 0) + 1
         if getattr(self.h5viewer, "_browser_scan_reset_pending", False):
             return
         self.displayframe.set_axes()
@@ -6209,20 +6251,28 @@ class staticWidget(QWidget):
         finish exactly once."""
         scan_name = str(getattr(getattr(self, "scan", None), "name", "") or "")
         wrangler_name = str(getattr(self.wrangler, "scan_name", "") or "")
-        if scan_name == wrangler_name:
-            return True
-        if not scan_name or not wrangler_name:
-            return False
-        return ((_scan_key_from_source(scan_name) or scan_name)
-                == (_scan_key_from_source(wrangler_name) or wrangler_name))
+        return (staticWidget._canonical_run_token(scan_name)
+                == staticWidget._canonical_run_token(wrangler_name))
 
     @staticmethod
     def _canonical_run_token(name):
-        """Canonical catch-up token (H18-R8): the token must survive a
-        post-arm rename to/from an alias spelling of the SAME run."""
+        """Exact run token with only the documented Eiger alias removed.
+
+        Inputs here are usually already-canonical bare scan names.  Applying
+        the image-series suffix parser a second time collapsed distinct
+        container runs ending in ``_00005`` and ``_00006``.  Preserve every
+        other character and strip only a file extension and ``_master``.
+        """
         if not name:
             return None
-        return _scan_key_from_source(str(name)) or str(name)
+        text = str(name)
+        path = Path(text)
+        token = path.stem if path.suffix.lower() in {
+            ".h5", ".hdf5", ".nxs", ".cxi"
+        } else path.name
+        if token.lower().endswith("_master"):
+            token = token[:-7]
+        return token or None
 
     def _hook_waterfall_zoom_recording(self):
         """H18-R8(b): record GENUINE user zooms on the active bottom plot
@@ -6275,14 +6325,31 @@ class staticWidget(QWidget):
         except Exception:
             logger.debug("run-end waterfall auto-fit failed", exc_info=True)
 
-    def _runend_autofit_when_quiet(self):
-        """Bounded post-catch-up poll: fit once the disk load has settled."""
+    _runend_catchup_timeout_s = 30.0
+    _runend_autofit_timeout_s = 30.0
+
+    def _runend_autofit_when_quiet(self, generation=None, deadline=None):
+        """Fit after disk load settles, scoped to the run that requested it."""
+        generation = (getattr(self, "_runend_autofit_generation", None)
+                      if generation is None else generation)
+        if generation is None:
+            generation = getattr(self, "_runend_generation", 0)
+        if (generation != getattr(self, "_runend_generation", 0)
+                or bool(getattr(self, "_run_active", False))):
+            return
+        if deadline is None:
+            deadline = time.monotonic() + float(
+                getattr(self, "_runend_autofit_timeout_s", 30.0))
         if staticWidget._runend_catchup_busy(self):
-            tries = getattr(self, "_runend_autofit_tries", 0) + 1
-            self._runend_autofit_tries = tries
-            if tries <= 8:
+            if time.monotonic() < deadline:
                 QtCore.QTimer.singleShot(
-                    250, lambda: staticWidget._runend_autofit_when_quiet(self))
+                    250,
+                    lambda: staticWidget._runend_autofit_when_quiet(
+                        self, generation, deadline),
+                )
+            else:
+                logger.warning(
+                    "run-end waterfall auto-fit timed out while the GUI was busy")
             return
         staticWidget._runend_waterfall_autofit(self)
 
@@ -6326,12 +6393,18 @@ class staticWidget(QWidget):
         # canonical output) cannot false-cancel the catch-up.
         self._runend_catchup_token = staticWidget._canonical_run_token(
             getattr(self.scan, "name", None))
+        self._runend_catchup_generation = getattr(self, "_runend_generation", 0)
+        self._runend_catchup_deadline = time.monotonic() + float(
+            getattr(self, "_runend_catchup_timeout_s", 30.0))
         self._runend_catchup_tries = 0
         staticWidget._hook_waterfall_zoom_recording(self)
         logger.info("[PERF] run-end overlay catch-up: armed (scan=%r)",
                     self._runend_catchup_token)
         QtCore.QTimer.singleShot(
-            250, lambda: staticWidget._runend_overlay_catchup(self))
+            250,
+            lambda: staticWidget._runend_overlay_catchup(
+                self, self._runend_catchup_generation),
+        )
 
     def _runend_catchup_busy(self) -> bool:
         """True while the run-end debounce cascade / a disk load is still in
@@ -6369,8 +6442,13 @@ class staticWidget(QWidget):
                 have.add(frame_index_from_row_id(row_id))
         return full - have
 
-    def _runend_overlay_catchup(self):
+    def _runend_overlay_catchup(self, generation=None):
         """One-shot post-quiescence auto-Show-All (see _arm_runend_overlay_catchup)."""
+        generation = (getattr(self, "_runend_catchup_generation", None)
+                      if generation is None else generation)
+        if (generation is not None
+                and generation != getattr(self, "_runend_generation", 0)):
+            return
         if getattr(self, "_runend_catchup_token", None) is None:
             return                                   # cleared by a new run / reset
         df = getattr(self, "displayframe", None)
@@ -6399,16 +6477,18 @@ class staticWidget(QWidget):
         # and any load worker settle, then give up (degrades to manual Show All).
         if staticWidget._runend_catchup_busy(self):
             self._runend_catchup_tries = getattr(self, "_runend_catchup_tries", 0) + 1
-            if self._runend_catchup_tries <= 8:
+            if time.monotonic() < getattr(
+                    self, "_runend_catchup_deadline", 0.0):
                 QtCore.QTimer.singleShot(
-                    250, lambda: staticWidget._runend_overlay_catchup(self))
+                    250,
+                    lambda: staticWidget._runend_overlay_catchup(
+                        self, generation),
+                )
             else:
-                # Give up SILENTLY (spec): degrading to today's manual Show All
-                # is not an error, so a permanently-busy GUI must not add run-end
-                # noise louder than debug.
                 self._runend_catchup_token = None
-                logger.debug("[PERF] run-end overlay catch-up: gave up after 8 "
-                             "tries (GUI never quiesced); use Show All")
+                logger.warning(
+                    "run-end overlay catch-up timed out while the GUI was busy; "
+                    "the displayed waterfall may be incomplete (use Show All)")
             return
         # Guard 3 — missing set.  Empty -> already complete -> idempotent no-op.
         missing = staticWidget._runend_overlay_missing_ids(self)
@@ -6431,9 +6511,14 @@ class staticWidget(QWidget):
             logger.debug("run-end overlay catch-up show_all failed", exc_info=True)
         # H18-R8(b): once the disk load settles, auto-fit the full history
         # unless a genuine user zoom was recorded.
-        self._runend_autofit_tries = 0
+        self._runend_autofit_generation = generation
+        autofit_deadline = time.monotonic() + float(
+            getattr(self, "_runend_autofit_timeout_s", 30.0))
         QtCore.QTimer.singleShot(
-            250, lambda: staticWidget._runend_autofit_when_quiet(self))
+            250,
+            lambda: staticWidget._runend_autofit_when_quiet(
+                self, generation, autofit_deadline),
+        )
 
     def disable_auto_last(self, q):
         """
@@ -7010,6 +7095,19 @@ class staticWidget(QWidget):
         """
         if self._run_active:
             return
+        self._runend_generation = getattr(self, "_runend_generation", 0) + 1
+        self._runend_catchup_generation = None
+        self._runend_autofit_generation = None
+        self._v2_active_result_paths = set()
+        try:
+            source_label = staticWidget._controls_v2_configured_source_label(self)
+            self._v2_active_source_identity = (
+                staticWidget._controls_v2_normalized_path(source_label))
+        except (AttributeError, TypeError):
+            # Minimal lifecycle hosts and source panels without a configured
+            # path still participate in run ownership; they simply cannot
+            # contribute source provenance until a result path is registered.
+            self._v2_active_source_identity = ""
         # H18-R8(b)/R12: a new run opens a fresh genuine-zoom window — zooms
         # recorded during THIS run survive the run-end auto-fit; older ones
         # don't pin the next run's finished viewport.  The manual-range
@@ -7861,6 +7959,16 @@ class staticWidget(QWidget):
         # mid-stream (the "flickers to LaB6 then reverts to Combi" symptom).
         self._scan_fname_cache = getattr(self, "_scan_fname_cache", {})
         self._scan_fname_cache[name] = fname
+        run_active = bool(getattr(self, "_run_active", False))
+        run_state = getattr(self, "_controls_v2_run_active", None)
+        if callable(run_state):
+            run_active = bool(run_state())
+        if run_active:
+            active_path = staticWidget._controls_v2_normalized_path(fname)
+            if active_path:
+                self._v2_active_result_paths = getattr(
+                    self, "_v2_active_result_paths", set())
+                self._v2_active_result_paths.add(active_path)
         # G1/T0-1: a new run is a new data identity — drop the wavelength
         # restored from whatever file was open before, synchronously (the
         # async file-thread set_datafile also clears, but frames can render

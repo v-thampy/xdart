@@ -1299,7 +1299,11 @@ class imageWrangler(wranglerWidget):
         self.get_img_fname()
         self.thread.img_file = self.img_file
 
-        self.scan_name, _ = _get_scan_info(self.img_file)
+        # Container numeric suffixes are scan identity, while image-series
+        # numeric suffixes are frame identity.  Use the canonical source rule
+        # here too; feeding an already-bare container name back through the
+        # image-series parser later made sibling scans 00005/00006 collide.
+        self.scan_name = self._append_scan_name_for_source(self.img_file)
         self.thread.scan_name = self.scan_name
 
         self.thread.single_img = self.single_img

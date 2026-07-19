@@ -230,7 +230,7 @@ def test_describe_source_readiness_remote_uri_passes_the_stat_gate(monkeypatch):
     from xrd_tools.sources import readiness as R
 
     source = _FakeSource()
-    monkeypatch.setattr(R, "_open_source", lambda _v: source)
+    monkeypatch.setattr(R, "_open_source_observed", lambda _v: source)
 
     caps = R.describe_source_readiness("https://tiled.example/api/v1/scan")
 
@@ -268,7 +268,8 @@ def test_live_spec_keeps_escape_hatch_when_open_fails(monkeypatch):
     from types import SimpleNamespace
     from xrd_tools.sources import readiness as R
 
-    monkeypatch.setattr(R, "_open_source", lambda _v: None)   # force the fallback
+    monkeypatch.setattr(
+        R, "_open_source_observed", lambda _v: None)   # force the fallback
     caps = R.describe_source_readiness(SimpleNamespace(kind=R.SourceKind.LIVE))
     assert caps.raw_reachable is True
     assert caps.has_frames is True
@@ -449,3 +450,76 @@ def test_observe_raw_reachability_single_authoritative_enumeration():
     assert source.accesses == 1, \
         f"one authoritative enumeration required, saw {source.accesses}"
     assert obs.reachable is True and obs.definitive is True
+
+
+def test_source_readiness_processed_scan_denial_is_typed_not_escaped(
+        tmp_path, monkeypatch):
+    """A sharing denial must not escape while the observation formats its
+    subject or enumerates a real ProcessedScan."""
+    import h5py
+
+    import xrd_tools.io.read as read_module
+    from xrd_tools.sources.readiness import observe_source_readiness
+
+    record = tmp_path / "scan.nxs"
+    with h5py.File(record, "w") as handle:
+        handle.create_group("entry")
+
+    def denied(*args, **kwargs):
+        raise PermissionError("writer still owns the record")
+
+    monkeypatch.setattr(read_module, "get_frames", denied)
+    observation = observe_source_readiness(read_module.ProcessedScan(record))
+
+    assert observation.definitive is False
+    assert observation.caps == type(observation.caps)()
+    # The compatibility projection remains conservative and never raises.
+    assert describe_source_readiness(
+        read_module.ProcessedScan(record)) == type(observation.caps)()
+
+
+def test_source_readiness_transient_spec_stat_is_not_definitive(
+        tmp_path, monkeypatch):
+    from xrd_tools.sources.readiness import observe_source_readiness
+
+    source = tmp_path / "arriving.nxs"
+    real_exists = Path.exists
+    calls = {"count": 0}
+
+    def once_denied(path):
+        if path == source and calls["count"] == 0:
+            calls["count"] += 1
+            raise PermissionError("directory entry is temporarily locked")
+        return real_exists(path)
+
+    monkeypatch.setattr(Path, "exists", once_denied)
+    first = observe_source_readiness(str(source))
+    second = observe_source_readiness(str(source))
+
+    assert first.definitive is False
+    assert second.definitive is True
+    assert second.caps.has_frames is False
+
+
+def test_classification_fallback_never_claims_raw_pixels_reachable(
+        tmp_path, monkeypatch):
+    """Container classification is advisory; only a real frame load may
+    authorize raw-dependent tools."""
+    from types import SimpleNamespace
+
+    import xrd_tools.sources.readiness as readiness
+
+    source = tmp_path / "corrupt-but-classified.h5"
+    source.touch()
+    monkeypatch.setattr(readiness, "_open_source_observed", lambda value: None)
+    monkeypatch.setattr(
+        readiness,
+        "_classify_observed",
+        lambda value: SimpleNamespace(n_frames=4, has_raw=True),
+    )
+
+    observation = readiness.observe_source_readiness(str(source))
+    assert observation.definitive is True
+    assert observation.caps.has_frames is True
+    assert observation.caps.has_raw is True
+    assert observation.caps.raw_reachable is False

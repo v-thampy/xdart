@@ -27,6 +27,8 @@ from xrd_tools.session.readiness import ResultCaps, SourceCaps
 
 __all__ = [
     "describe_source_readiness",
+    "observe_source_readiness",
+    "SourceReadinessObservation",
     "capabilities_for_processed",
     "nxwriter_finalization_policy",
     "observe_raw_reachability",
@@ -129,11 +131,18 @@ def quiet_capability_observation(subject_path, subject_kind):
 
 def _observation_subject(value) -> tuple[str, str]:
     uri = _uri(value)
-    kind = getattr(value, "kind", None)
+    try:
+        kind = getattr(value, "kind", None)
+    except Exception:
+        kind = None
     subject = ("selected processed result"
                if kind == SourceKind.PROCESSED_NEXUS
                else "configured acquisition source")
-    return str(uri if uri is not None else value), subject
+    if uri is not None:
+        label = str(uri)
+    else:
+        label = f"{type(value).__module__}.{type(value).__qualname__}"
+    return label, subject
 
 
 
@@ -158,31 +167,80 @@ def describe_source_readiness(spec_or_source: Any, *, probe: bool = True) -> Sou
       ``scheme://`` URIs are not stat-able and pass through unchanged.
     """
 
-    gated = _spec_gate(spec_or_source)
+    return observe_source_readiness(spec_or_source, probe=probe).caps
+
+
+@dataclass(frozen=True)
+class SourceReadinessObservation:
+    """Typed source-capability observation for cache-holding consumers.
+
+    ``definitive=False`` means a sharing/availability failure interrupted the
+    observation.  The conservative ``caps`` remain safe for one-shot callers,
+    but must not be cached as stable source truth.
+    """
+
+    caps: SourceCaps
+    definitive: bool
+    detail: str = ""
+
+
+def observe_source_readiness(
+    spec_or_source: Any, *, probe: bool = True,
+) -> SourceReadinessObservation:
+    """Typed counterpart of :func:`describe_source_readiness`.
+
+    Every filesystem/open/enumerate/load stage preserves known transient
+    errors instead of converting them into a permanent all-False answer.
+    """
+    gated = _spec_gate_observed(spec_or_source)
     if gated is not None:
         return gated
-
     subject_path, subject_kind = _observation_subject(spec_or_source)
     with quiet_capability_observation(subject_path, subject_kind):
-        return _describe_open_source(spec_or_source, probe=probe)
+        return _observe_open_source_readiness(spec_or_source, probe=probe)
 
 
 def _describe_open_source(spec_or_source: Any, *, probe: bool = True) -> SourceCaps:
-    source = _open_source(spec_or_source)
-    if source is None:
-        return _caps_from_classification(spec_or_source)
+    return _observe_open_source_readiness(spec_or_source, probe=probe).caps
 
-    source_caps = _core_caps(source)
-    frame_indices, frame_count = _frame_indices(source)
-    unknown_length = frame_count is None
-    live_unknown = bool(
+
+def _observe_open_source_readiness(
+    spec_or_source: Any, *, probe: bool = True,
+) -> SourceReadinessObservation:
+    from xrd_tools.sources.probe import TRANSIENT_PROBE_ERRORS, observe_frame
+
+    try:
+        source = _open_source_observed(spec_or_source)
+    except TRANSIENT_PROBE_ERRORS as exc:
+        return SourceReadinessObservation(
+            SourceCaps(), False, f"transient open error: {exc}")
+    if source is None:
+        return _caps_from_classification_observed(spec_or_source)
+
+    try:
+        source_caps = _core_caps(source)
+    except TRANSIENT_PROBE_ERRORS as exc:
+        return SourceReadinessObservation(
+            SourceCaps(), False, f"transient capability error: {exc}")
+    truly_live = bool(
         source_caps.is_streaming
         or getattr(source, "kind", None) == SourceKind.LIVE
-        or unknown_length
     )
-    has_frames = bool(live_unknown or (frame_count is not None and frame_count > 0))
+    if truly_live:
+        frame_indices: list[int] = []
+        has_frames = True
+    else:
+        try:
+            frame_indices = [int(idx) for idx in source.frame_indices]
+        except TRANSIENT_PROBE_ERRORS as exc:
+            return SourceReadinessObservation(
+                SourceCaps(), False, f"transient enumeration error: {exc}")
+        except Exception as exc:
+            return SourceReadinessObservation(
+                SourceCaps(), True, f"frame enumeration failed: {exc}")
+        has_frames = bool(frame_indices)
 
-    if live_unknown:
+    if truly_live:
         # True-live escape hatch: a live acquisition may legitimately have no
         # frame 0 yet, so classification and the frame-0 probe are SKIPPED
         # (same answers as before, without touching a file another process may
@@ -190,20 +248,37 @@ def _describe_open_source(spec_or_source: Any, *, probe: bool = True) -> SourceC
         has_raw = True
         raw_reachable = True
     else:
-        info = _classify(spec_or_source)
+        try:
+            info = _classify_observed(spec_or_source)
+        except TRANSIENT_PROBE_ERRORS:
+            info = None
         has_raw = bool(
             getattr(source_caps, "has_raw_references", False)
             or getattr(info, "has_raw", False)
             or (has_frames and hasattr(source, "load_frame"))
         )
         if probe and has_raw:
-            raw_reachable = bool(_probe_first_frame(source))
+            if not frame_indices:
+                raw_reachable = False
+            else:
+                reachable, _image, transient = observe_frame(
+                    source, frame_indices[0])
+                if transient:
+                    return SourceReadinessObservation(
+                        SourceCaps(
+                            has_frames=has_frames,
+                            has_raw=has_raw,
+                        ),
+                        False,
+                        "transient frame probe error",
+                    )
+                raw_reachable = bool(reachable)
         else:
             raw_reachable = bool(has_raw)
 
     first_metadata = _first_metadata(source, frame_indices)
     motors = _motors(source)
-    return SourceCaps(
+    caps = SourceCaps(
         has_frames=has_frames,
         has_raw=has_raw,
         raw_reachable=raw_reachable,
@@ -221,6 +296,7 @@ def _describe_open_source(spec_or_source: Any, *, probe: bool = True) -> SourceC
         ),
         has_psi_metadata=_has_any_key(first_metadata, _PSI_KEYS),
     )
+    return SourceReadinessObservation(caps, True, "source observation")
 
 
 def capabilities_for_processed(
@@ -284,13 +360,21 @@ def _spec_gate(value: Any) -> SourceCaps | None:
     Returns the gated (all-False) caps, or ``None`` to proceed normally.
     """
 
+    observation = _spec_gate_observed(value)
+    return observation.caps if observation is not None else None
+
+
+def _spec_gate_observed(value: Any) -> SourceReadinessObservation | None:
+    """Typed spec gate; local sharing failures remain retryable."""
+    from xrd_tools.sources.probe import TRANSIENT_PROBE_ERRORS
+
     if not isinstance(value, (str, Path, SourceSpec)):
         return None
     uri = value.uri if isinstance(value, SourceSpec) else value
     text = str(uri or "").strip()
     if not text:
         # Nothing configured — never ready, live or not (label rule).
-        return SourceCaps()
+        return SourceReadinessObservation(SourceCaps(), True, "empty location")
     kind = value.kind if isinstance(value, SourceSpec) else None
     if kind == SourceKind.LIVE:
         # A configured live location may not exist yet; the escape hatch owns it.
@@ -298,9 +382,14 @@ def _spec_gate(value: Any) -> SourceCaps | None:
     if _URI_SCHEME_RE.match(text):
         # Remote resource (e.g. a future Tiled URI) — not stat-able here.
         return None
-    if not Path(text).expanduser().exists():
+    try:
+        exists = Path(text).expanduser().exists()
+    except TRANSIENT_PROBE_ERRORS as exc:
+        return SourceReadinessObservation(
+            SourceCaps(), False, f"transient stat error: {exc}")
+    if not exists:
         # Phantom-frame hazard: a typo'd local path has no frames (finding 1).
-        return SourceCaps()
+        return SourceReadinessObservation(SourceCaps(), True, "missing path")
     return None
 
 
@@ -316,23 +405,48 @@ def _open_source(value: Any) -> Any | None:
 
 
 def _caps_from_classification(value: Any) -> SourceCaps:
+    return _caps_from_classification_observed(value).caps
+
+
+def _caps_from_classification_observed(value: Any) -> SourceReadinessObservation:
+    from xrd_tools.sources.probe import TRANSIENT_PROBE_ERRORS
+
     # True-live escape hatch on the FALLBACK path too: if open_source() failed but
     # the spec is a LIVE kind, a live acquisition may simply have no frame 0 yet —
     # keep it raw-reachable rather than collapsing to all-False (which would wrongly
     # gate the Run).  Mirrors the live_unknown branch on the open-succeeds path.
     if getattr(value, "kind", None) == SourceKind.LIVE:
-        return SourceCaps(
-            has_frames=True, has_raw=True, raw_reachable=True, has_metadata=False,
+        return SourceReadinessObservation(
+            SourceCaps(
+                has_frames=True, has_raw=True, raw_reachable=True,
+                has_metadata=False,
+            ),
+            True,
+            "live escape hatch",
         )
-    info = _classify(value)
-    frame_count = getattr(info, "n_frames", 0) if info is not None else _count_frames(value)
+    try:
+        info = _classify_observed(value)
+        frame_count = (
+            getattr(info, "n_frames", 0)
+            if info is not None else _count_frames_observed(value)
+        )
+    except TRANSIENT_PROBE_ERRORS as exc:
+        return SourceReadinessObservation(
+            SourceCaps(), False, f"transient classification error: {exc}")
     has_frames = bool(frame_count and frame_count > 0)
     has_raw = bool(getattr(info, "has_raw", False))
-    return SourceCaps(
-        has_frames=has_frames,
-        has_raw=has_raw,
-        raw_reachable=has_raw and has_frames,
-        has_metadata=False,
+    # Classification is advisory.  It can establish that a source appears to
+    # contain raw frames, but only a successful strict load establishes that
+    # those pixels are reachable (a corrupt HDF5 master must not enable ROI).
+    return SourceReadinessObservation(
+        SourceCaps(
+            has_frames=has_frames,
+            has_raw=has_raw,
+            raw_reachable=False,
+            has_metadata=False,
+        ),
+        True,
+        "classification fallback",
     )
 
 
@@ -362,6 +476,15 @@ def _probe_first_frame(source: Any) -> bool:
 
 
 def _classify(value: Any) -> Any | None:
+    try:
+        return _classify_observed(value)
+    except Exception:
+        return None
+
+
+def _classify_observed(value: Any) -> Any | None:
+    from xrd_tools.sources.probe import TRANSIENT_PROBE_ERRORS
+
     uri = _uri(value)
     if uri is None:
         return None
@@ -369,11 +492,22 @@ def _classify(value: Any) -> Any | None:
         from xrd_tools.io.image_source import classify_image_source
 
         return classify_image_source(uri)
+    except TRANSIENT_PROBE_ERRORS:
+        raise
     except Exception:
         return None
 
 
 def _count_frames(value: Any) -> int:
+    try:
+        return _count_frames_observed(value)
+    except Exception:
+        return 0
+
+
+def _count_frames_observed(value: Any) -> int:
+    from xrd_tools.sources.probe import TRANSIENT_PROBE_ERRORS
+
     uri = _uri(value)
     if uri is None:
         return 0
@@ -381,6 +515,8 @@ def _count_frames(value: Any) -> int:
         from xrd_tools.io.image import count_frames
 
         return int(count_frames(uri))
+    except TRANSIENT_PROBE_ERRORS:
+        raise
     except Exception:
         return 0
 
@@ -390,9 +526,18 @@ def _uri(value: Any) -> str | Path | None:
         return value.uri
     if isinstance(value, (str, Path)):
         return value
-    spec = getattr(value, "spec", None)
+    try:
+        spec = getattr(value, "spec", None)
+    except Exception:
+        spec = None
     if isinstance(spec, SourceSpec):
         return spec.uri
+    try:
+        path = getattr(value, "path", None)
+    except Exception:
+        path = None
+    if isinstance(path, (str, Path)):
+        return path
     return None
 
 
@@ -514,10 +659,10 @@ def observe_raw_reachability(spec_or_source: Any) -> RawReachabilityObservation:
     :func:`xrd_tools.sources.probe.observe_first_frame`.
     """
 
-    gated = _spec_gate(spec_or_source)
+    gated = _spec_gate_observed(spec_or_source)
     if gated is not None:
         return RawReachabilityObservation(
-            bool(gated.raw_reachable), True, "spec gate")
+            bool(gated.caps.raw_reachable), gated.definitive, gated.detail)
     subject_path, subject_kind = _observation_subject(spec_or_source)
     with quiet_capability_observation(subject_path, subject_kind):
         return _observe_raw_reachability_open(spec_or_source)
@@ -538,10 +683,15 @@ def _observe_raw_reachability_open(spec_or_source: Any) -> RawReachabilityObserv
         return RawReachabilityObservation(
             False, False, f"transient open error: {exc}")
     if source is None:
-        caps = _caps_from_classification(spec_or_source)
+        observation = _caps_from_classification_observed(spec_or_source)
         return RawReachabilityObservation(
-            bool(caps.raw_reachable), True, "classification fallback")
-    source_caps = _core_caps(source)
+            bool(observation.caps.raw_reachable), observation.definitive,
+            observation.detail)
+    try:
+        source_caps = _core_caps(source)
+    except TRANSIENT_PROBE_ERRORS as exc:
+        return RawReachabilityObservation(
+            False, False, f"transient capability error: {exc}")
     truly_live = bool(
         source_caps.is_streaming
         or getattr(source, "kind", None) == SourceKind.LIVE
