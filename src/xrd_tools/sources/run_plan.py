@@ -56,6 +56,7 @@ from types import MappingProxyType
 
 from xrd_tools.sources.discover import Candidate
 from xrd_tools.sources.directory_index import Snapshot, StaleCandidateError
+from xrd_tools.sources.probe import ProbeResult, ProbeState
 
 
 class SupersededPlanError(ValueError):
@@ -273,16 +274,21 @@ class RunCandidatePlan:
             tuple(run_order), tuple(changed), tuple(removed),
             tuple(owner_flipped), appended)
 
-    def adopt(self, current: Candidate) -> "RunCandidatePlan":
+    def adopt(self, current: Candidate,
+              probe_result: ProbeResult) -> "RunCandidatePlan":
         """Return a NEW plan with *current* replacing the baseline candidate at
         the same path, retaining its ordering slot (the ``changed`` -> ready
         transition of RP1).
 
-        *current* must be a genuinely CHANGED candidate the consumer has just
-        re-observed and reprobed READY: same ``path`` and ``adapter_id`` as the
-        baseline entry, different ``version_stamp``.  Once adopted, the path is
-        identity-current, so a later :meth:`reconcile` places it in
-        ``run_order`` (opened exactly once) rather than ``changed`` again.
+        *current* must be a genuinely CHANGED candidate and *probe_result* must
+        be the effective READY result returned by
+        :meth:`DirectoryIndex.probe_candidate`: same ``path`` and ``adapter_id``
+        as the baseline entry, different ``version_stamp``.  Requiring the typed
+        verdict at this boundary prevents a caller from accidentally adopting an
+        ``IN_PROGRESS`` shell merely because it forgot to inspect the probe.
+        Once adopted, the path is identity-current, so a later
+        :meth:`reconcile` places it in ``run_order`` (opened exactly once) rather
+        than ``changed`` again.
 
         Raises :class:`KeyError` if *current.path* is not in the baseline,
         :class:`~xrd_tools.sources.directory_index.StaleCandidateError` if its
@@ -302,6 +308,10 @@ class RunCandidatePlan:
         if current.version_stamp == planned.version_stamp:
             raise ValueError(
                 f"{current.path} identity is unchanged; nothing to adopt")
+        if probe_result.state is not ProbeState.READY:
+            raise ValueError(
+                f"{current.path} cannot be adopted without a READY probe "
+                f"result (got {probe_result.state.value!r})")
         new_candidates = tuple(
             current if c.path == current.path else c for c in self.candidates)
         return RunCandidatePlan(

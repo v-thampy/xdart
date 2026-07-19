@@ -275,8 +275,9 @@ def test_reprobe_ready_then_adopt_consumes_the_growth_exactly_once(tmp_path):
         assert result.run_order == ()
 
         current = result.changed[0]
-        assert index.probe_candidate(current).state is ProbeState.READY
-        plan = plan.adopt(current)                        # adopt exactly once
+        probe = index.probe_candidate(current)
+        assert probe.state is ProbeState.READY
+        plan = plan.adopt(current, probe)                 # adopt exactly once
 
         again = plan.reconcile(index.poll())              # unchanged now
         assert [c.path.name for c in again.run_order] == ["g.grow"]
@@ -303,8 +304,9 @@ def test_second_growth_transition_repeats_the_safe_cycle(tmp_path):
         result = plan.reconcile(index.poll())
         assert [c.path.name for c in result.changed] == ["g.grow"]
         current = result.changed[0]
-        assert index.probe_candidate(current).state is ProbeState.READY
-        plan = plan.adopt(current)
+        probe = index.probe_candidate(current)
+        assert probe.state is ProbeState.READY
+        plan = plan.adopt(current, probe)
         assert [c.path.name for c in plan.reconcile(index.snapshot).run_order] \
             == ["g.grow"]
 
@@ -339,15 +341,30 @@ def test_adopt_rejects_owner_flip_and_unchanged_and_unknown(tmp_path):
         plan = RunCandidatePlan.from_snapshot(index.snapshot)
         baseline = plan.by_path()[tmp_path / "a.nxs"]
 
+        ready = ProbeResult(ProbeState.READY, reason="ready")
         with pytest.raises(ValueError):                   # unchanged: nothing to adopt
-            plan.adopt(baseline)
+            plan.adopt(baseline, ready)
         with pytest.raises(KeyError):                     # not in baseline
-            plan.adopt(Candidate(tmp_path / "z.nxs", baseline.adapter_id, 1, 1))
+            plan.adopt(
+                Candidate(tmp_path / "z.nxs", baseline.adapter_id, 1, 1), ready)
         # owner flip is not an adoptable growth
         flipped = Candidate(tmp_path / "a.nxs", "some_other_owner",
                             baseline.size + 1, baseline.mtime_ns + 1)
         with pytest.raises(StaleCandidateError):
-            plan.adopt(flipped)
+            plan.adopt(flipped, ready)
+
+
+def test_adopt_requires_ready_probe_evidence(tmp_path):
+    """A changed name-only candidate cannot be adopted merely because a caller
+    forgot to inspect its probe verdict.  IN_PROGRESS remains withheld."""
+    index = _index_with(tmp_path, "a.nxs")
+    plan = RunCandidatePlan.from_snapshot(index.snapshot)
+    _touch(tmp_path / "a.nxs", b"grown but not proven ready")
+    current = plan.reconcile(index.poll()).changed[0]
+
+    with pytest.raises(ValueError, match="READY"):
+        plan.adopt(current, ProbeResult(
+            ProbeState.IN_PROGRESS, reason="writer is still finalizing"))
 
 
 def test_reconcile_appends_later_candidates_in_natural_order(tmp_path):
