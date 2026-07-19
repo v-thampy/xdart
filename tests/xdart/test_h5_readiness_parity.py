@@ -1,43 +1,40 @@
 # -*- coding: utf-8 -*-
-"""H5 — Stage-6 readiness PARITY TEST: freeze the two gating truth sources together.
+"""H5→H18 — Stage-6 readiness UNIFICATION PIN: one gating truth source.
 
-The controls-panel gating logic currently lives TWICE:
+Under H5 this file froze TWO gating truth sources together — the GUI-inline
+``has_frames = has_raw = raw_reachable = source_ready`` collapse in
+``staticWidget`` vs the headless ``describe_source_readiness`` /
+``capabilities_for_processed`` — and pinned every divergence with a note
+recording which side wins.  H18 landed that contract: the inline constructors
+are GONE (``_controls_v2_source_caps`` / the ResultCaps literal now DELEGATE to
+``xrd_tools.sources.readiness``), and each pinned divergence below flipped to
+an agreement assertion or an explicit headless fix.  This file is now the
+regression pin that the two sides can never diverge again.
 
-* **GUI-inline** — ``staticWidget._controls_v2_state`` builds ``SourceCaps`` via
-  ``staticWidget._controls_v2_source_caps`` (the collapsed
-  ``has_frames = has_raw = raw_reachable = source_ready`` simplification, with
-  ``source_ready = bool(source_label) and (live_unknown or frame_count > 0)``)
-  and builds ``ResultCaps`` inline (``has_raw = raw_reachable = source_ready or
-  loaded_scan_available``) — ``src/xdart/gui/tabs/static_scan/static_scan_widget.py``.
-* **Headless** — ``describe_source_readiness`` / ``capabilities_for_processed`` —
-  ``src/xrd_tools/sources/readiness.py``.
+Post-H18 matrix (tri-fields = has_frames/has_raw/raw_reachable):
 
-Both sides project into the SAME frozen dataclasses
-(``xrd_tools.session.readiness.SourceCaps`` / ``ResultCaps``), so fields compare
-directly.  These tests drive a REAL ``staticWidget`` (real wrangler parameters,
-real fixture files on disk, no fakes on the seam) and the real headless calls
-over one fixture matrix, and assert field-by-field parity.  Where the two sides
-legitimately DIVERGE today, the divergence is pinned on BOTH sides with a
-comment recording WHICH SIDE WINS — that record is the H18 migration contract:
-H18 delegates the GUI gating to the headless core, and every pinned divergence
-below is an explicit H18 decision to resolve, not a behavior to flip silently.
+    case                       tri-fields         resolution
+    SPEC source                BOTH T/T/F         was headless-wins; GUI inherits
+                                                  the SpecSource answer
+    Eiger master               BOTH T/T/T         the H5 no-op row, unchanged
+    processed + reachable raw  BOTH T/T/T         was headless-wins; record truth
+                                                  adopted (run stays Reintegrate)
+    processed, raw missing     BOTH T/T/F         was headless-wins; plus the
+                                                  hazard-2 fix: GUI ResultCaps
+                                                  consume the frame-0 probe
+    live / unknown length      BOTH T/T/T         the true-live escape hatch is
+                                                  now the ONLY mechanism
+    live, no source label      BOTH F/F/F         was GUI-wins; the label rule
+                                                  moved INTO the core (empty
+                                                  location is never ready)
+    nonexistent path           BOTH F/F/F         was GUI-wins; the core now
+                                                  stats non-live local URIs
+                                                  (phantom-frame fix)
 
-Matrix (SourceCaps side; ResultCaps parity applies to the processed rows only —
-``capabilities_for_processed`` is defined over processed metadata, so a
-source-only GUI ``ResultCaps`` has no headless counterpart until H18):
-
-    case                       tri-fields (has_frames/has_raw/raw_reachable)
-    SPEC source                GUI F/F/F   vs headless T/T/F   (headless wins)
-    Eiger master               GUI T/T/T   ==  headless T/T/T  (full agreement)
-    processed + reachable raw  GUI F/F/F   vs headless T/T/T   (headless wins)
-    processed, raw missing     GUI F/F/F   vs headless T/T/F   (headless wins)
-    live / unknown length      GUI T/T/T   ==  headless T/T/T  (agree, different
-                               mechanisms: inline live_unknown collapse vs the
-                               headless true-live escape hatch)
-    nonexistent path           GUI F/F/F   vs headless T/T/F   (GUI wins)
-
-READ-ONLY chunk: this file adds tests only; pinning a divergence documents it,
-it does not endorse it.
+The one REMAINING policy divergence (pinned, deliberate): a configured LIVE
+source's optimistic metadata/geometry claims are advisory — the panel state
+overlays them in the GUI's consumption, because a live run without real
+metadata/calibration must stay gated.
 """
 
 import os
@@ -211,32 +208,37 @@ def test_spec_source_parity(qapp, tmp_path):
 
     # AGREE — raw_reachable: neither side can prove frame 0 loads (the .raw
     # sidecar images need explicit shape/dtype read params neither side has
-    # here), though they arrive there differently: the headless frame-0 probe
-    # fails; the inline side collapses from source_ready=False.
+    # here); post-H18 the GUI's False IS the headless frame-0 probe answer,
+    # not a collapse artifact.
     assert gui.raw_reachable is False
     assert headless.raw_reachable is False
 
-    # DIVERGE (headless wins) — has_frames / has_raw: the inline panel counts
-    # frames with image_io.count_frames, which cannot parse a SPEC scan table,
-    # so the collapsed source_ready gate reports NO frames for a perfectly
-    # valid 3-point SPEC scan.  describe_source_readiness opens a real
-    # SpecSource and sees the scan rows.  H18: delegating to the headless core
-    # FIXES this under-gating — keep the headless answer.
-    assert gui.has_frames is False        # inline: count_frames(spec) == 0
-    assert gui.has_raw is False
-    assert headless.has_frames is True    # headless: SpecSource scan rows
+    # UNIFIED on the headless answer (was: GUI F/F/F vs headless T/T/T-F,
+    # headless wins) — the inline count_frames collapse could not parse a SPEC
+    # scan table and reported NO frames for a perfectly valid 3-point scan.
+    # The delegated tri-fields adopt the SpecSource scan rows.
+    assert headless.has_frames is True    # SpecSource scan rows
     assert headless.has_raw is True
+    assert gui.has_frames is True         # ← was False (inline collapse)
+    assert gui.has_raw is True            # ← was False
 
-    # DIVERGE (headless wins) — metadata family: SpecSource serves the scan
-    # table (#L columns), motors (#O/#P) and the psi-family "chi" column at
-    # gate time; the panel only learns metadata once a run hydrates
-    # scan.scan_data, so before any run it reports False.
-    assert gui.has_metadata is False and headless.has_metadata is True
-    assert gui.has_motors is False and headless.has_motors is True
-    assert gui.has_psi_metadata is False and headless.has_psi_metadata is True
+    # UNIFIED on the headless answer (was: headless wins) — metadata family:
+    # SpecSource serves the scan table (#L columns), motors (#O/#P) and the
+    # psi-family "chi" column AT GATE TIME; the panel used to learn them only
+    # after a run hydrated scan.scan_data.  Non-live panel truth is now
+    # OR-composed with what the source itself serves.
+    assert gui.has_metadata is True and headless.has_metadata is True
+    assert gui.has_motors is True and headless.has_motors is True
+    assert gui.has_psi_metadata is True and headless.has_psi_metadata is True
 
-    # AGREE — no energy record in the SPEC table, no calibration on either side.
-    _assert_agree(gui, headless, ("has_energy", "has_geometry"))
+    # Full 8-field agreement — the SPEC row joins the no-op set.
+    _assert_agree(gui, headless, SOURCE_FIELDS)
+    assert gui == headless
+
+    # The RUN gate is unchanged: readiness truth no longer hides that frames
+    # exist, but the wrangler cannot run a SPEC scan (no spec wrangler; its
+    # frame count is 0), so run_target must not become SOURCE.
+    assert state.run_target is not RunTarget.SOURCE
 
 
 def test_eiger_master_parity(qapp, tmp_path):
@@ -252,10 +254,9 @@ def test_eiger_master_parity(qapp, tmp_path):
     state = _gui_state(cfg)
     gui = state.source_caps
 
-    # FULL AGREEMENT — the one matrix row where the inline collapse and the
-    # headless probe coincide on every field: both count 2 frames, both load
-    # frame 0, and neither claims metadata/motors/energy/geometry/psi for a
-    # bare detector master.  This row is the H18 no-op case.
+    # FULL AGREEMENT — the H5 no-op row, preserved verbatim through the H18
+    # delegation: both sides count 2 frames, both load frame 0, and neither
+    # claims metadata/motors/energy/geometry/psi for a bare detector master.
     assert state.frame_count == 2
     assert gui.has_frames is True and headless.has_frames is True
     assert gui.has_raw is True and headless.has_raw is True
@@ -282,50 +283,40 @@ def test_processed_with_reachable_raw_parity(qapp, tmp_path):
     state = _gui_state(cfg)
     gui_src, gui_res = state.source_caps, state.result_caps
 
-    # SourceCaps tri-fields — DIVERGE (headless wins): count_frames cannot
-    # count a processed record (no raw image dataset), so the inline collapse
-    # reports F/F/F; ProcessedNexusSource sees the frame record, and the
-    # frame-0 probe resolves the sibling raw master → T/T/T.
-    assert gui_src.has_frames is False
-    assert gui_src.has_raw is False
-    assert gui_src.raw_reachable is False
+    # SourceCaps tri-fields — UNIFIED on record truth (was: GUI F/F/F vs
+    # headless T/T/T, headless wins): ProcessedNexusSource sees the frame
+    # record and the frame-0 probe resolves the sibling raw master; the
+    # retired inline collapse could not count a processed record at all.
     assert headless_src.has_frames is True
     assert headless_src.has_raw is True
     assert headless_src.raw_reachable is True
+    _assert_agree(gui_src, headless_src, SOURCE_FIELDS)
+    assert gui_src == headless_src
 
-    # DIVERGE (headless wins on source truth) — the record carries metadata
-    # and geometry; the panel derives both from PANEL state (no PONI picked,
-    # scan_data not hydrated), so it reports False.  H18 note: for
-    # has_geometry the panel's answer stays authoritative for RUN gating (the
-    # run needs the panel's calibration, not the record's), while the
-    # headless answer is the record truth for viewer/launcher gating.
-    assert gui_src.has_metadata is False and headless_src.has_metadata is True
-    assert gui_src.has_geometry is False and headless_src.has_geometry is True
-    _assert_agree(gui_src, headless_src, ("has_motors", "has_energy"))
+    # UNIFIED on record truth (was: headless wins) — the record carries
+    # metadata and geometry the panel had not hydrated.  RUN gating is NOT
+    # loosened by this: CALIBRATION_PONI / BEAM_ENERGY key on the panel's own
+    # geom state (geom.calibrated / energy resolution), so the record's
+    # geometry informs rows and launchers without unblocking a run.
+    assert gui_src.has_metadata is True and gui_src.has_geometry is True
 
-    # The inline compensation for its all-False SourceCaps: the run gate
-    # falls back to the loaded scan, so the panel does not dead-end.
+    # Unchanged compensation: record-truth caps do not make a processed .nxs
+    # wrangler-runnable — the run gate still points at the loaded scan
+    # (Reintegrate), never a fresh SOURCE run over a processed record.
     assert state.loaded_scan_available is True
     assert state.run_target is RunTarget.LOADED_SCAN
 
-    # ResultCaps — AGREE on raw: both True, with different provenance
-    # (inline: source_ready OR loaded_scan_available; headless: the
-    # frames_record capability written by get_metadata).
-    assert gui_res.has_raw is True and headless_res.has_raw is True
-    assert gui_res.raw_reachable is True and headless_res.raw_reachable is True
-    _assert_agree(gui_res, headless_res,
-                  ("has_2d", "has_rsm", "has_phase_result"))
-
-    # DIVERGE (headless wins — record truth vs hydration state): the file
-    # contains 1D results and a scan table, but the inline panel only reports
-    # them after the load worker hydrates viewer rows / scan_data.  For
-    # gating a freshly opened processed scan the headless record answer is
-    # the truth; H18 should read the record, not the hydration mirrors.
-    assert gui_res.has_1d is False and headless_res.has_1d is True
-    assert gui_res.has_scan_metadata is False \
-        and headless_res.has_scan_metadata is True
-    assert gui_res.has_psi_metadata is False \
-        and headless_res.has_psi_metadata is True
+    # ResultCaps — UNIFIED on the record (was: headless wins on has_1d /
+    # scan_metadata / psi): the GUI now reads capabilities_for_processed over
+    # the loaded record instead of its hydration mirrors, so a freshly opened
+    # processed scan reports its 1D results and scan table BEFORE the load
+    # worker hydrates a single viewer row.
+    assert headless_res.has_1d is True
+    assert headless_res.has_scan_metadata is True
+    assert headless_res.has_psi_metadata is True
+    assert gui_res.has_raw is True and gui_res.raw_reachable is True
+    _assert_agree(gui_res, headless_res, RESULT_FIELDS)
+    assert gui_res == headless_res
 
 
 def test_processed_without_reachable_raw_parity(qapp, tmp_path):
@@ -349,28 +340,32 @@ def test_processed_without_reachable_raw_parity(qapp, tmp_path):
     assert headless_src.has_raw is True
     assert headless_src.raw_reachable is False   # ← probe truth
 
-    # DIVERGE (headless wins) — same inline collapse as the reachable-raw
-    # case: count_frames sees no frames, so F/F/F; the collapse cannot even
-    # EXPRESS "record present, raw missing" (its three fields are one bit).
-    assert gui_src.has_frames is False
-    assert gui_src.has_raw is False
-    assert gui_src.raw_reachable is False        # ← right value, wrong reason
+    # UNIFIED (was: GUI F/F/F for the wrong reason — the one-bit collapse
+    # could not even EXPRESS "record present, raw missing").  The delegated
+    # GUI answer is now T/T/F: right value, right reason.
+    assert gui_src.has_frames is True            # ← was False
+    assert gui_src.has_raw is True               # ← was False
+    assert gui_src.raw_reachable is False        # probe truth on both sides
+    _assert_agree(gui_src, headless_src, SOURCE_FIELDS)
 
-    # ResultCaps — JOINT overstatement (documented, not endorsed): BOTH sides
-    # claim raw_reachable=True while the master is gone.  The inline side
-    # collapses to loaded_scan_available; capabilities_for_processed mirrors
-    # the frames_record capability WITHOUT probing (by design — it must not
-    # reopen HDF5).  H18 decision: raw-dependent launcher gates must consult
-    # the describe_source_readiness probe (above, False) instead of trusting
-    # ResultCaps.raw_reachable.
-    assert gui_res.has_raw is True and gui_res.raw_reachable is True
+    # ResultCaps — the H18 hazard-2 resolution of the JOINT overstatement.
+    # The bare record mirror still reports raw_reachable=True (documented and
+    # deliberate: capabilities_for_processed must not reopen HDF5)...
     assert headless_res.has_raw is True and headless_res.raw_reachable is True
-    assert headless_src.raw_reachable is False   # the probe contradicts both
+    # ...but the core now accepts the probe answer, and the GUI consumes that
+    # probe-informed form, so raw-dependent launcher gating (ROI) sees the
+    # truth for an orphaned record:
+    probed_res = capabilities_for_processed(
+        get_metadata(nxs), raw_reachable=headless_src.raw_reachable)
+    assert probed_res.raw_reachable is False
+    assert gui_res.has_raw is True               # the record exists...
+    assert gui_res.raw_reachable is False        # ← was True (overstatement)
+    assert gui_res == probed_res
 
-    # Same record-vs-hydration divergences as the reachable-raw case.
-    assert gui_res.has_1d is False and headless_res.has_1d is True
+    # Record-vs-hydration fields, unified like the reachable-raw case.
+    assert gui_res.has_1d is True and headless_res.has_1d is True
     _assert_agree(gui_res, headless_res,
-                  ("has_2d", "has_rsm", "has_phase_result"))
+                  ("has_1d", "has_2d", "has_rsm", "has_phase_result"))
 
 
 def test_live_unknown_length_parity(qapp, tmp_path):
@@ -386,14 +381,12 @@ def test_live_unknown_length_parity(qapp, tmp_path):
     gui = state.source_caps
     headless = describe_source_readiness(SourceSpec(str(master), SourceKind.LIVE))
 
-    # THE H5 reconcile point (master table): both sides land T/T/T for a live
-    # run with a configured source, but by DIFFERENT mechanisms — the inline
-    # collapse treats live_unknown as ready (frame count None short-circuits
-    # source_ready), while the headless side applies the true-live escape
-    # hatch (a live acquisition may legitimately have no frame 0 yet, so
-    # raw_reachable stays True even when the probe cannot load an image).
-    # H18 must preserve BOTH behaviors when delegating: the escape hatch is
-    # the principled home for the inline shortcut.
+    # THE H5 reconcile point, RESOLVED as designed: both sides land T/T/T for
+    # a live run with a configured source, and the mechanism is now ONE — the
+    # GUI describes its live source as SourceSpec(label, LIVE) and inherits
+    # the true-live escape hatch (a live acquisition may legitimately have no
+    # frame 0 yet, so raw_reachable stays True even when nothing probes).
+    # The retired inline live_unknown collapse no longer exists.
     assert gui.has_frames is True and headless.has_frames is True
     assert gui.has_raw is True and headless.has_raw is True
     assert gui.raw_reachable is True and headless.raw_reachable is True
@@ -401,11 +394,12 @@ def test_live_unknown_length_parity(qapp, tmp_path):
     assert state.frame_count == 0
     assert state.run_target is RunTarget.SOURCE
 
-    # DIVERGE (panel wins for run gating) — LiveFrameSource optimistically
-    # advertises metadata/geometry capabilities; the panel gates on ACTUAL
-    # panel state (no PONI picked, nothing hydrated).  A live run without a
-    # calibration must stay blocked, so H18 keeps the panel's answer for the
-    # run gate and treats the source's claim as advisory.
+    # THE ONE REMAINING POLICY DIVERGENCE (pinned, deliberate — the explicit
+    # H18 decision): LiveFrameSource optimistically advertises
+    # metadata/geometry; those claims are ADVISORY.  For LIVE sources the
+    # panel state overlays the whole metadata family in the GUI's consumption
+    # (a live run without a calibration must stay blocked), so the panel's
+    # False wins here while the headless description keeps its claim.
     assert gui.has_metadata is False and headless.has_metadata is True
     assert gui.has_geometry is False and headless.has_geometry is True
     _assert_agree(gui, headless,
@@ -413,12 +407,12 @@ def test_live_unknown_length_parity(qapp, tmp_path):
 
 
 def test_live_without_configured_source_parity(qapp):
-    # Live with NO configured source label — the sides genuinely disagree.
-    # DIVERGE (GUI wins): the inline gate requires a source label even in
-    # live mode (a live run with nothing configured must not enable Run); the
-    # headless escape hatch trusts SourceKind.LIVE alone.  H18: the label
-    # requirement stays an outer GUI-side gate; the escape hatch governs only
-    # once a live source is actually configured.
+    # Live with NO configured source label — UNIFIED (was: GUI wins, with the
+    # headless escape hatch trusting SourceKind.LIVE alone).  H18 moved the
+    # label requirement INTO the core: describe_source_readiness refuses the
+    # escape hatch for an EMPTY location (nothing configured is never ready,
+    # live or not), so every consumer gets the safe answer — not just the
+    # wrapped GUI.
     # (Own test function: staticWidget.close() persists the session, so a
     # second widget inside the previous test would restore its source paths.)
     def cfg_empty(w):
@@ -430,12 +424,11 @@ def test_live_without_configured_source_parity(qapp):
     gui_empty = state_empty.source_caps
     headless_empty = describe_source_readiness(SourceSpec("", SourceKind.LIVE))
     assert state_empty.source_label == ""
-    assert gui_empty.has_frames is False          # inline: no label → not ready
-    assert gui_empty.has_raw is False
-    assert gui_empty.raw_reachable is False
-    assert headless_empty.has_frames is True      # headless: LIVE escape hatch
-    assert headless_empty.has_raw is True
-    assert headless_empty.raw_reachable is True
+    assert headless_empty.has_frames is False     # ← was True (escape hatch)
+    assert headless_empty.has_raw is False
+    assert headless_empty.raw_reachable is False
+    _assert_agree(gui_empty, headless_empty, SOURCE_FIELDS)
+    assert state_empty.run_target is RunTarget.NONE
 
 
 def test_unreachable_source_parity(qapp, tmp_path):
@@ -446,40 +439,34 @@ def test_unreachable_source_parity(qapp, tmp_path):
         lambda w: w._controls_v2_param(("Signal", "File")).setValue(str(missing)))
     gui = state.source_caps
 
-    # AGREE — raw_reachable: the headless frame-0 probe fails on the missing
-    # file, matching the inline collapse.
-    assert gui.raw_reachable is False
+    # UNIFIED (was: GUI wins) — the H18 hazard-1 fix landed in the CORE:
+    # describe_source_readiness now stats non-live local URIs before trusting
+    # open_source, which used to build an ImageFileSource around the typo'd
+    # path and claim a phantom frame_indices == [0].  A nonexistent path is
+    # all-False for every consumer (Tiled-style scheme:// URIs pass through
+    # un-stat-ed; LIVE specs keep the escape hatch — a live file may simply
+    # not exist yet).
+    assert headless.has_frames is False   # ← was True (phantom frame)
+    assert headless.has_raw is False
     assert headless.raw_reachable is False
+    _assert_agree(gui, headless, SOURCE_FIELDS)
+    assert gui == headless
 
-    # DIVERGE (GUI wins) — has_frames / has_raw: open_source builds an
-    # ImageFileSource for a NONEXISTENT path without stat-ing it, so the
-    # headless side claims a phantom frame_indices == [0] (has_frames=True,
-    # has_raw=True); the inline count's path.is_file() gate correctly reports
-    # no frames.  H18 HAZARD: naive delegation would flip has_frames
-    # False→True for a typo'd path and enable Run on nothing — the H18 gate
-    # must AND has_frames with raw_reachable for non-live sources (or teach
-    # describe_source_readiness to stat non-live URIs first).
-    assert gui.has_frames is False
-    assert gui.has_raw is False
-    assert headless.has_frames is True    # ← phantom frame on a missing file
-    assert headless.has_raw is True
-
-    _assert_agree(gui, headless, ("has_metadata", "has_motors", "has_energy",
-                                  "has_geometry", "has_psi_metadata"))
+    # And Run stays gated on nothing-to-run.
     assert state.run_target is not RunTarget.SOURCE
 
 
-def test_fresh_widget_reports_phantom_loaded_scan(qapp):
-    """PRE-EXISTING inline quirk, pinned (not fixed — H18 decision).
+def test_fresh_widget_reports_no_loaded_scan(qapp):
+    """H5 finding 3, FIXED by H18 (was pinned as a phantom).
 
     A fresh ``staticWidget`` constructs its LiveScan with
-    ``data_file=<scratch>/default.nxs`` (static_scan_widget._init_data_objects),
-    so ``loaded_scan_available`` — and with it the inline
-    ``ResultCaps.has_raw/raw_reachable`` and ``run_target=LOADED_SCAN`` — are
-    True before anything is loaded (the default file need not even exist).
-    There is no headless counterpart for "nothing loaded"; when H18 delegates
-    ResultCaps to ``capabilities_for_processed`` it should gate
-    loaded_scan_available on an actually-loaded record, not a default filename.
+    ``data_file=<scratch>/default.nxs`` (static_scan_widget._init_data_objects);
+    that placeholder used to leak into ``loaded_scan_available`` — and with it
+    the inline ``ResultCaps.has_raw/raw_reachable`` and
+    ``run_target=LOADED_SCAN`` — before anything was loaded.  The readiness
+    gate now recognizes the pristine scratch default: until frames hydrate,
+    publications exist, or ``data_file`` is re-pointed at a real record, an
+    empty widget reports NO loaded scan and run_target=NONE.
     """
     def cfg(w):
         w._controls_v2_param(("Signal", "File")).setValue("")
@@ -489,7 +476,7 @@ def test_fresh_widget_reports_phantom_loaded_scan(qapp):
 
     assert state.source_label == ""
     assert state.source_caps.has_frames is False
-    assert state.loaded_scan_available is True           # ← phantom
-    assert state.result_caps.has_raw is True             # ← phantom
-    assert state.result_caps.raw_reachable is True       # ← phantom
-    assert state.run_target is RunTarget.LOADED_SCAN     # ← phantom
+    assert state.loaded_scan_available is False          # ← was phantom True
+    assert state.result_caps.has_raw is False
+    assert state.result_caps.raw_reachable is False
+    assert state.run_target is RunTarget.NONE            # ← was LOADED_SCAN

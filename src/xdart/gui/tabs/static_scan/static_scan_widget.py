@@ -205,6 +205,11 @@ from xdart.modules.frame_publication import (
 from xdart.modules.wavelength import normalize_wavelength_m
 from xrd_tools.core import browse_publication_max_items
 from xrd_tools.core.energy import wavelength_m_to_energy_eV
+from xrd_tools.core.scan import SourceKind, SourceSpec
+from xrd_tools.sources.readiness import (
+    capabilities_for_processed,
+    describe_source_readiness,
+)
 from .ui.staticUI import Ui_Form
 from .h5viewer import H5Viewer, _qt_enum_value
 from .display_frame_widget import displayFrameWidget
@@ -565,6 +570,13 @@ class staticWidget(QWidget):
         self.dirname = self.local_path
 
         self.fname = os.path.join(self.dirname, 'default.nxs')
+        # H18 (H5 finding 3): remember the PRISTINE scratch placeholder so the
+        # readiness gate can tell "nothing loaded yet" from a genuinely
+        # loaded/processed scan.  LiveScan needs a default data_file, but that
+        # default must not make an empty widget report a phantom loaded scan
+        # (loaded_scan_available / ResultCaps.has_raw / run_target=LOADED_SCAN
+        # were all True on a fresh widget).
+        self._controls_v2_scratch_data_file = self.fname
         # J2: share ``file_lock`` with the scan so direct
         # LiveFrameSeries lazy loads use the same lock as the
         # wrangler's save paths.
@@ -2907,20 +2919,42 @@ class staticWidget(QWidget):
                                    for pub in pubs)
         except Exception:
             labels = ()
+        loaded_scan_file = self._controls_v2_loaded_scan_file(
+            loaded_frame_count=loaded_frame_count, labels=labels)
         loaded_scan_available = bool(
-            loaded_frame_count
-            or labels
-            or getattr(getattr(self, "scan", None), "data_file", None)
-        )
+            loaded_frame_count or labels or loaded_scan_file)
+        # H18: ResultCaps delegate to record truth (capabilities_for_processed
+        # over the loaded .nxs, with raw_reachable consulting the frame-0
+        # probe — H5 finding 2) OR-composed with in-memory truth (viewer rows,
+        # publications, hydrated scan_data).  When a scan counts as loaded but
+        # its record is unreadable (mid-run append, corrupt file), fall back to
+        # the pre-H18 optimistic loaded flag for the raw pair rather than
+        # flapping the launchers.
+        record_caps = self._controls_v2_loaded_result_caps(loaded_scan_file)
+        if record_caps is not None:
+            loaded_has_raw = record_caps.has_raw
+            loaded_raw_reachable = record_caps.raw_reachable
+        else:
+            loaded_has_raw = loaded_raw_reachable = loaded_scan_available
         result_caps = ResultCaps(
-            has_1d=has_1d,
-            has_2d=has_2d,
-            has_raw=source_ready or loaded_scan_available,
-            raw_reachable=source_ready or loaded_scan_available,
-            has_scan_metadata=has_scan_data,
-            has_rsm=bool(getattr(self.scan, "rsm_result", None)),
-            has_phase_result=False,
-            has_psi_metadata=has_scan_data,
+            has_1d=bool(
+                has_1d or (record_caps is not None and record_caps.has_1d)),
+            has_2d=bool(
+                has_2d or (record_caps is not None and record_caps.has_2d)),
+            has_raw=bool(source_caps.has_raw or loaded_has_raw),
+            raw_reachable=bool(
+                source_caps.raw_reachable or loaded_raw_reachable),
+            has_scan_metadata=bool(
+                has_scan_data
+                or (record_caps is not None and record_caps.has_scan_metadata)),
+            has_rsm=bool(
+                getattr(self.scan, "rsm_result", None)
+                or (record_caps is not None and record_caps.has_rsm)),
+            has_phase_result=bool(
+                record_caps is not None and record_caps.has_phase_result),
+            has_psi_metadata=bool(
+                has_scan_data
+                or (record_caps is not None and record_caps.has_psi_metadata)),
         )
         geom = GeomState(
             calibrated=self._controls_v2_calibrated(),
@@ -2991,8 +3025,8 @@ class staticWidget(QWidget):
             controls_locked=run_active,
         )
 
-    @staticmethod
     def _controls_v2_source_caps(
+        self,
         *,
         source_label: str,
         frame_count: int,
@@ -3003,22 +3037,193 @@ class staticWidget(QWidget):
         has_geometry: bool,
         has_psi_metadata: bool,
     ) -> tuple[SourceCaps, bool]:
+        """H18: ONE gating truth source.  The tri-fields
+        (``has_frames``/``has_raw``/``raw_reachable``) come from the headless
+        ``describe_source_readiness`` instead of the retired inline
+        ``has_frames = has_raw = raw_reachable = source_ready`` collapse.
+        Per the H5 parity findings the merge policy is:
+
+        * tri-fields — headless truth.  The panel's own wrangler frame count
+          is OR-ed into has_frames/has_raw (the wrangler counts filtered image
+          series the generic probe cannot parse) but NEVER into raw_reachable,
+          which stays frame-0 probe truth (live escape hatch included).
+        * metadata family — for NON-live sources, panel truth OR what the
+          source itself serves (a SPEC scan table / a processed record carries
+          metadata, motors, psi columns, geometry BEFORE any hydration — the
+          headless side genuinely knows more).  For LIVE sources the panel is
+          authoritative: ``LiveFrameSource`` optimistically advertises
+          metadata/geometry, and a live run without real panel metadata or
+          calibration must stay gated (its claims are advisory).
+        * has_energy — panel truth both ways: BEAM_ENERGY is a run-required
+          field and the run consumes the panel's energy resolution, never a
+          source-side claim.
+        * ``source_ready`` (what drives ``run_target=SOURCE``) stays the
+          panel's wrangler-runnability answer: a configured label plus a live
+          source or a positive wrangler frame count.  Capability truth for
+          readiness rows and launchers is delegated; what a fresh Run can
+          consume is still the wrangler's call (e.g. a processed ``.nxs``
+          reports record-truth caps but runs through Reintegrate).
+        """
         source_ready = bool(source_label) and (
             bool(live_unknown) or int(frame_count or 0) > 0
         )
+        headless = self._controls_v2_headless_source_caps(
+            source_label, live=bool(live_unknown))
+        counted = bool(not live_unknown and int(frame_count or 0) > 0)
+        if live_unknown:
+            merged_metadata = bool(has_metadata)
+            merged_motors = bool(has_motors)
+            merged_geometry = bool(has_geometry)
+            merged_psi = bool(has_psi_metadata)
+        else:
+            merged_metadata = bool(has_metadata or headless.has_metadata)
+            merged_motors = bool(has_motors or headless.has_motors)
+            merged_geometry = bool(has_geometry or headless.has_geometry)
+            merged_psi = bool(has_psi_metadata or headless.has_psi_metadata)
         return (
             SourceCaps(
-                has_frames=source_ready,
-                has_raw=source_ready,
-                raw_reachable=source_ready,
-                has_metadata=bool(has_metadata),
-                has_motors=bool(has_motors),
+                has_frames=bool(headless.has_frames or counted),
+                has_raw=bool(headless.has_raw or counted),
+                raw_reachable=bool(headless.raw_reachable),
+                has_metadata=merged_metadata,
+                has_motors=merged_motors,
                 has_energy=bool(has_energy),
-                has_geometry=bool(has_geometry),
-                has_psi_metadata=bool(has_psi_metadata),
+                has_geometry=merged_geometry,
+                has_psi_metadata=merged_psi,
             ),
             source_ready,
         )
+
+    def _controls_v2_headless_source_caps(
+            self, source_label: str, *, live: bool) -> SourceCaps:
+        """The delegated ``describe_source_readiness`` call.
+
+        A live source is described as ``SourceSpec(label, LIVE)`` — no file
+        IO: the true-live escape hatch answers without opening anything, so
+        live refresh stays cheap.  A non-live description opens and frame-0
+        probes the source, so it is cached on (label, mtime) exactly like the
+        wrangler frame count."""
+        label = str(source_label or "")
+        if not label:
+            return SourceCaps()
+        try:
+            if live:
+                return describe_source_readiness(
+                    SourceSpec(label, SourceKind.LIVE))
+            expanded = os.path.expanduser(label)
+            if os.path.isdir(expanded):
+                # DIR-2: a directory source is GUI-owned filtered-count
+                # territory.  Describing it headlessly would walk / open the
+                # contained HDF5 masters on every refresh — the exact
+                # per-refresh container opens the I/O contract forbids.  The
+                # wrangler's filtered count adds has_frames/has_raw evidence
+                # (composition rule 1); a count never manufactures
+                # raw_reachable (rule 2).
+                return SourceCaps()
+            cached = getattr(self, "_v2_source_caps_cache", None)
+            if self._controls_v2_run_active():
+                # Rule 5: an active run (including Pause) is never probed
+                # synchronously from the GUI thread — reuse the same-label
+                # snapshot, else answer conservatively without flapping.
+                if cached is not None and cached[0][0] == label:
+                    return cached[1]
+                return SourceCaps()
+            key = (label, self._controls_v2_source_identity_stamp(expanded))
+            if cached is not None and cached[0] == key:
+                return cached[1]
+            caps = describe_source_readiness(label)
+            self._v2_source_caps_cache = (key, caps)
+            return caps
+        except Exception:
+            logger.debug(
+                "Controls V2 headless source readiness failed", exc_info=True)
+            return SourceCaps()
+
+    @staticmethod
+    def _controls_v2_source_identity_stamp(path):
+        """R1-strength cheap cache identity: one ``stat`` plus the name-only
+        owning adapter — ``(size, mtime_ns, adapter_id)``; ``None`` when the
+        path cannot be statted.  Composition rules 2/3: cache identity is
+        SOURCE identity (path + version stamp + adapter owner), invalidated
+        on any of them changing, computed with zero file opens."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        try:
+            from xrd_tools.sources.adapters import candidate_owner
+            owner = candidate_owner(Path(path))
+            adapter_id = getattr(owner, "id", None)
+        except Exception:
+            adapter_id = None
+        return (int(st.st_size), int(st.st_mtime_ns), adapter_id)
+
+    def _controls_v2_loaded_scan_file(
+            self, *, loaded_frame_count: int, labels) -> str:
+        """Path of the ACTUALLY loaded processed scan, or ``""``.
+
+        H18 fix for H5 finding 3 (pre-existing bug): a fresh widget's LiveScan
+        is constructed around the scratch ``default.nxs`` placeholder
+        (``_init_data_objects``); until something is genuinely loaded or
+        processed (frames hydrated / publications present / ``data_file``
+        re-pointed) that placeholder must not count as a loaded scan."""
+        data_file = str(
+            getattr(getattr(self, "scan", None), "data_file", "") or "")
+        if not data_file:
+            return ""
+        if loaded_frame_count or labels:
+            return data_file
+        scratch = str(
+            getattr(self, "_controls_v2_scratch_data_file", "") or "")
+        try:
+            if scratch and (
+                os.path.abspath(os.path.expanduser(data_file))
+                == os.path.abspath(os.path.expanduser(scratch))
+            ):
+                return ""
+        except Exception:
+            logger.debug(
+                "Controls V2 scratch data-file compare failed", exc_info=True)
+        return data_file
+
+    def _controls_v2_loaded_result_caps(self, loaded_scan_file: str):
+        """Record-truth ``ResultCaps`` for the loaded processed scan, or None.
+
+        H18: delegate to ``capabilities_for_processed`` over the record's own
+        metadata instead of mirroring GUI hydration state (the record knows it
+        has 1D results and a scan table before the load worker hydrates any
+        viewer rows).  ``raw_reachable`` consults the headless frame-0 probe
+        (H5 finding 2: the ``frames_record`` capability alone overstates
+        reachability once the raw master is gone).  Cached on the R1-strength
+        identity stamp (path + size + mtime_ns + adapter owner, rules 2/3);
+        never touches the file during an active run — the record is being
+        appended and the panel is locked anyway."""
+        if not loaded_scan_file:
+            return None
+        path = os.path.expanduser(str(loaded_scan_file))
+        if not os.path.isfile(path):
+            return None
+        key = (path, self._controls_v2_source_identity_stamp(path))
+        cached = getattr(self, "_v2_result_caps_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        if self._controls_v2_run_active():
+            if cached is not None and cached[0][0] == path:
+                return cached[1]
+            return None
+        try:
+            from xrd_tools.io.read import get_metadata
+
+            caps = capabilities_for_processed(
+                get_metadata(path),
+                raw_reachable=describe_source_readiness(path).raw_reachable,
+            )
+        except Exception:
+            logger.debug(
+                "Controls V2 loaded-scan result caps failed", exc_info=True)
+            caps = None
+        self._v2_result_caps_cache = (key, caps)
+        return caps
 
     def _controls_v2_source_label(self) -> str:
         return self._controls_v2_configured_source_label()

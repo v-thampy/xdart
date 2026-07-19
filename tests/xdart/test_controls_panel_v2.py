@@ -2214,66 +2214,94 @@ def test_controls_panel_v2_metadata_probe_cache_tracks_directory_mtime(tmp_path)
     assert host._controls_v2_first_metadata_file() == str(raw)
 
 
-def test_controls_panel_v2_source_caps_match_headless_bridge_with_documented_divergences():
+def test_controls_panel_v2_source_caps_delegate_to_headless_readiness(
+        qapp, tmp_path):
+    """H18: ``_controls_v2_source_caps`` no longer constructs SourceCaps inline
+    (the ``has_frames = has_raw = raw_reachable = source_ready`` collapse is
+    GONE) — it DELEGATES the tri-fields to
+    ``xrd_tools.sources.readiness.describe_source_readiness`` over the real
+    configured source path.  Merge policy pinned here:
+
+    * non-live metadata family = panel truth OR source-served truth;
+    * has_energy = panel-only (BEAM_ENERGY is a run-required field);
+    * LIVE sources ride the core escape hatch for the tri-fields while their
+      optimistic metadata/geometry claims stay ADVISORY (panel truth only).
+    """
+    import h5py
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
-    from xrd_tools.core.scan import SourceCapabilities, SourceKind
+    from xrd_tools.core.scan import SourceKind, SourceSpec
     from xrd_tools.sources.readiness import describe_source_readiness
 
-    class _Source:
-        kind = SourceKind.NEXUS_STACK
-        capabilities = SourceCapabilities(
+    master = tmp_path / "scan_master.h5"
+    raw = np.arange(2 * 8 * 8, dtype=np.uint32).reshape(2, 8, 8)
+    with h5py.File(master, "w") as f:
+        f.create_dataset("entry/data/data", data=raw)
+
+    headless = describe_source_readiness(str(master))
+    assert headless.raw_reachable is True     # real file, real frame-0 probe
+    assert headless.has_metadata is False     # bare detector master
+
+    widget = staticWidget()
+    try:
+        gui, ready = widget._controls_v2_source_caps(
+            source_label=str(master),
+            frame_count=2,
+            live_unknown=False,
+            has_metadata=False,
+            has_motors=False,
+            has_energy=False,
+            has_geometry=False,
+            has_psi_metadata=False,
+        )
+        assert ready is True
+        assert gui == headless                # the delegation, field for field
+
+        # Panel truth the source cannot serve (hydrated metadata, PONI
+        # geometry, resolved energy) is OR-composed on top of the delegated
+        # answer for non-live sources.
+        gui_panel, _ready = widget._controls_v2_source_caps(
+            source_label=str(master),
+            frame_count=2,
+            live_unknown=False,
             has_metadata=True,
+            has_motors=True,
+            has_energy=True,
             has_geometry=True,
-            has_raw_references=True,
+            has_psi_metadata=True,
         )
-        frame_indices = [0, 1]
-        motors = {"omega": [0.1, 0.2]}
+        assert gui_panel.has_metadata is True and headless.has_metadata is False
+        assert gui_panel.has_motors is True
+        assert gui_panel.has_energy is True and headless.has_energy is False
+        assert gui_panel.has_geometry is True
+        assert (gui_panel.has_frames, gui_panel.has_raw,
+                gui_panel.raw_reachable) == (True, True, True)
 
-        def load_frame(self, index):
-            return np.ones((2, 2))
-
-        def metadata_for(self, index):
-            return {"energy_keV": 12.0, "psi": 0.3}
-
-    headless = describe_source_readiness(_Source())
-    gui, ready = staticWidget._controls_v2_source_caps(
-        source_label="/data/scan.nxs",
-        frame_count=2,
-        live_unknown=False,
-        has_metadata=headless.has_metadata,
-        has_motors=headless.has_motors,
-        has_energy=headless.has_energy,
-        has_geometry=headless.has_geometry,
-        has_psi_metadata=headless.has_psi_metadata,
-    )
-
-    assert ready is True
-    assert gui == headless
-
-    # Deliberate GUI divergences: the panel owns energy authority and loaded
-    # calibration state, so those two caps may differ from source-only metadata.
-    source_only = describe_source_readiness(
-        SimpleNamespace(
-            kind=SourceKind.NEXUS_STACK,
-            capabilities=SourceCapabilities(has_geometry=True),
-            frame_indices=[0],
-            load_frame=lambda index: np.ones((2, 2)),
-            metadata_for=lambda index: {},
+        # LIVE: the tri-fields come from the core true-live escape hatch, and
+        # the LiveFrameSource's optimistic metadata/geometry claims are
+        # advisory — the panel's actual state (here: nothing) wins, so a live
+        # run without real metadata/calibration stays gated.
+        live_headless = describe_source_readiness(
+            SourceSpec(str(master), SourceKind.LIVE))
+        assert live_headless.has_metadata is True     # the optimistic claim
+        assert live_headless.has_geometry is True
+        gui_live, ready_live = widget._controls_v2_source_caps(
+            source_label=str(master),
+            frame_count=0,
+            live_unknown=True,
+            has_metadata=False,
+            has_motors=False,
+            has_energy=False,
+            has_geometry=False,
+            has_psi_metadata=False,
         )
-    )
-    gui_panel, _ready = staticWidget._controls_v2_source_caps(
-        source_label="/data/scan.nxs",
-        frame_count=1,
-        live_unknown=False,
-        has_metadata=source_only.has_metadata,
-        has_motors=source_only.has_motors,
-        has_energy=True,
-        has_geometry=False,
-        has_psi_metadata=source_only.has_psi_metadata,
-    )
-
-    assert gui_panel.has_energy is True and source_only.has_energy is False
-    assert gui_panel.has_geometry is False and source_only.has_geometry is True
+        assert ready_live is True
+        assert (gui_live.has_frames, gui_live.has_raw,
+                gui_live.raw_reachable) == (True, True, True)
+        assert gui_live.has_metadata is False         # advisory claim overlaid
+        assert gui_live.has_geometry is False
+    finally:
+        widget.close()
+        widget.deleteLater()
 
 
 def test_controls_panel_v2_source_label_uses_configured_raw_source(
