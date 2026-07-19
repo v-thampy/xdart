@@ -673,6 +673,7 @@ class imageThread(wranglerThread):
         self._eiger_retry_after = {}
         self._eiger_zero_frame_seen = {}
         self._eiger_open_state = None
+        self._eiger_single_file_done = False  # finalized-consumed fixed point
         # R2: one sustained ContainerCursor per h5py-backed master (created,
         # read, and closed entirely on the prefetch owner thread) replaces the
         # raw persistent h5py.File/dataset for NeXus/Bluesky reads.  fabio stays
@@ -752,6 +753,7 @@ class imageThread(wranglerThread):
         self._eiger_retry_after.clear()
         self._eiger_zero_frame_seen.clear()
         self._eiger_open_state = None
+        self._eiger_single_file_done = False
         self._eiger_metadata_cache.clear()
         self._bluesky_source_cache.clear()
         # Start each run with an empty producer->consumer display slot so a frame
@@ -1538,7 +1540,16 @@ class imageThread(wranglerThread):
             self.flush_serial_tail(scan, force=True)
 
         # ── Phase 3: live watching ────────────────────────────────────────────
-        if self.live_mode and self.command != 'stop' and scan is not None:
+        # Rebind here: the collect loop binds series_average per frame, but a
+        # provisional single-file run (NXS-SF-2) can reach the watch with NO
+        # collected frame at all.
+        series_average = bool(getattr(self, "series_average", False))
+        # scan is None normally ends the run (nothing was collected) — EXCEPT
+        # for a provisional single-file container (nascent NXWriter shell /
+        # unlanded links), which must keep watching so the SAME run processes
+        # frames that land later (NXS-SF-2).
+        if (self.live_mode and self.command != 'stop'
+                and (scan is not None or self._eiger_single_file_watchable())):
             self.showLabel.emit('Watching for new files...')
             # Adaptive backoff between filesystem polls.  Starts tight
             # so first-frame latency is small (~100 ms vs the old fixed
@@ -3095,7 +3106,10 @@ class imageThread(wranglerThread):
         # per-frame metadata provider + all sustained reads (no repeated
         # per-container traversal).  fabio stays primary for real Eiger above.
         try:
-            from xrd_tools.sources.cursor import ContainerCursor
+            from xrd_tools.sources.cursor import (
+                ContainerCursor,
+                ContainerNotReadyError,
+            )
             from xrd_tools.sources.probe import ProbeState
 
             cursor = ContainerCursor(master_path, entry='entry').open()
@@ -3140,6 +3154,17 @@ class imageThread(wranglerThread):
                         'acquisition): %s', master_path)
             self._record_skip_reason('processed xdart output')
             self._eiger_open_state = "processed xdart output"
+            self._eiger_close_master()
+            self._eiger_nframes = 0
+        except ContainerNotReadyError as e:
+            # NXS-SF-2: a nascent container (an NXWriter shell before its
+            # detector tree, or a detector link whose target has not landed)
+            # is a typed provisional state, not an open error — keep it
+            # retryable by the caller's defer (directory) or watch
+            # (single-file) machinery.
+            logger.info('Container not ready yet (still being written), '
+                        'will retry: %s (%s)', master_path, e)
+            self._eiger_open_state = "not ready"
             self._eiger_close_master()
             self._eiger_nframes = 0
         except Exception as e:
@@ -3217,6 +3242,69 @@ class imageThread(wranglerThread):
             except Exception:
                 logger.debug('Failed to close replaced Eiger cursor', exc_info=True)
         return True
+
+    def _eiger_single_file_growth_outcome(self):
+        """Classify a single-file source at exhaustion: 'grown'|'wait'|'end'.
+
+        NXS-SF-1/SF-2 policy (handoff §6): a live run observes growth through
+        ONE bounded transactional cursor reopen (build-then-swap — a cached
+        ``Dataset.shape`` never grows without SWMR, so close-and-reopen is the
+        only honest refresh) and continues from the prior logical index.  A
+        nascent/not-ready container stays provisional ('wait'); a finalized
+        fully-consumed container is a fixed point ('end').  Batch/non-live
+        and Stop never wait.  This method never sleeps — the caller's watch
+        loop paces the retries with its own backoff.
+        """
+        from xrd_tools.sources.cursor import ContainerNotReadyError
+
+        stop_evt = getattr(self, '_prefetch_stop_evt', None)
+        if (not getattr(self, 'live_mode', False)
+                or getattr(self, 'batch_mode', False)
+                or getattr(self, 'command', None) == 'stop'
+                or (stop_evt is not None and stop_evt.is_set())):
+            return 'end'
+        if self._eiger_fabio_handle is not None:
+            # fabio-primary Eiger: the exhaustion recheck already reopened
+            # the handle; a still-exhausted declared nimages is this source's
+            # genuine end of stream (pre-existing semantics).
+            return 'end'
+        try:
+            if not self._eiger_reopen_cursor():
+                # Reopen succeeded but resolved no detector dataset: a
+                # definitive imageless container (a still-writing shell
+                # raises the typed not-ready error instead).
+                return 'end'
+        except ContainerNotReadyError:
+            return 'wait'          # nascent shell / unlanded link: retry later
+        except Exception:
+            logger.debug('single-file growth reopen failed for %s',
+                         self._eiger_master_path, exc_info=True)
+            return 'end'           # terminal (unsupported rank, vanished, ...)
+        self._emit_container_count(self._eiger_master_path, self._eiger_nframes)
+        if self._eiger_frame_idx < self._eiger_nframes:
+            return 'grown'
+        desc = self._eiger_descriptor
+        if desc is not None and getattr(desc, 'finalized', False):
+            return 'end'
+        return 'wait'
+
+    def _eiger_single_file_watchable(self):
+        """NXS-SF-2: whether a live single-file run should keep watching even
+        though the initial collect produced NO scan — i.e. the container is
+        still provisional (a nascent NXWriter shell, or links whose targets
+        have not landed).  Directory runs keep their own defer/queue
+        machinery; definitive outcomes (processed output, finalized
+        imageless, open error, finalized-and-consumed) never watch."""
+        if getattr(self, 'inp_type', None) == 'Image Directory':
+            return False
+        if getattr(self, '_eiger_single_file_done', False):
+            return False
+        if getattr(self, '_eiger_master_path', None) is None:
+            return False
+        if getattr(self, '_eiger_open_state', None) == 'not ready':
+            return True
+        desc = getattr(self, '_eiger_descriptor', None)
+        return desc is not None and not getattr(desc, 'finalized', True)
 
     @staticmethod
     def _h5_stack_nframes(dset):
@@ -3948,6 +4036,13 @@ class imageThread(wranglerThread):
                 # so a subsequent read sees frames written since it was opened
                 # (reopen-to-refresh, NOT a new SWMR policy).
                 self._eiger_reopen_cursor()
+            elif getattr(self, '_eiger_master_path', None) is not None:
+                # No handle at all — a single-file source whose detector tree
+                # landed after a provisional (not-ready) open.  Build the real
+                # cursor binding now so the tolerant read proceeds on the h5py
+                # path instead of burning the deadline on the fabio fallback
+                # (NXS-SF-2).
+                self._eiger_reopen_cursor()
         except Exception as e:
             logger.debug("Failed to refresh Eiger handle for %s: %s",
                          getattr(self, "_eiger_master_path", None), e)
@@ -3960,6 +4055,13 @@ class imageThread(wranglerThread):
         (_eiger_master_path, _eiger_frame_idx, _eiger_nframes).
         """
         while True:
+            # A finalized-and-consumed single file is a FIXED POINT: idle
+            # watch polls return end-of-stream with zero source opens
+            # (NXS-SF-1; handoff §8 "no spin-open while idle").
+            if (getattr(self, '_eiger_single_file_done', False)
+                    and self.inp_type != 'Image Directory'):
+                return None, None, 1, None, {}
+
             # ── Initialise on the very first call ────────────────────────────
             if self._eiger_master_path is None:
                 if self.inp_type == 'Image Directory':
@@ -4032,6 +4134,21 @@ class imageThread(wranglerThread):
                         self._eiger_close_or_defer_zero_frame_master()
                         continue
                 else:
+                    # NXS-SF-1/SF-2: a live single-file source may still be
+                    # growing (or nascent).  One bounded transactional reopen
+                    # observes growth; 'grown' continues from the PRIOR index
+                    # (never restarts at zero), 'wait' hands the watch loop a
+                    # sentinel to back off on, 'end' is the finalized fixed
+                    # point (or batch/stop) and closes the source.
+                    outcome = self._eiger_single_file_growth_outcome()
+                    if outcome == 'grown':
+                        continue
+                    if outcome == 'end':
+                        self._eiger_single_file_done = True
+                    # Close on 'end' AND 'wait': an idle provisional wait must
+                    # never pin a file another program is actively writing
+                    # (Windows writers fail loudly on pinned files — the DIR-3
+                    # class); the next watch poll reopens transactionally.
                     self._eiger_close_master()
                     return None, None, 1, None, {}
 
