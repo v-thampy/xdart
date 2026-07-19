@@ -8,9 +8,11 @@ This module is the pure bridge between those two shapes.
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,7 @@ __all__ = [
     "nxwriter_finalization_policy",
     "observe_raw_reachability",
     "RawReachabilityObservation",
+    "quiet_capability_observation",
 ]
 
 _ENERGY_KEYS = frozenset({
@@ -42,6 +45,65 @@ _ENERGY_KEYS = frozenset({
 })
 _PSI_KEYS = frozenset({"psi", "sin2psi", "sin^2psi", "chi", "eta"})
 _PHASE_CAPS = frozenset({"phase_result", "phase_fit", "phase_fractions"})
+
+logger = logging.getLogger(__name__)
+
+#: readers that emit generic expected-absence warnings while a capability
+#: observation opens a container (H18-R7)
+_READER_LOGGER_NAMES = ("xrd_tools.io.nexus", "xrd_tools.sources.nexus")
+_EXPECTED_ABSENCE_MARKERS = ("Energy not found", "Wavelength not derivable")
+
+
+class _ExpectedAbsenceFilter(logging.Filter):
+    def __init__(self):
+        super().__init__()
+        self.suppressed: list[str] = []
+
+    def filter(self, record):  # noqa: A003 - logging API name
+        message = record.getMessage()
+        if any(marker in message for marker in _EXPECTED_ABSENCE_MARKERS):
+            self.suppressed.append(message)
+            return False
+        return True
+
+
+@contextmanager
+def quiet_capability_observation(subject_path, subject_kind):
+    """H18-R7: a capability observation is not an operator problem report.
+
+    Missing energy/wavelength is EXPECTED for many raw detector masters (the
+    run's energy authority is the selected PONI), so the generic readers'
+    per-open WARNINGs are suppressed for the duration of the observation and
+    replaced by ONE structured DEBUG line that names the exact path and
+    whether the subject is the configured acquisition source or the selected
+    processed result.  Warnings that are not expected-absence pass through
+    unchanged.
+    """
+    absence_filter = _ExpectedAbsenceFilter()
+    reader_loggers = [logging.getLogger(name) for name in _READER_LOGGER_NAMES]
+    for reader_logger in reader_loggers:
+        reader_logger.addFilter(absence_filter)
+    try:
+        yield
+    finally:
+        for reader_logger in reader_loggers:
+            reader_logger.removeFilter(absence_filter)
+        if absence_filter.suppressed:
+            logger.debug(
+                "readiness observation for %s (%s): %s — expected absence; "
+                "the run's energy authority is the selected PONI",
+                subject_path, subject_kind,
+                "; ".join(sorted(set(absence_filter.suppressed))))
+
+
+def _observation_subject(value) -> tuple[str, str]:
+    uri = _uri(value)
+    kind = getattr(value, "kind", None)
+    subject = ("selected processed result"
+               if kind == SourceKind.PROCESSED_NEXUS
+               else "configured acquisition source")
+    return str(uri if uri is not None else value), subject
+
 
 
 def describe_source_readiness(spec_or_source: Any, *, probe: bool = True) -> SourceCaps:
@@ -69,6 +131,12 @@ def describe_source_readiness(spec_or_source: Any, *, probe: bool = True) -> Sou
     if gated is not None:
         return gated
 
+    subject_path, subject_kind = _observation_subject(spec_or_source)
+    with quiet_capability_observation(subject_path, subject_kind):
+        return _describe_open_source(spec_or_source, probe=probe)
+
+
+def _describe_open_source(spec_or_source: Any, *, probe: bool = True) -> SourceCaps:
     source = _open_source(spec_or_source)
     if source is None:
         return _caps_from_classification(spec_or_source)
@@ -419,6 +487,12 @@ def observe_raw_reachability(spec_or_source: Any) -> RawReachabilityObservation:
     if gated is not None:
         return RawReachabilityObservation(
             bool(gated.raw_reachable), True, "spec gate")
+    subject_path, subject_kind = _observation_subject(spec_or_source)
+    with quiet_capability_observation(subject_path, subject_kind):
+        return _observe_raw_reachability_open(spec_or_source)
+
+
+def _observe_raw_reachability_open(spec_or_source: Any) -> RawReachabilityObservation:
     source = _open_source(spec_or_source)
     if source is None:
         caps = _caps_from_classification(spec_or_source)

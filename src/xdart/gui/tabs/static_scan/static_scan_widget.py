@@ -211,6 +211,7 @@ from xrd_tools.sources.readiness import (
     capabilities_for_processed,
     describe_source_readiness,
     observe_raw_reachability,
+    quiet_capability_observation,
 )
 
 
@@ -3308,7 +3309,11 @@ class staticWidget(QWidget):
             spec = SourceSpec(
                 path, SourceKind.PROCESSED_NEXUS,
                 options=({"source_root": root} if root else {}))
-            metadata = get_metadata(path)
+            # H18-R7: the record read is a capability observation — expected
+            # energy/wavelength absence stays quiet and contextual.
+            with quiet_capability_observation(
+                    path, "selected processed result"):
+                metadata = get_metadata(path)
             # H18-R5: the typed probe seam — a transient probe error is NOT a
             # definitive unreachable observation; treat it exactly like a
             # transient metadata failure (debounce + retry, never cached).
@@ -3479,14 +3484,18 @@ class staticWidget(QWidget):
                 self._v2_frame_count_cache = (key, count, True)
                 return count
 
-        count = self._controls_v2_count_source_frames(
-            source_type=source_type,
-            img_file=img_file or nexus_file,
-            img_dir=img_dir,
-            img_ext=img_ext,
-            include_subdir=include_subdir,
-            file_filter=file_filter,
-        )
+        # H18-R7: the frame count opens the container — a capability
+        # observation; expected energy/wavelength absence stays quiet.
+        with quiet_capability_observation(
+                source_path, "configured acquisition source"):
+            count = self._controls_v2_count_source_frames(
+                source_type=source_type,
+                img_file=img_file or nexus_file,
+                img_dir=img_dir,
+                img_ext=img_ext,
+                include_subdir=include_subdir,
+                file_filter=file_filter,
+            )
         self._v2_frame_count_cache = (key, count, False)
         return count
 

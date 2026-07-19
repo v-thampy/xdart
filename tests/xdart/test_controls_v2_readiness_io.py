@@ -254,3 +254,41 @@ def test_processed_record_caps_read_metadata_once(widget, tmp_path, monkeypatch)
     assert opens.count(target) == first_opens, \
         "unchanged processed record must not be reopened per refresh"
     assert caps2 == caps1
+
+
+def test_readiness_probing_is_quiet_about_expected_energy_absence(
+        widget, tmp_path, monkeypatch, caplog):
+    """H18-R7: capability observations of energy-less containers must not
+    flood the operator with generic 'Energy not found'/'Wavelength not
+    derivable' WARNINGs (missing energy is expected — the run's energy
+    authority is the selected PONI); opens stay bounded across the configure
+    cascade, and readiness itself is unchanged."""
+    import logging
+
+    master = _eiger_master(tmp_path)                 # no energy fields
+    opens = _arm_open_counter(monkeypatch)
+    target = os.path.abspath(str(master))
+
+    with caplog.at_level(logging.DEBUG):
+        _configure_master(widget, master)
+        state = widget._controls_v2_state()
+        # the processed-result probe leg: an energy-less processed record
+        from tests.xdart.test_h5_readiness_parity import _processed_nxs
+        processed = _processed_nxs(tmp_path, raw_reachable=True)
+        widget.scan.data_file = str(processed)
+        widget._controls_v2_state()
+
+    flood = [r for r in caplog.records
+             if r.levelno >= logging.WARNING
+             and ("Energy not found" in r.getMessage()
+                  or "Wavelength not derivable" in r.getMessage())]
+    assert not flood, \
+        f"expected-absence must be quiet, saw {len(flood)} WARNING(s)"
+    # the ONE structured observation line names the exact path + subject
+    contextual = [r for r in caplog.records
+                  if "readiness observation for" in r.getMessage()]
+    assert any(target in r.getMessage()
+               and "configured acquisition source" in r.getMessage()
+               for r in contextual)
+    assert state.source_caps.has_frames is True      # readiness unchanged
+    assert 1 <= opens.count(target) <= 30            # bounded cascade
