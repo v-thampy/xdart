@@ -223,12 +223,28 @@ class ScanPlotDialog(QtWidgets.QDialog):
         return (str(selection.spec.uri), opts.get("scan"),
                 getattr(selection.spec, "entry", None))
 
+    @staticmethod
+    def _open_selected_source(spec):
+        """Open a ``FrameSource`` from a value-only selection's spec, on demand
+        (H19 §3).  The ROI consumer owns this source's lifecycle; returns
+        ``None`` (and logs) on failure, so the ROI button stays gated."""
+        if spec is None:
+            return None
+        from xrd_tools.sources import open_source
+        try:
+            return open_source(spec)
+        except Exception:
+            logger.exception(
+                "scan-plot: open_source failed for %s",
+                getattr(spec, "uri", None))
+            return None
+
     def _on_source_selected(self, selection):
         """The ScanSourceWidget chose a source.  A NEW scan rebuilds the table
         wholesale (and aborts any in-flight ROI run); when only the raw/image
         pairing of the SAME scan changed, refresh the source + ROI gating WITHOUT
         wiping the table or the user's computed ROI columns."""
-        if selection is None or selection.source is None:
+        if selection is None:
             self._abort_roi_run()
             self._source = None
             self._source_uri = None
@@ -241,7 +257,10 @@ class ScanPlotDialog(QtWidgets.QDialog):
             return
         identity = self._selection_identity(selection)
         same_scan = identity is not None and identity == self._scan_identity
-        self._source = selection.source
+        # H19 §3: the widget hands a VALUE-ONLY selection; this consumer opens
+        # its OWN source on demand from the spec, so no live FrameSource/handle
+        # crosses the widget's async-probe boundary.
+        self._source = self._open_selected_source(selection.spec)
         self._source_uri = str(selection.spec.uri) if selection.spec else None
         self._raw_reachable = bool(selection.reachable)
         self._first_image = selection.first_image
@@ -274,7 +293,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         processed NeXus, else the source's own per-frame metadata (which is just
         ``frame_index`` for a metadata-less image stack)."""
         from xrd_tools.core.scan import SourceKind
-        spec, source = selection.spec, selection.source
+        spec, source = selection.spec, self._source
         table = {}
         if spec is not None and spec.kind is SourceKind.PROCESSED_NEXUS:
             from xrd_tools.io import read_scan_data
@@ -295,7 +314,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         the source's own ``motors`` keys.  Best-effort: a read failure yields no
         hint (X then falls back to ``frame_index``)."""
         from xrd_tools.core.scan import SourceKind
-        spec, source = selection.spec, selection.source
+        spec, source = selection.spec, self._source
         if spec is not None and spec.kind is SourceKind.PROCESSED_NEXUS:
             from xrd_tools.io import get_metadata
             try:

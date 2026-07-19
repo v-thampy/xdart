@@ -2,10 +2,13 @@
 """Shared scan-source widget (the §3 design of design_shared_source_panel).
 
 One reusable, kind-general source picker — used by the ROI Scan Plotter now and
-the stitch/RSM wrangler later.  It assembles a :class:`SourceSpec`, opens it, and
-emits a :class:`ScanSelection` (spec + opened FrameSource + raw-reachable flag +
-the first frame) via :data:`sigSourceChanged`.  All parsing/IO is headless
-(`xrd_tools.sources` / `io`); this is the thin Qt layer.
+the stitch/RSM wrangler later.  It assembles a :class:`SourceSpec`, opens it in
+its probe worker only to read the raw-reachable flag and a COPY of the first
+frame, closes it there, and emits a VALUE-ONLY :class:`ScanSelection`
+(spec + raw-reachable flag + first-frame copy) via :data:`sigSourceChanged`
+(H19 §3: no live ``FrameSource`` / file handle crosses the worker boundary — a
+consumer opens its own source from the spec on demand).  All parsing/IO is
+headless (`xrd_tools.sources` / `io`); this is the thin Qt layer.
 
 Two entry modes (§2.2): a single master **File**, or a **Directory** + a
 Scan-kind dropdown (`discover_scans`).  The Scan selector then lists the
@@ -36,15 +39,23 @@ _TIFF_SUFFIXES = {".tif", ".tiff"}
 _RAW_DTYPES = ["int32", "uint32", "int16", "uint16", "float32", "float64"]
 
 
-@dataclass
+@dataclass(frozen=True)
 class ScanSelection:
-    """The widget's output: an opened, classified scan source."""
+    """The widget's output: a VALUE-ONLY classified scan observation.
 
-    spec: object               # SourceSpec | None
-    source: object             # FrameSource | None
+    H19 §3: no live ``FrameSource`` / file handle crosses the async worker
+    boundary or survives its scope.  The worker opens the source, probes the
+    first frame, then CLOSES the source inside its own scope; only these value
+    fields cross to the Qt thread.  A consumer that needs to iterate frames
+    opens its own source from :attr:`spec` on demand (see the ROI Scan
+    Plotter).
+    """
+
+    spec: object               # SourceSpec | None (a value)
     label: str
     reachable: bool            # raw frames loadable (probe) — independent of metadata
-    first_image: object        # ndarray | None (the probed frame; reused by ROI)
+    first_image: object        # ndarray | None — a COPY of the probed frame (owns its
+                               # buffer; safe after the worker's source is closed)
 
 
 class ScanSourceWidget(QtWidgets.QWidget):
@@ -431,7 +442,7 @@ class ScanSourceWidget(QtWidgets.QWidget):
 
     def _finish_sync_probe(self, spec, sig):
         try:
-            source, reachable, first_image = self._open_source_and_probe(spec)
+            reachable, first_image = self._probe_source(spec)
         except Exception:
             logger.exception("scan-source: open_source failed for %s", spec.uri)
             self._last_sig = self._last_selection = None
@@ -440,18 +451,34 @@ class ScanSourceWidget(QtWidgets.QWidget):
             return
         self._set_dot(reachable)
         selection = ScanSelection(
-            spec=spec, source=source, label=self._candidate_label(spec),
+            spec=spec, label=self._candidate_label(spec),
             reachable=reachable, first_image=first_image)
         self._last_sig, self._last_selection = sig, selection
         self.sigSourceChanged.emit(selection)
 
     @staticmethod
-    def _open_source_and_probe(spec):
+    def _probe_source(spec):
+        """VALUE-ONLY probe (H19 §3): open the source, probe the first frame,
+        then CLOSE the source inside this scope so no ``FrameSource`` / file
+        handle escapes to the Qt thread or survives the worker.  Returns
+        ``(reachable, first_image)`` where ``first_image`` is a COPY that owns
+        its buffer, so it stays valid after the source is closed."""
         from xrd_tools.sources import open_source
 
         source = open_source(spec)
-        reachable, first_image = probe_first_frame(source)
-        return source, reachable, first_image
+        try:
+            reachable, first_image = probe_first_frame(source)
+            if first_image is not None:
+                first_image = np.array(first_image, copy=True)
+        finally:
+            closer = getattr(source, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:
+                    logger.debug(
+                        "scan-source: source close failed", exc_info=True)
+        return reachable, first_image
 
     def _start_async_probe(self, spec, sig):
         self._probe_generation += 1
@@ -466,10 +493,10 @@ class ScanSourceWidget(QtWidgets.QWidget):
 
         def _work():
             try:
-                source, reachable, first_image = self._open_source_and_probe(spec)
-                return gen, sig, spec, source, reachable, first_image, None
+                reachable, first_image = self._probe_source(spec)
+                return gen, sig, spec, reachable, first_image, None
             except Exception as exc:  # pragma: no cover - logged in GUI path
-                return gen, sig, spec, None, False, None, exc
+                return gen, sig, spec, False, None, exc
 
         future = self._probe_executor.submit(_work)
 
@@ -479,7 +506,7 @@ class ScanSourceWidget(QtWidgets.QWidget):
             except CancelledError:
                 return
             except Exception as exc:  # pragma: no cover - defensive callback guard
-                result = (gen, sig, spec, None, False, None, exc)
+                result = (gen, sig, spec, False, None, exc)
             try:
                 self.sigProbeDone.emit(result)
             except RuntimeError:
@@ -491,15 +518,15 @@ class ScanSourceWidget(QtWidgets.QWidget):
         future.add_done_callback(_emit_done)
 
     def _on_probe_done(self, result):
-        gen, sig, spec, source, reachable, first_image, exc = result
+        gen, sig, spec, reachable, first_image, exc = result
         if gen != self._probe_generation or sig != self._pending_sig:
             return
         self._pending_sig = None
-        if exc is not None or source is None:
+        if exc is not None:
             logger.warning(
                 "scan-source: open_source failed for %s",
                 spec.uri,
-                exc_info=(type(exc), exc, exc.__traceback__) if exc is not None else None,
+                exc_info=(type(exc), exc, exc.__traceback__),
             )
             self._last_sig = self._last_selection = None
             self._set_dot(False)
@@ -507,7 +534,7 @@ class ScanSourceWidget(QtWidgets.QWidget):
             return
         self._set_dot(reachable)
         selection = ScanSelection(
-            spec=spec, source=source, label=self._candidate_label(spec),
+            spec=spec, label=self._candidate_label(spec),
             reachable=reachable, first_image=first_image)
         self._last_sig, self._last_selection = sig, selection
         self.sigSourceChanged.emit(selection)

@@ -54,6 +54,14 @@ def _wait_for(qapp, predicate, timeout=3.0):
     return False
 
 
+def _open(sel):
+    """Open the source a VALUE-ONLY selection points at.  H19 §3: the widget no
+    longer hands a live FrameSource across its async-probe boundary — a consumer
+    opens its own from ``sel.spec``."""
+    from xrd_tools.sources import open_source
+    return open_source(sel.spec)
+
+
 def test_widget_spec_metadata_then_images(qapp, tmp_path):
     from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
     from xrd_tools.core.scan import SourceKind
@@ -67,7 +75,8 @@ def test_widget_spec_metadata_then_images(qapp, tmp_path):
         sel = emitted[-1]
         assert sel is not None and sel.spec.kind is SourceKind.SPEC
         assert sel.reachable is False                 # no images yet → metadata only
-        assert sel.source.frame_indices == [0, 1, 2]  # scan 5 (default, first)
+        assert not hasattr(sel, "source")             # value-only: no live source (H19 §3)
+        assert _open(sel).frame_indices == [0, 1, 2]  # scan 5 (default, first)
         # the multi-scan selector lists both scans
         assert [w.scan_combo.itemText(i) for i in range(w.scan_combo.count())] == \
             ["myscan [5.1]", "myscan [6.1]"]
@@ -81,8 +90,12 @@ def test_widget_spec_metadata_then_images(qapp, tmp_path):
         sel2 = emitted[-1]
         assert sel2.reachable is True
         assert "● raw" in w.raw_dot.text()
-        np.testing.assert_allclose(sel2.source.load_frame(0), 1.0)
-        np.testing.assert_allclose(sel2.source.load_frame(2), 3.0)
+        src2 = _open(sel2)
+        np.testing.assert_allclose(src2.load_frame(0), 1.0)
+        np.testing.assert_allclose(src2.load_frame(2), 3.0)
+        # the value-only probe still carried the decoded first frame as a COPY
+        assert sel2.first_image is not None
+        np.testing.assert_allclose(np.asarray(sel2.first_image), 1.0)
     finally:
         w.deleteLater()
 
@@ -137,9 +150,9 @@ def test_widget_scan_switch_reloads(qapp, tmp_path):
     w.sigSourceChanged.connect(lambda sel: emitted.append(sel))
     try:
         w.set_uri(str(spec))
-        assert emitted[-1].source.frame_indices == [0, 1, 2]   # scan 5
+        assert _open(emitted[-1]).frame_indices == [0, 1, 2]   # scan 5
         w.scan_combo.setCurrentIndex(1)                        # → scan 6 (2 pts)
-        assert emitted[-1].source.frame_indices == [0, 1]
+        assert _open(emitted[-1]).frame_indices == [0, 1]
         assert "6.1" in emitted[-1].spec.options["scan"]
     finally:
         w.deleteLater()
@@ -160,7 +173,7 @@ def test_widget_directory_mode_discovers_scans(qapp, tmp_path):
         # both SPEC scans discovered in the folder
         assert [w.scan_combo.itemText(i) for i in range(w.scan_combo.count())] == \
             ["myscan [5.1]", "myscan [6.1]"]
-        assert emitted[-1].source.frame_indices == [0, 1, 2]
+        assert _open(emitted[-1]).frame_indices == [0, 1, 2]
     finally:
         w.deleteLater()
 
@@ -188,7 +201,7 @@ def test_widget_async_probe_emits_latest_selection(qapp, tmp_path):
         assert _wait_for(qapp, lambda: emitted[-1] is not first)
         sel = emitted[-1]
         assert sel.reachable is True
-        np.testing.assert_allclose(sel.source.load_frame(0), 1.0)
+        np.testing.assert_allclose(_open(sel).load_frame(0), 1.0)
     finally:
         w.shutdown_probe_worker()
         w.deleteLater()
@@ -206,7 +219,8 @@ def test_widget_async_probe_ignores_stale_generation(qapp, tmp_path):
         sig = w._spec_signature(spec)
         w._probe_generation = 2
         w._pending_sig = sig
-        w._on_probe_done((1, sig, spec, object(), True, None, None))
+        # value-only result tuple: (gen, sig, spec, reachable, first_image, exc)
+        w._on_probe_done((1, sig, spec, True, None, None))
         assert emitted == []
         assert w._last_selection is None
     finally:
