@@ -73,3 +73,8 @@ def test_directory_index_module_imports_without_gui_stack() -> None:
 
 def test_discover_module_imports_without_gui_stack() -> None:
     _assert_module_imports_without_gui("xrd_tools.sources.discover")
+
+
+def test_run_plan_module_imports_without_gui_stack() -> None:
+    # H19 §4: the Source-card -> Run handoff seam stays Qt-free.
+    _assert_module_imports_without_gui("xrd_tools.sources.run_plan")
