@@ -273,3 +273,23 @@ def test_live_spec_keeps_escape_hatch_when_open_fails(monkeypatch):
     assert caps.raw_reachable is True
     assert caps.has_frames is True
     assert caps.has_raw is True
+
+
+def test_readiness_import_purity_subprocess():
+    """H18 rule 7: importing xrd_tools.sources.readiness must not eagerly
+    import Qt, pyqtgraph, h5py, fabio, or pyFAI."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys; import xrd_tools.sources.readiness; "
+        "bad = sorted(m.split(chr(46))[0] for m in sys.modules "
+        "if m.split(chr(46))[0] in ("
+        "chr(80)+chr(121)+chr(83)+chr(105)+chr(100)+chr(101)+chr(54), "
+        "\"PyQt5\", \"PyQt6\", \"pyqtgraph\", \"h5py\", \"fabio\", \"pyFAI\")); "
+        "print(\",\".join(bad)); sys.exit(1 if bad else 0)"
+    )
+    proc = subprocess.run([sys.executable, "-c", code],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, (
+        f"heavy modules imported eagerly: {proc.stdout.strip()}")

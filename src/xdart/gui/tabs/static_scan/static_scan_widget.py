@@ -3310,6 +3310,17 @@ class staticWidget(QWidget):
             self._v2_source_count_is_files = bool(
                 cached[2] if len(cached) > 2 else False)
             return cached[1]
+        if cached is not None and self._controls_v2_run_active():
+            # H18 rule 5: an active run (including Pause) is never probed
+            # synchronously from the GUI thread.  A mid-run version-stamp
+            # change (the writer/detector appending to the very source being
+            # consumed) must not trigger a fresh count/open — the run-start
+            # snapshot answers until the run ends; the config half of the key
+            # cannot change while the plan is frozen.
+            if cached[0][:7] == key[:7]:
+                self._v2_source_count_is_files = bool(
+                    cached[2] if len(cached) > 2 else False)
+                return cached[1]
         self._v2_source_count_is_files = False
 
         # Directories of CONTAINER files: DO NOT pre-count frames
