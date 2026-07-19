@@ -3310,7 +3310,8 @@ class staticWidget(QWidget):
             self._v2_source_count_is_files = bool(
                 cached[2] if len(cached) > 2 else False)
             return cached[1]
-        if cached is not None and self._controls_v2_run_active():
+        _run_active = getattr(self, "_controls_v2_run_active", None)
+        if cached is not None and callable(_run_active) and _run_active():
             # H18 rule 5: an active run (including Pause) is never probed
             # synchronously from the GUI thread.  A mid-run version-stamp
             # change (the writer/detector appending to the very source being
