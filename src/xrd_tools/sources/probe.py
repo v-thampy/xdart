@@ -61,12 +61,25 @@ def observe_first_frame(source):
         return False, None, False
     try:
         idxs = list(source.frame_indices)
+    except TRANSIENT_PROBE_ERRORS:
+        # H18-R15: an enumeration-time sharing denial is retry-worthy too.
+        return False, None, True
     except Exception:
         return False, None, False
     if not idxs:
         return False, None, False
+    return observe_frame(source, idxs[0])
+
+
+def observe_frame(source, index):
+    """Typed single-frame load observation — NO enumeration (H18-R15).
+
+    Callers that already hold an authoritative frame index use this so the
+    open → enumerate → load route enumerates ``frame_indices`` exactly once;
+    a probe-time re-enumeration could hit a transient denial and silently
+    convert an enumerable, loadable source into a definitive unreachable."""
     try:
-        img = np.asarray(source.load_frame(idxs[0]))
+        img = np.asarray(source.load_frame(index))
     except TRANSIENT_PROBE_ERRORS:
         return False, None, True
     except Exception:

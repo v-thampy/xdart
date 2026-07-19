@@ -268,25 +268,30 @@ def test_stale_missing_data_file_is_not_a_loaded_scan(widget, tmp_path):
 
 # ── H18-R2: source_root-aware processed reachability ──────────────────────
 
-def _relative_source_nxs(nxs_dir, root, *, source_rel="raw/scan_master.h5"):
+def _relative_source_nxs(nxs_dir, root, *, source_rel="raw/scan_master.h5",
+                         first_label=0):
     """Processed record whose frame source is RELATIVE and whose raw master
     lives under ``root`` (not under the record's own directory), with a stale
-    absolute ``@source_base`` — reachable only via explicit source_root."""
+    absolute ``@source_base`` — reachable only via explicit source_root.
+    ``first_label`` writes a zero- or ONE-based record (real Eiger records
+    are commonly one-based, H18-R13)."""
     nxs = nxs_dir / "browsed.nxs"
     raw_dir = root / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
     _eiger_master(raw_dir)
     thumb = np.linspace(0, 100, 16 * 16).reshape(16, 16)
+    frame_name = f"frame_{int(first_label):04d}"
     with h5py.File(nxs, "w") as f:
         e = f.create_group("entry")
         e.attrs["source_base"] = "/stale/absolute/base"     # N1: loses to root
         g = e.create_group("integrated_1d")
         g.create_dataset("intensity", data=np.zeros((1, 5)))
-        g.create_dataset("frame_index", data=np.array([0], dtype=np.int64))
-        s = e.create_group("frames/frame_0000/source")
+        g.create_dataset(
+            "frame_index", data=np.array([int(first_label)], dtype=np.int64))
+        s = e.create_group(f"frames/{frame_name}/source")
         s.create_dataset("path", data=np.bytes_(source_rel))
         s.create_dataset("frame_index", data=1)
-        _write_thumbnail(e["frames/frame_0000"], "thumbnail", thumb)
+        _write_thumbnail(e[f"frames/{frame_name}"], "thumbnail", thumb)
     return nxs
 
 
@@ -492,16 +497,16 @@ def test_transient_raw_probe_failure_debounces_and_retries(
     import xrd_tools.sources.probe as probe_module
 
     processed = _processed_nxs(tmp_path, raw_reachable=True)
-    real = probe_module.observe_first_frame
+    real = probe_module.observe_frame
     calls = {"n": 0}
 
-    def once_transient(source):
+    def once_transient(source, index):
         calls["n"] += 1
         if calls["n"] == 1:
             raise PermissionError("transient sharing denial")
-        return real(source)
+        return real(source, index)
 
-    monkeypatch.setattr(probe_module, "observe_first_frame", once_transient)
+    monkeypatch.setattr(probe_module, "observe_frame", once_transient)
     widget._v2_result_caps_retry_delay = 0.0
 
     first = widget._controls_v2_loaded_result_caps(str(processed))
@@ -563,3 +568,51 @@ def test_acquisition_master_publication_proves_its_own_processed_output(
     assert state.result_caps.raw_reachable is True, \
         "the record's own acquisition master must prove it across " \
         "directories (H18-R9)"
+
+
+# ── H18-R13: one-based records through the natural lifecycle ──────────────
+
+def test_one_based_record_provenance_through_natural_lifecycle(
+        widget, tmp_path, monkeypatch):
+    """H18-R13: a ONE-based processed record (frames start at frame_0001 —
+    the real Eiger shape) resolves its stored provenance by default, driven
+    only through the natural Controls V2 lifecycle: an idle refresh caches
+    the record identity, then the paused acquisition master's resident raw
+    publication proves ITS OWN output."""
+    raw_root = tmp_path / "raw_tree"
+    out_dir = tmp_path / "processed_out"
+    out_dir.mkdir()
+    nxs = _relative_source_nxs(out_dir, raw_root, first_label=1)
+    widget.wrangler.project_folder = str(raw_root)
+    widget.scan.data_file = str(nxs)
+
+    idle = widget._controls_v2_state()        # NATURAL idle refresh: probes+caches
+    assert idle.result_caps.raw_reachable is True
+
+    monkeypatch.setattr(widget, "_controls_v2_run_active", lambda: True)
+    master = raw_root / "raw" / "scan_master.h5"
+    _raw_publication(widget.publication_store, source_identity=str(master),
+                     raw=np.ones((4, 4), dtype=np.uint16))
+
+    state = widget._controls_v2_state()
+    assert state.result_caps.raw_reachable is True, \
+        "a one-based record's provenance must resolve by default (H18-R13)"
+
+
+def test_resolved_raw_source_default_uses_first_stored_frame(tmp_path):
+    """H18-R13 core: the accessor's DEFAULT means the first actual stored
+    source-bearing frame; explicit labels stay exact and fail closed."""
+    from xrd_tools.io.read import resolved_raw_source
+
+    raw_root = tmp_path / "tree"
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    nxs = _relative_source_nxs(out_dir, raw_root, first_label=1)
+
+    assert resolved_raw_source(
+        nxs, source_root=str(raw_root)) is not None, \
+        "default must find the first stored frame of a one-based record"
+    assert resolved_raw_source(
+        nxs, frame=1, source_root=str(raw_root)) is not None
+    assert resolved_raw_source(nxs, frame=0, source_root=str(raw_root)) is None, \
+        "an explicit missing label must fail closed"

@@ -785,3 +785,25 @@ def test_genuine_zoom_during_run_is_recorded_via_real_signal(qapp, widget):
     staticWidget._runend_waterfall_autofit(w)
     assert target.getViewBox().autoRangeEnabled()[0] is False
     w._exit_run_state()
+
+
+def test_waterfall_viewbox_hooked_at_run_entry_below_threshold(qapp, widget):
+    """H18-R14: an Overlay run that starts BELOW the Waterfall threshold must
+    still have the concrete Waterfall view box connected at run entry, so a
+    genuine manual-range gesture after acquisition crosses the threshold is
+    recorded."""
+    w = widget
+    w.displayframe.ui.plotMethod.setCurrentText("Overlay")
+    df = w.displayframe
+    assert not df._waterfall_active()          # below the 15-trace threshold
+
+    w._enter_run_state()
+    assert df._wf_user_zoomed is False
+
+    wf_plot = df.wf_widget.image_plot          # the concrete Waterfall plot
+    vb = wf_plot.getViewBox()
+    vb.sigRangeChangedManually.emit(vb.autoRangeEnabled())
+    assert df._wf_user_zoomed is True, \
+        "the Waterfall view box must be hooked at run entry even while the " \
+        "line plot is the active bottom plot (H18-R14)"
+    w._exit_run_state()

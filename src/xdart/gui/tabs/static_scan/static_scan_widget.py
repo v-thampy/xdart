@@ -6236,16 +6236,17 @@ class staticWidget(QWidget):
         hooked = getattr(df, "_wf_zoom_hooked_ids", None)
         if hooked is None:
             hooked = df._wf_zoom_hooked_ids = set()
+        # H18-R14: connect BOTH concrete switchable bottom plots regardless
+        # of which is currently active — an Overlay run starts below the
+        # Waterfall threshold with the line plot active, and a zoom made
+        # after acquisition crosses the threshold must still be observed.
         plots = []
         line_plot = getattr(df, "plot", None)
         if line_plot is not None:
             plots.append(line_plot)
-        try:
-            active = df._active_bottom_plot()
-        except Exception:
-            active = None
-        if active is not None and active not in plots:
-            plots.append(active)
+        wf_plot = getattr(getattr(df, "wf_widget", None), "image_plot", None)
+        if wf_plot is not None and wf_plot not in plots:
+            plots.append(wf_plot)
         for plot in plots:
             try:
                 viewbox = plot.getViewBox()

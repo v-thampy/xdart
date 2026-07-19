@@ -559,9 +559,11 @@ def _observe_raw_reachability_open(spec_or_source: Any) -> RawReachabilityObserv
     if not indices:
         return RawReachabilityObservation(False, True, "empty scan")
     try:
-        from xrd_tools.sources.probe import observe_first_frame
+        from xrd_tools.sources.probe import observe_frame
 
-        reachable, _image, transient = observe_first_frame(source)
+        # H18-R15: ONE authoritative enumeration — the load reuses the first
+        # index observed above instead of re-enumerating inside the probe.
+        reachable, _image, transient = observe_frame(source, indices[0])
     except Exception as exc:  # a raised probe error is transient by contract
         return RawReachabilityObservation(False, False, f"probe error: {exc}")
     return RawReachabilityObservation(
@@ -576,14 +578,18 @@ def _open_source_observed(value: Any) -> Any | None:
     that raises must not escape untyped."""
     from xrd_tools.sources.probe import TRANSIENT_PROBE_ERRORS
 
-    try:
-        is_open_source = (hasattr(value, "frame_indices")
-                          and hasattr(value, "load_frame"))
-    except TRANSIENT_PROBE_ERRORS:
-        raise
-    except Exception:
-        is_open_source = False
-    if is_open_source:
+    # Duck-check WITHOUT executing instance properties (H18-R15: hasattr on
+    # the instance runs a ``frame_indices`` property — an extra, untyped
+    # enumeration).  A class-level attribute (property/method) or a plain
+    # instance attribute both identify an open source; neither lookup runs
+    # the property body.
+    def _duck_has(name: str) -> bool:
+        if hasattr(type(value), name):
+            return True
+        instance_dict = getattr(value, "__dict__", None)
+        return isinstance(instance_dict, dict) and name in instance_dict
+
+    if _duck_has("frame_indices") and _duck_has("load_frame"):
         return value
     try:
         from xrd_tools.sources.registry import open_source

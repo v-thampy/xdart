@@ -418,3 +418,34 @@ def test_observe_raw_reachability_transient_enumeration_is_not_definitive(
     obs = observe_raw_reachability(_BrokenIndices())
     assert obs.definitive is True and obs.reachable is False, \
         "a non-live unknown-length source must not use the live escape hatch"
+
+
+def test_observe_raw_reachability_single_authoritative_enumeration():
+    """H18-R15: raw readiness performs ONE authoritative enumeration and one
+    load — a probe-time re-enumeration hitting a sharing denial must not
+    convert an enumerable, loadable source into a definitive unreachable."""
+    import numpy as np
+
+    from xrd_tools.sources.readiness import observe_raw_reachability
+
+    class _AlternatingIndices:
+        kind = None
+
+        def __init__(self):
+            self.accesses = 0
+
+        @property
+        def frame_indices(self):
+            self.accesses += 1
+            if self.accesses > 1:
+                raise PermissionError("probe-time sharing denial")
+            return (0,)
+
+        def load_frame(self, idx):
+            return np.ones((4, 4), dtype=np.uint16)
+
+    source = _AlternatingIndices()
+    obs = observe_raw_reachability(source)
+    assert source.accesses == 1, \
+        f"one authoritative enumeration required, saw {source.accesses}"
+    assert obs.reachable is True and obs.definitive is True

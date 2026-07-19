@@ -462,7 +462,7 @@ _OUTSIDE_ROOT_WARNED: set = set()    # (source_dir, root) pairs already warned
 
 def resolved_raw_source(
     scan_file,
-    frame: int = 0,
+    frame: int | None = None,
     *,
     entry: str = "entry",
     source_root=None,
@@ -474,13 +474,37 @@ def resolved_raw_source(
     pointer resolves to (N1 precedence via :func:`resolve_source_master`),
     or ``None`` when the record has no usable pointer or nothing resolves.
     One tiny metadata read; never decodes an image.
+
+    H18-R13: the DEFAULT (``frame=None``) means the first ACTUAL stored
+    source-bearing frame — real Eiger records are commonly one-based, so an
+    invented label ``0`` resolved nothing for them.  An explicit ``frame``
+    label stays an exact lookup and fails closed when that label has no
+    stored source.
     """
     scan_file = Path(scan_file)
     try:
         with h5py.File(scan_file, "r") as f:
             entry_grp = _entry(f, entry)
+            label = frame
+            if label is None:
+                frames_grp = entry_grp.get("frames")
+                if not isinstance(frames_grp, h5py.Group):
+                    return None
+                for name in sorted(frames_grp):
+                    if not name.startswith("frame_"):
+                        continue
+                    group = frames_grp.get(name)
+                    if not isinstance(group, h5py.Group) or "source" not in group:
+                        continue
+                    try:
+                        label = int(name.rsplit("_", 1)[-1])
+                    except ValueError:
+                        continue
+                    break
+                if label is None:
+                    return None
             master, _idx, _thumb = _raw_frame_parts_from_entry(
-                scan_file, entry_grp, int(frame), scan=None,
+                scan_file, entry_grp, int(label), scan=None,
                 source_root=source_root,
             )
     except Exception:
