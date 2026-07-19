@@ -3,12 +3,12 @@
 
 One reusable, kind-general source picker — used by the ROI Scan Plotter now and
 the stitch/RSM wrangler later.  It assembles a :class:`SourceSpec`, opens it in
-its probe worker only to read the raw-reachable flag and a COPY of the first
-frame, closes it there, and emits a VALUE-ONLY :class:`ScanSelection`
-(spec + raw-reachable flag + first-frame copy) via :data:`sigSourceChanged`
-(H19 §3: no live ``FrameSource`` / file handle crosses the worker boundary — a
-consumer opens its own source from the spec on demand).  All parsing/IO is
-headless (`xrd_tools.sources` / `io`); this is the thin Qt layer.
+its probe worker only to read the raw-reachable flag and an immutable byte
+preview of the first frame, closes it there, and emits a VALUE-ONLY
+:class:`ScanSelection` via :data:`sigSourceChanged` (H19 §3: no live
+``FrameSource``, file handle, or mutable ndarray crosses the worker boundary — a
+consumer opens its own source from the spec inside its own I/O scope).  All
+parsing/IO is headless (`xrd_tools.sources` / `io`); this is the thin Qt layer.
 
 Two entry modes (§2.2): a single master **File**, or a **Directory** + a
 Scan-kind dropdown (`discover_scans`).  The Scan selector then lists the
@@ -39,7 +39,46 @@ _TIFF_SUFFIXES = {".tif", ".tiff"}
 _RAW_DTYPES = ["int32", "uint32", "int16", "uint16", "float32", "float64"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
+class ImagePreview:
+    """Immutable transport form for one decoded detector image.
+
+    Qt queued signals may cross threads.  Carrying a mutable ndarray there makes
+    a frozen outer dataclass only superficially immutable, so the probe worker
+    serializes the contiguous numeric payload to ``bytes`` and the GUI rebuilds
+    a read-only NumPy view only when it needs to display the ROI picker.
+    """
+
+    shape: tuple[int, ...]
+    dtype: str
+    data: bytes
+
+    def __post_init__(self) -> None:
+        dtype = np.dtype(self.dtype)
+        if dtype.hasobject:
+            raise TypeError("image previews cannot carry object-dtype data")
+        if not isinstance(self.data, bytes):
+            raise TypeError("image preview data must be immutable bytes")
+        if any(int(n) < 0 for n in self.shape):
+            raise ValueError("image preview shape cannot contain negative sizes")
+        expected = int(np.prod(self.shape, dtype=np.int64)) * dtype.itemsize
+        if len(self.data) != expected:
+            raise ValueError(
+                f"preview byte count {len(self.data)} does not match "
+                f"shape {self.shape} and dtype {dtype.str!r}")
+
+    @classmethod
+    def from_array(cls, image) -> "ImagePreview":
+        array = np.ascontiguousarray(np.asarray(image))
+        return cls(tuple(int(n) for n in array.shape), array.dtype.str,
+                   array.tobytes(order="C"))
+
+    def to_array(self) -> np.ndarray:
+        array = np.frombuffer(self.data, dtype=np.dtype(self.dtype))
+        return array.reshape(self.shape)
+
+
+@dataclass(frozen=True, slots=True)
 class ScanSelection:
     """The widget's output: a VALUE-ONLY classified scan observation.
 
@@ -54,8 +93,13 @@ class ScanSelection:
     spec: object               # SourceSpec | None (a value)
     label: str
     reachable: bool            # raw frames loadable (probe) — independent of metadata
-    first_image: object        # ndarray | None — a COPY of the probed frame (owns its
-                               # buffer; safe after the worker's source is closed)
+    first_image: ImagePreview | None
+
+    def __post_init__(self) -> None:
+        if self.first_image is not None and not isinstance(
+                self.first_image, ImagePreview):
+            object.__setattr__(
+                self, "first_image", ImagePreview.from_array(self.first_image))
 
 
 class ScanSourceWidget(QtWidgets.QWidget):
@@ -461,15 +505,16 @@ class ScanSourceWidget(QtWidgets.QWidget):
         """VALUE-ONLY probe (H19 §3): open the source, probe the first frame,
         then CLOSE the source inside this scope so no ``FrameSource`` / file
         handle escapes to the Qt thread or survives the worker.  Returns
-        ``(reachable, first_image)`` where ``first_image`` is a COPY that owns
-        its buffer, so it stays valid after the source is closed."""
+        ``(reachable, first_image)`` where ``first_image`` is an immutable
+        :class:`ImagePreview`, so no mutable ndarray crosses the worker boundary
+        and the payload stays valid after the source is closed."""
         from xrd_tools.sources import open_source
 
         source = open_source(spec)
         try:
             reachable, first_image = probe_first_frame(source)
             if first_image is not None:
-                first_image = np.array(first_image, copy=True)
+                first_image = ImagePreview.from_array(first_image)
         finally:
             closer = getattr(source, "close", None)
             if callable(closer):

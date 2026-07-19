@@ -95,7 +95,8 @@ def test_widget_spec_metadata_then_images(qapp, tmp_path):
         np.testing.assert_allclose(src2.load_frame(2), 3.0)
         # the value-only probe still carried the decoded first frame as a COPY
         assert sel2.first_image is not None
-        np.testing.assert_allclose(np.asarray(sel2.first_image), 1.0)
+        assert isinstance(sel2.first_image.data, bytes)
+        np.testing.assert_allclose(sel2.first_image.to_array(), 1.0)
     finally:
         w.deleteLater()
 
@@ -179,7 +180,8 @@ def test_widget_directory_mode_discovers_scans(qapp, tmp_path):
 
 
 def test_widget_async_probe_emits_latest_selection(qapp, tmp_path):
-    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xdart.gui.tabs.static_scan.scan_source_widget import (
+        ImagePreview, ScanSourceWidget)
 
     spec = _spec_with_images(tmp_path)
     w = ScanSourceWidget(mode="roi", async_probe=True)
@@ -202,6 +204,9 @@ def test_widget_async_probe_emits_latest_selection(qapp, tmp_path):
         sel = emitted[-1]
         assert sel.reachable is True
         np.testing.assert_allclose(_open(sel).load_frame(0), 1.0)
+        assert isinstance(sel.first_image, ImagePreview)
+        assert isinstance(sel.first_image.data, bytes)
+        np.testing.assert_allclose(sel.first_image.to_array(), 1.0)
     finally:
         w.shutdown_probe_worker()
         w.deleteLater()
@@ -226,6 +231,20 @@ def test_widget_async_probe_ignores_stale_generation(qapp, tmp_path):
     finally:
         w.shutdown_probe_worker()
         w.deleteLater()
+
+
+def test_image_preview_is_read_only_and_rejects_unsafe_payloads():
+    from xdart.gui.tabs.static_scan.scan_source_widget import ImagePreview
+
+    preview = ImagePreview.from_array(np.arange(6, dtype=np.uint16).reshape(2, 3))
+    restored = preview.to_array()
+    assert restored.flags.writeable is False
+    np.testing.assert_array_equal(restored, [[0, 1, 2], [3, 4, 5]])
+
+    with pytest.raises(TypeError, match="object-dtype"):
+        ImagePreview.from_array(np.asarray([[object()]], dtype=object))
+    with pytest.raises(ValueError, match="byte count"):
+        ImagePreview((2, 2), "<u2", b"short")
 
 
 def test_file_candidates_tiff_filters_to_scan_stem(qapp, tmp_path):

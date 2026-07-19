@@ -166,17 +166,21 @@ class RoiStatsWorker(Qt.QtCore.QThread):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._signals = ()
-        self._source = None
+        self._source_spec = None
         self._x_key = None
         self._mask = None
         self._mask_saturation = False
         self._cancel = False
 
-    def configure(self, signals, source, *, x_key=None, mask=None,
+    def configure(self, signals, source_spec, *, x_key=None, mask=None,
                   mask_saturation=False) -> None:
-        """Set the ROI signals + the raw source for the next ``start()``."""
+        """Set ROI signals + a value-only source spec for the next ``start()``.
+
+        The live source is opened, consumed, and closed inside :meth:`run`, so
+        no HDF5/source handle crosses from the GUI thread into this worker.
+        """
         self._signals = tuple(signals)
-        self._source = source
+        self._source_spec = source_spec
         self._x_key = x_key
         self._mask = mask
         self._mask_saturation = bool(mask_saturation)
@@ -186,9 +190,12 @@ class RoiStatsWorker(Qt.QtCore.QThread):
         self._cancel = True
 
     def run(self) -> None:
+        source = None
         try:
+            from xrd_tools.sources import open_source
+            source = open_source(self._source_spec)
             result = run_roi_signals(
-                self._signals, self._source,
+                self._signals, source,
                 x_key=self._x_key, mask=self._mask,
                 mask_saturation=self._mask_saturation,
                 on_progress=lambda done, total: self.sigProgress.emit(done, total),
@@ -198,6 +205,13 @@ class RoiStatsWorker(Qt.QtCore.QThread):
             logger.exception("ROI-stats worker failed")
             self.sigRoiDone.emit(None)
             return
+        finally:
+            closer = getattr(source, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:
+                    logger.debug("ROI source close failed", exc_info=True)
         if self._cancel:
             self.sigRoiDone.emit(None)   # cancelled -> abandon the partial columns
             return

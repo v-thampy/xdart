@@ -13,6 +13,7 @@ a later increment — see docs/design/design_scan_plotter_metadata_roi_jun2026.m
 """
 
 import logging
+from contextlib import contextmanager
 from dataclasses import replace
 
 import numpy as np
@@ -103,7 +104,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         # else None — the dialog's .nxs reads enter it so they cannot race the
         # live writer's `r+` saves (the display readers' _locked_scan_read rule).
         self._lock_provider = lock_provider
-        self._source = None
+        self._source_spec = None
         self._source_uri = None
         self._scan_identity = None          # (uri, scan, entry) of the loaded scan
         self._raw_reachable = False
@@ -224,20 +225,32 @@ class ScanPlotDialog(QtWidgets.QDialog):
                 getattr(selection.spec, "entry", None))
 
     @staticmethod
-    def _open_selected_source(spec):
-        """Open a ``FrameSource`` from a value-only selection's spec, on demand
-        (H19 §3).  The ROI consumer owns this source's lifecycle; returns
-        ``None`` (and logs) on failure, so the ROI button stays gated."""
-        if spec is None:
-            return None
-        from xrd_tools.sources import open_source
+    @contextmanager
+    def _opened_selected_source(spec):
+        """Yield a short-lived source opened from a value-only spec.
+
+        Metadata/picker reads own this scope on the GUI thread.  Sustained ROI
+        consumption uses a separate source opened inside ``RoiStatsWorker``.
+        Either way a live source never survives its owning I/O scope.
+        """
+        source = None
+        if spec is not None:
+            from xrd_tools.sources import open_source
+            try:
+                source = open_source(spec)
+            except Exception:
+                logger.exception(
+                    "scan-plot: open_source failed for %s",
+                    getattr(spec, "uri", None))
         try:
-            return open_source(spec)
-        except Exception:
-            logger.exception(
-                "scan-plot: open_source failed for %s",
-                getattr(spec, "uri", None))
-            return None
+            yield source
+        finally:
+            closer = getattr(source, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:
+                    logger.debug("scan-plot: source close failed", exc_info=True)
 
     def _on_source_selected(self, selection):
         """The ScanSourceWidget chose a source.  A NEW scan rebuilds the table
@@ -246,7 +259,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         wiping the table or the user's computed ROI columns."""
         if selection is None:
             self._abort_roi_run()
-            self._source = None
+            self._source_spec = None
             self._source_uri = None
             self._raw_reachable = False
             self._first_image = None
@@ -257,20 +270,22 @@ class ScanPlotDialog(QtWidgets.QDialog):
             return
         identity = self._selection_identity(selection)
         same_scan = identity is not None and identity == self._scan_identity
-        # H19 §3: the widget hands a VALUE-ONLY selection; this consumer opens
-        # its OWN source on demand from the spec, so no live FrameSource/handle
-        # crosses the widget's async-probe boundary.
-        self._source = self._open_selected_source(selection.spec)
+        # H19 §3: retain only the value spec.  Every live source is opened and
+        # closed inside the exact metadata/picker/worker scope that consumes it.
+        self._source_spec = selection.spec
         self._source_uri = str(selection.spec.uri) if selection.spec else None
         self._raw_reachable = bool(selection.reachable)
-        self._first_image = selection.first_image
+        self._first_image = (
+            selection.first_image.to_array()
+            if selection.first_image is not None else None)
         if same_scan:
             self._update_roi_button()       # only re-gate; keep table + ROI columns
             return
         self._abort_roi_run()
         self._scan_identity = identity
-        self._positioner_names = self._positioners_for(selection)
-        label, table = self._table_for(selection)
+        with self._opened_selected_source(selection.spec) as source:
+            self._positioner_names = self._positioners_for(selection, source)
+            label, table = self._table_for(selection, source)
         self.set_table(label, table)
         self._update_roi_button()
 
@@ -288,12 +303,12 @@ class ScanPlotDialog(QtWidgets.QDialog):
                 lock = None
         return lock if lock is not None else nullcontext()
 
-    def _table_for(self, selection):
+    def _table_for(self, selection, source=None):
         """Per-frame metadata table for a selection — the full ``scan_data`` for a
         processed NeXus, else the source's own per-frame metadata (which is just
         ``frame_index`` for a metadata-less image stack)."""
         from xrd_tools.core.scan import SourceKind
-        spec, source = selection.spec, self._source
+        spec = selection.spec
         table = {}
         if spec is not None and spec.kind is SourceKind.PROCESSED_NEXUS:
             from xrd_tools.io import read_scan_data
@@ -307,14 +322,14 @@ class ScanPlotDialog(QtWidgets.QDialog):
             table = _table_from_source(source)
         return selection.label, table
 
-    def _positioners_for(self, selection):
+    def _positioners_for(self, selection, source=None):
         """Scanned-motor names for the X default.  For a processed NeXus these
         are the recorded NXpositioner motors (``get_metadata`` — intentionally
         narrow to the diffractometer/scanned motors); for other sources they are
         the source's own ``motors`` keys.  Best-effort: a read failure yields no
         hint (X then falls back to ``frame_index``)."""
         from xrd_tools.core.scan import SourceKind
-        spec, source = selection.spec, self._source
+        spec = selection.spec
         if spec is not None and spec.kind is SourceKind.PROCESSED_NEXUS:
             from xrd_tools.io import get_metadata
             try:
@@ -524,7 +539,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
             self.roi_btn.setToolTip(
                 "Reduce rectangular ROIs over the scan's raw frames and add each "
                 "as a plotted column")
-        elif self._source is None:
+        elif self._source_spec is None:
             self.roi_btn.setToolTip(
                 "This scan exposes no raw frames (metadata only) — ROI plotting "
                 "is unavailable")
@@ -610,7 +625,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
             self.r_list.blockSignals(False)
 
     def _open_roi_dialog(self):
-        if not self._raw_reachable or self._source is None:
+        if not self._raw_reachable or self._source_spec is None:
             self.status.setText(
                 "Raw frames aren't reachable for this scan — ROI plotting is "
                 "unavailable.")
@@ -618,8 +633,11 @@ class ScanPlotDialog(QtWidgets.QDialog):
         image = self._first_image       # reuse the frame the reachability probe decoded
         if image is None:
             try:
-                idxs = list(self._source.frame_indices)
-                image = np.asarray(self._source.load_frame(idxs[0]))
+                with self._opened_selected_source(self._source_spec) as source:
+                    if source is None:
+                        raise RuntimeError("source could not be opened")
+                    idxs = list(source.frame_indices)
+                    image = np.asarray(source.load_frame(idxs[0])).copy()
             except Exception:
                 logger.exception("scan-plot: could not load the first frame for ROI")
                 self.status.setText("Could not load the first frame (see log).")
@@ -636,14 +654,17 @@ class ScanPlotDialog(QtWidgets.QDialog):
     def _compute_roi(self, signals):
         """Reduce ``signals`` (RoiSignals from the picker) over the raw frames
         off-thread; each becomes a NaN-seeded column that fills incrementally."""
-        if self._source is None or not signals:
+        if self._source_spec is None or not signals:
             return
         if self._roi_worker is not None and self._roi_worker.isRunning():
             self.status.setText("An ROI computation is already running.")
             return
         if "frame_index" not in self._table:
             try:
-                idxs = [float(i) for i in self._source.frame_indices]
+                with self._opened_selected_source(self._source_spec) as source:
+                    if source is None:
+                        raise RuntimeError("source could not be opened")
+                    idxs = [float(i) for i in source.frame_indices]
                 self._append_column("frame_index", np.asarray(idxs))
             except Exception:
                 pass
@@ -674,7 +695,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
                 mask = None
         mask_saturation = bool(self._roi_dialog is not None
                                and self._roi_dialog.mask_saturated())
-        self._roi_worker.configure(named, self._source, x_key=None, mask=mask,
+        self._roi_worker.configure(named, self._source_spec, x_key=None, mask=mask,
                                    mask_saturation=mask_saturation)
         self.status.setText("Computing ROI stats…")
         self._roi_worker.start()

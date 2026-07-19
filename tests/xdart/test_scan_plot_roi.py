@@ -37,6 +37,16 @@ def _pump(qapp, predicate, timeout=8.0):
     return predicate()
 
 
+def _memory_spec(monkeypatch, source, *, uri="memory://roi-test"):
+    """Install a value-only test spec whose worker-owned open returns *source*."""
+    import xrd_tools.sources as sources
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+
+    spec = SourceSpec(uri, SourceKind.MEMORY)
+    monkeypatch.setattr(sources, "open_source", lambda selected: source)
+    return spec
+
+
 # ── reachable-raw gating truth-table ──────────────────────────────────────
 
 
@@ -114,18 +124,19 @@ def test_scan_plot_loads_spec_metadata_roi_disabled(qapp, tmp_path):
         dlg.close()
 
 
-def test_roi_button_reflects_reachability(qapp):
+def test_roi_button_reflects_reachability(qapp, monkeypatch):
     from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
     from xrd_tools.sources import MemoryFrameSource
 
     dlg = ScanPlotDialog()
     try:
         assert dlg.roi_btn.isEnabled() is False         # blank -> disabled
-        dlg._source = MemoryFrameSource(_stack())
+        dlg._source_spec = _memory_spec(
+            monkeypatch, MemoryFrameSource(_stack()))
         dlg._raw_reachable = True
         dlg._update_roi_button()
         assert dlg.roi_btn.isEnabled() is True
-        dlg._source = None
+        dlg._source_spec = None
         dlg._raw_reachable = False
         dlg._update_roi_button()
         assert dlg.roi_btn.isEnabled() is False
@@ -229,7 +240,7 @@ def test_roi_select_reducer_and_background(qapp):
 # ── end-to-end: compute fills table columns == direct run_roi_signals ─────
 
 
-def test_scan_plot_roi_fills_columns_end_to_end(qapp):
+def test_scan_plot_roi_fills_columns_end_to_end(qapp, monkeypatch):
     from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
     from xrd_tools.analysis.plans import RoiSignal, run_roi_signals
     from xrd_tools.core.roi import RoiSpec
@@ -240,7 +251,7 @@ def test_scan_plot_roi_fills_columns_end_to_end(qapp):
     try:
         dlg.set_table("scan", {"frame_index": np.array([0.0, 1.0, 2.0]),
                                "motor": np.array([10.0, 11.0, 12.0])})
-        dlg._source = src
+        dlg._source_spec = _memory_spec(monkeypatch, src)
         dlg._raw_reachable = True
 
         sig = RoiSignal(
@@ -269,7 +280,7 @@ def test_scan_plot_roi_fills_columns_end_to_end(qapp):
         dlg.close()
 
 
-def test_scan_plot_roi_aligns_noncontiguous_frame_index(qapp):
+def test_scan_plot_roi_aligns_noncontiguous_frame_index(qapp, monkeypatch):
     """ROI stats stream the SOURCE frame index; _frame_row_map must map them to
     the right table rows when frame_index doesn't start at 0 / isn't 0..n-1."""
     from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
@@ -286,7 +297,7 @@ def test_scan_plot_roi_aligns_noncontiguous_frame_index(qapp):
     try:
         dlg.set_table("s", {"frame_index": np.array([5.0, 6.0, 7.0]),
                             "motor": np.array([1.0, 2.0, 3.0])})
-        dlg._source = src
+        dlg._source_spec = _memory_spec(monkeypatch, src)
         dlg._raw_reachable = True
         sig = RoiSignal(roi=RoiSpec(center_x=1.5, center_y=1.5, width_x=2,
                                     width_y=2), reducer="mean", name="roiA")
@@ -332,7 +343,7 @@ def test_scan_plot_same_scan_param_change_keeps_columns(qapp, tmp_path):
         # -> columns preserved, a source is open
         dlg._on_source_selected(ScanSelection(
             spec=spec5, label="A5", reachable=True, first_image=_stack()[0]))
-        assert "roiX" in dlg._columns and dlg._source is not None
+        assert "roiX" in dlg._columns and dlg._source_spec == spec5
 
         # a different scan -> full rebuild drops the ROI column
         dlg._on_source_selected(ScanSelection(
@@ -368,7 +379,7 @@ def test_scan_plot_metadata_less_source_roi_vs_frame(qapp, tmp_path):
         dlg.close()
 
 
-def test_scan_plot_roi_applies_provider_mask(qapp):
+def test_scan_plot_roi_applies_provider_mask(qapp, monkeypatch):
     """The dialog's mask_provider mask is threaded to the worker, so the ROI
     column matches a direct masked run (and differs from the unmasked one)."""
     from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
@@ -383,7 +394,7 @@ def test_scan_plot_roi_applies_provider_mask(qapp):
     dlg = ScanPlotDialog(mask_provider=lambda uri: mask)
     try:
         dlg.set_table("s", {"frame_index": np.array([0.0, 1.0, 2.0])})
-        dlg._source = src
+        dlg._source_spec = _memory_spec(monkeypatch, src)
         dlg._source_uri = "scan-A"
         dlg._raw_reachable = True
         sig = RoiSignal(roi=RoiSpec.full_frame(), reducer="mean", name="roiM")
@@ -434,7 +445,7 @@ def test_scan_plot_roi_column_normalizes_and_csv_roundtrips(qapp, tmp_path):
         dlg.close()
 
 
-def test_scan_plot_roi_abort_on_source_swap(qapp):
+def test_scan_plot_roi_abort_on_source_swap(qapp, monkeypatch):
     """Loading a new source mid-run stops the worker + forgets the run state, so
     a stale worker can't stream into the replaced table."""
     from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
@@ -449,7 +460,8 @@ def test_scan_plot_roi_abort_on_source_swap(qapp):
 
     dlg = ScanPlotDialog()
     dlg.set_table("s", {"frame_index": np.arange(40.0)})
-    dlg._source = _Slow([np.zeros((6, 6)) for _ in range(40)])
+    dlg._source_spec = _memory_spec(
+        monkeypatch, _Slow([np.zeros((6, 6)) for _ in range(40)]))
     dlg._raw_reachable = True
     dlg._compute_roi([RoiSignal(roi=RoiSpec.full_frame(), name="roiZ")])
     assert _pump(qapp, lambda: dlg._roi_worker.isRunning(), timeout=2.0)
@@ -520,7 +532,7 @@ def test_scan_plot_right_axis_plots_column_not_checked_in_y(qapp):
         dlg.close()
 
 
-def test_scan_plot_roi_close_mid_run_drops_partial_columns(qapp):
+def test_scan_plot_roi_close_mid_run_drops_partial_columns(qapp, monkeypatch):
     """Closing the dialog mid-ROI-run drops the partial NaN columns (they must
     not survive into the reused single-instance dialog's next show)."""
     from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
@@ -536,7 +548,7 @@ def test_scan_plot_roi_close_mid_run_drops_partial_columns(qapp):
     src = _Slow([np.zeros((6, 6)) for _ in range(40)])
     dlg = ScanPlotDialog()
     dlg.set_table("s", {"frame_index": np.arange(40.0)})
-    dlg._source = src
+    dlg._source_spec = _memory_spec(monkeypatch, src)
     dlg._raw_reachable = True
     dlg._compute_roi([RoiSignal(roi=RoiSpec.full_frame(), name="roiZ")])
     assert "roiZ" in dlg._table                       # column seeded
@@ -547,6 +559,88 @@ def test_scan_plot_roi_close_mid_run_drops_partial_columns(qapp):
         "partial ROI column survived the close"
     assert "roiZ" not in dlg._columns
     assert dlg._roi_run_columns == []
+
+
+def test_roi_source_is_opened_and_closed_on_worker_thread(qapp, monkeypatch):
+    """The value-only spec crosses Qt; the live source is born, consumed, and
+    closed inside RoiStatsWorker's owner thread."""
+    import threading
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xrd_tools.analysis.plans import RoiSignal
+    from xrd_tools.core.roi import RoiSpec
+    from xrd_tools.sources import MemoryFrameSource
+
+    class _Tracked(MemoryFrameSource):
+        def __init__(self):
+            super().__init__(_stack())
+            self.closed_on = None
+
+        def close(self):
+            self.closed_on = threading.get_ident()
+
+    tracked = _Tracked()
+    opened_on = []
+    import xrd_tools.sources as sources
+
+    def _open(_spec):
+        opened_on.append(threading.get_ident())
+        return tracked
+
+    monkeypatch.setattr(sources, "open_source", _open)
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    dlg = ScanPlotDialog()
+    try:
+        dlg.set_table("scan", {"frame_index": np.arange(3.0)})
+        dlg._source_spec = SourceSpec("memory://thread-owned", SourceKind.MEMORY)
+        dlg._raw_reachable = True
+        main_thread = threading.get_ident()
+        dlg._compute_roi([
+            RoiSignal(roi=RoiSpec.full_frame(), reducer="mean", name="roi")])
+        assert _pump(qapp, lambda: (dlg._roi_worker is not None
+                                    and not dlg._roi_worker.isRunning()
+                                    and not dlg._roi_run_columns))
+        assert len(opened_on) == 1
+        assert opened_on[0] != main_thread
+        assert tracked.closed_on == opened_on[0]
+    finally:
+        dlg.close()
+
+
+def test_selection_metadata_open_is_short_lived(qapp, monkeypatch):
+    """Browsing selections must not leave one HDF5/source handle per click."""
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSelection
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.sources import MemoryFrameSource
+
+    opened = []
+
+    class _Tracked(MemoryFrameSource):
+        def __init__(self):
+            super().__init__(_stack())
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    def _open(_spec):
+        source = _Tracked()
+        opened.append(source)
+        return source
+
+    import xrd_tools.sources as sources
+    monkeypatch.setattr(sources, "open_source", _open)
+    dlg = ScanPlotDialog()
+    try:
+        for name in ("one", "two"):
+            dlg._on_source_selected(ScanSelection(
+                spec=SourceSpec(f"memory://{name}", SourceKind.MEMORY),
+                label=name, reachable=True, first_image=_stack()[0]))
+        assert len(opened) == 2
+        assert all(source.closed for source in opened)
+        assert not hasattr(dlg, "_source")
+    finally:
+        dlg.close()
 
 
 def test_roi_frame_updates_are_redraw_coalesced(qapp):
