@@ -342,17 +342,27 @@ def find_nexus_image_dataset(
         # Eiger external-link pattern: /entry/data/data_NNNNNN.  Return the
         # *first* link path so the caller can enumerate siblings to build the
         # full stack.  (External target files may be missing mid-transfer, so
-        # the resolution is guarded.)
+        # every declared segment is validated before exposing any landed
+        # prefix.)
         ext_paths = _find_eiger_external_link_paths(f, entry)
         if ext_paths:
-            try:
-                ds = f[ext_paths[0]]
-                if isinstance(ds, h5py.Dataset) and ds.ndim == 3:
-                    logger.debug("Found Eiger external-link dataset: %s",
-                                 ext_paths[0])
-                    return ext_paths[0]
-            except Exception:
-                pass
+            missing = [link_path for link_path in ext_paths
+                       if f.get(link_path) is None]
+            if missing:
+                raise UnresolvedSourceLinkError(
+                    f"Eiger data link(s) {missing} in {p} do not resolve yet "
+                    f"(target not landed); container is still being written"
+                )
+            for link_path in ext_paths:
+                ds = f.get(link_path)
+                if not isinstance(ds, h5py.Dataset) or ds.ndim != 3:
+                    rank = getattr(ds, "ndim", None)
+                    raise UnsupportedDetectorRankError(
+                        f"{link_path} has rank {rank}; Eiger segments must be "
+                        "3-D"
+                    )
+            logger.debug("Found Eiger external-link dataset: %s", ext_paths[0])
+            return ext_paths[0]
 
         return find_nexus_image_dataset_in_open_file(f, entry)
 

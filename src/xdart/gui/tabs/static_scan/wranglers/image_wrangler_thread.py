@@ -3182,6 +3182,25 @@ class imageThread(wranglerThread):
             self._eiger_close_master()
             self._eiger_nframes = 0
             self._eiger_single_file_provisional = True
+        except OSError as e:
+            # A live single-file source can be visible before the writer
+            # releases its sharing lock.  Treat that first-open denial exactly
+            # like a transient growth-reopen denial so Phase 3 remains armed;
+            # batch/non-live callers retain the terminal open-error behavior.
+            if (getattr(self, 'live_mode', False)
+                    and not getattr(self, 'batch_mode', False)):
+                logger.info('Container temporarily unavailable, will retry: '
+                            '%s (%s)', master_path, e)
+                self._eiger_open_state = "not ready"
+                self._eiger_close_master()
+                self._eiger_nframes = 0
+                self._eiger_single_file_provisional = True
+            else:
+                logger.error('Error opening HDF5/NeXus file %s: %s',
+                             master_path, e)
+                self._eiger_open_state = "open error"
+                self._eiger_close_master()
+                self._eiger_nframes = 0
         except Exception as e:
             logger.error('Error opening HDF5/NeXus file %s: %s', master_path, e)
             self._eiger_open_state = "open error"

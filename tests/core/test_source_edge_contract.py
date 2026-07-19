@@ -250,6 +250,38 @@ def test_dangling_link_typed_provisional_then_ready(tmp_path, fixture, land):
             close()
 
 
+def test_partial_eiger_sequence_never_exposes_landed_prefix(tmp_path):
+    """Every public finder/open seam must keep a partially landed Eiger
+    sequence provisional; returning the first landed link silently truncates
+    a batch consumer."""
+    from xrd_tools.io.nexus import (
+        UnresolvedSourceLinkError,
+        find_nexus_image_dataset,
+        open_nexus_image_stack,
+    )
+
+    master = tmp_path / "partial_master.h5"
+    landed = tmp_path / "partial_data_000001.h5"
+    missing = tmp_path / "partial_data_000002.h5"
+    with h5py.File(landed, "w") as f:
+        f.create_dataset(
+            "entry/data/data", data=np.zeros((2, 8, 8), dtype=np.uint16))
+    with h5py.File(master, "w") as f:
+        entry = f.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        data = entry.create_group("data")
+        data["data_000001"] = h5py.ExternalLink(
+            str(landed), "/entry/data/data")
+        data["data_000002"] = h5py.ExternalLink(
+            str(missing), "/entry/data/data")
+
+    with pytest.raises(UnresolvedSourceLinkError):
+        find_nexus_image_dataset(master)
+    with pytest.raises(UnresolvedSourceLinkError):
+        open_nexus_image_stack(master)
+    assert describe_container(master).state is ProbeState.IN_PROGRESS
+
+
 # ── NXS-DIM-1: rank 4 is INVALID everywhere ───────────────────────────────
 
 def test_rank4_detector_invalid_everywhere(tmp_path):

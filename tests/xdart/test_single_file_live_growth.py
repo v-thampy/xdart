@@ -455,6 +455,37 @@ def test_single_file_transient_denial_stays_provisional(tmp_path, monkeypatch):
     assert got == [4], f"the run must recover after the denial, got {got}"
 
 
+def test_single_file_initial_denial_keeps_watch_gate_armed(tmp_path, monkeypatch):
+    """A sharing denial on the first cursor open occurs before Phase 3.  It
+    must remain provisional so the same run can observe the released file."""
+    from xrd_tools.sources.cursor import ContainerCursor
+
+    path = tmp_path / "initial_deny_00001.nxs"
+    _nxwriter_shell(path)
+    worker = _worker(path)
+    real_open = ContainerCursor.open
+    calls = {"n": 0}
+
+    def denying_first_open(self):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError(13, "sharing violation", str(path))
+        return real_open(self)
+
+    monkeypatch.setattr(ContainerCursor, "open", denying_first_open)
+    assert _drain(worker) == []
+    assert worker._eiger_open_state == "not ready"
+    assert worker._eiger_single_file_watchable(), \
+        "the Phase-3 watch gate must survive an initial sharing denial"
+
+    _nxwriter_frames(path, 3)
+    got = []
+    deadline = time.monotonic() + 15.0
+    while len(got) < 3 and time.monotonic() < deadline:
+        got.extend(_drain(worker))
+    assert got == [1, 2, 3]
+
+
 # ── Finalized single file: zero-open idle fixed point ─────────────────────
 
 def test_single_file_finalized_idle_is_zero_open(tmp_path, monkeypatch):
