@@ -730,12 +730,20 @@ def test_eiger_master_alias_arms_and_completes_651_frames(
 
     # H18-R8(b) preface: a mid-run PROGRAMMATIC crop (mode projection /
     # cadence render) — NOT a genuine user zoom — must not survive run end.
-    plot = w.displayframe._active_bottom_plot()
-    if plot is not None:
-        try:
-            plot.setRange(xRange=(0.0, 3.0), padding=0)   # disables auto-range
-        except Exception:
-            plot = None
+    # A finished 651-frame Overlay renders as a Waterfall, so the plot the
+    # run-end auto-fit acts on is ``wf_widget.image_plot`` (that IS this
+    # displayframe's ``_active_bottom_plot()`` once >15 traces are shown).
+    # Crop THAT plot's x-axis: capturing ``_active_bottom_plot()`` before the
+    # run returns the LINE plot (the Waterfall is not active yet), which the
+    # run-end auto-fit never touches — so a crop on it could never be observed
+    # as re-armed and the assertion below would be vacuous (H18-E1).
+    wf_plot = getattr(getattr(w.displayframe, "wf_widget", None),
+                      "image_plot", None)
+    assert wf_plot is not None, \
+        "the Waterfall image plot must exist for the 651-frame Overlay run"
+    wf_plot.setRange(xRange=(0.0, 3.0), padding=0)     # disables x auto-range
+    assert wf_plot.getViewBox().autoRangeEnabled()[0] is False, \
+        "the programmatic crop must disable Waterfall x auto-range pre-run-end"
 
     w.wrangler_finished()
 
@@ -772,13 +780,26 @@ def test_eiger_master_alias_arms_and_completes_651_frames(
     fires = [r for r in caplog.records if "-> show_all()" in r.getMessage()]
     assert len(fires) <= 1, "catch-up must fire at most once"
 
-    # H18-R8(b): full-history auto-fit after the automatic run-end reseed —
-    # no genuine user zoom was recorded, so the programmatic crop must not
-    # persist (auto-range re-armed on the active bottom plot).
-    if plot is not None:
-        auto = plot.getViewBox().autoRangeEnabled()
-        assert auto[0] or auto[1], \
-            "run-end reseed must auto-fit unless a genuine user zoom is recorded"
+    # H18-R8(b): full-history auto-fit after the automatic run-end reseed.
+    # No genuine user zoom was recorded, so the mid-run x crop must NOT
+    # survive: the NORMAL run-end path (show_all -> _runend_autofit_when_quiet
+    # -> _runend_waterfall_autofit, never called directly here) re-arms x
+    # auto-range on the finished Waterfall plot.  Assert the CROPPED axis
+    # specifically — the untouched y stays auto-ranged regardless, so the old
+    # ``auto[0] or auto[1]`` could not tell a working auto-fit from a no-op
+    # (the H18-E1 vacuity).  pyqtgraph reports an enabled axis as a float
+    # (1.0) and a disabled one as ``False``; the auto-fit is async
+    # (QTimer.singleShot ~250 ms after show_all), so poll to an explicit
+    # outcome rather than sleeping a fixed interval.
+    wf_vb = wf_plot.getViewBox()
+    autofit_deadline = time.monotonic() + 8.0
+    while (time.monotonic() < autofit_deadline
+           and wf_vb.autoRangeEnabled()[0] is False):
+        qapp.processEvents()
+        time.sleep(0.02)
+    assert wf_vb.autoRangeEnabled()[0] is not False, \
+        "run-end reseed must re-arm the cropped Waterfall x auto-range when " \
+        "no genuine user zoom is recorded (H18-R8(b))"
 
 
 def test_runend_autofit_respects_genuine_user_zoom(qapp, widget):

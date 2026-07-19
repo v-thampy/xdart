@@ -609,26 +609,45 @@ def test_acquisition_master_publication_proves_its_own_processed_output(
         widget, tmp_path, monkeypatch):
     """H18-R9 legitimate case: the raw source and the processed output live
     in DIFFERENT directories; the record's stored provenance links them, so
-    the acquisition master's resident raw pixels prove the selected output."""
+    the acquisition master's resident raw pixels prove the selected output.
+
+    The reachability is proved through the REAL provenance path — the record's
+    stored raw-source identity resolved at idle, then matched against the
+    resident publication during the run — NOT a cached ``ResultCaps`` snapshot
+    that would OR-mask the resident evidence (H18-E2)."""
     raw_root = tmp_path / "raw_tree"
     out_dir = tmp_path / "processed_out"
     out_dir.mkdir()
     nxs = _relative_source_nxs(out_dir, raw_root,
                                source_rel="raw/scan_master.h5")
+    master = raw_root / "raw" / "scan_master.h5"
     widget.wrangler.project_folder = str(raw_root)
     widget.scan.data_file = str(nxs)
+
+    # Natural idle observation: resolves + caches BOTH the record ResultCaps
+    # and the record's stored raw-source provenance identity.
     good = widget._controls_v2_loaded_result_caps(str(nxs))
     assert good is not None and good.raw_reachable is True   # provenance cached
+    # The idle observation resolved the record's stored raw-source identity to
+    # the acquisition master, across directories (the H18-R9 link).
+    assert widget._v2_result_source_ident[1] == \
+        widget._controls_v2_normalized_path(str(master)), \
+        "idle observation must resolve the record's stored raw-source identity"
+
+    # Neutralize ONLY the cached record-capability answer that would OR-mask
+    # resident evidence; PRESERVE the stored source-identity observation, so
+    # the identity-qualified resident publication is the sole proof below.
+    widget._v2_result_caps_cache = None
 
     monkeypatch.setattr(widget, "_controls_v2_run_active", lambda: True)
-    master = raw_root / "raw" / "scan_master.h5"
     _raw_publication(widget.publication_store, source_identity=str(master),
                      raw=np.ones((4, 4), dtype=np.uint16))
 
     state = widget._controls_v2_state()
     assert state.result_caps.raw_reachable is True, \
-        "the record's own acquisition master must prove it across " \
-        "directories (H18-R9)"
+        "the record's own acquisition master must prove it across directories " \
+        "via stored provenance, not a cached ResultCaps snapshot (H18-R9)"
+    assert _roi_enabled(state.result_caps) is True
 
 
 # ── H18-R13: one-based records through the natural lifecycle ──────────────
@@ -639,25 +658,42 @@ def test_one_based_record_provenance_through_natural_lifecycle(
     the real Eiger shape) resolves its stored provenance by default, driven
     only through the natural Controls V2 lifecycle: an idle refresh caches
     the record identity, then the paused acquisition master's resident raw
-    publication proves ITS OWN output."""
+    publication proves ITS OWN output.
+
+    Reachability is proved through the resolved provenance identity matched
+    against the resident publication, NOT a cached ``ResultCaps`` snapshot
+    (H18-E2)."""
     raw_root = tmp_path / "raw_tree"
     out_dir = tmp_path / "processed_out"
     out_dir.mkdir()
     nxs = _relative_source_nxs(out_dir, raw_root, first_label=1)
+    master = raw_root / "raw" / "scan_master.h5"
     widget.wrangler.project_folder = str(raw_root)
     widget.scan.data_file = str(nxs)
 
     idle = widget._controls_v2_state()        # NATURAL idle refresh: probes+caches
     assert idle.result_caps.raw_reachable is True
+    # DEFAULT provenance resolution starts from the record's FIRST actual
+    # stored frame (frame_0001), not an assumed frame zero — the resolved
+    # identity is the acquisition master (H18-R13).
+    assert widget._v2_result_source_ident[1] == \
+        widget._controls_v2_normalized_path(str(master)), \
+        "one-based record provenance must resolve from its first stored frame"
+
+    # Neutralize ONLY the cached record-capability answer; PRESERVE the stored
+    # source-identity observation, so the resident acquisition-master
+    # publication is the sole proof of reachability below.
+    widget._v2_result_caps_cache = None
 
     monkeypatch.setattr(widget, "_controls_v2_run_active", lambda: True)
-    master = raw_root / "raw" / "scan_master.h5"
     _raw_publication(widget.publication_store, source_identity=str(master),
                      raw=np.ones((4, 4), dtype=np.uint16))
 
     state = widget._controls_v2_state()
     assert state.result_caps.raw_reachable is True, \
-        "a one-based record's provenance must resolve by default (H18-R13)"
+        "a one-based record's provenance must resolve by default and its " \
+        "resident acquisition master must prove it, not a cached snapshot " \
+        "(H18-R13)"
 
 
 def test_resolved_raw_source_default_uses_first_stored_frame(tmp_path):
