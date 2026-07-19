@@ -52,7 +52,11 @@ if TYPE_CHECKING:
         StaleCandidateError,
     )
     from xrd_tools.sources.discover import Candidate, discover_scans, enumerate_candidates
-    from xrd_tools.sources.run_plan import RunCandidatePlan, RunReconcile
+    from xrd_tools.sources.run_plan import (
+        RunCandidatePlan,
+        RunReconcile,
+        SupersededPlanError,
+    )
     from xrd_tools.sources.read_plan import ReadPlan, plan_reads
     from xrd_tools.sources.grouping import flatten_scan_groups, parse_scan_groups
     from xrd_tools.sources.image import ImageFileSource, TiffSeriesSource
@@ -105,6 +109,7 @@ _LAZY_EXPORTS = {
     "RetryState": "xrd_tools.sources.directory_index",
     "RunCandidatePlan": "xrd_tools.sources.run_plan",
     "RunReconcile": "xrd_tools.sources.run_plan",
+    "SupersededPlanError": "xrd_tools.sources.run_plan",
     "Snapshot": "xrd_tools.sources.directory_index",
     "StaleCandidateError": "xrd_tools.sources.directory_index",
     "SourceFormatAdapter": "xrd_tools.sources.adapters",
@@ -176,6 +181,7 @@ __all__ = [
     "RetryState",
     "RunCandidatePlan",
     "RunReconcile",
+    "SupersededPlanError",
     "Snapshot",
     "StaleCandidateError",
     "SourceCapabilities",
