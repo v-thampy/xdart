@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,8 @@ __all__ = [
     "describe_source_readiness",
     "capabilities_for_processed",
     "nxwriter_finalization_policy",
+    "observe_raw_reachability",
+    "RawReachabilityObservation",
 ]
 
 _ENERGY_KEYS = frozenset({
@@ -386,3 +389,56 @@ def nxwriter_finalization_policy(path: str | Path) -> bool:
     """
     from xrd_tools.io.bluesky_nexus import is_unfinalized_nxwriter
     return not is_unfinalized_nxwriter(Path(path))
+
+
+@dataclass(frozen=True)
+class RawReachabilityObservation:
+    """Typed frame-0 reachability observation (H18-R5).
+
+    ``definitive=False`` marks a TRANSIENT probe error (sharing denial,
+    momentary SMB/HDF5 hiccup): the observation is retry-worthy and must not
+    be cached as a stable unreachable.  A missing referenced master, an
+    empty/metadata-only source, and a successful load are all definitive.
+    """
+
+    reachable: bool
+    definitive: bool
+    detail: str = ""
+
+
+def observe_raw_reachability(spec_or_source: Any) -> RawReachabilityObservation:
+    """Additive typed raw reachability seam for cache-holding consumers.
+
+    Mirrors the reachability half of :func:`describe_source_readiness`
+    (whose public boolean default behavior is unchanged) but distinguishes a
+    definitive unreachable result from a transient probe error via
+    :func:`xrd_tools.sources.probe.observe_first_frame`.
+    """
+
+    gated = _spec_gate(spec_or_source)
+    if gated is not None:
+        return RawReachabilityObservation(
+            bool(gated.raw_reachable), True, "spec gate")
+    source = _open_source(spec_or_source)
+    if source is None:
+        caps = _caps_from_classification(spec_or_source)
+        return RawReachabilityObservation(
+            bool(caps.raw_reachable), True, "classification fallback")
+    source_caps = _core_caps(source)
+    _indices, frame_count = _frame_indices(source)
+    live_unknown = bool(
+        source_caps.is_streaming
+        or getattr(source, "kind", None) == SourceKind.LIVE
+        or frame_count is None
+    )
+    if live_unknown:
+        return RawReachabilityObservation(True, True, "live escape hatch")
+    try:
+        from xrd_tools.sources.probe import observe_first_frame
+
+        reachable, _image, transient = observe_first_frame(source)
+    except Exception as exc:  # a raised probe error is transient by contract
+        return RawReachabilityObservation(False, False, f"probe error: {exc}")
+    return RawReachabilityObservation(
+        bool(reachable), not transient,
+        "frame-0 probe" if not transient else "transient probe error")

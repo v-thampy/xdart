@@ -210,7 +210,13 @@ from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.sources.readiness import (
     capabilities_for_processed,
     describe_source_readiness,
+    observe_raw_reachability,
 )
+
+
+class _TransientReadinessObservation(RuntimeError):
+    """H18-R5: a raw-probe observation that is not definitive — handled like
+    a transient metadata failure (debounced retry, never cached)."""
 from .ui.staticUI import Ui_Form
 from .h5viewer import H5Viewer, _qt_enum_value
 from .display_frame_widget import displayFrameWidget
@@ -2910,7 +2916,7 @@ class staticWidget(QWidget):
         has_1d = bool(self.viewer_rows_1d)
         has_2d = bool(self.viewer_rows_2d)
         labels = ()
-        resident_raw = False
+        pubs = ()
         try:
             labels = self.publication_store.labels()
             recent = labels[-16:] if len(labels) > 16 else labels
@@ -2919,16 +2925,9 @@ class staticWidget(QWidget):
                                    for pub in pubs)
             has_2d = has_2d or any(getattr(pub.view, "int_2d", None) is not None
                                    for pub in pubs)
-            # H18-R1: identity-qualified resident raw evidence — a recent
-            # publication of the DISPLAYED scan carrying an actual raw
-            # payload (or a live raw_ref) proves raw capability even while
-            # the record itself cannot be probed (active run / Pause).
-            resident_raw = any(
-                getattr(pub.view, "raw", None) is not None
-                or getattr(pub, "raw_ref", None) is not None
-                for pub in pubs)
         except Exception:
             labels = ()
+            pubs = ()
         loaded_scan_file = self._controls_v2_loaded_scan_file(
             loaded_frame_count=loaded_frame_count, labels=labels)
         loaded_scan_available = bool(
@@ -2949,6 +2948,13 @@ class staticWidget(QWidget):
         # "not probed" is never reported as reachable — only resident
         # evidence may prove it.  Source caps supply source-only ROI
         # readiness when no processed result is selected.
+        # H18-R4: resident evidence is qualified against the SELECTED (or,
+        # with nothing selected, the configured acquisition) identity through
+        # the one canonical scan-name helper; unknown or mismatched identity
+        # fails closed, only actual resident pixels count, and the outgoing
+        # store is never borrowed while a manual browser rescope is pending.
+        resident_raw = self._controls_v2_resident_selected_raw(
+            pubs, loaded_scan_file or source_label)
         record_caps = self._controls_v2_loaded_result_caps(loaded_scan_file)
         if loaded_scan_file:
             if record_caps is not None:
@@ -3220,6 +3226,41 @@ class staticWidget(QWidget):
                 "Controls V2 scratch data-file compare failed", exc_info=True)
         return data_file
 
+    def _controls_v2_resident_selected_raw(self, pubs, target_identity) -> bool:
+        """H18-R4: identity-qualified resident raw evidence.
+
+        A recent publication may prove raw capability ONLY when (a) no manual
+        browser rescope is pending (the outgoing scan's store must not be
+        borrowed), (b) its ``source_identity`` canonicalizes to the SAME scan
+        as the selected/displayed target (via the one canonical
+        ``scan_name_from_source``; unknown or mismatched identity fails
+        closed), and (c) actual nonempty full-resolution pixels are resident
+        (``view.raw``, or a live ``raw_ref`` whose ``map_raw``/``image`` is a
+        real array).  A bare/lazy/dead reference proves a reference exists,
+        never that it is reachable without a probe."""
+        if not pubs or not target_identity:
+            return False
+        if getattr(getattr(self, "h5viewer", None),
+                   "_browser_scan_reset_pending", False):
+            return False
+        target = _scan_key_from_source(str(target_identity))
+        if not target:
+            return False
+        for pub in pubs:
+            ident = str(getattr(pub, "source_identity", "") or "")
+            if not ident or _scan_key_from_source(ident) != target:
+                continue
+            raw = getattr(getattr(pub, "view", None), "raw", None)
+            if raw is not None and getattr(raw, "size", 0):
+                return True
+            ref = getattr(pub, "raw_ref", None)
+            if ref is not None:
+                for attr in ("map_raw", "image"):
+                    pixels = getattr(ref, attr, None)
+                    if pixels is not None and getattr(pixels, "size", 0):
+                        return True
+        return False
+
     def _controls_v2_loaded_result_caps(self, loaded_scan_file: str):
         """Record-truth ``ResultCaps`` for the loaded processed scan, or None.
 
@@ -3245,19 +3286,18 @@ class staticWidget(QWidget):
         cached = getattr(self, "_v2_result_caps_cache", None)
         if cached is not None and cached[0] == key and cached[1] is not None:
             return cached[1]
+        # H18-R6: a previous snapshot may answer ONLY on a FULL identity-key
+        # match (path + version stamp + adapter owner + normalized root) —
+        # that case is the cache hit above.  A changed identity (replaced
+        # record at the same pathname, root change) is conservatively
+        # pending/unavailable; resident browse evidence may still prove the
+        # capability at the composition layer.
         if self._controls_v2_run_active():
-            if (cached is not None and cached[0][0] == path
-                    and cached[1] is not None):
-                return cached[1]
             return None
         retry = getattr(self, "_v2_result_caps_retry", None)
         if (retry is not None and retry[0] == key
                 and time.monotonic() < retry[1]):
-            # H18-R3 debounce window: don't hammer a hiccuping share; the
-            # previous valid same-path snapshot keeps answering meanwhile.
-            if (cached is not None and cached[0][0] == path
-                    and cached[1] is not None):
-                return cached[1]
+            # H18-R3 debounce window: don't hammer a hiccuping share.
             return None
         try:
             from xrd_tools.io.read import get_metadata
@@ -3268,22 +3308,24 @@ class staticWidget(QWidget):
             spec = SourceSpec(
                 path, SourceKind.PROCESSED_NEXUS,
                 options=({"source_root": root} if root else {}))
+            metadata = get_metadata(path)
+            # H18-R5: the typed probe seam — a transient probe error is NOT a
+            # definitive unreachable observation; treat it exactly like a
+            # transient metadata failure (debounce + retry, never cached).
+            observation = observe_raw_reachability(spec)
+            if not observation.definitive:
+                raise _TransientReadinessObservation(observation.detail)
             caps = capabilities_for_processed(
-                get_metadata(path),
-                raw_reachable=describe_source_readiness(spec).raw_reachable,
-            )
+                metadata, raw_reachable=observation.reachable)
         except Exception:
             logger.debug(
                 "Controls V2 loaded-scan result caps failed", exc_info=True)
-            # H18-R3: never store the failure; schedule a bounded retry and
-            # keep serving the previous valid same-identity snapshot.
+            # H18-R3/R6: never store the failure and never answer with a
+            # different identity's snapshot; schedule a bounded retry.
             self._v2_result_caps_retry = (
                 key,
                 time.monotonic() + float(getattr(
                     self, "_v2_result_caps_retry_delay", 2.0)))
-            if (cached is not None and cached[0][0] == path
-                    and cached[1] is not None):
-                return cached[1]
             return None
         self._v2_result_caps_retry = None
         self._v2_result_caps_cache = (key, caps)

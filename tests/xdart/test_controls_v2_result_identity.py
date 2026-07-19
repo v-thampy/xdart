@@ -166,26 +166,90 @@ def test_paused_cached_selected_record_serves_its_snapshot(
     assert _roi_enabled(state.result_caps) is True
 
 
-def test_resident_publication_raw_proves_capability_while_uncached(
-        widget, tmp_path, monkeypatch):
-    """Identity-qualified resident browse evidence (a publication of the
-    selected scan carrying a raw payload) proves the capability even when the
-    record cannot be probed during the run."""
+def _raw_publication(store, *, source_identity, raw=None, raw_ref=None):
     from xrd_tools.core.frame_view import FrameView
     from xdart.modules.frame_publication import publication_from_frame_view
 
+    view = FrameView(label=0, raw=raw)
+    return store.upsert(publication_from_frame_view(
+        view, generation=store.generation,
+        source_identity=str(source_identity), raw_ref=raw_ref))
+
+
+def test_resident_publication_raw_proves_capability_while_uncached(
+        widget, tmp_path, monkeypatch):
+    """Identity-qualified resident browse evidence — a publication OF THE
+    SELECTED SCAN carrying actual nonempty raw pixels — proves the capability
+    even when the record cannot be probed during the run (H18-R1/H18-R4)."""
     processed = _processed_nxs(tmp_path, raw_reachable=True)
     monkeypatch.setattr(widget, "_controls_v2_run_active", lambda: True)
     widget.scan.data_file = str(processed)
 
-    view = FrameView(label=0, raw=np.ones((4, 4), dtype=np.uint16))
-    widget.publication_store.upsert(publication_from_frame_view(
-        view, generation=widget.publication_store.generation))
+    _raw_publication(widget.publication_store, source_identity=processed,
+                     raw=np.ones((4, 4), dtype=np.uint16))
 
     state = widget._controls_v2_state()
     assert state.result_caps.has_raw is True
     assert state.result_caps.raw_reachable is True, \
-        "resident raw evidence must prove the capability (H18-R1)"
+        "selected-scan-qualified resident raw evidence must prove the capability"
+    assert _roi_enabled(state.result_caps) is True
+
+
+def test_outgoing_acquisition_publication_does_not_prove_selected_record(
+        widget, tmp_path, monkeypatch):
+    """H18-R4: the Pause transition — the store still holds acquisition A's
+    resident raw publication while the selected record is orphaned B.  A's
+    evidence must not make B's raw look reachable."""
+    src_dir = tmp_path / "acq"
+    src_dir.mkdir()
+    master_a = _eiger_master(src_dir)
+    orphaned_b = _processed_nxs(tmp_path, raw_reachable=False)
+
+    monkeypatch.setattr(widget, "_controls_v2_run_active", lambda: True)
+    widget.scan.data_file = str(orphaned_b)
+    _raw_publication(widget.publication_store, source_identity=master_a,
+                     raw=np.ones((4, 4), dtype=np.uint16))
+
+    state = widget._controls_v2_state()
+    assert state.result_caps.raw_reachable is False, \
+        "acquisition A's resident raw must not prove orphaned B (H18-R4)"
+    assert _roi_enabled(state.result_caps) is False
+
+
+def test_dead_raw_ref_does_not_prove_reachability(
+        widget, tmp_path, monkeypatch):
+    """H18-R4: a bare/lazy/dead ``raw_ref`` (no resident pixels, no source)
+    is a reference, not a successful reachability probe."""
+    from types import SimpleNamespace
+
+    orphaned = _processed_nxs(tmp_path, raw_reachable=False)
+    monkeypatch.setattr(widget, "_controls_v2_run_active", lambda: True)
+    widget.scan.data_file = str(orphaned)
+    dead = SimpleNamespace(map_raw=None, image=None, source_file=None)
+    _raw_publication(widget.publication_store, source_identity=orphaned,
+                     raw=None, raw_ref=dead)
+
+    state = widget._controls_v2_state()
+    assert state.result_caps.raw_reachable is False, \
+        "an object reference alone must not manufacture reachability (H18-R4)"
+    assert _roi_enabled(state.result_caps) is False
+
+
+def test_pending_browser_rescope_fails_closed(widget, tmp_path, monkeypatch):
+    """H18-R4: while a manual browser rescope is pending, the outgoing
+    store's evidence is not borrowed even when identities match."""
+    processed = _processed_nxs(tmp_path, raw_reachable=True)
+    monkeypatch.setattr(widget, "_controls_v2_run_active", lambda: True)
+    widget.scan.data_file = str(processed)
+    _raw_publication(widget.publication_store, source_identity=processed,
+                     raw=np.ones((4, 4), dtype=np.uint16))
+    widget.h5viewer._browser_scan_reset_pending = True
+    try:
+        state = widget._controls_v2_state()
+        assert state.result_caps.raw_reachable is False, \
+            "a pending rescope must fail closed (H18-R4)"
+    finally:
+        widget.h5viewer._browser_scan_reset_pending = False
 
 
 def test_stale_missing_data_file_is_not_a_loaded_scan(widget, tmp_path):
@@ -297,17 +361,20 @@ def test_transient_metadata_failure_retries_after_debounce(
     assert calls["n"] == 2
 
 
-def test_transient_failure_preserves_previous_valid_snapshot(
+def test_transient_failure_on_changed_identity_is_conservative(
         widget, tmp_path, monkeypatch):
-    import time
-
+    """H18-R6: a failed observation may NOT reuse a snapshot whose full
+    identity key (path + stamp + adapter + root) no longer matches — a
+    same-path stamp change plus a transient failure answers conservatively,
+    never with the old record's capabilities; within the debounce window the
+    share is not hammered; after it, the new identity is read."""
     import xrd_tools.io.read as read_module
 
     processed = _processed_nxs(tmp_path, raw_reachable=True)
     good = widget._controls_v2_loaded_result_caps(str(processed))
     assert good is not None and good.raw_reachable is True
 
-    # stamp change invalidates the key; the next read transiently fails
+    # same-path stamp change = a DIFFERENT identity at the same pathname
     stamp = os.stat(processed).st_mtime_ns + 1_000_000
     os.utime(processed, ns=(stamp, stamp))
     real = read_module.get_metadata
@@ -323,14 +390,124 @@ def test_transient_failure_preserves_previous_valid_snapshot(
     widget._v2_result_caps_retry_delay = 30.0        # long debounce window
 
     during = widget._controls_v2_loaded_result_caps(str(processed))
-    assert during is not None and during.raw_reachable is True, \
-        "the previous valid same-identity snapshot must be preserved (H18-R3)"
-    # within the debounce window the share is not hammered
+    assert during is None, \
+        "a changed identity must not serve the old snapshot on failure (H18-R6)"
     widget._controls_v2_loaded_result_caps(str(processed))
-    assert calls["n"] == 1
+    assert calls["n"] == 1                           # window: no hammering
 
     widget._v2_result_caps_retry_delay = 0.0
     widget._v2_result_caps_retry = None              # window elapsed
     after = widget._controls_v2_loaded_result_caps(str(processed))
     assert after is not None and after.has_1d is True
+    assert calls["n"] == 2
+
+
+def test_same_path_replacement_never_serves_old_record_on_failure(
+        widget, tmp_path, monkeypatch):
+    """H18-R6 repro: replace a reachable record at the same pathname with a
+    DIFFERENT (orphaned) record; a transient lock on the first read must not
+    resurrect the old record's raw_reachable=True."""
+    import shutil
+
+    import xrd_tools.io.read as read_module
+
+    reachable_dir = tmp_path / "v1"
+    reachable_dir.mkdir()
+    v1 = _processed_nxs(reachable_dir, raw_reachable=True)
+    orphan_dir = tmp_path / "v2"
+    orphan_dir.mkdir()
+    v2 = _processed_nxs(orphan_dir, raw_reachable=False)
+
+    target = tmp_path / "record.nxs"
+    _eiger_master(tmp_path)      # v1's relative master resolves at the target
+    shutil.copy2(v1, target)
+    good = widget._controls_v2_loaded_result_caps(str(target))
+    assert good is not None and good.raw_reachable is True
+
+    shutil.copy2(v2, target)                         # replacement record
+    stamp = os.stat(target).st_mtime_ns + 1_000_000
+    os.utime(target, ns=(stamp, stamp))
+    real = read_module.get_metadata
+    calls = {"n": 0}
+
+    def once_failing(path, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise BlockingIOError("transient lock")
+        return real(path, *a, **k)
+
+    monkeypatch.setattr(read_module, "get_metadata", once_failing)
+    widget._v2_result_caps_retry_delay = 0.0
+
+    during = widget._controls_v2_loaded_result_caps(str(target))
+    assert during is None, \
+        "the old record's snapshot must not answer for its replacement (H18-R6)"
+    after = widget._controls_v2_loaded_result_caps(str(target))
+    assert after is not None
+    assert after.raw_reachable is False              # the REPLACEMENT's truth
+
+
+def test_root_change_with_failure_is_conservative(widget, tmp_path, monkeypatch):
+    """H18-R6: a source-root change plus a transient failure must not leak
+    the previous root's snapshot."""
+    import xrd_tools.io.read as read_module
+
+    nxs_dir = tmp_path / "records"
+    nxs_dir.mkdir()
+    moved_root = tmp_path / "moved_tree"
+    nxs = _relative_source_nxs(nxs_dir, moved_root)
+    widget.wrangler.project_folder = str(moved_root)
+    good = widget._controls_v2_loaded_result_caps(str(nxs))
+    assert good is not None and good.raw_reachable is True
+
+    other_root = tmp_path / "other_root"
+    other_root.mkdir()
+    widget.wrangler.project_folder = str(other_root)  # key changes
+    real = read_module.get_metadata
+    calls = {"n": 0}
+
+    def once_failing(path, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("transient")
+        return real(path, *a, **k)
+
+    monkeypatch.setattr(read_module, "get_metadata", once_failing)
+    widget._v2_result_caps_retry_delay = 0.0
+
+    during = widget._controls_v2_loaded_result_caps(str(nxs))
+    assert during is None, \
+        "the previous root's snapshot must not leak across a root change " \
+        "(H18-R6)"
+    after = widget._controls_v2_loaded_result_caps(str(nxs))
+    assert after is not None
+    assert after.raw_reachable is False              # unreachable under other_root
+
+
+def test_transient_raw_probe_failure_debounces_and_retries(
+        widget, tmp_path, monkeypatch):
+    """H18-R5: a transient error from the frame-0 raw probe is NOT a
+    definitive unreachable observation — it debounces and retries exactly
+    like a transient metadata failure."""
+    import xrd_tools.sources.probe as probe_module
+
+    processed = _processed_nxs(tmp_path, raw_reachable=True)
+    real = probe_module.observe_first_frame
+    calls = {"n": 0}
+
+    def once_transient(source):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError("transient sharing denial")
+        return real(source)
+
+    monkeypatch.setattr(probe_module, "observe_first_frame", once_transient)
+    widget._v2_result_caps_retry_delay = 0.0
+
+    first = widget._controls_v2_loaded_result_caps(str(processed))
+    assert first is None, \
+        "a transient probe error must not be cached as unreachable (H18-R5)"
+    second = widget._controls_v2_loaded_result_caps(str(processed))
+    assert second is not None
+    assert second.raw_reachable is True
     assert calls["n"] == 2

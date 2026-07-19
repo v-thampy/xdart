@@ -37,6 +37,37 @@ class ProbeResult:
     kind: SourceKind | None = None
 
 
+def observe_first_frame(source):
+    """Return ``(reachable, first_image, transient)`` — the typed frame-0 probe.
+
+    H18-R5: distinguishes a DEFINITIVE unreachable observation from a
+    TRANSIENT probe error.  Definitive is the DEFAULT — a missing referenced
+    master, an unresolvable record source, a metadata-only source, an empty
+    scan, and a non-2-D payload all read as definitively unreachable (never
+    reinterpret an ordinary ``False`` as transient).  Only the known
+    concurrency/availability error classes — a sharing/permission denial
+    (the Windows sharing-violation case), a blocking/interrupted read, or a
+    timeout — report ``transient=True`` so a caller with a cache can
+    debounce and retry instead of stranding the capability as unavailable."""
+    if source is None:
+        return False, None, False
+    try:
+        idxs = list(source.frame_indices)
+    except Exception:
+        return False, None, False
+    if not idxs:
+        return False, None, False
+    try:
+        img = np.asarray(source.load_frame(idxs[0]))
+    except (PermissionError, BlockingIOError, InterruptedError, TimeoutError):
+        return False, None, True
+    except Exception:
+        return False, None, False
+    if img.ndim == 2 and img.size > 0:
+        return True, img, False
+    return False, None, False
+
+
 def probe_first_frame(source):
     """Return ``(reachable, first_image)`` — load the source's first frame as a
     strict 2-D raw image (the ROI-stats requirement).
@@ -46,22 +77,10 @@ def probe_first_frame(source):
     never substitutes a downsampled thumbnail.  A metadata-only source (``None``)
     or an empty scan is unreachable.  The decoded image is returned so the caller
     can reuse it (the ROI picker shows exactly this frame) instead of decoding a
-    possibly multi-MB Eiger frame twice."""
-    if source is None:
-        return False, None
-    try:
-        idxs = list(source.frame_indices)
-    except Exception:
-        return False, None
-    if not idxs:
-        return False, None
-    try:
-        img = np.asarray(source.load_frame(idxs[0]))
-    except Exception:
-        return False, None
-    if img.ndim == 2 and img.size > 0:
-        return True, img
-    return False, None
+    possibly multi-MB Eiger frame twice.  Public legacy behavior: every failure
+    mode reads as unreachable; :func:`observe_first_frame` is the typed seam."""
+    reachable, img, _transient = observe_first_frame(source)
+    return reachable, img
 
 
 def raw_is_reachable(source):

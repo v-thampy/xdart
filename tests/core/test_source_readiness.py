@@ -293,3 +293,57 @@ def test_readiness_import_purity_subprocess():
                           capture_output=True, text=True)
     assert proc.returncode == 0, (
         f"heavy modules imported eagerly: {proc.stdout.strip()}")
+
+
+def test_observe_first_frame_distinguishes_transient_from_definitive(tmp_path):
+    """H18-R5: the typed probe seam — a missing referenced file is a
+    DEFINITIVE unreachable; any other load error is a TRANSIENT observation
+    (retry-worthy); a successful 2-D load is definitive reachable."""
+    import numpy as np
+
+    from xrd_tools.sources.probe import observe_first_frame, probe_first_frame
+
+    class _Source:
+        frame_indices = (0,)
+
+        def __init__(self, action):
+            self._action = action
+
+        def load_frame(self, idx):
+            return self._action()
+
+    ok = _Source(lambda: np.ones((4, 4), dtype=np.uint16))
+    reachable, img, transient = observe_first_frame(ok)
+    assert (reachable, transient) == (True, False) and img is not None
+
+    def _gone():
+        raise FileNotFoundError("referenced master is gone")
+
+    reachable, img, transient = observe_first_frame(_Source(_gone))
+    assert (reachable, transient) == (False, False), \
+        "a missing referenced file is definitive, not transient"
+
+    def _denied():
+        raise PermissionError("sharing violation")
+
+    reachable, img, transient = observe_first_frame(_Source(_denied))
+    assert (reachable, transient) == (False, True), \
+        "a non-missing load error is a transient observation"
+
+    # the public probe keeps its exact legacy behavior
+    assert probe_first_frame(ok)[0] is True
+    assert probe_first_frame(_Source(_denied)) == (False, None)
+
+
+def test_observe_raw_reachability_typed_observation(tmp_path):
+    """H18-R5: the additive readiness observation reports definitiveness;
+    describe_source_readiness's public default behavior is unchanged."""
+    from xrd_tools.sources.readiness import (
+        describe_source_readiness,
+        observe_raw_reachability,
+    )
+
+    missing = str(tmp_path / "nope" / "gone.tif")
+    obs = observe_raw_reachability(missing)
+    assert obs.reachable is False and obs.definitive is True
+    assert describe_source_readiness(missing).raw_reachable is False
