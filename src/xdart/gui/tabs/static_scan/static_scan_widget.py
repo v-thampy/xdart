@@ -5890,16 +5890,31 @@ class staticWidget(QWidget):
         """Force an outgoing Overlay/Waterfall tick before destructive rescope."""
         if staticWidget._overlay_plot_method(self) not in ("Overlay", "Waterfall"):
             return False
-        if getattr(self, "_pending_update_idx", None) is None:
-            return False
         self._update_timer.stop()
         self._list_timer.stop()
-        self._flush_pending_update(force=True)
-        # _flush_pending_update updates the selection through H5Viewer, whose
-        # terminal sigUpdate is normally coalesced by another 100 ms timer.  A
-        # scan boundary cannot wait for that timer because rescope clears the
-        # outgoing PublicationStore immediately; render through the authority now.
-        staticWidget._request_render(self, "scan-boundary-overlay-flush")
+        previous_reconcile = getattr(
+            self.displayframe, "_overlay_reconcile_full_batch", False)
+        self.displayframe._overlay_reconcile_full_batch = True
+        try:
+            if getattr(self, "_pending_update_idx", None) is not None:
+                self._flush_pending_update(force=True)
+            else:
+                # A latest-only live tick can consume the pending marker while the
+                # append-only accumulator still trails the complete per-scan index.
+                # Reconcile that index at the one safe synchronous boundary before
+                # rescope destroys the outgoing PublicationStore.
+                with self.scan.scan_lock:
+                    has_outgoing_frames = bool(self.scan.frames.index)
+                if not has_outgoing_frames:
+                    return False
+                staticWidget._render_overlay_full_scan(self)
+            # _flush_pending_update updates the selection through H5Viewer, whose
+            # terminal sigUpdate is normally coalesced by another 100 ms timer.  A
+            # scan boundary cannot wait for that timer because rescope clears the
+            # outgoing PublicationStore immediately; render through the authority.
+            staticWidget._request_render(self, "scan-boundary-overlay-flush")
+        finally:
+            self.displayframe._overlay_reconcile_full_batch = previous_reconcile
         return True
 
     def _flush_pending_update(self, *, force=False):
@@ -5963,7 +5978,13 @@ class staticWidget(QWidget):
             if getattr(self.displayframe, "_processing_active", False):
                 now = _t.perf_counter()
                 last = getattr(self, "_overlay_flush_last_t", 0.0)
-                if now - last < 0.5:
+                if force:
+                    # ``force`` is reserved for explicit scan/run boundaries.
+                    # Complete the outgoing scan before its store is rescoped;
+                    # never use this path from a timer or polling loop.
+                    self._overlay_flush_last_t = now
+                    staticWidget._render_overlay_full_scan(self, method=method)
+                elif now - last < 0.5:
                     staticWidget._h5viewer_data_changed_now(self)
                 else:
                     self._overlay_flush_last_t = now

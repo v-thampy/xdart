@@ -1336,11 +1336,25 @@ class PublicationDisplayAdapter:
                 LifecycleCause.INCOMPATIBLE_GRID,
                 site="_overlay_waterfall_payload[concrete grid mismatch]")
             prior = None
+        reconcile_ids = ()
+        if getattr(widget, "_overlay_reconcile_full_batch", False):
+            try:
+                reconcile_ids = tuple(
+                    overlay_identity_for_widget(
+                        widget, frame_idx, npt=np.asarray(ref_x).size,
+                        axis_info=axis_info,
+                        live_slice=slice_active,
+                    )[1]
+                    for frame_idx in state.selected_ids
+                )
+            except (TypeError, ValueError):
+                reconcile_ids = tuple(ids)
         history = accumulate_waterfall(
             prior, reset_key=reset_key, unit=unit, label=label,
             x=ref_x, rows=np.asarray(rows, dtype=float), ids=ids, names=names,
             metadata=metadata, row_meta=row_meta,
-            replace_ids=replace_ids, drop_ids=drop_ids)
+            replace_ids=replace_ids, drop_ids=drop_ids,
+            reconcile_ids=reconcile_ids)
         return self._history_to_payload(history)
 
     def _history_to_payload(self, history):

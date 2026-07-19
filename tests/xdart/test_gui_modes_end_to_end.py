@@ -2386,6 +2386,99 @@ def test_directory_overlay_accumulates_reused_zero_index_at_live_cadence(
         w._exit_run_state()
 
 
+@pytest.mark.parametrize("pending_at_boundary", [True, False])
+def test_directory_overlay_boundary_flushes_full_outgoing_scan_inside_throttle(
+        widget, pending_at_boundary):
+    """A directory boundary completes the outgoing scan despite render pacing.
+
+    A short scan can finish inside the 500 ms full-overlay interval.  The boundary
+    must therefore reconcile the complete outgoing index even when a coalesced
+    update is still pending *and* when a latest-only tick already consumed the
+    pending marker.  Otherwise whole short scans and the tail between the final
+    full tick and the boundary disappear from the cross-scan waterfall.
+    """
+    import time
+
+    from xrd_tools.core import IntegrationResult1D
+
+    w = widget
+    df = w.displayframe
+    _set_processing_mode(w, "Int 1D")
+    df.ui.plotMethod.setCurrentText("Overlay")
+    df.ui.plotUnit.setCurrentIndex(0)
+    w.h5viewer.auto_last = True
+    w.h5viewer.live_run_active = True
+    w.h5viewer.file_thread.live_run = True
+    w._enter_run_state()
+
+    thread = w.wrangler.thread
+    thread.batch_mode = False
+    thread.mask = None
+    q = np.linspace(0.5, 3.0, 32)
+
+    def frame(scan_name, idx):
+        return SimpleNamespace(
+            idx=idx,
+            gi=False,
+            scan_info={"mon": float(idx)},
+            source_file=f"/data/{scan_name}_master.h5",
+            source_frame_idx=idx - 1,
+            map_raw=None,
+            bg_raw=0,
+            mask=None,
+            thumbnail=None,
+            int_1d=IntegrationResult1D(
+                radial=q,
+                intensity=np.full_like(q, float(idx)),
+                sigma=np.ones_like(q),
+                unit="q_A^-1",
+            ),
+            int_2d=None,
+            gi_1d={},
+            gi_2d={},
+        )
+
+    def announce(scan_name):
+        w.new_scan(
+            scan_name,
+            f"/tmp/{scan_name}.nxs",
+            False,
+            "th",
+            False,
+            False,
+        )
+
+    try:
+        announce("scanA")
+        for idx in range(1, 6):
+            thread._published_frames[idx] = frame("scanA", idx)
+            w.update_data(idx)
+
+        # Guarantee the same cadence window as the live failure: an ordinary
+        # flush is allowed to paint only the latest row for another 500 ms.
+        w._overlay_flush_last_t = time.perf_counter()
+        if not pending_at_boundary:
+            w._update_timer.stop()
+            w._flush_pending_update()
+            type(w)._request_render(w, "test-latest-only-pre-boundary")
+            assert w._pending_update_idx is None
+            assert df._waterfall_history.count < 5
+
+        announce("scanB")
+        thread._published_frames[1] = frame("scanB", 1)
+        w.update_data(1)
+
+        history = df._waterfall_history
+        assert history.count == 5
+        assert history.ids == tuple(("scanA", idx) for idx in range(1, 6))
+    finally:
+        w._update_timer.stop()
+        w._list_timer.stop()
+        w.h5viewer.live_run_active = False
+        w.h5viewer.file_thread.live_run = False
+        w._exit_run_state()
+
+
 def test_int_plot_slice_characterizes_update_plot_state(widget):
     # Slice-derived 1D is update_plot-live: it projects from the cake and
     # includes the slice parameters in the trace name.

@@ -327,6 +327,33 @@ def test_accumulate_waterfall_partial_read_never_shrinks_or_restacks():
     assert h2.ids == (0, 1, 2, 3, 4) and h2.rows.shape == (5, 3)
 
 
+def test_accumulate_waterfall_full_batch_reconciles_only_its_row_order():
+    np = pytest.importorskip("numpy")
+    x = np.array([0.0, 1.0])
+    prior_id = ("prior", 1)
+    latest_id = ("scan", 3)
+    h = dl.accumulate_waterfall(
+        None, reset_key="A", unit="q", x=x,
+        rows=np.array([[10.0, 10.0], [30.0, 30.0]]),
+        ids=[prior_id, latest_id], names=["prior-1", "scan-3"],
+        metadata=[{"frame": 10}, {"frame": 3}],
+    )
+
+    scan_ids = [("scan", idx) for idx in (1, 2, 3)]
+    h2 = dl.accumulate_waterfall(
+        h, reset_key="A", unit="q", x=x,
+        rows=np.array([[1.0, 1.0], [2.0, 2.0], [30.0, 30.0]]),
+        ids=scan_ids, names=["scan-1", "scan-2", "scan-3"],
+        metadata=[{"frame": 1}, {"frame": 2}, {"frame": 3}],
+        reconcile_ids=scan_ids,
+    )
+
+    assert h2.ids == (prior_id, *scan_ids)
+    assert h2.names == ("prior-1", "scan-1", "scan-2", "scan-3")
+    assert [meta["frame"] for meta in h2.metadata] == [10, 1, 2, 3]
+    np.testing.assert_array_equal(h2.rows[:, 0], [10.0, 1.0, 2.0, 30.0])
+
+
 def test_accumulate_waterfall_replaces_explicit_live_slice_row_only():
     np = pytest.importorskip("numpy")
     x = np.array([0.0, 1.0, 2.0])

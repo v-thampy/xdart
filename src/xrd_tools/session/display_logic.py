@@ -777,7 +777,7 @@ def _interp_overlap(target_x, source_x, row):
 
 def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
                          label="", metadata=None, row_meta=None,
-                         replace_ids=(), drop_ids=(),
+                         replace_ids=(), drop_ids=(), reconcile_ids=(),
                          mismatch_policy=GridMismatchPolicy.ERROR):
     """Pure, append-only Overlay/Waterfall accumulator keyed on ``reset_key`` (the
     payload-owned successor to ``update_plot_accumulator`` + the widget triple).
@@ -813,6 +813,12 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
     the legacy same-size display-relabel branch: a display toggle never reaches
     this function, so there is no in-place grid relabel.
 
+    ``reconcile_ids`` is an explicit full-batch ordering hint.  It reorders only
+    those already-present rows at their first occupied slot, leaving every other
+    accumulated row in its existing relative order.  Boundary catch-up uses it
+    after a latest-only live tick so ``[..., frame N, frame 1, ... N-1]`` settles
+    back to the complete natural frame order without resetting prior scans.
+
     ``x`` / ``rows`` / ``ids`` / ``names`` are the incoming frames.  Returns the
     next :class:`WaterfallHistory`.
     """
@@ -836,6 +842,13 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
         row_meta.extend([None] * (len(ids) - len(row_meta)))
     row_meta = row_meta[:len(ids)]
     replace_keys = {_dedup_key(i) for i in (replace_ids or ())}
+    reconcile_keys = []
+    reconcile_seen = set()
+    for row_id in (reconcile_ids or ()):
+        key = _dedup_key(row_id)
+        if key not in reconcile_seen:
+            reconcile_keys.append(key)
+            reconcile_seen.add(key)
     # OV-7b: rows to REMOVE from the accumulator this render -- the live "current"
     # slice cut once its c/w matches a pin (the transient sentinel row must not
     # linger as a duplicate of the pin).  Empty by default => no behaviour change.
@@ -994,6 +1007,22 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
         if keep:
             row_buffer[:len(keep)] = row_buffer[keep]
         count = len(keep)
+
+    if reconcile_keys and count > 1:
+        positions = {_dedup_key(row_id): pos
+                     for pos, row_id in enumerate(out_ids)}
+        ordered = [positions[key] for key in reconcile_keys if key in positions]
+        if len(ordered) > 1:
+            selected = set(ordered)
+            insertion = min(ordered)
+            remaining = [pos for pos in range(count) if pos not in selected]
+            order = remaining[:insertion] + ordered + remaining[insertion:]
+            if order != list(range(count)):
+                out_ids = [out_ids[pos] for pos in order]
+                out_names = [out_names[pos] for pos in order]
+                out_meta = [out_meta[pos] for pos in order]
+                out_rmeta = [out_rmeta[pos] for pos in order]
+                row_buffer[:count] = row_buffer[order]
 
     return _waterfall_history_from_buffer(
         reset_key=reset_key, unit=unit, label=label, x=base_x,
