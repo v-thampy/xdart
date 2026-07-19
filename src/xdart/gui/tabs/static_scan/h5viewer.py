@@ -536,6 +536,13 @@ class H5Viewer(QWidget):
     sigUpdate = Qt.QtCore.Signal()
     sigThreadFinished = Qt.QtCore.Signal()
 
+    # Date sorting may refresh repeatedly during a live run. Reuse shallow
+    # directory scans briefly, while still noticing newly created children
+    # immediately through the directory's own mtime. Manual Refresh clears the
+    # cache, and in-place child writes converge after this short interval.
+    _DATE_SORT_CACHE_TTL_S = 2.0
+    _DATE_SORT_CACHE_MAX = 512
+
     def __init__(self, file_lock, local_path, dirname,
                  scan, frame, frame_ids, frames,
                  viewer_rows_1d, viewer_rows_2d,
@@ -600,6 +607,7 @@ class H5Viewer(QWidget):
         self._run_writing = False
         self._displayed_list_count = 0
         self._displayed_last_label = None
+        self._date_sort_dir_cache = {}
 
     def _init_ui(self):
         """Set up the main UI form and default widget."""
@@ -669,13 +677,16 @@ class H5Viewer(QWidget):
         btn_layout.addWidget(self.ui.auto_last)
         self.ui.gridLayout.addWidget(btn_row, 3, 0, 1, 2)
 
-    def refresh_directory(self):
+    def refresh_directory(self, *_signal_args):
         """Re-read the current directory's file listing (Refresh button).
 
         Repopulates ``listScans`` from ``self.dirname``; ``update_scans``
         preserves the XYE-overlay selection so a refresh mid-compare doesn't
-        drop the user's selected files.
+        drop the user's selected files. An explicit refresh also invalidates
+        cached child mtimes so in-place writes inside listed subdirectories
+        are reflected immediately in Date order.
         """
+        self._date_sort_dir_cache.clear()
         self.update_scans()
 
     @staticmethod
@@ -977,6 +988,60 @@ class H5Viewer(QWidget):
         return [int(c) if c.isdigit() else c.lower()
                 for c in re.split(r'(\d+)', text)]
 
+    def _date_sort_mtime(self, entry):
+        """Effective Date-sort timestamp for one browser entry.
+
+        Files use their own mtime. Directories use the newest mtime among the
+        directory and its immediate children, which matches the operator's
+        expectation for scan/XYE output folders without recursively walking a
+        potentially huge tree or network share. Repeated live refreshes use a
+        short bounded cache; a structural directory change invalidates its
+        entry immediately and the Refresh button clears all entries.
+        """
+        try:
+            # Match the browser's existing display semantics: a top-level
+            # symlink to a directory is presented as a directory and should
+            # therefore sort by that directory's immediate contents too.
+            stat = entry.stat()
+            own_mtime_ns = int(stat.st_mtime_ns)
+            is_dir = entry.is_dir()
+        except OSError:
+            return 0
+        if not is_dir:
+            return own_mtime_ns
+
+        path = os.path.normcase(os.path.abspath(entry.path))
+        now = time.monotonic()
+        cached = self._date_sort_dir_cache.get(path)
+        if cached is not None:
+            cached_own_mtime_ns, checked_at, effective_mtime_ns = cached
+            if (cached_own_mtime_ns == own_mtime_ns
+                    and now - checked_at < self._DATE_SORT_CACHE_TTL_S):
+                return effective_mtime_ns
+
+        effective_mtime_ns = own_mtime_ns
+        try:
+            with os.scandir(entry.path) as children:
+                for child in children:
+                    try:
+                        child_mtime_ns = int(
+                            child.stat(follow_symlinks=False).st_mtime_ns)
+                    except OSError:
+                        continue
+                    effective_mtime_ns = max(
+                        effective_mtime_ns, child_mtime_ns)
+        except OSError:
+            # A transiently unreadable directory still has its own useful
+            # timestamp. Do not cache the partial observation.
+            return own_mtime_ns
+
+        if len(self._date_sort_dir_cache) >= self._DATE_SORT_CACHE_MAX:
+            self._date_sort_dir_cache.pop(
+                next(iter(self._date_sort_dir_cache)), None)
+        self._date_sort_dir_cache[path] = (
+            own_mtime_ns, now, effective_mtime_ns)
+        return effective_mtime_ns
+
     def update_scans(self, *, preserve_selection=False):
         """Populate listScans with files in the current directory.
 
@@ -999,12 +1064,10 @@ class H5Viewer(QWidget):
             entries = list(it)
         if (getattr(self.ui, 'dateSort', None) is not None
                 and self.ui.dateSort.isChecked()):
-            def _safe_mtime(e):
-                try:
-                    return e.stat().st_mtime
-                except OSError:
-                    return 0.0        # a vanished/again entry sorts last
-            entries.sort(key=_safe_mtime, reverse=True)
+            # Stable natural-name order is the deterministic tie-breaker for
+            # entries sharing a timestamp (common after batch writes).
+            entries.sort(key=lambda e: self._natural_sort_key(e.name))
+            entries.sort(key=self._date_sort_mtime, reverse=True)
         else:
             entries.sort(key=lambda e: self._natural_sort_key(e.name))
 

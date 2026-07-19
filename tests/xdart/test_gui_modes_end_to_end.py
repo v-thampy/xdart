@@ -3487,6 +3487,80 @@ def test_date_sort_toggle_orders_scans_by_mtime(widget, tmp_path):
     assert _nxs_order() == ["c_scan.nxs", "b_scan.nxs", "a_scan.nxs"]  # mtime desc
 
 
+def test_date_sort_uses_newest_immediate_child_for_directories(
+        widget, tmp_path):
+    """A scan/output folder sorts by its newest direct child, not merely the
+    folder inode timestamp. The scan stays shallow so nested trees are never
+    recursively walked by the GUI thread."""
+    import os
+
+    hv = widget.h5viewer
+    hv.viewer_mode = 'normal'
+    hv.scan_name = None
+    older_contents = tmp_path / "scan_2"
+    newer_contents = tmp_path / "scan_10"
+    older_contents.mkdir()
+    newer_contents.mkdir()
+    old_child = older_contents / "result.xye"
+    new_child = newer_contents / "result.xye"
+    old_child.write_text("old")
+    new_child.write_text("new")
+
+    # Directory mtimes say scan_2 is newer; child mtimes say scan_10 is newer.
+    os.utime(older_contents, (4000, 4000))
+    os.utime(newer_contents, (2000, 2000))
+    os.utime(old_child, (1000, 1000))
+    os.utime(new_child, (5000, 5000))
+    hv.dirname = str(tmp_path)
+    hv.ui.dateSort.blockSignals(True)
+    hv.ui.dateSort.setChecked(True)
+    hv.ui.dateSort.blockSignals(False)
+    hv.refresh_directory()
+
+    directories = [
+        hv.ui.listScans.item(row).text()
+        for row in range(hv.ui.listScans.count())
+        if hv.ui.listScans.item(row).text().endswith('/')
+    ]
+    assert directories == ["scan_10/", "scan_2/"]
+
+
+def test_date_sort_cache_reuses_auto_refresh_and_manual_refresh_rechecks_children(
+        widget, tmp_path, monkeypatch):
+    """Automatic list refreshes do not rescan unchanged folder contents on
+    every tick; explicit Refresh invalidates that cache immediately."""
+    import os
+    import xdart.gui.tabs.static_scan.h5viewer as h5viewer_module
+
+    hv = widget.h5viewer
+    hv.viewer_mode = 'normal'
+    hv.scan_name = None
+    folder = tmp_path / "scan"
+    folder.mkdir()
+    child = folder / "result.xye"
+    child.write_text("x")
+    hv.dirname = str(tmp_path)
+    hv.ui.dateSort.blockSignals(True)
+    hv.ui.dateSort.setChecked(True)
+    hv.ui.dateSort.blockSignals(False)
+
+    real_scandir = os.scandir
+    child_scans = []
+
+    def recording_scandir(path):
+        if os.path.normpath(path) == os.path.normpath(folder):
+            child_scans.append(path)
+        return real_scandir(path)
+
+    monkeypatch.setattr(h5viewer_module.os, "scandir", recording_scandir)
+    hv.refresh_directory()
+    hv.update_scans()
+    assert len(child_scans) == 1
+
+    hv.refresh_directory()
+    assert len(child_scans) == 2
+
+
 def test_run_end_reselects_scans_panel(widget, monkeypatch, tmp_path):
     """scans_select_after_run: wrangler_finished must re-run update_scans in the
     LIVE saw-frames branch (post-write), so the Scans panel follows to the newly-
