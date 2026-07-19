@@ -186,6 +186,97 @@ def read_nexus(
     )
 
 
+class UnresolvedSourceLinkError(KeyError):
+    """A detector data link exists but its target is not reachable yet.
+
+    Raised by the finder/open seams when the master file declares its image
+    data through an (external) link whose target file/object has not landed —
+    the mid-transfer window of a normal acquisition.  This is a PROVISIONAL
+    state, not a defect: callers retry later (the descriptor maps it to
+    IN_PROGRESS).  Subclasses :class:`KeyError` so pre-existing provisional
+    handlers keep working, but no seam exposes a *bare* KeyError for it.
+    """
+
+
+class UnsupportedDetectorRankError(ValueError):
+    """A detector-marked dataset has an unsupported rank.
+
+    Detector data is 2-D (one frame) or 3-D (a stack); anything else (e.g. a
+    rank-4 multi-sequence layout) is rejected identically by the descriptor,
+    the probe, the finder, and the stack opener — never described READY with
+    a fabricated 3-D shape.  Subclasses :class:`ValueError` for compatibility
+    with pre-existing reader-side handlers.
+    """
+
+
+def _resolved_entry_name(h5f: h5py.File, entry: str) -> str:
+    """Resolve the NXentry name once, NXclass-aware, for the finder seams.
+
+    Same resolver the descriptor uses (``resolve_nxentry``): exact name hint
+    first, else the sole/first ``NX_class='NXentry'`` group — so a file whose
+    entry is ``/entry1`` classifies and opens identically on every route.
+    Falls back to the literal hint when nothing resolves.
+    """
+    try:
+        from xrd_tools.io.bluesky_nexus import resolve_nxentry
+        grp = resolve_nxentry(h5f, entry)
+        if grp is not None:
+            name = grp.name.strip("/").split("/")[-1]
+            if name:
+                return name
+    except Exception:
+        logger.debug("NXentry resolution failed; keeping hint %r",
+                     entry, exc_info=True)
+    return entry
+
+
+def _dangling_detector_links(h5f: h5py.File, entry: str) -> list[str]:
+    """Canonical detector locations whose LINK exists but does not resolve.
+
+    For a broken external link ``get(path)`` returns *None* while
+    ``get(path, getlink=True)`` still returns the link object (membership
+    ``in`` stays True) — that asymmetry is the detection.  Only canonical
+    detector locations are checked (Eiger ``data_NNNNNN`` siblings,
+    ``instrument/detector/data``, ``data/data``); an unrelated broken link
+    elsewhere never blocks classification.
+    """
+    dangling: list[str] = []
+    try:
+        for p in _find_eiger_external_link_paths(h5f, entry):
+            if h5f.get(p) is None:
+                dangling.append(p)
+    except Exception:
+        pass
+    for cand in (f"{entry}/instrument/detector/data", f"{entry}/data/data"):
+        parent, _, leaf = cand.rpartition("/")
+        try:
+            pgrp = h5f.get(parent)
+            if not isinstance(pgrp, h5py.Group):
+                continue
+            link = pgrp.get(leaf, getlink=True)
+            if link is not None and pgrp.get(leaf) is None:
+                dangling.append(f"/{cand}")
+        except Exception:
+            continue
+    return dangling
+
+
+def _reject_unsupported_detector_rank(h5f: h5py.File, entry: str) -> None:
+    """Raise :class:`UnsupportedDetectorRankError` for a >3-D detector signal
+    at a canonical location.  (The generic search arms are already strict
+    2-D/3-D, so only the canonical paths can carry a rank violation.)"""
+    for cand in (f"{entry}/instrument/detector/data", f"{entry}/data/data"):
+        try:
+            obj = h5f.get(cand)
+        except Exception:
+            continue
+        if isinstance(obj, h5py.Dataset) and obj.ndim > 3:
+            raise UnsupportedDetectorRankError(
+                f"/{cand} has rank {obj.ndim}; detector data must be 2-D "
+                f"(one frame) or 3-D (a stack)"
+            )
+
+
 def find_nexus_image_dataset(
     path: Path | str,
     entry: str = "entry",
@@ -235,6 +326,7 @@ def find_nexus_image_dataset(
         raise FileNotFoundError(f"NeXus file not found: {p}")
 
     with h5py.File(p, "r") as f:
+        entry = _resolved_entry_name(f, entry)
         if entry not in f:
             logger.warning("Entry %r not found in %s", entry, p)
             return None
@@ -343,8 +435,8 @@ class NexusImageStack:
             if obj.ndim == 2 and len(paths) == 1:
                 squeeze2d = True
             elif obj.ndim != 3:
-                raise ValueError(
-                    f"{p} is {obj.ndim}-D; NexusImageStack expects 3-D "
+                raise UnsupportedDetectorRankError(
+                    f"{p} has rank {obj.ndim}; NexusImageStack expects 3-D "
                     f"(or a single 2-D detector frame)"
                 )
             dsets.append(obj)
@@ -520,9 +612,24 @@ def open_nexus_image_stack(
 
     h5f = h5py.File(p, "r")
     try:
+        entry = _resolved_entry_name(h5f, entry)
         ext_paths = _find_eiger_external_link_paths(h5f, entry)
         if ext_paths:
-            return NexusImageStack(h5f, ext_paths)
+            # Mid-transfer, targets land in link order: open the contiguous
+            # landed prefix (a later reopen sees more — the R2 growth model);
+            # none landed yet is typed provisional, never a bare KeyError
+            # from the first dereference below.
+            landed: list[str] = []
+            for lp in ext_paths:
+                if h5f.get(lp) is None:
+                    break
+                landed.append(lp)
+            if not landed:
+                raise UnresolvedSourceLinkError(
+                    f"Eiger data link(s) in {p} do not resolve yet "
+                    f"(target not landed); container is still being written"
+                )
+            return NexusImageStack(h5f, landed)
 
         single = find_nexus_image_dataset_in_open_file(h5f, entry)
         if single is None:
@@ -544,9 +651,17 @@ def find_nexus_image_dataset_in_open_file(
     the file twice.  Same search order, minus the Eiger external-link
     branch (which the caller handles explicitly so it can grab *all*
     sibling links, not just the first).
+
+    Raises :class:`UnresolvedSourceLinkError` when the file declares its
+    detector data through a link whose target has not landed yet (provisional
+    — retry later), and :class:`UnsupportedDetectorRankError` for a >3-D
+    detector signal — never a bare *None* for either, so "no image data"
+    keeps meaning exactly that.
     """
+    entry = _resolved_entry_name(h5f, entry)
     if entry not in h5f:
         return None
+    _reject_unsupported_detector_rank(h5f, entry)
     grp = h5f[entry]
 
     # 3-D resolution keeps its FULL pre-F6 precedence: every arm below runs
@@ -557,21 +672,21 @@ def find_nexus_image_dataset_in_open_file(
     # acquisition) is accepted by the canonical-location LAST-RESORT pass at the
     # bottom, only when nothing else resolves.
     candidate = f"{entry}/instrument/detector/data"
-    if candidate in h5f and isinstance(h5f[candidate], h5py.Dataset) and h5f[candidate].ndim == 3:
+    if isinstance(_candidate_obj := h5f.get(candidate), h5py.Dataset) and _candidate_obj.ndim == 3:
         return f"/{candidate}"
 
     candidate = f"{entry}/data/data"
-    if candidate in h5f and isinstance(h5f[candidate], h5py.Dataset) and h5f[candidate].ndim == 3:
+    if isinstance(_candidate_obj := h5f.get(candidate), h5py.Dataset) and _candidate_obj.ndim == 3:
         return f"/{candidate}"
 
     if "instrument" in grp:
         instr = grp["instrument"]
         for subname in instr:
-            sub = instr[subname]
+            sub = instr.get(subname)  # None for a broken link
             if not isinstance(sub, h5py.Group):
                 continue
             inner = f"{entry}/instrument/{subname}/data"
-            if inner in h5f and isinstance(h5f[inner], h5py.Dataset) and h5f[inner].ndim == 3:
+            if isinstance(_inner_obj := h5f.get(inner), h5py.Dataset) and _inner_obj.ndim == 3:
                 return f"/{inner}"
 
     # Bluesky / apstools NXWriter: the NXdata ``@signal`` points at a scalar
@@ -582,6 +697,11 @@ def find_nexus_image_dataset_in_open_file(
     from xrd_tools.io.bluesky_nexus import find_detector_signal_dataset
     det = find_detector_signal_dataset(grp)
     if det is not None:
+        if det.ndim > 3:
+            raise UnsupportedDetectorRankError(
+                f"{det.name} has rank {det.ndim}; detector data must be 2-D "
+                f"(one frame) or 3-D (a stack)"
+            )
         return det.name
 
     # F-NXS-2: a processed xdart scan file has NO raw detector data, only the
@@ -628,17 +748,29 @@ def find_nexus_image_dataset_in_open_file(
     # real stack.  The largest-dataset fallback stays strict-3D — a lone 2-D
     # array of unknown provenance is more likely a table than a frame.
     for cand in (f"{entry}/instrument/detector/data", f"{entry}/data/data"):
-        if cand in h5f and isinstance(h5f[cand], h5py.Dataset) and h5f[cand].ndim == 2:
+        if isinstance(_cand_obj := h5f.get(cand), h5py.Dataset) and _cand_obj.ndim == 2:
             return f"/{cand}"
     if "instrument" in grp:
         instr = grp["instrument"]
         for subname in instr:
-            sub = instr[subname]
+            sub = instr.get(subname)  # None for a broken link
             if not isinstance(sub, h5py.Group):
                 continue
             inner = f"{entry}/instrument/{subname}/data"
-            if inner in h5f and isinstance(h5f[inner], h5py.Dataset) and h5f[inner].ndim == 2:
+            if isinstance(_inner_obj := h5f.get(inner), h5py.Dataset) and _inner_obj.ndim == 2:
                 return f"/{inner}"
+
+    # Nothing resolved.  If a canonical detector LINK exists but its target
+    # has not landed (mid-transfer), that is provisional — typed, never a
+    # silent None (which would misclassify the master IMAGELESS) and never a
+    # bare KeyError from a later dereference.
+    dangling = _dangling_detector_links(h5f, entry)
+    if dangling:
+        raise UnresolvedSourceLinkError(
+            f"detector data link(s) {dangling} in "
+            f"{getattr(h5f, 'filename', '<file>')} do not resolve yet "
+            f"(target not landed); container is still being written"
+        )
     return None
 
 

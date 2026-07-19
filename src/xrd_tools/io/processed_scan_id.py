@@ -73,15 +73,24 @@ def is_processed_xdart_file(f: h5py.File, entry: str = "entry") -> bool:
       (:data:`~xrd_tools.io.schema.ACCEPTED_SCHEMA_NAMES`, covering the
       pre-monorepo name too).
 
+    The entry is resolved NXclass-aware (the same ``resolve_nxentry`` route the
+    descriptor and finder use), so a processed record whose entry is named
+    ``/entry1`` classifies identically on every seam (NXS-PROC-1) — the *entry*
+    argument is a hint, not a literal requirement.
+
     Never raises: any traversal error answers ``False`` (let the raw path report
     a genuinely broken file its own way).
     """
     try:
-        for group in _PROCESSED_RESULT_GROUPS:
-            if f"{entry}/{group}" in f:
-                return True
         grp = f.get(entry)
+        if not isinstance(grp, h5py.Group):
+            # Literal hint absent — resolve the NXentry the canonical way.
+            from xrd_tools.io.bluesky_nexus import resolve_nxentry
+            grp = resolve_nxentry(f, entry)
         if isinstance(grp, h5py.Group):
+            for group in _PROCESSED_RESULT_GROUPS:
+                if group in grp:
+                    return True
             stamp = _attr_str(grp.attrs.get(SCHEMA_NAME_ATTR))
             if stamp in ACCEPTED_SCHEMA_NAMES:
                 return True

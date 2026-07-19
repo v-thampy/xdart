@@ -231,6 +231,10 @@ def _nexus_probe(path: Path) -> Any:
         is_processed_xdart_path,
     )
     from xrd_tools.io.image import _find_hdf5_image_dataset, _is_eiger_master
+    from xrd_tools.io.nexus import (
+        UnresolvedSourceLinkError,
+        UnsupportedDetectorRankError,
+    )
     import h5py
 
     path = Path(path)
@@ -255,6 +259,19 @@ def _nexus_probe(path: Path) -> Any:
                     reason="processed xdart record",
                     kind=SourceKind.PROCESSED_NEXUS,
                 )
+            except UnsupportedDetectorRankError as exc:
+                # NXS-DIM-1: a >3-D detector signal is a defect, not
+                # imageless — and never READY with fabricated 3-D facts.
+                return ProbeResult(
+                    ProbeState.INVALID,
+                    reason=f"unsupported detector rank: {exc}")
+            except UnresolvedSourceLinkError as exc:
+                # NXS-LINK-1: link target not landed — mid-transfer, typed
+                # provisional (retry later), never an escaping KeyError.
+                return ProbeResult(
+                    ProbeState.IN_PROGRESS,
+                    reason=f"detector data link target not yet available; "
+                           f"retry later: {exc}")
             except ValueError:
                 return ProbeResult(
                     ProbeState.IMAGELESS, reason="no 2-D+ detector dataset found")

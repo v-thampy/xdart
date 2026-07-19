@@ -198,8 +198,11 @@ def resolve_stack_paths(h5f: Any, entry: str) -> tuple[list[str], bool]:
         # ProcessedXdartInputError propagates (processed output); a genuine
         # "no detector dataset" ValueError resolves to IMAGELESS.
         from xrd_tools.io.image import _find_hdf5_image_dataset
+        from xrd_tools.io.nexus import UnsupportedDetectorRankError
         try:
             ds = _find_hdf5_image_dataset(h5f)
+        except UnsupportedDetectorRankError:
+            raise  # rank violation is INVALID, never IMAGELESS
         except ValueError:
             return [], False
         path = ds.name
@@ -215,6 +218,8 @@ def _stack_facts(h5f: Any, paths: list[str]) -> dict[str, Any]:
     chunks = tuple(int(c) for c in first.chunks) if first.chunks else None
     compression = _filter_summary(first)
 
+    from xrd_tools.io.nexus import UnsupportedDetectorRankError
+
     if len(paths) == 1:
         ds = first
         if ds.ndim == 2:
@@ -224,6 +229,12 @@ def _stack_facts(h5f: Any, paths: list[str]) -> dict[str, Any]:
                 "dataset_shape": frame_shape, "dtype": dtype, "chunks": chunks,
                 "compression": compression, "is_2d": True,
             }
+        if ds.ndim != 3:
+            # NXS-DIM-1: never fabricate 3-D facts from an unsupported rank.
+            raise UnsupportedDetectorRankError(
+                f"{ds.name} has rank {ds.ndim}; detector data must be 2-D "
+                f"(one frame) or 3-D (a stack)"
+            )
         frame_shape = tuple(int(d) for d in ds.shape[1:])
         return {
             "frame_count": int(ds.shape[0]), "frame_shape": frame_shape,
@@ -231,13 +242,18 @@ def _stack_facts(h5f: Any, paths: list[str]) -> dict[str, Any]:
             "chunks": chunks, "compression": compression, "is_2d": False,
         }
 
-    # Multiple external-link Eiger segments: concatenate along the frame axis.
+    # Multiple external-link Eiger segments: concatenate along the frame axis
+    # (strict-3D, the same invariant NexusImageStack enforces).
     total = 0
     frame_shape: tuple[int, ...] | None = None
     for p in paths:
         d = h5f[p]
-        total += int(d.shape[0]) if d.ndim >= 3 else 1
-        fs = tuple(int(x) for x in d.shape[1:]) if d.ndim >= 3 else tuple(int(x) for x in d.shape)
+        if d.ndim != 3:
+            raise UnsupportedDetectorRankError(
+                f"{p} has rank {d.ndim}; Eiger segments must be 3-D"
+            )
+        total += int(d.shape[0])
+        fs = tuple(int(x) for x in d.shape[1:])
         if frame_shape is None:
             frame_shape = fs
     return {
@@ -266,7 +282,11 @@ def describe_container_from_open(
     """
     from xrd_tools.io.bluesky_nexus import is_bluesky_nxwriter, resolve_nxentry
     from xrd_tools.io.image import _is_eiger_master
-    from xrd_tools.io.nexus import _read_energy, _read_wavelength
+    from xrd_tools.io.nexus import (
+        UnsupportedDetectorRankError,
+        _read_energy,
+        _read_wavelength,
+    )
     from xrd_tools.io.processed_scan_id import (
         ProcessedXdartInputError,
         is_processed_xdart_file,
@@ -340,6 +360,10 @@ def describe_container_from_open(
         return ContainerDescriptor(
             state=ProbeState.PROCESSED_OUTPUT, kind=SourceKind.PROCESSED_NEXUS,
             reason="processed xdart record", **common)
+    except UnsupportedDetectorRankError as exc:
+        return ContainerDescriptor(
+            state=ProbeState.INVALID, kind=kind,
+            reason=f"unsupported detector rank: {exc}", **common)
     except (KeyError, OSError) as exc:
         return ContainerDescriptor(
             state=ProbeState.IN_PROGRESS,
@@ -360,6 +384,10 @@ def describe_container_from_open(
             facts = None
         else:
             facts = _stack_facts(h5f, paths)
+    except UnsupportedDetectorRankError as exc:
+        return ContainerDescriptor(
+            state=ProbeState.INVALID, kind=kind,
+            reason=f"unsupported detector rank: {exc}", **common)
     except (KeyError, OSError) as exc:
         return ContainerDescriptor(
             state=ProbeState.IN_PROGRESS,

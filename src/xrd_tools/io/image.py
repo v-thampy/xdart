@@ -630,6 +630,23 @@ def _read_raw_binary(
     return arr.reshape(shape)
 
 
+def _resolvable_children(grp: h5py.Group):
+    """Iterate ``(name, object)`` pairs, skipping broken links.
+
+    ``Group.items()`` dereferences every child eagerly, so ONE dangling
+    external link (the mid-transfer window of a normal acquisition) aborts
+    the whole search with a bare KeyError.  Skipping lets the canonical
+    dangling-link check at the end of :func:`_find_hdf5_image_dataset`
+    classify the file as provisional instead (NXS-LINK-1).
+    """
+    for name in grp:
+        try:
+            item = grp[name]
+        except KeyError:
+            continue
+        yield name, item
+
+
 def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
     """Locate the image dataset inside an HDF5/NeXus file.
 
@@ -662,6 +679,20 @@ def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
             "the stored source pointer."
         )
 
+    # --- 0b. Reject unsupported detector rank (NXS-DIM-1) -------------------
+    # Same canonical-location rank gate as the NeXus finder, so a rank-4
+    # detector signal is rejected identically on every route instead of being
+    # returned by the >=2-D arms below.
+    from xrd_tools.io.nexus import (
+        _reject_unsupported_detector_rank,
+        _resolved_entry_name,
+        UnresolvedSourceLinkError,
+        UnsupportedDetectorRankError,
+        _dangling_detector_links,
+    )
+    nx_entry = _resolved_entry_name(f, "entry")
+    _reject_unsupported_detector_rank(f, nx_entry)
+
     # --- 1. Fixed candidate paths -------------------------------------------
     _FIXED_PATHS = (
         "/entry/data/data",
@@ -674,10 +705,12 @@ def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
         "/entry/instrument/eiger/data",
     )
     for candidate in _FIXED_PATHS:
-        if candidate in f:
-            obj = f[candidate]
-            if isinstance(obj, h5py.Dataset) and obj.ndim >= 2:
-                return obj  # type: ignore[return-value]
+        # get() answers None for a missing path AND for a broken link
+        # (membership would answer True for the latter and getitem would
+        # raise a bare KeyError — the NXS-LINK-1 escape).
+        obj = f.get(candidate)
+        if isinstance(obj, h5py.Dataset) and 2 <= obj.ndim <= 3:
+            return obj  # type: ignore[return-value]
 
     # --- 1b. Bluesky / apstools NXWriter detector marker ---------------------
     # Bluesky points the NXdata ``@signal`` at a scalar counter, so the image
@@ -687,11 +720,16 @@ def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
     from xrd_tools.io.bluesky_nexus import find_detector_signal_dataset
     det = find_detector_signal_dataset(f)
     if det is not None:
+        if det.ndim > 3:
+            raise UnsupportedDetectorRankError(
+                f"{det.name} has rank {det.ndim}; detector data must be 2-D "
+                f"(one frame) or 3-D (a stack)"
+            )
         return det  # type: ignore[return-value]
 
     # --- 2. NXdata groups (signal attribute) ---------------------------------
     def _search_nxdata(grp: h5py.Group) -> h5py.Dataset | None:
-        for name, item in grp.items():
+        for name, item in _resolvable_children(grp):
             nx_class = item.attrs.get("NX_class", b"")
             if isinstance(nx_class, bytes):
                 nx_class = nx_class.decode("utf-8", errors="replace")
@@ -702,11 +740,11 @@ def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
                         signal_name = signal_name.decode("utf-8", errors="replace")
                     if signal_name in item and isinstance(item[signal_name], h5py.Dataset):
                         ds = item[signal_name]
-                        if ds.ndim >= 2:
+                        if 2 <= ds.ndim <= 3:
                             return ds  # type: ignore[return-value]
-                # No signal attribute — pick first ≥2-D dataset
-                for sub_name, sub_item in item.items():
-                    if isinstance(sub_item, h5py.Dataset) and sub_item.ndim >= 2:
+                # No signal attribute — pick first 2-D/3-D dataset
+                for sub_name, sub_item in _resolvable_children(item):
+                    if isinstance(sub_item, h5py.Dataset) and 2 <= sub_item.ndim <= 3:
                         return sub_item  # type: ignore[return-value]
             # Recurse into subgroups
             if isinstance(item, h5py.Group):
@@ -721,13 +759,19 @@ def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
 
     # --- 3. NXdetector groups ------------------------------------------------
     def _search_nxdetector(grp: h5py.Group) -> h5py.Dataset | None:
-        for name, item in grp.items():
+        for name, item in _resolvable_children(grp):
             nx_class = item.attrs.get("NX_class", b"")
             if isinstance(nx_class, bytes):
                 nx_class = nx_class.decode("utf-8", errors="replace")
             if nx_class == "NXdetector" and isinstance(item, h5py.Group):
                 if "data" in item and isinstance(item["data"], h5py.Dataset):
-                    return item["data"]  # type: ignore[return-value]
+                    ds = item["data"]
+                    if ds.ndim > 3:
+                        raise UnsupportedDetectorRankError(
+                            f"{ds.name} has rank {ds.ndim}; detector data "
+                            f"must be 2-D (one frame) or 3-D (a stack)"
+                        )
+                    return ds  # type: ignore[return-value]
             if isinstance(item, h5py.Group):
                 result = _search_nxdetector(item)
                 if result is not None:
@@ -742,10 +786,20 @@ def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
     found: dict[str, h5py.Dataset] = {}
 
     def _visitor(name: str, obj: object) -> None:
-        if isinstance(obj, h5py.Dataset) and obj.ndim >= 2:
+        if isinstance(obj, h5py.Dataset) and 2 <= obj.ndim <= 3:
             found[name] = obj  # type: ignore[assignment]
 
     f.visititems(_visitor)
     if not found:
+        # A canonical detector LINK whose target has not landed means the
+        # container is still being written — typed provisional, never a bare
+        # "no dataset" (which would misclassify the master as imageless).
+        dangling = _dangling_detector_links(f, nx_entry)
+        if dangling:
+            raise UnresolvedSourceLinkError(
+                f"detector data link(s) {dangling} in {f.filename} do not "
+                f"resolve yet (target not landed); container is still being "
+                f"written"
+            )
         raise ValueError(f"No 2-D+ dataset found in {f.filename}")
     return max(found.values(), key=lambda d: d.size)

@@ -151,6 +151,17 @@ class ContainerCursor:
                 raise ContainerNotReadyError(
                     f"{self._path} is not ready for cursor reads: "
                     f"{self._descriptor.reason}")
+            if self._descriptor.state is ProbeState.INVALID:
+                # NXS-DIM-1: a defective container (unsupported detector
+                # rank) must fail the open loudly, not yield a stackless
+                # cursor whose reads fail obscurely later.
+                from xrd_tools.io.nexus import UnsupportedDetectorRankError
+                err = (UnsupportedDetectorRankError
+                       if "rank" in str(self._descriptor.reason or "")
+                       else ValueError)
+                raise err(
+                    f"{self._path} is not a readable detector container: "
+                    f"{self._descriptor.reason}")
             try:
                 self._entry_grp = resolve_nxentry(self._h5, self._entry)
             except Exception:

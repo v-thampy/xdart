@@ -190,20 +190,26 @@ def classify_image_source(path) -> ImageSourceInfo:
 
     try:
         with h5py.File(p, "r") as f:
-            entry = f.get("entry")
+            # NXS-ENTRY-1/PROC-1: resolve the NXentry NXclass-aware (the same
+            # route every other seam uses) so an ``/entry1`` file classifies
+            # identically here and in the probe/descriptor.
+            from xrd_tools.io.bluesky_nexus import resolve_nxentry
+            entry = resolve_nxentry(f, "entry")
             # ``entry/frames`` ALONE is NOT an xdart-processed marker — Eiger
             # data files carry a native ``entry/frames`` group alongside the raw
             # ``entry/data/data`` stack.  Only integrated data, or frames that
             # actually carry source/thumbnail content, mark a processed file.
-            has_integrated = (
-                "entry/integrated_1d" in f or "entry/integrated_2d" in f
+            has_integrated = entry is not None and (
+                "integrated_1d" in entry or "integrated_2d" in entry
             )
             if not has_integrated:
                 # A genuine raw detector dataset wins over a native frames group.
                 for cand in _RAW_DATASET_CANDIDATES:
                     obj = f.get(cand)
-                    if isinstance(obj, h5py.Dataset) and obj.ndim >= 2:
-                        n = obj.shape[0] if obj.ndim >= 3 else 1
+                    if obj is None and entry is not None and cand.startswith("entry/"):
+                        obj = entry.get(cand[len("entry/"):])
+                    if isinstance(obj, h5py.Dataset) and 2 <= obj.ndim <= 3:
+                        n = obj.shape[0] if obj.ndim == 3 else 1
                         return ImageSourceInfo(
                             kind=ImageSourceKind.RAW_MASTER, path=str(p),
                             frame_labels=tuple(range(int(n))),
@@ -212,8 +218,8 @@ def classify_image_source(path) -> ImageSourceInfo:
                 # ``@signal_type='detector'`` under a non-canonical name.
                 from xrd_tools.io.bluesky_nexus import find_detector_signal_dataset
                 det = find_detector_signal_dataset(f)
-                if det is not None and det.ndim >= 2:
-                    n = det.shape[0] if det.ndim >= 3 else 1
+                if det is not None and 2 <= det.ndim <= 3:
+                    n = det.shape[0] if det.ndim == 3 else 1
                     return ImageSourceInfo(
                         kind=ImageSourceKind.RAW_MASTER, path=str(p),
                         frame_labels=tuple(range(int(n))),
