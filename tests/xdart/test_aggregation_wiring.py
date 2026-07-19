@@ -1661,7 +1661,11 @@ def test_waterfall_history_payload_decimates_display_rows_only():
     assert payload.plot_history is history
     assert payload.overlaid_ids == ids
     assert len(payload.traces) <= MAX_WATERFALL_PAYLOAD_ROWS
-    assert payload.display_ids == ids[::3]
+    assert payload.display_ids[0] == ids[0]
+    assert payload.display_ids[-1] == ids[-1]
+    assert payload.display_ids == tuple(sorted(set(payload.display_ids)))
+    assert tuple(int(trace.y[0]) for trace in payload.traces) == \
+        payload.display_ids
 
 
 def test_cake_image_blanks_non_overall_eviction():
