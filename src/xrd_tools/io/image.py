@@ -738,10 +738,11 @@ def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
                 if signal_name is not None:
                     if isinstance(signal_name, bytes):
                         signal_name = signal_name.decode("utf-8", errors="replace")
-                    if signal_name in item and isinstance(item[signal_name], h5py.Dataset):
-                        ds = item[signal_name]
-                        if 2 <= ds.ndim <= 3:
-                            return ds  # type: ignore[return-value]
+                    # get(): membership answers True for a dangling link and
+                    # getitem then raises a bare KeyError (NXS-LINK-1).
+                    ds = item.get(signal_name)
+                    if isinstance(ds, h5py.Dataset) and 2 <= ds.ndim <= 3:
+                        return ds  # type: ignore[return-value]
                 # No signal attribute — pick first 2-D/3-D dataset
                 for sub_name, sub_item in _resolvable_children(item):
                     if isinstance(sub_item, h5py.Dataset) and 2 <= sub_item.ndim <= 3:
@@ -764,8 +765,10 @@ def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
             if isinstance(nx_class, bytes):
                 nx_class = nx_class.decode("utf-8", errors="replace")
             if nx_class == "NXdetector" and isinstance(item, h5py.Group):
-                if "data" in item and isinstance(item["data"], h5py.Dataset):
-                    ds = item["data"]
+                # get(): a dangling 'data' link answers membership True but
+                # getitem raises a bare KeyError (NXS-LINK-1).
+                ds = item.get("data")
+                if isinstance(ds, h5py.Dataset):
                     if ds.ndim > 3:
                         raise UnsupportedDetectorRankError(
                             f"{ds.name} has rank {ds.ndim}; detector data "
@@ -782,6 +785,20 @@ def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
     if nxdet_result is not None:
         return nxdet_result
 
+    # --- 3b. Dangling canonical detector link: provisional, BEFORE the ------
+    # largest-dataset rummage.  A real Dectris master carries 2-D auxiliary
+    # datasets (pixel_mask, flatfield) next to its not-yet-landed data link;
+    # falling through would return one of those as "the image" and classify a
+    # mid-transfer master READY while the descriptor says IN_PROGRESS
+    # (NXS-LINK-1).
+    dangling = _dangling_detector_links(f, nx_entry)
+    if dangling:
+        raise UnresolvedSourceLinkError(
+            f"detector data link(s) {dangling} in {f.filename} do not "
+            f"resolve yet (target not landed); container is still being "
+            f"written"
+        )
+
     # --- 4. Fallback: largest ≥2-D dataset -----------------------------------
     found: dict[str, h5py.Dataset] = {}
 
@@ -791,15 +808,5 @@ def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
 
     f.visititems(_visitor)
     if not found:
-        # A canonical detector LINK whose target has not landed means the
-        # container is still being written — typed provisional, never a bare
-        # "no dataset" (which would misclassify the master as imageless).
-        dangling = _dangling_detector_links(f, nx_entry)
-        if dangling:
-            raise UnresolvedSourceLinkError(
-                f"detector data link(s) {dangling} in {f.filename} do not "
-                f"resolve yet (target not landed); container is still being "
-                f"written"
-            )
         raise ValueError(f"No 2-D+ dataset found in {f.filename}")
     return max(found.values(), key=lambda d: d.size)

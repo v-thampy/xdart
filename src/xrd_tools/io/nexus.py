@@ -212,11 +212,19 @@ class UnsupportedDetectorRankError(ValueError):
 def _resolved_entry_name(h5f: h5py.File, entry: str) -> str:
     """Resolve the NXentry name once, NXclass-aware, for the finder seams.
 
-    Same resolver the descriptor uses (``resolve_nxentry``): exact name hint
-    first, else the sole/first ``NX_class='NXentry'`` group — so a file whose
-    entry is ``/entry1`` classifies and opens identically on every route.
-    Falls back to the literal hint when nothing resolves.
+    An EXPLICIT hint that names an existing group always wins (these seams
+    historically searched the literal hint, and a caller pointing at a
+    class-less ``/scan2`` must not be silently redirected to the first
+    NXentry-classed group).  Otherwise the descriptor's resolver
+    (``resolve_nxentry``) picks the sole/first ``NX_class='NXentry'`` group —
+    so a file whose entry is ``/entry1`` classifies and opens identically on
+    every route.  Falls back to the literal hint when nothing resolves.
     """
+    try:
+        if isinstance(h5f.get(entry), h5py.Group):
+            return entry
+    except Exception:
+        pass
     try:
         from xrd_tools.io.bluesky_nexus import resolve_nxentry
         grp = resolve_nxentry(h5f, entry)
@@ -615,21 +623,20 @@ def open_nexus_image_stack(
         entry = _resolved_entry_name(h5f, entry)
         ext_paths = _find_eiger_external_link_paths(h5f, entry)
         if ext_paths:
-            # Mid-transfer, targets land in link order: open the contiguous
-            # landed prefix (a later reopen sees more — the R2 growth model);
-            # none landed yet is typed provisional, never a bare KeyError
-            # from the first dereference below.
-            landed: list[str] = []
-            for lp in ext_paths:
-                if h5f.get(lp) is None:
-                    break
-                landed.append(lp)
-            if not landed:
+            # ANY declared-but-unlanded segment makes the whole open typed
+            # provisional (retry later).  Opening the landed prefix instead
+            # would hand a batch consumer a silently TRUNCATED stack it
+            # would retire as complete, while probe/descriptor answer
+            # IN_PROGRESS for the same container — one container, one state
+            # (NXS-LINK-1; §5).  KeyError-compatible with the pre-contract
+            # bare dereference failure.
+            missing = [lp for lp in ext_paths if h5f.get(lp) is None]
+            if missing:
                 raise UnresolvedSourceLinkError(
-                    f"Eiger data link(s) in {p} do not resolve yet "
+                    f"Eiger data link(s) {missing} in {p} do not resolve yet "
                     f"(target not landed); container is still being written"
                 )
-            return NexusImageStack(h5f, landed)
+            return NexusImageStack(h5f, ext_paths)
 
         single = find_nexus_image_dataset_in_open_file(h5f, entry)
         if single is None:

@@ -217,7 +217,7 @@ def test_single_file_growth_exactly_once_in_order(tmp_path, monkeypatch):
 
 # ── Stop while provisional ────────────────────────────────────────────────
 
-def test_single_file_stop_while_provisional_joins_clean(tmp_path):
+def test_single_file_stop_while_provisional_joins_clean(tmp_path, monkeypatch):
     path = tmp_path / "stop_00001.nxs"
     _nxwriter_shell(path)
     worker = _worker(path)
@@ -225,16 +225,24 @@ def test_single_file_stop_while_provisional_joins_clean(tmp_path):
     t0 = time.monotonic()
     _p, _s, _n, data, _m = worker._get_next_eiger_frame()   # real prefetcher
     assert data is None
+    # The provisional path itself must leave NO open cursor behind — asserted
+    # BEFORE any test-side cleanup (the close-on-wait production invariant).
+    assert worker._eiger_cursor is None, \
+        "a provisional wait must not hold an open cursor between polls"
     worker.command = "stop"
     stop_evt = worker._prefetch_stop_evt
     if stop_evt is not None:
         stop_evt.set()
     assert worker._prefetch_stop_prior(), "prefetch worker must join promptly"
-    worker._eiger_close_master()
-    assert worker._eiger_cursor is None
     thread = worker._prefetch_thread
     assert thread is None or not thread.is_alive()
     assert time.monotonic() - t0 < 10.0, "Stop must not wait out a deadline"
+
+    # A stopped worker's polls must not open the source at all.
+    opens = _count_cursor_opens(monkeypatch)
+    assert _drain(worker) == []
+    assert len(opens) == 0, "a stopped run must not reopen the source"
+    worker._eiger_close_master()                 # end-of-run hygiene (run())
 
 
 # ── Non-live fixed point ──────────────────────────────────────────────────
@@ -260,6 +268,155 @@ def test_single_file_batch_unfinalized_reads_then_ends(tmp_path):
     assert _drain(worker) == [1, 2, 3]
     assert time.monotonic() - t0 < 10.0, \
         "batch consumes what exists and ends without a growth wait"
+
+
+def _append_frames_subprocess(path, n):
+    """Append to *n* frames from a SEPARATE process — the beamline writer's
+    actual shape.  In-process HDF5 refuses a mixed RDONLY/RDWR open of the
+    same file, and the point here is growth landing while the worker's read
+    cursor is STILL OPEN; ``locking=False`` bypasses the reader's advisory
+    lock exactly as an external writer configuration does."""
+    import subprocess
+    import sys
+
+    script = (
+        "import h5py, numpy as np\n"
+        f"with h5py.File({str(path)!r}, 'a', locking=False) as f:\n"
+        "    ds = f['entry/instrument/detector/data']\n"
+        "    lo = ds.shape[0]\n"
+        f"    ds.resize(({n}, 8, 8))\n"
+        f"    for i in range(lo, {n}):\n"
+        "        ds[i] = np.full((8, 8), i + 1, dtype=np.uint16)\n"
+    )
+    subprocess.run([sys.executable, "-c", script],
+                   check=True, capture_output=True)
+
+
+def test_single_file_growth_while_cursor_open_uses_grown_arm(tmp_path):
+    """Growth landing DURING consumption (the common live cadence): at
+    exhaustion the still-open cursor's cached count is stale, and the
+    transactional-reopen 'grown' arm — not the cursor-less count recheck —
+    must observe the tail and continue from the prior index."""
+    path = tmp_path / "growopen_00001.nxs"
+    _nxwriter_shell(path)
+    _nxwriter_frames(path, 3)
+    worker = _worker(path)
+
+    outcomes = []
+    real_outcome = worker._eiger_single_file_growth_outcome
+
+    def spying_outcome():
+        out = real_outcome()
+        outcomes.append(out)
+        return out
+
+    worker._eiger_single_file_growth_outcome = spying_outcome
+
+    got = []
+    for _ in range(3):                           # consume the initial segment
+        _p, _s, num, data, _m = worker._get_next_eiger_frame_sync()
+        assert data is not None
+        got.append(num)
+    assert got == [1, 2, 3]
+    assert worker._eiger_cursor is not None, "consumption keeps ONE cursor"
+
+    _append_frames_subprocess(path, 5)           # tail lands while it is open
+
+    for _ in range(2):
+        _p, _s, num, data, _m = worker._get_next_eiger_frame_sync()
+        assert data is not None, "the grown tail must be read, not sentineled"
+        got.append(num)
+    assert got == [1, 2, 3, 4, 5]
+    assert "grown" in outcomes, \
+        f"the transactional-reopen growth arm never executed: {outcomes}"
+
+
+# ── fabio-primary live master: catch-up must not latch the run done ───────
+
+def test_fabio_master_catchup_stays_provisional(tmp_path):
+    """fabio's nframes counts only LANDED data files, so a live reader that
+    catches up with the writer sees 'exhaustion' while a declared segment is
+    still in flight.  That must classify 'wait' (retry on the next watch
+    poll) — latching done would permanently end source reads mid-acquisition
+    (review-caught blocker)."""
+    master = tmp_path / "fab_master.h5"
+    t1 = tmp_path / "fab_data_000001.h5"
+    t2 = tmp_path / "fab_data_000002.h5"
+    with h5py.File(t1, "w") as f:
+        f.create_dataset(
+            "entry/data/data",
+            data=np.arange(3 * 64, dtype=np.uint16).reshape(3, 8, 8))
+    with h5py.File(master, "w") as f:            # segment 2 NOT landed yet
+        e = f.create_group("entry")
+        e.attrs["NX_class"] = "NXentry"
+        d = e.create_group("data")
+        d.attrs["NX_class"] = "NXdata"
+        d["data_000001"] = h5py.ExternalLink(str(t1), "/entry/data/data")
+        d["data_000002"] = h5py.ExternalLink(str(t2), "/entry/data/data")
+
+    worker = _worker(master)
+    worker.img_ext = "h5"
+
+    _p, _s, num, data, _m = worker._get_next_eiger_frame_sync()
+    assert data is not None and num == 1
+    assert worker._eiger_fabio_handle is not None, \
+        "precondition: fabio must own this master (else the test is moot)"
+
+    got = [num] + _drain(worker)                 # catch up with the writer
+    assert got == [1, 2, 3]
+    assert not getattr(worker, "_eiger_single_file_done", False), \
+        "a live fabio catch-up must stay provisional, never latch done"
+    assert worker._eiger_single_file_watchable(), \
+        "the watch gate must keep polling a caught-up live fabio master"
+
+    with h5py.File(t2, "w") as f:                # segment 2 lands
+        f.create_dataset(
+            "entry/data/data",
+            data=np.arange(3 * 64, 6 * 64, dtype=np.uint16).reshape(3, 8, 8))
+
+    deadline = time.monotonic() + 15.0
+    while len(got) < 6 and time.monotonic() < deadline:
+        got.extend(_drain(worker))
+    assert got == [1, 2, 3, 4, 5, 6], \
+        f"the run must resume when the declared segment lands, got {got}"
+
+
+# ── Phase-3 watch gate facts survive the provisional close ────────────────
+
+def test_watch_gate_facts_from_production_reader_states(tmp_path):
+    """_eiger_single_file_watchable consumes state exactly as the production
+    reader leaves it (the provisional close clears the descriptor — the gate
+    must not depend on it)."""
+    # nascent shell -> watchable
+    shell = tmp_path / "gate_shell_00001.nxs"
+    _nxwriter_shell(shell)
+    w1 = _worker(shell)
+    assert _drain(w1) == []
+    assert w1._eiger_single_file_watchable(), \
+        "a nascent shell must keep the live watch alive (NXS-SF-2)"
+
+    # created-but-EMPTY detector dataset, unfinalized -> watchable
+    # (open succeeds, so open_state is 'ready' — the provisional FLAG, not
+    # the cleared descriptor, must carry the fact; review-caught)
+    empty = tmp_path / "gate_empty_00001.nxs"
+    _nxwriter_shell(empty)
+    with h5py.File(empty, "a") as f:
+        det = f["entry"].require_group("instrument").require_group("detector")
+        det.create_dataset("data", shape=(0, 8, 8), maxshape=(None, 8, 8),
+                           chunks=(1, 8, 8), dtype=np.uint16)
+    w2 = _worker(empty)
+    assert _drain(w2) == []
+    assert w2._eiger_single_file_watchable(), \
+        "an unfinalized zero-frame detector dataset is provisional, not done"
+
+    # plain finalized, fully consumed -> NOT watchable (fixed point)
+    done = tmp_path / "gate_done_00001.nxs"
+    _plain_finalized(done, 2)
+    w3 = _worker(done)
+    assert _drain(w3) == [1, 2]
+    assert _drain(w3) == []
+    assert not w3._eiger_single_file_watchable(), \
+        "a finalized consumed file must not watch (fixed point)"
 
 
 # ── Transient sharing denial stays provisional (§10, Windows-style) ───────

@@ -81,6 +81,15 @@ def _dangling_canonical(tmp_path):
         data = e.create_group("data")
         data.attrs["NX_class"] = "NXdata"        # as Dectris masters write it
         data["data_000001"] = h5py.ExternalLink(str(target), "/entry/data/data")
+        # Every real Dectris FileWriter master carries 2-D auxiliary datasets
+        # NEXT TO the not-yet-landed data link.  A finder that rummages for
+        # "the largest 2-D+ dataset" would classify the mid-transfer master
+        # READY with the flatfield as the image (review-caught).
+        det = e.create_group("instrument").create_group("detector")
+        det.attrs["NX_class"] = "NXdetector"
+        spec = det.create_group("detectorSpecific")
+        spec.create_dataset("pixel_mask", data=np.zeros((32, 32), np.uint32))
+        spec.create_dataset("flatfield", data=np.ones((32, 32), np.float32))
     return master, target
 
 
@@ -208,7 +217,16 @@ def test_dangling_link_typed_provisional_then_ready(tmp_path, fixture, land):
     desc = describe_container(str(master))
     assert desc.state is ProbeState.IN_PROGRESS
 
-    # the lower-level read seam is typed provisional, not KeyError/pixels
+    # the lower-level finder seam itself (what the R1 probe consumes) must
+    # raise the TYPED provisional error — not a bare KeyError, and not a
+    # READY-looking auxiliary dataset (pixel_mask/flatfield)
+    from xrd_tools.io.image import _find_hdf5_image_dataset
+    from xrd_tools.io.nexus import UnresolvedSourceLinkError
+    with h5py.File(master, "r") as f:
+        with pytest.raises(UnresolvedSourceLinkError):
+            _find_hdf5_image_dataset(f)
+    # public read route smoke: whatever reader claims the file, the failure
+    # is never a bare KeyError/AttributeError
     with pytest.raises(Exception) as exc_info:
         read_image(str(master))
     assert not type(exc_info.value) in (KeyError, AttributeError), \
@@ -250,7 +268,8 @@ def test_rank4_detector_invalid_everywhere(tmp_path):
     with pytest.raises(ValueError):
         ContainerCursor(str(path)).open()
 
-    with pytest.raises((ValueError, KeyError)):
+    with pytest.raises(ValueError):
+        # strictly the typed contract: a bare KeyError regression must FAIL
         source = open_source(SourceSpec(str(path), SourceKind.NEXUS_STACK))
         list(source.frame_indices)
 
