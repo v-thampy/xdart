@@ -10,6 +10,7 @@ import threading
 import copy
 import os
 import math
+import time
 from pathlib import Path
 from collections import OrderedDict
 import gc
@@ -2909,6 +2910,7 @@ class staticWidget(QWidget):
         has_1d = bool(self.viewer_rows_1d)
         has_2d = bool(self.viewer_rows_2d)
         labels = ()
+        resident_raw = False
         try:
             labels = self.publication_store.labels()
             recent = labels[-16:] if len(labels) > 16 else labels
@@ -2917,6 +2919,14 @@ class staticWidget(QWidget):
                                    for pub in pubs)
             has_2d = has_2d or any(getattr(pub.view, "int_2d", None) is not None
                                    for pub in pubs)
+            # H18-R1: identity-qualified resident raw evidence — a recent
+            # publication of the DISPLAYED scan carrying an actual raw
+            # payload (or a live raw_ref) proves raw capability even while
+            # the record itself cannot be probed (active run / Pause).
+            resident_raw = any(
+                getattr(pub.view, "raw", None) is not None
+                or getattr(pub, "raw_ref", None) is not None
+                for pub in pubs)
         except Exception:
             labels = ()
         loaded_scan_file = self._controls_v2_loaded_scan_file(
@@ -2926,24 +2936,40 @@ class staticWidget(QWidget):
         # H18: ResultCaps delegate to record truth (capabilities_for_processed
         # over the loaded .nxs, with raw_reachable consulting the frame-0
         # probe — H5 finding 2) OR-composed with in-memory truth (viewer rows,
-        # publications, hydrated scan_data).  When a scan counts as loaded but
-        # its record is unreadable (mid-run append, corrupt file), fall back to
-        # the pre-H18 optimistic loaded flag for the raw pair rather than
-        # flapping the launchers.
+        # publications, hydrated scan_data).
+        # H18-R1: the raw pair is IDENTITY-AWARE.  When a real processed scan
+        # is selected (browsed/loaded), ITS record truth plus identity-
+        # qualified resident browse evidence (a publication of the displayed
+        # scan carrying an actual raw payload) owns the result raw facts —
+        # the frozen configured acquisition source must never contaminate
+        # them (during Pause the source is the acquisition identity while
+        # the selected record is the explicit browse target; an orphaned
+        # record must not advertise ROI reachability because the source is
+        # reachable).  An UNCACHED record during Run/Pause is pending:
+        # "not probed" is never reported as reachable — only resident
+        # evidence may prove it.  Source caps supply source-only ROI
+        # readiness when no processed result is selected.
         record_caps = self._controls_v2_loaded_result_caps(loaded_scan_file)
-        if record_caps is not None:
-            loaded_has_raw = record_caps.has_raw
-            loaded_raw_reachable = record_caps.raw_reachable
+        if loaded_scan_file:
+            if record_caps is not None:
+                loaded_has_raw = bool(record_caps.has_raw or resident_raw)
+                loaded_raw_reachable = bool(
+                    record_caps.raw_reachable or resident_raw)
+            else:
+                loaded_has_raw = loaded_raw_reachable = bool(resident_raw)
+            result_has_raw = loaded_has_raw
+            result_raw_reachable = loaded_raw_reachable
         else:
-            loaded_has_raw = loaded_raw_reachable = loaded_scan_available
+            result_has_raw = bool(source_caps.has_raw or resident_raw)
+            result_raw_reachable = bool(
+                source_caps.raw_reachable or resident_raw)
         result_caps = ResultCaps(
             has_1d=bool(
                 has_1d or (record_caps is not None and record_caps.has_1d)),
             has_2d=bool(
                 has_2d or (record_caps is not None and record_caps.has_2d)),
-            has_raw=bool(source_caps.has_raw or loaded_has_raw),
-            raw_reachable=bool(
-                source_caps.raw_reachable or loaded_raw_reachable),
+            has_raw=result_has_raw,
+            raw_reachable=result_raw_reachable,
             has_scan_metadata=bool(
                 has_scan_data
                 or (record_caps is not None and record_caps.has_scan_metadata)),
@@ -3173,6 +3199,14 @@ class staticWidget(QWidget):
             return ""
         if loaded_frame_count or labels:
             return data_file
+        # H18-R1: with nothing genuinely loaded, a nonexistent (stale,
+        # session-restored) path is not a loaded scan either — it must not
+        # produce a LOADED_SCAN run target or optimistic result caps.
+        try:
+            if not os.path.exists(os.path.expanduser(data_file)):
+                return ""
+        except OSError:
+            return ""
         scratch = str(
             getattr(self, "_controls_v2_scratch_data_file", "") or "")
         try:
@@ -3195,35 +3229,84 @@ class staticWidget(QWidget):
         viewer rows).  ``raw_reachable`` consults the headless frame-0 probe
         (H5 finding 2: the ``frames_record`` capability alone overstates
         reachability once the raw master is gone).  Cached on the R1-strength
-        identity stamp (path + size + mtime_ns + adapter owner, rules 2/3);
-        never touches the file during an active run — the record is being
-        appended and the panel is locked anyway."""
+        identity stamp (path + size + mtime_ns + adapter owner) PLUS the
+        explicit source root (H18-R2); never touches the file during an
+        active run — the record is being appended and the panel is locked
+        anyway.  A transient read failure is never cached as stable truth
+        (H18-R3): a previous valid same-identity snapshot keeps answering
+        where safe, and the read retries after a bounded debounce."""
         if not loaded_scan_file:
             return None
         path = os.path.expanduser(str(loaded_scan_file))
         if not os.path.isfile(path):
             return None
-        key = (path, self._controls_v2_source_identity_stamp(path))
+        root = self._controls_v2_processed_source_root()
+        key = (path, self._controls_v2_source_identity_stamp(path), root)
         cached = getattr(self, "_v2_result_caps_cache", None)
-        if cached is not None and cached[0] == key:
+        if cached is not None and cached[0] == key and cached[1] is not None:
             return cached[1]
         if self._controls_v2_run_active():
-            if cached is not None and cached[0][0] == path:
+            if (cached is not None and cached[0][0] == path
+                    and cached[1] is not None):
+                return cached[1]
+            return None
+        retry = getattr(self, "_v2_result_caps_retry", None)
+        if (retry is not None and retry[0] == key
+                and time.monotonic() < retry[1]):
+            # H18-R3 debounce window: don't hammer a hiccuping share; the
+            # previous valid same-path snapshot keeps answering meanwhile.
+            if (cached is not None and cached[0][0] == path
+                    and cached[1] is not None):
                 return cached[1]
             return None
         try:
             from xrd_tools.io.read import get_metadata
 
+            # H18-R2: raw reachability resolves through the operator-owned
+            # explicit source root via the existing SourceSpec seam (N1
+            # precedence: source_root > @source_base > scan directory).
+            spec = SourceSpec(
+                path, SourceKind.PROCESSED_NEXUS,
+                options=({"source_root": root} if root else {}))
             caps = capabilities_for_processed(
                 get_metadata(path),
-                raw_reachable=describe_source_readiness(path).raw_reachable,
+                raw_reachable=describe_source_readiness(spec).raw_reachable,
             )
         except Exception:
             logger.debug(
                 "Controls V2 loaded-scan result caps failed", exc_info=True)
-            caps = None
+            # H18-R3: never store the failure; schedule a bounded retry and
+            # keep serving the previous valid same-identity snapshot.
+            self._v2_result_caps_retry = (
+                key,
+                time.monotonic() + float(getattr(
+                    self, "_v2_result_caps_retry_delay", 2.0)))
+            if (cached is not None and cached[0][0] == path
+                    and cached[1] is not None):
+                return cached[1]
+            return None
+        self._v2_result_caps_retry = None
         self._v2_result_caps_cache = (key, caps)
         return caps
+
+    #: bounded debounce (seconds) before a transiently failed processed-record
+    #: read is retried (H18-R3); tests may lower it.
+    _v2_result_caps_retry_delay = 2.0
+
+    def _controls_v2_processed_source_root(self) -> str:
+        """Explicit operator-owned source root for processed-record raw
+        resolution (H18-R2).  GUI ownership rule: the configured Project
+        Folder is the explicit ``source_root`` for records browsed in this
+        widget — the frozen acquisition root is never substituted for an
+        unrelated browsed scan.  Empty or invalid configures no override
+        (the reader falls back to ``@source_base`` then the scan directory,
+        the accepted N1 precedence)."""
+        root = str(getattr(
+            getattr(self, "wrangler", None), "project_folder", "") or "")
+        root = os.path.expanduser(root.strip())
+        if root and os.path.isdir(root):
+            return os.path.normpath(os.path.abspath(root))
+        return ""
 
     def _controls_v2_source_label(self) -> str:
         return self._controls_v2_configured_source_label()
