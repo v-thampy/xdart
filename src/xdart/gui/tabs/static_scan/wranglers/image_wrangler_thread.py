@@ -3276,10 +3276,18 @@ class imageThread(wranglerThread):
                 return 'end'
         except ContainerNotReadyError:
             return 'wait'          # nascent shell / unlanded link: retry later
+        except OSError:
+            # Transient I/O — including a Windows-style sharing denial
+            # (PermissionError) while the writer holds the file — must stay
+            # provisional, never latch the run done (no platform check: the
+            # exception type IS the contract).
+            logger.debug('single-file growth reopen transiently failed for '
+                         '%s', self._eiger_master_path, exc_info=True)
+            return 'wait'
         except Exception:
-            logger.debug('single-file growth reopen failed for %s',
+            logger.debug('single-file growth reopen failed terminally for %s',
                          self._eiger_master_path, exc_info=True)
-            return 'end'           # terminal (unsupported rank, vanished, ...)
+            return 'end'           # structural (unsupported rank, ...)
         self._emit_container_count(self._eiger_master_path, self._eiger_nframes)
         if self._eiger_frame_idx < self._eiger_nframes:
             return 'grown'

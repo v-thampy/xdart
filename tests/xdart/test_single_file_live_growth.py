@@ -262,6 +262,42 @@ def test_single_file_batch_unfinalized_reads_then_ends(tmp_path):
         "batch consumes what exists and ends without a growth wait"
 
 
+# ── Transient sharing denial stays provisional (§10, Windows-style) ───────
+
+def test_single_file_transient_denial_stays_provisional(tmp_path, monkeypatch):
+    """A PermissionError during the growth reopen (a writer holding the file,
+    the Windows sharing-denial shape — no platform assumption, the exception
+    type is the contract) must classify 'wait', never latch the run done."""
+    from xrd_tools.sources.cursor import ContainerCursor
+
+    path = tmp_path / "deny_00001.nxs"
+    _nxwriter_shell(path)
+    _nxwriter_frames(path, 3)
+    worker = _worker(path)
+    assert _drain(worker) == [1, 2, 3]
+
+    real_open = ContainerCursor.open
+    denials = {"n": 0}
+
+    def denying_open(self):
+        if denials["n"] == 0:
+            denials["n"] += 1
+            raise PermissionError(13, "sharing violation", str(path))
+        return real_open(self)
+
+    monkeypatch.setattr(ContainerCursor, "open", denying_open)
+    assert _drain(worker) == []          # denied poll: provisional, no crash
+    assert not getattr(worker, "_eiger_single_file_done", False), \
+        "a transient denial must not latch the single-file run done"
+
+    _nxwriter_frames(path, 4)            # writer releases; growth lands
+    got = []
+    deadline = time.monotonic() + 15.0
+    while len(got) < 1 and time.monotonic() < deadline:
+        got.extend(_drain(worker))
+    assert got == [4], f"the run must recover after the denial, got {got}"
+
+
 # ── Finalized single file: zero-open idle fixed point ─────────────────────
 
 def test_single_file_finalized_idle_is_zero_open(tmp_path, monkeypatch):
