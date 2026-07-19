@@ -460,6 +460,34 @@ def resolve_source_master(
 _OUTSIDE_ROOT_WARNED: set = set()    # (source_dir, root) pairs already warned
 
 
+def resolved_raw_source(
+    scan_file,
+    frame: int = 0,
+    *,
+    entry: str = "entry",
+    source_root=None,
+):
+    """Resolve one frame's stored raw-source provenance WITHOUT loading pixels.
+
+    H18-R9: record identity for capability decisions — returns the absolute
+    existing raw master ``Path`` the record's ``frames/frame_NNNN/source``
+    pointer resolves to (N1 precedence via :func:`resolve_source_master`),
+    or ``None`` when the record has no usable pointer or nothing resolves.
+    One tiny metadata read; never decodes an image.
+    """
+    scan_file = Path(scan_file)
+    try:
+        with h5py.File(scan_file, "r") as f:
+            entry_grp = _entry(f, entry)
+            master, _idx, _thumb = _raw_frame_parts_from_entry(
+                scan_file, entry_grp, int(frame), scan=None,
+                source_root=source_root,
+            )
+    except Exception:
+        return None
+    return master
+
+
 def relative_source_path(src, root=None) -> str:
     """N1 WRITE-side counterpart of :func:`resolve_source_master`: the portable
     string to store in ``source/path``.

@@ -511,3 +511,55 @@ def test_transient_raw_probe_failure_debounces_and_retries(
     assert second is not None
     assert second.raw_reachable is True
     assert calls["n"] == 2
+
+
+# ── H18-R9: cross-root identity ───────────────────────────────────────────
+
+def test_same_stem_cross_root_publication_is_rejected(
+        widget, tmp_path, monkeypatch):
+    """H18-R9: two unrelated records sharing a basename stem must not share
+    resident raw evidence — basename identity is not record identity."""
+    proc_dir = tmp_path / "processed" / "B"
+    proc_dir.mkdir(parents=True)
+    selected = _processed_nxs(proc_dir, raw_reachable=False)
+    renamed = proc_dir / "scan_0001.nxs"
+    os.rename(selected, renamed)
+
+    monkeypatch.setattr(widget, "_controls_v2_run_active", lambda: True)
+    widget.scan.data_file = str(renamed)
+    _raw_publication(
+        widget.publication_store,
+        source_identity=str(tmp_path / "acquisition" / "A" / "scan_0001.nxs"),
+        raw=np.ones((4, 4), dtype=np.uint16))
+
+    state = widget._controls_v2_state()
+    assert state.result_caps.raw_reachable is False, \
+        "a same-stem publication from a different root must not prove the " \
+        "selected record (H18-R9)"
+    assert _roi_enabled(state.result_caps) is False
+
+
+def test_acquisition_master_publication_proves_its_own_processed_output(
+        widget, tmp_path, monkeypatch):
+    """H18-R9 legitimate case: the raw source and the processed output live
+    in DIFFERENT directories; the record's stored provenance links them, so
+    the acquisition master's resident raw pixels prove the selected output."""
+    raw_root = tmp_path / "raw_tree"
+    out_dir = tmp_path / "processed_out"
+    out_dir.mkdir()
+    nxs = _relative_source_nxs(out_dir, raw_root,
+                               source_rel="raw/scan_master.h5")
+    widget.wrangler.project_folder = str(raw_root)
+    widget.scan.data_file = str(nxs)
+    good = widget._controls_v2_loaded_result_caps(str(nxs))
+    assert good is not None and good.raw_reachable is True   # provenance cached
+
+    monkeypatch.setattr(widget, "_controls_v2_run_active", lambda: True)
+    master = raw_root / "raw" / "scan_master.h5"
+    _raw_publication(widget.publication_store, source_identity=str(master),
+                     raw=np.ones((4, 4), dtype=np.uint16))
+
+    state = widget._controls_v2_state()
+    assert state.result_caps.raw_reachable is True, \
+        "the record's own acquisition master must prove it across " \
+        "directories (H18-R9)"

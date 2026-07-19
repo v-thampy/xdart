@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+import threading
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -54,46 +55,76 @@ _READER_LOGGER_NAMES = ("xrd_tools.io.nexus", "xrd_tools.sources.nexus")
 _EXPECTED_ABSENCE_MARKERS = ("Energy not found", "Wavelength not derivable")
 
 
-class _ExpectedAbsenceFilter(logging.Filter):
-    def __init__(self):
-        super().__init__()
-        self.suppressed: list[str] = []
+_OBSERVATION_TLS = threading.local()
+
+
+class _ThreadScopedAbsenceFilter(logging.Filter):
+    """H18-R11: suppression is scoped to the OBSERVING THREAD's active
+    observation stack — never process-global.  The single filter instance is
+    installed once per reader logger and left in place; with no observation
+    active on the CURRENT thread it is a pure pass-through, so a real warning
+    emitted by an unrelated thread while another thread holds an observation
+    open passes through unchanged (and is never attributed to the observing
+    path).  Nested observations suppress into the innermost context."""
 
     def filter(self, record):  # noqa: A003 - logging API name
+        stack = getattr(_OBSERVATION_TLS, "stack", None)
+        if not stack:
+            return True
         message = record.getMessage()
         if any(marker in message for marker in _EXPECTED_ABSENCE_MARKERS):
-            self.suppressed.append(message)
+            stack[-1].append(message)
             return False
         return True
 
 
+_SCOPED_FILTER = _ThreadScopedAbsenceFilter()
+_FILTERS_INSTALLED = False
+_FILTER_INSTALL_LOCK = threading.Lock()
+
+
+def _ensure_scoped_filters_installed() -> None:
+    global _FILTERS_INSTALLED
+    if _FILTERS_INSTALLED:
+        return
+    with _FILTER_INSTALL_LOCK:
+        if _FILTERS_INSTALLED:
+            return
+        for name in _READER_LOGGER_NAMES:
+            reader_logger = logging.getLogger(name)
+            if _SCOPED_FILTER not in reader_logger.filters:
+                reader_logger.addFilter(_SCOPED_FILTER)
+        _FILTERS_INSTALLED = True
+
+
 @contextmanager
 def quiet_capability_observation(subject_path, subject_kind):
-    """H18-R7: a capability observation is not an operator problem report.
+    """H18-R7/R11: a capability observation is not an operator problem report.
 
     Missing energy/wavelength is EXPECTED for many raw detector masters (the
     run's energy authority is the selected PONI), so the generic readers'
-    per-open WARNINGs are suppressed for the duration of the observation and
+    per-open WARNINGs are suppressed FOR THIS THREAD'S observation only and
     replaced by ONE structured DEBUG line that names the exact path and
     whether the subject is the configured acquisition source or the selected
-    processed result.  Warnings that are not expected-absence pass through
-    unchanged.
+    processed result.  Warnings that are not expected-absence, and warnings
+    from unrelated threads, pass through unchanged; nesting is safe.
     """
-    absence_filter = _ExpectedAbsenceFilter()
-    reader_loggers = [logging.getLogger(name) for name in _READER_LOGGER_NAMES]
-    for reader_logger in reader_loggers:
-        reader_logger.addFilter(absence_filter)
+    _ensure_scoped_filters_installed()
+    suppressed: list[str] = []
+    stack = getattr(_OBSERVATION_TLS, "stack", None)
+    if stack is None:
+        stack = _OBSERVATION_TLS.stack = []
+    stack.append(suppressed)
     try:
         yield
     finally:
-        for reader_logger in reader_loggers:
-            reader_logger.removeFilter(absence_filter)
-        if absence_filter.suppressed:
+        stack.pop()
+        if suppressed:
             logger.debug(
                 "readiness observation for %s (%s): %s — expected absence; "
                 "the run's energy authority is the selected PONI",
                 subject_path, subject_kind,
-                "; ".join(sorted(set(absence_filter.suppressed))))
+                "; ".join(sorted(set(suppressed))))
 
 
 def _observation_subject(value) -> tuple[str, str]:
@@ -493,20 +524,40 @@ def observe_raw_reachability(spec_or_source: Any) -> RawReachabilityObservation:
 
 
 def _observe_raw_reachability_open(spec_or_source: Any) -> RawReachabilityObservation:
-    source = _open_source(spec_or_source)
+    from xrd_tools.sources.probe import TRANSIENT_PROBE_ERRORS
+
+    # H18-R10: EVERY stage of the observation — open, frame enumeration, and
+    # the frame-0 load — flows through one typed path.  A transient failure
+    # at any stage is non-definitive (the caller debounces and retries);
+    # only an ACTUALLY streaming/live source may use the unknown-length live
+    # escape hatch (an enumeration failure on a non-live source is a
+    # definitive unreachable, never "live").
+    try:
+        source = _open_source_observed(spec_or_source)
+    except TRANSIENT_PROBE_ERRORS as exc:
+        return RawReachabilityObservation(
+            False, False, f"transient open error: {exc}")
     if source is None:
         caps = _caps_from_classification(spec_or_source)
         return RawReachabilityObservation(
             bool(caps.raw_reachable), True, "classification fallback")
     source_caps = _core_caps(source)
-    _indices, frame_count = _frame_indices(source)
-    live_unknown = bool(
+    truly_live = bool(
         source_caps.is_streaming
         or getattr(source, "kind", None) == SourceKind.LIVE
-        or frame_count is None
     )
-    if live_unknown:
+    if truly_live:
         return RawReachabilityObservation(True, True, "live escape hatch")
+    try:
+        indices = [int(idx) for idx in source.frame_indices]
+    except TRANSIENT_PROBE_ERRORS as exc:
+        return RawReachabilityObservation(
+            False, False, f"transient enumeration error: {exc}")
+    except Exception:
+        return RawReachabilityObservation(
+            False, True, "frame enumeration failed (non-live)")
+    if not indices:
+        return RawReachabilityObservation(False, True, "empty scan")
     try:
         from xrd_tools.sources.probe import observe_first_frame
 
@@ -516,3 +567,29 @@ def _observe_raw_reachability_open(spec_or_source: Any) -> RawReachabilityObserv
     return RawReachabilityObservation(
         bool(reachable), not transient,
         "frame-0 probe" if not transient else "transient probe error")
+
+
+def _open_source_observed(value: Any) -> Any | None:
+    """H18-R10 open stage: like ``_open_source`` but transient error classes
+    PROPAGATE (typed) instead of collapsing into the definitive
+    classification fallback.  The duck check itself is guarded — a property
+    that raises must not escape untyped."""
+    from xrd_tools.sources.probe import TRANSIENT_PROBE_ERRORS
+
+    try:
+        is_open_source = (hasattr(value, "frame_indices")
+                          and hasattr(value, "load_frame"))
+    except TRANSIENT_PROBE_ERRORS:
+        raise
+    except Exception:
+        is_open_source = False
+    if is_open_source:
+        return value
+    try:
+        from xrd_tools.sources.registry import open_source
+
+        return open_source(value)
+    except TRANSIENT_PROBE_ERRORS:
+        raise
+    except Exception:
+        return None

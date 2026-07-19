@@ -347,3 +347,74 @@ def test_observe_raw_reachability_typed_observation(tmp_path):
     obs = observe_raw_reachability(missing)
     assert obs.reachable is False and obs.definitive is True
     assert describe_source_readiness(missing).raw_reachable is False
+
+
+def test_observe_raw_reachability_transient_open_is_not_definitive(tmp_path):
+    """H18-R10: a sharing denial during open_source is a transient
+    observation, not a definitive unreachable via the classification
+    fallback."""
+    import h5py
+    import numpy as np
+
+    import xrd_tools.sources.registry as registry_module
+    from xrd_tools.sources.readiness import observe_raw_reachability
+
+    master = tmp_path / "scan_master.h5"
+    with h5py.File(master, "w") as f:
+        f.create_dataset(
+            "entry/data/data",
+            data=np.arange(2 * 4 * 4, dtype=np.uint32).reshape(2, 4, 4))
+
+    real = registry_module.open_source
+    calls = {"n": 0}
+
+    def once_denied(value, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError("sharing violation")
+        return real(value, *a, **k)
+
+    import unittest.mock as mock
+    with mock.patch.object(registry_module, "open_source", once_denied):
+        first = observe_raw_reachability(str(master))
+        assert first.definitive is False, \
+            "a transient open failure must not be a definitive observation"
+        assert first.reachable is False
+        second = observe_raw_reachability(str(master))
+    assert second.definitive is True and second.reachable is True
+
+
+def test_observe_raw_reachability_transient_enumeration_is_not_definitive(
+        tmp_path):
+    """H18-R10: a transient frame-enumeration failure is typed (never an
+    uncaught error, never the live escape hatch); a NON-transient
+    enumeration failure on a non-live source is definitively unreachable
+    (no unknown-length live hatch for non-live sources)."""
+    from xrd_tools.sources.readiness import observe_raw_reachability
+
+    class _TransientIndices:
+        kind = None
+
+        @property
+        def frame_indices(self):
+            raise PermissionError("transient enumeration denial")
+
+        def load_frame(self, idx):  # pragma: no cover - never reached
+            raise AssertionError
+
+    obs = observe_raw_reachability(_TransientIndices())
+    assert obs.definitive is False and obs.reachable is False
+
+    class _BrokenIndices:
+        kind = None
+
+        @property
+        def frame_indices(self):
+            raise TypeError("metadata-only source")
+
+        def load_frame(self, idx):  # pragma: no cover - never reached
+            raise AssertionError
+
+    obs = observe_raw_reachability(_BrokenIndices())
+    assert obs.definitive is True and obs.reachable is False, \
+        "a non-live unknown-length source must not use the live escape hatch"

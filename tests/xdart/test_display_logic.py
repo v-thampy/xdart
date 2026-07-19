@@ -540,20 +540,53 @@ def test_accumulate_waterfall_retains_long_live_stack_across_flushes():
 
 
 def test_waterfall_display_rows_decimates_rows_and_ids_together():
+    """WF-END-2: bounded display decimation applies ONE index set to rows and
+    ids and ALWAYS preserves the first and the TERMINAL row — the old stride
+    slice returned 1, 4, ..., 649 for a complete 651-row history, omitting
+    the finished run's top row."""
     np = pytest.importorskip("numpy")
     rows = np.arange(700 * 3, dtype=float).reshape(700, 3)
     ids = tuple(range(1000, 1700))
 
-    small_rows, small_ids, small_stride = dl.waterfall_display_rows(
+    small_rows, small_ids, small_idx = dl.waterfall_display_rows(
         rows[:16], ids[:16], 256)
-    assert small_stride == 1
+    assert small_idx is None                       # no decimation applied
     np.testing.assert_array_equal(small_rows, rows[:16])
     assert small_ids == ids[:16]
 
-    display_rows, display_ids, stride = dl.waterfall_display_rows(rows, ids, 256)
-    assert stride == 3
-    np.testing.assert_array_equal(display_rows, rows[::3])
-    assert display_ids == ids[::3]
+    display_rows, display_ids, idx = dl.waterfall_display_rows(rows, ids, 256)
+    assert idx is not None and len(display_ids) <= 256
+    assert display_ids[0] == 1000 and display_ids[-1] == 1699
+    np.testing.assert_array_equal(display_rows, rows[np.asarray(idx)])
+    assert display_ids == tuple(ids[j] for j in idx)
+
+
+def test_waterfall_display_rows_terminal_651_case():
+    """The live WF-END-2 shape: 651 accumulated rows at max 256 painted only
+    through id 649; the terminal id 651 must be displayed."""
+    np = pytest.importorskip("numpy")
+    rows = np.arange(651 * 4, dtype=float).reshape(651, 4)
+    ids = tuple(range(1, 652))
+    display_rows, display_ids, idx = dl.waterfall_display_rows(rows, ids, 256)
+    assert len(display_ids) <= 256
+    assert display_ids[0] == 1
+    assert display_ids[-1] == 651, "terminal completed frame must be painted"
+    np.testing.assert_array_equal(display_rows[-1], rows[-1])
+
+
+def test_waterfall_display_rows_non_divisible_and_tiny_budget():
+    np = pytest.importorskip("numpy")
+    rows = np.arange(10 * 2, dtype=float).reshape(10, 2)
+    ids = tuple(range(100, 110))
+    _r, d_ids, idx = dl.waterfall_display_rows(rows, ids, 4)
+    assert idx is not None and len(d_ids) <= 4
+    assert d_ids[0] == 100 and d_ids[-1] == 109
+
+    _r, d_ids, idx = dl.waterfall_display_rows(rows, ids, 2)
+    assert d_ids == (100, 109), "tiny budget keeps first + terminal"
+
+    _r, d_ids, idx = dl.waterfall_display_rows(rows, ids, 1)
+    assert d_ids == (109,), "budget of one keeps the terminal row"
 
 
 def test_accumulate_waterfall_lambda_less_cross_unit_same_size_batch_errors():
@@ -1858,19 +1891,23 @@ def test_display_grid_gi_units_pass_through_verbatim():
 
 
 def test_render_waterfall_view_decimates_before_norm_and_keeps_alignment():
-    # 10 rows, max_rows=5 → stride 2.  Each row's monitor differs, so any
-    # misalignment between the decimated rows and their metadata shows up as
-    # a wrong scale factor.
+    # 10 rows, max_rows=5 → ONE index set (WF-END-2: first AND terminal rows
+    # preserved).  Each row's monitor differs, so any misalignment between
+    # the decimated rows and their metadata shows up as a wrong scale factor.
     x = np.linspace(1.0, 5.0, 16)
     rows = [np.full_like(x, 10.0) for _ in range(10)]
     metas = [{"i0": float(k + 1)} for k in range(10)]
     hist = _native_hist(rows, x=x, metas=metas)
     x_disp, out, ids, axis = dl.render_waterfall_view(
         hist, want_unit=_PLOT_Q, norm_channel="i0", max_rows=5)
-    assert ids == tuple(("A", k) for k in range(0, 10, 2))
-    assert out.shape == (5, x.size)
-    for pos, k in enumerate(range(0, 10, 2)):
-        assert np.allclose(out[pos], 10.0 / (k + 1))
+    _rows_sel, ids_sel, idx = dl.waterfall_display_rows(
+        np.asarray(rows), tuple(("A", k) for k in range(10)), 5)
+    assert ids == ids_sel
+    assert ids[0] == ("A", 0) and ids[-1] == ("A", 9)   # terminal preserved
+    assert out.shape == (len(ids), x.size)
+    for pos, (_scan, k) in enumerate(ids):
+        assert np.allclose(out[pos], 10.0 / (k + 1)), \
+            "metadata must stay row-aligned with the decimated rows"
     assert np.array_equal(x_disp, x)
     assert (axis.label, axis.unit) == dl.x_axis_for_unit(_Q_UNIT)
 

@@ -756,3 +756,32 @@ def test_runend_autofit_respects_genuine_user_zoom(qapp, widget):
     auto = plot.getViewBox().autoRangeEnabled()
     assert auto[0] is False, \
         "a genuine user zoom must survive the run-end auto-fit (x stays pinned)"
+
+
+def test_genuine_zoom_during_run_is_recorded_via_real_signal(qapp, widget):
+    """H18-R12: the manual-range listener must be connected from RUN START
+    (not first at run end), on BOTH switchable bottom plots, so a zoom made
+    during processing survives the run-end auto-fit."""
+    w = widget
+    w._enter_run_state()
+    df = w.displayframe
+    assert getattr(df, "_wf_user_zoomed", None) is False
+
+    plots = {df.plot}
+    active = df._active_bottom_plot()
+    if active is not None:
+        plots.add(active)
+    assert plots, "no bottom plots to test"
+    for plot in plots:
+        df._wf_user_zoomed = False
+        vb = plot.getViewBox()
+        vb.sigRangeChangedManually.emit(vb.autoRangeEnabled())
+        assert df._wf_user_zoomed is True, \
+            f"manual range signal on {plot!r} was not recorded (H18-R12)"
+
+    # ...and the recorded zoom blocks the run-end auto-fit
+    target = active if active is not None else df.plot
+    target.setRange(xRange=(1.0, 2.0), padding=0)
+    staticWidget._runend_waterfall_autofit(w)
+    assert target.getViewBox().autoRangeEnabled()[0] is False
+    w._exit_run_state()

@@ -2955,7 +2955,7 @@ class staticWidget(QWidget):
         # fails closed, only actual resident pixels count, and the outgoing
         # store is never borrowed while a manual browser rescope is pending.
         resident_raw = self._controls_v2_resident_selected_raw(
-            pubs, loaded_scan_file or source_label)
+            pubs, loaded_scan_file, source_label)
         record_caps = self._controls_v2_loaded_result_caps(loaded_scan_file)
         if loaded_scan_file:
             if record_caps is not None:
@@ -3227,29 +3227,80 @@ class staticWidget(QWidget):
                 "Controls V2 scratch data-file compare failed", exc_info=True)
         return data_file
 
-    def _controls_v2_resident_selected_raw(self, pubs, target_identity) -> bool:
-        """H18-R4: identity-qualified resident raw evidence.
+    @staticmethod
+    def _controls_v2_normalized_path(value) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            return os.path.normpath(os.path.abspath(os.path.expanduser(text)))
+        except OSError:
+            return ""
+
+    def _controls_v2_selected_record_identities(self, loaded_scan_file) -> set:
+        """H18-R9: STRONG identities that prove a publication belongs to the
+        selected processed record — the record's own normalized path, plus
+        its stored raw-source provenance (the resolved acquisition master,
+        cached under the SAME full identity key as the record caps).  A raw
+        source and its processed output may legitimately live in different
+        directories; the provenance link is what proves they are the same
+        acquisition record.  Unknown provenance contributes nothing (fail
+        closed)."""
+        path = self._controls_v2_normalized_path(loaded_scan_file)
+        if not path:
+            return set()
+        identities = {path}
+        ident_cache = getattr(self, "_v2_result_source_ident", None)
+        if ident_cache is not None and ident_cache[1]:
+            root = self._controls_v2_processed_source_root()
+            key = (os.path.expanduser(str(loaded_scan_file)),
+                   self._controls_v2_source_identity_stamp(
+                       os.path.expanduser(str(loaded_scan_file))), root)
+            if ident_cache[0] == key:
+                identities.add(ident_cache[1])
+        return identities
+
+    def _controls_v2_resident_selected_raw(
+            self, pubs, loaded_scan_file, source_label) -> bool:
+        """H18-R4/R9: identity-qualified resident raw evidence.
 
         A recent publication may prove raw capability ONLY when (a) no manual
         browser rescope is pending (the outgoing scan's store must not be
-        borrowed), (b) its ``source_identity`` canonicalizes to the SAME scan
-        as the selected/displayed target (via the one canonical
-        ``scan_name_from_source``; unknown or mismatched identity fails
-        closed), and (c) actual nonempty full-resolution pixels are resident
-        (``view.raw``, or a live ``raw_ref`` whose ``map_raw``/``image`` is a
-        real array).  A bare/lazy/dead reference proves a reference exists,
-        never that it is reachable without a probe."""
-        if not pubs or not target_identity:
+        borrowed), (b) its normalized ``source_identity`` matches a STRONG
+        identity of the selected record — the record path itself, or the
+        record's stored raw-source provenance resolved under the current
+        identity key (H18-R9: basename-derived stems are NOT record
+        identity; same-stem records from different roots never match; with
+        no record selected, the configured acquisition path/directory is the
+        target), and (c) actual nonempty full-resolution pixels are resident
+        (``view.raw``, or a live ``raw_ref`` whose ``map_raw``/``image`` is
+        a real array).  A bare/lazy/dead reference proves a reference
+        exists, never that it is reachable without a probe."""
+        if not pubs:
             return False
         if getattr(getattr(self, "h5viewer", None),
                    "_browser_scan_reset_pending", False):
             return False
-        target = _scan_key_from_source(str(target_identity))
-        if not target:
+        dir_prefix = ""
+        if loaded_scan_file:
+            targets = self._controls_v2_selected_record_identities(
+                loaded_scan_file)
+        else:
+            label = self._controls_v2_normalized_path(source_label)
+            if not label:
+                return False
+            targets = {label}
+            if os.path.isdir(label):
+                dir_prefix = label + os.sep
+        if not targets:
             return False
         for pub in pubs:
-            ident = str(getattr(pub, "source_identity", "") or "")
-            if not ident or _scan_key_from_source(ident) != target:
+            ident = self._controls_v2_normalized_path(
+                getattr(pub, "source_identity", ""))
+            if not ident:
+                continue
+            if ident not in targets and not (
+                    dir_prefix and ident.startswith(dir_prefix)):
                 continue
             raw = getattr(getattr(pub, "view", None), "raw", None)
             if raw is not None and getattr(raw, "size", 0):
@@ -3322,6 +3373,23 @@ class staticWidget(QWidget):
                 raise _TransientReadinessObservation(observation.detail)
             caps = capabilities_for_processed(
                 metadata, raw_reachable=observation.reachable)
+            # H18-R9: cache the record's stored raw-source provenance under
+            # the SAME identity key — the strong identity that lets a live
+            # acquisition master's resident publication prove ITS OWN
+            # processed output across directories.  Resolution failure
+            # contributes nothing (fail closed).
+            try:
+                from xrd_tools.io.read import resolved_raw_source
+
+                with quiet_capability_observation(
+                        path, "selected processed result"):
+                    raw_src = resolved_raw_source(
+                        path, source_root=root or None)
+            except Exception:
+                raw_src = None
+            self._v2_result_source_ident = (
+                key,
+                self._controls_v2_normalized_path(raw_src) if raw_src else "")
         except Exception:
             logger.debug(
                 "Controls V2 loaded-scan result caps failed", exc_info=True)
@@ -6163,18 +6231,31 @@ class staticWidget(QWidget):
         auto-fit can distinguish an operator's zoom from a mid-run
         programmatic crop.  Idempotent."""
         df = getattr(self, "displayframe", None)
-        if df is None or getattr(df, "_wf_zoom_hooked", False):
+        if df is None:
             return
+        hooked = getattr(df, "_wf_zoom_hooked_ids", None)
+        if hooked is None:
+            hooked = df._wf_zoom_hooked_ids = set()
+        plots = []
+        line_plot = getattr(df, "plot", None)
+        if line_plot is not None:
+            plots.append(line_plot)
         try:
-            plot = df._active_bottom_plot()
-            if plot is None:
-                return
-            viewbox = plot.getViewBox()
-            viewbox.sigRangeChangedManually.connect(
-                lambda *_: setattr(df, "_wf_user_zoomed", True))
-            df._wf_zoom_hooked = True
+            active = df._active_bottom_plot()
         except Exception:
-            logger.debug("waterfall zoom hook failed", exc_info=True)
+            active = None
+        if active is not None and active not in plots:
+            plots.append(active)
+        for plot in plots:
+            try:
+                viewbox = plot.getViewBox()
+                if id(viewbox) in hooked:
+                    continue
+                viewbox.sigRangeChangedManually.connect(
+                    lambda *_, _df=df: setattr(_df, "_wf_user_zoomed", True))
+                hooked.add(id(viewbox))
+            except Exception:
+                logger.debug("waterfall zoom hook failed", exc_info=True)
 
     def _runend_waterfall_autofit(self):
         """H18-R8(b): full-history auto-fit after the automatic run-end
@@ -6928,12 +7009,16 @@ class staticWidget(QWidget):
         """
         if self._run_active:
             return
-        # H18-R8(b): a new run opens a fresh genuine-zoom window — zooms
+        # H18-R8(b)/R12: a new run opens a fresh genuine-zoom window — zooms
         # recorded during THIS run survive the run-end auto-fit; older ones
-        # don't pin the next run's finished viewport.
+        # don't pin the next run's finished viewport.  The manual-range
+        # listeners are connected HERE (both switchable bottom plots,
+        # idempotent) so gestures DURING processing are observed, not only
+        # after the run has already finished.
         df = getattr(self, "displayframe", None)
         if df is not None:
             df._wf_user_zoomed = False
+        staticWidget._hook_waterfall_zoom_recording(self)
         self._run_active = True
         # Frame-driven scan-boundary flag: clear it at run START so the first
         # new_scan of THIS run always clears the panel (fixes a same-name re-run

@@ -37,6 +37,14 @@ class ProbeResult:
     kind: SourceKind | None = None
 
 
+#: error classes a probe/open/enumeration may treat as TRANSIENT (H18-R5/R10)
+#: — concurrency/availability failures worth a debounced retry.  Everything
+#: else is a DEFINITIVE observation.
+TRANSIENT_PROBE_ERRORS = (
+    PermissionError, BlockingIOError, InterruptedError, TimeoutError,
+)
+
+
 def observe_first_frame(source):
     """Return ``(reachable, first_image, transient)`` — the typed frame-0 probe.
 
@@ -59,7 +67,7 @@ def observe_first_frame(source):
         return False, None, False
     try:
         img = np.asarray(source.load_frame(idxs[0]))
-    except (PermissionError, BlockingIOError, InterruptedError, TimeoutError):
+    except TRANSIENT_PROBE_ERRORS:
         return False, None, True
     except Exception:
         return False, None, False

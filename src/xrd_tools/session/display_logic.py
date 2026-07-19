@@ -1004,22 +1004,34 @@ def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names,
 def waterfall_display_rows(rows, ids, max_rows):
     """Display-only row decimation for a large Waterfall image.
 
-    The accumulator keeps every row.  This helper bounds only the rows painted in
-    one render and applies the same stride to the row ids so axis labels remain
-    aligned with the displayed image.
+    The accumulator keeps every row.  This helper bounds only the rows painted
+    in one render and applies ONE index set to the rows and the row ids so
+    axis labels remain aligned with the displayed image.  The index set always
+    preserves the FIRST and the TERMINAL row and spans the full history
+    extent — WF-END-2: the old stride slice returned ``1, 4, ..., 649`` for a
+    complete 651-row history at ``max_rows=256``, silently omitting the
+    finished run's top row even though the accumulator held all 651.
+
+    Returns ``(rows_display, ids_display, indices)``; ``indices`` is ``None``
+    when no decimation was applied, else the selected row indices — consumers
+    slice their per-row columns (metadata, row_meta) with the SAME set.
     """
     rows = np.asarray(rows)
     ids = tuple(ids)
     if max_rows is None:
-        return rows, ids, 1
+        return rows, ids, None
     max_rows = int(max_rows)
     n_rows = int(rows.shape[0]) if rows.ndim else 0
     if len(ids) != n_rows:
         ids = tuple(range(n_rows))
     if max_rows <= 0 or n_rows <= max_rows:
-        return rows, ids, 1
-    stride = int(np.ceil(n_rows / max_rows))
-    return rows[::stride], ids[::stride], stride
+        return rows, ids, None
+    if max_rows == 1:
+        indices = np.array([n_rows - 1], dtype=int)   # the terminal row
+    else:
+        indices = np.unique(np.round(
+            np.linspace(0, n_rows - 1, max_rows)).astype(int))
+    return rows[indices], tuple(ids[j] for j in indices), indices
 
 
 # ── V2: the single AccumulatorLifecycle owner (canonical-grid plan, Stage 5) ──
@@ -1311,7 +1323,7 @@ def render_waterfall_view(history, *, want_unit, norm_channel=None,
     converted with their own wavelength and ``np.interp``-ed onto
     ``x_display`` — the draw-time equivalent of the pre-flip per-row
     build-time convert+interp."""
-    rows, ids, stride = waterfall_display_rows(
+    rows, ids, indices = waterfall_display_rows(
         history.rows, history.ids, max_rows)
     n_rows = len(getattr(history, "ids", ()) or ())
     metadata = list(getattr(history, "metadata", ()) or ())
@@ -1320,10 +1332,14 @@ def render_waterfall_view(history, *, want_unit, norm_channel=None,
     row_meta = list(getattr(history, "row_meta", ()) or ())
     if len(row_meta) < n_rows:
         row_meta.extend([None] * (n_rows - len(row_meta)))
-    # The SAME stride waterfall_display_rows applied, so the per-row columns
-    # stay row-aligned with the decimated rows/ids.
-    metadata = metadata[::stride] if stride > 1 else metadata[:n_rows]
-    row_meta = row_meta[::stride] if stride > 1 else row_meta[:n_rows]
+    # The SAME index set waterfall_display_rows applied, so the per-row
+    # columns stay row-aligned with the decimated rows/ids (WF-END-2).
+    if indices is not None:
+        metadata = [metadata[j] for j in indices]
+        row_meta = [row_meta[j] for j in indices]
+    else:
+        metadata = metadata[:n_rows]
+        row_meta = row_meta[:n_rows]
     if norm_channel:
         rows = normalize_rows(rows, metadata, norm_channel)   # a new array
     else:

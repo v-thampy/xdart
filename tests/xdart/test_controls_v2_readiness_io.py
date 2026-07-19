@@ -292,3 +292,47 @@ def test_readiness_probing_is_quiet_about_expected_energy_absence(
                for r in contextual)
     assert state.source_caps.has_frames is True      # readiness unchanged
     assert 1 <= opens.count(target) <= 30            # bounded cascade
+
+
+def test_observation_suppression_is_thread_scoped(caplog):
+    """H18-R11: while one thread holds a readiness observation open, an
+    expected-absence WARNING emitted by an UNRELATED thread must pass
+    through unchanged (and never be attributed to the observing path);
+    nested observations on the observing thread stay suppressed."""
+    import logging
+    import threading
+
+    from xrd_tools.sources.readiness import quiet_capability_observation
+
+    reader = logging.getLogger("xrd_tools.io.nexus")
+    held = threading.Event()
+    release = threading.Event()
+
+    def observer():
+        with quiet_capability_observation("/A/master.h5", "configured acquisition source"):
+            reader.warning("Energy not found in NeXus file; using NaN")  # A's own: suppressed
+            with quiet_capability_observation("/A/nested.h5", "configured acquisition source"):
+                reader.warning("Wavelength not derivable; using NaN")    # nested: suppressed
+            held.set()
+            release.wait(5.0)
+
+    thread = threading.Thread(target=observer, daemon=True)
+    with caplog.at_level(logging.DEBUG):
+        thread.start()
+        assert held.wait(5.0)
+        # UNRELATED thread (the test main thread) emits the same warning while
+        # A's observation is still open — it must SURVIVE.
+        reader.warning("Energy not found in NeXus file; using NaN")
+        release.set()
+        thread.join(5.0)
+
+    survived = [r for r in caplog.records
+                if r.levelno == logging.WARNING
+                and "Energy not found" in r.getMessage()]
+    assert len(survived) == 1, \
+        "the unrelated thread's warning must pass through (H18-R11)"
+    # the observing thread's own absences were suppressed and contextualized
+    contextual = [r for r in caplog.records
+                  if "readiness observation for" in r.getMessage()]
+    assert any("/A/master.h5" in r.getMessage() for r in contextual)
+    assert any("/A/nested.h5" in r.getMessage() for r in contextual)
