@@ -9,6 +9,7 @@ This module is the pure bridge between those two shapes.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -46,7 +47,24 @@ def describe_source_readiness(spec_or_source: Any, *, probe: bool = True) -> Sou
     True-live / unknown-length sources keep ``raw_reachable=True`` even when a
     frame-0 probe cannot yet load an image; a live acquisition may legitimately
     have no frame zero at gate time.
+
+    Spec-level gates (H18, from the H5 parity findings — both adopt the
+    controls-panel behavior so the core is correct for EVERY consumer):
+
+    * An EMPTY location is never ready, even for ``SourceKind.LIVE`` — the
+      escape hatch governs a *configured* live source; with no location there
+      is nothing to run (the "label required even live" rule).
+    * A non-live LOCAL path that does not exist has no frames.  ``open_source``
+      happily builds e.g. an ``ImageFileSource`` around a typo'd path without
+      stat-ing it (phantom ``frame_indices == [0]``), which used to report
+      ``has_frames=has_raw=True`` for a nonexistent file (H5 finding 1) — a
+      naive run gate over that answer would enable Run on nothing.  Remote
+      ``scheme://`` URIs are not stat-able and pass through unchanged.
     """
+
+    gated = _spec_gate(spec_or_source)
+    if gated is not None:
+        return gated
 
     source = _open_source(spec_or_source)
     if source is None:
@@ -62,19 +80,24 @@ def describe_source_readiness(spec_or_source: Any, *, probe: bool = True) -> Sou
     )
     has_frames = bool(live_unknown or (frame_count is not None and frame_count > 0))
 
-    info = _classify(spec_or_source)
-    has_raw = bool(
-        live_unknown
-        or getattr(source_caps, "has_raw_references", False)
-        or getattr(info, "has_raw", False)
-        or (has_frames and hasattr(source, "load_frame"))
-    )
-
-    if probe and has_raw:
-        reachable = _probe_first_frame(source)
-        raw_reachable = bool(reachable or live_unknown)
+    if live_unknown:
+        # True-live escape hatch: a live acquisition may legitimately have no
+        # frame 0 yet, so classification and the frame-0 probe are SKIPPED
+        # (same answers as before, without touching a file another process may
+        # be writing — the readiness call must stay cheap on live refreshes).
+        has_raw = True
+        raw_reachable = True
     else:
-        raw_reachable = bool(has_raw or live_unknown)
+        info = _classify(spec_or_source)
+        has_raw = bool(
+            getattr(source_caps, "has_raw_references", False)
+            or getattr(info, "has_raw", False)
+            or (has_frames and hasattr(source, "load_frame"))
+        )
+        if probe and has_raw:
+            raw_reachable = bool(_probe_first_frame(source))
+        else:
+            raw_reachable = bool(has_raw)
 
     first_metadata = _first_metadata(source, frame_indices)
     motors = _motors(source)
@@ -98,12 +121,23 @@ def describe_source_readiness(spec_or_source: Any, *, probe: bool = True) -> Sou
     )
 
 
-def capabilities_for_processed(metadata: Mapping[str, Any]) -> ResultCaps:
+def capabilities_for_processed(
+    metadata: Mapping[str, Any],
+    *,
+    raw_reachable: bool | None = None,
+) -> ResultCaps:
     """Project already-materialized processed metadata into result caps.
 
     This consumes ``metadata["capabilities"]`` as written by
     :func:`xrd_tools.io.read.get_metadata`; it intentionally does not reopen an
     HDF5 file or call ``io.schema.detect_capabilities``.
+
+    ``raw_reachable`` lets the caller inject frame-0 PROBE truth (typically
+    ``describe_source_readiness(path).raw_reachable``): the ``frames_record``
+    capability only proves the record EXISTS, not that its raw master is still
+    reachable, so the default mirror overstates reachability for an orphaned
+    record (H5 finding 2).  Raw-dependent launcher gates should pass the probe
+    answer; ``None`` (default) keeps the pure, no-reopen record mirror.
     """
 
     caps = {str(cap) for cap in metadata.get("capabilities", ()) or ()}
@@ -121,16 +155,51 @@ def capabilities_for_processed(metadata: Mapping[str, Any]) -> ResultCaps:
         or metadata.get("n_frames")
         or _array_len(metadata.get("frames"))
     )
+    reachable = (
+        has_raw if raw_reachable is None else bool(has_raw and raw_reachable)
+    )
     return ResultCaps(
         has_1d=has_1d,
         has_2d=has_2d,
         has_raw=has_raw,
-        raw_reachable=has_raw,
+        raw_reachable=reachable,
         has_scan_metadata=has_scan_metadata,
         has_rsm="rsm" in caps,
         has_phase_result=bool(caps & _PHASE_CAPS),
         has_psi_metadata=has_scan_metadata,
     )
+
+
+_URI_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]+://")
+
+
+def _spec_gate(value: Any) -> SourceCaps | None:
+    """Spec-level readiness gate (H18) — see :func:`describe_source_readiness`.
+
+    Applies only to ``str`` / ``Path`` / :class:`SourceSpec` inputs; an
+    already-open source object is trusted as-is (its existence is its
+    configuration — e.g. an in-memory live source has no URI to check).
+    Returns the gated (all-False) caps, or ``None`` to proceed normally.
+    """
+
+    if not isinstance(value, (str, Path, SourceSpec)):
+        return None
+    uri = value.uri if isinstance(value, SourceSpec) else value
+    text = str(uri or "").strip()
+    if not text:
+        # Nothing configured — never ready, live or not (label rule).
+        return SourceCaps()
+    kind = value.kind if isinstance(value, SourceSpec) else None
+    if kind == SourceKind.LIVE:
+        # A configured live location may not exist yet; the escape hatch owns it.
+        return None
+    if _URI_SCHEME_RE.match(text):
+        # Remote resource (e.g. a future Tiled URI) — not stat-able here.
+        return None
+    if not Path(text).expanduser().exists():
+        # Phantom-frame hazard: a typo'd local path has no frames (finding 1).
+        return SourceCaps()
+    return None
 
 
 def _open_source(value: Any) -> Any | None:
