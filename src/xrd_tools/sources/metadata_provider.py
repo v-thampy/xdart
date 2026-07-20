@@ -54,6 +54,16 @@ class MetadataProvider:
     def metadata_for(self, frame_index: int) -> Mapping[str, Any]:
         return {}
 
+    def frame_count(self) -> int | None:
+        """The authoritative number of frames this provider serves, or ``None``
+        when the provider does not know (e.g. a sidecar-sourced stack).
+
+        Exposed so a consumer composing a per-frame row can bound the frame
+        identity with the SAME authority ``metadata_for`` uses internally,
+        rather than guessing the count from per-frame array lengths (which can
+        legitimately differ from the frame count for baseline/aborted points)."""
+        return None
+
     def motors(self) -> dict[str, np.ndarray]:
         return {}
 
@@ -107,6 +117,9 @@ class BlueskyMetadataProvider(MetadataProvider):
         self._table: dict[str, np.ndarray] | None = None
         self._motors: dict[str, np.ndarray] | None = None
         self._constants: dict[str, float] | None = None
+
+    def frame_count(self) -> int | None:
+        return self._frame_count
 
     def mark_source_closed(self) -> None:
         # Seal only when never materialized; a materialized provider is pure

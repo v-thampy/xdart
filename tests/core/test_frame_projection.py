@@ -1,0 +1,480 @@
+# -*- coding: utf-8 -*-
+"""X1-1/2/3 headless read-authority projection (``xrd_tools.session.frame_projection``).
+
+Production-wired: real :class:`FrameView` / :class:`FrameRecord` /
+:class:`FrameRecordStore` (real thinning + hydration path) and a small
+``MetadataProvider``-shaped object with the SAME method surface the real
+providers expose.  No fake on the projection under test.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import textwrap
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+from xrd_tools.core import FrameRecord, FrameView
+from xrd_tools.session import FrameRecordStore
+from xrd_tools.session.frame_projection import (
+    CapabilityState,
+    MetadataConflictError,
+    MetadataRow,
+    display_capabilities,
+    metadata_row_from_provider,
+    metadata_row_from_record,
+    metadata_row_from_view,
+    normalization_channels,
+    normalization_value,
+    project_frame,
+    wavelength_evidence,
+)
+
+
+# ── builders (real value types) ──────────────────────────────────────────────
+
+def _v1d(label=0, *, meta=None, source=None, resident=True, numeric=None):
+    r1 = SimpleNamespace(
+        radial=np.linspace(1.0, 5.0, 8), intensity=np.arange(8.0),
+        unit="q_A^-1", sigma=None) if resident else None
+    v = FrameView.from_results(
+        label=label, result_1d=r1, metadata_raw=meta or {},
+        metadata_numeric=numeric,
+        source_path=(source[0] if source else None),
+        source_frame_index=(source[1] if source else None))
+    return v
+
+
+def _v2d(label=0, *, meta=None, source=None):
+    r2 = SimpleNamespace(
+        radial=np.linspace(1.0, 5.0, 6), azimuthal=np.linspace(-180, 180, 4),
+        intensity=np.arange(24.0).reshape(6, 4), unit="q_A^-1",
+        azimuthal_unit="deg", sigma=None)
+    return FrameView.from_results(
+        label=label, result_2d=r2, metadata_raw=meta or {},
+        source_path=(source[0] if source else None),
+        source_frame_index=(source[1] if source else None))
+
+
+def _record_1d(label=0, *, meta=None, source=None):
+    return FrameRecord.from_view(_v1d(label, meta=meta, source=source))
+
+
+class _Provider:
+    """A MetadataProvider-shaped object (same surface as the real providers)."""
+
+    def __init__(self, *, motors=None, table=None, constants=None,
+                 metadata=None, wavelength=None, frame_count=None):
+        self._motors = motors or {}
+        self._table = table or {}
+        self._constants = constants or {}
+        # metadata[i] is the per-frame counter/constant dict (table > constant,
+        # scanned motors excluded) — exactly what the real metadata_for returns
+        self._metadata = metadata or {}
+        self._wavelength = wavelength
+        self._frame_count = frame_count
+        self.metadata_for_calls = []
+
+    def frame_count(self):
+        return self._frame_count
+
+    def motors(self):
+        return {k: np.asarray(v) for k, v in self._motors.items()}
+
+    def scan_table(self):
+        return {k: np.asarray(v) for k, v in self._table.items()}
+
+    def constants(self):
+        return dict(self._constants)
+
+    def metadata_for(self, i):
+        self.metadata_for_calls.append(i)
+        return dict(self._metadata.get(i, {}))
+
+    def wavelength(self):
+        return self._wavelength
+
+
+# ── 1. provider row composition + scanned-motor precedence ───────────────────
+
+def test_provider_scanned_motor_beats_counter_beats_constant():
+    prov = _Provider(
+        motors={"th": [10.0, 20.0, 30.0]},
+        table={"th": [10.0, 20.0, 30.0], "i0": [100.0, 110.0, 120.0]},
+        constants={"i0": 999.0, "gain": 5.0},
+        # a stale "th" in the per-frame table too: the SCANNED motor must win
+        metadata={1: {"i0": 110.0, "gain": 5.0, "th": 99.0}})
+    row = metadata_row_from_provider(prov, 1)
+    assert row.raw["th"] == 20.0        # scanned motor beats the stale table th=99
+    assert row.raw["i0"] == 110.0       # per-frame counter beat the 999 constant
+    assert row.raw["gain"] == 5.0       # constant present
+
+
+# ── 2. counters/constants, mixed scalar/string, numeric filtering, case ──────
+
+def test_mixed_scalar_string_numeric_filter_and_case():
+    meta = {"th": 10.5, "sample": "NbN", "profile": [1, 2, 3], "I0": 250.0}
+    row = MetadataRow(meta)
+    assert dict(row.raw) == meta                         # heterogeneous preserved
+    assert dict(row.numeric) == {"th": 10.5, "I0": 250.0}  # finite scalars only
+    # case-insensitive guarded selection (resolve_monitor_norm reused)
+    assert normalization_value(row, "i0") == 250.0
+    assert normalization_value(row, "I0") == 250.0
+    assert normalization_value(row, "sample") is None    # non-numeric channel
+
+
+# ── 3. negative / out-of-range frame identities never wrap ───────────────────
+
+def test_negative_frame_index_is_rejected_not_wrapped():
+    prov = _Provider(motors={"th": [10.0, 20.0, 30.0]},
+                     metadata={2: {"i0": 3.0}})
+    with pytest.raises(IndexError):
+        metadata_row_from_provider(prov, -1)          # must not wrap to th=30
+    # sanity: the last real frame is reachable the normal way
+    assert metadata_row_from_provider(prov, 2).raw["th"] == 30.0
+
+
+def test_out_of_range_frame_index_is_rejected():
+    prov = _Provider(motors={"th": [10.0, 20.0, 30.0]})
+    with pytest.raises(IndexError):
+        metadata_row_from_provider(prov, 3)
+
+
+def test_metadataless_provider_returns_empty_row_for_any_index():
+    prov = _Provider()                                # no motors/table/metadata
+    assert not metadata_row_from_provider(prov, 0)    # empty, not an error
+    assert not metadata_row_from_provider(prov, 7)
+
+
+# ── 4. active vs explicitly requested multimode record projection ────────────
+
+def test_record_projection_prefers_explicit_then_active():
+    v1 = _v1d(3, meta={"th": 1.0, "shared": 9.0})
+    v2 = _v2d(3, meta={"chi": 2.0, "shared": 9.0})
+    record = FrameRecord(label=3, results_1d={"a": v1}, results_2d={"b": v2},
+                         active_mode_1d="a", active_mode_2d="b")
+    # default: active 1D preferred
+    assert "th" in metadata_row_from_record(record).raw
+    # explicit 2D requested
+    assert "chi" in metadata_row_from_record(record, mode_2d="b").raw
+    # 2D-only record → falls through to the 2D view
+    record2d = FrameRecord(label=4, results_2d={"b": _v2d(4, meta={"chi": 7.0})},
+                           active_mode_2d="b")
+    assert metadata_row_from_record(record2d).raw["chi"] == 7.0
+
+
+# ── 5. contradictory metadata / source identity fails clearly ────────────────
+
+def test_contradictory_metadata_value_raises():
+    v1 = _v1d(0, meta={"temperature": 100.0})
+    v2 = _v2d(0, meta={"temperature": 200.0})           # same frame, disagrees
+    record = FrameRecord(label=0, results_1d={"a": v1}, results_2d={"b": v2},
+                         active_mode_1d="a", active_mode_2d="b")
+    with pytest.raises(MetadataConflictError):
+        metadata_row_from_record(record)
+
+
+def test_contradictory_source_identity_raises_and_is_error_capability():
+    v1 = _v1d(0, meta={"th": 1.0}, source=("/data/a.h5", 0))
+    v2 = _v2d(0, meta={"th": 1.0}, source=("/data/b.h5", 0))
+    record = FrameRecord(label=0, results_1d={"a": v1}, results_2d={"b": v2},
+                         active_mode_1d="a", active_mode_2d="b")
+    with pytest.raises(MetadataConflictError):
+        metadata_row_from_record(record)
+    caps = display_capabilities(record)
+    assert caps.metadata.state is CapabilityState.ERROR
+    assert caps.integrated_1d.state is CapabilityState.ERROR
+
+
+def test_agreeing_metadata_across_modes_is_not_a_conflict():
+    v1 = _v1d(0, meta={"th": 1.0, "shared": 5.0})
+    v2 = _v2d(0, meta={"chi": 2.0, "shared": 5.0})       # agrees on shared
+    record = FrameRecord(label=0, results_1d={"a": v1}, results_2d={"b": v2},
+                         active_mode_1d="a", active_mode_2d="b")
+    assert metadata_row_from_record(record).raw["th"] == 1.0   # no raise
+
+
+# ── 6. normalization channel discovery + guarded selected value ──────────────
+
+def test_normalization_channels_and_guarded_value():
+    row = MetadataRow({"i0": 500.0, "i1": 0.0, "ineg": -3.0, "name": "x"})
+    assert normalization_channels(row) == ("i0", "i1", "ineg")   # numeric only
+    assert normalization_value(row, "i0") == 500.0
+    assert normalization_value(row, "i1") is None       # zero rejected (guard)
+    assert normalization_value(row, "ineg") is None     # negative rejected
+    assert normalization_value(row, "missing") is None
+    assert normalization_value(row, None) is None
+
+
+# ── 7. wavelength present / absent / conflict, no I/O, no warning ─────────────
+
+def test_wavelength_present_absent_conflict(caplog):
+    import logging
+    caplog.set_level(logging.WARNING)
+    prov = _Provider(wavelength=1.5406)
+    row = MetadataRow({"wavelength": 1.5406, "th": 2.0})
+    present = wavelength_evidence(provider=prov, row=row)
+    assert present.status == "present" and present.value == pytest.approx(1.5406)
+
+    absent = wavelength_evidence(row=MetadataRow({"th": 2.0}))
+    assert absent.status == "absent" and absent.value is None
+
+    conflict = wavelength_evidence(
+        provider=_Provider(wavelength=1.5406),
+        row=MetadataRow({"wavelength": 0.9744}))
+    assert conflict.status == "conflict" and conflict.value is None
+    assert set(conflict.sources) == {"provider", "metadata"}
+    # a missing wavelength is not an operator warning here
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+# ── 8. capability states: resident / thinned / source-fallback / none / error ─
+
+def test_capabilities_resident_record():
+    record = _record_1d(0, meta={"th": 1.0})
+    caps = display_capabilities(record)
+    assert caps.integrated_1d.state is CapabilityState.AVAILABLE
+    assert caps.metadata.state is CapabilityState.AVAILABLE
+    assert caps.integrated_2d.state is CapabilityState.UNAVAILABLE   # no 2D mode
+
+
+def test_capabilities_thinned_is_pending():
+    store = FrameRecordStore(max_heavy_items=0, require_persisted_for_eviction=False)
+    store.upsert(_record_1d(5, meta={"th": 1.0}))       # thinned immediately
+    thinned = store.get(5)
+    assert store.has_heavy_payload(5) is False
+    caps = display_capabilities(thinned)
+    assert caps.integrated_1d.state is CapabilityState.PENDING   # hydratable
+    assert caps.metadata.state is CapabilityState.AVAILABLE      # metadata survived
+
+
+def test_capabilities_source_fallback_eligible_and_unavailable():
+    # raw not resident, but a source path makes it source-fallback eligible
+    v = _v1d(0, meta={"th": 1.0}, source=("/data/master.h5", 0))
+    caps = display_capabilities(FrameRecord.from_view(v))
+    assert caps.raw.state is CapabilityState.PENDING            # source-fallback
+    # no source, no raw → unavailable
+    caps2 = display_capabilities(_record_1d(0, meta={"th": 1.0}))
+    assert caps2.raw.state is CapabilityState.UNAVAILABLE
+
+
+def test_capabilities_empty_record_is_all_unavailable():
+    empty = FrameRecord(label=99)                       # a label, no results
+    caps = display_capabilities(empty)
+    assert caps.integrated_1d.state is CapabilityState.UNAVAILABLE
+    assert caps.integrated_2d.state is CapabilityState.UNAVAILABLE
+    assert caps.raw.state is CapabilityState.UNAVAILABLE
+    assert caps.metadata.state is CapabilityState.UNAVAILABLE
+
+
+# ── 9. thinned lookup preserves metadata/capabilities without heavy arrays ────
+
+def test_thinned_lookup_preserves_metadata_then_hydrates():
+    resident = _record_1d(7, meta={"th": 3.0, "i0": 400.0})
+    # produce a GENUINELY thinned record through the real eviction path
+    thinner = FrameRecordStore(max_heavy_items=0, require_persisted_for_eviction=False)
+    thinner.upsert(resident)
+    thinned = thinner.get(7)
+    assert thinner.has_heavy_payload(7) is False
+
+    store = FrameRecordStore()                           # default cap: has headroom
+    store.set_hydrator(lambda label: resident)           # synchronous hydrator
+    store.upsert(thinned, persisted=True)                # thinned AND on disk → hydratable
+
+    # resident-only projection: metadata + capabilities without heavy arrays
+    proj = project_frame(store, 7)
+    assert proj.present is True
+    assert proj.metadata.raw["th"] == 3.0
+    assert proj.capabilities.integrated_1d.state is CapabilityState.PENDING  # persisted → hydratable
+    assert store.has_heavy_payload(7) is False           # projection did not load arrays
+
+    # explicit synchronous hydration flips it AVAILABLE
+    hydrated = project_frame(store, 7, hydrate=True)
+    assert hydrated.capabilities.integrated_1d.state is CapabilityState.AVAILABLE
+    assert store.has_heavy_payload(7) is True
+
+
+def test_dropped_mode_is_unavailable_not_falsely_pending():
+    """A consciously-dropped mode (mark_dropped / MEM-1b) is thinned but NOT on
+    disk and NOT hydratable → UNAVAILABLE, not a false PENDING (fix RP#5)."""
+    r2 = SimpleNamespace(
+        radial=np.linspace(1.0, 5.0, 6), azimuthal=np.linspace(-180, 180, 4),
+        intensity=np.arange(24.0).reshape(6, 4), unit="q_A^-1",
+        azimuthal_unit="deg", sigma=None)
+    record = FrameRecord.from_view(
+        FrameView.from_results(label=8, result_2d=r2, metadata_raw={"th": 1.0}))
+    store = FrameRecordStore()
+    store.upsert(record)
+    store.mark_dropped(8, modes=("2d", "default"))       # husk kept, never persisted
+    assert store.has_heavy_payload(8) is False
+    assert ("2d", "default") not in store.persisted_modes(8)
+
+    proj = project_frame(store, 8)
+    assert proj.capabilities.integrated_2d.state is CapabilityState.UNAVAILABLE
+    # the pure record-level projection (no store context) is best-effort PENDING
+    assert display_capabilities(store.get(8)).integrated_2d.state \
+        is CapabilityState.PENDING
+
+
+def test_project_frame_absent_record():
+    store = FrameRecordStore()
+    proj = project_frame(store, 123)
+    assert proj.present is False
+    assert not proj.metadata
+    assert proj.capabilities.integrated_1d.state is CapabilityState.UNAVAILABLE
+    assert proj.wavelength.status == "absent"
+
+
+# ── 10. import purity: no Qt / h5py / fabio / pyFAI / xdart ───────────────────
+
+def test_frame_projection_import_is_headless():
+    root = Path(__file__).resolve().parents[2]
+    code = textwrap.dedent(
+        """
+        import sys
+        import xrd_tools.session.frame_projection  # noqa: F401
+        forbidden = ("xdart", "PySide6", "PySide2", "PyQt5", "PyQt6",
+                     "pyqtgraph", "matplotlib", "h5py", "fabio", "pyFAI")
+        bad = sorted(r for r in forbidden if any(
+            n == r or n.startswith(r + ".") for n in sys.modules))
+        if bad:
+            print(",".join(bad)); sys.exit(1)
+        """)
+    env = dict(os.environ)
+    src = root / "src"
+    env["PYTHONPATH"] = str(src) + (os.pathsep + env["PYTHONPATH"]
+                                    if env.get("PYTHONPATH") else "")
+    proc = subprocess.run([sys.executable, "-c", code],
+                          capture_output=True, text=True, env=env)
+    assert proc.returncode == 0, (
+        f"frame_projection import pulled in: {proc.stdout.strip()}\n"
+        f"{proc.stderr.strip()}")
+
+
+# ── 11. single-frame projection does not scale with scan length ──────────────
+
+def test_single_frame_projection_is_o1_in_scan_length():
+    def _time_projection(n):
+        prov = _Provider(
+            motors={"th": np.linspace(0.0, 10.0, n)},
+            table={"th": np.linspace(0.0, 10.0, n), "i0": np.arange(float(n))},
+            metadata={5: {"i0": 5.0}})
+        start = time.perf_counter()
+        for _ in range(200):
+            metadata_row_from_provider(prov, 5)
+        return time.perf_counter() - start
+
+    small = _time_projection(1_000)
+    large = _time_projection(1_000_000)               # 1000x longer scan
+    # a single-frame projection indexes one element; it must not scale with N
+    assert large < small * 20 + 0.05, (
+        f"projection scaled with scan length: {small:.4f}s -> {large:.4f}s")
+
+
+def test_provider_row_reads_only_the_selected_frame():
+    prov = _Provider(motors={"th": [1.0, 2.0, 3.0, 4.0, 5.0]},
+                     metadata={i: {"i0": float(i)} for i in range(5)})
+    metadata_row_from_provider(prov, 2)
+    assert prov.metadata_for_calls == [2]             # only frame 2, not all 5
+
+
+# ── review corrections (RP#1–#5 + minors) ────────────────────────────────────
+
+def test_provider_frame_count_is_authoritative_over_array_lengths():
+    """RP#1: the frame bound follows the provider's frame_count(), not
+    max(array lengths), in BOTH directions."""
+    # OVER-SHOOT: a scanned-motor column longer than frame_count (a baseline
+    # point) must not make a nonexistent frame readable.
+    over = _Provider(motors={"th": [10.0, 20.0, 30.0, 40.0]},   # len 4
+                     metadata={0: {"i0": 1.0}, 1: {"i0": 2.0}, 2: {"i0": 3.0}},
+                     frame_count=3)
+    with pytest.raises(IndexError):
+        metadata_row_from_provider(over, 3)              # frame 3 does not exist
+    assert metadata_row_from_provider(over, 2).raw["th"] == 30.0
+
+    # UNDER-SHOOT: per-frame arrays shorter than frame_count must not refuse a
+    # valid frame; its frame-independent constants still resolve.
+    under = _Provider(motors={"th": [10.0, 20.0, 30.0, 40.0, 50.0]},  # len 5
+                      metadata={i: {"exposure": 0.5} for i in range(10)},
+                      frame_count=10)
+    row = metadata_row_from_provider(under, 7)           # valid (7 < 10)
+    assert row.raw["exposure"] == 0.5                    # constant resolved
+    assert "th" not in row.raw                           # baseline-short motor absent
+
+
+def test_explicit_absent_mode_falls_back_to_active_metadata():
+    """RP#2: an explicitly requested mode that is absent must not silently drop
+    the frame's real metadata — it falls through to the active view."""
+    record = FrameRecord(
+        label=0, results_1d={"norm": _v1d(0, meta={"I0": 100.0})},
+        active_mode_1d="norm")
+    row = metadata_row_from_record(record, mode_1d="raw")   # 'raw' not present
+    assert row.raw["I0"] == 100.0                           # fell back to active
+
+
+def test_source_index_none_reconciles_with_concrete_index():
+    """RP#3: a same-path view with an unknown (None) source index reconciles
+    with one that knows the index — not a false identity conflict."""
+    v1 = _v1d(0, meta={"I0": 5.0}, source=("/f.h5", 0))
+    v2 = _v2d(0, meta={"I0": 5.0}, source=("/f.h5", None))
+    record = FrameRecord(label=0, results_1d={"a": v1}, results_2d={"b": v2},
+                         active_mode_1d="a", active_mode_2d="b")
+    # no raise; the identity resolves to the concrete index
+    assert metadata_row_from_record(record).raw["I0"] == 5.0
+    caps = display_capabilities(record)
+    assert caps.identity == "/f.h5#0"
+    assert caps.metadata.state is CapabilityState.AVAILABLE
+
+
+def test_project_frame_returns_error_projection_not_raise_on_conflict():
+    """RP#4: the single lookup boundary returns a typed ERROR projection on a
+    conflicting record instead of raising."""
+    v1 = _v1d(0, meta={"exposure": 1.0})
+    v2 = _v2d(0, meta={"exposure": 2.0})
+    record = FrameRecord(label=0, results_1d={"a": v1}, results_2d={"b": v2},
+                         active_mode_1d="a", active_mode_2d="b")
+    store = FrameRecordStore()
+    store.upsert(record)
+    proj = project_frame(store, 0)                       # must NOT raise
+    assert proj.present is True
+    assert proj.capabilities.metadata.state is CapabilityState.ERROR
+    assert not proj.metadata                             # empty on conflict
+
+
+def test_equal_ndarray_metadata_across_modes_is_not_a_conflict():
+    """Minor: byte-equal array-valued metadata in two modes is not a conflict."""
+    v1 = _v1d(0, meta={"positions": np.array([1.0, 2.0, 3.0])})
+    v2 = _v2d(0, meta={"positions": np.array([1.0, 2.0, 3.0])})
+    record = FrameRecord(label=0, results_1d={"a": v1}, results_2d={"b": v2},
+                         active_mode_1d="a", active_mode_2d="b")
+    row = metadata_row_from_record(record)               # no raise
+    assert "positions" in row.raw
+    # a genuine array disagreement still conflicts
+    v3 = _v2d(0, meta={"positions": np.array([9.0, 9.0, 9.0])})
+    bad = FrameRecord(label=0, results_1d={"a": v1}, results_2d={"b": v3},
+                      active_mode_1d="a", active_mode_2d="b")
+    with pytest.raises(MetadataConflictError):
+        metadata_row_from_record(bad)
+
+
+# ── 12. public API use from a synthetic headless consumer ────────────────────
+
+def test_public_api_end_to_end_headless_consumer():
+    from xrd_tools.session import (
+        project_frame as pf, normalization_value as nv,
+        metadata_row_from_view as mrv)
+    store = FrameRecordStore()
+    store.upsert(_record_1d(0, meta={"th": 12.0, "i0": 800.0}),
+                 source_identity="/data/scan.h5#0")
+    proj = pf(store, 0)
+    assert proj.present
+    assert proj.capabilities.identity == "/data/scan.h5#0"
+    assert "i0" in proj.normalization_channels
+    assert nv(proj.metadata, "i0") == 800.0
+    assert mrv(store.get(0).view_1d()).raw["th"] == 12.0
