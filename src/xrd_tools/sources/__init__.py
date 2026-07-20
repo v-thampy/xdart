@@ -51,6 +51,12 @@ if TYPE_CHECKING:
         Snapshot,
         StaleCandidateError,
     )
+    from xrd_tools.sources.directory_session import (
+        CandidateObservation,
+        DirectoryIndexSession,
+        DirectoryObservation,
+        DirectorySessionConfig,
+    )
     from xrd_tools.sources.discover import Candidate, discover_scans, enumerate_candidates
     from xrd_tools.sources.run_plan import (
         RunCandidatePlan,
@@ -87,6 +93,7 @@ _LAZY_EXPORTS = {
     "BaseFrameSource": "xrd_tools.sources.base",
     "BlueskyMetadataProvider": "xrd_tools.sources.metadata_provider",
     "Candidate": "xrd_tools.sources.discover",
+    "CandidateObservation": "xrd_tools.sources.directory_session",
     "CompositeFrameSource": "xrd_tools.sources.composite",
     "ContainerCursor": "xrd_tools.sources.cursor",
     "ContainerDescriptor": "xrd_tools.sources.descriptor",
@@ -94,6 +101,9 @@ _LAZY_EXPORTS = {
     "CursorClosedError": "xrd_tools.sources.cursor",
     "DEFAULT_RETRY_DEADLINE": "xrd_tools.sources.directory_index",
     "DirectoryIndex": "xrd_tools.sources.directory_index",
+    "DirectoryIndexSession": "xrd_tools.sources.directory_session",
+    "DirectoryObservation": "xrd_tools.sources.directory_session",
+    "DirectorySessionConfig": "xrd_tools.sources.directory_session",
     "EmptyMetadataProvider": "xrd_tools.sources.metadata_provider",
     "ImageFileSource": "xrd_tools.sources.image",
     "IndexDelta": "xrd_tools.sources.directory_index",
@@ -158,6 +168,7 @@ __all__ = [
     "BaseFrameSource",
     "BlueskyMetadataProvider",
     "Candidate",
+    "CandidateObservation",
     "CompositeFrameSource",
     "ContainerCursor",
     "ContainerDescriptor",
@@ -165,6 +176,9 @@ __all__ = [
     "CursorClosedError",
     "DEFAULT_RETRY_DEADLINE",
     "DirectoryIndex",
+    "DirectoryIndexSession",
+    "DirectoryObservation",
+    "DirectorySessionConfig",
     "EmptyMetadataProvider",
     "FrameSource",
     "ImageFileSource",
