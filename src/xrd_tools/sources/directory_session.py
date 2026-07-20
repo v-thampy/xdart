@@ -90,7 +90,17 @@ class DirectoryIndexSession:
     Neither API exposes the mutable index or any open source object.
     """
 
-    def __init__(self, *, retry_deadline: float | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        retry_deadline: float | None = None,
+        max_probes_per_observation: int = 8,
+        probe_time_budget_s: float = 0.75,
+    ) -> None:
+        if max_probes_per_observation < 1:
+            raise ValueError("max_probes_per_observation must be at least 1")
+        if probe_time_budget_s <= 0:
+            raise ValueError("probe_time_budget_s must be positive")
         self._lock = threading.Lock()
         self._desired: DirectorySessionConfig | None = None
         self._request_generation = 0
@@ -99,6 +109,8 @@ class DirectoryIndexSession:
         self._results: dict[Path, tuple[Candidate, ProbeResult]] = {}
         self._visible_candidates: tuple[Candidate, ...] = ()
         self._retry_deadline = retry_deadline
+        self._max_probes_per_observation = int(max_probes_per_observation)
+        self._probe_time_budget_s = float(probe_time_budget_s)
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="xdart-directory-index")
         self._closed = False
@@ -196,11 +208,35 @@ class DirectoryIndexSession:
 
         content_opens = 0
         stale_drops = 0
+        priority_paths = {
+            candidate.path
+            for candidate in (*index.last_delta.changed, *index.last_delta.added)
+        }
+        unseen = []
+        retrying_candidates = []
         for candidate in snapshot.candidates:
             stored = self._results.get(candidate.path)
             retrying = index.retry_state(candidate.path) is not None
-            if stored is not None and not retrying:
-                continue
+            if stored is None:
+                unseen.append(candidate)
+            elif retrying:
+                retrying_candidates.append(candidate)
+
+        # New/changed files get their first readiness observation before a
+        # nascent shell is retried.  This prevents one slow writer from
+        # starving later ready siblings.  Files from the current poll delta
+        # retain natural order at the front of the unseen queue.
+        unseen.sort(key=lambda item: item.path not in priority_paths)
+        probe_started = time.perf_counter()
+        for candidate in (*unseen, *retrying_candidates):
+            if content_opens >= self._max_probes_per_observation:
+                break
+            if (
+                content_opens
+                and time.perf_counter() - probe_started
+                >= self._probe_time_budget_s
+            ):
+                break
             try:
                 content_opens += 1
                 result = index.probe_candidate(candidate)
@@ -242,10 +278,18 @@ class DirectoryIndexSession:
         )
         self._visible_candidates = snapshot.candidates
 
+        queued_result = ProbeResult(
+            ProbeState.IN_PROGRESS,
+            reason="awaiting bounded readiness probe",
+        )
         observations = tuple(
-            CandidateObservation(candidate, self._results[candidate.path][1])
+            CandidateObservation(
+                candidate,
+                self._results[candidate.path][1]
+                if candidate.path in self._results
+                else queued_result,
+            )
             for candidate in snapshot.candidates
-            if candidate.path in self._results
         )
         ready_candidates = tuple(
             item.candidate for item in observations

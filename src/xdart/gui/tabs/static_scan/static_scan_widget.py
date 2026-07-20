@@ -3703,9 +3703,12 @@ class staticWidget(QWidget):
                 observation = self._controls_v2_current_directory_observation()
                 if observation is None:
                     return 0
+                from xrd_tools.sources import ProbeState
                 files = tuple(
-                    candidate.path
-                    for candidate in observation.ready_snapshot.candidates)
+                    item.candidate.path
+                    for item in observation.candidates
+                    if item.result.state in {
+                        ProbeState.READY, ProbeState.IN_PROGRESS})
                 # Lazy convergence: once EVERY file's frame count is
                 # known (landed by the run as it opened each container,
                 # or by the click-to-count sweep) the chip shows real

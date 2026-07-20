@@ -266,3 +266,60 @@ def test_eiger_master_suffix_excludes_data_sidecars_before_probe(
         assert opened == ["scan_2_master.h5", "scan_10_master.h5"]
     finally:
         session.close()
+
+
+def test_probe_work_is_bounded_and_unseen_siblings_precede_retries(
+    tmp_path, monkeypatch,
+):
+    calls = []
+
+    def probe(index, candidate):
+        calls.append(candidate.path.name)
+        attempts = calls.count(candidate.path.name)
+        state = (
+            ProbeState.IN_PROGRESS
+            if candidate.path.name == "scan_0.nxs" and attempts == 1
+            else ProbeState.READY
+        )
+        return index.record_probe(
+            candidate, ProbeResult(state, kind=SourceKind.NEXUS_STACK))
+
+    monkeypatch.setattr(DirectoryIndex, "probe_candidate", probe)
+    sources = tuple(_write(tmp_path / f"scan_{index}.nxs") for index in range(6))
+    session = DirectoryIndexSession(max_probes_per_observation=2)
+    try:
+        session.configure(tmp_path, suffixes=(".nxs",))
+        first = session.observe()
+        second = session.observe()
+        third = session.observe()
+        fourth = session.observe()
+        settled = session.observe()
+
+        assert first.content_opens == 2
+        assert first.pending_count == 5
+        assert [item.path for item in first.ready_snapshot.candidates] == [
+            sources[1],
+        ]
+        assert calls[:6] == [f"scan_{index}.nxs" for index in range(6)]
+        assert second.content_opens == 2
+        assert third.content_opens == 2
+        assert fourth.content_opens == 1
+        assert [item.path for item in fourth.ready_snapshot.candidates] == list(
+            sources)
+        assert settled.content_opens == 0
+        assert settled.pending_count == 0
+    finally:
+        session.close()
+
+
+def test_probe_batch_configuration_rejects_unbounded_values():
+    for kwargs in (
+        {"max_probes_per_observation": 0},
+        {"probe_time_budget_s": 0},
+    ):
+        try:
+            DirectoryIndexSession(**kwargs)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"accepted invalid probe budget: {kwargs}")
