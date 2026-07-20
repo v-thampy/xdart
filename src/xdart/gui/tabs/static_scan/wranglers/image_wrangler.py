@@ -264,6 +264,10 @@ class imageWrangler(wranglerWidget):
         self.motors = []
         self.command = None
         self.scan = scan
+        # H19: immutable Source-card baseline + serialized headless index owner.
+        # Populated immediately before setup() for container-directory runs.
+        self.source_run_plan = None
+        self.source_index_session = None
 
         # Setup gui elements
         self.ui = Ui_Form()
@@ -1295,6 +1299,8 @@ class imageWrangler(wranglerWidget):
 
         self.inp_type = self.parameters.child('Signal').child('inp_type').value()
         self.thread.inp_type = self.inp_type
+        self.thread.source_run_plan = self.source_run_plan
+        self.thread.source_index_session = self.source_index_session
 
         self.get_img_fname()
         self.thread.img_file = self.img_file
@@ -2001,23 +2007,29 @@ class imageWrangler(wranglerWidget):
             self.include_subdir = self.parameters.child('Signal').child('include_subdir').value()
             self._sync_meta_ext_to_img_ext()
 
-            # F1: same compiled Filter grammar as the worker's directory
-            # glob — the seed image must be selected by the same rule as
-            # the frames the run will process.  Match the NAME (minus
-            # extension), like the worker sites, not the full path.
-            from .image_wrangler_thread import _name_filter
-            match = _name_filter(self.file_filter)
-            suffix = f'.{self.img_ext}'
-
-            fname = self._find_image_directory_seed(match, suffix)
-            if fname:
-                self.img_file = fname
+            plan = getattr(self, "source_run_plan", None)
+            planned_paths = tuple(getattr(plan, "paths", ()) or ())
+            if planned_paths:
+                # H19 exact handoff: setup seeds from the first candidate the
+                # Source card marked Ready.  Do not independently walk here.
+                self.img_file = str(planned_paths[0])
             else:
-                # No seed yet (e.g. the Source just switched to Image Directory
-                # and no directory is chosen): drop the previous source's file
-                # so the motor/parameter reset below fires and the GI Theta Motor
-                # dropdown doesn't keep the old file's columns.
-                self.img_file = ''
+                # F1: same compiled Filter grammar as the worker's directory
+                # glob — the seed image must be selected by the same rule as
+                # the frames the run will process.  Match the NAME (minus
+                # extension), like the worker sites, not the full path.
+                from .image_wrangler_thread import _name_filter
+                match = _name_filter(self.file_filter)
+                suffix = f'.{self.img_ext}'
+
+                fname = self._find_image_directory_seed(match, suffix)
+                if fname:
+                    self.img_file = fname
+                else:
+                    # No seed yet (e.g. the Source just switched to Image
+                    # Directory and no directory is chosen): drop the previous
+                    # source's file so stale motor options are cleared below.
+                    self.img_file = ''
 
         if ((self.img_file != old_fname)
                 or (self.img_file and (len(self.scan_parameters) < 1))):

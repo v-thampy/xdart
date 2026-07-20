@@ -949,6 +949,15 @@ class ControlsPanelV2(QtWidgets.QWidget):
     ) -> None:
         self.processing_card.set_embedded_widget(widget, visible=visible)
 
+    def set_source_widget(
+        self,
+        widget: QtWidgets.QWidget | None,
+        *,
+        visible: bool = True,
+    ) -> None:
+        """Mount the shared authoritative source observer in the Source card."""
+        self.source_card.set_embedded_widget(widget, visible=visible)
+
     @property
     def profile(self) -> ControlProfile | None:
         return self._profile

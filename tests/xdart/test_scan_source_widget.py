@@ -233,6 +233,51 @@ def test_widget_async_probe_ignores_stale_generation(qapp, tmp_path):
         w.deleteLater()
 
 
+def test_controls_source_widget_emits_latest_directory_generation(
+    qapp, tmp_path, monkeypatch,
+):
+    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xrd_tools.core.scan import SourceKind
+    from xrd_tools.sources.directory_index import DirectoryIndex
+    from xrd_tools.sources.probe import ProbeResult, ProbeState
+
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "old.nxs").write_bytes(b"old")
+    (second / "scan_10.nxs").write_bytes(b"ten")
+    (second / "scan_2.nxs").write_bytes(b"two")
+
+    monkeypatch.setattr(
+        DirectoryIndex,
+        "probe_candidate",
+        lambda _index, _candidate: ProbeResult(
+            ProbeState.READY, kind=SourceKind.NEXUS_STACK),
+    )
+    w = ScanSourceWidget(mode="controls_source", async_probe=True)
+    emitted = []
+    w.sigDirectoryChanged.connect(lambda observation: emitted.append(observation))
+    try:
+        w.configure_directory(first, suffixes=(".nxs",))
+        w.configure_directory(second, suffixes=(".nxs",))
+        assert _wait_for(
+            qapp,
+            lambda: emitted
+            and emitted[-1] is not None
+            and emitted[-1].ready_snapshot.root == second,
+        )
+        assert [
+            item.path.name for item in emitted[-1].ready_snapshot.candidates
+        ] == ["scan_2.nxs", "scan_10.nxs"]
+        assert emitted[-1].request_generation == (
+            w.directory_session.request_generation)
+        assert w.directory_status.text() == "2 ready"
+    finally:
+        w.shutdown_probe_worker()
+        w.deleteLater()
+
+
 def test_image_preview_is_read_only_and_rejects_unsafe_payloads():
     from xdart.gui.tabs.static_scan.scan_source_widget import ImagePreview
 

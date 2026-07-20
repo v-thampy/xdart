@@ -3,6 +3,7 @@
 import gc
 import json
 import os
+import time
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
@@ -50,6 +51,16 @@ from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import (
     SegmentedControl,
     SubsectionCard,
 )
+
+
+def _wait_until(qapp, predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
 
 
 @pytest.fixture(autouse=True)
@@ -1425,11 +1436,14 @@ def test_controls_panel_v2_gi_motor_never_shows_phantom_th(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_dir_container_count_is_file_count_no_hdf5_opens(qapp, monkeypatch, tmp_path):
-    """DIR-2 (maintainer, 2026-07-13): a container DIRECTORY reports the FILE
-    count immediately — no per-file HDF5 open, ever (the old sweep cost
-    ~0.5-1 s/file over a beamline share and one WARNING per unreadable file).
-    True frame counts appear as the run opens each file (that path is lazy)."""
+def test_dir_container_count_uses_authoritative_file_count_without_frame_reads(
+    qapp, monkeypatch, tmp_path,
+):
+    """The count consumes the readiness snapshot without a frame-count sweep.
+
+    H19 probes each new or changed container once to establish READY, but this
+    presentation path must not independently reopen every file to count frames.
+    """
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
     from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter
@@ -1453,6 +1467,10 @@ def test_dir_container_count_is_file_count_no_hdf5_opens(qapp, monkeypatch, tmp_
         sig.child("img_dir").setValue(str(d))
         sig.child("img_ext").setValue("nxs")
 
+        assert _wait_until(
+            qapp,
+            lambda: widget._controls_v2_source_frame_count() == n_files,
+        )
         assert widget._controls_v2_source_frame_count() == n_files
         assert widget._v2_source_count_is_files is True
 
@@ -1460,6 +1478,11 @@ def test_dir_container_count_is_file_count_no_hdf5_opens(qapp, monkeypatch, tmp_
         # still without opening anything.
         _write_bluesky_nxwriter(d / f"scan_{n_files:05d}.nxs", n=5)
         widget._v2_frame_count_cache = None
+        widget._controls_v2_source_widget.request_directory_poll()
+        assert _wait_until(
+            qapp,
+            lambda: widget._controls_v2_source_frame_count() == n_files + 1,
+        )
         assert widget._controls_v2_source_frame_count() == n_files + 1
 
         # The summary chip renders FILES, not frames.
@@ -1496,8 +1519,176 @@ def test_dir_container_count_small_dir_is_file_count_too(qapp, monkeypatch, tmp_
         sig.child("inp_type").setValue("Image Directory")
         sig.child("img_dir").setValue(str(d))
         sig.child("img_ext").setValue("nxs")
+        assert _wait_until(
+            qapp,
+            lambda: widget._controls_v2_source_frame_count() == 3,
+        )
         assert widget._controls_v2_source_frame_count() == 3
         assert widget._v2_source_count_is_files is True
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_h19_source_card_mounts_shared_widget_and_freezes_exact_ready_set(
+    qapp, monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.core.scan import SourceKind
+    from xrd_tools.sources.directory_index import DirectoryIndex
+    from xrd_tools.sources.probe import ProbeResult, ProbeState
+
+    (tmp_path / "scan_10.nxs").write_bytes(b"ten")
+    (tmp_path / "scan_2.nxs").write_bytes(b"two")
+    (tmp_path / "processed.nxs").write_bytes(b"processed")
+
+    def probe(_index, candidate):
+        state = (
+            ProbeState.PROCESSED_OUTPUT
+            if candidate.path.name == "processed.nxs"
+            else ProbeState.READY
+        )
+        return ProbeResult(state, kind=SourceKind.NEXUS_STACK)
+
+    monkeypatch.setattr(DirectoryIndex, "probe_candidate", probe)
+    widget = staticWidget()
+    try:
+        source_widget = widget._controls_v2_source_widget
+        assert isinstance(source_widget, ScanSourceWidget)
+        assert source_widget._mode == "controls_source"
+        embedded = widget.controls_v2.source_card.embedded_layout.itemAt(0)
+        assert embedded.widget() is source_widget
+
+        signal = widget.wrangler.parameters.child("Signal")
+        signal.child("inp_type").setValue("Image Directory")
+        signal.child("img_dir").setValue(str(tmp_path))
+        signal.child("img_ext").setValue("nxs")
+        assert _wait_until(
+            qapp,
+            lambda: widget._controls_v2_freeze_source_run_plan() is not None,
+        )
+        observation = widget._controls_v2_current_directory_observation()
+        plan = widget._controls_v2_freeze_source_run_plan()
+        assert plan.candidates == observation.ready_snapshot.candidates
+        assert [path.name for path in plan.paths] == [
+            "scan_2.nxs", "scan_10.nxs",
+        ]
+        assert source_widget.directory_session is not None
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_h19_blank_container_directory_never_indexes_process_cwd(
+    qapp, monkeypatch,
+):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        signal = widget.wrangler.parameters.child("Signal")
+        signal.child("inp_type").setValue("Image Directory")
+        signal.child("img_ext").setValue("nxs")
+        signal.child("img_dir").setValue("")
+
+        assert widget._controls_v2_container_index_config() is None
+        assert widget._controls_v2_source_widget.directory_session.configured is None
+        assert widget._controls_v2_freeze_source_run_plan() is None
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_h19_legacy_panel_never_requires_v2_directory_authority(
+    qapp, monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "0")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        signal = widget.wrangler.parameters.child("Signal")
+        signal.child("inp_type").setValue("Image Directory")
+        signal.child("img_dir").setValue(str(tmp_path))
+        signal.child("img_ext").setValue("nxs")
+        assert widget._controls_v2_source_widget is None
+        assert widget._controls_v2_container_index_config() is None
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_h19_source_directory_config_roundtrip_rebinds_authoritative_index(
+    qapp, monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.core.scan import SourceKind
+    from xrd_tools.sources.directory_index import DirectoryIndex
+    from xrd_tools.sources.probe import ProbeResult, ProbeState
+
+    source_a = tmp_path / "source-a"
+    source_b = tmp_path / "source-b"
+    source_a.mkdir()
+    source_b.mkdir()
+    (source_a / "keep_scan_1.nxs").write_bytes(b"one")
+
+    monkeypatch.setattr(
+        DirectoryIndex,
+        "probe_candidate",
+        lambda _index, candidate: ProbeResult(
+            ProbeState.READY, kind=SourceKind.NEXUS_STACK),
+    )
+    config_path = tmp_path / "source-session.json"
+    widget = staticWidget()
+    try:
+        signal = widget.wrangler.parameters.child("Signal")
+        signal.child("inp_type").setValue("Image Directory")
+        signal.child("img_dir").setValue(str(source_a))
+        signal.child("include_subdir").setValue(True)
+        signal.child("img_ext").setValue("nxs")
+        signal.child("Filter").setValue("keep -bad")
+        signal.child("meta_ext").setValue("auto")
+        assert _wait_until(
+            qapp,
+            lambda: widget._controls_v2_freeze_source_run_plan() is not None,
+        )
+        widget.h5viewer.defaultWidget.save_defaults(fname=str(config_path))
+
+        signal.child("inp_type").setValue("Image Series")
+        signal.child("img_dir").setValue(str(source_b))
+        signal.child("include_subdir").setValue(False)
+        signal.child("img_ext").setValue("tif")
+        signal.child("Filter").setValue("")
+        signal.child("meta_ext").setValue("none")
+
+        widget.h5viewer.defaultWidget.load_defaults(fname=str(config_path))
+        assert _wait_until(
+            qapp,
+            lambda: widget._controls_v2_freeze_source_run_plan() is not None,
+        )
+
+        restored = widget.wrangler.parameters.child("Signal")
+        assert restored.child("inp_type").value() == "Image Directory"
+        assert restored.child("img_dir").value() == str(source_a)
+        assert restored.child("include_subdir").value() is True
+        assert restored.child("img_ext").value() == "nxs"
+        assert restored.child("Filter").value() == "keep -bad"
+        assert restored.child("meta_ext").value() == "auto"
+
+        source_widget = widget._controls_v2_source_widget
+        session_config = source_widget.directory_session.configured
+        assert session_config.root == source_a
+        assert session_config.recursive is True
+        assert session_config.name_filter == "keep -bad"
+        assert session_config.suffixes == (".nxs",)
+        assert [path.name for path in
+                widget._controls_v2_freeze_source_run_plan().paths] == [
+                    "keep_scan_1.nxs",
+                ]
     finally:
         widget.close()
         widget.deleteLater()

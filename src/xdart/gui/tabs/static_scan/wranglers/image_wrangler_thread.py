@@ -127,6 +127,7 @@ from xrd_tools.session.readiness import (
     processing_config_from_scan,
 )
 from xrd_tools.sources.image import ImageFileSource, TiffSeriesSource
+from xrd_tools.sources.probe import ProbeState
 from xrd_tools.io.image import read_image, count_frames
 from xrd_tools.io.export import write_xye
 from xrd_tools.io.output_safety import (
@@ -653,6 +654,12 @@ class imageThread(wranglerThread):
         self.max_cores = max_cores
         self.command = command
         self.scan = scan
+        # H19: supplied by the mounted Source card immediately before Run.
+        # Both are value/headless boundaries; the mutable DirectoryIndex stays
+        # owned by DirectoryIndexSession's serialized executor.
+        self.source_run_plan = None
+        self.source_index_session = None
+        self._source_plan_reported = set()
 
         self.user = None
         self.mask = None
@@ -751,6 +758,7 @@ class imageThread(wranglerThread):
         self._eiger_nframes = 0
         self._eiger_master_queue.clear()
         self._eiger_done_masters.clear()
+        self._source_plan_reported.clear()
         self._eiger_retry_after.clear()
         self._eiger_zero_frame_seen.clear()
         self._eiger_open_state = None
@@ -1044,6 +1052,11 @@ class imageThread(wranglerThread):
         img_ext = (getattr(self, "img_ext", "") or "").lower().lstrip(".")
 
         if inp_type == 'Image Directory':
+            plan = getattr(self, "source_run_plan", None)
+            if plan is not None:
+                for candidate in plan.candidates:
+                    add(self._eiger_scan_name(candidate.path))
+                return names
             img_dir = getattr(self, "img_dir", None)
             if not img_dir:
                 return names
@@ -3671,6 +3684,16 @@ class imageThread(wranglerThread):
 
     def _eiger_refill_master_queue(self):
         """Queue matching HDF5 master / NeXus files not yet processed."""
+        if (getattr(self, "source_run_plan", None) is not None
+                and getattr(self, "source_index_session", None) is not None):
+            queued = set(self._eiger_master_queue)
+            for path in self._h19_ready_master_paths():
+                value = str(path)
+                if value in self._eiger_done_masters or value in queued:
+                    continue
+                self._eiger_master_queue.append(value)
+            return
+
         match = _name_filter(self.file_filter)
         img_ext = (getattr(self, 'img_ext', '') or '').lower().lstrip('.')
         if not img_ext:
@@ -3721,6 +3744,49 @@ class imageThread(wranglerThread):
             # happens before a container is consumed and retired.
             self._eiger_master_queue.append(mf_str)
 
+    def _h19_ready_master_paths(self):
+        """Reconcile one worker poll against the Source-card run baseline."""
+        plan = getattr(self, "source_run_plan", None)
+        session = getattr(self, "source_index_session", None)
+        if plan is None or session is None:
+            return ()
+        try:
+            observation = session.observe()
+            reconciliation = plan.reconcile(observation.discovered_snapshot)
+            for candidate in reconciliation.changed:
+                result = observation.result_for(candidate)
+                if result is not None and result.state is ProbeState.READY:
+                    plan = plan.adopt(candidate, result)
+            reconciliation = plan.reconcile(observation.discovered_snapshot)
+            self.source_run_plan = plan
+        except Exception as exc:
+            logger.warning("authoritative directory reconciliation failed: %s", exc)
+            return ()
+
+        for path in reconciliation.removed:
+            key = ("removed", str(path))
+            if key not in self._source_plan_reported:
+                self._source_plan_reported.add(key)
+                logger.warning(
+                    "Skipping source removed after Run started: %s", path)
+        for candidate in reconciliation.owner_flipped:
+            key = ("owner", str(candidate.path))
+            if key not in self._source_plan_reported:
+                self._source_plan_reported.add(key)
+                logger.warning(
+                    "Skipping source whose format owner changed after Run "
+                    "started: %s", candidate.path)
+
+        ready = {
+            item.candidate.path
+            for item in observation.candidates
+            if item.result.state is ProbeState.READY
+        }
+        ordered = (*reconciliation.run_order, *reconciliation.appended)
+        return tuple(
+            candidate.path for candidate in ordered
+            if candidate.path in ready)
+
     def _eiger_pop_next_master(self):
         """Pop the next master, deferring unfinalized NXWriter containers.
 
@@ -3734,6 +3800,15 @@ class imageThread(wranglerThread):
         non-NXWriter files are never deferred
         (``is_unfinalized_nxwriter`` answers False for them).
         """
+        if (getattr(self, "source_run_plan", None) is not None
+                and getattr(self, "source_index_session", None) is not None):
+            eligible = {str(path) for path in self._h19_ready_master_paths()}
+            while self._eiger_master_queue:
+                candidate = self._eiger_master_queue.popleft()
+                if candidate in eligible:
+                    return candidate
+            return None
+
         from xrd_tools.io.bluesky_nexus import is_unfinalized_nxwriter
         while self._eiger_master_queue:
             cand = self._eiger_master_queue.popleft()

@@ -521,6 +521,8 @@ class staticWidget(QWidget):
         # the click-to-count sweep; a stale stamp invalidates the entry.
         self._v2_container_count_memo = {}
         self._v2_count_sweep_active = False
+        self._controls_v2_source_widget = None
+        self._controls_v2_directory_observation = None
         self._sigV2CountLanded.connect(self._on_container_count_landed)
         self._init_data_objects()
         self._init_ui()
@@ -1021,12 +1023,21 @@ class staticWidget(QWidget):
                 pass
             self.controls_v2_preview = preview
             self.controls_v2 = panel
+            from .scan_source_widget import ScanSourceWidget
+            source_widget = ScanSourceWidget(
+                mode="controls_source", parent=panel, async_probe=True)
+            source_widget.sigDirectoryChanged.connect(
+                self._on_controls_v2_directory_observation)
+            self._controls_v2_source_widget = source_widget
+            panel.set_source_widget(source_widget, visible=False)
             self._install_controls_v2_native_int_hooks()
             panel.set_processing_widget(self.ui.integratorFrame, visible=False)
+            self._sync_controls_v2_source_index()
             self._refresh_controls_v2_profile(immediate=True)
         except Exception:
             self.controls_v2_preview = None
             self.controls_v2 = None
+            self._controls_v2_source_widget = None
             logger.debug("Controls Panel V2 preview mount failed",
                          exc_info=True)
 
@@ -2314,7 +2325,42 @@ class staticWidget(QWidget):
             self._controls_v2_source_energy_cache = None
             self._controls_v2_metadata_probe_cache = None
         self._apply_controls_v2_field_value(path, value)
+        self._sync_controls_v2_source_index()
         self._refresh_controls_v2_profile(immediate=True)
+
+    def _on_controls_v2_source_tree_changed(self, _param, changes) -> None:
+        if self._controls_v2_run_active():
+            return
+        try:
+            if not any(change[1] == "value" for change in changes):
+                return
+        except (IndexError, TypeError):
+            pass
+        self._sync_controls_v2_source_index()
+
+    def _connect_controls_v2_source_tree(self) -> None:
+        """Follow the active wrangler's source parameters.
+
+        The Controls V2 panel is built before the wrangler stack, so this must
+        be connected from ``set_wrangler`` rather than panel construction.
+        """
+        previous = getattr(self, "_controls_v2_source_param_signal", None)
+        slot = getattr(self, "_controls_v2_source_tree_slot", None)
+        if previous is not None and slot is not None:
+            try:
+                previous.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+        parameters = getattr(getattr(self, "wrangler", None), "parameters", None)
+        signal = getattr(parameters, "sigTreeStateChanged", None)
+        if signal is None:
+            self._controls_v2_source_param_signal = None
+            return
+        if slot is None:
+            slot = self._on_controls_v2_source_tree_changed
+            self._controls_v2_source_tree_slot = slot
+        signal.connect(slot)
+        self._controls_v2_source_param_signal = signal
 
     def _on_controls_v2_field_browse(self, path) -> None:
         if self._controls_v2_run_active():
@@ -3508,6 +3554,87 @@ class staticWidget(QWidget):
                 return str(candidate)
         return ""
 
+    def _controls_v2_container_index_config(self):
+        """Return the one authoritative container-directory configuration."""
+        if (not self._controls_v2_enabled()
+                or getattr(self, "_controls_v2_source_widget", None) is None):
+            return None
+        source_type = str(
+            self._controls_v2_param_value(("Signal", "inp_type")) or "")
+        ext = str(
+            self._controls_v2_param_value(("Signal", "img_ext")) or ""
+        ).lstrip(".").lower()
+        if source_type != "Image Directory" or ext not in {
+                "h5", "hdf5", "nxs"}:
+            return None
+        root_text = str(
+            self._controls_v2_param_value(("Signal", "img_dir")) or ""
+        ).strip()
+        if not root_text:
+            return None
+        root = Path(root_text).expanduser()
+        recursive = bool(self._controls_v2_param_value(
+            ("Signal", "include_subdir"), False))
+        name_filter = str(self._controls_v2_param_value(
+            ("Signal", "Filter")) or "") or None
+        if ext == "h5":
+            suffixes = ("_master.h5",)
+        elif ext == "hdf5":
+            suffixes = ("_master.hdf5", "_master.h5")
+        else:
+            suffixes = (".nxs",)
+        return root, recursive, name_filter, suffixes
+
+    def _sync_controls_v2_source_index(self) -> None:
+        widget = getattr(self, "_controls_v2_source_widget", None)
+        panel = getattr(self, "controls_v2", None)
+        if widget is None or panel is None:
+            return
+        config = self._controls_v2_container_index_config()
+        panel.set_source_widget(widget, visible=config is not None)
+        if config is None or not config[0].is_dir():
+            widget.clear_directory()
+            self._controls_v2_directory_observation = None
+            return
+        root, recursive, name_filter, suffixes = config
+        widget.configure_directory(
+            root, recursive=recursive, name_filter=name_filter,
+            suffixes=suffixes)
+
+    def _on_controls_v2_directory_observation(self, observation) -> None:
+        self._controls_v2_directory_observation = observation
+        self._v2_frame_count_cache = None
+        self._controls_v2_metadata_probe_cache = None
+        self._controls_v2_source_energy_cache = None
+        self._refresh_controls_v2_profile(immediate=False)
+
+    def _controls_v2_current_directory_observation(self):
+        observation = getattr(
+            self, "_controls_v2_directory_observation", None)
+        widget = getattr(self, "_controls_v2_source_widget", None)
+        session = getattr(widget, "directory_session", None)
+        config = self._controls_v2_container_index_config()
+        if observation is None or session is None or config is None:
+            return None
+        desired = session.configured
+        root, recursive, name_filter, suffixes = config
+        if desired is None or (
+            desired.root != root
+            or desired.recursive != recursive
+            or desired.name_filter != name_filter
+            or desired.suffixes != suffixes
+            or observation.request_generation != session.request_generation
+        ):
+            return None
+        return observation
+
+    def _controls_v2_freeze_source_run_plan(self):
+        observation = self._controls_v2_current_directory_observation()
+        if observation is None:
+            return None
+        from xrd_tools.sources import RunCandidatePlan
+        return RunCandidatePlan.from_snapshot(observation.ready_snapshot)
+
     def _controls_v2_source_frame_count(self) -> int | None:
         """Images the configured raw source will yield; ``None`` for live."""
 
@@ -3573,12 +3700,12 @@ class staticWidget(QWidget):
         if source_type == "Image Directory":
             ext = str(img_ext or "").lstrip(".").lower()
             if ext in {"h5", "hdf5", "nxs"}:
-                from .wranglers.image_wrangler_thread import _name_filter
-                base = Path(str(img_dir or "")).expanduser()
-                if not base.is_dir():
+                observation = self._controls_v2_current_directory_observation()
+                if observation is None:
                     return 0
-                files = self._controls_v2_container_directory_files(
-                    base, ext, include_subdir, _name_filter(file_filter))
+                files = tuple(
+                    candidate.path
+                    for candidate in observation.ready_snapshot.candidates)
                 # Lazy convergence: once EVERY file's frame count is
                 # known (landed by the run as it opened each container,
                 # or by the click-to-count sweep) the chip shows real
@@ -3671,12 +3798,11 @@ class staticWidget(QWidget):
         ext = img_ext.lstrip(".").lower()
         if source_type != "Image Directory" or ext not in {"h5", "hdf5", "nxs"}:
             return
-        base = Path(img_dir or "").expanduser()
-        if not base.is_dir():
+        observation = self._controls_v2_current_directory_observation()
+        if observation is None:
             return
-        from .wranglers.image_wrangler_thread import _name_filter
-        files = self._controls_v2_container_directory_files(
-            base, ext, include_subdir, _name_filter(file_filter))
+        files = tuple(
+            candidate.path for candidate in observation.ready_snapshot.candidates)
         memo = self._v2_container_count_memo
         todo = []
         for path in files:
@@ -4105,6 +4231,12 @@ class staticWidget(QWidget):
             self._controls_v2_param_value(("Signal", "inp_type")) or ""
         )
         if source_type == "Image Directory":
+            current_observation = getattr(
+                self, "_controls_v2_current_directory_observation", None)
+            observation = (
+                current_observation() if callable(current_observation) else None)
+            if observation is not None and observation.ready_snapshot.candidates:
+                return str(observation.ready_snapshot.candidates[0].path)
             wrangler = getattr(self, "wrangler", None)
             img_file = str(getattr(wrangler, "img_file", "") or "")
             if img_file:
@@ -5146,6 +5278,8 @@ class staticWidget(QWidget):
             else None
         )
         self.wrangler.setup()
+        self._connect_controls_v2_source_tree()
+        self._sync_controls_v2_source_index()
         if native_gi_cfg is not None:
             self._controls_v2_apply_gi_config_to_scan(native_gi_cfg)
             self._push_gi_to_wrangler()
@@ -6722,6 +6856,9 @@ class staticWidget(QWidget):
         # Block the analysis slots first: a worker signal queued just before we
         # stop + destroy must not touch the about-to-be-destroyed dialog.
         self._tearing_down = True
+        source_widget = getattr(self, "_controls_v2_source_widget", None)
+        if source_widget is not None:
+            source_widget.shutdown_probe_worker()
         # Persist the integration panel settings (the wrangler tree saves
         # continuously; the integrator panel saves here at exit).
         try:
@@ -8167,6 +8304,23 @@ class staticWidget(QWidget):
         _perf = bool(os.environ.get("XDART_PERF"))
         _t0 = _time.perf_counter() if _perf else 0.0
         self._apply_controls_v2_run_state()
+        self._sync_controls_v2_source_index()
+        source_config = self._controls_v2_container_index_config()
+        source_plan = self._controls_v2_freeze_source_run_plan()
+        if source_config is not None and not source_plan:
+            logger.warning(
+                "Run deferred: the authoritative Source-card directory "
+                "snapshot has no ready containers yet")
+            source_widget = getattr(self, "_controls_v2_source_widget", None)
+            if source_widget is not None:
+                source_widget.directory_status.setText(
+                    "Waiting for ready containers; press Run again")
+                source_widget.request_directory_poll()
+            return
+        self.wrangler.source_run_plan = source_plan
+        self.wrangler.source_index_session = (
+            getattr(self._controls_v2_source_widget, "directory_session", None)
+            if source_plan is not None else None)
         _t1 = _time.perf_counter() if _perf else 0.0
         self.wrangler.enabled(False)
         self.wrangler.setup()

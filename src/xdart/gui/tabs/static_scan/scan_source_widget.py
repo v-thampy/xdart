@@ -109,10 +109,15 @@ class ScanSourceWidget(QtWidgets.QWidget):
     sigSourceChanged = QtCore.Signal(object)
     #: internal thread-safe completion channel for async source probes.
     sigProbeDone = QtCore.Signal(object)
+    #: internal completion channel for persistent directory observations.
+    sigDirectoryDone = QtCore.Signal(object)
+    #: emitted with the latest accepted, immutable DirectoryObservation.
+    sigDirectoryChanged = QtCore.Signal(object)
 
     def __init__(self, mode="roi", parent=None, *, async_probe=False):
         super().__init__(parent)
         self._mode = mode
+        self._controls_source = mode == "controls_source"
         self._allow_grouping = mode in ("stitch", "rsm")
         self._async_probe = bool(async_probe)
         self._probe_generation = 0
@@ -122,6 +127,12 @@ class ScanSourceWidget(QtWidgets.QWidget):
         self._last_sig = None          # signature of the last-opened spec (dedupe)
         self._last_selection = None
         self.sigProbeDone.connect(self._on_probe_done)
+        self.sigDirectoryDone.connect(self._on_directory_done)
+        self._directory_session = None
+        self._directory_observation = None
+        self._directory_signature = None
+        self._directory_future = None
+        self._directory_timer = None
         self._build_ui()
 
     # ---- UI -------------------------------------------------------------
@@ -129,6 +140,23 @@ class ScanSourceWidget(QtWidgets.QWidget):
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(5)
+
+        if self._controls_source:
+            from xrd_tools.sources import DirectoryIndexSession
+
+            self._directory_session = DirectoryIndexSession()
+            self.directory_status = QtWidgets.QLabel("No directory index")
+            self.directory_status.setObjectName("controlsV2DirectoryStatus")
+            self.directory_status.setWordWrap(True)
+            self.directory_status.setToolTip(
+                "Persistent headless directory index used by both this Source "
+                "card and the next Run.")
+            lay.addWidget(self.directory_status)
+            self._directory_timer = QtCore.QTimer(self)
+            self._directory_timer.setInterval(1000)
+            self._directory_timer.timeout.connect(self.request_directory_poll)
+            self._directory_timer.start()
+            return
 
         # Row 1: entry mode + path + (kind label | scan-kind combo) + Choose.
         row1 = QtWidgets.QHBoxLayout()
@@ -698,15 +726,118 @@ class ScanSourceWidget(QtWidgets.QWidget):
         self._cancel_pending_probe()
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
+        timer = self._directory_timer
+        if timer is not None:
+            timer.stop()
+        session = self._directory_session
+        self._directory_session = None
+        if session is not None:
+            session.close()
 
     def closeEvent(self, event):
         self.shutdown_probe_worker()
         super().closeEvent(event)
 
+    # ---- persistent Controls-V2 directory index -----------------------
+    @property
+    def directory_session(self):
+        return self._directory_session
+
+    @property
+    def directory_observation(self):
+        return self._directory_observation
+
+    def configure_directory(
+        self, root, *, recursive=False, name_filter=None, suffixes=(),
+    ):
+        if not self._controls_source or self._directory_session is None:
+            raise RuntimeError("widget is not in controls_source mode")
+        generation = self._directory_session.configure(
+            root, recursive=recursive, name_filter=name_filter,
+            suffixes=suffixes)
+        self.request_directory_poll()
+        return generation
+
+    def clear_directory(self):
+        if self._directory_session is None:
+            return
+        self._directory_session.clear()
+        self._directory_observation = None
+        self._directory_signature = None
+        self.directory_status.setText("No container-directory source")
+        self.sigDirectoryChanged.emit(None)
+
+    def request_directory_poll(self):
+        session = self._directory_session
+        if session is None or session.configured is None:
+            return
+        future = self._directory_future
+        if future is not None and not future.done():
+            return
+        self.directory_status.setText("Checking directory…")
+        future = session.observe_async()
+        self._directory_future = future
+
+        def _emit_done(done):
+            try:
+                result = done.result()
+            except CancelledError:
+                return
+            except Exception as exc:
+                result = exc
+            try:
+                self.sigDirectoryDone.emit(result)
+            except RuntimeError:
+                return
+
+        future.add_done_callback(_emit_done)
+
+    def _on_directory_done(self, result):
+        self._directory_future = None
+        if isinstance(result, Exception):
+            logger.warning("source-card directory observation failed: %s", result)
+            self.directory_status.setText("Directory temporarily unavailable")
+            return
+        session = self._directory_session
+        if session is None:
+            return
+        if result.request_generation != session.request_generation:
+            # Configuration changed while the serialized owner was polling.
+            # Do not wait for the periodic timer; immediately observe the
+            # latest requested root/filter generation.
+            self.request_directory_poll()
+            return
+        signature = (
+            result.request_generation,
+            result.discovered_snapshot.generation,
+            tuple(
+                (str(item.candidate.path), item.candidate.version_stamp,
+                 item.candidate.adapter_id, item.result.state.value)
+                for item in result.candidates
+            ),
+        )
+        changed = signature != self._directory_signature
+        self._directory_signature = signature
+        self._directory_observation = result
+        ready = len(result.ready_snapshot.candidates)
+        pending = result.pending_count
+        excluded = result.excluded_count
+        parts = [f"{ready} ready"]
+        if pending:
+            parts.append(f"{pending} pending")
+        if excluded:
+            parts.append(f"{excluded} excluded")
+        self.directory_status.setText(" · ".join(parts))
+        if changed:
+            self.sigDirectoryChanged.emit(result)
+
     # ---- public API for consumers --------------------------------------
     def set_uri(self, uri):
         """Programmatically load a file path (e.g. the dialog's default scan)."""
         if not uri:
+            return
+        if self._controls_source:
+            self.configure_directory(uri)
             return
         self.dir_check.setChecked(False)
         self.path_edit.setText(str(uri))
