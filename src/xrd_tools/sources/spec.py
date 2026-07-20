@@ -58,7 +58,11 @@ class SpecSource(BaseFrameSource):
                  name: str | None = None, image_dir: str | Path | None = None,
                  image_stem: str | None = None,
                  read_image_kwargs: Mapping[str, Any] | None = None) -> None:
-        from xrd_tools.io.spec import list_spec_scans, read_spec_scan_table
+        from xrd_tools.io.spec import (
+            get_spec_scanned_axes,
+            list_spec_scans,
+            read_spec_scan_table,
+        )
 
         self.path = Path(path)
         self.available_scans = list_spec_scans(self.path)
@@ -71,6 +75,10 @@ class SpecSource(BaseFrameSource):
             columns, motors, npts = read_spec_scan_table(self.path, self.scan_key)
         self._columns = columns
         self._motors = motors
+        self._scanned_axes = (
+            get_spec_scanned_axes(self.path, self.scan_key)
+            if self.scan_key is not None else ()
+        )
 
         # Optional raw images — located once by stem in image_dir.  The matched
         # files may be one-file-per-frame (raw / tiff / edf / cbf) OR a single
@@ -146,6 +154,15 @@ class SpecSource(BaseFrameSource):
     def motors(self) -> dict[str, np.ndarray]:
         """The per-point ``#L`` columns as whole arrays (one value per frame)."""
         return dict(self._columns)
+
+    @property
+    def scanned_axes(self) -> tuple[str, ...]:
+        """Per-point axes declared by ``#S``, in command order.
+
+        Unlike :attr:`motors`, this excludes counters and is therefore the
+        authoritative default-axis hint for plotting, stitching, and RSM.
+        """
+        return self._scanned_axes
 
     def metadata_for(self, index: int) -> Mapping[str, Any]:
         i = int(index)

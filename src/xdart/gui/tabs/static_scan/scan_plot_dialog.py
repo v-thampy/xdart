@@ -325,9 +325,11 @@ class ScanPlotDialog(QtWidgets.QDialog):
     def _positioners_for(self, selection, source=None):
         """Scanned-motor names for the X default.  For a processed NeXus these
         are the recorded NXpositioner motors (``get_metadata`` — intentionally
-        narrow to the diffractometer/scanned motors); for other sources they are
-        the source's own ``motors`` keys.  Best-effort: a read failure yields no
-        hint (X then falls back to ``frame_index``)."""
+        narrow to the diffractometer/scanned motors); a SPEC source exposes the
+        axes declared by its ``#S`` command separately from its counter-bearing
+        ``#L`` table.  Other sources retain their own ``motors`` keys.
+        Best-effort: a read failure yields no hint (X then falls back to
+        ``frame_index``)."""
         from xrd_tools.core.scan import SourceKind
         spec = selection.spec
         if spec is not None and spec.kind is SourceKind.PROCESSED_NEXUS:
@@ -339,6 +341,9 @@ class ScanPlotDialog(QtWidgets.QDialog):
             except Exception:
                 logger.exception("scan-plot: reading positioners failed")
                 return []
+        scanned_axes = getattr(source, "scanned_axes", None)
+        if scanned_axes is not None:
+            return [str(name) for name in scanned_axes]
         motors = getattr(source, "motors", None) or {}
         return [str(k) for k in motors]
 
@@ -421,9 +426,9 @@ class ScanPlotDialog(QtWidgets.QDialog):
         return x, y
 
     def _scanned_positioner(self, cols):
-        """The X default: among the file's positioners present as plottable
-        columns, the one that varies the most (a constant positioner wasn't the
-        scan axis).  ``None`` when none are present or vary."""
+        """The X default: among the declared positioners present as plottable
+        columns, the one that varies the most (a constant positioner was not an
+        active scan axis).  ``None`` when none are present or vary."""
         best, spread = None, 0.0
         for name in self._positioner_names:
             if name not in cols:

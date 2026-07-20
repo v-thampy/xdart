@@ -20,6 +20,7 @@ from xrd_tools.io.image import (
 from xrd_tools.io.spec import (
     get_scan_path_info,
     get_energy_and_UB,
+    get_spec_scanned_axes,
     get_spec_scan_type,
     get_from_spec_file,
     get_angles,

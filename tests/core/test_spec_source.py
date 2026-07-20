@@ -6,7 +6,7 @@ import pytest
 
 pytest.importorskip("silx")
 
-from xrd_tools.io.spec import is_spec_file
+from xrd_tools.io.spec import get_spec_scanned_axes, is_spec_file
 from xrd_tools.sources import (SourceKind, SpecSource, guess_source_kind,
                                open_source)
 
@@ -63,6 +63,44 @@ def test_spec_records_all_motors_and_columns(tmp_path):
     md = dict(src.metadata_for(1))
     assert md["th"] == 1.0 and md["i0"] == 110.0          # per-point
     assert md["chi"] == 5.0 and md["phi"] == 10.0          # constant, non-scanned
+
+
+def test_spec_exposes_declared_scanned_axes_not_counter_columns(tmp_path):
+    src = open_source(_spec(tmp_path), scan=5)
+    assert src.scanned_axes == ("th",)
+    assert "i0" in src.motors
+    assert "i0" not in src.scanned_axes
+
+
+def test_get_spec_scanned_axes_parses_common_commands(tmp_path):
+    p = tmp_path / "axis_commands"
+    p.write_text("""#F axis_commands
+#E 1
+
+#S 1 mesh eta 0 1 1 chi 2 4 1 0.1
+#N 3
+#L eta  chi  det
+0 2 100
+1 2 110
+0 4 120
+1 4 130
+
+#S 2 hklscan 1 1 -1 -1 2.9 3.1 2 0.1
+#N 4
+#L H  K  L  det
+1 -1 2.9 10
+1 -1 3.0 11
+1 -1 3.1 12
+
+#S 3 loopscan 2 0.1
+#N 2
+#L Epoch  det
+1 10
+2 11
+""")
+    assert get_spec_scanned_axes(p, "1.1") == ("eta", "chi")
+    assert get_spec_scanned_axes(p, "2.1") == ("L",)
+    assert get_spec_scanned_axes(p, "3.1") == ()
 
 
 def test_spec_metadata_only_disables_raw(tmp_path):

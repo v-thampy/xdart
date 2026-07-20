@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 import numpy as np
@@ -110,6 +111,61 @@ def get_spec_scan_type(spec_file: Path | str, scan_num: str) -> str | list[str]:
         x_col = [x for x, r in zip(("H", "K", "L"), hkl_ranges != 0) if r]
 
     return x_col
+
+
+def get_spec_scanned_axes(
+    spec_file: Path | str,
+    scan_num: str,
+) -> tuple[str, ...]:
+    """Return the per-point axes declared by a SPEC scan command.
+
+    This is deliberately narrower than the scan's ``#L`` columns: those also
+    contain counters, timers, and detector signals and therefore cannot be
+    used to infer the default X axis by numeric spread.  Axis order follows the
+    command, which matters for multi-axis scans.  Unknown/non-positional scan
+    commands return an empty tuple so callers can explicitly fall back to
+    frame index.
+    """
+    scan_data = _get_spec_scan(spec_file, scan_num)
+    tokens = scan_data.scan_header_dict.get("S", "").split()
+    if len(tokens) < 2:
+        return ()
+
+    command = tokens[1].lower()
+    candidates: list[str] = []
+
+    # ascan/dscan and their multi-motor forms (a2scan, d3scan, ...):
+    # each motor contributes ``name start stop`` before the shared tail.
+    match = re.fullmatch(r"[ad](\d*)scan", command)
+    if match:
+        count = int(match.group(1) or "1")
+        candidates = [
+            tokens[2 + 3 * i]
+            for i in range(count)
+            if 2 + 3 * i < len(tokens)
+        ]
+    elif command in {"mesh", "dmesh"}:
+        # mesh m1 start stop intervals1 m2 start stop intervals2 time
+        candidates = [tokens[i] for i in (2, 6) if i < len(tokens)]
+    elif command == "hklscan" and len(tokens) >= 8:
+        ranges = (
+            float(tokens[3]) - float(tokens[2]),
+            float(tokens[5]) - float(tokens[4]),
+            float(tokens[7]) - float(tokens[6]),
+        )
+        candidates = [
+            axis for axis, span in zip(("H", "K", "L"), ranges) if span != 0
+        ]
+
+    # Preserve the spelling used by #L and reject command arguments that are
+    # not actual per-point columns in this scan.
+    labels = {str(label).casefold(): str(label) for label in scan_data.labels}
+    out: list[str] = []
+    for candidate in candidates:
+        label = labels.get(str(candidate).casefold())
+        if label is not None and label not in out:
+            out.append(label)
+    return tuple(out)
 
 
 def get_from_spec_file(

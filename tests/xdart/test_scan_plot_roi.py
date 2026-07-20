@@ -795,6 +795,38 @@ def test_scan_plot_default_x_positioner_else_frame_index(qapp):
         dlg2.close()
 
 
+def test_scan_plot_spec_default_x_is_declared_motor_not_largest_counter(
+        qapp, tmp_path):
+    """A SPEC #L table contains counters as well as motors; a large counter
+    range must not become the default X axis merely because it varies most."""
+    pytest.importorskip("silx")
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSelection
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+
+    spec_file = tmp_path / "scan"
+    spec_file.write_text("""#F scan
+#E 1
+#S 1 ascan cry 0 0.2 2 0.1
+#N 3
+#L cry  Photod  pd10
+0.0 10 100000
+0.1 11 900000
+0.2 12 2100000
+""")
+    selection = ScanSelection(
+        spec=SourceSpec(spec_file, SourceKind.SPEC, options={"scan": "1.1"}),
+        label="scan [1.1]", reachable=False, first_image=None)
+    dlg = ScanPlotDialog()
+    try:
+        dlg._on_source_selected(selection)
+        assert dlg._positioner_names == ["cry"]
+        assert dlg.x_combo.currentText() == "cry"
+        assert dlg._checked_y() == ["Photod"]
+    finally:
+        dlg.close()
+
+
 def test_scan_plot_log_button_drives_left_axis(qapp):
     """10.5: Log toggles the LEFT axis only and survives a redraw; the RIGHT axis
     stays linear so its ticks match its (untransformed) curves."""
