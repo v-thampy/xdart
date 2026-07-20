@@ -40,6 +40,16 @@ def _point_at(widget, d):
     sig.child("img_ext").setValue("nxs")
 
 
+def _wait_until(qapp, predicate, timeout=15.0):
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        qapp.processEvents()
+        if predicate():
+            return True
+        _time.sleep(0.01)
+    return False
+
+
 def test_lazy_convergence_files_to_frames(qapp, monkeypatch, tmp_path):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -49,7 +59,8 @@ def test_lazy_convergence_files_to_frames(qapp, monkeypatch, tmp_path):
     widget = staticWidget()
     try:
         _point_at(widget, d)
-        assert widget._controls_v2_source_frame_count() == 3
+        assert _wait_until(
+            qapp, lambda: widget._controls_v2_source_frame_count() == 3)
         assert widget._v2_source_count_is_files is True
 
         # Counts land (as the run's sigContainerCount would deliver them).
@@ -62,7 +73,12 @@ def test_lazy_convergence_files_to_frames(qapp, monkeypatch, tmp_path):
         # the file count until the new count lands.
         _write_bluesky_nxwriter(d / "scan_00001.nxs", n=5)
         widget._v2_frame_count_cache = None
-        assert widget._controls_v2_source_frame_count() == 3
+        widget._controls_v2_source_widget.request_directory_poll()
+        assert _wait_until(
+            qapp,
+            lambda: widget._controls_v2_source_frame_count() == 3
+            and widget._v2_source_count_is_files is True,
+        )
         assert widget._v2_source_count_is_files is True
         widget._on_container_count_landed(str(d / "scan_00001.nxs"), 5)
         assert widget._controls_v2_source_frame_count() == 9
@@ -116,7 +132,8 @@ def test_click_to_count_sweeps_off_gui_and_converges(qapp, monkeypatch, tmp_path
     try:
         gui_ident = _threading.get_ident()
         _point_at(widget, d)
-        assert widget._controls_v2_source_frame_count() == 4  # files-mode
+        assert _wait_until(
+            qapp, lambda: widget._controls_v2_source_frame_count() == 4)
 
         # The click (files-mode) kicks the on-demand sweep...
         widget._on_readiness_summary_clicked()
@@ -153,6 +170,8 @@ def test_files_mode_tooltip_hint_and_source_header_unit(qapp, monkeypatch, tmp_p
     widget = staticWidget()
     try:
         _point_at(widget, d)
+        assert _wait_until(
+            qapp, lambda: widget._controls_v2_source_frame_count() == 2)
         widget._refresh_controls_v2_profile(immediate=True)
         # Click affordance: the tooltip advertises the on-demand count.
         tip = widget.controls.readinessLabel.toolTip()
