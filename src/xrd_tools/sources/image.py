@@ -26,6 +26,8 @@ class ImageFileSource(BaseFrameSource):
         *,
         detector_shape: tuple[int, int] | None = None,
         detector: str | tuple[int, int] | None = None,
+        raw_dtype: str = "int32",
+        raw_header_skip: int = 0,
         metadata_format: str | None = None,
         meta_dir: str | Path | None = None,
         frame_indices: Sequence[int] | None = None,
@@ -33,13 +35,21 @@ class ImageFileSource(BaseFrameSource):
         self.path = Path(path)
         self.detector_shape = detector_shape
         self.detector = detector
+        self.raw_dtype = str(raw_dtype)
+        self.raw_header_skip = int(raw_header_skip)
         self.metadata_format = metadata_format
         self.meta_dir = meta_dir
         if frame_indices is None:
-            try:
-                n = int(count_frames(self.path))
-            except Exception:
+            if self.path.suffix.lower() == ".raw":
+                # Beamline RAW files are one frame per file.  Asking fabio for a
+                # frame count cannot succeed without the operator-supplied
+                # shape and produces a misleading warning before the real read.
                 n = 1
+            else:
+                try:
+                    n = int(count_frames(self.path))
+                except Exception:
+                    n = 1
             frame_indices = range(max(n, 1))
         super().__init__(
             name=self.path.stem,
@@ -63,6 +73,8 @@ class ImageFileSource(BaseFrameSource):
                 frame=int(index),
                 detector_shape=self.detector_shape,
                 detector=self.detector,
+                raw_dtype=self.raw_dtype,
+                raw_header_skip=self.raw_header_skip,
             )
         )
 
@@ -95,10 +107,18 @@ class TiffSeriesSource(BaseFrameSource):
         name: str | None = None,
         metadata_format: str | None = "txt",
         meta_dir: str | Path | None = None,
+        detector_shape: tuple[int, int] | None = None,
+        detector: str | tuple[int, int] | None = None,
+        raw_dtype: str = "int32",
+        raw_header_skip: int = 0,
     ) -> None:
         self.files = [Path(p) for p in files]
         self.metadata_format = metadata_format
         self.meta_dir = meta_dir
+        self.detector_shape = detector_shape
+        self.detector = detector
+        self.raw_dtype = str(raw_dtype)
+        self.raw_header_skip = int(raw_header_skip)
         self._path_by_index = {
             int(index): path
             for index, path in zip(range(1, len(self.files) + 1), self.files)
@@ -126,12 +146,24 @@ class TiffSeriesSource(BaseFrameSource):
         pattern: str = "*.tif*",
         metadata_format: str | None = "txt",
         meta_dir: str | Path | None = None,
+        detector_shape: tuple[int, int] | None = None,
+        detector: str | tuple[int, int] | None = None,
+        raw_dtype: str = "int32",
+        raw_header_skip: int = 0,
     ) -> "TiffSeriesSource":
         files = [
             path for path in find_image_files(directory)
             if fnmatch.fnmatch(path.name, pattern)
         ]
-        return cls(files, metadata_format=metadata_format, meta_dir=meta_dir)
+        return cls(
+            files,
+            metadata_format=metadata_format,
+            meta_dir=meta_dir,
+            detector_shape=detector_shape,
+            detector=detector,
+            raw_dtype=raw_dtype,
+            raw_header_skip=raw_header_skip,
+        )
 
     def _path_for(self, index: int) -> Path:
         try:
@@ -140,7 +172,16 @@ class TiffSeriesSource(BaseFrameSource):
             raise IndexError(f"frame {index} is not in TIFF series {self.name!r}") from exc
 
     def load_frame(self, index: int) -> np.ndarray:
-        return np.asarray(read_image(self._path_for(index)))
+        return self._read_path(self._path_for(index))
+
+    def _read_path(self, path: str | Path) -> np.ndarray:
+        return np.asarray(read_image(
+            path,
+            detector_shape=self.detector_shape,
+            detector=self.detector,
+            raw_dtype=self.raw_dtype,
+            raw_header_skip=self.raw_header_skip,
+        ))
 
     def metadata_for(self, index: int) -> Mapping[str, Any]:
         if self.metadata_format is None:
@@ -155,7 +196,7 @@ class TiffSeriesSource(BaseFrameSource):
             metadata=dict(self.metadata_for(index)),
             source_path=path,
             source_frame_index=0,
-            loader=lambda frame: read_image(frame.source_path),
+            loader=lambda frame: self._read_path(frame.source_path),
             source_identity=str(path),
         )
 

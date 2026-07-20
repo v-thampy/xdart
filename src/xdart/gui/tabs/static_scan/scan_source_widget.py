@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 _DIR_KINDS = [("SPEC", "spec"), ("TIFF / RAW series", "tiff_series"),
               ("NeXus (raw stack)", "nexus_stack"),
               ("Processed NeXus", "processed_nexus"), ("Eiger", "eiger_master")]
-_TIFF_SUFFIXES = {".tif", ".tiff"}
+_SERIES_SUFFIXES = {".tif", ".tiff", ".raw"}
 _RAW_DTYPES = ["int32", "uint32", "int16", "uint16", "float32", "float64"]
 
 
@@ -184,16 +184,20 @@ class ScanSourceWidget(QtWidgets.QWidget):
         row3.addWidget(self.image_dir_edit, 1)
         self.image_dir_btn = QtWidgets.QPushButton("Folder…")
         row3.addWidget(self.image_dir_btn)
-        row3.addWidget(QtWidgets.QLabel("Root"))
+        self.image_stem_label = QtWidgets.QLabel("Filename contains")
+        row3.addWidget(self.image_stem_label)
         self.image_stem_edit = QtWidgets.QLineEdit()
         self.image_stem_edit.setMaximumWidth(140)
         self.image_stem_edit.setPlaceholderText("auto")
         self.image_stem_edit.setToolTip(
-            "Filename substring selecting this scan's images (default "
-            "{spec}_scan{N}_)")
+            "Optional filename substring. Leave blank for automatic matching "
+            "from the SPEC file name and scan number.")
         row3.addWidget(self.image_stem_edit)
-        self.raw_dot = QtWidgets.QLabel("○ no raw")
-        self.raw_dot.setToolTip("Whether raw frames are reachable (gates ROI)")
+        self.raw_dot = QtWidgets.QLabel("○ raw unavailable")
+        self._raw_status_tooltip = (
+            "Whether the selected scan's first detector frame can be read. "
+            "ROI plotting is enabled only when this says raw ready.")
+        self.raw_dot.setToolTip(self._raw_status_tooltip)
         row3.addWidget(self.raw_dot)
         # Raw-params toggle shares the images row (its params expand below).
         self.adv_btn = QtWidgets.QPushButton("Raw params ▾")
@@ -274,7 +278,7 @@ class ScanSourceWidget(QtWidgets.QWidget):
             # All files first/default — SPEC scan files are extensionless.
             path, _ = QtWidgets.QFileDialog.getOpenFileName(
                 self, "Choose a scan", start,
-                "All files (*);;Scans (*.nxs *.h5 *.hdf5 *.cxi *.tif *.tiff)")
+                "All files (*);;Scans (*.nxs *.h5 *.hdf5 *.cxi *.tif *.tiff *.raw)")
         if path:
             remember_browse_path(path)
             self.path_edit.setText(path)
@@ -325,14 +329,16 @@ class ScanSourceWidget(QtWidgets.QWidget):
             return [SourceSpec(path, SourceKind.SPEC, options={"scan": s})
                     for s in scans] or [SourceSpec(path, SourceKind.SPEC)]
         if (kind is SourceKind.IMAGE_FILE
-                and Path(path).suffix.lower() in _TIFF_SUFFIXES):
-            # A picked TIFF means THIS scan's series (sidecars → metadata), not
+                and Path(path).suffix.lower() in _SERIES_SUFFIXES):
+            # A picked TIFF/RAW means THIS scan's series (sidecars → metadata), not
             # the whole folder — which may hold several scans.  Filter the folder
             # glob to the picked file's scan stem = its name minus a trailing
             # _<frame number>; with no such suffix, fall back to the whole folder.
             p = Path(path)
             m = re.match(r"(.*?_)\d+$", p.stem)
             options = {"pattern": f"{m.group(1)}*"} if m else {}
+            if p.suffix.lower() == ".raw":
+                options["metadata_format"] = "auto"
             return [SourceSpec(p.parent, SourceKind.TIFF_SERIES, options=options)]
         if kind in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER,
                     SourceKind.PROCESSED_NEXUS):
@@ -379,13 +385,80 @@ class ScanSourceWidget(QtWidgets.QWidget):
         kind = spec.kind if spec is not None else None
         is_spec = kind is SourceKind.SPEC
         is_proc = kind is SourceKind.PROCESSED_NEXUS
-        self.images_label.setText("Repoint raw" if is_proc else "Images")
+        show_pairing = is_spec or is_proc
+        self.images_label.setText(
+            "Raw data root" if is_proc else "Raw image folder")
         self.image_dir_edit.setPlaceholderText(
             "(raw tree root, if the data moved)" if is_proc
-            else "(image folder — blank = auto / metadata only)")
-        self.image_dir_edit.setEnabled(is_spec or is_proc)
-        self.image_dir_btn.setEnabled(is_spec or is_proc)
-        self.image_stem_edit.setEnabled(is_spec)        # filename root: SPEC only
+            else "(blank = automatic matching next to the SPEC file)")
+        for widget in (self.images_label, self.image_dir_edit, self.image_dir_btn):
+            widget.setVisible(show_pairing)
+        self.image_stem_label.setVisible(is_spec)
+        self.image_stem_edit.setVisible(is_spec)
+        self.image_dir_edit.setEnabled(show_pairing)
+        self.image_dir_btn.setEnabled(show_pairing)
+        self.image_stem_edit.setEnabled(is_spec)
+        if self._selected_is_binary_raw() and not self.adv_btn.isChecked():
+            self.adv_btn.setChecked(True)
+
+    def _selected_is_binary_raw(self):
+        """Whether the current direct image selection is a headerless RAW file."""
+        if Path(self.path_edit.text().strip()).suffix.lower() == ".raw":
+            return True
+        spec = self._current_candidate()
+        options = dict(getattr(spec, "options", {}) or {}) if spec else {}
+        return str(options.get("pattern", "")).lower().endswith(".raw")
+
+    def _raw_unavailable_hint(self):
+        """Return an operator-facing reason why the raw probe cannot run."""
+        from xrd_tools.core.scan import SourceKind
+
+        if (self._selected_is_binary_raw()
+                and "detector_shape" not in self._read_image_kwargs()):
+            return (
+                "○ enter RAW shape",
+                "Open Raw params and enter detector rows, columns, and dtype. "
+                "These values are required to decode headerless RAW frames.",
+            )
+
+        spec = self._current_candidate()
+        if spec is None or spec.kind is not SourceKind.SPEC:
+            return None
+        options = dict(getattr(spec, "options", {}) or {})
+        scan = options.get("scan")
+        if not scan:
+            return None
+        directory_text = self.image_dir_edit.text().strip()
+        directory = (Path(directory_text) if directory_text
+                     else Path(str(spec.uri)).parent)
+        stem = self.image_stem_edit.text().strip()
+        if not stem:
+            scan_number = str(scan).split(".")[0]
+            stem = f"{Path(str(spec.uri)).stem}_scan{scan_number}_"
+        if not directory.is_dir():
+            return (
+                "○ image folder missing",
+                f"Raw image folder does not exist: {directory}",
+            )
+        try:
+            from xrd_tools.io.image import find_image_files
+            files = find_image_files(directory, stem=stem)
+        except Exception:
+            return None
+        if not files:
+            return (
+                "○ no matching images",
+                f"No detector files containing {stem!r} were found in "
+                f"{directory} for the selected SPEC scan.",
+            )
+        if (any(path.suffix.lower() == ".raw" for path in files)
+                and "detector_shape" not in self._read_image_kwargs()):
+            return (
+                "○ enter RAW shape",
+                "Matching headerless RAW frames were found. Open Raw params "
+                "and enter detector rows, columns, and dtype to decode them.",
+            )
+        return None
 
     def _current_candidate(self):
         i = self.scan_combo.currentIndex()
@@ -438,6 +511,8 @@ class ScanSourceWidget(QtWidgets.QWidget):
             root = self.image_dir_edit.text().strip()
             if root:
                 options["source_root"] = root       # repoint a moved raw tree
+        elif spec.kind in (SourceKind.IMAGE_FILE, SourceKind.TIFF_SERIES):
+            options.update(self._read_image_kwargs())
         return SourceSpec(spec.uri, spec.kind, entry=getattr(spec, "entry", None),
                           options=options)
 
@@ -589,7 +664,14 @@ class ScanSourceWidget(QtWidgets.QWidget):
         self._pending_sig = None
 
     def _set_dot(self, reachable, *, text=None):
-        self.raw_dot.setText(text or ("● raw" if reachable else "○ no raw"))
+        hint = self._raw_unavailable_hint() if text is None and not reachable else None
+        if hint is not None:
+            text, tooltip = hint
+            self.raw_dot.setToolTip(tooltip)
+        else:
+            self.raw_dot.setToolTip(self._raw_status_tooltip)
+        self.raw_dot.setText(
+            text or ("● raw ready" if reachable else "○ raw unavailable"))
         self.raw_dot.setStyleSheet(
             "color: #50fa7b;" if reachable else "color: #888;")
 

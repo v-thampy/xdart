@@ -68,6 +68,26 @@ def test_image_file_source_uses_existing_reader(tmp_path):
     assert isinstance(open_source(path), ImageFileSource)
 
 
+def test_image_file_source_reads_headerless_raw_without_frame_count_warning(
+        tmp_path, caplog):
+    from xrd_tools.sources import ImageFileSource
+
+    path = tmp_path / "scan_0000.raw"
+    image = np.arange(3 * 4, dtype=np.uint16).reshape(3, 4)
+    image.tofile(path)
+
+    source = ImageFileSource(
+        path,
+        detector_shape=(3, 4),
+        raw_dtype="uint16",
+        raw_header_skip=0,
+    )
+
+    assert source.frame_indices == [0]
+    np.testing.assert_array_equal(source.load_frame(0), image)
+    assert "Could not determine frame count" not in caplog.text
+
+
 def test_tiff_series_from_directory_uses_natural_order_and_pattern(tmp_path):
     from xrd_tools.sources import TiffSeriesSource
 
@@ -91,6 +111,33 @@ def test_tiff_series_from_directory_uses_natural_order_and_pattern(tmp_path):
         "scan_10.tif",
     ]
     assert source.frame_indices == [1, 2, 3, 4]
+
+
+def test_raw_series_from_directory_threads_binary_read_parameters(tmp_path):
+    from xrd_tools.sources import TiffSeriesSource
+
+    for index in (1, 10, 2):
+        np.full((3, 4), index, dtype=np.uint16).tofile(
+            tmp_path / f"scan_{index:04d}.raw")
+
+    source = TiffSeriesSource.from_directory(
+        tmp_path,
+        pattern="scan_*.raw",
+        metadata_format=None,
+        detector_shape=(3, 4),
+        raw_dtype="uint16",
+        raw_header_skip=0,
+    )
+
+    assert [path.name for path in source.files] == [
+        "scan_0001.raw",
+        "scan_0002.raw",
+        "scan_0010.raw",
+    ]
+    assert source.frame_indices == [1, 2, 3]
+    np.testing.assert_array_equal(source.load_frame(2), np.full((3, 4), 2))
+    np.testing.assert_array_equal(
+        source.frame_for(3).load_image(), np.full((3, 4), 10))
 
 
 def test_processed_nexus_source_reads_frame_views(tmp_path):

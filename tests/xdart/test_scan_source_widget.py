@@ -266,6 +266,86 @@ def test_file_candidates_tiff_filters_to_scan_stem(qapp, tmp_path):
     assert dict(spec.options).get("pattern") == "scanA_*"   # scan A only, not B
 
 
+def test_widget_numbered_raw_file_resolves_series_and_enables_roi(qapp, tmp_path):
+    """Picking one numbered RAW frame represents its whole scan series, and
+    the widget's binary-read parameters reach the source used by the ROI gate."""
+    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xrd_tools.core.scan import SourceKind
+
+    for index in (0, 1, 2):
+        np.full((3, 4), index + 1, dtype=np.uint16).tofile(
+            tmp_path / f"scanA_{index:04d}.raw")
+    np.full((3, 4), 99, dtype=np.uint16).tofile(
+        tmp_path / "scanB_0000.raw")
+
+    w = ScanSourceWidget(mode="roi")
+    emitted = []
+    w.sigSourceChanged.connect(lambda sel: emitted.append(sel))
+    try:
+        w.set_uri(str(tmp_path / "scanA_0001.raw"))
+        assert w._current_candidate().kind is SourceKind.TIFF_SERIES
+        assert dict(w._current_candidate().options)["pattern"] == "scanA_*"
+        assert w.adv_btn.isChecked()
+        assert "enter raw shape" in w.raw_dot.text().lower()
+
+        w.det_rows.setText("3")
+        w.det_cols.setText("4")
+        w.dtype_combo.setCurrentText("uint16")
+        w._emit_selection()
+
+        selection = emitted[-1]
+        assert selection is not None and selection.reachable
+        assert "raw ready" in w.raw_dot.text()
+        source = _open(selection)
+        assert source.frame_indices == [1, 2, 3]
+        np.testing.assert_array_equal(source.load_frame(1), np.ones((3, 4)))
+        np.testing.assert_array_equal(source.load_frame(3), np.full((3, 4), 3))
+        assert w.image_dir_edit.isHidden()
+        assert w.image_stem_edit.isHidden()
+    finally:
+        w.deleteLater()
+
+
+def test_widget_spec_raw_controls_use_operator_facing_labels(qapp, tmp_path):
+    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+
+    spec = _spec_with_images(tmp_path)
+    w = ScanSourceWidget(mode="roi")
+    try:
+        w.set_uri(str(spec))
+        assert not w.image_dir_edit.isHidden()
+        assert not w.image_stem_edit.isHidden()
+        assert w.images_label.text() == "Raw image folder"
+        assert w.image_stem_label.text() == "Filename contains"
+        assert "automatic" in w.image_stem_edit.toolTip().lower()
+    finally:
+        w.deleteLater()
+
+
+def test_widget_spec_raw_status_explains_shape_and_scan_match(qapp, tmp_path):
+    """A disabled ROI gate tells the operator which SPEC/raw precondition is
+    missing instead of collapsing every failure to ``raw unavailable``."""
+    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+
+    spec = _spec_with_images(tmp_path)
+    w = ScanSourceWidget(mode="roi")
+    try:
+        w.set_uri(str(spec))
+        w.image_dir_edit.setText(str(tmp_path))
+        w._emit_selection()
+        assert "enter raw shape" in w.raw_dot.text().lower()
+
+        w.det_rows.setText("6")
+        w.det_cols.setText("6")
+        w.dtype_combo.setCurrentText("int32")
+        w.scan_combo.setCurrentIndex(1)  # scan 6 has metadata but no images
+        assert "no matching images" in w.raw_dot.text().lower()
+        assert "myscan_scan6_" in w.raw_dot.toolTip()
+        assert str(tmp_path) in w.raw_dot.toolTip()
+    finally:
+        w.deleteLater()
+
+
 def test_source_widget_ui_tweaks(qapp):
     """Folder label reserves room (no clip), and Raw-params shares the images row."""
     from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
