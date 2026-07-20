@@ -11,11 +11,12 @@ each re-deriving Bluesky columns.  It fills the R1 format adapter's reserved
 The Bluesky provider is built on the OPEN entry group of a
 :class:`~xrd_tools.sources.cursor.ContainerCursor` and reads lazily: nothing is
 materialized for descriptor creation, frame count, or the first detector read.
-The first metadata request materializes the per-frame table + scanned motors +
-fixed constants ONCE into plain numpy arrays; after that the live h5py entry
-reference is dropped, so repeated ``metadata_for`` reads touch only memory and
-never reopen the source master.  Providers return ordinary Python/numpy values,
-never live ``h5py`` dataset objects.
+``complete_metadata_for`` can project one owner-scoped row without building the
+whole table.  The legacy table-oriented surfaces still materialize the
+per-frame table + scanned motors + fixed constants ONCE into plain numpy arrays;
+after that the live h5py entry reference is dropped, so repeated reads touch
+only memory and never reopen the source master.  Providers return ordinary
+Python/numpy values, never live ``h5py`` dataset objects.
 
 Plain NeXus / Eiger raw stacks (no Bluesky marker) get an
 :class:`EmptyMetadataProvider`: their per-frame metadata is sidecar-sourced and
@@ -53,6 +54,20 @@ class MetadataProvider:
 
     def metadata_for(self, frame_index: int) -> Mapping[str, Any]:
         return {}
+
+    def complete_metadata_for(self, frame_index: int) -> Mapping[str, Any]:
+        """One complete row, including scanned motors.
+
+        Generic providers compose their existing surfaces.  Source-specific
+        providers may override this to avoid materializing whole-scan arrays.
+        """
+        pos = int(frame_index)
+        out = dict(self.metadata_for(pos))
+        for name, values in self.motors().items():
+            if 0 <= pos < len(values):
+                value = np.asarray(values[pos])
+                out[str(name)] = value.item() if value.shape == () else values[pos]
+        return out
 
     def frame_count(self) -> int | None:
         """The authoritative number of frames this provider serves, or ``None``
@@ -120,6 +135,58 @@ class BlueskyMetadataProvider(MetadataProvider):
 
     def frame_count(self) -> int | None:
         return self._frame_count
+
+    def complete_metadata_for(self, frame_index: int) -> Mapping[str, Any]:
+        """Read one complete Bluesky row without building whole-scan arrays."""
+        pos = int(frame_index)
+        if not 0 <= pos < self._frame_count:
+            return {}
+        if self._table is not None:
+            return super().complete_metadata_for(pos)
+
+        entry = self._entry
+        if entry is _SOURCE_CLOSED:
+            raise MetadataSourceClosedError(
+                "metadata provider read after its cursor closed before the "
+                "per-frame table was materialized; open a fresh cursor"
+            )
+        if entry is None:
+            return {}
+
+        from xrd_tools.io.bluesky_nexus import (
+            _BLUESKY_COUNT_TIME_COL,
+            _DEFAULT_BLUESKY_COUNTERS,
+            bluesky_constant_metadata,
+            bluesky_motor_names,
+        )
+
+        data = entry.get("data")
+        names = tuple(dict.fromkeys(
+            (*bluesky_motor_names(entry), *_DEFAULT_BLUESKY_COUNTERS,
+             _BLUESKY_COUNT_TIME_COL, "EPOCH")
+        ))
+        per_frame_names: set[str] = set()
+        out: dict[str, Any] = {}
+        if data is not None:
+            for name in names:
+                dataset = data.get(name)
+                if (
+                    dataset is None
+                    or getattr(dataset, "ndim", None) != 1
+                    or getattr(getattr(dataset, "dtype", None), "kind", "O") not in "fiub"
+                ):
+                    continue
+                per_frame_names.add(str(name))
+                if pos >= int(dataset.shape[0]):
+                    continue
+                try:
+                    out[str(name)] = float(dataset[pos])
+                except (TypeError, ValueError, OSError):
+                    continue
+        constants = bluesky_constant_metadata(entry, exclude=per_frame_names)
+        for name, value in constants.items():
+            out.setdefault(str(name), float(value))
+        return out
 
     def mark_source_closed(self) -> None:
         # Seal only when never materialized; a materialized provider is pure

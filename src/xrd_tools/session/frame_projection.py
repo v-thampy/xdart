@@ -40,7 +40,7 @@ Four surfaces:
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
 from typing import Any
@@ -82,6 +82,29 @@ def _scalar(value: Any) -> Any:
     if arr.shape == ():
         item = arr.item()
         return item
+    return value
+
+
+def _freeze_metadata_value(value: Any) -> Any:
+    """Detach mutable metadata containers from their producer.
+
+    ``FrameView`` makes its top-level metadata mapping read-only, but legacy
+    metadata can still contain mutable arrays or containers.  A projection is a
+    value boundary: callers must not be able to mutate a stored record through
+    it.
+    """
+    if isinstance(value, np.ndarray):
+        frozen = np.array(value, copy=True)
+        frozen.setflags(write=False)
+        return frozen
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _freeze_metadata_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_metadata_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_metadata_value(item) for item in value)
     return value
 
 
@@ -214,7 +237,10 @@ class MetadataRow:
     numeric: Mapping[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        raw = MappingProxyType(dict(self.raw or {}))
+        raw = MappingProxyType({
+            str(key): _freeze_metadata_value(value)
+            for key, value in (self.raw or {}).items()
+        })
         numeric = dict(self.numeric) if self.numeric else numeric_metadata(raw)
         object.__setattr__(self, "raw", raw)
         object.__setattr__(self, "numeric", MappingProxyType(numeric))
@@ -253,14 +279,16 @@ def metadata_row_from_provider(provider: Any, frame_index: int) -> MetadataRow:
         raise IndexError(
             f"frame index {idx} is negative; refusing to wrap to the scan tail")
 
-    motors = _provider_call(provider, "motors") or {}
     frame_count = _provider_call(provider, "frame_count")
     if frame_count is not None:
         if idx >= int(frame_count):
             raise IndexError(
                 f"frame index {idx} is out of range for frame count "
                 f"{int(frame_count)}")
-    else:
+    complete_row = getattr(provider, "complete_metadata_for", None)
+    motors: Mapping[str, Any] = {}
+    if frame_count is None:
+        motors = _provider_call(provider, "motors") or {}
         lengths = [n for n in (
             _safe_len(v) for v in list(motors.values())
             + list((_provider_call(provider, "scan_table") or {}).values()))
@@ -268,6 +296,11 @@ def metadata_row_from_provider(provider: Any, frame_index: int) -> MetadataRow:
         if lengths and idx >= max(lengths):
             raise IndexError(
                 f"frame index {idx} is out of range for scan length {max(lengths)}")
+    elif callable(complete_row):
+        return MetadataRow(complete_row(idx) or {})
+
+    if not motors:
+        motors = _provider_call(provider, "motors") or {}
 
     raw: dict[str, Any] = dict(_provider_call(provider, "metadata_for", idx) or {})
     for name, arr in motors.items():          # scanned motor wins (overlaid last)
@@ -509,11 +542,16 @@ def display_capabilities(
     except MetadataConflictError as exc:
         err = Capability(CapabilityState.ERROR, str(exc))
         return DisplayCapabilities("<conflict>", err, err, err, err, err)
+    if source_identity and identity and source_identity != identity:
+        err = Capability(
+            CapabilityState.ERROR,
+            "store/source identity disagrees with the selected record: "
+            f"{source_identity!r} != {identity!r}",
+        )
+        return DisplayCapabilities("<conflict>", err, err, err, err, err)
     identity = source_identity if source_identity else identity
 
     views = tuple(record.results_1d.values()) + tuple(record.results_2d.values())
-    has_modes = bool(record.results_1d or record.results_2d)
-
     row = _EMPTY_ROW
     try:
         row = metadata_row_from_record(record, mode_1d=mode_1d, mode_2d=mode_2d)
@@ -539,9 +577,9 @@ def display_capabilities(
     thumb_resident = any(v.thumbnail is not None for v in views)
     if thumb_resident:
         thumbnail = Capability(CapabilityState.AVAILABLE, "resident thumbnail")
-    elif has_modes or source_eligible:
+    elif source_eligible:
         thumbnail = Capability(
-            CapabilityState.PENDING, "hydratable / source-fallback eligible")
+            CapabilityState.PENDING, "source-fallback eligible")
     else:
         thumbnail = Capability(CapabilityState.UNAVAILABLE, "no thumbnail evidence")
 
@@ -571,6 +609,7 @@ def project_frame(
     mode_2d: str | None = None,
     hydrate: bool = False,
     provider: Any | None = None,
+    provider_frame_index: int | None = None,
 ) -> FrameProjection:
     """Project one frame's read-authority facts from ``store``.
 
@@ -598,7 +637,9 @@ def project_frame(
     except Exception:
         identity = ""
     hydratable: frozenset[tuple[str, str]] | None = None
-    getter = getattr(store, "persisted_modes", None)
+    getter = getattr(store, "hydratable_modes", None)
+    if not callable(getter):
+        getter = getattr(store, "persisted_modes", None)
     if callable(getter):
         try:
             hydratable = frozenset(getter(label))
@@ -606,16 +647,71 @@ def project_frame(
             hydratable = None
     # A conflicting record surfaces as a typed ERROR projection (via
     # display_capabilities), never as a raised exception at this boundary.
+    row_error: MetadataConflictError | None = None
     try:
         row = metadata_row_from_record(record, mode_1d=mode_1d, mode_2d=mode_2d)
-    except MetadataConflictError:
+        if provider is not None:
+            selected_view = _selected_record_view(record, mode_1d, mode_2d)
+            index = provider_frame_index
+            if index is None and selected_view is not None:
+                index = selected_view.source_frame_index
+            if index is not None:
+                provider_row = metadata_row_from_provider(provider, index)
+                row = _merge_metadata_rows(row, provider_row)
+    except MetadataConflictError as exc:
+        row_error = exc
         row = _EMPTY_ROW
     caps = display_capabilities(
         record, source_identity=identity, mode_1d=mode_1d, mode_2d=mode_2d,
         hydratable_modes=hydratable)
-    view = record.view_1d(mode_1d) or record.view_2d(mode_2d)
+    if caps.metadata.state is CapabilityState.ERROR:
+        row = _EMPTY_ROW
+    if row_error is not None and caps.metadata.state is not CapabilityState.ERROR:
+        caps = replace(
+            caps,
+            metadata=Capability(CapabilityState.ERROR, str(row_error)),
+        )
+    elif row and caps.metadata.state is CapabilityState.UNAVAILABLE:
+        caps = replace(
+            caps,
+            metadata=Capability(
+                CapabilityState.AVAILABLE, "owner-scoped provider metadata"),
+        )
+    view = _selected_record_view(record, mode_1d, mode_2d)
     wavelength = wavelength_evidence(view=view, provider=provider, row=row)
     return FrameProjection(
         label=label, present=True, metadata=row, capabilities=caps,
         wavelength=wavelength,
         normalization_channels=normalization_channels(row))
+
+
+def _selected_record_view(
+    record: FrameRecord,
+    mode_1d: str | None,
+    mode_2d: str | None,
+) -> FrameView | None:
+    candidates = []
+    if mode_1d is not None:
+        candidates.append(record.view_1d(mode_1d))
+    if mode_2d is not None:
+        candidates.append(record.view_2d(mode_2d))
+    candidates.extend((record.view_1d(), record.view_2d()))
+    return next((view for view in candidates if view is not None), None)
+
+
+def _merge_metadata_rows(primary: MetadataRow, supplemental: MetadataRow) -> MetadataRow:
+    """Merge a stored row with owner-scoped provider facts, failing closed.
+
+    The stored row is authoritative for already-ingested values; the provider
+    may fill missing counters/motors but may not silently replace a conflicting
+    value for the same frame identity.
+    """
+    merged = dict(primary.raw)
+    for key, value in supplemental.raw.items():
+        if key in merged and _values_conflict(merged[key], value):
+            raise MetadataConflictError(
+                f"stored/provider metadata disagree for {key!r}: "
+                f"{merged[key]!r} != {value!r}"
+            )
+        merged.setdefault(key, value)
+    return MetadataRow(merged)

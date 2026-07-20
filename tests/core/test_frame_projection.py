@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import h5py
 import numpy as np
 import pytest
 
@@ -121,7 +122,8 @@ def test_provider_scanned_motor_beats_counter_beats_constant():
 def test_mixed_scalar_string_numeric_filter_and_case():
     meta = {"th": 10.5, "sample": "NbN", "profile": [1, 2, 3], "I0": 250.0}
     row = MetadataRow(meta)
-    assert dict(row.raw) == meta                         # heterogeneous preserved
+    assert row.raw["sample"] == "NbN"                  # heterogeneous preserved
+    assert row.raw["profile"] == (1, 2, 3)             # mutable containers frozen
     assert dict(row.numeric) == {"th": 10.5, "I0": 250.0}  # finite scalars only
     # case-insensitive guarded selection (resolve_monitor_norm reused)
     assert normalization_value(row, "i0") == 250.0
@@ -254,6 +256,30 @@ def test_capabilities_thinned_is_pending():
     assert caps.metadata.state is CapabilityState.AVAILABLE      # metadata survived
 
 
+def test_persisted_mode_without_hydrator_is_not_falsely_pending():
+    resident = _record_1d(6, meta={"th": 1.0})
+    thinner = FrameRecordStore(
+        max_heavy_items=0, require_persisted_for_eviction=False)
+    thinner.upsert(resident)
+    store = FrameRecordStore()
+    store.upsert(thinner.get(6), persisted=True)
+
+    assert store.persisted_modes(6) == frozenset({("1d", "default")})
+    assert store.hydratable_modes(6) == frozenset()
+    projected = project_frame(store, 6)
+    assert projected.capabilities.integrated_1d.state \
+        is CapabilityState.UNAVAILABLE
+    assert project_frame(store, 6, hydrate=True).capabilities.integrated_1d.state \
+        is CapabilityState.UNAVAILABLE
+
+
+def test_mode_presence_alone_does_not_make_thumbnail_recoverable():
+    store = FrameRecordStore()
+    store.upsert(_record_1d(6, meta={"th": 1.0}))
+    projected = project_frame(store, 6)
+    assert projected.capabilities.thumbnail.state is CapabilityState.UNAVAILABLE
+
+
 def test_capabilities_source_fallback_eligible_and_unavailable():
     # raw not resident, but a source path makes it source-fallback eligible
     v = _v1d(0, meta={"th": 1.0}, source=("/data/master.h5", 0))
@@ -331,6 +357,66 @@ def test_project_frame_absent_record():
     assert proj.wavelength.status == "absent"
 
 
+def test_project_frame_merges_owner_scoped_provider_row():
+    store = FrameRecordStore()
+    store.upsert(_record_1d(10, meta={}, source=("/data/raw.nxs", 1)))
+    provider = _Provider(
+        motors={"th": [1.0, 2.0]}, metadata={1: {"i0": 42.0}}, frame_count=2)
+
+    projected = project_frame(store, 10, provider=provider)
+    assert dict(projected.metadata.raw) == {"i0": 42.0, "th": 2.0}
+    assert projected.normalization_channels == ("i0", "th")
+    assert projected.capabilities.metadata.state is CapabilityState.AVAILABLE
+
+
+def test_project_frame_accepts_explicit_provider_identity_without_source_index():
+    store = FrameRecordStore()
+    store.upsert(_record_1d("frame-a", meta={}))
+    provider = _Provider(metadata={1: {"i0": 12.0}}, frame_count=2)
+    projected = project_frame(
+        store, "frame-a", provider=provider, provider_frame_index=1)
+    assert projected.metadata.raw["i0"] == 12.0
+
+
+def test_project_frame_reports_stored_provider_metadata_conflict():
+    store = FrameRecordStore()
+    store.upsert(
+        _record_1d(10, meta={"i0": 11.0}, source=("/data/raw.nxs", 1)))
+    provider = _Provider(metadata={1: {"i0": 42.0}}, frame_count=2)
+
+    projected = project_frame(store, 10, provider=provider)
+    assert projected.capabilities.metadata.state is CapabilityState.ERROR
+    assert "stored/provider metadata disagree" in projected.capabilities.metadata.reason
+    assert not projected.metadata
+
+
+def test_store_identity_cannot_override_conflicting_record_identity():
+    store = FrameRecordStore()
+    store.upsert(
+        _record_1d(11, meta={"i0": 1.0}, source=("/actual.h5", 0)),
+        source_identity="/other.h5#0",
+    )
+    projected = project_frame(store, 11)
+    assert projected.capabilities.identity == "<conflict>"
+    assert projected.capabilities.metadata.state is CapabilityState.ERROR
+    assert projected.capabilities.raw.state is CapabilityState.ERROR
+    assert not projected.metadata
+
+
+def test_projection_metadata_array_is_detached_and_read_only():
+    values = np.array([1.0, 2.0, 3.0])
+    store = FrameRecordStore()
+    store.upsert(_record_1d(12, meta={"positions": values}))
+    projected = project_frame(store, 12)
+    stored = store.get(12).view_1d().metadata_raw["positions"]
+
+    assert projected.metadata.raw["positions"] is not stored
+    assert projected.metadata.raw["positions"].flags.writeable is False
+    with pytest.raises(ValueError):
+        projected.metadata.raw["positions"][0] = 99.0
+    np.testing.assert_array_equal(stored, [1.0, 2.0, 3.0])
+
+
 # ── 10. import purity: no Qt / h5py / fabio / pyFAI / xdart ───────────────────
 
 def test_frame_projection_import_is_headless():
@@ -382,6 +468,34 @@ def test_provider_row_reads_only_the_selected_frame():
                      metadata={i: {"i0": float(i)} for i in range(5)})
     metadata_row_from_provider(prov, 2)
     assert prov.metadata_for_calls == [2]             # only frame 2, not all 5
+
+
+def test_real_bluesky_provider_complete_row_does_not_materialize_full_table(
+    tmp_path, monkeypatch,
+):
+    from xrd_tools.sources.metadata_provider import BlueskyMetadataProvider
+
+    path = tmp_path / "row.nxs"
+    with h5py.File(path, "w") as root:
+        entry = root.create_group("entry")
+        data = entry.create_group("data")
+        data.create_dataset("th", data=np.array([1.0, 2.0, 3.0]))
+        data.create_dataset("i0", data=np.array([10.0, 20.0, 30.0]))
+        data.create_dataset("EPOCH", data=np.array([100.0, 101.0, 102.0]))
+        positioners = entry.create_group("instrument/positioners")
+        positioners.create_group("th")
+        bluesky = entry.create_group("instrument/bluesky/metadata")
+        bluesky.create_dataset("motors", data=b"!!python/tuple\n- th\n")
+        provider = BlueskyMetadataProvider(entry, frame_count=3)
+        monkeypatch.setattr(
+            provider, "_ensure_table",
+            lambda: pytest.fail("single-row projection materialized the full table"),
+        )
+        row = metadata_row_from_provider(provider, 1)
+        assert row.raw["th"] == pytest.approx(2.0)
+        assert row.raw["i0"] == pytest.approx(20.0)
+        assert row.raw["EPOCH"] == pytest.approx(101.0)
+        assert provider._table is None
 
 
 # ── review corrections (RP#1–#5 + minors) ────────────────────────────────────

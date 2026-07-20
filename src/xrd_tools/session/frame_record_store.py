@@ -371,14 +371,21 @@ class FrameRecordStore:
             return self._label_persisted_locked(label)
 
     def persisted_modes(self, label: int | str) -> frozenset[_ModeKey]:
-        """The ``(dim, mode)`` keys of ``label`` confirmed on disk — i.e. the
-        modes a thinned record can be re-hydrated for.
+        """The ``(dim, mode)`` keys of ``label`` confirmed on disk.
 
         A mode consciously discarded at write (:meth:`mark_dropped`) is
-        intentionally absent here (it was never written), so a caller can tell a
-        hydratable evicted mode from a non-recoverable dropped mode.  Read-only;
-        does not touch retention/eviction policy."""
+        intentionally absent here (it was never written).  Persistence alone
+        does not imply current hydratability: a store also needs a registered
+        hydrator.  Use :meth:`hydratable_modes` for that combined fact.
+        Read-only; does not touch retention/eviction policy."""
         with self._lock:
+            return frozenset(self._persisted_modes.get(label, set()))
+
+    def hydratable_modes(self, label: int | str) -> frozenset[_ModeKey]:
+        """Persisted modes recoverable through this store right now."""
+        with self._lock:
+            if self._hydrator is None:
+                return frozenset()
             return frozenset(self._persisted_modes.get(label, set()))
 
     def has_heavy_payload(self, label: int | str) -> bool:
