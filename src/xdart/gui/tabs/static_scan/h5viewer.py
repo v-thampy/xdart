@@ -66,7 +66,11 @@ import numpy as np
 
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.io.export import read_xye
-from xrd_tools.io.image import read_image, count_frames
+from xrd_tools.io.image import (
+    COMMON_RAW_DETECTOR_SHAPES,
+    count_frames,
+    read_image,
+)
 from xdart.utils.session import load_session, save_session
 from .ui.h5viewerUI import Ui_Form
 from xdart.modules.live import LiveFrame
@@ -2540,15 +2544,9 @@ class H5Viewer(QWidget):
         finally:
             lw.blockSignals(was_blocked)
 
-    # Common detector shapes to try for raw binary files (name, shape)
-    _RAW_DETECTOR_FALLBACKS = [
-        ('Pilatus 100k', (195, 487)),
-        ('Pilatus 300k', (619, 487)),
-        ('Pilatus 300kw', (195, 1475)),
-        ('Pilatus 1M', (1043, 981)),
-        ('Rayonix MX225', (3072, 3072)),
-        ('Rayonix SX165', (2048, 2048)),
-    ]
+    # Backward-compatible test/extension hook; the authoritative table lives
+    # in headless image I/O and the first read now uses it automatically.
+    _RAW_DETECTOR_FALLBACKS = COMMON_RAW_DETECTOR_SHAPES
 
     def _load_single_frame(self, fpath, frame_idx=0, frame_id=1):
         """Load a single frame from an image file into viewer_rows_2d.

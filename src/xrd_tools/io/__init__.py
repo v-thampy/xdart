@@ -13,8 +13,10 @@ from xrd_tools.io.image import (
     find_image_files,
     apply_rotation,
     get_detector_mask,
+    infer_raw_detector_shape,
     resolve_detector_shape,
     count_frames,
+    COMMON_RAW_DETECTOR_SHAPES,
     SUPPORTED_EXTS,
 )
 from xrd_tools.io.spec import (

@@ -346,6 +346,32 @@ def test_widget_spec_raw_status_explains_shape_and_scan_match(qapp, tmp_path):
         w.deleteLater()
 
 
+def test_widget_spec_common_raw_shape_enables_roi_without_manual_shape(
+        qapp, tmp_path):
+    """A known headerless detector shape is a headless reader capability, not
+    a private Image Viewer fallback or an operator requirement."""
+    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+
+    spec = tmp_path / "known"
+    spec.write_text(_SPEC.replace("#F myscan", "#F known"))
+    image = np.arange(195 * 487, dtype=np.int32).reshape(195, 487)
+    for index in range(3):
+        (image + index).tofile(tmp_path / f"known_scan5_{index:04d}.raw")
+
+    w = ScanSourceWidget(mode="roi")
+    emitted = []
+    w.sigSourceChanged.connect(lambda selection: emitted.append(selection))
+    try:
+        w.set_uri(str(spec))
+        assert emitted[-1] is not None and emitted[-1].reachable
+        assert "raw ready" in w.raw_dot.text().lower()
+        assert emitted[-1].first_image.shape == (195, 487)
+        assert "detector_shape" not in dict(
+            emitted[-1].spec.options["read_image_kwargs"])
+    finally:
+        w.deleteLater()
+
+
 def test_source_widget_ui_tweaks(qapp):
     """Folder label reserves room (no clip), and Raw-params shares the images row."""
     from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget

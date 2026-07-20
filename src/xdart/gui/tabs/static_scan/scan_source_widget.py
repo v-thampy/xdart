@@ -414,7 +414,9 @@ class ScanSourceWidget(QtWidgets.QWidget):
         from xrd_tools.core.scan import SourceKind
 
         if (self._selected_is_binary_raw()
-                and "detector_shape" not in self._read_image_kwargs()):
+                and "detector_shape" not in self._read_image_kwargs()
+                and not self._raw_shape_is_inferable(
+                    [Path(self.path_edit.text().strip())])):
             return (
                 "○ enter RAW shape",
                 "Open Raw params and enter detector rows, columns, and dtype. "
@@ -451,14 +453,30 @@ class ScanSourceWidget(QtWidgets.QWidget):
                 f"No detector files containing {stem!r} were found in "
                 f"{directory} for the selected SPEC scan.",
             )
-        if (any(path.suffix.lower() == ".raw" for path in files)
-                and "detector_shape" not in self._read_image_kwargs()):
+        raw_files = [path for path in files if path.suffix.lower() == ".raw"]
+        if (raw_files and "detector_shape" not in self._read_image_kwargs()
+                and not self._raw_shape_is_inferable(raw_files)):
             return (
                 "○ enter RAW shape",
                 "Matching headerless RAW frames were found. Open Raw params "
                 "and enter detector rows, columns, and dtype to decode them.",
             )
         return None
+
+    def _raw_shape_is_inferable(self, files):
+        """Whether the first matching RAW frame has one exact known layout."""
+        if not files:
+            return False
+        kwargs = self._read_image_kwargs()
+        try:
+            from xrd_tools.io.image import infer_raw_detector_shape
+            return infer_raw_detector_shape(
+                files[0],
+                raw_dtype=kwargs.get("raw_dtype", "int32"),
+                raw_header_skip=kwargs.get("raw_header_skip", 0),
+            ) is not None
+        except (OSError, TypeError, ValueError):
+            return False
 
     def _current_candidate(self):
         i = self.scan_combo.currentIndex()
@@ -468,7 +486,7 @@ class ScanSourceWidget(QtWidgets.QWidget):
 
     # ---- read params + emit --------------------------------------------
     def _read_image_kwargs(self):
-        out = {}
+        out = {"raw_dtype": self.dtype_combo.currentText()}
         try:
             r = int(self.det_rows.text()) if self.det_rows.text().strip() else None
             c = int(self.det_cols.text()) if self.det_cols.text().strip() else None
@@ -476,7 +494,6 @@ class ScanSourceWidget(QtWidgets.QWidget):
             r = c = None
         if r and c:
             out["detector_shape"] = (r, c)
-            out["raw_dtype"] = self.dtype_combo.currentText()   # only with a shape
         try:
             skip = int(self.header_skip.text()) if self.header_skip.text().strip() else 0
         except ValueError:

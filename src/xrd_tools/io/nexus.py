@@ -2945,7 +2945,7 @@ def _read_energy(grp: h5py.Group) -> float:
             return _scalar_or_first(grp[path])
         except Exception:
             logger.warning("Could not read energy from %s", path, exc_info=True)
-    logger.warning(
+    logger.debug(
         "Energy not found in NeXus file %s; using NaN", grp.file.filename)
     return float(np.nan)
 
@@ -2966,7 +2966,7 @@ def _read_wavelength(grp: h5py.Group, energy: float) -> float:
             logger.warning("Could not read wavelength from %s", path, exc_info=True)
     if np.isfinite(energy) and energy > 0:
         return float(energy_to_wavelength(energy))
-    logger.warning(
+    logger.debug(
         "Wavelength not derivable for NeXus file %s; using NaN",
         grp.file.filename,
     )

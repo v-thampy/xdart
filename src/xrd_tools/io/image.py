@@ -25,6 +25,18 @@ logger = logging.getLogger(__name__)
 SUPPORTED_EXTS = {".edf", ".tif", ".tiff", ".cbf", ".img", ".mar3450",
                   ".h5", ".hdf5", ".nxs", ".raw"}
 
+# Established detector layouts for headerless binary frames.  This table is a
+# headless I/O capability shared by the GUI and every FrameSource; matching is
+# by exact payload byte count, never by filename or a best-effort reshape.
+COMMON_RAW_DETECTOR_SHAPES: tuple[tuple[str, tuple[int, int]], ...] = (
+    ("Pilatus 100k", (195, 487)),
+    ("Pilatus 300k", (619, 487)),
+    ("Pilatus 300kw", (195, 1475)),
+    ("Pilatus 1M", (1043, 981)),
+    ("Rayonix MX225", (3072, 3072)),
+    ("Rayonix SX165", (2048, 2048)),
+)
+
 
 def _is_eiger_master(path: Path) -> bool:
     """Return True if *path* looks like an Eiger HDF5 master file."""
@@ -61,6 +73,42 @@ def resolve_detector_shape(
     except Exception:
         logger.warning("Could not resolve detector shape for: %s", detector)
         return None
+
+
+def infer_raw_detector_shape(
+    path: Path | str,
+    *,
+    raw_dtype: str = "int32",
+    raw_header_skip: int = 0,
+) -> tuple[int, int] | None:
+    """Infer a known headerless RAW shape from its exact payload byte count.
+
+    A shape is returned only when one unique established detector layout
+    matches.  Unknown or ambiguous payloads return ``None`` so callers can ask
+    for explicit dimensions rather than silently interpreting the pixels with
+    the wrong geometry.
+    """
+    path = Path(path)
+    header_skip = int(raw_header_skip)
+    if header_skip < 0:
+        raise ValueError("raw_header_skip must be non-negative")
+    payload_bytes = path.stat().st_size - header_skip
+    dtype = np.dtype(raw_dtype)
+    if payload_bytes < 0 or payload_bytes % dtype.itemsize:
+        return None
+    pixel_count = payload_bytes // dtype.itemsize
+    matches = {
+        shape for _name, shape in COMMON_RAW_DETECTOR_SHAPES
+        if int(shape[0]) * int(shape[1]) == pixel_count
+    }
+    if len(matches) != 1:
+        return None
+    shape = matches.pop()
+    logger.debug(
+        "Inferred headerless RAW shape %sx%s for %s from %d payload bytes",
+        shape[0], shape[1], path, payload_bytes,
+    )
+    return shape
 
 
 def get_detector_mask(detector_name: str) -> np.ndarray | None:
@@ -165,9 +213,10 @@ def read_image(
     threshold : float, optional
         Pixels above this value are replaced with NaN.
     detector_shape : (rows, cols), optional
-        Detector dimensions for raw binary files.  Required when fabio
-        cannot auto-detect the format.  Also used as the reshape target
-        for the fallback binary reader.
+        Detector dimensions for raw binary files.  If omitted, an exact unique
+        match among established detector layouts is inferred from the payload
+        byte count.  Unknown layouts require explicit dimensions.  The shape
+        is also used as the reshape target for the fallback binary reader.
     detector : str or (rows, cols), optional
         Alternative to *detector_shape*.  If a string (e.g.
         ``'pilatus100k'``, ``'pilatus300k'``), the shape is resolved via
@@ -189,6 +238,9 @@ def read_image(
 
     # Resolve detector shape: explicit tuple wins, then detector name lookup
     shape = detector_shape or resolve_detector_shape(detector)
+    if ext == ".raw" and shape is None:
+        shape = infer_raw_detector_shape(
+            path, raw_dtype=raw_dtype, raw_header_skip=raw_header_skip)
 
     if ext == ".npy":
         # Saved NumPy array (e.g. a boolean/integer mask).  fabio can't open

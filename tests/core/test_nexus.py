@@ -179,8 +179,7 @@ class TestReadNexus:
         with pytest.raises(FileNotFoundError):
             read_nexus(tmp_path / "ghost.h5")
 
-    def test_missing_energy_and_wavelength_warnings_name_source_file(
-            self, tmp_path, caplog):
+    def test_missing_optional_beam_fields_do_not_warn(self, tmp_path, caplog):
         path = tmp_path / "metadata_without_beam_energy.nxs"
         with h5py.File(path, "w") as h5:
             h5.create_group("entry/data")
@@ -188,11 +187,11 @@ class TestReadNexus:
         with caplog.at_level("WARNING", logger="xrd_tools.io.nexus"):
             read_nexus(path)
 
-        messages = [record.getMessage() for record in caplog.records]
-        assert any("Energy not found" in message and str(path) in message
-                   for message in messages)
-        assert any("Wavelength not derivable" in message and str(path) in message
-                   for message in messages)
+        assert not [
+            record for record in caplog.records
+            if "Energy not found" in record.getMessage()
+            or "Wavelength not derivable" in record.getMessage()
+        ]
 
     def test_harvests_scan_data_and_positioners(self, tmp_path):
         """F6: motors live under entry/scan_data (the SPEC-style all-motors

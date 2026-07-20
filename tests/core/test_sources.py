@@ -88,6 +88,36 @@ def test_image_file_source_reads_headerless_raw_without_frame_count_warning(
     assert "Could not determine frame count" not in caplog.text
 
 
+def test_common_headerless_raw_shape_is_inferred_without_gui_defaults(tmp_path):
+    from xrd_tools.io.image import infer_raw_detector_shape, read_image
+    from xrd_tools.sources import ImageFileSource, TiffSeriesSource
+
+    shape = (195, 487)
+    images = []
+    for index in (1, 2):
+        image = np.full(shape, index, dtype=np.int32)
+        image.tofile(tmp_path / f"scan_{index:04d}.raw")
+        images.append(image)
+
+    first = tmp_path / "scan_0001.raw"
+    assert infer_raw_detector_shape(first) == shape
+    np.testing.assert_array_equal(read_image(first), images[0])
+    np.testing.assert_array_equal(ImageFileSource(first).load_frame(0), images[0])
+
+    series = TiffSeriesSource.from_directory(
+        tmp_path, pattern="scan_*.raw", metadata_format=None)
+    np.testing.assert_array_equal(series.load_frame(2), images[1])
+
+
+def test_unknown_headerless_raw_shape_is_not_guessed(tmp_path):
+    from xrd_tools.io.image import infer_raw_detector_shape
+
+    path = tmp_path / "unknown.raw"
+    np.zeros((17, 19), dtype=np.int32).tofile(path)
+
+    assert infer_raw_detector_shape(path) is None
+
+
 def test_tiff_series_from_directory_uses_natural_order_and_pattern(tmp_path):
     from xrd_tools.sources import TiffSeriesSource
 
