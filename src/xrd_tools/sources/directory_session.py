@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import threading
 import time
+import logging
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,9 @@ from xrd_tools.sources.directory_index import (
 from xrd_tools.sources.discover import Candidate
 from xrd_tools.sources.probe import ProbeResult, ProbeState
 from xrd_tools.core.filters import compile_filter
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +247,19 @@ class DirectoryIndexSession:
             except StaleCandidateError:
                 stale_drops += 1
                 continue
+            except Exception as exc:
+                # Cache an unexpected failure against this exact candidate
+                # identity so one defective source cannot poison every ready
+                # sibling. A later byte/owner change invalidates it normally.
+                logger.warning(
+                    "Source readiness probe failed for %s: %s",
+                    candidate.path,
+                    exc,
+                )
+                result = ProbeResult(
+                    ProbeState.INVALID,
+                    reason=f"{type(exc).__name__}: {exc}",
+                )
             self._results[candidate.path] = (candidate, result)
 
         # A probe can race a file mutation or owner flip.  Re-poll before

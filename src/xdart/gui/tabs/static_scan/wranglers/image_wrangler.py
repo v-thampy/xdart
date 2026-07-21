@@ -2009,10 +2009,11 @@ class imageWrangler(wranglerWidget):
 
             plan = getattr(self, "source_run_plan", None)
             planned_paths = tuple(getattr(plan, "paths", ()) or ())
-            if planned_paths:
+            if plan is not None:
                 # H19 exact handoff: setup seeds from the first candidate the
-                # Source card marked Ready.  Do not independently walk here.
-                self.img_file = str(planned_paths[0])
+                # Source card marked Ready. An empty plan is a valid live-watch
+                # arm, not permission to independently walk the directory.
+                self.img_file = str(planned_paths[0]) if planned_paths else ""
             else:
                 # F1: same compiled Filter grammar as the worker's directory
                 # glob — the seed image must be selected by the same rule as

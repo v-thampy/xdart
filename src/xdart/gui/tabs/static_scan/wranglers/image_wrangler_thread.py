@@ -660,6 +660,7 @@ class imageThread(wranglerThread):
         self.source_run_plan = None
         self.source_index_session = None
         self._source_plan_reported = set()
+        self._h19_observed_master_paths = ()
 
         self.user = None
         self.mask = None
@@ -721,7 +722,9 @@ class imageThread(wranglerThread):
         parent or signals from the process.
         """
         t0 = time.time()
-        if self.poni is None or (self.img_file == ''):
+        if (self.poni is None
+                or (self.img_file == ''
+                    and not self._h19_live_directory_armed())):
             return
 
         # This must be the FIRST stateful operation of a new Run.  A prior
@@ -759,6 +762,7 @@ class imageThread(wranglerThread):
         self._eiger_master_queue.clear()
         self._eiger_done_masters.clear()
         self._source_plan_reported.clear()
+        self._h19_observed_master_paths = ()
         self._eiger_retry_after.clear()
         self._eiger_zero_frame_seen.clear()
         self._eiger_open_state = None
@@ -1564,7 +1568,9 @@ class imageThread(wranglerThread):
         # unlanded links), which must keep watching so the SAME run processes
         # frames that land later (NXS-SF-2).
         if (self.live_mode and self.command != 'stop'
-                and (scan is not None or self._eiger_single_file_watchable())):
+                and (scan is not None
+                     or self._eiger_single_file_watchable()
+                     or self._h19_live_directory_armed())):
             self.showLabel.emit('Watching for new files...')
             # Adaptive backoff between filesystem polls.  Starts tight
             # so first-frame latency is small (~100 ms vs the old fixed
@@ -3682,15 +3688,39 @@ class imageThread(wranglerThread):
         self._eiger_nframes = 0
         return True
 
+    def _h19_live_directory_armed(self):
+        """Whether an empty authoritative plan should keep watching."""
+        return bool(
+            getattr(self, "live_mode", False)
+            and getattr(self, "inp_type", "") == "Image Directory"
+            and getattr(self, "source_run_plan", None) is not None
+            and getattr(self, "source_index_session", None) is not None
+        )
+
     def _eiger_refill_master_queue(self):
         """Queue matching HDF5 master / NeXus files not yet processed."""
         if (getattr(self, "source_run_plan", None) is not None
                 and getattr(self, "source_index_session", None) is not None):
             queued = set(self._eiger_master_queue)
-            for path in self._h19_ready_master_paths():
+            retries = getattr(self, "_eiger_retry_after", None)
+            if retries is None:
+                retries = self._eiger_retry_after = {}
+            zero_seen = getattr(self, "_eiger_zero_frame_seen", None)
+            if zero_seen is None:
+                zero_seen = self._eiger_zero_frame_seen = {}
+            ready_paths = self._h19_ready_master_paths()
+            observed = set(getattr(self, "_h19_observed_master_paths", ()))
+            for stale_path in set(retries) - observed:
+                retries.pop(stale_path, None)
+                zero_seen.pop(stale_path, None)
+            now = time.monotonic()
+            for path in ready_paths:
                 value = str(path)
                 if value in self._eiger_done_masters or value in queued:
                     continue
+                if retries.get(value, 0.0) > now:
+                    continue
+                retries.pop(value, None)
                 self._eiger_master_queue.append(value)
             return
 
@@ -3752,6 +3782,10 @@ class imageThread(wranglerThread):
             return ()
         try:
             observation = session.observe()
+            self._h19_observed_master_paths = tuple(
+                str(candidate.path)
+                for candidate in observation.discovered_snapshot.candidates
+            )
             reconciliation = plan.reconcile(observation.discovered_snapshot)
             for candidate in reconciliation.changed:
                 result = observation.result_for(candidate)
@@ -3760,22 +3794,38 @@ class imageThread(wranglerThread):
             reconciliation = plan.reconcile(observation.discovered_snapshot)
             self.source_run_plan = plan
         except Exception as exc:
+            message = f"Source directory temporarily unavailable: {exc}"
             logger.warning("authoritative directory reconciliation failed: %s", exc)
-            return ()
+            try:
+                self.showLabel.emit(message)
+            except Exception:
+                logger.debug("showLabel emit failed for source observation",
+                             exc_info=True)
+            raise RuntimeError(message) from exc
 
         for path in reconciliation.removed:
             key = ("removed", str(path))
             if key not in self._source_plan_reported:
                 self._source_plan_reported.add(key)
-                logger.warning(
-                    "Skipping source removed after Run started: %s", path)
+                message = f"Skipping source removed after Run started: {path}"
+                logger.warning(message)
+                try:
+                    self.showLabel.emit(message)
+                except Exception:
+                    logger.debug("showLabel emit failed", exc_info=True)
         for candidate in reconciliation.owner_flipped:
             key = ("owner", str(candidate.path))
             if key not in self._source_plan_reported:
                 self._source_plan_reported.add(key)
-                logger.warning(
+                message = (
                     "Skipping source whose format owner changed after Run "
-                    "started: %s", candidate.path)
+                    f"started: {candidate.path}"
+                )
+                logger.warning(message)
+                try:
+                    self.showLabel.emit(message)
+                except Exception:
+                    logger.debug("showLabel emit failed", exc_info=True)
 
         ready = {
             item.candidate.path
@@ -3803,9 +3853,15 @@ class imageThread(wranglerThread):
         if (getattr(self, "source_run_plan", None) is not None
                 and getattr(self, "source_index_session", None) is not None):
             eligible = {str(path) for path in self._h19_ready_master_paths()}
-            while self._eiger_master_queue:
+            retries = getattr(self, "_eiger_retry_after", {})
+            now = time.monotonic()
+            for _ in range(len(self._eiger_master_queue)):
                 candidate = self._eiger_master_queue.popleft()
+                if retries.get(candidate, 0.0) > now:
+                    self._eiger_master_queue.append(candidate)
+                    continue
                 if candidate in eligible:
+                    retries.pop(candidate, None)
                     return candidate
             return None
 

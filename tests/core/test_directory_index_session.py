@@ -119,6 +119,38 @@ def test_changed_candidate_is_reprobed_once_then_cached(tmp_path, monkeypatch):
         session.close()
 
 
+def test_raising_probe_is_cached_as_invalid_without_poisoning_session(
+    tmp_path, monkeypatch,
+):
+    calls = []
+
+    def probe(_index, candidate):
+        calls.append(candidate.path.name)
+        if candidate.path.name == "broken.nxs":
+            raise RuntimeError("adapter defect")
+        return _fake_probe(_index, candidate)
+
+    monkeypatch.setattr(DirectoryIndex, "probe_candidate", probe)
+    _write(tmp_path / "broken.nxs")
+    ready = _write(tmp_path / "ready.nxs")
+    session = DirectoryIndexSession()
+    try:
+        session.configure(tmp_path, suffixes=(".nxs",))
+        first = session.observe()
+        second = session.observe()
+
+        assert [item.path for item in first.ready_snapshot.candidates] == [ready]
+        broken = next(
+            item for item in first.candidates
+            if item.candidate.path.name == "broken.nxs")
+        assert broken.result.state is ProbeState.INVALID
+        assert "adapter defect" in (broken.result.reason or "")
+        assert second.content_opens == 0
+        assert calls == ["broken.nxs", "ready.nxs"]
+    finally:
+        session.close()
+
+
 def test_observations_are_value_only(tmp_path, monkeypatch):
     monkeypatch.setattr(DirectoryIndex, "probe_candidate", _fake_probe)
     _write(tmp_path / "scan.nxs")

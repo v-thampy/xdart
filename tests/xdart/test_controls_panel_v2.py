@@ -1602,6 +1602,134 @@ def test_h19_blank_container_directory_never_indexes_process_cwd(
         widget.deleteLater()
 
 
+def test_h19_empty_container_directory_freezes_empty_run_plan(
+    qapp, monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        signal = widget.wrangler.parameters.child("Signal")
+        signal.child("inp_type").setValue("Image Directory")
+        signal.child("img_dir").setValue(str(tmp_path))
+        signal.child("img_ext").setValue("nxs")
+        assert _wait_until(
+            qapp,
+            lambda: widget._controls_v2_current_directory_observation()
+            is not None,
+        )
+
+        plan = widget._controls_v2_freeze_source_run_plan()
+        assert plan is not None
+        assert plan.paths == ()
+        assert plan.root == tmp_path
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_h19_run_boundary_propagates_empty_plan_to_real_worker(
+    qapp, monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    started = []
+    try:
+        signal = widget.wrangler.parameters.child("Signal")
+        signal.child("inp_type").setValue("Image Directory")
+        signal.child("img_dir").setValue(str(tmp_path))
+        signal.child("img_ext").setValue("nxs")
+        assert _wait_until(
+            qapp,
+            lambda: widget._controls_v2_current_directory_observation()
+            is not None,
+        )
+        widget.controls.liveButton.setChecked(True)
+        monkeypatch.setattr(
+            widget.wrangler.thread, "start", lambda: started.append(True))
+
+        widget.start_wrangler()
+
+        assert started == [True]
+        assert widget.wrangler.source_run_plan is not None
+        assert widget.wrangler.source_run_plan.paths == ()
+        assert widget.wrangler.thread.source_run_plan is (
+            widget.wrangler.source_run_plan)
+        assert widget.wrangler.thread.source_index_session is (
+            widget.wrangler.source_index_session)
+        assert widget.wrangler.img_file == ""
+        assert widget.wrangler.thread.img_file == ""
+
+        widget._clear_controls_v2_run_source_authority()
+        assert widget.wrangler.source_run_plan is None
+        assert widget.wrangler.source_index_session is None
+        assert widget.wrangler.thread.source_run_plan is None
+        assert widget.wrangler.thread.source_index_session is None
+    finally:
+        widget._exit_run_state()
+        widget.close()
+        widget.deleteLater()
+
+
+def test_h19_zero_ready_observation_never_falls_back_to_legacy_sidecar(
+    qapp, monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    (tmp_path / "scan_data_000001.h5").write_bytes(b"sidecar")
+    widget = staticWidget()
+    try:
+        signal = widget.wrangler.parameters.child("Signal")
+        signal.child("inp_type").setValue("Image Directory")
+        signal.child("img_dir").setValue(str(tmp_path))
+        signal.child("img_ext").setValue("h5")
+        assert _wait_until(
+            qapp,
+            lambda: widget._controls_v2_current_directory_observation()
+            is not None,
+        )
+        observation = widget._controls_v2_current_directory_observation()
+        assert observation.ready_snapshot.candidates == ()
+        assert widget._controls_v2_first_metadata_file() == ""
+
+        marker = object()
+        widget._controls_v2_source_energy_cache = marker
+        widget._controls_v2_metadata_probe_cache = marker
+        widget._on_controls_v2_directory_observation(observation)
+        assert widget._controls_v2_source_energy_cache is marker
+        assert widget._controls_v2_metadata_probe_cache is marker
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_h19_close_stops_wrangler_before_shutting_directory_session(
+    qapp, monkeypatch,
+):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    events = []
+    try:
+        monkeypatch.setattr(
+            widget, "_stop_wrangler_thread_on_close",
+            lambda: events.append("wrangler"),
+        )
+        monkeypatch.setattr(
+            widget._controls_v2_source_widget, "shutdown_probe_worker",
+            lambda: events.append("session"),
+        )
+        widget.close()
+        assert events[:2] == ["wrangler", "session"]
+    finally:
+        widget.deleteLater()
+
+
 def test_h19_legacy_panel_never_requires_v2_directory_authority(
     qapp, monkeypatch, tmp_path,
 ):

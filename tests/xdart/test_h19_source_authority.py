@@ -61,6 +61,22 @@ class _Session:
         return self._observations[0]
 
 
+class _RaisingSession:
+    def __init__(self, exc):
+        self.exc = exc
+
+    def observe(self):
+        raise self.exc
+
+
+class _Signal:
+    def __init__(self):
+        self.values = []
+
+    def emit(self, value):
+        self.values.append(value)
+
+
 def _worker(plan, session):
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
         imageThread,
@@ -72,6 +88,12 @@ def _worker(plan, session):
         _source_plan_reported=set(),
         _eiger_master_queue=deque(),
         _eiger_done_masters=set(),
+        _eiger_retry_after={},
+        _eiger_zero_frame_seen={},
+        showLabel=_Signal(),
+        live_mode=True,
+        inp_type="Image Directory",
+        command="start",
     )
     host._h19_ready_master_paths = MethodType(
         imageThread._h19_ready_master_paths, host)
@@ -79,7 +101,59 @@ def _worker(plan, session):
         imageThread._eiger_refill_master_queue, host)
     host._eiger_pop_next_master = MethodType(
         imageThread._eiger_pop_next_master, host)
+    host._h19_live_directory_armed = MethodType(
+        imageThread._h19_live_directory_armed, host)
     return host
+
+
+def test_empty_frozen_baseline_arms_and_accepts_first_ready_append(tmp_path):
+    source = _candidate(tmp_path, "scan_1.nxs")
+    plan = RunCandidatePlan.from_snapshot(
+        Snapshot(0, (), tmp_path, False, None))
+    worker = _worker(
+        plan,
+        _Session(_observation(tmp_path, ((source, _result()),), generation=1)),
+    )
+
+    assert worker._h19_live_directory_armed() is True
+    worker._eiger_refill_master_queue()
+    assert list(worker._eiger_master_queue) == [str(source.path)]
+
+
+def test_authoritative_refill_honors_zero_frame_retry_clock(
+    tmp_path, monkeypatch,
+):
+    import xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread as iwt
+
+    source = _candidate(tmp_path, "scan_1.nxs")
+    plan = RunCandidatePlan.from_snapshot(
+        Snapshot(1, (source,), tmp_path, False, None))
+    observation = _observation(tmp_path, ((source, _result()),), generation=1)
+    worker = _worker(plan, _Session(observation))
+    worker._eiger_retry_after[str(source.path)] = 100.0
+
+    monkeypatch.setattr(iwt.time, "monotonic", lambda: 50.0)
+    worker._eiger_refill_master_queue()
+    assert list(worker._eiger_master_queue) == []
+
+    monkeypatch.setattr(iwt.time, "monotonic", lambda: 101.0)
+    worker._eiger_refill_master_queue()
+    assert list(worker._eiger_master_queue) == [str(source.path)]
+
+
+def test_observation_failure_preserves_queue_and_surfaces_status(tmp_path):
+    source = _candidate(tmp_path, "scan_1.nxs")
+    plan = RunCandidatePlan.from_snapshot(
+        Snapshot(1, (source,), tmp_path, False, None))
+    worker = _worker(plan, _RaisingSession(OSError("share unavailable")))
+    worker._eiger_master_queue.append(str(source.path))
+
+    with pytest.raises(RuntimeError, match="share unavailable"):
+        worker._eiger_pop_next_master()
+
+    assert list(worker._eiger_master_queue) == [str(source.path)]
+    assert worker.showLabel.values
+    assert "temporarily unavailable" in worker.showLabel.values[-1]
 
 
 def test_worker_uses_frozen_order_and_ready_appends_without_reglob(

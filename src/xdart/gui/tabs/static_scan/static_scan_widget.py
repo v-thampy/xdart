@@ -3604,8 +3604,8 @@ class staticWidget(QWidget):
     def _on_controls_v2_directory_observation(self, observation) -> None:
         self._controls_v2_directory_observation = observation
         self._v2_frame_count_cache = None
-        self._controls_v2_metadata_probe_cache = None
-        self._controls_v2_source_energy_cache = None
+        # Metadata/energy caches are already keyed by source identity. A
+        # converged directory poll must not discard them every cadence tick.
         self._refresh_controls_v2_profile(immediate=False)
 
     def _controls_v2_current_directory_observation(self):
@@ -3630,10 +3630,35 @@ class staticWidget(QWidget):
 
     def _controls_v2_freeze_source_run_plan(self):
         observation = self._controls_v2_current_directory_observation()
-        if observation is None:
-            return None
         from xrd_tools.sources import RunCandidatePlan
-        return RunCandidatePlan.from_snapshot(observation.ready_snapshot)
+        if observation is not None:
+            return RunCandidatePlan.from_snapshot(observation.ready_snapshot)
+
+        # Arm-then-acquire is a normal beamline workflow. If the Source card
+        # has a valid configured directory but its first observation has not
+        # landed yet, freeze an honest empty baseline for that exact config.
+        widget = getattr(self, "_controls_v2_source_widget", None)
+        session = getattr(widget, "directory_session", None)
+        config = self._controls_v2_container_index_config()
+        desired = getattr(session, "configured", None)
+        if session is None or config is None or desired is None:
+            return None
+        root, recursive, name_filter, suffixes = config
+        if (
+            desired.root != root
+            or desired.recursive != recursive
+            or desired.name_filter != name_filter
+            or desired.suffixes != suffixes
+        ):
+            return None
+        from xrd_tools.sources import Snapshot
+        return RunCandidatePlan.from_snapshot(Snapshot(
+            session.request_generation,
+            (),
+            root,
+            recursive,
+            name_filter,
+        ))
 
     def _controls_v2_source_frame_count(self) -> int | None:
         """Images the configured raw source will yield; ``None`` for live."""
@@ -4238,8 +4263,18 @@ class staticWidget(QWidget):
                 self, "_controls_v2_current_directory_observation", None)
             observation = (
                 current_observation() if callable(current_observation) else None)
-            if observation is not None and observation.ready_snapshot.candidates:
-                return str(observation.ready_snapshot.candidates[0].path)
+            if observation is not None:
+                if observation.ready_snapshot.candidates:
+                    return str(observation.ready_snapshot.candidates[0].path)
+                return ""
+            # A configured container directory is owned by the Source card.
+            # Before its first observation lands, do not independently glob a
+            # provisional file or a data sidecar as metadata authority.
+            container_config = getattr(
+                self, "_controls_v2_container_index_config", None)
+            if (callable(container_config)
+                    and container_config() is not None):
+                return ""
             wrangler = getattr(self, "wrangler", None)
             img_file = str(getattr(wrangler, "img_file", "") or "")
             if img_file:
@@ -6859,9 +6894,6 @@ class staticWidget(QWidget):
         # Block the analysis slots first: a worker signal queued just before we
         # stop + destroy must not touch the about-to-be-destroyed dialog.
         self._tearing_down = True
-        source_widget = getattr(self, "_controls_v2_source_widget", None)
-        if source_widget is not None:
-            source_widget.shutdown_probe_worker()
         # Persist the integration panel settings (the wrangler tree saves
         # continuously; the integrator panel saves here at exit).
         try:
@@ -6878,6 +6910,12 @@ class staticWidget(QWidget):
         # Setting command='stop' (the universal run-end signal) exits the pause
         # wait from any state; bound-wait the thread so teardown is clean.
         self._stop_wrangler_thread_on_close()
+        # The wrangler consumes this same serialized directory authority. Close
+        # it only after processing has stopped so teardown cannot cancel an
+        # observation future that the worker is currently reconciling.
+        source_widget = getattr(self, "_controls_v2_source_widget", None)
+        if source_widget is not None:
+            source_widget.shutdown_probe_worker()
         # Reintegration thread: request a between-batches stop and wait --
         # close() never touched it, so a multi-minute reintegrate-all
         # running at close was destroyed mid-loop (Qt6 qFatal) with its
@@ -8310,14 +8348,21 @@ class staticWidget(QWidget):
         self._sync_controls_v2_source_index()
         source_config = self._controls_v2_container_index_config()
         source_plan = self._controls_v2_freeze_source_run_plan()
-        if source_config is not None and not source_plan:
+        empty_plan = (
+            source_plan is not None
+            and not tuple(getattr(source_plan, "paths", ()) or ())
+        )
+        if (source_config is not None
+                and (source_plan is None
+                     or (empty_plan
+                         and not getattr(self.wrangler, "live_mode", False)))):
             logger.warning(
                 "Run deferred: the authoritative Source-card directory "
                 "snapshot has no ready containers yet")
             source_widget = getattr(self, "_controls_v2_source_widget", None)
             if source_widget is not None:
                 source_widget.directory_status.setText(
-                    "Waiting for ready containers; press Run again")
+                    "Waiting for ready containers; press Run again, or enable Live")
                 source_widget.request_directory_poll()
             return
         self.wrangler.source_run_plan = source_plan
@@ -8783,6 +8828,19 @@ class staticWidget(QWidget):
             "runend_wrangler_finished_exit",
             **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
         )
+        staticWidget._clear_controls_v2_run_source_authority(self)
+
+    def _clear_controls_v2_run_source_authority(self) -> None:
+        """Drop the frozen Source-card handoff after run-end consumers finish."""
+        wrangler = getattr(self, "wrangler", None)
+        if wrangler is None:
+            return
+        wrangler.source_run_plan = None
+        wrangler.source_index_session = None
+        thread = getattr(wrangler, "thread", None)
+        if thread is not None:
+            thread.source_run_plan = None
+            thread.source_index_session = None
 
     def _on_viewer_mode_changed(self, viewer_mode_str):
         """Enable or disable the integrator panel and update h5viewer for viewer mode.

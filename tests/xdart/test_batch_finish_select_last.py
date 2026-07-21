@@ -249,3 +249,20 @@ def test_batch_finish_skips_reload_while_reintegrate_running(tmp_path):
         tmp_path, batch=True, saw_frame=True, reintegrate_running=True)
     host.wrangler_finished()
     assert calls == [], f"must not reload while a reintegrate writes; got {calls}"
+
+
+def test_run_finish_clears_frozen_source_authority(tmp_path):
+    """A later Run must never inherit the prior Source-card snapshot."""
+    host, _h5viewer, _nxs, _calls = _finish_host(
+        tmp_path, batch=False, saw_frame=True)
+    host.wrangler.source_run_plan = object()
+    host.wrangler.source_index_session = object()
+    host.wrangler.thread.source_run_plan = object()
+    host.wrangler.thread.source_index_session = object()
+
+    host.wrangler_finished()
+
+    assert host.wrangler.source_run_plan is None
+    assert host.wrangler.source_index_session is None
+    assert host.wrangler.thread.source_run_plan is None
+    assert host.wrangler.thread.source_index_session is None
