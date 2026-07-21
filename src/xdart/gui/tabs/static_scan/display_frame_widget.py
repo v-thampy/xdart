@@ -74,7 +74,7 @@ from .display_logic import (
     stitch_plot_payload, stitch_image_payload,
     ConsumerKind, SupersedeReason,
 )
-from .display_controllers import register_default_controllers
+from .display_controllers import current_display_label, register_default_controllers
 from .browse_debug import (
     browse_debug_enabled,
     browse_debug_log,
@@ -2186,19 +2186,16 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         shared value instead of re-deriving frame facts from ``scan.scan_data``
         or the publication store.  Never raises into the render path."""
         adapter = getattr(self, "_frame_projection_adapter", None)
-        frame_ids = getattr(self, "frame_ids", None)
-        if adapter is None or not frame_ids:
+        if adapter is None:
             self._current_frame_projection = None
             return
-        try:
-            label = frame_ids[0]
-        except (TypeError, KeyError, IndexError):
+        # X1-GUI-R1: pin the SAME frame raw/cake/title show — the canonical
+        # current-display label (valid one-shot browse anchor, else latest
+        # selected), not frame_ids[0].  One resolver, reused.
+        label = current_display_label(self)
+        if label is None:
             self._current_frame_projection = None
             return
-        try:
-            label = int(label)
-        except (TypeError, ValueError):
-            pass
         try:
             scan_key = overlay_current_scan_key(self)
         except Exception:

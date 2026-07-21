@@ -200,6 +200,34 @@ def _browse_one_shot_anchor_label(widget, selected_ids=()):
     return anchor
 
 
+def current_display_label(widget):
+    """The single frame the raw image, cake, and title describe (X1-GUI-R1).
+
+    One canonical rule, composed from the existing pieces so no consumer
+    re-derives it: the valid one-shot browse anchor
+    (:func:`_browse_one_shot_anchor_label`) wins; otherwise the latest selected
+    frame — the last loaded selected index the 2D/1D panels actually draw
+    (``idxs_2d`` then ``idxs_1d``, matching :meth:`update_2d_label`), falling
+    back to the last selected id before anything is loaded.  Returns ``None`` with
+    no selection.  The X1 projection pins THIS frame so metadata / normalization /
+    wavelength / capability cannot describe a different frame than the image and
+    title.
+    """
+    keys = _label_keys(getattr(widget, "frame_ids", ()) or ())
+    if not keys:
+        return None
+    anchor = _browse_one_shot_anchor_label(widget, keys)
+    if anchor is not None:
+        return anchor
+    for attr in ("idxs_2d", "idxs_1d"):
+        idxs = getattr(widget, attr, None)
+        if idxs:
+            drawn = _label_keys((idxs[-1],))
+            if drawn:
+                return drawn[-1]
+    return keys[-1]
+
+
 def _data_snapshot(widget, *, mode, labels=None, two_d_labels=None,
                    include_legacy=True, request_2d_hydration=True):
     """Snapshot loaded keys + per-frame raw/thumbnail availability.
