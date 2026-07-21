@@ -105,7 +105,7 @@ def test_adapter_falls_back_to_publication_store_for_browse():
     # No record store -> the adapter presents the publication-backed view.
     adapter = FrameProjectionAdapter(_const(None), _const(publications))
 
-    projection = adapter.project(ProjectionRequest("loaded", 4, generation=0))
+    projection = adapter.project(ProjectionRequest("raw", 4, generation=0))
     assert isinstance(projection, FrameProjection)
     assert projection.present is True
     assert "i0" in projection.metadata.raw
@@ -120,7 +120,8 @@ def test_scan_qualified_record_store_serves_only_its_scan():
     record_store = _record_store(5, meta={"i0": 1.0})
     record_store._xdart_scan_key = "A"                   # active run owns scan A
     publications = PublicationStore()
-    publications.upsert(publication_from_frame_view(_view(5, meta={"i0": 999.0})))
+    publications.upsert(publication_from_frame_view(
+        _view(5, meta={"i0": 999.0}, source=("/data/B.nxs", 5))))
     adapter = FrameProjectionAdapter(_const(record_store), _const(publications))
 
     same_scan = adapter.project(ProjectionRequest("A", 5, generation=0))

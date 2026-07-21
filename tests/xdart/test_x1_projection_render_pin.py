@@ -75,6 +75,7 @@ def test_render_pins_one_projection_per_generation(qapp, monkeypatch, tmp_path):
     widget = _make_widget(monkeypatch, tmp_path)
     try:
         display = widget.displayframe
+        display.scan.name = "loaded"
         # Browse path: publish two frames into the shared store, no live run.
         display.publication_store.upsert(publication_from_frame_view(_view(0)))
         display.publication_store.upsert(publication_from_frame_view(_view(1)))

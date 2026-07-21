@@ -54,11 +54,11 @@ def _r1d(scale=1.0):
         radial=radial, intensity=intensity, sigma=np.sqrt(intensity), unit="q_A^-1")
 
 
-def _view(label, *, meta=None):
+def _view(label, *, meta=None, source_path="/data/loaded.nxs"):
     return FrameView.from_results(
         label=label, result_1d=_r1d(),
         metadata_raw=dict(meta or {"i0": 42.0}),
-        source_path="/data/loaded.nxs", source_frame_index=label)
+        source_path=source_path, source_frame_index=label)
 
 
 def _make_widget(monkeypatch, tmp_path):
@@ -92,11 +92,13 @@ def test_r1_multi_selection_pins_latest_not_first(qapp, monkeypatch, tmp_path):
     widget = _make_widget(monkeypatch, tmp_path)
     try:
         display = widget.displayframe
+        display.scan.name = "loaded"
         _publish(display, 0, 1, 2)
         display.frame_ids = (0, 1, 2)          # first=0, latest=2
         display.update()
         proj = display._current_frame_projection
         assert proj is not None
+        assert proj.present is True
         # Fail-before (frame_ids[0]) pinned 0; the current frame is the latest, 2.
         assert proj.label == 2
     finally:
@@ -108,12 +110,14 @@ def test_r1_one_shot_browse_anchor_takes_precedence(qapp, monkeypatch, tmp_path)
     widget = _make_widget(monkeypatch, tmp_path)
     try:
         display = widget.displayframe
+        display.scan.name = "loaded"
         _publish(display, 0, 1, 2)
         display.frame_ids = (0, 1, 2)          # first=0, latest=2
         display._browse_one_shot_anchor_label = 1   # anchor wins over both
         display.update()
         proj = display._current_frame_projection
         assert proj is not None
+        assert proj.present is True
         assert proj.label == 1                 # the valid anchor, not 0 and not 2
     finally:
         widget.close()
@@ -124,6 +128,7 @@ def test_r1_terminal_rapid_selection_generation_wins(qapp, monkeypatch, tmp_path
     widget = _make_widget(monkeypatch, tmp_path)
     try:
         display = widget.displayframe
+        display.scan.name = "loaded"
         _publish(display, 0, 1, 2, 3)
         # Rapid selection: (0,1) then (2,3) — only the terminal selection's
         # current (latest) frame may be pinned.
@@ -133,6 +138,7 @@ def test_r1_terminal_rapid_selection_generation_wins(qapp, monkeypatch, tmp_path
         display.update()
         proj = display._current_frame_projection
         assert proj is not None
+        assert proj.present is True
         assert proj.label == 3                 # terminal latest, never a stale 0
     finally:
         widget.close()
@@ -149,7 +155,8 @@ def test_r2_active_a_paused_browse_b_resume_a_reused_label():
     # requested scan, never the attached active store unconditionally.
     active_a = _qualified_store("A", 0, meta={"scan": "A"})
     browse_b = PublicationStore()
-    browse_b.upsert(publication_from_frame_view(_view(0, meta={"scan": "B"})))
+    browse_b.upsert(publication_from_frame_view(
+        _view(0, meta={"scan": "B"}, source_path="/data/B.nxs")))
     adapter = FrameProjectionAdapter(_const(active_a), _const(browse_b))
 
     following_a = adapter.project(ProjectionRequest("A", 0, generation=0))
@@ -185,6 +192,22 @@ def test_r2_matching_active_path_still_prefers_record_store():
 
     projected = adapter.project(ProjectionRequest("A", 0, generation=0))
     assert projected.metadata.raw["scan"] == "A-store"
+
+
+def test_r2_stale_publication_from_other_scan_fails_closed():
+    # The publication store can briefly retain scan A while the display has
+    # already moved to scan B.  Reused frame labels must not leak A/0 through
+    # the browse fallback after the active A store has been rejected.
+    active_a = _qualified_store("A", 0, meta={"scan": "A-store"})
+    stale_a = PublicationStore()
+    stale_a.upsert(publication_from_frame_view(
+        _view(0, meta={"scan": "A-publication"}, source_path="/data/A.nxs")))
+    adapter = FrameProjectionAdapter(_const(active_a), _const(stale_a))
+
+    projected = adapter.project(ProjectionRequest("B", 0, generation=0))
+
+    assert projected.present is False
+    assert "scan" not in projected.metadata.raw
 
 
 # --------------------------------------------------------------------------- #

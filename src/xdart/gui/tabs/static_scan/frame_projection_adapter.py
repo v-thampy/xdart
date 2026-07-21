@@ -22,15 +22,15 @@ Design contracts (handoff non-negotiables 1-3):
   separate bounded-worker concern (Slice 4), never a GUI-thread disk read here.
 * Request supersession is centralized: the latest generation wins, and a stale
   (older-generation) request can never overwrite the pinned projection.  One
-  lookup is performed per ``(scan_key, frame_index, generation)`` and pinned; a
-  repeat request for the same key returns the pinned value without a second
-  lookup.
+  lookup is performed per complete :class:`ProjectionRequest` identity and
+  pinned; a repeat request returns the pinned value without a second lookup.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from xrd_tools.session import FrameProjection, project_frame
@@ -58,6 +58,67 @@ def _store_serves_scan(store, requested_scan_key) -> bool:
     if owned is None:
         return True
     return requested_scan_key is not None and requested_scan_key == owned
+
+
+def _scan_identity_candidates(value) -> frozenset[str]:
+    """Return comparable spellings for one scan/source identity.
+
+    Display scan keys are usually bare scan names, while publications carry a
+    source path.  Compare those forms through the same canonical source-name
+    parser used by the wrangler, without touching the filesystem.
+    """
+    if value in (None, ""):
+        return frozenset()
+    raw = str(value).strip()
+    if not raw:
+        return frozenset()
+    # A FrameRecord identity may include ``#<frame>``; ownership is the source
+    # container/series, not that concrete frame.
+    source = raw.rsplit("#", 1)[0]
+    portable = source.replace("\\", "/")
+    leaf = portable.rsplit("/", 1)[-1]
+    candidates = {source, portable, leaf}
+    suffix = Path(leaf).suffix.lower()
+    if suffix:
+        candidates.add(Path(leaf).stem)
+        try:
+            from .wranglers.image_wrangler_thread import scan_name_from_source
+
+            candidates.add(scan_name_from_source(portable))
+        except Exception:
+            logger.debug("could not canonicalize publication source identity",
+                         exc_info=True)
+    return frozenset(item.casefold() for item in candidates if item)
+
+
+def _publication_serves_scan(publication, requested_scan_key) -> bool:
+    """Whether a publication belongs to the requested display scan.
+
+    A PublicationStore is shared across scan loads and can briefly retain the
+    preceding scan while a new browse request is being established.  Label
+    equality alone is therefore insufficient: frame zero is reused by nearly
+    every scan.
+    """
+    if publication is None:
+        return False
+    if requested_scan_key is None:
+        return True
+    requested = _scan_identity_candidates(requested_scan_key)
+    if not requested:
+        return False
+    sources = {
+        getattr(publication, "source_identity", None),
+        getattr(getattr(publication, "view", None), "source_path", None),
+        getattr(
+            getattr(getattr(publication, "record", None), "view", None),
+            "source_path",
+            None,
+        ),
+    }
+    owned = frozenset().union(
+        *(_scan_identity_candidates(source) for source in sources)
+    )
+    return bool(requested & owned)
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,13 +152,20 @@ class _PublicationBackedStoreView:
     ``AVAILABLE`` without this view fabricating persistence facts it cannot know.
     """
 
-    __slots__ = ("_publication_store",)
+    __slots__ = ("_publication_store", "_scan_key")
 
-    def __init__(self, publication_store) -> None:
+    def __init__(self, publication_store, scan_key=None) -> None:
         self._publication_store = publication_store
+        self._scan_key = scan_key
+
+    def _publication(self, label):
+        publication = self._publication_store.get(label)
+        if not _publication_serves_scan(publication, self._scan_key):
+            return None
+        return publication
 
     def get(self, label):
-        publication = self._publication_store.get(label)
+        publication = self._publication(label)
         if publication is None:
             return None
         return getattr(publication, "record", None)
@@ -108,7 +176,7 @@ class _PublicationBackedStoreView:
     get_or_hydrate = get
 
     def source_identity(self, label) -> str:
-        publication = self._publication_store.get(label)
+        publication = self._publication(label)
         if publication is None:
             return ""
         return str(getattr(publication, "source_identity", "") or "")
@@ -249,7 +317,8 @@ class FrameProjectionAdapter:
             return record_store
         publication_store = _call_provider(self._publication_store_provider)
         if publication_store is not None:
-            return _PublicationBackedStoreView(publication_store)
+            return _PublicationBackedStoreView(
+                publication_store, scan_key=request.scan_key)
         return None
 
     def _resolve_metadata_provider(self):
