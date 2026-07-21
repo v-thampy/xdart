@@ -5190,6 +5190,10 @@ class staticWidget(QWidget):
             self.disconnect_wrangler()
 
         self.wrangler = self.ui.wranglerStack.widget(qint)
+        # RR-1: the wrangler's _inputs_valid consults the host panel to decide
+        # whether an empty image source is an armed H19 authoritative-directory
+        # Live run (see imageWrangler._h19_empty_directory_live_run_ok).
+        self.wrangler._h19_host = self
         self.wrangler.input_q = self.command_queue
         self.wrangler.fname = self.fname
         self.wrangler.file_lock = self.file_lock
@@ -8474,8 +8478,28 @@ class staticWidget(QWidget):
             logger.debug("run-end scan-row select skipped", exc_info=True)
 
     def wrangler_finished(self):
-        """Called by the wrangler finished signal. If current scan
-        matches the wrangler scan, allows for integration.
+        """Called by the wrangler finished signal.
+
+        RR-2: the run-end tail runs many unguarded GUI finalization steps
+        (set_file, update_scans, selection, display catch-up).  Whatever any of
+        them does, the frozen Source-card handoff must be dropped afterward — a
+        raise part-way through must not leak the plan/session into the next
+        between-run ``setup()`` seeding.  Always clear it in a ``finally``.
+
+        Both calls use the explicit ``staticWidget.<method>(self)`` form (the
+        same idiom the original tail already used for the clear) so the run-end
+        unit tests, which drive this as ``MethodType(staticWidget.wrangler_finished,
+        host)`` on a lightweight ``SimpleNamespace`` double, keep working — the
+        double carries the attributes the body touches, not these helpers.
+        """
+        try:
+            staticWidget._wrangler_finished_body(self)
+        finally:
+            staticWidget._clear_controls_v2_run_source_authority(self)
+
+    def _wrangler_finished_body(self):
+        """The run-end finalization body (see :meth:`wrangler_finished`). If the
+        current scan matches the wrangler scan, allows for integration.
         """
         # End the run through the single run-state owner (task #68) BEFORE the
         # final flush so the 2D panels resume normal blank-on-missing for the
@@ -8828,7 +8852,8 @@ class staticWidget(QWidget):
             "runend_wrangler_finished_exit",
             **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
         )
-        staticWidget._clear_controls_v2_run_source_authority(self)
+        # RR-2: the authoritative-source clear is NOT here — it runs in the
+        # wrangler_finished() ``finally`` so it survives a raise in the tail above.
 
     def _clear_controls_v2_run_source_authority(self) -> None:
         """Drop the frozen Source-card handoff after run-end consumers finish."""

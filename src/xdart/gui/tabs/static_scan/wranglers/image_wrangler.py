@@ -1560,7 +1560,8 @@ class imageWrangler(wranglerWidget):
                     'Load a PONI calibration file to begin.',
                 )
             return False
-        if not self.img_file and not getattr(self, 'stitch_mode', False):
+        if (not self.img_file and not getattr(self, 'stitch_mode', False)
+                and not imageWrangler._h19_empty_directory_live_run_ok(self)):
             imageWrangler._safe_status_text(
                 self,
                 'Choose an image source to run. Use Reintegrate for a loaded processed scan.',
@@ -1569,6 +1570,47 @@ class imageWrangler(wranglerWidget):
         if not imageWrangler._confirm_or_cancel_append_mismatch(self):
             return False
         return True
+
+    def _h19_empty_directory_live_run_ok(self):
+        """RR-1: permit an EMPTY image source (``img_file == ''``) ONLY for an
+        armed H19 authoritative-directory Live run — the arm-then-acquire
+        workflow, where the watched directory is empty at Run time and its first
+        container lands afterward.
+
+        All of these must hold, else the empty source stays rejected (empty
+        non-Live runs, missing/non-directory sources, single-file sources, and
+        legacy non-authoritative configs never inherit the exception):
+
+        * source type is ``Image Directory``;
+        * Live mode is enabled;
+        * the configured directory exists and is a directory;
+        * the host panel owns this config as its authoritative directory path
+          (``_controls_v2_container_index_config`` — Controls V2 on, a container
+          extension, a non-empty root), which is what ``start_wrangler`` will
+          freeze an empty baseline plan for and the worker will keep watching.
+        """
+        if not getattr(self, "live_mode", False):
+            return False
+        try:
+            inp_type = str(
+                self.parameters.child("Signal").child("inp_type").value() or "")
+        except Exception:
+            return False
+        if inp_type != "Image Directory":
+            return False
+        try:
+            img_dir = str(
+                self.parameters.child("Signal").child("img_dir").value() or "").strip()
+        except Exception:
+            return False
+        if not img_dir or not os.path.isdir(os.path.expanduser(img_dir)):
+            return False
+        host = getattr(self, "_h19_host", None)
+        eligible = getattr(host, "_controls_v2_container_index_config", None)
+        try:
+            return bool(callable(eligible) and eligible() is not None)
+        except Exception:
+            return False
 
     def _adopt_loaded_scan_run_inputs(self):
         """Seed Run calibration from a loaded processed scan when blank.
