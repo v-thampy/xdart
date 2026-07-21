@@ -592,3 +592,94 @@ def test_public_api_end_to_end_headless_consumer():
     assert "i0" in proj.normalization_channels
     assert nv(proj.metadata, "i0") == 800.0
     assert mrv(store.get(0).view_1d()).raw["th"] == 12.0
+
+
+# ── independent-review corrections (IFR-1/2/3) ───────────────────────────────
+
+def test_project_frame_out_of_range_provider_index_is_error_not_raise():
+    """IFR-1: an out-of-range provider index (explicit, negative, or inferred
+    from a mismatched record source index) becomes a typed metadata ERROR
+    projection — it must never leak IndexError from the lookup boundary."""
+    prov = _Provider(motors={"th": [10.0, 20.0, 30.0]},
+                     metadata={i: {"i0": float(i)} for i in range(3)},
+                     frame_count=3)
+    store = FrameRecordStore()
+    store.upsert(_record_1d(0, meta={"th": 1.0}))
+
+    proj = project_frame(store, 0, provider=prov, provider_frame_index=999)
+    assert proj.present is True
+    assert proj.capabilities.metadata.state is CapabilityState.ERROR
+    assert not proj.metadata
+
+    proj_neg = project_frame(store, 0, provider=prov, provider_frame_index=-1)
+    assert proj_neg.capabilities.metadata.state is CapabilityState.ERROR
+
+    # automatic path: a record whose source_frame_index exceeds the provider range
+    store.upsert(FrameRecord.from_view(
+        _v1d(1, meta={"th": 1.0}, source=("/raw.h5", 999))))
+    proj_auto = project_frame(store, 1, provider=prov)      # inferred index = 999
+    assert proj_auto.capabilities.metadata.state is CapabilityState.ERROR
+
+    # a VALID index still merges the provider row normally (no regression); the
+    # record's stored fields don't collide with the provider's counters/motors
+    store.upsert(FrameRecord.from_view(
+        _v1d(2, meta={"note": "x"}, source=("/raw.h5", 2))))
+    ok = project_frame(store, 2, provider=prov)
+    assert ok.capabilities.metadata.state is not CapabilityState.ERROR
+    assert ok.metadata.raw["note"] == "x"                   # stored field preserved
+    assert ok.metadata.raw["th"] == 30.0                    # scanned motor at frame 2 merged in
+
+
+def test_store_path_only_identity_reconciles_with_concrete_record_index():
+    """IFR-2: a path-only store identity (`/f.h5#`) reconciles with the record's
+    concrete index (`/f.h5#0`); conflict only on a different path or two
+    different CONCRETE indices."""
+    store = FrameRecordStore()
+    store.upsert(FrameRecord.from_view(_v1d(0, meta={"th": 1.0}, source=("/f.h5", 0))),
+                 source_identity="/f.h5#")                   # path-only stamp
+    proj = project_frame(store, 0)
+    assert proj.capabilities.metadata.state is not CapabilityState.ERROR
+    assert proj.capabilities.identity == "/f.h5#0"           # more-specific reported
+    assert proj.metadata.raw["th"] == 1.0
+
+    # two different concrete indices → genuine conflict
+    store.upsert(FrameRecord.from_view(_v1d(1, meta={"th": 1.0}, source=("/f.h5", 0))),
+                 source_identity="/f.h5#5")
+    assert project_frame(store, 1).capabilities.metadata.state is CapabilityState.ERROR
+
+    # different path → genuine conflict
+    store.upsert(FrameRecord.from_view(_v1d(2, meta={"th": 1.0}, source=("/f.h5", 0))),
+                 source_identity="/other.h5#0")
+    assert project_frame(store, 2).capabilities.metadata.state is CapabilityState.ERROR
+
+
+def test_persisted_but_no_hydrator_is_distinct_from_dropped():
+    """IFR-3: a persisted mode with no hydrator registered is distinguished from
+    a consciously-dropped mode in the capability reason."""
+    resident = _record_1d(9, meta={"th": 1.0})
+    thinner = FrameRecordStore(max_heavy_items=0, require_persisted_for_eviction=False)
+    thinner.upsert(resident)
+    thinned = thinner.get(9)
+    store = FrameRecordStore()                               # NO hydrator registered
+    store.upsert(thinned, persisted=True)                   # persisted on disk
+    assert set(store.persisted_modes(9)) == {("1d", "default")}
+    assert set(store.hydratable_modes(9)) == set()
+
+    cap = project_frame(store, 9).capabilities.integrated_1d
+    assert cap.state is CapabilityState.UNAVAILABLE
+    assert "no hydrator" in cap.reason.lower()               # distinct reason
+    assert "dropped" not in cap.reason.lower()               # NOT mislabeled dropped
+
+    # a genuinely dropped mode is still reported as dropped
+    r2 = SimpleNamespace(
+        radial=np.linspace(1.0, 5.0, 6), azimuthal=np.linspace(-180, 180, 4),
+        intensity=np.arange(24.0).reshape(6, 4), unit="q_A^-1",
+        azimuthal_unit="deg", sigma=None)
+    rec = FrameRecord.from_view(
+        FrameView.from_results(label=10, result_2d=r2, metadata_raw={"th": 1.0}))
+    dstore = FrameRecordStore()
+    dstore.upsert(rec)
+    dstore.mark_dropped(10, modes=("2d", "default"))
+    dcap = project_frame(dstore, 10).capabilities.integrated_2d
+    assert dcap.state is CapabilityState.UNAVAILABLE
+    assert "dropped" in dcap.reason.lower()

@@ -488,9 +488,42 @@ class DisplayCapabilities:
     thumbnail: Capability
 
 
+def _split_identity(identity: str) -> tuple[str, str]:
+    """Split a ``"path#index"`` source identity into ``(path, index)``; a bare
+    string (no ``#``) is a path with an unknown index (``""``)."""
+    text = str(identity)
+    path, sep, idx = text.rpartition("#")
+    return (path, idx) if sep else (text, "")
+
+
+def _identities_conflict(a: str, b: str) -> bool:
+    """IFR-2: two source identities conflict only on a DIFFERENT path or on two
+    DIFFERENT CONCRETE indices; a path-only identity reconciles with a concrete
+    one (mirroring :func:`_record_source_identity`)."""
+    path_a, idx_a = _split_identity(a)
+    path_b, idx_b = _split_identity(b)
+    if path_a != path_b:
+        return True
+    return bool(idx_a and idx_b and idx_a != idx_b)
+
+
+def _reconcile_identity(store_id: str, record_id: str) -> str:
+    """The more-specific of two non-conflicting identities (same path; the
+    concrete index, if either knows it, wins)."""
+    if not store_id:
+        return record_id
+    if not record_id:
+        return store_id
+    path, idx_store = _split_identity(store_id)
+    _, idx_record = _split_identity(record_id)
+    idx = idx_store or idx_record
+    return f"{path}#{idx}"
+
+
 def _integrated_capability(
     record: FrameRecord, dim: str, mode: str | None,
     hydratable_modes: frozenset[tuple[str, str]] | None,
+    persisted_modes: frozenset[tuple[str, str]] | None = None,
 ) -> Capability:
     views = record.results_1d if dim == "1d" else record.results_2d
     if not views:
@@ -504,15 +537,22 @@ def _integrated_capability(
     resident = (view.intensity_1d if dim == "1d" else view.intensity_2d) is not None
     if resident:
         return Capability(CapabilityState.AVAILABLE, "resident")
-    # Thinned: recoverable ONLY if this mode is persisted on disk.  A
-    # consciously-dropped mode (mark_dropped / MEM-1b) is not persisted and not
-    # hydratable → UNAVAILABLE, not a false PENDING.  Without store context
-    # (hydratable_modes None) recoverability is unknown → best-effort PENDING.
-    if hydratable_modes is None:
+    # Thinned.  Three distinct facts (IFR-3): currently hydratable through the
+    # store (persisted AND a hydrator is registered) → PENDING; persisted on
+    # disk but not currently recoverable (no hydrator) → UNAVAILABLE with a
+    # distinct reason; neither → consciously dropped / never written →
+    # UNAVAILABLE.  Without store context (both sets None) recoverability is
+    # unknown → best-effort PENDING.
+    key = (dim, resolved_mode)
+    if hydratable_modes is not None and key in hydratable_modes:
+        return Capability(CapabilityState.PENDING, "thinned; hydratable from store")
+    if persisted_modes is not None and key in persisted_modes:
+        return Capability(
+            CapabilityState.UNAVAILABLE,
+            "thinned; persisted but no hydrator registered")
+    if hydratable_modes is None and persisted_modes is None:
         return Capability(
             CapabilityState.PENDING, "thinned; hydratable if persisted")
-    if (dim, resolved_mode) in hydratable_modes:
-        return Capability(CapabilityState.PENDING, "thinned; hydratable from store")
     return Capability(
         CapabilityState.UNAVAILABLE, "thinned and not persisted (dropped)")
 
@@ -524,17 +564,22 @@ def display_capabilities(
     mode_1d: str | None = None,
     mode_2d: str | None = None,
     hydratable_modes: frozenset[tuple[str, str]] | None = None,
+    persisted_modes: frozenset[tuple[str, str]] | None = None,
 ) -> DisplayCapabilities:
     """Typed, immutable display-capability facts for ``record`` — a PURE
     projection: no I/O, no store mutation, no hydration.
 
     A capability is inferred ONLY from actual resident/recoverable evidence,
     never from the mere presence of a label/title.  ``hydratable_modes`` is the
-    store's per-mode persisted set (``FrameRecordStore.persisted_modes``): a
-    thinned mode is ``pending`` only when its ``(dim, mode)`` key is hydratable,
-    else ``unavailable`` (a consciously dropped mode is not recoverable).  With
-    ``hydratable_modes=None`` (no store context) a thinned mode is best-effort
-    ``pending``.  A record whose views carry conflicting source identities is an
+    store's currently-recoverable per-mode set
+    (``FrameRecordStore.hydratable_modes``: persisted AND a hydrator registered);
+    ``persisted_modes`` is the on-disk set (``FrameRecordStore.persisted_modes``).
+    A thinned mode is ``pending`` when hydratable; ``unavailable`` with a
+    distinct reason when persisted-but-not-hydratable (no hydrator); and
+    ``unavailable`` (dropped) when neither.  With both sets ``None`` (no store
+    context) a thinned mode is best-effort ``pending``.  A store identity that
+    disagrees with the record's own source identity — a different path or two
+    different concrete indices (a path-only vs concrete index reconciles) — is an
     ERROR record (every fact ``error``).
     """
     try:
@@ -542,14 +587,14 @@ def display_capabilities(
     except MetadataConflictError as exc:
         err = Capability(CapabilityState.ERROR, str(exc))
         return DisplayCapabilities("<conflict>", err, err, err, err, err)
-    if source_identity and identity and source_identity != identity:
+    if source_identity and identity and _identities_conflict(source_identity, identity):
         err = Capability(
             CapabilityState.ERROR,
             "store/source identity disagrees with the selected record: "
             f"{source_identity!r} != {identity!r}",
         )
         return DisplayCapabilities("<conflict>", err, err, err, err, err)
-    identity = source_identity if source_identity else identity
+    identity = _reconcile_identity(source_identity or "", identity)
 
     views = tuple(record.results_1d.values()) + tuple(record.results_2d.values())
     row = _EMPTY_ROW
@@ -561,8 +606,10 @@ def display_capabilities(
     metadata = (Capability(CapabilityState.AVAILABLE, "resident") if row
                 else Capability(CapabilityState.UNAVAILABLE, "no metadata"))
 
-    integrated_1d = _integrated_capability(record, "1d", mode_1d, hydratable_modes)
-    integrated_2d = _integrated_capability(record, "2d", mode_2d, hydratable_modes)
+    integrated_1d = _integrated_capability(
+        record, "1d", mode_1d, hydratable_modes, persisted_modes)
+    integrated_2d = _integrated_capability(
+        record, "2d", mode_2d, hydratable_modes, persisted_modes)
 
     raw_resident = any(v.raw is not None for v in views)
     source_eligible = any(v.source_path is not None for v in views)
@@ -645,6 +692,13 @@ def project_frame(
             hydratable = frozenset(getter(label))
         except Exception:
             hydratable = None
+    persisted: frozenset[tuple[str, str]] | None = None
+    pgetter = getattr(store, "persisted_modes", None)
+    if callable(pgetter):
+        try:
+            persisted = frozenset(pgetter(label))
+        except Exception:
+            persisted = None
     # A conflicting record surfaces as a typed ERROR projection (via
     # display_capabilities), never as a raised exception at this boundary.
     row_error: MetadataConflictError | None = None
@@ -656,14 +710,24 @@ def project_frame(
             if index is None and selected_view is not None:
                 index = selected_view.source_frame_index
             if index is not None:
-                provider_row = metadata_row_from_provider(provider, index)
+                try:
+                    provider_row = metadata_row_from_provider(provider, index)
+                except IndexError as exc:
+                    # IFR-1: a provider that cannot serve the selected frame
+                    # (explicit out-of-range/negative index, or a record whose
+                    # source_frame_index does not exist in the paired provider)
+                    # is a provider/record mismatch — surface it as a typed
+                    # metadata ERROR, never leak IndexError from this boundary.
+                    raise MetadataConflictError(
+                        f"provider has no frame {index} to corroborate the "
+                        f"selected record: {exc}") from exc
                 row = _merge_metadata_rows(row, provider_row)
     except MetadataConflictError as exc:
         row_error = exc
         row = _EMPTY_ROW
     caps = display_capabilities(
         record, source_identity=identity, mode_1d=mode_1d, mode_2d=mode_2d,
-        hydratable_modes=hydratable)
+        hydratable_modes=hydratable, persisted_modes=persisted)
     if caps.metadata.state is CapabilityState.ERROR:
         row = _EMPTY_ROW
     if row_error is not None and caps.metadata.state is not CapabilityState.ERROR:
