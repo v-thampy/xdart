@@ -2805,6 +2805,16 @@ class imageThread(wranglerThread):
             max_items=record_store_max_items,
             max_heavy_items=window,
         )
+        # X1-GUI-R2: declare which scan this active-run store owns, matching how
+        # the display resolves its current scan key (overlay current_scan_key:
+        # visible name, else data file).  The projection adapter
+        # (frame_projection_adapter.STORE_SCAN_KEY_ATTR) then serves this store
+        # ONLY for its own scan, so a paused run cannot project into a browse of
+        # a different scan that reuses the same frame labels.
+        _store_scan_key = getattr(scan, "name", None)
+        if _store_scan_key in (None, "", "null_main"):
+            _store_scan_key = getattr(scan, "data_file", None) or None
+        record_store._xdart_scan_key = _store_scan_key
         self._streaming_record_store = record_store
         sink = QtNexusSink(
             self, scan, standard_plan, mask=self.mask, record_store=record_store

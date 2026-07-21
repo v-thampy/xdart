@@ -26,8 +26,16 @@ pytest.importorskip("pyqtgraph")
 from pyqtgraph import QtWidgets
 
 import xdart.gui.tabs.static_scan.frame_projection_adapter as fpa_mod
-from xdart.modules.frame_publication import publication_from_frame_view
-from xrd_tools.core import FrameView, IntegrationResult1D
+from xdart.gui.tabs.static_scan.frame_projection_adapter import (
+    FrameProjectionAdapter,
+    ProjectionRequest,
+)
+from xdart.modules.frame_publication import (
+    PublicationStore,
+    publication_from_frame_view,
+)
+from xrd_tools.core import FrameRecord, FrameView, IntegrationResult1D
+from xrd_tools.session import FrameRecordStore
 
 
 @pytest.fixture(scope="module")
@@ -59,6 +67,17 @@ def _make_widget(monkeypatch, tmp_path):
 def _publish(display, *labels):
     for label in labels:
         display.publication_store.upsert(publication_from_frame_view(_view(label)))
+
+
+def _qualified_store(scan_key, label, *, meta):
+    store = FrameRecordStore(max_heavy_items=None)
+    store.upsert(FrameRecord.from_view(_view(label, meta=meta)))
+    store._xdart_scan_key = scan_key           # active run declares its scan
+    return store
+
+
+def _const(value):
+    return lambda: value
 
 
 # --------------------------------------------------------------------------- #
@@ -114,3 +133,51 @@ def test_r1_terminal_rapid_selection_generation_wins(qapp, monkeypatch, tmp_path
     finally:
         widget.close()
         widget.deleteLater()
+
+
+# --------------------------------------------------------------------------- #
+# X1-GUI-R2: scan-qualified projection-store ownership
+# --------------------------------------------------------------------------- #
+
+def test_r2_active_a_paused_browse_b_resume_a_reused_label():
+    # Active run A owns frame 0; a paused browse loads scan B's frame 0 (reused
+    # label) into the publication store.  The projection must follow the
+    # requested scan, never the attached active store unconditionally.
+    active_a = _qualified_store("A", 0, meta={"scan": "A"})
+    browse_b = PublicationStore()
+    browse_b.upsert(publication_from_frame_view(_view(0, meta={"scan": "B"})))
+    adapter = FrameProjectionAdapter(_const(active_a), _const(browse_b))
+
+    following_a = adapter.project(ProjectionRequest("A", 0, generation=0))
+    assert following_a.metadata.raw["scan"] == "A"       # active store serves A
+
+    paused_browse_b = adapter.project(ProjectionRequest("B", 0, generation=1))
+    assert paused_browse_b.metadata.raw["scan"] == "B"   # browse B, NOT active A/0
+
+    resumed_a = adapter.project(ProjectionRequest("A", 0, generation=2))
+    assert resumed_a.metadata.raw["scan"] == "A"         # back to the active store
+
+
+def test_r2_no_cross_scan_fallback_fails_closed():
+    # Active run A owns frame 0; browsing scan C whose frame 0 is not loaded must
+    # fail closed (absent), never fall back to A/0.
+    active_a = _qualified_store("A", 0, meta={"scan": "A"})
+    empty_browse = PublicationStore()                    # C not loaded
+    adapter = FrameProjectionAdapter(_const(active_a), _const(empty_browse))
+
+    projected = adapter.project(ProjectionRequest("C", 0, generation=0))
+    assert projected is not None
+    assert projected.present is False                    # no A/0 cross-scan leak
+    assert "scan" not in projected.metadata.raw
+
+
+def test_r2_matching_active_path_still_prefers_record_store():
+    # The matching active path is unchanged: A's store wins over a stale
+    # publication for the same label when the request is for A.
+    active_a = _qualified_store("A", 0, meta={"scan": "A-store"})
+    stale_pub = PublicationStore()
+    stale_pub.upsert(publication_from_frame_view(_view(0, meta={"scan": "pub"})))
+    adapter = FrameProjectionAdapter(_const(active_a), _const(stale_pub))
+
+    projected = adapter.project(ProjectionRequest("A", 0, generation=0))
+    assert projected.metadata.raw["scan"] == "A-store"

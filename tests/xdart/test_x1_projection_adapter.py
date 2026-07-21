@@ -112,14 +112,33 @@ def test_adapter_falls_back_to_publication_store_for_browse():
     assert adapter.lookup_count == 1
 
 
-def test_adapter_prefers_record_store_over_publication_store():
+def test_scan_qualified_record_store_serves_only_its_scan():
+    # X1-GUI-R2: a scan-qualified active-run store serves its own scan (record
+    # wins) but NOT a browse of a different scan that reuses the label (the
+    # browsed scan's publication-backed source wins).  Replaces the former
+    # unconditional-preference test the review flagged.
     record_store = _record_store(5, meta={"i0": 1.0})
+    record_store._xdart_scan_key = "A"                   # active run owns scan A
     publications = PublicationStore()
     publications.upsert(publication_from_frame_view(_view(5, meta={"i0": 999.0})))
     adapter = FrameProjectionAdapter(_const(record_store), _const(publications))
 
-    projection = adapter.project(ProjectionRequest("s", 5, generation=0))
-    assert projection.metadata.raw["i0"] == 1.0          # record store wins
+    same_scan = adapter.project(ProjectionRequest("A", 5, generation=0))
+    assert same_scan.metadata.raw["i0"] == 1.0           # active store serves A
+
+    other_scan = adapter.project(ProjectionRequest("B", 5, generation=1))
+    assert other_scan.metadata.raw["i0"] == 999.0        # browse B -> publication
+
+
+def test_unqualified_record_store_serves_any_request_legacy():
+    # A store that declares no scan identity is unqualified (loaded-scan/test) and
+    # serves any request — preserves legacy behavior.
+    record_store = _record_store(5, meta={"i0": 1.0})    # no _xdart_scan_key
+    publications = PublicationStore()
+    publications.upsert(publication_from_frame_view(_view(5, meta={"i0": 999.0})))
+    adapter = FrameProjectionAdapter(_const(record_store), _const(publications))
+    projection = adapter.project(ProjectionRequest("anything", 5, generation=0))
+    assert projection.metadata.raw["i0"] == 1.0
 
 
 # --------------------------------------------------------------------------- #

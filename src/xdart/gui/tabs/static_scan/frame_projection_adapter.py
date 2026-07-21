@@ -39,6 +39,26 @@ logger = logging.getLogger(__name__)
 
 DISPLAY_PURPOSE = "display"
 
+#: Attribute the live run stamps on its ``FrameRecordStore`` to declare which
+#: scan the store owns (see ``image_wrangler_thread`` store creation).  A store
+#: that declares no identity (``None``) is unqualified and serves any request
+#: (legacy/loaded-scan behavior); a store that declares one serves ONLY its scan.
+STORE_SCAN_KEY_ATTR = "_xdart_scan_key"
+
+
+def _store_serves_scan(store, requested_scan_key) -> bool:
+    """Whether ``store`` may serve a request for ``requested_scan_key`` (X1-GUI-R2).
+
+    A scan-qualified active-run store serves only its own scan; a store with no
+    declared identity is unqualified and serves any request.  This is NOT a
+    global preference reversal — an unmatched active store is skipped so the
+    caller falls through to the browsed scan's publication-backed source.
+    """
+    owned = getattr(store, STORE_SCAN_KEY_ATTR, None)
+    if owned is None:
+        return True
+    return requested_scan_key is not None and requested_scan_key == owned
+
 
 @dataclass(frozen=True, slots=True)
 class ProjectionRequest:
@@ -161,7 +181,7 @@ class FrameProjectionAdapter:
         if key == self._pinned_key and self._pinned is not None:
             return self._pinned
 
-        store = self._resolve_store()
+        store = self._resolve_store(request)
         if store is None:
             # No record surface (e.g. a viewer mode with no store): advance the
             # generation watermark but pin nothing.
@@ -206,9 +226,19 @@ class FrameProjectionAdapter:
 
     # -- ownership resolution ----------------------------------------------- #
 
-    def _resolve_store(self):
+    def _resolve_store(self, request):
+        # X1-GUI-R2: the active-run FrameRecordStore serves a request only when
+        # its declared scan identity matches the requested scan.  During a paused
+        # run the live store stays attached while the operator browses another
+        # scan; using it unconditionally could project the active scan's frame
+        # while the raw/cake/publication path shows the browsed scan's same
+        # label.  An unmatched active store is skipped (NOT globally
+        # de-preferred) so browsing falls through to the browsed scan's
+        # publication-backed source; when neither owns the request the projection
+        # fails closed (absent record).
         record_store = _call_provider(self._record_store_provider)
-        if record_store is not None:
+        if record_store is not None and _store_serves_scan(
+                record_store, request.scan_key):
             return record_store
         publication_store = _call_provider(self._publication_store_provider)
         if publication_store is not None:
