@@ -88,6 +88,11 @@ from .display_overlay_utils import (
     overlay_projection_id_for_widget,
     overlay_slice_legend_suffix,
 )
+from .frame_projection_adapter import (
+    DISPLAY_PURPOSE,
+    FrameProjectionAdapter,
+    ProjectionRequest,
+)
 from xdart.utils.throttle import Coalescer
 
 QFileDialog = QtWidgets.QFileDialog
@@ -732,6 +737,19 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # scan/file load — so a worker result computed against an old
         # generation can be dropped (full enforcement lands in Stage 5).
         self.display_generation = 0
+        # X1 GUI-adoption Slice 1: one projection lookup per render generation.
+        # The adapter is the single boundary to
+        # ``xrd_tools.session.project_frame``; ``_update_impl`` pins
+        # ``self._current_frame_projection`` so the metadata / normalization /
+        # wavelength / capability / preview consumers can share ONE immutable
+        # store lookup instead of each re-deriving frame facts from
+        # ``scan.scan_data`` / the publication store (consumer adoption lands in
+        # later slices).  Providers resolve current ownership lazily because the
+        # record store is per-run and the host rebinds ``frame_record_store``
+        # after construction.
+        self._frame_projection_adapter = FrameProjectionAdapter(
+            self._projection_record_store, self._projection_publication_store)
+        self._current_frame_projection = None
         # Persistent stitch display: '1d'/'2d' while a Stitch mode is selected in
         # the wrangler dropdown AND a result exists; None ⇒ the per-frame view.
         # Set by the host via sigStitchModeChanged + stitch_thread_finished;
@@ -2136,6 +2154,67 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         finally:
             self._in_update = False
 
+    # -- X1 Slice 1: one projection lookup per render generation ------------- #
+
+    def _projection_record_store(self):
+        """The active session ``FrameRecordStore`` for a projection lookup.
+
+        Mirrors :meth:`_hydration_stores`: ``frame_record_store`` may be a bound
+        resolver (the host binds ``_active_frame_record_store``) or a store, and
+        is ``None`` for a loaded/browse session — where the adapter falls back to
+        the publication-backed view."""
+        store = getattr(self, "frame_record_store", None)
+        if callable(store):
+            try:
+                store = store()
+            except Exception:
+                logger.debug("projection record-store provider failed",
+                             exc_info=True)
+                return None
+        return store
+
+    def _projection_publication_store(self):
+        return getattr(self, "publication_store", None)
+
+    def _pin_selected_frame_projection(self):
+        """Pin ONE immutable ``project_frame`` result for the primary selected
+        frame at the current display generation.
+
+        Behavior-preserving in this slice: nothing consumes
+        ``_current_frame_projection`` yet — the metadata / normalization /
+        wavelength / capability / preview migrations (later slices) read this
+        shared value instead of re-deriving frame facts from ``scan.scan_data``
+        or the publication store.  Never raises into the render path."""
+        adapter = getattr(self, "_frame_projection_adapter", None)
+        frame_ids = getattr(self, "frame_ids", None)
+        if adapter is None or not frame_ids:
+            self._current_frame_projection = None
+            return
+        try:
+            label = frame_ids[0]
+        except (TypeError, KeyError, IndexError):
+            self._current_frame_projection = None
+            return
+        try:
+            label = int(label)
+        except (TypeError, ValueError):
+            pass
+        try:
+            scan_key = overlay_current_scan_key(self)
+        except Exception:
+            scan_key = None
+        request = ProjectionRequest(
+            scan_key=scan_key,
+            frame_index=label,
+            generation=self.display_generation,
+            purpose=DISPLAY_PURPOSE,
+        )
+        try:
+            self._current_frame_projection = adapter.project(request)
+        except Exception:
+            logger.debug("selected-frame projection pin failed", exc_info=True)
+            self._current_frame_projection = None
+
     def _update_impl(self):
         """Update the image and plot panels for the current selection.
 
@@ -2149,6 +2228,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.refresh_norm_channels()
         self.get_idxs()
         self._note_selection_generation()   # bump generation on selection change
+        # X1 Slice 1: one project_frame lookup for the primary selected frame,
+        # pinned per display generation for the (later-slice) shared consumers.
+        # Explicit class form (not self._pin...) so the duck-host render tests
+        # that drive _update_impl on a SimpleNamespace — binding only the
+        # methods they exercise — keep working; the method itself no-ops when
+        # the projection adapter is absent on such a host.
+        displayFrameWidget._pin_selected_frame_projection(self)
 
         if not self._updated():
             # Nothing to draw yet for the current selection.  Only render the
