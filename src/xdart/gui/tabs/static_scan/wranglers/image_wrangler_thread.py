@@ -1590,7 +1590,21 @@ class imageThread(wranglerThread):
                     break                 # Pause -> Stop while watching
                 img_file, scan_name, img_number, img_data, img_meta = self.get_next_image()
                 if img_data is None:
-                    # Nothing new yet — show watching status and sleep
+                    # A live scan can be complete without a successor arriving
+                    # to trigger the scan-swap flush.  Make its serial tail
+                    # durable at the first idle observation so the final XYE
+                    # folder and processed rows appear while the run remains
+                    # armed.  The counter is reset by a successful flush, so
+                    # subsequent watch ticks stay cheap no-ops.
+                    if (scan is not None and not self.xye_only
+                            and self._frames_since_save > 0):
+                        _n_idle = self._frames_since_save
+                        if self.flush_serial_tail(scan, force=True):
+                            logger.info(
+                                '[SAVE-ON-IDLE] %d frame(s) made durable for %s',
+                                _n_idle, scan.name,
+                            )
+                    # Nothing new yet — show watching status and sleep.
                     self.showLabel.emit('Watching for new files...')
                     time.sleep(poll_s)
                     poll_s = min(poll_s * _poll_growth, _poll_max)

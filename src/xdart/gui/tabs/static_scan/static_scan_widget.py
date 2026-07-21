@@ -2816,9 +2816,36 @@ class staticWidget(QWidget):
                 return
             can_run = bool(getattr(profile, "can_run", False))
             live_armable = self._controls_v2_live_watch_armable()
-            controls.set_run_row_enabled(can_run or live_armable)
-            if getattr(controls, "action_phase", lambda: "idle")() == "idle":
+            row_enabled = can_run or live_armable
+            controls.set_run_row_enabled(row_enabled)
+            phase = getattr(controls, "action_phase", lambda: "idle")()
+            if phase == "idle":
+                # Child widgets retain explicit disabled state independently
+                # of their parent on native Qt.  This method owns idle
+                # readiness, so restore both affordances explicitly.
+                controls.liveButton.setEnabled(row_enabled)
                 controls.startButton.setEnabled(can_run)
+
+            signature = (
+                bool(can_run), bool(live_armable), bool(row_enabled), str(phase),
+                bool(controls.liveButton.isEnabled()),
+                bool(controls.liveButton.isChecked()),
+                bool(controls.startButton.isEnabled()),
+            )
+            if signature != getattr(
+                    self, "_controls_v2_run_affordance_debug_signature", None):
+                self._controls_v2_run_affordance_debug_signature = signature
+                browse_debug_log(
+                    logger,
+                    "controls_run_affordances",
+                    can_run=can_run,
+                    live_armable=live_armable,
+                    row_enabled=row_enabled,
+                    phase=phase,
+                    live_enabled=controls.liveButton.isEnabled(),
+                    live_checked=controls.liveButton.isChecked(),
+                    run_enabled=controls.startButton.isEnabled(),
+                )
         except Exception:
             logger.debug("Controls V2 run-row readiness sync failed",
                          exc_info=True)

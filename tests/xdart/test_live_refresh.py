@@ -9648,6 +9648,97 @@ def test_batch_process_scan_dispatches_each_frame_as_read():
     }
 
 
+def test_live_directory_idle_flushes_last_scan_xye_before_stop(
+        monkeypatch, tmp_path):
+    """The last live scan becomes durable when the watcher first goes idle.
+
+    A later scan flushes its predecessor at the scan-swap boundary.  The final
+    scan has no successor, so its sub-interval serial tail must be flushed
+    before the watcher sleeps rather than waiting for Stop.
+    """
+    from xdart.gui.tabs.static_scan.wranglers import image_wrangler_thread as mod
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+
+    output_root = tmp_path / "processed"
+    xye_dir = output_root / "last_scan"
+    queue = [
+        # Initial empty-directory observation moves the run into live watch.
+        (None, None, None, None, None),
+        (
+            str(tmp_path / "last_scan.nxs"),
+            "last_scan",
+            0,
+            np.ones((2, 2)),
+            {"i0": 1.0},
+        ),
+        # First idle observation after the newly arrived scan.
+        (None, None, None, None, None),
+    ]
+    idle_observations = []
+
+    def next_image():
+        return queue.pop(0)
+
+    def make_scan():
+        return SimpleNamespace(
+            name="last_scan",
+            frames=SimpleNamespace(index=[]),
+            skip_2d=False,
+            data_file=str(output_root / "last_scan.nxs"),
+        )
+
+    host = SimpleNamespace(
+        command="start",
+        batch_mode=False,
+        live_mode=True,
+        single_img=False,
+        xye_only=False,
+        series_average=False,
+        img_file="",
+        poni=None,
+        scan_name="",
+        _frames_since_save=0,
+        _active_scan=None,
+        _perf=None,
+        _live_execution=lambda: "serial",
+        _h19_live_directory_armed=lambda: True,
+        _eiger_single_file_watchable=lambda: False,
+        showLabel=SimpleNamespace(emit=lambda *_: None),
+        sigUpdate=SimpleNamespace(emit=lambda *_: None),
+        _wait_if_paused=lambda: None,
+        get_next_image=next_image,
+        initialize_scan=make_scan,
+        _install_run_integrator=lambda *_: None,
+        _append_frame_complete=lambda *_: False,
+        _record_skip_reason=lambda *_: None,
+        get_background=lambda *_: 0.0,
+        _process_one=lambda *_: None,
+        _prime_append_skip_snapshots_for_run=lambda: None,
+        _flush_outgoing_scan=lambda *_: None,
+        _report_run_skip_summary=lambda *_: None,
+    )
+
+    def flush_serial_tail(scan, *, force=False):
+        if not force or host._frames_since_save <= 0:
+            return False
+        xye_dir.mkdir(parents=True, exist_ok=True)
+        host._frames_since_save = 0
+        return True
+
+    host.flush_serial_tail = flush_serial_tail
+
+    def observe_idle(_seconds):
+        idle_observations.append(xye_dir.is_dir())
+        host.command = "stop"
+
+    monkeypatch.setattr(mod.time, "sleep", observe_idle)
+
+    MethodType(imageThread.process_scan, host)()
+
+    assert idle_observations == [True]
+    assert xye_dir.is_dir()
+
+
 def test_batch_single_frame_still_routes_to_streaming_when_live_policy_serial():
     """N2 submits one-frame pending chunks.  Batch must still use the streaming
     dispatcher even if the live-mode fallback env is serial; otherwise the new

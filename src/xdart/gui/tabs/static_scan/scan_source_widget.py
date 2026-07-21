@@ -752,9 +752,14 @@ class ScanSourceWidget(QtWidgets.QWidget):
     ):
         if not self._controls_source or self._directory_session is None:
             raise RuntimeError("widget is not in controls_source mode")
+        previous_generation = self._directory_session.request_generation
         generation = self._directory_session.configure(
             root, recursive=recursive, name_filter=name_filter,
             suffixes=suffixes)
+        if generation != previous_generation:
+            self._directory_observation = None
+            self._directory_signature = None
+            self.directory_status.setText("Checking directory…")
         self.request_directory_poll()
         return generation
 
@@ -774,7 +779,6 @@ class ScanSourceWidget(QtWidgets.QWidget):
         future = self._directory_future
         if future is not None and not future.done():
             return
-        self.directory_status.setText("Checking directory…")
         future = session.observe_async()
         self._directory_future = future
 

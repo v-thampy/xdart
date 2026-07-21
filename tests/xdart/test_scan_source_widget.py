@@ -273,6 +273,14 @@ def test_controls_source_widget_emits_latest_directory_generation(
         assert emitted[-1].request_generation == (
             w.directory_session.request_generation)
         assert w.directory_status.text() == "2 ready"
+
+        # Routine watch polls must leave the last completed observation on
+        # screen.  Replacing it with a one-frame "Checking directory..."
+        # message once per second makes the Source card visibly flicker.
+        w.request_directory_poll()
+        assert w.directory_status.text() == "2 ready"
+        assert _wait_for(qapp, lambda: w._directory_future is None)
+        assert w.directory_status.text() == "2 ready"
     finally:
         w.shutdown_probe_worker()
         w.deleteLater()

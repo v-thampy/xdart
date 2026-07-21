@@ -141,6 +141,15 @@ def test_rr1_empty_live_directory_arms_through_real_run_button(
         assert widget.controls.startButton.isEnabled() is False
         assert "Enable Live" in widget.controls.readinessLabel.text()
 
+        # A child button can retain an explicit disabled state even after its
+        # parent action row is enabled (observed in the native macOS widget).
+        # The readiness owner must restore the child affordances themselves.
+        widget.controls.liveButton.setEnabled(False)
+        widget._refresh_controls_v2_profile(immediate=True)
+        assert widget.controls.actionRow.isEnabled() is True
+        assert widget.controls.liveButton.isEnabled() is True
+        assert widget.controls.startButton.isEnabled() is False
+
         poni = _poni()
         widget.wrangler.poni = poni
         widget.scan._cached_poni = poni
