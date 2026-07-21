@@ -2177,32 +2177,37 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         return getattr(self, "publication_store", None)
 
     def _pin_selected_frame_projection(self):
-        """Pin ONE immutable ``project_frame`` result for the primary selected
-        frame at the current display generation.
+        """Pin ONE immutable ``project_frame`` result for the current display
+        frame at the current generation.
 
-        Behavior-preserving in this slice: nothing consumes
-        ``_current_frame_projection`` yet — the metadata / normalization /
-        wavelength / capability / preview migrations (later slices) read this
-        shared value instead of re-deriving frame facts from ``scan.scan_data``
-        or the publication store.  Never raises into the render path."""
+        Consumed by the metadata popup and normalization-channel discovery (X1
+        Slice 2) — all through the shared, memoized :meth:`projection_for`, so a
+        selected-frame render performs one store lookup shared by every consumer
+        (handoff contract 2).  Never raises into the render path."""
+        self._current_frame_projection = displayFrameWidget.projection_for(self)
+
+    def projection_for(self, label=None):
+        """The shared immutable :class:`FrameProjection` for the current display
+        frame (``label=None``) or an explicit label.
+
+        Builds the COMPLETE scan-qualified, mode-aware request and returns the
+        adapter's memoized result — one lookup per full identity, shared across
+        the render pin, the metadata popup, and channel discovery.  Never a bare
+        label: it composes the canonical current-frame resolver (X1-GUI-R1), the
+        scan key (R2), and the canonical active modes (R3).  Returns ``None`` when
+        no adapter / store / current frame is resolvable — callers FAIL CLOSED
+        and must not fall back to ``scan.scan_data``."""
         adapter = getattr(self, "_frame_projection_adapter", None)
         if adapter is None:
-            self._current_frame_projection = None
-            return
-        # X1-GUI-R1: pin the SAME frame raw/cake/title show — the canonical
-        # current-display label (valid one-shot browse anchor, else latest
-        # selected), not frame_ids[0].  One resolver, reused.
-        label = current_display_label(self)
+            return None
         if label is None:
-            self._current_frame_projection = None
-            return
+            label = current_display_label(self)
+        if label is None:
+            return None
         try:
             scan_key = overlay_current_scan_key(self)
         except Exception:
             scan_key = None
-        # X1-GUI-R3: canonical active modes are part of the projection identity —
-        # project_frame derives capabilities from them, so a mode change must
-        # re-project even within one render generation.
         try:
             mode_1d, mode_2d = displayFrameWidget._projection_active_modes(self)
         except Exception:
@@ -2216,10 +2221,23 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             mode_2d=mode_2d,
         )
         try:
-            self._current_frame_projection = adapter.project(request)
+            return adapter.project(request)
         except Exception:
-            logger.debug("selected-frame projection pin failed", exc_info=True)
-            self._current_frame_projection = None
+            logger.debug("selected-frame projection failed", exc_info=True)
+            return None
+
+    def _projection_norm_channels(self):
+        """Available normalization-channel keys from the CURRENT scan-qualified
+        projection, or ``()`` when none is resolvable.
+
+        Fail closed (X1-GUI S2-R5): never reuse a prior scan's channels as
+        authoritative.  When the current projection is absent/not-present, the
+        available-channel set is empty until the current scan supplies it —
+        the combo may keep its selected text visually, but this set is truth."""
+        projection = displayFrameWidget.projection_for(self)
+        if projection is None or not getattr(projection, "present", False):
+            return ()
+        return tuple(projection.normalization_channels)
 
     def _projection_active_modes(self):
         """Canonical ``(mode_1d, mode_2d)`` for the current display (X1-GUI-R3).
@@ -4620,6 +4638,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         """Update plots if norm channel exists"""
         norm_channel = self.get_normChannel()
         if norm_channel:
+            # TEMPORARY (X1 S2-R8): this whole-scan norm SUM decides whether the
+            # channel applies to the aggregate 2D cake — a WHOLE-SCAN AGGREGATE,
+            # not the per-frame selected projection.  It stays on ``scan_data``
+            # until the deferred headless batch/aggregate projection owner lands.
+            # (Channel DISCOVERY above already comes from the projection.)
             # scan_data may now carry non-numeric columns (N2): treat a
             # non-numeric / zero norm channel as "no normalization".
             try:

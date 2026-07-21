@@ -27,7 +27,8 @@ class metadataWidget(Qt.QtWidgets.QWidget):
         update: Updates the data displayed
     """
     def __init__(self, scan, frame, frame_ids, frames, parent=None,
-                 viewer_rows_1d=None, publication_store=None, data_lock=None):
+                 viewer_rows_1d=None, publication_store=None, data_lock=None,
+                 projection_source=None):
         super().__init__(parent)
         self.layout = Qt.QtWidgets.QVBoxLayout()
         self.layout.setContentsMargins(0, 0, 0, 0)
@@ -49,6 +50,11 @@ class metadataWidget(Qt.QtWidgets.QWidget):
         self.publication_store = publication_store
         self.data_lock = data_lock if data_lock is not None else threading.RLock()
         self.viewer_mode = None
+        # X1 Slice 2: the display widget, whose ``projection_for()`` supplies the
+        # shared scan-qualified :class:`FrameProjection` for the current frame.
+        # When present it is the SOLE metadata authority (no ``scan_data`` read);
+        # ``None`` means a store-less test/legacy host uses the pre-X1 path.
+        self.projection_source = projection_source
 
     def showEvent(self, event):
         """Refresh when the panel becomes visible — ``update()`` short-
@@ -92,6 +98,38 @@ class metadataWidget(Qt.QtWidgets.QWidget):
                 and int(self.frame.idx) == sel_int):
             return self.frame
         return None
+
+    def _projection_metadata_update(self):
+        """Render the CURRENT display frame's projected ``MetadataRow`` when a
+        projection source is wired (X1 Slice 2).
+
+        Returns True when it OWNS the update — i.e. a projection source is
+        present — so production never continues to the ``scan_data`` path.  An
+        absent / no-selection / conflicting-ERROR projection shows an empty table
+        (fail closed, S2-R6/R7), never a contradictory ``scan_data`` value.
+        Returns False only for a store-less test/legacy host (no source), which
+        then uses the pre-X1 path."""
+        source = getattr(self, "projection_source", None)
+        getter = getattr(source, "projection_for", None)
+        if not callable(getter):
+            return False
+        try:
+            projection = getter()
+        except Exception:
+            projection = None
+        visible_info = {}
+        if projection is not None and getattr(projection, "present", False):
+            visible_info = {
+                key: value
+                for key, value in projection.metadata.raw.items()
+                if not str(key).startswith("_")     # hide internal keys
+            }
+        if visible_info:
+            data = pd.DataFrame(visible_info, index=[projection.label])
+            self.tableview.setModel(DFTableModel(data.transpose()))
+        else:
+            self.tableview.setModel(DFTableModel())
+        return True
 
     def _resolve_selected_publication(self):
         if not self.frame_ids or self.publication_store is None:
@@ -143,6 +181,12 @@ class metadataWidget(Qt.QtWidgets.QWidget):
         # silently blanked the panel.  The tableview is the widget actually
         # on screen, so its visibility is the correct gate.
         if not self.tableview.isVisible():
+            return
+        # X1 Slice 2: in normal (non-viewer) display the current frame's metadata
+        # comes from the shared scan-qualified projection — never ``scan_data`` —
+        # when a projection source is wired (production).  Viewer modes and
+        # store-less test/legacy hosts keep the pre-X1 publication/frame path.
+        if self.viewer_mode is None and self._projection_metadata_update():
             return
         sd = getattr(self.scan, "scan_data", None)
         if (

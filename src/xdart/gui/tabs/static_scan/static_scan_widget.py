@@ -942,7 +942,11 @@ class staticWidget(QWidget):
                                          self.frame_ids, self.frames,
                                          viewer_rows_1d=self.viewer_rows_1d,
                                          publication_store=self.publication_store,
-                                         data_lock=self.data_lock)
+                                         data_lock=self.data_lock,
+                                         # X1 Slice 2: the display widget supplies
+                                         # the shared scan-qualified projection for
+                                         # the current frame's metadata.
+                                         projection_source=self.displayframe)
         # Stage 4 (Direction A): the metadata table is no longer inline in the
         # bottom-left.  It opens on demand via the "Metadata" button, which
         # reparents this same metawidget into a popup dialog (see

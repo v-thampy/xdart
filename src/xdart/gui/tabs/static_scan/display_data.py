@@ -33,6 +33,7 @@ from xrd_tools.core import (
     view_to_result_1d,
     view_to_result_2d,
 )
+from xrd_tools.session import MetadataRow, normalization_value
 
 logger = logging.getLogger(__name__)
 
@@ -1146,6 +1147,12 @@ class DisplayDataMixin:
             else:
                 norm_fac = len(self.scan.frames.index)
                 if self.normChannel:
+                    # TEMPORARY (X1 S2-R8): whole-scan 2D-cake normalization is a
+                    # WHOLE-SCAN AGGREGATE, not a per-frame projection.  It stays
+                    # on ``scan_data`` until the deferred headless value-only
+                    # batch/aggregate projection owner exists (row identities,
+                    # missing/invalid policy, no GUI-thread I/O).  Do NOT migrate
+                    # this to the selected-frame adapter.
                     # scan_data may now carry non-numeric columns (N2); a
                     # non-numeric norm channel degrades to no normalization
                     # rather than crashing on a string ``.sum()``.
@@ -1534,16 +1541,43 @@ class DisplayDataMixin:
         except AttributeError:
             return np.zeros((10, 10))
 
+        # X1 Slice 2 (S2-R3): row-aligned render math.  ``scan_info`` is THIS
+        # frame's / publication's own metadata (every caller passes its own row),
+        # so each Overlay/Waterfall trace is normalized by its own monitor value,
+        # never the selected frame's.  The value + guard now come from the
+        # headless ``normalization_value`` (finite-positive, case-insensitive).
         normChannel = self.get_normChannel(scan_data_keys=scan_info.keys())
-        if normChannel and (scan_info[normChannel] > 0):
-            intensity /= scan_info[normChannel]
+        if normChannel:
+            value = normalization_value(MetadataRow(raw=dict(scan_info)), normChannel)
+            if value:
+                intensity /= value
 
         return intensity
+
+    def _norm_channel_discovery_keys(self):
+        """Candidate keys for normalization-channel DISCOVERY (the combo).
+
+        X1 Slice 2: production sources them from the current scan-qualified
+        projection and fails closed (empty) when none is current — never
+        reusing a prior scan's channels (S2-R5).  Only a store-less test/legacy
+        host with no projection wiring falls back to ``scan.scan_data``; the
+        production widget always has ``_projection_norm_channels`` and so cannot
+        read ``scan_data`` here (S2-R6, guarded by a mutation test).  This is
+        DISCOVERY only — per-row ``normalize`` passes its own frame keys."""
+        getter = getattr(self, "_projection_norm_channels", None)
+        if callable(getter):
+            return list(getter())
+        try:
+            return list(self.scan.scan_data.columns)
+        except Exception:
+            return []
 
     def get_normChannel(self, scan_data_keys=None):
         """Check to see if normalization channel exists in metadata and return name"""
         if scan_data_keys is None:
-            scan_data_keys = self.scan.scan_data.columns
+            # Class-form dispatch so duck-host tests that bind only get_normChannel /
+            # refresh_norm_channels keep working (the helper need not be bound).
+            scan_data_keys = DisplayDataMixin._norm_channel_discovery_keys(self)
         keys = list(scan_data_keys)
         if not keys:
             return None
@@ -1572,10 +1606,10 @@ class DisplayDataMixin:
         combo = getattr(getattr(self, 'ui', None), 'normChannel', None)
         if combo is None:
             return
-        try:
-            keys = list(self.scan.scan_data.columns)
-        except Exception:
-            keys = []
+        # X1 Slice 2: discover channels from the current scan-qualified projection
+        # (fail closed across scan changes), not ``scan.scan_data.columns``.
+        # Class-form dispatch keeps duck-host tests working.
+        keys = DisplayDataMixin._norm_channel_discovery_keys(self)
         channels = available_norm_channels(keys)
         current = self.get_normChannel(scan_data_keys=keys)
         signature = tuple(channels)
