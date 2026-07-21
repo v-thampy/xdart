@@ -62,12 +62,20 @@ def _store_serves_scan(store, requested_scan_key) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class ProjectionRequest:
-    """A scan-qualified request for one selected frame's projection."""
+    """A scan-qualified request for one selected frame's projection.
+
+    ``mode_1d``/``mode_2d`` are the canonical active display modes; they are part
+    of the intrinsic identity (X1-GUI-R2/R3) because ``project_frame`` derives
+    capabilities from them, so a mode change must yield a fresh projection even
+    within one render generation.
+    """
 
     scan_key: Any
     frame_index: int | str
     generation: int
     purpose: str = DISPLAY_PURPOSE
+    mode_1d: str | None = None
+    mode_2d: str | None = None
 
 
 class _PublicationBackedStoreView:
@@ -158,26 +166,25 @@ class FrameProjectionAdapter:
 
     # -- the single lookup boundary ----------------------------------------- #
 
-    def project(
-        self,
-        request: ProjectionRequest,
-        *,
-        mode_1d: str | None = None,
-        mode_2d: str | None = None,
-    ) -> FrameProjection | None:
+    def project(self, request: ProjectionRequest) -> FrameProjection | None:
         """Return the immutable projection for ``request``.
 
         Supersession: a request older than the latest observed generation is
         dropped (returns ``None``) so a stale completion cannot change the
         display.  For the current generation, one lookup is performed and pinned;
-        an identical repeat returns the pinned value with no second lookup.
+        an identical repeat (same scan/frame/generation/purpose AND canonical
+        modes) returns the pinned value with no second lookup.  A mode change at
+        the same generation is a distinct identity and performs a fresh lookup.
         Returns ``None`` when no store or record is resolvable (nothing to show).
         """
         if request.generation < self._latest_generation:
             # Superseded: a newer selection/generation has already been pinned.
             return None
 
-        key = (request.scan_key, request.frame_index, request.generation, request.purpose)
+        key = (
+            request.scan_key, request.frame_index, request.generation,
+            request.purpose, request.mode_1d, request.mode_2d,
+        )
         if key == self._pinned_key and self._pinned is not None:
             return self._pinned
 
@@ -195,8 +202,8 @@ class FrameProjectionAdapter:
             projection = project_frame(
                 store,
                 request.frame_index,
-                mode_1d=mode_1d,
-                mode_2d=mode_2d,
+                mode_1d=request.mode_1d,
+                mode_2d=request.mode_2d,
                 provider=provider,
             )
         except Exception:

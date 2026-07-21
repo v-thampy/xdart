@@ -2200,17 +2200,46 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             scan_key = overlay_current_scan_key(self)
         except Exception:
             scan_key = None
+        # X1-GUI-R3: canonical active modes are part of the projection identity —
+        # project_frame derives capabilities from them, so a mode change must
+        # re-project even within one render generation.
+        try:
+            mode_1d, mode_2d = displayFrameWidget._projection_active_modes(self)
+        except Exception:
+            mode_1d = mode_2d = None
         request = ProjectionRequest(
             scan_key=scan_key,
             frame_index=label,
             generation=self.display_generation,
             purpose=DISPLAY_PURPOSE,
+            mode_1d=mode_1d,
+            mode_2d=mode_2d,
         )
         try:
             self._current_frame_projection = adapter.project(request)
         except Exception:
             logger.debug("selected-frame projection pin failed", exc_info=True)
             self._current_frame_projection = None
+
+    def _projection_active_modes(self):
+        """Canonical ``(mode_1d, mode_2d)`` for the current display (X1-GUI-R3).
+
+        ``(None, None)`` for a non-GI scan (project_frame then uses the record's
+        active view).  For a GI scan, the displayed BAI-args mode canonicalized
+        the same way as :meth:`staticWidget._active_frame_record_modes`, so the
+        pinned capability follows the mode the user is actually viewing."""
+        scan = getattr(self, "scan", None)
+        if not displayFrameWidget._display_gi_enabled(scan):
+            return None, None
+        from xrd_tools.io.nexus_record import (
+            legacy_to_canonical_1d,
+            legacy_to_canonical_2d,
+        )
+        args_1d = displayFrameWidget._display_bai_args(scan, "1d") or {}
+        args_2d = displayFrameWidget._display_bai_args(scan, "2d") or {}
+        mode_1d = legacy_to_canonical_1d(str(args_1d.get("gi_mode_1d", "q_total")))
+        mode_2d = legacy_to_canonical_2d(str(args_2d.get("gi_mode_2d", "qip_qoop")))
+        return mode_1d, mode_2d
 
     def _update_impl(self):
         """Update the image and plot panels for the current selection.

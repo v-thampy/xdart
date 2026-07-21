@@ -25,7 +25,6 @@ import pytest
 pytest.importorskip("pyqtgraph")
 from pyqtgraph import QtWidgets
 
-import xdart.gui.tabs.static_scan.frame_projection_adapter as fpa_mod
 from xdart.gui.tabs.static_scan.frame_projection_adapter import (
     FrameProjectionAdapter,
     ProjectionRequest,
@@ -34,8 +33,13 @@ from xdart.modules.frame_publication import (
     PublicationStore,
     publication_from_frame_view,
 )
-from xrd_tools.core import FrameRecord, FrameView, IntegrationResult1D
-from xrd_tools.session import FrameRecordStore
+from xrd_tools.core import (
+    FrameRecord,
+    FrameView,
+    IntegrationResult1D,
+    IntegrationResult2D,
+)
+from xrd_tools.session import CapabilityState, FrameRecordStore
 
 
 @pytest.fixture(scope="module")
@@ -181,3 +185,59 @@ def test_r2_matching_active_path_still_prefers_record_store():
 
     projected = adapter.project(ProjectionRequest("A", 0, generation=0))
     assert projected.metadata.raw["scan"] == "A-store"
+
+
+# --------------------------------------------------------------------------- #
+# X1-GUI-R3: canonical modes in the projection/memo identity
+# --------------------------------------------------------------------------- #
+
+def _r2d():
+    radial = np.linspace(-1.0, 1.0, 3)
+    azimuthal = np.linspace(-0.5, 0.5, 2)
+    intensity = np.arange(6.0).reshape(3, 2)
+    return IntegrationResult2D(
+        radial=radial, azimuthal=azimuthal, intensity=intensity,
+        sigma=np.sqrt(intensity + 1.0),
+        unit="qip_A^-1", azimuthal_unit="qoop_A^-1")
+
+
+def _gi_2d_store(label):
+    view = FrameView.from_results(
+        label=label, result_2d=_r2d(), metadata_raw={"i0": 1.0},
+        source_path="/data/gi.nxs", source_frame_index=label)
+    store = FrameRecordStore(max_heavy_items=None)
+    store.upsert(FrameRecord.from_view(view))
+    return store
+
+
+def test_r3_mode_change_same_generation_relooks_up_with_correct_capability():
+    # The record's 2D view is present for its own mode ("default") and absent for
+    # any other requested mode — so the two modes give distinct capabilities.
+    store = _gi_2d_store(0)
+    adapter = FrameProjectionAdapter(_const(store), _const(None))
+
+    present = adapter.project(
+        ProjectionRequest("s", 0, generation=0, mode_2d="default"))
+    absent = adapter.project(
+        ProjectionRequest("s", 0, generation=0, mode_2d="q_chi"))
+
+    # Fail-before (mode-insensitive memo key) returned the FIRST projection for
+    # the second request: one lookup, and the wrong (AVAILABLE) 2D capability for
+    # the absent mode.
+    assert adapter.lookup_count == 2
+    assert absent is not present
+    assert present.capabilities.integrated_2d.state is CapabilityState.AVAILABLE
+    assert absent.capabilities.integrated_2d.state is not CapabilityState.AVAILABLE
+
+
+def test_r3_same_identity_including_modes_reuses_one_pin():
+    # The one-projection-per-generation behavior is preserved when the COMPLETE
+    # identity (scan/frame/generation/purpose AND modes) is unchanged.
+    store = _gi_2d_store(0)
+    adapter = FrameProjectionAdapter(_const(store), _const(None))
+    first = adapter.project(
+        ProjectionRequest("s", 0, generation=0, mode_2d="default"))
+    again = adapter.project(
+        ProjectionRequest("s", 0, generation=0, mode_2d="default"))
+    assert again is first
+    assert adapter.lookup_count == 1
