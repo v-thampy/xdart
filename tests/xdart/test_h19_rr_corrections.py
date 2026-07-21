@@ -1,13 +1,9 @@
 """Production-wired regression tests for the two H19 review corrections.
 
-RR-1 — empty-directory Live arming must be reachable through the REAL Run
-button.  ``imageWrangler._inputs_valid`` used to reject ``img_file == ''`` before
-``start()`` could reach ``sigStart``/``start_wrangler`` (the only place the empty
-baseline plan is frozen), so the arm-then-acquire workflow — watch an empty
-directory, arm a Live run, let the first container land afterward — was
-unreachable from the user boundary.  These tests drive ``wrangler.start()`` (not
-``static_scan_widget.start_wrangler()`` directly), so they exercise the exact
-gate that was broken.
+RR-1 — empty-directory Live arming must be reachable through the REAL Live and
+Run buttons.  The wrangler input gate and the Controls V2 readiness gate must
+both permit the arm-then-acquire workflow: watch an empty directory, select
+Live, click Run, and let the first container land afterward.
 
 RR-2 — the run-end Source-card handoff clear must be exception-safe.  It used to
 be the final statement of ``wrangler_finished``; a raise anywhere in the run-end
@@ -137,10 +133,25 @@ def test_rr1_empty_live_directory_arms_through_real_run_button(
         observation = widget._controls_v2_current_directory_observation()
         assert observation.discovered_snapshot.candidates == ()
 
-        widget.controls.liveButton.setChecked(True)  # Live mode
+        # Zero READY candidates must not disable the Live affordance.  Run is
+        # still gated until Live is selected, avoiding a circular state where
+        # the operator cannot make the empty directory runnable.
+        assert widget.controls.actionRow.isEnabled() is True
+        assert widget.controls.liveButton.isEnabled() is True
+        assert widget.controls.startButton.isEnabled() is False
+        assert "Enable Live" in widget.controls.readinessLabel.text()
+
+        poni = _poni()
+        widget.wrangler.poni = poni
+        widget.scan._cached_poni = poni
+        widget.wrangler.project_folder = str(tmp_path)
+        widget.wrangler.h5_dir = str(tmp_path)
+        widget._refresh_controls_v2_profile(immediate=True)
+
+        widget.controls.liveButton.click()
+        assert _wait_until(qapp, widget.controls.startButton.isEnabled)
         assert widget.wrangler.live_mode is True
 
-        widget.wrangler.poni = _poni()
         # The empty directory leaves the between-runs seed at img_file=''.
         widget.wrangler.img_file = ""
         # Stub the worker so start() arms without launching the watch loop.
@@ -154,8 +165,9 @@ def test_rr1_empty_live_directory_arms_through_real_run_button(
         assert widget._controls_v2_container_index_config() is not None
         assert widget.wrangler._inputs_valid() is True
 
-        # Drive the REAL Run-button path (NOT start_wrangler() directly).
-        widget.wrangler.start()
+        # Drive the REAL Qt Run button (not wrangler.start/start_wrangler).
+        widget.controls.startButton.click()
+        qapp.processEvents()
 
         # Armed: reached start_wrangler -> thread.start (stub), no rejection.
         assert started == [True]

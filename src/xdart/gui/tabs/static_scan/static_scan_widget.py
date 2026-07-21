@@ -2741,6 +2741,14 @@ class staticWidget(QWidget):
         live_btn = getattr(controls, "liveButton", None)
         live = bool(live_btn is not None and live_btn.isChecked()
                     and live_btn.isVisibleTo(controls))
+        if (not ready and not live
+                and self._controls_v2_live_watch_armable()):
+            mode = str(getattr(state, "processing_mode", "") or "").strip()
+            text = "Needs setup · Enable Live to watch this directory"
+            if mode:
+                text += f" · {mode}"
+            hint = "Enable Live to arm this configured directory before files arrive"
+            tooltip = f"{hint}; {tooltip}" if tooltip else hint
         # A live watch that is idling between files keeps its waiting text
         # against profile-refresh repaints (maintainer, 2026-07-13).
         if (text and getattr(self, "_live_waiting_status", False)
@@ -2806,7 +2814,11 @@ class staticWidget(QWidget):
             viewer = str(getattr(profile.processing_page, "value", "")) == "viewer"
             if viewer or controls.actionRow.isHidden():
                 return
-            controls.set_run_row_enabled(bool(getattr(profile, "can_run", False)))
+            can_run = bool(getattr(profile, "can_run", False))
+            live_armable = self._controls_v2_live_watch_armable()
+            controls.set_run_row_enabled(can_run or live_armable)
+            if getattr(controls, "action_phase", lambda: "idle")() == "idle":
+                controls.startButton.setEnabled(can_run)
         except Exception:
             logger.debug("Controls V2 run-row readiness sync failed",
                          exc_info=True)
@@ -3584,6 +3596,18 @@ class staticWidget(QWidget):
         else:
             suffixes = (".nxs",)
         return root, recursive, name_filter, suffixes
+
+    def _controls_v2_live_watch_armable(self) -> bool:
+        """Whether Live may be selected before a container is READY.
+
+        The Source card owns this decision: a supported container-directory
+        configuration with an existing root can be armed while empty or while
+        its first file is still provisional.  Run readiness remains separate
+        and turns true only after Live is selected and the remaining setup is
+        valid.
+        """
+        config = self._controls_v2_container_index_config()
+        return bool(config is not None and config[0].is_dir())
 
     def _sync_controls_v2_source_index(self) -> None:
         widget = getattr(self, "_controls_v2_source_widget", None)
