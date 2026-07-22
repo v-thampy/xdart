@@ -124,7 +124,7 @@ def _explicit_scan_owners_match(owner, requested_scan_key) -> bool:
     )
 
 
-def _publication_serves_scan(publication, requested_scan_key) -> bool:
+def publication_serves_scan(publication, requested_scan_key) -> bool:
     """Whether a publication belongs to the requested display scan.
 
     A PublicationStore is shared across scan loads and can briefly retain the
@@ -167,6 +167,10 @@ def _publication_serves_scan(publication, requested_scan_key) -> bool:
     )
 
 
+# Compatibility for focused Slice-3 tests and out-of-tree diagnostics.
+_publication_serves_scan = publication_serves_scan
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectionRequest:
     """A scan-qualified request for one selected frame's projection.
@@ -206,7 +210,7 @@ class _PublicationBackedStoreView:
 
     def _publication(self, label):
         publication = self._publication_store.get(label)
-        if not _publication_serves_scan(publication, self._scan_key):
+        if not publication_serves_scan(publication, self._scan_key):
             return None
         return publication
 

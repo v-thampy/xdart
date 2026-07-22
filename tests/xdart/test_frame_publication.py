@@ -2244,6 +2244,30 @@ def test_publication_scan_owner_stamped_and_default_none():
     assert unstamped.scan_key is None
 
 
+def test_publication_availability_rejects_reused_label_from_another_scan():
+    store = PublicationStore(max_items=None, max_heavy_items=None)
+    store.upsert(publication_from_live_frame(
+        DuckFrame(idx=0), scan_key="/data/run_a.nxs"))
+
+    loaded_1d, loaded_2d, raw = publication_availability(
+        store, labels=(0,))
+    assert loaded_1d == {0}
+    assert loaded_2d == {0}
+    assert raw[0]["has_raw"] is True
+
+    loaded_1d, loaded_2d, raw = publication_availability(
+        store, labels=(0,), scan_key="/data/run_b.nxs")
+    assert loaded_1d == set()
+    assert loaded_2d == set()
+    assert raw == {}
+
+    loaded_1d, loaded_2d, raw = publication_availability(
+        store, labels=(0,), scan_key="/data/run_a.nxs")
+    assert loaded_1d == {0}
+    assert loaded_2d == {0}
+    assert raw[0]["has_raw"] is True
+
+
 def test_scan_owner_preserved_through_thinning_tiers():
     """Tier-1 (semilight) and tier-2 (lightweight) eviction keep the owner."""
     store = PublicationStore(

@@ -1061,7 +1061,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 try:
                     from .display_publication import publication_availability
                     pub_1d, pub_2d, _raw = publication_availability(
-                        store, labels=ids)
+                        store,
+                        labels=ids,
+                        scan_key=scan_identity_key(getattr(self, "scan", None)),
+                    )
                     viewer_rows_1d_keys |= set(pub_1d)
                     viewer_rows_2d_keys |= set(pub_2d)
                 except Exception:

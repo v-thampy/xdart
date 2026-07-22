@@ -2479,6 +2479,14 @@ class staticWidget(QWidget):
         session-restore, not a bare ``setValue``), then refreshes the V2 panel.
         """
         poni_path = str(poni_path)
+        wrangler = getattr(self, "wrangler", None)
+        if wrangler is not None:
+            # The Image wrangler's value-change callback reads this attribute,
+            # so publish the new path before emitting the parameter signal.
+            try:
+                wrangler.poni_file = poni_path
+            except Exception:
+                pass
         for path in (("Signal", "poni_file"), ("Calibration", "poni_file")):
             param = self._controls_v2_param(path)
             if param is not None:
@@ -2488,13 +2496,15 @@ class staticWidget(QWidget):
                     logger.debug("Set poni_file param failed for %s", path,
                                  exc_info=True)
                 break
-        wrangler = getattr(self, "wrangler", None)
         if wrangler is not None:
-            try:
-                wrangler.poni_file = poni_path
-            except Exception:
-                pass
-            if isinstance(wrangler, nexusWrangler):
+            loader = getattr(wrangler, "get_poni_dict", None)
+            if callable(loader):
+                try:
+                    loader()
+                except Exception:
+                    logger.debug("PONI reload after config adoption failed",
+                                 exc_info=True)
+            elif isinstance(wrangler, nexusWrangler):
                 try:
                     from xrd_tools.core.containers import PONI
                     if os.path.exists(poni_path):
@@ -2502,6 +2512,13 @@ class staticWidget(QWidget):
                 except Exception:
                     logger.debug("PONI reload after autofill failed",
                                  exc_info=True)
+            loaded_poni = getattr(wrangler, "poni", None)
+            thread = getattr(wrangler, "thread", None)
+            if thread is not None and loaded_poni is not None:
+                try:
+                    thread.poni = loaded_poni
+                except Exception:
+                    pass
         self._force_controls_v2_rebuild()
 
     def _controls_v2_choose_source(self) -> None:
@@ -4012,7 +4029,6 @@ class staticWidget(QWidget):
                         f"{scan_name}_*.{file_ext}"
                     )
                     if series_re.match(sibling.name)
-                    and str(sibling) >= str(path)
                 ]
                 return len(files) if files else int(
                     image_io.count_frames(path) or 0
@@ -5035,6 +5051,24 @@ class staticWidget(QWidget):
                     stack.setCurrentIndex(index)
                 return
 
+    @staticmethod
+    def _legacy_config_poni_file(document, active_name: str) -> str:
+        """Return a PONI path from either historical wrangler schema."""
+        if not isinstance(document, dict) or not active_name:
+            return ""
+        outer = document.get(active_name)
+        if not isinstance(outer, dict):
+            return ""
+        tree = outer.get(active_name, outer)
+        if not isinstance(tree, dict):
+            return ""
+        for group in ("Signal", "Calibration"):
+            values = tree.get(group)
+            value = values.get("poni_file") if isinstance(values, dict) else None
+            if isinstance(value, str) and value:
+                return value
+        return ""
+
     def _apply_loaded_config_snapshot(self, document) -> None:
         """Commit a loaded config after every legacy tree has settled."""
 
@@ -5058,8 +5092,18 @@ class staticWidget(QWidget):
                     combo.setCurrentIndex(index)
         else:
             # Legacy files have only parameter trees.  Their active wrangler's
-            # value-change signals do the adoption; force one final coherent V2
-            # render after hidden wranglers have also finished loading.
+            # current Signal schema is applied by the parameter tree, while
+            # older TIFF sessions stored the same field under Calibration.
+            # Adopt either spelling explicitly so a preceding session cannot
+            # leave its calibration cached.
+            params = getattr(getattr(self, "wrangler", None), "parameters", None)
+            try:
+                active_name = str(params.name()) if params is not None else ""
+            except Exception:
+                active_name = ""
+            legacy_poni = self._legacy_config_poni_file(document, active_name)
+            if legacy_poni:
+                self._set_poni_field(legacy_poni)
             try:
                 gi = self.wrangler.parameters.child("GI").child("Grazing").value()
                 self.update_scattering_geometry(bool(gi))

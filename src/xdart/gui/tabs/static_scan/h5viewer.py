@@ -3301,8 +3301,12 @@ class H5Viewer(QWidget):
         if store is not None:
             try:
                 from .display_publication import publication_availability
+                from .display_overlay_utils import scan_identity_key
                 pub_1d, pub_2d, _raw = publication_availability(
-                    store, labels=read_idxs)
+                    store,
+                    labels=read_idxs,
+                    scan_key=scan_identity_key(getattr(self, "scan", None)),
+                )
                 keys = set(pub_2d if load_2d else pub_1d)
             except Exception:
                 logger.debug("publication availability lookup failed",

@@ -60,6 +60,7 @@ from .display_overlay_utils import (
     slice_enabled as _overlay_slice_enabled,
 )
 from .browse_debug import browse_debug_log, sequence_summary
+from .frame_projection_adapter import publication_serves_scan
 
 MAX_WATERFALL_PAYLOAD_ROWS = 256
 
@@ -1708,10 +1709,32 @@ class PublicationDisplayAdapter:
         return cls._has_full_raw(publication) or cls._has_thumbnail(publication)
 
 
-def publication_availability(store, *, labels=None) -> tuple[set, set, dict]:
+def publication_availability(
+        store, *, labels=None, scan_key=None) -> tuple[set, set, dict]:
     """Return loaded-1D keys, loaded-2D/raw keys, and raw availability."""
 
-    adapter = PublicationDisplayAdapter(store, labels=labels)
+    if scan_key is None:
+        adapter = PublicationDisplayAdapter(store, labels=labels)
+    else:
+        label_keys = None if labels is None else _label_keys(labels)
+        if label_keys is None:
+            items = dict(store.snapshot())
+        elif hasattr(store, "get_many"):
+            items = store.get_many(label_keys)
+        else:
+            items = {
+                label: publication
+                for label in label_keys
+                if (publication := store.get(label)) is not None
+            }
+        items = {
+            label: publication
+            for label, publication in items.items()
+            if publication_serves_scan(publication, scan_key)
+        }
+        # Do not retain the unfiltered store as a fallback: a reused frame
+        # label from another scan is not resident for this browse request.
+        adapter = PublicationDisplayAdapter(None, items=items)
     return (
         adapter.available_1d_keys(),
         adapter.available_2d_keys(),

@@ -2396,6 +2396,35 @@ def test_controls_panel_v2_source_count_uses_container_frame_count(
     assert count == 50
 
 
+def test_controls_panel_v2_source_count_reports_entire_image_series(
+        monkeypatch, tmp_path):
+    """The Source card describes the series, not the selected suffix onward."""
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.io import image as image_io
+
+    paths = []
+    for idx in range(1, 6):
+        path = tmp_path / f"scan_{idx:04d}.tif"
+        path.write_bytes(b"")
+        paths.append(path)
+    monkeypatch.setattr(
+        image_io,
+        "count_frames",
+        lambda path: pytest.fail("single-image series count opened a file"),
+    )
+
+    count = staticWidget._controls_v2_count_source_frames(
+        source_type="Image Series",
+        img_file=str(paths[3]),
+        img_dir="",
+        img_ext="tif",
+        include_subdir=False,
+        file_filter="",
+    )
+
+    assert count == 5
+
+
 def test_controls_panel_v2_source_count_directory_masters_is_file_count(
         monkeypatch, tmp_path):
     """DIR-2: a directory of masters reports the FILE count (2) — count_frames
@@ -3805,6 +3834,57 @@ def test_config_roundtrip_restores_active_poni_mode_and_native_grid(
         assert widget._controls_v2_current_poni().detector == "RayonixMx225"
         assert _visible_control_value(widget, ("GI", "Grazing")) is False
         assert _visible_control_value(widget, ("Int1D", "points")) == "321"
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_legacy_calibration_poni_restores_after_signal_schema_config(
+        qapp, monkeypatch, tmp_path):
+    """Old TIFF configs must replace a previously loaded Eiger calibration."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.core.containers import PONI
+
+    tiff_poni_path = tmp_path / "tiff-rayonix.poni"
+    eiger_poni_path = tmp_path / "eiger.poni"
+    PONI(
+        dist=0.1794,
+        poni1=0.01,
+        poni2=0.02,
+        detector="RayonixMx225",
+    ).to_poni_file(tiff_poni_path)
+    PONI(
+        dist=0.1385,
+        poni1=0.03,
+        poni2=0.04,
+        detector="Eiger4M",
+    ).to_poni_file(eiger_poni_path)
+    tiff_config = tmp_path / "legacy-tiff.json"
+    eiger_config = tmp_path / "eiger.json"
+
+    widget = staticWidget()
+    try:
+        widget._set_poni_field(str(eiger_poni_path))
+        widget.h5viewer.defaultWidget.save_defaults(fname=str(eiger_config))
+
+        widget._set_poni_field(str(tiff_poni_path))
+        widget.h5viewer.defaultWidget.save_defaults(fname=str(tiff_config))
+        legacy = json.loads(tiff_config.read_text())
+        legacy.pop(widget._CONFIG_STATE_KEY, None)
+        image_tree = legacy["image_wrangler"]["image_wrangler"]
+        saved_poni = image_tree["Signal"].pop("poni_file")
+        image_tree.setdefault("Calibration", {})["poni_file"] = saved_poni
+        tiff_config.write_text(json.dumps(legacy))
+
+        widget.h5viewer.defaultWidget.load_defaults(fname=str(eiger_config))
+        widget.h5viewer.defaultWidget.load_defaults(fname=str(tiff_config))
+        qapp.processEvents()
+
+        assert widget._controls_v2_poni_path() == str(tiff_poni_path)
+        assert widget.wrangler.poni_file == str(tiff_poni_path)
+        assert widget.wrangler.poni.detector == "RayonixMx225"
+        assert widget._controls_v2_current_poni().detector == "RayonixMx225"
     finally:
         widget.close()
         widget.deleteLater()
