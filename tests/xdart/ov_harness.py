@@ -323,7 +323,10 @@ class OVHarness:
             _pinned_slice_cuts={},
             _slice_2d_data_ready=lambda: True,
             get_normChannel=lambda: self._norm["channel"],
-            _get_wavelength=lambda ref: self._wavelength_m,
+            # X1 Slice 3a: accept the selected-frame opt-in keyword the three
+            # current-frame call sites now pass (the harness stub stays
+            # scan-constant either way).
+            _get_wavelength=lambda ref, **_kw: self._wavelength_m,
             _request_frame_hydration=(
                 lambda label, *, purpose="full":
                 self.hydration_requests.append((int(label), purpose))),

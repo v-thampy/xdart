@@ -73,21 +73,64 @@ def test_display_wavelength_accepts_authoritative_one_angstrom_poni(tmp_path):
     assert DisplayDataMixin._get_wavelength(host, frame) == pytest.approx(1.0e-10)
 
 
-def test_display_wavelength_reads_v2_instrument_source(tmp_path):
+def test_display_wavelength_never_opens_hdf5_per_selection(tmp_path, monkeypatch):
+    """X1 Slice 3a (R3-P5 — replaces the retired GUI-thread HDF5-tier pins):
+    a data_file carrying a real ``wavelength_A`` stamp is NO LONGER opened per
+    selection, on any thread, run writing or idle.  The persisted capture
+    (scan load / ``ensure_calibration_loaded`` / the run-end lifecycle stamp —
+    see test_x1_wavelength_capabilities) owns that value instead."""
     import h5py
 
     path = tmp_path / "wl.nxs"
     with h5py.File(path, "w") as f:
         src = f.create_group("entry/instrument/source")
         src.create_dataset("wavelength_A", data=0.7293)
-    host = SimpleNamespace(
-        scan=SimpleNamespace(
-            mg_args={"wavelength": 1.0e-10},
-            data_file=str(path),
-        )
-    )
 
+    real_file = h5py.File
+    opened = []
+
+    def counting_file(*args, **kwargs):
+        opened.append(os.fspath(args[0]))
+        return real_file(*args, **kwargs)
+
+    monkeypatch.setattr(h5py, "File", counting_file)
+    for run_writing in (False, True):
+        host = SimpleNamespace(
+            _run_writing=run_writing,
+            scan=SimpleNamespace(
+                mg_args={"wavelength": 1.0e-10},
+                data_file=str(path),
+            ),
+        )
+        for _ in range(5):
+            assert DisplayDataMixin._get_wavelength(host) is None
+    assert opened == []
+
+    # The persisted capture still serves the same scan without any open.
+    host.scan._persisted_wavelength_m = 0.7293e-10
     assert DisplayDataMixin._get_wavelength(host) == pytest.approx(0.7293e-10)
+    assert opened == []
+
+
+def test_display_wavelength_post_run_value_comes_from_run_end_stamp():
+    """X1 Slice 3a (R3-P5 — coverage moved from the retired one-angstrom HDF5
+    stamp read): after a live run, the lifecycle stamp — not a file read —
+    restores the composed wavelength, and an explicitly stamped 1.0 Å persisted
+    value remains authoritative."""
+    host = SimpleNamespace(
+        _run_writing=True,
+        scan=SimpleNamespace(
+            name="run_a", mg_args={"wavelength": 1.0e-10}, data_file=None,
+            _persisted_wavelength_m=None),
+    )
+    displayFrameWidget.begin_processing(host, host.scan, "run_a")
+    frame = SimpleNamespace(
+        integrator=SimpleNamespace(wavelength=1.5e-10), poni=None)
+    assert DisplayDataMixin._get_wavelength(host, frame) == pytest.approx(1.5e-10)
+    displayFrameWidget.finish_processing(host, host.scan, "run_a")
+    host._run_writing = False
+    assert host.scan._persisted_wavelength_m == pytest.approx(1.5e-10)
+    assert DisplayDataMixin._get_wavelength(host) == pytest.approx(1.5e-10)
 
 
 def test_display_wavelength_prefers_authoritative_reloaded_one_angstrom(tmp_path):
@@ -102,118 +145,28 @@ def test_display_wavelength_prefers_authoritative_reloaded_one_angstrom(tmp_path
     assert DisplayDataMixin._get_wavelength(host) == pytest.approx(1.0e-10)
 
 
-def test_display_wavelength_accepts_authoritative_one_angstrom_stamp(tmp_path):
-    import h5py
-
-    path = tmp_path / "wl_one_angstrom.nxs"
-    with h5py.File(path, "w") as f:
-        src = f.create_group("entry/instrument/source")
-        src.create_dataset("wavelength_A", data=1.0)
-    host = SimpleNamespace(
-        scan=SimpleNamespace(
-            mg_args={},
-            data_file=str(path),
-        )
-    )
-
-    assert DisplayDataMixin._get_wavelength(host) == pytest.approx(1.0e-10)
-
-
-def test_display_wavelength_caches_hdf5_stamp_and_negative_result(tmp_path, monkeypatch):
-    import h5py
-
-    path = tmp_path / "wl_cached.nxs"
-    with h5py.File(path, "w") as f:
-        src = f.create_group("entry/instrument/source")
-        src.create_dataset("wavelength_A", data=0.7293)
-    missing = tmp_path / "wl_missing.nxs"
-    with h5py.File(missing, "w") as f:
-        f.create_group("entry")
-
-    real_file = h5py.File
-    opened = []
-
-    def counting_file(*args, **kwargs):
-        opened.append(os.fspath(args[0]))
-        return real_file(*args, **kwargs)
-
-    monkeypatch.setattr(h5py, "File", counting_file)
-    host = SimpleNamespace(
-        scan=SimpleNamespace(mg_args={"wavelength": 1.0e-10}, data_file=str(path)),
-    )
-    DisplayDataMixin._clear_wavelength_cache(host)
-
-    for _ in range(5):
-        assert DisplayDataMixin._get_wavelength(host) == pytest.approx(0.7293e-10)
-    assert opened == [str(path)]
-
-    host.scan.data_file = str(missing)
-    for _ in range(5):
-        assert DisplayDataMixin._get_wavelength(host) is None
-    assert opened == [str(path), str(missing)]
-
-    DisplayDataMixin._clear_wavelength_cache(host)
-    assert DisplayDataMixin._get_wavelength(host) is None
-    assert opened == [str(path), str(missing), str(missing)]
-
-
-def test_display_wavelength_skips_hdf5_fallback_while_run_writing(tmp_path, monkeypatch):
-    import h5py
-
-    path = tmp_path / "wl_run_active.nxs"
-    with h5py.File(path, "w") as f:
-        src = f.create_group("entry/instrument/source")
-        src.create_dataset("wavelength_A", data=0.7293)
-
-    real_file = h5py.File
-    opened = []
-
-    def counting_file(*args, **kwargs):
-        opened.append(os.fspath(args[0]))
-        return real_file(*args, **kwargs)
-
-    monkeypatch.setattr(h5py, "File", counting_file)
-    host = SimpleNamespace(
-        _run_writing=True,
-        scan=SimpleNamespace(mg_args={"wavelength": 1.0e-10}, data_file=str(path)),
-    )
-    DisplayDataMixin._clear_wavelength_cache(host)
-
-    assert DisplayDataMixin._get_wavelength(host) is None
-    assert opened == []
-
-
-def test_display_wavelength_negative_cache_clears_when_run_writing_ends(tmp_path):
-    import h5py
-
-    path = tmp_path / "wl_late_stamp.nxs"
-    with h5py.File(path, "w") as f:
-        f.create_group("entry/instrument/source")
-
+def test_display_wavelength_late_stamp_served_after_run_via_persisted(tmp_path):
+    """X1 Slice 3a (replaces the retired negative-cache pin): a wavelength
+    stamped late in the run is served post-run through the persisted capture
+    — there is no per-selection file read left to cache or to go stale."""
     host = SimpleNamespace(
         _processing_active=False,
-        _run_writing=False,
+        _run_writing=True,
         _wf_last_draw_t=0.0,
-        scan=SimpleNamespace(mg_args={"wavelength": 1.0e-10}, data_file=str(path)),
+        scan=SimpleNamespace(
+            name="run_a", mg_args={"wavelength": 1.0e-10}, data_file=None,
+            _persisted_wavelength_m=None),
     )
-    host._clear_wavelength_cache = MethodType(
-        DisplayDataMixin._clear_wavelength_cache, host)
     host.set_processing_active = MethodType(
         displayFrameWidget.set_processing_active, host)
-    DisplayDataMixin._clear_wavelength_cache(host)
 
-    assert DisplayDataMixin._get_wavelength(host) is None
-    assert host._wavelength_cache_key is not None
-    assert host._wavelength_cache_value is None
+    assert DisplayDataMixin._get_wavelength(host) is None   # nothing stamped yet
 
-    with h5py.File(path, "a") as f:
-        f["entry/instrument/source"].create_dataset("wavelength_A", data=0.7293)
-
+    # ... the writer/loader capture lands late in the run ...
+    host.scan._persisted_wavelength_m = 0.7293e-10
     host._processing_active = True
-    host._run_writing = True
-    host.set_processing_active(False)
+    host.set_processing_active(False)                       # run end toggle
 
-    assert host._wavelength_cache_key is None
     assert DisplayDataMixin._get_wavelength(host) == pytest.approx(0.7293e-10)
 
 

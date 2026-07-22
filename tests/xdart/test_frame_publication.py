@@ -648,7 +648,7 @@ def test_cake_image_applies_imageunit_q_to_2theta_conversion():
             self.ui = type("UI", (), {"imageUnit": _Combo(label)})()
         def normalize(self, data, metadata):
             return np.asarray(data, dtype=float)
-        def _get_wavelength(self, frame=None):
+        def _get_wavelength(self, frame=None, *, for_selected_frame=False):
             return lam_m
 
     state = _cake_state(store, 12)
@@ -714,7 +714,7 @@ def test_cake_image_resamples_q_to_2theta_peak_position():
         def normalize(self, data, metadata):
             return np.asarray(data, dtype=float)
 
-        def _get_wavelength(self, frame=None):
+        def _get_wavelength(self, frame=None, *, for_selected_frame=False):
             return wavelength_m
 
     payload = PublicationDisplayAdapter(store, widget=_Widget()).cake_image(
@@ -756,7 +756,7 @@ def test_cake_image_no_wavelength_keeps_native_q_axis():
         def normalize(self, data, metadata):
             return np.asarray(data, dtype=float)
 
-        def _get_wavelength(self, frame=None):
+        def _get_wavelength(self, frame=None, *, for_selected_frame=False):
             return None
 
     payload = PublicationDisplayAdapter(store, widget=_Widget()).cake_image(
@@ -811,7 +811,7 @@ def test_cake_image_gi_ignores_imageunit_toggle():
         ui = type("UI", (), {"imageUnit": _Combo()})()
         def normalize(self, data, metadata):
             return np.asarray(data, dtype=float)
-        def _get_wavelength(self, frame=None):
+        def _get_wavelength(self, frame=None, *, for_selected_frame=False):
             return 1.0e-10
 
     cake = PublicationDisplayAdapter(store, widget=_Widget()).cake_image(
@@ -1247,7 +1247,7 @@ def _int_widget(*, plot_unit_text="q (Å⁻¹)", source="1d", axis="radial",
         ui=ui,
         normalize=lambda data, md: np.asarray(data, dtype=float)
         / ((md or {}).get("monitor", 1.0) or 1.0),
-        _get_wavelength=lambda ref: wavelength_m,
+        _get_wavelength=lambda ref, **_kw: wavelength_m,
     )
 
 

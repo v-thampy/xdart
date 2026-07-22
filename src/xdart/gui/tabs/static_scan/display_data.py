@@ -22,8 +22,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .display_logic import RawSource, choose_raw_source, sentinel_mask
+from .display_overlay_utils import current_scan_key as _current_scan_key
 from xdart.modules.frame_publication import publication_from_frame_view
-from xdart.modules.wavelength import normalize_wavelength_m, wavelength_angstrom_to_m
 from xrd_tools.core import (
     DEFAULT_MODE_KEY,
     FrameRecord,
@@ -33,13 +33,18 @@ from xrd_tools.core import (
     view_to_result_1d,
     view_to_result_2d,
 )
-from xrd_tools.session import MetadataRow, normalization_value
+from xrd_tools.core.energy import normalize_wavelength_m
+from xrd_tools.session import MetadataRow, WavelengthStatus, normalization_value
 
 logger = logging.getLogger(__name__)
 
 # Sentinel for the MEM-1[14] store-first publication memo generation tracking
 # (distinct from any real store generation, incl. None).
 _STORE_FIRST_UNSET = object()
+
+# Sentinel for the X1 Slice-3a evidence tier: "no evidence verdict — continue
+# with the persisted tiers" (distinct from a real None = failed conversion).
+_EVIDENCE_FALLTHROUGH = object()
 
 _BULK_1D_READ_CHUNK = 256
 
@@ -1430,15 +1435,32 @@ class DisplayDataMixin:
 
         return radial
 
-    def _get_wavelength(self, frame=None):
+    def _get_wavelength(self, frame=None, *, for_selected_frame=False):
         """Return the X-ray wavelength in metres.
 
-        Tries several sources in order:
-        1. ``frame.integrator.wavelength`` (available during live processing)
-        2. ``self.scan.mg_args['wavelength']`` when it is a real value
-        3. ``/entry/instrument/source/wavelength_A`` in the HDF5 file
+        Tier order (X1 Slice 3a):
 
-        Returns None if the wavelength cannot be determined.
+        1.  ``frame.integrator.wavelength`` → ``frame.poni.wavelength`` (live
+            processing; stamps the SCAN-QUALIFIED run cache, F1 + R3-P6)
+        2.  the run-scoped cache while ``_run_writing`` — consulted only when
+            the requesting display scan IS the run scan (R3-P6), so paused
+            browsing of another scan never inherits the run's wavelength
+        3'. the pinned projection's canonical-metres wavelength evidence —
+            CURRENT-FRAME contexts ONLY (``for_selected_frame=True``, opted in
+            by the three selected/reference-frame call sites); cross-checked
+            against the persisted value; a disagreement or typed conflict
+            fails THIS conversion visibly (``None`` → honest native axis) with
+            one deduplicated actionable warning (R3-P7).  Per-row
+            Overlay/Waterfall math never opts in (S2-R3 split).
+        4.  persisted scan-level truth: ``scan._persisted_wavelength_m`` →
+            non-sentinel ``scan.mg_args['wavelength']``.
+
+        The per-selection GUI-thread HDF5 tier was DELETED (R3-P5).  The
+        standing invariant is **no per-selection/render GUI-thread open**: the
+        run-end lifecycle stamp (:meth:`displayFrameWidget.finish_processing`)
+        and the scan-load/``ensure_calibration_loaded`` captures own the
+        persisted value instead.  Returns ``None`` if the wavelength cannot be
+        determined.
         """
         # 1. From the frame's integrator (fastest, works during live runs)
         if frame is not None:
@@ -1447,10 +1469,10 @@ class DisplayDataMixin:
             wl = normalize_wavelength_m(wl, allow_default_sentinel=True)
             if wl is not None:
                 # F1: cache a REAL run wavelength (reject the 1e-10 constructor
-                # sentinel) for hydrated rows this run; reset each run boundary.
+                # sentinel) for hydrated rows this run; lifecycle-owned reset.
                 _real = normalize_wavelength_m(wl)
                 if _real is not None:
-                    self._run_wavelength_m = _real
+                    DisplayDataMixin._stamp_run_wavelength(self, _real)
                 return wl
             poni = getattr(frame, 'poni', None)
             wl = normalize_wavelength_m(
@@ -1459,70 +1481,170 @@ class DisplayDataMixin:
             )
             if wl is not None:
                 # F1: cache a REAL run wavelength (reject the 1e-10 constructor
-                # sentinel) for hydrated rows this run; reset each run boundary.
+                # sentinel) for hydrated rows this run; lifecycle-owned reset.
                 _real = normalize_wavelength_m(wl)
                 if _real is not None:
-                    self._run_wavelength_m = _real
+                    DisplayDataMixin._stamp_run_wavelength(self, _real)
                 return wl
 
-        # 1.5 (F1): the run-scoped wavelength, stamped above from the first
-        # frame-backed row's integrator THIS run.  Hydrated rows (raw_ref=None)
-        # have no frame mid-run, and _persisted_wavelength_m / the HDF5 fallback
-        # (below) are unavailable while ``_run_writing`` -> without this the same
-        # append batch mixes units (Q for frame-backed rows, unconvertible for
+        # 2 (F1 + R3-P6): the run-scoped wavelength, stamped above from the
+        # first frame-backed row's integrator THIS run.  Hydrated rows
+        # (raw_ref=None) have no frame mid-run, and _persisted_wavelength_m is
+        # unavailable while ``_run_writing`` -> without this the same append
+        # batch mixes units (Q for frame-backed rows, unconvertible for
         # hydrated -> the blank-band / stale-combo regression).  Only trusted
-        # during a run; reset at each run boundary in ``set_processing_active``.
+        # during a run AND only for the run scan itself (scan-qualified) —
+        # the begin/pause/resume/finish lifecycle owns reset/stamp/clear.
         if getattr(self, '_run_writing', False):
             run_wl = getattr(self, '_run_wavelength_m', None)
-            if run_wl:
+            if run_wl and DisplayDataMixin._run_wavelength_serves_current_scan(
+                    self):
                 return run_wl
 
-        # 2. From scan.mg_args (loaded when NXS is opened). Reject the
-        # historical 1e-10 m constructor sentinel rather than using it for
-        # Q↔2θ conversion.
         scan = getattr(self, 'scan', None)
         persisted_wl = normalize_wavelength_m(
             getattr(scan, '_persisted_wavelength_m', None),
             allow_default_sentinel=True,
         )
+
+        # 3' (Slice 3a): the pinned projection's canonical evidence — only for
+        # demonstrably current-frame conversions, never per-row math.
+        if for_selected_frame:
+            resolved = DisplayDataMixin._selected_frame_evidence_wavelength(
+                self, persisted_wl)
+            if resolved is not _EVIDENCE_FALLTHROUGH:
+                return resolved
+
+        # 4. Persisted scan-level truth.  Reject the historical 1e-10 m
+        # constructor sentinel in mg_args rather than using it for Q↔2θ.
         if persisted_wl is not None:
             return persisted_wl
         mg_args = getattr(scan, 'mg_args', None)
         wl = mg_args.get('wavelength', None) if isinstance(mg_args, dict) else None
-        wl = normalize_wavelength_m(wl)
-        if wl is not None:
-            return wl
+        return normalize_wavelength_m(wl)
 
-        # 3. Read the writer's actual v2 NeXus wavelength stamp.  This fallback
-        # is intentionally cached per scan/file, including a negative result:
-        # large Single/Overlay selections can call _get_wavelength once per
-        # rendered frame, and opening the same .nxs hundreds of times on the GUI
-        # thread is enough to beachball the app.
-        data_file = getattr(scan, 'data_file', None)
-        if not data_file:
-            return None
-        if getattr(self, '_run_writing', False):
-            return None
-        key = (id(scan), os.fspath(data_file))
-        if getattr(self, '_wavelength_cache_key', None) == key:
-            return getattr(self, '_wavelength_cache_value', None)
-        wl = None
+    def _stamp_run_wavelength(self, value_m):
+        """F1 + R3-P6: cache the run wavelength, qualified by the scan the
+        display is rendering at stamp time (the run scan — the stamp only
+        happens for frame-backed live rows)."""
+        self._run_wavelength_m = value_m
         try:
-            import h5py
-            with h5py.File(data_file, 'r') as f:
-                wl = wavelength_angstrom_to_m(
-                    f['entry/instrument/source/wavelength_A'][()] # type: ignore
-                )
+            self._run_wavelength_scan_key = _current_scan_key(self)
         except Exception:
-            logger.debug("Failed to read wavelength from HDF5 instrument/source group in %s", data_file, exc_info=True)
+            self._run_wavelength_scan_key = None
 
-        self._wavelength_cache_key = key
-        self._wavelength_cache_value = wl
-        return wl
+    def _run_wavelength_serves_current_scan(self):
+        """R3-P6: the run cache serves only the scan it was stamped for.
 
-    def _clear_wavelength_cache(self):
-        self._wavelength_cache_key = None
-        self._wavelength_cache_value = None
+        An unqualified stamp (no resolvable scan identity — legacy/duck hosts)
+        keeps the pre-Slice-3 behavior and serves any request, mirroring the
+        R2 unqualified-store rule."""
+        key = getattr(self, '_run_wavelength_scan_key', None)
+        if key is None:
+            return True
+        try:
+            current = _current_scan_key(self)
+        except Exception:
+            current = None
+        return key == current
+
+    def _selected_frame_evidence_wavelength(self, persisted_wl_m):
+        """T3' (Slice 3a): consult the pinned projection's canonical-metres
+        wavelength evidence for a CURRENT-FRAME conversion.
+
+        Returns ``_EVIDENCE_FALLTHROUGH`` (structured absence / no usable pin
+        → continue with the persisted tiers), a metres value, or ``None``
+        (fail THIS conversion visibly: cross-check disagreement or typed
+        conflict, with one deduplicated warning per conflict identity —
+        R3-P7, never keyed by render generation)."""
+        projection = getattr(self, '_current_frame_projection', None)
+        if projection is None or not getattr(projection, 'present', False):
+            return _EVIDENCE_FALLTHROUGH
+        # Scan-qualified: the pin must describe the CURRENT display scan
+        # (contract 8) — a retained pin from another scan never converts
+        # this one.
+        pin_key = getattr(self, '_current_frame_projection_scan_key', None)
+        try:
+            current_key = _current_scan_key(self)
+        except Exception:
+            current_key = None
+        if pin_key != current_key:
+            return _EVIDENCE_FALLTHROUGH
+        evidence = getattr(projection, 'wavelength', None)
+        status = getattr(evidence, 'status', None)
+        identity = str(getattr(
+            getattr(projection, 'capabilities', None), 'identity', '') or '')
+        if status is WavelengthStatus.CONFLICT:
+            sources = dict(getattr(evidence, 'sources', {}) or {})
+            key = (identity, tuple(sorted(
+                (str(k), float(v)) for k, v in sources.items())),
+                'evidence-conflict')
+            DisplayDataMixin._warn_wavelength_conflict_once(
+                self, key,
+                "Selected frame wavelength evidence conflicts for %s: %s. "
+                "Keeping the native axis for this conversion." % (
+                    identity or '<unknown source>',
+                    ", ".join(f"{k}={v:.6g} m"
+                              for k, v in sorted(sources.items()))))
+            return None
+        if status is WavelengthStatus.PRESENT:
+            value = getattr(evidence, 'value', None)
+            if value is None:
+                return _EVIDENCE_FALLTHROUGH
+            if persisted_wl_m is not None and not np.isclose(
+                    value, persisted_wl_m, rtol=1e-3, atol=0.0):
+                sources = dict(getattr(evidence, 'sources', {}) or {})
+                key = (identity, tuple(sorted(
+                    (str(k), float(v)) for k, v in sources.items())),
+                    'persisted-cross-check')
+                DisplayDataMixin._warn_wavelength_conflict_once(
+                    self, key,
+                    "Selected processed result %s reports wavelength %s "
+                    "(canonical m), disagreeing with the persisted run "
+                    "wavelength %.6g m. Keeping the native axis for this "
+                    "conversion." % (
+                        identity or '<unknown source>',
+                        ", ".join(f"{k}={v:.6g}" for k, v in
+                                  sorted(sources.items())),
+                        persisted_wl_m))
+                return None
+            # Agreement (or no persisted value): this identity's conflict —
+            # if any was recorded — is resolved; re-arm its warning.
+            DisplayDataMixin._clear_wavelength_conflict_for_identity(
+                self, identity)
+            return persisted_wl_m if persisted_wl_m is not None else value
+        # ABSENT → structured absence: silent fall-through (mirrors the
+        # headless no-warning pin); a recorded conflict for this identity is
+        # resolved.
+        DisplayDataMixin._clear_wavelength_conflict_for_identity(self, identity)
+        return _EVIDENCE_FALLTHROUGH
+
+    def _warn_wavelength_conflict_once(self, key, message):
+        """R3-P7: one warning per conflict identity; the warned-key set clears
+        on a scan-identity change (a new scan's distinct conflict warns once
+        more) and per identity on resolution."""
+        try:
+            scan_key = _current_scan_key(self)
+        except Exception:
+            scan_key = None
+        warned = getattr(self, '_wavelength_conflict_warned_keys', None)
+        if (warned is None
+                or getattr(self, '_wavelength_conflict_warned_scan',
+                           _EVIDENCE_FALLTHROUGH) != scan_key):
+            warned = set()
+            self._wavelength_conflict_warned_keys = warned
+            self._wavelength_conflict_warned_scan = scan_key
+        if key in warned:
+            return
+        warned.add(key)
+        logger.warning(message)
+
+    def _clear_wavelength_conflict_for_identity(self, identity):
+        warned = getattr(self, '_wavelength_conflict_warned_keys', None)
+        if warned:
+            stale = {k for k in warned if k[0] == identity}
+            if stale:
+                warned.difference_update(stale)
 
     # ── Normalization ─────────────────────────────────────────────
 

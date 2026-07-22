@@ -87,6 +87,7 @@ from .display_overlay_utils import (
     overlay_identity_for_widget,
     overlay_projection_id_for_widget,
     overlay_slice_legend_suffix,
+    scan_identity_key,
 )
 from .frame_projection_adapter import (
     DISPLAY_PURPOSE,
@@ -719,7 +720,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._bkg_token = None
         self._norm_channel_map = {}
         self._last_applied_norm_channel = None
-        self._clear_wavelength_cache()
+        # X1 Slice 3a: the run wavelength lifecycle state (R3-P5/P6).  The
+        # per-selection HDF5 wavelength cache is GONE with its deleted tier.
+        self._run_wavelength_m = None
+        self._run_wavelength_scan_key = None
+        self._wavelength_run_scan = None
+        self._wavelength_run_scan_key = None
 
         # Viewer mode: None (normal), 'image', or 'xye'
         self.viewer_mode = None
@@ -2191,6 +2197,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if adapter is not None:
             adapter.invalidate()
         self._current_frame_projection = displayFrameWidget.projection_for(self)
+        # Slice 3a: record the scan identity this pin describes, so the
+        # wavelength/capability consumers can verify pin currency against the
+        # display scan (contract 8) without re-deriving the request.
+        try:
+            self._current_frame_projection_scan_key = \
+                overlay_current_scan_key(self)
+        except Exception:
+            self._current_frame_projection_scan_key = None
 
     def projection_for(self, label=None):
         """The shared immutable :class:`FrameProjection` for the current display
@@ -5098,30 +5112,84 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def set_processing_active(self, active):
         """Mark a wrangler/integrator run as in progress (or finished).
 
-        Called by ``staticWidget`` at run start/end (incl. Stop).  While active,
-        the PERSIST_2D_DURING_PROCESSING feature keeps the last-rendered 2D
-        panels on screen instead of blanking them when the in-flight frame's 2D
-        data isn't available yet — so the 2D panels persist like the 1D plot.
+        Called by ``staticWidget`` at run start/end (incl. Stop) AND at
+        pause/resume.  While active, the PERSIST_2D_DURING_PROCESSING feature
+        keeps the last-rendered 2D panels on screen instead of blanking them
+        when the in-flight frame's 2D data isn't available yet — so the 2D
+        panels persist like the 1D plot.
+
+        X1 Slice 3a (R3-P5/P6): this method is NOT the run-end wavelength
+        authority — it is called for both Pause and final exit, so it neither
+        clears nor stamps the run wavelength cache.  The explicit
+        begin/pause/resume/finish lifecycle
+        (:meth:`begin_processing`/:meth:`finish_processing`) owns that.
         """
-        was_writing = bool(getattr(self, "_run_writing", False))
         active = bool(active)
         self._processing_active = active
         self._run_writing = active
-        # F1: reset the run-scoped display wavelength at every run boundary; it is
-        # re-stamped from the first frame-backed row's integrator during the run
-        # and consulted for hydrated rows that lack a frame (mixed-unit fix).
-        self._run_wavelength_m = None
         if not active:
             self._aggregate_live_scan = None
-        if was_writing and not active:
-            clear_wavelength = getattr(self, "_clear_wavelength_cache", None)
-            if callable(clear_wavelength):
-                clear_wavelength()
         # Reset the waterfall-repaint throttle at every run boundary so the next
         # update_wf always repaints in full -- in particular the end-of-scan flush
         # (run just ended -> active False) must show the COMPLETE stack even if the
         # last in-scan repaint was throttled.
         self._wf_last_draw_t = 0.0
+
+    # -- X1 Slice 3a: run wavelength lifecycle (R3-P5/P6) -------------------- #
+
+    def begin_processing(self, run_scan, run_scan_key):
+        """Bind the run-wavelength cache to THIS run (the sole approved owner:
+        the static-widget run lifecycle).
+
+        Captures the GUI-owned run scan object + its canonical scan key and
+        resets any prior run's cache.  The cache value itself is stamped by
+        the first frame-backed live row (``_get_wavelength`` tier 1), which
+        also records the scan identity the display is rendering at stamp time
+        (the run scan — refined per sub-scan in Directory mode)."""
+        self._wavelength_run_scan = run_scan
+        self._wavelength_run_scan_key = run_scan_key
+        self._run_wavelength_m = None
+        self._run_wavelength_scan_key = None
+
+    def pause_processing(self):
+        """Pause PRESERVES the run's scan-qualified wavelength cache and the
+        captured run target (R3-P6) — deliberately no cache mutation.  Paused
+        browsing of another scan cannot consult the cache anyway: the writer
+        window (``_run_writing``) is shut and the scan-key guard rejects a
+        non-run scan."""
+
+    def resume_processing(self, run_scan_key=None):
+        """Resume may consult only the captured run's cache — enforced by the
+        scan-key guard in ``_get_wavelength`` tier 2; no reseed, no clear."""
+
+    def finish_processing(self, run_scan=None, run_scan_key=None):
+        """FINAL run exit (not Pause): stamp the CAPTURED run scan's persisted
+        wavelength from the run cache, then clear the cache in ``finally``
+        (R3-P5).  Whatever scan is currently displayed is irrelevant.
+
+        The stamp is skipped fail-closed when the cache's scan identity does
+        not match the captured scan's CURRENT identity (e.g. Stop while
+        paused-browsing another scan repointed the singleton) and when the
+        scan already carries a persisted value (disk truth wins)."""
+        if run_scan is None:
+            run_scan = getattr(self, '_wavelength_run_scan', None)
+        try:
+            value = getattr(self, '_run_wavelength_m', None)
+            cache_key = getattr(self, '_run_wavelength_scan_key', None)
+            if run_scan is not None and value and cache_key is not None:
+                if run_scan_key is None:
+                    run_scan_key = scan_identity_key(run_scan)
+                if cache_key == run_scan_key:
+                    if getattr(run_scan, '_persisted_wavelength_m', None) is None:
+                        run_scan._persisted_wavelength_m = value
+                        mg = getattr(run_scan, 'mg_args', None)
+                        if isinstance(mg, dict):
+                            mg['wavelength'] = value
+        finally:
+            self._wavelength_run_scan = None
+            self._wavelength_run_scan_key = None
+            self._run_wavelength_m = None
+            self._run_wavelength_scan_key = None
 
     def _show_viewer_set_bkg(self, show):
         """Surface ONLY the Set BG button in a viewer mode.

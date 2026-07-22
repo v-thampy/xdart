@@ -203,9 +203,8 @@ from xdart.modules.frame_publication import (
     publication_from_live_frame,
     publication_has_2d_errors,
 )
-from xdart.modules.wavelength import normalize_wavelength_m
 from xrd_tools.core import browse_publication_max_items
-from xrd_tools.core.energy import wavelength_m_to_energy_eV
+from xrd_tools.core.energy import normalize_wavelength_m, wavelength_m_to_energy_eV
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.sources.readiness import (
     capabilities_for_processed,
@@ -232,6 +231,7 @@ from .display_overlay_utils import (
     overlay_grid_spec_summary,
     overlay_grid_specs_match,
     row_id_belongs_to_widget_scan,
+    scan_identity_key,
 )
 from .integrator import (
     DEFAULT_POLARIZATION_FACTOR,
@@ -7396,6 +7396,13 @@ class staticWidget(QWidget):
         self._runend_catchup_token = None
         self._set_scan_integrated_reads_transient(True)
         self.displayframe.set_processing_active(True)
+        # X1 Slice 3a (R3-P5/P6): the run lifecycle — not set_processing_active
+        # — owns the run wavelength capture.  Capture the GUI-owned run scan
+        # object + its canonical key and bind the cache to THIS run.
+        self._x1_run_scan_capture = self.scan
+        _begin = getattr(self.displayframe, "begin_processing", None)
+        if callable(_begin):
+            _begin(self.scan, scan_identity_key(self.scan))
         # Start the main-thread liveness window for this run (XDART_PERF only).
         self._perf_hb_start_window()
         # Same run-state, pushed to the h5viewer so the frame-selection disk-load
@@ -7466,6 +7473,14 @@ class staticWidget(QWidget):
         if not self._run_active:
             return
         self._run_active = False
+        # X1 Slice 3a (R3-P5): FINAL exit — stamp the CAPTURED run scan's
+        # persisted wavelength from the run cache before the capture is
+        # cleared (Pause never reaches here; it goes through _on_run_paused).
+        _captured = getattr(self, "_x1_run_scan_capture", None)
+        _finish = getattr(self.displayframe, "finish_processing", None)
+        if callable(_finish):
+            _finish(_captured, scan_identity_key(_captured))
+        self._x1_run_scan_capture = None
         self._set_scan_integrated_reads_transient(False)
         self.displayframe.set_processing_active(False)
         # File is idle again: clear the disk-load guard.  set_run_writing(False)
@@ -7598,6 +7613,11 @@ class staticWidget(QWidget):
             return                       # not in a run; nothing to lift
         self._set_scan_integrated_reads_transient(False)
         self.displayframe.set_processing_active(False)
+        # X1 Slice 3a (R3-P6): Pause PRESERVES the run's scan-qualified
+        # wavelength cache and captured target; only the writing window shut.
+        _pause = getattr(self.displayframe, "pause_processing", None)
+        if callable(_pause):
+            _pause()
         invalidate_levels = getattr(
             self.displayframe, "invalidate_image_level_caches", None)
         if callable(invalidate_levels):
@@ -7639,6 +7659,12 @@ class staticWidget(QWidget):
                 getattr(self.h5viewer, "live_run_active", False))
         self.h5viewer.set_run_writing(True)
         self.displayframe.set_processing_active(True)
+        # X1 Slice 3a (R3-P6): Resume may consult only the captured run's
+        # scan-qualified cache (enforced by the key guard) — no reseed.
+        _resume = getattr(self.displayframe, "resume_processing", None)
+        if callable(_resume):
+            _resume(scan_identity_key(
+                getattr(self, "_x1_run_scan_capture", None)))
 
     def update_all(self, idx=None):
         """Updates all data in displays.
@@ -8064,11 +8090,8 @@ class staticWidget(QWidget):
         # Reset the Overlay/Waterfall accumulator only for incompatible grids.
         # Compatible scan boundaries append by design: cross-scan comparison is the
         # point of Overlay, while Clear remains the explicit relief valve.
-        try:
-            self.displayframe._clear_wavelength_cache()
-        except Exception:
-            logger.debug("display wavelength cache reset on scan rescope failed",
-                         exc_info=True)
+        # (X1 Slice 3a: the per-selection HDF5 wavelength cache is GONE with
+        # its deleted tier — nothing to reset here anymore.)
         try:
             if self._overlay_clear_needed_for_scan_boundary(first_frame=first_frame):
                 self.displayframe.clear_overlay(
@@ -8235,10 +8258,8 @@ class staticWidget(QWidget):
         _clear_wl = getattr(self.scan, '_clear_persisted_wavelength', None)
         if callable(_clear_wl):
             _clear_wl()
-        try:
-            self.displayframe._clear_wavelength_cache()
-        except Exception:
-            logger.debug("display wavelength cache reset failed", exc_info=True)
+        # (X1 Slice 3a: the per-selection HDF5 wavelength cache is GONE with
+        # its deleted tier — no display-side cache to reset here anymore.)
         # (Viewer wiring — save-dir + set_file — is done frame-driven in
         # _rescope_frame_panel_to, NOT here; see the stash above.)
         self.scan.gi = gi

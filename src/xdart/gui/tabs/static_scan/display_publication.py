@@ -694,8 +694,11 @@ class PublicationDisplayAdapter:
         if not ((want_tth and not have_tth) or (want_q and have_tth)):
             return image, axis_x, data_unit
         try:
+            # X1 Slice 3a: a CURRENT/reference-frame conversion — opt into the
+            # pinned projection's canonical wavelength evidence (T3').
             wavelength_m = widget._get_wavelength(
-                getattr(ref_publication, "raw_ref", None))
+                getattr(ref_publication, "raw_ref", None),
+                for_selected_frame=True)
         except Exception:
             wavelength_m = None
         if not wavelength_m or wavelength_m <= 0:
@@ -1429,8 +1432,11 @@ class PublicationDisplayAdapter:
         if not ((want_tth and not have_tth) or (want_q and have_tth)):
             return x_values, None
         try:
+            # X1 Slice 3a: a CURRENT/reference-frame conversion — opt into the
+            # pinned projection's canonical wavelength evidence (T3').
             wavelength_m = widget._get_wavelength(
-                getattr(ref_publication, "raw_ref", None))
+                getattr(ref_publication, "raw_ref", None),
+                for_selected_frame=True)
         except Exception:
             wavelength_m = None
         if not wavelength_m or wavelength_m <= 0:

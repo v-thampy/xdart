@@ -22,6 +22,23 @@ LIVE_SLICE_PROJECTION_ID = "__live_slice__"
 PROJECTION_ROUND_DIGITS = 6
 
 
+def scan_identity_key(scan):
+    """Stable scan key for a scan OBJECT (the ``current_scan_key`` rule without
+    a widget): the usable scan name, else the data file, else ``None``.
+
+    X1 Slice 3a: also used by the run wavelength lifecycle (R3-P5/P6) to bind
+    the run cache and the final stamp to the CAPTURED run scan's identity.
+    """
+    if scan is not None:
+        name = getattr(scan, "name", None)
+        if name not in (None, "", "null_main"):
+            return name
+        data_file = getattr(scan, "data_file", None)
+        if data_file:
+            return data_file
+    return None
+
+
 def current_scan_key(widget):
     """Stable scan key for row identity; prefer the visible scan name.
 
@@ -31,14 +48,9 @@ def current_scan_key(widget):
     which both start at frame zero cannot be captured as the same ``(None, 0)``
     row.  Normal live runs continue to use the visible scan name.
     """
-    scan = getattr(widget, "scan", None)
-    if scan is not None:
-        name = getattr(scan, "name", None)
-        if name not in (None, "", "null_main"):
-            return name
-        data_file = getattr(scan, "data_file", None)
-        if data_file:
-            return data_file
+    key = scan_identity_key(getattr(widget, "scan", None))
+    if key is not None:
+        return key
 
     frame = getattr(widget, "frame", None)
     source_file = getattr(frame, "source_file", None)

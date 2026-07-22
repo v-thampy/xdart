@@ -1784,7 +1784,10 @@ class DisplayPlotMixin:
             frames = getattr(self, 'frames', None)
             frame_for_wl = (frames.get(self.idxs_1d[0])
                             if hasattr(frames, 'get') else None)
-            wavelength = self._get_wavelength(frame_for_wl)
+            # X1 Slice 3a: a current-frame conversion — opt into the pinned
+            # projection's canonical wavelength evidence (T3').
+            wavelength = self._get_wavelength(
+                frame_for_wl, for_selected_frame=True)
             if wavelength is None or wavelength <= 0:
                 self.update()
                 return
