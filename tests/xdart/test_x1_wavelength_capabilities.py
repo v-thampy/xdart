@@ -877,6 +877,31 @@ def test_owner_mismatch_not_rescued_by_matching_source_filename(
         widget.deleteLater()
 
 
+def test_explicit_path_owners_do_not_collapse_across_roots():
+    """Two qualified owners remain distinct even when leaf and stem match."""
+    from xdart.gui.tabs.static_scan.frame_projection_adapter import (
+        _publication_serves_scan,
+    )
+
+    publication = SimpleNamespace(scan_key="/root_a/sample.nxs")
+    assert not _publication_serves_scan(publication, "/root_b/sample.nxs")
+    assert _publication_serves_scan(publication, "/root_a/sample.nxs")
+
+    windows_publication = SimpleNamespace(scan_key=r"C:\Data\sample.nxs")
+    assert _publication_serves_scan(
+        windows_publication, "c:/data/sample.nxs")
+
+    legacy_publication = SimpleNamespace(
+        scan_key=None,
+        source_identity="/root_a/sample.nxs",
+        view=None,
+        record=None,
+    )
+    assert not _publication_serves_scan(
+        legacy_publication, "/root_b/sample.nxs")
+    assert _publication_serves_scan(legacy_publication, "sample")
+
+
 def test_legacy_unstamped_provable_serves_and_unprovable_fails_closed(
         qapp, monkeypatch, tmp_path):
     """Required test 4: a legacy UNSTAMPED NeXus publication whose source

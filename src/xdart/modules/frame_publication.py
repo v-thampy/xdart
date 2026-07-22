@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import posixpath
 from dataclasses import dataclass, field, replace
 from threading import RLock
 from types import MappingProxyType
@@ -591,6 +592,23 @@ def _same_source(a: FramePublication, b: FramePublication) -> bool:
     return _same_source_id(a.source_identity, b.source_identity)
 
 
+def _scan_owners_compatible(a, b) -> bool:
+    """Whether two publications may contribute to one accumulated record.
+
+    An unstamped legacy publication can still merge through the source guard.
+    When both publications carry explicit owners, those owners must identify
+    the same scan; a matching source file alone is not sufficient evidence.
+    """
+    if a in (None, "") or b in (None, ""):
+        return True
+
+    def normalized(value) -> str:
+        source = str(value).strip().rsplit("#", 1)[0].replace("\\", "/")
+        return posixpath.normpath(source).casefold()
+
+    return normalized(a) == normalized(b)
+
+
 # MEM-2: sentinel so an unspecified heavy cap resolves to the RAM-aware window
 # at construction (frame shape is unknown here → the coarse RAM tier; the
 # wrangler resizes staging + record to the frame-precise window at run start).
@@ -835,8 +853,11 @@ class PublicationStore:
                 # projection (display consumers unchanged).  A DIFFERENT
                 # non-empty source_identity (a label reused within one epoch)
                 # must NOT splice -> plain wholesale replace.
-                if existing.generation == self._generation and _same_source(
-                    existing, publication
+                if (
+                    existing.generation == self._generation
+                    and _same_source(existing, publication)
+                    and _scan_owners_compatible(
+                        existing.scan_key, publication.scan_key)
                 ):
                     publication = replace(
                         publication,
@@ -861,7 +882,12 @@ class PublicationStore:
                 carried = self._carryover.pop(label, None)
                 if carried is not None:
                     carried_record, carried_source, carried_scan_key = carried
-                    if _same_source_id(carried_source, publication.source_identity):
+                    if (
+                        _same_source_id(
+                            carried_source, publication.source_identity)
+                        and _scan_owners_compatible(
+                            carried_scan_key, publication.scan_key)
+                    ):
                         publication = replace(
                             publication,
                             record=_merge_records(carried_record, publication.record),

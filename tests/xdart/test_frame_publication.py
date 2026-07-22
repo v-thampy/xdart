@@ -1899,7 +1899,7 @@ from xdart.modules.frame_publication import _publication_has_heavy_payload  # no
 
 
 def _mode_pub(label, *, mode_1d=None, mode_2d=None, scale=1.0, generation=0,
-              source_identity=None):
+              source_identity=None, scan_key=None):
     r1 = r2 = None
     if mode_1d is not None:
         r1 = IntegrationResult1D(
@@ -1916,7 +1916,8 @@ def _mode_pub(label, *, mode_1d=None, mode_2d=None, scale=1.0, generation=0,
         view, mode_1d=mode_1d or DEFAULT_MODE_KEY, mode_2d=mode_2d or DEFAULT_MODE_KEY)
     return publication_from_frame_view(
         view, record=rec, generation=generation,
-        source_identity=source_identity if source_identity is not None else str(label))
+        source_identity=source_identity if source_identity is not None else str(label),
+        scan_key=scan_key)
 
 
 def test_accumulation_same_frame_merges_modes_view_is_latest():
@@ -2268,6 +2269,32 @@ def test_scan_owner_preserved_through_same_scan_merge():
     assert merged.scan_key == "run_a"
 
 
+def test_scan_owner_mismatch_prevents_same_source_record_merge():
+    """A shared source path cannot splice modes across explicit scan owners."""
+    store = PublicationStore(max_items=None, max_heavy_items=None)
+    store.upsert(_mode_pub(
+        1, mode_1d="q_total", source_identity="shared.nxs",
+        scan_key="run_a"))
+    replaced = store.upsert(_mode_pub(
+        1, mode_1d="q_ip", source_identity="shared.nxs",
+        scan_key="run_b"))
+
+    assert replaced.scan_key == "run_b"
+    assert set(replaced.record.modes_1d) == {"q_ip"}
+
+
+def test_scan_owner_merge_normalizes_windows_spelling():
+    store = PublicationStore(max_items=None, max_heavy_items=None)
+    store.upsert(_mode_pub(
+        1, mode_1d="q_total", source_identity="shared.nxs",
+        scan_key=r"C:\Data\nested\..\run_a.nxs"))
+    merged = store.upsert(_mode_pub(
+        1, mode_1d="q_ip", source_identity="shared.nxs",
+        scan_key="c:/data/run_a.nxs"))
+
+    assert set(merged.record.modes_1d) == {"q_total", "q_ip"}
+
+
 def test_scan_owner_preserved_through_reintegrate_carryover():
     store = PublicationStore(max_items=None, max_heavy_items=None)
     store.upsert(publication_from_live_frame(DuckFrame(idx=1), scan_key="run_a"))
@@ -2276,6 +2303,21 @@ def test_scan_owner_preserved_through_reintegrate_carryover():
     # from a legacy unstamped caller
     republished = store.upsert(publication_from_live_frame(DuckFrame(idx=1)))
     assert republished.scan_key == "run_a"
+    store.end_reintegrate()
+
+
+def test_scan_owner_mismatch_prevents_reintegrate_carryover_merge():
+    store = PublicationStore(max_items=None, max_heavy_items=None)
+    store.upsert(_mode_pub(
+        1, mode_1d="q_total", source_identity="shared.nxs",
+        scan_key="run_a"))
+    store.begin_reintegrate()
+    republished = store.upsert(_mode_pub(
+        1, mode_1d="q_ip", source_identity="shared.nxs",
+        scan_key="run_b"))
+
+    assert republished.scan_key == "run_b"
+    assert set(republished.record.modes_1d) == {"q_ip"}
     store.end_reintegrate()
 
 

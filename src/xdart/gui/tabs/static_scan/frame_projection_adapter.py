@@ -29,6 +29,7 @@ Design contracts (handoff non-negotiables 1-3):
 from __future__ import annotations
 
 import logging
+import posixpath
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -91,6 +92,38 @@ def _scan_identity_candidates(value) -> frozenset[str]:
     return frozenset(item.casefold() for item in candidates if item)
 
 
+def _normalized_scan_identity(value) -> str:
+    """Normalize one explicit scan identity without touching the filesystem."""
+    if value in (None, ""):
+        return ""
+    source = str(value).strip().rsplit("#", 1)[0].replace("\\", "/")
+    if not source:
+        return ""
+    return posixpath.normpath(source).casefold()
+
+
+def _explicit_scan_owners_match(owner, requested_scan_key) -> bool:
+    """Compare explicit owners without collapsing two qualified paths.
+
+    A bare scan name may still be compared with a path-derived spelling for
+    compatibility with loaded scans.  Once both sides identify a path, their
+    normalized full paths are authoritative: a shared leaf or stem cannot
+    prove that they are the same scan.
+    """
+    owner_identity = _normalized_scan_identity(owner)
+    requested_identity = _normalized_scan_identity(requested_scan_key)
+    if not owner_identity or not requested_identity:
+        return False
+    if owner_identity == requested_identity:
+        return True
+    if "/" in owner_identity and "/" in requested_identity:
+        return False
+    return bool(
+        _scan_identity_candidates(owner)
+        & _scan_identity_candidates(requested_scan_key)
+    )
+
+
 def _publication_serves_scan(publication, requested_scan_key) -> bool:
     """Whether a publication belongs to the requested display scan.
 
@@ -101,11 +134,12 @@ def _publication_serves_scan(publication, requested_scan_key) -> bool:
 
     X1 Slice 3c (S3-OR1): the EXPLICIT immutable owner
     (``FramePublication.scan_key``, stamped by the production publish sites)
-    is preferred and FINAL — compared through the one canonical scan-key rule
-    (:func:`_scan_identity_candidates`); an explicit mismatch is never rescued
-    by source-name inference.  Only legacy UNSTAMPED publications fall back to
-    the positive source-identity proof: a per-frame source (e.g.
-    ``frame_0001.tif``) that cannot prove its scan fails closed.
+    is preferred and FINAL.  Qualified paths compare by normalized full path;
+    the name/path compatibility bridge applies only when one identity is a bare
+    scan name.  An explicit mismatch is never rescued by source-name inference.
+    Only legacy UNSTAMPED publications fall back to the same positive source-
+    identity proof: a per-frame source (e.g. ``frame_0001.tif``) that cannot
+    prove its scan fails closed.
     """
     if publication is None:
         return False
@@ -116,7 +150,7 @@ def _publication_serves_scan(publication, requested_scan_key) -> bool:
         return False
     owner = getattr(publication, "scan_key", None)
     if owner is not None:
-        return bool(requested & _scan_identity_candidates(owner))
+        return _explicit_scan_owners_match(owner, requested_scan_key)
     sources = {
         getattr(publication, "source_identity", None),
         getattr(getattr(publication, "view", None), "source_path", None),
@@ -126,10 +160,11 @@ def _publication_serves_scan(publication, requested_scan_key) -> bool:
             None,
         ),
     }
-    owned = frozenset().union(
-        *(_scan_identity_candidates(source) for source in sources)
+    return any(
+        _explicit_scan_owners_match(source, requested_scan_key)
+        for source in sources
+        if source not in (None, "")
     )
-    return bool(requested & owned)
 
 
 @dataclass(frozen=True, slots=True)
