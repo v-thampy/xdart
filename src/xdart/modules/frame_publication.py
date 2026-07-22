@@ -117,6 +117,14 @@ class FramePublication:
     metadata_raw: Mapping[str, Any] = field(default_factory=dict)
     metadata_numeric: Mapping[str, float] = field(default_factory=dict)
     diagnostics: PublicationDiagnostics = field(default_factory=PublicationDiagnostics)
+    #: X1 Slice 3c (S3-OR1): the IMMUTABLE owning-scan identity — display
+    #: publication provenance stamped by the production publish sites from the
+    #: already-authoritative current/run/browse scan key (never inferred from a
+    #: source filename, never via I/O).  ``None`` = legacy/viewer-only or
+    #: genuinely ownerless; the scan-qualified projection then falls back to
+    #: the positive source-identity proof only.  Preserved through replace,
+    #: thinning, hydration, merge, and store carryover.
+    scan_key: str | None = None
 
     def __post_init__(self) -> None:
         if self.record is None:
@@ -213,6 +221,7 @@ def publication_from_live_frame(
     validate: bool = True,
     active_mode_1d: str | None = None,
     active_mode_2d: str | None = None,
+    scan_key: str | None = None,
 ) -> FramePublication:
     """Adapt a current xdart ``LiveFrame``-like object into a publication.
 
@@ -273,6 +282,7 @@ def publication_from_live_frame(
         raw_status=raw_status,
         metadata_raw=metadata_raw,
         metadata_numeric=numeric_metadata(metadata_raw),
+        scan_key=scan_key,
     )
     if validate:
         diagnostics = validate_publication(publication)
@@ -289,6 +299,7 @@ def publication_from_frame_view(
     raw_ref: Any | None = None,
     raw_status: str = "unknown",
     validate: bool = True,
+    scan_key: str | None = None,
 ) -> FramePublication:
     """Wrap a headless :class:`FrameView` in the xdart publication envelope.
 
@@ -304,6 +315,7 @@ def publication_from_frame_view(
         raw_status=raw_status,
         metadata_raw=view.metadata_raw,
         metadata_numeric=view.metadata_numeric,
+        scan_key=scan_key,
     )
     if validate:
         publication = replace(
@@ -321,6 +333,7 @@ def publication_from_nexus_frame(
     entry: str = "entry",
     include_thumbnail: bool = True,
     validate: bool = True,
+    scan_key: str | None = None,
 ) -> FramePublication:
     """Read a saved processed frame and publish it through the same contract."""
 
@@ -340,6 +353,7 @@ def publication_from_nexus_frame(
         source_identity=str(scan_file),
         raw_status=("thumbnail" if view.thumbnail is not None else "missing"),
         validate=validate,
+        scan_key=scan_key,
     )
 
 
@@ -668,7 +682,9 @@ class PublicationStore:
         dropped modes are not resurrected (they rehydrate from disk)."""
         with self._lock:
             self._carryover = {
-                label: (pub.record, pub.source_identity)
+                # X1 3c: carry the scan owner alongside the record so the
+                # reintegrate republish keeps the stamp.
+                label: (pub.record, pub.source_identity, pub.scan_key)
                 for label, pub in self._items.items()
                 if pub.record is not None
             }
@@ -825,6 +841,13 @@ class PublicationStore:
                     publication = replace(
                         publication,
                         record=_merge_records(existing.record, publication.record),
+                        # X1 3c: the same-source merge preserves the explicit
+                        # scan owner — incl. when a legacy UNSTAMPED republish
+                        # (or an unstamped hydrator result) folds onto a
+                        # stamped entry.
+                        scan_key=(publication.scan_key
+                                  if publication.scan_key is not None
+                                  else existing.scan_key),
                     )
                 self._items.pop(label)
                 self._drop_heavy_label_locked(label)
@@ -837,11 +860,16 @@ class PublicationStore:
                 # carried entry is consumed (popped) so it merges only once.
                 carried = self._carryover.pop(label, None)
                 if carried is not None:
-                    carried_record, carried_source = carried
+                    carried_record, carried_source, carried_scan_key = carried
                     if _same_source_id(carried_source, publication.source_identity):
                         publication = replace(
                             publication,
                             record=_merge_records(carried_record, publication.record),
+                            # X1 3c: restore the carried scan owner for a
+                            # legacy unstamped republish of the same source.
+                            scan_key=(publication.scan_key
+                                      if publication.scan_key is not None
+                                      else carried_scan_key),
                         )
             self._items[publication.label] = publication
             if _publication_has_heavy_payload(publication):

@@ -66,13 +66,10 @@ def _selected_capability_context(widget):
     """X1 Slice 3b: the value-only pinned-projection snapshot for the typed
     hydration gate (R3-P8) and the per-panel capability layer (R3-P3).
 
-    Carries ``present`` so the pure layer applies typed verdicts only to
-    RESOLVED records: an ABSENT pin means the authority could not resolve the
-    frame — including legitimately-unprovable ownership (per-frame TIFF
-    source identities can never name-match a scan), so it must not override
-    legacy residency; its consumers (popup/channels/wavelength) still fail
-    closed.  Only a missing pin/adapter (duck hosts, viewer paths) is the
-    legacy ``None``."""
+    X1 3c: publication scan ownership is explicit now, so an ABSENT pin is a
+    real scan-qualified verdict and its all-UNAVAILABLE facts blank the
+    selected frame fail-closed in the pure layer.  Only a missing pin/adapter
+    (duck hosts, viewer paths) is the legacy ``None``."""
     projection = getattr(widget, "_current_frame_projection", None)
     if projection is None:
         return None
@@ -82,7 +79,6 @@ def _selected_capability_context(widget):
         label=_label_key(getattr(projection, "label", None)),
         integrated_1d=getattr(caps, "integrated_1d", None),
         capabilities=caps,
-        present=bool(getattr(projection, "present", False)),
     )
 
 
@@ -621,9 +617,17 @@ class _BaseController:
             # X1 Slice 3b (R3-P3): the pinned selected-frame capability
             # context + the requesting display's scan identity — the pure
             # state applies the per-panel typed layer only on an exact
-            # scan-qualified probe match.
-            selected_capability=_selected_capability_context(widget),
-            current_scan_key=_widget_scan_key(widget),
+            # scan-qualified probe match.  Viewer modes are an intentional
+            # legacy bypass (their ids are viewer rows, not scan frames —
+            # the pin is a scan-display concept; S3-OR1 #4).
+            selected_capability=(
+                None if mode in (Mode.IMAGE_VIEWER, Mode.XYE_VIEWER,
+                                 Mode.NEXUS_VIEWER)
+                else _selected_capability_context(widget)),
+            current_scan_key=(
+                None if mode in (Mode.IMAGE_VIEWER, Mode.XYE_VIEWER,
+                                 Mode.NEXUS_VIEWER)
+                else _widget_scan_key(widget)),
         )
 
     def build_payload(self, widget, state):

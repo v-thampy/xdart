@@ -399,6 +399,10 @@ class DisplayDataMixin:
             raw_ref=getattr(publication, "raw_ref", None),
             raw_status=getattr(publication, "raw_status", "unknown"),
             validate=True,
+            # X1 3c: preserve the stored publication's owner; else stamp the
+            # authoritative current scan.
+            scan_key=(getattr(publication, "scan_key", None)
+                      or _current_scan_key(self)),
         )
 
     def _store_first_publication_for_display(
@@ -701,6 +705,10 @@ class DisplayDataMixin:
                 active_mode_2d=(
                     _a2.get("gi_mode_2d", "qip_qoop")
                     if _is_gi else None),
+                # X1 3c (S3-OR1): hydration replacement re-stamps the owner
+                # from the authoritative current scan (the frame came from
+                # this scan's own frame series).
+                scan_key=_current_scan_key(self),
             )
         except Exception:
             logger.debug("rehydrate: publication build failed for %s", label,
@@ -807,6 +815,11 @@ class DisplayDataMixin:
                         ),
                         raw_status="1d-only",
                         validate=False,
+                        # X1 3c: preserve the stored owner; else stamp the
+                        # authoritative current scan (the batch reads THIS
+                        # scan's file).
+                        scan_key=(getattr(existing, "scan_key", None)
+                                  or _current_scan_key(self)),
                     )
                 )
         return tuple(publications)

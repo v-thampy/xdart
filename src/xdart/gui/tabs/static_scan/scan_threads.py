@@ -291,6 +291,8 @@ class integratorThread(Qt.QtCore.QThread):
             # modes ACCUMULATE into one record instead of colliding under
             # DEFAULT_MODE_KEY (the v2 reducer leaves frame.gi_* empty).  Non-GI
             # -> None -> DEFAULT (unchanged).  .view is unaffected.
+            from .display_overlay_utils import scan_identity_key
+
             _is_gi = bool(getattr(self.scan, "gi", False))
             self.publication_store.upsert(
                 publication_from_live_frame(
@@ -302,6 +304,9 @@ class integratorThread(Qt.QtCore.QThread):
                     active_mode_2d=(
                         self.scan.bai_2d_args.get("gi_mode_2d", "qip_qoop")
                         if _is_gi else None),
+                    # X1 3c (S3-OR1): stamp the immutable scan owner from the
+                    # thread's authoritative scan — never a source filename.
+                    scan_key=scan_identity_key(self.scan),
                 )
             )
         except Exception:

@@ -772,27 +772,31 @@ def test_single_fact_error_does_not_blank_other_panels(
         widget.deleteLater()
 
 
+def _assert_selected_panels_blank(state):
+    for role in (PanelRole.RAW_2D, PanelRole.CAKE_2D, PanelRole.PLOT_1D):
+        panel = state.panel(role)
+        if panel is not None:
+            assert panel.has_data is False, role
+    raw_panel = state.panel(PanelRole.RAW_2D)
+    if raw_panel is not None:
+        from xdart.gui.tabs.static_scan.display_logic import RawSource
+        assert raw_panel.source is RawSource.NONE
+
+
 def test_r4_stale_cross_scan_publication_pin_fails_closed(
         qapp, monkeypatch, tmp_path):
-    """Test 2e — ACHIEVABLE contract (PLAN DEVIATION, disclosed in the
-    handback): a retained cross-scan publication with a reused label yields an
-    ABSENT pin, so every PROJECTION consumer (metadata popup, channel
-    discovery, wavelength evidence — Slice 2/3a) fails closed.  The plan's
-    additional "panels blank on the absent pin" step is NOT implemented: the
-    R4 ownership proof is name-based and structurally UNPROVABLE for
-    legitimate per-frame source identities (TIFF-series scans publish
-    ``frame_0001.tif``-style sources that can never name-match the scan), so
-    blanking on ``present=False`` blanks REAL same-scan displays (caught by
-    the run-end catch-up suite).  Render blanking for the stale case needs a
-    scan-stamped publication identity — a maintainer/R4-owner residual.  The
-    typed layer therefore applies only to PRESENT projections, and this test
-    pins that boundary in both directions."""
+    """Test 2e RESTORED (S3-OR1 correction): a retained scan-A publication
+    with an EXPLICIT owner A, requested by scan B under the reused label,
+    projects ``present=False`` — and the absent scan-matching pin carries its
+    ABSENT capabilities into the pure layer, so raw, cake, AND the
+    selected-frame 1D all fail closed.  No legacy pixel fallback."""
     widget = _make_widget(monkeypatch, tmp_path)
     try:
         display = widget.displayframe
         display.scan.name = "scan_b"                      # browsing scan B
         display.publication_store.upsert(publication_from_frame_view(
-            _view2d(0, source="/data/scan_a.nxs")))       # stale A publication
+            _view2d(0, source="/data/scan_a.nxs"),
+            scan_key="scan_a"))                           # stamped A publication
 
         _select(display, 0)
         projection = display._current_frame_projection
@@ -801,11 +805,150 @@ def test_r4_stale_cross_scan_publication_pin_fails_closed(
             is CapabilityDisposition.ABSENT
         # Projection consumers fail closed on the absent pin (Slice 2/3a).
         assert displayFrameWidget._projection_norm_channels(display) == ()
-        # The ABSENT pin does NOT override legacy residency: panels carry NO
-        # typed layer (present=False) — the boundary the catch-up flows need.
+        # ... and so does the RENDER: the typed ABSENT facts blank every
+        # selected-frame panel — never scan A's pixels under scan B.
         state = display._live_display_state()
+        _assert_selected_panels_blank(state)
         cake = state.panel(PanelRole.CAKE_2D)
-        assert cake is not None and cake.capability is None
+        assert cake is not None and cake.capability is not None
+        assert cake.capability.disposition is CapabilityDisposition.ABSENT
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+# --------------------------------------------------------------------------- #
+# Slice 3c (S3-OR1): explicit immutable publication scan ownership
+# --------------------------------------------------------------------------- #
+
+def test_stamped_tiff_publication_projects_present_and_serves_consumers(
+        qapp, monkeypatch, tmp_path):
+    """Required test 1: a same-scan TIFF publication whose source_path is a
+    per-frame filename (name-unprovable) but whose explicit owner matches the
+    requested scan projects present=True; raw/cake/1D behavior is unchanged
+    and metadata/channel consumers are populated (the Slice-2 TIFF gap
+    closes)."""
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        display = widget.displayframe
+        display.scan.name = "tiff_scan"
+        view = FrameView.from_results(
+            label=0, result_1d=_r1d(), metadata_raw={"i0": 5.0, "motor_x": 7.0},
+            source_path="/data/frames/frame_0000.tif", source_frame_index=0)
+        display.publication_store.upsert(
+            publication_from_frame_view(view, scan_key="tiff_scan"))
+
+        _select(display, 0)
+        projection = display._current_frame_projection
+        assert projection is not None and projection.present is True
+        assert projection.capabilities.integrated_1d.state \
+            is CapabilityState.AVAILABLE
+        assert projection.metadata.raw["i0"] == 5.0        # metadata populated
+        assert displayFrameWidget._projection_norm_channels(display) \
+            == ("i0", "motor_x")                           # channels populated
+        state = display._live_display_state()
+        plot = state.panel(PanelRole.PLOT_1D)
+        assert plot is not None and plot.has_data is True  # normal render
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_owner_mismatch_not_rescued_by_matching_source_filename(
+        qapp, monkeypatch, tmp_path):
+    """Required test 3: an explicit owner mismatch is FINAL — a coincidentally
+    matching source filename must not rescue it (no fallback to source-name
+    inference after an explicit mismatch)."""
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        display = widget.displayframe
+        display.scan.name = "scan_b"
+        # The source FILENAME names scan_b, but the explicit owner is scan_a.
+        display.publication_store.upsert(publication_from_frame_view(
+            _view2d(0, source="/data/scan_b.nxs"), scan_key="scan_a"))
+
+        _select(display, 0)
+        projection = display._current_frame_projection
+        assert projection is not None and projection.present is False
+        state = display._live_display_state()
+        _assert_selected_panels_blank(state)
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_legacy_unstamped_provable_serves_and_unprovable_fails_closed(
+        qapp, monkeypatch, tmp_path):
+    """Required test 4: a legacy UNSTAMPED NeXus publication whose source
+    identity positively proves the scan stays compatible; an unstamped,
+    unprovable per-frame source fails closed (production sites stamp, so this
+    is the legacy boundary only)."""
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        display = widget.displayframe
+        # (a) provable: source stem == scan name (the existing R4 rule)
+        display.scan.name = "loaded"
+        display.publication_store.upsert(
+            publication_from_frame_view(_view(0)))         # /data/loaded.nxs
+        _select(display, 0)
+        assert display._current_frame_projection.present is True
+
+        # (b) unprovable per-frame source, unstamped → fails closed
+        display.scan.name = "tiff_scan"
+        display.publication_store.upsert(publication_from_frame_view(
+            FrameView.from_results(
+                label=1, result_1d=_r1d(), metadata_raw={"i0": 1.0},
+                source_path="/data/frames/frame_0001.tif",
+                source_frame_index=1)))
+        _select(display, 1)
+        projection = display._current_frame_projection
+        assert projection is not None and projection.present is False
+        state = display._live_display_state()
+        _assert_selected_panels_blank(state)
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_pause_browse_resume_owner_qualified_terminal_coherence(
+        qapp, monkeypatch, tmp_path):
+    """Required test 6: pause run A → browse B → resume A, plus rapid
+    same-label selection — the terminal pin is owner-qualified each time."""
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        display = widget.displayframe
+        display.scan.name = "run_a"
+        display.publication_store.upsert(publication_from_frame_view(
+            FrameView.from_results(
+                label=0, result_1d=_r1d(), metadata_raw={"i0": 111.0},
+                source_path="/data/frames/frame_0000.tif",
+                source_frame_index=0),
+            scan_key="run_a"))                             # A-stamped TIFF frame
+
+        _select(display, 0)
+        assert display._current_frame_projection.present is True
+        assert display._current_frame_projection.metadata.raw["i0"] == 111.0
+
+        # paused browse of scan B: A's retained publication must NOT serve B
+        display.scan.name = "scan_b"
+        _select(display, 0)
+        assert display._current_frame_projection.present is False
+        _assert_selected_panels_blank(display._live_display_state())
+
+        # resume A: A's frame serves again — owner-qualified, same label
+        display.scan.name = "run_a"
+        _select(display, 0)
+        assert display._current_frame_projection.present is True
+        assert display._current_frame_projection.metadata.raw["i0"] == 111.0
+
+        # rapid same-label flips end owner-coherent at the terminal scan
+        for terminal in ("scan_b", "run_a", "scan_b"):
+            display.scan.name = terminal
+            _select(display, 0)
+        assert display._current_frame_projection.present is False  # scan_b
+        display.scan.name = "run_a"
+        _select(display, 0)
+        assert display._current_frame_projection.present is True
     finally:
         widget.close()
         widget.deleteLater()

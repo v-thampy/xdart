@@ -3666,12 +3666,16 @@ class H5Viewer(QWidget):
             return
         try:
             store = getattr(self, "publication_store", None)
+            from .display_overlay_utils import scan_identity_key
             publication = publication_from_live_frame(
                 frame,
                 generation=(store.generation if store is not None else 0),
                 include_2d=bool(load_2d),
                 include_thumbnail=bool(load_2d),
                 retain_raw_ref=bool(load_2d),
+                # X1 3c (S3-OR1): stamp the immutable scan owner from the
+                # authoritative browse scan — never from a source filename.
+                scan_key=scan_identity_key(getattr(self, "scan", None)),
             )
             frame_idx = int(idx)
             has_2d_error = publication_has_2d_errors(publication)

@@ -1948,7 +1948,9 @@ def _set_int_scan(w, *, n=1, wavelength_m=0.7293e-10):
             w.viewer_rows_2d[i] = {"map_raw": f.map_raw, "bg_raw": 0, "mask": None,
                             "int_2d": f.int_2d, "gi_2d": {}, "thumbnail": None}
             w.viewer_rows_1d[i] = f
-            w.publication_store.upsert(publication_from_live_frame(f))
+            w.publication_store.upsert(publication_from_live_frame(
+                # X1 3c: stamp the scan this fixture INSTALLS (df.scan stub).
+                f, scan_key="scan"))
     w.frame_ids[:] = [str(i) for i in range(n)]
     df.idxs_2d = list(range(n))
     df.idxs_1d = list(range(n))
@@ -2190,7 +2192,9 @@ def test_average_all_nan_column_does_not_warn(widget):
             f = w.viewer_rows_1d[i]
             f.int_1d = IntegrationResult1D(
                 radial=q, intensity=inten, sigma=np.ones_like(q), unit="q_A^-1")
-            w.publication_store.upsert(publication_from_live_frame(f))
+            w.publication_store.upsert(publication_from_live_frame(
+                # X1 3c: stamp the scan this fixture INSTALLS (df.scan stub).
+                f, scan_key="scan"))
     df.ui.plotMethod.setCurrentText("Average")
     df.ui.plotUnit.setCurrentIndex(0)
     w.frame_ids[:] = ["0", "1", "2"]

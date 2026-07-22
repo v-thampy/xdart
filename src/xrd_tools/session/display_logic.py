@@ -442,13 +442,6 @@ class SelectedCapabilityContext:
     label: "object" = None
     integrated_1d: "Capability | None" = None
     capabilities: "DisplayCapabilities | None" = None
-    #: Whether the pinned projection RESOLVED a record (``FrameProjection
-    #: .present``).  The per-panel typed layer applies only to present
-    #: projections: an ABSENT pin means the authority could not resolve the
-    #: frame (record not present, or publication ownership unprovable — e.g.
-    #: per-frame TIFF source identities that cannot name-match a scan), which
-    #: is NOT proof the legacy-resident draw is wrong.
-    present: bool = False
 
 
 @dataclass(frozen=True)
@@ -2659,15 +2652,12 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
     # typed layer applies only when its probe matches the pin's scan-qualified
     # (scan_key, label) — never a bare label (contract 8), and never for an
     # aggregate probe that differs from the pin (S2-R3 analog).
+    # X1 3c (S3-OR1): the typed layer applies to EVERY scan-matching pin —
+    # including an ABSENT one, whose all-UNAVAILABLE facts blank the selected
+    # frame fail-closed (publication ownership is now explicit, so absence is
+    # a real scan-qualified verdict, not an unprovable-identity artifact).
     _sel_caps = (getattr(selected_capability, "capabilities", None)
                  if selected_capability is not None else None)
-    # The typed layer applies only to PRESENT projections — real typed
-    # verdicts about a resolved record.  An ABSENT pin (record not present /
-    # ownership unprovable) must not override legacy residency (see
-    # SelectedCapabilityContext.present).
-    if _sel_caps is not None and not getattr(
-            selected_capability, "present", False):
-        _sel_caps = None
     _sel_scan_ok = (
         _sel_caps is not None
         and selected_capability.scan_key == current_scan_key)

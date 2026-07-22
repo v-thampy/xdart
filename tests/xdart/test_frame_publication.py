@@ -2230,3 +2230,66 @@ def test_tier0_eviction_without_probe_keeps_legacy_behavior():
     for idx in (1, 2, 3):
         store.upsert(publication_from_live_frame(DuckFrame(idx=idx)))
     assert store.labels() == (2, 3)
+
+
+# --------------------------------------------------------------------------- #
+# X1 Slice 3c (S3-OR1): explicit immutable publication scan ownership
+# --------------------------------------------------------------------------- #
+
+def test_publication_scan_owner_stamped_and_default_none():
+    stamped = publication_from_live_frame(DuckFrame(idx=1), scan_key="run_a")
+    assert stamped.scan_key == "run_a"
+    unstamped = publication_from_live_frame(DuckFrame(idx=2))
+    assert unstamped.scan_key is None
+
+
+def test_scan_owner_preserved_through_thinning_tiers():
+    """Tier-1 (semilight) and tier-2 (lightweight) eviction keep the owner."""
+    store = PublicationStore(
+        max_items=None, max_heavy_items=0, max_thumbnail_items=0)
+    store.upsert(publication_from_live_frame(DuckFrame(idx=1), scan_key="run_a"))
+    thinned = store.get(1)
+    assert thinned is not None
+    assert thinned.raw_status == "evicted"          # fully thinned (both tiers)
+    assert thinned.scan_key == "run_a"              # owner survives eviction
+
+
+def test_scan_owner_preserved_through_same_scan_merge():
+    """The upsert merge keeps the owner — including when a legacy UNSTAMPED
+    republish of the same source merges onto a stamped entry."""
+    store = PublicationStore(max_items=None, max_heavy_items=None)
+    store.upsert(publication_from_live_frame(DuckFrame(idx=1), scan_key="run_a"))
+    # stamped incoming, same source: merged record + owner kept
+    merged = store.upsert(
+        publication_from_live_frame(DuckFrame(idx=1), scan_key="run_a"))
+    assert merged.scan_key == "run_a"
+    # legacy unstamped incoming, same source: EXISTING owner is preserved
+    merged = store.upsert(publication_from_live_frame(DuckFrame(idx=1)))
+    assert merged.scan_key == "run_a"
+
+
+def test_scan_owner_preserved_through_reintegrate_carryover():
+    store = PublicationStore(max_items=None, max_heavy_items=None)
+    store.upsert(publication_from_live_frame(DuckFrame(idx=1), scan_key="run_a"))
+    store.begin_reintegrate()
+    # the reintegrate republish (same source) restores the carried owner even
+    # from a legacy unstamped caller
+    republished = store.upsert(publication_from_live_frame(DuckFrame(idx=1)))
+    assert republished.scan_key == "run_a"
+    store.end_reintegrate()
+
+
+def test_scan_owner_preserved_through_hydration_replacement():
+    """get_or_hydrate replacing an evicted payload keeps the owner even when
+    the hydrator returns an unstamped same-source publication."""
+    store = PublicationStore(
+        max_items=None, max_heavy_items=0, max_thumbnail_items=0)
+    store.upsert(publication_from_live_frame(DuckFrame(idx=1), scan_key="run_a"))
+    assert store.get(1).raw_status == "evicted"
+    store.set_hydrator(
+        lambda label: publication_from_live_frame(
+            DuckFrame(idx=1), generation=store.generation))
+    hydrated = store.get_or_hydrate(1)
+    assert hydrated is not None
+    assert hydrated.view.intensity_1d is not None    # payload restored
+    assert hydrated.scan_key == "run_a"              # owner survived

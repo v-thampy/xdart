@@ -642,7 +642,8 @@ class OVHarness:
         the fresh frame; ``None`` publishes without touching the selection."""
         frame = self._make_frame(
             label, peak=peak, npt=npt, x_range=x_range, empty=empty)
-        self.store.upsert(publication_from_live_frame(frame))
+        self.store.upsert(publication_from_live_frame(
+            frame, scan_key=self.widget.scan.name))
         index = self.widget.scan.frames.index
         if int(label) not in index:
             index.append(int(label))
@@ -818,7 +819,8 @@ class OVHarness:
         try:
             for label in list(self.widget.scan.frames.index):
                 frame = self._make_frame(label)
-                self.store.upsert(publication_from_live_frame(frame))
+                self.store.upsert(publication_from_live_frame(
+            frame, scan_key=self.widget.scan.name))
         finally:
             self.store.end_reintegrate()
         self.widget.display_generation += 1
@@ -832,7 +834,8 @@ class OVHarness:
         ``stale=True`` mirrors a completion whose generation lapsed — it joins
         the pending-append queue (OV-3/BR-2 path) instead of the selection."""
         frame = self._make_frame(label)
-        self.store.upsert(publication_from_live_frame(frame))
+        self.store.upsert(publication_from_live_frame(
+            frame, scan_key=self.widget.scan.name))
         if stale:
             queue = self.widget._overlay_hydrated_pending_append_labels
             if int(label) not in queue:

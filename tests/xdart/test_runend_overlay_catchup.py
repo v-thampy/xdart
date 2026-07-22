@@ -198,7 +198,9 @@ def _publish_head(w, upto):
     store = w.publication_store
     for i in range(1, upto + 1):
         store.upsert(publication_from_live_frame(
-            _store_frame(i), generation=store.generation))
+            _store_frame(i), generation=store.generation,
+            # X1 3c: mirror the production publish stamp (explicit scan owner).
+            scan_key=SCAN_NAME))
     return store
 
 

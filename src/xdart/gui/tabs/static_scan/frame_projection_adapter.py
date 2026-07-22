@@ -98,6 +98,14 @@ def _publication_serves_scan(publication, requested_scan_key) -> bool:
     preceding scan while a new browse request is being established.  Label
     equality alone is therefore insufficient: frame zero is reused by nearly
     every scan.
+
+    X1 Slice 3c (S3-OR1): the EXPLICIT immutable owner
+    (``FramePublication.scan_key``, stamped by the production publish sites)
+    is preferred and FINAL — compared through the one canonical scan-key rule
+    (:func:`_scan_identity_candidates`); an explicit mismatch is never rescued
+    by source-name inference.  Only legacy UNSTAMPED publications fall back to
+    the positive source-identity proof: a per-frame source (e.g.
+    ``frame_0001.tif``) that cannot prove its scan fails closed.
     """
     if publication is None:
         return False
@@ -106,6 +114,9 @@ def _publication_serves_scan(publication, requested_scan_key) -> bool:
     requested = _scan_identity_candidates(requested_scan_key)
     if not requested:
         return False
+    owner = getattr(publication, "scan_key", None)
+    if owner is not None:
+        return bool(requested & _scan_identity_candidates(owner))
     sources = {
         getattr(publication, "source_identity", None),
         getattr(getattr(publication, "view", None), "source_path", None),

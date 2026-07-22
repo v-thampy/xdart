@@ -5950,6 +5950,9 @@ class staticWidget(QWidget):
                     # ndarray reference avoids a needless HDF5 hydration pass;
                     # bounded-store eviction releases both references together.
                     include_raw=True,
+                    # X1 3c (S3-OR1): stamp the immutable scan owner from the
+                    # authoritative run scan — never from a source filename.
+                    scan_key=scan_identity_key(self.scan),
                 )
                 if not skip_2d and publication_has_2d_errors(publication):
                     logger.warning(
