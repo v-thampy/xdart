@@ -737,7 +737,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # scan/file load — so a worker result computed against an old
         # generation can be dropped (full enforcement lands in Stage 5).
         self.display_generation = 0
-        # X1 GUI-adoption Slice 1: one projection lookup per render generation.
+        # X1 GUI-adoption Slice 1: one projection lookup per admitted render.
         # The adapter is the single boundary to
         # ``xrd_tools.session.project_frame``; ``_update_impl`` pins
         # ``self._current_frame_projection`` so the metadata / normalization /
@@ -2154,7 +2154,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         finally:
             self._in_update = False
 
-    # -- X1 Slice 1: one projection lookup per render generation ------------- #
+    # -- X1 Slice 1: one projection lookup per admitted render --------------- #
 
     def _projection_record_store(self):
         """The active session ``FrameRecordStore`` for a projection lookup.
@@ -2178,12 +2178,18 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     def _pin_selected_frame_projection(self):
         """Pin ONE immutable ``project_frame`` result for the current display
-        frame at the current generation.
+        frame for this admitted render.
 
         Consumed by the metadata popup and normalization-channel discovery (X1
         Slice 2) — all through the shared, memoized :meth:`projection_for`, so a
-        selected-frame render performs one store lookup shared by every consumer
-        (handoff contract 2).  Never raises into the render path."""
+        selected-frame render performs one fresh store lookup shared by every
+        consumer (handoff contract 2).  The pin is invalidated at the render
+        boundary because a publication can arrive for the same scan/frame
+        without changing the selection generation.  Never raises into the
+        render path."""
+        adapter = getattr(self, "_frame_projection_adapter", None)
+        if adapter is not None:
+            adapter.invalidate()
         self._current_frame_projection = displayFrameWidget.projection_for(self)
 
     def projection_for(self, label=None):
@@ -2268,8 +2274,6 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         ``layout`` and draws-or-clears each — no ``if viewer_mode == ...``
         dispatch here.
         """
-        if hasattr(self, 'refresh_norm_channels'):
-            self.refresh_norm_channels()
         self.get_idxs()
         self._note_selection_generation()   # bump generation on selection change
         # X1 Slice 1: one project_frame lookup for the primary selected frame,
@@ -2279,6 +2283,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # methods they exercise — keep working; the method itself no-ops when
         # the projection adapter is absent on such a host.
         displayFrameWidget._pin_selected_frame_projection(self)
+        # Channel discovery must follow the canonical selection update and pin.
+        # Running it before get_idxs() can resolve the prior frame through stale
+        # idxs_1d/idxs_2d and leave the combo one selection behind.
+        if hasattr(self, 'refresh_norm_channels'):
+            self.refresh_norm_channels()
 
         if not self._updated():
             # Nothing to draw yet for the current selection.  Only render the

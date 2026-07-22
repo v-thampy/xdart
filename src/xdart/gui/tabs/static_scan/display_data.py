@@ -1546,6 +1546,16 @@ class DisplayDataMixin:
         # so each Overlay/Waterfall trace is normalized by its own monitor value,
         # never the selected frame's.  The value + guard now come from the
         # headless ``normalization_value`` (finite-positive, case-insensitive).
+        # The combo can retain its prior text while a newly selected frame is
+        # awaiting publication.  In the projection-wired production widget that
+        # text is only a preference, not current authority: keep render math
+        # fail-closed until refresh_norm_channels() publishes a non-empty
+        # signature for the current scan-qualified projection.
+        if (
+            callable(getattr(self, "_projection_norm_channels", None))
+            and not getattr(self, "_norm_channel_signature", ())
+        ):
+            return intensity
         normChannel = self.get_normChannel(scan_data_keys=scan_info.keys())
         if normChannel:
             value = normalization_value(MetadataRow(raw=dict(scan_info)), normChannel)
@@ -1613,7 +1623,21 @@ class DisplayDataMixin:
         channels = available_norm_channels(keys)
         current = self.get_normChannel(scan_data_keys=keys)
         signature = tuple(channels)
-        if signature == getattr(self, '_norm_channel_signature', None):
+        previous_signature = getattr(self, '_norm_channel_signature', None)
+        if signature == previous_signature:
+            # A viewer-mode round trip can re-enable the combo after an empty
+            # projection.  Keep its enabled state tied to authoritative data.
+            combo.setEnabled(bool(channels))
+            return
+
+        if not channels and previous_signature not in (None, ()):
+            # A newly selected/live frame can briefly precede its publication.
+            # Keep the user's visible choice so it can be restored, but disable
+            # the control and publish an empty authoritative signature.  Since
+            # get_normChannel() re-queries the current projection, retained text
+            # can never normalize a row while that projection is unavailable.
+            self._norm_channel_signature = ()
+            combo.setEnabled(False)
             return
 
         try:
@@ -1642,6 +1666,7 @@ class DisplayDataMixin:
                     selected_index = row
             combo.setCurrentIndex(selected_index)
             self._norm_channel_signature = signature
+            combo.setEnabled(bool(channels))
             # The content-fit width was computed at init from the .ui
             # placeholder; refit for the real counter names so longer ones
             # aren't clipped in the closed combo.

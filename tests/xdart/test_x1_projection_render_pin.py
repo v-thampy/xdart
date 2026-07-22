@@ -5,11 +5,11 @@ Drives the REAL ``staticWidget.displayframe`` render (``update()`` ->
 ``PublicationStore`` (browse path; no live record store).  Locks the two Slice-1
 contracts on the actual production wiring:
 
-* one ``project_frame`` lookup per selected-frame render generation (repeat
-  renders at the same generation reuse the pinned value; a new selection
-  generation performs exactly one more);
+* one fresh ``project_frame`` lookup per admitted selected-frame render, shared
+  by every consumer during that render; repeated renders at the same selection
+  generation can therefore observe newly published store state;
 * removing the real ``_pin_selected_frame_projection()`` call in ``_update_impl``
-  makes ``test_render_pins_one_projection_per_generation`` fail (the pinned
+  makes ``test_render_pins_one_projection_per_admitted_render`` fail (the pinned
   ``_current_frame_projection`` goes ``None`` and the lookup count goes to 0).
 """
 
@@ -70,7 +70,8 @@ def _make_widget(monkeypatch, tmp_path):
     return staticWidget()
 
 
-def test_render_pins_one_projection_per_generation(qapp, monkeypatch, tmp_path):
+def test_render_pins_one_projection_per_admitted_render(
+        qapp, monkeypatch, tmp_path):
     calls = _spy_project_frame(monkeypatch)
     widget = _make_widget(monkeypatch, tmp_path)
     try:
@@ -90,17 +91,18 @@ def test_render_pins_one_projection_per_generation(qapp, monkeypatch, tmp_path):
         assert projection.label == 0
         assert len(calls) == 1                     # exactly one lookup
 
-        # A repeat render at the SAME selection/generation reuses the pin.
+        # A repeat admitted render at the SAME selection/generation refreshes
+        # once so same-frame publication/store changes can become visible.
         display.update()
-        assert len(calls) == 1
-        assert display._current_frame_projection is projection
+        assert len(calls) == 2
+        assert display._current_frame_projection is not projection
 
         # A new selection bumps the generation -> exactly one more lookup.
         display.frame_ids = (1,)
         display.update()
         assert display._current_frame_projection is not None
         assert display._current_frame_projection.label == 1
-        assert len(calls) == 2
+        assert len(calls) == 3
     finally:
         widget.close()
         widget.deleteLater()

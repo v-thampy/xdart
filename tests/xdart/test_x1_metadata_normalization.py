@@ -17,6 +17,7 @@ from types import MethodType, SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import h5py
 import numpy as np
 import pandas as pd
 import pytest
@@ -26,13 +27,21 @@ from pyqtgraph import QtWidgets
 from PySide6.QtCore import QModelIndex
 
 from xdart.gui.tabs.static_scan.display_data import DisplayDataMixin
-from xdart.modules.frame_publication import publication_from_frame_view
+from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+from xdart.modules.ewald.frame import LiveFrame
+from xdart.modules.frame_publication import (
+    publication_from_frame_view,
+    publication_from_live_frame,
+    publication_from_nexus_frame,
+)
 from xrd_tools.core import FrameRecord, FrameView, IntegrationResult1D
+from xrd_tools.io.nexus import write_integrated_stack
 from xrd_tools.session import (
     CapabilityState,
     FrameRecordStore,
     project_frame,
 )
+from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter
 
 
 @pytest.fixture(scope="module")
@@ -132,6 +141,87 @@ def test_scanned_motor_precedence_flows_through_projection(qapp, monkeypatch, tm
         widget.deleteLater()
 
 
+def _project_publication(publication):
+    store = FrameRecordStore(max_heavy_items=None)
+    store.upsert(publication.record)
+    return project_frame(store, publication.label)
+
+
+def test_bluesky_metadata_projection_matches_live_batch_and_reload(tmp_path):
+    """A real NXWriter motor/counter row survives all three production paths."""
+    source = _write_bluesky_nxwriter(tmp_path / "bluesky_00001.nxs", n=3)
+    reader = imageThread.__new__(imageThread)
+    reader.meta_ext = None
+    reader.meta_dir = None
+    reader._eiger_metadata_cache = {}
+    reader._bluesky_source_cache = {}
+    reader.img_file = str(source)
+
+    source_frame_index = 1
+    label = source_frame_index + 1
+    metadata = reader._frame_scan_info(str(source), source_frame_index)
+    assert {"hy", "i0"} <= metadata.keys()
+
+    integrator = SimpleNamespace()
+    live_frame = LiveFrame(
+        label,
+        np.ones((2, 2), dtype=np.float32),
+        scan_info=dict(metadata),
+        static=True,
+        integrator=integrator,
+    )
+    live_frame.source_file = str(source)
+    live_frame.source_frame_idx = source_frame_index
+    live_frame.int_1d = _r1d()
+    live = _project_publication(
+        publication_from_live_frame(live_frame, include_2d=False))
+
+    batch_worker = imageThread.__new__(imageThread)
+    batch_worker.command = ""
+    batch_worker.gi = False
+    batch_worker.incidence_motor = "th"
+    batch_worker.sample_orientation = 4
+    batch_worker.tilt_angle = 0.0
+    batch_worker.series_average = False
+    batch_worker.poni = None
+    batch_worker._apply_threshold_inline = lambda image: image
+    batch_worker._resolve_frame_mask = lambda scan, image: None
+    batch_scan = SimpleNamespace(
+        skip_2d=True,
+        _cached_integrator=SimpleNamespace(),
+    )
+    [batch_frame] = imageThread._build_batch_frames(
+        batch_worker,
+        batch_scan,
+        [(str(source), label, np.ones((2, 2), dtype=np.float32),
+          dict(metadata), 0.0, 0.0)],
+    )
+    batch_frame.int_1d = _r1d()
+    batch = _project_publication(
+        publication_from_live_frame(batch_frame, include_2d=False))
+
+    processed = tmp_path / "processed.nxs"
+    with h5py.File(processed, "w") as h5:
+        entry = h5.create_group("entry")
+        write_integrated_stack(
+            entry,
+            frame_indices=[label],
+            results_1d=[live_frame.int_1d],
+        )
+        scan_data = entry.create_group("scan_data")
+        scan_data.create_dataset("frame_index", data=np.array([label]))
+        for key, value in metadata.items():
+            if isinstance(value, (int, float, np.number)):
+                scan_data.create_dataset(key, data=np.array([float(value)]))
+    reload = _project_publication(
+        publication_from_nexus_frame(str(processed), label))
+
+    expected = {key: float(metadata[key]) for key in ("hy", "i0")}
+    for projection in (live, batch, reload):
+        assert projection.metadata.raw["hy"] == pytest.approx(expected["hy"])
+        assert projection.metadata.raw["i0"] == pytest.approx(expected["i0"])
+
+
 # --------------------------------------------------------------------------- #
 # channel discovery: projection, not scan_data; fail closed (S2-R5/R6)
 # --------------------------------------------------------------------------- #
@@ -171,6 +261,100 @@ def test_channel_discovery_fails_closed_without_current_projection(
         display.frame_ids = (0,)                 # but no publication/record for 0
         display.update()
         assert display._norm_channel_discovery_keys() == []   # fail closed
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_channel_combo_tracks_new_selection_after_projection_pin(
+        qapp, monkeypatch, tmp_path):
+    """A selection change refreshes channels from the newly pinned frame.
+
+    ``idxs_1d`` still describes the preceding render until ``get_idxs()`` runs.
+    Channel discovery must therefore happen after the selection generation and
+    projection pin, while reusing that pin instead of performing a second lookup.
+    """
+    widget = _make_widget(monkeypatch, tmp_path)
+    win = None
+    try:
+        display = widget.displayframe
+        display.scan.name = "loaded"
+        display.publication_store.upsert(
+            publication_from_frame_view(_view(0, meta={"i0": 2.0})))
+        display.publication_store.upsert(
+            publication_from_frame_view(_view(1, meta={"seconds": 3.0})))
+
+        def channel_data():
+            combo = display.ui.normChannel
+            return [combo.itemData(row) for row in range(1, combo.count())]
+
+        display.frame_ids = (0,)
+        display.update()
+        assert channel_data() == ["i0"]
+        before = display._frame_projection_adapter.lookup_count
+
+        display.frame_ids = (1,)
+        display.update()
+
+        assert display.idxs_1d == [1]
+        assert channel_data() == ["seconds"]
+        assert display._frame_projection_adapter.lookup_count == before + 1
+
+        # The metadata popup consumes the same pinned projection rather than
+        # issuing another store lookup for this selection/generation.
+        win = _show_metawidget(qapp, widget.metawidget)
+        widget.metawidget.update()
+        assert display._frame_projection_adapter.lookup_count == before + 1
+    finally:
+        if win is not None:
+            win.close()
+        widget.close()
+        widget.deleteLater()
+
+
+def test_channel_choice_survives_transient_projection_gap_fail_closed(
+        qapp, monkeypatch, tmp_path):
+    """A live publication gap disables, but does not erase, normalization."""
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        display = widget.displayframe
+        display.scan.name = "loaded"
+        display.publication_store.upsert(
+            publication_from_frame_view(_view(0, meta={"i0": 2.0})))
+
+        display.frame_ids = (0,)
+        display.update()
+        display.ui.normChannel.setCurrentIndex(1)
+        assert display.ui.normChannel.currentData() == "i0"
+        assert display.get_normChannel() == "i0"
+
+        # Frame 1 is selected before its record is published.  The old choice is
+        # visible but cannot be used as current-frame authority.
+        display.frame_ids = (1,)
+        display.update()
+        assert display.ui.normChannel.currentData() == "i0"
+        assert not display.ui.normChannel.isEnabled()
+        assert display._norm_channel_signature == ()
+        assert display.get_normChannel() is None
+        np.testing.assert_allclose(
+            display.normalize(np.array([2.0, 4.0]), {"i0": 2.0}),
+            np.array([2.0, 4.0]),
+        )
+
+        # Once that same scan-qualified frame arrives, restore the preference
+        # without relying on a selection-generation change.
+        generation = display.display_generation
+        display.publication_store.upsert(
+            publication_from_frame_view(_view(1, meta={"i0": 4.0})))
+        display.update()
+        assert display.display_generation == generation
+        assert display.ui.normChannel.isEnabled()
+        assert display.ui.normChannel.currentData() == "i0"
+        assert display.get_normChannel() == "i0"
+        np.testing.assert_allclose(
+            display.normalize(np.array([2.0, 4.0]), {"i0": 2.0}),
+            np.array([1.0, 2.0]),
+        )
     finally:
         widget.close()
         widget.deleteLater()
