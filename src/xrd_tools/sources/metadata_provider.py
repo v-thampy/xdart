@@ -30,6 +30,8 @@ from typing import Any
 
 import numpy as np
 
+from xrd_tools.core.energy import WavelengthUnit
+
 __all__ = [
     "MetadataProvider",
     "BlueskyMetadataProvider",
@@ -91,6 +93,16 @@ class MetadataProvider:
     def wavelength(self) -> float | None:
         return None
 
+    def wavelength_unit(self) -> WavelengthUnit | None:
+        """The DECLARED unit of :meth:`wavelength`, or ``None`` when unknown.
+
+        X1 R3-P1: a wavelength value with no declared unit contributes no
+        evidence — consumers must never infer a unit from value magnitude.
+        Generic/direct construction stays unknown-unit unless the caller
+        declares one (the cursor composition point declares ANGSTROM because
+        the descriptor's ``_read_wavelength`` explicitly returns angstroms)."""
+        return None
+
     def mark_source_closed(self) -> None:
         """Notify the provider that its owning cursor's handle has closed.
 
@@ -106,11 +118,16 @@ class EmptyMetadataProvider(MetadataProvider):
     non-Bluesky stack still reports its wavelength without any table build.
     """
 
-    def __init__(self, *, wavelength: float | None = None) -> None:
+    def __init__(self, *, wavelength: float | None = None,
+                 wavelength_unit: WavelengthUnit | None = None) -> None:
         self._wavelength = wavelength
+        self._wavelength_unit = wavelength_unit
 
     def wavelength(self) -> float | None:
         return self._wavelength
+
+    def wavelength_unit(self) -> WavelengthUnit | None:
+        return self._wavelength_unit
 
 
 class BlueskyMetadataProvider(MetadataProvider):
@@ -125,10 +142,12 @@ class BlueskyMetadataProvider(MetadataProvider):
     """
 
     def __init__(self, entry_grp: Any, *, frame_count: int,
-                 wavelength: float | None = None) -> None:
+                 wavelength: float | None = None,
+                 wavelength_unit: WavelengthUnit | None = None) -> None:
         self._entry = entry_grp          # live h5py group; dropped after build
         self._frame_count = int(frame_count)
         self._wavelength = wavelength
+        self._wavelength_unit = wavelength_unit
         self._table: dict[str, np.ndarray] | None = None
         self._motors: dict[str, np.ndarray] | None = None
         self._constants: dict[str, float] | None = None
@@ -237,6 +256,9 @@ class BlueskyMetadataProvider(MetadataProvider):
     def wavelength(self) -> float | None:
         return self._wavelength
 
+    def wavelength_unit(self) -> WavelengthUnit | None:
+        return self._wavelength_unit
+
     def metadata_for(self, frame_index: int) -> Mapping[str, Any]:
         self._ensure_table()
         table = self._table or {}
@@ -265,6 +287,7 @@ def metadata_provider_for_open_entry(
     *,
     frame_count: int,
     wavelength: float | None = None,
+    wavelength_unit: WavelengthUnit | None = None,
     is_bluesky: bool | None = None,
 ) -> MetadataProvider:
     """Build the right provider for an OPEN entry group.
@@ -273,9 +296,12 @@ def metadata_provider_for_open_entry(
     other raw stack gets an :class:`EmptyMetadataProvider` (sidecar behavior
     preserved).  ``is_bluesky`` may be supplied (e.g. from the descriptor) to
     avoid re-detecting; otherwise it is probed once from the open group.
+    ``wavelength_unit`` is the caller's explicit unit declaration for
+    ``wavelength`` (R3-P1) — retained as value-only provider state.
     """
     if entry_grp is None:
-        return EmptyMetadataProvider(wavelength=wavelength)
+        return EmptyMetadataProvider(
+            wavelength=wavelength, wavelength_unit=wavelength_unit)
     if is_bluesky is None:
         try:
             from xrd_tools.io.bluesky_nexus import is_bluesky_nxwriter
@@ -284,5 +310,7 @@ def metadata_provider_for_open_entry(
             is_bluesky = False
     if is_bluesky:
         return BlueskyMetadataProvider(
-            entry_grp, frame_count=frame_count, wavelength=wavelength)
-    return EmptyMetadataProvider(wavelength=wavelength)
+            entry_grp, frame_count=frame_count, wavelength=wavelength,
+            wavelength_unit=wavelength_unit)
+    return EmptyMetadataProvider(
+        wavelength=wavelength, wavelength_unit=wavelength_unit)

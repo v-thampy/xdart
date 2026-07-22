@@ -36,6 +36,7 @@ from typing import Any
 
 import numpy as np
 
+from xrd_tools.core.energy import WavelengthUnit
 from xrd_tools.sources.descriptor import (
     ContainerDescriptor,
     describe_container_from_open,
@@ -247,9 +248,14 @@ class ContainerCursor:
         if self._provider is None:
             desc = self._descriptor
             assert desc is not None
+            # R3-P1: ``ContainerDescriptor.wavelength`` comes from the io-layer
+            # ``_read_wavelength``, which explicitly returns ANGSTROMS — declare
+            # that unit here so the value becomes canonicalizable evidence.
             self._provider = metadata_provider_for_open_entry(
                 self._entry_grp, frame_count=desc.frame_count,
-                wavelength=desc.wavelength, is_bluesky=desc.is_bluesky)
+                wavelength=desc.wavelength,
+                wavelength_unit=WavelengthUnit.ANGSTROM,
+                is_bluesky=desc.is_bluesky)
         return self._provider
 
     def metadata_for(self, frame_index: int) -> Any:

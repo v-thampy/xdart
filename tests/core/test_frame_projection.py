@@ -22,11 +22,15 @@ import numpy as np
 import pytest
 
 from xrd_tools.core import FrameRecord, FrameView
+from xrd_tools.core.energy import WavelengthUnit
 from xrd_tools.session import FrameRecordStore
 from xrd_tools.session.frame_projection import (
+    Capability,
+    CapabilityDisposition,
     CapabilityState,
     MetadataConflictError,
     MetadataRow,
+    WavelengthStatus,
     display_capabilities,
     metadata_row_from_provider,
     metadata_row_from_record,
@@ -71,7 +75,8 @@ class _Provider:
     """A MetadataProvider-shaped object (same surface as the real providers)."""
 
     def __init__(self, *, motors=None, table=None, constants=None,
-                 metadata=None, wavelength=None, frame_count=None):
+                 metadata=None, wavelength=None, wavelength_unit=None,
+                 frame_count=None):
         self._motors = motors or {}
         self._table = table or {}
         self._constants = constants or {}
@@ -79,6 +84,7 @@ class _Provider:
         # scanned motors excluded) — exactly what the real metadata_for returns
         self._metadata = metadata or {}
         self._wavelength = wavelength
+        self._wavelength_unit = wavelength_unit
         self._frame_count = frame_count
         self.metadata_for_calls = []
 
@@ -100,6 +106,9 @@ class _Provider:
 
     def wavelength(self):
         return self._wavelength
+
+    def wavelength_unit(self):
+        return self._wavelength_unit
 
 
 # ── 1. provider row composition + scanned-motor precedence ───────────────────
@@ -191,7 +200,9 @@ def test_contradictory_source_identity_raises_and_is_error_capability():
         metadata_row_from_record(record)
     caps = display_capabilities(record)
     assert caps.metadata.state is CapabilityState.ERROR
+    assert caps.metadata.disposition is CapabilityDisposition.ERROR
     assert caps.integrated_1d.state is CapabilityState.ERROR
+    assert caps.integrated_1d.disposition is CapabilityDisposition.ERROR
 
 
 def test_agreeing_metadata_across_modes_is_not_a_conflict():
@@ -214,26 +225,112 @@ def test_normalization_channels_and_guarded_value():
     assert normalization_value(row, None) is None
 
 
-# ── 7. wavelength present / absent / conflict, no I/O, no warning ─────────────
+# ── 7. wavelength evidence: canonical metres, explicit units only (R3-P1) ─────
 
 def test_wavelength_present_absent_conflict(caplog):
+    """Canonical contract: every source is canonicalized to METRES before
+    comparison; only explicitly unit-declared sources contribute."""
     import logging
     caplog.set_level(logging.WARNING)
-    prov = _Provider(wavelength=1.5406)
-    row = MetadataRow({"wavelength": 1.5406, "th": 2.0})
+    # provider declares 1.54 Å; metadata carries the explicit metre key —
+    # cross-unit agreement is real agreement after canonicalization.
+    prov = _Provider(wavelength=1.54, wavelength_unit=WavelengthUnit.ANGSTROM)
+    row = MetadataRow({"wavelength_m": 1.54e-10, "th": 2.0})
     present = wavelength_evidence(provider=prov, row=row)
-    assert present.status == "present" and present.value == pytest.approx(1.5406)
+    assert present.status is WavelengthStatus.PRESENT
+    assert present.value == pytest.approx(1.54e-10)          # canonical metres
+    assert present.sources["provider"] == pytest.approx(1.54e-10)
+    assert present.sources["wavelength_m"] == pytest.approx(1.54e-10)
 
     absent = wavelength_evidence(row=MetadataRow({"th": 2.0}))
-    assert absent.status == "absent" and absent.value is None
+    assert absent.status is WavelengthStatus.ABSENT and absent.value is None
 
+    # provider Å genuinely disagrees with the explicit metre key → conflict,
+    # with each source named and reported in canonical metres.
     conflict = wavelength_evidence(
-        provider=_Provider(wavelength=1.5406),
-        row=MetadataRow({"wavelength": 0.9744}))
-    assert conflict.status == "conflict" and conflict.value is None
-    assert set(conflict.sources) == {"provider", "metadata"}
+        provider=_Provider(
+            wavelength=1.5406, wavelength_unit=WavelengthUnit.ANGSTROM),
+        row=MetadataRow({"wavelength_m": 0.9744e-10}))
+    assert conflict.status is WavelengthStatus.CONFLICT and conflict.value is None
+    assert set(conflict.sources) == {"provider", "wavelength_m"}
     # a missing wavelength is not an operator warning here
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_wavelength_bare_key_and_unknown_aliases_are_structured_absence():
+    """Only ``wavelength_m`` / ``wavelength_A`` are accepted.  A bare
+    ``wavelength`` (no enforceable unit) and unknown aliases are ignored —
+    neither false presence nor false conflict."""
+    ignored = wavelength_evidence(
+        row=MetadataRow({"wavelength": 1.5406, "lambda_A": 1.54, "th": 2.0}))
+    assert ignored.status is WavelengthStatus.ABSENT
+    assert ignored.value is None and not dict(ignored.sources)
+
+    # ... and a bare key cannot manufacture a conflict against an explicit one.
+    no_conflict = wavelength_evidence(
+        row=MetadataRow({"wavelength": 77.0, "wavelength_A": 1.54}))
+    assert no_conflict.status is WavelengthStatus.PRESENT
+    assert no_conflict.value == pytest.approx(1.54e-10)
+
+
+def test_wavelength_undeclared_provider_unit_contributes_no_evidence():
+    """A provider value with no declared unit is NOT evidence (no magnitude
+    inference); a legacy provider without ``wavelength_unit()`` likewise."""
+    undeclared = _Provider(wavelength=1.5406)          # wavelength_unit=None
+    assert wavelength_evidence(provider=undeclared).status \
+        is WavelengthStatus.ABSENT
+
+    legacy = SimpleNamespace(wavelength=lambda: 1.5406)  # no wavelength_unit()
+    assert wavelength_evidence(provider=legacy).status \
+        is WavelengthStatus.ABSENT
+
+    # ... and an undeclared provider cannot manufacture a conflict against an
+    # explicit metadata key (the old cross-unit false-conflict shape).
+    ev = wavelength_evidence(
+        provider=undeclared, row=MetadataRow({"wavelength_m": 0.9744e-10}))
+    assert ev.status is WavelengthStatus.PRESENT
+    assert ev.value == pytest.approx(0.9744e-10)
+    assert set(ev.sources) == {"wavelength_m"}
+
+
+def test_wavelength_explicit_one_angstrom_is_valid_evidence():
+    """Explicit 1.0 Å is real physical evidence even though it canonicalizes to
+    the historical 1e-10 m constructor sentinel — sentinel rejection is
+    provenance-sensitive and never applies to an explicitly declared source."""
+    from_key = wavelength_evidence(row=MetadataRow({"wavelength_A": 1.0}))
+    assert from_key.status is WavelengthStatus.PRESENT
+    assert from_key.value == pytest.approx(1.0e-10)
+
+    from_provider = wavelength_evidence(provider=_Provider(
+        wavelength=1.0, wavelength_unit=WavelengthUnit.ANGSTROM))
+    assert from_provider.status is WavelengthStatus.PRESENT
+    assert from_provider.value == pytest.approx(1.0e-10)
+
+
+def test_wavelength_explicit_key_disagreement_is_conflict():
+    """Both explicit keys present and disagreeing (beyond rtol 1e-3 after
+    canonicalization) is a REAL typed conflict, reachable with provider=None."""
+    conflict = wavelength_evidence(
+        row=MetadataRow({"wavelength_m": 1.54e-10, "wavelength_A": 0.9744}))
+    assert conflict.status is WavelengthStatus.CONFLICT
+    assert conflict.value is None
+    assert set(conflict.sources) == {"wavelength_m", "wavelength_A"}
+    assert conflict.sources["wavelength_m"] == pytest.approx(1.54e-10)
+    assert conflict.sources["wavelength_A"] == pytest.approx(0.9744e-10)
+
+    # agreement within rtol 1e-3 (rounded header vs full precision) stays
+    # present — cross-unit, post-canonicalization.
+    agree = wavelength_evidence(
+        row=MetadataRow({"wavelength_m": 1.540598e-10, "wavelength_A": 1.5406}))
+    assert agree.status is WavelengthStatus.PRESENT
+    assert agree.value == pytest.approx(1.540598e-10, rel=1e-3)
+
+
+def test_wavelength_keys_match_case_insensitively():
+    ev = wavelength_evidence(
+        row=MetadataRow({"Wavelength_M": 1.54e-10, "WAVELENGTH_A": 1.54}))
+    assert ev.status is WavelengthStatus.PRESENT
+    assert set(ev.sources) == {"wavelength_m", "wavelength_A"}
 
 
 # ── 8. capability states: resident / thinned / source-fallback / none / error ─
@@ -242,8 +339,11 @@ def test_capabilities_resident_record():
     record = _record_1d(0, meta={"th": 1.0})
     caps = display_capabilities(record)
     assert caps.integrated_1d.state is CapabilityState.AVAILABLE
+    assert caps.integrated_1d.disposition is CapabilityDisposition.RESIDENT
     assert caps.metadata.state is CapabilityState.AVAILABLE
+    assert caps.metadata.disposition is CapabilityDisposition.RESIDENT
     assert caps.integrated_2d.state is CapabilityState.UNAVAILABLE   # no 2D mode
+    assert caps.integrated_2d.disposition is CapabilityDisposition.ABSENT
 
 
 def test_capabilities_thinned_is_pending():
@@ -253,6 +353,8 @@ def test_capabilities_thinned_is_pending():
     assert store.has_heavy_payload(5) is False
     caps = display_capabilities(thinned)
     assert caps.integrated_1d.state is CapabilityState.PENDING   # hydratable
+    # no store context here → best-effort, typed as such (R3-P2)
+    assert caps.integrated_1d.disposition is CapabilityDisposition.BEST_EFFORT
     assert caps.metadata.state is CapabilityState.AVAILABLE      # metadata survived
 
 
@@ -269,6 +371,8 @@ def test_persisted_mode_without_hydrator_is_not_falsely_pending():
     projected = project_frame(store, 6)
     assert projected.capabilities.integrated_1d.state \
         is CapabilityState.UNAVAILABLE
+    assert projected.capabilities.integrated_1d.disposition \
+        is CapabilityDisposition.PERSISTED_NO_HYDRATOR
     assert project_frame(store, 6, hydrate=True).capabilities.integrated_1d.state \
         is CapabilityState.UNAVAILABLE
 
@@ -285,9 +389,12 @@ def test_capabilities_source_fallback_eligible_and_unavailable():
     v = _v1d(0, meta={"th": 1.0}, source=("/data/master.h5", 0))
     caps = display_capabilities(FrameRecord.from_view(v))
     assert caps.raw.state is CapabilityState.PENDING            # source-fallback
+    assert caps.raw.disposition is CapabilityDisposition.SOURCE_FALLBACK
+    assert caps.thumbnail.disposition is CapabilityDisposition.SOURCE_FALLBACK
     # no source, no raw → unavailable
     caps2 = display_capabilities(_record_1d(0, meta={"th": 1.0}))
     assert caps2.raw.state is CapabilityState.UNAVAILABLE
+    assert caps2.raw.disposition is CapabilityDisposition.ABSENT
 
 
 def test_capabilities_empty_record_is_all_unavailable():
@@ -297,6 +404,9 @@ def test_capabilities_empty_record_is_all_unavailable():
     assert caps.integrated_2d.state is CapabilityState.UNAVAILABLE
     assert caps.raw.state is CapabilityState.UNAVAILABLE
     assert caps.metadata.state is CapabilityState.UNAVAILABLE
+    for fact in (caps.metadata, caps.integrated_1d, caps.integrated_2d,
+                 caps.raw, caps.thumbnail):
+        assert fact.disposition is CapabilityDisposition.ABSENT
 
 
 # ── 9. thinned lookup preserves metadata/capabilities without heavy arrays ────
@@ -343,9 +453,12 @@ def test_dropped_mode_is_unavailable_not_falsely_pending():
 
     proj = project_frame(store, 8)
     assert proj.capabilities.integrated_2d.state is CapabilityState.UNAVAILABLE
+    assert proj.capabilities.integrated_2d.disposition \
+        is CapabilityDisposition.DROPPED
     # the pure record-level projection (no store context) is best-effort PENDING
-    assert display_capabilities(store.get(8)).integrated_2d.state \
-        is CapabilityState.PENDING
+    best_effort = display_capabilities(store.get(8)).integrated_2d
+    assert best_effort.state is CapabilityState.PENDING
+    assert best_effort.disposition is CapabilityDisposition.BEST_EFFORT
 
 
 def test_project_frame_absent_record():
@@ -354,7 +467,10 @@ def test_project_frame_absent_record():
     assert proj.present is False
     assert not proj.metadata
     assert proj.capabilities.integrated_1d.state is CapabilityState.UNAVAILABLE
+    assert proj.capabilities.integrated_1d.disposition \
+        is CapabilityDisposition.ABSENT
     assert proj.wavelength.status == "absent"
+    assert proj.wavelength.status is WavelengthStatus.ABSENT
 
 
 def test_project_frame_merges_owner_scoped_provider_row():
@@ -667,6 +783,9 @@ def test_persisted_but_no_hydrator_is_distinct_from_dropped():
 
     cap = project_frame(store, 9).capabilities.integrated_1d
     assert cap.state is CapabilityState.UNAVAILABLE
+    # R3-P2: the TYPED disposition is the policy key; the prose reason is
+    # asserted only as a diagnostic.
+    assert cap.disposition is CapabilityDisposition.PERSISTED_NO_HYDRATOR
     assert "no hydrator" in cap.reason.lower()               # distinct reason
     assert "dropped" not in cap.reason.lower()               # NOT mislabeled dropped
 
@@ -682,4 +801,48 @@ def test_persisted_but_no_hydrator_is_distinct_from_dropped():
     dstore.mark_dropped(10, modes=("2d", "default"))
     dcap = project_frame(dstore, 10).capabilities.integrated_2d
     assert dcap.state is CapabilityState.UNAVAILABLE
+    assert dcap.disposition is CapabilityDisposition.DROPPED
     assert "dropped" in dcap.reason.lower()
+
+
+# ── R3-P2: typed disposition contract (exact members, fixed state mapping) ────
+
+def test_capability_disposition_members_and_state_mapping():
+    """The eight exact members and the FIXED disposition→state mapping from the
+    Slice-3 contract.  Downstream policy is keyed by ``disposition``; ``state``
+    is the validated presentation category."""
+    expected = {
+        CapabilityDisposition.RESIDENT: CapabilityState.AVAILABLE,
+        CapabilityDisposition.HYDRATABLE: CapabilityState.PENDING,
+        CapabilityDisposition.SOURCE_FALLBACK: CapabilityState.PENDING,
+        CapabilityDisposition.BEST_EFFORT: CapabilityState.PENDING,
+        CapabilityDisposition.PERSISTED_NO_HYDRATOR: CapabilityState.UNAVAILABLE,
+        CapabilityDisposition.DROPPED: CapabilityState.UNAVAILABLE,
+        CapabilityDisposition.ABSENT: CapabilityState.UNAVAILABLE,
+        CapabilityDisposition.ERROR: CapabilityState.ERROR,
+    }
+    assert set(expected) == set(CapabilityDisposition)       # exactly eight
+    for disposition, state in expected.items():
+        cap = Capability(state, "any diagnostic prose", disposition=disposition)
+        assert cap.state is state and cap.disposition is disposition
+
+
+def test_capability_rejects_inconsistent_or_missing_disposition():
+    with pytest.raises(ValueError):
+        Capability(CapabilityState.AVAILABLE, "x",
+                   disposition=CapabilityDisposition.DROPPED)
+    with pytest.raises(ValueError):
+        Capability(CapabilityState.ERROR, "x",
+                   disposition=CapabilityDisposition.RESIDENT)
+    with pytest.raises(TypeError):
+        Capability(CapabilityState.AVAILABLE, "x")           # disposition required
+
+
+def test_capability_reason_is_diagnostic_only_not_identity():
+    """Rewording the reason changes neither the typed pair nor policy-relevant
+    equality inputs (R3-P2: prose can never drive behavior)."""
+    a = Capability(CapabilityState.UNAVAILABLE, "thinned and not persisted",
+                   disposition=CapabilityDisposition.DROPPED)
+    b = Capability(CapabilityState.UNAVAILABLE, "completely different words",
+                   disposition=CapabilityDisposition.DROPPED)
+    assert (a.state, a.disposition) == (b.state, b.disposition)

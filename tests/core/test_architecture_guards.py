@@ -115,18 +115,26 @@ def test_core_capability_imports():
     from xrd_tools.core.frame_view import FrameView, assert_frameview_equivalent  # noqa: F401
 
 
-def test_wavelength_sentinel_stays_in_xdart():
-    """Policy (greenfield D7): the 1.0 Å default-wavelength sentinel is an
-    xdart-internal acquisition artifact.  The ONLY crossing point into the
-    headless world is xdart's adapter calling the explicit
-    ``allow_default_sentinel`` helpers — xrd_tools itself must never
-    reference the sentinel API (None is the only missing-value sentinel
-    at headless API boundaries)."""
+def test_wavelength_sentinel_has_one_headless_owner():
+    """Policy (revised, X1 Slice 3a0 / R3-P1 — supersedes the greenfield-D7
+    "sentinel stays in xdart" pin): the 1.0 Å default-wavelength sentinel is a
+    legacy acquisition artifact whose handling now lives in EXACTLY ONE
+    headless module, ``xrd_tools.core.energy`` (so the projection and the GUI
+    share a single definition; ``xdart.modules.wavelength`` is a re-export
+    shim).  No OTHER xrd_tools module may reference the sentinel API — the
+    crossing points remain the explicit ``allow_default_sentinel`` helpers,
+    and None stays the only missing-value sentinel at headless API
+    boundaries."""
+    owner = PACKAGE / "core" / "energy.py"
     offenders = []
     for path in PACKAGE.rglob("*.py"):
+        if path == owner:
+            continue
         text = path.read_text(encoding="utf-8", errors="replace")
         for needle in ("allow_default_sentinel",
                        "DEFAULT_WAVELENGTH_SENTINEL"):
             if needle in text:
                 offenders.append(f"{path.relative_to(ROOT)}: {needle}")
     assert offenders == []
+    owner_text = owner.read_text(encoding="utf-8", errors="replace")
+    assert "DEFAULT_WAVELENGTH_SENTINEL_M" in owner_text   # the one owner

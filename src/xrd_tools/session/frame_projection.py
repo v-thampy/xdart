@@ -48,13 +48,16 @@ from typing import Any
 import numpy as np
 
 from xrd_tools.core import FrameRecord, FrameView
+from xrd_tools.core.energy import WavelengthUnit, canonical_wavelength_m
 from xrd_tools.core.metadata import numeric_metadata, resolve_monitor_norm
 
 __all__ = [
     "MetadataRow",
     "CapabilityState",
+    "CapabilityDisposition",
     "Capability",
     "DisplayCapabilities",
+    "WavelengthStatus",
     "WavelengthEvidence",
     "FrameProjection",
     "MetadataConflictError",
@@ -116,12 +119,6 @@ def _safe_len(value: Any) -> int | None:
         return None
 
 
-def _finite_positive(value: Any) -> float | None:
-    try:
-        num = float(value)
-    except (TypeError, ValueError):
-        return None
-    return num if np.isfinite(num) and num > 0.0 else None
 
 
 def _values_conflict(a: Any, b: Any) -> bool:
@@ -378,7 +375,9 @@ def normalization_value(row: MetadataRow, channel: str | None) -> float | None:
 
 # ── C — wavelength + capability projection ───────────────────────────────────
 
-class _WavelengthStatus(str, Enum):
+class WavelengthStatus(str, Enum):
+    """Public typed status of :class:`WavelengthEvidence` (X1 Slice 3a0)."""
+
     PRESENT = "present"
     ABSENT = "absent"
     CONFLICT = "conflict"
@@ -388,29 +387,41 @@ class _WavelengthStatus(str, Enum):
 class WavelengthEvidence:
     """Value-only wavelength evidence available WITHOUT opening a file.
 
-    ``value`` is the agreed wavelength when at least one source reports a finite
-    positive value and all reporting sources agree; ``status`` is
-    ``present`` / ``absent`` / ``conflict``; ``sources`` maps each contributing
-    source label to its value.  A missing wavelength is ``absent`` — it is not a
-    warning here (final processing readiness owns the operator-facing error after
-    the selected PONI/Experiment authority is considered).  Unit reconciliation
-    is the caller's responsibility; this reports values as provided.
+    CANONICAL METRES BY CONSTRUCTION (R3-P1): every contributing source is
+    canonicalized to metres before comparison, so ``value`` and every entry in
+    ``sources`` are metres.  ``status`` is a :class:`WavelengthStatus`
+    (``present`` / ``absent`` / ``conflict``); ``sources`` maps each
+    contributing source label (``"provider"``, ``"wavelength_m"``,
+    ``"wavelength_A"``) to its canonical-metre value.  A missing wavelength is
+    ``absent`` — it is not a warning here (final processing readiness owns the
+    operator-facing error after the selected PONI/Experiment authority is
+    considered).
     """
 
     value: float | None
-    status: str
+    status: WavelengthStatus
     sources: Mapping[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "status", WavelengthStatus(self.status))
         object.__setattr__(self, "sources", MappingProxyType(dict(self.sources)))
 
     @property
     def present(self) -> bool:
-        return self.status == _WavelengthStatus.PRESENT.value
+        return self.status is WavelengthStatus.PRESENT
 
     @property
     def conflict(self) -> bool:
-        return self.status == _WavelengthStatus.CONFLICT.value
+        return self.status is WavelengthStatus.CONFLICT
+
+
+#: The ONLY accepted explicit-unit metadata keys (case-insensitive match →
+#: canonical label).  Bare ``wavelength`` and unknown aliases carry no
+#: enforceable unit and are ignored as structured absence — never guessed.
+_WAVELENGTH_METADATA_KEYS: dict[str, tuple[str, WavelengthUnit]] = {
+    "wavelength_m": ("wavelength_m", WavelengthUnit.METRE),
+    "wavelength_a": ("wavelength_A", WavelengthUnit.ANGSTROM),
+}
 
 
 def wavelength_evidence(
@@ -421,37 +432,55 @@ def wavelength_evidence(
 ) -> WavelengthEvidence:
     """Collect wavelength evidence from a view/provider/row without I/O.
 
-    Sources: the provider's ``wavelength()``, and a finite-positive numeric
-    ``wavelength`` key in the frame metadata (from ``row`` or ``view``).  No PONI
-    (meters, H20-owned) source is consulted here.  Agreement (within a tight
-    tolerance) → ``present``; disagreement → ``conflict``; none → ``absent``.
+    Sources (each canonicalized to METRES before comparison, R3-P1):
+
+    * the provider's ``wavelength()`` — only when the provider DECLARES its
+      unit via ``wavelength_unit()``; an undeclared value contributes no
+      evidence (no magnitude inference);
+    * the explicit unit-bearing metadata keys ``wavelength_m`` (metres) and
+      ``wavelength_A`` (angstroms), matched case-insensitively; BOTH are
+      collected when both are present so a disagreement is a real conflict.
+
+    No PONI (H20-owned) source is consulted here.  Post-canonicalization
+    agreement (rtol 1e-3) → ``present``; disagreement → ``conflict``; no
+    evidence → ``absent``.  Explicit declarations are trusted physical
+    evidence: sentinel rejection never applies to them, so an explicit
+    ``wavelength_A = 1.0`` remains valid.
     """
     sources: dict[str, float] = {}
     if provider is not None:
-        pw = _finite_positive(_provider_call(provider, "wavelength"))
+        unit_fn = getattr(provider, "wavelength_unit", None)
+        declared = unit_fn() if callable(unit_fn) else None
+        try:
+            unit = WavelengthUnit(declared) if declared is not None else None
+        except ValueError:
+            unit = None                      # unknown declaration ≡ undeclared
+        pw = canonical_wavelength_m(_provider_call(provider, "wavelength"), unit)
         if pw is not None:
             sources["provider"] = pw
     meta = row if row is not None else (
         metadata_row_from_view(view) if view is not None else None)
     if meta is not None:
         for key, value in meta.numeric.items():
-            if str(key).lower() == "wavelength":
-                mw = _finite_positive(value)
-                if mw is not None:
-                    sources["metadata"] = mw
-                break
+            spec = _WAVELENGTH_METADATA_KEYS.get(str(key).lower())
+            if spec is None:
+                continue
+            label, unit = spec
+            mw = canonical_wavelength_m(value, unit)
+            if mw is not None:
+                sources.setdefault(label, mw)
 
     values = list(sources.values())
     if not values:
-        return WavelengthEvidence(None, _WavelengthStatus.ABSENT.value, sources)
+        return WavelengthEvidence(None, WavelengthStatus.ABSENT, sources)
     # Agreement tolerance is generous (1e-3 relative) so a rounded header value
-    # (e.g. 1.5406) agrees with a full-precision one (1.540598); genuinely
-    # different values still surface as a conflict.  Cross-UNIT sources are the
-    # caller's responsibility (documented) — X1 does not own unit/PONI ownership.
+    # (e.g. 1.5406 Å) agrees with a full-precision one (1.540598 Å); genuinely
+    # different values still surface as a conflict.  All values are canonical
+    # metres here, so cross-unit agreement is real agreement.
     if all(np.isclose(values[0], v, rtol=1e-3, atol=0.0) for v in values):
         return WavelengthEvidence(
-            values[0], _WavelengthStatus.PRESENT.value, sources)
-    return WavelengthEvidence(None, _WavelengthStatus.CONFLICT.value, sources)
+            values[0], WavelengthStatus.PRESENT, sources)
+    return WavelengthEvidence(None, WavelengthStatus.CONFLICT, sources)
 
 
 class CapabilityState(str, Enum):
@@ -463,12 +492,63 @@ class CapabilityState(str, Enum):
     ERROR = "error"               # a typed error (e.g. conflicting identity)
 
 
+class CapabilityDisposition(str, Enum):
+    """WHY a capability fact is in its state (X1 Slice 3a0, R3-P2).
+
+    The typed policy key: downstream decisions (hydration eligibility, panel
+    behavior) branch on this member, NEVER on the prose ``reason``.  Exactly
+    eight members with a FIXED state mapping (validated in
+    ``Capability.__post_init__``).
+    """
+
+    RESIDENT = "resident"                          # → AVAILABLE
+    HYDRATABLE = "hydratable"                      # → PENDING
+    SOURCE_FALLBACK = "source_fallback"            # → PENDING
+    BEST_EFFORT = "best_effort"                    # → PENDING (no store context)
+    PERSISTED_NO_HYDRATOR = "persisted_no_hydrator"  # → UNAVAILABLE
+    DROPPED = "dropped"                            # → UNAVAILABLE
+    ABSENT = "absent"                              # → UNAVAILABLE
+    ERROR = "error"                                # → ERROR
+
+
+#: The FIXED disposition → state mapping (Slice-3 Design 0).  ``state`` is the
+#: validated presentation category; implementations may not substitute prose
+#: parsing or an optional mapping.
+_DISPOSITION_TO_STATE: dict[CapabilityDisposition, CapabilityState] = {
+    CapabilityDisposition.RESIDENT: CapabilityState.AVAILABLE,
+    CapabilityDisposition.HYDRATABLE: CapabilityState.PENDING,
+    CapabilityDisposition.SOURCE_FALLBACK: CapabilityState.PENDING,
+    CapabilityDisposition.BEST_EFFORT: CapabilityState.PENDING,
+    CapabilityDisposition.PERSISTED_NO_HYDRATOR: CapabilityState.UNAVAILABLE,
+    CapabilityDisposition.DROPPED: CapabilityState.UNAVAILABLE,
+    CapabilityDisposition.ABSENT: CapabilityState.UNAVAILABLE,
+    CapabilityDisposition.ERROR: CapabilityState.ERROR,
+}
+
+
 @dataclass(frozen=True, slots=True)
 class Capability:
-    """One capability fact: a :class:`CapabilityState` plus a reason."""
+    """One capability fact: state + diagnostic reason + typed disposition.
+
+    ``disposition`` is REQUIRED (keyword) and must be consistent with ``state``
+    per the fixed mapping; ``reason`` is diagnostic prose only and never drives
+    policy (R3-P2)."""
 
     state: CapabilityState
     reason: str = ""
+    disposition: CapabilityDisposition | None = None
+
+    def __post_init__(self) -> None:
+        if self.disposition is None:
+            raise TypeError(
+                "Capability requires a typed disposition (R3-P2); the prose "
+                "reason is diagnostic only")
+        expected = _DISPOSITION_TO_STATE[self.disposition]
+        if self.state is not expected:
+            raise ValueError(
+                f"inconsistent Capability pair: state={self.state!r} does not "
+                f"match disposition={self.disposition!r} (fixed mapping expects "
+                f"{expected!r})")
 
 
 @dataclass(frozen=True, slots=True)
@@ -527,34 +607,42 @@ def _integrated_capability(
 ) -> Capability:
     views = record.results_1d if dim == "1d" else record.results_2d
     if not views:
-        return Capability(CapabilityState.UNAVAILABLE, f"no {dim} result mode")
+        return Capability(CapabilityState.UNAVAILABLE, f"no {dim} result mode",
+                          disposition=CapabilityDisposition.ABSENT)
     resolved_mode = mode if mode is not None else (
         record.active_mode_1d if dim == "1d" else record.active_mode_2d)
     view = record.view_1d(mode) if dim == "1d" else record.view_2d(mode)
     if view is None:
         return Capability(
-            CapabilityState.UNAVAILABLE, f"{dim} mode {mode!r} not present")
+            CapabilityState.UNAVAILABLE, f"{dim} mode {mode!r} not present",
+            disposition=CapabilityDisposition.ABSENT)
     resident = (view.intensity_1d if dim == "1d" else view.intensity_2d) is not None
     if resident:
-        return Capability(CapabilityState.AVAILABLE, "resident")
+        return Capability(CapabilityState.AVAILABLE, "resident",
+                          disposition=CapabilityDisposition.RESIDENT)
     # Thinned.  Three distinct facts (IFR-3): currently hydratable through the
     # store (persisted AND a hydrator is registered) → PENDING; persisted on
     # disk but not currently recoverable (no hydrator) → UNAVAILABLE with a
     # distinct reason; neither → consciously dropped / never written →
     # UNAVAILABLE.  Without store context (both sets None) recoverability is
-    # unknown → best-effort PENDING.
+    # unknown → best-effort PENDING.  Each branch carries its TYPED disposition
+    # (R3-P2) — the prose reasons below are diagnostics only.
     key = (dim, resolved_mode)
     if hydratable_modes is not None and key in hydratable_modes:
-        return Capability(CapabilityState.PENDING, "thinned; hydratable from store")
+        return Capability(CapabilityState.PENDING, "thinned; hydratable from store",
+                          disposition=CapabilityDisposition.HYDRATABLE)
     if persisted_modes is not None and key in persisted_modes:
         return Capability(
             CapabilityState.UNAVAILABLE,
-            "thinned; persisted but no hydrator registered")
+            "thinned; persisted but no hydrator registered",
+            disposition=CapabilityDisposition.PERSISTED_NO_HYDRATOR)
     if hydratable_modes is None and persisted_modes is None:
         return Capability(
-            CapabilityState.PENDING, "thinned; hydratable if persisted")
+            CapabilityState.PENDING, "thinned; hydratable if persisted",
+            disposition=CapabilityDisposition.BEST_EFFORT)
     return Capability(
-        CapabilityState.UNAVAILABLE, "thinned and not persisted (dropped)")
+        CapabilityState.UNAVAILABLE, "thinned and not persisted (dropped)",
+        disposition=CapabilityDisposition.DROPPED)
 
 
 def display_capabilities(
@@ -585,13 +673,15 @@ def display_capabilities(
     try:
         identity = _record_source_identity(record)
     except MetadataConflictError as exc:
-        err = Capability(CapabilityState.ERROR, str(exc))
+        err = Capability(CapabilityState.ERROR, str(exc),
+                         disposition=CapabilityDisposition.ERROR)
         return DisplayCapabilities("<conflict>", err, err, err, err, err)
     if source_identity and identity and _identities_conflict(source_identity, identity):
         err = Capability(
             CapabilityState.ERROR,
             "store/source identity disagrees with the selected record: "
             f"{source_identity!r} != {identity!r}",
+            disposition=CapabilityDisposition.ERROR,
         )
         return DisplayCapabilities("<conflict>", err, err, err, err, err)
     identity = _reconcile_identity(source_identity or "", identity)
@@ -601,10 +691,13 @@ def display_capabilities(
     try:
         row = metadata_row_from_record(record, mode_1d=mode_1d, mode_2d=mode_2d)
     except MetadataConflictError as exc:
-        err = Capability(CapabilityState.ERROR, str(exc))
+        err = Capability(CapabilityState.ERROR, str(exc),
+                         disposition=CapabilityDisposition.ERROR)
         return DisplayCapabilities(identity or "<conflict>", err, err, err, err, err)
-    metadata = (Capability(CapabilityState.AVAILABLE, "resident") if row
-                else Capability(CapabilityState.UNAVAILABLE, "no metadata"))
+    metadata = (Capability(CapabilityState.AVAILABLE, "resident",
+                           disposition=CapabilityDisposition.RESIDENT) if row
+                else Capability(CapabilityState.UNAVAILABLE, "no metadata",
+                                disposition=CapabilityDisposition.ABSENT))
 
     integrated_1d = _integrated_capability(
         record, "1d", mode_1d, hydratable_modes, persisted_modes)
@@ -614,21 +707,27 @@ def display_capabilities(
     raw_resident = any(v.raw is not None for v in views)
     source_eligible = any(v.source_path is not None for v in views)
     if raw_resident:
-        raw = Capability(CapabilityState.AVAILABLE, "resident raw pixels")
+        raw = Capability(CapabilityState.AVAILABLE, "resident raw pixels",
+                         disposition=CapabilityDisposition.RESIDENT)
     elif source_eligible:
         raw = Capability(
-            CapabilityState.PENDING, "source-fallback eligible (not store-hydratable)")
+            CapabilityState.PENDING, "source-fallback eligible (not store-hydratable)",
+            disposition=CapabilityDisposition.SOURCE_FALLBACK)
     else:
-        raw = Capability(CapabilityState.UNAVAILABLE, "no raw pixels, no source")
+        raw = Capability(CapabilityState.UNAVAILABLE, "no raw pixels, no source",
+                         disposition=CapabilityDisposition.ABSENT)
 
     thumb_resident = any(v.thumbnail is not None for v in views)
     if thumb_resident:
-        thumbnail = Capability(CapabilityState.AVAILABLE, "resident thumbnail")
+        thumbnail = Capability(CapabilityState.AVAILABLE, "resident thumbnail",
+                               disposition=CapabilityDisposition.RESIDENT)
     elif source_eligible:
         thumbnail = Capability(
-            CapabilityState.PENDING, "source-fallback eligible")
+            CapabilityState.PENDING, "source-fallback eligible",
+            disposition=CapabilityDisposition.SOURCE_FALLBACK)
     else:
-        thumbnail = Capability(CapabilityState.UNAVAILABLE, "no thumbnail evidence")
+        thumbnail = Capability(CapabilityState.UNAVAILABLE, "no thumbnail evidence",
+                               disposition=CapabilityDisposition.ABSENT)
 
     return DisplayCapabilities(
         identity, metadata, integrated_1d, integrated_2d, raw, thumbnail)
@@ -670,12 +769,13 @@ def project_frame(
     """
     record = store.get_or_hydrate(label) if hydrate else store.get(label)
     if record is None:
-        absent = Capability(CapabilityState.UNAVAILABLE, "record not present")
+        absent = Capability(CapabilityState.UNAVAILABLE, "record not present",
+                            disposition=CapabilityDisposition.ABSENT)
         return FrameProjection(
             label=label, present=False, metadata=_EMPTY_ROW,
             capabilities=DisplayCapabilities(
                 "", absent, absent, absent, absent, absent),
-            wavelength=WavelengthEvidence(None, _WavelengthStatus.ABSENT.value),
+            wavelength=WavelengthEvidence(None, WavelengthStatus.ABSENT),
             normalization_channels=())
 
     identity = ""
@@ -733,13 +833,15 @@ def project_frame(
     if row_error is not None and caps.metadata.state is not CapabilityState.ERROR:
         caps = replace(
             caps,
-            metadata=Capability(CapabilityState.ERROR, str(row_error)),
+            metadata=Capability(CapabilityState.ERROR, str(row_error),
+                                disposition=CapabilityDisposition.ERROR),
         )
     elif row and caps.metadata.state is CapabilityState.UNAVAILABLE:
         caps = replace(
             caps,
             metadata=Capability(
-                CapabilityState.AVAILABLE, "owner-scoped provider metadata"),
+                CapabilityState.AVAILABLE, "owner-scoped provider metadata",
+                disposition=CapabilityDisposition.RESIDENT),
         )
     view = _selected_record_view(record, mode_1d, mode_2d)
     wavelength = wavelength_evidence(view=view, provider=provider, row=row)

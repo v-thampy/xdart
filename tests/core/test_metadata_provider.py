@@ -13,10 +13,13 @@ import h5py
 import numpy as np
 import pytest
 
+from xrd_tools.core.energy import WavelengthUnit
 from xrd_tools.sources.cursor import ContainerCursor
 from xrd_tools.sources.metadata_provider import (
     BlueskyMetadataProvider,
     EmptyMetadataProvider,
+    MetadataProvider,
+    metadata_provider_for_open_entry,
 )
 
 NF = 5
@@ -165,6 +168,55 @@ def test_wavelength_available_without_table_build(tmp_path):
         # wavelength does not require the per-frame table
         _ = provider.wavelength()
         assert provider._table is None  # noqa: SLF001
+
+
+# --------------------------------------------------------------------------- #
+# X1 Slice 3a0 (R3-P1): explicit provider wavelength-unit declaration
+# --------------------------------------------------------------------------- #
+def test_cursor_provider_declares_angstrom_unit(tmp_path):
+    """The descriptor's `_read_wavelength` explicitly returns angstroms, so the
+    cursor composition point declares ANGSTROM — no magnitude inference."""
+    p, *_ = _bluesky(tmp_path / "wl_unit.nxs")
+    with ContainerCursor(p) as cur:
+        provider = cur.metadata_provider()
+        assert provider.wavelength_unit() is WavelengthUnit.ANGSTROM
+        # value semantics unchanged: still the as-provided angstrom value
+        assert provider.wavelength() == cur.wavelength
+
+    plain = _plain(tmp_path / "plain_unit.nxs")
+    with ContainerCursor(plain) as cur:
+        # plain stacks get the empty provider, still angstrom-declared
+        assert cur.metadata_provider().wavelength_unit() \
+            is WavelengthUnit.ANGSTROM
+
+
+def test_direct_provider_construction_is_unknown_unit_by_default():
+    """Direct generic construction remains unknown-unit unless the caller
+    declares one; a value with no declared unit contributes no evidence."""
+    assert MetadataProvider().wavelength_unit() is None
+    assert EmptyMetadataProvider(wavelength=1.54).wavelength_unit() is None
+    assert BlueskyMetadataProvider(
+        None, frame_count=3, wavelength=1.54).wavelength_unit() is None
+
+    declared = EmptyMetadataProvider(
+        wavelength=1.54, wavelength_unit=WavelengthUnit.ANGSTROM)
+    assert declared.wavelength_unit() is WavelengthUnit.ANGSTROM
+    assert declared.wavelength() == pytest.approx(1.54)
+
+
+def test_provider_factory_threads_wavelength_unit(tmp_path):
+    p, *_ = _bluesky(tmp_path / "factory_unit.nxs")
+    with h5py.File(p, "r") as f:
+        provider = metadata_provider_for_open_entry(
+            f["entry"], frame_count=NF, wavelength=1.033,
+            wavelength_unit=WavelengthUnit.ANGSTROM)
+        assert isinstance(provider, BlueskyMetadataProvider)
+        assert provider.wavelength_unit() is WavelengthUnit.ANGSTROM
+    none_provider = metadata_provider_for_open_entry(
+        None, frame_count=0, wavelength=None,
+        wavelength_unit=WavelengthUnit.METRE)
+    assert isinstance(none_provider, EmptyMetadataProvider)
+    assert none_provider.wavelength_unit() is WavelengthUnit.METRE
 
 
 # --------------------------------------------------------------------------- #

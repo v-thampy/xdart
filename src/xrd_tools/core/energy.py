@@ -13,6 +13,7 @@ The conversion was previously duplicated (``12398/λ`` in the RSM pipeline vs
 from __future__ import annotations
 
 import logging
+from enum import Enum
 
 import numpy as np
 
@@ -25,7 +26,111 @@ __all__ = [
     "energy_eV_to_wavelength_m",
     "wavelength_m_to_energy_eV",
     "check_energy_consistency",
+    # X1 Slice 3a0 (R3-P1): the one headless wavelength vocabulary.
+    "WavelengthUnit",
+    "canonical_wavelength_m",
+    "DEFAULT_WAVELENGTH_SENTINEL_M",
+    "is_default_wavelength_sentinel_m",
+    "normalize_wavelength_m",
+    "wavelength_m_to_angstrom",
+    "wavelength_angstrom_to_m",
 ]
+
+
+class WavelengthUnit(str, Enum):
+    """Explicit wavelength unit declaration (X1 R3-P1).
+
+    A wavelength value is evidence only when its unit is DECLARED by its
+    source — the NeXus container descriptor reports angstroms, PONI/run values
+    are metres, and an unqualified number has no enforceable unit.  Consumers
+    must never infer a unit from value magnitude.
+    """
+
+    METRE = "m"
+    ANGSTROM = "angstrom"
+
+
+def canonical_wavelength_m(value, unit: "WavelengthUnit | None") -> float | None:
+    """Canonicalize an explicitly unit-declared wavelength to metres.
+
+    ``None`` when the unit is undeclared (no evidence — never magnitude
+    inference), or the value is non-numeric / non-finite / non-positive.
+    Sentinel rejection is provenance-sensitive and does NOT apply here: an
+    explicitly declared ``1.0 angstrom`` (or ``1e-10 m``) source is valid
+    physical evidence even though it equals the historical untrusted
+    constructor placeholder (see :func:`normalize_wavelength_m`).
+    """
+    if unit is None:
+        return None
+    try:
+        wl = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(wl) or wl <= 0.0:
+        return None
+    if unit is WavelengthUnit.ANGSTROM:
+        return wl * 1e-10
+    return wl
+
+
+# ── historical default-sentinel handling (moved from xdart.modules.wavelength;
+#    that module is now a compatibility re-export shim) ────────────────────────
+#
+# ``LiveScan.mg_args`` historically defaults to ``{"wavelength": 1e-10}``,
+# which is 1.0 Angstrom in pyFAI's metre convention.  That value is only a
+# constructor sentinel, not a measured calibration wavelength, so display and
+# headless adapters must treat it as unknown unless a real integrator or
+# persisted NeXus wavelength supplies a value.
+
+DEFAULT_WAVELENGTH_SENTINEL_M = 1.0e-10
+_SENTINEL_ATOL_M = 1.0e-14
+
+
+def is_default_wavelength_sentinel_m(value) -> bool:
+    """Whether *value* is the historical ``1e-10`` metre placeholder."""
+    try:
+        wl = float(value)
+    except (TypeError, ValueError):
+        return False
+    return abs(wl - DEFAULT_WAVELENGTH_SENTINEL_M) <= _SENTINEL_ATOL_M
+
+
+def normalize_wavelength_m(value, *, allow_default_sentinel: bool = False) -> float | None:
+    """Return a real positive wavelength in metres, or ``None``.
+
+    Rejects non-numeric, non-positive, and (by default) the historical
+    placeholder value.  Pass ``allow_default_sentinel=True`` only for an
+    authoritative source such as a persisted NeXus ``wavelength_A`` field, where
+    1.0 Angstrom can be a real beam wavelength rather than a constructor
+    default.
+    """
+    try:
+        wl = float(value)
+    except (TypeError, ValueError):
+        return None
+    if wl <= 0:
+        return None
+    if not allow_default_sentinel and is_default_wavelength_sentinel_m(wl):
+        return None
+    return wl
+
+
+def wavelength_m_to_angstrom(value, *, allow_default_sentinel: bool = False) -> float | None:
+    wl = normalize_wavelength_m(
+        value,
+        allow_default_sentinel=allow_default_sentinel,
+    )
+    return None if wl is None else wl * 1e10
+
+
+def wavelength_angstrom_to_m(value) -> float | None:
+    try:
+        wl_a = float(value)
+    except (TypeError, ValueError):
+        return None
+    if wl_a <= 0:
+        return None
+    return wl_a * 1e-10
 
 
 def energy_eV_to_wavelength_m(energy_eV: float) -> float:
