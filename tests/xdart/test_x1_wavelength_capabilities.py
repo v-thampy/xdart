@@ -513,3 +513,604 @@ def test_gi_shaped_record_evidence_status_consistent():
     assert projection.wavelength.status is WavelengthStatus.PRESENT
     assert projection.wavelength.value == pytest.approx(1.033e-10)
 
+
+
+# =========================================================================== #
+# Slice 3b — per-panel capability adoption + request-boundary eligibility
+# =========================================================================== #
+
+from xrd_tools.core import FrameRecord, IntegrationResult2D  # noqa: E402
+from xrd_tools.session import Capability, CapabilityDisposition, CapabilityState  # noqa: E402
+from xdart.gui.tabs.static_scan.display_logic import (  # noqa: E402
+    DataTier,
+    Mode,
+    PanelRole,
+)
+from xdart.gui.tabs.static_scan.display_controllers import (  # noqa: E402
+    resolve_frame_data_for_widget,
+)
+from xdart.gui.tabs.static_scan.frame_projection_adapter import (  # noqa: E402
+    STORE_SCAN_KEY_ATTR,
+)
+
+
+def _record(label, *, meta=None, source="/data/loaded.nxs"):
+    return FrameRecord.from_view(_view(label, meta=meta, source=source))
+
+
+def _r2d(unit="q_A^-1", az_unit="deg"):
+    return IntegrationResult2D(
+        radial=np.linspace(0.5, 3.5, 6), azimuthal=np.linspace(-10, 10, 4),
+        intensity=np.arange(24.0).reshape(6, 4), sigma=None,
+        unit=unit, azimuthal_unit=az_unit)
+
+
+def _view2d(label, *, meta=None, source="/data/loaded.nxs"):
+    return FrameView.from_results(
+        label=label, result_2d=_r2d(), metadata_raw=dict(meta or {}),
+        source_path=source, source_frame_index=label)
+
+
+def _scan_store(*records, scan_key="loaded", hydrator=None, persisted=False):
+    store = FrameRecordStore(max_heavy_items=None)
+    if hydrator is not None:
+        store.set_hydrator(hydrator)
+    for record in records:
+        store.upsert(record, persisted=persisted)
+    setattr(store, STORE_SCAN_KEY_ATTR, scan_key)
+    return store
+
+
+def _thinned(record):
+    thinner = FrameRecordStore(
+        max_heavy_items=0, require_persisted_for_eviction=False)
+    thinner.upsert(record)
+    return thinner.get(record.label)
+
+
+def _hydration_spy(display):
+    """Route the REAL ``_request_frame_hydration`` guards into a recorder at
+    the worker seam (the boundary under test is UPSTREAM, in
+    ``resolve_frame_data``)."""
+    requests = []
+    display._async_hydration_enabled = True
+    worker = SimpleNamespace(
+        request=lambda label, generation, **kw:
+            requests.append((label, kw.get("purpose", "full"))))
+    display._ensure_hydration_worker = lambda: worker
+    return requests
+
+
+def _select(display, *labels):
+    display.frame_ids = tuple(labels)
+    display.update()
+
+
+def _reset_hydration_dedupe(display):
+    """Clear the widget-level latest-generation dedupe guards so a direct
+    request-boundary probe is not absorbed by a request the preceding
+    ``update()`` legitimately issued (the guards are NOT the policy owner —
+    R3-P8 — the boundary under test is upstream of them)."""
+    display._hydration_pending_labels = set()
+    display._hydration_success_labels = set()
+    display._hydration_failure_counts = {}
+
+
+def test_five_way_distinction_typed_and_request_gated(qapp, monkeypatch, tmp_path):
+    """Test 1: resident / hydratable / persisted-no-hydrator / dropped /
+    absent — exact typed (state, disposition) on the pin, and the ``"1d"``
+    request issued or suppressed at the resolve_frame_data boundary."""
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        display = widget.displayframe
+        display.scan.name = "loaded"
+        requests = _hydration_spy(display)
+
+        resident = _record(0)
+        cases = {}
+        # a. resident
+        cases[0] = (_scan_store(_record(0)),
+                    CapabilityState.AVAILABLE, CapabilityDisposition.RESIDENT)
+        # b. thinned + persisted + hydrator → hydratable
+        cases[1] = (_scan_store(_thinned(_record(1)),
+                                hydrator=lambda label: resident,
+                                persisted=True),
+                    CapabilityState.PENDING, CapabilityDisposition.HYDRATABLE)
+        # c. thinned + persisted, NO hydrator
+        cases[2] = (_scan_store(_thinned(_record(2)), persisted=True),
+                    CapabilityState.UNAVAILABLE,
+                    CapabilityDisposition.PERSISTED_NO_HYDRATOR)
+        # d. consciously dropped
+        dropped_store = _scan_store(_record(3))
+        dropped_store.mark_dropped(3, modes=("1d", "default"))
+        cases[3] = (dropped_store,
+                    CapabilityState.UNAVAILABLE, CapabilityDisposition.DROPPED)
+
+        for label, (store, state, disposition) in cases.items():
+            display.frame_record_store = store
+            _select(display, label)
+            fact = display._current_frame_projection.capabilities.integrated_1d
+            assert fact.state is state, label
+            assert fact.disposition is disposition, label
+
+            _reset_hydration_dedupe(display)
+            requests.clear()
+            resolve_frame_data_for_widget(
+                display, label, Mode.INT_1D, DataTier.ONE_D)
+            if disposition in (CapabilityDisposition.DROPPED,
+                               CapabilityDisposition.PERSISTED_NO_HYDRATOR):
+                assert requests == [], (label, requests)      # suppressed
+            elif disposition is CapabilityDisposition.HYDRATABLE:
+                assert (label, "1d") in requests, label       # still issued
+            else:                                             # resident
+                assert requests == [], label
+
+        # e. absent record: an ABSENT pin does NOT suppress (record-not-present
+        # is not proof recovery is pointless) — legacy request behavior.
+        display.frame_record_store = _scan_store(scan_key="loaded")
+        _select(display, 9)
+        projection = display._current_frame_projection
+        assert projection.present is False
+        assert projection.capabilities.integrated_1d.disposition \
+            is CapabilityDisposition.ABSENT
+        _reset_hydration_dedupe(display)
+        requests.clear()
+        resolve_frame_data_for_widget(display, 9, Mode.INT_1D, DataTier.ONE_D)
+        assert (9, "1d") in requests
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_eligibility_precedes_the_request_boundary(qapp, monkeypatch, tmp_path):
+    """Test 15 (R3-P8): drive the ``_data_snapshot → resolve_frame_data`` path
+    directly (no ``compute_display_state``) for a DROPPED frame — the worker
+    is never reached, proving suppression sits at the request boundary."""
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        display = widget.displayframe
+        display.scan.name = "loaded"
+        store = _scan_store(_record(4))
+        store.mark_dropped(4, modes=("1d", "default"))
+        display.frame_record_store = store
+        requests = _hydration_spy(display)
+
+        _select(display, 4)                   # pins the DROPPED projection
+        _reset_hydration_dedupe(display)
+        requests.clear()
+        result = resolve_frame_data_for_widget(
+            display, 4, Mode.INT_1D, DataTier.ONE_D)
+        assert requests == []                  # never queued
+        assert result.data is None             # nothing resident either
+
+        # Identity mismatch = unchanged legacy behavior (no false suppression
+        # of OTHER frames): a different label still issues its request.
+        resolve_frame_data_for_widget(display, 5, Mode.INT_1D, DataTier.ONE_D)
+        assert (5, "1d") in requests
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_identity_conflict_blanks_every_panel_never_stale(
+        qapp, monkeypatch, tmp_path):
+    """Test 3a (R3-P3): a genuine identity conflict sets every fact ERROR —
+    every panel blanks explicitly (no exception), and a RESIDENT stale
+    publication under the same label must not draw."""
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        display = widget.displayframe
+        display.scan.name = "loaded"
+        # A resident publication (would draw) ...
+        display.publication_store.upsert(
+            publication_from_frame_view(_view2d(0)))
+        # ... but the store's record identity contradicts the record's own.
+        store = FrameRecordStore(max_heavy_items=None)
+        store.upsert(_record(0), source_identity="/data/other.nxs#0")
+        setattr(store, STORE_SCAN_KEY_ATTR, "loaded")
+        display.frame_record_store = store
+
+        _select(display, 0)
+        caps = display._current_frame_projection.capabilities
+        for fact in (caps.metadata, caps.integrated_1d, caps.integrated_2d,
+                     caps.raw, caps.thumbnail):
+            assert fact.state is CapabilityState.ERROR
+        state = display._live_display_state()
+        for role in (PanelRole.RAW_2D, PanelRole.CAKE_2D, PanelRole.PLOT_1D):
+            panel = state.panel(role)
+            if panel is not None:
+                assert panel.has_data is False, role
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_single_fact_error_does_not_blank_other_panels(
+        qapp, monkeypatch, tmp_path):
+    """Test 3b (R3-P3): a metadata-only ERROR (other facts AVAILABLE — the
+    S2-R7 stored/provider-disagree shape) leaves raw/cake/1D drawn — one
+    fact's failure never becomes a global error.  The metadata-only ERROR
+    caps are composed from the REAL projection of a resident record (a record
+    whose own metadata conflicts is all-ERROR by design, so this shape only
+    arises from the provider-merge path)."""
+    from dataclasses import replace
+
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        display = widget.displayframe
+        display.scan.name = "loaded"
+        v2 = _view2d(0, meta={"exposure": 2.0})
+        display.frame_record_store = _scan_store(FrameRecord.from_view(v2))
+        display.publication_store.upsert(publication_from_frame_view(v2))
+
+        _select(display, 0)
+        real = display._current_frame_projection
+        assert real.capabilities.integrated_2d.state is CapabilityState.AVAILABLE
+        conflicted_meta = replace(
+            real.capabilities,
+            metadata=Capability(
+                CapabilityState.ERROR, "stored/provider metadata disagree",
+                disposition=CapabilityDisposition.ERROR))
+        display._current_frame_projection = SimpleNamespace(
+            label=real.label, present=True, capabilities=conflicted_meta,
+            wavelength=real.wavelength,
+            metadata=real.metadata,
+            normalization_channels=real.normalization_channels)
+
+        state = display._live_display_state()
+        cake = state.panel(PanelRole.CAKE_2D)
+        assert cake is not None
+        assert cake.has_data is True                 # NOT globally blanked
+        assert cake.capability is not None
+        assert cake.capability.state is CapabilityState.AVAILABLE
+        raw_panel = state.panel(PanelRole.RAW_2D)
+        assert raw_panel is not None
+        assert raw_panel.capability is not None
+        assert raw_panel.capability.state is not CapabilityState.ERROR
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_r4_stale_cross_scan_publication_pin_fails_closed(
+        qapp, monkeypatch, tmp_path):
+    """Test 2e — ACHIEVABLE contract (PLAN DEVIATION, disclosed in the
+    handback): a retained cross-scan publication with a reused label yields an
+    ABSENT pin, so every PROJECTION consumer (metadata popup, channel
+    discovery, wavelength evidence — Slice 2/3a) fails closed.  The plan's
+    additional "panels blank on the absent pin" step is NOT implemented: the
+    R4 ownership proof is name-based and structurally UNPROVABLE for
+    legitimate per-frame source identities (TIFF-series scans publish
+    ``frame_0001.tif``-style sources that can never name-match the scan), so
+    blanking on ``present=False`` blanks REAL same-scan displays (caught by
+    the run-end catch-up suite).  Render blanking for the stale case needs a
+    scan-stamped publication identity — a maintainer/R4-owner residual.  The
+    typed layer therefore applies only to PRESENT projections, and this test
+    pins that boundary in both directions."""
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        display = widget.displayframe
+        display.scan.name = "scan_b"                      # browsing scan B
+        display.publication_store.upsert(publication_from_frame_view(
+            _view2d(0, source="/data/scan_a.nxs")))       # stale A publication
+
+        _select(display, 0)
+        projection = display._current_frame_projection
+        assert projection is not None and projection.present is False
+        assert projection.capabilities.integrated_2d.disposition \
+            is CapabilityDisposition.ABSENT
+        # Projection consumers fail closed on the absent pin (Slice 2/3a).
+        assert displayFrameWidget._projection_norm_channels(display) == ()
+        # The ABSENT pin does NOT override legacy residency: panels carry NO
+        # typed layer (present=False) — the boundary the catch-up flows need.
+        state = display._live_display_state()
+        cake = state.panel(PanelRole.CAKE_2D)
+        assert cake is not None and cake.capability is None
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_persist_override_never_retains_unavailable_or_error(
+        qapp, monkeypatch, tmp_path):
+    """Test 2f: during an active run with PERSIST_2D_DURING_PROCESSING, an
+    UNAVAILABLE selected frame must not retain another frame's image (forced
+    clear), while a same-scan-qualified PENDING selection may keep it."""
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        display = widget.displayframe
+        display.scan.name = "loaded"
+        resident2d = _view2d(0)
+        display.publication_store.upsert(publication_from_frame_view(resident2d))
+
+        store = _scan_store(FrameRecord.from_view(resident2d))
+        dropped = FrameRecord.from_view(_view2d(1))
+        store.upsert(dropped)
+        store.mark_dropped(1, modes=("2d", "default"))
+        pending = _thinned(FrameRecord.from_view(_view2d(2)))
+        store.set_hydrator(lambda label: FrameRecord.from_view(_view2d(2)))
+        store.upsert(pending, persisted=True)
+        display.frame_record_store = store
+
+        cleared = []
+        real_clear = display.clear_binned_view
+        monkeypatch.setattr(
+            display, "clear_binned_view",
+            lambda *a, **k: (cleared.append("cake"), real_clear()))
+
+        display.set_processing_active(True)               # persist window on
+        _select(display, 0)                               # A drawn
+        cleared.clear()
+
+        _select(display, 1)                               # DROPPED selection
+        fact = display._current_frame_projection.capabilities.integrated_2d
+        assert fact.disposition is CapabilityDisposition.DROPPED
+        assert "cake" in cleared                          # forced clear
+
+        cleared.clear()
+        _select(display, 2)                               # PENDING selection
+        fact = display._current_frame_projection.capabilities.integrated_2d
+        assert fact.state is CapabilityState.PENDING
+        assert cleared == []                              # persist retains
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_aggregate_probe_keeps_legacy_residency(qapp, monkeypatch, tmp_path):
+    """Test 6: Sum/Average probe ≠ pin — the pinned frame's capability is never
+    applied to frame [0]; the panels keep legacy residency behavior."""
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        display = widget.displayframe
+        display.scan.name = "loaded"
+        for label in (0, 1):
+            display.publication_store.upsert(
+                publication_from_frame_view(_view2d(label)))
+        display.frame_record_store = _scan_store(
+            FrameRecord.from_view(_view2d(0)),
+            FrameRecord.from_view(_view2d(1)))
+
+        display.ui.plotMethod.setCurrentText("Sum")
+        _select(display, 0, 1)
+        # The pin is the CURRENT display frame (R1: the latest, frame 1);
+        # the Sum/Average probe is render_2d[0] (frame 0) — they differ.
+        assert display._current_frame_projection.label == 1
+        state = display._live_display_state()
+        cake = state.panel(PanelRole.CAKE_2D)
+        assert cake is not None
+        # Probe ≠ pin: the pinned frame's capability is never applied to
+        # frame [0] — legacy residency behavior, no typed layer.
+        assert cake.capability is None
+        assert cake.has_data is True          # legacy residency draw
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_rapid_selection_terminal_generation_owns_state(
+        qapp, monkeypatch, tmp_path):
+    """Test 7: rapid A→B→C ending on an UNAVAILABLE frame — the terminal
+    generation's typed state stands, and a stale hydration completion for A
+    cannot change it."""
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        display = widget.displayframe
+        display.scan.name = "loaded"
+        for label in (0, 1):
+            display.publication_store.upsert(
+                publication_from_frame_view(_view2d(label)))
+        store = _scan_store(FrameRecord.from_view(_view2d(0)),
+                            FrameRecord.from_view(_view2d(1)))
+        dropped = FrameRecord.from_view(_view2d(2))
+        store.upsert(dropped)
+        store.mark_dropped(2, modes=("2d", "default"))
+        display.frame_record_store = store
+
+        _select(display, 0)
+        _select(display, 1)
+        _select(display, 2)                                # terminal: dropped
+        stale_generation = display.display_generation - 1
+
+        fact = display._current_frame_projection.capabilities.integrated_2d
+        assert (fact.state, fact.disposition) == (
+            CapabilityState.UNAVAILABLE, CapabilityDisposition.DROPPED)
+        state = display._live_display_state()
+        cake = state.panel(PanelRole.CAKE_2D)
+        assert cake is not None and cake.has_data is False
+
+        # A deliberately-delayed stale completion for A (old generation) must
+        # change nothing.
+        display._on_frame_hydrated(0, stale_generation)
+        after = display._current_frame_projection.capabilities.integrated_2d
+        assert (after.state, after.disposition) == (
+            CapabilityState.UNAVAILABLE, CapabilityDisposition.DROPPED)
+        state2 = display._live_display_state()
+        cake2 = state2.panel(PanelRole.CAKE_2D)
+        assert cake2 is not None and cake2.has_data is False
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_gi_mode_flip_carries_fresh_mode_capability(qapp, monkeypatch, tmp_path):
+    """Test 8: flipping the displayed GI mode re-projects (R3) and the panel
+    decision follows the fresh mode's (UNAVAILABLE, ABSENT)."""
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        display = widget.displayframe
+        display.scan.name = "loaded"
+        display.scan.gi = True
+        display.scan.bai_1d_args = {"gi_mode_1d": "q_total"}
+        display.scan.bai_2d_args = {"gi_mode_2d": "qip_qoop"}
+
+        gi_r2 = IntegrationResult2D(
+            radial=np.linspace(-1.0, 1.0, 6), azimuthal=np.linspace(0, 1, 4),
+            intensity=np.arange(24.0).reshape(6, 4), sigma=None,
+            unit="qip_A^-1", azimuthal_unit="qoop_A^-1")
+        gi_view = FrameView.from_results(
+            label=0, result_2d=gi_r2, metadata_raw={"i0": 1.0},
+            source_path="/data/loaded.nxs", source_frame_index=0)
+        record = FrameRecord(
+            label=0, results_2d={"qip_qoop": gi_view},
+            active_mode_2d="qip_qoop")
+        display.frame_record_store = _scan_store(record)
+
+        _select(display, 0)
+        fact = display._current_frame_projection.capabilities.integrated_2d
+        assert fact.state is CapabilityState.AVAILABLE
+        before = display._frame_projection_adapter.lookup_count
+
+        display.scan.bai_2d_args = {"gi_mode_2d": "chi_tth"}   # mode flip
+        display.update()
+        assert display._frame_projection_adapter.lookup_count == before + 1
+        fact = display._current_frame_projection.capabilities.integrated_2d
+        assert (fact.state, fact.disposition) == (
+            CapabilityState.UNAVAILABLE, CapabilityDisposition.ABSENT)
+        state = display._live_display_state()
+        cake = state.panel(PanelRole.CAKE_2D)
+        if cake is not None:
+            assert cake.has_data is False
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_raw_recovery_survives_the_gate(qapp, monkeypatch, tmp_path):
+    """Test 9: raw/thumbnail UNAVAILABLE is NOT proof hydration is pointless
+    (findings 8-9) — the "full" purpose stays ungated; browse best-effort
+    integrated PENDING still issues its "1d" request."""
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        display = widget.displayframe
+        display.scan.name = "loaded"
+        requests = _hydration_spy(display)
+
+        # (a) raw facts ABSENT (no raw, no source) → "full" still issued.
+        no_source = FrameRecord.from_view(FrameView.from_results(
+            label=0, result_1d=_r1d(), metadata_raw={"i0": 1.0}))
+        display.frame_record_store = _scan_store(no_source)
+        _select(display, 0)
+        caps = display._current_frame_projection.capabilities
+        assert caps.raw.disposition is CapabilityDisposition.ABSENT
+        _reset_hydration_dedupe(display)
+        requests.clear()
+        resolve_frame_data_for_widget(
+            display, 0, Mode.INT_2D, DataTier.RAW_OR_THUMBNAIL)
+        assert (0, "full") in requests                    # ungated
+
+        # (b) browse best-effort PENDING (no store mode-context — the real
+        # publication-backed browse shape) keeps browse "1d" hydration alive.
+        from xrd_tools.session import display_capabilities
+
+        display.frame_record_store = None
+        thinned = _thinned(_record(1))
+        caps = display_capabilities(thinned)      # no store context (browse)
+        assert caps.integrated_1d.disposition \
+            is CapabilityDisposition.BEST_EFFORT
+        display._current_frame_projection = SimpleNamespace(
+            label=1, present=True, capabilities=caps)
+        display._current_frame_projection_scan_key = "loaded"
+        _reset_hydration_dedupe(display)
+        requests.clear()
+        resolve_frame_data_for_widget(display, 1, Mode.INT_1D, DataTier.ONE_D)
+        assert (1, "1d") in requests                      # not suppressed
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_caps_vs_active_view_divergence_is_pending_equivalent(
+        qapp, monkeypatch, tmp_path):
+    """Test 10 (finding 7): capabilities aggregate ANY view, the draw decision
+    stays with the ACTIVE view — a divergence renders pending-equivalent: no
+    draw from a fact the active view cannot serve, typed truth carried,
+    recovery allowed."""
+    from xrd_tools.session import display_capabilities
+
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        display = widget.displayframe
+        display.scan.name = "loaded"
+        # Active 2D view (mode a) has no raw; mode b's view carries raw — the
+        # multi-mode GI shape.  The capability derivation is the REAL headless
+        # one; the store strips raw payloads on upsert, so the divergence pin
+        # is injected value-only at the consumer seam.
+        va = _view2d(0)
+        vb = FrameView.from_results(
+            label=0, result_2d=_r2d(), metadata_raw={},
+            raw=np.ones((4, 4), dtype=np.float32),
+            source_path="/data/loaded.nxs", source_frame_index=0)
+        record = FrameRecord(
+            label=0, results_2d={"a": va, "b": vb}, active_mode_2d="a")
+        caps = display_capabilities(record, mode_2d="a")
+        assert caps.raw.state is CapabilityState.AVAILABLE   # any-view truth
+
+        display.publication_store.upsert(publication_from_frame_view(va))
+        _select(display, 0)                       # active-view booleans: no raw
+        display._current_frame_projection = SimpleNamespace(
+            label=0, present=True, capabilities=caps)
+        display._current_frame_projection_scan_key = "loaded"
+
+        state = display._live_display_state()
+        raw_panel = state.panel(PanelRole.RAW_2D)
+        assert raw_panel is not None
+        assert raw_panel.has_data is False        # active view can't serve it
+        assert raw_panel.capability is not None   # typed truth carried
+        assert raw_panel.capability.state is CapabilityState.AVAILABLE
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+@pytest.mark.parametrize("method", ["Overlay", "Waterfall"])
+def test_overlay_waterfall_history_survives_unavailable_selection(
+        qapp, monkeypatch, tmp_path, method):
+    """Test 12 (R3-P4): after accumulating rows, selecting a DROPPED (and a
+    PERSISTED_NO_HYDRATOR) row preserves the accumulated payload
+    byte/identity-unchanged, appends nothing, and issues NO 1d hydration."""
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        display = widget.displayframe
+        display.scan.name = "loaded"
+        requests = _hydration_spy(display)
+        display.ui.plotMethod.setCurrentText(method)
+        for label in (0, 1):
+            display.publication_store.upsert(
+                publication_from_frame_view(_view(label)))
+            _select(display, label)
+        history = display._waterfall_history
+        assert history is not None and history.count == 2
+        rows_before = [np.asarray(row).tobytes() for row in history.rows]
+
+        store = _scan_store(_record(2))
+        store.mark_dropped(2, modes=("1d", "default"))
+        thinned3 = _thinned(_record(3))
+        store.upsert(thinned3, persisted=True)     # persisted, NO hydrator
+        display.frame_record_store = store
+
+        for label, disposition in (
+                (2, CapabilityDisposition.DROPPED),
+                (3, CapabilityDisposition.PERSISTED_NO_HYDRATOR)):
+            requests.clear()
+            _select(display, label)
+            fact = display._current_frame_projection.capabilities.integrated_1d
+            assert fact.disposition is disposition, label
+            history = display._waterfall_history
+            assert history.count == 2                       # nothing appended
+            assert [np.asarray(row).tobytes() for row in history.rows] \
+                == rows_before                              # byte-identical
+            assert (label, "1d") not in requests            # no futile 1d
+            state = display._live_display_state()
+            plot = state.panel(PanelRole.PLOT_1D)
+            assert plot is not None and plot.has_data is True   # history kept
+
+        # Single mode with the same unavailable selection blanks.
+        display.ui.plotMethod.setCurrentText("Single")
+        _select(display, 2)
+        state = display._live_display_state()
+        plot = state.panel(PanelRole.PLOT_1D)
+        assert plot is not None and plot.has_data is False
+    finally:
+        widget.close()
+        widget.deleteLater()

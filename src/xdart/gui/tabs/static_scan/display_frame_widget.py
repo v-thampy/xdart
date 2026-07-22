@@ -73,6 +73,7 @@ from .display_logic import (
     combine_flat_masks, nan_gaps_in_thumbnail,
     stitch_plot_payload, stitch_image_payload,
     ConsumerKind, SupersedeReason,
+    CapabilityState,
 )
 from .display_controllers import current_display_label, register_default_controllers
 from .browse_debug import (
@@ -2303,7 +2304,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if hasattr(self, 'refresh_norm_channels'):
             self.refresh_norm_channels()
 
-        if not self._updated():
+        # X1 Slice 3b (2f): when the pinned projection PROVES a selected-frame
+        # fact UNAVAILABLE/ERROR, the not-updated keep-cached/empty shortcuts
+        # must not retain (or blindly blank) — route through the FULL state
+        # path, whose per-panel typed layer performs the honest never-stale
+        # clears while PENDING panels keep the persist behavior.
+        if not self._updated() and not displayFrameWidget._pin_blocks_keep_cached(self):
             # Nothing to draw yet for the current selection.  Only render the
             # EXPLICIT blank when there is genuinely nothing cached — a fresh
             # file, a cleared scan, or a failed load with no fallback.  When
@@ -2475,6 +2481,54 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             PanelRole.CAKE_2D: self.clear_binned_view,
             PanelRole.PLOT_1D: self.clear_plot_view,
         }.get(role)
+
+    def _pin_blocks_keep_cached(self):
+        """X1 Slice 3b (2f): True when the CURRENT pinned projection describes
+        this display scan and ANY of its selected-frame integrated/raw facts
+        is PROVEN dead — typed disposition DROPPED / PERSISTED_NO_HYDRATOR /
+        ERROR — so keep-cached would retain another frame's image for a panel
+        that provably has nothing coming.  Falling through to the full state
+        path keeps the per-panel decision honest: only the matched bad-fact
+        panels force-clear; PENDING panels keep today's persist behavior via
+        the delegates.
+
+        Deliberately NOT blocked: viewer modes (pins are a scan-display
+        concept) and ABSENT facts — record-not-present is the normal transient
+        await (live/catch-up ticks), where keep-cached is the intended
+        behavior; a retained cross-scan ABSENT pin still blanks through the
+        full state path's typed layer whenever something IS resident to
+        render.  No pin = legacy."""
+        if getattr(self, "viewer_mode", None) is not None:
+            return False
+        projection = getattr(self, "_current_frame_projection", None)
+        caps = getattr(projection, "capabilities", None)
+        if caps is None:
+            return False
+        pin_key = getattr(self, "_current_frame_projection_scan_key", None)
+        try:
+            current = overlay_current_scan_key(self)
+        except Exception:
+            current = None
+        if pin_key != current:
+            return False
+        from xrd_tools.session import CapabilityDisposition
+        blocked = (CapabilityDisposition.DROPPED,
+                   CapabilityDisposition.PERSISTED_NO_HYDRATOR,
+                   CapabilityDisposition.ERROR)
+        return any(fact.disposition in blocked for fact in (
+            caps.integrated_1d, caps.integrated_2d, caps.raw, caps.thumbnail))
+
+    @staticmethod
+    def _capability_forces_clear(state, role):
+        """X1 Slice 3b (2f): True when this panel's typed fact proves the
+        selected frame's data is UNAVAILABLE/ERROR — a stale image must not
+        be retained by any persist/keep-last path (typed key: the panel's
+        carried Capability state, never reason prose)."""
+        panel_of = getattr(state, "panel", None)
+        panel = panel_of(role) if callable(panel_of) else None
+        capability = getattr(panel, "capability", None)
+        return capability is not None and getattr(capability, "state", None) in (
+            CapabilityState.UNAVAILABLE, CapabilityState.ERROR)
 
     def _payload_for_role(self, role, payload):
         if payload is None:
@@ -3434,6 +3488,17 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # Clear the panels this state does not want (kills stale content).
         for role in plan.clear:
             clear = self._clear_delegate(role)
+            if clear is None and displayFrameWidget._capability_forces_clear(
+                    state, role):
+                # X1 Slice 3b (test 2f): the persist-during-processing skip
+                # must NEVER retain a stale image for a selected frame whose
+                # OWN typed fact is UNAVAILABLE/ERROR — never-stale beats
+                # persistence.  (A PENDING fact keeps the persist behavior.)
+                clear = {
+                    PanelRole.RAW_2D: self.clear_image_view,
+                    PanelRole.CAKE_2D: self.clear_binned_view,
+                    PanelRole.PLOT_1D: self.clear_plot_view,
+                }.get(role)
             if clear is not None:
                 browse_debug_log(
                     logger,

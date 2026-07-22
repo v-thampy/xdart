@@ -48,6 +48,14 @@ import numpy as np  # allowed: the purity guard forbids only Qt/pyqtgraph/h5py/p
 from xrd_tools.core.frame_view import (
     two_d_kind_from_units as _core_kind,
 )
+# X1 Slice 3b: the typed capability contracts (import-light session module —
+# the display_logic purity guard stays green).
+from xrd_tools.session.frame_projection import (
+    Capability,
+    CapabilityDisposition,
+    CapabilityState,
+    DisplayCapabilities,
+)
 from xrd_tools.core.invalid import (
     UINT32_CEILING as _UINT32_CEILING,
     integer_saturation_ceiling as _core_saturation_ceiling,
@@ -72,6 +80,7 @@ __all__ = [
     "PanelRole",
     "PanelKey",
     "PanelPlan",
+    "SelectedCapabilityContext",
     "ReadResult",
     "Axis",
     "Trace",
@@ -410,6 +419,36 @@ class PanelPlan:
     has_data: bool                       # False ⇒ render() clears this panel
     source: RawSource = RawSource.NONE   # 2D-raw panel only
     apply_mask: bool = False             # 2D-raw panel only
+    #: X1 Slice 3b (R3-P3): the typed capability fact for THIS panel's
+    #: selected frame, when the probe matches the pinned scan-qualified
+    #: projection — the Capability ITSELF (state/disposition/reason), never
+    #: copied into fields that can drift.  ``None`` on legacy/aggregate/
+    #: viewer paths.  Policy consumers key on ``capability.disposition``;
+    #: the prose reason stays diagnostic.
+    capability: "Capability | None" = None
+
+
+@dataclass(frozen=True)
+class SelectedCapabilityContext:
+    """Value-only snapshot of the pinned selected-frame projection (X1 3b).
+
+    ``(scan_key, label)`` is the pin's scan-qualified identity — gates compare
+    BOTH, never a bare label (contract 8).  ``integrated_1d`` drives the typed
+    hydration eligibility at the :func:`resolve_frame_data` request boundary
+    (R3-P8); ``capabilities`` carries the full per-panel facts for
+    :func:`compute_display_state` (R3-P3)."""
+
+    scan_key: "object" = None
+    label: "object" = None
+    integrated_1d: "Capability | None" = None
+    capabilities: "DisplayCapabilities | None" = None
+    #: Whether the pinned projection RESOLVED a record (``FrameProjection
+    #: .present``).  The per-panel typed layer applies only to present
+    #: projections: an ABSENT pin means the authority could not resolve the
+    #: frame (record not present, or publication ownership unprovable — e.g.
+    #: per-frame TIFF source identities that cannot name-match a scan), which
+    #: is NOT proof the legacy-resident draw is wrong.
+    present: bool = False
 
 
 @dataclass(frozen=True)
@@ -2003,6 +2042,36 @@ def _request_tier_hydration(request_hydration, label, tier_needed):
         return False
 
 
+def _hydration_suppressed_by_selected_capability(
+        selected_capability, request_scan_key, key, tier_needed):
+    """X1 Slice 3b (R3-P8): the typed hydration-eligibility decision at the
+    request boundary — BEFORE anything is queued.
+
+    Suppress a ``"1d"`` request iff the request's exact ``(scan_key, label)``
+    matches the pinned selection AND the pinned ``integrated_1d`` disposition
+    is DROPPED or PERSISTED_NO_HYDRATOR — a TYPED comparison, never a
+    reason-string parse (R3-P2).  Any identity mismatch or missing pin keeps
+    the legacy behavior; ABSENT does not suppress (record-not-present is not
+    proof recovery is pointless).  Purpose ``"full"`` is never gated in this
+    slice: it serves both the integrated-2D and raw/thumbnail tiers, and
+    record capabilities cannot see every production recovery path."""
+    if selected_capability is None:
+        return False
+    if _tier(tier_needed) is not DataTier.ONE_D:
+        return False
+    fact = selected_capability.integrated_1d
+    if fact is None:
+        return False
+    if selected_capability.scan_key != request_scan_key:
+        return False
+    if _label_key(selected_capability.label) != key:
+        return False
+    return getattr(fact, "disposition", None) in (
+        CapabilityDisposition.DROPPED,
+        CapabilityDisposition.PERSISTED_NO_HYDRATOR,
+    )
+
+
 def resolve_frame_data(
     label,
     mode,
@@ -2014,6 +2083,8 @@ def resolve_frame_data(
     viewer_rows_2d=None,
     include_legacy=True,
     request_hydration=None,
+    selected_capability=None,
+    request_scan_key=None,
 ):
     """Resolve one display datum through the H8 store-first read chain.
 
@@ -2023,6 +2094,11 @@ def resolve_frame_data(
     Scan displays read store-first accessor -> PublicationStore -> hydration.
     Viewer modes may still read their file-browser row stores.  Scan modes
     never consult those rows.
+
+    X1 Slice 3b: ``selected_capability`` (a :class:`SelectedCapabilityContext`)
+    plus the request's ``request_scan_key`` gate a pointless ``"1d"`` request
+    for a selected frame whose typed 1D disposition proves recovery is
+    impossible — see :func:`_hydration_suppressed_by_selected_capability`.
     """
     key = _label_key(label)
     tier_needed = _tier(tier_needed)
@@ -2078,6 +2154,14 @@ def resolve_frame_data(
         or request_hydration is not None
     )
     if can_hydrate:
+        # X1 Slice 3b (R3-P8): typed eligibility BEFORE the queue — a selected
+        # 1D row proven DROPPED / PERSISTED_NO_HYDRATOR gets no futile request
+        # (and honestly reports ABSENT: nothing is coming).
+        if _hydration_suppressed_by_selected_capability(
+                selected_capability, request_scan_key, key, tier_needed):
+            return ReadResult(
+                key, tier_needed, ReadStatus.ABSENT,
+                source="capability-suppressed")
         _request_tier_hydration(request_hydration, key, tier_needed)
         return ReadResult(
             key, tier_needed, ReadStatus.EVICTED_HYDRATING,
@@ -2474,10 +2558,30 @@ def _availability(raw_availability, fid):
     return entry or {}
 
 
+def _none_drawable_raw_fact(caps):
+    """The raw panel's typed fact when NO source is drawable by the active
+    view (X1 3b): ERROR if either raw fact is ERROR; else the AVAILABLE fact
+    (the caps-vs-active-view divergence — its typed truth is carried while
+    the behavior stays pending-equivalent: nothing drawn, recovery allowed);
+    else a PENDING fact (thumbnail preferred, mirroring the draw preference);
+    else the raw fact (UNAVAILABLE/ABSENT)."""
+    for fact in (caps.raw, caps.thumbnail):
+        if fact.state is CapabilityState.ERROR:
+            return fact
+    for fact in (caps.raw, caps.thumbnail):
+        if fact.state is CapabilityState.AVAILABLE:
+            return fact
+    for fact in (caps.thumbnail, caps.raw):
+        if fact.state is CapabilityState.PENDING:
+            return fact
+    return caps.raw
+
+
 def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys,
                           loaded_2d_keys, gi, plot_unit, method, unit_changed,
                           prev_overlaid_ids, raw_availability, titles,
-                          generation=0, loading=False):
+                          generation=0, loading=False,
+                          selected_capability=None, current_scan_key=None):
     """Compose the pure selectors into one immutable :class:`DisplayState`
     describing exactly what each panel should show.  THE function the GUI
     calls.  Pure: no Qt, no I/O, no mutation of inputs.
@@ -2487,6 +2591,15 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
     message) marks a failed load.  ``titles`` maps ``mode.value`` to the
     title/filename for the current selection.  ``loading`` is True while a
     load is in flight (lets EMPTY and LOADING be distinguished).
+
+    X1 Slice 3b (R3-P3): ``selected_capability`` is the pinned selected-frame
+    :class:`SelectedCapabilityContext`; ``current_scan_key`` is the REQUESTING
+    display's scan identity.  When a panel's probe matches the pin's
+    scan-qualified ``(scan_key, label)``, that panel carries its own typed
+    :class:`Capability` and blanks on its OWN fact's ERROR/UNAVAILABLE — never
+    on "any error anywhere".  A genuine identity conflict (every fact ERROR)
+    fails the whole selected-frame request explicitly.  Aggregate probes that
+    differ from the pin and legacy/viewer paths are untouched.
     """
     loaded_1d = set(loaded_1d_keys)
     loaded_2d = set(loaded_2d_keys)
@@ -2542,6 +2655,32 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
 
     x_label, _sym = x_axis_for_unit(plot_unit)
 
+    # X1 Slice 3b: the pinned selected-frame capability context.  A panel's
+    # typed layer applies only when its probe matches the pin's scan-qualified
+    # (scan_key, label) — never a bare label (contract 8), and never for an
+    # aggregate probe that differs from the pin (S2-R3 analog).
+    _sel_caps = (getattr(selected_capability, "capabilities", None)
+                 if selected_capability is not None else None)
+    # The typed layer applies only to PRESENT projections — real typed
+    # verdicts about a resolved record.  An ABSENT pin (record not present /
+    # ownership unprovable) must not override legacy residency (see
+    # SelectedCapabilityContext.present).
+    if _sel_caps is not None and not getattr(
+            selected_capability, "present", False):
+        _sel_caps = None
+    _sel_scan_ok = (
+        _sel_caps is not None
+        and selected_capability.scan_key == current_scan_key)
+
+    def _pin_matches(probe_pool):
+        if not _sel_scan_ok:
+            return False
+        pool = tuple(probe_pool) if probe_pool else ids
+        if not pool:
+            return False
+        probe = pool[0] if method in ("Sum", "Average") else pool[-1]
+        return _label_key(probe) == _label_key(selected_capability.label)
+
     # Failed load -> ERROR with a message; never a half-populated display
     # (§8 invariant).  Blank panels + blank title.
     err = raw_availability.get('__error__') if isinstance(raw_availability, dict) else None
@@ -2568,6 +2707,21 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
         # never drift from the payload it describes (§8 invariant).  Only a
         # READY state carries a title; EMPTY/LOADING/ERROR blank it.
         title = titles.get(mode.value, '') if load_status is LoadStatus.READY else ''
+
+    # X1 Slice 3b: a GENUINE identity conflict — every pinned fact ERROR — is
+    # a whole-selected-frame failure: blank every panel explicitly with the
+    # reason, never a stale panel (required test 4/3a).  LoadStatus keeps its
+    # whole-request meaning (this IS the whole request failing).
+    if (load_status is LoadStatus.READY and _sel_scan_ok
+            and _pin_matches(())):
+        _facts = (_sel_caps.metadata, _sel_caps.integrated_1d,
+                  _sel_caps.integrated_2d, _sel_caps.raw, _sel_caps.thumbnail)
+        if all(f.state is CapabilityState.ERROR for f in _facts):
+            load_status = LoadStatus.ERROR
+            error_message = (_sel_caps.metadata.reason
+                             or "selected record identity conflict")
+            render_ids = ()
+            title = ''
 
     ready = load_status is LoadStatus.READY
 
@@ -2599,6 +2753,44 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
     plot_panel = PanelPlan(
         visible=True,
         has_data=(ready and bool(render_1d)) or _overlay_preserve_1d)
+
+    # X1 Slice 3b (R3-P3): the per-panel typed layer.  DRAW-source truth stays
+    # the active view (the booleans above); capabilities govern the typed
+    # layer on top — the carried Capability, never-stale/error blanking, and
+    # the pending-equivalent divergence.  Each panel blanks on its OWN fact's
+    # ERROR/UNAVAILABLE only; PENDING keeps today's behavior.
+    if _sel_caps is not None:
+        if _pin_matches(render_2d):
+            _fact_2d = _sel_caps.integrated_2d
+            cake_panel = PanelPlan(
+                visible=True,
+                has_data=(cake_panel.has_data and _fact_2d.state not in
+                          (CapabilityState.ERROR, CapabilityState.UNAVAILABLE)),
+                capability=_fact_2d)
+            if raw_src is RawSource.RAW:
+                _fact_raw = _sel_caps.raw
+            elif raw_src is RawSource.THUMBNAIL:
+                _fact_raw = _sel_caps.thumbnail
+            else:
+                _fact_raw = _none_drawable_raw_fact(_sel_caps)
+            if _fact_raw.state in (CapabilityState.ERROR,
+                                   CapabilityState.UNAVAILABLE):
+                raw_panel = PanelPlan(
+                    visible=True, has_data=False, source=RawSource.NONE,
+                    apply_mask=False, capability=_fact_raw)
+            else:
+                raw_panel = PanelPlan(
+                    visible=True, has_data=raw_panel.has_data,
+                    source=raw_panel.source, apply_mask=raw_panel.apply_mask,
+                    capability=_fact_raw)
+        if _pin_matches(render_1d):
+            _fact_1d = _sel_caps.integrated_1d
+            plot_panel = PanelPlan(
+                visible=True,
+                has_data=((plot_panel.has_data and _fact_1d.state not in
+                           (CapabilityState.ERROR, CapabilityState.UNAVAILABLE))
+                          or _overlay_preserve_1d),
+                capability=_fact_1d)
 
     raw_key = PanelKey(PanelRole.RAW_2D)
     cake_key = PanelKey(PanelRole.CAKE_2D)

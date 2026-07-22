@@ -37,6 +37,7 @@ from .display_logic import (
     Mode,
     PlotPayload,
     ReadStatus,
+    SelectedCapabilityContext,
     Trace,
     compute_display_state,
     build_payload,
@@ -55,9 +56,41 @@ from .display_publication import (
 )
 from .browse_debug import browse_debug_log, sequence_summary
 from .display_overlay_utils import (
+    current_scan_key,
     frame_index_from_row_id,
     row_id_belongs_to_widget_scan,
 )
+
+
+def _selected_capability_context(widget):
+    """X1 Slice 3b: the value-only pinned-projection snapshot for the typed
+    hydration gate (R3-P8) and the per-panel capability layer (R3-P3).
+
+    Carries ``present`` so the pure layer applies typed verdicts only to
+    RESOLVED records: an ABSENT pin means the authority could not resolve the
+    frame — including legitimately-unprovable ownership (per-frame TIFF
+    source identities can never name-match a scan), so it must not override
+    legacy residency; its consumers (popup/channels/wavelength) still fail
+    closed.  Only a missing pin/adapter (duck hosts, viewer paths) is the
+    legacy ``None``."""
+    projection = getattr(widget, "_current_frame_projection", None)
+    if projection is None:
+        return None
+    caps = getattr(projection, "capabilities", None)
+    return SelectedCapabilityContext(
+        scan_key=getattr(widget, "_current_frame_projection_scan_key", None),
+        label=_label_key(getattr(projection, "label", None)),
+        integrated_1d=getattr(caps, "integrated_1d", None),
+        capabilities=caps,
+        present=bool(getattr(projection, "present", False)),
+    )
+
+
+def _widget_scan_key(widget):
+    try:
+        return current_scan_key(widget)
+    except Exception:
+        return None
 
 logger = logging.getLogger(__name__)
 
@@ -408,6 +441,12 @@ def resolve_frame_data_for_widget(
             getattr(widget, "viewer_rows_2d", None) if viewer_mode else None),
         include_legacy=include_legacy,
         request_hydration=request,
+        # X1 Slice 3b (R3-P8): the typed eligibility inputs — the pinned
+        # selection's context plus THIS request's scan identity; the pure
+        # boundary compares the exact (scan_key, label) pair.
+        selected_capability=(
+            None if viewer_mode else _selected_capability_context(widget)),
+        request_scan_key=(None if viewer_mode else _widget_scan_key(widget)),
     )
 
 
@@ -579,6 +618,12 @@ class _BaseController:
             raw_availability=raw_avail,
             titles={},
             generation=widget.display_generation,
+            # X1 Slice 3b (R3-P3): the pinned selected-frame capability
+            # context + the requesting display's scan identity — the pure
+            # state applies the per-panel typed layer only on an exact
+            # scan-qualified probe match.
+            selected_capability=_selected_capability_context(widget),
+            current_scan_key=_widget_scan_key(widget),
         )
 
     def build_payload(self, widget, state):
