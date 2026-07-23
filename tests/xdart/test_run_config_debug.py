@@ -139,34 +139,28 @@ def test_run_config_debug_records_all_run_ownership_carriers(
         qapp.processEvents()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "R4-D captured live failure: first Run lets a stale hidden threshold "
-        "carrier invoke setup and clobber Controls V2 Grazing"
-    ),
-)
 def test_r4d_first_run_preserves_grazing_across_stale_hidden_carriers(
     qapp, monkeypatch, tmp_path
 ):
-    """Desired ownership contract; captured red until the structural fix lands."""
+    """The first frozen run wins over every stale compatibility carrier."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     monkeypatch.setenv("XDART_SESSION_FRESH", "1")
     monkeypatch.setenv("XDART_SESSION_FILE", str(tmp_path / "session.json"))
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.session.run_configuration import FrozenRunConfiguration
 
     widget = staticWidget()
     try:
         _prime_stale_hidden_carriers(widget)
 
         # Production Run commit path (no monkeypatched setup/thread owners).
-        widget._apply_controls_v2_run_state()
+        run_configuration = widget._prepare_controls_v2_run_configuration()
+        assert isinstance(run_configuration, FrozenRunConfiguration)
+        assert run_configuration.gi.enabled is True
+        assert run_configuration.threshold.threshold_max == 5000
+        widget._apply_controls_v2_run_state(run_configuration)
 
         # The one run snapshot must win over every stale compatibility carrier.
-        # At 41292079 this is (False, False, False, False, False): the hidden
-        # threshold max write synchronously invokes full setup(), whose stale GI
-        # false is emitted back into the shared scan before the GI push derives
-        # its value.
         assert (
             widget.scan.gi,
             bool(widget.scan.gi_config),
@@ -174,6 +168,131 @@ def test_r4d_first_run_preserves_grazing_across_stale_hidden_carriers(
             widget.wrangler.gi,
             widget.wrangler.thread.gi,
         ) == (True, True, True, True, True)
+        assert (
+            widget.wrangler.parameters.child("Mask").child("max").value()
+            == 5000
+        )
+        assert widget.wrangler.run_configuration is run_configuration
+        assert widget.wrangler.thread.run_configuration is run_configuration
+    finally:
+        widget.close()
+        widget.deleteLater()
+        qapp.processEvents()
+
+
+def _adopt_direct_nxs_metadata(widget, source_dir):
+    """Drive the real preview -> wrangler signal -> integrator/Controls chain."""
+    from xrd_tools.sources import DirectorySourceSpec
+
+    wrangler = widget.wrangler
+    wrangler.source_spec = DirectorySourceSpec(
+        root=source_dir,
+        recursive=True,
+        suffixes=(".nxs",),
+    )
+    signal = wrangler.parameters.child("Signal")
+    previous = wrangler.parameters.blockSignals(True)
+    try:
+        signal.child("inp_type").setValue("Image Directory")
+        signal.child("img_dir").setValue(str(source_dir))
+        signal.child("img_ext").setValue("nxs")
+        signal.child("include_subdir").setValue(True)
+    finally:
+        wrangler.parameters.blockSignals(previous)
+    wrangler.inp_type = "Image Directory"
+    wrangler.get_img_fname()
+
+
+def test_r4b_directory_metadata_motor_is_offered_and_frozen_for_run(
+    qapp, monkeypatch, tmp_path
+):
+    """Lazy directory discovery still supplies and freezes the GI motor."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    monkeypatch.setenv("XDART_SESSION_FRESH", "1")
+    monkeypatch.setenv("XDART_SESSION_FILE", str(tmp_path / "session.json"))
+    from tests.core.test_bluesky_nexus import (
+        _write_bluesky_baseline_only_motors,
+    )
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_bluesky_baseline_only_motors(source / "direct_00001.nxs")
+
+    widget = staticWidget()
+    try:
+        _adopt_direct_nxs_metadata(widget, source)
+        qapp.processEvents()
+
+        hidden = widget.wrangler.parameters.child("GI").child("th_motor")
+        hidden_choices = tuple(hidden.opts["limits"])
+        combo = widget.integratorTree.ui.gi_motor
+        combo_choices = tuple(
+            combo.itemText(index) for index in range(combo.count())
+        )
+        controls_choices = widget._controls_v2_native_int_choices()[
+            ("GI", "th_motor")
+        ]
+
+        assert "halpha" in hidden_choices
+        assert "halpha" in combo_choices
+        assert "halpha" in controls_choices
+        assert hidden.value() == "halpha"
+        assert combo.currentText() == "halpha"
+
+        _click_grazing(widget)
+        run_configuration = widget._prepare_controls_v2_run_configuration()
+        widget._apply_controls_v2_run_state(run_configuration)
+
+        assert run_configuration.gi.enabled is True
+        assert run_configuration.gi.incidence_motor == "halpha"
+        assert widget.wrangler.run_configuration is run_configuration
+        assert widget.wrangler.thread.run_configuration is run_configuration
+    finally:
+        widget.close()
+        widget.deleteLater()
+        qapp.processEvents()
+
+
+def test_r4b_display_scan_mutation_cannot_change_next_frozen_gi_intent(
+    qapp, monkeypatch, tmp_path
+):
+    """Browsing a Standard result cannot overwrite the next GI run intent."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    monkeypatch.setenv("XDART_SESSION_FRESH", "1")
+    monkeypatch.setenv("XDART_SESSION_FILE", str(tmp_path / "session.json"))
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget.integratorTree.set_gi_motor_options(["halpha", "detx"])
+        widget._on_gi_motor_options_changed(["halpha", "detx"])
+        _click_grazing(widget)
+        widget._on_controls_v2_field_changed(
+            ("GI", "th_motor"), "halpha"
+        )
+
+        # The display LiveScan is reused when a different processed result is
+        # browsed.  Model that projection directly: it is display state, not
+        # authorization to rewrite the Controls-owned next-run intent.
+        widget.scan.gi = False
+        widget.scan.gi_config = {}
+        widget.scan.incidence_motor = "display_only_motor"
+        widget.scan.sample_orientation = 8
+        widget.scan.tilt_angle = 12.5
+        widget._refresh_controls_v2_profile_now()
+
+        run_configuration = widget._prepare_controls_v2_run_configuration()
+        widget._apply_controls_v2_run_state(run_configuration)
+
+        assert run_configuration.gi.enabled is True
+        assert run_configuration.gi.incidence_motor == "halpha"
+        assert run_configuration.gi.sample_orientation == 4
+        assert run_configuration.gi.tilt_angle == 0.0
+        assert widget.scan.gi is True
+        assert widget.scan.gi_config["incidence_motor"] == "halpha"
+        assert widget.wrangler.run_configuration is run_configuration
+        assert widget.wrangler.thread.run_configuration is run_configuration
     finally:
         widget.close()
         widget.deleteLater()

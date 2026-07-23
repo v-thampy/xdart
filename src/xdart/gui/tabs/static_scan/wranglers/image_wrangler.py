@@ -23,6 +23,7 @@ from xrd_tools.io.metadata import read_image_metadata
 from xrd_tools.session.readiness import (
     append_config_difference_lines,
     append_config_mismatch_check,
+    processing_config_from_mapping,
     processing_config_from_scan,
 )
 # ``_extract_scan_info`` is a private helper but the wrangler uses it
@@ -269,6 +270,7 @@ class imageWrangler(wranglerWidget):
         self.motors = []
         self.command = None
         self.scan = scan
+        self.run_configuration = None
         # H19: immutable Source-card baseline + serialized headless index owner.
         # Populated immediately before setup() for container-directory runs.
         self.source_run_plan = None
@@ -1146,9 +1148,14 @@ class imageWrangler(wranglerWidget):
             # this run would append to, use its already-restored reduction config.
             processed = processing_config_from_scan(scan, prefer_stored=True)
 
-        if processed is None or scan is None:
+        run_configuration = getattr(self, "run_configuration", None)
+        if processed is None or (scan is None and run_configuration is None):
             return None, None, None
-        current = processing_config_from_scan(scan)
+        if run_configuration is not None:
+            current = processing_config_from_mapping(
+                run_configuration.processing_mapping())
+        else:
+            current = processing_config_from_scan(scan)
         check = append_config_mismatch_check(
             write_mode,
             processed,
@@ -1675,6 +1682,17 @@ class imageWrangler(wranglerWidget):
     def start(self):
         # Refuse to run without a valid PONI rather than re-running the stale
         # previous scan.  Honors the Live/Batch mode toggles (no force-off).
+        host = getattr(self, "_h19_host", None)
+        prepare = getattr(
+            host, "_prepare_controls_v2_run_configuration", None)
+        if callable(prepare):
+            try:
+                prepare()
+            except Exception as exc:
+                logger.exception("could not freeze Controls run configuration")
+                imageWrangler._safe_status_text(
+                    self, f"Run configuration is invalid: {exc}")
+                return
         if not self._inputs_valid():
             return
         if getattr(self, 'stitch_mode', False):

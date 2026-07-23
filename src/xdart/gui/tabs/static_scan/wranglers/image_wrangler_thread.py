@@ -689,6 +689,7 @@ class imageThread(wranglerThread):
         self.max_cores = max_cores
         self.command = command
         self.scan = scan
+        self.run_configuration = None
         # H19: supplied by the mounted Source card immediately before Run.
         # Both are value/headless boundaries; the mutable DirectoryIndex stays
         # owned by DirectoryIndexSession's serialized executor.

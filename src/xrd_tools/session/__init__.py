@@ -35,6 +35,14 @@ __all__ = [
     "wavelength_evidence",
     "display_capabilities",
     "project_frame",
+    # Immutable run-boundary configuration values (headless):
+    "GIIntent",
+    "ThresholdIntent",
+    "RunIntent",
+    "FrozenGIConfiguration",
+    "FrozenThresholdPolicy",
+    "FrozenSourceSpec",
+    "FrozenRunConfiguration",
 ]
 
 _SCAN_SESSION_EXPORTS = {
@@ -64,6 +72,16 @@ _FRAME_PROJECTION_EXPORTS = {
     "project_frame",
 }
 
+_RUN_CONFIGURATION_EXPORTS = {
+    "GIIntent",
+    "ThresholdIntent",
+    "RunIntent",
+    "FrozenGIConfiguration",
+    "FrozenThresholdPolicy",
+    "FrozenSourceSpec",
+    "FrozenRunConfiguration",
+}
+
 
 def __getattr__(name: str) -> Any:
     if name == "FrameRecordStore":
@@ -72,6 +90,8 @@ def __getattr__(name: str) -> Any:
         value = getattr(import_module("xrd_tools.session.scan_session"), name)
     elif name in _FRAME_PROJECTION_EXPORTS:
         value = getattr(import_module("xrd_tools.session.frame_projection"), name)
+    elif name in _RUN_CONFIGURATION_EXPORTS:
+        value = getattr(import_module("xrd_tools.session.run_configuration"), name)
     else:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     globals()[name] = value

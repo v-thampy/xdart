@@ -210,6 +210,12 @@ from xdart.modules.frame_publication import (
 from xrd_tools.core import browse_publication_max_items
 from xrd_tools.core.energy import normalize_wavelength_m, wavelength_m_to_energy_eV
 from xrd_tools.core.scan import SourceKind, SourceSpec
+from xrd_tools.session.run_configuration import (
+    FrozenRunConfiguration,
+    GIIntent,
+    RunIntent,
+    ThresholdIntent,
+)
 from xrd_tools.sources.readiness import (
     capabilities_for_processed,
     describe_source_readiness,
@@ -990,6 +996,86 @@ class staticWidget(QWidget):
         value = os.environ.get("XDART_CONTROLS_PANEL_V2", "1")
         return str(value).strip().lower() not in {"0", "false", "no", "off"}
 
+    def _controls_v2_ensure_run_intent(self) -> RunIntent:
+        """Return the Controls-owned mutable intent for the next run.
+
+        ``self.scan`` is also the browser/display scan and may be replaced or
+        hydrated while the operator is paused.  It is therefore only a seed at
+        Controls construction time, never the long-lived owner of editable run
+        settings.
+        """
+
+        intent = getattr(self, "_controls_v2_run_intent", None)
+        if isinstance(intent, RunIntent):
+            return intent
+
+        scan = getattr(self, "scan", None)
+        a1 = copy.deepcopy(getattr(scan, "bai_1d_args", {}) or {})
+        a2 = copy.deepcopy(getattr(scan, "bai_2d_args", {}) or {})
+        gic = copy.deepcopy(getattr(scan, "gi_config", {}) or {})
+        motor = gic.get("incidence_motor")
+        th_val = self._controls_v2_float(gic.get("th_val", 0.1), 0.1)
+        if motor in (None, ""):
+            motor = getattr(scan, "incidence_motor", None)
+        if motor not in (None, ""):
+            try:
+                th_val = float(motor)
+                motor = "Manual"
+            except (TypeError, ValueError):
+                motor = str(motor)
+        else:
+            motor = "Manual"
+
+        controls = getattr(self, "controls", None)
+        mode_getter = getattr(controls, "current_mode", None)
+        try:
+            processing_mode = str(mode_getter())
+        except Exception:
+            processing_mode = "Int 2D"
+        if not processing_mode:
+            processing_mode = "Int 2D"
+
+        intent = RunIntent(
+            processing_mode=processing_mode,
+            bai_1d_args=a1,
+            bai_2d_args=a2,
+            gi=GIIntent(
+                enabled=bool(getattr(scan, "gi", False) or gic),
+                incidence_motor=str(motor),
+                th_val=th_val,
+                sample_orientation=self._controls_v2_int(
+                    gic.get(
+                        "sample_orientation",
+                        getattr(scan, "sample_orientation", 4),
+                    ),
+                    4,
+                ),
+                tilt_angle=self._controls_v2_float(
+                    gic.get("tilt_angle", getattr(scan, "tilt_angle", 0.0)),
+                    0.0,
+                ),
+                mode_1d=str(a1.get("gi_mode_1d", "q_total")),
+                mode_2d=str(a2.get("gi_mode_2d", "qip_qoop")),
+            ),
+            threshold=ThresholdIntent(
+                apply_threshold=bool(
+                    getattr(scan, "apply_threshold", False)),
+                threshold_min=self._controls_v2_float(
+                    getattr(scan, "threshold_min", 0.0), 0.0),
+                threshold_max=self._controls_v2_float(
+                    getattr(scan, "threshold_max", 0.0), 0.0),
+                mask_saturation=bool(
+                    getattr(scan, "mask_sentinel", True)),
+            ),
+        )
+        self._controls_v2_run_intent = intent
+        # A restored/session motor is deliberate.  A fresh LiveScan default is
+        # not: when metadata later supplies ``halpha``/``th`` the existing
+        # default-selection policy may adopt it as GI is enabled.
+        self._controls_v2_gi_selection_explicit = bool(gic)
+        self._controls_v2_threshold_state = intent.threshold.freeze().as_dict()
+        return intent
+
     def _init_controls_v2_preview(self) -> None:
         """Mount the Controls Panel V2 editor.
 
@@ -1060,6 +1146,7 @@ class staticWidget(QWidget):
         integrator = getattr(self, "integratorTree", None)
         if integrator is None:
             return
+        self._controls_v2_ensure_run_intent()
         integrator._controls_v2_native_args = True
         integrator.get_gi_config = self._controls_v2_gi_config
         integrator.get_threshold_config = self._controls_v2_threshold_config
@@ -1261,17 +1348,12 @@ class staticWidget(QWidget):
 
     def _controls_v2_threshold_config(self):
         state = getattr(self, "_controls_v2_threshold_state", None)
-        scan = getattr(self, "scan", None)
         if not isinstance(state, dict):
-            state = {
-                "apply_threshold": bool(getattr(scan, "apply_threshold", False)),
-                "threshold_min": self._controls_v2_float(
-                    getattr(scan, "threshold_min", 0.0), 0.0),
-                "threshold_max": self._controls_v2_float(
-                    getattr(scan, "threshold_max", 0.0), 0.0),
-                "mask_saturation": bool(getattr(scan, "mask_sentinel", True)),
-            }
+            state = self._controls_v2_ensure_run_intent().threshold.freeze(
+            ).as_dict()
             self._controls_v2_threshold_state = state
+        intent = self._controls_v2_ensure_run_intent()
+        intent.threshold = ThresholdIntent.from_mapping(state)
         return ThresholdSaturationConfig(
             apply_threshold=bool(state.get("apply_threshold", False)),
             threshold_min=self._controls_v2_float(
@@ -1302,6 +1384,9 @@ class staticWidget(QWidget):
         ):
             state["apply_threshold"] = True
         self._controls_v2_threshold_state = state
+        self._controls_v2_ensure_run_intent().threshold = (
+            ThresholdIntent.from_mapping(state)
+        )
         scan = getattr(self, "scan", None)
         if scan is not None:
             for attr, key in (
@@ -1327,14 +1412,12 @@ class staticWidget(QWidget):
         return pick_default_gi_motor([c for c in choices if str(c) != "Manual"])
 
     def _controls_v2_gi_config(self) -> dict:
-        scan = getattr(self, "scan", None)
+        intent = self._controls_v2_ensure_run_intent()
         a1, a2 = self._controls_v2_scan_int_args()
-        gic = dict(getattr(scan, "gi_config", {}) or {})
-        gi = bool(getattr(scan, "gi", False)) or bool(gic)
-        motor = gic.get("incidence_motor", None)
-        if motor is None:
-            motor = getattr(scan, "incidence_motor", None)
-        th_val = gic.get("th_val", 0.1)
+        gi_intent = intent.gi
+        gi = bool(gi_intent.enabled)
+        motor = gi_intent.incidence_motor
+        th_val = gi_intent.th_val
         if motor is None or str(motor) == "":
             motor = self._controls_v2_default_gi_motor()
         else:
@@ -1351,18 +1434,12 @@ class staticWidget(QWidget):
                 if motor != "Manual":
                     choices = self._controls_v2_native_int_choices().get(
                         ("GI", "th_motor"), ())
-                    if motor not in choices:
+                    real_choices = tuple(
+                        item for item in choices if str(item) != "Manual")
+                    if real_choices and motor not in choices:
                         motor = self._controls_v2_default_gi_motor()
-        sample_orientation = gic.get("sample_orientation", None)
-        if sample_orientation is None:
-            sample_orientation = getattr(scan, "sample_orientation", None)
-        if sample_orientation is None:
-            sample_orientation = 4
-        tilt_angle = gic.get("tilt_angle", None)
-        if tilt_angle is None:
-            tilt_angle = getattr(scan, "tilt_angle", None)
-        if tilt_angle is None:
-            tilt_angle = 0.0
+        sample_orientation = gi_intent.sample_orientation
+        tilt_angle = gi_intent.tilt_angle
         return {
             "gi": gi,
             "sample_orientation": self._controls_v2_int(sample_orientation, 4),
@@ -1403,8 +1480,7 @@ class staticWidget(QWidget):
 
     def _controls_v2_set_gi_field(self, leaf: str, value) -> None:
         scan = getattr(self, "scan", None)
-        if scan is None:
-            return
+        intent = self._controls_v2_ensure_run_intent()
         cfg = self._controls_v2_gi_config()
         if leaf == "Grazing":
             cfg["gi"] = self._controls_v2_bool(value)
@@ -1416,7 +1492,8 @@ class staticWidget(QWidget):
             # (th/halpha/…) wins.  A real saved gi_config (deliberate Manual
             # + its theta) is honored untouched.
             if (cfg["gi"] and cfg["incidence_motor"] == "Manual"
-                    and not dict(getattr(scan, "gi_config", {}) or {})):
+                    and not getattr(
+                        self, "_controls_v2_gi_selection_explicit", False)):
                 picked = self._controls_v2_default_gi_motor()
                 if picked != "Manual":
                     cfg["incidence_motor"] = picked
@@ -1430,28 +1507,30 @@ class staticWidget(QWidget):
                             combo.setCurrentIndex(idx)
         elif leaf == "th_motor":
             cfg["incidence_motor"] = str(value)
+            self._controls_v2_gi_selection_explicit = True
         elif leaf == "th_val":
             cfg["th_val"] = self._controls_v2_float(value, cfg.get("th_val", 0.1))
         elif leaf == "sample_orientation":
             cfg["sample_orientation"] = self._controls_v2_int(value, 4)
         elif leaf == "tilt_angle":
             cfg["tilt_angle"] = self._controls_v2_float(value, 0.0)
-        scan.gi = bool(cfg["gi"])
-        if scan.gi:
+        intent.gi = GIIntent(
+            enabled=bool(cfg["gi"]),
+            incidence_motor=str(cfg["incidence_motor"] or "Manual"),
+            th_val=float(cfg["th_val"] or 0.0),
+            sample_orientation=int(cfg["sample_orientation"] or 4),
+            tilt_angle=float(cfg["tilt_angle"] or 0.0),
+            mode_1d=str(cfg["gi_mode_1d"]),
+            mode_2d=str(cfg["gi_mode_2d"]),
+        )
+        if intent.gi.enabled:
             a1, a2 = self._controls_v2_scan_int_args()
             a1.setdefault("gi_mode_1d", "q_total")
             a2.setdefault("gi_mode_2d", "qip_qoop")
             a1["unit"] = "q_A^-1"
             a2["unit"] = "q_A^-1"
-        scan.gi_config = {
-            "gi_mode_1d": str(cfg["gi_mode_1d"]),
-            "gi_mode_2d": str(cfg["gi_mode_2d"]),
-            "incidence_motor": str(cfg["incidence_motor"] or ""),
-            "th_val": float(cfg["th_val"] or 0.0),
-            "tilt_angle": float(cfg["tilt_angle"] or 0.0),
-            "sample_orientation": int(cfg["sample_orientation"] or 4),
-        } if scan.gi else {}
-        self._controls_v2_apply_gi_config_to_scan()
+        if scan is not None:
+            self._controls_v2_apply_gi_config_to_scan(cfg)
 
     @staticmethod
     def _controls_v2_apply_native_int_snapshot_to_scan(
@@ -1559,7 +1638,19 @@ class staticWidget(QWidget):
         if commit_pending:
             self._commit_controls_v2_pending_edits()
         self._controls_v2_ensure_native_int_defaults()
-        self._controls_v2_apply_gi_config_to_scan()
+        self._controls_v2_apply_snapshot_to_scan(
+            self._controls_v2_native_int_snapshot()
+        )
+        threshold = self._controls_v2_threshold_config()
+        scan = getattr(self, "scan", None)
+        if scan is not None:
+            for attr, value in (
+                ("apply_threshold", threshold.apply_threshold),
+                ("threshold_min", threshold.threshold_min),
+                ("threshold_max", threshold.threshold_max),
+                ("mask_sentinel", threshold.mask_saturation),
+            ):
+                setattr(scan, attr, value)
         run_config_debug_log(
             logger,
             "native_int_scan_applied",
@@ -1597,26 +1688,29 @@ class staticWidget(QWidget):
         )
 
     def _controls_v2_native_int_snapshot(self) -> dict:
-        scan = getattr(self, "scan", None)
-        if scan is None:
-            return {}
+        intent = self._controls_v2_ensure_run_intent()
+        cfg = self._controls_v2_gi_config()
+        incidence = (
+            str(cfg["th_val"])
+            if cfg["incidence_motor"] == "Manual"
+            else str(cfg["incidence_motor"] or "")
+        )
         return {
-            "bai_1d_args": copy.deepcopy(
-                getattr(scan, "bai_1d_args", {}) or {}
-            ),
-            "bai_2d_args": copy.deepcopy(
-                getattr(scan, "bai_2d_args", {}) or {}
-            ),
-            "gi": bool(getattr(scan, "gi", False)),
-            "gi_config": copy.deepcopy(getattr(scan, "gi_config", {}) or {}),
-            "incidence_motor": copy.deepcopy(
-                getattr(scan, "incidence_motor", None)
-            ),
-            "th_mtr": copy.deepcopy(getattr(scan, "th_mtr", None)),
-            "sample_orientation": copy.deepcopy(
-                getattr(scan, "sample_orientation", None)
-            ),
-            "tilt_angle": copy.deepcopy(getattr(scan, "tilt_angle", None)),
+            "bai_1d_args": copy.deepcopy(intent.bai_1d_args),
+            "bai_2d_args": copy.deepcopy(intent.bai_2d_args),
+            "gi": bool(cfg["gi"]),
+            "gi_config": ({
+                "gi_mode_1d": str(cfg["gi_mode_1d"]),
+                "gi_mode_2d": str(cfg["gi_mode_2d"]),
+                "incidence_motor": str(cfg["incidence_motor"]),
+                "th_val": float(cfg["th_val"]),
+                "sample_orientation": int(cfg["sample_orientation"]),
+                "tilt_angle": float(cfg["tilt_angle"]),
+            } if cfg["gi"] else {}),
+            "incidence_motor": incidence,
+            "th_mtr": incidence,
+            "sample_orientation": int(cfg["sample_orientation"]),
+            "tilt_angle": float(cfg["tilt_angle"]),
         }
 
     @staticmethod
@@ -1650,22 +1744,12 @@ class staticWidget(QWidget):
         return value
 
     def _controls_v2_scan_int_args(self):
-        scan = getattr(self, "scan", None)
-        if scan is None:
-            return {}, {}
-        lock = getattr(scan, "scan_lock", None)
-
-        def _ensure():
-            if not isinstance(getattr(scan, "bai_1d_args", None), dict):
-                scan.bai_1d_args = {}
-            if not isinstance(getattr(scan, "bai_2d_args", None), dict):
-                scan.bai_2d_args = {}
-            return scan.bai_1d_args, scan.bai_2d_args
-
-        if lock is None:
-            return _ensure()
-        with lock:
-            return _ensure()
+        intent = self._controls_v2_ensure_run_intent()
+        if not isinstance(intent.bai_1d_args, dict):
+            intent.bai_1d_args = {}
+        if not isinstance(intent.bai_2d_args, dict):
+            intent.bai_2d_args = {}
+        return intent.bai_1d_args, intent.bai_2d_args
 
     def _controls_v2_ensure_native_int_defaults(self) -> None:
         a1, a2 = self._controls_v2_scan_int_args()
@@ -1977,7 +2061,7 @@ class staticWidget(QWidget):
     def _controls_v2_native_int_choices(self):
         integrator = getattr(self, "integratorTree", None)
         ui = getattr(integrator, "ui", None)
-        gi = bool(getattr(getattr(self, "scan", None), "gi", False))
+        gi = bool(self._controls_v2_ensure_run_intent().gi.enabled)
 
         def _combo_choices(name):
             combo = getattr(ui, name, None)
@@ -2162,23 +2246,188 @@ class staticWidget(QWidget):
         elif leaf == "method":
             args["method"] = str(value)
             self._controls_v2_sync_advanced_parameter(path)
+        # Compatibility/display projection only.  The Controls-owned intent
+        # remains authoritative, but existing reintegration and preview paths
+        # expect edits to appear on the shared scan immediately.
+        self._controls_v2_apply_snapshot_to_scan(
+            self._controls_v2_native_int_snapshot()
+        )
         return True
 
-    def _apply_controls_v2_run_state(self) -> dict:
-        """Apply native Controls V2 Int state and snapshot args for this run."""
-        self._apply_controls_v2_native_int_state(
-            commit_pending=True,
-            push_wrangler=True,
-        )
-        args = {
-            'bai_1d_args': copy.deepcopy(
-                getattr(self.scan, 'bai_1d_args', {}) or {}
-            ),
-            'bai_2d_args': copy.deepcopy(
-                getattr(self.scan, 'bai_2d_args', {}) or {}
-            ),
+    @staticmethod
+    def _controls_v2_frozen_native_snapshot(
+        run_configuration: FrozenRunConfiguration,
+    ) -> dict:
+        gi = run_configuration.gi
+        incidence = gi.scan_incidence_motor
+        return {
+            "bai_1d_args": run_configuration.bai_1d_args,
+            "bai_2d_args": run_configuration.bai_2d_args,
+            "gi": bool(gi.enabled),
+            "gi_config": gi.scan_config(),
+            "incidence_motor": incidence,
+            "th_mtr": incidence,
+            "sample_orientation": int(gi.sample_orientation),
+            "tilt_angle": float(gi.tilt_angle),
         }
-        self.wrangler.scan_args = args
+
+    def _controls_v2_apply_run_configuration_to_scan(
+        self,
+        run_configuration: FrozenRunConfiguration,
+        scan=None,
+    ) -> None:
+        """Project one immutable run value into a mutable ``LiveScan``."""
+
+        scan = scan if scan is not None else getattr(self, "scan", None)
+        if scan is None:
+            return
+        self._controls_v2_apply_native_int_snapshot_to_scan(
+            self._controls_v2_frozen_native_snapshot(run_configuration),
+            scan,
+        )
+        scan.skip_2d = bool(run_configuration.skip_2d)
+        scan.max_cores = int(run_configuration.max_cores)
+        scan.apply_threshold = bool(
+            run_configuration.threshold.apply_threshold)
+        scan.threshold_min = run_configuration.threshold.threshold_min
+        scan.threshold_max = run_configuration.threshold.threshold_max
+        scan.mask_sentinel = bool(
+            run_configuration.threshold.mask_saturation)
+        scan.run_configuration_generation = int(
+            run_configuration.generation)
+        scan.run_configuration_fingerprint = run_configuration.fingerprint
+        scan.run_configuration_provenance = (
+            run_configuration.as_provenance()
+        )
+
+    def _prepare_controls_v2_run_configuration(
+        self,
+    ) -> FrozenRunConfiguration | None:
+        """Freeze the next run before validation touches mutable GUI state."""
+
+        if not self._controls_v2_enabled():
+            return None
+        self._commit_controls_v2_pending_edits()
+        self._controls_v2_ensure_native_int_defaults()
+        intent = self._controls_v2_ensure_run_intent()
+        controls = getattr(self, "controls", None)
+        wrangler = getattr(self, "wrangler", None)
+
+        mode_getter = getattr(controls, "current_mode", None)
+        try:
+            intent.processing_mode = str(mode_getter())
+        except Exception:
+            intent.processing_mode = str(
+                getattr(wrangler, "viewer_mode", "") or "Int 2D")
+        write_mode = getattr(controls, "write_mode", None)
+        try:
+            intent.output_mode = str(write_mode())
+        except Exception:
+            active_mode = getattr(wrangler, "_active_write_mode", None)
+            intent.output_mode = (
+                str(active_mode()) if callable(active_mode) else "Append")
+        intent.live_mode = bool(
+            getattr(getattr(controls, "liveButton", None),
+                    "isChecked", lambda: False)())
+        intent.batch_mode = bool(
+            getattr(getattr(controls, "batchButton", None),
+                    "isChecked", lambda: False)())
+        intent.max_cores = max(
+            1,
+            int(getattr(
+                getattr(controls, "coresSpin", None),
+                "value",
+                lambda: 1,
+            )()),
+        )
+        intent.source_spec = self._controls_v2_freeze_source_spec()
+        intent.poni_file = str(
+            self._controls_v2_param_value(("Signal", "poni_file"))
+            or self._controls_v2_param_value(("Calibration", "poni_file"))
+            or getattr(wrangler, "poni_file", "")
+            or ""
+        )
+        intent.mask_file = str(
+            self._controls_v2_param_value(("Signal", "mask_file")) or "")
+        intent.project_root = str(
+            self._controls_v2_param_value(
+                ("Project", "project_folder")) or "")
+        intent.save_path = str(
+            self._controls_v2_param_value(("Project", "h5_dir")) or "")
+        intent.gi.mode_1d = str(
+            intent.bai_1d_args.get("gi_mode_1d", "q_total"))
+        intent.gi.mode_2d = str(
+            intent.bai_2d_args.get("gi_mode_2d", "qip_qoop"))
+        intent.run_options = {
+            "xye_only": "XYE" in intent.processing_mode,
+        }
+
+        frozen = intent.freeze()
+        self._pending_controls_v2_run_configuration = frozen
+        if wrangler is not None:
+            wrangler.run_configuration = frozen
+            wrangler.source_spec = frozen.thaw_source_spec()
+            thread = getattr(wrangler, "thread", None)
+            if thread is not None:
+                thread.run_configuration = frozen
+        return frozen
+
+    def _apply_controls_v2_run_state(
+        self,
+        run_configuration: FrozenRunConfiguration | None = None,
+    ) -> dict:
+        """Apply exactly one frozen Controls configuration to every run owner."""
+
+        if run_configuration is None:
+            run_configuration = getattr(
+                self, "_pending_controls_v2_run_configuration", None)
+        if not isinstance(run_configuration, FrozenRunConfiguration):
+            run_configuration = self._prepare_controls_v2_run_configuration()
+        if not isinstance(run_configuration, FrozenRunConfiguration):
+            return {}
+
+        self._controls_v2_apply_run_configuration_to_scan(run_configuration)
+        self._push_threshold_to_wrangler(run_configuration)
+        self._push_gi_to_wrangler(run_configuration)
+
+        args = run_configuration.scan_args()
+        wrangler = getattr(self, "wrangler", None)
+        if wrangler is not None:
+            wrangler.run_configuration = run_configuration
+            wrangler.scan_args = args
+            wrangler.gi = bool(run_configuration.gi.enabled)
+            wrangler.incidence_motor = (
+                run_configuration.gi.scan_incidence_motor)
+            wrangler.sample_orientation = int(
+                run_configuration.gi.sample_orientation)
+            wrangler.tilt_angle = float(run_configuration.gi.tilt_angle)
+            wrangler.apply_threshold = bool(
+                run_configuration.threshold.apply_threshold)
+            wrangler.threshold_min = (
+                run_configuration.threshold.threshold_min)
+            wrangler.threshold_max = (
+                run_configuration.threshold.threshold_max)
+            wrangler.mask_sentinel = bool(
+                run_configuration.threshold.mask_saturation)
+            thread = getattr(wrangler, "thread", None)
+            if thread is not None:
+                thread.run_configuration = run_configuration
+                thread.scan_args = run_configuration.scan_args()
+                thread.gi = bool(run_configuration.gi.enabled)
+                thread.incidence_motor = (
+                    run_configuration.gi.scan_incidence_motor)
+                thread.sample_orientation = int(
+                    run_configuration.gi.sample_orientation)
+                thread.tilt_angle = float(
+                    run_configuration.gi.tilt_angle)
+                thread.apply_threshold = bool(
+                    run_configuration.threshold.apply_threshold)
+                thread.threshold_min = (
+                    run_configuration.threshold.threshold_min)
+                thread.threshold_max = (
+                    run_configuration.threshold.threshold_max)
+                thread.mask_sentinel = bool(
+                    run_configuration.threshold.mask_saturation)
         return args
 
     def _controls_v2_int_session_state(self) -> dict:
@@ -2187,7 +2436,7 @@ class staticWidget(QWidget):
         if not getattr(self, "_tearing_down", False):
             self._commit_controls_v2_pending_edits()
         self._controls_v2_ensure_native_int_defaults()
-        self._controls_v2_apply_gi_config_to_scan()
+        snapshot = self._controls_v2_native_int_snapshot()
 
         cfg = self._controls_v2_threshold_config()
         threshold = {
@@ -2197,16 +2446,11 @@ class staticWidget(QWidget):
             "mask_saturation": bool(cfg.mask_saturation),
         }
 
-        scan = getattr(self, "scan", None)
         return {
-            "bai_1d_args": copy.deepcopy(
-                getattr(scan, "bai_1d_args", {}) or {}
-            ),
-            "bai_2d_args": copy.deepcopy(
-                getattr(scan, "bai_2d_args", {}) or {}
-            ),
-            "gi_config": copy.deepcopy(getattr(scan, "gi_config", {}) or {}),
-            "gi": bool(getattr(scan, "gi", False)),
+            "bai_1d_args": copy.deepcopy(snapshot["bai_1d_args"]),
+            "bai_2d_args": copy.deepcopy(snapshot["bai_2d_args"]),
+            "gi_config": copy.deepcopy(snapshot["gi_config"]),
+            "gi": bool(snapshot["gi"]),
             "threshold_config": threshold,
         }
 
@@ -2215,20 +2459,39 @@ class staticWidget(QWidget):
 
         if not isinstance(data, dict):
             return False
-        scan = getattr(self, "scan", None)
-        if scan is None:
-            return False
+        intent = self._controls_v2_ensure_run_intent()
         try:
-            with scan.scan_lock:
-                a1 = data.get("bai_1d_args")
-                a2 = data.get("bai_2d_args")
-                if isinstance(a1, dict):
-                    scan.bai_1d_args = copy.deepcopy(a1)
-                if isinstance(a2, dict):
-                    scan.bai_2d_args = copy.deepcopy(a2)
-                scan.gi = bool(data.get("gi", getattr(scan, "gi", False)))
-                gic = data.get("gi_config")
-                scan.gi_config = copy.deepcopy(gic) if isinstance(gic, dict) else {}
+            a1 = data.get("bai_1d_args")
+            a2 = data.get("bai_2d_args")
+            if isinstance(a1, dict):
+                intent.bai_1d_args = copy.deepcopy(a1)
+            if isinstance(a2, dict):
+                intent.bai_2d_args = copy.deepcopy(a2)
+            gic = data.get("gi_config")
+            gic = copy.deepcopy(gic) if isinstance(gic, dict) else {}
+            intent.gi = GIIntent(
+                enabled=bool(data.get("gi", bool(gic))),
+                incidence_motor=str(
+                    gic.get("incidence_motor", "Manual") or "Manual"),
+                th_val=self._controls_v2_float(gic.get("th_val", 0.1), 0.1),
+                sample_orientation=self._controls_v2_int(
+                    gic.get("sample_orientation", 4), 4),
+                tilt_angle=self._controls_v2_float(
+                    gic.get("tilt_angle", 0.0), 0.0),
+                mode_1d=str(
+                    gic.get(
+                        "gi_mode_1d",
+                        intent.bai_1d_args.get("gi_mode_1d", "q_total"),
+                    )
+                ),
+                mode_2d=str(
+                    gic.get(
+                        "gi_mode_2d",
+                        intent.bai_2d_args.get("gi_mode_2d", "qip_qoop"),
+                    )
+                ),
+            )
+            self._controls_v2_gi_selection_explicit = bool(gic)
         except Exception:
             logger.debug("Controls V2 native Int scan restore failed",
                          exc_info=True)
@@ -2246,17 +2509,20 @@ class staticWidget(QWidget):
                     threshold.get("threshold_max", 0.0), 0.0),
                 "mask_saturation": bool(threshold.get("mask_saturation", True)),
             }
+            intent.threshold = ThresholdIntent.from_mapping(
+                self._controls_v2_threshold_state
+            )
             cfg = self._controls_v2_threshold_config()
-            for attr, value in (
-                ("apply_threshold", cfg.apply_threshold),
-                ("threshold_min", cfg.threshold_min),
-                ("threshold_max", cfg.threshold_max),
-                ("mask_sentinel", cfg.mask_saturation),
-            ):
-                try:
-                    setattr(scan, attr, value)
-                except Exception:
-                    pass
+        self._controls_v2_apply_snapshot_to_scan(
+            self._controls_v2_native_int_snapshot()
+        )
+        scan = getattr(self, "scan", None)
+        if scan is not None:
+            cfg = self._controls_v2_threshold_config()
+            scan.apply_threshold = cfg.apply_threshold
+            scan.threshold_min = cfg.threshold_min
+            scan.threshold_max = cfg.threshold_max
+            scan.mask_sentinel = cfg.mask_saturation
 
         self._refresh_controls_v2_profile(immediate=True)
         return True
@@ -3031,7 +3297,9 @@ class staticWidget(QWidget):
             )
         except Exception:
             gi_cfg = {}
-        gi_on = bool(gi_cfg.get("gi", getattr(self.scan, "gi", False)))
+        display_scan = getattr(self, "scan", None)
+        gi_on = bool(
+            gi_cfg.get("gi", getattr(display_scan, "gi", False)))
         meas_mode = MeasMode.GI if gi_on else MeasMode.STANDARD
 
         loaded_frame_count = 0
@@ -5045,7 +5313,31 @@ class staticWidget(QWidget):
             logger.debug("could not surface reintegration write failure",
                          exc_info=True)
 
-    def _push_threshold_to_wrangler(self):
+    @staticmethod
+    def _mirror_wrangler_parameter_values(parameters, values) -> None:
+        """Mirror value-only run config into the hidden compatibility tree.
+
+        The tree's root signal owns ``imageWrangler.setup()``.  Blocking that
+        root for the whole transaction makes these hidden parameters output
+        adapters: a mirror cannot synchronously re-enter setup and reread a
+        half-updated run configuration.
+        """
+        if parameters is None:
+            return
+        previous = parameters.blockSignals(True)
+        try:
+            for path, value in values:
+                try:
+                    parameter = parameters.child(*path)
+                    if parameter.value() != value:
+                        parameter.setValue(value)
+                except Exception:
+                    # Wrangler schemas are intentionally heterogeneous.
+                    continue
+        finally:
+            parameters.blockSignals(previous)
+
+    def _push_threshold_to_wrangler(self, run_configuration=None):
         """Inject the native V2 pixel-rejection policy into the active
         wrangler setup params so live and reintegrate share one policy.
 
@@ -5056,9 +5348,13 @@ class staticWidget(QWidget):
         """
         try:
             cfg = (
-                self._controls_v2_threshold_config()
-                if self._controls_v2_enabled()
-                else self.integratorTree.get_threshold_config()
+                run_configuration.threshold
+                if run_configuration is not None
+                else (
+                    self._controls_v2_threshold_config()
+                    if self._controls_v2_enabled()
+                    else self.integratorTree.get_threshold_config()
+                )
             )
         except Exception:
             # Fail LOUD: silently falling back means the LIVE run applies the
@@ -5075,25 +5371,36 @@ class staticWidget(QWidget):
         if params is None:
             return
 
-        def _set(group, child, value):
-            try:
-                params.child(group).child(child).setValue(value)
-            except Exception:
-                pass  # wrangler lacks this group (e.g. NeXus has no 'Mask')
+        self._mirror_wrangler_parameter_values(
+            params,
+            (
+                (("Mask", "Threshold"), bool(cfg.apply_threshold)),
+                (("Mask", "min"), cfg.threshold_min),
+                (("Mask", "max"), cfg.threshold_max),
+                (("MaskSat", "mask_sentinel"), bool(cfg.mask_saturation)),
+            ),
+        )
 
-        _set('Mask', 'Threshold', bool(cfg.apply_threshold))
-        _set('Mask', 'min', cfg.threshold_min)
-        _set('Mask', 'max', cfg.threshold_max)
-        _set('MaskSat', 'mask_sentinel', bool(cfg.mask_saturation))
-
-    def _push_gi_to_wrangler(self):
+    def _push_gi_to_wrangler(self, run_configuration=None):
         """Inject the native V2 GI geometry into the active wrangler setup params."""
         try:
-            cfg = (
-                self._controls_v2_gi_config()
-                if self._controls_v2_enabled()
-                else self.integratorTree.get_gi_config()
-            )
+            if run_configuration is not None:
+                frozen_gi = run_configuration.gi
+                cfg = {
+                    "gi": bool(frozen_gi.enabled),
+                    "sample_orientation": int(
+                        frozen_gi.sample_orientation),
+                    "tilt_angle": float(frozen_gi.tilt_angle),
+                    "incidence_motor": str(
+                        frozen_gi.incidence_motor),
+                    "th_val": float(frozen_gi.th_val),
+                }
+            else:
+                cfg = (
+                    self._controls_v2_gi_config()
+                    if self._controls_v2_enabled()
+                    else self.integratorTree.get_gi_config()
+                )
         except Exception:
             # Fail LOUD: a silent fallback means the LIVE run uses the wrangler's
             # default GI geometry instead of the integrator's (quiet divergence).
@@ -5106,17 +5413,17 @@ class staticWidget(QWidget):
         if params is None or cfg is None:
             return
 
-        def _set(group, child, value):
-            try:
-                params.child(group).child(child).setValue(value)
-            except Exception:
-                pass  # wrangler lacks this group/child
-
-        _set('GI', 'Grazing', bool(cfg['gi']))
-        _set('GI', 'sample_orientation', int(cfg['sample_orientation']))
-        _set('GI', 'tilt_angle', float(cfg['tilt_angle']))
-        _set('GI', 'th_motor', str(cfg['incidence_motor']))
-        _set('GI', 'th_val', str(cfg['th_val']))
+        self._mirror_wrangler_parameter_values(
+            params,
+            (
+                (("GI", "Grazing"), bool(cfg["gi"])),
+                (("GI", "sample_orientation"),
+                 int(cfg["sample_orientation"])),
+                (("GI", "tilt_angle"), float(cfg["tilt_angle"])),
+                (("GI", "th_motor"), str(cfg["incidence_motor"])),
+                (("GI", "th_val"), str(cfg["th_val"])),
+            ),
+        )
 
     def _init_wranglers(self):
         """Initialize the wrangler stack and select the default wrangler."""
