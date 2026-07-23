@@ -2721,6 +2721,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             # area too aggressively and made browsed cakes look oversaturated.
             linear_percentiles=(2, 98) if role is PanelRole.RAW_2D
             else (0.5, 99.5),
+            # Sparse cakes can put both requested percentiles at zero.
+            # Detector previews retain their historical percentile contract;
+            # only cakes may widen a degenerate range to their finite extent.
+            expand_degenerate_levels=(role is PanelRole.CAKE_2D),
         )
         widget.setRect(rect)
         if role is not PanelRole.RAW_2D:
@@ -2843,47 +2847,78 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     @staticmethod
     def _trim_view_to_data(widget, image, x, y):
-        """Set the view range to the non-dummy data extent (display only).
+        """Fit the view to the complete finite rendered extent (display only).
 
         Skipped when the user has zoomed (auto-range off) so it never fights
-        manual navigation; with auto-range on it replaces the full-rect
-        autoscale that left e.g. a GI q-chi cake half empty."""
+        manual navigation.  The fit must not depend on which intensity bins are
+        positive: sparse support moves between live frames and previously made
+        the cake zoom to a different island on every render.  NaN-only padding
+        remains outside the view, preserving the physical GI wedge."""
         try:
             vb = widget.image_plot.getViewBox()
             auto = vb.autoRangeEnabled()
-            if not (auto[0] or auto[1]):
-                # Auto-range is off: either the USER zoomed (respect it) or it
-                # is just OUR previous trim -- setRange() itself disables
-                # auto-range, so without this check the first trim froze the
-                # view forever and an axis-KIND change (e.g. transmission q-chi
-                # -> GI qip-qoop) kept the stale window instead of rescaling.
-                last = getattr(widget, '_cake_trim_view', None)
-                cur = vb.viewRange()
+            last = getattr(widget, '_cake_trim_view', None)
+            # Older widget instances have only the two-axis range marker; both
+            # axes were owned by the prior implementation in that state.
+            owned = getattr(
+                widget, '_cake_trim_owned_axes',
+                (last is not None, last is not None))
+            cur = vb.viewRange()
 
-                def _same(a, b):
-                    return all(
-                        abs(p - q) <= 1e-9 + 1e-6 * max(abs(p), abs(q))
-                        for pa, pb in zip(a, b) for p, q in zip(pa, pb)
-                    )
+            def _same_axis(a, b):
+                return all(
+                    abs(p - q) <= 1e-9 + 1e-6 * max(abs(p), abs(q))
+                    for p, q in zip(a, b)
+                )
 
-                if last is None or not _same(cur, last):
-                    return                  # genuine user navigation
-            has = np.isfinite(image) & (image > 0)
-            if not has.any():
+            # setRange() disables auto-range on the axis it fits.  Re-fit an
+            # axis only if it is still automatic or if its current range is
+            # exactly the range this helper last owned.  This axis-by-axis
+            # check preserves an x-only or y-only user zoom.
+            fit_x = bool(auto[0]) or bool(
+                last is not None and owned[0]
+                and _same_axis(cur[0], last[0]))
+            fit_y = bool(auto[1]) or bool(
+                last is not None and owned[1]
+                and _same_axis(cur[1], last[1]))
+            if not (fit_x or fit_y):
                 return
-            x_idx = np.where(has.any(axis=1))[0]   # image is (x, y)
-            y_idx = np.where(has.any(axis=0))[0]
-            pad = 2                                # bins of margin
-            x_lo = float(x[max(0, x_idx[0] - pad)])
-            x_hi = float(x[min(len(x) - 1, x_idx[-1] + pad)])
-            y_lo = float(y[max(0, y_idx[0] - pad)])
-            y_hi = float(y[min(len(y) - 1, y_idx[-1] + pad)])
+            finite_x = np.asarray(x, dtype=float)
+            finite_x = finite_x[np.isfinite(finite_x)]
+            finite_y = np.asarray(y, dtype=float)
+            finite_y = finite_y[np.isfinite(finite_y)]
+            if not finite_x.size or not finite_y.size:
+                return
+            finite_data = np.isfinite(np.asarray(image))
+            if (finite_data.ndim == 2
+                    and finite_data.shape == (len(x), len(y))
+                    and finite_data.any()):
+                finite_data &= np.isfinite(np.asarray(x))[:, None]
+                finite_data &= np.isfinite(np.asarray(y))[None, :]
+                x_idx = np.flatnonzero(finite_data.any(axis=1))
+                y_idx = np.flatnonzero(finite_data.any(axis=0))
+                if not x_idx.size or not y_idx.size:
+                    return
+                pad = 2
+                x_lo = float(x[max(0, int(x_idx[0]) - pad)])
+                x_hi = float(x[min(len(x) - 1, int(x_idx[-1]) + pad)])
+                y_lo = float(y[max(0, int(y_idx[0]) - pad)])
+                y_hi = float(y[min(len(y) - 1, int(y_idx[-1]) + pad)])
+            else:
+                # Shape-mismatched duck hosts retain the safe full-axis fit.
+                x_lo, x_hi = float(np.min(finite_x)), float(np.max(finite_x))
+                y_lo, y_hi = float(np.min(finite_y)), float(np.max(finite_y))
             if x_hi > x_lo and y_hi > y_lo:
-                vb.setRange(xRange=(x_lo, x_hi), yRange=(y_lo, y_hi),
-                            padding=0.02)
-                # Remember what WE set so the next render can tell our trim
+                ranges = {}
+                if fit_x:
+                    ranges["xRange"] = (x_lo, x_hi)
+                if fit_y:
+                    ranges["yRange"] = (y_lo, y_hi)
+                vb.setRange(padding=0.02, **ranges)
+                # Remember what WE set so the next render can tell our fit
                 # apart from a user zoom.
                 widget._cake_trim_view = [list(r) for r in vb.viewRange()]
+                widget._cake_trim_owned_axes = (fit_x, fit_y)
         except Exception:
             logger.debug("cake view trim skipped", exc_info=True)
 

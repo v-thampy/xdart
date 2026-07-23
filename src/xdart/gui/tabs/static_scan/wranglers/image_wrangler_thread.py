@@ -210,6 +210,7 @@ _CONTAINER_READY_RETRY = _env_float(
     "XDART_CONTAINER_READY_RETRY", 0.5, 0.05, 5.0)
 _CONTAINER_READY_DEADLINE = _env_float(
     "XDART_CONTAINER_READY_DEADLINE", 30.0, 1.0, 600.0)
+_APPEND_CURSOR_MEMO_LIMIT = 1024
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -550,10 +551,11 @@ class imageThread(wranglerThread):
     # stopping cleanly): carries the user-facing message for the GUI's
     # one-modal warning + status text — see _handle_append_config_mismatch.
     sigAppendMismatch = Qt.QtCore.Signal(str)
-    # DIR-2 lazy convergence: (path, nframes) as each container is opened
-    # and again with the final count when it is retired — the GUI memoizes
-    # them so the 'N files' chip converges to real frames.
-    sigContainerCount = Qt.QtCore.Signal(str, int)
+    # DIR-2 lazy convergence: (path, nframes, (size, mtime_ns), authoritative)
+    # as each container is opened and again when it is retired.  The GUI uses
+    # every stamped value for display convergence, but only a finalized,
+    # self-contained retirement value may optimize a later Append Run.
+    sigContainerCount = Qt.QtCore.Signal(str, int, object, bool)
 
     def __init__(
             self,
@@ -659,8 +661,17 @@ class imageThread(wranglerThread):
         # owned by DirectoryIndexSession's serialized executor.
         self.source_run_plan = None
         self.source_index_session = None
+        # Value-only copy of the Source card's stamp-qualified lazy frame-count
+        # memo.  It lets Append retire a fully complete container without
+        # opening that raw master again; it is never a discovery authority.
+        self.source_frame_count_snapshot = {}
+        self.source_pending_count = 0
         self._source_plan_reported = set()
         self._h19_observed_master_paths = ()
+        self._h19_ready_master_candidates = {}
+        self._h19_seed_pending = False
+        self._h19_queue_already_current = False
+        self._eiger_master_candidate = None
 
         self.user = None
         self.mask = None
@@ -708,6 +719,12 @@ class imageThread(wranglerThread):
         self._prefetch_error = None
         self._plan_cache = StandardPlanCache()
         self._append_skip_frames_by_scan = {}
+        # Stamp-qualified processed-output cursors survive Stop -> Run on this
+        # wrangler thread.  Unchanged outputs can then be validated with one
+        # stat instead of reopening hundreds of small NeXus products.  The
+        # per-run map above remains the immutable snapshot used while a Run is
+        # active; this memo is only an optimization source for building it.
+        self._append_cursor_memo = {}
         self._append_skip_without_reading = 0
         self._append_config_mismatch = False
         self._discovered_frame_count = 0
@@ -762,7 +779,21 @@ class imageThread(wranglerThread):
         self._eiger_master_queue.clear()
         self._eiger_done_masters.clear()
         self._source_plan_reported.clear()
-        self._h19_observed_master_paths = ()
+        seed_candidates = tuple(
+            getattr(getattr(self, "source_run_plan", None), "candidates", ())
+            or ())
+        self._h19_observed_master_paths = tuple(
+            str(candidate.path) for candidate in seed_candidates)
+        self._h19_ready_master_candidates = {
+            str(candidate.path): candidate for candidate in seed_candidates}
+        # The plan was frozen from the Source card's exact READY observation.
+        # Consume that value snapshot once before asking the shared session for
+        # another full recursive observation.
+        self._h19_seed_pending = bool(seed_candidates)
+        self._h19_pending_count = max(
+            0, int(getattr(self, "source_pending_count", 0) or 0))
+        self._h19_queue_already_current = False
+        self._eiger_master_candidate = None
         self._eiger_retry_after.clear()
         self._eiger_zero_frame_seen.clear()
         self._eiger_open_state = None
@@ -1107,6 +1138,8 @@ class imageThread(wranglerThread):
         Normal directory runs call this lazily when the reader reaches a scan.
         That keeps Run and Stop responsive in a directory containing hundreds
         of processed outputs while preserving the skip-before-raw-read contract.
+        A stamp-qualified value memo survives Stop -> Run on the same wrangler,
+        so unchanged outputs need only one ``stat`` on subsequent runs.
         """
         if not self._append_skip_enabled() or scan_name is None:
             return set()
@@ -1125,13 +1158,55 @@ class imageThread(wranglerThread):
             cache[key] = set()
             return cache[key]
 
+        require_2d = not bool(getattr(self.scan, "skip_2d", False))
+        memo = getattr(self, "_append_cursor_memo", None)
+        if memo is None:
+            memo = self._append_cursor_memo = {}
+        memo_key = (os.path.abspath(out_path), require_2d)
         try:
-            with self._optional_lock(getattr(self, "file_lock", None)):
-                existing, provenance = _nexus_append_cursor(
-                    out_path,
-                    require_2d=not bool(getattr(self.scan, "skip_2d", False)),
-                )
-            processed_config = processing_config_from_mapping(provenance)
+            stat = os.stat(out_path)
+            before_stamp = (
+                int(getattr(stat, "st_dev", 0)),
+                int(getattr(stat, "st_ino", 0)),
+                int(stat.st_size),
+                int(stat.st_mtime_ns),
+            )
+        except OSError:
+            memo.pop(memo_key, None)
+            cache[key] = set()
+            return cache[key]
+
+        hit = memo.get(memo_key)
+        try:
+            if hit is not None and hit[0] == before_stamp:
+                existing = set(hit[1])
+                processed_config = hit[2]
+            else:
+                memo.pop(memo_key, None)
+                with self._optional_lock(getattr(self, "file_lock", None)):
+                    existing, provenance = _nexus_append_cursor(
+                        out_path,
+                        require_2d=require_2d,
+                    )
+                processed_config = processing_config_from_mapping(provenance)
+                # Cache only a transactionally stable read.  A product replaced
+                # while its cursor was being read remains valid for this run's
+                # historical snapshot, but it must be reopened next Run.
+                try:
+                    stat = os.stat(out_path)
+                    after_stamp = (
+                        int(getattr(stat, "st_dev", 0)),
+                        int(getattr(stat, "st_ino", 0)),
+                        int(stat.st_size),
+                        int(stat.st_mtime_ns),
+                    )
+                except OSError:
+                    after_stamp = None
+                if after_stamp == before_stamp:
+                    memo[memo_key] = (
+                        before_stamp, frozenset(existing), processed_config)
+                    while len(memo) > _APPEND_CURSOR_MEMO_LIMIT:
+                        memo.pop(next(iter(memo)))
             current_config = processing_config_from_scan(self.scan)
             append_check = append_config_mismatch_check(
                 self.write_mode, processed_config, current_config)
@@ -3080,17 +3155,77 @@ class imageThread(wranglerThread):
         """Return frame count for a master file, 0 on failure."""
         return count_frames(master_path)
 
-    def _emit_container_count(self, path, nframes):
+    @staticmethod
+    def _h19_cursor_is_self_contained(cursor, descriptor):
+        """True only when every resolved detector dataset is a hard link.
+
+        ``segment_paths`` is empty for both a self-contained single dataset and
+        a single external link, so its length alone cannot prove ownership.
+        Inspect link metadata through the cursor's already-open handle; no new
+        HDF5 open or pixel read is performed.
+        """
+        handle = getattr(cursor, "_h5", None)
+        if handle is None or descriptor is None:
+            return False
+        paths = tuple(getattr(descriptor, "segment_paths", ()) or ())
+        if not paths:
+            dataset_path = getattr(descriptor, "dataset_path", None)
+            paths = (dataset_path,) if dataset_path else ()
+        if not paths:
+            return False
+        try:
+            return all(
+                handle.get(path, getlink=True).__class__.__name__ == "HardLink"
+                for path in paths
+            )
+        except Exception:
+            return False
+
+    def _emit_container_count(self, path, nframes, *, authoritative=False):
         """DIR-2 lazy convergence: hand the GUI a container's frame
-        count the moment it is known (open / retire).  getattr-guarded:
-        duck-typed test hosts carry no Qt signal."""
+        count the moment it is known (open / retire).
+
+        The identity stamp is captured here, beside the count, rather than by
+        the later GUI-thread slot.  Otherwise a file can grow between emission
+        and delivery and pair an old count with a new stamp.  ``authoritative``
+        is additionally constrained to an exact-current H19 Candidate backed
+        by a finalized, self-contained ``.nxs`` cursor; fabio/external-link
+        counts describe only data landed so far and must never bulk-skip a
+        later Append run.
+        """
         sig = getattr(self, 'sigContainerCount', None)
         if sig is None or not nframes:
             return
         try:
-            sig.emit(str(path), int(nframes))
+            stat = os.stat(path)
+            stamp = (int(stat.st_size), int(stat.st_mtime_ns))
+        except OSError:
+            return
+        if authoritative:
+            authoritative = (
+                imageThread._eiger_open_count_is_authoritative(self, path)
+                and tuple(self._eiger_master_candidate.version_stamp) == stamp
+            )
+        try:
+            sig.emit(str(path), int(nframes), stamp, bool(authoritative))
         except Exception:
             logger.debug('sigContainerCount emit failed', exc_info=True)
+
+    def _eiger_open_count_is_authoritative(self, path):
+        """Whether the active raw cursor proves a final whole-file count."""
+        candidate = getattr(self, "_eiger_master_candidate", None)
+        descriptor = getattr(self, "_eiger_descriptor", None)
+        cursor = getattr(self, "_eiger_cursor", None)
+        return bool(
+            candidate is not None
+            and Path(candidate.path) == Path(path)
+            and Path(path).suffix.lower() == ".nxs"
+            and cursor is not None
+            and descriptor is not None
+            and bool(getattr(descriptor, "finalized", False))
+            and imageThread._h19_cursor_is_self_contained(cursor, descriptor)
+            and imageThread._h19_candidate_is_current(candidate)
+        )
 
     def _eiger_open_master(self, master_path):
         """Open (or switch to) an Eiger / NeXus HDF5 file, keeping the handle.
@@ -3116,6 +3251,10 @@ class imageThread(wranglerThread):
         ownership the raw h5py handle used); its ``ReadPlan`` sizes the bulk
         block and its provider serves per-frame metadata.
         """
+        queued_candidate = getattr(self, "_eiger_master_candidate", None)
+        if (queued_candidate is not None
+                and Path(queued_candidate.path) != Path(master_path)):
+            queued_candidate = None
         self._eiger_close_master()
         self._eiger_open_state = "opening"
         # Provisional-until-proven: recorded per open/outcome so the Phase-3
@@ -3164,7 +3303,11 @@ class imageThread(wranglerThread):
             )
             from xrd_tools.sources.probe import ProbeState
 
-            cursor = ContainerCursor(master_path, entry='entry').open()
+            cursor = ContainerCursor(
+                master_path,
+                entry='entry',
+                candidate=queued_candidate,
+            ).open()
             desc = cursor.descriptor
             if desc.state is ProbeState.PROCESSED_OUTPUT:
                 # F-NXS-2: a processed xdart output was swept into the raw source
@@ -3721,6 +3864,118 @@ class imageThread(wranglerThread):
             and getattr(self, "source_index_session", None) is not None
         )
 
+    @staticmethod
+    def _h19_candidate_is_current(candidate):
+        """Point-check one queued Candidate without re-walking its directory.
+
+        READY results in ``DirectoryIndexSession`` are sticky only for the
+        Candidate's exact ``(path, adapter, size, mtime)`` identity.  A single
+        stat plus the shared adapter-owner lookup therefore preserves the
+        fail-closed consumption check without an O(directory) observation for
+        every queued master.
+        """
+        try:
+            path = Path(candidate.path)
+            stat = path.stat()
+            # Register built-ins before consulting the one precedence owner.
+            import xrd_tools.sources.registry  # noqa: F401
+            from xrd_tools.sources.adapters import candidate_owner
+
+            owner = candidate_owner(path)
+            owner_id = owner.id if owner is not None else None
+            return (
+                owner_id == candidate.adapter_id
+                and (int(stat.st_size), int(stat.st_mtime_ns))
+                == tuple(candidate.version_stamp)
+            )
+        except Exception:
+            # Candidate ownership is a fail-closed consumption boundary.  A
+            # registry/adapter failure is no reason to open a path whose exact
+            # READY identity can no longer be proved; the next authoritative
+            # directory observation may adopt it again.
+            return False
+
+    def _eiger_complete_append_count(self, path, candidate):
+        """Known frame count iff Append can retire this whole raw container."""
+        if (not self._append_skip_enabled()
+                or getattr(self, "series_average", False)):
+            return 0
+        snapshot = getattr(self, "source_frame_count_snapshot", None) or {}
+        hit = snapshot.get(str(path))
+        if hit is None:
+            return 0
+        try:
+            stamp, nframes = hit
+            nframes = int(nframes)
+        except (TypeError, ValueError):
+            return 0
+        if nframes <= 0 or tuple(stamp) != tuple(candidate.version_stamp):
+            return 0
+
+        scan_name = self._eiger_scan_name(path)
+        completed = self._append_skip_snapshot(scan_name)
+        if all(frame in completed for frame in range(1, nframes + 1)):
+            return nframes
+        return 0
+
+    def _eiger_skip_complete_append_master(self, path, candidate):
+        """Bulk-account and retire one fully durable Append input.
+
+        The count is a stamp-qualified value copied at Run start and the output
+        cursor still performs the normal mode/config validation.  A miss,
+        stale count, partial output, or mismatch takes the unchanged raw-open
+        path.
+        """
+        count = self._eiger_complete_append_count(path, candidate)
+        if count <= 0:
+            return False
+        self._append_skip_without_reading = (
+            getattr(self, "_append_skip_without_reading", 0) + count)
+        self._record_discovered_frame(count)
+        self._record_skip_reason("already processed", count)
+        self._eiger_retire_master(str(path))
+        return True
+
+    def _eiger_skip_open_complete_append_master(self):
+        """Cold-start Append fast path after one raw-container open.
+
+        A fresh GUI has no finalized frame-count memo yet.  Opening a
+        self-contained finalized NeXus container supplies that count without
+        reading pixels; when the processed output covers the complete range,
+        retire and account the container as one unit instead of advancing all
+        frame indices merely to rediscover that every frame is complete.
+        """
+        path = getattr(self, "_eiger_master_path", None)
+        if (getattr(self, "inp_type", None) != "Image Directory"
+                or not path
+                or not self._eiger_open_count_is_authoritative(path)
+                or not self._append_skip_enabled()
+                or getattr(self, "series_average", False)):
+            return False
+        count = int(getattr(self, "_eiger_nframes", 0) or 0)
+        if count <= 0:
+            return False
+        scan_name = self._eiger_scan_name(path)
+        completed = self._append_skip_snapshot(scan_name)
+        if not all(frame in completed for frame in range(1, count + 1)):
+            return False
+
+        self._append_skip_without_reading = (
+            getattr(self, "_append_skip_without_reading", 0) + count)
+        self._record_discovered_frame(count)
+        self._record_skip_reason("already processed", count)
+        self._eiger_retire_master(str(path))
+        self._emit_container_count(path, count, authoritative=True)
+        self._eiger_close_master()
+        self._eiger_master_path = None
+        self._eiger_frame_idx = 0
+        self._eiger_nframes = 0
+        # The remaining frozen queue was not changed by opening/retiring this
+        # master.  Let the next loop pop it directly; an empty queue with
+        # unresolved work is reconciled by _eiger_pop_next_master itself.
+        self._h19_queue_already_current = True
+        return True
+
     def _eiger_refill_master_queue(self):
         """Queue matching HDF5 master / NeXus files not yet processed."""
         if (getattr(self, "source_run_plan", None) is not None
@@ -3732,7 +3987,23 @@ class imageThread(wranglerThread):
             zero_seen = getattr(self, "_eiger_zero_frame_seen", None)
             if zero_seen is None:
                 zero_seen = self._eiger_zero_frame_seen = {}
-            ready_paths = self._h19_ready_master_paths()
+            if getattr(self, "_h19_seed_pending", False):
+                # The frozen plan is already the exact READY Source-card
+                # snapshot accepted by Run.  Use it once so Run does not queue
+                # behind another recursive GUI poll before its first frame.
+                self._h19_seed_pending = False
+                ready_paths = tuple(
+                    candidate.path
+                    for candidate in getattr(
+                        self.source_run_plan, "candidates", ()))
+                self._h19_ready_master_candidates = {
+                    str(candidate.path): candidate
+                    for candidate in getattr(
+                        self.source_run_plan, "candidates", ())}
+                self._h19_observed_master_paths = tuple(
+                    str(path) for path in ready_paths)
+            else:
+                ready_paths = self._h19_ready_master_paths()
             observed = set(getattr(self, "_h19_observed_master_paths", ()))
             for stale_path in set(retries) - observed:
                 retries.pop(stale_path, None)
@@ -3806,6 +4077,9 @@ class imageThread(wranglerThread):
             return ()
         try:
             observation = session.observe()
+            self._h19_pending_count = (
+                int(observation.pending_count)
+                + int(bool(observation.stale_drops)))
             self._h19_observed_master_paths = tuple(
                 str(candidate.path)
                 for candidate in observation.discovered_snapshot.candidates
@@ -3857,9 +4131,11 @@ class imageThread(wranglerThread):
             if item.result.state is ProbeState.READY
         }
         ordered = (*reconciliation.run_order, *reconciliation.appended)
-        return tuple(
-            candidate.path for candidate in ordered
-            if candidate.path in ready)
+        ready_candidates = tuple(
+            candidate for candidate in ordered if candidate.path in ready)
+        self._h19_ready_master_candidates = {
+            str(candidate.path): candidate for candidate in ready_candidates}
+        return tuple(candidate.path for candidate in ready_candidates)
 
     def _eiger_pop_next_master(self):
         """Pop the next master, deferring unfinalized NXWriter containers.
@@ -3876,18 +4152,76 @@ class imageThread(wranglerThread):
         """
         if (getattr(self, "source_run_plan", None) is not None
                 and getattr(self, "source_index_session", None) is not None):
-            eligible = {str(path) for path in self._h19_ready_master_paths()}
-            retries = getattr(self, "_eiger_retry_after", {})
-            now = time.monotonic()
-            for _ in range(len(self._eiger_master_queue)):
-                candidate = self._eiger_master_queue.popleft()
-                if retries.get(candidate, 0.0) > now:
-                    self._eiger_master_queue.append(candidate)
+            stale_followups = 0
+            while True:
+                retries = getattr(self, "_eiger_retry_after", {})
+                now = time.monotonic()
+                candidates = getattr(
+                    self, "_h19_ready_master_candidates", None) or {}
+                stale_this_pass = False
+                for _ in range(len(self._eiger_master_queue)):
+                    path = self._eiger_master_queue.popleft()
+                    if retries.get(path, 0.0) > now:
+                        self._eiger_master_queue.append(path)
+                        continue
+                    candidate = candidates.get(path)
+                    if (candidate is None
+                            or not imageThread._h19_candidate_is_current(
+                                candidate)):
+                        stale_this_pass = True
+                        # The queued identity drifted after the frozen
+                        # observation. Force one authoritative follow-up after
+                        # the remaining queue drains so its replacement can be
+                        # reprobed without a per-master directory walk.
+                        self._h19_pending_count = max(
+                            1, int(getattr(
+                                self, "_h19_pending_count", 0) or 0))
+                        key = ("stale-at-pop", str(path))
+                        if key not in self._source_plan_reported:
+                            self._source_plan_reported.add(key)
+                            message = (
+                                "Skipping source changed after readiness; it "
+                                f"will be re-observed: {path}")
+                            logger.warning(message)
+                            try:
+                                self.showLabel.emit(message)
+                            except Exception:
+                                logger.debug(
+                                    "showLabel emit failed", exc_info=True)
+                        continue
+                    retries.pop(path, None)
+                    skip_complete = getattr(
+                        self, "_eiger_skip_complete_append_master", None)
+                    if (skip_complete is not None
+                            and skip_complete(path, candidate)):
+                        continue
+                    self._eiger_master_candidate = candidate
+                    return path
+
+                # The frozen READY snapshot can coexist with candidates still
+                # awaiting the session's bounded probe budget. Once the seed
+                # drains, observe only while each poll makes progress. A truly
+                # in-progress writer stabilizes and returns to the Live cadence;
+                # a converged directory performs zero extra walks.
+                if (int(getattr(self, "_h19_pending_count", 0) or 0) <= 0
+                        or getattr(self, "command", None) == "stop"):
+                    return None
+                # A directory session may briefly hand back the same sticky
+                # READY identity even though the point stat already disproved
+                # it.  Give that stale identity one authoritative follow-up,
+                # then yield instead of requeueing it forever at 100% CPU.
+                if stale_this_pass and stale_followups >= 1:
+                    return None
+                before = int(self._h19_pending_count)
+                self._eiger_refill_master_queue()
+                if stale_this_pass:
+                    stale_followups += 1
+                if self._eiger_master_queue:
                     continue
-                if candidate in eligible:
-                    retries.pop(candidate, None)
-                    return candidate
-            return None
+                after = int(
+                    getattr(self, "_h19_pending_count", 0) or 0)
+                if after <= 0 or after >= before:
+                    return None
 
         from xrd_tools.io.bluesky_nexus import is_unfinalized_nxwriter
         while self._eiger_master_queue:
@@ -4286,7 +4620,11 @@ class imageThread(wranglerThread):
             # ── Initialise on the very first call ────────────────────────────
             if self._eiger_master_path is None:
                 if self.inp_type == 'Image Directory':
-                    self._eiger_refill_master_queue()
+                    queue_current = bool(getattr(
+                        self, "_h19_queue_already_current", False))
+                    self._h19_queue_already_current = False
+                    if not queue_current:
+                        self._eiger_refill_master_queue()
                     next_master = self._eiger_pop_next_master()
                     if next_master is None:
                         return None, None, 1, None, {}
@@ -4295,6 +4633,8 @@ class imageThread(wranglerThread):
                     self._eiger_master_path = self.img_file
                 self._eiger_frame_idx = 0
                 self._eiger_open_master(self._eiger_master_path)
+                if self._eiger_skip_open_complete_append_master():
+                    continue
                 if self._eiger_nframes == 0:
                     self._eiger_close_or_defer_zero_frame_master()
                     if self.inp_type == 'Image Directory':
@@ -4335,7 +4675,8 @@ class imageThread(wranglerThread):
                 if self.inp_type == 'Image Directory':
                     self._eiger_retire_master(self._eiger_master_path)
                     self._emit_container_count(self._eiger_master_path,
-                                               self._eiger_nframes)
+                                               self._eiger_nframes,
+                                               authoritative=True)
                     self._eiger_close_master()
                     if not self._eiger_master_queue:
                         self._eiger_refill_master_queue()
@@ -4348,6 +4689,8 @@ class imageThread(wranglerThread):
                     self._eiger_master_path = next_master
                     self._eiger_frame_idx = 0
                     self._eiger_open_master(self._eiger_master_path)
+                    if self._eiger_skip_open_complete_append_master():
+                        continue
                     if self._eiger_nframes == 0:
                         # Imageless container mid-queue: retire-and-advance via
                         # the exhaustion branch, never end the stream (see the

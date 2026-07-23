@@ -1055,6 +1055,29 @@ def test_image_widget_accepts_cake_specific_linear_percentiles(qapp):
         qapp.processEvents()
 
 
+def test_image_widget_sparse_cake_expansion_survives_colorbar_bounds(qapp):
+    from xdart.gui.widgets import pgImageWidget
+
+    w = pgImageWidget(lockAspect=True, raw=False)
+    try:
+        img = np.full((100, 100), 10.0)
+        img[51, 53] = 1000.0  # deliberately off the min/max stride sample
+        w.setImage(
+            img,
+            scale="Linear",
+            cmap="viridis",
+            linear_percentiles=(0.5, 99.5),
+            expand_degenerate_levels=True,
+        )
+
+        assert tuple(w.imageItem.levels) == (10.0, 1000.0)
+        assert w.histogram.lo_lim == 10.0
+        assert w.histogram.hi_lim == 1000.0
+    finally:
+        w.deleteLater()
+        qapp.processEvents()
+
+
 def test_image_widget_reuses_levels_for_short_live_flush(qapp, monkeypatch):
     from xdart.gui.widgets import pgImageWidget
     import xdart.gui.widgets.image_widget as image_widget_mod
@@ -3759,11 +3782,10 @@ def test_integrator_panel_session_roundtrip(widget, monkeypatch):
     assert str(w._controls_v2_field_values()[("Int1D", "points")]) == "1234"
 
 
-def test_cake_view_trim_rearms_after_own_trim_but_respects_user_zoom(widget):
-    """The display trim disables pyqtgraph auto-range via its own setRange, so
-    it must recognize its OWN previous range and re-trim on the next render
-    (axis-kind switches stranded a stale window otherwise) -- while a range
-    the USER set stays untouched."""
+def test_cake_view_autofit_uses_full_axes_and_respects_user_zoom(widget):
+    """Sparse intensity must not make the cake zoom to a changing positive-pixel
+    island.  Automatic fitting follows the complete rendered axes across frames,
+    while a range the user set stays untouched."""
     import numpy as np
     from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
 
@@ -3774,19 +3796,113 @@ def test_cake_view_trim_rearms_after_own_trim_but_respects_user_zoom(widget):
     x = np.linspace(0.0, 10.0, 100); y = np.linspace(-180.0, 180.0, 100)
     displayFrameWidget._trim_view_to_data(w, img, x, y)
     first = vb.viewRange()
-    assert first[0][1] < 6.0                                 # trimmed in x
+    assert first[0][0] <= x[0] and first[0][1] >= x[-1]
+    assert first[1][0] <= y[0] and first[1][1] >= y[-1]
 
-    # Same auto-range-off state, new data elsewhere -> must RE-trim.
+    # Moving sparse support on the next frame must not move the axes.
     img2 = np.zeros((100, 100)); img2[70:90, 70:90] = 5.0
     displayFrameWidget._trim_view_to_data(w, img2, x, y)
     second = vb.viewRange()
-    assert second != first and second[0][0] > 5.0            # followed the data
+    assert np.allclose(second, first)
 
     # User zoom (a range we did NOT set) -> respected, no trim.
     vb.setRange(xRange=(2.0, 3.0), yRange=(0.0, 10.0), padding=0)
     user = vb.viewRange()
     displayFrameWidget._trim_view_to_data(w, img, x, y)
     assert vb.viewRange() == user
+
+
+def test_cake_view_autofit_preserves_one_axis_user_zoom(widget):
+    """Manual navigation may disable auto-range on only one axis."""
+    import numpy as np
+    from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
+
+    w = widget.displayframe.binned_widget
+    vb = w.image_plot.getViewBox()
+    img = np.zeros((100, 100))
+    x = np.linspace(0.0, 10.0, 100)
+    y = np.linspace(-180.0, 180.0, 100)
+
+    vb.enableAutoRange(x=True, y=True)
+    displayFrameWidget._trim_view_to_data(w, img, x, y)
+    vb.setXRange(2.0, 3.0, padding=0)
+    manual_x = list(vb.viewRange()[0])
+
+    # Leave y automatic while x is explicitly user-owned.
+    vb.enableAutoRange(axis="y", enable=True)
+    displayFrameWidget._trim_view_to_data(w, img, x, y)
+
+    assert np.allclose(vb.viewRange()[0], manual_x)
+    assert vb.viewRange()[1][0] <= y[0]
+    assert vb.viewRange()[1][1] >= y[-1]
+
+
+def test_cake_view_autofit_excludes_stable_nan_padding(widget):
+    """The fit follows finite geometry, not a frame's moving intensity island."""
+    import numpy as np
+    from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
+
+    w = widget.displayframe.binned_widget
+    vb = w.image_plot.getViewBox()
+    x = np.linspace(0.0, 10.0, 100)
+    y = np.linspace(-180.0, 180.0, 100)
+    first = np.full((100, 100), np.nan)
+    first[20:80, 10:90] = 0.0
+    first[25:30, 15:20] = 5.0
+
+    vb.enableAutoRange(x=True, y=True)
+    displayFrameWidget._trim_view_to_data(w, first, x, y)
+    first_range = vb.viewRange()
+    assert first_range[0][0] > x[0]
+    assert first_range[0][1] < x[-1]
+    assert first_range[1][0] > y[0]
+    assert first_range[1][1] < y[-1]
+
+    second = np.array(first, copy=True)
+    second[25:30, 15:20] = 0.0
+    second[70:75, 80:85] = 50.0
+    displayFrameWidget._trim_view_to_data(w, second, x, y)
+
+    assert np.allclose(vb.viewRange(), first_range)
+
+
+def test_sparse_cake_payload_keeps_full_axes_and_nonzero_levels(widget):
+    """Exercise the production payload renderer for the live sparse-cake case."""
+    from xrd_tools.session.display_logic import Axis, ImagePayload, PanelRole
+
+    df = widget.displayframe
+    view = df.binned_widget.image_plot.getViewBox()
+    x = np.linspace(1.0, 5.0, 500)
+    y = np.linspace(-72.0, 64.0, 500)
+
+    first = np.zeros((500, 500), dtype=float)
+    first[65:72, 75:82] = np.arange(1.0, 50.0).reshape(7, 7)
+    payload = ImagePayload(
+        image=first,
+        axis_x=Axis("q", "A^-1", values=x),
+        axis_y=Axis("chi", "deg", values=y),
+        rendered_axis_key="q_A^-1",
+        rendered_kind="q_chi",
+    )
+    assert df._draw_image_payload(PanelRole.CAKE_2D, payload)
+    first_range = view.viewRange()
+    assert first_range[0][0] <= x[0] and first_range[0][1] >= x[-1]
+    assert first_range[1][0] <= y[0] and first_range[1][1] >= y[-1]
+    lo, hi = tuple(df.binned_widget.imageItem.levels)
+    assert lo == 0.0
+    assert hi > lo
+
+    second = np.zeros((500, 500), dtype=float)
+    second[400:407, 420:427] = np.arange(2.0, 100.0, 2.0).reshape(7, 7)
+    payload = ImagePayload(
+        image=second,
+        axis_x=payload.axis_x,
+        axis_y=payload.axis_y,
+        rendered_axis_key="q_A^-1",
+        rendered_kind="q_chi",
+    )
+    assert df._draw_image_payload(PanelRole.CAKE_2D, payload)
+    assert np.allclose(view.viewRange(), first_range)
 
 
 def test_scale_switch_without_2d_panels_does_not_crash(widget):

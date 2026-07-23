@@ -1660,16 +1660,77 @@ def test_h19_run_boundary_propagates_empty_plan_to_real_worker(
             widget.wrangler.source_run_plan)
         assert widget.wrangler.thread.source_index_session is (
             widget.wrangler.source_index_session)
+        assert widget.wrangler.source_frame_count_snapshot == {}
+        assert widget.wrangler.thread.source_frame_count_snapshot == {}
+        assert widget.wrangler.source_pending_count == 0
+        assert widget.wrangler.thread.source_pending_count == 0
         assert widget.wrangler.img_file == ""
         assert widget.wrangler.thread.img_file == ""
 
         widget._clear_controls_v2_run_source_authority()
         assert widget.wrangler.source_run_plan is None
         assert widget.wrangler.source_index_session is None
+        assert widget.wrangler.source_frame_count_snapshot == {}
+        assert widget.wrangler.source_pending_count == 0
         assert widget.wrangler.thread.source_run_plan is None
         assert widget.wrangler.thread.source_index_session is None
+        assert widget.wrangler.thread.source_frame_count_snapshot == {}
+        assert widget.wrangler.thread.source_pending_count == 0
     finally:
         widget._exit_run_state()
+        widget.close()
+        widget.deleteLater()
+
+
+def test_h19_frame_count_handoff_is_a_value_copy(qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget._v2_container_final_count_memo = {
+            "/raw/scan.nxs": ((123, 456), 6)}
+
+        frozen = widget._controls_v2_freeze_container_frame_counts()
+        widget._v2_container_final_count_memo[
+            "/raw/scan.nxs"] = ((999, 999), 12)
+
+        assert frozen == {"/raw/scan.nxs": ((123, 456), 6)}
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_h19_delayed_count_signal_never_pairs_old_count_with_new_stamp(
+        qapp, monkeypatch, tmp_path):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    path = tmp_path / "scan.nxs"
+    path.write_bytes(b"old")
+    old_stamp = staticWidget._v2_file_stamp(path)
+    # Model growth between worker emission and GUI-thread delivery.
+    path.write_bytes(b"new container bytes")
+    new_stamp = staticWidget._v2_file_stamp(path)
+    assert new_stamp != old_stamp
+
+    widget = staticWidget()
+    try:
+        widget._on_container_count_landed(
+            str(path), 3, old_stamp, True)
+
+        assert widget._v2_container_count_memo[str(path)] == (old_stamp, 3)
+        assert widget._controls_v2_freeze_container_frame_counts() == {
+            str(path): (old_stamp, 3)}
+        assert widget._controls_v2_freeze_container_frame_counts()[
+            str(path)][0] != new_stamp
+
+        # The legacy click-to-count signal remains display-only.
+        widget._v2_container_final_count_memo.clear()
+        widget._on_container_count_landed(str(path), 9)
+        assert widget._v2_container_count_memo[str(path)] == (new_stamp, 9)
+        assert widget._controls_v2_freeze_container_frame_counts() == {}
+    finally:
         widget.close()
         widget.deleteLater()
 

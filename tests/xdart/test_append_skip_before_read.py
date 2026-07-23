@@ -424,6 +424,101 @@ def test_append_skip_snapshot_opens_each_reached_output_once(monkeypatch, tmp_pa
     assert Path(worker.fname).name == "current.nxs"
 
 
+def test_append_cursor_memo_reuses_only_unchanged_output_across_runs(
+        monkeypatch, tmp_path):
+    """Stop -> Run reuses a stamp-qualified processed-output cursor."""
+    worker = _bare_worker(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    output = out / "scan.nxs"
+    _write_minimal_integrated_nxs(output, [1, 2])
+    real_cursor = iwt._nexus_append_cursor
+
+    assert worker._load_append_skip_snapshot("scan") == {1, 2}
+    assert worker._append_cursor_memo
+
+    worker._append_skip_frames_by_scan = {}
+    monkeypatch.setattr(
+        iwt,
+        "_nexus_append_cursor",
+        lambda *_args, **_kwargs: pytest.fail(
+            "unchanged processed output was reopened"),
+    )
+    assert worker._load_append_skip_snapshot("scan") == {1, 2}
+
+    # Replacing the product changes its stamp and must invalidate the memo.
+    _write_minimal_integrated_nxs(output, [1, 2, 3])
+    calls = []
+
+    def cursor(path, *, require_2d):
+        calls.append(Path(path).name)
+        return real_cursor(path, require_2d=require_2d)
+
+    monkeypatch.setattr(iwt, "_nexus_append_cursor", cursor)
+    worker._append_skip_frames_by_scan = {}
+    assert worker._load_append_skip_snapshot("scan") == {1, 2, 3}
+    assert calls == ["scan.nxs"]
+
+
+def test_append_cursor_memo_revalidates_current_processing_config(
+        monkeypatch, tmp_path):
+    from xrd_tools.session.readiness import AppendConfigMismatchError
+
+    worker = _bare_worker(tmp_path)
+    worker.scan.bai_1d_args = {"unit": "q_A^-1", "numpoints": 1000}
+    out = tmp_path / "out"
+    out.mkdir()
+    _write_minimal_integrated_nxs(
+        out / "scan.nxs",
+        [1, 2],
+        reduction_config={
+            "gi": False,
+            "bai_1d_args": {"unit": "q_A^-1", "numpoints": 1000},
+            "bai_2d_args": {"unit": "q_A^-1"},
+        },
+    )
+
+    assert worker._load_append_skip_snapshot("scan") == {1, 2}
+    worker._append_skip_frames_by_scan = {}
+    worker.scan.bai_1d_args = {"unit": "q_A^-1", "numpoints": 500}
+    monkeypatch.setattr(
+        iwt,
+        "_nexus_append_cursor",
+        lambda *_args, **_kwargs: pytest.fail(
+            "config revalidation reopened an unchanged output"),
+    )
+
+    with pytest.raises(AppendConfigMismatchError):
+        worker._load_append_skip_snapshot("scan")
+
+
+def test_append_cursor_memo_avoids_reopening_300_unchanged_products(
+        monkeypatch, tmp_path):
+    worker = _bare_worker(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    names = tuple(f"scan_{idx:04d}" for idx in range(300))
+    for name in names:
+        (out / f"{name}.nxs").write_bytes(name.encode())
+
+    calls = []
+
+    def cursor(path, *, require_2d):
+        calls.append(Path(path).name)
+        return set(range(1, 7)), {}
+
+    monkeypatch.setattr(iwt, "_nexus_append_cursor", cursor)
+    for name in names:
+        assert worker._load_append_skip_snapshot(name) == set(range(1, 7))
+    assert len(calls) == 300
+
+    worker._append_skip_frames_by_scan = {}
+    calls.clear()
+    for name in names:
+        assert worker._load_append_skip_snapshot(name) == set(range(1, 7))
+    assert calls == []
+
+
 def test_append_skip_snapshot_stop_does_not_open_output(monkeypatch, tmp_path):
     worker = _bare_worker(tmp_path)
     worker.command = "stop"
@@ -477,6 +572,242 @@ def test_normal_append_process_start_never_primes_whole_directory(tmp_path):
     worker.process_scan()
 
     assert worker.files_processed == 0
+
+
+def _current_candidate(path):
+    import xrd_tools.sources.registry  # noqa: F401
+    from xrd_tools.sources.adapters import candidate_owner
+    from xrd_tools.sources.discover import Candidate
+
+    stat = path.stat()
+    owner = candidate_owner(path)
+    assert owner is not None
+    return Candidate(
+        path, owner.id, int(stat.st_size), int(stat.st_mtime_ns))
+
+
+def test_complete_append_master_uses_count_hint_without_raw_open(
+        monkeypatch, tmp_path):
+    """A restarted Append run retires a complete container as one unit."""
+    from xrd_tools.sources.directory_index import Snapshot
+    from xrd_tools.sources.run_plan import RunCandidatePlan
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    raw = raw_dir / "scan.nxs"
+    raw.write_bytes(b"source identity only")
+    candidate = _current_candidate(raw)
+
+    worker = _bare_worker(tmp_path)
+    worker.inp_type = "Image Directory"
+    worker.img_ext = "nxs"
+    worker.img_dir = str(raw_dir)
+    worker.live_mode = False
+    worker._eiger_master_path = None
+    worker._eiger_frame_idx = 0
+    worker._eiger_nframes = 0
+    worker._eiger_master_queue = deque()
+    worker._eiger_done_masters = set()
+    worker._eiger_retry_after = {}
+    worker._eiger_zero_frame_seen = {}
+    worker._source_plan_reported = set()
+    worker._h19_observed_master_paths = ()
+    worker._h19_ready_master_candidates = {str(raw): candidate}
+    worker._h19_seed_pending = True
+    worker._eiger_master_candidate = None
+    worker.source_run_plan = RunCandidatePlan.from_snapshot(Snapshot(
+        1, (candidate,), raw_dir, False, None))
+    worker.source_index_session = object()
+    worker.source_frame_count_snapshot = {
+        str(raw): (candidate.version_stamp, 6)}
+    worker.showLabel = SimpleNamespace(emit=lambda *_: None)
+
+    out = Path(worker.h5_dir)
+    out.mkdir()
+    _write_minimal_integrated_nxs(out / "scan.nxs", range(1, 7))
+    monkeypatch.setattr(
+        worker,
+        "_eiger_open_master",
+        lambda _path: pytest.fail("complete raw master was opened"),
+    )
+
+    result = worker._get_next_eiger_frame_sync()
+
+    assert result == (None, None, 1, None, {})
+    assert worker._eiger_done_masters == {str(raw)}
+    assert worker._append_skip_without_reading == 6
+    assert worker._discovered_frame_count == 6
+    assert worker._skip_reason_counts == Counter({"already processed": 6})
+
+
+def test_cold_append_opens_complete_master_once_without_frame_index_walk(
+        monkeypatch, tmp_path):
+    """A fresh GUI uses the first raw open's count and skips as one unit."""
+    import h5py
+    from xrd_tools.sources.cursor import ContainerCursor
+    from xrd_tools.sources.directory_index import Snapshot
+    from xrd_tools.sources.run_plan import RunCandidatePlan
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    raw = raw_dir / "scan.nxs"
+    with h5py.File(raw, "w") as handle:
+        detector = handle.create_group("entry/instrument/detector")
+        detector.create_dataset(
+            "data", data=np.zeros((6, 3, 4), dtype=np.uint16))
+    candidate = _current_candidate(raw)
+
+    worker = _bare_worker(tmp_path)
+    worker.inp_type = "Image Directory"
+    worker.img_ext = "nxs"
+    worker.img_dir = str(raw_dir)
+    worker.live_mode = False
+    worker._eiger_master_path = None
+    worker._eiger_frame_idx = 0
+    worker._eiger_nframes = 0
+    worker._eiger_master_queue = deque()
+    worker._eiger_done_masters = set()
+    worker._eiger_retry_after = {}
+    worker._eiger_zero_frame_seen = {}
+    worker._source_plan_reported = set()
+    worker._h19_observed_master_paths = ()
+    worker._h19_ready_master_candidates = {str(raw): candidate}
+    worker._h19_seed_pending = True
+    worker._h19_pending_count = 0
+    worker._eiger_master_candidate = None
+    worker._eiger_cursor = None
+    worker._eiger_descriptor = None
+    worker._eiger_read_plan = None
+    worker._eiger_provider = None
+    worker._eiger_fabio_handle = None
+    worker.source_run_plan = RunCandidatePlan.from_snapshot(Snapshot(
+        1, (candidate,), raw_dir, False, None))
+    worker.source_index_session = object()
+    worker.source_frame_count_snapshot = {}
+
+    out = Path(worker.h5_dir)
+    out.mkdir()
+    _write_minimal_integrated_nxs(out / "scan.nxs", range(1, 7))
+
+    opens = []
+
+    def open_once(path):
+        opens.append(str(path))
+        cursor = ContainerCursor(path, candidate=candidate).open()
+        worker._eiger_cursor = cursor
+        worker._eiger_descriptor = cursor.descriptor
+        worker._eiger_nframes = cursor.frame_count
+
+    monkeypatch.setattr(worker, "_eiger_open_master", open_once)
+    monkeypatch.setattr(
+        worker,
+        "_should_skip_before_read",
+        lambda *_args: pytest.fail("complete container walked frame indices"),
+    )
+
+    result = worker._get_next_eiger_frame_sync()
+
+    assert result == (None, None, 1, None, {})
+    assert opens == [str(raw)]
+    assert worker._eiger_done_masters == {str(raw)}
+    assert worker._append_skip_without_reading == 6
+    assert worker._discovered_frame_count == 6
+    assert worker._skip_reason_counts == Counter({"already processed": 6})
+    assert worker._eiger_cursor is None
+
+
+def test_complete_append_directory_retires_1800_frames_without_raw_open(
+        monkeypatch, tmp_path):
+    """A large restarted directory is skipped in container-sized units.
+
+    This mirrors the beamline case (roughly 300 six-frame NeXus files): the
+    worker may point-check each container identity and validate each processed
+    output, but it must not reopen a raw container, iterate the frame reader, or
+    re-walk the recursive directory before returning the no-op result.
+    """
+    from xrd_tools.sources.directory_index import Snapshot
+    from xrd_tools.sources.run_plan import RunCandidatePlan
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    paths = tuple(raw_dir / f"scan_{idx:04d}.nxs" for idx in range(300))
+    for path in paths:
+        path.write_bytes(path.name.encode())
+    candidates = tuple(_current_candidate(path) for path in paths)
+
+    class NoObservation:
+        def observe(self):
+            pytest.fail("frozen READY queue was re-observed")
+
+    worker = _bare_worker(tmp_path)
+    worker.inp_type = "Image Directory"
+    worker.img_ext = "nxs"
+    worker.img_dir = str(raw_dir)
+    worker.live_mode = False
+    worker._eiger_master_path = None
+    worker._eiger_frame_idx = 0
+    worker._eiger_nframes = 0
+    worker._eiger_master_queue = deque()
+    worker._eiger_done_masters = set()
+    worker._eiger_retry_after = {}
+    worker._eiger_zero_frame_seen = {}
+    worker._source_plan_reported = set()
+    worker._h19_observed_master_paths = ()
+    worker._h19_ready_master_candidates = {
+        str(candidate.path): candidate for candidate in candidates}
+    worker._h19_seed_pending = True
+    worker._eiger_master_candidate = None
+    worker.source_run_plan = RunCandidatePlan.from_snapshot(Snapshot(
+        1, candidates, raw_dir, True, None))
+    worker.source_index_session = NoObservation()
+    worker.source_frame_count_snapshot = {
+        str(candidate.path): (candidate.version_stamp, 6)
+        for candidate in candidates
+    }
+    worker._append_skip_frames_by_scan = {
+        worker._eiger_scan_name(candidate.path): set(range(1, 7))
+        for candidate in candidates
+    }
+    monkeypatch.setattr(
+        worker,
+        "_eiger_open_master",
+        lambda _path: pytest.fail("complete raw container was opened"),
+    )
+
+    result = worker._get_next_eiger_frame_sync()
+
+    assert result == (None, None, 1, None, {})
+    assert worker._eiger_done_masters == {str(path) for path in paths}
+    assert worker._append_skip_without_reading == 1800
+    assert worker._discovered_frame_count == 1800
+    assert worker._skip_reason_counts == Counter(
+        {"already processed": 1800})
+
+
+@pytest.mark.parametrize("case", ("stale-count", "partial-output"))
+def test_append_master_count_hint_falls_back_when_not_authoritative(
+        case, tmp_path):
+    raw = tmp_path / "scan.nxs"
+    raw.write_bytes(b"source identity only")
+    candidate = _current_candidate(raw)
+    worker = _bare_worker(tmp_path)
+    worker._eiger_done_masters = set()
+    worker.source_frame_count_snapshot = {
+        str(raw): (
+            (candidate.size + 1, candidate.mtime_ns)
+            if case == "stale-count" else candidate.version_stamp,
+            6,
+        )
+    }
+    out = Path(worker.h5_dir)
+    out.mkdir()
+    labels = range(1, 7) if case == "stale-count" else range(1, 6)
+    _write_minimal_integrated_nxs(out / "scan.nxs", labels)
+
+    assert worker._eiger_skip_complete_append_master(
+        str(raw), candidate) is False
+    assert worker._eiger_done_masters == set()
+    assert worker._append_skip_without_reading == 0
 
 
 def test_append_skip_snapshot_primes_once_read_only(monkeypatch, tmp_path):

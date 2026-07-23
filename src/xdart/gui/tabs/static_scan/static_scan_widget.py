@@ -520,6 +520,11 @@ class staticWidget(QWidget):
         # filled by the run as containers open (sigContainerCount) and by
         # the click-to-count sweep; a stale stamp invalidates the entry.
         self._v2_container_count_memo = {}
+        # Optimization-only subset whose count and exact stamp were captured
+        # together when a finalized, self-contained container was retired.
+        # Open-time, click-sweep, fabio, and external-link counts deliberately
+        # never enter this map.
+        self._v2_container_final_count_memo = {}
         self._v2_count_sweep_active = False
         self._controls_v2_source_widget = None
         self._controls_v2_directory_observation = None
@@ -3700,11 +3705,16 @@ class staticWidget(QWidget):
             return None
         return observation
 
-    def _controls_v2_freeze_source_run_plan(self):
+    def _controls_v2_freeze_source_run_authority(self):
+        """Freeze one coherent READY plan plus its unresolved-work count."""
         observation = self._controls_v2_current_directory_observation()
         from xrd_tools.sources import RunCandidatePlan
         if observation is not None:
-            return RunCandidatePlan.from_snapshot(observation.ready_snapshot)
+            return (
+                RunCandidatePlan.from_snapshot(observation.ready_snapshot),
+                int(observation.pending_count)
+                + int(bool(observation.stale_drops)),
+            )
 
         # Arm-then-acquire is a normal beamline workflow. If the Source card
         # has a valid configured directory but its first observation has not
@@ -3714,7 +3724,7 @@ class staticWidget(QWidget):
         config = self._controls_v2_container_index_config()
         desired = getattr(session, "configured", None)
         if session is None or config is None or desired is None:
-            return None
+            return None, 0
         root, recursive, name_filter, suffixes = config
         if (
             desired.root != root
@@ -3722,15 +3732,43 @@ class staticWidget(QWidget):
             or desired.name_filter != name_filter
             or desired.suffixes != suffixes
         ):
-            return None
+            return None, 0
         from xrd_tools.sources import Snapshot
-        return RunCandidatePlan.from_snapshot(Snapshot(
-            session.request_generation,
-            (),
-            root,
-            recursive,
-            name_filter,
-        ))
+        return (
+            RunCandidatePlan.from_snapshot(Snapshot(
+                session.request_generation,
+                (),
+                root,
+                recursive,
+                name_filter,
+            )),
+            0,
+        )
+
+    def _controls_v2_freeze_source_run_plan(self):
+        """Compatibility accessor for callers that need only the value plan."""
+        return self._controls_v2_freeze_source_run_authority()[0]
+
+    def _controls_v2_freeze_container_frame_counts(self):
+        """Copy the lazy, stamp-qualified container counts for one Run.
+
+        This is value-only optimization evidence, not a second source index.
+        The processing worker compares each entry with the exact Candidate it
+        is about to consume and falls back to the normal raw open on any miss
+        or stamp mismatch.
+        """
+        frozen = {}
+        memo = getattr(self, "_v2_container_final_count_memo", None) or {}
+        for path, entry in memo.items():
+            try:
+                stamp, count = entry
+                stamp = (int(stamp[0]), int(stamp[1]))
+                count = int(count)
+            except (TypeError, ValueError, IndexError):
+                continue
+            if count >= 0:
+                frozen[str(path)] = (stamp, count)
+        return frozen
 
     def _controls_v2_source_frame_count(self) -> int | None:
         """Images the configured raw source will yield; ``None`` for live."""
@@ -3860,18 +3898,33 @@ class staticWidget(QWidget):
             total += int(hit[1])
         return total
 
-    def _on_container_count_landed(self, path, nframes) -> None:
+    def _on_container_count_landed(
+            self, path, nframes, stamp=None, authoritative=False) -> None:
         """GUI-thread landing for a container's frame count (from the run's
         sigContainerCount or the click-to-count sweep)."""
         if getattr(self, "_tearing_down", False):
             return
+        if stamp is None:
+            try:
+                stamp = staticWidget._v2_file_stamp(path)
+            except OSError:
+                return
         try:
-            stamp = staticWidget._v2_file_stamp(path)
-        except OSError:
+            stamp = (int(stamp[0]), int(stamp[1]))
+            nframes = int(nframes)
+        except (TypeError, ValueError, IndexError):
             return
         self._v2_container_count_memo[str(path)] = (stamp, int(nframes))
         if len(self._v2_container_count_memo) > 8192:
             self._v2_container_count_memo.clear()
+        if authoritative:
+            final_memo = getattr(
+                self, "_v2_container_final_count_memo", None)
+            if final_memo is None:
+                final_memo = self._v2_container_final_count_memo = {}
+            final_memo[str(path)] = (stamp, nframes)
+            if len(final_memo) > 8192:
+                final_memo.clear()
         self._v2_frame_count_cache = None
         if not self._controls_v2_run_active():
             self._refresh_controls_v2_profile(immediate=False)
@@ -8474,7 +8527,8 @@ class staticWidget(QWidget):
         self._apply_controls_v2_run_state()
         self._sync_controls_v2_source_index()
         source_config = self._controls_v2_container_index_config()
-        source_plan = self._controls_v2_freeze_source_run_plan()
+        source_plan, source_pending_count = (
+            self._controls_v2_freeze_source_run_authority())
         empty_plan = (
             source_plan is not None
             and not tuple(getattr(source_plan, "paths", ()) or ())
@@ -8496,6 +8550,11 @@ class staticWidget(QWidget):
         self.wrangler.source_index_session = (
             getattr(self._controls_v2_source_widget, "directory_session", None)
             if source_plan is not None else None)
+        self.wrangler.source_frame_count_snapshot = (
+            self._controls_v2_freeze_container_frame_counts()
+            if source_plan is not None else {})
+        self.wrangler.source_pending_count = (
+            source_pending_count if source_plan is not None else 0)
         _t1 = _time.perf_counter() if _perf else 0.0
         self.wrangler.enabled(False)
         self.wrangler.setup()
@@ -8985,10 +9044,14 @@ class staticWidget(QWidget):
             return
         wrangler.source_run_plan = None
         wrangler.source_index_session = None
+        wrangler.source_frame_count_snapshot = {}
+        wrangler.source_pending_count = 0
         thread = getattr(wrangler, "thread", None)
         if thread is not None:
             thread.source_run_plan = None
             thread.source_index_session = None
+            thread.source_frame_count_snapshot = {}
+            thread.source_pending_count = 0
 
     def _on_viewer_mode_changed(self, viewer_mode_str):
         """Enable or disable the integrator panel and update h5viewer for viewer mode.

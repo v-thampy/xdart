@@ -88,7 +88,8 @@ def _finite_minmax(arr):
     return float(np.nanmin(values)), float(np.nanmax(values))
 
 
-def _ceiling_safe_levels(displayed, raw, pct):
+def _ceiling_safe_levels(
+        displayed, raw, pct, *, expand_degenerate=False):
     """Robust ``nanpercentile`` levels for ``displayed``, excluding exact
     detector-ceiling pixels from the percentile population.
 
@@ -117,7 +118,24 @@ def _ceiling_safe_levels(displayed, raw, pct):
             (raw_arr == sat_ceil) | (raw_arr >= _UINT32_CEIL))
         if ceiling.any() and (finite & ~ceiling).any():
             pop_mask = finite & ~ceiling
-    lo, hi = np.nanpercentile(_level_population(disp, pop_mask), pct)
+    population = _level_population(disp, pop_mask)
+    lo, hi = np.nanpercentile(population, pct)
+    # Sparse cakes can contain far fewer non-zero bins than the upper-tail
+    # percentile (for example 49 positive bins in a 500x500 image).  In that
+    # case both percentile endpoints are zero even though real intensity is
+    # present, and pyqtgraph receives a degenerate colour range.  Only on that
+    # rare path, inspect the full ceiling-safe population and fall back to its
+    # finite extent.  Constant images deliberately keep their legacy equal
+    # levels; there is no additional contrast to recover.
+    if (expand_degenerate
+            and not (np.isfinite(lo) and np.isfinite(hi) and hi > lo)):
+        full_population = disp[pop_mask]
+        full_population = full_population[np.isfinite(full_population)]
+        if full_population.size:
+            full_lo = float(np.nanmin(full_population))
+            full_hi = float(np.nanmax(full_population))
+            if full_hi > full_lo:
+                lo, hi = full_lo, full_hi
     return (float(lo), float(hi))
 
 
@@ -257,7 +275,8 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
             return np.asarray(self.raw_image)
         return np.array(self.raw_image, dtype=float, copy=True)
 
-    def _cached_levels(self, scale, cmap, pct, data_range):
+    def _cached_levels(
+            self, scale, cmap, pct, data_range, *, expand_degenerate=False):
         raw = np.asarray(self.raw_image)
         displayed = np.asarray(self.displayed_image)
         key = (
@@ -269,13 +288,18 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
             str(raw.dtype),
             getattr(self, "_level_scan_token", None),
             tuple(data_range),
+            bool(expand_degenerate),
         )
         now = time.perf_counter()
         cached = self._level_cache
         if (cached is not None and cached.get("key") == key
                 and now - cached.get("time", 0.0) <= _LEVEL_CACHE_TTL_S):
             return cached["levels"], True
-        levels = _ceiling_safe_levels(displayed, raw, pct)
+        if expand_degenerate:
+            levels = _ceiling_safe_levels(
+                displayed, raw, pct, expand_degenerate=True)
+        else:
+            levels = _ceiling_safe_levels(displayed, raw, pct)
         self._level_cache = {"key": key, "time": now, "levels": levels}
         return levels, False
 
@@ -307,6 +331,8 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
         self.histogram.axis.setLogMode(False)
 
         linear_pct = tuple(kwargs.pop("linear_percentiles", (2, 98)))
+        expand_degenerate = bool(
+            kwargs.pop("expand_degenerate_levels", False))
         if scale == 'Log':
             min_val = np.nanmin(self.displayed_image)
             if min_val < 1:
@@ -345,7 +371,16 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
         # levels for the rest of the pause/scan. Identical re-renders still hit.
         low, high = _finite_minmax(self.displayed_image)
         levels, cache_hit = self._cached_levels(
-            scale, cmap, pct, (low, high))
+            scale, cmap, pct, (low, high),
+            expand_degenerate=expand_degenerate)
+        if expand_degenerate:
+            # The ordinary colorbar bound uses a stride sample.  A sparse cake
+            # may enter the full-population degenerate fallback precisely
+            # because that sample misses its few nonzero bins; ensure the
+            # recovered levels are not immediately clamped back to the sampled
+            # constant bound.
+            low = min(low, levels[0])
+            high = max(high, levels[1])
         t_levels = time.perf_counter() if perf else 0.0
         self.imageItem.setImage(self.displayed_image, levels=levels, **kwargs)
         t_setimage = time.perf_counter() if perf else 0.0

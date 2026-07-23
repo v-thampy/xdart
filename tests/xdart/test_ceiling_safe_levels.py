@@ -61,6 +61,32 @@ def test_all_nonfinite_returns_unit_range():
     assert out == (0.0, 1.0)
 
 
+def test_sparse_cake_degenerate_percentiles_fall_back_to_finite_extent():
+    """A mostly-zero cake can have both requested percentiles at zero even
+    though it contains real intensity.  Autoscale must retain a non-degenerate
+    range so those sparse peaks remain visible."""
+    cake = np.zeros((500, 500), dtype=float)
+    cake[65:72, 75:82] = np.arange(1.0, 50.0).reshape(7, 7)
+
+    assert tuple(np.nanpercentile(cake, (0.5, 99.5))) == (0.0, 0.0)
+    lo, hi = _ceiling_safe_levels(
+        cake, cake, (0.5, 99.5), expand_degenerate=True)
+
+    assert lo == 0.0
+    assert hi == 49.0
+
+
+def test_degenerate_detector_percentiles_keep_historical_contract():
+    """Cake contrast recovery must not turn one hot detector pixel into a
+    min/max autoscale regression."""
+    raw = np.full((100, 100), 10.0)
+    raw[50, 50] = 1000.0
+
+    assert _ceiling_safe_levels(raw, raw, (2, 98)) == (10.0, 10.0)
+    assert _ceiling_safe_levels(
+        raw, raw, (2, 98), expand_degenerate=True) == (10.0, 1000.0)
+
+
 def test_ceiling_derived_from_integer_dtype_not_hardcoded():
     """R3-D: the saturation ceiling is taken from the raw INTEGER dtype, not a
     hardcoded 65535.  A uint8 frame's 255 ceiling must be excluded from the

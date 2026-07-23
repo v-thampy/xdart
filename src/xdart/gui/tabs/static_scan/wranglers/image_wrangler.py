@@ -268,6 +268,8 @@ class imageWrangler(wranglerWidget):
         # Populated immediately before setup() for container-directory runs.
         self.source_run_plan = None
         self.source_index_session = None
+        self.source_frame_count_snapshot = {}
+        self.source_pending_count = 0
 
         # Setup gui elements
         self.ui = Ui_Form()
@@ -1301,6 +1303,10 @@ class imageWrangler(wranglerWidget):
         self.thread.inp_type = self.inp_type
         self.thread.source_run_plan = self.source_run_plan
         self.thread.source_index_session = self.source_index_session
+        self.thread.source_frame_count_snapshot = dict(
+            self.source_frame_count_snapshot or {})
+        self.thread.source_pending_count = int(
+            self.source_pending_count or 0)
 
         self.get_img_fname()
         self.thread.img_file = self.img_file
