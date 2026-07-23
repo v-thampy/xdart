@@ -219,6 +219,30 @@ def test_session_package_exposes_values_lazily_without_qt():
     from xrd_tools.session import RunIntent as PublicRunIntent
 
     assert PublicRunIntent is RunIntent
-    assert "qtpy" not in sys.modules
-    assert "pyqtgraph" not in sys.modules
     assert issubclass(FrozenRunConfiguration, object)
+
+    # R4B-13: import purity ("keeps xdart thin") must be proven in a FRESH
+    # interpreter.  Asserting ``"pyqtgraph" not in sys.modules`` in THIS process
+    # was order-fragile — any earlier Qt-importing test in the same pytest
+    # process left pyqtgraph resident and failed the assertion vacuously.  A
+    # subprocess isolates the fact under test: importing ``xrd_tools.session``
+    # must not drag in Qt/pyqtgraph.
+    import subprocess
+
+    code = (
+        "import sys\n"
+        "import xrd_tools.session as session\n"
+        "assert session.RunIntent is not None\n"
+        "leaked = sorted(\n"
+        "    name for name in sys.modules\n"
+        "    if name == 'qtpy' or name == 'pyqtgraph'\n"
+        "    or name.startswith('qtpy.') or name.startswith('pyqtgraph.')\n"
+        ")\n"
+        "assert not leaked, leaked\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr

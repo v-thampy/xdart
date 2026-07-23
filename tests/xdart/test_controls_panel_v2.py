@@ -698,12 +698,17 @@ def test_advanced_polarization_none_survives_dialog_round_trip_s10(
     widget = staticWidget()
     try:
         integrator = widget.integratorTree
-        # Polarization OFF is the fresh-scan default; pin the precondition.
-        widget.scan.bai_1d_args["polarization_factor"] = None
-        widget.scan.bai_2d_args["polarization_factor"] = None
+        # Pin the precondition through the PRODUCTION Controls seam (the panel's
+        # fieldValueChanged handler), not by writing the retired display-scan
+        # owner: R4-B made the Controls-owned intent the single writer of run
+        # configuration, and the Advanced dialog hydrates from it.  Turning
+        # polarization OFF here encodes ``polarization_factor=None`` on the
+        # intent AND projects it to the scan.
+        widget._on_controls_v2_field_changed(("Int1D", "apply_polarization"), False)
+        widget._on_controls_v2_field_changed(("Int2D", "apply_polarization"), False)
 
         # The REAL dialog-open path: builds the dialog and hydrates the live
-        # advanced trees from the scan args.
+        # advanced trees from the (intent-owned) integration args.
         widget._show_integration_advanced()
 
         # The checkbox must render the None-encoding as unchecked...
@@ -724,8 +729,10 @@ def test_advanced_polarization_none_survives_dialog_round_trip_s10(
         assert widget.scan.bai_1d_args["polarization_factor"] is None
         assert widget.scan.bai_2d_args["polarization_factor"] is None
 
-        # A deliberate ON round-trips its numeric value unchanged.
-        widget.scan.bai_1d_args["polarization_factor"] = 0.5
+        # A deliberate ON round-trips its numeric value unchanged.  Set it
+        # through the Controls seam (single owner) so the dialog hydrate reflects
+        # it, then re-hydrate the advanced trees.
+        widget._on_controls_v2_field_changed(("Int1D", "polarization_factor"), 0.5)
         widget._controls_v2_hydrate_advanced_from_scan()
         assert integrator.bai_1d_pars.child(
             "Apply polarization factor").value() is True
@@ -2920,7 +2927,13 @@ def test_controls_panel_v2_append_mismatch_same_target_stays_clickable(
             "bai_2d_args": {"unit": "q_A^-1"},
         }
         widget.scan._display_reduction_config = dict(widget.scan.reduction_config)
-        widget.scan.gi = True
+        # Enable Grazing through the PRODUCTION Controls seam (single owner)
+        # rather than writing the retired display-scan flag directly: this sets
+        # both the Controls-owned intent (which the Run-click freeze reads) and
+        # the projected scan (which _controls_v2_state's current_config reads),
+        # so the processed(Standard)-vs-current(Grazing) mismatch is detected
+        # both at state build and at Run click.
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
 
         state = widget._controls_v2_state()
         profile = build_control_profile(state)
@@ -5181,6 +5194,131 @@ def test_frame_boundary_paints_outgoing_list_before_rescope_dir1(
             f"outgoing scan's full list never painted; paints={paints}")
         # ...and the panel then rescoped to the new scan.
         assert widget.scan.name.startswith("scanB")
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_gi_mirror_blocks_child_signals_no_setup_reentry(qapp, monkeypatch):
+    """R4B-9 (O-1a-i item 6): the run-boundary GI mirror into the hidden wrangler
+    tree must not fire the child-level θ-motor handlers or re-enter
+    ``wrangler.setup()``.  Blocking only the ROOT Parameter left
+    ``GI.th_motor``/``GI.th_val`` ``sigValueChanged`` connected to
+    ``set_gi_th_motor`` (which writes ``wrangler.incidence_motor``); the mirror
+    must block each written child's own signals too so the hidden tree stays a
+    pure output adapter."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        wrangler = widget.wrangler
+        params = wrangler.parameters
+        th_motor = params.child("GI", "th_motor")
+        # Offer a real motor so the mirror actually CHANGES the value (a no-op
+        # setValue would not emit even without the block).
+        th_motor.setOpts(limits=["Manual", "halpha"], value="Manual")
+
+        setup_calls = []
+        orig_setup = wrangler.setup
+
+        def _counting_setup(*a, **k):
+            setup_calls.append(1)
+            return orig_setup(*a, **k)
+
+        monkeypatch.setattr(wrangler, "setup", _counting_setup)
+
+        child_fires = []
+        params.child("GI", "th_motor").sigValueChanged.connect(
+            lambda *a: child_fires.append(("th_motor",) + a[:0]))
+        params.child("GI", "th_val").sigValueChanged.connect(
+            lambda *a: child_fires.append(("th_val",)))
+
+        # Build exactly one frozen configuration with GI enabled and a motor that
+        # differs from the current hidden-tree value, then mirror it.
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        widget._on_controls_v2_field_changed(("GI", "th_motor"), "halpha")
+        frozen = widget._controls_v2_ensure_run_intent().freeze()
+        widget._push_gi_to_wrangler(frozen)
+
+        assert child_fires == [], (
+            "GI mirror fired child-level θ-motor handlers during the mirror "
+            f"(setup/incidence_motor write-back risk): {child_fires}")
+        assert setup_calls == [], "GI mirror re-entered wrangler.setup()"
+        # The hidden tree still received the mirrored value (its adapter role).
+        assert th_motor.value() == "halpha"
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_run_active_edit_deferred_to_next_run_with_notice(qapp, monkeypatch):
+    """R4B-12 (O-1a-i item 8): a Controls edit made during an active run is not
+    silently dropped.  It is deferred to the next run's intent (applied through
+    the normal handler at run end) and the operator is told, replacing the old
+    debug-level discard."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        notices = []
+        widget.wrangler.showLabel.connect(lambda m: notices.append(str(m)))
+
+        assert widget._controls_v2_ensure_run_intent().gi.enabled is False
+
+        widget._enter_run_state()
+        assert widget._controls_v2_run_active() is True
+
+        # Edit during the run: it must NOT mutate the running intent...
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        assert widget._controls_v2_ensure_run_intent().gi.enabled is False, (
+            "run-active edit mutated the in-flight run intent")
+        assert any("next run" in m.lower() for m in notices), (
+            f"no visible next-run notice for a run-active edit: {notices}")
+        assert list(getattr(widget, "_controls_v2_deferred_field_edits", [])), (
+            "run-active edit was not queued as next-run intent")
+
+        # ...and it lands in the next-run intent when the run ends.
+        widget._exit_run_state()
+        assert widget._controls_v2_ensure_run_intent().gi.enabled is True, (
+            "deferred run-active edit was not applied at run end")
+        assert list(
+            getattr(widget, "_controls_v2_deferred_field_edits", [])) == []
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_apply_snapshot_to_scan_in_place_not_aliased(qapp, monkeypatch):
+    """R4B-15 (O-1a-i item 9) + orchestrator amendment: projecting the Controls
+    snapshot onto the display scan mutates the existing ``bai_*_args`` dicts IN
+    PLACE (stable identity for held references — the S10 polarization round-trip)
+    while introducing NO aliasing with the Controls-owned intent (the single
+    writer of run configuration)."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        intent = widget._controls_v2_ensure_run_intent()
+        widget._controls_v2_ensure_native_int_defaults()
+        held_1d = widget.scan.bai_1d_args
+        held_2d = widget.scan.bai_2d_args
+
+        widget._controls_v2_apply_snapshot_to_scan(
+            widget._controls_v2_native_int_snapshot())
+
+        # Stable identity: the held references still ARE the scan's dicts.
+        assert widget.scan.bai_1d_args is held_1d
+        assert widget.scan.bai_2d_args is held_2d
+        # No aliasing with the intent: distinct objects both ways.
+        assert widget.scan.bai_1d_args is not intent.bai_1d_args
+        assert widget.scan.bai_2d_args is not intent.bai_2d_args
+        widget.scan.bai_1d_args["__probe_scan__"] = 123
+        assert "__probe_scan__" not in intent.bai_1d_args
+        intent.bai_1d_args["__probe_intent__"] = 456
+        assert "__probe_intent__" not in widget.scan.bai_1d_args
     finally:
         widget.close()
         widget.deleteLater()

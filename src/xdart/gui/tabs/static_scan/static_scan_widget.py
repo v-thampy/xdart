@@ -1430,13 +1430,19 @@ class staticWidget(QWidget):
                 # 'th' default from LiveScan) that is NOT one of the loaded
                 # source's real motors must not be shown — fall to the shared
                 # default policy over the actual choices.  A genuine saved motor
-                # (present in the choices) or 'Manual' is kept as-is.
+                # (a real gi_config or an explicit user pick) is kept as-is even
+                # when the source's motor list is not yet populated; but an
+                # unverifiable, non-explicit leftover ('th' with no motors listed)
+                # must still resolve to the default (Manual with no choices) so it
+                # can never surface as a phantom selection (R4B-15).
                 if motor != "Manual":
                     choices = self._controls_v2_native_int_choices().get(
                         ("GI", "th_motor"), ())
                     real_choices = tuple(
                         item for item in choices if str(item) != "Manual")
-                    if real_choices and motor not in choices:
+                    explicit = bool(
+                        getattr(self, "_controls_v2_gi_selection_explicit", False))
+                    if motor not in choices and (real_choices or not explicit):
                         motor = self._controls_v2_default_gi_motor()
         sample_orientation = gi_intent.sample_orientation
         tilt_angle = gi_intent.tilt_angle
@@ -1478,6 +1484,21 @@ class staticWidget(QWidget):
         scan.sample_orientation = int(cfg["sample_orientation"] or 4)
         scan.tilt_angle = float(cfg["tilt_angle"] or 0.0)
 
+    def _controls_v2_sync_integrator_gi_motor(self, motor) -> None:
+        """Point the integrator's GI θ-motor combo at *motor* (the two θ-motor
+        surfaces must never disagree — CLAUDE.md GI rule).  No-op when the combo
+        does not offer *motor* or is already there."""
+        it = getattr(self, "integratorTree", None)
+        combo = getattr(getattr(it, "ui", None), "gi_motor", None)
+        if combo is None:
+            return
+        try:
+            idx = combo.findText(str(motor))
+            if idx >= 0 and combo.currentIndex() != idx:
+                combo.setCurrentIndex(idx)
+        except Exception:
+            logger.debug("integrator GI motor combo sync failed", exc_info=True)
+
     def _controls_v2_set_gi_field(self, leaf: str, value) -> None:
         scan = getattr(self, "scan", None)
         intent = self._controls_v2_ensure_run_intent()
@@ -1497,14 +1518,14 @@ class staticWidget(QWidget):
                 picked = self._controls_v2_default_gi_motor()
                 if picked != "Manual":
                     cfg["incidence_motor"] = picked
-                    # Keep the integrator combo equal (the two θ-motor
-                    # surfaces must never disagree — CLAUDE.md GI rule).
-                    it = getattr(self, "integratorTree", None)
-                    combo = getattr(getattr(it, "ui", None), "gi_motor", None)
-                    if combo is not None:
-                        idx = combo.findText(picked)
-                        if idx >= 0:
-                            combo.setCurrentIndex(idx)
+            # Keep the integrator combo equal to whatever motor the config
+            # resolved (the two θ-motor surfaces must never disagree — CLAUDE.md
+            # GI rule).  R4B-15: ``_controls_v2_gi_config`` may already have
+            # repicked a stale 'th'→real motor before this handler ran, so the
+            # combo must be synced to the resolved value even when the Manual
+            # re-pick branch above did not fire.
+            if cfg["gi"]:
+                self._controls_v2_sync_integrator_gi_motor(cfg["incidence_motor"])
         elif leaf == "th_motor":
             cfg["incidence_motor"] = str(value)
             self._controls_v2_gi_selection_explicit = True
@@ -1533,6 +1554,25 @@ class staticWidget(QWidget):
             self._controls_v2_apply_gi_config_to_scan(cfg)
 
     @staticmethod
+    def _controls_v2_replace_dict_in_place(scan, attr, value) -> None:
+        """Project a run-config mapping onto the display scan by CLEAR+UPDATE.
+
+        R4B-15: replacing ``scan.bai_1d_args`` with a fresh object on every
+        Controls edit invalidated held references in the reintegration/display
+        paths (the S10 polarization round-trip lost its dict).  Mutating the
+        existing dict in place keeps a stable identity while a deep copy of the
+        snapshot value guarantees NO aliasing with the Controls-owned intent
+        (the intent stays the single writer of run configuration).
+        """
+        fresh = copy.deepcopy(value) if isinstance(value, dict) else {}
+        existing = getattr(scan, attr, None)
+        if isinstance(existing, dict):
+            existing.clear()
+            existing.update(fresh)
+        else:
+            setattr(scan, attr, fresh)
+
+    @staticmethod
     def _controls_v2_apply_native_int_snapshot_to_scan(
         snapshot: dict,
         scan,
@@ -1542,10 +1582,13 @@ class staticWidget(QWidget):
         lock = getattr(scan, "scan_lock", None)
 
         def _apply():
-            scan.bai_1d_args = copy.deepcopy(snapshot.get("bai_1d_args", {}) or {})
-            scan.bai_2d_args = copy.deepcopy(snapshot.get("bai_2d_args", {}) or {})
+            staticWidget._controls_v2_replace_dict_in_place(
+                scan, "bai_1d_args", snapshot.get("bai_1d_args", {}) or {})
+            staticWidget._controls_v2_replace_dict_in_place(
+                scan, "bai_2d_args", snapshot.get("bai_2d_args", {}) or {})
             scan.gi = bool(snapshot.get("gi", False))
-            scan.gi_config = copy.deepcopy(snapshot.get("gi_config", {}) or {})
+            staticWidget._controls_v2_replace_dict_in_place(
+                scan, "gi_config", snapshot.get("gi_config", {}) or {})
             for attr in (
                 "incidence_motor",
                 "th_mtr",
@@ -2634,11 +2677,59 @@ class staticWidget(QWidget):
             if cache is not None and hasattr(cache, "plan_builder"):
                 cache.plan_builder = builder
 
-    def _on_controls_v2_field_changed(self, path, value) -> None:
-        if self._controls_v2_run_active():
-            logger.debug("Ignoring Controls V2 edit during active run: %s", path)
-            return
+    def _controls_v2_defer_field_edit(self, path, value) -> None:
+        """Queue a run-active Controls edit as next-run intent (R4B-12).
+
+        The edit is NOT applied to the running scan/integrator (that would
+        corrupt the in-flight run); it is replayed through the normal field
+        handler when the run ends, so it lands in the next run's ``RunIntent``.
+        A visible status notice replaces the previous silent debug-level drop.
+        """
         path = tuple(path)
+        deferred = getattr(self, "_controls_v2_deferred_field_edits", None)
+        if not isinstance(deferred, list):
+            deferred = []
+        # Last write wins per field path.
+        deferred = [(p, v) for (p, v) in deferred if p != path]
+        deferred.append((path, value))
+        self._controls_v2_deferred_field_edits = deferred
+        try:
+            self.wrangler.showLabel.emit(
+                "Change saved — it will apply to the next run.")
+        except Exception:
+            logger.debug("could not surface deferred-edit notice",
+                         exc_info=True)
+        run_config_debug_log(
+            logger,
+            "controls_field_deferred_active_run",
+            widget=self,
+            origin="controls_v2_ui",
+            field_path=list(path),
+            field_value=value,
+            deferred_pending=len(deferred),
+        )
+
+    def _controls_v2_replay_deferred_field_edits(self) -> None:
+        """Apply run-active deferred edits into the next-run intent (R4B-12)."""
+        deferred = getattr(self, "_controls_v2_deferred_field_edits", None)
+        if not deferred:
+            return
+        self._controls_v2_deferred_field_edits = []
+        for path, value in deferred:
+            try:
+                self._on_controls_v2_field_changed(path, value)
+            except Exception:
+                logger.debug(
+                    "deferred Controls edit replay failed for %s", path,
+                    exc_info=True)
+
+    def _on_controls_v2_field_changed(self, path, value) -> None:
+        path = tuple(path)
+        if self._controls_v2_run_active():
+            # R4B-12: never silently drop a run-active edit — defer it to the
+            # next run and tell the user (see _controls_v2_defer_field_edit).
+            self._controls_v2_defer_field_edit(path, value)
+            return
         if path and path[0] in {"Signal", "Source"}:
             self._controls_v2_source_energy_cache = None
             self._controls_v2_metadata_probe_cache = None
@@ -5321,20 +5412,36 @@ class staticWidget(QWidget):
         root for the whole transaction makes these hidden parameters output
         adapters: a mirror cannot synchronously re-enter setup and reread a
         half-updated run configuration.
+
+        R4B-9: blocking the ROOT alone is not enough.  Individual child
+        Parameters carry their own direct ``sigValueChanged`` connections
+        (``GI.th_motor``/``GI.th_val`` → ``set_gi_th_motor``, which writes
+        ``wrangler.incidence_motor``).  Those fire synchronously on ``setValue``
+        regardless of the root block, so each written child's own signals are
+        blocked for the duration of its ``setValue`` too — the hidden tree stays
+        a pure output adapter with no write-back into the run.
         """
         if parameters is None:
             return
         previous = parameters.blockSignals(True)
+        child_blocked = []
         try:
             for path, value in values:
                 try:
                     parameter = parameters.child(*path)
                     if parameter.value() != value:
+                        prev_child = parameter.blockSignals(True)
+                        child_blocked.append((parameter, prev_child))
                         parameter.setValue(value)
                 except Exception:
                     # Wrangler schemas are intentionally heterogeneous.
                     continue
         finally:
+            for parameter, prev_child in child_blocked:
+                try:
+                    parameter.blockSignals(prev_child)
+                except Exception:
+                    continue
             parameters.blockSignals(previous)
 
     def _push_threshold_to_wrangler(self, run_configuration=None):
@@ -8035,6 +8142,11 @@ class staticWidget(QWidget):
                 immediate=True,
                 preserve_focused_editor=False,
             )
+        # R4B-12: the run is fully idle again — apply any edits the operator made
+        # during the run into the (now) next-run intent through the normal
+        # handler.  Done last so run_active is already False and the edits are
+        # not treated as a second round of deferrals.
+        self._controls_v2_replay_deferred_field_edits()
 
     def _on_stop_clicked(self):
         """Single owner of the shared Stop button — route to the active run.
