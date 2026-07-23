@@ -122,6 +122,7 @@ def test_chunked_stack_descriptor(tmp_path):
     assert d.dtype == np.dtype(np.uint16)
     assert d.chunks == (2, 16, 16)
     assert d.is_2d is False
+    assert d.self_contained is True
     assert d.scan_name == "chunked"
     assert d.finalized is True
     assert d.frame_bytes == 16 * 16 * 2
@@ -179,6 +180,7 @@ def test_single_link_eiger_master(tmp_path):
     assert d.dataset_path == "/entry/data/data_000001"
     assert d.segment_paths == ()  # single segment
     assert d.chunks == (2, 8, 8)
+    assert d.self_contained is False
 
 
 def test_multi_segment_eiger_concatenates_frames(tmp_path):
@@ -432,3 +434,40 @@ def test_detector_at_non_entry_location_is_found(tmp_path):
     assert d.state is ProbeState.READY
     assert d.dataset_path == "/data"
     assert d.frame_count == 3
+
+
+def test_apstools_flat_nxwriter_uses_direct_detector_contract(
+        tmp_path, monkeypatch):
+    """The qualified fast path avoids a recursive whole-file detector walk."""
+    from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter
+    from xrd_tools.sources import descriptor as descriptor_module
+
+    path = _write_bluesky_nxwriter(tmp_path / "flat_00001.nxs", n=6)
+    monkeypatch.setattr(
+        descriptor_module,
+        "resolve_stack_paths",
+        lambda *_args, **_kwargs: pytest.fail(
+            "qualified flat NXWriter fell back to recursive detector search"),
+    )
+
+    descriptor = describe_container(path)
+
+    assert descriptor.state is ProbeState.READY
+    assert descriptor.dataset_path == "/entry/data/eiger_image"
+    assert descriptor.frame_count == 6
+    assert descriptor.self_contained is True
+
+
+def test_apstools_flat_detector_does_not_hide_canonical_rank_error(tmp_path):
+    from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter
+
+    path = _write_bluesky_nxwriter(tmp_path / "bad_rank_00001.nxs", n=2)
+    with h5py.File(path, "r+") as handle:
+        canonical = handle["entry/instrument"].create_group("detector")
+        canonical.create_dataset(
+            "data", data=np.zeros((1, 2, 3, 4), dtype=np.uint16))
+
+    descriptor = describe_container(path)
+
+    assert descriptor.state is ProbeState.INVALID
+    assert "rank 4" in descriptor.reason

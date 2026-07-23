@@ -1235,6 +1235,40 @@ def test_frame_source_for_rejects_neighbour_files(tmp_path):
     assert got == keep, f"strict factory admitted neighbour files: {got}"
 
 
+def test_frame_source_for_uses_same_frozen_membership_as_worker(tmp_path):
+    """GI scouting cannot admit a TIFF that landed after the Run snapshot."""
+    from types import MethodType, SimpleNamespace
+
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+    from xrd_tools.sources import image_series_spec
+
+    frozen = [tmp_path / f"scan_{index:04d}.tif" for index in range(1, 4)]
+    for path in frozen:
+        path.touch()
+    spec = image_series_spec(frozen[1])
+    (tmp_path / "scan_0004.tif").touch()
+
+    w = SimpleNamespace(
+        single_img=False,
+        inp_type="Image Series",
+        img_file=str(frozen[1]),
+        img_dir=str(tmp_path),
+        scan_name="scan",
+        img_ext="tif",
+        meta_ext="txt",
+        meta_dir=str(tmp_path),
+        source_spec=spec,
+        _enumerate_scan_files=lambda: (_ for _ in ()).throw(
+            AssertionError("frozen GI membership must not re-enumerate")),
+    )
+    w._frame_source_for = MethodType(imageThread._frame_source_for, w)
+
+    source = w._frame_source_for(None)
+
+    assert source.name == "scan"
+    assert tuple(source.files) == tuple(frozen)
+
+
 def test_gi_prepass_scout_indices_map_back_to_noncontiguous_files(tmp_path):
     """Codex gate: a :class:`TiffSeriesSource` labels frames by POSITION
     (1..N) in the strict file list, so ``prepare_gi_freeze`` returns POSITIONAL

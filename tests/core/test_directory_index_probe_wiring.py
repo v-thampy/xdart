@@ -111,11 +111,13 @@ def test_in_progress_via_real_unfinalized_bluesky_fixture(tmp_path):
 
     result = index.probe_candidate(_candidate_for(tmp_path, "writing.nxs"))
     assert result.state is ProbeState.IN_PROGRESS   # inside the bounded window
+    assert result.descriptor is not None
+    assert result.descriptor.finalized is False
+    assert index.retry_state(tmp_path / "writing.nxs") is not None
 
 
-def test_imageless_stays_provisional_then_terminal_via_real_shell_fixture(tmp_path):
-    """The exact "newly readable shell... not permanently retired as
-    imageless" policy, end-to-end through probe_candidate."""
+def test_finalized_imageless_is_terminal_via_real_shell_fixture(tmp_path):
+    """A readable finalized detectorless record is ignored immediately."""
     _nxs_imageless(tmp_path / "shell.nxs")
     clock = _FakeClock()
     index = DirectoryIndex(tmp_path, clock=clock, retry_deadline=10.0)
@@ -123,11 +125,50 @@ def test_imageless_stays_provisional_then_terminal_via_real_shell_fixture(tmp_pa
     candidate = _candidate_for(tmp_path, "shell.nxs")
 
     first = index.probe_candidate(candidate)
-    assert first.state is ProbeState.IN_PROGRESS   # NOT trusted as imageless yet
+    assert first.state is ProbeState.IMAGELESS
+    assert first.descriptor is not None
+    assert first.descriptor.finalized is True
+    assert index.retry_state(candidate.path) is None
+    assert index.probe_candidate(candidate) is first
 
-    clock.advance(11.0)   # past the deadline; file never changed
-    final = index.probe_candidate(candidate)
-    assert final.state is ProbeState.IMAGELESS      # now trusted as terminal
+
+def test_probe_rejects_file_changed_after_descriptor_inspection(
+    tmp_path, monkeypatch,
+):
+    """A post-open mutation cannot retain READY facts under the old stamp."""
+    from dataclasses import replace
+
+    import pytest
+
+    from xrd_tools.sources import adapters as adapter_module
+    from xrd_tools.sources.directory_index import StaleCandidateError
+
+    path = _nxs_ready(tmp_path / "racing.nxs")
+    index = DirectoryIndex(tmp_path, clock=_FakeClock())
+    index.poll()
+    candidate = _candidate_for(tmp_path, path.name)
+
+    entry = adapter_module._ADAPTERS[candidate.adapter_id]
+    original_probe = entry.adapter.probe
+
+    def racing_probe(probe_path):
+        result = original_probe(probe_path)
+        with Path(probe_path).open("ab") as stream:
+            stream.write(b"x")
+        return result
+
+    monkeypatch.setitem(
+        adapter_module._ADAPTERS,
+        candidate.adapter_id,
+        replace(
+            entry,
+            adapter=replace(entry.adapter, probe=racing_probe),
+        ),
+    )
+
+    with pytest.raises(StaleCandidateError, match="changed while"):
+        index.probe_candidate(candidate)
+    assert index.retry_state(path) is None
 
 
 def test_invalid_via_real_corrupt_image_file(tmp_path):

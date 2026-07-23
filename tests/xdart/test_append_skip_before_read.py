@@ -78,9 +78,11 @@ def _bare_worker(tmp_path):
 
 
 def _write_minimal_integrated_nxs(
-        path, labels, *, labels_2d=None, reduction_config=None):
+        path, labels, *, labels_2d=None, reduction_config=None,
+        source_path=None, source_snapshot=None):
     import h5py
     from xrd_tools.core.provenance import write_provenance
+    from xrd_tools.io.nexus_record import write_frame_source_ref
 
     labels = np.asarray(labels, dtype=np.int64)
     q = np.linspace(0.1, 1.0, 4, dtype=np.float32)
@@ -104,6 +106,16 @@ def _write_minimal_integrated_nxs(
             g2 = entry.create_group("integrated_2d")
             g2.create_dataset(
                 "frame_index", data=np.asarray(labels_2d, dtype=np.int64))
+        if source_path is not None and labels.size:
+            frames = entry.create_group("frames")
+            frame = frames.create_group(
+                f"frame_{int(labels.max()):04d}")
+            write_frame_source_ref(
+                frame,
+                source_path,
+                int(labels.max()) - 1,
+                source_snapshot=source_snapshot,
+            )
         if reduction_config is not None:
             write_provenance(h5, config=reduction_config, host="")
 
@@ -174,8 +186,10 @@ def test_append_image_series_skips_before_reader_and_metadata(monkeypatch, tmp_p
     assert worker._append_skip_without_reading == 2
 
 
-def test_image_series_start_filter_uses_parsed_frame_index(monkeypatch, tmp_path):
-    """Unpadded/dash-index filenames must not be filtered by path text order."""
+def test_image_series_selected_member_does_not_truncate_full_series(
+    monkeypatch, tmp_path,
+):
+    """The selected member is context, not a lower frame bound."""
     paths = [
         tmp_path / "scan_1.tif",
         tmp_path / "scan-2.tif",
@@ -192,6 +206,8 @@ def test_image_series_start_filter_uses_parsed_frame_index(monkeypatch, tmp_path
     worker.scan_name = "scan"
     worker.img_fnames = []
     worker.processed = []
+    from xrd_tools.sources import image_series_spec
+    worker.source_spec = image_series_spec(paths[1])
 
     read_calls = []
 
@@ -201,12 +217,14 @@ def test_image_series_start_filter_uses_parsed_frame_index(monkeypatch, tmp_path
 
     monkeypatch.setattr(iwt, "read_image", fake_read)
 
-    first = worker.get_next_image()
-    second = worker.get_next_image()
+    observed = [worker.get_next_image() for _ in paths]
 
-    assert (Path(first[0]).name, first[2]) == ("scan-2.tif", 2)
-    assert (Path(second[0]).name, second[2]) == ("scan_10.tif", 10)
-    assert read_calls == ["scan-2.tif", "scan_10.tif"]
+    assert [(Path(item[0]).name, item[2]) for item in observed] == [
+        ("scan_1.tif", 1),
+        ("scan-2.tif", 2),
+        ("scan_10.tif", 10),
+    ]
+    assert read_calls == ["scan_1.tif", "scan-2.tif", "scan_10.tif"]
 
 
 def test_single_image_append_skip_emits_update_without_reader(monkeypatch, tmp_path):
@@ -586,6 +604,44 @@ def _current_candidate(path):
         path, owner.id, int(stat.st_size), int(stat.st_mtime_ns))
 
 
+def test_live_idle_recursive_discovery_is_bounded_per_reader_request(tmp_path):
+    """An accidental broad root cannot be fully traversed in one live tick."""
+    from xrd_tools.sources import DirectorySourceSpec
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    for index in range(150):
+        child = raw_dir / f"child_{index:03d}"
+        child.mkdir()
+        (child / "notes.txt").write_text("not a source")
+
+    worker = _bare_worker(tmp_path)
+    worker.inp_type = "Image Directory"
+    worker.img_ext = "nxs"
+    worker.img_dir = str(raw_dir)
+    worker.include_subdir = True
+    worker.source_spec = DirectorySourceSpec(
+        raw_dir, recursive=True, suffixes=(".nxs",))
+    worker.source_run_plan = None
+    worker.source_index_session = None
+    worker.live_mode = True
+    worker._eiger_master_path = None
+    worker._eiger_frame_idx = 0
+    worker._eiger_nframes = 0
+    worker._eiger_master_queue = deque()
+    worker._directory_walk_iter = None
+    worker._eiger_done_masters = set()
+    worker._eiger_retry_after = {}
+    worker._eiger_zero_frame_seen = {}
+    worker._eiger_master_candidate = None
+    worker._eiger_open_state = None
+
+    assert worker._get_next_eiger_frame_sync() == (
+        None, None, 1, None, {})
+    assert worker._directory_walk_iter is not None
+    assert worker._eiger_done_masters == set()
+
+
 def test_complete_append_master_uses_count_hint_without_raw_open(
         monkeypatch, tmp_path):
     """A restarted Append run retires a complete container as one unit."""
@@ -638,6 +694,135 @@ def test_complete_append_master_uses_count_hint_without_raw_open(
     assert worker._append_skip_without_reading == 6
     assert worker._discovered_frame_count == 6
     assert worker._skip_reason_counts == Counter({"already processed": 6})
+
+
+def test_restarted_append_uses_persisted_source_stamp_without_raw_open(
+        monkeypatch, tmp_path):
+    """A new worker can validate a completed self-contained source by stat.
+
+    The optimization evidence lives in the processed product, not only in a
+    same-process GUI memo.  Directory enumeration remains lazy and the raw
+    container is never opened when its exact stamp and full extent match.
+    """
+    from xrd_tools.sources import DirectorySourceSpec
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    raw = raw_dir / "scan.nxs"
+    raw.write_bytes(b"stable self-contained source identity")
+    candidate = _current_candidate(raw)
+
+    worker = _bare_worker(tmp_path)
+    worker.inp_type = "Image Directory"
+    worker.img_ext = "nxs"
+    worker.img_dir = str(raw_dir)
+    worker.source_spec = DirectorySourceSpec(
+        raw_dir, suffixes=(".nxs",))
+    worker.source_run_plan = None
+    worker.source_index_session = None
+    worker.source_frame_count_snapshot = {}
+    worker.live_mode = False
+    worker._eiger_master_path = None
+    worker._eiger_frame_idx = 0
+    worker._eiger_nframes = 0
+    worker._eiger_master_queue = deque()
+    worker._directory_walk_iter = None
+    worker._eiger_done_masters = set()
+    worker._eiger_retry_after = {}
+    worker._eiger_zero_frame_seen = {}
+    worker._eiger_master_candidate = None
+    worker._eiger_open_state = None
+    worker._eiger_cursor = None
+    worker._eiger_descriptor = None
+    worker._eiger_read_plan = None
+    worker._eiger_provider = None
+    worker._eiger_fabio_handle = None
+    worker._source_snapshot_by_path = {}
+
+    out = Path(worker.h5_dir)
+    out.mkdir()
+    _write_minimal_integrated_nxs(
+        out / "scan.nxs",
+        range(1, 7),
+        source_path=raw,
+        source_snapshot={
+            "size": candidate.size,
+            "mtime_ns": candidate.mtime_ns,
+            "frame_count": 6,
+            "dataset_path": "/entry/data/detector",
+            "self_contained": True,
+        },
+    )
+    monkeypatch.setattr(
+        worker,
+        "_eiger_open_master",
+        lambda _path: pytest.fail(
+            "unchanged complete source was opened"),
+    )
+
+    assert worker._get_next_eiger_frame_sync() == (
+        None, None, 1, None, {})
+    assert worker._eiger_done_masters == {str(raw)}
+    assert worker._append_skip_without_reading == 6
+    assert worker._append_source_snapshot_by_scan["scan"][
+        "frame_count"] == 6
+
+
+def test_changed_source_stamp_invalidates_persisted_append_extent(tmp_path):
+    """A growing/replaced source never inherits an old complete decision."""
+    raw = tmp_path / "scan.nxs"
+    raw.write_bytes(b"old")
+    old = _current_candidate(raw)
+
+    worker = _bare_worker(tmp_path)
+    worker._eiger_done_masters = set()
+    out = Path(worker.h5_dir)
+    out.mkdir()
+    _write_minimal_integrated_nxs(
+        out / "scan.nxs",
+        range(1, 7),
+        source_path=raw,
+        source_snapshot={
+            "size": old.size,
+            "mtime_ns": old.mtime_ns,
+            "frame_count": 6,
+            "self_contained": True,
+        },
+    )
+
+    raw.write_bytes(b"new source extent is larger")
+    current = _current_candidate(raw)
+    assert current.version_stamp != old.version_stamp
+    assert worker._eiger_skip_complete_append_master(
+        str(raw), current) is False
+    assert worker._eiger_done_masters == set()
+
+
+def test_eiger_master_never_uses_persisted_mtime_as_completeness(tmp_path):
+    """External Eiger data can grow while the master stamp stays unchanged."""
+    raw = tmp_path / "scan_master.h5"
+    raw.write_bytes(b"stable master bytes, external data may grow")
+    candidate = _current_candidate(raw)
+
+    worker = _bare_worker(tmp_path)
+    worker._eiger_done_masters = set()
+    out = Path(worker.h5_dir)
+    out.mkdir()
+    _write_minimal_integrated_nxs(
+        out / "scan.nxs",
+        range(1, 7),
+        source_path=raw,
+        source_snapshot={
+            "size": candidate.size,
+            "mtime_ns": candidate.mtime_ns,
+            "frame_count": 6,
+            "self_contained": False,
+        },
+    )
+
+    assert worker._eiger_skip_complete_append_master(
+        str(raw), candidate) is False
+    assert worker._eiger_done_masters == set()
 
 
 def test_cold_append_opens_complete_master_once_without_frame_index_walk(
@@ -714,6 +899,72 @@ def test_cold_append_opens_complete_master_once_without_frame_index_walk(
     assert worker._discovered_frame_count == 6
     assert worker._skip_reason_counts == Counter({"already processed": 6})
     assert worker._eiger_cursor is None
+
+
+def test_cold_append_tail_seek_accounts_completed_prefix(tmp_path):
+    raw = tmp_path / "scan.nxs"
+    raw.touch()
+    worker = _bare_worker(tmp_path)
+    worker.inp_type = "Image Directory"
+    worker._eiger_master_path = str(raw)
+    worker._eiger_nframes = 7
+    worker._eiger_frame_idx = 0
+    worker._eiger_cursor = object()
+    worker._eiger_descriptor = object()
+    worker._append_skip_frames_by_scan = {
+        "scan": set(range(1, 6))}
+
+    assert worker._eiger_skip_open_complete_append_master() is False
+    assert worker._eiger_frame_idx == 5
+    assert worker._append_skip_without_reading == 5
+    assert worker._discovered_frame_count == 5
+    assert worker._skip_reason_counts == Counter(
+        {"already processed": 5})
+
+
+def test_external_nexus_master_reopens_then_seeks_missing_tail(tmp_path):
+    """External masters use their current open extent, never persisted mtime."""
+    import h5py
+
+    target = tmp_path / "scan_data_000001.h5"
+    with h5py.File(target, "w") as handle:
+        handle.create_dataset(
+            "frames", data=np.zeros((7, 3, 4), dtype=np.uint16))
+    master = tmp_path / "scan.nxs"
+    with h5py.File(master, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        data = entry.create_group("data")
+        data["data_000001"] = h5py.ExternalLink(
+            target.name, "/frames")
+
+    worker = _bare_worker(tmp_path)
+    worker.inp_type = "Image Directory"
+    worker._eiger_master_path = str(master)
+    worker._eiger_master_candidate = _current_candidate(master)
+    worker._eiger_frame_idx = 0
+    worker._eiger_nframes = 0
+    worker._eiger_cursor = None
+    worker._eiger_descriptor = None
+    worker._eiger_read_plan = None
+    worker._eiger_provider = None
+    worker._eiger_fabio_handle = None
+    worker._eiger_metadata_cache = {}
+    worker._bluesky_source_cache = {}
+    worker.sigContainerCount = None
+    worker._append_skip_frames_by_scan = {
+        "scan": set(range(1, 6))}
+
+    worker._eiger_open_master(str(master))
+    try:
+        assert worker._eiger_nframes == 7
+        assert worker._eiger_descriptor.self_contained is False
+        assert worker._eiger_open_count_can_bulk_compare(str(master)) is True
+        assert worker._eiger_skip_open_complete_append_master() is False
+        assert worker._eiger_frame_idx == 5
+        assert worker._append_skip_without_reading == 5
+    finally:
+        worker._eiger_close_master()
 
 
 def test_complete_append_directory_retires_1800_frames_without_raw_open(

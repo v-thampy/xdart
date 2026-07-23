@@ -272,6 +272,7 @@ class imageWrangler(wranglerWidget):
         # H19: immutable Source-card baseline + serialized headless index owner.
         # Populated immediately before setup() for container-directory runs.
         self.source_run_plan = None
+        self.source_spec = None
         self.source_index_session = None
         self.source_frame_count_snapshot = {}
         self.source_pending_count = 0
@@ -1329,6 +1330,7 @@ class imageWrangler(wranglerWidget):
         self.inp_type = self.parameters.child('Signal').child('inp_type').value()
         self.thread.inp_type = self.inp_type
         self.thread.source_run_plan = self.source_run_plan
+        self.thread.source_spec = self.source_spec
         self.thread.source_index_session = self.source_index_session
         self.thread.source_frame_count_snapshot = dict(
             self.source_frame_count_snapshot or {})
@@ -1337,6 +1339,7 @@ class imageWrangler(wranglerWidget):
 
         self.get_img_fname()
         self.thread.img_file = self.img_file
+        self.thread.file_filter = self.file_filter
 
         # Container numeric suffixes are scan identity, while image-series
         # numeric suffixes are frame identity.  Use the canonical source rule
@@ -1348,7 +1351,9 @@ class imageWrangler(wranglerWidget):
         self.thread.single_img = self.single_img
         self.thread.img_dir, self.thread.img_ext = self.img_dir, self.img_ext
 
-        self.include_subdir = self.parameters.child('Signal').child('include_subdir').value()
+        if self.inp_type != "Image Directory":
+            self.include_subdir = self.parameters.child(
+                'Signal').child('include_subdir').value()
         self.thread.include_subdir = self.include_subdir
 
         self.thread.series_average = self.series_average
@@ -1594,7 +1599,7 @@ class imageWrangler(wranglerWidget):
                 )
             return False
         if (not self.img_file and not getattr(self, 'stitch_mode', False)
-                and not imageWrangler._h19_empty_directory_live_run_ok(self)):
+                and not imageWrangler._directory_run_without_seed_ok(self)):
             imageWrangler._safe_status_text(
                 self,
                 'Choose an image source to run. Use Reintegrate for a loaded processed scan.',
@@ -1604,26 +1609,13 @@ class imageWrangler(wranglerWidget):
             return False
         return True
 
-    def _h19_empty_directory_live_run_ok(self):
-        """RR-1: permit an EMPTY image source (``img_file == ''``) ONLY for an
-        armed H19 authoritative-directory Live run — the arm-then-acquire
-        workflow, where the watched directory is empty at Run time and its first
-        container lands afterward.
+    def _directory_run_without_seed_ok(self):
+        """Whether a configured Image Directory may start without ``img_file``.
 
-        All of these must hold, else the empty source stays rejected (empty
-        non-Live runs, missing/non-directory sources, single-file sources, and
-        legacy non-authoritative configs never inherit the exception):
-
-        * source type is ``Image Directory``;
-        * Live mode is enabled;
-        * the configured directory exists and is a directory;
-        * the host panel owns this config as its authoritative directory path
-          (``_controls_v2_container_index_config`` — Controls V2 on, a container
-          extension, a non-empty root), which is what ``start_wrangler`` will
-          freeze an empty baseline plan for and the worker will keep watching.
+        Directory selection no longer searches for a representative container.
+        The worker discovers and inspects candidates after Run, so both batch
+        and Live directory runs intentionally begin with an empty ``img_file``.
         """
-        if not getattr(self, "live_mode", False):
-            return False
         try:
             inp_type = str(
                 self.parameters.child("Signal").child("inp_type").value() or "")
@@ -1644,6 +1636,10 @@ class imageWrangler(wranglerWidget):
             return bool(callable(eligible) and eligible() is not None)
         except Exception:
             return False
+
+    # Compatibility name retained for focused tests and older callers.
+    def _h19_empty_directory_live_run_ok(self):
+        return imageWrangler._directory_run_without_seed_ok(self)
 
     def _adopt_loaded_scan_run_inputs(self):
         """Seed Run calibration from a loaded processed scan when blank.
@@ -2064,6 +2060,80 @@ class imageWrangler(wranglerWidget):
         self._img_dir_probe_cache = (key, found, now)
         return found
 
+    def _directory_metadata_preview_suffixes(self):
+        spec = getattr(self, "source_spec", None)
+        suffixes = tuple(getattr(spec, "suffixes", ()) or ())
+        if suffixes:
+            return suffixes
+        ext = str(self.img_ext or "").lstrip(".").lower()
+        if ext == "hdf5":
+            return ("_master.hdf5", "_master.h5")
+        if ext == "h5":
+            return ("_master.h5",)
+        return (f".{ext}",) if ext else ()
+
+    def _directory_metadata_preview_file(self):
+        """One direct-child metadata preview, never recursive Run membership.
+
+        GI motor/counter choices still need a representative metadata schema
+        before Run.  Inspecting one direct matching file preserves that UX
+        without classifying every container or walking Subdirs.
+        """
+        try:
+            from .image_wrangler_thread import _name_filter
+
+            match = _name_filter(self.file_filter)
+            suffixes = imageWrangler._directory_metadata_preview_suffixes(self)
+            candidates = []
+            for path in Path(self.img_dir).expanduser().iterdir():
+                if not path.is_file():
+                    continue
+                low = path.name.lower()
+                suffix = next(
+                    (value for value in suffixes if low.endswith(value)), "")
+                if not suffix:
+                    continue
+                if match(path.name[:-len(suffix)]):
+                    candidates.append(path)
+            if not candidates:
+                return ""
+            from .image_wrangler_thread import natural_sort_ints
+
+            return str(natural_sort_ints(
+                [str(path) for path in candidates])[0])
+        except Exception:
+            logger.debug("directory metadata preview discovery failed",
+                         exc_info=True)
+            return ""
+
+    def _adopt_directory_metadata_preview(self, preview_file):
+        """Populate option lists from at most one direct-child container."""
+        if preview_file:
+            bluesky_cols = self._read_bluesky_source_columns(preview_file)
+            if bluesky_cols is not None:
+                motors, counters = bluesky_cols
+                self.motors = list(motors)
+                self.counters = list(counters)
+                self.scan_parameters = [*self.motors, *self.counters]
+                self.set_gi_motor_options()
+                self.set_bg_matching_options()
+                self.set_bg_norm_options()
+                return
+            if self.meta_ext and self.exists_meta_file(preview_file):
+                prior = self.img_file
+                try:
+                    self.img_file = preview_file
+                    self.set_pars_from_meta()
+                finally:
+                    self.img_file = prior
+                return
+        self.scan_parameters = []
+        self.motors = []
+        self.counters = []
+        self.set_gi_motor_options()
+        self.set_bg_matching_options()
+        self.set_bg_norm_options()
+
     def get_img_fname(self):
         """Sets file name based on chosen options
         """
@@ -2080,32 +2150,74 @@ class imageWrangler(wranglerWidget):
             self.img_ext = self.parameters.child('Signal').child('img_ext').value()
             self.img_dir = self.parameters.child('Signal').child('img_dir').value()
             self.include_subdir = self.parameters.child('Signal').child('include_subdir').value()
+            try:
+                from xrd_tools.sources import DirectorySourceSpec
+
+                spec = getattr(self, "source_spec", None)
+                if isinstance(spec, DirectorySourceSpec):
+                    self.img_dir = str(spec.root)
+                    self.include_subdir = bool(spec.recursive)
+                    self.file_filter = str(spec.name_filter or "")
+                    if spec.suffixes:
+                        suffix = spec.suffixes[0]
+                        if suffix.startswith("_master."):
+                            self.img_ext = suffix.rsplit(".", 1)[-1]
+                        else:
+                            self.img_ext = suffix.lstrip(".")
+            except Exception:
+                logger.debug("directory source intent adoption failed",
+                             exc_info=True)
             self._sync_meta_ext_to_img_ext()
-
-            plan = getattr(self, "source_run_plan", None)
-            planned_paths = tuple(getattr(plan, "paths", ()) or ())
-            if plan is not None:
-                # H19 exact handoff: setup seeds from the first candidate the
-                # Source card marked Ready. An empty plan is a valid live-watch
-                # arm, not permission to independently walk the directory.
-                self.img_file = str(planned_paths[0]) if planned_paths else ""
+            # No representative-file search here.  In particular, Subdirs must
+            # not trigger a recursive os.walk or embedded-metadata read merely
+            # because the operator selected a directory.
+            self.img_file = ''
+            try:
+                directory = Path(self.img_dir).expanduser()
+                directory_stat = directory.stat()
+                discovery_key = (
+                    str(directory.resolve()),
+                    imageWrangler._directory_metadata_preview_suffixes(self),
+                    str(self.file_filter or ""),
+                    int(getattr(directory_stat, "st_dev", 0)),
+                    int(getattr(directory_stat, "st_ino", 0)),
+                    int(directory_stat.st_mtime_ns),
+                )
+            except OSError:
+                discovery_key = (
+                    str(Path(self.img_dir).expanduser()),
+                    imageWrangler._directory_metadata_preview_suffixes(self),
+                    str(self.file_filter or ""),
+                    None,
+                )
+            if discovery_key == getattr(
+                self, "_directory_metadata_discovery_key", None
+            ):
+                preview_file = getattr(
+                    self, "_directory_metadata_preview_path", "")
             else:
-                # F1: same compiled Filter grammar as the worker's directory
-                # glob — the seed image must be selected by the same rule as
-                # the frames the run will process.  Match the NAME (minus
-                # extension), like the worker sites, not the full path.
-                from .image_wrangler_thread import _name_filter
-                match = _name_filter(self.file_filter)
-                suffix = f'.{self.img_ext}'
-
-                fname = self._find_image_directory_seed(match, suffix)
-                if fname:
-                    self.img_file = fname
-                else:
-                    # No seed yet (e.g. the Source just switched to Image
-                    # Directory and no directory is chosen): drop the previous
-                    # source's file so stale motor options are cleared below.
-                    self.img_file = ''
+                preview_file = self._directory_metadata_preview_file()
+                self._directory_metadata_discovery_key = discovery_key
+                self._directory_metadata_preview_path = preview_file
+            try:
+                preview_stat = Path(preview_file).stat() if preview_file else None
+                preview_stamp = (
+                    int(preview_stat.st_size),
+                    int(preview_stat.st_mtime_ns),
+                ) if preview_stat is not None else None
+            except OSError:
+                preview_stamp = None
+            preview_key = (
+                preview_file,
+                preview_stamp,
+            )
+            if (
+                preview_key != getattr(
+                    self, "_directory_metadata_preview_key", None)
+            ):
+                self._directory_metadata_preview_key = preview_key
+                self._adopt_directory_metadata_preview(preview_file)
+            return
 
         if ((self.img_file != old_fname)
                 or (self.img_file and (len(self.scan_parameters) < 1))):

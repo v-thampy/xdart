@@ -20,6 +20,7 @@ from pathlib import Path
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from itertools import islice
 
 logger = logging.getLogger(__name__)
 
@@ -80,12 +81,57 @@ def _nexus_integrated_frame_sets(h5, *, entry="entry"):
     return tuple(result)
 
 
+_APPEND_SOURCE_SNAPSHOT_KEY = "_xdart_append_source_snapshot"
+
+
+def _nexus_processed_source_snapshot(h5, completed, *, entry="entry"):
+    """Read the source stamp/extent beside the latest completed frame."""
+    if not completed or entry not in h5:
+        return None
+    frame_group = h5.get(
+        f"{entry}/frames/frame_{max(int(v) for v in completed):04d}/source")
+    if frame_group is None or "path" not in frame_group:
+        return None
+    try:
+        path = frame_group["path"][()]
+        if isinstance(path, bytes):
+            path = path.decode("utf-8", errors="replace")
+        path = str(path)
+        if not os.path.isabs(path):
+            source_base = h5[entry].attrs.get("source_base")
+            if isinstance(source_base, bytes):
+                source_base = source_base.decode("utf-8", errors="replace")
+            base = (
+                str(source_base)
+                if source_base
+                else os.path.dirname(os.path.abspath(str(h5.filename)))
+            )
+            path = os.path.abspath(os.path.join(base, path))
+        attrs = frame_group.attrs
+        required = ("file_size", "file_mtime_ns", "frame_count")
+        if any(name not in attrs for name in required):
+            return None
+        return {
+            "path": os.path.abspath(path),
+            "size": int(attrs["file_size"]),
+            "mtime_ns": int(attrs["file_mtime_ns"]),
+            "frame_count": int(attrs["frame_count"]),
+            "dataset_path": str(attrs.get("dataset_path", "") or ""),
+            "self_contained": bool(attrs.get("self_contained", False)),
+        }
+    except (KeyError, TypeError, ValueError, OSError):
+        return None
+
+
 def _nexus_append_cursor(path, *, require_2d, entry="entry"):
     """Read mode-aware completion labels and provenance in one file open."""
     with h5py.File(path, "r") as h5:
         labels_1d, labels_2d = _nexus_integrated_frame_sets(h5, entry=entry)
-        provenance = read_provenance_from_handle(h5, entry=entry)
-    completed = labels_1d & labels_2d if require_2d else labels_1d
+        completed = labels_1d & labels_2d if require_2d else labels_1d
+        provenance = dict(read_provenance_from_handle(h5, entry=entry))
+        provenance[_APPEND_SOURCE_SNAPSHOT_KEY] = (
+            _nexus_processed_source_snapshot(
+                h5, completed, entry=entry))
     return completed, provenance
 
 
@@ -284,19 +330,6 @@ def _series_frame_sort_key(path):
     scan_name, img_number = _get_scan_info(path)
     number_key = -1 if img_number is None else img_number
     return str(scan_name), number_key, natural_keys_int(str(path))
-
-
-def _same_series_at_or_after(path, first_path):
-    """Return True when *path* is in first_path's parsed series at/after it."""
-    first_scan, first_number = _get_scan_info(first_path)
-    scan_name, img_number = _get_scan_info(path)
-    if scan_name != first_scan:
-        return False
-    if first_number is None:
-        return True
-    if img_number is None:
-        return False
-    return img_number >= first_number
 
 
 def _split_scan_suffix(stem):
@@ -660,6 +693,7 @@ class imageThread(wranglerThread):
         # Both are value/headless boundaries; the mutable DirectoryIndex stays
         # owned by DirectoryIndexSession's serialized executor.
         self.source_run_plan = None
+        self.source_spec = None
         self.source_index_session = None
         # Value-only copy of the Source card's stamp-qualified lazy frame-count
         # memo.  It lets Append retire a fully complete container without
@@ -688,6 +722,7 @@ class imageThread(wranglerThread):
         self._eiger_frame_idx = 0
         self._eiger_nframes = 0
         self._eiger_master_queue = deque()
+        self._directory_walk_iter = None
         self._eiger_done_masters = set()
         self._eiger_retry_after = {}
         self._eiger_zero_frame_seen = {}
@@ -704,6 +739,7 @@ class imageThread(wranglerThread):
         self._eiger_provider = None      # materialized per-frame metadata provider
         self._eiger_fabio_handle = None  # persistent fabio.EigerImage (primary Eiger)
         self._eiger_metadata_cache = {}  # master metadata is stable across frames
+        self._source_snapshot_by_path = {}
         # Bluesky/NXWriter embedded per-frame table + wavelength, per master
         # (see _bluesky_source_for) — caches None for non-Bluesky masters too.
         self._bluesky_source_cache = {}
@@ -719,6 +755,7 @@ class imageThread(wranglerThread):
         self._prefetch_error = None
         self._plan_cache = StandardPlanCache()
         self._append_skip_frames_by_scan = {}
+        self._append_source_snapshot_by_scan = {}
         # Stamp-qualified processed-output cursors survive Stop -> Run on this
         # wrangler thread.  Unchanged outputs can then be validated with one
         # stat instead of reopening hundreds of small NeXus products.  The
@@ -741,7 +778,7 @@ class imageThread(wranglerThread):
         t0 = time.time()
         if (self.poni is None
                 or (self.img_file == ''
-                    and not self._h19_live_directory_armed())):
+                    and not self._directory_source_armed())):
             return
 
         # This must be the FIRST stateful operation of a new Run.  A prior
@@ -777,6 +814,7 @@ class imageThread(wranglerThread):
         self._eiger_frame_idx = 0
         self._eiger_nframes = 0
         self._eiger_master_queue.clear()
+        self._directory_walk_iter = None
         self._eiger_done_masters.clear()
         self._source_plan_reported.clear()
         seed_candidates = tuple(
@@ -792,6 +830,7 @@ class imageThread(wranglerThread):
         self._h19_seed_pending = bool(seed_candidates)
         self._h19_pending_count = max(
             0, int(getattr(self, "source_pending_count", 0) or 0))
+        self._h19_unprobed_count = None
         self._h19_queue_already_current = False
         self._eiger_master_candidate = None
         self._eiger_retry_after.clear()
@@ -812,6 +851,8 @@ class imageThread(wranglerThread):
         self._prefetch_stop_evt = None
         self._prefetch_error = None
         self._append_skip_frames_by_scan = {}
+        self._append_source_snapshot_by_scan = {}
+        self._source_snapshot_by_path.clear()
         self._append_skip_without_reading = 0
         self._append_config_mismatch = False
         self._discovered_frame_count = 0
@@ -995,7 +1036,10 @@ class imageThread(wranglerThread):
                 and not getattr(self, "xye_only", False))
 
     def _append_output_number(self, img_number):
-        if getattr(self, "series_average", False):
+        if (
+            getattr(self, "series_average", False)
+            and getattr(self, "inp_type", None) != "Image Directory"
+        ):
             return 1
         return 1 if img_number is None else img_number
 
@@ -1147,6 +1191,11 @@ class imageThread(wranglerThread):
         if cache is None:
             cache = {}
             self._append_skip_frames_by_scan = cache
+        source_cache = getattr(
+            self, "_append_source_snapshot_by_scan", None)
+        if source_cache is None:
+            source_cache = {}
+            self._append_source_snapshot_by_scan = source_cache
         key = str(scan_name)
         if key in cache:
             return cache[key]
@@ -1156,6 +1205,7 @@ class imageThread(wranglerThread):
         out_path = self._append_output_path(key)
         if not os.path.exists(out_path):
             cache[key] = set()
+            source_cache[key] = None
             return cache[key]
 
         require_2d = not bool(getattr(self.scan, "skip_2d", False))
@@ -1174,6 +1224,7 @@ class imageThread(wranglerThread):
         except OSError:
             memo.pop(memo_key, None)
             cache[key] = set()
+            source_cache[key] = None
             return cache[key]
 
         hit = memo.get(memo_key)
@@ -1181,6 +1232,7 @@ class imageThread(wranglerThread):
             if hit is not None and hit[0] == before_stamp:
                 existing = set(hit[1])
                 processed_config = hit[2]
+                source_snapshot = hit[3] if len(hit) > 3 else None
             else:
                 memo.pop(memo_key, None)
                 with self._optional_lock(getattr(self, "file_lock", None)):
@@ -1188,6 +1240,8 @@ class imageThread(wranglerThread):
                         out_path,
                         require_2d=require_2d,
                     )
+                source_snapshot = provenance.get(
+                    _APPEND_SOURCE_SNAPSHOT_KEY)
                 processed_config = processing_config_from_mapping(provenance)
                 # Cache only a transactionally stable read.  A product replaced
                 # while its cursor was being read remains valid for this run's
@@ -1204,7 +1258,11 @@ class imageThread(wranglerThread):
                     after_stamp = None
                 if after_stamp == before_stamp:
                     memo[memo_key] = (
-                        before_stamp, frozenset(existing), processed_config)
+                        before_stamp,
+                        frozenset(existing),
+                        processed_config,
+                        source_snapshot,
+                    )
                     while len(memo) > _APPEND_CURSOR_MEMO_LIMIT:
                         memo.pop(next(iter(memo)))
             current_config = processing_config_from_scan(self.scan)
@@ -1218,7 +1276,9 @@ class imageThread(wranglerThread):
         except Exception as exc:
             self._warn_append_snapshot_failed(key, out_path, exc)
             existing = set()
+            source_snapshot = None
         cache[key] = existing
+        source_cache[key] = source_snapshot
         return cache[key]
 
     def _prime_append_skip_snapshots_for_run(self):
@@ -2236,11 +2296,24 @@ class imageThread(wranglerThread):
         if getattr(self, "single_img", False):
             return ImageFileSource(
                 img_file, metadata_format=meta_fmt, meta_dir=meta_dir)
-        files = self._enumerate_scan_files()
+        source_spec = getattr(self, "source_spec", None)
+        frozen_files = tuple(
+            getattr(source_spec, "options", {}).get("files", ())
+            if source_spec is not None else ()
+        )
+        files = (
+            [(str(path), _get_scan_info(path)[1]) for path in frozen_files]
+            if frozen_files
+            else self._enumerate_scan_files()
+        )
         if not files:
             return None
         return TiffSeriesSource(
             [fname for fname, _num in files],
+            name=(
+                getattr(source_spec, "options", {}).get("scan_name")
+                if source_spec is not None else None
+            ),
             metadata_format=meta_fmt, meta_dir=meta_dir)
 
     def _gi_whole_scan_scout_entries(self, scan):
@@ -2632,6 +2705,7 @@ class imageThread(wranglerThread):
                 frame.source_frame_idx = int(img_number) - 1
             else:
                 frame.source_frame_idx = 0
+            frame.source_snapshot = self._source_snapshot_for_frame(img_file)
             frame.skip_map_raw = skip_2d or _raw_lives_in_source(img_file)
             frames.append(frame)
         return frames
@@ -3081,6 +3155,7 @@ class imageThread(wranglerThread):
                 frame.source_frame_idx = int(img_number) - 1
             else:
                 frame.source_frame_idx = 0
+            frame.source_snapshot = self._source_snapshot_for_frame(img_file)
             # For Eiger: raw frames already live in the master file — don't double-store them.
             frame.skip_map_raw = scan.skip_2d or _raw_lives_in_source(img_file)
             _t4 = time.time()
@@ -3194,7 +3269,10 @@ class imageThread(wranglerThread):
         later Append run.
         """
         sig = getattr(self, 'sigContainerCount', None)
-        if sig is None or not nframes:
+        if not nframes:
+            return
+        imageThread._remember_source_snapshot(self, path, nframes)
+        if sig is None:
             return
         try:
             stat = os.stat(path)
@@ -3211,6 +3289,49 @@ class imageThread(wranglerThread):
         except Exception:
             logger.debug('sigContainerCount emit failed', exc_info=True)
 
+    def _remember_source_snapshot(self, path, nframes):
+        """Retain source stamp + authoritative extent for frames we write."""
+        if not path or int(nframes or 0) <= 0:
+            return
+        candidate = getattr(self, "_eiger_master_candidate", None)
+        descriptor = getattr(self, "_eiger_descriptor", None)
+        try:
+            if (
+                candidate is not None
+                and Path(candidate.path) == Path(path)
+            ):
+                size, mtime_ns = candidate.version_stamp
+            else:
+                stat = os.stat(path)
+                size, mtime_ns = int(stat.st_size), int(stat.st_mtime_ns)
+        except OSError:
+            return
+        snapshot = {
+            "size": int(size),
+            "mtime_ns": int(mtime_ns),
+            "frame_count": int(nframes),
+            "dataset_path": (
+                str(getattr(descriptor, "dataset_path", "") or "")
+                if descriptor is not None else ""
+            ),
+            "self_contained": bool(
+                getattr(descriptor, "self_contained", False)
+                if descriptor is not None else False
+            ),
+        }
+        cache = getattr(self, "_source_snapshot_by_path", None)
+        if cache is None:
+            cache = {}
+            self._source_snapshot_by_path = cache
+        cache[os.path.abspath(str(path))] = snapshot
+
+    def _source_snapshot_for_frame(self, path):
+        if not path:
+            return {}
+        return dict(getattr(
+            self, "_source_snapshot_by_path", {}
+        ).get(os.path.abspath(str(path)), {}))
+
     def _eiger_open_count_is_authoritative(self, path):
         """Whether the active raw cursor proves a final whole-file count."""
         candidate = getattr(self, "_eiger_master_candidate", None)
@@ -3225,6 +3346,32 @@ class imageThread(wranglerThread):
             and bool(getattr(descriptor, "finalized", False))
             and imageThread._h19_cursor_is_self_contained(cursor, descriptor)
             and imageThread._h19_candidate_is_current(candidate)
+        )
+
+    def _eiger_open_count_can_bulk_compare(self, path):
+        """Whether this open supplies a count usable for this Append pass.
+
+        Self-contained finalized NeXus counts may also be persisted.  An
+        external-link Eiger/fabio count is intentionally run-local: the master
+        is reopened on every Append run because linked data files can grow
+        without changing the master stamp.
+        """
+        if self._eiger_open_count_is_authoritative(path):
+            return True
+        if int(getattr(self, "_eiger_nframes", 0) or 0) <= 0:
+            return False
+        if (
+            Path(path).suffix.lower() in {".h5", ".hdf5"}
+            and getattr(self, "_eiger_fabio_handle", None) is not None
+        ):
+            return True
+        # A sustained cursor may represent an external-link .nxs master or a
+        # Bluesky-shaped *_master.h5 that fabio could not open.  Its current
+        # descriptor extent is safe for this one Append pass even though it is
+        # deliberately not persisted as authoritative across runs.
+        return bool(
+            getattr(self, "_eiger_cursor", None) is not None
+            and getattr(self, "_eiger_descriptor", None) is not None
         )
 
     def _eiger_open_master(self, master_path):
@@ -3323,13 +3470,45 @@ class imageThread(wranglerThread):
                 self._eiger_close_master()
                 self._eiger_nframes = 0
                 return
+            if (
+                getattr(self, "inp_type", None) == "Image Directory"
+                and (
+                    desc.state is ProbeState.IN_PROGRESS
+                    or not bool(getattr(desc, "finalized", True))
+                )
+            ):
+                # Directory mode consumes a container only after finality.  The
+                # descriptor came from this same cursor open, replacing the old
+                # is_unfinalized_nxwriter preflight (and its duplicate open).
+                cursor.close()
+                logger.info(
+                    "Deferring provisional container until a later Run poll: %s",
+                    master_path,
+                )
+                self._eiger_open_state = "not ready"
+                self._eiger_close_master()
+                self._eiger_nframes = 0
+                self._eiger_single_file_provisional = True
+                return
             if desc.dataset_path is None:
                 cursor.close()
                 log = (logger.debug if getattr(self, "live_mode", False)
                        and getattr(self, "inp_type", None) == "Image Directory"
                        else logger.warning)
                 log('Could not find image dataset in %s', master_path)
-                self._eiger_open_state = "no detector dataset"
+                # ``finalized`` defaults true for formats without a lifecycle
+                # marker.  Only a positively identified, finalized NXWriter
+                # container is therefore terminally detectorless.  A plain or
+                # still-unclassified HDF5 shell may be visible before its
+                # detector tree lands and must retain the live retry path.
+                self._eiger_open_state = (
+                    "finalized no detector dataset"
+                    if (
+                        bool(getattr(desc, "is_bluesky", False))
+                        and bool(getattr(desc, "finalized", False))
+                    )
+                    else "no detector dataset"
+                )
                 self._eiger_close_master()
                 self._eiger_nframes = 0
                 return
@@ -3408,11 +3587,9 @@ class imageThread(wranglerThread):
             desc.frame_count, desc.frame_shape, desc.dtype, desc.chunks,
             source_block_budget_bytes(), two_d=desc.is_2d)
         provider = cursor.metadata_provider()
-        try:
-            provider.scan_table()
-        except Exception:
-            logger.debug('provider materialize skipped for %s',
-                         getattr(desc, 'path', None), exc_info=True)
+        # Keep the provider lazy.  Complete Append containers are retired from
+        # descriptor.frame_count before any per-frame metadata table or pixel
+        # is materialized.
         return desc, int(cursor.frame_count), read_plan, provider
 
     def _eiger_install_cursor_binding(self, cursor, binding):
@@ -3795,7 +3972,10 @@ class imageThread(wranglerThread):
         if (not getattr(self, "live_mode", False)
                 or getattr(self, "inp_type", None) != "Image Directory"
                 or getattr(self, "_eiger_open_state", None)
-                == "processed xdart output"):
+                in {
+                    "processed xdart output",
+                    "finalized no detector dataset",
+                }):
             return False
         try:
             stat = os.stat(path)
@@ -3844,6 +4024,45 @@ class imageThread(wranglerThread):
         )
         return True
 
+    def _eiger_retry_is_pending(self, path, *, now=None):
+        """Return whether *path* must still wait for its live retry deadline.
+
+        A retry delay paces repeated opens of an unchanged provisional file.
+        It must not hide a writer transition, however: if the same path's cheap
+        identity stamp changes, clear the delay immediately so a finalized or
+        newly populated container can flow on the next poll.
+        """
+        retries = getattr(self, "_eiger_retry_after", None)
+        if not retries:
+            return False
+        deadline = float(retries.get(path, 0.0) or 0.0)
+        if now is None:
+            now = time.monotonic()
+        if deadline <= now:
+            retries.pop(path, None)
+            return False
+
+        zero_seen = getattr(self, "_eiger_zero_frame_seen", None) or {}
+        observed = zero_seen.get(path)
+        if observed is None:
+            return True
+        try:
+            stat = os.stat(path)
+            current_stamp = (
+                int(getattr(stat, "st_dev", 0)),
+                int(getattr(stat, "st_ino", 0)),
+                int(stat.st_size),
+                int(stat.st_mtime_ns),
+            )
+        except OSError:
+            return True
+        if current_stamp == observed[0]:
+            return True
+
+        retries.pop(path, None)
+        zero_seen.pop(path, None)
+        return False
+
     def _eiger_close_or_defer_zero_frame_master(self):
         """Close a zero-frame open and clear its identity when deferred."""
         path = self._eiger_master_path
@@ -3855,13 +4074,32 @@ class imageThread(wranglerThread):
         self._eiger_nframes = 0
         return True
 
+    def _directory_source_armed(self):
+        """Whether Run owns a valid directory intent without a seed file."""
+        spec = getattr(self, "source_spec", None)
+        try:
+            from xrd_tools.sources import DirectorySourceSpec
+
+            return bool(
+                getattr(self, "inp_type", "") == "Image Directory"
+                and isinstance(spec, DirectorySourceSpec)
+                and spec.root.is_dir()
+            )
+        except Exception:
+            return False
+
     def _h19_live_directory_armed(self):
-        """Whether an empty authoritative plan should keep watching."""
+        """Compatibility alias for the retired eager-plan arm."""
         return bool(
             getattr(self, "live_mode", False)
-            and getattr(self, "inp_type", "") == "Image Directory"
-            and getattr(self, "source_run_plan", None) is not None
-            and getattr(self, "source_index_session", None) is not None
+            and (
+                imageThread._directory_source_armed(self)
+                or (
+                    getattr(self, "inp_type", "") == "Image Directory"
+                    and getattr(self, "source_run_plan", None) is not None
+                    and getattr(self, "source_index_session", None) is not None
+                )
+            )
         )
 
     @staticmethod
@@ -3900,20 +4138,50 @@ class imageThread(wranglerThread):
         if (not self._append_skip_enabled()
                 or getattr(self, "series_average", False)):
             return 0
-        snapshot = getattr(self, "source_frame_count_snapshot", None) or {}
-        hit = snapshot.get(str(path))
-        if hit is None:
-            return 0
-        try:
-            stamp, nframes = hit
-            nframes = int(nframes)
-        except (TypeError, ValueError):
-            return 0
-        if nframes <= 0 or tuple(stamp) != tuple(candidate.version_stamp):
-            return 0
 
         scan_name = self._eiger_scan_name(path)
         completed = self._append_skip_snapshot(scan_name)
+        source_snapshot = (
+            getattr(self, "_append_source_snapshot_by_scan", {}) or {}
+        ).get(str(scan_name))
+        nframes = 0
+        if (
+            Path(path).suffix.lower() == ".nxs"
+            and source_snapshot
+            and bool(source_snapshot.get("self_contained", False))
+            and os.path.normcase(os.path.abspath(str(
+                source_snapshot.get("path", ""))))
+            == os.path.normcase(os.path.abspath(str(path)))
+        ):
+            stamp = None
+            try:
+                stamp = (
+                    int(source_snapshot["size"]),
+                    int(source_snapshot["mtime_ns"]),
+                )
+                nframes = int(source_snapshot["frame_count"])
+            except (KeyError, TypeError, ValueError):
+                nframes = 0
+            if stamp is None or tuple(stamp) != tuple(candidate.version_stamp):
+                nframes = 0
+
+        # Same-process compatibility memo for products written before the
+        # persisted source snapshot existed.  It remains stamp-qualified and
+        # applies only to finalized self-contained counts.
+        if nframes <= 0:
+            snapshot = getattr(
+                self, "source_frame_count_snapshot", None) or {}
+            hit = snapshot.get(str(path))
+            if hit is not None:
+                try:
+                    stamp, nframes = hit
+                    nframes = int(nframes)
+                except (TypeError, ValueError):
+                    nframes = 0
+                if tuple(stamp) != tuple(candidate.version_stamp):
+                    nframes = 0
+        if nframes <= 0:
+            return 0
         if all(frame in completed for frame in range(1, nframes + 1)):
             return nframes
         return 0
@@ -3946,9 +4214,33 @@ class imageThread(wranglerThread):
         frame indices merely to rediscover that every frame is complete.
         """
         path = getattr(self, "_eiger_master_path", None)
+        if (
+            getattr(self, "inp_type", None) == "Image Directory"
+            and path
+            and self._append_skip_enabled()
+            and getattr(self, "series_average", False)
+        ):
+            scan_name = self._eiger_scan_name(path)
+            if 1 in self._append_skip_snapshot(scan_name):
+                message = (
+                    f"Averaged output already exists for '{scan_name}' — the "
+                    "whole series would be skipped and nothing written. "
+                    "Switch write mode to Replace, or clear the target."
+                )
+                logger.error("run refused: %s", message)
+                try:
+                    self.showLabel.emit(message)
+                except Exception:
+                    logger.debug("showLabel emit failed", exc_info=True)
+                self.command = "stop"
+                self._eiger_close_master()
+                self._eiger_master_path = None
+                self._eiger_frame_idx = 0
+                self._eiger_nframes = 0
+                return True
         if (getattr(self, "inp_type", None) != "Image Directory"
                 or not path
-                or not self._eiger_open_count_is_authoritative(path)
+                or not self._eiger_open_count_can_bulk_compare(path)
                 or not self._append_skip_enabled()
                 or getattr(self, "series_average", False)):
             return False
@@ -3957,7 +4249,23 @@ class imageThread(wranglerThread):
             return False
         scan_name = self._eiger_scan_name(path)
         completed = self._append_skip_snapshot(scan_name)
-        if not all(frame in completed for frame in range(1, count + 1)):
+        first_missing = next(
+            (frame for frame in range(1, count + 1)
+             if frame not in completed),
+            None,
+        )
+        if first_missing is not None:
+            # Skip the already-complete prefix without advancing through it.
+            # Later holes still flow through the ordinary per-frame cursor.
+            prefix = int(first_missing) - 1
+            if prefix > 0:
+                self._append_skip_without_reading = (
+                    getattr(self, "_append_skip_without_reading", 0)
+                    + prefix
+                )
+                self._record_discovered_frame(prefix)
+                self._record_skip_reason("already processed", prefix)
+            self._eiger_frame_idx = prefix
             return False
 
         self._append_skip_without_reading = (
@@ -4013,7 +4321,9 @@ class imageThread(wranglerThread):
                 value = str(path)
                 if value in self._eiger_done_masters or value in queued:
                     continue
-                if retries.get(value, 0.0) > now:
+                if imageThread._eiger_retry_is_pending(
+                    self, value, now=now
+                ):
                     continue
                 retries.pop(value, None)
                 self._eiger_master_queue.append(value)
@@ -4028,17 +4338,22 @@ class imageThread(wranglerThread):
                 'directory discovery skipped: no File Type extension set '
                 '(directory: %s)', getattr(self, 'img_dir', ''))
             return
-        suffix = f'_master.{img_ext}' if img_ext in ('h5', 'hdf5') else f'.{img_ext}'
-        candidates = _paths_with_suffix(
-            Path(self.img_dir), suffix, recursive=self.include_subdir)
-        # Human/numeric order, shared with the image-series path: plain string
-        # sorting puts scan_10 before scan_2 and makes a directory run appear to
-        # jump backwards.  Keep Path objects after sorting for the queue logic.
-        master_files = [
-            Path(path) for path in natural_sort_ints([
-                str(p) for p in candidates if match(p.name[:-len(suffix)])
-            ])
-        ]
+        spec = getattr(self, "source_spec", None)
+        suffixes = tuple(getattr(spec, "suffixes", ()) or ())
+        if not suffixes:
+            suffixes = (
+                (f"_master.{img_ext}",)
+                if img_ext in ("h5", "hdf5")
+                else (f".{img_ext}",)
+            )
+        root = Path(getattr(spec, "root", self.img_dir))
+        recursive = bool(getattr(
+            spec, "recursive", self.include_subdir))
+        walk = getattr(self, "_directory_walk_iter", None)
+        if walk is None:
+            walk = self._directory_walk_items(
+                root, recursive=recursive, suffixes=suffixes, match=match)
+            self._directory_walk_iter = walk
         queued = set(self._eiger_master_queue)
         retries = getattr(self, "_eiger_retry_after", None)
         if retries is None:
@@ -4046,16 +4361,26 @@ class imageThread(wranglerThread):
         zero_seen = getattr(self, "_eiger_zero_frame_seen", None)
         if zero_seen is None:
             zero_seen = self._eiger_zero_frame_seen = {}
-        candidate_names = {str(path) for path in master_files}
-        for stale_path in set(retries) - candidate_names:
-            retries.pop(stale_path, None)
-            zero_seen.pop(stale_path, None)
         now = time.monotonic()
-        for mf in master_files:
+        # Bound each refill by files/directories visited, so Run and Stop do
+        # not wait for a complete accidental high-level recursive traversal.
+        visit_budget = 64
+        for _ in range(visit_budget):
+            if getattr(self, "command", None) == "stop":
+                return
+            try:
+                mf = next(walk)
+            except StopIteration:
+                self._directory_walk_iter = None
+                break
+            if mf is None:
+                continue  # one directory boundary; still charges the budget
             mf_str = str(mf)
             if mf_str in self._eiger_done_masters:
                 continue
-            if retries.get(mf_str, 0.0) > now:
+            if imageThread._eiger_retry_is_pending(
+                self, mf_str, now=now
+            ):
                 continue
             retries.pop(mf_str, None)
             if mf_str in queued:
@@ -4069,6 +4394,67 @@ class imageThread(wranglerThread):
             # happens before a container is consumed and retired.
             self._eiger_master_queue.append(mf_str)
 
+    def _directory_walk_items(
+        self, root, *, recursive, suffixes, match,
+    ):
+        """Yield a bounded token for every visited directory entry.
+
+        ``os.walk`` materializes every name in a directory before its first
+        yield.  A very wide accidental root could therefore defeat the outer
+        64-token budget even when no source matched.  This scanner reads at
+        most 64 entries into a naturally-sorted local batch, yielding either a
+        matching path or ``None`` for every entry before reading the next
+        batch.  Recursive child directories are retained as value-only paths
+        and visited after the current directory is incrementally exhausted.
+        """
+        root = Path(root)
+        if not root.is_dir():
+            return
+        pending_dirs = [root]
+        while pending_dirs:
+            current = pending_dirs.pop()
+            child_dirs = []
+            try:
+                with os.scandir(current) as entries:
+                    while True:
+                        batch = list(islice(entries, 64))
+                        if not batch:
+                            break
+                        by_name = {entry.name: entry for entry in batch}
+                        for name in natural_sort_ints(list(by_name)):
+                            entry = by_name[name]
+                            try:
+                                is_dir = entry.is_dir(follow_symlinks=False)
+                                is_file = entry.is_file(follow_symlinks=False)
+                            except OSError:
+                                yield None
+                                continue
+                            if is_dir:
+                                if recursive:
+                                    child_dirs.append(Path(entry.path))
+                                yield None
+                                continue
+                            if not is_file:
+                                yield None
+                                continue
+                            low = str(name).lower()
+                            suffix = next(
+                                (value for value in suffixes
+                                 if low.endswith(value)),
+                                "",
+                            )
+                            if (
+                                suffix
+                                and match(str(name)[:-len(suffix)])
+                            ):
+                                yield Path(entry.path)
+                            else:
+                                yield None
+            except OSError:
+                continue
+            if recursive:
+                pending_dirs.extend(reversed(child_dirs))
+
     def _h19_ready_master_paths(self):
         """Reconcile one worker poll against the Source-card run baseline."""
         plan = getattr(self, "source_run_plan", None)
@@ -4076,7 +4462,16 @@ class imageThread(wranglerThread):
         if plan is None or session is None:
             return ()
         try:
-            observation = session.observe()
+            known_unprobed = getattr(self, "_h19_unprobed_count", None)
+            drain_known_catalog = (
+                int(known_unprobed or 0) > 0
+                or (
+                    known_unprobed is None
+                    and int(getattr(self, "_h19_pending_count", 0) or 0) > 0
+                )
+            )
+            observation = session.observe(refresh=not drain_known_catalog)
+            self._h19_unprobed_count = int(observation.unprobed_count)
             self._h19_pending_count = (
                 int(observation.pending_count)
                 + int(bool(observation.stale_drops)))
@@ -4161,7 +4556,9 @@ class imageThread(wranglerThread):
                 stale_this_pass = False
                 for _ in range(len(self._eiger_master_queue)):
                     path = self._eiger_master_queue.popleft()
-                    if retries.get(path, 0.0) > now:
+                    if imageThread._eiger_retry_is_pending(
+                        self, path, now=now
+                    ):
                         self._eiger_master_queue.append(path)
                         continue
                     candidate = candidates.get(path)
@@ -4223,20 +4620,53 @@ class imageThread(wranglerThread):
                 if after <= 0 or after >= before:
                     return None
 
-        from xrd_tools.io.bluesky_nexus import is_unfinalized_nxwriter
-        while self._eiger_master_queue:
-            cand = self._eiger_master_queue.popleft()
-            try:
-                unfinalized = is_unfinalized_nxwriter(cand)
-            except Exception:
-                # Unreadable / mid-copy: defer, never consume-and-retire.
-                unfinalized = True
-            if unfinalized:
-                logger.debug(
-                    'Deferring unfinalized NXWriter container: %s', cand)
-                continue
-            return cand
-        return None
+        while True:
+            for _ in range(len(self._eiger_master_queue)):
+                cand = self._eiger_master_queue.popleft()
+                if imageThread._eiger_retry_is_pending(self, cand):
+                    self._eiger_master_queue.append(cand)
+                    continue
+                try:
+                    from xrd_tools.sources.adapters import candidate_owner
+                    from xrd_tools.sources.discover import Candidate
+                    import xrd_tools.sources.registry  # noqa: F401
+
+                    path = Path(cand)
+                    stat = path.stat()
+                    owner = candidate_owner(path)
+                    candidate = Candidate(
+                        path=path,
+                        adapter_id=owner.id if owner is not None else "",
+                        size=int(stat.st_size),
+                        mtime_ns=int(stat.st_mtime_ns),
+                    )
+                except Exception:
+                    # A vanished/unstatable path is rediscovered on a later live
+                    # pass. No content open is attempted for an unowned identity.
+                    continue
+                skip_complete = getattr(
+                    self, "_eiger_skip_complete_append_master", None)
+                if (
+                    owner is not None
+                    and skip_complete is not None
+                    and skip_complete(cand, candidate)
+                ):
+                    continue
+                self._eiger_master_candidate = (
+                    candidate if owner is not None else None)
+                return cand
+            if (
+                getattr(self, "command", None) == "stop"
+                or getattr(self, "_directory_walk_iter", None) is None
+            ):
+                return None
+            if getattr(self, "live_mode", False):
+                # One live reader request owns at most one bounded discovery
+                # batch.  Returning an idle sentinel here keeps Stop/UI cadence
+                # responsive on an accidentally broad recursive root; the
+                # persistent iterator resumes on the next watch request.
+                return None
+            self._eiger_refill_master_queue()
 
     def _get_next_eiger_frame(self):
         """Return the next frame from Eiger / NeXus HDF5 file(s).
@@ -4610,6 +5040,8 @@ class imageThread(wranglerThread):
         (_eiger_master_path, _eiger_frame_idx, _eiger_nframes).
         """
         while True:
+            if getattr(self, "command", None) == "stop":
+                return None, None, 1, None, {}
             # A finalized-and-consumed single file is a FIXED POINT: idle
             # watch polls return end-of-stream with zero source opens
             # (NXS-SF-1; handoff §8 "no spin-open while idle").
@@ -4828,21 +5260,29 @@ class imageThread(wranglerThread):
 
         if len(self.img_fnames) == 0:
             if self.inp_type != 'Image Directory':
-                first_img = self.img_file
-                # Glob is loose: `{scan_name}_*.{ext}` would also match
-                # neighbours like `{scan_name}_again_0001.{ext}`. Filter to
-                # files whose tail is purely a numeric frame index, so we
-                # only pick up the *strict* siblings of self.img_file.
-                _series_re = re.compile(
-                    rf'^{re.escape(self.scan_name)}[_-]\d+\.{re.escape(self.img_ext)}$',
-                    re.IGNORECASE,
+                source_spec = getattr(self, "source_spec", None)
+                frozen_files = tuple(
+                    getattr(source_spec, "options", {}).get("files", ())
+                    if source_spec is not None else ()
                 )
-                self.img_fnames = [
-                    p for p in _paths_with_suffix(Path(self.img_dir), f'.{self.img_ext}')
-                    if _series_re.match(p.name)
-                ]
+                if frozen_files:
+                    # Controls freezes the COMPLETE strict series at Run start.
+                    # The picked member is selection context, never a lower
+                    # frame bound (selecting frame 4 still means frames 1..N).
+                    self.img_fnames = [Path(path) for path in frozen_files]
+                else:
+                    # Legacy fallback keeps the same full-series semantics.
+                    _series_re = re.compile(
+                        rf'^{re.escape(self.scan_name)}[_-]\d+\.'
+                        rf'{re.escape(self.img_ext)}$',
+                        re.IGNORECASE,
+                    )
+                    self.img_fnames = [
+                        p for p in _paths_with_suffix(
+                            Path(self.img_dir), f'.{self.img_ext}')
+                        if _series_re.match(p.name)
+                    ]
             else:
-                first_img = ''
                 match = _name_filter(self.file_filter)
                 suffix = f'.{self.img_ext}'
                 candidates = _paths_with_suffix(
@@ -4854,7 +5294,6 @@ class imageThread(wranglerThread):
             self.img_fnames = [
                 str(f) for f in self.img_fnames
                 if str(f) not in processed
-                and (not first_img or _same_series_at_or_after(f, first_img))
             ]
 
             self.img_fnames = deque(sorted(

@@ -394,9 +394,14 @@ def write_thumbnail(frame_grp: h5py.Group, thumbnail,
         ds.attrs[key] = value
 
 
-def write_frame_source_ref(frame_grp: h5py.Group, source_path,
-                           frame_index: int, *,
-                           source_base=None) -> None:
+def write_frame_source_ref(
+    frame_grp: h5py.Group,
+    source_path,
+    frame_index: int,
+    *,
+    source_base=None,
+    source_snapshot=None,
+) -> None:
     """``source/{path,frame_index}`` — the raw-source pointer.
 
     ``path`` is stored RELATIVE to ``source_base`` (POSIX, portable) when
@@ -410,12 +415,40 @@ def write_frame_source_ref(frame_grp: h5py.Group, source_path,
     sub = _nxcollection(frame_grp, "source")
     sub["path"] = relative_source_path(str(source_path), source_base)
     sub["frame_index"] = int(frame_index)
+    snapshot = dict(source_snapshot or {})
+    attr_names = {
+        "size": "file_size",
+        "mtime_ns": "file_mtime_ns",
+        "frame_count": "frame_count",
+        "dataset_path": "dataset_path",
+        "self_contained": "self_contained",
+    }
+    for key, attr_name in attr_names.items():
+        value = snapshot.get(key)
+        if value is None:
+            continue
+        try:
+            if key in {"size", "mtime_ns", "frame_count"}:
+                value = int(value)
+            elif key == "self_contained":
+                value = bool(value)
+            else:
+                value = str(value)
+            sub.attrs[attr_name] = value
+        except (TypeError, ValueError, OverflowError):
+            logger.debug(
+                "invalid source snapshot field %s=%r for %s",
+                key,
+                value,
+                source_path,
+            )
 
 
 def write_frame_record(frames_grp: h5py.Group, frame_key: str, *,
                        thumbnail=None, thumbnail_dtype: str = "uint8",
                        source_path=None, source_frame_index: int = 0,
-                       timestamp=None, source_base=None) -> h5py.Group:
+                       timestamp=None, source_base=None,
+                       source_snapshot=None) -> h5py.Group:
     """Write one complete per-frame record group (idempotent per key).
 
     Per the v2 schema, per-frame groups carry *only* metadata + thumbnail —
@@ -427,7 +460,8 @@ def write_frame_record(frames_grp: h5py.Group, frame_key: str, *,
         write_thumbnail(fg, thumbnail, dtype=thumbnail_dtype)
     if source_path and "source" not in fg:
         write_frame_source_ref(fg, source_path, source_frame_index,
-                               source_base=source_base)
+                               source_base=source_base,
+                               source_snapshot=source_snapshot)
     if timestamp is not None and "timestamp" not in fg:
         fg["timestamp"] = str(timestamp)
     return fg

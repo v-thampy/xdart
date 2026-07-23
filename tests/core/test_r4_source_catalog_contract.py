@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import pytest
-
 from tests.core.test_container_cursor import _count_h5_opens, _stack
 from xrd_tools.sources.cursor import ContainerCursor
 from xrd_tools.sources.descriptor import ContainerDescriptor
 from xrd_tools.sources.directory_session import DirectoryIndexSession
+from xrd_tools.sources.run_plan import RunCandidatePlan
 
 
 def _retained_descriptor(observed_candidate):
@@ -20,14 +19,6 @@ def _retained_descriptor(observed_candidate):
     return descriptor
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "R4-D captured live failure: one logical directory probe performs "
-        "three HDF5 opens, drops ContainerDescriptor facts, and the cursor "
-        "opens the same container again"
-    ),
-)
 def test_r4d_catalog_retains_one_open_descriptor_for_cursor_handoff(
     tmp_path, monkeypatch,
 ):
@@ -45,6 +36,7 @@ def test_r4d_catalog_retains_one_open_descriptor_for_cursor_handoff(
         observation = session.observe()
         item = observation.candidates[0]
         descriptor = _retained_descriptor(item)
+        plan = RunCandidatePlan.from_observation(observation)
         catalog_opens = opens.count(str(path))
 
         # Model the next production owner. Reading pixels still requires one
@@ -69,5 +61,9 @@ def test_r4d_catalog_retains_one_open_descriptor_for_cursor_handoff(
             f"{diagnostic}; probe result type={type(item.result).__name__}, "
             f"slots={getattr(item.result, '__slots__', ())}"
         )
+        assert plan.descriptor_for(item.candidate) is descriptor
+        assert plan.frame_count_snapshot() == {
+            str(path): (item.candidate.version_stamp, 4),
+        }
     finally:
         session.close()

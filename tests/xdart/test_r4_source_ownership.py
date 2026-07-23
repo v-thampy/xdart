@@ -33,13 +33,6 @@ def _write_real_tiff_series(directory, *, count=5):
     return tuple(paths)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "R4-D captured live failure: Image Directory img_ext=nxs remains "
-        "hidden and makes a five-file TIFF Image Series report one frame"
-    ),
-)
 def test_r4d_nxs_directory_to_tiff_series_uses_selected_file_source_spec(
     qapp, monkeypatch, tmp_path,
 ):
@@ -79,6 +72,7 @@ def test_r4d_nxs_directory_to_tiff_series_uses_selected_file_source_spec(
         assert signal.child("img_ext").value() == "nxs"
 
         count = widget._controls_v2_source_frame_count()
+        source_spec = widget._controls_v2_freeze_source_spec()
         state = widget._controls_v2_state()
         widget._refresh_controls_v2_profile_now()
         source_status = widget.controls_v2.source_card.status.text()
@@ -90,6 +84,8 @@ def test_r4d_nxs_directory_to_tiff_series_uses_selected_file_source_spec(
             5,
             "5 frames · Image Series",
         )
+        assert tuple(source_spec.options["files"]) == tuple(
+            str(path) for path in tiff_paths)
     finally:
         widget.close()
         widget.deleteLater()

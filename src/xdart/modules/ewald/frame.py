@@ -214,6 +214,11 @@ class LiveFrame():
         # single-frame source files (typical SPEC layout) when it's None.
         self.source_file: str = ""
         self.source_frame_idx: int | None = None
+        # Stamp/extent captured from the one open source cursor.  The writer
+        # persists this beside the raw-source pointer so a later Directory
+        # Append can validate an unchanged self-contained container with one
+        # stat before deciding whether a raw open is necessary.
+        self.source_snapshot: dict[str, object] = {}
         self.thumbnail: np.ndarray | None = None  # downsampled (map_raw - bg_raw)
         # R3 guardrail: when an frame is reconstructed from a v2 .nxs
         # without a raw image (the common case — v2 doesn't store
@@ -949,6 +954,7 @@ class LiveFrame():
         # regeneration, etc.).
         frame_copy.source_file = self.source_file
         frame_copy.source_frame_idx = self.source_frame_idx
+        frame_copy.source_snapshot = dict(self.source_snapshot)
         frame_copy._source_root = self._source_root
         frame_copy.is_reload_only = self.is_reload_only
         # Always copy thumbnail — it's small and needed for image preview

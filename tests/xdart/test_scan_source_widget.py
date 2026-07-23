@@ -237,9 +237,7 @@ def test_controls_source_widget_emits_latest_directory_generation(
     qapp, tmp_path, monkeypatch,
 ):
     from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
-    from xrd_tools.core.scan import SourceKind
     from xrd_tools.sources.directory_index import DirectoryIndex
-    from xrd_tools.sources.probe import ProbeResult, ProbeState
 
     first = tmp_path / "first"
     second = tmp_path / "second"
@@ -252,8 +250,8 @@ def test_controls_source_widget_emits_latest_directory_generation(
     monkeypatch.setattr(
         DirectoryIndex,
         "probe_candidate",
-        lambda _index, _candidate: ProbeResult(
-            ProbeState.READY, kind=SourceKind.NEXUS_STACK),
+        lambda *_args, **_kwargs: pytest.fail(
+            "Source status must not inspect container contents"),
     )
     w = ScanSourceWidget(mode="controls_source", async_probe=True)
     emitted = []
@@ -265,22 +263,79 @@ def test_controls_source_widget_emits_latest_directory_generation(
             qapp,
             lambda: emitted
             and emitted[-1] is not None
-            and emitted[-1].ready_snapshot.root == second,
+            and emitted[-1].discovered_snapshot.root == second,
         )
         assert [
-            item.path.name for item in emitted[-1].ready_snapshot.candidates
+            item.path.name
+            for item in emitted[-1].discovered_snapshot.candidates
         ] == ["scan_2.nxs", "scan_10.nxs"]
+        assert emitted[-1].ready_snapshot.candidates == ()
+        assert emitted[-1].content_opens == 0
         assert emitted[-1].request_generation == (
             w.directory_session.request_generation)
-        assert w.directory_status.text() == "2 ready"
+        assert w.directory_status.text() == "2 matching files in this folder"
 
         # Routine watch polls must leave the last completed observation on
         # screen.  Replacing it with a one-frame "Checking directory..."
         # message once per second makes the Source card visibly flicker.
         w.request_directory_poll()
-        assert w.directory_status.text() == "2 ready"
+        assert w.directory_status.text() == "2 matching files in this folder"
         assert _wait_for(qapp, lambda: w._directory_future is None)
-        assert w.directory_status.text() == "2 ready"
+        assert w.directory_status.text() == "2 matching files in this folder"
+    finally:
+        w.shutdown_probe_worker()
+        w.deleteLater()
+
+
+def test_controls_source_counts_direct_names_without_content_or_subdir_walk(
+    qapp, monkeypatch, tmp_path,
+):
+    """Source status is a cheap direct-child name projection.
+
+    Subdirs is frozen as Run intent, but selecting it must neither recurse nor
+    open/probe every candidate merely to paint the Source card.
+    """
+    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xrd_tools.sources.directory_index import DirectoryIndex
+
+    for index in range(17):
+        (tmp_path / f"scan_{index}.nxs").write_bytes(b"x")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    for index in range(5):
+        (nested / f"nested_{index}.nxs").write_bytes(b"x")
+
+    probe_calls = []
+    monkeypatch.setattr(
+        DirectoryIndex,
+        "probe_candidate",
+        lambda *_args, **_kwargs: probe_calls.append(True),
+    )
+
+    w = ScanSourceWidget(mode="controls_source", async_probe=True)
+    w._directory_timer.stop()
+    try:
+        w.configure_directory(
+            tmp_path,
+            recursive=True,
+            suffixes=(".nxs",),
+            subdirs_lazy=True,
+        )
+        assert _wait_for(
+            qapp,
+            lambda: w.directory_observation is not None,
+        )
+        observation = w.directory_observation
+        assert len(observation.discovered_snapshot.candidates) == 17
+        assert observation.ready_snapshot.candidates == ()
+        assert observation.content_opens == 0
+        assert probe_calls == []
+        assert w.directory_session.configured.recursive is False
+        assert w.directory_subdirs_lazy is True
+        assert w.directory_status.text() == (
+            "17 matching files in this folder · "
+            "subfolders processed during Run"
+        )
     finally:
         w.shutdown_probe_worker()
         w.deleteLater()

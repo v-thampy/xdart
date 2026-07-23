@@ -49,6 +49,11 @@ class CandidateObservation:
     candidate: Candidate
     result: ProbeResult
 
+    @property
+    def descriptor(self):
+        """Container facts retained by this exact candidate observation."""
+        return self.result.descriptor
+
 
 @dataclass(frozen=True, slots=True)
 class DirectoryObservation:
@@ -62,6 +67,7 @@ class DirectoryObservation:
     content_opens: int
     stale_drops: int
     elapsed_s: float
+    unprobed_count: int = 0
 
     def result_for(self, candidate: Candidate | str | Path) -> ProbeResult | None:
         path = candidate.path if isinstance(candidate, Candidate) else Path(candidate)
@@ -85,6 +91,35 @@ class DirectoryObservation:
             for item in self.candidates
         )
 
+    @property
+    def acquiring_count(self) -> int:
+        """Probed candidates still genuinely provisional."""
+        return max(0, self.pending_count - int(self.unprobed_count))
+
+    @property
+    def ready_observations(self) -> tuple[CandidateObservation, ...]:
+        """READY candidates and their retained facts, in catalog order."""
+        return tuple(
+            item for item in self.candidates
+            if item.result.state is ProbeState.READY
+        )
+
+    @property
+    def ready_frame_count(self) -> int | None:
+        """Total READY detector frames from this catalog generation.
+
+        ``None`` means at least one READY adapter did not provide descriptor
+        facts.  Built-in NeXus candidates always provide them; plugin adapters
+        remain supported and may use their legacy file-count presentation.
+        """
+        total = 0
+        for item in self.ready_observations:
+            descriptor = item.descriptor
+            if descriptor is None:
+                return None
+            total += max(0, int(descriptor.frame_count))
+        return total
+
 
 class DirectoryIndexSession:
     """Own one persistent index on one serialized worker thread.
@@ -100,6 +135,7 @@ class DirectoryIndexSession:
         retry_deadline: float | None = None,
         max_probes_per_observation: int = 8,
         probe_time_budget_s: float = 0.75,
+        probe_candidates: bool = True,
     ) -> None:
         if max_probes_per_observation < 1:
             raise ValueError("max_probes_per_observation must be at least 1")
@@ -115,6 +151,7 @@ class DirectoryIndexSession:
         self._retry_deadline = retry_deadline
         self._max_probes_per_observation = int(max_probes_per_observation)
         self._probe_time_budget_s = float(probe_time_budget_s)
+        self._probe_candidates = bool(probe_candidates)
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="xdart-directory-index")
         self._closed = False
@@ -152,12 +189,20 @@ class DirectoryIndexSession:
                 self._request_generation += 1
             return self._request_generation
 
-    def observe_async(self) -> Future:
-        generation, config = self._request()
-        return self._executor.submit(self._observe_on_owner, generation, config)
+    def observe_async(self, *, refresh: bool = True) -> Future:
+        """Observe the configured directory.
 
-    def observe(self) -> DirectoryObservation:
-        return self.observe_async().result()
+        ``refresh=True`` performs the normal name/stat poll before draining a
+        bounded probe batch.  ``refresh=False`` drains more candidates from the
+        already-discovered immutable snapshot, so a large recursive tree is not
+        walked again for every eight-file batch.
+        """
+        generation, config = self._request()
+        return self._executor.submit(
+            self._observe_on_owner, generation, config, bool(refresh))
+
+    def observe(self, *, refresh: bool = True) -> DirectoryObservation:
+        return self.observe_async(refresh=refresh).result()
 
     def _request(self) -> tuple[int, DirectorySessionConfig]:
         with self._lock:
@@ -168,10 +213,11 @@ class DirectoryIndexSession:
             return self._request_generation, self._desired
 
     def _observe_on_owner(
-        self, generation: int, config: DirectorySessionConfig,
+        self, generation: int, config: DirectorySessionConfig, refresh: bool,
     ) -> DirectoryObservation:
         started = time.perf_counter()
-        if self._index is None or self._active != config:
+        reconfigured = self._index is None or self._active != config
+        if reconfigured:
             kwargs = {}
             if self._retry_deadline is not None:
                 kwargs["retry_deadline"] = float(self._retry_deadline)
@@ -186,7 +232,11 @@ class DirectoryIndexSession:
             self._visible_candidates = ()
 
         index = self._index
-        snapshot = index.poll()
+        snapshot = (
+            index.poll()
+            if refresh or reconfigured or index.snapshot.generation == 0
+            else index.snapshot
+        )
         name_ok = compile_filter(config.name_filter)
 
         def included(candidate: Candidate) -> bool:
@@ -232,35 +282,36 @@ class DirectoryIndexSession:
         # retain natural order at the front of the unseen queue.
         unseen.sort(key=lambda item: item.path not in priority_paths)
         probe_started = time.perf_counter()
-        for candidate in (*unseen, *retrying_candidates):
-            if content_opens >= self._max_probes_per_observation:
-                break
-            if (
-                content_opens
-                and time.perf_counter() - probe_started
-                >= self._probe_time_budget_s
-            ):
-                break
-            try:
-                content_opens += 1
-                result = index.probe_candidate(candidate)
-            except StaleCandidateError:
-                stale_drops += 1
-                continue
-            except Exception as exc:
-                # Cache an unexpected failure against this exact candidate
-                # identity so one defective source cannot poison every ready
-                # sibling. A later byte/owner change invalidates it normally.
-                logger.warning(
-                    "Source readiness probe failed for %s: %s",
-                    candidate.path,
-                    exc,
-                )
-                result = ProbeResult(
-                    ProbeState.INVALID,
-                    reason=f"{type(exc).__name__}: {exc}",
-                )
-            self._results[candidate.path] = (candidate, result)
+        if self._probe_candidates:
+            for candidate in (*unseen, *retrying_candidates):
+                if content_opens >= self._max_probes_per_observation:
+                    break
+                if (
+                    content_opens
+                    and time.perf_counter() - probe_started
+                    >= self._probe_time_budget_s
+                ):
+                    break
+                try:
+                    content_opens += 1
+                    result = index.probe_candidate(candidate)
+                except StaleCandidateError:
+                    stale_drops += 1
+                    continue
+                except Exception as exc:
+                    # Cache an unexpected failure against this exact candidate
+                    # identity so one defective source cannot poison every ready
+                    # sibling. A later byte/owner change invalidates it normally.
+                    logger.warning(
+                        "Source readiness probe failed for %s: %s",
+                        candidate.path,
+                        exc,
+                    )
+                    result = ProbeResult(
+                        ProbeState.INVALID,
+                        reason=f"{type(exc).__name__}: {exc}",
+                    )
+                self._results[candidate.path] = (candidate, result)
 
         # A probe can race a file mutation or owner flip.  Re-poll before
         # publishing so no stale candidate identity reaches the GUI or Run.
@@ -308,6 +359,10 @@ class DirectoryIndexSession:
             )
             for candidate in snapshot.candidates
         )
+        unprobed_count = sum(
+            candidate.path not in self._results
+            for candidate in snapshot.candidates
+        )
         ready_candidates = tuple(
             item.candidate for item in observations
             if item.result.state is ProbeState.READY
@@ -328,6 +383,7 @@ class DirectoryIndexSession:
             content_opens=content_opens,
             stale_drops=stale_drops,
             elapsed_s=time.perf_counter() - started,
+            unprobed_count=unprobed_count,
         )
 
     def close(self) -> None:

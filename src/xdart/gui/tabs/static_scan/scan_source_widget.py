@@ -132,6 +132,8 @@ class ScanSourceWidget(QtWidgets.QWidget):
         self._directory_observation = None
         self._directory_signature = None
         self._directory_future = None
+        self._directory_request_token = 0
+        self._directory_subdirs_lazy = False
         self._directory_timer = None
         self._build_ui()
 
@@ -144,13 +146,18 @@ class ScanSourceWidget(QtWidgets.QWidget):
         if self._controls_source:
             from xrd_tools.sources import DirectoryIndexSession
 
-            self._directory_session = DirectoryIndexSession()
+            # Controls only needs a cheap direct-child filename count.  It must
+            # not open HDF5 containers or recursively inspect a selected tree;
+            # the worker owns those operations after Run starts.
+            self._directory_session = DirectoryIndexSession(
+                probe_candidates=False)
             self.directory_status = QtWidgets.QLabel("No directory index")
             self.directory_status.setObjectName("controlsV2DirectoryStatus")
             self.directory_status.setWordWrap(True)
             self.directory_status.setToolTip(
-                "Persistent headless directory index used by both this Source "
-                "card and the next Run.")
+                "Counts matching files directly in the selected folder. "
+                "Container metadata is opened only after Run starts; when "
+                "Subdirs is enabled, child folders are processed lazily.")
             lay.addWidget(self.directory_status)
             self._directory_timer = QtCore.QTimer(self)
             self._directory_timer.setInterval(1000)
@@ -747,14 +754,22 @@ class ScanSourceWidget(QtWidgets.QWidget):
     def directory_observation(self):
         return self._directory_observation
 
+    @property
+    def directory_subdirs_lazy(self):
+        return self._directory_subdirs_lazy
+
     def configure_directory(
         self, root, *, recursive=False, name_filter=None, suffixes=(),
+        subdirs_lazy=False,
     ):
         if not self._controls_source or self._directory_session is None:
             raise RuntimeError("widget is not in controls_source mode")
         previous_generation = self._directory_session.request_generation
+        # Recursive intent is presentation-only here.  Even when the operator
+        # selected Subdirs, Source status looks at direct children only.
+        self._directory_subdirs_lazy = bool(subdirs_lazy or recursive)
         generation = self._directory_session.configure(
-            root, recursive=recursive, name_filter=name_filter,
+            root, recursive=False, name_filter=name_filter,
             suffixes=suffixes)
         if generation != previous_generation:
             self._directory_observation = None
@@ -769,18 +784,21 @@ class ScanSourceWidget(QtWidgets.QWidget):
         self._directory_session.clear()
         self._directory_observation = None
         self._directory_signature = None
+        self._directory_subdirs_lazy = False
         self.directory_status.setText("No container-directory source")
         self.sigDirectoryChanged.emit(None)
 
-    def request_directory_poll(self):
+    def request_directory_poll(self, *, refresh=True):
         session = self._directory_session
         if session is None or session.configured is None:
             return
         future = self._directory_future
         if future is not None and not future.done():
             return
-        future = session.observe_async()
+        future = session.observe_async(refresh=bool(refresh))
         self._directory_future = future
+        self._directory_request_token += 1
+        request_token = self._directory_request_token
 
         def _emit_done(done):
             try:
@@ -790,13 +808,27 @@ class ScanSourceWidget(QtWidgets.QWidget):
             except Exception as exc:
                 result = exc
             try:
-                self.sigDirectoryDone.emit(result)
+                self.sigDirectoryDone.emit((request_token, result))
             except RuntimeError:
                 return
 
         future.add_done_callback(_emit_done)
 
-    def _on_directory_done(self, result):
+    def _on_directory_done(self, payload):
+        if (
+            isinstance(payload, tuple)
+            and len(payload) == 2
+            and isinstance(payload[0], int)
+        ):
+            request_token, result = payload
+            if request_token != self._directory_request_token:
+                # A done future can queue its Qt signal, then a newer request
+                # can start before that queued delivery runs.  The old
+                # completion must not clear or overwrite the newer owner.
+                return
+        else:
+            # Compatibility for direct unit-test calls and older signal users.
+            result = payload
         self._directory_future = None
         if isinstance(result, Exception):
             logger.warning("source-card directory observation failed: %s", result)
@@ -819,18 +851,17 @@ class ScanSourceWidget(QtWidgets.QWidget):
                  item.candidate.adapter_id, item.result.state.value)
                 for item in result.candidates
             ),
+            int(result.unprobed_count),
+            int(result.stale_drops),
         )
         changed = signature != self._directory_signature
         self._directory_signature = signature
         self._directory_observation = result
-        ready = len(result.ready_snapshot.candidates)
-        pending = result.pending_count
-        excluded = result.excluded_count
-        parts = [f"{ready} ready"]
-        if pending:
-            parts.append(f"{pending} pending")
-        if excluded:
-            parts.append(f"{excluded} excluded")
+        count = len(result.discovered_snapshot.candidates)
+        noun = "file" if count == 1 else "files"
+        parts = [f"{count} matching {noun} in this folder"]
+        if self._directory_subdirs_lazy:
+            parts.append("subfolders processed during Run")
         self.directory_status.setText(" · ".join(parts))
         if changed:
             self.sigDirectoryChanged.emit(result)

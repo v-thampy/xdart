@@ -1504,6 +1504,7 @@ def _write_per_frame_metadata(f, scan, *, entry: str) -> None:
             thumbnail=thumb,
             source_path=_resolved_frame_source(frame, output_dir),
             source_frame_index=_frame_source_index(frame),
+            source_snapshot=getattr(frame, "source_snapshot", None),
             timestamp=getattr(frame, "timestamp", None),
             source_base=source_base,
         )

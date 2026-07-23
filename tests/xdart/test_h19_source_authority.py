@@ -60,7 +60,7 @@ class _Session:
         self._observations = deque(observations)
         self.calls = 0
 
-    def observe(self):
+    def observe(self, **_kwargs):
         self.calls += 1
         if len(self._observations) > 1:
             return self._observations.popleft()
@@ -71,7 +71,7 @@ class _RaisingSession:
     def __init__(self, exc):
         self.exc = exc
 
-    def observe(self):
+    def observe(self, **_kwargs):
         raise self.exc
 
 
@@ -376,10 +376,10 @@ def test_real_session_observes_only_after_frozen_queue_exhausts(
         calls = 0
         real_observe = session.observe
 
-        def observe():
+        def observe(*, refresh=True):
             nonlocal calls
             calls += 1
-            return real_observe()
+            return real_observe(refresh=refresh)
 
         monkeypatch.setattr(session, "observe", observe)
 
@@ -425,13 +425,12 @@ def test_real_session_converges_unprobed_tail_after_seed_bulk_skip(
         worker._h19_ready_master_candidates = {
             str(candidate.path): candidate for candidate in plan.candidates}
 
-        calls = 0
+        calls = []
         real_observe = session.observe
 
-        def observe():
-            nonlocal calls
-            calls += 1
-            return real_observe()
+        def observe(*, refresh=True):
+            calls.append(refresh)
+            return real_observe(refresh=refresh)
 
         monkeypatch.setattr(session, "observe", observe)
 
@@ -445,7 +444,7 @@ def test_real_session_converges_unprobed_tail_after_seed_bulk_skip(
         assert worker._eiger_pop_next_master() is None
         assert worker._eiger_done_masters == {str(path) for path in paths}
         assert worker._h19_pending_count == 0
-        assert calls == 2
+        assert calls == [False, False]
     finally:
         session.close()
 

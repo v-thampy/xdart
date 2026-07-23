@@ -20,24 +20,22 @@ candidate map actually changed.
 
 :meth:`DirectoryIndex.record_probe` layers BOUNDED RETRY on top of an
 explicit, caller-invoked probe (:mod:`xrd_tools.sources.adapters`,
-:mod:`xrd_tools.sources.probe`) — the index itself never probes.  This is the
-"newly readable HDF5 shell... remains provisional... not permanently retired
-as imageless" policy: a fresh IN_PROGRESS/IMAGELESS verdict is held as
-IN_PROGRESS for up to ``retry_deadline`` seconds (an injectable clock, no
-wall-clock sleeps in tests) before the raw verdict is trusted.  Once the
-window resolves to a terminal verdict, that verdict is STICKY for the
-candidate's current version stamp — repeated probes of the same stamp return
-it without opening a new window — until a size/mtime change, removal, or
-reconfiguration clears the resolution and permits a fresh bounded window.
-This stamp-qualified resolution is a tiny value map (path -> stamp + verdict);
-it is deliberately not a metadata cache.
+:mod:`xrd_tools.sources.probe`) — the index itself never probes.  IN_PROGRESS
+and IMAGELESS results lacking finality evidence remain provisional; a retained
+descriptor makes a readable finalized IMAGELESS container terminal
+immediately.  Once a window resolves to a terminal verdict, that verdict is
+STICKY for the candidate's current version stamp — repeated probes of the same
+stamp return it without opening a new window — until a size/mtime change,
+removal, or reconfiguration clears the resolution and permits a fresh bounded
+window.  This stamp-qualified resolution is a tiny value map (path -> stamp +
+verdict); it is deliberately not a metadata cache.
 """
 
 from __future__ import annotations
 
 import time
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -53,7 +51,20 @@ _Stamp = tuple[int, int]
 #: only with provisional candidates").  READY/PROCESSED_OUTPUT are terminal
 #: successes; INVALID is a terminal failure (an unreadable-forever file is
 #: not what the young-container policy is protecting).
-_PROVISIONAL_STATES = frozenset({ProbeState.IN_PROGRESS, ProbeState.IMAGELESS})
+def _is_provisional(result: ProbeResult) -> bool:
+    """Whether *result* still needs the bounded-readiness policy.
+
+    A descriptor proves whether a readable detectorless container is already
+    finalized.  Such an IMAGELESS result is terminal immediately.  Legacy and
+    plugin adapters that return IMAGELESS without finality evidence retain the
+    historical bounded window.
+    """
+    if result.state is ProbeState.IN_PROGRESS:
+        return True
+    if result.state is not ProbeState.IMAGELESS:
+        return False
+    descriptor = result.descriptor
+    return descriptor is None or not bool(descriptor.finalized)
 
 #: Default bounded-readiness window, matching the wrangler's
 #: XDART_CONTAINER_READY_DEADLINE default (image_wrangler_thread.py) — the
@@ -321,12 +332,13 @@ class DirectoryIndex:
           case the stamp check alone cannot see;
         * a stamp already resolved to a TERMINAL verdict returns that sticky
           verdict without reopening a window (R1-R1);
-        * a terminal result (READY / PROCESSED_OUTPUT / INVALID) resolves the
-          stamp terminally, clears any active retry window, and is returned
-          unchanged;
-        * a provisional result (IN_PROGRESS / IMAGELESS) starts or continues a
-          bounded retry window keyed to the candidate's current stamp and is
-          surfaced as IN_PROGRESS while the window is open;
+        * a terminal result (READY / PROCESSED_OUTPUT / INVALID, plus
+          descriptor-proven finalized IMAGELESS) resolves the stamp terminally,
+          clears any active retry window, and is returned unchanged;
+        * a provisional result (IN_PROGRESS, or IMAGELESS without finalized
+          descriptor evidence) starts or continues a bounded retry window keyed
+          to the candidate's current stamp and is surfaced as IN_PROGRESS while
+          the window is open;
         * once the window exceeds ``retry_deadline`` (or the constructor
           default) it resolves TERMINALLY and sticks for the stamp: a window
           that was ever readable-but-imageless resolves to IMAGELESS (a
@@ -380,7 +392,7 @@ class DirectoryIndex:
 
         now = self._clock()
 
-        if result.state not in _PROVISIONAL_STATES:
+        if not _is_provisional(result):
             self._retries.pop(path, None)
             self._terminal[path] = (stamp, result)
             return result
@@ -391,7 +403,12 @@ class DirectoryIndex:
             self._retries[path] = RetryState(
                 first_seen_at=now, stamp=stamp, attempts=1, last_result=result,
                 imageless_result=this_imageless)
-            return ProbeResult(ProbeState.IN_PROGRESS, reason=result.reason)
+            return ProbeResult(
+                ProbeState.IN_PROGRESS,
+                reason=result.reason,
+                kind=result.kind,
+                descriptor=result.descriptor,
+            )
 
         # Carry the most-resolved observation forward: an IMAGELESS seen
         # anywhere in the window survives a later transient IN_PROGRESS.
@@ -410,11 +427,18 @@ class DirectoryIndex:
                 resolved = ProbeResult(
                     ProbeState.INVALID,
                     reason=f"{result.reason} (exceeded {deadline:g}s retry window)",
+                    kind=result.kind,
+                    descriptor=result.descriptor,
                 )
             self._terminal[path] = (stamp, resolved)
             return resolved
         self._retries[path] = entry
-        return ProbeResult(ProbeState.IN_PROGRESS, reason=result.reason)
+        return ProbeResult(
+            ProbeState.IN_PROGRESS,
+            reason=result.reason,
+            kind=result.kind,
+            descriptor=result.descriptor,
+        )
 
     def retry_state(self, path: str | Path) -> RetryState | None:
         """The active :class:`RetryState` for *path* — an OPEN provisional
@@ -460,6 +484,54 @@ class DirectoryIndex:
         if adapter is None:
             raise LookupError(f"no adapter registered for id {candidate.adapter_id!r}")
         raw = adapter.probe(candidate.path)
+        # Revalidate the filesystem + registry identity AFTER the adapter has
+        # inspected the content.  The descriptor's pre-open stat cannot detect
+        # a mutation or owner flip that happens while/just after the handle is
+        # open; retaining that result under the old Candidate would make the
+        # Source card and Run plan authorize facts for different bytes.
+        try:
+            stat = candidate.path.stat()
+        except OSError as exc:
+            raise StaleCandidateError(
+                f"{candidate.path} disappeared while it was being observed; "
+                "re-poll and re-probe"
+            ) from exc
+        if (
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+        ) != candidate.version_stamp:
+            raise StaleCandidateError(
+                f"{candidate.path} changed while it was being observed; "
+                "re-poll and re-probe"
+            )
+        import xrd_tools.sources.registry  # noqa: F401
+        from xrd_tools.sources.adapters import candidate_owner
+
+        current_owner = candidate_owner(candidate.path)
+        current_owner_id = (
+            current_owner.id if current_owner is not None else None
+        )
+        if current_owner_id != candidate.adapter_id:
+            raise StaleCandidateError(
+                f"{candidate.path} owning adapter changed from "
+                f"{candidate.adapter_id!r} to {current_owner_id!r} while it "
+                "was being observed; re-poll and re-probe"
+            )
+        descriptor = raw.descriptor
+        if descriptor is not None:
+            # Bind the adapter's path-only observation to the exact immutable
+            # candidate identity being recorded. A differing stamp means the
+            # file changed between enumeration and observation; fail closed
+            # rather than retaining facts for different bytes.
+            if (descriptor.path != candidate.path
+                    or descriptor.version_stamp != candidate.version_stamp):
+                raise StaleCandidateError(
+                    f"{candidate.path} changed while its descriptor was being "
+                    "observed; re-poll and re-probe")
+            if descriptor.adapter_id != candidate.adapter_id:
+                descriptor = replace(
+                    descriptor, adapter_id=candidate.adapter_id)
+                raw = replace(raw, descriptor=descriptor)
         # Pass the full Candidate so record_probe re-validates path+stamp+
         # adapter_id — a concurrent owner flip between this freshness check and
         # the record raises StaleCandidateError rather than returning A's stale

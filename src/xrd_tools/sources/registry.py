@@ -148,9 +148,16 @@ def open_source(uri_or_spec: str | Path | SourceSpec | FrameSource, **opts: Any)
 
     if kind is SourceKind.TIFF_SERIES:
         path = Path(spec.uri)
+        opts = dict(spec.options)
+        files = opts.pop("files", ())
+        opts.pop("selected_file", None)
+        scan_name = opts.pop("scan_name", None)
+        if files:
+            opts.pop("pattern", None)
+            return TiffSeriesSource(files, name=scan_name or None, **opts)
         if path.is_dir():
-            return TiffSeriesSource.from_directory(path, **dict(spec.options))
-        return TiffSeriesSource([path], **dict(spec.options))
+            return TiffSeriesSource.from_directory(path, **opts)
+        return TiffSeriesSource([path], **opts)
     if kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
         return NexusStackSource(spec.uri, entry=spec.entry or "entry")
     if kind is SourceKind.PROCESSED_NEXUS:
@@ -217,74 +224,23 @@ def _nexus_scan_name(path: Path) -> str:
 
 
 def _nexus_probe(path: Path) -> Any:
-    """Raw, stateless, single-shot content classification — "what does this
-    file look like right now."  A young file that is unreadable or not yet
-    finalized reads as IN_PROGRESS; a readable file with no detector dataset
-    reads as IMAGELESS.  Whether an IMAGELESS/IN_PROGRESS verdict should still
-    be SURFACED as provisional (not yet trusted as final) is the
-    DirectoryIndex retry policy's job, not this function's — see
-    ``directory_index.py``'s bounded-readiness handling."""
-    from xrd_tools.sources.probe import ProbeResult, ProbeState
-    from xrd_tools.io.bluesky_nexus import is_unfinalized_nxwriter
-    from xrd_tools.io.processed_scan_id import (
-        ProcessedXdartInputError,
-        is_processed_xdart_path,
-    )
-    from xrd_tools.io.image import _find_hdf5_image_dataset, _is_eiger_master
-    from xrd_tools.io.nexus import (
-        UnresolvedSourceLinkError,
-        UnsupportedDetectorRankError,
-    )
-    import h5py
+    """Classify one NeXus/HDF5 candidate through the handle-aware descriptor.
 
-    path = Path(path)
-    if is_unfinalized_nxwriter(path):
-        return ProbeResult(
-            ProbeState.IN_PROGRESS,
-            reason="NXWriter run not yet finalized (no end_time), or unreadable",
-        )
-    if is_processed_xdart_path(path):
-        return ProbeResult(
-            ProbeState.PROCESSED_OUTPUT,
-            reason="processed xdart record (integrated_1d/2d or schema stamp)",
-            kind=SourceKind.PROCESSED_NEXUS,
-        )
-    try:
-        with h5py.File(path, "r") as f:
-            try:
-                ds = _find_hdf5_image_dataset(f)
-            except ProcessedXdartInputError:
-                return ProbeResult(
-                    ProbeState.PROCESSED_OUTPUT,
-                    reason="processed xdart record",
-                    kind=SourceKind.PROCESSED_NEXUS,
-                )
-            except UnsupportedDetectorRankError as exc:
-                # NXS-DIM-1: a >3-D detector signal is a defect, not
-                # imageless — and never READY with fabricated 3-D facts.
-                return ProbeResult(
-                    ProbeState.INVALID,
-                    reason=f"unsupported detector rank: {exc}")
-            except UnresolvedSourceLinkError as exc:
-                # NXS-LINK-1: link target not landed — mid-transfer, typed
-                # provisional (retry later), never an escaping KeyError.
-                return ProbeResult(
-                    ProbeState.IN_PROGRESS,
-                    reason=f"detector data link target not yet available; "
-                           f"retry later: {exc}")
-            except ValueError:
-                return ProbeResult(
-                    ProbeState.IMAGELESS, reason="no 2-D+ detector dataset found")
-            n = int(ds.shape[0]) if ds.ndim >= 3 else 1
-    except OSError as exc:
-        return ProbeResult(
-            ProbeState.IN_PROGRESS,
-            reason=f"unreadable HDF5 (treated as still-writing): {exc}",
-        )
-    if n <= 0:
-        return ProbeResult(ProbeState.IMAGELESS, reason="zero-frame detector dataset")
-    kind = SourceKind.EIGER_MASTER if _is_eiger_master(path) else SourceKind.NEXUS_STACK
-    return ProbeResult(ProbeState.READY, reason="detector dataset present", kind=kind)
+    ``describe_container`` opens one short-lived handle and delegates every
+    finality, processed-output, detector-layout, and frame-count decision to
+    ``describe_container_from_open``.  The resulting descriptor is retained on
+    the probe value instead of throwing those already-resolved facts away.
+    """
+    from xrd_tools.sources.descriptor import describe_container
+    from xrd_tools.sources.probe import ProbeResult
+
+    descriptor = describe_container(Path(path))
+    return ProbeResult(
+        descriptor.state,
+        reason=descriptor.reason,
+        kind=descriptor.kind,
+        descriptor=descriptor,
+    )
 
 
 def _nexus_open(spec: SourceSpec) -> FrameSource:
@@ -366,9 +322,16 @@ def _tiff_series_probe(path: Path) -> Any:
 
 def _tiff_series_open(spec: SourceSpec) -> FrameSource:
     path = Path(spec.uri)
+    opts = dict(spec.options)
+    files = opts.pop("files", ())
+    opts.pop("selected_file", None)
+    scan_name = opts.pop("scan_name", None)
+    if files:
+        opts.pop("pattern", None)
+        return TiffSeriesSource(files, name=scan_name or None, **opts)
     if path.is_dir():
-        return TiffSeriesSource.from_directory(path, **dict(spec.options))
-    return TiffSeriesSource([path], **dict(spec.options))
+        return TiffSeriesSource.from_directory(path, **opts)
+    return TiffSeriesSource([path], **opts)
 
 
 def _spec_is_candidate(path: Path) -> bool:

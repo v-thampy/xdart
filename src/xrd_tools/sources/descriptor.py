@@ -77,6 +77,7 @@ class ContainerDescriptor:
     chunks: tuple[int, ...] | None = None
     compression: str | None = None
     is_2d: bool = False
+    self_contained: bool | None = None
     # -- cheap physics + lifecycle -------------------------------------------
     wavelength: float | None = None
     is_bluesky: bool = False
@@ -122,6 +123,7 @@ class ContainerDescriptor:
             "chunks": list(self.chunks) if self.chunks is not None else None,
             "compression": self.compression,
             "is_2d": self.is_2d,
+            "self_contained": self.self_contained,
             "wavelength": self.wavelength,
             "is_bluesky": self.is_bluesky,
             "finalized": self.finalized,
@@ -263,6 +265,121 @@ def _stack_facts(h5f: Any, paths: list[str]) -> dict[str, Any]:
     }
 
 
+def _stack_is_self_contained(h5f: Any, paths: list[str]) -> bool | None:
+    """Whether all resolved detector datasets are hard links in this file."""
+    if not paths:
+        return None
+    try:
+        return all(
+            h5f.get(path, getlink=True).__class__.__name__ == "HardLink"
+            for path in paths
+        )
+    except Exception:
+        return None
+
+
+def _apstools_flat_nxdata_contract(h5f: Any, entry_grp: Any) -> bool:
+    """Whether this file declares the flat apstools ``NXWriter`` layout.
+
+    ``creator=NXWriter`` by itself is not decisive: compatibility fixtures and
+    older writers can place detector data only at generic NeXus locations.  The
+    combination with an ``NXdata`` ``entry/data`` group is the positive schema
+    signpost documented by :mod:`xrd_tools.io.bluesky_nexus`.
+    """
+    if entry_grp is None:
+        return False
+
+    def text(value: Any) -> str:
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        if isinstance(value, np.ndarray):
+            return text(value.ravel()[0]) if value.size else ""
+        return str(value) if value is not None else ""
+
+    try:
+        creator = text(h5f.attrs.get("creator", ""))
+        data_grp = entry_grp.get("data")
+        bluesky_grp = entry_grp.get("instrument/bluesky")
+        return (
+            creator == "NXWriter"
+            and bluesky_grp is not None
+            and bluesky_grp.__class__.__name__ == "Group"
+            and data_grp is not None
+            and data_grp.__class__.__name__ == "Group"
+            and text(data_grp.attrs.get("NX_class", "")) == "NXdata"
+        )
+    except Exception:
+        return False
+
+
+def _apstools_flat_stack_paths(entry_grp: Any) -> list[str]:
+    """Resolve detector pixels from apstools' flat ``entry/data`` contract.
+
+    The image links/datasets are direct children marked
+    ``signal_type='detector'``; the many 1-D counter/motor fields can therefore
+    be rejected without recursively walking the whole Bluesky metadata tree.
+    A dangling direct link is conservatively provisional, and a detector marker
+    with unsupported rank remains an explicit defect.
+    """
+    from xrd_tools.io.nexus import (
+        UnresolvedSourceLinkError,
+        UnsupportedDetectorRankError,
+        _dangling_detector_links,
+        _reject_unsupported_detector_rank,
+    )
+
+    data_grp = entry_grp.get("data")
+    best_path: str | None = None
+    best_size = -1
+    dangling: list[str] = []
+
+    def text(value: Any) -> str:
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        if isinstance(value, np.ndarray):
+            return text(value.ravel()[0]) if value.size else ""
+        return str(value) if value is not None else ""
+
+    for name in data_grp:
+        link = data_grp.get(name, getlink=True)
+        obj = data_grp.get(name)
+        path = f"{data_grp.name.rstrip('/')}/{name}"
+        if link is not None and obj is None:
+            dangling.append(path)
+            continue
+        if obj is None or obj.__class__.__name__ != "Dataset":
+            continue
+        if text(obj.attrs.get("signal_type", "")) != "detector":
+            continue
+        rank = int(getattr(obj, "ndim", 0))
+        if rank > 3:
+            raise UnsupportedDetectorRankError(
+                f"{path} has rank {rank}; detector data must be 2-D "
+                "(one frame) or 3-D (a stack)"
+            )
+        if rank < 2:
+            continue
+        size = int(getattr(obj, "size", 0))
+        if size > best_size:
+            best_path = path
+            best_size = size
+
+    h5f = entry_grp.file
+    entry_name = entry_grp.name.strip("/").split("/")[-1]
+    _reject_unsupported_detector_rank(h5f, entry_name)
+    if best_path is not None:
+        return [best_path]
+    for path in _dangling_detector_links(h5f, entry_name):
+        if path not in dangling:
+            dangling.append(path)
+    if dangling:
+        raise UnresolvedSourceLinkError(
+            f"NXWriter data link(s) {dangling} do not resolve yet "
+            "(target not landed); container is still being written"
+        )
+    return []
+
+
 def describe_container_from_open(
     h5f: Any,
     *,
@@ -355,7 +472,10 @@ def describe_container_from_open(
     kind = SourceKind.EIGER_MASTER if _is_eiger_master(path) else SourceKind.NEXUS_STACK
 
     try:
-        paths, _ = resolve_stack_paths(h5f, entry_name)
+        if _apstools_flat_nxdata_contract(h5f, entry_grp):
+            paths = _apstools_flat_stack_paths(entry_grp)
+        else:
+            paths, _ = resolve_stack_paths(h5f, entry_name)
     except ProcessedXdartInputError:
         return ContainerDescriptor(
             state=ProbeState.PROCESSED_OUTPUT, kind=SourceKind.PROCESSED_NEXUS,
@@ -427,6 +547,7 @@ def describe_container_from_open(
         frame_count=facts["frame_count"], frame_shape=facts["frame_shape"],
         dtype=facts["dtype"], dataset_shape=facts["dataset_shape"],
         chunks=facts["chunks"], compression=facts["compression"], is_2d=facts["is_2d"],
+        self_contained=_stack_is_self_contained(h5f, paths),
         wavelength=wavelength, **common)
 
 

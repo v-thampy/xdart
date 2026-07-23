@@ -55,6 +55,7 @@ from pathlib import Path
 from types import MappingProxyType
 
 from xrd_tools.sources.discover import Candidate
+from xrd_tools.sources.descriptor import ContainerDescriptor
 from xrd_tools.sources.directory_index import Snapshot, StaleCandidateError
 from xrd_tools.sources.probe import ProbeResult, ProbeState
 
@@ -137,13 +138,27 @@ class RunCandidatePlan:
     root: Path
     recursive: bool
     name_filter: str | None
+    descriptors: tuple[ContainerDescriptor | None, ...] = ()
 
     def __post_init__(self) -> None:
+        descriptors = tuple(self.descriptors)
+        if not descriptors:
+            descriptors = (None,) * len(self.candidates)
+            object.__setattr__(self, "descriptors", descriptors)
+        elif len(descriptors) != len(self.candidates):
+            raise ValueError(
+                "RunCandidatePlan descriptors must align one-for-one with "
+                "candidates")
         index = {c.path: c for c in self.candidates}
+        descriptor_index = {
+            candidate.path: descriptor
+            for candidate, descriptor in zip(self.candidates, descriptors)
+        }
         # object.__setattr__: populate the cached lookup on a frozen instance.
         # Not dataclass fields, so they do not affect eq/hash/repr.
         object.__setattr__(self, "_index", index)
         object.__setattr__(self, "_index_view", MappingProxyType(index))
+        object.__setattr__(self, "_descriptor_index", descriptor_index)
 
     @classmethod
     def from_snapshot(cls, snapshot: Snapshot) -> "RunCandidatePlan":
@@ -161,6 +176,31 @@ class RunCandidatePlan:
             name_filter=snapshot.name_filter,
         )
 
+    @classmethod
+    def from_observation(cls, observation) -> "RunCandidatePlan":
+        """Freeze READY candidate identities and their catalog descriptors.
+
+        The descriptor tuple is aligned with ``ready_snapshot.candidates`` so
+        processing receives the exact facts projected by the Source card,
+        rather than reopening containers merely to rediscover frame counts.
+        """
+        ready = {
+            item.candidate.path: item
+            for item in observation.ready_observations
+        }
+        snapshot = observation.ready_snapshot
+        return cls(
+            generation=snapshot.generation,
+            candidates=tuple(snapshot.candidates),
+            root=snapshot.root,
+            recursive=snapshot.recursive,
+            name_filter=snapshot.name_filter,
+            descriptors=tuple(
+                ready[candidate.path].descriptor
+                for candidate in snapshot.candidates
+            ),
+        )
+
     @property
     def paths(self) -> tuple[Path, ...]:
         """The baseline candidate paths, in frozen order."""
@@ -170,6 +210,34 @@ class RunCandidatePlan:
         """Baseline candidates keyed by path — a read-only view of the cached,
         plan-owned lookup (the SAME object across calls; never rebuilt)."""
         return self._index_view  # type: ignore[attr-defined]
+
+    def descriptor_for(
+        self, candidate: Candidate | str | Path,
+    ) -> ContainerDescriptor | None:
+        """Descriptor retained for one frozen candidate, if its adapter supplied one."""
+        path = candidate.path if isinstance(candidate, Candidate) else Path(candidate)
+        return self._descriptor_index.get(path)  # type: ignore[attr-defined]
+
+    def frame_count_snapshot(
+        self, *, finalized_only: bool = True,
+        require_self_contained: bool = False,
+    ) -> dict[str, tuple[tuple[int, int], int]]:
+        """Stamp-qualified frame totals derived only from frozen descriptors."""
+        result: dict[str, tuple[tuple[int, int], int]] = {}
+        for candidate, descriptor in zip(self.candidates, self.descriptors):
+            if descriptor is None:
+                continue
+            if finalized_only and not descriptor.finalized:
+                continue
+            if require_self_contained and descriptor.self_contained is not True:
+                continue
+            if descriptor.version_stamp != candidate.version_stamp:
+                continue
+            count = int(descriptor.frame_count)
+            if count > 0:
+                result[str(candidate.path)] = (
+                    candidate.version_stamp, count)
+        return result
 
     def __len__(self) -> int:
         return len(self.candidates)
@@ -314,10 +382,14 @@ class RunCandidatePlan:
                 f"result (got {probe_result.state.value!r})")
         new_candidates = tuple(
             current if c.path == current.path else c for c in self.candidates)
+        new_descriptors = tuple(
+            probe_result.descriptor if c.path == current.path else descriptor
+            for c, descriptor in zip(self.candidates, self.descriptors)
+        )
         return RunCandidatePlan(
             generation=self.generation, candidates=new_candidates,
             root=self.root, recursive=self.recursive,
-            name_filter=self.name_filter)
+            name_filter=self.name_filter, descriptors=new_descriptors)
 
 
 __all__ = ["RunCandidatePlan", "RunReconcile", "SupersededPlanError"]

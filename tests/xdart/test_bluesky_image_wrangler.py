@@ -143,6 +143,9 @@ def _wrangler_holder():
         "set_bg_matching_options",
         "exists_meta_file",
         "_sync_meta_ext_to_img_ext",
+        "_directory_metadata_preview_suffixes",
+        "_directory_metadata_preview_file",
+        "_adopt_directory_metadata_preview",
         "get_img_fname",
     ):
         setattr(h, name, MethodType(getattr(imageWrangler, name), h))
@@ -401,6 +404,84 @@ def test_directory_of_nxs_masters(tmp_path):
     assert {"i0", "i1", "i2", "pd"} <= set(counters)
 
 
+def test_directory_metadata_preview_keeps_gi_motor_options_direct_and_cached(
+        tmp_path):
+    """Lazy directory status must not remove pre-Run GI motor discovery.
+
+    One direct matching container may provide the metadata schema.  Nested
+    files are not searched merely because Subdirs is enabled, and repeating
+    setup against the same source stamp does not reopen the representative.
+    """
+    from xrd_tools.sources import DirectorySourceSpec
+
+    direct = _write_bluesky_baseline_only_motors(
+        tmp_path / "direct_00001.nxs")
+    nested_dir = tmp_path / "nested"
+    nested_dir.mkdir()
+    _write_bluesky_nxwriter(nested_dir / "nested_00001.nxs")
+
+    holder, root = _wrangler_holder()
+    holder.inp_type = "Image Directory"
+    holder.source_spec = DirectorySourceSpec(
+        root=tmp_path,
+        recursive=True,
+        suffixes=(".nxs",),
+    )
+    signal = root.child("Signal")
+    signal.child("inp_type").setValue("Image Directory")
+    signal.child("img_dir").setValue(str(tmp_path))
+    signal.child("img_ext").setValue("nxs")
+    signal.child("include_subdir").setValue(True)
+
+    calls = []
+    discovery_calls = []
+    read_columns = holder._read_bluesky_source_columns
+    discover = holder._directory_metadata_preview_file
+
+    def counted_read(_self, path):
+        calls.append(str(path))
+        return read_columns(path)
+
+    def counted_discover(_self):
+        discovery_calls.append(True)
+        return discover()
+
+    holder._read_bluesky_source_columns = MethodType(counted_read, holder)
+    holder._directory_metadata_preview_file = MethodType(
+        counted_discover, holder)
+
+    holder.get_img_fname()
+    assert holder.img_file == ""
+    assert calls == [str(direct)]
+    assert discovery_calls == [True]
+    choices = list(root.child("GI").child("th_motor").opts["limits"])
+    assert {"Manual", "halpha", "detx", "sbsx"} <= set(choices)
+    assert root.child("GI").child("th_motor").value() == "halpha"
+
+    holder.get_img_fname()
+    assert calls == [str(direct)]
+    assert discovery_calls == [True]
+
+
+def test_directory_hdf5_preview_accepts_master_h5_alias(tmp_path):
+    """The hdf5 selector's accepted _master.h5 alias still supplies GI motors."""
+    source = _write_bluesky_baseline_only_motors(
+        tmp_path / "scan_master.h5")
+    holder, root = _wrangler_holder()
+    holder.inp_type = "Image Directory"
+    signal = root.child("Signal")
+    signal.child("inp_type").setValue("Image Directory")
+    signal.child("img_dir").setValue(str(tmp_path))
+    signal.child("img_ext").setValue("hdf5")
+
+    holder.get_img_fname()
+
+    assert holder.img_file == ""
+    assert holder._directory_metadata_preview_path == str(source)
+    choices = root.child("GI").child("th_motor").opts["limits"]
+    assert "halpha" in choices
+
+
 # ---------------------------------------------------------------------------
 # F5 (Codex review 2026-07-11, maintainer decision: finalized-.nxs-only): the
 # live directory watch must DEFER an in-progress NXWriter container instead of
@@ -529,18 +610,35 @@ def test_unfinished_earlier_scan_does_not_block_ready_later_scan(tmp_path):
         del h5["entry/end_time"]
 
     t = _real_dir_watch_thread(watch, out)
-    t._eiger_refill_master_queue()
-    assert Path(t._eiger_pop_next_master()).name == "scan_2.nxs"
-    # _eiger_pop_next_master only selects; the real reader retires after drain.
-    t._eiger_done_masters.add(str(later))
-    assert t._eiger_pop_next_master() is None
+    # Selection itself is name/stat-only.  The first JIT cursor open classifies
+    # scan_1 as provisional, defers it, and continues to the ready sibling in
+    # the same reader call.
+    first = t._get_next_eiger_frame_sync()
+    assert first[1:3] == ("scan_2", 1)
+    assert str(earlier) not in t._eiger_done_masters
+
+    later_frames = [first]
+    for _ in range(NFRAMES + 2):
+        item = t._get_next_eiger_frame_sync()
+        if item[3] is None:
+            break
+        later_frames.append(item)
+    assert [item[2] for item in later_frames] == list(range(1, NFRAMES + 1))
+    assert {item[1] for item in later_frames} == {"scan_2"}
+    assert str(later) in t._eiger_done_masters
 
     with h5py.File(earlier, "r+") as h5:
         h5["entry"].create_dataset(
             "end_time", data=b"2026-07-14T00:01:00")
-    t._eiger_refill_master_queue()
-    assert Path(t._eiger_pop_next_master()).name == "scan_1.nxs"
-    assert t._eiger_pop_next_master() is None
+    earlier_frames = []
+    for _ in range(NFRAMES + 2):
+        item = t._get_next_eiger_frame_sync()
+        if item[3] is None:
+            break
+        earlier_frames.append(item)
+    assert [item[2] for item in earlier_frames] == list(range(1, NFRAMES + 1))
+    assert {item[1] for item in earlier_frames} == {"scan_1"}
+    assert str(earlier) in t._eiger_done_masters
 
 
 def test_live_zero_frame_shell_is_retried_without_blocking_ready_scan(tmp_path):
@@ -578,6 +676,36 @@ def test_live_zero_frame_shell_is_retried_without_blocking_ready_scan(tmp_path):
         if item[3] is not None:
             frames.append((item[1], item[2]))
     assert frames == [("01_shell_00001", 1), ("01_shell_00001", 2)]
+
+
+def test_finalized_bluesky_detectorless_is_terminal_without_retry(tmp_path):
+    """A positive NXWriter marker plus end_time proves a completed imageless run."""
+    import h5py
+
+    watch = tmp_path / "watch"
+    watch.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
+
+    alignment = watch / "01_alignment_00001.nxs"
+    with h5py.File(alignment, "w") as h5:
+        entry = h5.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.create_group("instrument/bluesky")
+        entry.create_group("data").create_dataset(
+            "i0", data=np.linspace(0.0, 1.0, 5))
+        entry.create_dataset(
+            "end_time", data=b"2026-07-14T00:01:00")
+    ready = watch / "02_ready_00001.nxs"
+    _write_bluesky_nxwriter(ready, n=1)
+
+    t = _real_dir_watch_thread(watch, out)
+    t.CONTAINER_READY_RETRY = 60.0
+
+    first = t._get_next_eiger_frame_sync()
+    assert first[1:3] == ("02_ready_00001", 1)
+    assert str(alignment) in t._eiger_done_masters
+    assert str(alignment) not in t._eiger_retry_after
 
 
 def test_live_stale_mtime_shell_gets_a_retry_before_retirement(tmp_path):
@@ -650,13 +778,15 @@ def test_live_prefetch_finds_shell_populated_after_idle_sentinel(tmp_path):
         t._prefetch_stop_prior()
 
 
-def test_f5_pop_defers_only_unfinalized_bluesky(tmp_path):
-    """DIR-2 moved the F5 finalized-at-close check from REFILL (one HDF5 open
-    per file per poll — the bl17-2 24.5 s first-dispatch stall) to POP time.
-    Same safety pins: finalized Bluesky and PLAIN .nxs flow immediately; an
-    in-progress or unreadable (mid-copy/torn) container is deferred — dropped
-    from the queue, neither consumed nor retired — and flows the moment it
-    finalizes.  Refill itself is now name-only (no opens)."""
+def test_f5_jit_open_classifies_each_reached_container_once(
+    tmp_path, monkeypatch,
+):
+    """Refill/pop stay name-only; one JIT cursor open owns classification.
+
+    Finalized Bluesky and plain NeXus flow. An in-progress or torn container is
+    deferred without blocking its ready siblings, and a changed/finalized path
+    becomes eligible immediately rather than waiting out the old retry timer.
+    """
     import h5py
 
     watch = tmp_path / "watch"
@@ -681,45 +811,58 @@ def test_f5_pop_defers_only_unfinalized_bluesky(tmp_path):
 
     t = _real_dir_watch_thread(watch, out)
 
-    # Refill is name-only: EVERYTHING queues without a single open.
-    from xrd_tools.io import bluesky_nexus as bn
+    from xrd_tools.sources.cursor import ContainerCursor
+
     opens = []
-    real_check = bn.is_unfinalized_nxwriter
-    bn_patch = lambda p: (opens.append(str(p)), real_check(p))[1]
-    orig = bn.is_unfinalized_nxwriter
-    bn.is_unfinalized_nxwriter = bn_patch
-    try:
-        t._eiger_refill_master_queue()
-        assert sorted(t._eiger_master_queue) == sorted(
-            [str(done), str(inprog), str(plain), str(torn)])
-        assert opens == []                       # zero opens at refill
+    real_open = ContainerCursor.open
 
-        # Pop-time: finalized + plain flow; unfinalized + torn are deferred
-        # (dropped, not retired) — exactly one check per popped candidate.
-        popped = []
-        while True:
-            nxt = t._eiger_pop_next_master()
-            if nxt is None:
-                break
-            popped.append(nxt)
-        assert sorted(popped) == sorted([str(done), str(plain)])
-        assert not t._eiger_done_masters         # nothing retired by popping
-        assert len(t._eiger_master_queue) == 0   # deferred are re-polled
+    def counted_open(cursor):
+        opens.append(str(cursor._path))
+        return real_open(cursor)
 
-        # end_time lands -> the next refill+pop picks the deferred file up.
-        with h5py.File(inprog, "r+") as f:
-            f["entry"].create_dataset("end_time", data=b"2026-07-12T00:01:00")
-        t._eiger_refill_master_queue()
-        assert str(inprog) in t._eiger_master_queue
-        remaining = []
-        while True:
-            nxt = t._eiger_pop_next_master()
-            if nxt is None:
-                break
-            remaining.append(nxt)
-        assert str(inprog) in remaining
-    finally:
-        bn.is_unfinalized_nxwriter = orig
+    monkeypatch.setattr(ContainerCursor, "open", counted_open)
+
+    t._eiger_refill_master_queue()
+    assert sorted(t._eiger_master_queue) == sorted(
+        [str(done), str(inprog), str(plain), str(torn)])
+    assert opens == []
+
+    # Pop is also name/stat-only; classification belongs to open_master's
+    # sustained cursor, not a duplicate finalized-at-close preflight.
+    assert t._eiger_pop_next_master() == str(done)
+    assert opens == []
+    t._eiger_master_queue.appendleft(str(done))
+
+    frames = []
+    for _ in range(2 * NFRAMES + 8):
+        item = t._get_next_eiger_frame_sync()
+        if item[3] is None:
+            break
+        frames.append((item[1], item[2]))
+    assert {name for name, _number in frames} == {
+        "done_00001", "plain_00001",
+    }
+    assert opens.count(str(done)) == 1
+    assert opens.count(str(inprog)) == 1
+    assert opens.count(str(plain)) == 1
+    assert opens.count(str(torn)) == 1
+    assert str(inprog) not in t._eiger_done_masters
+    assert str(torn) not in t._eiger_done_masters
+
+    # end_time changes the cheap identity stamp. The next poll bypasses the
+    # delay and performs exactly one new cursor open for the finalized version.
+    with h5py.File(inprog, "r+") as f:
+        f["entry"].create_dataset("end_time", data=b"2026-07-12T00:01:00")
+    inprog_frames = []
+    for _ in range(NFRAMES + 2):
+        item = t._get_next_eiger_frame_sync()
+        if item[3] is None:
+            break
+        inprog_frames.append((item[1], item[2]))
+    assert inprog_frames == [
+        ("inprog_00001", number) for number in range(1, NFRAMES + 1)
+    ]
+    assert opens.count(str(inprog)) == 2
 
 
 def test_dir2b_bluesky_master_h5_reads_via_h5py_fallback(tmp_path):

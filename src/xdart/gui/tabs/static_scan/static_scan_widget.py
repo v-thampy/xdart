@@ -3261,12 +3261,27 @@ class staticWidget(QWidget):
           consume is still the wrangler's call (e.g. a processed ``.nxs``
           reports record-truth caps but runs through Reintegrate).
         """
+        directory_config = self._controls_v2_container_index_config()
+        directory_intent_ready = bool(
+            directory_config is not None
+            and directory_config[0].is_dir()
+            and (
+                int(frame_count or 0) > 0
+                or bool(directory_config[1])
+                or bool(live_unknown)
+            )
+        )
         source_ready = bool(source_label) and (
-            bool(live_unknown) or int(frame_count or 0) > 0
+            bool(live_unknown)
+            or int(frame_count or 0) > 0
+            or directory_intent_ready
         )
         headless = self._controls_v2_headless_source_caps(
             source_label, live=bool(live_unknown))
-        counted = bool(not live_unknown and int(frame_count or 0) > 0)
+        counted = bool(
+            not live_unknown
+            and (int(frame_count or 0) > 0 or directory_intent_ready)
+        )
         if live_unknown:
             merged_metadata = bool(has_metadata)
             merged_motors = bool(has_motors)
@@ -3281,7 +3296,8 @@ class staticWidget(QWidget):
             SourceCaps(
                 has_frames=bool(headless.has_frames or counted),
                 has_raw=bool(headless.has_raw or counted),
-                raw_reachable=bool(headless.raw_reachable),
+                raw_reachable=bool(
+                    headless.raw_reachable or directory_intent_ready),
                 has_metadata=merged_metadata,
                 has_motors=merged_motors,
                 has_energy=bool(has_energy),
@@ -3727,8 +3743,8 @@ class staticWidget(QWidget):
             return
         root, recursive, name_filter, suffixes = config
         widget.configure_directory(
-            root, recursive=recursive, name_filter=name_filter,
-            suffixes=suffixes)
+            root, recursive=False, name_filter=name_filter,
+            suffixes=suffixes, subdirs_lazy=recursive)
 
     def _on_controls_v2_directory_observation(self, observation) -> None:
         self._controls_v2_directory_observation = observation
@@ -3749,59 +3765,64 @@ class staticWidget(QWidget):
         root, recursive, name_filter, suffixes = config
         if desired is None or (
             desired.root != root
-            or desired.recursive != recursive
+            or desired.recursive
             or desired.name_filter != name_filter
             or desired.suffixes != suffixes
+            or bool(getattr(widget, "directory_subdirs_lazy", False))
+            != recursive
             or observation.request_generation != session.request_generation
         ):
             return None
         return observation
 
     def _controls_v2_freeze_source_run_authority(self):
-        """Freeze one coherent READY plan plus its unresolved-work count."""
-        observation = self._controls_v2_current_directory_observation()
-        from xrd_tools.sources import RunCandidatePlan
-        if observation is not None:
-            return (
-                RunCandidatePlan.from_snapshot(observation.ready_snapshot),
-                int(observation.pending_count)
-                + int(bool(observation.stale_drops)),
-            )
+        """Compatibility seam: directory membership is now worker-owned.
 
-        # Arm-then-acquire is a normal beamline workflow. If the Source card
-        # has a valid configured directory but its first observation has not
-        # landed yet, freeze an honest empty baseline for that exact config.
-        widget = getattr(self, "_controls_v2_source_widget", None)
-        session = getattr(widget, "directory_session", None)
-        config = self._controls_v2_container_index_config()
-        desired = getattr(session, "configured", None)
-        if session is None or config is None or desired is None:
-            return None, 0
-        root, recursive, name_filter, suffixes = config
-        if (
-            desired.root != root
-            or desired.recursive != recursive
-            or desired.name_filter != name_filter
-            or desired.suffixes != suffixes
-        ):
-            return None, 0
-        from xrd_tools.sources import Snapshot
-        return (
-            RunCandidatePlan.from_snapshot(Snapshot(
-                session.request_generation,
-                (),
-                root,
-                recursive,
-                name_filter,
-            )),
-            0,
-        )
+        Source selection freezes only :class:`DirectorySourceSpec`; it never
+        freezes a content-classified READY plan.
+        """
+        return None, 0
 
     def _controls_v2_freeze_source_run_plan(self):
         """Compatibility accessor for callers that need only the value plan."""
         return self._controls_v2_freeze_source_run_authority()[0]
 
-    def _controls_v2_freeze_container_frame_counts(self):
+    def _controls_v2_freeze_source_spec(self):
+        """Freeze typed mode-specific source membership for the next Run."""
+        source_type = str(
+            self._controls_v2_param_value(("Signal", "inp_type")) or "")
+        if source_type == "Image Directory":
+            config = self._controls_v2_container_index_config()
+            if config is not None:
+                from xrd_tools.sources import DirectorySourceSpec
+
+                root, recursive, name_filter, suffixes = config
+                widget = getattr(self, "_controls_v2_source_widget", None)
+                session = getattr(widget, "directory_session", None)
+                return DirectorySourceSpec(
+                    root=root,
+                    recursive=recursive,
+                    suffixes=suffixes,
+                    name_filter=name_filter,
+                    generation=int(getattr(
+                        session, "request_generation", 0) or 0),
+                )
+        selected = str(
+            self._controls_v2_param_value(("Signal", "File")) or "").strip()
+        selected_ext = Path(selected).suffix.lstrip(".").lower()
+        if (
+            source_type == "Image Series"
+            and selected
+            and selected_ext not in {"h5", "hdf5", "nxs"}
+        ):
+            from xrd_tools.sources import image_series_spec
+            return image_series_spec(selected)
+        if source_type == "Single Image" and selected:
+            from xrd_tools.core.scan import SourceKind, SourceSpec
+            return SourceSpec(selected, SourceKind.IMAGE_FILE)
+        return None
+
+    def _controls_v2_freeze_container_frame_counts(self, source_plan=None):
         """Copy the lazy, stamp-qualified container counts for one Run.
 
         This is value-only optimization evidence, not a second source index.
@@ -3809,7 +3830,11 @@ class staticWidget(QWidget):
         is about to consume and falls back to the normal raw open on any miss
         or stamp mismatch.
         """
-        frozen = {}
+        frozen = (
+            source_plan.frame_count_snapshot(
+                finalized_only=True, require_self_contained=True)
+            if source_plan is not None else {}
+        )
         memo = getattr(self, "_v2_container_final_count_memo", None) or {}
         for path, entry in memo.items():
             try:
@@ -3819,7 +3844,7 @@ class staticWidget(QWidget):
             except (TypeError, ValueError, IndexError):
                 continue
             if count >= 0:
-                frozen[str(path)] = (stamp, count)
+                frozen.setdefault(str(path), (stamp, count))
         return frozen
 
     def _controls_v2_source_frame_count(self) -> int | None:
@@ -3834,6 +3859,11 @@ class staticWidget(QWidget):
             self._controls_v2_param_value(("NeXus File", "nexus_file")) or ""
         )
         img_ext = str(self._controls_v2_param_value(("Signal", "img_ext")) or "")
+        effective_ext = (
+            Path(img_file).suffix.lstrip(".").lower()
+            if source_type == "Image Series" and img_file
+            else img_ext.lstrip(".").lower()
+        )
         include_subdir = bool(
             self._controls_v2_param_value(("Signal", "include_subdir"), False)
         )
@@ -3848,15 +3878,28 @@ class staticWidget(QWidget):
         if self._controls_v2_live_source_active():
             return None
 
+        source_stamp = self._controls_v2_source_cache_stamp(source_path)
+        if (
+            source_type == "Image Series"
+            and effective_ext not in {"h5", "hdf5", "nxs"}
+            and img_file
+        ):
+            # Series membership is a property of the selected file *and* its
+            # sibling directory.  This makes a landed/removed member invalidate
+            # the cache while avoiding a directory walk on every profile paint.
+            source_stamp = (
+                source_stamp,
+                self._controls_v2_source_cache_stamp(Path(img_file).parent),
+            )
         key = (
             source_type,
             img_file,
             img_dir,
             nexus_file,
-            img_ext,
+            effective_ext,
             include_subdir,
             file_filter,
-            self._controls_v2_source_cache_stamp(source_path),
+            source_stamp,
         )
         cached = getattr(self, "_v2_frame_count_cache", None)
         if cached is not None and cached[0] == key:
@@ -3877,35 +3920,26 @@ class staticWidget(QWidget):
                 return cached[1]
         self._v2_source_count_is_files = False
 
-        # Directories of CONTAINER files: DO NOT pre-count frames
-        # (maintainer, 2026-07-13 / DIR-2).  A per-file count needs one
-        # HDF5 open (~0.5-1 s each on a beamline share) over potentially
-        # hundreds of files, and every failed count logged a WARNING.  A
-        # FILE count serves everything this feeds — the readiness gate
-        # only needs '>0' and the chip renders 'N files'; true frame
-        # counts appear as the run opens each file (that path is lazy).
+        if (
+            source_type == "Image Series"
+            and effective_ext not in {"h5", "hdf5", "nxs"}
+        ):
+            source_spec = self._controls_v2_freeze_source_spec()
+            if source_spec is not None:
+                count = len(tuple(source_spec.options.get("files", ())))
+                self._v2_frame_count_cache = (key, count, False)
+                return count
+
+        # Directory selection reports a direct-child FILE count only.  It does
+        # not recurse when Subdirs is selected and never opens container
+        # metadata.  Recursive membership and frame counts belong to Run-time.
         if source_type == "Image Directory":
-            ext = str(img_ext or "").lstrip(".").lower()
+            ext = effective_ext
             if ext in {"h5", "hdf5", "nxs"}:
                 observation = self._controls_v2_current_directory_observation()
                 if observation is None:
                     return 0
-                from xrd_tools.sources import ProbeState
-                files = tuple(
-                    item.candidate.path
-                    for item in observation.candidates
-                    if item.result.state in {
-                        ProbeState.READY, ProbeState.IN_PROGRESS})
-                # Lazy convergence: once EVERY file's frame count is
-                # known (landed by the run as it opened each container,
-                # or by the click-to-count sweep) the chip shows real
-                # frames; until then it shows the file count.
-                total = self._v2_memoized_frame_total(files)
-                if total is not None:
-                    self._v2_source_count_is_files = False
-                    self._v2_frame_count_cache = (key, total, False)
-                    return total
-                count = len(files)
+                count = len(observation.discovered_snapshot.candidates)
                 self._v2_source_count_is_files = True
                 self._v2_frame_count_cache = (key, count, True)
                 return count
@@ -3918,7 +3952,7 @@ class staticWidget(QWidget):
                 source_type=source_type,
                 img_file=img_file or nexus_file,
                 img_dir=img_dir,
-                img_ext=img_ext,
+                img_ext=effective_ext,
                 include_subdir=include_subdir,
                 file_filter=file_filter,
             )
@@ -3982,12 +4016,13 @@ class staticWidget(QWidget):
             self._refresh_controls_v2_profile(immediate=False)
 
     def _on_readiness_summary_clicked(self) -> None:
-        """Click-to-count (maintainer, 2026-07-13): while the chip shows a
-        FILE count, one click kicks a background frame-count sweep; each
-        file's count lands via _sigV2CountLanded and the chip converges to
-        real frames."""
-        if getattr(self, "_v2_source_count_is_files", False):
-            self._controls_v2_kick_container_count_sweep()
+        """Directory summaries remain file counts.
+
+        Container extents are inspected lazily by the processing worker.  A
+        summary click must not turn an intentionally cheap Source projection
+        into an eager recursive metadata sweep.
+        """
+        return
 
     def _controls_v2_kick_container_count_sweep(self) -> None:
         if getattr(self, "_v2_count_sweep_active", False):
@@ -4122,7 +4157,11 @@ class staticWidget(QWidget):
             path = Path(str(img_file or "")).expanduser()
             if not path.is_file():
                 return 0
-            file_ext = (ext or path.suffix.lstrip(".")).lower()
+            file_ext = (
+                path.suffix.lstrip(".").lower()
+                if source_type == "Image Series"
+                else (ext or path.suffix.lstrip(".")).lower()
+            )
             if source_type == "Image Series" and file_ext not in container_exts:
                 scan_name, _img_number = _get_scan_info(path)
                 import re
@@ -8613,35 +8652,13 @@ class staticWidget(QWidget):
             origin="start_wrangler",
         )
         self._sync_controls_v2_source_index()
-        source_config = self._controls_v2_container_index_config()
-        source_plan, source_pending_count = (
-            self._controls_v2_freeze_source_run_authority())
-        empty_plan = (
-            source_plan is not None
-            and not tuple(getattr(source_plan, "paths", ()) or ())
-        )
-        if (source_config is not None
-                and (source_plan is None
-                     or (empty_plan
-                         and not getattr(self.wrangler, "live_mode", False)))):
-            logger.warning(
-                "Run deferred: the authoritative Source-card directory "
-                "snapshot has no ready containers yet")
-            source_widget = getattr(self, "_controls_v2_source_widget", None)
-            if source_widget is not None:
-                source_widget.directory_status.setText(
-                    "Waiting for ready containers; press Run again, or enable Live")
-                source_widget.request_directory_poll()
-            return
+        source_plan = None
         self.wrangler.source_run_plan = source_plan
-        self.wrangler.source_index_session = (
-            getattr(self._controls_v2_source_widget, "directory_session", None)
-            if source_plan is not None else None)
+        self.wrangler.source_spec = self._controls_v2_freeze_source_spec()
+        self.wrangler.source_index_session = None
         self.wrangler.source_frame_count_snapshot = (
-            self._controls_v2_freeze_container_frame_counts()
-            if source_plan is not None else {})
-        self.wrangler.source_pending_count = (
-            source_pending_count if source_plan is not None else 0)
+            self._controls_v2_freeze_container_frame_counts(source_plan))
+        self.wrangler.source_pending_count = 0
         _t1 = _time.perf_counter() if _perf else 0.0
         self.wrangler.enabled(False)
         self.wrangler.setup()
@@ -9142,12 +9159,14 @@ class staticWidget(QWidget):
         if wrangler is None:
             return
         wrangler.source_run_plan = None
+        wrangler.source_spec = None
         wrangler.source_index_session = None
         wrangler.source_frame_count_snapshot = {}
         wrangler.source_pending_count = 0
         thread = getattr(wrangler, "thread", None)
         if thread is not None:
             thread.source_run_plan = None
+            thread.source_spec = None
             thread.source_index_session = None
             thread.source_frame_count_snapshot = {}
             thread.source_pending_count = 0

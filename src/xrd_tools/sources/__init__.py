@@ -87,6 +87,7 @@ if TYPE_CHECKING:
         register_source,
     )
     from xrd_tools.sources.spec import SpecSource
+    from xrd_tools.sources.selection import DirectorySourceSpec, image_series_spec
 
 
 _LAZY_EXPORTS = {
@@ -103,6 +104,7 @@ _LAZY_EXPORTS = {
     "DirectoryIndex": "xrd_tools.sources.directory_index",
     "DirectoryIndexSession": "xrd_tools.sources.directory_session",
     "DirectoryObservation": "xrd_tools.sources.directory_session",
+    "DirectorySourceSpec": "xrd_tools.sources.selection",
     "DirectorySessionConfig": "xrd_tools.sources.directory_session",
     "EmptyMetadataProvider": "xrd_tools.sources.metadata_provider",
     "ImageFileSource": "xrd_tools.sources.image",
@@ -141,6 +143,7 @@ _LAZY_EXPORTS = {
     "flatten_scan_groups": "xrd_tools.sources.grouping",
     "get_adapter": "xrd_tools.sources.adapters",
     "guess_source_kind": "xrd_tools.sources.registry",
+    "image_series_spec": "xrd_tools.sources.selection",
     "nxwriter_finalization_policy": "xrd_tools.sources.readiness",
     "open_source": "xrd_tools.sources.registry",
     "parse_scan_groups": "xrd_tools.sources.grouping",
@@ -178,6 +181,7 @@ __all__ = [
     "DirectoryIndex",
     "DirectoryIndexSession",
     "DirectoryObservation",
+    "DirectorySourceSpec",
     "DirectorySessionConfig",
     "EmptyMetadataProvider",
     "FrameSource",
@@ -220,6 +224,7 @@ __all__ = [
     "flatten_scan_groups",
     "get_adapter",
     "guess_source_kind",
+    "image_series_spec",
     "nxwriter_finalization_policy",
     "open_source",
     "parse_scan_groups",

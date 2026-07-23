@@ -406,6 +406,23 @@ def _load_source_ref(frame: LiveFrame, fg) -> None:
         except _SRC_READ_ERRORS as e:
             logger.debug("source/frame_index read failed for frame %s: %s",
                          frame.idx, e)
+        snapshot = {}
+        for attr_name, key in (
+            ("file_size", "size"),
+            ("file_mtime_ns", "mtime_ns"),
+            ("frame_count", "frame_count"),
+            ("dataset_path", "dataset_path"),
+            ("self_contained", "self_contained"),
+        ):
+            try:
+                value = src_grp.attrs.get(attr_name)
+                if value is not None:
+                    if isinstance(value, bytes):
+                        value = value.decode("utf-8", errors="replace")
+                    snapshot[key] = value.item() if hasattr(value, "item") else value
+            except _SRC_READ_ERRORS:
+                continue
+        frame.source_snapshot = snapshot
         return
 
     # Legacy support: dict-shaped source_ref subgroup.

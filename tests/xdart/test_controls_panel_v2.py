@@ -1436,14 +1436,10 @@ def test_controls_panel_v2_gi_motor_never_shows_phantom_th(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_dir_container_count_uses_authoritative_file_count_without_frame_reads(
+def test_dir_container_count_reports_direct_files_without_counting_frames(
     qapp, monkeypatch, tmp_path,
 ):
-    """The count consumes the readiness snapshot without a frame-count sweep.
-
-    H19 probes each new or changed container once to establish READY, but this
-    presentation path must not independently reopen every file to count frames.
-    """
+    """Directory Source status is name-only and direct-child-only."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
     from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter
@@ -1474,8 +1470,8 @@ def test_dir_container_count_uses_authoritative_file_count_without_frame_reads(
         assert widget._controls_v2_source_frame_count() == n_files
         assert widget._v2_source_count_is_files is True
 
-        # A new file arrives (live acquisition): the count follows the glob,
-        # still without opening anything.
+        # A new direct child arrives: the displayed file count follows the
+        # name/stat poll, still without counting container frames.
         _write_bluesky_nxwriter(d / f"scan_{n_files:05d}.nxs", n=5)
         widget._v2_frame_count_cache = None
         widget._controls_v2_source_widget.request_directory_poll()
@@ -1485,7 +1481,7 @@ def test_dir_container_count_uses_authoritative_file_count_without_frame_reads(
         )
         assert widget._controls_v2_source_frame_count() == n_files + 1
 
-        # The summary chip renders FILES, not frames.
+        # The summary chip says files, never descriptor-frame totals.
         state = widget._controls_v2_state()
         assert state.frame_count_is_files is True
         from xdart.gui.tabs.static_scan.controls_logic import (
@@ -1495,15 +1491,15 @@ def test_dir_container_count_uses_authoritative_file_count_without_frame_reads(
         text, _ready, _tooltip = staticWidget._controls_v2_run_summary(
             state, profile)
         if str(state.frame_count) in text:
-            assert "file" in text and "frame" not in text
+            assert "file" in text
     finally:
         widget.close()
         widget.deleteLater()
 
 
-def test_dir_container_count_small_dir_is_file_count_too(qapp, monkeypatch, tmp_path):
-    """No small-directory exception: every container directory is a file
-    count (DIR-2)."""
+def test_dir_container_count_small_dir_is_file_count(
+    qapp, monkeypatch, tmp_path,
+):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
     from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter
@@ -1530,29 +1526,25 @@ def test_dir_container_count_small_dir_is_file_count_too(qapp, monkeypatch, tmp_
         widget.deleteLater()
 
 
-def test_h19_source_card_mounts_shared_widget_and_freezes_exact_ready_set(
+def test_source_card_mounts_shared_widget_and_freezes_directory_intent(
     qapp, monkeypatch, tmp_path,
 ):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
-    from xrd_tools.core.scan import SourceKind
     from xrd_tools.sources.directory_index import DirectoryIndex
-    from xrd_tools.sources.probe import ProbeResult, ProbeState
+    from xrd_tools.sources.selection import DirectorySourceSpec
 
     (tmp_path / "scan_10.nxs").write_bytes(b"ten")
     (tmp_path / "scan_2.nxs").write_bytes(b"two")
     (tmp_path / "processed.nxs").write_bytes(b"processed")
 
-    def probe(_index, candidate):
-        state = (
-            ProbeState.PROCESSED_OUTPUT
-            if candidate.path.name == "processed.nxs"
-            else ProbeState.READY
-        )
-        return ProbeResult(state, kind=SourceKind.NEXUS_STACK)
-
-    monkeypatch.setattr(DirectoryIndex, "probe_candidate", probe)
+    monkeypatch.setattr(
+        DirectoryIndex,
+        "probe_candidate",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Source selection must not classify container contents"),
+    )
     widget = staticWidget()
     try:
         source_widget = widget._controls_v2_source_widget
@@ -1567,14 +1559,19 @@ def test_h19_source_card_mounts_shared_widget_and_freezes_exact_ready_set(
         signal.child("img_ext").setValue("nxs")
         assert _wait_until(
             qapp,
-            lambda: widget._controls_v2_freeze_source_run_plan() is not None,
+            lambda: widget._controls_v2_current_directory_observation()
+            is not None,
         )
         observation = widget._controls_v2_current_directory_observation()
-        plan = widget._controls_v2_freeze_source_run_plan()
-        assert plan.candidates == observation.ready_snapshot.candidates
-        assert [path.name for path in plan.paths] == [
-            "scan_2.nxs", "scan_10.nxs",
-        ]
+        assert len(observation.discovered_snapshot.candidates) == 3
+        assert observation.ready_snapshot.candidates == ()
+        assert observation.content_opens == 0
+        assert widget._controls_v2_freeze_source_run_plan() is None
+        spec = widget._controls_v2_freeze_source_spec()
+        assert isinstance(spec, DirectorySourceSpec)
+        assert spec.root == tmp_path
+        assert spec.recursive is False
+        assert spec.suffixes == (".nxs",)
         assert source_widget.directory_session is not None
     finally:
         widget.close()
@@ -1602,7 +1599,7 @@ def test_h19_blank_container_directory_never_indexes_process_cwd(
         widget.deleteLater()
 
 
-def test_h19_empty_container_directory_freezes_empty_run_plan(
+def test_empty_container_directory_freezes_runnable_directory_intent(
     qapp, monkeypatch, tmp_path,
 ):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
@@ -1620,16 +1617,17 @@ def test_h19_empty_container_directory_freezes_empty_run_plan(
             is not None,
         )
 
-        plan = widget._controls_v2_freeze_source_run_plan()
-        assert plan is not None
-        assert plan.paths == ()
-        assert plan.root == tmp_path
+        assert widget._controls_v2_freeze_source_run_plan() is None
+        spec = widget._controls_v2_freeze_source_spec()
+        assert spec.root == tmp_path
+        assert spec.recursive is False
+        assert spec.suffixes == (".nxs",)
     finally:
         widget.close()
         widget.deleteLater()
 
 
-def test_h19_run_boundary_propagates_empty_plan_to_real_worker(
+def test_run_boundary_propagates_directory_intent_without_catalog_owner(
     qapp, monkeypatch, tmp_path,
 ):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
@@ -1654,12 +1652,12 @@ def test_h19_run_boundary_propagates_empty_plan_to_real_worker(
         widget.start_wrangler()
 
         assert started == [True]
-        assert widget.wrangler.source_run_plan is not None
-        assert widget.wrangler.source_run_plan.paths == ()
-        assert widget.wrangler.thread.source_run_plan is (
-            widget.wrangler.source_run_plan)
-        assert widget.wrangler.thread.source_index_session is (
-            widget.wrangler.source_index_session)
+        assert widget.wrangler.source_run_plan is None
+        assert widget.wrangler.thread.source_run_plan is None
+        assert widget.wrangler.source_index_session is None
+        assert widget.wrangler.thread.source_index_session is None
+        assert widget.wrangler.source_spec.root == tmp_path
+        assert widget.wrangler.thread.source_spec is widget.wrangler.source_spec
         assert widget.wrangler.source_frame_count_snapshot == {}
         assert widget.wrangler.thread.source_frame_count_snapshot == {}
         assert widget.wrangler.source_pending_count == 0
@@ -1669,10 +1667,12 @@ def test_h19_run_boundary_propagates_empty_plan_to_real_worker(
 
         widget._clear_controls_v2_run_source_authority()
         assert widget.wrangler.source_run_plan is None
+        assert widget.wrangler.source_spec is None
         assert widget.wrangler.source_index_session is None
         assert widget.wrangler.source_frame_count_snapshot == {}
         assert widget.wrangler.source_pending_count == 0
         assert widget.wrangler.thread.source_run_plan is None
+        assert widget.wrangler.thread.source_spec is None
         assert widget.wrangler.thread.source_index_session is None
         assert widget.wrangler.thread.source_frame_count_snapshot == {}
         assert widget.wrangler.thread.source_pending_count == 0
@@ -1810,14 +1810,12 @@ def test_h19_legacy_panel_never_requires_v2_directory_authority(
         widget.deleteLater()
 
 
-def test_h19_source_directory_config_roundtrip_rebinds_authoritative_index(
+def test_source_directory_config_roundtrip_rebinds_lazy_intent(
     qapp, monkeypatch, tmp_path,
 ):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
-    from xrd_tools.core.scan import SourceKind
     from xrd_tools.sources.directory_index import DirectoryIndex
-    from xrd_tools.sources.probe import ProbeResult, ProbeState
 
     source_a = tmp_path / "source-a"
     source_b = tmp_path / "source-b"
@@ -1828,8 +1826,8 @@ def test_h19_source_directory_config_roundtrip_rebinds_authoritative_index(
     monkeypatch.setattr(
         DirectoryIndex,
         "probe_candidate",
-        lambda _index, candidate: ProbeResult(
-            ProbeState.READY, kind=SourceKind.NEXUS_STACK),
+        lambda *_args, **_kwargs: pytest.fail(
+            "config restore must not inspect container contents"),
     )
     config_path = tmp_path / "source-session.json"
     widget = staticWidget()
@@ -1843,7 +1841,8 @@ def test_h19_source_directory_config_roundtrip_rebinds_authoritative_index(
         signal.child("meta_ext").setValue("auto")
         assert _wait_until(
             qapp,
-            lambda: widget._controls_v2_freeze_source_run_plan() is not None,
+            lambda: widget._controls_v2_current_directory_observation()
+            is not None,
         )
         widget.h5viewer.defaultWidget.save_defaults(fname=str(config_path))
 
@@ -1857,7 +1856,8 @@ def test_h19_source_directory_config_roundtrip_rebinds_authoritative_index(
         widget.h5viewer.defaultWidget.load_defaults(fname=str(config_path))
         assert _wait_until(
             qapp,
-            lambda: widget._controls_v2_freeze_source_run_plan() is not None,
+            lambda: widget._controls_v2_current_directory_observation()
+            is not None,
         )
 
         restored = widget.wrangler.parameters.child("Signal")
@@ -1871,13 +1871,16 @@ def test_h19_source_directory_config_roundtrip_rebinds_authoritative_index(
         source_widget = widget._controls_v2_source_widget
         session_config = source_widget.directory_session.configured
         assert session_config.root == source_a
-        assert session_config.recursive is True
+        assert session_config.recursive is False
         assert session_config.name_filter == "keep -bad"
         assert session_config.suffixes == (".nxs",)
-        assert [path.name for path in
-                widget._controls_v2_freeze_source_run_plan().paths] == [
-                    "keep_scan_1.nxs",
-                ]
+        assert source_widget.directory_subdirs_lazy is True
+        assert widget._controls_v2_freeze_source_run_plan() is None
+        spec = widget._controls_v2_freeze_source_spec()
+        assert spec.root == source_a
+        assert spec.recursive is True
+        assert spec.name_filter == "keep -bad"
+        assert spec.suffixes == (".nxs",)
     finally:
         widget.close()
         widget.deleteLater()

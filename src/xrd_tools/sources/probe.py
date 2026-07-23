@@ -4,10 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from xrd_tools.core.scan import SourceKind
+
+if TYPE_CHECKING:
+    from xrd_tools.sources.descriptor import ContainerDescriptor
 
 
 class ProbeState(str, Enum):
@@ -30,11 +34,19 @@ class ProbeState(str, Enum):
 @dataclass(frozen=True, slots=True)
 class ProbeResult:
     """Result of probing one candidate: its typed state, a disclosed reason,
-    and (when known) the specific :class:`SourceKind` to open it as."""
+    (when known) the specific :class:`SourceKind` to open it as, and the
+    immutable container facts resolved by that same observation.
+
+    Non-container and out-of-tree adapters may leave ``descriptor`` unset.
+    Keeping it optional preserves the adapter seam while allowing the built-in
+    NeXus adapter to hand one authoritative observation through the catalog,
+    Source-card projection, and frozen Run plan.
+    """
 
     state: ProbeState
     reason: str = ""
     kind: SourceKind | None = None
+    descriptor: "ContainerDescriptor | None" = None
 
 
 #: error classes a probe/open/enumeration may treat as TRANSIENT (H18-R5/R10)

@@ -221,6 +221,7 @@ def test_unchanged_provisional_candidate_is_retried_until_ready(
 def test_real_nascent_nexus_shell_becomes_ready_after_detector_arrives(tmp_path):
     source = tmp_path / "scan.nxs"
     with h5py.File(source, "w") as handle:
+        handle.attrs["creator"] = "NXWriter"
         handle.create_group("entry")
 
     session = DirectoryIndexSession()
@@ -234,6 +235,8 @@ def test_real_nascent_nexus_shell_becomes_ready_after_detector_arrives(tmp_path)
             detector = handle["entry"].create_group("instrument/detector")
             detector.create_dataset(
                 "data", data=np.zeros((2, 3, 4), dtype=np.uint16))
+            handle["entry"].create_dataset(
+                "end_time", data=np.bytes_("2026-07-23T12:00:00"))
 
         ready = session.observe()
         assert [item.path for item in ready.delta.changed] == [source]
@@ -340,6 +343,43 @@ def test_probe_work_is_bounded_and_unseen_siblings_precede_retries(
             sources)
         assert settled.content_opens == 0
         assert settled.pending_count == 0
+    finally:
+        session.close()
+
+
+def test_probe_queue_can_drain_without_rewalking_recursive_tree(
+    tmp_path, monkeypatch,
+):
+    calls = []
+    polls = 0
+    original_poll = DirectoryIndex.poll
+
+    def poll(index):
+        nonlocal polls
+        polls += 1
+        return original_poll(index)
+
+    def probe(_index, candidate):
+        calls.append(candidate.path.name)
+        return _fake_probe(_index, candidate)
+
+    monkeypatch.setattr(DirectoryIndex, "poll", poll)
+    monkeypatch.setattr(DirectoryIndex, "probe_candidate", probe)
+    for index in range(5):
+        _write(tmp_path / f"scan_{index}.nxs")
+
+    session = DirectoryIndexSession(max_probes_per_observation=2)
+    try:
+        session.configure(tmp_path, recursive=True, suffixes=(".nxs",))
+        first = session.observe()
+        second = session.observe(refresh=False)
+        final = session.observe(refresh=False)
+
+        assert (first.unprobed_count, second.unprobed_count,
+                final.unprobed_count) == (3, 1, 0)
+        assert len(final.ready_snapshot.candidates) == 5
+        assert polls == 1
+        assert calls == [f"scan_{index}.nxs" for index in range(5)]
     finally:
         session.close()
 

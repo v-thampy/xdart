@@ -601,6 +601,61 @@ def test_source_ref_multiframe(tmp_path):
             assert int(src["frame_index"][()]) == 1000 + i
 
 
+def test_source_snapshot_writer_roundtrip_drives_restarted_append_skip(
+        tmp_path):
+    """Production writer provenance is sufficient for a new worker to skip."""
+    import h5py
+
+    from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter
+    from tests.xdart.test_append_skip_before_read import (
+        _bare_worker,
+        _current_candidate,
+    )
+    from xdart.modules.ewald.frame_series import _load_frame_v2
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+
+    raw = _write_bluesky_nxwriter(tmp_path / "scan.nxs", n=6)
+    candidate = _current_candidate(raw)
+    snapshot = {
+        "size": candidate.size,
+        "mtime_ns": candidate.mtime_ns,
+        "frame_count": 6,
+        "dataset_path": "/entry/data/eiger_image",
+        "self_contained": True,
+    }
+    frames = [_DuckArch(idx=index) for index in range(1, 7)]
+    for offset, frame in enumerate(frames):
+        frame.source_file = str(raw)
+        frame.source_frame_idx = offset
+        frame.source_snapshot = dict(snapshot)
+    scan = _DuckSphere(frames)
+
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    output = output_dir / "scan.nxs"
+    save_scan_to_nexus(scan, output, entry="entry", finalize=False)
+
+    with h5py.File(output, "r") as handle:
+        source = handle["entry/frames/frame_0006/source"]
+        assert int(source.attrs["file_size"]) == candidate.size
+        assert int(source.attrs["file_mtime_ns"]) == candidate.mtime_ns
+        assert int(source.attrs["frame_count"]) == 6
+        assert source.attrs["dataset_path"] == "/entry/data/eiger_image"
+        assert bool(source.attrs["self_contained"]) is True
+        reloaded = _load_frame_v2(handle, 6, static=False, gi=False)
+    assert reloaded.source_snapshot == snapshot
+
+    worker = _bare_worker(tmp_path)
+    worker.scan = scan
+    worker._eiger_done_masters = set()
+    worker.source_frame_count_snapshot = {}
+
+    assert worker._eiger_skip_complete_append_master(
+        str(raw), candidate) is True
+    assert worker._eiger_done_masters == {str(raw)}
+    assert worker._append_skip_without_reading == 6
+
+
 def test_replace_frame_indices_updates_only_targets(tmp_path):
     """Replace mode: slice-assign new int_1d/int_2d over the listed
     frames; leave all other rows byte-identical.
