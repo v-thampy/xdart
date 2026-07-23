@@ -37,6 +37,11 @@ from xdart.modules.live import LiveScan
 from xdart.utils import get_fname_dir, match_img_detector
 from xdart.utils.browse import browse_start_dir, remember_browse_path
 from xdart.utils.session import load_session, save_session
+from ..run_config_debug import (
+    parameter_change_summary,
+    run_config_debug_enabled,
+    run_config_debug_log,
+)
 
 
 QFileDialog = QtWidgets.QFileDialog
@@ -649,7 +654,29 @@ class imageWrangler(wranglerWidget):
         try:
             for ch in changes:
                 if ch[1] == 'value':
+                    debug_trace = run_config_debug_enabled()
+                    summary = (
+                        parameter_change_summary(changes)
+                        if debug_trace
+                        else None
+                    )
+                    if debug_trace:
+                        run_config_debug_log(
+                            logger,
+                            "legacy_parameter_setup_enter",
+                            wrangler=self,
+                            origin="hidden_parameter_tree_value",
+                            changes=summary,
+                        )
                     self.setup()
+                    if debug_trace:
+                        run_config_debug_log(
+                            logger,
+                            "legacy_parameter_setup_exit",
+                            wrangler=self,
+                            origin="hidden_parameter_tree_value",
+                            changes=summary,
+                        )
                     return
         except (IndexError, TypeError):
             # Malformed change tuple: fall back to the historical behaviour.

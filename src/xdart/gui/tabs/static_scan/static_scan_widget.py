@@ -18,6 +18,10 @@ import imageio
 import pyFAI
 
 from .browse_debug import browse_debug_enabled, browse_debug_log, sequence_summary
+from .run_config_debug import (
+    bump_run_config_debug_generation,
+    run_config_debug_log,
+)
 
 logger = logging.getLogger(__name__)
 _ORPHANED_STITCH_THREADS = []
@@ -1543,15 +1547,54 @@ class staticWidget(QWidget):
     ) -> None:
         """Apply native V2 Int/GI/threshold state to the scan and consumers."""
 
+        run_config_debug_log(
+            logger,
+            "native_int_apply_enter",
+            widget=self,
+            origin="controls_v2_native_int_state",
+            commit_pending=commit_pending,
+            push_wrangler=push_wrangler,
+            push_integrator=push_integrator,
+        )
         if commit_pending:
             self._commit_controls_v2_pending_edits()
         self._controls_v2_ensure_native_int_defaults()
         self._controls_v2_apply_gi_config_to_scan()
+        run_config_debug_log(
+            logger,
+            "native_int_scan_applied",
+            widget=self,
+            origin="controls_v2_native_int_state",
+        )
         if push_wrangler:
+            run_config_debug_log(
+                logger,
+                "threshold_push_enter",
+                widget=self,
+                origin="controls_v2_native_int_state",
+            )
             self._push_threshold_to_wrangler()
+            run_config_debug_log(
+                logger,
+                "threshold_push_exit",
+                widget=self,
+                origin="controls_v2_native_int_state",
+            )
             self._push_gi_to_wrangler()
+            run_config_debug_log(
+                logger,
+                "gi_push_exit",
+                widget=self,
+                origin="controls_v2_native_int_state",
+            )
         if push_integrator:
             self._controls_v2_push_threshold_to_integrator()
+        run_config_debug_log(
+            logger,
+            "native_int_apply_exit",
+            widget=self,
+            origin="controls_v2_native_int_state",
+        )
 
     def _controls_v2_native_int_snapshot(self) -> dict:
         scan = getattr(self, "scan", None)
@@ -2334,6 +2377,15 @@ class staticWidget(QWidget):
             self._controls_v2_source_energy_cache = None
             self._controls_v2_metadata_probe_cache = None
         self._apply_controls_v2_field_value(path, value)
+        bump_run_config_debug_generation(self, "config")
+        run_config_debug_log(
+            logger,
+            "controls_field_applied",
+            widget=self,
+            origin="controls_v2_ui",
+            field_path=path,
+            field_value=value,
+        )
         self._sync_controls_v2_source_index()
         self._refresh_controls_v2_profile(immediate=True)
 
@@ -5165,6 +5217,14 @@ class staticWidget(QWidget):
                              exc_info=True)
         self._configure_controls_v2_native_run_plan()
         self._refresh_controls_v2_profile(immediate=True)
+        bump_run_config_debug_generation(self, "config")
+        run_config_debug_log(
+            logger,
+            "config_snapshot_applied",
+            widget=self,
+            origin="config_load",
+            native_snapshot=isinstance(payload, dict),
+        )
 
     def _init_defaults_and_timer(self):
         """Set up default parameters and the coalescing update timer."""
@@ -8480,6 +8540,13 @@ class staticWidget(QWidget):
         args:
             gi: bool, flag for determining if in Grazing incidence
         """
+        run_config_debug_log(
+            logger,
+            "scattering_geometry_update_enter",
+            widget=self,
+            origin="sigUpdateGI_or_direct",
+            requested_gi=bool(gi),
+        )
         scan = getattr(self, "scan", None)
         if scan is not None:
             scan.gi = gi
@@ -8494,6 +8561,13 @@ class staticWidget(QWidget):
             self._refresh_controls_v2_profile(immediate=True)
         else:
             self.integratorTree.set_image_units()
+        run_config_debug_log(
+            logger,
+            "scattering_geometry_update_exit",
+            widget=self,
+            origin="sigUpdateGI_or_direct",
+            requested_gi=bool(gi),
+        )
 
     def new_frame(self, frame_data):
         """Connected to sigUpdateFile from wrangler. Called when a new
@@ -8524,7 +8598,20 @@ class staticWidget(QWidget):
         import time as _time
         _perf = bool(os.environ.get("XDART_PERF"))
         _t0 = _time.perf_counter() if _perf else 0.0
+        bump_run_config_debug_generation(self, "run")
+        run_config_debug_log(
+            logger,
+            "run_start_enter",
+            widget=self,
+            origin="start_wrangler",
+        )
         self._apply_controls_v2_run_state()
+        run_config_debug_log(
+            logger,
+            "run_state_applied",
+            widget=self,
+            origin="start_wrangler",
+        )
         self._sync_controls_v2_source_index()
         source_config = self._controls_v2_container_index_config()
         source_plan, source_pending_count = (
@@ -8558,6 +8645,12 @@ class staticWidget(QWidget):
         _t1 = _time.perf_counter() if _perf else 0.0
         self.wrangler.enabled(False)
         self.wrangler.setup()
+        run_config_debug_log(
+            logger,
+            "wrangler_setup_exit",
+            widget=self,
+            origin="start_wrangler",
+        )
         _t2 = _time.perf_counter() if _perf else 0.0
         self._configure_controls_v2_native_run_plan()
         self.h5viewer.auto_last = True
@@ -8598,6 +8691,12 @@ class staticWidget(QWidget):
                     or []),
             )
 
+        run_config_debug_log(
+            logger,
+            "worker_start",
+            widget=self,
+            origin="start_wrangler",
+        )
         self.wrangler.thread.start()
 
     def _perf_heartbeat_tick(self):

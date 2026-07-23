@@ -979,6 +979,143 @@ def test_pause_browse_resume_owner_qualified_terminal_coherence(
         widget.deleteLater()
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "R4-D captured live failure: the run capture aliases H5Viewer's "
+        "mutable browse LiveScan"
+    ),
+)
+def test_r4_run_capture_survives_h5viewer_browse_mutation(
+        qapp, monkeypatch, tmp_path):
+    """Pause/Browse/Resume must not mutate the acquisition owner in place."""
+    widget = _make_widget(monkeypatch, tmp_path)
+    resumed_keys = []
+    try:
+        widget.scan.name = "run_a"
+        widget.scan.gi = False
+        widget.displayframe.resume_processing = resumed_keys.append
+
+        # Use the production run-state owner without launching a reduction
+        # worker.  The production H5Viewer and display still share the same
+        # LiveScan object at the captured failure point.
+        widget._enter_run_state()
+        captured = widget._x1_run_scan_capture
+        captured_scan = getattr(captured, "scan", captured)
+
+        # Drive the real Run-button pause state and worker-boundary signal.
+        widget.wrangler.command = "start"
+        widget.wrangler.thread.command = "start"
+        widget.wrangler._set_action_button("running")
+        widget.controls.startButton.click()
+        assert widget.wrangler.thread.command == "pause"
+        widget.wrangler.thread.sigPaused.emit()
+        qapp.processEvents()
+        assert widget._run_active is True
+
+        # fileHandlerThread.set_datafile mutates this production owner in
+        # place.  Direct field mutation isolates the ownership failure without
+        # paying for either processed-file load.
+        browse_scan = widget.h5viewer.scan
+        browse_scan.name = "scan_b"
+        browse_scan.gi = True
+
+        widget.controls.startButton.click()
+        qapp.processEvents()
+
+        # Current captured tuple at 41292079 is
+        # (False, "scan_b", True, ["scan_b"]).
+        assert (
+            captured_scan is not browse_scan,
+            captured_scan.name,
+            captured_scan.gi,
+            resumed_keys,
+        ) == (True, "run_a", False, ["run_a"])
+    finally:
+        if widget._run_active:
+            widget._exit_run_state()
+        widget._controls_v2_refresh_timer.cancel()
+        widget.close()
+        widget.deleteLater()
+        qapp.processEvents()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "R4-D captured live failure: hydration round trips carry a display "
+        "generation but no acquisition/browse owner"
+    ),
+)
+def test_r4_hydration_same_generation_cross_owner_completion_is_rejected(
+        qapp, monkeypatch, tmp_path):
+    """Generation equality must not authorize another owner's completion."""
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        display = widget.displayframe
+        generation = 23
+        requested = []
+        repaints = []
+
+        class RecordingWorker:
+            def request(self, label, request_generation, **kwargs):
+                requested.append((label, request_generation, dict(kwargs)))
+
+        worker = RecordingWorker()
+        display.scan.name = "scan_b"
+        display.frame_ids = ("9",)
+        display.overall = False
+        display.display_generation = generation
+        display._last_selection_sig = display._selection_generation_signature()
+        display._async_hydration_enabled = True
+        display._hydration_pending_labels = set()
+        display._hydration_success_labels = set()
+        display._hydration_success_generation = generation
+        display._hydration_failure_counts = {}
+        display._hydration_failure_logged = set()
+        display._pending_hydration_render = False
+        display._pending_hydration_generation = None
+        display._hydration_purpose_resident = lambda *_args: False
+        display._ensure_hydration_worker = lambda: worker
+
+        # Exercise the production request builder under browse owner B.
+        display._request_frame_hydration(9, purpose="full")
+        assert len(requested) == 1
+
+        # Switch to owner A while deliberately preserving the numeric
+        # generation.  This prevents the existing generation guard from
+        # masking the missing owner contract.
+        display.scan.name = "scan_a"
+        display._last_selection_sig = display._selection_generation_signature()
+        display._hydration_purpose_resident = lambda *_args: True
+        display._hydration_quiet_timer = None
+        display.request_current_selection_repaint = (
+            lambda *, generation=None, reason=None:
+                repaints.append((generation, reason)) or True
+        )
+
+        # Echo the legacy completion.  A correct round trip must know this
+        # request belonged to B and reject it even with an equal generation.
+        display._on_frame_hydrated(9, generation)
+
+        request_kwargs = requested[0][2]
+        has_owner = (
+            any(
+                key in request_kwargs
+                for key in ("owner", "owner_token", "request_owner")
+            )
+            or {"context_id", "scan_key"} <= set(request_kwargs)
+        )
+        # Current captured tuple at 41292079 is
+        # (False, [(23, "hydration")]).
+        assert (has_owner, repaints) == (True, [])
+    finally:
+        widget._controls_v2_refresh_timer.cancel()
+        widget.close()
+        widget.deleteLater()
+        qapp.processEvents()
+
+
 def test_persist_override_never_retains_unavailable_or_error(
         qapp, monkeypatch, tmp_path):
     """Test 2f: during an active run with PERSIST_2D_DURING_PROCESSING, an
