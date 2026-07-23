@@ -162,6 +162,12 @@ def _build_batch_thread(poni, mask, *, incidence_motor="th",
     w._wait_if_paused = MethodType(imageThread._wait_if_paused, w)
     # Frame-shell builder extracted from the streaming dispatcher.
     w._build_batch_frames = MethodType(imageThread._build_batch_frames, w)
+    # R4A-8: _build_batch_frames stamps each frame's Append provenance via
+    # self._source_snapshot_for_frame (added in a72ba63c at iwt:2709); bind the
+    # REAL method so the batch worker host exercises the production path instead
+    # of AttributeError-ing (it reads self._source_snapshot_by_path, default {}).
+    w._source_snapshot_for_frame = MethodType(
+        imageThread._source_snapshot_for_frame, w)
     # The real freeze+dispatch orchestrator (freezes, then routes to the
     # streaming dispatcher) — used to exercise the Int-1D-XYE path where the 2D
     # freeze self-skips on xye_only.
