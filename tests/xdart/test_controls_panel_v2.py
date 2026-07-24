@@ -6368,3 +6368,638 @@ def test_apply_snapshot_to_scan_in_place_not_aliased(qapp, monkeypatch):
     finally:
         widget.close()
         widget.deleteLater()
+
+
+# ---------------------------------------------------------------------------
+# T-2R (§14.11) — checked-commit atomicity: preflight, push-before-setter,
+# rollback-all, contained exceptions, display-scan rollback, typed attempt
+# result.  Each is RED at 1f8b4255 and GREEN at the T-2R correction.
+# ---------------------------------------------------------------------------
+
+
+def test_t2r_failed_forward_carrier_is_itself_restored(qapp, monkeypatch):
+    """§14.11.A.3 / E1: a setter that writes the WRONG value then fails readback
+    still gets restored — the failed-forward carrier is pushed onto the rollback
+    stack BEFORE its setter and force-restored directly.
+
+    RED at 1f8b4255: the carrier was appended to ``applied`` only AFTER a
+    successful readback, so the one that failed forward was never rolled back."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        mask_path = ("Signal", "mask_file")
+        bg_path = ("BG", "File")
+        mask = widget._controls_v2_param(mask_path)
+        bg = widget._controls_v2_param(bg_path)
+        mask_before = mask.value()
+        bg_before = bg.value()
+        staged = widget.stage_controls_transaction(
+            [(mask_path, "/tmp/t2r-mask.edf"), (bg_path, "/tmp/t2r-bg.edf")])
+
+        original_bg_set = bg.setValue
+
+        def set_wrong(_value, *args, **kwargs):
+            return original_bg_set("/tmp/t2r-wrong.edf", *args, **kwargs)
+
+        monkeypatch.setattr(bg, "setValue", set_wrong)
+        result = widget.commit_controls_transaction(staged)
+
+        assert not result.ok
+        assert result.phase == "legacy_apply"
+        assert mask.value() == mask_before
+        assert bg.value() == bg_before
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t2r_rollback_continues_past_first_restore_failure(qapp, monkeypatch):
+    """§14.11.A.4 / E2: a restore failure on one carrier must NOT abort the
+    restore of independently-restorable OLDER carriers; every un-restorable path
+    is collected.
+
+    RED at 1f8b4255: ``_controls_v2_rollback_legacy`` returned on the first
+    restore failure, leaving earlier carriers mutated."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        first_path = ("Signal", "mask_file")
+        second_path = ("BG", "File")
+        trigger_path = ("Signal", "Filter")
+        first = widget._controls_v2_param(first_path)
+        second = widget._controls_v2_param(second_path)
+        trigger = widget._controls_v2_param(trigger_path)
+        first_before = first.value()
+        second_before = second.value()
+        staged = widget.stage_controls_transaction([
+            (first_path, "/tmp/t2r-first.edf"),
+            (second_path, "/tmp/t2r-second.edf"),
+            (trigger_path, "t2r-trigger"),
+        ])
+
+        original_second_set = second.setValue
+
+        def refuse_restore(value, *args, **kwargs):
+            if value != second_before:
+                return original_second_set(value, *args, **kwargs)
+            return None
+
+        monkeypatch.setattr(second, "setValue", refuse_restore)
+        monkeypatch.setattr(trigger, "setValue", lambda *a, **k: None)
+        result = widget.commit_controls_transaction(staged)
+
+        assert not result.ok
+        assert result.recovery_failed_path == second_path
+        assert second_path in result.recovery_failed_paths
+        assert first.value() == first_before   # older carrier still restored
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t2r_getter_exception_stays_inside_boundary(qapp, monkeypatch):
+    """§14.11.A.1/A.5 / E3: a getter that raises is contained — no raw exception
+    escapes ``commit_controls_transaction`` and earlier carriers are untouched.
+
+    RED at 1f8b4255: the prior value was read inside the forward loop AFTER an
+    earlier write, so the raw ``RuntimeError`` escaped with A applied."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        first_path = ("Signal", "mask_file")
+        second_path = ("BG", "File")
+        first = widget._controls_v2_param(first_path)
+        second = widget._controls_v2_param(second_path)
+        first_before = first.value()
+        staged = widget.stage_controls_transaction(
+            [(first_path, "/tmp/t2r-first.edf"), (second_path, "/tmp/t2r-second.edf")])
+
+        monkeypatch.setattr(
+            second, "value",
+            lambda: (_ for _ in ()).throw(RuntimeError("read failed")))
+        result = widget.commit_controls_transaction(staged)   # must NOT raise
+
+        assert not result.ok
+        assert first.value() == first_before
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t2r_missing_carrier_at_preflight_fails_closed(qapp, monkeypatch):
+    """§14.11.A.1/A.6 / E4: a carrier missing at preflight is a typed refusal with
+    ZERO writes — never the silent success of the old
+    ``_controls_v2_apply_legacy_carrier`` (which returned True when the param was
+    ``None``).
+
+    RED at 1f8b4255: a missing carrier was treated as applied, so the commit
+    succeeded and the earlier carrier was written."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        mask_path = ("Signal", "mask_file")
+        bg_path = ("BG", "File")
+        mask = widget.wrangler.parameters.child(*mask_path)
+        mask_before = mask.value()
+        staged = widget.stage_controls_transaction(
+            [(mask_path, "/tmp/t2r-mask.edf"), (bg_path, "/tmp/t2r-bg.edf")])
+
+        real_param = widget._controls_v2_param
+
+        def fake_param(path):
+            if tuple(path) == bg_path:
+                return None    # carrier "missing" at preflight
+            return real_param(path)
+
+        monkeypatch.setattr(widget, "_controls_v2_param", fake_param)
+        result = widget.commit_controls_transaction(staged)
+
+        assert not result.ok
+        assert result.phase == "preflight"
+        assert result.failed_path == bg_path
+        assert mask.value() == mask_before   # zero writes
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t2r_partial_display_projection_is_rolled_back(qapp, monkeypatch):
+    """§14.11.B.1 / E5: a mid-projection failure in
+    ``_controls_v2_apply_snapshot_to_scan`` restores the display scan (in-place
+    dict identity preserved) as well as the intent.
+
+    RED at 1f8b4255: only the intent/self fields were snapshotted; the display
+    scan stayed at its partially-projected value."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        intent = widget._controls_v2_ensure_run_intent()
+        widget._controls_v2_ensure_native_int_defaults()
+        held_1d = widget.scan.bai_1d_args
+        intent_before = copy.deepcopy(intent.bai_1d_args)
+        scan_before = copy.deepcopy(widget.scan.bai_1d_args)
+        staged = widget.stage_controls_transaction([(("Int1D", "points"), "777")])
+
+        def partial_then_raise(_snapshot, *a, **k):
+            widget.scan.bai_1d_args["numpoints"] = 999_999
+            raise RuntimeError("partial display projection")
+
+        monkeypatch.setattr(
+            widget, "_controls_v2_apply_snapshot_to_scan", partial_then_raise)
+        result = widget.commit_controls_transaction(staged)
+
+        assert not result.ok
+        assert result.phase == "install"
+        assert intent.bai_1d_args == intent_before
+        assert widget.scan.bai_1d_args == scan_before
+        assert widget.scan.bai_1d_args is held_1d   # in-place identity preserved
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t2r_stale_recovery_does_not_mislabel_next_attempt(qapp, monkeypatch):
+    """§14.11.C / E7: the fold's returned result is the sole diagnostic authority;
+    a stale ambient recovery marker must not relabel a fresh staging failure.
+
+    RED at 1f8b4255: ``_prepare`` read the ambient
+    ``_controls_v2_last_fold_recovery`` (cleared only on success), so an
+    unrelated staging failure surfaced the old carrier's recovery message."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import (
+        DeferredRunEditsPendingError,
+        staticWidget,
+    )
+
+    widget = staticWidget()
+    try:
+        # A stale ambient marker from a prior attempt (now defunct).
+        widget._controls_v2_last_fold_recovery = ("Signal", "mask_file")
+        widget._controls_v2_record_edit(
+            ("Int1D", "points"), "not-a-number", origin="draft")
+
+        with pytest.raises(DeferredRunEditsPendingError) as excinfo:
+            widget._prepare_controls_v2_run_configuration()
+
+        message = str(excinfo.value)
+        assert "Int1D/points" in message
+        assert "could not be restored" not in message
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t2r_refusal_message_is_phase_correct(qapp, monkeypatch):
+    """§14.11.C / E10: an install failure surfaces its PHASE, not an empty path.
+
+    RED at 1f8b4255: an install failure had ``failed_path=None``, so the message
+    rendered ``deferred edit invalid ()`` with an empty descriptor."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import (
+        DeferredRunEditsPendingError,
+        staticWidget,
+    )
+
+    widget = staticWidget()
+    try:
+        widget._pending_controls_v2_run_configuration = None
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("Int1D", "points"), 111)
+        widget.wrangler.finished.emit()
+        qapp.processEvents()
+
+        def _raise(_snapshot, *a, **k):
+            raise RuntimeError("injected install failure")
+
+        monkeypatch.setattr(
+            widget, "_controls_v2_apply_snapshot_to_scan", _raise)
+
+        with pytest.raises(DeferredRunEditsPendingError) as excinfo:
+            widget._prepare_controls_v2_run_configuration()
+
+        message = str(excinfo.value)
+        assert "install" in message         # phase surfaced
+        assert "()" not in message          # not an empty descriptor
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+# ---------------------------------------------------------------------------
+# T-2.1 (§13.6/§13.7/§13.8/§13.11 + §14.11.B.4/D.2) — compound PONI carrier,
+# source-token GI hydration, child-only-dir UNKNOWN, candidate SourceSpec.
+# Each is RED at 1f8b4255 and GREEN at the T-2.1 correction.
+# ---------------------------------------------------------------------------
+
+
+def _write_poni(path, dist):
+    path.write_text(
+        f"Distance: {dist}\nPoni1: 0.01\nPoni2: 0.02\n"
+        "Rot1: 0.0\nRot2: 0.0\nRot3: 0.0\nWavelength: 1.0e-10\n"
+    )
+    return str(path)
+
+
+def test_t2_1_candidate_source_is_b_with_unknown_motor(qapp, monkeypatch, tmp_path):
+    """§13.11 test 5: a staged source A→B (then GI enable) derives candidate
+    source B immediately and sets motor knowledge UNKNOWN — A's motor is never
+    adopted into the candidate.
+
+    RED at 1f8b4255: StagedControlsTransaction had no candidate_source_spec."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import (
+        GIMotorObservation,
+        staticWidget,
+    )
+
+    widget = staticWidget()
+    try:
+        file_a = str(tmp_path / "scan_a.tif")
+        file_b = str(tmp_path / "scan_b.tif")
+        sig = widget.wrangler.parameters.child("Signal")
+        sig.child("inp_type").setValue("Single Image")
+        sig.child("File").setValue(file_a)
+        # Record source A's motor observation (halpha) under A's token.
+        widget._controls_v2_record_gi_motor_observation(["halpha"])
+        assert widget._controls_v2_capture_gi_motor_observation().state == (
+            GIMotorObservation.KNOWN_NONEMPTY)
+
+        staged = widget.stage_controls_transaction([
+            (("Signal", "File"), file_b),
+            (("GI", "Grazing"), True),
+        ])
+
+        # Candidate source is B ...
+        assert staged.candidate_source_spec is not None
+        assert file_b in str(getattr(staged.candidate_source_spec, "uri", ""))
+        assert file_b in tuple(str(x) for x in (staged.source_fingerprint or ()))
+        # ... and its motor knowledge is UNKNOWN; A's halpha is never adopted.
+        assert staged.gi_motor_observation.state == GIMotorObservation.UNKNOWN
+        assert "halpha" not in staged.gi_motor_observation.motors
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t2_1_delayed_and_older_hydration_are_ignored(qapp, monkeypatch):
+    """§13.11 test 6: a production delayed-A result under source B, and an older
+    same-root generation under a newer request, change NEITHER the stored motor
+    knowledge NOR the visible theta dropdown.
+
+    RED at 1f8b4255: sigGIMotorOptions carried a bare list with no source/epoch,
+    so a delayed result was recorded as the current source."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        wr = widget.wrangler
+        wr.inp_type = "Image Directory"
+        integ_calls = []
+        monkeypatch.setattr(
+            widget.integratorTree, "set_gi_motor_options",
+            lambda motors: integ_calls.append(tuple(motors)))
+        emitted = []
+        wr.sigGIMotorOptions.connect(lambda p: emitted.append(p))
+
+        # Source A: request starts (gen bumped), motors halpha -> owner records A.
+        wr.img_dir = "/tmp/source_A"
+        wr._next_gi_hydration_generation()
+        wr.motors = ["halpha"]
+        wr._gi_motor_knowledge_proved = True
+        wr.set_gi_motor_options()
+        qapp.processEvents()
+        payload_a = emitted[-1]
+
+        # Switch to source B: newer request, motors gonth -> owner records B.
+        wr.img_dir = "/tmp/source_B"
+        wr._next_gi_hydration_generation()
+        wr.motors = ["gonth"]
+        wr.set_gi_motor_options()
+        qapp.processEvents()
+        stored_after_b = widget._controls_v2_gi_motor_observation
+        integ_calls_after_b = len(integ_calls)
+
+        # DELAYED A result arrives under B -> ignored (fingerprint mismatch).
+        widget._on_gi_motor_options_changed(payload_a)
+        assert widget._controls_v2_gi_motor_observation is stored_after_b
+        assert len(integ_calls) == integ_calls_after_b   # dropdown untouched
+
+        # An OLDER same-root generation under a newer request -> also ignored.
+        wr.img_dir = "/tmp/source_R"
+        wr._next_gi_hydration_generation()
+        wr.motors = ["th"]
+        wr.set_gi_motor_options()
+        qapp.processEvents()
+        payload_r_old = emitted[-1]
+        wr._next_gi_hydration_generation()          # newer request, same root R
+        wr.motors = ["eta"]
+        wr.set_gi_motor_options()
+        qapp.processEvents()
+        stored_after_r = widget._controls_v2_gi_motor_observation
+        integ_calls_after_r = len(integ_calls)
+
+        widget._on_gi_motor_options_changed(payload_r_old)   # stale generation
+        assert widget._controls_v2_gi_motor_observation is stored_after_r
+        assert len(integ_calls) == integ_calls_after_r
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t2_1_recursive_dir_preview_is_unknown_then_hydrates(qapp, monkeypatch, tmp_path):
+    """§13.11 test 7: a recursive directory whose matching data lives ONLY in a
+    subdirectory yields UNKNOWN (no eager recursive walk; explicit motor
+    preserved); a later targeted hydration then populates the choices.
+
+    RED at 1f8b4255: 'no direct-child preview' was classified KNOWN_EMPTY, so an
+    explicit GI motor degraded to Manual."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import (
+        GIMotorObservation,
+        staticWidget,
+    )
+
+    widget = staticWidget()
+    try:
+        root = tmp_path / "recursive_root"
+        (root / "sub").mkdir(parents=True)
+        (root / "sub" / "img_00001_master.h5").write_bytes(b"")
+        wr = widget.wrangler
+        wr.inp_type = "Image Directory"
+        wr.img_dir = str(root)
+        wr.include_subdir = True
+        wr.img_ext = "h5"
+        wr.file_filter = ""
+
+        emitted = []
+        wr.sigGIMotorOptions.connect(lambda p: emitted.append(p))
+
+        # Direct-child-only preview finds nothing (no recursive walk into sub/).
+        assert wr._directory_metadata_preview_file() == ""
+        wr.motors = []
+        wr._adopt_directory_metadata_preview("")
+        qapp.processEvents()
+        assert emitted[-1].state == GIMotorObservation.UNKNOWN
+        obs = widget._controls_v2_capture_gi_motor_observation()
+        assert obs.state == GIMotorObservation.UNKNOWN
+        assert obs.choices_for_freeze() is None      # explicit motor preserved
+
+        # Targeted hydration reports motors for THIS source.
+        wr.motors = ["halpha"]
+        wr._gi_motor_knowledge_proved = True
+        wr.set_gi_motor_options()
+        qapp.processEvents()
+        assert emitted[-1].state == GIMotorObservation.KNOWN_NONEMPTY
+        obs2 = widget._controls_v2_capture_gi_motor_observation()
+        assert obs2.state == GIMotorObservation.KNOWN_NONEMPTY
+        assert "halpha" in obs2.choices_for_freeze()
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t2_1_targeted_empty_is_known_empty_and_manual(qapp, monkeypatch):
+    """§13.11 test 8: a source PROVEN to have no motors is KNOWN_EMPTY, and the
+    effective GI motor resolves to Manual.
+
+    RED at 1f8b4255: sigGIMotorOptions carried a bare list with no knowledge
+    state (payload has no ``.state``)."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import (
+        GIMotorObservation,
+        staticWidget,
+    )
+
+    widget = staticWidget()
+    try:
+        wr = widget.wrangler
+        emitted = []
+        wr.sigGIMotorOptions.connect(lambda p: emitted.append(p))
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        widget._on_controls_v2_field_changed(("GI", "th_motor"), "halpha")
+
+        # A targeted inspection proves NO motors -> KNOWN_EMPTY.
+        wr.motors = []
+        wr._gi_motor_knowledge_proved = True
+        wr.set_gi_motor_options()
+        qapp.processEvents()
+        assert emitted[-1].state == GIMotorObservation.KNOWN_EMPTY
+        assert widget._controls_v2_capture_gi_motor_observation().state == (
+            GIMotorObservation.KNOWN_EMPTY)
+
+        frozen = widget._prepare_controls_v2_run_configuration()
+        assert frozen.gi.effective_motor == "Manual"
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t2_1_compound_poni_deferred_parity(qapp, monkeypatch, tmp_path):
+    """§13.11 test 9: a deferred PONI A→B installs path, values, object, wrangler
+    carrier, thread carrier, and writer provenance as ONE compound value.
+
+    RED at 1f8b4255: the signal-blocked projection updated only the path, so the
+    thread kept PONI A's in-memory object while the frozen identity named B."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    from xrd_tools.core.containers import PONI
+
+    widget = staticWidget()
+    try:
+        poni_a = _write_poni(tmp_path / "a.poni", 0.10)
+        poni_b = _write_poni(tmp_path / "b.poni", 0.20)
+        b_values = PONI.from_poni_file(poni_b).to_dict()
+
+        # Establish live PONI A on the wrangler + thread.
+        widget.wrangler.parameters.child("Signal", "poni_file").setValue(poni_a)
+        assert widget.wrangler.poni is not None
+
+        # Deferred edit A→B, then Start folds it through the checked commit.
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("Signal", "poni_file"), poni_b)
+        widget.wrangler.finished.emit()
+        qapp.processEvents()
+        frozen = widget._prepare_controls_v2_run_configuration()
+
+        assert widget.wrangler.poni_file == poni_b
+        assert widget.wrangler.poni.to_dict() == b_values
+        assert widget.wrangler.thread.poni.to_dict() == b_values
+        assert widget._controls_v2_ensure_run_intent().poni_values == b_values
+        assert frozen.poni_file == poni_b
+        assert frozen.poni_values == b_values
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t2_1_compound_poni_invalid_b_and_midcommit_restore_a(qapp, monkeypatch, tmp_path):
+    """§13.11 test 9 (rollback): an invalid B refuses staging, and an injected
+    mid-commit failure rolls back — both leave ALL of PONI A's carriers intact.
+
+    RED at 1f8b4255: PONI was not part of the transaction, so an invalid B and a
+    mid-commit failure could leave a torn (path B / object A) state."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import (
+        ControlsTransactionError,
+        staticWidget,
+    )
+
+    widget = staticWidget()
+    try:
+        poni_a = _write_poni(tmp_path / "a.poni", 0.10)
+        bad_b = tmp_path / "bad.poni"
+        bad_b.write_text("- not\n- a\n- mapping\n")   # exists but unparseable
+        widget.wrangler.parameters.child("Signal", "poni_file").setValue(poni_a)
+        # get_poni_dict sets wrangler.poni on load; the thread carrier is synced
+        # at setup — establish the full A baseline (as a prior run would leave it).
+        widget.wrangler.thread.poni = widget.wrangler.poni
+        a_values = widget.wrangler.poni.to_dict()
+        a_object = widget.wrangler.poni
+
+        # Invalid B -> staging refuses; A carriers untouched.
+        staged = widget.stage_controls_transaction(
+            [(("Signal", "poni_file"), str(bad_b))])
+        assert isinstance(staged, ControlsTransactionError)
+        assert widget.wrangler.poni is a_object
+        assert widget.wrangler.thread.poni.to_dict() == a_values
+
+        # Valid B but an injected mid-commit failure -> rollback restores A.
+        good_b = _write_poni(tmp_path / "b.poni", 0.20)
+        staged2 = widget.stage_controls_transaction(
+            [(("Signal", "poni_file"), good_b)])
+        assert staged2.poni_touched
+
+        def _boom(_snapshot, *a, **k):
+            raise RuntimeError("injected mid-commit failure")
+
+        monkeypatch.setattr(
+            widget, "_controls_v2_apply_snapshot_to_scan", _boom)
+        result = widget.commit_controls_transaction(staged2)
+
+        assert not result.ok
+        assert widget.wrangler.poni is a_object
+        assert widget.wrangler.poni_file == poni_a
+        assert widget.wrangler.thread.poni.to_dict() == a_values
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t2r_source_double_fault_names_source_carrier(qapp, monkeypatch):
+    """§14.11.B.4 / E6: when source reconciliation fails AND the restore-sync also
+    fails, the recovery failure explicitly NAMES the source carrier, and the
+    caches/observation are restored where possible.
+
+    RED at 1f8b4255: the restore-sync exception was logged and discarded, so
+    recovery_failed_path never named the source owner."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        path = ("Signal", "include_subdir")
+        current = bool(widget._controls_v2_param(path).value())
+        staged = widget.stage_controls_transaction([(path, not current)])
+        prior_observation = object()
+        prior_energy_cache = ("old", 12.0)
+        prior_probe_cache = ("old", "probe")
+        widget._controls_v2_directory_observation = prior_observation
+        widget._controls_v2_source_energy_cache = prior_energy_cache
+        widget._controls_v2_metadata_probe_cache = prior_probe_cache
+        calls = []
+
+        def _sync_fails():
+            calls.append(1)
+            widget._controls_v2_directory_observation = ("partial", len(calls))
+            raise RuntimeError("source reconciliation failed")
+
+        monkeypatch.setattr(
+            widget, "_sync_controls_v2_source_index", _sync_fails)
+        result = widget.commit_controls_transaction(staged)
+
+        assert not result.ok
+        assert len(calls) == 2                       # forward + restore attempt
+        assert result.recovery_failed_path == ("Source",)
+        assert widget._controls_v2_directory_observation is prior_observation
+        assert widget._controls_v2_source_energy_cache == prior_energy_cache
+        assert widget._controls_v2_metadata_probe_cache == prior_probe_cache
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t2r_same_value_source_edit_does_not_reconcile(qapp, monkeypatch):
+    """§14.11.D.2: a same-value source edit whose effective selection is unchanged
+    performs ZERO source reconciliation.
+
+    RED at 1f8b4255: source_selection_touched was set from path membership, so a
+    net-zero include_subdir edit still requested one reconciliation."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        path = ("Signal", "include_subdir")
+        current = widget._controls_v2_param(path).value()
+        widget._controls_v2_record_edit(path, current, origin="deferred")
+        calls = []
+        monkeypatch.setattr(
+            widget, "_sync_controls_v2_source_index",
+            lambda: calls.append(1))
+
+        assert widget._controls_v2_fold_deferred_edits_into_intent() is None
+        assert calls == []
+    finally:
+        widget.close()
+        widget.deleteLater()

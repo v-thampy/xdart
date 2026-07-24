@@ -9,6 +9,7 @@ import os
 from queue import Queue
 import threading
 import traceback
+from typing import NamedTuple
 
 # Other imports
 import numpy as np
@@ -105,6 +106,36 @@ class _CommandCancelToken:
         return getattr(self._owner, 'command', None) == 'stop'
 
 
+class GIMotorHydration(NamedTuple):
+    """Immutable, source-qualified GI theta-motor observation carried by
+    :attr:`wranglerWidget.sigGIMotorOptions` (§13.6 / §13.11 hydration 1-6).
+
+    Replaces the bare motor ``list`` payload so a late result cannot silently
+    overwrite the current source's motor knowledge:
+
+    * ``state`` is one of ``UNKNOWN`` / ``KNOWN_EMPTY`` / ``KNOWN_NONEMPTY``.
+      ``UNKNOWN`` means the source was NOT inspected (e.g. a lazy recursive
+      directory whose direct children hold no preview file); ``KNOWN_EMPTY``
+      means a targeted inspection PROVED there are no eligible motors (§13.7).
+    * ``source_fingerprint`` + ``generation`` are the source identity and the
+      request/hydration epoch captured when the metadata request STARTED, so
+      the static-widget owner can reject a delayed result from a superseded
+      source (fingerprint mismatch) or an older same-root request (lower
+      generation) BEFORE it updates stored knowledge or the visible dropdown.
+    """
+
+    state: str
+    motors: tuple
+    source_fingerprint: object
+    generation: int
+
+    # Knowledge states (string-equal to GIMotorObservation's, so the static
+    # widget owner can compare payload.state directly).
+    UNKNOWN = "UNKNOWN"
+    KNOWN_EMPTY = "KNOWN_EMPTY"
+    KNOWN_NONEMPTY = "KNOWN_NONEMPTY"
+
+
 class wranglerWidget(Qt.QtWidgets.QWidget):
     """Base class for wranglers. Extending this ensures all methods,
     signals, and attributes expected by ttheta_widget are present.
@@ -147,7 +178,10 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
     sigXyeOutputReady = Qt.QtCore.Signal(str)
     # GI move (Stage B): hands the available SPEC incidence-motor columns to the
     # integrator panel's GI motor dropdown (the integrator owns the selection).
-    sigGIMotorOptions = Qt.QtCore.Signal(list)
+    # §13.6: the payload is now an immutable, source-qualified GIMotorHydration
+    # (fingerprint + request epoch + knowledge state + motors), not a bare list,
+    # so a late result under a newer source/request is rejected by the owner.
+    sigGIMotorOptions = Qt.QtCore.Signal(object)
     finished = Qt.QtCore.Signal()
     started = Qt.QtCore.Signal()
     # Pause/Resume (Phase B): sigPaused fires once the run is frozen at a frame
@@ -156,6 +190,86 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
     # only by wranglers that support pause (image wrangler); harmless elsewhere.
     sigPaused = Qt.QtCore.Signal()
     sigResuming = Qt.QtCore.Signal()
+
+    # ------------------------------------------------------------------
+    # GI motor hydration identity (§13.6).  The fingerprint + generation are
+    # stamped onto every GIMotorHydration at emit; the static-widget owner
+    # verifies them before it trusts the result.
+    # ------------------------------------------------------------------
+    def _gi_source_fingerprint(self):
+        """Hashable identity of the wrangler's CURRENT source selection.
+
+        Image-style default (directory / series / single-image inputs);
+        :class:`nexusWrangler` overrides it with its own file/entry identity.
+        Read defensively so duck-typed test hosts (SimpleNamespace) never
+        raise here."""
+        return (
+            "image",
+            str(getattr(self, "inp_type", "") or ""),
+            str(getattr(self, "img_dir", "") or ""),
+            str(getattr(self, "img_file", "") or ""),
+            bool(getattr(self, "include_subdir", False)),
+            str(getattr(self, "file_filter", "") or ""),
+            str(getattr(self, "img_ext", "") or ""),
+            str(getattr(self, "meta_ext", "") or ""),
+        )
+
+    def _next_gi_hydration_generation(self) -> int:
+        """Bump + return the hydration epoch at the START of a metadata request.
+
+        Capturing the epoch when the request BEGINS (not when its result is
+        delivered) is what lets the owner reject an older same-root request
+        whose result arrives after a newer one (§13.6 / §13.11 hydration 2)."""
+        gen = int(getattr(self, "_gi_hydration_generation", 0) or 0) + 1
+        self._gi_hydration_generation = gen
+        return gen
+
+    def _emit_gi_hydration(self, motors, *, proved: bool) -> None:
+        """Emit a source-qualified :class:`GIMotorHydration` on sigGIMotorOptions.
+
+        ``proved`` records whether a TARGETED inspection ran: an empty motor
+        list from a proved inspection is ``KNOWN_EMPTY``, but an empty list with
+        nothing inspected is ``UNKNOWN`` (§13.7 — never classify a lazy
+        recursive directory as known-empty).  A non-empty list is always
+        ``KNOWN_NONEMPTY``.  getattr-guarded so duck-typed hosts without the Qt
+        signal are a harmless no-op."""
+        sig = getattr(self, "sigGIMotorOptions", None)
+        if sig is None:
+            return
+        real = tuple(
+            str(m) for m in (motors or ())
+            if str(m) and not any(x in str(m).lower() for x in ("roi", "pd"))
+        )
+        if real:
+            state = GIMotorHydration.KNOWN_NONEMPTY
+        elif proved:
+            state = GIMotorHydration.KNOWN_EMPTY
+        else:
+            state = GIMotorHydration.UNKNOWN
+        fingerprint = None
+        fp_getter = getattr(self, "_gi_source_fingerprint", None)
+        if callable(fp_getter):
+            try:
+                fingerprint = fp_getter()
+            except Exception:
+                fingerprint = None
+        generation = int(getattr(self, "_gi_hydration_generation", 0) or 0)
+        sig.emit(GIMotorHydration(state, real, fingerprint, generation))
+
+    def gi_hydration_is_current(self, hydration) -> bool:
+        """Whether *hydration* still describes the CURRENT source + epoch.
+
+        The static-widget owner calls this BEFORE updating stored motor
+        knowledge or the visible theta options, so a delayed result from a
+        superseded source (different fingerprint) or an older same-root request
+        (lower generation) is ignored (§13.6 / §13.11 hydration 3-4).  A bare
+        legacy list payload has no identity and is treated as current."""
+        if not isinstance(hydration, GIMotorHydration):
+            return True
+        if hydration.source_fingerprint != self._gi_source_fingerprint():
+            return False
+        return int(hydration.generation) == int(
+            getattr(self, "_gi_hydration_generation", 0) or 0)
 
     def __init__(self, fname, file_lock, parent=None):
         """fname: str, file path

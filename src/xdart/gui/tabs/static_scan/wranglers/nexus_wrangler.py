@@ -27,7 +27,7 @@ from pyqtgraph.parametertree import ParameterTree, Parameter
 
 # Project imports
 from xrd_tools.core.containers import PONI
-from .wrangler_widget import wranglerWidget
+from .wrangler_widget import GIMotorHydration, wranglerWidget
 from .nexus_wrangler_thread import nexusThread
 from xdart.utils import get_fname_dir
 from xdart.utils.browse import browse_start_dir, remember_browse_path
@@ -463,17 +463,37 @@ class nexusWrangler(wranglerWidget):
             self._save_to_session()
             self._emit_gi_motor_options()
 
+    def _gi_source_fingerprint(self):
+        """NeXus source identity: the selected file + entry (§13.6).
+
+        Overrides the image-style base so a delayed motor result under a
+        different NeXus file/entry is rejected by the static-widget owner."""
+        try:
+            entry = (self.parameters.child('NeXus File').child('entry').value()
+                     or getattr(self, 'entry', ''))
+        except Exception:
+            entry = getattr(self, 'entry', '')
+        return (
+            "nexus",
+            str(getattr(self, 'nexus_file', '') or ''),
+            str(entry or ''),
+        )
+
     def _emit_gi_motor_options(self):
         """Hand the NeXus file's motor names to the integrator's GI-motor
         dropdown so a non-standard incidence motor is selectable (F6).
 
         Best-effort: a bad/locked/missing file or a duck-typed test host (no Qt
         signal) must never crash the GUI -- GI still resolves ``th``/Manual from
-        metadata without this.
+        metadata without this.  §13.6: emits a source-qualified GIMotorHydration
+        (a read of a specific file is a PROVED inspection, so an empty result is
+        KNOWN_EMPTY).  A read failure emits nothing (leaves prior knowledge).
         """
         sig = getattr(self, 'sigGIMotorOptions', None)
         if sig is None or not self.nexus_file:
             return
+        # A specific NeXus file was selected -> a new hydration request starts.
+        self._next_gi_hydration_generation()
         try:
             from xrd_tools.io.nexus import read_nexus
             entry = (self.parameters.child('NeXus File').child('entry').value()
@@ -483,8 +503,7 @@ class nexusWrangler(wranglerWidget):
         except Exception:
             logger.debug("[NEXUS] GI-motor option read failed", exc_info=True)
             return
-        if motors:
-            sig.emit(motors)
+        self._emit_gi_hydration(motors, proved=True)
 
     def browse_mask(self):
         mask_file, _ = QFileDialog.getOpenFileName(

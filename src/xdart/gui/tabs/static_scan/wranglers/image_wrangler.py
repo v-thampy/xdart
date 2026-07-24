@@ -31,7 +31,7 @@ from xrd_tools.session.readiness import (
 # same parser the SSRL reader uses, so the UI's existence check stays
 # in sync with what ``read_image_metadata`` will actually look for.
 from xrd_tools.io.metadata import _extract_scan_info
-from .wrangler_widget import wranglerWidget
+from .wrangler_widget import GIMotorHydration, wranglerWidget
 from .image_wrangler_thread import imageThread, _get_scan_info  # noqa: F401
 from .ui.specUI import Ui_Form
 from xdart.modules.live import LiveScan
@@ -2133,6 +2133,9 @@ class imageWrangler(wranglerWidget):
                 self.motors = list(motors)
                 self.counters = list(counters)
                 self.scan_parameters = [*self.motors, *self.counters]
+                # A direct-child container WAS inspected -> the motor result is
+                # authoritative (KNOWN_EMPTY when it has none), not UNKNOWN.
+                self._gi_motor_knowledge_proved = True
                 self.set_gi_motor_options()
                 self.set_bg_matching_options()
                 self.set_bg_norm_options()
@@ -2145,9 +2148,14 @@ class imageWrangler(wranglerWidget):
                 finally:
                     self.img_file = prior
                 return
+        # §13.7: no direct-child preview file was inspected (e.g. a lazy
+        # recursive root whose matching data lives only in subdirectories), so
+        # the motor knowledge is UNKNOWN, NOT known-empty.  Clearing the stale
+        # option lists must not resolve an explicit GI motor to Manual.
         self.scan_parameters = []
         self.motors = []
         self.counters = []
+        self._gi_motor_knowledge_proved = False
         self.set_gi_motor_options()
         self.set_bg_matching_options()
         self.set_bg_norm_options()
@@ -2156,6 +2164,10 @@ class imageWrangler(wranglerWidget):
         """Sets file name based on chosen options
         """
         old_fname = self.img_file
+        # §13.6: a new source-selection request STARTS here -> bump the hydration
+        # epoch so any GIMotorHydration emitted below carries the current epoch
+        # and a delayed older-epoch result is rejected by the owner.
+        self._next_gi_hydration_generation()
         if self.inp_type != 'Image Directory':
             img_file = self.parameters.child('Signal').child('File').value()
             if os.path.exists(img_file):
@@ -2255,9 +2267,12 @@ class imageWrangler(wranglerWidget):
                 # source just switched, nothing chosen): clear the previous
                 # source's stale motor/parameter options and default the GI Theta
                 # Motor to Manual, so the incidence angle can be entered directly.
+                # §13.7: a RESOLVED file with no readable motors is a proven
+                # KNOWN_EMPTY (Eiger); no file resolved yet is UNKNOWN.
                 self.scan_parameters = []
                 self.motors = []
                 self.counters = []
+                self._gi_motor_knowledge_proved = bool(self.img_file)
                 self.set_gi_motor_options()
                 # Refresh the BG Match + norm-channel dropdowns too, so they don't
                 # keep the previous format's columns after a format/source switch
@@ -2381,6 +2396,9 @@ class imageWrangler(wranglerWidget):
     def set_pars_from_meta(self):
         self.get_scan_parameters()
         self.set_bg_matching_options()
+        # A targeted metadata read ran -> the motor result is authoritative
+        # (KNOWN_EMPTY when it found none), not UNKNOWN (§13.7).
+        self._gi_motor_knowledge_proved = True
         self.set_gi_motor_options()
         self.set_bg_norm_options()
 
@@ -2584,12 +2602,20 @@ class imageWrangler(wranglerWidget):
         self.set_gi_th_motor()
         # GI move (Stage B): hand the available motor columns (excl. Manual) to
         # the integrator panel's GI motor dropdown, which owns the selection.
-        # getattr-guarded: duck-typed test hosts have no Qt signal.
-        _sig = getattr(self, 'sigGIMotorOptions', None)
-        if _sig is not None:
-            _avail = [p for p in self.motors
-                      if not any(x.lower() in p.lower() for x in ['ROI', 'PD'])]
-            _sig.emit(list(_avail))
+        # §13.6/§13.7: emit a source-qualified GIMotorHydration, not a bare list.
+        # ``_gi_motor_knowledge_proved`` is set by the discovery caller to record
+        # whether a TARGETED inspection ran (so an empty list is KNOWN_EMPTY only
+        # when proved, else UNKNOWN — a lazy recursive directory is never
+        # misclassified as known-empty).
+        # Default proved=True: a bare set_gi_motor_options() (or a session
+        # re-announce) with an empty list is KNOWN_EMPTY.  The §13.7 "not
+        # inspected -> UNKNOWN" cases (no direct-child preview / no file
+        # resolved) set ``_gi_motor_knowledge_proved = False`` EXPLICITLY before
+        # calling, so only a lazy recursive directory reports UNKNOWN.
+        _avail = [p for p in self.motors
+                  if not any(x.lower() in p.lower() for x in ['ROI', 'PD'])]
+        self._emit_gi_hydration(
+            _avail, proved=bool(getattr(self, '_gi_motor_knowledge_proved', True)))
 
     def set_gi_th_motor(self):
         """Update Grazing theta motor.

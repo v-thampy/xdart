@@ -147,6 +147,10 @@ def _wrangler_holder():
         "_directory_metadata_preview_file",
         "_adopt_directory_metadata_preview",
         "get_img_fname",
+        # §13.6 structured GI hydration helpers used by the emit path.
+        "_gi_source_fingerprint",
+        "_next_gi_hydration_generation",
+        "_emit_gi_hydration",
     ):
         setattr(h, name, MethodType(getattr(imageWrangler, name), h))
     return h, root
@@ -179,8 +183,16 @@ def test_gui_bluesky_populates_gi_motor_and_norm(bluesky_file):
     for counter in ("i0", "i1", "i2", "pd"):
         assert counter in norm_values
 
-    # The integrator's GI-motor combo still receives the file's real motor list.
-    assert holder.sigGIMotorOptions.emitted == [(["hy"],)]
+    # The integrator's GI-motor combo still receives the file's real motor list,
+    # now as a source-qualified GIMotorHydration (§13.6): a proved inspection
+    # that found motors -> KNOWN_NONEMPTY.
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import (
+        GIMotorHydration,
+    )
+    hydration = holder.sigGIMotorOptions.emitted[-1][0]
+    assert isinstance(hydration, GIMotorHydration)
+    assert hydration.state == GIMotorHydration.KNOWN_NONEMPTY
+    assert tuple(hydration.motors) == ("hy",)
 
 
 def test_gui_fixed_incidence_motor_in_options(fixed_incidence_file):
@@ -222,9 +234,9 @@ def test_gui_gi_dropdown_lists_all_motors(baseline_only_file):
     # halpha is the named-preference incidence axis -> the default selection.
     assert th_motor.value() == "halpha"
     assert holder.incidence_motor == "halpha"
-    # The integrator combo receives the same full motor list.
+    # The integrator combo receives the same full motor list (§13.6 hydration).
     assert holder.sigGIMotorOptions.emitted
-    emitted_motors = holder.sigGIMotorOptions.emitted[-1][0]
+    emitted_motors = holder.sigGIMotorOptions.emitted[-1][0].motors
     assert set(emitted_motors) == {"halpha", "detx", "sbsx"}
 
 
@@ -256,7 +268,15 @@ def test_gui_plain_nexus_does_not_populate_from_embedded(plain_nexus_file):
     values = list(root.child("GI").child("th_motor").opts["limits"])
     assert values == ["Manual"]
     assert holder.motors == []
-    assert holder.sigGIMotorOptions.emitted == [([],)]
+    # §13.7: a RESOLVED file that was inspected and has no readable motors is a
+    # PROVED KNOWN_EMPTY hydration (motors ()), not an unqualified empty list.
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import (
+        GIMotorHydration,
+    )
+    hydration = holder.sigGIMotorOptions.emitted[-1][0]
+    assert isinstance(hydration, GIMotorHydration)
+    assert hydration.state == GIMotorHydration.KNOWN_EMPTY
+    assert tuple(hydration.motors) == ()
 
 
 def test_gui_helper_returns_none_for_non_nxs(tmp_path):

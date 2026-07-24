@@ -2555,6 +2555,10 @@ def test_gi_motor_options_default_manual_when_no_metadata():
         h = SimpleNamespace(motors=motors, parameters=params, incidence_motor=None)
         h.set_gi_th_motor = MethodType(imageWrangler.set_gi_th_motor, h)
         h.set_gi_motor_options = MethodType(imageWrangler.set_gi_motor_options, h)
+        h._emit_gi_hydration = MethodType(imageWrangler._emit_gi_hydration, h)
+        h._gi_source_fingerprint = MethodType(imageWrangler._gi_source_fingerprint, h)
+        h._next_gi_hydration_generation = MethodType(
+            imageWrangler._next_gi_hydration_generation, h)
         return h, gi
 
     # No metadata -> Manual default, Theta field visible, incidence = th_val.
@@ -2605,6 +2609,10 @@ def test_gi_motor_options_default_select_follows_preference_order():
         h = SimpleNamespace(motors=motors, parameters=params, incidence_motor=None)
         h.set_gi_th_motor = MethodType(imageWrangler.set_gi_th_motor, h)
         h.set_gi_motor_options = MethodType(imageWrangler.set_gi_motor_options, h)
+        h._emit_gi_hydration = MethodType(imageWrangler._emit_gi_hydration, h)
+        h._gi_source_fingerprint = MethodType(imageWrangler._gi_source_fingerprint, h)
+        h._next_gi_hydration_generation = MethodType(
+            imageWrangler._next_gi_hydration_generation, h)
         h.set_gi_motor_options()
         return gi["th_motor"].value(), gi["th_motor"].opts["values"]
 
@@ -2680,7 +2688,11 @@ def test_get_img_fname_clears_motors_when_source_switch_resolves_no_file():
         incidence_motor=None,
     )
     h.get_img_fname = MethodType(imageWrangler.get_img_fname, h)
+    h._next_gi_hydration_generation = MethodType(
+        imageWrangler._next_gi_hydration_generation, h)
+    h._gi_source_fingerprint = MethodType(imageWrangler._gi_source_fingerprint, h)
     h.set_gi_motor_options = MethodType(imageWrangler.set_gi_motor_options, h)
+    h._emit_gi_hydration = MethodType(imageWrangler._emit_gi_hydration, h)
     h.set_gi_th_motor = MethodType(imageWrangler.set_gi_th_motor, h)
     h._sync_meta_ext_to_img_ext = lambda: None
     h._find_image_directory_seed = lambda match, suffix: None  # no seed -> no file
@@ -2837,6 +2849,9 @@ def test_get_img_fname_no_sidecar_clears_counters_and_refreshes_bg(tmp_path):
     h.set_bg_matching_options = lambda: called.append("bg_match")
     h.set_bg_norm_options = lambda: called.append("bg_norm")
     h.get_img_fname = MethodType(imageWrangler.get_img_fname, h)
+    h._next_gi_hydration_generation = MethodType(
+        imageWrangler._next_gi_hydration_generation, h)
+    h._gi_source_fingerprint = MethodType(imageWrangler._gi_source_fingerprint, h)
 
     h.get_img_fname()
 
