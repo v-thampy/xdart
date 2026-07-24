@@ -74,8 +74,12 @@ def test_readback_reads_bound_handle_not_path_replacement(widget, monkeypatch):
         return real if calls["n"] <= 3 else replacement
 
     monkeypatch.setattr(widget, "_controls_v2_param", switching)
+    # §22.10.B.1: the transaction no longer delegates to the permissive
+    # compatibility mirror, so the silent no-op write is injected at the STRICT
+    # writer.  A path-resolved readback would then see `replacement` and report a
+    # false success; the bound-handle readback sees the untouched original.
     monkeypatch.setattr(
-        widget, "_mirror_wrangler_parameter_values", lambda *_a, **_k: None)
+        widget, "_controls_v2_write_legacy_carrier", lambda *_a, **_k: None)
 
     result = widget.commit_controls_transaction(staged)
 

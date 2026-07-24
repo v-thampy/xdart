@@ -288,6 +288,23 @@ class ControlsTransactionError(Exception):
         super().__init__(f"invalid control edit ({pretty}): {self.reason}")
 
 
+class _ControlsCommitAbort(Exception):
+    """INTERNAL control-flow signal for the commit failure funnel (§22.10.C).
+
+    Carries the ORIGINAL forward failure identity — ``phase``, ``failed_path`` and
+    ``reason`` — out of the post-first-write region to the single handler in
+    :meth:`staticWidget.commit_controls_transaction`, which runs recovery exactly
+    once and converts it into a typed :class:`ControlsCommitResult`.  It never
+    escapes that method and is never part of any public API."""
+
+    def __init__(self, phase, failed_path, reason):
+        self.phase = str(phase)
+        self.failed_path = (tuple(failed_path)
+                            if failed_path is not None else None)
+        self.reason = str(reason)
+        super().__init__(f"{self.phase}: {self.reason}")
+
+
 class GIMotorObservation:
     """A source-qualified snapshot of the GI theta-motor choices (§12.5).
 
@@ -478,6 +495,15 @@ def _journal_leaf_or_none(value):
     # np.float64/np.str_ subclass the Python leaf types, so an isinstance check
     # would store them verbatim and leak dtype into the journal's identity.
     # Guarded by attribute probing so this module never imports numpy.
+    #
+    # DECLARED 0-d POLICY (§22.10.E.3 — "encode or reject at staging"): a 0-d
+    # array (``np.array(5)``, ``shape == ()``) is NORMALIZED to its Python scalar
+    # here, exactly like a NumPy scalar, and is NOT rejected.  It carries exactly
+    # one immutable value, only that scalar is ever stored, and rejecting it would
+    # refuse a value the algebra can represent losslessly.  Arrays of rank >= 1
+    # are REJECTED at ingress (they fail this ``shape == ()`` probe and reach the
+    # typed refusal below) because the supported carrier/journal inventory is
+    # scalar-only and an array has no reviewed immutable encoding here.
     item = getattr(value, "item", None)
     if callable(item) and getattr(value, "shape", None) == ():
         try:
@@ -530,6 +556,26 @@ def _freeze_journal_value(value, path=None):
         "leaves (None/bool/int/float/complex/str/bytes, normalized NumPy "
         "scalars, bytearray) and recursive containers of them",
         value)
+
+
+def _journal_equality_key(frozen):
+    """Order-INDEPENDENT canonical key for a frozen value (§21.6 req 5).
+
+    Dict pairs are frozen in INSERTION order so a thaw round-trips the caller's
+    original ordering, but MAPPING EQUALITY must not depend on that order:
+    ``{"a": 1, "b": 2}`` and ``{"b": 2, "a": 1}`` are the same value.  Equality
+    therefore compares this canonical key, which sorts mapping pairs exactly the
+    way sets are already sorted at freeze.  Tags are retained, so tuple/list and
+    set/frozenset stay distinguishable (comparing THAWED values would make
+    ``{1} == frozenset({1})`` true and lose that discrimination)."""
+    kind, payload = frozen
+    if kind in (_JOURNAL_LEAF, _JOURNAL_BYTEARRAY):
+        return frozen
+    if kind == _JOURNAL_DICT:
+        return (kind, tuple(sorted(
+            ((_journal_equality_key(k), _journal_equality_key(v))
+             for k, v in payload), key=repr)))
+    return (kind, tuple(_journal_equality_key(v) for v in payload))
 
 
 def _thaw_journal_value(frozen):
@@ -607,7 +653,10 @@ class JournalEntry:
     def __eq__(self, other):
         if not isinstance(other, JournalEntry):
             return NotImplemented
-        return (self._frozen == other._frozen
+        # §21.6 req 5: value-correct for mappings — canonical key, not the
+        # insertion-ordered storage (see :func:`_journal_equality_key`).
+        return (_journal_equality_key(self._frozen)
+                == _journal_equality_key(other._frozen)
                 and self.revision == other.revision
                 and self.origin == other.origin)
 
@@ -809,27 +858,34 @@ class ControlsCommitResult:
 _CONTROLS_V2_MISSING = object()
 
 
-def _freeze_carrier_payload(value):
-    """Normalise one carrier payload so the plan cannot be rewritten (§19.5 req 1).
+def _freeze_carrier_payload(value, path=None):
+    """Freeze one carrier payload through THE ONE closed value algebra (§22.10.E).
 
-    Sequences become tuples and mappings become immutable proxies; every other
-    value is deep-copied.  Control payloads are scalars, strings and small
-    sequences in practice, so this keeps ``==`` readback semantics intact while
-    removing the caller's ability to mutate a stored payload after preparation."""
-    if isinstance(value, (str, bytes)) or value is None:
-        return value
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze_carrier_payload(v) for v in value)
-    if isinstance(value, dict):
-        return MappingProxyType(
-            {k: _freeze_carrier_payload(v) for k, v in value.items()})
-    if isinstance(value, (set, frozenset)):
-        return frozenset(_freeze_carrier_payload(v) for v in value)
-    return copy.deepcopy(value)
+    §22.7 required a single reviewed immutable value algebra in both places rather
+    than "another open-ended ``deepcopy`` fallback": the old implementation gave
+    lists/tuples/dicts/sets explicit encodings and deep-copied EVERYTHING else
+    straight onto ``carrier.value``, so a NumPy array, a ``bytearray``, or a
+    mutable custom object stayed mutable THROUGH the prepared transaction plan.
+    The deepcopy fallback is DELETED; this delegates to
+    :func:`_freeze_journal_value`, so the carrier and the journal share one closed
+    algebra: immutable leaves (incl. deliberately normalized NumPy scalars and 0-d
+    arrays), ``bytearray`` -> ``bytes``, and recursive containers of them.
+    Anything else raises :class:`ControlsTransactionError` at STAGING, before the
+    first write (§22.10.E.4)."""
+    return _freeze_journal_value(value, path)
+
+
+def _thaw_carrier_payload(frozen):
+    """A FRESH mutable value from a frozen carrier payload (§22.10.E.5).
+
+    A legacy ``setValue``/readback consumer that needs a concrete mutable type
+    gets its OWN reconstruction; the plan's immutable representation is never
+    handed out, so mutating what a carrier read cannot reach the plan."""
+    return _thaw_journal_value(frozen)
 
 
 class _PreparedLegacyCarrier:
-    """FROZEN prepared legacy carrier (§18.8.3 req 1 / §19.5 req 1).
+    """FROZEN prepared legacy carrier (§18.8.3 req 1 / §19.5 req 1 / §22.10.E).
 
     Binds the diagnostic ``path`` to the ORIGINAL ``Parameter`` handle resolved
     ONCE at preflight, plus the raw edit ``value``, the ``prior`` value, and the
@@ -839,17 +895,35 @@ class _PreparedLegacyCarrier:
 
     §19.5 req 1: EVERY attribute is read-only after construction (a `__slots__`
     class whose ``path``/``expected`` stay assignable is not an immutable
-    transaction plan), and mutable payloads are normalised at ingress so the
-    caller cannot rewrite the plan through an alias."""
+    transaction plan).  §22.10.E: the three payloads are stored in the shared
+    closed immutable encoding and every read (``value`` / ``prior`` /
+    ``expected``) reconstructs a FRESH value, so a caller that mutates what it
+    read mutates a throwaway — the prepared plan is recursively immutable, not
+    merely attribute-frozen.  An unsupported mutable payload is REFUSED here,
+    at staging, with the typed :class:`ControlsTransactionError`."""
 
-    __slots__ = ("path", "param", "value", "prior", "expected")
+    __slots__ = ("path", "param", "_value", "_prior", "_expected")
 
     def __init__(self, path, param, value, prior, expected):
-        object.__setattr__(self, "path", tuple(path))
+        path = tuple(path)
+        object.__setattr__(self, "path", path)
         object.__setattr__(self, "param", param)
-        object.__setattr__(self, "value", _freeze_carrier_payload(value))
-        object.__setattr__(self, "prior", _freeze_carrier_payload(prior))
-        object.__setattr__(self, "expected", _freeze_carrier_payload(expected))
+        object.__setattr__(self, "_value", _freeze_carrier_payload(value, path))
+        object.__setattr__(self, "_prior", _freeze_carrier_payload(prior, path))
+        object.__setattr__(
+            self, "_expected", _freeze_carrier_payload(expected, path))
+
+    @property
+    def value(self):
+        return _thaw_carrier_payload(self._value)
+
+    @property
+    def prior(self):
+        return _thaw_carrier_payload(self._prior)
+
+    @property
+    def expected(self):
+        return _thaw_carrier_payload(self._expected)
 
     def __setattr__(self, name, value):
         raise AttributeError(
@@ -863,6 +937,108 @@ class _PreparedLegacyCarrier:
         return (f"_PreparedLegacyCarrier(path={self.path!r}, "
                 f"value={self.value!r}, prior={self.prior!r}, "
                 f"expected={self.expected!r})")
+
+
+class _ControlsRecoveryMember(NamedTuple):
+    """ONE independently-recoverable member of a recovery class (§22.10.D).
+
+    §22.5 found recovery to be class-continuing but NOT member-continuing: several
+    class wrappers used one shared ``try`` around several independently restorable
+    members, so the FIRST raising member left every later member mutated (a
+    raising directory-observation setter left both caches at the new values; a
+    raising ``wrangler.poni`` restore left ``wrangler.poni_file`` and
+    ``thread.poni`` at the new values).  Each member now declares:
+
+    * ``path``     — its STABLE diagnostic path;
+    * ``policy``   — the declared snapshot/reference + comparator policy (§22.8:
+      the choice is recorded in the descriptor, not left implicit in a helper);
+    * ``restore``  — its OWN primary restore ``(host, ctx) -> None``, or ``None``
+      when the class-level overridable helper IS the primary for this member;
+    * ``matches``  — its readback comparator ``(host, ctx) -> bool``;
+    * ``backstop`` — its AUTHORITATIVE restore ``(host, ctx) -> None``, used when
+      the primary raised or left the member unrestored.
+
+    Post-backstop verification is performed by the driver below.
+    """
+
+    path: tuple
+    policy: str
+    restore: object
+    matches: object
+    backstop: object
+
+
+def _controls_v2_recover_members(host, ctx, members, class_path,
+                                 primary_failed=False):
+    """Attempt EVERY member of one recovery class INDEPENDENTLY (§22.10.D).
+
+    A member failure NEVER stops later members: each member's primary, comparator,
+    backstop, and post-backstop verification are individually contained.  Failure
+    recording follows the primary that actually failed —
+
+    * a member with its OWN primary (``restore is not None``) records its stable
+      path whenever that primary raised or left it unmatched, EVEN IF the
+      authoritative backstop then succeeded: backstop success restores state but
+      never erases the evidence that the primary recovery contract failed
+      (§22.10.D closing rule / §19.6 req 6);
+    * a member whose primary is the class-level overridable helper records the
+      CLASS path once (``primary_failed``) — that is where that primary lives —
+      and adds its own path only when it is STILL unrestored after its
+      authoritative backstop, i.e. when it is genuinely unrecoverable.
+
+    Returns the ordered list of failed paths (class path first, then members in
+    declaration order)."""
+    failures = []
+    if primary_failed and class_path is not None:
+        failures.append(tuple(class_path))
+    for member in members:
+        raised = False
+        if member.restore is not None:
+            try:
+                member.restore(host, ctx)
+            except Exception:
+                logger.debug("controls recovery member %s primary raised",
+                             member.path, exc_info=True)
+                raised = True
+        try:
+            matched = bool(member.matches(host, ctx))
+        except Exception:
+            logger.debug("controls recovery member %s comparator raised",
+                         member.path, exc_info=True)
+            matched = False
+        if not raised and matched:
+            continue
+        try:
+            member.backstop(host, ctx)
+        except Exception:
+            logger.debug("controls recovery member %s backstop raised",
+                         member.path, exc_info=True)
+        try:
+            recovered = bool(member.matches(host, ctx))
+        except Exception:
+            logger.debug("controls recovery member %s post-backstop check raised",
+                         member.path, exc_info=True)
+            recovered = False
+        logger.debug("controls recovery member %s (%s): primary %s, backstop %s",
+                     member.path, member.policy,
+                     "raised" if raised else "left it unmatched",
+                     "recovered" if recovered else "did NOT recover")
+        if member.restore is not None or not recovered:
+            failures.append(member.path)
+    return failures
+
+
+def _controls_v2_identity_match(current, wanted) -> bool:
+    """Declared IDENTITY comparator — the exact prior object must be back."""
+    return current is wanted
+
+
+def _controls_v2_value_match(current, wanted) -> bool:
+    """Declared VALUE comparator, guarded (a raising ``__eq__`` is a mismatch)."""
+    try:
+        return bool(current == wanted)
+    except Exception:
+        return False
 
 
 class SourceRecoveryReceipt(NamedTuple):
@@ -4545,11 +4721,45 @@ class staticWidget(QWidget):
                 return False
         return True
 
+    @staticmethod
+    def _controls_v2_intent_members(snapshot):
+        """One :class:`_ControlsRecoveryMember` per intent FIELD (§22.10.D.7).
+
+        The forward install REPLACES each field reference, and any one field's
+        setter may fail independently, so each field is verified and backstopped
+        on its own — a raising field can no longer leave the remaining fields
+        holding the transaction's values.  Declared policy: REFERENCE identity
+        (install replaces references, so a correct restore puts the EXACT prior
+        object back; a silent no-op leaves the staged object and fails identity).
+
+        Each member's authoritative backstop routes through the SAME reviewed
+        ``_controls_v2_apply_intent_snapshot`` seam as before — one field at a
+        time — so a fault test that replaces that seam still governs it and a
+        raising backstop stays a contained, NAMED recovery failure."""
+        members = []
+        for name, value in snapshot.items():
+            members.append(_ControlsRecoveryMember(
+                path=("Intent", name),
+                policy="reference-identity",
+                restore=None,          # the class helper is this member's primary
+                matches=(lambda host, ctx, _n=name, _v=value:
+                         _controls_v2_identity_match(
+                             getattr(ctx["live"], _n, _CONTROLS_V2_MISSING), _v)),
+                backstop=(lambda host, ctx, _n=name, _v=value:
+                          staticWidget._controls_v2_apply_intent_snapshot(
+                              ctx["live"], {_n: _v})),
+            ))
+        return members
+
     def _controls_v2_restore_intent_values_verified(self, live, snapshot) -> list:
-        """Restore intent references THROUGH the overridable helper, then VERIFY
-        (§18.5).  A helper that raises OR leaves the intent unrestored is a named
-        ``("Intent",)`` recovery failure; the snapshot is re-applied as a backstop
-        so live intent is never left half-installed."""
+        """Restore intent references THROUGH the overridable helper, then verify
+        and backstop EVERY FIELD INDEPENDENTLY (§18.5 / §22.10.D.7).
+
+        A helper that raises OR leaves the intent unrestored is a named
+        ``("Intent",)`` recovery failure; each field is then re-applied on its own
+        so one raising field cannot leave the others half-installed, and a field
+        that is STILL unrestored after its authoritative backstop is named at its
+        own stable ``("Intent", <field>)`` path."""
         if live is None or not snapshot:
             return []
         raised = False
@@ -4563,49 +4773,65 @@ class staticWidget(QWidget):
         except Exception:
             logger.debug("controls intent verification raised", exc_info=True)
             matched = False
-        if not matched:
-            # §19.7 req 1: a raising backstop is a contained recovery failure.
-            try:
-                staticWidget._controls_v2_apply_intent_snapshot(live, snapshot)
-            except Exception:
-                logger.debug("controls intent snapshot backstop raised",
-                             exc_info=True)
-        return [] if (not raised and matched) else [("Intent",)]
+        if not raised and matched:
+            return []
+        return _controls_v2_recover_members(
+            self, {"live": live}, self._controls_v2_intent_members(snapshot),
+            ("Intent",), primary_failed=True)
 
-    def _controls_v2_bound_carrier(self, path):
-        """The carrier BOUND at preflight for *path*, or ``None`` (§19.5 req 2).
+    def _controls_v2_write_legacy_carrier(self, params, carrier, value) -> None:
+        """STRICT transaction write of ONE prepared carrier (§22.10.A/B).
 
-        The path is a KEY into this transaction's prepared plan — it is never
-        resolved against the live parameter tree, so an object newly installed at
-        the same path is unreachable from any post-preflight write or restore."""
-        bound = getattr(self, "_controls_v2_bound_carriers", None) or {}
-        return bound.get(tuple(path))
+        §22.10.A.2: the write target is the ``_PreparedLegacyCarrier`` the commit
+        loop already owns, passed in DIRECTLY.  It is no longer selected by a
+        ``path -> self._controls_v2_bound_carriers[path] -> param`` lookup: that
+        registry was a second MUTABLE target authority (§22.3), and an entry
+        changed after the pre-write identity guard redirected the write to a
+        replacement that the outer loop then never rolled back.  Nothing here
+        consults ambient widget state to choose what to write.
 
-    def _controls_v2_write_legacy_carrier(self, params, path, value) -> None:
-        """Write ONE legacy carrier through its BOUND handle, signal-blocked.
+        §22.10.B: this is a STRICT writer, NOT the permissive compatibility
+        mirror.  ``_mirror_wrangler_parameter_values`` catches every child
+        getter/setter exception and continues — heterogeneous-schema behavior that
+        is correct for the two non-transactional pre-run mirror callers and WRONG
+        for a checked transaction: a ``setValue`` that installed the exact coerced
+        value and then raised had its exception discarded, readback succeeded, and
+        the commit returned ``ok=True`` on a partially-executed setter (§22.2).
+        Here the required signal blocking is kept — the ROOT (whose signal owns
+        ``wrangler.setup()``) and the bound CHILD (whose own connections fire on
+        ``setValue``) — but getter/setter exceptions REACH the transaction
+        boundary, where ANY setter exception is a forward failure even if the
+        final readback equals ``expected``.  Unblocking is best-effort in a
+        ``finally`` so it can never mask the setter's exception.
 
-        §19.5 req 2/3/6: the write target is the ``Parameter`` object resolved
-        ONCE at preflight and bound onto the prepared carrier — NEVER
-        ``params.child(*path)``.  The previous implementation delegated to the
-        mirror layer, which re-resolved the child, so a replacement installed at
-        that path after preflight was the object actually mutated while the
-        prepared original stayed untouched (§19.5).  There is exactly ONE write
-        mechanism: no "fast normal" path beside a "forced bound" exception path.
-
-        Signal blocking covers the ROOT (whose signal owns ``wrangler.setup()``)
-        and the bound CHILD (whose own connections fire on ``setValue``), without
-        resolving a new child as the target.  No readback here: the caller MUST
-        verify via :meth:`_controls_v2_carrier_readback_ok` on the bound handle —
-        the readback, not the setter's return, is the authority (§14.11.A.2)."""
-        carrier = self._controls_v2_bound_carrier(path)
+        No readback here: the caller MUST verify via
+        :meth:`_controls_v2_carrier_readback_ok` on the bound handle — the
+        readback, not the setter's return, is the authority (§14.11.A.2)."""
         param = None if carrier is None else carrier.param
         if param is None:
+            path = () if carrier is None else carrier.path
             raise ControlsTransactionError(
                 tuple(path), "no bound carrier for legacy write", value)
-        # The mirror layer still owns the signal-blocking discipline (root +
-        # child), but it is handed the ALREADY-RESOLVED bound object instead of a
-        # path, so it cannot resolve — and cannot mutate — a replacement.
-        self._mirror_wrangler_parameter_values(params, ((param, value),))
+        root_prev = _CONTROLS_V2_MISSING
+        child_prev = _CONTROLS_V2_MISSING
+        try:
+            if params is not None:
+                root_prev = params.blockSignals(True)
+            child_prev = param.blockSignals(True)
+            param.setValue(value)
+        finally:
+            if child_prev is not _CONTROLS_V2_MISSING:
+                try:
+                    param.blockSignals(child_prev)
+                except Exception:
+                    logger.debug("child unblock after strict write of %s failed",
+                                 carrier.path, exc_info=True)
+            if root_prev is not _CONTROLS_V2_MISSING:
+                try:
+                    params.blockSignals(root_prev)
+                except Exception:
+                    logger.debug("root unblock after strict write of %s failed",
+                                 carrier.path, exc_info=True)
 
     def _controls_v2_carrier_readback_ok(self, carrier, expected) -> bool:
         """Whether the BOUND ORIGINAL handle reads back as *expected* (§18.4).
@@ -4806,12 +5032,46 @@ class staticWidget(QWidget):
                 return False
         return True
 
+    @staticmethod
+    def _controls_v2_display_members(values, identities):
+        """One :class:`_ControlsRecoveryMember` per display-scan FIELD (§22.10.D.8).
+
+        The forward projection writes each field on its own and any one setter may
+        fail independently, so the restore is verified and backstopped per field —
+        a raising field can no longer leave the remaining fields projected at the
+        transaction's values.  Declared policy: deep VALUE equality, PLUS object
+        IDENTITY for the dict fields the reintegration/display paths hold by
+        reference (§18.8.3 req 5).  Each member's authoritative backstop routes
+        through the SAME reviewed ``_controls_v2_apply_display_snapshot`` seam, one
+        field at a time, so a fault test replacing that seam still governs and a
+        raising backstop stays contained."""
+        members = []
+        for name, value in values.items():
+            members.append(_ControlsRecoveryMember(
+                path=("Display", name),
+                policy=("value+identity" if identities.get(name) is not None
+                        else "value"),
+                restore=None,          # the class helper is this member's primary
+                matches=(lambda host, ctx, _n=name, _v=value:
+                         host._controls_v2_display_scan_matches(
+                             ctx["scan"], {_n: _v},
+                             {_n: ctx["identities"].get(_n)}
+                             if ctx["identities"].get(_n) is not None else {})),
+                backstop=(lambda host, ctx, _n=name, _v=value:
+                          staticWidget._controls_v2_apply_display_snapshot(
+                              ctx["scan"], {_n: _v})),
+            ))
+        return members
+
     def _controls_v2_restore_display_scan_verified(self, scan, snapshot) -> list:
-        """Restore the display scan THROUGH the overridable helper, then VERIFY
-        (§18.5).  A helper that raises OR leaves the scan not matching the snapshot
-        (silent no-op) is a named ``("Display",)`` recovery failure; the snapshot is
-        re-applied as a backstop under ``scan_lock`` so live acquisition state is
-        never left half-projected."""
+        """Restore the display scan THROUGH the overridable helper, then verify and
+        backstop EVERY FIELD INDEPENDENTLY under ``scan_lock`` (§18.5 / §22.10.D.8).
+
+        A helper that raises OR leaves the scan not matching the snapshot (silent
+        no-op) is a named ``("Display",)`` recovery failure; each field is then
+        re-applied on its own so one raising field cannot leave the others
+        half-projected, and a field STILL unrestored after its authoritative
+        backstop is named at its own stable ``("Display", <field>)`` path."""
         values = self._controls_v2_display_snapshot_values(snapshot)
         if scan is None or not values:
             return []
@@ -4824,31 +5084,25 @@ class staticWidget(QWidget):
             logger.debug("controls display scan restore raised", exc_info=True)
             raised = True
         lock = getattr(scan, "scan_lock", None)
+        ctx = {"scan": scan, "identities": identities}
+        members = self._controls_v2_display_members(values, identities)
 
-        def _verify_and_backstop():
+        def _verify_members():
             matched = self._controls_v2_display_scan_matches(
                 scan, values, identities)
-            if not matched:
-                # §19.7 req 1: the authoritative backstop is best-effort — if IT
-                # raises, that is a contained recovery failure, never an exception
-                # escaping the transaction and skipping later recovery classes.
-                try:
-                    staticWidget._controls_v2_apply_display_snapshot(scan, values)
-                except Exception:
-                    logger.debug("controls display snapshot backstop raised",
-                                 exc_info=True)
-            return matched
+            if not raised and matched:
+                return []
+            return _controls_v2_recover_members(
+                self, ctx, members, ("Display",), primary_failed=True)
 
         try:
             if lock is None:
-                matched = _verify_and_backstop()
-            else:
-                with lock:
-                    matched = _verify_and_backstop()
+                return _verify_members()
+            with lock:
+                return _verify_members()
         except Exception:
             logger.debug("controls display verification raised", exc_info=True)
-            matched = False
-        return [] if (not raised and matched) else [("Display",)]
+            return [("Display",)]
 
     def commit_controls_transaction(self, staged) -> ControlsCommitResult:
         """Install a validated :class:`StagedControlsTransaction` atomically.
@@ -4904,7 +5158,7 @@ class staticWidget(QWidget):
         # swallowed into expected=value) is a typed preflight failure, zero writes.
         carriers = []  # list[_PreparedLegacyCarrier]
         # §19.5: the previous transaction's bindings are never reachable.
-        self._controls_v2_bound_carriers = {}
+        self._controls_v2_bound_carriers = MappingProxyType({})
         for path, value in projection:
             path = tuple(path)
             param = self._controls_v2_param(path)
@@ -4933,13 +5187,29 @@ class staticWidget(QWidget):
                     phase="preflight")
             # §18.8.3 req 1: bind the ORIGINAL handle into an immutable prepared
             # carrier; forward/readback/rollback all use param, never the path.
-            carriers.append(
-                _PreparedLegacyCarrier(path, param, value, prior, expected))
-        # §19.5 req 2/6: publish the prepared plan as THE binding registry for
-        # this transaction.  Every post-preflight write and restore resolves its
-        # target here — the path is a key into the plan, never a lookup against
-        # the live parameter tree.
-        self._controls_v2_bound_carriers = {c.path: c for c in carriers}
+            # §22.10.E.4: a payload outside the ONE closed immutable value algebra
+            # is REFUSED here, before the first write, with the typed refusal —
+            # never smuggled into the plan behind a deepcopy where it stays mutable.
+            try:
+                carriers.append(
+                    _PreparedLegacyCarrier(path, param, value, prior, expected))
+            except Exception:
+                logger.debug("preflight carrier payload refused for %s", path,
+                             exc_info=True)
+                return ControlsCommitResult(
+                    False, failed_path=path,
+                    reason="legacy carrier payload type unsupported at preflight",
+                    phase="preflight")
+        # §22.10.A.1/A.3: the prepared plan is published as an IMMUTABLE
+        # DIAGNOSTIC record only.  It is NEVER consulted to select a write or
+        # restore target: §22.3 showed that a `path -> registry -> param` lookup is
+        # the same "second mutable target authority" defect in a different
+        # container — an entry replaced after the pre-write identity guard
+        # redirected the write to an object the outer loop never rolled back.  The
+        # commit loop owns the local `_PreparedLegacyCarrier` objects and passes
+        # them DIRECTLY to the strict writer and to every rollback helper.
+        self._controls_v2_bound_carriers = MappingProxyType(
+            {c.path: c for c in carriers})
 
         # B.3: display snapshot BEFORE the first write, under scan_lock; an
         # uncopyable field RAISES -> typed preflight failure (never an alias).
@@ -5000,115 +5270,171 @@ class staticWidget(QWidget):
             "params": params,
         }
 
-        # ===================== FORWARD — legacy carriers ====================
-        # §18.8.3 req 7: track which carrier CLASSES actually reach an attempted
-        # forward write so recovery touches only those; an early legacy failure
-        # must not "recover" a display/intent/PONI that was never installed.
+        # ============ POST-PREFLIGHT — ONE exception-total funnel ===========
+        # §22.10.C: after the FIRST attempted write, NOTHING may bypass the typed
+        # recovery funnel.  §22.4 found two escapes: the pre/post-write identity
+        # resolver ran outside any guard (a raising resolver while preparing a
+        # LATER carrier left an EARLIER carrier installed and let `RuntimeError`
+        # escape instead of returning a `ControlsCommitResult`), and energy-cache
+        # invalidation ran outside it too (a raise there left the requested
+        # preference installed and escaped without recovery).  Every step below —
+        # identity guards, the strict setter, readback, intent/display/PONI
+        # install, cache invalidation and source reconciliation — now leaves this
+        # region ONLY by raising `_ControlsCommitAbort` (an expected, identified
+        # failure) or by any other exception (an unexpected one).  Both land in the
+        # single handler, which runs `_controls_v2_recover_all()` EXACTLY ONCE and
+        # returns a typed result; the forward phase/path/reason is captured BEFORE
+        # recovery and is preserved independently of every recovery failure (C.3).
+        #
+        # §18.8.3 req 7: `touched` tracks which carrier CLASSES actually reach an
+        # attempted forward write so recovery touches only those; an early legacy
+        # failure must not "recover" a display/intent/PONI that was never installed.
         touched = set()
         applied = []  # list[_PreparedLegacyCarrier] in application order
-        for carrier in carriers:
-            # §18.8.3 req 3 (before write): the carrier handle must be the SAME
-            # object preflight resolved.  A replacement detected BEFORE any write
-            # fails WITHOUT adding this carrier to the rollback stack and WITHOUT
-            # touching the replacement (the path detects replacement; it is never
-            # the data authority).
-            if self._controls_v2_param(carrier.path) is not carrier.param:
-                recovery = self._controls_v2_recover_all(
-                    ctx, applied, touched=touched)
-                return ControlsCommitResult(
-                    False, failed_path=carrier.path,
-                    reason="legacy carrier handle replaced before apply",
-                    recovery_failed_paths=recovery, phase="legacy_apply")
-            applied.append(carrier)  # push BEFORE the setter (A.3)
-            touched.add("legacy")
-            replaced_after = False
+        progress = {"phase": "legacy_apply", "source_reconciled": False}
+
+        def _forward():
+            """Every post-preflight step that may write (§22.10.C.1)."""
+            for carrier in carriers:
+                # §18.8.3 req 3 (before write): the carrier handle must be the
+                # SAME object preflight resolved.  A replacement detected BEFORE
+                # any write fails WITHOUT adding this carrier to the rollback
+                # stack and WITHOUT touching the replacement.  §22.10.A.4: the
+                # live path is resolved ONLY as an identity guard — a mismatch OR
+                # a guard exception is a typed failure, and it NEVER re-targets
+                # the write.
+                if self._controls_v2_param(carrier.path) is not carrier.param:
+                    raise _ControlsCommitAbort(
+                        "legacy_apply", carrier.path,
+                        "legacy carrier handle replaced before apply")
+                applied.append(carrier)  # push BEFORE the setter (A.3)
+                touched.add("legacy")
+                # §22.10.B.3/B.4: the STRICT writer lets a setter exception reach
+                # this boundary, and ANY setter exception is a forward failure
+                # even when the final readback equals `expected` — a setter that
+                # installed the exact coerced value and then raised is a partially
+                # executed setter, not a success.  The setter exception itself is
+                # preserved as the forward diagnostic.
+                try:
+                    self._controls_v2_write_legacy_carrier(
+                        params, carrier, carrier.value)
+                except Exception as exc:
+                    logger.debug("strict legacy write raised for %s",
+                                 carrier.path, exc_info=True)
+                    raise _ControlsCommitAbort(
+                        "legacy_apply", carrier.path,
+                        f"legacy carrier setter failed: {exc!r}") from exc
+                # §18.8.3 req 2/3 (after write): the path may detect a
+                # replacement, but the readback reads the BOUND ORIGINAL handle —
+                # never the replacement — so a no-op write cannot report success.
+                if self._controls_v2_param(carrier.path) is not carrier.param:
+                    raise _ControlsCommitAbort(
+                        "legacy_apply", carrier.path,
+                        "legacy carrier handle replaced after write")
+                if not self._controls_v2_carrier_readback_ok(
+                        carrier, carrier.expected):
+                    raise _ControlsCommitAbort(
+                        "legacy_apply", carrier.path,
+                        "legacy carrier readback failed")
+
+            # =============== INSTALL — intent + display + PONI ==============
+            # req 7: each class is marked touched BEFORE its (possibly partially
+            # mutating) write, so a raise mid-INSTALL recovers what was reached.
+            progress["phase"] = "install"
             try:
-                self._controls_v2_write_legacy_carrier(
-                    params, carrier.path, carrier.value)
-                # §18.8.3 req 2/3 (after write): the path may detect a replacement,
-                # but the readback reads the BOUND ORIGINAL handle — never the
-                # replacement — so a no-op write cannot report success.
-                replaced_after = (
-                    self._controls_v2_param(carrier.path) is not carrier.param)
-                ok = (not replaced_after
-                      and self._controls_v2_carrier_readback_ok(
-                          carrier, carrier.expected))
-            except Exception:
-                logger.debug("legacy carrier apply/readback raised for %s",
-                             carrier.path, exc_info=True)
-                ok = False
-            if not ok:
-                # req 3 (after write): restore the bound ORIGINAL handle and leave
-                # any replacement untouched (forced restore is handle-direct).
-                recovery = self._controls_v2_recover_all(
-                    ctx, applied, touched=touched)
-                return ControlsCommitResult(
-                    False, failed_path=carrier.path,
-                    reason=("legacy carrier handle replaced after write"
-                            if replaced_after
-                            else "legacy carrier readback failed"),
-                    recovery_failed_paths=recovery, phase="legacy_apply")
+                touched.add("intent")
+                self._controls_v2_install_intent_values(
+                    live, staged.staged_intent)
+                self._controls_v2_gi_selection_explicit = (
+                    staged.gi_selection_explicit)
+                if staged.threshold_state is not None:
+                    self._controls_v2_threshold_state = staged.threshold_state
+                self._controls_v2_source_energy_preference = (
+                    staged.source_energy_preference)
+                touched.add("display")
+                self._controls_v2_apply_snapshot_to_scan(
+                    self._controls_v2_native_int_snapshot())
+                # §12.6/§13.8: the compound PONI carrier installs as ONE value —
+                # path (legacy projection, above) + wrangler object/path + thread
+                # object + intent values (already copied by the intent install).
+                if staged.poni_touched:
+                    touched.add("poni")
+                    if wrangler is not None:
+                        wrangler.poni = staged.poni_object
+                        wrangler.poni_file = str(
+                            staged.staged_intent.poni_file or "")
+                    if thread is not None:
+                        thread.poni = staged.poni_object
+            except Exception as exc:
+                logger.debug("controls commit intent install failed",
+                             exc_info=True)
+                raise _ControlsCommitAbort(
+                    "install", None, "intent install failed") from exc
 
-        # ===================== INSTALL — intent + display + PONI ============
-        # req 7: each class is marked touched BEFORE its (possibly partially
-        # mutating) write, so a raise mid-INSTALL recovers exactly what was reached.
-        try:
-            touched.add("intent")
-            self._controls_v2_install_intent_values(live, staged.staged_intent)
-            self._controls_v2_gi_selection_explicit = staged.gi_selection_explicit
-            if staged.threshold_state is not None:
-                self._controls_v2_threshold_state = staged.threshold_state
-            self._controls_v2_source_energy_preference = (
-                staged.source_energy_preference)
-            touched.add("display")
-            self._controls_v2_apply_snapshot_to_scan(
-                self._controls_v2_native_int_snapshot())
-            # §12.6/§13.8: the compound PONI carrier installs as ONE value — path
-            # (legacy projection, above) + wrangler object/path + thread object +
-            # intent values (already copied by _controls_v2_install_intent_values).
-            if staged.poni_touched:
-                touched.add("poni")
-                if wrangler is not None:
-                    wrangler.poni = staged.poni_object
-                    wrangler.poni_file = str(staged.staged_intent.poni_file or "")
-                if thread is not None:
-                    thread.poni = staged.poni_object
-        except Exception:
-            logger.debug("controls commit intent install failed", exc_info=True)
-            recovery = self._controls_v2_recover_all(ctx, applied, touched=touched)
-            return ControlsCommitResult(
-                False, failed_path=None, reason="intent install failed",
-                recovery_failed_paths=recovery, phase="install")
+            # An energy-preference change invalidates only the energy cache
+            # (§12.7).  §22.4: this is INSIDE the funnel — a raising invalidation
+            # after intent/display install used to escape untyped with the
+            # requested preference still installed.
+            try:
+                if staged.source_energy_preference != prior_energy_pref:
+                    self._controls_v2_source_energy_cache = None
+            except Exception as exc:
+                logger.debug("controls energy-cache invalidation failed",
+                             exc_info=True)
+                raise _ControlsCommitAbort(
+                    "install", None,
+                    "source energy cache invalidation failed") from exc
+            _source_reconcile()
 
-        # An energy-preference change invalidates only the energy cache (§12.7).
-        if staged.source_energy_preference != prior_energy_pref:
-            self._controls_v2_source_energy_cache = None
+        def _source_reconcile():
+            """======================= SOURCE reconciliation =================
 
-        # ===================== SOURCE reconciliation ========================
-        # §14.11.B.3 DECISION (recorded, not silently kept): the full "build a
-        # candidate source/index ASIDE, then ONE swap" is DEFERRED (B.3 remains
-        # deferred scope).  On a source failure the recovery collector first
-        # restores the SOURCE-SELECTION legacy carriers, THEN reconciles the owner
-        # for the PRIOR selection, THEN verifies against the typed receipt
-        # (§18.6) — proving the prior selection restored, not the new one a second
-        # time.  The §14 oracle no longer constrains an exact `_sync` count; an
-        # unrestorable source owner is a DISTINCT recovery failure naming the
-        # ("Source",) carrier, never log-and-discard.
-        if staged.source_selection_touched:
+            §14.11.B.3 DECISION (recorded, not silently kept): the full "build a
+            candidate source/index ASIDE, then ONE swap" is DEFERRED (B.3 remains
+            deferred scope).  On a source failure the recovery collector first
+            restores the SOURCE-SELECTION legacy carriers, THEN reconciles the
+            owner for the PRIOR selection, THEN verifies against the typed receipt
+            (§18.6) — proving the PRIOR selection restored, not the new one a
+            second time.  The §14 oracle no longer constrains an exact `_sync`
+            count; an unrestorable source owner is a DISTINCT recovery failure
+            naming the ("Source",) carrier, never log-and-discard."""
+            if not staged.source_selection_touched:
+                return
+            progress["phase"] = "source_reconcile"
+            progress["source_reconciled"] = True
             try:
                 self._controls_v2_source_energy_cache = None
                 self._controls_v2_metadata_probe_cache = None
                 self._sync_controls_v2_source_index()  # forward reconcile
-            except Exception:
+            except Exception as exc:
                 logger.debug("controls commit source reconcile failed",
                              exc_info=True)
-                recovery = self._controls_v2_recover_all(
-                    ctx, applied, source_reconciled=True, touched=touched)
-                return ControlsCommitResult(
-                    False, failed_path=("Source",),
-                    reason="source reconciliation failed",
-                    recovery_failed_paths=recovery, phase="source_reconcile")
-        return ControlsCommitResult(True)
+                raise _ControlsCommitAbort(
+                    "source_reconcile", ("Source",),
+                    "source reconciliation failed") from exc
+
+        try:
+            _forward()
+        except _ControlsCommitAbort as abort:
+            # C.3: the ORIGINAL forward identity, captured before any recovery.
+            phase, failed_path, reason = abort.phase, abort.failed_path, abort.reason
+        except Exception as exc:
+            # C.1: an unexpected escape from ANY post-first-write operation still
+            # funnels — it never leaves this method untyped.
+            logger.debug("controls commit forward phase raised untyped",
+                         exc_info=True)
+            phase = progress["phase"]
+            failed_path = None
+            reason = f"controls commit failed during {phase}: {exc!r}"
+        else:
+            return ControlsCommitResult(True)
+        # C.2: EXACTLY ONE recovery invocation for every post-first-write failure.
+        recovery = self._controls_v2_recover_all(
+            ctx, applied, source_reconciled=progress["source_reconciled"],
+            touched=touched)
+        return ControlsCommitResult(
+            False, failed_path=failed_path, reason=reason,
+            recovery_failed_paths=recovery, phase=phase)
 
     def _controls_v2_recover_all(self, ctx, applied,
                                  source_reconciled=False, touched=frozenset()):
@@ -5135,14 +5461,38 @@ class staticWidget(QWidget):
         staged = ctx["staged"]
 
         def collect(label, restore, *args):
-            """Run one recovery class TOTALLY (§19.7 req 1-2/4-5)."""
+            """Run one recovery class TOTALLY (§19.7 req 1-2/4-5 / §22.10.F).
+
+            §22.6: only ``restore(*args)`` used to be inside the ``try`` — truth
+            testing, ITERATING the returned object, normalizing paths and
+            deduplicating them all happened outside it, so a wrapper returning a
+            generator that yields one failure and then raises escaped the whole
+            collector and skipped every LATER recovery class.  Execution,
+            materialization, validation, normalization and dedup now all happen
+            inside ONE exception boundary: ``None`` means no failures, a concrete
+            sequence of path tuples is the only other valid result, and anything
+            malformed — or an exception at any point — becomes this class's stable
+            fallback label.  Later classes always run."""
             try:
                 found = restore(*args)
+                normalized = []
+                if found is not None:
+                    for item in list(found):     # materialize INSIDE the try
+                        if item is None:
+                            continue
+                        if (isinstance(item, (str, bytes))
+                                or not isinstance(item, (tuple, list))):
+                            raise TypeError(
+                                "malformed recovery failure entry "
+                                f"{item!r} from class {label!r}")
+                        path = tuple(item)
+                        if path not in normalized:
+                            normalized.append(path)
             except Exception:
                 logger.debug("controls recovery class %s raised", label,
                              exc_info=True)
-                found = [label]
-            for path in found or ():
+                normalized = [tuple(label)]
+            for path in normalized:
                 if path not in failures:
                     failures.append(path)
 
@@ -5182,62 +5532,84 @@ class staticWidget(QWidget):
         return failures
 
     #: The self-state fields the install writes, as
-    #: ``(diagnostic name, attribute, ctx snapshot key)`` in RESTORE order.
-    #: §19.6: each is snapshotted before the forward write, restored
-    #: independently, verified by readback, and named on failure.
+    #: ``(diagnostic name, attribute, ctx snapshot key, DECLARED comparator
+    #: policy)`` in RESTORE order.  §19.6: each is snapshotted before the forward
+    #: write, restored independently, verified by readback, and named on failure.
+    #:
+    #: §22.8 — the comparator policy is DECIDED PER FIELD and recorded here rather
+    #: than left implicit in a helper that "tries ``is`` first" (which made no
+    #: field identity-sensitive):
+    #:
+    #: * ``gi_selection_explicit`` — SCALAR VALUE semantics (a ``bool`` flag);
+    #: * ``source_energy_preference`` — SCALAR VALUE semantics (a short ``str``);
+    #: * ``threshold_state`` — VALUE semantics, derived from its CONSUMERS: every
+    #:   writer REPLACES the whole dict (``_controls_v2_set_threshold_field``, the
+    #:   intent-sync at ``freeze().as_dict()``, the profile refresh, and the commit
+    #:   install), every reader is a by-key ``state.get(...)`` value read
+    #:   (``_controls_v2_threshold_config``), and the stage candidate takes a
+    #:   ``copy.deepcopy``.  No consumer mutates the dict in place or holds a
+    #:   reference across a replacement, so an equal-but-distinct dict is a fully
+    #:   correct restoration and preserved-reference semantics would report a
+    #:   false failure.
     _CONTROLS_V2_SELF_STATE_FIELDS = (
         ("gi_selection_explicit", "_controls_v2_gi_selection_explicit",
-         "prior_gi_explicit"),
+         "prior_gi_explicit", "scalar-value"),
         ("threshold_state", "_controls_v2_threshold_state",
-         "prior_threshold_state"),
+         "prior_threshold_state", "value"),
         ("source_energy_preference", "_controls_v2_source_energy_preference",
-         "prior_energy_pref"),
+         "prior_energy_pref", "scalar-value"),
     )
+
+    @classmethod
+    def _controls_v2_self_state_members(cls):
+        """The three self-state members (§22.10.D.9), each with its OWN primary.
+
+        Unlike the other classes there is no overridable class-level helper here:
+        each field's primary restore is its own ``setattr``, so a primary failure
+        is recorded at that field's stable ``("Intent", <name>)`` path EVEN IF the
+        instance-dict backstop then succeeds — backstop success restores state but
+        never erases the evidence that the primary contract failed (§19.6 req 6)."""
+        members = []
+        for name, attr, key, policy in cls._CONTROLS_V2_SELF_STATE_FIELDS:
+            members.append(_ControlsRecoveryMember(
+                path=("Intent", name), policy=policy,
+                restore=(lambda host, ctx, _a=attr, _k=key:
+                         setattr(host, _a, ctx[_k])),
+                matches=(lambda host, ctx, _a=attr, _k=key:
+                         host._controls_v2_self_state_matches(_a, ctx[_k])),
+                backstop=(lambda host, ctx, _a=attr, _k=key:
+                          host.__dict__.__setitem__(_a, ctx[_k])),
+            ))
+        return members
 
     def _controls_v2_restore_self_state_verified(self, ctx) -> list:
         """Restore the three self-state fields INDEPENDENTLY and VERIFY each
-        (§19.6 req 1-7).
+        (§19.6 req 1-7 / §22.10.D.9).
 
         Direct assignment used to be the whole contract: exceptions were logged
         and a setter that silently refused the prior value was invisible, so
         ``recovery_failed_paths`` stayed empty while the NEW value remained
-        installed.  Each field is now restored on its own, read back and compared
-        (identity or equality, whichever its owner needs), and a failure appends a
-        stable ``("Intent", <name>)`` path and does NOT stop the remaining fields.
-        An instance-dict backstop is attempted after a failed restore; even when
-        the backstop succeeds the primary failure is still reported, so recovery
-        evidence is never erased (req 6)."""
-        failures = []
-        for name, attr, key in self._CONTROLS_V2_SELF_STATE_FIELDS:
-            wanted = ctx[key]
-            raised = False
-            try:
-                setattr(self, attr, wanted)
-            except Exception:
-                logger.debug("controls self-state restore of %s raised", name,
-                             exc_info=True)
-                raised = True
-            if raised or not self._controls_v2_self_state_matches(attr, wanted):
-                try:                       # authoritative backstop (req 6)
-                    self.__dict__[attr] = wanted
-                except Exception:
-                    logger.debug("controls self-state backstop for %s failed",
-                                 name, exc_info=True)
-                failures.append(("Intent", name))
-        return failures
+        installed.  Each field is now an ordered member descriptor with its own
+        declared comparator policy (see ``_CONTROLS_V2_SELF_STATE_FIELDS``): it is
+        restored on its own, read back through that policy, backstopped in the
+        instance dict, re-verified, and named on failure without stopping the
+        remaining fields."""
+        return _controls_v2_recover_members(
+            self, ctx, self._controls_v2_self_state_members(), None)
 
     def _controls_v2_self_state_matches(self, attr, wanted) -> bool:
-        """Whether *attr* currently reads back as *wanted* (§19.6 req 3)."""
+        """Whether *attr* currently reads back as *wanted* (§19.6 req 3 / §22.8).
+
+        DECLARED VALUE SEMANTICS for all three self-state fields — see
+        ``_CONTROLS_V2_SELF_STATE_FIELDS`` for the per-field decision and its
+        rationale.  Identity is deliberately NOT consulted: an equal-but-distinct
+        object IS a correct restoration for every one of these fields, and the old
+        "``is`` first, then ``==``" shape only looked identity-sensitive."""
         try:
             current = getattr(self, attr, _CONTROLS_V2_MISSING)
         except Exception:
             return False
-        if current is wanted:
-            return True
-        try:
-            return bool(current == wanted)
-        except Exception:
-            return False
+        return _controls_v2_value_match(current, wanted)
 
     def _controls_v2_restore_source_owner_verified(self, ctx, applied) -> list:
         """Restore the source owner to the PRIOR selection and PROVE it (§18.6).
@@ -5278,40 +5650,62 @@ class staticWidget(QWidget):
         self._controls_v2_source_energy_cache = ctx["prior_energy_cache"]
         self._controls_v2_metadata_probe_cache = ctx["prior_probe_cache"]
 
+    #: The three INDEPENDENT source-cache members (§22.10.D.1-3), as
+    #: ``(stable path, attribute, ctx snapshot key, declared comparator policy)``.
+    #: §22.5: these used to share ONE ``try`` and one stop-on-first backstop, so a
+    #: raising directory-observation setter left BOTH caches at the new values.
+    _CONTROLS_V2_SOURCE_CACHE_MEMBERS = (
+        (("Source", "observation"), "_controls_v2_directory_observation",
+         "prior_observation", "reference-identity"),
+        (("Source", "energy_cache"), "_controls_v2_source_energy_cache",
+         "prior_energy_cache", "value"),
+        (("Source", "probe_cache"), "_controls_v2_metadata_probe_cache",
+         "prior_probe_cache", "value"),
+    )
+
+    @classmethod
+    def _controls_v2_source_cache_members(cls):
+        """Ordered independent members of the source-cache recovery class."""
+        members = []
+        for path, attr, key, policy in cls._CONTROLS_V2_SOURCE_CACHE_MEMBERS:
+            compare = (_controls_v2_identity_match if policy == "reference-identity"
+                       else _controls_v2_value_match)
+            members.append(_ControlsRecoveryMember(
+                path=path, policy=policy,
+                restore=None,          # the class helper is this member's primary
+                matches=(lambda host, ctx, _a=attr, _k=key, _c=compare:
+                         _c(getattr(host, _a, _CONTROLS_V2_MISSING), ctx[_k])),
+                backstop=(lambda host, ctx, _a=attr, _k=key:
+                          setattr(host, _a, ctx[_k])),
+            ))
+        return members
+
     def _controls_v2_restore_source_caches_verified(self, ctx) -> list:
         """Restore the source caches/observation THROUGH the overridable helper,
-        then VERIFY (§18.8.3 req 6).  A helper that raises OR leaves any cache
-        unrestored is a named ``("Source", "cache")`` recovery failure; the snapshot
-        is re-applied as a backstop."""
+        then verify and backstop EACH MEMBER INDEPENDENTLY (§18.8.3 req 6 /
+        §22.10.D.1-3).
+
+        A helper that raises OR leaves any cache unrestored is a named
+        ``("Source", "cache")`` recovery failure; the observation, energy cache and
+        probe cache are then each re-applied on their own, so a raising member no
+        longer leaves the later members at the transaction's values, and a member
+        STILL unrestored after its backstop is named at its own stable path."""
         raised = False
         try:
             self._controls_v2_restore_source_caches(ctx)
         except Exception:
             logger.debug("controls source cache restore raised", exc_info=True)
             raised = True
-        ok = True
-        try:
-            if (getattr(self, "_controls_v2_directory_observation",
-                        _CONTROLS_V2_MISSING) is not ctx["prior_observation"]):
-                ok = False
-            if (getattr(self, "_controls_v2_source_energy_cache",
-                        _CONTROLS_V2_MISSING) != ctx["prior_energy_cache"]):
-                ok = False
-            if (getattr(self, "_controls_v2_metadata_probe_cache",
-                        _CONTROLS_V2_MISSING) != ctx["prior_probe_cache"]):
-                ok = False
-        except Exception:
-            ok = False
-        if raised or not ok:
+        members = self._controls_v2_source_cache_members()
+        if not raised:
             try:
-                self._controls_v2_directory_observation = ctx["prior_observation"]
-                self._controls_v2_source_energy_cache = ctx["prior_energy_cache"]
-                self._controls_v2_metadata_probe_cache = ctx["prior_probe_cache"]
+                if all(m.matches(self, ctx) for m in members):
+                    return []
             except Exception:
-                logger.debug("controls source cache backstop failed",
+                logger.debug("controls source cache verification raised",
                              exc_info=True)
-            return [("Source", "cache")]
-        return []
+        return _controls_v2_recover_members(
+            self, ctx, members, ("Source", "cache"), primary_failed=True)
 
     def _controls_v2_restore_poni_carriers(self, ctx) -> None:
         """Restore the compound PONI carriers (wrangler object/path + thread object)
@@ -5325,45 +5719,73 @@ class staticWidget(QWidget):
         if th is not None:
             th.poni = ctx["prior_thread_poni"]
 
+    #: The three INDEPENDENT compound-PONI members (§22.10.D.4-6), as
+    #: ``(stable path, ctx owner key, attribute, ctx snapshot key, policy)``.
+    #: §22.5: these shared ONE ``try``, so a raising ``wrangler.poni`` restore left
+    #: ``wrangler.poni_file`` AND ``thread.poni`` at the new values.
+    _CONTROLS_V2_PONI_MEMBERS = (
+        (("Signal", "wrangler_poni"), "wrangler", "poni",
+         "prior_wrangler_poni", "reference-identity"),
+        (("Signal", "wrangler_poni_file"), "wrangler", "poni_file",
+         "prior_wrangler_poni_file", "value"),
+        (("Signal", "thread_poni"), "thread", "poni",
+         "prior_thread_poni", "reference-identity"),
+    )
+
+    @classmethod
+    def _controls_v2_poni_members(cls):
+        """Ordered independent members of the compound-PONI recovery class.
+
+        A member whose owner is absent (no wrangler / no thread) is a satisfied
+        no-op, exactly as the old combined check treated a ``None`` owner."""
+        members = []
+        for path, owner_key, attr, key, policy in cls._CONTROLS_V2_PONI_MEMBERS:
+            compare = (_controls_v2_identity_match if policy == "reference-identity"
+                       else _controls_v2_value_match)
+
+            def _matches(host, ctx, _o=owner_key, _a=attr, _k=key, _c=compare):
+                owner = ctx.get(_o)
+                if owner is None:
+                    return True
+                return _c(getattr(owner, _a, _CONTROLS_V2_MISSING), ctx[_k])
+
+            def _backstop(host, ctx, _o=owner_key, _a=attr, _k=key):
+                owner = ctx.get(_o)
+                if owner is None:
+                    return
+                setattr(owner, _a, ctx[_k])
+
+            members.append(_ControlsRecoveryMember(
+                path=path, policy=policy,
+                restore=None,          # the class helper is this member's primary
+                matches=_matches, backstop=_backstop))
+        return members
+
     def _controls_v2_restore_poni_carriers_verified(self, ctx) -> list:
-        """Restore the PONI carriers THROUGH the overridable helper, then VERIFY
-        (§18.8.3 req 6).  A helper that raises OR leaves a carrier unrestored is a
-        named ``("Signal", "poni_file")`` recovery failure; the values are re-applied
-        as a backstop."""
+        """Restore the PONI carriers THROUGH the overridable helper, then verify and
+        backstop EACH MEMBER INDEPENDENTLY (§18.8.3 req 6 / §22.10.D.4-6).
+
+        A helper that raises OR leaves a carrier unrestored is a named
+        ``("Signal", "poni_file")`` recovery failure; the wrangler PONI object, the
+        wrangler PONI path and the thread PONI object are then each re-applied on
+        their own, so a raising member no longer leaves the later members at the
+        transaction's values, and a member STILL unrestored after its backstop is
+        named at its own stable path."""
         raised = False
         try:
             self._controls_v2_restore_poni_carriers(ctx)
         except Exception:
             logger.debug("controls PONI carrier restore raised", exc_info=True)
             raised = True
-        w = ctx["wrangler"]
-        th = ctx["thread"]
-        ok = True
-        try:
-            if w is not None and (
-                    getattr(w, "poni", _CONTROLS_V2_MISSING)
-                    is not ctx["prior_wrangler_poni"]
-                    or getattr(w, "poni_file", _CONTROLS_V2_MISSING)
-                    != ctx["prior_wrangler_poni_file"]):
-                ok = False
-            if th is not None and (
-                    getattr(th, "poni", _CONTROLS_V2_MISSING)
-                    is not ctx["prior_thread_poni"]):
-                ok = False
-        except Exception:
-            ok = False
-        if raised or not ok:
+        members = self._controls_v2_poni_members()
+        if not raised:
             try:
-                if w is not None:
-                    w.poni = ctx["prior_wrangler_poni"]
-                    w.poni_file = ctx["prior_wrangler_poni_file"]
-                if th is not None:
-                    th.poni = ctx["prior_thread_poni"]
+                if all(m.matches(self, ctx) for m in members):
+                    return []
             except Exception:
-                logger.debug("controls PONI carrier backstop failed",
-                             exc_info=True)
-            return [("Signal", "poni_file")]
-        return []
+                logger.debug("controls PONI verification raised", exc_info=True)
+        return _controls_v2_recover_members(
+            self, ctx, members, ("Signal", "poni_file"), primary_failed=True)
 
     def _controls_v2_defer_field_edit(self, path, value) -> None:
         """Record a run-active Controls edit into the journal for the NEXT run.
@@ -7207,9 +7629,19 @@ class staticWidget(QWidget):
         re-configures the same selection legitimately advances it (restoration is
         proved by the configured selection returning, not by the counter
         rewinding), and ``observation`` is restored and verified by the cache
-        owner under ``("Source", "cache")``."""
-        if receipt is None:
-            return True
+        owner under ``("Source", "cache")``.
+
+        §22.10.E.6 / §22.8: the EXACT typed receipt is REQUIRED.  ``receipt is
+        None -> True`` was FAIL-OPEN — when source reconciliation was attempted,
+        the absence (or wrong type) of the preflight receipt cannot certify
+        restoration, yet it certified it unconditionally.  A missing or malformed
+        receipt now fails CLOSED and is reported as a ``("Source",)`` recovery
+        failure."""
+        if not isinstance(receipt, SourceRecoveryReceipt):
+            logger.debug(
+                "source restore cannot be certified: expected a "
+                "SourceRecoveryReceipt, got %r", type(receipt).__name__)
+            return False
         widget = getattr(self, "_controls_v2_source_widget", None)
         session = getattr(widget, "directory_session", None)
         if getattr(session, "configured", None) != receipt.configured:

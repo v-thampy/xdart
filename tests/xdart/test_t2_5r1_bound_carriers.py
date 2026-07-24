@@ -233,22 +233,25 @@ def test_later_failure_rolls_back_an_earlier_bound_carrier(widget, monkeypatch):
 
 
 def test_no_post_preflight_write_targets_a_path(widget, monkeypatch):
-    """§19.5 req 6: ONE mechanism.  Every carrier write inside the transaction
-    hands the mirror an ALREADY-RESOLVED handle — never a path for it to resolve
-    against the live tree — so no post-preflight write can reach a replacement."""
+    """§19.5 req 6 / §22.10.A.2: ONE mechanism.  Every carrier write inside the
+    transaction is handed the PREPARED CARRIER itself — never a path, and never a
+    key into a widget-level registry that a second authority could redirect — so
+    no post-preflight write can reach a replacement."""
+    from xdart.gui.tabs.static_scan.static_scan_widget import (
+        _PreparedLegacyCarrier)
+
     path = ("Signal", "mask_file")
     original = widget._controls_v2_param(path)
     staged = widget.stage_controls_transaction([(path, "/tmp/one-mechanism.edf")])
     targets = []
-    real_mirror = widget._mirror_wrangler_parameter_values
+    real_writer = widget._controls_v2_write_legacy_carrier
 
-    def recording_mirror(parameters, values):
-        values = tuple(values)
-        targets.extend(target for target, _ in values)
-        return real_mirror(parameters, values)
+    def recording_writer(parameters, carrier, value):
+        targets.append(carrier)
+        return real_writer(parameters, carrier, value)
 
     monkeypatch.setattr(
-        widget, "_mirror_wrangler_parameter_values", recording_mirror)
+        widget, "_controls_v2_write_legacy_carrier", recording_writer)
     # Force a failure AFTER the legacy carrier is installed, so both the forward
     # write and the full rollback run.
     monkeypatch.setattr(
@@ -257,9 +260,10 @@ def test_no_post_preflight_write_targets_a_path(widget, monkeypatch):
     result = widget.commit_controls_transaction(staged)
 
     assert not result.ok
-    assert targets, "the forward carrier write did not reach the mirror"
+    assert targets, "the forward carrier write did not reach the strict writer"
     for target in targets:
-        assert target is original
+        assert isinstance(target, _PreparedLegacyCarrier)
+        assert target.param is original
         assert not isinstance(target, (tuple, list))
 
 

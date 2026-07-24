@@ -316,8 +316,10 @@ def test_valid_legacy_edit_readback_failure_is_typed_refusal(widget, monkeypatch
     monkeypatch.setattr(widget, "_controls_v2_status_message", lambda *_a: None)
     # The forward legacy write no-ops, so the readback cannot match -> the engine
     # rolls the carrier back and returns a typed legacy_apply failure.
+    # §22.10.B.1: the transaction no longer delegates to the permissive
+    # compatibility mirror, so the no-op is injected at the STRICT writer.
     monkeypatch.setattr(
-        widget, "_mirror_wrangler_parameter_values", lambda *_a, **_k: None)
+        widget, "_controls_v2_write_legacy_carrier", lambda *_a, **_k: None)
 
     widget._on_controls_v2_field_changed(path, "/tmp/t25-legacy-fail.edf")
 
