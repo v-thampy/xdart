@@ -476,6 +476,10 @@ class FormRow(QtWidgets.QWidget):
     """One editable row in the transitional V2 form."""
 
     valueChanged = QtCore.Signal(object, object)
+    #: A still-uncommitted USER draft (line-editor ``textEdited`` — never a
+    #: programmatic ``setText``), so a focused draft can be revisioned at action
+    #: time (§12.4) without being applied until it commits.
+    draftChanged = QtCore.Signal(object, object)
     browseRequested = QtCore.Signal(object)
 
     def __init__(
@@ -546,6 +550,12 @@ class FormRow(QtWidgets.QWidget):
             editor.setObjectName("controlsV2LineEdit")
             editor.editingFinished.connect(
                 lambda e=editor: self._emit_edit(e.text())
+            )
+            # A focused draft (user typing, NOT programmatic setText) is
+            # revisioned at action time so it survives a rebuild and wins by
+            # revision (§12.4); it commits (and applies) on editingFinished.
+            editor.textEdited.connect(
+                lambda text, p=self._path: self.draftChanged.emit(p, text)
             )
             lay.addWidget(editor, 1)
 
@@ -899,6 +909,9 @@ class ControlsPanelV2(QtWidgets.QWidget):
     analysisLaunchRequested = QtCore.Signal(object)
     controlActionRequested = QtCore.Signal(object)
     fieldValueChanged = QtCore.Signal(object, object)
+    #: A focused, still-uncommitted line-editor draft (§12.4) — revisioned at
+    #: action time, applied only when it commits via fieldValueChanged.
+    fieldDraftChanged = QtCore.Signal(object, object)
     fieldBrowseRequested = QtCore.Signal(object)
 
     def __init__(self, parent=None):
@@ -1568,6 +1581,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
             row.label.hide()
             row.setMaximumWidth(72)
             row.valueChanged.connect(self.fieldValueChanged)
+            row.draftChanged.connect(self.fieldDraftChanged)
             sub.add_header_widget(row)
 
     @staticmethod
@@ -1753,6 +1767,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
             reason=field.reason,
         )
         row.valueChanged.connect(self.fieldValueChanged)
+        row.draftChanged.connect(self.fieldDraftChanged)
         row.browseRequested.connect(self.fieldBrowseRequested)
         if field.browse and field.value and not field.reason:
             # Path/file fields truncate in the narrow panel; show the FULL path
@@ -1802,6 +1817,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
             pr.label.hide()
             pr.setMaximumWidth(58)   # ~20% narrower than the old 72px cap
             pr.valueChanged.connect(self.fieldValueChanged)
+            pr.draftChanged.connect(self.fieldDraftChanged)
             row.add_trailing_widget(pr)
 
     @staticmethod

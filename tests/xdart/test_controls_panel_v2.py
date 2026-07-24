@@ -1,5 +1,6 @@
 """Offscreen tests for the hidden Controls Panel V2 scaffold."""
 
+import copy
 import gc
 import json
 import os
@@ -5708,6 +5709,345 @@ def test_t1_gi_freeze_honors_explicit_motor_when_choices_unknown(
         assert frozen.gi.enabled is True
         assert frozen.gi.incidence_motor == "halpha"     # raw retained
         assert frozen.gi.effective_motor == "halpha"     # honored, NOT Manual
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def _t1r_widget(monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    return staticWidget()
+
+
+def test_t1r_source_edit_plus_invalid_leaves_all_state_unchanged(qapp, monkeypatch):
+    """§12 test 1: staging a source edit followed by an invalid field mutates NO
+    production state — source-energy preference, source-energy cache, source
+    index/observation, and the display scan are byte/value-identical.
+
+    RED at 4b59b7da: the redirect stage wrote _controls_v2_source_energy_preference
+    (C1) and _controls_v2_axis_to_native wrote the display scan gi_config."""
+    from xdart.gui.tabs.static_scan.static_scan_widget import ControlsTransactionError
+    widget = _t1r_widget(monkeypatch)
+    try:
+        pref0 = getattr(widget, "_controls_v2_source_energy_preference", "poni")
+        cache0 = getattr(widget, "_controls_v2_source_energy_cache", None)
+        obs0 = getattr(widget, "_controls_v2_directory_observation", None)
+        scan = getattr(widget, "scan", None)
+        gi_cfg0 = copy.deepcopy(getattr(scan, "gi_config", None)) if scan else None
+        gi0 = bool(getattr(scan, "gi", False)) if scan else None
+
+        result = widget.stage_controls_transaction([
+            (("Source", "energy_preference"), "metadata"),
+            (("GI", "Grazing"), True),
+            (("Int1D", "axis"), "Qip"),
+            (("BG", "Scale"), "not-a-number"),
+        ])
+        assert isinstance(result, ControlsTransactionError)
+        assert getattr(widget, "_controls_v2_source_energy_preference", "poni") == pref0
+        assert getattr(widget, "_controls_v2_source_energy_cache", None) == cache0
+        assert getattr(widget, "_controls_v2_directory_observation", None) is obs0
+        if scan is not None:
+            assert copy.deepcopy(getattr(scan, "gi_config", None)) == gi_cfg0
+            assert bool(getattr(scan, "gi", False)) == gi0
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t1r_unsupported_path_is_typed_refusal(qapp, monkeypatch):
+    """§12 test 2: an unsupported control path is a typed ControlsTransactionError,
+    not a silent skip, and the winning journal is retained.
+
+    RED at 4b59b7da: the stage loop `continue`d past a param-less path."""
+    from xdart.gui.tabs.static_scan.static_scan_widget import ControlsTransactionError
+    widget = _t1r_widget(monkeypatch)
+    try:
+        result = widget.stage_controls_transaction([
+            (("Nonexistent", "field"), "x"),
+        ])
+        assert isinstance(result, ControlsTransactionError)
+        assert result.path == ("Nonexistent", "field")
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t1r_invalid_native_numeric_is_typed_refusal(qapp, monkeypatch):
+    """§12 test 3: an invalid native numeric (Int1D/points='not-a-number') is a
+    typed refusal, not a permissive clamp to a default.
+
+    RED at 4b59b7da: the native setter clamped invalid input to a default and
+    returned a successful StagedControlsTransaction."""
+    from xdart.gui.tabs.static_scan.static_scan_widget import ControlsTransactionError
+    widget = _t1r_widget(monkeypatch)
+    try:
+        result = widget.stage_controls_transaction([
+            (("Int1D", "points"), "not-a-number"),
+        ])
+        assert isinstance(result, ControlsTransactionError)
+        assert result.path == ("Int1D", "points")
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t1r_threshold_min_gt_max_is_typed_refusal(qapp, monkeypatch):
+    """§12 test 4: a cross-field contradiction (threshold min>max) is a typed
+    staging refusal that leaves the live intent unchanged and retains the journal
+    — freeze is NOT the error boundary.
+
+    RED at 4b59b7da: min>max staged and committed, installed an invalid live
+    intent and cleared the journal; only RunIntent.freeze() raised later."""
+    from xdart.gui.tabs.static_scan.static_scan_widget import (
+        ControlsTransactionError, DeferredRunEditsPendingError)
+    widget = _t1r_widget(monkeypatch)
+    try:
+        # Pure stage: typed refusal, no install.
+        result = widget.stage_controls_transaction([
+            (("Mask", "min"), 100.0),
+            (("Mask", "max"), 10.0),
+        ])
+        assert isinstance(result, ControlsTransactionError)
+
+        # Through the production Start seam: refuse, retain journal, nothing frozen.
+        widget._pending_controls_v2_run_configuration = None
+        intent = widget._controls_v2_ensure_run_intent()
+        min_before = intent.threshold.threshold_min
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("Mask", "min"), 100.0)
+        widget._on_controls_v2_field_changed(("Mask", "max"), 10.0)
+        widget.wrangler.finished.emit()
+        qapp.processEvents()
+        with pytest.raises(DeferredRunEditsPendingError):
+            widget._prepare_controls_v2_run_configuration()
+        assert widget._controls_v2_ensure_run_intent().threshold.threshold_min == min_before
+        assert getattr(widget, "_pending_controls_v2_run_configuration", None) is None
+        remaining = {tuple(p) for p, _ in widget._controls_v2_deferred_field_edits}
+        assert ("Mask", "min") in remaining and ("Mask", "max") in remaining
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t1r_gi_enable_then_axis_composes_against_staged_state(qapp, monkeypatch):
+    """§12 test 5: a GI-enable followed by a GI-axis edit in ONE transaction
+    composes against the STAGED GI state — the axis reducer sees gi_enabled and
+    sets the GI mode, not a unit.
+
+    RED at 4b59b7da: the axis reducer read the stale display scan (gi=False), so
+    the second edit was evaluated as a Standard unit change (q_total retained)."""
+    from xdart.gui.tabs.static_scan.static_scan_widget import (
+        GI_MODES_1D, StagedControlsTransaction)
+    widget = _t1r_widget(monkeypatch)
+    try:
+        staged = widget.stage_controls_transaction([
+            (("GI", "Grazing"), True),
+            (("Int1D", "axis"), "Qip"),
+        ])
+        assert isinstance(staged, StagedControlsTransaction)
+        assert staged.staged_intent.gi.enabled is True
+        assert staged.staged_intent.bai_1d_args.get("gi_mode_1d") == "q_ip"
+        assert "q_ip" in GI_MODES_1D
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t1r_staging_gi_axis_does_not_mutate_display_scan(qapp, monkeypatch):
+    """§12 test 6: staging a GI-axis change does NOT mutate the live display scan
+    (the reducer touches only the candidate)."""
+    from xdart.gui.tabs.static_scan.static_scan_widget import StagedControlsTransaction
+    widget = _t1r_widget(monkeypatch)
+    try:
+        # Enable GI on the live intent first (idle apply) so the scan reflects GI.
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        scan = getattr(widget, "scan", None)
+        gi_cfg0 = copy.deepcopy(getattr(scan, "gi_config", None)) if scan else None
+        staged = widget.stage_controls_transaction([
+            (("Int1D", "axis"), "Qoop"),
+        ])
+        assert isinstance(staged, StagedControlsTransaction)
+        assert staged.staged_intent.bai_1d_args.get("gi_mode_1d") == "q_oop"
+        if scan is not None:
+            assert copy.deepcopy(getattr(scan, "gi_config", None)) == gi_cfg0
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t1r_focused_draft_supersedes_older_deferred_by_revision(qapp, monkeypatch):
+    """§12 test 7: an older deferred value followed by a NEWER still-focused real
+    form draft selects the newer revision (no journal-beats-form rule).
+
+    RED at 4b59b7da: the form harvest skipped a path already in the journal, so
+    the older deferred value won over the newer focused draft."""
+    widget = _t1r_widget(monkeypatch)
+    try:
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("BG", "Scale"), 2)   # deferred A (older)
+        widget.wrangler.finished.emit()
+        qapp.processEvents()
+        # Newer focused draft for the same path (idle), via the production slot.
+        widget._on_controls_v2_field_draft_changed(("BG", "Scale"), 7)
+        winners = dict(widget._controls_v2_collect_pending_edits())
+        assert winners.get(("BG", "Scale")) == 7   # newer draft wins by revision
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t1r_invalid_focused_draft_revisioned_and_survives_rebuild(qapp, monkeypatch):
+    """§12 test 8: an invalid focused form draft is revisioned in the journal and
+    SURVIVES a panel rebuild/refresh (it is not lost to a re-render).
+
+    RED at 4b59b7da: focused drafts never entered the journal, so a rebuild lost
+    the user's uncommitted text."""
+    widget = _t1r_widget(monkeypatch)
+    try:
+        widget._on_controls_v2_field_draft_changed(("BG", "Scale"), "not-a-number")
+        journal = widget._controls_v2_edit_journal_dict()
+        assert ("BG", "Scale") in journal
+        entry = journal[("BG", "Scale")]
+        assert entry["value"] == "not-a-number" and entry["origin"] == "draft"
+        rev_before = entry["revision"]
+        # A panel rebuild/refresh must not drop the journaled draft.
+        widget._refresh_controls_v2_profile(immediate=True)
+        qapp.processEvents()
+        journal2 = widget._controls_v2_edit_journal_dict()
+        assert journal2.get(("BG", "Scale"), {}).get("value") == "not-a-number"
+        assert journal2[("BG", "Scale")]["revision"] == rev_before
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t1r_form_harvest_failure_refuses_preparation(qapp, monkeypatch):
+    """§12 test 9: a form/draft collection failure REFUSES preparation (fail
+    closed), it does not log-and-continue.
+
+    RED at 4b59b7da: a form-harvest exception was caught and preparation
+    continued with an empty harvest."""
+    from xdart.gui.tabs.static_scan.static_scan_widget import DeferredRunEditsPendingError
+    widget = _t1r_widget(monkeypatch)
+    try:
+        widget._pending_controls_v2_run_configuration = None
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        widget.wrangler.finished.emit()
+        qapp.processEvents()
+
+        def _boom():
+            raise RuntimeError("injected form harvest failure")
+        monkeypatch.setattr(widget.controls_v2, "current_form_edits", _boom)
+
+        with pytest.raises(DeferredRunEditsPendingError):
+            widget._prepare_controls_v2_run_configuration()
+        assert getattr(widget, "_pending_controls_v2_run_configuration", None) is None
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t1r_commit_pending_cannot_bypass_journal(qapp, monkeypatch):
+    """§12 test 10: a non-run form commit (reintegrate/advanced) records the
+    focused value into the revisioned journal, so an OLDER deferred value cannot
+    overwrite the newer focused correction at the next Start.
+
+    RED at 4b59b7da: _commit_controls_v2_pending_edits applied the form value
+    directly without journaling it, so an older deferred journal entry won."""
+    widget = _t1r_widget(monkeypatch)
+    try:
+        # Older deferred value for BG.Scale (during a run).
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("BG", "Scale"), 2)   # deferred, older
+        widget.wrangler.finished.emit()
+        qapp.processEvents()
+        # Idle: a newer focused form value published through the reintegrate/
+        # advanced harvest seam (the form holds 9 while the carrier still holds the
+        # old value); it must be journaled so it beats the older deferred at Start.
+        class _Edit:
+            def __init__(self, path, value):
+                self.path = path
+                self.value = value
+        monkeypatch.setattr(
+            widget.controls_v2, "current_form_edits",
+            lambda: (_Edit(("BG", "Scale"), 9),))
+        widget._commit_controls_v2_pending_edits()
+
+        winners = dict(widget._controls_v2_collect_pending_edits())
+        assert winners.get(("BG", "Scale")) == 9   # newer focused value wins
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t1r_gi_motor_observation_is_source_qualified(qapp, monkeypatch):
+    """§12 test 11: motor choices are tied to the SOURCE they were observed from.
+    Source A's halpha does not seed source B's freeze; UNKNOWN/KNOWN_EMPTY/
+    KNOWN_NONEMPTY map correctly; a delayed stale A signal is ignored under B.
+
+    RED at 4b59b7da: choices came from the persistent combo, so a source A→B edit
+    froze B with A's motor, and known-empty was unreachable."""
+    from xdart.gui.tabs.static_scan.static_scan_widget import GIMotorObservation
+    widget = _t1r_widget(monkeypatch)
+    try:
+        token = {"v": "A"}
+        monkeypatch.setattr(
+            widget, "_controls_v2_source_token", lambda: token["v"])
+
+        # Source A: metadata hydration reports halpha -> KNOWN_NONEMPTY for A.
+        widget._controls_v2_record_gi_motor_observation(["halpha", "detx"])
+        obs_a = widget._controls_v2_capture_gi_motor_observation()
+        assert obs_a.state == GIMotorObservation.KNOWN_NONEMPTY
+        # choices_for_freeze() is the source's real motor LIST (resolve_gi_motor
+        # then picks the effective motor from it), not the resolved motor.
+        assert obs_a.choices_for_freeze() == ("halpha", "detx")
+
+        # Switch to source B (no observation yet) -> UNKNOWN (A's is not reused).
+        token["v"] = "B"
+        obs_b = widget._controls_v2_capture_gi_motor_observation()
+        assert obs_b.state == GIMotorObservation.UNKNOWN
+        assert obs_b.choices_for_freeze() is None
+
+        # A DELAYED stale A signal arriving under B is ignored.
+        widget._controls_v2_record_gi_motor_observation(["halpha"], for_token="A")
+        assert widget._controls_v2_capture_gi_motor_observation().state == (
+            GIMotorObservation.UNKNOWN)
+
+        # B hydrates to a genuinely empty motor list -> KNOWN_EMPTY -> ().
+        widget._controls_v2_record_gi_motor_observation([])
+        obs_b2 = widget._controls_v2_capture_gi_motor_observation()
+        assert obs_b2.state == GIMotorObservation.KNOWN_EMPTY
+        assert obs_b2.choices_for_freeze() == ()
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t1r_unknown_preserves_motor_known_empty_resolves_manual(qapp, monkeypatch):
+    """§12 test 12: at freeze, UNKNOWN choices preserve the operator's explicit
+    motor while KNOWN_EMPTY resolves it to Manual.
+
+    RED at 4b59b7da: the GUI mapped every no-real-choice case to None, so the
+    core policy's known-empty ()→Manual distinction was unreachable."""
+    from xdart.gui.tabs.static_scan.static_scan_widget import GIMotorObservation
+    widget = _t1r_widget(monkeypatch)
+    try:
+        token = {"v": "A"}
+        monkeypatch.setattr(
+            widget, "_controls_v2_source_token", lambda: token["v"])
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        widget._on_controls_v2_field_changed(("GI", "th_motor"), "halpha")
+
+        # UNKNOWN: no observation for the source -> explicit motor honored.
+        frozen = widget._prepare_controls_v2_run_configuration()
+        assert frozen.gi.effective_motor == "halpha"
+
+        # KNOWN_EMPTY: the source is probed and has no real motors -> Manual.
+        widget._controls_v2_record_gi_motor_observation([])
+        frozen2 = widget._prepare_controls_v2_run_configuration()
+        assert frozen2.gi.effective_motor == "Manual"
     finally:
         widget.close()
         widget.deleteLater()

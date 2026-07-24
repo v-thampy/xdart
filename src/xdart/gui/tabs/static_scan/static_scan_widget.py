@@ -230,6 +230,10 @@ class _TransientReadinessObservation(RuntimeError):
     a transient metadata failure (debounced retry, never cached)."""
 
 
+#: Sentinel distinguishing "argument not supplied" from an explicit ``None``.
+_UNSET = object()
+
+
 class DeferredRunEditsPendingError(RuntimeError):
     """R4B-12 (O-1a-i.2): Run preparation refuses to freeze because a Controls
     edit queued during the previous run could not be applied.  Raised by
@@ -244,7 +248,7 @@ class ControlsTransactionError(Exception):
     freeze with a typed, user-visible message and a structured event.  This is
     RETURNED by :meth:`staticWidget.stage_controls_transaction` (never raised
     from staging), so the stage phase mutates no production carrier before the
-    failure is known (§9.10 step 3-stage)."""
+    failure is known (§9.10 step 3-stage / §12.3)."""
 
     def __init__(self, path, reason, value=None):
         self.path = tuple(path) if path is not None else None
@@ -254,14 +258,104 @@ class ControlsTransactionError(Exception):
         super().__init__(f"invalid control edit ({pretty}): {self.reason}")
 
 
-class StagedControlsTransaction:
-    """A fully validated, PURE candidate for the next run.
+class GIMotorObservation:
+    """A source-qualified snapshot of the GI theta-motor choices (§12.5).
 
-    Produced by a pure stage: native/int/GI/threshold edits are applied to
-    ``staged_intent`` (a clone of the Controls-owned intent), and legacy-backed
-    edits are coerced into ``legacy_projection`` WITHOUT touching a Parameter.
-    No production carrier (Qt param, display scan, source index, session,
-    wrangler, profile) is written while staging (§9.10 step 3-stage)."""
+    The ``state`` is one of ``UNKNOWN`` / ``KNOWN_EMPTY`` / ``KNOWN_NONEMPTY``,
+    tied to the ``source_token`` (the immutable identity of the source the
+    motors were observed FROM).  ``choices_for_freeze()`` maps the three states
+    to the ``resolve_gi_motor`` contract — ``None`` (unknown, preserve the
+    explicit motor), ``()`` (known-empty, resolve to Manual), or the motor
+    tuple.  Choices from a DIFFERENT source token must never seed a freeze — a
+    deferred source A→B edit invalidates the observation, so B never inherits
+    A's motor.
+    """
+
+    UNKNOWN = "UNKNOWN"
+    KNOWN_EMPTY = "KNOWN_EMPTY"
+    KNOWN_NONEMPTY = "KNOWN_NONEMPTY"
+
+    __slots__ = ("state", "motors", "source_token")
+
+    def __init__(self, state=UNKNOWN, motors=(), source_token=None):
+        motors = tuple(str(m) for m in (motors or ()) if str(m) and str(m) != "Manual")
+        if state == self.KNOWN_NONEMPTY and not motors:
+            state = self.KNOWN_EMPTY
+        if state == self.KNOWN_EMPTY and motors:
+            state = self.KNOWN_NONEMPTY
+        self.state = state
+        self.motors = motors
+        self.source_token = source_token
+
+    def matches(self, source_token) -> bool:
+        return self.source_token == source_token
+
+    def choices_for_freeze(self):
+        if self.state == self.KNOWN_NONEMPTY:
+            return self.motors
+        if self.state == self.KNOWN_EMPTY:
+            return ()
+        return None
+
+
+class ControlsStageCandidate:
+    """Mutable working state for a PURE stage (§12.2).
+
+    Every reducer reads and writes ONLY this candidate — never ``self.scan``, a
+    legacy parameter, a widget, the wrangler, or a thread — so multiple edits in
+    one transaction compose in revision order and staging installs nothing on the
+    production widget.  ``gi_enabled`` reads the candidate intent, so a GI-enable
+    followed by a GI-axis edit composes against the staged GI state."""
+
+    __slots__ = (
+        "intent",
+        "threshold_state",
+        "gi_selection_explicit",
+        "source_energy_preference",
+        "gi_motor_observation",
+        "legacy_projection",
+        "source_touched",
+    )
+
+    def __init__(
+        self,
+        intent,
+        threshold_state,
+        gi_selection_explicit,
+        source_energy_preference,
+        gi_motor_observation,
+    ):
+        self.intent = intent
+        self.threshold_state = threshold_state
+        self.gi_selection_explicit = bool(gi_selection_explicit)
+        self.source_energy_preference = str(source_energy_preference or "poni")
+        self.gi_motor_observation = gi_motor_observation
+        self.legacy_projection = {}
+        self.source_touched = False
+
+    @property
+    def gi_enabled(self) -> bool:
+        return bool(self.intent.gi.enabled)
+
+    @property
+    def bai(self):
+        if not isinstance(self.intent.bai_1d_args, dict):
+            self.intent.bai_1d_args = {}
+        if not isinstance(self.intent.bai_2d_args, dict):
+            self.intent.bai_2d_args = {}
+        return self.intent.bai_1d_args, self.intent.bai_2d_args
+
+
+class StagedControlsTransaction:
+    """A fully validated, PURE candidate for the next run (§12.2/§12.3).
+
+    Produced by a pure reducer: native/int/GI/threshold edits are reduced onto
+    ``staged_intent`` (a clone of the Controls-owned intent) and legacy-backed
+    edits are coerced into ``legacy_projection`` WITHOUT touching a Parameter or
+    any ``self`` state.  The complete candidate is validated before this object
+    exists.  No production carrier (Qt param, display scan, source index/cache,
+    session, wrangler, profile, threshold/energy self-state) is written while
+    staging."""
 
     __slots__ = (
         "staged_intent",
@@ -269,6 +363,8 @@ class StagedControlsTransaction:
         "threshold_state",
         "gi_selection_explicit",
         "source_touched",
+        "source_energy_preference",
+        "gi_motor_observation",
     )
 
     def __init__(
@@ -278,12 +374,16 @@ class StagedControlsTransaction:
         threshold_state,
         gi_selection_explicit,
         source_touched,
+        source_energy_preference,
+        gi_motor_observation,
     ):
         self.staged_intent = staged_intent
         self.legacy_projection = dict(legacy_projection)
         self.threshold_state = threshold_state
         self.gi_selection_explicit = bool(gi_selection_explicit)
         self.source_touched = bool(source_touched)
+        self.source_energy_preference = source_energy_preference
+        self.gi_motor_observation = gi_motor_observation
 
 
 class ControlsCommitResult:
@@ -1174,6 +1274,8 @@ class staticWidget(QWidget):
                 self._on_controls_v2_action)
             panel.fieldValueChanged.connect(
                 self._on_controls_v2_field_changed)
+            panel.fieldDraftChanged.connect(
+                self._on_controls_v2_field_draft_changed)
             panel.fieldBrowseRequested.connect(
                 self._on_controls_v2_field_browse)
             preview.setWidget(panel)
@@ -1308,6 +1410,15 @@ class staticWidget(QWidget):
         return True
 
     def _commit_controls_v2_pending_edits(self) -> None:
+        """Harvest the panel's form edits for a NON-run consumer (reintegrate,
+        advanced processing, calibration/mask routing, native-state apply).
+
+        §12.4: these paths must not bypass the revisioned journal.  A focused form
+        value that differs from the committed state is RECORDED into the journal
+        (revisioned at harvest time) BEFORE it is applied, so an older deferred
+        journal entry for the same path cannot overwrite it at the next Start —
+        the newer focused correction wins by revision and is applied once.
+        """
         panel = getattr(self, "controls_v2", None)
         get_edits = getattr(panel, "current_form_edits", None)
         if not callable(get_edits):
@@ -1318,7 +1429,12 @@ class staticWidget(QWidget):
             logger.debug("Controls Panel V2 pending edit harvest failed",
                          exc_info=True)
             return
+        committed = self._controls_v2_field_values() if edits else {}
         for edit in edits:
+            path = tuple(edit.path)
+            if self._controls_v2_form_value_differs(
+                    path, edit.value, committed.get(path)):
+                self._controls_v2_record_edit(path, edit.value, origin="form")
             self._apply_controls_v2_field_value(edit.path, edit.value)
         if edits:
             self._refresh_controls_v2_profile(immediate=True)
@@ -1455,8 +1571,6 @@ class staticWidget(QWidget):
         self._controls_v2_ensure_run_intent().threshold = (
             ThresholdIntent.from_mapping(state)
         )
-        if getattr(self, "_controls_v2_staging", False):
-            return  # pure stage: no display-scan write (§9.10 step 3-stage)
         scan = getattr(self, "scan", None)
         if scan is not None:
             for attr, key in (
@@ -1527,8 +1641,6 @@ class staticWidget(QWidget):
         }
 
     def _controls_v2_apply_gi_config_to_scan(self, cfg=None) -> None:
-        if getattr(self, "_controls_v2_staging", False):
-            return  # pure stage: no display-scan write (§9.10 step 3-stage)
         scan = getattr(self, "scan", None)
         if scan is None:
             return
@@ -1560,8 +1672,6 @@ class staticWidget(QWidget):
         """Point the integrator's GI θ-motor combo at *motor* (the two θ-motor
         surfaces must never disagree — CLAUDE.md GI rule).  No-op when the combo
         does not offer *motor* or is already there."""
-        if getattr(self, "_controls_v2_staging", False):
-            return  # pure stage: no integrator-combo write (§9.10 step 3-stage)
         it = getattr(self, "integratorTree", None)
         combo = getattr(getattr(it, "ui", None), "gi_motor", None)
         if combo is None:
@@ -1679,8 +1789,6 @@ class staticWidget(QWidget):
                 _apply()
 
     def _controls_v2_apply_snapshot_to_scan(self, snapshot: dict, scan=None) -> None:
-        if scan is None and getattr(self, "_controls_v2_staging", False):
-            return  # pure stage: no display-scan write (§9.10 step 3-stage)
         scan = scan if scan is not None else getattr(self, "scan", None)
         self._controls_v2_apply_native_int_snapshot_to_scan(snapshot, scan)
 
@@ -2225,8 +2333,6 @@ class staticWidget(QWidget):
         return {path: vals for path, vals in choices.items() if vals}
 
     def _controls_v2_sync_advanced_parameter(self, path) -> None:
-        if getattr(self, "_controls_v2_staging", False):
-            return  # pure stage: no hidden advanced-param write (§9.10 step 3-stage)
         spec = next(
             (spec for spec in INTEGRATOR_BACKED_CONTROL_SPECS
              if spec.path == tuple(path) and spec.parameter_name),
@@ -2843,133 +2949,510 @@ class staticWidget(QWidget):
         )
         return [(path, entry["value"]) for path, entry in ordered]
 
-    def _controls_v2_collect_pending_edits(self):
-        """Merge journal winners with in-progress panel form edits.
+    def _controls_v2_form_value_differs(self, path, form_value, committed_value) -> bool:
+        """Whether a harvested form value is a REAL change vs the committed state.
 
-        Committed edits recorded via ``fieldValueChanged`` (deferred/idle/
-        correction origins) WIN over the panel's current form snapshot: after a
-        run the panel re-renders at its stale pre-deferred values, so a wholesale
-        form harvest would clobber a deferred edit.  A form edit therefore only
-        contributes a path the journal has NOT already recorded (a genuine
-        uncommitted in-progress edit).
+        A stale post-run panel value equals the committed state (not a change),
+        so it is not harvested and cannot clobber a deferred edit.  An
+        un-coercible draft is treated as a differing edit so it is journaled and
+        then refused by staging (never silently dropped, §12.4)."""
+        if committed_value is None:
+            return True
+        try:
+            coerced = coerce_control_edit_value(committed_value, form_value)
+        except Exception:
+            return True
+        return coerced != committed_value
+
+    def _controls_v2_collect_pending_edits(self):
+        """Return the transaction's winning edits, ordered SOLELY by revision.
+
+        Every user action — deferred, idle, focused draft, correction, or a
+        reintegration form commit — carries an immutable revision recorded at
+        ACTION time; there is no 'journal beats form' rule (§12.4).  A still
+        uncommitted focused draft that differs from the committed state and is not
+        already journaled at its true value is recorded here with a fresh revision
+        so it participates by revision (never rank-below-journal).  A form-harvest
+        failure is a typed refusal, not fail-open (§12.4 test 9).
         """
-        merged: dict = {}
-        order: list = []
-        for path, value in self._controls_v2_journal_winners():
-            path = tuple(path)
-            merged[path] = value
-            order.append(path)
+        journal = self._controls_v2_edit_journal_dict()
         panel = getattr(self, "controls_v2", None)
         get_edits = getattr(panel, "current_form_edits", None)
         if callable(get_edits):
             try:
                 form_edits = get_edits()
-            except Exception:
-                logger.debug("Controls Panel V2 form-edit harvest failed",
-                             exc_info=True)
-                form_edits = ()
+            except Exception as exc:
+                raise ControlsTransactionError(
+                    None, "form edit harvest failed", None) from exc
+            committed = self._controls_v2_field_values()
             for edit in form_edits:
                 path = tuple(edit.path)
-                if path in merged:
-                    continue  # journaled (committed) edit wins over stale form
-                merged[path] = edit.value
-                order.append(path)
-        return [(path, merged[path]) for path in order]
+                if not self._controls_v2_form_value_differs(
+                        path, edit.value, committed.get(path)):
+                    continue
+                existing = journal.get(path)
+                if existing is not None and existing.get("value") == edit.value:
+                    continue  # already journaled at action time (draft/idle)
+                self._controls_v2_record_edit(path, edit.value, origin="form")
+        return self._controls_v2_journal_winners()
+
+    def _controls_v2_source_token(self):
+        """A hashable identity of the CURRENTLY-configured source selection.
+
+        Excludes the directory request-generation so re-selecting the same
+        directory keeps its motor observation; different sources (roots/kinds)
+        produce different tokens (§12.5)."""
+        try:
+            spec = self._controls_v2_freeze_source_spec()
+        except Exception:
+            return None
+        if spec is None:
+            return None
+        from xrd_tools.sources.selection import DirectorySourceSpec
+        if isinstance(spec, DirectorySourceSpec):
+            return (
+                "directory",
+                str(spec.root),
+                bool(spec.recursive),
+                spec.name_filter,
+                tuple(str(s) for s in spec.suffixes),
+            )
+        kind = getattr(spec, "kind", "")
+        return (
+            "source",
+            str(getattr(spec, "uri", "")),
+            str(getattr(kind, "value", kind)),
+        )
+
+    def _controls_v2_record_gi_motor_observation(
+            self, motors, for_token=_UNSET) -> None:
+        """Store the GI motor observation for the CURRENT source (§12.5).
+
+        Called from the targeted-metadata hydration handler, so a motor list is
+        trusted only when it is tied to the source it was observed from.  When the
+        caller knows which source the motors came from it passes ``for_token``; a
+        delayed result whose ``for_token`` no longer matches the current source is
+        IGNORED (a stale A signal cannot seed B's freeze).  A later source edit
+        also changes the token, so the CAPTURE side never returns a previous
+        source's motors regardless."""
+        token = self._controls_v2_source_token()
+        if for_token is not _UNSET and for_token != token:
+            return
+        real = [
+            str(m) for m in (motors or [])
+            if str(m) and str(m) != "Manual"
+            and not any(x in str(m).lower() for x in ("roi", "pd"))
+        ]
+        state = (
+            GIMotorObservation.KNOWN_NONEMPTY if real
+            else GIMotorObservation.KNOWN_EMPTY)
+        self._controls_v2_gi_motor_observation = GIMotorObservation(
+            state, real, token)
+
+    def _controls_v2_capture_gi_motor_observation(self):
+        """Return the motor observation for the CURRENT source, or UNKNOWN.
+
+        A stored observation is trusted only when its source token still matches
+        the current selection; otherwise the choices are UNKNOWN (freeze then
+        preserves the operator's explicit motor rather than degrading it —
+        §12.5), until targeted hydration records an observation for this source."""
+        token = self._controls_v2_source_token()
+        stored = getattr(self, "_controls_v2_gi_motor_observation", None)
+        if isinstance(stored, GIMotorObservation) and stored.matches(token):
+            return stored
+        return GIMotorObservation(GIMotorObservation.UNKNOWN, (), token)
 
     def _controls_v2_gi_motor_choices_for_freeze(self):
-        """Real source motor choices for the GI freeze, or ``None`` when unknown.
+        """GI motor choices for the freeze, source-qualified (§12.5).
 
-        The ()-vs-None escape (T-1): pass ``None`` — not ``()`` — when the GI
-        θ-motor dropdown is not populated from a source, so ``resolve_gi_motor``
-        HONORS the operator's explicit selection instead of degrading it to
-        Manual (which would diverge from the display policy).  ``()`` is reserved
-        for a genuinely probed, empty motor list; the dropdown cannot distinguish
-        that from 'not yet probed', so it always passes the real tuple or None.
-        """
-        choices = self._controls_v2_native_int_choices().get(("GI", "th_motor"))
-        if not choices:
-            return None
-        real = tuple(str(c) for c in choices if str(c) and str(c) != "Manual")
-        return real or None
+        Maps the current source's motor observation to the ``resolve_gi_motor``
+        contract: ``UNKNOWN -> None`` (preserve the explicit motor),
+        ``KNOWN_EMPTY -> ()`` (resolve to Manual), ``KNOWN_NONEMPTY ->
+        tuple(motors)``.  Choices are never derived from the persistent combo, so
+        a source A→B edit cannot freeze B with A's motor."""
+        return self._controls_v2_capture_gi_motor_observation().choices_for_freeze()
 
     # ------------------------------------------------------------------
     # Pure stage (§9.10 step 3-stage) — validate every edit against a CLONE.
     # ------------------------------------------------------------------
 
-    def stage_controls_transaction(self, edits):
-        """Validate *edits* against a CLONE of the Controls intent — PURE.
+    # ------------------------------------------------------------------
+    # Pure candidate reducer (§12.2/§12.3) — NO self-install, NO production
+    # setters.  Every reducer reads and writes ONLY the ControlsStageCandidate.
+    # ------------------------------------------------------------------
 
-        Native/int/GI/threshold edits mutate ``staged_intent`` (a deep clone of
-        the live intent); legacy-backed edits are coerced into a candidate
-        projection WITHOUT ``Parameter.setValue``.  NO production carrier — Qt
-        param, display scan, integrator combo, advanced param, source index,
-        session, wrangler, or profile — is written while staging.  Invalid
-        numeric input for a legacy field is a typed
-        :class:`ControlsTransactionError`, not a silently-coerced 'landed' value.
-        Returns the failure OR a :class:`StagedControlsTransaction`.
+    @staticmethod
+    def _controls_v2_is_finite(value) -> bool:
+        return value == value and value not in (float("inf"), float("-inf"))
+
+    def _controls_v2_reduce_int(self, value, *, minimum=None) -> int:
+        """Strict int coercion for the pure reducer — RAISES on invalid input
+        (unlike the permissive live _controls_v2_int which clamps to a default)."""
+        try:
+            out = int(float(value))
+        except (TypeError, ValueError):
+            raise ValueError(f"expected an integer, got {value!r}")
+        if minimum is not None and out < int(minimum):
+            raise ValueError(f"value {out} below minimum {minimum}")
+        return out
+
+    def _controls_v2_reduce_float(self, value) -> float:
+        """Strict finite-float coercion for the pure reducer — RAISES on
+        invalid or non-finite input."""
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"expected a number, got {value!r}")
+        if not self._controls_v2_is_finite(out):
+            raise ValueError("value must be finite")
+        return out
+
+    def _controls_v2_candidate_default_range(self, cand, root, axis):
+        a1, a2 = cand.bai
+        gi = cand.gi_enabled
+        if root == "Int1D":
+            if gi:
+                mode = a1.get("gi_mode_1d", "q_total")
+                if axis == "radial":
+                    return (-5.0, 5.0) if mode == "exit_angle" else (
+                        (-10.0, 10.0) if mode in {"q_ip", "q_oop"} else (0.0, 5.0))
+                if mode in {"q_ip", "q_oop"}:
+                    return (0.0, 5.0)
+                if mode == "exit_angle":
+                    return (0.0, 90.0)
+                return (-180.0, 180.0)
+            if axis == "radial":
+                return (0.0, 90.0) if a1.get("unit") == "2th_deg" else (0.0, 5.0)
+            return (-180.0, 180.0)
+        if gi:
+            mode = a2.get("gi_mode_2d", "qip_qoop")
+            if axis == "radial":
+                return (-5.0, 5.0) if mode == "exit_angles" else (
+                    (-10.0, 10.0) if mode == "qip_qoop" else (0.0, 5.0))
+            if mode == "qip_qoop":
+                return (0.0, 5.0)
+            if mode == "exit_angles":
+                return (0.0, 90.0)
+            return (-180.0, 180.0)
+        if axis == "radial":
+            return (0.0, 90.0) if a2.get("unit") == "2th_deg" else (0.0, 5.0)
+        return (-180.0, 180.0)
+
+    def _controls_v2_candidate_range_value(self, cand, root, axis):
+        a1, a2 = cand.bai
+        args = a1 if root == "Int1D" else a2
+        key = "radial_range" if axis == "radial" else "azimuth_range"
+        value = args.get(key)
+        return value if value is not None else (
+            self._controls_v2_candidate_default_range(cand, root, axis))
+
+    def _controls_v2_candidate_npts_oop_visible(self, cand) -> bool:
+        if not cand.gi_enabled:
+            return False
+        a1, _ = cand.bai
+        return (
+            a1.get("gi_mode_1d", "q_total") != "q_total"
+            or a1.get("azimuth_range") is not None)
+
+    def _controls_v2_reduce_axis(self, cand, root, value) -> None:
+        a1, a2 = cand.bai
+        text = str(value or "")
+        if cand.gi_enabled:
+            if root == "Int1D":
+                old_mode = a1.get("gi_mode_1d")
+                try:
+                    a1["gi_mode_1d"] = GI_MODES_1D[GI_LABELS_1D.index(text)]
+                except ValueError:
+                    a1["gi_mode_1d"] = "q_total"
+                if a1["gi_mode_1d"] != old_mode:
+                    _drop_output_axis_ranges(a1)
+                if self._controls_v2_candidate_npts_oop_visible(cand):
+                    a1.setdefault("npt_oop", int(a1.get("numpoints", 3000)))
+            else:
+                old_mode = a2.get("gi_mode_2d")
+                try:
+                    a2["gi_mode_2d"] = GI_MODES_2D[GI_LABELS_2D.index(text)]
+                except ValueError:
+                    a2["gi_mode_2d"] = "qip_qoop"
+                if a2["gi_mode_2d"] != old_mode:
+                    _drop_output_axis_ranges(a2)
+            a1["unit"] = "q_A^-1"
+            a2["unit"] = "q_A^-1"
+            # The candidate intent carries gi_mode_* on both the bai args (the
+            # authoritative reduction key) and the GI sub-intent; keep them in
+            # sync WITHOUT touching any display scan (§12.2 test 6).
+            cand.intent.gi.mode_1d = str(a1.get("gi_mode_1d", "q_total"))
+            cand.intent.gi.mode_2d = str(a2.get("gi_mode_2d", "qip_qoop"))
+            return
+        if root == "Int1D":
+            old_unit = a1.get("unit")
+            a1["unit"] = self._controls_v2_unit_code(text, dim="1d")
+            if a1["unit"] != old_unit:
+                a1.pop("radial_range", None)
+        else:
+            old_unit = a2.get("unit")
+            a2["unit"] = "2th_deg" if text.startswith("2") else "q_A^-1"
+            if a2["unit"] != old_unit:
+                a2.pop("radial_range", None)
+
+    def _controls_v2_reduce_range_auto(self, cand, root, axis, auto) -> None:
+        a1, a2 = cand.bai
+        args = a1 if root == "Int1D" else a2
+        key = "radial_range" if axis == "radial" else "azimuth_range"
+        value = None if auto else self._controls_v2_candidate_range_value(
+            cand, root, axis)
+        args[key] = value
+        if root == "Int2D" and cand.gi_enabled:
+            alt = "x_range" if axis == "radial" else "y_range"
+            if value is None:
+                args.pop(alt, None)
+            else:
+                args[alt] = value
+        if root == "Int1D" and axis == "azimuth" and (
+                self._controls_v2_candidate_npts_oop_visible(cand)):
+            args.setdefault("npt_oop", int(args.get("numpoints", 3000)))
+
+    def _controls_v2_reduce_range_bound(self, cand, root, axis, bound, value) -> None:
+        a1, a2 = cand.bai
+        args = a1 if root == "Int1D" else a2
+        key = "radial_range" if axis == "radial" else "azimuth_range"
+        low, high = self._controls_v2_candidate_range_value(cand, root, axis)
+        number = self._controls_v2_reduce_float(value)
+        if bound == "low":
+            low = number
+        else:
+            high = number
+        args[key] = (float(low), float(high))
+        if root == "Int2D" and cand.gi_enabled:
+            args["x_range" if axis == "radial" else "y_range"] = args[key]
+        if root == "Int1D" and axis == "azimuth" and (
+                self._controls_v2_candidate_npts_oop_visible(cand)):
+            args.setdefault("npt_oop", int(args.get("numpoints", 3000)))
+
+    def _controls_v2_reduce_gi_field(self, cand, leaf, value) -> None:
+        from .gi_motor_defaults import pick_default_gi_motor
+        a1, a2 = cand.bai
+        gi_intent = cand.intent.gi
+        obs = cand.gi_motor_observation
+        real_choices = list(obs.motors) if obs is not None else []
+        gi = bool(gi_intent.enabled)
+        motor = str(gi_intent.incidence_motor or "Manual")
+        th_val = float(gi_intent.th_val)
+        sample_orientation = int(gi_intent.sample_orientation)
+        tilt_angle = float(gi_intent.tilt_angle)
+        mode_1d = str(gi_intent.mode_1d or a1.get("gi_mode_1d", "q_total"))
+        mode_2d = str(gi_intent.mode_2d or a2.get("gi_mode_2d", "qip_qoop"))
+        if leaf == "Grazing":
+            gi = self._controls_v2_bool(value)
+            # Enabling GI with a leftover Manual and no explicit pick adopts the
+            # source's default motor (from the source-qualified observation, NOT
+            # the persistent combo — §12.5).
+            if gi and motor == "Manual" and not cand.gi_selection_explicit:
+                picked = pick_default_gi_motor(real_choices)
+                if picked != "Manual":
+                    motor = picked
+        elif leaf == "th_motor":
+            motor = str(value)
+            cand.gi_selection_explicit = True
+        elif leaf == "th_val":
+            th_val = self._controls_v2_reduce_float(value)
+        elif leaf == "sample_orientation":
+            sample_orientation = self._controls_v2_reduce_int(value)
+        elif leaf == "tilt_angle":
+            tilt_angle = self._controls_v2_reduce_float(value)
+        cand.intent.gi = GIIntent(
+            enabled=bool(gi),
+            incidence_motor=str(motor or "Manual"),
+            th_val=float(th_val),
+            sample_orientation=int(sample_orientation),
+            tilt_angle=float(tilt_angle),
+            mode_1d=mode_1d,
+            mode_2d=mode_2d,
+        )
+        if cand.intent.gi.enabled:
+            a1.setdefault("gi_mode_1d", "q_total")
+            a2.setdefault("gi_mode_2d", "qip_qoop")
+            a1["unit"] = "q_A^-1"
+            a2["unit"] = "q_A^-1"
+
+    def _controls_v2_reduce_threshold_field(self, cand, path, value) -> None:
+        state = dict(cand.threshold_state or {})
+        state.setdefault("apply_threshold", False)
+        state.setdefault("threshold_min", 0.0)
+        state.setdefault("threshold_max", 0.0)
+        state.setdefault("mask_saturation", True)
+        if path == ("Mask", "Threshold"):
+            state["apply_threshold"] = self._controls_v2_bool(value)
+        elif path == ("Mask", "min"):
+            state["threshold_min"] = self._controls_v2_reduce_float(value)
+        elif path == ("Mask", "max"):
+            state["threshold_max"] = self._controls_v2_reduce_float(value)
+        elif path == ("MaskSat", "mask_sentinel"):
+            state["mask_saturation"] = self._controls_v2_bool(value)
+        if path in {("Mask", "min"), ("Mask", "max")} and (
+                state["threshold_min"] != 0.0 or state["threshold_max"] != 0.0):
+            state["apply_threshold"] = True
+        cand.threshold_state = state
+        cand.intent.threshold = ThresholdIntent.from_mapping(state)
+
+    def _controls_v2_reduce_int_field(self, cand, path, value) -> None:
+        root = path[0]
+        leaf = path[1] if len(path) > 1 else ""
+        if root == "GI":
+            self._controls_v2_reduce_gi_field(cand, leaf, value)
+            return
+        if root in {"Mask", "MaskSat"}:
+            self._controls_v2_reduce_threshold_field(cand, path, value)
+            return
+        if root not in {"Int1D", "Int2D"}:
+            return
+        a1, a2 = cand.bai
+        args = a1 if root == "Int1D" else a2
+        if leaf == "unit":
+            args["unit"] = self._controls_v2_unit_code(
+                value, dim="1d" if root == "Int1D" else "2d")
+        elif leaf == "axis":
+            self._controls_v2_reduce_axis(cand, root, value)
+        elif leaf == "points":
+            args["numpoints"] = self._controls_v2_reduce_int(value, minimum=1)
+            if self._controls_v2_candidate_npts_oop_visible(cand):
+                args.setdefault("npt_oop", args["numpoints"])
+        elif leaf == "points_oop":
+            args["npt_oop"] = self._controls_v2_reduce_int(value, minimum=1)
+        elif leaf == "radial_points":
+            args["npt_rad"] = self._controls_v2_reduce_int(value, minimum=1)
+        elif leaf == "azim_points":
+            args["npt_azim"] = self._controls_v2_reduce_int(value, minimum=1)
+        elif leaf == "radial_auto":
+            self._controls_v2_reduce_range_auto(
+                cand, root, "radial", self._controls_v2_bool(value))
+        elif leaf == "azim_auto":
+            self._controls_v2_reduce_range_auto(
+                cand, root, "azimuth", self._controls_v2_bool(value))
+        elif leaf == "radial_low":
+            self._controls_v2_reduce_range_bound(cand, root, "radial", "low", value)
+        elif leaf == "radial_high":
+            self._controls_v2_reduce_range_bound(cand, root, "radial", "high", value)
+        elif leaf == "azim_low":
+            self._controls_v2_reduce_range_bound(cand, root, "azimuth", "low", value)
+        elif leaf == "azim_high":
+            self._controls_v2_reduce_range_bound(cand, root, "azimuth", "high", value)
+        elif leaf == "apply_polarization":
+            if self._controls_v2_bool(value):
+                current = args.get("polarization_factor")
+                args["polarization_factor"] = (
+                    DEFAULT_POLARIZATION_FACTOR if current is None
+                    else self._controls_v2_reduce_float(current))
+            else:
+                args["polarization_factor"] = None
+        elif leaf == "polarization_factor":
+            args["polarization_factor"] = self._controls_v2_reduce_float(value)
+        elif leaf in {"correctSolidAngle", "safe"}:
+            args[leaf] = self._controls_v2_bool(value)
+        elif leaf in {"dummy", "delta_dummy", "chi_offset"}:
+            args[leaf] = self._controls_v2_reduce_float(value)
+        elif leaf == "method":
+            args["method"] = str(value)
+
+    def _controls_v2_reduce_edit(self, cand, path, value) -> None:
+        """Reduce ONE edit onto the candidate.  Raises ``ControlsTransactionError``
+        for an unsupported path or invalid coercion (§12.3)."""
+        path = tuple(path)
+        if path and path[0] in {"Signal", "Source"}:
+            cand.source_touched = True
+        if path in NATIVE_CONTROL_PATHS:
+            if path == ("Source", "energy_preference"):
+                text = str(value or "").strip().lower()
+                aliases = {
+                    "poni": "poni", "poni file": "poni",
+                    "metadata": "metadata", "meta": "metadata",
+                }
+                cand.source_energy_preference = aliases.get(text, "poni")
+            return
+        if path in INTEGRATOR_BACKED_CONTROL_PATHS:
+            try:
+                self._controls_v2_reduce_int_field(cand, path, value)
+            except ControlsTransactionError:
+                raise
+            except Exception as exc:
+                err = ControlsTransactionError(
+                    path, "invalid value for this field", value)
+                err.__cause__ = exc
+                raise err
+            return
+        # Legacy-backed field: coerce WITHOUT setValue.  An unsupported path (no
+        # backing param) is a typed refusal, not a silent skip (§12.3).
+        param = self._controls_v2_param(path)
+        if param is None:
+            raise ControlsTransactionError(path, "unsupported control path", value)
+        try:
+            coerced = coerce_control_edit_value(param.value(), value)
+        except Exception as exc:
+            err = ControlsTransactionError(
+                path, "value cannot be coerced to the field type", value)
+            err.__cause__ = exc
+            raise err
+        cand.legacy_projection[path] = coerced
+
+    def _controls_v2_validate_candidate(self, cand) -> None:
+        """Validate the COMPLETE candidate before returning it (§12.3): finite
+        numerics, sample-orientation range, threshold min<=max, and every
+        cross-field invariant the frozen dataclasses enforce — raising a typed
+        :class:`ControlsTransactionError` on the CLONE, before any install and
+        before freeze.  Freeze is NOT a substitute for transaction validation."""
+        try:
+            # Freezing the CLONE runs the GI/threshold/output __post_init__
+            # validators (sample_orientation 1-8, finite th_val/tilt/threshold,
+            # threshold_min<=max, output_mode) against candidate data only.
+            cand.intent.freeze(
+                gi_motor_choices=(
+                    cand.gi_motor_observation.choices_for_freeze()
+                    if cand.gi_motor_observation is not None else None))
+        except ControlsTransactionError:
+            raise
+        except Exception as exc:
+            raise ControlsTransactionError(
+                None, f"invalid run configuration: {exc}", None) from exc
+
+    def stage_controls_transaction(self, edits):
+        """Reduce *edits* onto a PURE candidate — no ``self`` state, no scan, no
+        Qt param, no wrangler/thread is touched (§12.2).  The complete candidate
+        is validated (§12.3) before a :class:`StagedControlsTransaction` is
+        returned; any unsupported path, invalid coercion, non-finite number, or
+        cross-field contradiction (e.g. threshold min>max) is a typed
+        :class:`ControlsTransactionError` returned with the offending path and
+        the original exception as its cause.  On refusal the live production
+        state and the winning journal are unchanged.
         """
         live_intent = self._controls_v2_ensure_run_intent()
-        staged_intent = copy.deepcopy(live_intent)
-        saved_intent = self._controls_v2_run_intent
         saved_threshold = getattr(self, "_controls_v2_threshold_state", None)
-        saved_explicit = bool(
-            getattr(self, "_controls_v2_gi_selection_explicit", False))
-        saved_staging = getattr(self, "_controls_v2_staging", False)
-        legacy_projection: dict = {}
-        source_touched = False
-        error = None
-        # Redirect the Controls-owned intent/threshold state to the clone and
-        # suppress every display/Qt side effect for the duration (the native
-        # setters mutate ONLY the clone; the staging flag no-ops the projections).
-        self._controls_v2_run_intent = staged_intent
-        self._controls_v2_threshold_state = (
-            copy.deepcopy(saved_threshold)
-            if isinstance(saved_threshold, dict) else None)
-        self._controls_v2_staging = True
+        cand = ControlsStageCandidate(
+            intent=copy.deepcopy(live_intent),
+            threshold_state=(
+                copy.deepcopy(saved_threshold)
+                if isinstance(saved_threshold, dict) else None),
+            gi_selection_explicit=bool(
+                getattr(self, "_controls_v2_gi_selection_explicit", False)),
+            source_energy_preference=getattr(
+                self, "_controls_v2_source_energy_preference", "poni"),
+            gi_motor_observation=self._controls_v2_capture_gi_motor_observation(),
+        )
         try:
             for path, value in edits:
-                path = tuple(path)
-                if path and path[0] in {"Signal", "Source"}:
-                    source_touched = True
-                if path in NATIVE_CONTROL_PATHS:
-                    self._set_controls_v2_native_source_field(path, value)
-                    continue
-                if path in INTEGRATOR_BACKED_CONTROL_PATHS:
-                    self._set_controls_v2_native_int_field(path, value)
-                    continue
-                param = self._controls_v2_param(path)
-                if param is None:
-                    # Unsupported path — matches _apply_controls_v2_field_value
-                    # (returns False); nothing to project.
-                    continue
-                try:
-                    coerced = coerce_control_edit_value(param.value(), value)
-                except Exception as exc:
-                    error = ControlsTransactionError(
-                        path, "value cannot be coerced to the field type", value)
-                    error.__cause__ = exc
-                    break
-                legacy_projection[path] = coerced
-        finally:
-            staged_threshold = getattr(
-                self, "_controls_v2_threshold_state", None)
-            staged_explicit = bool(
-                getattr(self, "_controls_v2_gi_selection_explicit", False))
-            # Restore the live Controls state — staging leaves NO trace.
-            self._controls_v2_run_intent = saved_intent
-            self._controls_v2_threshold_state = saved_threshold
-            self._controls_v2_gi_selection_explicit = saved_explicit
-            self._controls_v2_staging = saved_staging
-        if error is not None:
-            return error
+                self._controls_v2_reduce_edit(cand, path, value)
+            self._controls_v2_validate_candidate(cand)
+        except ControlsTransactionError as err:
+            return err
         return StagedControlsTransaction(
-            staged_intent=staged_intent,
-            legacy_projection=legacy_projection,
+            staged_intent=cand.intent,
+            legacy_projection=cand.legacy_projection,
             threshold_state=(
-                copy.deepcopy(staged_threshold)
-                if isinstance(staged_threshold, dict) else None),
-            gi_selection_explicit=staged_explicit,
-            source_touched=source_touched,
+                copy.deepcopy(cand.threshold_state)
+                if isinstance(cand.threshold_state, dict) else None),
+            gi_selection_explicit=cand.gi_selection_explicit,
+            source_touched=cand.source_touched,
+            source_energy_preference=cand.source_energy_preference,
+            gi_motor_observation=cand.gi_motor_observation,
         )
 
     # ------------------------------------------------------------------
@@ -3058,6 +3541,10 @@ class staticWidget(QWidget):
         self._controls_v2_gi_selection_explicit = staged.gi_selection_explicit
         if staged.threshold_state is not None:
             self._controls_v2_threshold_state = staged.threshold_state
+        # The staged candidate carries the source-energy preference (staging is
+        # pure and never mutates the live one — §12.2 / C1); install it here.
+        self._controls_v2_source_energy_preference = (
+            staged.source_energy_preference)
         # Compatibility projection onto the display scan (the intent stays the
         # single writer of run configuration).
         self._controls_v2_apply_snapshot_to_scan(
@@ -3076,13 +3563,15 @@ class staticWidget(QWidget):
         operator is told the change is QUEUED and applies to the next run.
         """
         path = tuple(path)
-        self._controls_v2_record_edit(path, value, origin="deferred")
+        revision = self._controls_v2_record_edit(path, value, origin="deferred")
         try:
             self.wrangler.showLabel.emit(
                 "Change queued — it applies to the next run.")
         except Exception:
             logger.debug("could not surface deferred-edit notice",
                          exc_info=True)
+        # §12.4 / C3: include the path, revision, AND origin so ordering failures
+        # are diagnosable.
         run_config_debug_log(
             logger,
             "controls_field_deferred_active_run",
@@ -3090,6 +3579,8 @@ class staticWidget(QWidget):
             origin="controls_v2_ui",
             field_path=list(path),
             field_value=value,
+            revision=revision,
+            edit_origin="deferred",
             deferred_pending=len(self._controls_v2_deferred_field_edits),
         )
 
@@ -3105,7 +3596,22 @@ class staticWidget(QWidget):
         journal.  No timer, no post-finalization owner, no carrier write between
         run-end and Start.
         """
-        edits = self._controls_v2_collect_pending_edits()
+        try:
+            edits = self._controls_v2_collect_pending_edits()
+        except ControlsTransactionError as harvest_err:
+            # §12.4 test 9: a form/draft collection failure REFUSES preparation,
+            # it does not continue fail-open.
+            run_config_debug_log(
+                logger,
+                "controls_deferred_fold_invalid",
+                widget=self,
+                origin="controls_v2_prepare_fold",
+                failed_path=list(harvest_err.path or ()),
+                reason=harvest_err.reason,
+                deferred_pending=len(self._controls_v2_journal_winners()),
+                level="warning",
+            )
+            return tuple(harvest_err.path or ("Controls",))
         if not edits:
             return None
         staged = self.stage_controls_transaction(edits)
@@ -3155,7 +3661,7 @@ class staticWidget(QWidget):
             return
         # Idle edit: record in the journal (so it supersedes any older deferred
         # value for this path by revision) AND apply live for immediate UX.
-        self._controls_v2_record_edit(path, value, origin="idle")
+        _idle_rev = self._controls_v2_record_edit(path, value, origin="idle")
         if path and path[0] in {"Signal", "Source"}:
             self._controls_v2_source_energy_cache = None
             self._controls_v2_metadata_probe_cache = None
@@ -3168,9 +3674,33 @@ class staticWidget(QWidget):
             origin="controls_v2_ui",
             field_path=path,
             field_value=value,
+            revision=_idle_rev,
+            edit_origin="idle",
         )
         self._sync_controls_v2_source_index()
         self._refresh_controls_v2_profile(immediate=True)
+
+    def _on_controls_v2_field_draft_changed(self, path, value) -> None:
+        """A focused, still-uncommitted form DRAFT changed (§12.4).
+
+        The draft receives its own revision at the time the user types it (so a
+        newer draft supersedes an older deferred/idle value by revision, and the
+        draft survives a panel rebuild/refresh because it lives in the journal),
+        but it is NOT applied to a carrier until it commits through
+        :meth:`_on_controls_v2_field_changed`.  Programmatic ``setText``/
+        projection must NOT reach this slot."""
+        path = tuple(path)
+        revision = self._controls_v2_record_edit(path, value, origin="draft")
+        run_config_debug_log(
+            logger,
+            "controls_field_draft",
+            widget=self,
+            origin="controls_v2_ui",
+            field_path=list(path),
+            field_value=value,
+            revision=revision,
+            edit_origin="draft",
+        )
 
     def _on_controls_v2_source_tree_changed(self, _param, changes) -> None:
         if self._controls_v2_run_active():
@@ -3794,7 +4324,13 @@ class staticWidget(QWidget):
 
     def _on_gi_motor_options_changed(self, _motors=None) -> None:
         """The wrangler emitted a fresh GI motor-column list (metadata loaded);
-        re-render so the inline V2 GI motor combo shows the updated choices."""
+        record the source-qualified observation (§12.5) so the freeze resolves the
+        effective motor from THIS source's motors, and re-render so the inline V2
+        GI motor combo shows the updated choices."""
+        motors = _motors
+        if not isinstance(motors, (list, tuple)):
+            motors = getattr(getattr(self, "wrangler", None), "motors", None)
+        self._controls_v2_record_gi_motor_observation(motors or [])
         self._refresh_controls_v2_profile(immediate=True)
 
     def _controls_v2_state(self) -> ControlState:
