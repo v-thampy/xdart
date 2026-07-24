@@ -5260,189 +5260,109 @@ def test_gi_mirror_no_reentry_no_intent_write(qapp, monkeypatch):
         widget.deleteLater()
 
 
-_FINISH_OWNERS = (
-    ("wrangler", lambda w: w.wrangler.finished),
-    ("integrator", lambda w: w.integratorTree.integrator_thread.finished),
-    ("stitch", lambda w: w.stitch_thread.finished),
-)
-
-
-@pytest.mark.parametrize("owner_name,finished", _FINISH_OWNERS,
-                         ids=[o[0] for o in _FINISH_OWNERS])
-def test_deferred_edits_apply_via_production_finish_tail(
-        qapp, monkeypatch, owner_name, finished):
-    """R4B-12 §7.4 (O-1a-i.2): a run-active edit is QUEUED (not "saved") and is
-    applied by the post-finalization owner scheduled from the OUTERMOST finally
-    of the real finish handler — driven here through the production signal→slot
-    (wrangler/reintegrate/stitch finished).  The owner runs strictly AFTER the
-    synchronous finish tail: the edit is NOT applied when the slot returns, only
-    after the event loop ticks."""
+def test_no_carrier_mutation_between_run_end_and_start(qapp, monkeypatch):
+    """R4B-12 [b] (O-1a-i.3): with the timer/owner machinery deleted, NO carrier
+    mutates between run-end and the next Start — deferred edits are a pure data
+    delta until the fold inside preparation.  Red at d13dc545: the finish-handler
+    singleShot owner applied edits at run-end (the property that kills the whole
+    trial-write/timer class)."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
     widget = staticWidget()
     try:
-        notices = []
-        widget.wrangler.showLabel.connect(lambda m: notices.append(str(m)))
-        tail = []
-        finished(widget).connect(lambda *a: tail.append(owner_name))
-
-        assert widget._controls_v2_ensure_run_intent().gi.enabled is False
-        widget._enter_run_state()
-        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
-        assert widget._controls_v2_ensure_run_intent().gi.enabled is False
-        assert notices and "queued" in notices[-1].lower()
-        assert "saved" not in notices[-1].lower()
-
-        # Drive the PRODUCTION finish signal→slot; the synchronous tail runs now.
-        finished(widget).emit()
-        assert tail == [owner_name], "production finish slot did not run"
-        # The owner is scheduled, not yet run: nothing applied during the tail.
-        assert widget._controls_v2_ensure_run_intent().gi.enabled is False, (
-            "deferred edit applied inside the synchronous finish tail")
-
-        qapp.processEvents()  # release the scheduled owner
-        assert widget._controls_v2_ensure_run_intent().gi.enabled is True
-        assert list(widget._controls_v2_deferred_field_edits) == []
-    finally:
-        widget.close()
-        widget.deleteLater()
-
-
-def test_deferred_legacy_field_lands_via_signal_blocked_mirror(
-        qapp, monkeypatch):
-    """R4B-12 (O-1a-i.2): a legacy-backed field deferred during a run lands at
-    post-finalization through the signal-blocked mirror ONLY — never firing the
-    wrangler ROOT tree signal (imageWrangler.setup() / legacy session write),
-    driven through the production wrangler-finished slot."""
-    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
-    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
-
-    widget = staticWidget()
-    try:
-        params = widget.wrangler.parameters
-        mask_param = params.child("Signal", "mask_file")
-        target = "/tmp/deferred_mask.edf"
-        assert mask_param.value() != target
-
-        widget._enter_run_state()
-        widget._on_controls_v2_field_changed(("Signal", "mask_file"), target)
-        assert mask_param.value() != target  # not applied while the run is live
-
-        root_fires = []
-        params.sigTreeStateChanged.connect(lambda *a: root_fires.append(1))
-
-        widget.wrangler.finished.emit()
-        assert mask_param.value() != target  # not during the finish tail either
-        qapp.processEvents()
-
-        assert mask_param.value() == target  # landed at post-finalization
-        assert root_fires == [], (
-            "legacy deferred field fired the wrangler root signal "
-            "(setup()/session write)")
-        assert list(widget._controls_v2_deferred_field_edits) == []
-    finally:
-        widget.close()
-        widget.deleteLater()
-
-
-def test_deferred_multi_field_atomic_success_and_freezes_once(qapp, monkeypatch):
-    """R4B-12 (O-1a-i.2): two fields deferred during a run (native GI + legacy
-    mask) both become next-run state TOGETHER at post-finalization, and a
-    subsequent Run freezes the final values exactly once."""
-    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
-    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
-
-    widget = staticWidget()
-    try:
-        params = widget.wrangler.parameters
-        mask_param = params.child("Signal", "mask_file")
-        target = "/tmp/multi_mask.edf"
-
-        widget._enter_run_state()
-        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
-        widget._on_controls_v2_field_changed(("Signal", "mask_file"), target)
-        assert widget._controls_v2_ensure_run_intent().gi.enabled is False
-        assert mask_param.value() != target
-        widget.wrangler.finished.emit()
-        assert widget._controls_v2_ensure_run_intent().gi.enabled is False
-        assert mask_param.value() != target
-
-        qapp.processEvents()
-        assert widget._controls_v2_ensure_run_intent().gi.enabled is True
-        assert mask_param.value() == target
-        assert list(widget._controls_v2_deferred_field_edits) == []
-
-        # A subsequent Run freezes the final next-run values ONCE.
-        intent = widget._controls_v2_ensure_run_intent()
-        gen_before = intent.generation
-        frozen = widget._prepare_controls_v2_run_configuration()
-        assert frozen is not None
-        assert frozen.gi.enabled is True
-        assert intent.generation == gen_before + 1
-    finally:
-        widget.close()
-        widget.deleteLater()
-
-
-def test_deferred_replay_partial_failure_is_atomic(qapp, monkeypatch, caplog):
-    """R4B-12 [P1] (O-1a-i.2): a failed multi-field replay is a TRANSACTION — if
-    field B (legacy) cannot land, field A (native GI) is NOT applied either, the
-    WHOLE delta is retained, one controls_field_replay_failed event fires, and a
-    visible error is raised.  Red at 6c3f58f0: A was committed before B failed
-    (half-applied delta)."""
-    import logging
-
-    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
-    monkeypatch.setenv("XDART_RUN_CONFIG_DEBUG", "1")
-    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
-
-    widget = staticWidget()
-    try:
-        notices = []
-        widget.wrangler.showLabel.connect(lambda m: notices.append(str(m)))
         params = widget.wrangler.parameters
         mask_param = params.child("Signal", "mask_file")
         mask_before = mask_param.value()
 
         widget._enter_run_state()
-        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)    # A native
-        widget._on_controls_v2_field_changed(
-            ("Signal", "mask_file"), "/tmp/fail_mask.edf")               # B legacy
-        # Inject a REAL legacy-apply failure: setValue becomes a silent no-op so
-        # the value cannot land and validation must detect it BEFORE committing A.
-        monkeypatch.setattr(mask_param, "setValue", lambda *a, **k: None)
-
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        widget._on_controls_v2_field_changed(("Signal", "mask_file"), "/tmp/x.edf")
+        # End the run through the production finish slot, then pump the loop.
         widget.wrangler.finished.emit()
-        notices.clear()
-        with caplog.at_level(logging.INFO):
-            qapp.processEvents()
+        qapp.processEvents()
 
-        # ATOMIC: A (native GI) was NOT committed because B could not land.
-        assert widget._controls_v2_ensure_run_intent().gi.enabled is False, (
-            "field A committed while the transaction failed (half-applied)")
-        assert mask_param.value() == mask_before  # B unchanged
-        remaining = [
-            tuple(p) for p, _ in widget._controls_v2_deferred_field_edits]
-        assert ("GI", "Grazing") in remaining and (
-            "Signal", "mask_file") in remaining, remaining
-        assert any(
-            "pending" in n.lower() or "could not" in n.lower()
-            for n in notices), notices
-        assert caplog.text.count("controls_field_replay_failed") >= 1
-        assert "controls_field_replay_applied" not in caplog.text
+        # NOTHING applied between run-end and Start:
+        assert widget._controls_v2_ensure_run_intent().gi.enabled is False
+        assert mask_param.value() == mask_before
+        queued = [tuple(p) for p, _ in widget._controls_v2_deferred_field_edits]
+        assert ("GI", "Grazing") in queued and ("Signal", "mask_file") in queued
     finally:
         widget.close()
         widget.deleteLater()
 
 
-def test_run_preparation_refuses_freeze_while_deferred_edits_unresolved(
+def test_deferred_edits_fold_into_intent_and_carriers_at_next_start(
         qapp, monkeypatch):
-    """R4B-12 [P1-2] (O-1a-i.2): while a deferred edit cannot be applied, Run
-    preparation REFUSES to freeze — a typed, user-visible abort and NO
-    FrozenRunConfiguration.  Red at 6c3f58f0: _prepare ignored the replay result
-    and froze over the pending delta."""
+    """R4B-12 (O-1a-i.3): deferred edits (native GI + legacy mask) fold into the
+    intent + hidden carriers at the next Start's preparation, and the frozen
+    config reflects them.  'queued' notice, not 'saved'."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        notices = []
+        widget.wrangler.showLabel.connect(lambda m: notices.append(str(m)))
+        params = widget.wrangler.parameters
+        mask_param = params.child("Signal", "mask_file")
+        target = "/tmp/fold_mask.edf"
+
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        widget._on_controls_v2_field_changed(("Signal", "mask_file"), target)
+        assert notices and "queued" in notices[-1].lower()
+        assert "saved" not in notices[-1].lower()
+        widget.wrangler.finished.emit()
+        qapp.processEvents()
+        assert widget._controls_v2_ensure_run_intent().gi.enabled is False
+        assert mask_param.value() != target
+
+        frozen = widget._prepare_controls_v2_run_configuration()
+        assert frozen is not None
+        assert frozen.gi.enabled is True
+        assert mask_param.value() == target
+        assert list(widget._controls_v2_deferred_field_edits) == []
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_fast_start_folds_deferred_values_before_publish(qapp, monkeypatch):
+    """R4B-12 [a] (O-1a-i.3): defer edits during a run, Start immediately at run
+    end (no event tick), assert the new frozen config already contains the folded
+    values — the fold is synchronous inside preparation, so no window exists in
+    which a frozen config publishes while deferred edits are unresolved."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        widget._exit_run_state()  # run ends (fast Start: no event tick follows)
+
+        intent = widget._controls_v2_ensure_run_intent()
+        gen_before = intent.generation
+        frozen = widget._prepare_controls_v2_run_configuration()
+        assert frozen is not None
+        assert frozen.gi.enabled is True
+        assert list(widget._controls_v2_deferred_field_edits) == []
+        assert intent.generation == gen_before + 1  # frozen exactly once
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_invalid_fold_aborts_prep_nothing_frozen(qapp, monkeypatch, caplog):
+    """R4B-12 [c] (O-1a-i.3): a deferred legacy edit that cannot land aborts
+    preparation at the fold — typed visible error, structured event, NO frozen
+    config, full delta retained.  The i.3 fold has no separate validation/commit
+    phase, so the i.2 silent-loss class cannot recur."""
+    import logging
+
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    monkeypatch.setenv("XDART_RUN_CONFIG_DEBUG", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import (
         DeferredRunEditsPendingError,
         staticWidget,
@@ -5450,65 +5370,95 @@ def test_run_preparation_refuses_freeze_while_deferred_edits_unresolved(
 
     widget = staticWidget()
     try:
+        widget._pending_controls_v2_run_configuration = None
         params = widget.wrangler.parameters
         mask_param = params.child("Signal", "mask_file")
 
         widget._enter_run_state()
         widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
-        widget._on_controls_v2_field_changed(
-            ("Signal", "mask_file"), "/tmp/fail_mask.edf")
+        widget._on_controls_v2_field_changed(("Signal", "mask_file"), "/tmp/f.edf")
         monkeypatch.setattr(mask_param, "setValue", lambda *a, **k: None)
-        widget._exit_run_state()  # run ends; owner scheduled
+        widget.wrangler.finished.emit()
 
-        # An immediate Run BEFORE the timer tick: _prepare drains synchronously,
-        # the transaction fails, and preparation must refuse — no frozen config.
-        widget._pending_controls_v2_run_configuration = None
-        with pytest.raises(DeferredRunEditsPendingError):
-            widget._prepare_controls_v2_run_configuration()
+        with caplog.at_level(logging.INFO):
+            with pytest.raises(DeferredRunEditsPendingError):
+                widget._prepare_controls_v2_run_configuration()
+
         assert getattr(
             widget, "_pending_controls_v2_run_configuration", None) is None
-        # The full delta is still queued (recoverable) after the refusal.
-        assert list(widget._controls_v2_deferred_field_edits)
+        remaining = [
+            tuple(p) for p, _ in widget._controls_v2_deferred_field_edits]
+        assert ("Signal", "mask_file") in remaining, remaining
+        assert "controls_deferred_fold_invalid" in caplog.text
     finally:
         widget.close()
         widget.deleteLater()
 
 
-def test_deferred_owner_after_widget_close_no_crash_no_mutation(
-        qapp, monkeypatch):
-    """R4B-12 [P2] (O-1a-i.2): a queued deferred-apply that fires AFTER the widget
-    is closed must not crash and must not mutate — the owner is guarded by
-    _tearing_down (set by close()).  Red at 6c3f58f0: the owner had no teardown
-    guard and would apply post-close."""
+def test_deferred_source_edit_reconciles_source_index(qapp, monkeypatch):
+    """R4B-12 [d] (O-1a-i.3): a deferred SOURCE edit reconciles the source index
+    at the fold, exactly like a live idle source edit.  Red at d13dc545: the i.2
+    owner never called _sync_controls_v2_source_index."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
     widget = staticWidget()
     try:
+        calls = []
+        orig = widget._sync_controls_v2_source_index
+        monkeypatch.setattr(
+            widget, "_sync_controls_v2_source_index",
+            lambda: calls.append(1))
+
         widget._enter_run_state()
-        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
-        widget.wrangler.finished.emit()  # schedules the owner
-        assert widget._controls_v2_ensure_run_intent().gi.enabled is False
-        queued_before = list(widget._controls_v2_deferred_field_edits)
-        assert queued_before
+        widget._on_controls_v2_field_changed(("Signal", "include_subdir"), True)
+        widget.wrangler.finished.emit()
+        qapp.processEvents()
+        calls.clear()  # only count reconciliation at the fold
 
-        widget.close()  # marks _tearing_down before destruction
-        qapp.processEvents()  # the scheduled owner fires now — must be a no-op
-
-        # No crash reaching here; no post-close mutation.
-        assert getattr(widget, "_tearing_down", False) is True
-        assert widget._controls_v2_ensure_run_intent().gi.enabled is False
-        assert list(widget._controls_v2_deferred_field_edits) == queued_before
+        widget._controls_v2_fold_deferred_edits_into_intent()
+        assert calls, (
+            "deferred source edit did not reconcile the source index at fold")
     finally:
+        widget.close()
         widget.deleteLater()
 
 
-def test_deferred_apply_scheduled_despite_exception_in_run_end(qapp, monkeypatch):
-    """R4B-12 [P2 §7.3] (O-1a-i.2): an exception during _exit_run_state's
-    finalization must NOT bypass scheduling of the deferred-edit owner — the
-    schedule is owned by the finish handler's OUTERMOST finally, after authority
-    cleanup.  Red at 6c3f58f0: scheduling sat at the end of _exit_run_state, so a
-    raise before it skipped scheduling and the queued edit was never applied."""
+def test_deferred_multi_field_folds_together_once(qapp, monkeypatch):
+    """R4B-12 (O-1a-i.3, pin): multiple deferred fields fold together atomically
+    by construction (pure data), and a subsequent Run freezes once."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        params = widget.wrangler.parameters
+        mask_param = params.child("Signal", "mask_file")
+        target = "/tmp/multi_fold.edf"
+
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        widget._on_controls_v2_field_changed(("Signal", "mask_file"), target)
+        widget.wrangler.finished.emit()
+        qapp.processEvents()
+
+        intent = widget._controls_v2_ensure_run_intent()
+        gen_before = intent.generation
+        frozen = widget._prepare_controls_v2_run_configuration()
+        assert frozen.gi.enabled is True
+        assert mask_param.value() == target
+        assert list(widget._controls_v2_deferred_field_edits) == []
+        assert intent.generation == gen_before + 1
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_deferred_edit_survives_finish_exception_and_folds_next_start(
+        qapp, monkeypatch):
+    """R4B-12 (O-1a-i.3): a deferred edit is never stranded by a finish-body
+    exception — with no timer/owner it stays a pure data delta and folds at the
+    next Start regardless of any exception on the run-exit path."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -5516,25 +5466,33 @@ def test_deferred_apply_scheduled_despite_exception_in_run_end(qapp, monkeypatch
     try:
         widget._enter_run_state()
         widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
-        assert widget._controls_v2_ensure_run_intent().gi.enabled is False
 
-        # Force a raise inside _exit_run_state's unguarded finalization.
-        def _boom(*a, **k):
-            raise RuntimeError("injected finalization failure")
+        boom = [True]
 
-        monkeypatch.setattr(widget.h5viewer, "set_run_writing", _boom)
+        def _maybe_boom(*a, **k):
+            if boom[0]:
+                raise RuntimeError("injected finish-path failure")
+
+        monkeypatch.setattr(widget.h5viewer, "set_run_writing", _maybe_boom)
         try:
-            widget.wrangler.finished.emit()  # slot raises out; both finallys run
+            widget._exit_run_state()  # run-exit path raises
         except RuntimeError:
             pass
+        # The edit survives as a queued delta despite the exit-path exception.
+        assert list(widget._controls_v2_deferred_field_edits)
+        assert widget._controls_v2_ensure_run_intent().gi.enabled is False
 
-        qapp.processEvents()  # the outer-finally schedule still applied the owner
-        assert widget._controls_v2_ensure_run_intent().gi.enabled is True, (
-            "deferred edit lost when finalization raised before scheduling")
+        # Clear the injected failure and the stranded run latch, then fold.
+        boom[0] = False
+        widget._run_active = False
+        frozen = widget._prepare_controls_v2_run_configuration()
+        assert frozen is not None
+        assert frozen.gi.enabled is True
         assert list(widget._controls_v2_deferred_field_edits) == []
     finally:
         widget.close()
         widget.deleteLater()
+
 
 
 def test_apply_snapshot_to_scan_in_place_not_aliased(qapp, monkeypatch):
