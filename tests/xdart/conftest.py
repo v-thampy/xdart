@@ -6,6 +6,7 @@ modules import ``pyqtgraph.Qt`` directly.
 
 import gc
 import os
+import sys
 import tempfile
 
 import pytest
@@ -94,3 +95,50 @@ def _qt_session_teardown():
         gc.collect()
     except Exception:
         pass
+
+
+# --------------------------------------------------------------------------
+# Skip PySide6's pathological interpreter-shutdown teardown of the accumulated
+# Qt object graph.
+#
+# Every GUI test builds a ``staticWidget`` whose sub-widgets (pyqtgraph
+# ViewBoxMenus, combobox popups, context QMenus, card QFrames, ...) create
+# ~190 PARENTLESS top-level widgets.  ``widget.close() + deleteLater()`` cannot
+# reap them: no Qt event loop runs during the tests, so the posted
+# ``DeferredDelete`` events are never delivered (the per-test
+# ``qapp.processEvents()`` drain does not flush level-0 DeferredDelete), and the
+# widgets are parentless so nothing cascade-deletes them.  All ~190 per test
+# accumulate for the whole file (>30k live QObjects, GBs of RSS) and are
+# destroyed in a single avalanche at ``Py_Finalize`` ->
+# ``PySide::destroyQCoreApplication`` -> ``visitAllPyObjects``.  Each
+# destruction walks PySide6's GLOBAL signal-connection QHash
+# (``onPysideReceiverSlotDestroyed``), so the mass teardown is O(N^2): measured
+# ~286 s of pure post-session hang for test_controls_panel_v2.py (body ~85 s).
+#
+# We CANNOT reduce N by reaping per test: a ``sendPostedEvents(DeferredDelete)``
+# drain is banned (it segfaulted linux CI mid-run -- see _qt_session_teardown),
+# and a blind ``shiboken6.delete`` of the parentless popup graph double-frees
+# (verified: SIGSEGV).  So we do what scripts/ci_pytest.py already does on linux
+# CI (and what pyqtgraph's ``pg.exit()`` does): once pytest has finished — the
+# terminal summary printed and any JUnit XML written in pytest_sessionfinish —
+# hard-exit with pytest's own verdict, skipping the Py_Finalize object-graph
+# walk where the hang (macOS) / segfault (linux) lives.  The safe session
+# cleanups above (thread waits, H5 pool close) run as fixture finalizers BEFORE
+# pytest_unconfigure, so they are preserved.
+#
+# Opt out with XDART_KEEP_TEARDOWN=1 (e.g. debugging teardown itself).
+def pytest_sessionfinish(session, exitstatus):
+    session.config._xdart_exit_status = int(exitstatus)
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_unconfigure(config):
+    if os.environ.get("XDART_KEEP_TEARDOWN"):
+        return
+    status = int(getattr(config, "_xdart_exit_status", 0))
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(status)
