@@ -654,6 +654,9 @@ class RangeRow(QtWidgets.QWidget):
     """
 
     valueChanged = QtCore.Signal(object, object)
+    #: A still-uncommitted USER draft on a range bound (line-editor ``textEdited``
+    #: — never programmatic ``setText``), revisioned at action time (§12.4).
+    draftChanged = QtCore.Signal(object, object)
 
     def __init__(self, *, label, low, high, toggle=None, parent=None):
         super().__init__(parent)
@@ -699,6 +702,9 @@ class RangeRow(QtWidgets.QWidget):
         path = tuple(spec["path"])
         edit.editingFinished.connect(
             lambda e=edit, p=path: self.valueChanged.emit(p, e.text())
+        )
+        edit.textEdited.connect(
+            lambda text, p=path: self.draftChanged.emit(p, text)
         )
         lay.addWidget(edit, 1)
         return edit, path
@@ -1629,6 +1635,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
             toggle=toggle,
         )
         row.valueChanged.connect(self.fieldValueChanged)
+        row.draftChanged.connect(self.fieldDraftChanged)
         return row
 
     @staticmethod

@@ -315,6 +315,7 @@ class ControlsStageCandidate:
         "gi_motor_observation",
         "legacy_projection",
         "source_touched",
+        "source_selection_touched",
     )
 
     def __init__(
@@ -332,6 +333,9 @@ class ControlsStageCandidate:
         self.gi_motor_observation = gi_motor_observation
         self.legacy_projection = {}
         self.source_touched = False
+        #: True only when a SOURCE-SELECTION path (not mask/PONI/series-average)
+        #: was reduced — the sole trigger for source reconciliation (§12.7).
+        self.source_selection_touched = False
 
     @property
     def gi_enabled(self) -> bool:
@@ -363,6 +367,7 @@ class StagedControlsTransaction:
         "threshold_state",
         "gi_selection_explicit",
         "source_touched",
+        "source_selection_touched",
         "source_energy_preference",
         "gi_motor_observation",
     )
@@ -376,26 +381,36 @@ class StagedControlsTransaction:
         source_touched,
         source_energy_preference,
         gi_motor_observation,
+        source_selection_touched=False,
     ):
         self.staged_intent = staged_intent
         self.legacy_projection = dict(legacy_projection)
         self.threshold_state = threshold_state
         self.gi_selection_explicit = bool(gi_selection_explicit)
         self.source_touched = bool(source_touched)
+        self.source_selection_touched = bool(source_selection_touched)
         self.source_energy_preference = source_energy_preference
         self.gi_motor_observation = gi_motor_observation
 
 
 class ControlsCommitResult:
-    """Outcome of installing a :class:`StagedControlsTransaction`."""
+    """Outcome of installing a :class:`StagedControlsTransaction`.
 
-    __slots__ = ("ok", "failed_path", "reason")
+    ``recovery_failed_path`` is set (in addition to ``failed_path``) only when the
+    checked commit could not RESTORE a carrier during rollback — a distinct
+    recovery error (§9.10 step 3-commit): Run stays refused, the journal is
+    retained, and both the original and rollback failures are surfaced."""
 
-    def __init__(self, ok, failed_path=None, reason=""):
+    __slots__ = ("ok", "failed_path", "reason", "recovery_failed_path")
+
+    def __init__(self, ok, failed_path=None, reason="", recovery_failed_path=None):
         self.ok = bool(ok)
         self.failed_path = (
             tuple(failed_path) if failed_path is not None else None)
         self.reason = str(reason)
+        self.recovery_failed_path = (
+            tuple(recovery_failed_path)
+            if recovery_failed_path is not None else None)
 from .ui.staticUI import Ui_Form
 from .h5viewer import H5Viewer, _qt_enum_value
 from .display_frame_widget import displayFrameWidget
@@ -1410,34 +1425,40 @@ class staticWidget(QWidget):
         return True
 
     def _commit_controls_v2_pending_edits(self) -> None:
-        """Harvest the panel's form edits for a NON-run consumer (reintegrate,
-        advanced processing, calibration/mask routing, native-state apply).
+        """Apply the panel's form edits for a NON-run consumer (reintegrate,
+        advanced processing, calibration/mask routing, native-state apply)
+        through the SAME validated stage→checked-commit owner (§12.9 item 7 /
+        finding 1) — NEVER the permissive live setters.
 
-        §12.4: these paths must not bypass the revisioned journal.  A focused form
-        value that differs from the committed state is RECORDED into the journal
-        (revisioned at harvest time) BEFORE it is applied, so an older deferred
-        journal entry for the same path cannot overwrite it at the next Start —
-        the newer focused correction wins by revision and is applied once.
-        """
-        panel = getattr(self, "controls_v2", None)
-        get_edits = getattr(panel, "current_form_edits", None)
-        if not callable(get_edits):
+        The revisioned journal (a differing focused value is recorded by
+        ``_controls_v2_collect_pending_edits`` at harvest) is staged and
+        checked-committed exactly once, so an older deferred entry cannot
+        overwrite a newer focused correction and an invalid value is a typed
+        refusal rather than a silent clamp/swallow.  A harvest failure or an
+        invalid/unlandable edit fails CLOSED: the journal is retained and the
+        consumer's action does not proceed on a partial or clamped value."""
+        if getattr(self, "_run_active", False):
+            return  # run-active edits are journaled as deferred, not committed here
+        if not self._controls_v2_enabled():
             return
-        try:
-            edits = get_edits()
-        except Exception:
-            logger.debug("Controls Panel V2 pending edit harvest failed",
-                         exc_info=True)
+        if not callable(getattr(
+                getattr(self, "controls_v2", None), "current_form_edits", None)):
             return
-        committed = self._controls_v2_field_values() if edits else {}
-        for edit in edits:
-            path = tuple(edit.path)
-            if self._controls_v2_form_value_differs(
-                    path, edit.value, committed.get(path)):
-                self._controls_v2_record_edit(path, edit.value, origin="form")
-            self._apply_controls_v2_field_value(edit.path, edit.value)
-        if edits:
-            self._refresh_controls_v2_profile(immediate=True)
+        # collect (inside the fold) journals a differing focused value, then the
+        # journal is staged + checked-committed once.
+        failed = self._controls_v2_fold_deferred_edits_into_intent()
+        if failed is not None:
+            recovery = getattr(self, "_controls_v2_last_fold_recovery", None)
+            if recovery:
+                raise DeferredRunEditsPendingError(
+                    "control edit could not be applied and a carrier ("
+                    + "/".join(str(seg) for seg in recovery)
+                    + ") could not be restored — action not applied")
+            raise DeferredRunEditsPendingError(
+                "control edit invalid ("
+                + "/".join(str(seg) for seg in failed)
+                + ") — action not applied; re-check the control")
+        self._refresh_controls_v2_profile(immediate=True)
 
     def _controls_v2_param(self, path):
         wrangler = getattr(self, "wrangler", None)
@@ -2546,14 +2567,25 @@ class staticWidget(QWidget):
         # so a later-field failure cannot half-apply an earlier field.
         _failed_fold = self._controls_v2_fold_deferred_edits_into_intent()
         if _failed_fold is not None:
+            _recovery = getattr(self, "_controls_v2_last_fold_recovery", None)
             run_config_debug_log(
                 logger,
                 "run_prepare_aborted_invalid_fold",
                 widget=self,
                 origin="controls_v2_prepare",
                 failed_path=list(_failed_fold),
+                recovery_failed_path=list(_recovery) if _recovery else None,
                 level="warning",
             )
+            if _recovery:
+                # §9.10 step 3-commit: a rollback failure is a distinct recovery
+                # error — name the carrier that could not be restored.
+                raise DeferredRunEditsPendingError(
+                    "run configuration could not be applied and a carrier ("
+                    + "/".join(str(seg) for seg in _recovery)
+                    + ") could not be restored — Run not started; check the"
+                    " control state before retrying"
+                )
             raise DeferredRunEditsPendingError(
                 "deferred edit invalid ("
                 + "/".join(str(seg) for seg in _failed_fold)
@@ -2925,6 +2957,16 @@ class staticWidget(QWidget):
 
     def _controls_v2_edit_journal_clear(self) -> None:
         self._controls_v2_edit_journal = {}
+
+    def _controls_v2_clear_consumed_revisions(self, consumed) -> None:
+        """Remove ONLY the exact ``{path: revision}`` entries this transaction
+        consumed.  A path whose journal revision advanced after the harvest (a
+        newer concurrent edit) is retained, never erased (§12.9)."""
+        journal = self._controls_v2_edit_journal_dict()
+        for path, revision in consumed.items():
+            entry = journal.get(path)
+            if entry is not None and entry.get("revision") == revision:
+                del journal[path]
 
     def _controls_v2_journal_winners(self):
         """Winning ``(path, value)`` per path, ordered by ascending revision."""
@@ -3360,6 +3402,14 @@ class staticWidget(QWidget):
         path = tuple(path)
         if path and path[0] in {"Signal", "Source"}:
             cand.source_touched = True
+        if path in self._CONTROLS_V2_SOURCE_SELECTION_PATHS:
+            cand.source_selection_touched = True
+            # §12.5 / finding 4: a source-SELECTION change invalidates the
+            # candidate's GI motor observation — the new source's motors are
+            # UNKNOWN until targeted hydration reports them, so a [source A→B +
+            # GI-enable] transaction cannot default-pick A's motor into B.
+            cand.gi_motor_observation = GIMotorObservation(
+                GIMotorObservation.UNKNOWN, (), None)
         if path in NATIVE_CONTROL_PATHS:
             if path == ("Source", "energy_preference"):
                 text = str(value or "").strip().lower()
@@ -3400,6 +3450,20 @@ class staticWidget(QWidget):
         cross-field invariant the frozen dataclasses enforce — raising a typed
         :class:`ControlsTransactionError` on the CLONE, before any install and
         before freeze.  Freeze is NOT a substitute for transaction validation."""
+        # Range shape: a radial/azimuth range whose low exceeds its high is a
+        # cross-field contradiction (§12.9 P3b) — a typed refusal, not a freeze
+        # error or a silently-swapped range.
+        a1, a2 = cand.bai
+        for args, root in ((a1, "Int1D"), (a2, "Int2D")):
+            for key, axis in (
+                    ("radial_range", "radial"), ("azimuth_range", "azimuth")):
+                rng = args.get(key)
+                if (isinstance(rng, (tuple, list)) and len(rng) == 2
+                        and rng[0] is not None and rng[1] is not None
+                        and float(rng[0]) > float(rng[1])):
+                    raise ControlsTransactionError(
+                        (root, axis + "_range"),
+                        "range low cannot exceed high", rng)
         try:
             # Freezing the CLONE runs the GI/threshold/output __post_init__
             # validators (sample_orientation 1-8, finite th_val/tilt/threshold,
@@ -3451,6 +3515,7 @@ class staticWidget(QWidget):
                 if isinstance(cand.threshold_state, dict) else None),
             gi_selection_explicit=cand.gi_selection_explicit,
             source_touched=cand.source_touched,
+            source_selection_touched=cand.source_selection_touched,
             source_energy_preference=cand.source_energy_preference,
             gi_motor_observation=cand.gi_motor_observation,
         )
@@ -3460,99 +3525,176 @@ class staticWidget(QWidget):
     # snapshot + reverse-order verified rollback + transactional source owner).
     # ------------------------------------------------------------------
 
-    def _controls_v2_apply_legacy_projection(self, projection):
-        """Apply candidate legacy values to the hidden carriers, signal-blocked,
-        verifying every readback.  Returns the first path whose readback fails (a
-        silent ``setValue`` no-op), else ``None``.
+    #: Intent fields copied by the in-place install/snapshot (identity kept).
+    _CONTROLS_V2_INTENT_FIELDS = (
+        "source_spec", "processing_mode", "output_mode", "live_mode",
+        "batch_mode", "max_cores", "bai_1d_args", "bai_2d_args", "gi",
+        "threshold", "poni_file", "poni_values", "mask_file", "project_root",
+        "save_path", "run_options",
+    )
 
-        T-1 detects the failure and aborts; the reverse-order verified ROLLBACK
-        of already-applied carriers lands in T-2 (§9.10 step 3-commit).
-        """
-        if not projection:
-            return None
-        wrangler = getattr(self, "wrangler", None)
-        params = getattr(wrangler, "parameters", None)
-        if params is None:
-            return None
-        for path, value in projection.items():
-            path = tuple(path)
-            self._mirror_wrangler_parameter_values(params, ((path, value),))
-            param = self._controls_v2_param(path)
-            if param is None:
-                continue
-            try:
-                expected = coerce_control_edit_value(param.value(), value)
-            except Exception:
-                expected = value
-            if param.value() != expected:
-                return path
-        return None
+    #: Legacy paths that change the SOURCE SELECTION (the SourceSpec).  Only these
+    #: trigger source reconciliation; mask/PONI/series-average/BG edits do NOT
+    #: (§12.7 / §12 test 13 — an unrelated edit or an unchanged Start reconciles
+    #: nothing and requests no directory poll).
+    _CONTROLS_V2_SOURCE_SELECTION_PATHS = frozenset({
+        ("Signal", "inp_type"),
+        ("Signal", "File"),
+        ("Signal", "img_dir"),
+        ("Signal", "include_subdir"),
+        ("Signal", "img_ext"),
+        ("Signal", "Filter"),
+        ("Signal", "meta_dir"),
+        ("Signal", "meta_ext"),
+        ("NeXus File", "nexus_file"),
+        ("NeXus File", "entry"),
+    })
 
-    @staticmethod
-    def _controls_v2_install_intent_values(live, staged) -> None:
+    @classmethod
+    def _controls_v2_install_intent_values(cls, live, staged) -> None:
         """Copy the staged intent's VALUES onto *live* in place (identity kept).
 
         The monotonic ``generation`` is deliberately NOT copied: the live intent
         owns the counter and the staged clone started from the same value, so a
-        later ``freeze`` advances the live intent exactly once.
-        """
-        for field_name in (
-            "source_spec",
-            "processing_mode",
-            "output_mode",
-            "live_mode",
-            "batch_mode",
-            "max_cores",
-            "bai_1d_args",
-            "bai_2d_args",
-            "gi",
-            "threshold",
-            "poni_file",
-            "poni_values",
-            "mask_file",
-            "project_root",
-            "save_path",
-            "run_options",
-        ):
+        later ``freeze`` advances the live intent exactly once."""
+        for field_name in cls._CONTROLS_V2_INTENT_FIELDS:
             setattr(live, field_name, getattr(staged, field_name))
 
-    def commit_controls_transaction(self, staged) -> ControlsCommitResult:
-        """Install a validated :class:`StagedControlsTransaction`.
+    @classmethod
+    def _controls_v2_snapshot_intent_values(cls, live) -> dict:
+        """Shallow field-reference snapshot of *live* for atomic rollback.
 
-        Order (§9.10 step 3-commit): apply the legacy projection with per-write
-        readback FIRST; on failure abort with the intent UNTOUCHED (retain the
-        journal, refuse to freeze).  Only after the legacy projection lands is
-        the staged intent installed as one operation and projected onto the
-        display scan, then the source is reconciled exactly once.
+        Install REPLACES the field references (never mutates the prior objects),
+        so restoring the snapshot references puts the intent back exactly."""
+        return {name: getattr(live, name) for name in cls._CONTROLS_V2_INTENT_FIELDS}
+
+    @classmethod
+    def _controls_v2_restore_intent_values(cls, live, snapshot) -> None:
+        for name, value in snapshot.items():
+            setattr(live, name, value)
+
+    def _controls_v2_apply_legacy_carrier(self, params, path, value) -> bool:
+        """Apply one legacy value signal-blocked; True iff the readback verifies."""
+        path = tuple(path)
+        self._mirror_wrangler_parameter_values(params, ((path, value),))
+        param = self._controls_v2_param(path)
+        if param is None:
+            return True
+        try:
+            expected = coerce_control_edit_value(param.value(), value)
+        except Exception:
+            expected = value
+        return param.value() == expected
+
+    def _controls_v2_rollback_legacy(self, params, applied):
+        """Restore applied ``(path, prior)`` legacy carriers in REVERSE order,
+        verifying every readback.  Returns the first path that could NOT be
+        restored (a recovery failure), else ``None``."""
+        if params is None:
+            return None
+        for path, prior in reversed(applied):
+            if not self._controls_v2_apply_legacy_carrier(params, path, prior):
+                return tuple(path)
+        return None
+
+    def commit_controls_transaction(self, staged) -> ControlsCommitResult:
+        """Install a validated :class:`StagedControlsTransaction` atomically.
+
+        §9.10 step 3-commit / step 4.  ONE rollback boundary: the complete legacy
+        projection is applied signal-blocked with per-write readback; any failure
+        restores every changed carrier in REVERSE order with verified readback and
+        leaves the live intent/display/source untouched.  Only after the legacy
+        projection lands are the staged intent, GI-explicit flag, threshold state,
+        and source-energy preference installed as one logical operation; the
+        source is then reconciled through ONE owner and ONLY when the source
+        SELECTION actually changed (§12.7).  A rollback failure returns a distinct
+        ``recovery_failed_path``.
         """
-        failed = self._controls_v2_apply_legacy_projection(
-            staged.legacy_projection)
-        if failed is not None:
+        wrangler = getattr(self, "wrangler", None)
+        params = getattr(wrangler, "parameters", None)
+
+        prior_energy_pref = getattr(
+            self, "_controls_v2_source_energy_preference", "poni")
+
+        # --- 3/4. apply the complete legacy projection, verified readback; any
+        #          failure rolls back what we changed, in reverse order. ---
+        applied = []  # (path, prior_value) in application order
+        if params is not None:
+            for path, value in staged.legacy_projection.items():
+                path = tuple(path)
+                param = self._controls_v2_param(path)
+                prior = param.value() if param is not None else None
+                if not self._controls_v2_apply_legacy_carrier(params, path, value):
+                    recovery = self._controls_v2_rollback_legacy(params, applied)
+                    return ControlsCommitResult(
+                        False, failed_path=path,
+                        reason="legacy carrier readback failed",
+                        recovery_failed_path=recovery)
+                applied.append((path, prior))
+
+        # --- snapshot the live intent + Controls self-state for atomic install ---
+        live = self._controls_v2_ensure_run_intent()
+        intent_snapshot = self._controls_v2_snapshot_intent_values(live)
+        prior_gi_explicit = getattr(
+            self, "_controls_v2_gi_selection_explicit", False)
+        prior_threshold_state = getattr(
+            self, "_controls_v2_threshold_state", None)
+        prior_observation = getattr(
+            self, "_controls_v2_directory_observation", None)
+
+        def _restore_intent_state():
+            self._controls_v2_restore_intent_values(live, intent_snapshot)
+            self._controls_v2_gi_selection_explicit = prior_gi_explicit
+            self._controls_v2_threshold_state = prior_threshold_state
+            self._controls_v2_source_energy_preference = prior_energy_pref
+
+        # --- 5. install the staged intent + display projection as one op ---
+        try:
+            self._controls_v2_install_intent_values(live, staged.staged_intent)
+            self._controls_v2_gi_selection_explicit = staged.gi_selection_explicit
+            if staged.threshold_state is not None:
+                self._controls_v2_threshold_state = staged.threshold_state
+            self._controls_v2_source_energy_preference = (
+                staged.source_energy_preference)
+            self._controls_v2_apply_snapshot_to_scan(
+                self._controls_v2_native_int_snapshot())
+        except Exception:
+            logger.debug("controls commit intent install failed", exc_info=True)
+            _restore_intent_state()
+            recovery = self._controls_v2_rollback_legacy(params, applied)
             return ControlsCommitResult(
-                False, failed_path=failed,
-                reason="legacy carrier readback failed")
-        # Install the staged VALUES onto the live Controls-owned intent IN PLACE
-        # — never replace the object.  The intent owns the monotonic generation
-        # counter and may be held by reference (R4B-15 identity rule); the staged
-        # clone started from the same generation, so ``freeze`` advances the live
-        # intent correctly and held references stay valid.
-        self._controls_v2_install_intent_values(
-            self._controls_v2_ensure_run_intent(), staged.staged_intent)
-        self._controls_v2_gi_selection_explicit = staged.gi_selection_explicit
-        if staged.threshold_state is not None:
-            self._controls_v2_threshold_state = staged.threshold_state
-        # The staged candidate carries the source-energy preference (staging is
-        # pure and never mutates the live one — §12.2 / C1); install it here.
-        self._controls_v2_source_energy_preference = (
-            staged.source_energy_preference)
-        # Compatibility projection onto the display scan (the intent stays the
-        # single writer of run configuration).
-        self._controls_v2_apply_snapshot_to_scan(
-            self._controls_v2_native_int_snapshot())
-        if staged.source_touched:
+                False, failed_path=None, reason="intent install failed",
+                recovery_failed_path=recovery)
+
+        # An energy-preference change invalidates only the energy cache — never a
+        # directory poll (§12.7).
+        if staged.source_energy_preference != prior_energy_pref:
             self._controls_v2_source_energy_cache = None
-            self._controls_v2_metadata_probe_cache = None
-            self._sync_controls_v2_source_index()
+
+        # --- 6. transactional source reconciliation through ONE owner, and ONLY
+        #        when a source-SELECTION path changed (§12.7 test 13: mask/PONI/
+        #        series-average edits and an unchanged Start reconcile nothing and
+        #        request no directory poll). ---
+        if staged.source_selection_touched:
+            try:
+                self._controls_v2_source_energy_cache = None
+                self._controls_v2_metadata_probe_cache = None
+                self._sync_controls_v2_source_index()
+            except Exception:
+                logger.debug("controls commit source reconcile failed",
+                             exc_info=True)
+                _restore_intent_state()
+                self._controls_v2_directory_observation = prior_observation
+                recovery = self._controls_v2_rollback_legacy(params, applied)
+                try:
+                    self._sync_controls_v2_source_index()
+                except Exception:
+                    logger.debug("controls source restore reconcile failed",
+                                 exc_info=True)
+                return ControlsCommitResult(
+                    False, failed_path=("Source",),
+                    reason="source reconciliation failed",
+                    recovery_failed_path=recovery)
         return ControlsCommitResult(True)
 
     def _controls_v2_defer_field_edit(self, path, value) -> None:
@@ -3614,6 +3756,12 @@ class staticWidget(QWidget):
             return tuple(harvest_err.path or ("Controls",))
         if not edits:
             return None
+        # Snapshot the exact revisions this transaction consumes, so success
+        # clears ONLY them — a newer concurrent edit (higher revision) survives.
+        consumed = {
+            path: entry["revision"]
+            for path, entry in self._controls_v2_edit_journal_dict().items()
+        }
         staged = self.stage_controls_transaction(edits)
         if isinstance(staged, ControlsTransactionError):
             run_config_debug_log(
@@ -3629,19 +3777,29 @@ class staticWidget(QWidget):
             return tuple(staged.path or ())
         result = self.commit_controls_transaction(staged)
         if not result.ok:
+            # A rollback failure is a DISTINCT recovery error: retain the journal,
+            # refuse Run, and identify the carrier that could not be restored
+            # (§9.10 step 3-commit); _prepare surfaces it visibly.
+            self._controls_v2_last_fold_recovery = result.recovery_failed_path
             run_config_debug_log(
                 logger,
                 "controls_deferred_fold_invalid",
                 widget=self,
                 origin="controls_v2_prepare_fold",
                 failed_path=list(result.failed_path or ()),
+                recovery_failed_path=(
+                    list(result.recovery_failed_path)
+                    if result.recovery_failed_path else None),
                 reason=result.reason,
                 deferred_pending=len(self._controls_v2_journal_winners()),
                 level="warning",
             )
             return tuple(result.failed_path or ())
+        self._controls_v2_last_fold_recovery = None
+        # Clear ONLY the exact revisions this transaction consumed, so a newer
+        # concurrent edit recorded after the harvest is never erased (§12.9).
         folded = [list(p) for p, _ in edits]
-        self._controls_v2_edit_journal_clear()
+        self._controls_v2_clear_consumed_revisions(consumed)
         bump_run_config_debug_generation(self, "config")
         run_config_debug_log(
             logger,

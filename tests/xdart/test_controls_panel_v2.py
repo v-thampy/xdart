@@ -5950,12 +5950,14 @@ def test_t1r_form_harvest_failure_refuses_preparation(qapp, monkeypatch):
 
 
 def test_t1r_commit_pending_cannot_bypass_journal(qapp, monkeypatch):
-    """§12 test 10: a non-run form commit (reintegrate/advanced) records the
-    focused value into the revisioned journal, so an OLDER deferred value cannot
-    overwrite the newer focused correction at the next Start.
+    """§12 test 10 / T-2 finding 1: a non-run form commit (reintegrate/advanced)
+    routes through the SAME validated transaction owner, so a NEWER focused
+    correction beats an OLDER deferred value by revision and is applied EXACTLY
+    ONCE — the permissive live-setter path is retired.
 
     RED at 4b59b7da: _commit_controls_v2_pending_edits applied the form value
-    directly without journaling it, so an older deferred journal entry won."""
+    directly via _apply_controls_v2_field_value without journaling it, so an
+    older deferred journal entry won at the next Start."""
     widget = _t1r_widget(monkeypatch)
     try:
         # Older deferred value for BG.Scale (during a run).
@@ -5965,7 +5967,7 @@ def test_t1r_commit_pending_cannot_bypass_journal(qapp, monkeypatch):
         qapp.processEvents()
         # Idle: a newer focused form value published through the reintegrate/
         # advanced harvest seam (the form holds 9 while the carrier still holds the
-        # old value); it must be journaled so it beats the older deferred at Start.
+        # old value); it must beat the older deferred by revision.
         class _Edit:
             def __init__(self, path, value):
                 self.path = path
@@ -5973,10 +5975,23 @@ def test_t1r_commit_pending_cannot_bypass_journal(qapp, monkeypatch):
         monkeypatch.setattr(
             widget.controls_v2, "current_form_edits",
             lambda: (_Edit(("BG", "Scale"), 9),))
+
+        bg = widget.wrangler.parameters.child("BG", "Scale")
+        applied = []
+        orig_set = bg.setValue
+        monkeypatch.setattr(
+            bg, "setValue",
+            lambda v, *a, **k: (applied.append(int(v)), orig_set(v, *a, **k))[1])
+
         widget._commit_controls_v2_pending_edits()
 
-        winners = dict(widget._controls_v2_collect_pending_edits())
-        assert winners.get(("BG", "Scale")) == 9   # newer focused value wins
+        # The newer focused value (9) won over the older deferred (2) and was
+        # applied through the validated transaction, exactly once — never 2.
+        assert int(bg.value()) == 9
+        assert applied.count(9) == 1
+        assert 2 not in applied
+        # The transaction consumed the journal (applied once, not left pending).
+        assert widget._controls_v2_edit_journal_dict() == {}
     finally:
         widget.close()
         widget.deleteLater()
@@ -6048,6 +6063,274 @@ def test_t1r_unknown_preserves_motor_known_empty_resolves_manual(qapp, monkeypat
         widget._controls_v2_record_gi_motor_observation([])
         frozen2 = widget._prepare_controls_v2_run_configuration()
         assert frozen2.gi.effective_motor == "Manual"
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t2_second_field_failure_rolls_back_earlier_field(qapp, monkeypatch):
+    """§9.10 test 1: a two-field transaction whose SECOND legacy field fails
+    readback restores the FIRST field to its exact pre-Start value (reverse-order
+    verified rollback), retains the whole journal, and refuses the freeze — no
+    generation bump.
+
+    RED at 506dd978: T-1R detected the silent no-op and aborted but did NOT roll
+    back the earlier field, leaving it mutated (reverse-rollback deferred to T-2)."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import (
+        DeferredRunEditsPendingError,
+        staticWidget,
+    )
+
+    widget = staticWidget()
+    try:
+        widget._pending_controls_v2_run_configuration = None
+        params = widget.wrangler.parameters
+        mask_param = params.child("Signal", "mask_file")
+        bg_param = params.child("BG", "File")
+        mask_before = mask_param.value()
+        bg_before = bg_param.value()
+        gen_before = widget._controls_v2_ensure_run_intent().generation
+
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("Signal", "mask_file"), "/tmp/a.edf")
+        widget._on_controls_v2_field_changed(("BG", "File"), "/tmp/b.edf")
+        widget.wrangler.finished.emit()
+        qapp.processEvents()
+        # Field B's carrier silently no-ops.
+        monkeypatch.setattr(bg_param, "setValue", lambda *a, **k: None)
+
+        with pytest.raises(DeferredRunEditsPendingError):
+            widget._prepare_controls_v2_run_configuration()
+
+        # A rolled back; B unchanged; journal full; nothing frozen; no gen bump.
+        assert mask_param.value() == mask_before
+        assert bg_param.value() == bg_before
+        assert getattr(
+            widget, "_pending_controls_v2_run_configuration", None) is None
+        assert widget._controls_v2_ensure_run_intent().generation == gen_before
+        remaining = {tuple(p) for p, _ in widget._controls_v2_deferred_field_edits}
+        assert ("Signal", "mask_file") in remaining
+        assert ("BG", "File") in remaining
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t2_setter_exception_is_commit_failure_with_verified_rollback(
+        qapp, monkeypatch):
+    """§9.10 test 3: a silent setter FAILURE (setValue raises, swallowed by the
+    signal-blocked mirror) is caught by the per-write readback as a commit
+    failure, and the earlier applied field is rolled back with verified readback.
+    The readback — not the setter's return — is the authority.
+
+    RED at 506dd978: T-1R aborted on the readback but left the earlier field
+    mutated (no rollback)."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import (
+        DeferredRunEditsPendingError,
+        staticWidget,
+    )
+
+    widget = staticWidget()
+    try:
+        widget._pending_controls_v2_run_configuration = None
+        params = widget.wrangler.parameters
+        mask_param = params.child("Signal", "mask_file")
+        bg_param = params.child("BG", "File")
+        mask_before = mask_param.value()
+
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("Signal", "mask_file"), "/tmp/a.edf")
+        widget._on_controls_v2_field_changed(("BG", "File"), "/tmp/b.edf")
+        widget.wrangler.finished.emit()
+        qapp.processEvents()
+
+        def _raise(*a, **k):
+            raise RuntimeError("injected setter failure")
+
+        monkeypatch.setattr(bg_param, "setValue", _raise)
+
+        with pytest.raises(DeferredRunEditsPendingError):
+            widget._prepare_controls_v2_run_configuration()
+
+        assert mask_param.value() == mask_before  # verified rollback of A
+        assert getattr(
+            widget, "_pending_controls_v2_run_configuration", None) is None
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t2_rollback_failure_surfaces_recovery_error_naming_carrier(
+        qapp, monkeypatch):
+    """§9.10 test 4: when the checked commit cannot RESTORE a carrier during
+    rollback, Run stays refused with a DISTINCT recovery error that NAMES the
+    un-restorable carrier, and the journal is retained.
+
+    RED at 506dd978: T-1R had no rollback, hence no recovery-error concept."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import (
+        DeferredRunEditsPendingError,
+        staticWidget,
+    )
+
+    widget = staticWidget()
+    try:
+        widget._pending_controls_v2_run_configuration = None
+        params = widget.wrangler.parameters
+        mask_param = params.child("Signal", "mask_file")
+        bg_param = params.child("BG", "File")
+
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("Signal", "mask_file"), "/tmp/a.edf")
+        widget._on_controls_v2_field_changed(("BG", "File"), "/tmp/b.edf")
+        widget.wrangler.finished.emit()
+        qapp.processEvents()
+
+        # Field A applies forward (non-empty) but its RESTORE (to the empty prior)
+        # silently no-ops -> A cannot be rolled back.  Field B no-ops forward ->
+        # triggers the rollback of A.
+        orig_mask_set = mask_param.setValue
+
+        def _mask_set(value, *a, **k):
+            if str(value):
+                orig_mask_set(value, *a, **k)
+
+        monkeypatch.setattr(mask_param, "setValue", _mask_set)
+        monkeypatch.setattr(bg_param, "setValue", lambda *a, **k: None)
+
+        with pytest.raises(DeferredRunEditsPendingError) as excinfo:
+            widget._prepare_controls_v2_run_configuration()
+
+        assert "mask_file" in str(excinfo.value)   # names the un-restorable carrier
+        assert getattr(
+            widget, "_pending_controls_v2_run_configuration", None) is None
+        remaining = {tuple(p) for p, _ in widget._controls_v2_deferred_field_edits}
+        assert ("Signal", "mask_file") in remaining
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t2_source_transaction_reconciles_exactly_once(qapp, monkeypatch):
+    """§9.10 test 6: a transaction with multiple source-selection fields reconciles
+    the source index EXACTLY ONCE (the legacy projection is signal-blocked, so the
+    source-tree handler cannot independently reconcile) and does not lose the
+    edits."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        calls = []
+        monkeypatch.setattr(
+            widget, "_sync_controls_v2_source_index",
+            lambda: calls.append(1))
+
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("Signal", "include_subdir"), True)
+        widget._on_controls_v2_field_changed(("Signal", "img_ext"), "tif")
+        widget.wrangler.finished.emit()
+        qapp.processEvents()
+        calls.clear()  # count only the Start-time reconciliation
+
+        frozen = widget._prepare_controls_v2_run_configuration()
+        assert frozen is not None                 # edits applied, not lost
+        assert len(calls) == 1                     # exactly one reconciliation
+        assert list(widget._controls_v2_deferred_field_edits) == []
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t2_source_reconcile_failure_refuses_and_retains_journal(
+        qapp, monkeypatch):
+    """§9.10 test 7: a source reconciliation exception fails CLOSED — no freeze,
+    the journal is retained, and Run is refused with a typed
+    DeferredRunEditsPendingError; the transaction does not leave a partial
+    source-owner swap or a false applied event.
+
+    RED at 506dd978: T-1R's commit called _sync_controls_v2_source_index with no
+    guard, so the raw exception propagated (not the typed refusal) and the intent
+    was left installed (fail-open, §9.7)."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import (
+        DeferredRunEditsPendingError,
+        staticWidget,
+    )
+
+    widget = staticWidget()
+    try:
+        widget._pending_controls_v2_run_configuration = None
+
+        def _boom():
+            raise RuntimeError("injected source reconcile failure")
+
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("Signal", "include_subdir"), True)
+        widget.wrangler.finished.emit()
+        qapp.processEvents()
+        monkeypatch.setattr(
+            widget, "_sync_controls_v2_source_index", _boom)
+
+        with pytest.raises(DeferredRunEditsPendingError):
+            widget._prepare_controls_v2_run_configuration()
+
+        assert getattr(
+            widget, "_pending_controls_v2_run_configuration", None) is None
+        remaining = {tuple(p) for p, _ in widget._controls_v2_deferred_field_edits}
+        assert ("Signal", "include_subdir") in remaining
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t2_unrelated_edits_and_unchanged_start_reconcile_nothing(
+        qapp, monkeypatch):
+    """§12 test 13 / §12.7: mask/PONI/series-average edits and an unchanged Start
+    cause ZERO source reconciliation and zero directory poll — only a source
+    SELECTION change reconciles.
+
+    RED at 506dd978: T-1R's commit reconciled on any Signal/Source
+    (source_touched) edit, including mask/series-average."""
+    widget = _t1r_widget(monkeypatch)
+    try:
+        calls = []
+        monkeypatch.setattr(
+            widget, "_sync_controls_v2_source_index", lambda: calls.append(1))
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("Signal", "mask_file"), "/tmp/m.edf")
+        widget._on_controls_v2_field_changed(("Signal", "series_average"), "3")
+        widget.wrangler.finished.emit()
+        qapp.processEvents()
+        calls.clear()
+
+        frozen = widget._prepare_controls_v2_run_configuration()
+        assert frozen is not None
+        assert calls == []   # non-selection edits reconcile nothing (§12.7)
+
+        calls.clear()
+        widget._prepare_controls_v2_run_configuration()   # unchanged Start
+        assert calls == []
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t2_range_low_gt_high_is_typed_refusal(qapp, monkeypatch):
+    """§12.9 P3b: a radial/azimuth range whose low exceeds its high is a typed
+    staging refusal (not a freeze error or a silent swap).
+
+    RED at 506dd978: the pure reducer did not validate range shape."""
+    from xdart.gui.tabs.static_scan.static_scan_widget import ControlsTransactionError
+    widget = _t1r_widget(monkeypatch)
+    try:
+        result = widget.stage_controls_transaction([
+            (("Int1D", "radial_low"), 5.0),
+            (("Int1D", "radial_high"), 1.0),
+        ])
+        assert isinstance(result, ControlsTransactionError)
     finally:
         widget.close()
         widget.deleteLater()
