@@ -228,6 +228,13 @@ from xrd_tools.sources.readiness import (
 class _TransientReadinessObservation(RuntimeError):
     """H18-R5: a raw-probe observation that is not definitive — handled like
     a transient metadata failure (debounced retry, never cached)."""
+
+
+class DeferredRunEditsPendingError(RuntimeError):
+    """R4B-12 (O-1a-i.2): Run preparation refuses to freeze because a Controls
+    edit queued during the previous run could not be applied.  Raised by
+    ``_prepare_controls_v2_run_configuration`` and surfaced to the operator by
+    ``imageWrangler.start()``; no ``FrozenRunConfiguration`` is produced."""
 from .ui.staticUI import Ui_Form
 from .h5viewer import H5Viewer, _qt_enum_value
 from .display_frame_widget import displayFrameWidget
@@ -2350,12 +2357,29 @@ class staticWidget(QWidget):
 
         if not self._controls_v2_enabled():
             return None
-        # R4B-12 (O-1a-i.1): drain any edits deferred during the previous run
+        # R4B-12 (O-1a-i.1/i.2): drain any edits deferred during the previous run
         # into the next-run intent BEFORE this freeze, so a run started before
         # the post-finalization singleShot has ticked still freezes the final
-        # values exactly once (the owner is idempotent and no-ops when idle with
-        # an empty queue).
+        # values exactly once.  If the transaction cannot fully apply (a queued
+        # change that will not land), REFUSE to freeze: Run must not start on a
+        # partially-applied or pending next-run delta.  Typed, user-visible abort
+        # (surfaced by imageWrangler.start()); no FrozenRunConfiguration produced.
         self._controls_v2_apply_deferred_next_run_edits()
+        pending = list(
+            getattr(self, "_controls_v2_deferred_field_edits", None) or [])
+        if pending:
+            run_config_debug_log(
+                logger,
+                "run_prepare_aborted_pending_edits",
+                widget=self,
+                origin="controls_v2_prepare",
+                pending=[list(p) for p, _ in pending],
+                level="warning",
+            )
+            raise DeferredRunEditsPendingError(
+                "a queued settings change could not be applied, so Run did not "
+                "start — re-check the highlighted control and try again"
+            )
         self._commit_controls_v2_pending_edits()
         self._controls_v2_ensure_native_int_defaults()
         intent = self._controls_v2_ensure_run_intent()
@@ -2753,50 +2777,104 @@ class staticWidget(QWidget):
                 exc_info=True)
             return False
 
-    def _controls_v2_apply_deferred_next_run_edits(self) -> None:
+    def _controls_v2_validate_replay_field(self, path, value) -> bool:
+        """Validate ONE deferred field WITHOUT committing any run carrier.
+
+        Native source/int paths are pure value assignments to the Controls-owned
+        intent and cannot fail.  A legacy-backed field is trial-projected through
+        the signal-blocked mirror and then RESTORED, so a ``setValue`` that
+        cannot land (the swallowed-failure class) is detected here — before ANY
+        field is committed — while validation itself mutates nothing.
+        """
+        path = tuple(path)
+        try:
+            if (path in NATIVE_CONTROL_PATHS
+                    or path in INTEGRATOR_BACKED_CONTROL_PATHS):
+                return True
+            param = self._controls_v2_param(path)
+            if param is None:
+                return False
+            current = param.value()
+            new_value = coerce_control_edit_value(current, value)
+            if current == new_value:
+                return True
+            params = getattr(
+                getattr(self, "wrangler", None), "parameters", None)
+            self._mirror_wrangler_parameter_values(params, ((path, new_value),))
+            landed = param.value() == new_value
+            if param.value() != current:
+                # Restore so validation leaves the carrier exactly as it was.
+                self._mirror_wrangler_parameter_values(
+                    params, ((path, current),))
+            return landed
+        except Exception:
+            logger.debug(
+                "deferred Controls replay validation failed for %s", path,
+                exc_info=True)
+            return False
+
+    def _controls_v2_schedule_deferred_apply(self) -> None:
+        """Idempotently schedule the post-finalization deferred-edit owner.
+
+        Called from the OUTERMOST ``finally`` of every run-end finish handler
+        (wrangler/reintegrate/stitch), AFTER run-source authority cleanup — so an
+        exception in the earlier finalization can never bypass scheduling, and
+        the owner runs strictly after the whole synchronous finish tail via the
+        teardown-safe 3-arg ``singleShot`` (bound to ``self``; a destroyed widget
+        never receives it).  Suppressed during teardown so a closing widget does
+        not schedule post-close UI mutation.
+        """
+        if getattr(self, "_tearing_down", False):
+            return
+        owner = getattr(
+            self, "_controls_v2_apply_deferred_next_run_edits", None)
+        if not callable(owner):
+            # Lightweight run-end test hosts (SimpleNamespace) drive the finish
+            # handlers without the full widget — nothing to schedule.
+            return
+        try:
+            QtCore.QTimer.singleShot(0, self, owner)
+        except Exception:
+            logger.debug("could not schedule deferred-edit owner",
+                         exc_info=True)
+
+    def _controls_v2_apply_deferred_next_run_edits(self) -> bool:
         """The ONE post-finalization owner of deferred next-run edits (R4B-12).
 
-        Scheduled from :meth:`_exit_run_state` via a teardown-safe
-        ``singleShot(0, self, ...)`` so it runs STRICTLY AFTER the whole
-        synchronous run unwind (wrangler ``stop()``, final batch
-        selection/reload, and ``wrangler_finished``'s ``finally`` that clears
-        run-source authority) for every run-end path — wrangler, reintegrate,
-        stitch, abort/error — and is also drained synchronously just before the
-        next freeze so a subsequent run always sees the final values once.
+        Returns True when there is nothing pending OR the complete delta was
+        committed atomically; False when the transaction was refused (the delta
+        is retained unchanged), the widget is tearing down, or a run is still
+        active.
 
-        The queued last-write-wins delta is snapshotted before applying and is
-        NOT cleared until the whole transaction succeeds: on the first real
-        failure the entire delta is retained (recoverable), a visible error is
-        raised, and a structured ``controls_field_replay_failed`` event is
-        emitted.  On success the queue is cleared and the profile is refreshed
-        exactly ONCE.
+        Transaction (O-1a-i.2): the COMPLETE last-write-wins delta is VALIDATED
+        first — every legacy field is trial-projected and restored, so a field
+        that cannot land is detected before ANY carrier is mutated.  Only if the
+        whole delta validates is it committed; on any validation failure ZERO
+        carriers change, the full delta is retained (recoverable), a visible
+        error is raised, and exactly one ``controls_field_replay_failed`` event
+        is emitted.  On success the queue is cleared and the profile refreshed
+        once.  Scheduled from each finish-path ``finally`` and also drained
+        synchronously by :meth:`_prepare_controls_v2_run_configuration`, which
+        REFUSES to freeze while any deferred edit remains unresolved.
         """
+        if getattr(self, "_tearing_down", False):
+            # Post-close: retain, never mutate a widget being torn down.
+            return False
         if self._controls_v2_run_active():
             # Not finalized yet — leave the delta queued for the true boundary.
-            return
+            return False
         delta = list(
             getattr(self, "_controls_v2_deferred_field_edits", None) or [])
         if not delta:
-            return
+            return True
+        # PHASE 1 — validate the COMPLETE delta before mutating any run carrier.
         failed_path = None
         for path, value in delta:
-            if not self._controls_v2_replay_apply_field(path, value):
+            if not self._controls_v2_validate_replay_field(path, value):
                 failed_path = tuple(path)
                 break
-        if failed_path is None:
-            self._controls_v2_deferred_field_edits = []
-            bump_run_config_debug_generation(self, "config")
-            run_config_debug_log(
-                logger,
-                "controls_field_replay_applied",
-                widget=self,
-                origin="controls_v2_post_finalization",
-                applied=[list(p) for p, _ in delta],
-            )
-            self._refresh_controls_v2_profile(immediate=True)
-        else:
-            # Retain the WHOLE delta so nothing the UI promised is lost
-            # (recoverable at the next run-end or Run click); surface + record.
+        if failed_path is not None:
+            # Zero carriers changed; retain the whole delta, surface + record.
             self._controls_v2_deferred_field_edits = delta
             try:
                 self.wrangler.showLabel.emit(
@@ -2814,6 +2892,21 @@ class staticWidget(QWidget):
                 deferred_pending=len(delta),
                 level="warning",
             )
+            return False
+        # PHASE 2 — commit the validated delta (validated legacy sets land).
+        for path, value in delta:
+            self._controls_v2_replay_apply_field(path, value)
+        self._controls_v2_deferred_field_edits = []
+        bump_run_config_debug_generation(self, "config")
+        run_config_debug_log(
+            logger,
+            "controls_field_replay_applied",
+            widget=self,
+            origin="controls_v2_post_finalization",
+            applied=[list(p) for p, _ in delta],
+        )
+        self._refresh_controls_v2_profile(immediate=True)
+        return True
 
     def _on_controls_v2_field_changed(self, path, value) -> None:
         path = tuple(path)
@@ -8234,20 +8327,12 @@ class staticWidget(QWidget):
                 immediate=True,
                 preserve_focused_editor=False,
             )
-        # R4B-12 (O-1a-i.1): do NOT apply deferred edits here.  _exit_run_state
-        # runs EARLY in a wrangler run's finalization (before wrangler.stop()
-        # completes, final batch selection/reload, and wrangler_finished()'s
-        # finally clears run-source authority).  Applying now would reconfigure
-        # the still-unwinding run and could half-apply through legacy paths.
-        # Instead schedule the single post-finalization owner on the event loop
-        # so it runs STRICTLY AFTER the whole synchronous unwind, for every
-        # run-end path (wrangler/reintegrate/stitch/abort).  The teardown-safe
-        # 3-arg singleShot binds the callback to `self`, so a destroyed widget
-        # never receives it.  A synchronous drain in
-        # _prepare_controls_v2_run_configuration guarantees the next run still
-        # freezes the final values once even before the event loop ticks.
-        QtCore.QTimer.singleShot(
-            0, self, self._controls_v2_apply_deferred_next_run_edits)
+        # R4B-12 (O-1a-i.2): do NOT schedule the deferred-edit owner here.
+        # _exit_run_state performs several unguarded GUI finalization steps and
+        # runs EARLY in a wrangler run's finalization; an exception in any of
+        # them would bypass scheduling.  Scheduling is owned by the OUTERMOST
+        # finally of each finish handler (wrangler/reintegrate/stitch), after
+        # run-source authority cleanup — so no abort/error path can skip it.
 
     def _on_stop_clicked(self):
         """Single owner of the shared Stop button — route to the active run.
@@ -8509,11 +8594,16 @@ class staticWidget(QWidget):
 
     def integrator_thread_finished(self):
         """Finish a true reintegration and invalidate prior overlay history."""
-        staticWidget._finalize_processing_run(
-            self,
-            reset_overlay=True,
-            origin="integrator",
-        )
+        try:
+            staticWidget._finalize_processing_run(
+                self,
+                reset_overlay=True,
+                origin="integrator",
+            )
+        finally:
+            # R4B-12 (O-1a-i.2): schedule deferred-edit apply from the outermost
+            # finally so a raise in finalization cannot bypass it.
+            staticWidget._controls_v2_schedule_deferred_apply(self)
 
     # ── Stitch (Stitch 1D / Stitch 2D modes) ───────────────────────────
     def _stitch_status(self, msg):
@@ -8628,23 +8718,27 @@ class staticWidget(QWidget):
         display source (StitchDisplayController) — set the flag + bump generation
         BEFORE the refresh so update_all() routes through it (it now survives
         subsequent update() calls instead of the old one-shot paint)."""
-        self.thread_state_changed()
-        if not self.wrangler.thread.isRunning():
-            self._exit_run_state()
-        self.h5viewer.set_open_enabled(True)
-        if getattr(self.stitch_thread, 'ok', False):
-            self.displayframe.stitch_display_mode = self.stitch_thread.mode
-            self.displayframe._bump_display_generation()
-            # Surface a partial skip so the merge isn't silently a subset.
-            skipped = getattr(self.scan, 'stitch_skipped', None) or []
-            suffix = (f' — WARNING: {len(skipped)} frame(s) skipped (no raw data)'
-                      if skipped else '')
-            self._stitch_status(
-                f'Stitch {self.stitch_thread.mode.upper()} complete.{suffix}')
-        # else: _on_stitch_error already surfaced the failure — don't overwrite.
-        self.update_all()
-        if not self.wrangler.thread.isRunning():
-            self.wrangler.enabled(True)
+        try:
+            self.thread_state_changed()
+            if not self.wrangler.thread.isRunning():
+                self._exit_run_state()
+            self.h5viewer.set_open_enabled(True)
+            if getattr(self.stitch_thread, 'ok', False):
+                self.displayframe.stitch_display_mode = self.stitch_thread.mode
+                self.displayframe._bump_display_generation()
+                # Surface a partial skip so the merge isn't silently a subset.
+                skipped = getattr(self.scan, 'stitch_skipped', None) or []
+                suffix = (f' — WARNING: {len(skipped)} frame(s) skipped (no raw data)'
+                          if skipped else '')
+                self._stitch_status(
+                    f'Stitch {self.stitch_thread.mode.upper()} complete.{suffix}')
+            # else: _on_stitch_error already surfaced the failure.
+            self.update_all()
+            if not self.wrangler.thread.isRunning():
+                self.wrangler.enabled(True)
+        finally:
+            # R4B-12 (O-1a-i.2): outermost finally — schedule deferred-edit apply.
+            staticWidget._controls_v2_schedule_deferred_apply(self)
 
     def _on_stitch_error(self, msg):
         """Stitch worker raised (caught in the worker, so the thread survived and
@@ -9311,9 +9405,15 @@ class staticWidget(QWidget):
         double carries the attributes the body touches, not these helpers.
         """
         try:
-            staticWidget._wrangler_finished_body(self)
+            try:
+                staticWidget._wrangler_finished_body(self)
+            finally:
+                staticWidget._clear_controls_v2_run_source_authority(self)
         finally:
-            staticWidget._clear_controls_v2_run_source_authority(self)
+            # R4B-12 (O-1a-i.2): OUTERMOST finally — schedule the deferred-edit
+            # owner after the whole finish tail AND the source-authority cleanup,
+            # so no exception in the body or the cleanup can bypass scheduling.
+            staticWidget._controls_v2_schedule_deferred_apply(self)
 
     def _wrangler_finished_body(self):
         """The run-end finalization body (see :meth:`wrangler_finished`). If the
