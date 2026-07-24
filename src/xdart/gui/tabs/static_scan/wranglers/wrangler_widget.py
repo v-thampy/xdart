@@ -6,6 +6,7 @@
 # Standard library imports
 import logging
 import os
+from collections import deque
 from queue import Queue
 import threading
 import traceback
@@ -215,18 +216,20 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         )
 
     def _next_gi_hydration_generation(self) -> int:
-        """Bump + return the hydration epoch at the START of a metadata request.
+        """Open a GI-motor hydration request; bump + return the hydration epoch.
 
-        Capturing the epoch when the request BEGINS (not when its result is
-        delivered) is what lets the owner reject an older same-root request
-        whose result arrives after a newer one (§13.6 / §13.11 hydration 2)."""
+        §13.6 / §13.11 hydration 2 / §15.12-C.3: the request-local token (this
+        request's generation + the source fingerprint captured AT REQUEST START) is
+        enqueued onto ``_gi_hydration_pending``.  A completing request's
+        :meth:`_emit_gi_hydration` consumes the OLDEST outstanding token (FIFO), so a
+        delayed result carries the identity it was requested under — not whatever the
+        wrangler happens to hold when the result emits.  This is what makes rejection
+        correct once metadata reads run off the GUI thread (the single-slot "latest
+        token" stamp was only safe while synchronous, and mis-stamped A with B's
+        identity under A-starts, then B-starts, then A-completes).  Callers open a
+        request 1:1 with the emit that follows, so no un-emitted token leaks."""
         gen = int(getattr(self, "_gi_hydration_generation", 0) or 0) + 1
         self._gi_hydration_generation = gen
-        # §13.11 hydration 2: capture the source identity AND epoch together AT
-        # REQUEST START into a token, so a delayed result carries the identity it
-        # was requested under — not whatever the wrangler happens to hold by the
-        # time the result emits.  This is what makes rejection correct under async
-        # metadata (the current-state stamp was only safe while synchronous).
         fingerprint = None
         fp_getter = getattr(self, "_gi_source_fingerprint", None)
         if callable(fp_getter):
@@ -234,8 +237,27 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
                 fingerprint = fp_getter()
             except Exception:
                 fingerprint = None
-        self._gi_hydration_request_token = (gen, fingerprint)
+        token = (gen, fingerprint)
+        pending = getattr(self, "_gi_hydration_pending", None)
+        if pending is None:
+            pending = self._gi_hydration_pending = deque(maxlen=16)
+        pending.append(token)
+        # Kept only for external readers / diagnostics; delivery no longer consults
+        # this single slot (it consumes the FIFO token instead).
+        self._gi_hydration_request_token = token
         return gen
+
+    def _begin_gi_hydration_request(self):
+        """Open a hydration request and RETURN its request-local token (§15.12-C.3).
+
+        For a future asynchronous discovery owner that RETAINS the token in its
+        completion closure and passes it back at emit time.  The synchronous GUI
+        paths call :meth:`_next_gi_hydration_generation` directly; both enqueue the
+        same request-local token, so the emit consumes the request it belongs to.
+        Kept a distinct method (not called by the duck-typed test hosts, which bind
+        only the synchronous entry point) to avoid the SimpleNamespace double trap."""
+        self._next_gi_hydration_generation()
+        return self._gi_hydration_request_token
 
     def _emit_gi_hydration(self, motors, *, proved: bool) -> None:
         """Emit a source-qualified :class:`GIMotorHydration` on sigGIMotorOptions.
@@ -259,16 +281,16 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
             state = GIMotorHydration.KNOWN_EMPTY
         else:
             state = GIMotorHydration.UNKNOWN
-        # §13.11 hydration 2: stamp the REQUEST-START token (epoch + source
-        # fingerprint captured when the metadata request BEGAN via
-        # _next_gi_hydration_generation), NOT the wrangler's current state — so an
-        # async result arriving after a newer request or a source change carries
-        # its OWN (now-superseded) identity and the owner rejects it, instead of
-        # it masquerading as the current source.  A direct emit with no captured
-        # request token (e.g. a session re-announce) falls back to current state.
-        token = getattr(self, "_gi_hydration_request_token", None)
-        if isinstance(token, tuple) and len(token) == 2:
-            generation, fingerprint = token
+        # §15.12-C.3: stamp with THIS request's OWN start token — the oldest
+        # outstanding request captured by _begin_gi_hydration_request — NOT a
+        # mutable "latest" slot.  So an async result arriving after a newer request
+        # or a source change carries its OWN (now-superseded) identity and the owner
+        # rejects it, instead of masquerading as the current source.  A direct emit
+        # with no outstanding request (e.g. a session re-announce) falls back to the
+        # current source state.
+        pending = getattr(self, "_gi_hydration_pending", None)
+        if pending:
+            generation, fingerprint = pending.popleft()
         else:
             fingerprint = None
             fp_getter = getattr(self, "_gi_source_fingerprint", None)
@@ -310,8 +332,17 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         # any future emit path that forgets to establish knowledge fails safe to
         # UNKNOWN rather than silently reporting KNOWN_EMPTY.
         self._gi_motor_knowledge_proved = True
-        # Hydration epoch + request-start token (§13.11 hydration 2).
+        # Hydration epoch + request-start token (§13.11 hydration 2 / §15.12-C.3).
+        # ``_gi_hydration_pending`` is a REQUEST-LOCAL FIFO of the tokens captured
+        # when each metadata request STARTED.  A completing request's emit consumes
+        # its OWN start token (the oldest outstanding one) rather than reading a
+        # single mutable "latest" slot — so under A-starts → B-starts → A-completes,
+        # A's late result carries A's identity/epoch and is rejected as superseded
+        # (§15.5 A-late-under-B mis-stamp).  Bounded so a request-without-emit leak
+        # (a gen bump whose discovery finds nothing changed) sheds its stalest token
+        # rather than growing without limit.
         self._gi_hydration_generation = 0
+        self._gi_hydration_pending = deque(maxlen=16)
         self._gi_hydration_request_token = None
         self.parameters = Parameter.create(
             name='wrangler_widget', type='int', value=0

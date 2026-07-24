@@ -2194,12 +2194,6 @@ class imageWrangler(wranglerWidget):
                 logger.debug("directory source intent adoption failed",
                              exc_info=True)
             self._sync_meta_ext_to_img_ext()
-            # §13.6 / §13.11 hydration 2: the source-selection request token is
-            # captured HERE — AFTER the new directory source is applied — so the
-            # GIMotorHydration emitted by discovery below carries the fingerprint
-            # of the source the request is FOR (bumping the epoch at the top,
-            # before the source was set, stamped the PREVIOUS source's identity).
-            self._next_gi_hydration_generation()
             # No representative-file search here.  In particular, Subdirs must
             # not trigger a recursive os.walk or embedded-metadata read merely
             # because the operator selected a directory.
@@ -2248,15 +2242,22 @@ class imageWrangler(wranglerWidget):
                     self, "_directory_metadata_preview_key", None)
             ):
                 self._directory_metadata_preview_key = preview_key
+                # §13.6 / §13.11 hydration 2 / §15.12-C.3: open the hydration
+                # request token HERE — AFTER the new directory source is applied and
+                # ONLY when an adopt (which always emits a GIMotorHydration) will
+                # follow — so the request token is captured 1:1 with its emit (never
+                # leaking an un-emitted token onto the pending FIFO) and carries the
+                # fingerprint of the source the request is FOR.
+                self._next_gi_hydration_generation()
                 self._adopt_directory_metadata_preview(preview_file)
             return
 
-        # §13.6 / §13.11 hydration 2: capture the request token AFTER the single-
-        # image / series source is applied above, so the hydration emitted by the
-        # option-refresh paths below carries THIS request's source identity.
-        self._next_gi_hydration_generation()
         if ((self.img_file != old_fname)
                 or (self.img_file and (len(self.scan_parameters) < 1))):
+            # §13.6 / §13.11 hydration 2 / §15.12-C.3: open the request token AFTER
+            # the single-image / series source is applied above and ONLY on the
+            # branch that refreshes options (emits), so bump and emit stay 1:1.
+            self._next_gi_hydration_generation()
             if (self.meta_ext and self.img_file
                     and self.exists_meta_file(self.img_file)):
                 self.set_pars_from_meta()

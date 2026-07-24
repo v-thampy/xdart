@@ -191,7 +191,7 @@ _LIVE_FLUSH_MIN_MS = 110
 _LIVE_TIMER_MIN_MS = 10
 
 # Qt imports
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 if TYPE_CHECKING:
     QtWidgets: Any = None
     QtCore: Any = None
@@ -325,6 +325,101 @@ class GIMotorObservation:
         if self.state == self.KNOWN_EMPTY:
             return ()
         return None
+
+
+class SourceSelectionIdentity(NamedTuple):
+    """Canonical, immutable identity of a source SELECTION (§15.12-C.1).
+
+    ONE hashable identity shared by the static widget and the candidate stage,
+    covering EVERY source mode so a source change can never collapse two distinct
+    selections to the same token.  It carries the source type, the
+    directory/file/selected-series discriminator, the recursive flag, the image
+    suffix, the file filter, the metadata format/directory, and the NeXus
+    file/entry — closing the §15.5 gaps where non-container Image Directories,
+    NeXus file/entry, and metadata format/directory changes all produced token
+    ``None`` (so a TIFF directory A→B could preserve A's proved motor into B).
+
+    The identity deliberately EXCLUDES the directory request generation: the
+    async request epoch is kept explicit in the wrangler's request-local hydration
+    token (``_gi_hydration_pending``), so re-selecting the SAME source keeps its
+    proved motor observation while a genuine field change invalidates it.  A
+    :meth:`GIMotorObservation.matches` compares these identities by value.
+    """
+
+    source_type: str = ""
+    directory: str = ""
+    selected: str = ""
+    nexus_file: str = ""
+    nexus_entry: str = ""
+    recursive: bool = False
+    suffix: str = ""
+    name_filter: str = ""
+    meta_format: str = ""
+    meta_dir: str = ""
+
+
+def _source_selection_identity(get) -> "SourceSelectionIdentity":
+    """Build a :class:`SourceSelectionIdentity` from a source-field getter.
+
+    ``get(path)`` resolves a legacy source-selection field value (a live Qt
+    parameter for the current selection, or a candidate's reduced/committed value
+    during staging) — the SAME derivation for both so a same-value edit yields an
+    equal identity and a genuine change yields a different one.  Per-mode
+    normalization zeroes the discriminators that do not apply to the selected
+    source type, so an unrelated stale field cannot spuriously invalidate an
+    observation, while any relevant change (dir/file/series/suffix/filter/subdirs/
+    metadata/NeXus) does.  Never ``None`` for a configured source (§15.12-C.2)."""
+    def s(path):
+        return str(get(path) or "").strip()
+
+    source_type = s(("Signal", "inp_type"))
+    meta_format = s(("Signal", "meta_ext"))
+    meta_dir = s(("Signal", "meta_dir"))
+    nexus_file = s(("NeXus File", "nexus_file"))
+    nexus_entry = s(("NeXus File", "entry"))
+    if source_type == "Image Directory":
+        return SourceSelectionIdentity(
+            source_type=source_type,
+            directory=s(("Signal", "img_dir")),
+            recursive=bool(get(("Signal", "include_subdir"))),
+            suffix=s(("Signal", "img_ext")).lstrip(".").lower(),
+            name_filter=s(("Signal", "Filter")),
+            meta_format=meta_format,
+            meta_dir=meta_dir,
+        )
+    if source_type in ("Image Series", "Single Image"):
+        selected = s(("Signal", "File"))
+        return SourceSelectionIdentity(
+            source_type=source_type,
+            selected=selected,
+            suffix=Path(selected).suffix.lstrip(".").lower(),
+            meta_format=meta_format,
+            meta_dir=meta_dir,
+        )
+    if nexus_file or nexus_entry:
+        # NeXus source (own wrangler; no Signal/inp_type surface): identity is the
+        # file + entry, so a file/entry A→B invalidates the old motor knowledge.
+        return SourceSelectionIdentity(
+            source_type=source_type or "NeXus File",
+            nexus_file=nexus_file,
+            nexus_entry=nexus_entry,
+            meta_format=meta_format,
+            meta_dir=meta_dir,
+        )
+    # Any other / not-yet-configured source: still NEVER None — carry every
+    # discriminator so two genuinely different selections cannot collide.
+    return SourceSelectionIdentity(
+        source_type=source_type,
+        directory=s(("Signal", "img_dir")),
+        selected=s(("Signal", "File")),
+        nexus_file=nexus_file,
+        nexus_entry=nexus_entry,
+        recursive=bool(get(("Signal", "include_subdir"))),
+        suffix=s(("Signal", "img_ext")).lstrip(".").lower(),
+        name_filter=s(("Signal", "Filter")),
+        meta_format=meta_format,
+        meta_dir=meta_dir,
+    )
 
 
 class JournalEntry:
@@ -3462,39 +3557,37 @@ class staticWidget(QWidget):
             return  # already journaled at action time (draft/idle)
         self._controls_v2_record_edit(path, edit.value, origin="form")
 
-    @staticmethod
-    def _source_token_from_spec(spec):
-        """A hashable identity of a SourceSpec (§12.5).
-
-        Excludes the directory request-generation so re-selecting the same
-        directory keeps its motor observation; different sources (roots/kinds)
-        produce different tokens.  Shared by the LIVE source token and the
-        CANDIDATE source fingerprint so both are directly comparable."""
-        if spec is None:
-            return None
-        from xrd_tools.sources.selection import DirectorySourceSpec
-        if isinstance(spec, DirectorySourceSpec):
-            return (
-                "directory",
-                str(spec.root),
-                bool(spec.recursive),
-                spec.name_filter,
-                tuple(str(s) for s in spec.suffixes),
-            )
-        kind = getattr(spec, "kind", "")
-        return (
-            "source",
-            str(getattr(spec, "uri", "")),
-            str(getattr(kind, "value", kind)),
-        )
-
     def _controls_v2_source_token(self):
-        """A hashable identity of the CURRENTLY-configured source selection."""
+        """The canonical identity of the CURRENTLY-configured source selection.
+
+        §15.12-C.1/2: a :class:`SourceSelectionIdentity` derived from the live
+        source-selection fields — NEVER ``None`` for a configured source, and
+        covering every mode (non-container directories and NeXus included), so a
+        source change can never collapse to the same token and preserve the old
+        source's proved motor observation into the new one (§15.5)."""
         try:
-            spec = self._controls_v2_freeze_source_spec()
+            return _source_selection_identity(
+                lambda path: self._controls_v2_param_value(path, ""))
         except Exception:
+            logger.debug("source selection identity derivation failed",
+                         exc_info=True)
             return None
-        return self._source_token_from_spec(spec)
+
+    @staticmethod
+    def _controls_v2_candidate_source_getter(cand):
+        """A source-field getter over the CANDIDATE (§13.11 candidate 3).
+
+        Reads the candidate's reduced value for a source-selection path, falling
+        back to the COMMITTED snapshot captured at stage entry — NEVER a live Qt
+        Parameter.  Shared by the candidate SourceSpec derivation and the candidate
+        :class:`SourceSelectionIdentity`, so both see the NEW source, not the stale
+        one, and agree with each other."""
+        def cval(path):
+            p = tuple(path)
+            if p in cand.legacy_projection:
+                return cand.legacy_projection[p]
+            return cand.committed_legacy.get(p, "")
+        return cval
 
     def _controls_v2_candidate_source_spec(self, cand):
         """Derive the CANDIDATE SourceSpec from a source-SELECTION reduce.
@@ -3504,14 +3597,7 @@ class staticWidget(QWidget):
         see the NEW source, never the stale one.  Mirrors
         :meth:`_controls_v2_freeze_source_spec` (Image Directory / Series /
         Single Image); other source types have no typed candidate spec."""
-        def cval(path):
-            p = tuple(path)
-            if p in cand.legacy_projection:
-                return cand.legacy_projection[p]
-            # §13.11 candidate 3: fall back to the COMMITTED snapshot captured at
-            # stage entry, NEVER a live Qt Parameter read.
-            return cand.committed_legacy.get(p, "")
-
+        cval = self._controls_v2_candidate_source_getter(cand)
         source_type = str(cval(("Signal", "inp_type")) or "")
         if source_type == "Image Directory":
             root_text = str(cval(("Signal", "img_dir")) or "").strip()
@@ -4120,8 +4206,14 @@ class staticWidget(QWidget):
                 # A→B edit followed by GI-enable never adopts A's motor.
                 cand.candidate_source_spec = (
                     self._controls_v2_candidate_source_spec(cand))
-                cand.source_fingerprint = self._source_token_from_spec(
-                    cand.candidate_source_spec)
+                # §15.12-C.1/2: the candidate's source identity is derived from the
+                # candidate's OWN reduced source fields (falling back to the
+                # committed snapshot), the SAME derivation the live token uses — so
+                # a source A→B edit yields a DIFFERENT identity for every mode
+                # (including non-container directories and NeXus) and the stored
+                # observation only survives when it is genuinely the same source.
+                cand.source_fingerprint = _source_selection_identity(
+                    self._controls_v2_candidate_source_getter(cand))
                 # §14.11.D.2: reconcile ONLY when the EFFECTIVE selection changes.
                 # A same-value / net-zero source edit (every edited selection path
                 # coerces back to its live value) performs zero reconciliation.
@@ -4481,6 +4573,11 @@ class staticWidget(QWidget):
             "prior_observation": prior_observation,
             "prior_energy_cache": prior_energy_cache,
             "prior_probe_cache": prior_probe_cache,
+            # §15.12-C.5: a typed receipt of the source owner's state BEFORE any
+            # reconcile — configured selection, request generation, observation,
+            # lazy flag, visible status — so recovery can VERIFY restoration rather
+            # than trust a non-raising `_sync`.
+            "source_receipt": self._controls_v2_capture_source_receipt(),
             "params": params,
         }
 
@@ -4582,14 +4679,23 @@ class staticWidget(QWidget):
         Order (reverse of application): source owner -> caches/observation ->
         compound PONI -> display scan -> intent/self-state -> legacy carriers."""
         failures = []
-        # 1. source owner (applied LAST => restored FIRST).  §14.11.B.4: the
-        #    verified restore is the SECOND `_sync` (keeps `len(calls) == 2`).
+        # 1. source owner (applied LAST => restored FIRST).  §15.12-C.5: attempt the
+        #    restore reconcile, then VERIFY the source owner's state against the
+        #    typed receipt (configured selection, request generation, lazy flag).  A
+        #    non-raising `_sync` that did NOT actually restore is a recovery FAILURE
+        #    — not proof of restoration — so a build-aside owner that reconciles once
+        #    (or a no-op restore) is caught here rather than silently "succeeding".
         if source_reconciled:
+            restored = False
             try:
                 self._sync_controls_v2_source_index()
+                restored = self._controls_v2_source_restore_verified(
+                    ctx.get("source_receipt"))
             except Exception:
                 logger.debug("controls source restore reconcile failed",
                              exc_info=True)
+                restored = False
+            if not restored:
                 failures.append(("Source",))
         # Restore observation + caches from the preflight snapshot AFTER any
         # restore-sync, so they are authoritative even if it mutated them again.
@@ -4855,23 +4961,46 @@ class staticWidget(QWidget):
             # installed intent + display scan + integrator combo with that live
             # resolution so all θ-motor surfaces AND the freeze agree without
             # injecting a motor not offered by the source (CLAUDE.md GI rule).
+            #
+            # §15-C folded concern-1: this bridge runs in the Qt fieldChanged SLOT,
+            # OUTSIDE the checked commit engine's rollback boundary.  The atomic
+            # commit already SUCCEEDED (the edit is installed); an exception here
+            # would ESCAPE the slot and crash the GUI.  Contain it to a structured
+            # event — the θ-motor surface reconcile is best-effort display sync, not
+            # a data-integrity step, so a failure degrades to the installed value.
             if path and path[0] == "GI":
-                cfg = self._controls_v2_gi_config()
-                live_intent = self._controls_v2_ensure_run_intent()
-                live_intent.gi = GIIntent(
-                    enabled=bool(cfg["gi"]),
-                    incidence_motor=str(cfg["incidence_motor"] or "Manual"),
-                    th_val=float(cfg["th_val"] or 0.0),
-                    sample_orientation=int(cfg["sample_orientation"] or 4),
-                    tilt_angle=float(cfg["tilt_angle"] or 0.0),
-                    mode_1d=str(cfg["gi_mode_1d"]),
-                    mode_2d=str(cfg["gi_mode_2d"]),
-                )
-                if live_intent.gi.enabled and getattr(self, "scan", None) is not None:
-                    self._controls_v2_apply_gi_config_to_scan(cfg)
-                if cfg.get("gi") and cfg.get("incidence_motor"):
-                    self._controls_v2_sync_integrator_gi_motor(
-                        cfg["incidence_motor"])
+                try:
+                    cfg = self._controls_v2_gi_config()
+                    live_intent = self._controls_v2_ensure_run_intent()
+                    live_intent.gi = GIIntent(
+                        enabled=bool(cfg["gi"]),
+                        incidence_motor=str(cfg["incidence_motor"] or "Manual"),
+                        th_val=float(cfg["th_val"] or 0.0),
+                        sample_orientation=int(cfg["sample_orientation"] or 4),
+                        tilt_angle=float(cfg["tilt_angle"] or 0.0),
+                        mode_1d=str(cfg["gi_mode_1d"]),
+                        mode_2d=str(cfg["gi_mode_2d"]),
+                    )
+                    if (live_intent.gi.enabled
+                            and getattr(self, "scan", None) is not None):
+                        self._controls_v2_apply_gi_config_to_scan(cfg)
+                    if cfg.get("gi") and cfg.get("incidence_motor"):
+                        self._controls_v2_sync_integrator_gi_motor(
+                            cfg["incidence_motor"])
+                except Exception as exc:
+                    logger.debug("post-commit GI theta-motor bridge failed",
+                                 exc_info=True)
+                    run_config_debug_log(
+                        logger,
+                        "controls_gi_bridge_failed",
+                        widget=self,
+                        origin="controls_v2_ui",
+                        field_path=path,
+                        field_value=value,
+                        revision=_idle_rev,
+                        reason=str(exc),
+                        level="warning",
+                    )
             run_config_debug_log(
                 logger,
                 "controls_field_applied",
@@ -6346,6 +6475,54 @@ class staticWidget(QWidget):
         """
         config = self._controls_v2_container_index_config()
         return bool(config is not None and config[0].is_dir())
+
+    def _controls_v2_capture_source_receipt(self):
+        """§15.12-C.5: snapshot the source owner's externally-visible state.
+
+        Captured under the commit's PREFLIGHT (before any reconcile) so
+        :meth:`_controls_v2_source_restore_verified` can prove — not merely assume —
+        that a rollback restored the configured selection, request generation, lazy
+        flag, and visible status.  Reads defensively so a widget with no directory
+        session (non-container source) yields a well-formed empty receipt."""
+        widget = getattr(self, "_controls_v2_source_widget", None)
+        session = getattr(widget, "directory_session", None)
+        panel = getattr(self, "controls_v2", None)
+        config = None
+        try:
+            config = self._controls_v2_container_index_config()
+        except Exception:
+            config = None
+        return {
+            "configured": getattr(session, "configured", None),
+            "generation": int(getattr(session, "request_generation", 0) or 0),
+            "observation": getattr(
+                self, "_controls_v2_directory_observation", None),
+            "lazy": bool(getattr(widget, "directory_subdirs_lazy", False)),
+            "visible": config is not None,
+        }
+
+    def _controls_v2_source_restore_verified(self, receipt) -> bool:
+        """§15.12-C.5: whether the source owner's CURRENT state matches *receipt*.
+
+        Verifies the CONFIGURED SELECTION and the lazy-recursion flag actually
+        returned to their pre-reconcile values — the observable source identity.
+        A ``True`` result is the ONLY proof of restoration; a no-op/non-raising
+        `_sync` that left the session pointed at the new (failed) selection returns
+        ``False`` and is reported as a recovery failure.  The session's
+        ``request_generation`` is captured in the receipt for diagnostics but NOT
+        equality-checked: it is a monotonic counter, so a restore that re-configures
+        the same selection legitimately advances it (restoration is proved by the
+        configured selection returning, not by the counter rewinding)."""
+        if not receipt:
+            return True
+        widget = getattr(self, "_controls_v2_source_widget", None)
+        session = getattr(widget, "directory_session", None)
+        if getattr(session, "configured", None) != receipt.get("configured"):
+            return False
+        if bool(getattr(widget, "directory_subdirs_lazy", False)) != bool(
+                receipt.get("lazy", False)):
+            return False
+        return True
 
     def _sync_controls_v2_source_index(self) -> None:
         widget = getattr(self, "_controls_v2_source_widget", None)
