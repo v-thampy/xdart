@@ -137,6 +137,35 @@ class GIMotorHydration(NamedTuple):
     KNOWN_NONEMPTY = "KNOWN_NONEMPTY"
 
 
+class GIHydrationRequestToken(NamedTuple):
+    """Immutable request-local GI-hydration token (§19.4 req 1).
+
+    Captured when a metadata request STARTS and carried back by the completing
+    emit, so ownership is decided by the request identity — NOT by completion
+    order.  Field order ``(generation, source_fingerprint)`` matches the
+    ``(hydration.generation, hydration.source_fingerprint)`` tuple the owner
+    compares against, and a :class:`GIHydrationRequestToken` compares equal to the
+    plain 2-tuple with the same values."""
+
+    generation: int
+    source_fingerprint: object
+
+
+def _read_gi_source_fingerprint(obj):
+    """The object's CURRENT source fingerprint, read defensively.
+
+    A module function (not a method) so duck-typed test hosts that bind only a
+    subset of wrangler methods onto a ``SimpleNamespace`` never trip on a missing
+    bound helper (the SimpleNamespace-double trap)."""
+    fp_getter = getattr(obj, "_gi_source_fingerprint", None)
+    if callable(fp_getter):
+        try:
+            return fp_getter()
+        except Exception:
+            return None
+    return None
+
+
 class wranglerWidget(Qt.QtWidgets.QWidget):
     """Base class for wranglers. Extending this ensures all methods,
     signals, and attributes expected by ttheta_widget are present.
@@ -218,55 +247,106 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
     def _next_gi_hydration_generation(self) -> int:
         """Open a GI-motor hydration request; bump + return the hydration epoch.
 
-        §13.6 / §13.11 hydration 2 / §15.12-C.3: the request-local token (this
-        request's generation + the source fingerprint captured AT REQUEST START) is
-        enqueued onto ``_gi_hydration_pending``.  A completing request's
-        :meth:`_emit_gi_hydration` consumes the OLDEST outstanding token (FIFO), so a
-        delayed result carries the identity it was requested under — not whatever the
-        wrangler happens to hold when the result emits.  This is what makes rejection
-        correct once metadata reads run off the GUI thread (the single-slot "latest
-        token" stamp was only safe while synchronous, and mis-stamped A with B's
-        identity under A-starts, then B-starts, then A-completes).  Callers open a
-        request 1:1 with the emit that follows, so no un-emitted token leaks."""
+        §19.4 / §13.6 / §15.12-C.3: an immutable :class:`GIHydrationRequestToken`
+        (this request's generation + the source fingerprint captured AT REQUEST
+        START) is registered as an OUTSTANDING request.  The completing
+        :meth:`_emit_gi_hydration` carries that exact token — via an explicit
+        ``token=`` argument on a future asynchronous owner, or, for the synchronous
+        GUI paths, the CURRENT (most-recently-opened) outstanding request (§19.4
+        req 5).  Ownership is therefore the request identity, never completion
+        order — the old FIFO-oldest pop mis-stamped A with B's identity under
+        A-starts → B-starts → B-completes."""
         gen = int(getattr(self, "_gi_hydration_generation", 0) or 0) + 1
         self._gi_hydration_generation = gen
-        fingerprint = None
-        fp_getter = getattr(self, "_gi_source_fingerprint", None)
-        if callable(fp_getter):
-            try:
-                fingerprint = fp_getter()
-            except Exception:
-                fingerprint = None
-        token = (gen, fingerprint)
+        token = GIHydrationRequestToken(
+            gen, _read_gi_source_fingerprint(self))
         pending = getattr(self, "_gi_hydration_pending", None)
         if pending is None:
             pending = self._gi_hydration_pending = deque(maxlen=16)
         pending.append(token)
-        # Kept only for external readers / diagnostics; delivery no longer consults
-        # this single slot (it consumes the FIFO token instead).
+        # Kept only for external readers / diagnostics.
         self._gi_hydration_request_token = token
         return gen
 
-    def _begin_gi_hydration_request(self):
-        """Open a hydration request and RETURN its request-local token (§15.12-C.3).
+    def _begin_gi_hydration_request(self) -> "GIHydrationRequestToken":
+        """Open a hydration request and RETURN its immutable request-local token.
 
-        For a future asynchronous discovery owner that RETAINS the token in its
-        completion closure and passes it back at emit time.  The synchronous GUI
-        paths call :meth:`_next_gi_hydration_generation` directly; both enqueue the
-        same request-local token, so the emit consumes the request it belongs to.
-        Kept a distinct method (not called by the duck-typed test hosts, which bind
-        only the synchronous entry point) to avoid the SimpleNamespace double trap."""
+        §19.4 req 2: an asynchronous discovery owner RETAINS this exact token in its
+        completion closure and passes it back as ``_emit_gi_hydration(..., token=)``,
+        so ownership is decided by the request that completes, not by completion
+        order.  The synchronous GUI paths call :meth:`_next_gi_hydration_generation`
+        directly and let the emit take the current outstanding request."""
         self._next_gi_hydration_generation()
         return self._gi_hydration_request_token
 
-    def _emit_gi_hydration(self, motors, *, proved: bool) -> None:
+    def _cancel_gi_hydration_request(self, token=None) -> bool:
+        """Cancel one outstanding request so it can NEVER complete as current.
+
+        §19.4 req 6: a request whose discovery failed (or was abandoned) must be
+        invalidated, not left outstanding — otherwise a late result carrying its
+        token would still match the live epoch and be adopted as the current
+        source's knowledge.  Removes the EXACT token from the outstanding
+        registry (identity, never completion order) and, when the cancelled
+        request is the one that defines the current epoch, advances the epoch so
+        its identity is permanently superseded.  ``token=None`` cancels the
+        current (most-recently-opened) outstanding request.  Returns whether a
+        registered token was removed."""
+        pending = getattr(self, "_gi_hydration_pending", None)
+        if token is None:
+            if not pending:
+                return False
+            token = pending[-1]
+        removed = False
+        if pending is not None:
+            try:
+                pending.remove(token)
+                removed = True
+            except ValueError:
+                removed = False
+        generation = int(getattr(token, "generation", 0) or 0)
+        if generation and generation == int(
+                getattr(self, "_gi_hydration_generation", 0) or 0):
+            self._gi_hydration_generation = generation + 1
+        if getattr(self, "_gi_hydration_request_token", None) == token:
+            self._gi_hydration_request_token = None
+        return removed
+
+    def _invalidate_gi_hydration_requests(self) -> int:
+        """Cancel EVERY outstanding request and advance the epoch (§19.4 req 6).
+
+        Used on teardown/close (and available to any source-identity reset that
+        wants to abandon in-flight discovery wholesale): after this, no
+        previously issued token can be judged current, whichever order the
+        completions arrive in.  Returns the new epoch."""
+        pending = getattr(self, "_gi_hydration_pending", None)
+        if pending:
+            pending.clear()
+        self._gi_hydration_request_token = None
+        gen = int(getattr(self, "_gi_hydration_generation", 0) or 0) + 1
+        self._gi_hydration_generation = gen
+        return gen
+
+    def closeEvent(self, event):
+        """Invalidate outstanding GI-hydration requests on close (§19.4 req 6)."""
+        try:
+            self._invalidate_gi_hydration_requests()
+        except Exception:
+            logger.debug(
+                "[GI] hydration invalidation on close failed", exc_info=True)
+        super().closeEvent(event)
+
+    def _emit_gi_hydration(self, motors, *, proved: bool, token=None) -> None:
         """Emit a source-qualified :class:`GIMotorHydration` on sigGIMotorOptions.
 
         ``proved`` records whether a TARGETED inspection ran: an empty motor
         list from a proved inspection is ``KNOWN_EMPTY``, but an empty list with
         nothing inspected is ``UNKNOWN`` (§13.7 — never classify a lazy
         recursive directory as known-empty).  A non-empty list is always
-        ``KNOWN_NONEMPTY``.  getattr-guarded so duck-typed hosts without the Qt
+        ``KNOWN_NONEMPTY``.  ``token`` is the request-local identity captured at
+        request start (§19.4): an asynchronous owner passes its OWN token so the
+        result carries the identity it was requested under regardless of completion
+        order; a synchronous emit leaves it ``None`` and takes the current
+        outstanding request.  getattr-guarded so duck-typed hosts without the Qt
         signal are a harmless no-op."""
         sig = getattr(self, "sigGIMotorOptions", None)
         if sig is None:
@@ -281,25 +361,30 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
             state = GIMotorHydration.KNOWN_EMPTY
         else:
             state = GIMotorHydration.UNKNOWN
-        # §15.12-C.3: stamp with THIS request's OWN start token — the oldest
-        # outstanding request captured by _begin_gi_hydration_request — NOT a
-        # mutable "latest" slot.  So an async result arriving after a newer request
-        # or a source change carries its OWN (now-superseded) identity and the owner
-        # rejects it, instead of masquerading as the current source.  A direct emit
-        # with no outstanding request (e.g. a session re-announce) falls back to the
-        # current source state.
+        # §19.4 req 3-5: resolve + retire the request token this completion belongs
+        # to.  An EXPLICIT ``token`` (async owner carrying its own request identity)
+        # is removed by value and used verbatim — never inferred from completion
+        # order.  ``token is None`` (a synchronous emit / direct re-announce) takes
+        # the CURRENT (most-recently-opened) outstanding request (§19.4 req 5's
+        # "current request token"), else the live source state.  Inlined — never a
+        # ``self.<helper>`` call — so a duck-typed host that binds only this method
+        # does not trip the SimpleNamespace-double trap.
         pending = getattr(self, "_gi_hydration_pending", None)
-        if pending:
-            generation, fingerprint = pending.popleft()
-        else:
-            fingerprint = None
-            fp_getter = getattr(self, "_gi_source_fingerprint", None)
-            if callable(fp_getter):
+        if token is not None:
+            if pending is not None:
                 try:
-                    fingerprint = fp_getter()
-                except Exception:
-                    fingerprint = None
+                    pending.remove(token)
+                except ValueError:
+                    pass
+            generation = int(getattr(token, "generation", 0) or 0)
+            fingerprint = getattr(token, "source_fingerprint", None)
+        elif pending:
+            current = pending.pop()  # most-recently-opened outstanding request
+            generation = int(current.generation)
+            fingerprint = current.source_fingerprint
+        else:
             generation = int(getattr(self, "_gi_hydration_generation", 0) or 0)
+            fingerprint = _read_gi_source_fingerprint(self)
         sig.emit(GIMotorHydration(state, real, fingerprint, generation))
 
     def gi_hydration_is_current(self, hydration) -> bool:
@@ -333,15 +418,15 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         # source (a proven empty inspection — e.g. Eiger — is KNOWN_EMPTY), and it is
         # a persistent instance bit so a direct re-announce carries the prior proof.
         self._gi_motor_knowledge_proved = False
-        # Hydration epoch + request-start token (§13.11 hydration 2 / §15.12-C.3).
-        # ``_gi_hydration_pending`` is a REQUEST-LOCAL FIFO of the tokens captured
-        # when each metadata request STARTED.  A completing request's emit consumes
-        # its OWN start token (the oldest outstanding one) rather than reading a
-        # single mutable "latest" slot — so under A-starts → B-starts → A-completes,
-        # A's late result carries A's identity/epoch and is rejected as superseded
-        # (§15.5 A-late-under-B mis-stamp).  Bounded so a request-without-emit leak
-        # (a gen bump whose discovery finds nothing changed) sheds its stalest token
-        # rather than growing without limit.
+        # Hydration epoch + outstanding request tokens (§19.4 / §13.11 hydration 2 /
+        # §15.12-C.3).  ``_gi_hydration_pending`` holds the immutable
+        # :class:`GIHydrationRequestToken` captured when each metadata request
+        # STARTED.  A completion carries its OWN token — passed explicitly by an
+        # async owner (removed by identity), or taken as the CURRENT outstanding
+        # request by a synchronous emit — so ownership is the request identity, NOT
+        # completion order (the old OLDEST-first pop mis-stamped A with B's identity
+        # under A-starts → B-starts → B-completes; §15.5 / §19.4).  Bounded so a
+        # request-without-emit leak sheds its stalest token rather than growing.
         self._gi_hydration_generation = 0
         self._gi_hydration_pending = deque(maxlen=16)
         self._gi_hydration_request_token = None

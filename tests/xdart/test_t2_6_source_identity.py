@@ -135,7 +135,11 @@ def test_metadata_format_change_invalidates_observation(widget, tmp_path):
 
 def test_overlapped_late_a_result_is_rejected(widget, qapp):
     """A starts → B starts → A completes late: A carries its OWN start identity
-    and is rejected as superseded (§15.5 A-late-under-B mis-stamp)."""
+    and is rejected as superseded (§15.5 A-late-under-B mis-stamp).
+
+    §19.4 update: A's completion now CARRIES A's token (``token=token_a``)
+    rather than relying on a FIFO-oldest pop at the completion seam — completion
+    order must never select request identity."""
     wrangler = widget.wrangler
     emitted = []
     wrangler.sigGIMotorOptions.connect(emitted.append)
@@ -143,11 +147,12 @@ def test_overlapped_late_a_result_is_rejected(widget, qapp):
 
     wrangler.img_dir = "/tmp/c-source-a"
     fingerprint_a = wrangler._gi_source_fingerprint()
-    wrangler._next_gi_hydration_generation()          # A's request
+    token_a = wrangler._begin_gi_hydration_request()  # A's request
 
     wrangler.img_dir = "/tmp/c-source-b"
-    wrangler._next_gi_hydration_generation()          # B's request
-    wrangler._emit_gi_hydration(["halpha"], proved=True)   # A completes late
+    wrangler._begin_gi_hydration_request()            # B's request
+    # A completes late, under its own token.
+    wrangler._emit_gi_hydration(["halpha"], proved=True, token=token_a)
     qapp.processEvents()
 
     assert emitted[-1].source_fingerprint == fingerprint_a
@@ -156,16 +161,19 @@ def test_overlapped_late_a_result_is_rejected(widget, qapp):
 
 def test_older_same_source_request_completing_after_newer_is_rejected(widget, qapp):
     """Two requests for the SAME source; the older completes after the newer was
-    opened — the older result is rejected on its (lower) generation."""
+    opened — the older result is rejected on its (lower) generation.
+
+    §19.4 update: the older completion carries the older request's token."""
     wrangler = widget.wrangler
     emitted = []
     wrangler.sigGIMotorOptions.connect(emitted.append)
     wrangler.inp_type = "Image Directory"
     wrangler.img_dir = "/tmp/c-same-source"
 
-    wrangler._next_gi_hydration_generation()          # older request
-    wrangler._next_gi_hydration_generation()          # newer request
-    wrangler._emit_gi_hydration(["halpha"], proved=True)   # older completes first
+    token_older = wrangler._begin_gi_hydration_request()   # older request
+    wrangler._begin_gi_hydration_request()                 # newer request
+    # The older request completes first, under its own token.
+    wrangler._emit_gi_hydration(["halpha"], proved=True, token=token_older)
     qapp.processEvents()
 
     older = emitted[-1]

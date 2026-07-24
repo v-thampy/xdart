@@ -488,12 +488,18 @@ class nexusWrangler(wranglerWidget):
         metadata without this.  §13.6: emits a source-qualified GIMotorHydration
         (a read of a specific file is a PROVED inspection, so an empty result is
         KNOWN_EMPTY).  A read failure emits nothing (leaves prior knowledge).
+
+        §19.4 req 3/6: the request's own immutable token is captured at request
+        START and carried back by the completing emit, so ownership is the
+        request identity rather than completion order; a failed read CANCELS
+        that exact token instead of leaving it outstanding (a leaked token would
+        let a later synchronous emit inherit this request's identity).
         """
         sig = getattr(self, 'sigGIMotorOptions', None)
         if sig is None or not self.nexus_file:
             return
         # A specific NeXus file was selected -> a new hydration request starts.
-        self._next_gi_hydration_generation()
+        token = self._begin_gi_hydration_request()
         try:
             from xrd_tools.io.nexus import read_nexus
             entry = (self.parameters.child('NeXus File').child('entry').value()
@@ -502,8 +508,9 @@ class nexusWrangler(wranglerWidget):
             motors = list(getattr(meta, 'angles', None) or {})
         except Exception:
             logger.debug("[NEXUS] GI-motor option read failed", exc_info=True)
+            self._cancel_gi_hydration_request(token)
             return
-        self._emit_gi_hydration(motors, proved=True)
+        self._emit_gi_hydration(motors, proved=True, token=token)
 
     def browse_mask(self):
         mask_file, _ = QFileDialog.getOpenFileName(

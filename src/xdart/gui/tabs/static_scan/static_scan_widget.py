@@ -661,6 +661,24 @@ class _PreparedLegacyCarrier:
         self.expected = expected
 
 
+class SourceRecoveryReceipt(NamedTuple):
+    """Frozen snapshot of the source owner's externally-visible state (§19.4 req 8).
+
+    Captured at the commit's PREFLIGHT (before any reconcile) so recovery can PROVE
+    — not assume — that a rollback restored the configured selection and lazy
+    session state.  ``configured`` (the session's configured selection) and
+    ``lazy`` (the directory recursion flag) are the restoration proof; ``generation``
+    and ``observation`` are diagnostic-only (the request generation is a monotonic
+    counter that legitimately advances on a re-configure of the same selection, so
+    it is NOT equality-checked)."""
+
+    configured: object
+    generation: int
+    observation: object
+    lazy: bool
+    visible: bool
+
+
 from .ui.staticUI import Ui_Form
 from .h5viewer import H5Viewer, _qt_enum_value
 from .display_frame_widget import displayFrameWidget
@@ -6703,14 +6721,14 @@ class staticWidget(QWidget):
             config = self._controls_v2_container_index_config()
         except Exception:
             config = None
-        return {
-            "configured": getattr(session, "configured", None),
-            "generation": int(getattr(session, "request_generation", 0) or 0),
-            "observation": getattr(
+        return SourceRecoveryReceipt(
+            configured=getattr(session, "configured", None),
+            generation=int(getattr(session, "request_generation", 0) or 0),
+            observation=getattr(
                 self, "_controls_v2_directory_observation", None),
-            "lazy": bool(getattr(widget, "directory_subdirs_lazy", False)),
-            "visible": config is not None,
-        }
+            lazy=bool(getattr(widget, "directory_subdirs_lazy", False)),
+            visible=config is not None,
+        )
 
     def _controls_v2_source_restore_verified(self, receipt) -> bool:
         """§15.12-C.5: whether the source owner's CURRENT state matches *receipt*.
@@ -6724,14 +6742,14 @@ class staticWidget(QWidget):
         equality-checked: it is a monotonic counter, so a restore that re-configures
         the same selection legitimately advances it (restoration is proved by the
         configured selection returning, not by the counter rewinding)."""
-        if not receipt:
+        if receipt is None:
             return True
         widget = getattr(self, "_controls_v2_source_widget", None)
         session = getattr(widget, "directory_session", None)
-        if getattr(session, "configured", None) != receipt.get("configured"):
+        if getattr(session, "configured", None) != receipt.configured:
             return False
         if bool(getattr(widget, "directory_subdirs_lazy", False)) != bool(
-                receipt.get("lazy", False)):
+                receipt.lazy):
             return False
         return True
 
