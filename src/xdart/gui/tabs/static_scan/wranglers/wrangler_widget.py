@@ -325,13 +325,14 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         self.file_lock = file_lock
         self.fname = fname
         self.scan_name = 'null_thread'
-        # §13.11 hydration 5 / §13.7: GI-motor knowledge state.  The lazy
-        # recursive "not inspected" paths downgrade this to False EXPLICITLY
-        # before publishing so an uninspected source is UNKNOWN (never
-        # known-empty).  The emit-time getattr FALLBACK is inverted to False so
-        # any future emit path that forgets to establish knowledge fails safe to
-        # UNKNOWN rather than silently reporting KNOWN_EMPTY.
-        self._gi_motor_knowledge_proved = True
+        # §13.11 hydration 5 / §13.7 / §15.12-C.4: GI-motor knowledge state.  Proof
+        # initializes FALSE — a fresh wrangler that has NOT run a targeted metadata
+        # inspection is UNKNOWN, never known-empty, so a bare empty emit preserves an
+        # explicit / session-restored motor instead of resolving it to Manual.  The
+        # discovery paths set this True/False EXPLICITLY once they have inspected the
+        # source (a proven empty inspection — e.g. Eiger — is KNOWN_EMPTY), and it is
+        # a persistent instance bit so a direct re-announce carries the prior proof.
+        self._gi_motor_knowledge_proved = False
         # Hydration epoch + request-start token (§13.11 hydration 2 / §15.12-C.3).
         # ``_gi_hydration_pending`` is a REQUEST-LOCAL FIFO of the tokens captured
         # when each metadata request STARTED.  A completing request's emit consumes
