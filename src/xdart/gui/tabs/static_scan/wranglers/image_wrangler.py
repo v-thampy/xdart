@@ -2624,8 +2624,19 @@ class imageWrangler(wranglerWidget):
         # than silently reporting KNOWN_EMPTY.
         _avail = [p for p in self.motors
                   if not any(x.lower() in p.lower() for x in ['ROI', 'PD'])]
-        self._emit_gi_hydration(
-            _avail, proved=bool(getattr(self, '_gi_motor_knowledge_proved', False)))
+        _proved = bool(getattr(self, '_gi_motor_knowledge_proved', False))
+        # §21.4 req 4-5: the synchronous image discovery paths OPEN a request in
+        # get_img_fname and complete it HERE, so the request's own token is
+        # threaded through `_gi_hydration_open_token` rather than re-derived from
+        # completion order.  With no open request this is a direct re-announcement
+        # of the current source, which goes through the structurally separate
+        # announce API and consumes no request.  Read as an ATTRIBUTE so a
+        # duck-typed host that binds only the emit methods still works.
+        _token = getattr(self, '_gi_hydration_open_token', None)
+        if _token is not None:
+            self._emit_gi_hydration(_avail, proved=_proved, token=_token)
+        else:
+            self._announce_gi_hydration(_avail, proved=_proved)
 
     def set_gi_th_motor(self):
         """Update Grazing theta motor.

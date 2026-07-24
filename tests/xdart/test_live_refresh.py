@@ -2556,6 +2556,12 @@ def test_gi_motor_options_default_manual_when_no_metadata():
         h.set_gi_th_motor = MethodType(imageWrangler.set_gi_th_motor, h)
         h.set_gi_motor_options = MethodType(imageWrangler.set_gi_motor_options, h)
         h._emit_gi_hydration = MethodType(imageWrangler._emit_gi_hydration, h)
+        h._announce_gi_hydration = MethodType(
+            imageWrangler._announce_gi_hydration, h)
+        h._gi_hydration_registry = MethodType(
+            imageWrangler._gi_hydration_registry, h)
+        h._retire_gi_hydration_token = MethodType(
+            imageWrangler._retire_gi_hydration_token, h)
         h._gi_source_fingerprint = MethodType(imageWrangler._gi_source_fingerprint, h)
         h._next_gi_hydration_generation = MethodType(
             imageWrangler._next_gi_hydration_generation, h)
@@ -2610,6 +2616,12 @@ def test_gi_motor_options_default_select_follows_preference_order():
         h.set_gi_th_motor = MethodType(imageWrangler.set_gi_th_motor, h)
         h.set_gi_motor_options = MethodType(imageWrangler.set_gi_motor_options, h)
         h._emit_gi_hydration = MethodType(imageWrangler._emit_gi_hydration, h)
+        h._announce_gi_hydration = MethodType(
+            imageWrangler._announce_gi_hydration, h)
+        h._gi_hydration_registry = MethodType(
+            imageWrangler._gi_hydration_registry, h)
+        h._retire_gi_hydration_token = MethodType(
+            imageWrangler._retire_gi_hydration_token, h)
         h._gi_source_fingerprint = MethodType(imageWrangler._gi_source_fingerprint, h)
         h._next_gi_hydration_generation = MethodType(
             imageWrangler._next_gi_hydration_generation, h)
@@ -2693,6 +2705,12 @@ def test_get_img_fname_clears_motors_when_source_switch_resolves_no_file():
     h._gi_source_fingerprint = MethodType(imageWrangler._gi_source_fingerprint, h)
     h.set_gi_motor_options = MethodType(imageWrangler.set_gi_motor_options, h)
     h._emit_gi_hydration = MethodType(imageWrangler._emit_gi_hydration, h)
+    h._announce_gi_hydration = MethodType(
+        imageWrangler._announce_gi_hydration, h)
+    h._gi_hydration_registry = MethodType(
+        imageWrangler._gi_hydration_registry, h)
+    h._retire_gi_hydration_token = MethodType(
+        imageWrangler._retire_gi_hydration_token, h)
     h.set_gi_th_motor = MethodType(imageWrangler.set_gi_th_motor, h)
     # Real directory-preview seam (get_img_fname -> _directory_metadata_preview_file
     # -> _adopt_directory_metadata_preview).  img_dir="" ("no directory chosen")

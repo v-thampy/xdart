@@ -39,7 +39,7 @@ def _emitted_collector(wrangler):
     emitted = []
     wrangler.sigGIMotorOptions.connect(emitted.append)
     wrangler.inp_type = "Image Directory"
-    wrangler._gi_hydration_pending.clear()
+    wrangler._invalidate_gi_hydration_requests()
     return emitted
 
 
@@ -52,9 +52,10 @@ def test_reverse_order_completion_keeps_each_requests_token(widget, qapp):
     wrangler.img_dir = "/tmp/t26r-b"
     token_b = wrangler._begin_gi_hydration_request()
 
-    # B completes first, then stale A.
-    wrangler._emit_gi_hydration(["motor_b"], proved=True)
-    wrangler._emit_gi_hydration(["motor_a"], proved=True)
+    # B completes first, then stale A — each carrying ITS OWN token (§21.4 req 6:
+    # a no-token emit is a re-announcement, never a simulated async completion).
+    wrangler._emit_gi_hydration(["motor_b"], proved=True, token=token_b)
+    wrangler._emit_gi_hydration(["motor_a"], proved=True, token=token_a)
     qapp.processEvents()
 
     first, second = emitted[-2:]
@@ -139,16 +140,20 @@ def test_duplicate_completion_never_steals_another_requests_token(widget, qapp):
     wrangler.img_dir = "/tmp/t26r-dup-b"
     token_b = wrangler._begin_gi_hydration_request()
 
-    wrangler._emit_gi_hydration(["motor_a"], proved=True, token=token_a)
-    wrangler._emit_gi_hydration(["motor_a"], proved=True, token=token_a)
+    assert wrangler._emit_gi_hydration(
+        ["motor_a"], proved=True, token=token_a).accepted is True
+    accepted_count = len(emitted)
+    # §21.4 req 1: the token was a SINGLE-COMPLETION capability — the duplicate is
+    # inert and cannot emit again under A's (or anyone's) identity.
+    assert wrangler._emit_gi_hydration(
+        ["motor_a_again"], proved=True, token=token_a).accepted is False
     qapp.processEvents()
-
-    first, second = emitted[-2:]
-    assert (first.generation, first.source_fingerprint) == token_a
-    assert (second.generation, second.source_fingerprint) == token_a
-    # B is still outstanding and still the current request.
-    assert wrangler.gi_hydration_is_current(second) is False
-    wrangler._emit_gi_hydration(["motor_b"], proved=True, token=token_b)
+    assert len(emitted) == accepted_count
+    assert (emitted[-1].generation, emitted[-1].source_fingerprint) == token_a
+    assert wrangler.gi_hydration_is_current(emitted[-1]) is False
+    # B is untouched by A's replay and still completes for its own owner.
+    assert wrangler._emit_gi_hydration(
+        ["motor_b"], proved=True, token=token_b).accepted is True
     qapp.processEvents()
     assert wrangler.gi_hydration_is_current(emitted[-1]) is True
 
@@ -164,9 +169,11 @@ def test_requests_beyond_the_former_deque_capacity_keep_their_tokens(widget, qap
     tokens = [
         wrangler._begin_gi_hydration_request() for _ in range(capacity + 4)
     ]
-    # The oldest tokens have been shed from the bounded registry ...
+    # The oldest tokens are shed from the bounded DIAGNOSTIC history ...
     assert tokens[0] not in wrangler._gi_hydration_pending
-    # ... but the request that holds one still completes under its own identity.
+    # ... but the identity-keyed AUTHORITY still holds them (§21.4 req 3), so the
+    # request that holds one still completes under its own identity.
+    assert wrangler._gi_hydration_token_outstanding(tokens[0]) is True
     wrangler._emit_gi_hydration(["oldest"], proved=True, token=tokens[0])
     wrangler._emit_gi_hydration(["newest"], proved=True, token=tokens[-1])
     qapp.processEvents()
@@ -188,15 +195,18 @@ def test_cancelled_request_can_never_complete_as_current(widget, qapp):
 
     token = wrangler._begin_gi_hydration_request()
     assert wrangler._cancel_gi_hydration_request(token) is True
-    assert token not in wrangler._gi_hydration_pending
+    assert wrangler._gi_hydration_token_outstanding(token) is False
 
-    wrangler._emit_gi_hydration(["late"], proved=True, token=token)
+    # §21.4 req 2: a cancelled token yields NO owner-applicable emission.
+    before = len(emitted)
+    assert wrangler._emit_gi_hydration(
+        ["late"], proved=True, token=token).accepted is False
     qapp.processEvents()
-    assert wrangler.gi_hydration_is_current(emitted[-1]) is False
+    assert len(emitted) == before
 
-    # A following synchronous emit must not adopt the cancelled identity.
+    # A following completion must not adopt the cancelled identity.
     fresh = wrangler._begin_gi_hydration_request()
-    wrangler._emit_gi_hydration(["fresh"], proved=True)
+    wrangler._emit_gi_hydration(["fresh"], proved=True, token=fresh)
     qapp.processEvents()
     assert (emitted[-1].generation, emitted[-1].source_fingerprint) == fresh
     assert wrangler.gi_hydration_is_current(emitted[-1]) is True
@@ -213,12 +223,15 @@ def test_close_invalidates_every_outstanding_request(widget, qapp):
 
     wrangler.close()
     qapp.processEvents()
-    assert not wrangler._gi_hydration_pending
+    assert not wrangler._gi_hydration_outstanding
 
+    # §21.4 req 2: an invalidated token yields NO owner-applicable emission.
     for token in (token_a, token_b):
-        wrangler._emit_gi_hydration(["after_close"], proved=True, token=token)
+        before = len(emitted)
+        assert wrangler._emit_gi_hydration(
+            ["after_close"], proved=True, token=token).accepted is False
         qapp.processEvents()
-        assert wrangler.gi_hydration_is_current(emitted[-1]) is False
+        assert len(emitted) == before
 
 
 def test_nexus_read_failure_cancels_its_own_request(widget, qapp, monkeypatch, tmp_path):
@@ -232,13 +245,13 @@ def test_nexus_read_failure_cancels_its_own_request(widget, qapp, monkeypatch, t
     target = tmp_path / "broken.nxs"
     target.write_bytes(b"not-a-nexus-file")
     wrangler.nexus_file = str(target)
-    wrangler._gi_hydration_pending.clear()
+    wrangler._invalidate_gi_hydration_requests()
     before = int(wrangler._gi_hydration_generation)
 
     wrangler._emit_gi_motor_options()          # the read raises -> cancel
     qapp.processEvents()
 
-    assert not wrangler._gi_hydration_pending          # no leaked token
+    assert not wrangler._gi_hydration_outstanding      # no leaked token
     assert int(wrangler._gi_hydration_generation) > before
 
 

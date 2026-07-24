@@ -274,7 +274,7 @@ def test_async_gi_hydration_under_changed_source_is_rejected(widget, tmp_path):
     wrangler.inp_type = "Image Directory"
     wrangler.img_dir = str(dir_a)
     fp_a = wrangler._gi_source_fingerprint()
-    wrangler._next_gi_hydration_generation()
+    token = wrangler._begin_gi_hydration_request()
 
     # The source changes to B before A's metadata result comes back.
     wrangler.img_dir = str(dir_b)
@@ -282,7 +282,7 @@ def test_async_gi_hydration_under_changed_source_is_rejected(widget, tmp_path):
 
     # A's delayed result emits — it must carry A's request-start fingerprint,
     # NOT the current source B, and the owner must reject it as stale.
-    wrangler._emit_gi_hydration(["halpha"], proved=True)
+    wrangler._emit_gi_hydration(["halpha"], proved=True, token=token)
 
     assert captured, "sigGIMotorOptions did not emit"
     payload = captured[-1]

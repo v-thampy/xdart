@@ -315,12 +315,22 @@ class SectionCard(QtWidgets.QFrame):
         label.setObjectName("controlsV2GroupHeader")
         self.add_row(label)
 
+    def embedded_visible(self) -> bool:
+        """The embedded widget's EXPLICIT projection state (§21.5 req 2).
+
+        The visibility this card last actually applied — observed projection
+        state, not the caller's desired configuration, and independent of whether
+        an ancestor happens to be shown (so it is meaningful offscreen).  The
+        source-recovery receipt proves against this."""
+        return bool(getattr(self, "_embedded_visible", False))
+
     def set_embedded_widget(
         self,
         widget: QtWidgets.QWidget | None,
         *,
         visible: bool = True,
     ) -> None:
+        self._embedded_visible = bool(widget is not None and visible)
         current = self.embedded_layout.itemAt(0)
         if current is not None and current.widget() is widget:
             self.embedded.setVisible(widget is not None and visible)
@@ -976,6 +986,14 @@ class ControlsPanelV2(QtWidgets.QWidget):
     ) -> None:
         """Mount the shared authoritative source observer in the Source card."""
         self.source_card.set_embedded_widget(widget, visible=visible)
+
+    def source_widget_visible(self) -> bool:
+        """The Source card's EXPLICIT embedded-source visibility (§21.5 req 2).
+
+        The reviewed accessor the Controls transaction's source-recovery receipt
+        proves against — what the projection last applied, never the desired
+        `config is not None`."""
+        return self.source_card.embedded_visible()
 
     @property
     def profile(self) -> ControlProfile | None:

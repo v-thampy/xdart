@@ -147,10 +147,13 @@ def _wrangler_holder():
         "_directory_metadata_preview_file",
         "_adopt_directory_metadata_preview",
         "get_img_fname",
-        # §13.6 structured GI hydration helpers used by the emit path.
+        # §13.6/§21.4 structured GI hydration helpers used by the emit path.
         "_gi_source_fingerprint",
         "_next_gi_hydration_generation",
+        "_gi_hydration_registry",
+        "_retire_gi_hydration_token",
         "_emit_gi_hydration",
+        "_announce_gi_hydration",
     ):
         setattr(h, name, MethodType(getattr(imageWrangler, name), h))
     return h, root

@@ -791,15 +791,32 @@ class _PreparedLegacyCarrier:
 
 
 class SourceRecoveryReceipt(NamedTuple):
-    """Frozen snapshot of the source owner's externally-visible state (§19.4 req 8).
+    """Frozen snapshot of the source owner's externally-visible state (§19.4 req 8,
+    field contract decided per §21.5 req 1).
 
     Captured at the commit's PREFLIGHT (before any reconcile) so recovery can PROVE
-    — not assume — that a rollback restored the configured selection and lazy
-    session state.  ``configured`` (the session's configured selection) and
-    ``lazy`` (the directory recursion flag) are the restoration proof; ``generation``
-    and ``observation`` are diagnostic-only (the request generation is a monotonic
-    counter that legitimately advances on a re-configure of the same selection, so
-    it is NOT equality-checked)."""
+    — not assume — that a rollback restored the source owner.
+
+    PROOF FIELDS — every one of these is verified after the recovery reconcile,
+    and a mismatch is a named ``("Source",)`` recovery failure:
+
+    * ``configured`` — the session's configured selection (prior source identity);
+    * ``lazy`` — the directory recursion flag;
+    * ``visible`` — the EXPLICIT embedded-source projection state, read through
+      the reviewed ``controls_v2.source_widget_visible()`` accessor.  This is what
+      the Source card last actually applied, NOT the desired ``config is not None``
+      (which is configuration, not observed projection), so a silent visibility
+      no-op during rollback is caught.
+
+    DIAGNOSTIC FIELDS — recorded for reporting, never equality-checked:
+
+    * ``generation`` — the session's monotonic request counter, which legitimately
+      advances when a restore re-configures the same selection;
+    * ``observation`` — a BY-VALUE snapshot of the directory observation (the
+      cache owner restores and verifies the live object separately, under
+      ``("Source", "cache")``).  Snapshotted rather than referenced so this record
+      is frozen in substance and not merely in its attribute bindings (§21.5 req 4).
+    """
 
     configured: object
     generation: int
@@ -7007,38 +7024,71 @@ class staticWidget(QWidget):
 
         Captured under the commit's PREFLIGHT (before any reconcile) so
         :meth:`_controls_v2_source_restore_verified` can prove — not merely assume —
-        that a rollback restored the configured selection, request generation, lazy
-        flag, and visible status.  Reads defensively so a widget with no directory
-        session (non-container source) yields a well-formed empty receipt."""
+        that a rollback restored the three PROOF fields (configured selection, lazy
+        flag, explicit source visibility).  Reads defensively so a widget with no
+        directory session (non-container source) yields a well-formed empty
+        receipt."""
         widget = getattr(self, "_controls_v2_source_widget", None)
         session = getattr(widget, "directory_session", None)
-        panel = getattr(self, "controls_v2", None)
-        config = None
-        try:
-            config = self._controls_v2_container_index_config()
-        except Exception:
-            config = None
         return SourceRecoveryReceipt(
             configured=getattr(session, "configured", None),
             generation=int(getattr(session, "request_generation", 0) or 0),
-            observation=getattr(
-                self, "_controls_v2_directory_observation", None),
+            # §21.5 req 4: diagnostic, captured BY VALUE — a frozen record must
+            # not retain a mutable live reference.
+            observation=self._controls_v2_frozen_observation_snapshot(),
             lazy=bool(getattr(widget, "directory_subdirs_lazy", False)),
-            visible=config is not None,
+            visible=self._controls_v2_source_widget_visible(),
         )
+
+    def _controls_v2_frozen_observation_snapshot(self):
+        """A by-value snapshot of the directory observation (§21.5 req 4).
+
+        Diagnostic only.  Deep-copied so the receipt cannot be changed through the
+        live observation; an uncopyable observation degrades to its ``repr`` rather
+        than smuggling a mutable reference into a frozen record."""
+        observation = getattr(self, "_controls_v2_directory_observation", None)
+        if observation is None:
+            return None
+        try:
+            return copy.deepcopy(observation)
+        except Exception:
+            logger.debug("directory observation snapshot fell back to repr",
+                         exc_info=True)
+            return repr(observation)
+
+    def _controls_v2_source_widget_visible(self) -> bool:
+        """The EXPLICIT embedded-source projection state (§21.5 req 2).
+
+        Read through the reviewed ``ControlsPanelV2.source_widget_visible()``
+        accessor — what the Source card last actually applied — never the desired
+        ``config is not None``.  A panel that predates the accessor reports
+        ``False`` rather than guessing."""
+        panel = getattr(self, "controls_v2", None)
+        getter = getattr(panel, "source_widget_visible", None)
+        if not callable(getter):
+            return False
+        try:
+            return bool(getter())
+        except Exception:
+            logger.debug("source visibility read failed", exc_info=True)
+            return False
 
     def _controls_v2_source_restore_verified(self, receipt) -> bool:
         """§15.12-C.5: whether the source owner's CURRENT state matches *receipt*.
 
-        Verifies the CONFIGURED SELECTION and the lazy-recursion flag actually
-        returned to their pre-reconcile values — the observable source identity.
-        A ``True`` result is the ONLY proof of restoration; a no-op/non-raising
-        `_sync` that left the session pointed at the new (failed) selection returns
-        ``False`` and is reported as a recovery failure.  The session's
-        ``request_generation`` is captured in the receipt for diagnostics but NOT
-        equality-checked: it is a monotonic counter, so a restore that re-configures
-        the same selection legitimately advances it (restoration is proved by the
-        configured selection returning, not by the counter rewinding)."""
+        §21.5 req 3: EVERY proof field is verified — the configured selection, the
+        lazy-recursion flag, AND the explicit embedded-source visibility.  A
+        ``True`` result is the ONLY proof of restoration; a no-op/non-raising
+        `_sync` that left the session pointed at the new (failed) selection, or
+        that left the Source card projecting the wrong thing, returns ``False``
+        and is reported as a ``("Source",)`` recovery failure.
+
+        The DIAGNOSTIC fields are deliberately not equality-checked:
+        ``request_generation`` is a monotonic counter, so a restore that
+        re-configures the same selection legitimately advances it (restoration is
+        proved by the configured selection returning, not by the counter
+        rewinding), and ``observation`` is restored and verified by the cache
+        owner under ``("Source", "cache")``."""
         if receipt is None:
             return True
         widget = getattr(self, "_controls_v2_source_widget", None)
@@ -7047,6 +7097,8 @@ class staticWidget(QWidget):
             return False
         if bool(getattr(widget, "directory_subdirs_lazy", False)) != bool(
                 receipt.lazy):
+            return False
+        if self._controls_v2_source_widget_visible() != bool(receipt.visible):
             return False
         return True
 
@@ -10504,12 +10556,61 @@ class staticWidget(QWidget):
         except Exception:
             logger.debug("enable_async_hydration failed", exc_info=True)
 
+    def _invalidate_all_gi_hydration(self) -> int:
+        """THE production teardown owner for GI-motor hydration (§21.3 req 1-4).
+
+        Invalidates outstanding requests on EVERY wrangler the stack owns — not
+        just the selected one — because an inactive wrangler can hold a request
+        opened before the user switched source modes, and its completion callback
+        outlives the switch.  ``wranglerWidget.closeEvent`` remains as a secondary
+        direct-close guard (req 2).
+
+        IDEMPOTENT (req 3): each wrangler's invalidation retires what is
+        outstanding and opens nothing, so a second host close — or a child close
+        after host invalidation — neither creates a request nor raises.  Returns
+        the number of wranglers invalidated.  Total: teardown must never be the
+        thing that raises."""
+        invalidated = 0
+        seen = set()
+        candidates = []
+        stack = getattr(getattr(self, "ui", None), "wranglerStack", None)
+        if stack is not None:
+            try:
+                for index in range(stack.count()):
+                    candidates.append(stack.widget(index))
+            except Exception:
+                logger.debug("wrangler stack enumeration failed at teardown",
+                             exc_info=True)
+        candidates.append(getattr(self, "wrangler", None))
+        for wrangler in candidates:
+            if wrangler is None or id(wrangler) in seen:
+                continue
+            seen.add(id(wrangler))
+            invalidate = getattr(
+                wrangler, "_invalidate_gi_hydration_requests", None)
+            if not callable(invalidate):
+                continue
+            try:
+                invalidate()
+                invalidated += 1
+            except Exception:
+                logger.debug("GI hydration invalidation failed for %r",
+                             wrangler, exc_info=True)
+        return invalidated
+
     def close(self):
         """Tries a graceful close.
         """
         # Block the analysis slots first: a worker signal queued just before we
         # stop + destroy must not touch the about-to-be-destroyed dialog.
         self._tearing_down = True
+        # §21.3: invalidate every outstanding GI-hydration request FIRST, before
+        # any thread shutdown or queued-signal unwind, so a discovery callback
+        # that completes during teardown cannot produce an owner-applicable
+        # result.  Qt does NOT deliver a child's closeEvent when the parent
+        # closes (the same rule this method already documents for the source
+        # widget), so the child guard alone never covered this path.
+        self._invalidate_all_gi_hydration()
         # Persist the integration panel settings (the wrangler tree saves
         # continuously; the integrator panel saves here at exit).
         try:
@@ -10585,10 +10686,17 @@ class staticWidget(QWidget):
                 dlg.close()
         except Exception:
             logger.debug("scan-plot dialog close failed", exc_info=True)
-        del self.scan
-        del self.displayframe.scan
-        del self.frame
-        del self.displayframe.frame
+        # §21.3 req 3: teardown is IDEMPOTENT.  These unconditional deletes made
+        # a second close() raise AttributeError, which would have defeated the
+        # "a second close must not raise" half of the teardown contract (and
+        # masked any later teardown step).  Deleting what is already gone is a
+        # no-op, not an error.
+        for _owner, _name in ((self, "scan"), (self.displayframe, "scan"),
+                              (self, "frame"), (self.displayframe, "frame")):
+            try:
+                delattr(_owner, _name)
+            except AttributeError:
+                pass
         super().close()
 
         gc.collect()
