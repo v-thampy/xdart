@@ -305,6 +305,64 @@ class _ControlsCommitAbort(Exception):
         super().__init__(f"{self.phase}: {self.reason}")
 
 
+class _ControlsStrictWriteError(Exception):
+    """A STRICT bound-carrier write failure (§24.4).
+
+    Carries the failure the transaction must report plus any signal owner whose
+    block state could not be restored, so the caller can name it for recovery:
+
+    * ``reason``     — the forward diagnostic.  When the setter failed, the setter
+      stays the PRIMARY reason even if cleanup also failed (§24.4 req 5);
+    * ``unrestored`` — ``((stable_path, owner, prior_state), …)`` for each signal
+      owner still not back at its captured state (§24.4 req 7)."""
+
+    def __init__(self, reason, unrestored=(), cause=None):
+        self.reason = str(reason)
+        self.unrestored = tuple(unrestored)
+        self.cause = cause
+        super().__init__(self.reason)
+
+
+def _controls_v2_signal_state_matches(owner, wanted) -> bool:
+    """Whether *owner*'s signal-block state is *wanted* (§24.4 req 3).
+
+    Verified through ``signalsBlocked()`` where the object exposes it.  An object
+    that does not expose it cannot be verified, so it is treated as matched rather
+    than manufacturing a recovery failure that cannot be substantiated."""
+    probe = getattr(owner, "signalsBlocked", None)
+    if not callable(probe):
+        return True
+    try:
+        return bool(probe()) == bool(wanted)
+    except Exception:
+        logger.debug("signal-state probe raised", exc_info=True)
+        return False
+
+
+def _controls_v2_validated_recovery_path(item, label=None):
+    """The validated recovery path for *item*, or raise (§24.3).
+
+    A valid recovery path is a NONEMPTY concrete ``tuple``/``list`` of NONEMPTY
+    ``str`` segments.  §24.3: a wrapper that returned a path containing an object
+    whose ``__eq__`` raises poisoned the collector's dedup comparison and skipped
+    every later recovery class, so NO attacker-controlled equality may enter the
+    global ``failures`` list.  ``type(segment) is not str`` is deliberately exact:
+    a ``str`` SUBCLASS may override ``__eq__``, which is the same hazard."""
+    if isinstance(item, (str, bytes)) or not isinstance(item, (tuple, list)):
+        raise TypeError(
+            f"malformed recovery failure entry {item!r} from class {label!r}: "
+            "expected a nonempty tuple/list of str segments")
+    if not item:
+        raise ValueError(
+            f"empty recovery failure path from class {label!r}")
+    for segment in item:
+        if type(segment) is not str or not segment:
+            raise TypeError(
+                f"malformed recovery path segment {segment!r} from class "
+                f"{label!r}: every segment must be a nonempty str")
+    return tuple(item)
+
+
 class GIMotorObservation:
     """A source-qualified snapshot of the GI theta-motor choices (§12.5).
 
@@ -4801,8 +4859,26 @@ class staticWidget(QWidget):
         ``wrangler.setup()``) and the bound CHILD (whose own connections fire on
         ``setValue``) — but getter/setter exceptions REACH the transaction
         boundary, where ANY setter exception is a forward failure even if the
-        final readback equals ``expected``.  Unblocking is best-effort in a
-        ``finally`` so it can never mask the setter's exception.
+        final readback equals ``expected``.
+
+        §24.4: signal-state RESTORATION is part of the checked write, not
+        best-effort cleanup.  The previous version restored in a ``finally`` that
+        caught unblock exceptions and only logged them, so a bound child whose
+        ``blockSignals(False)`` raised returned normally with the new value
+        installed, the child still BLOCKED, and the transaction seeing success.
+        Now (req 1-5): the prior root and child states are CAPTURED; both
+        restorations are ALWAYS attempted, in reverse of the blocking order, even
+        when the setter or the first restoration failed; each final state is
+        VERIFIED through ``signalsBlocked()`` where exposed (so a silent no-op
+        restore is caught too, not merely a raising one); an otherwise-successful
+        setter plus an unrestored owner is a typed forward failure; and when both
+        the setter and cleanup fail the SETTER stays the primary reason.  Every
+        still-unrestored owner rides out on
+        :class:`_ControlsStrictWriteError.unrestored` so the caller can record it
+        for recovery reattempt + naming (req 6-7).
+
+        The ``(params, carrier, value)`` signature is deliberately UNCHANGED — the
+        independent depth oracles inject at this seam.
 
         No readback here: the caller MUST verify via
         :meth:`_controls_v2_carrier_readback_ok` on the bound handle — the
@@ -4814,24 +4890,46 @@ class staticWidget(QWidget):
                 tuple(path), "no bound carrier for legacy write", value)
         root_prev = _CONTROLS_V2_MISSING
         child_prev = _CONTROLS_V2_MISSING
+        setter_exc = None
+        set_attempted = False
         try:
             if params is not None:
                 root_prev = params.blockSignals(True)
             child_prev = param.blockSignals(True)
+            set_attempted = True
             param.setValue(value)
-        finally:
-            if child_prev is not _CONTROLS_V2_MISSING:
-                try:
-                    param.blockSignals(child_prev)
-                except Exception:
-                    logger.debug("child unblock after strict write of %s failed",
-                                 carrier.path, exc_info=True)
-            if root_prev is not _CONTROLS_V2_MISSING:
-                try:
-                    params.blockSignals(root_prev)
-                except Exception:
-                    logger.debug("root unblock after strict write of %s failed",
-                                 carrier.path, exc_info=True)
+        except Exception as exc:
+            setter_exc = exc
+        # req 2: ALWAYS attempt BOTH restorations — child first (reverse of the
+        # blocking order), then root — regardless of the setter's outcome and
+        # regardless of whether the CHILD restoration itself failed, so a root
+        # failure can never suppress child cleanup and vice versa.
+        unrestored = []
+        for owner, prev, stable in (
+                (param, child_prev, ("Signal", "child_signals")),
+                (params, root_prev, ("Signal", "root_signals"))):
+            if owner is None or prev is _CONTROLS_V2_MISSING:
+                continue          # never blocked => nothing to restore
+            try:
+                owner.blockSignals(prev)
+            except Exception:
+                logger.debug("signal-state restore of %s after strict write of "
+                             "%s raised", stable, carrier.path, exc_info=True)
+            # req 3: the CHECK is the authority, not the absence of an exception.
+            if not _controls_v2_signal_state_matches(owner, prev):
+                unrestored.append((stable, owner, prev))
+        if setter_exc is None and not unrestored:
+            return
+        if setter_exc is not None:
+            # req 5: the setter is the PRIMARY reason when both fail.
+            reason = (f"legacy carrier setter failed: {setter_exc!r}"
+                      if set_attempted
+                      else f"legacy carrier signal blocking failed: {setter_exc!r}")
+        else:
+            # req 4: a good setter plus unrestored signal state is still a failure.
+            reason = ("legacy carrier signal state not restored after write: "
+                      + ", ".join("/".join(p) for p, _o, _s in unrestored))
+        raise _ControlsStrictWriteError(reason, unrestored, setter_exc)
 
     def _controls_v2_carrier_readback_ok(self, carrier, expected) -> bool:
         """Whether the BOUND ORIGINAL handle reads back as *expected* (§18.4).
@@ -5249,6 +5347,28 @@ class staticWidget(QWidget):
         prior_probe_cache = getattr(
             self, "_controls_v2_metadata_probe_cache", None)
 
+        # §24.5: the source recovery receipt is needed ONLY when this transaction
+        # can reach source reconciliation.  It used to be captured
+        # UNCONDITIONALLY and OUTSIDE containment inside the `ctx` literal, so a
+        # raising host property escaped the action/Run boundary untyped.  For any
+        # non-source transaction it is now captured ZERO times; for a
+        # source-selection transaction a capture failure is a typed `preflight`
+        # refusal with ZERO writes.  An empty receipt is never manufactured —
+        # absence cannot certify later source recovery, and
+        # `_controls_v2_source_restore_verified` fails closed without the exact
+        # typed receipt (§22.10.E.6).
+        source_receipt = None
+        if staged.source_selection_touched:
+            try:
+                source_receipt = self._controls_v2_capture_source_receipt()
+            except Exception:
+                logger.debug("controls commit source receipt capture failed",
+                             exc_info=True)
+                return ControlsCommitResult(
+                    False, failed_path=("Source",),
+                    reason="source recovery receipt capture failed",
+                    phase="preflight")
+
         ctx = {
             "live": live, "intent_snapshot": intent_snapshot,
             "prior_gi_explicit": prior_gi_explicit,
@@ -5265,9 +5385,13 @@ class staticWidget(QWidget):
             # §15.12-C.5: a typed receipt of the source owner's state BEFORE any
             # reconcile — configured selection, request generation, observation,
             # lazy flag, visible status — so recovery can VERIFY restoration rather
-            # than trust a non-raising `_sync`.
-            "source_receipt": self._controls_v2_capture_source_receipt(),
+            # than trust a non-raising `_sync`.  Captured above, conditionally
+            # (§24.5): `None` here means this transaction does no source work.
+            "source_receipt": source_receipt,
             "params": params,
+            # §24.4 req 6-7: signal owners the strict writer could not restore,
+            # carried on the EXISTING transaction context (no new ambient state).
+            "unrestored_signals": (),
         }
 
         # ============ POST-PREFLIGHT — ONE exception-total funnel ===========
@@ -5318,6 +5442,20 @@ class staticWidget(QWidget):
                 try:
                     self._controls_v2_write_legacy_carrier(
                         params, carrier, carrier.value)
+                except _ControlsStrictWriteError as exc:
+                    # §24.4 req 6-7: hand any still-unrestored signal owner to
+                    # recovery through the EXISTING transaction context + touched
+                    # set, so it is reattempted, re-verified, and named at a stable
+                    # path.  The writer's reason is already setter-primary (req 5).
+                    logger.debug("strict legacy write failed for %s",
+                                 carrier.path, exc_info=True)
+                    if exc.unrestored:
+                        ctx["unrestored_signals"] = (
+                            tuple(ctx.get("unrestored_signals") or ())
+                            + tuple(exc.unrestored))
+                        touched.add("signals")
+                    raise _ControlsCommitAbort(
+                        "legacy_apply", carrier.path, exc.reason) from exc
                 except Exception as exc:
                     logger.debug("strict legacy write raised for %s",
                                  carrier.path, exc_info=True)
@@ -5377,6 +5515,14 @@ class staticWidget(QWidget):
             # requested preference still installed.
             try:
                 if staged.source_energy_preference != prior_energy_pref:
+                    # §24.2 P1: mark the CACHE-TOUCH FACT before the mutation.
+                    # Cache mutation and source-owner reconciliation are separate
+                    # facts: recovery used to restore the caches only under
+                    # `source_reconciled`, and an energy-preference-only
+                    # transaction never sets `source_selection_touched`, so a
+                    # setter that installed `None` and THEN raised lost the prior
+                    # cache with `recovery_failed_paths == ()`.
+                    touched.add("source_cache")
                     self._controls_v2_source_energy_cache = None
             except Exception as exc:
                 logger.debug("controls energy-cache invalidation failed",
@@ -5402,6 +5548,9 @@ class staticWidget(QWidget):
                 return
             progress["phase"] = "source_reconcile"
             progress["source_reconciled"] = True
+            # §24.2 P1: the cache-touch fact is marked before THIS cache
+            # mutation too, independently of `source_reconciled`.
+            touched.add("source_cache")
             try:
                 self._controls_v2_source_energy_cache = None
                 self._controls_v2_metadata_probe_cache = None
@@ -5472,7 +5621,17 @@ class staticWidget(QWidget):
             inside ONE exception boundary: ``None`` means no failures, a concrete
             sequence of path tuples is the only other valid result, and anything
             malformed — or an exception at any point — becomes this class's stable
-            fallback label.  Later classes always run."""
+            fallback label.  Later classes always run.
+
+            §24.3: the MERGE into the outer ``failures`` list was still OUTSIDE
+            that containment, and path SEGMENTS were unvalidated.  A wrapper that
+            returned a path containing an object whose ``__eq__`` raises therefore
+            escaped during the global dedup comparison and skipped every later
+            recovery class.  Execution, materialization, per-segment validation
+            (``_controls_v2_validated_recovery_path``), normalization, per-wrapper
+            dedup AND the merge into ``failures`` are now ALL inside the boundary,
+            so only nonempty ``str`` segments — never attacker-controlled equality
+            — can ever enter the global result."""
             try:
                 found = restore(*args)
                 normalized = []
@@ -5480,21 +5639,19 @@ class staticWidget(QWidget):
                     for item in list(found):     # materialize INSIDE the try
                         if item is None:
                             continue
-                        if (isinstance(item, (str, bytes))
-                                or not isinstance(item, (tuple, list))):
-                            raise TypeError(
-                                "malformed recovery failure entry "
-                                f"{item!r} from class {label!r}")
-                        path = tuple(item)
+                        path = _controls_v2_validated_recovery_path(item, label)
                         if path not in normalized:
                             normalized.append(path)
+                for path in normalized:          # MERGE inside the boundary too
+                    if path not in failures:
+                        failures.append(path)
+                return
             except Exception:
                 logger.debug("controls recovery class %s raised", label,
                              exc_info=True)
-                normalized = [tuple(label)]
-            for path in normalized:
-                if path not in failures:
-                    failures.append(path)
+            fallback = tuple(label)              # the class's stable label
+            if fallback not in failures:
+                failures.append(fallback)
 
         # 1. source owner (applied LAST => restored FIRST).  §18.6: restore the
         #    SOURCE-SELECTION legacy carriers FIRST so the recovery reconcile
@@ -5504,8 +5661,15 @@ class staticWidget(QWidget):
         if source_reconciled:
             collect(("Source",), self._controls_v2_restore_source_owner_verified,
                     ctx, applied)
-            # observation + caches from the preflight snapshot AFTER the restore
-            # reconcile (authoritative even if it mutated them again), verified.
+        # 1b. §24.2 P1: the CACHES are restored whenever ANY cache mutation was
+        #     attempted — an energy-preference-only transaction mutates the energy
+        #     cache without ever setting `source_selection_touched`, so gating the
+        #     cache restore on `source_reconciled` silently lost the prior cache.
+        #     Source-owner-first ordering is preserved when BOTH are true: the
+        #     owner reconcile above runs first, and the caches are then restored
+        #     from the preflight snapshot AFTER it (authoritative even if the
+        #     reconcile mutated them again), verified.
+        if "source_cache" in touched:
             collect(("Source", "cache"),
                     self._controls_v2_restore_source_caches_verified, ctx)
         # 2. compound PONI carriers (verified — a silent no-op is a named failure).
@@ -5529,7 +5693,39 @@ class staticWidget(QWidget):
         # 5. legacy carriers (reverse projection order; its own verified collector).
         collect(("Signal",), self._controls_v2_rollback_legacy_all,
                 ctx["params"], applied)
+        # 6. §24.4 req 6-7: signal-block state the strict writer could not restore
+        #    is REATTEMPTED and RE-VERIFIED here — LAST, so the carrier rollback
+        #    above (which does its own blocking) has finished touching these same
+        #    owners.  An owner still unrestored is named at its stable path.
+        if "signals" in touched:
+            collect(("Signal", "signal_state"),
+                    self._controls_v2_restore_signal_state_verified, ctx)
         return failures
+
+    def _controls_v2_restore_signal_state_verified(self, ctx) -> list:
+        """Reattempt + VERIFY signal-block restoration for every owner the strict
+        writer left unrestored (§24.4 req 6-7).
+
+        Each owner is one independent member with NO primary of its own — the
+        writer's own restoration attempt WAS the primary and already failed — so
+        the driver verifies, reattempts through the authoritative backstop,
+        re-verifies, and names the owner at its stable path ONLY if it is STILL
+        unrestored.  A member that the reattempt fixes is genuinely restored and
+        must not be reported as an outstanding recovery failure."""
+        entries = tuple(ctx.get("unrestored_signals") or ())
+        if not entries:
+            return []
+        members = []
+        for path, owner, prior in entries:
+            members.append(_ControlsRecoveryMember(
+                path=tuple(path), policy="signal-block-state",
+                restore=None,      # the writer's failed attempt was the primary
+                matches=(lambda host, c, _o=owner, _p=prior:
+                         _controls_v2_signal_state_matches(_o, _p)),
+                backstop=(lambda host, c, _o=owner, _p=prior:
+                          _o.blockSignals(_p)),
+            ))
+        return _controls_v2_recover_members(self, ctx, members, None)
 
     #: The self-state fields the install writes, as
     #: ``(diagnostic name, attribute, ctx snapshot key, DECLARED comparator
