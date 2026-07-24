@@ -423,20 +423,32 @@ def _source_selection_identity(get) -> "SourceSelectionIdentity":
 
 
 class JournalEntry:
-    """Immutable, deep-copied revisioned edit (§13.9).
+    """Truly immutable, deep-copied revisioned edit (§13.9 / §15.12-E.1).
 
     The value is deep-copied on construction so the journal can never be mutated
     through a caller's aliased list/dict, and every outward read hands back a
-    FRESH deep copy so projection cannot alias the stored value either.  Supports
-    the historical ``entry["value"]`` / ``["revision"]`` / ``["origin"]`` mapping
-    access (and ``.get``) so existing readers are unchanged."""
+    FRESH deep copy so projection cannot alias the stored value either.  ALL
+    attributes are read-only after construction (``entry.revision = …`` /
+    ``entry.origin = …`` raise): metadata cannot be rewritten in place to bypass
+    monotonic revision ownership — only the monotonic record owner may REPLACE an
+    entry (a whole new object in the journal dict).  Supports the historical
+    ``entry["value"]`` / ``["revision"]`` / ``["origin"]`` mapping access (and
+    ``.get``) so existing readers are unchanged."""
 
     __slots__ = ("_value", "revision", "origin")
 
     def __init__(self, value, revision, origin):
-        self._value = copy.deepcopy(value)
-        self.revision = int(revision)
-        self.origin = str(origin)
+        object.__setattr__(self, "_value", copy.deepcopy(value))
+        object.__setattr__(self, "revision", int(revision))
+        object.__setattr__(self, "origin", str(origin))
+
+    def __setattr__(self, name, value):
+        raise AttributeError(
+            "JournalEntry is immutable; only the monotonic record owner may "
+            f"replace an entry (attempted to set {name!r})")
+
+    def __delattr__(self, name):
+        raise AttributeError("JournalEntry is immutable")
 
     @property
     def value(self):
@@ -1642,24 +1654,6 @@ class staticWidget(QWidget):
             return True
         return False
 
-    def _apply_controls_v2_field_value(self, path, value) -> bool:
-        if self._set_controls_v2_native_source_field(path, value):
-            return True
-        if self._set_controls_v2_native_int_field(path, value):
-            return True
-        param = self._controls_v2_param(tuple(path))
-        if param is None:
-            return False
-        try:
-            current = param.value()
-            new_value = coerce_control_edit_value(current, value)
-            if current != new_value:
-                param.setValue(new_value)
-        except Exception:
-            logger.debug("Controls Panel V2 field update failed for %s", path,
-                         exc_info=True)
-        return True
-
     def _commit_controls_v2_pending_edits(self):
         """Apply the panel's form edits for a NON-run consumer (reintegrate,
         advanced processing, calibration/mask routing, native-state apply)
@@ -1893,13 +1887,15 @@ class staticWidget(QWidget):
         return bool(value)
 
     def _controls_v2_threshold_config(self):
+        # §17.8: a PURE reader.  It neither lazy-initializes
+        # ``_controls_v2_threshold_state`` nor rewrites ``intent.threshold`` — a
+        # config getter must not mutate self-state or the live intent (that belongs
+        # to the explicit set/commit owner).  With no saved state it derives the
+        # config from the current intent LOCALLY, storing nothing.
         state = getattr(self, "_controls_v2_threshold_state", None)
         if not isinstance(state, dict):
             state = self._controls_v2_ensure_run_intent().threshold.freeze(
             ).as_dict()
-            self._controls_v2_threshold_state = state
-        intent = self._controls_v2_ensure_run_intent()
-        intent.threshold = ThresholdIntent.from_mapping(state)
         return ThresholdSaturationConfig(
             apply_threshold=bool(state.get("apply_threshold", False)),
             threshold_min=self._controls_v2_float(
@@ -2788,23 +2784,6 @@ class staticWidget(QWidget):
             logger.debug("Controls Panel V2 advanced hydrate failed",
                          exc_info=True)
 
-    def _set_controls_v2_native_source_field(self, path, value) -> bool:
-        path = tuple(path)
-        if path not in NATIVE_CONTROL_PATHS:
-            return False
-        if path == ("Source", "energy_preference"):
-            text = str(value or "").strip().lower()
-            aliases = {
-                "poni": "poni",
-                "poni file": "poni",
-                "metadata": "metadata",
-                "meta": "metadata",
-            }
-            self._controls_v2_source_energy_preference = aliases.get(text, "poni")
-            self._controls_v2_source_energy_cache = None
-            return True
-        return False
-
     def _controls_v2_energy_preference(self) -> str:
         pref = str(
             getattr(self, "_controls_v2_source_energy_preference", "poni")
@@ -2812,79 +2791,6 @@ class staticWidget(QWidget):
         ).strip().lower()
         return pref if pref in {"poni", "metadata"} else "poni"
 
-    def _set_controls_v2_native_int_field(self, path, value) -> bool:
-        path = tuple(path)
-        if path not in INTEGRATOR_BACKED_CONTROL_PATHS:
-            return False
-        root = path[0]
-        leaf = path[1] if len(path) > 1 else ""
-        if root == "GI":
-            self._controls_v2_set_gi_field(leaf, value)
-            return True
-        if root in {"Mask", "MaskSat"}:
-            self._controls_v2_set_threshold_field(path, value)
-            return True
-        if root not in {"Int1D", "Int2D"}:
-            return True
-        self._controls_v2_ensure_native_int_defaults()
-        a1, a2 = self._controls_v2_scan_int_args()
-        args = a1 if root == "Int1D" else a2
-        if leaf == "unit":
-            args["unit"] = self._controls_v2_unit_code(
-                value, dim="1d" if root == "Int1D" else "2d")
-        elif leaf == "axis":
-            self._controls_v2_axis_to_native(root, value)
-        elif leaf == "points":
-            args["numpoints"] = self._controls_v2_int(value, 3000, minimum=1)
-            if self._controls_v2_npts_oop_visible():
-                args.setdefault("npt_oop", args["numpoints"])
-        elif leaf == "points_oop":
-            args["npt_oop"] = self._controls_v2_int(
-                value, args.get("numpoints", 3000), minimum=1)
-        elif leaf == "radial_points":
-            args["npt_rad"] = self._controls_v2_int(value, 500, minimum=1)
-        elif leaf == "azim_points":
-            args["npt_azim"] = self._controls_v2_int(value, 500, minimum=1)
-        elif leaf == "radial_auto":
-            self._controls_v2_set_range_auto(root, "radial", self._controls_v2_bool(value))
-        elif leaf == "azim_auto":
-            self._controls_v2_set_range_auto(root, "azimuth", self._controls_v2_bool(value))
-        elif leaf == "radial_low":
-            self._controls_v2_set_range_bound(root, "radial", "low", value)
-        elif leaf == "radial_high":
-            self._controls_v2_set_range_bound(root, "radial", "high", value)
-        elif leaf == "azim_low":
-            self._controls_v2_set_range_bound(root, "azimuth", "low", value)
-        elif leaf == "azim_high":
-            self._controls_v2_set_range_bound(root, "azimuth", "high", value)
-        elif leaf == "apply_polarization":
-            if self._controls_v2_bool(value):
-                args["polarization_factor"] = self._controls_v2_float(
-                    args.get("polarization_factor"),
-                    DEFAULT_POLARIZATION_FACTOR)
-            else:
-                args["polarization_factor"] = None
-            self._controls_v2_sync_advanced_parameter(path)
-        elif leaf == "polarization_factor":
-            args["polarization_factor"] = self._controls_v2_float(
-                value, DEFAULT_POLARIZATION_FACTOR)
-            self._controls_v2_sync_advanced_parameter(path)
-        elif leaf in {"correctSolidAngle", "safe"}:
-            args[leaf] = self._controls_v2_bool(value)
-            self._controls_v2_sync_advanced_parameter(path)
-        elif leaf in {"dummy", "delta_dummy", "chi_offset"}:
-            args[leaf] = self._controls_v2_float(value, args.get(leaf, 0.0))
-            self._controls_v2_sync_advanced_parameter(path)
-        elif leaf == "method":
-            args["method"] = str(value)
-            self._controls_v2_sync_advanced_parameter(path)
-        # Compatibility/display projection only.  The Controls-owned intent
-        # remains authoritative, but existing reintegration and preview paths
-        # expect edits to appear on the shared scan immediately.
-        self._controls_v2_apply_snapshot_to_scan(
-            self._controls_v2_native_int_snapshot()
-        )
-        return True
 
     @staticmethod
     def _controls_v2_frozen_native_snapshot(

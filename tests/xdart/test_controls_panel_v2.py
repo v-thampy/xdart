@@ -3077,14 +3077,9 @@ def test_controls_panel_v2_native_int_uses_binding_table(
             if spec.path in values
         }
         assert expected_paths <= set(values)
-
-        for spec in INTEGRATOR_BACKED_CONTROL_SPECS:
-            if spec.path not in values:
-                continue
-            assert widget._set_controls_v2_native_int_field(
-                spec.path,
-                values[spec.path],
-            )
+        # (The retired per-field permissive setter `_set_controls_v2_native_int_field`
+        # is deleted — writes now go ONLY through the validated stage/commit engine,
+        # so there is no second setter authority left to round-trip here.)
     finally:
         widget.close()
         widget.deleteLater()

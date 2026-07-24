@@ -292,11 +292,15 @@ def test_async_gi_hydration_under_changed_source_is_rejected(widget, tmp_path):
 
 
 def test_known_empty_gi_motor_choices_stay_known_empty(widget):
-    """Item 12 tripwire (mirrors the §12 oracle): a bare set_gi_motor_options()
-    with an explicit empty motor list is KNOWN_EMPTY, not UNKNOWN."""
+    """Item 12 tripwire (mirrors the AMENDED §12 oracle, mtime 09:50): a
+    set_gi_motor_options() whose empty motor list came from a TARGETED inspection
+    (proof=True set explicitly, as the discovery paths do) is KNOWN_EMPTY.  Per
+    §15.11-4 / T-2.6b, an UNPROVED bare empty emit is UNKNOWN, so proof is stated
+    here explicitly rather than relied on from the fresh-wrangler default."""
     from xdart.gui.tabs.static_scan.static_scan_widget import GIMotorObservation
 
     widget.wrangler.motors = []
+    widget.wrangler._gi_motor_knowledge_proved = True
     widget.wrangler.set_gi_motor_options()
     obs = widget._controls_v2_capture_gi_motor_observation()
     assert obs.state == GIMotorObservation.KNOWN_EMPTY
