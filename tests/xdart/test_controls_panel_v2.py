@@ -2618,7 +2618,11 @@ def test_controls_panel_v2_frame_count_cache_tracks_directory_mtime(tmp_path):
     assert host._controls_v2_source_frame_count() == 1
 
 
-def test_controls_panel_v2_metadata_probe_cache_tracks_directory_mtime(tmp_path):
+def test_controls_panel_v2_first_metadata_file_uses_resolved_preview_no_walk(tmp_path):
+    """§15.12-D.2/D.3: the GUI profile takes the metadata authority ONLY from the
+    wrangler's already-resolved direct-child preview — never an independent
+    directory walk.  A matching file physically present in the directory does NOT
+    surface until the wrangler has resolved it as a preview."""
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
     values = {
@@ -2628,8 +2632,9 @@ def test_controls_panel_v2_metadata_probe_cache_tracks_directory_mtime(tmp_path)
         ("Signal", "Filter"): "",
         ("Signal", "include_subdir"): False,
     }
+    wrangler = SimpleNamespace(img_file="", _directory_metadata_preview_path="")
     host = SimpleNamespace(
-        wrangler=SimpleNamespace(img_file=""),
+        wrangler=wrangler,
         _controls_v2_metadata_probe_cache=None,
         _controls_v2_param_value=lambda path, default="": values.get(tuple(path), default),
         _controls_v2_source_cache_stamp=staticWidget._controls_v2_source_cache_stamp,
@@ -2637,13 +2642,18 @@ def test_controls_panel_v2_metadata_probe_cache_tracks_directory_mtime(tmp_path)
     host._controls_v2_first_metadata_file = MethodType(
         staticWidget._controls_v2_first_metadata_file, host)
 
-    assert host._controls_v2_first_metadata_file() == ""
+    # No resolved preview yet -> empty, even though a matching file exists.
     raw = tmp_path / "scan_0001.tif"
     raw.write_bytes(b"")
-    stamp = tmp_path.stat().st_mtime_ns + 1_000_000
-    os.utime(tmp_path, ns=(stamp, stamp))
+    assert host._controls_v2_first_metadata_file() == ""
 
+    # A resolved direct-child preview from the wrangler IS used (no walk).
+    wrangler._directory_metadata_preview_path = str(raw)
     assert host._controls_v2_first_metadata_file() == str(raw)
+
+    # A resolved single-image file takes precedence.
+    wrangler.img_file = str(tmp_path / "chosen.tif")
+    assert host._controls_v2_first_metadata_file() == str(tmp_path / "chosen.tif")
 
 
 def test_controls_panel_v2_source_caps_delegate_to_headless_readiness(

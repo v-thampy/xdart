@@ -94,11 +94,24 @@ def test_exactly_one_reconcile_across_idle_change_then_start(widget, monkeypatch
     assert calls == [1]
 
 
-def test_genuine_in_tree_edit_still_reconciles(widget, monkeypatch):
+def test_genuine_in_tree_edit_still_reconciles(widget, monkeypatch, tmp_path):
+    # §15.12-D.4: a direct parameter-tree edit on a SOURCE-SELECTION path (NOT via
+    # _on_controls_v2_field_changed, so the reentrancy guard is not set) whose
+    # effective selection actually changed must STILL reconcile.  (An edit on a
+    # NON-source path — mask/PONI/BG — reconciles nothing; see test_t2_7.)
+    signal = widget.wrangler.parameters.child("Signal")
+    signal.child("inp_type").setValue("Image Directory")
+    signal.child("img_ext").setValue("tif")
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    signal.child("img_dir").setValue(str(a))
+    token_a = widget._controls_v2_source_token()
+    signal.child("img_dir").setValue(str(b))
+    widget._controls_v2_last_reconciled_source_token = token_a
     calls = _count_reconciles(widget, monkeypatch)
-    # A direct parameter-tree edit (NOT via _on_controls_v2_field_changed, so the
-    # reentrancy guard is not set) must STILL reconcile.
     assert not getattr(widget, "_controls_v2_applying_field", False)
     widget._on_controls_v2_source_tree_changed(
-        None, [(object(), "value", "x")])
+        None, [(signal.child("img_dir"), "value", str(b))])
     assert calls == [1]

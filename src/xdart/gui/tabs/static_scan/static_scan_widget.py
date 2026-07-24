@@ -5092,12 +5092,43 @@ class staticWidget(QWidget):
         # (no guard set) still reconciles here.
         if getattr(self, "_controls_v2_applying_field", False):
             return
-        try:
-            if not any(change[1] == "value" for change in changes):
-                return
-        except (IndexError, TypeError):
-            pass
+        # §15.12-D.4 / §15.10.1-2: reconcile ONLY when a value change lands on a
+        # SOURCE-SELECTION path.  A direct mask/PONI/BG tree edit is not a source
+        # change and must trigger zero reconciliation/poll.
+        if not self._controls_v2_source_tree_change_touches_selection(changes):
+            return
+        # And only when the EFFECTIVE source selection actually changed — a
+        # same-value edit reconciles nothing (the identity is unchanged).
+        token = self._controls_v2_source_token()
+        if token == getattr(
+                self, "_controls_v2_last_reconciled_source_token", _UNSET):
+            return
+        self._controls_v2_last_reconciled_source_token = token
         self._sync_controls_v2_source_index()
+
+    def _controls_v2_source_tree_change_touches_selection(self, changes) -> bool:
+        """Whether any ``value`` change in *changes* lands on a source-selection
+        path (§15.12-D.4).  Maps each changed parameter to its ``(group, field)``
+        path and tests membership in ``_CONTROLS_V2_SOURCE_SELECTION_PATHS``."""
+        try:
+            iterator = iter(changes)
+        except TypeError:
+            return False
+        for change in iterator:
+            try:
+                param, change_type, _data = change
+            except (ValueError, TypeError):
+                continue
+            if change_type != "value":
+                continue
+            parent = getattr(param, "parent", None)
+            parent = parent() if callable(parent) else None
+            if parent is None:
+                continue
+            path = (str(parent.name()), str(param.name()))
+            if path in self._CONTROLS_V2_SOURCE_SELECTION_PATHS:
+                return True
+        return False
 
     def _connect_controls_v2_source_tree(self) -> None:
         """Follow the active wrangler's source parameters.
@@ -6939,12 +6970,13 @@ class staticWidget(QWidget):
                     files = cls._controls_v2_container_directory_files(
                         base, ext, include_subdir, match)
                     return len(files)
+                # §15.12-D.1: the GUI profile reports a DIRECT-CHILD file count for
+                # EVERY Image Directory extension — Subdirs may relabel intent but
+                # must NOT recurse (rglob) during profile construction.  Recursive
+                # membership belongs to the run-time/background source owner.
                 pattern = f"*.{ext}" if ext else "*"
-                candidates = (
-                    base.rglob(pattern) if include_subdir else base.glob(pattern)
-                )
                 return sum(
-                    1 for path in candidates
+                    1 for path in base.glob(pattern)
                     if path.is_file() and match(path.stem)
                 )
 
@@ -7284,52 +7316,17 @@ class staticWidget(QWidget):
             if (callable(container_config)
                     and container_config() is not None):
                 return ""
+            # §15.12-D.2/D.3: the GUI profile takes the metadata authority ONLY
+            # from a resolved direct-child preview or the current authoritative
+            # observation — never an independent directory walk (glob/rglob) or a
+            # metadata open.  The wrangler resolves its bounded, non-recursive
+            # direct-child preview in get_img_fname; use that, else empty.
             wrangler = getattr(self, "wrangler", None)
             img_file = str(getattr(wrangler, "img_file", "") or "")
             if img_file:
                 return img_file
-            img_dir = str(
-                self._controls_v2_param_value(("Signal", "img_dir")) or ""
-            )
-            img_ext = str(
-                self._controls_v2_param_value(("Signal", "img_ext")) or ""
-            ).lstrip(".")
-            if not img_dir or not img_ext:
-                return ""
-            try:
-                from .wranglers.image_wrangler_thread import _name_filter
-                filter_text = str(
-                    self._controls_v2_param_value(("Signal", "Filter")) or "")
-                match = _name_filter(filter_text)
-                base = Path(img_dir).expanduser()
-                include_subdir = bool(self._controls_v2_param_value(
-                    ("Signal", "include_subdir"), False))
-                pattern = f"*.{img_ext}"
-                candidates = (
-                    base.rglob(pattern) if include_subdir else base.glob(pattern)
-                )
-                cache_key = (
-                    str(base),
-                    img_ext,
-                    filter_text,
-                    include_subdir,
-                    self._controls_v2_source_cache_stamp(base),
-                )
-                cached = getattr(self, "_controls_v2_metadata_probe_cache", None)
-                if cached is not None and cached[0] == cache_key:
-                    return cached[1]
-                for path in candidates:
-                    if path.is_file() and match(path.stem):
-                        result = str(path)
-                        self._controls_v2_metadata_probe_cache = (
-                            cache_key, result)
-                        return result
-            except Exception:
-                logger.debug("Controls V2 metadata source probe failed",
-                             exc_info=True)
-                return ""
-            self._controls_v2_metadata_probe_cache = (cache_key, "")
-            return ""
+            return str(
+                getattr(wrangler, "_directory_metadata_preview_path", "") or "")
         img_file = str(
             self._controls_v2_param_value(("Signal", "File")) or ""
         )
