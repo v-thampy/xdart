@@ -422,23 +422,87 @@ def _source_selection_identity(get) -> "SourceSelectionIdentity":
     )
 
 
+# --------------------------------------------------------------------------
+# §19.8: the journal's stored representation is RECURSIVELY immutable.
+#
+# Deep-copying at ingress stops a caller's alias reaching the entry, but it
+# still stores a live mutable list/dict — anything holding the private
+# reference could mutate it in place and change every later read.  The journal
+# is the revisioned authority for user intent, so its storage is normalised to
+# a tagged, fully hashable tuple tree at ingress and a fresh MUTABLE value is
+# reconstructed at each read.  The tag records the original container type, so
+# list-in/list-out and tuple-in/tuple-out semantics are preserved exactly.
+#
+# A value that is neither a container nor a scalar (an arbitrary object) is
+# stored as an ATOM: deep-copied in and deep-copied out, which is the strongest
+# isolation available without rejecting the type.
+# --------------------------------------------------------------------------
+_JOURNAL_ATOM = "atom"
+_JOURNAL_LIST = "list"
+_JOURNAL_TUPLE = "tuple"
+_JOURNAL_DICT = "dict"
+_JOURNAL_SET = "set"
+_JOURNAL_FROZENSET = "frozenset"
+
+
+def _freeze_journal_value(value):
+    """Recursively immutable, tagged representation of *value* (§19.8 req 1)."""
+    if isinstance(value, tuple):
+        return (_JOURNAL_TUPLE, tuple(_freeze_journal_value(v) for v in value))
+    if isinstance(value, list):
+        return (_JOURNAL_LIST, tuple(_freeze_journal_value(v) for v in value))
+    if isinstance(value, dict):
+        return (_JOURNAL_DICT, tuple(
+            (_freeze_journal_value(k), _freeze_journal_value(v))
+            for k, v in value.items()))
+    if isinstance(value, frozenset):
+        return (_JOURNAL_FROZENSET,
+                tuple(_freeze_journal_value(v) for v in value))
+    if isinstance(value, set):
+        return (_JOURNAL_SET, tuple(_freeze_journal_value(v) for v in value))
+    return (_JOURNAL_ATOM, copy.deepcopy(value))
+
+
+def _thaw_journal_value(frozen):
+    """A FRESH mutable reconstruction of a frozen journal value (§19.8 req 2)."""
+    kind, payload = frozen
+    if kind == _JOURNAL_ATOM:
+        return copy.deepcopy(payload)
+    if kind == _JOURNAL_TUPLE:
+        return tuple(_thaw_journal_value(v) for v in payload)
+    if kind == _JOURNAL_LIST:
+        return [_thaw_journal_value(v) for v in payload]
+    if kind == _JOURNAL_DICT:
+        return {_thaw_journal_value(k): _thaw_journal_value(v)
+                for k, v in payload}
+    if kind == _JOURNAL_SET:
+        return {_thaw_journal_value(v) for v in payload}
+    if kind == _JOURNAL_FROZENSET:
+        return frozenset(_thaw_journal_value(v) for v in payload)
+    return copy.deepcopy(payload)
+
+
 class JournalEntry:
-    """Truly immutable, deep-copied revisioned edit (§13.9 / §15.12-E.1).
+    """Truly immutable, recursively frozen revisioned edit (§13.9 / §15.12-E.1 /
+    §19.8).
 
-    The value is deep-copied on construction so the journal can never be mutated
-    through a caller's aliased list/dict, and every outward read hands back a
-    FRESH deep copy so projection cannot alias the stored value either.  ALL
+    The value is normalised to a recursively immutable representation on
+    construction, so the journal can never be mutated through a caller's aliased
+    list/dict NOR through the private storage reference itself; every outward
+    read — ``.value``, ``._value``, ``entry["value"]`` — reconstructs a FRESH
+    mutable value, so projection cannot alias the stored value either.  ALL
     attributes are read-only after construction (``entry.revision = …`` /
-    ``entry.origin = …`` raise): metadata cannot be rewritten in place to bypass
-    monotonic revision ownership — only the monotonic record owner may REPLACE an
-    entry (a whole new object in the journal dict).  Supports the historical
-    ``entry["value"]`` / ``["revision"]`` / ``["origin"]`` mapping access (and
-    ``.get``) so existing readers are unchanged."""
+    ``entry.origin = …`` / ``entry._value = …`` raise): metadata cannot be
+    rewritten in place to bypass monotonic revision ownership — only the
+    monotonic record owner may REPLACE an entry (a whole new object in the
+    journal dict).  Supports the historical ``entry["value"]`` / ``["revision"]``
+    / ``["origin"]`` mapping access (and ``.get``) so existing readers are
+    unchanged."""
 
-    __slots__ = ("_value", "revision", "origin")
+    __slots__ = ("_frozen", "revision", "origin")
 
     def __init__(self, value, revision, origin):
-        object.__setattr__(self, "_value", copy.deepcopy(value))
+        object.__setattr__(self, "_frozen", _freeze_journal_value(value))
         object.__setattr__(self, "revision", int(revision))
         object.__setattr__(self, "origin", str(origin))
 
@@ -452,7 +516,35 @@ class JournalEntry:
 
     @property
     def value(self):
-        return copy.deepcopy(self._value)
+        return _thaw_journal_value(self._frozen)
+
+    @property
+    def _value(self):
+        """Historical private alias — also a fresh reconstruction, so mutating
+        it (``entry._value.append(...)``) cannot reach the stored value."""
+        return _thaw_journal_value(self._frozen)
+
+    def __copy__(self):
+        return JournalEntry(self.value, self.revision, self.origin)
+
+    def __deepcopy__(self, memo):
+        clone = JournalEntry(self.value, self.revision, self.origin)
+        memo[id(self)] = clone
+        return clone
+
+    def __eq__(self, other):
+        if not isinstance(other, JournalEntry):
+            return NotImplemented
+        return (self._frozen == other._frozen
+                and self.revision == other.revision
+                and self.origin == other.origin)
+
+    def __hash__(self):
+        return hash((self._frozen, self.revision, self.origin))
+
+    def __repr__(self):
+        return (f"JournalEntry(value={self.value!r}, "
+                f"revision={self.revision!r}, origin={self.origin!r})")
 
     def __getitem__(self, key):
         if key == "value":
@@ -1723,8 +1815,11 @@ class staticWidget(QWidget):
             return None  # run-active edits are journaled as deferred, not committed
         if not self._controls_v2_enabled():
             return None
+        # §19.9: the panel-capability probe keys on the SURVIVING harvest seam
+        # (the focused-editor flush); the full-form snapshot is no longer an
+        # input authority for this transaction.
         if not callable(getattr(
-                getattr(self, "controls_v2", None), "current_form_edits", None)):
+                getattr(self, "controls_v2", None), "focused_form_edit", None)):
             return None
         # collect (inside the fold) journals a differing focused value, then the
         # journal is staged + checked-committed once.  A non-None fold IS the
@@ -3469,39 +3564,31 @@ class staticWidget(QWidget):
         already journaled at its true value is recorded here with a fresh revision
         so it participates by revision (never rank-below-journal).  A form-harvest
         failure is a typed refusal, not fail-open (§12.4 test 9).
+
+        §19.9 — GUI INPUT AUTHORITY.  The transaction consumes the DIRTY
+        REVISIONED ENTRIES (the journal — every draft/idle/deferred/correction is
+        recorded at ACTION time via ``draftChanged``) plus AT MOST ONE
+        focused-editor flush: the editor the user is currently editing, whose
+        final text may post-date its last draft signal (the click/focus-transition
+        ordering case).  The no-focus full-form sweep is DELETED: it journaled
+        every visible value that differed from the committed one, so a
+        programmatic ``editor.setText(...)`` with no focus and no user edit signal
+        was converted into user intent.  The GUI is a projection and a draft
+        emitter; it no longer infers intent by polling all visible text.
         """
         journal = self._controls_v2_edit_journal_dict()
         panel = getattr(self, "controls_v2", None)
         committed = self._controls_v2_field_values(overlay_pending=False)
-        # §13.11 owner 5: the transaction consumes the DIRTY REVISIONED ENTRIES
-        # (the journal — every draft/idle/deferred/correction is recorded at
-        # action time via draftChanged).  From the visible form we take AT MOST
-        # ONE focused-editor flush — the editor the user is mid-editing, whose
-        # final text may post-date its last draft signal.  The full-form snapshot
-        # is NO LONGER imported: a non-focused row is only ever set to a committed
-        # value (signal-blocked rebuild guard), so it is never dirty-unjournaled.
         focused = getattr(panel, "focused_form_edit", None)
         if callable(focused):
+            # Fail CLOSED: a harvest failure on the surviving seam is a typed
+            # refusal, never a silently empty harvest (§12.4 test 9).
             try:
                 edit = focused()
-            except Exception:
-                edit = None
-            if edit is not None:
-                self._controls_v2_flush_form_edit(edit, journal, committed)
-                return self._controls_v2_journal_winners()
-        # No editor is focused (a programmatic ``setText`` or a harvest-time
-        # snapshot): flush the dirty, not-yet-journaled visible edits.  Still
-        # dirty-only — a value equal to committed or already journaled is never
-        # re-recorded.  A harvest failure is a typed refusal (§12.4), not
-        # fail-open.
-        get_edits = getattr(panel, "current_form_edits", None)
-        if callable(get_edits):
-            try:
-                form_edits = get_edits()
             except Exception as exc:
                 raise ControlsTransactionError(
                     None, "form edit harvest failed", None) from exc
-            for edit in form_edits:
+            if edit is not None:
                 self._controls_v2_flush_form_edit(edit, journal, committed)
         return self._controls_v2_journal_winners()
 

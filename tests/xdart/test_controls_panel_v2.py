@@ -15,6 +15,27 @@ import pytest
 
 pytest.importorskip("pyqtgraph")
 from pyqtgraph import QtWidgets
+from pyqtgraph.Qt import QtTest
+
+
+def _user_types(qapp, widget, editor, text):
+    """Drive a REAL user edit into *editor*.
+
+    §19.9: a programmatic ``editor.setText(...)`` on an unfocused row is a
+    PROJECTION, not user intent — the no-focus full-form sweep that used to
+    convert it into a journal entry is deleted.  The production input
+    authorities are the keystroke draft signal (``textEdited`` →
+    ``draftChanged``) and the focused-editor flush, and real focus + real
+    ``keyClicks`` drives both, exactly as the amended §12 harvest tests do.
+    """
+    widget.show()
+    qapp.processEvents()
+    editor.setFocus()
+    qapp.processEvents()
+    assert editor.hasFocus()
+    editor.selectAll()
+    QtTest.QTest.keyClicks(editor, text)
+    qapp.processEvents()
 
 from xdart.gui.tabs.static_scan.controls_logic import (
     AnalysisLauncherSpec,
@@ -4518,7 +4539,7 @@ def test_controls_panel_v2_run_commits_focused_integration_edit(qapp, monkeypatc
             if row.path == ("Int1D", "points")
         ]
         assert rows
-        rows[0].editor.setText("777")
+        _user_types(qapp, widget, rows[0].editor, "777")
         assert widget.integratorTree.ui.npts_1D.text() != "777"
 
         widget.wrangler.thread = FakeThread()
@@ -4552,7 +4573,7 @@ def test_controls_panel_v2_run_state_harvests_and_deep_copies_snapshot(
         # Simulate the user typing and immediately pressing Run: no
         # editingFinished has fired yet, so only the run-boundary harvest can
         # make this value part of the current run.
-        rows[("Int1D", "points")].editor.setText("246")
+        _user_types(qapp, widget, rows[("Int1D", "points")].editor, "246")
         assert widget.integratorTree.ui.npts_1D.text() != "246"
 
         args = widget._apply_controls_v2_run_state()
@@ -4591,8 +4612,8 @@ def test_controls_panel_v2_run_commits_focused_2d_points(qapp, monkeypatch):
             row.path: row
             for row in widget.controls_v2.processing_card.body.findChildren(FormRow)
         }
-        rows[("Int2D", "radial_points")].editor.setText("123")
-        rows[("Int2D", "azim_points")].editor.setText("456")
+        _user_types(qapp, widget, rows[("Int2D", "radial_points")].editor, "123")
+        _user_types(qapp, widget, rows[("Int2D", "azim_points")].editor, "456")
         assert widget.integratorTree.ui.npts_radial_2D.text() != "123"
 
         widget.wrangler.thread = FakeThread()
@@ -4629,7 +4650,7 @@ def test_controls_panel_v2_reintegrate_commits_focused_edit(qapp, monkeypatch):
             row.path: row
             for row in widget.controls_v2.processing_card.body.findChildren(FormRow)
         }
-        rows[("Int1D", "points")].editor.setText("432")
+        _user_types(qapp, widget, rows[("Int1D", "points")].editor, "432")
         assert widget.integratorTree.ui.npts_1D.text() != "432"
 
         monkeypatch.setattr(widget.integratorTree.ui, "reintegrate1D", fake)
@@ -4728,7 +4749,7 @@ def test_controls_panel_v2_advanced_commits_focused_edit(qapp, monkeypatch):
             row.path: row
             for row in widget.controls_v2.processing_card.body.findChildren(FormRow)
         }
-        rows[("Int1D", "points")].editor.setText("543")
+        _user_types(qapp, widget, rows[("Int1D", "points")].editor, "543")
         assert widget.integratorTree.ui.npts_1D.text() != "543"
 
         def _fake_advanced():
@@ -4857,8 +4878,8 @@ def test_controls_panel_v2_pending_manual_range_survives_run_commit(qapp, monkey
             for row in widget.controls_v2.processing_card.body.findChildren(RangeRow)
         }
         row = ranges[("Int1D", "radial_low")]
-        row._low.setText("0.25")
-        row._high.setText("4.25")
+        _user_types(qapp, widget, row._low, "0.25")
+        _user_types(qapp, widget, row._high, "4.25")
 
         widget._commit_controls_v2_pending_edits()
 
@@ -5956,7 +5977,7 @@ def test_t1r_form_harvest_failure_refuses_preparation(qapp, monkeypatch):
 
         def _boom():
             raise RuntimeError("injected form harvest failure")
-        monkeypatch.setattr(widget.controls_v2, "current_form_edits", _boom)
+        monkeypatch.setattr(widget.controls_v2, "focused_form_edit", _boom)
 
         with pytest.raises(DeferredRunEditsPendingError):
             widget._prepare_controls_v2_run_configuration()
@@ -5990,8 +6011,8 @@ def test_t1r_commit_pending_cannot_bypass_journal(qapp, monkeypatch):
                 self.path = path
                 self.value = value
         monkeypatch.setattr(
-            widget.controls_v2, "current_form_edits",
-            lambda: (_Edit(("BG", "Scale"), 9),))
+            widget.controls_v2, "focused_form_edit",
+            lambda: _Edit(("BG", "Scale"), 9))
 
         bg = widget.wrangler.parameters.child("BG", "Scale")
         applied = []

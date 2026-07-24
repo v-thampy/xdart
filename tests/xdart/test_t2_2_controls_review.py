@@ -378,8 +378,14 @@ def test_focused_flush_is_the_only_form_source(widget, qapp):
     path = ("Int1D", "points")
     row = _form_row(widget, path)
     # A focused, programmatically-set editor value (no textEdited) is flushed as
-    # exactly one revision by the collector.
+    # exactly one revision by the collector.  §19.9: the focus must be REAL —
+    # with the no-focus form sweep deleted, an unfocused editor is a projection
+    # and never becomes intent, so the widget is shown and the focus asserted.
+    widget.show()
+    qapp.processEvents()
     row.editor.setFocus()
+    qapp.processEvents()
+    assert row.editor.hasFocus()
     row.editor.setText("1234")
 
     winners = dict(widget._controls_v2_collect_pending_edits())
