@@ -5495,6 +5495,224 @@ def test_deferred_edit_survives_finish_exception_and_folds_next_start(
 
 
 
+def test_t1_stage_controls_transaction_is_pure_no_carrier_writes(qapp, monkeypatch):
+    """T-1 (§9.10 step 3-stage): the pure stage writes NO production carrier.
+
+    A native GI edit and a legacy mask edit are staged; the returned
+    StagedControlsTransaction carries the candidate values, but the LIVE intent
+    (object identity + generation), the hidden Qt params, and the display scan
+    are all unchanged.  Staging leaves no trace of its redirect/side-effect
+    suppression."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import (
+        StagedControlsTransaction,
+        staticWidget,
+    )
+
+    widget = staticWidget()
+    try:
+        intent = widget._controls_v2_ensure_run_intent()
+        gi_before = intent.gi.enabled
+        gen_before = intent.generation
+        mask_param = widget.wrangler.parameters.child("Signal", "mask_file")
+        mask_before = mask_param.value()
+        scan = getattr(widget, "scan", None)
+        gi_scan_before = (
+            bool(getattr(scan, "gi", False)) if scan is not None else None)
+
+        staged = widget.stage_controls_transaction([
+            (("GI", "Grazing"), True),
+            (("Signal", "mask_file"), "/tmp/t1_pure_stage.edf"),
+        ])
+
+        assert isinstance(staged, StagedControlsTransaction)
+        # The candidate carries the values...
+        assert staged.staged_intent.gi.enabled is True
+        assert staged.legacy_projection[("Signal", "mask_file")] == (
+            "/tmp/t1_pure_stage.edf")
+        # ...but NOTHING production changed.
+        assert widget._controls_v2_ensure_run_intent() is intent  # identity kept
+        assert intent.gi.enabled == gi_before
+        assert intent.generation == gen_before
+        assert mask_param.value() == mask_before
+        if scan is not None:
+            assert bool(getattr(scan, "gi", False)) == gi_scan_before
+        assert getattr(widget, "_controls_v2_staging", False) is False
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t1_stage_rejects_invalid_coercion_no_freeze(qapp, monkeypatch):
+    """T-1 (§9.10 test 2): an invalid numeric on a legacy-backed field (BG.Scale)
+    is a TYPED staging failure — not a silently-coerced 'landed' value.  A
+    deferred invalid edit aborts preparation BEFORE any freeze, retains the
+    journal, and surfaces DeferredRunEditsPendingError with a structured event.
+
+    RED at 10e7b630: the i.3 fold classified an un-coercible legacy value as
+    'landed' (coerce raised -> _controls_v2_deferred_field_landed returned True)
+    and froze anyway, silently dropping the operator's edit (§9.3)."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    monkeypatch.setenv("XDART_RUN_CONFIG_DEBUG", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import (
+        DeferredRunEditsPendingError,
+        staticWidget,
+    )
+
+    widget = staticWidget()
+    try:
+        widget._pending_controls_v2_run_configuration = None
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("BG", "Scale"), "not-a-number")
+        widget.wrangler.finished.emit()
+        qapp.processEvents()
+
+        with pytest.raises(DeferredRunEditsPendingError):
+            widget._prepare_controls_v2_run_configuration()
+
+        assert getattr(
+            widget, "_pending_controls_v2_run_configuration", None) is None
+        remaining = [
+            tuple(p) for p, _ in widget._controls_v2_deferred_field_edits]
+        assert ("BG", "Scale") in remaining, remaining
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t1_journal_lww_idle_edit_supersedes_older_deferred(qapp, monkeypatch):
+    """T-1 (§9.10 test 5, clause 1): a newer IDLE edit supersedes an older
+    DEFERRED value for the SAME path, by revision.  Run-active GI on, then idle
+    GI off -> the next Start freezes GI OFF.
+
+    RED at 10e7b630: the deferred queue and the idle edit were separate
+    containers; the deferred value was folded AFTER the panel harvest and won
+    regardless of the newer idle correction (§9.4)."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)   # deferred A
+        widget.wrangler.finished.emit()
+        qapp.processEvents()
+        # Newer idle correction B for the same path.
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), False)
+
+        frozen = widget._prepare_controls_v2_run_configuration()
+        assert frozen is not None
+        assert frozen.gi.enabled is False   # newest edit (idle B) wins over A
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t1_journal_lww_bad_deferred_recovered_by_idle_correction(
+        qapp, monkeypatch):
+    """T-1 (§9.10 test 5, clause 2): a bad deferred edit that fails Start is
+    RECOVERABLE through the ordinary UI — an idle correction supersedes it (by
+    revision) and the next Start succeeds with the corrected value.
+
+    RED at 10e7b630: an un-coercible deferred value was silently 'landed', so the
+    FIRST Start already froze (dropping the edit) and never refused — the
+    recovery invariant could not even be exercised."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import (
+        DeferredRunEditsPendingError,
+        staticWidget,
+    )
+
+    widget = staticWidget()
+    try:
+        widget._pending_controls_v2_run_configuration = None
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("BG", "Scale"), "not-a-number")
+        widget.wrangler.finished.emit()
+        qapp.processEvents()
+
+        with pytest.raises(DeferredRunEditsPendingError):
+            widget._prepare_controls_v2_run_configuration()   # refuses on bad A
+
+        # Correct the field through the ordinary idle edit path (BG.Scale is an
+        # integer-backed param, so use an integer correction value).
+        widget._on_controls_v2_field_changed(("BG", "Scale"), 3)
+
+        frozen = widget._prepare_controls_v2_run_configuration()
+        assert frozen is not None
+        param = widget.wrangler.parameters.child("BG", "Scale")
+        assert int(param.value()) == 3
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t1_invalid_second_field_leaves_earlier_native_field_unmutated(
+        qapp, monkeypatch):
+    """T-1 partial-mutation probe: a multi-field transaction whose SECOND field is
+    invalid leaves the FIRST (native GI) field UNMUTATED — the pure stage
+    validates the complete delta before ANY carrier/intent write, so no earlier
+    field half-applies.
+
+    RED at 10e7b630: the i.3 fold applied fields sequentially; GI landed on the
+    live intent before the invalid BG.Scale was reached, leaving GI enabled while
+    the fold reported success (§9.2)."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import (
+        DeferredRunEditsPendingError,
+        staticWidget,
+    )
+
+    widget = staticWidget()
+    try:
+        assert widget._controls_v2_ensure_run_intent().gi.enabled is False
+        widget._pending_controls_v2_run_configuration = None
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        widget._on_controls_v2_field_changed(("BG", "Scale"), "not-a-number")
+        widget.wrangler.finished.emit()
+        qapp.processEvents()
+
+        with pytest.raises(DeferredRunEditsPendingError):
+            widget._prepare_controls_v2_run_configuration()
+
+        # The earlier native GI field was NOT applied to the live intent.
+        assert widget._controls_v2_ensure_run_intent().gi.enabled is False
+        assert getattr(
+            widget, "_pending_controls_v2_run_configuration", None) is None
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_t1_gi_freeze_honors_explicit_motor_when_choices_unknown(
+        qapp, monkeypatch):
+    """T-1 item-5 ()-vs-None escape: when the GI θ-motor dropdown is NOT populated
+    from a source, _prepare passes None (never ()) to freeze, so an explicit saved
+    motor is HONORED — a motor GI run never silently degrades to a fixed-angle
+    Manual run (display/frozen divergence, review F8)."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        # No source loaded: the θ-motor dropdown carries no real choices, so the
+        # freeze helper reports 'unknown' (None), not empty-and-known (()).
+        assert widget._controls_v2_gi_motor_choices_for_freeze() is None
+
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        widget._on_controls_v2_field_changed(("GI", "th_motor"), "halpha")
+
+        frozen = widget._prepare_controls_v2_run_configuration()
+        assert frozen is not None
+        assert frozen.gi.enabled is True
+        assert frozen.gi.incidence_motor == "halpha"     # raw retained
+        assert frozen.gi.effective_motor == "halpha"     # honored, NOT Manual
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
 def test_apply_snapshot_to_scan_in_place_not_aliased(qapp, monkeypatch):
     """R4B-15 (O-1a-i item 9) + orchestrator amendment: projecting the Controls
     snapshot onto the display scan mutates the existing ``bai_*_args`` dicts IN

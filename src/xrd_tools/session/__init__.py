@@ -43,6 +43,9 @@ __all__ = [
     "FrozenThresholdPolicy",
     "FrozenSourceSpec",
     "FrozenRunConfiguration",
+    # GI theta-motor default policy (Qt-free, single source of truth):
+    "GI_MOTOR_PREFERENCE",
+    "pick_default_gi_motor",
 ]
 
 _SCAN_SESSION_EXPORTS = {
@@ -83,9 +86,17 @@ _RUN_CONFIGURATION_EXPORTS = {
 }
 
 
+_GI_MOTOR_EXPORTS = {
+    "GI_MOTOR_PREFERENCE",
+    "pick_default_gi_motor",
+}
+
+
 def __getattr__(name: str) -> Any:
     if name == "FrameRecordStore":
         value = getattr(import_module("xrd_tools.session.frame_record_store"), name)
+    elif name in _GI_MOTOR_EXPORTS:
+        value = getattr(import_module("xrd_tools.session.gi_motor"), name)
     elif name in _SCAN_SESSION_EXPORTS:
         value = getattr(import_module("xrd_tools.session.scan_session"), name)
     elif name in _FRAME_PROJECTION_EXPORTS:

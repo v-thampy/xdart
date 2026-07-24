@@ -235,6 +235,67 @@ class DeferredRunEditsPendingError(RuntimeError):
     edit queued during the previous run could not be applied.  Raised by
     ``_prepare_controls_v2_run_configuration`` and surfaced to the operator by
     ``imageWrangler.start()``; no ``FrozenRunConfiguration`` is produced."""
+
+
+class ControlsTransactionError(Exception):
+    """A PURE Controls staging failure — an edit could not be resolved/coerced.
+
+    Carries the offending path, reason, and value so the caller can refuse to
+    freeze with a typed, user-visible message and a structured event.  This is
+    RETURNED by :meth:`staticWidget.stage_controls_transaction` (never raised
+    from staging), so the stage phase mutates no production carrier before the
+    failure is known (§9.10 step 3-stage)."""
+
+    def __init__(self, path, reason, value=None):
+        self.path = tuple(path) if path is not None else None
+        self.reason = str(reason)
+        self.value = value
+        pretty = "/".join(str(seg) for seg in (self.path or ()))
+        super().__init__(f"invalid control edit ({pretty}): {self.reason}")
+
+
+class StagedControlsTransaction:
+    """A fully validated, PURE candidate for the next run.
+
+    Produced by a pure stage: native/int/GI/threshold edits are applied to
+    ``staged_intent`` (a clone of the Controls-owned intent), and legacy-backed
+    edits are coerced into ``legacy_projection`` WITHOUT touching a Parameter.
+    No production carrier (Qt param, display scan, source index, session,
+    wrangler, profile) is written while staging (§9.10 step 3-stage)."""
+
+    __slots__ = (
+        "staged_intent",
+        "legacy_projection",
+        "threshold_state",
+        "gi_selection_explicit",
+        "source_touched",
+    )
+
+    def __init__(
+        self,
+        staged_intent,
+        legacy_projection,
+        threshold_state,
+        gi_selection_explicit,
+        source_touched,
+    ):
+        self.staged_intent = staged_intent
+        self.legacy_projection = dict(legacy_projection)
+        self.threshold_state = threshold_state
+        self.gi_selection_explicit = bool(gi_selection_explicit)
+        self.source_touched = bool(source_touched)
+
+
+class ControlsCommitResult:
+    """Outcome of installing a :class:`StagedControlsTransaction`."""
+
+    __slots__ = ("ok", "failed_path", "reason")
+
+    def __init__(self, ok, failed_path=None, reason=""):
+        self.ok = bool(ok)
+        self.failed_path = (
+            tuple(failed_path) if failed_path is not None else None)
+        self.reason = str(reason)
 from .ui.staticUI import Ui_Form
 from .h5viewer import H5Viewer, _qt_enum_value
 from .display_frame_widget import displayFrameWidget
@@ -1394,6 +1455,8 @@ class staticWidget(QWidget):
         self._controls_v2_ensure_run_intent().threshold = (
             ThresholdIntent.from_mapping(state)
         )
+        if getattr(self, "_controls_v2_staging", False):
+            return  # pure stage: no display-scan write (§9.10 step 3-stage)
         scan = getattr(self, "scan", None)
         if scan is not None:
             for attr, key in (
@@ -1464,6 +1527,8 @@ class staticWidget(QWidget):
         }
 
     def _controls_v2_apply_gi_config_to_scan(self, cfg=None) -> None:
+        if getattr(self, "_controls_v2_staging", False):
+            return  # pure stage: no display-scan write (§9.10 step 3-stage)
         scan = getattr(self, "scan", None)
         if scan is None:
             return
@@ -1495,6 +1560,8 @@ class staticWidget(QWidget):
         """Point the integrator's GI θ-motor combo at *motor* (the two θ-motor
         surfaces must never disagree — CLAUDE.md GI rule).  No-op when the combo
         does not offer *motor* or is already there."""
+        if getattr(self, "_controls_v2_staging", False):
+            return  # pure stage: no integrator-combo write (§9.10 step 3-stage)
         it = getattr(self, "integratorTree", None)
         combo = getattr(getattr(it, "ui", None), "gi_motor", None)
         if combo is None:
@@ -1612,6 +1679,8 @@ class staticWidget(QWidget):
                 _apply()
 
     def _controls_v2_apply_snapshot_to_scan(self, snapshot: dict, scan=None) -> None:
+        if scan is None and getattr(self, "_controls_v2_staging", False):
+            return  # pure stage: no display-scan write (§9.10 step 3-stage)
         scan = scan if scan is not None else getattr(self, "scan", None)
         self._controls_v2_apply_native_int_snapshot_to_scan(snapshot, scan)
 
@@ -2156,6 +2225,8 @@ class staticWidget(QWidget):
         return {path: vals for path, vals in choices.items() if vals}
 
     def _controls_v2_sync_advanced_parameter(self, path) -> None:
+        if getattr(self, "_controls_v2_staging", False):
+            return  # pure stage: no hidden advanced-param write (§9.10 step 3-stage)
         spec = next(
             (spec for spec in INTEGRATOR_BACKED_CONTROL_SPECS
              if spec.path == tuple(path) and spec.parameter_name),
@@ -2357,16 +2428,16 @@ class staticWidget(QWidget):
 
         if not self._controls_v2_enabled():
             return None
-        self._commit_controls_v2_pending_edits()
-        # R4B-12 (O-1a-i.3): fold any edits deferred during the previous run into
-        # the intent + hidden carriers ONCE here, synchronously, BEFORE the single
-        # freeze — the sole projection point (no timer/owner writes between run-end
-        # and Start).  Folded AFTER committing the panel's pending edits so the
-        # deferred values (the operator's LATEST intent, made while the panel was
-        # run-locked) WIN over the panel's stale run-time state.  An invalid fold
-        # aborts preparation BEFORE any freeze/publish: typed, user-visible
-        # (surfaced by imageWrangler.start()), structured event, full delta
-        # retained.  No FrozenRunConfiguration is produced.
+        # T-1 (§9.10 steps 1 + 3-stage): harvest the revisioned edit journal
+        # (deferred + idle + correction) PLUS any in-progress panel form edit
+        # (journaled edits win over the stale panel snapshot), pure-stage them
+        # against a clone of the intent, then commit ONCE.  An invalid edit
+        # (unsupported coercion / silent legacy setter no-op) aborts preparation
+        # BEFORE any freeze/publish: typed, user-visible (surfaced by
+        # imageWrangler.start()), structured event, full journal retained.  No
+        # FrozenRunConfiguration is produced.  This replaces the i.3 sequential
+        # fold: staging validates the COMPLETE delta before any carrier write,
+        # so a later-field failure cannot half-apply an earlier field.
         _failed_fold = self._controls_v2_fold_deferred_edits_into_intent()
         if _failed_fold is not None:
             run_config_debug_log(
@@ -2436,7 +2507,11 @@ class staticWidget(QWidget):
             "xye_only": "XYE" in intent.processing_mode,
         }
 
-        frozen = intent.freeze()
+        # Item 5 (R4B-8): resolve the effective GI motor ONCE at freeze from the
+        # source's real motor list — passing None (not ()) when the dropdown is
+        # not populated so an explicit motor is honored, never degraded to Manual.
+        frozen = intent.freeze(
+            gi_motor_choices=self._controls_v2_gi_motor_choices_for_freeze())
         self._pending_controls_v2_run_configuration = frozen
         if wrangler is not None:
             wrangler.run_configuration = frozen
@@ -2708,25 +2783,300 @@ class staticWidget(QWidget):
             if cache is not None and hasattr(cache, "plan_builder"):
                 cache.plan_builder = builder
 
-    def _controls_v2_defer_field_edit(self, path, value) -> None:
-        """Queue a run-active Controls edit for the NEXT run (R4B-12, O-1a-i.3).
+    # ------------------------------------------------------------------
+    # Edit journal (§9.10 step 1) — ONE revisioned owner for every edit.
+    # Every accepted user action (deferred during a run, entered while idle,
+    # harvested as an uncommitted panel form edit, or entered as a correction
+    # after a failed Start) records ONE monotonic revision keyed by field path.
+    # There is exactly one winner per path: the highest revision.  A newer idle
+    # edit therefore supersedes an older deferred value by construction, rather
+    # than leaving a stale value in a separate queue — chronology IS the
+    # revision, not the order separate containers happen to be harvested at Start.
+    # ------------------------------------------------------------------
 
-        The edit is held as a PURE last-write-wins data delta and is NOT applied
-        to any carrier while the run is active (or between run-end and the next
-        Start): it is folded into the Controls-owned intent + hidden carriers
-        exactly once, synchronously, by
-        :meth:`_controls_v2_fold_deferred_edits_into_intent` inside the next
-        Start's preparation.  There is no timer and no post-finalization owner.
-        The operator is told the change is QUEUED and applies to the next run.
+    def _controls_v2_edit_journal_dict(self) -> dict:
+        journal = getattr(self, "_controls_v2_edit_journal", None)
+        if not isinstance(journal, dict):
+            journal = {}
+            self._controls_v2_edit_journal = journal
+        return journal
+
+    def _controls_v2_next_edit_revision(self) -> int:
+        rev = int(getattr(self, "_controls_v2_edit_revision_counter", 0)) + 1
+        self._controls_v2_edit_revision_counter = rev
+        return rev
+
+    def _controls_v2_record_edit(self, path, value, origin: str) -> int:
+        """Record one revisioned edit into the journal (LWW per path)."""
+        path = tuple(path)
+        rev = self._controls_v2_next_edit_revision()
+        self._controls_v2_edit_journal_dict()[path] = {
+            "value": value,
+            "revision": rev,
+            "origin": str(origin),
+        }
+        return rev
+
+    def _controls_v2_edit_journal_clear(self) -> None:
+        self._controls_v2_edit_journal = {}
+
+    def _controls_v2_journal_winners(self):
+        """Winning ``(path, value)`` per path, ordered by ascending revision."""
+        journal = self._controls_v2_edit_journal_dict()
+        ordered = sorted(journal.items(), key=lambda kv: kv[1]["revision"])
+        return [(path, entry["value"]) for path, entry in ordered]
+
+    @property
+    def _controls_v2_deferred_field_edits(self):
+        """Read-only view of the deferred-origin journal entries as a list.
+
+        The journal (:meth:`_controls_v2_edit_journal_dict`) is the single owner;
+        this preserves the O-1a-i.3 accessor.  A newer idle/form correction for
+        the same path OVERWRITES the deferred entry (higher revision), so it no
+        longer appears here — that IS the global last-write-wins rule.
+        """
+        journal = self._controls_v2_edit_journal_dict()
+        ordered = sorted(
+            (item for item in journal.items()
+             if item[1].get("origin") == "deferred"),
+            key=lambda kv: kv[1]["revision"],
+        )
+        return [(path, entry["value"]) for path, entry in ordered]
+
+    def _controls_v2_collect_pending_edits(self):
+        """Merge journal winners with in-progress panel form edits.
+
+        Committed edits recorded via ``fieldValueChanged`` (deferred/idle/
+        correction origins) WIN over the panel's current form snapshot: after a
+        run the panel re-renders at its stale pre-deferred values, so a wholesale
+        form harvest would clobber a deferred edit.  A form edit therefore only
+        contributes a path the journal has NOT already recorded (a genuine
+        uncommitted in-progress edit).
+        """
+        merged: dict = {}
+        order: list = []
+        for path, value in self._controls_v2_journal_winners():
+            path = tuple(path)
+            merged[path] = value
+            order.append(path)
+        panel = getattr(self, "controls_v2", None)
+        get_edits = getattr(panel, "current_form_edits", None)
+        if callable(get_edits):
+            try:
+                form_edits = get_edits()
+            except Exception:
+                logger.debug("Controls Panel V2 form-edit harvest failed",
+                             exc_info=True)
+                form_edits = ()
+            for edit in form_edits:
+                path = tuple(edit.path)
+                if path in merged:
+                    continue  # journaled (committed) edit wins over stale form
+                merged[path] = edit.value
+                order.append(path)
+        return [(path, merged[path]) for path in order]
+
+    def _controls_v2_gi_motor_choices_for_freeze(self):
+        """Real source motor choices for the GI freeze, or ``None`` when unknown.
+
+        The ()-vs-None escape (T-1): pass ``None`` — not ``()`` — when the GI
+        θ-motor dropdown is not populated from a source, so ``resolve_gi_motor``
+        HONORS the operator's explicit selection instead of degrading it to
+        Manual (which would diverge from the display policy).  ``()`` is reserved
+        for a genuinely probed, empty motor list; the dropdown cannot distinguish
+        that from 'not yet probed', so it always passes the real tuple or None.
+        """
+        choices = self._controls_v2_native_int_choices().get(("GI", "th_motor"))
+        if not choices:
+            return None
+        real = tuple(str(c) for c in choices if str(c) and str(c) != "Manual")
+        return real or None
+
+    # ------------------------------------------------------------------
+    # Pure stage (§9.10 step 3-stage) — validate every edit against a CLONE.
+    # ------------------------------------------------------------------
+
+    def stage_controls_transaction(self, edits):
+        """Validate *edits* against a CLONE of the Controls intent — PURE.
+
+        Native/int/GI/threshold edits mutate ``staged_intent`` (a deep clone of
+        the live intent); legacy-backed edits are coerced into a candidate
+        projection WITHOUT ``Parameter.setValue``.  NO production carrier — Qt
+        param, display scan, integrator combo, advanced param, source index,
+        session, wrangler, or profile — is written while staging.  Invalid
+        numeric input for a legacy field is a typed
+        :class:`ControlsTransactionError`, not a silently-coerced 'landed' value.
+        Returns the failure OR a :class:`StagedControlsTransaction`.
+        """
+        live_intent = self._controls_v2_ensure_run_intent()
+        staged_intent = copy.deepcopy(live_intent)
+        saved_intent = self._controls_v2_run_intent
+        saved_threshold = getattr(self, "_controls_v2_threshold_state", None)
+        saved_explicit = bool(
+            getattr(self, "_controls_v2_gi_selection_explicit", False))
+        saved_staging = getattr(self, "_controls_v2_staging", False)
+        legacy_projection: dict = {}
+        source_touched = False
+        error = None
+        # Redirect the Controls-owned intent/threshold state to the clone and
+        # suppress every display/Qt side effect for the duration (the native
+        # setters mutate ONLY the clone; the staging flag no-ops the projections).
+        self._controls_v2_run_intent = staged_intent
+        self._controls_v2_threshold_state = (
+            copy.deepcopy(saved_threshold)
+            if isinstance(saved_threshold, dict) else None)
+        self._controls_v2_staging = True
+        try:
+            for path, value in edits:
+                path = tuple(path)
+                if path and path[0] in {"Signal", "Source"}:
+                    source_touched = True
+                if path in NATIVE_CONTROL_PATHS:
+                    self._set_controls_v2_native_source_field(path, value)
+                    continue
+                if path in INTEGRATOR_BACKED_CONTROL_PATHS:
+                    self._set_controls_v2_native_int_field(path, value)
+                    continue
+                param = self._controls_v2_param(path)
+                if param is None:
+                    # Unsupported path — matches _apply_controls_v2_field_value
+                    # (returns False); nothing to project.
+                    continue
+                try:
+                    coerced = coerce_control_edit_value(param.value(), value)
+                except Exception as exc:
+                    error = ControlsTransactionError(
+                        path, "value cannot be coerced to the field type", value)
+                    error.__cause__ = exc
+                    break
+                legacy_projection[path] = coerced
+        finally:
+            staged_threshold = getattr(
+                self, "_controls_v2_threshold_state", None)
+            staged_explicit = bool(
+                getattr(self, "_controls_v2_gi_selection_explicit", False))
+            # Restore the live Controls state — staging leaves NO trace.
+            self._controls_v2_run_intent = saved_intent
+            self._controls_v2_threshold_state = saved_threshold
+            self._controls_v2_gi_selection_explicit = saved_explicit
+            self._controls_v2_staging = saved_staging
+        if error is not None:
+            return error
+        return StagedControlsTransaction(
+            staged_intent=staged_intent,
+            legacy_projection=legacy_projection,
+            threshold_state=(
+                copy.deepcopy(staged_threshold)
+                if isinstance(staged_threshold, dict) else None),
+            gi_selection_explicit=staged_explicit,
+            source_touched=source_touched,
+        )
+
+    # ------------------------------------------------------------------
+    # Commit (T-1: install with per-write readback detection; T-2 adds the
+    # snapshot + reverse-order verified rollback + transactional source owner).
+    # ------------------------------------------------------------------
+
+    def _controls_v2_apply_legacy_projection(self, projection):
+        """Apply candidate legacy values to the hidden carriers, signal-blocked,
+        verifying every readback.  Returns the first path whose readback fails (a
+        silent ``setValue`` no-op), else ``None``.
+
+        T-1 detects the failure and aborts; the reverse-order verified ROLLBACK
+        of already-applied carriers lands in T-2 (§9.10 step 3-commit).
+        """
+        if not projection:
+            return None
+        wrangler = getattr(self, "wrangler", None)
+        params = getattr(wrangler, "parameters", None)
+        if params is None:
+            return None
+        for path, value in projection.items():
+            path = tuple(path)
+            self._mirror_wrangler_parameter_values(params, ((path, value),))
+            param = self._controls_v2_param(path)
+            if param is None:
+                continue
+            try:
+                expected = coerce_control_edit_value(param.value(), value)
+            except Exception:
+                expected = value
+            if param.value() != expected:
+                return path
+        return None
+
+    @staticmethod
+    def _controls_v2_install_intent_values(live, staged) -> None:
+        """Copy the staged intent's VALUES onto *live* in place (identity kept).
+
+        The monotonic ``generation`` is deliberately NOT copied: the live intent
+        owns the counter and the staged clone started from the same value, so a
+        later ``freeze`` advances the live intent exactly once.
+        """
+        for field_name in (
+            "source_spec",
+            "processing_mode",
+            "output_mode",
+            "live_mode",
+            "batch_mode",
+            "max_cores",
+            "bai_1d_args",
+            "bai_2d_args",
+            "gi",
+            "threshold",
+            "poni_file",
+            "poni_values",
+            "mask_file",
+            "project_root",
+            "save_path",
+            "run_options",
+        ):
+            setattr(live, field_name, getattr(staged, field_name))
+
+    def commit_controls_transaction(self, staged) -> ControlsCommitResult:
+        """Install a validated :class:`StagedControlsTransaction`.
+
+        Order (§9.10 step 3-commit): apply the legacy projection with per-write
+        readback FIRST; on failure abort with the intent UNTOUCHED (retain the
+        journal, refuse to freeze).  Only after the legacy projection lands is
+        the staged intent installed as one operation and projected onto the
+        display scan, then the source is reconciled exactly once.
+        """
+        failed = self._controls_v2_apply_legacy_projection(
+            staged.legacy_projection)
+        if failed is not None:
+            return ControlsCommitResult(
+                False, failed_path=failed,
+                reason="legacy carrier readback failed")
+        # Install the staged VALUES onto the live Controls-owned intent IN PLACE
+        # — never replace the object.  The intent owns the monotonic generation
+        # counter and may be held by reference (R4B-15 identity rule); the staged
+        # clone started from the same generation, so ``freeze`` advances the live
+        # intent correctly and held references stay valid.
+        self._controls_v2_install_intent_values(
+            self._controls_v2_ensure_run_intent(), staged.staged_intent)
+        self._controls_v2_gi_selection_explicit = staged.gi_selection_explicit
+        if staged.threshold_state is not None:
+            self._controls_v2_threshold_state = staged.threshold_state
+        # Compatibility projection onto the display scan (the intent stays the
+        # single writer of run configuration).
+        self._controls_v2_apply_snapshot_to_scan(
+            self._controls_v2_native_int_snapshot())
+        if staged.source_touched:
+            self._controls_v2_source_energy_cache = None
+            self._controls_v2_metadata_probe_cache = None
+            self._sync_controls_v2_source_index()
+        return ControlsCommitResult(True)
+
+    def _controls_v2_defer_field_edit(self, path, value) -> None:
+        """Record a run-active Controls edit into the journal for the NEXT run.
+
+        The edit is PURE data (never applied to a carrier while the run is
+        active); it is staged + committed exactly once at the next Start.  The
+        operator is told the change is QUEUED and applies to the next run.
         """
         path = tuple(path)
-        deferred = getattr(self, "_controls_v2_deferred_field_edits", None)
-        if not isinstance(deferred, list):
-            deferred = []
-        # Last write wins per field path (pure data, atomic by construction).
-        deferred = [(p, v) for (p, v) in deferred if p != path]
-        deferred.append((path, value))
-        self._controls_v2_deferred_field_edits = deferred
+        self._controls_v2_record_edit(path, value, origin="deferred")
         try:
             self.wrangler.showLabel.emit(
                 "Change queued — it applies to the next run.")
@@ -2740,104 +3090,72 @@ class staticWidget(QWidget):
             origin="controls_v2_ui",
             field_path=list(path),
             field_value=value,
-            deferred_pending=len(deferred),
+            deferred_pending=len(self._controls_v2_deferred_field_edits),
         )
 
-    def _controls_v2_deferred_field_landed(self, path, value) -> bool:
-        """Whether a deferred field actually took effect after the fold.
-
-        Native source/int fields are pure value assignments to the
-        Controls-owned intent and always land.  A legacy-backed field's hidden
-        carrier is verified by readback, so a ``setValue`` that silently no-ops
-        is detected (``_apply_controls_v2_field_value`` swallows setter failures
-        and returns True, so it cannot be trusted).
-        """
-        path = tuple(path)
-        if path in NATIVE_CONTROL_PATHS or path in INTEGRATOR_BACKED_CONTROL_PATHS:
-            return True
-        param = self._controls_v2_param(path)
-        if param is None:
-            return False
-        try:
-            expected = coerce_control_edit_value(param.value(), value)
-        except Exception:
-            return True
-        return param.value() == expected
-
     def _controls_v2_fold_deferred_edits_into_intent(self):
-        """Fold the deferred delta into the intent + hidden carriers ONCE, at the
-        next Start (R4B-12, O-1a-i.3 — the structural pivot).
+        """Stage + commit the revisioned edit journal at the next Start.
 
-        This is the SOLE place a deferred edit is projected.  There is no timer,
-        no post-finalization owner, and NO carrier write anywhere between run-end
-        and Start: edits sit as a pure last-write-wins delta until Start folds
-        them here through the ordinary production field path (native -> intent,
-        legacy -> hidden carrier), reconciling any source-affecting edit through
-        the SAME source-index path a live idle edit uses.  Because the run is idle
-        and the fold is synchronous inside preparation, no window exists in which
-        a frozen configuration can publish while deferred edits are unresolved.
-
-        Returns ``None`` on success (delta cleared) or the failing ``path`` tuple
-        when a fold cannot land — the caller then aborts preparation BEFORE any
-        freeze/publish, retains the full delta, and a structured event is emitted.
+        Harvests the journal winners plus any in-progress panel form edit
+        (journaled edits win over the stale panel snapshot), pure-stages them
+        against a clone of the intent, and — only if staging AND commit succeed —
+        installs the result, reconciling any source edit ONCE.  Returns ``None``
+        on success (journal cleared) or the failing ``path`` tuple; the caller
+        then aborts preparation BEFORE any freeze/publish and retains the full
+        journal.  No timer, no post-finalization owner, no carrier write between
+        run-end and Start.
         """
-        delta = list(
-            getattr(self, "_controls_v2_deferred_field_edits", None) or [])
-        if not delta:
+        edits = self._controls_v2_collect_pending_edits()
+        if not edits:
             return None
-        source_touched = False
-        for path, value in delta:
-            path = tuple(path)
-            if path and path[0] in {"Signal", "Source"}:
-                source_touched = True
-                self._controls_v2_source_energy_cache = None
-                self._controls_v2_metadata_probe_cache = None
-            try:
-                self._apply_controls_v2_field_value(path, value)
-                landed = self._controls_v2_deferred_field_landed(path, value)
-            except Exception:
-                logger.debug("deferred fold failed for %s", path, exc_info=True)
-                landed = False
-            if not landed:
-                # Retain the WHOLE delta; the caller aborts the run visibly.
-                self._controls_v2_deferred_field_edits = delta
-                run_config_debug_log(
-                    logger,
-                    "controls_deferred_fold_invalid",
-                    widget=self,
-                    origin="controls_v2_prepare_fold",
-                    failed_path=list(path),
-                    deferred_pending=len(delta),
-                    level="warning",
-                )
-                return path
-        if source_touched:
-            # Codex 8.7: a deferred source edit must reconcile the source index/
-            # session exactly like a live idle source edit — ONCE.
-            try:
-                self._sync_controls_v2_source_index()
-            except Exception:
-                logger.debug("deferred source-index reconcile failed",
-                             exc_info=True)
-        self._controls_v2_deferred_field_edits = []
+        staged = self.stage_controls_transaction(edits)
+        if isinstance(staged, ControlsTransactionError):
+            run_config_debug_log(
+                logger,
+                "controls_deferred_fold_invalid",
+                widget=self,
+                origin="controls_v2_prepare_fold",
+                failed_path=list(staged.path or ()),
+                reason=staged.reason,
+                deferred_pending=len(self._controls_v2_journal_winners()),
+                level="warning",
+            )
+            return tuple(staged.path or ())
+        result = self.commit_controls_transaction(staged)
+        if not result.ok:
+            run_config_debug_log(
+                logger,
+                "controls_deferred_fold_invalid",
+                widget=self,
+                origin="controls_v2_prepare_fold",
+                failed_path=list(result.failed_path or ()),
+                reason=result.reason,
+                deferred_pending=len(self._controls_v2_journal_winners()),
+                level="warning",
+            )
+            return tuple(result.failed_path or ())
+        folded = [list(p) for p, _ in edits]
+        self._controls_v2_edit_journal_clear()
         bump_run_config_debug_generation(self, "config")
         run_config_debug_log(
             logger,
             "controls_deferred_folded",
             widget=self,
             origin="controls_v2_prepare_fold",
-            folded=[list(p) for p, _ in delta],
+            folded=folded,
         )
         return None
-
 
     def _on_controls_v2_field_changed(self, path, value) -> None:
         path = tuple(path)
         if self._controls_v2_run_active():
-            # R4B-12: never silently drop a run-active edit — defer it to the
-            # next run and tell the user (see _controls_v2_defer_field_edit).
+            # R4B-12: never silently drop a run-active edit — record it as pure
+            # next-run data (deferred origin) and tell the operator.
             self._controls_v2_defer_field_edit(path, value)
             return
+        # Idle edit: record in the journal (so it supersedes any older deferred
+        # value for this path by revision) AND apply live for immediate UX.
+        self._controls_v2_record_edit(path, value, origin="idle")
         if path and path[0] in {"Signal", "Source"}:
             self._controls_v2_source_energy_cache = None
             self._controls_v2_metadata_probe_cache = None

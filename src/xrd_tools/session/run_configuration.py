@@ -16,6 +16,7 @@ fingerprint while their ``generation`` values remain distinct.
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import math
@@ -26,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from xrd_tools.core.scan import SourceSpec
+from xrd_tools.session.gi_motor import pick_default_gi_motor
 from xrd_tools.sources.selection import DirectorySourceSpec
 
 
@@ -170,6 +172,38 @@ def _thaw_value(value: _FrozenValue) -> Any:
     raise ValueError(f"unknown frozen run-configuration value tag {tag!r}")
 
 
+def resolve_gi_motor(
+    raw: str,
+    choices: "list[str] | tuple[str, ...] | None",
+) -> str:
+    """Resolve the effective GI incidence motor ONCE, from a choices list.
+
+    ``raw`` is the operator's stored selection; ``choices`` is the source's real
+    motor list (may include ``'Manual'``).  Rule (R4B-8, one policy):
+
+    * a deliberate ``'Manual'`` stays ``'Manual'``;
+    * a valid explicit selection (``raw`` is a real motor of the source) wins;
+    * otherwise the shared default policy (:func:`pick_default_gi_motor`) picks
+      over the source's real motors — never injecting a motor absent from the
+      source;
+    * when no choices list is supplied (``choices is None``) the raw selection
+      is honored as-is — the caller could not offer a source motor list to
+      verify against, so degrading an explicit motor to Manual would silently
+      diverge from what the operator sees.  ``()`` means genuinely
+      empty-and-known (the source was probed and has no real motors); a caller
+      that has NOT probed must pass ``None``, not ``()``.
+    """
+    raw = str(raw or "Manual")
+    if choices is None:
+        return raw
+    real = [str(c) for c in choices if str(c) and str(c) != "Manual"]
+    if raw == "Manual":
+        return "Manual"
+    if raw in real:
+        return raw
+    return pick_default_gi_motor(real)
+
+
 def _mapping_value(value: Mapping[Any, Any] | None) -> _FrozenValue:
     return _freeze_value(dict(value or {}))
 
@@ -193,10 +227,16 @@ class GIIntent:
     mode_1d: str = "q_total"
     mode_2d: str = "qip_qoop"
 
-    def freeze(self) -> "FrozenGIConfiguration":
+    def freeze(
+        self,
+        *,
+        choices: "list[str] | tuple[str, ...] | None" = None,
+    ) -> "FrozenGIConfiguration":
+        raw = str(self.incidence_motor or "Manual")
         return FrozenGIConfiguration(
             enabled=bool(self.enabled),
-            incidence_motor=str(self.incidence_motor or "Manual"),
+            incidence_motor=raw,
+            resolved_motor=resolve_gi_motor(raw, choices),
             th_val=float(self.th_val),
             sample_orientation=int(self.sample_orientation),
             tilt_angle=float(self.tilt_angle),
@@ -229,10 +269,18 @@ class GIIntent:
 
 @dataclass(frozen=True, slots=True)
 class FrozenGIConfiguration:
-    """Deeply immutable grazing-incidence configuration for one run."""
+    """Deeply immutable grazing-incidence configuration for one run.
+
+    ``incidence_motor`` is the operator's RAW selection; ``resolved_motor`` is
+    the effective incidence axis chosen once by the shared policy from the
+    source's motor list (R4B-8).  Every RUN consumer (plan builder, worker,
+    writer provenance) uses the resolved value; the raw selection is retained
+    for provenance/audit.
+    """
 
     enabled: bool = False
     incidence_motor: str = "Manual"
+    resolved_motor: str = ""
     th_val: float = 0.1
     sample_orientation: int = 4
     tilt_angle: float = 0.0
@@ -246,12 +294,23 @@ class FrozenGIConfiguration:
             raise ValueError("th_val must be finite")
         if not math.isfinite(float(self.tilt_angle)):
             raise ValueError("tilt_angle must be finite")
+        # Direct construction (tests, restore) may omit resolution; fall back to
+        # the raw selection so the resolved value is always populated.
+        if not str(self.resolved_motor or ""):
+            object.__setattr__(
+                self, "resolved_motor", str(self.incidence_motor or "Manual"))
+
+    @property
+    def effective_motor(self) -> str:
+        """The resolved incidence-motor axis every RUN consumer must use."""
+        return str(self.resolved_motor or self.incidence_motor or "Manual")
 
     @property
     def scan_incidence_motor(self) -> str:
-        if self.incidence_motor == "Manual":
+        motor = self.effective_motor
+        if motor == "Manual":
             return str(float(self.th_val))
-        return str(self.incidence_motor)
+        return str(motor)
 
     def scan_config(self) -> dict[str, Any]:
         """Return a fresh ``LiveScan.gi_config`` mapping."""
@@ -261,7 +320,7 @@ class FrozenGIConfiguration:
         return {
             "gi_mode_1d": self.mode_1d,
             "gi_mode_2d": self.mode_2d,
-            "incidence_motor": self.incidence_motor,
+            "incidence_motor": self.effective_motor,
             "th_val": float(self.th_val),
             "sample_orientation": int(self.sample_orientation),
             "tilt_angle": float(self.tilt_angle),
@@ -271,6 +330,7 @@ class FrozenGIConfiguration:
         return {
             "enabled": bool(self.enabled),
             "incidence_motor": self.incidence_motor,
+            "resolved_motor": self.effective_motor,
             "th_val": float(self.th_val),
             "sample_orientation": int(self.sample_orientation),
             "tilt_angle": float(self.tilt_angle),
@@ -540,6 +600,7 @@ class FrozenRunConfiguration:
             (
                 bool(self.gi.enabled),
                 str(self.gi.incidence_motor),
+                str(self.gi.effective_motor),
                 _float_token(self.gi.th_val),
                 int(self.gi.sample_orientation),
                 _float_token(self.gi.tilt_angle),
@@ -668,6 +729,21 @@ class FrozenRunConfiguration:
             "run_options": self.run_options,
         }
 
+    def native_int_snapshot(self) -> dict[str, Any]:
+        """Return a reduction snapshot dictionary derived from this frozen configuration."""
+        gi_enabled = bool(self.gi.enabled)
+        incidence = self.gi.scan_incidence_motor if gi_enabled else "Manual"
+        return {
+            "bai_1d_args": copy.deepcopy(dict(self.bai_1d_args or {})),
+            "bai_2d_args": copy.deepcopy(dict(self.bai_2d_args or {})),
+            "gi": gi_enabled,
+            "gi_config": self.gi.scan_config() if gi_enabled else {},
+            "incidence_motor": incidence,
+            "th_mtr": incidence,
+            "sample_orientation": int(self.gi.sample_orientation),
+            "tilt_angle": float(self.gi.tilt_angle),
+        }
+
 
 @dataclass(slots=True)
 class RunIntent:
@@ -718,8 +794,14 @@ class RunIntent:
         self,
         *,
         generation: int | None = None,
+        gi_motor_choices: "list[str] | tuple[str, ...] | None" = None,
     ) -> FrozenRunConfiguration:
-        """Freeze the current values and advance the monotonic run generation."""
+        """Freeze the current values and advance the monotonic run generation.
+
+        ``gi_motor_choices`` is the source's real motor list, supplied by the
+        caller (the GUI) so the effective GI motor is resolved ONCE here (R4B-8)
+        rather than independently by each run consumer.
+        """
 
         if generation is None:
             next_generation = int(self.generation) + 1
@@ -742,7 +824,7 @@ class RunIntent:
             live_mode=bool(self.live_mode),
             batch_mode=bool(self.batch_mode),
             max_cores=int(self.max_cores),
-            gi=self.gi.freeze(),
+            gi=self.gi.freeze(choices=gi_motor_choices),
             threshold=self.threshold.freeze(),
             poni_file=str(self.poni_file or ""),
             mask_file=str(self.mask_file or ""),
@@ -798,4 +880,5 @@ __all__ = [
     "GIIntent",
     "RunIntent",
     "ThresholdIntent",
+    "resolve_gi_motor",
 ]

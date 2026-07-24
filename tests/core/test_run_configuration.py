@@ -246,3 +246,73 @@ def test_session_package_exposes_values_lazily_without_qt():
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_gi_motor_resolved_once_from_choices():
+    """O-1a-ii item 5 (R4B-8): the effective GI motor is resolved ONCE at freeze
+    from the supplied source-motor list, using the single shared policy — never
+    injecting a motor absent from the source, and carrying both the raw
+    selection and the resolved motor."""
+    from xrd_tools.session.run_configuration import resolve_gi_motor
+
+    # Policy directly.
+    assert resolve_gi_motor("th", ["halpha", "detx"]) == "halpha"   # stale -> default
+    assert resolve_gi_motor("halpha", ["halpha", "detx"]) == "halpha"  # valid kept
+    assert resolve_gi_motor("detx", ["detx", "dety"]) == "detx"     # valid explicit kept
+    assert resolve_gi_motor("Manual", ["halpha"]) == "Manual"       # Manual stays
+    # A stale motor absent from the source with no rotation-like axis -> Manual.
+    assert resolve_gi_motor("th", ["detx", "dety"]) == "Manual"
+    assert resolve_gi_motor("th", None) == "th"                     # unverifiable -> as-is
+
+    # GIIntent.freeze carries raw + resolved and drives the effective motor.
+    frozen = GIIntent(enabled=True, incidence_motor="th", th_val=0.2).freeze(
+        choices=["halpha", "detx"])
+    assert frozen.incidence_motor == "th"          # raw selection retained
+    assert frozen.resolved_motor == "halpha"       # resolved once
+    assert frozen.effective_motor == "halpha"
+    assert frozen.scan_incidence_motor == "halpha"
+    assert frozen.scan_config()["incidence_motor"] == "halpha"
+    assert frozen.as_dict()["resolved_motor"] == "halpha"
+
+    # Manual resolves to the typed theta value for the scan.
+    manual = GIIntent(enabled=True, incidence_motor="Manual", th_val=0.35).freeze(
+        choices=["halpha"])
+    assert manual.effective_motor == "Manual"
+    assert manual.scan_incidence_motor == str(0.35)
+
+
+def test_gi_resolved_motor_is_part_of_run_identity():
+    """Two runs with the same RAW GI selection but a different RESOLVED motor
+    (different source motor lists) have DIFFERENT fingerprints — the resolved
+    axis is part of the run's content identity."""
+    a = RunIntent(gi=GIIntent(enabled=True, incidence_motor="th")).freeze(
+        gi_motor_choices=["halpha", "detx"])
+    b = RunIntent(gi=GIIntent(enabled=True, incidence_motor="th")).freeze(
+        gi_motor_choices=["eta", "detx"])
+    assert a.gi.effective_motor == "halpha"
+    assert b.gi.effective_motor == "eta"
+    assert a.fingerprint != b.fingerprint
+
+
+def test_resolve_gi_motor_none_vs_empty_choices_escape():
+    """The ()-vs-None distinction (T-1 escape fix): an explicit saved motor with
+    UNKNOWN choices (``None``) must be HONORED (display/frozen must not diverge),
+    while a genuinely EMPTY-and-known list (``()``) degrades a stale explicit
+    motor to the default policy.  The GUI passes ``None`` when the dropdown is
+    not populated — never ``()`` — so a motor GI run never silently becomes a
+    fixed-angle run."""
+    from xrd_tools.session.run_configuration import resolve_gi_motor
+
+    # Unknown choices (None): the explicit motor is honored as-is.
+    assert resolve_gi_motor("halpha", None) == "halpha"
+    assert resolve_gi_motor("th", None) == "th"
+    # Empty-and-known (()): a stale explicit motor degrades (no source motors).
+    assert resolve_gi_motor("halpha", ()) == "Manual"
+    assert resolve_gi_motor("th", ()) == "Manual"
+    # Freeze honors an explicit motor when the caller cannot supply a list.
+    frozen_unknown = GIIntent(enabled=True, incidence_motor="halpha").freeze(
+        choices=None)
+    assert frozen_unknown.effective_motor == "halpha"
+    frozen_empty = GIIntent(enabled=True, incidence_motor="halpha").freeze(
+        choices=())
+    assert frozen_empty.effective_motor == "Manual"
