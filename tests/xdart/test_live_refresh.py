@@ -2694,6 +2694,14 @@ def test_get_img_fname_clears_motors_when_source_switch_resolves_no_file():
     h.set_gi_motor_options = MethodType(imageWrangler.set_gi_motor_options, h)
     h._emit_gi_hydration = MethodType(imageWrangler._emit_gi_hydration, h)
     h.set_gi_th_motor = MethodType(imageWrangler.set_gi_th_motor, h)
+    # Real directory-preview seam (get_img_fname -> _directory_metadata_preview_file
+    # -> _adopt_directory_metadata_preview).  img_dir="" ("no directory chosen")
+    # holds no "_master.h5" preview, so the real preview method returns "" and the
+    # real adopt method takes its §13.7 clear-stale branch -> motors/counters emptied.
+    h._directory_metadata_preview_file = MethodType(
+        imageWrangler._directory_metadata_preview_file, h)
+    h._adopt_directory_metadata_preview = MethodType(
+        imageWrangler._adopt_directory_metadata_preview, h)
     h._sync_meta_ext_to_img_ext = lambda: None
     h._find_image_directory_seed = lambda match, suffix: None  # no seed -> no file
     h.exists_meta_file = lambda f: False
@@ -9921,7 +9929,8 @@ def test_streaming_dispatch_series_average_submits_one_mean_frame(monkeypatch):
     )
     for name in ("_build_batch_frames", "_dispatch_batch_streaming",
                  "_get_streaming_session", "_record_store_hydrator",
-                 "_on_qt_gui_thread", "_heavy_staging_window"):
+                 "_on_qt_gui_thread", "_heavy_staging_window",
+                 "_source_snapshot_for_frame"):
         setattr(host, name, MethodType(getattr(imageThread, name), host))
 
     pending = [
