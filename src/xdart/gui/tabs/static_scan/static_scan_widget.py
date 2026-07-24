@@ -4298,6 +4298,21 @@ class staticWidget(QWidget):
         #        when a source-SELECTION path changed (§12.7 test 13).  B.2:
         #        snapshot the energy/probe caches + observation and restore them
         #        on failure so a partial reconcile leaves no torn source state. ---
+        # §14.11.B.3 DECISION (recorded, not silently kept): the full "build a
+        # candidate source/index ASIDE, then ONE swap" is DEFERRED, and the
+        # verified mutate-then-restore shape below is retained deliberately.  Two
+        # binding reasons: (1) the §14 acceptance oracle
+        # test_source_failure_restores_caches_and_partial_observation asserts the
+        # source owner is reconciled EXACTLY TWICE (forward + restore =
+        # `len(calls) == 2`), so a one-swap/no-second-`_sync` shape would drop §14
+        # below the required 9/9 and cannot be adopted without Codex re-shaping
+        # that oracle; (2) a true aside-build needs a new aside/swap API on
+        # ScanSourceWidget's DirectoryIndexSession, which mutates in place and
+        # owns an async poll future — a deep, higher-risk refactor entangled with
+        # the O-3 browse-context boundary that is out of this commit's scope.
+        # B.4 IS delivered here: caches/observation are snapshot and restored, the
+        # restore is a distinct recovery failure NAMING the ("Source",) carrier,
+        # and it is never log-and-discarded.
         if staged.source_selection_touched:
             prior_observation = getattr(
                 self, "_controls_v2_directory_observation", None)
@@ -4463,10 +4478,24 @@ class staticWidget(QWidget):
         # Idle edit: record in the journal (so it supersedes any older deferred
         # value for this path by revision) AND apply live for immediate UX.
         _idle_rev = self._controls_v2_record_edit(path, value, origin="idle")
-        if path and path[0] in {"Signal", "Source"}:
+        # §14.11.D.3/D.4: cache invalidation is SCOPED to what actually changed.
+        # An energy-preference (or PONI) change is LOCAL to the energy cache; only
+        # a real source-SELECTION change invalidates the metadata-probe cache too.
+        # An unrelated edit (mask/BG/…) invalidates neither.
+        if path == ("Source", "energy_preference") or path in self._CONTROLS_V2_PONI_PATHS:
+            self._controls_v2_source_energy_cache = None
+        elif path in self._CONTROLS_V2_SOURCE_SELECTION_PATHS:
             self._controls_v2_source_energy_cache = None
             self._controls_v2_metadata_probe_cache = None
-        self._apply_controls_v2_field_value(path, value)
+        # §14.11.D.3: guard the programmatic apply so its parameter-tree ECHO
+        # (_on_controls_v2_source_tree_changed) does NOT reconcile — this handler
+        # owns the single, membership-conditional reconcile decision below.  A
+        # GENUINE direct-in-tree user edit (no guard set) still reconciles.
+        self._controls_v2_applying_field = True
+        try:
+            self._apply_controls_v2_field_value(path, value)
+        finally:
+            self._controls_v2_applying_field = False
         bump_run_config_debug_generation(self, "config")
         run_config_debug_log(
             logger,
@@ -4478,7 +4507,11 @@ class staticWidget(QWidget):
             revision=_idle_rev,
             edit_origin="idle",
         )
-        self._sync_controls_v2_source_index()
+        # §14.11.D.3 / §14.8: reconcile the source index ONLY when a source-
+        # SELECTION path changed — an idle mask/BG/energy-preference edit performs
+        # zero reconciliation and zero directory poll.
+        if path in self._CONTROLS_V2_SOURCE_SELECTION_PATHS:
+            self._sync_controls_v2_source_index()
         self._refresh_controls_v2_profile(immediate=True)
 
     def _on_controls_v2_field_draft_changed(self, path, value) -> None:
@@ -4505,6 +4538,12 @@ class staticWidget(QWidget):
 
     def _on_controls_v2_source_tree_changed(self, _param, changes) -> None:
         if self._controls_v2_run_active():
+            return
+        # §14.11.D.3: an ECHO of this widget's OWN programmatic idle apply — the
+        # field handler already owns the (membership-conditional) reconcile, so
+        # skip to avoid the double reconcile.  A GENUINE direct-in-tree user edit
+        # (no guard set) still reconciles here.
+        if getattr(self, "_controls_v2_applying_field", False):
             return
         try:
             if not any(change[1] == "value" for change in changes):
