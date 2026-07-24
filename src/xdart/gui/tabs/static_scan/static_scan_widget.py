@@ -14,6 +14,7 @@ import time
 import types
 from pathlib import Path
 from collections import OrderedDict
+from types import MappingProxyType
 import gc
 import imageio
 import pyFAI
@@ -733,24 +734,60 @@ class ControlsCommitResult:
 _CONTROLS_V2_MISSING = object()
 
 
+def _freeze_carrier_payload(value):
+    """Normalise one carrier payload so the plan cannot be rewritten (§19.5 req 1).
+
+    Sequences become tuples and mappings become immutable proxies; every other
+    value is deep-copied.  Control payloads are scalars, strings and small
+    sequences in practice, so this keeps ``==`` readback semantics intact while
+    removing the caller's ability to mutate a stored payload after preparation."""
+    if isinstance(value, (str, bytes)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_carrier_payload(v) for v in value)
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {k: _freeze_carrier_payload(v) for k, v in value.items()})
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_carrier_payload(v) for v in value)
+    return copy.deepcopy(value)
+
+
 class _PreparedLegacyCarrier:
-    """Immutable prepared legacy carrier (§18.8.3 req 1).
+    """FROZEN prepared legacy carrier (§18.8.3 req 1 / §19.5 req 1).
 
     Binds the diagnostic ``path`` to the ORIGINAL ``Parameter`` handle resolved
     ONCE at preflight, plus the raw edit ``value``, the ``prior`` value, and the
     coerced ``expected`` readback value.  The forward setter, readback, and
     rollback all operate on the BOUND ``param`` handle; the path is used ONLY to
     DETECT identity replacement, never re-resolved as the data authority (§18.4).
-    """
+
+    §19.5 req 1: EVERY attribute is read-only after construction (a `__slots__`
+    class whose ``path``/``expected`` stay assignable is not an immutable
+    transaction plan), and mutable payloads are normalised at ingress so the
+    caller cannot rewrite the plan through an alias."""
 
     __slots__ = ("path", "param", "value", "prior", "expected")
 
     def __init__(self, path, param, value, prior, expected):
-        self.path = tuple(path)
-        self.param = param
-        self.value = value
-        self.prior = prior
-        self.expected = expected
+        object.__setattr__(self, "path", tuple(path))
+        object.__setattr__(self, "param", param)
+        object.__setattr__(self, "value", _freeze_carrier_payload(value))
+        object.__setattr__(self, "prior", _freeze_carrier_payload(prior))
+        object.__setattr__(self, "expected", _freeze_carrier_payload(expected))
+
+    def __setattr__(self, name, value):
+        raise AttributeError(
+            "_PreparedLegacyCarrier is frozen; a prepared transaction plan is "
+            f"never rewritten in place (attempted to set {name!r})")
+
+    def __delattr__(self, name):
+        raise AttributeError("_PreparedLegacyCarrier is frozen")
+
+    def __repr__(self):
+        return (f"_PreparedLegacyCarrier(path={self.path!r}, "
+                f"value={self.value!r}, prior={self.prior!r}, "
+                f"expected={self.expected!r})")
 
 
 class SourceRecoveryReceipt(NamedTuple):
@@ -4394,17 +4431,54 @@ class staticWidget(QWidget):
         except Exception:
             logger.debug("controls intent restore raised", exc_info=True)
             raised = True
-        matched = self._controls_v2_intent_values_match(live, snapshot)
+        try:
+            matched = self._controls_v2_intent_values_match(live, snapshot)
+        except Exception:
+            logger.debug("controls intent verification raised", exc_info=True)
+            matched = False
         if not matched:
-            staticWidget._controls_v2_apply_intent_snapshot(live, snapshot)
+            # §19.7 req 1: a raising backstop is a contained recovery failure.
+            try:
+                staticWidget._controls_v2_apply_intent_snapshot(live, snapshot)
+            except Exception:
+                logger.debug("controls intent snapshot backstop raised",
+                             exc_info=True)
         return [] if (not raised and matched) else [("Intent",)]
 
+    def _controls_v2_bound_carrier(self, path):
+        """The carrier BOUND at preflight for *path*, or ``None`` (§19.5 req 2).
+
+        The path is a KEY into this transaction's prepared plan — it is never
+        resolved against the live parameter tree, so an object newly installed at
+        the same path is unreachable from any post-preflight write or restore."""
+        bound = getattr(self, "_controls_v2_bound_carriers", None) or {}
+        return bound.get(tuple(path))
+
     def _controls_v2_write_legacy_carrier(self, params, path, value) -> None:
-        """Write one legacy carrier signal-blocked (no readback).  The mirror
-        swallows a broken wrangler setter, so the caller MUST verify via
-        :meth:`_controls_v2_carrier_readback_ok` on the BOUND handle — the
-        readback, not the setter's return, is the authority (§14.11.A.2)."""
-        self._mirror_wrangler_parameter_values(params, ((tuple(path), value),))
+        """Write ONE legacy carrier through its BOUND handle, signal-blocked.
+
+        §19.5 req 2/3/6: the write target is the ``Parameter`` object resolved
+        ONCE at preflight and bound onto the prepared carrier — NEVER
+        ``params.child(*path)``.  The previous implementation delegated to the
+        mirror layer, which re-resolved the child, so a replacement installed at
+        that path after preflight was the object actually mutated while the
+        prepared original stayed untouched (§19.5).  There is exactly ONE write
+        mechanism: no "fast normal" path beside a "forced bound" exception path.
+
+        Signal blocking covers the ROOT (whose signal owns ``wrangler.setup()``)
+        and the bound CHILD (whose own connections fire on ``setValue``), without
+        resolving a new child as the target.  No readback here: the caller MUST
+        verify via :meth:`_controls_v2_carrier_readback_ok` on the bound handle —
+        the readback, not the setter's return, is the authority (§14.11.A.2)."""
+        carrier = self._controls_v2_bound_carrier(path)
+        param = None if carrier is None else carrier.param
+        if param is None:
+            raise ControlsTransactionError(
+                tuple(path), "no bound carrier for legacy write", value)
+        # The mirror layer still owns the signal-blocking discipline (root +
+        # child), but it is handed the ALREADY-RESOLVED bound object instead of a
+        # path, so it cannot resolve — and cannot mutate — a replacement.
+        self._mirror_wrangler_parameter_values(params, ((param, value),))
 
     def _controls_v2_carrier_readback_ok(self, carrier, expected) -> bool:
         """Whether the BOUND ORIGINAL handle reads back as *expected* (§18.4).
@@ -4449,32 +4523,65 @@ class staticWidget(QWidget):
                 except Exception:
                     pass
 
-    def _controls_v2_rollback_legacy_all(self, params, applied, forced_paths=()):
-        """Restore ALL attempted prepared carriers in REVERSE order.
+    def _controls_v2_rollback_legacy_all(self, params, applied):
+        """Restore ALL attempted prepared carriers in REVERSE order, each through
+        ITS OWN bound handle.
 
-        §14.11.A.4-5 / §18.4: NEVER stop at the first restore failure — continue
-        restoring older carriers and collect EVERY path that could not be restored
-        (verified by reading the BOUND handle).  A ``forced_paths`` carrier (its
-        forward setter proved unreliable, or its path was reclaimed by a
-        replacement) is force-restored on the ORIGINAL handle rather than through
-        the same broken wrangler channel."""
+        §14.11.A.4-5 / §18.4 / §19.5 req 5-6: NEVER stop at the first restore
+        failure — continue restoring older carriers and collect EVERY path that
+        could not be restored (verified by reading the BOUND handle).  Restoration
+        is ALWAYS handle-direct: the former ``forced_paths`` split (a "normal"
+        path-routed restore beside a "forced" bound restore) is DELETED, because
+        the path-routed branch could restore a REPLACEMENT object that had taken
+        over the path while leaving the prepared original still holding the
+        transaction's value.  An object newly installed at a carrier's path is
+        left untouched in every case."""
         failed = []
-        forced = {tuple(p) for p in forced_paths}
         for carrier in reversed(applied):
             path = carrier.path
             try:
-                if path in forced:
-                    self._controls_v2_force_restore_carrier(carrier, carrier.prior)
-                else:
-                    self._controls_v2_write_legacy_carrier(
-                        params, path, carrier.prior)
+                # Normal restore FIRST, through the carrier's own (possibly
+                # overridden) setter on the BOUND handle, so a setter that
+                # refuses the prior value is DETECTED rather than bypassed.
+                self._controls_v2_restore_carrier_value(carrier, carrier.prior)
                 ok = self._controls_v2_carrier_readback_ok(carrier, carrier.prior)
             except Exception:
                 logger.debug("rollback of %s raised", path, exc_info=True)
                 ok = False
             if not ok:
+                # Authoritative backstop on the same bound handle (bypassing the
+                # unreliable setter) — the state is recovered, but the primary
+                # restore contract FAILED and that evidence is never erased.
+                try:
+                    self._controls_v2_force_restore_carrier(carrier, carrier.prior)
+                except Exception:
+                    logger.debug("forced rollback of %s raised", path,
+                                 exc_info=True)
                 failed.append(path)
         return failed
+
+    def _controls_v2_restore_carrier_value(self, carrier, value) -> None:
+        """Restore the BOUND handle through its ordinary setter, signal-blocked.
+
+        §19.5 req 5: the target is always ``carrier.param`` — an object newly
+        installed at the same path is never written — but the setter itself is
+        the carrier's own, so an override that refuses the value is observable in
+        the readback instead of being silently bypassed."""
+        param = carrier.param
+        if param is None:
+            return
+        try:
+            prev = param.blockSignals(True)
+        except Exception:
+            prev = None
+        try:
+            param.setValue(value)
+        finally:
+            if prev is not None:
+                try:
+                    param.blockSignals(prev)
+                except Exception:
+                    pass
 
     #: Display-scan fields the native-int projection writes (kept in sync with
     #: ``_controls_v2_apply_native_int_snapshot_to_scan``).  §14.11.B.1: the
@@ -4595,14 +4702,25 @@ class staticWidget(QWidget):
             matched = self._controls_v2_display_scan_matches(
                 scan, values, identities)
             if not matched:
-                staticWidget._controls_v2_apply_display_snapshot(scan, values)
+                # §19.7 req 1: the authoritative backstop is best-effort — if IT
+                # raises, that is a contained recovery failure, never an exception
+                # escaping the transaction and skipping later recovery classes.
+                try:
+                    staticWidget._controls_v2_apply_display_snapshot(scan, values)
+                except Exception:
+                    logger.debug("controls display snapshot backstop raised",
+                                 exc_info=True)
             return matched
 
-        if lock is None:
-            matched = _verify_and_backstop()
-        else:
-            with lock:
+        try:
+            if lock is None:
                 matched = _verify_and_backstop()
+            else:
+                with lock:
+                    matched = _verify_and_backstop()
+        except Exception:
+            logger.debug("controls display verification raised", exc_info=True)
+            matched = False
         return [] if (not raised and matched) else [("Display",)]
 
     def commit_controls_transaction(self, staged) -> ControlsCommitResult:
@@ -4658,6 +4776,8 @@ class staticWidget(QWidget):
         # missing carrier, a getter failure, OR a coercion failure (no longer
         # swallowed into expected=value) is a typed preflight failure, zero writes.
         carriers = []  # list[_PreparedLegacyCarrier]
+        # §19.5: the previous transaction's bindings are never reachable.
+        self._controls_v2_bound_carriers = {}
         for path, value in projection:
             path = tuple(path)
             param = self._controls_v2_param(path)
@@ -4688,6 +4808,11 @@ class staticWidget(QWidget):
             # carrier; forward/readback/rollback all use param, never the path.
             carriers.append(
                 _PreparedLegacyCarrier(path, param, value, prior, expected))
+        # §19.5 req 2/6: publish the prepared plan as THE binding registry for
+        # this transaction.  Every post-preflight write and restore resolves its
+        # target here — the path is a key into the plan, never a lookup against
+        # the live parameter tree.
+        self._controls_v2_bound_carriers = {c.path: c for c in carriers}
 
         # B.3: display snapshot BEFORE the first write, under scan_lock; an
         # uncopyable field RAISES -> typed preflight failure (never an alias).
@@ -4789,7 +4914,7 @@ class staticWidget(QWidget):
                 # req 3 (after write): restore the bound ORIGINAL handle and leave
                 # any replacement untouched (forced restore is handle-direct).
                 recovery = self._controls_v2_recover_all(
-                    ctx, applied, forced_paths=(carrier.path,), touched=touched)
+                    ctx, applied, touched=touched)
                 return ControlsCommitResult(
                     False, failed_path=carrier.path,
                     reason=("legacy carrier handle replaced after write"
@@ -4858,7 +4983,7 @@ class staticWidget(QWidget):
                     recovery_failed_paths=recovery, phase="source_reconcile")
         return ControlsCommitResult(True)
 
-    def _controls_v2_recover_all(self, ctx, applied, forced_paths=(),
+    def _controls_v2_recover_all(self, ctx, applied,
                                  source_reconciled=False, touched=frozenset()):
         """§15.4-B.5 / §18.5 RECOVERY COLLECTOR — restore every carrier CLASS that
         reached a forward write through a PER-CLASS ``try``/``except`` in reverse-
@@ -4870,65 +4995,150 @@ class staticWidget(QWidget):
         failure the caller reports is preserved separately from these recovery
         failures (req 8).
 
+        §19.7: recovery is EXCEPTION-TOTAL.  Every wrapper is total on its own,
+        AND every wrapper INVOCATION here is wrapped again, so a regression inside
+        one class can never suppress the recovery of later classes or leak an
+        untyped exception out of the action/Run boundary.  A wrapper that raises
+        is recorded as that class's named failure and recovery continues.
+
         Order (reverse of application): source owner -> caches/observation ->
-        compound PONI -> display scan -> intent/self-state -> legacy carriers."""
+        compound PONI -> display scan -> intent -> self-state -> legacy
+        carriers."""
         failures = []
         staged = ctx["staged"]
+
+        def collect(label, restore, *args):
+            """Run one recovery class TOTALLY (§19.7 req 1-2/4-5)."""
+            try:
+                found = restore(*args)
+            except Exception:
+                logger.debug("controls recovery class %s raised", label,
+                             exc_info=True)
+                found = [label]
+            for path in found or ():
+                if path not in failures:
+                    failures.append(path)
+
         # 1. source owner (applied LAST => restored FIRST).  §18.6: restore the
         #    SOURCE-SELECTION legacy carriers FIRST so the recovery reconcile
         #    observes the PRIOR selection, then VERIFY against the typed receipt
         #    (§15.12-C.5) — a non-raising `_sync` that left the owner on the new
         #    selection is a recovery FAILURE, never proof of restoration.
         if source_reconciled:
-            self._controls_v2_restore_source_selection_carriers(ctx, applied)
-            restored = False
-            try:
-                self._sync_controls_v2_source_index()
-                restored = self._controls_v2_source_restore_verified(
-                    ctx.get("source_receipt"))
-            except Exception:
-                logger.debug("controls source restore reconcile failed",
-                             exc_info=True)
-                restored = False
-            if not restored:
-                failures.append(("Source",))
+            collect(("Source",), self._controls_v2_restore_source_owner_verified,
+                    ctx, applied)
             # observation + caches from the preflight snapshot AFTER the restore
             # reconcile (authoritative even if it mutated them again), verified.
-            failures.extend(self._controls_v2_restore_source_caches_verified(ctx))
+            collect(("Source", "cache"),
+                    self._controls_v2_restore_source_caches_verified, ctx)
         # 2. compound PONI carriers (verified — a silent no-op is a named failure).
         if "poni" in touched and staged.poni_touched:
-            failures.extend(self._controls_v2_restore_poni_carriers_verified(ctx))
+            collect(("Signal", "poni_file"),
+                    self._controls_v2_restore_poni_carriers_verified, ctx)
         # 3. display-scan projection (verified under scan_lock).
         if "display" in touched:
-            failures.extend(self._controls_v2_restore_display_scan_verified(
-                ctx["scan"], ctx["display_scan_snapshot"]))
-        # 4. intent field references + self-state (verified).
+            collect(("Display",),
+                    self._controls_v2_restore_display_scan_verified,
+                    ctx["scan"], ctx["display_scan_snapshot"])
+        # 4. intent field references, then the three self-state fields —
+        #    snapshotted, restored INDEPENDENTLY, read back, and named on failure
+        #    (§19.6); a failure in one never skips the others.
         if "intent" in touched:
-            failures.extend(self._controls_v2_restore_intent_values_verified(
-                ctx["live"], ctx["intent_snapshot"]))
-            try:
-                self._controls_v2_gi_selection_explicit = ctx["prior_gi_explicit"]
-                self._controls_v2_threshold_state = ctx["prior_threshold_state"]
-                self._controls_v2_source_energy_preference = (
-                    ctx["prior_energy_pref"])
-            except Exception:
-                logger.debug("controls self-state restore failed", exc_info=True)
+            collect(("Intent",),
+                    self._controls_v2_restore_intent_values_verified,
+                    ctx["live"], ctx["intent_snapshot"])
+            collect(("Intent", "self_state"),
+                    self._controls_v2_restore_self_state_verified, ctx)
         # 5. legacy carriers (reverse projection order; its own verified collector).
-        failures.extend(self._controls_v2_rollback_legacy_all(
-            ctx["params"], applied, forced_paths=forced_paths))
+        collect(("Signal",), self._controls_v2_rollback_legacy_all,
+                ctx["params"], applied)
         return failures
+
+    #: The self-state fields the install writes, as
+    #: ``(diagnostic name, attribute, ctx snapshot key)`` in RESTORE order.
+    #: §19.6: each is snapshotted before the forward write, restored
+    #: independently, verified by readback, and named on failure.
+    _CONTROLS_V2_SELF_STATE_FIELDS = (
+        ("gi_selection_explicit", "_controls_v2_gi_selection_explicit",
+         "prior_gi_explicit"),
+        ("threshold_state", "_controls_v2_threshold_state",
+         "prior_threshold_state"),
+        ("source_energy_preference", "_controls_v2_source_energy_preference",
+         "prior_energy_pref"),
+    )
+
+    def _controls_v2_restore_self_state_verified(self, ctx) -> list:
+        """Restore the three self-state fields INDEPENDENTLY and VERIFY each
+        (§19.6 req 1-7).
+
+        Direct assignment used to be the whole contract: exceptions were logged
+        and a setter that silently refused the prior value was invisible, so
+        ``recovery_failed_paths`` stayed empty while the NEW value remained
+        installed.  Each field is now restored on its own, read back and compared
+        (identity or equality, whichever its owner needs), and a failure appends a
+        stable ``("Intent", <name>)`` path and does NOT stop the remaining fields.
+        An instance-dict backstop is attempted after a failed restore; even when
+        the backstop succeeds the primary failure is still reported, so recovery
+        evidence is never erased (req 6)."""
+        failures = []
+        for name, attr, key in self._CONTROLS_V2_SELF_STATE_FIELDS:
+            wanted = ctx[key]
+            raised = False
+            try:
+                setattr(self, attr, wanted)
+            except Exception:
+                logger.debug("controls self-state restore of %s raised", name,
+                             exc_info=True)
+                raised = True
+            if raised or not self._controls_v2_self_state_matches(attr, wanted):
+                try:                       # authoritative backstop (req 6)
+                    self.__dict__[attr] = wanted
+                except Exception:
+                    logger.debug("controls self-state backstop for %s failed",
+                                 name, exc_info=True)
+                failures.append(("Intent", name))
+        return failures
+
+    def _controls_v2_self_state_matches(self, attr, wanted) -> bool:
+        """Whether *attr* currently reads back as *wanted* (§19.6 req 3)."""
+        try:
+            current = getattr(self, attr, _CONTROLS_V2_MISSING)
+        except Exception:
+            return False
+        if current is wanted:
+            return True
+        try:
+            return bool(current == wanted)
+        except Exception:
+            return False
+
+    def _controls_v2_restore_source_owner_verified(self, ctx, applied) -> list:
+        """Restore the source owner to the PRIOR selection and PROVE it (§18.6).
+
+        Split out of the collector so §19.7's total wrapper covers it uniformly
+        with every other recovery class."""
+        self._controls_v2_restore_source_selection_carriers(ctx, applied)
+        try:
+            self._sync_controls_v2_source_index()
+            restored = self._controls_v2_source_restore_verified(
+                ctx.get("source_receipt"))
+        except Exception:
+            logger.debug("controls source restore reconcile failed",
+                         exc_info=True)
+            restored = False
+        return [] if restored else [("Source",)]
 
     def _controls_v2_restore_source_selection_carriers(self, ctx, applied) -> None:
         """§18.6: before a recovery source reconcile, restore the SOURCE-SELECTION
         legacy carriers to their prior values so the owner reconciles for the PRIOR
         selection — not the new one a second time.  Best-effort/idempotent; the
-        verified, failure-collecting legacy rollback still runs last."""
-        params = ctx.get("params")
+        verified, failure-collecting legacy rollback still runs last.  §19.5 req 5:
+        handle-direct like every other restore — never a path-resolved object."""
         for carrier in reversed(applied):
             if carrier.path in self._CONTROLS_V2_SOURCE_SELECTION_PATHS:
                 try:
-                    self._controls_v2_write_legacy_carrier(
-                        params, carrier.path, carrier.prior)
+                    self._controls_v2_force_restore_carrier(
+                        carrier, carrier.prior)
                 except Exception:
                     logger.debug("source-selection pre-restore of %s failed",
                                  carrier.path, exc_info=True)
@@ -8137,6 +8347,12 @@ class staticWidget(QWidget):
         regardless of the root block, so each written child's own signals are
         blocked for the duration of its ``setValue`` too — the hidden tree stays
         a pure output adapter with no write-back into the run.
+
+        §19.5: an entry's first element may be an ALREADY-RESOLVED ``Parameter``
+        object instead of a path.  The Controls transaction always passes the
+        handle bound at preflight, so a carrier write can never resolve — and can
+        never mutate — an object that took over the path after preparation.  The
+        path form remains for the non-transactional mirror callers.
         """
         if parameters is None:
             return
@@ -8145,7 +8361,9 @@ class staticWidget(QWidget):
         try:
             for path, value in values:
                 try:
-                    parameter = parameters.child(*path)
+                    parameter = (
+                        path if hasattr(path, "setValue")
+                        else parameters.child(*path))
                     if parameter.value() != value:
                         prev_child = parameter.blockSignals(True)
                         child_blocked.append((parameter, prev_child))
