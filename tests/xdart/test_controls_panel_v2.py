@@ -5199,14 +5199,15 @@ def test_frame_boundary_paints_outgoing_list_before_rescope_dir1(
         widget.deleteLater()
 
 
-def test_gi_mirror_blocks_child_signals_no_setup_reentry(qapp, monkeypatch):
-    """R4B-9 (O-1a-i item 6): the run-boundary GI mirror into the hidden wrangler
-    tree must not fire the child-level θ-motor handlers or re-enter
-    ``wrangler.setup()``.  Blocking only the ROOT Parameter left
-    ``GI.th_motor``/``GI.th_val`` ``sigValueChanged`` connected to
-    ``set_gi_th_motor`` (which writes ``wrangler.incidence_motor``); the mirror
-    must block each written child's own signals too so the hidden tree stays a
-    pure output adapter."""
+def test_gi_mirror_no_reentry_no_intent_write(qapp, monkeypatch):
+    """R4B-9 + P2 (O-1a-i.1 item 12): the run-boundary GI mirror is a pure
+    hidden-output adapter.  It changes ONLY the intended hidden tree value and
+    must not fire the ROOT tree signal (which drives ``imageWrangler.setup()``
+    and the legacy session write), fire the child θ-motor handlers (which write
+    ``wrangler.incidence_motor``), change the Controls-owned ``RunIntent``
+    identity, or change the wrangler's engine carriers.  The root signal is
+    observed DIRECTLY rather than by monkeypatching an already-connected
+    ``setup`` slot (which would not replace the bound connection)."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -5218,45 +5219,56 @@ def test_gi_mirror_blocks_child_signals_no_setup_reentry(qapp, monkeypatch):
         # Offer a real motor so the mirror actually CHANGES the value (a no-op
         # setValue would not emit even without the block).
         th_motor.setOpts(limits=["Manual", "halpha"], value="Manual")
-
-        setup_calls = []
-        orig_setup = wrangler.setup
-
-        def _counting_setup(*a, **k):
-            setup_calls.append(1)
-            return orig_setup(*a, **k)
-
-        monkeypatch.setattr(wrangler, "setup", _counting_setup)
-
-        child_fires = []
-        params.child("GI", "th_motor").sigValueChanged.connect(
-            lambda *a: child_fires.append(("th_motor",) + a[:0]))
-        params.child("GI", "th_val").sigValueChanged.connect(
-            lambda *a: child_fires.append(("th_val",)))
-
-        # Build exactly one frozen configuration with GI enabled and a motor that
-        # differs from the current hidden-tree value, then mirror it.
         widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
         widget._on_controls_v2_field_changed(("GI", "th_motor"), "halpha")
+
+        # Observe the ROOT signal directly — it owns _setup_on_value_change
+        # (-> setup()) and _save_to_session; silence here reliably proves
+        # neither ran.  Plus the child θ-motor handlers (R4B-9).
+        root_fires = []
+        params.sigTreeStateChanged.connect(lambda *a: root_fires.append(1))
+        child_fires = []
+        th_motor.sigValueChanged.connect(lambda *a: child_fires.append(1))
+        params.child("GI", "th_val").sigValueChanged.connect(
+            lambda *a: child_fires.append(1))
+
+        # fingerprint EXCLUDES generation, so it is stable across freeze() calls
+        # unless the intent CONTENT changes.
+        before_fingerprint = (
+            widget._controls_v2_ensure_run_intent().freeze().fingerprint)
+        before_motor = getattr(wrangler, "incidence_motor", None)
+        before_gi = getattr(wrangler, "gi", None)
+
         frozen = widget._controls_v2_ensure_run_intent().freeze()
         widget._push_gi_to_wrangler(frozen)
 
-        assert child_fires == [], (
-            "GI mirror fired child-level θ-motor handlers during the mirror "
-            f"(setup/incidence_motor write-back risk): {child_fires}")
-        assert setup_calls == [], "GI mirror re-entered wrangler.setup()"
-        # The hidden tree still received the mirrored value (its adapter role).
+        # Intended hidden output changed...
         assert th_motor.value() == "halpha"
+        # ...and NOTHING else:
+        assert root_fires == [], (
+            "GI mirror fired the root tree signal (setup()/session write risk)")
+        assert child_fires == [], (
+            "GI mirror fired child θ-motor handlers (incidence_motor write-back)")
+        after_fingerprint = (
+            widget._controls_v2_ensure_run_intent().freeze().fingerprint)
+        assert after_fingerprint == before_fingerprint, (
+            "GI mirror changed the Controls-owned RunIntent content")
+        assert getattr(wrangler, "incidence_motor", None) == before_motor
+        assert getattr(wrangler, "gi", None) == before_gi
     finally:
         widget.close()
         widget.deleteLater()
 
 
-def test_run_active_edit_deferred_to_next_run_with_notice(qapp, monkeypatch):
-    """R4B-12 (O-1a-i item 8): a Controls edit made during an active run is not
-    silently dropped.  It is deferred to the next run's intent (applied through
-    the normal handler at run end) and the operator is told, replacing the old
-    debug-level discard."""
+def test_deferred_edit_applies_post_finalization_not_during_unwind(
+        qapp, monkeypatch):
+    """R4B-12 (O-1a-i.1): a run-active edit is QUEUED (not "saved") and is NOT
+    applied during the synchronous run unwind — only by the single
+    post-finalization owner scheduled on the event loop (released here by
+    processEvents, standing in for the wrangler-finished tail returning to the
+    loop; all run-end paths route through _exit_run_state).  Red at b4add627:
+    the old code applied inside _exit_run_state, so the value changed during the
+    unwind and the notice said "saved"."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -5264,27 +5276,152 @@ def test_run_active_edit_deferred_to_next_run_with_notice(qapp, monkeypatch):
     try:
         notices = []
         widget.wrangler.showLabel.connect(lambda m: notices.append(str(m)))
-
         assert widget._controls_v2_ensure_run_intent().gi.enabled is False
 
         widget._enter_run_state()
-        assert widget._controls_v2_run_active() is True
-
-        # Edit during the run: it must NOT mutate the running intent...
         widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
-        assert widget._controls_v2_ensure_run_intent().gi.enabled is False, (
-            "run-active edit mutated the in-flight run intent")
-        assert any("next run" in m.lower() for m in notices), (
-            f"no visible next-run notice for a run-active edit: {notices}")
-        assert list(getattr(widget, "_controls_v2_deferred_field_edits", [])), (
-            "run-active edit was not queued as next-run intent")
+        assert widget._controls_v2_ensure_run_intent().gi.enabled is False
+        assert notices and "queued" in notices[-1].lower()
+        assert "saved" not in notices[-1].lower()
+        assert list(widget._controls_v2_deferred_field_edits)
 
-        # ...and it lands in the next-run intent when the run ends.
+        # End the run: _exit_run_state SCHEDULES the owner; it must not apply yet.
         widget._exit_run_state()
-        assert widget._controls_v2_ensure_run_intent().gi.enabled is True, (
-            "deferred run-active edit was not applied at run end")
-        assert list(
-            getattr(widget, "_controls_v2_deferred_field_edits", [])) == []
+        assert widget._controls_v2_ensure_run_intent().gi.enabled is False, (
+            "deferred edit applied during the synchronous run unwind")
+
+        # Release the event loop -> the post-finalization owner applies once.
+        qapp.processEvents()
+        assert widget._controls_v2_ensure_run_intent().gi.enabled is True
+        assert list(widget._controls_v2_deferred_field_edits) == []
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_deferred_legacy_field_lands_via_signal_blocked_mirror(
+        qapp, monkeypatch):
+    """R4B-12 req 9 (O-1a-i.1): a legacy-backed field deferred during a run lands
+    at post-finalization through the signal-blocked mirror ONLY — never firing
+    the wrangler ROOT tree signal (imageWrangler.setup() / legacy session
+    write), during the unwind OR the application.  Red at b4add627: the old
+    replay ran a bare param.setValue() from _exit_run_state, firing the root."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        params = widget.wrangler.parameters
+        mask_param = params.child("Signal", "mask_file")
+        target = "/tmp/deferred_mask.edf"
+        assert mask_param.value() != target
+
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("Signal", "mask_file"), target)
+        assert mask_param.value() != target  # not applied while the run is live
+
+        root_fires = []
+        params.sigTreeStateChanged.connect(lambda *a: root_fires.append(1))
+
+        widget._exit_run_state()
+        assert mask_param.value() != target  # not during the unwind either
+        qapp.processEvents()
+
+        assert mask_param.value() == target  # landed at post-finalization
+        assert root_fires == [], (
+            "legacy deferred field fired the wrangler root signal "
+            "(setup()/session write)")
+        assert list(widget._controls_v2_deferred_field_edits) == []
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_deferred_multi_field_atomic_and_freezes_once(qapp, monkeypatch):
+    """R4B-12 req 10 (O-1a-i.1): two fields deferred during a run (native GI +
+    legacy mask) both become next-run state TOGETHER at post-finalization, and a
+    subsequent Run freezes the final values exactly once."""
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        params = widget.wrangler.parameters
+        mask_param = params.child("Signal", "mask_file")
+        target = "/tmp/multi_mask.edf"
+
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
+        widget._on_controls_v2_field_changed(("Signal", "mask_file"), target)
+        # neither applied while the run is active or unwinding:
+        assert widget._controls_v2_ensure_run_intent().gi.enabled is False
+        assert mask_param.value() != target
+        widget._exit_run_state()
+        assert widget._controls_v2_ensure_run_intent().gi.enabled is False
+        assert mask_param.value() != target
+
+        qapp.processEvents()
+        assert widget._controls_v2_ensure_run_intent().gi.enabled is True
+        assert mask_param.value() == target
+        assert list(widget._controls_v2_deferred_field_edits) == []
+
+        # A subsequent Run freezes the final next-run values ONCE.
+        intent = widget._controls_v2_ensure_run_intent()
+        gen_before = intent.generation
+        frozen = widget._prepare_controls_v2_run_configuration()
+        assert frozen is not None
+        assert frozen.gi.enabled is True
+        assert intent.generation == gen_before + 1
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_deferred_replay_failure_retained_notice_and_event(
+        qapp, monkeypatch, caplog):
+    """R4B-12 req 11 (O-1a-i.1): if applying the deferred delta fails, the WHOLE
+    delta is retained (recoverable), the operator gets a visible error, and a
+    structured controls_field_replay_failed event is emitted — never the silent
+    loss the old queue-clear-then-swallow produced.  Red at b4add627: that code
+    cleared the queue before applying and swallowed the legacy setValue failure,
+    leaving the queue empty with no error."""
+    import logging
+
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    monkeypatch.setenv("XDART_RUN_CONFIG_DEBUG", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        notices = []
+        widget.wrangler.showLabel.connect(lambda m: notices.append(str(m)))
+        params = widget.wrangler.parameters
+        mask_param = params.child("Signal", "mask_file")
+
+        widget._enter_run_state()
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)   # A ok
+        widget._on_controls_v2_field_changed(
+            ("Signal", "mask_file"), "/tmp/fail_mask.edf")              # B legacy
+        # Inject a REAL legacy-apply failure: the param's setValue becomes a
+        # silent no-op, so the value cannot land and the replay must DETECT the
+        # false success (the exact P1b swallowed-failure class).  Injected before
+        # _exit_run_state so it also hits b4add627's synchronous replay.
+        monkeypatch.setattr(mask_param, "setValue", lambda *a, **k: None)
+
+        widget._exit_run_state()
+        notices.clear()
+        with caplog.at_level(logging.INFO):
+            qapp.processEvents()
+
+        remaining = [
+            tuple(p) for p, _ in widget._controls_v2_deferred_field_edits]
+        assert ("GI", "Grazing") in remaining, (
+            f"whole delta not retained after a failed replay: {remaining}")
+        assert ("Signal", "mask_file") in remaining, remaining
+        assert any(
+            "pending" in n.lower() or "could not" in n.lower()
+            for n in notices), notices
+        assert "controls_field_replay_failed" in caplog.text
     finally:
         widget.close()
         widget.deleteLater()

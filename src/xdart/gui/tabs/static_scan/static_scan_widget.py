@@ -2350,6 +2350,12 @@ class staticWidget(QWidget):
 
         if not self._controls_v2_enabled():
             return None
+        # R4B-12 (O-1a-i.1): drain any edits deferred during the previous run
+        # into the next-run intent BEFORE this freeze, so a run started before
+        # the post-finalization singleShot has ticked still freezes the final
+        # values exactly once (the owner is idempotent and no-ops when idle with
+        # an empty queue).
+        self._controls_v2_apply_deferred_next_run_edits()
         self._commit_controls_v2_pending_edits()
         self._controls_v2_ensure_native_int_defaults()
         intent = self._controls_v2_ensure_run_intent()
@@ -2678,12 +2684,16 @@ class staticWidget(QWidget):
                 cache.plan_builder = builder
 
     def _controls_v2_defer_field_edit(self, path, value) -> None:
-        """Queue a run-active Controls edit as next-run intent (R4B-12).
+        """Queue a run-active Controls edit for the NEXT run (R4B-12).
 
-        The edit is NOT applied to the running scan/integrator (that would
-        corrupt the in-flight run); it is replayed through the normal field
-        handler when the run ends, so it lands in the next run's ``RunIntent``.
-        A visible status notice replaces the previous silent debug-level drop.
+        The edit is NOT applied to the running scan/integrator/wrangler (that
+        would corrupt the in-flight run and is exactly what R4B-12 forbids); it
+        is held as a last-write-wins delta and applied by the single
+        post-finalization owner
+        (:meth:`_controls_v2_apply_deferred_next_run_edits`) once the run has
+        fully unwound.  Until it actually applies the operator is told the
+        change is QUEUED (not "saved"), so the UI never promises an effect that
+        has not happened.
         """
         path = tuple(path)
         deferred = getattr(self, "_controls_v2_deferred_field_edits", None)
@@ -2695,7 +2705,7 @@ class staticWidget(QWidget):
         self._controls_v2_deferred_field_edits = deferred
         try:
             self.wrangler.showLabel.emit(
-                "Change saved — it will apply to the next run.")
+                "Change queued — it will apply when the run finishes.")
         except Exception:
             logger.debug("could not surface deferred-edit notice",
                          exc_info=True)
@@ -2709,19 +2719,101 @@ class staticWidget(QWidget):
             deferred_pending=len(deferred),
         )
 
-    def _controls_v2_replay_deferred_field_edits(self) -> None:
-        """Apply run-active deferred edits into the next-run intent (R4B-12)."""
-        deferred = getattr(self, "_controls_v2_deferred_field_edits", None)
-        if not deferred:
+    def _controls_v2_replay_apply_field(self, path, value) -> bool:
+        """Apply ONE deferred field on the post-finalization replay path.
+
+        Returns True only on REAL success.  Native source/int fields update the
+        Controls-owned next-run intent directly.  A legacy-backed field is
+        projected into the hidden compatibility tree through the signal-blocked
+        mirror ONLY — so no ``imageWrangler.setup()`` re-entry and no legacy
+        session write occur — and success is confirmed by reading the value
+        back: ``_apply_controls_v2_field_value`` swallows ``setValue`` failures
+        and returns True, so it must not be trusted on the replay path.
+        """
+        path = tuple(path)
+        try:
+            if self._set_controls_v2_native_source_field(path, value):
+                return True
+            if self._set_controls_v2_native_int_field(path, value):
+                return True
+            param = self._controls_v2_param(path)
+            if param is None:
+                return False
+            current = param.value()
+            new_value = coerce_control_edit_value(current, value)
+            if current == new_value:
+                return True
+            params = getattr(
+                getattr(self, "wrangler", None), "parameters", None)
+            self._mirror_wrangler_parameter_values(params, ((path, new_value),))
+            return param.value() == new_value
+        except Exception:
+            logger.debug(
+                "deferred Controls replay apply failed for %s", path,
+                exc_info=True)
+            return False
+
+    def _controls_v2_apply_deferred_next_run_edits(self) -> None:
+        """The ONE post-finalization owner of deferred next-run edits (R4B-12).
+
+        Scheduled from :meth:`_exit_run_state` via a teardown-safe
+        ``singleShot(0, self, ...)`` so it runs STRICTLY AFTER the whole
+        synchronous run unwind (wrangler ``stop()``, final batch
+        selection/reload, and ``wrangler_finished``'s ``finally`` that clears
+        run-source authority) for every run-end path — wrangler, reintegrate,
+        stitch, abort/error — and is also drained synchronously just before the
+        next freeze so a subsequent run always sees the final values once.
+
+        The queued last-write-wins delta is snapshotted before applying and is
+        NOT cleared until the whole transaction succeeds: on the first real
+        failure the entire delta is retained (recoverable), a visible error is
+        raised, and a structured ``controls_field_replay_failed`` event is
+        emitted.  On success the queue is cleared and the profile is refreshed
+        exactly ONCE.
+        """
+        if self._controls_v2_run_active():
+            # Not finalized yet — leave the delta queued for the true boundary.
             return
-        self._controls_v2_deferred_field_edits = []
-        for path, value in deferred:
+        delta = list(
+            getattr(self, "_controls_v2_deferred_field_edits", None) or [])
+        if not delta:
+            return
+        failed_path = None
+        for path, value in delta:
+            if not self._controls_v2_replay_apply_field(path, value):
+                failed_path = tuple(path)
+                break
+        if failed_path is None:
+            self._controls_v2_deferred_field_edits = []
+            bump_run_config_debug_generation(self, "config")
+            run_config_debug_log(
+                logger,
+                "controls_field_replay_applied",
+                widget=self,
+                origin="controls_v2_post_finalization",
+                applied=[list(p) for p, _ in delta],
+            )
+            self._refresh_controls_v2_profile(immediate=True)
+        else:
+            # Retain the WHOLE delta so nothing the UI promised is lost
+            # (recoverable at the next run-end or Run click); surface + record.
+            self._controls_v2_deferred_field_edits = delta
             try:
-                self._on_controls_v2_field_changed(path, value)
+                self.wrangler.showLabel.emit(
+                    "Could not apply a queued change — it is still pending. "
+                    "Please re-check and retry.")
             except Exception:
-                logger.debug(
-                    "deferred Controls edit replay failed for %s", path,
-                    exc_info=True)
+                logger.debug("could not surface replay-failure notice",
+                             exc_info=True)
+            run_config_debug_log(
+                logger,
+                "controls_field_replay_failed",
+                widget=self,
+                origin="controls_v2_post_finalization",
+                failed_path=list(failed_path),
+                deferred_pending=len(delta),
+                level="warning",
+            )
 
     def _on_controls_v2_field_changed(self, path, value) -> None:
         path = tuple(path)
@@ -8142,11 +8234,20 @@ class staticWidget(QWidget):
                 immediate=True,
                 preserve_focused_editor=False,
             )
-        # R4B-12: the run is fully idle again — apply any edits the operator made
-        # during the run into the (now) next-run intent through the normal
-        # handler.  Done last so run_active is already False and the edits are
-        # not treated as a second round of deferrals.
-        self._controls_v2_replay_deferred_field_edits()
+        # R4B-12 (O-1a-i.1): do NOT apply deferred edits here.  _exit_run_state
+        # runs EARLY in a wrangler run's finalization (before wrangler.stop()
+        # completes, final batch selection/reload, and wrangler_finished()'s
+        # finally clears run-source authority).  Applying now would reconfigure
+        # the still-unwinding run and could half-apply through legacy paths.
+        # Instead schedule the single post-finalization owner on the event loop
+        # so it runs STRICTLY AFTER the whole synchronous unwind, for every
+        # run-end path (wrangler/reintegrate/stitch/abort).  The teardown-safe
+        # 3-arg singleShot binds the callback to `self`, so a destroyed widget
+        # never receives it.  A synchronous drain in
+        # _prepare_controls_v2_run_configuration guarantees the next run still
+        # freezes the final values once even before the event loop ticks.
+        QtCore.QTimer.singleShot(
+            0, self, self._controls_v2_apply_deferred_next_run_edits)
 
     def _on_stop_clicked(self):
         """Single owner of the shared Stop button — route to the active run.
