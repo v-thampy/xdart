@@ -1065,7 +1065,13 @@ class ControlsPanelV2(QtWidgets.QWidget):
         self._render_analysis(profile.analysis_launchers)
 
     def current_form_edits(self) -> tuple[ControlFormEdit, ...]:
-        """Return the current visible editor values, including focused line edits."""
+        """Return the current visible editor values, including focused line edits.
+
+        §19.9/§21.6 req 7: this is NOT a transaction input.  The no-focus form
+        sweep was deleted — polling every visible editor turned a programmatic
+        ``setText`` into user intent — so the only production caller left is
+        read-only debug reporting.  The commit authority is the revisioned
+        journal plus at most one :meth:`focused_form_edit` flush."""
 
         edits = [
             ControlFormEdit(path=row.path, value=row.current_value())
@@ -1142,7 +1148,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
 
     def _render_bound_fields(self, profile: ControlProfile) -> None:
         # Tear down any open GI '…' popup on every rebuild.  Its rows are parented
-        # under this panel, so current_form_edits() (findChildren(FormRow)) would
+        # under this panel, so a findChildren(FormRow) sweep would
         # otherwise harvest a STALE popup whose displayed value froze at open time
         # — a later _commit_controls_v2_pending_edits could then clobber a fresher
         # sample_orientation/tilt_angle back to the old value (F1).  Leaving
@@ -1452,12 +1458,12 @@ class ControlsPanelV2(QtWidgets.QWidget):
 
     def _close_gi_more_popup(self) -> None:
         """Close + dispose the GI '…' options popup if open, clearing the ref so a
-        stale popup can't be harvested by ``current_form_edits`` (F1/F2)."""
+        stale popup can't be harvested by any form reader (F1/F2)."""
         popup = getattr(self, "_gi_options_popup", None)
         if popup is not None:
             popup.close()
             # deleteLater() is async — its FormRow children would still be found
-            # by findChildren() (current_form_edits) until the event loop runs.
+            # by findChildren() until the event loop runs.
             # setParent(None) detaches the subtree from this panel NOW, so a
             # rebuild can't harvest its stale rows before the deferred delete.
             popup.setParent(None)
@@ -1613,7 +1619,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
         """Put the point-count field(s) on the subsection header as ``Pts [n] …``.
 
         Reuses :class:`FormRow` (label hidden) so the editors stay harvestable by
-        ``current_form_edits`` and route through the same write-through path."""
+        the draft/focused-edit seam and route through the same write-through path."""
         label = QtWidgets.QLabel("Pts")
         label.setObjectName("controlsV2HeaderLabel")
         sub.add_header_widget(label)
@@ -1850,7 +1856,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
         """Park the compact ``Pts [n] …`` cluster on the right of an Axis row.
 
         Reuses :class:`FormRow` (label hidden) so the editors stay harvestable by
-        ``current_form_edits`` and route through the same write-through path."""
+        the draft/focused-edit seam and route through the same write-through path."""
         label = QtWidgets.QLabel("Pts")
         label.setObjectName("controlsV2HeaderLabel")
         row.add_trailing_widget(label)

@@ -424,51 +424,121 @@ def _source_selection_identity(get) -> "SourceSelectionIdentity":
 
 
 # --------------------------------------------------------------------------
-# §19.8: the journal's stored representation is RECURSIVELY immutable.
+# THE SUPPORTED CONTROLS V2 JOURNAL VALUE ALGEBRA (§21.6 req 1-3).
 #
-# Deep-copying at ingress stops a caller's alias reaching the entry, but it
-# still stores a live mutable list/dict — anything holding the private
-# reference could mutate it in place and change every later read.  The journal
-# is the revisioned authority for user intent, so its storage is normalised to
-# a tagged, fully hashable tuple tree at ingress and a fresh MUTABLE value is
-# reconstructed at each read.  The tag records the original container type, so
-# list-in/list-out and tuple-in/tuple-out semantics are preserved exactly.
+# The journal is the revisioned AUTHORITY for user intent, so its storage must
+# be immutable all the way down: if any stored node can be mutated in place,
+# journal authority changes without a new revision.  Deep-copying an arbitrary
+# object at ingress does NOT achieve that — the copy stays reachable and
+# mutable through the private storage (the §21.6 bytearray probe).
 #
-# A value that is neither a container nor a scalar (an arbitrary object) is
-# stored as an ATOM: deep-copied in and deep-copied out, which is the strongest
-# isolation available without rejecting the type.
+# INVENTORY of what Controls V2 actually journals (the four
+# `_controls_v2_record_edit` call sites — deferred / idle / draft / form):
+#   * `str`   — every LINE field and COMBO selection, and every keystroke draft
+#               (`FormRow.current_value`, `RangeRow` low/high, `textEdited`);
+#   * `bool`  — every BOOL field and `SegmentedControl` toggle;
+#   * `int` / `float` — numeric field values arriving pre-coerced from a slot;
+#   * `None`  — an absent/cleared value.
+# Containers never occur in production today, but the reducers compose tuples
+# (ranges) and the test surface uses lists/dicts, so tagged recursive containers
+# stay supported.
+#
+# SUPPORTED ALGEBRA:
+#   leaves      None, bool, int, float, complex, str, bytes
+#   normalized  NumPy bool_/integer/floating/str_ scalars -> the Python scalar
+#               (deliberate: a NumPy scalar is immutable and compares equal, but
+#               storing it would leak dtype into the journal's identity)
+#   encoded     bytearray -> stored as immutable bytes, reconstructed as
+#               bytearray (round-trip preserving)
+#   containers  tuple, list, dict, set, frozenset — recursively, leaves only
+#
+# EVERYTHING ELSE IS REJECTED AT INGRESS with the typed refusal (§21.6 req 3-4)
+# — NumPy arrays, mutable custom objects, and anything else whose immutability
+# cannot be established.  Hiding them behind `deepcopy` is what allowed journal
+# authority to be mutated without a revision.
 # --------------------------------------------------------------------------
-_JOURNAL_ATOM = "atom"
+_JOURNAL_LEAF = "leaf"
+_JOURNAL_BYTEARRAY = "bytearray"
 _JOURNAL_LIST = "list"
 _JOURNAL_TUPLE = "tuple"
 _JOURNAL_DICT = "dict"
 _JOURNAL_SET = "set"
 _JOURNAL_FROZENSET = "frozenset"
 
+#: Immutable leaf types stored verbatim.  `bool` precedes `int` implicitly
+#: (isinstance covers it); all are immutable and hash-stable.
+_JOURNAL_LEAF_TYPES = (type(None), bool, int, float, complex, str, bytes)
 
-def _freeze_journal_value(value):
-    """Recursively immutable, tagged representation of *value* (§19.8 req 1)."""
+
+def _journal_leaf_or_none(value):
+    """The normalized immutable leaf for *value*, or ``None`` if it is not one.
+
+    Returns a 1-tuple so a legitimately ``None`` leaf is distinguishable."""
+    # Deliberate NumPy scalar normalization (§21.6 req 2), attempted FIRST:
+    # np.float64/np.str_ subclass the Python leaf types, so an isinstance check
+    # would store them verbatim and leak dtype into the journal's identity.
+    # Guarded by attribute probing so this module never imports numpy.
+    item = getattr(value, "item", None)
+    if callable(item) and getattr(value, "shape", None) == ():
+        try:
+            scalar = item()
+        except Exception:
+            return None
+        if isinstance(scalar, _JOURNAL_LEAF_TYPES):
+            return (scalar,)
+        return None
+    if isinstance(value, _JOURNAL_LEAF_TYPES):
+        return (value,)
+    return None
+
+
+def _freeze_journal_value(value, path=None):
+    """Recursively immutable, tagged representation of *value* (§21.6 req 1-3).
+
+    Raises :class:`ControlsTransactionError` for any value outside the supported
+    algebra, so an unsupported mutable object is REFUSED at ingress rather than
+    stored behind a deepcopy where it can still be mutated."""
+    leaf = _journal_leaf_or_none(value)
+    if leaf is not None:
+        return (_JOURNAL_LEAF, leaf[0])
+    if isinstance(value, bytearray):
+        return (_JOURNAL_BYTEARRAY, bytes(value))
     if isinstance(value, tuple):
-        return (_JOURNAL_TUPLE, tuple(_freeze_journal_value(v) for v in value))
+        return (_JOURNAL_TUPLE,
+                tuple(_freeze_journal_value(v, path) for v in value))
     if isinstance(value, list):
-        return (_JOURNAL_LIST, tuple(_freeze_journal_value(v) for v in value))
+        return (_JOURNAL_LIST,
+                tuple(_freeze_journal_value(v, path) for v in value))
     if isinstance(value, dict):
         return (_JOURNAL_DICT, tuple(
-            (_freeze_journal_value(k), _freeze_journal_value(v))
+            (_freeze_journal_value(k, path), _freeze_journal_value(v, path))
             for k, v in value.items()))
     if isinstance(value, frozenset):
         return (_JOURNAL_FROZENSET,
-                tuple(_freeze_journal_value(v) for v in value))
+                tuple(sorted(
+                    (_freeze_journal_value(v, path) for v in value),
+                    key=repr)))
     if isinstance(value, set):
-        return (_JOURNAL_SET, tuple(_freeze_journal_value(v) for v in value))
-    return (_JOURNAL_ATOM, copy.deepcopy(value))
+        return (_JOURNAL_SET,
+                tuple(sorted(
+                    (_freeze_journal_value(v, path) for v in value),
+                    key=repr)))
+    raise ControlsTransactionError(
+        path,
+        "unsupported journal value type "
+        f"{type(value).__name__!r}: the Controls journal stores only immutable "
+        "leaves (None/bool/int/float/complex/str/bytes, normalized NumPy "
+        "scalars, bytearray) and recursive containers of them",
+        value)
 
 
 def _thaw_journal_value(frozen):
-    """A FRESH mutable reconstruction of a frozen journal value (§19.8 req 2)."""
+    """A FRESH mutable reconstruction of a frozen journal value (§21.6 req 2)."""
     kind, payload = frozen
-    if kind == _JOURNAL_ATOM:
-        return copy.deepcopy(payload)
+    if kind == _JOURNAL_LEAF:
+        return payload                      # immutable: no copy needed
+    if kind == _JOURNAL_BYTEARRAY:
+        return bytearray(payload)
     if kind == _JOURNAL_TUPLE:
         return tuple(_thaw_journal_value(v) for v in payload)
     if kind == _JOURNAL_LIST:
@@ -480,7 +550,8 @@ def _thaw_journal_value(frozen):
         return {_thaw_journal_value(v) for v in payload}
     if kind == _JOURNAL_FROZENSET:
         return frozenset(_thaw_journal_value(v) for v in payload)
-    return copy.deepcopy(payload)
+    raise ControlsTransactionError(
+        None, f"unknown journal storage tag {kind!r}", frozen)
 
 
 class JournalEntry:
@@ -502,8 +573,8 @@ class JournalEntry:
 
     __slots__ = ("_frozen", "revision", "origin")
 
-    def __init__(self, value, revision, origin):
-        object.__setattr__(self, "_frozen", _freeze_journal_value(value))
+    def __init__(self, value, revision, origin, path=None):
+        object.__setattr__(self, "_frozen", _freeze_journal_value(value, path))
         object.__setattr__(self, "revision", int(revision))
         object.__setattr__(self, "origin", str(origin))
 
@@ -540,8 +611,12 @@ class JournalEntry:
                 and self.revision == other.revision
                 and self.origin == other.origin)
 
-    def __hash__(self):
-        return hash((self._frozen, self.revision, self.origin))
+    # §21.6 req 5: __hash__ is REMOVED.  No verified consumer needs a hashable
+    # JournalEntry (the journal is a dict keyed by PATH, and entries are only
+    # ever compared or replaced), and the previous unconditional implementation
+    # was invalid for any unhashable payload.  Defining __eq__ without __hash__
+    # makes instances unhashable, which is the correct, honest algebra.
+    __hash__ = None
 
     def __repr__(self):
         return (f"JournalEntry(value={self.value!r}, "
@@ -3549,13 +3624,48 @@ class staticWidget(QWidget):
     def _controls_v2_record_edit(self, path, value, origin: str) -> int:
         """Record one revisioned edit into the journal (LWW per path).
 
-        §13.9: stored as an immutable, deep-copied :class:`JournalEntry` so a
-        caller cannot mutate a list/dict value in place without a new revision."""
+        §13.9/§21.6: stored as a RECURSIVELY IMMUTABLE :class:`JournalEntry`, so
+        journal authority can never change without a new revision.  A value
+        outside the supported algebra raises
+        :class:`ControlsTransactionError` — see
+        :meth:`_controls_v2_record_edit_guarded` for the Qt-slot boundary that
+        turns that into a visible typed refusal instead of a crash."""
         path = tuple(path)
         rev = self._controls_v2_next_edit_revision()
         self._controls_v2_edit_journal_dict()[path] = JournalEntry(
-            value, rev, origin)
+            value, rev, origin, path)
         return rev
+
+    def _controls_v2_record_edit_guarded(self, path, value, origin: str):
+        """Record an edit from a Qt SLOT; refuse an unsupported value visibly.
+
+        §21.6 req 4: ingress rejection is mapped to the existing typed refusal at
+        every user-facing boundary.  An unsupported value must not crash a Qt
+        signal callback and must not vanish silently — the journal is left
+        untouched, the operator is told, and a structured event records it.
+        Returns the new revision, or ``None`` when the value was refused."""
+        path = tuple(path)
+        try:
+            return self._controls_v2_record_edit(path, value, origin)
+        except ControlsTransactionError as exc:
+            logger.debug("journal ingress refused %s", path, exc_info=True)
+            run_config_debug_log(
+                logger,
+                "controls_journal_refused",
+                widget=self,
+                origin="controls_v2_ui",
+                field_path=list(path),
+                field_value=repr(value),
+                edit_origin=origin,
+                reason=str(getattr(exc, "reason", exc)),
+            )
+            try:
+                self.wrangler.showLabel.emit(
+                    "That value can't be recorded for this field.")
+            except Exception:
+                logger.debug("could not surface journal-ingress refusal",
+                             exc_info=True)
+            return None
 
     def _controls_v2_edit_journal_clear(self) -> None:
         self._controls_v2_edit_journal = {}
@@ -5263,7 +5373,10 @@ class staticWidget(QWidget):
         operator is told the change is QUEUED and applies to the next run.
         """
         path = tuple(path)
-        revision = self._controls_v2_record_edit(path, value, origin="deferred")
+        revision = self._controls_v2_record_edit_guarded(
+            path, value, origin="deferred")
+        if revision is None:
+            return                      # §21.6 req 4: refused, visibly, not stored
         try:
             self.wrangler.showLabel.emit(
                 "Change queued — it applies to the next run.")
@@ -5429,7 +5542,10 @@ class staticWidget(QWidget):
         # contradiction (e.g. threshold min entered before max) stays JOURNAL-
         # OWNED and panel-overlaid — never installed, never serialized — until a
         # later related edit completes a valid winner set (§17.4).
-        _idle_rev = self._controls_v2_record_edit(path, value, origin="idle")
+        _idle_rev = self._controls_v2_record_edit_guarded(
+            path, value, origin="idle")
+        if _idle_rev is None:
+            return                      # §21.6 req 4: refused, visibly, not stored
         refusal = self._controls_v2_validate_idle_edit(path, value)
         if refusal is not None:
             run_config_debug_log(
@@ -5583,7 +5699,10 @@ class staticWidget(QWidget):
         :meth:`_on_controls_v2_field_changed`.  Programmatic ``setText``/
         projection must NOT reach this slot."""
         path = tuple(path)
-        revision = self._controls_v2_record_edit(path, value, origin="draft")
+        revision = self._controls_v2_record_edit_guarded(
+            path, value, origin="draft")
+        if revision is None:
+            return                      # §21.6 req 4: refused, visibly, not stored
         run_config_debug_log(
             logger,
             "controls_field_draft",
