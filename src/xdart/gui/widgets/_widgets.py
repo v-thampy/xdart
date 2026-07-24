@@ -145,6 +145,18 @@ class defaultWidget(Qt.QtWidgets.QWidget):
         ----------
         fname : str, path to file to save defaults
         """
+        # §15.12-A.4: synchronous pre-save VETO.  Config Save is a user ACTION,
+        # so a pending INVALID Controls edit refuses the save — no defaults
+        # captured, no dialog/file opened or written — instead of serializing a
+        # stale or permissively-clamped baseline.  The owner (staticWidget) sets
+        # this hook; it returns True to veto.
+        veto = getattr(self, "_pre_save_veto", None)
+        if callable(veto):
+            try:
+                if veto():
+                    return
+            except Exception:
+                logger.debug("config-save veto hook failed", exc_info=True)
         emit = False
         if fname is None:
             fname, _ = Qt.QtWidgets.QFileDialog().getSaveFileName(filter="*.json")

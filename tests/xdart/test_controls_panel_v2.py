@@ -572,21 +572,29 @@ def test_controls_panel_v2_combined_advanced_dialog_locked_during_run(
         widget.deleteLater()
 
 
-def test_controls_panel_v2_point_counts_clamp_to_one(qapp, monkeypatch):
+def test_controls_panel_v2_point_counts_refuse_below_minimum(qapp, monkeypatch):
+    """§15.3 / §15.12-A.1 (updated from the retired clamp-to-one behavior): a
+    below-minimum / negative point count is REFUSED at the checked idle commit —
+    the permissive clamp is gone, so no carrier is mutated and the committed
+    value stays at its valid default rather than silently becoming 1."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
     widget = staticWidget()
     try:
+        widget._refresh_controls_v2_profile_now()
+        before_1d = dict(widget.scan.bai_1d_args)
+        before_2d = dict(widget.scan.bai_2d_args)
+
         widget._on_controls_v2_field_changed(("Int1D", "points"), "0")
         widget._on_controls_v2_field_changed(("Int1D", "points_oop"), "-4")
         widget._on_controls_v2_field_changed(("Int2D", "radial_points"), "0")
         widget._on_controls_v2_field_changed(("Int2D", "azim_points"), "-9")
 
-        assert widget.scan.bai_1d_args["numpoints"] == 1
-        assert widget.scan.bai_1d_args["npt_oop"] == 1
-        assert widget.scan.bai_2d_args["npt_rad"] == 1
-        assert widget.scan.bai_2d_args["npt_azim"] == 1
+        # Refused, not clamped: never 1, unchanged from the committed default.
+        assert widget.scan.bai_1d_args["numpoints"] == before_1d["numpoints"] != 1
+        assert widget.scan.bai_2d_args["npt_rad"] == before_2d["npt_rad"] != 1
+        assert widget.scan.bai_2d_args["npt_azim"] == before_2d["npt_azim"] != 1
     finally:
         widget.close()
         widget.deleteLater()
