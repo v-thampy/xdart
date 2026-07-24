@@ -153,10 +153,26 @@ class defaultWidget(Qt.QtWidgets.QWidget):
         veto = getattr(self, "_pre_save_veto", None)
         if callable(veto):
             try:
-                if veto():
-                    return
+                vetoed = veto()
             except Exception:
-                logger.debug("config-save veto hook failed", exc_info=True)
+                # §15.12-A.4 fail CLOSED: a veto hook that RAISES means the save
+                # could NOT be checked, so the action is REFUSED — no defaults
+                # captured, no file written — never fall through to a possibly
+                # invalid/stale baseline.  Report rather than silently continuing.
+                logger.warning(
+                    "config save refused: pre-save veto hook raised; no file "
+                    "written", exc_info=True)
+                report = getattr(self, "_pre_save_veto_error", None)
+                if callable(report):
+                    try:
+                        report()
+                    except Exception:
+                        logger.debug(
+                            "config-save veto error report failed",
+                            exc_info=True)
+                return
+            if vetoed:
+                return
         emit = False
         if fname is None:
             fname, _ = Qt.QtWidgets.QFileDialog().getSaveFileName(filter="*.json")

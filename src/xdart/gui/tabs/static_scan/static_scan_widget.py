@@ -1612,12 +1612,25 @@ class staticWidget(QWidget):
         exception leaks through the Qt slot."""
         if result is None:
             return
-        # §15.12-A.2: ONE stable message per refusal.  The focus-loss idle commit
-        # surfaces the refusal first; the immediately-following action click
-        # re-stages the SAME journal and gets the SAME typed refusal — dedupe by
-        # signature so it suppresses its action WITHOUT a duplicate message.
+        # §15.12-A.2 / §17.7: ONE stable message per refused REVISION.  The
+        # focus-loss idle commit surfaces the refusal first; the immediately-
+        # following action click re-stages the SAME journal revision and gets the
+        # SAME typed refusal — dedupe so it suppresses its action WITHOUT a
+        # duplicate message.  The latch is keyed by the failed path's CURRENT
+        # journal revision so a NEW invalid edit on the same path (e.g. "4.5"
+        # then "5.5", a higher revision) is a DISTINCT visible refusal, not a
+        # suppressed replay.  A successful commit resets the latch.
+        revision = None
+        if result.failed_path is not None:
+            entry = self._controls_v2_edit_journal_dict().get(
+                tuple(result.failed_path))
+            if entry is not None:
+                try:
+                    revision = entry["revision"]
+                except Exception:
+                    revision = None
         signature = (
-            result.phase, result.failed_path, result.reason,
+            revision, result.phase, result.failed_path, result.reason,
             result.recovery_failed_paths)
         if signature == getattr(
                 self, "_controls_v2_last_refusal_signature", None):
@@ -3028,6 +3041,28 @@ class staticWidget(QWidget):
             self._controls_v2_report_pending_refusal(refusal, "config-save")
             return True
         return False
+
+    def _controls_v2_config_save_veto_error(self) -> None:
+        """§17.5: the Config-Save pre-save veto hook RAISED, so the save FAILED
+        CLOSED (no file written).  Failure of the validation owner removes
+        permission to save; report the refusal as a structured
+        ``config_save_refused`` event (phase ``precondition``) and one
+        user-visible status through the static-widget owner."""
+        run_config_debug_log(
+            logger,
+            "config_save_refused",
+            widget=self,
+            origin="controls_v2_config_save",
+            phase="precondition",
+            reason="pre-save veto hook raised",
+            level="warning",
+        )
+        try:
+            self._controls_v2_status_message(
+                "Config Save refused: the pending Controls edit could not be "
+                "checked — no file was written.")
+        except Exception:
+            logger.debug("config-save veto error status failed", exc_info=True)
 
     def _controls_v2_int_session_state(self) -> dict:
         """Native Controls V2 Int state used for run/reintegrate plans.
@@ -7693,6 +7728,11 @@ class staticWidget(QWidget):
         # synchronous pre-save hook that runs the checked commit first.
         self.h5viewer.defaultWidget._pre_save_veto = (
             self._controls_v2_config_save_veto)
+        # §17.5: a veto hook that RAISES fails CLOSED at the save boundary; the
+        # defaultWidget calls this owner hook to emit the structured refusal
+        # event and surface a status message.
+        self.h5viewer.defaultWidget._pre_save_veto_error = (
+            self._controls_v2_config_save_veto_error)
         self.h5viewer.defaultWidget.sigConfigSaving.connect(
             self._augment_config_snapshot)
         self.h5viewer.defaultWidget.sigConfigLoaded.connect(

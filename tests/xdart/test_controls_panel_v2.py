@@ -593,6 +593,10 @@ def test_controls_panel_v2_point_counts_refuse_below_minimum(qapp, monkeypatch):
 
         # Refused, not clamped: never 1, unchanged from the committed default.
         assert widget.scan.bai_1d_args["numpoints"] == before_1d["numpoints"] != 1
+        # points_oop=-4 refused: npt_oop is neither clamped to 1 nor otherwise
+        # mutated (it stays exactly as committed — absent, in the non-GI default).
+        assert widget.scan.bai_1d_args.get("npt_oop") == before_1d.get("npt_oop")
+        assert widget.scan.bai_1d_args.get("npt_oop") != 1
         assert widget.scan.bai_2d_args["npt_rad"] == before_2d["npt_rad"] != 1
         assert widget.scan.bai_2d_args["npt_azim"] == before_2d["npt_azim"] != 1
     finally:
