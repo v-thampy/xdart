@@ -2164,10 +2164,6 @@ class imageWrangler(wranglerWidget):
         """Sets file name based on chosen options
         """
         old_fname = self.img_file
-        # §13.6: a new source-selection request STARTS here -> bump the hydration
-        # epoch so any GIMotorHydration emitted below carries the current epoch
-        # and a delayed older-epoch result is rejected by the owner.
-        self._next_gi_hydration_generation()
         if self.inp_type != 'Image Directory':
             img_file = self.parameters.child('Signal').child('File').value()
             if os.path.exists(img_file):
@@ -2198,6 +2194,12 @@ class imageWrangler(wranglerWidget):
                 logger.debug("directory source intent adoption failed",
                              exc_info=True)
             self._sync_meta_ext_to_img_ext()
+            # §13.6 / §13.11 hydration 2: the source-selection request token is
+            # captured HERE — AFTER the new directory source is applied — so the
+            # GIMotorHydration emitted by discovery below carries the fingerprint
+            # of the source the request is FOR (bumping the epoch at the top,
+            # before the source was set, stamped the PREVIOUS source's identity).
+            self._next_gi_hydration_generation()
             # No representative-file search here.  In particular, Subdirs must
             # not trigger a recursive os.walk or embedded-metadata read merely
             # because the operator selected a directory.
@@ -2249,6 +2251,10 @@ class imageWrangler(wranglerWidget):
                 self._adopt_directory_metadata_preview(preview_file)
             return
 
+        # §13.6 / §13.11 hydration 2: capture the request token AFTER the single-
+        # image / series source is applied above, so the hydration emitted by the
+        # option-refresh paths below carries THIS request's source identity.
+        self._next_gi_hydration_generation()
         if ((self.img_file != old_fname)
                 or (self.img_file and (len(self.scan_parameters) < 1))):
             if (self.meta_ext and self.img_file
@@ -2607,15 +2613,18 @@ class imageWrangler(wranglerWidget):
         # whether a TARGETED inspection ran (so an empty list is KNOWN_EMPTY only
         # when proved, else UNKNOWN — a lazy recursive directory is never
         # misclassified as known-empty).
-        # Default proved=True: a bare set_gi_motor_options() (or a session
-        # re-announce) with an empty list is KNOWN_EMPTY.  The §13.7 "not
-        # inspected -> UNKNOWN" cases (no direct-child preview / no file
-        # resolved) set ``_gi_motor_knowledge_proved = False`` EXPLICITLY before
-        # calling, so only a lazy recursive directory reports UNKNOWN.
+        # ``_gi_motor_knowledge_proved`` is True on a fresh wrangler and after a
+        # direct establishment of the motor list (a bare ``set_gi_motor_options``
+        # / session re-announce with an explicit empty list is KNOWN_EMPTY).  The
+        # §13.7 "not inspected -> UNKNOWN" cases (no direct-child preview / no
+        # file resolved) set it False EXPLICITLY before calling.  §13.11
+        # hydration 5: the getattr FALLBACK is inverted to False, so any future
+        # emit path that never established knowledge fails safe to UNKNOWN rather
+        # than silently reporting KNOWN_EMPTY.
         _avail = [p for p in self.motors
                   if not any(x.lower() in p.lower() for x in ['ROI', 'PD'])]
         self._emit_gi_hydration(
-            _avail, proved=bool(getattr(self, '_gi_motor_knowledge_proved', True)))
+            _avail, proved=bool(getattr(self, '_gi_motor_knowledge_proved', False)))
 
     def set_gi_th_motor(self):
         """Update Grazing theta motor.

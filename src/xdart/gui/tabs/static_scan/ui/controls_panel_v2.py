@@ -1063,6 +1063,30 @@ class ControlsPanelV2(QtWidgets.QWidget):
             )
         return tuple(edits)
 
+    def focused_form_edit(self) -> ControlFormEdit | None:
+        """The single bound line editor the user is CURRENTLY editing (has
+        keyboard focus), as a ``ControlFormEdit``, or ``None`` when none is
+        focused.
+
+        §13.11 owner 5: the edit journal already holds every keystroke draft
+        (FormRow + RangeRow ``textEdited`` → ``draftChanged``); the ONLY value not
+        yet revisioned is the one the user is mid-editing, whose final text may
+        post-date its last draft signal.  The transaction flushes THIS editor
+        alone (exactly one revision) instead of importing the full visible-form
+        snapshot."""
+        for row in self.findChildren(FormRow):
+            editor = getattr(row, "editor", None)
+            if (editor is not None and hasattr(editor, "hasFocus")
+                    and editor.hasFocus() and hasattr(editor, "text")):
+                return ControlFormEdit(path=row.path, value=row.current_value())
+        for row in self.findChildren(RangeRow):
+            for editor, path in (
+                (row._low, row._low_path), (row._high, row._high_path)
+            ):
+                if (editor is not None and editor.hasFocus()):
+                    return ControlFormEdit(path=path, value=editor.text())
+        return None
+
     def _render_summary(self, profile: ControlProfile) -> None:
         self.summary_card.clear_rows()
         if profile.run_enabled:

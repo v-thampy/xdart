@@ -233,6 +233,14 @@ class _TransientReadinessObservation(RuntimeError):
 #: Sentinel distinguishing "argument not supplied" from an explicit ``None``.
 _UNSET = object()
 
+#: pyFAI integration methods the Controls panels offer (union of the Integrate 1D
+#: + 2D ``method`` lists in ``integrator.py``).  §13.4: a value outside this
+#: whitelist is a typed staging refusal, never silently accepted.
+_CONTROLS_V2_SUPPORTED_METHODS = frozenset({
+    "numpy", "cython", "BBox", "splitpixel", "lut", "csr",
+    "nosplit_csr", "full_csr", "lut_ocl", "csr_ocl",
+})
+
 
 class DeferredRunEditsPendingError(RuntimeError):
     """R4B-12 (O-1a-i.2): Run preparation refuses to freeze because a Controls
@@ -298,6 +306,42 @@ class GIMotorObservation:
         return None
 
 
+class JournalEntry:
+    """Immutable, deep-copied revisioned edit (§13.9).
+
+    The value is deep-copied on construction so the journal can never be mutated
+    through a caller's aliased list/dict, and every outward read hands back a
+    FRESH deep copy so projection cannot alias the stored value either.  Supports
+    the historical ``entry["value"]`` / ``["revision"]`` / ``["origin"]`` mapping
+    access (and ``.get``) so existing readers are unchanged."""
+
+    __slots__ = ("_value", "revision", "origin")
+
+    def __init__(self, value, revision, origin):
+        self._value = copy.deepcopy(value)
+        self.revision = int(revision)
+        self.origin = str(origin)
+
+    @property
+    def value(self):
+        return copy.deepcopy(self._value)
+
+    def __getitem__(self, key):
+        if key == "value":
+            return self.value
+        if key == "revision":
+            return self.revision
+        if key == "origin":
+            return self.origin
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
 class ControlsStageCandidate:
     """Mutable working state for a PURE stage (§12.2).
 
@@ -321,6 +365,7 @@ class ControlsStageCandidate:
         "poni_values",
         "candidate_source_spec",
         "source_fingerprint",
+        "committed_legacy",
     )
 
     def __init__(
@@ -330,7 +375,13 @@ class ControlsStageCandidate:
         gi_selection_explicit,
         source_energy_preference,
         gi_motor_observation,
+        committed_legacy=None,
     ):
+        #: §13.11 candidate 3 / §14.11.D: the COMMITTED legacy source-selection
+        #: param values captured ONCE at stage entry.  Reducers compare and derive
+        #: the candidate against THIS snapshot, never a live Qt Parameter — so the
+        #: stage depends on a captured value, not a mutable carrier.
+        self.committed_legacy = dict(committed_legacy or {})
         self.intent = intent
         self.threshold_state = threshold_state
         self.gi_selection_explicit = bool(gi_selection_explicit)
@@ -1422,8 +1473,12 @@ class staticWidget(QWidget):
         elif action == ControlAction.REINTEGRATE_2D:
             self._controls_v2_click_integrator_button("reintegrate2D")
         elif action == ControlAction.ADVANCED_PROCESSING:
-            self._commit_controls_v2_pending_edits()
-            self._show_integration_advanced()
+            refusal = self._commit_controls_v2_pending_edits()
+            if refusal is not None:
+                # §13.11 test 1: refuse visibly, do NOT open Advanced.
+                self._controls_v2_report_pending_refusal(refusal, action)
+            else:
+                self._show_integration_advanced()
         elif action == ControlAction.REFINE_GEOMETRY:
             QMessageBox.information(
                 self, "Refine geometry",
@@ -1437,13 +1492,22 @@ class staticWidget(QWidget):
 
     def _controls_v2_click_integrator_button(self, button_name: str) -> None:
         if button_name in {"reintegrate1D", "reintegrate2D"}:
-            self._apply_controls_v2_native_int_state(
+            refusal = self._apply_controls_v2_native_int_state(
                 commit_pending=True,
                 push_integrator=True,
             )
+            if refusal is not None:
+                # §13.11 test 1-2: an invalid focused edit refuses — zero
+                # reintegration click, live state untouched, journal retained.
+                self._controls_v2_report_pending_refusal(refusal, button_name)
+                return
             self._configure_controls_v2_native_run_plan(commit_pending=False)
         else:
-            self._commit_controls_v2_pending_edits()
+            refusal = self._commit_controls_v2_pending_edits()
+            if refusal is not None:
+                # calibrate/mask routing: suppress the delegated click on refusal.
+                self._controls_v2_report_pending_refusal(refusal, button_name)
+                return
         button = getattr(getattr(self.integratorTree, "ui", None), button_name, None)
         if button is None:
             return
@@ -1469,7 +1533,7 @@ class staticWidget(QWidget):
                          exc_info=True)
         return True
 
-    def _commit_controls_v2_pending_edits(self) -> None:
+    def _commit_controls_v2_pending_edits(self):
         """Apply the panel's form edits for a NON-run consumer (reintegrate,
         advanced processing, calibration/mask routing, native-state apply)
         through the SAME validated stage→checked-commit owner (§12.9 item 7 /
@@ -1479,34 +1543,82 @@ class staticWidget(QWidget):
         ``_controls_v2_collect_pending_edits`` at harvest) is staged and
         checked-committed exactly once, so an older deferred entry cannot
         overwrite a newer focused correction and an invalid value is a typed
-        refusal rather than a silent clamp/swallow.  A harvest failure or an
-        invalid/unlandable edit fails CLOSED: the journal is retained and the
-        consumer's action does not proceed on a partial or clamped value."""
+        refusal rather than a silent clamp/swallow.
+
+        §13.11 owner 1-3 / §14.11.C.4: this is a NON-run helper, so it does NOT
+        raise.  It returns ``None`` on success (edits applied, or nothing to
+        apply) and, on a harvest/stage/commit/recovery refusal, returns the typed
+        :class:`ControlsCommitResult` WITHOUT applying a partial or clamped value
+        and WITHOUT leaking an exception through a Qt slot.  The journal is
+        retained.  The CALLING production action is the ONE owner that renders a
+        visible refusal + structured phase/path event and suppresses its
+        delegated action/click (see ``_controls_v2_report_pending_refusal``)."""
         if getattr(self, "_run_active", False):
-            return  # run-active edits are journaled as deferred, not committed here
+            return None  # run-active edits are journaled as deferred, not committed
         if not self._controls_v2_enabled():
-            return
+            return None
         if not callable(getattr(
                 getattr(self, "controls_v2", None), "current_form_edits", None)):
-            return
+            return None
         # collect (inside the fold) journals a differing focused value, then the
-        # journal is staged + checked-committed once.
+        # journal is staged + checked-committed once.  A non-None fold IS the
+        # typed refusal — hand it back to the action owner (never raise here).
         _fold = self._controls_v2_fold_deferred_edits_into_intent()
         if _fold is not None:
-            recovery = _fold.recovery_failed_path
-            if recovery:
-                raise DeferredRunEditsPendingError(
-                    "control edit could not be applied and a carrier ("
-                    + "/".join(str(seg) for seg in recovery)
-                    + ") could not be restored — action not applied")
-            _where = (
-                "/".join(str(seg) for seg in _fold.failed_path)
-                if _fold.failed_path else (_fold.phase or "control"))
-            raise DeferredRunEditsPendingError(
-                "control edit invalid ("
-                + _where
-                + ") — action not applied; re-check the control")
+            return _fold
         self._refresh_controls_v2_profile(immediate=True)
+        return None
+
+    def _controls_v2_report_pending_refusal(self, result, action) -> None:
+        """§14.11.C.4: render a NON-run checked-commit refusal (returned by
+        ``_commit_controls_v2_pending_edits`` / ``_apply_controls_v2_native_int_state``)
+        as ONE user-visible message + one structured phase/path event, at the
+        production-action owner.  The delegated action/click is suppressed by the
+        caller and the journal is retained so the user can correct and retry.  No
+        exception leaks through the Qt slot."""
+        if result is None:
+            return
+        recovery = result.recovery_failed_path
+        where = (
+            "/".join(str(seg) for seg in result.failed_path)
+            if result.failed_path else (result.phase or "control"))
+        run_config_debug_log(
+            logger,
+            "controls_v2_action_refused_pending",
+            widget=self,
+            origin="controls_v2_action",
+            action=str(action),
+            phase=result.phase,
+            failed_path=list(result.failed_path or ()),
+            recovery_failed_path=list(recovery) if recovery else None,
+            level="warning",
+        )
+        if recovery:
+            message = (
+                "A control edit could not be applied and a carrier ("
+                + "/".join(str(seg) for seg in recovery)
+                + ") could not be restored — the action was not performed.")
+        else:
+            message = (
+                "A control edit is invalid (" + str(where)
+                + ") — the action was not performed; re-check the control.")
+        self._controls_v2_status_message(message)
+
+    def _controls_v2_status_message(self, msg) -> None:
+        """Non-modal user-visible status (mirrors ``_stitch_status``): route
+        through the active wrangler's status text if present, else the window
+        status bar.  Never raises."""
+        wrangler = getattr(self, "wrangler", None)
+        if wrangler is not None and hasattr(wrangler, "_set_status_text"):
+            try:
+                wrangler._set_status_text(msg)
+                return
+            except Exception:
+                logger.debug("Controls V2 status route failed", exc_info=True)
+        try:
+            self.window().statusBar().showMessage(msg)
+        except Exception:
+            logger.debug("Controls V2 status message failed", exc_info=True)
 
     def _controls_v2_param(self, path):
         wrangler = getattr(self, "wrangler", None)
@@ -1521,7 +1633,16 @@ class staticWidget(QWidget):
     def _controls_v2_field_paths(self):
         return BOUND_CONTROL_PATHS
 
-    def _controls_v2_field_values(self):
+    def _controls_v2_field_values(self, *, overlay_pending: bool = True):
+        """Display field values for the panel.
+
+        §13.11 owner 6: by DEFAULT the pending journal winners (the user's current
+        uncommitted drafts/corrections) are overlaid on top of the committed
+        values, so a forced ``set_state`` rebuild or a mode/schema change shows the
+        pending draft (valid OR invalid) rather than reverting to the stale
+        committed value.  Callers that need the COMMITTED baseline (e.g. the
+        pending-edit collector, which compares harvested form values against
+        what is committed) pass ``overlay_pending=False``."""
         values = {}
         for path in self._controls_v2_field_paths():
             if path in INTEGRATOR_BACKED_CONTROL_PATHS:
@@ -1535,7 +1656,18 @@ class staticWidget(QWidget):
                 pass
         values.update(self._controls_v2_native_int_values())
         values.update(self._controls_v2_native_source_values())
+        if overlay_pending:
+            self._controls_v2_overlay_pending_values(values)
         return values
+
+    def _controls_v2_overlay_pending_values(self, values) -> None:
+        """Overlay the pending journal winners onto the committed display
+        ``values`` in place (§13.11 owner 6).  Only display-bound paths are
+        overlaid; a still-invalid draft is shown as its raw text so the user can
+        see and correct it, and a rebuild never silently reverts it."""
+        for path, value in self._controls_v2_journal_winners():
+            if path in values:
+                values[path] = value
 
     def _controls_v2_field_choices(self):
         choices = {}
@@ -1919,8 +2051,14 @@ class staticWidget(QWidget):
         commit_pending: bool = True,
         push_wrangler: bool = False,
         push_integrator: bool = False,
-    ) -> None:
-        """Apply native V2 Int/GI/threshold state to the scan and consumers."""
+    ):
+        """Apply native V2 Int/GI/threshold state to the scan and consumers.
+
+        §13.11 owner 3 / §14.11.C.4: when ``commit_pending`` and the checked
+        commit REFUSES an invalid focused edit, this returns the typed
+        :class:`ControlsCommitResult` and applies NOTHING to the scan — the
+        reintegrate action owner then suppresses its button click and renders the
+        refusal.  Returns ``None`` on success."""
 
         run_config_debug_log(
             logger,
@@ -1932,7 +2070,11 @@ class staticWidget(QWidget):
             push_integrator=push_integrator,
         )
         if commit_pending:
-            self._commit_controls_v2_pending_edits()
+            refusal = self._commit_controls_v2_pending_edits()
+            if refusal is not None:
+                # Fail closed: do NOT project a partial/clamped snapshot onto the
+                # scan; hand the refusal back so the action owner suppresses.
+                return refusal
         self._controls_v2_ensure_native_int_defaults()
         self._controls_v2_apply_snapshot_to_scan(
             self._controls_v2_native_int_snapshot()
@@ -2099,7 +2241,8 @@ class staticWidget(QWidget):
         except Exception:
             return Units[0]
 
-    def _controls_v2_unit_code(self, text: object, *, dim: str = "1d") -> str:
+    def _controls_v2_unit_code(
+            self, text: object, *, dim: str = "1d", strict: bool = False) -> str:
         value = str(text or "").strip()
         if value in Units_dict:
             code = Units_dict[value]
@@ -2109,6 +2252,11 @@ class staticWidget(QWidget):
             code = "2th_deg"
         elif "chi" in value.lower() or "χ" in value:
             code = "chi_deg"
+        elif strict:
+            # §13.4: a genuinely unknown Standard axis/unit is a typed refusal,
+            # never a silent collapse to Q (the caller wraps this ValueError into
+            # a path-qualified ControlsTransactionError).
+            raise ValueError(f"unknown axis/unit {value!r}")
         else:
             code = "q_A^-1"
         if dim == "2d" and code == "chi_deg":
@@ -2596,6 +2744,22 @@ class staticWidget(QWidget):
             run_configuration.as_provenance()
         )
 
+    def _controls_v2_poni_values_for(self, poni_file):
+        """Parse a PONI file into its values dict for run-intent parity (item 11),
+        or ``None`` for an empty / missing / unparseable path (the run then keeps
+        its existing values and falls back to the wrangler's own calibration —
+        staging is the fail-loud path)."""
+        text = str(poni_file or "").strip()
+        if not text or not os.path.exists(text):
+            return None
+        try:
+            from xrd_tools.core.containers import PONI
+            return PONI.from_poni_file(text).to_dict()
+        except Exception:
+            logger.debug("Controls V2 PONI re-parse failed for %s", text,
+                         exc_info=True)
+            return None
+
     def _prepare_controls_v2_run_configuration(
         self,
     ) -> FrozenRunConfiguration | None:
@@ -2685,6 +2849,15 @@ class staticWidget(QWidget):
             or getattr(wrangler, "poni_file", "")
             or ""
         )
+        # item 11 (idle-PONI parity): an idle PONI edit updates the file carrier
+        # (via get_poni_dict()) but NOT the parsed intent values, so a stale
+        # poni_values could reach the freeze while poni_file is new.  Re-parse the
+        # current file so the frozen run carries values MATCHING poni_file.  A
+        # successfully-parsed file overrides; an empty/unreadable path leaves the
+        # existing values (the run is graceful — staging is the fail-loud path).
+        _reparsed_poni_values = self._controls_v2_poni_values_for(intent.poni_file)
+        if _reparsed_poni_values is not None:
+            intent.poni_values = _reparsed_poni_values
         intent.mask_file = str(
             self._controls_v2_param_value(("Signal", "mask_file")) or "")
         intent.project_root = str(
@@ -3000,14 +3173,14 @@ class staticWidget(QWidget):
         return rev
 
     def _controls_v2_record_edit(self, path, value, origin: str) -> int:
-        """Record one revisioned edit into the journal (LWW per path)."""
+        """Record one revisioned edit into the journal (LWW per path).
+
+        §13.9: stored as an immutable, deep-copied :class:`JournalEntry` so a
+        caller cannot mutate a list/dict value in place without a new revision."""
         path = tuple(path)
         rev = self._controls_v2_next_edit_revision()
-        self._controls_v2_edit_journal_dict()[path] = {
-            "value": value,
-            "revision": rev,
-            "origin": str(origin),
-        }
+        self._controls_v2_edit_journal_dict()[path] = JournalEntry(
+            value, rev, origin)
         return rev
 
     def _controls_v2_edit_journal_clear(self) -> None:
@@ -3074,6 +3247,28 @@ class staticWidget(QWidget):
         """
         journal = self._controls_v2_edit_journal_dict()
         panel = getattr(self, "controls_v2", None)
+        committed = self._controls_v2_field_values(overlay_pending=False)
+        # §13.11 owner 5: the transaction consumes the DIRTY REVISIONED ENTRIES
+        # (the journal — every draft/idle/deferred/correction is recorded at
+        # action time via draftChanged).  From the visible form we take AT MOST
+        # ONE focused-editor flush — the editor the user is mid-editing, whose
+        # final text may post-date its last draft signal.  The full-form snapshot
+        # is NO LONGER imported: a non-focused row is only ever set to a committed
+        # value (signal-blocked rebuild guard), so it is never dirty-unjournaled.
+        focused = getattr(panel, "focused_form_edit", None)
+        if callable(focused):
+            try:
+                edit = focused()
+            except Exception:
+                edit = None
+            if edit is not None:
+                self._controls_v2_flush_form_edit(edit, journal, committed)
+                return self._controls_v2_journal_winners()
+        # No editor is focused (a programmatic ``setText`` or a harvest-time
+        # snapshot): flush the dirty, not-yet-journaled visible edits.  Still
+        # dirty-only — a value equal to committed or already journaled is never
+        # re-recorded.  A harvest failure is a typed refusal (§12.4), not
+        # fail-open.
         get_edits = getattr(panel, "current_form_edits", None)
         if callable(get_edits):
             try:
@@ -3081,17 +3276,23 @@ class staticWidget(QWidget):
             except Exception as exc:
                 raise ControlsTransactionError(
                     None, "form edit harvest failed", None) from exc
-            committed = self._controls_v2_field_values()
             for edit in form_edits:
-                path = tuple(edit.path)
-                if not self._controls_v2_form_value_differs(
-                        path, edit.value, committed.get(path)):
-                    continue
-                existing = journal.get(path)
-                if existing is not None and existing.get("value") == edit.value:
-                    continue  # already journaled at action time (draft/idle)
-                self._controls_v2_record_edit(path, edit.value, origin="form")
+                self._controls_v2_flush_form_edit(edit, journal, committed)
         return self._controls_v2_journal_winners()
+
+    def _controls_v2_flush_form_edit(self, edit, journal, committed) -> None:
+        """Journal ONE visible-form edit iff it is a real change (differs from the
+        committed value) and is not already journaled at that exact value
+        (§12.4).  This is the dirty-only flush primitive — it never records a
+        stale committed value nor a duplicate of an action-time draft."""
+        path = tuple(edit.path)
+        if not self._controls_v2_form_value_differs(
+                path, edit.value, committed.get(path)):
+            return
+        existing = journal.get(path)
+        if existing is not None and existing.get("value") == edit.value:
+            return  # already journaled at action time (draft/idle)
+        self._controls_v2_record_edit(path, edit.value, origin="form")
 
     @staticmethod
     def _source_token_from_spec(spec):
@@ -3139,7 +3340,9 @@ class staticWidget(QWidget):
             p = tuple(path)
             if p in cand.legacy_projection:
                 return cand.legacy_projection[p]
-            return self._controls_v2_param_value(p)
+            # §13.11 candidate 3: fall back to the COMMITTED snapshot captured at
+            # stage entry, NEVER a live Qt Parameter read.
+            return cand.committed_legacy.get(p, "")
 
         source_type = str(cval(("Signal", "inp_type")) or "")
         if source_type == "Image Directory":
@@ -3258,11 +3461,17 @@ class staticWidget(QWidget):
 
     def _controls_v2_reduce_int(self, value, *, minimum=None) -> int:
         """Strict int coercion for the pure reducer — RAISES on invalid input
-        (unlike the permissive live _controls_v2_int which clamps to a default)."""
+        (unlike the permissive live _controls_v2_int which clamps to a default).
+
+        §13.4/§13.11-candidate 1: only a GENUINELY integral value is accepted —
+        ``"4.5"`` is refused, not silently truncated to ``4``."""
         try:
-            out = int(float(value))
+            fval = float(value)
         except (TypeError, ValueError):
             raise ValueError(f"expected an integer, got {value!r}")
+        if fval != int(fval):
+            raise ValueError(f"expected a whole number, got {value!r}")
+        out = int(fval)
         if minimum is not None and out < int(minimum):
             raise ValueError(f"value {out} below minimum {minimum}")
         return out
@@ -3329,23 +3538,29 @@ class staticWidget(QWidget):
         a1, a2 = cand.bai
         text = str(value or "")
         if cand.gi_enabled:
+            # §13.4: an unknown GI axis is a path-qualified typed refusal, never a
+            # silent default to q_total / qip_qoop.
             if root == "Int1D":
-                old_mode = a1.get("gi_mode_1d")
                 try:
-                    a1["gi_mode_1d"] = GI_MODES_1D[GI_LABELS_1D.index(text)]
+                    mode = GI_MODES_1D[GI_LABELS_1D.index(text)]
                 except ValueError:
-                    a1["gi_mode_1d"] = "q_total"
-                if a1["gi_mode_1d"] != old_mode:
+                    raise ControlsTransactionError(
+                        (root, "axis"), "unknown GI axis", value)
+                old_mode = a1.get("gi_mode_1d")
+                a1["gi_mode_1d"] = mode
+                if mode != old_mode:
                     _drop_output_axis_ranges(a1)
                 if self._controls_v2_candidate_npts_oop_visible(cand):
                     a1.setdefault("npt_oop", int(a1.get("numpoints", 3000)))
             else:
-                old_mode = a2.get("gi_mode_2d")
                 try:
-                    a2["gi_mode_2d"] = GI_MODES_2D[GI_LABELS_2D.index(text)]
+                    mode = GI_MODES_2D[GI_LABELS_2D.index(text)]
                 except ValueError:
-                    a2["gi_mode_2d"] = "qip_qoop"
-                if a2["gi_mode_2d"] != old_mode:
+                    raise ControlsTransactionError(
+                        (root, "axis"), "unknown GI axis", value)
+                old_mode = a2.get("gi_mode_2d")
+                a2["gi_mode_2d"] = mode
+                if mode != old_mode:
                     _drop_output_axis_ranges(a2)
             a1["unit"] = "q_A^-1"
             a2["unit"] = "q_A^-1"
@@ -3357,12 +3572,12 @@ class staticWidget(QWidget):
             return
         if root == "Int1D":
             old_unit = a1.get("unit")
-            a1["unit"] = self._controls_v2_unit_code(text, dim="1d")
+            a1["unit"] = self._controls_v2_unit_code(text, dim="1d", strict=True)
             if a1["unit"] != old_unit:
                 a1.pop("radial_range", None)
         else:
             old_unit = a2.get("unit")
-            a2["unit"] = "2th_deg" if text.startswith("2") else "q_A^-1"
+            a2["unit"] = self._controls_v2_unit_code(text, dim="2d", strict=True)
             if a2["unit"] != old_unit:
                 a2.pop("radial_range", None)
 
@@ -3481,7 +3696,7 @@ class staticWidget(QWidget):
         args = a1 if root == "Int1D" else a2
         if leaf == "unit":
             args["unit"] = self._controls_v2_unit_code(
-                value, dim="1d" if root == "Int1D" else "2d")
+                value, dim="1d" if root == "Int1D" else "2d", strict=True)
         elif leaf == "axis":
             self._controls_v2_reduce_axis(cand, root, value)
         elif leaf == "points":
@@ -3523,7 +3738,11 @@ class staticWidget(QWidget):
         elif leaf in {"dummy", "delta_dummy", "chi_offset"}:
             args[leaf] = self._controls_v2_reduce_float(value)
         elif leaf == "method":
-            args["method"] = str(value)
+            method = str(value)
+            if method not in _CONTROLS_V2_SUPPORTED_METHODS:
+                raise ControlsTransactionError(
+                    path, "unsupported integration method", value)
+            args["method"] = method
 
     def _controls_v2_reduce_edit(self, cand, path, value) -> None:
         """Reduce ONE edit onto the candidate.  Raises ``ControlsTransactionError``
@@ -3546,7 +3765,12 @@ class staticWidget(QWidget):
                     "poni": "poni", "poni file": "poni",
                     "metadata": "metadata", "meta": "metadata",
                 }
-                cand.source_energy_preference = aliases.get(text, "poni")
+                if text not in aliases:
+                    # §13.4: an unknown source-energy preference is a typed
+                    # refusal, never a silent default to 'poni'.
+                    raise ControlsTransactionError(
+                        path, "unknown source-energy preference", value)
+                cand.source_energy_preference = aliases[text]
             return
         if path in INTEGRATOR_BACKED_CONTROL_PATHS:
             try:
@@ -3655,9 +3879,22 @@ class staticWidget(QWidget):
         for path in self._CONTROLS_V2_SOURCE_SELECTION_PATHS:
             if path not in cand.legacy_projection:
                 continue
-            if cand.legacy_projection[path] != self._controls_v2_param_value(path):
+            # §14.11.D.2: compare against the COMMITTED snapshot captured at stage
+            # entry, NEVER a live Qt Parameter read.
+            if cand.legacy_projection[path] != cand.committed_legacy.get(path):
                 return True
         return False
+
+    def _controls_v2_committed_legacy_values(self) -> dict:
+        """§13.11 candidate 3 / §14.11.D: snapshot the COMMITTED legacy
+        source-selection param values ONCE at stage entry.  The pure reducers
+        (candidate source-spec derivation, effective-selection comparison) read
+        this stable snapshot instead of a live Qt Parameter, so the stage never
+        depends on a mutable carrier mid-transaction."""
+        return {
+            path: self._controls_v2_param_value(path)
+            for path in self._CONTROLS_V2_SOURCE_SELECTION_PATHS
+        }
 
     def stage_controls_transaction(self, edits):
         """Reduce *edits* onto a PURE candidate — no ``self`` state, no scan, no
@@ -3681,6 +3918,7 @@ class staticWidget(QWidget):
             source_energy_preference=getattr(
                 self, "_controls_v2_source_energy_preference", "poni"),
             gi_motor_observation=self._controls_v2_capture_gi_motor_observation(),
+            committed_legacy=self._controls_v2_committed_legacy_values(),
         )
         try:
             for path, value in edits:

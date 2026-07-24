@@ -222,6 +222,19 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         whose result arrives after a newer one (§13.6 / §13.11 hydration 2)."""
         gen = int(getattr(self, "_gi_hydration_generation", 0) or 0) + 1
         self._gi_hydration_generation = gen
+        # §13.11 hydration 2: capture the source identity AND epoch together AT
+        # REQUEST START into a token, so a delayed result carries the identity it
+        # was requested under — not whatever the wrangler happens to hold by the
+        # time the result emits.  This is what makes rejection correct under async
+        # metadata (the current-state stamp was only safe while synchronous).
+        fingerprint = None
+        fp_getter = getattr(self, "_gi_source_fingerprint", None)
+        if callable(fp_getter):
+            try:
+                fingerprint = fp_getter()
+            except Exception:
+                fingerprint = None
+        self._gi_hydration_request_token = (gen, fingerprint)
         return gen
 
     def _emit_gi_hydration(self, motors, *, proved: bool) -> None:
@@ -246,14 +259,25 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
             state = GIMotorHydration.KNOWN_EMPTY
         else:
             state = GIMotorHydration.UNKNOWN
-        fingerprint = None
-        fp_getter = getattr(self, "_gi_source_fingerprint", None)
-        if callable(fp_getter):
-            try:
-                fingerprint = fp_getter()
-            except Exception:
-                fingerprint = None
-        generation = int(getattr(self, "_gi_hydration_generation", 0) or 0)
+        # §13.11 hydration 2: stamp the REQUEST-START token (epoch + source
+        # fingerprint captured when the metadata request BEGAN via
+        # _next_gi_hydration_generation), NOT the wrangler's current state — so an
+        # async result arriving after a newer request or a source change carries
+        # its OWN (now-superseded) identity and the owner rejects it, instead of
+        # it masquerading as the current source.  A direct emit with no captured
+        # request token (e.g. a session re-announce) falls back to current state.
+        token = getattr(self, "_gi_hydration_request_token", None)
+        if isinstance(token, tuple) and len(token) == 2:
+            generation, fingerprint = token
+        else:
+            fingerprint = None
+            fp_getter = getattr(self, "_gi_source_fingerprint", None)
+            if callable(fp_getter):
+                try:
+                    fingerprint = fp_getter()
+                except Exception:
+                    fingerprint = None
+            generation = int(getattr(self, "_gi_hydration_generation", 0) or 0)
         sig.emit(GIMotorHydration(state, real, fingerprint, generation))
 
     def gi_hydration_is_current(self, hydration) -> bool:
@@ -279,6 +303,16 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         self.file_lock = file_lock
         self.fname = fname
         self.scan_name = 'null_thread'
+        # §13.11 hydration 5 / §13.7: GI-motor knowledge state.  The lazy
+        # recursive "not inspected" paths downgrade this to False EXPLICITLY
+        # before publishing so an uninspected source is UNKNOWN (never
+        # known-empty).  The emit-time getattr FALLBACK is inverted to False so
+        # any future emit path that forgets to establish knowledge fails safe to
+        # UNKNOWN rather than silently reporting KNOWN_EMPTY.
+        self._gi_motor_knowledge_proved = True
+        # Hydration epoch + request-start token (§13.11 hydration 2).
+        self._gi_hydration_generation = 0
+        self._gi_hydration_request_token = None
         self.parameters = Parameter.create(
             name='wrangler_widget', type='int', value=0
         )
