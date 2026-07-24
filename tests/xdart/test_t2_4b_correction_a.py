@@ -165,13 +165,10 @@ def test_strict_schema_corpus_refuses_invalid(widget, path, value):
 
 # --------------------------------------------------------------------------- #
 # §17.8 — the "pure" builder/serializer still mutates.  ASSIGNED TO T-2.5:
-# committed RED (xfail-strict) mutation sentinels; T-2.5 removes the markers.
+# mutation sentinels — committed RED (xfail-strict) at T-2.4b; T-2.5 makes the
+# builders pure / keeps the contradiction journal-only and removes the markers.
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="§17.8: _controls_v2_native_reduction_plan projects into scan; "
-           "made pure in T-2.5")
 def test_native_plan_builder_is_side_effect_free(widget, monkeypatch):
     from xdart.gui.tabs.static_scan import static_scan_widget as module
     from xrd_tools.session.run_configuration import GIIntent
@@ -204,10 +201,6 @@ def test_native_plan_builder_is_side_effect_free(widget, monkeypatch):
     assert widget.scan.incidence_motor == scan_before["incidence_motor"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="§17.4/§17.8: per-field-valid cross-field contradiction is installed "
-           "and serialized by the validate-then-apply owner; fixed in T-2.5")
 def test_transient_cross_field_state_is_not_serialized_as_committed(
         widget, monkeypatch):
     from xrd_tools.session.run_configuration import FrozenThresholdPolicy

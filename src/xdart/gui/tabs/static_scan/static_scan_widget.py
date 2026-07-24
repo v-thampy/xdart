@@ -11,6 +11,7 @@ import copy
 import os
 import math
 import time
+import types
 from pathlib import Path
 from collections import OrderedDict
 import gc
@@ -1651,15 +1652,22 @@ class staticWidget(QWidget):
             recovery_failed_path=list(recovery) if recovery else None,
             level="warning",
         )
+        # §15.4-B.7: surface the engine's exact `reason` in the visible message
+        # so the SAME specific cause survives into both the Run and non-run
+        # refusals (the stack oracle asserts the reason string reaches the user).
+        reason = (": " + result.reason) if result.reason else ""
         if recovery:
             message = (
                 "A control edit could not be applied and a carrier ("
                 + "/".join(str(seg) for seg in recovery)
-                + ") could not be restored — the action was not performed.")
+                + ") could not be restored"
+                + reason
+                + " — the action was not performed.")
         else:
             message = (
-                "A control edit is invalid (" + str(where)
-                + ") — the action was not performed; re-check the control.")
+                "A control edit is invalid (" + str(where) + ")"
+                + reason
+                + " — the action was not performed; re-check the control.")
         self._controls_v2_status_message(message)
 
     def _controls_v2_status_message(self, msg) -> None:
@@ -1899,8 +1907,12 @@ class staticWidget(QWidget):
             "gi_mode_2d": str(a2.get("gi_mode_2d", "qip_qoop")),
         }
 
-    def _controls_v2_apply_gi_config_to_scan(self, cfg=None) -> None:
-        scan = getattr(self, "scan", None)
+    def _controls_v2_apply_gi_config_to_scan(self, cfg=None, scan=None) -> None:
+        # §17.8: the target defaults to the LIVE scan (the real projection call
+        # sites), but a PURE builder passes an aside copy so it can read the
+        # projected GI fields without mutating the live scan.
+        if scan is None:
+            scan = getattr(self, "scan", None)
         if scan is None:
             return
         if cfg is None:
@@ -2874,14 +2886,20 @@ class staticWidget(QWidget):
                 recovery_failed_path=list(_recovery) if _recovery else None,
                 level="warning",
             )
+            # §15.4-B.7: thread the engine's exact `reason` through to the Run
+            # refusal so the operator (and the stack oracle) sees the specific
+            # cause, not just the phase/path.
+            _reason = (": " + _fold.reason) if _fold.reason else ""
             if _recovery:
                 # §9.10 step 3-commit: a rollback failure is a distinct recovery
                 # error — name the carrier that could not be restored.
                 raise DeferredRunEditsPendingError(
                     "run configuration could not be applied and a carrier ("
                     + "/".join(str(seg) for seg in _recovery)
-                    + ") could not be restored — Run not started; check the"
-                    " control state before retrying"
+                    + ") could not be restored"
+                    + _reason
+                    + " — Run not started; check the control state before"
+                    " retrying"
                 )
             _where = (
                 "/".join(str(seg) for seg in _fold.failed_path)
@@ -2889,7 +2907,9 @@ class staticWidget(QWidget):
             raise DeferredRunEditsPendingError(
                 "deferred edit invalid ("
                 + _where
-                + ") — Run not started; re-check the control and try again"
+                + ")"
+                + _reason
+                + " — Run not started; re-check the control and try again"
             )
         self._controls_v2_ensure_native_int_defaults()
         intent = self._controls_v2_ensure_run_intent()
@@ -3187,15 +3207,37 @@ class staticWidget(QWidget):
     ):
         """Build the native Controls V2 reduction plan used by run/reintegrate.
 
-        §15.12-A.3 / §15.8: this is a PURE builder — it snapshots the committed
-        state and never commits pending edits.  ``commit_pending`` is retained
-        only for call-site compatibility; the action owners (Run / reintegrate /
-        Config Save) run the checked commit BEFORE building a plan."""
+        §15.12-A.3 / §15.8 / §17.8: this is a PURE builder — it snapshots the
+        committed state, never commits pending edits, and NEVER projects into the
+        live scan.  ``commit_pending`` is retained only for call-site
+        compatibility; the action owners (Run / reintegrate / Config Save) run the
+        checked commit BEFORE building a plan."""
 
         self._controls_v2_ensure_native_int_defaults()
-        self._controls_v2_apply_gi_config_to_scan()
 
-        scan = getattr(self, "scan", None)
+        # §17.8: build from an ASIDE copy of the scan with the GI config projected
+        # onto it — reading the projected GI fields WITHOUT mutating the live
+        # scan.gi / scan.gi_config / scan.incidence_motor (the exact-object test).
+        live_scan = getattr(self, "scan", None)
+        scan = live_scan
+        if live_scan is not None:
+            scan = types.SimpleNamespace(
+                skip_2d=getattr(live_scan, "skip_2d", False),
+                detector_shape=getattr(live_scan, "detector_shape", None),
+                frames=getattr(live_scan, "frames", None),
+                bai_1d_args=getattr(live_scan, "bai_1d_args", {}),
+                bai_2d_args=getattr(live_scan, "bai_2d_args", {}),
+                _cached_fiber_integrator_angle=getattr(
+                    live_scan, "_cached_fiber_integrator_angle", None),
+                global_mask=getattr(live_scan, "global_mask", None),
+                gi=getattr(live_scan, "gi", False),
+                gi_config=getattr(live_scan, "gi_config", {}),
+                incidence_motor=getattr(live_scan, "incidence_motor", None),
+                th_mtr=getattr(live_scan, "th_mtr", None),
+                sample_orientation=getattr(live_scan, "sample_orientation", 4),
+                tilt_angle=getattr(live_scan, "tilt_angle", 0.0),
+            )
+            self._controls_v2_apply_gi_config_to_scan(scan=scan)
 
         threshold_min = None
         threshold_max = None
@@ -4256,18 +4298,29 @@ class staticWidget(QWidget):
     )
 
     def _controls_v2_snapshot_display_scan(self, scan):
-        """Deep snapshot of the projected display-scan fields for rollback."""
+        """Deep snapshot of the projected display-scan fields for rollback.
+
+        §15.4-B.3: taken UNDER ``scan_lock`` so no background writer tears a field
+        mid-copy, and with NO alias fallback — an alias of the live object is not a
+        recoverable snapshot.  A field that cannot be deep-copied is an UNCOPYABLE
+        rollback state: this RAISES so the caller fails the transaction at
+        PREFLIGHT (zero writes), never silently aliasing the live object."""
         if scan is None:
             return None
-        snap = {}
-        for name in self._CONTROLS_V2_DISPLAY_SCAN_FIELDS:
-            if not hasattr(scan, name):
-                continue
-            try:
+
+        def _snap():
+            snap = {}
+            for name in self._CONTROLS_V2_DISPLAY_SCAN_FIELDS:
+                if not hasattr(scan, name):
+                    continue
                 snap[name] = copy.deepcopy(getattr(scan, name))
-            except Exception:
-                snap[name] = getattr(scan, name)
-        return snap
+            return snap
+
+        lock = getattr(scan, "scan_lock", None)
+        if lock is None:
+            return _snap()
+        with lock:
+            return _snap()
 
     def _controls_v2_restore_display_scan(self, scan, snapshot) -> None:
         """Restore the projected display-scan fields under the scan lock.
@@ -4299,118 +4352,169 @@ class staticWidget(QWidget):
     def commit_controls_transaction(self, staged) -> ControlsCommitResult:
         """Install a validated :class:`StagedControlsTransaction` atomically.
 
-        §9.10 step 3-commit / step 4 + §14.11.A/B.  ONE checked rollback boundary:
+        §9.10 step 3-commit / step 4 + §14.11.A/B + §15.4 Correction B.  ONE
+        checked rollback boundary:
 
-        * PREFLIGHT — resolve every legacy carrier (handle, prior, coerced
-          expected) BEFORE any write; a missing carrier or a failing getter is a
-          typed preflight failure with ZERO writes (§14.11.A.1).
-        * FORWARD — each carrier is pushed onto the rollback stack BEFORE its
-          setter, and the setter AND readback are wrapped so no exception escapes
-          after the first write (§14.11.A.2-3).
-        * ROLLBACK — on the first failure, restore EVERY attempted carrier in
-          reverse order, never stopping at the first restore failure, collecting
-          all un-restorable paths (§14.11.A.4-5); the failed-forward carrier is
-          force-restored directly.
-        * INSTALL — the display scan is snapshotted before the projection and
-          restored under the scan lock on any later failure (§14.11.B.1).
+        * PREFLIGHT (ZERO writes) — a non-empty legacy projection with NO
+          parameter root REFUSES (B.1, never skip-and-succeed); resolve a STABLE
+          carrier record (path, handle identity, prior, coerced expected) for
+          every legacy carrier; a missing carrier, getter failure, OR coercion
+          failure is a typed preflight failure (B.1/B.2); and EVERY rollback
+          snapshot — display scan under ``scan_lock`` with no alias fallback,
+          intent, threshold/GI flags, compound PONI carriers, energy/probe caches
+          + observation BEFORE any invalidation — is captured before the first
+          write (B.3/B.6).  An uncopyable snapshot is a preflight failure.
+        * FORWARD — legacy carriers apply using ONLY the preflighted handle;
+          replacement is detected by object identity, never re-resolved by path
+          (B.4).  Each carrier is pushed onto the rollback stack BEFORE its setter;
+          setter AND readback are wrapped so nothing escapes after the first write.
+        * RECOVERY — every failure runs :meth:`_controls_v2_recover_all`, a
+          collector that attempts EVERY carrier class independently and collects
+          all un-restorable paths in reverse-application order (B.5), never
+          aborting on the first restore exception.
         * SOURCE — reconciled through ONE owner only when the source SELECTION
-          changed; its energy/probe caches + observation are snapshotted and
-          restored on failure (§14.11.B.2).
+          changed; the recovery collector performs the verified second `_sync` and
+          restores the energy/probe caches + observation (B.2 — the mutate-then-
+          restore/two-`_sync` shape is retained per §14; Correction C reshapes it).
 
         Returns a typed :class:`ControlsCommitResult` (phase / failed_path /
         reason / all recovery failures) — never an ambient side effect.
         """
         wrangler = getattr(self, "wrangler", None)
         params = getattr(wrangler, "parameters", None)
-
+        thread = getattr(wrangler, "thread", None)
+        scan = getattr(self, "scan", None)
         prior_energy_pref = getattr(
             self, "_controls_v2_source_energy_preference", "poni")
 
-        # --- A.1 PREFLIGHT: resolve EVERY legacy carrier BEFORE any write. ---
-        plan = []  # (path, value, prior, expected)
-        if params is not None:
-            for path, value in staged.legacy_projection.items():
-                path = tuple(path)
-                param = self._controls_v2_param(path)
-                if param is None:
-                    return ControlsCommitResult(
-                        False, failed_path=path,
-                        reason="legacy carrier missing at preflight",
-                        phase="preflight")
-                try:
-                    prior = param.value()
-                except Exception:
-                    logger.debug("preflight getter failed for %s", path,
-                                 exc_info=True)
-                    return ControlsCommitResult(
-                        False, failed_path=path,
-                        reason="legacy carrier getter failed at preflight",
-                        phase="preflight")
-                try:
-                    expected = coerce_control_edit_value(param.value(), value)
-                except Exception:
-                    expected = value
-                plan.append((path, value, prior, expected))
+        # ===================== PREFLIGHT — ZERO writes ======================
+        # B.1: a non-empty legacy projection with NO parameter root cannot be
+        # applied — refuse (the old code skipped-and-returned success).
+        projection = list(staged.legacy_projection.items())
+        if projection and params is None:
+            first_path = tuple(projection[0][0])
+            return ControlsCommitResult(
+                False, failed_path=first_path,
+                reason="parameter root missing at preflight",
+                phase="preflight")
 
-        # --- A.2/A.3 forward apply: push to the rollback stack BEFORE the setter;
-        #             wrap the setter AND readback so nothing escapes. ---
-        applied = []  # (path, prior) in application order
-        for path, value, prior, expected in plan:
-            applied.append((path, prior))  # BEFORE the setter (A.3)
-            try:
-                self._controls_v2_write_legacy_carrier(params, path, value)
-                ok = self._controls_v2_legacy_readback_ok(path, expected)
-            except Exception:
-                logger.debug("legacy carrier apply/readback raised for %s", path,
-                             exc_info=True)
-                ok = False
-            if not ok:
-                recovery = self._controls_v2_rollback_legacy_all(
-                    params, applied, forced_paths=(path,))
+        # B.1/B.2: resolve a STABLE carrier record for EVERY legacy carrier.  A
+        # missing carrier, a getter failure, OR a coercion failure (no longer
+        # swallowed into expected=value) is a typed preflight failure, zero writes.
+        carriers = []  # (path, param, value, prior, expected)
+        for path, value in projection:
+            path = tuple(path)
+            param = self._controls_v2_param(path)
+            if param is None:
                 return ControlsCommitResult(
                     False, failed_path=path,
-                    reason="legacy carrier readback failed",
-                    recovery_failed_paths=recovery, phase="legacy_apply")
+                    reason="legacy carrier missing at preflight",
+                    phase="preflight")
+            try:
+                prior = param.value()
+            except Exception:
+                logger.debug("preflight getter failed for %s", path,
+                             exc_info=True)
+                return ControlsCommitResult(
+                    False, failed_path=path,
+                    reason="legacy carrier getter failed at preflight",
+                    phase="preflight")
+            try:
+                expected = coerce_control_edit_value(param.value(), value)
+            except Exception:
+                logger.debug("preflight coercion failed for %s", path,
+                             exc_info=True)
+                return ControlsCommitResult(
+                    False, failed_path=path,
+                    reason="legacy carrier coercion failed at preflight",
+                    phase="preflight")
+            carriers.append((path, param, value, prior, expected))
 
-        # --- B.1 snapshot the display scan BEFORE install; A.5 wrap snapshot. ---
-        scan = getattr(self, "scan", None)
-        display_scan_snapshot = self._controls_v2_snapshot_display_scan(scan)
+        # B.3: display snapshot BEFORE the first write, under scan_lock; an
+        # uncopyable field RAISES -> typed preflight failure (never an alias).
+        try:
+            display_scan_snapshot = self._controls_v2_snapshot_display_scan(scan)
+        except Exception:
+            logger.debug("controls commit display snapshot failed", exc_info=True)
+            return ControlsCommitResult(
+                False, failed_path=None,
+                reason="display scan snapshot failed (uncopyable state)",
+                phase="preflight")
+        # B.3: intent snapshot also before the first write.
         try:
             live = self._controls_v2_ensure_run_intent()
             intent_snapshot = self._controls_v2_snapshot_intent_values(live)
         except Exception:
             logger.debug("controls commit intent snapshot failed", exc_info=True)
-            recovery = self._controls_v2_rollback_legacy_all(params, applied)
             return ControlsCommitResult(
                 False, failed_path=None, reason="intent snapshot failed",
-                recovery_failed_paths=recovery, phase="install")
+                phase="preflight")
+
+        # B.3/B.6: every other rollback carrier, captured BEFORE the first write —
+        # threshold/GI flags, compound PONI carriers, and the energy/probe caches +
+        # directory observation captured BEFORE any preference invalidation (the
+        # old code nulled the energy cache first and then "restored" None).
         prior_gi_explicit = getattr(
             self, "_controls_v2_gi_selection_explicit", False)
         prior_threshold_state = getattr(
             self, "_controls_v2_threshold_state", None)
-
-        # §12.6/§13.8/§14.11.B.5: the compound PONI carrier joins THIS boundary.
-        # Snapshot the wrangler/thread PONI carriers before install so they roll
-        # back with everything else on any later failure.
-        thread = getattr(wrangler, "thread", None)
         prior_wrangler_poni = getattr(wrangler, "poni", None)
         prior_wrangler_poni_file = getattr(wrangler, "poni_file", None)
         prior_thread_poni = getattr(thread, "poni", None)
+        prior_observation = getattr(
+            self, "_controls_v2_directory_observation", None)
+        prior_energy_cache = getattr(
+            self, "_controls_v2_source_energy_cache", None)
+        prior_probe_cache = getattr(
+            self, "_controls_v2_metadata_probe_cache", None)
 
-        def _restore_all():
-            self._controls_v2_restore_intent_values(live, intent_snapshot)
-            self._controls_v2_gi_selection_explicit = prior_gi_explicit
-            self._controls_v2_threshold_state = prior_threshold_state
-            self._controls_v2_source_energy_preference = prior_energy_pref
-            self._controls_v2_restore_display_scan(scan, display_scan_snapshot)
-            if staged.poni_touched:
-                if wrangler is not None:
-                    wrangler.poni = prior_wrangler_poni
-                    wrangler.poni_file = prior_wrangler_poni_file
-                if thread is not None:
-                    thread.poni = prior_thread_poni
+        ctx = {
+            "live": live, "intent_snapshot": intent_snapshot,
+            "prior_gi_explicit": prior_gi_explicit,
+            "prior_threshold_state": prior_threshold_state,
+            "prior_energy_pref": prior_energy_pref,
+            "scan": scan, "display_scan_snapshot": display_scan_snapshot,
+            "wrangler": wrangler, "thread": thread, "staged": staged,
+            "prior_wrangler_poni": prior_wrangler_poni,
+            "prior_wrangler_poni_file": prior_wrangler_poni_file,
+            "prior_thread_poni": prior_thread_poni,
+            "prior_observation": prior_observation,
+            "prior_energy_cache": prior_energy_cache,
+            "prior_probe_cache": prior_probe_cache,
+            "params": params,
+        }
 
-        # --- 5. install the staged intent + display projection as one op ---
+        # ===================== FORWARD — legacy carriers ====================
+        applied = []  # (path, prior) in application order
+        for path, param, value, prior, expected in carriers:
+            applied.append((path, prior))  # push BEFORE the setter (A.3)
+            # B.4: the carrier handle must be the SAME object preflight resolved;
+            # a replacement (path now maps to a different Parameter) is a contained
+            # failure, never a silent re-resolve that inspects a different object.
+            if self._controls_v2_param(path) is not param:
+                recovery = self._controls_v2_recover_all(
+                    ctx, applied, forced_paths=(path,))
+                return ControlsCommitResult(
+                    False, failed_path=path,
+                    reason="legacy carrier handle replaced before apply",
+                    recovery_failed_paths=recovery, phase="legacy_apply")
+            try:
+                self._controls_v2_write_legacy_carrier(params, path, value)
+                ok = (self._controls_v2_param(path) is param
+                      and self._controls_v2_legacy_readback_ok(path, expected))
+            except Exception:
+                logger.debug("legacy carrier apply/readback raised for %s", path,
+                             exc_info=True)
+                ok = False
+            if not ok:
+                recovery = self._controls_v2_recover_all(
+                    ctx, applied, forced_paths=(path,))
+                return ControlsCommitResult(
+                    False, failed_path=path,
+                    reason="legacy carrier readback failed",
+                    recovery_failed_paths=recovery, phase="legacy_apply")
+
+        # ===================== INSTALL — intent + display + PONI ============
         try:
             self._controls_v2_install_intent_values(live, staged.staged_intent)
             self._controls_v2_gi_selection_explicit = staged.gi_selection_explicit
@@ -4420,7 +4524,7 @@ class staticWidget(QWidget):
                 staged.source_energy_preference)
             self._controls_v2_apply_snapshot_to_scan(
                 self._controls_v2_native_int_snapshot())
-            # §12.6/§13.8: install the compound PONI carrier as ONE value — path
+            # §12.6/§13.8: the compound PONI carrier installs as ONE value — path
             # (legacy projection, above) + wrangler object/path + thread object +
             # intent values (already copied by _controls_v2_install_intent_values).
             if staged.poni_touched:
@@ -4431,72 +4535,107 @@ class staticWidget(QWidget):
                     thread.poni = staged.poni_object
         except Exception:
             logger.debug("controls commit intent install failed", exc_info=True)
-            _restore_all()
-            recovery = self._controls_v2_rollback_legacy_all(params, applied)
+            recovery = self._controls_v2_recover_all(ctx, applied)
             return ControlsCommitResult(
                 False, failed_path=None, reason="intent install failed",
                 recovery_failed_paths=recovery, phase="install")
 
-        # An energy-preference change invalidates only the energy cache — never a
-        # directory poll (§12.7).
+        # An energy-preference change invalidates only the energy cache (§12.7).
         if staged.source_energy_preference != prior_energy_pref:
             self._controls_v2_source_energy_cache = None
 
-        # --- 6. transactional source reconciliation through ONE owner, and ONLY
-        #        when a source-SELECTION path changed (§12.7 test 13).  B.2:
-        #        snapshot the energy/probe caches + observation and restore them
-        #        on failure so a partial reconcile leaves no torn source state. ---
+        # ===================== SOURCE reconciliation ========================
         # §14.11.B.3 DECISION (recorded, not silently kept): the full "build a
-        # candidate source/index ASIDE, then ONE swap" is DEFERRED, and the
-        # verified mutate-then-restore shape below is retained deliberately.  Two
-        # binding reasons: (1) the §14 acceptance oracle
-        # test_source_failure_restores_caches_and_partial_observation asserts the
-        # source owner is reconciled EXACTLY TWICE (forward + restore =
-        # `len(calls) == 2`), so a one-swap/no-second-`_sync` shape would drop §14
-        # below the required 9/9 and cannot be adopted without Codex re-shaping
-        # that oracle; (2) a true aside-build needs a new aside/swap API on
-        # ScanSourceWidget's DirectoryIndexSession, which mutates in place and
-        # owns an async poll future — a deep, higher-risk refactor entangled with
-        # the O-3 browse-context boundary that is out of this commit's scope.
-        # B.4 IS delivered here: caches/observation are snapshot and restored, the
-        # restore is a distinct recovery failure NAMING the ("Source",) carrier,
-        # and it is never log-and-discarded.
+        # candidate source/index ASIDE, then ONE swap" is DEFERRED; the verified
+        # mutate-then-restore shape is retained deliberately because the §14
+        # acceptance oracle asserts the source owner is reconciled EXACTLY TWICE
+        # (forward + the recovery collector's restore = ``len(calls) == 2``), and a
+        # true aside-build needs a new aside/swap API on the DirectoryIndexSession
+        # (a deeper refactor Codex reshapes in Correction C).  B.4/B.5: on failure
+        # the recovery collector performs the SECOND `_sync` and restores the
+        # caches/observation; an unrestorable source owner is a DISTINCT recovery
+        # failure naming the ("Source",) carrier, never log-and-discard.
         if staged.source_selection_touched:
-            prior_observation = getattr(
-                self, "_controls_v2_directory_observation", None)
-            prior_energy_cache = getattr(
-                self, "_controls_v2_source_energy_cache", None)
-            prior_probe_cache = getattr(
-                self, "_controls_v2_metadata_probe_cache", None)
             try:
                 self._controls_v2_source_energy_cache = None
                 self._controls_v2_metadata_probe_cache = None
-                self._sync_controls_v2_source_index()
+                self._sync_controls_v2_source_index()  # forward = call 1
             except Exception:
                 logger.debug("controls commit source reconcile failed",
                              exc_info=True)
-                _restore_all()
-                recovery = list(
-                    self._controls_v2_rollback_legacy_all(params, applied))
-                # Best-effort restore of the source owner, THEN reset the
-                # caches/observation last so they are authoritative even if the
-                # restore-sync mutates them again.  §14.11.B.4: if the source
-                # owner itself cannot be restored, that is a DISTINCT recovery
-                # failure naming the source carrier — never log-and-discard.
-                try:
-                    self._sync_controls_v2_source_index()
-                except Exception:
-                    logger.debug("controls source restore reconcile failed",
-                                 exc_info=True)
-                    recovery.append(("Source",))
-                self._controls_v2_directory_observation = prior_observation
-                self._controls_v2_source_energy_cache = prior_energy_cache
-                self._controls_v2_metadata_probe_cache = prior_probe_cache
+                recovery = self._controls_v2_recover_all(
+                    ctx, applied, source_reconciled=True)
                 return ControlsCommitResult(
                     False, failed_path=("Source",),
                     reason="source reconciliation failed",
                     recovery_failed_paths=recovery, phase="source_reconcile")
         return ControlsCommitResult(True)
+
+    def _controls_v2_recover_all(self, ctx, applied, forced_paths=(),
+                                 source_reconciled=False):
+        """§15.4-B.5 RECOVERY COLLECTOR — restore EVERY carrier class through a
+        PER-CLASS ``try``/``except`` in reverse-APPLICATION order, verifying each
+        readback/identity, collecting ALL un-restorable paths, and NEVER aborting
+        on the first restore exception.  Returns the deterministic reverse-order
+        failure list for :class:`ControlsCommitResult.recovery_failed_paths`.
+
+        Order (reverse of application): source owner -> caches/observation ->
+        compound PONI -> display scan -> intent/self-state -> legacy carriers."""
+        failures = []
+        # 1. source owner (applied LAST => restored FIRST).  §14.11.B.4: the
+        #    verified restore is the SECOND `_sync` (keeps `len(calls) == 2`).
+        if source_reconciled:
+            try:
+                self._sync_controls_v2_source_index()
+            except Exception:
+                logger.debug("controls source restore reconcile failed",
+                             exc_info=True)
+                failures.append(("Source",))
+        # Restore observation + caches from the preflight snapshot AFTER any
+        # restore-sync, so they are authoritative even if it mutated them again.
+        try:
+            self._controls_v2_directory_observation = ctx["prior_observation"]
+            self._controls_v2_source_energy_cache = ctx["prior_energy_cache"]
+            self._controls_v2_metadata_probe_cache = ctx["prior_probe_cache"]
+        except Exception:
+            logger.debug("controls source cache restore failed", exc_info=True)
+            failures.append(("Source", "cache"))
+        # 2. compound PONI carriers (wrangler object/path + thread object).
+        staged = ctx["staged"]
+        if staged.poni_touched:
+            try:
+                w = ctx["wrangler"]
+                th = ctx["thread"]
+                if w is not None:
+                    w.poni = ctx["prior_wrangler_poni"]
+                    w.poni_file = ctx["prior_wrangler_poni_file"]
+                if th is not None:
+                    th.poni = ctx["prior_thread_poni"]
+            except Exception:
+                logger.debug("controls PONI carrier restore failed",
+                             exc_info=True)
+                failures.append(("Signal", "poni_file"))
+        # 3. display-scan projection (dict identity preserved under scan_lock).
+        try:
+            self._controls_v2_restore_display_scan(
+                ctx["scan"], ctx["display_scan_snapshot"])
+        except Exception:
+            logger.debug("controls display scan restore failed", exc_info=True)
+            failures.append(("Display",))
+        # 4. intent field references + self-state (energy pref/GI-explicit/thresh).
+        try:
+            self._controls_v2_restore_intent_values(
+                ctx["live"], ctx["intent_snapshot"])
+            self._controls_v2_gi_selection_explicit = ctx["prior_gi_explicit"]
+            self._controls_v2_threshold_state = ctx["prior_threshold_state"]
+            self._controls_v2_source_energy_preference = ctx["prior_energy_pref"]
+        except Exception:
+            logger.debug("controls intent restore failed", exc_info=True)
+            failures.append(("Intent",))
+        # 5. legacy carriers (reverse projection order; its own verified collector).
+        failures.extend(self._controls_v2_rollback_legacy_all(
+            ctx["params"], applied, forced_paths=forced_paths))
+        return failures
 
     def _controls_v2_defer_field_edit(self, path, value) -> None:
         """Record a run-active Controls edit into the journal for the NEXT run.
@@ -4559,14 +4698,51 @@ class staticWidget(QWidget):
             return ControlsCommitResult(
                 False, failed_path=(harvest_err.path or ("Controls",)),
                 reason=harvest_err.reason, phase="harvest")
+        return self._controls_v2_stage_commit_edits(edits)
+
+    def _controls_v2_commit_journal_winners(self):
+        """§17.4 idle-commit owner: stage + checked-commit the CURRENT journal
+        winners WITHOUT re-harvesting the panel form.
+
+        The idle ``fieldValueChanged`` signal already recorded its edit as a
+        revision, so the transaction input is the journal itself; re-importing a
+        full-form snapshot (as the Run/action fold does for an unflushed focused
+        editor) would let a STALE non-focused row clobber the just-recorded idle
+        value.  Returns ``None`` on success or the typed
+        :class:`ControlsCommitResult` failure (journal retained).
+
+        §17.4: the commit batch is over the per-field-VALID winners.  A draft that
+        the strict per-field reducer REFUSES (e.g. a stale GI-mode axis label left
+        after GI was disabled) was already refused when entered and stays
+        JOURNAL-OWNED for the panel overlay — but it must NOT block the commit of
+        other valid edits.  A per-field-VALID edit that only forms a CROSS-FIELD
+        contradiction (threshold min>max) stays in the batch and pends as a group,
+        so the resolving edit still commits both at once."""
+        winners = [
+            (path, value)
+            for path, value in self._controls_v2_journal_winners()
+            if self._controls_v2_validate_idle_edit(path, value) is None
+        ]
+        return self._controls_v2_stage_commit_edits(winners)
+
+    def _controls_v2_stage_commit_edits(self, edits):
+        """Stage + checked-commit a RESOLVED winner set through the atomic engine
+        (§14.11.C).  Shared by the Run/action fold (form-harvested winners) and the
+        idle-commit owner (journal winners).  Returns ``None`` on success (only the
+        exact consumed revisions cleared) or the typed
+        :class:`ControlsCommitResult` failure (full journal retained; the RETURNED
+        value is the sole diagnostic authority)."""
         if not edits:
             return None
-        # Snapshot the exact revisions this transaction consumes, so success
-        # clears ONLY them — a newer concurrent edit (higher revision) survives.
-        consumed = {
-            path: entry["revision"]
-            for path, entry in self._controls_v2_edit_journal_dict().items()
-        }
+        # Snapshot the exact revisions THIS transaction consumes (only the staged
+        # edits), so success clears ONLY them — a newer concurrent edit (higher
+        # revision) AND an excluded per-field-invalid draft both survive (§12.9).
+        journal = self._controls_v2_edit_journal_dict()
+        consumed = {}
+        for path, _ in edits:
+            entry = journal.get(tuple(path))
+            if entry is not None:
+                consumed[tuple(path)] = entry["revision"]
         staged = self.stage_controls_transaction(edits)
         if isinstance(staged, ControlsTransactionError):
             run_config_debug_log(
@@ -4586,7 +4762,7 @@ class staticWidget(QWidget):
         if not result.ok:
             # A rollback failure is a DISTINCT recovery error: retain the journal,
             # refuse Run, and name every carrier that could not be restored
-            # (§14.11.A); _prepare surfaces the returned result visibly.
+            # (§14.11.A); the caller surfaces the returned result visibly.
             run_config_debug_log(
                 logger,
                 "controls_deferred_fold_invalid",
@@ -4623,15 +4799,18 @@ class staticWidget(QWidget):
             # next-run data (deferred origin) and tell the operator.
             self._controls_v2_defer_field_edit(path, value)
             return
-        # §15.12-A.1 / §15.3: an idle edit is recorded as a revision and then
-        # VALIDATED through the pure staging reducer BEFORE any carrier is
-        # touched.  An INVALID focus-loss edit (e.g. a non-integral "4.5" that the
-        # old permissive setter would have clamped to 4) mutates NO carrier: the
-        # journal is retained, ONE stable refusal is surfaced, and the
-        # immediately-following action click suppresses without a second mutation
-        # (§15.12-A.2).  A value that validates is applied through the checked
-        # native/legacy setters — which, for a value that already passed the
-        # strict reducer, cannot clamp.
+        # §15.12-A.1 / §15.3 / §17.4: an idle edit records a revision and is
+        # classified by the PURE per-field reducer BEFORE any carrier is touched.
+        # A per-field-INVALID value (e.g. a non-integral "4.5" the old permissive
+        # setter would have clamped to 4) is a typed refusal — journal retained,
+        # ONE stable message, ZERO carrier mutation (§15.12-A.2).  A per-field-VALID
+        # value is installed ONLY through the checked atomic engine (never the
+        # retired second setter `_apply_controls_v2_field_value`): the COMPLETE
+        # journal winner set is staged and committed as one, so a value that is
+        # individually valid but part of a still-incomplete CROSS-FIELD
+        # contradiction (e.g. threshold min entered before max) stays JOURNAL-
+        # OWNED and panel-overlaid — never installed, never serialized — until a
+        # later related edit completes a valid winner set (§17.4).
         _idle_rev = self._controls_v2_record_edit(path, value, origin="idle")
         refusal = self._controls_v2_validate_idle_edit(path, value)
         if refusal is not None:
@@ -4650,42 +4829,85 @@ class staticWidget(QWidget):
             self._controls_v2_report_pending_refusal(refusal, "focus-loss")
             self._refresh_controls_v2_profile(immediate=True)
             return
-        # A valid commit resolves any prior focus-loss refusal.
-        self._controls_v2_last_refusal_signature = None
-        # §14.11.D.3/D.4: cache invalidation is SCOPED to what actually changed.
-        # An energy-preference (or PONI) change is LOCAL to the energy cache; only
-        # a real source-SELECTION change invalidates the metadata-probe cache too.
-        # An unrelated edit (mask/BG/…) invalidates neither.
-        if path == ("Source", "energy_preference") or path in self._CONTROLS_V2_PONI_PATHS:
-            self._controls_v2_source_energy_cache = None
-        elif path in self._CONTROLS_V2_SOURCE_SELECTION_PATHS:
-            self._controls_v2_source_energy_cache = None
-            self._controls_v2_metadata_probe_cache = None
-        # §14.11.D.3: guard the setter's parameter-tree ECHO
-        # (_on_controls_v2_source_tree_changed) so it does NOT reconcile — this
-        # handler owns the single, membership-conditional reconcile below.  A
-        # GENUINE direct-in-tree user edit (no guard set) still reconciles.
+        # The current edit is per-field-valid.  Stage the COMPLETE journal winner
+        # set and commit through the SAME checked atomic engine.  The commit owns
+        # the display projection, source reconciliation, energy/probe cache
+        # invalidation, generation bump, and exact-revision clearing — there is no
+        # second setter authority.  The `applying_field` guard blocks the
+        # parameter-tree echo while the engine writes signal-blocked carriers.
         self._controls_v2_applying_field = True
         try:
-            self._apply_controls_v2_field_value(path, value)
+            result = self._controls_v2_commit_journal_winners()
         finally:
             self._controls_v2_applying_field = False
-        bump_run_config_debug_generation(self, "config")
-        run_config_debug_log(
-            logger,
-            "controls_field_applied",
-            widget=self,
-            origin="controls_v2_ui",
-            field_path=path,
-            field_value=value,
-            revision=_idle_rev,
-            edit_origin="idle",
-        )
-        # §14.11.D.3 / §14.8: reconcile the source index ONLY when a source-
-        # SELECTION path changed — an idle mask/BG/energy-preference edit performs
-        # zero reconciliation and zero directory poll.
-        if path in self._CONTROLS_V2_SOURCE_SELECTION_PATHS:
-            self._sync_controls_v2_source_index()
+        if result is None:
+            # Complete-valid: installed atomically, consumed revisions cleared.
+            self._controls_v2_last_refusal_signature = None
+            # §14.11.D.4: a PONI edit invalidates the energy cache LOCALLY
+            # (energy-preference and source-selection cache invalidation already
+            # happen inside the commit engine).
+            if path in self._CONTROLS_V2_PONI_PATHS:
+                self._controls_v2_source_energy_cache = None
+            # The pure staging reducer resolves the GI θ-motor from the candidate
+            # OBSERVATION, which is UNKNOWN for a lazily-hydrated directory source
+            # (Correction C); the LIVE _controls_v2_gi_config applies the R4B-15
+            # stale-motor repick over the REAL offered motors.  Reconcile the
+            # installed intent + display scan + integrator combo with that live
+            # resolution so all θ-motor surfaces AND the freeze agree without
+            # injecting a motor not offered by the source (CLAUDE.md GI rule).
+            if path and path[0] == "GI":
+                cfg = self._controls_v2_gi_config()
+                live_intent = self._controls_v2_ensure_run_intent()
+                live_intent.gi = GIIntent(
+                    enabled=bool(cfg["gi"]),
+                    incidence_motor=str(cfg["incidence_motor"] or "Manual"),
+                    th_val=float(cfg["th_val"] or 0.0),
+                    sample_orientation=int(cfg["sample_orientation"] or 4),
+                    tilt_angle=float(cfg["tilt_angle"] or 0.0),
+                    mode_1d=str(cfg["gi_mode_1d"]),
+                    mode_2d=str(cfg["gi_mode_2d"]),
+                )
+                if live_intent.gi.enabled and getattr(self, "scan", None) is not None:
+                    self._controls_v2_apply_gi_config_to_scan(cfg)
+                if cfg.get("gi") and cfg.get("incidence_motor"):
+                    self._controls_v2_sync_integrator_gi_motor(
+                        cfg["incidence_motor"])
+            run_config_debug_log(
+                logger,
+                "controls_field_applied",
+                widget=self,
+                origin="controls_v2_ui",
+                field_path=path,
+                field_value=value,
+                revision=_idle_rev,
+                edit_origin="idle",
+            )
+            self._refresh_controls_v2_profile(immediate=True)
+            return
+        if result.phase in ("stage", "harvest"):
+            # §17.4: the current edit is individually valid but the complete
+            # candidate is a transient cross-field contradiction (or a still-
+            # pending prior draft) — keep it JOURNAL-OWNED and panel-overlaid; NO
+            # install, NO committed mutation, NO refusal message.  A later
+            # resolving edit stages the complete winner set and commits both.
+            run_config_debug_log(
+                logger,
+                "controls_field_pending",
+                widget=self,
+                origin="controls_v2_ui",
+                field_path=path,
+                field_value=value,
+                revision=_idle_rev,
+                phase=result.phase,
+                failed_path=list(result.failed_path or ()),
+            )
+            self._refresh_controls_v2_profile(immediate=True)
+            return
+        # An install/source_reconcile/legacy_apply failure on a VALID candidate:
+        # the engine contained the exception and rolled back (nothing half-
+        # applied) — surface ONE typed refusal (the fold already logged the
+        # structured phase/path event).
+        self._controls_v2_report_pending_refusal(result, "focus-loss")
         self._refresh_controls_v2_profile(immediate=True)
 
     def _controls_v2_validate_idle_edit(self, path, value):
