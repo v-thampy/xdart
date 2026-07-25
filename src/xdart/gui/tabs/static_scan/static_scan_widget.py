@@ -12140,34 +12140,96 @@ class staticWidget(QWidget):
             or self._session_run_active()
         )
 
-    @staticmethod
-    def _controls_v2_owner_thread_running(thread) -> bool:
-        """``isRunning()`` on ONE run-owner thread, guarded for partial holders.
+    #: Suffix appended to an owner label when that owner's activity could NOT be
+    #: determined.  T-3.1 (§32.2): an unobservable owner is UNKNOWN, never idle,
+    #: so the label stays owner-identifying and therefore diagnosable.
+    _CONTROLS_V2_OWNER_PROBE_ERROR_SUFFIX = "-probe-error"
+
+    def _controls_v2_report_owner_probe_error(self, owner, reason) -> None:
+        """Report ONE unobservable run owner (§32.3 item 2).
+
+        Both a structured event AND a real log record: ``run_config_debug_log``
+        no-ops when run-config debugging is off, and an admission decision that
+        had to fail closed must never be invisible in an ordinary session."""
+        logger.warning(
+            "run-owner activity could not be determined (%s): %s — Run refuses "
+            "rather than assuming the owner is idle", owner, reason)
+        try:
+            run_config_debug_log(
+                logger,
+                "run_owner_probe_unknown",
+                widget=self,
+                origin="controls_v2_active_run_owner",
+                phase="precondition",
+                owner=str(owner),
+                reason=str(reason),
+                level="warning",
+            )
+        except Exception:
+            logger.debug("owner-probe diagnostic emit failed", exc_info=True)
+
+    def _controls_v2_owner_activity(self, owner, label) -> str:
+        """Observe ONE run owner: ``'active'`` / ``'idle'`` / ``'unknown'``.
+
+        T-3.1 (§32.2) replaces the boolean predecessor, which reported an
+        unevaluable probe as False.  A deleted or broken Qt owner can raise while
+        its worker is still running, and calling that "idle" let Start harvest,
+        freeze, and publish onto the very lifecycle the check exists to protect.
+
+        * ``owner is None`` -> ``'idle'``.  A genuinely ABSENT owner is the
+          partial-construction carve-out (§32.3 item 2), not a live run.
+        * a PRESENT owner with no callable probe, or whose probe raises ->
+          ``'unknown'`` plus a diagnostic.  Never ``'idle'``.
 
         Deliberately NOT phase-qualified (unlike :meth:`_wrangler_run_active`,
-        which exists to keep CONTROLS locked): a worker that is still unwinding
-        after Stop reads ``isRunning()`` True while its phase/latch already read
-        idle, and that window is exactly what a Start must refuse (§9.10 step 2 /
-        the r1 fast-Start defect).
+        which exists to keep CONTROLS locked): a worker still unwinding after Stop
+        reads ``isRunning()`` True while its phase/latch already read idle, and
+        that window is exactly what a Start must refuse (§9.10 step 2).
         """
-        if thread is None:
-            return False
-        probe = getattr(thread, 'isRunning', None)
+        if owner is None:
+            return "idle"
+        probe = getattr(owner, 'isRunning', None)
         if not callable(probe):
-            return False
+            self._controls_v2_report_owner_probe_error(
+                label, "owner is present but exposes no callable isRunning()")
+            return "unknown"
         try:
-            return bool(probe())
-        except Exception:
-            logger.debug("run-owner isRunning probe failed", exc_info=True)
-            return False
+            return "active" if bool(probe()) else "idle"
+        except Exception as exc:
+            self._controls_v2_report_owner_probe_error(
+                label, f"isRunning() raised {type(exc).__name__}: {exc}")
+            return "unknown"
+
+    def _controls_v2_session_activity(self) -> str:
+        """Observe the streaming session: ``'active'`` / ``'idle'`` / ``'unknown'``.
+
+        Deliberately SEPARATE from :meth:`_session_run_active`, whose boolean
+        contract many display/lock consumers depend on and which T-3.1 does not
+        change.  ``is_running`` is a PROPERTY, so a half-torn-down session raises
+        on attribute ACCESS — that is an unknown owner state, not an idle one.
+        No session open at all is ordinary idle.
+        """
+        wrangler = getattr(self, 'wrangler', None)
+        session = getattr(wrangler, 'scan_session', None) if wrangler else None
+        if session is None:
+            thread = getattr(wrangler, 'thread', None) if wrangler else None
+            session = getattr(thread, 'scan_session', None) if thread else None
+        if session is None:
+            return "idle"
+        try:
+            return "active" if bool(session.is_running) else "idle"
+        except Exception as exc:
+            self._controls_v2_report_owner_probe_error(
+                "run-session", f"is_running raised {type(exc).__name__}: {exc}")
+            return "unknown"
 
     def _controls_v2_active_run_owner(self) -> str | None:
         """THE production active/stopping predicate for Start admission (§9.10
-        step 2 / §31.3 item 3).
+        step 2 / §31.3 item 3), TOTAL as of T-3.1 (§32.3 item 2).
 
-        Returns the label of the first owner found active or stopping, or
-        ``None`` when every owner is idle.  The four owners, in refusal-report
-        order:
+        Returns a label for the first owner found active/stopping OR
+        unobservable, and ``None`` **only when every present owner was positively
+        observed idle**.  The four owners, in refusal-report order:
 
         ``run``
             the host run-state latch (``_run_active``) or an open streaming
@@ -12180,23 +12242,38 @@ class staticWidget(QWidget):
         ``stitch``
             the one-shot stitch worker.
 
+        An owner whose activity cannot be determined yields
+        ``"<owner>-probe-error"``, so the caller refuses with a label that names
+        which owner went unobserved.  The public ``str | None`` decision is
+        unchanged for every existing caller.
+
         This is the single owner of that question: ``imageWrangler.start()``
         consults it at its TOP and ``_prepare_controls_v2_run_configuration``
-        consults it defensively.  It reads only activity state — it mutates
+        consults it defensively.  It reads only activity state and mutates
         nothing, so a refusal cannot disturb the preservation set.
         """
-        if self._controls_v2_run_active():
+        suffix = self._CONTROLS_V2_OWNER_PROBE_ERROR_SUFFIX
+        # The latch is a plain attribute read and cannot fail.
+        if bool(getattr(self, '_run_active', False)):
             return "run"
-        if self._controls_v2_owner_thread_running(
-                getattr(getattr(self, 'wrangler', None), 'thread', None)):
-            return "wrangler"
-        if self._controls_v2_owner_thread_running(
-                getattr(getattr(self, 'integratorTree', None),
-                        'integrator_thread', None)):
-            return "reintegration"
-        if self._controls_v2_owner_thread_running(
-                getattr(self, 'stitch_thread', None)):
-            return "stitch"
+        session_state = self._controls_v2_session_activity()
+        if session_state == "active":
+            return "run"
+        if session_state == "unknown":
+            return "run-session" + suffix
+        for label, owner in (
+            ("wrangler",
+             getattr(getattr(self, 'wrangler', None), 'thread', None)),
+            ("reintegration",
+             getattr(getattr(self, 'integratorTree', None),
+                     'integrator_thread', None)),
+            ("stitch", getattr(self, 'stitch_thread', None)),
+        ):
+            state = self._controls_v2_owner_activity(owner, label)
+            if state == "active":
+                return label
+            if state == "unknown":
+                return label + suffix
         return None
 
     def _wrangler_run_active(self) -> bool:

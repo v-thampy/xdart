@@ -56,6 +56,38 @@ def_img_file = ''
 def_meta_ext = 'auto'
 
 
+#: Operator-facing refusal text per POSITIVELY OBSERVED active run owner
+#: (§9.10 step 2).  Any other label — notably the T-3.1 ``…-probe-error``
+#: variants, where an owner's activity could NOT be determined — falls through to
+#: :func:`_run_owner_refusal_status`'s honest "could not confirm" wording.  A
+#: module-level function on purpose: the Start sentinels drive duck-typed
+#: SimpleNamespace/MethodType holders that bind unbound methods individually, so a
+#: shared helper must not be a new method they would each have to bind.
+_RUN_OWNER_REFUSAL_STATUS = {
+    "run": 'Previous run is still stopping — try again in a moment.',
+    "wrangler": 'Previous run is still stopping — try again in a moment.',
+    "reintegration": 'A reintegration is still finishing — try again in a moment.',
+    "stitch": 'A stitch is still finishing — try again in a moment.',
+}
+
+
+def _run_owner_refusal_status(owner):
+    """Refusal text for one run-owner admission decision.
+
+    A KNOWN-active owner gets its specific wording.  An UNOBSERVABLE owner gets
+    text that says so rather than claiming a run is stopping: the operator needs
+    to know the Run was refused because the GUI could not confirm the previous
+    run finished, which is a different (and log-worthy) situation."""
+    text = _RUN_OWNER_REFUSAL_STATUS.get(str(owner))
+    if text is not None:
+        return text
+    return (
+        'Could not confirm that the previous run finished (' + str(owner)
+        + ') — Run refused rather than risk starting over a live run. '
+        'See the log, then try again.'
+    )
+
+
 def _normalize_meta_ext(value):
     """Return the internal metadata mode; ``None`` means GUI metadata off."""
     if value is None:
@@ -1123,23 +1155,42 @@ class imageWrangler(wranglerWidget):
         """The host's ONE active/stopping predicate (§9.10 step 2 / §31.3 item 3).
 
         Returns an owner label (``run`` / ``wrangler`` / ``reintegration`` /
-        ``stitch``) or ``None``.  A holder without the host seam still gets the
-        wrangler-thread half, so the historical "previous run is still stopping"
-        refusal is preserved for headless/partial holders."""
+        ``stitch``, or a ``…-probe-error`` variant) or ``None`` when every present
+        owner was positively observed idle.
+
+        T-3.1 (§32.3 item 3) — this wrapper must not erase a failure either:
+
+        * the host predicate EXISTS but raises -> refuse.  Previously this fell
+          through to the wrangler-only probe, so a broken admission owner
+          silently narrowed the decision to one of its four owners;
+        * the wrangler-only fallback runs ONLY when the host does not expose the
+          shared predicate at all;
+        * a fallback probe that RAISES also refuses.
+
+        A fallback holder whose thread exposes no ``isRunning`` at all stays idle:
+        that is absence, not failure (the §32.3 item-2 partial-construction
+        carve-out), and it is the shape of the headless/duck-typed holders the
+        Start sentinels drive."""
         host = getattr(self, "_h19_host", None)
         predicate = getattr(host, "_controls_v2_active_run_owner", None)
         if callable(predicate):
             try:
                 return predicate()
             except Exception:
-                logger.debug("active run-owner predicate failed", exc_info=True)
+                logger.exception(
+                    "run-owner admission predicate failed; refusing Start "
+                    "rather than assuming every owner is idle")
+                return "admission-check-probe-error"
         probe = getattr(getattr(self, "thread", None), "isRunning", None)
-        if callable(probe):
-            try:
-                return "wrangler" if bool(probe()) else None
-            except Exception:
-                logger.debug("wrangler isRunning probe failed", exc_info=True)
-        return None
+        if not callable(probe):
+            return None
+        try:
+            return "wrangler" if bool(probe()) else None
+        except Exception:
+            logger.exception(
+                "wrangler isRunning probe failed; refusing Start rather than "
+                "assuming the worker is idle")
+            return "wrangler-probe-error"
 
     def _append_config_mismatch_details(self):
         scan = getattr(self, "scan", None)
@@ -1747,11 +1798,12 @@ class imageWrangler(wranglerWidget):
         """
         owner = imageWrangler._active_run_owner(self)
         if owner is not None:
+            # T-3.1: `owner` is now non-None for an UNOBSERVABLE owner too, so
+            # the refusal text distinguishes "still stopping" from "could not
+            # confirm".  Either way this returns before `_inputs_valid`, command
+            # mutation, the button morph, preparation, and `sigStart`.
             imageWrangler._safe_status_text(
-                self,
-                'Previous run is still stopping — try again in a moment.'
-                if owner in ("wrangler", "run") else
-                f'A {owner} run is still finishing — try again in a moment.')
+                self, _run_owner_refusal_status(owner))
             return
         # Validation, PONI adoption, and the Append-mismatch modal all run BEFORE
         # the freeze now: adoption must reach the frozen provenance (§10.5), and

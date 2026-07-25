@@ -4530,6 +4530,13 @@ def test_controls_panel_v2_run_commits_focused_integration_edit(qapp, monkeypatc
         def start(self):
             pass
 
+        # A real ``imageThread`` is a QThread, so it always answers the
+        # run-owner admission probe.  T-3.1 refuses a Start when a PRESENT
+        # owner cannot be observed, so this double must be faithful here or
+        # it would stand in for a broken Qt owner rather than an idle one.
+        def isRunning(self):
+            return False
+
     widget = staticWidget()
     try:
         widget._refresh_controls_v2_profile_now()
@@ -4601,6 +4608,13 @@ def test_controls_panel_v2_run_commits_focused_2d_points(qapp, monkeypatch):
 
         def start(self):
             pass
+
+        # A real ``imageThread`` is a QThread, so it always answers the
+        # run-owner admission probe.  T-3.1 refuses a Start when a PRESENT
+        # owner cannot be observed, so this double must be faithful here or
+        # it would stand in for a broken Qt owner rather than an idle one.
+        def isRunning(self):
+            return False
 
     widget = staticWidget()
     try:
@@ -4903,6 +4917,13 @@ def test_controls_panel_v2_mask_saturated_is_pushed_before_run_lock(qapp, monkey
 
         def start(self):
             pass
+
+        # A real ``imageThread`` is a QThread, so it always answers the
+        # run-owner admission probe.  T-3.1 refuses a Start when a PRESENT
+        # owner cannot be observed, so this double must be faithful here or
+        # it would stand in for a broken Qt owner rather than an idle one.
+        def isRunning(self):
+            return False
 
     widget = staticWidget()
     seen_at_disable = []
