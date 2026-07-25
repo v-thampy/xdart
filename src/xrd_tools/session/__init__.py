@@ -43,9 +43,13 @@ __all__ = [
     "FrozenThresholdPolicy",
     "FrozenSourceSpec",
     "FrozenRunConfiguration",
-    # GI theta-motor default policy (Qt-free, single source of truth):
+    # GI theta-motor policy (Qt-free, single source of truth).  `resolve_gi_motor`
+    # is THE motor-resolution decision (raw selection + choice knowledge ->
+    # effective motor); `pick_default_gi_motor` is the default-pick it delegates
+    # to.  GUI owners import the resolver rather than re-deriving the rule.
     "GI_MOTOR_PREFERENCE",
     "pick_default_gi_motor",
+    "resolve_gi_motor",
 ]
 
 _SCAN_SESSION_EXPORTS = {
@@ -83,6 +87,7 @@ _RUN_CONFIGURATION_EXPORTS = {
     "FrozenThresholdPolicy",
     "FrozenSourceSpec",
     "FrozenRunConfiguration",
+    "resolve_gi_motor",
 }
 
 

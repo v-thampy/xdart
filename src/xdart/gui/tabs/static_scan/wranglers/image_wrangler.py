@@ -1099,6 +1099,48 @@ class imageWrangler(wranglerWidget):
             )
             return None
 
+    def _candidate_processing_mapping(self):
+        """Processing mapping of the configuration this Run click would freeze.
+
+        Delegates to the host's PURE staging owner (§9.10 step 3-stage).  Returns
+        ``None`` when the host cannot offer one — Controls V2 off, a duck-typed
+        holder without the host seam, or a staging refusal (the ordinary Run
+        preparation then raises the typed refusal) — so the caller falls back to
+        the live display projection exactly as before."""
+        host = getattr(self, "_h19_host", None)
+        getter = getattr(
+            host, "_controls_v2_candidate_processing_mapping", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter()
+        except Exception:
+            logger.debug("candidate run configuration unavailable",
+                         exc_info=True)
+            return None
+
+    def _active_run_owner(self):
+        """The host's ONE active/stopping predicate (§9.10 step 2 / §31.3 item 3).
+
+        Returns an owner label (``run`` / ``wrangler`` / ``reintegration`` /
+        ``stitch``) or ``None``.  A holder without the host seam still gets the
+        wrangler-thread half, so the historical "previous run is still stopping"
+        refusal is preserved for headless/partial holders."""
+        host = getattr(self, "_h19_host", None)
+        predicate = getattr(host, "_controls_v2_active_run_owner", None)
+        if callable(predicate):
+            try:
+                return predicate()
+            except Exception:
+                logger.debug("active run-owner predicate failed", exc_info=True)
+        probe = getattr(getattr(self, "thread", None), "isRunning", None)
+        if callable(probe):
+            try:
+                return "wrangler" if bool(probe()) else None
+            except Exception:
+                logger.debug("wrangler isRunning probe failed", exc_info=True)
+        return None
+
     def _append_config_mismatch_details(self):
         scan = getattr(self, "scan", None)
         active_write_mode = getattr(self, "_active_write_mode", None)
@@ -1148,12 +1190,17 @@ class imageWrangler(wranglerWidget):
             # this run would append to, use its already-restored reduction config.
             processed = processing_config_from_scan(scan, prefer_stored=True)
 
-        run_configuration = getattr(self, "run_configuration", None)
-        if processed is None or (scan is None and run_configuration is None):
+        # §10.3: compare the processed target against the CANDIDATE configuration
+        # THIS Run click would freeze — never ``self.run_configuration``, which
+        # normally belongs to the PREVIOUS run (Append could then pass the pre-run
+        # gate and discover the mismatch inside the worker, after raw-data work).
+        # The candidate is a pure stage of the revisioned journal winners, so an
+        # accepted modal decision is still folded in before the single freeze.
+        candidate = imageWrangler._candidate_processing_mapping(self)
+        if processed is None or (scan is None and candidate is None):
             return None, None, None
-        if run_configuration is not None:
-            current = processing_config_from_mapping(
-                run_configuration.processing_mapping())
+        if candidate is not None:
+            current = processing_config_from_mapping(candidate)
         else:
             current = processing_config_from_scan(scan)
         check = append_config_mismatch_check(
@@ -1680,19 +1727,36 @@ class imageWrangler(wranglerWidget):
                     pass
 
     def start(self):
-        # Refuse to run without a valid PONI rather than re-running the stale
-        # previous scan.  Honors the Live/Batch mode toggles (no force-off).
-        host = getattr(self, "_h19_host", None)
-        prepare = getattr(
-            host, "_prepare_controls_v2_run_configuration", None)
-        if callable(prepare):
-            try:
-                prepare()
-            except Exception as exc:
-                logger.exception("could not freeze Controls run configuration")
-                imageWrangler._safe_status_text(
-                    self, f"Run configuration is invalid: {exc}")
-                return
+        """The composed Start boundary (O-1a-T3, §9.10 steps 2 and 5).
+
+        Exact order, and the order matters at every step::
+
+            refuse active/stopping        <- BEFORE any mutation whatsoever
+            -> validate + adopt calibration + Append modal on the CANDIDATE
+            -> harvest revision winners -> pure stage -> checked commit
+            -> ONE freeze -> publish that SAME frozen object to every owner
+            -> start
+
+        M2 / the r1 fast-Start defect: Stop morphs the button back to green
+        immediately, but the worker can take seconds to unwind (final flush,
+        bounded writer join).  A Start click in that window must not revive the
+        old run, and — the part r1 got wrong — must not consume a next-run edit,
+        adopt calibration, run the modal, freeze, or publish onto the live worker
+        BEFORE refusing.  So the refusal is FIRST, through the ONE predicate that
+        also covers integration/reintegration, stitch, and the host run latch.
+        """
+        owner = imageWrangler._active_run_owner(self)
+        if owner is not None:
+            imageWrangler._safe_status_text(
+                self,
+                'Previous run is still stopping — try again in a moment.'
+                if owner in ("wrangler", "run") else
+                f'A {owner} run is still finishing — try again in a moment.')
+            return
+        # Validation, PONI adoption, and the Append-mismatch modal all run BEFORE
+        # the freeze now: adoption must reach the frozen provenance (§10.5), and
+        # an accepted modal decision must be applied to the candidate rather than
+        # arriving after the run configuration was already frozen (§10.3/§10.4).
         if not self._inputs_valid():
             return
         if getattr(self, 'stitch_mode', False):
@@ -1704,17 +1768,18 @@ class imageWrangler(wranglerWidget):
                 '1d' if '1D' in self.ui.processingModeCombo.currentText()
                 else '2d')
             return
+        host = getattr(self, "_h19_host", None)
+        prepare = getattr(
+            host, "_prepare_controls_v2_run_configuration", None)
+        if callable(prepare):
+            try:
+                prepare()
+            except Exception as exc:
+                logger.exception("could not freeze Controls run configuration")
+                imageWrangler._safe_status_text(
+                    self, f"Run configuration is invalid: {exc}")
+                return
         self.command = 'start'
-        # M2: Stop morphs the button back to green immediately, but the worker
-        # can take seconds to unwind (final flush, bounded writer join).  A
-        # Start click in that window must NOT revive the old run — setting
-        # command='start' un-stops a loop that hasn't observed 'stop' yet,
-        # while thread.start() on a running QThread is a no-op, and setup()
-        # would mutate the LIVE worker's config mid-run.
-        if getattr(self.thread, 'isRunning', lambda: False)():
-            self._set_status_text(
-                'Previous run is still stopping — try again in a moment.')
-            return
         self.thread.command = 'start'
         self.ui.stopButton.setEnabled(True)
         self._set_action_button('running')   # morph green Start -> orange Pause

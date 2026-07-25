@@ -216,6 +216,9 @@ from xrd_tools.session.run_configuration import (
     GIIntent,
     RunIntent,
     ThresholdIntent,
+    # O-1a-T3: THE single GI incidence-motor resolution policy.  The GUI owns
+    # choice KNOWLEDGE only; it must never re-derive the substitution rule.
+    resolve_gi_motor,
 )
 from xrd_tools.sources.readiness import (
     capabilities_for_processed,
@@ -268,6 +271,22 @@ class DeferredRunEditsPendingError(RuntimeError):
     edit queued during the previous run could not be applied.  Raised by
     ``_prepare_controls_v2_run_configuration`` and surfaced to the operator by
     ``imageWrangler.start()``; no ``FrozenRunConfiguration`` is produced."""
+
+
+class RunOwnerActiveError(RuntimeError):
+    """O-1a-T3 (§9.10 step 2): Run preparation refuses because a run owner is
+    active or still stopping.
+
+    The ONE production predicate (:meth:`staticWidget._controls_v2_active_run_owner`)
+    covers the wrangler worker thread, integration/reintegration, stitch, and the
+    host run-state latch.  Raised by the DEFENSIVE check inside
+    ``_prepare_controls_v2_run_configuration`` so every caller fails CLOSED: no
+    edit is consumed, no ``FrozenRunConfiguration`` is produced, and nothing in
+    the refusal preservation set (RunIntent, display projection, legacy
+    parameters, journal, wrangler/thread frozen carriers, source owner/index,
+    generation, fingerprint) is touched.  ``imageWrangler.start()`` refuses at
+    its TOP through the same predicate, so this error is the backstop, not the
+    ordinary user-visible path."""
 
 
 class ControlsTransactionError(Exception):
@@ -2666,24 +2685,36 @@ class staticWidget(QWidget):
                 motor = "Manual"
             except (TypeError, ValueError):
                 motor = str(motor)
-                # A stale/legacy incidence motor carried on the scan (notably the
-                # 'th' default from LiveScan) that is NOT one of the loaded
-                # source's real motors must not be shown — fall to the shared
-                # default policy over the actual choices.  A genuine saved motor
-                # (a real gi_config or an explicit user pick) is kept as-is even
-                # when the source's motor list is not yet populated; but an
-                # unverifiable, non-explicit leftover ('th' with no motors listed)
-                # must still resolve to the default (Manual with no choices) so it
-                # can never surface as a phantom selection (R4B-15).
+                # O-1a-T3: ONE motor-resolution policy.  This owner used to
+                # RE-DERIVE the "stored motor is not one of the source's real
+                # motors -> repick the default" rule locally; that duplicate is
+                # deleted and the decision now belongs to the shared
+                # ``xrd_tools.session.resolve_gi_motor`` (the same policy the
+                # freeze uses, so the θ-motor surfaces and the frozen run cannot
+                # disagree).  What this GUI owner still contributes is choice
+                # KNOWLEDGE, and the ()-vs-None distinction is the whole point
+                # (§12.5):
+                #
+                #   tuple  the dropdown offers real motors -> resolve against them
+                #   ()     probed and genuinely empty -> an unverifiable,
+                #          non-explicit leftover ('th' from LiveScan) resolves to
+                #          Manual, so it can never surface as a phantom
+                #          selection (R4B-15)
+                #   None   knowledge UNKNOWN (nothing offered yet) for an
+                #          EXPLICIT user pick -> honor it rather than silently
+                #          degrade the operator's visible choice to Manual
                 if motor != "Manual":
-                    choices = self._controls_v2_native_int_choices().get(
-                        ("GI", "th_motor"), ())
                     real_choices = tuple(
-                        item for item in choices if str(item) != "Manual")
+                        item for item in
+                        self._controls_v2_native_int_choices().get(
+                            ("GI", "th_motor"), ())
+                        if str(item) != "Manual")
                     explicit = bool(
                         getattr(self, "_controls_v2_gi_selection_explicit", False))
-                    if motor not in choices and (real_choices or not explicit):
-                        motor = self._controls_v2_default_gi_motor()
+                    motor = resolve_gi_motor(
+                        motor,
+                        real_choices if (real_choices or not explicit) else None,
+                    )
         sample_orientation = gi_intent.sample_orientation
         tilt_angle = gi_intent.tilt_angle
         return {
@@ -3552,13 +3583,78 @@ class staticWidget(QWidget):
                          exc_info=True)
             return None
 
+    def _controls_v2_candidate_processing_mapping(self):
+        """The processing mapping of the configuration the NEXT Run would freeze.
+
+        §10.3: the pre-run Append-mismatch gate must compare the processed target
+        against the CANDIDATE this click will freeze — never
+        ``wrangler.run_configuration``, which normally belongs to the PREVIOUS
+        run.  This is a PURE read: the revisioned journal winners are staged onto
+        a CLONE through the trusted staging owner and the CLONE is frozen, so no
+        production carrier is written and the live intent's generation is not
+        consumed (§10.7 — "throwaway" describes ownership, not side-effect
+        freedom).
+
+        Returns ``None`` when Controls V2 is inactive or staging refuses; the
+        caller then falls back to the live display projection and the ordinary
+        Run preparation surfaces the typed refusal.
+        """
+        if not self._controls_v2_enabled():
+            return None
+        try:
+            staged = self.stage_controls_transaction(
+                self._controls_v2_journal_winners())
+            if isinstance(staged, ControlsTransactionError):
+                return None
+            candidate = staged.staged_intent
+            choices = (
+                staged.gi_motor_observation.choices_for_freeze()
+                if getattr(staged, "gi_motor_observation", None) is not None
+                else self._controls_v2_gi_motor_choices_for_freeze())
+            return candidate.freeze(
+                gi_motor_choices=choices).processing_mapping()
+        except Exception:
+            logger.debug("candidate processing mapping unavailable",
+                         exc_info=True)
+            return None
+
     def _prepare_controls_v2_run_configuration(
         self,
     ) -> FrozenRunConfiguration | None:
-        """Freeze the next run before validation touches mutable GUI state."""
+        """Harvest, stage, commit, and freeze the next run — exactly once.
+
+        §9.10 step 5 order: the caller has already refused an active/stopping
+        Start, so by here the sequence is harvest revision winners -> pure stage
+        -> checked commit -> ONE freeze -> publish that SAME frozen object to
+        every run owner.  The DEFENSIVE step-2 check below repeats the refusal
+        for any other caller so no path can freeze onto a live run."""
 
         if not self._controls_v2_enabled():
             return None
+        # §9.10 step 2 (defensive half): refuse BEFORE the harvest, so an active
+        # or stopping owner leaves the RunIntent, display projection, legacy
+        # parameters, journal, wrangler/thread carriers, source owner/index,
+        # generation, and fingerprint all untouched, and no frozen object is
+        # produced or published.  ``imageWrangler.start()`` refuses at its TOP
+        # through the SAME predicate; this is the backstop for every other
+        # caller, and it fails CLOSED (typed) rather than returning None, which a
+        # run path would read as "nothing to configure".
+        _owner = self._controls_v2_active_run_owner()
+        if _owner is not None:
+            run_config_debug_log(
+                logger,
+                "run_prepare_refused_active_owner",
+                widget=self,
+                origin="controls_v2_prepare",
+                phase="precondition",
+                reason=f"{_owner} owner is active or stopping",
+                owner=_owner,
+                level="warning",
+            )
+            raise RunOwnerActiveError(
+                f"a {_owner} run is active or still stopping — Run not started;"
+                " no configuration was changed"
+            )
         # T-1 (§9.10 steps 1 + 3-stage): harvest the revisioned edit journal
         # (deferred + idle + correction) PLUS any in-progress panel form edit
         # (journaled edits win over the stale panel snapshot), pure-stage them
@@ -3663,6 +3759,21 @@ class staticWidget(QWidget):
         _reparsed_poni_values = self._controls_v2_poni_values_for(intent.poni_file)
         if _reparsed_poni_values is not None:
             intent.poni_values = _reparsed_poni_values
+        elif not intent.poni_file:
+            # §10.5 (adoption half): a calibration ADOPTED from a loaded processed
+            # scan (``_adopt_loaded_scan_run_inputs``, which now runs BEFORE this
+            # freeze) has no .poni PATH, so its identity is its VALUES — read them
+            # off the live calibration object through the production ``PONI``'s own
+            # ``to_dict``.  Without this the run executes WITH the adopted
+            # calibration while the frozen provenance claims it has none.
+            _adopted = getattr(wrangler, "poni", None)
+            _adopted_to_dict = getattr(_adopted, "to_dict", None)
+            if callable(_adopted_to_dict):
+                try:
+                    intent.poni_values = dict(_adopted_to_dict())
+                except Exception:
+                    logger.debug("adopted PONI values unavailable",
+                                 exc_info=True)
         intent.mask_file = str(
             self._controls_v2_param_value(("Signal", "mask_file")) or "")
         intent.project_root = str(
@@ -3683,6 +3794,10 @@ class staticWidget(QWidget):
         # not populated so an explicit motor is honored, never degraded to Manual.
         frozen = intent.freeze(
             gi_motor_choices=self._controls_v2_gi_motor_choices_for_freeze())
+        # §9.10 step 5: ONE freeze, then publish THAT object.  The pending slot
+        # hands this exact identity to the run owner that adopts it and is
+        # cleared on adoption, so no later consumer can inherit a previous
+        # click's configuration.
         self._pending_controls_v2_run_configuration = frozen
         if wrangler is not None:
             wrangler.run_configuration = frozen
@@ -3696,7 +3811,13 @@ class staticWidget(QWidget):
         self,
         run_configuration: FrozenRunConfiguration | None = None,
     ) -> dict:
-        """Apply exactly one frozen Controls configuration to every run owner."""
+        """Apply exactly one frozen Controls configuration to every run owner.
+
+        The pending slot is consumed EXACTLY ONCE: it is cleared as soon as a run
+        owner adopts it, so a configuration frozen for an earlier click can never
+        be the one a later consumer runs (the r1 stale-pending defect).  With the
+        slot empty the run re-prepares from the LIVE intent, which is also what
+        keeps every non-run consumer on the live state."""
 
         if run_configuration is None:
             run_configuration = getattr(
@@ -3705,6 +3826,9 @@ class staticWidget(QWidget):
             run_configuration = self._prepare_controls_v2_run_configuration()
         if not isinstance(run_configuration, FrozenRunConfiguration):
             return {}
+        if (getattr(self, "_pending_controls_v2_run_configuration", None)
+                is run_configuration):
+            self._pending_controls_v2_run_configuration = None
 
         self._controls_v2_apply_run_configuration_to_scan(run_configuration)
         self._push_threshold_to_wrangler(run_configuration)
@@ -12015,6 +12139,65 @@ class staticWidget(QWidget):
             bool(getattr(self, '_run_active', False))
             or self._session_run_active()
         )
+
+    @staticmethod
+    def _controls_v2_owner_thread_running(thread) -> bool:
+        """``isRunning()`` on ONE run-owner thread, guarded for partial holders.
+
+        Deliberately NOT phase-qualified (unlike :meth:`_wrangler_run_active`,
+        which exists to keep CONTROLS locked): a worker that is still unwinding
+        after Stop reads ``isRunning()`` True while its phase/latch already read
+        idle, and that window is exactly what a Start must refuse (§9.10 step 2 /
+        the r1 fast-Start defect).
+        """
+        if thread is None:
+            return False
+        probe = getattr(thread, 'isRunning', None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe())
+        except Exception:
+            logger.debug("run-owner isRunning probe failed", exc_info=True)
+            return False
+
+    def _controls_v2_active_run_owner(self) -> str | None:
+        """THE production active/stopping predicate for Start admission (§9.10
+        step 2 / §31.3 item 3).
+
+        Returns the label of the first owner found active or stopping, or
+        ``None`` when every owner is idle.  The four owners, in refusal-report
+        order:
+
+        ``run``
+            the host run-state latch (``_run_active``) or an open streaming
+            session that reports it is running;
+        ``wrangler``
+            the acquisition/reduction worker thread, INCLUDING its post-Stop
+            unwind window;
+        ``reintegration``
+            the integrator thread (integration and reintegration share it);
+        ``stitch``
+            the one-shot stitch worker.
+
+        This is the single owner of that question: ``imageWrangler.start()``
+        consults it at its TOP and ``_prepare_controls_v2_run_configuration``
+        consults it defensively.  It reads only activity state — it mutates
+        nothing, so a refusal cannot disturb the preservation set.
+        """
+        if self._controls_v2_run_active():
+            return "run"
+        if self._controls_v2_owner_thread_running(
+                getattr(getattr(self, 'wrangler', None), 'thread', None)):
+            return "wrangler"
+        if self._controls_v2_owner_thread_running(
+                getattr(getattr(self, 'integratorTree', None),
+                        'integrator_thread', None)):
+            return "reintegration"
+        if self._controls_v2_owner_thread_running(
+                getattr(self, 'stitch_thread', None)):
+            return "stitch"
+        return None
 
     def _wrangler_run_active(self) -> bool:
         """True when the wrangler is in an actual acquisition/reduction run.
