@@ -31,6 +31,7 @@ from xrd_tools.session.readiness import (
 # same parser the SSRL reader uses, so the UI's existence check stays
 # in sync with what ``read_image_metadata`` will actually look for.
 from xrd_tools.io.metadata import _extract_scan_info
+from xrd_tools.session.run_configuration import RunConfigurationRefused
 from .wrangler_widget import GIMotorHydration, wranglerWidget
 from .image_wrangler_thread import imageThread, _get_scan_info  # noqa: F401
 from .ui.specUI import Ui_Form
@@ -1820,17 +1821,21 @@ class imageWrangler(wranglerWidget):
                 '1d' if '1D' in self.ui.processingModeCombo.currentText()
                 else '2d')
             return
-        host = getattr(self, "_h19_host", None)
-        prepare = getattr(
-            host, "_prepare_controls_v2_run_configuration", None)
-        if callable(prepare):
-            try:
-                prepare()
-            except Exception as exc:
-                logger.exception("could not freeze Controls run configuration")
-                imageWrangler._safe_status_text(
-                    self, f"Run configuration is invalid: {exc}")
-                return
+        # O-1a-W1A: the frozen configuration is MANDATORY on the run path.  It is
+        # produced here, before any command/button/session/source/output/worker
+        # side effect, and absence or a foreign result is a typed refusal — never
+        # a fall back to display state (W-1.2 case 5).
+        try:
+            imageWrangler._admit_run_configuration(self, "image-start")
+        except RunConfigurationRefused as exc:
+            imageWrangler._report_run_configuration_refusal(
+                self, exc, origin="image_wrangler_start")
+            return
+        except Exception as exc:
+            logger.exception("could not freeze Controls run configuration")
+            imageWrangler._safe_status_text(
+                self, f"Run configuration is invalid: {exc}")
+            return
         self.command = 'start'
         self.thread.command = 'start'
         self.ui.stopButton.setEnabled(True)
@@ -1984,16 +1989,6 @@ class imageWrangler(wranglerWidget):
         if current != target:
             param.setOpts(visible=target)
 
-    @staticmethod
-    def _safe_status_text(obj, text):
-        setter = getattr(obj, '_set_status_text', None)
-        if callable(setter):
-            setter(text)
-            return
-        label = getattr(getattr(obj, 'ui', None), 'specLabel', None)
-        set_text = getattr(label, 'setText', None)
-        if callable(set_text):
-            set_text(text)
 
     def _apply_disclosure(self):
         """N1 progressive disclosure (design §2): the tree reveals in stages —

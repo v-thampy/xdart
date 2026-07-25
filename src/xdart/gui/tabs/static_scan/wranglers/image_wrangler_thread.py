@@ -165,6 +165,10 @@ from xrd_tools.reduction import (
     prepare_gi_freeze,
 )
 from xrd_tools.session import FrameRecordStore
+from xrd_tools.session.run_configuration import (
+    RunConfigurationRefused,
+    require_run_configuration,
+)
 from xrd_tools.session.readiness import (
     AppendConfigMismatchError,
     append_config_difference_lines,
@@ -185,6 +189,7 @@ from xrd_tools.io.metadata import read_image_metadata
 from xdart.utils import get_series_avg
 from xdart.utils.h5pool import get_pool as _get_h5pool
 from xdart.modules.reduction import (
+    apply_frozen_run_configuration as _apply_frozen_run_configuration,
     freeze_live_scan_gi_ranges,
     frame_from_live_frame,
     open_live_reduction_session,
@@ -688,8 +693,15 @@ class imageThread(wranglerThread):
         # imageThread only needs to set the spec-specific extras here.
         self.max_cores = max_cores
         self.command = command
+        # The mutable DISPLAY scan.  Retained ONLY as the target of the backward
+        # GI-mode acquisition projection (``_project_gi_modes_onto_display_scan``);
+        # it is never a run-configuration source (W-1.2 case 12).
         self.scan = scan
+        # The ONE accepted frozen run configuration, published by the wrapper at
+        # admission, plus the accepted-generation watermark that makes a
+        # superseded object a typed refusal instead of a silent stale run.
         self.run_configuration = None
+        self.run_configuration_floor = 0
         # H19: supplied by the mounted Source card immediately before Run.
         # Both are value/headless boundaries; the mutable DirectoryIndex stays
         # owned by DirectoryIndexSession's serialized executor.
@@ -770,6 +782,41 @@ class imageThread(wranglerThread):
         self.files_processed_by_output = {}
         self._last_files_processed_by_output = {}
 
+    # ── The accepted run configuration (O-1a-W1A) ────────────────────────
+
+    def _require_run_configuration(self, stage):
+        """Return the ONE accepted frozen configuration, or refuse (typed).
+
+        After admission the frozen configuration is the sole run-configuration
+        authority: absence, a foreign carrier, or a generation superseded by a
+        later accepted click is a typed refusal, never a fall back to the
+        mutable display scan or to a panel-derived thread mirror.
+        """
+
+        return require_run_configuration(
+            getattr(self, "run_configuration", None),
+            stage=stage,
+            floor=int(getattr(self, "run_configuration_floor", 0) or 0),
+        )
+
+    def _project_gi_modes_onto_display_scan(self):
+        """Backward GI-mode write onto the mutable DISPLAY scan (retained).
+
+        This is an acquisition/display projection ONLY: the browser's scan shows
+        the GI axis modes this run is producing.  It is deliberately NOT a run
+        input -- the worker builds its per-run scan from the frozen
+        configuration, so nothing written here can reach the run, the plan, or
+        the written provenance (W-1.2 case 11).
+        """
+
+        if not self.gi:
+            return
+        scan = getattr(self, "scan", None)
+        if scan is None:
+            return
+        scan.bai_1d_args['gi_mode_1d'] = self.gi_mode_1d
+        scan.bai_2d_args['gi_mode_2d'] = self.gi_mode_2d
+
     # ── Main entry point ─────────────────────────────────────────────────
 
     def run(self):
@@ -777,6 +824,20 @@ class imageThread(wranglerThread):
         parent or signals from the process.
         """
         t0 = time.time()
+        # W-1.2 case 5: refuse BEFORE any stateful operation of this run.  A
+        # worker without the accepted configuration performs no source read, no
+        # output open, no cache clear and no reduction -- it returns, and the
+        # ordinary finish delivery unwinds the run state.
+        try:
+            self._require_run_configuration("image-worker-run")
+        except RunConfigurationRefused as exc:
+            logger.error("run refused: %s", exc)
+            self.command = 'stop'
+            try:
+                self.showLabel.emit(f"Run refused: {exc}")
+            except Exception:
+                logger.debug("showLabel emit failed for refusal", exc_info=True)
+            return
         if (self.poni is None
                 or (self.img_file == ''
                     and not self._directory_source_armed())):
@@ -921,10 +982,7 @@ class imageThread(wranglerThread):
             self.detector_shape = None
         self._cached_gi_incident_angle = None
 
-        # Sync GI mode selections from image_wrangler into scan.bai_*_args
-        if self.gi:
-            self.scan.bai_1d_args['gi_mode_1d'] = self.gi_mode_1d
-            self.scan.bai_2d_args['gi_mode_2d'] = self.gi_mode_2d
+        self._project_gi_modes_onto_display_scan()
 
         try:
             self.process_scan()
@@ -996,7 +1054,10 @@ class imageThread(wranglerThread):
             logger.info('Output (XYE) folder: %s\n',
                         os.path.join(self.h5_dir, self.scan_name))
         else:
-            output_path = getattr(self, 'fname', None) or getattr(self.scan, 'data_file', None)
+            # THIS run's own output path (``initialize_scan`` set it).  The old
+            # display-scan fallback is deleted: the browser's scan may point at a
+            # completely different file by the time a run ends.
+            output_path = getattr(self, 'fname', None)
             if output_path:
                 logger.info('Output file: %s\n', output_path)
 
@@ -1209,7 +1270,8 @@ class imageThread(wranglerThread):
             source_cache[key] = None
             return cache[key]
 
-        require_2d = not bool(getattr(self.scan, "skip_2d", False))
+        frozen = self._require_run_configuration("append-cursor")
+        require_2d = not bool(frozen.skip_2d)
         memo = getattr(self, "_append_cursor_memo", None)
         if memo is None:
             memo = self._append_cursor_memo = {}
@@ -1266,7 +1328,8 @@ class imageThread(wranglerThread):
                     )
                     while len(memo) > _APPEND_CURSOR_MEMO_LIMIT:
                         memo.pop(next(iter(memo)))
-            current_config = processing_config_from_scan(self.scan)
+            current_config = processing_config_from_mapping(
+                frozen.processing_mapping())
             append_check = append_config_mismatch_check(
                 self.write_mode, processed_config, current_config)
             if not append_check.ok:
@@ -5477,7 +5540,19 @@ class imageThread(wranglerThread):
     def initialize_scan(self):
         """If scan changes, initialize new LiveScan object.
         If mode is overwrite, replace existing HDF5 file, else append to it.
+
+        O-1a-W1A: the per-run ``LiveScan`` is built ENTIRELY from the accepted
+        frozen configuration -- ``frozen.scan_kwargs()`` for every integration /
+        GI / threshold value, ``frozen.processing_mapping()`` for the Append
+        comparison -- and carries the exact accepted object plus its detached
+        JSON-native provenance projection BEFORE any writer opens.  The mutable
+        display scan and the panel-derived thread mirrors are not read here.
         """
+        # This is the last checkpoint before a writer can open, so the typed
+        # refusal happens BEFORE the output-safety probe, the mkdir, and any
+        # source read (W-1.2 case 5).
+        frozen = self._require_run_configuration("initialize_scan")
+        scan_kwargs = frozen.scan_kwargs()
         fname = os.path.join(self.h5_dir, self.scan_name + '.nxs')
         # F-NXS-1: refuse to (over)write when the derived output collides with a
         # raw source — Save Path == the watched raw directory makes source ==
@@ -5503,16 +5578,19 @@ class imageThread(wranglerThread):
         scan = LiveScan(self.scan_name,
                           data_file=fname,
                           static=True,
-                          gi=self.gi,
-                          incidence_motor=self.incidence_motor,
+                          gi=bool(scan_kwargs["gi"]),
+                          incidence_motor=scan_kwargs["incidence_motor"],
+                          # acquisition shape, not run configuration: how frames
+                          # arrive from THIS source, never a Controls value.
                           series_average=self.series_average,
                           single_img=self.single_img,
                           global_mask=self.mask,
                           detector_shape=self.detector_shape,
                           # J2: share lock with wrangler save path
                           file_lock=self.file_lock,
-                          **self.scan_args)
-        scan.skip_2d = self.scan.skip_2d
+                          bai_1d_args=scan_kwargs["bai_1d_args"],
+                          bai_2d_args=scan_kwargs["bai_2d_args"])
+        _apply_frozen_run_configuration(scan, frozen)
         # N1: the project root -> entry/@source_base + relative raw source paths
         # in the writer (portable .nxs).  None -> absolute paths (back-compat).
         scan.source_base = getattr(self, "source_base", None)
@@ -5547,9 +5625,13 @@ class imageThread(wranglerThread):
                     if write_mode == 'Append':
                         # v2 NeXus loader (the only one we support now).
                         scan.load_from_h5(replace=False, mode='r')
+                        # the PROCESSED target's own stored configuration (read
+                        # off the file just loaded into the per-run scan) versus
+                        # the ACCEPTED run -- never the display scan.
                         processed_config = processing_config_from_scan(
                             scan, prefer_stored=True)
-                        current_config = processing_config_from_scan(self.scan)
+                        current_config = processing_config_from_mapping(
+                            frozen.processing_mapping())
                         append_check = append_config_mismatch_check(
                             write_mode, processed_config, current_config)
                         if not append_check.ok:
@@ -5566,8 +5648,14 @@ class imageThread(wranglerThread):
                                 processed_config,
                                 current_config,
                             )
-                        scan.skip_2d = self.scan.skip_2d
-                        for (k, v) in self.scan_args.items():
+                        # ``load_from_h5`` restored the TARGET file's stored
+                        # configuration onto the per-run scan.  Re-assert the
+                        # accepted run: the run integrates with what the operator
+                        # accepted at this click, not with what the file was
+                        # written with (the mismatch check above already refused
+                        # an incompatible target).
+                        _apply_frozen_run_configuration(scan, frozen)
+                        for (k, v) in frozen.scan_args().items():
                             setattr(scan, k, v)
                         self._remember_append_skip_snapshot(scan.name, scan=scan)
                         existing_frames = list(scan.frames.index)
@@ -5595,14 +5683,10 @@ class imageThread(wranglerThread):
                     else:
                         scan.save_to_nexus(replace=True)
 
-        # Copy integration args (including GI modes) from the main scan.
-        scan.bai_1d_args = self.scan.bai_1d_args.copy()
-        scan.bai_2d_args = self.scan.bai_2d_args.copy()
-
         self.sigUpdateFile.emit(
             self.scan_name, fname,
-            self.gi, self.incidence_motor, self.single_img,
-            self.series_average
+            bool(scan_kwargs["gi"]), scan_kwargs["incidence_motor"],
+            self.single_img, self.series_average
         )
         logger.info('***** New Scan *****')
         if self.xye_only:

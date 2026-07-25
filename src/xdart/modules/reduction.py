@@ -266,24 +266,77 @@ def compute_bad_pixel_mask(raw_image, *, mask_saturation: bool = True,
     return idx if idx.size else None
 
 
+def apply_frozen_run_configuration(live_scan: Any, run_configuration: Any) -> Any:
+    """Project one accepted run configuration onto the run's OWN ``LiveScan``.
+
+    O-1a-W1A: this is the single run-side projection owner.  It writes only
+    values the frozen configuration owns, attaches the EXACT accepted object
+    (identity, not a copy) plus its ``(generation, fingerprint)``, and attaches
+    the detached JSON-native writer projection -- all BEFORE the caller opens any
+    output, so the very first written file already carries the run identity.
+
+    The GUI's display projection (``staticWidget._controls_v2_apply_run_configuration_to_scan``)
+    is the DISPLAY-side counterpart: it writes the browser's shared scan in place
+    under ``scan_lock``.  Both derive from the same frozen object, so there is one
+    authority; only the target and the locking differ.
+    """
+
+    scan = live_scan
+    scan.skip_2d = bool(run_configuration.skip_2d)
+    scan.gi_config = run_configuration.gi.scan_config()
+    scan.sample_orientation = int(run_configuration.gi.sample_orientation)
+    scan.tilt_angle = float(run_configuration.gi.tilt_angle)
+    scan.th_mtr = run_configuration.gi.scan_incidence_motor
+    scan.max_cores = int(run_configuration.max_cores)
+    threshold = run_configuration.threshold
+    scan.apply_threshold = bool(threshold.apply_threshold)
+    scan.threshold_min = threshold.threshold_min
+    scan.threshold_max = threshold.threshold_max
+    scan.mask_sentinel = bool(threshold.mask_saturation)
+    scan.run_configuration = run_configuration
+    scan.run_configuration_generation = int(run_configuration.generation)
+    scan.run_configuration_fingerprint = run_configuration.fingerprint
+    scan.run_configuration_provenance = run_configuration.as_provenance()
+    return scan
+
+
 def plan_from_live_scan(
     live_scan: Any,
     *,
     integrate_1d: bool = True,
     integrate_2d: bool | None = None,
     gi_incident_angle: float | None = None,
+    run_configuration: Any = None,
 ) -> ReductionPlan:
     """Create a ``ReductionPlan`` using xdart's current live scan settings.
 
     Note: ``chunk_size`` and other execution-policy knobs live on
     :func:`run_reduction` (and on :func:`reduce_live_frame` by way of
     the single-frame call here), not on the plan itself.
-    """
-    if integrate_2d is None:
-        integrate_2d = not bool(getattr(live_scan, "skip_2d", False))
 
-    args_1d = dict(getattr(live_scan, "bai_1d_args", {}) or {})
-    args_2d = dict(getattr(live_scan, "bai_2d_args", {}) or {})
+    O-1a-W1A: a scan produced by an ADMITTED processing run carries the exact
+    accepted ``FrozenRunConfiguration`` (``scan.run_configuration``), and that
+    object -- not the mutable scan projection -- is then the integration
+    authority.  A reloaded/reintegrated scan carries none by construction, so it
+    keeps reading its own restored settings; the run path never reaches here
+    without one, because the worker refuses first.
+    """
+    frozen = run_configuration
+    if frozen is None:
+        frozen = getattr(live_scan, "run_configuration", None)
+    if frozen is not None and not hasattr(frozen, "processing_mapping"):
+        frozen = None
+    if integrate_2d is None:
+        integrate_2d = not bool(
+            frozen.skip_2d if frozen is not None
+            else getattr(live_scan, "skip_2d", False))
+
+    if frozen is not None:
+        args_1d = dict(frozen.bai_1d_args)
+        args_2d = dict(frozen.bai_2d_args)
+    else:
+        args_1d = dict(getattr(live_scan, "bai_1d_args", {}) or {})
+        args_2d = dict(getattr(live_scan, "bai_2d_args", {}) or {})
     unit_1d = _pop_first(args_1d, ("unit",), None)
     unit_2d = _pop_first(args_2d, ("unit",), None)
     method_1d = str(_pop_first(args_1d, ("method",), "csr"))
@@ -320,16 +373,22 @@ def plan_from_live_scan(
     _pop_first(args_1d, ("normalization_factor",), None)
     _pop_first(args_2d, ("normalization_factor",), None)
 
-    is_gi = bool(getattr(live_scan, "gi", False))
+    is_gi = bool(frozen.gi.enabled if frozen is not None
+                 else getattr(live_scan, "gi", False))
     # Reintegrate-on-reload: a .nxs-reloaded scan carries its GI geometry only in
     # ``scan.gi_config`` — a live run sets the direct attrs via
     # ``sync_live_scan_gi_settings``, but a reload restores only the dict.  Fall
     # back to it so reintegrate uses the SAME sample_orientation / tilt as live;
     # otherwise sample_orientation silently defaults to 1 and the GI out-of-plane
-    # (Q_oop) axis flips sign vs the live run.
-    _gi_cfg = dict(getattr(live_scan, "gi_config", {}) or {})
+    # (Q_oop) axis flips sign vs the live run.  An ADMITTED run has one authority
+    # instead: the accepted frozen GI configuration.
+    _gi_cfg = dict(frozen.gi.scan_config() if frozen is not None
+                   else (getattr(live_scan, "gi_config", {}) or {}))
 
     def _gi_geom(attr, default):
+        if frozen is not None:
+            v = _gi_cfg.get(attr)
+            return default if v is None else v
         v = getattr(live_scan, attr, None)
         if v is None:
             v = _gi_cfg.get(attr)
@@ -349,7 +408,8 @@ def plan_from_live_scan(
         _strip_nonstandard_args(args_2d)
     if is_gi and gi_incident_angle is None:
         gi_incident_angle = getattr(live_scan, "_cached_fiber_integrator_angle", None)
-    incidence_motor = getattr(live_scan, "incidence_motor", None)
+    incidence_motor = (frozen.gi.scan_incidence_motor if frozen is not None
+                       else getattr(live_scan, "incidence_motor", None))
     if is_gi and gi_incident_angle is None and incidence_motor is not None:
         try:
             gi_incident_angle = resolve_incident_angle({}, incidence_motor)
@@ -1134,6 +1194,7 @@ def _gi_2d_unit_default(unit: Any, mode: str, *, is_gi: bool) -> str:
 
 __all__ = [
     "StandardPlanCache",
+    "apply_frozen_run_configuration",
     "frame_from_live_frame",
     "scan_from_live_scan",
     "plan_from_live_scan",

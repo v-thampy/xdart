@@ -43,6 +43,8 @@ __all__ = [
     "FrozenThresholdPolicy",
     "FrozenSourceSpec",
     "FrozenRunConfiguration",
+    "RunConfigurationRefused",
+    "require_run_configuration",
     # GI theta-motor policy (Qt-free, single source of truth).  `resolve_gi_motor`
     # is THE motor-resolution decision (raw selection + choice knowledge ->
     # effective motor); `pick_default_gi_motor` is the default-pick it delegates
@@ -87,6 +89,8 @@ _RUN_CONFIGURATION_EXPORTS = {
     "FrozenThresholdPolicy",
     "FrozenSourceSpec",
     "FrozenRunConfiguration",
+    "RunConfigurationRefused",
+    "require_run_configuration",
     "resolve_gi_motor",
 }
 

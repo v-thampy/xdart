@@ -8693,6 +8693,31 @@ def test_reintegrate_publish_updates_publication_store_not_legacy_raw_mirror():
     assert len(_hydrated_order(viewer_rows_2d)) == 8
 
 
+def _accepted_run_configuration_owner(*, gi=False, bai_1d_args=None,
+                                      bai_2d_args=None, skip_2d=False):
+    """A Controls owner that freezes ONE REAL run configuration per Run click.
+
+    O-1a-W1A: the frozen configuration is mandatory on the run path, so a Start
+    host without an accepted configuration is a typed refusal.  ``RunIntent`` and
+    ``freeze()`` here are the PRODUCTION value type and the production freeze --
+    only the surrounding Controls panel is ducked, exactly as this host already
+    ducks the parameter tree and the Qt widgets.
+    """
+    from xrd_tools.session import RunIntent
+    from xrd_tools.session.run_configuration import GIIntent
+
+    intent = RunIntent(
+        processing_mode="Int 1D" if skip_2d else "Int 2D",
+        bai_1d_args=dict(bai_1d_args if bai_1d_args is not None
+                         else {"unit": "q_A^-1"}),
+        bai_2d_args=dict(bai_2d_args if bai_2d_args is not None
+                         else {"unit": "q_A^-1"}),
+        gi=GIIntent(enabled=bool(gi)),
+    )
+    return SimpleNamespace(
+        _prepare_controls_v2_run_configuration=intent.freeze)
+
+
 def _wrangler_host(mode_text, *, live=False, batch=False):
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
 
@@ -8737,6 +8762,10 @@ def _wrangler_host(mode_text, *, live=False, batch=False):
             setattr(host, "_integration_controls_enabled", enabled),
         ),
     )
+    host.command = None
+    host.run_configuration = None
+    host.run_configuration_floor = 0
+    host._h19_host = _accepted_run_configuration_owner()
     host._on_mode_changed = MethodType(imageWrangler._on_mode_changed, host)
     host._apply_disclosure = MethodType(imageWrangler._apply_disclosure, host)
     host._adopt_loaded_scan_run_inputs = MethodType(
@@ -8833,6 +8862,11 @@ def _append_modal_host(tmp_path, *, raw_name="scan_0001.tif",
         frame_count=frame_count,
     )
     host._controls = _FakeRunControls("Append")
+    host._h19_host = _accepted_run_configuration_owner(
+        gi=current_gi,
+        bai_1d_args=dict(host.scan.bai_1d_args),
+        bai_2d_args=dict(host.scan.bai_2d_args),
+    )
     return host
 
 
@@ -8864,6 +8898,11 @@ def _append_cold_target_host(tmp_path, *, raw_name="scan_0001.tif",
         skip_2d=False,
     )
     host._controls = _FakeRunControls("Append")
+    host._h19_host = _accepted_run_configuration_owner(
+        gi=current_gi,
+        bai_1d_args=dict(current_1d),
+        bai_2d_args=dict(current_2d),
+    )
     return host, target
 
 

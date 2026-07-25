@@ -74,6 +74,15 @@ def build_reduction_config(
         if geom is not None:
             config["geometry"] = _geometry_config(geom)
 
+    # O-1a-W1A: the accepted run configuration, as the detached JSON-native
+    # projection the run owner attached to this scan BEFORE the output opened.
+    # Additive and value-only -- this function never reaches back to the GUI or
+    # re-derives the projection, and a scan without one writes nothing new.
+    run_configuration = getattr(scan, "run_configuration_provenance", None) \
+        if scan is not None else None
+    if isinstance(run_configuration, Mapping) and run_configuration:
+        config["run_configuration"] = dict(run_configuration)
+
     return config, (_inputs_from_scan(scan) if include_inputs else {})
 
 

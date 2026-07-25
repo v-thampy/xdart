@@ -98,6 +98,11 @@ def _make_thread(watch_dir, out_dir, *, img_ext="nxs", scan_name="scan",
         "start", scan,
         live_mode=live_mode, max_cores=1,
     )
+    # O-1a-W1A: a worker only runs on an ACCEPTED frozen configuration; the
+    # output-safety guard fires inside initialize_scan, after that admission.
+    from xrd_tools.session import RunIntent
+
+    t.run_configuration = RunIntent(processing_mode="Int 2D").freeze()
     _LIVE_THREADS.append(t)
     return t
 

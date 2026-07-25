@@ -610,6 +610,7 @@ def test_source_snapshot_writer_roundtrip_drives_restarted_append_skip(
     from tests.xdart.test_append_skip_before_read import (
         _bare_worker,
         _current_candidate,
+        _frozen_run_config,
     )
     from xdart.modules.ewald.frame_series import _load_frame_v2
     from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
@@ -647,6 +648,14 @@ def test_source_snapshot_writer_roundtrip_drives_restarted_append_skip(
 
     worker = _bare_worker(tmp_path)
     worker.scan = scan
+    # O-1a-W1A: the restarted worker admits the SAME configuration the target was
+    # written with; the Append cursor now compares against that accepted run
+    # rather than against whatever scan object the display happens to hold.
+    worker.run_configuration = _frozen_run_config(
+        skip_2d=False,
+        bai_1d_args=dict(scan.bai_1d_args),
+        bai_2d_args=dict(scan.bai_2d_args),
+    )
     worker._eiger_done_masters = set()
     worker.source_frame_count_snapshot = {}
 

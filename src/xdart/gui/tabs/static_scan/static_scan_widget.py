@@ -4114,6 +4114,7 @@ class staticWidget(QWidget):
     def _controls_v2_native_run_plan_builder(
         self,
         snapshot: dict,
+        run_configuration: FrozenRunConfiguration | None = None,
     ):
         snapshot = copy.deepcopy(snapshot or {})
         snapshot_key = self._controls_v2_native_int_snapshot_key(snapshot)
@@ -4136,14 +4137,47 @@ class staticWidget(QWidget):
             )
 
         _builder.prepare_scan = _prepare_scan
-        _builder.plan_cache_key = ("controls_v2_native_int", snapshot_key)
+        # O-1a-W1A: an ADMITTED run's builder carries the exact accepted object,
+        # and its cache key is that run's identity -- so the plan a worker gets is
+        # the plan of the configuration the operator accepted, and a new
+        # generation can never reuse a previous run's cached plan.
+        _builder.run_configuration = run_configuration
+        _builder.plan_cache_key = (
+            ("controls_v2_frozen_int", run_configuration.identity)
+            if run_configuration is not None
+            else ("controls_v2_native_int", snapshot_key)
+        )
         return _builder
 
     def _configure_controls_v2_native_run_plan(
         self,
         *,
         commit_pending: bool = False,
+        run_configuration: FrozenRunConfiguration | None = None,
     ) -> None:
+        """Install the reduction-plan builder for the next/current run.
+
+        O-1a-W1A: once a run is ADMITTED its plan is built from the accepted
+        frozen configuration and from nothing else -- no live Controls snapshot
+        is read, and no live projection is pushed onto the display scan, because
+        the accepted configuration was already projected at adoption.  The idle
+        (reintegrate / panel-init) path is unchanged: it has no accepted run by
+        construction and keeps building from the live state.
+        """
+
+        if run_configuration is None:
+            run_configuration = self._active_run_frozen_configuration()
+        if run_configuration is not None:
+            builder = self._controls_v2_native_run_plan_builder(
+                run_configuration.native_int_snapshot(),
+                run_configuration=run_configuration,
+            )
+            cache = getattr(
+                getattr(getattr(self, "wrangler", None), "thread", None),
+                "_plan_cache", None)
+            if cache is not None and hasattr(cache, "plan_builder"):
+                cache.plan_builder = builder
+            return
         builder = None
         if (
             self._controls_v2_enabled()
@@ -4164,6 +4198,19 @@ class staticWidget(QWidget):
             cache = getattr(owner, "_plan_cache", None)
             if cache is not None and hasattr(cache, "plan_builder"):
                 cache.plan_builder = builder
+
+    def _active_run_frozen_configuration(self):
+        """The frozen configuration of the run currently being started/running.
+
+        ``None`` when no run is admitted -- the idle Controls paths (reintegrate,
+        panel init, config load) then keep their live-state behaviour.
+        """
+
+        if not self._controls_v2_run_active():
+            return None
+        frozen = getattr(getattr(self, "wrangler", None),
+                         "run_configuration", None)
+        return frozen if isinstance(frozen, FrozenRunConfiguration) else None
 
     # ------------------------------------------------------------------
     # Edit journal (§9.10 step 1) — ONE revisioned owner for every edit.
@@ -13798,7 +13845,12 @@ class staticWidget(QWidget):
             origin="start_wrangler",
         )
         _t2 = _time.perf_counter() if _perf else 0.0
-        self._configure_controls_v2_native_run_plan()
+        # O-1a-W1A: build THIS run's reduction plan from the configuration the
+        # click accepted.  Passed explicitly because the shared run latch is not
+        # set until `_enter_run_state()` below.
+        self._configure_controls_v2_native_run_plan(
+            run_configuration=getattr(
+                self.wrangler, "run_configuration", None))
         self.h5viewer.auto_last = True
 
         # Live (non-batch) runs drive the display from the in-memory

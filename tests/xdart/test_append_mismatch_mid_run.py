@@ -158,6 +158,16 @@ def _real_append_thread(tmp_path):
         live_mode=False,
         max_cores=1,
     )
+    # O-1a-W1A: the accepted run configuration IS the "current" side of the
+    # mid-run Append comparison.  Frozen through the production owner with this
+    # re-run's Int 2D settings — exactly what the operator accepted at the click.
+    from xrd_tools.session import RunIntent
+
+    thread.run_configuration = RunIntent(
+        processing_mode="Int 2D",
+        bai_1d_args=dict(CURRENT_2D_ARGS["bai_1d_args"]),
+        bai_2d_args=dict(CURRENT_2D_ARGS["bai_2d_args"]),
+    ).freeze()
     return thread, target
 
 

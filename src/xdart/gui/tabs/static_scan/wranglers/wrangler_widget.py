@@ -23,6 +23,11 @@ from pyqtgraph.parametertree import Parameter
 # This module imports
 from xdart.utils.h5pool import get_pool as _get_h5pool
 from xrd_tools.io.export import write_xye
+from xrd_tools.session.run_configuration import (
+    RunConfigurationRefused,
+    require_run_configuration,
+)
+from ..run_config_debug import run_config_debug_log
 from .qt_nexus_sink import _is_append_axis_mismatch
 
 logger = logging.getLogger(__name__)
@@ -523,6 +528,11 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
             name='wrangler_widget', type='int', value=0
         )
         self.scan_args = {}
+        # O-1a-W1: the accepted frozen run configuration for the CURRENT run, and
+        # the accepted-generation watermark that makes a superseded object a
+        # typed refusal.  Every wrangler admits through the same owner.
+        self.run_configuration = None
+        self.run_configuration_floor = 0
 
         self.command_queue = Queue()
         self.thread = wranglerThread(self.command_queue, self.scan_args, self.fname, self.file_lock, self)
@@ -545,6 +555,91 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         during integration.
         """
         pass
+
+    # ── Run-configuration admission (O-1a-W1, shared by every wrangler) ──
+    #
+    # Static/duck-safe by design: the Start sentinels drive SimpleNamespace
+    # holders that bind unbound methods individually, so these are called as
+    # ``wranglerWidget._admit_run_configuration(self, ...)``.
+
+    @staticmethod
+    def _safe_status_text(obj, text):
+        setter = getattr(obj, '_set_status_text', None)
+        if callable(setter):
+            setter(text)
+            return
+        label = getattr(getattr(obj, 'ui', None), 'specLabel', None)
+        set_text = getattr(label, 'setText', None)
+        if callable(set_text):
+            set_text(text)
+
+    @staticmethod
+    def _admit_run_configuration(obj, stage):
+        """Freeze and publish THE run configuration for this click, or refuse.
+
+        One owner for both wranglers.  The Controls host produces exactly one
+        frozen object; this publishes that same object (identity, never a copy)
+        onto the wrangler and its worker and advances the accepted-generation
+        watermark.  Absence or a foreign result raises the typed refusal, so a
+        caller that has not yet mutated any run state can return untouched.
+        """
+
+        host = getattr(obj, "_h19_host", None)
+        prepare = getattr(host, "_prepare_controls_v2_run_configuration", None)
+        frozen = prepare() if callable(prepare) else None
+        frozen = require_run_configuration(
+            frozen,
+            stage=stage,
+            floor=int(getattr(obj, "run_configuration_floor", 0) or 0),
+        )
+        obj.run_configuration = frozen
+        obj.run_configuration_floor = int(frozen.generation)
+        thread = getattr(obj, "thread", None)
+        if thread is not None:
+            thread.run_configuration = frozen
+            thread.run_configuration_floor = int(frozen.generation)
+        return frozen
+
+    @staticmethod
+    def _publish_run_configuration_to_thread(obj, thread=None):
+        """Re-publish the accepted object onto a worker built AFTER admission.
+
+        ``nexusWrangler.setup()`` replaces its thread on every run, so the newly
+        constructed worker must receive the exact accepted identity rather than
+        starting with none.
+        """
+
+        thread = thread if thread is not None else getattr(obj, "thread", None)
+        frozen = getattr(obj, "run_configuration", None)
+        if thread is None or frozen is None:
+            return None
+        thread.run_configuration = frozen
+        thread.run_configuration_floor = int(
+            getattr(obj, "run_configuration_floor", 0) or 0)
+        return frozen
+
+    @staticmethod
+    def _report_run_configuration_refusal(obj, refusal, *, origin):
+        """Render one typed run-configuration refusal: visibly + structurally."""
+
+        wranglerWidget._safe_status_text(
+            obj,
+            f"Run refused: no accepted run configuration ({refusal.reason}) "
+            "— see the log.",
+        )
+        logger.warning("%s", refusal)
+        try:
+            run_config_debug_log(
+                logger,
+                "run_configuration_refused",
+                widget=getattr(obj, "_h19_host", None),
+                wrangler=obj,
+                origin=origin,
+                level="warning",
+                **refusal.as_event_fields(),
+            )
+        except Exception:
+            logger.debug("refusal event emit failed", exc_info=True)
 
     # ── Shared run-controls (CONTROLS section) ──────────────────────────
     def controls_profile(self):
@@ -815,6 +910,12 @@ class wranglerThread(Qt.QtCore.QThread):
         # stop, GI freeze abort) — without it a self-stop landing between the
         # GUI's check and its 'pause' write was silently revived.
         self.command_lock = threading.Lock()
+        # O-1a-W1: every worker carries the ONE accepted frozen run configuration
+        # published by its wrapper at admission, plus the accepted-generation
+        # watermark.  Declared on the base so image and NeXus workers admit
+        # through the same owner.
+        self.run_configuration = None
+        self.run_configuration_floor = 0
 
         # ── Shared batch-engine state ────────────────────────────────
         # Subclasses can override any of these before .start() (or

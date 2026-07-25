@@ -872,13 +872,102 @@ class RunIntent:
         )
 
 
+class RunConfigurationRefused(RuntimeError):
+    """One typed refusal for a run configuration that may not be executed.
+
+    O-1a-W1: after admission the frozen configuration is the SOLE run-configuration
+    authority, so a consumer that does not hold the accepted object must refuse
+    rather than fall back to display state.  Exactly three reasons exist:
+
+    ``absent``   nothing was published for this run;
+    ``foreign``  the carrier is not a :class:`FrozenRunConfiguration`;
+    ``stale``    the carrier was frozen for an earlier accepted click.
+    """
+
+    __slots__ = ("reason", "stage", "detail", "generation", "floor")
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        stage: str,
+        detail: str = "",
+        generation: int | None = None,
+        floor: int | None = None,
+    ) -> None:
+        self.reason = str(reason)
+        self.stage = str(stage)
+        self.detail = str(detail)
+        self.generation = generation
+        self.floor = floor
+        message = f"run configuration refused ({self.reason}) at {self.stage}"
+        if self.detail:
+            message = f"{message}: {self.detail}"
+        super().__init__(message)
+
+    def as_event_fields(self) -> dict[str, Any]:
+        """Structured fields for one refusal event (no formatting policy here)."""
+
+        return {
+            "reason": self.reason,
+            "stage": self.stage,
+            "detail": self.detail,
+            "generation": self.generation,
+            "floor": self.floor,
+        }
+
+
+def require_run_configuration(
+    value: Any,
+    *,
+    stage: str,
+    floor: int = 0,
+) -> FrozenRunConfiguration:
+    """Return the accepted frozen configuration, or raise the typed refusal.
+
+    ``floor`` is the generation the owner last ACCEPTED.  It is admission
+    evidence, not a configuration mirror: it only ever moves forward, and it is
+    what distinguishes "the object this click published" from "an object left
+    behind by an earlier one".
+    """
+
+    if value is None:
+        raise RunConfigurationRefused(
+            "absent",
+            stage=stage,
+            detail="no frozen run configuration was published for this run",
+            floor=int(floor),
+        )
+    if not isinstance(value, FrozenRunConfiguration):
+        raise RunConfigurationRefused(
+            "foreign",
+            stage=stage,
+            detail=f"carrier is {type(value).__name__}, not FrozenRunConfiguration",
+            floor=int(floor),
+        )
+    if int(value.generation) < int(floor):
+        raise RunConfigurationRefused(
+            "stale",
+            stage=stage,
+            detail=(
+                f"generation {int(value.generation)} was superseded by "
+                f"generation {int(floor)}"
+            ),
+            generation=int(value.generation),
+            floor=int(floor),
+        )
+    return value
+
+
 __all__ = [
     "FrozenGIConfiguration",
     "FrozenRunConfiguration",
     "FrozenSourceSpec",
     "FrozenThresholdPolicy",
     "GIIntent",
+    "RunConfigurationRefused",
     "RunIntent",
     "ThresholdIntent",
+    "require_run_configuration",
     "resolve_gi_motor",
 ]

@@ -39,6 +39,29 @@ def test_paths_with_suffix_matches_extensions_case_insensitively(tmp_path):
     assert hdf5_names == ["scan_master.HDF5"]
 
 
+def _frozen_run_config(*, skip_2d=True, gi=False, bai_1d_args=None,
+                       bai_2d_args=None, gi_mode_1d="q_total",
+                       gi_mode_2d="qip_qoop"):
+    """A REAL ``FrozenRunConfiguration`` through the PRODUCTION freeze owner.
+
+    O-1a-W1A: the accepted frozen configuration is the worker's only
+    run-configuration authority, so a worker-level test states its intent here
+    rather than on the mutable display scan.  Nothing is faked: ``RunIntent`` and
+    ``GIIntent`` are the production Controls value types and ``freeze()`` is the
+    production freeze.
+    """
+    from xrd_tools.session import RunIntent
+    from xrd_tools.session.run_configuration import GIIntent
+
+    return RunIntent(
+        processing_mode="Int 1D" if skip_2d else "Int 2D",
+        bai_1d_args=dict(bai_1d_args if bai_1d_args is not None
+                         else {"unit": "q_A^-1"}),
+        bai_2d_args=dict(bai_2d_args or {}),
+        gi=GIIntent(enabled=bool(gi), mode_1d=gi_mode_1d, mode_2d=gi_mode_2d),
+    ).freeze()
+
+
 def _bare_worker(tmp_path):
     worker = imageThread.__new__(imageThread)
     worker.write_mode = "Append"
@@ -67,6 +90,8 @@ def _bare_worker(tmp_path):
     worker._discovered_frame_count = 0
     worker._skip_reason_counts = Counter()
     worker._append_skip_snapshot_warnings = set()
+    # the mutable DISPLAY scan double: retained so the backward GI projection has
+    # a target, deliberately NOT the run-configuration source any more.
     worker.scan = SimpleNamespace(
         skip_2d=True,
         gi=False,
@@ -74,6 +99,8 @@ def _bare_worker(tmp_path):
         bai_2d_args={},
         gi_config={},
     )
+    worker.run_configuration = _frozen_run_config()
+    worker.run_configuration_floor = 0
     return worker
 
 
@@ -134,6 +161,8 @@ def _initialize_scan_worker(tmp_path, *, write_mode="Append"):
         bai_2d_args={},
         gi_config={},
     )
+    worker.run_configuration = _frozen_run_config()
+    worker.run_configuration_floor = 0
     worker.sigUpdateFile = SimpleNamespace(emit=lambda *_: None)
 
     @contextmanager
@@ -351,7 +380,7 @@ def test_append_skip_snapshot_lazily_reads_only_current_frame_index(
 
 def test_int_2d_append_does_not_skip_frame_with_only_1d_output(tmp_path):
     worker = _bare_worker(tmp_path)
-    worker.scan.skip_2d = False
+    worker.run_configuration = _frozen_run_config(skip_2d=False)
     out = tmp_path / "out"
     out.mkdir()
     _write_minimal_integrated_nxs(out / "scan.nxs", [0])
@@ -362,7 +391,7 @@ def test_int_2d_append_does_not_skip_frame_with_only_1d_output(tmp_path):
 
 def test_int_2d_append_completion_is_1d_2d_intersection(tmp_path):
     worker = _bare_worker(tmp_path)
-    worker.scan.skip_2d = False
+    worker.run_configuration = _frozen_run_config(skip_2d=False)
     out = tmp_path / "out"
     out.mkdir()
     _write_minimal_integrated_nxs(
@@ -385,7 +414,7 @@ def test_int_1d_append_completion_requires_only_1d_output(tmp_path):
 
 def test_append_dispatch_guard_uses_mode_aware_cursor_not_union_index(tmp_path):
     worker = _bare_worker(tmp_path)
-    worker.scan.skip_2d = False
+    worker.run_configuration = _frozen_run_config(skip_2d=False)
     worker._append_skip_frames_by_scan = {"scan": set()}
     loaded_scan = SimpleNamespace(frames=SimpleNamespace(index=[0]))
 
@@ -407,7 +436,8 @@ def test_append_cursor_rejects_reached_target_config_before_skip(tmp_path):
             "bai_2d_args": {"unit": "q_A^-1"},
         },
     )
-    worker.scan.bai_1d_args = {"unit": "q_A^-1", "numpoints": 500}
+    worker.run_configuration = _frozen_run_config(
+        bai_1d_args={"unit": "q_A^-1", "numpoints": 500})
 
     with pytest.raises(AppendConfigMismatchError) as excinfo:
         worker._should_skip_before_read("scan", 0)
@@ -483,7 +513,8 @@ def test_append_cursor_memo_revalidates_current_processing_config(
     from xrd_tools.session.readiness import AppendConfigMismatchError
 
     worker = _bare_worker(tmp_path)
-    worker.scan.bai_1d_args = {"unit": "q_A^-1", "numpoints": 1000}
+    worker.run_configuration = _frozen_run_config(
+        bai_1d_args={"unit": "q_A^-1", "numpoints": 1000})
     out = tmp_path / "out"
     out.mkdir()
     _write_minimal_integrated_nxs(
@@ -498,7 +529,8 @@ def test_append_cursor_memo_revalidates_current_processing_config(
 
     assert worker._load_append_skip_snapshot("scan") == {1, 2}
     worker._append_skip_frames_by_scan = {}
-    worker.scan.bai_1d_args = {"unit": "q_A^-1", "numpoints": 500}
+    worker.run_configuration = _frozen_run_config(
+        bai_1d_args={"unit": "q_A^-1", "numpoints": 500})
     monkeypatch.setattr(
         iwt,
         "_nexus_append_cursor",
@@ -1235,13 +1267,11 @@ def test_append_initialize_config_mismatch_aborts_with_empty_img_file(tmp_path):
     before = target.read_bytes()
     worker.img_file = ""  # live/cold path: Run click may not know the source yet.
     worker.gi = True
-    worker.scan.gi = True
-    worker.scan.bai_1d_args = {"unit": "q_A^-1", "gi_mode_1d": "q_total"}
-    worker.scan.bai_2d_args = {"unit": "q_A^-1", "gi_mode_2d": "qip_qoop"}
-    worker.scan.gi_config = {
-        "gi_mode_1d": "q_total",
-        "gi_mode_2d": "qip_qoop",
-    }
+    worker.run_configuration = _frozen_run_config(
+        gi=True,
+        bai_1d_args={"unit": "q_A^-1", "gi_mode_1d": "q_total"},
+        bai_2d_args={"unit": "q_A^-1", "gi_mode_2d": "qip_qoop"},
+    )
 
     with pytest.raises(RuntimeError, match="Integration settings changed mid-run") as excinfo:
         worker.initialize_scan()
@@ -1285,17 +1315,18 @@ def test_append_initialize_same_config_canonical_noise_passes(tmp_path):
         },
     )
     worker.img_file = ""
-    worker.scan.gi = False
-    worker.scan.bai_1d_args = {
-        "unit": "q_A^-1",
-        "radial_range": (0.1, 6.0),
-    }
-    worker.scan.bai_2d_args = {
-        "unit": "q_A^-1",
-        "npt_rad": 500,
-        "radial_range": (0.1, 6.0),
-        "azimuth_range": (-90, 90),
-    }
+    worker.run_configuration = _frozen_run_config(
+        bai_1d_args={
+            "unit": "q_A^-1",
+            "radial_range": (0.1, 6.0),
+        },
+        bai_2d_args={
+            "unit": "q_A^-1",
+            "npt_rad": 500,
+            "radial_range": (0.1, 6.0),
+            "azimuth_range": (-90, 90),
+        },
+    )
 
     scan = worker.initialize_scan()
 
@@ -1315,13 +1346,11 @@ def test_append_initialize_mismatch_ignored_in_overwrite_mode(tmp_path):
     )
     worker.img_file = ""
     worker.gi = True
-    worker.scan.gi = True
-    worker.scan.bai_1d_args = {"unit": "q_A^-1", "gi_mode_1d": "q_total"}
-    worker.scan.bai_2d_args = {"unit": "q_A^-1", "gi_mode_2d": "qip_qoop"}
-    worker.scan.gi_config = {
-        "gi_mode_1d": "q_total",
-        "gi_mode_2d": "qip_qoop",
-    }
+    worker.run_configuration = _frozen_run_config(
+        gi=True,
+        bai_1d_args={"unit": "q_A^-1", "gi_mode_1d": "q_total"},
+        bai_2d_args={"unit": "q_A^-1", "gi_mode_2d": "qip_qoop"},
+    )
 
     scan = worker.initialize_scan()
 
