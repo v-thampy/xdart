@@ -27,7 +27,12 @@ from pyqtgraph.parametertree import ParameterTree, Parameter
 
 # Project imports
 from xrd_tools.core.containers import PONI
-from .wrangler_widget import GIMotorHydration, wranglerWidget
+from xrd_tools.session.run_configuration import RunConfigurationRefused
+from .wrangler_widget import (
+    GIMotorHydration,
+    _run_owner_refusal_status,
+    wranglerWidget,
+)
 from .nexus_wrangler_thread import nexusThread
 from xdart.utils import get_fname_dir
 from xdart.utils.browse import browse_start_dir, remember_browse_path
@@ -619,6 +624,10 @@ class nexusWrangler(wranglerWidget):
         # N1: push the project root so the writer stamps @source_base + relative
         # raw paths (set AFTER the thread recreate above).
         self.thread.source_base = self.source_base
+        # O-1a-W1B: setup() REPLACES the worker, so the accepted configuration
+        # admitted by ``start()`` must be published onto the thread that will
+        # actually run — otherwise the new worker starts with none and refuses.
+        wranglerWidget._publish_run_configuration_to_thread(self, self.thread)
 
     def controls_profile(self):
         """NeXus wrangler: no Live / Batch / Pause; its own 3 mode items.
@@ -665,6 +674,38 @@ class nexusWrangler(wranglerWidget):
         self.stopButton.setEnabled(False)
 
     def start(self):
+        """The composed NeXus Start boundary (O-1a-W1B).
+
+        Parity with the image path, in the same order and for the same reason::
+
+            refuse active/stopping        <- BEFORE any mutation whatsoever
+            -> admit the ONE frozen run configuration
+            -> command / mode / buttons / session
+            -> start
+
+        Before this, ``command = 'start'`` was the FIRST statement, so a Start
+        during the stopping window mutated the command, the worker's cores, the
+        processing-mode flags, both buttons and the persisted session before
+        anything could refuse — and the run then executed with no accepted
+        configuration at all.  Both refusals are zero-delta: nothing above has
+        run yet when they return.
+        """
+        owner = wranglerWidget._active_run_owner(self)
+        if owner is not None:
+            wranglerWidget._safe_status_text(
+                self, _run_owner_refusal_status(owner))
+            return
+        try:
+            wranglerWidget._admit_run_configuration(self, "nexus-start")
+        except RunConfigurationRefused as exc:
+            wranglerWidget._report_run_configuration_refusal(
+                self, exc, origin="nexus_wrangler_start")
+            return
+        except Exception as exc:
+            logger.exception("could not freeze Controls run configuration")
+            wranglerWidget._safe_status_text(
+                self, f"Run configuration is invalid: {exc}")
+            return
         self.command = 'start'
         self.thread.command = 'start'
         # Push the current Cores selection into the worker thread.

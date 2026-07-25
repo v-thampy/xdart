@@ -261,6 +261,13 @@ _CONTAINER_READY_RETRY = _env_float(
     "XDART_CONTAINER_READY_RETRY", 0.5, 0.05, 5.0)
 _CONTAINER_READY_DEADLINE = _env_float(
     "XDART_CONTAINER_READY_DEADLINE", 30.0, 1.0, 600.0)
+#: Self-contained container inputs: ONE run reads many frames out of a single
+#: file (Eiger master, NeXus stack, processed .nxs) instead of one file per
+#: frame.  Used by the frozen container-versus-series gate (R4B-14).
+_CONTAINER_SUFFIXES = frozenset({"h5", "hdf5", "nxs"})
+_CONTAINER_SOURCE_KINDS = frozenset(
+    {"eiger_master", "nexus_stack", "processed_nexus"})
+
 _APPEND_CURSOR_MEMO_LIMIT = 1024
 
 # ---------------------------------------------------------------------------
@@ -809,13 +816,10 @@ class imageThread(wranglerThread):
         the written provenance (W-1.2 case 11).
         """
 
-        if not self.gi:
+        if not self.gi or self.scan is None:
             return
-        scan = getattr(self, "scan", None)
-        if scan is None:
-            return
-        scan.bai_1d_args['gi_mode_1d'] = self.gi_mode_1d
-        scan.bai_2d_args['gi_mode_2d'] = self.gi_mode_2d
+        self.scan.bai_1d_args['gi_mode_1d'] = self.gi_mode_1d
+        self.scan.bai_2d_args['gi_mode_2d'] = self.gi_mode_2d
 
     # ── Main entry point ─────────────────────────────────────────────────
 
@@ -829,7 +833,7 @@ class imageThread(wranglerThread):
         # output open, no cache clear and no reduction -- it returns, and the
         # ordinary finish delivery unwinds the run state.
         try:
-            self._require_run_configuration("image-worker-run")
+            imageThread._require_run_configuration(self, "image-worker-run")
         except RunConfigurationRefused as exc:
             logger.error("run refused: %s", exc)
             self.command = 'stop'
@@ -982,7 +986,7 @@ class imageThread(wranglerThread):
             self.detector_shape = None
         self._cached_gi_incident_angle = None
 
-        self._project_gi_modes_onto_display_scan()
+        imageThread._project_gi_modes_onto_display_scan(self)
 
         try:
             self.process_scan()
@@ -1270,7 +1274,7 @@ class imageThread(wranglerThread):
             source_cache[key] = None
             return cache[key]
 
-        frozen = self._require_run_configuration("append-cursor")
+        frozen = imageThread._require_run_configuration(self, "append-cursor")
         require_2d = not bool(frozen.skip_2d)
         memo = getattr(self, "_append_cursor_memo", None)
         if memo is None:
@@ -5303,6 +5307,38 @@ class imageThread(wranglerThread):
         return (now - first) >= getattr(
             self, "FRAME_READ_DEADLINE", _FRAME_READ_DEADLINE)
 
+    def _frozen_source_is_container(self):
+        """Container-versus-series, decided by the ACCEPTED frozen source (R4B-14).
+
+        The old gate keyed on ``self.img_ext`` — a mutable panel mirror, i.e. a
+        SECOND format authority that a mid-run panel edit could flip.  The
+        decision now comes from the frozen source selection:
+
+        * a frozen directory source is a container run iff its frozen suffixes
+          are container suffixes;
+        * a frozen file source is a container run iff its kind (or its own URI's
+          suffix) is a container kind;
+        * when the click froze NO typed source (the Eiger-master Image-Series
+          case, where Controls deliberately freezes none), the decision falls to
+          the run's OWN source URI — file identity, never panel configuration.
+        """
+
+        frozen = imageThread._require_run_configuration(
+            self, "container-selection")
+        source = frozen.source
+        if source is not None:
+            if source.family == "directory":
+                return any(
+                    str(suffix).lstrip(".").lower() in _CONTAINER_SUFFIXES
+                    for suffix in source.suffixes)
+            if str(source.source_kind) in _CONTAINER_SOURCE_KINDS:
+                return True
+            return Path(str(source.uri)).suffix.lstrip(".").lower() \
+                in _CONTAINER_SUFFIXES
+        img_file = getattr(self, "img_file", "") or ""
+        return bool(img_file) and (
+            Path(img_file).suffix.lstrip(".").lower() in _CONTAINER_SUFFIXES)
+
     def get_next_image(self):
         """Gets next image in image series or in directory to process."""
         is_master = _is_eiger_master(self.img_file) if self.img_file else False
@@ -5319,7 +5355,7 @@ class imageThread(wranglerThread):
             meta = read_image_metadata(self.img_file, meta_format=self.meta_ext, meta_dir=self.meta_dir) if self.meta_ext else {}
             return self.img_file, scan_name, img_number, img_data, meta
 
-        if is_master or self.img_ext.lower() in ('h5', 'hdf5', 'nxs'):
+        if is_master or self._frozen_source_is_container():
             return self._get_next_eiger_frame()
 
         if len(self.img_fnames) == 0:
@@ -5551,7 +5587,8 @@ class imageThread(wranglerThread):
         # This is the last checkpoint before a writer can open, so the typed
         # refusal happens BEFORE the output-safety probe, the mkdir, and any
         # source read (W-1.2 case 5).
-        frozen = self._require_run_configuration("initialize_scan")
+        frozen = imageThread._require_run_configuration(
+            self, "initialize_scan")
         scan_kwargs = frozen.scan_kwargs()
         fname = os.path.join(self.h5_dir, self.scan_name + '.nxs')
         # F-NXS-1: refuse to (over)write when the derived output collides with a

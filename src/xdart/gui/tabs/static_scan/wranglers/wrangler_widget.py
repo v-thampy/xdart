@@ -33,6 +33,38 @@ from .qt_nexus_sink import _is_append_axis_mismatch
 logger = logging.getLogger(__name__)
 
 
+#: Operator-facing refusal text per POSITIVELY OBSERVED active run owner
+#: (§9.10 step 2).  Any other label — notably the T-3.1 ``…-probe-error``
+#: variants, where an owner's activity could NOT be determined — falls through to
+#: :func:`_run_owner_refusal_status`'s honest "could not confirm" wording.  A
+#: module-level function on purpose: the Start sentinels drive duck-typed
+#: SimpleNamespace/MethodType holders that bind unbound methods individually, so a
+#: shared helper must not be a new method they would each have to bind.
+_RUN_OWNER_REFUSAL_STATUS = {
+    "run": 'Previous run is still stopping — try again in a moment.',
+    "wrangler": 'Previous run is still stopping — try again in a moment.',
+    "reintegration": 'A reintegration is still finishing — try again in a moment.',
+    "stitch": 'A stitch is still finishing — try again in a moment.',
+}
+
+
+def _run_owner_refusal_status(owner):
+    """Refusal text for one run-owner admission decision.
+
+    A KNOWN-active owner gets its specific wording.  An UNOBSERVABLE owner gets
+    text that says so rather than claiming a run is stopping: the operator needs
+    to know the Run was refused because the GUI could not confirm the previous
+    run finished, which is a different (and log-worthy) situation."""
+    text = _RUN_OWNER_REFUSAL_STATUS.get(str(owner))
+    if text is not None:
+        return text
+    return (
+        'Could not confirm that the previous run finished (' + str(owner)
+        + ') — Run refused rather than risk starting over a live run. '
+        'See the log, then try again.'
+    )
+
+
 # MEM-1a: the wrangler→GUI live display hand-off (``_published_frames``) stashes
 # one fully-hydrated LiveFrame per frame for the GUI's ``update_data`` to pop.
 # In live mode each retained frame still holds its ~18 MB raw (upcast ~64 MB
@@ -555,6 +587,47 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         during integration.
         """
         pass
+
+    def _active_run_owner(self):
+        """The host's ONE active/stopping predicate (§9.10 step 2 / §31.3 item 3).
+
+        Returns an owner label (``run`` / ``wrangler`` / ``reintegration`` /
+        ``stitch``, or a ``…-probe-error`` variant) or ``None`` when every present
+        owner was positively observed idle.
+
+        T-3.1 (§32.3 item 3) — this wrapper must not erase a failure either:
+
+        * the host predicate EXISTS but raises -> refuse.  Previously this fell
+          through to the wrangler-only probe, so a broken admission owner
+          silently narrowed the decision to one of its four owners;
+        * the wrangler-only fallback runs ONLY when the host does not expose the
+          shared predicate at all;
+        * a fallback probe that RAISES also refuses.
+
+        A fallback holder whose thread exposes no ``isRunning`` at all stays idle:
+        that is absence, not failure (the §32.3 item-2 partial-construction
+        carve-out), and it is the shape of the headless/duck-typed holders the
+        Start sentinels drive."""
+        host = getattr(self, "_h19_host", None)
+        predicate = getattr(host, "_controls_v2_active_run_owner", None)
+        if callable(predicate):
+            try:
+                return predicate()
+            except Exception:
+                logger.exception(
+                    "run-owner admission predicate failed; refusing Start "
+                    "rather than assuming every owner is idle")
+                return "admission-check-probe-error"
+        probe = getattr(getattr(self, "thread", None), "isRunning", None)
+        if not callable(probe):
+            return None
+        try:
+            return "wrangler" if bool(probe()) else None
+        except Exception:
+            logger.exception(
+                "wrangler isRunning probe failed; refusing Start rather than "
+                "assuming the worker is idle")
+            return "wrangler-probe-error"
 
     # ── Run-configuration admission (O-1a-W1, shared by every wrangler) ──
     #

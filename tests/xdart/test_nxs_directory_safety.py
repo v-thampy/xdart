@@ -277,6 +277,9 @@ def test_single_file_nexus_wrangler_rejects_processed_cleanly(tmp_path):
         "q_total", "qip_qoop",           # gi modes
         "start", scan,
     )
+    from xrd_tools.session import RunIntent
+
+    t.run_configuration = RunIntent(processing_mode="Int 2D").freeze()
     labels = []
     t.showLabel.connect(labels.append)
     # Must return cleanly (before the diff: uncaught ProcessedXdartInputError).

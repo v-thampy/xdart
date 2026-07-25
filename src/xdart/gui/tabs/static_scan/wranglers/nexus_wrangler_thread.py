@@ -56,7 +56,12 @@ from xrd_tools.io.image import read_image
 from xrd_tools.io.processed_scan_id import ProcessedXdartInputError
 from xrd_tools.io.export import write_xye
 from xdart.utils.h5pool import get_pool as _get_h5pool
+from xrd_tools.session.run_configuration import (
+    RunConfigurationRefused,
+    require_run_configuration,
+)
 from xdart.modules.reduction import (
+    apply_frozen_run_configuration as _apply_frozen_run_configuration,
     open_live_reduction_session,
     StandardPlanCache,
     reduce_live_frames,
@@ -175,8 +180,50 @@ class nexusThread(wranglerThread):
 
     # ── Main entry point ─────────────────────────────────────────────────
 
+    def _require_run_configuration(self, stage):
+        """Return the ONE accepted frozen configuration, or refuse (typed).
+
+        Parity with ``imageThread``: after admission the frozen configuration is
+        the sole run-configuration authority, and absence / a foreign carrier /
+        a superseded generation is a typed refusal.
+        """
+
+        return require_run_configuration(
+            getattr(self, "run_configuration", None),
+            stage=stage,
+            floor=int(getattr(self, "run_configuration_floor", 0) or 0),
+        )
+
+    def _project_gi_modes_onto_display_scan(self):
+        """Backward GI-mode write onto the mutable DISPLAY scan (retained).
+
+        The twin of ``imageThread._project_gi_modes_onto_display_scan``: an
+        acquisition/display projection only.  The values come from the accepted
+        frozen configuration, so this can never change what the run integrates.
+        """
+
+        frozen = nexusThread._require_run_configuration(
+            self, "nexus-gi-projection")
+        if not frozen.gi.enabled or self.scan is None:
+            return
+        self.scan.bai_1d_args['gi_mode_1d'] = frozen.gi.mode_1d
+        self.scan.bai_2d_args['gi_mode_2d'] = frozen.gi.mode_2d
+
     def run(self):
         """QThread entry: run the integration body."""
+        # W-1.2 case 5 parity: refuse before any source read, output open or
+        # reduction session — a worker without the accepted configuration does
+        # nothing at all.
+        try:
+            nexusThread._require_run_configuration(self, "nexus-worker-run")
+        except RunConfigurationRefused as exc:
+            logger.error("run refused: %s", exc)
+            self.command = 'stop'
+            try:
+                self.showLabel.emit(f"Run refused: {exc}")
+            except Exception:
+                logger.debug("showLabel emit failed for refusal", exc_info=True)
+            return
         self._reset_xye_output_notifications()
         try:
             self._run_impl()
@@ -199,10 +246,7 @@ class nexusThread(wranglerThread):
                         else custom_mask)
         self.mask = np.flatnonzero(det_mask) if det_mask is not None else None
 
-        # Sync GI mode
-        if self.gi:
-            self.scan.bai_1d_args['gi_mode_1d'] = self.gi_mode_1d
-            self.scan.bai_2d_args['gi_mode_2d'] = self.gi_mode_2d
+        nexusThread._project_gi_modes_onto_display_scan(self)
 
         # Read scan-level metadata once (counters/angles per-frame
         # arrays).  Per-frame slicing happens later.
@@ -452,10 +496,21 @@ class nexusThread(wranglerThread):
     # ── Helpers ─────────────────────────────────────────────────────────
 
     def _initialize_scan(self, scan_name):
-        """Create or reset the LiveScan for this scan."""
+        """Create or reset the LiveScan for this scan.
+
+        RESIDUAL (ledgered): the NeXus worker still executes ON the display scan
+        object rather than a per-run scan of its own -- that restructuring is
+        outside the W-1 packet.  What W-1B closes is the AUTHORITY: every
+        configuration value written here now comes from the accepted frozen
+        configuration, and the run identity + detached writer projection are
+        attached BEFORE the writer opens, exactly as on the image path.
+        """
+        frozen = nexusThread._require_run_configuration(
+            self, "nexus-initialize-scan")
         self.scan.name = scan_name
-        self.scan.gi = self.gi
+        self.scan.gi = bool(frozen.gi.enabled)
         self.scan.static = True
+        _apply_frozen_run_configuration(self.scan, frozen)
         # N1: the project root -> entry/@source_base + relative raw source paths
         # in the writer (portable .nxs).  None -> absolute paths (back-compat).
         # The abspath at frame.source_file stays as-is; the writer relativizes it

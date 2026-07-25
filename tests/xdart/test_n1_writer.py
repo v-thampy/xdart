@@ -198,16 +198,26 @@ def test_nexus_wrangler_thread_initialize_scan_sets_source_base():
     from types import SimpleNamespace, MethodType
     from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler_thread import nexusThread
 
+    # O-1a-W1B: `_initialize_scan` now runs on an ADMITTED configuration, so the
+    # duck host carries one frozen through the production owner.
+    from xrd_tools.session import RunIntent
+    from xrd_tools.session.run_configuration import GIIntent
+
+    gi_run = RunIntent(processing_mode="Int 2D", gi=GIIntent(enabled=True)).freeze()
+    std_run = RunIntent(processing_mode="Int 2D").freeze()
+
     scan = SimpleNamespace(name=None, gi=None, static=None)
     t = SimpleNamespace(scan=scan, gi=True, source_base="/proj",
-                        _active_scan=None)
+                        _active_scan=None, run_configuration=gi_run,
+                        run_configuration_floor=0)
     t._initialize_scan = MethodType(nexusThread._initialize_scan, t)
     assert t._initialize_scan("s").source_base == "/proj"
     assert t._active_scan is scan
 
     # No source_base on the worker -> None (back-compat, absolute paths).
     scan2 = SimpleNamespace(name=None, gi=None, static=None)
-    t2 = SimpleNamespace(scan=scan2, gi=False, _active_scan=None)
+    t2 = SimpleNamespace(scan=scan2, gi=False, _active_scan=None,
+                         run_configuration=std_run, run_configuration_floor=0)
     t2._initialize_scan = MethodType(nexusThread._initialize_scan, t2)
     assert getattr(t2._initialize_scan("s"), "source_base", "X") is None
     assert t2._active_scan is scan2
