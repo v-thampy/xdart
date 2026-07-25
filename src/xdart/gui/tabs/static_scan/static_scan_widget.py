@@ -348,38 +348,83 @@ _CONTROLS_V2_SIGNAL_SNAPSHOT_FLAGS = (
     "prior", "probed", "acquired", "mismatched", "repaired")
 
 
+def _controls_v2_safe_error_text(error):
+    """A never-raising diagnostic string for ONE error object (§27.4 req 1-3).
+
+    §27.4 P2: both projection sites used a bare ``repr(error)`` comprehension, and
+    an exception object is free to define a RAISING ``__repr__``.  In the detached
+    snapshot that dropped the ENTIRE owner entry — stable path, prior state,
+    mismatch and repaired flags included.  In repaired-event publication it escaped
+    the classification loop, so the recovery collector falsely reported a REPAIRED
+    transient as ``("Signal", "signal_state")``, directly violating the accepted
+    §26.2/E1 rule that a repaired transient is evidence, not an outstanding failure.
+
+    ``repr`` is PREFERRED because it is the useful representation.  On any failure
+    the fallback is a stable exact string built ONLY from the safe built-in type
+    name — hostile INSTANCE formatting is never invoked again — so this function is
+    total and one bad error can never cost the surrounding evidence."""
+    try:
+        return repr(error)
+    except Exception:
+        pass
+    name = "unknown"
+    try:
+        name = str(type(error).__name__)
+    except Exception:
+        logger.debug("error type name was itself unrepresentable", exc_info=True)
+    return f"<unrepresentable {name} diagnostic>"
+
+
 def _controls_v2_detached_signal_snapshot(registry):
     """A FRESH, fully DETACHED plain copy of the signal registry (§26.3 req 3/5).
 
     Nothing in the result IS the live registry, a live entry, or a live mutable
     member of one: the flags are copied by value, the ordered cleanup errors are
-    projected to ``repr`` strings, and the live Qt ``owner`` is omitted entirely.
-    Mutating any part of the result — clearing it, replacing an entry, rewriting a
-    ``prior`` — therefore cannot alter recovery authority."""
+    projected through :func:`_controls_v2_safe_error_text`, and the live Qt
+    ``owner`` is omitted entirely.  Mutating any part of the result — clearing it,
+    replacing an entry, rewriting a ``prior`` — cannot alter recovery authority.
+
+    §27.4 req 1/4: every field is projected INDEPENDENTLY and totally.  The old
+    shape computed all error strings inside one ``try`` whose ``except`` did
+    ``continue``, so a single hostile representation discarded the whole owner
+    entry.  No projection failure can now drop an entry."""
     snapshot = {}
     for key, entry in (registry or {}).items():
+        projected = {"path": (), "errors": []}
         try:
-            projected = {
-                "path": tuple(entry.get("path") or ()),
-                "errors": [repr(error) for error in (entry.get("errors") or ())],
-            }
-            for flag in _CONTROLS_V2_SIGNAL_SNAPSHOT_FLAGS:
-                projected[flag] = bool(entry.get(flag))
+            projected["path"] = tuple(entry.get("path") or ())
         except Exception:
-            logger.debug("signal registry snapshot projection raised",
+            logger.debug("signal snapshot path projection raised", exc_info=True)
+        try:
+            raw_errors = list(entry.get("errors") or ())
+        except Exception:
+            logger.debug("signal snapshot error list projection raised",
                          exc_info=True)
-            continue
+            raw_errors = []
+        projected["errors"] = [
+            _controls_v2_safe_error_text(error) for error in raw_errors]
+        for flag in _CONTROLS_V2_SIGNAL_SNAPSHOT_FLAGS:
+            try:
+                projected[flag] = bool(entry.get(flag))
+            except Exception:
+                logger.debug("signal snapshot flag %s projection raised", flag,
+                             exc_info=True)
+                projected[flag] = False
         snapshot[key] = projected
     return snapshot
 
 
 def _controls_v2_carrier_registry(carrier):
-    """The LIVE signal registry for *carrier*, or ``None`` (§26.3 req 4).
+    """The LIVE signal registry for an EXECUTION carrier, or ``None`` (§27.3 req 1/4).
 
-    The only route to the live registry.  A DIAGNOSTIC copy — the kind published
-    through ``_controls_v2_bound_carriers`` — always yields ``None``, so a published
-    twin can never act as an execution carrier even if one reached this seam."""
-    if carrier is None or getattr(carrier, "_diagnostic", False):
+    Only the local :class:`_PreparedLegacyCarrier` objects the commit loop owns carry
+    the registry, and they are never published.  What IS published is a value-only
+    :class:`_ControlsCarrierDiagnostic`, which has no registry attribute under any
+    spelling — so there is nothing for a caller to reach.  §27.3 req 9: this helper
+    does not "enforce exclusivity"; exclusivity comes from the published record not
+    holding the object at all.  The check below is a TYPE check, not a naming
+    convention — a leading underscore is not a capability boundary (§27.5)."""
+    if not isinstance(carrier, _PreparedLegacyCarrier):
         return None
     return getattr(carrier, "_signals", None)
 
@@ -1157,52 +1202,35 @@ class _PreparedLegacyCarrier:
     ``param``; ``None`` means "constructed outside a transaction", and the caller
     then gets a throwaway registry so direct construction in a test still works."""
 
-    __slots__ = ("path", "param", "_value", "_prior", "_expected",
-                 "_signals", "_diagnostic")
+    __slots__ = ("path", "param", "_value", "_prior", "_expected", "_signals")
 
-    def __init__(self, path, param, value, prior, expected, signals=None,
-                 diagnostic=False):
+    def __init__(self, path, param, value, prior, expected, signals=None):
         path = tuple(path)
         object.__setattr__(self, "path", path)
         object.__setattr__(self, "param", param)
         object.__setattr__(self, "_signals", signals)
-        object.__setattr__(self, "_diagnostic", bool(diagnostic))
         object.__setattr__(self, "_value", _freeze_carrier_payload(value, path))
         object.__setattr__(self, "_prior", _freeze_carrier_payload(prior, path))
         object.__setattr__(
             self, "_expected", _freeze_carrier_payload(expected, path))
 
-    @property
-    def signals(self):
-        """A FRESH, fully DETACHED snapshot of the signal registry (§26.3 req 3/5).
-
-        §26.3 P1: this attribute used to hand out the ONE mutable registry dict, and
-        the live execution carriers were published through
-        ``_controls_v2_bound_carriers``.  ``MappingProxyType`` protected only the
-        outer path->carrier mapping, so a real setter could reach a live carrier and
-        call ``carrier.signals.clear()`` — erasing recovery authority after the
-        earliest prior state was recorded.  Rollback then re-registered the
-        already-blocked child with ``prior=True`` and final recovery faithfully
-        "restored" that forged value, certifying a leaked Qt block.
-
-        Every read now returns a throwaway plain copy that shares NO object with the
-        live registry (see :func:`_controls_v2_detached_signal_snapshot`), so
-        clearing it, replacing an entry, or rewriting a ``prior`` mutates nothing.
-        The live registry is reachable ONLY through
-        :func:`_controls_v2_carrier_registry`, and only from a non-diagnostic
-        carrier."""
-        return _controls_v2_detached_signal_snapshot(self._signals)
-
     def diagnostic_copy(self):
-        """A DETACHED diagnostic twin for publication (§26.3 req 2-3).
+        """The VALUE-ONLY published diagnostic for this carrier (§27.3 req 2-3).
 
-        A distinct object from the execution carrier, marked so
-        :func:`_controls_v2_carrier_registry` refuses it: even if a caller managed
-        to route this copy into the strict writer or a rollback helper, it could
-        not reach the live registry."""
-        return _PreparedLegacyCarrier(
-            self.path, self.param, self.value, self.prior, self.expected,
-            self._signals, diagnostic=True)
+        §27.3 P1: publishing another ``_PreparedLegacyCarrier`` was the WRONG
+        ABSTRACTION, however the registry reference was spelled.  The twin was a
+        distinct Python object, but it still stored the ONE live registry in an
+        ordinary slot — so ``twin._signals.clear()`` cleared real recovery authority
+        mid-transaction — and it still stored the live Qt ``Parameter``, so
+        ``twin.param.setValue(rogue)`` wrote to production OUTSIDE the checked
+        transaction.  Renaming the attribute closed nothing: a leading underscore is
+        not a capability boundary.
+
+        What is published is therefore a :class:`_ControlsCarrierDiagnostic` — a
+        value-only record with NO parameter, NO registry, NO Qt owner, no callback
+        and no raw exception object under any name."""
+        return _ControlsCarrierDiagnostic(
+            self.path, self.value, self.prior, self.expected)
 
     @property
     def value(self):
@@ -1226,6 +1254,76 @@ class _PreparedLegacyCarrier:
 
     def __repr__(self):
         return (f"_PreparedLegacyCarrier(path={self.path!r}, "
+                f"value={self.value!r}, prior={self.prior!r}, "
+                f"expected={self.expected!r})")
+
+
+class _ControlsCarrierDiagnostic:
+    """The VALUE-ONLY record published through ``_controls_v2_bound_carriers`` (§27.3).
+
+    §27.3 P1 established that the published object must not be an execution carrier
+    at all.  A ``_PreparedLegacyCarrier`` twin — even one whose ``signals`` property
+    returned detached copies — still stored the live registry and the live Qt
+    ``Parameter`` in ordinary slots, so a caller reaching the published mapping could
+    clear real recovery authority mid-transaction or write to production outside the
+    checked transaction.
+
+    This record holds ONLY detached values:
+
+    * ``path``     — the stable diagnostic path;
+    * ``value`` / ``prior`` / ``expected`` — stored in the shared closed immutable
+      encoding and THAWED FRESH on every read, so a reader mutates a throwaway;
+    * ``signals``  — a POINT-IN-TIME detached snapshot (§27.2 permits ``None`` or a
+      point-in-time snapshot; publication happens at PREFLIGHT, before any blocking
+      call, so this is empty by construction — it is a stable shape, never a live
+      view, and deliberately has NO refresh machinery, callback, or registry).
+
+    There is NO ``param``, NO registry under any spelling, NO Qt owner, no callback
+    or closure, and no raw exception object.  Nothing here can execute, mutate, or
+    observe live transaction state; every slot is asserted by the architecture test.
+    """
+
+    __slots__ = ("path", "_value", "_prior", "_expected", "_signals_snapshot")
+
+    def __init__(self, path, value, prior, expected, signals_snapshot=None):
+        path = tuple(path)
+        object.__setattr__(self, "path", path)
+        object.__setattr__(self, "_value", _freeze_carrier_payload(value, path))
+        object.__setattr__(self, "_prior", _freeze_carrier_payload(prior, path))
+        object.__setattr__(
+            self, "_expected", _freeze_carrier_payload(expected, path))
+        # Frozen at construction into plain immutable text/flags; never a live view.
+        object.__setattr__(
+            self, "_signals_snapshot",
+            _controls_v2_detached_signal_snapshot(signals_snapshot))
+
+    @property
+    def value(self):
+        return _thaw_carrier_payload(self._value)
+
+    @property
+    def prior(self):
+        return _thaw_carrier_payload(self._prior)
+
+    @property
+    def expected(self):
+        return _thaw_carrier_payload(self._expected)
+
+    @property
+    def signals(self):
+        """A FRESH copy of the POINT-IN-TIME snapshot — never a live registry."""
+        return _controls_v2_detached_signal_snapshot(self._signals_snapshot)
+
+    def __setattr__(self, name, value):
+        raise AttributeError(
+            "_ControlsCarrierDiagnostic is a frozen value record "
+            f"(attempted to set {name!r})")
+
+    def __delattr__(self, name):
+        raise AttributeError("_ControlsCarrierDiagnostic is a frozen value record")
+
+    def __repr__(self):
+        return (f"_ControlsCarrierDiagnostic(path={self.path!r}, "
                 f"value={self.value!r}, prior={self.prior!r}, "
                 f"expected={self.expected!r})")
 
@@ -6058,15 +6156,27 @@ class staticWidget(QWidget):
             entry["mismatched"] = not matched
             entry["repaired"] = bool(entry["errors"]) and matched
             if entry["repaired"]:
-                run_config_debug_log(
-                    logger,
-                    "controls_signal_cleanup_repaired",
-                    widget=self,
-                    origin="controls_v2_recovery",
-                    signal_owner=list(entry["path"]),
-                    prior_blocked=bool(entry["prior"]),
-                    cleanup_errors=[repr(e) for e in entry["errors"]],
-                )
+                # §27.4 req 5-6: the SAME per-error formatter as the detached
+                # snapshot, and the whole publication is contained.  This site used
+                # a raw `[repr(e) for e in ...]`: a hostile `__repr__` escaped the
+                # classification loop, the outer collector caught it, and a REPAIRED
+                # transient was falsely reported as ("Signal", "signal_state") —
+                # diagnostic formatting must never alter recovery classification.
+                try:
+                    run_config_debug_log(
+                        logger,
+                        "controls_signal_cleanup_repaired",
+                        widget=self,
+                        origin="controls_v2_recovery",
+                        signal_owner=list(entry["path"]),
+                        prior_blocked=bool(entry["prior"]),
+                        cleanup_errors=[
+                            _controls_v2_safe_error_text(e)
+                            for e in entry["errors"]],
+                    )
+                except Exception:
+                    logger.debug("repaired-cleanup event publication raised",
+                                 exc_info=True)
         return failures
 
     #: The self-state fields the install writes, as

@@ -77,6 +77,29 @@ def events(monkeypatch):
     return captured
 
 
+def _find_live_registry(record, owner):
+    """The FIRST attribute of *record* yielding a dict that holds a LIVE entry.
+
+    §27.3 req 6 / §27.5: the invariant is REACHABILITY, not attribute naming — "a
+    leading underscore is not a capability boundary".  This walks every attribute
+    (the independent verifier's SHA-agnostic pattern), so it finds `signals` at
+    `1266ef57` and `_signals` at `e1ab5794` without naming either.  A live entry is
+    identified by its `owner` member, which the detached projection omits."""
+    for name in dir(record):
+        if name.startswith("__"):
+            continue
+        try:
+            value = getattr(record, name)
+        except Exception:
+            continue
+        if not isinstance(value, dict) or id(owner) not in value:
+            continue
+        entry = value[id(owner)]
+        if isinstance(entry, dict) and entry.get("owner") is owner:
+            return name, value
+    return None, None
+
+
 def _one_shot_unblock(owner, message):
     """A real `blockSignals` whose FIRST restore attempt raises, leaving it blocked."""
     real = type(owner).blockSignals
@@ -115,24 +138,34 @@ def test_published_map_exposes_no_live_registry_object(widget):
     may be the live registry, a live entry, or the live execution carrier, and the
     internal registry accessor must refuse every published twin."""
     from xdart.gui.tabs.static_scan.static_scan_widget import (
+        _ControlsCarrierDiagnostic, _PreparedLegacyCarrier,
         _controls_v2_carrier_registry)
 
     staged = widget.stage_controls_transaction([(MASK, "/tmp/t25r5-arch.edf")])
     captured = {}
     real_set = type(widget._controls_v2_param(MASK)).setValue
     param = widget._controls_v2_param(MASK)
+    real_writer = widget._controls_v2_write_legacy_carrier
+
+    def capture_writer(params, carrier, value):
+        # the LIVE execution carrier is the only holder of the one registry
+        captured["live_registry"] = _controls_v2_carrier_registry(carrier)
+        return real_writer(params, carrier, value)
 
     def setter(self, value, *args, **kwargs):
         if self is param and "t25r5-arch" in str(value):
             published = widget._controls_v2_bound_carriers
             captured["published"] = published
             captured["twin"] = published[MASK]
+            captured["live_param"] = param
             captured["snapshot_a"] = published[MASK].signals
             captured["snapshot_b"] = published[MASK].signals
         return real_set(self, value, *args, **kwargs)
 
     monkeypatch_setattr = pytest.MonkeyPatch()
     monkeypatch_setattr.setattr(type(param), "setValue", setter)
+    monkeypatch_setattr.setattr(
+        widget, "_controls_v2_write_legacy_carrier", capture_writer)
     try:
         result = widget.commit_controls_transaction(staged)
     finally:
@@ -140,23 +173,43 @@ def test_published_map_exposes_no_live_registry_object(widget):
 
     assert result.ok
     assert isinstance(captured["published"], MappingProxyType)
-    twin = captured["twin"]
-    # the published value is NOT an execution carrier ...
-    assert _controls_v2_carrier_registry(twin) is None
-    # ... and each read of its diagnostic view is a FRESH detached object
-    assert captured["snapshot_a"] == captured["snapshot_b"]
+    record = captured["twin"]
+    live_registry = captured["live_registry"]
+    live_param = captured["live_param"]
+
+    # §27.6 case 1/3 + §27.3 req 6: walk EVERY slot of EVERY published record and
+    # assert no value is the live registry, a live entry, or the bound Parameter.
+    # This replaces the §26 "public surface" assertion, which was the hole.
+    assert live_registry, "the transaction registry should have been populated"
+    for path, published in captured["published"].items():
+        assert isinstance(published, _ControlsCarrierDiagnostic)
+        assert not isinstance(published, _PreparedLegacyCarrier)
+        assert _controls_v2_carrier_registry(published) is None
+        slots = []
+        for klass in type(published).__mro__:
+            slots.extend(getattr(klass, "__slots__", ()) or ())
+        assert slots, "the record must declare __slots__ so this walk is total"
+        for name in slots:
+            value = getattr(published, name, None)
+            assert value is not live_registry, (
+                f"published record slot {name!r} IS the live registry")
+            assert value is not live_param, (
+                f"published record slot {name!r} IS the bound Parameter")
+            for entry in live_registry.values():
+                assert value is not entry, (
+                    f"published record slot {name!r} IS a live registry entry")
+        # no attribute under ANY spelling yields a live entry
+        assert _find_live_registry(published, live_param) == (None, None)
+        # and there is no parameter/Qt owner to write through
+        assert not hasattr(published, "param")
+        assert not hasattr(published, "_signals")
+
+    # each read of the inert projection is a FRESH detached object
+    assert captured["snapshot_a"] == captured["snapshot_b"] == {}
     assert captured["snapshot_a"] is not captured["snapshot_b"]
-    for key, entry in captured["snapshot_a"].items():
-        assert entry is not captured["snapshot_b"][key]
-        assert type(entry) is dict
-        # the live Qt owner is deliberately absent from the projection
-        assert "owner" not in entry
-        assert type(entry["errors"]) is list
-        for error in entry["errors"]:
-            assert type(error) is str
     # the mapping itself still refuses item assignment (§22.10.A.3 retained)
     with pytest.raises(TypeError):
-        captured["published"][MASK] = twin
+        captured["published"][MASK] = record
 
 
 def test_setter_clearing_the_published_signals_cannot_erase_authority(
@@ -176,10 +229,17 @@ def test_setter_clearing_the_published_signals_cannot_erase_authority(
 
     def setter(self, value, *args, **kwargs):
         if self is param and value == requested:
-            twin = widget._controls_v2_bound_carriers[MASK]
-            seen["visible"] = len(twin.signals)
-            twin.signals.clear()                 # impotent: a throwaway copy
-            seen["after_clear"] = len(twin.signals)
+            # §27.2 RESHAPE: the original form asserted live entries were VISIBLE
+            # through the published view.  That pinned the exploit path's
+            # availability, not a product contract — §27.2 ruled no production
+            # consumer reads `_controls_v2_bound_carriers[*].signals`.  The
+            # assertion is now ABSENCE of authority, by any attribute spelling.
+            record = widget._controls_v2_bound_carriers[MASK]
+            name, live = _find_live_registry(record, param)
+            seen["live_attr"] = name
+            seen["visible"] = len(record.signals)
+            record.signals.clear()               # impotent: a throwaway copy
+            seen["after_clear"] = len(record.signals)
         return real_set(self, value, *args, **kwargs)
 
     monkeypatch.setattr(type(param), "setValue", setter)
@@ -191,9 +251,12 @@ def test_setter_clearing_the_published_signals_cannot_erase_authority(
 
         assert not result.ok
         assert param.value() == prior
-        # the registry was visible for diagnostics and survived the clear
-        assert seen["visible"] >= 1
-        assert seen["after_clear"] == seen["visible"]
+        # §27.6 case 1/4: NO attribute of the published record yields a live entry,
+        # and the projection it does expose is inert (empty, and clearable without
+        # effect) — the authority is absent, not merely copy-protected.
+        assert seen["live_attr"] is None
+        assert seen["visible"] == 0
+        assert seen["after_clear"] == 0
         # the earliest prior survived, so the child is repaired and NOT named
         assert (param.signalsBlocked(),
                 CHILD in result.recovery_failed_paths) == (False, False)
@@ -255,19 +318,25 @@ def test_rewriting_a_published_prior_cannot_forge_a_successful_commit(
 
     def setter(self, value, *args, **kwargs):
         if self is param and value == requested:
-            twin = widget._controls_v2_bound_carriers[MASK]
-            entry = twin.signals[id(owner)]
-            seen["prior_seen"] = entry["prior"]
-            entry["prior"] = True                # throwaway
-            seen["prior_after"] = twin.signals[id(owner)]["prior"]
+            # §27.2 RESHAPE: the original indexed the live entry to forge its
+            # `prior`.  There is now no entry to index under ANY attribute name, so
+            # the assertion is absence; the attempt itself must stay harmless.
+            record = widget._controls_v2_bound_carriers[MASK]
+            name, live = _find_live_registry(record, owner)
+            seen["live_attr"] = name
+            projection = record.signals
+            seen["entry_present"] = id(owner) in projection
+            projection[id(owner)] = {"prior": True}   # throwaway
+            seen["still_absent"] = id(owner) not in record.signals
         return real_set(self, value, *args, **kwargs)
 
     monkeypatch.setattr(type(param), "setValue", setter)
     try:
         result = widget.commit_controls_transaction(staged)
 
-        assert seen["prior_seen"] is False
-        assert seen["prior_after"] is False      # the rewrite did not stick
+        assert seen["live_attr"] is None
+        assert seen["entry_present"] is False
+        assert seen["still_absent"] is True      # the injection did not stick
         assert result.ok
         assert owner.signalsBlocked() is False
     finally:
@@ -307,38 +376,43 @@ def test_replacing_the_whole_published_mapping_redirects_nothing(
     assert param.signalsBlocked() is False
 
 
-def test_diagnostic_copy_cannot_act_as_an_execution_carrier(widget):
-    """§26.3 req 2/4: even routed into the writer, a published twin cannot reach the
-    live registry — so it can never become a second recovery authority."""
+def test_diagnostic_copy_is_a_value_record_not_an_execution_carrier(widget):
+    """§27.3 req 2-3 (RESHAPED from the §26 twin form): what `diagnostic_copy()`
+    returns is a VALUE-ONLY record of a different type entirely — it cannot reach the
+    live registry and cannot be mistaken for an execution carrier."""
     from xdart.gui.tabs.static_scan.static_scan_widget import (
-        _PreparedLegacyCarrier, _controls_v2_carrier_registry)
+        _ControlsCarrierDiagnostic, _PreparedLegacyCarrier,
+        _controls_v2_carrier_registry)
 
     param = widget._controls_v2_param(MASK)
     registry = {}
-    live = _PreparedLegacyCarrier(
-        MASK, param, "a", "b", "c", registry)
-    twin = live.diagnostic_copy()
+    live = _PreparedLegacyCarrier(MASK, param, "a", "b", "c", registry)
+    record = live.diagnostic_copy()
 
-    assert twin is not live
+    assert isinstance(record, _ControlsCarrierDiagnostic)
+    assert not isinstance(record, _PreparedLegacyCarrier)
+    # the execution carrier still owns the ONE registry ...
     assert _controls_v2_carrier_registry(live) is registry
-    assert _controls_v2_carrier_registry(twin) is None
-    # the public attribute never hands out the live dict, on either object
-    assert live.signals is not registry
-    assert twin.signals is not registry
-    # and the frozen-plan claim still holds
+    # ... and the value record is refused by the accessor and holds no param
+    assert _controls_v2_carrier_registry(record) is None
+    assert not hasattr(record, "param")
+    assert record.signals == {}
+    # values round-trip, detached and fresh per read
+    assert (record.path, record.value, record.prior, record.expected) == (
+        MASK, "a", "b", "c")
     with pytest.raises(AttributeError):
-        twin.signals = {}
+        record.signals = {}
 
 
 def test_five_positional_carrier_construction_still_works(widget):
-    """§26.3 req 6 / the 8-case depth oracle constructs carriers 5-positionally."""
+    """§27.3 req 5 / the 8-case depth oracle constructs carriers 5-positionally."""
     from xdart.gui.tabs.static_scan.static_scan_widget import (
         _PreparedLegacyCarrier, _controls_v2_carrier_registry)
 
     carrier = _PreparedLegacyCarrier(MASK, widget._controls_v2_param(MASK),
                                      "v", "p", "e")
-    assert carrier.signals == {}
     assert _controls_v2_carrier_registry(carrier) is None
+    assert (carrier.value, carrier.prior, carrier.expected) == ("v", "p", "e")
 
 
 # ---------------------------------------------------------------------------
