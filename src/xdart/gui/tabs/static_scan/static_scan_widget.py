@@ -339,6 +339,51 @@ def _controls_v2_signal_state_matches(owner, wanted) -> bool:
         return False
 
 
+#: Registry entry fields that are safe to project into a detached diagnostic
+#: snapshot.  ``owner`` is DELIBERATELY excluded (§26.3 req 5/8): it is the live Qt
+#: object, and nothing publicly reachable from ``_controls_v2_bound_carriers``
+#: should hand out a live mutable participant.  The stable ``path`` identifies the
+#: owner for every diagnostic purpose.
+_CONTROLS_V2_SIGNAL_SNAPSHOT_FLAGS = (
+    "prior", "probed", "acquired", "mismatched", "repaired")
+
+
+def _controls_v2_detached_signal_snapshot(registry):
+    """A FRESH, fully DETACHED plain copy of the signal registry (§26.3 req 3/5).
+
+    Nothing in the result IS the live registry, a live entry, or a live mutable
+    member of one: the flags are copied by value, the ordered cleanup errors are
+    projected to ``repr`` strings, and the live Qt ``owner`` is omitted entirely.
+    Mutating any part of the result — clearing it, replacing an entry, rewriting a
+    ``prior`` — therefore cannot alter recovery authority."""
+    snapshot = {}
+    for key, entry in (registry or {}).items():
+        try:
+            projected = {
+                "path": tuple(entry.get("path") or ()),
+                "errors": [repr(error) for error in (entry.get("errors") or ())],
+            }
+            for flag in _CONTROLS_V2_SIGNAL_SNAPSHOT_FLAGS:
+                projected[flag] = bool(entry.get(flag))
+        except Exception:
+            logger.debug("signal registry snapshot projection raised",
+                         exc_info=True)
+            continue
+        snapshot[key] = projected
+    return snapshot
+
+
+def _controls_v2_carrier_registry(carrier):
+    """The LIVE signal registry for *carrier*, or ``None`` (§26.3 req 4).
+
+    The only route to the live registry.  A DIAGNOSTIC copy — the kind published
+    through ``_controls_v2_bound_carriers`` — always yields ``None``, so a published
+    twin can never act as an execution carrier even if one reached this seam."""
+    if carrier is None or getattr(carrier, "_diagnostic", False):
+        return None
+    return getattr(carrier, "_signals", None)
+
+
 def _controls_v2_register_signal_owner(registry, owner, stable):
     """The registry entry for *owner*, created on first touch (§25.4 / §25.6).
 
@@ -403,7 +448,11 @@ def _controls_v2_acquire_signal_block(registry, owner, stable):
                      exc_info=True)
         try:
             owner.blockSignals(entry["prior"])
-        except Exception:
+        except Exception as restore_exc:
+            # §26.4 closing paragraph: CAPTURE this second cleanup exception, do
+            # not merely log it.  The acquisition exception already causes the
+            # typed failure, but the ordered diagnostic list must not discard it.
+            entry["errors"].append(restore_exc)
             logger.debug("immediate restore after failed acquisition of %s "
                          "raised", entry["path"], exc_info=True)
         if not _controls_v2_signal_state_matches(owner, entry["prior"]):
@@ -414,6 +463,28 @@ def _controls_v2_acquire_signal_block(registry, owner, stable):
         entry["prior"] = bool(previous)
     entry["acquired"] = True
     return entry
+
+
+def _controls_v2_retry_signal_restore(entry):
+    """The FINAL-RETRY backstop for one signal owner (§26.4 req 1-2/6).
+
+    §26.4 P2: the retry used to be the bare lambda
+    ``entry["owner"].blockSignals(entry["prior"])``.  The generic member driver
+    caught its exception but never recorded it, so a retry that RESTORED the state
+    and then raised left ``errors == []`` and ``repaired == False`` and emitted no
+    ``controls_signal_cleanup_repaired`` event — the state repair was right, but the
+    cleanup exception was ERASED instead of retained as structured evidence.
+
+    The exact exception is now APPENDED to the same entry's ordered error list —
+    never replacing earlier cleanup exceptions — and then re-raised into the member
+    driver's containment, which still verifies the final state independently."""
+    try:
+        entry["owner"].blockSignals(entry["prior"])
+    except Exception as exc:
+        entry["errors"].append(exc)
+        logger.debug("final signal-state retry for %s raised", entry["path"],
+                     exc_info=True)
+        raise
 
 
 def _controls_v2_release_signal_block(entry):
@@ -1086,17 +1157,52 @@ class _PreparedLegacyCarrier:
     ``param``; ``None`` means "constructed outside a transaction", and the caller
     then gets a throwaway registry so direct construction in a test still works."""
 
-    __slots__ = ("path", "param", "_value", "_prior", "_expected", "signals")
+    __slots__ = ("path", "param", "_value", "_prior", "_expected",
+                 "_signals", "_diagnostic")
 
-    def __init__(self, path, param, value, prior, expected, signals=None):
+    def __init__(self, path, param, value, prior, expected, signals=None,
+                 diagnostic=False):
         path = tuple(path)
         object.__setattr__(self, "path", path)
         object.__setattr__(self, "param", param)
-        object.__setattr__(self, "signals", signals)
+        object.__setattr__(self, "_signals", signals)
+        object.__setattr__(self, "_diagnostic", bool(diagnostic))
         object.__setattr__(self, "_value", _freeze_carrier_payload(value, path))
         object.__setattr__(self, "_prior", _freeze_carrier_payload(prior, path))
         object.__setattr__(
             self, "_expected", _freeze_carrier_payload(expected, path))
+
+    @property
+    def signals(self):
+        """A FRESH, fully DETACHED snapshot of the signal registry (§26.3 req 3/5).
+
+        §26.3 P1: this attribute used to hand out the ONE mutable registry dict, and
+        the live execution carriers were published through
+        ``_controls_v2_bound_carriers``.  ``MappingProxyType`` protected only the
+        outer path->carrier mapping, so a real setter could reach a live carrier and
+        call ``carrier.signals.clear()`` — erasing recovery authority after the
+        earliest prior state was recorded.  Rollback then re-registered the
+        already-blocked child with ``prior=True`` and final recovery faithfully
+        "restored" that forged value, certifying a leaked Qt block.
+
+        Every read now returns a throwaway plain copy that shares NO object with the
+        live registry (see :func:`_controls_v2_detached_signal_snapshot`), so
+        clearing it, replacing an entry, or rewriting a ``prior`` mutates nothing.
+        The live registry is reachable ONLY through
+        :func:`_controls_v2_carrier_registry`, and only from a non-diagnostic
+        carrier."""
+        return _controls_v2_detached_signal_snapshot(self._signals)
+
+    def diagnostic_copy(self):
+        """A DETACHED diagnostic twin for publication (§26.3 req 2-3).
+
+        A distinct object from the execution carrier, marked so
+        :func:`_controls_v2_carrier_registry` refuses it: even if a caller managed
+        to route this copy into the strict writer or a rollback helper, it could
+        not reach the live registry."""
+        return _PreparedLegacyCarrier(
+            self.path, self.param, self.value, self.prior, self.expected,
+            self._signals, diagnostic=True)
 
     @property
     def value(self):
@@ -5015,7 +5121,7 @@ class staticWidget(QWidget):
             path = () if carrier is None else carrier.path
             raise ControlsTransactionError(
                 tuple(path), "no bound carrier for legacy write", value)
-        registry = carrier.signals
+        registry = _controls_v2_carrier_registry(carrier)
         if registry is None:
             registry = {}         # constructed outside a transaction (direct call)
         root = None
@@ -5097,7 +5203,7 @@ class staticWidget(QWidget):
         param = carrier.param
         if param is None:
             return
-        registry = carrier.signals
+        registry = _controls_v2_carrier_registry(carrier)
         if registry is None:
             registry = {}
         entry = None
@@ -5169,7 +5275,7 @@ class staticWidget(QWidget):
         param = carrier.param
         if param is None:
             return
-        registry = carrier.signals
+        registry = _controls_v2_carrier_registry(carrier)
         if registry is None:
             registry = {}
         entry = None
@@ -5465,8 +5571,18 @@ class staticWidget(QWidget):
         # redirected the write to an object the outer loop never rolled back.  The
         # commit loop owns the local `_PreparedLegacyCarrier` objects and passes
         # them DIRECTLY to the strict writer and to every rollback helper.
+        #
+        # §26.3 req 2-3: what is PUBLISHED is a DETACHED diagnostic twin of each
+        # carrier, never the live execution object.  Publishing the live carriers
+        # re-opened the very defect class §22 closed: `MappingProxyType` froze only
+        # the outer mapping, so a real setter could reach a live carrier and mutate
+        # the ONE signal registry through `carrier.signals` — erasing recovery
+        # authority mid-transaction and letting a leaked Qt block be certified as
+        # repaired.  The twins expose only fresh detached snapshots, and
+        # `_controls_v2_carrier_registry` refuses them outright, so nothing
+        # reachable through this mapping can alter execution or recovery authority.
         self._controls_v2_bound_carriers = MappingProxyType(
-            {c.path: c for c in carriers})
+            {c.path: c.diagnostic_copy() for c in carriers})
 
         # B.3: display snapshot BEFORE the first write, under scan_lock; an
         # uncopyable field RAISES -> typed preflight failure (never an alias).
@@ -5923,8 +6039,11 @@ class staticWidget(QWidget):
                 matches=(lambda host, c, _e=entry:
                          _controls_v2_signal_state_matches(
                              _e["owner"], _e["prior"])),
+                # §26.4 req 1: a signal-SPECIFIC helper, not a bare lambda, so a
+                # restore-then-raise records its exception on the entry before the
+                # member driver contains it.
                 backstop=(lambda host, c, _e=entry:
-                          _e["owner"].blockSignals(_e["prior"])),
+                          _controls_v2_retry_signal_restore(_e)),
             ))
         if not members:
             return []
