@@ -339,28 +339,146 @@ def _controls_v2_signal_state_matches(owner, wanted) -> bool:
         return False
 
 
-def _controls_v2_validated_recovery_path(item, label=None):
-    """The validated recovery path for *item*, or raise (§24.3).
+def _controls_v2_register_signal_owner(registry, owner, stable):
+    """The registry entry for *owner*, created on first touch (§25.4 / §25.6).
 
-    A valid recovery path is a NONEMPTY concrete ``tuple``/``list`` of NONEMPTY
-    ``str`` segments.  §24.3: a wrapper that returned a path containing an object
-    whose ``__eq__`` raises poisoned the collector's dedup comparison and skipped
-    every later recovery class, so NO attacker-controlled equality may enter the
-    global ``failures`` list.  ``type(segment) is not str`` is deliberately exact:
-    a ``str`` SUBCLASS may override ``__eq__``, which is the same hazard."""
-    if isinstance(item, (str, bytes)) or not isinstance(item, (tuple, list)):
+    THE ONE transaction-local, identity-keyed signal restoration registry.  It is
+    created per commit and carried on the existing transaction context (and on the
+    prepared carriers, which is how the strict writer and both rollback helpers
+    reach it without any new ambient owner and without changing a single
+    oracle-injected signature).
+
+    §25.6 req 1-2: the prior state is QUERIED through ``signalsBlocked()`` BEFORE
+    any ``blockSignals(True)`` and stored immediately, because deriving it from the
+    acquisition's RETURN value loses it entirely when that call blocks the owner and
+    then raises — the owner was then skipped by cleanup as "never blocked".
+
+    §25.4 req 1 / §25.6 req 3: the EARLIEST prior state per owner identity wins.  A
+    later acquisition (a rollback re-blocking the same child) must never overwrite
+    it with ``True``, or cleanup would "restore" the owner to blocked."""
+    key = id(owner)
+    entry = registry.get(key)
+    if entry is not None:
+        return entry
+    probed = False
+    prior = False
+    probe = getattr(owner, "signalsBlocked", None)
+    if callable(probe):
+        try:
+            prior = bool(probe())
+            probed = True
+        except Exception:
+            logger.debug("prior signal-state probe raised", exc_info=True)
+    entry = {
+        "owner": owner,
+        "path": tuple(stable),
+        "prior": prior,
+        # True once the prior state came from an authoritative source, so the
+        # acquisition return value is only a FALLBACK for owners that do not
+        # expose signalsBlocked() at all.
+        "probed": probed,
+        "acquired": False,
+        "errors": [],
+        "mismatched": False,
+        "repaired": False,
+    }
+    registry[key] = entry
+    return entry
+
+
+def _controls_v2_acquire_signal_block(registry, owner, stable):
+    """Register *owner*, then block its signals; RAISE if blocking fails (§25.6).
+
+    On acquire-then-raise the owner may ALREADY be blocked, so an immediate restore
+    is attempted and the owner is LEFT REGISTERED for final verification (§25.6
+    req 4) — it is never dropped as "never blocked"."""
+    if owner is None:
+        return None
+    entry = _controls_v2_register_signal_owner(registry, owner, stable)
+    try:
+        previous = owner.blockSignals(True)
+    except Exception as exc:
+        entry["errors"].append(exc)
+        logger.debug("signal acquisition for %s raised", entry["path"],
+                     exc_info=True)
+        try:
+            owner.blockSignals(entry["prior"])
+        except Exception:
+            logger.debug("immediate restore after failed acquisition of %s "
+                         "raised", entry["path"], exc_info=True)
+        if not _controls_v2_signal_state_matches(owner, entry["prior"]):
+            entry["mismatched"] = True
+        raise
+    if not entry["probed"] and not entry["acquired"]:
+        # No signalsBlocked(): fall back to the FIRST acquisition's return value.
+        entry["prior"] = bool(previous)
+    entry["acquired"] = True
+    return entry
+
+
+def _controls_v2_release_signal_block(entry):
+    """Restore *entry*'s owner to its EARLIEST prior state and verify (§25.5).
+
+    Returns the cleanup exception or ``None``.  §25.5 req 1-2: the exception is
+    tracked INDEPENDENTLY of the final state match — a restore that puts the state
+    back and THEN raises used to be logged and erased, so a successful setter
+    returned success while an exception had been discarded.  The final MISMATCH is
+    tracked separately because it is what decides whether recovery must retry
+    (§25.5 req 3)."""
+    if entry is None:
+        return None
+    owner = entry["owner"]
+    prior = entry["prior"]
+    cleanup_exc = None
+    try:
+        owner.blockSignals(prior)
+    except Exception as exc:
+        cleanup_exc = exc
+        entry["errors"].append(exc)
+        logger.debug("signal-state restore of %s raised", entry["path"],
+                     exc_info=True)
+    entry["mismatched"] = not _controls_v2_signal_state_matches(owner, prior)
+    return cleanup_exc
+
+
+def _controls_v2_validated_recovery_path(item, label=None):
+    """The validated recovery path for *item*, or raise (§24.3 / §25.3).
+
+    A valid recovery path is a NONEMPTY **exact built-in** ``tuple``/``list`` of
+    NONEMPTY **exact built-in** ``str`` segments.  No attacker-controlled equality
+    may enter the global ``failures`` list: a wrapper that returned a path holding
+    an object whose ``__eq__`` raises poisoned the collector's dedup comparison and
+    skipped every later recovery class (§24.3).
+
+    §25.3 closed a TIME-OF-CHECK/TIME-OF-USE split in the first version, which
+    accepted ``tuple``/``list`` SUBCLASSES through ``isinstance()``, validated ONE
+    iteration, and then took a SECOND iteration in ``tuple(item)``.  A stateful
+    container could therefore yield exact strings while being validated and a
+    non-string or equality-poison object while being converted.  Two defenses now:
+
+    1. only the EXACT built-in container types are admitted, so ``__iter__``
+       cannot be overridden at all; and
+    2. the container is SNAPSHOTTED EXACTLY ONCE, before any inspection, and it is
+       that immutable snapshot which is validated AND returned AND merged — never a
+       fresh iteration of the caller's object.
+
+    ``type(...) is not str`` is likewise deliberately exact: a ``str`` SUBCLASS may
+    override ``__eq__``, which is the same hazard."""
+    if type(item) is not tuple and type(item) is not list:
         raise TypeError(
             f"malformed recovery failure entry {item!r} from class {label!r}: "
-            "expected a nonempty tuple/list of str segments")
-    if not item:
+            "expected a nonempty built-in tuple/list of str segments "
+            f"(got {type(item).__name__!r})")
+    snapshot = tuple(item)          # SNAPSHOT ONCE, before any inspection
+    if not snapshot:
         raise ValueError(
             f"empty recovery failure path from class {label!r}")
-    for segment in item:
+    for segment in snapshot:        # validate the EXACT snapshot that is returned
         if type(segment) is not str or not segment:
             raise TypeError(
                 f"malformed recovery path segment {segment!r} from class "
-                f"{label!r}: every segment must be a nonempty str")
-    return tuple(item)
+                f"{label!r}: every segment must be a nonempty built-in str")
+    return snapshot
 
 
 class GIMotorObservation:
@@ -958,14 +1076,23 @@ class _PreparedLegacyCarrier:
     ``expected``) reconstructs a FRESH value, so a caller that mutates what it
     read mutates a throwaway — the prepared plan is recursively immutable, not
     merely attribute-frozen.  An unsupported mutable payload is REFUSED here,
-    at staging, with the typed :class:`ControlsTransactionError`."""
+    at staging, with the typed :class:`ControlsTransactionError`.
 
-    __slots__ = ("path", "param", "_value", "_prior", "_expected")
+    §25.4/§25.6: the carrier also carries a REFERENCE to the transaction's ONE
+    identity-keyed ``signals`` registry (the same dict the transaction context
+    holds).  That is how the strict writer and BOTH rollback helpers reach it
+    without a new ambient owner and — critically — without changing any signature
+    the independent depth oracles inject at.  The reference is read-only like
+    ``param``; ``None`` means "constructed outside a transaction", and the caller
+    then gets a throwaway registry so direct construction in a test still works."""
 
-    def __init__(self, path, param, value, prior, expected):
+    __slots__ = ("path", "param", "_value", "_prior", "_expected", "signals")
+
+    def __init__(self, path, param, value, prior, expected, signals=None):
         path = tuple(path)
         object.__setattr__(self, "path", path)
         object.__setattr__(self, "param", param)
+        object.__setattr__(self, "signals", signals)
         object.__setattr__(self, "_value", _freeze_carrier_payload(value, path))
         object.__setattr__(self, "_prior", _freeze_carrier_payload(prior, path))
         object.__setattr__(
@@ -4888,14 +5015,18 @@ class staticWidget(QWidget):
             path = () if carrier is None else carrier.path
             raise ControlsTransactionError(
                 tuple(path), "no bound carrier for legacy write", value)
-        root_prev = _CONTROLS_V2_MISSING
-        child_prev = _CONTROLS_V2_MISSING
+        registry = carrier.signals
+        if registry is None:
+            registry = {}         # constructed outside a transaction (direct call)
+        root = None
+        child = None
         setter_exc = None
         set_attempted = False
         try:
-            if params is not None:
-                root_prev = params.blockSignals(True)
-            child_prev = param.blockSignals(True)
+            root = _controls_v2_acquire_signal_block(
+                registry, params, ("Signal", "root_signals"))
+            child = _controls_v2_acquire_signal_block(
+                registry, param, ("Signal", "child_signals"))
             set_attempted = True
             param.setValue(value)
         except Exception as exc:
@@ -4903,22 +5034,21 @@ class staticWidget(QWidget):
         # req 2: ALWAYS attempt BOTH restorations — child first (reverse of the
         # blocking order), then root — regardless of the setter's outcome and
         # regardless of whether the CHILD restoration itself failed, so a root
-        # failure can never suppress child cleanup and vice versa.
-        unrestored = []
-        for owner, prev, stable in (
-                (param, child_prev, ("Signal", "child_signals")),
-                (params, root_prev, ("Signal", "root_signals"))):
-            if owner is None or prev is _CONTROLS_V2_MISSING:
-                continue          # never blocked => nothing to restore
-            try:
-                owner.blockSignals(prev)
-            except Exception:
-                logger.debug("signal-state restore of %s after strict write of "
-                             "%s raised", stable, carrier.path, exc_info=True)
-            # req 3: the CHECK is the authority, not the absence of an exception.
-            if not _controls_v2_signal_state_matches(owner, prev):
-                unrestored.append((stable, owner, prev))
-        if setter_exc is None and not unrestored:
+        # failure can never suppress child cleanup and vice versa.  Owners that
+        # raised during ACQUISITION are released too: they may be blocked (§25.6).
+        cleanup = []
+        for entry in (child, root):
+            if entry is None:
+                continue
+            exc = _controls_v2_release_signal_block(entry)
+            if exc is not None:
+                cleanup.append(entry["path"])
+        # §25.5 req 1-3: a cleanup EXCEPTION and a final MISMATCH are tracked
+        # separately.  Either one fails the write; the mismatch is additionally
+        # what final recovery must retry.
+        mismatched = [e["path"] for e in (child, root)
+                      if e is not None and e["mismatched"]]
+        if setter_exc is None and not cleanup and not mismatched:
             return
         if setter_exc is not None:
             # req 5: the setter is the PRIMARY reason when both fail.
@@ -4926,10 +5056,13 @@ class staticWidget(QWidget):
                       if set_attempted
                       else f"legacy carrier signal blocking failed: {setter_exc!r}")
         else:
-            # req 4: a good setter plus unrestored signal state is still a failure.
+            # §24.4 req 4 / §25.5 req 2: a good setter plus ANY cleanup exception —
+            # even one raised AFTER the state was already restored — is a typed
+            # forward failure, as is a silent final mismatch.
+            named = list(dict.fromkeys(cleanup + mismatched))
             reason = ("legacy carrier signal state not restored after write: "
-                      + ", ".join("/".join(p) for p, _o, _s in unrestored))
-        raise _ControlsStrictWriteError(reason, unrestored, setter_exc)
+                      + ", ".join("/".join(p) for p in named))
+        raise _ControlsStrictWriteError(reason, mismatched, setter_exc)
 
     def _controls_v2_carrier_readback_ok(self, carrier, expected) -> bool:
         """Whether the BOUND ORIGINAL handle reads back as *expected* (§18.4).
@@ -4954,25 +5087,33 @@ class staticWidget(QWidget):
         whose path was reclaimed by a replacement — is restored on the ORIGINAL
         handle captured at preflight, never on a path-re-resolved object, so the
         replacement is left untouched and the object actually written is the one
-        actually restored."""
+        actually restored.
+
+        §25.4 req 3: this used to SWALLOW its unblock exception, so a force restore
+        could leave the child permanently blocked with nothing registered anywhere.
+        The block/restore now goes through the transaction's ONE signal registry, so
+        the cleanup outcome is REGISTERED and the final signal-state recovery class
+        sees this owner even though the forward write succeeded."""
         param = carrier.param
         if param is None:
             return
+        registry = carrier.signals
+        if registry is None:
+            registry = {}
+        entry = None
         try:
-            prev = param.blockSignals(True)
+            entry = _controls_v2_acquire_signal_block(
+                registry, param, ("Signal", "child_signals"))
         except Exception:
-            prev = None
+            logger.debug("force-restore signal acquisition for %s raised",
+                         carrier.path, exc_info=True)
         try:
             type(param).setValue(param, value)
         except Exception:
             logger.debug("force-restore of %s failed", carrier.path,
                          exc_info=True)
         finally:
-            if prev is not None:
-                try:
-                    param.blockSignals(prev)
-                except Exception:
-                    pass
+            _controls_v2_release_signal_block(entry)
 
     def _controls_v2_rollback_legacy_all(self, params, applied):
         """Restore ALL attempted prepared carriers in REVERSE order, each through
@@ -5017,22 +5158,31 @@ class staticWidget(QWidget):
         §19.5 req 5: the target is always ``carrier.param`` — an object newly
         installed at the same path is never written — but the setter itself is
         the carrier's own, so an override that refuses the value is observable in
-        the readback instead of being silently bypassed."""
+        the readback instead of being silently bypassed.
+
+        §25.4 req 3: this used to SWALLOW its unblock exception, so a clean forward
+        write followed by a later failure and a raising ROLLBACK unblock left the
+        child permanently blocked with NO signal-recovery target registered — the
+        final signal-state class never ran.  The block/restore now goes through the
+        transaction's ONE signal registry, so the cleanup outcome is REGISTERED and
+        observable to final recovery."""
         param = carrier.param
         if param is None:
             return
+        registry = carrier.signals
+        if registry is None:
+            registry = {}
+        entry = None
         try:
-            prev = param.blockSignals(True)
+            entry = _controls_v2_acquire_signal_block(
+                registry, param, ("Signal", "child_signals"))
         except Exception:
-            prev = None
+            logger.debug("rollback signal acquisition for %s raised",
+                         carrier.path, exc_info=True)
         try:
             param.setValue(value)
         finally:
-            if prev is not None:
-                try:
-                    param.blockSignals(prev)
-                except Exception:
-                    pass
+            _controls_v2_release_signal_block(entry)
 
     #: Display-scan fields the native-int projection writes (kept in sync with
     #: ``_controls_v2_apply_native_int_snapshot_to_scan``).  §14.11.B.1: the
@@ -5255,6 +5405,14 @@ class staticWidget(QWidget):
         # missing carrier, a getter failure, OR a coercion failure (no longer
         # swallowed into expected=value) is a typed preflight failure, zero writes.
         carriers = []  # list[_PreparedLegacyCarrier]
+        # §25.4/§25.6: THE ONE transaction-local, identity-keyed signal restoration
+        # registry.  Created here, carried on the transaction context AND on every
+        # prepared carrier (which is how the strict writer and both rollback helpers
+        # reach it without a new ambient owner and without changing any
+        # oracle-injected signature).  Populated by EVERY blocking call — forward
+        # write, normal rollback, and force rollback — so final recovery observes
+        # every owner either of them touched, not just the forward writer's.
+        signal_registry = {}
         # §19.5: the previous transaction's bindings are never reachable.
         self._controls_v2_bound_carriers = MappingProxyType({})
         for path, value in projection:
@@ -5290,7 +5448,8 @@ class staticWidget(QWidget):
             # never smuggled into the plan behind a deepcopy where it stays mutable.
             try:
                 carriers.append(
-                    _PreparedLegacyCarrier(path, param, value, prior, expected))
+                    _PreparedLegacyCarrier(path, param, value, prior, expected,
+                                           signal_registry))
             except Exception:
                 logger.debug("preflight carrier payload refused for %s", path,
                              exc_info=True)
@@ -5368,6 +5527,24 @@ class staticWidget(QWidget):
                     False, failed_path=("Source",),
                     reason="source recovery receipt capture failed",
                     phase="preflight")
+            # §25.7: the captured value must actually BE the typed receipt.  The
+            # raising capture was caught but ANY returned value was accepted, so a
+            # source transaction proceeded after the capture returned `None`, an
+            # `object()`, or an equal-SHAPED plain tuple — none of which can
+            # establish the rollback proof §24.5 requires before the first write.
+            # A wrong type is treated EXACTLY like a capture failure, and a tuple is
+            # never coerced into the receipt type: coercion would fabricate proof
+            # that was never captured.
+            if not isinstance(source_receipt, SourceRecoveryReceipt):
+                logger.debug(
+                    "controls commit source receipt is not a "
+                    "SourceRecoveryReceipt (got %r)",
+                    type(source_receipt).__name__)
+                return ControlsCommitResult(
+                    False, failed_path=("Source",),
+                    reason="source recovery receipt capture failed: "
+                           "not a SourceRecoveryReceipt",
+                    phase="preflight")
 
         ctx = {
             "live": live, "intent_snapshot": intent_snapshot,
@@ -5391,7 +5568,9 @@ class staticWidget(QWidget):
             "params": params,
             # §24.4 req 6-7: signal owners the strict writer could not restore,
             # carried on the EXISTING transaction context (no new ambient state).
-            "unrestored_signals": (),
+            # §25.4/§25.6: the ONE identity-keyed signal restoration registry (the
+            # SAME dict object every prepared carrier holds).
+            "signal_registry": signal_registry,
         }
 
         # ============ POST-PREFLIGHT — ONE exception-total funnel ===========
@@ -5443,17 +5622,13 @@ class staticWidget(QWidget):
                     self._controls_v2_write_legacy_carrier(
                         params, carrier, carrier.value)
                 except _ControlsStrictWriteError as exc:
-                    # §24.4 req 6-7: hand any still-unrestored signal owner to
-                    # recovery through the EXISTING transaction context + touched
-                    # set, so it is reattempted, re-verified, and named at a stable
-                    # path.  The writer's reason is already setter-primary (req 5).
+                    # §25.4 req 2: nothing is seeded from this exception any more —
+                    # the writer already REGISTERED every owner it touched in the
+                    # transaction's one signal registry, so final recovery observes
+                    # owners stranded by the ROLLBACK too, not only by the forward
+                    # writer.  The writer's reason is already setter-primary (req 5).
                     logger.debug("strict legacy write failed for %s",
                                  carrier.path, exc_info=True)
-                    if exc.unrestored:
-                        ctx["unrestored_signals"] = (
-                            tuple(ctx.get("unrestored_signals") or ())
-                            + tuple(exc.unrestored))
-                        touched.add("signals")
                     raise _ControlsCommitAbort(
                         "legacy_apply", carrier.path, exc.reason) from exc
                 except Exception as exc:
@@ -5649,9 +5824,19 @@ class staticWidget(QWidget):
             except Exception:
                 logger.debug("controls recovery class %s raised", label,
                              exc_info=True)
-            fallback = tuple(label)              # the class's stable label
-            if fallback not in failures:
-                failures.append(fallback)
+            # §25.3 req 4-5 / §25.8 C1: the FALLBACK merge is inside containment
+            # too.  It used to sit outside, so once the validator's
+            # time-of-check/time-of-use split let a poison path into `failures`,
+            # this membership test raised OUT of the collector and skipped every
+            # later recovery class.  If even the fallback merge raises, log it and
+            # CONTINUE to the later classes — recovery never stops here.
+            try:
+                fallback = tuple(label)          # the class's stable label
+                if fallback not in failures:
+                    failures.append(fallback)
+            except Exception:
+                logger.debug("controls recovery fallback merge for %s raised",
+                             label, exc_info=True)
 
         # 1. source owner (applied LAST => restored FIRST).  §18.6: restore the
         #    SOURCE-SELECTION legacy carriers FIRST so the recovery reconcile
@@ -5693,39 +5878,77 @@ class staticWidget(QWidget):
         # 5. legacy carriers (reverse projection order; its own verified collector).
         collect(("Signal",), self._controls_v2_rollback_legacy_all,
                 ctx["params"], applied)
-        # 6. §24.4 req 6-7: signal-block state the strict writer could not restore
-        #    is REATTEMPTED and RE-VERIFIED here — LAST, so the carrier rollback
-        #    above (which does its own blocking) has finished touching these same
-        #    owners.  An owner still unrestored is named at its stable path.
-        if "signals" in touched:
+        # 6. §24.4 req 6-7 / §25.4 req 4: signal-block state is REATTEMPTED and
+        #    RE-VERIFIED here — LAST, so the carrier rollback above (which does its
+        #    own blocking) has finished touching these same owners.  §25.4: the
+        #    observation set is the whole REGISTRY, so an owner stranded by the
+        #    ROLLBACK is seen even though the forward write was clean.  It is no
+        #    longer gated on a `touched` marker seeded only by the forward writer.
+        if ctx.get("signal_registry"):
             collect(("Signal", "signal_state"),
                     self._controls_v2_restore_signal_state_verified, ctx)
         return failures
 
     def _controls_v2_restore_signal_state_verified(self, ctx) -> list:
-        """Reattempt + VERIFY signal-block restoration for every owner the strict
-        writer left unrestored (§24.4 req 6-7).
+        """Reattempt + VERIFY signal-block restoration for EVERY registered owner
+        (§24.4 req 6-7 / §25.4 req 4-7).
 
-        Each owner is one independent member with NO primary of its own — the
-        writer's own restoration attempt WAS the primary and already failed — so
-        the driver verifies, reattempts through the authoritative backstop,
-        re-verifies, and names the owner at its stable path ONLY if it is STILL
-        unrestored.  A member that the reattempt fixes is genuinely restored and
-        must not be reported as an outstanding recovery failure."""
-        entries = tuple(ctx.get("unrestored_signals") or ())
-        if not entries:
-            return []
+        The observation set is the transaction's ONE identity-keyed registry, so it
+        covers every owner touched by the forward write OR by either rollback path —
+        §25.4 showed that seeding only from the forward writer's exception left a
+        clean-write-then-raising-rollback child permanently blocked and unnamed.
+
+        Each owner is one INDEPENDENT member with no primary of its own (the earlier
+        restoration attempt WAS the primary and already failed), so the driver
+        verifies, reattempts through the authoritative backstop, re-verifies, and —
+        §25.4 req 5 — one owner's failure never suppresses another's.
+
+        §25.4 req 6: a TRANSIENT cleanup error that this retry repairs is NOT an
+        outstanding ``recovery_failed_path``; it stays structured diagnostic
+        evidence on the registry entry and in a ``run_config_debug`` event.  Only an
+        owner that remains MISMATCHED after the retry is named, at its stable
+        child/root path (req 7)."""
+        registry = ctx.get("signal_registry") or {}
         members = []
-        for path, owner, prior in entries:
+        watched = []
+        for entry in registry.values():
+            # An owner that was never blocked and never raised has nothing to
+            # verify; anything else is inspected, including acquisition failures.
+            if not entry["acquired"] and not entry["errors"]:
+                continue
+            watched.append(entry)
             members.append(_ControlsRecoveryMember(
-                path=tuple(path), policy="signal-block-state",
-                restore=None,      # the writer's failed attempt was the primary
-                matches=(lambda host, c, _o=owner, _p=prior:
-                         _controls_v2_signal_state_matches(_o, _p)),
-                backstop=(lambda host, c, _o=owner, _p=prior:
-                          _o.blockSignals(_p)),
+                path=entry["path"], policy="signal-block-state",
+                restore=None,      # the earlier restoration attempt was the primary
+                matches=(lambda host, c, _e=entry:
+                         _controls_v2_signal_state_matches(
+                             _e["owner"], _e["prior"])),
+                backstop=(lambda host, c, _e=entry:
+                          _e["owner"].blockSignals(_e["prior"])),
             ))
-        return _controls_v2_recover_members(self, ctx, members, None)
+        if not members:
+            return []
+        failures = _controls_v2_recover_members(self, ctx, members, None)
+        # §25.4 req 6: classify each watched owner and keep the transient evidence.
+        for entry in watched:
+            try:
+                matched = _controls_v2_signal_state_matches(
+                    entry["owner"], entry["prior"])
+            except Exception:
+                matched = False
+            entry["mismatched"] = not matched
+            entry["repaired"] = bool(entry["errors"]) and matched
+            if entry["repaired"]:
+                run_config_debug_log(
+                    logger,
+                    "controls_signal_cleanup_repaired",
+                    widget=self,
+                    origin="controls_v2_recovery",
+                    signal_owner=list(entry["path"]),
+                    prior_blocked=bool(entry["prior"]),
+                    cleanup_errors=[repr(e) for e in entry["errors"]],
+                )
+        return failures
 
     #: The self-state fields the install writes, as
     #: ``(diagnostic name, attribute, ctx snapshot key, DECLARED comparator

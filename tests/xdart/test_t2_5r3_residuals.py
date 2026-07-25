@@ -573,16 +573,19 @@ def test_absent_receipt_still_cannot_certify_source_recovery(widget):
         {"source_receipt": None}, []) == [("Source",)]
 
 
-def test_global_failure_merge_lives_inside_collect_containment():
-    """§24.3 / §24.7 mutation 3: the MERGE into the global ``failures`` list must
-    itself be inside ``collect()``'s exception boundary.
+def test_no_failures_membership_or_append_outside_collect_containment():
+    """§24.3 / §25.8 C1: EVERY ``failures`` membership test and append inside
+    ``collect()`` must sit within an exception boundary — the NORMALIZED merge and
+    the FALLBACK merge alike.
 
-    Once per-segment validation is in place, no *behavioral* probe can separate
-    "merge inside" from "merge outside": nothing that can raise on comparison
-    survives validation, so the containment is defense in depth (recorded as a
-    discrepancy in Boundary 7).  §24.3 nevertheless requires the whole operation
-    to remain within containment, so this pins it structurally — at least one
-    ``failures.append(...)`` must live in the ``try`` BODY, not only after it."""
+    §25.3 refuted the earlier claim that per-segment validation made this
+    unobservable: the validator itself had a time-of-check/time-of-use split, so a
+    poison path DID reach the fallback membership test and escaped `collect()`.
+    The behavioral changing-iterator cases in
+    ``test_t2_5r4_cleanup_totality.py`` are the primary oracle for that invariant;
+    this remains as the supplementary LOCATION pin, strengthened per §25.8 C1 so a
+    membership or append operation cannot be reintroduced outside the protected
+    region."""
     import ast
     import inspect
     import textwrap
@@ -595,10 +598,9 @@ def test_global_failure_merge_lives_inside_collect_containment():
     collect = next(
         node for node in ast.walk(outer)
         if isinstance(node, ast.FunctionDef) and node.name == "collect")
-    tries = [node for node in collect.body if isinstance(node, ast.Try)]
-    assert len(tries) == 1, "collect() must have exactly one exception boundary"
 
-    def _merges(nodes):
+    def _ops(nodes):
+        """Count `failures` appends AND `... in/not in failures` comparisons."""
         found = 0
         for node in nodes:
             for sub in ast.walk(node):
@@ -608,7 +610,21 @@ def test_global_failure_merge_lives_inside_collect_containment():
                         and isinstance(sub.func.value, ast.Name)
                         and sub.func.value.id == "failures"):
                     found += 1
+                elif isinstance(sub, ast.Compare) and any(
+                        isinstance(op, (ast.In, ast.NotIn))
+                        for op in sub.ops):
+                    for comparator in sub.comparators:
+                        if (isinstance(comparator, ast.Name)
+                                and comparator.id == "failures"):
+                            found += 1
         return found
 
-    assert _merges(tries[0].body) >= 1, (
-        "the merge into `failures` is OUTSIDE collect()'s try body")
+    tries = [node for node in collect.body if isinstance(node, ast.Try)]
+    assert tries, "collect() must have at least one exception boundary"
+    assert _ops(tries) >= 2, (
+        "expected both the normalized and the fallback merge inside containment")
+    unprotected = [node for node in collect.body
+                   if not isinstance(node, ast.Try)]
+    assert _ops(unprotected) == 0, (
+        "a `failures` membership test or append sits OUTSIDE collect()'s "
+        "exception containment")
