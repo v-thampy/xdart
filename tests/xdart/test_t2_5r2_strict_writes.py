@@ -14,8 +14,10 @@ mutation evidence for the correction:
 * §22.3 — ``_controls_v2_bound_carriers`` was a second MUTABLE target authority: the
   writer re-selected its target by ``path -> registry -> param``, so an entry
   replaced after the pre-write identity guard redirected the write to an object the
-  outer loop never rolled back.  The prepared carrier is now passed DIRECTLY; the
-  registry is an immutable diagnostic record that never selects a target.
+  outer loop never rolled back.  The prepared carrier is now passed DIRECTLY, and
+  §29.2 DELETED the publication outright — there is no registry to select through,
+  which is what ``test_transaction_publishes_no_carrier_mapping_or_diagnostic_record``
+  below pins.
 * §22.4 — the identity resolver and the energy-cache invalidation ran OUTSIDE the
   guarded boundary, so each could leave an earlier carrier installed and escape
   untyped.  Every post-first-write step is now behind ONE funnel that recovers
@@ -39,7 +41,7 @@ real staging/commit engine.
 from __future__ import annotations
 
 import copy
-from types import MappingProxyType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 from pyqtgraph.Qt import QtWidgets
@@ -204,68 +206,31 @@ def test_non_transactional_mirror_callers_keep_skip_missing(widget):
 # §22.3 / §22.10.A — one target authority
 # ---------------------------------------------------------------------------
 
-def test_bound_carrier_registry_is_immutable_and_never_selects_a_target(
-        widget):
-    """§22.10.A.1/A.3.  The published plan registry is IMMUTABLE (a second
-    authority cannot rewrite an entry at all) and is retained for diagnostics
-    only."""
-    staged = widget.stage_controls_transaction([(MASK, "/tmp/t25r2-registry.edf")])
-    widget.commit_controls_transaction(staged)
+def test_transaction_publishes_no_carrier_mapping_or_diagnostic_record(widget):
+    """§29.5 item 1-2 — THE deletion assertion (red at `1c395e44`, green at T-2.5D).
 
-    registry = widget._controls_v2_bound_carriers
-    assert isinstance(registry, MappingProxyType)
-    with pytest.raises(TypeError):
-        registry[MASK] = SimpleNamespace(param=None)
+    §29.2's rule-9 root-cause checkpoint DELETED the carrier publication: it had two
+    stores and zero production loads, and every round that tried to harden it
+    re-found the same defect class ("a published object still confers authority").
+    Locality is now the whole invariant — the commit loop's local carriers are the
+    only holders, so there is nothing published to reach, forge, or clear.
 
+    This replaces the former mapping-immutability and mapping-redirection tests.
+    Bound-target replacement behavior is still proven by
+    `test_t2_5r1_bound_carriers.py` and the atomicity-depth suite; the local
+    push-before-setter and bound-original readback cases survive below."""
+    from xdart.gui.tabs.static_scan import static_scan_widget as module
 
-def test_registry_redirect_after_the_identity_guard_cannot_move_the_write(
-        widget, monkeypatch):
-    """§22.11 case 2 / §22.10.A.  A second authority that swaps the widget-level
-    registry entry after the pre-write identity guard must NOT redirect the
-    forward write: the replacement is never touched and the original is restored.
+    staged = widget.stage_controls_transaction([(MASK, "/tmp/t25d-no-publication.edf")])
+    assert widget.commit_controls_transaction(staged).ok
 
-    At `4d7065ac` the writer re-selected its target through the registry, so the
-    replacement was mutated and left mutated (the outer loop rolled back only the
-    original, which it had read back and refused)."""
-    from xdart.gui.tabs.static_scan.static_scan_widget import (
-        _PreparedLegacyCarrier)
-
-    original = widget._controls_v2_param(MASK)
-    original_prior = original.value()
-    replacement = Parameter.create(
-        name="replacement-mask", type="str", value="/tmp/replacement-prior.edf")
-    replacement_prior = replacement.value()
-    staged = widget.stage_controls_transaction([(MASK, "/tmp/t25r2-redirect.edf")])
-
-    real_lookup = widget._controls_v2_param
-    calls = {"n": 0}
-
-    def lookup(candidate):
-        if tuple(candidate) != MASK:
-            return real_lookup(candidate)
-        calls["n"] += 1
-        if calls["n"] == 2:            # after the pre-write identity guard
-            registry = dict(widget._controls_v2_bound_carriers)
-            registry[MASK] = _PreparedLegacyCarrier(
-                MASK, replacement, "/tmp/t25r2-redirect.edf",
-                replacement_prior, "/tmp/t25r2-redirect.edf")
-            # Even a whole-attribute swap (not merely an item write, which the
-            # immutable proxy already refuses) must not move the target: the
-            # commit loop holds its own carrier objects.
-            object.__setattr__(widget, "_controls_v2_bound_carriers",
-                               MappingProxyType(registry))
-        return original
-
-    monkeypatch.setattr(widget, "_controls_v2_param", lookup)
-    result = widget.commit_controls_transaction(staged)
-
-    assert calls["n"] >= 2, "the identity guard did not run after preflight"
-    # The redirect is a COMPLETE no-op: the write went to the prepared original
-    # and the replacement was never touched, so there is nothing to roll back.
-    assert replacement.value() == replacement_prior
-    assert original.value() == "/tmp/t25r2-redirect.edf"
-    assert original.value() != original_prior
-    assert result.ok
+    # after a REAL transaction there is no published mapping, under any access
+    assert not hasattr(widget, "_controls_v2_bound_carriers")
+    assert "_controls_v2_bound_carriers" not in vars(widget)
+    # ... and the record type and its factory are gone from the module
+    assert not hasattr(module, "_ControlsCarrierDiagnostic")
+    assert not hasattr(module, "_controls_v2_detached_signal_snapshot")
+    assert not hasattr(module._PreparedLegacyCarrier, "diagnostic_copy")
 
 
 # ---------------------------------------------------------------------------

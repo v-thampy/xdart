@@ -14,7 +14,6 @@ import time
 import types
 from pathlib import Path
 from collections import OrderedDict
-from types import MappingProxyType
 import gc
 import imageio
 import pyFAI
@@ -339,30 +338,17 @@ def _controls_v2_signal_state_matches(owner, wanted) -> bool:
         return False
 
 
-#: Registry entry fields that are safe to project into a detached diagnostic
-#: snapshot.  ``owner`` is DELIBERATELY excluded (§26.3 req 5/8): it is the live Qt
-#: object, and nothing publicly reachable from ``_controls_v2_bound_carriers``
-#: should hand out a live mutable participant.  The stable ``path`` identifies the
-#: owner for every diagnostic purpose.
-_CONTROLS_V2_SIGNAL_SNAPSHOT_FLAGS = (
-    "prior", "probed", "acquired", "mismatched", "repaired")
-
-
 def _controls_v2_safe_error_text(error):
-    """A never-raising diagnostic string for ONE error object (§27.4 req 1-3).
+    """A never-raising diagnostic string for ONE cleanup error (§27.4 req 1-3).
 
-    §27.4 P2: both projection sites used a bare ``repr(error)`` comprehension, and
-    an exception object is free to define a RAISING ``__repr__``.  In the detached
-    snapshot that dropped the ENTIRE owner entry — stable path, prior state,
-    mismatch and repaired flags included.  In repaired-event publication it escaped
-    the classification loop, so the recovery collector falsely reported a REPAIRED
-    transient as ``("Signal", "signal_state")``, directly violating the accepted
-    §26.2/E1 rule that a repaired transient is evidence, not an outstanding failure.
+    Used by repaired-event publication, where a raising ``__repr__`` previously
+    escaped the classification loop and made the recovery collector falsely report a
+    REPAIRED transient as ``("Signal", "signal_state")`` — violating the §26.2/E1
+    rule that a repaired transient is evidence, not an outstanding failure.
 
-    ``repr`` is PREFERRED because it is the useful representation.  On any failure
-    the fallback is a stable exact string built ONLY from the safe built-in type
-    name — hostile INSTANCE formatting is never invoked again — so this function is
-    total and one bad error can never cost the surrounding evidence."""
+    ``repr`` is PREFERRED; on any failure the fallback is a stable exact string built
+    ONLY from the safe built-in type name, so hostile instance formatting is never
+    invoked twice and one bad error cannot cost the surrounding evidence."""
     try:
         return repr(error)
     except Exception:
@@ -375,55 +361,15 @@ def _controls_v2_safe_error_text(error):
     return f"<unrepresentable {name} diagnostic>"
 
 
-def _controls_v2_detached_signal_snapshot(registry):
-    """A FRESH, fully DETACHED plain copy of the signal registry (§26.3 req 3/5).
-
-    Nothing in the result IS the live registry, a live entry, or a live mutable
-    member of one: the flags are copied by value, the ordered cleanup errors are
-    projected through :func:`_controls_v2_safe_error_text`, and the live Qt
-    ``owner`` is omitted entirely.  Mutating any part of the result — clearing it,
-    replacing an entry, rewriting a ``prior`` — cannot alter recovery authority.
-
-    §27.4 req 1/4: every field is projected INDEPENDENTLY and totally.  The old
-    shape computed all error strings inside one ``try`` whose ``except`` did
-    ``continue``, so a single hostile representation discarded the whole owner
-    entry.  No projection failure can now drop an entry."""
-    snapshot = {}
-    for key, entry in (registry or {}).items():
-        projected = {"path": (), "errors": []}
-        try:
-            projected["path"] = tuple(entry.get("path") or ())
-        except Exception:
-            logger.debug("signal snapshot path projection raised", exc_info=True)
-        try:
-            raw_errors = list(entry.get("errors") or ())
-        except Exception:
-            logger.debug("signal snapshot error list projection raised",
-                         exc_info=True)
-            raw_errors = []
-        projected["errors"] = [
-            _controls_v2_safe_error_text(error) for error in raw_errors]
-        for flag in _CONTROLS_V2_SIGNAL_SNAPSHOT_FLAGS:
-            try:
-                projected[flag] = bool(entry.get(flag))
-            except Exception:
-                logger.debug("signal snapshot flag %s projection raised", flag,
-                             exc_info=True)
-                projected[flag] = False
-        snapshot[key] = projected
-    return snapshot
-
-
 def _controls_v2_carrier_registry(carrier):
-    """The LIVE signal registry for an EXECUTION carrier, or ``None`` (§27.3 req 1/4).
+    """The LIVE signal registry for an EXECUTION carrier, or ``None``.
 
-    Only the local :class:`_PreparedLegacyCarrier` objects the commit loop owns carry
-    the registry, and they are never published.  What IS published is a value-only
-    :class:`_ControlsCarrierDiagnostic`, which has no registry attribute under any
-    spelling — so there is nothing for a caller to reach.  §27.3 req 9: this helper
-    does not "enforce exclusivity"; exclusivity comes from the published record not
-    holding the object at all.  The check below is a TYPE check, not a naming
-    convention — a leading underscore is not a capability boundary (§27.5)."""
+    The invariant is LOCALITY AND OWNERSHIP, not a type test (§29.3 D5): the one
+    transaction-local registry lives on the local :class:`_PreparedLegacyCarrier`
+    objects the commit loop owns, and those objects never leave the transaction.
+    Nothing is published, so there is no second holder for anything to reach — the
+    check below is a defensive guard against a wrong argument, not a capability
+    boundary."""
     if not isinstance(carrier, _PreparedLegacyCarrier):
         return None
     return getattr(carrier, "_signals", None)
@@ -1214,24 +1160,6 @@ class _PreparedLegacyCarrier:
         object.__setattr__(
             self, "_expected", _freeze_carrier_payload(expected, path))
 
-    def diagnostic_copy(self):
-        """The VALUE-ONLY published diagnostic for this carrier (§27.3 req 2-3).
-
-        §27.3 P1: publishing another ``_PreparedLegacyCarrier`` was the WRONG
-        ABSTRACTION, however the registry reference was spelled.  The twin was a
-        distinct Python object, but it still stored the ONE live registry in an
-        ordinary slot — so ``twin._signals.clear()`` cleared real recovery authority
-        mid-transaction — and it still stored the live Qt ``Parameter``, so
-        ``twin.param.setValue(rogue)`` wrote to production OUTSIDE the checked
-        transaction.  Renaming the attribute closed nothing: a leading underscore is
-        not a capability boundary.
-
-        What is published is therefore a :class:`_ControlsCarrierDiagnostic` — a
-        value-only record with NO parameter, NO registry, NO Qt owner, no callback
-        and no raw exception object under any name."""
-        return _ControlsCarrierDiagnostic(
-            self.path, self.value, self.prior, self.expected)
-
     @property
     def value(self):
         return _thaw_carrier_payload(self._value)
@@ -1254,76 +1182,6 @@ class _PreparedLegacyCarrier:
 
     def __repr__(self):
         return (f"_PreparedLegacyCarrier(path={self.path!r}, "
-                f"value={self.value!r}, prior={self.prior!r}, "
-                f"expected={self.expected!r})")
-
-
-class _ControlsCarrierDiagnostic:
-    """The VALUE-ONLY record published through ``_controls_v2_bound_carriers`` (§27.3).
-
-    §27.3 P1 established that the published object must not be an execution carrier
-    at all.  A ``_PreparedLegacyCarrier`` twin — even one whose ``signals`` property
-    returned detached copies — still stored the live registry and the live Qt
-    ``Parameter`` in ordinary slots, so a caller reaching the published mapping could
-    clear real recovery authority mid-transaction or write to production outside the
-    checked transaction.
-
-    This record holds ONLY detached values:
-
-    * ``path``     — the stable diagnostic path;
-    * ``value`` / ``prior`` / ``expected`` — stored in the shared closed immutable
-      encoding and THAWED FRESH on every read, so a reader mutates a throwaway;
-    * ``signals``  — a POINT-IN-TIME detached snapshot (§27.2 permits ``None`` or a
-      point-in-time snapshot; publication happens at PREFLIGHT, before any blocking
-      call, so this is empty by construction — it is a stable shape, never a live
-      view, and deliberately has NO refresh machinery, callback, or registry).
-
-    There is NO ``param``, NO registry under any spelling, NO Qt owner, no callback
-    or closure, and no raw exception object.  Nothing here can execute, mutate, or
-    observe live transaction state; every slot is asserted by the architecture test.
-    """
-
-    __slots__ = ("path", "_value", "_prior", "_expected", "_signals_snapshot")
-
-    def __init__(self, path, value, prior, expected, signals_snapshot=None):
-        path = tuple(path)
-        object.__setattr__(self, "path", path)
-        object.__setattr__(self, "_value", _freeze_carrier_payload(value, path))
-        object.__setattr__(self, "_prior", _freeze_carrier_payload(prior, path))
-        object.__setattr__(
-            self, "_expected", _freeze_carrier_payload(expected, path))
-        # Frozen at construction into plain immutable text/flags; never a live view.
-        object.__setattr__(
-            self, "_signals_snapshot",
-            _controls_v2_detached_signal_snapshot(signals_snapshot))
-
-    @property
-    def value(self):
-        return _thaw_carrier_payload(self._value)
-
-    @property
-    def prior(self):
-        return _thaw_carrier_payload(self._prior)
-
-    @property
-    def expected(self):
-        return _thaw_carrier_payload(self._expected)
-
-    @property
-    def signals(self):
-        """A FRESH copy of the POINT-IN-TIME snapshot — never a live registry."""
-        return _controls_v2_detached_signal_snapshot(self._signals_snapshot)
-
-    def __setattr__(self, name, value):
-        raise AttributeError(
-            "_ControlsCarrierDiagnostic is a frozen value record "
-            f"(attempted to set {name!r})")
-
-    def __delattr__(self, name):
-        raise AttributeError("_ControlsCarrierDiagnostic is a frozen value record")
-
-    def __repr__(self):
-        return (f"_ControlsCarrierDiagnostic(path={self.path!r}, "
                 f"value={self.value!r}, prior={self.prior!r}, "
                 f"expected={self.expected!r})")
 
@@ -5172,12 +5030,11 @@ class staticWidget(QWidget):
         """STRICT transaction write of ONE prepared carrier (§22.10.A/B).
 
         §22.10.A.2: the write target is the ``_PreparedLegacyCarrier`` the commit
-        loop already owns, passed in DIRECTLY.  It is no longer selected by a
-        ``path -> self._controls_v2_bound_carriers[path] -> param`` lookup: that
-        registry was a second MUTABLE target authority (§22.3), and an entry
-        changed after the pre-write identity guard redirected the write to a
-        replacement that the outer loop then never rolled back.  Nothing here
-        consults ambient widget state to choose what to write.
+        loop already owns, passed in DIRECTLY.  It is never selected by an ambient
+        path-to-carrier lookup: such a registry was a second MUTABLE target
+        authority (§22.3), and an entry changed after the pre-write identity guard
+        redirected the write to a replacement that the outer loop then never rolled
+        back.  Nothing here consults ambient widget state to choose what to write.
 
         §22.10.B: this is a STRICT writer, NOT the permissive compatibility
         mirror.  ``_mirror_wrangler_parameter_values`` catches every child
@@ -5617,8 +5474,6 @@ class staticWidget(QWidget):
         # write, normal rollback, and force rollback — so final recovery observes
         # every owner either of them touched, not just the forward writer's.
         signal_registry = {}
-        # §19.5: the previous transaction's bindings are never reachable.
-        self._controls_v2_bound_carriers = MappingProxyType({})
         for path, value in projection:
             path = tuple(path)
             param = self._controls_v2_param(path)
@@ -5661,26 +5516,15 @@ class staticWidget(QWidget):
                     False, failed_path=path,
                     reason="legacy carrier payload type unsupported at preflight",
                     phase="preflight")
-        # §22.10.A.1/A.3: the prepared plan is published as an IMMUTABLE
-        # DIAGNOSTIC record only.  It is NEVER consulted to select a write or
-        # restore target: §22.3 showed that a `path -> registry -> param` lookup is
-        # the same "second mutable target authority" defect in a different
-        # container — an entry replaced after the pre-write identity guard
-        # redirected the write to an object the outer loop never rolled back.  The
-        # commit loop owns the local `_PreparedLegacyCarrier` objects and passes
-        # them DIRECTLY to the strict writer and to every rollback helper.
-        #
-        # §26.3 req 2-3: what is PUBLISHED is a DETACHED diagnostic twin of each
-        # carrier, never the live execution object.  Publishing the live carriers
-        # re-opened the very defect class §22 closed: `MappingProxyType` froze only
-        # the outer mapping, so a real setter could reach a live carrier and mutate
-        # the ONE signal registry through `carrier.signals` — erasing recovery
-        # authority mid-transaction and letting a leaked Qt block be certified as
-        # repaired.  The twins expose only fresh detached snapshots, and
-        # `_controls_v2_carrier_registry` refuses them outright, so nothing
-        # reachable through this mapping can alter execution or recovery authority.
-        self._controls_v2_bound_carriers = MappingProxyType(
-            {c.path: c.diagnostic_copy() for c in carriers})
+        # §22.10.A / §29.2: the prepared plan is NOT published anywhere.  The commit
+        # loop owns this local `carriers` list and passes each `_PreparedLegacyCarrier`
+        # DIRECTLY to the strict writer and to every rollback helper, so a target is
+        # never re-selected through an ambient path-to-carrier lookup.  §22.3 had
+        # retained an immutable diagnostic mapping of the plan; §29.2 measured zero
+        # production readers of it (two stores, no loads) and deleted it at the
+        # rule-9 root-cause checkpoint rather than harden it further, because a
+        # published object that confers any authority is the defect class §§22-27
+        # kept re-finding.  Locality is now the whole invariant.
 
         # B.3: display snapshot BEFORE the first write, under scan_lock; an
         # uncopyable field RAISES -> typed preflight failure (never an alias).
