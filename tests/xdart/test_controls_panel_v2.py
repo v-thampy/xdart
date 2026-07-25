@@ -564,7 +564,7 @@ def test_controls_panel_v2_run_lock_disables_buttons_and_ignores_signals(
         assert calls == []
         assert widget.integratorTree.get_gi_config()["sample_orientation"] == before
     finally:
-        widget._exit_run_state()
+        widget._exit_run_state(widget._new_projection_receipt())
         _reset_controls_v2_gi(widget)
         widget.close()
         widget.deleteLater()
@@ -586,7 +586,7 @@ def test_controls_panel_v2_combined_advanced_dialog_locked_during_run(
         widget._show_integration_advanced()
         assert not dlg.isEnabled()
 
-        widget._exit_run_state()
+        widget._exit_run_state(widget._new_projection_receipt())
         assert dlg.isEnabled()
     finally:
         widget.close()
@@ -1718,7 +1718,7 @@ def test_run_boundary_propagates_directory_intent_without_catalog_owner(
         assert widget.wrangler.thread.source_frame_count_snapshot == {}
         assert widget.wrangler.thread.source_pending_count == 0
     finally:
-        widget._exit_run_state()
+        widget._exit_run_state(widget._new_projection_receipt())
         widget.close()
         widget.deleteLater()
 
@@ -2214,7 +2214,7 @@ def test_controls_panel_v2_active_run_refreshes_once_after_run(qapp, monkeypatch
         assert calls == []
         assert widget._controls_v2_batch_refresh_deferred is True
 
-        widget._exit_run_state()
+        widget._exit_run_state(widget._new_projection_receipt())
 
         assert len(calls) == 1
         assert widget._controls_v2_batch_refresh_deferred is False
@@ -4189,7 +4189,7 @@ def test_controls_panel_v2_mask_saturated_survives_run_state(qapp, monkeypatch):
         assert not btn.isEnabled()
         assert widget._controls_v2_threshold_config().mask_saturation is True
     finally:
-        widget._exit_run_state()
+        widget._exit_run_state(widget._new_projection_receipt())
         widget.close()
         widget.deleteLater()
 
@@ -4514,7 +4514,7 @@ def test_enter_run_state_resets_frame_count_snapshot(qapp, monkeypatch):
         # freeze logic re-snapshots the CURRENT frame count (never the old 999).
         assert widget._controls_v2_run_frame_count != 999
     finally:
-        widget._exit_run_state()
+        widget._exit_run_state(widget._new_projection_receipt())
         widget.close()
         widget.deleteLater()
 
@@ -4558,7 +4558,7 @@ def test_controls_panel_v2_run_commits_focused_integration_edit(qapp, monkeypatc
         assert widget.scan.bai_1d_args["numpoints"] == 777
         assert widget.wrangler.scan_args["bai_1d_args"]["numpoints"] == 777
     finally:
-        widget._exit_run_state()
+        widget._exit_run_state(widget._new_projection_receipt())
         widget.close()
         widget.deleteLater()
 
@@ -4640,7 +4640,7 @@ def test_controls_panel_v2_run_commits_focused_2d_points(qapp, monkeypatch):
         assert widget.wrangler.scan_args["bai_2d_args"]["npt_rad"] == 123
         assert widget.wrangler.scan_args["bai_2d_args"]["npt_azim"] == 456
     finally:
-        widget._exit_run_state()
+        widget._exit_run_state(widget._new_projection_receipt())
         widget.close()
         widget.deleteLater()
 
@@ -4722,7 +4722,7 @@ def test_controls_panel_v2_reintegrate_finish_unlocks_stale_running_phase(
         }
         assert rows[("Int1D", "points")].editor.isEnabled()
     finally:
-        widget._exit_run_state()
+        widget._exit_run_state(widget._new_projection_receipt())
         widget.close()
         widget.deleteLater()
 
@@ -4747,7 +4747,7 @@ def test_controls_panel_v2_run_exit_unlocks_focused_editor(qapp, monkeypatch):
         widget._enter_run_state()
         assert not editor.isEnabled()
 
-        widget._exit_run_state()
+        widget._exit_run_state(widget._new_projection_receipt())
 
         rows = {
             row.path: row
@@ -4756,7 +4756,7 @@ def test_controls_panel_v2_run_exit_unlocks_focused_editor(qapp, monkeypatch):
         assert rows[("Int1D", "points")].editor.isEnabled()
         assert widget._controls_v2_pending_editor is None
     finally:
-        widget._exit_run_state()
+        widget._exit_run_state(widget._new_projection_receipt())
         widget.close()
         widget.deleteLater()
 
@@ -4884,7 +4884,7 @@ def test_controls_panel_v2_auto_stays_visibly_checked_while_run_locked(
         assert selector in render_qss("dark")
         assert selector in render_qss("light")
     finally:
-        widget._exit_run_state()
+        widget._exit_run_state(widget._new_projection_receipt())
         widget.close()
         widget.deleteLater()
 
@@ -4956,7 +4956,7 @@ def test_controls_panel_v2_mask_saturated_is_pushed_before_run_lock(qapp, monkey
         assert seen_at_disable == [True]
         assert widget._controls_v2_threshold_config().mask_saturation is True
     finally:
-        widget._exit_run_state()
+        widget._exit_run_state(widget._new_projection_receipt())
         widget.close()
         widget.deleteLater()
 
@@ -5410,7 +5410,8 @@ def test_fast_start_folds_deferred_values_before_publish(qapp, monkeypatch):
     try:
         widget._enter_run_state()
         widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
-        widget._exit_run_state()  # run ends (fast Start: no event tick follows)
+        # The run ends; a fast next Start receives no intervening event tick.
+        widget._exit_run_state(widget._new_projection_receipt())
 
         intent = widget._controls_v2_ensure_run_intent()
         gen_before = intent.generation
@@ -5545,7 +5546,7 @@ def test_deferred_edit_survives_finish_exception_and_folds_next_start(
 
         monkeypatch.setattr(widget.h5viewer, "set_run_writing", _maybe_boom)
         try:
-            widget._exit_run_state()  # run-exit path raises
+            widget._exit_run_state(widget._new_projection_receipt())  # run-exit path raises
         except RuntimeError:
             pass
         # The edit survives as a queued delta despite the exit-path exception.

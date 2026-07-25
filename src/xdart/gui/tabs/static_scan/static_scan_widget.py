@@ -15,6 +15,7 @@ import time
 import types
 from pathlib import Path
 from collections import OrderedDict
+from dataclasses import dataclass, field
 import gc
 import imageio
 import pyFAI
@@ -29,6 +30,24 @@ logger = logging.getLogger(__name__)
 _ORPHANED_STITCH_THREADS = []
 _XYE_REFRESH_COALESCE_MS = 50
 _XYE_REFRESH_RETRY_MS = (150, 500, 1500, 3000, 7000)
+
+
+@dataclass(slots=True)
+class _SeamAttempt:
+    """The two bounded attempts for one ordered idle-projection seam."""
+
+    seam: str
+    initial_error: Exception | None = None
+    recovery_error: Exception | None = None
+    recovery_attempted: bool = False
+    completed: bool = False
+
+
+@dataclass(slots=True, weakref_slot=True)
+class _ProjectionReceipt:
+    """Delivery-local evidence for one synchronous Qt finish notification."""
+
+    attempts: dict[str, _SeamAttempt] = field(default_factory=dict)
 
 
 def _retain_orphaned_close_thread(thread) -> None:
@@ -12430,7 +12449,7 @@ class staticWidget(QWidget):
                 logger.debug("disable combined advanced dialog failed",
                              exc_info=True)
 
-    def _exit_run_state(self, receipt=None):
+    def _exit_run_state(self, receipt: _ProjectionReceipt):
         """Single owner of run END (task #68): mark the run finished.
         Idempotent — exiting an already-idle state is a no-op.
 
@@ -12456,17 +12475,15 @@ class staticWidget(QWidget):
         if not self._run_active:
             return
         self._run_active = False
-        self._run_lifecycle_restored = False
-        if receipt is None:
-            receipt = staticWidget._new_projection_receipt()
         staticWidget._run_idle_lifecycle_projection(self, receipt)
-        if not receipt["failed"]:
-            self._run_lifecycle_restored = True
+        if not staticWidget._projection_incomplete(receipt):
             return
         # T-4.2 (§35.7.B req 1/2): the COMPLETE ordered first-pass record stays in
         # the caller's receipt so the outer collector can name every failed seam;
         # the first exception object and traceback still propagate unchanged.
-        raise receipt["failed"][0][1]
+        for attempt in receipt.attempts.values():
+            if attempt.initial_error is not None and not attempt.completed:
+                raise attempt.initial_error
 
     # ------------------------------------------------------------------
     # O-1a-T4 (§9.10 Step 6) — lifecycle closure for the finish paths.
@@ -12636,7 +12653,7 @@ class staticWidget(QWidget):
         return tuple(steps)
 
     @staticmethod
-    def _new_projection_receipt() -> dict:
+    def _new_projection_receipt() -> _ProjectionReceipt:
         """A per-delivery LOCAL projection receipt (§35.7.B).
 
         Pure diagnostic transport for ONE synchronous finish delivery — not a
@@ -12644,9 +12661,10 @@ class staticWidget(QWidget):
         entry point allocates it, passes it through the rich body,
         `_exit_run_state()` and `_close_run_lifecycle()`, and drops it on return;
         nothing is stored on the widget and no receipt outlives the delivery."""
-        return {"attempted": False, "done": [], "failed": [], "retried": []}
+        return _ProjectionReceipt()
 
-    def _run_idle_lifecycle_projection(self, receipt) -> dict:
+    def _run_idle_lifecycle_projection(
+            self, receipt: _ProjectionReceipt) -> _ProjectionReceipt:
         """Attempt the one projection independently, recording into *receipt*.
 
         First pass: every substep is attempted and each failure is recorded in
@@ -12654,49 +12672,50 @@ class staticWidget(QWidget):
         already-successful, side-effectful seam such as ``set_run_writing(False)``
         is never replayed (§35.7.B req 4/5), and a seam that recovers still keeps
         its initial failure in the record (req 6)."""
-        first_pass = not receipt["attempted"]
-        receipt["attempted"] = True
-        done = set(receipt["done"])
-        failed_seams = {seam for seam, _ in receipt["failed"]}
         for seam, step in staticWidget._idle_lifecycle_substeps(self):
-            if seam in done:
+            attempt = receipt.attempts.get(seam)
+            if attempt is None:
+                attempt = _SeamAttempt(seam)
+                receipt.attempts[seam] = attempt
+                try:
+                    step()
+                except Exception as exc:
+                    attempt.initial_error = exc
+                else:
+                    attempt.completed = True
                 continue
-            if not first_pass and seam not in failed_seams:
+            if (attempt.completed or attempt.initial_error is None
+                    or attempt.recovery_attempted):
                 continue
+            attempt.recovery_attempted = True
             try:
                 step()
             except Exception as exc:
-                if first_pass:
-                    receipt["failed"].append((seam, exc))
-                else:
-                    receipt["retried"].append((seam, exc))
-                continue
-            receipt["done"].append(seam)
+                attempt.recovery_error = exc
+            else:
+                attempt.completed = True
         return receipt
 
     @staticmethod
-    def _projection_incomplete(receipt) -> bool:
+    def _projection_incomplete(receipt: _ProjectionReceipt) -> bool:
         """Whether any seam is still outstanding after this delivery's passes."""
-        recovered = set(receipt["done"])
-        return any(seam not in recovered for seam, _ in receipt["failed"])
+        return any(
+            attempt.initial_error is not None and not attempt.completed
+            for attempt in receipt.attempts.values()
+        )
 
     @staticmethod
-    def _drive_exit_run_state(self, receipt) -> None:
-        """Call the run-exit owner, threading the per-delivery receipt.
-
-        The run-end unit tests bind a ZERO-ARGUMENT ``_exit_run_state`` stub onto
-        duck-typed ``SimpleNamespace`` finish hosts, so the receipt is threaded
-        only when the bound callable IS the production owner."""
+    def _drive_exit_run_state(
+            self, receipt: _ProjectionReceipt) -> None:
+        """Call the run-exit owner with the mandatory per-delivery receipt."""
         exit_fn = getattr(self, "_exit_run_state", None)
         if exit_fn is None:
             return
-        if getattr(exit_fn, "__func__", None) is staticWidget._exit_run_state:
-            exit_fn(receipt)
-        else:
-            exit_fn()
+        exit_fn(receipt)
 
-    def _close_run_lifecycle(self, origin, *, release_source=False,
-                             receipt=None) -> None:
+    def _close_run_lifecycle(
+            self, origin, *, receipt: _ProjectionReceipt,
+            release_source=False) -> None:
         """Idempotent total lifecycle closure for ONE finish owner (Step 6).
 
         Called from the OUTERMOST ``finally`` of every production finish entry
@@ -12720,8 +12739,6 @@ class staticWidget(QWidget):
         With no primary in flight a cleanup failure is surfaced visibly rather
         than logging a false success."""
         primary_in_flight = sys.exc_info()[0] is not None
-        if receipt is None:
-            receipt = staticWidget._new_projection_receipt()
         failures = []
         if release_source:
             try:
@@ -12740,24 +12757,30 @@ class staticWidget(QWidget):
                 except Exception as exc:
                     # Only an umbrella when the receipt carries no seam detail
                     # (§35.3: the umbrella must not REPLACE the ordered record).
-                    if not receipt["failed"]:
+                    if not any(
+                            attempt.initial_error is not None
+                            for attempt in receipt.attempts.values()):
                         failures.append(("_exit_run_state", exc))
-            if not getattr(self, "_run_lifecycle_restored", True):
+            if staticWidget._projection_incomplete(receipt):
                 staticWidget._run_idle_lifecycle_projection(self, receipt)
-                if not staticWidget._projection_incomplete(receipt):
-                    self._run_lifecycle_restored = True
         # §35.7.B req 6: EVERY initial failed seam is reported, in projection
         # order, even when the retry recovered it — with its disposition, so an
         # outstanding recovery failure is distinguishable from a recovered one.
-        recovered = set(receipt["done"])
-        retried = {seam for seam, _ in receipt["retried"]}
-        for seam, exc in receipt["failed"]:
-            if seam in recovered:
-                failures.append((seam + " (recovered on retry)", exc))
-            elif seam in retried:
-                failures.append((seam + " (recovery failed)", exc))
+        for attempt in receipt.attempts.values():
+            initial = attempt.initial_error
+            if initial is None:
+                continue
+            if attempt.completed:
+                failures.append(
+                    (attempt.seam + " (recovered on retry)", initial))
+            elif attempt.recovery_error is not None:
+                failures.append(
+                    (attempt.seam + " (initial failure)", initial))
+                failures.append(
+                    (attempt.seam + " (recovery failed)",
+                     attempt.recovery_error))
             else:
-                failures.append((seam, exc))
+                failures.append((attempt.seam, initial))
         if failures:
             staticWidget._report_run_lifecycle_closure_failures(
                 self, origin, failures, primary_in_flight)
@@ -12992,8 +13015,8 @@ class staticWidget(QWidget):
         staticWidget._request_render(self, "reintegrate-flush")
         self.metawidget.update()
 
-    def _finalize_processing_run(self, *, reset_overlay, origin,
-                                 receipt=None):
+    def _finalize_processing_run(
+            self, *, reset_overlay, origin, receipt: _ProjectionReceipt):
         """Finish shared run UI state, optionally resetting plot history.
 
         Overlay history belongs to the acquisition run and must survive normal
@@ -13916,7 +13939,7 @@ class staticWidget(QWidget):
             staticWidget._close_run_lifecycle(
                 self, "wrangler", release_source=True, receipt=receipt)
 
-    def _wrangler_finished_body(self, receipt=None):
+    def _wrangler_finished_body(self, receipt: _ProjectionReceipt):
         """The run-end finalization body (see :meth:`wrangler_finished`). If the
         current scan matches the wrangler scan, allows for integration.
         """
@@ -14192,6 +14215,7 @@ class staticWidget(QWidget):
             self._finalize_processing_run(
                 reset_overlay=False,
                 origin="wrangler",
+                receipt=receipt,
             )
             browse_debug_log(
                 logger,

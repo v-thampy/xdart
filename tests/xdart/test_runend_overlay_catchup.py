@@ -448,7 +448,7 @@ def test_new_run_clears_pending_token(qapp, widget, monkeypatch, catchup_nxs):
     assert w._runend_catchup_token is None
     _pump(qapp, 1.5)
     assert calls == []
-    w._exit_run_state()
+    w._exit_run_state(w._new_projection_receipt())
 
 
 def test_new_file_clears_pending_token(qapp, widget, monkeypatch, catchup_nxs):
@@ -844,7 +844,7 @@ def test_genuine_zoom_during_run_is_recorded_via_real_signal(qapp, widget):
     target.setRange(xRange=(1.0, 2.0), padding=0)
     staticWidget._runend_waterfall_autofit(w)
     assert target.getViewBox().autoRangeEnabled()[0] is False
-    w._exit_run_state()
+    w._exit_run_state(w._new_projection_receipt())
 
 
 def test_waterfall_viewbox_hooked_at_run_entry_below_threshold(qapp, widget):
@@ -866,4 +866,4 @@ def test_waterfall_viewbox_hooked_at_run_entry_below_threshold(qapp, widget):
     assert df._wf_user_zoomed is True, \
         "the Waterfall view box must be hooked at run entry even while the " \
         "line plot is the active bottom plot (H18-R14)"
-    w._exit_run_state()
+    w._exit_run_state(w._new_projection_receipt())

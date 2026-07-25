@@ -271,7 +271,7 @@ def test_run_lifecycle_wired_through_static_widget(qapp, monkeypatch, tmp_path):
         widget._on_run_resuming()
         assert calls[-1] == ("resume", "run_scan")
 
-        widget._exit_run_state()
+        widget._exit_run_state(widget._new_projection_receipt())
         assert calls[-1][0] == "finish"
         assert calls[-1][1] is widget.scan and calls[-1][2] == "run_scan"
     finally:
@@ -1033,7 +1033,7 @@ def test_r4_run_capture_survives_h5viewer_browse_mutation(
         ) == (True, "run_a", False, ["run_a"])
     finally:
         if widget._run_active:
-            widget._exit_run_state()
+            widget._exit_run_state(widget._new_projection_receipt())
         widget._controls_v2_refresh_timer.cancel()
         widget.close()
         widget.deleteLater()

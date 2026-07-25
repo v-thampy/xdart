@@ -2385,7 +2385,7 @@ def test_directory_overlay_accumulates_reused_zero_index_at_live_cadence(
         # Production run-end invokes this normal callback once after stopping
         # the timer.  Calling it directly controls cadence without force-rendering
         # or waiting on a starvable Qt timeout.
-        w._exit_run_state()
+        w._exit_run_state(w._new_projection_receipt())
         w._update_timer.stop()
         df._sync_selection_generation()
         w._flush_pending_update()
@@ -2394,6 +2394,7 @@ def test_directory_overlay_accumulates_reused_zero_index_at_live_cadence(
             w,
             reset_overlay=False,
             origin="wrangler",
+            receipt=w._new_projection_receipt(),
         )
 
         history = df._waterfall_history
@@ -2410,7 +2411,7 @@ def test_directory_overlay_accumulates_reused_zero_index_at_live_cadence(
         w._list_timer.stop()
         w.h5viewer.live_run_active = False
         w.h5viewer.file_thread.live_run = False
-        w._exit_run_state()
+        w._exit_run_state(w._new_projection_receipt())
 
 
 @pytest.mark.parametrize("pending_at_boundary", [True, False])
@@ -2503,7 +2504,7 @@ def test_directory_overlay_boundary_flushes_full_outgoing_scan_inside_throttle(
         w._list_timer.stop()
         w.h5viewer.live_run_active = False
         w.h5viewer.file_thread.live_run = False
-        w._exit_run_state()
+        w._exit_run_state(w._new_projection_receipt())
 
 
 def test_int_plot_slice_characterizes_update_plot_state(widget):
@@ -3083,14 +3084,14 @@ def test_slice_range_label_tracks_plotunit_and_mode(widget):
 
 def test_run_state_toggles_processing_active(widget):
     w = widget
-    w._exit_run_state()                      # idle baseline
+    w._exit_run_state(w._new_projection_receipt())                      # idle baseline
     assert w._run_active is False
 
     w._enter_run_state()
     assert w._run_active is True
     assert w.displayframe._processing_active is True
 
-    w._exit_run_state()
+    w._exit_run_state(w._new_projection_receipt())
     assert w._run_active is False
     assert w.displayframe._processing_active is False
 
@@ -3102,7 +3103,7 @@ def test_run_state_disables_whole_integrator_and_mode_row(widget):
     Cores) locks; the action row (Pause/Resume/Stop) stays usable."""
     w = widget
     iu = w.integratorTree.ui
-    w._exit_run_state()                          # idle baseline
+    w._exit_run_state(w._new_projection_receipt())                          # idle baseline
     combo = w.wrangler.ui.processingModeCombo
     i = combo.findText("Int 2D")                 # a mode where the rows start on
     if i >= 0:
@@ -3119,14 +3120,15 @@ def test_run_state_disables_whole_integrator_and_mode_row(widget):
     assert not w.controls.batchButton.isEnabled()
     assert w.controls.actionRow.isEnabled()      # action row stays live
 
-    w._exit_run_state()
+    w._exit_run_state(w._new_projection_receipt())
     assert iu.gi_frame.isEnabled() and iu.frame_pixreject.isEnabled()
     assert w.controls.modeCombo.isEnabled()
 
 
 def test_run_state_is_idempotent(widget):
     w = widget
-    w._exit_run_state()                      # idle baseline (exit-when-idle is a no-op)
+    # Idle baseline: exit-when-idle is a no-op.
+    w._exit_run_state(w._new_projection_receipt())
     assert w._run_active is False
 
     calls = []
@@ -3136,8 +3138,8 @@ def test_run_state_is_idempotent(widget):
 
     w._enter_run_state()
     w._enter_run_state()                     # re-entry: no-op (guard)
-    w._exit_run_state()
-    w._exit_run_state()                      # re-exit: no-op (guard)
+    w._exit_run_state(w._new_projection_receipt())
+    w._exit_run_state(w._new_projection_receipt())                      # re-exit: no-op (guard)
 
     # The setter fired exactly once True then once False — no double-toggle.
     assert calls == [True, False], calls
@@ -3195,7 +3197,7 @@ def _proc_controls(w):
 def test_run_disables_processing_controls(widget):
     w = widget
     _set_processing_mode(w, 'Int 2D')
-    w._exit_run_state()                      # idle baseline
+    w._exit_run_state(w._new_projection_receipt())                      # idle baseline
     assert all(_proc_controls(w).values())   # all enabled when idle (Int 2D)
 
     w._enter_run_state()
@@ -3225,7 +3227,7 @@ def test_exit_restores_mode_correct_int_2d(widget):
     w = widget
     _set_processing_mode(w, 'Int 2D')
     w._enter_run_state()
-    w._exit_run_state()
+    w._exit_run_state(w._new_projection_receipt())
 
     ui = w.integratorTree.ui
     # Int 2D: both panels back on; Calibrate / Make Mask back on.
@@ -3237,7 +3239,7 @@ def test_exit_restores_mode_correct_int_1d_keeps_2d_off(widget):
     w = widget
     _set_processing_mode(w, 'Int 1D')
     w._enter_run_state()
-    w._exit_run_state()
+    w._exit_run_state(w._new_projection_receipt())
 
     ui = w.integratorTree.ui
     # Mode-correct restore — NOT a blanket enable: Int 1D has no cake, so the
@@ -3265,7 +3267,7 @@ def test_run_preserves_auto_toggle_checked_look(widget):
     assert ui.azim_autoRange_2D.isChecked()
     assert ui.axis1D.currentText() == axis_before
 
-    w._exit_run_state()
+    w._exit_run_state(w._new_projection_receipt())
     assert ui.radial_autoRange_1D.isChecked()
     assert ui.azim_autoRange_2D.isChecked()
 
@@ -3292,13 +3294,13 @@ def test_run_disables_advanced_param_dialogs(widget):
     adv2d = getattr(w.integratorTree, 'advancedWidget2D', None)
     if adv1d is None or adv2d is None:
         pytest.skip("advancedWidget1D/2D not present")
-    w._exit_run_state()                      # idle baseline
+    w._exit_run_state(w._new_projection_receipt())                      # idle baseline
     assert adv1d.isEnabled() and adv2d.isEnabled()
 
     w._enter_run_state()
     assert not adv1d.isEnabled() and not adv2d.isEnabled()
 
-    w._exit_run_state()
+    w._exit_run_state(w._new_projection_receipt())
     assert adv1d.isEnabled() and adv2d.isEnabled()
 
 
@@ -3311,7 +3313,7 @@ def test_exit_restores_mode_correct_viewer(widget):
     for viewer_mode in ('Image Viewer', 'XYE Viewer'):
         _set_processing_mode(w, viewer_mode)
         w._enter_run_state()
-        w._exit_run_state()
+        w._exit_run_state(w._new_projection_receipt())
         assert not ui.frame1D.isEnabled(), f"{viewer_mode}: frame1D should stay disabled"
         assert not ui.frame2D.isEnabled(), f"{viewer_mode}: frame2D should stay disabled"
         assert ui.pyfai_calib.isEnabled(), f"{viewer_mode}: Calibrate should re-enable"
@@ -4380,7 +4382,7 @@ def test_reintegrate_live_default_and_stop_wiring(widget, monkeypatch):
     w._run_active = False
     w._enter_run_state()
     assert not w.controls.startButton.isEnabled()
-    w._exit_run_state()
+    w._exit_run_state(w._new_projection_receipt())
     assert w.controls.actionRow.isEnabled() is False
 
     # Per-frame reintegrate updates are THROTTLED (coalesced), not rendered

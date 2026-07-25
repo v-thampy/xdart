@@ -576,7 +576,7 @@ def test_active_run_output_keeps_resident_raw_after_writer_stamp_change(
         assert state.result_caps.raw_reachable is True
         assert _roi_enabled(state.result_caps) is True
     finally:
-        widget._exit_run_state()
+        widget._exit_run_state(widget._new_projection_receipt())
 
 
 # ── H18-R9: cross-root identity ───────────────────────────────────────────

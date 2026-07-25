@@ -48,7 +48,7 @@ def widget(qapp, monkeypatch):
         yield value
     finally:
         try:
-            value._exit_run_state()
+            value._exit_run_state(value._new_projection_receipt())
         except Exception:
             pass
         value.close()
@@ -206,7 +206,7 @@ def test_fast_start_with_a_non_empty_journal_preserves_sentinels_and_journal(
     widget._on_controls_v2_field_changed(("Int1D", "points"), 1234)
     journal = dict(widget._controls_v2_edit_journal_dict())
     assert journal, "the run-active edit must be journaled as deferred"
-    widget._exit_run_state()
+    widget._exit_run_state(widget._new_projection_receipt())
 
     _make_stopping_wrangler(widget, monkeypatch)
     started = _block_thread_start(widget, monkeypatch)

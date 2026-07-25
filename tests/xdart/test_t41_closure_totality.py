@@ -55,7 +55,7 @@ def widget(qapp, monkeypatch):
         yield value
     finally:
         try:
-            value._exit_run_state()
+            value._exit_run_state(value._new_projection_receipt())
         except Exception:
             pass
         value.close()

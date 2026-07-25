@@ -202,7 +202,7 @@ def test_rr1_empty_live_directory_arms_through_real_run_button(
         queued = list(widget.wrangler.thread._eiger_master_queue)
         assert any(str(item).endswith("scan_0.nxs") for item in queued), queued
     finally:
-        widget._exit_run_state()
+        widget._exit_run_state(widget._new_projection_receipt())
         widget.close()
         widget.deleteLater()
 

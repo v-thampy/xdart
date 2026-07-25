@@ -3747,7 +3747,7 @@ def test_reintegrate_finished_resets_overlay_before_refresh():
     host = SimpleNamespace(
         thread_state_changed=lambda: calls.append("state"),
         _wrangler_run_active=lambda: False,
-        _exit_run_state=lambda: calls.append("exit"),
+        _exit_run_state=lambda _receipt: calls.append("exit"),
         h5viewer=SimpleNamespace(
             set_open_enabled=lambda enabled: calls.append(("open", enabled))),
         displayframe=SimpleNamespace(
