@@ -10,6 +10,7 @@ import threading
 import copy
 import os
 import math
+import sys
 import time
 import types
 from pathlib import Path
@@ -12503,6 +12504,180 @@ class staticWidget(QWidget):
         # (_controls_v2_fold_deferred_edits_into_intent) — there is no timer, no
         # post-finalization owner, and no carrier write on the run-exit path.
 
+    # ------------------------------------------------------------------
+    # O-1a-T4 (§9.10 Step 6) — lifecycle closure for the finish paths.
+    #
+    # `_exit_run_state()` remains the single owner of the shared latch and the
+    # ordinary run UI; this is a CLEANUP PROJECTION layered over it, not a second
+    # phase model, run identity, edit owner, source owner, or callback registry.
+    # At the parent every finish owner reached `_exit_run_state()` only from
+    # inside its rich body, after at least one fallible operation (the reintegrate
+    # overlap probe for the wrangler; `thread_state_changed()` for the integrator
+    # and stitch), so a raise there stranded the latch, the H5Viewer writing
+    # guard, the display processing flag, the mode row, and Stop/Start — leaving
+    # the GUI permanently "in a run" with no later Start possible.
+    #
+    # N-V1 (§33.4): `_controls_v2_run_active()` is the DISPLAY/LOCK boolean, while
+    # `_controls_v2_active_run_owner()` is the sole fail-closed Start-admission
+    # authority.  Any future run-owner condition must update the admission
+    # predicate and its owner matrix explicitly, not only the boolean helper.
+    # ------------------------------------------------------------------
+
+    def _run_owner_still_live_besides(self, origin) -> bool:
+        """Whether a run owner OTHER than *origin* is still genuinely live.
+
+        Lifecycle closure must never unlock shared state that belongs to another
+        owner still in flight (T-4.3 item 2); that owner's own finish delivery
+        closes it.  The established per-owner policies are reused as-is — the
+        phase-qualified :meth:`_wrangler_run_active` for the wrangler (matching
+        the integrator/stitch bodies) and the T-3 tri-state observation for the
+        two worker threads (T-4.3 item 6 — no second activity policy).
+
+        An UNOBSERVABLE other owner is deliberately NOT treated as live: a
+        stranded latch permanently disables the GUI, whereas closing early is
+        recoverable because :meth:`_controls_v2_active_run_owner` independently
+        refuses to START anything over an active-or-unknown owner.  Admission is
+        conservative about starting; closure is conservative about leaving the
+        GUI truthful.
+        """
+        if origin != "wrangler":
+            try:
+                if self._wrangler_run_active():
+                    return True
+            except Exception:
+                logger.debug("closure wrangler-overlap probe failed",
+                             exc_info=True)
+        for owner_origin, owner in (
+            ("integrator", getattr(getattr(self, 'integratorTree', None),
+                                   'integrator_thread', None)),
+            ("stitch", getattr(self, 'stitch_thread', None)),
+        ):
+            if origin == owner_origin:
+                continue
+            if self._controls_v2_owner_activity(owner, owner_origin) == "active":
+                return True
+        return False
+
+    def _run_lifecycle_closure_steps(self):
+        """The INDEPENDENT truthful-idle restoration substeps, in order.
+
+        Every step is idempotent and resolved through ``getattr`` so a partially
+        constructed widget — or the duck-typed ``SimpleNamespace`` finish hosts the
+        run-end unit tests bind — simply yields fewer steps instead of raising.
+
+        This is deliberately the DECLARED MINIMUM: latch, transient reads, display
+        processing flag, H5Viewer writing guard and Open, mode row, Stop, Start.
+        The mode-correct integration re-assertion and ``wrangler.enabled(True)``
+        stay in `_exit_run_state`/the rich bodies — closure re-asserts truth, it
+        does not repeat display work.
+        """
+        steps = []
+
+        def _add(label, owner, name, *args):
+            target = getattr(owner, name, None) if owner is not None else None
+            if callable(target):
+                steps.append((label, lambda t=target, a=args: t(*a)))
+
+        _add("set_scan_integrated_reads_transient", self,
+             "_set_scan_integrated_reads_transient", False)
+        _add("set_processing_active", getattr(self, "displayframe", None),
+             "set_processing_active", False)
+        h5viewer = getattr(self, "h5viewer", None)
+        _add("set_run_writing", h5viewer, "set_run_writing", False)
+        _add("set_open_enabled", h5viewer, "set_open_enabled", True)
+        controls = getattr(self, "controls", None)
+        _add("set_mode_row_enabled", controls, "set_mode_row_enabled", True)
+        _add("set_stop_enabled", controls, "set_stop_enabled", False)
+        # Start's ENABLEMENT is deliberately NOT a closure step.  `_exit_run_state`
+        # releases the reintegrate-era Start lock, and the Controls readiness
+        # profile then owns the final value (no calibration/source => Start stays
+        # disabled, which is correct and is the parent's normal post-run state).
+        # Re-asserting True here would override that owner.  What T-4 must
+        # guarantee is that the RUN no longer holds Start — proven by the
+        # admission predicate reading idle and preparation succeeding, not by a
+        # button flag.
+        return tuple(steps)
+
+    def _close_run_lifecycle(self, origin) -> None:
+        """Idempotent minimum lifecycle closure for ONE finish owner (Step 6).
+
+        Called from the OUTERMOST ``finally`` of every production finish entry
+        point, so it still runs when the rich finish body raises before or during
+        the ordinary `_exit_run_state()` call.
+
+        * a different owner still live -> return, unlocking nothing;
+        * the latch is closed through its single owner, `_exit_run_state()`;
+        * every remaining substep is attempted INDEPENDENTLY, so one failure
+          cannot strand the rest;
+        * a primary finish exception is never replaced — cleanup failures are
+          SECONDARY diagnostics.  With no primary in flight a cleanup failure is
+          surfaced visibly instead of logging a false success.
+
+        It changes lifecycle/UI state only: it never harvests, validates, applies,
+        clears, or re-revisions the edit journal, freezes a configuration, mutates
+        ``RunIntent``, polls a directory, or hydrates metadata.  Wrangler source
+        authority is released by its own owning path, not here.
+        """
+        try:
+            if staticWidget._run_owner_still_live_besides(self, origin):
+                return
+        except Exception:
+            logger.debug("run-lifecycle overlap check failed; closing anyway",
+                         exc_info=True)
+        primary_in_flight = sys.exc_info()[0] is not None
+        failures = []
+        if bool(getattr(self, "_run_active", False)):
+            try:
+                self._exit_run_state()
+            except Exception as exc:
+                failures.append(("_exit_run_state", exc))
+        for label, step in staticWidget._run_lifecycle_closure_steps(self):
+            try:
+                step()
+            except Exception as exc:
+                failures.append((label, exc))
+        if failures:
+            staticWidget._report_run_lifecycle_closure_failures(
+                self, origin, failures, primary_in_flight)
+
+    def _report_run_lifecycle_closure_failures(
+            self, origin, failures, primary_in_flight) -> None:
+        """Name every lifecycle seam that could not be restored (T-4.3 item 3)."""
+        names = ", ".join(label for label, _ in failures)
+        detail = "; ".join(
+            f"{label}: {type(exc).__name__}: {exc}" for label, exc in failures)
+        if primary_in_flight:
+            # SECONDARY: the original finish failure stays the primary diagnostic
+            # and is re-raised by the enclosing ``finally``.
+            logger.warning(
+                "run-lifecycle closure (%s) could not restore %s while a finish "
+                "exception was already in flight — %s", origin, names, detail)
+        else:
+            logger.error(
+                "run-lifecycle closure (%s) could not restore %s — %s",
+                origin, names, detail)
+            try:
+                staticWidget._stitch_status(
+                    self,
+                    f"Run finished, but the interface could not be fully reset "
+                    f"({names}). Check the log before starting another run.")
+            except Exception:
+                logger.debug("closure status message failed", exc_info=True)
+        try:
+            run_config_debug_log(
+                logger,
+                "run_lifecycle_closure_incomplete",
+                widget=self,
+                origin=f"close_run_lifecycle[{origin}]",
+                phase="cleanup",
+                reason=detail,
+                failed_steps=[label for label, _ in failures],
+                primary_in_flight=bool(primary_in_flight),
+                level="warning",
+            )
+        except Exception:
+            logger.debug("closure diagnostic emit failed", exc_info=True)
+
     def _on_stop_clicked(self):
         """Single owner of the shared Stop button — route to the active run.
 
@@ -12762,12 +12937,20 @@ class staticWidget(QWidget):
         )
 
     def integrator_thread_finished(self):
-        """Finish a true reintegration and invalidate prior overlay history."""
-        staticWidget._finalize_processing_run(
-            self,
-            reset_overlay=True,
-            origin="integrator",
-        )
+        """Finish a true reintegration and invalidate prior overlay history.
+
+        T-4 (§9.10 Step 6): `_finalize_processing_run` reaches
+        ``_exit_run_state()`` only after ``thread_state_changed()`` and the
+        wrangler overlap probe, so lifecycle closure runs from the outermost
+        ``finally`` here."""
+        try:
+            staticWidget._finalize_processing_run(
+                self,
+                reset_overlay=True,
+                origin="integrator",
+            )
+        finally:
+            staticWidget._close_run_lifecycle(self, "integrator")
 
     # ── Stitch (Stitch 1D / Stitch 2D modes) ───────────────────────────
     def _stitch_status(self, msg):
@@ -12881,24 +13064,31 @@ class staticWidget(QWidget):
         also in flight) and refresh.  On success the result becomes the persistent
         display source (StitchDisplayController) — set the flag + bump generation
         BEFORE the refresh so update_all() routes through it (it now survives
-        subsequent update() calls instead of the old one-shot paint)."""
-        self.thread_state_changed()
-        if not self.wrangler.thread.isRunning():
-            self._exit_run_state()
-        self.h5viewer.set_open_enabled(True)
-        if getattr(self.stitch_thread, 'ok', False):
-            self.displayframe.stitch_display_mode = self.stitch_thread.mode
-            self.displayframe._bump_display_generation()
-            # Surface a partial skip so the merge isn't silently a subset.
-            skipped = getattr(self.scan, 'stitch_skipped', None) or []
-            suffix = (f' — WARNING: {len(skipped)} frame(s) skipped (no raw data)'
-                      if skipped else '')
-            self._stitch_status(
-                f'Stitch {self.stitch_thread.mode.upper()} complete.{suffix}')
-        # else: _on_stitch_error already surfaced the failure — don't overwrite.
-        self.update_all()
-        if not self.wrangler.thread.isRunning():
-            self.wrangler.enabled(True)
+        subsequent update() calls instead of the old one-shot paint).
+
+        T-4 (§9.10 Step 6): ``thread_state_changed()`` and the wrangler overlap
+        probe both precede the ordinary ``_exit_run_state()`` call, so lifecycle
+        closure runs from the outermost ``finally``."""
+        try:
+            self.thread_state_changed()
+            if not self.wrangler.thread.isRunning():
+                self._exit_run_state()
+            self.h5viewer.set_open_enabled(True)
+            if getattr(self.stitch_thread, 'ok', False):
+                self.displayframe.stitch_display_mode = self.stitch_thread.mode
+                self.displayframe._bump_display_generation()
+                # Surface a partial skip so the merge isn't silently a subset.
+                skipped = getattr(self.scan, 'stitch_skipped', None) or []
+                suffix = (f' — WARNING: {len(skipped)} frame(s) skipped (no raw data)'
+                          if skipped else '')
+                self._stitch_status(
+                    f'Stitch {self.stitch_thread.mode.upper()} complete.{suffix}')
+            # else: _on_stitch_error already surfaced the failure — don't overwrite.
+            self.update_all()
+            if not self.wrangler.thread.isRunning():
+                self.wrangler.enabled(True)
+        finally:
+            staticWidget._close_run_lifecycle(self, "stitch")
 
     def _on_stitch_error(self, msg):
         """Stitch worker raised (caught in the worker, so the thread survived and
@@ -13558,7 +13748,14 @@ class staticWidget(QWidget):
         raise part-way through must not leak the plan/session into the next
         between-run ``setup()`` seeding.  Always clear it in a ``finally``.
 
-        Both calls use the explicit ``staticWidget.<method>(self)`` form (the
+        T-4 (§9.10 Step 6) adds lifecycle closure to that same outermost
+        ``finally``, nested so it runs even if the source-authority release
+        itself raises: the tail's FIRST fallible operation is the reintegrate
+        overlap probe, which precedes the ordinary ``_exit_run_state()`` call, so
+        without this a raise there left the run latch, writing guard, display
+        processing flag, mode row, and Stop/Start permanently mid-run.
+
+        All calls use the explicit ``staticWidget.<method>(self)`` form (the
         same idiom the original tail already used for the clear) so the run-end
         unit tests, which drive this as ``MethodType(staticWidget.wrangler_finished,
         host)`` on a lightweight ``SimpleNamespace`` double, keep working — the
@@ -13567,7 +13764,10 @@ class staticWidget(QWidget):
         try:
             staticWidget._wrangler_finished_body(self)
         finally:
-            staticWidget._clear_controls_v2_run_source_authority(self)
+            try:
+                staticWidget._clear_controls_v2_run_source_authority(self)
+            finally:
+                staticWidget._close_run_lifecycle(self, "wrangler")
 
     def _wrangler_finished_body(self):
         """The run-end finalization body (see :meth:`wrangler_finished`). If the
@@ -13868,7 +14068,14 @@ class staticWidget(QWidget):
             if (not is_batch and not is_xye_only
                     and getattr(self, '_run_saw_frame', True)):
                 staticWidget._arm_runend_overlay_catchup(self)
-        else:
+        elif not _reintegrate_running:
+            # T-4 (§9.10 Step 6 / T-4.3 item 2): overlap-qualify this re-enable
+            # the same way the integrator and stitch finish paths already qualify
+            # theirs.  `wrangler.enabled(True)` runs `_on_mode_changed`, which
+            # re-enables the SHARED run-config row — so on the scan-name-mismatch
+            # branch it unlocked controls that a still-running reintegrate needs
+            # locked, even though the overlap guard above correctly kept the
+            # shared latch held.  The reintegrate's own finish re-enables them.
             self.wrangler.enabled(True)
 
         # Kickoff/teardown perf (XDART_PERF): this forced full gc.collect() at
