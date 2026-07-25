@@ -12191,14 +12191,15 @@ class staticWidget(QWidget):
             return "idle"
         probe = getattr(owner, 'isRunning', None)
         if not callable(probe):
-            self._controls_v2_report_owner_probe_error(
-                label, "owner is present but exposes no callable isRunning()")
+            staticWidget._controls_v2_report_owner_probe_error(
+                self, label,
+                "owner is present but exposes no callable isRunning()")
             return "unknown"
         try:
             return "active" if bool(probe()) else "idle"
         except Exception as exc:
-            self._controls_v2_report_owner_probe_error(
-                label, f"isRunning() raised {type(exc).__name__}: {exc}")
+            staticWidget._controls_v2_report_owner_probe_error(
+                self, label, f"isRunning() raised {type(exc).__name__}: {exc}")
             return "unknown"
 
     def _controls_v2_session_activity(self) -> str:
@@ -12220,8 +12221,9 @@ class staticWidget(QWidget):
         try:
             return "active" if bool(session.is_running) else "idle"
         except Exception as exc:
-            self._controls_v2_report_owner_probe_error(
-                "run-session", f"is_running raised {type(exc).__name__}: {exc}")
+            staticWidget._controls_v2_report_owner_probe_error(
+                self, "run-session",
+                f"is_running raised {type(exc).__name__}: {exc}")
             return "unknown"
 
     def _controls_v2_active_run_owner(self) -> str | None:
@@ -12438,71 +12440,28 @@ class staticWidget(QWidget):
         re-enables the integration controls and re-asserts the *mode-correct*
         per-mode state (Int 1D vs Int 2D vs viewer) rather than a blanket enable,
         so the controls are right for the current mode after the run.
+
+        T-4.1 (§34.6.A): the restoration itself is the ONE authoritative
+        projection in :meth:`_idle_lifecycle_substeps`, shared with abnormal
+        closure — there is no second, smaller fallback copy.  Every substep is
+        attempted INDEPENDENTLY, so an early failure can no longer skip the tail
+        and strand run-owned controls; the first failure is then re-raised
+        unchanged so it stays the caller's primary diagnostic.
+
+        R4B-12 (O-1a-i.3): nothing happens here for deferred edits.  They are a
+        pure data delta folded into the intent + hidden carriers exactly once,
+        synchronously, inside the next Start's preparation — no timer, no
+        post-finalization owner, no carrier write on the run-exit path.
         """
         if not self._run_active:
             return
         self._run_active = False
-        # X1 Slice 3a (R3-P5): FINAL exit — stamp the CAPTURED run scan's
-        # persisted wavelength from the run cache before the capture is
-        # cleared (Pause never reaches here; it goes through _on_run_paused).
-        _captured = getattr(self, "_x1_run_scan_capture", None)
-        _finish = getattr(self.displayframe, "finish_processing", None)
-        if callable(_finish):
-            _finish(_captured, scan_identity_key(_captured))
-        self._x1_run_scan_capture = None
-        self._set_scan_integrated_reads_transient(False)
-        self.displayframe.set_processing_active(False)
-        # File is idle again: clear the disk-load guard.  set_run_writing(False)
-        # also re-fires the standing frame selection so any frame skipped during
-        # the run (evicted + disk-load suppressed) loads now from the idle file.
-        self.h5viewer.set_run_writing(False)
-        # Re-enable the tree (restores the auto-range field gating) then overlay
-        # the mode-correct state (run_active is now False).
-        self.enable_integration(True)
-        dlg = getattr(self, '_integ_adv_combined_dlg', None)
-        if dlg is not None:
-            try:
-                dlg.setEnabled(True)
-            except Exception:
-                logger.debug("re-enable combined advanced dialog failed",
-                             exc_info=True)
-        self._invalidate_controls_v2_render_cache()
-        self._controls_v2_unlocking_run = True
-        try:
-            self._apply_integration_control_state()
-        finally:
-            self._controls_v2_unlocking_run = False
-        # Unlock the mode row (matched with _enter_run_state).  A wrangler end
-        # also does this via wrangler.enabled(True); both agree on the idle state.
-        try:
-            self.controls.set_mode_row_enabled(True)
-        except Exception:
-            logger.debug("unlock mode row on run exit failed", exc_info=True)
-        # Run fully ended: drop the Stop button (reintegrate enabled it in
-        # _enter_run_state; a wrangler end agrees on the idle state).
-        try:
-            self.controls.set_stop_enabled(False)
-        except Exception:
-            logger.debug("disable Stop on run exit failed", exc_info=True)
-        # Re-enable Start (reintegrate disabled it in _enter_run_state; a wrangler
-        # end resets it via its own idle morph, so True here is consistent).
-        try:
-            self.controls.startButton.setEnabled(True)
-        except Exception:
-            logger.debug("re-enable Start on run exit failed", exc_info=True)
-        self._controls_v2_run_frame_count = None
-        if getattr(self, "_controls_v2_batch_refresh_deferred", False):
-            self._controls_v2_batch_refresh_deferred = False
-        if getattr(self, "_controls_v2_last_signature", None) is None:
-            self._refresh_controls_v2_profile(
-                immediate=True,
-                preserve_focused_editor=False,
-            )
-        # R4B-12 (O-1a-i.3): nothing to do here for deferred edits.  They are a
-        # pure data delta folded into the intent + hidden carriers exactly once,
-        # synchronously, inside the next Start's preparation
-        # (_controls_v2_fold_deferred_edits_into_intent) — there is no timer, no
-        # post-finalization owner, and no carrier write on the run-exit path.
+        self._run_lifecycle_restored = False
+        failures = staticWidget._run_idle_lifecycle_projection(self)
+        if not failures:
+            self._run_lifecycle_restored = True
+            return
+        raise failures[0][1]
 
     # ------------------------------------------------------------------
     # O-1a-T4 (§9.10 Step 6) — lifecycle closure for the finish paths.
@@ -12524,118 +12483,222 @@ class staticWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _run_owner_still_live_besides(self, origin) -> bool:
-        """Whether a run owner OTHER than *origin* is still genuinely live.
+        """Whether any run owner OTHER than *origin* is not POSITIVELY idle.
 
-        Lifecycle closure must never unlock shared state that belongs to another
-        owner still in flight (T-4.3 item 2); that owner's own finish delivery
-        closes it.  The established per-owner policies are reused as-is — the
-        phase-qualified :meth:`_wrangler_run_active` for the wrangler (matching
-        the integrator/stitch bodies) and the T-3 tri-state observation for the
-        two worker threads (T-4.3 item 6 — no second activity policy).
+        §34.6.B — this is a SAFETY decision, so it reuses the accepted T-3
+        observers and nothing else: :meth:`_controls_v2_owner_activity` per worker
+        and :meth:`_controls_v2_session_activity` for the streaming session.  It
+        introduces no second boolean activity policy, timer/retry owner, phase
+        model, or exception-specific carve-out.
 
-        An UNOBSERVABLE other owner is deliberately NOT treated as live: a
-        stranded latch permanently disables the GUI, whereas closing early is
-        recoverable because :meth:`_controls_v2_active_run_owner` independently
-        refuses to START anything over an active-or-unknown owner.  Admission is
-        conservative about starting; closure is conservative about leaving the
-        GUI truthful.
+        ``"active"`` AND ``"unknown"`` both HOLD every shared lock; closure
+        proceeds only when every other applicable owner was positively observed
+        ``"idle"``.  T-4 treated an unobservable owner as idle, which dropped the
+        H5 writing guard and unlocked mutable run controls before Start admission
+        could refuse anything — admission refusal cannot make an early unlock
+        safe.  The remaining owner's own qualified delivery closes the lifecycle
+        once it becomes positively idle.  An owner that is genuinely ABSENT stays
+        idle (``_controls_v2_owner_activity`` returns ``"idle"`` for ``None``),
+        which is the partial-construction carve-out.
         """
-        if origin != "wrangler":
-            try:
-                if self._wrangler_run_active():
-                    return True
-            except Exception:
-                logger.debug("closure wrangler-overlap probe failed",
-                             exc_info=True)
         for owner_origin, owner in (
+            ("wrangler", getattr(getattr(self, 'wrangler', None), 'thread', None)),
             ("integrator", getattr(getattr(self, 'integratorTree', None),
                                    'integrator_thread', None)),
             ("stitch", getattr(self, 'stitch_thread', None)),
         ):
             if origin == owner_origin:
                 continue
-            if self._controls_v2_owner_activity(owner, owner_origin) == "active":
+            state = staticWidget._controls_v2_owner_activity(
+                self, owner, owner_origin)
+            if state == "unknown":
                 return True
+            if state != "active":
+                continue
+            if owner_origin != "wrangler":
+                return True
+            # A POSITIVELY-active wrangler is interpreted through its existing,
+            # already-pinned run phase: `QThread.isRunning()` can read True from a
+            # STALE flag while the wrangler is idle, and the accepted behaviour is
+            # that such a flag must not leave the panel grey after a reintegrate
+            # finish.  This is not a second activity policy — the ONE tri-state
+            # observation still decides KNOWN-ness (and "unknown" always holds,
+            # which is §34.3's actual defect); the phase only interprets a known
+            # ACTIVE wrangler.
+            phase = str(getattr(getattr(self, 'wrangler', None),
+                                '_run_phase', '') or '').lower()
+            if phase in ("", "running", "pausing", "paused"):
+                return True
+        # The session owner belongs to the wrangler; its own finish releases it.
+        if (origin != "wrangler"
+                and staticWidget._controls_v2_session_activity(self) != "idle"):
+            return True
         return False
 
-    def _run_lifecycle_closure_steps(self):
-        """The INDEPENDENT truthful-idle restoration substeps, in order.
+    def _finalize_captured_run_scan(self) -> None:
+        """Substep 1: finalize the CAPTURED run scan's display state and release it.
 
-        Every step is idempotent and resolved through ``getattr`` so a partially
-        constructed widget — or the duck-typed ``SimpleNamespace`` finish hosts the
-        run-end unit tests bind — simply yields fewer steps instead of raising.
+        X1 Slice 3a (R3-P5): stamps the captured run scan's persisted wavelength
+        from the run cache before the capture is dropped.  Pause never reaches
+        here; it goes through ``_on_run_paused``."""
+        captured = getattr(self, "_x1_run_scan_capture", None)
+        finish = getattr(getattr(self, "displayframe", None),
+                         "finish_processing", None)
+        if callable(finish):
+            finish(captured, scan_identity_key(captured))
+        self._x1_run_scan_capture = None
 
-        This is deliberately the DECLARED MINIMUM: latch, transient reads, display
-        processing flag, H5Viewer writing guard and Open, mode row, Stop, Start.
-        The mode-correct integration re-assertion and ``wrangler.enabled(True)``
-        stay in `_exit_run_state`/the rich bodies — closure re-asserts truth, it
-        does not repeat display work.
-        """
+    def _set_advanced_integration_enabled(self, enabled) -> None:
+        """Substep 6: the advanced 1D/2D widgets + combined dialog.
+
+        ``_enter_run_state`` disables all three so a dialog left open cannot leak a
+        mid-run edit into the next scan; the idle projection must restore all
+        three, which T-4's fallback list omitted entirely."""
+        itree = getattr(self, "integratorTree", None)
+        for name in ("advancedWidget1D", "advancedWidget2D"):
+            adv = getattr(itree, name, None)
+            if adv is not None:
+                adv.setEnabled(bool(enabled))
+        dlg = getattr(self, "_integ_adv_combined_dlg", None)
+        if dlg is not None:
+            dlg.setEnabled(bool(enabled))
+
+    def _apply_unlocking_integration_state(self) -> None:
+        """Substep 7: the mode-correct projection under the run-unlock guard."""
+        self._controls_v2_unlocking_run = True
+        try:
+            self._apply_integration_control_state()
+        finally:
+            self._controls_v2_unlocking_run = False
+
+    def _reset_run_lifecycle_bookkeeping(self) -> None:
+        """Substep 11: per-run frame-count freeze and deferred-refresh flags."""
+        self._controls_v2_run_frame_count = None
+        if getattr(self, "_controls_v2_batch_refresh_deferred", False):
+            self._controls_v2_batch_refresh_deferred = False
+
+    def _project_controls_v2_readiness(self) -> None:
+        """Substep 12: the CANONICAL readiness projection of the action row/Start.
+
+        §34.6.A: Start is never assigned ``True`` as the answer.  Its value comes
+        from the existing readiness owner (:meth:`_controls_v2_sync_run_row`), so a
+        profile that was canonically ready recovers to enabled while a genuinely
+        unready profile stays disabled.  The pre-existing conditional full refresh
+        is preserved; otherwise only the run row is re-projected, so no NEW
+        unconditional full-profile rebuild is added to any finish."""
+        if getattr(self, "_controls_v2_last_signature", None) is None:
+            self._refresh_controls_v2_profile(
+                immediate=True, preserve_focused_editor=False)
+            return
+        render_state = build_control_panel_state(
+            self._controls_v2_state(),
+            self._controls_v2_field_values(),
+            self._controls_v2_field_choices(),
+        )
+        self._controls_v2_sync_run_row(render_state.profile)
+
+    def _idle_lifecycle_substeps(self):
+        """THE one authoritative ordered idle projection (§34.6.A).
+
+        Consumed by BOTH ordinary `_exit_run_state()` and abnormal
+        `_close_run_lifecycle()` — there is deliberately no second, smaller
+        fallback list for the two to drift apart.  The order mirrors the run-lock
+        delta taken by ``_enter_run_state``; every entry is ``(seam, thunk)``, is
+        idempotent, and is resolved through ``getattr`` so a partially constructed
+        widget — or the duck-typed ``SimpleNamespace`` finish hosts the run-end
+        unit tests bind — simply yields fewer substeps instead of raising.
+
+        It restores lifecycle/UI/source-handoff state only: no edit application,
+        freeze, source poll/reconcile, metadata hydration, or rich reload/render
+        work."""
         steps = []
 
-        def _add(label, owner, name, *args):
+        def _add(seam, owner, name, *args):
             target = getattr(owner, name, None) if owner is not None else None
             if callable(target):
-                steps.append((label, lambda t=target, a=args: t(*a)))
+                steps.append((seam, lambda t=target, a=args: t(*a)))
 
-        _add("set_scan_integrated_reads_transient", self,
-             "_set_scan_integrated_reads_transient", False)
-        _add("set_processing_active", getattr(self, "displayframe", None),
-             "set_processing_active", False)
-        h5viewer = getattr(self, "h5viewer", None)
-        _add("set_run_writing", h5viewer, "set_run_writing", False)
-        _add("set_open_enabled", h5viewer, "set_open_enabled", True)
+        df = getattr(self, "displayframe", None)
+        h5 = getattr(self, "h5viewer", None)
         controls = getattr(self, "controls", None)
+        _add("finish_processing", self, "_finalize_captured_run_scan")
+        _add("transient_reads", self,
+             "_set_scan_integrated_reads_transient", False)
+        _add("set_processing_active", df, "set_processing_active", False)
+        _add("set_run_writing", h5, "set_run_writing", False)
+        _add("set_open_enabled", h5, "set_open_enabled", True)
+        _add("enable_integration", self, "enable_integration", True)
+        _add("advanced_widgets", self,
+             "_set_advanced_integration_enabled", True)
+        _add("invalidate_render_cache", self,
+             "_invalidate_controls_v2_render_cache")
+        _add("integration_control_state", self,
+             "_apply_unlocking_integration_state")
         _add("set_mode_row_enabled", controls, "set_mode_row_enabled", True)
         _add("set_stop_enabled", controls, "set_stop_enabled", False)
-        # Start's ENABLEMENT is deliberately NOT a closure step.  `_exit_run_state`
-        # releases the reintegrate-era Start lock, and the Controls readiness
-        # profile then owns the final value (no calibration/source => Start stays
-        # disabled, which is correct and is the parent's normal post-run state).
-        # Re-asserting True here would override that owner.  What T-4 must
-        # guarantee is that the RUN no longer holds Start — proven by the
-        # admission predicate reading idle and preparation succeeding, not by a
-        # button flag.
+        _add("run_bookkeeping", self, "_reset_run_lifecycle_bookkeeping")
+        _add("readiness_projection", self, "_project_controls_v2_readiness")
         return tuple(steps)
 
-    def _close_run_lifecycle(self, origin) -> None:
-        """Idempotent minimum lifecycle closure for ONE finish owner (Step 6).
+    def _run_idle_lifecycle_projection(self):
+        """Attempt EVERY substep of the one projection independently.
+
+        Returns the ordered ``[(seam, exception), ...]`` list of failures so the
+        caller decides whether they are a primary or secondary diagnostic."""
+        failures = []
+        for seam, step in staticWidget._idle_lifecycle_substeps(self):
+            try:
+                step()
+            except Exception as exc:
+                failures.append((seam, exc))
+        return failures
+
+    def _close_run_lifecycle(self, origin, *, release_source=False) -> None:
+        """Idempotent total lifecycle closure for ONE finish owner (Step 6).
 
         Called from the OUTERMOST ``finally`` of every production finish entry
         point, so it still runs when the rich finish body raises before or during
         the ordinary `_exit_run_state()` call.
 
-        * a different owner still live -> return, unlocking nothing;
-        * the latch is closed through its single owner, `_exit_run_state()`;
-        * every remaining substep is attempted INDEPENDENTLY, so one failure
-          cannot strand the rest;
-        * a primary finish exception is never replaced — cleanup failures are
-          SECONDARY diagnostics.  With no primary in flight a cleanup failure is
-          surfaced visibly instead of logging a false success.
+        §34.6.C — ONE secondary-failure collector covers wrangler source release
+        AND the total lifecycle projection:
 
-        It changes lifecycle/UI state only: it never harvests, validates, applies,
-        clears, or re-revisions the edit journal, freezes a configuration, mutates
-        ``RunIntent``, polls a directory, or hydrates metadata.  Wrangler source
-        authority is released by its own owning path, not here.
-        """
-        try:
-            if staticWidget._run_owner_still_live_besides(self, origin):
-                return
-        except Exception:
-            logger.debug("run-lifecycle overlap check failed; closing anyway",
-                         exc_info=True)
+        1. the original rich-body exception is preserved and re-raised unchanged
+           by the enclosing ``finally``; nothing here replaces it;
+        2. wrangler-owned source release is attempted FIRST and regardless of
+           overlap (the wrangler releases its own handoff even while another owner
+           keeps the shared UI locked; integrator and stitch never clear it);
+        3. the owner-qualified total projection runs only when every other owner
+           is positively idle, and only if the ordinary exit did not already
+           complete it; and
+        4. every failed seam is reported in deterministic order through the
+           existing visible + structured incomplete-cleanup event.
+
+        With no primary in flight a cleanup failure is surfaced visibly rather
+        than logging a false success."""
         primary_in_flight = sys.exc_info()[0] is not None
         failures = []
-        if bool(getattr(self, "_run_active", False)):
+        if release_source:
             try:
-                self._exit_run_state()
+                staticWidget._clear_controls_v2_run_source_authority(self)
             except Exception as exc:
-                failures.append(("_exit_run_state", exc))
-        for label, step in staticWidget._run_lifecycle_closure_steps(self):
-            try:
-                step()
-            except Exception as exc:
-                failures.append((label, exc))
+                failures.append(("source_authority_release", exc))
+        try:
+            hold = staticWidget._run_owner_still_live_besides(self, origin)
+        except Exception as exc:
+            failures.append(("overlap_observation", exc))
+            hold = True
+        if not hold:
+            if bool(getattr(self, "_run_active", False)):
+                try:
+                    self._exit_run_state()
+                except Exception as exc:
+                    failures.append(("_exit_run_state", exc))
+            if not getattr(self, "_run_lifecycle_restored", True):
+                projected = staticWidget._run_idle_lifecycle_projection(self)
+                failures.extend(projected)
+                if not projected:
+                    self._run_lifecycle_restored = True
         if failures:
             staticWidget._report_run_lifecycle_closure_failures(
                 self, origin, failures, primary_in_flight)
@@ -12893,13 +12956,20 @@ class staticWidget(QWidget):
         # exit the shared run-state then (mirrors the wrangler-enable guard
         # below).
         wrangler_running = self._wrangler_run_active()
+        # T-4.1 (§34.6.B): the SHARED LIFECYCLE decision belongs to the one
+        # owner-observation policy, which holds on "active" AND "unknown" and also
+        # covers stitch — this local `wrangler_running` boolean saw neither, so an
+        # unobservable or stitch owner was unlocked from here.  It survives only
+        # for the wrangler-PANEL re-enable below, which is its own concern.
+        _hold = staticWidget._run_owner_still_live_besides(self, "integrator")
         browse_debug_log(
             logger,
             f"runend_{origin}_finalize_state",
             wrangler_running=wrangler_running,
+            other_owner_holds=_hold,
             **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
         )
-        if not wrangler_running:
+        if not _hold:
             self._exit_run_state()
         self.h5viewer.set_open_enabled(True)
         if reset_overlay:
@@ -12928,7 +12998,10 @@ class staticWidget(QWidget):
             f"runend_{origin}_finalize_after_update_all",
             **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
         )
-        if not wrangler_running:
+        if not _hold:
+            # `wrangler.enabled(True)` runs `_on_mode_changed`, which re-enables the
+            # SHARED run-config row — so it is gated by the one hold decision, not
+            # by the wrangler-only boolean (T-4.1 §34.6.B).
             self.wrangler.enabled(True)
         browse_debug_log(
             logger,
@@ -13071,7 +13144,11 @@ class staticWidget(QWidget):
         closure runs from the outermost ``finally``."""
         try:
             self.thread_state_changed()
-            if not self.wrangler.thread.isRunning():
+            # T-4.1 (§34.6.B): one owner-observation policy for the shared latch —
+            # the raw `isRunning()` read here saw neither an unobservable owner nor
+            # a live reintegrate.
+            _hold = staticWidget._run_owner_still_live_besides(self, "stitch")
+            if not _hold:
                 self._exit_run_state()
             self.h5viewer.set_open_enabled(True)
             if getattr(self.stitch_thread, 'ok', False):
@@ -13085,7 +13162,7 @@ class staticWidget(QWidget):
                     f'Stitch {self.stitch_thread.mode.upper()} complete.{suffix}')
             # else: _on_stitch_error already surfaced the failure — don't overwrite.
             self.update_all()
-            if not self.wrangler.thread.isRunning():
+            if not _hold:
                 self.wrangler.enabled(True)
         finally:
             staticWidget._close_run_lifecycle(self, "stitch")
@@ -13749,11 +13826,17 @@ class staticWidget(QWidget):
         between-run ``setup()`` seeding.  Always clear it in a ``finally``.
 
         T-4 (§9.10 Step 6) adds lifecycle closure to that same outermost
-        ``finally``, nested so it runs even if the source-authority release
-        itself raises: the tail's FIRST fallible operation is the reintegrate
+        ``finally``: the tail's FIRST fallible operation is the reintegrate
         overlap probe, which precedes the ordinary ``_exit_run_state()`` call, so
         without this a raise there left the run latch, writing guard, display
-        processing flag, mode row, and Stop/Start permanently mid-run.
+        processing flag, mode row, and Stop permanently mid-run.
+
+        T-4.1 (§34.6.C): the source release now happens INSIDE the closure's
+        secondary-failure collector rather than in its own nested ``finally``.
+        Nesting guaranteed closure ran, but ordinary Python unwind priority let a
+        source-cleanup exception REPLACE the rich-body primary. Source release is
+        cleanup: it must be reported as a named secondary and must never become
+        the exception the caller sees.
 
         All calls use the explicit ``staticWidget.<method>(self)`` form (the
         same idiom the original tail already used for the clear) so the run-end
@@ -13764,10 +13847,8 @@ class staticWidget(QWidget):
         try:
             staticWidget._wrangler_finished_body(self)
         finally:
-            try:
-                staticWidget._clear_controls_v2_run_source_authority(self)
-            finally:
-                staticWidget._close_run_lifecycle(self, "wrangler")
+            staticWidget._close_run_lifecycle(
+                self, "wrangler", release_source=True)
 
     def _wrangler_finished_body(self):
         """The run-end finalization body (see :meth:`wrangler_finished`). If the
@@ -13797,7 +13878,8 @@ class staticWidget(QWidget):
             auto_last=getattr(self.h5viewer, "auto_last", None),
             **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
         )
-        if not _reintegrate_running:
+        _hold = staticWidget._run_owner_still_live_besides(self, "wrangler")
+        if not _hold:
             self._exit_run_state()
             browse_debug_log(
                 logger,
@@ -14068,7 +14150,7 @@ class staticWidget(QWidget):
             if (not is_batch and not is_xye_only
                     and getattr(self, '_run_saw_frame', True)):
                 staticWidget._arm_runend_overlay_catchup(self)
-        elif not _reintegrate_running:
+        elif not _hold:
             # T-4 (§9.10 Step 6 / T-4.3 item 2): overlap-qualify this re-enable
             # the same way the integrator and stitch finish paths already qualify
             # theirs.  `wrangler.enabled(True)` runs `_on_mode_changed`, which

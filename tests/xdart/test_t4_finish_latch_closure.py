@@ -165,8 +165,11 @@ def test_wrangler_pre_exit_failure_still_closes_the_lifecycle(
     _idle_owners(widget, monkeypatch)
     widget._enter_run_state()
     assert widget._run_active is True
-    monkeypatch.setattr(
-        widget.integratorTree.integrator_thread, "isRunning", _boom)
+    # T-4.1 (§34.6.B): injecting at the reintegrate OVERLAP PROBE would make that
+    # owner unobservable, which now correctly HOLDS the shared lifecycle — a
+    # different case (family 4).  Inject just after the probe instead, so this
+    # case still proves that a pre-exit failure cannot strand the lifecycle.
+    monkeypatch.setattr(widget, "_flush_pending_update", _boom)
 
     with pytest.raises(RuntimeError, match="injected finish-tail failure"):
         widget.wrangler_finished()
@@ -277,7 +280,11 @@ def test_cleanup_failure_without_a_primary_is_surfaced_not_swallowed(
     monkeypatch.setattr(widget.controls, "set_stop_enabled", _boom)
 
     with caplog.at_level(logging.WARNING):
-        widget.integrator_thread_finished()
+        # T-4.1: the restoration projection IS the ordinary exit path now, so a
+        # failure in it is a genuine run-end failure — surfaced AND propagated,
+        # never silently swallowed into a false success.
+        with pytest.raises(RuntimeError, match="injected finish-tail failure"):
+            widget.integrator_thread_finished()
 
     records = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("set_stop_enabled" in r.getMessage() for r in records), (
