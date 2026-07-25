@@ -4678,9 +4678,18 @@ def test_controls_panel_v2_reintegrate_commits_focused_edit(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_controls_panel_v2_reintegrate_finish_unlocks_idle_wrangler_thread(
+def test_controls_panel_v2_reintegrate_finish_unlocks_stale_running_phase(
         qapp, monkeypatch):
-    """A stale/idle wrangler thread flag must not leave V2 grey after reintegrate."""
+    """A stale wrangler run PHASE must not leave V2 grey after reintegrate.
+
+    T-4.2 (§35.2/§35.7.A): this case previously used ``isRunning() == True`` with
+    ``_run_phase == "idle"`` and called that "stale".  That shape is not stale — it
+    is the production Stop/unwind window (``imageWrangler.stop()`` sets the phase
+    idle before the worker finishes), and releasing the shared lifecycle through it
+    reopens T-3's fast-Start window.  The TRUTHFUL stale-phase shape is an IDLE
+    QThread carrying a leftover ``running`` phase, which is what this now drives;
+    the active-thread case is owned by
+    ``test_t42_closure_evidence::test_active_stopping_wrangler_without_session_holds_shared_locks``."""
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
@@ -4700,8 +4709,9 @@ def test_controls_panel_v2_reintegrate_finish_unlocks_idle_wrangler_thread(
         }
         assert not rows[("Int1D", "points")].editor.isEnabled()
 
-        monkeypatch.setattr(widget.wrangler.thread, "isRunning", lambda: True)
-        monkeypatch.setattr(widget.wrangler, "_run_phase", "idle", raising=False)
+        monkeypatch.setattr(widget.wrangler.thread, "isRunning", lambda: False)
+        monkeypatch.setattr(
+            widget.wrangler, "_run_phase", "running", raising=False)
 
         widget.integrator_thread_finished()
 

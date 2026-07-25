@@ -20,6 +20,13 @@ so a raise at any of those points strands `_run_active`, the H5Viewer writing
 guard, the display processing flag, the mode row, Stop/Start, and Open — the GUI
 is then permanently "in a run" and no later Start can proceed.
 
+T-4.2 note (§35.6): this module is NOT byte-unchanged since `3a22d661`. Two cases
+were deliberately reconciled with the later binding contract — the wrangler
+pre-exit injection moved off the overlap probe (which §34.6.B now treats as an
+unknown, lock-holding owner), and a projection failure with no rich primary is
+expected to PROPAGATE as well as be surfaced (§34.7 family 2). Both dispositions
+were reviewed and accepted; the substantive assertions are unchanged.
+
 Cases 1-3 are §9.10 test 11 split per owner; case 8 is §9.10 test 12.  Every case
 drives the REAL production slot on a REAL ``staticWidget`` with its real signal
 connections asserted — calling the new closure helper directly would not be proof.

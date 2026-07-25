@@ -12430,7 +12430,7 @@ class staticWidget(QWidget):
                 logger.debug("disable combined advanced dialog failed",
                              exc_info=True)
 
-    def _exit_run_state(self):
+    def _exit_run_state(self, receipt=None):
         """Single owner of run END (task #68): mark the run finished.
         Idempotent — exiting an already-idle state is a no-op.
 
@@ -12457,11 +12457,16 @@ class staticWidget(QWidget):
             return
         self._run_active = False
         self._run_lifecycle_restored = False
-        failures = staticWidget._run_idle_lifecycle_projection(self)
-        if not failures:
+        if receipt is None:
+            receipt = staticWidget._new_projection_receipt()
+        staticWidget._run_idle_lifecycle_projection(self, receipt)
+        if not receipt["failed"]:
             self._run_lifecycle_restored = True
             return
-        raise failures[0][1]
+        # T-4.2 (§35.7.B req 1/2): the COMPLETE ordered first-pass record stays in
+        # the caller's receipt so the outer collector can name every failed seam;
+        # the first exception object and traceback still propagate unchanged.
+        raise receipt["failed"][0][1]
 
     # ------------------------------------------------------------------
     # O-1a-T4 (§9.10 Step 6) — lifecycle closure for the finish paths.
@@ -12509,25 +12514,14 @@ class staticWidget(QWidget):
         ):
             if origin == owner_origin:
                 continue
-            state = staticWidget._controls_v2_owner_activity(
-                self, owner, owner_origin)
-            if state == "unknown":
-                return True
-            if state != "active":
-                continue
-            if owner_origin != "wrangler":
-                return True
-            # A POSITIVELY-active wrangler is interpreted through its existing,
-            # already-pinned run phase: `QThread.isRunning()` can read True from a
-            # STALE flag while the wrangler is idle, and the accepted behaviour is
-            # that such a flag must not leave the panel grey after a reintegrate
-            # finish.  This is not a second activity policy — the ONE tri-state
-            # observation still decides KNOWN-ness (and "unknown" always holds,
-            # which is §34.3's actual defect); the phase only interprets a known
-            # ACTIVE wrangler.
-            phase = str(getattr(getattr(self, 'wrangler', None),
-                                '_run_phase', '') or '').lower()
-            if phase in ("", "running", "pausing", "paused"):
+            # T-4.2 (§35.7.A): owner truth is TRI-STATE ONLY.  The UI
+            # `_run_phase` may NOT downgrade a positively active QThread —
+            # `imageWrangler.stop()` sets that phase idle before the worker has
+            # finished, and not every source/mode has a streaming-session adapter,
+            # so {isRunning()=True, phase="idle", no session} is a real Stop/unwind
+            # window.  `_run_phase` remains an action-button/display concern.
+            if staticWidget._controls_v2_owner_activity(
+                    self, owner, owner_origin) != "idle":
                 return True
         # The session owner belongs to the wrangler; its own finish releases it.
         if (origin != "wrangler"
@@ -12540,28 +12534,21 @@ class staticWidget(QWidget):
 
         X1 Slice 3a (R3-P5): stamps the captured run scan's persisted wavelength
         from the run cache before the capture is dropped.  Pause never reaches
-        here; it goes through ``_on_run_paused``."""
+        here; it goes through ``_on_run_paused``.
+
+        T-4.2 (§35.7.C): the capture is DETACHED ATOMICALLY FIRST and the
+        finalizer is then driven from the local.  Clearing it afterwards meant a
+        persistent finalizer failure left the live run scan owned after terminal
+        closure and the recovery pass finalized the same identity twice.  An absent
+        capture is a no-op, so a retry can never re-finalize."""
         captured = getattr(self, "_x1_run_scan_capture", None)
+        self._x1_run_scan_capture = None
+        if captured is None:
+            return
         finish = getattr(getattr(self, "displayframe", None),
                          "finish_processing", None)
         if callable(finish):
             finish(captured, scan_identity_key(captured))
-        self._x1_run_scan_capture = None
-
-    def _set_advanced_integration_enabled(self, enabled) -> None:
-        """Substep 6: the advanced 1D/2D widgets + combined dialog.
-
-        ``_enter_run_state`` disables all three so a dialog left open cannot leak a
-        mid-run edit into the next scan; the idle projection must restore all
-        three, which T-4's fallback list omitted entirely."""
-        itree = getattr(self, "integratorTree", None)
-        for name in ("advancedWidget1D", "advancedWidget2D"):
-            adv = getattr(itree, name, None)
-            if adv is not None:
-                adv.setEnabled(bool(enabled))
-        dlg = getattr(self, "_integ_adv_combined_dlg", None)
-        if dlg is not None:
-            dlg.setEnabled(bool(enabled))
 
     def _apply_unlocking_integration_state(self) -> None:
         """Substep 7: the mode-correct projection under the run-unlock guard."""
@@ -12628,8 +12615,16 @@ class staticWidget(QWidget):
         _add("set_run_writing", h5, "set_run_writing", False)
         _add("set_open_enabled", h5, "set_open_enabled", True)
         _add("enable_integration", self, "enable_integration", True)
-        _add("advanced_widgets", self,
-             "_set_advanced_integration_enabled", True)
+        # T-4.2 (§35.7.D): three INDEPENDENT owners.  As one compound substep a
+        # 1-D widget failure skipped both the 2-D widget and the combined dialog,
+        # which is the §34.2 stranded-control class one level inside a "step".
+        itree = getattr(self, "integratorTree", None)
+        _add("advanced_widget_1d",
+             getattr(itree, "advancedWidget1D", None), "setEnabled", True)
+        _add("advanced_widget_2d",
+             getattr(itree, "advancedWidget2D", None), "setEnabled", True)
+        _add("advanced_dialog",
+             getattr(self, "_integ_adv_combined_dlg", None), "setEnabled", True)
         _add("invalidate_render_cache", self,
              "_invalidate_controls_v2_render_cache")
         _add("integration_control_state", self,
@@ -12640,20 +12635,68 @@ class staticWidget(QWidget):
         _add("readiness_projection", self, "_project_controls_v2_readiness")
         return tuple(steps)
 
-    def _run_idle_lifecycle_projection(self):
-        """Attempt EVERY substep of the one projection independently.
+    @staticmethod
+    def _new_projection_receipt() -> dict:
+        """A per-delivery LOCAL projection receipt (§35.7.B).
 
-        Returns the ordered ``[(seam, exception), ...]`` list of failures so the
-        caller decides whether they are a primary or secondary diagnostic."""
-        failures = []
+        Pure diagnostic transport for ONE synchronous finish delivery — not a
+        phase, run identity, callback registry, or transaction engine.  The finish
+        entry point allocates it, passes it through the rich body,
+        `_exit_run_state()` and `_close_run_lifecycle()`, and drops it on return;
+        nothing is stored on the widget and no receipt outlives the delivery."""
+        return {"attempted": False, "done": [], "failed": [], "retried": []}
+
+    def _run_idle_lifecycle_projection(self, receipt) -> dict:
+        """Attempt the one projection independently, recording into *receipt*.
+
+        First pass: every substep is attempted and each failure is recorded in
+        projection order.  Later passes retry ONLY the seams that failed — an
+        already-successful, side-effectful seam such as ``set_run_writing(False)``
+        is never replayed (§35.7.B req 4/5), and a seam that recovers still keeps
+        its initial failure in the record (req 6)."""
+        first_pass = not receipt["attempted"]
+        receipt["attempted"] = True
+        done = set(receipt["done"])
+        failed_seams = {seam for seam, _ in receipt["failed"]}
         for seam, step in staticWidget._idle_lifecycle_substeps(self):
+            if seam in done:
+                continue
+            if not first_pass and seam not in failed_seams:
+                continue
             try:
                 step()
             except Exception as exc:
-                failures.append((seam, exc))
-        return failures
+                if first_pass:
+                    receipt["failed"].append((seam, exc))
+                else:
+                    receipt["retried"].append((seam, exc))
+                continue
+            receipt["done"].append(seam)
+        return receipt
 
-    def _close_run_lifecycle(self, origin, *, release_source=False) -> None:
+    @staticmethod
+    def _projection_incomplete(receipt) -> bool:
+        """Whether any seam is still outstanding after this delivery's passes."""
+        recovered = set(receipt["done"])
+        return any(seam not in recovered for seam, _ in receipt["failed"])
+
+    @staticmethod
+    def _drive_exit_run_state(self, receipt) -> None:
+        """Call the run-exit owner, threading the per-delivery receipt.
+
+        The run-end unit tests bind a ZERO-ARGUMENT ``_exit_run_state`` stub onto
+        duck-typed ``SimpleNamespace`` finish hosts, so the receipt is threaded
+        only when the bound callable IS the production owner."""
+        exit_fn = getattr(self, "_exit_run_state", None)
+        if exit_fn is None:
+            return
+        if getattr(exit_fn, "__func__", None) is staticWidget._exit_run_state:
+            exit_fn(receipt)
+        else:
+            exit_fn()
+
+    def _close_run_lifecycle(self, origin, *, release_source=False,
+                             receipt=None) -> None:
         """Idempotent total lifecycle closure for ONE finish owner (Step 6).
 
         Called from the OUTERMOST ``finally`` of every production finish entry
@@ -12677,6 +12720,8 @@ class staticWidget(QWidget):
         With no primary in flight a cleanup failure is surfaced visibly rather
         than logging a false success."""
         primary_in_flight = sys.exc_info()[0] is not None
+        if receipt is None:
+            receipt = staticWidget._new_projection_receipt()
         failures = []
         if release_source:
             try:
@@ -12691,14 +12736,28 @@ class staticWidget(QWidget):
         if not hold:
             if bool(getattr(self, "_run_active", False)):
                 try:
-                    self._exit_run_state()
+                    staticWidget._drive_exit_run_state(self, receipt)
                 except Exception as exc:
-                    failures.append(("_exit_run_state", exc))
+                    # Only an umbrella when the receipt carries no seam detail
+                    # (§35.3: the umbrella must not REPLACE the ordered record).
+                    if not receipt["failed"]:
+                        failures.append(("_exit_run_state", exc))
             if not getattr(self, "_run_lifecycle_restored", True):
-                projected = staticWidget._run_idle_lifecycle_projection(self)
-                failures.extend(projected)
-                if not projected:
+                staticWidget._run_idle_lifecycle_projection(self, receipt)
+                if not staticWidget._projection_incomplete(receipt):
                     self._run_lifecycle_restored = True
+        # §35.7.B req 6: EVERY initial failed seam is reported, in projection
+        # order, even when the retry recovered it — with its disposition, so an
+        # outstanding recovery failure is distinguishable from a recovered one.
+        recovered = set(receipt["done"])
+        retried = {seam for seam, _ in receipt["retried"]}
+        for seam, exc in receipt["failed"]:
+            if seam in recovered:
+                failures.append((seam + " (recovered on retry)", exc))
+            elif seam in retried:
+                failures.append((seam + " (recovery failed)", exc))
+            else:
+                failures.append((seam, exc))
         if failures:
             staticWidget._report_run_lifecycle_closure_failures(
                 self, origin, failures, primary_in_flight)
@@ -12933,7 +12992,8 @@ class staticWidget(QWidget):
         staticWidget._request_render(self, "reintegrate-flush")
         self.metawidget.update()
 
-    def _finalize_processing_run(self, *, reset_overlay, origin):
+    def _finalize_processing_run(self, *, reset_overlay, origin,
+                                 receipt=None):
         """Finish shared run UI state, optionally resetting plot history.
 
         Overlay history belongs to the acquisition run and must survive normal
@@ -12970,7 +13030,7 @@ class staticWidget(QWidget):
             **_runend_waterfall_history_fields(getattr(self, "displayframe", None)),
         )
         if not _hold:
-            self._exit_run_state()
+            staticWidget._drive_exit_run_state(self, receipt)
         self.h5viewer.set_open_enabled(True)
         if reset_overlay:
             try:
@@ -13016,14 +13076,17 @@ class staticWidget(QWidget):
         ``_exit_run_state()`` only after ``thread_state_changed()`` and the
         wrangler overlap probe, so lifecycle closure runs from the outermost
         ``finally`` here."""
+        receipt = staticWidget._new_projection_receipt()
         try:
             staticWidget._finalize_processing_run(
                 self,
                 reset_overlay=True,
                 origin="integrator",
+                receipt=receipt,
             )
         finally:
-            staticWidget._close_run_lifecycle(self, "integrator")
+            staticWidget._close_run_lifecycle(
+                self, "integrator", receipt=receipt)
 
     # ── Stitch (Stitch 1D / Stitch 2D modes) ───────────────────────────
     def _stitch_status(self, msg):
@@ -13142,6 +13205,7 @@ class staticWidget(QWidget):
         T-4 (§9.10 Step 6): ``thread_state_changed()`` and the wrangler overlap
         probe both precede the ordinary ``_exit_run_state()`` call, so lifecycle
         closure runs from the outermost ``finally``."""
+        receipt = staticWidget._new_projection_receipt()
         try:
             self.thread_state_changed()
             # T-4.1 (§34.6.B): one owner-observation policy for the shared latch —
@@ -13149,7 +13213,7 @@ class staticWidget(QWidget):
             # a live reintegrate.
             _hold = staticWidget._run_owner_still_live_besides(self, "stitch")
             if not _hold:
-                self._exit_run_state()
+                staticWidget._drive_exit_run_state(self, receipt)
             self.h5viewer.set_open_enabled(True)
             if getattr(self.stitch_thread, 'ok', False):
                 self.displayframe.stitch_display_mode = self.stitch_thread.mode
@@ -13165,7 +13229,8 @@ class staticWidget(QWidget):
             if not _hold:
                 self.wrangler.enabled(True)
         finally:
-            staticWidget._close_run_lifecycle(self, "stitch")
+            staticWidget._close_run_lifecycle(
+                self, "stitch", receipt=receipt)
 
     def _on_stitch_error(self, msg):
         """Stitch worker raised (caught in the worker, so the thread survived and
@@ -13844,13 +13909,14 @@ class staticWidget(QWidget):
         host)`` on a lightweight ``SimpleNamespace`` double, keep working — the
         double carries the attributes the body touches, not these helpers.
         """
+        receipt = staticWidget._new_projection_receipt()
         try:
-            staticWidget._wrangler_finished_body(self)
+            staticWidget._wrangler_finished_body(self, receipt)
         finally:
             staticWidget._close_run_lifecycle(
-                self, "wrangler", release_source=True)
+                self, "wrangler", release_source=True, receipt=receipt)
 
-    def _wrangler_finished_body(self):
+    def _wrangler_finished_body(self, receipt=None):
         """The run-end finalization body (see :meth:`wrangler_finished`). If the
         current scan matches the wrangler scan, allows for integration.
         """
@@ -13880,7 +13946,7 @@ class staticWidget(QWidget):
         )
         _hold = staticWidget._run_owner_still_live_besides(self, "wrangler")
         if not _hold:
-            self._exit_run_state()
+            staticWidget._drive_exit_run_state(self, receipt)
             browse_debug_log(
                 logger,
                 "runend_wrangler_after_exit_run_state",
