@@ -25,6 +25,7 @@ from xdart.utils.h5pool import get_pool as _get_h5pool
 from xrd_tools.io.export import write_xye
 from xrd_tools.session.run_configuration import (
     FrozenRunConfiguration,
+    FrozenSourceSpec,
     RunConfigurationRefused,
     admit_run_configuration,
     require_run_configuration,
@@ -90,11 +91,37 @@ def _frozen_source_family(frozen):
     return "Image Series"
 
 
+def _frozen_source_is_admissible(source):
+    """Whether a TYPED frozen source is also a REAL one (review §41.3.D).
+
+    Presence and type are not sufficient: the plain-image Directory freeze builds
+    a ``DirectorySourceSpec`` from whatever the card holds, so a nonexistent
+    directory could reach Start as a well-typed but invalid source.  Validate the
+    family's own invariants -- a directory needs a real root and a format token; a
+    file-shaped source needs a uri.  An EMPTY but existing directory stays valid:
+    the worker discovers candidates after Run.
+    """
+    if source.family == "directory":
+        root = str(source.uri or "").strip()
+        return (
+            bool(root)
+            and bool(source.suffixes)
+            and Path(root).expanduser().is_dir()
+        )
+    return bool(str(source.uri or "").strip())
+
+
 def _frozen_source_root(frozen):
     source = frozen.source
     if source is None:
         return _UNSET
     if source.family == "directory":
+        return str(source.uri)
+    # O-1a-W1R-D1 (review §40.1 P1-B): ``image_series_spec`` freezes the
+    # CONTAINING DIRECTORY as a series' uri, so taking its parent answered with
+    # the grandparent -- the wrong directory for output-collision safety and
+    # metadata discovery.  Only a source that names a FILE has a parent.
+    if str(source.source_kind or "").lower() == "tiff_series":
         return str(source.uri)
     return str(Path(str(source.uri)).parent)
 
@@ -103,11 +130,14 @@ def _frozen_source_format(frozen):
     source = frozen.source
     if source is None:
         return _UNSET
+    # A frozen source is TOTAL for its format (§40.3 D1 item 3): the freeze owner
+    # records the token from canonical data, so neither family has to re-derive it
+    # from a uri that may name a directory.
+    for suffix in source.suffixes:
+        token = _source_format_token(suffix)
+        if token:
+            return token
     if source.family == "directory":
-        for suffix in source.suffixes:
-            token = _source_format_token(suffix)
-            if token:
-                return token
         return _UNSET
     token = _source_format_token(Path(str(source.uri)).suffix)
     return token or _UNSET
@@ -121,14 +151,17 @@ def _frozen_single_image(frozen):
 
 def _frozen_recursive(frozen):
     source = frozen.source
-    if source is None or source.family != "directory":
+    if source is None:
         return _UNSET
+    # "Not applicable" is a frozen NEUTRAL value, never permission to read a
+    # writable compatibility slot (§40.1 P1-B): a non-directory source froze
+    # recursive=False, so answer with it.
     return bool(source.recursive)
 
 
 def _frozen_name_filter(frozen):
     source = frozen.source
-    if source is None or source.family != "directory":
+    if source is None:
         return _UNSET
     return source.name_filter or ""
 
@@ -916,36 +949,84 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
 
         host = getattr(obj, "_h19_host", None)
         prepare = getattr(host, "_prepare_controls_v2_run_configuration", None)
-        offered = prepare() if callable(prepare) else None
         bound = getattr(obj, "run_configuration", None)
-        frozen = admit_run_configuration(
-            offered,
-            stage=stage,
-            floor=int(getattr(obj, "run_configuration_floor", 0) or 0),
-            bound=bound if isinstance(bound, FrozenRunConfiguration) else None,
-        )
-        # O-1a-W1R (review §39.5 Phase 3 item 6): the projection falls back to
-        # the display slot when the accepted object cannot answer for a carrier.
-        # For a value the worker would otherwise read from a WRITABLE mirror that
-        # leg must be unreachable during an admitted run, so admission refuses a
-        # configuration that lacks it -- before any carrier is bound, so the
-        # refusal stays zero-delta.  ``imageWrangler`` requires ``save_path``:
-        # an accepted run with no output target is the sharpest W1R-P1-4 surface.
-        for _required in getattr(obj, "_admission_required_frozen_values", ()):
-            if not str(getattr(frozen, _required, "") or ""):
+        # O-1a-W1R-D1 (review §40.1 P1-D, §40.3 D1 items 5-6): STAGE, then
+        # validate identity and required frozen values, and only then PUBLISH --
+        # once.  Every refusal below happens before the first carrier write, and
+        # any tentative handoff the staging owner parked is consumed on the way
+        # out, so a refused Start leaves wrapper, source, thread, generation and
+        # pending state exactly as it found them.
+        try:
+            offered = prepare() if callable(prepare) else None
+            frozen = admit_run_configuration(
+                offered,
+                stage=stage,
+                floor=int(getattr(obj, "run_configuration_floor", 0) or 0),
+                bound=(
+                    bound if isinstance(bound, FrozenRunConfiguration) else None
+                ),
+            )
+            wranglerWidget._require_admissible_frozen_values(
+                obj, frozen, stage=stage)
+            # O-1a-W1R-D1 (review §41.3.E): compute EVERY fallible projection
+            # before the first carrier write.  The publication used to interleave
+            # the wrapper binding, this thawed projection and the thread binding,
+            # so a failure part-way through left a partially accepted run.  With
+            # the only throwing step hoisted above the writes, the writes below are
+            # bounded attribute stores on objects that already exist.
+            source_projection = frozen.thaw_source_spec()
+        except Exception:
+            wranglerWidget._discard_staged_run_configuration(obj)
+            raise
+        thread = getattr(obj, "thread", None)
+        wranglerWidget._bind_admitted_run_configuration(obj, frozen)
+        # The wrapper's ``source_spec`` mirror moves here from the staging owner
+        # (§40.3 D1 items 5-6).  The WORKER deliberately gets no thawed mirror:
+        # a thawed ``SourceSpec`` carries a ``mappingproxy`` in ``options``, which
+        # is unpicklable, and the worker already holds the exact frozen object.
+        obj.source_spec = source_projection
+        if thread is not None:
+            wranglerWidget._bind_admitted_run_configuration(thread, frozen)
+        return frozen
+
+    @staticmethod
+    def _require_admissible_frozen_values(obj, frozen, *, stage):
+        """Refuse an accepted-shaped object that cannot answer for a run.
+
+        O-1a-W1R-D1 (review §40.3 D1 item 4).  A value the worker would otherwise
+        have to infer must be present in the frozen object, so admission refuses
+        rather than letting execution fall back to a mutable mirror.
+        ``imageWrangler`` requires ``save_path`` -- an accepted run with no output
+        target -- and ``source``: §40.1 P1-A showed two real GUI paths admitting
+        ``source is None`` and handing 58 worker reads back to writable state.
+
+        ``source`` is a typed value object, not a string, so it is validated for
+        presence and type; the remaining required names are text fields.
+        """
+        for required in getattr(obj, "_admission_required_frozen_values", ()):
+            value = getattr(frozen, required, None)
+            if required == "source":
+                ok = (isinstance(value, FrozenSourceSpec)
+                      and _frozen_source_is_admissible(value))
+            else:
+                ok = bool(str(value or ""))
+            if not ok:
                 raise RunConfigurationRefused(
                     "absent",
                     stage=stage,
                     detail=(
-                        f"the frozen run configuration carries no {_required}; "
-                        "the run would have to read a mutable mirror instead"),
+                        f"the frozen run configuration carries no {required}; "
+                        "the run would have to infer it from mutable state"),
                     generation=int(frozen.generation),
                 )
-        wranglerWidget._bind_admitted_run_configuration(obj, frozen)
-        thread = getattr(obj, "thread", None)
-        if thread is not None:
-            wranglerWidget._bind_admitted_run_configuration(thread, frozen)
-        return frozen
+
+    @staticmethod
+    def _discard_staged_run_configuration(obj):
+        """Consume a tentative handoff a refused Start must not leave behind."""
+        host = getattr(obj, "_h19_host", None)
+        if host is not None and getattr(
+                host, "_pending_controls_v2_run_configuration", None) is not None:
+            host._pending_controls_v2_run_configuration = None
 
     @staticmethod
     def _bind_admitted_run_configuration(target, frozen):
@@ -961,6 +1042,14 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         target.run_configuration = frozen
         target.run_configuration_floor = int(frozen.generation)
         target._admitted_run_configuration = frozen
+        # O-1a-W1R-D1 (review §40.1 P1-C, §40.3 D1 item 7): a new admission
+        # INVALIDATES any prior active/qualified reference.  The worker is reused
+        # across runs, and the qualification published at Run A's worker entry was
+        # never cleared or requalified, so every pre-entry Run-B read still
+        # resolved through Run A -- production-reachable, because setup reads the
+        # worker's parallelism before entry.  No previous run's policy may remain
+        # observable once a new object is admitted.
+        target._qualified_run_configuration = None
         return frozen
 
     @staticmethod

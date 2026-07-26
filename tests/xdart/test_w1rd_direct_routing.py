@@ -214,11 +214,22 @@ def test_project_switch_clears_the_field_and_the_runtime_source_and_refuses(
 def test_operator_cleared_file_refuses_visibly(widget, tmp_path, monkeypatch):
     """Item 2.  The editable ``Image File`` field is a ``str_browse`` param: an
     operator can empty it without any browse."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import (
+        imageWrangler,
+    )
+
     _arm_series(widget, tmp_path)
     status = []
+    # Production calls this CLASS-qualified (``imageWrangler._safe_status_text(
+    # self, ...)``) so that the duck-typed hosts keep working; patching the
+    # instance would not intercept it.  Rule-9 entry recorded in BOUNDARY 22:
+    # this corrects the interception point of a harness assertion, not the
+    # assertion itself -- "the refusal must be visible" is unchanged.
+    real_status = imageWrangler._safe_status_text
     monkeypatch.setattr(
-        widget.wrangler, "_safe_status_text",
-        lambda text, *a, **k: status.append(str(text)), raising=False)
+        imageWrangler, "_safe_status_text",
+        lambda host, text, *a, **k: (
+            status.append(str(text)), real_status(host, text, *a, **k))[1])
     widget.wrangler.parameters.child("Signal", "File").setValue("")
 
     assert widget.wrangler.img_file == ""
@@ -299,15 +310,28 @@ def test_valid_tiff_series_has_total_typed_source_values(
     assert frozen.source is not None
     assert str(frozen.source.source_kind) == "tiff_series"
 
+    poison_dir = tmp_path / "POISON"
+    poison_dir.mkdir()
     thread.img_ext = "h5"
     thread.include_subdir = True
     thread.file_filter = "POISON"
     thread.inp_type = "Image Directory"
+    thread.img_dir = str(poison_dir)
     safety = thread._output_safety_args()
 
+    # Rule-9 entry 2 (BOUNDARY 22): the original D0 spelling asserted
+    # ``watched_dirs == [series directory]``, which is factually wrong about the
+    # production contract -- ``_output_safety_args`` populates watched_dirs only
+    # for an Image DIRECTORY run, and a series carries its frames in
+    # ``input_files``.  The corrected assertions are the real contract and are
+    # strictly stronger where it matters: the poisoned directory must not appear,
+    # the poisoned format must not turn a TIFF series into a container, and the
+    # guarded input must come from the frozen source.
     assert safety["recursive"] is False
     assert safety["container_directory_mode"] is False
-    assert safety["watched_dirs"] == [str(raw.parent)], safety["watched_dirs"]
+    assert str(poison_dir) not in safety["watched_dirs"], safety["watched_dirs"]
+    assert safety["watched_dirs"] == []
+    assert safety["input_files"] == [str(raw)], safety["input_files"]
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
         imageThread,
     )

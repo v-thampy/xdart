@@ -437,6 +437,24 @@ def _configure_container_directory(widget, root, ext):
         f"File Type {ext!r} is not selectable in this build")
 
 
+
+def _publish_admitted(widget, frozen):
+    """O-1a-W1R-D1 (review §40.3 D1 items 5-6): ``_prepare_...`` now only STAGES
+    the one tentative object -- publishing there is what made the zero-delta
+    refusal claim false (§40.1 P1-D).  Bind through the same production step
+    admission uses, so these cases still drive real code to reach the worker.
+    """
+    if frozen is None:
+        return None
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import (
+        wranglerWidget,
+    )
+    wranglerWidget._bind_admitted_run_configuration(widget.wrangler, frozen)
+    thread = getattr(widget.wrangler, "thread", None)
+    if thread is not None:
+        wranglerWidget._bind_admitted_run_configuration(thread, frozen)
+    return frozen
+
 @pytest.mark.parametrize("ext", ["h5", "nxs"])
 def test_frozen_container_directory_from_the_real_freeze_owner(
         widget, tmp_path, monkeypatch, ext):
@@ -448,7 +466,8 @@ def test_frozen_container_directory_from_the_real_freeze_owner(
     assert emitted is not None, "the production emitter refused this File Type"
     suffixes = emitted[3]
 
-    frozen = widget._prepare_controls_v2_run_configuration()
+    frozen = _publish_admitted(
+        widget, widget._prepare_controls_v2_run_configuration())
     assert frozen is not None
     assert frozen.source is not None and frozen.source.family == "directory"
     assert frozen.source.suffixes == tuple(suffixes), (
@@ -471,7 +490,8 @@ def test_live_directory_watch_reaches_the_container_reader(
     "series", every ``*_master.h5`` container is handed to the single-image
     reader and its frames are silently lost."""
     _configure_container_directory(widget, tmp_path, ext)
-    frozen = widget._prepare_controls_v2_run_configuration()
+    frozen = _publish_admitted(
+        widget, widget._prepare_controls_v2_run_configuration())
     assert frozen is not None
 
     thread = widget.wrangler.thread
@@ -514,7 +534,8 @@ def test_every_emitter_branch_is_accepted_as_a_container(widget, tmp_path):
         assert emitted is not None, ext
         suffixes = emitted[3]
         observed[ext] = suffixes
-        frozen = widget._prepare_controls_v2_run_configuration()
+        frozen = _publish_admitted(
+        widget, widget._prepare_controls_v2_run_configuration())
         thread = widget.wrangler.thread
         assert imageThread._frozen_source_is_container(thread) is True, (
             f"emitter branch {ext} -> {suffixes!r} was refused")
@@ -527,15 +548,28 @@ def test_every_emitter_branch_is_accepted_as_a_container(widget, tmp_path):
 
 def test_a_non_container_directory_is_still_a_series(widget, tmp_path):
     """W-1.2 case 9 (the other polarity, through production).  A tif directory
-    freezes NO typed source and must stay on the series path."""
+    freezes a TYPED directory source and must stay on the non-container path.
+
+    O-1a-W1R-D1 (review §41.4 item 3): this case asserted ``source is None``,
+    which was the behavior §40.3 D0 item 8 ordered replaced -- a plain-image
+    Directory was selectable in the production File Type list yet froze no source,
+    so every source-shape consumer fell back to legacy inference.  The contract is
+    now a typed ``DirectorySourceSpec`` whose format keeps it off the container
+    reader.
+    """
     signal = widget.wrangler.parameters.child("Signal")
     signal.child("inp_type").setValue("Image Directory")
     signal.child("img_dir").setValue(str(tmp_path))
     signal.child("img_ext").setValue("tif")
+    # The CONTAINER emitter still refuses it; that is what makes it non-container.
     assert widget._controls_v2_container_index_config() is None
 
-    frozen = widget._prepare_controls_v2_run_configuration()
-    assert frozen is not None and frozen.source is None
+    frozen = _publish_admitted(
+        widget, widget._prepare_controls_v2_run_configuration())
+    assert frozen is not None
+    assert frozen.source is not None
+    assert frozen.source.family == "directory"
+    assert frozen.source.suffixes == (".tif",)
     thread = widget.wrangler.thread
     thread.img_file = ""
     assert imageThread._frozen_source_is_container(thread) is False
@@ -559,6 +593,13 @@ def test_one_identity_from_the_run_click_through_reload(
     out.mkdir()
     widget._set_poni_field(poni_path)
     widget.wrangler.parameters.child("Project", "h5_dir").setValue(str(out))
+    # O-1a-W1R-D1 (review §40.1 P1-A, §40.3 D1 items 1-2): arm the
+    # AUTHORITATIVE Source card.  Setting only ``img_file`` is the shorthand
+    # shape §40.1 named -- a truthful ``get_img_fname`` sync clears a cursor the
+    # Source card does not back, and admission now requires a typed source.
+    _signal = widget.wrangler.parameters.child("Signal")
+    _signal.child("inp_type").setValue("Image Series")
+    _signal.child("File").setValue(str(raw_path))
     widget.wrangler.img_file = str(raw_path)
     widget.controls.set_write_mode("Overwrite")
     widget._on_controls_v2_field_changed(("Int1D", "points"), 404)

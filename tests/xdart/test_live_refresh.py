@@ -8718,6 +8718,42 @@ def _accepted_run_configuration_owner(*, gi=False, bai_1d_args=None,
         _prepare_controls_v2_run_configuration=intent.freeze)
 
 
+class _SourceCardStub:
+    """Minimal ParameterTree stand-in for the Source-card readiness gate.
+
+    O-1a-W1R-D1 (review §40.3 D1 item 2, D2 item 7): ``_inputs_valid`` validates
+    the AUTHORITATIVE selection instead of the ``img_file`` cursor, so a host that
+    exercises the readiness gate must present the parameters production reads.
+    Production may not carry a fallback for an incomplete double, so the double
+    grows the attribute instead.  ``__file__`` is used only because the gate asks
+    whether the selection names an existing file.
+    """
+
+    names: list = []
+
+    def __init__(self, selected=None, values=None):
+        self._values = values if values is not None else {
+            "inp_type": "Image Series",
+            "File": selected if selected is not None else __file__,
+            "img_dir": "",
+            "img_ext": "tif",
+            "Filter": "",
+            "include_subdir": False,
+        }
+        self._name = "root"
+
+    def child(self, *names):
+        stub = _SourceCardStub(values=self._values)
+        stub._name = names[-1] if names else "root"
+        return stub
+
+    def value(self):
+        return self._values.get(self._name, "")
+
+    def setValue(self, value):
+        self._values[self._name] = value
+
+
 def _wrangler_host(mode_text, *, live=False, batch=False):
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
 
@@ -8755,7 +8791,10 @@ def _wrangler_host(mode_text, *, live=False, batch=False):
         sender=lambda: None,
         # _on_mode_changed now refreshes wrangler disclosure; this lightweight
         # host has no N1 'Project' param group, so _apply_disclosure no-ops.
-        parameters=SimpleNamespace(names=[]),
+        parameters=_SourceCardStub(),
+        # O-1a-W1R-D1: the readiness gate asks the host which source MODE
+        # is selected before consulting the Source card.
+        inp_type='Image Series',
         _integration_calls=integration_calls,
         _set_integration_controls_enabled=lambda enabled, **kwargs: (
             integration_calls.append((enabled, kwargs)),
@@ -8854,7 +8893,14 @@ def _append_modal_host(tmp_path, *, raw_name="scan_0001.tif",
     raw.write_bytes(b"")
     target = tmp_path / target_name
     host.img_file = str(raw)
+    # Keep the Source card and the runtime cursor telling the SAME story
+    # (O-1a-W1R-D1): the readiness gate now validates the card.
+    host.parameters.child("Signal").child("File").setValue(str(raw))
     host.h5_dir = str(tmp_path)
+    # O-1a-W1R-D1 (review §41.4 item 1): represent the output target on the
+    # Source card too.  Admission reads the CARD, so a fixture that sets only
+    # the runtime mirror no longer reaches the append-mismatch modal.
+    host.parameters.child("Project").child("h5_dir").setValue(str(tmp_path))
     host.scan = _append_modal_scan(
         data_file=target,
         processed_gi=processed_gi,
@@ -8887,7 +8933,14 @@ def _append_cold_target_host(tmp_path, *, raw_name="scan_0001.tif",
         current_2d["gi_mode_2d"] = "qip_qoop"
         gi_config = {"gi_mode_1d": "q_total", "gi_mode_2d": "qip_qoop"}
     host.img_file = str(raw)
+    # Keep the Source card and the runtime cursor telling the SAME story
+    # (O-1a-W1R-D1): the readiness gate now validates the card.
+    host.parameters.child("Signal").child("File").setValue(str(raw))
     host.h5_dir = str(tmp_path)
+    # O-1a-W1R-D1 (review §41.4 item 1): represent the output target on the
+    # Source card too.  Admission reads the CARD, so a fixture that sets only
+    # the runtime mirror no longer reaches the append-mismatch modal.
+    host.parameters.child("Project").child("h5_dir").setValue(str(tmp_path))
     host.scan = SimpleNamespace(
         data_file=None,
         bai_1d_args=current_1d,
@@ -9394,6 +9447,11 @@ def test_start_guard_adopts_processed_scan_cached_poni_but_requires_source(tmp_p
     host.img_file = ""
     host.img_dir = ""
     host.img_ext = ""
+    # O-1a-W1R-D1 (review §41.4 item 1): the readiness gate validates the
+    # AUTHORITATIVE selection, so clearing only the runtime cursor no longer
+    # models "no source chosen".
+    host.parameters.child("Signal").child("File").setValue("")
+    host.parameters.child("Signal").child("img_dir").setValue("")
     messages = []
     host.ui.specLabel.setText = messages.append
     host.scan._cached_poni = cached_poni

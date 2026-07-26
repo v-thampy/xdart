@@ -287,7 +287,13 @@ class imageWrangler(wranglerWidget):
         # O-1a-W1R: frozen values this wrangler's worker must never take from a
         # mutable mirror.  Admission refuses a configuration missing any of them,
         # which makes the projection's absent-value leg unreachable for a run.
-        self._admission_required_frozen_values = ("save_path",)
+        # O-1a-W1R-D1 (review §40.1 P1-A, §40.3 D1 item 4): an image run needs an
+        # output target AND a typed source.  Two real GUI paths admitted
+        # ``source is None`` -- an N1 project switch and an operator clearing the
+        # editable Image File field -- and handed 58 worker reads back to writable
+        # state.  Legitimate seedless typed Directory runs are unaffected: they
+        # freeze a real DirectorySourceSpec.
+        self._admission_required_frozen_values = ("save_path", "source")
         # O-1a-W1R: the loaded-scan calibration CANDIDATE for the click in
         # progress.  The freeze owner reads it; only exact admission publishes it.
         self._staged_run_calibration = None
@@ -1648,7 +1654,8 @@ class imageWrangler(wranglerWidget):
                     'Load a PONI calibration file to begin.',
                 )
             return False
-        if (not self.img_file and not getattr(self, 'stitch_mode', False)
+        if (not imageWrangler._authoritative_source_selected(self)
+                and not getattr(self, 'stitch_mode', False)
                 and not imageWrangler._directory_run_without_seed_ok(self)):
             imageWrangler._safe_status_text(
                 self,
@@ -1658,6 +1665,31 @@ class imageWrangler(wranglerWidget):
         if not imageWrangler._confirm_or_cancel_append_mismatch(self):
             return False
         return True
+
+    def _authoritative_source_selected(self):
+        """Whether the CURRENT selection names a usable source.
+
+        O-1a-W1R-D1 (review §40.3 D1 item 2).  ``_inputs_valid`` used to test
+        ``self.img_file``, an instance cursor that could outlive the selection it
+        described; a Start therefore passed validation on a file the operator had
+        already cleared.  Validation now reads the authoritative parameter, so a
+        blank or non-existent selection cannot be certified by a stale cursor even
+        if one is restored by hand.
+        """
+        signal = self.parameters.child('Signal')
+        # O-1a-W1R-D1 (review §41.3.D): the MODE comes from the Source card too.
+        # Branching on the mutable ``self.inp_type`` mirror let a poisoned mode
+        # send the gate to the Directory leg, whose any-nonblank-string rule is
+        # the weaker one.
+        mode = str(signal.child('inp_type').value() or '')
+        if mode == 'Image Directory':
+            root = str(signal.child('img_dir').value() or '').strip()
+            # A nonexistent directory is not a source.  An EMPTY but existing
+            # directory stays legitimate: the worker discovers candidates after
+            # Run, so this must not demand a representative frame.
+            return bool(root) and os.path.isdir(os.path.expanduser(root))
+        selected = str(signal.child('File').value() or '').strip()
+        return bool(selected) and os.path.exists(selected)
 
     def _directory_run_without_seed_ok(self):
         """Whether a configured Image Directory may start without ``img_file``.
@@ -1680,10 +1712,18 @@ class imageWrangler(wranglerWidget):
             return False
         if not img_dir or not os.path.isdir(os.path.expanduser(img_dir)):
             return False
+        # O-1a-W1R-D1 (review §40.3 D0 item 8): the eligibility question is
+        # "does the freeze owner produce a typed directory source", not "is this
+        # a CONTAINER directory".  Gating on the container index config made
+        # every plain-image directory selection unstartable while leaving it
+        # selectable in the production File Type list.
         host = getattr(self, "_h19_host", None)
-        eligible = getattr(host, "_controls_v2_container_index_config", None)
+        freeze = getattr(host, "_controls_v2_freeze_source_spec", None)
         try:
-            return bool(callable(eligible) and eligible() is not None)
+            from xrd_tools.sources import DirectorySourceSpec
+
+            return bool(callable(freeze)
+                        and isinstance(freeze(), DirectorySourceSpec))
         except Exception:
             return False
 
@@ -1797,42 +1837,51 @@ class imageWrangler(wranglerWidget):
         # candidate and validate from it.  Nothing is published yet, so every
         # refusal below is zero-delta on the PONI carriers.
         staged = imageWrangler._stage_loaded_scan_calibration(self)
-        if not self._inputs_valid(staged):
-            return
-        if getattr(self, 'stitch_mode', False):
-            # Stitch is a one-shot batch reduction of the already-loaded scan,
-            # not a wrangler acquisition run.  Divert to the host's stitch worker
-            # and return BEFORE the Pause/Resume morph or sigStart, so the action
-            # button stays a green "Run" (stitch is Start/Stop only).
-            self.sigStitchRequested.emit(
-                '1d' if '1D' in self.ui.processingModeCombo.currentText()
-                else '2d')
-            return
-        # O-1a-W1A: the frozen configuration is MANDATORY on the run path.  It is
-        # produced here, before any command/button/session/source/output/worker
-        # side effect, and absence or a foreign result is a typed refusal — never
-        # a fall back to display state (W-1.2 case 5).
+        # O-1a-W1R-D1 (review §41.3.C): ONE bounded cleanup owner for the staged
+        # calibration candidate.  The branch-local clears covered the admission
+        # refusal paths and the success path, but an ``_inputs_valid()`` refusal
+        # and the Stitch diversion below both returned with the candidate still
+        # parked -- so a later freeze could read a calibration staged by a click
+        # that never ran.  Every early return, refusal, success and exception now
+        # leaves the slot empty.
         try:
-            imageWrangler._admit_run_configuration(self, "image-start")
-        except RunConfigurationRefused as exc:
+            if not self._inputs_valid(staged):
+                return
+            if getattr(self, 'stitch_mode', False):
+                # Stitch is a one-shot batch reduction of the already-loaded
+                # scan, not a wrangler acquisition run.  Divert to the host's
+                # stitch worker and return BEFORE the Pause/Resume morph or
+                # sigStart, so the action button stays a green "Run" (stitch is
+                # Start/Stop only).
+                self.sigStitchRequested.emit(
+                    '1d' if '1D' in self.ui.processingModeCombo.currentText()
+                    else '2d')
+                return
+            # O-1a-W1A: the frozen configuration is MANDATORY on the run path.
+            # It is produced here, before any command/button/session/source/
+            # output/worker side effect, and absence or a foreign result is a
+            # typed refusal — never a fall back to display state (W-1.2 case 5).
+            try:
+                imageWrangler._admit_run_configuration(self, "image-start")
+            except RunConfigurationRefused as exc:
+                imageWrangler._report_run_configuration_refusal(
+                    self, exc, origin="image_wrangler_start")
+                return
+            except Exception as exc:
+                logger.exception("could not freeze Controls run configuration")
+                imageWrangler._safe_status_text(
+                    self, f"Run configuration is invalid: {exc}")
+                return
+            # Admitted: NOW the staged calibration may reach the legacy carriers.
+            imageWrangler._publish_staged_calibration(self, staged)
+            self.command = 'start'
+            self.thread.command = 'start'
+            self.ui.stopButton.setEnabled(True)
+            # morph green Start -> orange Pause
+            self._set_action_button('running')
+            self.sigStart.emit()
+        finally:
             self._staged_run_calibration = None
-            imageWrangler._report_run_configuration_refusal(
-                self, exc, origin="image_wrangler_start")
-            return
-        except Exception as exc:
-            self._staged_run_calibration = None
-            logger.exception("could not freeze Controls run configuration")
-            imageWrangler._safe_status_text(
-                self, f"Run configuration is invalid: {exc}")
-            return
-        # Admitted: NOW the staged calibration may reach the legacy carriers.
-        imageWrangler._publish_staged_calibration(self, staged)
-        self._staged_run_calibration = None
-        self.command = 'start'
-        self.thread.command = 'start'
-        self.ui.stopButton.setEnabled(True)
-        self._set_action_button('running')   # morph green Start -> orange Pause
-        self.sigStart.emit()
 
     def pause(self):
         """Request a Pause: freeze processing at a frame boundary without
@@ -2275,6 +2324,18 @@ class imageWrangler(wranglerWidget):
                 _p = Path(self.img_file)
                 self.img_dir, self.img_ext = str(_p.parent), _p.suffix.lstrip('.')
                 self._sync_meta_ext_to_img_ext()
+            else:
+                # O-1a-W1R-D1 (review §40.1 P1-A, §40.3 D1 item 1): SYNCHRONIZE
+                # on every call.  Assigning only when the configured file exists
+                # left the previous selection in ``self.img_file`` whenever the
+                # authoritative field went blank or named a missing file -- and
+                # ``_on_project_folder_changed`` clears that field by design on an
+                # N1 project switch.  ``_inputs_valid`` then trusted the stale
+                # instance value, the freeze owner produced no typed source, and
+                # the run started against the OLD project's frames.  The
+                # neighbouring BUG-1 guard already clears ``poni_file`` for
+                # exactly this reason; the source needs the same treatment.
+                self.img_file = ''
 
         else:
             self.img_ext = self.parameters.child('Signal').child('img_ext').value()
@@ -2642,6 +2703,11 @@ class imageWrangler(wranglerWidget):
         # letting a Start run the new folder's images against the old calibration
         # (the BUG-1 this reset exists to prevent).
         self.poni_file = ''
+        # O-1a-W1R-D1 (review §40.3 D1 item 1): invalidate the runtime SOURCE
+        # cursor here too, for the same reason the calibration is invalidated
+        # above -- the old file still exists on disk, so nothing downstream could
+        # tell that it belongs to the previous project.
+        self.img_file = ''
         self.parameters.child('Signal').child('poni_file').setValue('')
         for seg in (('Signal', 'File'), ('Signal', 'img_dir'),
                     ('Signal', 'mask_file')):

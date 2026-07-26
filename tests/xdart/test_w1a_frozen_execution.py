@@ -113,6 +113,13 @@ def _click_run(widget, tmp_path, monkeypatch, *, write_mode="Overwrite",
 
     widget._set_poni_field(poni_path)
     widget.wrangler.parameters.child("Project", "h5_dir").setValue(str(out))
+    # O-1a-W1R-D1 (review §40.1 P1-A, §40.3 D1 items 1-2): arm the
+    # AUTHORITATIVE Source card.  Setting only ``img_file`` is the shorthand
+    # shape §40.1 named -- a truthful ``get_img_fname`` sync clears a cursor the
+    # Source card does not back, and admission now requires a typed source.
+    _signal = widget.wrangler.parameters.child("Signal")
+    _signal.child("inp_type").setValue("Image Series")
+    _signal.child("File").setValue(str(raw_path))
     widget.wrangler.img_file = str(raw_path)
     widget.controls.set_write_mode(write_mode)
     if gi:
@@ -438,6 +445,13 @@ def test_start_refuses_absent_configuration_before_any_side_effect(
     out.mkdir()
     widget._set_poni_field(poni_path)
     widget.wrangler.parameters.child("Project", "h5_dir").setValue(str(out))
+    # O-1a-W1R-D1 (review §40.1 P1-A, §40.3 D1 items 1-2): arm the
+    # AUTHORITATIVE Source card.  Setting only ``img_file`` is the shorthand
+    # shape §40.1 named -- a truthful ``get_img_fname`` sync clears a cursor the
+    # Source card does not back, and admission now requires a typed source.
+    _signal = widget.wrangler.parameters.child("Signal")
+    _signal.child("inp_type").setValue("Image Series")
+    _signal.child("File").setValue(str(raw_path))
     widget.wrangler.img_file = str(raw_path)
 
     started = []

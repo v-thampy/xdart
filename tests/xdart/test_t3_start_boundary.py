@@ -121,7 +121,13 @@ def _assert_preserved(before, after):
 
 
 def _establish_prior_frozen(widget):
-    """Freeze + publish once so the refusal tests have real prior carriers."""
+    """Stage one prior frozen object.
+
+    O-1a-W1R-D1 (review §41.3.B / §41.4 item 2): preparation now only STAGES the
+    tentative candidate -- publishing there is what made the zero-delta refusal
+    claim false -- so this returns the staged object and the carriers stay
+    unpublished until exact admission.
+    """
     frozen = widget._prepare_controls_v2_run_configuration()
     assert frozen is not None
     return frozen
@@ -234,8 +240,10 @@ def test_fast_start_publishes_no_frozen_object_and_never_sets_command(
 
     widget.wrangler.start()
 
-    assert widget.wrangler.run_configuration is prior
-    assert widget.wrangler.thread.run_configuration is prior
+    # §41.4 item 2: preparation publishes nothing, so the refusal must leave the
+    # carriers UNPUBLISHED and the staged object intact.
+    assert widget.wrangler.run_configuration is None
+    assert widget.wrangler.thread.run_configuration is None
     assert widget._pending_controls_v2_run_configuration is prior
     assert int(widget._controls_v2_ensure_run_intent().generation) == generation
     assert widget.wrangler.command == "stop"
@@ -260,7 +268,9 @@ def test_prepare_defensively_refuses_while_a_run_owner_is_active(
 
     after = _preservation_snapshot(widget)
     _assert_preserved(before, after)
-    assert widget.wrangler.run_configuration is prior
+    # §41.4 item 2: nothing was published before the refusal, so nothing changed.
+    assert widget.wrangler.run_configuration is None
+    assert widget._pending_controls_v2_run_configuration is prior
 
 
 # --------------------------------------------------------------------------- #
@@ -318,6 +328,13 @@ def test_append_mismatch_compares_the_candidate_not_the_previous_run(
 
     widget._set_poni_field(poni_path)
     widget.wrangler.parameters.child("Project", "h5_dir").setValue(str(tmp_path))
+    # O-1a-W1R-D1 (review §40.1 P1-A, §40.3 D1 items 1-2): arm the
+    # AUTHORITATIVE Source card.  Setting only ``img_file`` is the shorthand
+    # shape §40.1 named -- a truthful ``get_img_fname`` sync clears a cursor the
+    # Source card does not back, and admission now requires a typed source.
+    _signal = widget.wrangler.parameters.child("Signal")
+    _signal.child("inp_type").setValue("Image Series")
+    _signal.child("File").setValue(str(raw_path))
     widget.wrangler.img_file = str(raw_path)
     widget.controls.set_write_mode("Append")
 
@@ -332,8 +349,15 @@ def test_append_mismatch_compares_the_candidate_not_the_previous_run(
 
     # Freeze a PREVIOUS run at 100, then move the live Controls to 200.
     widget._on_controls_v2_field_changed(("Int1D", "points"), 100)
-    stale = widget._prepare_controls_v2_run_configuration()
+    # §41.4 item 2: establish the previous ACCEPTED object through the real
+    # admission seam.  Preparation stages; only admission publishes.
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import (
+        wranglerWidget,
+    )
+    stale = wranglerWidget._admit_run_configuration(
+        widget.wrangler, "t3-prior-accepted")
     assert stale is widget.wrangler.run_configuration
+    assert stale is widget.wrangler._admitted_run_configuration
     widget._on_controls_v2_field_changed(("Int1D", "points"), 200)
 
     check, processed, current = imageWrangler._append_config_mismatch_details(
@@ -363,6 +387,13 @@ def test_accepted_append_modal_overwrite_reaches_the_frozen_configuration(
 
     widget._set_poni_field(poni_path)
     widget.wrangler.parameters.child("Project", "h5_dir").setValue(str(tmp_path))
+    # O-1a-W1R-D1 (review §40.1 P1-A, §40.3 D1 items 1-2): arm the
+    # AUTHORITATIVE Source card.  Setting only ``img_file`` is the shorthand
+    # shape §40.1 named -- a truthful ``get_img_fname`` sync clears a cursor the
+    # Source card does not back, and admission now requires a typed source.
+    _signal = widget.wrangler.parameters.child("Signal")
+    _signal.child("inp_type").setValue("Image Series")
+    _signal.child("File").setValue(str(raw_path))
     widget.wrangler.img_file = str(raw_path)
     widget.controls.set_write_mode("Append")
     widget.scan.data_file = str(target)
@@ -425,13 +456,27 @@ def test_run_state_apply_after_a_refused_start_does_not_reuse_the_stale_pending(
     assert widget._pending_controls_v2_run_configuration is None
 
     # A later idle edit, then a run-state apply with no fresh prepare.
-    widget._on_controls_v2_field_changed(("Int1D", "points"), 777)
-    widget._apply_controls_v2_run_state()
+    #
+    # O-1a-W1R-D1 (review §41.4 item 4): this case was written for the
+    # second-freeze fallback, which §39 DELETED -- a lost handoff is a typed,
+    # visible refusal, never permission to freeze a second generation and run it.
+    # The retired expectation (a fresh object carrying the later edit) is what the
+    # r1 stale-pending defect looked like from the outside.
+    from xrd_tools.session import RunConfigurationRefused
 
-    adopted = widget.wrangler.run_configuration
-    assert adopted is not stale
-    assert adopted.bai_1d_args["numpoints"] == 777
-    assert adopted.generation > stale.generation
+    widget._on_controls_v2_field_changed(("Int1D", "points"), 777)
+    generation = int(widget._controls_v2_ensure_run_intent().generation)
+    published = widget.wrangler.run_configuration
+
+    with pytest.raises(RunConfigurationRefused) as refusal:
+        widget._apply_controls_v2_run_state()
+
+    assert refusal.value.reason == "absent"
+    # No new generation, and nothing published.
+    assert int(widget._controls_v2_ensure_run_intent().generation) == generation
+    assert widget.wrangler.run_configuration is published
+    assert widget._pending_controls_v2_run_configuration is None
+    assert stale is not None
 
 
 # --------------------------------------------------------------------------- #
@@ -483,6 +528,13 @@ def test_adopted_scan_calibration_reaches_the_frozen_configuration(
     widget.scan._cached_integrator = poni_to_integrator(adopted)
     widget.wrangler.poni = None
     widget.wrangler.parameters.child("Signal", "poni_file").setValue("")
+    # O-1a-W1R-D1 (review §40.1 P1-A, §40.3 D1 items 1-2): arm the
+    # AUTHORITATIVE Source card.  Setting only ``img_file`` is the shorthand
+    # shape §40.1 named -- a truthful ``get_img_fname`` sync clears a cursor the
+    # Source card does not back, and admission now requires a typed source.
+    _signal = widget.wrangler.parameters.child("Signal")
+    _signal.child("inp_type").setValue("Image Series")
+    _signal.child("File").setValue(str(tmp_path / "scan_0001.tif"))
     widget.wrangler.img_file = str(tmp_path / "scan_0001.tif")
     (tmp_path / "scan_0001.tif").write_bytes(b"")
     widget.wrangler.parameters.child("Project", "h5_dir").setValue(str(tmp_path))
@@ -512,6 +564,13 @@ def test_one_frozen_identity_reaches_every_owner_t3_publishes(
     raw_path = tmp_path / "scan_0001.tif"
     raw_path.write_bytes(b"")
     widget._set_poni_field(poni_path)
+    # O-1a-W1R-D1 (review §40.1 P1-A, §40.3 D1 items 1-2): arm the
+    # AUTHORITATIVE Source card.  Setting only ``img_file`` is the shorthand
+    # shape §40.1 named -- a truthful ``get_img_fname`` sync clears a cursor the
+    # Source card does not back, and admission now requires a typed source.
+    _signal = widget.wrangler.parameters.child("Signal")
+    _signal.child("inp_type").setValue("Image Series")
+    _signal.child("File").setValue(str(raw_path))
     widget.wrangler.img_file = str(raw_path)
     widget.wrangler.parameters.child("Project", "h5_dir").setValue(str(tmp_path))
     started = _block_thread_start(widget, monkeypatch)
@@ -538,6 +597,13 @@ def test_a_single_run_click_freezes_exactly_once(
     raw_path = tmp_path / "scan_0001.tif"
     raw_path.write_bytes(b"")
     widget._set_poni_field(poni_path)
+    # O-1a-W1R-D1 (review §40.1 P1-A, §40.3 D1 items 1-2): arm the
+    # AUTHORITATIVE Source card.  Setting only ``img_file`` is the shorthand
+    # shape §40.1 named -- a truthful ``get_img_fname`` sync clears a cursor the
+    # Source card does not back, and admission now requires a typed source.
+    _signal = widget.wrangler.parameters.child("Signal")
+    _signal.child("inp_type").setValue("Image Series")
+    _signal.child("File").setValue(str(raw_path))
     widget.wrangler.img_file = str(raw_path)
     widget.wrangler.parameters.child("Project", "h5_dir").setValue(str(tmp_path))
     _block_thread_start(widget, monkeypatch)
@@ -549,16 +615,28 @@ def test_a_single_run_click_freezes_exactly_once(
     calls = []
     real_freeze = RunIntent.freeze
 
+    canonical_freezes = []
+
     def _counting_freeze(self, **kwargs):
+        # §41.3.B: the click freezes a DETACHED candidate cloned from the
+        # canonical intent.  Freezing the canonical instance is what burned a
+        # generation on a refused click, so that is the thing to forbid; the idle
+        # validation path legitimately freezes its own throwaway candidates.
         if self is live:
-            calls.append(kwargs)
+            canonical_freezes.append(kwargs)
+        calls.append(kwargs)
         return real_freeze(self, **kwargs)
 
     monkeypatch.setattr(RunIntent, "freeze", _counting_freeze)
 
     widget.wrangler.start()
 
-    assert len(calls) == 1, f"the live intent froze {len(calls)} times"
+    assert canonical_freezes == [], (
+        "the canonical intent was frozen directly; §41.3.B requires a detached "
+        "candidate so a refused click cannot burn a generation")
+    assert calls, "the run click never froze a candidate"
+    # The accepted candidate's generation is committed back to the canonical
+    # intent exactly once (§41.3.B item 6).
     assert int(live.generation) == before + 1
 
 

@@ -3735,7 +3735,15 @@ class staticWidget(QWidget):
                 + " — Run not started; re-check the control and try again"
             )
         self._controls_v2_ensure_native_int_defaults()
-        intent = self._controls_v2_ensure_run_intent()
+        # O-1a-W1R-D1 (review §41.3.B): populate and freeze a DETACHED candidate,
+        # never the canonical intent.  ``RunIntent.freeze()`` advances
+        # ``generation`` as part of snapshotting, so freezing the canonical intent
+        # burned a generation even when admission then refused a missing source or
+        # save_path -- making a rejected click look like an accepted one and
+        # leaving a hole in the Controls-owned sequence.  The canonical intent's
+        # generation is committed once, after exact admission, by
+        # ``_apply_controls_v2_run_state``.
+        intent = self._controls_v2_ensure_run_intent().clone_candidate()
         controls = getattr(self, "controls", None)
         wrangler = getattr(self, "wrangler", None)
 
@@ -3840,13 +3848,16 @@ class staticWidget(QWidget):
         # hands this exact identity to the run owner that adopts it and is
         # cleared on adoption, so no later consumer can inherit a previous
         # click's configuration.
+        # O-1a-W1R-D1 (review §40.1 P1-D, §40.3 D1 items 5-6): freeze/STAGE and
+        # publish/ADMIT are separate phases.  This owner may park the ONE
+        # tentative object in the pending slot and return it; it may not publish
+        # wrapper, source or thread carriers.  Publishing here is what made the
+        # "refusal before any carrier write" claim false: a missing-save_path or
+        # absent-source refusal left the refused object on four carriers even
+        # though no worker started, and it made the rebind branch unreachable
+        # because the wrapper carrier already held the offered object.
+        # ``_admit_run_configuration`` publishes exactly once, after validation.
         self._pending_controls_v2_run_configuration = frozen
-        if wrangler is not None:
-            wrangler.run_configuration = frozen
-            wrangler.source_spec = frozen.thaw_source_spec()
-            thread = getattr(wrangler, "thread", None)
-            if thread is not None:
-                thread.run_configuration = frozen
         return frozen
 
     def _require_controls_v2_run_handoff(self) -> FrozenRunConfiguration:
@@ -3912,6 +3923,17 @@ class staticWidget(QWidget):
         if (getattr(self, "_pending_controls_v2_run_configuration", None)
                 is run_configuration):
             self._pending_controls_v2_run_configuration = None
+        # O-1a-W1R-D1 (review §41.3.B item 6): the accepted candidate's generation
+        # is COMMITTED to the canonical intent here -- exactly once, only for an
+        # exactly admitted object, and idempotent on re-entry.  This is the other
+        # half of freezing a detached candidate: a refused click leaves the
+        # sequence untouched, an accepted one advances it by one.  No second
+        # revision counter or identity authority is introduced; the frozen object
+        # remains the only run identity.
+        _canonical = getattr(self, "_controls_v2_run_intent", None)
+        if isinstance(_canonical, RunIntent) and int(
+                _canonical.generation) < int(run_configuration.generation):
+            _canonical.generation = int(run_configuration.generation)
 
         self._controls_v2_apply_run_configuration_to_scan(run_configuration)
         self._push_threshold_to_wrangler(run_configuration)
@@ -5077,7 +5099,12 @@ class staticWidget(QWidget):
         live_intent = self._controls_v2_ensure_run_intent()
         saved_threshold = getattr(self, "_controls_v2_threshold_state", None)
         return ControlsStageCandidate(
-            intent=copy.deepcopy(live_intent),
+            # O-1a-W1R-D1 (review §41.3.A): ``copy.deepcopy`` cannot copy an
+            # intent that carries a real typed source -- ``SourceSpec`` stores its
+            # options in a ``MappingProxyType`` -- so the first idle edit after a
+            # source was retained raised ``TypeError: cannot pickle 'mappingproxy'
+            # object``.  One explicit value-copy boundary owns this instead.
+            intent=live_intent.clone_candidate(),
             threshold_state=(
                 copy.deepcopy(saved_threshold)
                 if isinstance(saved_threshold, dict) else None),
@@ -8475,10 +8502,10 @@ class staticWidget(QWidget):
         source_type = str(
             self._controls_v2_param_value(("Signal", "inp_type")) or "")
         if source_type == "Image Directory":
+            from xrd_tools.sources import DirectorySourceSpec
+
             config = self._controls_v2_container_index_config()
             if config is not None:
-                from xrd_tools.sources import DirectorySourceSpec
-
                 root, recursive, name_filter, suffixes = config
                 widget = getattr(self, "_controls_v2_source_widget", None)
                 session = getattr(widget, "directory_session", None)
@@ -8490,6 +8517,31 @@ class staticWidget(QWidget):
                     generation=int(getattr(
                         session, "request_generation", 0) or 0),
                 )
+            # O-1a-W1R-D1 (review §40.3 D0 item 8, D1 item 3): a PLAIN-IMAGE
+            # Image Directory is selectable in the production File Type list and
+            # the worker already implements directory traversal, but only the
+            # CONTAINER config above froze a typed source -- so every
+            # source-shape consumer fell back to legacy inference, and §40.3
+            # rules that selectable-but-unstartable is not acceptable.  Freeze
+            # the same typed value object from the authoritative parameters.
+            root_text = str(self._controls_v2_param_value(
+                ("Signal", "img_dir")) or "").strip()
+            ext = str(self._controls_v2_param_value(
+                ("Signal", "img_ext")) or "").lstrip(".").lower()
+            # O-1a-W1R-D1 (review §41.3.D): do not fabricate a typed source for a
+            # directory that does not exist.  An EMPTY but existing directory is
+            # still legitimate -- membership is discovered by the worker after Run.
+            if (not root_text or not ext
+                    or not Path(root_text).expanduser().is_dir()):
+                return None
+            return DirectorySourceSpec(
+                root=Path(root_text).expanduser(),
+                recursive=bool(self._controls_v2_param_value(
+                    ("Signal", "include_subdir"), False)),
+                suffixes=(f".{ext}",),
+                name_filter=str(self._controls_v2_param_value(
+                    ("Signal", "Filter")) or "") or None,
+            )
         selected = str(
             self._controls_v2_param_value(("Signal", "File")) or "").strip()
         selected_ext = Path(selected).suffix.lstrip(".").lower()

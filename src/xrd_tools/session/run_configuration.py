@@ -21,7 +21,7 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dataclass_replace
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -404,6 +404,72 @@ class FrozenThresholdPolicy:
         }
 
 
+def _detached_value(value: Any) -> Any:
+    """Recursively detach one mutable intent value from its producer.
+
+    O-1a-W1R-D1 (review §41.3.A).  A copy boundary that shares a nested container
+    is not a copy: the candidate could mutate the canonical intent through it.
+    ``Mapping`` covers both ``dict`` and the ``MappingProxyType`` that
+    ``SourceSpec`` wraps its options in.
+    """
+    if isinstance(value, Mapping):
+        return {key: _detached_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_detached_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_detached_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return set(value)
+    return value
+
+
+def _detached_source_spec(value):
+    """A detached copy of one typed source selection (review §41.3.A)."""
+    if value is None:
+        return None
+    from xrd_tools.sources import DirectorySourceSpec
+
+    if isinstance(value, DirectorySourceSpec):
+        # Frozen dataclass of immutable scalars and a tuple; rebuild anyway so a
+        # candidate never shares identity with the canonical intent's value.
+        return DirectorySourceSpec(
+            root=value.root,
+            recursive=bool(value.recursive),
+            suffixes=tuple(value.suffixes),
+            name_filter=value.name_filter,
+            generation=int(value.generation),
+        )
+    if isinstance(value, SourceSpec):
+        return SourceSpec(
+            uri=value.uri,
+            kind=value.kind,
+            metadata_uri=value.metadata_uri,
+            entry=value.entry,
+            options=_detached_value(dict(value.options or {})),
+        )
+    return value
+
+
+def _non_directory_suffixes(value: SourceSpec) -> tuple[str, ...]:
+    """The format token of a non-directory source, from its canonical data.
+
+    O-1a-W1R-D1 (review §40.1 P1-B).  ``image_series_spec`` freezes the
+    containing directory as the ``uri`` and records the selected member in
+    ``options``, so the member is the authority for a series; a single image or a
+    container master names its own file.  Returns ``()`` only when neither
+    carries a suffix, which is not a supported production shape.
+    """
+    selected = ""
+    options = getattr(value, "options", None) or {}
+    try:
+        selected = str(options.get("selected_file") or "")
+    except AttributeError:
+        selected = ""
+    token = Path(selected).suffix if selected else Path(str(value.uri)).suffix
+    token = str(token).strip().lower()
+    return (token,) if token else ()
+
+
 @dataclass(frozen=True, slots=True)
 class FrozenSourceSpec:
     """Deeply immutable value projection of a supported source selection."""
@@ -447,6 +513,17 @@ class FrozenSourceSpec:
                 ),
                 entry=value.entry,
                 options=_mapping_value(value.options),
+                # O-1a-W1R-D1 (review §40.1 P1-B, §40.3 D1 item 3): a
+                # non-directory source must be TOTAL.  A numbered series freezes
+                # the CONTAINING DIRECTORY as its uri, so a consumer deriving the
+                # format from the uri got nothing and fell back to a mutable
+                # mirror.  The format comes from canonical frozen data -- the
+                # selected member when the source names one, else the uri itself
+                # -- and the directory-only questions get their neutral answers
+                # rather than "not applicable".
+                suffixes=_non_directory_suffixes(value),
+                recursive=False,
+                name_filter="",
                 uri_was_path=isinstance(value.uri, Path),
                 metadata_uri_was_path=isinstance(metadata_uri, Path),
             )
@@ -853,6 +930,44 @@ class RunIntent:
         # sequence or make a retry look like a different accepted run.
         self.generation = next_generation
         return frozen
+
+    def clone_candidate(self) -> "RunIntent":
+        """Return a DETACHED candidate copy, safe to populate, freeze and discard.
+
+        O-1a-W1R-D1 (review §41.3.A and §41.3.B).  Two defects share one root:
+        ``copy.deepcopy`` cannot copy this intent once a real source is on it,
+        because ``SourceSpec.__post_init__`` stores ``options`` in a
+        ``MappingProxyType``; and freezing the canonical intent to build a run
+        candidate advances its generation even when admission then refuses.
+
+        One explicit value-copy boundary answers both.  Every nested mutable value
+        is detached recursively -- a shared nested container is not a copy -- and
+        the clone starts from this intent's generation without advancing it, so
+        ``freeze()`` on the clone leaves the canonical sequence untouched until an
+        accepted run commits it.
+        """
+        return RunIntent(
+            source_spec=_detached_source_spec(self.source_spec),
+            processing_mode=str(self.processing_mode),
+            output_mode=str(self.output_mode),
+            live_mode=bool(self.live_mode),
+            batch_mode=bool(self.batch_mode),
+            max_cores=int(self.max_cores),
+            bai_1d_args=_detached_value(dict(self.bai_1d_args or {})),
+            bai_2d_args=_detached_value(dict(self.bai_2d_args or {})),
+            gi=dataclass_replace(self.gi),
+            threshold=dataclass_replace(self.threshold),
+            poni_file=self.poni_file,
+            poni_values=(
+                None if self.poni_values is None
+                else _detached_value(dict(self.poni_values))
+            ),
+            mask_file=self.mask_file,
+            project_root=self.project_root,
+            save_path=self.save_path,
+            run_options=_detached_value(dict(self.run_options or {})),
+            generation=int(self.generation),
+        )
 
     @classmethod
     def from_frozen(cls, value: FrozenRunConfiguration) -> "RunIntent":
