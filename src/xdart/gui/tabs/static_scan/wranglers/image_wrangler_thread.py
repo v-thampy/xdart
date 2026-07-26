@@ -268,6 +268,18 @@ _CONTAINER_SUFFIXES = frozenset({"h5", "hdf5", "nxs"})
 _CONTAINER_SOURCE_KINDS = frozenset(
     {"eiger_master", "nexus_stack", "processed_nexus"})
 
+
+def _suffix_format_token(suffix):
+    """Return the FORMAT token of one match suffix or path extension.
+
+    Frozen directory sources carry the freeze owner's match suffixes
+    (``"_master.h5"``, ``".nxs"``); paths carry extensions (``".h5"``).  Both
+    answer the same question — which format is this — so both reduce to the text
+    after the final dot: ``"_master.hdf5" -> "hdf5"``, ``".nxs" -> "nxs"``,
+    ``"nxs" -> "nxs"``, ``".tif" -> "tif"``.
+    """
+    return str(suffix).rsplit(".", 1)[-1].strip().lower()
+
 _APPEND_CURSOR_MEMO_LIMIT = 1024
 
 # ---------------------------------------------------------------------------
@@ -5314,13 +5326,24 @@ class imageThread(wranglerThread):
         SECOND format authority that a mid-run panel edit could flip.  The
         decision now comes from the frozen source selection:
 
-        * a frozen directory source is a container run iff its frozen suffixes
-          are container suffixes;
+        * a frozen directory source is a container run iff any of its frozen
+          suffixes names a container FORMAT;
         * a frozen file source is a container run iff its kind (or its own URI's
           suffix) is a container kind;
         * when the click froze NO typed source (the Eiger-master Image-Series
           case, where Controls deliberately freezes none), the decision falls to
           the run's OWN source URI — file identity, never panel configuration.
+
+        W-1C: a frozen DIRECTORY source carries the freeze owner's MATCH
+        SUFFIXES, not bare extensions — ``_controls_v2_container_index_config``
+        emits ``("_master.h5",)`` for File Type h5 and
+        ``("_master.hdf5", "_master.h5")`` for hdf5, because a container
+        directory is matched by filename TAIL.  Comparing the whole suffix
+        string therefore refused every real Eiger-master directory.  The
+        container question is about the format, so compare the extension TOKEN
+        (:func:`_suffix_format_token`) and let the emitter go on spelling its own
+        match rule — the alternative, teaching this consumer the ``_master.*``
+        literals, would re-create exactly the emitter coupling R4B-14 removed.
         """
 
         frozen = imageThread._require_run_configuration(
@@ -5328,16 +5351,15 @@ class imageThread(wranglerThread):
         source = frozen.source
         if source is not None:
             if source.family == "directory":
-                return any(
-                    str(suffix).lstrip(".").lower() in _CONTAINER_SUFFIXES
-                    for suffix in source.suffixes)
+                return any(_suffix_format_token(suffix) in _CONTAINER_SUFFIXES
+                           for suffix in source.suffixes)
             if str(source.source_kind) in _CONTAINER_SOURCE_KINDS:
                 return True
-            return Path(str(source.uri)).suffix.lstrip(".").lower() \
-                in _CONTAINER_SUFFIXES
+            return _suffix_format_token(
+                Path(str(source.uri)).suffix) in _CONTAINER_SUFFIXES
         img_file = getattr(self, "img_file", "") or ""
         return bool(img_file) and (
-            Path(img_file).suffix.lstrip(".").lower() in _CONTAINER_SUFFIXES)
+            _suffix_format_token(Path(img_file).suffix) in _CONTAINER_SUFFIXES)
 
     def get_next_image(self):
         """Gets next image in image series or in directory to process."""
@@ -5355,7 +5377,7 @@ class imageThread(wranglerThread):
             meta = read_image_metadata(self.img_file, meta_format=self.meta_ext, meta_dir=self.meta_dir) if self.meta_ext else {}
             return self.img_file, scan_name, img_number, img_data, meta
 
-        if is_master or self._frozen_source_is_container():
+        if is_master or imageThread._frozen_source_is_container(self):
             return self._get_next_eiger_frame()
 
         if len(self.img_fnames) == 0:

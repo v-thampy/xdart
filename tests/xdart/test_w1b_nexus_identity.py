@@ -37,6 +37,8 @@ from pyqtgraph.Qt import QtWidgets
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+
 
 # --------------------------------------------------------------------------- #
 # Fixtures
@@ -403,6 +405,131 @@ def test_series_selection_follows_the_frozen_series_source(
 
     assert container == [], "the frozen series source selected the container reader"
     assert Path(img_file).name == paths[0].name
+
+
+# --------------------------------------------------------------------------- #
+# Case 9 (W-1C) — the SAME decision, driven by the REAL freeze owner.
+#
+# The two rows above hand-build ``DirectorySourceSpec(suffixes=(".h5",))``.  That
+# spelling is one production NEVER emits: ``_controls_v2_container_index_config``
+# emits MATCH SUFFIXES (``("_master.h5",)`` for File Type h5, ``(".nxs",)`` for
+# nxs), so a consumer that compares whole suffix strings against bare extensions
+# passes a literal-driven test and still refuses every real Eiger-master
+# directory.  These rows consume the emitter's actual output instead.
+# --------------------------------------------------------------------------- #
+
+def _configure_container_directory(widget, root, ext):
+    """Configure the REAL Source panel for a container-directory run."""
+    signal = widget.wrangler.parameters.child("Signal")
+    signal.child("inp_type").setValue("Image Directory")
+    signal.child("img_dir").setValue(str(root))
+    signal.child("img_ext").setValue(ext)
+    assert signal.child("img_ext").value() == ext, (
+        f"File Type {ext!r} is not selectable in this build")
+
+
+@pytest.mark.parametrize("ext", ["h5", "nxs"])
+def test_frozen_container_directory_from_the_real_freeze_owner(
+        widget, tmp_path, monkeypatch, ext):
+    """W-1.2 case 9, end to end through production: the File Type the operator
+    picks -> the emitter's match suffixes -> the frozen source -> the container
+    reader.  No literal suffix appears anywhere in this test."""
+    _configure_container_directory(widget, tmp_path, ext)
+    emitted = widget._controls_v2_container_index_config()
+    assert emitted is not None, "the production emitter refused this File Type"
+    suffixes = emitted[3]
+
+    frozen = widget._prepare_controls_v2_run_configuration()
+    assert frozen is not None
+    assert frozen.source is not None and frozen.source.family == "directory"
+    assert frozen.source.suffixes == tuple(suffixes), (
+        "the frozen source did not carry the emitter's own suffixes")
+
+    thread = widget.wrangler.thread
+    assert thread.run_configuration is frozen
+    assert imageThread._frozen_source_is_container(thread) is True, (
+        f"a frozen {ext} container directory was not recognised as a container; "
+        f"emitter suffixes were {suffixes!r}")
+
+
+@pytest.mark.parametrize("ext", ["h5", "nxs"])
+def test_live_directory_watch_reaches_the_container_reader(
+        widget, tmp_path, monkeypatch, ext):
+    """W-1.2 case 9, the consequence that matters.  A Live directory run
+    intentionally starts with an EMPTY ``img_file``
+    (``imageWrangler._directory_run_without_seed_ok``), so ``is_master`` is False
+    and the container decision rests entirely on the frozen source.  If it says
+    "series", every ``*_master.h5`` container is handed to the single-image
+    reader and its frames are silently lost."""
+    _configure_container_directory(widget, tmp_path, ext)
+    frozen = widget._prepare_controls_v2_run_configuration()
+    assert frozen is not None
+
+    thread = widget.wrangler.thread
+    thread.img_file = ""
+    thread.single_img = False
+    thread.inp_type = "Image Directory"
+    thread.img_fnames = []
+    thread.processed = []
+    container = []
+    monkeypatch.setattr(
+        thread, "_get_next_eiger_frame",
+        lambda: container.append(True) or (None, "s", 1, None, {}))
+
+    thread.get_next_image()
+
+    assert container == [True], (
+        "the Live container watch fell through to the plain-file branch")
+
+
+def test_every_emitter_branch_is_accepted_as_a_container(widget, tmp_path):
+    """W-1.2 case 9 (complete emitter coverage, including the ``hdf5`` branch).
+
+    ``_controls_v2_container_index_config`` has three branches; the visible File
+    Type list is ``['tif','raw','h5','nxs','mar3450']``, so its ``hdf5`` branch —
+    which emits the TWO-suffix tuple ``("_master.hdf5", "_master.h5")`` — cannot
+    currently be selected through the panel.  Rather than assert a literal, this
+    row extends the list parameter's limits so the PRODUCTION emitter runs its own
+    hdf5 branch, and then requires the consumer to accept whatever it emits.
+    Disclosed: extending the limits is a test-side widening of the visible
+    choices, not a substitute for the emitter.
+    """
+    signal = widget.wrangler.parameters.child("Signal")
+    limits = list(signal.child("img_ext").opts.get("limits") or [])
+    signal.child("img_ext").setLimits(limits + ["hdf5"])
+
+    observed = {}
+    for ext in ("h5", "hdf5", "nxs"):
+        _configure_container_directory(widget, tmp_path, ext)
+        emitted = widget._controls_v2_container_index_config()
+        assert emitted is not None, ext
+        suffixes = emitted[3]
+        observed[ext] = suffixes
+        frozen = widget._prepare_controls_v2_run_configuration()
+        thread = widget.wrangler.thread
+        assert imageThread._frozen_source_is_container(thread) is True, (
+            f"emitter branch {ext} -> {suffixes!r} was refused")
+
+    # the branch shapes this row actually exercised, recorded as evidence
+    assert observed["h5"] == ("_master.h5",)
+    assert observed["hdf5"] == ("_master.hdf5", "_master.h5")
+    assert observed["nxs"] == (".nxs",)
+
+
+def test_a_non_container_directory_is_still_a_series(widget, tmp_path):
+    """W-1.2 case 9 (the other polarity, through production).  A tif directory
+    freezes NO typed source and must stay on the series path."""
+    signal = widget.wrangler.parameters.child("Signal")
+    signal.child("inp_type").setValue("Image Directory")
+    signal.child("img_dir").setValue(str(tmp_path))
+    signal.child("img_ext").setValue("tif")
+    assert widget._controls_v2_container_index_config() is None
+
+    frozen = widget._prepare_controls_v2_run_configuration()
+    assert frozen is not None and frozen.source is None
+    thread = widget.wrangler.thread
+    thread.img_file = ""
+    assert imageThread._frozen_source_is_container(thread) is False
 
 
 # --------------------------------------------------------------------------- #

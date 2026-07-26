@@ -494,6 +494,15 @@ def test_run_refusal_preserves_lingering_reader_state():
     worker.poni = object()
     worker.img_file = "raw.nxs"
     worker.command = "start"
+    # O-1a-W1A/W1C: ``run()`` admits the accepted frozen configuration BEFORE the
+    # lingering-reader guard, because a worker with no accepted configuration must
+    # touch nothing at all.  In production a Run click always published one, so
+    # this host carries a REAL one (production freeze owner) and the assertion
+    # below still measures the reader-retry refusal it was written for.
+    from xrd_tools.session import RunIntent
+
+    worker.run_configuration = RunIntent(processing_mode="Int 2D").freeze()
+    worker.run_configuration_floor = 0
     worker.showLabel = SimpleNamespace(emit=lambda message: statuses.append(message))
     worker.img_fnames = ["pending-image"]
     worker.processed = ["processed-image"]

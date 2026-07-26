@@ -75,12 +75,20 @@ def test_tolerant_read_returns_immediately_on_stop(tmp_path):
 # --------------------------------------------------------------------------- #
 def _series_stub(fnames, *, batch_mode, budget=0.05, deadline=30.0):
     it = _imageThread()
+    # O-1a-W1A/W1C: ``get_next_image`` decides container-versus-series from the
+    # ACCEPTED frozen configuration, so a host that drives it must carry one.
+    # This is a REAL FrozenRunConfiguration through the production freeze owner:
+    # a tif image series, which is what this file's frames are.
+    from xrd_tools.session import RunIntent
+
     stub = types.SimpleNamespace(
         single_img=False, img_file=None, img_ext="tif",
         img_fnames=deque(str(f) for f in fnames),
         processed=[], _frame_read_clocks={},
         batch_mode=batch_mode, series_average=False, meta_ext="",
         command="live",
+        run_configuration=RunIntent(processing_mode="Int 2D").freeze(),
+        run_configuration_floor=0,
         FRAME_READ_RETRY_BUDGET=budget, FRAME_READ_DEADLINE=deadline,
     )
     stub._read_frame_tolerant = it._read_frame_tolerant.__get__(stub)
