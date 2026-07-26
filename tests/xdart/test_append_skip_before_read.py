@@ -42,7 +42,7 @@ def test_paths_with_suffix_matches_extensions_case_insensitively(tmp_path):
 def _frozen_run_config(*, skip_2d=True, gi=False, bai_1d_args=None,
                        bai_2d_args=None, gi_mode_1d="q_total",
                        gi_mode_2d="qip_qoop", output_mode="Append",
-                       live_mode=False):
+                       live_mode=False, save_path=""):
     """A REAL ``FrozenRunConfiguration`` through the PRODUCTION freeze owner.
 
     O-1a-W1A: the accepted frozen configuration is the worker's only
@@ -62,6 +62,10 @@ def _frozen_run_config(*, skip_2d=True, gi=False, bai_1d_args=None,
         # zero-reader) thread mirror.
         output_mode=output_mode,
         live_mode=live_mode,
+        # O-1a-W1R: the output target is a STRICT frozen leg -- an admitted run
+        # with no accepted ``save_path`` refuses rather than reading the (now
+        # zero-reader) ``h5_dir`` mirror.
+        save_path=save_path,
         bai_1d_args=dict(bai_1d_args if bai_1d_args is not None
                          else {"unit": "q_A^-1"}),
         bai_2d_args=dict(bai_2d_args or {}),
@@ -107,7 +111,8 @@ def _bare_worker(tmp_path, *, write_mode="Append"):
         gi_config={},
     )
     worker.run_configuration = worker._admitted_run_configuration = (
-        _frozen_run_config(output_mode=write_mode))
+        _frozen_run_config(output_mode=write_mode,
+                           save_path=str(tmp_path / "out")))
     worker.run_configuration_floor = 0
     return worker
 
@@ -169,7 +174,7 @@ def _initialize_scan_worker(tmp_path, *, write_mode="Append"):
         gi_config={},
     )
     worker.run_configuration = worker._admitted_run_configuration = (
-        _frozen_run_config(output_mode=write_mode))
+        _frozen_run_config(output_mode=write_mode, save_path=str(out)))
     worker.run_configuration_floor = 0
     worker.sigUpdateFile = SimpleNamespace(emit=lambda *_: None)
 

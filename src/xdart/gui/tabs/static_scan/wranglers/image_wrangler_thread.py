@@ -824,12 +824,17 @@ class imageThread(wranglerThread):
         bare floor never authorizes execution.
         """
 
-        return require_run_configuration(
+        frozen = require_run_configuration(
             getattr(self, "run_configuration", None),
             stage=stage,
             floor=int(getattr(self, "run_configuration_floor", 0) or 0),
             expected=getattr(self, "_admitted_run_configuration", None),
         )
+        # Capture the qualified reference ONCE (§39.5 Phase 2 item 1): every
+        # projection reads it from here on, so a later reassignment of the
+        # carrier cannot re-decide this run's policy.
+        self._qualified_run_configuration = frozen
+        return frozen
 
     def _frozen_run_policy(self, stage):
         """The accepted configuration for a read INSIDE an already-gated run.

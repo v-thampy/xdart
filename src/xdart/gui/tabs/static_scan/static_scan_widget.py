@@ -4519,6 +4519,20 @@ class staticWidget(QWidget):
                 and selected_ext not in {"h5", "hdf5", "nxs"}):
             from xrd_tools.sources import image_series_spec
             return image_series_spec(selected)
+        if source_type == "Image Series" and selected:
+            # O-1a-W1R (review §39.5 Phase 3 item 2): a CONTAINER Image-Series
+            # selection (an Eiger master / NeXus stack) used to freeze NO typed
+            # source, so every source-shape consumer fell back to legacy
+            # inference off the mutable ``img_file`` cursor.  Freeze the typed
+            # container source instead: "no supported shape may fall back".
+            # Applied to BOTH the freeze owner and its candidate mirror so a
+            # same-value edit still fingerprints identically (§14.11.D.2).
+            from xrd_tools.core.scan import SourceKind, SourceSpec
+            return SourceSpec(
+                selected,
+                (SourceKind.NEXUS_STACK if selected_ext == "nxs"
+                 else SourceKind.EIGER_MASTER),
+            )
         if source_type == "Single Image" and selected:
             from xrd_tools.core.scan import SourceKind, SourceSpec
             return SourceSpec(selected, SourceKind.IMAGE_FILE)
@@ -8486,6 +8500,20 @@ class staticWidget(QWidget):
         ):
             from xrd_tools.sources import image_series_spec
             return image_series_spec(selected)
+        if source_type == "Image Series" and selected:
+            # O-1a-W1R (review §39.5 Phase 3 item 2): a CONTAINER Image-Series
+            # selection (an Eiger master / NeXus stack) used to freeze NO typed
+            # source, so every source-shape consumer fell back to legacy
+            # inference off the mutable ``img_file`` cursor.  Freeze the typed
+            # container source instead: "no supported shape may fall back".
+            # Applied to BOTH the freeze owner and its candidate mirror so a
+            # same-value edit still fingerprints identically (§14.11.D.2).
+            from xrd_tools.core.scan import SourceKind, SourceSpec
+            return SourceSpec(
+                selected,
+                (SourceKind.NEXUS_STACK if selected_ext == "nxs"
+                 else SourceKind.EIGER_MASTER),
+            )
         if source_type == "Single Image" and selected:
             from xrd_tools.core.scan import SourceKind, SourceSpec
             return SourceSpec(selected, SourceKind.IMAGE_FILE)

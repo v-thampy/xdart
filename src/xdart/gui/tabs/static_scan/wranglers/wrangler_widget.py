@@ -59,6 +59,14 @@ def frozen_run_policy(obj):
     Presence and type are still required: a non-frozen carrier is never policy.
     """
 
+    # §39.5 Phase 2 item 1: once a worker-entry gate has QUALIFIED the accepted
+    # object by identity, that captured reference -- not the re-readable carrier
+    # -- is what execution consumes.  A post-entry reassignment of
+    # ``run_configuration`` therefore cannot change this run's policy, and the
+    # next entry gate still refuses the substituted carrier outright.
+    qualified = getattr(obj, "_qualified_run_configuration", None)
+    if isinstance(qualified, FrozenRunConfiguration):
+        return qualified
     frozen = getattr(obj, "run_configuration", None)
     return frozen if isinstance(frozen, FrozenRunConfiguration) else None
 
@@ -916,6 +924,23 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
             floor=int(getattr(obj, "run_configuration_floor", 0) or 0),
             bound=bound if isinstance(bound, FrozenRunConfiguration) else None,
         )
+        # O-1a-W1R (review §39.5 Phase 3 item 6): the projection falls back to
+        # the display slot when the accepted object cannot answer for a carrier.
+        # For a value the worker would otherwise read from a WRITABLE mirror that
+        # leg must be unreachable during an admitted run, so admission refuses a
+        # configuration that lacks it -- before any carrier is bound, so the
+        # refusal stays zero-delta.  ``imageWrangler`` requires ``save_path``:
+        # an accepted run with no output target is the sharpest W1R-P1-4 surface.
+        for _required in getattr(obj, "_admission_required_frozen_values", ()):
+            if not str(getattr(frozen, _required, "") or ""):
+                raise RunConfigurationRefused(
+                    "absent",
+                    stage=stage,
+                    detail=(
+                        f"the frozen run configuration carries no {_required}; "
+                        "the run would have to read a mutable mirror instead"),
+                    generation=int(frozen.generation),
+                )
         wranglerWidget._bind_admitted_run_configuration(obj, frozen)
         thread = getattr(obj, "thread", None)
         if thread is not None:
@@ -1267,6 +1292,9 @@ class wranglerThread(Qt.QtCore.QThread):
         # O-1a-W1R: the exact object the wrapper admitted for this run.  The
         # worker-entry identity gate compares the carrier against it by ``is``.
         self._admitted_run_configuration = None
+        # O-1a-W1R: the reference a worker-entry gate qualified for THIS run.
+        # Set only by `_require_run_configuration`; consumed by every projection.
+        self._qualified_run_configuration = None
 
         # ── Shared batch-engine state ────────────────────────────────
         # Subclasses can override any of these before .start() (or

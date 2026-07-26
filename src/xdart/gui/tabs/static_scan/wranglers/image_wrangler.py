@@ -284,6 +284,10 @@ class imageWrangler(wranglerWidget):
         self.scan = scan
         self.run_configuration = None
         self._admitted_run_configuration = None
+        # O-1a-W1R: frozen values this wrangler's worker must never take from a
+        # mutable mirror.  Admission refuses a configuration missing any of them,
+        # which makes the projection's absent-value leg unreachable for a run.
+        self._admission_required_frozen_values = ("save_path",)
         # O-1a-W1R: the loaded-scan calibration CANDIDATE for the click in
         # progress.  The freeze owner reads it; only exact admission publishes it.
         self._staged_run_calibration = None

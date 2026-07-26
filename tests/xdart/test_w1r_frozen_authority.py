@@ -248,6 +248,60 @@ def test_real_worker_refuses_a_same_generation_foreign_configuration(
     assert excinfo.value.reason == "foreign"
 
 
+def test_post_entry_substitution_cannot_change_this_runs_policy(
+        widget, tmp_path, monkeypatch):
+    """Row 16 (added at the orchestrator's request, review §39.5 Phase 2 item 1).
+
+    ``frozen_run_policy`` re-reads the carrier per access and checks presence and
+    type only -- identity lives at the worker-entry gate.  The consequence that
+    must hold is therefore: once an entry gate has QUALIFIED the accepted object,
+    reassigning ``thread.run_configuration`` to a GENUINE same-generation object
+    with a different fingerprint cannot change what the run executes.
+
+    Both acceptable outcomes are asserted: the qualified reference is what
+    execution uses, AND the next entry gate refuses the substituted carrier.
+    """
+    run = _click_run(widget, tmp_path, monkeypatch, write_mode="Append")
+    thread = run.thread
+    accepted = run.frozen
+
+    # Enter and qualify, exactly as the worker does.
+    assert imageThreadEntryGate(thread, "row16-entry") is accepted
+
+    substitute = RunIntent(
+        source_spec=accepted.thaw_source_spec(),
+        processing_mode="Int 1D",
+        output_mode="Overwrite",
+        save_path=str(tmp_path / "substituted-output"),
+        poni_file=accepted.poni_file,
+        poni_values=accepted.poni_values,
+    ).freeze(generation=accepted.generation)
+    assert substitute is not accepted
+    assert substitute.generation == accepted.generation
+    assert substitute.fingerprint != accepted.fingerprint
+    thread.run_configuration = substitute
+
+    # 1) the qualified reference still drives every policy read
+    assert thread.write_mode == accepted.output_mode == "Append"
+    assert Path(thread.h5_dir) == Path(accepted.save_path)
+    assert thread._append_skip_enabled() is True
+    assert bool(thread.xye_only) is bool(
+        accepted.run_options.get("xye_only", False))
+
+    # 2) and the next entry gate refuses the substituted carrier outright
+    with pytest.raises(RunConfigurationRefused) as excinfo:
+        imageThreadEntryGate(thread, "row16-reentry")
+    assert excinfo.value.reason == "foreign"
+
+
+def imageThreadEntryGate(thread, stage):
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
+        imageThread,
+    )
+
+    return imageThread._require_run_configuration(thread, stage)
+
+
 # --------------------------------------------------------------------------- #
 # W1R-P1-3 / row 4 — a lost handoff refuses; it never freezes again.
 # --------------------------------------------------------------------------- #
