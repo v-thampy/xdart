@@ -48,6 +48,11 @@ from tests.core.test_bluesky_nexus import (  # noqa: E402
     _write_bluesky_nxwriter,
 )
 
+from tests.xdart._accepted_run import (  # noqa: E402
+    accepted_run,
+    container_source,
+    directory_source,
+)
 from xrd_tools.core.metadata import resolve_incident_angle  # noqa: E402
 from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (  # noqa: E402
     imageThread,
@@ -248,8 +253,8 @@ def test_thread_fixed_incidence_constant_across_frames(fixed_incidence_file):
     (value_start), while the scanned motor still varies per frame."""
     worker = _bare_thread(fixed_incidence_file)
 
-    si0 = worker._frame_scan_info(str(fixed_incidence_file), 0)
-    si_last = worker._frame_scan_info(str(fixed_incidence_file), NFRAMES - 1)
+    si0 = worker._frame_scan_info(worker.run_configuration, str(fixed_incidence_file), 0)
+    si_last = worker._frame_scan_info(worker.run_configuration, str(fixed_incidence_file), NFRAMES - 1)
 
     # halpha is broadcast constant; hy is scanned per-frame.
     assert si0["halpha"] == pytest.approx(HALPHA_FIXED)
@@ -295,20 +300,22 @@ def test_gui_helper_returns_none_for_non_nxs(tmp_path):
 # ---------------------------------------------------------------------------
 
 def _bare_thread(img_file):
+    """A worker plus the accepted configuration its routed reads consume."""
     worker = imageThread.__new__(imageThread)
-    worker.meta_ext = None
     worker.meta_dir = None
     worker._eiger_metadata_cache = {}
     worker._bluesky_source_cache = {}
     worker.img_file = str(img_file)
+    worker.run_configuration = worker._admitted_run_configuration = accepted_run(
+        source_spec=container_source(img_file))
     return worker
 
 
 def test_thread_per_frame_scan_info_from_bluesky(bluesky_file):
     worker = _bare_thread(bluesky_file)
 
-    si0 = worker._frame_scan_info(str(bluesky_file), 0)
-    si_last = worker._frame_scan_info(str(bluesky_file), NFRAMES - 1)
+    si0 = worker._frame_scan_info(worker.run_configuration, str(bluesky_file), 0)
+    si_last = worker._frame_scan_info(worker.run_configuration, str(bluesky_file), NFRAMES - 1)
 
     # Per-frame motor + counter values are present (not an empty sidecar).
     for key in ("hy", "i0", "i1", "i2", "pd"):
@@ -344,7 +351,7 @@ def test_thread_non_bluesky_scan_info_unchanged(plain_nexus_file):
     """Regression: a plain .nxs frame gets exactly the sidecar metadata (empty
     here, meta_ext off) — the Bluesky overlay is a no-op."""
     worker = _bare_thread(plain_nexus_file)
-    assert worker._frame_scan_info(str(plain_nexus_file), 0) == {}
+    assert worker._frame_scan_info(worker.run_configuration, str(plain_nexus_file), 0) == {}
     assert worker._bluesky_frame_row(str(plain_nexus_file), 0) == {}
     # And it never stamps a wavelength.
     scan = types.SimpleNamespace(mg_args={"wavelength": 1e-10})
@@ -367,8 +374,8 @@ def test_thread_scan_info_carries_fixed_motors_and_counting_time(baseline_only_f
     (detx/sbsx) as constants AND both counting times — this is exactly what the
     Frame metadata popup / Plot Metadata show for a Bluesky file."""
     worker = _bare_thread(baseline_only_file)
-    si0 = worker._frame_scan_info(str(baseline_only_file), 0)
-    si_last = worker._frame_scan_info(str(baseline_only_file), NFRAMES - 1)
+    si0 = worker._frame_scan_info(worker.run_configuration, str(baseline_only_file), 0)
+    si_last = worker._frame_scan_info(worker.run_configuration, str(baseline_only_file), NFRAMES - 1)
 
     # Fixed motors broadcast constant across every frame.
     for si in (si0, si_last):
@@ -407,15 +414,11 @@ def test_directory_of_nxs_masters(tmp_path):
     # Append-skip priming enumerates each .nxs as its OWN output scan (regression:
     # this branch used to exclude '.nxs', so append re-runs re-read every frame).
     t = imageThread.__new__(imageThread)
-    t.write_mode = "Append"
-    t.xye_only = False
-    t.inp_type = "Image Directory"
-    t.img_dir = str(d)
-    t.img_ext = "nxs"
     t.img_file = str(d / "pos0_scan0001.nxs")
-    t.file_filter = ""
-    t.include_subdir = False
-    assert sorted(t._append_run_start_scan_names()) == stems
+    t.run_configuration = accepted_run(
+        output_mode="Append",
+        source_spec=directory_source(d, ext="nxs"))
+    assert sorted(t._append_run_start_scan_names(t.run_configuration)) == stems
 
     # The seed (first .nxs) yields the GI motor + counter columns that populate
     # the θ-motor / Normalize dropdowns in directory mode.
@@ -521,7 +524,7 @@ def _real_dir_watch_thread(watch_dir, out_dir):
     from xdart.modules.live import LiveScan
 
     scan = LiveScan("scan", data_file=str(out_dir / "scan.nxs"), static=True)
-    return imageThread(
+    worker = imageThread(
         Queue(),                     # command_queue
         {},                          # scan_args
         threading.RLock(),           # file_lock
@@ -559,6 +562,15 @@ def _real_dir_watch_thread(watch_dir, out_dir):
         live_mode=True,
         max_cores=1,
     )
+    # O-1a-W1R-D2: worker execution consumes the ACCEPTED configuration passed
+    # explicitly, so a harness driving it must admit one that names the same
+    # directory of .nxs containers this thread watches.
+    worker.run_configuration = worker._admitted_run_configuration = accepted_run(
+        live_mode=True,
+        save_path=str(out_dir),
+        source_spec=directory_source(watch_dir, ext="nxs"),
+    )
+    return worker
 
 
 def test_f5_unfinalized_nxs_deferred_then_consumed_in_full(tmp_path):
@@ -578,7 +590,7 @@ def test_f5_unfinalized_nxs_deferred_then_consumed_in_full(tmp_path):
         del f["entry/end_time"]
 
     t = _real_dir_watch_thread(watch, out)
-    item = t._get_next_eiger_frame_sync()
+    item = t._get_next_eiger_frame_sync(t.run_configuration)
     assert item[3] is None                       # deferred: end-of-stream sentinel
     assert str(p) not in t._eiger_done_masters   # NOT retired (the F5 data-loss)
     assert len(t._eiger_master_queue) == 0       # not queued either — re-polled
@@ -588,7 +600,7 @@ def test_f5_unfinalized_nxs_deferred_then_consumed_in_full(tmp_path):
 
     frames = []
     for _ in range(10):
-        item = t._get_next_eiger_frame_sync()
+        item = t._get_next_eiger_frame_sync(t.run_configuration)
         if item[3] is None:
             break
         frames.append(item)
@@ -607,10 +619,10 @@ def test_ready_nexus_scans_pop_in_natural_order(tmp_path):
         _write_bluesky_nxwriter(watch / f"{stem}.nxs")
 
     t = _real_dir_watch_thread(watch, out)
-    t._eiger_refill_master_queue()
+    t._eiger_refill_master_queue(t.run_configuration)
     popped = []
     while True:
-        path = t._eiger_pop_next_master()
+        path = t._eiger_pop_next_master(t.run_configuration)
         if path is None:
             break
         popped.append(Path(path).name)
@@ -636,13 +648,13 @@ def test_unfinished_earlier_scan_does_not_block_ready_later_scan(tmp_path):
     # Selection itself is name/stat-only.  The first JIT cursor open classifies
     # scan_1 as provisional, defers it, and continues to the ready sibling in
     # the same reader call.
-    first = t._get_next_eiger_frame_sync()
+    first = t._get_next_eiger_frame_sync(t.run_configuration)
     assert first[1:3] == ("scan_2", 1)
     assert str(earlier) not in t._eiger_done_masters
 
     later_frames = [first]
     for _ in range(NFRAMES + 2):
-        item = t._get_next_eiger_frame_sync()
+        item = t._get_next_eiger_frame_sync(t.run_configuration)
         if item[3] is None:
             break
         later_frames.append(item)
@@ -655,7 +667,7 @@ def test_unfinished_earlier_scan_does_not_block_ready_later_scan(tmp_path):
             "end_time", data=b"2026-07-14T00:01:00")
     earlier_frames = []
     for _ in range(NFRAMES + 2):
-        item = t._get_next_eiger_frame_sync()
+        item = t._get_next_eiger_frame_sync(t.run_configuration)
         if item[3] is None:
             break
         earlier_frames.append(item)
@@ -687,7 +699,7 @@ def test_live_zero_frame_shell_is_retried_without_blocking_ready_scan(tmp_path):
     t = _real_dir_watch_thread(watch, out)
     t.CONTAINER_READY_RETRY = 0.01
 
-    first = t._get_next_eiger_frame_sync()
+    first = t._get_next_eiger_frame_sync(t.run_configuration)
     assert first[1:3] == ("02_ready_00001", 1)
     assert str(shell) not in t._eiger_done_masters
 
@@ -695,7 +707,7 @@ def test_live_zero_frame_shell_is_retried_without_blocking_ready_scan(tmp_path):
     time.sleep(0.02)
     frames = []
     for _ in range(6):
-        item = t._get_next_eiger_frame_sync()
+        item = t._get_next_eiger_frame_sync(t.run_configuration)
         if item[3] is not None:
             frames.append((item[1], item[2]))
     assert frames == [("01_shell_00001", 1), ("01_shell_00001", 2)]
@@ -725,7 +737,7 @@ def test_finalized_bluesky_detectorless_is_terminal_without_retry(tmp_path):
     t = _real_dir_watch_thread(watch, out)
     t.CONTAINER_READY_RETRY = 60.0
 
-    first = t._get_next_eiger_frame_sync()
+    first = t._get_next_eiger_frame_sync(t.run_configuration)
     assert first[1:3] == ("02_ready_00001", 1)
     assert str(alignment) in t._eiger_done_masters
     assert str(alignment) not in t._eiger_retry_after
@@ -754,7 +766,7 @@ def test_live_stale_mtime_shell_gets_a_retry_before_retirement(tmp_path):
     t = _real_dir_watch_thread(watch, out)
     t.CONTAINER_READY_RETRY = 0.01
 
-    first = t._get_next_eiger_frame_sync()
+    first = t._get_next_eiger_frame_sync(t.run_configuration)
     assert first[3] is None
     assert str(shell) not in t._eiger_done_masters
 
@@ -762,7 +774,7 @@ def test_live_stale_mtime_shell_gets_a_retry_before_retirement(tmp_path):
     time.sleep(0.02)
     frames = []
     for _ in range(6):
-        item = t._get_next_eiger_frame_sync()
+        item = t._get_next_eiger_frame_sync(t.run_configuration)
         if item[3] is not None:
             frames.append((item[1], item[2]))
     assert frames == [("stale_clock_00001", 1), ("stale_clock_00001", 2)]
@@ -783,14 +795,14 @@ def test_live_prefetch_finds_shell_populated_after_idle_sentinel(tmp_path):
     t = _real_dir_watch_thread(watch, out)
     t.CONTAINER_READY_RETRY = 0.01
     try:
-        assert t._get_next_eiger_frame()[3] is None
+        assert t._get_next_eiger_frame(t.run_configuration)[3] is None
         assert str(shell) not in t._eiger_done_masters
 
         _write_bluesky_nxwriter(shell, n=2)
         deadline = time.monotonic() + 3.0
         frames = []
         while time.monotonic() < deadline and len(frames) < 2:
-            item = t._get_next_eiger_frame()
+            item = t._get_next_eiger_frame(t.run_configuration)
             if item[3] is not None:
                 frames.append((item[1], item[2]))
             else:
@@ -845,20 +857,20 @@ def test_f5_jit_open_classifies_each_reached_container_once(
 
     monkeypatch.setattr(ContainerCursor, "open", counted_open)
 
-    t._eiger_refill_master_queue()
+    t._eiger_refill_master_queue(t.run_configuration)
     assert sorted(t._eiger_master_queue) == sorted(
         [str(done), str(inprog), str(plain), str(torn)])
     assert opens == []
 
     # Pop is also name/stat-only; classification belongs to open_master's
     # sustained cursor, not a duplicate finalized-at-close preflight.
-    assert t._eiger_pop_next_master() == str(done)
+    assert t._eiger_pop_next_master(t.run_configuration) == str(done)
     assert opens == []
     t._eiger_master_queue.appendleft(str(done))
 
     frames = []
     for _ in range(2 * NFRAMES + 8):
-        item = t._get_next_eiger_frame_sync()
+        item = t._get_next_eiger_frame_sync(t.run_configuration)
         if item[3] is None:
             break
         frames.append((item[1], item[2]))
@@ -878,7 +890,7 @@ def test_f5_jit_open_classifies_each_reached_container_once(
         f["entry"].create_dataset("end_time", data=b"2026-07-12T00:01:00")
     inprog_frames = []
     for _ in range(NFRAMES + 2):
-        item = t._get_next_eiger_frame_sync()
+        item = t._get_next_eiger_frame_sync(t.run_configuration)
         if item[3] is None:
             break
         inprog_frames.append((item[1], item[2]))
@@ -903,11 +915,14 @@ def test_dir2b_bluesky_master_h5_reads_via_h5py_fallback(tmp_path):
     _write_bluesky_nxwriter(p, n=3)
 
     t = _real_dir_watch_thread(watch, out)
-    t.img_ext = "h5"
+    t.run_configuration = t._admitted_run_configuration = accepted_run(
+        live_mode=True,
+        save_path=str(out),
+        source_spec=directory_source(watch, ext="h5"))
 
     frames = []
     for _ in range(6):
-        item = t._get_next_eiger_frame_sync()
+        item = t._get_next_eiger_frame_sync(t.run_configuration)
         if item[3] is None:
             break
         frames.append(item)
@@ -954,7 +969,7 @@ def test_f6_single_exposure_2d_nxs_consumed_by_live_watch(tmp_path):
     img = _write_single_exposure_bluesky(p)
 
     t = _real_dir_watch_thread(watch, out)
-    item = t._get_next_eiger_frame_sync()
+    item = t._get_next_eiger_frame_sync(t.run_configuration)
     assert item[3] is not None, "single 2-D exposure must yield a frame"
     assert item[1] == "single_00001"
     assert item[2] == 1
@@ -962,7 +977,7 @@ def test_f6_single_exposure_2d_nxs_consumed_by_live_watch(tmp_path):
     assert frame.shape == img.shape           # the frame, not a (W,) row
     assert np.array_equal(frame, img)
 
-    item = t._get_next_eiger_frame_sync()
+    item = t._get_next_eiger_frame_sync(t.run_configuration)
     assert item[3] is None                    # exactly one frame, then done
     assert str(p) in t._eiger_done_masters
 
@@ -1002,7 +1017,7 @@ def test_imageless_containers_are_skipped_not_stream_ending(tmp_path):
     t.CONTAINER_READY_DEADLINE = 0.0
     frames = []
     for _ in range(12):
-        item = t._get_next_eiger_frame_sync()
+        item = t._get_next_eiger_frame_sync(t.run_configuration)
         if item[3] is None:
             break
         frames.append((item[1], item[2]))
@@ -1047,10 +1062,10 @@ def test_real_thread_per_frame_and_wavelength():
     from xdart.modules.wavelength import DEFAULT_WAVELENGTH_SENTINEL_M
 
     worker = _bare_thread(_REAL)
-    si0 = worker._frame_scan_info(str(_REAL), 0)
+    si0 = worker._frame_scan_info(worker.run_configuration, str(_REAL), 0)
     assert {"hy", "i0", "i1", "i2", "pd"} <= set(si0)
     assert resolve_incident_angle(si0, "hy") == pytest.approx(si0["hy"])
-    assert si0["hy"] != worker._frame_scan_info(str(_REAL), 30)["hy"]
+    assert si0["hy"] != worker._frame_scan_info(worker.run_configuration, str(_REAL), 30)["hy"]
 
     scan = types.SimpleNamespace(
         mg_args={"wavelength": DEFAULT_WAVELENGTH_SENTINEL_M}
@@ -1085,7 +1100,7 @@ def test_r2_cursor_backed_read_one_open_native_dtype_and_provider(tmp_path, monk
     t = _real_dir_watch_thread(watch, out)
     frames = []
     for _ in range(NFRAMES + 3):
-        item = t._get_next_eiger_frame_sync()
+        item = t._get_next_eiger_frame_sync(t.run_configuration)
         if item[3] is None:
             break
         # the cursor + read plan are live while the master is being read
@@ -1117,7 +1132,7 @@ def test_r2_cursor_closed_on_stop_and_clean_rerun(tmp_path):
     _write_bluesky_nxwriter(watch / "s_00001.nxs", n=NFRAMES)
 
     t = _real_dir_watch_thread(watch, out)
-    item = t._get_next_eiger_frame_sync()
+    item = t._get_next_eiger_frame_sync(t.run_configuration)
     assert item[3] is not None
     cursor = t._eiger_cursor
     assert cursor is not None and cursor.closed is False
@@ -1132,7 +1147,7 @@ def test_r2_cursor_closed_on_stop_and_clean_rerun(tmp_path):
     t.command = "start"
     t._eiger_master_path = None
     t._eiger_frame_idx = 0
-    item2 = t._get_next_eiger_frame_sync()
+    item2 = t._get_next_eiger_frame_sync(t.run_configuration)
     assert item2[3] is not None
     assert t._eiger_cursor is not None
     assert t._eiger_cursor is not cursor  # a NEW cursor, not the stopped one
@@ -1189,7 +1204,7 @@ def test_r2_cursor_refresh_failure_preserves_binding_then_recovers(tmp_path, mon
     _write_bluesky_nxwriter(path, n=NFRAMES)
 
     worker = _real_dir_watch_thread(watch, out)
-    assert worker._get_next_eiger_frame_sync()[3] is not None
+    assert worker._get_next_eiger_frame_sync(worker.run_configuration)[3] is not None
     old_cursor = worker._eiger_cursor
     old_descriptor = worker._eiger_descriptor
     old_plan = worker._eiger_read_plan
@@ -1238,7 +1253,7 @@ def test_r2_cursor_refresh_imageless_replacement_keeps_old_binding(
         entry.create_group("instrument")
 
     worker = _real_dir_watch_thread(watch, out)
-    assert worker._get_next_eiger_frame_sync()[3] is not None
+    assert worker._get_next_eiger_frame_sync(worker.run_configuration)[3] is not None
     old = (worker._eiger_cursor, worker._eiger_descriptor,
            worker._eiger_read_plan, worker._eiger_provider)
 
@@ -1266,7 +1281,7 @@ def test_r2_cursor_backed_rows_overlay_scanned_motors_and_preserve_order(tmp_pat
     worker = _real_dir_watch_thread(watch, out)
     rows = []
     for _ in range(NFRAMES):
-        item = worker._get_next_eiger_frame_sync()
+        item = worker._get_next_eiger_frame_sync(worker.run_configuration)
         assert item[3] is not None
         rows.append(item)
 
@@ -1277,7 +1292,7 @@ def test_r2_cursor_backed_rows_overlay_scanned_motors_and_preserve_order(tmp_pat
                 "sbsx", "eiger_count_time"} <= set(row)
         assert resolve_incident_angle(row, "halpha") == pytest.approx(row["halpha"])
     assert rows[0][4]["halpha"] != rows[-1][4]["halpha"]
-    legacy = _bare_thread(path)._frame_scan_info(str(path), 0)
+    legacy = _bare_thread(path)._frame_scan_info(_bare_thread(path).run_configuration, str(path), 0)
     assert rows[0][4] == legacy
     assert worker._eiger_descriptor.wavelength == pytest.approx(WAVELENGTH)
     worker._eiger_close_master()
@@ -1324,7 +1339,7 @@ def test_r2_append_skip_avoids_real_cursor_reads_and_metadata(tmp_path, monkeypa
     worker._append_skip_frames_by_scan = {"append_00001": {1, 3}}
     worker._prefetch_queue = queue.Queue(maxsize=NFRAMES + 1)
     worker._prefetch_stop_evt = threading.Event()
-    worker._prefetch_worker()
+    worker._prefetch_worker(worker.run_configuration)
     items = []
     while not worker._prefetch_queue.empty():
         item = worker._prefetch_queue.get_nowait()

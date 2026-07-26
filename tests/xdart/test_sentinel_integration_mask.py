@@ -9,19 +9,24 @@ from types import SimpleNamespace, MethodType
 
 import numpy as np
 
+from tests.xdart._accepted_run import (  # noqa: E402
+    accepted_run,
+    threshold_intent,
+)
 from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
 from xdart.modules.ewald.frame import _make_thumbnail
 
 
 def _resolve(img, mask_sentinel=True):
-    w = SimpleNamespace(mask_sentinel=mask_sentinel)
+    w = SimpleNamespace(run_configuration=accepted_run(
+        threshold=threshold_intent(mask_saturation=mask_sentinel)))
     w._resolve_frame_mask = MethodType(wranglerThread._resolve_frame_mask, w)
     # R3-A: _resolve_frame_mask emits a one-time advisory when the saturation
     # mask fires; bind it (no showLabel on this holder -> it just logs).
     w._warn_saturation_masked = MethodType(
         wranglerThread._warn_saturation_masked, w)
     scan = SimpleNamespace(_cached_data_mask=None)
-    idx = w._resolve_frame_mask(scan, img)
+    idx = w._resolve_frame_mask(w.run_configuration, scan, img)
     masked = np.zeros(np.asarray(img).size, dtype=bool)
     if idx is not None and len(idx):
         masked[idx] = True
@@ -83,25 +88,27 @@ def test_resolve_frame_mask_warns_once_when_saturation_fires(caplog):
     img = np.full((100, 100), 100, dtype=np.uint16)
     img[:30, :] = 65535                  # 30% dead block -> mask fires
 
-    w = SimpleNamespace(mask_sentinel=True)
+    w = SimpleNamespace(run_configuration=accepted_run(
+        threshold=threshold_intent(mask_saturation=True)))
     w._resolve_frame_mask = MethodType(wranglerThread._resolve_frame_mask, w)
     w._warn_saturation_masked = MethodType(
         wranglerThread._warn_saturation_masked, w)
     scan = SimpleNamespace(_cached_data_mask=None)
     with caplog.at_level(logging.WARNING):
-        w._resolve_frame_mask(scan, img)
-        w._resolve_frame_mask(scan, img)   # cache hit -> no recompute, no 2nd warn
+        w._resolve_frame_mask(w.run_configuration, scan, img)
+        w._resolve_frame_mask(w.run_configuration, scan, img)   # cache hit -> no recompute, no 2nd warn
     fired = [m for m in caplog.messages if "Mask Saturated" in m]
     assert len(fired) == 1, f"expected one advisory, got {fired}"
 
     # toggle OFF -> never warns (the saturated block is left in the integration).
-    w2 = SimpleNamespace(mask_sentinel=False)
+    w2 = SimpleNamespace(run_configuration=accepted_run(
+        threshold=threshold_intent(mask_saturation=False)))
     w2._resolve_frame_mask = MethodType(wranglerThread._resolve_frame_mask, w2)
     w2._warn_saturation_masked = MethodType(
         wranglerThread._warn_saturation_masked, w2)
     caplog.clear()
     with caplog.at_level(logging.WARNING):
-        w2._resolve_frame_mask(SimpleNamespace(_cached_data_mask=None), img)
+        w2._resolve_frame_mask(w2.run_configuration, SimpleNamespace(_cached_data_mask=None), img)
     assert not [m for m in caplog.messages if "Mask Saturated" in m]
 
 

@@ -3,6 +3,12 @@
 
 from __future__ import annotations
 
+from tests.xdart._accepted_run import (  # noqa: E402
+    accepted_run,
+    container_source,
+    directory_source,
+)
+
 from collections import deque
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -105,8 +111,10 @@ def _worker(plan, session):
         _eiger_retry_after={},
         _eiger_zero_frame_seen={},
         showLabel=_Signal(),
-        live_mode=True,
-        inp_type="Image Directory",
+        run_configuration=accepted_run(
+            live_mode=True,
+            source_spec=directory_source(
+                getattr(plan, "root", "/nonexistent"), ext="h5")),
         command="start",
         _h19_seed_pending=False,
         _h19_ready_master_candidates={},
@@ -131,8 +139,8 @@ def test_empty_frozen_baseline_arms_and_accepts_first_ready_append(tmp_path):
         _Session(_observation(tmp_path, ((source, _result()),), generation=1)),
     )
 
-    assert worker._h19_live_directory_armed() is True
-    worker._eiger_refill_master_queue()
+    assert worker._h19_live_directory_armed(worker.run_configuration) is True
+    worker._eiger_refill_master_queue(worker.run_configuration)
     assert list(worker._eiger_master_queue) == [str(source.path)]
 
 
@@ -149,11 +157,11 @@ def test_authoritative_refill_honors_zero_frame_retry_clock(
     worker._eiger_retry_after[str(source.path)] = 100.0
 
     monkeypatch.setattr(iwt.time, "monotonic", lambda: 50.0)
-    worker._eiger_refill_master_queue()
+    worker._eiger_refill_master_queue(worker.run_configuration)
     assert list(worker._eiger_master_queue) == []
 
     monkeypatch.setattr(iwt.time, "monotonic", lambda: 101.0)
-    worker._eiger_refill_master_queue()
+    worker._eiger_refill_master_queue(worker.run_configuration)
     assert list(worker._eiger_master_queue) == [str(source.path)]
 
 
@@ -165,7 +173,7 @@ def test_observation_failure_preserves_queue_and_surfaces_status(tmp_path):
     worker._eiger_master_queue.append(str(source.path))
 
     with pytest.raises(RuntimeError, match="share unavailable"):
-        worker._eiger_refill_master_queue()
+        worker._eiger_refill_master_queue(worker.run_configuration)
 
     assert list(worker._eiger_master_queue) == [str(source.path)]
     assert worker.showLabel.values
@@ -194,7 +202,7 @@ def test_worker_uses_frozen_order_and_ready_appends_without_reglob(
         "_paths_with_suffix",
         lambda *_args, **_kwargs: pytest.fail("H19 worker re-globbed"),
     )
-    worker._eiger_refill_master_queue()
+    worker._eiger_refill_master_queue(worker.run_configuration)
     assert [Path(path).name for path in worker._eiger_master_queue] == [
         "scan_2.nxs", "scan_10.nxs", "scan_11.nxs",
     ]
@@ -267,10 +275,10 @@ def test_pop_point_revalidates_and_never_consumes_changed_candidate(tmp_path):
     session = _Session(ready)
     worker = _worker(plan, session)
 
-    worker._eiger_refill_master_queue()
+    worker._eiger_refill_master_queue(worker.run_configuration)
     assert list(worker._eiger_master_queue) == [str(source.path)]
     path.write_bytes(b"changed bytes")
-    assert worker._eiger_pop_next_master() is None
+    assert worker._eiger_pop_next_master(worker.run_configuration) is None
     # One authoritative follow-up is allowed, but the same sticky stale
     # identity must then yield rather than spin/requeue forever.
     assert session.calls == 2
@@ -287,9 +295,9 @@ def test_first_refill_uses_frozen_ready_seed_without_observation(tmp_path):
     worker._h19_seed_pending = True
     worker._h19_ready_master_candidates = {str(path): source}
 
-    worker._eiger_refill_master_queue()
+    worker._eiger_refill_master_queue(worker.run_configuration)
 
-    assert worker._eiger_pop_next_master() == str(path)
+    assert worker._eiger_pop_next_master(worker.run_configuration) == str(path)
 
 
 def test_pop_does_not_reobserve_each_already_queued_master(tmp_path):
@@ -306,10 +314,10 @@ def test_pop_does_not_reobserve_each_already_queued_master(tmp_path):
     session = _Session(observation)
     worker = _worker(plan, session)
 
-    worker._eiger_refill_master_queue()
+    worker._eiger_refill_master_queue(worker.run_configuration)
     popped = (
-        worker._eiger_pop_next_master(),
-        worker._eiger_pop_next_master(),
+        worker._eiger_pop_next_master(worker.run_configuration),
+        worker._eiger_pop_next_master(worker.run_configuration),
     )
 
     assert popped == tuple(str(path) for path in paths)
@@ -336,16 +344,16 @@ def test_seed_drain_observes_only_when_frozen_plan_has_pending_work(tmp_path):
     worker._h19_pending_count = 1
     worker._h19_ready_master_candidates = {str(first.path): first}
 
-    def skip_first(path, _candidate):
+    def skip_first(_frozen, path, _candidate):
         if path != str(first.path):
             return False
         worker._eiger_done_masters.add(path)
         return True
 
     worker._eiger_skip_complete_append_master = skip_first
-    worker._eiger_refill_master_queue()
+    worker._eiger_refill_master_queue(worker.run_configuration)
 
-    assert worker._eiger_pop_next_master() == str(second.path)
+    assert worker._eiger_pop_next_master(worker.run_configuration) == str(second.path)
     assert session.calls == 1
 
 
@@ -383,16 +391,16 @@ def test_real_session_observes_only_after_frozen_queue_exhausts(
 
         monkeypatch.setattr(session, "observe", observe)
 
-        worker._eiger_refill_master_queue()
+        worker._eiger_refill_master_queue(worker.run_configuration)
         popped = (
-            worker._eiger_pop_next_master(),
-            worker._eiger_pop_next_master(),
+            worker._eiger_pop_next_master(worker.run_configuration),
+            worker._eiger_pop_next_master(worker.run_configuration),
         )
         assert popped == tuple(str(path) for path in paths)
         assert calls == 0
 
         worker._eiger_done_masters.update(popped)
-        worker._eiger_refill_master_queue()
+        worker._eiger_refill_master_queue(worker.run_configuration)
         assert calls == 1
         assert list(worker._eiger_master_queue) == []
     finally:
@@ -434,14 +442,14 @@ def test_real_session_converges_unprobed_tail_after_seed_bulk_skip(
 
         monkeypatch.setattr(session, "observe", observe)
 
-        def skip(path, _candidate):
+        def skip(_frozen, path, _candidate):
             worker._eiger_done_masters.add(path)
             return True
 
         worker._eiger_skip_complete_append_master = skip
-        worker._eiger_refill_master_queue()
+        worker._eiger_refill_master_queue(worker.run_configuration)
 
-        assert worker._eiger_pop_next_master() is None
+        assert worker._eiger_pop_next_master(worker.run_configuration) is None
         assert worker._eiger_done_masters == {str(path) for path in paths}
         assert worker._h19_pending_count == 0
         assert calls == [False, False]

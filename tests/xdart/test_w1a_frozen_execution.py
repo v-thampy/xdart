@@ -271,7 +271,7 @@ def test_append_cursor_compares_the_frozen_mapping_not_the_display_scan(
                             labels=(1, 2), labels_2d=(1, 2))
     _poison_display_state(run)
 
-    existing = run.thread._load_append_skip_snapshot(run.thread.scan_name)
+    existing = run.thread._load_append_skip_snapshot(run.thread.run_configuration, run.thread.scan_name)
 
     assert existing == {1, 2}
 
@@ -297,7 +297,7 @@ def test_append_cursor_refuses_when_the_frozen_mapping_differs(
     _poison_display_state(run)
 
     with pytest.raises(AppendConfigMismatchError):
-        run.thread._load_append_skip_snapshot(run.thread.scan_name)
+        run.thread._load_append_skip_snapshot(run.thread.run_configuration, run.thread.scan_name)
 
 
 def test_append_cursor_require_2d_follows_the_frozen_skip_2d(
@@ -314,7 +314,7 @@ def test_append_cursor_require_2d_follows_the_frozen_skip_2d(
     _poison_display_state(run)
     widget.scan.skip_2d = True
 
-    existing = run.thread._load_append_skip_snapshot(run.thread.scan_name)
+    existing = run.thread._load_append_skip_snapshot(run.thread.run_configuration, run.thread.scan_name)
 
     assert existing == {1}, "require_2d must come from the frozen configuration"
 
@@ -579,7 +579,7 @@ def test_backward_gi_display_write_cannot_reach_the_frozen_run(
     run.thread.gi = True
     run.thread.gi_mode_1d = "POISON_MODE_1D"
     run.thread.gi_mode_2d = "POISON_MODE_2D"
-    run.thread._project_gi_modes_onto_display_scan()
+    run.thread._project_gi_modes_onto_display_scan(run.thread.run_configuration)
 
     # the backward write STAYS (display/acquisition projection)
     assert widget.scan.bai_1d_args["gi_mode_1d"] == "POISON_MODE_1D"

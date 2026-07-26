@@ -317,7 +317,7 @@ def test_valid_tiff_series_has_total_typed_source_values(
     thread.file_filter = "POISON"
     thread.inp_type = "Image Directory"
     thread.img_dir = str(poison_dir)
-    safety = thread._output_safety_args()
+    safety = thread._output_safety_args(frozen)
 
     # Rule-9 entry 2 (BOUNDARY 22): the original D0 spelling asserted
     # ``watched_dirs == [series directory]``, which is factually wrong about the
@@ -335,7 +335,7 @@ def test_valid_tiff_series_has_total_typed_source_values(
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
         imageThread,
     )
-    assert imageThread._frozen_source_is_container(thread) is False
+    assert imageThread._frozen_source_is_container(thread, frozen) is False
 
 
 # --------------------------------------------------------------------------- #
@@ -391,7 +391,8 @@ def test_plain_image_directory_freezes_a_typed_source_and_starts(
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
         imageThread,
     )
-    assert imageThread._frozen_source_is_container(widget.wrangler.thread) is False
+    assert imageThread._frozen_source_is_container(
+        widget.wrangler.thread, frozen) is False
 
 
 # --------------------------------------------------------------------------- #
@@ -436,15 +437,25 @@ def test_run_b_never_observes_run_a_policy_on_the_reused_worker(
     assert thread.run_configuration is second
     assert thread._admitted_run_configuration is second
     # No Run-A value may be observable through ANY route once B is admitted.
-    assert thread.h5_dir == second.save_path, (
-        f"Run B setup reads Run A output {thread.h5_dir!r}, "
-        f"not {second.save_path!r}")
-    assert thread.batch_mode is True, "Run B setup reads Run A batch mode"
-    assert thread.max_cores == second.max_cores, (
-        f"Run B setup reads Run A parallelism {thread.max_cores}")
-    stale = getattr(thread, "_qualified_run_configuration", None)
-    assert stale is None or stale is second, (
-        "a prior run's qualified reference survived the new admission")
+    #
+    # O-1a-W1R-D2/D3 amendment: the parent spelling read Run B's values back
+    # through the descriptor mirrors (``thread.h5_dir`` / ``batch_mode`` /
+    # ``max_cores``).  D3 deletes them, so the leak this case was written for is
+    # structurally impossible: there is no stored qualified reference to go
+    # stale, and no mirror for a pre-entry read to resolve through.  What is
+    # asserted here is exactly that -- plus the consequence at the routed
+    # boundary: Run B's entry gate qualifies Run B's object, and a routed read
+    # driven from it answers with Run B's output target.
+    assert not hasattr(thread, "_qualified_run_configuration")
+    for name in ("h5_dir", "batch_mode", "max_cores"):
+        assert not hasattr(thread, name), (
+            f"a mutable {name} mirror survived; a pre-entry read could resolve "
+            "through the previous run again")
+    assert thread._require_run_configuration("oracle-run-b-entry") is second
+    assert Path(thread._append_output_path(second, "scan_b")).parent == Path(
+        second.save_path)
+    assert Path(thread._append_output_path(first, "scan_b")).parent != Path(
+        second.save_path)
 
 
 def test_a_bare_frozen_carrier_activates_no_execution_policy(

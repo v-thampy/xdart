@@ -14,6 +14,10 @@ from types import SimpleNamespace
 import pytest
 
 from xrd_tools.reduction import FlushPolicy
+from tests.xdart._accepted_run import (  # noqa: E402
+    accepted_run,
+    threshold_intent,
+)
 from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
 
 
@@ -24,9 +28,11 @@ def _serial(frames_since, *, cap, interval, unsaved, xye_only=False):
         unsaved_in_memory_count=(lambda: unsaved) if unsaved is not None else None,
     )
     scan = SimpleNamespace(frames=frames)
-    host = SimpleNamespace(xye_only=xye_only, _frames_since_save=frames_since,
+    host = SimpleNamespace(run_configuration=accepted_run(
+                               run_options={"xye_only": xye_only}),
+                           _frames_since_save=frames_since,
                            LIVE_SAVE_INTERVAL=interval)
-    return imageThread._save_due(host, scan), scan
+    return imageThread._save_due(host, host.run_configuration, scan), scan
 
 
 @pytest.mark.parametrize("frames_since", [0, 1, 7, 8, 55, 56, 57])
@@ -39,9 +45,10 @@ def test_serial_save_due_reproduces_flush_policy(frames_since, unsaved, interval
         unsaved_in_memory_count=(lambda: unsaved) if unsaved is not None else None,
     )
     scan = SimpleNamespace(frames=frames)
-    host = SimpleNamespace(xye_only=False, _frames_since_save=frames_since,
+    host = SimpleNamespace(run_configuration=accepted_run(),
+                           _frames_since_save=frames_since,
                            LIVE_SAVE_INTERVAL=interval)
-    got = imageThread._save_due(host, scan, force=force)
+    got = imageThread._save_due(host, host.run_configuration, scan, force=force)
     expected = FlushPolicy(interval=interval, cap=64).should_flush(
         frames_since_flush=frames_since, unsaved_in_memory=unsaved, force=force)
     assert got is expected
@@ -66,7 +73,9 @@ def test_streaming_due_to_save_reproduces_flush_policy(tmp_path):
     for batch_mode, interval in ((True, cap), (False, 8)):
         scan = LiveScan(data_file=str(tmp_path / f"c_{batch_mode}.nxs"))
         scan.frames._in_memory_cap = cap
-        host = SimpleNamespace(batch_mode=batch_mode, LIVE_SAVE_INTERVAL=8)
+        host = SimpleNamespace(
+            run_configuration=accepted_run(batch_mode=batch_mode),
+            LIVE_SAVE_INTERVAL=8)
         sink = QtNexusSink(host, scan, ReductionPlan(integration_2d=None), mask=None)
         policy = FlushPolicy(interval=interval, cap=cap,
                              margin=_SAVE_BEFORE_EVICT_MARGIN)

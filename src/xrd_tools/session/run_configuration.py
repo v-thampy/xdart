@@ -413,14 +413,62 @@ def _detached_value(value: Any) -> Any:
     ``SourceSpec`` wraps its options in.
     """
     if isinstance(value, Mapping):
-        return {key: _detached_value(item) for key, item in value.items()}
+        # O-1a-W1R-D2 (review §43.3): KEYS ride the same boundary as values.
+        return {
+            _detached_value(key): _detached_value(item)
+            for key, item in value.items()
+        }
     if isinstance(value, list):
         return [_detached_value(item) for item in value]
     if isinstance(value, tuple):
         return tuple(_detached_value(item) for item in value)
-    if isinstance(value, (set, frozenset)):
-        return set(value)
-    return value
+    # O-1a-W1R-D2 (review §42.2 item 2): preserve set VERSUS frozenset -- the
+    # first version collapsed both to a mutable ``set`` -- and detach members.
+    if isinstance(value, frozenset):
+        return frozenset(_detached_value(item) for item in value)
+    if isinstance(value, set):
+        return {_detached_value(item) for item in value}
+    return _detached_container(value)
+
+
+def _detached_container(value: Any) -> Any:
+    """Detach one duck-typed value container (NumPy arrays/scalars and kin).
+
+    O-1a-W1R-D2 (review §42.2 items 1 and 3, §43.3).  :func:`_freeze_value`
+    accepts ANY object that converts itself through ``item()``/``tolist()``, so
+    those -- not just the ``dtype``-bearing subset the first version copied --
+    are exactly what this boundary owes a copy; an object with neither is one of
+    the immutable scalars that algebra accepts, and sharing it is safe.
+
+    ``copy()`` is preferred because it preserves dtype and shape, but a
+    ``copy()`` that is absent, refuses, or hands back the SAME object is not a
+    copy, so the value conversion is detached in its place.  Nothing this module
+    recognizes as a mutable value container is ever returned as-is; a container
+    that can neither copy nor convert itself fails closed.
+    """
+    converters = [name for name in ("item", "tolist")
+                  if callable(getattr(value, name, None))]
+    if not converters:
+        return value
+    copier = getattr(value, "copy", None)
+    if callable(copier):
+        try:
+            copied = copier()
+        except Exception:  # a copy that raises is not a copy; convert instead
+            copied = value
+        if copied is not value:
+            return copied
+    for name in converters:
+        try:
+            converted = getattr(value, name)()
+        except (TypeError, ValueError):
+            continue
+        if converted is not value:
+            return _detached_value(converted)
+    raise TypeError(
+        "run configuration values must be detachable; "
+        f"{type(value).__module__}.{type(value).__qualname__} can neither "
+        "copy nor convert itself")
 
 
 def _detached_source_spec(value):
@@ -530,6 +578,37 @@ class FrozenSourceSpec:
         raise TypeError(
             "source_spec must be SourceSpec, DirectorySourceSpec, or None"
         )
+
+    @property
+    def _uri_names_a_directory(self) -> bool:
+        # A numbered series freezes its CONTAINING DIRECTORY as the uri, so both
+        # source-value answers below turn on this one fact (review §43.1).
+        return self.family == "directory" or self.source_kind == "tiff_series"
+
+    @property
+    def format_tokens(self) -> tuple[str, ...]:
+        """Every frozen format alternative, as a bare token ('_master.h5' -> 'h5').
+
+        All alternatives are preserved: an Eiger master froze as
+        ``("_master.hdf5", "_master.h5")`` reads as ``("hdf5", "h5")``, because a
+        consumer matching one spelling must still recognize the other.
+        """
+        candidates = self.suffixes or (
+            () if self._uri_names_a_directory else (Path(self.uri).suffix,))
+        tokens = (str(item).strip().lower().rsplit(".", 1)[-1]
+                  for item in candidates)
+        return tuple(token for token in tokens if token)
+
+    @property
+    def filesystem_root(self) -> str:
+        """The directory this source reads from; fail closed when it has none."""
+        if self._uri_names_a_directory:
+            return str(self.uri)
+        if self.source_kind in ("image_file", "nexus_stack", "eiger_master",
+                                "processed_nexus", "spec"):
+            return str(Path(self.uri).parent)
+        raise ValueError(
+            f"frozen source kind {self.source_kind!r} has no filesystem root")
 
     def thaw(self) -> SourceSpec | DirectorySourceSpec:
         """Return a fresh typed source selection."""

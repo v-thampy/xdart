@@ -17,6 +17,10 @@ keep the test fast / dep-free.
 """
 
 from __future__ import annotations
+from tests.xdart._accepted_run import (  # noqa: E402
+    accepted_run,
+    container_source,
+)
 
 import logging
 
@@ -655,12 +659,17 @@ def test_source_snapshot_writer_roundtrip_drives_restarted_append_skip(
         skip_2d=False,
         bai_1d_args=dict(scan.bai_1d_args),
         bai_2d_args=dict(scan.bai_2d_args),
+        source_spec=container_source(raw),
+        output_mode="Append",
+        # the accepted output target: the append cursor resolves the existing
+        # processed scan from HERE, not from a mutable ``h5_dir`` mirror.
+        save_path=str(output_dir),
     )
     worker._eiger_done_masters = set()
     worker.source_frame_count_snapshot = {}
 
     assert worker._eiger_skip_complete_append_master(
-        str(raw), candidate) is True
+        worker.run_configuration, str(raw), candidate) is True
     assert worker._eiger_done_masters == {str(raw)}
     assert worker._append_skip_without_reading == 6
 

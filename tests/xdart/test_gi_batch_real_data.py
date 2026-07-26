@@ -119,6 +119,62 @@ def _integrate_direct(poni, img, mask, incidence, bai_2d_args, sample_orientatio
     )
 
 
+def _accepted_scout_run(member, *, source_spec=None, gi=True,
+                        incidence_motor="th", batch_mode=True,
+                        directory=None, meta_ext="txt", xye_only=False):
+    """The accepted configuration a GI scout/prepass rig executes.
+
+    O-1a-W1R-D2: source shape, GI axis, batch mode and the metadata format are
+    frozen run policy; the routed reads take them from here.
+    """
+    from tests.xdart._accepted_run import (
+        accepted_run,
+        directory_source,
+        gi_intent,
+        series_source,
+    )
+
+    if source_spec is None:
+        source_spec = (directory_source(directory, ext="tif")
+                       if directory is not None else series_source(member))
+    return accepted_run(
+        processing_mode="Int 2D",
+        batch_mode=batch_mode,
+        source_spec=source_spec,
+        gi=gi_intent(enabled=bool(gi), incidence_motor=incidence_motor,
+                     sample_orientation=4, tilt_angle=0.0),
+        run_options={"xye_only": xye_only, "series_average": False,
+                     "meta_ext": meta_ext},
+    )
+
+
+def _accepted_gi_run(*, gi, incidence_motor, sample_orientation,
+                     batch_mode, max_cores=1, xye_only=True):
+    """The accepted configuration both spine rigs execute.
+
+    O-1a-W1R-D2: GI axis/orientation, batch mode, parallelism and the XYE switch
+    are frozen run policy; the worker takes them as an explicit argument, so the
+    rig states them ONCE here instead of on mutable thread mirrors.
+    """
+    from tests.xdart._accepted_run import (
+        accepted_run,
+        gi_intent,
+        series_source,
+    )
+
+    return accepted_run(
+        # the rigs read real TIFF frames from one directory
+        source_spec=series_source("/nonexistent-source/frame_0001.tif"),
+        # the rigs integrate 2D and flush XYE; skip_2d must stay False
+        processing_mode="Int 2D",
+        batch_mode=batch_mode,
+        max_cores=max_cores,
+        gi=gi_intent(enabled=bool(gi), incidence_motor=incidence_motor,
+                     sample_orientation=sample_orientation, tilt_angle=0.0),
+        run_options={"xye_only": xye_only, "series_average": False},
+    )
+
+
 def _build_batch_thread(poni, mask, *, incidence_motor="th",
                         sample_orientation=4, gi=True):
     """Build a SimpleNamespace imageThread wired with the real integration
@@ -137,11 +193,11 @@ def _build_batch_thread(poni, mask, *, incidence_motor="th",
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
 
     w = SimpleNamespace(
-        max_cores=2, gi=gi, incidence_motor=incidence_motor,
-        sample_orientation=sample_orientation, tilt_angle=0,
-        series_average=False, mask=mask, poni=poni, command="",
-        batch_mode=True, xye_only=True,
-        apply_threshold=False, threshold_min=0, threshold_max=0,
+        run_configuration=_accepted_gi_run(
+            gi=gi, incidence_motor=incidence_motor,
+            sample_orientation=sample_orientation,
+            batch_mode=True, max_cores=2),
+        mask=mask, poni=poni, command="",
         _plan_cache=StandardPlanCache(), _xye_lock=RLock(), _xye_buffer=[],
         _cached_gi_incident_angle=None,
         showLabel=SimpleNamespace(emit=lambda *a: None),
@@ -151,6 +207,7 @@ def _build_batch_thread(poni, mask, *, incidence_motor="th",
     for meth in ("_resolve_frame_mask", "_prewarm_frame_mask",
                  "_apply_threshold_inline"):
         setattr(w, meth, MethodType(getattr(wranglerThread, meth), w))
+    w._warn_gi_first_chunk_freeze = lambda *a, **k: None
     w._dispatch_batch_serial = MethodType(imageThread._dispatch_batch_serial, w)
     # D₂: the serial dispatch tail now routes through these (real _save_due gate
     # works — the rig sets LIVE_SAVE_INTERVAL + a real scan with frames).
@@ -278,7 +335,12 @@ def _frozen_gi_bai_args(poni, img, meta, mask, *, gi_mode_1d, gi_mode_2d,
         poni, mask, incidence_motor=incidence_motor,
         sample_orientation=sample_orientation, gi=True,
     )
-    w.xye_only = False  # so _freeze_gi_2d_auto_ranges runs (it skips on xye_only)
+    # O-1a-W1R-D2: the switch is frozen run policy -- re-admit a configuration
+    # with it OFF so _freeze_gi_2d_auto_ranges runs (it skips on xye_only).
+    w.run_configuration = _accepted_gi_run(
+        gi=True, incidence_motor=incidence_motor,
+        sample_orientation=sample_orientation, batch_mode=True, max_cores=2,
+        xye_only=False)
     scan = _make_scan(
         poni, mask,
         {"gi_mode_1d": gi_mode_1d, "numpoints": numpoints},
@@ -286,8 +348,8 @@ def _frozen_gi_bai_args(poni, img, meta, mask, *, gi_mode_1d, gi_mode_2d,
         gi=True,
     )
     pending = [(_TIFF_FRAMES[0], 1, img, dict(meta), 0.0, 0.0)]
-    w._freeze_gi_1d_auto_range(scan, pending)
-    w._freeze_gi_2d_auto_ranges(scan, pending)
+    w._freeze_gi_1d_auto_range(w.run_configuration, scan, pending)
+    w._freeze_gi_2d_auto_ranges(w.run_configuration, scan, pending)
     return dict(scan.bai_1d_args), dict(scan.bai_2d_args)
 
 
@@ -333,7 +395,7 @@ def _run_batch_streaming(poni, pending_data, mask, *, incidence_motor="th",
 
     pending = [(name, i + 1, img, info, 0.0, 0.0)
                for i, (name, img, info) in enumerate(pending_data)]
-    w._dispatch_batch_streaming(scan, pending)
+    w._dispatch_batch_streaming(w.run_configuration, scan, pending)
     w._close_reduction_session()    # finish() -> QtNexusSink final flush -> spy
     return captured
 
@@ -368,11 +430,10 @@ def _run_live_single(poni, name, img, meta, mask, *, incidence_motor="th",
         _cached_data_mask=None,
     )
     w = SimpleNamespace(
-        gi=gi, incidence_motor=incidence_motor,
-        sample_orientation=sample_orientation, tilt_angle=0,
-        series_average=False, mask=mask, poni=poni, command="",
-        batch_mode=False, xye_only=True,
-        apply_threshold=False, threshold_min=0, threshold_max=0,
+        run_configuration=_accepted_gi_run(
+            gi=gi, incidence_motor=incidence_motor,
+            sample_orientation=sample_orientation, batch_mode=False),
+        mask=mask, poni=poni, command="",
         _plan_cache=StandardPlanCache(), _xye_lock=RLock(), _xye_buffer=[],
         _published_frames={}, _cached_gi_incident_angle=None,
         viewer_rows_1d={}, viewer_rows_2d={}, file_lock=Condition(),
@@ -385,7 +446,7 @@ def _run_live_single(poni, name, img, meta, mask, *, incidence_motor="th",
                  "_apply_threshold_inline"):
         setattr(w, meth, MethodType(getattr(wranglerThread, meth), w))
     w._process_one = MethodType(imageThread._process_one, w)
-    imageThread._process_one(w, scan, name, 1, img, dict(meta), 0.0, 0.0)
+    imageThread._process_one(w, w.run_configuration, scan, name, 1, img, dict(meta), 0.0, 0.0)
     return w._published_frames[1]
 
 
@@ -971,8 +1032,8 @@ def test_gi_submode_xye_only_uniform_xgrid(gi_mode_1d):
     scan.skip_2d = True            # Int 1D mode doesn't compute/write the cake
     pending = [(_TIFF_FRAMES[i], i + 1, raw[i][0], raw[i][2], 0.0, 0.0)
                for i in range(2)]
-    w._freeze_gi_1d_auto_range(scan, pending)   # the prepass's 1D freeze, explicit
-    w._dispatch_batch(scan, pending)            # streaming; session honours the grid
+    w._freeze_gi_1d_auto_range(w.run_configuration, scan, pending)   # the prepass's 1D freeze, explicit
+    w._dispatch_batch(w.run_configuration, scan, pending)            # streaming; session honours the grid
     w._close_reduction_session()                # finish -> QtNexusSink final flush
 
     assert set(captured) == {1, 2}
@@ -1093,7 +1154,7 @@ def _freeze_1d_output_range(poni, mask, pending, gi_mode_1d):
     scan = _make_scan(
         poni, mask, {"gi_mode_1d": gi_mode_1d, "numpoints": 128},
         {"gi_mode_2d": "qip_qoop", "npt_rad": 64, "npt_azim": 48}, gi=True)
-    w._freeze_gi_1d_auto_range(scan, pending)
+    w._freeze_gi_1d_auto_range(w.run_configuration, scan, pending)
     return scan.bai_1d_args.get(gi_1d_output_axis_key(gi_mode_1d))
 
 
@@ -1160,10 +1221,10 @@ def test_gi_streaming_prepass_scouts_whole_scan_extremes():
 
     scan_name = "Combi4_Angledependence_samz_4p9_03271002"
     w = SimpleNamespace(
-        incidence_motor="th",
+        run_configuration=_accepted_scout_run(
+            TIFF / f"{scan_name}_0001.tif"),
         img_file=str(TIFF / f"{scan_name}_0001.tif"),
-        img_dir=str(TIFF), scan_name=scan_name, img_ext="tif",
-        meta_ext="txt", meta_dir=str(TIFF), inp_type=None,
+        scan_name=scan_name, meta_dir=str(TIFF),
         get_background=lambda *a, **k: 0.0,
     )
     w._enumerate_scan_files = MethodType(imageThread._enumerate_scan_files, w)
@@ -1173,7 +1234,7 @@ def test_gi_streaming_prepass_scouts_whole_scan_extremes():
 
     # (1) The whole-scan metadata sweep finds the two incidence EXTREMES
     #     (th 0.15 = frame 1, th 0.35 = frame 5) and loads their images.
-    status, entries = w._gi_whole_scan_scout_entries(None)
+    status, entries = w._gi_whole_scan_scout_entries(w.run_configuration, None)
     assert status == "freeze"
     assert len(entries) == 2
     nums = sorted(e[1] for e in entries)
@@ -1227,15 +1288,14 @@ def test_frame_source_for_rejects_neighbour_files(tmp_path):
         (tmp_path / name).touch()
 
     w = SimpleNamespace(
-        single_img=False, inp_type=None,
+        run_configuration=_accepted_scout_run(tmp_path / "scan_0001.tif"),
         img_file=str(tmp_path / "scan_0001.tif"),
-        img_dir=str(tmp_path), scan_name="scan", img_ext="tif",
-        meta_ext="txt", meta_dir=str(tmp_path),
+        scan_name="scan", meta_dir=str(tmp_path),
     )
     for m in ("_frame_source_for", "_enumerate_scan_files"):
         setattr(w, m, MethodType(getattr(imageThread, m), w))
 
-    source = w._frame_source_for(None)
+    source = w._frame_source_for(w.run_configuration, None)
     assert isinstance(source, TiffSeriesSource)
     got = [Path(p).name for p in source.files]
     assert got == keep, f"strict factory admitted neighbour files: {got}"
@@ -1255,21 +1315,16 @@ def test_frame_source_for_uses_same_frozen_membership_as_worker(tmp_path):
     (tmp_path / "scan_0004.tif").touch()
 
     w = SimpleNamespace(
-        single_img=False,
-        inp_type="Image Series",
+        run_configuration=_accepted_scout_run(frozen[1], source_spec=spec),
         img_file=str(frozen[1]),
-        img_dir=str(tmp_path),
         scan_name="scan",
-        img_ext="tif",
-        meta_ext="txt",
         meta_dir=str(tmp_path),
-        source_spec=spec,
         _enumerate_scan_files=lambda: (_ for _ in ()).throw(
             AssertionError("frozen GI membership must not re-enumerate")),
     )
     w._frame_source_for = MethodType(imageThread._frame_source_for, w)
 
-    source = w._frame_source_for(None)
+    source = w._frame_source_for(w.run_configuration, None)
 
     assert source.name == "scan"
     assert tuple(source.files) == tuple(frozen)
@@ -1295,17 +1350,17 @@ def test_gi_prepass_scout_indices_map_back_to_noncontiguous_files(tmp_path):
         shutil.copy(TIFF / f"{src_scan}_{src_n}.txt", tmp_path / f"recon_{dst_n}.txt")
 
     w = SimpleNamespace(
-        incidence_motor="th", single_img=False, inp_type=None,
+        run_configuration=_accepted_scout_run(
+            str(tmp_path / "recon_0003.tif"), source_spec=None),
         img_file=str(tmp_path / "recon_0003.tif"),
-        img_dir=str(tmp_path), scan_name="recon", img_ext="tif",
-        meta_ext="txt", meta_dir=str(tmp_path),
+        scan_name="recon", meta_dir=str(tmp_path),
         get_background=lambda *a, **k: 0.0,
     )
     for m in ("_frame_source_for", "_enumerate_scan_files",
               "_gi_whole_scan_scout_entries"):
         setattr(w, m, MethodType(getattr(imageThread, m), w))
 
-    status, entries = w._gi_whole_scan_scout_entries(None)
+    status, entries = w._gi_whole_scan_scout_entries(w.run_configuration, None)
     assert status == "freeze"
     assert len(entries) == 2
     nums = sorted(e[1] for e in entries)
@@ -1333,11 +1388,13 @@ def test_gi_prepass_warns_and_proceeds_on_unestablishable_range():
     scan_name = "Combi4_Angledependence_samz_4p9_03271002"
     emitted = []
     w = SimpleNamespace(
-        gi=True, batch_mode=True, batch_execution="streaming",
-        incidence_motor="no_such_motor",      # absent from every frame's metadata
+        run_configuration=_accepted_scout_run(
+            TIFF / f"{scan_name}_0001.tif",
+            # absent from every frame's metadata
+            incidence_motor="no_such_motor"),
+        batch_execution="streaming",
         img_file=str(TIFF / f"{scan_name}_0001.tif"),
-        img_dir=str(TIFF), scan_name=scan_name, img_ext="tif",
-        meta_ext="txt", meta_dir=str(TIFF), inp_type=None,
+        scan_name=scan_name, meta_dir=str(TIFF),
         get_background=lambda *a, **k: 0.0, command="",
         showLabel=SimpleNamespace(emit=lambda m: emitted.append(m)),
     )
@@ -1347,12 +1404,12 @@ def test_gi_prepass_warns_and_proceeds_on_unestablishable_range():
         setattr(w, m, MethodType(getattr(imageThread, m), w))
 
     # The sweep finds the 5 files but resolves no incidence for any -> "abort".
-    status, entries = w._gi_whole_scan_scout_entries(None)
+    status, entries = w._gi_whole_scan_scout_entries(w.run_configuration, None)
     assert status == "abort" and entries == []
 
     # T0-4: the orchestrator WARNS and PROCEEDS on the first-chunk freeze.
     scan = SimpleNamespace()
-    proceed = w._gi_freeze_whole_scan_prepass(scan)
+    proceed = w._gi_freeze_whole_scan_prepass(w.run_configuration, scan)
     assert proceed is True
     assert w.command == ""                       # run not stopped
     assert emitted and "set from the first frames" in emitted[-1]
@@ -1371,11 +1428,10 @@ def test_gi_prepass_warns_and_proceeds_on_image_directory_source():
 
     emitted = []
     w = SimpleNamespace(
-        gi=True, batch_mode=True, batch_execution="streaming",
-        incidence_motor="th",          # non-fixed motor (not float-parseable)
-        img_file="/data/scan_0001.tif", inp_type="Image Directory",
-        img_dir="/data", scan_name="scan", img_ext="tif",
-        meta_ext="txt", meta_dir="/data",
+        run_configuration=_accepted_scout_run(
+            "/data/scan_0001.tif", directory="/data"),
+        img_file="/data/scan_0001.tif",
+        scan_name="scan", meta_dir="/data",
         command="",
         showLabel=SimpleNamespace(emit=lambda m: emitted.append(m)),
     )
@@ -1385,12 +1441,12 @@ def test_gi_prepass_warns_and_proceeds_on_image_directory_source():
         setattr(w, m, MethodType(getattr(imageThread, m), w))
 
     # Image-Directory with a non-fixed motor -> "unverifiable" (can't sweep).
-    status, entries = w._gi_whole_scan_scout_entries(None)
+    status, entries = w._gi_whole_scan_scout_entries(w.run_configuration, None)
     assert status == "unverifiable" and entries == []
 
     # T0-4: orchestrator WARNS and PROCEEDS on the first-chunk freeze.
     scan = SimpleNamespace()
-    proceed = w._gi_freeze_whole_scan_prepass(scan)
+    proceed = w._gi_freeze_whole_scan_prepass(w.run_configuration, scan)
     assert proceed is True
     assert w.command == ""
     assert emitted and "set from the first frames" in emitted[-1]
@@ -1406,11 +1462,11 @@ def _pinned_prepass_holder(emitted):
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
 
     w = SimpleNamespace(
-        gi=True, batch_mode=True, batch_execution="streaming",
-        incidence_motor="th", inp_type="Image Directory",
-        img_file="/data/scan_0001.tif", img_dir="/data", scan_name="scan",
-        img_ext="tif", meta_ext="txt", meta_dir="/data",
-        xye_only=False, command="",
+        run_configuration=_accepted_scout_run(
+            "/data/scan_0001.tif", directory="/data"),
+        batch_execution="streaming",
+        img_file="/data/scan_0001.tif", scan_name="scan", meta_dir="/data",
+        command="",
         showLabel=SimpleNamespace(emit=lambda m: emitted.append(m)),
     )
     for m in ("_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned",
@@ -1442,7 +1498,7 @@ def test_gi_prepass_skips_scout_when_ranges_fully_pinned():
         skip_2d=False,
     )
 
-    proceed = w._gi_freeze_whole_scan_prepass(scan)
+    proceed = w._gi_freeze_whole_scan_prepass(w.run_configuration, scan)
 
     assert proceed is True
     assert w.command == ""                       # no abort
@@ -1473,7 +1529,7 @@ def test_gi_prepass_warns_when_ranges_partially_pinned():
         skip_2d=False,
     )
 
-    proceed = w._gi_freeze_whole_scan_prepass(scan)
+    proceed = w._gi_freeze_whole_scan_prepass(w.run_configuration, scan)
 
     assert proceed is True
     assert w.command == ""
@@ -1492,14 +1548,15 @@ def test_gi_prepass_fails_closed_on_degenerate_scout_freeze():
 
     emitted = []
     w = SimpleNamespace(
-        gi=True, batch_mode=True, batch_execution="streaming", command="",
+        run_configuration=_accepted_scout_run("/data/scan_0001.tif"),
+        batch_execution="streaming", command="",
         showLabel=SimpleNamespace(emit=lambda m: emitted.append(m)),
     )
     for m in ("_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned", "_abort_gi_prepass", "_warn_gi_first_chunk_freeze"):
         setattr(w, m, MethodType(getattr(imageThread, m), w))
     # The scout resolves two extremes ("freeze"), but the production freeze hits
     # a blank scout cake and raises GIFreezeError.
-    w._gi_whole_scan_scout_entries = lambda scan: (
+    w._gi_whole_scan_scout_entries = lambda _frozen, scan: (
         "freeze", [("f", 1, None, {}, 0.0, 0.0)])
 
     def _boom(scan, scouts):
@@ -1507,7 +1564,7 @@ def test_gi_prepass_fails_closed_on_degenerate_scout_freeze():
     w._freeze_gi_1d_auto_range = _boom
     w._freeze_gi_2d_auto_ranges = _boom
 
-    proceed = w._gi_freeze_whole_scan_prepass(SimpleNamespace())
+    proceed = w._gi_freeze_whole_scan_prepass(w.run_configuration, SimpleNamespace())
     assert proceed is False                # fail closed, not raised
     assert w.command == "stop"
     assert emitted and "GI batch aborted" in emitted[-1]
@@ -1537,16 +1594,13 @@ def test_gi_streaming_multichunk_later_chunk_uses_whole_scan_grid():
     gi_mode_1d = "q_oop"                 # out-of-plane output: drifts with incidence
 
     w, captured = _build_batch_thread(poni, mask, gi=True)
-    w.xye_only = True
-    # Source attrs so the whole-scan pre-pass can metadata-sweep the 5-file series.
+    # O-1a-W1R-D2: the source the pre-pass sweeps and the XYE switch are frozen
+    # run policy -- re-admit one configuration that carries both.
+    w.run_configuration = _accepted_scout_run(
+        TIFF / f"{scan_name}_0001.tif", batch_mode=True, xye_only=True)
     w.img_file = str(TIFF / f"{scan_name}_0001.tif")
-    w.img_dir = str(TIFF)
     w.scan_name = scan_name
-    w.img_ext = "tif"
-    w.meta_ext = "txt"
     w.meta_dir = str(TIFF)
-    w.inp_type = None
-    w.incidence_motor = "th"
     w.get_background = lambda *a, **k: 0.0
     # Streaming wiring (mirrors test_streaming_batch_xye_matches_chunked).
     w.batch_execution = "streaming"
@@ -1576,9 +1630,9 @@ def test_gi_streaming_multichunk_later_chunk_uses_whole_scan_grid():
                 raw[i][0], raw[i][2], 0.0, 0.0) for i in range(5)]
     chunk1, chunk2 = pending[:2], pending[2:]   # the global max (frame 5) is in chunk 2
 
-    w._dispatch_batch(scan, chunk1)
+    w._dispatch_batch(w.run_configuration, scan, chunk1)
     assert w.command != "stop", "pre-pass aborted unexpectedly on real GI data"
-    w._dispatch_batch(scan, chunk2)
+    w._dispatch_batch(w.run_configuration, scan, chunk2)
     w._close_reduction_session()                # finish -> QtNexusSink final flush
 
     # The pre-pass froze the WHOLE-scan union into scan.bai_1d_args (the session

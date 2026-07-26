@@ -416,10 +416,6 @@ class nexusWrangler(wranglerWidget):
         skip_2d = ('1D' in mode_text) and ('2D' not in mode_text)
         self.scan.skip_2d = skip_2d
         self.xye_only = (mode_text == 'Int 1D (XYE)')
-        # Push down to the thread immediately so a mid-session mode
-        # change picks up on the next run without going through start().
-        if hasattr(self, 'thread') and self.thread is not None:
-            self.thread.xye_only = self.xye_only
 
     # ── Browse dialogs ───────────────────────────────────────────────
 
@@ -615,12 +611,10 @@ class nexusWrangler(wranglerWidget):
         self.sigUpdateGI.emit(self.gi)
 
         self.thread.file_lock = self.file_lock
-        self.thread.scan_args = self.scan_args
         self.thread.scan = self.scan
         self.thread.command = self.command
         # R3-B: the freshly-recreated thread defaults mask_sentinel=True; push
         # the UI's value so the NeXus opt-out actually reaches _resolve_frame_mask.
-        self.thread.mask_sentinel = self.mask_sentinel
         # N1: push the project root so the writer stamps @source_base + relative
         # raw paths (set AFTER the thread recreate above).
         self.thread.source_base = self.source_base
@@ -711,7 +705,6 @@ class nexusWrangler(wranglerWidget):
         # Push the current Cores selection into the worker thread.
         # The thread caches it as ``self.max_cores`` and uses it when
         # building the ThreadPoolExecutor for parallel integration.
-        self.thread.max_cores = self.maxCoresSpinBox.value()
         # Re-sync processing-mode flags onto scan + thread so a
         # stale ``thread`` instance (recreated in :meth:`setup` since
         # the last mode-change signal) sees the latest selection.

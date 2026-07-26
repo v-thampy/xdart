@@ -152,6 +152,23 @@ def _last_processed_output_file(thread, fallback=None):
     return last or fallback
 
 
+def _accepted_run_policy(owner):
+    """The accepted configuration a run executed, or None before the first Run.
+
+    O-1a-W1R-D2 (review §43.4): the worker carries no mutable policy mirrors any
+    more, so the HOST reads the object its run was admitted with rather than a
+    display slot that used to shadow it.
+    """
+    frozen = getattr(owner, "run_configuration", None)
+    return frozen if isinstance(frozen, FrozenRunConfiguration) else None
+
+
+def _accepted_run_option(owner, name, default=False):
+    """One run-scoped switch (``xye_only``) off the accepted configuration."""
+    frozen = _accepted_run_policy(owner)
+    return default if frozen is None else frozen.run_options.get(name, default)
+
+
 def _finished_output_file(thread, wrangler, *, all_skipped_append=False):
     """Resolve the existing processed output owned by a completed run.
 
@@ -173,7 +190,9 @@ def _finished_output_file(thread, wrangler, *, all_skipped_append=False):
             try:
                 candidate = (output_path(scan_name) if callable(output_path)
                              else os.path.join(
-                                 os.fspath(getattr(thread, "h5_dir", "")),
+                                 os.fspath(getattr(
+                                     _accepted_run_policy(thread),
+                                     "save_path", "") or ""),
                                  f"{scan_name}.nxs"))
             except (TypeError, ValueError):
                 continue
@@ -3958,25 +3977,12 @@ class staticWidget(QWidget):
                 run_configuration.threshold.threshold_max)
             wrangler.mask_sentinel = bool(
                 run_configuration.threshold.mask_saturation)
+            # O-1a-W1R-D2 (review §43.4): the worker consumes this exact object
+            # as an argument, so publishing the object IS the whole hand-off --
+            # the per-value mirror writes it used to need are gone.
             thread = getattr(wrangler, "thread", None)
             if thread is not None:
                 thread.run_configuration = run_configuration
-                thread.scan_args = run_configuration.scan_args()
-                thread.gi = bool(run_configuration.gi.enabled)
-                thread.incidence_motor = (
-                    run_configuration.gi.scan_incidence_motor)
-                thread.sample_orientation = int(
-                    run_configuration.gi.sample_orientation)
-                thread.tilt_angle = float(
-                    run_configuration.gi.tilt_angle)
-                thread.apply_threshold = bool(
-                    run_configuration.threshold.apply_threshold)
-                thread.threshold_min = (
-                    run_configuration.threshold.threshold_min)
-                thread.threshold_max = (
-                    run_configuration.threshold.threshold_max)
-                thread.mask_sentinel = bool(
-                    run_configuration.threshold.mask_saturation)
         return args
 
     def _controls_v2_config_save_veto(self) -> bool:
@@ -8853,7 +8859,9 @@ class staticWidget(QWidget):
         wrangler = getattr(self, "wrangler", None)
         if bool(getattr(wrangler, "live_mode", False)):
             return True
-        return bool(getattr(getattr(wrangler, "thread", None), "live_mode", False))
+        return bool(getattr(
+            _accepted_run_policy(getattr(wrangler, "thread", None)),
+            "live_mode", False))
 
     def _controls_v2_append_target_matches_displayed_scan(self) -> bool:
         wrangler = getattr(self, "wrangler", None)
@@ -13666,9 +13674,10 @@ class staticWidget(QWidget):
         are loaded here.
         """
         thread = getattr(getattr(self, "wrangler", None), "thread", None)
-        if thread is None or getattr(thread, "write_mode", None) != "Append":
+        if thread is None or getattr(
+                _accepted_run_policy(thread), "output_mode", None) != "Append":
             return 0
-        if getattr(thread, "xye_only", False):
+        if _accepted_run_option(thread, "xye_only"):
             return 0
         snapshot = getattr(thread, "_append_skip_snapshot", None)
         try:
@@ -14016,14 +14025,15 @@ class staticWidget(QWidget):
         # wipe the live caches (the multi-scan Eiger blank-plot fix).
         # Batch / XYE-only runs keep the original reload-on-new-file
         # behaviour — their final refresh reads frames from disk.
-        live = not getattr(self.wrangler.thread, 'batch_mode', False)
+        live = not getattr(
+            _accepted_run_policy(self.wrangler.thread), 'batch_mode', False)
         self.h5viewer.live_run_active = live
         self.h5viewer.file_thread.live_run = live
         # Int 1D (XYE) writes only .xye files (no .nxs); tell the file thread
         # not to try loading a .nxs that will never exist.  Cleared in
         # wrangler_finished so a later normal open still loads from disk.
-        self.h5viewer.file_thread.no_nxs = getattr(
-            self.wrangler.thread, 'xye_only', False)
+        self.h5viewer.file_thread.no_nxs = _accepted_run_option(
+            self.wrangler.thread, 'xye_only')
 
         # Mark the run active through the single run-state owner (task #68):
         # the 2D panels keep their last-rendered content (instead of blanking)
@@ -14227,8 +14237,8 @@ class staticWidget(QWidget):
 
         # Auto-load the final file generated from the batch if applicable
         thread = self.wrangler.thread
-        is_batch = getattr(thread, 'batch_mode', False)
-        is_xye_only = getattr(thread, 'xye_only', False)
+        is_batch = getattr(_accepted_run_policy(thread), 'batch_mode', False)
+        is_xye_only = _accepted_run_option(thread, 'xye_only')
 
         processed_count = None
         for attr in ("files_processed", "_files_processed",
@@ -14247,7 +14257,8 @@ class staticWidget(QWidget):
         except (TypeError, ValueError):
             append_skipped = 0
         all_skipped_append = (
-            getattr(thread, "write_mode", None) == 'Append'
+            getattr(_accepted_run_policy(thread), "output_mode", None)
+            == 'Append'
             and processed_count == 0
             and append_skipped > 0
         )
@@ -14528,7 +14539,6 @@ class staticWidget(QWidget):
         thread = getattr(wrangler, "thread", None)
         if thread is not None:
             thread.source_run_plan = None
-            thread.source_spec = None
             thread.source_index_session = None
             thread.source_frame_count_snapshot = {}
             thread.source_pending_count = 0

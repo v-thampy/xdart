@@ -958,9 +958,6 @@ class imageWrangler(wranglerWidget):
             self.scan.skip_2d = ('1D' in mode_text) and ('2D' not in mode_text)
 
         # Sync to thread
-        self.thread.batch_mode = self.batch_mode
-        self.thread.xye_only = self.xye_only
-        self.thread.live_mode = self.live_mode
 
         # Gray out integration controls in viewer mode
         self._set_integration_controls_enabled(not is_viewer)
@@ -1340,9 +1337,6 @@ class imageWrangler(wranglerWidget):
             if button is not None and hasattr(button, "setChecked"):
                 button.setChecked(str(mode) == "Overwrite")
         self.write_mode = mode
-        thread = getattr(self, "thread", None)
-        if thread is not None:
-            thread.write_mode = mode
 
     def _confirm_or_cancel_append_mismatch(self):
         check, processed, current = imageWrangler._append_config_mismatch_details(
@@ -1485,16 +1479,13 @@ class imageWrangler(wranglerWidget):
         self.sigUpdateGI.emit(self.gi)
 
         # Processing mode flags and parallel cores
-        self.thread.live_mode = self.live_mode
-        self.thread.batch_mode = self.batch_mode
-        self.thread.xye_only = self.xye_only
-        self.thread.max_cores = self.ui.maxCoresSpinBox.value()
-        self.scan.max_cores = self.thread.max_cores  # used by scan_threads
+        # Parallelism is frozen run policy; the display scan keeps its own copy
+        # for scan_threads (a GUI consumer, not the run).
+        self.scan.max_cores = self.ui.maxCoresSpinBox.value()
 
         self.thread.command = self.command
 
         self.thread.file_lock = self.file_lock
-        self.thread.scan_args = self.scan_args
 
         self.thread.scan = self.scan
 
@@ -1666,6 +1657,16 @@ class imageWrangler(wranglerWidget):
             return False
         return True
 
+    def _authoritative_source_mode(self):
+        """The source MODE the Source card selects (review §42.2).
+
+        ``self.inp_type`` is display/compatibility state and may not decide which
+        source leg runs.  There is deliberately no fallback to it: a host that
+        exercises these paths provides the card production reads.
+        """
+        return str(
+            self.parameters.child('Signal').child('inp_type').value() or '')
+
     def _authoritative_source_selected(self):
         """Whether the CURRENT selection names a usable source.
 
@@ -1681,8 +1682,7 @@ class imageWrangler(wranglerWidget):
         # Branching on the mutable ``self.inp_type`` mirror let a poisoned mode
         # send the gate to the Directory leg, whose any-nonblank-string rule is
         # the weaker one.
-        mode = str(signal.child('inp_type').value() or '')
-        if mode == 'Image Directory':
+        if imageWrangler._authoritative_source_mode(self) == 'Image Directory':
             root = str(signal.child('img_dir').value() or '').strip()
             # A nonexistent directory is not a source.  An EMPTY but existing
             # directory stays legitimate: the worker discovers candidates after
@@ -1963,7 +1963,6 @@ class imageWrangler(wranglerWidget):
         records live_mode (``_on_mode_changed``, connected first, already does;
         resync defensively)."""
         self.live_mode = bool(checked)
-        self.thread.live_mode = bool(checked)
 
     def stop(self):
         self.command = 'stop'
@@ -1981,7 +1980,6 @@ class imageWrangler(wranglerWidget):
             self.ui.liveCheckBox.setChecked(False)
             self.ui.liveCheckBox.blockSignals(False)
         self.live_mode = False
-        self.thread.live_mode = False
 
     def _browse_dir(self, current: str = '') -> str:
         """Start directory for the file dialogs: the LAST successful pick --
@@ -2317,7 +2315,12 @@ class imageWrangler(wranglerWidget):
         """Sets file name based on chosen options
         """
         old_fname = self.img_file
-        if self.inp_type != 'Image Directory':
+        # O-1a-W1R-D2 (review §42.2): read the source MODE from the authoritative
+        # Source card, not the mutable ``self.inp_type`` mirror.  A stale mirror
+        # sent a real Image-Series selection down the Directory leg, which clears
+        # the runtime cursor.  Preventive authority cleanup: admission already
+        # consults the card independently.
+        if imageWrangler._authoritative_source_mode(self) != 'Image Directory':
             img_file = self.parameters.child('Signal').child('File').value()
             if os.path.exists(img_file):
                 self.img_file = img_file

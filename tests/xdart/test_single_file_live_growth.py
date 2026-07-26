@@ -32,6 +32,11 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from tests.xdart._accepted_run import (  # noqa: E402
+    accepted_run,
+    container_source,
+    directory_source,
+)
 from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
     imageThread,
 )
@@ -92,17 +97,12 @@ def _worker(path, *, live=True, batch=False):
     attribute set run() resets), driving the real production reader."""
     w = imageThread.__new__(imageThread)
     w.img_file = str(path)
-    w.img_ext = "nxs"
-    w.inp_type = "Image File"
-    w.single_img = False
-    w.live_mode = live
-    w.batch_mode = batch
     w.command = ""
-    w.write_mode = "Add"
-    w.xye_only = False
-    w.series_average = False
-    w.meta_ext = None
     w.meta_dir = None
+    # O-1a-W1R-D2: the reader takes the accepted configuration as an argument.
+    w.run_configuration = w._admitted_run_configuration = accepted_run(
+        live_mode=live, batch_mode=batch,
+        source_spec=container_source(path))
     w.FRAME_READ_DEADLINE = 1.0        # bound the tolerant-read wait for tests
     w._eiger_master_path = None
     w._eiger_frame_idx = 0
@@ -135,7 +135,7 @@ def _drain(worker, limit=32):
     """Pull sync frames until the end-of-stream sentinel; return img numbers."""
     numbers = []
     for _ in range(limit):
-        _path, _scan, number, data, _meta = worker._get_next_eiger_frame_sync()
+        _path, _scan, number, data, _meta = worker._get_next_eiger_frame_sync(worker.run_configuration)
         if data is None:
             return numbers
         numbers.append(number)
@@ -223,7 +223,7 @@ def test_single_file_stop_while_provisional_joins_clean(tmp_path, monkeypatch):
     worker = _worker(path)
 
     t0 = time.monotonic()
-    _p, _s, _n, data, _m = worker._get_next_eiger_frame()   # real prefetcher
+    _p, _s, _n, data, _m = worker._get_next_eiger_frame(worker.run_configuration)   # real prefetcher
     assert data is None
     # The provisional path itself must leave NO open cursor behind — asserted
     # BEFORE any test-side cleanup (the close-on-wait production invariant).
@@ -305,8 +305,8 @@ def test_single_file_growth_while_cursor_open_uses_grown_arm(tmp_path):
     outcomes = []
     real_outcome = worker._eiger_single_file_growth_outcome
 
-    def spying_outcome():
-        out = real_outcome()
+    def spying_outcome(frozen):
+        out = real_outcome(frozen)
         outcomes.append(out)
         return out
 
@@ -314,7 +314,7 @@ def test_single_file_growth_while_cursor_open_uses_grown_arm(tmp_path):
 
     got = []
     for _ in range(3):                           # consume the initial segment
-        _p, _s, num, data, _m = worker._get_next_eiger_frame_sync()
+        _p, _s, num, data, _m = worker._get_next_eiger_frame_sync(worker.run_configuration)
         assert data is not None
         got.append(num)
     assert got == [1, 2, 3]
@@ -323,7 +323,7 @@ def test_single_file_growth_while_cursor_open_uses_grown_arm(tmp_path):
     _append_frames_subprocess(path, 5)           # tail lands while it is open
 
     for _ in range(2):
-        _p, _s, num, data, _m = worker._get_next_eiger_frame_sync()
+        _p, _s, num, data, _m = worker._get_next_eiger_frame_sync(worker.run_configuration)
         assert data is not None, "the grown tail must be read, not sentineled"
         got.append(num)
     assert got == [1, 2, 3, 4, 5]
@@ -357,7 +357,7 @@ def test_fabio_master_catchup_stays_provisional(tmp_path):
     worker = _worker(master)
     worker.img_ext = "h5"
 
-    _p, _s, num, data, _m = worker._get_next_eiger_frame_sync()
+    _p, _s, num, data, _m = worker._get_next_eiger_frame_sync(worker.run_configuration)
     assert data is not None and num == 1
     assert worker._eiger_fabio_handle is not None, \
         "precondition: fabio must own this master (else the test is moot)"
@@ -366,7 +366,7 @@ def test_fabio_master_catchup_stays_provisional(tmp_path):
     assert got == [1, 2, 3]
     assert not getattr(worker, "_eiger_single_file_done", False), \
         "a live fabio catch-up must stay provisional, never latch done"
-    assert worker._eiger_single_file_watchable(), \
+    assert worker._eiger_single_file_watchable(worker.run_configuration), \
         "the watch gate must keep polling a caught-up live fabio master"
 
     with h5py.File(t2, "w") as f:                # segment 2 lands
@@ -392,7 +392,7 @@ def test_watch_gate_facts_from_production_reader_states(tmp_path):
     _nxwriter_shell(shell)
     w1 = _worker(shell)
     assert _drain(w1) == []
-    assert w1._eiger_single_file_watchable(), \
+    assert w1._eiger_single_file_watchable(w1.run_configuration), \
         "a nascent shell must keep the live watch alive (NXS-SF-2)"
 
     # created-but-EMPTY detector dataset, unfinalized -> watchable
@@ -406,7 +406,7 @@ def test_watch_gate_facts_from_production_reader_states(tmp_path):
                            chunks=(1, 8, 8), dtype=np.uint16)
     w2 = _worker(empty)
     assert _drain(w2) == []
-    assert w2._eiger_single_file_watchable(), \
+    assert w2._eiger_single_file_watchable(w2.run_configuration), \
         "an unfinalized zero-frame detector dataset is provisional, not done"
 
     # plain finalized, fully consumed -> NOT watchable (fixed point)
@@ -415,7 +415,7 @@ def test_watch_gate_facts_from_production_reader_states(tmp_path):
     w3 = _worker(done)
     assert _drain(w3) == [1, 2]
     assert _drain(w3) == []
-    assert not w3._eiger_single_file_watchable(), \
+    assert not w3._eiger_single_file_watchable(w3.run_configuration), \
         "a finalized consumed file must not watch (fixed point)"
 
 
@@ -475,7 +475,7 @@ def test_single_file_initial_denial_keeps_watch_gate_armed(tmp_path, monkeypatch
     monkeypatch.setattr(ContainerCursor, "open", denying_first_open)
     assert _drain(worker) == []
     assert worker._eiger_open_state == "not ready"
-    assert worker._eiger_single_file_watchable(), \
+    assert worker._eiger_single_file_watchable(worker.run_configuration), \
         "the Phase-3 watch gate must survive an initial sharing denial"
 
     _nxwriter_frames(path, 3)

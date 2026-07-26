@@ -1,3 +1,7 @@
+from tests.xdart._accepted_run import (  # noqa: E402
+    accepted_run,
+    container_source,
+)
 """MEM-2 wiring — the RAM-aware window feeds all three live heavy caps.
 
 The pure ``heavy_window`` math is covered in ``tests/core/test_heavy_window.py``;
@@ -90,7 +94,7 @@ def test_streaming_session_reuse_does_not_repeat_worker_cap_log(monkeypatch, cap
     sink = object()
     worker = imageThread.__new__(imageThread)
     worker.detector_shape = (2167, 2070)
-    worker.max_cores = 8
+    worker.run_configuration = accepted_run(max_cores=8)
     worker._streaming_session = session
     worker._streaming_sink = sink
     worker._streaming_scan_id = id(scan)
@@ -100,7 +104,7 @@ def test_streaming_session_reuse_does_not_repeat_worker_cap_log(monkeypatch, cap
         logging.DEBUG,
         logger="xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread",
     ):
-        assert imageThread._get_streaming_session(worker, scan, []) == (session, sink)
+        assert imageThread._get_streaming_session(worker, worker.run_configuration, scan, []) == (session, sink)
 
     messages = [record.getMessage() for record in caplog.records]
     assert not any("reduction workers:" in msg for msg in messages)

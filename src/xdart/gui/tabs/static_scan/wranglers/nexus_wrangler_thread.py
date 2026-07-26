@@ -68,8 +68,6 @@ from xdart.modules.reduction import (
     sync_live_scan_gi_settings,
 )
 from .wrangler_widget import (
-    frozen_run_policy,
-    install_frozen_run_projections,
     wranglerThread,
 )
 
@@ -128,11 +126,6 @@ class nexusThread(wranglerThread):
 
         self.nexus_file = nexus_file
         self.poni = poni
-        self.mask_file = mask_file
-        self.gi = gi
-        self.incidence_motor = th_mtr
-        self.sample_orientation = sample_orientation
-        self.tilt_angle = tilt_angle
         self.gi_mode_1d = gi_mode_1d
         self.gi_mode_2d = gi_mode_2d
         self.command = command
@@ -150,19 +143,16 @@ class nexusThread(wranglerThread):
         # auto-reloads the generated file and selects the last frame
         # once processing is done. Without these, the display is left
         # showing stale state from before the run.
-        self.batch_mode = True
-        self.xye_only = False
         # Settable from outside (e.g. before .start()) when the GUI
         # eventually exposes a Cores spinbox for the NeXus wrangler.
-        self.max_cores = _DEFAULT_MAX_CORES
         # C1: cached standard ReductionPlan, rebuilt only when scan
         # settings change.  Lives on the thread so it survives across
         # chunks within a single run.
         self._plan_cache = StandardPlanCache()
 
-    def _final_save_to_nexus(self, scan, files_processed):
+    def _final_save_to_nexus(self, frozen, scan, files_processed):
         """Persist the final NeXus tail with writer-lock-before-pool-pause."""
-        if files_processed <= 0 or self.xye_only:
+        if files_processed <= 0 or frozen.run_options.get("xye_only", False):
             return
         is_finalize = (self.command != 'stop')
         with self.file_lock:
@@ -201,27 +191,9 @@ class nexusThread(wranglerThread):
             floor=int(getattr(self, "run_configuration_floor", 0) or 0),
             expected=getattr(self, "_admitted_run_configuration", None),
         )
-        # Capture the qualified reference ONCE (§39.5 Phase 2 item 1): every
-        # projection reads it from here on, so a later reassignment of the
-        # carrier cannot re-decide this run's policy.
-        self._qualified_run_configuration = frozen
         return frozen
 
-    def _frozen_run_policy(self, stage):
-        """The accepted configuration for a read INSIDE an already-gated run.
-
-        Presence and type only: identity was qualified once at worker entry
-        (§39.5 Phase 2 item 1).  Absence is still the typed refusal -- there is
-        no fall back to display state.
-        """
-
-        frozen = frozen_run_policy(self)
-        if frozen is None:
-            return require_run_configuration(
-                getattr(self, "run_configuration", None), stage=stage)
-        return frozen
-
-    def _project_gi_modes_onto_display_scan(self):
+    def _project_gi_modes_onto_display_scan(self, frozen):
         """Backward GI-mode write onto the mutable DISPLAY scan (retained).
 
         The twin of ``imageThread._project_gi_modes_onto_display_scan``: an
@@ -229,8 +201,6 @@ class nexusThread(wranglerThread):
         frozen configuration, so this can never change what the run integrates.
         """
 
-        frozen = nexusThread._frozen_run_policy(
-            self, "nexus-gi-projection")
         if not frozen.gi.enabled or self.scan is None:
             return
         self.scan.bai_1d_args['gi_mode_1d'] = frozen.gi.mode_1d
@@ -242,7 +212,8 @@ class nexusThread(wranglerThread):
         # reduction session — a worker without the accepted configuration does
         # nothing at all.
         try:
-            nexusThread._require_run_configuration(self, "nexus-worker-run")
+            frozen = nexusThread._require_run_configuration(
+                self, "nexus-worker-run")
         except RunConfigurationRefused as exc:
             logger.error("run refused: %s", exc)
             self.command = 'stop'
@@ -253,17 +224,17 @@ class nexusThread(wranglerThread):
             return
         self._reset_xye_output_notifications()
         try:
-            self._run_impl()
+            self._run_impl(frozen)
         finally:
             self._close_reduction_session()
 
-    def _run_impl(self):
+    def _run_impl(self, frozen):
         """Read frames from a NeXus file and integrate them in parallel."""
+        xye_only = frozen.run_options.get("xye_only", False)
         t0 = time.time()
         # O-1a-W1R (review §39.5 Phase 2 item 1): capture the accepted frozen
         # reference ONCE at worker entry.  Identity was gated in ``run()``; this
         # is the object every execution decision below consumes.
-        _frozen = nexusThread._frozen_run_policy(self, "nexus-run-impl")
         if self.poni is None or not self.nexus_file:
             return
 
@@ -271,13 +242,13 @@ class nexusThread(wranglerThread):
         self.detector = (get_detector(self.poni.detector)
                          if self.poni.detector else None)
         det_mask = self.detector.mask if self.detector is not None else None
-        if self.mask_file and os.path.exists(self.mask_file):
-            custom_mask = np.asarray(read_image(self.mask_file), dtype=bool)
+        if frozen.mask_file and os.path.exists(frozen.mask_file):
+            custom_mask = np.asarray(read_image(frozen.mask_file), dtype=bool)
             det_mask = (det_mask | custom_mask if det_mask is not None
                         else custom_mask)
         self.mask = np.flatnonzero(det_mask) if det_mask is not None else None
 
-        nexusThread._project_gi_modes_onto_display_scan(self)
+        nexusThread._project_gi_modes_onto_display_scan(self, frozen)
 
         # Read scan-level metadata once (counters/angles per-frame
         # arrays).  Per-frame slicing happens later.
@@ -303,7 +274,7 @@ class nexusThread(wranglerThread):
         # Notify the GUI that a new scan is being processed.
         self.sigUpdateFile.emit(
             scan_name, self.fname,
-            self.gi, self.incidence_motor,
+            frozen.gi.enabled, frozen.gi.scan_incidence_motor,
             False, False,  # single_img=False, series_average=False
         )
 
@@ -345,16 +316,16 @@ class nexusThread(wranglerThread):
             # isn't enforced).  Cheap: one frame read + a flatten.
             if getattr(scan, '_cached_data_mask', None) is None:
                 first_frame = np.asarray(ds[0], dtype=np.float32)
-                self._prewarm_frame_mask(scan, first_frame)
+                self._prewarm_frame_mask(frozen, scan, first_frame)
 
-            n_workers = min(self.max_cores, nframes)
+            n_workers = min(frozen.max_cores, nframes)
             # C1: cached per-scan plan — rebuilt only when scan
             # integration settings or mask change between chunks.
             sync_live_scan_gi_settings(
                 scan,
-                incidence_motor=self.incidence_motor,
-                sample_orientation=self.sample_orientation,
-                tilt_angle=self.tilt_angle,
+                incidence_motor=frozen.gi.scan_incidence_motor,
+                sample_orientation=frozen.gi.sample_orientation,
+                tilt_angle=frozen.gi.tilt_angle,
             )
             standard_plan = self._plan_cache.get(
                 # O-1a-W1R (review §39.2 W1R-P1-6): this 2D-integration
@@ -382,7 +353,7 @@ class nexusThread(wranglerThread):
                 frames = []
                 for i, frame_idx in enumerate(range(chunk_start, chunk_end)):
                     frames.append(self._build_frame(
-                        scan,
+                        frozen, scan,
                         frame_idx,
                         block[i],
                         self._frame_meta(scan_meta, base_meta, frame_idx),
@@ -408,7 +379,7 @@ class nexusThread(wranglerThread):
                             executor=executor,
                             cancel_token=self._cancel_token(),
                             chunk_size=len(frames) if frames else 1,
-                            gi_freeze_mode="scout_union" if self.gi else None,
+                            gi_freeze_mode="scout_union" if frozen.gi.enabled else None,
                         ),
                     )
                 except GIFreezeError as exc:
@@ -433,7 +404,7 @@ class nexusThread(wranglerThread):
                     session=session,
                     cancel_token=self._cancel_token(),
                     chunk_size=len(frames) if frames else 1,
-                    gi_freeze_mode="scout_union" if self.gi else None,
+                    gi_freeze_mode="scout_union" if frozen.gi.enabled else None,
                 )
                 _t_phase1 = time.time() - _t_phase1
 
@@ -450,7 +421,7 @@ class nexusThread(wranglerThread):
                 for frame in frames:
                     if frame is None:
                         continue
-                    self._publish(scan, frame)
+                    self._publish(frozen, scan, frame)
                     self.sigUpdate.emit(frame.idx)
                     files_processed += 1
                     frames_since_save += 1
@@ -486,7 +457,7 @@ class nexusThread(wranglerThread):
                 # under xye_only, but we short-circuit here too so
                 # the chunk loop reads clean).
                 _due = frames_since_save >= self.LIVE_SAVE_INTERVAL
-                if not _due and not self.xye_only and frames_since_save > 0:
+                if not _due and not xye_only and frames_since_save > 0:
                     # Cap-aware bound (mirrors imageThread._save_due): the
                     # 1D interval is 1000, but stash() cannot evict unsaved
                     # frames -- without this, up to 1000 frames each pinning
@@ -497,8 +468,8 @@ class nexusThread(wranglerThread):
                     _unsaved = (_counter() if callable(_counter)
                                 else frames_since_save)
                     _due = _unsaved >= max(1, _cap - 8)
-                if not self.xye_only and _due:
-                    self._save_to_disk(scan)
+                if not xye_only and _due:
+                    self._save_to_disk(frozen, scan)
                     frames_since_save = 0
 
         # Final save: write everything coherent + provenance + finalize.
@@ -518,7 +489,7 @@ class nexusThread(wranglerThread):
         # ``scan.save_to_nexus`` also takes this same reentrant lock internally;
         # the outer hold is the ordering guard that prevents pause/close from
         # racing a load worker that borrowed a pooled read handle under file_lock.
-        self._final_save_to_nexus(scan, files_processed)
+        self._final_save_to_nexus(frozen, scan, files_processed)
 
         self.showLabel.emit(f'Done — {files_processed} frames processed')
         logger.info(
@@ -581,15 +552,15 @@ class nexusThread(wranglerThread):
             )
         return meta
 
-    def _build_frame(self, scan, frame_idx, img_data, img_meta):
+    def _build_frame(self, frozen, scan, frame_idx, img_data, img_meta):
         """Build a LiveFrame shell for the headless reducer."""
-        frame_mask = self._resolve_frame_mask(scan, img_data)
+        frame_mask = self._resolve_frame_mask(frozen, scan, img_data)
         frame = LiveFrame(
             frame_idx, img_data, poni=self.poni,
-            scan_info=img_meta, static=True, gi=self.gi,
-            th_mtr=self.incidence_motor,
-            sample_orientation=self.sample_orientation,
-            tilt_angle=self.tilt_angle,
+            scan_info=img_meta, static=True, gi=frozen.gi.enabled,
+            th_mtr=frozen.gi.scan_incidence_motor,
+            sample_orientation=frozen.gi.sample_orientation,
+            tilt_angle=frozen.gi.tilt_angle,
             series_average=False,
             integrator=scan._cached_integrator,
             mask=frame_mask,
@@ -609,7 +580,7 @@ class nexusThread(wranglerThread):
 
         return frame
 
-    def _publish(self, scan, frame):
+    def _publish(self, frozen, scan, frame):
         """Push the integrated frame into scan + the publish slot.
 
         Runs on the main thread after the parallel section so
@@ -627,11 +598,11 @@ class nexusThread(wranglerThread):
         # are gated off in this mode, so mark_persisted never runs and
         # stash() could never evict — every frame's raw (a view pinning the
         # whole bulk read chunk) accumulated for the entire run.
-        if not self.xye_only:
+        if not frozen.run_options.get("xye_only", False):
             scan.add_frame(
                 frame=frame, calculate=False, update=True,
-                get_sd=True, set_mg=False, static=True, gi=self.gi,
-                th_mtr=self.incidence_motor, series_average=False,
+                get_sd=True, set_mg=False, static=True, gi=frozen.gi.enabled,
+                th_mtr=frozen.gi.scan_incidence_motor, series_average=False,
                 batch_save=True,
             )
         # Publish for the GUI's update_data slot to consume.  Single
@@ -644,15 +615,3 @@ class nexusThread(wranglerThread):
     # kills the process mid-scan.
 
 
-# ── O-1a-W1R Phase 2: frozen policy is the SOLE execution input ─────────────
-#
-# The NeXus worker's half of the same contract.  Its own source membership comes
-# from the NeXus file it was handed, so the source-family projections do not
-# apply here; every scientific-policy and mode carrier it consumes does.
-install_frozen_run_projections(nexusThread, (
-    "apply_threshold", "threshold_min", "threshold_max", "mask_sentinel",
-    "mask_file",
-    "gi", "incidence_motor", "sample_orientation", "tilt_angle",
-    "max_cores", "xye_only",
-    "scan_args",
-))

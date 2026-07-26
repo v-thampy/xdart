@@ -200,8 +200,6 @@ from xdart.modules.reduction import (
 )
 from .qt_nexus_sink import QtNexusSink
 from .wrangler_widget import (
-    frozen_run_policy,
-    install_frozen_run_projections,
     wranglerThread,
 )
 
@@ -660,7 +658,6 @@ class imageThread(wranglerThread):
 
         super().__init__(command_queue, scan_args, fname, file_lock, parent)
 
-        self.h5_dir = h5_dir
         # Pause: the LiveScan currently being processed (a local in
         # process_scan), stashed so _enter_pause's serial branch can flush it.
         self._active_scan = None
@@ -668,7 +665,6 @@ class imageThread(wranglerThread):
         # setup() (None -> absolute raw paths, back-compat).
         self.source_base = None
         self.scan_name = scan_name
-        self.single_img = single_img
         self.poni = poni
         # GENERIC-DETECTOR FIX: when a Run adopts a loaded processed scan's
         # geometry (image_wrangler._adopt_loaded_scan_run_inputs), the wrangler
@@ -679,21 +675,12 @@ class imageThread(wranglerThread):
         self._adopted_poni = None
         self._adopted_integrator = None
         self._adopted_fiber_integrator = None
-        self.inp_type = inp_type
         self.img_file = img_file
-        self.img_dir = img_dir
-        self.include_subdir = include_subdir
-        self.img_ext = img_ext
-        self.series_average = series_average
-        self.meta_ext = meta_ext
         # Optional explicit SPEC search dir.  Set by the wrangler
         # widget (set_meta_dir / setup) — None / '' falls back to
         # the xrd_tools default heuristic.  Threaded through
         # to every read_image_metadata call below.
         self.meta_dir = None
-        self.file_filter = file_filter
-        self.mask_file = mask_file
-        self.write_mode = write_mode
         self.bg_type = bg_type
         self.bg_file = bg_file
         self.bg_dir = bg_dir
@@ -702,19 +689,13 @@ class imageThread(wranglerThread):
         self.bg_file_filter = bg_file_filter
         self.bg_scale = bg_scale
         self.bg_norm_channel = bg_norm_channel
-        self.gi = gi
-        self.incidence_motor = th_mtr
-        self.sample_orientation = sample_orientation
-        self.tilt_angle = tilt_angle
         self.gi_mode_1d = gi_mode_1d
         self.gi_mode_2d = gi_mode_2d
-        self.live_mode = live_mode
         # batch_mode / xye_only / apply_threshold / threshold_min /
         # threshold_max / sub_label / _xye_buffer / _xye_lock /
         # _frames_since_save / _published_frames are all initialised
         # by the wranglerThread base class — see wrangler_widget.py.
         # imageThread only needs to set the spec-specific extras here.
-        self.max_cores = max_cores
         self.command = command
         # The mutable DISPLAY scan.  Retained ONLY as the target of the backward
         # GI-mode acquisition projection (``_project_gi_modes_onto_display_scan``);
@@ -730,7 +711,6 @@ class imageThread(wranglerThread):
         # Both are value/headless boundaries; the mutable DirectoryIndex stays
         # owned by DirectoryIndexSession's serialized executor.
         self.source_run_plan = None
-        self.source_spec = None
         self.source_index_session = None
         # Value-only copy of the Source card's stamp-qualified lazy frame-count
         # memo.  It lets Append retire a fully complete container without
@@ -830,29 +810,9 @@ class imageThread(wranglerThread):
             floor=int(getattr(self, "run_configuration_floor", 0) or 0),
             expected=getattr(self, "_admitted_run_configuration", None),
         )
-        # Capture the qualified reference ONCE (§39.5 Phase 2 item 1): every
-        # projection reads it from here on, so a later reassignment of the
-        # carrier cannot re-decide this run's policy.
-        self._qualified_run_configuration = frozen
         return frozen
 
-    def _frozen_run_policy(self, stage):
-        """The accepted configuration for a read INSIDE an already-gated run.
-
-        Presence and type only: run IDENTITY is qualified ONCE at worker entry
-        (review §39.5 Phase 2 item 1), so repeating the identity comparison at
-        every internal read would make the gate's location unknowable.  Absence
-        remains the typed refusal -- there is never a fall back to the mutable
-        display scan or a panel-derived mirror.
-        """
-
-        frozen = frozen_run_policy(self)
-        if frozen is None:
-            return require_run_configuration(
-                getattr(self, "run_configuration", None), stage=stage)
-        return frozen
-
-    def _project_gi_modes_onto_display_scan(self):
+    def _project_gi_modes_onto_display_scan(self, frozen):
         """Backward GI-mode write onto the mutable DISPLAY scan (retained).
 
         This is an acquisition/display projection ONLY: the browser's scan shows
@@ -862,7 +822,7 @@ class imageThread(wranglerThread):
         the written provenance (W-1.2 case 11).
         """
 
-        if not self.gi or self.scan is None:
+        if not frozen.gi.enabled or self.scan is None:
             return
         self.scan.bai_1d_args['gi_mode_1d'] = self.gi_mode_1d
         self.scan.bai_2d_args['gi_mode_2d'] = self.gi_mode_2d
@@ -879,7 +839,8 @@ class imageThread(wranglerThread):
         # output open, no cache clear and no reduction -- it returns, and the
         # ordinary finish delivery unwinds the run state.
         try:
-            imageThread._require_run_configuration(self, "image-worker-run")
+            frozen = imageThread._require_run_configuration(
+                self, "image-worker-run")
         except RunConfigurationRefused as exc:
             logger.error("run refused: %s", exc)
             self.command = 'stop'
@@ -890,7 +851,7 @@ class imageThread(wranglerThread):
             return
         if (self.poni is None
                 or (self.img_file == ''
-                    and not self._directory_source_armed())):
+                    and not self._directory_source_armed(frozen))):
             return
 
         # This must be the FIRST stateful operation of a new Run.  A prior
@@ -989,9 +950,9 @@ class imageThread(wranglerThread):
         self.detector = get_detector(self.poni.detector) if self.poni.detector else None
         self.sub_label = ''
         det_mask = self.detector.mask if self.detector is not None else None  # pyFAI .mask property
-        if self.mask_file and os.path.exists(self.mask_file):
+        if frozen.mask_file and os.path.exists(frozen.mask_file):
             try:
-                custom_mask = np.asarray(read_image(self.mask_file), dtype=bool)
+                custom_mask = np.asarray(read_image(frozen.mask_file), dtype=bool)
                 # Validate the Mask File against the detector FRAME shape: the
                 # built-in mask shape, or (for detectors with no built-in mask,
                 # e.g. RayonixMx225) the geometry shape.  A shape mismatch can't
@@ -1014,7 +975,7 @@ class imageThread(wranglerThread):
                 else:
                     det_mask = det_mask | custom_mask if det_mask is not None else custom_mask
             except Exception as e:
-                logger.warning('Could not load mask file %s: %s', self.mask_file, e)
+                logger.warning('Could not load mask file %s: %s', frozen.mask_file, e)
         self.mask = np.flatnonzero(det_mask) if det_mask is not None else None
         # The full-res raw frame shape (H, W) the flat mask indices index into —
         # carried onto the scan + persisted so a reloaded thumbnail-only scan can
@@ -1032,10 +993,10 @@ class imageThread(wranglerThread):
             self.detector_shape = None
         self._cached_gi_incident_angle = None
 
-        imageThread._project_gi_modes_onto_display_scan(self)
+        imageThread._project_gi_modes_onto_display_scan(self, frozen)
 
         try:
-            self.process_scan()
+            self.process_scan(frozen)
         except AppendConfigMismatchError as exc:
             # Backstop: process_scan handles this at its initialize_scan call
             # sites; nothing may escape run() as an unhandled QThread
@@ -1099,10 +1060,10 @@ class imageThread(wranglerThread):
         # Trailing newline gives a visual gap before the next scan's
         # 'New Scan' banner (or before the next prompt if this was the
         # last scan in the session).
-        if self.xye_only:
+        if frozen.run_options.get("xye_only", False):
             # Int 1D (XYE) writes only .xye files (no .nxs) into <dir>/<scan>.
             logger.info('Output (XYE) folder: %s\n',
-                        os.path.join(self.h5_dir, self.scan_name))
+                        os.path.join(frozen.save_path, self.scan_name))
         else:
             # THIS run's own output path (``initialize_scan`` set it).  The old
             # display-scan fallback is deleted: the browser's scan may point at a
@@ -1143,14 +1104,14 @@ class imageThread(wranglerThread):
             scan._cached_fiber_integrator = None
         scan._cached_poni = self.poni
 
-    def _append_skip_enabled(self):
-        return (getattr(self, "write_mode", None) == 'Append'
-                and not getattr(self, "xye_only", False))
+    def _append_skip_enabled(self, frozen):
+        return (frozen.output_mode == 'Append'
+                and not frozen.run_options.get("xye_only", False))
 
-    def _append_output_number(self, img_number):
+    def _append_output_number(self, frozen, img_number):
         if (
-            getattr(self, "series_average", False)
-            and getattr(self, "inp_type", None) != "Image Directory"
+            frozen.run_options.get("series_average", False)
+            and frozen.source.family != "directory"
         ):
             return 1
         return 1 if img_number is None else img_number
@@ -1196,8 +1157,8 @@ class imageThread(wranglerThread):
             out_path, exc,
         )
 
-    def _remember_append_skip_snapshot(self, scan_name, frame_index=None, *, scan=None):
-        if not self._append_skip_enabled() or scan_name is None:
+    def _remember_append_skip_snapshot(self, frozen, scan_name, frame_index=None, *, scan=None):
+        if not self._append_skip_enabled(frozen) or scan_name is None:
             return
         cache = getattr(self, "_append_skip_frames_by_scan", None)
         if cache is None:
@@ -1215,16 +1176,16 @@ class imageThread(wranglerThread):
                         if scan is not None
                         else set(frame_index or ()))
         except Exception as exc:
-            out_path = self._append_output_path(scan_name)
+            out_path = self._append_output_path(frozen, scan_name)
             self._warn_append_snapshot_failed(scan_name, out_path, exc)
             existing = set()
         cache[key] = existing
 
-    def _append_output_path(self, scan_name):
-        return os.path.join(getattr(self, "h5_dir", ""), str(scan_name) + '.nxs')
+    def _append_output_path(self, frozen, scan_name):
+        return os.path.join(frozen.save_path, str(scan_name) + '.nxs')
 
-    def _append_run_start_scan_names(self):
-        if not self._append_skip_enabled():
+    def _append_run_start_scan_names(self, frozen):
+        if not self._append_skip_enabled(frozen):
             return []
 
         names = []
@@ -1239,43 +1200,35 @@ class imageThread(wranglerThread):
                 names.append(key)
 
         img_file = getattr(self, "img_file", None)
-        inp_type = getattr(self, "inp_type", None)
-        img_ext = (getattr(self, "img_ext", "") or "").lower().lstrip(".")
 
-        if inp_type == 'Image Directory':
+        if frozen.source.family == "directory":
             plan = getattr(self, "source_run_plan", None)
             if plan is not None:
                 for candidate in plan.candidates:
                     add(self._eiger_scan_name(candidate.path))
                 return names
-            img_dir = getattr(self, "img_dir", None)
+            img_dir = frozen.source.filesystem_root
             if not img_dir:
                 return names
-            match = _name_filter(getattr(self, "file_filter", ""))
+            match = _name_filter((frozen.source.name_filter or ""))
             root = Path(img_dir)
-            include_subdir = bool(getattr(self, "include_subdir", False))
-            if img_ext in ('h5', 'hdf5', 'nxs'):
-                # Self-contained masters — one output scan per file.  An Eiger
-                # master carries a '_master' infix; a Bluesky/NXWriter '.nxs'
-                # does not.  Mirror the read path's suffix rule exactly
-                # (_eiger_refill_master_queue) so the append-skip cursor matches
-                # the files the run actually discovers + the scan names it writes.
-                suffix = (f'_master.{img_ext}'
-                          if img_ext in ('h5', 'hdf5') else f'.{img_ext}')
+            include_subdir = bool(frozen.source.recursive)
+            # Self-contained masters get one output scan per file; plain images
+            # get the series name.  The frozen source carries the DISCOVERY
+            # spelling itself ('_master.h5' for an Eiger File Type, '.tif' for a
+            # plain one), so this no longer reconstructs the read path's suffix
+            # rule from an extension token -- and every alternative the freeze
+            # owner recorded is honored, not just the first.
+            container = imageThread._frozen_source_is_container(self, frozen)
+            for suffix in frozen.source.suffixes:
                 candidates = _paths_with_suffix(
                     root, suffix, recursive=include_subdir)
                 for path in natural_sort_ints([str(p) for p in candidates]):
                     p = Path(path)
-                    if match(p.name[:-len(suffix)]):
-                        add(self._eiger_scan_name(p))
-            elif img_ext:
-                suffix = f'.{img_ext}'
-                candidates = _paths_with_suffix(
-                    root, suffix, recursive=include_subdir)
-                for path in natural_sort_ints([str(p) for p in candidates]):
-                    p = Path(path)
-                    if match(p.name[:-len(suffix)]):
-                        add(_get_scan_info(p)[0])
+                    if not match(p.name[:-len(suffix)]):
+                        continue
+                    add(self._eiger_scan_name(p) if container
+                        else _get_scan_info(p)[0])
             return names
 
         if img_file:
@@ -1288,7 +1241,7 @@ class imageThread(wranglerThread):
             add(getattr(self, "scan_name", None))
         return names
 
-    def _load_append_skip_snapshot(self, scan_name):
+    def _load_append_skip_snapshot(self, frozen, scan_name):
         """Load one scan's append cursor, once, without hydrating a LiveScan.
 
         Normal directory runs call this lazily when the reader reaches a scan.
@@ -1297,7 +1250,7 @@ class imageThread(wranglerThread):
         A stamp-qualified value memo survives Stop -> Run on the same wrangler,
         so unchanged outputs need only one ``stat`` on subsequent runs.
         """
-        if not self._append_skip_enabled() or scan_name is None:
+        if not self._append_skip_enabled(frozen) or scan_name is None:
             return set()
         cache = getattr(self, "_append_skip_frames_by_scan", None)
         if cache is None:
@@ -1314,13 +1267,12 @@ class imageThread(wranglerThread):
         if getattr(self, "command", None) == "stop":
             return set()
 
-        out_path = self._append_output_path(key)
+        out_path = self._append_output_path(frozen, key)
         if not os.path.exists(out_path):
             cache[key] = set()
             source_cache[key] = None
             return cache[key]
 
-        frozen = imageThread._frozen_run_policy(self, "append-cursor")
         require_2d = not bool(frozen.skip_2d)
         memo = getattr(self, "_append_cursor_memo", None)
         if memo is None:
@@ -1381,7 +1333,7 @@ class imageThread(wranglerThread):
             current_config = processing_config_from_mapping(
                 frozen.processing_mapping())
             append_check = append_config_mismatch_check(
-                self.write_mode, processed_config, current_config)
+                frozen.output_mode, processed_config, current_config)
             if not append_check.ok:
                 raise self._append_config_mismatch_error(
                     out_path, append_check, processed_config, current_config)
@@ -1395,21 +1347,21 @@ class imageThread(wranglerThread):
         source_cache[key] = source_snapshot
         return cache[key]
 
-    def _prime_append_skip_snapshots_for_run(self):
+    def _prime_append_skip_snapshots_for_run(self, frozen):
         """Eagerly prime cursors for the series-average no-op safeguard only.
 
         Normal runs load one cursor lazily in ``_append_skip_snapshot``.  Keep
         this all-scan variant for series averaging, where an existing frame 1
         must refuse the run before any source frame is consumed.
         """
-        if not self._append_skip_enabled():
+        if not self._append_skip_enabled(frozen):
             return
-        for scan_name in self._append_run_start_scan_names():
+        for scan_name in self._append_run_start_scan_names(frozen):
             if getattr(self, "command", None) == "stop":
                 break
-            self._load_append_skip_snapshot(scan_name)
+            self._load_append_skip_snapshot(frozen, scan_name)
 
-    def _series_average_append_blocker(self):
+    def _series_average_append_blocker(self, frozen):
         """MEM-1c: refuse a silently-empty series-average Append run.
 
         ``_append_output_number`` collapses EVERY source frame of a series
@@ -1421,12 +1373,12 @@ class imageThread(wranglerThread):
         actionable reason so the run is refused loudly instead.  Returns the
         user-facing message, or ``None`` when the run may proceed.
         """
-        if not (getattr(self, "series_average", False)
-                and self._append_skip_enabled()):
+        if not (frozen.run_options.get("series_average", False)
+                and self._append_skip_enabled(frozen)):
             return None
-        collapsed = self._append_output_number(None)   # series-average => 1
-        for scan_name in self._append_run_start_scan_names():
-            if collapsed in self._append_skip_snapshot(scan_name):
+        collapsed = self._append_output_number(frozen, None)   # series-average => 1
+        for scan_name in self._append_run_start_scan_names(frozen):
+            if collapsed in self._append_skip_snapshot(frozen, scan_name):
                 return (
                     f"Averaged output already exists for '{scan_name}' — the "
                     "whole series would be skipped and nothing written.  "
@@ -1434,13 +1386,13 @@ class imageThread(wranglerThread):
                     "running a series average.")
         return None
 
-    def _append_skip_snapshot(self, scan_name):
+    def _append_skip_snapshot(self, frozen, scan_name):
         """Return this run's append-skip frame snapshot for *scan_name*.
 
         The first lookup for a scan reads only its on-disk ``frame_index``
         datasets; subsequent per-frame lookups are pure in-memory operations.
         """
-        if not self._append_skip_enabled() or scan_name is None:
+        if not self._append_skip_enabled(frozen) or scan_name is None:
             return set()
         key = str(scan_name)
         cache = getattr(self, "_append_skip_frames_by_scan", None)
@@ -1449,21 +1401,21 @@ class imageThread(wranglerThread):
             self._append_skip_frames_by_scan = cache
         if key in cache:
             return cache[key]
-        return self._load_append_skip_snapshot(key)
+        return self._load_append_skip_snapshot(frozen, key)
 
-    def _should_skip_before_read(self, scan_name, img_number):
-        output_img_number = self._append_output_number(img_number)
-        if output_img_number in self._append_skip_snapshot(scan_name):
+    def _should_skip_before_read(self, frozen, scan_name, img_number):
+        output_img_number = self._append_output_number(frozen, img_number)
+        if output_img_number in self._append_skip_snapshot(frozen, scan_name):
             self._append_skip_without_reading = (
                 getattr(self, "_append_skip_without_reading", 0) + 1)
             self._record_skip_reason("already processed")
             return True
         return False
 
-    def _append_frame_complete(self, scan_name, img_number, scan):
+    def _append_frame_complete(self, frozen, scan_name, img_number, scan):
         """Use the same mode-aware cursor at raw-read and dispatch boundaries."""
-        if self._append_skip_enabled():
-            return img_number in self._append_skip_snapshot(scan_name)
+        if self._append_skip_enabled(frozen):
+            return img_number in self._append_skip_snapshot(frozen, scan_name)
         return img_number in getattr(getattr(scan, "frames", None), "index", ())
 
     @staticmethod
@@ -1498,19 +1450,19 @@ class imageThread(wranglerThread):
             parts.append(f"{reason} ({count})" if count != 1 else reason)
         return "; ".join(parts)
 
-    def _format_no_frames_discovered_message(self):
-        directory = getattr(self, "img_dir", None) or (
+    def _format_no_frames_discovered_message(self, frozen):
+        directory = frozen.source.filesystem_root or (
             str(Path(getattr(self, "img_file", "")).parent)
             if getattr(self, "img_file", None) else "")
-        ext = (getattr(self, "img_ext", "") or "").lstrip(".") or "<any>"
-        pattern = getattr(self, "file_filter", "") or "<none>"
+        ext = "/".join(frozen.source.format_tokens) or "<any>"
+        pattern = (frozen.source.name_filter or "") or "<none>"
         return (
             "No frames discovered"
             f" (directory: {directory or '<unknown>'}, "
             f"ext: .{ext}, pattern: {pattern})"
         )
 
-    def _report_run_skip_summary(self, files_processed):
+    def _report_run_skip_summary(self, frozen, files_processed):
         skipped = getattr(self, "_append_skip_without_reading", 0)
         if skipped:
             logger.info(
@@ -1523,7 +1475,7 @@ class imageThread(wranglerThread):
             return
         if discovered <= 0:
             if files_processed <= 0:
-                msg = self._format_no_frames_discovered_message()
+                msg = self._format_no_frames_discovered_message(frozen)
                 logger.warning(msg)
                 try:
                     self.showLabel.emit(msg)
@@ -1533,7 +1485,7 @@ class imageThread(wranglerThread):
             return
         if files_processed >= discovered:
             return
-        if getattr(self, "series_average", False) and files_processed > 0:
+        if frozen.run_options.get("series_average", False) and files_processed > 0:
             return
         msg = (
             f"{files_processed} of {discovered} discovered frame(s) processed"
@@ -1555,13 +1507,15 @@ class imageThread(wranglerThread):
             logger.debug("showLabel emit failed for zero-frame warning",
                          exc_info=True)
 
-    def process_scan(self):
+    def process_scan(self, frozen):
         """Batch-integrate all existing images, then optionally watch for new ones (live mode).
 
         Phase 1 — Collect: drain the current directory glob into a pending list.
         Phase 2 — Process: sequential with cached AzimuthalIntegrator (~0.35 s/frame).
         Phase 3 — Watch (live mode only): poll every 2 s for new files; process each immediately.
         """
+        series_average = frozen.run_options.get("series_average", False)
+        xye_only = frozen.run_options.get("xye_only", False)
         scan = None
         files_processed = 0
         files_processed_by_output = Counter()
@@ -1582,19 +1536,19 @@ class imageThread(wranglerThread):
         _cached_poni = None
         # O-1a-W1R (review §39.2 W1R-P1-5): the source family comes from the
         # accepted frozen source, not from the mutable current-file cursor.
-        is_eiger = imageThread._frozen_source_is_container(self)
+        is_eiger = imageThread._frozen_source_is_container(self, frozen)
         # One-time visibility into which execution path this run takes (so the
         # XDART_LIVE_EXECUTION flag is observable).  Batch always streams now.
         # DEBUG: developer diagnostics, not run output.
         logger.debug('Execution policy: batch_mode=%s  batch=streaming  live=%s',
-                     self.batch_mode, self._live_execution())
+                     frozen.batch_mode, self._live_execution())
         # MEM-1c: refuse a series-average Append run whose averaged output
         # already exists (would silently skip everything and write nothing).
         # Only this special case needs an eager all-scan cursor pass.  Ordinary
         # Append runs load one tiny cursor lazily as each scan is reached.
-        if getattr(self, "series_average", False):
-            self._prime_append_skip_snapshots_for_run()
-            _blocker = self._series_average_append_blocker()
+        if series_average:
+            self._prime_append_skip_snapshots_for_run(frozen)
+            _blocker = self._series_average_append_blocker(frozen)
         else:
             _blocker = None
         if _blocker:
@@ -1617,16 +1571,16 @@ class imageThread(wranglerThread):
         _t_read_accum = 0.0
 
         while True:
-            self._wait_if_paused()        # freeze here (before reading) if paused
+            self._wait_if_paused(frozen)        # freeze here (before reading) if paused
             if self.command == 'stop':
                 break
 
             _t_r0 = time.time()
-            img_file, scan_name, img_number, img_data, img_meta = self.get_next_image()
+            img_file, scan_name, img_number, img_data, img_meta = self.get_next_image(frozen)
             _t_read_this = time.time() - _t_r0
             _t_read_accum += _t_read_this
             if img_data is None:
-                if not self.batch_mode and pending:
+                if not frozen.batch_mode and pending:
                     logger.info('Collected %d image(s) in %.2fs',
                                 len(pending), _t_read_accum)
                 break  # initial glob exhausted — move on to processing
@@ -1642,7 +1596,7 @@ class imageThread(wranglerThread):
                 _label = (f'Collecting {fname} [frame {img_number}]'
                           if _multi else
                           f'Collecting {fname}')
-                if self.batch_mode:
+                if frozen.batch_mode:
                     # Batch: the label is the only progress feedback while the
                     # whole pending set is read up front.
                     self.showLabel.emit(_label)
@@ -1686,7 +1640,7 @@ class imageThread(wranglerThread):
             if (scan is None) or (scan_name != scan.name):
                 if pending:
                     dispatched = self._dispatch_batch(
-                        scan, pending, force_save=True,
+                        frozen, scan, pending, force_save=True,
                     )
                     record_processed(scan, dispatched)
                     pending = []
@@ -1695,7 +1649,7 @@ class imageThread(wranglerThread):
                 # the per-iteration dispatch cadence below: the old
                 # scan may have integrated-but-unsaved frames in
                 # memory whose save_to_nexus call never fired.
-                self._flush_outgoing_scan(scan)
+                self._flush_outgoing_scan(frozen, scan)
                 try:
                     scan = self.initialize_scan()
                 except OutputCollisionError as exc:
@@ -1728,17 +1682,16 @@ class imageThread(wranglerThread):
                 _cached_poni = self.poni
                 self._cached_gi_incident_angle = None
 
-            series_average = bool(getattr(self, "series_average", False))
             output_img_number = 1 if series_average else img_number
             if self._append_frame_complete(
-                    scan.name, output_img_number, scan):
+                    frozen, scan.name, output_img_number, scan):
                 self._record_skip_reason("already processed at dispatch")
-                if self.single_img and not is_eiger:
+                if (frozen.source.source_kind == "image_file") and not is_eiger:
                     self.sigUpdate.emit(img_number)
                     break
                 continue
 
-            bg_raw = self.get_background(img_file, img_number, img_meta)
+            bg_raw = self.get_background(frozen, img_file, img_number, img_meta)
             # Stash the per-frame read time on the tuple so the per-frame
             # TIMING log can show it (otherwise it gets lumped into the
             # batch [FLUSH] line and hides per-frame variance).
@@ -1750,7 +1703,7 @@ class imageThread(wranglerThread):
             else:
                 pending.append(entry)
 
-            if self.single_img and not is_eiger:
+            if (frozen.source.source_kind == "image_file") and not is_eiger:
                 break
 
             # ── Submit cadence ──────────────────────────────────────────────
@@ -1761,12 +1714,12 @@ class imageThread(wranglerThread):
             # display-silent until the final sigUpdate(-1).
             flush_size = 1
             if pending and len(pending) >= flush_size and not series_average:
-                if self.batch_mode:
+                if frozen.batch_mode:
                     self.showLabel.emit(
                         f'Integrating {len(pending)} frame(s)...'
                     )
                 _t_disp = time.time()
-                dispatched = self._dispatch_batch(scan, pending)
+                dispatched = self._dispatch_batch(frozen, scan, pending)
                 record_processed(scan, dispatched)
                 _disp_dt = time.time() - _t_disp
                 _perf = getattr(self, '_perf', None)
@@ -1788,7 +1741,7 @@ class imageThread(wranglerThread):
         if pending and scan is not None and self.command != 'stop':
             _t_disp = time.time()
             dispatched = self._dispatch_batch(
-                scan, pending, force_save=True,
+                frozen, scan, pending, force_save=True,
             )
             record_processed(scan, dispatched)
             pending_avg_count = 0
@@ -1802,26 +1755,25 @@ class imageThread(wranglerThread):
                 '[FLUSH-FINAL] %d frames  read=%.2fs  dispatch=%.2fs',
                 len(pending), _t_read_accum, _disp_dt,
             )
-        elif (scan is not None and not self.xye_only
+        elif (scan is not None and not xye_only
               and self._frames_since_save > 0 and self.command != 'stop'):
             # Pending was empty but the live-save batcher has unflushed frames
             # (last batch hit the divisor exactly).  Force a save before leaving
             # the collect loop.
-            self.flush_serial_tail(scan, force=True)
+            self.flush_serial_tail(frozen, scan, force=True)
 
         # ── Phase 3: live watching ────────────────────────────────────────────
         # Rebind here: the collect loop binds series_average per frame, but a
         # provisional single-file run (NXS-SF-2) can reach the watch with NO
         # collected frame at all.
-        series_average = bool(getattr(self, "series_average", False))
         # scan is None normally ends the run (nothing was collected) — EXCEPT
         # for a provisional single-file container (nascent NXWriter shell /
         # unlanded links), which must keep watching so the SAME run processes
         # frames that land later (NXS-SF-2).
-        if (self.live_mode and self.command != 'stop'
+        if (frozen.live_mode and self.command != 'stop'
                 and (scan is not None
-                     or self._eiger_single_file_watchable()
-                     or self._h19_live_directory_armed())):
+                     or self._eiger_single_file_watchable(frozen)
+                     or self._h19_live_directory_armed(frozen))):
             self.showLabel.emit('Watching for new files...')
             # Adaptive backoff between filesystem polls.  Starts tight
             # so first-frame latency is small (~100 ms vs the old fixed
@@ -1836,10 +1788,10 @@ class imageThread(wranglerThread):
             _poll_growth = 2.0
             poll_s = _poll_min
             while self.command != 'stop':
-                self._wait_if_paused()    # pause/examine/resume a live acquisition
+                self._wait_if_paused(frozen)    # pause/examine/resume a live acquisition
                 if self.command == 'stop':
                     break                 # Pause -> Stop while watching
-                img_file, scan_name, img_number, img_data, img_meta = self.get_next_image()
+                img_file, scan_name, img_number, img_data, img_meta = self.get_next_image(frozen)
                 if img_data is None:
                     # A live scan can be complete without a successor arriving
                     # to trigger the scan-swap flush.  Make its serial tail
@@ -1847,10 +1799,10 @@ class imageThread(wranglerThread):
                     # folder and processed rows appear while the run remains
                     # armed.  The counter is reset by a successful flush, so
                     # subsequent watch ticks stay cheap no-ops.
-                    if (scan is not None and not self.xye_only
+                    if (scan is not None and not xye_only
                             and self._frames_since_save > 0):
                         _n_idle = self._frames_since_save
-                        if self.flush_serial_tail(scan, force=True):
+                        if self.flush_serial_tail(frozen, scan, force=True):
                             logger.info(
                                 '[SAVE-ON-IDLE] %d frame(s) made durable for %s',
                                 _n_idle, scan.name,
@@ -1873,7 +1825,7 @@ class imageThread(wranglerThread):
                     # sub-LIVE_SAVE_INTERVAL live scan (A→B→C single-frame
                     # masters) is not counted-as-processed yet shipped empty.
                     # Symmetric with the initial-collection boundary above.
-                    self._flush_outgoing_scan(scan)
+                    self._flush_outgoing_scan(frozen, scan)
                     try:
                         scan = self.initialize_scan()
                     except OutputCollisionError as exc:
@@ -1903,39 +1855,39 @@ class imageThread(wranglerThread):
 
                 output_img_number = 1 if series_average else img_number
                 if self._append_frame_complete(
-                        scan.name, output_img_number, scan):
+                        frozen, scan.name, output_img_number, scan):
                     self._record_skip_reason("already processed at dispatch")
                     continue
 
-                bg_raw = self.get_background(img_file, img_number, img_meta)
+                bg_raw = self.get_background(frozen, img_file, img_number, img_meta)
                 # Process immediately — single-threaded for low latency.
                 # _process_one uses add_frame(batch_save=True), so the
                 # disk save still rides on _frames_since_save below.
-                self._process_one(scan, img_file, img_number, img_data, img_meta, bg_raw)
+                self._process_one(frozen, scan, img_file, img_number, img_data, img_meta, bg_raw)
                 record_processed(scan, 1)
                 self._frames_since_save += 1
-                if self.xye_only:
+                if xye_only:
                     # No .nxs save in this mode -- drain the XYE buffer per
                     # frame so output appears as the watch processes files.
                     self._flush_xye_buffer(scan)
-                self.flush_serial_tail(scan)
+                self.flush_serial_tail(frozen, scan)
 
         # Final flush on exit (live-watch tail or stop request) so the
         # last few frames aren't lost.
-        if scan is not None and self.xye_only:
+        if scan is not None and xye_only:
             self._flush_xye_buffer(scan)
-        self.flush_serial_tail(scan, force=True)
+        self.flush_serial_tail(frozen, scan, force=True)
 
         # In batch mode, emit a single final signal so the GUI can refresh
         self.files_processed = files_processed
         self._last_files_processed = files_processed
         self.files_processed_by_output = dict(files_processed_by_output)
         self._last_files_processed_by_output = dict(files_processed_by_output)
-        if self.batch_mode and files_processed > 0:
+        if frozen.batch_mode and files_processed > 0:
             self.sigUpdate.emit(-1)
         report_skip_summary = getattr(self, "_report_run_skip_summary", None)
         if callable(report_skip_summary):
-            report_skip_summary(files_processed)
+            report_skip_summary(frozen, files_processed)
         logger.info('Total Files Processed: %d', files_processed)
 
     # ── Batch dispatch ────────────────────────────────────────────────────────
@@ -2006,8 +1958,8 @@ class imageThread(wranglerThread):
         )
         return new_count
 
-    def _series_average_pending(self, pending):
-        if not bool(getattr(self, "series_average", False)) or len(pending) <= 1:
+    def _series_average_pending(self, frozen, pending):
+        if not bool(frozen.run_options.get("series_average", False)) or len(pending) <= 1:
             return list(pending)
         averaged = []
         count = 0
@@ -2016,30 +1968,30 @@ class imageThread(wranglerThread):
                 self, averaged, entry, count)
         return averaged
 
-    def _dispatch_batch(self, scan, pending, *, force_save=False):
+    def _dispatch_batch(self, frozen, scan, pending, *, force_save=False):
         """Process a list of pending images — parallel in batch mode, serial otherwise.
 
         ``force_save`` only affects the serial path (live mode); the
         parallel path always saves at end of batch by construction
         (the whole point of batch mode is one big save per dispatch).
         """
-        self._maybe_warn_live_gi_clip()
-        if self.batch_mode:
+        self._maybe_warn_live_gi_clip(frozen)
+        if frozen.batch_mode:
             # 4e: batch is one write path — always the streaming session.
-            return self._dispatch_batch_streaming(scan, pending)
+            return self._dispatch_batch_streaming(frozen, scan, pending)
         # Live (non-batch): #3 routes it through the SAME streaming session +
         # QtNexusSink (which does the per-frame display publish for live), behind
         # the live flag; the proven per-frame _process_one path is the default.
         if self._live_execution() == "streaming":
-            return self._dispatch_batch_streaming(scan, pending)
-        return self._dispatch_batch_serial(scan, pending, force_save=force_save)
+            return self._dispatch_batch_streaming(frozen, scan, pending)
+        return self._dispatch_batch_serial(frozen, scan, pending, force_save=force_save)
 
     def _live_execution(self) -> str:
         """Active live (non-batch) execution policy ('serial' | 'streaming').
         Instance override (``self.live_execution``) wins over the module default."""
         return getattr(self, "live_execution", None) or _LIVE_EXECUTION
 
-    def _maybe_warn_live_gi_clip(self) -> None:
+    def _maybe_warn_live_gi_clip(self, frozen) -> None:
         """One-time advisory for live GI runs (#75).
 
         In a live run the common GI output grid is frozen from the FIRST frame
@@ -2051,7 +2003,7 @@ class imageThread(wranglerThread):
         varies, and source-agnostic (no assumption about the frame source).
         Batch runs bracket all frames, so this never fires there.
         """
-        if (not self.gi or self.batch_mode
+        if (not frozen.gi.enabled or frozen.batch_mode
                 or getattr(self, '_warned_live_gi_clip', False)):
             return
         self._warned_live_gi_clip = True
@@ -2076,7 +2028,7 @@ class imageThread(wranglerThread):
     # (_dispatch_batch_streaming); _scout_pending_frames / _build_scout are
     # their selection/build helpers, also exercised directly by the
     # GI-equivalence tests.
-    def _scout_pending_frames(self, pending):
+    def _scout_pending_frames(self, frozen, pending):
         """Return bounded representative pending entries for the GI freeze.
 
         Selection helper for :meth:`_freeze_gi_1d_auto_range` /
@@ -2088,7 +2040,7 @@ class imageThread(wranglerThread):
         """
         if len(pending) <= 1:
             return list(pending)
-        motor = self.incidence_motor
+        motor = frozen.gi.scan_incidence_motor
         try:
             float(motor)
             return [pending[0]]
@@ -2110,18 +2062,18 @@ class imageThread(wranglerThread):
             idxs.update((0, len(pending) - 1))
         return [pending[i] for i in sorted(idxs)]
 
-    def _build_scout(self, scan, entry):
+    def _build_scout(self, frozen, scan, entry):
         """Build a temporary ``LiveFrame`` for the headless freeze adapter."""
         img_file, img_number, img_data, img_meta, bg_raw, _ = entry
-        img_data = self._apply_threshold_inline(img_data)
-        frame_mask = self._resolve_frame_mask(scan, img_data)
+        img_data = self._apply_threshold_inline(frozen, img_data)
+        frame_mask = self._resolve_frame_mask(frozen, scan, img_data)
         scratch = LiveFrame(
             img_number, img_data, poni=self.poni,
             scan_info=img_meta, static=True, gi=True,
-            th_mtr=self.incidence_motor, bg_raw=bg_raw,
-            sample_orientation=self.sample_orientation,
-            tilt_angle=self.tilt_angle,
-            series_average=self.series_average,
+            th_mtr=frozen.gi.scan_incidence_motor, bg_raw=bg_raw,
+            sample_orientation=frozen.gi.sample_orientation,
+            tilt_angle=frozen.gi.tilt_angle,
+            series_average=frozen.run_options.get("series_average", False),
             integrator=scan._cached_integrator,
             mask=frame_mask,
         )
@@ -2134,9 +2086,9 @@ class imageThread(wranglerThread):
         scratch._get_incident_angle()
         return scratch
 
-    def _freeze_gi_1d_auto_range(self, scan, pending) -> None:
+    def _freeze_gi_1d_auto_range(self, frozen, scan, pending) -> None:
         """Compatibility wrapper for tests; delegates freeze to ssrl."""
-        if not self.gi or not pending:
+        if not frozen.gi.enabled or not pending:
             return
         args = getattr(scan, 'bai_1d_args', None)
         if not isinstance(args, dict):
@@ -2146,12 +2098,12 @@ class imageThread(wranglerThread):
             return
         sync_live_scan_gi_settings(
             scan,
-            incidence_motor=self.incidence_motor,
-            sample_orientation=self.sample_orientation,
-            tilt_angle=self.tilt_angle,
+            incidence_motor=frozen.gi.scan_incidence_motor,
+            sample_orientation=frozen.gi.sample_orientation,
+            tilt_angle=frozen.gi.tilt_angle,
         )
-        scouts = [self._build_scout(scan, entry)
-                  for entry in self._scout_pending_frames(pending)]
+        scouts = [self._build_scout(frozen, scan, entry)
+                  for entry in self._scout_pending_frames(frozen, pending)]
         freeze_live_scan_gi_ranges(
             scan,
             scouts,
@@ -2161,12 +2113,12 @@ class imageThread(wranglerThread):
             poni=self.poni,
             integrate_1d=True,
             integrate_2d=False,
-            gi_freeze_mode="scout_union" if self.batch_mode else "first_frame",
+            gi_freeze_mode="scout_union" if frozen.batch_mode else "first_frame",
         )
 
-    def _freeze_gi_2d_auto_ranges(self, scan, pending) -> None:
+    def _freeze_gi_2d_auto_ranges(self, frozen, scan, pending) -> None:
         """Compatibility wrapper for tests; delegates freeze to ssrl."""
-        if (not self.gi or self.xye_only or getattr(scan, 'skip_2d', False)
+        if (not frozen.gi.enabled or frozen.run_options.get("xye_only", False) or getattr(scan, 'skip_2d', False)
                 or not pending):
             return
         args = getattr(scan, 'bai_2d_args', None)
@@ -2177,12 +2129,12 @@ class imageThread(wranglerThread):
             return
         sync_live_scan_gi_settings(
             scan,
-            incidence_motor=self.incidence_motor,
-            sample_orientation=self.sample_orientation,
-            tilt_angle=self.tilt_angle,
+            incidence_motor=frozen.gi.scan_incidence_motor,
+            sample_orientation=frozen.gi.sample_orientation,
+            tilt_angle=frozen.gi.tilt_angle,
         )
-        scouts = [self._build_scout(scan, entry)
-                  for entry in self._scout_pending_frames(pending)]
+        scouts = [self._build_scout(frozen, scan, entry)
+                  for entry in self._scout_pending_frames(frozen, pending)]
         freeze_live_scan_gi_ranges(
             scan,
             scouts,
@@ -2192,10 +2144,10 @@ class imageThread(wranglerThread):
             poni=self.poni,
             integrate_1d=False,
             integrate_2d=True,
-            gi_freeze_mode="scout_union" if self.batch_mode else "first_frame",
+            gi_freeze_mode="scout_union" if frozen.batch_mode else "first_frame",
         )
 
-    def _gi_ranges_fully_pinned(self, scan) -> bool:
+    def _gi_ranges_fully_pinned(self, frozen, scan) -> bool:
         """True when every GI output range this run would auto-freeze is
         already explicitly set (T0-3).
 
@@ -2213,7 +2165,7 @@ class imageThread(wranglerThread):
         key = gi_1d_output_axis_key(args_1d.get('gi_mode_1d', 'q_total'))
         if args_1d.get(key) is None:
             return False
-        if self.xye_only or getattr(scan, 'skip_2d', False):
+        if frozen.run_options.get("xye_only", False) or getattr(scan, 'skip_2d', False):
             return True
         args_2d = getattr(scan, 'bai_2d_args', None)
         if not isinstance(args_2d, dict):
@@ -2222,7 +2174,7 @@ class imageThread(wranglerThread):
                    for k in _gi_2d_range_keys(args_2d))
 
     # ── BLOCKER 1: whole-scan GI grid freeze (streaming batch) ──────────────
-    def _gi_freeze_whole_scan_prepass(self, scan) -> bool:
+    def _gi_freeze_whole_scan_prepass(self, frozen, scan) -> bool:
         """Freeze the GI common q/χ grid from the WHOLE scan's incidence range
         BEFORE the streaming session opens.
 
@@ -2262,11 +2214,11 @@ class imageThread(wranglerThread):
         Returns ``True`` when the caller may open the session, ``False`` when
         the run was aborted (freeze error only; caller must not proceed).
         """
-        if not (self.gi and self.batch_mode):
+        if not (frozen.gi.enabled and frozen.batch_mode):
             return True
         if getattr(self, "_gi_prepass_scan_id", None) == id(scan):
             return True
-        if self._gi_ranges_fully_pinned(scan):
+        if self._gi_ranges_fully_pinned(frozen, scan):
             # T0-3: every GI output range this run would auto-freeze is already
             # explicitly set — the freeze functions self-skip and the session's
             # own per-session freeze early-returns, so there is no auto grid to
@@ -2276,7 +2228,7 @@ class imageThread(wranglerThread):
             self._gi_prepass_scan_id = id(scan)   # latch: decided for this scan
             return True
         try:
-            status, scouts = self._gi_whole_scan_scout_entries(scan)
+            status, scouts = self._gi_whole_scan_scout_entries(frozen, scan)
         except Exception as exc:
             # T0-4 warn-and-proceed: a scout failure means we lose the union
             # sweep, not correctness — the first-chunk freeze is acceptable.
@@ -2297,10 +2249,12 @@ class imageThread(wranglerThread):
             # sidecar, per frame).  T0-4 policy: proceed on the first-chunk
             # freeze with an advisory — values inside the grid are exact; only
             # extreme-incidence tails beyond it are cropped.
-            source = (getattr(self, "inp_type", None) or
-                      ("Eiger master" if (getattr(self, "img_file", "") and
-                                          _is_eiger_master(getattr(self, "img_file", "")))
-                       else "this source"))
+            # An operator LABEL, built here at the presentation edge: the frozen
+            # source owns execution values, never GUI mode names (§43.1).
+            source = ("Image Directory" if frozen.source.family == "directory"
+                      else ("Eiger master"
+                            if str(frozen.source.source_kind) == "eiger_master"
+                            else "this source"))
             self._warn_gi_first_chunk_freeze(
                 f"the whole-scan incidence range cannot be swept up front for "
                 f"'{source}'", scan)
@@ -2314,8 +2268,8 @@ class imageThread(wranglerThread):
             # produced a broken grid, not a narrow one) and must not escape
             # the worker thread (run() has no except).
             try:
-                self._freeze_gi_1d_auto_range(scan, scouts)
-                self._freeze_gi_2d_auto_ranges(scan, scouts)
+                self._freeze_gi_1d_auto_range(frozen, scan, scouts)
+                self._freeze_gi_2d_auto_ranges(frozen, scan, scouts)
             except Exception as exc:
                 self._abort_gi_prepass(f"whole-scan grid freeze failed ({exc})")
                 return False
@@ -2381,7 +2335,7 @@ class imageThread(wranglerThread):
         else:
             self.command = 'stop'
 
-    def _frame_source_for(self, scan):
+    def _frame_source_for(self, frozen, scan):
         r"""Build a core :class:`FrameSource` over this scan's per-file image
         series for the headless GI freeze prepass (ADR-0006 STEP 2).
 
@@ -2402,17 +2356,16 @@ class imageThread(wranglerThread):
         img_file = getattr(self, "img_file", None)
         if not img_file or _is_eiger_master(img_file):
             return None
-        img_ext = getattr(self, "img_ext", "") or ""
-        if img_ext.lower() in ('h5', 'hdf5', 'nxs'):
+        if imageThread._frozen_source_is_container(self, frozen):
             return None
-        if getattr(self, "inp_type", None) == 'Image Directory':
+        if frozen.source.family == "directory":
             return None
-        meta_fmt = getattr(self, "meta_ext", None) or None
+        meta_fmt = frozen.run_options.get("meta_ext") or None
         meta_dir = getattr(self, "meta_dir", None)
-        if getattr(self, "single_img", False):
+        if (frozen.source.source_kind == "image_file"):
             return ImageFileSource(
                 img_file, metadata_format=meta_fmt, meta_dir=meta_dir)
-        source_spec = getattr(self, "source_spec", None)
+        source_spec = frozen.thaw_source_spec()
         frozen_files = tuple(
             getattr(source_spec, "options", {}).get("files", ())
             if source_spec is not None else ()
@@ -2420,7 +2373,7 @@ class imageThread(wranglerThread):
         files = (
             [(str(path), _get_scan_info(path)[1]) for path in frozen_files]
             if frozen_files
-            else self._enumerate_scan_files()
+            else self._enumerate_scan_files(frozen)
         )
         if not files:
             return None
@@ -2432,7 +2385,7 @@ class imageThread(wranglerThread):
             ),
             metadata_format=meta_fmt, meta_dir=meta_dir)
 
-    def _gi_whole_scan_scout_entries(self, scan):
+    def _gi_whole_scan_scout_entries(self, frozen, scan):
         """Decide how to freeze the whole-scan GI grid and, when needed, gather
         the scout images.  Returns ``(status, entries)``:
 
@@ -2455,13 +2408,13 @@ class imageThread(wranglerThread):
         a core :class:`FrameSource`; xdart keeps only the scout LOAD + the freeze
         invocation (which can't move to core: chunk 1 can't see the last frame).
         """
-        motor = self.incidence_motor
+        motor = frozen.gi.scan_incidence_motor
         try:
             float(motor)        # fixed/manual: one angle for the whole scan
             return "skip", []
         except (TypeError, ValueError):
             pass
-        source = self._frame_source_for(scan)
+        source = self._frame_source_for(frozen, scan)
         if source is None:
             # _frame_source_for() returns None for sources that can't be cheaply
             # swept per-frame.  Preserve the old skip-vs-unverifiable split:
@@ -2471,7 +2424,7 @@ class imageThread(wranglerThread):
             #   SAFE ("skip"): missing source attrs / no img_file — not an angle
             #     dependence sweep at all (so the grid was never chunk-clipped).
             img_file = getattr(self, "img_file", None) or ""
-            if getattr(self, "inp_type", None) == "Image Directory":
+            if frozen.source.family == "directory":
                 return "unverifiable", []
             if img_file and _is_eiger_master(img_file):
                 return "unverifiable", []
@@ -2514,7 +2467,7 @@ class imageThread(wranglerThread):
             # driven), so a failing/missing background must NOT abort an
             # otherwise-valid GI run -- degrade to 0 for the axis-only scout.
             try:
-                bg = self.get_background(fname, img_number, meta)
+                bg = self.get_background(frozen, fname, img_number, meta)
             except Exception:
                 logger.debug("GI scout background failed for %s; using 0 for the "
                              "axis-only scout", fname, exc_info=True)
@@ -2522,7 +2475,7 @@ class imageThread(wranglerThread):
             entries.append((fname, img_number, data, meta, bg, 0.0))
         return "freeze", entries
 
-    def _enumerate_scan_files(self):
+    def _enumerate_scan_files(self, frozen):
         """Sorted ``(fname, img_number)`` for a per-file scan series, metadata
         only (NO image read).  Returns ``[]`` for Eiger/HDF5 masters and
         Image-Directory sources that can't be cheaply per-frame swept (and,
@@ -2530,13 +2483,15 @@ class imageThread(wranglerThread):
         img_file = getattr(self, "img_file", None)
         if not img_file or _is_eiger_master(img_file):
             return []
-        img_ext = getattr(self, "img_ext", "") or ""
-        if img_ext.lower() in ('h5', 'hdf5', 'nxs'):
+        if imageThread._frozen_source_is_container(self, frozen):
             return []
-        if getattr(self, "inp_type", None) == 'Image Directory':
+        if frozen.source.family == "directory":
             return []
+        # A per-file series froze exactly one format token (its member's own
+        # suffix); the container and directory shapes returned above.
+        img_ext = (frozen.source.format_tokens or ("",))[0]
         scan_name = getattr(self, "scan_name", None)
-        img_dir = getattr(self, "img_dir", None)
+        img_dir = frozen.source.filesystem_root
         if not scan_name or not img_dir:
             return []
         _series_re = re.compile(
@@ -2552,7 +2507,7 @@ class imageThread(wranglerThread):
         return out
 
     # ── Pause / Resume ──────────────────────────────────────────────────────
-    def _wait_if_paused(self) -> None:
+    def _wait_if_paused(self, frozen) -> None:
         """Block while a Pause is in effect, WITHOUT tearing down the scan or
         session.  Pause is a THIRD command state between the run state
         (``'start'``) and ``'stop'`` (the loops treat everything != 'stop' as go,
@@ -2569,7 +2524,7 @@ class imageThread(wranglerThread):
         """
         if self.command != 'pause':
             return
-        self._enter_pause()
+        self._enter_pause(frozen)
         while self.command == 'pause':
             time.sleep(0.05)
         # Resume (or stop): clear the session's paused flag (4a) so the next
@@ -2583,7 +2538,7 @@ class imageThread(wranglerThread):
     #: can't deadlock the pause; the wait also bails early on Stop/close.
     PAUSE_DRAIN_TIMEOUT = 30.0
 
-    def _enter_pause(self) -> None:
+    def _enter_pause(self, frozen) -> None:
         """Quiesce the writer at a frame boundary so a paused user can browse any
         already-processed frame from disk, then signal the GUI to lift the guard.
 
@@ -2634,11 +2589,11 @@ class imageThread(wranglerThread):
             elif scan is not None and self._frames_since_save > 0:
                 # Serial path is the active writer (watch loop / serial
                 # dispatch): flush the serial tail.
-                if self.xye_only:
+                if frozen.run_options.get("xye_only", False):
                     self._flush_xye_buffer(scan)      # no .nxs save in xye-only
                     self._frames_since_save = 0
                 else:
-                    self.flush_serial_tail(scan, force=True)
+                    self.flush_serial_tail(frozen, scan, force=True)
             elif adapter is not None:
                 # Streaming path (batch / reprocess / live Phase 2): in-flight
                 # window drained (non-terminal — session stays open) + flush
@@ -2672,7 +2627,7 @@ class imageThread(wranglerThread):
         finally:
             _get_h5pool().resume(scan.data_file)
 
-    def _flush_outgoing_scan(self, scan) -> None:
+    def _flush_outgoing_scan(self, frozen, scan) -> None:
         """Force-save the OUTGOING scan's integrated-but-unsaved serial tail at a
         scan-boundary swap, before it is replaced by ``initialize_scan()``.
 
@@ -2687,16 +2642,16 @@ class imageThread(wranglerThread):
         ``xye_only`` (xye is drained per-frame, has no .nxs tail).
         """
         if (scan is not None
-                and not self.xye_only
+                and not frozen.run_options.get("xye_only", False)
                 and self._frames_since_save > 0):
             _n_swap = self._frames_since_save     # reset by the tail
-            if self.flush_serial_tail(scan, force=True):
+            if self.flush_serial_tail(frozen, scan, force=True):
                 logger.info(
                     '[SAVE-ON-SWAP] %d frames flushed for %s',
                     _n_swap, scan.name,
                 )
 
-    def flush_serial_tail(self, scan, *, force=False) -> bool:
+    def flush_serial_tail(self, frozen, scan, *, force=False) -> bool:
         """The serial save tail (the DRYed copy-paste idiom).
 
         When a save is due (cadence / cap-pressure / ``force``), h5pool-bracket a
@@ -2711,7 +2666,7 @@ class imageThread(wranglerThread):
         mode (no .nxs target — ``_save_due`` returns False) and for ``scan is
         None``.
         """
-        if scan is None or not self._save_due(scan, force=force):
+        if scan is None or not self._save_due(frozen, scan, force=force):
             return False
         with self.file_lock:
             with self._h5pool_bracket(scan):
@@ -2720,7 +2675,7 @@ class imageThread(wranglerThread):
         self._frames_since_save = 0
         return True
 
-    def _save_due(self, scan, *, force=False):
+    def _save_due(self, frozen, scan, *, force=False):
         """Whether a non-batch v2 save should fire now (persist-before-evict).
 
         A save is due when forced (final flush), when ``LIVE_SAVE_INTERVAL``
@@ -2734,7 +2689,7 @@ class imageThread(wranglerThread):
         HARD bound, so the high interval is safe even on scans longer than the
         cap.  Never saves in xye_only mode (no .nxs target).
         """
-        if self.xye_only:
+        if frozen.run_options.get("xye_only", False):
             return False
         # Phase 4b-3: the same headless FlushPolicy the streaming sink uses
         # (kills the predicate divergence).  Serial owns the LIVE unsaved
@@ -2749,7 +2704,7 @@ class imageThread(wranglerThread):
         return policy.should_flush(frames_since_flush=self._frames_since_save,
                                    unsaved_in_memory=unsaved, force=force)
 
-    def _dispatch_batch_serial(self, scan, pending, *, force_save=False):
+    def _dispatch_batch_serial(self, frozen, scan, pending, *, force_save=False):
         """Sequential dispatch (live mode or single-image batches).
 
         Each frame in ``pending`` gets integrated + GUI-updated
@@ -2762,23 +2717,23 @@ class imageThread(wranglerThread):
         """
         count = 0
         for item in pending:
-            self._wait_if_paused()        # pause between frames (serial path)
+            self._wait_if_paused(frozen)        # pause between frames (serial path)
             if self.command == 'stop':
                 break
             # item is (img_file, img_number, img_data, img_meta, bg_raw, t_read)
-            self._process_one(scan, *item)
+            self._process_one(frozen, scan, *item)
             count += 1
 
         self._frames_since_save += count
 
         _n_save = self._frames_since_save        # reset by the tail
         _t_save0 = time.time()
-        if self.flush_serial_tail(scan, force=force_save):
+        if self.flush_serial_tail(frozen, scan, force=force_save):
             logger.info(
                 '[SAVE] %d frames since last save  flush=%.3fs',
                 _n_save, time.time() - _t_save0,
             )
-        elif self.xye_only:
+        elif frozen.run_options.get("xye_only", False):
             # Int 1D (XYE) on the serial fallback: there is no .nxs save to
             # ride on (_save_due is always False in this mode), so drain the
             # XYE buffer per dispatch -- without this the serial path wrote
@@ -2787,22 +2742,22 @@ class imageThread(wranglerThread):
             self._flush_xye_buffer(scan)
         return count
 
-    def _build_batch_frames(self, scan, pending):
+    def _build_batch_frames(self, frozen, scan, pending):
         """Build the LiveFrame shells for a batch chunk (shared by the chunked
         and streaming dispatchers).  Stamps source refs + skip_map_raw."""
         skip_2d = scan.skip_2d
-        gi = self.gi
-        th_mtr = self.incidence_motor
-        sample_orientation = self.sample_orientation
-        tilt_angle = self.tilt_angle
-        series_average = self.series_average
+        gi = frozen.gi.enabled
+        th_mtr = frozen.gi.scan_incidence_motor
+        sample_orientation = frozen.gi.sample_orientation
+        tilt_angle = frozen.gi.tilt_angle
+        series_average = frozen.run_options.get("series_average", False)
         frames = []
-        pending = imageThread._series_average_pending(self, pending)
+        pending = imageThread._series_average_pending(self, frozen, pending)
         for img_file, img_number, img_data, img_meta, bg_raw, _t_read in pending:
             if self.command == 'stop':
                 break
-            img_data = self._apply_threshold_inline(img_data)
-            frame_mask = self._resolve_frame_mask(scan, img_data)
+            img_data = self._apply_threshold_inline(frozen, img_data)
+            frame_mask = self._resolve_frame_mask(frozen, scan, img_data)
             frame = LiveFrame(
                 img_number, img_data, poni=self.poni,
                 scan_info=img_meta, static=True, gi=gi,
@@ -2826,7 +2781,7 @@ class imageThread(wranglerThread):
             frames.append(frame)
         return frames
 
-    def _dispatch_batch_streaming(self, scan, pending):
+    def _dispatch_batch_streaming(self, frozen, scan, pending):
         """Stream a batch chunk through a persistent ReductionSession +
         QtNexusSink (PERF-4b/WS-X1).
 
@@ -2836,18 +2791,18 @@ class imageThread(wranglerThread):
         ``_close_reduction_session`` ``finish()`` drains the writer and does the
         final flush.  Behind the execution flag; chunked is the default.
         """
-        pending = imageThread._series_average_pending(self, pending)
+        pending = imageThread._series_average_pending(self, frozen, pending)
         if getattr(scan, "_cached_integrator", None) is None:
             logger.info('[STREAM] no cached integrator yet — first frame falls '
                         'back to serial (streaming engages from the next frame)')
-            return self._dispatch_batch_serial(scan, pending)
+            return self._dispatch_batch_serial(frozen, scan, pending)
         if getattr(scan, '_cached_data_mask', None) is None and pending:
-            self._prewarm_frame_mask(scan, pending[0][2])
+            self._prewarm_frame_mask(frozen, scan, pending[0][2])
         sync_live_scan_gi_settings(
             scan,
-            incidence_motor=self.incidence_motor,
-            sample_orientation=self.sample_orientation,
-            tilt_angle=self.tilt_angle,
+            incidence_motor=frozen.gi.scan_incidence_motor,
+            sample_orientation=frozen.gi.sample_orientation,
+            tilt_angle=frozen.gi.tilt_angle,
         )
         # BLOCKER 1: freeze the GI common grid from the WHOLE scan's incidence
         # range before the session opens (no-op on chunks 2..N via the scan-id
@@ -2855,18 +2810,18 @@ class imageThread(wranglerThread):
         # an unverifiable/unestablishable range WARNS and proceeds on the
         # first-chunk freeze (diagnostic persisted in provenance); only a
         # freeze that actually errors aborts the run.
-        if not self._gi_freeze_whole_scan_prepass(scan):
+        if not self._gi_freeze_whole_scan_prepass(frozen, scan):
             return 0
-        frames = self._build_batch_frames(scan, pending)
+        frames = self._build_batch_frames(frozen, scan, pending)
         if not frames:
             return 0
-        session, sink = self._get_streaming_session(scan, frames)
+        session, sink = self._get_streaming_session(frozen, scan, frames)
         if session is None:
             return 0
         adapter = self._scan_session_adapter
         count = 0
         for live in frames:
-            self._wait_if_paused()        # pause between frames (streaming path)
+            self._wait_if_paused(frozen)        # pause between frames (streaming path)
             if self.command == 'stop':
                 break
             # Per-frame status is emitted at COMPLETION by the sink
@@ -3013,13 +2968,13 @@ class imageThread(wranglerThread):
         if callable(resize):
             resize(window)
 
-    def _log_reduction_worker_cap(self, workers):
+    def _log_reduction_worker_cap(self, frozen, workers):
         from xrd_tools.core import reduction_worker_cap_log_line
         logger.info(reduction_worker_cap_log_line(
-            workers, requested=self.max_cores,
+            workers, requested=frozen.max_cores,
             overridden=bool(os.environ.get("XDART_REDUCTION_WORKERS"))))
 
-    def _get_streaming_session(self, scan, frames):
+    def _get_streaming_session(self, frozen, scan, frames):
         """Build (once per scan) or return the persistent streaming session +
         its ``QtNexusSink``.  Returns ``(None, None)`` if the GI freeze scout
         fails (the batch is skipped with an advisory, as in the chunked path)."""
@@ -3038,15 +2993,15 @@ class imageThread(wranglerThread):
         # ``n_workers==1 -> None`` silently built a ~20-worker default pool
         # (20 integrator deepcopies), the opposite of the requested serial run.
         from xrd_tools.core import reduction_worker_cap
-        executor = reduction_worker_cap(self.max_cores)
+        executor = reduction_worker_cap(frozen.max_cores)
         self._streaming_executor_workers = executor
-        imageThread._log_reduction_worker_cap(self, executor)
+        imageThread._log_reduction_worker_cap(self, frozen, executor)
         cancel_token = self._cancel_token() if hasattr(self, "_cancel_token") else None
         # Batch brackets all frames (scout_union over first+last of the chunk);
         # live has no last frame at session open, so it freezes from the first
         # frame only (matches the legacy _process_one live path + the #75 advisory).
-        _default_freeze = ("scout_union" if self.batch_mode else "first_frame") \
-            if self.gi else None
+        _default_freeze = ("scout_union" if frozen.batch_mode else "first_frame") \
+            if frozen.gi.enabled else None
         gi_freeze_mode = getattr(self, "gi_freeze_mode", _default_freeze)
         # MEM-2: RAM-aware heavy window feeds all three heavy caps.  Set the
         # LiveFrameSeries staging cap here so the record store (which mirrors it)
@@ -3132,7 +3087,7 @@ class imageThread(wranglerThread):
             imageThread._record_store_hydrator(self, scan, record_store))
         return session, sink
 
-    def _process_one(self, scan, img_file, img_number, img_data, img_meta,
+    def _process_one(self, frozen, scan, img_file, img_number, img_data, img_meta,
                      bg_raw, t_read=0.0):
         """Integrate one image sequentially and save. Includes timing instrumentation.
 
@@ -3142,6 +3097,7 @@ class imageThread(wranglerThread):
         per-frame variance.  Defaults to 0 for callers that don't
         track it (the live-watch loop reads via a different path).
         """
+        series_average = frozen.run_options.get("series_average", False)
         fname = os.path.splitext(os.path.basename(img_file))[0]
         # Multi-frame containers reuse a single master filename across
         # frames; appending "[frame N]" to the status box so the user
@@ -3156,21 +3112,21 @@ class imageThread(wranglerThread):
         # Threshold via dummy sentinel + stable cached mask — see
         # _apply_threshold_inline / _resolve_frame_mask docstrings for
         # why this is fast even with per-frame threshold filtering on.
-        img_data = self._apply_threshold_inline(img_data)
-        frame_mask = self._resolve_frame_mask(scan, img_data)
+        img_data = self._apply_threshold_inline(frozen, img_data)
+        frame_mask = self._resolve_frame_mask(frozen, scan, img_data)
         frame = LiveFrame(
             img_number, img_data, poni=self.poni,
-            scan_info=img_meta, static=True, gi=self.gi,
-            th_mtr=self.incidence_motor, bg_raw=bg_raw,
-            sample_orientation=self.sample_orientation,
-            tilt_angle=self.tilt_angle,
-            series_average=self.series_average,
+            scan_info=img_meta, static=True, gi=frozen.gi.enabled,
+            th_mtr=frozen.gi.scan_incidence_motor, bg_raw=bg_raw,
+            sample_orientation=frozen.gi.sample_orientation,
+            tilt_angle=frozen.gi.tilt_angle,
+            series_average=series_average,
             integrator=scan._cached_integrator,
             mask=frame_mask,
         )
         _t_frame = time.time() - _t1
 
-        if self.gi:
+        if frozen.gi.enabled:
             try:
                 frame._get_incident_angle()
             except IncidenceAngleUnresolved as exc:
@@ -3186,9 +3142,9 @@ class imageThread(wranglerThread):
         _t2 = time.time()
         sync_live_scan_gi_settings(
             scan,
-            incidence_motor=self.incidence_motor,
-            sample_orientation=self.sample_orientation,
-            tilt_angle=self.tilt_angle,
+            incidence_motor=frozen.gi.scan_incidence_motor,
+            sample_orientation=frozen.gi.sample_orientation,
+            tilt_angle=frozen.gi.tilt_angle,
         )
 
         plan = self._plan_cache.get(scan, integrate_2d=not scan.skip_2d)
@@ -3204,7 +3160,7 @@ class imageThread(wranglerThread):
                 poni=self.poni,
                 cancel_token=cancel_token,
                 chunk_size=1,
-                gi_freeze_mode="first_frame" if self.gi else None,
+                gi_freeze_mode="first_frame" if frozen.gi.enabled else None,
             )
 
         session_getter = getattr(self, "_get_reduction_session", None)
@@ -3238,7 +3194,7 @@ class imageThread(wranglerThread):
                 session=session,
                 cancel_token=cancel_token,
                 chunk_size=1,
-                gi_freeze_mode="first_frame" if self.gi else None,
+                gi_freeze_mode="first_frame" if frozen.gi.enabled else None,
             )
         finally:
             if close_session:
@@ -3257,7 +3213,7 @@ class imageThread(wranglerThread):
         _t_h5_total = _t_h5_wait = _t_h5_write = 0.0
 
         # ── In-memory accumulation (no disk I/O — batch flush handles that) ──
-        if not self.xye_only:
+        if not frozen.run_options.get("xye_only", False):
             # Set source file as relative path from HDF5 dir for NeXus provenance
             if img_file:
                 frame.source_file = os.path.abspath(str(img_file))
@@ -3280,8 +3236,8 @@ class imageThread(wranglerThread):
             # end-of-batch, so we don't pay per-frame write cost here.
             scan.add_frame(
                 frame=frame, calculate=False, update=True,
-                get_sd=True, set_mg=False, static=True, gi=self.gi,
-                th_mtr=self.incidence_motor, series_average=self.series_average,
+                get_sd=True, set_mg=False, static=True, gi=frozen.gi.enabled,
+                th_mtr=frozen.gi.scan_incidence_motor, series_average=series_average,
                 batch_save=True,
             )
             _t_h5_total = time.time() - _t4
@@ -3333,7 +3289,7 @@ class imageThread(wranglerThread):
         # via process_scan's final ``sigUpdate.emit(-1)``.  Batch mode
         # exists precisely to skip GUI work during the run and let
         # the wrangler focus on integration throughput.
-        if not self.batch_mode:
+        if not frozen.batch_mode:
             # Publish the freshly-integrated frame so the main thread can
             # consume it without going back to disk.  See
             # static_scan_widget.update_data for the consumer side.
@@ -3490,7 +3446,7 @@ class imageThread(wranglerThread):
             and getattr(self, "_eiger_descriptor", None) is not None
         )
 
-    def _eiger_open_master(self, master_path):
+    def _eiger_open_master(self, frozen, master_path):
         """Open (or switch to) an Eiger / NeXus HDF5 file, keeping the handle.
 
         Strategy
@@ -3587,7 +3543,7 @@ class imageThread(wranglerThread):
                 self._eiger_nframes = 0
                 return
             if (
-                getattr(self, "inp_type", None) == "Image Directory"
+                frozen.source.family == "directory"
                 and (
                     desc.state is ProbeState.IN_PROGRESS
                     or not bool(getattr(desc, "finalized", True))
@@ -3608,8 +3564,8 @@ class imageThread(wranglerThread):
                 return
             if desc.dataset_path is None:
                 cursor.close()
-                log = (logger.debug if getattr(self, "live_mode", False)
-                       and getattr(self, "inp_type", None) == "Image Directory"
+                log = (logger.debug if frozen.live_mode
+                       and frozen.source.family == "directory"
                        else logger.warning)
                 log('Could not find image dataset in %s', master_path)
                 # ``finalized`` defaults true for formats without a lifecycle
@@ -3668,8 +3624,8 @@ class imageThread(wranglerThread):
             # releases its sharing lock.  Treat that first-open denial exactly
             # like a transient growth-reopen denial so Phase 3 remains armed;
             # batch/non-live callers retain the terminal open-error behavior.
-            if (getattr(self, 'live_mode', False)
-                    and not getattr(self, 'batch_mode', False)):
+            if (frozen.live_mode
+                    and not frozen.batch_mode):
                 logger.info('Container temporarily unavailable, will retry: '
                             '%s (%s)', master_path, e)
                 self._eiger_open_state = "not ready"
@@ -3756,7 +3712,7 @@ class imageThread(wranglerThread):
                 logger.debug('Failed to close replaced Eiger cursor', exc_info=True)
         return True
 
-    def _eiger_single_file_growth_outcome(self):
+    def _eiger_single_file_growth_outcome(self, frozen):
         """Classify a single-file source at exhaustion: 'grown'|'wait'|'end'.
 
         NXS-SF-1/SF-2 policy (handoff §6): a live run observes growth through
@@ -3771,8 +3727,8 @@ class imageThread(wranglerThread):
         from xrd_tools.sources.cursor import ContainerNotReadyError
 
         stop_evt = getattr(self, '_prefetch_stop_evt', None)
-        if (not getattr(self, 'live_mode', False)
-                or getattr(self, 'batch_mode', False)
+        if (not frozen.live_mode
+                or frozen.batch_mode
                 or getattr(self, 'command', None) == 'stop'
                 or (stop_evt is not None and stop_evt.is_set())):
             return 'end'
@@ -3830,7 +3786,7 @@ class imageThread(wranglerThread):
         self._eiger_single_file_provisional = True
         return 'wait'
 
-    def _eiger_single_file_watchable(self):
+    def _eiger_single_file_watchable(self, frozen):
         """NXS-SF-2: whether a live single-file run should keep watching even
         though the initial collect produced NO scan — i.e. the container is
         still provisional (a nascent NXWriter shell, an unfinalized container
@@ -3841,7 +3797,7 @@ class imageThread(wranglerThread):
         runs.  Directory runs keep their own defer/queue machinery;
         definitive outcomes (processed output, finalized imageless, open
         error, finalized-and-consumed) never watch."""
-        if getattr(self, 'inp_type', None) == 'Image Directory':
+        if frozen.source.family == "directory":
             return False
         if getattr(self, '_eiger_single_file_done', False):
             return False
@@ -3887,18 +3843,19 @@ class imageThread(wranglerThread):
                 logger.debug("Failed to close Eiger cursor: %s", e)
             self._eiger_cursor = None
 
-    def _read_eiger_metadata(self, master_path):
+    def _read_eiger_metadata(self, frozen, master_path):
         """Read per-master metadata once, returning a per-frame copy."""
-        if not self.meta_ext:
+        meta_ext = frozen.run_options.get("meta_ext")
+        if not meta_ext:
             return {}
         key = (
             os.path.abspath(str(master_path)),
-            str(self.meta_ext),
+            str(meta_ext),
             os.path.abspath(str(self.meta_dir)) if self.meta_dir else '',
         )
         if key not in self._eiger_metadata_cache:
             self._eiger_metadata_cache[key] = read_image_metadata(
-                master_path, meta_format=self.meta_ext, meta_dir=self.meta_dir,
+                master_path, meta_format=meta_ext, meta_dir=self.meta_dir,
             )
         return dict(self._eiger_metadata_cache[key])
 
@@ -3991,12 +3948,12 @@ class imageThread(wranglerThread):
             row.setdefault(col, float(val))
         return row
 
-    def _frame_scan_info(self, master_path, frame_idx):
+    def _frame_scan_info(self, frozen, master_path, frame_idx):
         """The frame's ``scan_info``: the sidecar/scalar metadata (unchanged)
         overlaid with the Bluesky per-frame motor + counter row when the master
         is a Bluesky ``.nxs``.  For any other source this is exactly
         :meth:`_read_eiger_metadata` (frame_idx ignored)."""
-        base = self._read_eiger_metadata(master_path)
+        base = self._read_eiger_metadata(frozen, master_path)
         row = self._bluesky_row(master_path, frame_idx)
         if row:
             base.update(row)
@@ -4083,10 +4040,10 @@ class imageThread(wranglerThread):
             zero_seen.pop(path, None)
         done.add(path)
 
-    def _eiger_defer_zero_frame_master(self, path):
+    def _eiger_defer_zero_frame_master(self, frozen, path):
         """Retry a young zero-frame container without blocking later scans."""
-        if (not getattr(self, "live_mode", False)
-                or getattr(self, "inp_type", None) != "Image Directory"
+        if (not frozen.live_mode
+                or frozen.source.family != "directory"
                 or getattr(self, "_eiger_open_state", None)
                 in {
                     "processed xdart output",
@@ -4179,39 +4136,39 @@ class imageThread(wranglerThread):
         zero_seen.pop(path, None)
         return False
 
-    def _eiger_close_or_defer_zero_frame_master(self):
+    def _eiger_close_or_defer_zero_frame_master(self, frozen):
         """Close a zero-frame open and clear its identity when deferred."""
         path = self._eiger_master_path
         self._eiger_close_master()
-        if not self._eiger_defer_zero_frame_master(path):
+        if not self._eiger_defer_zero_frame_master(frozen, path):
             return False
         self._eiger_master_path = None
         self._eiger_frame_idx = 0
         self._eiger_nframes = 0
         return True
 
-    def _directory_source_armed(self):
+    def _directory_source_armed(self, frozen):
         """Whether Run owns a valid directory intent without a seed file."""
-        spec = getattr(self, "source_spec", None)
+        spec = frozen.thaw_source_spec()
         try:
             from xrd_tools.sources import DirectorySourceSpec
 
             return bool(
-                getattr(self, "inp_type", "") == "Image Directory"
+                frozen.source.family == "directory"
                 and isinstance(spec, DirectorySourceSpec)
                 and spec.root.is_dir()
             )
         except Exception:
             return False
 
-    def _h19_live_directory_armed(self):
+    def _h19_live_directory_armed(self, frozen):
         """Compatibility alias for the retired eager-plan arm."""
         return bool(
-            getattr(self, "live_mode", False)
+            frozen.live_mode
             and (
-                imageThread._directory_source_armed(self)
+                imageThread._directory_source_armed(self, frozen)
                 or (
-                    getattr(self, "inp_type", "") == "Image Directory"
+                    frozen.source.family == "directory"
                     and getattr(self, "source_run_plan", None) is not None
                     and getattr(self, "source_index_session", None) is not None
                 )
@@ -4249,14 +4206,14 @@ class imageThread(wranglerThread):
             # directory observation may adopt it again.
             return False
 
-    def _eiger_complete_append_count(self, path, candidate):
+    def _eiger_complete_append_count(self, frozen, path, candidate):
         """Known frame count iff Append can retire this whole raw container."""
-        if (not self._append_skip_enabled()
-                or getattr(self, "series_average", False)):
+        if (not self._append_skip_enabled(frozen)
+                or frozen.run_options.get("series_average", False)):
             return 0
 
         scan_name = self._eiger_scan_name(path)
-        completed = self._append_skip_snapshot(scan_name)
+        completed = self._append_skip_snapshot(frozen, scan_name)
         source_snapshot = (
             getattr(self, "_append_source_snapshot_by_scan", {}) or {}
         ).get(str(scan_name))
@@ -4302,7 +4259,7 @@ class imageThread(wranglerThread):
             return nframes
         return 0
 
-    def _eiger_skip_complete_append_master(self, path, candidate):
+    def _eiger_skip_complete_append_master(self, frozen, path, candidate):
         """Bulk-account and retire one fully durable Append input.
 
         The count is a stamp-qualified value copied at Run start and the output
@@ -4310,7 +4267,7 @@ class imageThread(wranglerThread):
         stale count, partial output, or mismatch takes the unchanged raw-open
         path.
         """
-        count = self._eiger_complete_append_count(path, candidate)
+        count = self._eiger_complete_append_count(frozen, path, candidate)
         if count <= 0:
             return False
         self._append_skip_without_reading = (
@@ -4320,7 +4277,7 @@ class imageThread(wranglerThread):
         self._eiger_retire_master(str(path))
         return True
 
-    def _eiger_skip_open_complete_append_master(self):
+    def _eiger_skip_open_complete_append_master(self, frozen):
         """Cold-start Append fast path after one raw-container open.
 
         A fresh GUI has no finalized frame-count memo yet.  Opening a
@@ -4331,13 +4288,13 @@ class imageThread(wranglerThread):
         """
         path = getattr(self, "_eiger_master_path", None)
         if (
-            getattr(self, "inp_type", None) == "Image Directory"
+            frozen.source.family == "directory"
             and path
-            and self._append_skip_enabled()
-            and getattr(self, "series_average", False)
+            and self._append_skip_enabled(frozen)
+            and frozen.run_options.get("series_average", False)
         ):
             scan_name = self._eiger_scan_name(path)
-            if 1 in self._append_skip_snapshot(scan_name):
+            if 1 in self._append_skip_snapshot(frozen, scan_name):
                 message = (
                     f"Averaged output already exists for '{scan_name}' — the "
                     "whole series would be skipped and nothing written. "
@@ -4354,17 +4311,17 @@ class imageThread(wranglerThread):
                 self._eiger_frame_idx = 0
                 self._eiger_nframes = 0
                 return True
-        if (getattr(self, "inp_type", None) != "Image Directory"
+        if (frozen.source.family != "directory"
                 or not path
                 or not self._eiger_open_count_can_bulk_compare(path)
-                or not self._append_skip_enabled()
-                or getattr(self, "series_average", False)):
+                or not self._append_skip_enabled(frozen)
+                or frozen.run_options.get("series_average", False)):
             return False
         count = int(getattr(self, "_eiger_nframes", 0) or 0)
         if count <= 0:
             return False
         scan_name = self._eiger_scan_name(path)
-        completed = self._append_skip_snapshot(scan_name)
+        completed = self._append_skip_snapshot(frozen, scan_name)
         first_missing = next(
             (frame for frame in range(1, count + 1)
              if frame not in completed),
@@ -4400,7 +4357,7 @@ class imageThread(wranglerThread):
         self._h19_queue_already_current = True
         return True
 
-    def _eiger_refill_master_queue(self):
+    def _eiger_refill_master_queue(self, frozen):
         """Queue matching HDF5 master / NeXus files not yet processed."""
         if (getattr(self, "source_run_plan", None) is not None
                 and getattr(self, "source_index_session", None) is not None):
@@ -4445,26 +4402,18 @@ class imageThread(wranglerThread):
                 self._eiger_master_queue.append(value)
             return
 
-        match = _name_filter(self.file_filter)
-        img_ext = (getattr(self, 'img_ext', '') or '').lower().lstrip('.')
-        if not img_ext:
-            # Never skip discovery SILENTLY — an unset extension here reads
-            # as "found nothing" with no clue why (bl17-2, 2026-07-13).
-            logger.warning(
-                'directory discovery skipped: no File Type extension set '
-                '(directory: %s)', getattr(self, 'img_dir', ''))
-            return
-        spec = getattr(self, "source_spec", None)
-        suffixes = tuple(getattr(spec, "suffixes", ()) or ())
+        match = _name_filter((frozen.source.name_filter or ""))
+        suffixes = frozen.source.suffixes
         if not suffixes:
-            suffixes = (
-                (f"_master.{img_ext}",)
-                if img_ext in ("h5", "hdf5")
-                else (f".{img_ext}",)
-            )
-        root = Path(getattr(spec, "root", self.img_dir))
-        recursive = bool(getattr(
-            spec, "recursive", self.include_subdir))
+            # Never skip discovery SILENTLY — no match suffix here reads as
+            # "found nothing" with no clue why (bl17-2, 2026-07-13).
+            logger.warning(
+                'directory discovery skipped: the accepted source froze no '
+                'File Type suffix (directory: %s)',
+                frozen.source.filesystem_root)
+            return
+        root = Path(frozen.source.filesystem_root)
+        recursive = bool(frozen.source.recursive)
         walk = getattr(self, "_directory_walk_iter", None)
         if walk is None:
             walk = self._directory_walk_items(
@@ -4648,7 +4597,7 @@ class imageThread(wranglerThread):
             str(candidate.path): candidate for candidate in ready_candidates}
         return tuple(candidate.path for candidate in ready_candidates)
 
-    def _eiger_pop_next_master(self):
+    def _eiger_pop_next_master(self, frozen):
         """Pop the next master, deferring unfinalized NXWriter containers.
 
         F5 moved here from refill time (DIR-2): one finalized-at-close
@@ -4706,7 +4655,7 @@ class imageThread(wranglerThread):
                     skip_complete = getattr(
                         self, "_eiger_skip_complete_append_master", None)
                     if (skip_complete is not None
-                            and skip_complete(path, candidate)):
+                            and skip_complete(frozen, path, candidate)):
                         continue
                     self._eiger_master_candidate = candidate
                     return path
@@ -4726,7 +4675,7 @@ class imageThread(wranglerThread):
                 if stale_this_pass and stale_followups >= 1:
                     return None
                 before = int(self._h19_pending_count)
-                self._eiger_refill_master_queue()
+                self._eiger_refill_master_queue(frozen)
                 if stale_this_pass:
                     stale_followups += 1
                 if self._eiger_master_queue:
@@ -4765,7 +4714,7 @@ class imageThread(wranglerThread):
                 if (
                     owner is not None
                     and skip_complete is not None
-                    and skip_complete(cand, candidate)
+                    and skip_complete(frozen, cand, candidate)
                 ):
                     continue
                 self._eiger_master_candidate = (
@@ -4776,15 +4725,15 @@ class imageThread(wranglerThread):
                 or getattr(self, "_directory_walk_iter", None) is None
             ):
                 return None
-            if getattr(self, "live_mode", False):
+            if frozen.live_mode:
                 # One live reader request owns at most one bounded discovery
                 # batch.  Returning an idle sentinel here keeps Stop/UI cadence
                 # responsive on an accidentally broad recursive root; the
                 # persistent iterator resumes on the next watch request.
                 return None
-            self._eiger_refill_master_queue()
+            self._eiger_refill_master_queue(frozen)
 
-    def _get_next_eiger_frame(self):
+    def _get_next_eiger_frame(self, frozen):
         """Return the next frame from Eiger / NeXus HDF5 file(s).
 
         Wraps :meth:`_get_next_eiger_frame_sync` with a background
@@ -4798,7 +4747,7 @@ class imageThread(wranglerThread):
         worker exited without pushing a sentinel.
         """
         if self._prefetch_queue is None:
-            self._start_prefetcher()
+            self._start_prefetcher(frozen)
         # Poll the queue so we can cooperate with user Stop even if the
         # prefetcher died or hasn't pushed an end-of-stream sentinel yet.
         while True:
@@ -4817,7 +4766,7 @@ class imageThread(wranglerThread):
                 # batch, a drained worker is the genuine end of the finite scan.
                 if (self._prefetch_thread is None
                         or not self._prefetch_thread.is_alive()):
-                    if (not self.batch_mode) and self.command != 'stop':
+                    if (not frozen.batch_mode) and self.command != 'stop':
                         self._prefetch_queue = None
                         self._prefetch_thread = None
                     return (None, None, 1, None, {})
@@ -4834,7 +4783,7 @@ class imageThread(wranglerThread):
                 self._prefetch_error = None
             return item
 
-    def _start_prefetcher(self):
+    def _start_prefetcher(self, frozen):
         """Spin up the background prefetch thread (idempotent)."""
         if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
             return
@@ -4844,7 +4793,10 @@ class imageThread(wranglerThread):
         self._prefetch_stop_evt = stop_evt
         self._prefetch_thread = threading.Thread(
             target=self._prefetch_worker,
-            args=(prefetch_queue, stop_evt),
+            # The prefetch thread executes THIS run, so it receives the exact
+            # accepted configuration at spawn rather than re-reading a carrier
+            # from another thread (review §43.4).
+            args=(frozen, prefetch_queue, stop_evt),
             name='eiger-prefetch',
             daemon=True,
         )
@@ -4873,7 +4825,7 @@ class imageThread(wranglerThread):
                 continue
         return False
 
-    def _prefetch_worker(self, prefetch_queue=None, stop_evt=None):
+    def _prefetch_worker(self, frozen, prefetch_queue=None, stop_evt=None):
         """Read frames sequentially and push them onto the bounded queue.
 
         Uses bulk HDF5 slices (`dset[i:i+N]`) where possible so each chunk
@@ -4901,7 +4853,7 @@ class imageThread(wranglerThread):
                 # Always fetch the first frame of (the next) master through
                 # the sync reader — it handles master-queue advancement,
                 # handle opening, and frame-count refresh.
-                item = self._get_next_eiger_frame_sync()
+                item = self._get_next_eiger_frame_sync(frozen)
                 if not self._push_frame_to_queue(
                         item, prefetch_queue=prefetch_queue, stop_evt=stop_evt):
                     return
@@ -4936,7 +4888,7 @@ class imageThread(wranglerThread):
                     to_read = []
                     for frame_idx in range(start, end):
                         self._record_discovered_frame()
-                        if self._should_skip_before_read(scan_name, frame_idx + 1):
+                        if self._should_skip_before_read(frozen, scan_name, frame_idx + 1):
                             continue
                         to_read.append(frame_idx)
 
@@ -5004,7 +4956,7 @@ class imageThread(wranglerThread):
                                 # motor + counter row (so each frame carries its
                                 # own hy/i0.. values, not a shared master dict).
                                 self._frame_scan_info(
-                                    self._eiger_master_path, frame_idx),
+                                    frozen, self._eiger_master_path, frame_idx),
                             )
                             if not self._push_frame_to_queue(
                                     item, prefetch_queue=prefetch_queue,
@@ -5075,7 +5027,7 @@ class imageThread(wranglerThread):
             prefetch_thread.join(timeout=2.0)
         return prefetch_thread is None or not prefetch_thread.is_alive()
 
-    def _read_eiger_frame_tolerant(self, frame_idx):
+    def _read_eiger_frame_tolerant(self, frozen, frame_idx):
         """Read one Eiger frame, tolerating a data file that lags the master.
 
         An Eiger master declares ``nimages`` up front (written at scan start),
@@ -5112,7 +5064,7 @@ class imageThread(wranglerThread):
                             else _img.get_frame(frame_idx).data)
                 return np.asarray(_raw)
             except Exception as e:
-                if getattr(self, 'batch_mode', False) or waited >= deadline:
+                if frozen.batch_mode or waited >= deadline:
                     logger.error('Error reading frame %d from %s: %s',
                                  frame_idx, self._eiger_master_path, e)
                     return None
@@ -5148,7 +5100,7 @@ class imageThread(wranglerThread):
             logger.debug("Failed to refresh Eiger handle for %s: %s",
                          getattr(self, "_eiger_master_path", None), e)
 
-    def _get_next_eiger_frame_sync(self):
+    def _get_next_eiger_frame_sync(self, frozen):
         """Return the next frame from Eiger HDF5 master file(s), one at a time.
 
         Keeps the h5py file handle open across frames to avoid the
@@ -5162,30 +5114,30 @@ class imageThread(wranglerThread):
             # watch polls return end-of-stream with zero source opens
             # (NXS-SF-1; handoff §8 "no spin-open while idle").
             if (getattr(self, '_eiger_single_file_done', False)
-                    and self.inp_type != 'Image Directory'):
+                    and frozen.source.family != "directory"):
                 return None, None, 1, None, {}
 
             # ── Initialise on the very first call ────────────────────────────
             if self._eiger_master_path is None:
-                if self.inp_type == 'Image Directory':
+                if frozen.source.family == "directory":
                     queue_current = bool(getattr(
                         self, "_h19_queue_already_current", False))
                     self._h19_queue_already_current = False
                     if not queue_current:
-                        self._eiger_refill_master_queue()
-                    next_master = self._eiger_pop_next_master()
+                        self._eiger_refill_master_queue(frozen)
+                    next_master = self._eiger_pop_next_master(frozen)
                     if next_master is None:
                         return None, None, 1, None, {}
                     self._eiger_master_path = next_master
                 else:
                     self._eiger_master_path = self.img_file
                 self._eiger_frame_idx = 0
-                self._eiger_open_master(self._eiger_master_path)
-                if self._eiger_skip_open_complete_append_master():
+                self._eiger_open_master(frozen, self._eiger_master_path)
+                if self._eiger_skip_open_complete_append_master(frozen):
                     continue
                 if self._eiger_nframes == 0:
-                    self._eiger_close_or_defer_zero_frame_master()
-                    if self.inp_type == 'Image Directory':
+                    self._eiger_close_or_defer_zero_frame_master(frozen)
+                    if frozen.source.family == "directory":
                         # An imageless container (a diode/alignment scan in a
                         # mixed beamline directory) must not END the stream —
                         # loop back so the exhaustion branch retires it and
@@ -5220,15 +5172,15 @@ class imageThread(wranglerThread):
                     self._eiger_nframes = self._get_nframes(self._eiger_master_path)
 
             if self._eiger_frame_idx >= self._eiger_nframes:
-                if self.inp_type == 'Image Directory':
+                if frozen.source.family == "directory":
                     self._eiger_retire_master(self._eiger_master_path)
                     self._emit_container_count(self._eiger_master_path,
                                                self._eiger_nframes,
                                                authoritative=True)
                     self._eiger_close_master()
                     if not self._eiger_master_queue:
-                        self._eiger_refill_master_queue()
-                    next_master = self._eiger_pop_next_master()
+                        self._eiger_refill_master_queue(frozen)
+                    next_master = self._eiger_pop_next_master(frozen)
                     if next_master is None:
                         self._eiger_master_path = None
                         self._eiger_frame_idx = 0
@@ -5236,14 +5188,14 @@ class imageThread(wranglerThread):
                         return None, None, 1, None, {}
                     self._eiger_master_path = next_master
                     self._eiger_frame_idx = 0
-                    self._eiger_open_master(self._eiger_master_path)
-                    if self._eiger_skip_open_complete_append_master():
+                    self._eiger_open_master(frozen, self._eiger_master_path)
+                    if self._eiger_skip_open_complete_append_master(frozen):
                         continue
                     if self._eiger_nframes == 0:
                         # Imageless container mid-queue: retire-and-advance via
                         # the exhaustion branch, never end the stream (see the
                         # init-branch note).
-                        self._eiger_close_or_defer_zero_frame_master()
+                        self._eiger_close_or_defer_zero_frame_master(frozen)
                         continue
                 else:
                     # NXS-SF-1/SF-2: a live single-file source may still be
@@ -5252,7 +5204,7 @@ class imageThread(wranglerThread):
                     # (never restarts at zero), 'wait' hands the watch loop a
                     # sentinel to back off on, 'end' is the finalized fixed
                     # point (or batch/stop) and closes the source.
-                    outcome = self._eiger_single_file_growth_outcome()
+                    outcome = self._eiger_single_file_growth_outcome(frozen)
                     if outcome == 'grown':
                         continue
                     if outcome == 'end':
@@ -5270,10 +5222,10 @@ class imageThread(wranglerThread):
             scan_name = self._eiger_scan_name(self._eiger_master_path)
             img_number = frame_idx + 1  # 1-based
             self._record_discovered_frame()
-            if self._should_skip_before_read(scan_name, img_number):
+            if self._should_skip_before_read(frozen, scan_name, img_number):
                 continue
 
-            img_data = self._read_eiger_frame_tolerant(frame_idx)
+            img_data = self._read_eiger_frame_tolerant(frozen, frame_idx)
             if img_data is None:
                 stop_evt = getattr(self, '_prefetch_stop_evt', None)
                 if (getattr(self, 'command', None) == 'stop'
@@ -5288,7 +5240,7 @@ class imageThread(wranglerThread):
                 self._record_skip_reason("unreadable or empty image data")
                 continue
 
-            meta = self._frame_scan_info(self._eiger_master_path, frame_idx)
+            meta = self._frame_scan_info(frozen, self._eiger_master_path, frame_idx)
 
             return self._eiger_master_path, scan_name, img_number, img_data, meta
 
@@ -5355,7 +5307,7 @@ class imageThread(wranglerThread):
         return (now - first) >= getattr(
             self, "FRAME_READ_DEADLINE", _FRAME_READ_DEADLINE)
 
-    def _frozen_source_is_container(self):
+    def _frozen_source_is_container(self, frozen):
         """Container-versus-series, decided by the ACCEPTED frozen source (R4B-14).
 
         The old gate keyed on ``self.img_ext`` — a mutable panel mirror, i.e. a
@@ -5365,10 +5317,7 @@ class imageThread(wranglerThread):
         * a frozen directory source is a container run iff any of its frozen
           suffixes names a container FORMAT;
         * a frozen file source is a container run iff its kind (or its own URI's
-          suffix) is a container kind;
-        * when the click froze NO typed source (the Eiger-master Image-Series
-          case, where Controls deliberately freezes none), the decision falls to
-          the run's OWN source URI — file identity, never panel configuration.
+          suffix) is a container kind.
 
         W-1C: a frozen DIRECTORY source carries the freeze owner's MATCH
         SUFFIXES, not bare extensions — ``_controls_v2_container_index_config``
@@ -5376,29 +5325,23 @@ class imageThread(wranglerThread):
         ``("_master.hdf5", "_master.h5")`` for hdf5, because a container
         directory is matched by filename TAIL.  Comparing the whole suffix
         string therefore refused every real Eiger-master directory.  The
-        container question is about the format, so compare the extension TOKEN
-        (:func:`_suffix_format_token`) and let the emitter go on spelling its own
-        match rule — the alternative, teaching this consumer the ``_master.*``
-        literals, would re-create exactly the emitter coupling R4B-14 removed.
+        container question is about the format, so compare the extension TOKENS
+        the frozen source normalizes for exactly this purpose and let the emitter
+        go on spelling its own match rule — the alternative, teaching this
+        consumer the ``_master.*`` literals, would re-create exactly the emitter
+        coupling R4B-14 removed.
         """
 
-        frozen = imageThread._frozen_run_policy(
-            self, "container-selection")
         source = frozen.source
-        if source is not None:
-            if source.family == "directory":
-                return any(_suffix_format_token(suffix) in _CONTAINER_SUFFIXES
-                           for suffix in source.suffixes)
-            if str(source.source_kind) in _CONTAINER_SOURCE_KINDS:
-                return True
-            return _suffix_format_token(
-                Path(str(source.uri)).suffix) in _CONTAINER_SUFFIXES
-        img_file = getattr(self, "img_file", "") or ""
-        return bool(img_file) and (
-            _suffix_format_token(Path(img_file).suffix) in _CONTAINER_SUFFIXES)
+        if str(source.source_kind) in _CONTAINER_SOURCE_KINDS:
+            return True
+        return any(token in _CONTAINER_SUFFIXES
+                   for token in source.format_tokens)
 
-    def get_next_image(self):
+    def get_next_image(self, frozen):
         """Gets next image in image series or in directory to process."""
+        series_average = frozen.run_options.get("series_average", False)
+        meta_ext = frozen.run_options.get("meta_ext")
         # O-1a-W1R (review §39.2 W1R-P1-5 items 1-2): the reader FAMILY is the
         # frozen source's decision.  The parent derived ``is_master`` from the
         # mutable ``img_file`` cursor and evaluated ``single_img`` before the
@@ -5407,26 +5350,26 @@ class imageThread(wranglerThread):
         # container directory plus ``single_img=True`` routed to plain-image
         # handling.  ``img_file`` stays the runtime cursor; it no longer decides
         # the family.
-        is_container = imageThread._frozen_source_is_container(self)
+        is_container = imageThread._frozen_source_is_container(self, frozen)
 
-        if self.single_img and not is_container:
+        if (frozen.source.source_kind == "image_file") and not is_container:
             scan_name, img_number = _get_scan_info(self.img_file)
             self._record_discovered_frame()
-            if self._should_skip_before_read(scan_name, img_number):
-                self.sigUpdate.emit(self._append_output_number(img_number))
+            if self._should_skip_before_read(frozen, scan_name, img_number):
+                self.sigUpdate.emit(self._append_output_number(frozen, img_number))
                 return None, scan_name, img_number, None, {}
             img_data = self._read_frame_tolerant(self.img_file)
             if img_data is None:
                 return None, scan_name, img_number, None, {}
-            meta = read_image_metadata(self.img_file, meta_format=self.meta_ext, meta_dir=self.meta_dir) if self.meta_ext else {}
+            meta = read_image_metadata(self.img_file, meta_format=meta_ext, meta_dir=self.meta_dir) if meta_ext else {}
             return self.img_file, scan_name, img_number, img_data, meta
 
         if is_container:
-            return self._get_next_eiger_frame()
+            return self._get_next_eiger_frame(frozen)
 
         if len(self.img_fnames) == 0:
-            if self.inp_type != 'Image Directory':
-                source_spec = getattr(self, "source_spec", None)
+            if frozen.source.family != "directory":
+                source_spec = frozen.thaw_source_spec()
                 frozen_files = tuple(
                     getattr(source_spec, "options", {}).get("files", ())
                     if source_spec is not None else ()
@@ -5438,23 +5381,29 @@ class imageThread(wranglerThread):
                     self.img_fnames = [Path(path) for path in frozen_files]
                 else:
                     # Legacy fallback keeps the same full-series semantics.
+                    token = (frozen.source.format_tokens or ("",))[0]
                     _series_re = re.compile(
                         rf'^{re.escape(self.scan_name)}[_-]\d+\.'
-                        rf'{re.escape(self.img_ext)}$',
+                        rf'{re.escape(token)}$',
                         re.IGNORECASE,
                     )
                     self.img_fnames = [
                         p for p in _paths_with_suffix(
-                            Path(self.img_dir), f'.{self.img_ext}')
+                            Path(frozen.source.filesystem_root), f'.{token}')
                         if _series_re.match(p.name)
                     ]
             else:
-                match = _name_filter(self.file_filter)
-                suffix = f'.{self.img_ext}'
-                candidates = _paths_with_suffix(
-                    Path(self.img_dir), suffix, recursive=self.include_subdir)
-                self.img_fnames = (p for p in candidates
-                                   if match(p.name[:-len(suffix)]))
+                match = _name_filter((frozen.source.name_filter or ""))
+                # The freeze owner's own match suffixes, all alternatives.
+                candidates = [
+                    path
+                    for suffix in frozen.source.suffixes
+                    for path in _paths_with_suffix(
+                        Path(frozen.source.filesystem_root), suffix,
+                        recursive=frozen.source.recursive)
+                    if match(path.name[:-len(suffix)])
+                ]
+                self.img_fnames = candidates
 
             processed = set(str(f) for f in self.processed)
             self.img_fnames = [
@@ -5474,7 +5423,7 @@ class imageThread(wranglerThread):
             if (n > 0) and (scan_name != sname):
                 break
 
-            if self._should_skip_before_read(sname, snumber):
+            if self._should_skip_before_read(frozen, sname, snumber):
                 self._commit_frame(fname)
                 continue
 
@@ -5485,7 +5434,7 @@ class imageThread(wranglerThread):
                 # and re-poll on the next sweep (never dropped) until the
                 # cross-sweep deadline; only then -- or in batch, where every
                 # file is already complete -- give up and skip it.
-                if (not self.batch_mode) and not self._frame_read_deadline_reached(fname):
+                if (not frozen.batch_mode) and not self._frame_read_deadline_reached(fname):
                     return None, sname, snumber, None, {}
                 self._commit_frame(fname)
                 self._record_skip_reason("unreadable image (gave up after deadline)")
@@ -5496,10 +5445,10 @@ class imageThread(wranglerThread):
                 self._record_skip_reason("unreadable or empty image data")
                 continue
 
-            meta = read_image_metadata(fname, meta_format=self.meta_ext, meta_dir=self.meta_dir) if self.meta_ext else {}
+            meta = read_image_metadata(fname, meta_format=meta_ext, meta_dir=self.meta_dir) if meta_ext else {}
             n += 1
 
-            if (not self.series_average) or (snumber is None):
+            if (not series_average) or (snumber is None):
                 return fname, sname, snumber, data, meta
             else:
                 if n == 1:
@@ -5527,15 +5476,16 @@ class imageThread(wranglerThread):
 
     # ── Metadata / Background ────────────────────────────────────────────
 
-    def get_meta_data(self, img_file):
-        if not self.meta_ext:
+    def get_meta_data(self, frozen, img_file):
+        meta_ext = frozen.run_options.get("meta_ext")
+        if not meta_ext:
             # GUI "none"/blank is an off switch.  The reusable headless reader
             # maps None to auto, so the GUI worker must guard before calling it.
             return {}
-        return read_image_metadata(img_file, meta_format=self.meta_ext, meta_dir=self.meta_dir)
+        return read_image_metadata(img_file, meta_format=meta_ext, meta_dir=self.meta_dir)
 
-    def subtract_bg(self, img_data, img_file, img_number, img_meta):
-        bg = self.get_background(img_file, img_number, img_meta)
+    def subtract_bg(self, frozen, img_data, img_file, img_number, img_meta):
+        bg = self.get_background(frozen, img_file, img_number, img_meta)
         try:
             img_data -= bg
         except ValueError:
@@ -5581,7 +5531,7 @@ class imageThread(wranglerThread):
         except Exception:
             logger.debug("showLabel emit failed", exc_info=True)
 
-    def _output_safety_args(self):
+    def _output_safety_args(self, frozen):
         """Assemble the source/output collision-guard inputs from run config.
 
         Shared by the run-start preflight (fail loud before any read) and the
@@ -5590,21 +5540,20 @@ class imageThread(wranglerThread):
         (:func:`xrd_tools.io.output_safety.check_output_not_source`).  Pure
         assembly — no I/O.
         """
-        inp_type = getattr(self, "inp_type", None)
-        img_ext = (getattr(self, "img_ext", "") or "").lower().lstrip(".")
         img_file = getattr(self, "img_file", "") or ""
-        is_dir = inp_type == 'Image Directory'
+        is_dir = frozen.source.family == "directory"
         # Self-contained container input (kept independent of the output suffix,
         # per the safety contract): a directory File Type of nxs/h5/hdf5, or a
         # single container/Eiger-master input file.
         container = (
-            img_ext in ('h5', 'hdf5', 'nxs')
+            any(token in _CONTAINER_SUFFIXES
+                for token in frozen.source.format_tokens)
             or (bool(img_file) and _is_eiger_master(img_file))
             or (bool(img_file)
                 and Path(img_file).suffix.lower() in ('.h5', '.hdf5', '.nxs'))
         )
-        watched = ([getattr(self, "img_dir", "")]
-                   if is_dir and getattr(self, "img_dir", "") else [])
+        watched = ([frozen.source.filesystem_root]
+                   if is_dir and frozen.source.filesystem_root else [])
         # Known source file(s): the explicit input, and (best effort) the
         # container currently open.  Directory-mode same-file overwrite is caught
         # structurally by the watched-dir check, so a raced/prefetched master
@@ -5618,7 +5567,7 @@ class imageThread(wranglerThread):
         return dict(
             input_files=inputs,
             watched_dirs=watched,
-            recursive=bool(getattr(self, "include_subdir", False)),
+            recursive=bool(frozen.source.recursive),
             container_directory_mode=bool(container),
         )
 
@@ -5656,7 +5605,9 @@ class imageThread(wranglerThread):
         frozen = imageThread._require_run_configuration(
             self, "initialize_scan")
         scan_kwargs = frozen.scan_kwargs()
-        fname = os.path.join(self.h5_dir, self.scan_name + '.nxs')
+        series_average = frozen.run_options.get("series_average", False)
+        xye_only = frozen.run_options.get("xye_only", False)
+        fname = os.path.join(frozen.save_path, self.scan_name + '.nxs')
         # F-NXS-1: refuse to (over)write when the derived output collides with a
         # raw source — Save Path == the watched raw directory makes source ==
         # output for a same-stem container, which overwrote a 1.8 MB raw
@@ -5667,9 +5618,9 @@ class imageThread(wranglerThread):
         # for a clean run stop (like the DIR-3 locked-destination handling).
         # Skipped for Int-1D/XYE, which writes only .xye files into a
         # <scan_name>/ subfolder and never replaces this .nxs (no collision).
-        if not self.xye_only:
-            check_output_not_source(fname, **self._output_safety_args())
-        Path(self.h5_dir).mkdir(parents=True, exist_ok=True)
+        if not xye_only:
+            check_output_not_source(fname, **self._output_safety_args(frozen))
+        Path(frozen.save_path).mkdir(parents=True, exist_ok=True)
         # Eiger master files are pre-processed with the trailing
         # ``_master`` suffix stripped from scan_name (see
         # _get_next_eiger_frame). Without this sync, the wrangler
@@ -5685,8 +5636,8 @@ class imageThread(wranglerThread):
                           incidence_motor=scan_kwargs["incidence_motor"],
                           # acquisition shape, not run configuration: how frames
                           # arrive from THIS source, never a Controls value.
-                          series_average=self.series_average,
-                          single_img=self.single_img,
+                          series_average=series_average,
+                          single_img=(frozen.source.source_kind == "image_file"),
                           global_mask=self.mask,
                           detector_shape=self.detector_shape,
                           # J2: share lock with wrangler save path
@@ -5710,7 +5661,7 @@ class imageThread(wranglerThread):
         # other source; PONI geometry still wins (see _stamp_bluesky_wavelength).
         self._stamp_bluesky_wavelength(scan)
 
-        write_mode = self.write_mode
+        write_mode = frozen.output_mode
         if not os.path.exists(fname):
             write_mode = 'Overwrite'
 
@@ -5718,11 +5669,11 @@ class imageThread(wranglerThread):
         # create or write the .nxs stack at all.  Skip all NeXus disk I/O here —
         # the per-batch ``scan._save_to_nexus`` is already gated off for
         # xye_only, so the scan object is used purely in-memory for integration.
-        if not self.xye_only:
+        if not xye_only:
             if write_mode == 'Append':
                 # Usually populated before the raw read.  Keep direct entry
                 # paths safe too; when cached this performs no file I/O.
-                self._load_append_skip_snapshot(self.scan_name)
+                self._load_append_skip_snapshot(frozen, self.scan_name)
             with self.file_lock:
                 with self._h5pool_bracket(scan):
                     if write_mode == 'Append':
@@ -5760,7 +5711,7 @@ class imageThread(wranglerThread):
                         _apply_frozen_run_configuration(scan, frozen)
                         for (k, v) in frozen.scan_args().items():
                             setattr(scan, k, v)
-                        self._remember_append_skip_snapshot(scan.name, scan=scan)
+                        self._remember_append_skip_snapshot(frozen, scan.name, scan=scan)
                         existing_frames = list(scan.frames.index)
                         if len(existing_frames) == 0:
                             try:
@@ -5789,29 +5740,29 @@ class imageThread(wranglerThread):
         self.sigUpdateFile.emit(
             self.scan_name, fname,
             bool(scan_kwargs["gi"]), scan_kwargs["incidence_motor"],
-            self.single_img, self.series_average
+            (frozen.source.source_kind == "image_file"), series_average
         )
         logger.info('***** New Scan *****')
-        if self.xye_only:
+        if xye_only:
             logger.info('Output (XYE) folder: %s',
-                        os.path.join(self.h5_dir, self.scan_name))
+                        os.path.join(frozen.save_path, self.scan_name))
         else:
             logger.info('Output file: %s', fname)
 
         return scan
 
-    def get_mask(self):
+    def get_mask(self, frozen):
         """Get mask array from mask file."""
         self.mask = self.detector.calc_mask()
-        if self.mask_file and os.path.exists(self.mask_file):
+        if frozen.mask_file and os.path.exists(frozen.mask_file):
             if self.mask is not None:
                 try:
-                    self.mask += fabio.open(self.mask_file).data
+                    self.mask += fabio.open(frozen.mask_file).data
                 except ValueError:
                     logger.warning('Mask file not valid for Detector (shape mismatch)')
                     pass
             else:
-                self.mask = fabio.open(self.mask_file).data
+                self.mask = fabio.open(frozen.mask_file).data
 
         if self.mask is None:
             return None
@@ -5822,13 +5773,14 @@ class imageThread(wranglerThread):
 
         self.mask = np.flatnonzero(self.mask)
 
-    def threshold(self, img_data):
+    def threshold(self, frozen, img_data):
         """Return flat indices of pixels outside [threshold_min, threshold_max]."""
-        mask = (img_data < self.threshold_min) | (img_data > self.threshold_max)
+        mask = (img_data < frozen.threshold.threshold_min) | (img_data > frozen.threshold.threshold_max)
         return np.flatnonzero(mask)
 
-    def get_background(self, img_file, img_number, img_meta):
+    def get_background(self, frozen, img_file, img_number, img_meta):
         """Subtract background image if bg_file or bg_dir specified."""
+        meta_ext = frozen.run_options.get("meta_ext")
         if self.bg_type == 'None':
             return 0
 
@@ -5838,10 +5790,10 @@ class imageThread(wranglerThread):
         if self.bg_type == 'Single BG File':
             if self.bg_file:
                 bg_file = self.bg_file
-                bg_meta = self.get_meta_data(bg_file)
+                bg_meta = self.get_meta_data(frozen, bg_file)
         elif self.bg_type == 'Series Average':
             if self.bg_file:
-                sname, fnames, bg, bg_meta = get_series_avg(self.bg_file, self.detector, self.meta_ext)
+                sname, fnames, bg, bg_meta = get_series_avg(self.bg_file, self.detector, meta_ext)
                 if sname is None:
                     return 0
         else:
@@ -5856,23 +5808,24 @@ class imageThread(wranglerThread):
                     scan_term = str(self.scan_name).lower()
                     match = (lambda name, _m=match, _t=scan_term:
                              _t in str(name).lower() and _m(name))
-                if not self.meta_ext:
+                if not meta_ext:
                     meta_files = []
                     suffix = ''
                 else:
-                    suffix = f'.{self.meta_ext}'
+                    suffix = f'.{meta_ext}'
                     meta_files = sorted(
-                        str(f) for f in _paths_with_suffix(self.img_dir, suffix)
+                        str(f) for f in _paths_with_suffix(frozen.source.filesystem_root, suffix)
                         if match(f.name[:-len(suffix)])
                     )
 
                 for meta_file in meta_files:
-                    bg_file = f'{os.path.splitext(meta_file)[0]}.{self.img_ext}'
+                    bg_file = (f'{os.path.splitext(meta_file)[0]}'
+                               f'.{(frozen.source.format_tokens or ("",))[0]}')
                     if bg_file == img_file:
                         bg_file = None
                         continue
 
-                    bg_meta = self.get_meta_data(bg_file)
+                    bg_meta = self.get_meta_data(frozen, bg_file)
                     if self.bg_match_fname:
                         _, meta_img_num = _get_scan_info(meta_file)
                         if img_number == meta_img_num:
@@ -5917,31 +5870,3 @@ class imageThread(wranglerThread):
     # ``save_1d`` moved to wranglerThread (the base class).
 
 
-# ── O-1a-W1R Phase 2: frozen policy is the SOLE execution input ─────────────
-#
-# Every FROZEN_EXECUTION_POLICY carrier this worker consumes is bound to the
-# shared read-through projection (review §39.2 W1R-P1-4/W1R-P1-5, §39.5 Phase 2
-# items 2-3).  The historical names are unchanged, so no read site needs an
-# indirection, but the mutable field is gone: while a run configuration is
-# admitted the read resolves through THAT exact object and a write lands in the
-# zero-reader display slot.  RUNTIME_SOURCE_CURSOR values (``img_file``,
-# ``img_fnames``, ``scan_name``, ``processed``, ``poni``, ``detector``, ``mask``,
-# ``meta_dir``, ``source_base``) are deliberately NOT listed: they are real
-# runtime data and must stay writable.
-install_frozen_run_projections(imageThread, (
-    # output
-    "write_mode", "h5_dir",
-    # scientific policy
-    "apply_threshold", "threshold_min", "threshold_max", "mask_sentinel",
-    "mask_file",
-    # grazing incidence
-    "gi", "incidence_motor", "sample_orientation", "tilt_angle",
-    # mode / parallelism
-    "live_mode", "batch_mode", "max_cores", "xye_only", "series_average",
-    "meta_ext",
-    # source family / traversal
-    "inp_type", "img_ext", "img_dir", "single_img", "include_subdir",
-    "file_filter", "source_spec",
-    # integration arguments
-    "scan_args",
-))

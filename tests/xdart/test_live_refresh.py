@@ -1297,9 +1297,9 @@ def test_append_run_start_seeds_processed_frame_browser_without_render():
     viewer._remember_displayed_frames = MethodType(
         H5Viewer._remember_displayed_frames, viewer)
     viewer.update_data = MethodType(H5Viewer.update_data, viewer)
+    # O-1a-W1R-D3: the seeding host reads the run's ACCEPTED configuration.
     thread = SimpleNamespace(
-        write_mode="Append",
-        xye_only=False,
+        run_configuration=_seed_accepted_run(),
         _append_skip_snapshot=lambda name: {1, 2, 3},
     )
     host = SimpleNamespace(
@@ -2678,8 +2678,11 @@ def test_get_img_fname_clears_motors_when_source_switch_resolves_no_file():
         def show(self):
             self.visible = True
 
+    # O-1a-W1R-D2 (review §42.2): the source MODE is read from the Source
+    # card now, so these hand-armed hosts must state it there -- production
+    # carries no fallback to the mutable mirror (§42.4 item 8).
     signal = {"img_ext": _P("h5"), "img_dir": _P(""), "include_subdir": _P(False),
-              "File": _P("")}
+              "File": _P(""), "inp_type": _P("Image Directory")}
     gi = {"th_motor": _P("th"), "th_val": _P("0.1")}
     groups = {"Signal": signal, "GI": gi}
     params = SimpleNamespace(
@@ -2855,7 +2858,10 @@ def test_get_img_fname_no_sidecar_clears_counters_and_refreshes_bg(tmp_path):
         def value(self):
             return self._v
 
-    signal = {"File": _P(str(img))}
+    # O-1a-W1R-D2 (review §42.2): the source MODE is read from the Source
+    # card now, so these hand-armed hosts must state it there -- production
+    # carries no fallback to the mutable mirror (§42.4 item 8).
+    signal = {"File": _P(str(img)), "inp_type": _P("Image Series")}
     params = SimpleNamespace(
         child=lambda name: SimpleNamespace(child=lambda n: signal[n]))
 
@@ -2956,9 +2962,11 @@ def test_live_gi_clip_warning_fires_once_in_live_gi_only():
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
 
     def _host(*, gi, batch):
+        from xrd_tools.session import GIIntent, RunIntent
         labels = []
         h = SimpleNamespace(
-            gi=gi, batch_mode=batch,
+            run_configuration=RunIntent(
+                gi=GIIntent(enabled=gi), batch_mode=batch).freeze(),
             showLabel=SimpleNamespace(emit=labels.append),
         )
         h._maybe_warn_live_gi_clip = MethodType(
@@ -2967,19 +2975,19 @@ def test_live_gi_clip_warning_fires_once_in_live_gi_only():
 
     # Live + GI → warns exactly once.
     h, labels = _host(gi=True, batch=False)
-    h._maybe_warn_live_gi_clip()
+    h._maybe_warn_live_gi_clip(h.run_configuration)
     assert len(labels) == 1 and "batch" in labels[0].lower()
-    h._maybe_warn_live_gi_clip()
+    h._maybe_warn_live_gi_clip(h.run_configuration)
     assert len(labels) == 1                      # once only
 
     # Batch GI → never (union scout brackets all frames).
     h, labels = _host(gi=True, batch=True)
-    h._maybe_warn_live_gi_clip()
+    h._maybe_warn_live_gi_clip(h.run_configuration)
     assert labels == []
 
     # Live non-GI → never.
     h, labels = _host(gi=False, batch=False)
-    h._maybe_warn_live_gi_clip()
+    h._maybe_warn_live_gi_clip(h.run_configuration)
     assert labels == []
 
 
@@ -3025,7 +3033,14 @@ def test_wrangler_thread_reuses_reduction_session_by_key():
 
 def _scout_host(motor):
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
-    host = SimpleNamespace(incidence_motor=motor)
+    from xrd_tools.session import GIIntent, RunIntent
+    try:
+        # A Manual numeric selection freezes as the scan's theta value.
+        gi = GIIntent(enabled=True, incidence_motor="Manual",
+                      th_val=float(motor))
+    except (TypeError, ValueError):
+        gi = GIIntent(enabled=True, incidence_motor=str(motor))
+    host = SimpleNamespace(run_configuration=RunIntent(gi=gi).freeze())
     host._scout_pending_frames = MethodType(imageThread._scout_pending_frames, host)
     return host
 
@@ -3043,32 +3058,32 @@ def _scout_pending(incs, motor='th'):
 def test_scout_picks_incidence_extremes_order_independent():
     host = _scout_host('th')
     asc = _scout_pending([0.1, 0.2, 0.3, 0.4])
-    assert host._scout_pending_frames(asc) == [asc[0], asc[3]]
+    assert host._scout_pending_frames(host.run_configuration, asc) == [asc[0], asc[3]]
     desc = _scout_pending([0.4, 0.3, 0.2, 0.1])
     # Extremes by VALUE (idx3 lowest, idx0 highest), not position → order-independent.
-    assert host._scout_pending_frames(desc) == [desc[0], desc[3]]
+    assert host._scout_pending_frames(host.run_configuration, desc) == [desc[0], desc[3]]
     unsorted_ = _scout_pending([0.3, 0.1, 0.4, 0.2])
-    assert host._scout_pending_frames(unsorted_) == [unsorted_[1], unsorted_[2]]  # min@1, max@2
+    assert host._scout_pending_frames(host.run_configuration, unsorted_) == [unsorted_[1], unsorted_[2]]  # min@1, max@2
 
 
 def test_scout_partial_metadata_adds_positional_ends():
     host = _scout_host('th')
     # idx1 unreadable; resolvable min@0 (0.1), max@2 (0.3); + positional ends 0,3.
     pending = _scout_pending([0.1, None, 0.3, 0.2])
-    got = host._scout_pending_frames(pending)
+    got = host._scout_pending_frames(host.run_configuration, pending)
     assert got == [pending[0], pending[2], pending[3]]   # {0,2} ∪ {0,3}
 
 
 def test_scout_all_metadata_missing_falls_back_to_ends():
     host = _scout_host('th')
     pending = _scout_pending([None, None, None])
-    assert host._scout_pending_frames(pending) == [pending[0], pending[2]]
+    assert host._scout_pending_frames(host.run_configuration, pending) == [pending[0], pending[2]]
 
 
 def test_scout_manual_numeric_incidence_single_frame():
     host = _scout_host('0.2')   # Manual numeric → all frames equal
     pending = _scout_pending([None, None, None], motor='th')
-    assert host._scout_pending_frames(pending) == [pending[0]]
+    assert host._scout_pending_frames(host.run_configuration, pending) == [pending[0]]
 
 
 def test_absorb_chunk_populates_publication_store_for_1d_and_2d():
@@ -8718,6 +8733,13 @@ def _accepted_run_configuration_owner(*, gi=False, bai_1d_args=None,
         _prepare_controls_v2_run_configuration=intent.freeze)
 
 
+def _seed_accepted_run():
+    """An accepted Append configuration for the run-end/seed host cases."""
+    from xrd_tools.session import RunIntent
+
+    return RunIntent(output_mode="Append").freeze()
+
+
 class _SourceCardStub:
     """Minimal ParameterTree stand-in for the Source-card readiness gate.
 
@@ -9129,8 +9151,9 @@ def test_append_config_mismatch_run_click_replace_flips_mode_and_starts(tmp_path
 
     assert prompts == [("Standard", "Grazing")]
     assert host._controls.write_mode() == "Overwrite"
+    # O-1a-W1R-D3: the mode lives on the wrangler (and its controls) -- the
+    # worker has no write_mode mirror; the next Run freezes the flipped mode.
     assert host.write_mode == "Overwrite"
-    assert host.thread.write_mode == "Overwrite"
     assert host.sigStart.emitted == [()]
 
 
@@ -9276,7 +9299,9 @@ def test_wrangler_enabled_reapplies_viewer_mode_controls():
             assert host.ui.frame.isVisible() is True
             assert host.ui.frame.isEnabled() is False
         assert host._integration_controls_enabled is False
-        assert host.thread.live_mode is False
+        # O-1a-W1R-D3: the wrangler's own flag is what the next freeze consumes;
+        # the worker carries no live_mode mirror to push it down to.
+        assert host.live_mode is False
         assert host.tree.isEnabled() is True   # Project/Save Path stay usable
 
 
@@ -9307,7 +9332,6 @@ def test_wrangler_enabled_reapplies_xye_mode_controls():
     assert host.ui.batchCheckBox.isChecked() is True
     assert host.ui.batchCheckBox.isEnabled() is False
     assert host.xye_only is True
-    assert host.thread.xye_only is True
 
 
 def test_wrangler_enabled_run_end_reenables_mode_toggles():
@@ -9698,10 +9722,6 @@ def test_batch_process_scan_dispatches_each_frame_as_read():
 
     host = SimpleNamespace(
         command="start",
-        batch_mode=True,
-        live_mode=False,
-        single_img=False,
-        xye_only=False,
         img_file="/tmp/scan_a_0001.tif",
         poni=None,
         scan_name="scan_a",
@@ -9711,18 +9731,20 @@ def test_batch_process_scan_dispatches_each_frame_as_read():
         _live_execution=lambda: "serial",
         showLabel=SimpleNamespace(emit=lambda *_: None),
         sigUpdate=SimpleNamespace(emit=lambda value: final_updates.append(value)),
-        _wait_if_paused=lambda: None,
-        get_next_image=next_image,
+        _wait_if_paused=lambda _frozen: None,
+        get_next_image=lambda _frozen: next_image(),
         _middle_truncate=lambda text, max_len=40: text,
         initialize_scan=make_scan,
         get_background=lambda *_: 0.0,
         _flush_xye_buffer=lambda *_args, **_kw: None,
-        _save_due=lambda scan, force=False: False,   # frames=0 -> nothing due
-        _prime_append_skip_snapshots_for_run=lambda: None,
-        _append_frame_complete=lambda _name, idx, scan: idx in scan.frames.index,
+        # frames=0 -> nothing due
+        _save_due=lambda _frozen, scan, force=False: False,
+        _prime_append_skip_snapshots_for_run=lambda _frozen: None,
+        _append_frame_complete=lambda _frozen, _name, idx, scan:
+            idx in scan.frames.index,
     )
 
-    def dispatch(scan, pending, *, force_save=False):
+    def dispatch(_frozen, scan, pending, *, force_save=False):
         dispatched.append((tuple(item[1] for item in pending), bool(force_save)))
         return len(pending)
 
@@ -9741,11 +9763,18 @@ def test_batch_process_scan_dispatches_each_frame_as_read():
     # always published one, so arm this host with a REAL frozen configuration
     # from the production freeze owner; the case still measures what it was
     # written for.
+    from xrd_tools.core.scan import SourceKind, SourceSpec
     from xrd_tools.session import RunIntent as _W1R_RunIntent
     host.run_configuration = _W1R_RunIntent(
-        processing_mode="Int 2D").freeze()
+        processing_mode="Int 2D",
+        batch_mode=True,
+        live_mode=False,
+        source_spec=SourceSpec(
+            '/tmp', SourceKind.TIFF_SERIES,
+            options={"selected_file": '/tmp/scan_a_0001.tif'}),
+    ).freeze()
     host._admitted_run_configuration = host.run_configuration
-    MethodType(imageThread.process_scan, host)()
+    MethodType(imageThread.process_scan, host)(host.run_configuration)
 
     assert dispatched == [((1,), False), ((2,), False), ((0,), False)]
     assert final_updates == [-1]
@@ -9809,24 +9838,24 @@ def test_live_directory_idle_flushes_last_scan_xye_before_stop(
         _active_scan=None,
         _perf=None,
         _live_execution=lambda: "serial",
-        _h19_live_directory_armed=lambda: True,
-        _eiger_single_file_watchable=lambda: False,
+        _h19_live_directory_armed=lambda _frozen: True,
+        _eiger_single_file_watchable=lambda _frozen: False,
         showLabel=SimpleNamespace(emit=lambda *_: None),
         sigUpdate=SimpleNamespace(emit=lambda *_: None),
-        _wait_if_paused=lambda: None,
-        get_next_image=next_image,
+        _wait_if_paused=lambda _frozen: None,
+        get_next_image=lambda _frozen: next_image(),
         initialize_scan=make_scan,
         _install_run_integrator=lambda *_: None,
         _append_frame_complete=lambda *_: False,
         _record_skip_reason=lambda *_: None,
         get_background=lambda *_: 0.0,
         _process_one=lambda *_: None,
-        _prime_append_skip_snapshots_for_run=lambda: None,
+        _prime_append_skip_snapshots_for_run=lambda _frozen: None,
         _flush_outgoing_scan=lambda *_: None,
         _report_run_skip_summary=lambda *_: None,
     )
 
-    def flush_serial_tail(scan, *, force=False):
+    def flush_serial_tail(_frozen, scan, *, force=False):
         if not force or host._frames_since_save <= 0:
             return False
         xye_dir.mkdir(parents=True, exist_ok=True)
@@ -9847,11 +9876,18 @@ def test_live_directory_idle_flushes_last_scan_xye_before_stop(
     # always published one, so arm this host with a REAL frozen configuration
     # from the production freeze owner; the case still measures what it was
     # written for.
+    from xrd_tools.core.scan import SourceKind, SourceSpec
     from xrd_tools.session import RunIntent as _W1R_RunIntent
     host.run_configuration = _W1R_RunIntent(
-        processing_mode="Int 2D").freeze()
+        processing_mode="Int 2D",
+        batch_mode=False,
+        live_mode=True,
+        source_spec=SourceSpec(
+            '/tmp', SourceKind.TIFF_SERIES,
+            options={"selected_file": '/tmp/last_scan.nxs'}),
+    ).freeze()
     host._admitted_run_configuration = host.run_configuration
-    MethodType(imageThread.process_scan, host)()
+    MethodType(imageThread.process_scan, host)(host.run_configuration)
 
     assert idle_observations == [True]
     assert xye_dir.is_dir()
@@ -9863,19 +9899,21 @@ def test_batch_single_frame_still_routes_to_streaming_when_live_policy_serial():
     cadence would silently revert batch to the old serial path."""
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
 
+    from xrd_tools.session import RunIntent
     calls = []
     host = SimpleNamespace(
-        batch_mode=True,
-        _maybe_warn_live_gi_clip=lambda: None,
-        _dispatch_batch_streaming=lambda scan, pending: calls.append(
+        run_configuration=RunIntent(batch_mode=True).freeze(),
+        _maybe_warn_live_gi_clip=lambda _frozen: None,
+        _dispatch_batch_streaming=lambda _frozen, scan, pending: calls.append(
             ("streaming", tuple(item[1] for item in pending))) or len(pending),
-        _dispatch_batch_serial=lambda scan, pending, force_save=False: calls.append(
-            ("serial", tuple(item[1] for item in pending))) or len(pending),
+        _dispatch_batch_serial=lambda _frozen, scan, pending, force_save=False:
+            calls.append(
+                ("serial", tuple(item[1] for item in pending))) or len(pending),
         _live_execution=lambda: "serial",
     )
     pending = [("/tmp/scan_0001.tif", 1, np.ones((2, 2)), {}, 0.0, 0.0)]
 
-    assert MethodType(imageThread._dispatch_batch, host)(object(), pending) == 1
+    assert MethodType(imageThread._dispatch_batch, host)(host.run_configuration, object(), pending) == 1
     assert calls == [("streaming", (1,))]
 
 
@@ -10038,17 +10076,16 @@ def test_streaming_dispatch_series_average_submits_one_mean_frame(monkeypatch):
         USE_LEGACY_MASK_NORMALIZATION=False)
     scan.bai_1d_args = {"numpoints": 5}
     scan.bai_2d_args = {}
+    from xrd_tools.session import RunIntent as _StreamRunIntent
     host = SimpleNamespace(
-        max_cores=1,
-        gi=False,
-        incidence_motor="",
-        sample_orientation=4,
-        tilt_angle=0.0,
-        series_average=True,
+        run_configuration=_StreamRunIntent(
+            max_cores=1,
+            batch_mode=True,
+            run_options={"series_average": True},
+        ).freeze(),
         mask=None,
         poni=None,
         command="",
-        batch_mode=True,
         _plan_cache=StandardPlanCache(
             plan_builder=lambda _scan, **_kw: ReductionPlan(
                 integration_1d=Integration1DPlan(npt=5)
@@ -10061,11 +10098,11 @@ def test_streaming_dispatch_series_average_submits_one_mean_frame(monkeypatch):
         max_cores_count=1,
         _cached_gi_incident_angle=None,
         showLabel=SimpleNamespace(emit=lambda *_: None),
-        _wait_if_paused=lambda: None,
-        _prewarm_frame_mask=lambda _scan, _img: None,
-        _apply_threshold_inline=lambda img: img,
-        _resolve_frame_mask=lambda _scan, _img: None,
-        _gi_freeze_whole_scan_prepass=lambda _scan: True,
+        _wait_if_paused=lambda _frozen: None,
+        _prewarm_frame_mask=lambda _frozen, _scan, _img: None,
+        _apply_threshold_inline=lambda _frozen, img: img,
+        _resolve_frame_mask=lambda _frozen, _scan, _img: None,
+        _gi_freeze_whole_scan_prepass=lambda _frozen, _scan: True,
         _cancel_token=lambda: None,
         publication_store=PublicationStore(max_heavy_items=1),
     )
@@ -10081,7 +10118,7 @@ def test_streaming_dispatch_series_average_submits_one_mean_frame(monkeypatch):
         ("scan_0003.tif", 3, np.full((2, 2), 9.0), {"th": "5.0"}, 0.0, 0.1),
     ]
 
-    count = host._dispatch_batch_streaming(scan, pending)
+    count = host._dispatch_batch_streaming(host.run_configuration, scan, pending)
 
     assert count == 1
     assert len(opened) == 1

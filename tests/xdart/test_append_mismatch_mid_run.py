@@ -21,6 +21,8 @@ raise -> catch -> signal -> clean-stop seam.
 
 from __future__ import annotations
 
+from tests.xdart._accepted_run import series_source  # noqa: E402
+
 import importlib.util
 import os
 import sys
@@ -167,6 +169,10 @@ def _real_append_thread(tmp_path):
         processing_mode="Int 2D",
         bai_1d_args=dict(CURRENT_2D_ARGS["bai_1d_args"]),
         bai_2d_args=dict(CURRENT_2D_ARGS["bai_2d_args"]),
+        # the accepted source is this run's real series member
+        source_spec=series_source(raw),
+        save_path=str(out),
+        output_mode="Append",
     ).freeze()
     return thread, target
 
@@ -237,7 +243,7 @@ def test_live_watch_append_mismatch_stops_cleanly(tmp_path):
         ("/tmp/b_0001.tif", "b", 1, np.ones((2, 2)), {}),
     ]
 
-    def next_image():
+    def next_image(_frozen=None):
         if queue:
             return queue.pop(0)
         return None, None, None, None, None
@@ -278,16 +284,18 @@ def test_live_watch_append_mismatch_stops_cleanly(tmp_path):
         showLabel=SimpleNamespace(emit=lambda *_: None),
         sigUpdate=SimpleNamespace(emit=lambda *_: None),
         sigAppendMismatch=SimpleNamespace(emit=emitted.append),
-        _wait_if_paused=lambda: None,
+        _wait_if_paused=lambda _frozen: None,
         get_next_image=next_image,
         _middle_truncate=lambda text, max_len=40: text,
         initialize_scan=initialize_scan,
         get_background=lambda *_: 0.0,
         _flush_xye_buffer=lambda *_args, **_kw: None,
-        _save_due=lambda scan, force=False: force,
-        _prime_append_skip_snapshots_for_run=lambda: None,
-        _append_frame_complete=lambda _name, idx, scan: idx in scan.frames.index,
-        _dispatch_batch=lambda scan, pending, force_save=False: dispatched.append(
+        _save_due=lambda _frozen, scan, force=False: force,
+        _prime_append_skip_snapshots_for_run=lambda _frozen: None,
+        _append_frame_complete=lambda _frozen, _name, idx, scan:
+            idx in scan.frames.index,
+        _dispatch_batch=lambda _frozen, scan, pending, force_save=False:
+            dispatched.append(
             tuple(item[1] for item in pending)) or len(pending),
         _process_one=lambda *a, **k: None,
     )
@@ -316,8 +324,11 @@ def test_live_watch_append_mismatch_stops_cleanly(tmp_path):
                 # object, so a live-watch case must freeze it.
                 live_mode=bool(getattr(host, "live_mode", False)),
                 batch_mode=bool(getattr(host, "batch_mode", False)),
+                # O-1a-W1R-D2: the routed source reads take the accepted
+                # source, so a host driving the reader must admit one.
+                source_spec=series_source("/nonexistent-source/a_0001.tif"),
             ).freeze())
-    MethodType(imageThread.process_scan, host)()    # must NOT raise
+    MethodType(imageThread.process_scan, host)(host.run_configuration)    # must NOT raise
 
     assert init_calls == [0, 1]                 # scan "a", then the mismatch
     assert host.command == "stop"
@@ -429,27 +440,29 @@ def test_live_watch_saves_every_intermediate_scan(tmp_path):
         showLabel=SimpleNamespace(emit=lambda *_: None),
         sigUpdate=SimpleNamespace(emit=lambda *_: None),
         sigAppendMismatch=SimpleNamespace(emit=lambda *_: None),
-        _wait_if_paused=lambda: None,
+        _wait_if_paused=lambda _frozen: None,
         _middle_truncate=lambda text, max_len=40: text,
         initialize_scan=initialize_scan,
         get_background=lambda *_: 0.0,
         _flush_xye_buffer=lambda *_a, **_k: None,
-            _save_due=(lambda scan, force=False: bool(force)),   # only FORCE saves
-            _prime_append_skip_snapshots_for_run=lambda: None,
-            _append_frame_complete=lambda _name, idx, scan: idx in scan.frames.index,
+            # only FORCE saves
+            _save_due=(lambda _frozen, scan, force=False: bool(force)),
+            _prime_append_skip_snapshots_for_run=lambda _frozen: None,
+            _append_frame_complete=lambda _frozen, _name, idx, scan:
+            idx in scan.frames.index,
             _process_one=lambda *a, **k: None,
         _install_run_integrator=lambda *a, **k: None,
     )
 
     # Mirror the real dispatch's side effect: processing frames advances the
     # per-save counter, so the OUTGOING scan has an unsaved tail at a swap.
-    def _dispatch_batch(scan, pending, force_save=False):
+    def _dispatch_batch(_frozen, scan, pending, force_save=False):
         host._frames_since_save += len(pending)
         return len(pending)
 
     host._dispatch_batch = _dispatch_batch
 
-    def next_image():
+    def next_image(_frozen=None):
         if frame_queue:
             return frame_queue.pop(0)
         host.command = "stop"       # after C is processed, end the watch
@@ -479,8 +492,11 @@ def test_live_watch_saves_every_intermediate_scan(tmp_path):
                 # object, so a live-watch case must freeze it.
                 live_mode=bool(getattr(host, "live_mode", False)),
                 batch_mode=bool(getattr(host, "batch_mode", False)),
+                # O-1a-W1R-D2: the routed source reads take the accepted
+                # source, so a host driving the reader must admit one.
+                source_spec=series_source("/nonexistent-source/a_0001.tif"),
             ).freeze())
-    MethodType(imageThread.process_scan, host)()
+    MethodType(imageThread.process_scan, host)(host.run_configuration)
 
     assert init_calls == ["a", "b", "c"]
     # Every scan's tail persisted at its boundary — NOT just the last one

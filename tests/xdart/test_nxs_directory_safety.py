@@ -38,6 +38,11 @@ from xrd_tools.io.output_safety import (  # noqa: E402
     OutputCollisionError,
     check_output_not_source,
 )
+from tests.xdart._accepted_run import (  # noqa: E402
+    accepted_run,
+    container_source,
+    directory_source,
+)
 from xdart.modules.live import LiveScan  # noqa: E402
 from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (  # noqa: E402
     imageThread,
@@ -102,7 +107,13 @@ def _make_thread(watch_dir, out_dir, *, img_ext="nxs", scan_name="scan",
     # output-safety guard fires inside initialize_scan, after that admission.
     from xrd_tools.session import RunIntent
 
-    t.run_configuration = t._admitted_run_configuration = RunIntent(processing_mode="Int 2D").freeze()
+    t.run_configuration = t._admitted_run_configuration = RunIntent(
+        processing_mode="Int 2D",
+        live_mode=live_mode,
+        save_path=str(out_dir),
+        source_spec=directory_source(
+            watch_dir, ext=img_ext, recursive=include_subdir),
+    ).freeze()
     _LIVE_THREADS.append(t)
     return t
 
@@ -126,7 +137,7 @@ def _drain_reader(t, limit=64):
     """Pull frames from the REAL directory reader until the stream ends."""
     frames = []
     for _ in range(limit):
-        item = t._get_next_eiger_frame_sync()
+        item = t._get_next_eiger_frame_sync(t.run_configuration)
         if item[3] is None:
             break
         # (scan_name, img_number, frame_shape)
@@ -156,7 +167,7 @@ def test_raw_source_preserved_when_save_path_equals_source_dir(tmp_path):
 
     # And the real run body refuses BEFORE reading/writing anything.
     t.command = "start"
-    t.process_scan()
+    t.process_scan(t.run_configuration)
     assert t.command == "stop"
 
     after = _digest(raw)
@@ -191,7 +202,7 @@ def test_separate_directories_process_normally(tmp_path):
 
     t = _make_thread(watch, out, scan_name="acq_00001")
     # The safety owner (assembled from the REAL thread config) does not fire.
-    check_output_not_source(str(out / "acq_00001.nxs"), **t._output_safety_args())
+    check_output_not_source(str(out / "acq_00001.nxs"), **t._output_safety_args(t.run_configuration))
     # And the real reader yields the raw frames.
     frames = _drain_reader(t)
     assert [f[0] for f in frames] == ["acq_00001"] * 3
@@ -279,11 +290,15 @@ def test_single_file_nexus_wrangler_rejects_processed_cleanly(tmp_path):
     )
     from xrd_tools.session import RunIntent
 
-    t.run_configuration = t._admitted_run_configuration = RunIntent(processing_mode="Int 2D").freeze()
+    t.run_configuration = t._admitted_run_configuration = RunIntent(
+        processing_mode="Int 2D",
+        save_path=str(out),
+        source_spec=container_source(proc),
+    ).freeze()
     labels = []
     t.showLabel.connect(labels.append)
     # Must return cleanly (before the diff: uncaught ProcessedXdartInputError).
-    t._run_impl()
+    t._run_impl(t.run_configuration)
     assert any("processed xdart" in m.lower() for m in labels), labels
     # No output was written on rejection (rejection precedes any reduction/save).
     assert not (out / "scan.nxs").exists()
@@ -299,7 +314,7 @@ def test_processed_file_never_resolves_integrated_2d_via_worker(tmp_path):
     proc = _write_processed_xdart(watch / "proc_00001.nxs")
 
     t = _make_thread(watch, out)
-    t._eiger_open_master(str(proc))
+    t._eiger_open_master(t.run_configuration, str(proc))
     assert t._eiger_nframes == 0
     assert t._eiger_cursor is None
     assert t._skip_reason_counts.get("processed xdart output", 0) == 1

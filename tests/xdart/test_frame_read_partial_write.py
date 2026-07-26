@@ -79,15 +79,20 @@ def _series_stub(fnames, *, batch_mode, budget=0.05, deadline=30.0):
     # ACCEPTED frozen configuration, so a host that drives it must carry one.
     # This is a REAL FrozenRunConfiguration through the production freeze owner:
     # a tif image series, which is what this file's frames are.
+    from tests.xdart._accepted_run import series_source
     from xrd_tools.session import RunIntent
 
     stub = types.SimpleNamespace(
-        single_img=False, img_file=None, img_ext="tif",
+        img_file=None,
         img_fnames=deque(str(f) for f in fnames),
         processed=[], _frame_read_clocks={},
-        batch_mode=batch_mode, series_average=False, meta_ext="",
         command="live",
-        run_configuration=RunIntent(processing_mode="Int 2D").freeze(),
+        run_configuration=RunIntent(
+            processing_mode="Int 2D",
+            batch_mode=batch_mode,
+            source_spec=series_source(
+                next(iter(fnames), "/nonexistent/frame_0000.tif")),
+        ).freeze(),
         run_configuration_floor=0,
         FRAME_READ_RETRY_BUDGET=budget, FRAME_READ_DEADLINE=deadline,
     )
@@ -109,13 +114,13 @@ def test_live_repolls_partial_frame_and_does_not_drop_it(tmp_path):
     p.write_bytes(b"")                               # detector created it, no data yet
     stub = _series_stub([p], batch_mode=False, deadline=30.0)
 
-    r1 = _imageThread().get_next_image(stub)         # sweep 1: not ready
+    r1 = _imageThread().get_next_image(stub, stub.run_configuration)         # sweep 1: not ready
     assert r1[3] is None                             # img_data None -> watch re-polls
     assert str(p) not in stub.processed              # NOT committed / dropped
     assert len(stub.img_fnames) == 1                 # still queued for retry
 
     p.write_bytes(good)                              # the write completes
-    r2 = _imageThread().get_next_image(stub)         # sweep 2: now reads it
+    r2 = _imageThread().get_next_image(stub, stub.run_configuration)         # sweep 2: now reads it
     assert r2[3] is not None and r2[3].shape == (16, 16)
     assert str(p) in stub.processed                  # now committed exactly once
 
@@ -129,9 +134,9 @@ def test_live_skips_frame_once_past_deadline(tmp_path):
     _write_valid_tif(goodf)
     stub = _series_stub([corrupt, goodf], batch_mode=False, deadline=0.0)
 
-    r1 = _imageThread().get_next_image(stub)         # starts the clock, re-polls
+    r1 = _imageThread().get_next_image(stub, stub.run_configuration)         # starts the clock, re-polls
     assert r1[3] is None
-    r2 = _imageThread().get_next_image(stub)         # deadline reached -> skip corrupt, read good
+    r2 = _imageThread().get_next_image(stub, stub.run_configuration)         # deadline reached -> skip corrupt, read good
     assert r2[3] is not None
     assert str(corrupt) in stub.processed
 
@@ -145,7 +150,7 @@ def test_batch_skips_unreadable_frame_without_repoll(tmp_path):
     _write_valid_tif(goodf)
     stub = _series_stub([corrupt, goodf], batch_mode=True)
 
-    r = _imageThread().get_next_image(stub)          # corrupt skipped, good returned, no raise
+    r = _imageThread().get_next_image(stub, stub.run_configuration)          # corrupt skipped, good returned, no raise
     assert r[3] is not None
     assert str(corrupt) in stub.processed
 
@@ -166,8 +171,13 @@ def _eiger_stub(master_path, *, batch_mode, deadline=30.0, command="live"):
 
     # R2: the h5py-backed read path now goes through the sustained cursor; the
     # growth-refresh reopens it (reopen-to-refresh, the fabio-reopen analogue).
+    from tests.xdart._accepted_run import accepted_run, container_source
+
     stub = types.SimpleNamespace(
-        command=command, batch_mode=batch_mode,
+        command=command,
+        run_configuration=accepted_run(
+            batch_mode=batch_mode,
+            source_spec=container_source(master_path)),
         _prefetch_stop_evt=threading.Event(),
         _eiger_fabio_handle=None,
         _eiger_cursor=ContainerCursor(str(master_path)).open(),
@@ -206,7 +216,7 @@ def test_eiger_read_waits_for_lagging_data_frame_then_reads(tmp_path, monkeypatc
                 h.flush()                        # commit so the reopened cursor sees it
         monkeypatch.setattr(mod.time, "sleep", fake_sleep)
 
-        arr = it._read_eiger_frame_tolerant(stub, 5)   # frame 5 absent -> wait -> read
+        arr = it._read_eiger_frame_tolerant(stub, stub.run_configuration, 5)   # frame 5 absent -> wait -> read
         assert arr is not None and arr.shape == (8, 8)
     finally:
         h.close()
@@ -221,7 +231,7 @@ def test_eiger_read_batch_returns_none_without_waiting(tmp_path):
     h = h5py.File(f, "r")
     try:
         stub = _eiger_stub(f, batch_mode=True)
-        assert it._read_eiger_frame_tolerant(stub, 5) is None   # missing frame, no retry, no raise
+        assert it._read_eiger_frame_tolerant(stub, stub.run_configuration, 5) is None   # missing frame, no retry, no raise
     finally:
         h.close()
 
@@ -235,6 +245,6 @@ def test_eiger_read_returns_none_on_stop(tmp_path):
     h = h5py.File(f, "r")
     try:
         stub = _eiger_stub(f, batch_mode=False, command="stop", deadline=60.0)
-        assert it._read_eiger_frame_tolerant(stub, 5) is None
+        assert it._read_eiger_frame_tolerant(stub, stub.run_configuration, 5) is None
     finally:
         h.close()

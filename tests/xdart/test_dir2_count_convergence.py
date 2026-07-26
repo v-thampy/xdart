@@ -108,7 +108,7 @@ def test_wrangler_emits_container_counts(tmp_path):
     t.sigContainerCount.connect(lambda path, n: landed.append((path, n)))
 
     for _ in range(6):
-        item = t._get_next_eiger_frame_sync()
+        item = t._get_next_eiger_frame_sync(t.run_configuration)
         if item[3] is None:
             break
     assert (str(p), 3) in landed

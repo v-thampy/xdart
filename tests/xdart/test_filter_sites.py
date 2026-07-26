@@ -8,6 +8,10 @@ master-queue site.
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
+from tests.xdart._accepted_run import (  # noqa: E402
+    accepted_run,
+    directory_source,
+)
 from xdart.gui.tabs.static_scan.wranglers import image_wrangler_thread as iwt
 
 
@@ -36,16 +40,19 @@ def test_eiger_master_queue_applies_filter_to_stem(tmp_path):
     (tmp_path / "Eiger_scan001_data_000001.h5").touch()   # not a master
 
     holder = SimpleNamespace(
-        img_dir=str(tmp_path),
-        img_ext="h5",
-        include_subdir=False,
-        file_filter="scan001 | scan003",
+        run_configuration=accepted_run(source_spec=directory_source(
+            tmp_path, ext=("_master.h5",), name_filter="scan001 | scan003")),
         _eiger_master_queue=[],
         _eiger_done_masters=set(),
     )
+    # Discovery walks the directory through the real bounded walker; bind it so
+    # the holder drives production, not a stub (stale-test repair: this binding
+    # was missing, so the case failed on AttributeError before D2 as well).
+    holder._directory_walk_items = MethodType(
+        iwt.imageThread._directory_walk_items, holder)
     holder._eiger_refill_master_queue = MethodType(
         iwt.imageThread._eiger_refill_master_queue, holder)
-    holder._eiger_refill_master_queue()
+    holder._eiger_refill_master_queue(holder.run_configuration)
     names = sorted(Path(p).name for p in holder._eiger_master_queue)
     assert names == ["Eiger_scan001_master.h5", "Eiger_scan003_master.h5"]
 
@@ -55,17 +62,20 @@ def test_nexus_directory_queue_uses_natural_scan_order(tmp_path):
         (tmp_path / f"{stem}.nxs").touch()
 
     holder = SimpleNamespace(
-        img_dir=str(tmp_path),
-        img_ext="nxs",
-        include_subdir=False,
-        file_filter="",
+        run_configuration=accepted_run(
+            source_spec=directory_source(tmp_path, ext="nxs")),
         _eiger_master_queue=[],
         _eiger_done_masters=set(),
     )
+    # Discovery walks the directory through the real bounded walker; bind it so
+    # the holder drives production, not a stub (stale-test repair: this binding
+    # was missing, so the case failed on AttributeError before D2 as well).
+    holder._directory_walk_items = MethodType(
+        iwt.imageThread._directory_walk_items, holder)
     holder._eiger_refill_master_queue = MethodType(
         iwt.imageThread._eiger_refill_master_queue, holder)
 
-    holder._eiger_refill_master_queue()
+    holder._eiger_refill_master_queue(holder.run_configuration)
 
     assert [Path(path).name for path in holder._eiger_master_queue] == [
         "scan_1.nxs", "scan_2.nxs", "scan_10.nxs",

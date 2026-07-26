@@ -17,6 +17,7 @@ from types import SimpleNamespace, MethodType
 
 import pytest
 
+from tests.xdart._accepted_run import accepted_run  # noqa: E402
 import xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread as itmod
 import xdart.gui.tabs.static_scan.wranglers.wrangler_widget as wwmod
 
@@ -45,12 +46,13 @@ def test_enter_pause_streaming_drains_then_flushes_then_signals():
     emitted = []
     w = SimpleNamespace(
         _streaming_session=session, _streaming_sink=sink,
-        _active_scan=None, xye_only=False, _frames_since_save=0,
+        _active_scan=None, run_configuration=accepted_run(
+            run_options={"xye_only": False}), _frames_since_save=0,
         sigPaused=SimpleNamespace(emit=lambda: emitted.append('paused')),
     )
     w._enter_pause = MethodType(imageThread._enter_pause, w)
 
-    w._enter_pause()
+    w._enter_pause(w.run_configuration)
 
     assert calls == ['drain', ('flush', True)]      # drain strictly before flush
     assert emitted == ['paused']                    # signalled after drain+flush
@@ -74,16 +76,17 @@ def test_enter_pause_serial_tail_wins_over_open_streaming_session(monkeypatch):
                            _save_to_nexus=lambda: order.append('save'))
     w = SimpleNamespace(
         _streaming_session=session, _streaming_sink=sink,   # open but dormant
-        _active_scan=scan, xye_only=False, _frames_since_save=4,
+        _active_scan=scan, run_configuration=accepted_run(
+            run_options={"xye_only": False}), _frames_since_save=4,
         file_lock=threading.RLock(),
-        _save_due=lambda scan, force=False: True,
+        _save_due=lambda _frozen, scan, force=False: True,
         _flush_xye_buffer=lambda s: order.append('xye'),
         sigPaused=SimpleNamespace(emit=lambda: order.append('paused')),
     )
     w._enter_pause = MethodType(imageThread._enter_pause, w)
     _bind_serial_tail(w)
 
-    w._enter_pause()
+    w._enter_pause(w.run_configuration)
 
     # Serial branch ran (drain the dormant session, then SERIAL save+xye), and
     # the sink streaming flush did NOT (would re-route the watch tail wrongly).
@@ -105,16 +108,17 @@ def test_enter_pause_serial_flushes_unsaved_tail(monkeypatch):
                            _save_to_nexus=lambda: saved.append('save'))
     w = SimpleNamespace(
         _streaming_session=None, _streaming_sink=None,
-        _active_scan=scan, xye_only=False, _frames_since_save=3,
+        _active_scan=scan, run_configuration=accepted_run(
+            run_options={"xye_only": False}), _frames_since_save=3,
         file_lock=threading.RLock(),
-        _save_due=lambda scan, force=False: True,
+        _save_due=lambda _frozen, scan, force=False: True,
         _flush_xye_buffer=lambda s: flushed.append(s),
         sigPaused=SimpleNamespace(emit=lambda: emitted.append('paused')),
     )
     w._enter_pause = MethodType(imageThread._enter_pause, w)
     _bind_serial_tail(w)
 
-    w._enter_pause()
+    w._enter_pause(w.run_configuration)
 
     assert saved == ['save'] and flushed == [scan]
     assert w._frames_since_save == 0                # tail flushed -> counter reset
@@ -130,11 +134,12 @@ def test_enter_pause_serial_nothing_to_flush_still_signals(monkeypatch):
     emitted = []
     w = SimpleNamespace(
         _streaming_session=None, _streaming_sink=None,
-        _active_scan=None, xye_only=True, _frames_since_save=0,
+        _active_scan=None, run_configuration=accepted_run(
+            run_options={"xye_only": True}), _frames_since_save=0,
         sigPaused=SimpleNamespace(emit=lambda: emitted.append('paused')),
     )
     w._enter_pause = MethodType(imageThread._enter_pause, w)
-    w._enter_pause()
+    w._enter_pause(w.run_configuration)
     assert emitted == ['paused']
 
 
@@ -147,11 +152,12 @@ def test_enter_pause_signals_even_if_drain_raises():
     w = SimpleNamespace(
         _streaming_session=SimpleNamespace(drain=_boom),
         _streaming_sink=SimpleNamespace(flush=lambda *, force=False: None),
-        _active_scan=None, xye_only=False, _frames_since_save=0,
+        _active_scan=None, run_configuration=accepted_run(
+            run_options={"xye_only": False}), _frames_since_save=0,
         sigPaused=SimpleNamespace(emit=lambda: emitted.append('paused')),
     )
     w._enter_pause = MethodType(imageThread._enter_pause, w)
-    w._enter_pause()
+    w._enter_pause(w.run_configuration)
     assert emitted == ['paused']
 
 
@@ -216,13 +222,14 @@ def test_flush_serial_tail_locks_before_pausing_h5pool(monkeypatch):
         _save_to_nexus=lambda: events.append(("save", lock.held)),
     )
     w = SimpleNamespace(
-        xye_only=False, _frames_since_save=1, file_lock=lock,
-        _save_due=lambda scan, force=False: True,
+        run_configuration=accepted_run(
+            run_options={"xye_only": False}), _frames_since_save=1, file_lock=lock,
+        _save_due=lambda _frozen, scan, force=False: True,
         _flush_xye_buffer=lambda s: events.append(("xye", lock.held)),
     )
     _bind_serial_tail(w)
 
-    assert w.flush_serial_tail(scan, force=True) is True
+    assert w.flush_serial_tail(w.run_configuration, scan, force=True) is True
     assert events == [
         "lock-enter",
         ("pause", "x.nxs", True),
@@ -265,10 +272,11 @@ def test_base_save_to_disk_locks_before_pausing_h5pool(monkeypatch):
         data_file='x.nxs',
         _save_to_nexus=lambda: events.append(("save", lock.held)),
     )
-    w = SimpleNamespace(xye_only=False, file_lock=lock)
+    w = SimpleNamespace(run_configuration=accepted_run(
+            run_options={"xye_only": False}), file_lock=lock)
     w._save_to_disk = MethodType(wwmod.wranglerThread._save_to_disk, w)
 
-    w._save_to_disk(scan)
+    w._save_to_disk(w.run_configuration, scan)
 
     assert events == [
         "lock-enter",
@@ -317,10 +325,11 @@ def test_nexus_final_save_locks_before_pausing_h5pool(monkeypatch):
         save_to_nexus=lambda replace=False, finalize=True: events.append(
             ("save", replace, finalize, lock.held)),
     )
-    w = SimpleNamespace(xye_only=False, command='stop', file_lock=lock)
+    w = SimpleNamespace(run_configuration=accepted_run(
+            run_options={"xye_only": False}), command='stop', file_lock=lock)
     w._final_save_to_nexus = MethodType(nexusThread._final_save_to_nexus, w)
 
-    w._final_save_to_nexus(scan, 3)
+    w._final_save_to_nexus(w.run_configuration, scan, 3)
 
     assert events == [
         "lock-enter",
@@ -345,41 +354,42 @@ def test_flush_serial_tail_persists_before_resetting_counter(monkeypatch):
         data_file='x.nxs',
         _save_to_nexus=lambda: saw_counter.append(w._frames_since_save))
     w = SimpleNamespace(
-        xye_only=False, _frames_since_save=5, file_lock=threading.RLock(),
-        _save_due=lambda scan, force=False: True,
+        run_configuration=accepted_run(
+            run_options={"xye_only": False}), _frames_since_save=5, file_lock=threading.RLock(),
+        _save_due=lambda _frozen, scan, force=False: True,
         _flush_xye_buffer=lambda s: None,
     )
     _bind_serial_tail(w)
 
-    assert w.flush_serial_tail(scan, force=True) is True
+    assert w.flush_serial_tail(w.run_configuration, scan, force=True) is True
     assert saw_counter == [5]              # counter NOT yet reset when saving
     assert w._frames_since_save == 0       # reset only AFTER the persist
 
     # not-due (the _save_due gate says no) and scan-None are no-ops -> False.
-    w._save_due = lambda scan, force=False: False
-    assert w.flush_serial_tail(scan, force=True) is False
-    assert w.flush_serial_tail(None, force=True) is False
+    w._save_due = lambda _frozen, scan, force=False: False
+    assert w.flush_serial_tail(w.run_configuration, scan, force=True) is False
+    assert w.flush_serial_tail(w.run_configuration, None, force=True) is False
 
 
 # ── _wait_if_paused: block until resume/stop, no-op otherwise ────────────────
 
 def test_wait_if_paused_noop_when_not_paused():
     entered = []
-    w = SimpleNamespace(command='start')
-    w._enter_pause = lambda: entered.append('enter')
+    w = SimpleNamespace(command='start', run_configuration=accepted_run())
+    w._enter_pause = lambda _frozen: entered.append('enter')
     w._wait_if_paused = MethodType(imageThread._wait_if_paused, w)
-    w._wait_if_paused()
+    w._wait_if_paused(w.run_configuration)
     assert entered == []          # never enters pause when command != 'pause'
 
 
 def test_wait_if_paused_blocks_until_resume_and_enters_once():
     entered = []
-    w = SimpleNamespace(command='pause')
-    w._enter_pause = lambda: entered.append('enter')
+    w = SimpleNamespace(command='pause', run_configuration=accepted_run())
+    w._enter_pause = lambda _frozen: entered.append('enter')
     w._wait_if_paused = MethodType(imageThread._wait_if_paused, w)
 
     done = []
-    t = threading.Thread(target=lambda: (w._wait_if_paused(), done.append(True)))
+    t = threading.Thread(target=lambda: (w._wait_if_paused(w.run_configuration), done.append(True)))
     t.start()
     time.sleep(0.15)
     assert not done               # still blocked while command == 'pause'
@@ -392,11 +402,11 @@ def test_wait_if_paused_blocks_until_resume_and_enters_once():
 def test_wait_if_paused_exits_on_stop():
     """Shutdown-safe: setting command='stop' (close/Stop) breaks the pause wait
     just like resume, so the loop returns and run() can finalize."""
-    w = SimpleNamespace(command='pause')
-    w._enter_pause = lambda: None
+    w = SimpleNamespace(command='pause', run_configuration=accepted_run())
+    w._enter_pause = lambda _frozen: None
     w._wait_if_paused = MethodType(imageThread._wait_if_paused, w)
     done = []
-    t = threading.Thread(target=lambda: (w._wait_if_paused(), done.append(True)))
+    t = threading.Thread(target=lambda: (w._wait_if_paused(w.run_configuration), done.append(True)))
     t.start()
     time.sleep(0.1)
     assert not done
@@ -548,14 +558,15 @@ def test_enter_pause_drain_timeout_skips_flush_but_signals():
                            _save_to_nexus=lambda: calls.append('save'))
     w = SimpleNamespace(
         _streaming_session=session, _streaming_sink=sink,
-        _active_scan=scan, xye_only=False, _frames_since_save=4,
+        _active_scan=scan, run_configuration=accepted_run(
+            run_options={"xye_only": False}), _frames_since_save=4,
         file_lock=threading.RLock(),
         _flush_xye_buffer=lambda s: calls.append('xye'),
         sigPaused=SimpleNamespace(emit=lambda: emitted.append('paused')),
     )
     w._enter_pause = MethodType(imageThread._enter_pause, w)
 
-    w._enter_pause()
+    w._enter_pause(w.run_configuration)
 
     assert calls == ['drain']            # no save, no sink flush, no xye
     assert w._frames_since_save == 4     # counter preserved for the next save
@@ -629,23 +640,24 @@ def test_serial_dispatch_drains_xye_buffer_without_nxs_save():
 
     flushed = []
     w = SimpleNamespace(
-        xye_only=True,
+        run_configuration=accepted_run(
+            run_options={"xye_only": True}),
         _frames_since_save=0,
         _wait_if_paused=lambda: None,
-        _save_due=lambda scan, force=False: False,
+        _save_due=lambda _frozen, scan, force=False: False,
         _flush_xye_buffer=lambda scan, **k: flushed.append(scan),
     )
     w._dispatch_batch_serial = MethodType(
         imageThread._dispatch_batch_serial, w)
     _bind_serial_tail(w)
     scan = object()
-    w._dispatch_batch_serial(scan, [])
+    w._dispatch_batch_serial(w.run_configuration, scan, [])
     assert flushed == [scan]
 
     # Non-XYE mode with no save due: no flush (unchanged behavior).
     flushed.clear()
-    w.xye_only = False
-    w._dispatch_batch_serial(scan, [])
+    w.run_configuration = accepted_run(run_options={"xye_only": False})
+    w._dispatch_batch_serial(w.run_configuration, scan, [])
     assert flushed == []
 
 
@@ -688,11 +700,12 @@ def test_enter_pause_streaming_routes_through_adapter():
     w = SimpleNamespace(
         _scan_session_adapter=adapter,
         _streaming_session=session, _streaming_sink=sink,
-        _active_scan=None, xye_only=False, _frames_since_save=0,
+        _active_scan=None, run_configuration=accepted_run(
+            run_options={"xye_only": False}), _frames_since_save=0,
         sigPaused=SimpleNamespace(emit=lambda: emitted.append('paused')),
     )
     w._enter_pause = MethodType(imageThread._enter_pause, w)
-    w._enter_pause()
+    w._enter_pause(w.run_configuration)
 
     assert adapter.calls == [('quiesce', 30.0), 'flush']   # quiesce before flush
     assert 'LEGACY_drain' not in emitted and 'LEGACY_flush' not in emitted
@@ -713,15 +726,16 @@ def test_enter_pause_serial_tail_wins_with_adapter_present(monkeypatch):
     w = SimpleNamespace(
         _scan_session_adapter=adapter,
         _streaming_session=SimpleNamespace(), _streaming_sink=SimpleNamespace(),
-        _active_scan=scan, xye_only=False, _frames_since_save=4,
+        _active_scan=scan, run_configuration=accepted_run(
+            run_options={"xye_only": False}), _frames_since_save=4,
         file_lock=threading.RLock(),
-        _save_due=lambda scan, force=False: True,
+        _save_due=lambda _frozen, scan, force=False: True,
         _flush_xye_buffer=lambda s: order.append('xye'),
         sigPaused=SimpleNamespace(emit=lambda: order.append('paused')),
     )
     w._enter_pause = MethodType(imageThread._enter_pause, w)
     _bind_serial_tail(w)
-    w._enter_pause()
+    w._enter_pause(w.run_configuration)
 
     assert adapter.calls == [('quiesce', 30.0)]      # quiesced, but NOT flushed
     assert 'flush' not in adapter.calls
@@ -734,12 +748,13 @@ def test_wait_if_paused_resumes_adapter_on_exit():
     """On leaving the pause spin (resume), _wait_if_paused clears the session
     pause flag via adapter.resume() so the next submit isn't rejected (4a)."""
     adapter = _SpyAdapter()
-    w = SimpleNamespace(command='pause', _scan_session_adapter=adapter)
-    w._enter_pause = lambda: adapter.calls.append('enter')
+    w = SimpleNamespace(command='pause', _scan_session_adapter=adapter,
+                        run_configuration=accepted_run())
+    w._enter_pause = lambda _frozen: adapter.calls.append('enter')
     w._wait_if_paused = MethodType(imageThread._wait_if_paused, w)
 
     done = []
-    t = threading.Thread(target=lambda: (w._wait_if_paused(), done.append(True)))
+    t = threading.Thread(target=lambda: (w._wait_if_paused(w.run_configuration), done.append(True)))
     t.start()
     time.sleep(0.1)
     assert 'resume' not in adapter.calls      # not resumed while still paused

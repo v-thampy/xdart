@@ -7,6 +7,7 @@ the select-last silently no-op and the last frame never appears."""
 from types import SimpleNamespace, MethodType
 import logging
 
+from tests.xdart._accepted_run import accepted_run  # noqa: E402
 from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
 
@@ -38,12 +39,16 @@ def _finish_host(tmp_path, *, batch, saw_frame, xye_only=False,
         update_data=lambda **_kwargs: None,
         set_file=lambda fname, *, internal=False: calls.append((fname, internal)),
     )
+    # O-1a-W1R-D3: the run-end host reads the run's ACCEPTED configuration; the
+    # worker carries no mode/output mirrors for it to consult any more.
     thread = SimpleNamespace(
-        batch_mode=batch,
-        xye_only=xye_only,
+        run_configuration=accepted_run(
+            batch_mode=batch,
+            output_mode=write_mode,
+            save_path=str(tmp_path),
+            run_options={"xye_only": xye_only},
+        ),
         fname=str(thread_fname),
-        h5_dir=str(tmp_path),
-        write_mode=write_mode,
         _append_skip_without_reading=append_skipped,
         _append_config_mismatch=append_config_mismatch,
         _append_skip_frames_by_scan={"scan": set(range(1, indexed_count + 1))},

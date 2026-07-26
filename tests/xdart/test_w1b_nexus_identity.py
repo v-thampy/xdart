@@ -373,9 +373,9 @@ def test_container_selection_follows_the_frozen_directory_source(
     thread.processed = []
     container = []
     monkeypatch.setattr(thread, "_get_next_eiger_frame",
-                        lambda: container.append(True) or (None, "s", 1, None, {}))
+                        lambda _frozen: container.append(True) or (None, "s", 1, None, {}))
 
-    thread.get_next_image()
+    thread.get_next_image(thread.run_configuration)
 
     assert container == [True], "the frozen container source did not select the "\
         "container reader"
@@ -404,13 +404,13 @@ def test_series_selection_follows_the_frozen_series_source(
     thread.meta_ext = None
     container = []
     monkeypatch.setattr(thread, "_get_next_eiger_frame",
-                        lambda: container.append(True) or (None, "s", 1, None, {}))
+                        lambda _frozen: container.append(True) or (None, "s", 1, None, {}))
     import xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread as iwt
     import numpy as np
     monkeypatch.setattr(iwt, "read_image",
                         lambda path: np.ones((2, 2), dtype=float))
 
-    img_file, scan_name, img_number, img_data, _meta = thread.get_next_image()
+    img_file, scan_name, img_number, img_data, _meta = thread.get_next_image(thread.run_configuration)
 
     assert container == [], "the frozen series source selected the container reader"
     assert Path(img_file).name == paths[0].name
@@ -475,7 +475,7 @@ def test_frozen_container_directory_from_the_real_freeze_owner(
 
     thread = widget.wrangler.thread
     assert thread.run_configuration is frozen
-    assert imageThread._frozen_source_is_container(thread) is True, (
+    assert imageThread._frozen_source_is_container(thread, thread.run_configuration) is True, (
         f"a frozen {ext} container directory was not recognised as a container; "
         f"emitter suffixes were {suffixes!r}")
 
@@ -503,9 +503,9 @@ def test_live_directory_watch_reaches_the_container_reader(
     container = []
     monkeypatch.setattr(
         thread, "_get_next_eiger_frame",
-        lambda: container.append(True) or (None, "s", 1, None, {}))
+        lambda _frozen: container.append(True) or (None, "s", 1, None, {}))
 
-    thread.get_next_image()
+    thread.get_next_image(thread.run_configuration)
 
     assert container == [True], (
         "the Live container watch fell through to the plain-file branch")
@@ -537,7 +537,7 @@ def test_every_emitter_branch_is_accepted_as_a_container(widget, tmp_path):
         frozen = _publish_admitted(
         widget, widget._prepare_controls_v2_run_configuration())
         thread = widget.wrangler.thread
-        assert imageThread._frozen_source_is_container(thread) is True, (
+        assert imageThread._frozen_source_is_container(thread, thread.run_configuration) is True, (
             f"emitter branch {ext} -> {suffixes!r} was refused")
 
     # the branch shapes this row actually exercised, recorded as evidence
@@ -572,7 +572,7 @@ def test_a_non_container_directory_is_still_a_series(widget, tmp_path):
     assert frozen.source.suffixes == (".tif",)
     thread = widget.wrangler.thread
     thread.img_file = ""
-    assert imageThread._frozen_source_is_container(thread) is False
+    assert imageThread._frozen_source_is_container(thread, thread.run_configuration) is False
 
 
 # --------------------------------------------------------------------------- #

@@ -36,61 +36,6 @@ from .qt_nexus_sink import _is_append_axis_mismatch
 logger = logging.getLogger(__name__)
 
 
-_CONTAINER_FORMAT_TOKENS = ("nxs", "hdf5", "h5")
-
-#: A projection reader returns this when the accepted frozen configuration
-#: cannot answer for a carrier at all (today: a supported source shape that
-#: Controls deliberately froze as ``source=None``).  It is NOT the same as a
-#: frozen value that happens to be ``None`` -- ``threshold_min`` is legitimately
-#: ``None``, and must NOT fall through to the display slot.
-_UNSET = object()
-
-
-def frozen_run_policy(obj):
-    """The accepted frozen configuration a worker is currently executing, or None.
-
-    O-1a-W1R (review §39.5 Phase 2 item 1).  Run IDENTITY is qualified ONCE at
-    worker entry (``imageThread.run`` / ``initialize_scan`` /
-    ``nexusThread._run_impl`` call :func:`require_run_configuration` with the
-    exact admitted object).  Every read INSIDE the run then resolves through the
-    object that gate qualified, so this accessor deliberately does not repeat the
-    identity check per read -- repeating it would make the gate's location
-    unknowable and would refuse on threads a caller armed directly.
-
-    Presence and type are still required: a non-frozen carrier is never policy.
-    """
-
-    # §39.5 Phase 2 item 1: once a worker-entry gate has QUALIFIED the accepted
-    # object by identity, that captured reference -- not the re-readable carrier
-    # -- is what execution consumes.  A post-entry reassignment of
-    # ``run_configuration`` therefore cannot change this run's policy, and the
-    # next entry gate still refuses the substituted carrier outright.
-    qualified = getattr(obj, "_qualified_run_configuration", None)
-    if isinstance(qualified, FrozenRunConfiguration):
-        return qualified
-    frozen = getattr(obj, "run_configuration", None)
-    return frozen if isinstance(frozen, FrozenRunConfiguration) else None
-
-
-def _source_format_token(text):
-    """The extension TOKEN of ``text`` (``'_master.h5'`` -> ``'h5'``)."""
-    token = str(text or "").lower().strip()
-    token = token.rsplit(".", 1)[-1] if "." in token else token
-    return token
-
-
-def _frozen_source_family(frozen):
-    source = frozen.source
-    if source is None:
-        return _UNSET
-    if source.family == "directory":
-        return "Image Directory"
-    kind = str(source.source_kind or "").lower()
-    if "image_file" in kind or kind == "image":
-        return "Single Image"
-    return "Image Series"
-
-
 def _frozen_source_is_admissible(source):
     """Whether a TYPED frozen source is also a REAL one (review §41.3.D).
 
@@ -109,201 +54,6 @@ def _frozen_source_is_admissible(source):
             and Path(root).expanduser().is_dir()
         )
     return bool(str(source.uri or "").strip())
-
-
-def _frozen_source_root(frozen):
-    source = frozen.source
-    if source is None:
-        return _UNSET
-    if source.family == "directory":
-        return str(source.uri)
-    # O-1a-W1R-D1 (review §40.1 P1-B): ``image_series_spec`` freezes the
-    # CONTAINING DIRECTORY as a series' uri, so taking its parent answered with
-    # the grandparent -- the wrong directory for output-collision safety and
-    # metadata discovery.  Only a source that names a FILE has a parent.
-    if str(source.source_kind or "").lower() == "tiff_series":
-        return str(source.uri)
-    return str(Path(str(source.uri)).parent)
-
-
-def _frozen_source_format(frozen):
-    source = frozen.source
-    if source is None:
-        return _UNSET
-    # A frozen source is TOTAL for its format (§40.3 D1 item 3): the freeze owner
-    # records the token from canonical data, so neither family has to re-derive it
-    # from a uri that may name a directory.
-    for suffix in source.suffixes:
-        token = _source_format_token(suffix)
-        if token:
-            return token
-    if source.family == "directory":
-        return _UNSET
-    token = _source_format_token(Path(str(source.uri)).suffix)
-    return token or _UNSET
-
-
-def _frozen_single_image(frozen):
-    if frozen.source is None:
-        return _UNSET
-    return _frozen_source_family(frozen) == "Single Image"
-
-
-def _frozen_recursive(frozen):
-    source = frozen.source
-    if source is None:
-        return _UNSET
-    # "Not applicable" is a frozen NEUTRAL value, never permission to read a
-    # writable compatibility slot (§40.1 P1-B): a non-directory source froze
-    # recursive=False, so answer with it.
-    return bool(source.recursive)
-
-
-def _frozen_name_filter(frozen):
-    source = frozen.source
-    if source is None:
-        return _UNSET
-    return source.name_filter or ""
-
-
-def _frozen_run_option(name):
-    def read(frozen):
-        options = frozen.run_options
-        return options[name] if name in options else _UNSET
-    return read
-
-
-def _frozen_thawed_source(frozen):
-    thawed = frozen.thaw_source_spec()
-    return _UNSET if thawed is None else thawed
-
-
-class FrozenRunProjection:
-    """A read-through projection of ONE accepted frozen run-configuration value.
-
-    O-1a-W1R (review §39.2 W1R-P1-4/W1R-P1-5, §39.5 Phase 2 items 2, 3 and 6).
-
-    The historical worker carrier keeps its NAME -- so no consumer needs a new
-    indirection and no read site has to be rewritten -- but it is no longer an
-    execution INPUT.  While the worker holds an accepted frozen configuration the
-    read resolves THROUGH that exact object; a write only ever lands in the
-    zero-reader display/compatibility slot.
-
-    This deliberately satisfies the three conditions §39.5 Phase 2 imposes on a
-    projection, and is strictly weaker than what that clause permits:
-
-    * it is a STATELESS read-through, not a constructed projection object: there
-      is no copy, no cache, no registry and no lifecycle of its own, so there is
-      nothing here that could become a second execution-configuration authority;
-    * its identity and equality are traceable to the accepted object by
-      construction -- ``__get__`` reads ``obj.run_configuration`` and returns a
-      value derived from that object on every access;
-    * consumers retain NO fallback execution read: during an admitted run the
-      display slot is unreachable, which
-      ``tests/xdart/test_w1r_execution_read_census.py`` asserts directly.
-
-    Outside an admitted run (idle GUI, setup before the first Run, a worker a
-    caller armed by hand) the display slot is returned, because with no accepted
-    configuration there is no execution to protect.  ``run_configuration`` itself
-    is qualified against the exact admitted object at worker entry, so a
-    substituted carrier refuses there rather than silently re-deciding policy.
-    """
-
-    __slots__ = ("_name", "_read", "_slot", "_default")
-
-    def __init__(self, name, read, *, default=None):
-        self._name = str(name)
-        self._read = read
-        self._slot = f"_display_{name}"
-        self._default = default
-
-    @property
-    def name(self):
-        return self._name
-
-    @property
-    def display_slot(self):
-        return self._slot
-
-    def __get__(self, obj, owner=None):
-        if obj is None:
-            return self
-        frozen = frozen_run_policy(obj)
-        if frozen is not None:
-            value = self._read(frozen)
-            if value is not _UNSET:
-                return value
-        return obj.__dict__.get(self._slot, self._default)
-
-    def __set__(self, obj, value):
-        # §39.5 Phase 2 item 6: backward writes survive as a ONE-WAY
-        # display/compatibility projection.  The slot has zero execution
-        # readers while a run configuration is admitted.
-        obj.__dict__[self._slot] = value
-
-    def __delete__(self, obj):
-        obj.__dict__.pop(self._slot, None)
-
-
-#: The FROZEN_EXECUTION_POLICY projections shared by both worker classes.
-#: ``name -> (reader, default)``.  Declared once here and installed onto
-#: ``imageThread`` / ``nexusThread`` so the two workers cannot drift.
-FROZEN_RUN_PROJECTIONS = {
-    # ── output ───────────────────────────────────────────────────────────
-    "write_mode": (lambda f: f.output_mode, "Append"),
-    # An EMPTY frozen ``save_path`` is the absence of an accepted output target
-    # (no Project Save Path was captured), not an instruction to write to "".
-    # Absence defers to the display slot; any real accepted path WINS.
-    "h5_dir": (lambda f: f.save_path or _UNSET, ""),
-    "project_folder": (lambda f: f.project_root, ""),
-    # ── scientific policy ────────────────────────────────────────────────
-    "apply_threshold": (lambda f: bool(f.threshold.apply_threshold), False),
-    "threshold_min": (lambda f: f.threshold.threshold_min, None),
-    "threshold_max": (lambda f: f.threshold.threshold_max, None),
-    "mask_sentinel": (lambda f: bool(f.threshold.mask_saturation), True),
-    "mask_file": (lambda f: f.mask_file, ""),
-    "poni_file": (lambda f: f.poni_file, ""),
-    # ── grazing incidence ────────────────────────────────────────────────
-    "gi": (lambda f: bool(f.gi.enabled), False),
-    "incidence_motor": (lambda f: f.gi.scan_incidence_motor, "Manual"),
-    "sample_orientation": (lambda f: int(f.gi.sample_orientation), 4),
-    "tilt_angle": (lambda f: float(f.gi.tilt_angle), 0.0),
-    # ── mode / parallelism ───────────────────────────────────────────────
-    "live_mode": (lambda f: bool(f.live_mode), False),
-    "batch_mode": (lambda f: bool(f.batch_mode), False),
-    "max_cores": (lambda f: int(f.max_cores), 1),
-    "xye_only": (_frozen_run_option("xye_only"), False),
-    "series_average": (_frozen_run_option("series_average"), False),
-    "meta_ext": (_frozen_run_option("meta_ext"), None),
-    # ── source family / traversal (never the frame cursor) ───────────────
-    "inp_type": (_frozen_source_family, None),
-    "img_ext": (_frozen_source_format, ""),
-    "img_dir": (_frozen_source_root, ""),
-    "single_img": (_frozen_single_image, False),
-    "include_subdir": (_frozen_recursive, False),
-    "file_filter": (_frozen_name_filter, ""),
-    # ``source=None`` is the deliberate "Controls froze no typed source" shape
-    # (today: an Eiger-master Image Series).  That is ABSENCE and defers; a real
-    # frozen source always wins.  See the residual note in Boundary 21.
-    "source_spec": (_frozen_thawed_source, None),
-    "scan_args": (lambda f: f.scan_args(), None),
-}
-
-
-def install_frozen_run_projections(worker_class, names):
-    """Bind the shared FROZEN_EXECUTION_POLICY projections onto *worker_class*.
-
-    Called once per worker class at import.  ``names`` is the subset that worker
-    actually consumes, so a worker never advertises policy it does not execute.
-    """
-
-    for name in names:
-        reader, default = FROZEN_RUN_PROJECTIONS[name]
-        setattr(
-            worker_class,
-            name,
-            FrozenRunProjection(name, reader, default=default),
-        )
 
 
 #: Operator-facing refusal text per POSITIVELY OBSERVED active run owner
@@ -1042,14 +792,11 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         target.run_configuration = frozen
         target.run_configuration_floor = int(frozen.generation)
         target._admitted_run_configuration = frozen
-        # O-1a-W1R-D1 (review §40.1 P1-C, §40.3 D1 item 7): a new admission
-        # INVALIDATES any prior active/qualified reference.  The worker is reused
-        # across runs, and the qualification published at Run A's worker entry was
-        # never cleared or requalified, so every pre-entry Run-B read still
-        # resolved through Run A -- production-reachable, because setup reads the
-        # worker's parallelism before entry.  No previous run's policy may remain
-        # observable once a new object is admitted.
-        target._qualified_run_configuration = None
+        # O-1a-W1R-D2 (review §43.4): there is no stored "active" reference to
+        # invalidate any more.  A run consumes the object its entry gate
+        # qualified, passed down as an argument, so no previous run's policy can
+        # remain observable once a new object is admitted -- and no pre-entry
+        # read can resolve through the previous run at all.
         return frozen
 
     @staticmethod
@@ -1362,7 +1109,6 @@ class wranglerThread(Qt.QtCore.QThread):
         """
         super().__init__(parent)
         self.input_q = command_queue # thread queue
-        self.scan_args = scan_args
         self.fname = fname
         self.file_lock = file_lock
         self.signal_q = Queue()
@@ -1381,9 +1127,6 @@ class wranglerThread(Qt.QtCore.QThread):
         # O-1a-W1R: the exact object the wrapper admitted for this run.  The
         # worker-entry identity gate compares the carrier against it by ``is``.
         self._admitted_run_configuration = None
-        # O-1a-W1R: the reference a worker-entry gate qualified for THIS run.
-        # Set only by `_require_run_configuration`; consumed by every projection.
-        self._qualified_run_configuration = None
 
         # ── Shared batch-engine state ────────────────────────────────
         # Subclasses can override any of these before .start() (or
@@ -1408,13 +1151,9 @@ class wranglerThread(Qt.QtCore.QThread):
         # Threshold filtering — subclass sets these from its UI; the
         # base default is "no threshold" so nexus / other wranglers
         # that don't expose a threshold UI pay nothing.
-        self.apply_threshold = False
-        self.threshold_min = 0
-        self.threshold_max = 0
         # Auto-mask the uint16 ceiling (65535) as a saturated/dead sentinel.
         # ON by default = the long-standing behaviour; wranglers that expose
         # the Intensity-Threshold UI override this from the param tree.
-        self.mask_sentinel = True
 
         # Sub-label appended to log lines (e.g. "[Subtracted bg.tif]"
         # for SPEC bg-subtraction mode).  Empty string = no append.
@@ -1422,9 +1161,6 @@ class wranglerThread(Qt.QtCore.QThread):
 
         # Mode flags read by the dispatch loops + the GUI's
         # wrangler_finished handler.
-        self.batch_mode = False
-        self.xye_only = False
-        self.max_cores = 1
         self._reduction_session = None
         self._reduction_session_key = None
         # Streaming (PERF-4b) session + its QtNexusSink, kept on dedicated slots
@@ -1600,7 +1336,7 @@ class wranglerThread(Qt.QtCore.QThread):
         back to their own run-state cache)."""
         return self._scan_session_adapter
 
-    def _resolve_frame_mask(self, scan, img_data):
+    def _resolve_frame_mask(self, frozen, scan, img_data):
         """Return a stable per-scan "bad pixel" mask cached on the scan.
 
         Computed once from ``img_data < 0`` of the first frame seen
@@ -1634,7 +1370,7 @@ class wranglerThread(Qt.QtCore.QThread):
                 from xrd_tools.core.invalid import saturation_pixels
                 arr0 = np.asarray(img_data)
                 frame_size = int(arr0.size)
-                mask_sat = bool(getattr(self, 'mask_sentinel', True))
+                mask_sat = bool(frozen.threshold.mask_saturation)
                 # ONE masking implementation (xdart.modules.reduction) shared
                 # with the reintegrate path so live ≡ reintegrate on the same
                 # frame.  Pass the DISPLAY policy's ceiling (its legacy 65535
@@ -1692,7 +1428,7 @@ class wranglerThread(Qt.QtCore.QThread):
                 logger.debug("showLabel emit failed for saturation advisory",
                              exc_info=True)
 
-    def _prewarm_frame_mask(self, scan, img_data) -> None:
+    def _prewarm_frame_mask(self, frozen, scan, img_data) -> None:
         """Populate ``scan._cached_data_mask`` on the main thread.
 
         F3 — prevents the racy initialization that happens when N
@@ -1707,9 +1443,9 @@ class wranglerThread(Qt.QtCore.QThread):
         """
         if getattr(scan, '_cached_data_mask', None) is not None:
             return
-        self._resolve_frame_mask(scan, img_data)
+        self._resolve_frame_mask(frozen, scan, img_data)
 
-    def _apply_threshold_inline(self, img_data):
+    def _apply_threshold_inline(self, frozen, img_data):
         """Pre-clamp pixels outside the threshold band to NaN.
 
         Returns a fresh float32 array with out-of-band pixels
@@ -1721,10 +1457,10 @@ class wranglerThread(Qt.QtCore.QThread):
         No-op when ``self.apply_threshold`` is False — subclasses
         that don't expose a threshold UI inherit a free pass-through.
         """
-        if not self.apply_threshold:
+        if not frozen.threshold.apply_threshold:
             return img_data
         img = np.asarray(img_data, dtype=np.float32, copy=True)
-        bad = (img < self.threshold_min) | (img > self.threshold_max)
+        bad = (img < frozen.threshold.threshold_min) | (img > frozen.threshold.threshold_max)
         img[bad] = _THRESHOLD_NAN
         return img
 
@@ -1819,7 +1555,7 @@ class wranglerThread(Qt.QtCore.QThread):
                   np.sqrt(np.abs(r1d.intensity)))
         return fname
 
-    def _save_to_disk(self, scan):
+    def _save_to_disk(self, frozen, scan):
         """Persist scan state to its .nxs file (intermediate save).
 
         Honours the h5pool pause/resume protocol so the GUI's
@@ -1827,7 +1563,7 @@ class wranglerThread(Qt.QtCore.QThread):
         the per-wrangler ``file_lock`` so reads stay quiescent
         during the write.  No-op in xye_only mode (no .nxs target).
         """
-        if self.xye_only:
+        if frozen.run_options.get("xye_only", False):
             return
         with self.file_lock:
             _get_h5pool().pause(scan.data_file)

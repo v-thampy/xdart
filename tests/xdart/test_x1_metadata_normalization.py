@@ -26,6 +26,11 @@ pytest.importorskip("pyqtgraph")
 from pyqtgraph import QtWidgets
 from PySide6.QtCore import QModelIndex
 
+from tests.xdart._accepted_run import (  # noqa: E402
+    accepted_run,
+    container_source,
+    gi_intent,
+)
 from xdart.gui.tabs.static_scan.display_data import DisplayDataMixin
 from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
 from xdart.modules.ewald.frame import LiveFrame
@@ -151,15 +156,16 @@ def test_bluesky_metadata_projection_matches_live_batch_and_reload(tmp_path):
     """A real NXWriter motor/counter row survives all three production paths."""
     source = _write_bluesky_nxwriter(tmp_path / "bluesky_00001.nxs", n=3)
     reader = imageThread.__new__(imageThread)
-    reader.meta_ext = None
     reader.meta_dir = None
     reader._eiger_metadata_cache = {}
     reader._bluesky_source_cache = {}
     reader.img_file = str(source)
+    reader.run_configuration = accepted_run(
+        source_spec=container_source(source))
 
     source_frame_index = 1
     label = source_frame_index + 1
-    metadata = reader._frame_scan_info(str(source), source_frame_index)
+    metadata = reader._frame_scan_info(reader.run_configuration, str(source), source_frame_index)
     assert {"hy", "i0"} <= metadata.keys()
 
     integrator = SimpleNamespace()
@@ -178,20 +184,18 @@ def test_bluesky_metadata_projection_matches_live_batch_and_reload(tmp_path):
 
     batch_worker = imageThread.__new__(imageThread)
     batch_worker.command = ""
-    batch_worker.gi = False
-    batch_worker.incidence_motor = "th"
-    batch_worker.sample_orientation = 4
-    batch_worker.tilt_angle = 0.0
-    batch_worker.series_average = False
     batch_worker.poni = None
-    batch_worker._apply_threshold_inline = lambda image: image
-    batch_worker._resolve_frame_mask = lambda scan, image: None
+    batch_worker.run_configuration = accepted_run(
+        gi=gi_intent(incidence_motor="th", sample_orientation=4),
+        source_spec=container_source(source))
+    batch_worker._apply_threshold_inline = lambda _frozen, image: image
+    batch_worker._resolve_frame_mask = lambda _frozen, scan, image: None
     batch_scan = SimpleNamespace(
         skip_2d=True,
         _cached_integrator=SimpleNamespace(),
     )
     [batch_frame] = imageThread._build_batch_frames(
-        batch_worker,
+        batch_worker, batch_worker.run_configuration,
         batch_scan,
         [(str(source), label, np.ones((2, 2), dtype=np.float32),
           dict(metadata), 0.0, 0.0)],

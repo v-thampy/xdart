@@ -281,12 +281,21 @@ def test_post_entry_substitution_cannot_change_this_runs_policy(
     assert substitute.fingerprint != accepted.fingerprint
     thread.run_configuration = substitute
 
-    # 1) the qualified reference still drives every policy read
-    assert thread.write_mode == accepted.output_mode == "Append"
-    assert Path(thread.h5_dir) == Path(accepted.save_path)
-    assert thread._append_skip_enabled() is True
-    assert bool(thread.xye_only) is bool(
-        accepted.run_options.get("xye_only", False))
+    # 1) what this run executes is decided by the object its entry gate
+    #    QUALIFIED, which routing passes down explicitly -- so the substituted
+    #    carrier cannot reach a policy read.  O-1a-W1R-D2 amendment: the parent
+    #    spelling asserted the same property through the descriptor mirrors
+    #    (``thread.write_mode`` / ``h5_dir`` / ``xye_only``), which no longer
+    #    exist; the routed form below is strictly stronger, because it shows the
+    #    ANSWER is a function of the passed object, and the D3 architecture guard
+    #    proves no execution helper re-reads the carrier at all.
+    assert accepted.output_mode == "Append"
+    assert thread._append_skip_enabled(accepted) is True
+    assert thread._append_skip_enabled(substitute) is False
+    assert (Path(thread._append_output_path(accepted, "scan_a")).parent
+            == Path(accepted.save_path))
+    assert (Path(thread._append_output_path(substitute, "scan_a")).parent
+            != Path(accepted.save_path))
 
     # 2) and the next entry gate refuses the substituted carrier outright
     with pytest.raises(RunConfigurationRefused) as excinfo:
@@ -367,7 +376,12 @@ def test_execution_source_is_thawed_from_the_accepted_frozen_object(
     frozen = widget.wrangler.run_configuration
     assert frozen is not None
     assert frozen.thaw_source_spec() == first
-    assert widget.wrangler.thread.source_spec == first
+    # O-1a-W1R-D2/D3 amendment: the worker's thawed ``source_spec`` mirror is
+    # deleted -- execution thaws from the accepted object it is handed.  The
+    # WRAPPER keeps one thawed projection for its GUI edge, and it must be
+    # capture A too.
+    assert widget.wrangler.source_spec == first
+    assert not hasattr(widget.wrangler.thread, "source_spec")
     assert all(caller != "start_wrangler" for caller, _v in seen), seen
 
 
@@ -427,11 +441,11 @@ def test_frozen_series_is_not_overridden_by_a_master_shaped_mutable_path(
     eiger = []
     monkeypatch.setattr(
         thread, "_get_next_eiger_frame",
-        lambda: eiger.append(True) or (None, "s", 1, None, {}))
+        lambda _frozen: eiger.append(True) or (None, "s", 1, None, {}))
     monkeypatch.setattr(
         iwt, "read_image", lambda path: np.ones((2, 2), dtype=float))
 
-    result = thread.get_next_image()
+    result = thread.get_next_image(thread.run_configuration)
 
     assert eiger == [], "a mutable master-shaped path reached the Eiger reader"
     assert Path(result[0]).name == tif.name
@@ -468,11 +482,11 @@ def test_frozen_container_directory_is_not_overridden_by_single_image_flag(
     eiger = []
     monkeypatch.setattr(
         thread, "_get_next_eiger_frame",
-        lambda: eiger.append(True) or (None, "s", 1, None, {}))
+        lambda _frozen: eiger.append(True) or (None, "s", 1, None, {}))
     monkeypatch.setattr(
         iwt, "read_image", lambda path: np.ones((2, 2), dtype=float))
 
-    thread.get_next_image()
+    thread.get_next_image(thread.run_configuration)
 
     assert eiger == [True], "the frozen container source lost the reader choice"
 
@@ -507,7 +521,7 @@ def test_output_safety_uses_the_frozen_container_source(
 
     with pytest.raises(OutputCollisionError):
         check_output_not_source(
-            str(tmp_path / "raw_master.nxs"), **thread._output_safety_args())
+            str(tmp_path / "raw_master.nxs"), **thread._output_safety_args(thread.run_configuration))
 
 
 # --------------------------------------------------------------------------- #
@@ -524,7 +538,7 @@ def test_output_mode_is_consumed_from_the_frozen_configuration(
     assert run.thread.run_configuration is run.frozen
 
     run.thread.write_mode = "Overwrite"
-    assert run.thread._append_skip_enabled() is True
+    assert run.thread._append_skip_enabled(run.thread.run_configuration) is True
 
 
 def test_output_target_is_consumed_from_the_frozen_configuration(
@@ -552,7 +566,7 @@ def test_threshold_policy_is_consumed_from_the_frozen_configuration(
     run.thread.apply_threshold = True
     run.thread.threshold_min = 0.0
     run.thread.threshold_max = 0.0
-    observed = run.thread._apply_threshold_inline(np.asarray([1.0]))
+    observed = run.thread._apply_threshold_inline(run.thread.run_configuration, np.asarray([1.0]))
 
     assert np.array_equal(observed, np.asarray([1.0]))
 
@@ -565,19 +579,38 @@ def test_mode_and_parallelism_are_consumed_from_the_frozen_configuration(
     frozen = run.frozen
     thread = run.thread
 
+    # O-1a-W1R-D2/D3 amendment: the parent spelling poisoned the mirrors and read
+    # them BACK through the descriptor.  The mirrors are deleted, so a write here
+    # only creates a plain attribute that no production read can reach; the
+    # property is asserted where each value is CONSUMED, and the total absence of
+    # a mirror read is asserted by ``test_w1rd_architecture_guard.py``.
+    import inspect
+
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
+        imageThread,
+    )
+
     thread.batch_mode = not bool(frozen.batch_mode)
     thread.live_mode = not bool(frozen.live_mode)
     thread.max_cores = int(frozen.max_cores) + 7
     thread.xye_only = not bool(frozen.run_options.get("xye_only", False))
     thread.series_average = True
 
-    assert bool(thread.batch_mode) is bool(frozen.batch_mode)
-    assert bool(thread.live_mode) is bool(frozen.live_mode)
-    assert int(thread.max_cores) == int(frozen.max_cores)
-    assert bool(thread.xye_only) is bool(
-        frozen.run_options.get("xye_only", False))
-    assert bool(thread.series_average) is bool(
-        frozen.run_options.get("series_average", False))
+    xye = bool(frozen.run_options.get("xye_only", False))
+    assert thread._append_skip_enabled(frozen) is (
+        frozen.output_mode == "Append" and not xye)
+    # this run did not freeze a series average, so the pending chunk must reach
+    # the dispatcher UNCOLLAPSED -- the poisoned mirror above cannot collapse it
+    assert not frozen.run_options.get("series_average", False)
+    pending = [("f", 1, None, {}, 0.0, 0.0), ("g", 2, None, {}, 0.0, 0.0)]
+    assert thread._series_average_pending(frozen, pending) == pending
+    for method, expression in (
+            (imageThread._get_streaming_session, "frozen.max_cores"),
+            (imageThread._dispatch_batch, "frozen.batch_mode"),
+            (imageThread._eiger_pop_next_master, "frozen.live_mode"),
+            (imageThread._save_due, 'frozen.run_options.get("xye_only"')):
+        assert expression in inspect.getsource(method), (
+            f"{method.__qualname__} no longer reads {expression}")
 
 
 # --------------------------------------------------------------------------- #
@@ -600,7 +633,7 @@ def test_real_live_frame_consumes_the_frozen_gi_policy(
     _poison_display_state(run)
     scan = run.thread.initialize_scan()
     frame = run.thread._build_batch_frames(
-        scan,
+        run.thread.run_configuration, scan,
         [(str(tmp_path / "scan_0001.tif"), 1,
           np.zeros((4, 4), dtype=np.float32), {}, None, 0.0)],
     )[0]

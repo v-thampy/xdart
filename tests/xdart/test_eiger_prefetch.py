@@ -16,11 +16,21 @@ from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
 )
 
 
-def _bare_image_thread():
+def _bare_image_thread(*, master="/nonexistent/scan_master.h5", **options):
+    """A worker plus the ACCEPTED configuration its routed reads consume.
+
+    O-1a-W1R-D2: the container reader takes the accepted object as an argument,
+    so a bare host must carry one rather than a mutable ``meta_ext`` mirror.
+    """
+    from tests.xdart._accepted_run import accepted_run, container_source
+
     worker = imageThread.__new__(imageThread)
-    worker.meta_ext = None
     worker.meta_dir = None
     worker._eiger_metadata_cache = {}
+    worker.run_configuration = accepted_run(
+        source_spec=container_source(master), run_options=dict(options))
+    worker._admitted_run_configuration = worker.run_configuration
+    worker.run_configuration_floor = 0
     return worker
 
 
@@ -59,14 +69,13 @@ def test_eiger_metadata_is_cached_per_master(monkeypatch, tmp_path):
 
     monkeypatch.setattr(image_wrangler_thread, "read_image_metadata", fake_read)
 
-    worker = _bare_image_thread()
-    worker.meta_ext = "txt"
-    worker.meta_dir = str(tmp_path / "meta")
     master = tmp_path / "scan_master.h5"
+    worker = _bare_image_thread(master=master, meta_ext="txt")
+    worker.meta_dir = str(tmp_path / "meta")
 
-    first = worker._read_eiger_metadata(master)
+    first = worker._read_eiger_metadata(worker.run_configuration, master)
     first["theta"] = 99.0
-    second = worker._read_eiger_metadata(master)
+    second = worker._read_eiger_metadata(worker.run_configuration, master)
 
     assert calls == [(str(master), "txt", str(tmp_path / "meta"))]
     assert second == {"theta": 1.25}
@@ -86,7 +95,7 @@ def test_sync_eiger_read_keeps_native_dataset_dtype(tmp_path):
     worker._eiger_provider = None
     worker.inp_type = "Image File"
 
-    _path, _scan_name, _number, image, _meta = worker._get_next_eiger_frame_sync()
+    _path, _scan_name, _number, image, _meta = worker._get_next_eiger_frame_sync(worker.run_configuration)
 
     assert image.dtype == np.uint16
 
@@ -111,7 +120,7 @@ def test_prefetch_bulk_read_keeps_native_dataset_dtype(tmp_path):
 
     calls = 0
 
-    def fake_sync_read():
+    def fake_sync_read(_frozen):
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -127,7 +136,7 @@ def test_prefetch_bulk_read_keeps_native_dataset_dtype(tmp_path):
 
     worker._get_next_eiger_frame_sync = fake_sync_read
 
-    worker._prefetch_worker()
+    worker._prefetch_worker(worker.run_configuration)
 
     queued = []
     while not worker._prefetch_queue.empty():
@@ -215,7 +224,7 @@ def _owner_tracked_worker(tmp_path, n_frames, *, maxsize, block_frames=2):
 
     calls = {"n": 0}
 
-    def fake_sync():
+    def fake_sync(_frozen):
         calls["n"] += 1
         if calls["n"] == 1:
             worker._eiger_frame_idx = 1
@@ -249,7 +258,7 @@ def test_prefetch_releases_owner_block_before_next_allocation(tmp_path):
     worker, cursor, _copies = _owner_tracked_worker(
         tmp_path, N, maxsize=1000, block_frames=2)
 
-    worker._prefetch_worker()
+    worker._prefetch_worker(worker.run_configuration)
 
     assert len(cursor.samples) == 4, "expected 4 owner-block reads"
     peak = max(n for n, _b, _q in cursor.samples)
@@ -298,7 +307,9 @@ def test_prefetch_owner_and_copy_bytes_bounded_with_production_queue(tmp_path):
             _time.sleep(0.002)  # throttle: lets the queue back up to full
 
     consumer = threading.Thread(target=throttled_consumer, daemon=True)
-    producer = threading.Thread(target=worker._prefetch_worker, daemon=True)
+    producer = threading.Thread(
+        target=worker._prefetch_worker,
+        args=(worker.run_configuration,), daemon=True)
     producer.start()
     consumer.start()
     producer.join(timeout=30)
@@ -337,7 +348,7 @@ def test_prefetch_read_failure_fallback_releases_prior_owner(tmp_path):
     data = cursor._data
 
     # sequential sync reader: the fallback path re-serves frames one at a time
-    def sequential_sync():
+    def sequential_sync(_frozen):
         idx = worker._eiger_frame_idx
         if idx >= N:
             return (None, None, 1, None, {})
@@ -362,7 +373,7 @@ def test_prefetch_read_failure_fallback_releases_prior_owner(tmp_path):
 
     cursor.read_block = failing_read_block
 
-    worker._prefetch_worker()
+    worker._prefetch_worker(worker.run_configuration)
 
     # the failure-path entry saw NO lingering prior owner block
     assert live_at_failure == [0], (
@@ -390,7 +401,9 @@ def test_prefetch_stop_releases_owner_and_queued_copies(tmp_path):
     worker, cursor, copy_refs = _owner_tracked_worker(
         tmp_path, N, maxsize=depth, block_frames=2)
 
-    producer = threading.Thread(target=worker._prefetch_worker, daemon=True)
+    producer = threading.Thread(
+        target=worker._prefetch_worker,
+        args=(worker.run_configuration,), daemon=True)
     producer.start()
     # wait until the worker is wedged on the full queue, then Stop
     deadline = 30.0
@@ -432,7 +445,7 @@ def test_prefetch_worker_keeps_generation_handles_during_cleanup(tmp_path):
 
     worker._get_next_eiger_frame_sync = slow_read_returning_after_cleanup
 
-    worker._prefetch_worker(prefetch_queue, stop_evt)
+    worker._prefetch_worker(worker.run_configuration, prefetch_queue, stop_evt)
 
     assert prefetch_queue.get_nowait() == (None, None, 1, None, {})
 

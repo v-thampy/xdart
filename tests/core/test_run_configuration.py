@@ -11,6 +11,7 @@ from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.session.readiness import processing_config_from_mapping
 from xrd_tools.session.run_configuration import (
     FrozenRunConfiguration,
+    FrozenSourceSpec,
     GIIntent,
     RunIntent,
     ThresholdIntent,
@@ -292,6 +293,237 @@ def test_gi_resolved_motor_is_part_of_run_identity():
     assert a.gi.effective_motor == "halpha"
     assert b.gi.effective_motor == "eta"
     assert a.fingerprint != b.fingerprint
+
+
+# --------------------------------------------------------------------------- #
+# The two intrinsic source-value operations (review §43.1).
+#
+# ``filesystem_root`` and ``format_tokens`` are value semantics OWNED by the
+# accepted frozen source: computed from one immutable value object, with no
+# setter, cache, table, default or second authority.  They replace the worker
+# side's legacy source wrappers, so this matrix is the contract those wrappers
+# used to carry.  The freeze-owner end (which GUI card produces which shape) is
+# asserted by the production-shaped GUI oracle, not here.
+# --------------------------------------------------------------------------- #
+
+
+def test_directory_source_values_preserve_every_frozen_answer(tmp_path):
+    frozen = FrozenSourceSpec.from_source(DirectorySourceSpec(
+        root=tmp_path / "raw",
+        recursive=True,
+        suffixes=(".TIF",),
+        name_filter="sample",
+    ))
+
+    assert frozen.filesystem_root == str(tmp_path / "raw")
+    assert frozen.format_tokens == ("tif",)
+    assert frozen.recursive is True
+    assert frozen.name_filter == "sample"
+
+
+def test_container_directory_keeps_both_real_master_spellings(tmp_path):
+    """An Eiger container directory freezes TWO spellings; both must survive.
+
+    Collapsing ``("_master.hdf5", "_master.h5")`` to one token would make a
+    consumer matching the other spelling silently discover nothing.
+    """
+    frozen = FrozenSourceSpec.from_source(DirectorySourceSpec(
+        root=tmp_path,
+        suffixes=("_master.hdf5", "_master.h5"),
+    ))
+
+    assert frozen.format_tokens == ("hdf5", "h5")
+    assert frozen.filesystem_root == str(tmp_path)
+
+
+def test_tiff_series_root_is_the_containing_directory(tmp_path):
+    """The §40.1 P1-B grandparent bug, now owned by the value object."""
+    from xrd_tools.sources import image_series_spec
+
+    member = tmp_path / "scan_0001.tif"
+    member.write_bytes(b"")
+    frozen = FrozenSourceSpec.from_source(image_series_spec(member))
+
+    assert frozen.source_kind == "tiff_series"
+    assert frozen.filesystem_root == str(tmp_path)
+    assert frozen.format_tokens == ("tif",)
+
+
+@pytest.mark.parametrize(
+    ("name", "kind", "token"),
+    [
+        ("frame.tif", SourceKind.IMAGE_FILE, "tif"),
+        ("scan_master.h5", SourceKind.EIGER_MASTER, "h5"),
+        ("scan_master.hdf5", SourceKind.EIGER_MASTER, "hdf5"),
+        ("stack.nxs", SourceKind.NEXUS_STACK, "nxs"),
+    ],
+)
+def test_file_shaped_source_root_is_the_parent(tmp_path, name, kind, token):
+    frozen = FrozenSourceSpec.from_source(SourceSpec(tmp_path / name, kind))
+
+    assert frozen.filesystem_root == str(tmp_path)
+    assert frozen.format_tokens == (token,)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [SourceKind.LIVE, SourceKind.TILED, SourceKind.MEMORY, SourceKind.UNKNOWN],
+)
+def test_non_filesystem_source_fabricates_no_root(kind):
+    frozen = FrozenSourceSpec.from_source(SourceSpec("some://handle", kind))
+
+    with pytest.raises(ValueError, match="no filesystem root"):
+        frozen.filesystem_root
+
+
+def test_absent_source_is_refused_rather_than_defaulted():
+    frozen = RunIntent(source_spec=None).freeze()
+
+    assert frozen.source is None
+    assert frozen.thaw_source_spec() is None
+
+
+def test_uri_suffix_fallback_never_reads_a_directory_name():
+    """A dotted DIRECTORY name is not a format token.
+
+    The uri-suffix fallback exists for a file-shaped source with no frozen
+    suffix tuple; applying it to a source whose uri names a directory would
+    reinvent exactly the inference §40.1 P1-B removed.
+    """
+    series = FrozenSourceSpec(
+        family="source", uri="/data/scan.2026", source_kind="tiff_series")
+    directory = FrozenSourceSpec(family="directory", uri="/data/scan.2026")
+
+    assert series.format_tokens == ()
+    assert directory.format_tokens == ()
+
+
+def test_source_value_properties_stay_headless():
+    """The value type and BOTH properties import no Qt and no xdart."""
+    import subprocess
+
+    code = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from xrd_tools.core.scan import SourceKind, SourceSpec\n"
+        "from xrd_tools.session.run_configuration import FrozenSourceSpec\n"
+        "frozen = FrozenSourceSpec.from_source(\n"
+        "    SourceSpec(Path('/data/scan_master.h5'), SourceKind.EIGER_MASTER))\n"
+        "assert frozen.filesystem_root == str(Path('/data'))\n"
+        "assert frozen.format_tokens == ('h5',)\n"
+        "leaked = sorted(\n"
+        "    name for name in sys.modules\n"
+        "    if name.split('.')[0] in {'qtpy', 'pyqtgraph', 'xdart'}\n"
+        ")\n"
+        "assert not leaked, leaked\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+
+
+# --------------------------------------------------------------------------- #
+# The detached copy algebra (review §42.2, §43.3).
+#
+# ``_freeze_value`` accepts any object that can convert itself through ``item()``
+# or ``tolist()``, so the copy boundary ``clone_candidate`` uses must cover that
+# WHOLE algebra: a mutable container the freeze accepts but the copy aliases
+# would let a later idle edit reach an already-published candidate.
+# --------------------------------------------------------------------------- #
+
+
+class _TolistOnly:
+    """A MUTABLE value container the frozen algebra accepts via ``tolist``."""
+
+    def __init__(self, items):
+        self.items = list(items)
+
+    def tolist(self):
+        return list(self.items)
+
+
+class _CopyReturnsSelf(_TolistOnly):
+    """``copy()`` exists but hands back the same mutable object."""
+
+    def copy(self):
+        return self
+
+
+class _ThrowingCopy(_TolistOnly):
+    """``copy()`` exists and refuses; the value conversion still works."""
+
+    def copy(self):
+        raise ValueError("this container cannot copy itself")
+
+
+class _HashableTolist(_TolistOnly):
+    """Hash-sensitive: usable as a mapping key while still mutable."""
+
+    def __hash__(self):
+        return hash(tuple(self.items))
+
+    def __eq__(self, other):
+        return isinstance(other, _HashableTolist) and self.items == other.items
+
+
+class _CopyableKey(_HashableTolist):
+    """A hash-sensitive key that CAN hand back an independent copy."""
+
+    def copy(self):
+        return _CopyableKey(self.items)
+
+
+@pytest.mark.parametrize(
+    "factory", [_TolistOnly, _CopyReturnsSelf, _ThrowingCopy])
+def test_clone_candidate_detaches_every_accepted_value_container(factory):
+    value = factory([1, 2])
+    intent = RunIntent(run_options={"probe": value})
+
+    # The frozen algebra ACCEPTS this object, so the copy boundary owes it a
+    # detached value; anything less contradicts the stated whole-algebra
+    # contract rather than merely missing an exotic type.
+    assert intent.freeze().run_options["probe"] == [1, 2]
+
+    copied = intent.clone_candidate().run_options["probe"]
+
+    assert copied is not value
+    value.items.append(3)
+    settled = copied.tolist() if hasattr(copied, "tolist") else copied
+    assert settled == [1, 2]
+
+
+def test_clone_candidate_detaches_or_refuses_a_hash_sensitive_mapping_key():
+    """Keys ride the same boundary as values, or the copy fails closed.
+
+    A key that can copy itself detaches; one that can only convert through
+    ``tolist()`` becomes unhashable, and refusing is the correct fail-closed
+    outcome -- returning the original key would alias it.
+    """
+    copyable = _CopyableKey([1, 2])
+    intent = RunIntent(run_options={copyable: "value"})
+
+    (copied_key,) = intent.clone_candidate().run_options
+    assert copied_key is not copyable
+    assert copied_key == copyable
+
+    intent = RunIntent(run_options={_HashableTolist([3]): "value"})
+    with pytest.raises(TypeError):
+        intent.clone_candidate()
+
+
+def test_clone_candidate_preserves_numpy_dtype_and_shape():
+    numpy = pytest.importorskip("numpy")
+    array = numpy.arange(4, dtype=numpy.int16).reshape(2, 2)
+    intent = RunIntent(bai_1d_args={"weights": array})
+
+    copied = intent.clone_candidate().bai_1d_args["weights"]
+
+    assert copied is not array
+    assert copied.dtype == array.dtype
+    assert copied.shape == array.shape
+    array[0, 0] = 99
+    assert int(copied[0, 0]) == 0
 
 
 def test_resolve_gi_motor_none_vs_empty_choices_escape():

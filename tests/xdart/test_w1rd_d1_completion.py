@@ -347,6 +347,40 @@ def test_nonexistent_directory_cannot_be_admitted(
     assert getattr(wrangler, "_admitted_run_configuration", None) is None
 
 
+def test_admission_itself_refuses_an_accepted_object_with_no_source(
+        widget, tmp_path, monkeypatch):
+    """§40.3 D1 item 4 / §40.4 mutation 1, at the ADMISSION owner itself.
+
+    The GUI's pre-Start readiness gate also refuses a sourceless click, so a
+    mutation that drops ``source`` from the required frozen values stayed masked
+    behind it.  Drive the real admission owner directly: the accepted object must
+    be refused there too, because a run whose frozen source is absent would have
+    to infer it from mutable state.
+    """
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import (
+        wranglerWidget,
+    )
+    from xrd_tools.session import RunConfigurationRefused, RunIntent
+
+    wrangler = widget.wrangler
+    out = tmp_path / "out"
+    out.mkdir()
+    sourceless = RunIntent(
+        processing_mode="Int 2D", save_path=str(out), source_spec=None).freeze()
+    assert sourceless.source is None
+    monkeypatch.setattr(
+        widget, "_prepare_controls_v2_run_configuration", lambda: sourceless)
+    before = getattr(wrangler, "run_configuration", None)
+
+    with pytest.raises(RunConfigurationRefused) as excinfo:
+        wranglerWidget._admit_run_configuration(wrangler, "oracle-no-source")
+
+    assert excinfo.value.reason == "absent"
+    assert "source" in str(excinfo.value)
+    # and the refusal is still zero-delta
+    assert getattr(wrangler, "run_configuration", None) is before
+
+
 def test_empty_but_existing_directory_remains_legitimate(
         widget, tmp_path, monkeypatch):
     """§41.3.D's explicit carve-out: the lazy Directory contract must survive.
@@ -447,3 +481,94 @@ def test_publication_failure_leaves_no_partially_accepted_run(
     assert changed == {}, f"publication was not atomic: {sorted(changed)}"
     monkeypatch.setattr(
         FrozenRunConfiguration, "thaw_source_spec", real_thaw, raising=False)
+
+
+# --------------------------------------------------------------------------- #
+# §42.2 / §42.5 items 1-2 — the candidate-copy boundary must cover every value
+# type the frozen-value algebra accepts, and get_img_fname must read the CARD.
+# --------------------------------------------------------------------------- #
+
+def _canonical_intent_with(widget, **values):
+    intent = widget._controls_v2_ensure_run_intent()
+    for name, value in values.items():
+        setattr(intent, name, value)
+    return intent
+
+
+def test_candidate_copy_detaches_numpy_arrays_both_directions(widget):
+    """§42.2 item 3.  ``_detached_value`` fell through to ``return value`` for a
+    NumPy array, so the canonical intent and the candidate SHARED one buffer --
+    a mutation through either was visible in the other."""
+    import numpy as np
+
+    array = np.arange(6, dtype=np.float64).reshape(2, 3)
+    intent = _canonical_intent_with(
+        widget, bai_1d_args={"mask": array, "unit": "q_A^-1"})
+
+    candidate = intent.clone_candidate()
+    copied = candidate.bai_1d_args["mask"]
+
+    assert copied is not array
+    assert copied.dtype == array.dtype
+    assert copied.shape == array.shape
+    assert np.array_equal(copied, array)
+
+    copied[0, 0] = 99.0
+    assert array[0, 0] == 0.0, "candidate mutation reached the canonical intent"
+    array[1, 2] = -7.0
+    assert copied[1, 2] == 5.0, "canonical mutation reached the candidate"
+
+
+def test_candidate_copy_detaches_numpy_zero_d_without_changing_dtype(widget):
+    """§42.2 item 3, the 0-D case: dtype and shape are preserved exactly."""
+    import numpy as np
+
+    zero_d = np.array(3.5, dtype=np.float32)
+    intent = _canonical_intent_with(widget, poni_values={"wavelength": zero_d})
+
+    copied = intent.clone_candidate().poni_values["wavelength"]
+
+    # An ALIASED value trivially has the right dtype and shape, so the identity
+    # assertion is what makes this case discriminate at all.
+    assert copied is not zero_d
+    assert copied.dtype == np.dtype(np.float32)
+    assert copied.shape == ()
+    assert float(copied) == 3.5
+
+
+def test_candidate_copy_preserves_frozenset_and_detaches_set_members(widget):
+    """§42.2 item 2.  A ``frozenset`` was silently coerced to a mutable ``set``
+    and neither kind had its MEMBERS detached."""
+    intent = _canonical_intent_with(widget, run_options={
+        "frozen_choice": frozenset({"a", "b"}),
+        "mutable_choice": {"c"},
+        "nested": {"members": [{"deep": 1}]},
+    })
+
+    options = intent.clone_candidate().run_options
+
+    assert isinstance(options["frozen_choice"], frozenset), (
+        "a frozenset became a mutable set")
+    assert options["frozen_choice"] == frozenset({"a", "b"})
+    assert isinstance(options["mutable_choice"], set)
+    assert options["mutable_choice"] is not intent.run_options["mutable_choice"]
+    deep = options["nested"]["members"][0]
+    assert deep is not intent.run_options["nested"]["members"][0]
+    deep["deep"] = 999
+    assert intent.run_options["nested"]["members"][0]["deep"] == 1
+
+
+def test_get_img_fname_reads_the_card_not_a_stale_mode_mirror(
+        widget, tmp_path):
+    """§42.2 / §42.5 item 2.  ``get_img_fname`` still branched on the mutable
+    ``self.inp_type`` mirror, so a stale mode sent a real Image-Series selection
+    down the Directory leg and cleared the runtime cursor."""
+    raw, _out = _arm_series(widget, tmp_path)
+    assert widget.wrangler.img_file == str(raw)
+
+    # The card still says Image Series; only the mutable mirror is stale.
+    widget.wrangler.inp_type = "Image Directory"
+    widget.wrangler.get_img_fname()
+
+    assert widget.wrangler.img_file == str(raw), (
+        "a stale inp_type mirror redirected the authoritative source read")
