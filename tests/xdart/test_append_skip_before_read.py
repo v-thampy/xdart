@@ -41,7 +41,8 @@ def test_paths_with_suffix_matches_extensions_case_insensitively(tmp_path):
 
 def _frozen_run_config(*, skip_2d=True, gi=False, bai_1d_args=None,
                        bai_2d_args=None, gi_mode_1d="q_total",
-                       gi_mode_2d="qip_qoop"):
+                       gi_mode_2d="qip_qoop", output_mode="Append",
+                       live_mode=False):
     """A REAL ``FrozenRunConfiguration`` through the PRODUCTION freeze owner.
 
     O-1a-W1A: the accepted frozen configuration is the worker's only
@@ -55,6 +56,12 @@ def _frozen_run_config(*, skip_2d=True, gi=False, bai_1d_args=None,
 
     return RunIntent(
         processing_mode="Int 1D" if skip_2d else "Int 2D",
+        # O-1a-W1R (review §39.2 W1R-P1-4): the worker consumes the output mode
+        # and the live/batch mode from the ACCEPTED object, so a case that wants
+        # Overwrite/Replace or live watch must FREEZE it rather than set the (now
+        # zero-reader) thread mirror.
+        output_mode=output_mode,
+        live_mode=live_mode,
         bai_1d_args=dict(bai_1d_args if bai_1d_args is not None
                          else {"unit": "q_A^-1"}),
         bai_2d_args=dict(bai_2d_args or {}),
@@ -62,9 +69,9 @@ def _frozen_run_config(*, skip_2d=True, gi=False, bai_1d_args=None,
     ).freeze()
 
 
-def _bare_worker(tmp_path):
+def _bare_worker(tmp_path, *, write_mode="Append"):
     worker = imageThread.__new__(imageThread)
-    worker.write_mode = "Append"
+    worker.write_mode = write_mode
     worker.xye_only = False
     worker.series_average = False
     worker.h5_dir = str(tmp_path / "out")
@@ -99,7 +106,8 @@ def _bare_worker(tmp_path):
         bai_2d_args={},
         gi_config={},
     )
-    worker.run_configuration = _frozen_run_config()
+    worker.run_configuration = worker._admitted_run_configuration = (
+        _frozen_run_config(output_mode=write_mode))
     worker.run_configuration_floor = 0
     return worker
 
@@ -148,12 +156,11 @@ def _write_minimal_integrated_nxs(
 
 
 def _initialize_scan_worker(tmp_path, *, write_mode="Append"):
-    worker = _bare_worker(tmp_path)
+    worker = _bare_worker(tmp_path, write_mode=write_mode)
     out = tmp_path / "out"
     out.mkdir(exist_ok=True)
     worker.h5_dir = str(out)
     worker.scan_name = "scan"
-    worker.write_mode = write_mode
     worker.scan = SimpleNamespace(
         skip_2d=True,
         gi=False,
@@ -161,7 +168,8 @@ def _initialize_scan_worker(tmp_path, *, write_mode="Append"):
         bai_2d_args={},
         gi_config={},
     )
-    worker.run_configuration = _frozen_run_config()
+    worker.run_configuration = worker._admitted_run_configuration = (
+        _frozen_run_config(output_mode=write_mode))
     worker.run_configuration_floor = 0
     worker.sigUpdateFile = SimpleNamespace(emit=lambda *_: None)
 
@@ -380,7 +388,7 @@ def test_append_skip_snapshot_lazily_reads_only_current_frame_index(
 
 def test_int_2d_append_does_not_skip_frame_with_only_1d_output(tmp_path):
     worker = _bare_worker(tmp_path)
-    worker.run_configuration = _frozen_run_config(skip_2d=False)
+    worker.run_configuration = worker._admitted_run_configuration = _frozen_run_config(skip_2d=False)
     out = tmp_path / "out"
     out.mkdir()
     _write_minimal_integrated_nxs(out / "scan.nxs", [0])
@@ -391,7 +399,7 @@ def test_int_2d_append_does_not_skip_frame_with_only_1d_output(tmp_path):
 
 def test_int_2d_append_completion_is_1d_2d_intersection(tmp_path):
     worker = _bare_worker(tmp_path)
-    worker.run_configuration = _frozen_run_config(skip_2d=False)
+    worker.run_configuration = worker._admitted_run_configuration = _frozen_run_config(skip_2d=False)
     out = tmp_path / "out"
     out.mkdir()
     _write_minimal_integrated_nxs(
@@ -414,7 +422,7 @@ def test_int_1d_append_completion_requires_only_1d_output(tmp_path):
 
 def test_append_dispatch_guard_uses_mode_aware_cursor_not_union_index(tmp_path):
     worker = _bare_worker(tmp_path)
-    worker.run_configuration = _frozen_run_config(skip_2d=False)
+    worker.run_configuration = worker._admitted_run_configuration = _frozen_run_config(skip_2d=False)
     worker._append_skip_frames_by_scan = {"scan": set()}
     loaded_scan = SimpleNamespace(frames=SimpleNamespace(index=[0]))
 
@@ -436,7 +444,7 @@ def test_append_cursor_rejects_reached_target_config_before_skip(tmp_path):
             "bai_2d_args": {"unit": "q_A^-1"},
         },
     )
-    worker.run_configuration = _frozen_run_config(
+    worker.run_configuration = worker._admitted_run_configuration = _frozen_run_config(
         bai_1d_args={"unit": "q_A^-1", "numpoints": 500})
 
     with pytest.raises(AppendConfigMismatchError) as excinfo:
@@ -513,7 +521,7 @@ def test_append_cursor_memo_revalidates_current_processing_config(
     from xrd_tools.session.readiness import AppendConfigMismatchError
 
     worker = _bare_worker(tmp_path)
-    worker.run_configuration = _frozen_run_config(
+    worker.run_configuration = worker._admitted_run_configuration = _frozen_run_config(
         bai_1d_args={"unit": "q_A^-1", "numpoints": 1000})
     out = tmp_path / "out"
     out.mkdir()
@@ -529,7 +537,7 @@ def test_append_cursor_memo_revalidates_current_processing_config(
 
     assert worker._load_append_skip_snapshot("scan") == {1, 2}
     worker._append_skip_frames_by_scan = {}
-    worker.run_configuration = _frozen_run_config(
+    worker.run_configuration = worker._admitted_run_configuration = _frozen_run_config(
         bai_1d_args={"unit": "q_A^-1", "numpoints": 500})
     monkeypatch.setattr(
         iwt,
@@ -656,6 +664,10 @@ def test_live_idle_recursive_discovery_is_bounded_per_reader_request(tmp_path):
         raw_dir, recursive=True, suffixes=(".nxs",))
     worker.source_run_plan = None
     worker.source_index_session = None
+    # O-1a-W1R: live/batch mode is FROZEN policy -- the bounded-discovery branch
+    # in `_eiger_pop_next_master` reads it, so freeze it here.
+    worker.run_configuration = worker._admitted_run_configuration = (
+        _frozen_run_config(live_mode=True))
     worker.live_mode = True
     worker._eiger_master_path = None
     worker._eiger_frame_idx = 0
@@ -1267,7 +1279,7 @@ def test_append_initialize_config_mismatch_aborts_with_empty_img_file(tmp_path):
     before = target.read_bytes()
     worker.img_file = ""  # live/cold path: Run click may not know the source yet.
     worker.gi = True
-    worker.run_configuration = _frozen_run_config(
+    worker.run_configuration = worker._admitted_run_configuration = _frozen_run_config(
         gi=True,
         bai_1d_args={"unit": "q_A^-1", "gi_mode_1d": "q_total"},
         bai_2d_args={"unit": "q_A^-1", "gi_mode_2d": "qip_qoop"},
@@ -1315,7 +1327,7 @@ def test_append_initialize_same_config_canonical_noise_passes(tmp_path):
         },
     )
     worker.img_file = ""
-    worker.run_configuration = _frozen_run_config(
+    worker.run_configuration = worker._admitted_run_configuration = _frozen_run_config(
         bai_1d_args={
             "unit": "q_A^-1",
             "radial_range": (0.1, 6.0),
@@ -1346,7 +1358,8 @@ def test_append_initialize_mismatch_ignored_in_overwrite_mode(tmp_path):
     )
     worker.img_file = ""
     worker.gi = True
-    worker.run_configuration = _frozen_run_config(
+    worker.run_configuration = worker._admitted_run_configuration = _frozen_run_config(
+        output_mode="Overwrite",
         gi=True,
         bai_1d_args={"unit": "q_A^-1", "gi_mode_1d": "q_total"},
         bai_2d_args={"unit": "q_A^-1", "gi_mode_2d": "qip_qoop"},
@@ -1429,9 +1442,10 @@ def test_non_series_average_append_never_blocked(monkeypatch, tmp_path):
 
 
 def test_series_average_replace_mode_not_blocked(monkeypatch, tmp_path):
-    worker = _bare_worker(tmp_path)
+    # O-1a-W1R: the output mode is FROZEN policy, so a case that wants Replace
+    # must freeze it -- the thread mirror has no execution readers left.
+    worker = _bare_worker(tmp_path, write_mode="Overwrite")
     worker.series_average = True
-    worker.write_mode = "Overwrite"        # not Append => append-skip disabled
     monkeypatch.setattr(worker, "_append_run_start_scan_names", lambda: ["scan"])
     worker._append_skip_frames_by_scan = {"scan": {1}}
 

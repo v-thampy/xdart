@@ -163,7 +163,7 @@ def _real_append_thread(tmp_path):
     # re-run's Int 2D settings — exactly what the operator accepted at the click.
     from xrd_tools.session import RunIntent
 
-    thread.run_configuration = RunIntent(
+    thread.run_configuration = thread._admitted_run_configuration = RunIntent(
         processing_mode="Int 2D",
         bai_1d_args=dict(CURRENT_2D_ARGS["bai_1d_args"]),
         bai_2d_args=dict(CURRENT_2D_ARGS["bai_2d_args"]),
@@ -302,6 +302,21 @@ def test_live_watch_append_mismatch_stops_cleanly(tmp_path):
     host._handle_append_config_mismatch = MethodType(
         imageThread._handle_append_config_mismatch, host)
 
+    # O-1a-W1R (review §39.2 W1R-P1-5): the source FAMILY is the accepted frozen
+    # source's decision now, so ``process_scan`` consults it instead of sniffing
+    # the mutable ``img_file`` cursor.  Arm this host with a REAL frozen
+    # configuration from the production freeze owner.
+    from xrd_tools.session import RunIntent as _W1R_RunIntent
+    if getattr(host, "run_configuration", None) is None:
+        host.run_configuration = host._admitted_run_configuration = (
+            _W1R_RunIntent(
+                processing_mode="Int 2D",
+                # live/batch mode is FROZEN policy now: the bounded-discovery
+                # branch and the batch dispatcher both read it from the accepted
+                # object, so a live-watch case must freeze it.
+                live_mode=bool(getattr(host, "live_mode", False)),
+                batch_mode=bool(getattr(host, "batch_mode", False)),
+            ).freeze())
     MethodType(imageThread.process_scan, host)()    # must NOT raise
 
     assert init_calls == [0, 1]                 # scan "a", then the mismatch
@@ -450,6 +465,21 @@ def test_live_watch_saves_every_intermediate_scan(tmp_path):
     host.flush_serial_tail = MethodType(imageThread.flush_serial_tail, host)
     host._flush_outgoing_scan = MethodType(imageThread._flush_outgoing_scan, host)
 
+    # O-1a-W1R (review §39.2 W1R-P1-5): the source FAMILY is the accepted frozen
+    # source's decision now, so ``process_scan`` consults it instead of sniffing
+    # the mutable ``img_file`` cursor.  Arm this host with a REAL frozen
+    # configuration from the production freeze owner.
+    from xrd_tools.session import RunIntent as _W1R_RunIntent
+    if getattr(host, "run_configuration", None) is None:
+        host.run_configuration = host._admitted_run_configuration = (
+            _W1R_RunIntent(
+                processing_mode="Int 2D",
+                # live/batch mode is FROZEN policy now: the bounded-discovery
+                # branch and the batch dispatcher both read it from the accepted
+                # object, so a live-watch case must freeze it.
+                live_mode=bool(getattr(host, "live_mode", False)),
+                batch_mode=bool(getattr(host, "batch_mode", False)),
+            ).freeze())
     MethodType(imageThread.process_scan, host)()
 
     assert init_calls == ["a", "b", "c"]

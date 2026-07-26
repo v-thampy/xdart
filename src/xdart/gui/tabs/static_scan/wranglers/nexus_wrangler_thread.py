@@ -67,7 +67,11 @@ from xdart.modules.reduction import (
     reduce_live_frames,
     sync_live_scan_gi_settings,
 )
-from .wrangler_widget import wranglerThread
+from .wrangler_widget import (
+    frozen_run_policy,
+    install_frozen_run_projections,
+    wranglerThread,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -181,18 +185,36 @@ class nexusThread(wranglerThread):
     # ── Main entry point ─────────────────────────────────────────────────
 
     def _require_run_configuration(self, stage):
-        """Return the ONE accepted frozen configuration, or refuse (typed).
+        """Return the EXACT admitted frozen configuration, or refuse (typed).
 
-        Parity with ``imageThread``: after admission the frozen configuration is
-        the sole run-configuration authority, and absence / a foreign carrier /
-        a superseded generation is a typed refusal.
+        Parity with ``imageThread``: the WORKER-ENTRY identity gate.  O-1a-W1R
+        (review §39.2 W1R-P1-1) makes the comparison exact object identity
+        against the admission ledger, so a genuine but different
+        ``FrozenRunConfiguration`` -- same generation, future generation, or an
+        equal-valued reconstruction -- refuses here rather than executing the
+        substitution.
         """
 
         return require_run_configuration(
             getattr(self, "run_configuration", None),
             stage=stage,
             floor=int(getattr(self, "run_configuration_floor", 0) or 0),
+            expected=getattr(self, "_admitted_run_configuration", None),
         )
+
+    def _frozen_run_policy(self, stage):
+        """The accepted configuration for a read INSIDE an already-gated run.
+
+        Presence and type only: identity was qualified once at worker entry
+        (§39.5 Phase 2 item 1).  Absence is still the typed refusal -- there is
+        no fall back to display state.
+        """
+
+        frozen = frozen_run_policy(self)
+        if frozen is None:
+            return require_run_configuration(
+                getattr(self, "run_configuration", None), stage=stage)
+        return frozen
 
     def _project_gi_modes_onto_display_scan(self):
         """Backward GI-mode write onto the mutable DISPLAY scan (retained).
@@ -202,7 +224,7 @@ class nexusThread(wranglerThread):
         frozen configuration, so this can never change what the run integrates.
         """
 
-        frozen = nexusThread._require_run_configuration(
+        frozen = nexusThread._frozen_run_policy(
             self, "nexus-gi-projection")
         if not frozen.gi.enabled or self.scan is None:
             return
@@ -233,6 +255,10 @@ class nexusThread(wranglerThread):
     def _run_impl(self):
         """Read frames from a NeXus file and integrate them in parallel."""
         t0 = time.time()
+        # O-1a-W1R (review §39.5 Phase 2 item 1): capture the accepted frozen
+        # reference ONCE at worker entry.  Identity was gated in ``run()``; this
+        # is the object every execution decision below consumes.
+        _frozen = nexusThread._frozen_run_policy(self, "nexus-run-impl")
         if self.poni is None or not self.nexus_file:
             return
 
@@ -326,7 +352,11 @@ class nexusThread(wranglerThread):
                 tilt_angle=self.tilt_angle,
             )
             standard_plan = self._plan_cache.get(
-                scan, integrate_2d=not scan.skip_2d,
+                # O-1a-W1R (review §39.2 W1R-P1-6): this 2D-integration
+                # decision used to read ``skip_2d`` off the locally
+                # aliased DISPLAY scan, which the committed AST census
+                # could not see.  It now comes from frozen policy.
+                scan, integrate_2d=not _frozen.skip_2d,
             )
             frames_since_save = 0
             for chunk_start in range(0, nframes, _READ_CHUNK):
@@ -607,3 +637,17 @@ class nexusThread(wranglerThread):
     # from the chunk loop every LIVE_SAVE_INTERVAL frames so the
     # on-disk file stays close to in-memory state even if the user
     # kills the process mid-scan.
+
+
+# ── O-1a-W1R Phase 2: frozen policy is the SOLE execution input ─────────────
+#
+# The NeXus worker's half of the same contract.  Its own source membership comes
+# from the NeXus file it was handed, so the source-family projections do not
+# apply here; every scientific-policy and mode carrier it consumes does.
+install_frozen_run_projections(nexusThread, (
+    "apply_threshold", "threshold_min", "threshold_max", "mask_sentinel",
+    "mask_file",
+    "gi", "incidence_motor", "sample_orientation", "tilt_angle",
+    "max_cores", "xye_only",
+    "scan_args",
+))

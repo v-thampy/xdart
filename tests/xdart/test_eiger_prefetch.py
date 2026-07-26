@@ -503,6 +503,12 @@ def test_run_refusal_preserves_lingering_reader_state():
 
     worker.run_configuration = RunIntent(processing_mode="Int 2D").freeze()
     worker.run_configuration_floor = 0
+    # O-1a-W1R (review §39.2 W1R-P1-1): worker-entry consumption now compares the
+    # carrier against the object the wrapper ADMITTED, by identity -- a generation
+    # floor is not execution authorization.  This host is its own admitter, so it
+    # records the same object as its admission ledger; the assertion below still
+    # measures the reader-retry refusal it was written for.
+    worker._admitted_run_configuration = worker.run_configuration
     worker.showLabel = SimpleNamespace(emit=lambda message: statuses.append(message))
     worker.img_fnames = ["pending-image"]
     worker.processed = ["processed-image"]

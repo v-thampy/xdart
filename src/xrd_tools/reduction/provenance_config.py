@@ -310,17 +310,30 @@ def _copy_optional(out: dict[str, Any], key: str, value: Any) -> None:
 
 
 def _jsonable_range(value: Any) -> Any:
+    """One JSON-native range projection, shared with the run-configuration owner.
+
+    O-1a-W1R (review §39.2 W1R-P1-7): this pair used to be the only bounded
+    recursive normalization in the tree, so the run-configuration provenance
+    owner generalized it rather than adding a second writer schema authority.
+    Both paths now go through :func:`xrd_tools.session.run_configuration.
+    jsonable_run_value`; the numeric coercion below is kept because a reduction
+    range is numeric by contract.
+    """
     if value is None:
         return None
-    if isinstance(value, tuple):
-        return tuple(float(v) for v in value)
-    if isinstance(value, list):
-        return [float(v) for v in value]
-    return value
+    if isinstance(value, (tuple, list)):
+        return _jsonable(tuple(float(v) for v in value))
+    return _jsonable(value)
 
 
 def _enum_value(value: Any) -> Any:
-    return getattr(value, "value", value)
+    return _jsonable(getattr(value, "value", value))
+
+
+def _jsonable(value: Any) -> Any:
+    from xrd_tools.session.run_configuration import jsonable_run_value
+
+    return jsonable_run_value(value, path="reduction_config")
 
 
 def _first_truthy(*values: Any) -> Any:

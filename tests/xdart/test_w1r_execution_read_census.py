@@ -161,6 +161,9 @@ def _carriers_read_by(worker) -> set[str]:
     import ast
 
     module = inspect.getmodule(worker)
+    assert module is not None, (
+        f"could not resolve the defining module of {worker!r}; the census must "
+        "fail loudly rather than by TypeError")
     tree = ast.parse(inspect.getsource(module))
     names = set(FROZEN_EXECUTION_POLICY) | set(RUNTIME_SOURCE_CURSOR)
     found = set()

@@ -44,7 +44,9 @@ __all__ = [
     "FrozenSourceSpec",
     "FrozenRunConfiguration",
     "RunConfigurationRefused",
+    "admit_run_configuration",
     "require_run_configuration",
+    "jsonable_run_value",
     # GI theta-motor policy (Qt-free, single source of truth).  `resolve_gi_motor`
     # is THE motor-resolution decision (raw selection + choice knowledge ->
     # effective motor); `pick_default_gi_motor` is the default-pick it delegates
@@ -90,7 +92,9 @@ _RUN_CONFIGURATION_EXPORTS = {
     "FrozenSourceSpec",
     "FrozenRunConfiguration",
     "RunConfigurationRefused",
+    "admit_run_configuration",
     "require_run_configuration",
+    "jsonable_run_value",
     "resolve_gi_motor",
 }
 

@@ -199,7 +199,11 @@ from xdart.modules.reduction import (
     sync_live_scan_gi_settings,
 )
 from .qt_nexus_sink import QtNexusSink
-from .wrangler_widget import wranglerThread
+from .wrangler_widget import (
+    frozen_run_policy,
+    install_frozen_run_projections,
+    wranglerThread,
+)
 
 # Batch execution policy (PERF-4b/WS-X1).  Batch ALWAYS streams now: one
 # persistent ReductionSession + QtNexusSink (submit-per-frame, single writer
@@ -721,6 +725,7 @@ class imageThread(wranglerThread):
         # superseded object a typed refusal instead of a silent stale run.
         self.run_configuration = None
         self.run_configuration_floor = 0
+        self._admitted_run_configuration = None
         # H19: supplied by the mounted Source card immediately before Run.
         # Both are value/headless boundaries; the mutable DirectoryIndex stays
         # owned by DirectoryIndexSession's serialized executor.
@@ -804,19 +809,43 @@ class imageThread(wranglerThread):
     # ── The accepted run configuration (O-1a-W1A) ────────────────────────
 
     def _require_run_configuration(self, stage):
-        """Return the ONE accepted frozen configuration, or refuse (typed).
+        """Return the EXACT admitted frozen configuration, or refuse (typed).
 
-        After admission the frozen configuration is the sole run-configuration
-        authority: absence, a foreign carrier, or a generation superseded by a
-        later accepted click is a typed refusal, never a fall back to the
-        mutable display scan or to a panel-derived thread mirror.
+        The WORKER-ENTRY identity gate (review §39.5 Phase 1 item 5 / Phase 2
+        item 1).  After admission the frozen configuration is the sole
+        run-configuration authority, so this refuses -- before any source read,
+        writer open, session mutation or reduction -- when the carrier is
+        missing, not frozen, stale, or a genuine but DIFFERENT
+        ``FrozenRunConfiguration`` than the one the wrapper admitted
+        (same-generation, future-generation, or an equal-valued reconstruction).
+
+        O-1a-W1R (review §39.2 W1R-P1-1): the comparison is exact object
+        identity against the admission ledger, not ``generation >= floor``.  A
+        bare floor never authorizes execution.
         """
 
         return require_run_configuration(
             getattr(self, "run_configuration", None),
             stage=stage,
             floor=int(getattr(self, "run_configuration_floor", 0) or 0),
+            expected=getattr(self, "_admitted_run_configuration", None),
         )
+
+    def _frozen_run_policy(self, stage):
+        """The accepted configuration for a read INSIDE an already-gated run.
+
+        Presence and type only: run IDENTITY is qualified ONCE at worker entry
+        (review §39.5 Phase 2 item 1), so repeating the identity comparison at
+        every internal read would make the gate's location unknowable.  Absence
+        remains the typed refusal -- there is never a fall back to the mutable
+        display scan or a panel-derived mirror.
+        """
+
+        frozen = frozen_run_policy(self)
+        if frozen is None:
+            return require_run_configuration(
+                getattr(self, "run_configuration", None), stage=stage)
+        return frozen
 
     def _project_gi_modes_onto_display_scan(self):
         """Backward GI-mode write onto the mutable DISPLAY scan (retained).
@@ -1286,7 +1315,7 @@ class imageThread(wranglerThread):
             source_cache[key] = None
             return cache[key]
 
-        frozen = imageThread._require_run_configuration(self, "append-cursor")
+        frozen = imageThread._frozen_run_policy(self, "append-cursor")
         require_2d = not bool(frozen.skip_2d)
         memo = getattr(self, "_append_cursor_memo", None)
         if memo is None:
@@ -1546,7 +1575,9 @@ class imageThread(wranglerThread):
                     files_processed_by_output[key] += count
 
         _cached_poni = None
-        is_eiger = _is_eiger_master(self.img_file) if self.img_file else False
+        # O-1a-W1R (review §39.2 W1R-P1-5): the source family comes from the
+        # accepted frozen source, not from the mutable current-file cursor.
+        is_eiger = imageThread._frozen_source_is_container(self)
         # One-time visibility into which execution path this run takes (so the
         # XDART_LIVE_EXECUTION flag is observable).  Batch always streams now.
         # DEBUG: developer diagnostics, not run output.
@@ -5346,7 +5377,7 @@ class imageThread(wranglerThread):
         literals, would re-create exactly the emitter coupling R4B-14 removed.
         """
 
-        frozen = imageThread._require_run_configuration(
+        frozen = imageThread._frozen_run_policy(
             self, "container-selection")
         source = frozen.source
         if source is not None:
@@ -5363,9 +5394,17 @@ class imageThread(wranglerThread):
 
     def get_next_image(self):
         """Gets next image in image series or in directory to process."""
-        is_master = _is_eiger_master(self.img_file) if self.img_file else False
+        # O-1a-W1R (review §39.2 W1R-P1-5 items 1-2): the reader FAMILY is the
+        # frozen source's decision.  The parent derived ``is_master`` from the
+        # mutable ``img_file`` cursor and evaluated ``single_img`` before the
+        # frozen container decision, so a frozen TIFF series plus a
+        # master-shaped mutable path routed to the Eiger reader and a frozen
+        # container directory plus ``single_img=True`` routed to plain-image
+        # handling.  ``img_file`` stays the runtime cursor; it no longer decides
+        # the family.
+        is_container = imageThread._frozen_source_is_container(self)
 
-        if self.single_img and not is_master:
+        if self.single_img and not is_container:
             scan_name, img_number = _get_scan_info(self.img_file)
             self._record_discovered_frame()
             if self._should_skip_before_read(scan_name, img_number):
@@ -5377,7 +5416,7 @@ class imageThread(wranglerThread):
             meta = read_image_metadata(self.img_file, meta_format=self.meta_ext, meta_dir=self.meta_dir) if self.meta_ext else {}
             return self.img_file, scan_name, img_number, img_data, meta
 
-        if is_master or imageThread._frozen_source_is_container(self):
+        if is_container:
             return self._get_next_eiger_frame()
 
         if len(self.img_fnames) == 0:
@@ -5871,3 +5910,33 @@ class imageThread(wranglerThread):
         return bg
 
     # ``save_1d`` moved to wranglerThread (the base class).
+
+
+# ── O-1a-W1R Phase 2: frozen policy is the SOLE execution input ─────────────
+#
+# Every FROZEN_EXECUTION_POLICY carrier this worker consumes is bound to the
+# shared read-through projection (review §39.2 W1R-P1-4/W1R-P1-5, §39.5 Phase 2
+# items 2-3).  The historical names are unchanged, so no read site needs an
+# indirection, but the mutable field is gone: while a run configuration is
+# admitted the read resolves through THAT exact object and a write lands in the
+# zero-reader display slot.  RUNTIME_SOURCE_CURSOR values (``img_file``,
+# ``img_fnames``, ``scan_name``, ``processed``, ``poni``, ``detector``, ``mask``,
+# ``meta_dir``, ``source_base``) are deliberately NOT listed: they are real
+# runtime data and must stay writable.
+install_frozen_run_projections(imageThread, (
+    # output
+    "write_mode", "h5_dir",
+    # scientific policy
+    "apply_threshold", "threshold_min", "threshold_max", "mask_sentinel",
+    "mask_file",
+    # grazing incidence
+    "gi", "incidence_motor", "sample_orientation", "tilt_angle",
+    # mode / parallelism
+    "live_mode", "batch_mode", "max_cores", "xye_only", "series_average",
+    "meta_ext",
+    # source family / traversal
+    "inp_type", "img_ext", "img_dir", "single_img", "include_subdir",
+    "file_filter", "source_spec",
+    # integration arguments
+    "scan_args",
+))

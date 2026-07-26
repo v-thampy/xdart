@@ -276,7 +276,16 @@ def test_nexus_worker_refuses_a_foreign_configuration(
 
 def test_nexus_worker_refuses_a_stale_generation(widget, tmp_path, monkeypatch):
     """W-1.2 case 8 (stale).  A configuration frozen for an earlier click is
-    refused against the accepted floor."""
+    refused against the object this run admitted.
+
+    RULE-9 CORRECTION (W-1R, review §39.2 W1R-P1-1).  This case originally
+    expressed the refusal as ``generation < floor`` against a bare integer
+    watermark.  §39.2 W1R-P1-1 rules that comparison out for CONSUMPTION -- a
+    floor cannot tell the object this click published from a different genuine
+    object at the same generation -- and §39.5 Phase 1 item 3 replaces it with an
+    exact expected-object comparison.  The INTENT is unchanged and still
+    asserted: an earlier click's configuration is refused ``stale``, and the
+    admitted object passes.  Only the API expressing it moved."""
     from xrd_tools.session import RunConfigurationRefused, require_run_configuration
     from xrd_tools.session import RunIntent
 
@@ -287,11 +296,11 @@ def test_nexus_worker_refuses_a_stale_generation(widget, tmp_path, monkeypatch):
 
     with pytest.raises(RunConfigurationRefused) as excinfo:
         require_run_configuration(
-            stale, stage="nexus-worker", floor=int(fresh.generation))
+            stale, stage="nexus-worker", expected=fresh)
 
     assert excinfo.value.reason == "stale"
     assert require_run_configuration(
-        fresh, stage="nexus-worker", floor=int(fresh.generation)) is fresh
+        fresh, stage="nexus-worker", expected=fresh) is fresh
 
 
 def test_nexus_worker_run_refuses_absent_configuration_before_any_read(

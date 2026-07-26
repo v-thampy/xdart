@@ -651,7 +651,7 @@ def test_source_snapshot_writer_roundtrip_drives_restarted_append_skip(
     # O-1a-W1A: the restarted worker admits the SAME configuration the target was
     # written with; the Append cursor now compares against that accepted run
     # rather than against whatever scan object the display happens to hold.
-    worker.run_configuration = _frozen_run_config(
+    worker.run_configuration = worker._admitted_run_configuration = _frozen_run_config(
         skip_2d=False,
         bai_1d_args=dict(scan.bai_1d_args),
         bai_2d_args=dict(scan.bai_2d_args),

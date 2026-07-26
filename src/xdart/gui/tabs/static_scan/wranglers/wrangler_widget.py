@@ -24,13 +24,245 @@ from pyqtgraph.parametertree import Parameter
 from xdart.utils.h5pool import get_pool as _get_h5pool
 from xrd_tools.io.export import write_xye
 from xrd_tools.session.run_configuration import (
+    FrozenRunConfiguration,
     RunConfigurationRefused,
+    admit_run_configuration,
     require_run_configuration,
 )
 from ..run_config_debug import run_config_debug_log
 from .qt_nexus_sink import _is_append_axis_mismatch
 
 logger = logging.getLogger(__name__)
+
+
+_CONTAINER_FORMAT_TOKENS = ("nxs", "hdf5", "h5")
+
+#: A projection reader returns this when the accepted frozen configuration
+#: cannot answer for a carrier at all (today: a supported source shape that
+#: Controls deliberately froze as ``source=None``).  It is NOT the same as a
+#: frozen value that happens to be ``None`` -- ``threshold_min`` is legitimately
+#: ``None``, and must NOT fall through to the display slot.
+_UNSET = object()
+
+
+def frozen_run_policy(obj):
+    """The accepted frozen configuration a worker is currently executing, or None.
+
+    O-1a-W1R (review §39.5 Phase 2 item 1).  Run IDENTITY is qualified ONCE at
+    worker entry (``imageThread.run`` / ``initialize_scan`` /
+    ``nexusThread._run_impl`` call :func:`require_run_configuration` with the
+    exact admitted object).  Every read INSIDE the run then resolves through the
+    object that gate qualified, so this accessor deliberately does not repeat the
+    identity check per read -- repeating it would make the gate's location
+    unknowable and would refuse on threads a caller armed directly.
+
+    Presence and type are still required: a non-frozen carrier is never policy.
+    """
+
+    frozen = getattr(obj, "run_configuration", None)
+    return frozen if isinstance(frozen, FrozenRunConfiguration) else None
+
+
+def _source_format_token(text):
+    """The extension TOKEN of ``text`` (``'_master.h5'`` -> ``'h5'``)."""
+    token = str(text or "").lower().strip()
+    token = token.rsplit(".", 1)[-1] if "." in token else token
+    return token
+
+
+def _frozen_source_family(frozen):
+    source = frozen.source
+    if source is None:
+        return _UNSET
+    if source.family == "directory":
+        return "Image Directory"
+    kind = str(source.source_kind or "").lower()
+    if "image_file" in kind or kind == "image":
+        return "Single Image"
+    return "Image Series"
+
+
+def _frozen_source_root(frozen):
+    source = frozen.source
+    if source is None:
+        return _UNSET
+    if source.family == "directory":
+        return str(source.uri)
+    return str(Path(str(source.uri)).parent)
+
+
+def _frozen_source_format(frozen):
+    source = frozen.source
+    if source is None:
+        return _UNSET
+    if source.family == "directory":
+        for suffix in source.suffixes:
+            token = _source_format_token(suffix)
+            if token:
+                return token
+        return _UNSET
+    token = _source_format_token(Path(str(source.uri)).suffix)
+    return token or _UNSET
+
+
+def _frozen_single_image(frozen):
+    if frozen.source is None:
+        return _UNSET
+    return _frozen_source_family(frozen) == "Single Image"
+
+
+def _frozen_recursive(frozen):
+    source = frozen.source
+    if source is None or source.family != "directory":
+        return _UNSET
+    return bool(source.recursive)
+
+
+def _frozen_name_filter(frozen):
+    source = frozen.source
+    if source is None or source.family != "directory":
+        return _UNSET
+    return source.name_filter or ""
+
+
+def _frozen_run_option(name):
+    def read(frozen):
+        options = frozen.run_options
+        return options[name] if name in options else _UNSET
+    return read
+
+
+def _frozen_thawed_source(frozen):
+    thawed = frozen.thaw_source_spec()
+    return _UNSET if thawed is None else thawed
+
+
+class FrozenRunProjection:
+    """A read-through projection of ONE accepted frozen run-configuration value.
+
+    O-1a-W1R (review §39.2 W1R-P1-4/W1R-P1-5, §39.5 Phase 2 items 2, 3 and 6).
+
+    The historical worker carrier keeps its NAME -- so no consumer needs a new
+    indirection and no read site has to be rewritten -- but it is no longer an
+    execution INPUT.  While the worker holds an accepted frozen configuration the
+    read resolves THROUGH that exact object; a write only ever lands in the
+    zero-reader display/compatibility slot.
+
+    This deliberately satisfies the three conditions §39.5 Phase 2 imposes on a
+    projection, and is strictly weaker than what that clause permits:
+
+    * it is a STATELESS read-through, not a constructed projection object: there
+      is no copy, no cache, no registry and no lifecycle of its own, so there is
+      nothing here that could become a second execution-configuration authority;
+    * its identity and equality are traceable to the accepted object by
+      construction -- ``__get__`` reads ``obj.run_configuration`` and returns a
+      value derived from that object on every access;
+    * consumers retain NO fallback execution read: during an admitted run the
+      display slot is unreachable, which
+      ``tests/xdart/test_w1r_execution_read_census.py`` asserts directly.
+
+    Outside an admitted run (idle GUI, setup before the first Run, a worker a
+    caller armed by hand) the display slot is returned, because with no accepted
+    configuration there is no execution to protect.  ``run_configuration`` itself
+    is qualified against the exact admitted object at worker entry, so a
+    substituted carrier refuses there rather than silently re-deciding policy.
+    """
+
+    __slots__ = ("_name", "_read", "_slot", "_default")
+
+    def __init__(self, name, read, *, default=None):
+        self._name = str(name)
+        self._read = read
+        self._slot = f"_display_{name}"
+        self._default = default
+
+    @property
+    def name(self):
+        return self._name
+
+    @property
+    def display_slot(self):
+        return self._slot
+
+    def __get__(self, obj, owner=None):
+        if obj is None:
+            return self
+        frozen = frozen_run_policy(obj)
+        if frozen is not None:
+            value = self._read(frozen)
+            if value is not _UNSET:
+                return value
+        return obj.__dict__.get(self._slot, self._default)
+
+    def __set__(self, obj, value):
+        # §39.5 Phase 2 item 6: backward writes survive as a ONE-WAY
+        # display/compatibility projection.  The slot has zero execution
+        # readers while a run configuration is admitted.
+        obj.__dict__[self._slot] = value
+
+    def __delete__(self, obj):
+        obj.__dict__.pop(self._slot, None)
+
+
+#: The FROZEN_EXECUTION_POLICY projections shared by both worker classes.
+#: ``name -> (reader, default)``.  Declared once here and installed onto
+#: ``imageThread`` / ``nexusThread`` so the two workers cannot drift.
+FROZEN_RUN_PROJECTIONS = {
+    # ── output ───────────────────────────────────────────────────────────
+    "write_mode": (lambda f: f.output_mode, "Append"),
+    # An EMPTY frozen ``save_path`` is the absence of an accepted output target
+    # (no Project Save Path was captured), not an instruction to write to "".
+    # Absence defers to the display slot; any real accepted path WINS.
+    "h5_dir": (lambda f: f.save_path or _UNSET, ""),
+    "project_folder": (lambda f: f.project_root, ""),
+    # ── scientific policy ────────────────────────────────────────────────
+    "apply_threshold": (lambda f: bool(f.threshold.apply_threshold), False),
+    "threshold_min": (lambda f: f.threshold.threshold_min, None),
+    "threshold_max": (lambda f: f.threshold.threshold_max, None),
+    "mask_sentinel": (lambda f: bool(f.threshold.mask_saturation), True),
+    "mask_file": (lambda f: f.mask_file, ""),
+    "poni_file": (lambda f: f.poni_file, ""),
+    # ── grazing incidence ────────────────────────────────────────────────
+    "gi": (lambda f: bool(f.gi.enabled), False),
+    "incidence_motor": (lambda f: f.gi.scan_incidence_motor, "Manual"),
+    "sample_orientation": (lambda f: int(f.gi.sample_orientation), 4),
+    "tilt_angle": (lambda f: float(f.gi.tilt_angle), 0.0),
+    # ── mode / parallelism ───────────────────────────────────────────────
+    "live_mode": (lambda f: bool(f.live_mode), False),
+    "batch_mode": (lambda f: bool(f.batch_mode), False),
+    "max_cores": (lambda f: int(f.max_cores), 1),
+    "xye_only": (_frozen_run_option("xye_only"), False),
+    "series_average": (_frozen_run_option("series_average"), False),
+    "meta_ext": (_frozen_run_option("meta_ext"), None),
+    # ── source family / traversal (never the frame cursor) ───────────────
+    "inp_type": (_frozen_source_family, None),
+    "img_ext": (_frozen_source_format, ""),
+    "img_dir": (_frozen_source_root, ""),
+    "single_img": (_frozen_single_image, False),
+    "include_subdir": (_frozen_recursive, False),
+    "file_filter": (_frozen_name_filter, ""),
+    # ``source=None`` is the deliberate "Controls froze no typed source" shape
+    # (today: an Eiger-master Image Series).  That is ABSENCE and defers; a real
+    # frozen source always wins.  See the residual note in Boundary 21.
+    "source_spec": (_frozen_thawed_source, None),
+    "scan_args": (lambda f: f.scan_args(), None),
+}
+
+
+def install_frozen_run_projections(worker_class, names):
+    """Bind the shared FROZEN_EXECUTION_POLICY projections onto *worker_class*.
+
+    Called once per worker class at import.  ``names`` is the subset that worker
+    actually consumes, so a worker never advertises policy it does not execute.
+    """
+
+    for name in names:
+        reader, default = FROZEN_RUN_PROJECTIONS[name]
+        setattr(
+            worker_class,
+            name,
+            FrozenRunProjection(name, reader, default=default),
+        )
 
 
 #: Operator-facing refusal text per POSITIVELY OBSERVED active run owner
@@ -565,6 +797,10 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         # typed refusal.  Every wrangler admits through the same owner.
         self.run_configuration = None
         self.run_configuration_floor = 0
+        # O-1a-W1R: the admission LEDGER -- the exact object this owner bound at
+        # admission.  Consumption compares against it by ``is``; a generation
+        # floor is not execution authorization (review §39.2 W1R-P1-1).
+        self._admitted_run_configuration = None
 
         self.command_queue = Queue()
         self.thread = wranglerThread(self.command_queue, self.scan_args, self.fname, self.file_lock, self)
@@ -648,29 +884,58 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
 
     @staticmethod
     def _admit_run_configuration(obj, stage):
-        """Freeze and publish THE run configuration for this click, or refuse.
+        """Bind THE run configuration for this click exactly once, or refuse.
 
         One owner for both wranglers.  The Controls host produces exactly one
-        frozen object; this publishes that same object (identity, never a copy)
-        onto the wrangler and its worker and advances the accepted-generation
-        watermark.  Absence or a foreign result raises the typed refusal, so a
-        caller that has not yet mutated any run state can return untouched.
+        frozen object; this BINDS that same object (identity, never a copy) onto
+        the wrangler and its worker, records it as the consumption expectation,
+        and advances the accepted-generation watermark.
+
+        O-1a-W1R (review §39.2 W1R-P1-1, §39.5 Phase 1 items 1 and 3): first
+        admission and later consumption have different rules and different
+        owners.  This is the ADMISSION half, so it goes through
+        :func:`admit_run_configuration`:
+
+        * while an object is bound at the current generation, only THAT exact
+          object may be re-admitted (an idempotent re-publication).  A different
+          genuine ``FrozenRunConfiguration`` at the same generation is a REBIND
+          and refuses ``foreign`` -- which is what the parent accepted, because
+          its shared gate only knew the generation floor;
+        * a strictly newer generation is a genuinely new accepted click;
+        * the refusal is raised BEFORE any carrier is written, so a caller that
+          has not yet mutated run state returns untouched (zero delta).
         """
 
         host = getattr(obj, "_h19_host", None)
         prepare = getattr(host, "_prepare_controls_v2_run_configuration", None)
-        frozen = prepare() if callable(prepare) else None
-        frozen = require_run_configuration(
-            frozen,
+        offered = prepare() if callable(prepare) else None
+        bound = getattr(obj, "run_configuration", None)
+        frozen = admit_run_configuration(
+            offered,
             stage=stage,
             floor=int(getattr(obj, "run_configuration_floor", 0) or 0),
+            bound=bound if isinstance(bound, FrozenRunConfiguration) else None,
         )
-        obj.run_configuration = frozen
-        obj.run_configuration_floor = int(frozen.generation)
+        wranglerWidget._bind_admitted_run_configuration(obj, frozen)
         thread = getattr(obj, "thread", None)
         if thread is not None:
-            thread.run_configuration = frozen
-            thread.run_configuration_floor = int(frozen.generation)
+            wranglerWidget._bind_admitted_run_configuration(thread, frozen)
+        return frozen
+
+    @staticmethod
+    def _bind_admitted_run_configuration(target, frozen):
+        """Record ONE accepted object as both carrier and consumption expectation.
+
+        ``run_configuration`` is the published carrier every consumer reads;
+        ``_admitted_run_configuration`` is the admission LEDGER the worker-entry
+        identity gate compares against by ``is``.  The ledger carries only that
+        exact object -- no scalar mirrors, no second revision/fingerprint
+        authority, no mutable owner (§39.5 Phase 1, final paragraph).
+        """
+
+        target.run_configuration = frozen
+        target.run_configuration_floor = int(frozen.generation)
+        target._admitted_run_configuration = frozen
         return frozen
 
     @staticmethod
@@ -678,18 +943,28 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         """Re-publish the accepted object onto a worker built AFTER admission.
 
         ``nexusWrangler.setup()`` replaces its thread on every run, so the newly
-        constructed worker must receive the exact accepted identity rather than
-        starting with none.
+        constructed worker must receive the exact accepted identity -- carrier
+        AND admission ledger -- rather than starting with none.
         """
 
         thread = thread if thread is not None else getattr(obj, "thread", None)
         frozen = getattr(obj, "run_configuration", None)
-        if thread is None or frozen is None:
+        if thread is None or not isinstance(frozen, FrozenRunConfiguration):
             return None
-        thread.run_configuration = frozen
-        thread.run_configuration_floor = int(
-            getattr(obj, "run_configuration_floor", 0) or 0)
-        return frozen
+        expected = getattr(obj, "_admitted_run_configuration", None)
+        if expected is not None and frozen is not expected:
+            # The wrapper's carrier no longer matches what it admitted; refuse
+            # rather than propagate the substitution to a fresh worker.
+            raise RunConfigurationRefused(
+                "foreign",
+                stage="publish-to-worker",
+                detail=(
+                    "the wrapper carrier is not the object it admitted; a "
+                    "substituted configuration may not reach a new worker"),
+                generation=int(frozen.generation),
+                floor=int(expected.generation),
+            )
+        return wranglerWidget._bind_admitted_run_configuration(thread, frozen)
 
     @staticmethod
     def _report_run_configuration_refusal(obj, refusal, *, origin):
@@ -989,6 +1264,9 @@ class wranglerThread(Qt.QtCore.QThread):
         # through the same owner.
         self.run_configuration = None
         self.run_configuration_floor = 0
+        # O-1a-W1R: the exact object the wrapper admitted for this run.  The
+        # worker-entry identity gate compares the carrier against it by ``is``.
+        self._admitted_run_configuration = None
 
         # ── Shared batch-engine state ────────────────────────────────
         # Subclasses can override any of these before .start() (or

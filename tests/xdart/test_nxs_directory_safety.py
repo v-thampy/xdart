@@ -102,7 +102,7 @@ def _make_thread(watch_dir, out_dir, *, img_ext="nxs", scan_name="scan",
     # output-safety guard fires inside initialize_scan, after that admission.
     from xrd_tools.session import RunIntent
 
-    t.run_configuration = RunIntent(processing_mode="Int 2D").freeze()
+    t.run_configuration = t._admitted_run_configuration = RunIntent(processing_mode="Int 2D").freeze()
     _LIVE_THREADS.append(t)
     return t
 
@@ -279,7 +279,7 @@ def test_single_file_nexus_wrangler_rejects_processed_cleanly(tmp_path):
     )
     from xrd_tools.session import RunIntent
 
-    t.run_configuration = RunIntent(processing_mode="Int 2D").freeze()
+    t.run_configuration = t._admitted_run_configuration = RunIntent(processing_mode="Int 2D").freeze()
     labels = []
     t.showLabel.connect(labels.append)
     # Must return cleanly (before the diff: uncaught ProcessedXdartInputError).

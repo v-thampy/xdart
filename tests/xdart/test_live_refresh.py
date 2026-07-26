@@ -9404,8 +9404,15 @@ def test_start_guard_adopts_processed_scan_cached_poni_but_requires_source(tmp_p
     host.scan.frames = Frames()
 
     assert imageWrangler._inputs_valid(host) is False
-    assert host.poni is cached_poni
-    assert host.thread.poni is cached_poni
+    # O-1a-W1R (review §39.2 W1R-P1-8): validation no longer PUBLISHES the
+    # loaded-scan calibration.  A Start that refuses must be zero-delta on the
+    # PONI carriers, so adoption is STAGED here and projected onto the legacy
+    # carriers only after exact admission.  The intent this case was written for
+    # -- the loaded scan's calibration is available, but Run still requires a
+    # source -- is unchanged and asserted against the candidate.
+    assert host.poni is None
+    assert getattr(host.thread, "poni", None) is not cached_poni
+    assert host._staged_run_calibration["poni"] is cached_poni
     assert host.img_file == ""
     assert host.img_dir == ""
     assert host.img_ext == ""
@@ -9670,6 +9677,16 @@ def test_batch_process_scan_dispatches_each_frame_as_read():
     host._flush_outgoing_scan = MethodType(imageThread._flush_outgoing_scan, host)
     host._h5pool_bracket = MethodType(imageThread._h5pool_bracket, host)
 
+    # O-1a-W1R (review §39.2 W1R-P1-5): the source FAMILY is now the accepted
+    # frozen source's decision, so ``process_scan`` consults it instead of
+    # sniffing the mutable ``img_file`` cursor.  In production a Run click has
+    # always published one, so arm this host with a REAL frozen configuration
+    # from the production freeze owner; the case still measures what it was
+    # written for.
+    from xrd_tools.session import RunIntent as _W1R_RunIntent
+    host.run_configuration = _W1R_RunIntent(
+        processing_mode="Int 2D").freeze()
+    host._admitted_run_configuration = host.run_configuration
     MethodType(imageThread.process_scan, host)()
 
     assert dispatched == [((1,), False), ((2,), False), ((0,), False)]
@@ -9766,6 +9783,16 @@ def test_live_directory_idle_flushes_last_scan_xye_before_stop(
 
     monkeypatch.setattr(mod.time, "sleep", observe_idle)
 
+    # O-1a-W1R (review §39.2 W1R-P1-5): the source FAMILY is now the accepted
+    # frozen source's decision, so ``process_scan`` consults it instead of
+    # sniffing the mutable ``img_file`` cursor.  In production a Run click has
+    # always published one, so arm this host with a REAL frozen configuration
+    # from the production freeze owner; the case still measures what it was
+    # written for.
+    from xrd_tools.session import RunIntent as _W1R_RunIntent
+    host.run_configuration = _W1R_RunIntent(
+        processing_mode="Int 2D").freeze()
+    host._admitted_run_configuration = host.run_configuration
     MethodType(imageThread.process_scan, host)()
 
     assert idle_observations == [True]

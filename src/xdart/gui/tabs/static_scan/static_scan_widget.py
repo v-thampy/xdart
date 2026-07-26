@@ -234,8 +234,10 @@ from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.session.run_configuration import (
     FrozenRunConfiguration,
     GIIntent,
+    RunConfigurationRefused,
     RunIntent,
     ThresholdIntent,
+    require_run_configuration,
     # O-1a-T3: THE single GI incidence-motor resolution policy.  The GUI owns
     # choice KNOWLEDGE only; it must never re-derive the substitution rule.
     resolve_gi_motor,
@@ -1391,6 +1393,7 @@ from .integrator import (
 from .scan_threads import stitchThread
 from .metadata import metadataWidget
 from .wranglers import imageWrangler, nexusWrangler, wranglerWidget
+from .wranglers.image_wrangler import _normalize_meta_ext
 from .wranglers.wrangler_widget import GIMotorHydration
 from .controls_logic import (
     AnalysisTool,
@@ -3786,7 +3789,17 @@ class staticWidget(QWidget):
             # off the live calibration object through the production ``PONI``'s own
             # ``to_dict``.  Without this the run executes WITH the adopted
             # calibration while the frozen provenance claims it has none.
-            _adopted = getattr(wrangler, "poni", None)
+            # O-1a-W1R (review §39.2 W1R-P1-8): the adopted calibration is now
+            # STAGED rather than published before admission, so read the
+            # candidate first and fall back to an already-installed object.  The
+            # adopted values still enter the accepted configuration and its
+            # provenance; what changed is that a REFUSED Start leaves the legacy
+            # carriers untouched.
+            _staged = getattr(wrangler, "_staged_run_calibration", None)
+            _adopted = (
+                _staged.get("poni") if isinstance(_staged, dict) else None)
+            if _adopted is None:
+                _adopted = getattr(wrangler, "poni", None)
             _adopted_to_dict = getattr(_adopted, "to_dict", None)
             if callable(_adopted_to_dict):
                 try:
@@ -3805,8 +3818,17 @@ class staticWidget(QWidget):
             intent.bai_1d_args.get("gi_mode_1d", "q_total"))
         intent.gi.mode_2d = str(
             intent.bai_2d_args.get("gi_mode_2d", "qip_qoop"))
+        # O-1a-W1R (review §39.2 W1R-P1-4, mutation row 10): the run-policy
+        # values that had no frozen home and therefore stayed mutable worker
+        # mirrors join the SAME authority -- ``run_options`` is already part of
+        # the frozen object, its fingerprint and its provenance, so this adds no
+        # second execution-configuration owner.
         intent.run_options = {
             "xye_only": "XYE" in intent.processing_mode,
+            "series_average": bool(
+                self._controls_v2_param_value(("Signal", "series_average"))),
+            "meta_ext": _normalize_meta_ext(
+                self._controls_v2_param_value(("Signal", "meta_ext"))),
         }
 
         # Item 5 (R4B-8): resolve the effective GI motor ONCE at freeze from the
@@ -3827,6 +3849,40 @@ class staticWidget(QWidget):
                 thread.run_configuration = frozen
         return frozen
 
+    def _require_controls_v2_run_handoff(self) -> FrozenRunConfiguration:
+        """Return the EXACT object this click admitted, or refuse (typed).
+
+        O-1a-W1R (review §39.2 W1R-P1-3, §39.5 Phase 1 items 2 and 4).  The host
+        half of the Start call chain.  ``_prepare_controls_v2_run_configuration``
+        parks the one frozen object in the pending slot and the wrangler ADMITS
+        it; this verifies that the object the host is about to apply is that same
+        object by ``is``.
+
+        The parent instead re-called ``_prepare_controls_v2_run_configuration()``
+        whenever the slot was empty or the wrong type, so clearing the slot
+        between admission and host delivery silently produced a SECOND generation
+        and ran it.  There is no re-freeze here: a lost or substituted handoff is
+        a typed, visible refusal raised BEFORE any run-state mutation.
+        """
+
+        pending = getattr(self, "_pending_controls_v2_run_configuration", None)
+        admitted = getattr(
+            getattr(self, "wrangler", None), "_admitted_run_configuration", None)
+        if admitted is None:
+            # No wrangler admission has happened (a non-run caller, or Controls
+            # V2 inactive).  Presence and type are then the whole contract.
+            return require_run_configuration(
+                pending,
+                stage="controls-v2-run-handoff",
+                expected=pending if isinstance(
+                    pending, FrozenRunConfiguration) else None,
+            )
+        return require_run_configuration(
+            pending,
+            stage="controls-v2-run-handoff",
+            expected=admitted,
+        )
+
     def _apply_controls_v2_run_state(
         self,
         run_configuration: FrozenRunConfiguration | None = None,
@@ -3840,12 +3896,19 @@ class staticWidget(QWidget):
         keeps every non-run consumer on the live state."""
 
         if run_configuration is None:
-            run_configuration = getattr(
-                self, "_pending_controls_v2_run_configuration", None)
+            run_configuration = self._require_controls_v2_run_handoff()
+        # O-1a-W1R (review §39.2 W1R-P1-3, §39.5 Phase 1 item 4): the
+        # second-freeze fallback is DELETED.  Loss or mismatch of the handoff is
+        # a typed refusal; it is never permission to freeze a second generation
+        # and proceed with it.
         if not isinstance(run_configuration, FrozenRunConfiguration):
-            run_configuration = self._prepare_controls_v2_run_configuration()
-        if not isinstance(run_configuration, FrozenRunConfiguration):
-            return {}
+            raise RunConfigurationRefused(
+                "absent",
+                stage="controls-v2-run-state",
+                detail=(
+                    "no accepted frozen run configuration was handed to the "
+                    "run state owner"),
+            )
         if (getattr(self, "_pending_controls_v2_run_configuration", None)
                 is run_configuration):
             self._pending_controls_v2_run_configuration = None
@@ -13820,7 +13883,17 @@ class staticWidget(QWidget):
             widget=self,
             origin="start_wrangler",
         )
-        self._apply_controls_v2_run_state()
+        # O-1a-W1R (review §39.2 W1R-P1-2/W1R-P1-3, §39.5 Phase 1 items 2 and 4):
+        # take the EXACT admitted object once, here, and thread it through the
+        # rest of Start.  A lost or substituted handoff refuses; it never
+        # re-freezes.
+        try:
+            _frozen = self._require_controls_v2_run_handoff()
+        except RunConfigurationRefused as _exc:
+            wranglerWidget._report_run_configuration_refusal(
+                self.wrangler, _exc, origin="start_wrangler_handoff")
+            return
+        self._apply_controls_v2_run_state(_frozen)
         run_config_debug_log(
             logger,
             "run_state_applied",
@@ -13830,7 +13903,12 @@ class staticWidget(QWidget):
         self._sync_controls_v2_source_index()
         source_plan = None
         self.wrangler.source_run_plan = source_plan
-        self.wrangler.source_spec = self._controls_v2_freeze_source_spec()
+        # O-1a-W1R (review §39.2 W1R-P1-2): the post-admission GUI source
+        # RECAPTURE is deleted.  The parent called
+        # ``_controls_v2_freeze_source_spec()`` a second time here and installed
+        # capture B onto the worker while the accepted configuration held capture
+        # A.  The execution source is now thawed from the accepted object only.
+        self.wrangler.source_spec = _frozen.thaw_source_spec()
         self.wrangler.source_index_session = None
         self.wrangler.source_frame_count_snapshot = (
             self._controls_v2_freeze_container_frame_counts(source_plan))
@@ -13849,8 +13927,7 @@ class staticWidget(QWidget):
         # click accepted.  Passed explicitly because the shared run latch is not
         # set until `_enter_run_state()` below.
         self._configure_controls_v2_native_run_plan(
-            run_configuration=getattr(
-                self.wrangler, "run_configuration", None))
+            run_configuration=_frozen)
         self.h5viewer.auto_last = True
 
         # Live (non-batch) runs drive the display from the in-memory

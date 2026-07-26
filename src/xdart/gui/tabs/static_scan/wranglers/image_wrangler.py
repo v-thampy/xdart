@@ -120,8 +120,15 @@ params = [
         {'name': 'File', 'title': 'Image File   ', 'type': 'str_browse', 'value': def_img_file},
         {'name': 'img_dir', 'title': 'Directory', 'type': 'str_browse', 'value': '', 'visible': False},
         {'name': 'include_subdir', 'title': 'Subdirectories', 'type': 'bool', 'value': False, 'visible': False},
+        # O-1a-W1R (review §39.4, ".hdf5 selector reachability"): the backend,
+        # the single-file browse filter, the container emitter branch and the
+        # directory contracts all support ``.hdf5``, but the operator could not
+        # SELECT it here, so the supported branch was unreachable outside a
+        # test-side limits override.  ``hdf5`` sits next to ``h5`` because it is
+        # the same container format with the long spelling.
         {'name': 'img_ext', 'title': 'File Type  ', 'type': 'list',
-         'values': ['tif', 'raw', 'h5', 'nxs', 'mar3450'], 'value': 'tif', 'visible': False},
+         'values': ['tif', 'raw', 'h5', 'hdf5', 'nxs', 'mar3450'],
+         'value': 'tif', 'visible': False},
         {'name': 'series_average', 'title': 'Average Scan', 'type': 'bool', 'value': False, 'visible': True},
         {'name': 'meta_ext', 'title': 'Meta File', 'type': 'list',
          'values': ['auto', 'none', 'txt', 'pdi', 'metadata', 'spec'],
@@ -276,6 +283,10 @@ class imageWrangler(wranglerWidget):
         self.command = None
         self.scan = scan
         self.run_configuration = None
+        self._admitted_run_configuration = None
+        # O-1a-W1R: the loaded-scan calibration CANDIDATE for the click in
+        # progress.  The freeze owner reads it; only exact admission publishes it.
+        self._staged_run_calibration = None
         # H19: immutable Source-card baseline + serialized headless index owner.
         # Populated immediately before setup() for container-directory runs.
         self.source_run_plan = None
@@ -1361,13 +1372,10 @@ class imageWrangler(wranglerWidget):
 
         # Signal
         self.file_filter = self.parameters.child('Signal').child('Filter').value()
-        self.thread.file_filter = self.file_filter
         self.thread.publication_store = getattr(self, "publication_store", None)
 
         self.inp_type = self.parameters.child('Signal').child('inp_type').value()
-        self.thread.inp_type = self.inp_type
         self.thread.source_run_plan = self.source_run_plan
-        self.thread.source_spec = self.source_spec
         self.thread.source_index_session = self.source_index_session
         self.thread.source_frame_count_snapshot = dict(
             self.source_frame_count_snapshot or {})
@@ -1376,7 +1384,6 @@ class imageWrangler(wranglerWidget):
 
         self.get_img_fname()
         self.thread.img_file = self.img_file
-        self.thread.file_filter = self.file_filter
 
         # Container numeric suffixes are scan identity, while image-series
         # numeric suffixes are frame identity.  Use the canonical source rule
@@ -1385,39 +1392,27 @@ class imageWrangler(wranglerWidget):
         self.scan_name = self._append_scan_name_for_source(self.img_file)
         self.thread.scan_name = self.scan_name
 
-        self.thread.single_img = self.single_img
-        self.thread.img_dir, self.thread.img_ext = self.img_dir, self.img_ext
 
         if self.inp_type != "Image Directory":
             self.include_subdir = self.parameters.child(
                 'Signal').child('include_subdir').value()
-        self.thread.include_subdir = self.include_subdir
 
-        self.thread.series_average = self.series_average
-        self.thread.meta_ext = self.meta_ext
         self.thread.meta_dir = self.meta_dir
 
         self._sync_h5_dir_from_parameters()
-        self.thread.h5_dir = self.h5_dir
         self.fname = os.path.join(self.h5_dir, self.scan_name + '.nxs')
         self.thread.fname = self.fname
 
         self.mask_file = self.parameters.child('Signal').child('mask_file').value()
-        self.thread.mask_file = self.mask_file
 
         # Threshold
         self.apply_threshold = self.parameters.child('Mask').child('Threshold').value()
-        self.thread.apply_threshold = self.apply_threshold
         self.threshold_min = self.parameters.child('Mask').child('min').value()
-        self.thread.threshold_min = self.threshold_min
         self.threshold_max = self.parameters.child('Mask').child('max').value()
-        self.thread.threshold_max = self.threshold_max
         self.mask_sentinel = self.parameters.child('MaskSat').child('mask_sentinel').value()
-        self.thread.mask_sentinel = self.mask_sentinel
 
         # Write Mode
         self.write_mode = self._active_write_mode()
-        self.thread.write_mode = self.write_mode
 
         # Background
         self.bg_type = self.parameters.child('BG').child('bg_type').value()
@@ -1446,16 +1441,12 @@ class imageWrangler(wranglerWidget):
 
         # Grazing Incidence
         self.gi = self.parameters.child('GI').child('Grazing').value()
-        self.thread.gi = self.gi
 
         # self.incidence_motor = self.parameters.child('GI').child('th_motor').value()
-        self.thread.incidence_motor = self.incidence_motor
 
         self.sample_orientation = self.parameters.child('GI').child('sample_orientation').value()
-        self.thread.sample_orientation = self.sample_orientation
 
         self.tilt_angle = self.parameters.child('GI').child('tilt_angle').value()
-        self.thread.tilt_angle = self.tilt_angle
 
         # GI modes are driven by the integrator panel (axis1D / axis2D),
         # so read them from scan.bai_*_args which the integrator updates.
@@ -1596,14 +1587,25 @@ class imageWrangler(wranglerWidget):
         else:
             self.start()
 
-    def _inputs_valid(self):
-        """Whether the wrangler can start a run.
+    def _inputs_valid(self, staged=None):
+        """Whether the wrangler can start a run.  PURE -- it publishes nothing.
 
         A loaded PONI calibration is required; without this gate a Start/Live
         click with no (or an invalid) PONI ran the *previous* scan with the
         stale calibration (BUG-1).  The image source / save path remain guarded
-        inside the run thread."""
-        self._adopt_loaded_scan_run_inputs()
+        inside the run thread.
+
+        O-1a-W1R (review §39.2 W1R-P1-8): validation used to CALL
+        ``_adopt_loaded_scan_run_inputs()``, which published the loaded scan's
+        PONI/integrator onto ``self.poni`` and three worker carriers -- before
+        admission had a chance to refuse.  A refused Start was therefore not
+        zero-delta.  Adoption is now STAGED (see
+        :meth:`_stage_loaded_scan_calibration`) and only projected onto the
+        legacy carriers after exact admission, so this predicate decides from the
+        candidate values without writing any of them.
+        """
+        if staged is None:
+            staged = imageWrangler._stage_loaded_scan_calibration(self)
         # GENERIC-DETECTOR FIX (block, not crash): a processed .nxs saved WITHOUT
         # detector pixel sizes AND without a resolvable detector name (an
         # unnamed/generic 'Detector') restores no usable calibration — its
@@ -1615,14 +1617,21 @@ class imageWrangler(wranglerWidget):
         # scan is loaded but carries no usable calibration; the user can still
         # supply their own .poni (a different poni object than the scan's).
         scan = getattr(self, "scan", None)
-        adopted_poni = getattr(self.thread, "_adopted_poni", None)
         scan_loaded = bool(
             list(getattr(getattr(scan, "frames", None), "index", ()) or ()))
         scan_has_integrator = getattr(scan, "_cached_integrator", None) is not None
-        adopted_pixel_less = (
-            adopted_poni is not None and self.poni is adopted_poni
-            and not scan_has_integrator)
-        if self.poni is None or adopted_pixel_less:
+        # The calibration THIS click would run with: the already-installed one,
+        # else the staged candidate.  Neither is published here.
+        candidate_poni = self.poni
+        candidate_is_adopted = False
+        if candidate_poni is None and staged is not None:
+            candidate_poni = staged.get("poni")
+            candidate_is_adopted = candidate_poni is not None
+        adopted_poni = getattr(self.thread, "_adopted_poni", None)
+        candidate_is_adopted = candidate_is_adopted or (
+            adopted_poni is not None and candidate_poni is adopted_poni)
+        adopted_pixel_less = candidate_is_adopted and not scan_has_integrator
+        if candidate_poni is None or adopted_pixel_less:
             if scan_loaded and not scan_has_integrator:
                 imageWrangler._safe_status_text(
                     self,
@@ -1678,36 +1687,75 @@ class imageWrangler(wranglerWidget):
     def _h19_empty_directory_live_run_ok(self):
         return imageWrangler._directory_run_without_seed_ok(self)
 
-    def _adopt_loaded_scan_run_inputs(self):
-        """Seed Run calibration from a loaded processed scan when blank.
+    def _stage_loaded_scan_calibration(self):
+        """CANDIDATE loaded-scan calibration for this click -- published nowhere.
 
-        A processed xdart ``.nxs`` can carry the original PONI/integrator, which
-        keeps Reintegrate and an explicitly configured fresh Run calibrated.  It
-        must not silently become the raw frame source for a fresh Run; Controls
-        V2 owns that source choice and disables Run until the user chooses one.
+        O-1a-W1R (review §39.2 W1R-P1-8, §39.5 Phase 3 item 5).  A processed
+        xdart ``.nxs`` can carry the original PONI/integrator, which keeps
+        Reintegrate and an explicitly configured fresh Run calibrated.  Adoption
+        must reach the FROZEN provenance (§10.5), so the candidate is staged in
+        ``self._staged_run_calibration`` where the freeze owner can read it, and
+        the legacy wrapper/worker carriers are written only by
+        :meth:`_publish_staged_calibration` after exact admission.
+
+        Returns the candidate mapping, or ``None`` when there is nothing to
+        adopt.  Absence, foreign identity, stale identity and freeze failure all
+        leave every carrier unchanged, because none was touched.
         """
         scan = getattr(self, "scan", None)
-        if self.poni is None:
-            cached_poni = getattr(scan, "_cached_poni", None)
-            if cached_poni is not None:
-                self.poni = cached_poni
-                try:
-                    self.thread.poni = cached_poni
-                    # GENERIC-DETECTOR FIX: the restored ``_cached_integrator``
-                    # carries the detector PIXEL SIZE that a pixel-less PONI
-                    # dataclass (detector NAME only) cannot rebuild.  Carry it
-                    # to the run thread KEYED on the adopted poni, so the
-                    # thread's poni-identity rebuild block REUSES it instead of
-                    # clobbering it with a pixel-less ``poni_to_integrator``.
-                    # A genuinely-new user-loaded .poni is a DIFFERENT object,
-                    # so it still rebuilds (the key won't match).
-                    self.thread._adopted_poni = cached_poni
-                    self.thread._adopted_integrator = getattr(
-                        scan, "_cached_integrator", None)
-                    self.thread._adopted_fiber_integrator = getattr(
-                        scan, "_cached_fiber_integrator", None)
-                except Exception:
-                    pass
+        if self.poni is not None:
+            self._staged_run_calibration = None
+            return None
+        cached_poni = getattr(scan, "_cached_poni", None)
+        if cached_poni is None:
+            self._staged_run_calibration = None
+            return None
+        staged = {
+            "poni": cached_poni,
+            "integrator": getattr(scan, "_cached_integrator", None),
+            "fiber_integrator": getattr(scan, "_cached_fiber_integrator", None),
+        }
+        self._staged_run_calibration = staged
+        return staged
+
+    def _publish_staged_calibration(self, staged):
+        """Project a STAGED calibration candidate onto the legacy carriers.
+
+        Called only after exact admission (review §39.5 Phase 3 item 5).  This is
+        the only writer of the adopted PONI/integrator carriers.
+        """
+        if not staged:
+            return None
+        cached_poni = staged.get("poni")
+        if cached_poni is None or self.poni is not None:
+            return None
+        self.poni = cached_poni
+        try:
+            self.thread.poni = cached_poni
+            # GENERIC-DETECTOR FIX: the restored ``_cached_integrator`` carries
+            # the detector PIXEL SIZE that a pixel-less PONI dataclass (detector
+            # NAME only) cannot rebuild.  Carry it to the run thread KEYED on the
+            # adopted poni, so the thread's poni-identity rebuild block REUSES it
+            # instead of clobbering it with a pixel-less ``poni_to_integrator``.
+            # A genuinely-new user-loaded .poni is a DIFFERENT object, so it
+            # still rebuilds (the key won't match).
+            self.thread._adopted_poni = cached_poni
+            self.thread._adopted_integrator = staged.get("integrator")
+            self.thread._adopted_fiber_integrator = staged.get(
+                "fiber_integrator")
+        except Exception:
+            pass
+        return cached_poni
+
+    def _adopt_loaded_scan_run_inputs(self):
+        """Compatibility shim: stage THEN publish in one step.
+
+        Retained for non-run callers (and older focused tests) that legitimately
+        want the adoption applied immediately.  The RUN path deliberately does
+        not use it -- see :meth:`_stage_loaded_scan_calibration`.
+        """
+        return imageWrangler._publish_staged_calibration(
+            self, imageWrangler._stage_loaded_scan_calibration(self))
 
     def start(self):
         """The composed Start boundary (O-1a-T3, §9.10 steps 2 and 5).
@@ -1741,7 +1789,11 @@ class imageWrangler(wranglerWidget):
         # the freeze now: adoption must reach the frozen provenance (§10.5), and
         # an accepted modal decision must be applied to the candidate rather than
         # arriving after the run configuration was already frozen (§10.3/§10.4).
-        if not self._inputs_valid():
+        # O-1a-W1R (review §39.2 W1R-P1-8): STAGE the loaded-scan calibration
+        # candidate and validate from it.  Nothing is published yet, so every
+        # refusal below is zero-delta on the PONI carriers.
+        staged = imageWrangler._stage_loaded_scan_calibration(self)
+        if not self._inputs_valid(staged):
             return
         if getattr(self, 'stitch_mode', False):
             # Stitch is a one-shot batch reduction of the already-loaded scan,
@@ -1759,14 +1811,19 @@ class imageWrangler(wranglerWidget):
         try:
             imageWrangler._admit_run_configuration(self, "image-start")
         except RunConfigurationRefused as exc:
+            self._staged_run_calibration = None
             imageWrangler._report_run_configuration_refusal(
                 self, exc, origin="image_wrangler_start")
             return
         except Exception as exc:
+            self._staged_run_calibration = None
             logger.exception("could not freeze Controls run configuration")
             imageWrangler._safe_status_text(
                 self, f"Run configuration is invalid: {exc}")
             return
+        # Admitted: NOW the staged calibration may reach the legacy carriers.
+        imageWrangler._publish_staged_calibration(self, staged)
+        self._staged_run_calibration = None
         self.command = 'start'
         self.thread.command = 'start'
         self.ui.stopButton.setEnabled(True)

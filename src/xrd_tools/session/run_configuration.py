@@ -705,8 +705,19 @@ class FrozenRunConfiguration:
         return self.threshold.as_dict()
 
     def as_provenance(self) -> dict[str, Any]:
-        """Return a fresh JSON-friendly writer-provenance mapping."""
+        """Return a fresh, detached, JSON-NATIVE writer-provenance mapping.
 
+        O-1a-W1R (review §39.2 W1R-P1-7): the mapping is normalized through the
+        ONE bounded recursive normalizer (:func:`jsonable_run_value`) so
+        ``json.loads(json.dumps(mapping)) == mapping`` holds for every supported
+        frozen value, and an unsupported/live value REFUSES here -- before the
+        writer opens any output file -- instead of being stringified into the
+        persisted record.
+        """
+
+        return jsonable_run_value(self._provenance_values(), path="provenance")
+
+    def _provenance_values(self) -> dict[str, Any]:
         return {
             "schema_version": _SCHEMA_VERSION,
             "generation": int(self.generation),
@@ -880,8 +891,16 @@ class RunConfigurationRefused(RuntimeError):
     rather than fall back to display state.  Exactly three reasons exist:
 
     ``absent``   nothing was published for this run;
-    ``foreign``  the carrier is not a :class:`FrozenRunConfiguration`;
+    ``foreign``  the carrier is not THE object this run admitted -- either not a
+                 :class:`FrozenRunConfiguration` at all, or a genuine but
+                 different one (same-generation, future-generation, or
+                 equal-valued reconstruction);
     ``stale``    the carrier was frozen for an earlier accepted click.
+
+    O-1a-W1R (review §39.2 W1R-P1-1): ``foreign`` deliberately covers a GENUINE
+    frozen object that is not the admitted one.  Generation is monotonic
+    admission metadata; it is never execution authorization, so two distinct
+    genuine objects at the same generation are not interchangeable.
     """
 
     __slots__ = ("reason", "stage", "detail", "generation", "floor")
@@ -917,19 +936,13 @@ class RunConfigurationRefused(RuntimeError):
         }
 
 
-def require_run_configuration(
+def _require_frozen_carrier(
     value: Any,
     *,
     stage: str,
-    floor: int = 0,
+    floor: int,
 ) -> FrozenRunConfiguration:
-    """Return the accepted frozen configuration, or raise the typed refusal.
-
-    ``floor`` is the generation the owner last ACCEPTED.  It is admission
-    evidence, not a configuration mirror: it only ever moves forward, and it is
-    what distinguishes "the object this click published" from "an object left
-    behind by an earlier one".
-    """
+    """The absence/type half both gates share."""
 
     if value is None:
         raise RunConfigurationRefused(
@@ -945,18 +958,183 @@ def require_run_configuration(
             detail=f"carrier is {type(value).__name__}, not FrozenRunConfiguration",
             floor=int(floor),
         )
-    if int(value.generation) < int(floor):
+    return value
+
+
+def require_run_configuration(
+    value: Any,
+    *,
+    stage: str,
+    floor: int = 0,
+    expected: FrozenRunConfiguration | None = None,
+) -> FrozenRunConfiguration:
+    """CONSUMPTION gate: return the EXACT admitted object, or refuse.
+
+    O-1a-W1R (review §39.2 W1R-P1-1, §39.5 Phase 1 item 3).  Admission and
+    consumption have different rules, and this is the consumption half:
+
+    * ``expected`` is the object the owner bound at admission.  The carrier must
+      be that object by ``is``.  A genuine but different ``FrozenRunConfiguration``
+      -- same generation, a future generation, or an equal-valued reconstruction
+      with an identical fingerprint -- is ``foreign``, because equal values are
+      not run identity;
+    * ``expected=None`` means this owner has no admitted binding.  A carrier
+      without a binding is refused: a bare generation ``floor`` is admission
+      evidence, NOT execution authorization, so it can never license a
+      substitution (this is exactly what the parent got wrong).
+
+    ``floor`` is retained for the refusal event fields and for the ``stale``
+    diagnosis; it no longer decides anything on its own.
+    """
+
+    frozen = _require_frozen_carrier(value, stage=stage, floor=floor)
+    if expected is None:
+        raise RunConfigurationRefused(
+            "foreign",
+            stage=stage,
+            detail=(
+                "no admitted run configuration is bound at this stage; a "
+                "generation floor is not execution authorization"
+            ),
+            generation=int(frozen.generation),
+            floor=int(floor),
+        )
+    if frozen is expected:
+        return frozen
+    if int(frozen.generation) < int(expected.generation):
         raise RunConfigurationRefused(
             "stale",
             stage=stage,
             detail=(
-                f"generation {int(value.generation)} was superseded by "
-                f"generation {int(floor)}"
+                f"generation {int(frozen.generation)} was superseded by "
+                f"generation {int(expected.generation)}"
             ),
-            generation=int(value.generation),
-            floor=int(floor),
+            generation=int(frozen.generation),
+            floor=int(expected.generation),
         )
-    return value
+    same_values = frozen.fingerprint == expected.fingerprint
+    raise RunConfigurationRefused(
+        "foreign",
+        stage=stage,
+        detail=(
+            "carrier is a different FrozenRunConfiguration than the one this "
+            f"run admitted (carrier generation {int(frozen.generation)}, "
+            f"admitted generation {int(expected.generation)}, "
+            + ("identical" if same_values else "different")
+            + " fingerprint)"
+        ),
+        generation=int(frozen.generation),
+        floor=int(expected.generation),
+    )
+
+
+def admit_run_configuration(
+    value: Any,
+    *,
+    stage: str,
+    floor: int = 0,
+    bound: FrozenRunConfiguration | None = None,
+) -> FrozenRunConfiguration:
+    """FIRST-ADMISSION gate: accept ONE newly frozen object, exactly once.
+
+    O-1a-W1R (review §39.5 Phase 1 items 1 and 3).  The rules here are
+    deliberately NOT the consumption rules:
+
+    * ``bound`` is the object this owner is currently holding.  While an object
+      is bound at the SAME generation, the only acceptable admission is that
+      exact object again (an idempotent re-publication).  A different genuine
+      object at the bound generation is a REBIND and is refused ``foreign``;
+    * a strictly newer generation is a genuinely new accepted click and binds;
+    * an older generation is ``stale``.
+
+    Generation therefore stays monotonic first-admission metadata, which is all
+    §39.2 W1R-P1-1 leaves it authorized to be.
+    """
+
+    frozen = _require_frozen_carrier(value, stage=stage, floor=floor)
+    generation = int(frozen.generation)
+    reference = int(
+        bound.generation if bound is not None else floor)
+    if generation < reference:
+        raise RunConfigurationRefused(
+            "stale",
+            stage=stage,
+            detail=(
+                f"generation {generation} was superseded by generation "
+                f"{reference}"
+            ),
+            generation=generation,
+            floor=reference,
+        )
+    if generation == reference and reference > 0:
+        if bound is None or frozen is not bound:
+            raise RunConfigurationRefused(
+                "foreign",
+                stage=stage,
+                detail=(
+                    "a different FrozenRunConfiguration was offered at the "
+                    f"already-admitted generation {reference}; admission binds "
+                    "one object once"
+                ),
+                generation=generation,
+                floor=reference,
+            )
+    return frozen
+
+
+# --------------------------------------------------------------------------- #
+# Detached JSON-native provenance (review §39.2 W1R-P1-7).
+# --------------------------------------------------------------------------- #
+
+def jsonable_run_value(value: Any, *, path: str = "provenance") -> Any:
+    """Return a detached, deterministic, JSON-NATIVE copy of *value*.
+
+    O-1a-W1R (review §39.2 W1R-P1-7, §39.5 Phase 3 item 4).  ``_freeze_value``
+    accepts several value types that survive :meth:`FrozenRunConfiguration.thaw`
+    but are NOT JSON — most importantly the pyFAI method TUPLE — so
+    ``json.loads(json.dumps(provenance))`` differed from the mapping the writer
+    was handed.  This is the ONE normalizer for that conversion; it follows the
+    bounded rules the vNext provenance path already used
+    (``reduction.provenance_config._jsonable_range`` / ``_enum_value``), which
+    now delegates here so the tree keeps a single owner.
+
+    Unsupported or live values RAISE, before any output file is created: a
+    lossy ``default=str`` stringify at write time is what W-1 forbids.
+    """
+
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError(
+                f"{path}: non-finite float {number!r} has no JSON form")
+        return number
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Enum):
+        return jsonable_run_value(value.value, path=f"{path}.value")
+    if isinstance(value, Mapping):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(
+                    f"{path}: JSON object keys must be str, got "
+                    f"{type(key).__module__}.{type(key).__qualname__}"
+                )
+            out[key] = jsonable_run_value(item, path=f"{path}.{key}")
+        return out
+    if isinstance(value, (list, tuple)):
+        return [
+            jsonable_run_value(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    raise TypeError(
+        f"{path}: run provenance values must be JSON-native; unsupported "
+        f"{type(value).__module__}.{type(value).__qualname__}"
+    )
 
 
 __all__ = [
@@ -968,6 +1146,8 @@ __all__ = [
     "RunConfigurationRefused",
     "RunIntent",
     "ThresholdIntent",
+    "admit_run_configuration",
+    "jsonable_run_value",
     "require_run_configuration",
     "resolve_gi_motor",
 ]

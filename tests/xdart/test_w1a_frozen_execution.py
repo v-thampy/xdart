@@ -116,6 +116,14 @@ def _click_run(widget, tmp_path, monkeypatch, *, write_mode="Overwrite",
     widget.wrangler.img_file = str(raw_path)
     widget.controls.set_write_mode(write_mode)
     if gi:
+        # RULE-9 CORRECTION (W-1R, review §39.3 item 1).  This helper used to set
+        # ONLY the legacy ParameterTree value, which is NOT harvested by
+        # `_prepare_controls_v2_run_configuration`, so `gi=True` froze a STANDARD
+        # configuration and every GI case here was under-discriminating: it agreed
+        # with the run only because `thread.gi` was still the mutable legacy
+        # mirror.  Write the CANONICAL Controls V2 intent (the freeze owner's real
+        # input) as well, and assert the frozen value below.
+        widget._on_controls_v2_field_changed(("GI", "Grazing"), True)
         widget.wrangler.parameters.child("GI", "Grazing").setValue(True)
     widget._on_controls_v2_field_changed(("Int1D", "points"), points)
 
@@ -129,6 +137,13 @@ def _click_run(widget, tmp_path, monkeypatch, *, write_mode="Overwrite",
     frozen = widget.wrangler.run_configuration
     assert frozen is not None, "the Run click published no frozen configuration"
     assert thread.run_configuration is frozen
+    # §39.3 item 1: prove a REQUESTED GI intent actually reached the freeze
+    # BEFORE any case poisons a mirror.  Only this direction is asserted: the
+    # canonical Controls V2 intent is persisted to the isolated session file, so
+    # a later widget in the same process can legitimately start GI-enabled.
+    if gi:
+        assert frozen.gi.enabled is True, (
+            "the requested GI intent did not reach the freeze")
     thread.h5_dir = str(out)
     thread.scan_name = scan_name
     thread.fname = str(out / f"{scan_name}.nxs")
