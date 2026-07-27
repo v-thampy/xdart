@@ -221,3 +221,91 @@ def test_spec_metadata_beside_a_valid_image_source_stays_runnable(
 
     assert state.run_target is RunTarget.SOURCE, (
         "selecting SPEC as the metadata format disabled a valid image Run")
+
+
+# --------------------------------------------------------------------------- #
+# Live is not an escape hatch — review §56.1.
+#
+# Live legitimately waives a KNOWN FRAME COUNT: nobody can count frames that
+# have not been acquired yet.  It does not waive the existence of a READER.  An
+# unknown frame count is not an unknown reader family, so the same file refused
+# in batch must stay refused with Live checked -- otherwise ticking one box
+# turns an unrunnable selection into a Run that freezes into the image-series
+# path with no raw-frame reader behind it.
+# --------------------------------------------------------------------------- #
+
+def _with_live(configure):
+    def wrapped(widget):
+        configure(widget)
+        widget.controls.liveButton.setChecked(True)
+    return wrapped
+
+
+def test_live_does_not_make_a_spec_image_member_runnable(qapp, tmp_path):
+    """§56.1, promoted from the reviewer's oracle."""
+    from xrd_tools.session.readiness import RunTarget
+
+    spec = tmp_path / "myscan"
+    spec.write_text("#F myscan\n#S 5 ascan hy 0 2 2 1\n#N 3\n#L hy  chi  I0\n"
+                    "0 1 100\n1 2 100\n2 3 100\n")
+
+    non_live = _state(qapp, _select("Image Series", spec))
+    assert non_live.run_target is not RunTarget.SOURCE
+
+    live = _state(qapp, _with_live(_select("Image Series", spec)))
+    assert live.run_target is not RunTarget.SOURCE, (
+        "checking Live turned an unreadable SPEC member into a runnable source")
+
+
+def test_live_does_not_make_an_unsupported_extension_runnable(qapp, tmp_path):
+    """§56.3 E item 1, the other negative Live shape."""
+    from xrd_tools.session.readiness import RunTarget
+
+    stray = tmp_path / "measurement_0001.qqq"
+    stray.write_bytes(b"not an image")
+
+    live = _state(qapp, _with_live(_select("Image Series", stray)))
+
+    assert live.run_target is not RunTarget.SOURCE, (
+        "checking Live turned a file no accepted reader owns into a source")
+
+
+def test_live_hdf5_source_remains_runnable(qapp, tmp_path):
+    """§56.3 E item 3.  Live must keep waiving the frame COUNT: a real
+    Eiger/HDF5 source with nothing acquired yet is exactly what Live is for."""
+    from xrd_tools.session.readiness import RunTarget
+
+    master = _eiger_master(tmp_path)
+
+    def configure(widget):
+        widget._controls_v2_param(("Signal", "inp_type")).setValue("Image Series")
+        widget._controls_v2_param(("Signal", "img_ext")).setValue("h5")
+        widget._controls_v2_param(("Signal", "File")).setValue(str(master))
+
+    live = _state(qapp, _with_live(configure))
+
+    assert live.run_target is RunTarget.SOURCE, (
+        "a valid live HDF5/Eiger source lost Run eligibility")
+
+
+def test_live_configured_directory_remains_runnable(qapp, tmp_path):
+    """§56.3 E item 3.  The canonical live case: an EMPTY configured container
+    directory that the worker will populate during the run."""
+    from xrd_tools.session.readiness import RunTarget
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+
+    def configure(widget):
+        signal = widget.wrangler.parameters.child("Signal")
+        signal.child("inp_type").setValue("Image Directory")
+        signal.child("img_dir").setValue(str(raw))
+        signal.child("img_ext").setValue("nxs")
+        signal.child("include_subdir").setValue(True)
+        signal.child("File").setValue("")
+
+    live = _state(qapp, _with_live(configure))
+
+    assert live.run_target is RunTarget.SOURCE, (
+        "an empty configured live directory lost Run eligibility -- Live must "
+        "still waive the frame count")

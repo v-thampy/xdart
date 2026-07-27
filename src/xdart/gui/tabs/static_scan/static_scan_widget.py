@@ -7910,16 +7910,26 @@ class staticWidget(QWidget):
         directory_configured = bool(
             directory_config is not None and directory_config[0].is_dir())
         verified_frames = int(frame_count or 0) > 0
-        # Run eligibility comes from configured-intent validity, never from a
-        # fabricated count -- AND never from a source the worker cannot read
-        # (O-1b §54.4 S2: capability truth is not execution eligibility).
+        # Run eligibility is TWO independent questions, and O-1b §56.1 is what
+        # happens when they are folded together:
+        #
+        #   evidence      -- is there something to read?  A verified count, a
+        #                    configured directory intent, or Live (which
+        #                    legitimately waives a count: nobody can count
+        #                    frames that have not been acquired yet).
+        #   executability -- is there a READER for it?  (§54.4 S2)
+        #
+        # Executability sits OUTSIDE the evidence choice.  Folded inside it,
+        # `live_unknown` short-circuited the whole disjunct and the Live toggle
+        # became an unconditional escape: the identical SPEC file refused in
+        # batch turned runnable by checking one box, and still froze into the
+        # image-series path with no raw-frame reader behind it.  An unknown
+        # frame count is not an unknown reader family.
         source_ready = bool(source_label) and (
             bool(live_unknown)
-            or (
-                (verified_frames or directory_configured)
-                and self._controls_v2_source_is_executable(source_label)
-            )
-        )
+            or verified_frames
+            or directory_configured
+        ) and self._controls_v2_source_is_executable(source_label)
         discovery_deferred = bool(
             directory_configured and not verified_frames and not live_unknown)
         headless = self._controls_v2_headless_source_caps(
