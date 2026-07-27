@@ -610,6 +610,10 @@ def test_source_snapshot_writer_roundtrip_drives_restarted_append_skip(
     """Production writer provenance is sufficient for a new worker to skip."""
     import h5py
 
+    # R4A-3: the worker test helpers live behind this optional GUI dependency.
+    # Skip before importing/calling them so a headless dependency-minimal test
+    # environment reports the intended skip instead of NameError(imageThread).
+    pytest.importorskip("pyqtgraph")
     from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter
     from tests.xdart.test_append_skip_before_read import (
         _bare_worker,
