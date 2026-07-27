@@ -231,23 +231,78 @@ def test_streaming_sink_does_not_read_retired_policy_from_its_host():
         "incidence_motor",
         "series_average",
     }
+    host_receivers = {"self._host"}
+    host_mappings = set()
+    # Bounded alias closure inside this one sink module.  This catches the
+    # simple disguises that could otherwise evade a receiver-name check without
+    # growing a repository-wide data-flow analyzer.
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = (
+                node.targets if isinstance(node, ast.Assign) else [node.target]
+            )
+            names = [target.id for target in targets
+                     if isinstance(target, ast.Name)]
+            if not names or node.value is None:
+                continue
+            value_text = ast.unparse(node.value)
+            if value_text in host_receivers:
+                for name in names:
+                    if name not in host_receivers:
+                        host_receivers.add(name)
+                        changed = True
+            if value_text in host_mappings:
+                for name in names:
+                    if name not in host_mappings:
+                        host_mappings.add(name)
+                        changed = True
+            if (isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id == "vars"
+                    and node.value.args
+                    and ast.unparse(node.value.args[0]) in host_receivers):
+                for name in names:
+                    if name not in host_mappings:
+                        host_mappings.add(name)
+                        changed = True
+            if (isinstance(node.value, ast.Attribute)
+                    and node.value.attr == "__dict__"
+                    and ast.unparse(node.value.value) in host_receivers):
+                for name in names:
+                    if name not in host_mappings:
+                        host_mappings.add(name)
+                        changed = True
+
     for node in ast.walk(tree):
         if (isinstance(node, ast.Attribute)
                 and isinstance(node.ctx, ast.Load)
                 and node.attr in sink_policy
-                and ast.unparse(node.value) == "self._host"):
+                and ast.unparse(node.value) in host_receivers):
             offenders.append(
-                f"{_SINK_FILE.name}:{node.lineno} self._host.{node.attr}")
+                f"{_SINK_FILE.name}:{node.lineno} "
+                f"{ast.unparse(node.value)}.{node.attr}")
         if (isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
                 and node.func.id == "getattr"
                 and len(node.args) >= 2
-                and ast.unparse(node.args[0]) == "self._host"
+                and ast.unparse(node.args[0]) in host_receivers
                 and isinstance(node.args[1], ast.Constant)
                 and node.args[1].value in sink_policy):
             offenders.append(
                 f"{_SINK_FILE.name}:{node.lineno} "
-                f"getattr(self._host, {node.args[1].value!r})")
+                f"getattr({ast.unparse(node.args[0])}, "
+                f"{node.args[1].value!r})")
+        if (isinstance(node, ast.Subscript)
+                and ast.unparse(node.value) in host_mappings
+                and isinstance(node.slice, ast.Constant)
+                and node.slice.value in sink_policy):
+            offenders.append(
+                f"{_SINK_FILE.name}:{node.lineno} "
+                f"{ast.unparse(node.value)}[{node.slice.value!r}]")
     assert offenders == [], offenders
 
 
