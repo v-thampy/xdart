@@ -313,7 +313,6 @@ def test_first_jit_container_hydrates_display_without_changing_frozen_motor(
     nested = root / "day1"
     nested.mkdir(parents=True)
     container = nested / "scan_0001.nxs"
-    _write_bluesky_nxwriter(container)
     output = tmp_path / "processed"
     output.mkdir()
     scan = LiveScan(
@@ -340,6 +339,13 @@ def test_first_jit_container_hydrates_display_without_changing_frozen_motor(
         effective_before = frozen.gi.effective_motor
         emitted = []
         wrapper.sigGIMotorOptions.connect(emitted.append)
+
+        # The source arrives only after the pre-Run recursive preview has
+        # honestly established UNKNOWN motor knowledge.  Keeping the nested
+        # container absent until this point makes a later populated dropdown
+        # attributable only to the real JIT worker delivery, rather than to
+        # the same Subdirs preview asserted by the neighbouring R4A-2 row.
+        _write_bluesky_nxwriter(container)
 
         # Review §49.6 C: drive the real Directory reader route over MULTIPLE
         # frames instead of poking `_eiger_open_master`/`_frame_scan_info`, so
