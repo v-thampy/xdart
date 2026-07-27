@@ -245,6 +245,14 @@ else:
 
 # This module imports
 from xdart.modules.live import LiveFrame, LiveScan
+from xdart.modules.display_context import (
+    AcquisitionContext,
+    BrowseContext,
+    ContextKind,
+    DisplayContextError,
+    DisplaySelection,
+    new_context_token,
+)
 from xdart.modules.frame_publication import (
     PublicationStore,
     legacy_to_canonical_1d,
@@ -1830,13 +1838,25 @@ class staticWidget(QWidget):
         return active_1d, active_2d
 
     def _active_frame_record_store(self):
-        """The current per-scan session store, if the live path has one."""
+        """The ACQUISITION per-scan session store, if the live path has one.
+
+        X1 O-3: this stays the acquisition record store's resolver — it is what
+        the eviction probe and the run's own store-first reads consult — and it
+        is also the single writer that hands the store to the acquisition
+        context once the streaming session creates it.  A browse never reaches
+        here; it serves from its own publication store (see
+        ``_display_selected_stores``).
+        """
         thread = getattr(getattr(self, "wrangler", None), "thread", None)
         store = getattr(thread, "_streaming_record_store", None)
-        if store is not None:
+        if store is None:
+            store = getattr(self, "_frame_record_store", None)
+        else:
             self._frame_record_store = store
-            return store
-        return getattr(self, "_frame_record_store", None)
+        context = getattr(self, "_acquisition_context", None)
+        if context is not None and context.record_store is not store:
+            context.adopt_record_store(store)
+        return store
 
     def _publication_label_evictable(self, label):
         """MEM1-15 persist gate for the publication store's tier-0 eviction.
@@ -10181,6 +10201,16 @@ class staticWidget(QWidget):
         # _exit_run_state, which drive the display persist flag AND the
         # processing-control disable (task #71) so the two can never desync.
         self._run_active = False
+        # X1 O-3 (c1): the run's display-side owner.  Created ONCE by
+        # `_enter_run_state` from the exact admitted configuration and released
+        # by the run-end context substeps; it replaces the `self.scan` alias
+        # capture, which was a reference to a mutable object rather than an
+        # identity.  There is deliberately no second acquisition identity owner.
+        self._acquisition_context = None
+        # The paused-run browse owner (c2) and the immutable pointer naming
+        # which context the panels render (c2/c3).  Both stay None while idle.
+        self._browse_context = None
+        self._display_selection = None
 
         # Coalescing timer for wrangler updates: when the wrangler thread
         # processes images faster than the GUI can render, only the most
@@ -12636,6 +12666,106 @@ class staticWidget(QWidget):
         if callable(setter):
             setter(active)
 
+    # ------------------------------------------------------------------
+    # X1 O-3 — the display-context owners.
+    #
+    # ONE owner (this widget) constructs, installs and releases every context;
+    # H5Viewer and displayFrameWidget only REQUEST and render.  The wrangler,
+    # integrator, stitch and writer bindings are never part of any swap: they
+    # stay on the acquisition scan for the whole run, which is exactly what
+    # makes the backward GI-mode writes safe once browse stops touching it.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _context_identity_stamp(value) -> str:
+        """A DETACHED spelling of an owned object's identity.
+
+        A string, never the object: comparing two stamps at a later boundary
+        must not be able to resurrect, hydrate or mutate the array/geometry it
+        describes.  Shape is included because a mask/PONI swap that keeps the
+        same address is not a thing, but a same-address rebind is.
+        """
+        if value is None:
+            return ""
+        shape = getattr(value, "shape", None)
+        try:
+            shape = "x".join(str(int(dim)) for dim in shape) if shape else ""
+        except (TypeError, ValueError):
+            shape = ""
+        return f"{type(value).__name__}@{id(value):x}{':' + shape if shape else ''}"
+
+    def _admitted_acquisition_configuration(self):
+        """The EXACT admitted ``FrozenRunConfiguration`` this run executes.
+
+        O-3 binding rule 8: the context accepts only the object that passed the
+        W-1 admission gate — ``wrangler.run_configuration is
+        wrangler._admitted_run_configuration``.  An equal-valued, reconstructed,
+        stale-generation or fallback configuration is REFUSED and lands here as
+        ``None``; there is deliberately no tolerant acquisition-config path,
+        because ``FrozenRunConfiguration`` equality is by content and a foreign
+        object would otherwise be indistinguishable from an admitted one.
+
+        ``None`` is also the honest answer for a run with no wrangler admission
+        at all — a reintegrate or a stitch.
+        """
+        return _accepted_run_policy(getattr(self, "wrangler", None))
+
+    def _install_acquisition_context(self):
+        """Create THE acquisition context for this run (run-admission owner).
+
+        Constructed exactly once per run, at the seam that used to alias the
+        mutable scan.  Everything object-valued the display side may later swap
+        is listed here, so a partial swap is a construction error rather than a
+        mixed-context render: scan, frame, frame ids, frame map, both viewer-row
+        mappings and the publication store.  The record store joins later —
+        the streaming session creates it — through the single adopting writer.
+        """
+        scan = getattr(self, "scan", None)
+        frozen = staticWidget._admitted_acquisition_configuration(self)
+        generation, fingerprint = None, ""
+        if frozen is not None:
+            try:
+                generation, fingerprint = frozen.identity
+            except Exception:
+                generation, fingerprint = None, ""
+        context = AcquisitionContext(
+            context_token=new_context_token(ContextKind.ACQUISITION),
+            run_configuration=frozen,
+            config_generation=generation,
+            config_fingerprint=str(fingerprint or ""),
+            run_scan_key=str(scan_identity_key(scan) or ""),
+            source_path=str(getattr(scan, "data_file", "") or ""),
+            scan=scan,
+            frame=getattr(self, "frame", None),
+            frame_ids=getattr(self, "frame_ids", None),
+            frames=getattr(self, "frames", None),
+            viewer_rows_1d=getattr(self, "viewer_rows_1d", None),
+            viewer_rows_2d=getattr(self, "viewer_rows_2d", None),
+            publication_store=getattr(self, "publication_store", None),
+            poni_identity=staticWidget._context_identity_stamp(
+                getattr(scan, "_cached_poni", None)),
+            mask_identity=staticWidget._context_identity_stamp(
+                getattr(scan, "global_mask", None)),
+            geometry_identity=staticWidget._context_identity_stamp(
+                getattr(scan, "_cached_integrator", None)),
+        )
+        context.adopt_record_store(
+            staticWidget._active_frame_record_store(self))
+        self._acquisition_context = context
+        return context
+
+    def _acquisition_context_scan(self):
+        """The acquisition scan THIS run owns.
+
+        Falls back to ``self.scan`` only for the duck-typed lifecycle hosts and
+        for idle callers that legitimately have no run context — never as a
+        second acquisition identity owner during a run.
+        """
+        context = getattr(self, "_acquisition_context", None)
+        if context is not None:
+            return context.scan
+        return getattr(self, "scan", None)
+
     def _enter_run_state(self):
         """Single owner of run START (task #68): mark a wrangler/integrator run
         in progress.  Idempotent — re-entry while already active is a no-op so
@@ -12693,11 +12823,15 @@ class staticWidget(QWidget):
         self._set_scan_integrated_reads_transient(True)
         self.displayframe.set_processing_active(True)
         # X1 Slice 3a (R3-P5/P6): the run lifecycle — not set_processing_active
-        # — owns the run wavelength capture.  Capture the GUI-owned run scan
-        # object + its canonical key and bind the cache to THIS run.
-        self._x1_run_scan_capture = self.scan
+        # — owns the run wavelength capture.  X1 O-3 (c1): that capture is now
+        # an OWNER RECORD, not an alias.  The parent stored `self.scan` in
+        # `_x1_run_scan_capture`, which is a reference to a mutable object: a
+        # paused browse repointed that very object and Resume then had nothing
+        # left to recover.  `AcquisitionContext` carries the run's identity, its
+        # display bindings and its stores, so a browse can be given its own.
+        staticWidget._install_acquisition_context(self)
         # O-2.1: the browse chain qualifies its records against THIS run, so the
-        # detached snapshot is refreshed as soon as the run owns a capture.
+        # detached snapshot is refreshed as soon as the run owns a context.
         staticWidget._publish_diagnostic_run_identity(self)
         _begin = getattr(self.displayframe, "begin_processing", None)
         if callable(_begin):
@@ -12855,26 +12989,32 @@ class staticWidget(QWidget):
             return True
         return False
 
-    def _finalize_captured_run_scan(self) -> None:
-        """Substep 1: finalize the CAPTURED run scan's display state and release it.
+    def _finalize_acquisition_context_scan(self) -> None:
+        """Substep 1: finalize the acquisition context's scan and release it.
 
-        X1 Slice 3a (R3-P5): stamps the captured run scan's persisted wavelength
-        from the run cache before the capture is dropped.  Pause never reaches
-        here; it goes through ``_on_run_paused``.
+        X1 Slice 3a (R3-P5): stamps the run scan's persisted wavelength from
+        the run cache before the context is dropped.  Pause never reaches here;
+        it goes through ``_on_run_paused``.
 
-        T-4.2 (§35.7.C): the capture is DETACHED ATOMICALLY FIRST and the
-        finalizer is then driven from the local.  Clearing it afterwards meant a
-        persistent finalizer failure left the live run scan owned after terminal
-        closure and the recovery pass finalized the same identity twice.  An absent
-        capture is a no-op, so a retry can never re-finalize."""
-        captured = getattr(self, "_x1_run_scan_capture", None)
-        self._x1_run_scan_capture = None
-        if captured is None:
+        T-4.2 (§35.7.C) preserved verbatim under the O-3 owner: the context is
+        DETACHED ATOMICALLY FIRST and its ONE finalization claim is consumed
+        before the fallible finalizer is driven from the local.  Releasing it
+        afterwards meant a persistent finalizer failure left the live run scan
+        owned after terminal closure and the recovery pass finalized the same
+        identity twice.  An absent context — or an already-consumed claim — is a
+        no-op, so a retry can never re-finalize."""
+        context = getattr(self, "_acquisition_context", None)
+        self._acquisition_context = None
+        if context is None:
+            return
+        run_scan = context.claim_finalization()
+        if run_scan is None:
             return
         finish = getattr(getattr(self, "displayframe", None),
                          "finish_processing", None)
         if callable(finish):
-            finish(captured, scan_identity_key(captured))
+            finish(run_scan, scan_identity_key(run_scan))
+        context.mark_finalized()
 
     def _apply_unlocking_integration_state(self) -> None:
         """Substep 7: the mode-correct projection under the run-unlock guard."""
@@ -12934,7 +13074,7 @@ class staticWidget(QWidget):
         df = getattr(self, "displayframe", None)
         h5 = getattr(self, "h5viewer", None)
         controls = getattr(self, "controls", None)
-        _add("finish_processing", self, "_finalize_captured_run_scan")
+        _add("finish_processing", self, "_finalize_acquisition_context_scan")
         _add("transient_reads", self,
              "_set_scan_integrated_reads_transient", False)
         _add("set_processing_active", df, "set_processing_active", False)
@@ -13277,7 +13417,7 @@ class staticWidget(QWidget):
         staticWidget._publish_diagnostic_run_identity(self)
         display_context_transition_log(
             logger, "pause", widget=self, origin="_on_run_paused",
-            target=getattr(self, "_x1_run_scan_capture", None))
+            target=staticWidget._acquisition_context_scan(self))
 
     def _on_run_resuming(self):
         """Resume (Phase B): RE-ENGAGE the freeze guard BEFORE the worker flips
@@ -13302,14 +13442,14 @@ class staticWidget(QWidget):
         _resume = getattr(self.displayframe, "resume_processing", None)
         if callable(_resume):
             _resume(scan_identity_key(
-                getattr(self, "_x1_run_scan_capture", None)))
+                staticWidget._acquisition_context_scan(self)))
         # O-2 diagnostics: what the run is resuming INTO.  Compared against the
         # pause event, this is where a mutated singleton shows up as an
         # acquisition role whose scan key / GI / PONI moved while paused.
         staticWidget._publish_diagnostic_run_identity(self)
         display_context_transition_log(
             logger, "resume", widget=self, origin="_on_run_resuming",
-            target=getattr(self, "_x1_run_scan_capture", None))
+            target=staticWidget._acquisition_context_scan(self))
 
     def update_all(self, idx=None):
         """Updates all data in displays.

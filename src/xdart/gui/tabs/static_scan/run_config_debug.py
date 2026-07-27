@@ -433,13 +433,49 @@ class DiagnosticRunIdentity:
         }
 
 
+def _acquisition_scan(widget):
+    """The run's acquisition scan, read from the ONE acquisition owner.
+
+    X1 O-3 (c1): the parent read the ``_x1_run_scan_capture`` alias.  That alias
+    is deleted — it was a reference to a mutable object, so the diagnostic could
+    not tell "the run owns scan A" from "something repointed A".  The
+    ``AcquisitionContext`` is the single owner now; this reads it rather than
+    creating a parallel diagnostic authority.  ``None`` when no run owns one —
+    idle browsing and the duck-typed lifecycle hosts have no acquisition role
+    to report, exactly as the alias reported none before a run started.
+    """
+    context = _safe_attr(widget, "_acquisition_context")
+    if context is not None:
+        return _safe_attr(context, "scan")
+    return None
+
+
+def _context_identity(context, role: str) -> dict:
+    """Bounded identity of one display-context owner (never the objects)."""
+    if context is None:
+        return {"role": role, "present": False}
+    return {
+        "role": role,
+        "present": True,
+        "context_token": _owner_identity(_safe_attr(context, "context_token")),
+        "scan_key": _owner_identity(_safe_attr(context, "scan_key")),
+        "source_path": _owner_identity(_safe_attr(context, "source_path")),
+        "scan_object_id": _object_identity(
+            _safe_attr(context, "scan")).get("object_id"),
+        "publication_store_id": _object_identity(
+            _safe_attr(context, "publication_store")).get("object_id"),
+        "load_generation": _safe_attr(context, "load_generation"),
+        "released": bool(_safe_attr(context, "released", False)),
+    }
+
+
 def capture_diagnostic_run_identity(widget) -> DiagnosticRunIdentity | None:
     """Freeze the widget's current run/config identity, or ``None`` when off."""
     if not run_config_debug_enabled() or widget is None:
         return None
     try:
         display = _safe_attr(widget, "displayframe")
-        acquisition = _safe_attr(widget, "_x1_run_scan_capture")
+        acquisition = _acquisition_scan(widget)
         wrangler = _safe_attr(widget, "wrangler")
         worker = _safe_attr(wrangler, "thread")
         # O-2.2R (§65.3.6): the ADMISSION LEDGER is the authority, and all four
@@ -631,7 +667,10 @@ def display_context_summary(
     """
     display = _safe_attr(widget, "displayframe")
     viewer = _safe_attr(widget, "h5viewer")
-    acquisition = _safe_attr(widget, "_x1_run_scan_capture")
+    acquisition_context = _safe_attr(widget, "_acquisition_context")
+    browse_context = _safe_attr(widget, "_browse_context")
+    selection = _safe_attr(widget, "_display_selection")
+    acquisition = _acquisition_scan(widget)
     if record_store is None:
         record_store = _safe_attr(widget, "_frame_record_store")
     if record_store is None:
@@ -661,6 +700,24 @@ def display_context_summary(
         "record_store": _store_identity(record_store, "frame_record_store"),
         "publication_store": _store_identity(
             publication_store, "publication_store"),
+        # X1 O-3: the OWNERS, beside the objects.  Two distinct context tokens
+        # with two distinct store ids is what a real split looks like; one
+        # token under every role is the singleton mutation this trace exists to
+        # attribute.
+        "acquisition_context": _context_identity(
+            acquisition_context, "acquisition"),
+        "browse_context": _context_identity(browse_context, "browse"),
+        "selection": (
+            None if selection is None
+            else {
+                "kind": _owner_identity(
+                    getattr(_safe_attr(selection, "kind"), "value", None)),
+                "context_token": _owner_identity(
+                    _safe_attr(selection, "context_token")),
+                "scan_key": _owner_identity(_safe_attr(selection, "scan_key")),
+                "display_generation": _safe_attr(
+                    selection, "display_generation"),
+            }),
     }
 
 

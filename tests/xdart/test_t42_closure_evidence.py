@@ -14,7 +14,7 @@ violations of the already-frozen §34 contract survived it:
   closure re-ran the WHOLE projection, so one-shot failures vanished from the
   record while successful side-effectful seams (``set_run_writing(False)``)
   replayed;
-* §35.4 `_x1_run_scan_capture` was cleared only AFTER its fallible finalizer, so a
+* §35.4 the run-scan capture was cleared only AFTER its fallible finalizer, so a
   finalizer failure retained the live run scan and the retry finalized the same
   identity twice; and
 * §35.5 the compound advanced-controls helper short-circuited internally — a 1-D
@@ -40,6 +40,38 @@ from .test_t4_finish_latch_closure import (
     _lifecycle_truth,
     _TRUTHFUL_IDLE,
 )
+
+
+def _minimal_acquisition_context(scan=None):
+    """The smallest real ``AcquisitionContext`` a duck host can own (X1 O-3).
+
+    The promoted adversary case used a bare ``object()`` under the deleted
+    ``_x1_run_scan_capture`` alias.  The run-end finalizer now consumes the
+    context's ONE finalization claim, so the host has to own a real context for
+    the "detached before the fallible finalizer / retry is a no-op" contract to
+    mean anything.
+    """
+    from xdart.modules.display_context import (
+        AcquisitionContext,
+        ContextKind,
+        new_context_token,
+    )
+
+    return AcquisitionContext(
+        context_token=new_context_token(ContextKind.ACQUISITION),
+        run_configuration=None,
+        config_generation=None,
+        config_fingerprint="",
+        run_scan_key="run_a",
+        source_path="",
+        scan=scan if scan is not None else object(),
+        frame=None,
+        frame_ids=[],
+        frames={},
+        viewer_rows_1d={},
+        viewer_rows_2d={},
+        publication_store=None,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -241,12 +273,13 @@ def test_successful_seams_are_not_replayed_on_a_later_failure(
 
 def test_finalizer_failure_releases_the_capture_and_finalizes_once(
         widget, monkeypatch, caplog):
-    """§35.4/§35.7.C. A PERMANENT `finish_processing` failure must still leave
-    ``_x1_run_scan_capture is None`` and must record exactly ONE finalization
-    attempt — the retry may not finalize the same identity again."""
+    """§35.4/§35.7.C, under the O-3 owner. A PERMANENT `finish_processing`
+    failure must still leave the acquisition context DETACHED from the widget
+    and must record exactly ONE finalization attempt — the retry may not
+    finalize the same identity again."""
     _idle_owners(widget, monkeypatch)
     widget._enter_run_state()
-    assert widget._x1_run_scan_capture is widget.scan
+    assert widget._acquisition_context.scan is widget.scan
     attempts = []
 
     def _failing_finish(*_a, **_k):
@@ -262,7 +295,7 @@ def test_finalizer_failure_releases_the_capture_and_finalizes_once(
                           match="permanent finalization failure"):
             widget.integrator_thread_finished()
 
-    assert widget._x1_run_scan_capture is None, (
+    assert widget._acquisition_context is None, (
         "the live run scan stayed owned after terminal closure")
     assert len(attempts) == 1, (
         f"the captured identity was finalized {len(attempts)} times")
@@ -365,7 +398,7 @@ def test_rich_failure_before_any_projection_runs_everything_once(
 
 def test_promoted_boundary_finalizer_releases_capture_without_widget():
     """Codex adversary case 1, promoted: the boundary contract holds even for a
-    minimal host — the capture is detached BEFORE the fallible finalizer."""
+    minimal host — the context is detached BEFORE the fallible finalizer."""
     from types import SimpleNamespace
 
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -374,16 +407,16 @@ def test_promoted_boundary_finalizer_releases_capture_without_widget():
         raise RuntimeError("display finalization failed")
 
     host = SimpleNamespace(
-        _x1_run_scan_capture=object(),
+        _acquisition_context=_minimal_acquisition_context(),
         displayframe=SimpleNamespace(finish_processing=_fail),
     )
 
     with pytest.raises(RuntimeError, match="display finalization failed"):
-        staticWidget._finalize_captured_run_scan(host)
+        staticWidget._finalize_acquisition_context_scan(host)
 
-    assert host._x1_run_scan_capture is None
+    assert host._acquisition_context is None
     # A retry must be a no-op rather than finalizing the identity again.
-    staticWidget._finalize_captured_run_scan(host)
+    staticWidget._finalize_acquisition_context_scan(host)
 
 
 def test_promoted_real_finish_failure_releases_the_captured_scan(
@@ -391,14 +424,14 @@ def test_promoted_real_finish_failure_releases_the_captured_scan(
     """Codex adversary case 3, promoted verbatim in intent."""
     _idle_owners(widget, monkeypatch)
     widget._enter_run_state()
-    assert widget._x1_run_scan_capture is widget.scan
+    assert widget._acquisition_context.scan is widget.scan
     monkeypatch.setattr(widget, "thread_state_changed", lambda: None)
     monkeypatch.setattr(widget.displayframe, "finish_processing", _boom)
 
     with pytest.raises(RuntimeError, match="injected finish-tail failure"):
         widget.integrator_thread_finished()
 
-    assert widget._x1_run_scan_capture is None
+    assert widget._acquisition_context is None
 
 
 # --------------------------------------------------------------------------- #

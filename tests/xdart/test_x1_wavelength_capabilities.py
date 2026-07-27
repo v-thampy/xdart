@@ -1000,7 +1000,7 @@ def test_r4_run_capture_survives_h5viewer_browse_mutation(
         # worker.  The production H5Viewer and display still share the same
         # LiveScan object at the captured failure point.
         widget._enter_run_state()
-        captured = widget._x1_run_scan_capture
+        captured = widget._acquisition_context
         captured_scan = getattr(captured, "scan", captured)
 
         # Drive the real Run-button pause state and worker-boundary signal.
