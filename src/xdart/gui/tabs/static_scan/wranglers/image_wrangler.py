@@ -234,6 +234,15 @@ _EMBEDDED_META_EXTS = ('.nxs', '.h5', '.hdf5')
 # are the retired probe-budget constants from the pre-R4-A recursive seed.
 _PREVIEW_MAX_CONTENT_OPENS = 8
 _PREVIEW_DEADLINE_S = 0.75
+# R4A-III.1 (review §54.3 item 3): a preview-only CONTAINMENT ceiling on how
+# many directory entries may reach the final natural-key sort.  Ordering has no
+# cooperative point inside it, so rather than leave one opaque unbounded phase,
+# a directory wider than this is simply not previewed -- UNKNOWN/Manual, never a
+# truncated candidate set.  This is name-only containment, NOT a content open,
+# and it is set far above any real acquisition directory (the 529-file
+# beamline benchmark is two orders of magnitude below it) so it is a runaway
+# guard rather than a limit operators can reach.
+_PREVIEW_MAX_PREVIEW_ENTRIES = 20000
 
 
 class DirectoryMetadataPreview(NamedTuple):
@@ -304,44 +313,73 @@ def _directory_preview_entries(directory, budget):
     ``is_file``/``is_dir`` bits and never opened, so listing a candidate root
     stays inside the lazy-discovery contract.
 
-    O-1b R4A-III (review §52.2).  The deadline is charged WHILE the scandir
-    iterator is consumed, before anything is materialized or sorted.  Bounding
-    only content opens left a real hole: a wide accidental root could spend
-    arbitrarily longer than the budget listing and sorting names with ZERO
-    opens, so the eight-open cap never fired and the GUI froze anyway.
+    O-1b R4A-III / R4A-III.1 (review §52.2, §54.2).  The ONE shared deadline
+    covers every phase of the attempt that can block, because each of them was
+    the same user-visible high-level-directory freeze wearing a different name:
 
-    The two outcomes are deliberately different facts:
+    * **enumeration** — the deadline is charged while the scandir iterator is
+      consumed, before anything is materialized.  Draining a wide accidental
+      root into a dict first spent arbitrarily long with ZERO content opens, so
+      the eight-open cap never fired;
+    * **classification** — ``is_file``/``is_dir`` are checked immediately before
+      AND after each call.  They are NOT guaranteed cached value reads: on NFS,
+      and on any filesystem whose directory entries carry no usable ``d_type``,
+      each is a stat-like call whose latency is outside Python's control, so a
+      listing could complete just under the deadline and then block for O(N)
+      more; and
+    * **ordering** — a natural-key sort has no cooperative point inside it, so
+      instead of reintroducing one opaque unbounded phase, the number of entries
+      that may reach the sort is capped by ``_PREVIEW_MAX_PREVIEW_ENTRIES``.
 
-    * the listing COMPLETED inside the budget -> the complete name list is
-      natural-sorted once, so ``scan_2`` still precedes ``scan_10`` however
-      wide the directory is; or
-    * the deadline expired mid-listing -> ``None``.  A partial listing is NOT a
-      globally ordered candidate set, and inspecting its head would silently
-      reintroduce the ``candidates[0]``-order bug R4A-2 exists to fix.  The
-      caller abandons preview truthfully instead; the admitted worker remains
-      the later authoritative discovery owner.
+    Every failure mode produces the SAME truthful answer, ``None``: a partial
+    listing is not a globally ordered candidate set, and inspecting its head
+    would silently reintroduce the ``candidates[0]``-order bug R4A-2 exists to
+    fix.  The caller abandons preview and the admitted worker remains the later
+    authoritative discovery owner.
+
+    When the preview does complete, ordering is exactly as before: one global
+    natural sort, so ``scan_2`` precedes ``scan_10`` however wide the directory.
     """
-    from .image_wrangler_thread import natural_sort_ints
+    from .image_wrangler_thread import natural_keys_int
 
     try:
         with os.scandir(directory) as entries:
-            by_name = {}
+            retained = []
             for entry in entries:
                 if budget.deadline_passed():
                     return None
-                by_name[entry.name] = entry
+                if len(retained) >= _PREVIEW_MAX_PREVIEW_ENTRIES:
+                    # Containment, not an open: past this the final ordering
+                    # step is no longer conservatively bounded.  Abandon rather
+                    # than order a truncated set.
+                    return None
+                retained.append(entry)
     except OSError:
         return (), ()
+    # Natural-key preparation + sort: bounded by the ceiling above, and still
+    # charged, so a large in-budget listing cannot spend the whole attempt here.
+    if budget.deadline_passed():
+        return None
+    ordered = sorted(retained, key=lambda entry: natural_keys_int(entry.name))
     files, subdirs = [], []
-    for name in natural_sort_ints(list(by_name)):
-        entry = by_name[name]
+    for entry in ordered:
+        if budget.deadline_passed():
+            return None
         try:
-            if entry.is_file(follow_symlinks=False):
-                files.append(Path(entry.path))
-            elif entry.is_dir(follow_symlinks=False):
-                subdirs.append(Path(entry.path))
+            is_file = entry.is_file(follow_symlinks=False)
+            is_dir = False if is_file else entry.is_dir(follow_symlinks=False)
         except OSError:
+            # An entry that vanished mid-listing is skipped, but the call still
+            # consumed real time, so the bound is re-checked before continuing.
+            if budget.deadline_passed():
+                return None
             continue
+        if budget.deadline_passed():
+            return None
+        if is_file:
+            files.append(Path(entry.path))
+        elif is_dir:
+            subdirs.append(Path(entry.path))
     return tuple(files), tuple(subdirs)
 
 

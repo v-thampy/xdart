@@ -772,3 +772,148 @@ def test_preview_deadline_bounds_name_enumeration_not_only_content_opens(
     hints = [values[0] for values in host.showLabel.emissions if values]
     assert any("motor" in str(hint).lower() for hint in hints), (
         f"the operator got no hint that motors will fill during Run; {hints}")
+
+
+def test_completed_listing_classification_is_bounded_by_the_same_deadline(
+        tmp_path, monkeypatch):
+    """R4A-III.1 (review §54.2), promoted from the reviewer's retained probe.
+
+    `e6e93d52` charged the deadline while the ``scandir`` iterator was consumed,
+    but stopped consulting it once the iterator was exhausted: the completed
+    listing was then natural-sorted and every retained entry classified with
+    ``is_file()``/``is_dir()`` outside any budget.  Those are not guaranteed
+    cached value reads -- on NFS and any filesystem whose directory entries
+    carry no usable ``d_type`` they are one stat-like call each -- so a listing
+    could finish just under 0.75 s and then block for O(N) more with ZERO
+    content opens.  Same user-visible freeze, later phase.
+
+    Only the classification calls advance the injected clock here, so nothing
+    this row proves can be attributed to the enumeration hole `e6e93d52` closed.
+    """
+    from xdart.gui.tabs.static_scan.wranglers import image_wrangler as iw
+
+    root = tmp_path / "wide"
+    root.mkdir()
+    # A genuinely usable container: a partial-classification implementation
+    # would reach it and fill the dropdown.
+    _write_bluesky_nxwriter(root / "aaa_usable.nxs")
+    for index in range(20):
+        (root / f"scan_{index:04d}.nxs").touch()
+    # Sorts last, so it never perturbs the bounded classification count, but a
+    # descent past expiry would have to list it.
+    (root / "zzz_day1").mkdir()
+    _write_bluesky_nxwriter(root / "zzz_day1" / "nested_0001.nxs")
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(iw.time, "monotonic", lambda: clock["now"])
+
+    yielded = []
+    listed = []
+    classified = []
+    enumeration_elapsed = {}
+    real_scandir = iw.os.scandir
+
+    def classifying_scandir(path):
+        inner = real_scandir(path)
+        if Path(path) == root or Path(path).parent == root:
+            listed.append(str(path))
+
+            def on_yield(entry):
+                yielded.append(entry.name)
+                # Enumeration itself costs NOTHING here.
+                enumeration_elapsed["at_last_yield"] = clock["now"] - 1000.0
+
+            def on_classify(name):
+                classified.append(name)
+                clock["now"] += 0.25
+
+            return _TickingScandir(
+                inner, on_yield,
+                wrap=lambda entry: _CountingEntry(entry, on_classify))
+        return inner
+
+    monkeypatch.setattr(iw.os, "scandir", classifying_scandir)
+
+    host, params = _holder(root, recursive=True)
+    opens = []
+    real_reader = host._read_bluesky_source_columns
+    host._read_bluesky_source_columns = (
+        lambda path: opens.append(str(path)) or real_reader(path))
+
+    host.get_img_fname()
+
+    # Enumeration COMPLETED and cost no time -- this row is about the phase
+    # after it, independently of the one `e6e93d52` fixed.
+    assert len(yielded) == 22, (
+        f"enumeration did not complete over the whole directory: {len(yielded)}")
+    assert enumeration_elapsed.get("at_last_yield") == 0.0, (
+        "enumeration consumed budget, so this row would not isolate the "
+        "classification phase")
+    # Classification is charged: 0.25 s per entry against a 0.75 s deadline.
+    assert len(classified) == 3, (
+        "the complete-preview deadline did not bound DirEntry classification: "
+        f"{len(classified)} entries, elapsed={clock['now'] - 1000.0}")
+    assert clock["now"] - 1000.0 >= 0.75
+    # Nothing was inspected, and no child was listed.
+    assert opens == [], f"a candidate was content-opened past the deadline: {opens}"
+    assert listed == [str(root)], (
+        f"the descent listed further directories past the deadline: {listed}")
+    # Truthful projection.
+    assert _motor_choices(params) == ["Manual"], _motor_choices(params)
+    assert host._gi_motor_knowledge_proved is False
+    hints = [values[0] for values in host.showLabel.emissions if values]
+    assert any("motor" in str(hint).lower() for hint in hints), hints
+
+
+def test_preview_abandons_a_directory_wider_than_the_entry_ceiling(
+        tmp_path, monkeypatch):
+    """R4A-III.1 (review §54.3 item 3): no opaque unbounded final ordering.
+
+    A completed listing still has to be natural-key prepared and sorted, and
+    that step is O(N log N) with no cooperative point inside it.  Rather than
+    reintroduce one unbounded phase, a conservative preview-only entry ceiling
+    bounds what may reach the sort at all.  Exceeding it is UNKNOWN/Manual --
+    never a partial candidate set -- and the admitted worker stays authoritative
+    during Run.
+
+    The ceiling constant is overridden here so the row stays fast; it owns the
+    constant, not the number.
+    """
+    from xdart.gui.tabs.static_scan.wranglers import image_wrangler as iw
+
+    monkeypatch.setattr(iw, "_PREVIEW_MAX_PREVIEW_ENTRIES", 8)
+
+    root = tmp_path / "huge"
+    root.mkdir()
+    _write_bluesky_nxwriter(root / "aaa_usable.nxs")
+    for index in range(20):
+        (root / f"scan_{index:04d}.nxs").touch()
+
+    yielded = []
+    real_scandir = iw.os.scandir
+
+    def counting_scandir(path):
+        inner = real_scandir(path)
+        if Path(path) == root:
+            return _TickingScandir(inner, lambda entry: yielded.append(entry.name))
+        return inner
+
+    monkeypatch.setattr(iw.os, "scandir", counting_scandir)
+
+    host, params = _holder(root)
+    opens = []
+    real_reader = host._read_bluesky_source_columns
+    host._read_bluesky_source_columns = (
+        lambda path: opens.append(str(path)) or real_reader(path))
+
+    host.get_img_fname()
+
+    assert len(yielded) == 9, (
+        "enumeration must stop as soon as the ceiling is exceeded, without "
+        f"draining the directory; {len(yielded)} entries")
+    assert opens == [], (
+        f"a partial candidate set was inspected past the ceiling: {opens}")
+    assert _motor_choices(params) == ["Manual"], _motor_choices(params)
+    assert host._gi_motor_knowledge_proved is False
+    hints = [values[0] for values in host.showLabel.emissions if values]
+    assert any("motor" in str(hint).lower() for hint in hints), hints
