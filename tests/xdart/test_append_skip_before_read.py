@@ -1273,7 +1273,16 @@ def test_append_initialize_marks_loaded_rows_persisted(tmp_path):
 
     assert scan.frames.index == [1, 2, 3]
     assert set(scan.frames._persisted) == {1, 2, 3}
-    sink = QtNexusSink(SimpleNamespace(batch_mode=True), scan, object())
+    frozen = _frozen_run_config(
+        output_mode="Append",
+        source_spec=series_source(tmp_path / "raw_0001.tif"),
+    )
+    sink = QtNexusSink(
+        SimpleNamespace(_admitted_run_configuration=frozen),
+        scan,
+        object(),
+        run_configuration=frozen,
+    )
     assert sink._needs_atomic_first_batch_flush() is False
 
 

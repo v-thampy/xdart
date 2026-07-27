@@ -37,6 +37,7 @@ from typing import Any
 
 from xrd_tools.core import DEFAULT_MODE_KEY
 from xrd_tools.reduction import FlushPolicy
+from xrd_tools.session import FrozenRunConfiguration
 
 logger = logging.getLogger(__name__)
 
@@ -60,12 +61,15 @@ class QtNexusSink:
     host
         The ``imageWranglerThread`` (provides ``file_lock``, ``_xye_lock`` /
         ``_xye_buffer`` / ``_flush_xye_buffer``, ``LIVE_SAVE_INTERVAL``,
-        ``xye_only`` / ``batch_mode`` / ``gi`` / ``incidence_motor`` /
-        ``series_average``, and ``sigUpdate``).
+        display hand-off signals, and ``sigUpdate``). It is an operational
+        service host, never a run-policy owner.
     scan
         The ``LiveScan`` whose ``.nxs`` is being written.
     plan
         The active ``ReductionPlan`` (for the per-frame normalization factor).
+    run_configuration
+        The exact ``FrozenRunConfiguration`` admitted by the worker. All
+        execution policy is read from this object for the sink's lifetime.
     mask
         The detector-level global mask used for thumbnails.
     record_store
@@ -74,8 +78,18 @@ class QtNexusSink:
         succeeds.
     """
 
-    def __init__(self, host, scan, plan, *, mask=None, record_store=None):
+    def __init__(self, host, scan, plan, *, run_configuration, mask=None,
+                 record_store=None):
+        if not isinstance(run_configuration, FrozenRunConfiguration):
+            raise TypeError(
+                "QtNexusSink requires the accepted FrozenRunConfiguration")
+        expected = getattr(host, "_admitted_run_configuration", None)
+        if run_configuration is not expected:
+            raise ValueError(
+                "QtNexusSink run configuration is not the object admitted "
+                "by its worker")
         self._host = host
+        self._run_configuration = run_configuration
         self._scan = scan
         self._plan = plan
         self._mask = mask
@@ -167,7 +181,7 @@ class QtNexusSink:
         (writer-thread Qt work flooding the coalescer), and fought the selection.
         No-op in batch (silent run; the GUI reloads from the .nxs at end-of-batch).
         """
-        if getattr(self._host, "batch_mode", True):
+        if self._run_configuration.batch_mode:
             return
         idx = int(live.idx)
         published = getattr(self._host, "_published_frames", None)
@@ -195,7 +209,7 @@ class QtNexusSink:
         if live is None:
             return
         skip = (
-            self._host.xye_only
+            self._run_configuration.run_options.get("xye_only", False)
             or (hasattr(live, "can_skip_thumbnail")
                 and live.can_skip_thumbnail(getattr(self._scan, "skip_2d", False)))
         )
@@ -211,7 +225,7 @@ class QtNexusSink:
         # PERF-3: free the raw in BATCH mode only.  In live (non-batch) mode the
         # display reads map_raw through the publication's raw_ref, so keep it.
         # PublicationStore bounds old raw_refs via tiered eviction.
-        if getattr(self._host, "batch_mode", True):
+        if self._run_configuration.batch_mode:
             live.free_raw()
 
     def replace(self, frame, reduction) -> None:
@@ -231,7 +245,7 @@ class QtNexusSink:
                 f"QtNexusSink.replace: no LiveFrame for re-fed index {idx} "
                 f"(original write likely failed)")
         self._hydrate(live, frame, reduction)
-        if not self._host.xye_only:
+        if not self._run_configuration.run_options.get("xye_only", False):
             self._add_frame(live)
         live.free_raw()
 
@@ -242,7 +256,7 @@ class QtNexusSink:
         # their LiveFrames (and, since batch worker_process frees raw only on
         # the success path, their full raw images) for the scan's lifetime.
         self._registry.clear()
-        if getattr(self._host, "batch_mode", False):
+        if self._run_configuration.batch_mode:
             sig = getattr(self._host, "sigUpdate", None)
             if sig is not None:
                 sig.emit(-1)
@@ -279,16 +293,17 @@ class QtNexusSink:
     def _add_frame(self, live) -> None:
         self._scan.add_frame(
             frame=live, calculate=False, update=True, get_sd=True, static=True,
-            gi=getattr(self._host, "gi", False),
-            th_mtr=getattr(self._host, "incidence_motor", None),
-            series_average=getattr(self._host, "series_average", False),
+            gi=self._run_configuration.gi.enabled,
+            th_mtr=self._run_configuration.gi.scan_incidence_motor,
+            series_average=self._run_configuration.run_options.get(
+                "series_average", False),
             batch_save=True,
         )
 
     def _stash_and_buffer(self, live) -> None:
         # raw was already freed in worker_process (parallel); the writer only
         # stashes the integrated result + buffers the XYE row.
-        if not self._host.xye_only:
+        if not self._run_configuration.run_options.get("xye_only", False):
             self._add_frame(live)        # in-memory stash (no disk I/O)
         with self._host._xye_lock:
             self._host._xye_buffer.append((live.idx, live))
@@ -307,7 +322,7 @@ class QtNexusSink:
         # still feeds FlushPolicy so the durable save happens before staging
         # would need to evict an unsaved frame.
         cap = getattr(self._scan.frames, "_in_memory_cap", 64)
-        interval = (cap if getattr(self._host, "batch_mode", True)
+        interval = (cap if self._run_configuration.batch_mode
                     else self._host.LIVE_SAVE_INTERVAL)
         policy = FlushPolicy(interval=interval, cap=cap,
                              margin=_SAVE_BEFORE_EVICT_MARGIN)
@@ -322,7 +337,7 @@ class QtNexusSink:
         atomic ``mode="w"`` path for that transition instead of mutating the
         skeleton in place while the GUI may also be browsing the file.
         """
-        if not getattr(self._host, "batch_mode", False):
+        if not self._run_configuration.batch_mode:
             return False
         frames = getattr(self._scan, "frames", None)
         if frames is None or not getattr(frames, "index", ()):
@@ -438,7 +453,7 @@ class QtNexusSink:
         if self._since_save <= 0 and not force:
             return
         published = set(self._published)
-        if not self._host.xye_only:
+        if not self._run_configuration.run_options.get("xye_only", False):
             dropped = None
             # Streaming writer reuses ONLY the host's symmetric h5pool bracket
             # (keeps its own mode= + mark_persisted bookkeeping; not the serial

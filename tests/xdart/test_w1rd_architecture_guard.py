@@ -107,6 +107,7 @@ _WORKER_FILES = (
     _WRANGLER_DIR / "nexus_wrangler_thread.py",
     _WRANGLER_DIR / "wrangler_widget.py",
 )
+_SINK_FILE = _WRANGLER_DIR / "qt_nexus_sink.py"
 _PRODUCTION_ROOT = Path(image_wrangler_thread.__file__).parents[4]
 
 
@@ -216,6 +217,37 @@ def test_no_host_reads_or_writes_a_retired_name_on_a_worker():
             if ("thread" in lowered or "worker" in lowered) and (
                     "_accepted_run_policy" not in receiver):
                 offenders.append(f"{path.name}:{node.lineno} {receiver}.{target}")
+    assert offenders == [], offenders
+
+
+def test_streaming_sink_does_not_read_retired_policy_from_its_host():
+    """The transitive writer consumer receives policy from the frozen run."""
+    tree = ast.parse(_SINK_FILE.read_text())
+    offenders = []
+    sink_policy = {
+        "xye_only",
+        "batch_mode",
+        "gi",
+        "incidence_motor",
+        "series_average",
+    }
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.ctx, ast.Load)
+                and node.attr in sink_policy
+                and ast.unparse(node.value) == "self._host"):
+            offenders.append(
+                f"{_SINK_FILE.name}:{node.lineno} self._host.{node.attr}")
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and len(node.args) >= 2
+                and ast.unparse(node.args[0]) == "self._host"
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value in sink_policy):
+            offenders.append(
+                f"{_SINK_FILE.name}:{node.lineno} "
+                f"getattr(self._host, {node.args[1].value!r})")
     assert offenders == [], offenders
 
 

@@ -76,7 +76,14 @@ def test_streaming_due_to_save_reproduces_flush_policy(tmp_path):
         host = SimpleNamespace(
             run_configuration=accepted_run(batch_mode=batch_mode),
             LIVE_SAVE_INTERVAL=8)
-        sink = QtNexusSink(host, scan, ReductionPlan(integration_2d=None), mask=None)
+        host._admitted_run_configuration = host.run_configuration
+        sink = QtNexusSink(
+            host,
+            scan,
+            ReductionPlan(integration_2d=None),
+            run_configuration=host.run_configuration,
+            mask=None,
+        )
         policy = FlushPolicy(interval=interval, cap=cap,
                              margin=_SAVE_BEFORE_EVICT_MARGIN)
         for since in (0, 1, 3, 4, 7, 8, 11, 12):

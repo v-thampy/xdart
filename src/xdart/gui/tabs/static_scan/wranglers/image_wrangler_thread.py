@@ -3037,7 +3037,12 @@ class imageThread(wranglerThread):
         record_store._xdart_scan_key = _store_scan_key
         self._streaming_record_store = record_store
         sink = QtNexusSink(
-            self, scan, standard_plan, mask=self.mask, record_store=record_store
+            self,
+            scan,
+            standard_plan,
+            run_configuration=frozen,
+            mask=self.mask,
+            record_store=record_store,
         )
         try:
             # 4f-bridge: drive the streaming write path through the PUBLIC
@@ -5868,5 +5873,4 @@ class imageThread(wranglerThread):
         return bg
 
     # ``save_1d`` moved to wranglerThread (the base class).
-
 

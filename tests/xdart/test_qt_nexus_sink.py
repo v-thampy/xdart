@@ -103,6 +103,41 @@ def _minimal_plan():
     return ReductionPlan(integration_2d=None)
 
 
+def _make_sink(host, scan, plan, **kwargs):
+    """Construct the sink with one accepted run policy, not host mirrors."""
+    from tests.xdart._accepted_run import accepted_run, gi_intent
+    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
+
+    batch_mode = bool(getattr(host, "batch_mode", True))
+    frozen = accepted_run(
+        processing_mode=(
+            "Int 1D"
+            if bool(getattr(host, "xye_only", False))
+            else "Int 2D"
+        ),
+        live_mode=not batch_mode,
+        batch_mode=batch_mode,
+        gi=gi_intent(
+            enabled=bool(getattr(host, "gi", False)),
+            incidence_motor=str(
+                getattr(host, "incidence_motor", "Manual") or "Manual"),
+        ),
+        run_options={
+            "xye_only": bool(getattr(host, "xye_only", False)),
+            "series_average": bool(
+                getattr(host, "series_average", False)),
+        },
+    )
+    host._admitted_run_configuration = frozen
+    return QtNexusSink(
+        host,
+        scan,
+        plan,
+        run_configuration=frozen,
+        **kwargs,
+    )
+
+
 def _drive(sink, host, n):
     """Register + write n frames through the sink, then finish."""
     sink.begin(None, None)
@@ -163,7 +198,7 @@ def test_qt_sink_flush_locks_before_pausing_h5pool():
             events.append(("save", mode, lock.held)) or {}
         ),
     )
-    sink = QtNexusSink(_Host(), scan, SimpleNamespace())
+    sink = _make_sink(_Host(), scan, SimpleNamespace())
     sink._since_save = 1
     sink._published = {7}
 
@@ -188,7 +223,7 @@ def test_sink_writes_all_frames_to_nxs_and_pops_register(tmp_path):
     scan.skip_2d = True
     scan.frames._in_memory_cap = 16        # cap < N < interval (persist-before-evict)
     host = _FakeHost(batch_mode=True)
-    sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+    sink = _make_sink(host, scan, _minimal_plan(), mask=None)
 
     N = 25
     _drive(sink, host, N)
@@ -225,7 +260,7 @@ def test_qt_sink_persists_accumulated_gi_modes(tmp_path):
     host = _FakeHost(batch_mode=True)
     host.gi = True
     host.incidence_motor = "th"
-    sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+    sink = _make_sink(host, scan, _minimal_plan(), mask=None)
     sink.begin(scan, _minimal_plan())
 
     active_1d = _r1d(1.0, unit="q_A^-1")
@@ -277,7 +312,7 @@ def test_first_forced_batch_flush_replaces_skeleton_atomically(tmp_path, monkeyp
     scan = LiveScan(data_file=str(tmp_path / "scan.nxs"))
     scan.skip_2d = True
     host = _FakeHost(batch_mode=True)
-    sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+    sink = _make_sink(host, scan, _minimal_plan(), mask=None)
     sink.begin(scan, _minimal_plan())
     for i in range(3):
         live = _live_frame(i)
@@ -313,7 +348,7 @@ def test_forced_batch_flush_appends_after_frames_are_persisted(tmp_path, monkeyp
     scan = LiveScan(data_file=str(tmp_path / "scan.nxs"))
     scan.skip_2d = True
     host = _FakeHost(batch_mode=True)
-    sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+    sink = _make_sink(host, scan, _minimal_plan(), mask=None)
     sink.begin(scan, _minimal_plan())
     live = _live_frame(0)
     sink.register(live)
@@ -359,7 +394,7 @@ def test_qt_sink_marks_record_store_persisted_after_nexus_save(tmp_path, monkeyp
     host = _FakeHost(batch_mode=True)
     events = []
     store = _Store()
-    sink = QtNexusSink(
+    sink = _make_sink(
         host, scan, _minimal_plan(), mask=None, record_store=store
     )
     sink.begin(scan, _minimal_plan())
@@ -414,7 +449,7 @@ def test_qt_sink_marks_only_written_record_store_modes(tmp_path, monkeypatch):
     scan.skip_2d = False
     host = _FakeHost(batch_mode=True)
     store = _Store()
-    sink = QtNexusSink(
+    sink = _make_sink(
         host, scan, _minimal_plan(), mask=None, record_store=store
     )
     sink.begin(scan, _minimal_plan())
@@ -446,7 +481,7 @@ def test_sink_persist_before_evict_no_unsaved_eviction(tmp_path):
     scan.skip_2d = True
     scan.frames._in_memory_cap = 16
     host = _FakeHost(batch_mode=True, live_save_interval=100000)  # interval >> N
-    sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+    sink = _make_sink(host, scan, _minimal_plan(), mask=None)
 
     N = 60
     _drive(sink, host, N)
@@ -466,7 +501,8 @@ def test_worker_process_makes_thumbnail_off_the_writer(tmp_path):
 
     scan = LiveScan(data_file=str(tmp_path / "s.nxs"))
     scan.skip_2d = False                       # 2D mode -> thumbnail wanted
-    sink = QtNexusSink(_FakeHost(batch_mode=True), scan, _minimal_plan(), mask=None)
+    sink = _make_sink(
+        _FakeHost(batch_mode=True), scan, _minimal_plan(), mask=None)
     sink.begin(None, None)
     live = _live_frame(0)
     assert live.thumbnail is None
@@ -481,7 +517,8 @@ def test_worker_process_uses_core_corrected_image_for_thumbnail(tmp_path):
 
     scan = LiveScan(data_file=str(tmp_path / "s.nxs"))
     scan.skip_2d = False
-    sink = QtNexusSink(_FakeHost(batch_mode=True), scan, _minimal_plan(), mask=None)
+    sink = _make_sink(
+        _FakeHost(batch_mode=True), scan, _minimal_plan(), mask=None)
     sink.begin(None, None)
     live = _live_frame(0)
     reduction = _reduction(0)
@@ -515,7 +552,7 @@ def test_live_mode_hands_off_via_published_frames(tmp_path):
     scan = LiveScan(data_file=str(tmp_path / "s.nxs"))
     scan.skip_2d = False
     host = _FakeHost(batch_mode=False)          # live
-    sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+    sink = _make_sink(host, scan, _minimal_plan(), mask=None)
     sink.begin(None, None)
     live = _live_frame(0)
     assert live.map_raw is not None
@@ -543,7 +580,7 @@ def test_sink_xye_only_writes_xye_no_nxs(tmp_path):
     scan = LiveScan(data_file=nxs)
     scan.skip_2d = True
     host = _FakeHost(xye_only=True, batch_mode=True)
-    sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+    sink = _make_sink(host, scan, _minimal_plan(), mask=None)
 
     _drive(sink, host, 10)
     # XYE rows written; no frames stashed into the scan (.nxs untouched).
@@ -643,7 +680,12 @@ def test_resume_parity_streaming_nxs_matches_unpaused(tmp_path):
     def _run(nxs, pause_after=None):
         scan = LiveScan(data_file=nxs)
         scan.skip_2d = True
-        sink = QtNexusSink(_FakeHost(batch_mode=True), scan, _minimal_plan(), mask=None)
+        sink = _make_sink(
+            _FakeHost(batch_mode=True),
+            scan,
+            _minimal_plan(),
+            mask=None,
+        )
         sink.begin(None, None)
         for i in range(N):
             sink.register(_live_frame(i))
@@ -679,7 +721,7 @@ def test_finish_and_abort_clear_unwritten_registry(tmp_path):
         scan = LiveScan(data_file=str(tmp_path / f"reg_{teardown}.nxs"))
         scan.skip_2d = True
         host = _FakeHost(batch_mode=True)
-        sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+        sink = _make_sink(host, scan, _minimal_plan(), mask=None)
         sink.begin(scan, _minimal_plan())
         # Two in-flight frames that will never reach write() (failed/cancelled).
         sink.register(SimpleNamespace(idx=0))
@@ -700,7 +742,8 @@ def test_write_without_registration_fails_loud(tmp_path):
     from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
 
     scan = LiveScan(data_file=str(tmp_path / "unregistered.nxs"))
-    sink = QtNexusSink(_FakeHost(batch_mode=True), scan, _minimal_plan(), mask=None)
+    sink = _make_sink(
+        _FakeHost(batch_mode=True), scan, _minimal_plan(), mask=None)
     sink.begin(scan, _minimal_plan())
 
     with pytest.raises(RuntimeError, match="register"):
@@ -725,7 +768,7 @@ def _spy_session_drive(host, scan, lives, monkeypatch, *, executor=3):
     from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
     from xrd_tools.reduction import Frame
 
-    sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+    sink = _make_sink(host, scan, _minimal_plan(), mask=None)
     for lv in lives:
         sink.register(lv)
     spy = ThreadSpySink(inner=sink)
@@ -774,7 +817,7 @@ def test_qt_sink_replace_upserts_without_recounting(tmp_path):
     scan = LiveScan(data_file=str(tmp_path / "replace.nxs"))
     scan.skip_2d = True
     host = _FakeHost(batch_mode=True, live_save_interval=1000)
-    sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+    sink = _make_sink(host, scan, _minimal_plan(), mask=None)
     sink.begin(scan, _minimal_plan())
     for i in range(3):
         live = _live_frame(i)
@@ -807,7 +850,7 @@ def test_qt_sink_abort_flushes_completed_frames(tmp_path):
     scan = LiveScan(data_file=nxs)
     scan.skip_2d = True
     host = _FakeHost(batch_mode=True, live_save_interval=1000)
-    sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+    sink = _make_sink(host, scan, _minimal_plan(), mask=None)
     sink.begin(scan, _minimal_plan())
     for i in range(2):
         live = _live_frame(i)
@@ -831,7 +874,7 @@ def test_qt_sink_abort_append_axis_mismatch_logs_clean_once(
 
     scan = LiveScan(data_file=str(tmp_path / "append_mismatch.nxs"))
     host = _FakeHost(batch_mode=True, live_save_interval=1000)
-    sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+    sink = _make_sink(host, scan, _minimal_plan(), mask=None)
     sink._registry[1] = object()
 
     def _raise_append_mismatch(*, force=False):
@@ -862,7 +905,7 @@ def test_qt_sink_persist_before_evict_threshold(tmp_path, monkeypatch):
     scan.skip_2d = True
     scan.frames._in_memory_cap = 12            # threshold = 12 - 8 = 4
     host = _FakeHost(batch_mode=True, live_save_interval=1000)
-    sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+    sink = _make_sink(host, scan, _minimal_plan(), mask=None)
 
     saves = []
     orig_save = scan._save_to_nexus

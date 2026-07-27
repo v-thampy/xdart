@@ -160,7 +160,10 @@ def _accepted_run_policy(owner):
     display slot that used to shadow it.
     """
     frozen = getattr(owner, "run_configuration", None)
-    return frozen if isinstance(frozen, FrozenRunConfiguration) else None
+    admitted = getattr(owner, "_admitted_run_configuration", None)
+    if not isinstance(frozen, FrozenRunConfiguration) or frozen is not admitted:
+        return None
+    return frozen
 
 
 def _accepted_run_option(owner, name, default=False):
