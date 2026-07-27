@@ -367,7 +367,18 @@ def _directory_preview_entries(directory, budget):
             return None
         try:
             is_file = entry.is_file(follow_symlinks=False)
-            is_dir = False if is_file else entry.is_dir(follow_symlinks=False)
+            # R4A-III.2 (review §56.2): PER CALL, not per entry.  Checking only
+            # before `is_file` and after `is_dir` let a directory entry burn the
+            # whole remaining deadline in the first call and still START the
+            # second one out of budget -- and on a filesystem with no usable
+            # `d_type` that second call is another stat.  This is the branch a
+            # file-first listing never reaches.
+            if is_file:
+                is_dir = False
+            elif budget.deadline_passed():
+                return None
+            else:
+                is_dir = entry.is_dir(follow_symlinks=False)
         except OSError:
             # An entry that vanished mid-listing is skipped, but the call still
             # consumed real time, so the bound is re-checked before continuing.

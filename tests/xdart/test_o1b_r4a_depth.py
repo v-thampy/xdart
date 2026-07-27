@@ -917,3 +917,96 @@ def test_preview_abandons_a_directory_wider_than_the_entry_ceiling(
     assert host._gi_motor_knowledge_proved is False
     hints = [values[0] for values in host.showLabel.emissions if values]
     assert any("motor" in str(hint).lower() for hint in hints), hints
+
+
+class _BudgetConsumingEntry:
+    """A ``DirEntry`` stand-in whose classification calls consume the clock.
+
+    Deliberately a DIRECTORY entry: ``is_file()`` answers False and only then is
+    ``is_dir()`` reachable, which is the branch a real directory takes and the
+    one the file-first classifier row cannot exercise.
+    """
+
+    name = "day1"
+    path = "/fake/day1"
+
+    def __init__(self, clock, calls, *, is_file_cost, is_dir_cost):
+        self._clock = clock
+        self._calls = calls
+        self._is_file_cost = is_file_cost
+        self._is_dir_cost = is_dir_cost
+
+    def is_file(self, *, follow_symlinks):
+        self._calls.append("is_file")
+        self._clock["now"] += self._is_file_cost
+        return False
+
+    def is_dir(self, *, follow_symlinks):
+        self._calls.append("is_dir")
+        self._clock["now"] += self._is_dir_cost
+        return True
+
+
+class _SingleEntryScandir:
+    def __init__(self, entry):
+        self._entry = entry
+
+    def __enter__(self):
+        return iter((self._entry,))
+
+    def __exit__(self, *_args):
+        return False
+
+
+def test_deadline_is_checked_between_is_file_and_is_dir(monkeypatch):
+    """R4A-III.2 (review §56.2), promoted from the reviewer's oracle.
+
+    Classification was bounded per ENTRY, not per CALL: the budget was consulted
+    before ``is_file()`` and after ``is_dir()``, but not between them.  A
+    directory entry therefore burns the whole remaining deadline in
+    ``is_file()`` and STILL starts ``is_dir()`` out of budget -- a second
+    stat-like call on a filesystem with no usable ``d_type``, exactly the
+    latency this budget exists to bound.
+
+    Only the injected ``image_wrangler.time.monotonic`` moves; nothing sleeps.
+    """
+    from xdart.gui.tabs.static_scan.wranglers import image_wrangler as iw
+
+    clock = {"now": 0.0}
+    calls = []
+    entry = _BudgetConsumingEntry(
+        clock, calls, is_file_cost=0.75, is_dir_cost=0.25)
+    monkeypatch.setattr(iw.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(iw.os, "scandir", lambda _path: _SingleEntryScandir(entry))
+
+    budget = iw._PreviewBudget(deadline=0.75, opens=8)
+
+    assert iw._directory_preview_entries(Path("/fake"), budget) is None, (
+        "an expired classification must abandon the listing")
+    assert calls == ["is_file"], (
+        "is_dir() was called after the deadline had already expired inside "
+        f"is_file(); calls={calls}")
+
+
+def test_classification_still_completes_a_directory_entry_within_budget(
+        monkeypatch):
+    """The other direction: the inter-call check must not truncate a listing
+    that is comfortably inside its budget.  A directory entry classified cheaply
+    still reaches ``is_dir()`` and is returned as a subdirectory."""
+    from xdart.gui.tabs.static_scan.wranglers import image_wrangler as iw
+
+    clock = {"now": 0.0}
+    calls = []
+    entry = _BudgetConsumingEntry(
+        clock, calls, is_file_cost=0.01, is_dir_cost=0.01)
+    monkeypatch.setattr(iw.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(iw.os, "scandir", lambda _path: _SingleEntryScandir(entry))
+
+    budget = iw._PreviewBudget(deadline=0.75, opens=8)
+    result = iw._directory_preview_entries(Path("/fake"), budget)
+
+    assert calls == ["is_file", "is_dir"], calls
+    assert result is not None
+    files, subdirs = result
+    assert files == ()
+    assert [Path(item).name for item in subdirs] == ["day1"]
