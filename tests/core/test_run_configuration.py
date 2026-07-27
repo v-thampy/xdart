@@ -608,6 +608,23 @@ def test_clone_candidate_preserves_numpy_dtype_and_shape():
     assert int(copied[0, 0]) == 0
 
 
+def test_clone_candidate_rejects_value_changing_numpy_deepcopy(monkeypatch):
+    numpy = pytest.importorskip("numpy")
+    import xrd_tools.session.run_configuration as module
+
+    array = numpy.arange(4, dtype=numpy.int16).reshape(2, 2)
+    intent = RunIntent(bai_1d_args={"weights": array})
+    monkeypatch.setattr(
+        module.copy,
+        "deepcopy",
+        lambda _value: numpy.array([999], dtype=numpy.int16),
+    )
+
+    copied = intent.clone_candidate().bai_1d_args["weights"]
+
+    assert numpy.array_equal(numpy.asarray(copied), array)
+
+
 def test_resolve_gi_motor_none_vs_empty_choices_escape():
     """The ()-vs-None distinction (T-1 escape fix): an explicit saved motor with
     UNKNOWN choices (``None``) must be HONORED (display/frozen must not diverge),
