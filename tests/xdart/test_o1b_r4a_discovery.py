@@ -283,7 +283,6 @@ def test_batch_prefetch_generation_consumes_a_container_finalizing_midrun(
     that same generation -- no second Run, no restarted reader, no post-EOS
     manual call.
     """
-    import queue as queue_mod
     import threading
 
     import h5py
@@ -312,20 +311,41 @@ def test_batch_prefetch_generation_consumes_a_container_finalizing_midrun(
             # Pause the LIVE generation here so the finalize below lands after
             # the IN_PROGRESS observation and before terminal retirement.
             observed.set()
-            resume.wait(10.0)
+            if not resume.wait(10.0):
+                raise AssertionError(
+                    "the test owner did not finalize/release the provisional "
+                    "container before the deterministic timeout")
         return result
 
     worker._eiger_open_master = latching_open
 
-    prefetch_queue = queue_mod.Queue(maxsize=64)
-    stop_evt = threading.Event()
-    worker._prefetch_queue = prefetch_queue
-    worker._prefetch_stop_evt = stop_evt
-    producer = threading.Thread(
-        target=worker._prefetch_worker,
-        args=(frozen, prefetch_queue, stop_evt),
-        name="o1b-r4a5-prefetch", daemon=True)
-    producer.start()
+    # Enter through the consumer-facing production route.  Draining a private
+    # queue after producer termination would be a false green: a broken worker
+    # could enqueue EOS and only then enqueue frames, while production stops at
+    # the first EOS and never consumes those later frames.
+    start_calls = []
+    real_start = worker._start_prefetcher
+
+    def recording_start(config):
+        result = real_start(config)
+        start_calls.append(worker._prefetch_thread)
+        return result
+
+    worker._start_prefetcher = recording_start
+    delivered = []
+
+    def consume_one_generation():
+        for _ in range(16):
+            item = worker.get_next_image(frozen)
+            delivered.append(item)
+            if item[3] is None:
+                return
+        raise AssertionError("one prefetch generation never delivered EOS")
+
+    consumer = threading.Thread(
+        target=consume_one_generation,
+        name="o1b-r4a5-consumer", daemon=True)
+    consumer.start()
     try:
         assert observed.wait(10.0), (
             "the provisional container was never classified IN_PROGRESS, so "
@@ -336,18 +356,25 @@ def test_batch_prefetch_generation_consumes_a_container_finalizing_midrun(
         _write_bluesky_nxwriter(growing, n=5)
     finally:
         resume.set()
+    consumer.join(timeout=30.0)
+    assert not consumer.is_alive(), "the production consumer never terminated"
+    assert len(start_calls) == 1, (
+        f"the same batch Run started {len(start_calls)} prefetch generations")
+    producer = start_calls[0]
+    assert producer is worker._prefetch_thread
     producer.join(timeout=30.0)
     assert not producer.is_alive(), "the prefetch generation never terminated"
-    stop_evt.set()
+    worker._prefetch_stop_evt.set()
 
-    labels = []
-    while True:
-        try:
-            item = prefetch_queue.get_nowait()
-        except queue_mod.Empty:
-            break
-        if item[3] is not None:
-            labels.append(item[2])
+    terminal = [index for index, item in enumerate(delivered)
+                if item[3] is None]
+    assert terminal == [len(delivered) - 1], (
+        "one terminal sentinel must follow every frame exactly once; "
+        f"terminal positions={terminal}, items={delivered!r}")
+    assert worker._prefetch_queue.empty(), (
+        "the producer queued data after the terminal sentinel; production "
+        "would stop at EOS and drop it")
+    labels = [item[2] for item in delivered if item[3] is not None]
 
     assert labels == [1, 2, 3, 4, 5], (
         "one batch prefetch generation must emit every label exactly once "

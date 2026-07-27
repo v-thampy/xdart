@@ -227,13 +227,16 @@ def test_nested_descent_stops_on_the_deadline_not_the_open_cap(
 
     host.get_img_fname()
 
+    elapsed = clock["now"] - 1000.0
     assert opens, (
         "no nested container was opened, so no deadline can have been observed")
-    assert len(opens) < 8, (
-        f"traversal ran to the OPEN CAP ({len(opens)} opens) with the clock "
-        f"already at {clock['now'] - 1000.0:.2f} s; the 0.75 s deadline is not "
-        "load-bearing on its own")
-    assert clock["now"] - 1000.0 > 0.75, (
+    assert len(opens) == 3, (
+        "a 0.75 s deadline with 0.3 s per open must stop after exactly three "
+        f"opens, not {len(opens)}; elapsed={elapsed:.2f} s")
+    assert 0.75 < elapsed <= 0.90 + 1e-9, (
+        "the traversal did not stop at the contractual 0.75 s threshold; "
+        f"elapsed={elapsed:.2f} s")
+    assert elapsed > 0.75, (
         "the injected clock never passed the deadline, so this case proves "
         "nothing about it")
     assert _motor_choices(root) == ["Manual"], _motor_choices(root)
