@@ -618,3 +618,157 @@ def test_jit_delivery_after_teardown_is_inert(tmp_path):
         wrapper.close()
         wrapper.deleteLater()
         app.processEvents()
+
+
+# --------------------------------------------------------------------------- #
+# R4A-III (review §52.2) — the 0.75 s deadline bounds NAME ENUMERATION too, not
+# only content opens.
+# --------------------------------------------------------------------------- #
+
+class _CountingEntry:
+    """A ``DirEntry`` proxy that records CLASSIFICATION of a listed name.
+
+    ``is_file``/``is_dir`` are the first thing done to an entry once a listing
+    is accepted, so counting them separates "the deadline stopped enumeration"
+    from "the deadline stopped enumeration and then the partial head was
+    classified and sorted anyway".
+    """
+
+    def __init__(self, inner, on_classify):
+        self._inner = inner
+        self._on_classify = on_classify
+
+    @property
+    def name(self):
+        return self._inner.name
+
+    @property
+    def path(self):
+        return self._inner.path
+
+    def is_file(self, *args, **kwargs):
+        self._on_classify(self._inner.name)
+        return self._inner.is_file(*args, **kwargs)
+
+    def is_dir(self, *args, **kwargs):
+        self._on_classify(self._inner.name)
+        return self._inner.is_dir(*args, **kwargs)
+
+
+class _TickingScandir:
+    """A real ``os.scandir`` result whose iteration advances an injected clock.
+
+    The entries are REAL ``DirEntry`` objects from a REAL directory -- only the
+    passage of time is synthetic, so this pins the production consumption loop
+    rather than a stubbed listing.
+    """
+
+    def __init__(self, inner, on_yield, wrap=None):
+        self._inner = inner
+        self._on_yield = on_yield
+        self._wrap = wrap
+
+    def __enter__(self):
+        self._inner.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._inner.__exit__(*exc)
+
+    def __iter__(self):
+        for entry in self._inner:
+            self._on_yield(entry)
+            yield self._wrap(entry) if self._wrap is not None else entry
+
+
+def test_preview_deadline_bounds_name_enumeration_not_only_content_opens(
+        tmp_path, monkeypatch):
+    """R4A-III.  Bounding only content opens left the user-facing freeze open.
+
+    ``_directory_preview_entries`` used to drain the whole ``scandir`` iterator
+    and sort it before any budget check, so a wide accidental root could spend
+    arbitrarily longer than 0.75 s enumerating names with ZERO opens -- the
+    eight-open cap never fires on that path, and the existing fake-clock row
+    only delays ``_read_bluesky_source_columns``, so neither could see it.
+
+    Here the clock advances per ENTRY YIELDED and nothing else moves it.  The
+    directory holds a genuinely usable container, so an implementation that
+    inspected the partial head would find ``hy`` and fill the dropdown; a
+    correct one abandons truthfully.
+    """
+    from xdart.gui.tabs.static_scan.wranglers import image_wrangler as iw
+
+    root = tmp_path / "wide"
+    root.mkdir()
+    _write_bluesky_nxwriter(root / "aaa_usable.nxs")
+    for index in range(200):
+        (root / f"scan_{index:04d}.nxs").touch()
+    # A subdirectory the descent would list if it ever got that far.
+    (root / "day1").mkdir()
+    _write_bluesky_nxwriter(root / "day1" / "nested_0001.nxs")
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(iw.time, "monotonic", lambda: clock["now"])
+
+    yielded = []
+    listed = []
+    classified = []
+    real_scandir = iw.os.scandir
+
+    def ticking_scandir(path):
+        inner = real_scandir(path)
+        if Path(path) == root or Path(path).parent == root:
+            listed.append(str(path))
+
+            def tick(entry):
+                yielded.append(entry.name)
+                # 0.25 is exactly representable, so three entries reach the
+                # 0.75 s deadline with no floating-point drift to argue about.
+                clock["now"] += 0.25
+
+            return _TickingScandir(
+                inner, tick,
+                wrap=lambda entry: _CountingEntry(entry, classified.append))
+        return inner
+
+    monkeypatch.setattr(iw.os, "scandir", ticking_scandir)
+
+    host, params = _holder(root, recursive=True)
+    opens = []
+    real_reader = host._read_bluesky_source_columns
+    host._read_bluesky_source_columns = (
+        lambda path: opens.append(str(path)) or real_reader(path))
+
+    host.get_img_fname()
+
+    elapsed = clock["now"] - 1000.0
+    # The deadline really expired, and it expired DURING enumeration.
+    assert elapsed >= 0.75, (
+        f"the injected clock never reached the deadline: {elapsed}")
+    assert len(yielded) == 3, (
+        "a 0.75 s deadline with 0.25 s per entry must stop consuming after "
+        f"exactly three entries, not {len(yielded)}")
+    # No complete materialization: the directory is far wider than what was read.
+    assert len(yielded) < 201, (
+        f"the whole directory was materialized before any budget check: "
+        f"{len(yielded)} entries")
+    # The partial head is ABANDONED, not classified and sorted anyway.  A
+    # partial listing is not a globally ordered candidate set, so treating it
+    # as one would silently reintroduce the candidates[0]-order bug even when
+    # the shared budget happens to block the opens that would follow.
+    assert classified == [], (
+        f"the partial listing was classified after the deadline: {classified}")
+    # No content open, and therefore no partial, non-globally-ordered inspection.
+    assert opens == [], (
+        f"a candidate was opened after the deadline expired: {opens}")
+    # No recursive descent past expiry -- only the root was ever listed.
+    assert listed == [str(root)], (
+        f"the descent listed further directories after expiry: {listed}")
+    # Truthful projection: UNKNOWN, Manual, and the real operator hint.
+    assert _motor_choices(params) == ["Manual"], _motor_choices(params)
+    assert host._gi_motor_knowledge_proved is False, (
+        "an abandoned preview must leave motor knowledge UNKNOWN, not "
+        "known-empty")
+    hints = [values[0] for values in host.showLabel.emissions if values]
+    assert any("motor" in str(hint).lower() for hint in hints), (
+        f"the operator got no hint that motors will fill during Run; {hints}")

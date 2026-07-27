@@ -276,8 +276,18 @@ class _PreviewBudget:
         self.deadline = float(deadline)
         self.opens = int(opens)
 
+    def deadline_passed(self):
+        """The TIME bound alone (review §52.3 item 3).
+
+        Name enumeration is charged against the clock but NOT against the
+        content-open cap, so the two bounds stay independently discriminating:
+        a delay in ``scandir`` iteration with no candidate opens must trip this
+        and nothing else.
+        """
+        return time.monotonic() >= self.deadline
+
     def exhausted(self):
-        return self.opens <= 0 or time.monotonic() >= self.deadline
+        return self.opens <= 0 or self.deadline_passed()
 
     def charge(self):
         """Authorize ONE content open, or refuse because a bound tripped."""
@@ -287,19 +297,39 @@ class _PreviewBudget:
         return True
 
 
-def _directory_preview_entries(directory):
-    """``(files, subdirectories)`` of *directory* in GLOBAL natural order.
+def _directory_preview_entries(directory, budget):
+    """``(files, subdirectories)`` in GLOBAL natural order, or ``None``.
 
     Name-only: ``os.scandir`` entries are classified with the cached
     ``is_file``/``is_dir`` bits and never opened, so listing a candidate root
-    stays inside the lazy-discovery contract.  The complete listing is sorted
-    ONCE, so ``scan_2`` precedes ``scan_10`` however wide the directory is.
+    stays inside the lazy-discovery contract.
+
+    O-1b R4A-III (review §52.2).  The deadline is charged WHILE the scandir
+    iterator is consumed, before anything is materialized or sorted.  Bounding
+    only content opens left a real hole: a wide accidental root could spend
+    arbitrarily longer than the budget listing and sorting names with ZERO
+    opens, so the eight-open cap never fired and the GUI froze anyway.
+
+    The two outcomes are deliberately different facts:
+
+    * the listing COMPLETED inside the budget -> the complete name list is
+      natural-sorted once, so ``scan_2`` still precedes ``scan_10`` however
+      wide the directory is; or
+    * the deadline expired mid-listing -> ``None``.  A partial listing is NOT a
+      globally ordered candidate set, and inspecting its head would silently
+      reintroduce the ``candidates[0]``-order bug R4A-2 exists to fix.  The
+      caller abandons preview truthfully instead; the admitted worker remains
+      the later authoritative discovery owner.
     """
     from .image_wrangler_thread import natural_sort_ints
 
     try:
         with os.scandir(directory) as entries:
-            by_name = {entry.name: entry for entry in entries}
+            by_name = {}
+            for entry in entries:
+                if budget.deadline_passed():
+                    return None
+                by_name[entry.name] = entry
     except OSError:
         return (), ()
     files, subdirs = [], []
@@ -2427,7 +2457,14 @@ class imageWrangler(wranglerWidget):
                 deadline=time.monotonic() + _PREVIEW_DEADLINE_S,
                 opens=_PREVIEW_MAX_CONTENT_OPENS,
             )
-            files, subdirs = _directory_preview_entries(root)
+            entries = _directory_preview_entries(root, budget)
+            if entries is None:
+                # R4A-III: the deadline expired while the root was still being
+                # listed.  Abandon here -- inspecting the partial head would be
+                # a non-global candidate order, and descending would spend more
+                # time past a bound that has already tripped.
+                return None
+            files, subdirs = entries
             result = imageWrangler._first_usable_preview(
                 self, files, suffixes, match, budget)
             if result is not None or not self.include_subdir:
@@ -2435,7 +2472,10 @@ class imageWrangler(wranglerWidget):
             pending = list(subdirs)
             while pending and not budget.exhausted():
                 child = pending.pop(0)
-                child_files, child_dirs = _directory_preview_entries(child)
+                child_entries = _directory_preview_entries(child, budget)
+                if child_entries is None:
+                    return None
+                child_files, child_dirs = child_entries
                 result = imageWrangler._first_usable_preview(
                     self, child_files, suffixes, match, budget)
                 if result is not None:
