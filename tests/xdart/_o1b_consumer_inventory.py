@@ -172,23 +172,84 @@ def derive_worker_alias_attributes(src_root: Path):
     names "thread" or "worker", which is exactly how the `QtNexusSink._host`
     escape survived the W-1R-D3 guard.
     """
-    index, trees = _class_index(src_root)
+    _index, trees = _class_index(src_root)
     aliases = set()
     for _path, tree in trees.items():
+        # O-1b-0.1: a local alias for the worker CLASS still constructs a worker,
+        # so resolve `builder = imageThread` before reading constructions.
+        class_aliases = set(WORKER_CLASSES)
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in class_aliases):
+                class_aliases.add(node.targets[0].id)
+        for node in ast.walk(tree):
+            # O-1b-0.1: annotated storage (`self.thread: imageThread = ...`) is
+            # an AnnAssign, which the first version missed entirely.
+            if isinstance(node, ast.AnnAssign):
+                target, value = node.target, node.value
+            elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target, value = node.targets[0], node.value
+            else:
                 continue
-            target = node.targets[0]
             if not isinstance(target, ast.Attribute):
                 continue
-            value = node.value
+            if isinstance(node, ast.AnnAssign) and isinstance(
+                    node.annotation, ast.Name):
+                if node.annotation.id in class_aliases:
+                    aliases.add(target.attr)
             builder = None
             if isinstance(value, ast.Call):
                 builder = (value.func.id if isinstance(value.func, ast.Name)
                            else getattr(value.func, "attr", None))
-            if builder in WORKER_CLASSES:
+            if builder in class_aliases:
                 aliases.add(target.attr)
     return frozenset(aliases)
+
+
+def derive_callback_handoffs(src_root: Path):
+    """Real ``Thread(target=self.<method>, args=(...))`` handoffs from a worker.
+
+    Returns ``{f"{cls}.{method}": {"args": [...], "site": "...",
+    "target_params": [...]}}``.  Derived from the tree so the guard can prove the
+    accepted configuration is actually PASSED, rather than trusting a declaration
+    (the first version's callback row was tautological).
+    """
+    index, _trees = _class_index(src_root)
+    handoffs = {}
+    for worker in WORKER_CLASSES:
+        if worker not in index:
+            continue
+        path, cls_node = index[worker]
+        by_name = {m.name: m for m in _methods(cls_node)}
+        for method in _methods(cls_node):
+            for node in ast.walk(method):
+                if not isinstance(node, ast.Call):
+                    continue
+                builder = (node.func.id if isinstance(node.func, ast.Name)
+                           else getattr(node.func, "attr", None))
+                if builder != "Thread":
+                    continue
+                target = args = None
+                for kw in node.keywords:
+                    if kw.arg == "target":
+                        target = ast.unparse(kw.value)
+                    elif kw.arg == "args":
+                        args = kw.value
+                if not target or not target.startswith("self."):
+                    continue
+                callee = target.split(".", 1)[1]
+                arg_texts = ([ast.unparse(e) for e in args.elts]
+                             if isinstance(args, ast.Tuple) else [])
+                params = ([a.arg for a in by_name[callee].args.args]
+                          if callee in by_name else [])
+                handoffs[f"{worker}.{callee}"] = {
+                    "args": arg_texts,
+                    "site": f"{path.name}:{node.lineno} {worker}.{method.name}",
+                    "target_params": params,
+                }
+    return handoffs
 
 
 def derive_consumer_closure(src_root: Path, *, max_depth: int = 6):
@@ -207,6 +268,15 @@ def derive_consumer_closure(src_root: Path, *, max_depth: int = 6):
         for holder, holder_aliases in frontier.items():
             _hpath, holder_node = index[holder]
             for method in _methods(holder_node):
+                # O-1b-0.1: a local bound to an alias (`me = self`) hands the
+                # same reference onward, so watch it for this method too.
+                local_aliases = set()
+                for node in ast.walk(method):
+                    if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                            and isinstance(node.targets[0], ast.Name)
+                            and ast.unparse(node.value) in holder_aliases):
+                        local_aliases.add(node.targets[0].id)
+                watched = set(holder_aliases) | local_aliases
                 for node in ast.walk(method):
                     if not isinstance(node, ast.Call):
                         continue
@@ -216,10 +286,10 @@ def derive_consumer_closure(src_root: Path, *, max_depth: int = 6):
                         continue
                     keys = []
                     for position, arg in enumerate(node.args):
-                        if ast.unparse(arg) in holder_aliases:
+                        if ast.unparse(arg) in watched:
                             keys.append(position)
                     for kw in node.keywords:
-                        if kw.arg and ast.unparse(kw.value) in holder_aliases:
+                        if kw.arg and ast.unparse(kw.value) in watched:
                             keys.append(kw.arg)
                     if not keys:
                         continue

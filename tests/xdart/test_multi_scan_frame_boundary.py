@@ -20,7 +20,7 @@ from types import SimpleNamespace, MethodType
 
 import pandas as pd
 
-from tests.xdart._accepted_run import accepted_run  # noqa: E402
+from tests.xdart._accepted_run import admitted_worker, accepted_run  # noqa: E402
 from xdart.gui.tabs.static_scan.display_logic import LifecycleCause
 from xdart.gui.tabs.static_scan.static_scan_widget import (
     staticWidget, _scan_key_from_source,
@@ -34,11 +34,10 @@ def _boundary_worker(*, batch_mode):
     O-1b: the host reads run policy from the accepted object and qualifies it by
     identity (review §45.3), so a rig must admit the same object it publishes.
     """
-    accepted = accepted_run(batch_mode=batch_mode)
-    return SimpleNamespace(
-        run_configuration=accepted,
-        _admitted_run_configuration=accepted,
-        _published_frames={}, mask=None, detector_shape=None)
+    return admitted_worker(
+        SimpleNamespace(
+            _published_frames={}, mask=None, detector_shape=None),
+        batch_mode=batch_mode)
 
 
 def _boundary_host():

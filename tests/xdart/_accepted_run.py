@@ -85,3 +85,42 @@ def threshold_intent(**fields: Any):
     from xrd_tools.session import ThresholdIntent
 
     return ThresholdIntent(**fields)
+
+
+def admitted_worker(target=None, /, *, frozen=None, **fields):
+    """Publish an accepted configuration onto *target* through the REAL seam.
+
+    O-1b-0.1.  Four independent test families created the impossible state
+    "carrier published, admission ledger absent": the GI streaming rigs, the
+    batch-finish run-end host, the live-refresh append-seed host, and the O-1b
+    frame-boundary rig.  Every one of them was then refused by an
+    identity-qualified consumer (review §45.3 for the host reads, §46.2 for the
+    sink) or silently fell back to a default.
+
+    Binding through ``wranglerWidget._bind_admitted_run_configuration`` -- the
+    same owner production admission uses -- makes carrier, admission ledger and
+    generation floor unable to drift, because a fixture can no longer set one
+    without the others.
+
+    ``target`` may be an existing worker/stub (bound in place and returned) or
+    omitted, in which case a fresh ``SimpleNamespace`` is created.  Pass a
+    prebuilt object as ``frozen=``, or the :func:`accepted_run` fields inline.
+
+    Tests that deliberately construct a MALFORMED state -- a bare carrier with no
+    ledger, a foreign identity, a stale generation -- must keep doing so by hand;
+    this helper exists for the positive admitted-run path only.
+    """
+    from types import SimpleNamespace
+
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import (
+        wranglerWidget,
+    )
+
+    if frozen is None:
+        frozen = accepted_run(**fields)
+    elif fields:
+        raise TypeError("pass either frozen= or accepted_run fields, not both")
+    if target is None:
+        target = SimpleNamespace()
+    wranglerWidget._bind_admitted_run_configuration(target, frozen)
+    return target

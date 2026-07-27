@@ -24,6 +24,7 @@ from tests.xdart._o1b_consumer_inventory import (
     FORBIDDEN_POLICY_FIELDS,
     OPERATIONAL_ALLOWLIST,
     WORKER_CLASSES,
+    derive_callback_handoffs,
     derive_consumer_closure,
     derive_worker_alias_attributes,
     forbidden_reads_through_aliases,
@@ -105,8 +106,93 @@ def test_operational_access_stays_allowlisted_and_disjoint():
 
 
 def test_worker_callbacks_receive_policy_at_handoff():
-    for name, entry in DECLARED_CALLBACKS.items():
+    """The accepted configuration must be PASSED at the handoff, not declared.
+
+    O-1b-0.1: the first version of this row only re-read the inventory's own
+    fields, so it would have passed even if the spawn dropped the argument
+    entirely.  It now derives the real ``Thread(target=..., args=...)`` call and
+    proves the first spawn argument is the routed policy parameter that the
+    target method declares.
+    """
+    derived = derive_callback_handoffs(_SRC)
+    assert derived, "no worker hands a bound method to a thread any more"
+
+    undeclared = sorted(set(derived) - set(DECLARED_CALLBACKS))
+    assert undeclared == [], (
+        f"callback handoffs missing from the inventory: {undeclared}")
+
+    for name, handoff in derived.items():
+        entry = DECLARED_CALLBACKS[name]
         assert entry["classification"] in VALID_CLASSIFICATIONS, name
         cls, _, method = name.partition(".")
         assert cls in WORKER_CLASSES, name
         assert method, name
+        params = handoff["target_params"]
+        assert params[:2] == ["self", "frozen"], (
+            f"{name} does not take the accepted configuration as its first "
+            f"required argument; signature starts {params[:2]}")
+        assert handoff["args"], (
+            f"{name} is spawned with no arguments, so the concurrent reader "
+            f"cannot have been handed a configuration ({handoff['site']})")
+        assert handoff["args"][0] == "frozen", (
+            f"{name} is spawned with {handoff['args'][0]!r} first, not the "
+            f"accepted configuration ({handoff['site']})")
+
+
+# --------------------------------------------------------------------------- #
+# Bounded proofs that the derivation catches the evasions it claims to.
+# Synthetic sources, one shape each -- deliberately NOT a taint analyzer.
+# --------------------------------------------------------------------------- #
+
+def _derive_from(tmp_path, source, name="probe.py"):
+    (tmp_path / name).write_text(source)
+    return tmp_path
+
+
+def test_derivation_catches_annotated_worker_storage(tmp_path):
+    """`self.thread: imageThread = ...` is an AnnAssign, not an Assign."""
+    root = _derive_from(tmp_path, '''
+class imageThread:
+    pass
+
+
+class Host:
+    def __init__(self):
+        self.annotated_slot: imageThread = imageThread()
+''')
+    assert "annotated_slot" in derive_worker_alias_attributes(root)
+
+
+def test_derivation_catches_an_aliased_worker_constructor(tmp_path):
+    """A local alias for the worker class still constructs a worker."""
+    root = _derive_from(tmp_path, '''
+class wranglerThread:
+    pass
+
+
+builder = wranglerThread
+
+
+class Host:
+    def __init__(self):
+        self.aliased_slot = builder()
+''')
+    assert "aliased_slot" in derive_worker_alias_attributes(root)
+
+
+def test_derivation_catches_a_worker_handed_via_a_local_self_alias(tmp_path):
+    """`me = self; Sink(me)` must still make Sink a declared consumer."""
+    root = _derive_from(tmp_path, '''
+class Sink:
+    def __init__(self, host):
+        self._host = host
+
+
+class imageThread:
+    def go(self):
+        me = self
+        return Sink(me)
+''')
+    closure = derive_consumer_closure(root)
+    assert "Sink" in closure, sorted(closure)
+    assert closure["Sink"]["aliases"] == {"self._host"}

@@ -7,7 +7,7 @@ the select-last silently no-op and the last frame never appears."""
 from types import SimpleNamespace, MethodType
 import logging
 
-from tests.xdart._accepted_run import accepted_run  # noqa: E402
+from tests.xdart._accepted_run import admitted_worker, accepted_run  # noqa: E402
 from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
 
@@ -41,23 +41,21 @@ def _finish_host(tmp_path, *, batch, saw_frame, xye_only=False,
     )
     # O-1a-W1R-D3: the run-end host reads the run's ACCEPTED configuration; the
     # worker carries no mode/output mirrors for it to consult any more.
-    # §45.3: the host qualifies the accepted object by IDENTITY, so a rig must
-    # admit the same object it publishes.
-    _accepted = accepted_run(
+    # O-1b-0.1: bind through the real admission seam so carrier, ledger and
+    # generation floor cannot drift.
+    thread = admitted_worker(
+        SimpleNamespace(fname=str(thread_fname)),
         batch_mode=batch,
         output_mode=write_mode,
         save_path=str(tmp_path),
         run_options={"xye_only": xye_only},
     )
-    thread = SimpleNamespace(
-        run_configuration=_accepted,
-        _admitted_run_configuration=_accepted,
-        fname=str(thread_fname),
-        _append_skip_without_reading=append_skipped,
-        _append_config_mismatch=append_config_mismatch,
-        _append_skip_frames_by_scan={"scan": set(range(1, indexed_count + 1))},
-        _append_output_path=lambda scan_name: str(tmp_path / f"{scan_name}.nxs"),
-    )
+    thread._append_skip_without_reading = append_skipped
+    thread._append_config_mismatch = append_config_mismatch
+    thread._append_skip_frames_by_scan = {
+        "scan": set(range(1, indexed_count + 1))}
+    thread._append_output_path = (
+        lambda scan_name: str(tmp_path / f"{scan_name}.nxs"))
     if files_processed is not None:
         thread.files_processed = files_processed
     wrangler = SimpleNamespace(
