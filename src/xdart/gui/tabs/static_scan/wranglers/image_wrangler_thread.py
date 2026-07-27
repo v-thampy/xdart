@@ -18,6 +18,7 @@ import time
 import numpy as np
 from pathlib import Path
 from collections import Counter, deque
+from typing import NamedTuple
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
@@ -566,6 +567,36 @@ def natural_sort_float(list_to_sort):
     return sorted(list_to_sort, key=natural_keys_float)
 
 
+class GISourceMotorDiscovery(NamedTuple):
+    """What the worker learned about ONE just-classified source, as a value.
+
+    O-1b R4A-1(iii) (review §49.3 item 5, §49.8).  When the pre-Run preview
+    found nothing usable, the run itself is the first thing that classifies a
+    container -- so the FIRST such container hands its motor/counter names to
+    the GUI here.
+
+    This is a VALUE PROJECTION, not a second run/source authority:
+
+    * ``run_configuration`` is the EXACT accepted ``FrozenRunConfiguration``
+      object this worker was admitted with, so the wrapper qualifies delivery by
+      ``is`` identity.  A foreign or merely equal-VALUED configuration, a stale
+      source generation, a later run and a post-close arrival are all inert,
+      because none of them can produce that object;
+    * ``motors``/``counters`` are DETACHED name tuples -- no live handle, no
+      provider, no mutable panel list crosses the signal; and
+    * it retains no reference to the worker, so it adds no entry to the
+      ``f512c705`` transitive-consumer inventory.
+
+    Nothing here may mutate, replace or re-freeze the accepted configuration, or
+    change the motor the worker actually integrates with.
+    """
+
+    run_configuration: object
+    source_path: str
+    motors: tuple
+    counters: tuple
+
+
 # ---------------------------------------------------------------------------
 # imageThread
 # ---------------------------------------------------------------------------
@@ -614,6 +645,12 @@ class imageThread(wranglerThread):
     # every stamped value for display convergence, but only a finalized,
     # self-contained retirement value may optimize a later Append Run.
     sigContainerCount = Qt.QtCore.Signal(str, int, object, bool)
+    # O-1b R4A-1(iii): the FIRST JIT-classified container's motor + counter
+    # names, published ONCE per accepted run as an immutable
+    # :class:`GISourceMotorDiscovery`.  Display-only -- the wrapper qualifies it
+    # by the exact accepted configuration OBJECT before translating it onto the
+    # existing GI hydration projection, and nothing here can alter the run.
+    sigGISourceMotors = Qt.QtCore.Signal(object)
 
     def __init__(
             self,
@@ -3590,6 +3627,10 @@ class imageThread(wranglerThread):
                 return
             self._eiger_bind_cursor(cursor)
             self._eiger_open_state = "ready"
+            # R4A-1(iii): this container is now JIT-CLASSIFIED and has a live
+            # metadata provider, so it is the earliest honest moment to hand the
+            # GUI its motor/counter names.  Display-only and once per run.
+            imageThread._publish_gi_source_motors(self, frozen, master_path)
             # An unfinalized container (NXWriter without end_time — e.g. a
             # created-but-still-empty detector dataset) is provisional even
             # though the open succeeded (NXS-SF-2).
@@ -3647,6 +3688,84 @@ class imageThread(wranglerThread):
             self._eiger_open_state = "open error"
             self._eiger_close_master()
             self._eiger_nframes = 0
+
+    @staticmethod
+    def _bluesky_source_column_names(master_path):
+        """``(motors, counters)`` NAMES for a Bluesky container, or ``None``.
+
+        Deliberately the SAME io authority the pre-Run preview uses
+        (``bluesky_all_motor_names`` / ``bluesky_counters``), so a dropdown
+        filled mid-run by :meth:`_publish_gi_source_motors` is identical to one
+        the preview would have filled.  Names only -- no per-frame table, no
+        pixel, and the caller invokes it at most once per run.
+        """
+        try:
+            import h5py
+            from xrd_tools.io.bluesky_nexus import (
+                bluesky_all_motor_names,
+                bluesky_counters,
+                is_bluesky_nxwriter,
+                resolve_nxentry,
+            )
+
+            with h5py.File(master_path, 'r') as h5:
+                entry = resolve_nxentry(h5)
+                if entry is None or not is_bluesky_nxwriter(entry):
+                    return None
+                return (tuple(str(name)
+                              for name in bluesky_all_motor_names(entry)),
+                        tuple(str(name) for name in bluesky_counters(entry)))
+        except Exception:
+            logger.debug("Bluesky source column names unavailable for %s",
+                         master_path, exc_info=True)
+            return None
+
+    def _publish_gi_source_motors(self, frozen, master_path):
+        """R4A-1(iii): publish the FIRST classified container's motor names.
+
+        Exactly one immutable :class:`GISourceMotorDiscovery` per accepted run.
+        The latch is keyed on the accepted configuration OBJECT, so a second
+        container in the same run, a re-opened master, and a replayed open are
+        all silent, while a genuinely new run re-arms with no reset step that
+        could be forgotten.
+
+        Publication carries ``frozen`` -- the exact configuration this routed
+        call was given -- and never reads it back into the run: the worker keeps
+        integrating with the motor frozen at Run.
+        """
+        if getattr(self, "_gi_source_motors_published", None) is frozen:
+            return
+        if frozen is None:
+            return
+        provider = getattr(self, "_eiger_provider", None)
+        descriptor = getattr(self, "_eiger_descriptor", None)
+        # "JIT-classified WITH a metadata provider": a fabio-primary Eiger
+        # master has no provider and no embedded columns, and is not a source of
+        # motor names at all.
+        if provider is None or not bool(getattr(descriptor, "is_bluesky", False)):
+            return
+        sig = getattr(self, "sigGISourceMotors", None)
+        if sig is None:
+            return
+        columns = imageThread._bluesky_source_column_names(master_path)
+        if columns is None:
+            return
+        motors, counters = columns
+        # Latch BEFORE emitting so even a re-entrant/duplicate delivery attempt
+        # cannot produce a second publication for this run.
+        self._gi_source_motors_published = frozen
+        if not motors and not counters:
+            return
+        try:
+            sig.emit(GISourceMotorDiscovery(
+                run_configuration=frozen,
+                source_path=str(master_path),
+                motors=tuple(motors),
+                counters=tuple(counters),
+            ))
+        except Exception:
+            logger.debug("GI source motor publication failed for %s",
+                         master_path, exc_info=True)
 
     def _eiger_cursor_binding(self, cursor):
         """Build, but do not install, a coherent open-cursor binding.

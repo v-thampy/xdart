@@ -10,6 +10,7 @@ import fnmatch
 import time
 import numpy as np
 from pathlib import Path
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,11 @@ from .wrangler_widget import (
     _run_owner_refusal_status,
     wranglerWidget,
 )
-from .image_wrangler_thread import imageThread, _get_scan_info  # noqa: F401
+from .image_wrangler_thread import (  # noqa: F401
+    GISourceMotorDiscovery,
+    imageThread,
+    _get_scan_info,
+)
 from .ui.specUI import Ui_Form
 from xdart.modules.live import LiveScan
 from xdart.utils import get_fname_dir, match_img_detector
@@ -222,6 +227,92 @@ from ..gi_motor_defaults import pick_default_gi_motor
 # source (TIFF/EDF/CBF/…) skips the probe entirely, so the sidecar path — and
 # the light-holder tests that bind only the metadata methods — are untouched.
 _EMBEDDED_META_EXTS = ('.nxs', '.h5', '.hdf5')
+
+# O-1b R4A-1: the metadata-preview budget.  BOTH bounds cover the COMPLETE
+# preview attempt (direct children AND any Subdirs descent), and they are
+# independently load-bearing: whichever trips first stops the attempt.  These
+# are the retired probe-budget constants from the pre-R4-A recursive seed.
+_PREVIEW_MAX_CONTENT_OPENS = 8
+_PREVIEW_DEADLINE_S = 0.75
+
+
+class DirectoryMetadataPreview(NamedTuple):
+    """THE immutable, detached result of inspecting ONE candidate container.
+
+    O-1b R4A-2 (review §49.3 item 1, §50.1).  Candidate discovery used to pick
+    ``natural_sort_ints(candidates)[0]`` while adoption independently decided
+    usability, so discovery could select a candidate adoption then rejected --
+    and the whole GI/BG option set was cleared with a usable sibling right
+    there.  There is now ONE usability operation
+    (:meth:`imageWrangler._metadata_preview_result`) returning either this value
+    or ``None``; discovery and adoption consume the SAME result, so a candidate
+    is never content-opened twice and the two can no longer drift apart.
+
+    ``motors``/``counters`` are detached name tuples: nothing here aliases a
+    live HDF5 handle, a provider, or a mutable panel list.
+    """
+
+    path: str
+    kind: str                 # 'embedded' (Bluesky columns) | 'sidecar'
+    motors: tuple
+    counters: tuple
+
+
+class _PreviewBudget:
+    """The WHOLE-attempt content-open + wall-clock bound for one preview.
+
+    Both bounds must be independently discriminating (review §50.2): enforcing
+    eight opens without a deadline, or a deadline without the open cap, each
+    passes one frozen row and fails the other.  The clock is read through the
+    module-level ``time`` import so the oracle's injected ``monotonic`` is
+    load-bearing -- a deadline captured from ``time.time``/``perf_counter``, or
+    from a clock imported into another module, would look correct and never
+    trip.
+    """
+
+    __slots__ = ("deadline", "opens")
+
+    def __init__(self, *, deadline, opens):
+        self.deadline = float(deadline)
+        self.opens = int(opens)
+
+    def exhausted(self):
+        return self.opens <= 0 or time.monotonic() >= self.deadline
+
+    def charge(self):
+        """Authorize ONE content open, or refuse because a bound tripped."""
+        if self.exhausted():
+            return False
+        self.opens -= 1
+        return True
+
+
+def _directory_preview_entries(directory):
+    """``(files, subdirectories)`` of *directory* in GLOBAL natural order.
+
+    Name-only: ``os.scandir`` entries are classified with the cached
+    ``is_file``/``is_dir`` bits and never opened, so listing a candidate root
+    stays inside the lazy-discovery contract.  The complete listing is sorted
+    ONCE, so ``scan_2`` precedes ``scan_10`` however wide the directory is.
+    """
+    from .image_wrangler_thread import natural_sort_ints
+
+    try:
+        with os.scandir(directory) as entries:
+            by_name = {entry.name: entry for entry in entries}
+    except OSError:
+        return (), ()
+    files, subdirs = [], []
+    for name in natural_sort_ints(list(by_name)):
+        entry = by_name[name]
+        try:
+            if entry.is_file(follow_symlinks=False):
+                files.append(Path(entry.path))
+            elif entry.is_dir(follow_symlinks=False):
+                subdirs.append(Path(entry.path))
+        except OSError:
+            continue
+    return tuple(files), tuple(subdirs)
 
 
 class imageWrangler(wranglerWidget):
@@ -579,6 +670,10 @@ class imageWrangler(wranglerWidget):
         # self.thread.sigUpdateFrame.connect(self.sigUpdateFrame.emit)
         self.thread.sigUpdateGI.connect(self.sigUpdateGI.emit)
         self.thread.sigXyeOutputReady.connect(self.sigXyeOutputReady.emit)
+        # R4A-1(iii): the first JIT-classified container's motor/counter names.
+        # Delivered as a VALUE the receiver qualifies by exact accepted-object
+        # identity; it is never re-emitted onward unqualified.
+        self.thread.sigGISourceMotors.connect(self._on_gi_source_motors)
         # Pause (Phase B): the worker emits sigPaused once it has drained+flushed
         # at a frame boundary.  Morph the action button to Resume here AND
         # re-emit at the wrangler level so the host (staticWidget) can lift the
@@ -2241,67 +2336,161 @@ class imageWrangler(wranglerWidget):
             return ("_master.h5",)
         return (f".{ext}",) if ext else ()
 
-    def _directory_metadata_preview_file(self):
-        """One direct-child metadata preview, never recursive Run membership.
+    def _metadata_preview_result(self, path):
+        """THE usability definition: an immutable preview value, or ``None``.
 
-        GI motor/counter choices still need a representative metadata schema
-        before Run.  Inspecting one direct matching file preserves that UX
-        without classifying every container or walking Subdirs.
+        O-1b R4A-2 (review §49.3 item 1).  This is the SINGLE predicate: there
+        may not be one "looks like a candidate" rule for discovery and a
+        different "can actually adopt" rule for adoption, because the two drift
+        (§50.1) and discovery then selects what adoption rejects.  An empty or
+        torn file, a processed xdart output, a detectorless container and an
+        unreadable candidate all answer ``None`` -- none of them carries the
+        embedded Bluesky columns, and none resolves sidecar metadata -- so the
+        caller can skip it and keep looking.
+
+        The candidate is content-opened HERE, exactly once; adoption consumes
+        this same value rather than re-opening it.  ``_read_bluesky_source_columns``
+        is reached through the instance so an injected/counting reader really
+        observes every preview open.
+        """
+        value = str(path or "")
+        if not value:
+            return None
+        try:
+            columns = self._read_bluesky_source_columns(value)
+        except Exception:
+            logger.debug("preview column read failed for %s", value,
+                         exc_info=True)
+            columns = None
+        if columns is not None:
+            motors, counters = columns
+            return DirectoryMetadataPreview(
+                value, 'embedded',
+                tuple(str(name) for name in motors),
+                tuple(str(name) for name in counters))
+        try:
+            if self.meta_ext and self.exists_meta_file(value):
+                # A sidecar-described candidate is usable, but its columns are
+                # parsed by the shared ``set_pars_from_meta`` projection at
+                # adoption; the preview only decides usability + identity.
+                return DirectoryMetadataPreview(value, 'sidecar', (), ())
+        except Exception:
+            logger.debug("preview sidecar probe failed for %s", value,
+                         exc_info=True)
+        return None
+
+    def _first_usable_preview(self, files, suffixes, match, budget):
+        """The first usable candidate among *files*, in the order given.
+
+        R4A-2: an unusable candidate is SKIPPED, never allowed to clear a later
+        usable sibling.  Every content open is charged to the whole-attempt
+        budget, so the caps bound the complete preview rather than one
+        directory.
+        """
+        for path in files:
+            low = path.name.lower()
+            suffix = next(
+                (value for value in suffixes if low.endswith(value)), "")
+            if not suffix:
+                continue
+            if not match(path.name[:-len(suffix)]):
+                continue
+            if not budget.charge():
+                return None
+            result = imageWrangler._metadata_preview_result(self, str(path))
+            if result is not None:
+                return result
+        return None
+
+    def _discover_directory_metadata_preview(self):
+        """One usable metadata preview for the selected root, or ``None``.
+
+        O-1b R4A-1/R4A-2 (review §49.3 items 2-3).  Direct children are listed
+        NAME-ONLY, natural-sorted globally, and inspected in that order until
+        the first usable result.  Only when no direct child is usable, and only
+        when Subdirs is enabled, does a lazy deterministic descent follow -- the
+        pre-R4-A recursive seed's UX without its eager recursion.  The descent
+        stops at the first usable result, eight content opens, or 0.75 s,
+        whichever comes first, and those bounds cover the COMPLETE attempt.  No
+        frame-count or metadata sweep is performed: name enumeration is
+        value-only and only a charged candidate is ever opened.
         """
         try:
             from .image_wrangler_thread import _name_filter
 
-            match = _name_filter(self.file_filter)
             suffixes = imageWrangler._directory_metadata_preview_suffixes(self)
-            candidates = []
-            for path in Path(self.img_dir).expanduser().iterdir():
-                if not path.is_file():
-                    continue
-                low = path.name.lower()
-                suffix = next(
-                    (value for value in suffixes if low.endswith(value)), "")
-                if not suffix:
-                    continue
-                if match(path.name[:-len(suffix)]):
-                    candidates.append(path)
-            if not candidates:
-                return ""
-            from .image_wrangler_thread import natural_sort_ints
-
-            return str(natural_sort_ints(
-                [str(path) for path in candidates])[0])
+            if not suffixes:
+                return None
+            match = _name_filter(self.file_filter)
+            root = Path(self.img_dir).expanduser()
+            budget = _PreviewBudget(
+                deadline=time.monotonic() + _PREVIEW_DEADLINE_S,
+                opens=_PREVIEW_MAX_CONTENT_OPENS,
+            )
+            files, subdirs = _directory_preview_entries(root)
+            result = imageWrangler._first_usable_preview(
+                self, files, suffixes, match, budget)
+            if result is not None or not self.include_subdir:
+                return result
+            pending = list(subdirs)
+            while pending and not budget.exhausted():
+                child = pending.pop(0)
+                child_files, child_dirs = _directory_preview_entries(child)
+                result = imageWrangler._first_usable_preview(
+                    self, child_files, suffixes, match, budget)
+                if result is not None:
+                    return result
+                pending.extend(child_dirs)
+            return None
         except Exception:
             logger.debug("directory metadata preview discovery failed",
                          exc_info=True)
-            return ""
+            return None
 
-    def _adopt_directory_metadata_preview(self, preview_file):
-        """Populate option lists from at most one direct-child container."""
-        if preview_file:
-            bluesky_cols = self._read_bluesky_source_columns(preview_file)
-            if bluesky_cols is not None:
-                motors, counters = bluesky_cols
-                self.motors = list(motors)
-                self.counters = list(counters)
+    def _directory_metadata_preview_file(self):
+        """The usable preview candidate's PATH, or ``""`` -- compatibility name.
+
+        The identity half of :meth:`_discover_directory_metadata_preview`, kept
+        because the Source card and older callers ask only "which file".
+        """
+        result = imageWrangler._discover_directory_metadata_preview(self)
+        # Stash the value half beside the identity half so the caller can adopt
+        # THE inspected result instead of re-opening the candidate.
+        self._directory_metadata_preview_result = result
+        return result.path if result is not None else ""
+
+    def _adopt_directory_metadata_preview(self, preview):
+        """Project ONE shared preview result onto the option lists.
+
+        *preview* is the :class:`DirectoryMetadataPreview` discovery already
+        produced (so nothing is content-opened twice), ``None``/``""`` for "no
+        usable candidate", or -- for older callers -- a bare path string, which
+        is resolved through the SAME single usability predicate.
+        """
+        if isinstance(preview, str):
+            preview = imageWrangler._metadata_preview_result(self, preview)
+        if preview is not None:
+            if preview.kind == 'embedded':
+                self.motors = list(preview.motors)
+                self.counters = list(preview.counters)
                 self.scan_parameters = [*self.motors, *self.counters]
-                # A direct-child container WAS inspected -> the motor result is
+                # A container WAS inspected -> the motor result is
                 # authoritative (KNOWN_EMPTY when it has none), not UNKNOWN.
                 self._gi_motor_knowledge_proved = True
                 self.set_gi_motor_options()
                 self.set_bg_matching_options()
                 self.set_bg_norm_options()
                 return
-            if self.meta_ext and self.exists_meta_file(preview_file):
-                prior = self.img_file
-                try:
-                    self.img_file = preview_file
-                    self.set_pars_from_meta()
-                finally:
-                    self.img_file = prior
-                return
-        # §13.7: no direct-child preview file was inspected (e.g. a lazy
-        # recursive root whose matching data lives only in subdirectories), so
-        # the motor knowledge is UNKNOWN, NOT known-empty.  Clearing the stale
+            prior = self.img_file
+            try:
+                self.img_file = preview.path
+                self.set_pars_from_meta()
+            finally:
+                self.img_file = prior
+            return
+        # §13.7: nothing usable was found anywhere within the budget (e.g. a
+        # lazy recursive root whose matching data has not landed yet), so the
+        # motor knowledge is UNKNOWN, NOT known-empty.  Clearing the stale
         # option lists must not resolve an explicit GI motor to Manual.
         self.scan_parameters = []
         self.motors = []
@@ -2310,6 +2499,65 @@ class imageWrangler(wranglerWidget):
         self.set_gi_motor_options()
         self.set_bg_matching_options()
         self.set_bg_norm_options()
+        imageWrangler._report_no_metadata_preview(self)
+
+    def _on_gi_source_motors(self, value):
+        """Translate ONE exact-run-qualified worker discovery to the display.
+
+        R4A-1(iii) (review §49.3 item 5).  The pre-Run preview may legitimately
+        have found nothing (a lazy recursive root whose data lands during the
+        run), and this is how the dropdown fills anyway.
+
+        Qualification is by ``is`` against BOTH the accepted carrier and the
+        admission ledger, so the only value that can be applied is the one
+        carrying the exact object this wrapper admitted for the CURRENT run.
+        There is deliberately no equality fallback and no "reconstruct the
+        current run" path: a foreign or equal-VALUED configuration, a stale
+        source generation, a later run, and a post-close arrival (the carrier is
+        cleared / the receiver is gone) are all inert.  The per-run latch makes
+        it at most once, so a duplicate frame or a re-opened master republishes
+        nothing.
+
+        Display-only.  The accepted configuration is never mutated, replaced or
+        re-frozen here, and the worker keeps integrating with the motor frozen
+        at Run; only the visible option lists move, through the SAME projection
+        and hydration chain the preview uses.
+        """
+        if not isinstance(value, GISourceMotorDiscovery):
+            return
+        frozen = getattr(self, 'run_configuration', None)
+        if frozen is None or value.run_configuration is not frozen:
+            return
+        if getattr(self, '_admitted_run_configuration', None) is not frozen:
+            return
+        if getattr(self, '_gi_source_motors_applied', None) is frozen:
+            return
+        self._gi_source_motors_applied = frozen
+        self.motors = list(value.motors)
+        self.counters = list(value.counters)
+        self.scan_parameters = [*self.motors, *self.counters]
+        # A real container WAS classified, so the motor knowledge is proved.
+        self._gi_motor_knowledge_proved = True
+        self.set_gi_motor_options()
+        self.set_bg_matching_options()
+        self.set_bg_norm_options()
+
+    def _report_no_metadata_preview(self):
+        """Tell the OPERATOR that motor choices will arrive during the run.
+
+        R4A-1(iii) (review §49.3 item 4, §50.2).  The hint goes through the
+        production ``showLabel`` status seam -- the place the operator actually
+        reads -- so a private/test-only field cannot satisfy it.
+        """
+        emit = getattr(getattr(self, 'showLabel', None), 'emit', None)
+        if not callable(emit):
+            return
+        try:
+            emit('No readable scan metadata in this directory yet — GI theta '
+                 'motor choices will populate during Run.')
+        except Exception:
+            logger.debug("showLabel emit failed for the preview hint",
+                         exc_info=True)
 
     def get_img_fname(self):
         """Sets file name based on chosen options
@@ -2373,6 +2621,13 @@ class imageWrangler(wranglerWidget):
                     str(directory.resolve()),
                     imageWrangler._directory_metadata_preview_suffixes(self),
                     str(self.file_filter or ""),
+                    # R4A-1: Subdirs is an INPUT to preview discovery now, so it
+                    # belongs in the key.  Without it, ticking Subdirs on a root
+                    # whose containers live only in subfolders re-served the
+                    # cached "nothing usable" answer and the dropdown never
+                    # filled until the root's own mtime happened to change --
+                    # exactly the case R4A-1 exists to fix.
+                    bool(self.include_subdir),
                     int(getattr(directory_stat, "st_dev", 0)),
                     int(getattr(directory_stat, "st_ino", 0)),
                     int(directory_stat.st_mtime_ns),
@@ -2382,16 +2637,33 @@ class imageWrangler(wranglerWidget):
                     str(Path(self.img_dir).expanduser()),
                     imageWrangler._directory_metadata_preview_suffixes(self),
                     str(self.file_filter or ""),
+                    bool(self.include_subdir),
                     None,
                 )
             if discovery_key == getattr(
                 self, "_directory_metadata_discovery_key", None
             ):
+                # R4A-2: what is cached is the shared PREVIEW RESULT, not a bare
+                # path, so a repeat selection re-adopts without opening the
+                # candidate again.
                 preview_file = getattr(
                     self, "_directory_metadata_preview_path", "")
+                preview = getattr(
+                    self, "_directory_metadata_preview_result", None)
             else:
+                # Discovery keeps going through the identity leg (callers and
+                # focused tests substitute THAT method), and the shared result it
+                # stashes is reused so discovery and adoption never open the same
+                # candidate twice.  A substituted identity is re-resolved through
+                # the SAME single predicate rather than a second one.
                 preview_file = self._directory_metadata_preview_file()
+                preview = getattr(
+                    self, "_directory_metadata_preview_result", None)
+                if preview is None or preview.path != preview_file:
+                    preview = imageWrangler._metadata_preview_result(
+                        self, preview_file)
                 self._directory_metadata_discovery_key = discovery_key
+                self._directory_metadata_preview_result = preview
                 self._directory_metadata_preview_path = preview_file
             try:
                 preview_stat = Path(preview_file).stat() if preview_file else None
@@ -2417,7 +2689,7 @@ class imageWrangler(wranglerWidget):
                 # leaking an un-emitted token onto the pending FIFO) and carries the
                 # fingerprint of the source the request is FOR.
                 self._next_gi_hydration_generation()
-                self._adopt_directory_metadata_preview(preview_file)
+                self._adopt_directory_metadata_preview(preview)
             return
 
         if ((self.img_file != old_fname)
