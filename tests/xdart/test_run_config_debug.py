@@ -124,7 +124,17 @@ def test_run_config_debug_records_all_run_ownership_carriers(
         assert payload["controls"]["gi_visible_values"] == [True]
         assert payload["shared_scan"]["gi"] is True
         assert payload["wrangler"]["hidden_parameters"]["gi"] is False
-        assert payload["wrangler"]["worker"]["gi"] is False
+        # O-1b §54.4 S1: D3 DELETED the worker's `gi` policy mirror -- the
+        # worker consumes the exact FrozenRunConfiguration now.  The diagnostic
+        # must therefore report that carrier as ABSENT.  Asserting a stale
+        # `False` here would only pass again if someone re-added the mirror,
+        # which is the regression this row now guards against.
+        assert payload["wrangler"]["worker"]["present"] is True
+        assert payload["wrangler"]["worker"]["gi"] is None, (
+            "the retired worker GI carrier is back; the worker takes its policy "
+            "as the frozen configuration argument, not as a mirror")
+        assert not hasattr(widget.wrangler.thread, "gi"), (
+            "imageThread must not carry a `gi` attribute at all")
         assert payload["controls"]["threshold"]["threshold_max"] == 5000.0
         assert (
             payload["wrangler"]["hidden_parameters"]["threshold"]["max"] == 0
@@ -160,20 +170,28 @@ def test_r4d_first_run_preserves_grazing_across_stale_hidden_carriers(
         assert run_configuration.threshold.threshold_max == 5000
         widget._apply_controls_v2_run_state(run_configuration)
 
-        # The one run snapshot must win over every stale compatibility carrier.
+        # The one run snapshot must win over every stale compatibility carrier
+        # that still EXISTS.  The worker's `gi` mirror is not one of them: D3
+        # deleted it, so first-run truth for the worker is asserted below
+        # through the frozen object it actually executes, and reading a mirror
+        # here would only re-legitimise the carrier the deletion removed.
         assert (
             widget.scan.gi,
             bool(widget.scan.gi_config),
             widget.wrangler.parameters.child("GI").child("Grazing").value(),
             widget.wrangler.gi,
-            widget.wrangler.thread.gi,
-        ) == (True, True, True, True, True)
+        ) == (True, True, True, True)
+        assert not hasattr(widget.wrangler.thread, "gi"), (
+            "the retired worker GI carrier is back")
         assert (
             widget.wrangler.parameters.child("Mask").child("max").value()
             == 5000
         )
         assert widget.wrangler.run_configuration is run_configuration
+        # §54.4 S1 item 2: the worker's first-run GI truth, stated through the
+        # exact object it executes rather than a mirror of it.
         assert widget.wrangler.thread.run_configuration is run_configuration
+        assert run_configuration.gi.enabled is True
     finally:
         widget.close()
         widget.deleteLater()
