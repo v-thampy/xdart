@@ -192,11 +192,12 @@ def _build_batch_thread(poni, mask, *, incidence_motor="th",
     from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
 
+    _accepted = _accepted_gi_run(
+        gi=gi, incidence_motor=incidence_motor,
+        sample_orientation=sample_orientation, batch_mode=True, max_cores=2)
     w = SimpleNamespace(
-        run_configuration=_accepted_gi_run(
-            gi=gi, incidence_motor=incidence_motor,
-            sample_orientation=sample_orientation,
-            batch_mode=True, max_cores=2),
+        run_configuration=_accepted,
+        _admitted_run_configuration=_accepted,
         mask=mask, poni=poni, command="",
         _plan_cache=StandardPlanCache(), _xye_lock=RLock(), _xye_buffer=[],
         _cached_gi_incident_angle=None,
@@ -337,7 +338,7 @@ def _frozen_gi_bai_args(poni, img, meta, mask, *, gi_mode_1d, gi_mode_2d,
     )
     # O-1a-W1R-D2: the switch is frozen run policy -- re-admit a configuration
     # with it OFF so _freeze_gi_2d_auto_ranges runs (it skips on xye_only).
-    w.run_configuration = _accepted_gi_run(
+    w.run_configuration = w._admitted_run_configuration = _accepted_gi_run(
         gi=True, incidence_motor=incidence_motor,
         sample_orientation=sample_orientation, batch_mode=True, max_cores=2,
         xye_only=False)
@@ -429,10 +430,12 @@ def _run_live_single(poni, name, img, meta, mask, *, incidence_motor="th",
         _cached_fiber_integrator_angle=None,
         _cached_data_mask=None,
     )
+    _accepted = _accepted_gi_run(
+        gi=gi, incidence_motor=incidence_motor,
+        sample_orientation=sample_orientation, batch_mode=False)
     w = SimpleNamespace(
-        run_configuration=_accepted_gi_run(
-            gi=gi, incidence_motor=incidence_motor,
-            sample_orientation=sample_orientation, batch_mode=False),
+        run_configuration=_accepted,
+        _admitted_run_configuration=_accepted,
         mask=mask, poni=poni, command="",
         _plan_cache=StandardPlanCache(), _xye_lock=RLock(), _xye_buffer=[],
         _published_frames={}, _cached_gi_incident_angle=None,
@@ -1596,7 +1599,7 @@ def test_gi_streaming_multichunk_later_chunk_uses_whole_scan_grid():
     w, captured = _build_batch_thread(poni, mask, gi=True)
     # O-1a-W1R-D2: the source the pre-pass sweeps and the XYE switch are frozen
     # run policy -- re-admit one configuration that carries both.
-    w.run_configuration = _accepted_scout_run(
+    w.run_configuration = w._admitted_run_configuration = _accepted_scout_run(
         TIFF / f"{scan_name}_0001.tif", batch_mode=True, xye_only=True)
     w.img_file = str(TIFF / f"{scan_name}_0001.tif")
     w.scan_name = scan_name
