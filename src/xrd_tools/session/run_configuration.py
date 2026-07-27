@@ -439,11 +439,11 @@ def _detached_container(value: Any) -> Any:
     those -- not just the ``dtype``-bearing subset -- are exactly what this
     boundary owes a recursive copy.
 
-    An arbitrary ``copy()`` is not evidence: it can be shallow or even change
-    the value.  Generic containers are rebuilt from their recursively detached
-    value conversion (or reduced to that built-in value).  Only NumPy's narrow
-    dtype/shape value protocol uses ``deepcopy`` to preserve its public type,
-    and every retained result must freeze to the exact pre-copy value.
+    An arbitrary ``copy()`` or constructor is not evidence: either can alias
+    the original or change the value.  Generic containers reduce to their
+    recursively detached built-in value.  Only NumPy's narrow dtype/shape value
+    protocol uses ``deepcopy`` to preserve its public type, and every retained
+    result must freeze to the exact pre-copy value.
     """
     converters = [name for name in ("item", "tolist")
                   if callable(getattr(value, name, None))]
@@ -473,17 +473,6 @@ def _detached_container(value: Any) -> Any:
                     and _freeze_value(copied) == frozen_before):
                 return copied
 
-        # Rebuilding from an already-detached value preserves simple public
-        # value-container types (including hashable mapping keys) without
-        # trusting their potentially shallow ``copy()`` implementation.
-        if callable(getattr(value, "copy", None)):
-            try:
-                rebuilt = value_type(detached)
-            except Exception:
-                rebuilt = value
-            if (rebuilt is not value
-                    and _freeze_value(rebuilt) == frozen_before):
-                return rebuilt
         return detached
     raise TypeError(
         "run configuration values must be detachable; "

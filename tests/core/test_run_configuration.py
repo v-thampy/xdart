@@ -485,6 +485,20 @@ class _ConstructorLieContainer(_TolistOnly):
         return copied
 
 
+class _ConstructorAliasContainer(_TolistOnly):
+    """Its constructor reconnects a clone to an external mutable backing."""
+
+    backing = None
+
+    def __init__(self, items):
+        self.items = type(self).backing
+
+    def copy(self):
+        copied = object.__new__(type(self))
+        copied.items = list(self.items)
+        return copied
+
+
 class _HashableTolist(_TolistOnly):
     """Hash-sensitive: usable as a mapping key while still mutable."""
 
@@ -542,7 +556,7 @@ def test_clone_candidate_does_not_trust_a_value_changing_copy():
     assert settled == [1, 2]
 
 
-def test_clone_candidate_verifies_reconstructed_value_equivalence():
+def test_clone_candidate_does_not_retain_value_changing_constructor():
     value = object.__new__(_ConstructorLieContainer)
     value.items = [1, 2]
     intent = RunIntent(run_options={"probe": value})
@@ -553,23 +567,31 @@ def test_clone_candidate_verifies_reconstructed_value_equivalence():
     assert settled == [1, 2]
 
 
+def test_clone_candidate_does_not_retain_a_constructor_alias():
+    backing = [1, 2]
+    _ConstructorAliasContainer.backing = backing
+    value = object.__new__(_ConstructorAliasContainer)
+    value.items = backing
+    intent = RunIntent(run_options={"probe": value})
+
+    copied = intent.clone_candidate().run_options["probe"]
+    backing.append(3)
+
+    settled = copied.tolist() if hasattr(copied, "tolist") else copied
+    assert settled == [1, 2]
+
+
 def test_clone_candidate_detaches_or_refuses_a_hash_sensitive_mapping_key():
     """Keys ride the same boundary as values, or the copy fails closed.
 
-    A key that can copy itself detaches; one that can only convert through
-    ``tolist()`` becomes unhashable, and refusing is the correct fail-closed
-    outcome -- returning the original key would alias it.
+    Conversion through ``tolist()`` becomes unhashable, and refusing is the
+    correct fail-closed outcome.  A custom ``copy()`` or constructor is not
+    sufficient proof that a hash-sensitive key is independent.
     """
-    copyable = _CopyableKey([1, 2])
-    intent = RunIntent(run_options={copyable: "value"})
-
-    (copied_key,) = intent.clone_candidate().run_options
-    assert copied_key is not copyable
-    assert copied_key == copyable
-
-    intent = RunIntent(run_options={_HashableTolist([3]): "value"})
-    with pytest.raises(TypeError):
-        intent.clone_candidate()
+    for key in (_CopyableKey([1, 2]), _HashableTolist([3])):
+        intent = RunIntent(run_options={key: "value"})
+        with pytest.raises(TypeError):
+            intent.clone_candidate()
 
 
 def test_clone_candidate_preserves_numpy_dtype_and_shape():
