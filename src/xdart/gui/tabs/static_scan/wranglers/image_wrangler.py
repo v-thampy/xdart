@@ -2525,6 +2525,8 @@ class imageWrangler(wranglerWidget):
         """
         if not isinstance(value, GISourceMotorDiscovery):
             return
+        if getattr(self, '_gi_hydration_closed', False):
+            return
         frozen = getattr(self, 'run_configuration', None)
         if frozen is None or value.run_configuration is not frozen:
             return

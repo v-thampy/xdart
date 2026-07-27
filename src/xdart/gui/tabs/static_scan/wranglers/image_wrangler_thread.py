@@ -925,6 +925,12 @@ class imageThread(wranglerThread):
         self._eiger_master_queue.clear()
         self._directory_walk_iter = None
         self._eiger_done_masters.clear()
+        # R4A-5 per-run provisional bookkeeping.  Cleared here, which is exactly
+        # what makes "left for the next Run" true: a container this run gave up
+        # on is visible again the moment a new Run starts.
+        self._eiger_provisional_masters = set()
+        self._eiger_provisional_exhausted = set()
+        self._eiger_provisional_recheck_done = False
         self._source_plan_reported.clear()
         seed_candidates = tuple(
             getattr(getattr(self, "source_run_plan", None), "candidates", ())
@@ -4517,6 +4523,10 @@ class imageThread(wranglerThread):
                 value = str(path)
                 if value in self._eiger_done_masters or value in queued:
                     continue
+                # R4A-5: parked provisional containers rejoin the queue only
+                # through the one end-of-sweep recheck, never by re-discovery.
+                if imageThread._eiger_provisional_hold(self, value):
+                    continue
                 if imageThread._eiger_retry_is_pending(
                     self, value, now=now
                 ):
@@ -4565,6 +4575,9 @@ class imageThread(wranglerThread):
                 continue  # one directory boundary; still charges the budget
             mf_str = str(mf)
             if mf_str in self._eiger_done_masters:
+                continue
+            # R4A-5: see the authoritative branch above.
+            if imageThread._eiger_provisional_hold(self, mf_str):
                 continue
             if imageThread._eiger_retry_is_pending(
                 self, mf_str, now=now
@@ -4718,6 +4731,105 @@ class imageThread(wranglerThread):
         self._h19_ready_master_candidates = {
             str(candidate.path): candidate for candidate in ready_candidates}
         return tuple(candidate.path for candidate in ready_candidates)
+
+    def _eiger_provisional_open_outcome(self):
+        """Whether the LAST open produced a provisional (still-writing) file."""
+        return bool(
+            getattr(self, "_eiger_single_file_provisional", False)
+            or getattr(self, "_eiger_open_state", None) == "not ready")
+
+    def _eiger_provisional_hold(self, path):
+        """Whether *path* is held out of THIS run's discovery by R4A-5.
+
+        Either parked awaiting the one end-of-sweep recheck, or already
+        rechecked and still provisional.  Neither state is retirement: the
+        container was never consumed, and both sets are cleared at Run start.
+        """
+        return (
+            path in (getattr(self, "_eiger_provisional_masters", None) or ())
+            or path in (getattr(self, "_eiger_provisional_exhausted", None) or ())
+        )
+
+    def _eiger_park_provisional_master(self, frozen, path):
+        """R4A-5: hold a provisional container instead of retiring it.
+
+        The deferral itself was already correct -- ``_eiger_open_master``
+        defers an ``IN_PROGRESS``/unfinalized directory container, which is what
+        F5/DIR-2 fixed for the live watch.  What was missing is that BATCH (and
+        any other non-live directory run) has no watch loop to re-poll it, so
+        the deferred container fell through to the exhaustion branch, was
+        RETIRED into ``_eiger_done_masters`` at first sight, and every frame it
+        flushed later in the SAME run was lost.
+
+        Returns ``True`` when the caller must neither retire nor count the
+        container.  It is parked for exactly one end-of-sweep recheck; if it is
+        still provisional then, it is held out of this run's discovery so the
+        sweep cannot spin on an unchanged file -- but it is never recorded as
+        consumed, so the next Run picks it up.
+        """
+        if (not path
+                or frozen.live_mode
+                or frozen.source.family != "directory"
+                or not imageThread._eiger_provisional_open_outcome(self)):
+            return False
+        value = str(path)
+        if getattr(self, "_eiger_provisional_recheck_done", False):
+            exhausted = getattr(self, "_eiger_provisional_exhausted", None)
+            if exhausted is None:
+                exhausted = self._eiger_provisional_exhausted = set()
+            if value not in exhausted:
+                exhausted.add(value)
+                logger.info(
+                    "Container still being written after its end-of-sweep "
+                    "recheck; leaving it for the next Run: %s", value)
+            return True
+        parked = getattr(self, "_eiger_provisional_masters", None)
+        if parked is None:
+            parked = self._eiger_provisional_masters = set()
+        parked.add(value)
+        return True
+
+    def _eiger_recheck_provisional_masters(self, frozen):
+        """R4A-5: ONE bounded end-of-sweep recheck; ``True`` if anything requeued.
+
+        Requeued paths take the normal pop -> :meth:`_eiger_open_master` ->
+        adapter-binding route again, so a container that finalized mid-run is
+        read through a freshly built NXWriter cursor/provider rather than the
+        stale binding that saw it provisional.  A cheap frame-count re-read
+        would look cheaper and produce unreadable frames.
+
+        At most once per Run, so a directory of permanently provisional
+        containers finishes truthfully instead of spinning.
+        """
+        if frozen.live_mode or frozen.source.family != "directory":
+            return False
+        if getattr(self, "_eiger_provisional_recheck_done", False):
+            return False
+        self._eiger_provisional_recheck_done = True
+        parked = sorted(getattr(self, "_eiger_provisional_masters", None) or ())
+        self._eiger_provisional_masters = set()
+        requeued = False
+        for value in parked:
+            if value in self._eiger_done_masters:
+                continue
+            if not os.path.exists(value):
+                continue
+            self._eiger_master_queue.append(value)
+            requeued = True
+        if requeued:
+            logger.info(
+                "Rechecking %d provisional container(s) before end of run",
+                len(parked))
+        return requeued
+
+    def _eiger_pop_master_with_recheck(self, frozen):
+        """The pop the directory reader uses: drained sweep -> one recheck."""
+        next_master = self._eiger_pop_next_master(frozen)
+        if next_master is not None:
+            return next_master
+        if not imageThread._eiger_recheck_provisional_masters(self, frozen):
+            return None
+        return self._eiger_pop_next_master(frozen)
 
     def _eiger_pop_next_master(self, frozen):
         """Pop the next master, deferring unfinalized NXWriter containers.
@@ -5247,7 +5359,8 @@ class imageThread(wranglerThread):
                     self._h19_queue_already_current = False
                     if not queue_current:
                         self._eiger_refill_master_queue(frozen)
-                    next_master = self._eiger_pop_next_master(frozen)
+                    next_master = imageThread._eiger_pop_master_with_recheck(
+                        self, frozen)
                     if next_master is None:
                         return None, None, 1, None, {}
                     self._eiger_master_path = next_master
@@ -5258,6 +5371,8 @@ class imageThread(wranglerThread):
                 if self._eiger_skip_open_complete_append_master(frozen):
                     continue
                 if self._eiger_nframes == 0:
+                    parked = imageThread._eiger_park_provisional_master(
+                        self, frozen, self._eiger_master_path)
                     self._eiger_close_or_defer_zero_frame_master(frozen)
                     if frozen.source.family == "directory":
                         # An imageless container (a diode/alignment scan in a
@@ -5266,6 +5381,16 @@ class imageThread(wranglerThread):
                         # advances to the next master (bl17-2 2026-07-12: one
                         # alignment file sorting FIRST killed the whole batch
                         # run with 'Total Files Processed: 0').
+                        if parked:
+                            # R4A-5: a PROVISIONAL container is different.  Drop
+                            # its identity here so the exhaustion branch below
+                            # cannot retire it (losing the frames it flushes
+                            # later in this same run) nor re-count it with no
+                            # cursor bound; it rejoins through the one
+                            # end-of-sweep recheck.
+                            self._eiger_master_path = None
+                            self._eiger_frame_idx = 0
+                            self._eiger_nframes = 0
                         continue
                     return None, None, 1, None, {}
 
@@ -5295,14 +5420,23 @@ class imageThread(wranglerThread):
 
             if self._eiger_frame_idx >= self._eiger_nframes:
                 if frozen.source.family == "directory":
-                    self._eiger_retire_master(self._eiger_master_path)
-                    self._emit_container_count(self._eiger_master_path,
-                                               self._eiger_nframes,
-                                               authoritative=True)
-                    self._eiger_close_master()
+                    if imageThread._eiger_park_provisional_master(
+                            self, frozen, self._eiger_master_path):
+                        # R4A-5: never retired, never counted.  Retiring it here
+                        # at first sight is what lost a container that changed
+                        # from IN_PROGRESS to complete during the same run, and
+                        # a zero count for a still-writing file is not a fact.
+                        self._eiger_close_master()
+                    else:
+                        self._eiger_retire_master(self._eiger_master_path)
+                        self._emit_container_count(self._eiger_master_path,
+                                                   self._eiger_nframes,
+                                                   authoritative=True)
+                        self._eiger_close_master()
                     if not self._eiger_master_queue:
                         self._eiger_refill_master_queue(frozen)
-                    next_master = self._eiger_pop_next_master(frozen)
+                    next_master = imageThread._eiger_pop_master_with_recheck(
+                        self, frozen)
                     if next_master is None:
                         self._eiger_master_path = None
                         self._eiger_frame_idx = 0
@@ -5316,7 +5450,15 @@ class imageThread(wranglerThread):
                     if self._eiger_nframes == 0:
                         # Imageless container mid-queue: retire-and-advance via
                         # the exhaustion branch, never end the stream (see the
-                        # init-branch note).
+                        # init-branch note).  A PROVISIONAL one is parked there
+                        # instead, so it is not retired and not re-read.
+                        if imageThread._eiger_park_provisional_master(
+                                self, frozen, self._eiger_master_path):
+                            self._eiger_close_master()
+                            self._eiger_master_path = None
+                            self._eiger_frame_idx = 0
+                            self._eiger_nframes = 0
+                            continue
                         self._eiger_close_or_defer_zero_frame_master(frozen)
                         continue
                 else:

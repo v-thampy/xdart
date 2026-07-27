@@ -646,6 +646,15 @@ class SourceCaps:
     has_energy: bool = False
     has_geometry: bool = False
     has_psi_metadata: bool = False
+    #: O-1b R4A-6.  A valid configured source whose discovery is DEFERRED to the
+    #: run (a lazy container directory: nobody has walked or opened anything
+    #: yet).  It is the typed distinction between "proved to have nothing" and
+    #: "not looked yet", and it exists so the capability fields above can stay
+    #: strictly evidence-based while Run eligibility keys on configured-intent
+    #: validity.  A caller must never read this as evidence OF frames -- it is
+    #: the explicit statement that there is no evidence either way.  Defaults
+    #: false, so every existing producer keeps its exact meaning.
+    discovery_deferred: bool = False
 
 
 @dataclass(frozen=True, slots=True)

@@ -431,6 +431,13 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
             pending.clear()
         self._gi_hydration_request_token = None
         self._gi_hydration_open_token = None
+        # O-1b R4A-1(iii): this is the ONLY teardown primitive (the child
+        # closeEvent plus the host's `_invalidate_all_gi_hydration`), so it is
+        # also where "this wrangler is closed" becomes knowable to a value
+        # delivery that carries its own identity and therefore never had a
+        # token to invalidate.  A worker discovery arriving after teardown must
+        # be inert, not merely late.
+        self._gi_hydration_closed = True
         gen = int(getattr(self, "_gi_hydration_generation", 0) or 0) + 1
         self._gi_hydration_generation = gen
         return gen
@@ -579,6 +586,9 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         self._gi_hydration_pending = deque(maxlen=16)
         self._gi_hydration_request_token = None
         self._gi_hydration_open_token = None
+        # Set by `_invalidate_gi_hydration_requests` at teardown; read by the
+        # identity-carrying value deliveries that have no token to invalidate.
+        self._gi_hydration_closed = False
         self.parameters = Parameter.create(
             name='wrangler_widget', type='int', value=0
         )

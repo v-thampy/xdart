@@ -7888,26 +7888,41 @@ class staticWidget(QWidget):
           reports record-truth caps but runs through Reintegrate).
         """
         directory_config = self._controls_v2_container_index_config()
-        directory_intent_ready = bool(
-            directory_config is not None
-            and directory_config[0].is_dir()
-            and (
-                int(frame_count or 0) > 0
-                or bool(directory_config[1])
-                or bool(live_unknown)
-            )
-        )
+        # O-1b R4A-6.  Two different questions, kept apart:
+        #
+        #   directory_configured  -- the operator named a real container
+        #                            directory.  A CONFIGURATION fact.
+        #   counted               -- somebody actually verified frames.  An
+        #                            EVIDENCE fact.
+        #
+        # The parent collapsed them: `directory_intent_ready` was true on
+        # configuration alone (Subdirs on, or live), and then fed
+        # counted/has_frames/has_raw/raw_reachable -- so a directory nobody had
+        # probed reported frames, raw data and reachable raw data.  The
+        # publication gates still failed closed, but every readiness row and
+        # launcher was reading fabricated evidence.  The other half of the same
+        # dishonesty ran the opposite way: with Subdirs OFF and no count, a
+        # perfectly valid configured intent lost `source_ready` and the run
+        # button went dead on a directory the worker would have discovered
+        # happily.  The typed `discovery_deferred` fact is what lets both hold
+        # at once.  This path performs zero recursive discovery and zero
+        # content opens.
+        directory_configured = bool(
+            directory_config is not None and directory_config[0].is_dir())
+        verified_frames = int(frame_count or 0) > 0
+        # Run eligibility comes from configured-intent validity, never from a
+        # fabricated count.
         source_ready = bool(source_label) and (
             bool(live_unknown)
-            or int(frame_count or 0) > 0
-            or directory_intent_ready
+            or verified_frames
+            or directory_configured
         )
+        discovery_deferred = bool(
+            directory_configured and not verified_frames and not live_unknown)
         headless = self._controls_v2_headless_source_caps(
             source_label, live=bool(live_unknown))
-        counted = bool(
-            not live_unknown
-            and (int(frame_count or 0) > 0 or directory_intent_ready)
-        )
+        # Evidence only: a configured directory contributes NO frame count.
+        counted = bool(not live_unknown and verified_frames)
         if live_unknown:
             merged_metadata = bool(has_metadata)
             merged_motors = bool(has_motors)
@@ -7922,13 +7937,13 @@ class staticWidget(QWidget):
             SourceCaps(
                 has_frames=bool(headless.has_frames or counted),
                 has_raw=bool(headless.has_raw or counted),
-                raw_reachable=bool(
-                    headless.raw_reachable or directory_intent_ready),
+                raw_reachable=bool(headless.raw_reachable),
                 has_metadata=merged_metadata,
                 has_motors=merged_motors,
                 has_energy=bool(has_energy),
                 has_geometry=merged_geometry,
                 has_psi_metadata=merged_psi,
+                discovery_deferred=discovery_deferred,
             ),
             source_ready,
         )

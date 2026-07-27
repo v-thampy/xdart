@@ -389,3 +389,232 @@ def test_worker_publishes_at_most_once_per_run_across_containers(tmp_path):
         wrapper.close()
         wrapper.deleteLater()
         app.processEvents()
+
+
+# --------------------------------------------------------------------------- #
+# D3/D4 — the provisional recheck is BOUNDED, rebuilds the reader, and never
+# retires a container it did not consume.
+# --------------------------------------------------------------------------- #
+
+def _batch_dir_thread(watch_dir, out_dir):
+    """A real ``imageThread`` over a directory of .nxs containers, BATCH mode."""
+    from queue import Queue
+
+    from tests.xdart._accepted_run import admitted_worker, directory_source
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
+        imageThread,
+    )
+    from xdart.modules.live import LiveScan
+    from xrd_tools.core.containers import PONI
+
+    scan = LiveScan("scan", data_file=str(out_dir / "scan.nxs"), static=True)
+    worker = imageThread(
+        Queue(), {}, threading.RLock(), "",
+        str(out_dir), "scan", False,
+        PONI(dist=0.2, poni1=0.1, poni2=0.1, wavelength=1e-10),
+        "Image Directory", "", str(watch_dir), False, "nxs", False, None, "",
+        None, "Full", "None", "", "", None, "", "", 1.0, None,
+        False, None, 1, 0.0, "q_total", "qip_qoop", "start", scan,
+        live_mode=False, max_cores=1,
+    )
+    return admitted_worker(
+        worker,
+        batch_mode=True,
+        save_path=str(out_dir),
+        source_spec=directory_source(watch_dir, ext="nxs"))
+
+
+def _unfinalized(path, *, n=2):
+    import h5py
+
+    _write_bluesky_nxwriter(path, n=n)
+    with h5py.File(path, "r+") as handle:
+        del handle["entry/end_time"]
+    return path
+
+
+def _drain(worker, frozen, *, limit=24, timeout=30.0):
+    """Consume ONE generation to end-of-stream, under a deterministic watchdog.
+
+    The consumer runs on its own thread with a bounded join, because the
+    failure this must report -- a reader that spins on an unchanged provisional
+    file -- would otherwise WEDGE the gate instead of failing it.  A wedged gate
+    is not a red.
+    """
+    delivered = []
+    done = threading.Event()
+
+    def consume():
+        try:
+            for _ in range(limit):
+                item = worker.get_next_image(frozen)
+                delivered.append(item)
+                if item[3] is None:
+                    return
+        finally:
+            done.set()
+
+    consumer = threading.Thread(target=consume, name="o1b-r4a-drain",
+                                daemon=True)
+    consumer.start()
+    finished = done.wait(timeout)
+    if not finished:
+        worker.command = 'stop'
+        stop_evt = getattr(worker, '_prefetch_stop_evt', None)
+        if stop_evt is not None:
+            stop_evt.set()
+        consumer.join(timeout=10.0)
+        raise AssertionError(
+            "the directory reader never terminated: it is spinning on a "
+            f"container that never finalized (delivered={len(delivered)})")
+    consumer.join(timeout=10.0)
+    assert delivered and delivered[-1][3] is None, (
+        f"one generation must end with exactly one EOS; got {delivered!r}")
+    return delivered
+
+
+def test_permanently_provisional_container_finishes_without_spinning(tmp_path):
+    """D4.  A container that never finalizes must end the run TRUTHFULLY.
+
+    The recheck is bounded at ONE, so the sweep neither spins on an unchanged
+    file nor reopens it without limit -- and because the container was never
+    consumed it is never recorded as retired, so the next Run picks it up.
+    """
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
+        imageThread,
+    )
+
+    watch = tmp_path / "watch"
+    watch.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
+    growing = _unfinalized(watch / "grow_00001.nxs")
+
+    worker = _batch_dir_thread(watch, out)
+    frozen = worker.run_configuration
+
+    opens = []
+    real_open = worker._eiger_open_master
+
+    def counting_open(frozen_arg, path):
+        opens.append(str(path))
+        return real_open(frozen_arg, path)
+
+    worker._eiger_open_master = counting_open
+    try:
+        delivered = _drain(worker, frozen)
+    finally:
+        worker._prefetch_stop_evt.set()
+        worker._eiger_close_master()
+
+    labels = [item[2] for item in delivered if item[3] is not None]
+    assert labels == [], f"an unfinalized container produced frames: {labels}"
+    assert opens == [str(growing), str(growing)], (
+        "the container must be opened exactly twice -- once in the sweep and "
+        f"once for its single bounded recheck; got {len(opens)} opens")
+    assert str(growing) not in worker._eiger_done_masters, (
+        "a container that was never consumed was recorded as retired, so the "
+        "next Run would skip it")
+    assert imageThread._eiger_provisional_hold(worker, str(growing)) is True
+
+
+def test_end_of_sweep_recheck_rebuilds_the_reader(tmp_path):
+    """The recheck must go back through the normal open/adapter binding.
+
+    A cheap frame-count re-read would look cheaper and then read frames with the
+    stale binding that saw the container provisional -- which is exactly the
+    ``HDF5 file does not contain an Eiger-like structure`` failure the parent
+    produced.  Proving a fresh cursor was BOUND is what makes the delivered
+    frames attributable to a rebuilt reader.
+    """
+    watch = tmp_path / "watch"
+    watch.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
+    growing = _unfinalized(watch / "grow_00001.nxs")
+
+    worker = _batch_dir_thread(watch, out)
+    frozen = worker.run_configuration
+
+    binds = []
+    real_bind = worker._eiger_bind_cursor
+
+    def counting_bind(cursor):
+        binds.append(cursor)
+        return real_bind(cursor)
+
+    worker._eiger_bind_cursor = counting_bind
+
+    real_open = worker._eiger_open_master
+
+    def finalizing_open(frozen_arg, path):
+        result = real_open(frozen_arg, path)
+        if getattr(worker, "_eiger_open_state", None) == "not ready":
+            # The acquisition completes between the sweep and the recheck.
+            _write_bluesky_nxwriter(growing, n=5)
+        return result
+
+    worker._eiger_open_master = finalizing_open
+    try:
+        delivered = _drain(worker, frozen)
+    finally:
+        worker._prefetch_stop_evt.set()
+        worker._eiger_close_master()
+
+    labels = [item[2] for item in delivered if item[3] is not None]
+    assert labels == [1, 2, 3, 4, 5], labels
+    assert len(binds) == 1, (
+        "the finalized container was read without binding a fresh cursor; "
+        f"{len(binds)} bindings")
+    assert delivered[-1][3] is None, "end-of-stream must come last"
+    assert str(growing) in worker._eiger_done_masters, (
+        "a fully drained container must be retired")
+
+
+def test_jit_delivery_after_teardown_is_inert(tmp_path):
+    """A worker discovery that arrives after teardown must be INERT.
+
+    The hydration chain's existing inertness comes from invalidating outstanding
+    TOKENS, and a value delivery carries its own identity instead of a token --
+    so without an explicit closed state it would sail past teardown and touch a
+    wrangler the host has already torn down.
+    """
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
+        GISourceMotorDiscovery,
+    )
+    from tests.xdart._accepted_run import (
+        accepted_run,
+        admitted_worker,
+        directory_source,
+        gi_intent,
+    )
+
+    app, wrapper, raw, output = _jit_rig(tmp_path)
+    worker = wrapper.thread
+    try:
+        frozen = accepted_run(
+            save_path=str(output),
+            source_spec=directory_source(raw, ext="nxs", recursive=True),
+            gi=gi_intent(enabled=True, incidence_motor="halpha"),
+        )
+        admitted_worker(wrapper, frozen=frozen)
+        admitted_worker(worker, frozen=frozen)
+
+        emitted = []
+        wrapper.sigGIMotorOptions.connect(emitted.append)
+
+        # The production teardown owner, not a private poke.
+        wrapper._invalidate_gi_hydration_requests()
+
+        wrapper._on_gi_source_motors(GISourceMotorDiscovery(
+            run_configuration=frozen,
+            source_path=str(raw / "day1" / "scan_0001.nxs"),
+            motors=("hy",), counters=("i0",)))
+        app.processEvents()
+
+        assert emitted == [], "a post-teardown delivery was applied"
+        assert _motor_choices(wrapper.parameters) == ["Manual"]
+    finally:
+        wrapper.close()
+        wrapper.deleteLater()
+        app.processEvents()
