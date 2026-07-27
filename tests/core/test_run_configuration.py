@@ -473,6 +473,18 @@ class _SemanticLieContainer(_TolistOnly):
         return type(self)([999])
 
 
+class _ConstructorLieContainer(_TolistOnly):
+    """Its copy is honest, but reconstruction silently changes the value."""
+
+    def __init__(self, items):
+        self.items = [999]
+
+    def copy(self):
+        copied = object.__new__(type(self))
+        copied.items = list(self.items)
+        return copied
+
+
 class _HashableTolist(_TolistOnly):
     """Hash-sensitive: usable as a mapping key while still mutable."""
 
@@ -522,6 +534,17 @@ def test_clone_candidate_does_not_trust_a_distinct_shallow_copy():
 
 def test_clone_candidate_does_not_trust_a_value_changing_copy():
     value = _SemanticLieContainer([1, 2])
+    intent = RunIntent(run_options={"probe": value})
+
+    copied = intent.clone_candidate().run_options["probe"]
+
+    settled = copied.tolist() if hasattr(copied, "tolist") else copied
+    assert settled == [1, 2]
+
+
+def test_clone_candidate_verifies_reconstructed_value_equivalence():
+    value = object.__new__(_ConstructorLieContainer)
+    value.items = [1, 2]
     intent = RunIntent(run_options={"probe": value})
 
     copied = intent.clone_candidate().run_options["probe"]
