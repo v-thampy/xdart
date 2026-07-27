@@ -28,6 +28,7 @@ from pyqtgraph import Qt
 
 # This module imports
 from xdart.utils import catch_h5py_file as catch
+from .run_config_debug import display_context_transition_log
 
 
 
@@ -1085,6 +1086,12 @@ class fileHandlerThread(Qt.QtCore.QThread):
                 self.sigTaskDone.emit(method_name)
     
     def set_datafile(self):
+        # O-2 diagnostics: capture the target's identity BEFORE the load so the
+        # finish event can state what this call changed.  Read under no lock and
+        # kept to plain strings/ids -- the loop below must not be reordered or
+        # slowed by instrumentation.
+        _before_key = getattr(self.scan, 'name', None)
+        _before_file = getattr(self.scan, 'data_file', None)
         with self.file_lock:
             skip_2d = getattr(self.scan, 'skip_2d', False)
             if getattr(self, 'no_nxs', False):
@@ -1144,6 +1151,23 @@ class fileHandlerThread(Qt.QtCore.QThread):
             if _frames is not None and hasattr(_frames, 'data_file'):
                 _frames.data_file = self.fname
             self.scan.skip_2d = skip_2d  # preserve checkbox state across load
+        # O-2 diagnostics: the browse-load FINISH, emitted on the file thread
+        # with the object the load was applied to.  Paired with the
+        # ``browse_load_start`` record it names the mutation directly: same
+        # target ``object_id``, different scan key / GI / PONI / mask.
+        display_context_transition_log(
+            logger, "browse_load_finish",
+            origin="fileHandlerThread.set_datafile",
+            scan=self.scan, target=self.scan,
+            publication_store=getattr(
+                self, 'diagnostic_publication_store', None),
+            requested_file=str(self.fname),
+            previous_scan_key=(None if _before_key is None
+                               else str(_before_key)),
+            previous_data_file=(None if _before_file is None
+                                else str(_before_file)),
+            no_nxs=bool(getattr(self, 'no_nxs', False)),
+            live_run=bool(getattr(self, 'live_run', False)))
         self.sigNewFile.emit(self.fname)
         self.sigUpdate.emit()
     

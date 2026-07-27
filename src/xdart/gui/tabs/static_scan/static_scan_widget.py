@@ -23,6 +23,7 @@ import pyFAI
 from .browse_debug import browse_debug_enabled, browse_debug_log, sequence_summary
 from .run_config_debug import (
     bump_run_config_debug_generation,
+    display_context_transition_log,
     run_config_debug_log,
 )
 
@@ -13236,6 +13237,13 @@ class staticWidget(QWidget):
                     self.displayframe, "display_generation", None),
                 reason="pause",
             )
+        # O-2 diagnostics: the acquisition context at the moment browsing
+        # becomes legal.  Every later browse/resume event is read against this
+        # one, so it is emitted AFTER the pause work — it must describe the
+        # state a browse will actually meet, not the state it replaced.
+        display_context_transition_log(
+            logger, "pause", widget=self, origin="_on_run_paused",
+            target=getattr(self, "_x1_run_scan_capture", None))
 
     def _on_run_resuming(self):
         """Resume (Phase B): RE-ENGAGE the freeze guard BEFORE the worker flips
@@ -13261,6 +13269,12 @@ class staticWidget(QWidget):
         if callable(_resume):
             _resume(scan_identity_key(
                 getattr(self, "_x1_run_scan_capture", None)))
+        # O-2 diagnostics: what the run is resuming INTO.  Compared against the
+        # pause event, this is where a mutated singleton shows up as an
+        # acquisition role whose scan key / GI / PONI moved while paused.
+        display_context_transition_log(
+            logger, "resume", widget=self, origin="_on_run_resuming",
+            target=getattr(self, "_x1_run_scan_capture", None))
 
     def update_all(self, idx=None):
         """Updates all data in displays.
@@ -13670,6 +13684,15 @@ class staticWidget(QWidget):
         _scan_info_rows alongside the index is required — otherwise a late new_scan
         (or this call) would strand the new scan's undrained frames.
         """
+        # O-2 diagnostics: emitted BEFORE the destructive clears, so the record
+        # states which publication store (owner + generation + count) is about
+        # to be discarded and under whose identity.  Emitted after the clear it
+        # could only describe the loss, never attribute it — and the resume
+        # boundary's ``publication_store.clear()`` is exactly the decision the
+        # R4-D stock-take could not see.
+        display_context_transition_log(
+            logger, "rescope", widget=self, origin="_rescope_frame_panel_to",
+            target=self.scan, incoming_scan_name=str(name))
         self.scan.name = name
         # Wire the viewer to THIS scan's output HERE (driven by the frame stream),
         # NOT from the new_scan signal — set_file queues an async set_datafile that

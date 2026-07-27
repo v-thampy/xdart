@@ -36,6 +36,8 @@ from typing import Any
 
 from xrd_tools.session import FrameProjection, project_frame
 
+from .run_config_debug import fail_closed_rejection_log
+
 logger = logging.getLogger(__name__)
 
 DISPLAY_PURPOSE = "display"
@@ -211,6 +213,22 @@ class _PublicationBackedStoreView:
     def _publication(self, label):
         publication = self._publication_store.get(label)
         if not publication_serves_scan(publication, self._scan_key):
+            # FAIL-CLOSED REJECTION (O-2): a retained publication for THIS label
+            # belongs to another scan, so the projection reports the frame
+            # absent and the panels blank.  Before this the decision was
+            # invisible -- a blanked panel and a frame that simply had not
+            # arrived looked identical in every log.
+            fail_closed_rejection_log(
+                logger, "publication_owner_mismatch",
+                reason=("retained publication does not belong to the requested "
+                        "display scan"),
+                expected=self._scan_key,
+                found=(None if publication is None
+                       else getattr(publication, "scan_key", None)
+                       or getattr(publication, "source_identity", None)),
+                origin="_PublicationBackedStoreView._publication",
+                label=label,
+                publication_present=publication is not None)
             return None
         return publication
 
@@ -297,6 +315,15 @@ class FrameProjectionAdapter:
         """
         if request.generation < self._latest_generation:
             # Superseded: a newer selection/generation has already been pinned.
+            fail_closed_rejection_log(
+                logger, "projection_superseded",
+                reason="request generation is older than the pinned generation",
+                expected=self._latest_generation,
+                found=request.generation,
+                origin="FrameProjectionAdapter.project",
+                scan_key=request.scan_key,
+                label=request.frame_index,
+                purpose=request.purpose)
             return None
 
         key = (
@@ -366,9 +393,32 @@ class FrameProjectionAdapter:
                 record_store, request.scan_key):
             return record_store
         publication_store = _call_provider(self._publication_store_provider)
+        if record_store is not None:
+            # FAIL-CLOSED REJECTION (O-2): the attached record store declares a
+            # different scan, so it is skipped.  ``outcome`` distinguishes a
+            # fall-through (the browsed scan's publications may still serve)
+            # from a genuine blank, because only the second one empties panels.
+            fail_closed_rejection_log(
+                logger, "record_store_owner_mismatch",
+                reason="attached record store declares a different scan",
+                expected=request.scan_key,
+                found=getattr(record_store, STORE_SCAN_KEY_ATTR, None),
+                origin="FrameProjectionAdapter._resolve_store",
+                label=request.frame_index,
+                generation=request.generation,
+                outcome=("fallthrough_to_publication_store"
+                         if publication_store is not None else "no_store"))
         if publication_store is not None:
             return _PublicationBackedStoreView(
                 publication_store, scan_key=request.scan_key)
+        fail_closed_rejection_log(
+            logger, "projection_store_absent",
+            reason="no record surface owns the requested display scan",
+            expected=request.scan_key,
+            found=None,
+            origin="FrameProjectionAdapter._resolve_store",
+            label=request.frame_index,
+            generation=request.generation)
         return None
 
     def _resolve_metadata_provider(self):

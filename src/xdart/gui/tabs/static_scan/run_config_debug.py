@@ -4,6 +4,21 @@
 R4-D diagnostics deliberately inspect every mutable carrier involved in a run
 boundary.  They are gated by ``XDART_RUN_CONFIG_DEBUG`` so the normal GUI does
 not traverse Qt widgets, parameter trees, or scan state for logging.
+
+O-2 adds the two decisions the R4-D stock-take found uninstrumented, on THIS
+channel (one gate, one owner — a second diagnostics owner is forbidden):
+
+* :func:`display_context_transition_log` — the ownership snapshot at each of the
+  five display-context boundaries (:data:`DISPLAY_CONTEXT_PHASES`).  It carries
+  the TARGET-object identity, so a trace shows directly whether a browse builds
+  its own scan or repoints the acquisition singleton.
+* :func:`fail_closed_rejection_log` — every context-qualified projection or
+  availability rejection that blanks a panel, with the reason and the expected
+  versus found owner identity.  Before this, a blank panel was silent.
+
+Both emit identity only: object ids, keys, paths, shapes, dtypes, counts and
+generations.  No array, no live Qt object, and no unbounded sequence is ever
+serialized, so the channel stays safe to leave on for a whole beamline session.
 """
 
 from __future__ import annotations
@@ -309,3 +324,247 @@ def run_config_debug_log(
     if not callable(log):
         log = logger.info
     log(message)
+
+
+# --------------------------------------------------------------------------- #
+# O-2: display-context transitions and fail-closed rejections
+# --------------------------------------------------------------------------- #
+
+#: The five boundaries a display context can move across.  ``rescope`` is the
+#: frame-driven scan-boundary reset (the site that clears the publication
+#: store), not a user gesture.
+DISPLAY_CONTEXT_PHASES = (
+    "pause",
+    "browse_load_start",
+    "browse_load_finish",
+    "resume",
+    "rescope",
+)
+
+#: Attribute a live run's ``FrameRecordStore`` carries to declare its scan.
+#: Duplicated from ``frame_projection_adapter.STORE_SCAN_KEY_ATTR`` so this
+#: module stays import-free of the GUI display stack (it is imported by the
+#: worker-side ``scan_threads`` too).
+_STORE_SCAN_KEY_ATTR = "_xdart_scan_key"
+
+#: Diagnostic-only event names, so a trace consumer can filter without
+#: string-matching prose.
+DISPLAY_CONTEXT_TRANSITION_EVENT = "display_context_transition"
+FAIL_CLOSED_REJECTION_EVENT = "fail_closed_rejection"
+
+
+def _owner_identity(value) -> str:
+    """One short, comparable spelling of an ownership key.
+
+    Never raises and never returns a live object: a rejection record has to be
+    readable next to another record's owner, and nothing more.
+    """
+    if value is None:
+        return ""
+    try:
+        return str(value)
+    except Exception:
+        return "<unprintable>"
+
+
+def _store_identity(store, kind: str) -> dict:
+    """Identity, declared owner and generation of one frame store.
+
+    Counts are read through ``len`` only — the records themselves are never
+    touched, so this cannot hydrate anything or serialize a payload.
+    """
+    if store is None:
+        return {"kind": kind, "present": False}
+    items = _safe_attr(store, "_items")
+    if items is None:
+        items = _safe_attr(store, "_records")
+    try:
+        count = len(items) if items is not None else None
+    except Exception:
+        count = None
+    return {
+        "kind": kind,
+        "present": True,
+        "object_id": hex(id(store)),
+        "type": type(store).__name__,
+        "owner": _owner_identity(_safe_attr(store, _STORE_SCAN_KEY_ATTR)),
+        "generation": _safe_attr(store, "generation"),
+        "count": count,
+    }
+
+
+def _context_scan_identity(scan, role: str) -> dict:
+    """The ownership facts one scan object carries at a context boundary.
+
+    This is deliberately NARROWER than :func:`_scan_summary`: it is the set a
+    reviewer needs to answer "is this the same owner as the previous event, and
+    does it still hold its own calibration?" — object identity, canonical key,
+    file path, GI identity, and the PONI/mask identities (never their arrays).
+    """
+    if scan is None:
+        return {"role": role, "present": False}
+    a1 = dict(_safe_attr(scan, "bai_1d_args", {}) or {})
+    a2 = dict(_safe_attr(scan, "bai_2d_args", {}) or {})
+    return {
+        "role": role,
+        "present": True,
+        "object_id": hex(id(scan)),
+        "scan_key": _owner_identity(_scan_key(scan)),
+        "name": _safe_attr(scan, "name"),
+        "data_file": _path_identity(_safe_attr(scan, "data_file")),
+        "gi": {
+            "enabled": bool(_safe_attr(scan, "gi", False)),
+            "incidence_motor": _safe_attr(scan, "incidence_motor"),
+            "sample_orientation": _safe_attr(scan, "sample_orientation"),
+            "tilt_angle": _safe_attr(scan, "tilt_angle"),
+            "gi_mode_1d": a1.get("gi_mode_1d"),
+            "gi_mode_2d": a2.get("gi_mode_2d"),
+        },
+        "poni": _object_identity(_safe_attr(scan, "_cached_poni")),
+        "global_mask": _object_identity(_safe_attr(scan, "global_mask")),
+        "cached_data_mask": _object_identity(
+            _safe_attr(scan, "_cached_data_mask")),
+    }
+
+
+def display_context_summary(
+    widget=None,
+    *,
+    target=None,
+    scan=None,
+    record_store=None,
+    publication_store=None,
+) -> dict:
+    """Bounded ownership snapshot for one display-context transition.
+
+    ``target`` is the object the transition is about to write to (the file
+    thread's scan on a browse load, for instance).  Logging it beside the
+    acquisition/display/viewer roles is the whole point: when one ``object_id``
+    appears under every role, the trace has recorded a singleton mutation
+    rather than a context switch.
+
+    Tolerates ``widget=None`` so the browse chain — the viewer and the file
+    thread, neither of which owns the static widget — emits the same shape;
+    those callers pass their own ``scan``/``target``/store handles instead.
+    """
+    display = _safe_attr(widget, "displayframe")
+    viewer = _safe_attr(widget, "h5viewer")
+    acquisition = _safe_attr(widget, "_x1_run_scan_capture")
+    if record_store is None:
+        record_store = _safe_attr(widget, "_frame_record_store")
+    if record_store is None:
+        thread = _safe_attr(_safe_attr(widget, "wrangler"), "thread")
+        record_store = _safe_attr(thread, "_streaming_record_store")
+    if publication_store is None:
+        publication_store = _safe_attr(widget, "publication_store")
+    if publication_store is None:
+        publication_store = _safe_attr(display, "publication_store")
+    return {
+        "run_active": bool(_safe_attr(widget, "_run_active", False)),
+        "run_generation": _safe_attr(
+            widget, "_run_config_debug_run_generation"),
+        "config_generation": _safe_attr(
+            widget, "_run_config_debug_config_generation"),
+        "runend_generation": _safe_attr(widget, "_runend_generation"),
+        "display_generation": _safe_attr(display, "display_generation"),
+        "load_generation": _safe_attr(viewer, "_load_generation"),
+        "acquisition": _context_scan_identity(acquisition, "acquisition"),
+        "shared": _context_scan_identity(
+            scan if scan is not None else _safe_attr(widget, "scan"), "shared"),
+        "display_scan": _context_scan_identity(
+            _safe_attr(display, "scan"), "display"),
+        "viewer_scan": _context_scan_identity(
+            _safe_attr(viewer, "scan"), "viewer"),
+        "target": _context_scan_identity(target, "target"),
+        "record_store": _store_identity(record_store, "frame_record_store"),
+        "publication_store": _store_identity(
+            publication_store, "publication_store"),
+    }
+
+
+def display_context_transition_log(
+    logger,
+    phase: str,
+    *,
+    widget=None,
+    origin: str = "",
+    target=None,
+    scan=None,
+    record_store=None,
+    publication_store=None,
+    level: str = "info",
+    **fields,
+) -> None:
+    """Record one DISPLAY-CONTEXT-TRANSITION on the run-config channel.
+
+    ``phase`` is one of :data:`DISPLAY_CONTEXT_PHASES`.  Emitting an unknown
+    phase is not an error (a diagnostic must never break a boundary), but it is
+    flagged in the payload so a malformed trace is visible rather than silent.
+    """
+    if not run_config_debug_enabled():
+        return
+    try:
+        payload = {
+            "phase": str(phase),
+            "phase_known": str(phase) in DISPLAY_CONTEXT_PHASES,
+            "context": display_context_summary(
+                widget, target=target, scan=scan,
+                record_store=record_store,
+                publication_store=publication_store),
+        }
+        payload.update(fields)
+        run_config_debug_log(
+            logger,
+            DISPLAY_CONTEXT_TRANSITION_EVENT,
+            widget=widget,
+            origin=origin,
+            level=level,
+            **payload,
+        )
+    except Exception:
+        # A boundary must survive its own instrumentation.
+        pass
+
+
+def fail_closed_rejection_log(
+    logger,
+    decision: str,
+    *,
+    reason: str,
+    expected=None,
+    found=None,
+    origin: str = "",
+    level: str = "info",
+    **fields,
+) -> None:
+    """Record one FAIL-CLOSED REJECTION that blanks (or withholds) a panel.
+
+    ``decision`` names the gate (``record_store_owner_mismatch``,
+    ``publication_owner_mismatch``, ``projection_superseded``,
+    ``projection_store_absent``, ``capability_forces_clear``); ``expected`` and
+    ``found`` are the owner identities the gate compared.  Deliberately does NOT
+    take a widget: these fire inside per-frame lookup paths, so the record stays
+    a flat identity tuple with no traversal behind it.
+    """
+    if not run_config_debug_enabled():
+        return
+    try:
+        payload = {
+            "event": FAIL_CLOSED_REJECTION_EVENT,
+            "decision": str(decision),
+            "reason": str(reason),
+            "expected_owner": _owner_identity(expected),
+            "found_owner": _owner_identity(found),
+            "origin": origin,
+            "t": round(time.monotonic(), 6),
+        }
+        payload.update(
+            {str(key): _jsonable(val) for key, val in fields.items()})
+        message = "RUN_CONFIG_DEBUG " + json.dumps(
+            payload, sort_keys=True, separators=(",", ":"))
+        log = getattr(logger, level, None)
+        if not callable(log):
+            log = logger.info
+        log(message)
+    except Exception:
+        pass

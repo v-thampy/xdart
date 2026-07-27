@@ -82,6 +82,10 @@ from .browse_debug import (
     image_payload_summary,
     sequence_summary,
 )
+from .run_config_debug import (
+    fail_closed_rejection_log,
+    run_config_debug_enabled,
+)
 from .display_overlay_utils import (
     current_scan_key as overlay_current_scan_key,
     current_axis_info as overlay_current_axis_info,
@@ -2533,6 +2537,41 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         return capability is not None and getattr(capability, "state", None) in (
             CapabilityState.UNAVAILABLE, CapabilityState.ERROR)
 
+    def _log_capability_force_clear(self, state, role):
+        """FAIL-CLOSED REJECTION (O-2), availability half.
+
+        Emitted at the render site rather than inside
+        :meth:`_capability_forces_clear` so the record can name the display
+        scan the panel was being blanked FOR — the predicate is a static
+        two-argument rule with no owner in scope, and it must stay one.
+
+        Gated up front: this sits on the per-role render path, and resolving the
+        panel plan and the current scan key is real work that the disabled
+        channel must not pay for.
+        """
+        if not run_config_debug_enabled():
+            return
+        try:
+            panel_of = getattr(state, "panel", None)
+            panel = panel_of(role) if callable(panel_of) else None
+            capability = getattr(panel, "capability", None)
+            try:
+                expected = overlay_current_scan_key(self)
+            except Exception:
+                expected = None
+            fail_closed_rejection_log(
+                logger, "capability_forces_clear",
+                reason="selected frame capability is UNAVAILABLE or ERROR",
+                expected=expected,
+                found=getattr(capability, "identity", None),
+                origin="displayFrameWidget._render_display",
+                role=getattr(role, "value", str(role)),
+                generation=getattr(state, "generation", None),
+                capability_state=str(getattr(capability, "state", None)))
+        except Exception:
+            logger.debug("capability force-clear diagnostic failed",
+                         exc_info=True)
+
     def _payload_for_role(self, role, payload):
         if payload is None:
             return None
@@ -3532,6 +3571,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 # must NEVER retain a stale image for a selected frame whose
                 # OWN typed fact is UNAVAILABLE/ERROR — never-stale beats
                 # persistence.  (A PENDING fact keeps the persist behavior.)
+                displayFrameWidget._log_capability_force_clear(
+                    self, state, role)
                 clear = {
                     PanelRole.RAW_2D: self.clear_image_view,
                     PanelRole.CAKE_2D: self.clear_binned_view,

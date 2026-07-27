@@ -87,6 +87,7 @@ from .browse_debug import (
     sequence_summary,
     widget_selection_summary,
 )
+from .run_config_debug import display_context_transition_log
 from .display_logic import xye_unit_from_filename
 from .display_controllers import ImageViewerController
 from xrd_tools.io import ImageSourceKind
@@ -884,6 +885,11 @@ class H5Viewer(QWidget):
                                              frame_ids=self.frame_ids,
                                              frames=self.frames,
                                              data_lock=self.data_lock)
+        # O-2 diagnostics only: the file thread emits the browse-load FINISH
+        # event and would otherwise be unable to report which publication store
+        # the load landed beside.  Read exclusively by
+        # ``display_context_transition_log``; the thread never touches it.
+        self.file_thread.diagnostic_publication_store = self.publication_store
         self.file_thread.sigTaskDone.connect(self.thread_finished)
         self.file_thread.sigNewFile.connect(self.sigNewFile.emit)
         self.file_thread.sigUpdate.connect(self._emit_file_thread_update)
@@ -2748,6 +2754,22 @@ class H5Viewer(QWidget):
                 self._remember_displayed_frames()
                 # self.set_open_enabled(False)
                 self.file_thread.fname = fname
+                # O-2 diagnostics: the browse-load START, recorded with the
+                # object the load is about to be applied to.  ``target`` is the
+                # FILE THREAD's scan; when its ``object_id`` equals the viewer's
+                # (and the acquisition's), the trace has caught the load
+                # repointing the shared singleton rather than a browse-owned
+                # scan.  The static widget is not reachable from here, so the
+                # viewer passes its own scan and store handles.
+                display_context_transition_log(
+                    logger, "browse_load_start", origin="H5Viewer.set_file",
+                    scan=self.scan,
+                    target=getattr(self.file_thread, "scan", None),
+                    publication_store=getattr(self, "publication_store", None),
+                    requested_file=str(fname),
+                    internal=bool(internal),
+                    run_writing=bool(getattr(self, "_run_writing", False)),
+                    live_run=bool(getattr(self.file_thread, "live_run", False)))
                 self._ensure_file_thread_running()
                 self.file_thread.queue.put("set_datafile")
                 self.ui.listData.itemSelectionChanged.connect(self.data_changed)
