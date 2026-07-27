@@ -20,7 +20,6 @@ from pathlib import Path
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from itertools import islice
 
 logger = logging.getLogger(__name__)
 
@@ -4484,44 +4483,43 @@ class imageThread(wranglerThread):
         while pending_dirs:
             current = pending_dirs.pop()
             child_dirs = []
+            # O-1b R4A-4: complete this directory's NAME-only listing and sort it
+            # GLOBALLY before any content work.  Sorting each 64-entry scandir
+            # batch in isolation lost `scan_2`-before-`scan_10` in every
+            # directory wider than one batch, so a wide directory processed
+            # `scan_100` first.  Name listing is cheap and stays inside the lazy
+            # contract (the plan's R4A-4 clause); consumption below is still one
+            # token per entry, so the caller's discovery budget is unchanged.
             try:
                 with os.scandir(current) as entries:
-                    while True:
-                        batch = list(islice(entries, 64))
-                        if not batch:
-                            break
-                        by_name = {entry.name: entry for entry in batch}
-                        for name in natural_sort_ints(list(by_name)):
-                            entry = by_name[name]
-                            try:
-                                is_dir = entry.is_dir(follow_symlinks=False)
-                                is_file = entry.is_file(follow_symlinks=False)
-                            except OSError:
-                                yield None
-                                continue
-                            if is_dir:
-                                if recursive:
-                                    child_dirs.append(Path(entry.path))
-                                yield None
-                                continue
-                            if not is_file:
-                                yield None
-                                continue
-                            low = str(name).lower()
-                            suffix = next(
-                                (value for value in suffixes
-                                 if low.endswith(value)),
-                                "",
-                            )
-                            if (
-                                suffix
-                                and match(str(name)[:-len(suffix)])
-                            ):
-                                yield Path(entry.path)
-                            else:
-                                yield None
+                    by_name = {entry.name: entry for entry in entries}
             except OSError:
                 continue
+            for name in natural_sort_ints(list(by_name)):
+                entry = by_name[name]
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                    is_file = entry.is_file(follow_symlinks=False)
+                except OSError:
+                    yield None
+                    continue
+                if is_dir:
+                    if recursive:
+                        child_dirs.append(Path(entry.path))
+                    yield None
+                    continue
+                if not is_file:
+                    yield None
+                    continue
+                low = str(name).lower()
+                suffix = next(
+                    (value for value in suffixes if low.endswith(value)),
+                    "",
+                )
+                if suffix and match(str(name)[:-len(suffix)]):
+                    yield Path(entry.path)
+                else:
+                    yield None
             if recursive:
                 pending_dirs.extend(reversed(child_dirs))
 
