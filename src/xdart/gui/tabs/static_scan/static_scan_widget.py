@@ -7911,11 +7911,14 @@ class staticWidget(QWidget):
             directory_config is not None and directory_config[0].is_dir())
         verified_frames = int(frame_count or 0) > 0
         # Run eligibility comes from configured-intent validity, never from a
-        # fabricated count.
+        # fabricated count -- AND never from a source the worker cannot read
+        # (O-1b §54.4 S2: capability truth is not execution eligibility).
         source_ready = bool(source_label) and (
             bool(live_unknown)
-            or verified_frames
-            or directory_configured
+            or (
+                (verified_frames or directory_configured)
+                and self._controls_v2_source_is_executable(source_label)
+            )
         )
         discovery_deferred = bool(
             directory_configured and not verified_frames and not live_unknown)
@@ -7946,6 +7949,74 @@ class staticWidget(QWidget):
                 discovery_deferred=discovery_deferred,
             ),
             source_ready,
+        )
+
+    #: The source families the image worker actually implements a raw-frame
+    #: reader for.  ``SourceKind.SPEC`` is deliberately ABSENT: a SPEC file is a
+    #: real, correctly-described source of scan-table frames and metadata, but
+    #: the worker has no SPEC image reader, so it is not something a fresh Run
+    #: can execute.  This is the reader contract stated once, not a second
+    #: extension table -- which filename each reader claims is answered by the
+    #: `xrd_tools.sources` adapter registry.
+    _EXECUTABLE_SOURCE_KINDS = frozenset({
+        "image_file", "tiff_series", "nexus_stack", "eiger_master",
+        "processed_nexus",
+    })
+
+    def _controls_v2_source_is_executable(self, source_label: str) -> bool:
+        """Whether *source_label* has an accepted raw-frame reader.
+
+        O-1b §54.4 S2.  ``describe_source_readiness`` correctly reports that an
+        extensionless SPEC file contains scan-table frames, metadata, motors and
+        psi columns -- and the panel now agrees with it, which is the whole
+        point of the H18 delegation.  But the Image-Series worker has no reader
+        for that file, so treating "the source describes frames" as "a Run can
+        consume it" set ``RunTarget.SOURCE`` on something unrunnable.
+
+        Eligibility is therefore derived from the accepted source family/reader
+        contract: the registry answers which adapter owns the selected filename,
+        and :data:`_EXECUTABLE_SOURCE_KINDS` says which reader families the
+        worker implements.  Capability truth is untouched; only executability is
+        decided here.
+
+        The question is asked about the SAME path whose capabilities are being
+        described -- the caller's ``source_label`` -- and never about a
+        separately-read parameter.  Reading the Source card here instead would
+        be a second authority that can disagree with the label in hand, which is
+        exactly the kind of split this lane keeps removing.
+
+        A configured Image Directory stays eligible on its own terms: its label
+        IS the directory, its members are discovered by the worker after Run, so
+        there is no selected file to classify (R4A-6).  A SPEC file used as
+        METADATA beside a valid image source is likewise unaffected -- that is
+        ``meta_ext``, not the image selection this reads.
+        """
+        label = str(source_label or "").strip()
+        if not label:
+            return False
+        expanded = Path(label).expanduser()
+        try:
+            if expanded.is_dir():
+                return True
+        except OSError:
+            return False
+        try:
+            # Registers the built-in adapters before consulting the one
+            # precedence owner (same order the worker's pop path uses).
+            import xrd_tools.sources.registry  # noqa: F401
+            from xrd_tools.sources.adapters import candidate_owner
+
+            owner = candidate_owner(expanded)
+        except Exception:
+            logger.debug("source executability lookup failed for %s",
+                         label, exc_info=True)
+            return False
+        if owner is None:
+            # No accepted reader claims this filename at all.
+            return False
+        return any(
+            str(getattr(kind, "value", kind)) in self._EXECUTABLE_SOURCE_KINDS
+            for kind in getattr(owner, "kinds", ())
         )
 
     def _controls_v2_headless_source_caps(
