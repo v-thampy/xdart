@@ -15,6 +15,13 @@ from __future__ import annotations
 from typing import Any
 
 
+_ADMISSION_FIELDS = frozenset({
+    "run_configuration",
+    "_admitted_run_configuration",
+    "run_configuration_floor",
+})
+
+
 def accepted_run(**fields: Any):
     """One frozen run configuration, from the production freeze owner."""
     from xrd_tools.session import RunIntent
@@ -116,6 +123,12 @@ def admitted_worker(target=None, /, *, frozen=None, **fields):
         wranglerWidget,
     )
 
+    reserved = sorted(_ADMISSION_FIELDS.intersection(fields))
+    if reserved:
+        raise TypeError(
+            "admitted_worker owns admission fields: "
+            + ", ".join(reserved)
+        )
     if frozen is None:
         frozen = accepted_run(**fields)
     elif fields:

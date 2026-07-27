@@ -9764,9 +9764,10 @@ def test_batch_process_scan_dispatches_each_frame_as_read():
     # always published one, so arm this host with a REAL frozen configuration
     # from the production freeze owner; the case still measures what it was
     # written for.
+    from tests.xdart._accepted_run import admitted_worker
     from xrd_tools.core.scan import SourceKind, SourceSpec
     from xrd_tools.session import RunIntent as _W1R_RunIntent
-    host.run_configuration = _W1R_RunIntent(
+    frozen = _W1R_RunIntent(
         processing_mode="Int 2D",
         batch_mode=True,
         live_mode=False,
@@ -9774,8 +9775,8 @@ def test_batch_process_scan_dispatches_each_frame_as_read():
             '/tmp', SourceKind.TIFF_SERIES,
             options={"selected_file": '/tmp/scan_a_0001.tif'}),
     ).freeze()
-    host._admitted_run_configuration = host.run_configuration
-    MethodType(imageThread.process_scan, host)(host.run_configuration)
+    admitted_worker(host, frozen=frozen)
+    MethodType(imageThread.process_scan, host)(frozen)
 
     assert dispatched == [((1,), False), ((2,), False), ((0,), False)]
     assert final_updates == [-1]
@@ -9877,9 +9878,10 @@ def test_live_directory_idle_flushes_last_scan_xye_before_stop(
     # always published one, so arm this host with a REAL frozen configuration
     # from the production freeze owner; the case still measures what it was
     # written for.
+    from tests.xdart._accepted_run import admitted_worker
     from xrd_tools.core.scan import SourceKind, SourceSpec
     from xrd_tools.session import RunIntent as _W1R_RunIntent
-    host.run_configuration = _W1R_RunIntent(
+    frozen = _W1R_RunIntent(
         processing_mode="Int 2D",
         batch_mode=False,
         live_mode=True,
@@ -9887,8 +9889,8 @@ def test_live_directory_idle_flushes_last_scan_xye_before_stop(
             '/tmp', SourceKind.TIFF_SERIES,
             options={"selected_file": '/tmp/last_scan.nxs'}),
     ).freeze()
-    host._admitted_run_configuration = host.run_configuration
-    MethodType(imageThread.process_scan, host)(host.run_configuration)
+    admitted_worker(host, frozen=frozen)
+    MethodType(imageThread.process_scan, host)(frozen)
 
     assert idle_observations == [True]
     assert xye_dir.is_dir()

@@ -179,6 +179,11 @@ def derive_worker_alias_attributes(src_root: Path):
         # so resolve `builder = imageThread` before reading constructions.
         class_aliases = set(WORKER_CLASSES)
         for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for imported in node.names:
+                    if imported.name in WORKER_CLASSES:
+                        class_aliases.add(imported.asname or imported.name)
+        for node in ast.walk(tree):
             if (isinstance(node, ast.Assign) and len(node.targets) == 1
                     and isinstance(node.targets[0], ast.Name)
                     and isinstance(node.value, ast.Name)

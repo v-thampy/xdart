@@ -117,9 +117,11 @@ def test_worker_callbacks_receive_policy_at_handoff():
     derived = derive_callback_handoffs(_SRC)
     assert derived, "no worker hands a bound method to a thread any more"
 
-    undeclared = sorted(set(derived) - set(DECLARED_CALLBACKS))
-    assert undeclared == [], (
-        f"callback handoffs missing from the inventory: {undeclared}")
+    assert set(derived) == set(DECLARED_CALLBACKS), (
+        "callback inventory drift: "
+        f"derived-only={sorted(set(derived) - set(DECLARED_CALLBACKS))}, "
+        f"declared-only={sorted(set(DECLARED_CALLBACKS) - set(derived))}"
+    )
 
     for name, handoff in derived.items():
         entry = DECLARED_CALLBACKS[name]
@@ -178,6 +180,19 @@ class Host:
         self.aliased_slot = builder()
 ''')
     assert "aliased_slot" in derive_worker_alias_attributes(root)
+
+
+def test_derivation_catches_an_import_aliased_worker_constructor(tmp_path):
+    """An ``ImportFrom`` alias is still the same bounded worker constructor."""
+    root = _derive_from(tmp_path, '''
+from package import imageThread as Builder
+
+
+class Host:
+    def __init__(self):
+        self.import_aliased_slot = Builder()
+''')
+    assert "import_aliased_slot" in derive_worker_alias_attributes(root)
 
 
 def test_derivation_catches_a_worker_handed_via_a_local_self_alias(tmp_path):
