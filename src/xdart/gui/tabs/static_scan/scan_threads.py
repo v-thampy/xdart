@@ -7,6 +7,7 @@
 import logging
 import os
 import time
+from dataclasses import dataclass
 from queue import Queue
 from threading import Condition, RLock
 import traceback
@@ -1020,6 +1021,28 @@ class stitchThread(Qt.QtCore.QThread):
             self.errorSig.emit(str(e))
 
 
+@dataclass(frozen=True, slots=True)
+class FileTask:
+    """One queued file-thread task, and the diagnostic operation that IS it.
+
+    O-2.2R (review §65.3).  The browse-load diagnostic operation used to live in
+    a parallel structure on the viewer, consumed FIFO at completion.  That can
+    only stay aligned with this thread's queue while it never overflows, and the
+    queue is unbounded: past the side structure's bound the oldest entry was
+    discarded while its task was still waiting, and every later completion was
+    mislabelled.  Carrying the operation INSIDE the task removes the second
+    owner entirely — the correlation cannot desynchronise from a queue it is
+    part of, and its lifetime is exactly the task's.
+
+    Values only: ``method`` is a method name on the thread and ``operation`` is
+    a frozen :class:`~..run_config_debug.DisplayContextOperation` or ``None``.
+    Never a Qt object, scan, store or callback.
+    """
+
+    method: str
+    operation: object | None = None
+
+
 class fileHandlerThread(Qt.QtCore.QThread):
     """Thread class for loading data. Handles locks and waiting for
     locks to be released.
@@ -1027,7 +1050,9 @@ class fileHandlerThread(Qt.QtCore.QThread):
     sigNewFile = Qt.QtCore.Signal(str)
     sigUpdate = Qt.QtCore.Signal()
     sigTaskStarted = Qt.QtCore.Signal()
-    sigTaskDone = Qt.QtCore.Signal(str)
+    # Carries the completed FileTask (or a legacy bare method name), so a
+    # receiver reads the operation off the task that actually finished.
+    sigTaskDone = Qt.QtCore.Signal(object)
     
     def __init__(self, scan, frame, file_lock,
                  parent=None, frame_ids=None, frames=None,
@@ -1064,9 +1089,12 @@ class fileHandlerThread(Qt.QtCore.QThread):
 
     def run(self):
         while True:
-            method_name = self.queue.get()
-            if method_name is None:
+            task = self.queue.get()
+            if task is None:
                 break  # Sentinel: cleanly exit the thread
+            # A legacy bare method name stays accepted for existing callers
+            # (``save_data_as`` here, and duck-typed rigs in the suite).
+            method_name = task.method if isinstance(task, FileTask) else task
             try:
                 self.running = True
                 self.sigTaskStarted.emit()
@@ -1082,7 +1110,10 @@ class fileHandlerThread(Qt.QtCore.QThread):
                 traceback.print_exc()
             finally:
                 self.running = False
-                self.sigTaskDone.emit(method_name)
+                # The SAME envelope, including after a method exception: a
+                # raising task that dropped its own completion would shift every
+                # later one onto the wrong operation.
+                self.sigTaskDone.emit(task)
     
     def set_datafile(self):
         with self.file_lock:

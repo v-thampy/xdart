@@ -2190,3 +2190,284 @@ def test_assertion_dicts_declare_no_duplicate_rows():
         duplicates.extend(
             (node.lineno, key) for key in set(keys) if keys.count(key) > 1)
     assert duplicates == [], f"duplicate assertion keys: {duplicates}"
+
+
+# --------------------------------------------------------------------------- #
+# O-2.2R acceptance (§65.4) — admission proof and task-envelope correlation
+#
+# Two false-greens closed here share one root (§65.3): the diagnostic identity
+# was INFERRED from a parallel carrier instead of travelling with, or being
+# checked against, the production owner.  Rows 1-2 below are the review's own
+# preserved reproducers (§65.1) folded into the committed suite; rows 3-6 pin
+# the task-envelope correlation (§65.2).
+# --------------------------------------------------------------------------- #
+
+def _file_task_method(task):
+    """The method name a queued file task names, envelope or legacy string."""
+    return getattr(task, "method", task)
+
+
+def _file_task_operation(task):
+    """The diagnostic operation carried BY the task, if any."""
+    return getattr(task, "operation", None)
+
+
+def _admission_references(widget):
+    """The four references that together prove a configuration was admitted.
+
+    §65.1: two public carriers and two admission LEDGERS.  Comparing only the
+    carriers cannot tell an admitted object from an equal-valued foreign one,
+    because ``FrozenRunConfiguration`` equality is by content.
+    """
+    wrangler = widget.wrangler
+    worker = wrangler.thread
+    return {
+        "wrapper_carrier": getattr(wrangler, "run_configuration", None),
+        "wrapper_ledger": getattr(
+            wrangler, "_admitted_run_configuration", None),
+        "worker_carrier": getattr(worker, "run_configuration", None),
+        "worker_ledger": getattr(worker, "_admitted_run_configuration", None),
+    }
+
+
+def test_diagnostic_identity_requires_the_admission_ledgers(
+        qapp, acquisition, monkeypatch):
+    """§65.4.1 — an equal-valued FOREIGN carrier is not an admitted one.
+
+    Preserved from the review's own reproducer.  Both public carriers are
+    replaced with a reconstructed configuration whose generation and
+    fingerprint are identical, while both admission ledgers keep the object
+    that actually passed the gate.  Content equality must not be mistaken for
+    admission, and the foreign object's identity must never be published as the
+    accepted one.
+    """
+    monkeypatch.setenv("XDART_RUN_CONFIG_DEBUG", "1")
+    from dataclasses import replace as _replace
+
+    from xdart.gui.tabs.static_scan.run_config_debug import (
+        capture_diagnostic_run_identity,
+    )
+
+    widget, _recorder = acquisition()
+    references = _admission_references(widget)
+    admitted = references["wrapper_ledger"]
+    assert admitted is not None, "the run admitted no configuration"
+    assert all(value is admitted for value in references.values()), (
+        "the fixture did not reach a fully admitted state")
+
+    accepted_generation, accepted_fingerprint = admitted.identity
+    foreign = _replace(admitted)
+    assert foreign is not admitted
+    assert foreign.identity == admitted.identity, (
+        "the foreign object must be content-equal or it proves nothing")
+
+    wrangler, worker = widget.wrangler, widget.wrangler.thread
+    try:
+        wrangler.run_configuration = foreign
+        worker.run_configuration = foreign
+        identity = capture_diagnostic_run_identity(widget)
+        assert identity is not None
+        observed = {
+            "config_consistent": identity.config_consistent,
+            "config_generation": identity.config_generation,
+            "config_fingerprint": identity.config_fingerprint,
+        }
+        assert observed == {
+            "config_consistent": False,
+            "config_generation": accepted_generation,
+            "config_fingerprint": accepted_fingerprint,
+        }
+    finally:
+        wrangler.run_configuration = admitted
+        worker.run_configuration = admitted
+
+
+@pytest.mark.parametrize(
+    "reference",
+    ["wrapper_carrier", "wrapper_ledger", "worker_carrier", "worker_ledger"])
+def test_any_single_admission_reference_divergence_is_inconsistent(
+        qapp, acquisition, monkeypatch, reference):
+    """§65.4.2 — each of the four references alone must break consistency."""
+    monkeypatch.setenv("XDART_RUN_CONFIG_DEBUG", "1")
+    from dataclasses import replace as _replace
+
+    from xdart.gui.tabs.static_scan.run_config_debug import (
+        capture_diagnostic_run_identity,
+    )
+
+    widget, _recorder = acquisition()
+    references = _admission_references(widget)
+    admitted = references["wrapper_ledger"]
+    assert admitted is not None
+    assert capture_diagnostic_run_identity(widget).config_consistent is True, (
+        "the fully admitted baseline must be consistent")
+
+    owner = (widget.wrangler if reference.startswith("wrapper")
+             else widget.wrangler.thread)
+    attribute = ("run_configuration" if reference.endswith("carrier")
+                 else "_admitted_run_configuration")
+    foreign = _replace(admitted)
+    try:
+        setattr(owner, attribute, foreign)
+        identity = capture_diagnostic_run_identity(widget)
+        assert identity.config_consistent is False, (
+            f"a diverged {reference} still reported a consistent admission")
+        # The ACCEPTED identity is still the ledger's, never the foreign one's.
+        if reference != "wrapper_ledger":
+            assert identity.config_generation == admitted.identity[0]
+            assert identity.config_fingerprint == admitted.identity[1]
+    finally:
+        setattr(owner, attribute, admitted)
+
+
+def _queued_file_tasks(monkeypatch, viewer):
+    """Capture what actually reaches the production file-task queue."""
+    queued = []
+    monkeypatch.setattr(viewer, "_ensure_file_thread_running", lambda: None)
+    monkeypatch.setattr(viewer.file_thread.queue, "put", queued.append)
+    return queued
+
+
+def test_every_queued_browse_task_carries_its_own_operation(
+        qapp, monkeypatch, tmp_path, caplog):
+    """§65.4.3 — more queued loads than any side-table bound, still correlated.
+
+    The file worker's queue is unbounded and holds one entry per accepted
+    browse.  A bounded parallel receipt structure therefore cannot stay aligned
+    with it: on overflow the oldest receipt is discarded while its task is
+    still queued, and every later completion is mislabelled.  The operation has
+    to travel INSIDE the task.
+    """
+    monkeypatch.setenv("XDART_RUN_CONFIG_DEBUG", "1")
+    caplog.set_level(logging.INFO)
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        viewer = widget.h5viewer
+        queued = _queued_file_tasks(monkeypatch, viewer)
+        paths = [str(tmp_path / f"scan_{index}.nxs") for index in range(40)]
+        for path in paths:
+            viewer.set_file(path)
+
+        assert len(queued) == len(paths), (
+            f"{len(queued)} of {len(paths)} browse actions reached the queue")
+        operations = [_file_task_operation(task) for task in queued]
+        assert all(op is not None for op in operations), (
+            "a queued browse task carries no operation of its own")
+        assert [_file_task_method(task) for task in queued] == (
+            ["set_datafile"] * len(paths))
+        assert [op.requested_path for op in operations] == paths, (
+            "queued operations are not in one-to-one order with their tasks")
+        assert len({op.token for op in operations}) == len(paths), (
+            "queued operations share tokens")
+        # Nothing may be retained outside the task itself.
+        assert not _pending_browse_receipts(viewer)
+    finally:
+        _teardown(qapp, widget)
+
+
+def test_failed_enqueue_emits_no_start_and_retains_nothing(
+        qapp, monkeypatch, tmp_path, caplog):
+    """§65.4.4 — a refused enqueue must leave no start record and no operation.
+
+    Emitting the start BEFORE the task is accepted advertises a load that never
+    happened and leaves a half-pair in the trace.
+    """
+    monkeypatch.setenv("XDART_RUN_CONFIG_DEBUG", "1")
+    caplog.set_level(logging.INFO)
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        viewer = widget.h5viewer
+        monkeypatch.setattr(viewer, "_ensure_file_thread_running", lambda: None)
+
+        def refusing_put(task):
+            raise RuntimeError("enqueue refused")
+
+        monkeypatch.setattr(viewer.file_thread.queue, "put", refusing_put)
+        caplog.clear()
+        viewer.dirname = str(_B_RESULT.parent)
+        viewer.set_file(str(_B_RESULT))
+        _pump(qapp, 0.3)
+
+        starts = [event for event in _transition_events(caplog)
+                  if event["phase"] == "browse_load_start"]
+        assert starts == [], (
+            "a refused enqueue emitted a browse_load_start with no task behind "
+            "it")
+        assert not _pending_browse_receipts(viewer)
+    finally:
+        _teardown(qapp, widget)
+
+
+def test_task_method_exception_still_completes_its_own_envelope(
+        qapp, monkeypatch, tmp_path, caplog):
+    """§65.4.5 — a failing task completes ITS OWN envelope, not a later one.
+
+    The worker's run loop already survives any task failure; the correlation
+    must survive it too, or one raising load silently re-labels every
+    completion after it.
+    """
+    monkeypatch.setenv("XDART_RUN_CONFIG_DEBUG", "1")
+    caplog.set_level(logging.INFO)
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        viewer = widget.h5viewer
+        completed = []
+        viewer.file_thread.sigTaskDone.connect(completed.append)
+
+        def exploding_set_datafile():
+            raise RuntimeError("deliberate task failure")
+
+        monkeypatch.setattr(
+            viewer.file_thread, "set_datafile", exploding_set_datafile,
+            raising=False)
+        viewer.dirname = str(_B_RESULT.parent)
+        viewer.set_file(str(_B_RESULT))
+        _wait_until(qapp, lambda: bool(completed), _BOUNDARY_TIMEOUT_S,
+                    "the failing task to complete")
+        _pump(qapp, 0.5)
+
+        assert len(completed) == 1
+        operation = _file_task_operation(completed[0])
+        assert operation is not None, (
+            "a failed task completed without its own operation")
+        assert operation.requested_path == str(_B_RESULT)
+        assert _file_task_method(completed[0]) == "set_datafile"
+        assert not _pending_browse_receipts(viewer)
+    finally:
+        _teardown(qapp, widget)
+
+
+def test_shutdown_retains_no_side_receipt_structure(
+        qapp, monkeypatch, tmp_path):
+    """§65.4.6 — after a drain there is no parallel receipt owner left at all.
+
+    The strongest form of "the side table cannot desynchronise" is that there
+    is no side table.
+    """
+    monkeypatch.setenv("XDART_RUN_CONFIG_DEBUG", "1")
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        viewer = widget.h5viewer
+        _browse_load(qapp, widget, _B_RESULT)
+        assert not _pending_browse_receipts(viewer)
+        assert not hasattr(viewer, "_display_context_operations"), (
+            "a parallel receipt queue survives; the operation must travel in "
+            "the task envelope instead")
+        assert not hasattr(viewer, "_display_context_operation")
+        from xdart.gui.tabs.static_scan import h5viewer as h5viewer_module
+        assert not hasattr(h5viewer_module, "_MAX_BROWSE_RECEIPTS"), (
+            "the receipt bound constant survives the correction")
+    finally:
+        _teardown(qapp, widget)
+
+
+def test_file_task_envelope_is_values_only(monkeypatch, tmp_path):
+    """The envelope must not become a smuggling route for live owners."""
+    from xdart.gui.tabs.static_scan.scan_threads import FileTask
+
+    assert getattr(FileTask, "__dataclass_params__").frozen is True
+    task = FileTask(method="set_datafile", operation=None)
+    with pytest.raises(Exception):
+        task.method = "other"
+    assert set(getattr(FileTask, "__dataclass_fields__")) == {
+        "method", "operation"}

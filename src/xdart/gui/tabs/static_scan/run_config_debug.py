@@ -403,16 +403,15 @@ class DiagnosticRunIdentity:
 
     run_generation: int | None = None
     #: The ADMITTED ``FrozenRunConfiguration``'s own generation and content
-    #: fingerprint -- O-2.2 (§63.4 B.1).  The first cut read a debug-only
-    #: counter that nothing ever assigns, so every browse record reported
-    #: ``config_generation=None``: a run-generation tick and a mutable scan
-    #: address are not the accepted configuration.
+    #: fingerprint, read from the wrapper's admission LEDGER -- O-2.2R
+    #: (§65.3.6).  Never read from a public carrier, so a foreign object
+    #: assigned there cannot have its identity published as accepted.
     config_generation: int | None = None
     config_fingerprint: str = ""
-    #: False when the wrangler's carrier and its worker's copy are not the SAME
-    #: object.  Recorded rather than papered over: a diagnostic that invents a
-    #: consistent-looking identity out of a divergence is worse than one that
-    #: reports the divergence.
+    #: True only when all FOUR references -- wrapper carrier, wrapper ledger,
+    #: worker carrier, worker ledger -- are the same object.  Comparing the two
+    #: carriers alone reported an equal-valued foreign configuration as
+    #: consistent, because equality here is by content, not by admission.
     config_consistent: bool = False
     runend_generation: int | None = None
     display_generation: int | None = None
@@ -442,22 +441,33 @@ def capture_diagnostic_run_identity(widget) -> DiagnosticRunIdentity | None:
         display = _safe_attr(widget, "displayframe")
         acquisition = _safe_attr(widget, "_x1_run_scan_capture")
         wrangler = _safe_attr(widget, "wrangler")
-        carrier = _safe_attr(wrangler, "run_configuration")
-        executed = _safe_attr(_safe_attr(wrangler, "thread"),
-                              "run_configuration")
+        worker = _safe_attr(wrangler, "thread")
+        # O-2.2R (§65.3.6): the ADMISSION LEDGER is the authority, and all four
+        # references must be the same object.  ``FrozenRunConfiguration``
+        # equality is by content, so an equal-valued foreign object assigned to
+        # the public carriers is indistinguishable from the admitted one by
+        # value -- only identity against the ledgers proves it passed the gate.
+        accepted = _safe_attr(wrangler, "_admitted_run_configuration")
         config_generation, config_fingerprint = None, ""
-        if carrier is not None:
+        if accepted is not None:
             try:
-                config_generation, config_fingerprint = carrier.identity
+                config_generation, config_fingerprint = accepted.identity
             except Exception:
                 config_generation, config_fingerprint = None, ""
+        # Deliberately published from the LEDGER, never from a carrier: a
+        # foreign carrier must not be able to have its generation/fingerprint
+        # reported as the accepted identity.
+        config_consistent = bool(
+            accepted is not None
+            and _safe_attr(wrangler, "run_configuration") is accepted
+            and _safe_attr(worker, "run_configuration") is accepted
+            and _safe_attr(worker, "_admitted_run_configuration") is accepted)
         return DiagnosticRunIdentity(
             run_generation=_safe_attr(
                 widget, "_run_config_debug_run_generation"),
             config_generation=config_generation,
             config_fingerprint=str(config_fingerprint or ""),
-            config_consistent=bool(
-                carrier is not None and executed is carrier),
+            config_consistent=config_consistent,
             runend_generation=_safe_attr(widget, "_runend_generation"),
             display_generation=_safe_attr(display, "display_generation"),
             run_active=bool(_safe_attr(widget, "_run_active", False)),

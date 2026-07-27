@@ -62,8 +62,6 @@ def _retain_orphaned_load_worker(worker, thread) -> None:
 
 # This module imports
 import re
-from collections import deque
-
 import numpy as np
 
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
@@ -82,7 +80,7 @@ from .viewer_raw_lru import (
     clear_viewer_raw_lru,
     remember_viewer_raw_lru,
 )
-from .scan_threads import fileHandlerThread
+from .scan_threads import FileTask, fileHandlerThread
 from .browse_debug import (
     browse_debug_enabled,
     browse_debug_log,
@@ -519,12 +517,6 @@ class _AccumulatingClickFilter(QtCore.QObject):
         return False
 
 
-#: Bound on outstanding browse-load diagnostic receipts.  The file worker's
-#: queue is short-lived, so this only has to survive a burst of clicks; it
-#: exists so a pathological producer cannot grow the deque without limit.
-_MAX_BROWSE_RECEIPTS = 32
-
-
 class H5Viewer(QWidget):
     """Widget for displaying the contents of an LiveScan object and
     a basic file explorer. Also holds menus for more general tasks like
@@ -608,14 +600,6 @@ class H5Viewer(QWidget):
         self._browser_scan_reset_pending = False
         self._browser_previous_context = None
         self._browser_restore_in_progress = False
-        # O-2.2 diagnostics (§63.4 B.2): browse-load receipts, one per ACTUALLY
-        # ENQUEUED file task, consumed FIFO at completion.  A single scalar
-        # could not survive two loads queued before the first completes -- the
-        # second start overwrote the first receipt, so the first completion
-        # consumed the wrong one and the second consumed none.  Bounded, and
-        # every entry is a frozen values-only record: never a widget, scan,
-        # store or callback.
-        self._display_context_operations = deque(maxlen=_MAX_BROWSE_RECEIPTS)
         # A DETACHED accepted run/config snapshot pushed by the static widget at
         # each of its own context boundaries, so a browse record is
         # generation-qualified without the viewer holding the widget.
@@ -1531,9 +1515,11 @@ class H5Viewer(QWidget):
         # echoes the exact operation minted at the start, so the pair shares one
         # token, requested path, load generation and accepted run/config
         # identity, and it can report the stores the load landed beside.
-        if task == "set_datafile":
-            receipts = getattr(self, "_display_context_operations", None)
-            operation = receipts.popleft() if receipts else None
+        # A legacy bare method name is still accepted (``save_data_as``, and
+        # duck-typed rigs in the suite); it simply carries no operation.
+        method = task.method if isinstance(task, FileTask) else task
+        if method == "set_datafile":
+            operation = task.operation if isinstance(task, FileTask) else None
             if operation is not None and run_config_debug_enabled():
                 display_context_transition_log(
                     logger, "browse_load_finish",
@@ -2823,7 +2809,16 @@ class H5Viewer(QWidget):
                         identity=getattr(
                             self, "diagnostic_run_identity", None),
                         previous_scan=self.scan)
-                    self._display_context_operations.append(operation)
+                # O-2.2R (§65.3): the operation travels INSIDE the task, and the
+                # start is emitted only once that task has actually been
+                # accepted.  A refused enqueue therefore raises to the handler
+                # below having emitted nothing and retained nothing -- there is
+                # no parallel structure left to roll back, because there is no
+                # parallel structure.
+                self._ensure_file_thread_running()
+                self.file_thread.queue.put(
+                    FileTask(method="set_datafile", operation=operation))
+                if operation is not None:
                     display_context_transition_log(
                         logger, "browse_load_start",
                         origin="H5Viewer.set_file",
@@ -2836,19 +2831,6 @@ class H5Viewer(QWidget):
                             getattr(self, "_run_writing", False)),
                         live_run=bool(
                             getattr(self.file_thread, "live_run", False)))
-                try:
-                    self._ensure_file_thread_running()
-                    self.file_thread.queue.put("set_datafile")
-                except Exception:
-                    # The receipt is only valid while a task exists to consume
-                    # it; a refused enqueue must not leave one behind for the
-                    # next unrelated completion to mislabel itself with.
-                    if operation is not None:
-                        try:
-                            self._display_context_operations.remove(operation)
-                        except ValueError:
-                            pass
-                    raise
                 self.ui.listData.itemSelectionChanged.connect(self.data_changed)
                 self.new_scan = True
             except Exception:
