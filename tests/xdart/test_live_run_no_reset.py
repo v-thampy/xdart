@@ -44,7 +44,10 @@ def _fake_scan():
         # The lazy frame series carries its OWN data_file (captured at build).
         frames=SimpleNamespace(data_file="old.nxs"),
     )
-    scan.set_datafile = lambda fname: calls.append(fname)
+    # X1 O-3 (c2): the full-load branch now names the scan through THE
+    # canonical parser, so the double records the (path, name) pair the
+    # production caller actually passes.
+    scan.set_datafile = lambda fname, name=None: calls.append(fname)
     return scan, calls
 
 

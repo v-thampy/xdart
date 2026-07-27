@@ -559,12 +559,22 @@ def _resume_rows(widget, captured, held_labels):
             selected["projection_scan_key"] == a_key
             and bool(getattr(projection, "present", False)),
         # The load-bearing half §63.2 P1-O2.1-4.4 found missing.
+        #
+        # O-3 c2 correction: each row asks for a resident payload AND for that
+        # payload to be A's.  Residency alone was only ever a proxy for
+        # ownership because a browsed scan could not serve a resident tier at
+        # all; once a browse IS fully servable — which O-3 c2 requires — a
+        # retained B projection satisfies residency, and these rows would go
+        # green on exactly the false-green they exist to reject.
         "resumed_raw_is_acquisition_resident_payload":
-            _capability_is_rendered_payload(projection, "raw"),
+            _capability_is_rendered_payload(projection, "raw")
+            and _evidence_names_scan(projection, a_key),
         "resumed_cake_is_acquisition_resident_payload":
-            _capability_is_rendered_payload(projection, "integrated_2d"),
+            _capability_is_rendered_payload(projection, "integrated_2d")
+            and _evidence_names_scan(projection, a_key),
         "resumed_1d_is_acquisition_resident_payload":
-            _capability_is_rendered_payload(projection, "integrated_1d"),
+            _capability_is_rendered_payload(projection, "integrated_1d")
+            and _evidence_names_scan(projection, a_key),
         "resumed_raw_panel_rendered": _panel_has_image(display.image_data),
         "resumed_cake_panel_rendered": _panel_has_image(display.binned_data),
         "resumed_1d_panel_rendered": _panel_has_trace(display.plot_data),
@@ -773,14 +783,6 @@ def _user_browse_pair(caplog, requested_path):
 # 1. A paused browse must render the BROWSED scan (R4T-5's gap)
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "O-2 reproducer (O-3 flips it): a paused browse of the real Rayonix GI "
-        "result cannot serve its own raw, cake or integrated tiers as RESIDENT "
-        "payload — the browse never gets a context of its own"
-    ),
-)
 def test_paused_browse_renders_browsed_scan(qapp, acquisition):
     """Acceptance path 1 — B must be FULLY servable while A is paused.
 
@@ -852,15 +854,6 @@ def test_paused_browse_renders_browsed_scan(qapp, acquisition):
 # 2. Browsing B must leave acquisition A untouched (R4T-6, first half)
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "O-2 reproducer (O-3 flips it): the browse load repoints the CAPTURED "
-        "acquisition scan in place — key, GI, mask, PONI and both BAI argument "
-        "sets move on the object A still owns, and B's publications overwrite "
-        "A's on the colliding labels"
-    ),
-)
 def test_paused_browse_leaves_acquisition_untouched(qapp, acquisition):
     """Acceptance path 2 — nothing A owns may move while B is browsed.
 
@@ -1172,15 +1165,6 @@ def test_same_label_publications_never_cross_serve(qapp, acquisition):
     assert publication_serves_scan(b_publication, a_key) is False
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "O-2 reproducer (O-3 flips it): A and B share frame labels and share "
-        "ONE publication store, so A's captured store no longer serves A's "
-        "publication for a colliding label and the two contexts have no "
-        "distinct stores at all"
-    ),
-)
 def test_same_label_collision_preserves_both_owners(qapp, acquisition):
     """Acceptance path 5a — BOTH owners must hold the shared label at once.
 
@@ -1264,15 +1248,6 @@ def test_canonical_parser_keeps_the_full_dotted_stem(tmp_path):
     assert scan_name_from_source(str(_B_RESULT)) == _B_RESULT.stem
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "O-2 reproducer (O-3 flips it): the browse path names the selected scan "
-        "with set_datafile's first-dot truncation instead of the canonical "
-        "scan_name_from_source, so a dotted stem loses everything after the "
-        "first dot"
-    ),
-)
 def test_browse_load_names_a_dotted_stem_canonically(
         qapp, monkeypatch, tmp_path):
     """Acceptance path 5b — ONE parser must name the browsed scan.
@@ -1912,6 +1887,41 @@ def _pending_browse_receipts(viewer):
     return [] if scalar is None else [scalar]
 
 
+def _display_a_mode_the_record_does_not_hold(widget):
+    """Switch the selected scan to a GI display mode its record lacks.
+
+    O-3 c2 correction.  A blanking record is emitted only when a PLANNED
+    panel's capability is ``UNAVAILABLE``/``ERROR``, and the two rows below
+    used to reach that state by accident: a paused browse could not serve its
+    own tiers, so every panel blanked.  Once the browse is fully servable, that
+    driver is gone — a frame with no publication plans no panels at all, so it
+    reports nothing either.
+
+    This drives the same emitter from the real operator gesture that still
+    produces it: displaying a GI mode the stored record does not contain.  The
+    mode is written where the display actually reads it (the persisted
+    reduction config takes precedence over the scan's own BAI args), so the
+    projection genuinely asks for a mode the record cannot answer.
+    """
+    from xdart.gui.tabs.static_scan.display_frame_widget import (
+        displayFrameWidget,
+    )
+
+    scan = widget.displayframe.scan
+    unheld = {"bai_1d_args": ("gi_mode_1d", "q_oop"),
+              "bai_2d_args": ("gi_mode_2d", "q_chi")}
+    config = displayFrameWidget._display_reduction_config(scan)
+    for args_key, (mode_key, value) in unheld.items():
+        if isinstance(config, dict) and isinstance(config.get(args_key), dict):
+            config[args_key][mode_key] = value
+        args = getattr(scan, args_key, None)
+        if isinstance(args, dict):
+            args[mode_key] = value
+    modes = displayFrameWidget._projection_active_modes(widget.displayframe)
+    assert modes == ("q_oop", "q_chi"), (
+        f"the display did not adopt the unheld GI modes: {modes}")
+
+
 def _drive_capability_blank(qapp, widget, *, processing_active):
     """Render the current selection with the persistence flag set explicitly.
 
@@ -1964,6 +1974,7 @@ def test_capability_blanking_on_the_ordinary_clear_path(
     widget, _recorder = acquisition()
     _browse_load(qapp, widget, _B_RESULT)
     _select_frame_row(qapp, widget, 2)
+    _display_a_mode_the_record_does_not_hold(widget)
 
     caplog.clear()
     _drive_capability_blank(qapp, widget, processing_active=False)
@@ -1986,6 +1997,7 @@ def test_capability_blanking_on_the_persistence_override_path(
     widget, _recorder = acquisition()
     _browse_load(qapp, widget, _B_RESULT)
     _select_frame_row(qapp, widget, 2)
+    _display_a_mode_the_record_does_not_hold(widget)
 
     caplog.clear()
     try:

@@ -494,6 +494,245 @@ def test_the_acquisition_alias_is_gone_and_has_no_replacement(widget):
     assert aliases == [], f"new mutable acquisition aliases: {aliases}"
 
 
+# --------------------------------------------------------------------------- #
+# 4. The paused browse owner (c2), on the real widget
+#
+# The real-file acceptance for "B is servable" lives in
+# ``test_x1_context_split.py``; these rows pin the OWNERSHIP properties that a
+# real-data sequence cannot isolate — that the acquisition object is never
+# passed anywhere, that replacing a browse releases the previous one, and that
+# an admission is by exact identity rather than by arrival.
+# --------------------------------------------------------------------------- #
+
+def _paused_run(widget, monkeypatch):
+    """Put the real widget in the state a paused browse is legal from."""
+    widget._enter_run_state()
+    widget.h5viewer.paused_browse_active = True
+    # The file worker is not started: the queue is inspected directly, so the
+    # task under test is the exact object production enqueued.
+    queued = []
+    monkeypatch.setattr(widget.h5viewer, "_ensure_file_thread_running",
+                        lambda: None)
+    monkeypatch.setattr(widget.h5viewer.file_thread.queue, "put", queued.append)
+    return queued
+
+
+def test_paused_browse_never_hands_over_the_acquisition_scan(
+        widget, monkeypatch, tmp_path):
+    """M1's guard: the browse target is a NEW scan, and A's own load entry
+    points are never called.
+
+    Spies wrap the REAL acquisition ``LiveScan``'s methods rather than replacing
+    the seam under test, so the assertion is about production behaviour and not
+    about a double.
+    """
+    queued = _paused_run(widget, monkeypatch)
+    acquisition = widget._acquisition_context.scan
+    calls = []
+    for name in ("set_datafile", "reset", "load_from_h5"):
+        original = getattr(acquisition, name, None)
+        if callable(original):
+            monkeypatch.setattr(
+                acquisition, name,
+                lambda *a, _n=name, _o=original, **k: (
+                    calls.append(_n), _o(*a, **k))[1],
+                raising=False)
+
+    path = tmp_path / "browsed_result.nxs"
+    context = widget._begin_paused_browse(str(path))
+
+    assert context is not None
+    assert context.scan is not acquisition, (
+        "the browse was handed the acquisition scan itself")
+    assert context.publication_store is not widget.publication_store
+    assert context.scan_key == "browsed_result"
+    assert calls == [], f"the browse called {calls} on the acquisition scan"
+
+    assert len(queued) == 1
+    task = queued[0]
+    from xdart.gui.tabs.static_scan.scan_threads import BrowseLoadTask, FileTask
+
+    assert isinstance(task, BrowseLoadTask) and isinstance(task, FileTask)
+    assert task.method == "load_browse_datafile"
+    assert task.scan is context.scan
+    assert task.fname == str(path)
+    assert task.scan_name == context.scan_key
+    assert task.context_token == context.context_token
+    assert task.load_generation == context.load_generation
+    # The accepted O-2.2R envelope is EXTENDED, never widened.
+    assert set(FileTask.__dataclass_fields__) == {"method", "operation"}
+
+
+def test_replacing_a_browse_releases_the_previous_one(
+        widget, monkeypatch, tmp_path):
+    """One browse at a time; the loser's store is released and it can never be
+    admitted afterwards."""
+    queued = _paused_run(widget, monkeypatch)
+
+    first = widget._begin_paused_browse(str(tmp_path / "first.nxs"))
+    first_store = first.publication_store
+    second = widget._begin_paused_browse(str(tmp_path / "second.nxs"))
+
+    assert widget._browse_context is second
+    assert first.released is True
+    assert first_store.snapshot() == {}
+    assert second.released is False
+    assert first.context_token != second.context_token
+    assert first.load_generation != second.load_generation
+    assert len(queued) == 2
+
+    # The FIRST task completing late must not be admitted, and must not touch
+    # the newer selection.
+    assert widget._on_browse_loaded(queued[0]) is None
+    assert widget._display_selection is None
+    assert widget.displayframe.scan is widget.scan
+
+
+def test_admission_refuses_a_completion_it_does_not_own(
+        widget, monkeypatch, tmp_path):
+    """Exact identity, not arrival order: token, generation and a live run."""
+    from xdart.gui.tabs.static_scan.scan_threads import BrowseLoadTask
+
+    queued = _paused_run(widget, monkeypatch)
+    context = widget._begin_paused_browse(str(tmp_path / "browsed.nxs"))
+    task = queued[0]
+
+    foreign_token = BrowseLoadTask(
+        method="load_browse_datafile", operation=None, scan=context.scan,
+        fname=task.fname, scan_name=task.scan_name,
+        context_token="browse-not-ours", load_generation=task.load_generation)
+    assert widget._on_browse_loaded(foreign_token) is None
+
+    stale_generation = BrowseLoadTask(
+        method="load_browse_datafile", operation=None, scan=context.scan,
+        fname=task.fname, scan_name=task.scan_name,
+        context_token=task.context_token,
+        load_generation=task.load_generation + 1)
+    assert widget._on_browse_loaded(stale_generation) is None
+    assert widget._display_selection is None
+
+    # The exact task IS admitted while the run is paused...
+    assert widget._on_browse_loaded(task) is not None
+    assert widget._display_selection.kind is ContextKind.BROWSE
+    # ...and the same task is refused once the run is no longer active.
+    widget._run_active = False
+    widget._display_selection = None
+    assert widget._on_browse_loaded(task) is None
+
+
+def test_the_swap_moves_every_display_binding(widget, monkeypatch, tmp_path):
+    """M6's guard: a partial swap is a mixed-context render.
+
+    Every field of the frozen binding record must land on BOTH display-side
+    consumers, and the never-swapped owners must not move.
+    """
+    queued = _paused_run(widget, monkeypatch)
+    context = widget._begin_paused_browse(str(tmp_path / "browsed.nxs"))
+    acquisition = widget._acquisition_context
+
+    integrator_scan = widget.integratorTree.scan
+    stitch_scan = widget.stitch_thread.scan
+    file_thread_scan = widget.h5viewer.file_thread.scan
+    widget._on_browse_loaded(queued[0])
+
+    bindings = context.display_bindings()
+    for target in (widget.h5viewer, widget.displayframe):
+        for name in _REQUIRED_BINDINGS:
+            if name == "record_store":
+                continue
+            assert getattr(target, name) is getattr(bindings, name), (
+                f"{type(target).__name__}.{name} was not swapped")
+    assert widget.displayframe.frame_record_store() is None, (
+        "the acquisition record store is still reachable from the browse")
+
+    # Never swapped: the widget's own scan, the workers, the file thread.
+    assert widget.scan is acquisition.scan
+    assert widget.publication_store is acquisition.publication_store
+    assert widget.integratorTree.scan is integrator_scan
+    assert widget.stitch_thread.scan is stitch_scan
+    assert widget.h5viewer.file_thread.scan is file_thread_scan
+
+    # And the selection names the context at the stamped generation.
+    selection = widget._display_selection
+    assert selection.names(context)
+    assert selection.display_generation == \
+        widget.displayframe.display_generation
+    assert widget.displayframe.display_context_token == context.context_token
+
+
+def _publication(label, scan_key, source):
+    """A real publication, so the store lookup under test is a real lookup."""
+    import numpy as np
+    from xdart.modules.frame_publication import publication_from_frame_view
+    from xrd_tools.core import FrameView, IntegrationResult1D
+
+    view = FrameView.from_results(
+        label=label,
+        result_1d=IntegrationResult1D(
+            radial=np.linspace(0.5, 3.5, 4),
+            intensity=np.array([2.0, 4.0, 8.0, 16.0]),
+            sigma=np.ones(4), unit="q_A^-1"),
+        metadata_raw={"i0": 1.0},
+        source_path=source, source_frame_index=label)
+    return publication_from_frame_view(view, scan_key=scan_key)
+
+
+def test_store_first_reads_never_cross_the_selected_context(
+        widget, monkeypatch, tmp_path):
+    """M2's guard: the data tier must resolve BOTH stores from the selection.
+
+    A and B publish the SAME label.  A label-only read — one that resolves the
+    store from the widget instead of from the selection — serves A's frame for
+    B's label, which is the pin/data asymmetry this seam exists to close.
+    """
+    queued = _paused_run(widget, monkeypatch)
+    label = 1
+    widget.publication_store.upsert(
+        _publication(label, "run_a", "/data/run_a.nxs"))
+
+    context = widget._begin_paused_browse(str(tmp_path / "browsed.nxs"))
+    context.publication_store.upsert(
+        _publication(label, context.scan_key, str(tmp_path / "browsed.nxs")))
+    widget._on_browse_loaded(queued[0])
+
+    record_store, publications = widget._display_selected_stores()
+    assert record_store is None
+    assert publications is context.publication_store
+    assert publications is not widget.publication_store
+
+    view = widget.store_first_frame_view(label)
+    assert view is not None
+    assert str(view.source_path).endswith("browsed.nxs"), (
+        "the store-first read served the acquisition's frame for the "
+        "browsed scan's label")
+    # A's own publication is untouched and still its own.
+    assert widget.publication_store.get(label).scan_key == "run_a"
+
+
+def test_a_browse_request_without_a_canonical_name_is_refused(
+        widget, monkeypatch):
+    """Fail closed: no canonical scan name, no context and no queued task."""
+    queued = _paused_run(widget, monkeypatch)
+    assert widget._begin_paused_browse("") is None
+    assert widget._browse_context is None
+    assert queued == []
+
+
+def test_idle_browse_takes_the_legacy_path(widget, monkeypatch, tmp_path):
+    """With no run active the browse owner defers to the legacy seam.
+
+    Idle browsing is deliberately out of scope: it keeps loading into the
+    widget's own scan, and no ``BrowseContext`` is minted for it.
+    """
+    seen = []
+    monkeypatch.setattr(widget.h5viewer, "set_file",
+                        lambda path, **kw: seen.append(path))
+    assert widget._run_active is False
+    widget._begin_paused_browse(str(tmp_path / "idle.nxs"))
+    assert seen == [str(tmp_path / "idle.nxs")]
+    assert widget._browse_context is None
+
+
 def test_only_the_context_owner_constructs_an_acquisition_context():
     """ONE construction site, so a second owner cannot appear by copy-paste."""
     from xdart.gui.tabs.static_scan import static_scan_widget as ssw_module

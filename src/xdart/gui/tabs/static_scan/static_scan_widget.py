@@ -21,10 +21,16 @@ import imageio
 import pyFAI
 
 from .browse_debug import browse_debug_enabled, browse_debug_log, sequence_summary
+from .frame_projection_adapter import STORE_SCAN_KEY_ATTR
 from .run_config_debug import (
+    DECISION_BROWSE_ADMISSION_REFUSED,
+    DECISION_BROWSE_REQUEST_REFUSED,
+    DECISION_RECORD_STORE_SKIPPED,
     bump_run_config_debug_generation,
     capture_diagnostic_run_identity,
     display_context_transition_log,
+    fail_closed_rejection_log,
+    new_display_context_operation,
     run_config_debug_enabled,
     run_config_debug_log,
 )
@@ -262,6 +268,7 @@ from xdart.modules.frame_publication import (
     publication_has_2d_errors,
 )
 from xrd_tools.core import browse_publication_max_items
+from xrd_tools.session.display_logic import SupersedeReason
 from xrd_tools.core.energy import normalize_wavelength_m, wavelength_m_to_energy_eV
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.session.run_configuration import (
@@ -1423,7 +1430,7 @@ from .integrator import (
     Units_dict_inv,
     integratorTree,
 )
-from .scan_threads import stitchThread
+from .scan_threads import BrowseLoadTask, stitchThread
 from .metadata import metadataWidget
 from .wranglers import imageWrangler, nexusWrangler, wranglerWidget
 from .wranglers.image_wrangler import _normalize_meta_ext
@@ -1902,8 +1909,9 @@ class staticWidget(QWidget):
 
     def _publication_frame_view(
             self, idx, mode_1d: str | None, mode_2d: str | None,
-            *, allow_blocking_read: bool = False):
-        store = getattr(self, "publication_store", None)
+            *, allow_blocking_read: bool = False, store=None):
+        if store is None:
+            store = getattr(self, "publication_store", None)
         if store is None:
             return None
         getter = getattr(store, "get_or_hydrate", None) if allow_blocking_read else None
@@ -1928,11 +1936,18 @@ class staticWidget(QWidget):
             self, idx, *, mode_1d: str | None = None,
             mode_2d: str | None = None,
             allow_blocking_read: bool = False):
-        """Return the selected scan frame view from the authoritative stores."""
+        """Return the selected scan frame view from the authoritative stores.
+
+        X1 O-3 (c2): "authoritative" is now qualified by the display SELECTION.
+        The parent resolved the record store from the run and the publication
+        store from the widget attribute, so a paused browse asked the
+        acquisition's store for B's frame and, worse, fired B's hydration
+        requests into A's store.  Both stores come from one resolver here.
+        """
         key = self._coerce_frame_label(idx)
         mode_1d, mode_2d = self._active_frame_record_modes(mode_1d, mode_2d)
 
-        store = self._active_frame_record_store()
+        store, publications = staticWidget._display_selected_stores(self)
         if store is not None:
             try:
                 record = (
@@ -1958,8 +1973,9 @@ class staticWidget(QWidget):
                         logger.debug("record_store projection missed for %s", key,
                                      exc_info=True)
 
-        view = self._publication_frame_view(
-            key, mode_1d, mode_2d, allow_blocking_read=allow_blocking_read)
+        view = staticWidget._publication_frame_view(
+            self, key, mode_1d, mode_2d,
+            allow_blocking_read=allow_blocking_read, store=publications)
         if view is not None:
             return view
         return None
@@ -1991,7 +2007,16 @@ class staticWidget(QWidget):
                                                data_lock=self.data_lock,
                                                publication_store=self.publication_store)
         self.displayframe.store_first_frame_view = self.store_first_frame_view
-        self.displayframe.frame_record_store = self._active_frame_record_store
+        # X1 O-3 (c2): the record-store provider follows the display SELECTION,
+        # not the run.  With a browse selected it returns None, which is what
+        # makes the acquisition's scan-qualified store structurally unreachable
+        # from the browse's data tier (the projection adapter and the hydration
+        # store resolver both call this lazily).
+        self.displayframe.frame_record_store = self._selected_frame_record_store
+        # The viewer REQUESTS a paused browse through this bound callback; the
+        # context itself is constructed and owned here, never there.
+        self.h5viewer.begin_paused_browse = self._begin_paused_browse
+        self.h5viewer.file_thread.sigBrowseLoaded.connect(self._on_browse_loaded)
         self.displayframe._resolve_overlay_grid_mismatch = (
             self._resolve_overlay_grid_mismatch)
         self.displayframe._cancel_overlay_grid_selection = (
@@ -12766,6 +12791,329 @@ class staticWidget(QWidget):
             return context.scan
         return getattr(self, "scan", None)
 
+    def _selected_display_context(self):
+        """The context the panels are currently rendering, or ``None``.
+
+        ``None`` is the idle/legacy regime: no run, no browse, and the widget's
+        own scan and store are what the display is bound to.
+        """
+        selection = getattr(self, "_display_selection", None)
+        if selection is None:
+            return None
+        if selection.kind is ContextKind.BROWSE:
+            browse = getattr(self, "_browse_context", None)
+            return browse if selection.names(browse) else None
+        acquisition = getattr(self, "_acquisition_context", None)
+        return acquisition if selection.names(acquisition) else None
+
+    def _display_selected_stores(self):
+        """``(record_store, publication_store)`` for the SELECTED context.
+
+        This is the read seam the pin/data asymmetry needed.  A browse
+        selection resolves to ``(None, <browse store>)``: the acquisition's
+        scan-qualified ``FrameRecordStore`` becomes structurally unreachable
+        from the data tier, so A's record can no longer be served as B's data
+        and a hydration fired for B can no longer land in A's store.
+
+        Idle and acquisition selections keep exactly today's answer — the
+        active record store plus the widget's own publication store — so the
+        eviction probe and the run's store-first reads are unchanged.
+        """
+        context = staticWidget._selected_display_context(self)
+        if context is not None and context.kind is ContextKind.BROWSE:
+            # The acquisition's scan-qualified record store is SKIPPED here, at
+            # the owner that withholds it.  The projection adapter used to be
+            # where that decision became visible, because the store was still
+            # attached and it had to reject it per lookup; now it is never
+            # offered, and a skip that stopped being reported would look like a
+            # skip that stopped happening.  Same decision, truthful mechanism.
+            acquisition = getattr(self, "_acquisition_context", None)
+            record_store = (None if acquisition is None
+                            else acquisition.record_store)
+            if record_store is not None:
+                fail_closed_rejection_log(
+                    logger, DECISION_RECORD_STORE_SKIPPED,
+                    reason=("the acquisition record store is not offered to a "
+                            "browse context"),
+                    outcome="withheld_from_browse_context",
+                    blanks_panel=False,
+                    expected=context.scan_key,
+                    found=getattr(record_store, STORE_SCAN_KEY_ATTR, None),
+                    origin="staticWidget._display_selected_stores",
+                    label=None,
+                    generation=context.load_generation)
+            return (context.record_store, context.publication_store)
+        return (staticWidget._active_frame_record_store(self),
+                getattr(self, "publication_store", None))
+
+    def _selected_frame_record_store(self):
+        """The record store of the SELECTED context (``None`` for a browse).
+
+        Bound onto ``displayframe.frame_record_store``, which the projection
+        adapter and the hydration store resolver both consult lazily — so the
+        projection, the store-first payload lookup and the hydrator all follow
+        one selection instead of three independent opinions.
+        """
+        return staticWidget._display_selected_stores(self)[0]
+
+    def _apply_display_selection(self, context, *, origin=""):
+        """THE display-selection owner: swap every display binding, atomically.
+
+        Plain attribute assignments only — no event-loop re-entry between them
+        — so there is never a moment when the viewer renders one context's rows
+        against another's store.  The binding set comes from the context's own
+        :class:`DisplayBindings`, which is why a partial swap is a construction
+        error rather than the mixed-context render it used to be (A's rows in
+        B's list; B's cake blank on scroll-back).
+
+        NOT swapped, ever: ``staticWidget.scan`` itself, the file thread's
+        scan, and the wrangler/integrator/stitch bindings.  Those stay on the
+        acquisition scan for the whole run — which is precisely what makes the
+        workers' backward GI-mode writes safe now that browse cannot touch it.
+
+        Rule 10: this owner bumps the display generation FIRST and then stamps
+        the selection with it, so a caller can never build a selection at a
+        pre-bump generation and ask someone else to advance it afterwards.
+        """
+        display = getattr(self, "displayframe", None)
+        viewer = getattr(self, "h5viewer", None)
+        bindings = context.display_bindings()
+
+        for target in (viewer, display):
+            if target is None:
+                continue
+            target.scan = bindings.scan
+            target.frame = bindings.frame
+            target.frame_ids = bindings.frame_ids
+            target.frames = bindings.frames
+            target.viewer_rows_1d = bindings.viewer_rows_1d
+            target.viewer_rows_2d = bindings.viewer_rows_2d
+            target.publication_store = bindings.publication_store
+        # The swapped-IN store must be able to rehydrate its own evicted
+        # frames, or the browsed cake blanks the moment a frame is evicted and
+        # scrolled back to.  The acquisition store keeps its persist-before-
+        # evict probe; a browse store has none — everything it holds is already
+        # on disk, which is the legacy loaded-scan behaviour.
+        store = bindings.publication_store
+        set_hydrator = getattr(store, "set_hydrator", None)
+        rehydrate = getattr(display, "_rehydrate_publication", None)
+        if callable(set_hydrator) and callable(rehydrate):
+            set_hydrator(rehydrate)
+
+        generation = display.display_generation
+        bump = getattr(display, "_bump_display_generation", None)
+        if callable(bump):
+            generation = bump(reason=SupersedeReason.SELECTION)
+        selection = DisplaySelection.for_context(context, generation)
+        self._display_selection = selection
+        # The context token the hydration/absorb admission compares against
+        # (c3); published here so it can never disagree with the selection.
+        if display is not None:
+            display.display_context_token = selection.context_token
+
+        # Deliberately NOT a DISPLAY-CONTEXT-TRANSITION: the five phases are the
+        # boundaries a context moves ACROSS, and each already has exactly one
+        # emitter.  A swap is the mechanism, so it reports under its own event
+        # name and rides the shared context block (which names both context
+        # owners, their stores and this selection) instead of minting a second
+        # `browse_load_finish` that would break the start/finish pairing.
+        run_config_debug_log(
+            logger, "display_selection_applied", widget=self,
+            origin=origin or "_apply_display_selection",
+            selected_context=selection.context_token,
+            selected_kind=selection.kind.value,
+            selected_scan_key=selection.scan_key,
+            selected_generation=selection.display_generation,
+            store_id=hex(id(bindings.publication_store)))
+
+        repaint = getattr(display, "request_current_selection_repaint", None)
+        if callable(repaint):
+            repaint(generation=generation, reason="context-swap")
+        return selection
+
+    def _select_acquisition_for_run_end(self):
+        """Return the panel to the acquisition context, then drop the browse.
+
+        A no-op for the overwhelmingly common case — a run that was never
+        browsed owns no browse context and has no browse selection, so nothing
+        is swapped, no generation is bumped and no repaint is requested.
+        """
+        viewer = getattr(self, "h5viewer", None)
+        if viewer is not None:
+            viewer.paused_browse_active = False
+        selected = staticWidget._selected_display_context(self)
+        acquisition = getattr(self, "_acquisition_context", None)
+        if (acquisition is not None and selected is not None
+                and selected.kind is ContextKind.BROWSE):
+            staticWidget._apply_display_selection(
+                self, acquisition, origin="staticWidget._exit_run_state")
+        staticWidget._release_browse_context(self, reason="run_end")
+
+    def _release_browse_context(self, *, reason=""):
+        """Invalidate and release the current browse, exactly once.
+
+        Called when a newer browse replaces this one, on Resume, and at run
+        end.  Releasing bumps nothing on the acquisition side: A's scan, stores
+        and record store are not this owner's to touch.
+        """
+        browse = getattr(self, "_browse_context", None)
+        self._browse_context = None
+        if browse is None:
+            return None
+        browse.release()
+        run_config_debug_log(
+            logger, "browse_context_released", widget=self,
+            origin="_release_browse_context", reason=str(reason),
+            context_token=browse.context_token,
+            load_generation=browse.load_generation,
+            requested_path=browse.requested_path)
+        return browse
+
+    def _begin_paused_browse(self, fpath):
+        """Mint ONE browse context for a paused-run browse and queue its load.
+
+        The whole point is what this does NOT do: it never passes the
+        acquisition scan to anything.  A fresh ``LiveScan`` and a fresh
+        ``PublicationStore`` are allocated here, the file task is given them as
+        its own immutable target, and the display keeps rendering the paused
+        acquisition until the load is admitted.  Exactly one swap per browse.
+        """
+        viewer = getattr(self, "h5viewer", None)
+        if viewer is None:
+            return None
+        if not getattr(self, "_run_active", False):
+            # Not a paused run: the idle/legacy path owns this gesture.
+            return viewer.set_file(fpath)
+        scan_key = _scan_key_from_source(fpath)
+        if not fpath or not scan_key:
+            fail_closed_rejection_log(
+                logger, DECISION_BROWSE_REQUEST_REFUSED,
+                reason="the browse path yields no canonical scan name",
+                outcome="browse_refused", blanks_panel=False,
+                expected="canonical_scan_name", found=str(fpath or ""),
+                origin="staticWidget._begin_paused_browse")
+            return None
+
+        # A newer request supersedes the previous browse outright: its stores
+        # are released here, so two contexts never hold payload at once and a
+        # late completion for the old one can only be rejected.
+        staticWidget._release_browse_context(self, reason="superseded")
+
+        token = new_context_token(ContextKind.BROWSE)
+        load_generation = int(
+            getattr(self, "_browse_load_generation", 0)) + 1
+        self._browse_load_generation = load_generation
+        operation = None
+        if run_config_debug_enabled():
+            operation = new_display_context_operation(
+                kind="user_browse",
+                requested_path=fpath,
+                load_generation=load_generation,
+                identity=capture_diagnostic_run_identity(self),
+                previous_scan=staticWidget._acquisition_context_scan(self),
+                token=token)
+        browse_scan = LiveScan(scan_key, data_file=str(fpath), static=True,
+                               file_lock=self.file_lock)
+        context = BrowseContext(
+            context_token=token,
+            load_generation=load_generation,
+            operation=operation,
+            requested_path=str(fpath),
+            scan_key=scan_key,
+            scan=browse_scan,
+            frame=LiveFrame(static=True, gi=browse_scan.gi),
+            frame_ids=[],
+            frames=OrderedDict(),
+            viewer_rows_1d=FixSizeOrderedDict(max=_VIEWER_ROWS_1D_CACHE_MAX),
+            viewer_rows_2d=FixSizeOrderedDict(max=_VIEWER_ROWS_2D_CACHE_MAX),
+            publication_store=PublicationStore(
+                max_items=browse_publication_max_items()),
+        )
+
+        task = BrowseLoadTask(
+            method="load_browse_datafile",
+            operation=operation,
+            scan=browse_scan,
+            fname=str(fpath),
+            scan_name=scan_key,
+            context_token=token,
+            load_generation=load_generation,
+        )
+        try:
+            viewer.cancel_pending_loads()
+            viewer.ui.listData.clear()
+            viewer.ui.listData.addItem('Loading...')
+            viewer._ensure_file_thread_running()
+            viewer.file_thread.queue.put(task)
+        except Exception:
+            logger.exception("paused browse enqueue failed: %s", fpath)
+            context.release()
+            return None
+        # Only now is the request real, so only now does the trace claim one.
+        self._browse_context = context
+        if operation is not None:
+            display_context_transition_log(
+                logger, "browse_load_start",
+                origin="staticWidget._begin_paused_browse",
+                widget=self,
+                target=browse_scan,
+                publication_store=context.publication_store,
+                operation=operation,
+                run_writing=bool(getattr(viewer, "_run_writing", False)))
+        return context
+
+    def _on_browse_loaded(self, task):
+        """Admit ONE completed browse load, or refuse it (GUI thread).
+
+        Admission is by exact identity: the completion must name the context
+        this widget currently owns, at its exact load generation, while the run
+        is still paused.  A superseded, released or post-resume completion is
+        refused with a typed record and changes neither context.
+        """
+        context = getattr(self, "_browse_context", None)
+        token = getattr(task, "context_token", None)
+        generation = getattr(task, "load_generation", None)
+        if (context is None
+                or not context.matches(token, generation)
+                or not getattr(self, "_run_active", False)):
+            fail_closed_rejection_log(
+                logger, DECISION_BROWSE_ADMISSION_REFUSED,
+                reason=("the completed browse does not name the owned "
+                        "context, or the run is no longer paused"),
+                outcome="browse_completion_dropped", blanks_panel=False,
+                expected=(None if context is None else context.context_token),
+                found=token, origin="staticWidget._on_browse_loaded",
+                label=str(getattr(task, "fname", "")),
+                generation=generation,
+                request_token=token)
+            return None
+        if getattr(task, "operation", None) is not None:
+            context.stamp_provenance(
+                calibration=staticWidget._context_identity_stamp(
+                    getattr(context.scan, "_cached_poni", None)),
+                mask=staticWidget._context_identity_stamp(
+                    getattr(context.scan, "global_mask", None)),
+                result=str(getattr(context.scan, "data_file", "") or ""))
+        context.mark_loaded()
+        selection = staticWidget._apply_display_selection(
+            self, context, origin="staticWidget._on_browse_loaded")
+        viewer = self.h5viewer
+        # ``file_thread.fname`` is a record of what IS loaded, stamped only once
+        # the load has actually been admitted — never the task's identity, and
+        # never a promise made at enqueue time.  Setting it at request time
+        # would advertise a completed browse to the browser's same-file dedupe
+        # (and to anything else that asks "which file is loaded?") while the
+        # panels were still showing the paused run.
+        viewer.file_thread.fname = context.requested_path
+        # Rebuild the frame list from the NOW-selected context.  update_data
+        # reads ``viewer.scan``/``viewer.frame_ids``, which the swap has just
+        # repointed, so this lists B's frames and never touches A's.
+        try:
+            viewer.update_data()
+        except Exception:
+            logger.debug("browse frame-list rebuild failed", exc_info=True)
+        return selection
+
     def _enter_run_state(self):
         """Single owner of run START (task #68): mark a wrangler/integrator run
         in progress.  Idempotent — re-entry while already active is a no-op so
@@ -12918,6 +13266,13 @@ class staticWidget(QWidget):
         if not self._run_active:
             return
         self._run_active = False
+        # X1 O-3 (c2): a run that ends while a browse is displayed returns the
+        # panel to the FINISHED run first, so run-end reconciliation, the batch
+        # reload and the finished-row selection all target the run's own scan —
+        # and only then is the browse released.  A run that never browsed takes
+        # no new action at all.  (c3 moves these into their own named,
+        # independently retryable substeps of the idle projection.)
+        staticWidget._select_acquisition_for_run_end(self)
         staticWidget._run_idle_lifecycle_projection(self, receipt)
         if not staticWidget._projection_incomplete(receipt):
             return
@@ -13402,6 +13757,10 @@ class staticWidget(QWidget):
         if file_thread is not None:
             file_thread.live_run = False
         self.h5viewer.set_run_writing(False)
+        # X1 O-3 (c2): browsing is legal from here until Resume or run end —
+        # and from here it must go through the context owner, so the legacy
+        # path that repoints the acquisition scan is unreachable.
+        self.h5viewer.paused_browse_active = True
         request_repaint = getattr(
             self.displayframe, "request_current_selection_repaint", None)
         if callable(request_repaint):
@@ -13427,6 +13786,13 @@ class staticWidget(QWidget):
         from the wrangler's sigResuming, ahead of the command flip."""
         if not self._run_active:
             return
+        # X1 O-3 (c2): browsing stops being legal the moment the run resumes,
+        # and the browse's work is invalidated here so a load still in flight
+        # can only be refused.  (Selecting the acquisition context back is c3;
+        # until then the display keeps rendering the browsed scan, which is
+        # coherent — just not yet the resumed run.)
+        self.h5viewer.paused_browse_active = False
+        staticWidget._release_browse_context(self, reason="resume")
         self._set_scan_integrated_reads_transient(True)
         # Restore path-only live repoints before re-engaging the writer guard.
         # The next frame-driven scan rescope can then return the browser to the

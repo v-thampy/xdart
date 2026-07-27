@@ -33,6 +33,23 @@ from xdart.utils import catch_h5py_file as catch
 
 
 
+def _canonical_scan_name(path):
+    """THE scan name for a loaded file, or ``None`` when there is no path.
+
+    Delegates to the single canonical ``scan_name_from_source`` (Codex F2) so
+    the browse chain can never disagree with the worker, the frame-boundary
+    parser or the plot title about what a file is called.  Imported lazily:
+    the parser is a pure string rule that happens to live beside the wrangler
+    worker, and pulling that module in at import time would drag the whole
+    reduction stack onto the file thread's import path.
+    """
+    if not path:
+        return None
+    from .wranglers.image_wrangler_thread import scan_name_from_source
+
+    return scan_name_from_source(path) or None
+
+
 # M2: _reintegrate_frame (the module-level pickle-safe worker for the
 # pre-M2 ProcessPoolExecutor reintegrate path) removed.  Architecture-v2
 # routes reintegration through xrd_tools.reduction.run_reduction so
@@ -1043,6 +1060,42 @@ class FileTask:
     operation: object | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class BrowseLoadTask(FileTask):
+    """One paused-run browse load, carrying its OWN target (X1 O-3 c2).
+
+    EXTENDS the accepted O-2.2R envelope rather than replacing it: the base
+    class keeps exactly ``method`` and ``operation``, so the values-only
+    guarantee and the diagnostic correlation are untouched, and every existing
+    ``isinstance(task, FileTask)`` consumer still reads this task's method and
+    receipt.  What is added is the one thing a browse cannot express as a
+    value — the browse-owned ``LiveScan`` it must load INTO.
+
+    Why the target travels inside the task and not beside it:
+
+    * ``self.fname`` and ``self.scan`` are read at EXECUTION time.  Two loads
+      queued before either runs would both act on whatever the last enqueue
+      left there — the execution-time-binding race this tranche exists to
+      close.  A frozen per-task target has no such window.
+    * a scalar ``_browse_load_request`` on the thread is the same defect one
+      level down: a later request overwrites the pending one.  There is
+      deliberately no such slot, and no side table keyed by token either — the
+      correlation cannot desynchronise from a queue it is part of.
+    * the thread retains nothing: the task is dropped when the run loop
+      finishes with it, so no browse owner outlives its load.
+
+    ``context_token`` and ``load_generation`` are the browse context's own —
+    the same pair its diagnostic receipt carries — so the GUI admission owner
+    can compare the completion against the context by exact identity.
+    """
+
+    scan: object = None
+    fname: str = ""
+    scan_name: str = ""
+    context_token: str = ""
+    load_generation: int = 0
+
+
 class fileHandlerThread(Qt.QtCore.QThread):
     """Thread class for loading data. Handles locks and waiting for
     locks to be released.
@@ -1053,7 +1106,12 @@ class fileHandlerThread(Qt.QtCore.QThread):
     # Carries the completed FileTask (or a legacy bare method name), so a
     # receiver reads the operation off the task that actually finished.
     sigTaskDone = Qt.QtCore.Signal(object)
-    
+    # X1 O-3 (c2): a browse load that SUCCEEDED, carrying its own task.  Kept
+    # distinct from ``sigTaskDone`` (which fires from the run loop's ``finally``
+    # even for a raising task) so a failed load can never be admitted as a
+    # displayable browse context.
+    sigBrowseLoaded = Qt.QtCore.Signal(object)
+
     def __init__(self, scan, frame, file_lock,
                  parent=None, frame_ids=None, frames=None,
                  data_lock=None):
@@ -1099,7 +1157,12 @@ class fileHandlerThread(Qt.QtCore.QThread):
                 self.running = True
                 self.sigTaskStarted.emit()
                 method = getattr(self, method_name)
-                method()
+                if isinstance(task, BrowseLoadTask):
+                    # A browse load carries its own immutable target, so the
+                    # worker never resolves one from mutable thread state.
+                    method(task)
+                else:
+                    method()
             except Exception as e:
                 # The loop must survive ANY task failure: this thread is
                 # created once and never restarted, so a single OSError
@@ -1161,7 +1224,16 @@ class fileHandlerThread(Qt.QtCore.QThread):
                 # set_datafile via ``save_args.pop('compression', None)``
                 # but that workaround is unnecessary now that the caller
                 # doesn't supply the dead kwarg in the first place.
-                self.scan.set_datafile(self.fname)
+                #
+                # X1 O-3 (c2): supply the name from THE canonical parser.
+                # ``LiveScan.set_datafile`` names an unnamed load by splitting
+                # the basename on its FIRST dot, so `Combi4.v2_03271005.nxs`
+                # loaded as `Combi4` while every title derived from
+                # ``scan_name_from_source`` kept the full stem — two parsers,
+                # one file, two identities.  The path-only live/no_nxs repoints
+                # above are acquisition-side naming and stay untouched.
+                self.scan.set_datafile(
+                    self.fname, name=_canonical_scan_name(self.fname))
             # Invariant: the lazy frame series must read from the SAME file as the
             # scan.  The path-only branches above (no_nxs / live_run) repoint
             # scan.data_file but leave scan.frames as the init-time series whose
@@ -1182,6 +1254,32 @@ class fileHandlerThread(Qt.QtCore.QThread):
         # GUI-thread completion seam — emits it instead, echoing the operation
         # identity minted at the start.
         self.sigNewFile.emit(self.fname)
+
+    def load_browse_datafile(self, task):
+        """Load ONE paused-run browse into the task's OWN scan (X1 O-3 c2).
+
+        Everything this needs comes from *task*: the target scan, the path and
+        the canonical name.  Nothing is read from ``self.fname``/``self.scan``,
+        so a second browse queued behind this one cannot redirect it, and
+        nothing is written back onto the thread, so no browse owner survives
+        the load.
+
+        ``sigNewFile`` is deliberately NOT emitted.  That signal drives the
+        acquisition-side cascade — the wrangler's output filename, the
+        integrator hydration and the display-clearing reset — and a browse of
+        somebody else's processed scan has no business moving any of them while
+        a run is paused.  The GUI admission owner is driven by
+        :attr:`sigBrowseLoaded` instead, which fires only on success: a load
+        that raised must never be admitted as a displayable context.
+        """
+        scan = getattr(task, "scan", None)
+        if scan is None:
+            return
+        with self.file_lock:
+            scan.set_datafile(
+                task.fname,
+                name=(task.scan_name or _canonical_scan_name(task.fname)))
+        self.sigBrowseLoaded.emit(task)
         self.sigUpdate.emit()
     
     def update_scan(self):

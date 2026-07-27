@@ -374,6 +374,14 @@ DECISION_CAPABILITY_FORCES_CLEAR = "capability_forces_clear"
 #: set, and so O-3 has no naming latitude when it starts emitting it.
 DECISION_HYDRATION_CONTEXT_MISMATCH = "hydration_context_mismatch"
 
+#: X1 O-3 (c2): the two browse-context ownership refusals.  A request that
+#: cannot be named canonically never becomes a context, and a completion that
+#: does not name the OWNED context at its exact load generation is dropped —
+#: both silently before, which is why "the panel did not change" and "the
+#: browse never happened" were indistinguishable in a captured log.
+DECISION_BROWSE_REQUEST_REFUSED = "browse_request_refused"
+DECISION_BROWSE_ADMISSION_REFUSED = "browse_admission_refused"
+
 FAIL_CLOSED_DECISIONS = (
     DECISION_RECORD_STORE_SKIPPED,
     DECISION_PUBLICATION_ABSENT,
@@ -382,6 +390,8 @@ FAIL_CLOSED_DECISIONS = (
     DECISION_PROJECTION_SUPERSEDED,
     DECISION_CAPABILITY_FORCES_CLEAR,
     DECISION_HYDRATION_CONTEXT_MISMATCH,
+    DECISION_BROWSE_REQUEST_REFUSED,
+    DECISION_BROWSE_ADMISSION_REFUSED,
 )
 
 #: Process-unique operation counter.  A browse load crosses a thread boundary,
@@ -557,10 +567,18 @@ def new_display_context_operation(
     load_generation=None,
     identity: DiagnosticRunIdentity | None = None,
     previous_scan=None,
+    token: str | None = None,
 ) -> DisplayContextOperation:
-    """Mint one browse-load operation identity.  Callers gate on the channel."""
+    """Mint one browse-load operation identity.  Callers gate on the channel.
+
+    X1 O-3 (c2): a browse that owns a CONTEXT passes that context's token in,
+    so the receipt and the context share one identity instead of each minting
+    its own from a separate counter.  The legacy ``set_file`` path (and the
+    internal run-output reload) has no context and keeps this counter.
+    """
     return DisplayContextOperation(
-        token=f"{os.getpid():x}-{next(_operation_counter):x}",
+        token=(str(token) if token
+               else f"{os.getpid():x}-{next(_operation_counter):x}"),
         kind=str(kind),
         requested_path=("" if requested_path is None else str(requested_path)),
         load_generation=load_generation,

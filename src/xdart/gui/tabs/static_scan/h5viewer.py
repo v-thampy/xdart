@@ -80,7 +80,7 @@ from .viewer_raw_lru import (
     clear_viewer_raw_lru,
     remember_viewer_raw_lru,
 )
-from .scan_threads import FileTask, fileHandlerThread
+from .scan_threads import BrowseLoadTask, FileTask, fileHandlerThread
 from .browse_debug import (
     browse_debug_enabled,
     browse_debug_log,
@@ -618,6 +618,12 @@ class H5Viewer(QWidget):
         # source of truth and can't drift.  Distinct from live_run_active, which
         # is live-only and also drives data_reset / the file-thread repoint.
         self._run_writing = False
+        # X1 O-3 (c2): True only between Pause and Resume/run-end, when a
+        # browse is legal AND must be given its own context.  The callback is
+        # installed by the static widget (the ONE context owner); the viewer
+        # only requests through it and never constructs a context itself.
+        self.paused_browse_active = False
+        self.begin_paused_browse = None
         self._displayed_list_count = 0
         self._displayed_last_label = None
         self._date_sort_dir_cache = {}
@@ -1518,21 +1524,37 @@ class H5Viewer(QWidget):
         # A legacy bare method name is still accepted (``save_data_as``, and
         # duck-typed rigs in the suite); it simply carries no operation.
         method = task.method if isinstance(task, FileTask) else task
-        if method == "set_datafile":
+        if method in ("set_datafile", "load_browse_datafile"):
             operation = task.operation if isinstance(task, FileTask) else None
             if operation is not None and run_config_debug_enabled():
+                # X1 O-3 (c2): a browse load reports the task's OWN target and
+                # loaded path.  The legacy path still reports the file thread's
+                # scan and fname, which for it IS the target; a browse-owned
+                # load has neither on the thread by design.
+                browse_task = isinstance(task, BrowseLoadTask)
                 display_context_transition_log(
                     logger, "browse_load_finish",
                     origin="H5Viewer.thread_finished",
                     scan=self.scan,
-                    target=getattr(self.file_thread, "scan", None),
+                    target=(task.scan if browse_task
+                            else getattr(self.file_thread, "scan", None)),
                     publication_store=getattr(
                         self, "publication_store", None),
                     operation=operation,
-                    loaded_file=str(getattr(self.file_thread, "fname", "")),
+                    loaded_file=str(
+                        task.fname if browse_task
+                        else getattr(self.file_thread, "fname", "")),
                     run_writing=bool(getattr(self, "_run_writing", False)),
                     live_run=bool(
                         getattr(self.file_thread, "live_run", False)))
+        if method == "load_browse_datafile":
+            # The browse-owned load performs no viewer refresh here: the frame
+            # list must be rebuilt from the SELECTED context, and the selection
+            # has not been applied yet (the admission owner does that, off
+            # ``sigBrowseLoaded``, and refreshes the viewer itself).  Refreshing
+            # now would rebuild the list from the still-selected acquisition.
+            self.sigThreadFinished.emit()
+            return
         self.update()
         if getattr(self, "_browser_restore_in_progress", False):
             context = getattr(self, "_browser_previous_context", None) or {}
@@ -1807,6 +1829,16 @@ class H5Viewer(QWidget):
             # still populates + deselects).  Only reached in normal mode — the
             # viewer branches above return first, keeping their auto-first-frame.
             current_fname = getattr(getattr(self, 'file_thread', None), 'fname', None)
+            # X1 O-3 (c2): a browse while the run is PAUSED goes to the context
+            # owner, which gives it a scan and stores of its own.  The legacy
+            # `set_file` path below repoints the acquisition singleton, so it
+            # must be unreachable from here — the viewer only REQUESTS; it
+            # never constructs or owns a context.
+            begin_paused_browse = getattr(self, "begin_paused_browse", None)
+            if (getattr(self, "paused_browse_active", False)
+                    and callable(begin_paused_browse)):
+                begin_paused_browse(fpath)
+                return
             if getattr(self, '_run_writing', False):
                 # The normal Int browser and the live display still share one
                 # mutable Scan. Repointing it while the writer is active can
@@ -3752,12 +3784,40 @@ class H5Viewer(QWidget):
         try:
             store = getattr(self, "publication_store", None)
             from .display_overlay_utils import scan_identity_key
+            # X1 O-3 (c2): key the record under the modes the DISPLAY will ask
+            # for, and declare the raw this publication is already holding.
+            #
+            # A disk-loaded frame carries no per-mode `gi_*` dicts, so the
+            # record collapsed to the `default` mode key while the projection
+            # asked for the selected scan's GI modes — `q_total` / `qip_qoop`
+            # for a GI result — and every integrated tier came back ABSENT with
+            # the arrays sitting right there.  The modes come from the DISPLAY's
+            # own resolver, so the writer and the reader cannot disagree.
+            #
+            # `include_raw` costs no memory: `retain_raw_ref` already pins the
+            # frame that owns `map_raw`, and this hands the store the SAME array
+            # rather than leaving the raw tier a source-fallback the panel has
+            # to go back to disk for.
+            mode_1d = mode_2d = None
+            active_modes = getattr(
+                getattr(self, "displayframe", None),
+                "_projection_active_modes", None)
+            if callable(active_modes):
+                try:
+                    mode_1d, mode_2d = active_modes()
+                except Exception:
+                    logger.debug("active display modes unresolved",
+                                 exc_info=True)
             publication = publication_from_live_frame(
                 frame,
                 generation=(store.generation if store is not None else 0),
                 include_2d=bool(load_2d),
                 include_thumbnail=bool(load_2d),
+                include_raw=bool(load_2d)
+                and getattr(frame, "map_raw", None) is not None,
                 retain_raw_ref=bool(load_2d),
+                active_mode_1d=mode_1d,
+                active_mode_2d=mode_2d,
                 # X1 3c (S3-OR1): stamp the immutable scan owner from the
                 # authoritative browse scan — never from a source filename.
                 scan_key=scan_identity_key(getattr(self, "scan", None)),

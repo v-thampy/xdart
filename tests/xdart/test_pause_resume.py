@@ -495,7 +495,8 @@ def test_paused_transition_enables_full_browser_frame_index_load():
     scan = SimpleNamespace(
         skip_2d=False,
         frames=SimpleNamespace(data_file="live_output.nxs"),
-        set_datafile=lambda path: loaded.append(path),
+        # X1 O-3 (c2): the full browser load supplies the canonical name.
+        set_datafile=lambda path, name=None: loaded.append(path),
     )
     file_thread = SimpleNamespace(
         scan=scan,
