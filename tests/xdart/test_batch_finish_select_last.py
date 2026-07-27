@@ -41,13 +41,17 @@ def _finish_host(tmp_path, *, batch, saw_frame, xye_only=False,
     )
     # O-1a-W1R-D3: the run-end host reads the run's ACCEPTED configuration; the
     # worker carries no mode/output mirrors for it to consult any more.
+    # §45.3: the host qualifies the accepted object by IDENTITY, so a rig must
+    # admit the same object it publishes.
+    _accepted = accepted_run(
+        batch_mode=batch,
+        output_mode=write_mode,
+        save_path=str(tmp_path),
+        run_options={"xye_only": xye_only},
+    )
     thread = SimpleNamespace(
-        run_configuration=accepted_run(
-            batch_mode=batch,
-            output_mode=write_mode,
-            save_path=str(tmp_path),
-            run_options={"xye_only": xye_only},
-        ),
+        run_configuration=_accepted,
+        _admitted_run_configuration=_accepted,
         fname=str(thread_fname),
         _append_skip_without_reading=append_skipped,
         _append_config_mismatch=append_config_mismatch,

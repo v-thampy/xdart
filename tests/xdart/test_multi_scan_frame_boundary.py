@@ -20,11 +20,25 @@ from types import SimpleNamespace, MethodType
 
 import pandas as pd
 
+from tests.xdart._accepted_run import accepted_run  # noqa: E402
 from xdart.gui.tabs.static_scan.display_logic import LifecycleCause
 from xdart.gui.tabs.static_scan.static_scan_widget import (
     staticWidget, _scan_key_from_source,
 )
 from xdart.modules.frame_publication import PublicationStore
+
+
+def _boundary_worker(*, batch_mode):
+    """A worker stub that publishes a carrier AND its admission ledger.
+
+    O-1b: the host reads run policy from the accepted object and qualifies it by
+    identity (review §45.3), so a rig must admit the same object it publishes.
+    """
+    accepted = accepted_run(batch_mode=batch_mode)
+    return SimpleNamespace(
+        run_configuration=accepted,
+        _admitted_run_configuration=accepted,
+        _published_frames={}, mask=None, detector_shape=None)
 
 
 def _boundary_host():
@@ -44,8 +58,7 @@ def _boundary_host():
             auto_last=False, latest_idx=0,
             set_file=lambda fname, **k: None, update_scans=lambda: None,
             update=lambda: None),
-        wrangler=SimpleNamespace(thread=SimpleNamespace(
-            batch_mode=False, _published_frames={}, mask=None, detector_shape=None)),
+        wrangler=SimpleNamespace(thread=_boundary_worker(batch_mode=False)),
         integratorTree=SimpleNamespace(
             get_args=lambda n: None, set_image_units=lambda: None),
         _update_timer=SimpleNamespace(stop=lambda: None, trigger=lambda: None),
@@ -214,7 +227,9 @@ def test_batch_mode_never_frame_rescopes():
     # Batch suppresses per-frame update_data, but assert the boundary block is inert
     # under a batch-flagged wrangler even if update_data is reached.
     host, scan = _boundary_host()
-    host.wrangler.thread.batch_mode = True
+    # O-1b: batch mode is frozen run policy; the worker carries no mirror for the
+    # boundary block to read, so a batch run states it on the accepted object.
+    host.wrangler.thread = _boundary_worker(batch_mode=True)
     for i in (1, 2, 3):
         _arrive(host, i, "scanA")
     # a scanB frame under batch must NOT rescope

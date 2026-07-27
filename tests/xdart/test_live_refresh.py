@@ -1298,8 +1298,10 @@ def test_append_run_start_seeds_processed_frame_browser_without_render():
         H5Viewer._remember_displayed_frames, viewer)
     viewer.update_data = MethodType(H5Viewer.update_data, viewer)
     # O-1a-W1R-D3: the seeding host reads the run's ACCEPTED configuration.
+    _seed_accepted = _seed_accepted_run()
     thread = SimpleNamespace(
-        run_configuration=_seed_accepted_run(),
+        run_configuration=_seed_accepted,
+        _admitted_run_configuration=_seed_accepted,
         _append_skip_snapshot=lambda name: {1, 2, 3},
     )
     host = SimpleNamespace(

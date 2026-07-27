@@ -10754,8 +10754,14 @@ class staticWidget(QWidget):
         # frame (never pop — the pop below stays the sole consumer).  Skipped in
         # batch (which suppresses per-frame update_data) and for the very first
         # scan (name "null_main", whose new_scan reliably precedes its frames).
+        # O-1b: batch mode is frozen run policy.  Reading it off the worker used
+        # to work through the retired projection descriptor; after D3 that read
+        # silently defaulted to False and INVERTED the batch suppression, so the
+        # boundary block ran during batch runs.  The worker reference stays for
+        # the operational frame hand-off only.
         published = getattr(self.wrangler, "thread", None)
-        if published is not None and not getattr(published, "batch_mode", False):
+        _batch = getattr(_accepted_run_policy(published), "batch_mode", False)
+        if published is not None and not _batch:
             _peek = getattr(published, "_published_frames", {}).get(idx)
             if _peek is not None:
                 _key = _scan_key_from_source(getattr(_peek, "source_file", ""))
