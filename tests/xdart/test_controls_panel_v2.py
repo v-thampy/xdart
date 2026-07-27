@@ -264,6 +264,18 @@ def _apply_v2_edits(widget, edits):
         widget._on_controls_v2_field_changed(path, value)
 
 
+def _apply_prepared_run_state(widget):
+    """Drive the post-admission owner with the one staged frozen identity.
+
+    W-1R-D1 split preparation from admission.  Focused projection tests use
+    this seam explicitly instead of relying on the deleted second-freeze
+    fallback in ``_apply_controls_v2_run_state()``.
+    """
+    frozen = widget._prepare_controls_v2_run_configuration()
+    assert frozen is not None
+    return widget._apply_controls_v2_run_state(frozen), frozen
+
+
 def _current_plan_snapshot(widget, *, include_threshold=True,
                            integrate_1d=True, integrate_2d=True,
                            commit_pending=True):
@@ -1690,6 +1702,8 @@ def test_run_boundary_propagates_directory_intent_without_catalog_owner(
         monkeypatch.setattr(
             widget.wrangler.thread, "start", lambda: started.append(True))
 
+        frozen = widget._prepare_controls_v2_run_configuration()
+        assert frozen.source is not None
         widget.start_wrangler()
 
         assert started == [True]
@@ -1698,7 +1712,9 @@ def test_run_boundary_propagates_directory_intent_without_catalog_owner(
         assert widget.wrangler.source_index_session is None
         assert widget.wrangler.thread.source_index_session is None
         assert widget.wrangler.source_spec.root == tmp_path
-        assert widget.wrangler.thread.source_spec is widget.wrangler.source_spec
+        assert widget.wrangler.run_configuration is frozen
+        assert widget.wrangler.thread.run_configuration is frozen
+        assert "source_spec" not in vars(widget.wrangler.thread)
         assert widget.wrangler.source_frame_count_snapshot == {}
         assert widget.wrangler.thread.source_frame_count_snapshot == {}
         assert widget.wrangler.source_pending_count == 0
@@ -1713,7 +1729,7 @@ def test_run_boundary_propagates_directory_intent_without_catalog_owner(
         assert widget.wrangler.source_frame_count_snapshot == {}
         assert widget.wrangler.source_pending_count == 0
         assert widget.wrangler.thread.source_run_plan is None
-        assert widget.wrangler.thread.source_spec is None
+        assert "source_spec" not in vars(widget.wrangler.thread)
         assert widget.wrangler.thread.source_index_session is None
         assert widget.wrangler.thread.source_frame_count_snapshot == {}
         assert widget.wrangler.thread.source_pending_count == 0
@@ -3138,7 +3154,7 @@ def test_controls_panel_v2_native_gi_oop_points_feed_plan(
         assert values[("Int1D", "points_oop")] == "345"
         assert _visible_control_value(widget, ("Int1D", "points_oop")) == "345"
 
-        widget._apply_controls_v2_run_state()
+        _apply_prepared_run_state(widget)
         snapshot = _current_plan_snapshot(widget, commit_pending=False)
         assert snapshot["integration_1d"]["npt"] == 234
         assert snapshot["gi"]["mode_1d"] == "q_ip"
@@ -3727,7 +3743,7 @@ def test_controls_panel_v2_native_reintegrate_results_match_run_after_stale_lega
         _apply_v2_edits(widget, edits)
 
         widget.scan.skip_2d = False
-        widget._apply_controls_v2_run_state()
+        _apply_prepared_run_state(widget)
         widget._configure_controls_v2_native_run_plan()
         run_cache = widget.wrangler.thread._plan_cache
         run_1d = run_cache.get(widget.scan, integrate_1d=True, integrate_2d=False)
@@ -4552,6 +4568,7 @@ def test_controls_panel_v2_run_commits_focused_integration_edit(qapp, monkeypatc
         widget.wrangler.thread = FakeThread()
         monkeypatch.setattr(widget.wrangler, "setup", lambda: None)
 
+        widget._prepare_controls_v2_run_configuration()
         widget.start_wrangler()
 
         assert widget.integratorTree.ui.npts_1D.text() != "777"
@@ -4583,7 +4600,7 @@ def test_controls_panel_v2_run_state_harvests_and_deep_copies_snapshot(
         _user_types(qapp, widget, rows[("Int1D", "points")].editor, "246")
         assert widget.integratorTree.ui.npts_1D.text() != "246"
 
-        args = widget._apply_controls_v2_run_state()
+        (args, _frozen) = _apply_prepared_run_state(widget)
 
         assert args is widget.wrangler.scan_args
         assert widget.integratorTree.ui.npts_1D.text() != "246"
@@ -4633,6 +4650,7 @@ def test_controls_panel_v2_run_commits_focused_2d_points(qapp, monkeypatch):
         widget.wrangler.thread = FakeThread()
         monkeypatch.setattr(widget.wrangler, "setup", lambda: None)
 
+        widget._prepare_controls_v2_run_configuration()
         widget.start_wrangler()
 
         assert widget.integratorTree.ui.npts_radial_2D.text() != "123"
@@ -4951,6 +4969,7 @@ def test_controls_panel_v2_mask_saturated_is_pushed_before_run_lock(qapp, monkey
         monkeypatch.setattr(widget.wrangler, "enabled", enabled)
         monkeypatch.setattr(widget.wrangler, "setup", lambda: None)
 
+        widget._prepare_controls_v2_run_configuration()
         widget.start_wrangler()
 
         assert seen_at_disable == [True]
@@ -5419,7 +5438,13 @@ def test_fast_start_folds_deferred_values_before_publish(qapp, monkeypatch):
         assert frozen is not None
         assert frozen.gi.enabled is True
         assert list(widget._controls_v2_deferred_field_edits) == []
-        assert intent.generation == gen_before + 1  # frozen exactly once
+        # Preparation freezes a detached candidate without advancing the
+        # canonical intent.  The post-admission owner commits that generation
+        # exactly once.
+        assert frozen.generation == gen_before + 1
+        assert intent.generation == gen_before
+        widget._apply_controls_v2_run_state(frozen)
+        assert intent.generation == gen_before + 1
     finally:
         widget.close()
         widget.deleteLater()
@@ -5519,6 +5544,9 @@ def test_deferred_multi_field_folds_together_once(qapp, monkeypatch):
         assert frozen.gi.enabled is True
         assert mask_param.value() == target
         assert list(widget._controls_v2_deferred_field_edits) == []
+        assert frozen.generation == gen_before + 1
+        assert intent.generation == gen_before
+        widget._apply_controls_v2_run_state(frozen)
         assert intent.generation == gen_before + 1
     finally:
         widget.close()
