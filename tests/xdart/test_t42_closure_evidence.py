@@ -295,6 +295,10 @@ def test_finalizer_failure_releases_the_capture_and_finalizes_once(
                           match="permanent finalization failure"):
             widget.integrator_thread_finished()
 
+    # X1 O-3 (c3): the context is released by its own ordered substep, after
+    # the finalization seam has had its ONE attempt.  T-4.2's invariant is
+    # unchanged — a permanent failure still releases the run scan, and the
+    # retry may not finalize the same identity again.
     assert widget._acquisition_context is None, (
         "the live run scan stayed owned after terminal closure")
     assert len(attempts) == 1, (
@@ -414,9 +418,18 @@ def test_promoted_boundary_finalizer_releases_capture_without_widget():
     with pytest.raises(RuntimeError, match="display finalization failed"):
         staticWidget._finalize_acquisition_context_scan(host)
 
-    assert host._acquisition_context is None
+    assert host._acquisition_context.finalization_claimed is True
+    assert host._acquisition_context.finalized is False
     # A retry must be a no-op rather than finalizing the identity again.
     staticWidget._finalize_acquisition_context_scan(host)
+    # The release substep is ORDERED after that one attempt, never before it.
+    from xdart.modules.display_context import DisplayContextError
+
+    fresh = SimpleNamespace(_acquisition_context=_minimal_acquisition_context())
+    with pytest.raises(DisplayContextError):
+        staticWidget._release_acquisition_context(fresh)
+    staticWidget._release_acquisition_context(host)
+    assert host._acquisition_context is None
 
 
 def test_promoted_real_finish_failure_releases_the_captured_scan(

@@ -41,7 +41,14 @@ from pyqtgraph.Qt import QtWidgets
 
 
 _EXPECTED_DEFAULT_SEAMS = (
+    # X1 O-3 (c3): the run-end context seams are four SEPARATELY NAMED,
+    # independently retryable substeps — select the acquisition context,
+    # finalize its scan exactly once, release the browse owner exactly once,
+    # and release the acquisition context only once finalization succeeded.
+    "select_acquisition_context",
     "finish_processing",
+    "release_browse_context",
+    "release_acquisition_context",
     "transient_reads",
     "set_processing_active",
     "set_run_writing",

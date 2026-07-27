@@ -84,6 +84,7 @@ from .browse_debug import (
 )
 from .run_config_debug import (
     DECISION_CAPABILITY_FORCES_CLEAR,
+    DECISION_HYDRATION_CONTEXT_MISMATCH,
     fail_closed_rejection_log,
     run_config_debug_enabled,
 )
@@ -1551,14 +1552,73 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             if pending_key in pending and consumer is not ConsumerKind.OVERLAY_1D:
                 return
             pending.add(pending_key)
+            # X1 O-3 (c3): capture the display context at REQUEST time.  The
+            # completion is admitted against the context selected when it
+            # LANDS, so a browse hydration held across a Resume is refused by
+            # identity rather than admitted because the generation happens to
+            # match — two contexts can sit at the same generation, and the
+            # publication's owner stamp used to be taken at execution time,
+            # which is the wrong end of the round trip.
+            context_token = str(getattr(self, "display_context_token", "") or "")
+            try:
+                context_scan_key = str(overlay_current_scan_key(self) or "")
+            except Exception:
+                context_scan_key = ""
             try:
                 worker.request(
                     label_key, self.display_generation, purpose=purpose_key,
                     consumer=consumer,
-                    supersede_reason=SupersedeReason.SELECTION)
+                    supersede_reason=SupersedeReason.SELECTION,
+                    context_token=context_token,
+                    context_scan_key=context_scan_key)
             except TypeError:
                 worker.request(
                     label_key, self.display_generation, purpose=purpose_key)
+
+    def _admit_hydration_owner(self, owner, label, generation) -> bool:
+        """Whether a completion belongs to the CURRENTLY selected context.
+
+        Fail-closed by identity, not by generation.  ``owner`` is the
+        ``(context_token, scan_key)`` pair captured when the request was made.
+        A refusal records ONE typed rejection naming the request's own token, so
+        a reader can correlate it to the exact request rather than to "some
+        request for this frame at this generation" — a later request for the
+        same frame would satisfy label plus generation on its own.
+
+        Returns True when the completion may proceed: no owner was carried (the
+        legacy/duck-host call), the display has no context token yet, or the
+        tokens agree.
+        """
+        if not owner:
+            return True
+        try:
+            request_token, request_scan_key = owner
+        except (TypeError, ValueError):
+            return True
+        request_token = str(request_token or "")
+        current_token = str(getattr(self, "display_context_token", "") or "")
+        if not request_token or not current_token:
+            return True
+        if request_token == current_token:
+            return True
+        try:
+            expected = overlay_current_scan_key(self)
+        except Exception:
+            expected = None
+        fail_closed_rejection_log(
+            logger, DECISION_HYDRATION_CONTEXT_MISMATCH,
+            reason=("the completion names a display context this widget has "
+                    "left"),
+            outcome="completion_dropped",
+            blanks_panel=False,
+            expected=expected,
+            found=str(request_scan_key or ""),
+            origin="displayFrameWidget._on_frame_hydrated",
+            label=label,
+            generation=generation,
+            request_token=request_token,
+            current_token=current_token)
+        return False
 
     def _flush_hydration_render(self) -> None:
         if not getattr(self, "_pending_hydration_render", False):
@@ -1583,7 +1643,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             return
         self._flush_hydration_render()
 
-    def _on_frame_hydrated(self, label, generation) -> None:
+    def _on_frame_hydrated(self, label, generation, owner=None) -> None:
         """A background hydration finished: the heavy payload is now resident in
         the store.  Drop a stale result (the selection/mode moved on), else
         schedule a bounded re-render so the panel upgrades from its thumbnail
@@ -1592,7 +1652,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         A fast sweep over hundreds of evicted frames can stream hundreds of
         completions.  The quiet timer gives one final render after the burst; the
         progress timer allows at most one intermediate render per second while
-        more requested frames are still in flight."""
+        more requested frames are still in flight.
+
+        X1 O-3 (c3): a completion is admitted only by the context that ASKED for
+        it.  ``owner`` is the ``(context_token, scan_key)`` captured at request
+        time; when it names a context this display has since left — a browse
+        hydration released after Resume — the completion is refused with one
+        typed record and changes nothing on either side.  Generation equality is
+        not authority: two contexts can be at the same generation, which is
+        exactly how a held browse read used to be applied to the resumed run.
+        ``owner=None`` is the legacy/duck-host call and keeps the old
+        generation-only behaviour."""
+        if not displayFrameWidget._admit_hydration_owner(
+                self, owner, label, generation):
+            return
         if isinstance(label, (list, tuple, set, frozenset)):
             label_keys = []
             for one_label in label:

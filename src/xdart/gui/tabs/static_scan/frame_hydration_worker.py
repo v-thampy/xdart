@@ -42,6 +42,13 @@ class _HydrationRequest:
     generation: int
     purpose: str
     consumer: ConsumerKind
+    #: X1 O-3 (c3): the display context this request was made UNDER, captured
+    #: at request time and echoed on completion.  A generation alone cannot
+    #: authorize a completion — two contexts can be at the same generation, and
+    #: a completion held across a context switch would then be admitted by the
+    #: owner it no longer belongs to.  Values only: two strings.
+    context_token: str = ""
+    context_scan_key: str = ""
 
 
 class FrameHydrationWorker(Qt.QtCore.QThread):
@@ -59,8 +66,12 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
     does not wake an integrated-results-only disk hydrator.
     """
 
-    #: (label, generation) — label echoes the request; generation gates staleness.
-    sigHydrated = Qt.QtCore.Signal(object, int)
+    #: ``(label, generation, owner)`` — label echoes the request, generation
+    #: gates staleness, and ``owner`` is the ``(context_token, scan_key)`` pair
+    #: the request was made under so the GUI can refuse a completion that
+    #: belongs to a context it has since left (X1 O-3 c3).  A two-argument slot
+    #: may still connect; the extra argument is simply not delivered to it.
+    sigHydrated = Qt.QtCore.Signal(object, int, object)
 
     def __init__(self, store, parent=None):
         super().__init__(parent)
@@ -146,9 +157,17 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
     def request(
             self, label, generation: int, *, purpose: str = "full",
             consumer=ConsumerKind.PLOT_1D,
-            supersede_reason=SupersedeReason.SELECTION) -> None:
-        """Enqueue a hydration request (non-blocking; returns immediately)."""
+            supersede_reason=SupersedeReason.SELECTION,
+            context_token: str = "", context_scan_key: str = "") -> None:
+        """Enqueue a hydration request (non-blocking; returns immediately).
+
+        ``context_token``/``context_scan_key`` name the display context at
+        REQUEST time (X1 O-3 c3).  They are carried untouched to the completion
+        so admission can compare against the context that is selected THEN.
+        """
         generation = int(generation)
+        context_token = str(context_token or "")
+        context_scan_key = str(context_scan_key or "")
         purpose = str(purpose or "full")
         consumer = self._consumer(consumer)
         supersede_reason = self._reason(supersede_reason)
@@ -183,7 +202,8 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
                 self._queue[-1].labels = (*self._queue[-1].labels, label)
             else:
                 self._queue.append(
-                    _HydrationRequest((label,), generation, purpose, consumer))
+                    _HydrationRequest((label,), generation, purpose, consumer,
+                                      context_token, context_scan_key))
             browse_debug_log(
                 logger,
                 "hydration_worker_enqueue",
@@ -200,7 +220,9 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
     def _pop_batch_locked(self):
         request = self._queue.popleft()
         self._discard_locked(request)
-        return list(request.labels), request.generation, request.purpose, request.consumer
+        return (list(request.labels), request.generation, request.purpose,
+                request.consumer,
+                (request.context_token, request.context_scan_key))
 
     @staticmethod
     def _store_supports_purpose(store, purpose: str) -> bool:
@@ -242,7 +264,8 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
                     self._cond.wait()
                 if self._stop:
                     return
-                labels, generation, purpose, consumer = self._pop_batch_locked()
+                (labels, generation, purpose, consumer,
+                 owner) = self._pop_batch_locked()
                 newest = self._newest_gen
             if (
                 generation < newest
@@ -288,7 +311,7 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
                 success=bool(success),
                 emitted=True,
             )
-            self.sigHydrated.emit(emitted_label, generation)
+            self.sigHydrated.emit(emitted_label, generation, owner)
 
     def stop(self, timeout_ms: int = 8000) -> bool:
         """Signal the loop to exit and join (idempotent).

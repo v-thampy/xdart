@@ -890,10 +890,17 @@ def test_paused_browse_leaves_acquisition_untouched(qapp, acquisition):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "O-2 reproducer (O-3 flips it): Resume leaves B's GI flag and PONI on "
-        "the captured acquisition scan, the first resumed frame's rescope "
-        "clears the publication store, and the resumed payload is not owner-"
-        "qualified to A"
+        "EXPLICITLY DEFERRED at the O-3 c3 tip.  Every Resume row this case "
+        "asserts is green — the selection points back at the captured "
+        "acquisition object, nothing A owns moved, the publication store is "
+        "not cleared, and the resumed cake and 1-D are A-owned RESIDENT "
+        "payloads.  The single outstanding row is "
+        "resumed_raw_is_acquisition_resident_payload, and it is NOT a "
+        "resume/context property: a live run's projection is served by the "
+        "acquisition FrameRecordStore, which carries no raw pixels, so the raw "
+        "tier reports SOURCE_FALLBACK.  Measured identical for a paused A "
+        "frame BEFORE any browse context exists, so it is an acquisition-side "
+        "store-tiering question for R4-G/Slice 4, not the browse split"
     ),
 )
 def test_resume_restores_acquisition_coherently(qapp, acquisition):
@@ -990,15 +997,6 @@ def _record_hydration_requests(monkeypatch, sink):
     monkeypatch.setattr(FrameHydrationWorker, "request", recording_request)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "O-2 reproducer (O-3 flips it): a hydration round trip carries a "
-        "display generation and no owner, so the browse completion held past "
-        "Resume produces no hydration_context_mismatch and is not rejected by "
-        "context identity"
-    ),
-)
 def test_delayed_browse_hydration_rejected_after_resume(
         qapp, acquisition, monkeypatch, caplog):
     """Acceptance path 4 — the HELD B completion must be refused by identity.
@@ -1085,7 +1083,13 @@ def test_delayed_browse_hydration_rejected_after_resume(
             "mask": getattr(a_scan, "global_mask", None),
             "key": str(getattr(a_scan, "name", "")),
             "display_scan": widget.displayframe.scan,
-            "a_labels": _store_labels(captured["publication_store"]),
+            # O-3 c3 correction: the RESUMED RUN is publishing throughout the
+            # release window — by construction, since this case waits for A to
+            # produce a frame before sampling — so A's label SET cannot be
+            # expected to stand still.  What the stale completion must not do is
+            # take anything away from A or put its own frame under A's
+            # ownership, and those are the rows below.
+            "a_labels": set(_store_labels(captured["publication_store"])),
         }
         rejections_before = len(_rejection_events(caplog))
 
@@ -1116,9 +1120,12 @@ def test_delayed_browse_hydration_rejected_after_resume(
             str(getattr(a_scan, "name", "")) == before_release["key"],
         "display_selection_untouched":
             widget.displayframe.scan is before_release["display_scan"],
-        "acquisition_store_unchanged":
-            _store_labels(captured["publication_store"])
-            == before_release["a_labels"],
+        "acquisition_store_kept_every_label_it_held":
+            before_release["a_labels"]
+            <= set(_store_labels(captured["publication_store"])),
+        "acquisition_store_did_not_adopt_the_held_frame":
+            _publication_owner(captured["publication_store"], held_label)
+            in (None, a_key),
         "browse_store_kept_its_own_payload":
             _publication_owner(browse_store, held_label) is not None,
     }
@@ -1314,15 +1321,6 @@ def _o3_context_module_facts():
             "qt_free": qt_free}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "O-2.1 forbidden-design pin (O-3 supplies the shape and removes this "
-        "marker): there is no xdart.modules.display_context, the "
-        "_x1_run_scan_capture alias still exists, and the browse targets the "
-        "acquisition scan itself"
-    ),
-)
 def test_o3_context_owner_shape_is_absent(qapp, acquisition):
     """The O-3 shape, pinned as a discriminator BEFORE it exists.
 
@@ -1346,7 +1344,16 @@ def test_o3_context_owner_shape_is_absent(qapp, acquisition):
         "key": str(getattr(a_scan, "name", "")),
         "gi": bool(getattr(a_scan, "gi", False)),
         "poni": getattr(a_scan, "_cached_poni", None),
-        "browse_target": getattr(widget.h5viewer.file_thread, "scan", None),
+        # O-3 c3 correction: the browse loads through a per-TASK target, so
+        # the browse target is the browse context's own scan.  Repointing
+        # ``file_thread.scan`` was the rejected alternative — every queued task
+        # reads it at execution time, so a load already in the queue would act
+        # on the wrong scan, and Resume would have to repoint it BACK, which is
+        # the restoration-style Resume this tranche forbids.  The row asserting
+        # the thread was never repointed is therefore added, not replaced.
+        "browse_target": getattr(
+            getattr(widget, "_browse_context", None), "scan", None),
+        "file_thread_scan": getattr(widget.h5viewer.file_thread, "scan", None),
         "display_scan": widget.displayframe.scan,
         "integrator_scan": getattr(widget.integratorTree, "scan", None),
     }
@@ -1364,7 +1371,10 @@ def test_o3_context_owner_shape_is_absent(qapp, acquisition):
         "context_owners_are_qt_free": module_facts["qt_free"],
         "run_scan_alias_deleted": not hasattr(widget, "_x1_run_scan_capture"),
         "browse_target_is_not_the_acquisition_scan":
-            during_browse["browse_target"] is not a_scan,
+            during_browse["browse_target"] is not None
+            and during_browse["browse_target"] is not a_scan,
+        "the_file_thread_was_never_repointed":
+            during_browse["file_thread_scan"] is a_scan,
         "acquisition_never_mutated": (
             during_browse["key"] == captured["scan_key"]
             and during_browse["gi"] == captured["gi"]

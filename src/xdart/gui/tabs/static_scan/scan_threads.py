@@ -1225,15 +1225,12 @@ class fileHandlerThread(Qt.QtCore.QThread):
                 # but that workaround is unnecessary now that the caller
                 # doesn't supply the dead kwarg in the first place.
                 #
-                # X1 O-3 (c2): supply the name from THE canonical parser.
-                # ``LiveScan.set_datafile`` names an unnamed load by splitting
-                # the basename on its FIRST dot, so `Combi4.v2_03271005.nxs`
-                # loaded as `Combi4` while every title derived from
-                # ``scan_name_from_source`` kept the full stem — two parsers,
-                # one file, two identities.  The path-only live/no_nxs repoints
-                # above are acquisition-side naming and stay untouched.
-                self.scan.set_datafile(
-                    self.fname, name=_canonical_scan_name(self.fname))
+                # X1 O-3 (§8.4): the SHARED idle/full-load path is left exactly
+                # as it was.  Canonical dotted-stem naming belongs to the
+                # browse-owned task below, which is the only path this tranche
+                # contracted to change; changing idle naming here is a separate
+                # contract with its own evidence.
+                self.scan.set_datafile(self.fname)
             # Invariant: the lazy frame series must read from the SAME file as the
             # scan.  The path-only branches above (no_nxs / live_run) repoint
             # scan.data_file but leave scan.frames as the init-time series whose

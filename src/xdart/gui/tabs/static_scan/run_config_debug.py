@@ -382,6 +382,20 @@ DECISION_HYDRATION_CONTEXT_MISMATCH = "hydration_context_mismatch"
 DECISION_BROWSE_REQUEST_REFUSED = "browse_request_refused"
 DECISION_BROWSE_ADMISSION_REFUSED = "browse_admission_refused"
 
+#: X1 O-3 (c3): a frame-driven rescope to the key already in scope.  The
+#: destructive clears are refused rather than performed, and the anomaly is
+#: reported instead of being absorbed as an ordinary scan boundary.
+DECISION_RESCOPE_WITHOUT_BOUNDARY = "rescope_without_boundary"
+
+#: A display selection that names no owned context.  It resolves to NO store —
+#: never to the acquisition's, which would serve one context's data through
+#: another's bindings.
+DECISION_SELECTION_UNRESOLVED = "display_selection_unresolved"
+
+#: A wrangler run whose configuration is not ONE admitted object across the
+#: handed-off value and all four wrapper/worker carrier-and-ledger references.
+DECISION_RUN_CONFIGURATION_UNADMITTED = "run_configuration_unadmitted"
+
 FAIL_CLOSED_DECISIONS = (
     DECISION_RECORD_STORE_SKIPPED,
     DECISION_PUBLICATION_ABSENT,
@@ -392,6 +406,9 @@ FAIL_CLOSED_DECISIONS = (
     DECISION_HYDRATION_CONTEXT_MISMATCH,
     DECISION_BROWSE_REQUEST_REFUSED,
     DECISION_BROWSE_ADMISSION_REFUSED,
+    DECISION_RESCOPE_WITHOUT_BOUNDARY,
+    DECISION_SELECTION_UNRESOLVED,
+    DECISION_RUN_CONFIGURATION_UNADMITTED,
 )
 
 #: Process-unique operation counter.  A browse load crosses a thread boundary,

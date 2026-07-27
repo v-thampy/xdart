@@ -16,6 +16,7 @@ import types
 from pathlib import Path
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from functools import partial
 import gc
 import imageio
 import pyFAI
@@ -26,6 +27,9 @@ from .run_config_debug import (
     DECISION_BROWSE_ADMISSION_REFUSED,
     DECISION_BROWSE_REQUEST_REFUSED,
     DECISION_RECORD_STORE_SKIPPED,
+    DECISION_RESCOPE_WITHOUT_BOUNDARY,
+    DECISION_SELECTION_UNRESOLVED,
+    DECISION_RUN_CONFIGURATION_UNADMITTED,
     bump_run_config_debug_generation,
     capture_diagnostic_run_identity,
     display_context_transition_log,
@@ -36,6 +40,16 @@ from .run_config_debug import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: X1 O-3 (§8.1): WHICH owner started a run.  Explicit, because the three have
+#: different configuration contracts and the wrangler's admission fields
+#: outlive the run that set them — inferring the owner from whatever survived
+#: is how a later reintegrate adopted a finished run's frozen configuration.
+RUN_ORIGIN_WRANGLER = "wrangler"
+RUN_ORIGIN_REINTEGRATE = "reintegrate"
+RUN_ORIGIN_STITCH = "stitch"
+RUN_ORIGIN_UNQUALIFIED = "unqualified"
+
 _ORPHANED_STITCH_THREADS = []
 _XYE_REFRESH_COALESCE_MS = 50
 _XYE_REFRESH_RETRY_MS = (150, 500, 1500, 3000, 7000)
@@ -2040,7 +2054,7 @@ class staticWidget(QWidget):
         # reduction of the loaded scan, routed through the SAME run-state owner
         # (_enter/_exit_run_state) as a wrangler run or a reintegrate.
         self.stitch_thread = stitchThread(self.scan, parent=self)
-        self.stitch_thread.started.connect(self._enter_run_state)
+        self.stitch_thread.started.connect(self._enter_stitch_run_state)
         self.stitch_thread.finished.connect(self.stitch_thread_finished)
         self.stitch_thread.errorSig.connect(self._on_stitch_error)
         # Default panel proportions: middle (image/plot) panels ~10% wider
@@ -9889,7 +9903,8 @@ class staticWidget(QWidget):
         # run-state owner (task #68) — keeps the 2D panels persistent AND
         # disables the processing controls (task #71) for its duration; cleared
         # in integrator_thread_finished via _exit_run_state.
-        self.integratorTree.integrator_thread.started.connect(self._enter_run_state)
+        self.integratorTree.integrator_thread.started.connect(
+            self._enter_reintegrate_run_state)
         self.integratorTree.integrator_thread.update.connect(self.integrator_thread_update)
         self.integratorTree.integrator_thread.writeError.connect(
             self._show_reintegration_write_error)
@@ -10919,7 +10934,16 @@ class staticWidget(QWidget):
             _peek = getattr(published, "_published_frames", {}).get(idx)
             if _peek is not None:
                 _key = _scan_key_from_source(getattr(_peek, "source_file", ""))
-                _cur = getattr(self.scan, "name", None)
+                # X1 O-3 (c3): the boundary compares against the acquisition
+                # CONTEXT's stamped sub-scan key, not against whatever object
+                # the display currently holds.  Reading a scan NAME here is what
+                # let a browse manufacture a boundary: the browse renamed the
+                # shared scan, the next acquisition frame looked like a new
+                # scan, and the rescope wiped the run's publication store.  The
+                # fallback keeps idle callers and duck hosts working.
+                _context = getattr(self, "_acquisition_context", None)
+                _cur = (_context.scan_key if _context is not None
+                        else getattr(self.scan, "name", None))
                 if _key and _key != _cur and _cur != "null_main":
                     # DIR-1 (bl17-2): paint the OUTGOING scan's complete frame
                     # list before the rescope clears it.  Per-frame updates
@@ -12719,23 +12743,60 @@ class staticWidget(QWidget):
             shape = ""
         return f"{type(value).__name__}@{id(value):x}{':' + shape if shape else ''}"
 
-    def _admitted_acquisition_configuration(self):
-        """The EXACT admitted ``FrozenRunConfiguration`` this run executes.
+    def _require_wrangler_run_configuration(self, handed_off):
+        """The wrangler run's configuration, or a typed refusal (§8.1).
 
-        O-3 binding rule 8: the context accepts only the object that passed the
-        W-1 admission gate — ``wrangler.run_configuration is
-        wrangler._admitted_run_configuration``.  An equal-valued, reconstructed,
-        stale-generation or fallback configuration is REFUSED and lands here as
-        ``None``; there is deliberately no tolerant acquisition-config path,
-        because ``FrozenRunConfiguration`` equality is by content and a foreign
-        object would otherwise be indistinguishable from an admitted one.
+        FIVE references must be ONE object: the configuration the Start path
+        hands over, the wrapper's public carrier, the wrapper's admission
+        ledger, the worker's carrier and the worker's ledger.  Fewer checks are
+        not equivalent — ``FrozenRunConfiguration`` equality is by CONTENT, so
+        an equal-valued reconstruction is indistinguishable from the admitted
+        object by value, and the wrapper pair alone says nothing about what the
+        worker is actually executing.
 
-        ``None`` is also the honest answer for a run with no wrangler admission
-        at all — a reintegrate or a stitch.
+        A mismatch RAISES, before ``_run_active``, before display persistence
+        and before any context exists.  It is deliberately not encoded as a
+        context whose configuration is ``None``: that spelling belongs to the
+        owners that legitimately have no wrangler admission, and reusing it for
+        a refusal would make a broken run indistinguishable from a reintegrate.
         """
-        return _accepted_run_policy(getattr(self, "wrangler", None))
+        wrangler = getattr(self, "wrangler", None)
+        worker = getattr(wrangler, "thread", None)
+        references = {
+            "handed_off": handed_off,
+            "wrapper_carrier": getattr(wrangler, "run_configuration", None),
+            "wrapper_ledger": getattr(
+                wrangler, "_admitted_run_configuration", None),
+            "worker_carrier": getattr(worker, "run_configuration", None),
+            "worker_ledger": getattr(
+                worker, "_admitted_run_configuration", None),
+        }
+        diverged = sorted(name for name, value in references.items()
+                          if value is not handed_off)
+        if handed_off is None or diverged:
+            fail_closed_rejection_log(
+                logger, DECISION_RUN_CONFIGURATION_UNADMITTED,
+                reason=("the wrangler run configuration is not one admitted "
+                        "object across all five references"),
+                outcome="run_refused", blanks_panel=False,
+                expected="handed_off", found=",".join(diverged) or "absent",
+                origin="staticWidget._enter_run_state",
+                diverged=diverged)
+            raise DisplayContextError(
+                "refusing a wrangler run whose configuration is not the "
+                "admitted object; diverged references: "
+                f"{diverged or ['absent']}")
+        return handed_off
 
-    def _install_acquisition_context(self):
+    def _enter_reintegrate_run_state(self):
+        """Reintegrate's run-start slot — a NON-wrangler owner (§8.1.4)."""
+        staticWidget._enter_run_state(self, origin=RUN_ORIGIN_REINTEGRATE)
+
+    def _enter_stitch_run_state(self):
+        """Stitch's run-start slot — a NON-wrangler owner (§8.1.4)."""
+        staticWidget._enter_run_state(self, origin=RUN_ORIGIN_STITCH)
+
+    def _install_acquisition_context(self, origin, run_configuration):
         """Create THE acquisition context for this run (run-admission owner).
 
         Constructed exactly once per run, at the seam that used to alias the
@@ -12746,7 +12807,12 @@ class staticWidget(QWidget):
         the streaming session creates it — through the single adopting writer.
         """
         scan = getattr(self, "scan", None)
-        frozen = staticWidget._admitted_acquisition_configuration(self)
+        # §8.1: the configuration comes from the ORIGIN, never from whichever
+        # wrangler fields happen to have survived a previous run.  A
+        # reintegrate or a Stitch is not a wrangler run and gets ``None``,
+        # deliberately — the parent adopted the prior run's frozen object
+        # because the wrapper's admission fields outlive the run that set them.
+        frozen = run_configuration if origin == RUN_ORIGIN_WRANGLER else None
         generation, fingerprint = None, ""
         if frozen is not None:
             try:
@@ -12773,6 +12839,7 @@ class staticWidget(QWidget):
                 getattr(scan, "global_mask", None)),
             geometry_identity=staticWidget._context_identity_stamp(
                 getattr(scan, "_cached_integrator", None)),
+            origin=str(origin),
         )
         context.adopt_record_store(
             staticWidget._active_frame_record_store(self))
@@ -12819,7 +12886,22 @@ class staticWidget(QWidget):
         active record store plus the widget's own publication store — so the
         eviction probe and the run's store-first reads are unchanged.
         """
+        selection = getattr(self, "_display_selection", None)
         context = staticWidget._selected_display_context(self)
+        if selection is not None and context is None:
+            # §8.2.4 — a selection that names a context this widget no longer
+            # owns resolves to NOTHING.  Treating it like the idle regime is
+            # what let A's stores be served through another context's bindings;
+            # a display that cannot say whose data it is showing must show none.
+            fail_closed_rejection_log(
+                logger, DECISION_SELECTION_UNRESOLVED,
+                reason="the display selection names no owned context",
+                outcome="no_store_served", blanks_panel=True,
+                expected=getattr(selection, "context_token", ""),
+                found="", origin="staticWidget._display_selected_stores",
+                selected_kind=getattr(
+                    getattr(selection, "kind", None), "value", ""))
+            return (None, None)
         if context is not None and context.kind is ContextKind.BROWSE:
             # The acquisition's scan-qualified record store is SKIPPED here, at
             # the owner that withholds it.  The projection adapter used to be
@@ -12894,11 +12976,17 @@ class staticWidget(QWidget):
         # scrolled back to.  The acquisition store keeps its persist-before-
         # evict probe; a browse store has none — everything it holds is already
         # on disk, which is the legacy loaded-scan behaviour.
+        # The hydrator is bound to THIS context, not to the display: the read
+        # runs on a background thread and can land long after the selection
+        # moved on, so resolving its scan and its owner stamp at execution time
+        # is the same defect one level below the store.  A browse read released
+        # after Resume must still produce the BROWSE's payload, into the
+        # browse's own store — and must never write the resumed run's.
         store = bindings.publication_store
         set_hydrator = getattr(store, "set_hydrator", None)
         rehydrate = getattr(display, "_rehydrate_publication", None)
         if callable(set_hydrator) and callable(rehydrate):
-            set_hydrator(rehydrate)
+            set_hydrator(partial(rehydrate, context=context))
 
         generation = display.display_generation
         bump = getattr(display, "_bump_display_generation", None)
@@ -12931,23 +13019,48 @@ class staticWidget(QWidget):
             repaint(generation=generation, reason="context-swap")
         return selection
 
-    def _select_acquisition_for_run_end(self):
-        """Return the panel to the acquisition context, then drop the browse.
+    def _select_acquisition_context(self, *, origin=""):
+        """Point the display back at the acquisition context.
 
-        A no-op for the overwhelmingly common case — a run that was never
-        browsed owns no browse context and has no browse selection, so nothing
-        is swapped, no generation is bumped and no repaint is requested.
+        THE Resume/run-end primitive, and the whole of what Resume does to the
+        acquisition: a POINTER move.  Nothing is restored, reloaded, re-derived
+        or written back — the acquisition scan, its stores and its calibration
+        were never touched while the browse was displayed, so there is nothing
+        to recover.  A no-op when a browse is not what is selected, so a run
+        that was never browsed bumps no generation and repaints nothing.
+
+        Ending browsing is deliberately NOT this method's job: replacing one
+        browse with another selects A first and then keeps browsing legal, so
+        clearing ``paused_browse_active`` here would refuse the very completion
+        the caller is about to enqueue.  The two callers that genuinely end
+        browsing — Resume and run end — clear it themselves.
         """
-        viewer = getattr(self, "h5viewer", None)
-        if viewer is not None:
-            viewer.paused_browse_active = False
         selected = staticWidget._selected_display_context(self)
         acquisition = getattr(self, "_acquisition_context", None)
-        if (acquisition is not None and selected is not None
-                and selected.kind is ContextKind.BROWSE):
-            staticWidget._apply_display_selection(
-                self, acquisition, origin="staticWidget._exit_run_state")
-        staticWidget._release_browse_context(self, reason="run_end")
+        if (acquisition is None or selected is None
+                or selected.kind is not ContextKind.BROWSE):
+            return None
+        return staticWidget._apply_display_selection(
+            self, acquisition, origin=origin or "_select_acquisition_context")
+
+    def _invalidate_browse_context(self, *, reason=""):
+        """Stop admitting browse work, but keep what the browse already holds.
+
+        Resume's half of the browse lifecycle.  The context stays owned so the
+        run-end substep can release it exactly once, and so a read still in
+        flight lands in the browse's own store rather than in the resumed run's.
+        """
+        browse = getattr(self, "_browse_context", None)
+        if browse is None or browse.invalidated:
+            return None
+        browse.invalidate()
+        run_config_debug_log(
+            logger, "browse_context_invalidated", widget=self,
+            origin="_invalidate_browse_context", reason=str(reason),
+            context_token=browse.context_token,
+            load_generation=browse.load_generation,
+            requested_path=browse.requested_path)
+        return browse
 
     def _release_browse_context(self, *, reason=""):
         """Invalidate and release the current browse, exactly once.
@@ -12957,10 +13070,13 @@ class staticWidget(QWidget):
         and record store are not this owner's to touch.
         """
         browse = getattr(self, "_browse_context", None)
-        self._browse_context = None
         if browse is None:
             return None
+        # Release BEFORE dropping the reference: a failure must leave the
+        # context reachable so the seam can be retried, not orphaned with its
+        # payload still held.
         browse.release()
+        self._browse_context = None
         run_config_debug_log(
             logger, "browse_context_released", widget=self,
             origin="_release_browse_context", reason=str(reason),
@@ -12994,9 +13110,16 @@ class staticWidget(QWidget):
                 origin="staticWidget._begin_paused_browse")
             return None
 
-        # A newer request supersedes the previous browse outright: its stores
-        # are released here, so two contexts never hold payload at once and a
-        # late completion for the old one can only be rejected.
+        # §8.2 — ORDER IS LOAD-BEARING.  Releasing the outgoing browse first
+        # emptied B's stores while the viewer bindings and the DisplaySelection
+        # still named B; the selection then no longer resolved, and the store
+        # seam fell through to the ACQUISITION's stores.  The display could
+        # therefore read A's stores through B's scan and bindings for the whole
+        # of C's load — permanently, if C's enqueue failed.  So: point the
+        # display at A, and only then release B, by which time no binding,
+        # hydrator owner or selection names it.
+        staticWidget._select_acquisition_context(
+            self, origin="staticWidget._begin_paused_browse")
         staticWidget._release_browse_context(self, reason="superseded")
 
         token = new_context_token(ContextKind.BROWSE)
@@ -13046,10 +13169,19 @@ class staticWidget(QWidget):
             viewer._ensure_file_thread_running()
             viewer.file_thread.queue.put(task)
         except Exception:
+            # Only the TENTATIVE context is released; the display is already
+            # coherently on A, so a refused enqueue leaves no mixed state.
             logger.exception("paused browse enqueue failed: %s", fpath)
             context.release()
+            fail_closed_rejection_log(
+                logger, DECISION_BROWSE_REQUEST_REFUSED,
+                reason="the browse task could not be queued",
+                outcome="browse_refused", blanks_panel=False,
+                expected=token, found=str(fpath),
+                origin="staticWidget._begin_paused_browse")
             return None
         # Only now is the request real, so only now does the trace claim one.
+        context.adopt_load_request(task)
         self._browse_context = context
         if operation is not None:
             display_context_transition_log(
@@ -13073,31 +13205,43 @@ class staticWidget(QWidget):
         context = getattr(self, "_browse_context", None)
         token = getattr(task, "context_token", None)
         generation = getattr(task, "load_generation", None)
-        if (context is None
-                or not context.matches(token, generation)
-                or not getattr(self, "_run_active", False)):
+        viewer = getattr(self, "h5viewer", None)
+        paused = bool(getattr(viewer, "paused_browse_active", False))
+        admitted = (context is not None and context.admits(task)
+                    and bool(getattr(self, "_run_active", False)) and paused)
+        if not admitted:
+            # §8.3 — the completion must BE the request this context enqueued.
+            # Token and generation alone are not an identity: a reconstructed
+            # task carrying the same pair but a foreign scan, path, name or
+            # receipt would cross this boundary.  And `_run_active` stays true
+            # across Resume, so it is not a substitute for "still paused" —
+            # `paused_browse_active` is the state that makes a browse legal.
             fail_closed_rejection_log(
                 logger, DECISION_BROWSE_ADMISSION_REFUSED,
-                reason=("the completed browse does not name the owned "
-                        "context, or the run is no longer paused"),
+                reason=("the completion is not the exact load this context "
+                        "enqueued, or browsing is no longer legal"),
                 outcome="browse_completion_dropped", blanks_panel=False,
                 expected=(None if context is None else context.context_token),
                 found=token, origin="staticWidget._on_browse_loaded",
                 label=str(getattr(task, "fname", "")),
                 generation=generation,
-                request_token=token)
+                request_token=token,
+                run_active=bool(getattr(self, "_run_active", False)),
+                paused_browse_active=paused)
             return None
-        if getattr(task, "operation", None) is not None:
-            context.stamp_provenance(
-                calibration=staticWidget._context_identity_stamp(
-                    getattr(context.scan, "_cached_poni", None)),
-                mask=staticWidget._context_identity_stamp(
-                    getattr(context.scan, "global_mask", None)),
-                result=str(getattr(context.scan, "data_file", "") or ""))
+        # §8.3.3 — provenance is a PRODUCTION property of the loaded context,
+        # not a diagnostic.  Stamping it only when the debug channel happened
+        # to be on made the context's calibration/mask/result qualification
+        # depend on an environment variable.
+        context.stamp_provenance(
+            calibration=staticWidget._context_identity_stamp(
+                getattr(context.scan, "_cached_poni", None)),
+            mask=staticWidget._context_identity_stamp(
+                getattr(context.scan, "global_mask", None)),
+            result=str(getattr(context.scan, "data_file", "") or ""))
         context.mark_loaded()
         selection = staticWidget._apply_display_selection(
             self, context, origin="staticWidget._on_browse_loaded")
-        viewer = self.h5viewer
         # ``file_thread.fname`` is a record of what IS loaded, stamped only once
         # the load has actually been admitted — never the task's identity, and
         # never a promise made at enqueue time.  Setting it at request time
@@ -13114,7 +13258,8 @@ class staticWidget(QWidget):
             logger.debug("browse frame-list rebuild failed", exc_info=True)
         return selection
 
-    def _enter_run_state(self):
+    def _enter_run_state(self, origin=RUN_ORIGIN_UNQUALIFIED,
+                         run_configuration=None):
         """Single owner of run START (task #68): mark a wrangler/integrator run
         in progress.  Idempotent — re-entry while already active is a no-op so
         re-fired ``started`` signals don't double-toggle.
@@ -13127,6 +13272,13 @@ class staticWidget(QWidget):
         """
         if self._run_active:
             return
+        # BEFORE any run-state, UI or context mutation: a wrangler run that
+        # cannot prove its configuration was admitted does not start (§8.1).
+        if origin == RUN_ORIGIN_WRANGLER:
+            run_configuration = staticWidget._require_wrangler_run_configuration(
+                self, run_configuration)
+        else:
+            run_configuration = None
         self._runend_generation = getattr(self, "_runend_generation", 0) + 1
         self._runend_catchup_generation = None
         self._runend_autofit_generation = None
@@ -13177,7 +13329,8 @@ class staticWidget(QWidget):
         # paused browse repointed that very object and Resume then had nothing
         # left to recover.  `AcquisitionContext` carries the run's identity, its
         # display bindings and its stores, so a browse can be given its own.
-        staticWidget._install_acquisition_context(self)
+        staticWidget._install_acquisition_context(
+            self, origin, run_configuration)
         # O-2.1: the browse chain qualifies its records against THIS run, so the
         # detached snapshot is refreshed as soon as the run owns a context.
         staticWidget._publish_diagnostic_run_identity(self)
@@ -13266,13 +13419,6 @@ class staticWidget(QWidget):
         if not self._run_active:
             return
         self._run_active = False
-        # X1 O-3 (c2): a run that ends while a browse is displayed returns the
-        # panel to the FINISHED run first, so run-end reconciliation, the batch
-        # reload and the finished-row selection all target the run's own scan —
-        # and only then is the browse released.  A run that never browsed takes
-        # no new action at all.  (c3 moves these into their own named,
-        # independently retryable substeps of the idle projection.)
-        staticWidget._select_acquisition_for_run_end(self)
         staticWidget._run_idle_lifecycle_projection(self, receipt)
         if not staticWidget._projection_incomplete(receipt):
             return
@@ -13344,22 +13490,74 @@ class staticWidget(QWidget):
             return True
         return False
 
+    def _select_acquisition_context_for_idle(self) -> None:
+        """Run-end substep 1: if a browse is displayed, select acquisition.
+
+        FIRST, before anything else the run end does: the reconcile, the batch
+        reload, the catch-up and the finished-row selection all target the run's
+        own scan, and they must not be asked to operate while the panel is bound
+        to somebody else's browsed result.  Idempotent — a second delivery finds
+        the acquisition already selected and does nothing.
+        """
+        viewer = getattr(self, "h5viewer", None)
+        if viewer is not None:
+            viewer.paused_browse_active = False
+        staticWidget._select_acquisition_context(
+            self, origin="staticWidget._exit_run_state")
+
+    def _release_browse_context_step(self) -> None:
+        """Run-end substep 3: release the browse load owner and its stores.
+
+        Separate from the selection swap on purpose: a retry after a failed
+        selection must not re-release, and a failure to release must not be
+        mistaken for a failure to swap.  The operator can re-open the browsed
+        result through the ordinary idle path afterwards.
+        """
+        staticWidget._release_browse_context(self, reason="run_end")
+
+    def _release_acquisition_context(self) -> None:
+        """Run-end substep 4: drop the acquisition context, last.
+
+        ORDERED after the finalization seam, not conditioned on its RESULT.
+        Refusing until ``finish_processing`` returned cleanly cannot converge:
+        the finalization claim is one-shot by design (T-4.2 — a retry must
+        never finalize the same identity twice), so a seam that failed once can
+        never report success on the retry, and the context would be stranded
+        unreleasable for the rest of the session.  What this must guarantee is
+        the ORDER — the run's identity is not discarded before its finalizer has
+        been given its one attempt — and that is exactly what the claim proves.
+        A permanent finalizer failure therefore still releases the run scan
+        (T-4.2 §35.7.C, unchanged) while its error stays in the receipt.
+        """
+        context = getattr(self, "_acquisition_context", None)
+        if context is None:
+            return
+        if not context.finalization_claimed:
+            raise DisplayContextError(
+                "the acquisition context cannot be released before its "
+                "finalization seam has run")
+        self._acquisition_context = None
+        self._display_selection = None
+
     def _finalize_acquisition_context_scan(self) -> None:
-        """Substep 1: finalize the acquisition context's scan and release it.
+        """Run-end substep 2: finalize the acquisition context's scan.
 
         X1 Slice 3a (R3-P5): stamps the run scan's persisted wavelength from
         the run cache before the context is dropped.  Pause never reaches here;
         it goes through ``_on_run_paused``.
 
-        T-4.2 (§35.7.C) preserved verbatim under the O-3 owner: the context is
-        DETACHED ATOMICALLY FIRST and its ONE finalization claim is consumed
-        before the fallible finalizer is driven from the local.  Releasing it
-        afterwards meant a persistent finalizer failure left the live run scan
-        owned after terminal closure and the recovery pass finalized the same
-        identity twice.  An absent context — or an already-consumed claim — is a
-        no-op, so a retry can never re-finalize."""
+        T-4.2 (§35.7.C) preserved under the O-3 owner: the ONE finalization
+        claim is consumed ATOMICALLY FIRST and the fallible finalizer is then
+        driven from the local.  Taking the claim afterwards meant a persistent
+        finalizer failure left the live run scan owned after terminal closure
+        and the recovery pass finalized the same identity twice.  An absent
+        context — or an already-consumed claim — is a no-op, so a retry can
+        never re-finalize.
+
+        The context OBJECT is released by its own later substep, and only once
+        this one has succeeded; dropping it here would discard the run identity
+        the receipt still needs to report an unfinished seam against."""
         context = getattr(self, "_acquisition_context", None)
-        self._acquisition_context = None
         if context is None:
             return
         run_scan = context.claim_finalization()
@@ -13368,7 +13566,10 @@ class staticWidget(QWidget):
         finish = getattr(getattr(self, "displayframe", None),
                          "finish_processing", None)
         if callable(finish):
-            finish(run_scan, scan_identity_key(run_scan))
+            # X1 O-3 (c3): the key is the context's own stamped sub-scan
+            # identity, not a re-derivation from whatever the scan object is
+            # named at finish time.
+            finish(run_scan, context.scan_key or scan_identity_key(run_scan))
         context.mark_finalized()
 
     def _apply_unlocking_integration_state(self) -> None:
@@ -13429,7 +13630,18 @@ class staticWidget(QWidget):
         df = getattr(self, "displayframe", None)
         h5 = getattr(self, "h5viewer", None)
         controls = getattr(self, "controls", None)
+        # X1 O-3 (c3): four SEPARATELY NAMED, independently retryable context
+        # seams in this exact order — select acquisition, finalize it exactly
+        # once, release the browse owner exactly once, release the acquisition
+        # only once its finalization succeeded.  Collapsing them into one
+        # opaque helper would make a later retry rerun seams that already
+        # succeeded and would lose which one actually failed.
+        _add("select_acquisition_context", self,
+             "_select_acquisition_context_for_idle")
         _add("finish_processing", self, "_finalize_acquisition_context_scan")
+        _add("release_browse_context", self, "_release_browse_context_step")
+        _add("release_acquisition_context", self,
+             "_release_acquisition_context")
         _add("transient_reads", self,
              "_set_scan_integrated_reads_transient", False)
         _add("set_processing_active", df, "set_processing_active", False)
@@ -13786,13 +13998,16 @@ class staticWidget(QWidget):
         from the wrangler's sigResuming, ahead of the command flip."""
         if not self._run_active:
             return
-        # X1 O-3 (c2): browsing stops being legal the moment the run resumes,
-        # and the browse's work is invalidated here so a load still in flight
-        # can only be refused.  (Selecting the acquisition context back is c3;
-        # until then the display keeps rendering the browsed scan, which is
-        # coherent — just not yet the resumed run.)
+        # X1 O-3 (c3): RESUME IS A SELECTION.  Browsing stops being legal, the
+        # display is pointed back at the acquisition context that has owned the
+        # run all along, and the browse is invalidated so a load still in
+        # flight can only be refused.  Nothing is restored: no scan field is
+        # rewritten, no A state is reloaded, and no identity is derived from the
+        # browsed object — because the browse never touched any of it.
         self.h5viewer.paused_browse_active = False
-        staticWidget._release_browse_context(self, reason="resume")
+        staticWidget._select_acquisition_context(
+            self, origin="staticWidget._on_run_resuming")
+        staticWidget._invalidate_browse_context(self, reason="resume")
         self._set_scan_integrated_reads_transient(True)
         # Restore path-only live repoints before re-engaging the writer guard.
         # The next frame-driven scan rescope can then return the browser to the
@@ -13807,8 +14022,12 @@ class staticWidget(QWidget):
         # scan-qualified cache (enforced by the key guard) — no reseed.
         _resume = getattr(self.displayframe, "resume_processing", None)
         if callable(_resume):
-            _resume(scan_identity_key(
-                staticWidget._acquisition_context_scan(self)))
+            # Keyed from the context's OWN stamped sub-scan identity, never
+            # re-derived from whatever object the display happens to hold.
+            context = getattr(self, "_acquisition_context", None)
+            _resume(context.scan_key if context is not None
+                    else scan_identity_key(
+                        staticWidget._acquisition_context_scan(self)))
         # O-2 diagnostics: what the run is resuming INTO.  Compared against the
         # pause event, this is where a mutated singleton shows up as an
         # acquisition role whose scan key / GI / PONI moved while paused.
@@ -14235,7 +14454,30 @@ class staticWidget(QWidget):
         display_context_transition_log(
             logger, "rescope", widget=self, origin="_rescope_frame_panel_to",
             target=self.scan, incoming_scan_name=str(name))
+        # X1 O-3 (c3): a rescope to the key the context is ALREADY scoped to is
+        # not a scan boundary — it is the signature of one having been
+        # manufactured (the browse-renames-the-singleton path that made Resume
+        # clear the run's publication store).  Browse can no longer rename the
+        # acquisition scan, so this cannot fire from that cause any more; it
+        # stays as a regression guard that refuses the destructive clears rather
+        # than performing them silently.
+        context = getattr(self, "_acquisition_context", None)
+        if context is not None and str(name) == str(context.scan_key):
+            fail_closed_rejection_log(
+                logger, DECISION_RESCOPE_WITHOUT_BOUNDARY,
+                reason="rescope requested to the key already in scope",
+                outcome="destructive_clears_skipped",
+                blanks_panel=False,
+                expected=context.scan_key,
+                found=str(name),
+                origin="staticWidget._rescope_frame_panel_to",
+                context_token=context.context_token)
+            return
         self.scan.name = name
+        # Single writer, same statement group as the scan rename: the context's
+        # stamped sub-scan key and the scan's own name never diverge.
+        if context is not None:
+            context.rescope_to(name)
         # Wire the viewer to THIS scan's output HERE (driven by the frame stream),
         # NOT from the new_scan signal — set_file queues an async set_datafile that
         # RENAMES scan.name (scan.py:set_datafile), so calling it from an out-of-sync
@@ -14712,7 +14954,8 @@ class staticWidget(QWidget):
         # Called synchronously here (GUI thread) so the controls lock before the
         # thread starts.  Cleared in wrangler_finished.
         _t3 = _time.perf_counter() if _perf else 0.0
-        self._enter_run_state()
+        self._enter_run_state(origin=RUN_ORIGIN_WRANGLER,
+                              run_configuration=_frozen)
         if _perf:
             _t4 = _time.perf_counter()
             logger.info(

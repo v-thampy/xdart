@@ -33,6 +33,12 @@ import pytest
 pytest.importorskip("pyqtgraph")
 from pyqtgraph.Qt import QtWidgets
 
+from xdart.gui.tabs.static_scan.static_scan_widget import (
+    RUN_ORIGIN_REINTEGRATE,
+    RUN_ORIGIN_STITCH,
+    RUN_ORIGIN_WRANGLER,
+)
+from xdart.modules.live import LiveScan
 from xdart.modules.display_context import (
     AcquisitionContext,
     BrowseContext,
@@ -393,43 +399,108 @@ def test_enter_run_state_builds_one_acquisition_context(widget):
     assert widget._acquisition_context is context
 
 
-def test_context_refuses_a_configuration_that_was_not_admitted(
-        widget, monkeypatch):
-    """O-3 rule 8 — only the EXACT admitted object, never an equal-valued one.
+def _admit_everywhere(widget, monkeypatch, frozen):
+    """Put all four wrapper/worker references on the same admitted object."""
+    wrangler = widget.wrangler
+    worker = wrangler.thread
+    for owner in (wrangler, worker):
+        for name in ("run_configuration", "_admitted_run_configuration"):
+            monkeypatch.setattr(owner, name, frozen, raising=False)
 
-    ``FrozenRunConfiguration`` equality is by content, so a reconstructed copy
-    on the public carrier is indistinguishable from the admitted one by value.
-    The context takes it only when the carrier IS the admission ledger.
+
+def _frozen_configuration():
+    from xrd_tools.session.run_configuration import RunIntent
+
+    return RunIntent().freeze()
+
+
+def test_a_wrangler_run_requires_all_five_admission_references(
+        widget, monkeypatch):
+    """§8.1 — the handed-off object AND all four carrier/ledger references.
+
+    ``FrozenRunConfiguration`` equality is by CONTENT, so an equal-valued
+    reconstruction is indistinguishable from the admitted object by value; and
+    the wrapper pair alone says nothing about what the WORKER is executing.
     """
     from dataclasses import replace as _replace
 
-    from xrd_tools.session.run_configuration import RunIntent
+    admitted = _frozen_configuration()
+    _admit_everywhere(widget, monkeypatch, admitted)
 
-    intent = RunIntent()
-    admitted = intent.freeze()
-    wrangler = widget.wrangler
-
-    # (a) admitted: carrier IS the ledger.
-    monkeypatch.setattr(wrangler, "run_configuration", admitted, raising=False)
-    monkeypatch.setattr(wrangler, "_admitted_run_configuration", admitted,
-                        raising=False)
-    widget._enter_run_state()
+    widget._enter_run_state(origin=RUN_ORIGIN_WRANGLER,
+                            run_configuration=admitted)
     context = widget._acquisition_context
     assert context.run_configuration is admitted
+    assert context.origin == RUN_ORIGIN_WRANGLER
     assert context.config_generation == admitted.identity[0]
     assert context.config_fingerprint == admitted.identity[1]
+    widget._exit_run_state(widget._new_projection_receipt())
 
-    # (b) foreign but content-equal: refused, and NOT silently substituted.
     foreign = _replace(admitted)
     assert foreign == admitted and foreign is not admitted
+    references = ("run_configuration", "_admitted_run_configuration")
+    owners = {"wrapper": widget.wrangler, "worker": widget.wrangler.thread}
+    for owner_name, owner in owners.items():
+        for reference in references:
+            _admit_everywhere(widget, monkeypatch, admitted)
+            monkeypatch.setattr(owner, reference, foreign, raising=False)
+            # §8.1.3/8.1.6: a refusal is a REFUSAL — no run state, no context,
+            # not a context whose configuration is quietly None.
+            with pytest.raises(DisplayContextError):
+                widget._enter_run_state(origin=RUN_ORIGIN_WRANGLER,
+                                        run_configuration=admitted)
+            assert widget._run_active is False, (
+                f"a diverged {owner_name}.{reference} still started the run")
+            assert widget._acquisition_context is None
+
+    # The handed-off object itself must be the admitted one.
+    _admit_everywhere(widget, monkeypatch, admitted)
+    with pytest.raises(DisplayContextError):
+        widget._enter_run_state(origin=RUN_ORIGIN_WRANGLER,
+                                run_configuration=foreign)
+    assert widget._run_active is False
+    assert widget._acquisition_context is None
+    with pytest.raises(DisplayContextError):
+        widget._enter_run_state(origin=RUN_ORIGIN_WRANGLER,
+                                run_configuration=None)
+    assert widget._run_active is False
+
+
+@pytest.mark.parametrize(
+    "origin", [RUN_ORIGIN_REINTEGRATE, RUN_ORIGIN_STITCH])
+def test_a_non_wrangler_run_never_adopts_the_previous_configuration(
+        widget, monkeypatch, origin):
+    """§8.1.4/8.1.5 — the stale-owner path, driven as a real sequence.
+
+    The wrapper's admission fields OUTLIVE the run that set them, so a
+    reintegrate or a Stitch that started afterwards inherited the finished
+    wrangler run's frozen configuration.  Both must deliberately carry ``None``.
+    """
+    admitted = _frozen_configuration()
+    _admit_everywhere(widget, monkeypatch, admitted)
+
+    # A real wrangler run, started and finished.
+    widget._enter_run_state(origin=RUN_ORIGIN_WRANGLER,
+                            run_configuration=admitted)
+    assert widget._acquisition_context.run_configuration is admitted
     widget._exit_run_state(widget._new_projection_receipt())
-    monkeypatch.setattr(wrangler, "run_configuration", foreign, raising=False)
-    widget._enter_run_state()
-    refused = widget._acquisition_context
-    assert refused.run_configuration is None, (
-        "an equal-valued foreign configuration was accepted as admitted")
-    assert refused.config_generation is None
-    assert refused.config_fingerprint == ""
+    assert widget._acquisition_context is None
+    # The wrangler still carries the finished run's configuration.
+    assert widget.wrangler.run_configuration is admitted
+    assert widget.wrangler._admitted_run_configuration is admitted
+
+    # Now the NON-wrangler owner starts, through its own slot.
+    slot = (widget._enter_reintegrate_run_state
+            if origin == RUN_ORIGIN_REINTEGRATE
+            else widget._enter_stitch_run_state)
+    slot()
+    context = widget._acquisition_context
+    assert context is not None
+    assert context.origin == origin
+    assert context.run_configuration is None, (
+        f"{origin} adopted the previous wrangler run's configuration")
+    assert context.config_generation is None
+    assert context.config_fingerprint == ""
 
 
 def test_run_end_finalizes_through_the_context_and_releases_it(
@@ -588,6 +659,99 @@ def test_replacing_a_browse_releases_the_previous_one(
     assert widget.displayframe.scan is widget.scan
 
 
+def _mixed_context_rows(widget, released, tentative):
+    """Every row §8.2 requires of a browse replacement.
+
+    The defect was a WINDOW: B's stores were emptied while the viewer bindings
+    and the ``DisplaySelection`` still named B, so the selection stopped
+    resolving and the store seam fell through to the ACQUISITION's stores.  The
+    display could then read A's data through B's bindings for the whole of C's
+    load — and forever, if C's enqueue failed.
+    """
+    record_store, publications = widget._display_selected_stores()
+    acquisition = widget._acquisition_context
+    selection = widget._display_selection
+    return {
+        "no_binding_names_the_released_browse": all(
+            getattr(target, name) is not getattr(released, name)
+            for target in (widget.h5viewer, widget.displayframe)
+            for name in ("scan", "frame", "frames", "frame_ids",
+                         "viewer_rows_1d", "viewer_rows_2d",
+                         "publication_store")),
+        "the_selection_does_not_name_the_released_browse":
+            selection is None or not selection.names(released),
+        "the_selection_resolves":
+            selection is None
+            or widget._selected_display_context() is not None,
+        "the_stores_are_not_the_acquisitions_under_a_browse_binding":
+            widget.displayframe.scan is acquisition.scan
+            or publications is not widget.publication_store,
+        "the_released_browse_is_released": released.released is True,
+        "the_tentative_browse_is_not_serving":
+            tentative is None or widget.displayframe.scan is not tentative.scan,
+        "the_record_store_is_the_acquisitions_or_none":
+            record_store in (None, acquisition.record_store),
+    }
+
+
+def test_replacing_a_selected_browse_never_mixes_its_bindings_with_a_stores(
+        widget, monkeypatch, tmp_path):
+    """§8.2 — B1 selected, B2 pending: no mixed context at any point."""
+    queued = _paused_run(widget, monkeypatch)
+    first = widget._begin_paused_browse(str(tmp_path / "b1.nxs"))
+    widget._on_browse_loaded(queued[0])
+    assert widget._display_selection.names(first)
+    assert widget.displayframe.scan is first.scan
+
+    second = widget._begin_paused_browse(str(tmp_path / "b2.nxs"))
+    assert second is not None and second is widget._browse_context
+    rows = _mixed_context_rows(widget, first, second)
+    assert rows == dict.fromkeys(rows, True), rows
+    # Selecting A back is what makes all of that true.
+    assert widget.displayframe.scan is widget._acquisition_context.scan
+    assert widget._display_selection.names(widget._acquisition_context)
+
+
+def test_a_failed_browse_enqueue_leaves_a_coherent_acquisition_selection(
+        widget, monkeypatch, tmp_path):
+    """§8.2.3/8.2.5 — the permanent form of the same window.
+
+    An enqueue failure used to leave B released, B's bindings displayed and A's
+    stores serving them, with nothing to correct it.
+    """
+    queued = _paused_run(widget, monkeypatch)
+    first = widget._begin_paused_browse(str(tmp_path / "b1.nxs"))
+    widget._on_browse_loaded(queued[0])
+    assert widget.displayframe.scan is first.scan
+
+    def refusing_put(task):
+        raise RuntimeError("enqueue refused")
+
+    monkeypatch.setattr(widget.h5viewer.file_thread.queue, "put", refusing_put)
+    assert widget._begin_paused_browse(str(tmp_path / "b2.nxs")) is None
+    assert widget._browse_context is None
+
+    rows = _mixed_context_rows(widget, first, None)
+    assert rows == dict.fromkeys(rows, True), rows
+    assert widget.displayframe.scan is widget._acquisition_context.scan
+    assert widget._display_selected_stores()[1] is widget.publication_store
+
+
+def test_an_unresolved_selection_serves_no_store(widget, monkeypatch,
+                                                 tmp_path):
+    """§8.2.4 — an unresolved selection must NEVER mean "fall back to A"."""
+    queued = _paused_run(widget, monkeypatch)
+    context = widget._begin_paused_browse(str(tmp_path / "b1.nxs"))
+    widget._on_browse_loaded(queued[0])
+    assert widget._display_selected_stores()[1] is context.publication_store
+
+    # The selection now names a context this widget no longer owns.
+    widget._browse_context = None
+    assert widget._selected_display_context() is None
+    assert widget._display_selected_stores() == (None, None), (
+        "an unresolved selection served the acquisition's stores")
+
+
 def test_admission_refuses_a_completion_it_does_not_own(
         widget, monkeypatch, tmp_path):
     """Exact identity, not arrival order: token, generation and a live run."""
@@ -618,6 +782,110 @@ def test_admission_refuses_a_completion_it_does_not_own(
     widget._run_active = False
     widget._display_selection = None
     assert widget._on_browse_loaded(task) is None
+
+
+def test_admission_refuses_a_reconstructed_task_on_every_field(
+        widget, monkeypatch, tmp_path):
+    """§8.3 — token plus generation is not an identity.
+
+    Each row reconstructs the task with the SAME token and generation and one
+    foreign field.  Every one must be refused, and every refusal must leave the
+    selection and both contexts exactly as they were.
+    """
+    from xdart.gui.tabs.static_scan.scan_threads import BrowseLoadTask
+
+    queued = _paused_run(widget, monkeypatch)
+    context = widget._begin_paused_browse(str(tmp_path / "browsed.nxs"))
+    task = queued[0]
+    foreign_scan = LiveScan("foreign", data_file=str(tmp_path / "foreign.nxs"),
+                            static=True, file_lock=widget.file_lock)
+
+    class _Receipt:
+        token = task.context_token
+        load_generation = task.load_generation
+
+    variants = {
+        "foreign_scan": dict(scan=foreign_scan),
+        "foreign_path": dict(fname=str(tmp_path / "foreign.nxs")),
+        "foreign_name": dict(scan_name="foreign"),
+        "foreign_operation": dict(operation=_Receipt()),
+    }
+    for name, override in variants.items():
+        fields = dict(
+            method=task.method, operation=task.operation, scan=task.scan,
+            fname=task.fname, scan_name=task.scan_name,
+            context_token=task.context_token,
+            load_generation=task.load_generation)
+        fields.update(override)
+        assert widget._on_browse_loaded(BrowseLoadTask(**fields)) is None, name
+        assert widget._display_selection is None, name
+        assert widget._browse_context is context, name
+        assert context.loaded is False, name
+        assert widget.displayframe.scan is widget.scan, name
+
+    # A task that is value-identical but not the SAME object is still refused.
+    clone = BrowseLoadTask(
+        method=task.method, operation=task.operation, scan=task.scan,
+        fname=task.fname, scan_name=task.scan_name,
+        context_token=task.context_token,
+        load_generation=task.load_generation)
+    assert widget._on_browse_loaded(clone) is None
+    assert widget._display_selection is None
+    # The exact enqueued object is admitted.
+    assert widget._on_browse_loaded(task) is not None
+
+
+def test_admission_refuses_a_completion_once_browsing_has_ended(
+        widget, monkeypatch, tmp_path):
+    """§8.3.2 — ``_run_active`` stays true across Resume, so it is not the gate."""
+    queued = _paused_run(widget, monkeypatch)
+    context = widget._begin_paused_browse(str(tmp_path / "browsed.nxs"))
+    # Exactly what Resume leaves behind: the run is still active, browsing is
+    # not legal any more, and the browse has been invalidated.
+    widget.h5viewer.paused_browse_active = False
+    widget._invalidate_browse_context(reason="resume")
+    assert widget._run_active is True
+
+    assert widget._on_browse_loaded(queued[0]) is None
+    assert widget._display_selection is None
+    assert context.loaded is False
+    assert widget.displayframe.scan is widget.scan
+
+
+def test_admission_refuses_once_browsing_ends_even_before_the_release(
+        widget, monkeypatch, tmp_path):
+    """§8.3.2, isolated: the PAUSED state alone must refuse the completion.
+
+    Run end clears ``paused_browse_active`` in its first substep and releases
+    the browse in its third, so there is a real window in which the context is
+    still live and still un-invalidated while browsing is already illegal.  A
+    completion landing there must be refused on that ground alone — which is
+    what makes the paused check load-bearing rather than merely redundant with
+    the invalidation.
+    """
+    queued = _paused_run(widget, monkeypatch)
+    context = widget._begin_paused_browse(str(tmp_path / "browsed.nxs"))
+    widget.h5viewer.paused_browse_active = False
+    assert widget._run_active is True
+    assert context.invalidated is False and context.released is False
+
+    assert widget._on_browse_loaded(queued[0]) is None
+    assert widget._display_selection is None
+    assert context.loaded is False
+
+
+def test_provenance_is_stamped_without_the_diagnostic_channel(
+        widget, monkeypatch, tmp_path):
+    """§8.3.3 — turning the debug channel off must not unqualify a context."""
+    monkeypatch.delenv("XDART_RUN_CONFIG_DEBUG", raising=False)
+    queued = _paused_run(widget, monkeypatch)
+    context = widget._begin_paused_browse(str(tmp_path / "browsed.nxs"))
+    assert context.operation is None, "the channel was not actually off"
+
+    assert widget._on_browse_loaded(queued[0]) is not None
+    assert context.loaded is True
+    assert context.result_identity.endswith("browsed.nxs"), (
+        "the accepted load carries no detached result provenance")
 
 
 def test_the_swap_moves_every_display_binding(widget, monkeypatch, tmp_path):

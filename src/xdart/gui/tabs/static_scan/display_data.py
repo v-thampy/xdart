@@ -570,8 +570,15 @@ class DisplayDataMixin:
                     )
         return snapshot
 
-    def _hydrate_frame_from_disk(self, idx, *, allow_blocking_read=True):
+    def _hydrate_frame_from_disk(self, idx, *, allow_blocking_read=True,
+                                 scan=None):
         """Lazy-load a frame from the scan for a ``viewer_rows_2d`` cache miss.
+
+        X1 O-3 (c3): ``scan`` names the context the read belongs to.  Without
+        it this resolved the display's CURRENT scan at execution time, so a
+        browse hydration that completed after Resume read the resumed run's
+        frames — the same execution-time binding the browse split exists to
+        remove, one level below the store.
 
         ``viewer_rows_2d`` is a bounded window (``FixSizeOrderedDict(max=20)``), so a
         cross-frame 2D selection larger than the window would otherwise drop the
@@ -583,7 +590,7 @@ class DisplayDataMixin:
         Returns the ``LiveFrame`` or ``None`` (never raises — a missing/corrupt
         frame is just excluded from the selection).
         """
-        scan = getattr(self, 'scan', None)
+        scan = scan if scan is not None else getattr(self, 'scan', None)
         frames = getattr(scan, 'frames', None)
         if frames is None:
             return None
@@ -598,7 +605,12 @@ class DisplayDataMixin:
         # goes idle.  The full disk hydration below runs only when idle (post-run
         # reload / whole-scan Set-Bkg on a finished file), where the writer is
         # not contending and catch_h5py_file opens cleanly.
-        if getattr(self, '_processing_active', False):
+        _own_scan = getattr(self, 'scan', None)
+        if getattr(self, '_processing_active', False) and scan is _own_scan:
+            # The writer is churning THIS scan's .nxs, so serve only what it
+            # already has resident.  A context whose file no writer owns is not
+            # subject to that restriction — refusing its read would be
+            # protecting the wrong file.
             in_mem = getattr(frames, '_in_memory', None)
             return in_mem.get(int(idx)) if isinstance(in_mem, dict) else None
         if not allow_blocking_read:
@@ -643,10 +655,17 @@ class DisplayDataMixin:
         with ctx:
             yield
 
-    def _rehydrate_publication(self, label):
-        """D2 hydrator for the shared :class:`PublicationStore` (greenfield
-        Phase 3): read an evicted frame from ``scan.frames`` / the ``.nxs`` and
-        build a heavy :class:`FramePublication` (cake + full raw).
+    def _rehydrate_publication(self, label, *, context=None):
+        """D2 hydrator for a :class:`PublicationStore` (greenfield Phase 3):
+        read an evicted frame from ``scan.frames`` / the ``.nxs`` and build a
+        heavy :class:`FramePublication` (cake + full raw).
+
+        X1 O-3 (c3): ``context`` is the display context whose store registered
+        this hydrator, bound at swap time.  Every read and every stamp is taken
+        from THAT context rather than from whatever the display happens to be
+        showing when the background read finally runs — so a browse hydration
+        released after Resume produces the BROWSE's payload, in the browse's own
+        store, and the resumed run's store is never written by it.
 
         Registered via ``store.set_hydrator`` and invoked by
         ``store.get_or_hydrate`` — from the BACKGROUND
@@ -658,8 +677,9 @@ class DisplayDataMixin:
         resident in-memory frames (lock-free), so this never contends with the
         live writer for the file.
         """
+        _context_scan = getattr(context, "scan", None)
         try:
-            lf = self._hydrate_frame_from_disk(int(label))
+            lf = self._hydrate_frame_from_disk(int(label), scan=_context_scan)
         except Exception:
             logger.debug("rehydrate: disk read failed for %s", label,
                          exc_info=True)
@@ -672,14 +692,17 @@ class DisplayDataMixin:
             except Exception:
                 logger.debug("rehydrate: lazy raw failed for %s", label,
                              exc_info=True)
-        store = getattr(self, 'publication_store', None)
+        store = (getattr(context, "publication_store", None)
+                 if context is not None
+                 else getattr(self, 'publication_store', None))
         generation = store.generation if store is not None else 0
         try:
             from xdart.modules.frame_publication import publication_from_live_frame
             # Step 6: key the rehydrated record under the real GI mode (same as
             # the live/reintegrate upsert sites) so an evicted-then-rehydrated
             # frame's record is consistent with the rest.  .view is unaffected.
-            _scan = getattr(self, "scan", None)
+            _scan = (_context_scan if _context_scan is not None
+                     else getattr(self, "scan", None))
             _display_gi = getattr(self, "_display_gi_enabled", None)
             _is_gi = (
                 bool(_display_gi(_scan))
@@ -706,9 +729,10 @@ class DisplayDataMixin:
                     _a2.get("gi_mode_2d", "qip_qoop")
                     if _is_gi else None),
                 # X1 3c (S3-OR1): hydration replacement re-stamps the owner
-                # from the authoritative current scan (the frame came from
-                # this scan's own frame series).
-                scan_key=_current_scan_key(self),
+                # from the authoritative scan the frame came from — the
+                # REQUESTING context's, not whatever is displayed now (O-3 c3).
+                scan_key=(str(getattr(context, "scan_key", "") or "")
+                          or _current_scan_key(self)),
             )
         except Exception:
             logger.debug("rehydrate: publication build failed for %s", label,

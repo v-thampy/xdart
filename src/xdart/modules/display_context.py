@@ -122,13 +122,16 @@ class _WriteOnceIdentity:
 
 
 def _clear(obj) -> None:
-    """Best-effort ``clear()`` on an owned container/store."""
+    """``clear()`` an owned container/store.  Failures PROPAGATE.
+
+    A swallowed release failure is a retained payload nobody can see: the
+    run-end projection would record the seam as complete while the browse's
+    store still held its frames.  The caller is a receipt substep, so raising
+    is what gets the seam recorded and retried.
+    """
     clear = getattr(obj, "clear", None)
     if callable(clear):
-        try:
-            clear()
-        except Exception:
-            pass
+        clear()
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +228,10 @@ class AcquisitionContext(_WriteOnceIdentity):
     publication_store: object
     #: Detached geometry/mask stamps — strings, so comparing them can never
     #: resurrect or mutate the array they describe.
+    #: WHICH owner started this run (§8.1) — wrangler, reintegrate or stitch.
+    #: Recorded so a later reader can tell "this run had no frozen
+    #: configuration because it is a reintegrate" from "this run lost one".
+    origin: str = ""
     poni_identity: str = ""
     mask_identity: str = ""
     geometry_identity: str = ""
@@ -243,7 +250,7 @@ class AcquisitionContext(_WriteOnceIdentity):
         "context_token", "run_configuration", "config_generation",
         "config_fingerprint", "run_scan_key", "source_path", "scan", "frame",
         "frame_ids", "frames", "viewer_rows_1d", "viewer_rows_2d",
-        "publication_store", "poni_identity", "mask_identity",
+        "publication_store", "origin", "poni_identity", "mask_identity",
         "geometry_identity",
     })
 
@@ -329,8 +336,20 @@ class BrowseContext(_WriteOnceIdentity):
     #: acquisition's scan-qualified record store.  Present so the swap surface
     #: is complete by construction rather than by omission.
     record_store: object = None
+    #: The EXACT immutable load request this context enqueued (the file task
+    #: itself).  Admission compares the completion against THIS object, not
+    #: against a token that a reconstructed task could also carry.  SINGLE
+    #: WRITER: :meth:`adopt_load_request`, once, at enqueue.
+    load_request: object = None
     #: SINGLE WRITER: the GUI admission owner.
     loaded: bool = False
+    #: No further completion may be admitted.  Resume sets this WITHOUT
+    #: discarding what the browse already holds: a read that was already in
+    #: flight still lands in the browse's own store, where it belongs and
+    #: where it can be seen to have landed — it simply cannot reach the
+    #: display any more.
+    invalidated: bool = False
+    #: The owned payload has been dropped as well (replacement, run end).
     released: bool = False
     calibration_identity: str = ""
     mask_identity: str = ""
@@ -361,9 +380,38 @@ class BrowseContext(_WriteOnceIdentity):
     def source_path(self) -> str:
         return self.requested_path
 
+    def adopt_load_request(self, request) -> None:
+        """Retain the exact enqueued request (write-once)."""
+        if self.load_request is not None:
+            raise DisplayContextError(
+                "a browse context enqueues exactly one load request")
+        self.load_request = request
+
+    def admits(self, request) -> bool:
+        """Whether *request* is EXACTLY the load this context is waiting for.
+
+        Identity first — the completion must be the object this context
+        enqueued — and then every value it carries is re-checked against the
+        context.  A token and a generation are not an identity: a reconstructed
+        request carrying the same pair but a foreign scan, path, name or receipt
+        would otherwise cross a fail-closed admission boundary.
+        """
+        if self.released or self.invalidated or self.load_request is None:
+            return False
+        if request is not self.load_request:
+            return False
+        return (getattr(request, "context_token", None) == self.context_token
+                and getattr(request, "load_generation", None)
+                == self.load_generation
+                and getattr(request, "scan", None) is self.scan
+                and str(getattr(request, "fname", "")) == self.requested_path
+                and str(getattr(request, "scan_name", "")) == self.scan_key
+                and getattr(request, "operation", None) is self.operation)
+
     def matches(self, context_token, load_generation) -> bool:
-        """Whether a completion names EXACTLY this context and load."""
+        """Whether a completion names this context's token and load."""
         return (not self.released
+                and not self.invalidated
                 and context_token == self.context_token
                 and load_generation == self.load_generation)
 
@@ -388,8 +436,20 @@ class BrowseContext(_WriteOnceIdentity):
             publication_store=self.publication_store,
         )
 
+    def invalidate(self) -> None:
+        """Refuse every further completion, WITHOUT dropping the payload.
+
+        This is what Resume does to a browse.  A read already in flight still
+        completes into this context's own store — that is where it belongs, and
+        destroying the store underneath it would turn a clean rejection into a
+        half-written one — but nothing it produces can reach the display again.
+        Idempotent.
+        """
+        self.invalidated = True
+        self.loaded = False
+
     def release(self) -> None:
-        """Invalidate this browse and drop everything it retained.
+        """Invalidate this browse AND drop everything it retained.
 
         Idempotent.  The identity fields stay bound so a late completion can
         still be REJECTED by token rather than crashing on a half-nulled
@@ -398,8 +458,12 @@ class BrowseContext(_WriteOnceIdentity):
         """
         if self.released:
             return
-        self.released = True
-        self.loaded = False
+        # Invalidate FIRST: whatever happens to the payload, no completion may
+        # be admitted from here on.  ``released`` is set only once every owned
+        # container is actually empty, so a failed release is retried by the
+        # run-end projection instead of being recorded as done.
+        self.invalidate()
         for owned in (self.publication_store, self.frames, self.frame_ids,
                       self.viewer_rows_1d, self.viewer_rows_2d):
             _clear(owned)
+        self.released = True
