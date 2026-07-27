@@ -436,39 +436,59 @@ def _detached_container(value: Any) -> Any:
 
     O-1a-W1R-D2 (review §42.2 items 1 and 3, §43.3).  :func:`_freeze_value`
     accepts ANY object that converts itself through ``item()``/``tolist()``, so
-    those -- not just the ``dtype``-bearing subset the first version copied --
-    are exactly what this boundary owes a copy; an object with neither is one of
-    the immutable scalars that algebra accepts, and sharing it is safe.
+    those -- not just the ``dtype``-bearing subset -- are exactly what this
+    boundary owes a recursive copy.
 
-    ``copy()`` is preferred because it preserves dtype and shape, but a
-    ``copy()`` that is absent, refuses, or hands back the SAME object is not a
-    copy, so the value conversion is detached in its place.  Nothing this module
-    recognizes as a mutable value container is ever returned as-is; a container
-    that can neither copy nor convert itself fails closed.
+    An arbitrary ``copy()`` is not evidence: it can be shallow or even change
+    the value.  Generic containers are rebuilt from their recursively detached
+    value conversion (or reduced to that built-in value).  Only NumPy's narrow
+    dtype/shape value protocol uses ``deepcopy`` to preserve its public type,
+    and every retained result must freeze to the exact pre-copy value.
     """
     converters = [name for name in ("item", "tolist")
                   if callable(getattr(value, name, None))]
     if not converters:
         return value
-    copier = getattr(value, "copy", None)
-    if callable(copier):
-        try:
-            copied = copier()
-        except Exception:  # a copy that raises is not a copy; convert instead
-            copied = value
-        if copied is not value:
-            return copied
+
+    frozen_before = _freeze_value(value)
     for name in converters:
         try:
             converted = getattr(value, name)()
         except (TypeError, ValueError):
             continue
-        if converted is not value:
-            return _detached_value(converted)
+        if converted is value:
+            continue
+        detached = _detached_value(converted)
+        if _freeze_value(detached) != frozen_before:
+            continue
+
+        value_type = type(value)
+        if (value_type.__module__.split(".", 1)[0] == "numpy"
+                and hasattr(value, "dtype") and hasattr(value, "shape")):
+            try:
+                copied = copy.deepcopy(value)
+            except Exception:
+                copied = value
+            if (copied is not value
+                    and _freeze_value(copied) == frozen_before):
+                return copied
+
+        # Rebuilding from an already-detached value preserves simple public
+        # value-container types (including hashable mapping keys) without
+        # trusting their potentially shallow ``copy()`` implementation.
+        if callable(getattr(value, "copy", None)):
+            try:
+                rebuilt = value_type(detached)
+            except Exception:
+                rebuilt = value
+            if (rebuilt is not value
+                    and _freeze_value(rebuilt) == frozen_before):
+                return rebuilt
+        return detached
     raise TypeError(
         "run configuration values must be detachable; "
-        f"{type(value).__module__}.{type(value).__qualname__} can neither "
-        "copy nor convert itself")
+        f"{type(value).__module__}.{type(value).__qualname__} cannot provide "
+        "an equivalent detached value")
 
 
 def _detached_source_spec(value):

@@ -457,6 +457,22 @@ class _ThrowingCopy(_TolistOnly):
         raise ValueError("this container cannot copy itself")
 
 
+class _ShallowCopyContainer(_TolistOnly):
+    """A distinct outer copy that still aliases its mutable payload."""
+
+    def copy(self):
+        copied = object.__new__(type(self))
+        copied.items = self.items
+        return copied
+
+
+class _SemanticLieContainer(_TolistOnly):
+    """A distinct ``copy()`` whose value differs from the accepted input."""
+
+    def copy(self):
+        return type(self)([999])
+
+
 class _HashableTolist(_TolistOnly):
     """Hash-sensitive: usable as a mapping key while still mutable."""
 
@@ -489,6 +505,27 @@ def test_clone_candidate_detaches_every_accepted_value_container(factory):
 
     assert copied is not value
     value.items.append(3)
+    settled = copied.tolist() if hasattr(copied, "tolist") else copied
+    assert settled == [1, 2]
+
+
+def test_clone_candidate_does_not_trust_a_distinct_shallow_copy():
+    value = _ShallowCopyContainer([1, 2])
+    intent = RunIntent(run_options={"probe": value})
+
+    copied = intent.clone_candidate().run_options["probe"]
+    value.items.append(3)
+
+    settled = copied.tolist() if hasattr(copied, "tolist") else copied
+    assert settled == [1, 2]
+
+
+def test_clone_candidate_does_not_trust_a_value_changing_copy():
+    value = _SemanticLieContainer([1, 2])
+    intent = RunIntent(run_options={"probe": value})
+
+    copied = intent.clone_candidate().run_options["probe"]
+
     settled = copied.tolist() if hasattr(copied, "tolist") else copied
     assert settled == [1, 2]
 
