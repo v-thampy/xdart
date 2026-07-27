@@ -478,6 +478,218 @@ def _selected_display_owners(widget):
     }
 
 
+def _acquisition_unchanged_rows(widget, captured, held_labels):
+    """The "nothing A owns moved" contract, as a reusable predicate.
+
+    Extracted so the mutation rows in this file can drive the SAME rows the
+    acceptance case asserts (§63.4 A.5) — a mutation that a private inline dict
+    cannot be pointed at is not a discriminator.
+
+    Every row interrogates an object captured at Pause, except the binding rows,
+    which are deliberately re-read live: comparing a captured reference back to
+    the scan it came from could never fail.
+    """
+    a_scan = captured["scan"]
+    a_store = captured["publication_store"]
+    record_store = captured["record_store"]
+    live = _live_bindings(widget)
+    return {
+        "captured_scan_keeps_its_key":
+            str(getattr(a_scan, "name", "")) == captured["scan_key"],
+        "captured_scan_keeps_its_file":
+            str(getattr(a_scan, "data_file", "") or "") == captured["data_file"],
+        "captured_scan_keeps_its_gi":
+            bool(getattr(a_scan, "gi", False)) == captured["gi"],
+        "captured_scan_keeps_its_mask":
+            getattr(a_scan, "global_mask", None) is captured["global_mask"],
+        "captured_scan_keeps_its_data_mask":
+            getattr(a_scan, "_cached_data_mask", None)
+            is captured["cached_data_mask"],
+        "captured_scan_keeps_its_poni":
+            getattr(a_scan, "_cached_poni", None) is captured["poni"],
+        "captured_scan_keeps_its_1d_args":
+            dict(getattr(a_scan, "bai_1d_args", {}) or {})
+            == captured["bai_1d_args"],
+        "captured_scan_keeps_its_2d_args":
+            dict(getattr(a_scan, "bai_2d_args", {}) or {})
+            == captured["bai_2d_args"],
+        "captured_record_store_keeps_its_owner":
+            getattr(record_store, STORE_SCAN_KEY_ATTR, None)
+            == captured["record_store_owner"],
+        "captured_record_store_keeps_its_frames":
+            set(captured["record_store_labels"])
+            <= set(_store_labels(record_store)),
+        "captured_publication_store_keeps_its_generation":
+            a_store.generation == captured["publication_generation"],
+        "captured_publications_survive": all(
+            _publication_owner(a_store, label)
+            == captured["publication_owners"][label] for label in held_labels),
+        # Live re-reads: a binding swap after Pause must be visible here.
+        "integrator_is_still_bound_to_acquisition":
+            live["integrator_scan"] is a_scan,
+        "stitch_is_still_bound_to_acquisition":
+            live["stitch_scan"] is a_scan,
+        "worker_is_still_bound_to_acquisition":
+            live["wrangler_thread_scan"] is None
+            or live["wrangler_thread_scan"] is a_scan,
+    }
+
+
+def _resume_rows(widget, captured, held_labels):
+    """The "Resume is a selection, and A's own payload comes back" contract.
+
+    §63.4 C.3.  An A title over retained B panels is the false-green this row
+    set exists to reject, so the rendered tiers AND their typed capabilities are
+    required to be A's resident payload — the title and key rows are necessary
+    but never sufficient.
+    """
+    a_scan = captured["scan"]
+    a_key = captured["scan_key"]
+    display = widget.displayframe
+    selected = _selected_display_owners(widget)
+    projection = selected["projection"]
+    live = _live_bindings(widget)
+    rows = dict(_acquisition_unchanged_rows(widget, captured, held_labels))
+    rows.update({
+        "run_still_owned": widget._run_active is True,
+        "selection_points_at_captured_acquisition":
+            selected["display_scan"] is a_scan,
+        "title_names_acquisition": a_key in selected["title"],
+        "resumed_projection_is_owner_qualified":
+            selected["projection_scan_key"] == a_key
+            and bool(getattr(projection, "present", False)),
+        # The load-bearing half §63.2 P1-O2.1-4.4 found missing.
+        "resumed_raw_is_acquisition_resident_payload":
+            _capability_is_rendered_payload(projection, "raw"),
+        "resumed_cake_is_acquisition_resident_payload":
+            _capability_is_rendered_payload(projection, "integrated_2d"),
+        "resumed_1d_is_acquisition_resident_payload":
+            _capability_is_rendered_payload(projection, "integrated_1d"),
+        "resumed_raw_panel_rendered": _panel_has_image(display.image_data),
+        "resumed_cake_panel_rendered": _panel_has_image(display.binned_data),
+        "resumed_1d_panel_rendered": _panel_has_trace(display.plot_data),
+        "resumed_evidence_belongs_to_acquisition":
+            _evidence_names_scan(projection, a_key),
+        "resumed_geometry_is_acquisition":
+            getattr(a_scan, "_cached_poni", None) is captured["poni"]
+            and getattr(
+                selected["display_scan"], "_cached_poni", None)
+            is captured["poni"],
+        "resumed_mask_is_acquisition":
+            getattr(
+                selected["display_scan"], "global_mask", None)
+            is captured["global_mask"],
+        "integrator_never_left_the_acquisition":
+            live["integrator_scan"] is a_scan,
+        "captured_publication_store_not_recycled":
+            selected["publication_store"] is captured["publication_store"],
+    })
+    return rows
+
+
+def _evidence_names_scan(projection, scan_key):
+    """Does the projection's source evidence belong to ``scan_key``?
+
+    The capability identity is a ``path#index`` source spelling and the scan key
+    is a scan name — different namespaces, so they are compared through the
+    production canonical parser rather than by equality (§63.2 P1-O2.1-3).
+    """
+    identity = str(
+        getattr(getattr(projection, "capabilities", None), "identity", "") or "")
+    if not identity or not scan_key:
+        return False
+    source = identity.rsplit("#", 1)[0]
+    try:
+        return scan_name_from_source(source) == scan_key
+    except Exception:
+        return False
+
+
+def _hydration_latch_store(widget):
+    """The store a held BROWSE hydration must be latched on.
+
+    §63.4 C.1: the SELECTED display store, not ``widget.publication_store``.
+    They are one object at this parent, but under the required split the widget
+    attribute stays acquisition-owned and a latch installed there would never be
+    entered by B's hydrator — the acceptance case would then die at its
+    precondition instead of proving anything.
+    """
+    return _selected_display_owners(widget)["publication_store"]
+
+
+def _correlated_hydration_rejections(
+        events, *, expected_owner, found_owner, label, generation,
+        request_token):
+    """New rejections that echo the EXACT held request (§63.4 C.1).
+
+    Label and generation alone are not a correlation: a later request for the
+    same frame at the same generation would satisfy them.  The request's own
+    context token must come back.
+    """
+    matched = []
+    for event in events:
+        if event.get("decision") != DECISION_HYDRATION_CONTEXT_MISMATCH:
+            continue
+        if event.get("label") != label or event.get("generation") != generation:
+            continue
+        if event.get("expected_owner") != expected_owner:
+            continue
+        if found_owner not in str(event.get("found_owner", "")):
+            continue
+        if not request_token or event.get("request_token") != request_token:
+            continue
+        matched.append(event)
+    return matched
+
+
+def _held_request_context_token(kwargs):
+    """The context token a hydration request carries, or ``""``.
+
+    Nothing supplies one at this parent — which is the defect — so this returns
+    empty and the correlation above cannot match.  O-3 threads the browse
+    context's token through the request and echoes it in the rejection.
+    """
+    for key in ("context_token", "owner_token", "request_token", "context_id"):
+        value = kwargs.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _live_bindings(widget):
+    """Re-read the acquisition-side bindings NOW, from the live widget.
+
+    §63.4 C.2.  Comparing the references captured at Pause back to the scan they
+    were captured from is a tautology — it cannot see a binding swap that
+    happened afterwards.  These are read fresh at every checkpoint so a
+    forbidden swap of the integrator, stitch or wrangler binding is visible.
+    """
+    wrangler = getattr(widget, "wrangler", None)
+    return {
+        "integrator_scan": getattr(
+            getattr(widget, "integratorTree", None), "scan", None),
+        "stitch_scan": getattr(
+            getattr(widget, "stitch_thread", None), "scan", None),
+        "wrangler_scan_name": getattr(wrangler, "scan_name", None),
+        "wrangler_thread_scan": getattr(
+            getattr(wrangler, "thread", None), "scan", None),
+    }
+
+
+def _admitted_run_configuration(widget):
+    """The exact ``FrozenRunConfiguration`` admitted to execution, if any.
+
+    Returns ``(carrier, executed)`` — the object the wrangler holds and the one
+    its worker thread holds.  A browse's diagnostic identity must be built from
+    THIS, not from a run generation counter plus a mutable scan address.
+    """
+    wrangler = getattr(widget, "wrangler", None)
+    return (
+        getattr(wrangler, "run_configuration", None),
+        getattr(getattr(wrangler, "thread", None), "run_configuration", None),
+    )
+
+
 def _capability(projection, name):
     return getattr(getattr(projection, "capabilities", None), name, None)
 
@@ -660,8 +872,6 @@ def test_paused_browse_leaves_acquisition_untouched(qapp, acquisition):
     """
     widget, _recorder = acquisition()
     captured = _capture_acquisition_owners(widget)
-    a_scan = captured["scan"]
-    a_store = captured["publication_store"]
     held = tuple(label for label in _COLLIDING_LABELS
                  if captured["publication_owners"].get(label))
     assert held, (
@@ -671,44 +881,7 @@ def test_paused_browse_leaves_acquisition_untouched(qapp, acquisition):
     _browse_load(qapp, widget, _B_RESULT)
     _select_frame_row(qapp, widget, 2)
 
-    record_store = captured["record_store"]
-    observed = {
-        "captured_scan_keeps_its_key":
-            str(getattr(a_scan, "name", "")) == captured["scan_key"],
-        "captured_scan_keeps_its_file":
-            str(getattr(a_scan, "data_file", "") or "")
-            == captured["data_file"],
-        "captured_scan_keeps_its_gi":
-            bool(getattr(a_scan, "gi", False)) == captured["gi"],
-        "captured_scan_keeps_its_mask":
-            getattr(a_scan, "global_mask", None) is captured["global_mask"],
-        "captured_scan_keeps_its_data_mask":
-            getattr(a_scan, "_cached_data_mask", None)
-            is captured["cached_data_mask"],
-        "captured_scan_keeps_its_poni":
-            getattr(a_scan, "_cached_poni", None) is captured["poni"],
-        "captured_scan_keeps_its_1d_args":
-            dict(getattr(a_scan, "bai_1d_args", {}) or {})
-            == captured["bai_1d_args"],
-        "captured_scan_keeps_its_2d_args":
-            dict(getattr(a_scan, "bai_2d_args", {}) or {})
-            == captured["bai_2d_args"],
-        "captured_record_store_keeps_its_owner":
-            getattr(record_store, STORE_SCAN_KEY_ATTR, None)
-            == captured["record_store_owner"],
-        "captured_record_store_keeps_its_frames":
-            set(captured["record_store_labels"])
-            <= set(_store_labels(record_store)),
-        "captured_publication_store_keeps_its_generation":
-            a_store.generation == captured["publication_generation"],
-        "captured_publications_survive": all(
-            _publication_owner(a_store, label)
-            == captured["publication_owners"][label] for label in held),
-        "integrator_stays_bound_to_acquisition":
-            captured["integrator_scan"] is a_scan,
-        "stitch_stays_bound_to_acquisition":
-            captured["stitch_scan"] is a_scan,
-    }
+    observed = _acquisition_unchanged_rows(widget, captured, held)
     expected = dict.fromkeys(observed, True)
     # Captured at this parent: the key, file, GI flag, mask, PONI and both
     # argument sets all move on A's own object, and the colliding publications
@@ -741,8 +914,8 @@ def test_resume_restores_acquisition_coherently(qapp, acquisition):
     """
     widget, recorder = acquisition()
     captured = _capture_acquisition_owners(widget)
-    a_scan = captured["scan"]
-    a_key = captured["scan_key"]
+    held = tuple(label for label in _COLLIDING_LABELS
+                 if captured["publication_owners"].get(label))
 
     _browse_load(qapp, widget, _B_RESULT)
     _select_frame_row(qapp, widget, 2)
@@ -753,38 +926,10 @@ def test_resume_restores_acquisition_coherently(qapp, acquisition):
                 _RUN_TIMEOUT_S, "the next reduced frame from acquisition A")
     _pump(qapp, 2.0)
 
-    selected = _selected_display_owners(widget)
-    projection = selected["projection"]
-    observed = {
-        "run_still_owned": widget._run_active is True,
-        "selection_points_at_captured_acquisition":
-            selected["display_scan"] is a_scan,
-        "captured_scan_keeps_its_key":
-            str(getattr(a_scan, "name", "")) == a_key,
-        "captured_scan_keeps_its_gi":
-            bool(getattr(a_scan, "gi", False)) == captured["gi"],
-        "captured_scan_keeps_its_poni":
-            getattr(a_scan, "_cached_poni", None) is captured["poni"],
-        "captured_scan_keeps_its_mask":
-            getattr(a_scan, "global_mask", None) is captured["global_mask"],
-        "captured_scan_keeps_its_1d_args":
-            dict(getattr(a_scan, "bai_1d_args", {}) or {})
-            == captured["bai_1d_args"],
-        "captured_scan_keeps_its_2d_args":
-            dict(getattr(a_scan, "bai_2d_args", {}) or {})
-            == captured["bai_2d_args"],
-        "integrator_never_left_the_acquisition":
-            captured["integrator_scan"] is a_scan,
-        "title_names_acquisition": a_key in selected["title"],
-        "resumed_projection_is_owner_qualified":
-            selected["projection_scan_key"] == a_key
-            and bool(getattr(projection, "present", False)),
-        "captured_publication_store_not_recycled":
-            selected["publication_store"] is captured["publication_store"],
-        "captured_publication_store_not_cleared":
-            captured["publication_store"].generation
-            == captured["publication_generation"],
-    }
+    observed = _resume_rows(widget, captured, held)
+    observed["captured_publication_store_not_cleared"] = (
+        captured["publication_store"].generation
+        == captured["publication_generation"])
     expected = dict.fromkeys(observed, True)
     # Captured at this parent: the GI flag, PONI and both argument sets are
     # still B's on A's own object, and the publication store's generation has
@@ -899,7 +1044,10 @@ def test_delayed_browse_hydration_rejected_after_resume(
     # The production enable-once seam the live app calls; headless tests leave
     # hydration synchronous, so this is what puts the REAL worker in the path.
     display.enable_async_hydration()
-    latch = _HydrationLatch(widget.publication_store)
+    # §63.4 C.1: the SELECTED display store, not the widget attribute.  Under
+    # the required split the latter stays acquisition-owned and B's hydrator
+    # would never enter a latch installed there.
+    latch = _HydrationLatch(_hydration_latch_store(widget))
     held_request = None
     try:
         # Ask for a B frame OTHER than the selected one whose heavy tier the
@@ -958,19 +1106,14 @@ def test_delayed_browse_hydration_rejected_after_resume(
 
     new_rejections = _rejection_events(caplog)[rejections_before:]
     held_label, held_generation, held_kwargs = held_request
-    owner_keys = {"owner", "owner_token", "request_owner", "context_id"}
-    correlated = [
-        event for event in new_rejections
-        if event.get("decision") == DECISION_HYDRATION_CONTEXT_MISMATCH
-        and event.get("label") == held_label
-        and event.get("generation") == held_generation
-        and event.get("expected_owner") == a_key
-        and browse_key in str(event.get("found_owner", ""))
-    ]
+    held_token = _held_request_context_token(held_kwargs)
+    correlated = _correlated_hydration_rejections(
+        new_rejections,
+        expected_owner=a_key, found_owner=browse_key,
+        label=held_label, generation=held_generation,
+        request_token=held_token)
     observed = {
-        "request_carries_owner": bool(
-            owner_keys & set(held_kwargs)
-            or {"context_id", "scan_key"} <= set(held_kwargs)),
+        "request_carries_context_token": bool(held_token),
         "exactly_one_correlated_rejection": len(correlated) == 1,
         "acquisition_poni_untouched":
             getattr(a_scan, "_cached_poni", None) is before_release["poni"],
@@ -987,11 +1130,13 @@ def test_delayed_browse_hydration_rejected_after_resume(
             _publication_owner(browse_store, held_label) is not None,
     }
     expected = dict.fromkeys(observed, True)
-    # Captured at this parent: request_carries_owner is False (the request seam
-    # takes label/generation/purpose/consumer and nothing that identifies the
-    # context) and exactly_one_correlated_rejection is False (nothing emits
-    # hydration_context_mismatch at all, so the held completion is never
-    # rejected by context).
+    # Captured at this parent: request_carries_context_token is False (the
+    # request seam takes label/generation/purpose/consumer and nothing that
+    # identifies the context) and exactly_one_correlated_rejection is False
+    # (nothing emits hydration_context_mismatch at all, so the held completion
+    # is never rejected by context).  Label and generation alone are
+    # deliberately NOT accepted as a correlation: a later request for the same
+    # frame at the same generation would satisfy them.
     assert observed == expected
 
 
@@ -1410,7 +1555,9 @@ def test_projection_adapter_records_each_fail_closed_decision(
     assert found[DECISION_RECORD_STORE_SKIPPED]["outcome"] == "no_store"
     assert found[DECISION_RECORD_STORE_SKIPPED]["blanks_panel"] is True
 
-    # (e) a superseded request is dropped rather than allowed to overwrite.
+    # (e) a superseded request is dropped rather than allowed to overwrite —
+    #     which RETAINS the current panel, so it must not claim a blank
+    #     (§63.3.1).
     caplog.clear()
     adapter = FrameProjectionAdapter(lambda: None, lambda: publications)
     adapter.project(ProjectionRequest(
@@ -1423,8 +1570,8 @@ def test_projection_adapter_records_each_fail_closed_decision(
     assert superseded is not None, sorted(found)
     assert superseded["expected_owner"] == "7"
     assert superseded["found_owner"] == "3"
-    assert superseded["outcome"] == "request_dropped"
-    assert superseded["blanks_panel"] is True
+    assert superseded["outcome"] == "request_dropped_display_retained"
+    assert superseded["blanks_panel"] is False
 
     for event in _rejection_events(caplog):
         assert event["decision_known"] is True
@@ -1485,14 +1632,14 @@ def test_disabled_channel_installs_nothing_and_evaluates_nothing(
             assert "publication" not in name, (
                 f"file worker attribute {name!r} looks like a live store "
                 "carrier")
-        assert widget.h5viewer._display_context_operation is None
+        assert not _pending_browse_receipts(widget.h5viewer)
         assert widget.h5viewer.diagnostic_run_identity is None
 
         _browse_load(qapp, widget, _B_RESULT)
 
-        assert widget.h5viewer._display_context_operation is None, (
-            "a browse load with the channel disabled built an operation "
-            "identity; the transition arguments were evaluated")
+        assert not _pending_browse_receipts(widget.h5viewer), (
+            "a browse load with the channel disabled left a receipt; the "
+            "transition arguments were evaluated")
         assert widget.h5viewer.diagnostic_run_identity is None
     finally:
         _teardown(qapp, widget)
@@ -1614,3 +1761,432 @@ def test_fail_closed_rejection_is_recorded_for_a_cross_owner_publication(
             assert event["expected_owner"], (
                 f"{event['decision']} blanked a panel without naming the "
                 "expected owner")
+
+
+# --------------------------------------------------------------------------- #
+# O-2.2 discriminators (§63.4 A) — each targets one named correlation defect
+# --------------------------------------------------------------------------- #
+
+def test_user_browse_pair_carries_the_admitted_frozen_configuration(
+        qapp, acquisition, monkeypatch, caplog):
+    """§63.4 A.1 — the pair must name the EXACT admitted frozen configuration.
+
+    A run-generation counter and a mutable scan address do not identify which
+    configuration a browse happened under.  The operator's browse must carry the
+    admitted ``FrozenRunConfiguration``'s integer generation AND its content
+    fingerprint, and both must agree with the object the wrangler and its worker
+    thread are actually executing.
+    """
+    monkeypatch.setenv("XDART_RUN_CONFIG_DEBUG", "1")
+    caplog.set_level(logging.INFO)
+
+    widget, _recorder = acquisition()
+    carrier, executed = _admitted_run_configuration(widget)
+    assert carrier is not None, "the run admitted no frozen configuration"
+    assert executed is carrier, (
+        "the wrangler and its worker hold different configuration objects")
+    generation, fingerprint = carrier.identity
+    assert isinstance(generation, int) and fingerprint
+
+    _browse_load(qapp, widget, _B_RESULT)
+    starts, finishes = _user_browse_pair(caplog, _B_RESULT)
+    assert len(starts) == 1 and len(finishes) == 1
+
+    identity = starts[0]["operation"]["identity"]
+    assert identity is not None, "the browse pair carries no run identity"
+    observed = {
+        "config_generation": identity.get("config_generation"),
+        "config_fingerprint": identity.get("config_fingerprint"),
+        "config_consistent": identity.get("config_consistent"),
+        "finish_echoes_it": finishes[0]["operation"]["identity"],
+    }
+    assert observed == {
+        "config_generation": generation,
+        "config_fingerprint": fingerprint,
+        "config_consistent": True,
+        "finish_echoes_it": identity,
+    }
+
+
+def test_concurrent_browse_operations_keep_their_own_receipts(
+        qapp, acquisition, monkeypatch, caplog):
+    """§63.4 A.2 — two loads queued before either completes must not cross-pair.
+
+    The file worker's queue is FIFO, so two ``set_datafile`` tasks produce two
+    completions in order.  A single overwritable scalar cannot survive that: the
+    first completion consumes the SECOND operation and the second completion
+    finds none.  Driven through the real ``set_file`` seam with the worker held
+    at its queue so both starts are issued first.
+    """
+    monkeypatch.setenv("XDART_RUN_CONFIG_DEBUG", "1")
+    caplog.set_level(logging.INFO)
+
+    widget, _recorder = acquisition()
+    viewer = widget.h5viewer
+    first = _B_RESULT
+    second = _DATA / "xdart_processed_data" / "bluesky_17_2_00090.nxs"
+    assert second.exists(), f"second browse fixture absent: {second}"
+
+    # Hold the worker so both enqueues land before either task is serviced.
+    gate = threading.Event()
+    real_set_datafile = viewer.file_thread.set_datafile
+
+    def gated_set_datafile():
+        gate.wait(_BOUNDARY_TIMEOUT_S)
+        return real_set_datafile()
+
+    monkeypatch.setattr(
+        viewer.file_thread, "set_datafile", gated_set_datafile, raising=False)
+
+    viewer.dirname = str(first.parent)
+    viewer.set_file(str(first))
+    viewer.set_file(str(second))
+    gate.set()
+    _wait_until(
+        qapp,
+        lambda: (len(_transition_events(caplog)) >= 4
+                 and not viewer.file_thread.running
+                 and viewer.file_thread.queue.empty()),
+        _RUN_TIMEOUT_S, "both queued browse loads to complete")
+    _pump(qapp, 1.5)
+
+    browse = [event for event in _transition_events(caplog)
+              if event["phase"].startswith("browse_load")
+              and (event.get("operation") or {}).get("requested_path")
+              in (str(first), str(second))]
+    starts = [e for e in browse if e["phase"] == "browse_load_start"]
+    finishes = [e for e in browse if e["phase"] == "browse_load_finish"]
+    start_tokens = [e["operation"]["token"] for e in starts]
+    finish_tokens = [e["operation"]["token"] for e in finishes]
+
+    observed = {
+        "two_starts": len(starts) == 2,
+        "two_finishes": len(finishes) == 2,
+        "tokens_are_distinct": len(set(start_tokens)) == 2,
+        "no_token_dropped": sorted(finish_tokens) == sorted(start_tokens),
+        "fifo_order_preserved": finish_tokens == start_tokens,
+        "paths_not_cross_paired": all(
+            finish["operation"]["requested_path"]
+            == start["operation"]["requested_path"]
+            for start, finish in zip(starts, finishes)),
+    }
+    assert observed == dict.fromkeys(observed, True)
+    # A completed pair must leave nothing installed for a future task to consume.
+    assert not _pending_browse_receipts(viewer)
+
+
+def test_failed_browse_enqueue_leaves_no_orphan_receipt(
+        qapp, monkeypatch, tmp_path, caplog):
+    """§63.4 A.2 (second half) — a failed enqueue must roll its receipt back.
+
+    An operation appended before the task is actually queued would be consumed
+    by the NEXT unrelated completion, mislabelling it.
+    """
+    monkeypatch.setenv("XDART_RUN_CONFIG_DEBUG", "1")
+    caplog.set_level(logging.INFO)
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        viewer = widget.h5viewer
+        boom = RuntimeError("enqueue refused")
+
+        def failing_put(item):
+            raise boom
+
+        monkeypatch.setattr(viewer.file_thread.queue, "put", failing_put)
+        viewer.dirname = str(_B_RESULT.parent)
+        viewer.set_file(str(_B_RESULT))
+        _pump(qapp, 0.3)
+
+        assert not _pending_browse_receipts(viewer), (
+            "a refused enqueue left an orphan browse receipt installed")
+    finally:
+        _teardown(qapp, widget)
+
+
+def _pending_browse_receipts(viewer):
+    """Whatever browse receipts the viewer currently has outstanding."""
+    receipts = getattr(viewer, "_display_context_operations", None)
+    if receipts is not None:
+        return list(receipts)
+    scalar = getattr(viewer, "_display_context_operation", None)
+    return [] if scalar is None else [scalar]
+
+
+def _drive_capability_blank(qapp, widget, *, processing_active):
+    """Render the current selection with the persistence flag set explicitly.
+
+    Both blanking paths are production states: ``_processing_active`` True is a
+    run in progress (the persistence override), False is idle/paused (the
+    ordinary clear delegate).  Driving them explicitly through the production
+    ``set_processing_active`` seam is what makes the coverage deterministic
+    instead of depending on whatever the real-file sequence left active.
+    """
+    display = widget.displayframe
+    display.set_processing_active(bool(processing_active))
+    display.update()
+    _pump(qapp, 1.0)
+
+
+def _capability_records(caplog):
+    return [event for event in _rejection_events(caplog)
+            if event["decision"] == DECISION_CAPABILITY_FORCES_CLEAR]
+
+
+def _assert_capability_record_is_qualified(event, *, widget, outcome):
+    """Every field §63.4 A.3 requires of one capability blanking record."""
+    display = widget.displayframe
+    selected = _selected_display_owners(widget)
+    assert event["outcome"] == outcome
+    assert event["blanks_panel"] is True
+    assert event["role"], "no panel role"
+    assert event["reason"]
+    assert event["capability_state"]
+    # Context owners, compared in ONE namespace.
+    assert event["expected_owner"] == selected["projection_scan_key"], (
+        "expected_owner must be the selected display context's scan key")
+    assert event["found_owner"] == getattr(
+        display, "_current_frame_projection_scan_key", None) or ""
+    # Frame evidence lives in its OWN field, never compared to a scan key.
+    assert "evidence_identity" in event, (
+        "the source/frame evidence identity must be reported separately")
+    # The blank must be attributable to one selected frame and generation.
+    assert event["label"] is not None, (
+        "a capability blank with no selected label cannot be correlated")
+    assert event["generation"] is not None
+
+
+def test_capability_blanking_on_the_ordinary_clear_path(
+        qapp, acquisition, monkeypatch, caplog):
+    """§63.4 A.3 — the idle/paused clear delegate path, driven explicitly."""
+    monkeypatch.setenv("XDART_RUN_CONFIG_DEBUG", "1")
+    caplog.set_level(logging.INFO)
+
+    widget, _recorder = acquisition()
+    _browse_load(qapp, widget, _B_RESULT)
+    _select_frame_row(qapp, widget, 2)
+
+    caplog.clear()
+    _drive_capability_blank(qapp, widget, processing_active=False)
+    records = [e for e in _capability_records(caplog)
+               if e["outcome"] == "normal_clear"]
+    assert records, (
+        "the ordinary clear path recorded no capability blanking; observed "
+        f"{sorted({e['outcome'] for e in _capability_records(caplog)})}")
+    for event in records:
+        _assert_capability_record_is_qualified(
+            event, widget=widget, outcome="normal_clear")
+
+
+def test_capability_blanking_on_the_persistence_override_path(
+        qapp, acquisition, monkeypatch, caplog):
+    """§63.4 A.3 — the processing-persistence override path, driven explicitly."""
+    monkeypatch.setenv("XDART_RUN_CONFIG_DEBUG", "1")
+    caplog.set_level(logging.INFO)
+
+    widget, _recorder = acquisition()
+    _browse_load(qapp, widget, _B_RESULT)
+    _select_frame_row(qapp, widget, 2)
+
+    caplog.clear()
+    try:
+        _drive_capability_blank(qapp, widget, processing_active=True)
+        records = [e for e in _capability_records(caplog)
+                   if e["outcome"] == "persistence_override"]
+        assert records, (
+            "the persistence override recorded no capability blanking; "
+            f"observed {sorted({e['outcome'] for e in _capability_records(caplog)})}")
+        for event in records:
+            _assert_capability_record_is_qualified(
+                event, widget=widget, outcome="persistence_override")
+    finally:
+        widget.displayframe.set_processing_active(False)
+
+
+def test_disabled_channel_never_evaluates_transition_arguments(
+        qapp, monkeypatch, tmp_path):
+    """§63.4 A.4 / §63.3.2 — a poisoned constructor must never be reached.
+
+    Checking that no operation is INSTALLED cannot distinguish "never built"
+    from "built and consumed".  Poisoning the constructor and one argument
+    getter can: with the channel off, a real load must complete without
+    touching either.
+    """
+    monkeypatch.delenv("XDART_RUN_CONFIG_DEBUG", raising=False)
+    from xdart.gui.tabs.static_scan import h5viewer as h5viewer_module
+
+    touched = []
+
+    def poisoned_operation(**kwargs):
+        touched.append("new_display_context_operation")
+        raise AssertionError(
+            "the disabled channel built a display-context operation")
+
+    def poisoned_identity(widget):
+        touched.append("capture_diagnostic_run_identity")
+        raise AssertionError(
+            "the disabled channel captured a run identity")
+
+    monkeypatch.setattr(
+        h5viewer_module, "new_display_context_operation", poisoned_operation)
+    from xdart.gui.tabs.static_scan import static_scan_widget as ssw_module
+    monkeypatch.setattr(
+        ssw_module, "capture_diagnostic_run_identity", poisoned_identity)
+
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        _browse_load(qapp, widget, _B_RESULT)
+        _select_frame_row(qapp, widget, 0)
+        assert touched == [], f"disabled channel evaluated {touched}"
+        assert not _pending_browse_receipts(widget.h5viewer)
+    finally:
+        _teardown(qapp, widget)
+
+
+# --------------------------------------------------------------------------- #
+# O-2.2 mutation rows (§63.4 A.5) — each must redden its owning acceptance row
+# --------------------------------------------------------------------------- #
+
+def test_mutated_integrator_binding_reddens_the_acquisition_rows(
+        qapp, acquisition):
+    """A forbidden binding swap must be caught by the acquisition contract.
+
+    The integrator/stitch rows are among the few that are GREEN at this parent,
+    so this mutation proves they are load-bearing rather than vacuous: swapping
+    the live binding after Pause must flip them.
+    """
+    widget, _recorder = acquisition()
+    captured = _capture_acquisition_owners(widget)
+    held = tuple(label for label in _COLLIDING_LABELS
+                 if captured["publication_owners"].get(label))
+
+    baseline = _acquisition_unchanged_rows(widget, captured, held)
+    assert baseline["integrator_is_still_bound_to_acquisition"] is True
+    assert baseline["stitch_is_still_bound_to_acquisition"] is True
+
+    _browse_load(qapp, widget, _B_RESULT)
+    _select_frame_row(qapp, widget, 2)
+
+    # The forbidden swap: repoint the integrator and stitch owners at some scan
+    # that is not the acquisition's.  A distinct sentinel is used deliberately —
+    # at this parent the browsed scan IS the acquisition singleton, so assigning
+    # THAT would be a no-op and would prove nothing about the row.
+    foreign_scan = object()
+    widget.integratorTree.scan = foreign_scan
+    widget.stitch_thread.scan = foreign_scan
+    mutated = _acquisition_unchanged_rows(widget, captured, held)
+
+    assert mutated["integrator_is_still_bound_to_acquisition"] is False
+    assert mutated["stitch_is_still_bound_to_acquisition"] is False
+
+
+def test_retained_browse_panels_under_an_a_title_redden_the_resume_rows(
+        qapp, acquisition):
+    """An A title over stale B panels must NOT satisfy the Resume contract.
+
+    §63.2 P1-O2.1-4.4 is precisely this false-green: the title and key rows read
+    correct while the rendered tiers still belong to the browsed scan.
+    """
+    widget, recorder = acquisition()
+    captured = _capture_acquisition_owners(widget)
+    held = tuple(label for label in _COLLIDING_LABELS
+                 if captured["publication_owners"].get(label))
+
+    _browse_load(qapp, widget, _B_RESULT)
+    _select_frame_row(qapp, widget, 2)
+    browse_projection = widget.displayframe._current_frame_projection
+
+    frames_at_resume = len(recorder.frames)
+    _resume_acquisition(qapp, widget, recorder)
+    _wait_until(qapp, lambda: len(recorder.frames) > frames_at_resume,
+                _RUN_TIMEOUT_S, "acquisition A to produce a frame again")
+    _pump(qapp, 1.5)
+
+    # Force the exact false-green: A's title/key over B's retained projection.
+    widget.displayframe.ui.labelCurrent.setText(f"{captured['scan_key']}_1")
+    widget.displayframe._current_frame_projection = browse_projection
+    rows = _resume_rows(widget, captured, held)
+
+    assert rows["title_names_acquisition"] is True, (
+        "the mutation did not actually produce the A title it is testing")
+    assert rows["resumed_evidence_belongs_to_acquisition"] is False
+    assert rows["resumed_raw_is_acquisition_resident_payload"] is False
+    assert rows["resumed_cake_is_acquisition_resident_payload"] is False
+    assert rows["resumed_1d_is_acquisition_resident_payload"] is False
+
+
+def test_latching_the_legacy_store_is_detected_as_the_wrong_target(
+        qapp, monkeypatch, tmp_path):
+    """The hydration latch must follow the SELECTED store, not the widget's.
+
+    At this parent both are one object, so the divergence is constructed here:
+    once the display owns its own store — which is what O-3 delivers — a latch
+    installed on ``widget.publication_store`` would never be entered.
+    """
+    widget = _make_widget(monkeypatch, tmp_path)
+    try:
+        legacy = widget.publication_store
+        assert _hydration_latch_store(widget) is legacy
+
+        browse_store = PublicationStore()
+        widget.displayframe.publication_store = browse_store
+        assert _hydration_latch_store(widget) is browse_store, (
+            "the latch target still follows the widget attribute; a browse-"
+            "owned store would never be latched")
+        assert _hydration_latch_store(widget) is not legacy
+    finally:
+        widget.displayframe.publication_store = widget.publication_store
+        _teardown(qapp, widget)
+
+
+def test_changed_request_token_reddens_the_hydration_correlation():
+    """Label plus generation is not a correlation (§63.4 A.5, C.1).
+
+    A rejection that echoes the right frame at the right generation but a
+    DIFFERENT request/context token belongs to another request and must not
+    satisfy the acceptance row.
+    """
+    base = {
+        "decision": DECISION_HYDRATION_CONTEXT_MISMATCH,
+        "label": 7,
+        "generation": 23,
+        "expected_owner": "run_a",
+        "found_owner": "scan_b",
+        "request_token": "tok-held",
+    }
+    kwargs = {"label": 7, "generation": 23, "context_token": "tok-held"}
+    held_token = _held_request_context_token(kwargs)
+    assert held_token == "tok-held"
+
+    matched = _correlated_hydration_rejections(
+        [base], expected_owner="run_a", found_owner="scan_b",
+        label=7, generation=23, request_token=held_token)
+    assert len(matched) == 1, "the exact echo must correlate"
+
+    # Only the token differs — same frame, same generation, same owners.
+    other = dict(base, request_token="tok-other")
+    assert _correlated_hydration_rejections(
+        [other], expected_owner="run_a", found_owner="scan_b",
+        label=7, generation=23, request_token=held_token) == []
+
+    # A request that carries no token at all cannot correlate anything.
+    assert _held_request_context_token(
+        {"purpose": "full", "consumer": "plot_1d"}) == ""
+    assert _correlated_hydration_rejections(
+        [base], expected_owner="run_a", found_owner="scan_b",
+        label=7, generation=23, request_token="") == []
+
+
+def test_assertion_dicts_declare_no_duplicate_rows():
+    """Structural guard for §63.3.4 — a repeated key silently drops a row."""
+    import ast
+
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    duplicates = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        keys = [k.value for k in node.keys
+                if isinstance(k, ast.Constant) and isinstance(k.value, str)]
+        duplicates.extend(
+            (node.lineno, key) for key in set(keys) if keys.count(key) > 1)
+    assert duplicates == [], f"duplicate assertion keys: {duplicates}"

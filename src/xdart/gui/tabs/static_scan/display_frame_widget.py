@@ -2567,22 +2567,39 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             capability = getattr(panel, "capability", None)
             projection = getattr(self, "_current_frame_projection", None)
             capabilities = getattr(projection, "capabilities", None)
+            # O-2.2 (§63.4 B.3): THREE namespaces, kept apart.  The first cut
+            # put a scan key in ``expected_owner`` and a ``path#index`` source
+            # identity in ``found_owner`` and compared them as if they were the
+            # same kind of thing.  ``expected``/``found`` are now both CONTEXT
+            # scan keys -- the context the panel is being rendered for, and the
+            # context the pinned projection actually describes -- and the source
+            # evidence gets its own field.
             try:
                 expected = overlay_current_scan_key(self)
             except Exception:
                 expected = None
+            pin_scan_key = getattr(
+                self, "_current_frame_projection_scan_key", None)
+            # The blank must be attributable to ONE selected frame: a record
+            # with no label cannot be correlated to anything the operator did.
+            try:
+                label = current_display_label(self)
+            except Exception:
+                label = None
             fail_closed_rejection_log(
                 logger, DECISION_CAPABILITY_FORCES_CLEAR,
                 reason="selected frame capability is UNAVAILABLE or ERROR",
                 outcome=str(outcome),
                 blanks_panel=True,
                 expected=expected,
-                found=getattr(capabilities, "identity", None),
+                found=pin_scan_key,
                 origin="displayFrameWidget._render_display",
                 role=getattr(role, "value", str(role)),
+                label=label,
                 generation=getattr(state, "generation", None),
-                pin_scan_key=getattr(
-                    self, "_current_frame_projection_scan_key", None),
+                evidence_identity=str(
+                    getattr(capabilities, "identity", "") or ""),
+                pin_scan_key=pin_scan_key,
                 capability_state=str(getattr(capability, "state", None)),
                 capability_disposition=str(
                     getattr(capability, "disposition", None)))

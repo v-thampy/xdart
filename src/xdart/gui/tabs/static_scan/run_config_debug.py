@@ -28,7 +28,7 @@ import json
 import os
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 
 def run_config_debug_enabled() -> bool:
@@ -402,7 +402,18 @@ class DiagnosticRunIdentity:
     """
 
     run_generation: int | None = None
+    #: The ADMITTED ``FrozenRunConfiguration``'s own generation and content
+    #: fingerprint -- O-2.2 (§63.4 B.1).  The first cut read a debug-only
+    #: counter that nothing ever assigns, so every browse record reported
+    #: ``config_generation=None``: a run-generation tick and a mutable scan
+    #: address are not the accepted configuration.
     config_generation: int | None = None
+    config_fingerprint: str = ""
+    #: False when the wrangler's carrier and its worker's copy are not the SAME
+    #: object.  Recorded rather than papered over: a diagnostic that invents a
+    #: consistent-looking identity out of a divergence is worse than one that
+    #: reports the divergence.
+    config_consistent: bool = False
     runend_generation: int | None = None
     display_generation: int | None = None
     run_active: bool = False
@@ -413,6 +424,8 @@ class DiagnosticRunIdentity:
         return {
             "run_generation": self.run_generation,
             "config_generation": self.config_generation,
+            "config_fingerprint": self.config_fingerprint,
+            "config_consistent": self.config_consistent,
             "runend_generation": self.runend_generation,
             "display_generation": self.display_generation,
             "run_active": self.run_active,
@@ -428,11 +441,23 @@ def capture_diagnostic_run_identity(widget) -> DiagnosticRunIdentity | None:
     try:
         display = _safe_attr(widget, "displayframe")
         acquisition = _safe_attr(widget, "_x1_run_scan_capture")
+        wrangler = _safe_attr(widget, "wrangler")
+        carrier = _safe_attr(wrangler, "run_configuration")
+        executed = _safe_attr(_safe_attr(wrangler, "thread"),
+                              "run_configuration")
+        config_generation, config_fingerprint = None, ""
+        if carrier is not None:
+            try:
+                config_generation, config_fingerprint = carrier.identity
+            except Exception:
+                config_generation, config_fingerprint = None, ""
         return DiagnosticRunIdentity(
             run_generation=_safe_attr(
                 widget, "_run_config_debug_run_generation"),
-            config_generation=_safe_attr(
-                widget, "_run_config_debug_config_generation"),
+            config_generation=config_generation,
+            config_fingerprint=str(config_fingerprint or ""),
+            config_consistent=bool(
+                carrier is not None and executed is carrier),
             runend_generation=_safe_attr(widget, "_runend_generation"),
             display_generation=_safe_attr(display, "display_generation"),
             run_active=bool(_safe_attr(widget, "_run_active", False)),
@@ -498,19 +523,6 @@ def new_display_context_operation(
         previous_data_file=_owner_identity(
             _safe_attr(previous_scan, "data_file")),
     )
-
-
-def completed_display_context_operation(
-    operation: DisplayContextOperation | None,
-    **updates,
-) -> DisplayContextOperation | None:
-    """Echo ``operation`` with completion-side fields filled in."""
-    if operation is None:
-        return None
-    try:
-        return replace(operation, **updates)
-    except Exception:
-        return operation
 
 
 def _owner_identity(value) -> str:

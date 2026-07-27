@@ -337,8 +337,11 @@ class FrameProjectionAdapter:
             fail_closed_rejection_log(
                 logger, DECISION_PROJECTION_SUPERSEDED,
                 reason="request generation is older than the pinned generation",
-                outcome="request_dropped",
-                blanks_panel=True,
+                # O-2.2 (§63.3.1): dropping a SUPERSEDED request retains the
+                # current panel; it does not blank one.  Recording it as a blank
+                # overstated the consequence of the newest-wins rule.
+                outcome="request_dropped_display_retained",
+                blanks_panel=False,
                 expected=self._latest_generation,
                 found=request.generation,
                 origin="FrameProjectionAdapter.project",
