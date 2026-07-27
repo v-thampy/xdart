@@ -265,15 +265,18 @@ def test_browse_release_is_idempotent_and_drops_what_it_retained():
     assert browse.publication_store.cleared == 1, "release is not idempotent"
 
 
-def test_finalization_claim_is_one_shot():
+def test_finalization_is_one_attempt_at_a_time_and_succeeds_once():
+    """§9.1: attempts are serialised; only SUCCESS reaches finalized."""
     scan = object()
     acquisition = _acquisition(scan=scan)
-    assert acquisition.claim_finalization() is scan
-    assert acquisition.claim_finalization() is None
-    assert acquisition.finalization_claimed is True
+    assert acquisition.begin_finalization() is scan
+    assert acquisition.begin_finalization() is None, (
+        "a second attempt ran while one was in flight")
     assert acquisition.finalized is False
-    acquisition.mark_finalized()
+    acquisition.complete_finalization()
     assert acquisition.finalized is True
+    assert acquisition.begin_finalization() is None, (
+        "a finalized identity was offered for finalization again")
 
 
 def test_acquisition_scan_key_tracks_the_live_sub_scan():

@@ -53,6 +53,9 @@ from dataclasses import dataclass, fields as dataclass_fields
 from enum import Enum
 
 __all__ = [
+    "FINALIZATION_FINALIZED",
+    "FINALIZATION_IN_PROGRESS",
+    "FINALIZATION_PENDING",
     "AcquisitionContext",
     "BrowseContext",
     "ContextKind",
@@ -61,6 +64,14 @@ __all__ = [
     "DisplaySelection",
     "new_context_token",
 ]
+
+
+#: The run-end finalization states (§9.1).  Explicit, because "an attempt was
+#: made" and "the finalization succeeded" are different facts and only the
+#: second may authorise releasing the run's identity.
+FINALIZATION_PENDING = "pending"
+FINALIZATION_IN_PROGRESS = "in_progress"
+FINALIZATION_FINALIZED = "finalized"
 
 
 class ContextKind(str, Enum):
@@ -241,10 +252,19 @@ class AcquisitionContext(_WriteOnceIdentity):
     #: The run's ``FrameRecordStore`` once the streaming session creates one.
     #: SINGLE WRITER: :meth:`adopt_record_store`.
     record_store: object = None
-    #: One-shot run-end finalization claim.  SINGLE WRITER:
-    #: :meth:`claim_finalization` / :meth:`mark_finalized`.
-    finalization_claimed: bool = False
-    finalized: bool = False
+    #: The run-end finalization state machine (§9.1).  A failed attempt
+    #: returns to PENDING so the seam is genuinely retryable; only a
+    #: successful attempt reaches FINALIZED, and only FINALIZED authorises
+    #: release.  The parent consumed a one-shot claim BEFORE the fallible
+    #: finalizer, so a failure could never be retried while the release seam —
+    #: which asked only whether the claim had been taken — dropped the context
+    #: anyway, and the scientific finalization was silently never done.
+    #: SINGLE WRITER: :meth:`begin_finalization` / :meth:`fail_finalization` /
+    #: :meth:`complete_finalization`.
+    finalization_state: str = FINALIZATION_PENDING
+    #: How many attempts have been made.  A DIAGNOSTIC fact only — never
+    #: release authority.
+    finalization_attempts: int = 0
 
     _IDENTITY_FIELDS = frozenset({
         "context_token", "run_configuration", "config_generation",
@@ -288,20 +308,37 @@ class AcquisitionContext(_WriteOnceIdentity):
             publication_store=self.publication_store,
         )
 
-    def claim_finalization(self):
-        """Take the ONE finalization claim (the run scan), else ``None``.
+    @property
+    def finalized(self) -> bool:
+        """Whether the run scan's finalization has SUCCEEDED."""
+        return self.finalization_state == FINALIZATION_FINALIZED
 
-        The claim is consumed BEFORE the fallible finalizer runs, so a
-        permanently failing finalizer still releases the run scan's claim and a
-        retried run-end seam can never finalize the same identity twice.
+    @property
+    def finalization_pending(self) -> bool:
+        """Whether a finalization attempt may still be made."""
+        return self.finalization_state == FINALIZATION_PENDING
+
+    def begin_finalization(self):
+        """Take the run scan for ONE attempt, or ``None``.
+
+        ``None`` means either that an attempt is already in flight or that the
+        scan has already been finalized — so a retry can neither race nor
+        finalize the same identity twice.
         """
-        if self.finalization_claimed:
+        if self.finalization_state != FINALIZATION_PENDING:
             return None
-        self.finalization_claimed = True
+        self.finalization_state = FINALIZATION_IN_PROGRESS
+        self.finalization_attempts += 1
         return self.scan
 
-    def mark_finalized(self) -> None:
-        self.finalized = True
+    def fail_finalization(self) -> None:
+        """Return a failed attempt to the retryable state."""
+        if self.finalization_state == FINALIZATION_IN_PROGRESS:
+            self.finalization_state = FINALIZATION_PENDING
+
+    def complete_finalization(self) -> None:
+        """Record the ONE successful finalization."""
+        self.finalization_state = FINALIZATION_FINALIZED
 
 
 @dataclass(slots=True)

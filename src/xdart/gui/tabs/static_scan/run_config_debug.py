@@ -396,6 +396,10 @@ DECISION_SELECTION_UNRESOLVED = "display_selection_unresolved"
 #: handed-off value and all four wrapper/worker carrier-and-ledger references.
 DECISION_RUN_CONFIGURATION_UNADMITTED = "run_configuration_unadmitted"
 
+#: A new run refused because the previous run's acquisition context is still
+#: awaiting cleanup — its finalization has not succeeded (§9.1.5).
+DECISION_RESIDUAL_CONTEXT_RETAINED = "residual_context_retained"
+
 FAIL_CLOSED_DECISIONS = (
     DECISION_RECORD_STORE_SKIPPED,
     DECISION_PUBLICATION_ABSENT,
@@ -409,6 +413,7 @@ FAIL_CLOSED_DECISIONS = (
     DECISION_RESCOPE_WITHOUT_BOUNDARY,
     DECISION_SELECTION_UNRESOLVED,
     DECISION_RUN_CONFIGURATION_UNADMITTED,
+    DECISION_RESIDUAL_CONTEXT_RETAINED,
 )
 
 #: Process-unique operation counter.  A browse load crosses a thread boundary,

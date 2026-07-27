@@ -453,7 +453,19 @@ def _capture_acquisition_owners(widget):
             label: _publication_owner(widget.publication_store, label)
             for label in _COLLIDING_LABELS
         },
+        # §9.3.2: the detector image SHAPE A is showing at Pause.  A and B are
+        # different detectors, so this is what tells "A's raw panel" from "B's
+        # retained raw panel" without demanding a raw tier the acquisition
+        # record store deliberately does not own.
+        "raw_shape": _panel_image_shape(widget.displayframe.image_data),
     }
+
+
+def _panel_image_shape(pair):
+    """The shape of the image a 2-D panel is currently showing, or ``None``."""
+    if pair is None or pair[0] is None:
+        return None
+    return tuple(getattr(pair[0], "shape", ()) or ()) or None
 
 
 def _selected_display_owners(widget):
@@ -535,7 +547,25 @@ def _acquisition_unchanged_rows(widget, captured, held_labels):
     }
 
 
-def _resume_rows(widget, captured, held_labels):
+def _capability_is_servable_a_payload(projection, name, scan_key):
+    """§9.3.2 — the amended raw-tier contract.
+
+    Cake and 1-D stay strictly RESIDENT/AVAILABLE.  The raw tier may also be a
+    SOURCE_FALLBACK: a live run's projection is served by the acquisition
+    ``FrameRecordStore``, which by design carries no detector raw, so demanding
+    residency there would demand a tier the accepted record-store design does
+    not own.  What may NOT be relaxed is OWNERSHIP — the fact must still belong
+    to the acquisition — and the rendered panel must still be A's image, which
+    the shape row below proves.
+    """
+    fact = _capability(projection, name)
+    servable = {CapabilityDisposition.RESIDENT,
+                CapabilityDisposition.SOURCE_FALLBACK}
+    return (getattr(fact, "disposition", None) in servable
+            and _evidence_names_scan(projection, scan_key))
+
+
+def _resume_rows(widget, captured, held_labels, browse_raw_shape=None):
     """The "Resume is a selection, and A's own payload comes back" contract.
 
     §63.4 C.3.  An A title over retained B panels is the false-green this row
@@ -566,9 +596,13 @@ def _resume_rows(widget, captured, held_labels):
         # all; once a browse IS fully servable — which O-3 c2 requires — a
         # retained B projection satisfies residency, and these rows would go
         # green on exactly the false-green they exist to reject.
-        "resumed_raw_is_acquisition_resident_payload":
-            _capability_is_rendered_payload(projection, "raw")
-            and _evidence_names_scan(projection, a_key),
+        "resumed_raw_is_acquisition_servable_payload":
+            _capability_is_servable_a_payload(projection, "raw", a_key),
+        "resumed_raw_panel_is_acquisitions_image":
+            _panel_image_shape(display.image_data) == captured["raw_shape"],
+        "resumed_raw_panel_is_not_the_browsed_image":
+            browse_raw_shape is None
+            or _panel_image_shape(display.image_data) != browse_raw_shape,
         "resumed_cake_is_acquisition_resident_payload":
             _capability_is_rendered_payload(projection, "integrated_2d")
             and _evidence_names_scan(projection, a_key),
@@ -887,22 +921,6 @@ def test_paused_browse_leaves_acquisition_untouched(qapp, acquisition):
 # 3. Resume must be a SELECTION, not a restoration
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "EXPLICITLY DEFERRED at the O-3 c3 tip.  Every Resume row this case "
-        "asserts is green — the selection points back at the captured "
-        "acquisition object, nothing A owns moved, the publication store is "
-        "not cleared, and the resumed cake and 1-D are A-owned RESIDENT "
-        "payloads.  The single outstanding row is "
-        "resumed_raw_is_acquisition_resident_payload, and it is NOT a "
-        "resume/context property: a live run's projection is served by the "
-        "acquisition FrameRecordStore, which carries no raw pixels, so the raw "
-        "tier reports SOURCE_FALLBACK.  Measured identical for a paused A "
-        "frame BEFORE any browse context exists, so it is an acquisition-side "
-        "store-tiering question for R4-G/Slice 4, not the browse split"
-    ),
-)
 def test_resume_restores_acquisition_coherently(qapp, acquisition):
     """Acceptance path 3 — the next A frame renders as A, and nothing is wiped.
 
@@ -919,6 +937,14 @@ def test_resume_restores_acquisition_coherently(qapp, acquisition):
 
     _browse_load(qapp, widget, _B_RESULT)
     _select_frame_row(qapp, widget, 2)
+    # §9.3.2: B is a different detector, so its rendered image has a distinct
+    # shape.  Capturing it here is what makes "the resumed panel is A's" a
+    # discriminating row rather than a tautology.
+    browse_raw_shape = _panel_image_shape(widget.displayframe.image_data)
+    assert browse_raw_shape is not None, "the browse rendered no raw image"
+    assert browse_raw_shape != captured["raw_shape"], (
+        "A and B rendered the same detector shape; this case cannot "
+        "discriminate a retained B panel")
 
     frames_at_resume = len(recorder.frames)
     _resume_acquisition(qapp, widget, recorder)
@@ -926,7 +952,8 @@ def test_resume_restores_acquisition_coherently(qapp, acquisition):
                 _RUN_TIMEOUT_S, "the next reduced frame from acquisition A")
     _pump(qapp, 2.0)
 
-    observed = _resume_rows(widget, captured, held)
+    observed = _resume_rows(widget, captured, held,
+                            browse_raw_shape=browse_raw_shape)
     observed["captured_publication_store_not_cleared"] = (
         captured["publication_store"].generation
         == captured["publication_generation"])
@@ -1090,6 +1117,7 @@ def test_delayed_browse_hydration_rejected_after_resume(
             # take anything away from A or put its own frame under A's
             # ownership, and those are the rows below.
             "a_labels": set(_store_labels(captured["publication_store"])),
+            "b_owner": _publication_owner(browse_store, target_label),
         }
         rejections_before = len(_rejection_events(caplog))
 
@@ -1126,8 +1154,13 @@ def test_delayed_browse_hydration_rejected_after_resume(
         "acquisition_store_did_not_adopt_the_held_frame":
             _publication_owner(captured["publication_store"], held_label)
             in (None, a_key),
-        "browse_store_kept_its_own_payload":
-            _publication_owner(browse_store, held_label) is not None,
+        # Section 4's consequence, restored (§9.3): the invalidated request
+        # changes NEITHER context.  Requiring B's late payload to appear was
+        # the opposite contract — it demanded the very insertion the commit
+        # gate exists to refuse.
+        "browse_store_did_not_gain_the_held_frame":
+            _publication_owner(browse_store, held_label)
+            == before_release["b_owner"],
     }
     expected = dict.fromkeys(observed, True)
     # Captured at this parent: request_carries_context_token is False (the
@@ -1256,39 +1289,39 @@ def test_canonical_parser_keeps_the_full_dotted_stem(tmp_path):
 
 
 def test_browse_load_names_a_dotted_stem_canonically(
-        qapp, monkeypatch, tmp_path):
-    """Acceptance path 5b — ONE parser must name the browsed scan.
+        qapp, acquisition, tmp_path):
+    """Acceptance path 5b — ONE parser must name the BROWSE-OWNED scan.
 
-    Driven through the real browser gesture and the real file thread, and read
-    back off the SELECTED display/viewer scan rather than ``widget.scan``: the
-    divergence only matters because the browse path picks the wrong parser for
-    the object the display is about to show.
+    §9.3.1: driven through the real acquisition fixture, a real Pause and the
+    browse-owned task, because that is the path this tranche contracted to
+    change.  The earlier cut built an idle widget and so drove the SHARED
+    full-load path, which §8.4 deliberately restored to its legacy naming —
+    idle naming is unchanged and needs its own contract if it is ever wanted.
     """
-    widget = _make_widget(monkeypatch, tmp_path)
-    try:
-        dotted = _dotted_stem_link(tmp_path, _B_RESULT)
-        canonical = scan_name_from_source(str(dotted))
-        _browse_load(qapp, widget, dotted)
+    widget, _recorder = acquisition()
+    dotted = _dotted_stem_link(tmp_path, _B_RESULT)
+    canonical = scan_name_from_source(str(dotted))
+    assert canonical == "Combi4.v2_03271005"
 
-        selected = _selected_display_owners(widget)
-        observed = {
-            "display_scan_key": str(
-                getattr(selected["display_scan"], "name", "")),
-            "viewer_scan_key": str(
-                getattr(selected["viewer_scan"], "name", "")),
-            "data_file": os.path.basename(
-                getattr(selected["display_scan"], "data_file", "") or ""),
-        }
-        # Captured at this parent: both keys are "Combi4" — set_datafile splits
-        # on the FIRST dot, so "v2_03271005" is silently discarded while the
-        # data file (and every title derived from the canonical parser) keeps it.
-        assert observed == {
-            "display_scan_key": canonical,
-            "viewer_scan_key": canonical,
-            "data_file": dotted.name,
-        }
-    finally:
-        _teardown(qapp, widget)
+    _browse_load(qapp, widget, dotted)
+
+    selected = _selected_display_owners(widget)
+    observed = {
+        "display_scan_key": str(getattr(selected["display_scan"], "name", "")),
+        "viewer_scan_key": str(getattr(selected["viewer_scan"], "name", "")),
+        "data_file": os.path.basename(
+            getattr(selected["display_scan"], "data_file", "") or ""),
+        "context_scan_key": str(
+            getattr(widget._browse_context, "scan_key", "")),
+    }
+    # The first-dot parser would silently discard "v2_03271005" while the data
+    # file — and every title derived from the canonical parser — keeps it.
+    assert observed == {
+        "display_scan_key": canonical,
+        "viewer_scan_key": canonical,
+        "data_file": dotted.name,
+        "context_scan_key": canonical,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -2131,7 +2164,7 @@ def test_retained_browse_panels_under_an_a_title_redden_the_resume_rows(
     assert rows["title_names_acquisition"] is True, (
         "the mutation did not actually produce the A title it is testing")
     assert rows["resumed_evidence_belongs_to_acquisition"] is False
-    assert rows["resumed_raw_is_acquisition_resident_payload"] is False
+    assert rows["resumed_raw_is_acquisition_servable_payload"] is False
     assert rows["resumed_cake_is_acquisition_resident_payload"] is False
     assert rows["resumed_1d_is_acquisition_resident_payload"] is False
 

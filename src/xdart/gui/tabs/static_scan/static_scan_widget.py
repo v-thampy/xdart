@@ -30,6 +30,7 @@ from .run_config_debug import (
     DECISION_RESCOPE_WITHOUT_BOUNDARY,
     DECISION_SELECTION_UNRESOLVED,
     DECISION_RUN_CONFIGURATION_UNADMITTED,
+    DECISION_RESIDUAL_CONTEXT_RETAINED,
     bump_run_config_debug_generation,
     capture_diagnostic_run_identity,
     display_context_transition_log,
@@ -13272,6 +13273,23 @@ class staticWidget(QWidget):
         """
         if self._run_active:
             return
+        # §9.1.5 — a RETAINED cleanup owner refuses the next Run.  Overwriting
+        # it would discard a run whose finalization never succeeded, silently
+        # and permanently; the residual owner must be cleaned up first.
+        residual = getattr(self, "_acquisition_context", None)
+        if residual is not None:
+            fail_closed_rejection_log(
+                logger, DECISION_RESIDUAL_CONTEXT_RETAINED,
+                reason="a previous run's context is still awaiting cleanup",
+                outcome="run_refused", blanks_panel=False,
+                expected="no retained acquisition context",
+                found=residual.context_token,
+                origin="staticWidget._enter_run_state",
+                finalization_state=residual.finalization_state,
+                finalization_attempts=residual.finalization_attempts)
+            raise DisplayContextError(
+                "refusing a new run while the previous acquisition context is "
+                f"awaiting cleanup (state={residual.finalization_state})")
         # BEFORE any run-state, UI or context mutation: a wrangler run that
         # cannot prove its configuration was admitted does not start (§8.1).
         if origin == RUN_ORIGIN_WRANGLER:
@@ -13513,6 +13531,20 @@ class staticWidget(QWidget):
         mistaken for a failure to swap.  The operator can re-open the browsed
         result through the ordinary idle path afterwards.
         """
+        browse = getattr(self, "_browse_context", None)
+        if browse is None:
+            return
+        # §9.1.4 — DEPENDENT on select-A.  Clearing B while the display still
+        # names B is the mixed-context state the request seam already closes
+        # from the other end; a failed or partial select must not let the
+        # run-end path reopen it.
+        acquisition = getattr(self, "_acquisition_context", None)
+        selection = getattr(self, "_display_selection", None)
+        if (acquisition is None or selection is None
+                or not selection.names(acquisition)):
+            raise DisplayContextError(
+                "the browse context cannot be released until the acquisition "
+                "selection is installed")
         staticWidget._release_browse_context(self, reason="run_end")
 
     def _release_acquisition_context(self) -> None:
@@ -13532,10 +13564,23 @@ class staticWidget(QWidget):
         context = getattr(self, "_acquisition_context", None)
         if context is None:
             return
-        if not context.finalization_claimed:
+        if getattr(self, "_browse_context", None) is not None:
+            # LAST in the chain: releasing A's context while a browse owner is
+            # still outstanding would leave the selection naming a context
+            # nobody owns — the unresolvable state §8.2.4 fails closed on.
             raise DisplayContextError(
-                "the acquisition context cannot be released before its "
-                "finalization seam has run")
+                "the acquisition context cannot be released while a browse "
+                "context is still outstanding")
+        if not context.finalized:
+            # §9.1.3 — a failed or in-progress finalization RETAINS the exact
+            # context and raises from this named seam, so the receipt records
+            # release as outstanding and a later qualified delivery reruns
+            # both.  Releasing here on "an attempt was made" is what let the
+            # run's identity be discarded with its stamp never written.
+            raise DisplayContextError(
+                "the acquisition context cannot be released until its scan "
+                f"has been finalized (state={context.finalization_state}, "
+                f"attempts={context.finalization_attempts})")
         self._acquisition_context = None
         self._display_selection = None
 
@@ -13560,17 +13605,27 @@ class staticWidget(QWidget):
         context = getattr(self, "_acquisition_context", None)
         if context is None:
             return
-        run_scan = context.claim_finalization()
+        run_scan = context.begin_finalization()
         if run_scan is None:
+            # Already finalized, or an attempt is in flight: either way this
+            # identity is not finalized twice.
             return
-        finish = getattr(getattr(self, "displayframe", None),
-                         "finish_processing", None)
-        if callable(finish):
-            # X1 O-3 (c3): the key is the context's own stamped sub-scan
-            # identity, not a re-derivation from whatever the scan object is
-            # named at finish time.
-            finish(run_scan, context.scan_key or scan_identity_key(run_scan))
-        context.mark_finalized()
+        try:
+            finish = getattr(getattr(self, "displayframe", None),
+                             "finish_processing", None)
+            if callable(finish):
+                # The key is the context's own stamped sub-scan identity, not
+                # a re-derivation from whatever the scan is named at finish
+                # time.
+                finish(run_scan,
+                       context.scan_key or scan_identity_key(run_scan))
+        except BaseException:
+            # §9.1 — a failed attempt returns the context to a RETRYABLE state
+            # and reports.  It does not consume the context's one chance, and
+            # it emphatically does not authorise releasing it.
+            context.fail_finalization()
+            raise
+        context.complete_finalization()
 
     def _apply_unlocking_integration_state(self) -> None:
         """Substep 7: the mode-correct projection under the run-unlock guard."""
@@ -13606,6 +13661,45 @@ class staticWidget(QWidget):
         )
         self._controls_v2_sync_run_row(render_state.profile)
 
+    def _context_lifecycle_substeps(self):
+        """The FOUR context seams, in dependency order (§4, §9.1).
+
+        Separately named and independently retryable, but each fails closed
+        until its prerequisite is complete: select acquisition, finalize it
+        exactly once, release the browse owner (only once A is selected), and
+        release the acquisition context (only once its finalization SUCCEEDED).
+        Kept as their own list so a residual cleanup delivery can rerun exactly
+        these without replaying unrelated seams that already succeeded.
+        """
+        steps = []
+        for seam, name in (
+            ("select_acquisition_context",
+             "_select_acquisition_context_for_idle"),
+            ("finish_processing", "_finalize_acquisition_context_scan"),
+            ("release_browse_context", "_release_browse_context_step"),
+            ("release_acquisition_context", "_release_acquisition_context"),
+        ):
+            target = getattr(self, name, None)
+            if callable(target):
+                steps.append((seam, target))
+        return tuple(steps)
+
+    def _has_residual_context_cleanup(self) -> bool:
+        """Whether a previous delivery left context work outstanding."""
+        return (getattr(self, "_acquisition_context", None) is not None
+                or getattr(self, "_browse_context", None) is not None)
+
+    def _run_residual_context_cleanup(self, receipt):
+        """Retry ONLY the outstanding context seams (§9.1.5).
+
+        Driven by a later qualified finish or by Close, and deliberately
+        reachable after ``_run_active`` has already gone false: a context whose
+        finalization never succeeded is retained, and something has to come
+        back for it.  Unrelated seams that already succeeded are not replayed.
+        """
+        return staticWidget._run_projection_over(
+            self, receipt, staticWidget._context_lifecycle_substeps(self))
+
     def _idle_lifecycle_substeps(self):
         """THE one authoritative ordered idle projection (§34.6.A).
 
@@ -13630,18 +13724,7 @@ class staticWidget(QWidget):
         df = getattr(self, "displayframe", None)
         h5 = getattr(self, "h5viewer", None)
         controls = getattr(self, "controls", None)
-        # X1 O-3 (c3): four SEPARATELY NAMED, independently retryable context
-        # seams in this exact order — select acquisition, finalize it exactly
-        # once, release the browse owner exactly once, release the acquisition
-        # only once its finalization succeeded.  Collapsing them into one
-        # opaque helper would make a later retry rerun seams that already
-        # succeeded and would lose which one actually failed.
-        _add("select_acquisition_context", self,
-             "_select_acquisition_context_for_idle")
-        _add("finish_processing", self, "_finalize_acquisition_context_scan")
-        _add("release_browse_context", self, "_release_browse_context_step")
-        _add("release_acquisition_context", self,
-             "_release_acquisition_context")
+        steps.extend(staticWidget._context_lifecycle_substeps(self))
         _add("transient_reads", self,
              "_set_scan_integrated_reads_transient", False)
         _add("set_processing_active", df, "set_processing_active", False)
@@ -13688,7 +13771,18 @@ class staticWidget(QWidget):
         already-successful, side-effectful seam such as ``set_run_writing(False)``
         is never replayed (§35.7.B req 4/5), and a seam that recovers still keeps
         its initial failure in the record (req 6)."""
-        for seam, step in staticWidget._idle_lifecycle_substeps(self):
+        return staticWidget._run_projection_over(
+            self, receipt, staticWidget._idle_lifecycle_substeps(self))
+
+    @staticmethod
+    def _run_projection_over(self, receipt, steps):
+        """Attempt *steps* independently, recording into *receipt*.
+
+        Extracted so the idle projection and the residual context cleanup share
+        ONE attempt/recovery record; a second copy would let the two drift on
+        exactly the retry semantics §35.7.B pins.
+        """
+        for seam, step in steps:
             attempt = receipt.attempts.get(seam)
             if attempt is None:
                 attempt = _SeamAttempt(seam)
@@ -13779,6 +13873,12 @@ class staticWidget(QWidget):
                         failures.append(("_exit_run_state", exc))
             if staticWidget._projection_incomplete(receipt):
                 staticWidget._run_idle_lifecycle_projection(self, receipt)
+            elif (not bool(getattr(self, "_run_active", False))
+                    and staticWidget._has_residual_context_cleanup(self)):
+                # §9.1.5 — the run is already idle but a context is still
+                # awaiting cleanup, because its finalization never succeeded.
+                # This delivery is a qualified opportunity to retry it.
+                staticWidget._run_residual_context_cleanup(self, receipt)
         # §35.7.B req 6: EVERY initial failed seam is reported, in projection
         # order, even when the retry recovered it — with its disposition, so an
         # outstanding recovery failure is distinguishable from a recovered one.

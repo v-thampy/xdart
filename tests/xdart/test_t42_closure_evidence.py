@@ -231,11 +231,16 @@ def test_two_one_shot_failures_are_both_named_once_in_order(
     assert len(reports) == 1, f"expected one closure report, got {len(reports)}"
     _origin, failures, _primary = reports[0]
     seams = [seam.split(" (")[0] for seam, _ in failures]
-    assert seams == ["finish_processing", "set_run_writing"], (
+    # X1 O-3 (c3R §9.1): release-A is DEPENDENT on the finalization, so a
+    # one-shot finalizer failure legitimately reports the release seam too —
+    # it refused, and it recovered on the same retry that fixed its
+    # prerequisite.  Order and once-ness are what this case pins.
+    assert seams == ["finish_processing", "release_acquisition_context",
+                     "set_run_writing"], (
         f"first-pass evidence was erased or reordered: {seams}")
     reasons = [str(exc) for _, exc in failures]
-    assert reasons == ["one-shot finalization failure",
-                       "one-shot writing-guard failure"]
+    assert reasons[0] == "one-shot finalization failure"
+    assert reasons[-1] == "one-shot writing-guard failure"
     # Both were one-shot, so the retry restored the lifecycle.
     assert widget._run_active is False
     assert "finish_processing" in _closure_messages(caplog)
@@ -299,10 +304,15 @@ def test_finalizer_failure_releases_the_capture_and_finalizes_once(
     # the finalization seam has had its ONE attempt.  T-4.2's invariant is
     # unchanged — a permanent failure still releases the run scan, and the
     # retry may not finalize the same identity again.
-    assert widget._acquisition_context is None, (
-        "the live run scan stayed owned after terminal closure")
-    assert len(attempts) == 1, (
-        f"the captured identity was finalized {len(attempts)} times")
+    # §9.1: a PERMANENT finalizer failure retains the context as a cleanup
+    # owner rather than discarding a run whose stamp never landed, and each
+    # delivery pass makes at most one attempt.
+    context = widget._acquisition_context
+    assert context is not None, "an un-finalized run identity was discarded"
+    assert context.finalized is False
+    assert len(attempts) == context.finalization_attempts, (
+        f"{len(attempts)} finalizer calls for "
+        f"{context.finalization_attempts} attempts")
     assert "finish_processing" in _closure_messages(caplog)
 
 
@@ -418,18 +428,16 @@ def test_promoted_boundary_finalizer_releases_capture_without_widget():
     with pytest.raises(RuntimeError, match="display finalization failed"):
         staticWidget._finalize_acquisition_context_scan(host)
 
-    assert host._acquisition_context.finalization_claimed is True
+    # X1 O-3 (c3R §9.1): a FAILED attempt returns the context to a retryable
+    # state — it does not consume its one chance — and release stays refused
+    # until a finalization actually SUCCEEDS.
+    assert host._acquisition_context.finalization_attempts == 1
     assert host._acquisition_context.finalized is False
-    # A retry must be a no-op rather than finalizing the identity again.
-    staticWidget._finalize_acquisition_context_scan(host)
-    # The release substep is ORDERED after that one attempt, never before it.
     from xdart.modules.display_context import DisplayContextError
 
-    fresh = SimpleNamespace(_acquisition_context=_minimal_acquisition_context())
     with pytest.raises(DisplayContextError):
-        staticWidget._release_acquisition_context(fresh)
-    staticWidget._release_acquisition_context(host)
-    assert host._acquisition_context is None
+        staticWidget._release_acquisition_context(host)
+    assert host._acquisition_context is not None
 
 
 def test_promoted_real_finish_failure_releases_the_captured_scan(
@@ -444,7 +452,8 @@ def test_promoted_real_finish_failure_releases_the_captured_scan(
     with pytest.raises(RuntimeError, match="injected finish-tail failure"):
         widget.integrator_thread_finished()
 
-    assert widget._acquisition_context is None
+    assert widget._acquisition_context is not None
+    assert widget._acquisition_context.finalized is False
 
 
 # --------------------------------------------------------------------------- #

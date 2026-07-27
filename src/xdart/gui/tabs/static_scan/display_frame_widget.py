@@ -5438,23 +5438,27 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         scan already carries a persisted value (disk truth wins)."""
         if run_scan is None:
             run_scan = getattr(self, '_wavelength_run_scan', None)
-        try:
-            value = getattr(self, '_run_wavelength_m', None)
-            cache_key = getattr(self, '_run_wavelength_scan_key', None)
-            if run_scan is not None and value and cache_key is not None:
-                if run_scan_key is None:
-                    run_scan_key = scan_identity_key(run_scan)
-                if cache_key == run_scan_key:
-                    if getattr(run_scan, '_persisted_wavelength_m', None) is None:
-                        run_scan._persisted_wavelength_m = value
-                        mg = getattr(run_scan, 'mg_args', None)
-                        if isinstance(mg, dict):
-                            mg['wavelength'] = value
-        finally:
-            self._wavelength_run_scan = None
-            self._wavelength_run_scan_key = None
-            self._run_wavelength_m = None
-            self._run_wavelength_scan_key = None
+        # §9.1.2 — RETRY-SAFE.  The decision is staged first, the write is
+        # idempotent, and the run cache is cleared only after a successful
+        # commit.  Clearing it in a `finally` meant a failed run-end attempt
+        # destroyed the very cache a retry needed, so the retry could only
+        # ever be a silent no-op; and the scientific stamp still lands exactly
+        # once, because it is skipped when the scan already carries a value.
+        value = getattr(self, '_run_wavelength_m', None)
+        cache_key = getattr(self, '_run_wavelength_scan_key', None)
+        if run_scan is not None and value and cache_key is not None:
+            if run_scan_key is None:
+                run_scan_key = scan_identity_key(run_scan)
+            if cache_key == run_scan_key:
+                if getattr(run_scan, '_persisted_wavelength_m', None) is None:
+                    run_scan._persisted_wavelength_m = value
+                    mg = getattr(run_scan, 'mg_args', None)
+                    if isinstance(mg, dict):
+                        mg['wavelength'] = value
+        self._wavelength_run_scan = None
+        self._wavelength_run_scan_key = None
+        self._run_wavelength_m = None
+        self._run_wavelength_scan_key = None
 
     def _show_viewer_set_bkg(self, show):
         """Surface ONLY the Set BG button in a viewer mode.
