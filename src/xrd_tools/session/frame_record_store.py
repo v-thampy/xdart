@@ -336,7 +336,20 @@ class FrameRecordStore:
                 if (record := self._records.get(label)) is not None
             }
 
-    def get_or_hydrate(self, label: int | str) -> FrameRecord | None:
+    def get_or_hydrate(self, label: int | str, *, commit_gate=None,
+                       commit_epoch=None) -> FrameRecord | None:
+        """Return the record, rehydrating an evicted heavy payload.
+
+        ``commit_gate`` is the REQUESTING owner's commit authority (X1 O-3).
+        The hydrator's read stays outside both this store's lock and the gate —
+        it is a disk read on a background thread — and the gate is taken only
+        around the final source-qualified upsert.  A cancelled or stale gate
+        inserts NOTHING: it does not fall back to an ungated upsert, and it
+        leaves the persisted-mode and source-identity bookkeeping untouched.
+
+        Without a gate the behaviour is exactly as before, which is the idle
+        and legacy path.
+        """
         with self._lock:
             record = self._records.get(label)
             if record is None or _has_heavy_payload(record):
@@ -353,18 +366,26 @@ class FrameRecordStore:
         fresh = hydrator(label)
         if fresh is None:
             return record
-        current_source_identity = self.source_identity(label)
-        fresh_source_identity = _source_identity_from_record(fresh)
-        source_identity = (
-            current_source_identity
-            if current_source_identity and not fresh_source_identity
-            else None
-        )
-        return self.upsert(
-            fresh,
-            source_identity=source_identity,
-            persisted_modes=prev_persisted,
-        )
+        if commit_gate is not None and not commit_gate.enter(commit_epoch):
+            # The requesting owner lost its commit authority while the read was
+            # in flight.  Nothing is inserted and no bookkeeping moves.
+            return record
+        try:
+            current_source_identity = self.source_identity(label)
+            fresh_source_identity = _source_identity_from_record(fresh)
+            source_identity = (
+                current_source_identity
+                if current_source_identity and not fresh_source_identity
+                else None
+            )
+            return self.upsert(
+                fresh,
+                source_identity=source_identity,
+                persisted_modes=prev_persisted,
+            )
+        finally:
+            if commit_gate is not None:
+                commit_gate.leave()
 
     def is_persisted(self, label: int | str) -> bool:
         with self._lock:

@@ -13628,6 +13628,11 @@ class staticWidget(QWidget):
                 "the acquisition context cannot be released until its scan "
                 f"has been finalized (state={context.finalization_state}, "
                 f"attempts={context.finalization_attempts})")
+        # §10.2 — cancel BEFORE the owner is dropped.  A request already in
+        # flight holds this gate and the store tuple it captured; releasing the
+        # reference without withdrawing commit authority let its old epoch
+        # still enter and insert into the retired run's store.
+        context.retire()
         self._acquisition_context = None
         self._display_selection = None
 

@@ -82,7 +82,21 @@ from .browse_debug import (
     image_payload_summary,
     sequence_summary,
 )
-from xdart.modules.display_context import HydrationRequest
+from xdart.modules.display_context import HydrationOwner, HydrationRequest
+
+
+def _hydration_owner(owner):
+    """Coerce a completion's echoed owner, or ``None`` when it is unusable.
+
+    A completion may echo the frozen :class:`HydrationOwner` (the owned path)
+    or a legacy 2-tuple.  Anything else — absent, malformed, the wrong arity —
+    resolves to ``None`` and is refused whenever a context is active.
+    """
+    if isinstance(owner, HydrationOwner):
+        return owner
+    if isinstance(owner, (tuple, list)) and len(owner) in (2, 4):
+        return HydrationOwner.of(*owner)
+    return None
 from .run_config_debug import (
     DECISION_CAPABILITY_FORCES_CLEAR,
     DECISION_HYDRATION_CONTEXT_MISMATCH,
@@ -1637,28 +1651,40 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         tokens agree.
         """
         current_token = str(getattr(self, "display_context_token", "") or "")
-        try:
-            expected = overlay_current_scan_key(self)
-        except Exception:
-            expected = None
-        expected = str(expected or "")
         if not current_token:
             # No context is active: the idle/legacy regime, where a completion
-            # carries no owner and none is required.
+            # carries no owner and none is required.  This is the ONLY
+            # compatibility path (§9.2.5).
             return True
-        # §9.2.5 — while a context IS active, FAIL CLOSED on anything that is
-        # not a complete, matching owner.  The parent failed OPEN for absent,
-        # malformed and empty owners, and compared only the token when one was
-        # present, so a stale scan key inside the right context was admitted.
-        request_token, request_scan_key = "", ""
-        malformed = True
-        if isinstance(owner, (tuple, list)) and len(owner) == 2:
-            request_token = str(owner[0] or "")
-            request_scan_key = str(owner[1] or "")
-            malformed = not (request_token and request_scan_key)
-        if not malformed and request_token == current_token and (
-                not expected or request_scan_key == expected):
-            return True
+        context = displayFrameWidget._selected_context(self)
+        try:
+            expected_key = str(overlay_current_scan_key(self) or "")
+        except Exception:
+            expected_key = ""
+        expected_source = str(getattr(context, "source_path", "") or "")
+        expected_epoch = getattr(context, "commit_epoch", None)
+        # §9.2.5 / §10.3 — while a context IS active, FAIL CLOSED on anything
+        # that is not a COMPLETE, matching owner.  The parent failed open for
+        # absent, malformed and empty owners; then it compared only the token;
+        # then it still ignored the source identity and the epoch it was
+        # carrying, so a completion from another sub-scan of the same container
+        # — or from a superseded epoch — was admitted.
+        request = _hydration_owner(owner)
+        if request is not None and request.qualified:
+            if (request.context_token == current_token
+                    and (not expected_key
+                         or request.scan_key == expected_key)
+                    and (not expected_source
+                         or not request.source
+                         or request.source == expected_source)
+                    and (expected_epoch is None
+                         or not request.epoch
+                         or request.epoch == expected_epoch)):
+                return True
+            request_scan_key = request.scan_key
+        else:
+            request_scan_key = ""
+        expected = expected_key
         fail_closed_rejection_log(
             logger, DECISION_HYDRATION_CONTEXT_MISMATCH,
             reason=("the completion does not name the display context this "
@@ -1670,8 +1696,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             origin="displayFrameWidget._on_frame_hydrated",
             label=label,
             generation=generation,
-            request_token=request_token,
-            current_token=current_token)
+            request_token=(request.context_token if request is not None
+                           else ""),
+            request_source=(request.source if request is not None else ""),
+            request_epoch=(request.epoch if request is not None else None),
+            current_token=current_token,
+            current_source=expected_source,
+            current_epoch=expected_epoch)
         return False
 
     def _flush_hydration_render(self) -> None:

@@ -54,6 +54,7 @@ from enum import Enum
 
 __all__ = [
     "CommitGate",
+    "HydrationOwner",
     "HydrationRequest",
     "FINALIZATION_FINALIZED",
     "FINALIZATION_IN_PROGRESS",
@@ -240,6 +241,36 @@ class DisplayBindings:
 
 
 @dataclass(frozen=True, slots=True)
+class HydrationOwner:
+    """WHO a hydration belongs to — values only (§10.3).
+
+    ONE envelope, reused for the worker's queue identity, for the completion it
+    echoes and for the GUI admission that follows.  Carrying a source string
+    that no decision reads is not source qualification: two requests differing
+    only in source collapsed into one dedupe token, so the second sub-scan's
+    frame was never read.
+    """
+
+    context_token: str = ""
+    scan_key: str = ""
+    source: str = ""
+    epoch: int = 0
+
+    @classmethod
+    def of(cls, context_token="", scan_key="", source="", epoch=0):
+        return cls(str(context_token or ""), str(scan_key or ""),
+                   str(source or ""), int(epoch or 0))
+
+    @property
+    def qualified(self) -> bool:
+        """Whether this owner names a context at all."""
+        return bool(self.context_token and self.scan_key)
+
+    def as_tuple(self) -> tuple:
+        return (self.context_token, self.scan_key, self.source, self.epoch)
+
+
+@dataclass(frozen=True, slots=True)
 class HydrationRequest:
     """Everything a background hydration needs, decided when it was REQUESTED.
 
@@ -260,9 +291,13 @@ class HydrationRequest:
     epoch: int
 
     @property
-    def owner(self) -> tuple:
-        """The identity a completion must echo."""
-        return (self.context_token, self.context_scan_key)
+    def owner(self) -> HydrationOwner:
+        """The complete identity a completion must echo (§10.3)."""
+        return HydrationOwner.of(
+            context_token=self.context_token,
+            scan_key=self.context_scan_key,
+            source=self.context_source,
+            epoch=self.epoch)
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,6 +404,10 @@ class AcquisitionContext(_WriteOnceIdentity):
         "frame_ids", "frames", "viewer_rows_1d", "viewer_rows_2d",
         "publication_store", "origin", "poni_identity", "mask_identity",
         "geometry_identity",
+        # §10.2: the SOLE commit authority a request captures.  Replaceable, it
+        # would let a later assignment silently orphan the cancellation and
+        # epoch that in-flight requests are already qualified against.
+        "commit_gate",
     })
 
     def __post_init__(self):
@@ -447,6 +486,22 @@ class AcquisitionContext(_WriteOnceIdentity):
         """Record the ONE successful finalization."""
         self.finalization_state = FINALIZATION_FINALIZED
 
+    def retire(self) -> None:
+        """THE terminal action for an acquisition context (§10.2).
+
+        Idempotent, and deliberately the mirror of ``BrowseContext.invalidate``:
+        it withdraws commit authority and nothing else.  Dropping the owner
+        reference without this left an in-flight request holding the gate and
+        the exact store tuple it had captured, so its old epoch could still
+        enter after run-end release and insert into the retired run's store.
+
+        It records no second lifecycle authority — ``finalization_state``
+        remains the one finalization fact — and it does not touch the run's
+        last rendered values: what is cancelled is late COMMIT authority, not
+        the accepted final display.
+        """
+        self.commit_gate.cancel()
+
 
 @dataclass(slots=True)
 class BrowseContext(_WriteOnceIdentity):
@@ -506,6 +561,9 @@ class BrowseContext(_WriteOnceIdentity):
         "context_token", "load_generation", "operation", "requested_path",
         "scan_key", "scan", "frame", "frame_ids", "frames", "viewer_rows_1d",
         "viewer_rows_2d", "publication_store", "record_store",
+        # §10.2: one gate, created with the context and mutated only through
+        # its own methods — never replaceable by assignment.
+        "commit_gate",
     })
 
     def __post_init__(self):

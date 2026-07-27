@@ -29,6 +29,7 @@ from .display_logic import (
     SupersedeReason,
     hydration_supersede_action,
 )
+from xdart.modules.display_context import HydrationOwner
 from .browse_debug import browse_debug_log, sequence_summary
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,24 @@ class _HydrationRequest:
     #: The file identity the request was made against, so a completion can be
     #: refused on source as well as on scan key.
     context_source: str = ""
+
+    @property
+    def owner(self):
+        """The complete values-only identity this request belongs to (§10.3)."""
+        return HydrationOwner.of(
+            context_token=self.context_token,
+            scan_key=self.context_scan_key,
+            source=self.context_source,
+            epoch=self.epoch)
+
+    @property
+    def owner(self):
+        """The complete values-only identity this request belongs to."""
+        return HydrationOwner.of(
+            context_token=self.context_token,
+            scan_key=self.context_scan_key,
+            source=self.context_source,
+            epoch=self.epoch)
 
 
 class FrameHydrationWorker(Qt.QtCore.QThread):
@@ -126,22 +145,21 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
             return SupersedeReason.GENERATION
 
     @staticmethod
-    def _token(label, generation, purpose, consumer,
-               context_token="", context_scan_key="", epoch=0):
-        # c3R-b (§9.2.6): the CONTEXT is part of the identity.  Without it the
+    def _token(label, generation, purpose, consumer, owner=None):
+        # §9.2.6 / §10.3: the COMPLETE owner is part of the identity — context
+        # token, scan key, SOURCE identity and epoch.  Without the context the
         # same label at the same generation in two sub-scans collapsed to one
-        # request, so the second sub-scan never got its frame.
+        # request; without the source, two sub-scans of one container did.
+        owner = owner if owner is not None else HydrationOwner()
         return (label, int(generation), str(purpose or "full"), consumer,
-                str(context_token or ""), str(context_scan_key or ""),
-                int(epoch or 0))
+                owner.as_tuple())
 
     def _discard_locked(self, request: _HydrationRequest) -> None:
         for label in request.labels:
             self._queued.discard(
                 self._token(label, request.generation,
                             request.purpose, request.consumer,
-                            request.context_token, request.context_scan_key,
-                            request.epoch))
+                            request.owner))
 
     def _drain_stale_locked(self, reason=SupersedeReason.GENERATION) -> None:
         if not self._queue:
@@ -205,8 +223,10 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
             if generation > self._newest_gen:
                 self._newest_gen = generation
                 self._drain_stale_locked(supersede_reason)
-            token = self._token(label, generation, purpose, consumer,
-                                context_token, context_scan_key, epoch)
+            owner = HydrationOwner.of(
+                context_token=context_token, scan_key=context_scan_key,
+                source=context_source, epoch=epoch)
+            token = self._token(label, generation, purpose, consumer, owner)
             if token in self._queued:
                 browse_debug_log(
                     logger,
@@ -227,10 +247,9 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
                 and self._queue[-1].generation == generation
                 and self._queue[-1].purpose == purpose
                 and self._queue[-1].consumer is consumer
-                # §9.2.6: never coalesce across contexts or epochs.
-                and self._queue[-1].context_token == context_token
-                and self._queue[-1].context_scan_key == context_scan_key
-                and self._queue[-1].epoch == epoch
+                # §9.2.6 / §10.3: never coalesce across contexts, SOURCES or
+                # epochs — the whole owner has to match, not part of it.
+                and self._queue[-1].owner == owner
             ):
                 self._queue[-1].labels = (*self._queue[-1].labels, label)
             else:
@@ -312,7 +331,7 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
                 generation = request.generation
                 purpose = request.purpose
                 consumer = request.consumer
-                owner = (request.context_token, request.context_scan_key)
+                owner = request.owner
                 newest = self._newest_gen
             if (
                 generation < newest
