@@ -251,6 +251,23 @@ def test_streaming_sink_does_not_read_retired_policy_from_its_host():
     assert offenders == [], offenders
 
 
+def test_streaming_sink_requires_the_accepted_configuration_argument():
+    """The writer boundary cannot revive an optional-policy fallback."""
+    tree = ast.parse(_SINK_FILE.read_text())
+    sink_class = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "QtNexusSink"
+    )
+    init = next(
+        node for node in sink_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    names = [arg.arg for arg in init.args.kwonlyargs]
+    index = names.index("run_configuration")
+    assert init.args.kw_defaults[index] is None, (
+        "QtNexusSink.run_configuration must be a required keyword argument")
+
+
 def test_only_the_entry_gates_consult_the_published_carrier():
     """Item 4.  No execution helper re-reads a holder after worker entry."""
     holders = {"run_configuration", "_qualified_run_configuration"}
