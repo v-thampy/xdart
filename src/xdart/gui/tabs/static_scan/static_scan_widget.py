@@ -23,7 +23,9 @@ import pyFAI
 from .browse_debug import browse_debug_enabled, browse_debug_log, sequence_summary
 from .run_config_debug import (
     bump_run_config_debug_generation,
+    capture_diagnostic_run_identity,
     display_context_transition_log,
+    run_config_debug_enabled,
     run_config_debug_log,
 )
 
@@ -12694,6 +12696,9 @@ class staticWidget(QWidget):
         # — owns the run wavelength capture.  Capture the GUI-owned run scan
         # object + its canonical key and bind the cache to THIS run.
         self._x1_run_scan_capture = self.scan
+        # O-2.1: the browse chain qualifies its records against THIS run, so the
+        # detached snapshot is refreshed as soon as the run owns a capture.
+        staticWidget._publish_diagnostic_run_identity(self)
         _begin = getattr(self.displayframe, "begin_processing", None)
         if callable(_begin):
             _begin(self.scan, scan_identity_key(self.scan))
@@ -13195,6 +13200,34 @@ class staticWidget(QWidget):
         mb.exec()
         return mb.clickedButton() is stop_btn
 
+    def _publish_diagnostic_run_identity(self):
+        """Push the DETACHED accepted run/config snapshot to the viewer.
+
+        O-2.1 (§61.4 B).  The browse chain has to qualify its transitions by the
+        run/config they happened under, and it cannot reach the static widget.
+        Handing it a frozen tuple of ints and strings supplies that without
+        giving a background seam a live widget, store, scan or callback to hold.
+        Refreshed at each of this widget's own context boundaries — which is
+        exactly when the identity can change — and a no-op when the channel is
+        off, so nothing is computed or stored in a normal session.
+
+        Always invoked as ``staticWidget._publish_diagnostic_run_identity(self)``:
+        the run-end and frame-boundary tests bind these lifecycle methods onto
+        duck hosts, so a ``self.`` call would demand the helper exist on every
+        such host.
+        """
+        if not run_config_debug_enabled():
+            return
+        viewer = getattr(self, "h5viewer", None)
+        if viewer is None:
+            return
+        try:
+            viewer.diagnostic_run_identity = capture_diagnostic_run_identity(
+                self)
+        except Exception:
+            logger.debug("diagnostic run-identity publish failed",
+                         exc_info=True)
+
     def _on_run_paused(self):
         """Pause (Phase B): the run is FROZEN at a frame boundary (the worker has
         drained the in-flight window + flushed the .nxs and emitted sigPaused).
@@ -13241,6 +13274,7 @@ class staticWidget(QWidget):
         # becomes legal.  Every later browse/resume event is read against this
         # one, so it is emitted AFTER the pause work — it must describe the
         # state a browse will actually meet, not the state it replaced.
+        staticWidget._publish_diagnostic_run_identity(self)
         display_context_transition_log(
             logger, "pause", widget=self, origin="_on_run_paused",
             target=getattr(self, "_x1_run_scan_capture", None))
@@ -13272,6 +13306,7 @@ class staticWidget(QWidget):
         # O-2 diagnostics: what the run is resuming INTO.  Compared against the
         # pause event, this is where a mutated singleton shows up as an
         # acquisition role whose scan key / GI / PONI moved while paused.
+        staticWidget._publish_diagnostic_run_identity(self)
         display_context_transition_log(
             logger, "resume", widget=self, origin="_on_run_resuming",
             target=getattr(self, "_x1_run_scan_capture", None))
@@ -13690,6 +13725,7 @@ class staticWidget(QWidget):
         # could only describe the loss, never attribute it — and the resume
         # boundary's ``publication_store.clear()`` is exactly the decision the
         # R4-D stock-take could not see.
+        staticWidget._publish_diagnostic_run_identity(self)
         display_context_transition_log(
             logger, "rescope", widget=self, origin="_rescope_frame_panel_to",
             target=self.scan, incoming_scan_name=str(name))

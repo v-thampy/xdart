@@ -87,7 +87,11 @@ from .browse_debug import (
     sequence_summary,
     widget_selection_summary,
 )
-from .run_config_debug import display_context_transition_log
+from .run_config_debug import (
+    display_context_transition_log,
+    new_display_context_operation,
+    run_config_debug_enabled,
+)
 from .display_logic import xye_unit_from_filename
 from .display_controllers import ImageViewerController
 from xrd_tools.io import ImageSourceKind
@@ -596,6 +600,14 @@ class H5Viewer(QWidget):
         self._browser_scan_reset_pending = False
         self._browser_previous_context = None
         self._browser_restore_in_progress = False
+        # O-2.1 diagnostics: the in-flight browse-load operation identity, or
+        # None.  A frozen value object (strings/ints) minted only when the
+        # channel is on -- never a live widget, store, scan or callback.
+        self._display_context_operation = None
+        # A DETACHED accepted run/config snapshot pushed by the static widget at
+        # each of its own context boundaries, so a browse record is
+        # generation-qualified without the viewer holding the widget.
+        self.diagnostic_run_identity = None
         self.viewer_mode = None
         # True only while a live (non-batch) wrangler run is in progress.
         # Suppresses ``data_reset`` (wired to the async ``sigNewFile``)
@@ -885,11 +897,6 @@ class H5Viewer(QWidget):
                                              frame_ids=self.frame_ids,
                                              frames=self.frames,
                                              data_lock=self.data_lock)
-        # O-2 diagnostics only: the file thread emits the browse-load FINISH
-        # event and would otherwise be unable to report which publication store
-        # the load landed beside.  Read exclusively by
-        # ``display_context_transition_log``; the thread never touches it.
-        self.file_thread.diagnostic_publication_store = self.publication_store
         self.file_thread.sigTaskDone.connect(self.thread_finished)
         self.file_thread.sigNewFile.connect(self.sigNewFile.emit)
         self.file_thread.sigUpdate.connect(self._emit_file_thread_update)
@@ -1507,6 +1514,27 @@ class H5Viewer(QWidget):
         self.data_changed(show_all=True)
 
     def thread_finished(self, task):
+        # O-2.1 (§61.4 B): the browse-load FINISH, emitted HERE — the existing
+        # GUI-thread completion seam — rather than from the file worker.  It
+        # echoes the exact operation minted at the start, so the pair shares one
+        # token, requested path, load generation and accepted run/config
+        # identity, and it can report the stores the load landed beside.
+        if task == "set_datafile":
+            operation = getattr(self, "_display_context_operation", None)
+            self._display_context_operation = None
+            if operation is not None and run_config_debug_enabled():
+                display_context_transition_log(
+                    logger, "browse_load_finish",
+                    origin="H5Viewer.thread_finished",
+                    scan=self.scan,
+                    target=getattr(self.file_thread, "scan", None),
+                    publication_store=getattr(
+                        self, "publication_store", None),
+                    operation=operation,
+                    loaded_file=str(getattr(self.file_thread, "fname", "")),
+                    run_writing=bool(getattr(self, "_run_writing", False)),
+                    live_run=bool(
+                        getattr(self.file_thread, "live_run", False)))
         self.update()
         if getattr(self, "_browser_restore_in_progress", False):
             context = getattr(self, "_browser_previous_context", None) or {}
@@ -2754,22 +2782,47 @@ class H5Viewer(QWidget):
                 self._remember_displayed_frames()
                 # self.set_open_enabled(False)
                 self.file_thread.fname = fname
-                # O-2 diagnostics: the browse-load START, recorded with the
-                # object the load is about to be applied to.  ``target`` is the
-                # FILE THREAD's scan; when its ``object_id`` equals the viewer's
-                # (and the acquisition's), the trace has caught the load
-                # repointing the shared singleton rather than a browse-owned
-                # scan.  The static widget is not reachable from here, so the
-                # viewer passes its own scan and store handles.
-                display_context_transition_log(
-                    logger, "browse_load_start", origin="H5Viewer.set_file",
-                    scan=self.scan,
-                    target=getattr(self.file_thread, "scan", None),
-                    publication_store=getattr(self, "publication_store", None),
-                    requested_file=str(fname),
-                    internal=bool(internal),
-                    run_writing=bool(getattr(self, "_run_writing", False)),
-                    live_run=bool(getattr(self.file_thread, "live_run", False)))
+                # O-2.1 (§61.4 B): the browse-load START mints ONE immutable
+                # operation identity — token, kind, requested path, load
+                # generation and the detached accepted run/config snapshot — and
+                # the finish echoes that exact object.  Without it the two halves
+                # of an asynchronous load could only be paired by timestamp, and
+                # the finish (which used to run on the file thread) reported a
+                # null generation for everything.
+                #
+                # ``kind`` separates the OPERATOR's browse from the application's
+                # own run-output rewiring: both are real transitions, but only
+                # the first is a user browse, and the acceptance assertion must
+                # not be satisfiable by an internal reload.
+                #
+                # ``target`` is the FILE THREAD's scan; when its ``object_id``
+                # equals the viewer's (and the acquisition's), the trace has
+                # caught the load repointing the shared singleton rather than a
+                # browse-owned scan.  Guarded by the channel check so a disabled
+                # session evaluates none of these arguments and stores nothing.
+                if run_config_debug_enabled():
+                    self._display_context_operation = (
+                        new_display_context_operation(
+                            kind=("internal_output_reload" if internal
+                                  else "user_browse"),
+                            requested_path=fname,
+                            load_generation=getattr(
+                                self, "_load_generation", None),
+                            identity=getattr(
+                                self, "diagnostic_run_identity", None),
+                            previous_scan=self.scan))
+                    display_context_transition_log(
+                        logger, "browse_load_start",
+                        origin="H5Viewer.set_file",
+                        scan=self.scan,
+                        target=getattr(self.file_thread, "scan", None),
+                        publication_store=getattr(
+                            self, "publication_store", None),
+                        operation=self._display_context_operation,
+                        run_writing=bool(
+                            getattr(self, "_run_writing", False)),
+                        live_run=bool(
+                            getattr(self.file_thread, "live_run", False)))
                 self._ensure_file_thread_running()
                 self.file_thread.queue.put("set_datafile")
                 self.ui.listData.itemSelectionChanged.connect(self.data_changed)

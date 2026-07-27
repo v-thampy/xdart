@@ -83,6 +83,7 @@ from .browse_debug import (
     sequence_summary,
 )
 from .run_config_debug import (
+    DECISION_CAPABILITY_FORCES_CLEAR,
     fail_closed_rejection_log,
     run_config_debug_enabled,
 )
@@ -2537,13 +2538,22 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         return capability is not None and getattr(capability, "state", None) in (
             CapabilityState.UNAVAILABLE, CapabilityState.ERROR)
 
-    def _log_capability_force_clear(self, state, role):
-        """FAIL-CLOSED REJECTION (O-2), availability half.
+    def _log_capability_force_clear(self, state, role, *, outcome):
+        """FAIL-CLOSED REJECTION (O-2 / O-2.1 §61.4 C), availability half.
 
         Emitted at the render site rather than inside
         :meth:`_capability_forces_clear` so the record can name the display
         scan the panel was being blanked FOR — the predicate is a static
         two-argument rule with no owner in scope, and it must stay one.
+
+        Two corrections over the first cut.  It fires for BOTH blanking paths
+        (``outcome`` says which), because a capability-driven blank on the
+        ordinary idle/paused clear delegate is the same rejection as one on the
+        processing-persistence override — reporting only the override made the
+        coverage false-green.  And the evidence identity comes from the pinned
+        projection's ``DisplayCapabilities``, which is where identity actually
+        lives; one ``Capability`` has none, so the first cut's ``found_owner``
+        was empty on every record it emitted.
 
         Gated up front: this sits on the per-role render path, and resolving the
         panel plan and the current scan key is real work that the disabled
@@ -2555,19 +2565,27 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             panel_of = getattr(state, "panel", None)
             panel = panel_of(role) if callable(panel_of) else None
             capability = getattr(panel, "capability", None)
+            projection = getattr(self, "_current_frame_projection", None)
+            capabilities = getattr(projection, "capabilities", None)
             try:
                 expected = overlay_current_scan_key(self)
             except Exception:
                 expected = None
             fail_closed_rejection_log(
-                logger, "capability_forces_clear",
+                logger, DECISION_CAPABILITY_FORCES_CLEAR,
                 reason="selected frame capability is UNAVAILABLE or ERROR",
+                outcome=str(outcome),
+                blanks_panel=True,
                 expected=expected,
-                found=getattr(capability, "identity", None),
+                found=getattr(capabilities, "identity", None),
                 origin="displayFrameWidget._render_display",
                 role=getattr(role, "value", str(role)),
                 generation=getattr(state, "generation", None),
-                capability_state=str(getattr(capability, "state", None)))
+                pin_scan_key=getattr(
+                    self, "_current_frame_projection_scan_key", None),
+                capability_state=str(getattr(capability, "state", None)),
+                capability_disposition=str(
+                    getattr(capability, "disposition", None)))
         except Exception:
             logger.debug("capability force-clear diagnostic failed",
                          exc_info=True)
@@ -3563,16 +3581,29 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self._apply_layout(mode)
 
         # Clear the panels this state does not want (kills stale content).
+        diagnosing = run_config_debug_enabled()
         for role in plan.clear:
             clear = self._clear_delegate(role)
-            if clear is None and displayFrameWidget._capability_forces_clear(
-                    state, role):
+            # O-2.1 §61.4 C: the typed capability rejection is evaluated
+            # INDEPENDENTLY of which path performs the blank.  It is still only
+            # ACTED on when the persistence override left no delegate (the
+            # behaviour below is unchanged), but a capability-driven blank on
+            # the ordinary clear delegate is the same rejection and must be
+            # reported too — recording only the override made the availability
+            # coverage false-green.
+            forced = (
+                displayFrameWidget._capability_forces_clear(state, role)
+                if (clear is None or diagnosing) else False)
+            if forced and diagnosing:
+                displayFrameWidget._log_capability_force_clear(
+                    self, state, role,
+                    outcome=("persistence_override" if clear is None
+                             else "normal_clear"))
+            if clear is None and forced:
                 # X1 Slice 3b (test 2f): the persist-during-processing skip
                 # must NEVER retain a stale image for a selected frame whose
                 # OWN typed fact is UNAVAILABLE/ERROR — never-stale beats
                 # persistence.  (A PENDING fact keeps the persist behavior.)
-                displayFrameWidget._log_capability_force_clear(
-                    self, state, role)
                 clear = {
                     PanelRole.RAW_2D: self.clear_image_view,
                     PanelRole.CAKE_2D: self.clear_binned_view,

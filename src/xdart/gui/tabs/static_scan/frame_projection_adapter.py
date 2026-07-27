@@ -36,7 +36,14 @@ from typing import Any
 
 from xrd_tools.session import FrameProjection, project_frame
 
-from .run_config_debug import fail_closed_rejection_log
+from .run_config_debug import (
+    DECISION_PROJECTION_STORE_ABSENT,
+    DECISION_PROJECTION_SUPERSEDED,
+    DECISION_PUBLICATION_ABSENT,
+    DECISION_PUBLICATION_OWNER_MISMATCH,
+    DECISION_RECORD_STORE_SKIPPED,
+    fail_closed_rejection_log,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -213,22 +220,34 @@ class _PublicationBackedStoreView:
     def _publication(self, label):
         publication = self._publication_store.get(label)
         if not publication_serves_scan(publication, self._scan_key):
-            # FAIL-CLOSED REJECTION (O-2): a retained publication for THIS label
-            # belongs to another scan, so the projection reports the frame
-            # absent and the panels blank.  Before this the decision was
-            # invisible -- a blanked panel and a frame that simply had not
-            # arrived looked identical in every log.
-            fail_closed_rejection_log(
-                logger, "publication_owner_mismatch",
-                reason=("retained publication does not belong to the requested "
-                        "display scan"),
-                expected=self._scan_key,
-                found=(None if publication is None
-                       else getattr(publication, "scan_key", None)
-                       or getattr(publication, "source_identity", None)),
-                origin="_PublicationBackedStoreView._publication",
-                label=label,
-                publication_present=publication is not None)
+            # FAIL-CLOSED REJECTION (O-2/O-2.1 §61.4 C): two DIFFERENT
+            # decisions, kept apart.  "The store holds nothing for this label"
+            # is a normal transient await; "the store holds this label under
+            # ANOTHER scan" is the cross-context bug.  Collapsing them into one
+            # event was the untruthful taxonomy the review rejected.  Both blank
+            # the panel, which is why both are recorded at all.
+            if publication is None:
+                fail_closed_rejection_log(
+                    logger, DECISION_PUBLICATION_ABSENT,
+                    reason="no publication is held for this label",
+                    outcome="record_absent",
+                    blanks_panel=True,
+                    expected=self._scan_key,
+                    found=None,
+                    origin="_PublicationBackedStoreView._publication",
+                    label=label)
+            else:
+                fail_closed_rejection_log(
+                    logger, DECISION_PUBLICATION_OWNER_MISMATCH,
+                    reason=("retained publication does not belong to the "
+                            "requested display scan"),
+                    outcome="record_withheld",
+                    blanks_panel=True,
+                    expected=self._scan_key,
+                    found=(getattr(publication, "scan_key", None)
+                           or getattr(publication, "source_identity", None)),
+                    origin="_PublicationBackedStoreView._publication",
+                    label=label)
             return None
         return publication
 
@@ -316,8 +335,10 @@ class FrameProjectionAdapter:
         if request.generation < self._latest_generation:
             # Superseded: a newer selection/generation has already been pinned.
             fail_closed_rejection_log(
-                logger, "projection_superseded",
+                logger, DECISION_PROJECTION_SUPERSEDED,
                 reason="request generation is older than the pinned generation",
+                outcome="request_dropped",
+                blanks_panel=True,
                 expected=self._latest_generation,
                 found=request.generation,
                 origin="FrameProjectionAdapter.project",
@@ -394,28 +415,33 @@ class FrameProjectionAdapter:
             return record_store
         publication_store = _call_provider(self._publication_store_provider)
         if record_store is not None:
-            # FAIL-CLOSED REJECTION (O-2): the attached record store declares a
-            # different scan, so it is skipped.  ``outcome`` distinguishes a
-            # fall-through (the browsed scan's publications may still serve)
-            # from a genuine blank, because only the second one empties panels.
+            # The attached record store declares a different scan, so it is
+            # SKIPPED.  O-2.1 §61.4 C: this is a rejection but usually not a
+            # blanking one -- the browsed scan's publications still get their
+            # chance -- so it is a distinct decision that reports
+            # ``blanks_panel`` honestly instead of being filed next to a real
+            # blank and left to the reader to disambiguate.
             fail_closed_rejection_log(
-                logger, "record_store_owner_mismatch",
+                logger, DECISION_RECORD_STORE_SKIPPED,
                 reason="attached record store declares a different scan",
+                outcome=("fallthrough_to_publication_store"
+                         if publication_store is not None else "no_store"),
+                blanks_panel=publication_store is None,
                 expected=request.scan_key,
                 found=getattr(record_store, STORE_SCAN_KEY_ATTR, None),
                 origin="FrameProjectionAdapter._resolve_store",
                 label=request.frame_index,
-                generation=request.generation,
-                outcome=("fallthrough_to_publication_store"
-                         if publication_store is not None else "no_store"))
+                generation=request.generation)
         if publication_store is not None:
             return _PublicationBackedStoreView(
                 publication_store, scan_key=request.scan_key)
         fail_closed_rejection_log(
-            logger, "projection_store_absent",
+            logger, DECISION_PROJECTION_STORE_ABSENT,
             reason="no record surface owns the requested display scan",
+            outcome="panel_blanked",
+            blanks_panel=True,
             expected=request.scan_key,
-            found=None,
+            found=getattr(record_store, STORE_SCAN_KEY_ATTR, None),
             origin="FrameProjectionAdapter._resolve_store",
             label=request.frame_index,
             generation=request.generation)

@@ -23,10 +23,12 @@ serialized, so the channel stays safe to leave on for a whole beamline session.
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass, replace
 
 
 def run_config_debug_enabled() -> bool:
@@ -352,6 +354,164 @@ _STORE_SCAN_KEY_ATTR = "_xdart_scan_key"
 DISPLAY_CONTEXT_TRANSITION_EVENT = "display_context_transition"
 FAIL_CLOSED_REJECTION_EVENT = "fail_closed_rejection"
 
+#: The canonical fail-closed decision names.  O-2.1 (§61.4 C): the taxonomy has
+#: to be TRUTHFUL, so "no publication exists" is a different decision from "a
+#: publication exists under the wrong owner", and a record-store candidate that
+#: was skipped while the publication fallback still served is NOT a blanking
+#: event.  Every record carries ``blanks_panel`` so a reader never has to infer
+#: that from the decision name.
+DECISION_RECORD_STORE_SKIPPED = "record_store_skipped_owner_mismatch"
+DECISION_PUBLICATION_ABSENT = "publication_absent"
+DECISION_PUBLICATION_OWNER_MISMATCH = "publication_owner_mismatch"
+DECISION_PROJECTION_STORE_ABSENT = "projection_store_absent"
+DECISION_PROJECTION_SUPERSEDED = "projection_superseded"
+DECISION_CAPABILITY_FORCES_CLEAR = "capability_forces_clear"
+
+#: The ONE name a context-qualified hydration rejection must use.  Nothing emits
+#: it at this tip: hydration completions carry a generation and no owner, which
+#: is the defect O-2's reproducer pins and O-3 fixes.  It is named here so the
+#: reproducer can require the exact decision instead of matching a permissive
+#: set, and so O-3 has no naming latitude when it starts emitting it.
+DECISION_HYDRATION_CONTEXT_MISMATCH = "hydration_context_mismatch"
+
+FAIL_CLOSED_DECISIONS = (
+    DECISION_RECORD_STORE_SKIPPED,
+    DECISION_PUBLICATION_ABSENT,
+    DECISION_PUBLICATION_OWNER_MISMATCH,
+    DECISION_PROJECTION_STORE_ABSENT,
+    DECISION_PROJECTION_SUPERSEDED,
+    DECISION_CAPABILITY_FORCES_CLEAR,
+    DECISION_HYDRATION_CONTEXT_MISMATCH,
+)
+
+#: Process-unique operation counter.  A browse load crosses a thread boundary,
+#: so start and finish can only be paired by a token that is minted once and
+#: echoed — wall-clock ordering does not survive a queued task.
+_operation_counter = itertools.count(1)
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosticRunIdentity:
+    """A DETACHED snapshot of which run/config a display operation happened under.
+
+    Strings and integers only.  The browse chain needs the accepted run identity
+    to qualify its transitions, and the static widget is not reachable from
+    there; handing the viewer this frozen tuple keeps the qualification without
+    giving a background seam a live widget, store, scan or callback to hold
+    (§61.4 B).
+    """
+
+    run_generation: int | None = None
+    config_generation: int | None = None
+    runend_generation: int | None = None
+    display_generation: int | None = None
+    run_active: bool = False
+    acquisition_key: str = ""
+    acquisition_object_id: str = ""
+
+    def as_fields(self) -> dict:
+        return {
+            "run_generation": self.run_generation,
+            "config_generation": self.config_generation,
+            "runend_generation": self.runend_generation,
+            "display_generation": self.display_generation,
+            "run_active": self.run_active,
+            "acquisition_key": self.acquisition_key,
+            "acquisition_object_id": self.acquisition_object_id,
+        }
+
+
+def capture_diagnostic_run_identity(widget) -> DiagnosticRunIdentity | None:
+    """Freeze the widget's current run/config identity, or ``None`` when off."""
+    if not run_config_debug_enabled() or widget is None:
+        return None
+    try:
+        display = _safe_attr(widget, "displayframe")
+        acquisition = _safe_attr(widget, "_x1_run_scan_capture")
+        return DiagnosticRunIdentity(
+            run_generation=_safe_attr(
+                widget, "_run_config_debug_run_generation"),
+            config_generation=_safe_attr(
+                widget, "_run_config_debug_config_generation"),
+            runend_generation=_safe_attr(widget, "_runend_generation"),
+            display_generation=_safe_attr(display, "display_generation"),
+            run_active=bool(_safe_attr(widget, "_run_active", False)),
+            acquisition_key=_owner_identity(_scan_key(acquisition)),
+            acquisition_object_id=(
+                "" if acquisition is None else hex(id(acquisition))),
+        )
+    except Exception:
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class DisplayContextOperation:
+    """One browse load's immutable diagnostic identity.
+
+    Minted at ``browse_load_start`` and echoed verbatim at
+    ``browse_load_finish``, so a reader can pair the two halves of an
+    asynchronous load without guessing from timestamps.  ``kind`` separates the
+    operator's own browse from the application's internal run-output rewiring:
+    both are real transitions, but only the first is a user browse, and the
+    O-2.1 acceptance assertion must not be satisfiable by an internal reload
+    (§61.4 B).
+    """
+
+    token: str
+    kind: str
+    requested_path: str
+    load_generation: int | None
+    identity: DiagnosticRunIdentity | None
+    previous_scan_key: str = ""
+    previous_data_file: str = ""
+
+    def as_fields(self) -> dict:
+        fields = {
+            "token": self.token,
+            "kind": self.kind,
+            "requested_path": self.requested_path,
+            "load_generation": self.load_generation,
+            "previous_scan_key": self.previous_scan_key,
+            "previous_data_file": self.previous_data_file,
+        }
+        fields["identity"] = (
+            None if self.identity is None else self.identity.as_fields())
+        return fields
+
+
+def new_display_context_operation(
+    *,
+    kind: str,
+    requested_path,
+    load_generation=None,
+    identity: DiagnosticRunIdentity | None = None,
+    previous_scan=None,
+) -> DisplayContextOperation:
+    """Mint one browse-load operation identity.  Callers gate on the channel."""
+    return DisplayContextOperation(
+        token=f"{os.getpid():x}-{next(_operation_counter):x}",
+        kind=str(kind),
+        requested_path=("" if requested_path is None else str(requested_path)),
+        load_generation=load_generation,
+        identity=identity,
+        previous_scan_key=_owner_identity(_scan_key(previous_scan)),
+        previous_data_file=_owner_identity(
+            _safe_attr(previous_scan, "data_file")),
+    )
+
+
+def completed_display_context_operation(
+    operation: DisplayContextOperation | None,
+    **updates,
+) -> DisplayContextOperation | None:
+    """Echo ``operation`` with completion-side fields filled in."""
+    if operation is None:
+        return None
+    try:
+        return replace(operation, **updates)
+    except Exception:
+        return operation
+
 
 def _owner_identity(value) -> str:
     """One short, comparable spelling of an ownership key.
@@ -492,6 +652,7 @@ def display_context_transition_log(
     scan=None,
     record_store=None,
     publication_store=None,
+    operation: DisplayContextOperation | None = None,
     level: str = "info",
     **fields,
 ) -> None:
@@ -500,17 +661,33 @@ def display_context_transition_log(
     ``phase`` is one of :data:`DISPLAY_CONTEXT_PHASES`.  Emitting an unknown
     phase is not an error (a diagnostic must never break a boundary), but it is
     flagged in the payload so a malformed trace is visible rather than silent.
+
+    ``operation`` carries the browse-load pair's immutable identity.  When the
+    caller has no widget (the browse chain), its ``identity`` snapshot is also
+    folded into the context block, so a browse record is generation-qualified
+    instead of reporting nulls for every generation (§61.4 B).
     """
     if not run_config_debug_enabled():
         return
     try:
+        context = display_context_summary(
+            widget, target=target, scan=scan,
+            record_store=record_store,
+            publication_store=publication_store)
+        if widget is None and operation is not None and operation.identity:
+            for key, value in operation.identity.as_fields().items():
+                if key in context and context[key] is None:
+                    context[key] = value
+                elif key not in context:
+                    context[key] = value
+            if context.get("load_generation") is None:
+                context["load_generation"] = operation.load_generation
         payload = {
             "phase": str(phase),
             "phase_known": str(phase) in DISPLAY_CONTEXT_PHASES,
-            "context": display_context_summary(
-                widget, target=target, scan=scan,
-                record_store=record_store,
-                publication_store=publication_store),
+            "context": context,
+            "operation": (
+                None if operation is None else operation.as_fields()),
         }
         payload.update(fields)
         run_config_debug_log(
@@ -531,20 +708,24 @@ def fail_closed_rejection_log(
     decision: str,
     *,
     reason: str,
+    outcome: str,
+    blanks_panel: bool,
     expected=None,
     found=None,
     origin: str = "",
     level: str = "info",
     **fields,
 ) -> None:
-    """Record one FAIL-CLOSED REJECTION that blanks (or withholds) a panel.
+    """Record one FAIL-CLOSED REJECTION.
 
-    ``decision`` names the gate (``record_store_owner_mismatch``,
-    ``publication_owner_mismatch``, ``projection_superseded``,
-    ``projection_store_absent``, ``capability_forces_clear``); ``expected`` and
-    ``found`` are the owner identities the gate compared.  Deliberately does NOT
-    take a widget: these fire inside per-frame lookup paths, so the record stays
-    a flat identity tuple with no traversal behind it.
+    ``decision`` must be one of :data:`FAIL_CLOSED_DECISIONS`; ``expected`` and
+    ``found`` are the owner identities the gate compared.  ``outcome`` and
+    ``blanks_panel`` are REQUIRED (§61.4 C): a record-store candidate that was
+    skipped while the publication fallback still served is a real rejection but
+    blanks nothing, and calling both cases the same event made the taxonomy
+    untruthful.  Deliberately does NOT take a widget: these fire inside
+    per-frame lookup paths, so the record stays a flat identity tuple with no
+    traversal behind it.
     """
     if not run_config_debug_enabled():
         return
@@ -552,7 +733,10 @@ def fail_closed_rejection_log(
         payload = {
             "event": FAIL_CLOSED_REJECTION_EVENT,
             "decision": str(decision),
+            "decision_known": str(decision) in FAIL_CLOSED_DECISIONS,
             "reason": str(reason),
+            "outcome": str(outcome),
+            "blanks_panel": bool(blanks_panel),
             "expected_owner": _owner_identity(expected),
             "found_owner": _owner_identity(found),
             "origin": origin,
