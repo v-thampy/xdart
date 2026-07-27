@@ -49,10 +49,12 @@ from __future__ import annotations
 import itertools
 import os
 import threading
-from dataclasses import dataclass, fields as dataclass_fields
+from dataclasses import dataclass, field, fields as dataclass_fields
 from enum import Enum
 
 __all__ = [
+    "CommitGate",
+    "HydrationRequest",
     "FINALIZATION_FINALIZED",
     "FINALIZATION_IN_PROGRESS",
     "FINALIZATION_PENDING",
@@ -132,6 +134,72 @@ class _WriteOnceIdentity:
         object.__setattr__(self, name, value)
 
 
+class CommitGate:
+    """The linearization point between a background read and its insertion.
+
+    A hydration request reads from disk OFF the GUI thread and UNLOCKED — that
+    is the whole point of the background worker — and then inserts what it read
+    into a store.  Between those two moments the display can move: Resume can
+    invalidate a browse, a rescope can move the acquisition's sub-scan, a
+    replacement can release a context.  Checking ownership only when the
+    completion reaches the GUI is too late, because by then the payload is
+    already in a store.
+
+    So the gate is held around the INSERT and nothing else.  ``cancel()`` runs
+    on the GUI thread and therefore waits, at worst, for one bounded store
+    upsert — never for an ``.nxs`` open.  A request carries the epoch it was
+    minted under; once the epoch moves or the gate is cancelled, the request may
+    read to completion but may insert nowhere.
+
+    This is not a fourth authority: exactly one gate belongs to each of the two
+    context owners, created with them and cancelled by their own lifecycle.
+    """
+
+    __slots__ = ("_lock", "_epoch", "_cancelled")
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._epoch = 1
+        self._cancelled = False
+
+    @property
+    def epoch(self) -> int:
+        return self._epoch
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def enter(self, epoch) -> bool:
+        """Take the commit window for *epoch*, or refuse it.
+
+        On ``True`` the caller HOLDS the gate and must call :meth:`leave`.
+        """
+        self._lock.acquire()
+        if self._cancelled or epoch != self._epoch:
+            self._lock.release()
+            return False
+        return True
+
+    def leave(self) -> None:
+        try:
+            self._lock.release()
+        except RuntimeError:
+            pass
+
+    def advance(self) -> int:
+        """Move to a new epoch, invalidating every request minted before it."""
+        with self._lock:
+            self._epoch += 1
+            return self._epoch
+
+    def cancel(self) -> None:
+        """Permanently withdraw commit authority (idempotent)."""
+        with self._lock:
+            self._cancelled = True
+            self._epoch += 1
+
+
 def _clear(obj) -> None:
     """``clear()`` an owned container/store.  Failures PROPAGATE.
 
@@ -169,6 +237,32 @@ class DisplayBindings:
     @classmethod
     def field_names(cls) -> tuple:
         return tuple(f.name for f in dataclass_fields(cls))
+
+
+@dataclass(frozen=True, slots=True)
+class HydrationRequest:
+    """Everything a background hydration needs, decided when it was REQUESTED.
+
+    The target stores and the commit authority travel WITH the request, so the
+    worker never asks a live provider where a completed read belongs.  That
+    lookup, done at execution time, is how a read made under a browse landed in
+    the resumed run's store.
+    """
+
+    label: object
+    purpose: str
+    generation: int
+    context_token: str
+    context_scan_key: str
+    context_source: str
+    stores: tuple
+    commit_gate: object
+    epoch: int
+
+    @property
+    def owner(self) -> tuple:
+        """The identity a completion must echo."""
+        return (self.context_token, self.context_scan_key)
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,6 +343,9 @@ class AcquisitionContext(_WriteOnceIdentity):
     #: The live sub-scan key.  SINGLE WRITER: :meth:`rescope_to`, driven by the
     #: frame-driven scan-boundary owner.  Initialised to ``run_scan_key``.
     current_scan_key: str = ""
+    #: This context's commit authority (§9.2.4).  Created with the context and
+    #: cancelled by its own lifecycle — one per owner, not a new authority.
+    commit_gate: CommitGate = field(default_factory=CommitGate)
     #: The run's ``FrameRecordStore`` once the streaming session creates one.
     #: SINGLE WRITER: :meth:`adopt_record_store`.
     record_store: object = None
@@ -279,6 +376,10 @@ class AcquisitionContext(_WriteOnceIdentity):
             self.current_scan_key = str(self.run_scan_key or "")
 
     @property
+    def commit_epoch(self) -> int:
+        return self.commit_gate.epoch
+
+    @property
     def kind(self) -> ContextKind:
         return ContextKind.ACQUISITION
 
@@ -288,8 +389,14 @@ class AcquisitionContext(_WriteOnceIdentity):
         return self.current_scan_key or self.run_scan_key
 
     def rescope_to(self, scan_key) -> None:
-        """Stamp the new sub-scan key at a genuine scan boundary."""
+        """Stamp the new sub-scan key at a genuine scan boundary.
+
+        The commit epoch moves with it (§9.2.2): a request minted against the
+        previous sub-scan is qualified against a key the display has left, so
+        it must no longer be able to insert.
+        """
         self.current_scan_key = str(scan_key or "")
+        self.commit_gate.advance()
 
     def adopt_record_store(self, store) -> None:
         """Adopt the streaming session's per-run record store."""
@@ -373,6 +480,9 @@ class BrowseContext(_WriteOnceIdentity):
     #: acquisition's scan-qualified record store.  Present so the swap surface
     #: is complete by construction rather than by omission.
     record_store: object = None
+    #: This context's commit authority (§9.2.4).  Created with the context and
+    #: cancelled by its own lifecycle — one per owner, not a new authority.
+    commit_gate: CommitGate = field(default_factory=CommitGate)
     #: The EXACT immutable load request this context enqueued (the file task
     #: itself).  Admission compares the completion against THIS object, not
     #: against a token that a reconstructed task could also carry.  SINGLE
@@ -408,6 +518,10 @@ class BrowseContext(_WriteOnceIdentity):
                     "a browse receipt must carry its own context token and "
                     f"load generation: receipt=({token!r}, {generation!r}) "
                     f"context=({self.context_token!r}, {self.load_generation!r})")
+
+    @property
+    def commit_epoch(self) -> int:
+        return self.commit_gate.epoch
 
     @property
     def kind(self) -> ContextKind:
@@ -484,6 +598,9 @@ class BrowseContext(_WriteOnceIdentity):
         """
         self.invalidated = True
         self.loaded = False
+        # §9.2.7 — commit authority goes FIRST.  A read already in flight may
+        # finish reading; it may insert into nothing.
+        self.commit_gate.cancel()
 
     def release(self) -> None:
         """Invalidate this browse AND drop everything it retained.

@@ -658,7 +658,8 @@ def test_replacing_a_browse_releases_the_previous_one(
     # The FIRST task completing late must not be admitted, and must not touch
     # the newer selection.
     assert widget._on_browse_loaded(queued[0]) is None
-    assert widget._display_selection is None
+    assert widget._display_selection.names(widget._acquisition_context), (
+        "a refused browse changed the display selection")
     assert widget.displayframe.scan is widget.scan
 
 
@@ -776,7 +777,7 @@ def test_admission_refuses_a_completion_it_does_not_own(
         context_token=task.context_token,
         load_generation=task.load_generation + 1)
     assert widget._on_browse_loaded(stale_generation) is None
-    assert widget._display_selection is None
+    assert widget._display_selection.names(widget._acquisition_context)
 
     # The exact task IS admitted while the run is paused...
     assert widget._on_browse_loaded(task) is not None
@@ -821,7 +822,8 @@ def test_admission_refuses_a_reconstructed_task_on_every_field(
             load_generation=task.load_generation)
         fields.update(override)
         assert widget._on_browse_loaded(BrowseLoadTask(**fields)) is None, name
-        assert widget._display_selection is None, name
+        assert widget._display_selection.names(
+            widget._acquisition_context), name
         assert widget._browse_context is context, name
         assert context.loaded is False, name
         assert widget.displayframe.scan is widget.scan, name
@@ -833,7 +835,7 @@ def test_admission_refuses_a_reconstructed_task_on_every_field(
         context_token=task.context_token,
         load_generation=task.load_generation)
     assert widget._on_browse_loaded(clone) is None
-    assert widget._display_selection is None
+    assert widget._display_selection.names(widget._acquisition_context)
     # The exact enqueued object is admitted.
     assert widget._on_browse_loaded(task) is not None
 
@@ -850,7 +852,7 @@ def test_admission_refuses_a_completion_once_browsing_has_ended(
     assert widget._run_active is True
 
     assert widget._on_browse_loaded(queued[0]) is None
-    assert widget._display_selection is None
+    assert widget._display_selection.names(widget._acquisition_context)
     assert context.loaded is False
     assert widget.displayframe.scan is widget.scan
 
@@ -873,7 +875,7 @@ def test_admission_refuses_once_browsing_ends_even_before_the_release(
     assert context.invalidated is False and context.released is False
 
     assert widget._on_browse_loaded(queued[0]) is None
-    assert widget._display_selection is None
+    assert widget._display_selection.names(widget._acquisition_context)
     assert context.loaded is False
 
 

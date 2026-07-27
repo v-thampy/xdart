@@ -275,7 +275,11 @@ def test_writer_can_interleave_between_bulk_1d_hydration_chunks(monkeypatch):
 def test_request_frame_hydration_respects_enabled_flag():
     calls = []
     fake_worker = SimpleNamespace(
-        request=lambda label, gen, *, purpose="full": calls.append(
+        # X1 O-3 (c3R-b §9.2.5): the broad `except TypeError` retry is gone —
+        # it silently downgraded an owned request to an ownerless one whenever
+        # ANY production TypeError escaped, bypassing the admission boundary.
+        # A double must therefore accept the arguments production passes.
+        request=lambda label, gen, *, purpose="full", **kw: calls.append(
             (label, gen, purpose)))
     h = SimpleNamespace(
         _async_hydration_enabled=False, display_generation=5,
@@ -304,7 +308,11 @@ def test_repeated_failed_hydration_suppresses_until_generation_bump(caplog):
     calls = []
     rendered = []
     fake_worker = SimpleNamespace(
-        request=lambda label, gen, *, purpose="full": calls.append(
+        # X1 O-3 (c3R-b §9.2.5): the broad `except TypeError` retry is gone —
+        # it silently downgraded an owned request to an ownerless one whenever
+        # ANY production TypeError escaped, bypassing the admission boundary.
+        # A double must therefore accept the arguments production passes.
+        request=lambda label, gen, *, purpose="full", **kw: calls.append(
             (label, gen, purpose)))
     h = SimpleNamespace(
         _async_hydration_enabled=True,

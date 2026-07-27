@@ -739,12 +739,19 @@ class DisplayDataMixin:
                          exc_info=True)
             return None
 
-    def _rehydrate_publications_1d(self, labels):
-        """Batch hydrate selected 1D rows without raw/cake materialization."""
+    def _rehydrate_publications_1d(self, labels, *, context=None):
+        """Batch hydrate selected 1D rows without raw/cake materialization.
+
+        X1 O-3 (c3R-b §9.2.3): ``context`` is the display context whose store
+        registered this hydrator.  The batch path derived its scan and its
+        store from mutable display attributes, so a browse's 1-D sweep read
+        whatever the display had moved on to.
+        """
         labels = tuple(dict.fromkeys(int(label) for label in labels))
         if not labels:
             return ()
-        scan = getattr(self, "scan", None)
+        scan = (getattr(context, "scan", None) if context is not None
+                else getattr(self, "scan", None))
         scan_file = getattr(scan, "data_file", None)
         if not scan_file:
             return ()

@@ -82,6 +82,7 @@ from .browse_debug import (
     image_payload_summary,
     sequence_summary,
 )
+from xdart.modules.display_context import HydrationRequest
 from .run_config_debug import (
     DECISION_CAPABILITY_FORCES_CLEAR,
     DECISION_HYDRATION_CONTEXT_MISMATCH,
@@ -1559,21 +1560,67 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             # match — two contexts can sit at the same generation, and the
             # publication's owner stamp used to be taken at execution time,
             # which is the wrong end of the round trip.
-            context_token = str(getattr(self, "display_context_token", "") or "")
-            try:
-                context_scan_key = str(overlay_current_scan_key(self) or "")
-            except Exception:
-                context_scan_key = ""
-            try:
+            request = displayFrameWidget._build_hydration_request(
+                self, label_key, purpose=purpose_key)
+            if request is None:
+                # §9.2.5 — the IDLE/legacy path, reached through an explicit
+                # adapter rather than a broad `except TypeError` retry.  The
+                # parent's retry would silently downgrade an owned request to
+                # an ownerless one whenever an unrelated production TypeError
+                # escaped, bypassing the whole admission boundary.
                 worker.request(
                     label_key, self.display_generation, purpose=purpose_key,
                     consumer=consumer,
-                    supersede_reason=SupersedeReason.SELECTION,
-                    context_token=context_token,
-                    context_scan_key=context_scan_key)
-            except TypeError:
+                    supersede_reason=SupersedeReason.SELECTION)
+            else:
                 worker.request(
-                    label_key, self.display_generation, purpose=purpose_key)
+                    request.label, request.generation,
+                    purpose=request.purpose, consumer=consumer,
+                    supersede_reason=SupersedeReason.SELECTION,
+                    context_token=request.context_token,
+                    context_scan_key=request.context_scan_key,
+                    context_source=request.context_source,
+                    stores=request.stores,
+                    commit_gate=request.commit_gate,
+                    epoch=request.epoch)
+
+    def _selected_context(self):
+        """The display context this widget is rendering, or ``None``.
+
+        Bound by the host (the ONE context owner); ``None`` for the idle/legacy
+        regime and for duck hosts that own no context at all.
+        """
+        resolver = getattr(self, "selected_display_context", None)
+        if not callable(resolver):
+            return None
+        try:
+            return resolver()
+        except Exception:
+            logger.debug("selected-context resolver failed", exc_info=True)
+            return None
+
+    def _build_hydration_request(self, label, *, purpose="full"):
+        """Freeze WHERE a hydration lands, at the moment it is requested.
+
+        Returns ``None`` only when no context is active — the idle/legacy
+        regime, which keeps the ownerless path through an explicit adapter.
+        While a context IS active a request can never be ownerless (§9.2.1/5).
+        """
+        context = displayFrameWidget._selected_context(self)
+        if context is None:
+            return None
+        stores = tuple(displayFrameWidget._hydration_stores(self))
+        return HydrationRequest(
+            label=label,
+            purpose=str(purpose or "full"),
+            generation=int(getattr(self, "display_generation", 0)),
+            context_token=str(context.context_token or ""),
+            context_scan_key=str(context.scan_key or ""),
+            context_source=str(getattr(context, "source_path", "") or ""),
+            stores=stores,
+            commit_gate=context.commit_gate,
+            epoch=int(context.commit_epoch),
+        )
 
     def _admit_hydration_owner(self, owner, label, generation) -> bool:
         """Whether a completion belongs to the CURRENTLY selected context.
@@ -1589,26 +1636,33 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         legacy/duck-host call), the display has no context token yet, or the
         tokens agree.
         """
-        if not owner:
-            return True
-        try:
-            request_token, request_scan_key = owner
-        except (TypeError, ValueError):
-            return True
-        request_token = str(request_token or "")
         current_token = str(getattr(self, "display_context_token", "") or "")
-        if not request_token or not current_token:
-            return True
-        if request_token == current_token:
-            return True
         try:
             expected = overlay_current_scan_key(self)
         except Exception:
             expected = None
+        expected = str(expected or "")
+        if not current_token:
+            # No context is active: the idle/legacy regime, where a completion
+            # carries no owner and none is required.
+            return True
+        # §9.2.5 — while a context IS active, FAIL CLOSED on anything that is
+        # not a complete, matching owner.  The parent failed OPEN for absent,
+        # malformed and empty owners, and compared only the token when one was
+        # present, so a stale scan key inside the right context was admitted.
+        request_token, request_scan_key = "", ""
+        malformed = True
+        if isinstance(owner, (tuple, list)) and len(owner) == 2:
+            request_token = str(owner[0] or "")
+            request_scan_key = str(owner[1] or "")
+            malformed = not (request_token and request_scan_key)
+        if not malformed and request_token == current_token and (
+                not expected or request_scan_key == expected):
+            return True
         fail_closed_rejection_log(
             logger, DECISION_HYDRATION_CONTEXT_MISMATCH,
-            reason=("the completion names a display context this widget has "
-                    "left"),
+            reason=("the completion does not name the display context this "
+                    "widget is rendering"),
             outcome="completion_dropped",
             blanks_panel=False,
             expected=expected,

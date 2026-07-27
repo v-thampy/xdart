@@ -1704,6 +1704,12 @@ def test_run_boundary_propagates_directory_intent_without_catalog_owner(
 
         frozen = widget._prepare_controls_v2_run_configuration()
         assert frozen.source is not None
+        # §8.1: stand in for the admission the production Start path performs;
+        # the run-state owner refuses a wrangler run whose configuration is not
+        # ONE admitted object across all five references.
+        for _owner in (widget.wrangler, widget.wrangler.thread):
+            for _name in ("run_configuration", "_admitted_run_configuration"):
+                setattr(_owner, _name, frozen)
         widget.start_wrangler()
 
         assert started == [True]
@@ -4535,6 +4541,24 @@ def test_enter_run_state_resets_frame_count_snapshot(qapp, monkeypatch):
         widget.deleteLater()
 
 
+
+def _admit_pending_run_configuration(widget):
+    """Install the run admission a real ``imageWrangler.start()`` performs.
+
+    X1 O-3 (§8.1): the run-state owner requires the handed-off frozen object
+    and all four wrapper/worker carrier-and-ledger references to be ONE object
+    before it will start a wrangler run.  These Controls cases drive
+    ``start_wrangler()`` directly, so they have to stand in for the admission
+    the production Start path would already have done — otherwise the double
+    represents a run whose configuration was never admitted, which is exactly
+    what the gate exists to refuse.
+    """
+    frozen = widget._require_controls_v2_run_handoff()
+    for owner in (widget.wrangler, widget.wrangler.thread):
+        for name in ("run_configuration", "_admitted_run_configuration"):
+            setattr(owner, name, frozen)
+    return frozen
+
 def test_controls_panel_v2_run_commits_focused_integration_edit(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -4569,6 +4593,7 @@ def test_controls_panel_v2_run_commits_focused_integration_edit(qapp, monkeypatc
         monkeypatch.setattr(widget.wrangler, "setup", lambda: None)
 
         widget._prepare_controls_v2_run_configuration()
+        _admit_pending_run_configuration(widget)
         widget.start_wrangler()
 
         assert widget.integratorTree.ui.npts_1D.text() != "777"
@@ -4651,6 +4676,7 @@ def test_controls_panel_v2_run_commits_focused_2d_points(qapp, monkeypatch):
         monkeypatch.setattr(widget.wrangler, "setup", lambda: None)
 
         widget._prepare_controls_v2_run_configuration()
+        _admit_pending_run_configuration(widget)
         widget.start_wrangler()
 
         assert widget.integratorTree.ui.npts_radial_2D.text() != "123"
@@ -4970,6 +4996,7 @@ def test_controls_panel_v2_mask_saturated_is_pushed_before_run_lock(qapp, monkey
         monkeypatch.setattr(widget.wrangler, "setup", lambda: None)
 
         widget._prepare_controls_v2_run_configuration()
+        _admit_pending_run_configuration(widget)
         widget.start_wrangler()
 
         assert seen_at_disable == [True]

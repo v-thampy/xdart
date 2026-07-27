@@ -2030,6 +2030,11 @@ class staticWidget(QWidget):
         self.displayframe.frame_record_store = self._selected_frame_record_store
         # The viewer REQUESTS a paused browse through this bound callback; the
         # context itself is constructed and owned here, never there.
+        # The display resolves WHICH context it is rendering through the ONE
+        # owner, so a hydration request can freeze its target and its commit
+        # authority at request time (§9.2.3).
+        self.displayframe.selected_display_context = (
+            self._selected_display_context)
         self.h5viewer.begin_paused_browse = self._begin_paused_browse
         self.h5viewer.file_thread.sigBrowseLoaded.connect(self._on_browse_loaded)
         self.displayframe._resolve_overlay_grid_mismatch = (
@@ -12988,6 +12993,13 @@ class staticWidget(QWidget):
         rehydrate = getattr(display, "_rehydrate_publication", None)
         if callable(set_hydrator) and callable(rehydrate):
             set_hydrator(partial(rehydrate, context=context))
+        set_1d = getattr(store, "set_1d_hydrator", None)
+        rehydrate_1d = getattr(display, "_rehydrate_publications_1d", None)
+        if callable(set_1d) and callable(rehydrate_1d):
+            # The batch 1-D path is bound the same way: it derived its scan and
+            # its store from mutable display attributes, so a browse's sweep
+            # read whatever the display had moved on to (§9.2.3).
+            set_1d(partial(rehydrate_1d, context=context))
 
         generation = display.display_generation
         bump = getattr(display, "_bump_display_generation", None)
@@ -13018,6 +13030,36 @@ class staticWidget(QWidget):
         repaint = getattr(display, "request_current_selection_repaint", None)
         if callable(repaint):
             repaint(generation=generation, reason="context-swap")
+        return selection
+
+    def _install_acquisition_selection(self, context=None, *, origin=""):
+        """Stamp the acquisition selection WITHOUT a repaint (§9.2.1/9.2.2).
+
+        Used at Run admission and at a genuine sub-scan boundary: the display
+        is already showing the acquisition in both cases, so this records WHICH
+        identity it is showing rather than swapping anything.  The selection
+        owner still bumps the generation before stamping, so a request minted
+        after it can never carry a pre-bump identity.
+        """
+        context = (context if context is not None
+                   else getattr(self, "_acquisition_context", None))
+        display = getattr(self, "displayframe", None)
+        if context is None or display is None:
+            return None
+        generation = display.display_generation
+        bump = getattr(display, "_bump_display_generation", None)
+        if callable(bump):
+            generation = bump(reason=SupersedeReason.SELECTION)
+        selection = DisplaySelection.for_context(context, generation)
+        self._display_selection = selection
+        display.display_context_token = selection.context_token
+        run_config_debug_log(
+            logger, "acquisition_selection_stamped", widget=self,
+            origin=origin or "_install_acquisition_selection",
+            selected_context=selection.context_token,
+            selected_scan_key=selection.scan_key,
+            selected_generation=selection.display_generation,
+            commit_epoch=context.commit_epoch)
         return selection
 
     def _select_acquisition_context(self, *, origin=""):
@@ -13347,8 +13389,13 @@ class staticWidget(QWidget):
         # paused browse repointed that very object and Resume then had nothing
         # left to recover.  `AcquisitionContext` carries the run's identity, its
         # display bindings and its stores, so a browse can be given its own.
-        staticWidget._install_acquisition_context(
+        context = staticWidget._install_acquisition_context(
             self, origin, run_configuration)
+        # §9.2.1 — a context-active production hydration request may never be
+        # ownerless, so the acquisition selection is installed HERE, at
+        # admission, rather than only appearing when a browse forces one.
+        staticWidget._install_acquisition_selection(
+            self, context, origin="staticWidget._enter_run_state")
         # O-2.1: the browse chain qualifies its records against THIS run, so the
         # detached snapshot is refreshed as soon as the run owns a context.
         staticWidget._publish_diagnostic_run_identity(self)
@@ -14578,6 +14625,13 @@ class staticWidget(QWidget):
         # stamped sub-scan key and the scan's own name never diverge.
         if context is not None:
             context.rescope_to(name)
+            # §9.2.2 — and the SELECTION is restamped with it.  Moving
+            # `current_scan_key` while the selection kept naming the previous
+            # sub-scan left every later request qualified against a key the
+            # display had already left; the context's commit epoch moves too,
+            # so requests minted before the boundary can no longer insert.
+            staticWidget._install_acquisition_selection(
+                self, context, origin="staticWidget._rescope_frame_panel_to")
         # Wire the viewer to THIS scan's output HERE (driven by the frame stream),
         # NOT from the new_scan signal — set_file queues an async set_datafile that
         # RENAMES scan.name (scan.py:set_datafile), so calling it from an out-of-sync

@@ -49,6 +49,18 @@ class _HydrationRequest:
     #: owner it no longer belongs to.  Values only: two strings.
     context_token: str = ""
     context_scan_key: str = ""
+    #: c3R-b (§9.2.3): the EXACT stores this request lands in, resolved when it
+    #: was made.  The worker must never ask a live provider where a request
+    #: belongs — that is how a read made under a browse landed in the resumed
+    #: run's store.
+    stores: tuple = ()
+    #: The context's commit authority and the epoch this request was minted
+    #: under (§9.2.4).  Read is unlocked; the INSERT goes through the gate.
+    commit_gate: object = None
+    epoch: int = 0
+    #: The file identity the request was made against, so a completion can be
+    #: refused on source as well as on scan key.
+    context_source: str = ""
 
 
 class FrameHydrationWorker(Qt.QtCore.QThread):
@@ -114,14 +126,22 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
             return SupersedeReason.GENERATION
 
     @staticmethod
-    def _token(label, generation, purpose, consumer):
-        return (label, int(generation), str(purpose or "full"), consumer)
+    def _token(label, generation, purpose, consumer,
+               context_token="", context_scan_key="", epoch=0):
+        # c3R-b (§9.2.6): the CONTEXT is part of the identity.  Without it the
+        # same label at the same generation in two sub-scans collapsed to one
+        # request, so the second sub-scan never got its frame.
+        return (label, int(generation), str(purpose or "full"), consumer,
+                str(context_token or ""), str(context_scan_key or ""),
+                int(epoch or 0))
 
     def _discard_locked(self, request: _HydrationRequest) -> None:
         for label in request.labels:
             self._queued.discard(
                 self._token(label, request.generation,
-                            request.purpose, request.consumer))
+                            request.purpose, request.consumer,
+                            request.context_token, request.context_scan_key,
+                            request.epoch))
 
     def _drain_stale_locked(self, reason=SupersedeReason.GENERATION) -> None:
         if not self._queue:
@@ -158,7 +178,9 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
             self, label, generation: int, *, purpose: str = "full",
             consumer=ConsumerKind.PLOT_1D,
             supersede_reason=SupersedeReason.SELECTION,
-            context_token: str = "", context_scan_key: str = "") -> None:
+            context_token: str = "", context_scan_key: str = "",
+            stores=None, commit_gate=None, epoch: int = 0,
+            context_source: str = "") -> None:
         """Enqueue a hydration request (non-blocking; returns immediately).
 
         ``context_token``/``context_scan_key`` name the display context at
@@ -168,6 +190,12 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
         generation = int(generation)
         context_token = str(context_token or "")
         context_scan_key = str(context_scan_key or "")
+        context_source = str(context_source or "")
+        # §9.2.3: resolve the target NOW.  Doing it in `run()` meant the store
+        # was chosen after the display may already have moved on.
+        if stores is None:
+            stores = self._stores()
+        stores = tuple(stores or ())
         purpose = str(purpose or "full")
         consumer = self._consumer(consumer)
         supersede_reason = self._reason(supersede_reason)
@@ -177,7 +205,8 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
             if generation > self._newest_gen:
                 self._newest_gen = generation
                 self._drain_stale_locked(supersede_reason)
-            token = self._token(label, generation, purpose, consumer)
+            token = self._token(label, generation, purpose, consumer,
+                                context_token, context_scan_key, epoch)
             if token in self._queued:
                 browse_debug_log(
                     logger,
@@ -198,12 +227,18 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
                 and self._queue[-1].generation == generation
                 and self._queue[-1].purpose == purpose
                 and self._queue[-1].consumer is consumer
+                # §9.2.6: never coalesce across contexts or epochs.
+                and self._queue[-1].context_token == context_token
+                and self._queue[-1].context_scan_key == context_scan_key
+                and self._queue[-1].epoch == epoch
             ):
                 self._queue[-1].labels = (*self._queue[-1].labels, label)
             else:
                 self._queue.append(
                     _HydrationRequest((label,), generation, purpose, consumer,
-                                      context_token, context_scan_key))
+                                      context_token, context_scan_key,
+                                      stores, commit_gate, epoch,
+                                      context_source))
             browse_debug_log(
                 logger,
                 "hydration_worker_enqueue",
@@ -220,38 +255,46 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
     def _pop_batch_locked(self):
         request = self._queue.popleft()
         self._discard_locked(request)
-        return (list(request.labels), request.generation, request.purpose,
-                request.consumer,
-                (request.context_token, request.context_scan_key))
+        return request
 
     @staticmethod
     def _store_supports_purpose(store, purpose: str) -> bool:
         purposes = getattr(store, "hydration_purposes", None)
         return purposes is None or purpose in purposes
 
-    def _hydrate_full(self, label, purpose: str) -> bool:
+    @staticmethod
+    def _commit_kwargs(request):
+        """The commit-gate arguments a store insertion must be qualified by."""
+        if getattr(request, "commit_gate", None) is None:
+            return {}
+        return {"commit_gate": request.commit_gate,
+                "commit_epoch": request.epoch}
+
+    def _hydrate_full(self, request, label, purpose: str) -> bool:
         hydrated = False
-        for store in self._stores():
+        commit = self._commit_kwargs(request)
+        for store in (request.stores or ()):
             if not self._store_supports_purpose(store, purpose):
                 continue
             getter = getattr(store, "get_or_hydrate", None)
             if getter is None:
                 continue
             try:
-                hydrated = getter(label) is not None or hydrated
+                hydrated = getter(label, **commit) is not None or hydrated
             except Exception:
                 logger.debug("background hydration failed for %s", label,
                              exc_info=True)
         return hydrated
 
-    def _hydrate_1d_many(self, labels) -> bool:
+    def _hydrate_1d_many(self, request, labels) -> bool:
         hydrated = False
-        for store in self._stores():
+        commit = self._commit_kwargs(request)
+        for store in (request.stores or ()):
             getter = getattr(store, "get_1d_many_or_hydrate", None)
             if getter is None:
                 continue
             try:
-                hydrated = bool(getter(labels)) or hydrated
+                hydrated = bool(getter(labels, **commit)) or hydrated
             except Exception:
                 logger.debug("background 1D hydration failed for %s", labels,
                              exc_info=True)
@@ -264,8 +307,12 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
                     self._cond.wait()
                 if self._stop:
                     return
-                (labels, generation, purpose, consumer,
-                 owner) = self._pop_batch_locked()
+                request = self._pop_batch_locked()
+                labels = list(request.labels)
+                generation = request.generation
+                purpose = request.purpose
+                consumer = request.consumer
+                owner = (request.context_token, request.context_scan_key)
                 newest = self._newest_gen
             if (
                 generation < newest
@@ -290,11 +337,12 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
                 )
                 continue
             if purpose == "1d":
-                success = self._hydrate_1d_many(tuple(labels))
+                success = self._hydrate_1d_many(request, tuple(labels))
             else:
                 success = False
                 for label in labels:
-                    success = self._hydrate_full(label, purpose) or success
+                    success = (
+                        self._hydrate_full(request, label, purpose) or success)
             # The GUI handler still re-checks generation == the live
             # display_generation (a change that landed during the read). Emit
             # even when hydration failed so GUI-side pending dedupe can clear the

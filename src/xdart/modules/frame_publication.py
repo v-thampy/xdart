@@ -766,10 +766,18 @@ class PublicationStore:
         with self._lock:
             self._hydrator_1d_many = hydrator
 
-    def get_or_hydrate(self, label: int | str) -> FramePublication | None:
+    def get_or_hydrate(self, label: int | str, *, commit_gate=None,
+                       commit_epoch=None) -> FramePublication | None:
         """Return the publication, rehydrating an evicted payload via the
         registered hydrator (synchronous — call from a background worker
-        for disk-backed hydrators)."""
+        for disk-backed hydrators).
+
+        X1 O-3 (c3R-b §9.2.4): ``commit_gate`` is the REQUESTING context's
+        commit authority.  The hydrator's disk read runs unlocked and off the
+        GUI thread as before; only the final insertion is taken through the
+        gate, so an invalidation, a rescope or a release that lands mid-read
+        linearizes cleanly and the payload is inserted NOWHERE.  Without a gate
+        the behaviour is unchanged — that is the idle/legacy path."""
         with self._lock:
             publication = self._items.get(label)
             hydrator = self._hydrator
@@ -799,10 +807,20 @@ class PublicationStore:
             return publication
         if fresh is None:
             return publication
-        return self.upsert(fresh)
+        if commit_gate is None:
+            return self.upsert(fresh)
+        if not commit_gate.enter(commit_epoch):
+            # The requesting context lost its commit authority while the read
+            # was in flight.  The read is simply discarded; nothing is stored.
+            return None
+        try:
+            return self.upsert(fresh)
+        finally:
+            commit_gate.leave()
 
     def get_1d_many_or_hydrate(
-        self, labels: Iterable[int | str]
+        self, labels: Iterable[int | str], *, commit_gate=None,
+        commit_epoch=None
     ) -> dict[int | str, FramePublication]:
         """Return publications with 1D payloads, batch hydrating misses.
 
@@ -822,9 +840,22 @@ class PublicationStore:
             hydrator = self._hydrator_1d_many
         if missing and hydrator is not None:
             try:
-                for publication in hydrator(tuple(missing)) or ():
-                    if publication is not None:
-                        self.upsert(publication)
+                # The batch read runs UNLOCKED, exactly like the full hydrator;
+                # only the insertions go through the requesting context's
+                # commit gate (§9.2.4), so an invalidation mid-read inserts
+                # nothing rather than half a batch.
+                fresh = tuple(hydrator(tuple(missing)) or ())
+                if commit_gate is None:
+                    for publication in fresh:
+                        if publication is not None:
+                            self.upsert(publication)
+                elif commit_gate.enter(commit_epoch):
+                    try:
+                        for publication in fresh:
+                            if publication is not None:
+                                self.upsert(publication)
+                    finally:
+                        commit_gate.leave()
             except Exception:
                 logger.debug("batch 1D publication hydration failed", exc_info=True)
         return self.get_many(requested)
