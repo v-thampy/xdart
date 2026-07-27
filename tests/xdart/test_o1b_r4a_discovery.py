@@ -266,13 +266,26 @@ def _batch_dir_thread(watch_dir, out_dir):
         source_spec=directory_source(watch_dir, ext="nxs"))
 
 
-def test_batch_defers_an_in_progress_container_and_consumes_it_on_finalize(
+def test_batch_prefetch_generation_consumes_a_container_finalizing_midrun(
         tmp_path):
-    """R4A-5.  Batch retired a provisional container at first sight, so a
-    container that finalized while the batch was still running was never read.
+    """R4A-5, production-shaped (review §49.6 correction A).
 
-    Deferring must leave it UN-retired and re-check it before end-of-run.
+    The parent row called ``_get_next_eiger_frame_sync()`` a second time after
+    an end-of-stream tuple.  Production never does that: ``_prefetch_worker``
+    queues the terminal tuple and EXITS, so that row could pass while a real
+    batch still dropped a container that changed from ``IN_PROGRESS`` to
+    complete.
+
+    This drives ONE real prefetch generation through the production entry.  A
+    deterministic latch pauses the worker inside the provisional classification
+    (no sleep, no spin loop), the fixture finalizes while that generation is
+    still live, and the whole label range must then arrive exactly once from
+    that same generation -- no second Run, no restarted reader, no post-EOS
+    manual call.
     """
+    import queue as queue_mod
+    import threading
+
     import h5py
 
     from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter
@@ -287,24 +300,57 @@ def test_batch_defers_an_in_progress_container_and_consumes_it_on_finalize(
         del handle["entry/end_time"]
 
     worker = _batch_dir_thread(watch, out)
+    frozen = worker.run_configuration
 
-    first = worker._get_next_eiger_frame_sync(worker.run_configuration)
-    assert first[3] is None, "a provisional container was consumed in batch"
-    assert str(growing) not in worker._eiger_done_masters, (
-        "batch RETIRED a provisional container at first sight, so the frames it "
-        "flushes later in the same run can never be read")
+    observed = threading.Event()
+    resume = threading.Event()
+    real_open = worker._eiger_open_master
 
-    # the writer finalizes the SAME path while the batch is still running
-    _write_bluesky_nxwriter(growing, n=5)
+    def latching_open(*args, **kwargs):
+        result = real_open(*args, **kwargs)
+        if getattr(worker, "_eiger_open_state", None) == "not ready":
+            # Pause the LIVE generation here so the finalize below lands after
+            # the IN_PROGRESS observation and before terminal retirement.
+            observed.set()
+            resume.wait(10.0)
+        return result
 
-    frames = []
-    for _ in range(10):
-        item = worker._get_next_eiger_frame_sync(worker.run_configuration)
-        if item[3] is None:
+    worker._eiger_open_master = latching_open
+
+    prefetch_queue = queue_mod.Queue(maxsize=64)
+    stop_evt = threading.Event()
+    worker._prefetch_queue = prefetch_queue
+    worker._prefetch_stop_evt = stop_evt
+    producer = threading.Thread(
+        target=worker._prefetch_worker,
+        args=(frozen, prefetch_queue, stop_evt),
+        name="o1b-r4a5-prefetch", daemon=True)
+    producer.start()
+    try:
+        assert observed.wait(10.0), (
+            "the provisional container was never classified IN_PROGRESS, so "
+            "this case cannot speak to the deferral at all")
+        assert str(growing) not in worker._eiger_done_masters, (
+            "batch RETIRED a provisional container at first sight, so the "
+            "frames it flushes later in the SAME run can never be read")
+        _write_bluesky_nxwriter(growing, n=5)
+    finally:
+        resume.set()
+    producer.join(timeout=30.0)
+    assert not producer.is_alive(), "the prefetch generation never terminated"
+    stop_evt.set()
+
+    labels = []
+    while True:
+        try:
+            item = prefetch_queue.get_nowait()
+        except queue_mod.Empty:
             break
-        frames.append(item)
+        if item[3] is not None:
+            labels.append(item[2])
 
-    assert [item[2] for item in frames] == [1, 2, 3, 4, 5], (
-        f"batch lost frames from a mid-run finalization; got {frames!r}")
+    assert labels == [1, 2, 3, 4, 5], (
+        "one batch prefetch generation must emit every label exactly once "
+        f"after a mid-run finalization; got {labels}")
     assert str(growing) in worker._eiger_done_masters, (
         "retired only after a finalized drain")

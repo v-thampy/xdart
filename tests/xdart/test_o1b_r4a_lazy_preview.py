@@ -193,6 +193,52 @@ def test_nested_descent_is_bounded_in_opens_and_wall_time(tmp_path):
     assert _motor_choices(root) == ["Manual"], _motor_choices(root)
 
 
+def test_nested_descent_stops_on_the_deadline_not_the_open_cap(
+        tmp_path, monkeypatch):
+    """R4A-1's TIME bound, independently load-bearing (review §49.6 B).
+
+    The open-count row above uses fast local opens, so an implementation that
+    enforced eight opens and had no deadline at all would pass it.  Here an
+    injected monotonic clock advances 0.3 s per container open while 40
+    candidates wait: exhaustion would need 40 opens and the count cap would stop
+    at 8, so stopping earlier can only be the 0.75 s deadline.  No real sleep and
+    no machine-speed assumption.
+    """
+    from xdart.gui.tabs.static_scan.wranglers import image_wrangler as iw
+
+    for index in range(40):
+        sub_dir = tmp_path / f"dir_{index:03d}"
+        sub_dir.mkdir()
+        (sub_dir / f"torn_{index:03d}.nxs").write_bytes(b"")
+
+    host, root = _holder(tmp_path, recursive=True)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(iw.time, "monotonic", lambda: clock["now"])
+
+    opens = []
+    real_reader = host._read_bluesky_source_columns
+
+    def slow_reader(path):
+        opens.append(str(path))
+        clock["now"] += 0.3          # deterministic: 3 opens exceed 0.75 s
+        return real_reader(path)
+
+    host._read_bluesky_source_columns = slow_reader
+
+    host.get_img_fname()
+
+    assert opens, (
+        "no nested container was opened, so no deadline can have been observed")
+    assert len(opens) < 8, (
+        f"traversal ran to the OPEN CAP ({len(opens)} opens) with the clock "
+        f"already at {clock['now'] - 1000.0:.2f} s; the 0.75 s deadline is not "
+        "load-bearing on its own")
+    assert clock["now"] - 1000.0 > 0.75, (
+        "the injected clock never passed the deadline, so this case proves "
+        "nothing about it")
+    assert _motor_choices(root) == ["Manual"], _motor_choices(root)
+
+
 def test_non_recursive_root_does_not_descend(tmp_path):
     """The lazy contract: Subdirs OFF must not walk subfolders at all."""
     child = tmp_path / "nested"
@@ -292,16 +338,49 @@ def test_first_jit_container_hydrates_display_without_changing_frozen_motor(
         emitted = []
         wrapper.sigGIMotorOptions.connect(emitted.append)
 
-        worker._eiger_master_path = str(container)
-        worker._eiger_open_master(frozen, str(container))
-        worker._frame_scan_info(frozen, str(container), 0)
-        assert worker._eiger_provider is not None
-        assert "hy" in worker._eiger_provider.motors()
+        # Review §49.6 C: drive the real Directory reader route over MULTIPLE
+        # frames instead of poking `_eiger_open_master`/`_frame_scan_info`, so
+        # the hydration is proved where the run actually produces it.
+        frames = []
+        for _ in range(8):
+            item = worker.get_next_image(frozen)
+            if item[3] is None:
+                break
+            frames.append(item)
+        assert len(frames) >= 2, (
+            f"the run route produced too few frames to test republication: "
+            f"{[item[2] for item in frames]}")
+
+        # Discrimination without depending on which reader backend ran: the
+        # motor must be present in the metadata the RUN ROUTE itself produced,
+        # so a missing dropdown is undelivered hydration rather than an
+        # unreadable fixture or a backend that never materializes a provider.
+        discovered = [name for item in frames for name in (item[4] or {})]
+        assert "hy" in discovered, (
+            "the run route never surfaced the motor, so this case cannot speak "
+            f"to hydration delivery; metadata keys={sorted(set(discovered))}")
         app.processEvents()
 
-        assert emitted
-        assert "hy" in tuple(emitted[-1].motors)
+        assert len(emitted) == 1, (
+            "exactly ONE immutable hydration value is published per run; "
+            f"{len(emitted)} were emitted across {len(frames)} frames")
+        published = emitted[0]
+        assert "hy" in tuple(published.motors)
         assert "hy" in _motor_choices(wrapper.parameters)
+
+        # duplicate frames must not republish
+        worker.get_next_image(frozen)
+        app.processEvents()
+        assert len(emitted) == 1, "a duplicate frame republished the hydration"
+
+        # a stale/foreign completion is inert
+        foreign = published._replace(source_fingerprint="foreign-source")
+        assert wrapper.gi_hydration_is_current(foreign) is False
+        assert "hy" in _motor_choices(wrapper.parameters)
+
+        # the admitted configuration and its effective motor are unchanged
+        assert wrapper.run_configuration is frozen
+        assert worker.run_configuration is frozen
         assert frozen.gi.effective_motor == effective_before == "halpha"
     finally:
         worker._eiger_close_master()
