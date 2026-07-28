@@ -404,18 +404,20 @@ class _ControlsCommitAbort(Exception):
 class _ControlsStrictWriteError(Exception):
     """A STRICT bound-carrier write failure (§24.4).
 
-    Carries the failure the transaction must report plus any signal owner whose
-    block state could not be restored, so the caller can name it for recovery:
+    Carries the ONE thing the transaction reports: ``reason``, the forward
+    diagnostic.  When the setter failed, the setter stays the PRIMARY reason
+    even if cleanup also failed (§24.4 req 5).
 
-    * ``reason``     — the forward diagnostic.  When the setter failed, the setter
-      stays the PRIMARY reason even if cleanup also failed (§24.4 req 5);
-    * ``unrestored`` — ``((stable_path, owner, prior_state), …)`` for each signal
-      owner still not back at its captured state (§24.4 req 7)."""
+    R4-G: this type used to carry two further slots — a tuple of signal owners
+    left unrestored, and the originating setter exception.  Since §25.4 the
+    STRICT writer REGISTERS every owner it touches in the transaction's one
+    signal registry, so final recovery observes owners stranded by the rollback
+    too, not only by the forward writer.  Both slots therefore had no shipped
+    reader; the single catch site consumes ``reason`` alone.
+    """
 
-    def __init__(self, reason, unrestored=(), cause=None):
+    def __init__(self, reason):
         self.reason = str(reason)
-        self.unrestored = tuple(unrestored)
-        self.cause = cause
         super().__init__(self.reason)
 
 
@@ -5448,9 +5450,10 @@ class staticWidget(QWidget):
         restore is caught too, not merely a raising one); an otherwise-successful
         setter plus an unrestored owner is a typed forward failure; and when both
         the setter and cleanup fail the SETTER stays the primary reason.  Every
-        still-unrestored owner rides out on
-        :class:`_ControlsStrictWriteError.unrestored` so the caller can record it
-        for recovery reattempt + naming (req 6-7).
+        owner this writer touches is REGISTERED in the transaction's one signal
+        registry (§25.4), which is where final recovery finds it — including
+        owners stranded by the rollback rather than by this forward write
+        (req 6-7).
 
         The ``(params, carrier, value)`` signature is deliberately UNCHANGED — the
         independent depth oracles inject at this seam.
@@ -5510,7 +5513,7 @@ class staticWidget(QWidget):
             named = list(dict.fromkeys(cleanup + mismatched))
             reason = ("legacy carrier signal state not restored after write: "
                       + ", ".join("/".join(p) for p in named))
-        raise _ControlsStrictWriteError(reason, mismatched, setter_exc)
+        raise _ControlsStrictWriteError(reason)
 
     def _controls_v2_carrier_readback_ok(self, carrier, expected) -> bool:
         """Whether the BOUND ORIGINAL handle reads back as *expected* (§18.4).

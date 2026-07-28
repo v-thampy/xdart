@@ -27,8 +27,6 @@ Production-wired: real `staticWidget`, real pyqtgraph `Parameter` handles, real 
 
 from __future__ import annotations
 
-from types import MappingProxyType
-
 import pytest
 from pyqtgraph.Qt import QtWidgets
 
@@ -75,43 +73,6 @@ def events(monkeypatch):
 
     monkeypatch.setattr(module, "run_config_debug_log", capture)
     return captured
-
-
-def _find_live_registry(record, owner):
-    """The FIRST attribute of *record* yielding a dict that holds a LIVE entry.
-
-    §27.3 req 6 / §27.5: the invariant is REACHABILITY, not attribute naming — "a
-    leading underscore is not a capability boundary".  This walks every attribute
-    (the independent verifier's SHA-agnostic pattern), so it finds `signals` at
-    `1266ef57` and `_signals` at `e1ab5794` without naming either.  A live entry is
-    identified by its `owner` member, which the detached projection omits."""
-    for name in dir(record):
-        if name.startswith("__"):
-            continue
-        try:
-            value = getattr(record, name)
-        except Exception:
-            continue
-        if not isinstance(value, dict) or id(owner) not in value:
-            continue
-        entry = value[id(owner)]
-        if isinstance(entry, dict) and entry.get("owner") is owner:
-            return name, value
-    return None, None
-
-
-def _one_shot_unblock(owner, message):
-    """A real `blockSignals` whose FIRST restore attempt raises, leaving it blocked."""
-    real = type(owner).blockSignals
-    state = {"failed": False}
-
-    def block(wanted):
-        if not wanted and not state["failed"]:
-            state["failed"] = True
-            raise RuntimeError(message)
-        return real(owner, wanted)
-
-    return block, real
 
 
 def _registered_entry(widget, owner, path, *, blocked=True):
