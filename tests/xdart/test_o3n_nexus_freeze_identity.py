@@ -322,23 +322,46 @@ def test_the_nexus_wrangler_declares_both_required_frozen_values(widget):
 
 def test_setup_initializes_the_replacement_worker_from_the_frozen_values(
         widget, tmp_path, monkeypatch):
-    """Section 14.2 item 4.  ``setup()`` REPLACES the thread; the new worker's
-    input and output must come from the admitted object."""
+    """Section 14.2 item 4.  ``setup()`` REPLACES the thread, and it runs AFTER
+    admission -- so a panel edit landing in that window must not reach the new
+    worker.  The edit is injected at the real ordering point: the host's
+    ``_apply_controls_v2_run_state`` runs after admission and before
+    ``wrangler.setup()`` inside one synchronous Start.
+    """
     wrangler = _select_nexus(widget)
     src, out = _arm_nexus(wrangler, tmp_path, entry="entry/data")
     _start_recorder(wrangler, monkeypatch)
+    poison_dir = tmp_path / "late"
+    poison_dir.mkdir()
+    poison_file = poison_dir / "late.nxs"
+    poison_file.write_bytes(b"late")
+    original = type(widget)._apply_controls_v2_run_state
+
+    def _poison_between_admission_and_setup(self, frozen):
+        result = original(self, frozen)
+        wrangler.parameters.child("NeXus File", "nexus_file").setValue(
+            str(poison_file))
+        wrangler.parameters.child("NeXus File", "entry").setValue("late/entry")
+        wrangler.parameters.child("Output", "h5_dir").setValue(str(poison_dir))
+        return result
+
+    monkeypatch.setattr(type(widget), "_apply_controls_v2_run_state",
+                        _poison_between_admission_and_setup)
 
     wrangler.start()
 
     frozen = wrangler.run_configuration
     thread = wrangler.thread
     assert frozen is not None and frozen.source is not None
-    assert thread.nexus_file == frozen.source.uri
-    assert thread.entry == frozen.source.entry
-    assert thread.fname == os.path.join(
-        frozen.save_path, f"{Path(frozen.source.uri).stem}.nxs")
-    assert str(out) == frozen.save_path
-    assert str(src) == frozen.source.uri
+    assert frozen.source.uri == str(src)
+    assert frozen.save_path == str(out)
+    assert thread.nexus_file == str(src), (
+        "the replacement worker took its input from the Qt tree, not the "
+        "accepted configuration")
+    assert thread.entry == "entry/data"
+    assert thread.fname == os.path.join(str(out), f"{src.stem}.nxs")
+    assert wrangler.fname == thread.fname
+    assert str(poison_dir) not in str(thread.fname)
 
 
 def test_poisoning_qt_and_mirrors_cannot_move_the_worker_input_or_output(
@@ -384,9 +407,13 @@ def test_poisoning_qt_and_mirrors_cannot_move_the_worker_input_or_output(
 
 def test_the_worker_run_entry_reinitializes_its_cursors_from_the_frozen_object(
         widget, tmp_path, monkeypatch):
-    """Runtime cursor state may stay mutable, but it is INITIALIZED FROM and
-    qualified by the accepted values -- a poisoned mirror is overwritten before
-    anything opens."""
+    """Runtime cursor state may stay mutable, but the REAL worker entry
+    (re)initializes it from the accepted values before anything opens, so a
+    mirror poisoned after admission is overwritten rather than obeyed.
+
+    The reduction body stands in for "anything opens": the row asserts what the
+    cursors held at the moment ``run()`` handed over to it.
+    """
     from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler_thread import (
         nexusThread,
     )
@@ -395,19 +422,28 @@ def test_the_worker_run_entry_reinitializes_its_cursors_from_the_frozen_object(
     src, out = _arm_nexus(wrangler, tmp_path, entry="entry/data")
     _start_recorder(wrangler, monkeypatch)
     wrangler.start()
-    frozen = wrangler.run_configuration
     thread = wrangler.thread
 
     thread.nexus_file = str(tmp_path / "poison.nxs")
     thread.entry = "poison/entry"
     thread.fname = str(tmp_path / "poison" / "poison.nxs")
+    thread.scan_name = "poison"
 
-    nexusThread._adopt_frozen_source_target(thread, frozen)
+    at_handover = {}
+    monkeypatch.setattr(
+        nexusThread, "_run_impl",
+        lambda self, frozen: at_handover.update(
+            uri=self.nexus_file, entry=self.entry, fname=self.fname,
+            scan_name=self.scan_name))
 
-    assert thread.nexus_file == str(src)
-    assert thread.entry == "entry/data"
-    assert thread.fname == os.path.join(str(out), f"{src.stem}.nxs")
-    assert thread.scan_name == src.stem
+    thread.run()
+
+    assert at_handover, "the real worker entry never reached the reduction body"
+    assert at_handover["uri"] == str(src), (
+        "the worker opened the poisoned legacy source mirror")
+    assert at_handover["entry"] == "entry/data"
+    assert at_handover["fname"] == os.path.join(str(out), f"{src.stem}.nxs")
+    assert at_handover["scan_name"] == src.stem
 
 
 # --------------------------------------------------------------------------- #
