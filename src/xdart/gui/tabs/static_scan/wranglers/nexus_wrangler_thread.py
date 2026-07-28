@@ -41,6 +41,7 @@ import logging
 import os
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 
@@ -72,6 +73,22 @@ from .wrangler_widget import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class FrozenSourceTarget(NamedTuple):
+    """What a NeXus run opens and where it writes, from the accepted object.
+
+    O-3N (§14.2 items 4-5).  These four values used to be re-read from the Qt
+    tree by ``nexusWrangler.setup()`` and then carried as mutable worker
+    mirrors, so poisoning a field after admission changed what the run opened
+    and where its output landed.  They are now one derivation from one accepted
+    ``FrozenRunConfiguration``.
+    """
+
+    uri: str
+    entry: str
+    scan_name: str
+    output_path: str
 
 
 # How many frames to bulk-read from the source HDF5 per iteration.
@@ -193,6 +210,51 @@ class nexusThread(wranglerThread):
         )
         return frozen
 
+    @staticmethod
+    def _frozen_source_target(frozen):
+        """The accepted source URI, entry, scan name and output path.
+
+        The ONE place a NeXus run answers "what do I open?" and "where does the
+        output go?".  Both come from the accepted ``FrozenRunConfiguration``, so
+        a poisoned Qt field, wrapper mirror or worker cursor cannot move either
+        (§14.2 items 4-5).  Admission already refuses a configuration missing
+        ``source`` or ``save_path``; this raises the same typed refusal rather
+        than inventing a fallback, because there is no safe value to guess.
+        """
+        source = getattr(frozen, "source", None)
+        uri = str(getattr(source, "uri", "") or "").strip()
+        save_path = str(getattr(frozen, "save_path", "") or "").strip()
+        for name, value in (("source", uri), ("save_path", save_path)):
+            if not value:
+                raise RunConfigurationRefused(
+                    "absent",
+                    stage="nexus-source-target",
+                    detail=(
+                        f"the accepted run configuration carries no {name}; "
+                        "the NeXus run would have to infer it"),
+                    generation=int(getattr(frozen, "generation", 0) or 0),
+                )
+        entry = str(getattr(source, "entry", "") or "").strip() or "entry"
+        scan_name = Path(uri).stem or "nexus_scan"
+        return FrozenSourceTarget(
+            uri, entry, scan_name,
+            os.path.join(save_path, f"{scan_name}.nxs"))
+
+    def _adopt_frozen_source_target(self, frozen):
+        """Initialize this worker's runtime cursors FROM the accepted values.
+
+        Cursor/handle state stays mutable — the reader needs it — but it is
+        (re)initialized here from the accepted object before anything opens, so
+        a mirror poisoned between admission and execution is overwritten rather
+        than obeyed (§14.2 item 4).
+        """
+        target = nexusThread._frozen_source_target(frozen)
+        self.nexus_file = target.uri
+        self.entry = target.entry
+        self.scan_name = target.scan_name
+        self.fname = target.output_path
+        return target
+
     def _project_gi_modes_onto_display_scan(self, frozen):
         """Backward GI-mode write onto the mutable DISPLAY scan (retained).
 
@@ -214,6 +276,10 @@ class nexusThread(wranglerThread):
         try:
             frozen = nexusThread._require_run_configuration(
                 self, "nexus-worker-run")
+            # O-3N (§14.2 item 4): re-derive what this run opens and where it
+            # writes from the accepted object BEFORE any source read or output
+            # open, so the panel/wrapper/worker mirrors cannot decide either.
+            nexusThread._adopt_frozen_source_target(self, frozen)
         except RunConfigurationRefused as exc:
             logger.error("run refused: %s", exc)
             self.command = 'stop'
@@ -265,7 +331,9 @@ class nexusThread(wranglerThread):
             scan_meta = None
             base_meta = {}
 
-        scan_name = Path(self.nexus_file).stem
+        # O-3N: one derivation — the name adopted from the accepted source at
+        # worker entry, never a second stem computed off a mutable mirror.
+        scan_name = self.scan_name
         scan = self._initialize_scan(scan_name)
         scan._cached_integrator = poni_to_integrator(self.poni)
         scan._cached_poni = self.poni
@@ -332,7 +400,11 @@ class nexusThread(wranglerThread):
                 # decision used to read ``skip_2d`` off the locally
                 # aliased DISPLAY scan, which the committed AST census
                 # could not see.  It now comes from frozen policy.
-                scan, integrate_2d=not _frozen.skip_2d,
+                # O-3N: the name is ``frozen`` in this scope -- ``_frozen`` was
+                # a NameError that no NeXus run could reach while the O-3 source
+                # guard refused them all.  Making NeXus runs executable again
+                # makes this line reachable, so it is corrected here.
+                scan, integrate_2d=not frozen.skip_2d,
             )
             frames_since_save = 0
             for chunk_start in range(0, nframes, _READ_CHUNK):

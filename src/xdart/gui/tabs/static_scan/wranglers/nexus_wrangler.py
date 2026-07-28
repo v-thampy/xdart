@@ -120,6 +120,15 @@ class nexusWrangler(wranglerWidget):
         self.poni = None
         self.command = None
         self.scan = scan
+        # O-3N (§14.2 item 3): frozen values this wrangler's worker must never
+        # take from a mutable mirror -- the same declaration ``imageWrangler``
+        # makes.  Without it admission published a configuration that could
+        # identify neither the NeXus container being reduced nor where its
+        # output goes, and every downstream owner re-read the Qt tree instead.
+        self._admission_required_frozen_values = ("save_path", "source")
+        # O-3N: armed by ``start()`` once admission succeeds, consumed by the
+        # very next ``setup()``.  See :meth:`_consume_frozen_setup_target`.
+        self._frozen_setup_pending = False
 
         # Attributes
         self.nexus_file = ''
@@ -535,10 +544,41 @@ class nexusWrangler(wranglerWidget):
 
     # ── Thread control ───────────────────────────────────────────────
 
+    def _consume_frozen_setup_target(self):
+        """The accepted (uri, entry, scan_name, output) for a STARTING run.
+
+        O-3N (§14.2 item 4).  ``setup()`` has two callers: the run path, which
+        reaches it only through an accepted admission, and the wrangler-switch
+        wiring path, which has no run at all.  Only the first is "after
+        admission", so only the first reads the frozen values; the second keeps
+        deriving from the panel, which is also what the NEXT admission will
+        freeze.  The one-shot flag is armed by ``start()`` after admission
+        succeeds and is consumed here whether or not it was set, so a later
+        refusal in the Start chain cannot leave it armed.
+        """
+        armed = bool(getattr(self, '_frozen_setup_pending', False))
+        self._frozen_setup_pending = False
+        if not armed:
+            return None
+        frozen = getattr(self, 'run_configuration', None)
+        if frozen is None or frozen is not getattr(
+                self, '_admitted_run_configuration', None):
+            return None
+        return nexusThread._frozen_source_target(frozen)
+
     def setup(self):
         """Sync parameters to thread before starting."""
-        self.nexus_file = self.parameters.child('NeXus File').child('nexus_file').value()
-        self.entry = self.parameters.child('NeXus File').child('entry').value()
+        # O-3N (§14.2 item 4): after admission, the source, entry and output are
+        # the ACCEPTED ones.  Re-reading them from the Qt tree here is what let
+        # a post-admission edit change what the replacement worker opened and
+        # where it wrote, while the frozen provenance claimed something else.
+        _target = self._consume_frozen_setup_target()
+        if _target is None:
+            self.nexus_file = self.parameters.child('NeXus File').child('nexus_file').value()
+            self.entry = self.parameters.child('NeXus File').child('entry').value()
+        else:
+            self.nexus_file = _target.uri
+            self.entry = _target.entry
         self._emit_gi_motor_options()
         self.poni_file = self.parameters.child('Calibration').child('poni_file').value()
         self.mask_file = self.parameters.child('Signal').child('mask_file').value()
@@ -552,15 +592,21 @@ class nexusWrangler(wranglerWidget):
         if self.poni_file and os.path.exists(self.poni_file):
             self.poni = PONI.from_poni_file(self.poni_file)
 
-        # Output directory
-        h5_dir = self.parameters.child('Output').child('h5_dir').value()
-        if h5_dir:
-            self.h5_dir = h5_dir
-
-        # HDF5 output file
-        scan_name = Path(self.nexus_file).stem if self.nexus_file else 'nexus_scan'
-        self.fname = os.path.join(self.h5_dir, f'{scan_name}.nxs')
-        self.scan_name = scan_name
+        # Output directory + HDF5 output file.  After admission both come from
+        # the accepted configuration (§14.2 items 2 and 4); off the run path the
+        # panel still answers, because the panel is what the next Start freezes.
+        if _target is None:
+            h5_dir = self.parameters.child('Output').child('h5_dir').value()
+            if h5_dir:
+                self.h5_dir = h5_dir
+            scan_name = (Path(self.nexus_file).stem if self.nexus_file
+                         else 'nexus_scan')
+            self.fname = os.path.join(self.h5_dir, f'{scan_name}.nxs')
+            self.scan_name = scan_name
+        else:
+            self.h5_dir = os.path.dirname(_target.output_path)
+            self.fname = _target.output_path
+            self.scan_name = _target.scan_name
 
         # GI parameters
         self.gi = self.parameters.child('GI').child('Grazing').value()
@@ -700,6 +746,10 @@ class nexusWrangler(wranglerWidget):
             wranglerWidget._safe_status_text(
                 self, f"Run configuration is invalid: {exc}")
             return
+        # O-3N: from here on this click is AFTER admission, so the ``setup()``
+        # the host is about to call takes its source, entry and output from the
+        # accepted object rather than re-reading the panel.
+        self._frozen_setup_pending = True
         self.command = 'start'
         self.thread.command = 'start'
         # Push the current Cores selection into the worker thread.

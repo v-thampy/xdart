@@ -3917,8 +3917,14 @@ class staticWidget(QWidget):
         intent.project_root = str(
             self._controls_v2_param_value(
                 ("Project", "project_folder")) or "")
+        # O-3N (§14.2 item 2): the output directory lives in the page's own
+        # namespace -- ``Project/h5_dir`` on the image page, ``Output/h5_dir``
+        # on the NeXus page.  Reading only the image name froze ``save_path=""``
+        # for every NeXus run, so the accepted configuration could name neither
+        # its input nor its output.
         intent.save_path = str(
-            self._controls_v2_param_value(("Project", "h5_dir")) or "")
+            self._controls_v2_param_value(self._controls_v2_output_dir_path())
+            or "")
         intent.gi.mode_1d = str(
             intent.bai_1d_args.get("gi_mode_1d", "q_total"))
         intent.gi.mode_2d = str(
@@ -4594,6 +4600,8 @@ class staticWidget(QWidget):
         :meth:`_controls_v2_freeze_source_spec` (Image Directory / Series /
         Single Image); other source types have no typed candidate spec."""
         cval = self._controls_v2_candidate_source_getter(cand)
+        if self._controls_v2_source_namespace() == "nexus":
+            return staticWidget._nexus_source_spec_from(cval)
         source_type = str(cval(("Signal", "inp_type")) or "")
         if source_type == "Image Directory":
             root_text = str(cval(("Signal", "img_dir")) or "").strip()
@@ -8677,8 +8685,50 @@ class staticWidget(QWidget):
         """Compatibility accessor for callers that need only the value plan."""
         return self._controls_v2_freeze_source_run_authority()[0]
 
+    def _controls_v2_source_namespace(self):
+        """Which parameter namespace the CURRENT page keeps source/output in.
+
+        O-3N (§14.1/§14.2): the freeze owner used to know only the image page's
+        ``Signal/inp_type`` + ``Signal/File`` + ``Project/h5_dir`` names, so
+        every NeXus freeze carried ``source=None`` and ``save_path=""`` and the
+        O-3 source guard refused every NeXus run.  The page a value lives on is
+        a property of the page, not of the value, so ask the page once and read
+        the right names -- rather than adding a second source authority, a
+        Source card to the NeXus panel, or a mutable source mirror.
+        """
+        return ("nexus"
+                if self._controls_v2_param(("NeXus File", "nexus_file"))
+                is not None else "image")
+
+    def _controls_v2_output_dir_path(self):
+        """The output-directory parameter path for the current page."""
+        return (("Output", "h5_dir")
+                if self._controls_v2_source_namespace() == "nexus"
+                else ("Project", "h5_dir"))
+
+    @staticmethod
+    def _nexus_source_spec_from(getter):
+        """The NeXus page's typed source, from ANY source-field getter.
+
+        ONE derivation for both callers -- the live freeze and the staged
+        candidate -- so a file or entry edit moves the same fingerprint and the
+        same provenance no matter which path observed it (§14.2 item 1).  The
+        entry is part of the source identity: two entries of one container are
+        two different acquisitions.
+        """
+        uri = str(getter(("NeXus File", "nexus_file")) or "").strip()
+        if not uri:
+            return None
+        from xrd_tools.core.scan import SourceKind, SourceSpec
+
+        entry = str(getter(("NeXus File", "entry")) or "").strip()
+        return SourceSpec(uri, SourceKind.NEXUS_STACK, entry=entry or None)
+
     def _controls_v2_freeze_source_spec(self):
         """Freeze typed mode-specific source membership for the next Run."""
+        if self._controls_v2_source_namespace() == "nexus":
+            return staticWidget._nexus_source_spec_from(
+                self._controls_v2_param_value)
         source_type = str(
             self._controls_v2_param_value(("Signal", "inp_type")) or "")
         if source_type == "Image Directory":
