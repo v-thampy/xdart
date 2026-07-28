@@ -650,7 +650,10 @@ class nexusWrangler(wranglerWidget):
             # earlier object.  ``_frozen_source_target`` already refused a
             # nonconstructible one, so ``None`` here means the accepted run
             # genuinely carries none and execution must not invent one.
-            self.poni = _target.poni
+            # O-3N.R.2 §17.7: the target carries VALUES; each caller
+            # constructs its own ``PONI`` rather than sharing one mutable
+            # object with the worker.
+            self.poni = _target.poni()
         elif self.poni_file and os.path.exists(self.poni_file):
             self.poni = PONI.from_poni_file(self.poni_file)
 

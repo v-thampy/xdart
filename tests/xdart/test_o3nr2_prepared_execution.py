@@ -558,16 +558,33 @@ def test_xye_tail_discovery_never_deletes_this_run_s_own_output(
 # --------------------------------------------------------------------------- #
 
 def test_the_superseded_parallel_latches_and_dead_helper_are_gone():
-    """A bounded fact about the actual production module (rule 9), not a taint
-    analyzer: the five parallel latches and the dead ``_execution_poni`` helper
-    are deleted once the envelope owns those phases."""
+    """A bounded fact about the actual production owner graph (rule 9), not a
+    taint analyzer: the five parallel latches and the dead ``_execution_poni``
+    helper are deleted once the envelope owns those phases.
+
+    Asserted over the AST's attribute/name/def references, NOT over raw module
+    text — the class docstring names the deleted latches deliberately, because
+    "what this object replaced, and why" is the durable record of the §17 root
+    cause.  A guard that cannot tell prose from a reference would force that
+    history out of the code.
+    """
+    import ast
     import inspect
 
-    source = inspect.getsource(nwt)
-    superseded = ("_prepared_for", "_prepared_stack", "_run_output_prepared",
+    tree = ast.parse(inspect.getsource(nwt))
+    referenced: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            referenced.add(node.attr)
+        elif isinstance(node, ast.Name):
+            referenced.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            referenced.add(node.name)
+
+    superseded = {"_prepared_for", "_prepared_stack", "_run_output_prepared",
                   "_run_target_replaced", "_xye_tail_cleared",
-                  "_execution_poni")
-    found = [name for name in superseded if name in source]
+                  "_execution_poni"}
+    found = sorted(superseded & referenced)
 
     assert found == [], f"superseded parallel state survived: {found}"
 

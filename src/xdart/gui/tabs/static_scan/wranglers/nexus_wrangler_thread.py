@@ -62,7 +62,7 @@ from xrd_tools.session.readiness import (
 )
 from xrd_tools.integrate.calibration import poni_to_integrator, get_detector
 from xrd_tools.reduction import GIFreezeError
-from xrd_tools.io.nexus import open_nexus_image_stack, read_nexus
+from xrd_tools.io.nexus import open_nexus_image_stack_exact, read_nexus
 from xrd_tools.io.image import read_image
 from xrd_tools.io.processed_scan_id import ProcessedXdartInputError
 from xrd_tools.io.export import write_xye
@@ -84,6 +84,15 @@ from .wrangler_widget import (
 
 logger = logging.getLogger(__name__)
 
+#: Sentinel: "judge the object on my carrier", as distinct from an explicitly
+#: supplied candidate that happens to be ``None`` (which must still refuse).
+_CARRIER = object()
+
+#: Suffix of the run-owned staging copy an Overwrite replacement renames the
+#: prior target to.  It lives beside the target so the rename is atomic, and it
+#: is dropped on commit / restored on rollback (§17.5).
+_REPLACING_SUFFIX = ".xdart-replacing"
+
 
 class FrozenSourceTarget(NamedTuple):
     """The whole NeXus execution target, from the accepted object.
@@ -94,6 +103,11 @@ class FrozenSourceTarget(NamedTuple):
     mutable state, so one run could execute with panel science while its
     provenance claimed the accepted identity.  Everything an executing NeXus run
     decides is derived HERE, once, from one ``FrozenRunConfiguration``.
+
+    O-3N.R.2 §17.7: the target holds calibration VALUES.  It used to embed a
+    constructed ``PONI`` -- a ``@dataclass(slots=True)``, so mutable -- while
+    calling itself immutable, which meant every consumer shared one object that
+    any of them could edit.  :meth:`poni` hands each caller its own.
     """
 
     uri: str
@@ -103,12 +117,88 @@ class FrozenSourceTarget(NamedTuple):
     output_dir: str = ""
     source_base: str = ""
     output_mode: str = "Append"
-    #: O-3N.R.1 §16.6: the calibration travels as the constructed immutable
-    #: ``PONI``, not as a mutable dict inside an object that calls itself
-    #: immutable.
-    poni: object | None = None
+    #: The accepted calibration as an immutable ``(key, value)`` tuple.  Empty
+    #: means the accepted run genuinely carries no calibration; execution then
+    #: refuses rather than reusing whatever object the worker happened to hold.
+    poni_values: tuple[tuple[str, object], ...] = ()
     generation: int = 0
     fingerprint: str = ""
+
+    def poni(self):
+        """A FRESH :class:`PONI` for this caller, or ``None``.
+
+        Constructibility was already proved in
+        :meth:`nexusThread._frozen_source_target`, so this cannot raise for a
+        target that exists.
+        """
+        if not self.poni_values:
+            return None
+        return PONI.from_dict(dict(self.poni_values))
+
+
+class PreparedNexusExecution:
+    """The ONE prepared execution envelope for a NeXus run (§17.8 item 1).
+
+    O-3N.R.2's design checkpoint.  The parent kept five parallel latches --
+    ``_prepared_for``, ``_prepared_stack``, ``_run_output_prepared``,
+    ``_run_target_replaced`` and ``_xye_tail_cleared`` -- and each of them
+    recorded "prepared / replaced / cleared" *before* the resource or
+    transaction it named had reached a successful terminal state.  That is one
+    root cause with six symptoms (§17.1-§17.6): a foreign object could be
+    prepared, a proved stack could leak, a refused Append could be retried into
+    silence, a failed replacement could burn its retry identity, and a swallowed
+    delete could strand a stale XYE tail forever.
+
+    So this object owns all of it, for exactly one run:
+
+    * ``frozen`` -- the EXACT admitted ``FrozenRunConfiguration``, held by
+      reference.  Every later decision compares against it by ``is``;
+    * ``target`` -- the one derived :class:`FrozenSourceTarget`;
+    * ``stack`` -- the strict exact-entry raw stack, closed exactly once;
+    * ``scan`` -- this run's own ``LiveScan``;
+    * the output-transaction state, each flag consumed only AFTER the operation
+      it describes has succeeded.
+    """
+
+    __slots__ = ("frozen", "target", "stack", "scan", "poni",
+                 "output_committed", "target_replaced", "xye_tail_pending",
+                 "_closed")
+
+    def __init__(self, frozen, target, stack=None):
+        self.frozen = frozen
+        self.target = target
+        self.stack = stack
+        self.scan = None
+        self.poni = target.poni() if target is not None else None
+        #: Append qualification finished successfully (never set on refusal).
+        self.output_committed = False
+        #: An Overwrite replacement has been COMMITTED by a successful writer.
+        self.target_replaced = False
+        #: ``None`` until the stale XYE set is discovered (once, before this run
+        #: writes); then the list of artifacts still awaiting deletion.
+        self.xye_tail_pending = None
+        self._closed = False
+
+    def owns(self, frozen) -> bool:
+        """True only for the exact object this envelope was prepared for."""
+        return frozen is self.frozen
+
+    def close(self) -> None:
+        """Close the owned raw stack exactly once.  Idempotent by contract.
+
+        §17.8 item 3: every success, typed refusal, exception, Stop and Close
+        path routes here, so the proved HDF5 handle cannot outlive the run.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        stack = self.stack
+        if stack is None:
+            return
+        try:
+            stack.close()
+        except Exception:                              # noqa: BLE001
+            logger.debug("prepared stack close failed", exc_info=True)
 
 
 # How many frames to bulk-read from the source HDF5 per iteration.
@@ -174,15 +264,12 @@ class nexusThread(wranglerThread):
 
         self.detector = None
         self.mask = None
-        # O-3N.R: the immutable execution target for the run in progress, and
-        # the one-shot latch that makes Overwrite replace exactly once.
-        self._run_output_prepared = None
-        self._run_target_replaced = None
-        # O-3N.R.1 §16.7 R.1-1: the ONE prepared execution resource for the run
-        # in progress, and the frozen object it was prepared for.
-        self._prepared_for = None
-        self._prepared_stack = None
-        self._xye_tail_cleared = None
+        # O-3N.R.2 §17.8 item 1: the ONE prepared execution envelope for the run
+        # in progress -- exact admitted object, derived target, proved raw
+        # stack, run scan and output-transaction state.  It replaces the five
+        # parallel latches whose early "prepared/replaced/cleared" writes were
+        # the §17 root cause; ``None`` means this worker is idle.
+        self._execution = None
 
         # NeXus processing is always batch-mode equivalent — surface the
         # same flags the GUI's wrangler_finished handler checks so it
@@ -201,24 +288,29 @@ class nexusThread(wranglerThread):
         if files_processed <= 0 or frozen.run_options.get("xye_only", False):
             return
         is_finalize = (self.command != 'stop')
-        # §16.4: if no periodic save happened, THIS is the run's first writer
-        # action, so the Overwrite replacement belongs here.
-        nexusThread._replace_target_once(self, frozen, scan)
-        # O-3N.R §15.4 item 4: Overwrite already replaced the target once, at
-        # the FIRST writer action of this run (``_prepare_output_for_run``), so
-        # every save inside the run appends into what this run created and the
-        # final save can never mix a previous identity's rows under the new
-        # provenance.  ``replace`` stays False here for exactly that reason.
-        with self.file_lock:
-            pool = _get_h5pool()
-            pool.pause(scan.data_file)
-            try:
-                scan.default_geometry()
-                scan.save_to_nexus(
-                    replace=False, finalize=is_finalize,
-                )
-            finally:
-                pool.resume(scan.data_file)
+        prepared = nexusThread._require_execution(self, frozen)
+
+        def write():
+            # O-3N.R §15.4 item 4: Overwrite replaces the target exactly once,
+            # at the first SUCCESSFUL writer action of this run, so every save
+            # inside the run appends into what this run created and the final
+            # save can never mix a previous identity's rows under the new
+            # provenance.  ``replace`` stays False here for exactly that reason.
+            with self.file_lock:
+                pool = _get_h5pool()
+                pool.pause(scan.data_file)
+                try:
+                    scan.default_geometry()
+                    scan.save_to_nexus(
+                        replace=False, finalize=is_finalize,
+                    )
+                finally:
+                    pool.resume(scan.data_file)
+
+        # §16.4/§17.5: if no periodic save happened, THIS is the run's first
+        # writer action, so the atomic Overwrite replacement belongs here -- the
+        # same success-after-operation rule as every other save.
+        nexusThread._write_run_result(self, prepared, scan, write)
         if not is_finalize:
             logger.info(
                 '[NEXUS] Stop tail-flushed %d frames; .nxs is '
@@ -228,7 +320,7 @@ class nexusThread(wranglerThread):
 
     # ── Main entry point ─────────────────────────────────────────────────
 
-    def _require_run_configuration(self, stage):
+    def _require_run_configuration(self, stage, candidate=_CARRIER):
         """Return the EXACT admitted frozen configuration, or refuse (typed).
 
         Parity with ``imageThread``: the WORKER-ENTRY identity gate.  O-1a-W1R
@@ -237,10 +329,18 @@ class nexusThread(wranglerThread):
         ``FrozenRunConfiguration`` -- same generation, future generation, or an
         equal-valued reconstruction -- refuses here rather than executing the
         substitution.
+
+        O-3N.R.2 §17.1: ``candidate`` lets the gate judge an object that was
+        HANDED to the worker rather than read off its carrier.  The supported
+        direct ``_run_impl(frozen)`` entry point took that argument on trust,
+        so an equal-valued but non-identical object opened its source and wrote
+        accepted output; now that entry traverses this same gate.
         """
 
+        value = (getattr(self, "run_configuration", None)
+                 if candidate is _CARRIER else candidate)
         frozen = require_run_configuration(
-            getattr(self, "run_configuration", None),
+            value,
             stage=stage,
             floor=int(getattr(self, "run_configuration_floor", 0) or 0),
             expected=getattr(self, "_admitted_run_configuration", None),
@@ -280,24 +380,30 @@ class nexusThread(wranglerThread):
         # O-3N.R.1 §16.5: the accepted calibration is assigned or REFUSED; a
         # run whose identity claims no constructible calibration may not fall
         # back to whatever object the worker happened to hold.
+        # O-3N.R.2 §17.7: constructibility is proved HERE, once, and the target
+        # then carries VALUES -- ``PONI`` is a mutable dataclass, so keeping one
+        # inside a self-described immutable target handed every consumer the
+        # same editable object.
         values = getattr(frozen, "poni_values", None)
-        poni = None
+        poni_values: tuple[tuple[str, object], ...] = ()
         if values:
+            values = dict(values)
             try:
-                poni = PONI.from_dict(dict(values))
+                PONI.from_dict(dict(values))
             except Exception as exc:                   # noqa: BLE001
                 raise RunConfigurationRefused(
                     "absent", stage="nexus-source-target",
                     detail=("the accepted calibration values are not "
                             f"constructible: {exc}"),
                     generation=int(getattr(frozen, "generation", 0) or 0))
+            poni_values = tuple(values.items())
         return FrozenSourceTarget(
             uri, entry, scan_name,
             os.path.join(save_path, f"{scan_name}.nxs"),
             output_dir=save_path,
             source_base=str(getattr(frozen, "project_root", "") or ""),
             output_mode=str(getattr(frozen, "output_mode", "") or "Append"),
-            poni=poni,
+            poni_values=poni_values,
             generation=int(getattr(frozen, "generation", 0) or 0),
             fingerprint=str(getattr(frozen, "fingerprint", "") or ""))
 
@@ -313,18 +419,26 @@ class nexusThread(wranglerThread):
         * the output does not collide with the source, through the shared
           headless :func:`check_output_not_source` owner, so symlink/hard-link
           identity is one policy;
-        * the SELECTED entry is an HDF5 **Group**.  Membership alone was not
-          enough: a Dataset at that path passed, and the shared reader accepts
-          an explicit hint only when it resolves to a Group -- otherwise it
-          falls back to the first ``NXentry`` and the run reduces one group
-          under another's provenance (§16.3);
-        * the exact selected group carries a RUNNABLE raw stack, proved by
-          opening it.  §16.4: output ownership must not become destructive
-          before this holds, or a valid-but-frameless container destroys a
-          durable prior result and creates nothing.
+        * the SELECTED entry is an HDF5 **Group** carrying a RUNNABLE raw
+          stack, proved by :func:`open_nexus_image_stack_exact` -- ONE open
+          that both qualifies the group and binds the stack.
 
-        Returns the proved ``NexusImageStack`` context manager; the caller owns
-        closing it.
+          O-3N.R.2 §17.3: this used to be two facts.  The group was proved with
+          one ``h5py.File`` open, that handle was closed, and the shared opener
+          opened the file again to bind the stack -- with its legacy fallback
+          to the first ``NXentry`` still live.  Replacing the selected group
+          between the two opens bound ``/fallback/instrument/detector/data``
+          while the accepted source and written provenance still named
+          ``selected``.  Membership alone had already been insufficient (§16.3:
+          a Dataset at that path passed); the remaining gap was that
+          qualification and binding described different resources.  One strict
+          open closes both.
+
+          §16.4: output ownership must not become destructive before this
+          holds, or a valid-but-frameless container destroys a durable prior
+          result and creates nothing.
+
+        Returns the proved ``NexusImageStack``; the ENVELOPE owns closing it.
         """
         def refuse(detail):
             raise RunConfigurationRefused(
@@ -333,7 +447,7 @@ class nexusThread(wranglerThread):
 
         if not target.entry:
             refuse("the accepted NeXus configuration names no entry")
-        if target.poni is None:
+        if not target.poni_values:
             refuse("the accepted NeXus configuration carries no calibration")
         source = Path(target.uri)
         if not source.is_file():
@@ -347,29 +461,10 @@ class nexusThread(wranglerThread):
                                     input_files=[target.uri])
         except OutputCollisionError as exc:
             refuse(str(exc))
-        # Strict entry: the selected object must BE a group, not merely present.
+        # Strict source open: the selected group IS the bound stack.  This is
+        # the last precondition for output ownership becoming destructive.
         try:
-            import h5py
-
-            with h5py.File(target.uri, "r") as handle:
-                node = handle.get(target.entry)
-                is_group = isinstance(node, h5py.Group)
-                present = node is not None
-        except OSError as exc:
-            refuse(f"the accepted NeXus source could not be opened: {exc}")
-        else:
-            if not present:
-                refuse(f"the selected entry {target.entry!r} does not exist in "
-                       f"{target.uri}; refusing rather than reducing another "
-                       "NXentry under its provenance")
-            if not is_group:
-                refuse(f"the selected entry {target.entry!r} is not an HDF5 "
-                       "group; the reader would fall back to another NXentry "
-                       "while provenance kept claiming this one")
-        # Raw-stack proof: open the EXACT selected group.  This is the last
-        # precondition for output ownership becoming destructive.
-        try:
-            stack = open_nexus_image_stack(target.uri, target.entry)
+            stack = open_nexus_image_stack_exact(target.uri, target.entry)
         except ProcessedXdartInputError:
             # F-NXS-2 keeps its actionable operator message; the STOP is now the
             # shared typed refusal, raised before any output action.
@@ -388,20 +483,15 @@ class nexusThread(wranglerThread):
             raise                                      # unreachable; refuse()
         return stack
 
-    def _execution_poni(self, frozen):
-        """The calibration this run integrates with — the accepted one, or none.
-
-        O-3N.R.1 §16.5: a thin accessor onto the prepared target, so there is
-        exactly one construction site.  A nonconstructible mapping already
-        refused in :meth:`_frozen_source_target`; ``None`` here means the
-        accepted run genuinely carries no calibration, and execution must
-        refuse rather than keep an earlier object.
-        """
-        return nexusThread._frozen_source_target(frozen).poni
-
     @staticmethod
     def _append_identity(mapping):
-        """The stored (source uri, entry, processing signature) of a target."""
+        """The stored (uri, entry, processing signature, fingerprint) identity.
+
+        O-3N.R.2 §17.4: the fingerprint is part of it.  Comparing only URI,
+        entry and the narrower processing mapping admitted a second Start on
+        the same container whose accepted PONI distance had changed -- a
+        different accepted CONTENT identity appending into the first run's rows.
+        """
         config = (mapping or {}).get("config") or {}
         run = config.get("run_configuration") or {}
         source = run.get("source") or {}
@@ -410,41 +500,49 @@ class nexusThread(wranglerThread):
                     "bai_1d_args": run.get("bai_1d_args"),
                     "bai_2d_args": run.get("bai_2d_args"),
                     "gi": run.get("gi"),
-                })
+                },
+                str(run.get("fingerprint") or ""))
 
-    def _prepare_output_for_run(self, frozen, scan):
+    def _prepare_output_for_run(self, prepared, scan):
         """Own the output transaction for this run, before any writer action.
 
-        O-3N.R.1 §16.2/§16.4.  Two modes, two contracts:
+        O-3N.R.1 §16.2/§16.4, closed by O-3N.R.2 §17.4.  Two modes, two
+        contracts:
 
         * **Append** is PROVENANCE-QUALIFIED.  An existing target is inspected
           before reduction or any writer mutation; only a target whose stored
-          source URI, exact entry and processing signature match the accepted
-          run is admitted.  Missing, malformed, foreign-source, foreign-entry or
-          science-incompatible provenance is a visible typed refusal that leaves
-          the target byte-for-byte.  Previously every non-Overwrite mode
-          returned immediately, so two same-stem sources could mix old rows
-          under a new identity -- and Append is the UI default.
+          source URI, exact entry, processing signature AND accepted content
+          fingerprint match this run is admitted.  Missing, malformed,
+          foreign-source, foreign-entry, science-incompatible or
+          foreign-content provenance is a visible typed refusal that leaves the
+          target byte-for-byte.
         * **Overwrite** is NOT destructive here.  The prior result survives
-          until the raw stack is proved and the first real writer action
-          replaces it, exactly once (see :meth:`_replace_target_once`).
+          until the raw stack is proved and a writer action COMMITS a
+          replacement, exactly once (see :meth:`_write_run_result`).
+
+        The envelope's ``output_committed`` flag is set only after every proof
+        and the reapply have succeeded.  The parent assigned its equivalent
+        latch on entry, so one malformed or foreign target refused once and
+        then let an exact retry return early, bypassing qualification entirely.
 
         XYE-only never touches the ``.nxs`` at all.
         """
+        frozen = prepared.frozen
         if frozen.run_options.get("xye_only", False):
             return False
         Path(os.path.dirname(scan.data_file)).mkdir(parents=True,
                                                     exist_ok=True)
-        if self._run_output_prepared is frozen:
+        if prepared.output_committed:
             return False
-        self._run_output_prepared = frozen
         if str(getattr(frozen, "output_mode", "Append")) == "Overwrite":
             # §16.4: retain the old target.  The first successful writer action
             # replaces it; nothing is destroyed during preparation.
+            prepared.output_committed = True
             return False
 
         target = Path(scan.data_file)
         if not target.exists():
+            prepared.output_committed = True
             return False
 
         def refuse(detail):
@@ -458,7 +556,7 @@ class nexusThread(wranglerThread):
             refuse(f"the Append target carries no readable provenance "
                    f"({exc}); refusing rather than mixing rows under a new "
                    "identity")
-        stored_uri, stored_entry, stored_processing = (
+        stored_uri, stored_entry, stored_processing, stored_fingerprint = (
             nexusThread._append_identity(stored))
         accepted = frozen.source
         if not stored_uri:
@@ -477,8 +575,21 @@ class nexusThread(wranglerThread):
         if not check.ok:
             refuse(f"the Append target's processing configuration is "
                    f"incompatible: {check.reason}")
+        # §17.4: the accepted CONTENT identity.  ``processing_mapping()`` is
+        # deliberately narrower than the frozen fingerprint -- the calibration
+        # lives outside it -- so this is the comparison that catches a changed
+        # accepted science value on an otherwise identical source/entry.
+        accepted_fingerprint = str(getattr(frozen, "fingerprint", "") or "")
+        if not stored_fingerprint:
+            refuse("the Append target records no content fingerprint; it was "
+                   "not written by an admitted run")
+        if stored_fingerprint != accepted_fingerprint:
+            refuse(f"the Append target carries content identity "
+                   f"{stored_fingerprint!r}, not this run's "
+                   f"{accepted_fingerprint!r}")
         # Compatible: load the existing rows into THIS run's scan so new rows
         # are added once and existing durability state is preserved honestly.
+        # The identity is committed only once this has SUCCEEDED.
         loader = getattr(scan, "load_from_h5", None)
         if callable(loader):
             with self.file_lock:
@@ -486,43 +597,105 @@ class nexusThread(wranglerThread):
             _apply_frozen_run_configuration(scan, frozen)
             for key, value in frozen.scan_args().items():
                 setattr(scan, key, value)
+        prepared.output_committed = True
         return True
 
-    def _replace_target_once(self, frozen, scan):
-        """Perform an Overwrite replacement at the FIRST writer action only.
+    def _begin_target_replacement(self, prepared, scan):
+        """Move a prior Overwrite target aside so a writer failure can undo it.
 
-        §16.4: destructive exactly once, after the raw stack is proved and a
-        real result is ready.  Later saves in the same run append into what
-        this run created.
+        O-3N.R.2 §17.5.  The parent unlinked the prior target and only then
+        called the writer, so an injected writer failure left no old target and
+        no new result.  A rename within the output directory is atomic, so
+        there is no instant at which neither file exists; the backup is dropped
+        on commit and restored on rollback.
+
+        Returns the backup path, or ``None`` when there is nothing to protect.
         """
+        frozen = prepared.frozen
         if str(getattr(frozen, "output_mode", "Append")) != "Overwrite":
-            return False
-        if self._run_target_replaced is frozen:
-            return False
-        self._run_target_replaced = frozen
+            return None
+        if prepared.target_replaced:
+            return None
         target = Path(scan.data_file)
         if not target.exists():
-            return False
+            return None
+        backup = target.with_name(target.name + _REPLACING_SUFFIX)
         with self.file_lock:
             pool = _get_h5pool()
             pool.pause(str(target))
             try:
-                target.unlink()
+                if backup.exists():
+                    backup.unlink()
+                os.replace(target, backup)
             finally:
                 pool.resume(str(target))
-        logger.info('[NEXUS] Overwrite: replaced %s at the first writer action',
-                    target)
-        return True
+        return backup
 
-    def _adopt_frozen_source_target(self, frozen):
+    def _rollback_target_replacement(self, scan, backup):
+        """Restore the prior Overwrite target byte-for-byte after a failure."""
+        target = Path(scan.data_file)
+        with self.file_lock:
+            pool = _get_h5pool()
+            pool.pause(str(target))
+            try:
+                if target.exists():
+                    target.unlink()            # discard the failed partial
+                os.replace(backup, target)
+            except OSError:
+                # Loud, and RECOVERABLE: the prior result is still on disk
+                # under the staging name, so an operator can restore it.
+                logger.error(
+                    '[NEXUS] Overwrite rollback failed; the prior result is '
+                    'preserved at %s', backup, exc_info=True)
+            finally:
+                pool.resume(str(target))
+
+    def _write_run_result(self, prepared, scan, write):
+        """ONE atomic writer transaction for this run (§17.5).
+
+        Every ``.nxs`` writer action of a NeXus run goes through here --
+        periodic and final alike -- so "replace at the first SUCCESSFUL writer
+        action" is a property of the transaction rather than of one call site.
+        The once-only replacement identity is consumed after the commit, never
+        before: a failed writer restores the prior target and leaves one exact
+        retry available.
+        """
+        backup = nexusThread._begin_target_replacement(self, prepared, scan)
+        try:
+            result = write()
+        except BaseException:
+            if backup is not None:
+                nexusThread._rollback_target_replacement(self, scan, backup)
+            raise
+        if str(getattr(prepared.frozen, "output_mode", "Append")) == "Overwrite":
+            if not prepared.target_replaced:
+                logger.info(
+                    '[NEXUS] Overwrite: replaced %s at the first successful '
+                    'writer action', scan.data_file)
+            prepared.target_replaced = True
+        if backup is not None:
+            try:
+                backup.unlink()
+            except OSError:
+                logger.warning(
+                    '[NEXUS] the replaced prior target could not be removed: '
+                    '%s', backup, exc_info=True)
+        return result
+
+    def _adopt_frozen_source_target(self, prepared):
         """Initialize this worker's runtime cursors FROM the accepted values.
 
         Cursor/handle state stays mutable — the reader needs it — but it is
-        (re)initialized here from the accepted object before anything opens, so
-        a mirror poisoned between admission and execution is overwritten rather
+        (re)initialized here from the ENVELOPE before anything opens, so a
+        mirror poisoned between admission and execution is overwritten rather
         than obeyed (§14.2 item 4).
+
+        O-3N.R.2 §17.1: it takes the prepared envelope, not a raw frozen
+        object.  ``run()``, ``_run_impl()`` and ``_initialize_scan()`` each used
+        to re-derive the target and rebuild a different ``PONI``; the envelope
+        derives both exactly once.
         """
-        target = nexusThread._frozen_source_target(frozen)
+        target = prepared.target
         self.nexus_file = target.uri
         self.entry = target.entry
         self.scan_name = target.scan_name
@@ -533,64 +706,138 @@ class nexusThread(wranglerThread):
         # O-3N.R.1 §16.5: ASSIGN the accepted calibration -- never preserve an
         # older object when the accepted run carries none.  A nonconstructible
         # mapping already refused inside ``_frozen_source_target``.
-        self.poni = target.poni
+        self.poni = prepared.poni
         return target
 
     def _save_to_disk(self, frozen, scan):
-        """The run's writer action, with the Overwrite replacement folded in.
+        """The run's periodic writer action, inside the output transaction.
 
-        §16.4: Overwrite is destructive exactly ONCE, here, at the first real
-        writer action -- after the raw stack was proved and a result exists.
-        Later saves in the same run append into what this run created.
-        XYE-only never reaches the ``.nxs`` writer at all.
+        §16.4/§17.5: Overwrite is destructive exactly ONCE per run, and only
+        once a writer action has SUCCEEDED -- after the raw stack was proved
+        and a result exists.  Later saves in the same run append into what this
+        run created.  XYE-only never reaches the ``.nxs`` writer at all.
         """
         if frozen.run_options.get("xye_only", False):
             return
-        nexusThread._replace_target_once(self, frozen, scan)
-        return wranglerThread._save_to_disk(self, frozen, scan)
+        prepared = nexusThread._require_execution(self, frozen)
+        return nexusThread._write_run_result(
+            self, prepared, scan,
+            lambda: wranglerThread._save_to_disk(self, frozen, scan))
 
     def _flush_xye_buffer(self, scan, published_idxs=None):
         """Flush XYE, clearing an earlier longer run's tail under Overwrite.
 
         §16.4: an Overwrite XYE run must not leave higher-frame files from a
-        previous, longer run beside this run's output.  The clear happens once,
-        at the first flush of the run, and only for Overwrite.
+        previous, longer run beside this run's output.
         """
-        frozen = getattr(self, "run_configuration", None)
-        mode = str(getattr(frozen, "output_mode", "Append") or "Append")
-        if (frozen is not None and mode == "Overwrite"
-                and self._xye_tail_cleared is not frozen):
-            self._xye_tail_cleared = frozen
-            root = Path(os.path.dirname(scan.data_file)) / str(scan.name)
-            if root.is_dir():
-                for stale in root.glob("*.xye"):
-                    try:
-                        stale.unlink()
-                    except OSError:
-                        logger.debug("stale XYE could not be removed: %s",
-                                     stale, exc_info=True)
+        prepared = getattr(self, "_execution", None)
+        if prepared is not None:
+            nexusThread._clear_stale_xye_tail(self, prepared, scan)
         return wranglerThread._flush_xye_buffer(
             self, scan, published_idxs=published_idxs)
 
+    def _clear_stale_xye_tail(self, prepared, scan):
+        """All-or-pending stale-XYE deletion for an Overwrite run (§17.6).
+
+        Two parent defects, one owner:
+
+        * the policy was read off mutable ``self.run_configuration``, so
+          replacing that carrier after admission with a foreign Append object
+          suppressed cleanup entirely.  It now comes from the ENVELOPE'S
+          accepted output policy, which nothing can poison;
+        * the completion latch was consumed before unlinking and ``OSError``
+          was swallowed, so one transient delete failure stranded a stale
+          higher-frame file permanently.  Cleanup is now all-or-pending and
+          every later flush retries what is left.
+
+        The stale set is discovered ONCE, before this run has written anything,
+        so a retry can never sweep the run's own output.
+        """
+        if str(getattr(prepared.frozen, "output_mode", "Append")) != "Overwrite":
+            return
+        if prepared.xye_tail_pending is None:
+            root = Path(os.path.dirname(scan.data_file)) / str(scan.name)
+            prepared.xye_tail_pending = (sorted(root.glob("*.xye"))
+                                         if root.is_dir() else [])
+        remaining = []
+        for stale in prepared.xye_tail_pending:
+            try:
+                stale.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                remaining.append(stale)
+        prepared.xye_tail_pending = remaining
+        if remaining:
+            logger.warning(
+                '[NEXUS] Overwrite: %d stale XYE file(s) could not be removed; '
+                'cleanup stays PENDING and the next flush retries: %s',
+                len(remaining), [str(p) for p in remaining])
+
     def _prepare_execution(self, frozen):
-        """THE worker execution-preparation owner (§16.7 R.1-1).
+        """THE worker execution-preparation owner (§16.7 R.1-1, §17.8 item 1).
 
         One idempotent operation, reached by both ``run()`` and a supported
-        direct ``_run_impl()`` entry.  It derives the immutable target, assigns
-        or refuses the accepted calibration, proves the exact HDF5 Group, opens
-        and proves the exact raw stack, and applies the collision/output facts.
-        No content read and no output action precedes it.
+        direct ``_run_impl()`` entry.  In order: it admits the EXACT frozen
+        object, derives the immutable target once, and proves/binds the exact
+        raw stack in one strict open.  No content read and no output action
+        precedes it.
 
-        Returns ``(target, stack_context)``; the caller owns the stack.
+        O-3N.R.2 §17.1: admission comes FIRST.  The parent adopted the supplied
+        object's target and opened its source before any identity check, so the
+        direct path accepted an equal-valued but non-identical configuration and
+        one invocation could read a foreign source while writing accepted
+        output and provenance.
+
+        Returns the :class:`PreparedNexusExecution` envelope; the WORKER owns
+        releasing it.
         """
-        target = nexusThread._adopt_frozen_source_target(self, frozen)
-        previous = getattr(self, "_prepared_stack", None)
-        if previous is not None and getattr(self, "_prepared_for", None) is frozen:
-            return target, previous
-        stack = nexusThread._preflight_execution_target(self, target)
-        self._prepared_for = frozen
-        self._prepared_stack = stack
-        return target, stack
+        prepared = getattr(self, "_execution", None)
+        if prepared is not None and prepared.owns(frozen):
+            return prepared
+        accepted = nexusThread._require_run_configuration(
+            self, "nexus-execution-preparation", candidate=frozen)
+        # A superseded envelope never lingers beside a new one.
+        nexusThread._release_execution(self)
+        stack = None
+        try:
+            target = nexusThread._frozen_source_target(accepted)
+            stack = nexusThread._preflight_execution_target(self, target)
+            prepared = PreparedNexusExecution(accepted, target, stack)
+        except BaseException:
+            if stack is not None:
+                try:
+                    stack.close()
+                except Exception:                      # noqa: BLE001
+                    logger.debug("stack close failed", exc_info=True)
+            raise
+        self._execution = prepared
+        nexusThread._adopt_frozen_source_target(self, prepared)
+        return prepared
+
+    def _require_execution(self, frozen):
+        """The prepared envelope for the EXACT object, or a typed refusal."""
+        prepared = getattr(self, "_execution", None)
+        if prepared is None or not prepared.owns(frozen):
+            raise RunConfigurationRefused(
+                "foreign", stage="nexus-execution",
+                detail=("no prepared execution envelope owns this frozen "
+                        "configuration; the run was never prepared, or the "
+                        "object is not the one it was prepared for"),
+                generation=int(getattr(frozen, "generation", 0) or 0))
+        return prepared
+
+    def _release_execution(self):
+        """Close and clear the prepared envelope exactly once (§17.8 item 3).
+
+        Every terminal path -- success, typed refusal, exception, Stop and
+        Close -- routes here, so a proved raw-stack handle cannot outlive its
+        run and the worker returns to idle.
+        """
+        prepared = getattr(self, "_execution", None)
+        self._execution = None
+        if prepared is not None:
+            prepared.close()
 
     def _project_gi_modes_onto_display_scan(self, frozen):
         """Backward GI-mode write onto the mutable DISPLAY scan (retained).
@@ -606,45 +853,71 @@ class nexusThread(wranglerThread):
         self.scan.bai_2d_args['gi_mode_2d'] = frozen.gi.mode_2d
 
     def run(self):
-        """QThread entry: run the integration body."""
+        """QThread entry: run the integration body.
+
+        O-3N.R.2 §17.2/§17.8 item 3: EVERY worker refusal is contained here --
+        not just one raised by the initial preparation call.  A
+        production-shaped incompatible Append refuses well after preparation,
+        and the parent let that escape the QThread entry while the prepared
+        stack stayed open.  A worker-boundary refusal is an expected typed
+        terminal outcome: it is surfaced visibly, the envelope is released, and
+        the lifecycle returns to idle.
+        """
         # W-1.2 case 5 parity: refuse before any source read, output open or
         # reduction session — a worker without the accepted configuration does
         # nothing at all.
         try:
-            frozen = nexusThread._require_run_configuration(
-                self, "nexus-worker-run")
-            # O-3N (§14.2 item 4): re-derive what this run opens and where it
-            # writes from the accepted object BEFORE any source read or output
-            # open, so the panel/wrapper/worker mirrors cannot decide either.
-            nexusThread._prepare_execution(self, frozen)
-        except RunConfigurationRefused as exc:
-            logger.error("run refused: %s", exc)
-            self.command = 'stop'
             try:
-                self.showLabel.emit(f"Run refused: {exc}")
-            except Exception:
-                logger.debug("showLabel emit failed for refusal", exc_info=True)
-            return
-        self._reset_xye_output_notifications()
-        try:
-            self._run_impl(frozen)
+                frozen = nexusThread._require_run_configuration(
+                    self, "nexus-worker-run")
+                # O-3N (§14.2 item 4): derive what this run opens and where it
+                # writes from the accepted object BEFORE any source read or
+                # output open, so no mirror can decide either.
+                nexusThread._prepare_execution(self, frozen)
+                self._reset_xye_output_notifications()
+                self._run_impl(frozen)
+            except RunConfigurationRefused as exc:
+                logger.error("run refused: %s", exc)
+                self.command = 'stop'
+                try:
+                    self.showLabel.emit(f"Run refused: {exc}")
+                except Exception:
+                    logger.debug("showLabel emit failed for refusal",
+                                 exc_info=True)
         finally:
-            self._close_reduction_session()
+            # The reduction session drains first (its finish() is the streaming
+            # batch's end-of-scan write), then the source stack is released.
+            try:
+                self._close_reduction_session()
+            finally:
+                nexusThread._release_execution(self)
 
     def _run_impl(self, frozen):
         """Read frames from a NeXus file and integrate them in parallel."""
         # O-3N.R.1 §16.7 R.1-1: ONE worker preparation owner, reached by both
         # ``run()`` and a supported direct ``_run_impl()`` entry.  It is
-        # idempotent, and nothing that reads source content or touches output
-        # may precede it.
-        target, ds_cm = nexusThread._prepare_execution(self, frozen)
+        # idempotent, admits the exact object first, and nothing that reads
+        # source content or touches output may precede it.
+        prepared = nexusThread._prepare_execution(self, frozen)
+        try:
+            return nexusThread._run_body(self, prepared)
+        finally:
+            # §17.2: the proved raw stack was opened during preparation but only
+            # entered a ``with`` block after detector/mask/scan/Append work.
+            # Anything failing in between leaked the open HDF5 handle; the
+            # release is unconditional, and idempotent.
+            nexusThread._release_execution(self)
+
+    def _run_body(self, prepared):
+        """The integration body, executing ONLY on the prepared envelope."""
+        frozen = prepared.frozen
+        target = prepared.target
+        ds_cm = prepared.stack
         xye_only = frozen.run_options.get("xye_only", False)
         t0 = time.time()
-        # O-1a-W1R (review §39.5 Phase 2 item 1): capture the accepted frozen
-        # reference ONCE at worker entry.  Identity was gated in ``run()``; this
-        # is the object every execution decision below consumes.
-        if self.poni is None or not self.nexus_file:
-            return
+        # §17.1: source, entry, output and calibration are the envelope's --
+        # preflight already refused an absent calibration or unreadable source,
+        # so there is no silent early return to fall through here.
 
         # Setup detector and global mask
         self.detector = (get_detector(self.poni.detector)
@@ -916,32 +1189,42 @@ class nexusThread(wranglerThread):
 
         The display scan is neither executed on nor reset here.  Publication
         still reaches the GUI through the existing per-frame handoff.
+
+        O-3N.R.2 §17.1: the target is the ENVELOPE'S, not a third derivation.
+        §17.2/§17.8 item 3: an Append refusal raised from here releases the
+        envelope, so the proved raw stack cannot outlive the refusal.
         """
         frozen = nexusThread._require_run_configuration(
             self, "nexus-initialize-scan")
-        target = nexusThread._adopt_frozen_source_target(self, frozen)
-        scan_kwargs = frozen.scan_kwargs()
-        scan = LiveScan(
-            scan_name,
-            # §15.1: the run owns its output BEFORE anything can write.  Both
-            # saves and every XYE file resolve through ``data_file``.
-            data_file=target.output_path,
-            static=True,
-            gi=bool(scan_kwargs["gi"]),
-            incidence_motor=scan_kwargs["incidence_motor"],
-            series_average=False,
-            global_mask=self.mask,
-            # J2: share the wrangler's writer lock, as the image worker does.
-            file_lock=self.file_lock,
-            bai_1d_args=scan_kwargs["bai_1d_args"],
-            bai_2d_args=scan_kwargs["bai_2d_args"],
-        )
-        _apply_frozen_run_configuration(scan, frozen)
-        # N1: the accepted project root -> entry/@source_base + relative raw
-        # source paths in the writer (portable .nxs).
-        scan.source_base = target.source_base or None
-        self._active_scan = scan
-        nexusThread._prepare_output_for_run(self, frozen, scan)
+        prepared = nexusThread._prepare_execution(self, frozen)
+        try:
+            target = prepared.target
+            scan_kwargs = frozen.scan_kwargs()
+            scan = LiveScan(
+                scan_name,
+                # §15.1: the run owns its output BEFORE anything can write.
+                # Both saves and every XYE file resolve through ``data_file``.
+                data_file=target.output_path,
+                static=True,
+                gi=bool(scan_kwargs["gi"]),
+                incidence_motor=scan_kwargs["incidence_motor"],
+                series_average=False,
+                global_mask=self.mask,
+                # J2: share the wrangler's writer lock, as the image worker does.
+                file_lock=self.file_lock,
+                bai_1d_args=scan_kwargs["bai_1d_args"],
+                bai_2d_args=scan_kwargs["bai_2d_args"],
+            )
+            _apply_frozen_run_configuration(scan, frozen)
+            # N1: the accepted project root -> entry/@source_base + relative raw
+            # source paths in the writer (portable .nxs).
+            scan.source_base = target.source_base or None
+            prepared.scan = scan
+            self._active_scan = scan
+            nexusThread._prepare_output_for_run(self, prepared, scan)
+        except BaseException:
+            nexusThread._release_execution(self)
+            raise
         return scan
 
     def _frame_meta(self, scan_meta, base_meta, frame_idx):

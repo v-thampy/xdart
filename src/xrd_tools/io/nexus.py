@@ -584,6 +584,97 @@ class NexusImageStack:
         return np.concatenate(chunks, axis=0)
 
 
+def open_nexus_image_stack_exact(
+    path: Path | str,
+    entry: str,
+) -> NexusImageStack:
+    """Open the raw stack of the EXACTLY named NXentry, or raise.  No fallback.
+
+    The strict sibling of :func:`open_nexus_image_stack`, for callers whose
+    provenance names the entry they claim to have reduced.  The shared opener
+    deliberately backstops an unresolvable hint with the first ``NXentry`` in
+    the file, which is right for a display reader guessing at a container and
+    wrong for an execution owner: a run would reduce one group while its written
+    provenance kept claiming another.
+
+    The difference that matters is not only the missing fallback.  Qualifying
+    the group with one open, closing it, and opening the file again to bind the
+    stack leaves a window in which the selected group can be replaced between
+    the two — the qualified resource and the executed resource are then two
+    facts, not one.  This function proves the group and binds the stack on a
+    SINGLE handle, so that window does not exist, and it additionally rejects
+    any resolved dataset path that lies outside the selected group.
+
+    Parameters
+    ----------
+    path : Path or str
+        Path to the NeXus HDF5 file.
+    entry : str
+        Name of the NXentry group.  Required, and taken literally.
+
+    Returns
+    -------
+    NexusImageStack
+        Proxy over the dataset(s) resolved strictly inside ``/{entry}/``.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the file does not exist.
+    ValueError
+        If no entry is named.
+    KeyError
+        If the entry is missing, is not an HDF5 ``Group``, carries no runnable
+        image dataset, or resolves to a dataset outside itself.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"NeXus file not found: {p}")
+    name = str(entry or "").strip().strip("/")
+    if not name:
+        raise ValueError(
+            "an exact NeXus stack open requires a named entry; there is no "
+            "safe group to guess"
+        )
+
+    h5f = h5py.File(p, "r")
+    try:
+        node = h5f.get(name)
+        if node is None:
+            raise KeyError(f"entry {name!r} does not exist in {p}")
+        if not isinstance(node, h5py.Group):
+            raise KeyError(
+                f"entry {name!r} in {p} is not an HDF5 group "
+                f"(got {type(node).__name__})"
+            )
+        ext_paths = _find_eiger_external_link_paths(h5f, name)
+        if ext_paths:
+            # Same provisional-link contract as the shared opener (NXS-LINK-1).
+            missing = [lp for lp in ext_paths if h5f.get(lp) is None]
+            if missing:
+                raise UnresolvedSourceLinkError(
+                    f"Eiger data link(s) {missing} in {p} do not resolve yet "
+                    f"(target not landed); container is still being written"
+                )
+            paths = list(ext_paths)
+        else:
+            single = find_nexus_image_dataset_in_open_file(h5f, name)
+            if single is None:
+                raise KeyError(f"No image dataset found in {p}:{name}")
+            paths = [single]
+        prefix = f"/{name}/"
+        outside = [q for q in paths if not q.startswith(prefix)]
+        if outside:
+            raise KeyError(
+                f"the image dataset(s) {outside} resolved outside the selected "
+                f"entry {name!r} in {p}"
+            )
+        return NexusImageStack(h5f, paths)
+    except Exception:
+        h5f.close()
+        raise
+
+
 def open_nexus_image_stack(
     path: Path | str,
     entry: str = "entry",
