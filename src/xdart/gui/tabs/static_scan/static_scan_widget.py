@@ -13139,6 +13139,19 @@ class staticWidget(QWidget):
             staticWidget._report_run_lifecycle_closure_failures(
                 self, "close", failures, False)
 
+    def _public_start_entries(self):
+        """Every real wrangler public Start entry, from the production stack.
+
+        §12.6 E.3 — the ONE enumeration, walking ``ui.wranglerStack`` by index.
+        There is no separate wrangler collection to invent: the stack IS the
+        topology, and ``self.wrangler`` is only whichever page is current.
+        """
+        stack = getattr(getattr(self, "ui", None), "wranglerStack", None)
+        if stack is None:
+            one = getattr(self, "wrangler", None)
+            return [] if one is None else [one]
+        return [stack.widget(index) for index in range(stack.count())]
+
     def _refuse_action_for_active_owner(self, action) -> str | None:
         """The ONE early admission check every run action shares (§10.4.3).
 
@@ -13149,7 +13162,13 @@ class staticWidget(QWidget):
         already mutated run state and the two thread owners have already been
         started.
         """
-        owner = staticWidget._controls_v2_active_run_owner(self)
+        try:
+            owner = staticWidget._controls_v2_active_run_owner(self)
+        except Exception:
+            # An owner that cannot be OBSERVED is not an owner that is idle.
+            logger.warning("%s refused: the run-owner probe failed", action,
+                           exc_info=True)
+            owner = "owner-probe-error"
         if owner is None:
             return None
         fail_closed_rejection_log(
@@ -14751,19 +14770,31 @@ class staticWidget(QWidget):
         self.scan.name = name
         # Single writer, same statement group as the scan rename: the context's
         # stamped sub-scan key and the scan's own name never diverge.
-        if context is not None:
-            # §11.2.2 — the member SOURCE moves with the member.  The
-            # authoritative value is on the frame that drove the boundary; the
-            # context advances key, source and commit epoch together.
-            context.rescope_to(
-                name, source=getattr(first_frame, "source_file", None))
-            # §9.2.2 — and the SELECTION is restamped with it.  Moving
-            # `current_scan_key` while the selection kept naming the previous
-            # sub-scan left every later request qualified against a key the
-            # display had already left; the context's commit epoch moves too,
-            # so requests minted before the boundary can no longer insert.
+        member_source = str(getattr(first_frame, "source_file", "") or "")
+        if context is not None and member_source:
+            # §11.2.2 / §12.6 C — the member SOURCE moves with the member, and
+            # the authoritative value is on the FRAME that drove the boundary.
+            # Key, source and commit epoch advance together, then the selection
+            # is restamped from the resulting owner.
+            context.rescope_to(name, source=member_source)
             staticWidget._install_acquisition_selection(
                 self, context, origin="staticWidget._rescope_frame_panel_to")
+        elif context is not None:
+            # §12.6 C.3 — the SIGNAL-ONLY path (`new_scan` with no frame) may
+            # prepare UI state, but it carries no authoritative member source,
+            # so it must not advance the hydration identity at all.  Advancing
+            # the key and the epoch here left the previous source in place, and
+            # the later frame then saw an already-matching key and never
+            # performed the restamp — a mixed identity reachable purely by
+            # signal ordering.
+            run_config_debug_log(
+                logger, "rescope_identity_deferred", widget=self,
+                origin="staticWidget._rescope_frame_panel_to",
+                incoming_scan_name=str(name),
+                context_token=context.context_token,
+                current_scan_key=context.scan_key,
+                current_source=context.source)
+
         # Wire the viewer to THIS scan's output HERE (driven by the frame stream),
         # NOT from the new_scan signal — set_file queues an async set_datafile that
         # RENAMES scan.name (scan.py:set_datafile), so calling it from an out-of-sync

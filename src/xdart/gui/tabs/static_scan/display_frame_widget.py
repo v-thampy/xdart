@@ -84,6 +84,12 @@ from .browse_debug import (
 )
 from xdart.modules.display_context import HydrationOwner, HydrationRequest
 
+#: §12.6 D — the three states selected-context resolution actually has.  Private
+#: sentinels, values only: no registry, no widget back-reference.
+_CONTEXT_IDLE = "idle"
+_CONTEXT_ACTIVE = "active"
+_CONTEXT_ERROR = "error"
+
 
 def _hydration_owner(owner):
     """Decode a completion's echoed owner.  TOTAL — never raises (§11.1.2).
@@ -106,6 +112,7 @@ def _hydration_owner(owner):
 from .run_config_debug import (
     DECISION_CAPABILITY_FORCES_CLEAR,
     DECISION_HYDRATION_CONTEXT_MISMATCH,
+    DECISION_SELECTION_UNRESOLVED,
     fail_closed_rejection_log,
     run_config_debug_enabled,
 )
@@ -1582,6 +1589,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             # which is the wrong end of the round trip.
             request = displayFrameWidget._build_hydration_request(
                 self, label_key, purpose=purpose_key)
+            if request is not None and not request.enqueueable:
+                # §12.6 D — ERROR: no enqueue, one typed diagnostic (already
+                # emitted where the request was built).
+                pending.discard(pending_key)
+                return
             if request is None:
                 # §9.2.5 — the IDLE/legacy path, reached through an explicit
                 # adapter rather than a broad `except TypeError` retry.  The
@@ -1593,31 +1605,49 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     consumer=consumer,
                     supersede_reason=SupersedeReason.SELECTION)
             else:
+                # §12.6 B.3 — the owner travels WHOLE.
                 worker.request(
                     request.label, request.generation,
                     purpose=request.purpose, consumer=consumer,
                     supersede_reason=SupersedeReason.SELECTION,
-                    context_token=request.context_token,
-                    context_scan_key=request.context_scan_key,
-                    context_source=request.context_source,
+                    owner=request.owner,
                     stores=request.stores,
-                    commit_gate=request.commit_gate,
-                    epoch=request.epoch)
+                    commit_gate=request.commit_gate)
 
-    def _selected_context(self):
-        """The display context this widget is rendering, or ``None``.
+    def _resolve_selected_context(self):
+        """``(state, context)`` — IDLE, ACTIVE or ERROR (§12.6 D).
 
-        Bound by the host (the ONE context owner); ``None`` for the idle/legacy
-        regime and for duck hosts that own no context at all.
+        Three states, because the policy has three.  Collapsing them into
+        ``None`` made a BROKEN authority indistinguishable from a known-idle
+        one, so an installed resolver that raised became permission: request
+        construction minted an ownerless legacy request and completion
+        admission took the idle compatibility branch.
+
+        Only ``IDLE`` may use compatibility.  ``ERROR`` may neither enqueue nor
+        admit.
         """
         resolver = getattr(self, "selected_display_context", None)
         if not callable(resolver):
-            return None
+            # No owner installed at all: a duck host or the idle regime.
+            return _CONTEXT_IDLE, None
         try:
-            return resolver()
+            context = resolver()
         except Exception:
-            logger.debug("selected-context resolver failed", exc_info=True)
-            return None
+            logger.warning("the selected-context owner could not be resolved",
+                           exc_info=True)
+            return _CONTEXT_ERROR, None
+        if context is None:
+            return _CONTEXT_IDLE, None
+        return _CONTEXT_ACTIVE, context
+
+    def _selected_context(self):
+        """The ACTIVE selected context, or ``None``.
+
+        Compatibility accessor for callers that only need the object; the
+        three-state result above is what the ownership boundaries consume.
+        """
+        state, context = displayFrameWidget._resolve_selected_context(self)
+        return context if state is _CONTEXT_ACTIVE else None
 
     def _build_hydration_request(self, label, *, purpose="full"):
         """Freeze WHERE a hydration lands, at the moment it is requested.
@@ -1626,20 +1656,44 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         regime, which keeps the ownerless path through an explicit adapter.
         While a context IS active a request can never be ownerless (§9.2.1/5).
         """
-        context = displayFrameWidget._selected_context(self)
-        if context is None:
+        state, context = displayFrameWidget._resolve_selected_context(self)
+        if state is _CONTEXT_IDLE:
             return None
-        stores = tuple(displayFrameWidget._hydration_stores(self))
+        if state is _CONTEXT_ERROR:
+            # §12.6 D — an unresolvable owner is NOT idle.  A request exists so
+            # the caller can diagnose it, but it carries the inert owner and no
+            # target, so it can neither be enqueued nor committed.
+            fail_closed_rejection_log(
+                logger, DECISION_SELECTION_UNRESOLVED,
+                reason="the selected-context owner could not be resolved",
+                outcome="request_not_enqueueable", blanks_panel=False,
+                expected="one resolvable display context", found="",
+                origin="displayFrameWidget._build_hydration_request",
+                label=label, purpose=str(purpose or "full"))
+            return HydrationRequest(
+                label=label,
+                purpose=str(purpose or "full"),
+                generation=int(getattr(self, "display_generation", 0)),
+                owner=HydrationOwner(),
+                stores=(),
+                commit_gate=None,
+            )
+        owner = getattr(context, "hydration_owner", None)
+        if owner is None:
+            owner = HydrationOwner(
+                getattr(context, "context_token", ""),
+                getattr(context, "scan_key", ""),
+                (getattr(context, "source", "")
+                 or getattr(context, "source_path", "")),
+                getattr(context, "commit_epoch", 0))
         return HydrationRequest(
             label=label,
             purpose=str(purpose or "full"),
             generation=int(getattr(self, "display_generation", 0)),
-            context_token=str(context.context_token or ""),
-            context_scan_key=str(context.scan_key or ""),
-            context_source=str(getattr(context, "source_path", "") or ""),
-            stores=stores,
+            # §12.6 B.2 — the context's OWN projection, carried unchanged.
+            owner=owner,
+            stores=tuple(displayFrameWidget._hydration_stores(self)),
             commit_gate=context.commit_gate,
-            epoch=int(context.commit_epoch),
         )
 
     def _admit_hydration_owner(self, owner, label, generation) -> bool:
@@ -1660,30 +1714,37 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # exact admission applies.  The parent decided that from the
         # `display_context_token` mirror, so an empty mirror while A or B
         # existed sent every completion down the idle compatibility branch.
-        context = displayFrameWidget._selected_context(self)
+        state, context = displayFrameWidget._resolve_selected_context(self)
+        request = _hydration_owner(owner)
         mirror_token = str(getattr(self, "display_context_token", "") or "")
-        if context is None and not mirror_token:
-            # The genuine idle/legacy regime — the ONLY path on which a
-            # completion may carry no owner, and the only one a legacy 2-tuple
-            # is accepted on.  A MISSING mirror cannot turn an extant context
-            # into idle, and a host that still claims a token is not idle
-            # either; both are strict below.
-            return True
-        if context is not None:
-            expected = HydrationOwner.of(
-                context_token=getattr(context, "context_token", ""),
-                scan_key=getattr(context, "scan_key", ""),
-                source=(getattr(context, "source", "")
-                        or getattr(context, "source_path", "")),
-                epoch=getattr(context, "commit_epoch", 0))
+        if state is _CONTEXT_IDLE and not mirror_token:
+            # §12.6 D — the genuine idle/legacy regime, and the ONLY path on
+            # which a completion may carry no owner.  An OWNERFUL completion is
+            # never this call: it belongs to a context that has been retired,
+            # so it is refused below rather than waved through.
+            if not request.qualified and not request.context_token:
+                return True
+        if state is _CONTEXT_ACTIVE:
+            # §12.6 B — compare against the context's OWN projection, so the
+            # mint and the comparison cannot disagree.  A duck context that
+            # exposes only the underlying fields is normalized through the very
+            # same constructor; that is one contract used twice, not a second
+            # mint with its own rules.
+            expected = getattr(context, "hydration_owner", None)
+            if expected is None:
+                expected = HydrationOwner(
+                    getattr(context, "context_token", ""),
+                    getattr(context, "scan_key", ""),
+                    (getattr(context, "source", "")
+                     or getattr(context, "source_path", "")),
+                    getattr(context, "commit_epoch", 0))
         else:
-            # A host that advertises a context token but exposes no context
-            # owner: still ACTIVE, and therefore still strict.  It can supply
-            # no complete expectation, so nothing is admitted — fail closed.
+            # ERROR, or a host that advertises a token but exposes no owner:
+            # active enough to be strict, unable to supply a complete
+            # expectation, so nothing is admitted.
             expected = HydrationOwner()
         # §11.1.4 — all four fields, compared exactly.  No field's absence is
         # permission, on either side.
-        request = _hydration_owner(owner)
         if request.qualified and expected.qualified and request == expected:
             return True
         fail_closed_rejection_log(

@@ -1467,15 +1467,27 @@ class integratorTree(QtWidgets.QWidget):
             # remains the defensive backstop for that case.
             return False
         try:
-            return bool(refuse("reintegration"))
+            result = refuse("reintegration")
         except Exception:
             # §11.3.2 — an INSTALLED but broken predicate is never permission.
-            # Returning False here let GI/threshold writes and a worker start
-            # proceed on exactly the reading that could not be made.
             logger.warning(
                 "reintegration refused: the run-owner probe failed",
                 exc_info=True)
             return True
+        # §12.6 E.1/E.2 — the EXACT result algebra.  The contract is
+        # ``str | None``: exactly None allows, a non-empty label refuses, and
+        # anything else is malformed and also refuses.  `bool(result)` turned
+        # every FALSEY malformed answer — False, 0, "", [], {} — into
+        # permission, and both entries then loaded calibration, applied
+        # GI/threshold state and started the thread.
+        if result is None:
+            return False
+        if isinstance(result, str) and result:
+            return True
+        logger.warning(
+            "reintegration refused: the run-owner probe returned a malformed "
+            "result %r (expected a non-empty owner label or None)", result)
+        return True
 
     def bai_2d(self, q):
         """Uses the integrator_thread attribute to call bai_2d

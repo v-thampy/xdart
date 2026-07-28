@@ -402,7 +402,11 @@ def test_a_rescope_restamps_the_acquisition_selection(
     before = widget._display_selection
     assert before.scan_key == acquisition.scan_key
 
-    widget._rescope_frame_panel_to("run-a-sub2")
+    # §12.6 C — an identity transition is FRAME-DRIVEN: the authoritative
+    # member source rides on the frame that drove the boundary.
+    widget._rescope_frame_panel_to(
+        "run-a-sub2",
+        first_frame=SimpleNamespace(source_file="/raw/run-a-sub2.h5"))
     assert acquisition.scan_key == "run-a-sub2"
     after = widget._display_selection
     assert after is not before, "the selection was not restamped"

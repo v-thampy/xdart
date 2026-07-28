@@ -240,6 +240,30 @@ class DisplayBindings:
         return tuple(f.name for f in dataclass_fields(cls))
 
 
+def _owner_text(value) -> str:
+    """One text rule for every owner field.  Never raises (§12.6 A.2)."""
+    if value is None or isinstance(value, (bytes, bytearray)):
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return str(value) if value else ""
+    except Exception:
+        return ""
+
+
+def _owner_epoch(value) -> int:
+    """A POSITIVE INTEGER epoch, or ``0``.  Never raises (§12.6 A.2).
+
+    A bool is not an epoch, and neither is a string, a float or anything that
+    merely coerces to one: those are malformed inputs, and inventing a number
+    from them is how a forged owner compared equal to a real one.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return value if value > 0 else 0
+
+
 @dataclass(frozen=True, slots=True)
 class HydrationOwner:
     """WHO a hydration belongs to — values only (§10.3).
@@ -256,41 +280,35 @@ class HydrationOwner:
     source: str = ""
     epoch: int = 0
 
-    @staticmethod
-    def _epoch(value) -> int:
-        """A POSITIVE INTEGER epoch, or ``0`` for anything else.  Never raises.
+    def __post_init__(self):
+        """§12.6 A.1 — THE one construction contract.
 
-        Deliberately strict (§11.1.1): a bool is not an epoch, and neither is
-        something that merely coerces to one.  A completion arriving with a
-        malformed epoch has to become an inert refusal, not an exception
-        crossing a Qt signal and not a value invented by ``int()``.
+        Normalization lives in the dataclass construction path itself, so a
+        caller cannot choose which invariant the value object enforces by
+        picking a constructor.  ``of()`` delegates here; it is not a second
+        contract.  Any input yields either a complete canonical owner or the
+        inert empty one, and nothing raises — the decode runs on a completion
+        delivered through a Qt signal, where an exception would escape into the
+        render path instead of dropping one stale completion.
         """
-        if isinstance(value, bool) or not isinstance(value, int):
-            return 0
-        return value if value > 0 else 0
+        object.__setattr__(self, "context_token", _owner_text(self.context_token))
+        object.__setattr__(self, "scan_key", _owner_text(self.scan_key))
+        object.__setattr__(self, "source", _owner_text(self.source))
+        object.__setattr__(self, "epoch", _owner_epoch(self.epoch))
 
     @classmethod
     def of(cls, context_token="", scan_key="", source="", epoch=0):
-        """Build an owner TOTALLY — any input yields an owner, never a raise."""
-        def _text(value):
-            if value is None or isinstance(value, (bytes, bytearray)):
-                return ""
-            try:
-                return str(value) if value else ""
-            except Exception:
-                return ""
-
-        return cls(_text(context_token), _text(scan_key), _text(source),
-                   cls._epoch(epoch))
+        """Delegates to the ONE normalizing construction path."""
+        return cls(context_token, scan_key, source, epoch)
 
     @property
     def qualified(self) -> bool:
-        """Whether this owner is COMPLETE (§11.1.1).
+        """Whether this owner is COMPLETE (§11.1.1, §12.6 A.3).
 
-        All four fields, or none of the authority.  The parent asked only for a
-        token and a scan key, so an empty source or a zero epoch read as a
-        wildcard — a carried field is not an authority while its absence is
-        treated as permission.
+        All four fields, or none of the authority.  Reads only ALREADY
+        NORMALIZED fields, so it is total: an epoch whose comparison or
+        truthiness raises was turned into ``0`` at construction and can never
+        reach this expression.
         """
         return bool(self.context_token and self.scan_key and self.source
                     and self.epoch > 0)
@@ -312,21 +330,39 @@ class HydrationRequest:
     label: object
     purpose: str
     generation: int
-    context_token: str
-    context_scan_key: str
-    context_source: str
+    #: §12.6 B.2 — the context's OWN projection, stored whole.  Four parallel
+    #: scalars meant the owner was RECONSTRUCTED at every hop, and each
+    #: reconstruction was another chance to pick a different source or a
+    #: different normalization rule.
+    owner: HydrationOwner
     stores: tuple
     commit_gate: object
-    epoch: int
 
     @property
-    def owner(self) -> HydrationOwner:
-        """The complete identity a completion must echo (§10.3)."""
-        return HydrationOwner.of(
-            context_token=self.context_token,
-            scan_key=self.context_scan_key,
-            source=self.context_source,
-            epoch=self.epoch)
+    def context_token(self) -> str:
+        return self.owner.context_token
+
+    @property
+    def context_scan_key(self) -> str:
+        return self.owner.scan_key
+
+    @property
+    def context_source(self) -> str:
+        return self.owner.source
+
+    @property
+    def epoch(self) -> int:
+        return self.owner.epoch
+
+    @property
+    def enqueueable(self) -> bool:
+        """Whether this request may reach the worker at all (§12.6 D).
+
+        An unresolvable owner produces a request that exists — so the caller
+        can diagnose it — but can never be enqueued or committed.
+        """
+        return bool(self.owner.qualified and self.stores
+                    and self.commit_gate is not None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,19 +376,31 @@ class DisplaySelection:
     """
 
     kind: ContextKind
-    context_token: str
-    scan_key: str
-    source_path: str
+    #: §12.6 B.4 — the context's OWN projection, stored whole.  The parent
+    #: copied token, key and source into separate fields, which let the
+    #: selection independently choose the admitted source over the current one.
+    owner: "HydrationOwner"
     display_generation: int
+
+    @property
+    def context_token(self) -> str:
+        return self.owner.context_token
+
+    @property
+    def scan_key(self) -> str:
+        return self.owner.scan_key
+
+    @property
+    def source_path(self) -> str:
+        """The CURRENT source this selection names (compatibility accessor)."""
+        return self.owner.source
 
     @classmethod
     def for_context(cls, context, display_generation: int) -> "DisplaySelection":
         """Stamp a selection naming *context* at an ALREADY-bumped generation."""
         return cls(
             kind=context.kind,
-            context_token=context.context_token,
-            scan_key=str(context.scan_key or ""),
-            source_path=str(context.source_path or ""),
+            owner=context.hydration_owner,
             display_generation=int(display_generation),
         )
 
@@ -468,19 +516,49 @@ class AcquisitionContext(_WriteOnceIdentity):
         """The source the display is currently scoped to within this run."""
         return self.current_source or self.source_path
 
-    def rescope_to(self, scan_key, source=None) -> None:
-        """Stamp the new sub-scan identity at a genuine scan boundary.
+    @property
+    def admitted_source(self) -> str:
+        """The immutable ACCEPTED source, kept for provenance (§12.6 B.5).
 
-        Key, SOURCE and commit epoch move TOGETHER (§11.2.2).  Advancing only
-        the key left the display comparing sources exactly — and comparing the
-        wrong value, because the member source never moved with the member.
-        A request minted against the previous member is qualified against an
-        identity the display has left, so its epoch is retired here too.
+        Deliberately a different name from :attr:`source`: reading "the source"
+        and getting the admitted root after a member transition is exactly the
+        mixed identity §12.2 found, so the two are no longer interchangeable.
         """
-        self.current_scan_key = str(scan_key or "")
-        if source:
-            self.current_source = str(source)
+        return self.source_path
+
+    @property
+    def hydration_owner(self) -> "HydrationOwner":
+        """THE production mint (§12.6 B.1) — one owner, from CURRENT identity."""
+        return HydrationOwner(self.context_token, self.scan_key, self.source,
+                              self.commit_epoch)
+
+    def rescope_to(self, scan_key, source) -> None:
+        """Replace the sub-scan identity with a COMPLETE pair (§12.6 C).
+
+        Both halves are required and validated BEFORE either is written, so the
+        invalid partial transition is not representable.  An optional
+        ``source`` meant omission could silently mean "reuse the previous one",
+        which is how a new key ended up paired with the previous member's
+        source; and a signal-only rescope could advance the key and the epoch
+        while the later, authoritative frame then saw a matching key and never
+        restamped.
+
+        A genuine same-source rescope passes the current source explicitly —
+        see :meth:`rescope_within_source`.
+        """
+        scan_key = str(scan_key or "")
+        source = str(source or "")
+        if not scan_key or not source:
+            raise DisplayContextError(
+                "a sub-scan boundary needs a complete (scan key, source) "
+                f"pair; got ({scan_key!r}, {source!r})")
+        self.current_scan_key = scan_key
+        self.current_source = source
         self.commit_gate.advance()
+
+    def rescope_within_source(self, scan_key) -> None:
+        """A boundary that genuinely keeps the current source, said out loud."""
+        self.rescope_to(scan_key, self.source)
 
     def adopt_record_store(self, store) -> None:
         """Adopt the streaming session's per-run record store."""
@@ -638,6 +716,16 @@ class BrowseContext(_WriteOnceIdentity):
     def source(self) -> str:
         """One resolution rule with the acquisition owner: the live source."""
         return self.requested_path
+
+    @property
+    def admitted_source(self) -> str:
+        return self.requested_path
+
+    @property
+    def hydration_owner(self) -> "HydrationOwner":
+        """THE production mint for a browse (§12.6 B.1)."""
+        return HydrationOwner(self.context_token, self.scan_key, self.source,
+                              self.commit_epoch)
 
     def adopt_load_request(self, request) -> None:
         """Retain the exact enqueued request (write-once)."""

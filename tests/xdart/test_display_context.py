@@ -147,7 +147,9 @@ def test_identity_fields_are_write_once_on_both_contexts():
             with pytest.raises(DisplayContextError):
                 setattr(context, name, object())
     # The declared MUTABLE lifetime fields still move, each through its owner.
-    acquisition.rescope_to("sub_b")
+    # §12.6 C.4 — a genuine SAME-SOURCE boundary says so explicitly; omission
+    # may not mean "reuse the previous source".
+    acquisition.rescope_within_source("sub_b")
     assert acquisition.scan_key == "sub_b"
     acquisition.adopt_record_store("store")
     assert acquisition.record_store == "store"
@@ -332,7 +334,7 @@ def test_acquisition_scan_key_tracks_the_live_sub_scan():
     acquisition = _acquisition()
     assert acquisition.current_scan_key == "run_a"
     assert acquisition.scan_key == "run_a"
-    acquisition.rescope_to("run_a_sub2")
+    acquisition.rescope_within_source("run_a_sub2")
     assert acquisition.scan_key == "run_a_sub2"
     assert acquisition.run_scan_key == "run_a", (
         "the run identity must survive a sub-scan boundary")

@@ -43,34 +43,19 @@ class _HydrationRequest:
     generation: int
     purpose: str
     consumer: ConsumerKind
-    #: X1 O-3 (c3): the display context this request was made UNDER, captured
-    #: at request time and echoed on completion.  A generation alone cannot
-    #: authorize a completion — two contexts can be at the same generation, and
-    #: a completion held across a context switch would then be admitted by the
-    #: owner it no longer belongs to.  Values only: two strings.
-    context_token: str = ""
-    context_scan_key: str = ""
+    #: §12.6 B.3 — the display context this request was made UNDER, stored and
+    #: echoed WHOLE.  A generation alone cannot authorize a completion (two
+    #: contexts can share one), and reconstructing the owner from scalars at
+    #: each hop is what let the source diverge between mint and comparison.
+    owner: HydrationOwner = HydrationOwner()
     #: c3R-b (§9.2.3): the EXACT stores this request lands in, resolved when it
     #: was made.  The worker must never ask a live provider where a request
     #: belongs — that is how a read made under a browse landed in the resumed
     #: run's store.
     stores: tuple = ()
-    #: The context's commit authority and the epoch this request was minted
-    #: under (§9.2.4).  Read is unlocked; the INSERT goes through the gate.
+    #: The context's commit authority (§9.2.4).  Read is unlocked; the INSERT
+    #: goes through the gate, at the epoch the owner carries.
     commit_gate: object = None
-    epoch: int = 0
-    #: The file identity the request was made against, so a completion can be
-    #: refused on source as well as on scan key.
-    context_source: str = ""
-
-    @property
-    def owner(self):
-        """The complete values-only identity this request belongs to (§10.3)."""
-        return HydrationOwner.of(
-            context_token=self.context_token,
-            scan_key=self.context_scan_key,
-            source=self.context_source,
-            epoch=self.epoch)
 
 
 class FrameHydrationWorker(Qt.QtCore.QThread):
@@ -137,13 +122,10 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
 
     @staticmethod
     def _token(label, generation, purpose, consumer, owner=None):
-        # §9.2.6 / §10.3: the COMPLETE owner is part of the identity — context
-        # token, scan key, SOURCE identity and epoch.  Without the context the
-        # same label at the same generation in two sub-scans collapsed to one
-        # request; without the source, two sub-scans of one container did.
-        owner = owner if owner is not None else HydrationOwner()
+        # §9.2.6 / §10.3 / §12.6 B.3: the COMPLETE owner IS part of the queue
+        # identity, used as it was minted rather than rebuilt from scalars.
         return (label, int(generation), str(purpose or "full"), consumer,
-                owner.as_tuple())
+                owner if owner is not None else HydrationOwner())
 
     def _discard_locked(self, request: _HydrationRequest) -> None:
         for label in request.labels:
@@ -187,7 +169,7 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
             self, label, generation: int, *, purpose: str = "full",
             consumer=ConsumerKind.PLOT_1D,
             supersede_reason=SupersedeReason.SELECTION,
-            context_token: str = "", context_scan_key: str = "",
+            owner=None, context_token: str = "", context_scan_key: str = "",
             stores=None, commit_gate=None, epoch: int = 0,
             context_source: str = "") -> None:
         """Enqueue a hydration request (non-blocking; returns immediately).
@@ -197,9 +179,12 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
         so admission can compare against the context that is selected THEN.
         """
         generation = int(generation)
-        context_token = str(context_token or "")
-        context_scan_key = str(context_scan_key or "")
-        context_source = str(context_source or "")
+        # §12.6 B.3: an owner supplied whole is carried unchanged.  The
+        # scalar keywords remain only for the tests and legacy callers that
+        # still speak them, and they are normalized by the SAME constructor.
+        if owner is None:
+            owner = HydrationOwner(context_token, context_scan_key,
+                                   context_source, epoch)
         # §9.2.3: resolve the target NOW.  Doing it in `run()` meant the store
         # was chosen after the display may already have moved on.
         if stores is None:
@@ -214,9 +199,6 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
             if generation > self._newest_gen:
                 self._newest_gen = generation
                 self._drain_stale_locked(supersede_reason)
-            owner = HydrationOwner.of(
-                context_token=context_token, scan_key=context_scan_key,
-                source=context_source, epoch=epoch)
             token = self._token(label, generation, purpose, consumer, owner)
             if token in self._queued:
                 browse_debug_log(
@@ -246,9 +228,7 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
             else:
                 self._queue.append(
                     _HydrationRequest((label,), generation, purpose, consumer,
-                                      context_token, context_scan_key,
-                                      stores, commit_gate, epoch,
-                                      context_source))
+                                      owner, stores, commit_gate))
             browse_debug_log(
                 logger,
                 "hydration_worker_enqueue",
@@ -278,7 +258,7 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
         if getattr(request, "commit_gate", None) is None:
             return {}
         return {"commit_gate": request.commit_gate,
-                "commit_epoch": request.epoch}
+                "commit_epoch": request.owner.epoch}
 
     def _hydrate_full(self, request, label, purpose: str) -> bool:
         hydrated = False

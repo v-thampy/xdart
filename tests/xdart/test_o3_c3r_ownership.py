@@ -526,15 +526,10 @@ def test_a_raising_owner_probe_refuses_every_reintegration_action(
 
 
 def _available_wranglers(widget):
-    """Every real wrangler entry this widget exposes (image and NeXus)."""
-    found, seen = [], set()
-    for name in ("wrangler",):
-        one = getattr(widget, name, None)
-        if one is not None and id(one) not in seen:
-            seen.add(id(one))
-            found.append(one)
-    for one in getattr(widget, "_wranglers", ()) or ():
-        if one is not None and id(one) not in seen:
-            seen.add(id(one))
-            found.append(one)
-    return found
+    """Every real wrangler entry, from the REAL production stack (§12.6 E.3).
+
+    The parent enumerated ``widget.wrangler`` and a nonexistent
+    ``widget._wranglers``, so it claimed image + NeXus coverage and drove
+    ``imageWrangler`` only.
+    """
+    return staticWidget._public_start_entries(widget)
