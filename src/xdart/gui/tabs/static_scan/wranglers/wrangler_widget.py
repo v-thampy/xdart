@@ -604,7 +604,7 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         self._admitted_run_configuration = None
 
         self.command_queue = Queue()
-        self.thread = wranglerThread(self.command_queue, self.scan_args, self.fname, self.file_lock, self)
+        self.thread = wranglerThread(self.command_queue, self.fname, self.file_lock, self)
         self.thread.finished.connect(self.finished.emit)
         self.thread.started.connect(self.started.emit)
         self.thread.sigUpdate.connect(self.sigUpdateData.emit)
@@ -1053,7 +1053,7 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
             self.thread.sigUpdateGI.disconnect(self.sigUpdateGI.emit)
         except (TypeError, RuntimeError):
             pass  # Signals were never connected or already disconnected
-        self.thread = wranglerThread(self.command_queue, self.scan_args, self.fname, self.file_lock, self)
+        self.thread = wranglerThread(self.command_queue, self.fname, self.file_lock, self)
         self.thread.finished.connect(self.finished.emit)
         self.thread.started.connect(self.started.emit)
         self.thread.sigUpdate.connect(self.sigUpdateData.emit)
@@ -1081,9 +1081,10 @@ class wranglerThread(Qt.QtCore.QThread):
         fname: str, path to data file.
         input_q: mp.Queue, queue for commands sent from parent
         signal_q: mp.Queue, queue for commands sent from process
-        scan_args: dict, used as **kwargs in scan initialization.
-            see LiveScan.
-    
+        run_configuration: the ONE accepted FrozenRunConfiguration for this
+            run, published by the wrapper at admission (with its generation
+            floor and the exact admitted object).
+
     methods:
         run: Called by start, main thread task.
     
@@ -1117,13 +1118,16 @@ class wranglerThread(Qt.QtCore.QThread):
     def LIVE_SAVE_INTERVAL(self, value: int) -> None:
         self._live_save_interval_override = int(value)
 
-    def __init__(self, command_queue, scan_args, fname, file_lock,
-                 parent=None):
+    def __init__(self, command_queue, fname, file_lock, parent=None):
         """command_queue: mp.Queue, queue for commands sent from parent
-        scan_args: dict, used as **kwargs in scan initialization.
-            see LiveScan.
         fname: str, path to data file.
         file_lock: mp.Condition, process safe lock for file access
+
+        R4-G: ``scan_args`` was retired from this signature.  The wrangler
+        WIDGET still owns a live ``scan_args`` slot -- populated from the
+        accepted frozen configuration at admission and read at the
+        readiness/metadata seam -- but it was constructed empty and handed
+        here before that ever happened, and no worker stored it.
         """
         super().__init__(parent)
         self.input_q = command_queue # thread queue

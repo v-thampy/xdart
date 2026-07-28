@@ -697,25 +697,19 @@ class imageWrangler(wranglerWidget):
         )
 
         # Setup thread
+        # R4-G: seventeen retired arguments no longer travel here.  Everything
+        # they used to mirror -- acquisition shape, source family, traversal,
+        # reader selection, output policy, GI geometry, live mode, worker cap --
+        # reaches the worker as the accepted FrozenRunConfiguration at
+        # admission, which is also the only value that is current at Run time
+        # rather than at widget-construction time.
         self.thread = imageThread(
             self.command_queue,
-            self.scan_args,
             self.file_lock,
             self.fname,
-            self.h5_dir,
             self.scan_name,
-            self.single_img,
             self.poni,
-            self.inp_type,
             self.img_file,
-            self.img_dir,
-            self.include_subdir,
-            self.img_ext,
-            self.series_average,
-            self.meta_ext,
-            self.file_filter,
-            self.mask_file,
-            self.write_mode,
             self.bg_type,
             self.bg_file,
             self.bg_dir,
@@ -724,16 +718,10 @@ class imageWrangler(wranglerWidget):
             self.bg_file_filter,
             self.bg_scale,
             self.bg_norm_channel,
-            self.gi,
-            self.incidence_motor,
-            self.sample_orientation,
-            self.tilt_angle,
             self.gi_mode_1d,
             self.gi_mode_2d,
             self.command,
             self.scan,
-            live_mode=self.live_mode,
-            max_cores=self.ui.maxCoresSpinBox.value(),
             parent=self,
         )
 

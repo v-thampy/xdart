@@ -250,14 +250,15 @@ def _batch_dir_thread(watch_dir, out_dir):
     from xrd_tools.core.containers import PONI
 
     scan = LiveScan("scan", data_file=str(out_dir / "scan.nxs"), static=True)
+    # R4-G: retired policy arguments removed; the watched directory and every
+    # other run policy arrive through `admitted_worker` below.
     worker = imageThread(
-        Queue(), {}, threading.RLock(), "",
-        str(out_dir), "scan", False,
+        Queue(), threading.RLock(), "",
+        "scan",
         PONI(dist=0.2, poni1=0.1, poni2=0.1, wavelength=1e-10),
-        "Image Directory", "", str(watch_dir), False, "nxs", False, None, "",
-        None, "Full", "None", "", "", None, "", "", 1.0, None,
-        False, None, 1, 0.0, "q_total", "qip_qoop", "start", scan,
-        live_mode=False, max_cores=1,
+        "",
+        "None", "", "", None, "", "", 1.0, None,
+        "q_total", "qip_qoop", "start", scan,
     )
     return admitted_worker(
         worker,

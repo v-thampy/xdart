@@ -323,12 +323,11 @@ def test_nexus_worker_run_refuses_absent_configuration_before_any_read(
     source = tmp_path / "raw.nxs"
     source.write_bytes(b"")
     scan = LiveScan("scan", data_file=str(out / "scan.nxs"), static=True)
+    # R4-G: mask + GI arguments retired from this signature (frozen-owned).
     thread = nexusThread(
-        Queue(), {}, threading.RLock(), str(out / "scan.nxs"),
+        Queue(), threading.RLock(), str(out / "scan.nxs"),
         str(source),
         PONI(dist=0.2, poni1=0.1, poni2=0.1, wavelength=1e-10),
-        None,
-        False, None, 1, 0.0,
         "q_total", "qip_qoop",
         "start", scan,
     )

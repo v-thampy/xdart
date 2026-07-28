@@ -79,29 +79,20 @@ def _make_thread(watch_dir, out_dir, *, img_ext="nxs", scan_name="scan",
     """A REAL imageThread watching *watch_dir*, writing into *out_dir*."""
     scan = LiveScan("scan", data_file=str(Path(out_dir) / "scan.nxs"),
                     static=True)
+    # R4-G: the retired policy arguments are gone.  The watched directory,
+    # recursion, extension, output mode and live mode reach the worker only
+    # through the accepted configuration admitted immediately below -- which
+    # is what production does and what this helper always meant to exercise.
     t = imageThread(
-        Queue(), {}, threading.RLock(), "",
-        str(out_dir),                # h5_dir
+        Queue(), threading.RLock(), "",
         scan_name,                   # scan_name
-        False,                       # single_img
         PONI(dist=0.2, poni1=0.1, poni2=0.1, wavelength=1e-10),
-        "Image Directory",           # inp_type
         str(img_file),               # img_file
-        str(watch_dir),              # img_dir
-        include_subdir,              # include_subdir
-        img_ext,                     # img_ext
-        False,                       # series_average
-        None,                        # meta_ext
-        "",                          # file_filter
-        None,                        # mask_file
-        "Full",                      # write_mode
         "None",                      # bg_type
         "", "", None, "", "",        # bg_*
         1.0, None,                   # bg_scale, bg_norm_channel
-        False, None, 1, 0.0,         # gi, th_mtr, sample_orientation, tilt
         "q_total", "qip_qoop",       # gi modes
         "start", scan,
-        live_mode=live_mode, max_cores=1,
     )
     # O-1a-W1A: a worker only runs on an ACCEPTED frozen configuration; the
     # output-safety guard fires inside initialize_scan, after that admission.
@@ -279,12 +270,11 @@ def test_single_file_nexus_wrangler_rejects_processed_cleanly(tmp_path):
     out = tmp_path / "out"
     out.mkdir()
     scan = LiveScan("scan", data_file=str(out / "scan.nxs"), static=True)
+    # R4-G: mask + GI arguments retired from this signature (frozen-owned).
     t = nexusThread(
-        Queue(), {}, threading.RLock(), str(out / "scan.nxs"),
+        Queue(), threading.RLock(), str(out / "scan.nxs"),
         str(proc),                       # nexus_file — the processed output
         PONI(dist=0.2, poni1=0.1, poni2=0.1, wavelength=1e-10),
-        None,                            # mask_file
-        False, None, 1, 0.0,             # gi, th_mtr, sample_orientation, tilt
         "q_total", "qip_qoop",           # gi modes
         "start", scan,
     )

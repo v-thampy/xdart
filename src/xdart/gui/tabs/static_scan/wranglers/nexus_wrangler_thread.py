@@ -370,11 +370,9 @@ _READ_CHUNK = 16
 # Save cadence inherited from wranglerThread.LIVE_SAVE_INTERVAL.
 # Subclass-level override would go here as ``LIVE_SAVE_INTERVAL = N``.
 
-# Default number of parallel integration workers when the GUI
-# doesn't expose a Cores spinbox to the NeXus wrangler (it currently
-# doesn't — wiring it up is a small UI follow-up).  Caller can set
-# ``self.max_cores`` before starting the thread to override.
-_DEFAULT_MAX_CORES = 4
+# R4-G: the module-level `_DEFAULT_MAX_CORES` fallback is gone along with the
+# worker-cached core count it used to backstop.  The parallel-integration cap
+# is `frozen.max_cores` -- one owner, and no default that can drift from it.
 
 
 class nexusThread(wranglerThread):
@@ -392,24 +390,26 @@ class nexusThread(wranglerThread):
     def __init__(
             self,
             command_queue,
-            scan_args,
             file_lock,
             fname,
             nexus_file,
             poni,
-            mask_file,
-            gi,
-            th_mtr,
-            sample_orientation,
-            tilt_angle,
             gi_mode_1d,
             gi_mode_2d,
             command,
             scan,
             entry='entry',
             parent=None):
+        """R4-G: ``scan_args``, ``mask_file``, ``gi``, ``th_mtr``,
+        ``sample_orientation`` and ``tilt_angle`` were retired here.
 
-        super().__init__(command_queue, scan_args, fname, file_lock, parent)
+        W-1R-D deleted the worker slots they seeded (review §44.2); the mask
+        and the GI geometry are read from the accepted
+        ``FrozenRunConfiguration``, and ``scan_args`` was an always-empty
+        construction-time snapshot the base class never stored.
+        """
+
+        super().__init__(command_queue, fname, file_lock, parent)
 
         self.nexus_file = nexus_file
         self.poni = poni

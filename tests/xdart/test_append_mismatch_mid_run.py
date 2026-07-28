@@ -122,25 +122,17 @@ def _real_append_thread(tmp_path):
         bai_2d_args=dict(CURRENT_2D_ARGS["bai_2d_args"]),
     )
 
+    # R4-G: the retired policy arguments (source shape/family/traversal,
+    # output mode, GI geometry, live mode, worker cap) are gone from this
+    # signature -- the accepted FrozenRunConfiguration below is what the run
+    # executes on, exactly as in production.
     thread = imageThread(
         Queue(),                     # command_queue
-        {},                          # scan_args
         threading.RLock(),           # file_lock
         "",                          # fname
-        str(out),                    # h5_dir
         "scan",                      # scan_name
-        False,                       # single_img
         PONI(dist=0.2, poni1=0.1, poni2=0.1, wavelength=1e-10),
-        "Image Series",              # inp_type
         str(raw),                    # img_file
-        str(tmp_path),               # img_dir
-        False,                       # include_subdir
-        "tif",                       # img_ext
-        False,                       # series_average
-        None,                        # meta_ext
-        "",                          # file_filter
-        None,                        # mask_file
-        "Append",                    # write_mode
         "None",                      # bg_type
         "",                          # bg_file
         "",                          # bg_dir
@@ -149,16 +141,10 @@ def _real_append_thread(tmp_path):
         "",                          # bg_file_filter
         1.0,                         # bg_scale
         None,                        # bg_norm_channel
-        False,                       # gi
-        None,                        # th_mtr
-        1,                           # sample_orientation
-        0.0,                         # tilt_angle
         "q_total",                   # gi_mode_1d
         "qip_qoop",                  # gi_mode_2d
         "start",                     # command
         current_scan,                # scan
-        live_mode=False,
-        max_cores=1,
     )
     # O-1a-W1A: the accepted run configuration IS the "current" side of the
     # mid-run Append comparison.  Frozen through the production owner with this

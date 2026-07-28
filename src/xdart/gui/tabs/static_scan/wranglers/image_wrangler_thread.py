@@ -611,19 +611,18 @@ class imageThread(wranglerThread):
         file_lock: mp.Condition, process safe lock for file access
         scan_name: str, name of current scan
         fname: str, full path to data file.
-        h5_dir: str, data file directory.
         img_file: str, path to image file
-        img_dir: str, path to image directory
-        img_ext : str, extension of image file
-        series_average : bool, flag to average over series
-        meta_ext : str, extension of metadata file
         poni_dict: str, Poni File name
         detector: str, Detector name
         input_q: mp.Queue, queue for commands sent from parent
         signal_q: mp.Queue, queue for commands sent from process
-        scan_args: dict, used as **kwargs in scan initialization.
-            see LiveScan.
         command: command passed to start, stop etc.
+        run_configuration: the ONE accepted FrozenRunConfiguration, published
+            by the wrapper at admission.  Acquisition shape, source family,
+            traversal, reader selection, output policy, GI geometry, live mode
+            and the worker cap are read from it and from nowhere else -- the
+            constructor parameters that once mirrored them were retired at
+            R4-G (see __init__).
 
     signals:
         showLabel: str, sends out text to be used in specLabel
@@ -655,23 +654,11 @@ class imageThread(wranglerThread):
     def __init__(
             self,
             command_queue,
-            scan_args,
             file_lock,
             fname,
-            h5_dir,
             scan_name,
-            single_img,
             poni,
-            inp_type,
             img_file,
-            img_dir,
-            include_subdir,
-            img_ext,
-            series_average,
-            meta_ext,
-            file_filter,
-            mask_file,
-            write_mode,
             bg_type,
             bg_file,
             bg_dir,
@@ -680,19 +667,31 @@ class imageThread(wranglerThread):
             bg_file_filter,
             bg_scale,
             bg_norm_channel,
-            gi,
-            th_mtr,
-            sample_orientation,
-            tilt_angle,
             gi_mode_1d,
             gi_mode_2d,
             command,
             scan,
-            live_mode=False,
-            max_cores=1,
             parent=None):
+        """R4-G: seventeen retired parameters were removed here.
 
-        super().__init__(command_queue, scan_args, fname, file_lock, parent)
+        W-1R-D deleted every worker SLOT they used to seed (review §44.2), so
+        from that commit on they were accepted and dropped on the floor.  What
+        each one used to configure -- acquisition shape, source family,
+        traversal, reader selection, output policy, GI geometry, live mode and
+        the worker cap -- is read from the accepted ``FrozenRunConfiguration``
+        and from nowhere else.  ``scan_args`` went with them: it was an
+        always-EMPTY snapshot at construction time (the wrangler populates its
+        own slot later, at admission), threaded into a parameter the base
+        class never stored.
+
+        Retired: ``scan_args``, ``h5_dir``, ``single_img``, ``inp_type``,
+        ``img_dir``, ``include_subdir``, ``img_ext``, ``series_average``,
+        ``meta_ext``, ``file_filter``, ``mask_file``, ``write_mode``, ``gi``,
+        ``th_mtr``, ``sample_orientation``, ``tilt_angle``, ``live_mode``,
+        ``max_cores``.
+        """
+
+        super().__init__(command_queue, fname, file_lock, parent)
 
         # Pause: the LiveScan currently being processed (a local in
         # process_scan), stashed so _enter_pause's serial branch can flush it.

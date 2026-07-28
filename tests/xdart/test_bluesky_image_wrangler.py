@@ -524,25 +524,16 @@ def _real_dir_watch_thread(watch_dir, out_dir):
     from xdart.modules.live import LiveScan
 
     scan = LiveScan("scan", data_file=str(out_dir / "scan.nxs"), static=True)
+    # R4-G: retired policy arguments removed.  The watched directory, the
+    # container extension and live mode now reach the worker only through the
+    # accepted configuration admitted below.
     worker = imageThread(
         Queue(),                     # command_queue
-        {},                          # scan_args
         threading.RLock(),           # file_lock
         "",                          # fname
-        str(out_dir),                # h5_dir
         "scan",                      # scan_name
-        False,                       # single_img
         PONI(dist=0.2, poni1=0.1, poni2=0.1, wavelength=1e-10),
-        "Image Directory",           # inp_type
         "",                          # img_file
-        str(watch_dir),              # img_dir
-        False,                       # include_subdir
-        "nxs",                       # img_ext
-        False,                       # series_average
-        None,                        # meta_ext
-        "",                          # file_filter
-        None,                        # mask_file
-        "Full",                      # write_mode
         "None",                      # bg_type
         "",                          # bg_file
         "",                          # bg_dir
@@ -551,16 +542,10 @@ def _real_dir_watch_thread(watch_dir, out_dir):
         "",                          # bg_file_filter
         1.0,                         # bg_scale
         None,                        # bg_norm_channel
-        False,                       # gi
-        None,                        # th_mtr
-        1,                           # sample_orientation
-        0.0,                         # tilt_angle
         "q_total",                   # gi_mode_1d
         "qip_qoop",                  # gi_mode_2d
         "start",                     # command
         scan,                        # scan
-        live_mode=True,
-        max_cores=1,
     )
     # O-1a-W1R-D2: worker execution consumes the ACCEPTED configuration passed
     # explicitly, so a harness driving it must admit one that names the same

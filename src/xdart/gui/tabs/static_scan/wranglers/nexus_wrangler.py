@@ -189,10 +189,10 @@ class nexusWrangler(wranglerWidget):
 
         # Cores spinbox — controls how many worker threads the
         # nexusThread spawns for parallel batch integration.  Same
-        # convention as imageWrangler.maxCoresSpinBox.  Pushed down
-        # to ``self.thread.max_cores`` before each scan starts (see
-        # :meth:`start`).  Default = min(CPU-1, 4) so we don't
-        # saturate a busy laptop by default.
+        # convention as imageWrangler.maxCoresSpinBox.  R4-G: its value
+        # reaches the worker as ``frozen.max_cores`` at admission, not as a
+        # ``self.thread.max_cores`` push-down (that slot is gone).
+        # Default = min(CPU-1, 4) so we don't saturate a busy laptop.
         self.coresLabel = QtWidgets.QLabel('Cores:')
         self.maxCoresSpinBox = QtWidgets.QSpinBox()
         self.maxCoresSpinBox.setMinimum(1)
@@ -272,18 +272,15 @@ class nexusWrangler(wranglerWidget):
         self._install_group_toggles(self.tree)
 
         # Setup thread
+        # R4-G: the mask and GI arguments no longer travel here -- the worker
+        # reads both from the accepted FrozenRunConfiguration, and `scan_args`
+        # was an empty construction-time snapshot no worker ever stored.
         self.thread = nexusThread(
             self.command_queue,
-            self.scan_args,
             self.file_lock,
             self.fname,
             self.nexus_file,
             self.poni,
-            self.mask_file,
-            self.gi,
-            self.incidence_motor,
-            self.sample_orientation,
-            self.tilt_angle,
             self.gi_mode_1d,
             self.gi_mode_2d,
             self.command,
@@ -694,18 +691,15 @@ class nexusWrangler(wranglerWidget):
                 _old.deleteLater()
             except Exception:
                 logger.debug("old nexusThread release failed", exc_info=True)
+        # R4-G: the mask and GI arguments no longer travel here -- the worker
+        # reads both from the accepted FrozenRunConfiguration, and `scan_args`
+        # was an empty construction-time snapshot no worker ever stored.
         self.thread = nexusThread(
             self.command_queue,
-            self.scan_args,
             self.file_lock,
             self.fname,
             self.nexus_file,
             self.poni,
-            self.mask_file,
-            self.gi,
-            self.incidence_motor,
-            self.sample_orientation,
-            self.tilt_angle,
             self.gi_mode_1d,
             self.gi_mode_2d,
             self.command,
@@ -817,9 +811,6 @@ class nexusWrangler(wranglerWidget):
         self._frozen_setup_pending = True
         self.command = 'start'
         self.thread.command = 'start'
-        # Push the current Cores selection into the worker thread.
-        # The thread caches it as ``self.max_cores`` and uses it when
-        # building the ThreadPoolExecutor for parallel integration.
         # Re-sync processing-mode flags onto scan + thread so a
         # stale ``thread`` instance (recreated in :meth:`setup` since
         # the last mode-change signal) sees the latest selection.

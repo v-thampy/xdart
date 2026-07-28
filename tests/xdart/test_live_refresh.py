@@ -3018,7 +3018,7 @@ def test_wrangler_thread_reuses_reduction_session_by_key():
             self.finished = True
             return None
 
-    thread = wranglerThread(Queue(), {}, "scan.nxs", None)
+    thread = wranglerThread(Queue(), "scan.nxs", None)
     first = thread._get_reduction_session(("scan", 4), _Session)
     second = thread._get_reduction_session(("scan", 4), _Session)
     third = thread._get_reduction_session(("scan", 2), _Session)
@@ -9924,7 +9924,7 @@ def test_xye_flush_announces_first_durable_file_once_per_run(tmp_path):
     """The browser edge must follow the write and stay O(scans), not O(frames)."""
     from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
 
-    thread = wranglerThread(Queue(), {}, str(tmp_path / "unused.nxs"), None)
+    thread = wranglerThread(Queue(), str(tmp_path / "unused.nxs"), None)
     output_root = tmp_path / "processed"
     scan = SimpleNamespace(
         name="last_scan",
