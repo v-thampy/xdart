@@ -40,6 +40,7 @@ Performance shape (post-P3A refactor 2026-05-13):
 import logging
 import os
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import NamedTuple
 
@@ -208,21 +209,18 @@ class PreparedNexusExecution:
         return frozen is self.frozen
 
     def close(self) -> None:
-        """Close the owned raw stack exactly once.  Idempotent by contract.
+        """Close the raw stack exactly once, retaining failed cleanup.
 
         §17.8 item 3: every success, typed refusal, exception, Stop and Close
         path routes here, so the proved HDF5 handle cannot outlive the run.
         """
         if self._closed:
             return
-        self._closed = True
         stack = self.stack
-        if stack is None:
-            return
-        try:
+        if stack is not None:
             stack.close()
-        except Exception:                              # noqa: BLE001
-            logger.debug("prepared stack close failed", exc_info=True)
+            self.stack = None
+        self._closed = True
 
 
 # How many frames to bulk-read from the source HDF5 per iteration.
@@ -1031,7 +1029,6 @@ class nexusThread(wranglerThread):
         they sit in the buffer.)
         """
         prepared = getattr(self, "_execution", None)
-        self._execution = None
         if prepared is not None:
             if (getattr(prepared, "xye_withheld_idxs", None)
                     or getattr(prepared, "xye_tail_pending", None)):
@@ -1046,6 +1043,7 @@ class nexusThread(wranglerThread):
                             'their released envelope; they were never '
                             'published (run ended PENDING)', dropped)
             prepared.close()
+            self._execution = None
 
     def _project_gi_modes_onto_display_scan(self, frozen):
         """Backward GI-mode write onto the mutable DISPLAY scan (retained).
@@ -1185,7 +1183,10 @@ class nexusThread(wranglerThread):
         # §16.4: the raw stack was PROVED by the preparation owner before any
         # output ownership became destructive; this is that exact resource, not
         # a second open.  A processed/frameless/dangling source refused there.
-        with ds_cm as ds:
+        # The prepared envelope is the sole lifetime owner.  Scope the body
+        # without invoking the stack context manager's close; exact release
+        # happens once in ``_release_execution`` and remains retryable.
+        with nullcontext(ds_cm) as ds:
             nframes = ds.shape[0]
             n_segments = ds.n_segments
             self.showLabel.emit(
@@ -1552,5 +1553,4 @@ class nexusThread(wranglerThread):
     # from the chunk loop every LIVE_SAVE_INTERVAL frames so the
     # on-disk file stays close to in-memory state even if the user
     # kills the process mid-scan.
-
 

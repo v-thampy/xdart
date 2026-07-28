@@ -551,13 +551,32 @@ class NexusImageStack:
 
     # ── Lifecycle / context manager ─────────────────────────────────────
     def close(self) -> None:
-        """Close the underlying ``h5py.File`` if still open."""
+        """Close every owned dataset ID and then the master file.
+
+        Resolving an :class:`h5py.ExternalLink` creates a dataset ID against
+        the target file.  Closing only the master leaves that target ID live
+        (and its raw data readable) while ``_dsets`` retains the object.
+        Each dataset ID is therefore closed independently, even when several
+        links resolve into the same target file.
+
+        Cleanup is retryable: already-closed IDs are skipped, while ``_dsets``
+        and ``_h5`` stay attached until their cleanup phase succeeds.
+        """
+        failure = None
+        for dataset in tuple(getattr(self, "_dsets", ())):
+            try:
+                if dataset.id.valid:
+                    dataset.id.close()
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            raise failure
+        self._dsets = []
+
         h5 = getattr(self, "_h5", None)
         if h5 is not None:
-            try:
-                h5.close()
-            except Exception:
-                pass
+            h5.close()
             self._h5 = None
 
     def __enter__(self) -> "NexusImageStack":
