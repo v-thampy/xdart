@@ -418,8 +418,20 @@ def test_the_worker_run_entry_reinitializes_its_cursors_from_the_frozen_object(
         nexusThread,
     )
 
+    h5py = pytest.importorskip("h5py")
+    import numpy as np
+
     wrangler = _select_nexus(widget)
-    src, out = _arm_nexus(wrangler, tmp_path, entry="entry/data")
+    src, out = _arm_nexus(wrangler, tmp_path, entry="entry")
+    # O-3N.R: the worker entry now PREFLIGHTS the real container (strict entry,
+    # collision, source shape) before handing over, so this row needs a real
+    # NeXus file rather than a placeholder byte string.
+    with h5py.File(src, "w") as handle:
+        group = handle.create_group("entry")
+        group.attrs["NX_class"] = "NXentry"
+        group.create_dataset(
+            "instrument/detector/data",
+            data=np.zeros((2, 8, 8), dtype=np.float32))
     _start_recorder(wrangler, monkeypatch)
     wrangler.start()
     thread = wrangler.thread
@@ -441,7 +453,7 @@ def test_the_worker_run_entry_reinitializes_its_cursors_from_the_frozen_object(
     assert at_handover, "the real worker entry never reached the reduction body"
     assert at_handover["uri"] == str(src), (
         "the worker opened the poisoned legacy source mirror")
-    assert at_handover["entry"] == "entry/data"
+    assert at_handover["entry"] == "entry"
     assert at_handover["fname"] == os.path.join(str(out), f"{src.stem}.nxs")
     assert at_handover["scan_name"] == src.stem
 
@@ -481,10 +493,12 @@ def test_one_nexus_identity_from_start_through_provenance_and_reload(
     assert provenance["source"]["entry"] == "entry/data"
     assert provenance["save_path"] == str(out)
 
-    # The GUI's ``sigUpdateFile`` hop is what points the display scan at the
-    # frozen-derived output; the worker's own contribution is ``thread.fname``,
-    # asserted against the frozen values above and here.
-    scan.data_file = thread.fname
+    # O-3N.R §15.5 R2: the manual ``scan.data_file = thread.fname`` that used to
+    # sit here HID §15.1 -- the worker never installed its own output, so the
+    # real writer targeted whatever the display scan pointed at.  The worker's
+    # ``_initialize_scan`` now owns the target, so this row drives the actual
+    # writer seam with no test-side repoint.
+    assert scan.data_file == thread.fname
     scan.save_to_nexus()
     stored = (read_provenance(thread.fname).get("config") or {}).get(
         "run_configuration")

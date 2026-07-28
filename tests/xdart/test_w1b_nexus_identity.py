@@ -679,6 +679,12 @@ JUSTIFIED_DISPLAY_SCAN_SURVIVORS = {
         "ALLOW_BACKWARD_DISPLAY_WRITE",
     ("nexus_wrangler_thread.py", "_initialize_scan", "source_base", "write"):
         "ALLOW_BACKWARD_DISPLAY_WRITE",
+    # O-3N.R §15.1: THE writer target.  Both saves and every XYE file resolve
+    # through ``scan.data_file``; until this write the only repoint was the
+    # ASYNCHRONOUS GUI ``sigUpdateFile`` chain, so a previous/default/browsed
+    # file could receive the run.  The value is the accepted frozen output.
+    ("nexus_wrangler_thread.py", "_initialize_scan", "data_file", "write"):
+        "FROZEN_RUN_OUTPUT_TARGET",
     ("nexus_wrangler_thread.py", "_initialize_scan", "<self.scan>", "read"):
         "JUSTIFIED_NON_CONFIGURATION_READ",
 }

@@ -241,19 +241,22 @@ def test_no_gui_thread_hdf5_entry_inspection_after_admission(
         widget, tmp_path, monkeypatch):
     """§15.4 item 3: `_emit_gi_motor_options()` used to reread Entry and open
     the container synchronously on the GUI thread inside `setup()`."""
-    import xdart.gui.tabs.static_scan.wranglers.nexus_wrangler as nw
+    import xrd_tools.io.nexus as nexus_io
 
     wrangler = _select_nexus(widget)
     _arm_real(wrangler, tmp_path)
     _start_recorder(wrangler, monkeypatch)
     opened = []
-    monkeypatch.setattr(nw, "read_nexus",
-                        lambda *a, **k: opened.append(a) or (_ for _ in ()).throw(
-                            AssertionError("GUI-thread HDF5 read after admission")))
+    original = nexus_io.read_nexus
+    monkeypatch.setattr(
+        nexus_io, "read_nexus",
+        lambda *a, **k: (opened.append(a), original(*a, **k))[1])
 
     wrangler.start()
 
-    assert opened == []
+    assert opened == [], (
+        "setup() still inspected the container on the GUI thread after "
+        "admission")
 
 
 def test_the_execution_target_carries_the_accepted_output_mode(
@@ -282,11 +285,14 @@ def test_overwrite_replaces_a_prior_same_stem_result(
     widget.controls.set_write_mode("Overwrite")
     src, out, thread = _started(wrangler, tmp_path, monkeypatch)
     frozen = thread.run_configuration
-    scan = thread._initialize_scan(Path(frozen.source.uri).stem)
-    stale = Path(scan.data_file)
+    # A prior result already occupies this run's target, from a DIFFERENT
+    # identity.  Overwrite must replace it at the run's first writer action --
+    # which is inside the worker's own _initialize_scan, not a test call.
+    stale = out / f"{Path(frozen.source.uri).stem}.nxs"
     stale.write_bytes(b"not a real nxs")
 
-    thread._prepare_output_for_run(frozen, scan)
+    scan = thread._initialize_scan(Path(frozen.source.uri).stem)
+    assert not stale.exists(), "Overwrite did not replace the prior result"
     scan.save_to_nexus()
 
     stored = (read_provenance(str(stale)).get("config") or {}).get(
