@@ -168,7 +168,8 @@ class PreparedNexusExecution:
 
     __slots__ = ("frozen", "target", "stack", "scan_metadata", "scan", "poni",
                  "output_committed", "target_replaced", "replacement_backup",
-                 "xye_tail_pending", "xye_withheld_idxs", "_closed")
+                 "commit_leftover_backup", "xye_tail_pending",
+                 "xye_withheld_idxs", "_closed")
 
     def __init__(self, frozen, target, stack=None, scan_metadata=None):
         self.frozen = frozen
@@ -186,6 +187,13 @@ class PreparedNexusExecution:
         #: A later writer attempt must first complete this rollback; it may
         #: never delete the backup merely to reuse the suffix.
         self.replacement_backup = None
+        #: Panel finding R3-F2: a backup RESOLVED by a successful commit whose
+        #: unlink failed (transient reader/AV/NFS lock).  Disposable -- and the
+        #: envelope's fact to finish: each later successful commit retries the
+        #: removal, and a leftover still present at run end is surfaced
+        #: visibly.  Without this, one transient lock strands a suffix that
+        #: permanently refuses every later Overwrite run.
+        self.commit_leftover_backup = None
         #: ``None`` until the stale XYE set is discovered (once, before this run
         #: writes); then the list of artifacts still awaiting deletion.
         self.xye_tail_pending = None
@@ -676,10 +684,19 @@ class nexusThread(wranglerThread):
                 if not target.exists():
                     return None
                 if backup.exists():
-                    raise OSError(
+                    message = (
                         f"an unresolved prior-result backup occupies "
                         f"{backup}; refusing to destroy it to stage a new "
                         f"replacement — restore or remove it first")
+                    # Visible as well as raised: the refusal reaches the
+                    # operator on the label even though the raise ends the
+                    # run through the untyped writer-error path.
+                    try:
+                        self.showLabel.emit(f"Run refused: {message}")
+                    except Exception:
+                        logger.debug("showLabel emit failed for staging "
+                                     "refusal", exc_info=True)
+                    raise OSError(message)
                 os.replace(target, backup)
             finally:
                 pool.resume(str(target))
@@ -737,10 +754,30 @@ class nexusThread(wranglerThread):
                     '[NEXUS] Overwrite: replaced %s at the first successful '
                     'writer action', scan.data_file)
             prepared.target_replaced = True
+        # Panel finding R3-F2: a leftover from an EARLIER successful commit of
+        # this run is disposable -- retry its removal at each later commit so
+        # a transient lock does not strand the staging suffix (which a future
+        # run's envelope could not distinguish from an unresolved rollback and
+        # would refuse over).
+        leftover = prepared.commit_leftover_backup
+        if leftover is not None:
+            try:
+                leftover.unlink()
+            except FileNotFoundError:
+                prepared.commit_leftover_backup = None
+            except OSError:
+                logger.warning(
+                    '[NEXUS] the superseded backup is still locked: %s',
+                    leftover, exc_info=True)
+            else:
+                prepared.commit_leftover_backup = None
+                logger.info('[NEXUS] removed the previously locked superseded '
+                            'backup %s', leftover)
         if backup is not None:
             try:
                 backup.unlink()
             except OSError:
+                prepared.commit_leftover_backup = backup
                 logger.warning(
                     '[NEXUS] the replaced prior target could not be removed: '
                     '%s', backup, exc_info=True)
@@ -880,6 +917,21 @@ class nexusThread(wranglerThread):
 
         Returns ``True`` when this run's XYE output is complete and clean.
         """
+        # §16.4 applied to the XYE half (panel finding R3-F1): a run that
+        # published NOTHING has no XYE stake, and the destructive stale sweep
+        # may not run decoupled from publication.  A discovered tail means a
+        # publishing-loop flush already ran; withheld indices or a non-empty
+        # buffer mean this run has output to land.  Otherwise — Stop before
+        # the first chunk, a failed GI freeze scout — the prior run's XYE
+        # files stay untouched, exactly as the ``.nxs`` half already behaves
+        # (``_final_save_to_nexus`` no-ops on zero processed frames).
+        stake = (prepared.xye_tail_pending is not None
+                 or bool(prepared.xye_withheld_idxs))
+        if not stake:
+            with self._xye_lock:
+                stake = bool(self._xye_buffer)
+        if not stake:
+            return True
         self._flush_xye_buffer(scan, published_idxs=set())
         pending = list(prepared.xye_tail_pending or ())
         if not pending:
@@ -970,10 +1022,29 @@ class nexusThread(wranglerThread):
         Every terminal path -- success, typed refusal, exception, Stop and
         Close -- routes here, so a proved raw-stack handle cannot outlive its
         run and the worker returns to idle.
+
+        Panel finding R3-F3: WITHHELD XYE entries die with their envelope.
+        Once the run that withheld them is over they can never publish under
+        their own identity -- a later run on the same worker would drain them
+        under ITS published-index filter, writing another run's data into its
+        filenames.  (They also pin their integration payloads for as long as
+        they sit in the buffer.)
         """
         prepared = getattr(self, "_execution", None)
         self._execution = None
         if prepared is not None:
+            if (getattr(prepared, "xye_withheld_idxs", None)
+                    or getattr(prepared, "xye_tail_pending", None)):
+                lock = getattr(self, "_xye_lock", None)
+                if lock is not None:
+                    with lock:
+                        dropped = len(self._xye_buffer)
+                        self._xye_buffer = []
+                    if dropped:
+                        logger.warning(
+                            '[NEXUS] dropped %d withheld XYE entrie(s) with '
+                            'their released envelope; they were never '
+                            'published (run ended PENDING)', dropped)
             prepared.close()
 
     def _project_gi_modes_onto_display_scan(self, frozen):
@@ -1318,6 +1389,20 @@ class nexusThread(wranglerThread):
             return
 
         self.showLabel.emit(f'Done — {files_processed} frames processed')
+        # Panel finding R3-F2, visibility half: a superseded backup the
+        # commits could not remove is surfaced NOW, on the visible label --
+        # not discovered at the next run's unexplained staging refusal.
+        leftover = prepared.commit_leftover_backup
+        if leftover is not None:
+            message = (f'Done, with one leftover: the superseded backup '
+                       f'{leftover.name} could not be removed and will block '
+                       f'the next Overwrite run — remove it by hand.')
+            logger.error('[NEXUS] %s (%s)', message, leftover)
+            try:
+                self.showLabel.emit(message)
+            except Exception:
+                logger.debug("showLabel emit failed for leftover backup",
+                             exc_info=True)
         logger.info(
             'NeXus total time: %.2fs, %d frames', time.time() - t0,
             files_processed,
