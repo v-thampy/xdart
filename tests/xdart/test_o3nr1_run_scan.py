@@ -323,3 +323,31 @@ def test_no_o3n_row_assigns_scan_data_file_by_hand():
                     offenders.append(f"{name}:{node.lineno}")
     assert offenders == [], (
         f"a test-side `.data_file =` assignment reappeared: {offenders}")
+
+
+def test_gui_admission_asks_no_filesystem_or_hdf5_questions():
+    """§16.6, as a bounded fact about the production tree (rule 9).
+
+    GUI admission owns pure shape/value validation only.  Filesystem, link and
+    HDF5 facts belong to the worker: on a beamline network path a "cheap" stat
+    is not cheap, and a refusal that needs I/O must not run on the GUI thread.
+    """
+    import inspect
+    import textwrap
+
+    from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler import (
+        nexusWrangler,
+    )
+
+    tree = ast.parse(textwrap.dedent(
+        inspect.getsource(nexusWrangler._validate_admissible_source)))
+    body = tree.body[0].body
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)):
+        body = body[1:]                      # the docstring EXPLAINS the rule
+    source = "\n".join(ast.unparse(node) for node in body)
+    forbidden = ("is_file(", "is_dir(", "exists(", "os.stat", "h5py",
+                 "check_output_not_source", "open_nexus_image_stack")
+    found = [token for token in forbidden if token in source]
+    assert found == [], (
+        f"GUI admission asks filesystem/HDF5 questions: {found}")
