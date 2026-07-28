@@ -33,6 +33,10 @@ and the public/direct execution outcome; no private latch names):
 7b  a transiently blocked tail publishes the withheld XYE at run end  (§19.4)
 8   a failed-rollback retry never destroys the durable prior          (§19.3)
 9   an unowned .xdart-replacing artifact is refused, not destroyed    (§19.3)
+10  a zero-publication run never sweeps the prior XYE tail       (panel F1)
+11  a commit-resolved leftover backup is retried at the next commit (panel F2)
+12  a stuck leftover backup is surfaced visibly at run end       (panel F2)
+13  withheld XYE entries die with their envelope                 (panel F3)
 
 Promotion provenance: rows 1/3/4 are the preserved reviewer rows from
 ``test_codex_o3nr2_single_source_handle.py`` and rows 6/8 the preserved rows
@@ -123,6 +127,40 @@ def _arm_pilatus(wrangler, tmp_path):
     return src, out
 
 
+def _started_with_motors(wrangler, tmp_path, monkeypatch):
+    """An admitted run whose ACCEPTED container carries a real motor column.
+
+    O-3N.R.3-3 oracle repair (adversarial-panel finding R3-F8): with the
+    standard motorless fixture, the promoted replacement-metadata assertion
+    was vacuously true — ``angles`` was always empty.  The preserved reviewer
+    rows observed the motor VALUE; this fixture makes that observation
+    load-bearing again: the accepted ``halpha`` is [5.0, 6.0], the replacement
+    writes 73.0.
+    """
+    src = tmp_path / "acq-motors.nxs"
+    with h5py.File(src, "w") as handle:
+        group = handle.create_group("entry")
+        group.attrs["NX_class"] = "NXentry"
+        detector = group.create_group("instrument/detector")
+        detector.attrs["NX_class"] = "NXdetector"
+        detector.create_dataset(
+            "data", data=np.arange(2 * 8 * 8, dtype=np.float32).reshape(2, 8, 8))
+        scan_data = group.create_group("scan_data")
+        scan_data.create_dataset("halpha", data=np.asarray([5.0, 6.0]))
+    out = tmp_path / "out"
+    out.mkdir(exist_ok=True)
+    wrangler.parameters.child("Calibration", "poni_file").setValue(
+        _write_poni(tmp_path / "cal.poni"))
+    wrangler.parameters.child("NeXus File", "nexus_file").setValue(str(src))
+    wrangler.parameters.child("NeXus File", "entry").setValue("entry")
+    wrangler.parameters.child("Output", "h5_dir").setValue(str(out))
+    wrangler.parameters.child("Project", "project_folder").setValue(
+        str(tmp_path))
+    _start_recorder(wrangler, monkeypatch)
+    wrangler.start()
+    return src, out, wrangler.thread
+
+
 # --------------------------------------------------------------------------- #
 # 1/2 — §19.1: raw frames and scan metadata are ONE accepted resource
 # --------------------------------------------------------------------------- #
@@ -161,11 +199,13 @@ def test_nothing_reopens_the_accepted_pathname_after_preparation(
 
     The §19.1 measured facts, asserted with corrected polarity: the raw stack
     stays bound to the accepted inode, no later open re-resolves the accepted
-    pathname, and the execution's scan metadata never carries the replacement
-    file's motor values.
+    pathname, and the execution's scan metadata carries the ACCEPTED motor
+    values — never the replacement file's.  The accepted container carries a
+    real ``halpha`` column so the motor-value observation is load-bearing
+    (panel finding R3-F8; the preserved reviewer rows measured this value).
     """
     wrangler = _select_nexus(widget)
-    source, _out, thread = _started(wrangler, tmp_path, monkeypatch)
+    source, _out, thread = _started_with_motors(wrangler, tmp_path, monkeypatch)
     frozen = thread.run_configuration
     prepared = nexusThread._prepare_execution(thread, frozen)
     accepted_raw = float(np.asarray(prepared.stack[0]).ravel()[1])
@@ -187,8 +227,12 @@ def test_nothing_reopens_the_accepted_pathname_after_preparation(
         assert float(np.asarray(prepared.stack[0]).ravel()[1]) == accepted_raw
         assert accepted_raw != 91.0
         meta = prepared.scan_metadata
-        angles = dict(getattr(meta, "angles", {}) or {}) if meta else {}
-        assert all(73.0 not in np.asarray(v).ravel() for v in angles.values()), (
+        assert meta is not None
+        halpha = np.asarray(meta.angles["halpha"]).ravel().tolist()
+        assert halpha == [5.0, 6.0], (
+            f"scan metadata does not carry the accepted motor values: {halpha}")
+        assert all(73.0 not in np.asarray(v).ravel()
+                   for v in meta.angles.values()), (
             "scan metadata came from the replacement file while raw pixels "
             "remained bound to the prepared source handle")
     finally:
@@ -518,3 +562,139 @@ def test_an_unowned_replacing_artifact_is_refused_not_destroyed(
         "the unowned backup was destroyed to reuse the staging suffix")
     assert target.read_bytes() == b"current prior"
     assert prepared.target_replaced is False
+
+
+# --------------------------------------------------------------------------- #
+# 10-13 — O-3N.R.3-3 correction rows (adversarial-panel findings R3-F1/F2/F3)
+# --------------------------------------------------------------------------- #
+
+def test_a_zero_publication_run_never_sweeps_the_prior_xye_tail(
+        widget, tmp_path, monkeypatch):
+    """§16.4 applied to the XYE half (panel finding R3-F1, P1).
+
+    A COMPLETE real Overwrite run that publishes NOTHING — the operator hits
+    Stop before the first chunk — must leave the prior run's XYE output
+    byte-for-byte.  The terminal stale sweep exists to gate THIS run's
+    publication; decoupled from any publication it silently destroys a
+    durable prior result and creates nothing.
+    """
+    wrangler = _select_nexus(widget)
+    widget.controls.set_write_mode("Overwrite")
+    src, out = _arm_pilatus(wrangler, tmp_path)
+    scan_dir = out / Path(src).stem
+    scan_dir.mkdir(parents=True)
+    prior = scan_dir / f"iq_{Path(src).stem}_0009.xye"
+    prior.write_text("prior run output")
+    _start_recorder(wrangler, monkeypatch)
+    wrangler.start()
+    thread = wrangler.thread
+    said: list[str] = []
+    thread.showLabel.connect(said.append)
+    thread.command = 'stop'                       # Stop before the first chunk
+
+    thread.run()
+
+    assert prior.exists() and prior.read_text() == "prior run output", (
+        "a run that published nothing destroyed the prior run's XYE output")
+    assert any(m.startswith("Done") for m in said), said
+
+
+def test_a_commit_leftover_backup_is_retried_at_the_next_commit(
+        tmp_path, monkeypatch):
+    """Panel finding R3-F2: a backup RESOLVED by a successful commit whose
+    unlink transiently failed is the envelope's fact to finish — the next
+    successful commit of the same run removes it, so one transient lock does
+    not strand a suffix that permanently refuses every later Overwrite run."""
+    target = tmp_path / "scan.nxs"
+    backup = tmp_path / f"scan.nxs{nwt._REPLACING_SUFFIX}"
+    target.write_bytes(b"prior durable bytes")
+    frozen = SimpleNamespace(output_mode="Overwrite")
+    prepared = _envelope(frozen, target)
+    worker = SimpleNamespace(file_lock=threading.RLock())
+    scan = SimpleNamespace(data_file=str(target))
+    pool = SimpleNamespace(pause=lambda _path: None, resume=lambda _path: None)
+    monkeypatch.setattr(nwt, "_get_h5pool", lambda: pool)
+
+    real_unlink = Path.unlink
+    backup_unlink_attempts = 0
+
+    def fail_first_backup_unlink(path, *args, **kwargs):
+        nonlocal backup_unlink_attempts
+        if path == backup:
+            backup_unlink_attempts += 1
+            if backup_unlink_attempts == 1:
+                raise OSError("transient lock on the replaced prior")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_first_backup_unlink)
+
+    def write_ok():
+        target.write_bytes(b"new run bytes")
+
+    nexusThread._write_run_result(worker, prepared, scan, write_ok)
+    assert prepared.target_replaced is True
+    assert backup.exists(), "the injected transient unlink failure never fired"
+
+    nexusThread._write_run_result(worker, prepared, scan, write_ok)
+
+    assert not backup.exists(), (
+        "the commit-resolved leftover backup was forgotten; the next "
+        "Overwrite run would refuse forever over a disposable file")
+    assert target.read_bytes() == b"new run bytes"
+
+
+def test_a_stuck_commit_backup_is_surfaced_at_run_end(
+        widget, tmp_path, monkeypatch):
+    """Panel finding R3-F2, visibility half: when the leftover cannot be
+    removed by run end, the operator is TOLD — on the same visible label —
+    which file to remove, at the moment it happens, not at the next run's
+    unexplained failure."""
+    wrangler = _select_nexus(widget)
+    widget.controls.set_write_mode("Overwrite")
+    src, out = _arm_pilatus(wrangler, tmp_path)
+    target = out / f"{Path(src).stem}.nxs"
+    target.write_bytes(b"prior durable result")
+    backup = out / f"{Path(src).stem}.nxs{nwt._REPLACING_SUFFIX}"
+    real_unlink = Path.unlink
+
+    def refuse_backup_unlink(path, *args, **kwargs):
+        if path == backup:
+            raise OSError("persistent lock on the replaced prior")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse_backup_unlink)
+    _start_recorder(wrangler, monkeypatch)
+    wrangler.start()
+    thread = wrangler.thread
+    said: list[str] = []
+    thread.showLabel.connect(said.append)
+
+    thread.run()
+
+    assert backup.exists()
+    assert any(backup.name in m for m in said), (
+        f"the stuck superseded backup was never surfaced to the operator: "
+        f"{said}")
+
+
+def test_release_drops_withheld_xye_entries_with_their_envelope(
+        widget, tmp_path, monkeypatch):
+    """Panel finding R3-F3: withheld XYE entries can never publish once their
+    envelope dies — left in the buffer, a later run on the same worker would
+    drain them under a FOREIGN identity.  They go with the envelope."""
+    wrangler = _select_nexus(widget)
+    _src, _out, thread = _started(wrangler, tmp_path, monkeypatch)
+    prepared = nexusThread._prepare_execution(thread, thread.run_configuration)
+    prepared.xye_tail_pending = [tmp_path / "scan" / "iq_scan_0009.xye"]
+    prepared.xye_withheld_idxs = {0, 1}
+    with thread._xye_lock:
+        thread._xye_buffer.append((0, object()))
+        thread._xye_buffer.append((1, object()))
+
+    nexusThread._release_execution(thread)
+
+    with thread._xye_lock:
+        leftover = list(thread._xye_buffer)
+    assert leftover == [], (
+        "withheld XYE entries outlived their envelope; a later run would "
+        "publish them under its own identity")
