@@ -12809,6 +12809,24 @@ class staticWidget(QWidget):
         }
         diverged = sorted(name for name, value in references.items()
                           if value is not handed_off)
+        if handed_off is not None and not diverged:
+            # §11.2.1 — a wrangler run must also present a COMPLETE admitted
+            # source.  Without one the acquisition owner used to borrow
+            # `scan.data_file`, which at admission can still name the scratch
+            # placeholder or the previous run's output, so every hydration
+            # owner it minted was qualified against the wrong file.
+            source = getattr(getattr(handed_off, "source", None), "uri", None)
+            if not source:
+                fail_closed_rejection_log(
+                    logger, DECISION_RUN_CONFIGURATION_UNADMITTED,
+                    reason=("the admitted wrangler configuration names no "
+                            "source uri"),
+                    outcome="run_refused", blanks_panel=False,
+                    expected="frozen.source.uri", found="",
+                    origin="staticWidget._enter_run_state")
+                raise DisplayContextError(
+                    "refusing a wrangler run whose admitted configuration "
+                    "carries no source uri")
         if handed_off is None or diverged:
             fail_closed_rejection_log(
                 logger, DECISION_RUN_CONFIGURATION_UNADMITTED,
@@ -12861,7 +12879,14 @@ class staticWidget(QWidget):
             config_generation=generation,
             config_fingerprint=str(fingerprint or ""),
             run_scan_key=str(scan_identity_key(scan) or ""),
-            source_path=str(getattr(scan, "data_file", "") or ""),
+            # §11.2.1 — the ACCEPTED source, never the mutable display/output
+            # path.  A wrangler run is admitted with one; a reintegrate or a
+            # Stitch has its own explicit scan-source contract and says so by
+            # falling back here, which is not a frozen wrangler admission.
+            source_path=str(
+                (getattr(getattr(frozen, "source", None), "uri", "")
+                 if origin == RUN_ORIGIN_WRANGLER else "")
+                or getattr(scan, "data_file", "") or ""),
             scan=scan,
             frame=getattr(self, "frame", None),
             frame_ids=getattr(self, "frame_ids", None),
@@ -13687,16 +13712,15 @@ class staticWidget(QWidget):
     def _release_acquisition_context(self) -> None:
         """Run-end substep 4: drop the acquisition context, last.
 
-        ORDERED after the finalization seam, not conditioned on its RESULT.
-        Refusing until ``finish_processing`` returned cleanly cannot converge:
-        the finalization claim is one-shot by design (T-4.2 — a retry must
-        never finalize the same identity twice), so a seam that failed once can
-        never report success on the retry, and the context would be stranded
-        unreleasable for the rest of the session.  What this must guarantee is
-        the ORDER — the run's identity is not discarded before its finalizer has
-        been given its one attempt — and that is exactly what the claim proves.
-        A permanent finalizer failure therefore still releases the run scan
-        (T-4.2 §35.7.C, unchanged) while its error stays in the receipt.
+        LAST in the dependency chain, and conditioned on SUCCESS (§9.1.3).  A
+        failed or in-progress finalization retains the exact context and raises
+        from this named seam, so the receipt records the release as outstanding
+        and a later qualified delivery — another finish, or public Close —
+        reruns both.  A permanent finalizer failure therefore leaves a
+        cleanup-pending owner that the next Run refuses to overwrite; it does
+        NOT release the run scan, which is what the c3R-a state machine
+        replaced.  The browse owner must also be gone first, or the selection
+        would be left naming a context nobody owns.
         """
         context = getattr(self, "_acquisition_context", None)
         if context is None:
@@ -14454,6 +14478,13 @@ class staticWidget(QWidget):
         route through the shared run-state owner (_enter/_exit_run_state)."""
         if self.stitch_thread.isRunning() or getattr(self, '_run_active', False):
             return
+        # §11.3.3 — the FIRST executable boundary, before any scan read,
+        # parameter construction, `stitch_thread.mode` assignment or thread
+        # start.  Asking after the parameters were built and the mode had
+        # already been published to the worker meant a refusal still left the
+        # thread carrying this action's configuration.
+        if staticWidget._refuse_action_for_active_owner(self, "stitch"):
+            return
         scan = self.scan
         if not getattr(scan, 'frames', None):
             self._stitch_status('Load a scan before stitching.')
@@ -14480,8 +14511,6 @@ class staticWidget(QWidget):
             self._stitch_status('Could not read stitch settings.')
             return
         self.stitch_thread.mode = mode
-        if staticWidget._refuse_action_for_active_owner(self, "stitch"):
-            return
         self.stitch_thread.params = params
         self.stitch_thread.stop_requested = False
         # Fail-loud UX: a detector mask that can't be applied to the stitch
@@ -14723,7 +14752,11 @@ class staticWidget(QWidget):
         # Single writer, same statement group as the scan rename: the context's
         # stamped sub-scan key and the scan's own name never diverge.
         if context is not None:
-            context.rescope_to(name)
+            # §11.2.2 — the member SOURCE moves with the member.  The
+            # authoritative value is on the frame that drove the boundary; the
+            # context advances key, source and commit epoch together.
+            context.rescope_to(
+                name, source=getattr(first_frame, "source_file", None))
             # §9.2.2 — and the SELECTION is restamped with it.  Moving
             # `current_scan_key` while the selection kept naming the previous
             # sub-scan left every later request qualified against a key the

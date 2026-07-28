@@ -1434,13 +1434,13 @@ class integratorTree(QtWidgets.QWidget):
     def bai_1d(self, q):
         """Uses the integrator_thread attribute to call bai_1d
         """
+        if self._refuse_reintegration_for_active_owner():
+            return
         if self._block_if_no_frames('1D'):
             return
         if self._block_if_reload_only_frames('1D'):
             return
         if not self._ensure_reintegration_calibration('1D'):
-            return
-        if self._refuse_reintegration_for_active_owner():
             return
         self._apply_gi_config_to_scan()
         self._apply_threshold_config_to_thread()
@@ -1462,25 +1462,31 @@ class integratorTree(QtWidgets.QWidget):
         """
         refuse = getattr(self, "_refuse_run_action", None)
         if not callable(refuse):
-            # No host bound (duck-typed panels in the suite): the host's own
-            # `_enter_run_state()` check remains the defensive backstop.
+            # A genuinely standalone integrator with no host bound keeps its
+            # existing behaviour; the host's own `_enter_run_state()` check
+            # remains the defensive backstop for that case.
             return False
         try:
             return bool(refuse("reintegration"))
         except Exception:
-            logger.debug("reintegration admission probe failed", exc_info=True)
-            return False
+            # §11.3.2 — an INSTALLED but broken predicate is never permission.
+            # Returning False here let GI/threshold writes and a worker start
+            # proceed on exactly the reading that could not be made.
+            logger.warning(
+                "reintegration refused: the run-owner probe failed",
+                exc_info=True)
+            return True
 
     def bai_2d(self, q):
         """Uses the integrator_thread attribute to call bai_2d
         """
+        if self._refuse_reintegration_for_active_owner():
+            return
         if self._block_if_no_frames('2D'):
             return
         if self._block_if_reload_only_frames('2D'):
             return
         if not self._ensure_reintegration_calibration('2D'):
-            return
-        if self._refuse_reintegration_for_active_owner():
             return
         self._apply_gi_config_to_scan()
         self._apply_threshold_config_to_thread()

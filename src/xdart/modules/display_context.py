@@ -256,15 +256,44 @@ class HydrationOwner:
     source: str = ""
     epoch: int = 0
 
+    @staticmethod
+    def _epoch(value) -> int:
+        """A POSITIVE INTEGER epoch, or ``0`` for anything else.  Never raises.
+
+        Deliberately strict (§11.1.1): a bool is not an epoch, and neither is
+        something that merely coerces to one.  A completion arriving with a
+        malformed epoch has to become an inert refusal, not an exception
+        crossing a Qt signal and not a value invented by ``int()``.
+        """
+        if isinstance(value, bool) or not isinstance(value, int):
+            return 0
+        return value if value > 0 else 0
+
     @classmethod
     def of(cls, context_token="", scan_key="", source="", epoch=0):
-        return cls(str(context_token or ""), str(scan_key or ""),
-                   str(source or ""), int(epoch or 0))
+        """Build an owner TOTALLY — any input yields an owner, never a raise."""
+        def _text(value):
+            if value is None or isinstance(value, (bytes, bytearray)):
+                return ""
+            try:
+                return str(value) if value else ""
+            except Exception:
+                return ""
+
+        return cls(_text(context_token), _text(scan_key), _text(source),
+                   cls._epoch(epoch))
 
     @property
     def qualified(self) -> bool:
-        """Whether this owner names a context at all."""
-        return bool(self.context_token and self.scan_key)
+        """Whether this owner is COMPLETE (§11.1.1).
+
+        All four fields, or none of the authority.  The parent asked only for a
+        token and a scan key, so an empty source or a zero epoch read as a
+        wildcard — a carried field is not an authority while its absence is
+        treated as permission.
+        """
+        return bool(self.context_token and self.scan_key and self.source
+                    and self.epoch > 0)
 
     def as_tuple(self) -> tuple:
         return (self.context_token, self.scan_key, self.source, self.epoch)
@@ -378,6 +407,11 @@ class AcquisitionContext(_WriteOnceIdentity):
     #: The live sub-scan key.  SINGLE WRITER: :meth:`rescope_to`, driven by the
     #: frame-driven scan-boundary owner.  Initialised to ``run_scan_key``.
     current_scan_key: str = ""
+    #: The live sub-scan SOURCE, analogous to ``current_scan_key`` and written
+    #: by the same single writer (§11.2.2).  A Directory run's members each
+    #: have their own source file, so a key alone cannot identify which member
+    #: a hydration belongs to.  Initialised to the admitted source.
+    current_source: str = ""
     #: This context's commit authority (§9.2.4).  Created with the context and
     #: cancelled by its own lifecycle — one per owner, not a new authority.
     commit_gate: CommitGate = field(default_factory=CommitGate)
@@ -413,6 +447,8 @@ class AcquisitionContext(_WriteOnceIdentity):
     def __post_init__(self):
         if not self.current_scan_key:
             self.current_scan_key = str(self.run_scan_key or "")
+        if not self.current_source:
+            self.current_source = str(self.source_path or "")
 
     @property
     def commit_epoch(self) -> int:
@@ -427,14 +463,23 @@ class AcquisitionContext(_WriteOnceIdentity):
         """The key the display is currently scoped to within this run."""
         return self.current_scan_key or self.run_scan_key
 
-    def rescope_to(self, scan_key) -> None:
-        """Stamp the new sub-scan key at a genuine scan boundary.
+    @property
+    def source(self) -> str:
+        """The source the display is currently scoped to within this run."""
+        return self.current_source or self.source_path
 
-        The commit epoch moves with it (§9.2.2): a request minted against the
-        previous sub-scan is qualified against a key the display has left, so
-        it must no longer be able to insert.
+    def rescope_to(self, scan_key, source=None) -> None:
+        """Stamp the new sub-scan identity at a genuine scan boundary.
+
+        Key, SOURCE and commit epoch move TOGETHER (§11.2.2).  Advancing only
+        the key left the display comparing sources exactly — and comparing the
+        wrong value, because the member source never moved with the member.
+        A request minted against the previous member is qualified against an
+        identity the display has left, so its epoch is retired here too.
         """
         self.current_scan_key = str(scan_key or "")
+        if source:
+            self.current_source = str(source)
         self.commit_gate.advance()
 
     def adopt_record_store(self, store) -> None:
@@ -587,6 +632,11 @@ class BrowseContext(_WriteOnceIdentity):
 
     @property
     def source_path(self) -> str:
+        return self.requested_path
+
+    @property
+    def source(self) -> str:
+        """One resolution rule with the acquisition owner: the live source."""
         return self.requested_path
 
     def adopt_load_request(self, request) -> None:

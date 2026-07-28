@@ -198,6 +198,55 @@ def test_browse_and_acquisition_bindings_never_share_an_object():
         assert left is not right, f"{name} is shared between the two contexts"
 
 
+def test_a_hydration_owner_is_complete_or_it_is_nothing():
+    """§11.1.1 — all four fields, or none of the authority.
+
+    The parent asked only for a token and a scan key, so an empty source or a
+    zero epoch read as a wildcard.  A carried field is not an authority while
+    its absence is treated as permission.
+    """
+    from xdart.modules.display_context import HydrationOwner
+
+    complete = HydrationOwner.of("tok", "key", "/data/a.nxs", 3)
+    assert complete.qualified is True
+
+    for owner in (
+        HydrationOwner.of("", "key", "/data/a.nxs", 3),
+        HydrationOwner.of("tok", "", "/data/a.nxs", 3),
+        HydrationOwner.of("tok", "key", "", 3),
+        HydrationOwner.of("tok", "key", "/data/a.nxs", 0),
+        HydrationOwner.of("tok", "key", "/data/a.nxs", -1),
+        HydrationOwner.of("tok", "key", "/data/a.nxs", True),
+        HydrationOwner.of("tok", "key"),
+        HydrationOwner(),
+    ):
+        assert owner.qualified is False, owner
+
+
+def test_hydration_owner_decoding_is_total_and_never_raises():
+    """§11.1.2 — a malformed owner is an inert refusal, not an exception.
+
+    The decode runs on a completion delivered through a Qt signal; a raise
+    there would escape into the render path instead of dropping one stale
+    completion.  A bool is not an epoch either, and neither is something that
+    merely coerces to one.
+    """
+    from xdart.modules.display_context import HydrationOwner
+
+    class Hostile:
+        def __str__(self):
+            raise RuntimeError("hostile __str__")
+
+    for epoch in ("not-an-int", None, 1.5, object(), True, False, [], "7"):
+        owner = HydrationOwner.of("tok", "key", "/data/a.nxs", epoch)
+        assert owner.epoch == 0, epoch
+        assert owner.qualified is False, epoch
+
+    hostile = HydrationOwner.of(Hostile(), "key", "/data/a.nxs", 3)
+    assert hostile.context_token == ""
+    assert hostile.qualified is False
+
+
 def test_display_selection_is_frozen_and_names_its_context():
     acquisition = _acquisition()
     selection = DisplaySelection.for_context(acquisition, 11)
@@ -412,9 +461,23 @@ def _admit_everywhere(widget, monkeypatch, frozen):
 
 
 def _frozen_configuration():
-    from xrd_tools.session.run_configuration import RunIntent
+    """An admitted configuration WITH a source (§11.2.1).
 
-    return RunIntent().freeze()
+    A wrangler run is refused unless its accepted configuration names one: the
+    acquisition owner takes its source identity from there and never from the
+    mutable ``scan.data_file``, which at admission can still be the scratch
+    placeholder or the previous run's output.
+    """
+    from dataclasses import replace as _replace
+
+    from xrd_tools.session.run_configuration import (
+        FrozenSourceSpec,
+        RunIntent,
+    )
+
+    frozen = RunIntent().freeze()
+    return _replace(frozen, source=FrozenSourceSpec(
+        family="source", source_kind="image_file", uri="/raw/accepted-source.h5"))
 
 
 def test_a_wrangler_run_requires_all_five_admission_references(

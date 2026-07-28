@@ -361,13 +361,30 @@ def test_an_active_context_never_produces_an_ownerless_request(
     assert display.display_context_token == \
         widget._acquisition_context.context_token
 
+    context = widget._acquisition_context
+    # §11.1.1/11.1.5 — while a context is active NOTHING incomplete passes,
+    # and that now includes the legacy two-tuple: a carried field is not an
+    # authority while the consumer reads its absence as permission.
+    from xdart.modules.display_context import HydrationOwner
+
     for owner in (None, (), ("",), ("", ""), "not-a-pair", ("tok",),
-                  (None, None)):
+                  (None, None),
+                  (display.display_context_token, context.scan_key),
+                  HydrationOwner.of(display.display_context_token,
+                                    context.scan_key, "",
+                                    context.commit_epoch),
+                  HydrationOwner.of(display.display_context_token,
+                                    context.scan_key, context.source, 0),
+                  HydrationOwner.of(display.display_context_token,
+                                    context.scan_key, context.source, True),
+                  (display.display_context_token, context.scan_key,
+                   context.source, "not-an-epoch")):
         assert displayFrameWidget._admit_hydration_owner(
             display, owner, 1, 0) is False, owner
 
-    good = (display.display_context_token,
-            widget._acquisition_context.scan_key)
+    good = HydrationOwner.of(display.display_context_token, context.scan_key,
+                             context.source, context.commit_epoch)
+    assert good.qualified is True
     assert displayFrameWidget._admit_hydration_owner(
         display, good, 1, 0) is True
 
@@ -519,3 +536,48 @@ def test_completion_admission_refuses_a_foreign_source_and_a_stale_epoch(
     assert displayFrameWidget._admit_hydration_owner(
         display, stale_epoch, 4, request.generation) is False, (
         "a completion from a superseded epoch was admitted")
+
+
+def test_a_frame_driven_boundary_moves_key_source_and_epoch_together(
+        widget, monkeypatch, tmp_path):
+    """§11.2.2/11.2.5 — the member SOURCE moves with the member.
+
+    A Directory run's members each have their own source file, and the
+    authoritative value is on the frame that drove the boundary.  Advancing
+    only the key left the display comparing sources exactly and comparing the
+    wrong value, so a hydration for the previous member was admitted against
+    the new one.
+    """
+    widget._enter_run_state(origin=RUN_ORIGIN_REINTEGRATE)
+    context = widget._acquisition_context
+    before_source = context.source
+    before_epoch = context.commit_epoch
+    before_selection = widget._display_selection
+
+    member = SimpleNamespace(source_file="/raw/run_a/member_00007.h5")
+    widget._rescope_frame_panel_to("run-a-member-7", first_frame=member)
+
+    assert context.scan_key == "run-a-member-7"
+    assert context.source == member.source_file, (
+        "the sub-scan boundary did not restamp the member source")
+    assert context.source != before_source
+    assert context.commit_epoch > before_epoch, (
+        "a request minted against the previous member can still commit")
+
+    selection = widget._display_selection
+    assert selection is not before_selection
+    assert selection.scan_key == "run-a-member-7"
+
+    # And a completion echoing the PREVIOUS member is now refused.
+    from xdart.modules.display_context import HydrationOwner
+
+    stale_member = HydrationOwner.of(
+        context.context_token, context.scan_key, before_source, before_epoch)
+    assert displayFrameWidget._admit_hydration_owner(
+        widget.displayframe, stale_member, 1, 0) is False
+
+    current = HydrationOwner.of(
+        context.context_token, context.scan_key, context.source,
+        context.commit_epoch)
+    assert displayFrameWidget._admit_hydration_owner(
+        widget.displayframe, current, 1, 0) is True

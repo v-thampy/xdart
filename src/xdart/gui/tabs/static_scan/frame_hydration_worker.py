@@ -72,15 +72,6 @@ class _HydrationRequest:
             source=self.context_source,
             epoch=self.epoch)
 
-    @property
-    def owner(self):
-        """The complete values-only identity this request belongs to."""
-        return HydrationOwner.of(
-            context_token=self.context_token,
-            scan_key=self.context_scan_key,
-            source=self.context_source,
-            epoch=self.epoch)
-
 
 class FrameHydrationWorker(Qt.QtCore.QThread):
     """One persistent thread draining a request queue into the store.

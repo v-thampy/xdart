@@ -86,17 +86,23 @@ from xdart.modules.display_context import HydrationOwner, HydrationRequest
 
 
 def _hydration_owner(owner):
-    """Coerce a completion's echoed owner, or ``None`` when it is unusable.
+    """Decode a completion's echoed owner.  TOTAL — never raises (§11.1.2).
 
     A completion may echo the frozen :class:`HydrationOwner` (the owned path)
-    or a legacy 2-tuple.  Anything else — absent, malformed, the wrong arity —
-    resolves to ``None`` and is refused whenever a context is active.
+    or a legacy 2-tuple, which decodes to an owner with no source and no epoch
+    and is therefore never COMPLETE.  Anything else — absent, malformed, the
+    wrong arity, a malformed epoch — becomes an inert unqualified owner, so a
+    broken completion is refused instead of propagating a conversion exception
+    through a Qt signal into the render path.
     """
     if isinstance(owner, HydrationOwner):
         return owner
     if isinstance(owner, (tuple, list)) and len(owner) in (2, 4):
-        return HydrationOwner.of(*owner)
-    return None
+        try:
+            return HydrationOwner.of(*owner)
+        except Exception:
+            return HydrationOwner()
+    return HydrationOwner()
 from .run_config_debug import (
     DECISION_CAPABILITY_FORCES_CLEAR,
     DECISION_HYDRATION_CONTEXT_MISMATCH,
@@ -1650,59 +1656,54 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         legacy/duck-host call), the display has no context token yet, or the
         tokens agree.
         """
-        current_token = str(getattr(self, "display_context_token", "") or "")
-        if not current_token:
-            # No context is active: the idle/legacy regime, where a completion
-            # carries no owner and none is required.  This is the ONLY
-            # compatibility path (§9.2.5).
-            return True
+        # §11.2.3/11.2.4 — the SELECTED CONTEXT is the authority for whether
+        # exact admission applies.  The parent decided that from the
+        # `display_context_token` mirror, so an empty mirror while A or B
+        # existed sent every completion down the idle compatibility branch.
         context = displayFrameWidget._selected_context(self)
-        try:
-            expected_key = str(overlay_current_scan_key(self) or "")
-        except Exception:
-            expected_key = ""
-        expected_source = str(getattr(context, "source_path", "") or "")
-        expected_epoch = getattr(context, "commit_epoch", None)
-        # §9.2.5 / §10.3 — while a context IS active, FAIL CLOSED on anything
-        # that is not a COMPLETE, matching owner.  The parent failed open for
-        # absent, malformed and empty owners; then it compared only the token;
-        # then it still ignored the source identity and the epoch it was
-        # carrying, so a completion from another sub-scan of the same container
-        # — or from a superseded epoch — was admitted.
-        request = _hydration_owner(owner)
-        if request is not None and request.qualified:
-            if (request.context_token == current_token
-                    and (not expected_key
-                         or request.scan_key == expected_key)
-                    and (not expected_source
-                         or not request.source
-                         or request.source == expected_source)
-                    and (expected_epoch is None
-                         or not request.epoch
-                         or request.epoch == expected_epoch)):
-                return True
-            request_scan_key = request.scan_key
+        mirror_token = str(getattr(self, "display_context_token", "") or "")
+        if context is None and not mirror_token:
+            # The genuine idle/legacy regime — the ONLY path on which a
+            # completion may carry no owner, and the only one a legacy 2-tuple
+            # is accepted on.  A MISSING mirror cannot turn an extant context
+            # into idle, and a host that still claims a token is not idle
+            # either; both are strict below.
+            return True
+        if context is not None:
+            expected = HydrationOwner.of(
+                context_token=getattr(context, "context_token", ""),
+                scan_key=getattr(context, "scan_key", ""),
+                source=(getattr(context, "source", "")
+                        or getattr(context, "source_path", "")),
+                epoch=getattr(context, "commit_epoch", 0))
         else:
-            request_scan_key = ""
-        expected = expected_key
+            # A host that advertises a context token but exposes no context
+            # owner: still ACTIVE, and therefore still strict.  It can supply
+            # no complete expectation, so nothing is admitted — fail closed.
+            expected = HydrationOwner()
+        # §11.1.4 — all four fields, compared exactly.  No field's absence is
+        # permission, on either side.
+        request = _hydration_owner(owner)
+        if request.qualified and expected.qualified and request == expected:
+            return True
         fail_closed_rejection_log(
             logger, DECISION_HYDRATION_CONTEXT_MISMATCH,
-            reason=("the completion does not name the display context this "
-                    "widget is rendering"),
+            reason=("the completion does not name, completely and exactly, "
+                    "the display context this widget is rendering"),
             outcome="completion_dropped",
             blanks_panel=False,
-            expected=expected,
-            found=str(request_scan_key or ""),
+            expected=expected.scan_key,
+            found=request.scan_key,
             origin="displayFrameWidget._on_frame_hydrated",
             label=label,
             generation=generation,
-            request_token=(request.context_token if request is not None
-                           else ""),
-            request_source=(request.source if request is not None else ""),
-            request_epoch=(request.epoch if request is not None else None),
-            current_token=current_token,
-            current_source=expected_source,
-            current_epoch=expected_epoch)
+            request_token=request.context_token,
+            request_source=request.source,
+            request_epoch=request.epoch,
+            request_qualified=request.qualified,
+            current_token=expected.context_token,
+            current_source=expected.source,
+            current_epoch=expected.epoch)
         return False
 
     def _flush_hydration_render(self) -> None:

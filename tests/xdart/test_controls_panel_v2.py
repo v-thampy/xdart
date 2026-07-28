@@ -4554,6 +4554,22 @@ def _admit_pending_run_configuration(widget):
     what the gate exists to refuse.
     """
     frozen = widget._require_controls_v2_run_handoff()
+    if getattr(getattr(frozen, "source", None), "uri", None) is None:
+        # X1 O-3 (§11.2.1): a wrangler run is refused unless its accepted
+        # configuration names a SOURCE — the acquisition owner takes its source
+        # identity from there and never from the mutable `scan.data_file`.
+        # These cases drive `start_wrangler()` directly and so bypass the
+        # readiness gate that makes a source mandatory before Start; the stand-
+        # in supplies the one a real Start would already have carried.
+        from dataclasses import replace as _replace
+
+        from xrd_tools.session.run_configuration import FrozenSourceSpec
+
+        frozen = _replace(frozen, source=FrozenSourceSpec(
+            family="source", source_kind="image_file", uri="/raw/controls-test-source.h5"))
+        # The handed-off object must be the SAME one: §8.1's five-reference
+        # gate compares by identity, not by content.
+        widget._pending_controls_v2_run_configuration = frozen
     for owner in (widget.wrangler, widget.wrangler.thread):
         for name in ("run_configuration", "_admitted_run_configuration"):
             setattr(owner, name, frozen)

@@ -428,58 +428,66 @@ def test_public_close_retries_the_retained_cleanup_owner(
     assert acquisition.commit_gate.cancelled is True
 
 
-def test_every_run_action_refuses_a_retained_cleanup_owner(
+def test_every_public_run_action_refuses_a_retained_cleanup_owner(
         widget, monkeypatch, tmp_path):
-    """§10.4.2/10.4.4 — the action matrix, at the EARLIEST guard.
+    """§11.3.4 — the FIVE public actions, driven for real.
 
-    Each action must refuse before it mutates anything and before it starts a
-    worker.  ``_enter_run_state()`` alone was far too late: a wrangler Start had
-    already applied configuration, called ``setup()`` and configured the plan,
-    and the two thread owners had already been started.
-
-    The reintegration legs are driven through the real ``bai_1d``/``bai_2d``
-    entries with only their pre-existing frame/calibration preconditions
-    satisfied, so what is measured is the new guard's PLACEMENT — ahead of the
-    first scan mutation and ahead of ``QThread.start()``.
+    The landed matrix was false-green: it replaced calibration loading with a
+    pure lambda, called the private Stitch predicate instead of
+    ``start_stitch()``, and never drove the image or NeXus Start entries.  Here
+    every action is the real public entry; only the DOWNSTREAM worker boundary
+    is observed.  Nothing may load calibration, mutate a carrier or start a
+    thread while a cleanup owner is retained.
     """
     widget._enter_run_state(origin=RUN_ORIGIN_REINTEGRATE)
     retained = widget._acquisition_context
     widget._run_active = False
-
-    # The one canonical predicate names it.
     assert widget._controls_v2_active_run_owner() == "context-cleanup"
 
     tree = widget.integratorTree
-    started, mutated = [], []
-    # Satisfy the pre-existing preconditions so no modal is raised; the guard
-    # under test sits AFTER them and before everything that follows.
+    events = []
+    # Downstream observation only — the public entry and the admission ORDER
+    # are real.  Calibration loading is watched, not replaced by a lambda that
+    # cannot fail: it is the first thing the old check ran after.
     monkeypatch.setattr(tree, "_block_if_no_frames", lambda _dim: False)
     monkeypatch.setattr(tree, "_block_if_reload_only_frames",
                         lambda _dim: False)
     monkeypatch.setattr(tree, "_ensure_reintegration_calibration",
-                        lambda _dim: True)
+                        lambda _dim: events.append("calibration") or True)
     monkeypatch.setattr(tree, "_apply_gi_config_to_scan",
-                        lambda: mutated.append("gi_config"))
+                        lambda: events.append("gi"))
     monkeypatch.setattr(tree, "_apply_threshold_config_to_thread",
-                        lambda: mutated.append("thresholds"))
+                        lambda: events.append("thresholds"))
     monkeypatch.setattr(tree.integrator_thread, "start",
-                        lambda: started.append("reintegration"),
+                        lambda: events.append("reintegrate-start"),
                         raising=False)
+    monkeypatch.setattr(widget, "_build_stitch_params",
+                        lambda mode: events.append("stitch-params") or {})
     monkeypatch.setattr(widget.stitch_thread, "start",
-                        lambda: started.append("stitch"), raising=False)
+                        lambda: events.append("stitch-start"), raising=False)
+    monkeypatch.setattr(widget.stitch_thread, "isRunning", lambda: False)
+    monkeypatch.setattr(widget.wrangler.thread, "start",
+                        lambda: events.append("wrangler-start"), raising=False)
 
+    stitch_mode = getattr(widget.stitch_thread, "mode", None)
+    stitch_params = getattr(widget.stitch_thread, "params", None)
+    scan_name = widget.scan.name
+    args_before = dict(widget.scan.bai_1d_args)
+
+    # 1 + 2: both reintegration entries.
     tree.bai_1d(None)
     tree.bai_2d(None)
-    assert started == [], f"a run action started a worker: {started}"
-    assert mutated == [], (
-        f"a run action mutated state before refusing: {mutated}")
+    # 3: Stitch, through its real public entry.
+    widget.start_stitch("1d")
+    # 4 + 5: image Start and NeXus Start, through the real wrangler entries.
+    for wrangler in _available_wranglers(widget):
+        wrangler.start()
 
-    # Stitch refuses at its own entry, through the same predicate.
-    assert staticWidget._refuse_action_for_active_owner(
-        widget, "stitch") == "context-cleanup"
-    assert started == []
-
-    # The owner is still retained, and nothing became active.
+    assert events == [], f"a public action acted on a retained owner: {events}"
+    assert getattr(widget.stitch_thread, "mode", None) == stitch_mode
+    assert getattr(widget.stitch_thread, "params", None) == stitch_params
+    assert widget.scan.name == scan_name
+    assert dict(widget.scan.bai_1d_args) == args_before
     assert widget._acquisition_context is retained
     assert widget._run_active is False
 
@@ -487,3 +495,46 @@ def test_every_run_action_refuses_a_retained_cleanup_owner(
     with pytest.raises(DisplayContextError):
         widget._enter_run_state(origin=RUN_ORIGIN_REINTEGRATE)
     assert widget._run_active is False
+
+
+def test_a_raising_owner_probe_refuses_every_reintegration_action(
+        widget, monkeypatch, tmp_path):
+    """§11.3.2 — an INSTALLED but broken predicate is never permission."""
+    tree = widget.integratorTree
+    events = []
+    monkeypatch.setattr(tree, "_block_if_no_frames", lambda _dim: False)
+    monkeypatch.setattr(tree, "_block_if_reload_only_frames",
+                        lambda _dim: False)
+    monkeypatch.setattr(tree, "_ensure_reintegration_calibration",
+                        lambda _dim: events.append("calibration") or True)
+    monkeypatch.setattr(tree, "_apply_gi_config_to_scan",
+                        lambda: events.append("gi"))
+    monkeypatch.setattr(tree, "_apply_threshold_config_to_thread",
+                        lambda: events.append("thresholds"))
+    monkeypatch.setattr(tree.integrator_thread, "start",
+                        lambda: events.append("start"), raising=False)
+
+    def broken(_action):
+        raise RuntimeError("owner probe failed")
+
+    monkeypatch.setattr(tree, "_refuse_run_action", broken, raising=False)
+
+    tree.bai_1d(None)
+    tree.bai_2d(None)
+    assert events == [], (
+        f"a failed owner probe was treated as permission: {events}")
+
+
+def _available_wranglers(widget):
+    """Every real wrangler entry this widget exposes (image and NeXus)."""
+    found, seen = [], set()
+    for name in ("wrangler",):
+        one = getattr(widget, name, None)
+        if one is not None and id(one) not in seen:
+            seen.add(id(one))
+            found.append(one)
+    for one in getattr(widget, "_wranglers", ()) or ():
+        if one is not None and id(one) not in seen:
+            seen.add(id(one))
+            found.append(one)
+    return found
