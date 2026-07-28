@@ -49,11 +49,16 @@ import numpy as np
 from pyqtgraph import Qt
 
 # Project imports
-from xdart.modules.live import LiveFrame
+from xdart.modules.live import LiveFrame, LiveScan
 from xrd_tools.core.containers import PONI
+from xrd_tools.core.provenance import read_provenance
 from xrd_tools.io.output_safety import (
     OutputCollisionError,
     check_output_not_source,
+)
+from xrd_tools.session.readiness import (
+    append_config_mismatch_check,
+    processing_config_from_mapping,
 )
 from xrd_tools.integrate.calibration import poni_to_integrator, get_detector
 from xrd_tools.reduction import GIFreezeError
@@ -98,7 +103,10 @@ class FrozenSourceTarget(NamedTuple):
     output_dir: str = ""
     source_base: str = ""
     output_mode: str = "Append"
-    poni_values: dict | None = None
+    #: O-3N.R.1 §16.6: the calibration travels as the constructed immutable
+    #: ``PONI``, not as a mutable dict inside an object that calls itself
+    #: immutable.
+    poni: object | None = None
     generation: int = 0
     fingerprint: str = ""
 
@@ -168,8 +176,13 @@ class nexusThread(wranglerThread):
         self.mask = None
         # O-3N.R: the immutable execution target for the run in progress, and
         # the one-shot latch that makes Overwrite replace exactly once.
-        self._execution_target = None
         self._run_output_prepared = None
+        self._run_target_replaced = None
+        # O-3N.R.1 §16.7 R.1-1: the ONE prepared execution resource for the run
+        # in progress, and the frozen object it was prepared for.
+        self._prepared_for = None
+        self._prepared_stack = None
+        self._xye_tail_cleared = None
 
         # NeXus processing is always batch-mode equivalent — surface the
         # same flags the GUI's wrangler_finished handler checks so it
@@ -188,6 +201,9 @@ class nexusThread(wranglerThread):
         if files_processed <= 0 or frozen.run_options.get("xye_only", False):
             return
         is_finalize = (self.command != 'stop')
+        # §16.4: if no periodic save happened, THIS is the run's first writer
+        # action, so the Overwrite replacement belongs here.
+        nexusThread._replace_target_once(self, frozen, scan)
         # O-3N.R §15.4 item 4: Overwrite already replaced the target once, at
         # the FIRST writer action of this run (``_prepare_output_for_run``), so
         # every save inside the run appends into what this run created and the
@@ -261,31 +277,54 @@ class nexusThread(wranglerThread):
         # execution opened a group.
         entry = str(getattr(source, "entry", "") or "").strip()
         scan_name = Path(uri).stem or "nexus_scan"
+        # O-3N.R.1 §16.5: the accepted calibration is assigned or REFUSED; a
+        # run whose identity claims no constructible calibration may not fall
+        # back to whatever object the worker happened to hold.
+        values = getattr(frozen, "poni_values", None)
+        poni = None
+        if values:
+            try:
+                poni = PONI.from_dict(dict(values))
+            except Exception as exc:                   # noqa: BLE001
+                raise RunConfigurationRefused(
+                    "absent", stage="nexus-source-target",
+                    detail=("the accepted calibration values are not "
+                            f"constructible: {exc}"),
+                    generation=int(getattr(frozen, "generation", 0) or 0))
         return FrozenSourceTarget(
             uri, entry, scan_name,
             os.path.join(save_path, f"{scan_name}.nxs"),
             output_dir=save_path,
             source_base=str(getattr(frozen, "project_root", "") or ""),
             output_mode=str(getattr(frozen, "output_mode", "") or "Append"),
-            poni_values=(dict(frozen.poni_values)
-                         if getattr(frozen, "poni_values", None) else None),
+            poni=poni,
             generation=int(getattr(frozen, "generation", 0) or 0),
             fingerprint=str(getattr(frozen, "fingerprint", "") or ""))
 
     def _preflight_execution_target(self, target):
-        """Validate the filesystem and HDF5 facts, in the WORKER, before I/O.
+        """Prove every filesystem and HDF5 fact, in the WORKER, before any I/O.
 
-        O-3N.R §15.2/§15.3.  Runs after exact frozen admission and before any
-        source-content read or writer open, off the GUI thread:
+        O-3N.R.1 §16.3/§16.6.  One idempotent worker operation; nothing that
+        reads source content or touches output may precede it.  It proves:
 
-        * the source is an existing file;
-        * the output directory exists (or can be created) and is a directory;
-        * the SELECTED entry exists and is the group that will be opened -- the
-          shared reader silently falls back to the first ``NXentry``, which let
-          a run reduce one group while its provenance named another;
-        * the output does not collide with the source, through the existing
+        * the source is an existing file and the output directory is a
+          directory (or creatable) -- these are filesystem facts, so they live
+          here, not on the GUI thread (§16.6);
+        * the output does not collide with the source, through the shared
           headless :func:`check_output_not_source` owner, so symlink/hard-link
-          identity is covered by the same policy the image path uses.
+          identity is one policy;
+        * the SELECTED entry is an HDF5 **Group**.  Membership alone was not
+          enough: a Dataset at that path passed, and the shared reader accepts
+          an explicit hint only when it resolves to a Group -- otherwise it
+          falls back to the first ``NXentry`` and the run reduces one group
+          under another's provenance (§16.3);
+        * the exact selected group carries a RUNNABLE raw stack, proved by
+          opening it.  §16.4: output ownership must not become destructive
+          before this holds, or a valid-but-frameless container destroys a
+          durable prior result and creates nothing.
+
+        Returns the proved ``NexusImageStack`` context manager; the caller owns
+        closing it.
         """
         def refuse(detail):
             raise RunConfigurationRefused(
@@ -294,6 +333,8 @@ class nexusThread(wranglerThread):
 
         if not target.entry:
             refuse("the accepted NeXus configuration names no entry")
+        if target.poni is None:
+            refuse("the accepted NeXus configuration carries no calibration")
         source = Path(target.uri)
         if not source.is_file():
             refuse(f"the accepted NeXus source is not a file: {target.uri}")
@@ -306,12 +347,14 @@ class nexusThread(wranglerThread):
                                     input_files=[target.uri])
         except OutputCollisionError as exc:
             refuse(str(exc))
-        # Strict entry: open ONLY the group index, never frame content.
+        # Strict entry: the selected object must BE a group, not merely present.
         try:
             import h5py
 
             with h5py.File(target.uri, "r") as handle:
-                present = target.entry in handle
+                node = handle.get(target.entry)
+                is_group = isinstance(node, h5py.Group)
+                present = node is not None
         except OSError as exc:
             refuse(f"the accepted NeXus source could not be opened: {exc}")
         else:
@@ -319,51 +362,156 @@ class nexusThread(wranglerThread):
                 refuse(f"the selected entry {target.entry!r} does not exist in "
                        f"{target.uri}; refusing rather than reducing another "
                        "NXentry under its provenance")
-        return target
+            if not is_group:
+                refuse(f"the selected entry {target.entry!r} is not an HDF5 "
+                       "group; the reader would fall back to another NXentry "
+                       "while provenance kept claiming this one")
+        # Raw-stack proof: open the EXACT selected group.  This is the last
+        # precondition for output ownership becoming destructive.
+        try:
+            stack = open_nexus_image_stack(target.uri, target.entry)
+        except ProcessedXdartInputError:
+            # F-NXS-2 keeps its actionable operator message; the STOP is now the
+            # shared typed refusal, raised before any output action.
+            try:
+                self.showLabel.emit(
+                    'Selected file is a processed xdart output, not a raw '
+                    'NeXus acquisition; open it in the viewer instead of '
+                    'reducing it.')
+            except Exception:
+                logger.debug("showLabel emit failed", exc_info=True)
+            refuse("the selected file is a processed xdart output, not a raw "
+                   "NeXus acquisition")
+        except (KeyError, FileNotFoundError, OSError, ValueError) as exc:
+            refuse(f"the selected entry carries no runnable detector stack: "
+                   f"{exc}")
+            raise                                      # unreachable; refuse()
+        return stack
 
     def _execution_poni(self, frozen):
-        """The calibration this run integrates with, from the accepted values.
+        """The calibration this run integrates with — the accepted one, or none.
 
-        O-3N.R §15.4 item 1: ``setup()`` rebuilt ``self.poni`` from the PONI
-        editor after admission, so a post-admission calibration edit changed the
-        science while the frozen provenance claimed the accepted one.
+        O-3N.R.1 §16.5: a thin accessor onto the prepared target, so there is
+        exactly one construction site.  A nonconstructible mapping already
+        refused in :meth:`_frozen_source_target`; ``None`` here means the
+        accepted run genuinely carries no calibration, and execution must
+        refuse rather than keep an earlier object.
         """
-        values = getattr(frozen, "poni_values", None)
-        if not values:
-            return None
-        try:
-            return PONI.from_dict(dict(values))
-        except Exception:
-            logger.debug("accepted PONI values are not constructible",
-                         exc_info=True)
-            return None
+        return nexusThread._frozen_source_target(frozen).poni
+
+    @staticmethod
+    def _append_identity(mapping):
+        """The stored (source uri, entry, processing signature) of a target."""
+        config = (mapping or {}).get("config") or {}
+        run = config.get("run_configuration") or {}
+        source = run.get("source") or {}
+        return (str(source.get("uri") or ""), str(source.get("entry") or ""),
+                run.get("processing_mapping") or {
+                    "bai_1d_args": run.get("bai_1d_args"),
+                    "bai_2d_args": run.get("bai_2d_args"),
+                    "gi": run.get("gi"),
+                })
 
     def _prepare_output_for_run(self, frozen, scan):
-        """Honour the accepted output mode on the FIRST writer action.
+        """Own the output transaction for this run, before any writer action.
 
-        O-3N.R §15.4 item 4: the periodic/final saves ignored
-        ``frozen.output_mode`` and the final save hard-coded ``replace=False``,
-        so two same-stem identities could mix rows in one file while provenance
-        moved to the newer one.  Overwrite replaces once, at the start of the
-        run; later saves in the SAME run append into what this run created.
+        O-3N.R.1 §16.2/§16.4.  Two modes, two contracts:
+
+        * **Append** is PROVENANCE-QUALIFIED.  An existing target is inspected
+          before reduction or any writer mutation; only a target whose stored
+          source URI, exact entry and processing signature match the accepted
+          run is admitted.  Missing, malformed, foreign-source, foreign-entry or
+          science-incompatible provenance is a visible typed refusal that leaves
+          the target byte-for-byte.  Previously every non-Overwrite mode
+          returned immediately, so two same-stem sources could mix old rows
+          under a new identity -- and Append is the UI default.
+        * **Overwrite** is NOT destructive here.  The prior result survives
+          until the raw stack is proved and the first real writer action
+          replaces it, exactly once (see :meth:`_replace_target_once`).
+
+        XYE-only never touches the ``.nxs`` at all.
         """
+        if frozen.run_options.get("xye_only", False):
+            return False
         Path(os.path.dirname(scan.data_file)).mkdir(parents=True,
                                                     exist_ok=True)
         if self._run_output_prepared is frozen:
             return False
         self._run_output_prepared = frozen
+        if str(getattr(frozen, "output_mode", "Append")) == "Overwrite":
+            # §16.4: retain the old target.  The first successful writer action
+            # replaces it; nothing is destroyed during preparation.
+            return False
+
+        target = Path(scan.data_file)
+        if not target.exists():
+            return False
+
+        def refuse(detail):
+            raise RunConfigurationRefused(
+                "foreign", stage="nexus-append-qualification", detail=detail,
+                generation=int(getattr(frozen, "generation", 0) or 0))
+
+        try:
+            stored = read_provenance(str(target))
+        except Exception as exc:                       # noqa: BLE001
+            refuse(f"the Append target carries no readable provenance "
+                   f"({exc}); refusing rather than mixing rows under a new "
+                   "identity")
+        stored_uri, stored_entry, stored_processing = (
+            nexusThread._append_identity(stored))
+        accepted = frozen.source
+        if not stored_uri:
+            refuse("the Append target names no source; it was not written by "
+                   "an admitted run")
+        if stored_uri != str(accepted.uri):
+            refuse(f"the Append target was written from {stored_uri!r}, not "
+                   f"{str(accepted.uri)!r}")
+        if stored_entry != str(accepted.entry or ""):
+            refuse(f"the Append target was written from entry "
+                   f"{stored_entry!r}, not {str(accepted.entry or '')!r}")
+        current = processing_config_from_mapping(frozen.processing_mapping())
+        check = append_config_mismatch_check(
+            "Append", processing_config_from_mapping(stored_processing),
+            current)
+        if not check.ok:
+            refuse(f"the Append target's processing configuration is "
+                   f"incompatible: {check.reason}")
+        # Compatible: load the existing rows into THIS run's scan so new rows
+        # are added once and existing durability state is preserved honestly.
+        loader = getattr(scan, "load_from_h5", None)
+        if callable(loader):
+            with self.file_lock:
+                loader(replace=False, mode='r')
+            _apply_frozen_run_configuration(scan, frozen)
+            for key, value in frozen.scan_args().items():
+                setattr(scan, key, value)
+        return True
+
+    def _replace_target_once(self, frozen, scan):
+        """Perform an Overwrite replacement at the FIRST writer action only.
+
+        §16.4: destructive exactly once, after the raw stack is proved and a
+        real result is ready.  Later saves in the same run append into what
+        this run created.
+        """
         if str(getattr(frozen, "output_mode", "Append")) != "Overwrite":
             return False
+        if self._run_target_replaced is frozen:
+            return False
+        self._run_target_replaced = frozen
         target = Path(scan.data_file)
-        if target.exists():
-            with self.file_lock:
-                pool = _get_h5pool()
-                pool.pause(str(target))
-                try:
-                    target.unlink()
-                finally:
-                    pool.resume(str(target))
-            logger.info('[NEXUS] Overwrite: replaced %s', target)
+        if not target.exists():
+            return False
+        with self.file_lock:
+            pool = _get_h5pool()
+            pool.pause(str(target))
+            try:
+                target.unlink()
+            finally:
+                pool.resume(str(target))
+        logger.info('[NEXUS] Overwrite: replaced %s at the first writer action',
+                    target)
         return True
 
     def _adopt_frozen_source_target(self, frozen):
@@ -382,11 +530,67 @@ class nexusThread(wranglerThread):
         # O-3N.R §15.4 items 1-2: the calibration and the portable source base
         # are accepted values too, not panel rereads.
         self.source_base = target.source_base or None
-        accepted_poni = nexusThread._execution_poni(self, frozen)
-        if accepted_poni is not None:
-            self.poni = accepted_poni
-        self._execution_target = target
+        # O-3N.R.1 §16.5: ASSIGN the accepted calibration -- never preserve an
+        # older object when the accepted run carries none.  A nonconstructible
+        # mapping already refused inside ``_frozen_source_target``.
+        self.poni = target.poni
         return target
+
+    def _save_to_disk(self, frozen, scan):
+        """The run's writer action, with the Overwrite replacement folded in.
+
+        §16.4: Overwrite is destructive exactly ONCE, here, at the first real
+        writer action -- after the raw stack was proved and a result exists.
+        Later saves in the same run append into what this run created.
+        XYE-only never reaches the ``.nxs`` writer at all.
+        """
+        if frozen.run_options.get("xye_only", False):
+            return
+        nexusThread._replace_target_once(self, frozen, scan)
+        return wranglerThread._save_to_disk(self, frozen, scan)
+
+    def _flush_xye_buffer(self, scan, published_idxs=None):
+        """Flush XYE, clearing an earlier longer run's tail under Overwrite.
+
+        §16.4: an Overwrite XYE run must not leave higher-frame files from a
+        previous, longer run beside this run's output.  The clear happens once,
+        at the first flush of the run, and only for Overwrite.
+        """
+        frozen = getattr(self, "run_configuration", None)
+        mode = str(getattr(frozen, "output_mode", "Append") or "Append")
+        if (frozen is not None and mode == "Overwrite"
+                and self._xye_tail_cleared is not frozen):
+            self._xye_tail_cleared = frozen
+            root = Path(os.path.dirname(scan.data_file)) / str(scan.name)
+            if root.is_dir():
+                for stale in root.glob("*.xye"):
+                    try:
+                        stale.unlink()
+                    except OSError:
+                        logger.debug("stale XYE could not be removed: %s",
+                                     stale, exc_info=True)
+        return wranglerThread._flush_xye_buffer(
+            self, scan, published_idxs=published_idxs)
+
+    def _prepare_execution(self, frozen):
+        """THE worker execution-preparation owner (§16.7 R.1-1).
+
+        One idempotent operation, reached by both ``run()`` and a supported
+        direct ``_run_impl()`` entry.  It derives the immutable target, assigns
+        or refuses the accepted calibration, proves the exact HDF5 Group, opens
+        and proves the exact raw stack, and applies the collision/output facts.
+        No content read and no output action precedes it.
+
+        Returns ``(target, stack_context)``; the caller owns the stack.
+        """
+        target = nexusThread._adopt_frozen_source_target(self, frozen)
+        previous = getattr(self, "_prepared_stack", None)
+        if previous is not None and getattr(self, "_prepared_for", None) is frozen:
+            return target, previous
+        stack = nexusThread._preflight_execution_target(self, target)
+        self._prepared_for = frozen
+        self._prepared_stack = stack
+        return target, stack
 
     def _project_gi_modes_onto_display_scan(self, frozen):
         """Backward GI-mode write onto the mutable DISPLAY scan (retained).
@@ -412,11 +616,7 @@ class nexusThread(wranglerThread):
             # O-3N (§14.2 item 4): re-derive what this run opens and where it
             # writes from the accepted object BEFORE any source read or output
             # open, so the panel/wrapper/worker mirrors cannot decide either.
-            target = nexusThread._adopt_frozen_source_target(self, frozen)
-            # O-3N.R (§15.2/§15.3): the filesystem and HDF5 facts are validated
-            # HERE -- in the worker, off the GUI thread, before any source
-            # content read or writer open.
-            nexusThread._preflight_execution_target(self, target)
+            nexusThread._prepare_execution(self, frozen)
         except RunConfigurationRefused as exc:
             logger.error("run refused: %s", exc)
             self.command = 'stop'
@@ -433,13 +633,11 @@ class nexusThread(wranglerThread):
 
     def _run_impl(self, frozen):
         """Read frames from a NeXus file and integrate them in parallel."""
-        # O-3N.R: derive the execution target from the accepted object HERE too.
-        # ``run()`` already adopted it (and preflighted the filesystem/HDF5
-        # facts), but the reduction body must be self-sufficient: sibling
-        # callers drive ``_run_impl`` directly, and a body that depended on an
-        # earlier call having set its cursors would break on them.  The
-        # derivation is pure and idempotent.
-        target = nexusThread._adopt_frozen_source_target(self, frozen)
+        # O-3N.R.1 §16.7 R.1-1: ONE worker preparation owner, reached by both
+        # ``run()`` and a supported direct ``_run_impl()`` entry.  It is
+        # idempotent, and nothing that reads source content or touches output
+        # may precede it.
+        target, ds_cm = nexusThread._prepare_execution(self, frozen)
         xye_only = frozen.run_options.get("xye_only", False)
         t0 = time.time()
         # O-1a-W1R (review §39.5 Phase 2 item 1): capture the accepted frozen
@@ -497,22 +695,9 @@ class nexusThread(wranglerThread):
         #     /entry/data/data_NNNNNN → individual _data_*.h5 files.
         # The proxy exposes the full scan as one (N, H, W) slice-able
         # object, so chunked reads can cross file boundaries.
-        try:
-            ds_cm = open_nexus_image_stack(self.nexus_file, self.entry)
-        except ProcessedXdartInputError:
-            # F-NXS-2: the selected file is a processed xdart output (integrated
-            # results, no raw detector frames).  The shared finder now rejects it
-            # before the largest-3D fallback could return an integrated cake as a
-            # raw stack; surface a clear message and stop cleanly instead of
-            # letting the ValueError escape run()'s try/finally as an uncaught
-            # QThread exception (mirrors the image wrangler's processed-skip).
-            self.showLabel.emit(
-                'Selected file is a processed xdart output, not a raw NeXus '
-                'acquisition; open it in the viewer instead of reducing it.')
-            return
-        except (KeyError, FileNotFoundError) as exc:
-            self.showLabel.emit(f'No image dataset found in NeXus file: {exc}')
-            return
+        # §16.4: the raw stack was PROVED by the preparation owner before any
+        # output ownership became destructive; this is that exact resource, not
+        # a second open.  A processed/frameless/dangling source refused there.
         with ds_cm as ds:
             nframes = ds.shape[0]
             n_segments = ds.n_segments
@@ -718,39 +903,46 @@ class nexusThread(wranglerThread):
     # ── Helpers ─────────────────────────────────────────────────────────
 
     def _initialize_scan(self, scan_name):
-        """Create or reset the LiveScan for this scan.
+        """Build THIS run's own ``LiveScan`` (§16.1/§16.7 R.1-2).
 
-        RESIDUAL (ledgered): the NeXus worker still executes ON the display scan
-        object rather than a per-run scan of its own -- that restructuring is
-        outside the W-1 packet.  What W-1B closes is the AUTHORITY: every
-        configuration value written here now comes from the accepted frozen
-        configuration, and the run identity + detached writer projection are
-        attached BEFORE the writer opens, exactly as on the image path.
+        The design checkpoint was resolved in favour of a genuine fresh per-run
+        scan, following the image worker, rather than a larger reset protocol on
+        the display singleton.  The previous revision renamed ``self.scan`` and
+        changed some fields; it cleared neither prior frame labels and resident
+        frames, nor ``scan_data``, nor writer cursor/durability marks, nor
+        cached integrator/mask/geometry state.  Under Overwrite those rows could
+        be written into a new target under a new identity; under Append the
+        whole prior display/browse identity participated in the write.
+
+        The display scan is neither executed on nor reset here.  Publication
+        still reaches the GUI through the existing per-frame handoff.
         """
         frozen = nexusThread._require_run_configuration(
             self, "nexus-initialize-scan")
         target = nexusThread._adopt_frozen_source_target(self, frozen)
-        self.scan.name = scan_name
-        self.scan.gi = bool(frozen.gi.enabled)
-        self.scan.static = True
-        # O-3N.R §15.1 — THE writer target.  Both the periodic save and
-        # ``_final_save_to_nexus`` write through ``scan.data_file``, and so does
-        # every XYE file (``save_1d`` derives its directory from it).  Until
-        # this assignment the only repoint was the ASYNCHRONOUS GUI
-        # ``sigUpdateFile`` chain, so a previous/default/browsed file could
-        # receive the run if the GUI had not processed the signal before the
-        # first flush.  The run owns its output before anything can write.
-        self.scan.data_file = target.output_path
-        _apply_frozen_run_configuration(self.scan, frozen)
-        # N1: the project root -> entry/@source_base + relative raw source paths
-        # in the writer (portable .nxs).  None -> absolute paths (back-compat).
-        # The abspath at frame.source_file stays as-is; the writer relativizes it
-        # against source_base at write time.  O-3N.R §15.4 item 2: the value is
-        # the ACCEPTED project root, not a post-admission panel reread.
-        self.scan.source_base = target.source_base or None
-        self._active_scan = self.scan
-        nexusThread._prepare_output_for_run(self, frozen, self.scan)
-        return self.scan
+        scan_kwargs = frozen.scan_kwargs()
+        scan = LiveScan(
+            scan_name,
+            # §15.1: the run owns its output BEFORE anything can write.  Both
+            # saves and every XYE file resolve through ``data_file``.
+            data_file=target.output_path,
+            static=True,
+            gi=bool(scan_kwargs["gi"]),
+            incidence_motor=scan_kwargs["incidence_motor"],
+            series_average=False,
+            global_mask=self.mask,
+            # J2: share the wrangler's writer lock, as the image worker does.
+            file_lock=self.file_lock,
+            bai_1d_args=scan_kwargs["bai_1d_args"],
+            bai_2d_args=scan_kwargs["bai_2d_args"],
+        )
+        _apply_frozen_run_configuration(scan, frozen)
+        # N1: the accepted project root -> entry/@source_base + relative raw
+        # source paths in the writer (portable .nxs).
+        scan.source_base = target.source_base or None
+        self._active_scan = scan
+        nexusThread._prepare_output_for_run(self, frozen, scan)
+        return scan
 
     def _frame_meta(self, scan_meta, base_meta, frame_idx):
         """Build a per-frame metadata dict from scan-level arrays.

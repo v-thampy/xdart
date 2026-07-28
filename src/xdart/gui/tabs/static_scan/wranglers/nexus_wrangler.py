@@ -27,10 +27,6 @@ from pyqtgraph.parametertree import ParameterTree, Parameter
 
 # Project imports
 from xrd_tools.core.containers import PONI
-from xrd_tools.io.output_safety import (
-    OutputCollisionError,
-    check_output_not_source,
-)
 from xrd_tools.session.run_configuration import RunConfigurationRefused
 from .wrangler_widget import (
     GIMotorHydration,
@@ -559,20 +555,19 @@ class nexusWrangler(wranglerWidget):
         * a cleared Entry is a refusal, not a value to invent later: blank and
           explicit ``"entry"`` would otherwise be two identities for one
           execution (§15.2);
-        * a source that is not an existing file, and an output that names an
-          existing NON-directory, cannot produce a run at all;
-        * a source/output pair that resolves to the SAME FILE is the F-NXS-1
-          raw-acquisition-overwrite hazard.  The comparison uses the SHARED
-          headless owner, so link identity is one policy, not two spellings.
+        * the accepted calibration VALUES must be constructible.  Whether a
+          detached mapping can build a ``PONI`` is a pure fact about the
+          accepted object, and without it a run could be admitted with no
+          calibration while the worker kept executing an earlier one (§16.5).
 
-        These are cheap ``stat`` questions.  Everything that needs real HDF5 or
-        writer I/O -- strict entry existence above all -- belongs to the worker
-        preflight, off the GUI thread.
+        O-3N.R.1 §16.6: filesystem and HDF5 facts are NOT asked here.  The
+        earlier revision ran ``Path.is_file()``, an output stat and
+        ``check_output_not_source()`` on the GUI thread; on a beamline network
+        path those "cheap" stats are not cheap, and the §15 boundary puts
+        filesystem, link/collision, HDF5 and raw-stack facts in the worker.
         """
         source = getattr(frozen, "source", None)
-        uri = str(getattr(source, "uri", "") or "").strip()
         entry = str(getattr(source, "entry", "") or "").strip()
-        save_path = str(getattr(frozen, "save_path", "") or "").strip()
 
         def refuse(detail):
             raise RunConfigurationRefused(
@@ -582,17 +577,15 @@ class nexusWrangler(wranglerWidget):
         if not entry:
             refuse("the NeXus run names no entry; a cleared Entry is refused "
                    "rather than silently executed as 'entry'")
-        if not Path(uri).is_file():
-            refuse(f"the NeXus source is not an existing file: {uri}")
-        output_dir = Path(save_path)
-        if output_dir.exists() and not output_dir.is_dir():
-            refuse(f"the NeXus output is not a directory: {save_path}")
-        output_path = os.path.join(
-            save_path, f"{Path(uri).stem or 'nexus_scan'}.nxs")
+        values = getattr(frozen, "poni_values", None)
+        if not values:
+            refuse("the NeXus run carries no calibration values; execution "
+                   "would keep whatever calibration the worker already held")
         try:
-            check_output_not_source(output_path, input_files=[uri])
-        except OutputCollisionError as exc:
-            refuse(str(exc))
+            PONI.from_dict(dict(values))
+        except Exception as exc:                       # noqa: BLE001
+            refuse(f"the accepted calibration values are not constructible: "
+                   f"{exc}")
 
     def _consume_frozen_setup_target(self):
         """The accepted (uri, entry, scan_name, output) for a STARTING run.
@@ -652,12 +645,12 @@ class nexusWrangler(wranglerWidget):
         # Load PONI.  O-3N.R §15.4 item 1: after admission the calibration is
         # the accepted VALUES, so a post-admission .poni edit cannot change the
         # science while the frozen provenance claims the accepted calibration.
-        if _target is not None and _target.poni_values:
-            try:
-                self.poni = PONI.from_dict(dict(_target.poni_values))
-            except Exception:
-                logger.debug("accepted PONI values are not constructible",
-                             exc_info=True)
+        if _target is not None:
+            # O-3N.R.1 §16.5: assign the ACCEPTED calibration, never keep an
+            # earlier object.  ``_frozen_source_target`` already refused a
+            # nonconstructible one, so ``None`` here means the accepted run
+            # genuinely carries none and execution must not invent one.
+            self.poni = _target.poni
         elif self.poni_file and os.path.exists(self.poni_file):
             self.poni = PONI.from_poni_file(self.poni_file)
 
