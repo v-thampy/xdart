@@ -15891,8 +15891,12 @@ class staticWidget(QWidget):
             self.h5viewer._apply_frames_panel_width(viewer_mode)
             if hasattr(self, "metawidget"):
                 self.metawidget.viewer_mode = viewer_mode
-            # Give displayframe a reference to the wrangler for mask/threshold
-            self.displayframe._wrangler = self.wrangler if is_viewer else None
+            # R4-G: the displayframe used to be handed a wrangler reference
+            # here "for mask/threshold".  That consumer is gone -- nothing ever
+            # read the slot -- and holding it made the display widget retain a
+            # wrangler, and through it a worker thread, for the lifetime of a
+            # viewer mode.  Mask and threshold reach the display through the
+            # publication/projection path like every other value.
             # In viewer mode, disable New/Save (keep Open Folder and Export)
             self.h5viewer.actionNewFile.setEnabled(not is_viewer)
             self.h5viewer.actionSaveDataAs.setEnabled(not is_viewer)

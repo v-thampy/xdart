@@ -777,11 +777,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._run_wavelength_m = None
         self._run_wavelength_scan_key = None
         self._wavelength_run_scan = None
-        self._wavelength_run_scan_key = None
 
         # Viewer mode: None (normal), 'image', or 'xye'
         self.viewer_mode = None
-        self._wrangler = None
         self.frame_record_store = None
 
         # Frame index tracking
@@ -5560,7 +5558,6 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         also records the scan identity the display is rendering at stamp time
         (the run scan — refined per sub-scan in Directory mode)."""
         self._wavelength_run_scan = run_scan
-        self._wavelength_run_scan_key = run_scan_key
         self._run_wavelength_m = None
         self._run_wavelength_scan_key = None
 
@@ -5609,7 +5606,6 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     if isinstance(mg, dict):
                         mg['wavelength'] = value
         self._wavelength_run_scan = None
-        self._wavelength_run_scan_key = None
         self._run_wavelength_m = None
         self._run_wavelength_scan_key = None
 
