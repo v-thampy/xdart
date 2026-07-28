@@ -27,6 +27,10 @@ from pyqtgraph.parametertree import ParameterTree, Parameter
 
 # Project imports
 from xrd_tools.core.containers import PONI
+from xrd_tools.io.output_safety import (
+    OutputCollisionError,
+    check_output_not_source,
+)
 from xrd_tools.session.run_configuration import RunConfigurationRefused
 from .wrangler_widget import (
     GIMotorHydration,
@@ -544,6 +548,52 @@ class nexusWrangler(wranglerWidget):
 
     # ── Thread control ───────────────────────────────────────────────
 
+    def _validate_admissible_source(self, frozen, *, stage):
+        """Refuse a NeXus configuration that cannot name a real run.
+
+        O-3N.R §15.2/§15.3/§15.5 R1 item 1.  Runs inside the shared admission
+        owner, BEFORE the first carrier write, so every refusal here is
+        zero-delta: carrier, ledger, thread, buttons, pending slot and
+        generation floor are exactly as they were.
+
+        * a cleared Entry is a refusal, not a value to invent later: blank and
+          explicit ``"entry"`` would otherwise be two identities for one
+          execution (§15.2);
+        * a source that is not an existing file, and an output that names an
+          existing NON-directory, cannot produce a run at all;
+        * a source/output pair that resolves to the SAME FILE is the F-NXS-1
+          raw-acquisition-overwrite hazard.  The comparison uses the SHARED
+          headless owner, so link identity is one policy, not two spellings.
+
+        These are cheap ``stat`` questions.  Everything that needs real HDF5 or
+        writer I/O -- strict entry existence above all -- belongs to the worker
+        preflight, off the GUI thread.
+        """
+        source = getattr(frozen, "source", None)
+        uri = str(getattr(source, "uri", "") or "").strip()
+        entry = str(getattr(source, "entry", "") or "").strip()
+        save_path = str(getattr(frozen, "save_path", "") or "").strip()
+
+        def refuse(detail):
+            raise RunConfigurationRefused(
+                "absent", stage=stage, detail=detail,
+                generation=int(getattr(frozen, "generation", 0) or 0))
+
+        if not entry:
+            refuse("the NeXus run names no entry; a cleared Entry is refused "
+                   "rather than silently executed as 'entry'")
+        if not Path(uri).is_file():
+            refuse(f"the NeXus source is not an existing file: {uri}")
+        output_dir = Path(save_path)
+        if output_dir.exists() and not output_dir.is_dir():
+            refuse(f"the NeXus output is not a directory: {save_path}")
+        output_path = os.path.join(
+            save_path, f"{Path(uri).stem or 'nexus_scan'}.nxs")
+        try:
+            check_output_not_source(output_path, input_files=[uri])
+        except OutputCollisionError as exc:
+            refuse(str(exc))
+
     def _consume_frozen_setup_target(self):
         """The accepted (uri, entry, scan_name, output) for a STARTING run.
 
@@ -579,17 +629,36 @@ class nexusWrangler(wranglerWidget):
         else:
             self.nexus_file = _target.uri
             self.entry = _target.entry
-        self._emit_gi_motor_options()
+        if _target is None:
+            # O-3N.R §15.4 item 3: the GI-motor preview is a SELECTION-time
+            # affordance.  Running it here after admission performed a
+            # synchronous HDF5 inspection on the GUI thread, off a value the
+            # accepted configuration already owns.
+            self._emit_gi_motor_options()
         self.poni_file = self.parameters.child('Calibration').child('poni_file').value()
         self.mask_file = self.parameters.child('Signal').child('mask_file').value()
         # R3-B: detector-saturation masking opt-out (default ON).
         self.mask_sentinel = self.parameters.child('MaskSat').child('mask_sentinel').value()
         # N1: Project Folder -> @source_base (relative raw paths -> portable .nxs).
-        self.project_folder = self.parameters.child('Project').child('project_folder').value()
-        self.source_base = self._compute_source_base()
+        # O-3N.R §15.4 item 2: after admission the portable root is the ACCEPTED
+        # one; a post-admission Project edit must not move written provenance.
+        if _target is None:
+            self.project_folder = self.parameters.child('Project').child('project_folder').value()
+            self.source_base = self._compute_source_base()
+        else:
+            self.project_folder = _target.source_base
+            self.source_base = _target.source_base or None
 
-        # Load PONI if needed
-        if self.poni_file and os.path.exists(self.poni_file):
+        # Load PONI.  O-3N.R §15.4 item 1: after admission the calibration is
+        # the accepted VALUES, so a post-admission .poni edit cannot change the
+        # science while the frozen provenance claims the accepted calibration.
+        if _target is not None and _target.poni_values:
+            try:
+                self.poni = PONI.from_dict(dict(_target.poni_values))
+            except Exception:
+                logger.debug("accepted PONI values are not constructible",
+                             exc_info=True)
+        elif self.poni_file and os.path.exists(self.poni_file):
             self.poni = PONI.from_poni_file(self.poni_file)
 
         # Output directory + HDF5 output file.  After admission both come from

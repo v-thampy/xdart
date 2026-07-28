@@ -8721,8 +8721,11 @@ class staticWidget(QWidget):
             return None
         from xrd_tools.core.scan import SourceKind, SourceSpec
 
+        # O-3N.R (§15.2): a cleared Entry freezes as the empty string it IS.
+        # Mapping it to ``None`` made blank and explicit "entry" two identities
+        # for one execution; admission refuses the blank one instead.
         entry = str(getter(("NeXus File", "entry")) or "").strip()
-        return SourceSpec(uri, SourceKind.NEXUS_STACK, entry=entry or None)
+        return SourceSpec(uri, SourceKind.NEXUS_STACK, entry=entry)
 
     def _controls_v2_freeze_source_spec(self):
         """Freeze typed mode-specific source membership for the next Run."""

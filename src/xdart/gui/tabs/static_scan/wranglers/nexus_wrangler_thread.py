@@ -50,6 +50,11 @@ from pyqtgraph import Qt
 
 # Project imports
 from xdart.modules.live import LiveFrame
+from xrd_tools.core.containers import PONI
+from xrd_tools.io.output_safety import (
+    OutputCollisionError,
+    check_output_not_source,
+)
 from xrd_tools.integrate.calibration import poni_to_integrator, get_detector
 from xrd_tools.reduction import GIFreezeError
 from xrd_tools.io.nexus import open_nexus_image_stack, read_nexus
@@ -76,19 +81,26 @@ logger = logging.getLogger(__name__)
 
 
 class FrozenSourceTarget(NamedTuple):
-    """What a NeXus run opens and where it writes, from the accepted object.
+    """The whole NeXus execution target, from the accepted object.
 
-    O-3N (§14.2 items 4-5).  These four values used to be re-read from the Qt
-    tree by ``nexusWrangler.setup()`` and then carried as mutable worker
-    mirrors, so poisoning a field after admission changed what the run opened
-    and where its output landed.  They are now one derivation from one accepted
-    ``FrozenRunConfiguration``.
+    O-3N (§14.2 items 4-5) established the first four values.  O-3N.R (§15.4)
+    completes it: the newly reachable NeXus worker was still taking its
+    calibration, portable source base and output policy from post-admission
+    mutable state, so one run could execute with panel science while its
+    provenance claimed the accepted identity.  Everything an executing NeXus run
+    decides is derived HERE, once, from one ``FrozenRunConfiguration``.
     """
 
     uri: str
     entry: str
     scan_name: str
     output_path: str
+    output_dir: str = ""
+    source_base: str = ""
+    output_mode: str = "Append"
+    poni_values: dict | None = None
+    generation: int = 0
+    fingerprint: str = ""
 
 
 # How many frames to bulk-read from the source HDF5 per iteration.
@@ -154,6 +166,10 @@ class nexusThread(wranglerThread):
 
         self.detector = None
         self.mask = None
+        # O-3N.R: the immutable execution target for the run in progress, and
+        # the one-shot latch that makes Overwrite replace exactly once.
+        self._execution_target = None
+        self._run_output_prepared = None
 
         # NeXus processing is always batch-mode equivalent — surface the
         # same flags the GUI's wrangler_finished handler checks so it
@@ -172,6 +188,11 @@ class nexusThread(wranglerThread):
         if files_processed <= 0 or frozen.run_options.get("xye_only", False):
             return
         is_finalize = (self.command != 'stop')
+        # O-3N.R §15.4 item 4: Overwrite already replaced the target once, at
+        # the FIRST writer action of this run (``_prepare_output_for_run``), so
+        # every save inside the run appends into what this run created and the
+        # final save can never mix a previous identity's rows under the new
+        # provenance.  ``replace`` stays False here for exactly that reason.
         with self.file_lock:
             pool = _get_h5pool()
             pool.pause(scan.data_file)
@@ -234,11 +255,116 @@ class nexusThread(wranglerThread):
                         "the NeXus run would have to infer it"),
                     generation=int(getattr(frozen, "generation", 0) or 0),
                 )
-        entry = str(getattr(source, "entry", "") or "").strip() or "entry"
+        # O-3N.R (§15.2): NO worker-only fallback.  A cleared Entry editor is
+        # refused at admission; inventing "entry" here is exactly what made one
+        # accepted identity mean two things -- provenance claiming nothing while
+        # execution opened a group.
+        entry = str(getattr(source, "entry", "") or "").strip()
         scan_name = Path(uri).stem or "nexus_scan"
         return FrozenSourceTarget(
             uri, entry, scan_name,
-            os.path.join(save_path, f"{scan_name}.nxs"))
+            os.path.join(save_path, f"{scan_name}.nxs"),
+            output_dir=save_path,
+            source_base=str(getattr(frozen, "project_root", "") or ""),
+            output_mode=str(getattr(frozen, "output_mode", "") or "Append"),
+            poni_values=(dict(frozen.poni_values)
+                         if getattr(frozen, "poni_values", None) else None),
+            generation=int(getattr(frozen, "generation", 0) or 0),
+            fingerprint=str(getattr(frozen, "fingerprint", "") or ""))
+
+    def _preflight_execution_target(self, target):
+        """Validate the filesystem and HDF5 facts, in the WORKER, before I/O.
+
+        O-3N.R §15.2/§15.3.  Runs after exact frozen admission and before any
+        source-content read or writer open, off the GUI thread:
+
+        * the source is an existing file;
+        * the output directory exists (or can be created) and is a directory;
+        * the SELECTED entry exists and is the group that will be opened -- the
+          shared reader silently falls back to the first ``NXentry``, which let
+          a run reduce one group while its provenance named another;
+        * the output does not collide with the source, through the existing
+          headless :func:`check_output_not_source` owner, so symlink/hard-link
+          identity is covered by the same policy the image path uses.
+        """
+        def refuse(detail):
+            raise RunConfigurationRefused(
+                "absent", stage="nexus-preflight", detail=detail,
+                generation=int(target.generation))
+
+        if not target.entry:
+            refuse("the accepted NeXus configuration names no entry")
+        source = Path(target.uri)
+        if not source.is_file():
+            refuse(f"the accepted NeXus source is not a file: {target.uri}")
+        output_dir = Path(target.output_dir)
+        if output_dir.exists() and not output_dir.is_dir():
+            refuse(f"the accepted NeXus output is not a directory: "
+                   f"{target.output_dir}")
+        try:
+            check_output_not_source(target.output_path,
+                                    input_files=[target.uri])
+        except OutputCollisionError as exc:
+            refuse(str(exc))
+        # Strict entry: open ONLY the group index, never frame content.
+        try:
+            import h5py
+
+            with h5py.File(target.uri, "r") as handle:
+                present = target.entry in handle
+        except OSError as exc:
+            refuse(f"the accepted NeXus source could not be opened: {exc}")
+        else:
+            if not present:
+                refuse(f"the selected entry {target.entry!r} does not exist in "
+                       f"{target.uri}; refusing rather than reducing another "
+                       "NXentry under its provenance")
+        return target
+
+    def _execution_poni(self, frozen):
+        """The calibration this run integrates with, from the accepted values.
+
+        O-3N.R §15.4 item 1: ``setup()`` rebuilt ``self.poni`` from the PONI
+        editor after admission, so a post-admission calibration edit changed the
+        science while the frozen provenance claimed the accepted one.
+        """
+        values = getattr(frozen, "poni_values", None)
+        if not values:
+            return None
+        try:
+            return PONI.from_dict(dict(values))
+        except Exception:
+            logger.debug("accepted PONI values are not constructible",
+                         exc_info=True)
+            return None
+
+    def _prepare_output_for_run(self, frozen, scan):
+        """Honour the accepted output mode on the FIRST writer action.
+
+        O-3N.R §15.4 item 4: the periodic/final saves ignored
+        ``frozen.output_mode`` and the final save hard-coded ``replace=False``,
+        so two same-stem identities could mix rows in one file while provenance
+        moved to the newer one.  Overwrite replaces once, at the start of the
+        run; later saves in the SAME run append into what this run created.
+        """
+        Path(os.path.dirname(scan.data_file)).mkdir(parents=True,
+                                                    exist_ok=True)
+        if self._run_output_prepared is frozen:
+            return False
+        self._run_output_prepared = frozen
+        if str(getattr(frozen, "output_mode", "Append")) != "Overwrite":
+            return False
+        target = Path(scan.data_file)
+        if target.exists():
+            with self.file_lock:
+                pool = _get_h5pool()
+                pool.pause(str(target))
+                try:
+                    target.unlink()
+                finally:
+                    pool.resume(str(target))
+            logger.info('[NEXUS] Overwrite: replaced %s', target)
+        return True
 
     def _adopt_frozen_source_target(self, frozen):
         """Initialize this worker's runtime cursors FROM the accepted values.
@@ -253,6 +379,13 @@ class nexusThread(wranglerThread):
         self.entry = target.entry
         self.scan_name = target.scan_name
         self.fname = target.output_path
+        # O-3N.R §15.4 items 1-2: the calibration and the portable source base
+        # are accepted values too, not panel rereads.
+        self.source_base = target.source_base or None
+        accepted_poni = nexusThread._execution_poni(self, frozen)
+        if accepted_poni is not None:
+            self.poni = accepted_poni
+        self._execution_target = target
         return target
 
     def _project_gi_modes_onto_display_scan(self, frozen):
@@ -279,7 +412,11 @@ class nexusThread(wranglerThread):
             # O-3N (§14.2 item 4): re-derive what this run opens and where it
             # writes from the accepted object BEFORE any source read or output
             # open, so the panel/wrapper/worker mirrors cannot decide either.
-            nexusThread._adopt_frozen_source_target(self, frozen)
+            target = nexusThread._adopt_frozen_source_target(self, frozen)
+            # O-3N.R (§15.2/§15.3): the filesystem and HDF5 facts are validated
+            # HERE -- in the worker, off the GUI thread, before any source
+            # content read or writer open.
+            nexusThread._preflight_execution_target(self, target)
         except RunConfigurationRefused as exc:
             logger.error("run refused: %s", exc)
             self.command = 'stop'
@@ -296,6 +433,13 @@ class nexusThread(wranglerThread):
 
     def _run_impl(self, frozen):
         """Read frames from a NeXus file and integrate them in parallel."""
+        # O-3N.R: derive the execution target from the accepted object HERE too.
+        # ``run()`` already adopted it (and preflighted the filesystem/HDF5
+        # facts), but the reduction body must be self-sufficient: sibling
+        # callers drive ``_run_impl`` directly, and a body that depended on an
+        # earlier call having set its cursors would break on them.  The
+        # derivation is pure and idempotent.
+        target = nexusThread._adopt_frozen_source_target(self, frozen)
         xye_only = frozen.run_options.get("xye_only", False)
         t0 = time.time()
         # O-1a-W1R (review §39.5 Phase 2 item 1): capture the accepted frozen
@@ -331,9 +475,9 @@ class nexusThread(wranglerThread):
             scan_meta = None
             base_meta = {}
 
-        # O-3N: one derivation — the name adopted from the accepted source at
-        # worker entry, never a second stem computed off a mutable mirror.
-        scan_name = self.scan_name
+        # O-3N: one derivation — the name comes from the accepted source, never
+        # a second stem computed off a mutable mirror.
+        scan_name = target.scan_name
         scan = self._initialize_scan(scan_name)
         scan._cached_integrator = poni_to_integrator(self.poni)
         scan._cached_poni = self.poni
@@ -585,16 +729,27 @@ class nexusThread(wranglerThread):
         """
         frozen = nexusThread._require_run_configuration(
             self, "nexus-initialize-scan")
+        target = nexusThread._adopt_frozen_source_target(self, frozen)
         self.scan.name = scan_name
         self.scan.gi = bool(frozen.gi.enabled)
         self.scan.static = True
+        # O-3N.R §15.1 — THE writer target.  Both the periodic save and
+        # ``_final_save_to_nexus`` write through ``scan.data_file``, and so does
+        # every XYE file (``save_1d`` derives its directory from it).  Until
+        # this assignment the only repoint was the ASYNCHRONOUS GUI
+        # ``sigUpdateFile`` chain, so a previous/default/browsed file could
+        # receive the run if the GUI had not processed the signal before the
+        # first flush.  The run owns its output before anything can write.
+        self.scan.data_file = target.output_path
         _apply_frozen_run_configuration(self.scan, frozen)
         # N1: the project root -> entry/@source_base + relative raw source paths
         # in the writer (portable .nxs).  None -> absolute paths (back-compat).
         # The abspath at frame.source_file stays as-is; the writer relativizes it
-        # against source_base at write time.
-        self.scan.source_base = getattr(self, "source_base", None)
+        # against source_base at write time.  O-3N.R §15.4 item 2: the value is
+        # the ACCEPTED project root, not a post-admission panel reread.
+        self.scan.source_base = target.source_base or None
         self._active_scan = self.scan
+        nexusThread._prepare_output_for_run(self, frozen, self.scan)
         return self.scan
 
     def _frame_meta(self, scan_meta, base_meta, frame_idx):

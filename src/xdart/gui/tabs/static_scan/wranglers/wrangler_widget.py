@@ -779,6 +779,14 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
                         "the run would have to infer it from mutable state"),
                     generation=int(frozen.generation),
                 )
+        # O-3N.R (§15.5 R1 item 1): a wrangler whose source has values the
+        # generic presence check cannot judge validates its own SHAPE here --
+        # still before the first carrier write, so the refusal is zero-delta.
+        # Filesystem/HDF5 facts that need real I/O belong to the worker
+        # preflight; this stays cheap.
+        hook = getattr(obj, "_validate_admissible_source", None)
+        if callable(hook):
+            hook(frozen, stage=stage)
 
     @staticmethod
     def _discard_staged_run_configuration(obj):
