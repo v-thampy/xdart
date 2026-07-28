@@ -239,8 +239,7 @@ def test_xye_flush_writes_under_the_frozen_path_and_nowhere_else(
     default_root = Path(os.path.expanduser("~")) / "xdart_processed_data"
     before = (sorted(default_root.iterdir()) if default_root.is_dir() else [])
 
-    with thread._xye_lock:
-        thread._xye_buffer.append((0, _fake_frame(0)))
+    thread._execution.xye.stage(0, _fake_frame(0))
     thread._flush_xye_buffer(scan, published_idxs={0})
 
     written = sorted((out / scan.name).glob("*.xye"))
@@ -262,8 +261,7 @@ def test_xye_only_overwrite_leaves_no_stale_tail_from_a_longer_run(
     stale = xye_dir / "iq_acq_0009.xye"
     stale.write_text("stale tail from a longer earlier run\n")
 
-    with thread._xye_lock:
-        thread._xye_buffer.append((0, _fake_frame(0)))
+    thread._execution.xye.stage(0, _fake_frame(0))
     thread._flush_xye_buffer(scan, published_idxs={0})
 
     assert not stale.exists(), "an Overwrite XYE run kept a stale tail"

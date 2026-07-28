@@ -199,4 +199,4 @@ def test_incompatible_append_is_refused_before_existing_target_is_used(
     with pytest.raises(RunConfigurationRefused):
         nexusThread._prepare_output_for_run(thread, prepared, scan)
     assert prior.read_bytes() == b"prior incompatible run"
-    assert prepared.output_committed is False
+    assert prepared.append_qualified is False

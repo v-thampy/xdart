@@ -137,4 +137,4 @@ def test_append_existing_different_identity_is_refused_before_writer(
         nexusThread._prepare_output_for_run(worker, prepared, scan)
 
     assert writes == []
-    assert prepared.output_committed is False
+    assert prepared.append_qualified is False

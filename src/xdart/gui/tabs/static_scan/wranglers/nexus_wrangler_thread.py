@@ -39,8 +39,10 @@ Performance shape (post-P3A refactor 2026-05-13):
 # Standard library imports
 import logging
 import os
+import threading
 import time
 from contextlib import nullcontext
+from enum import Enum
 from pathlib import Path
 from typing import NamedTuple
 
@@ -137,6 +139,140 @@ class FrozenSourceTarget(NamedTuple):
         return PONI.from_dict(dict(self.poni_values))
 
 
+class OverwritePhase(str, Enum):
+    """Terminally meaningful phases of one accepted output transaction."""
+
+    READY = "ready"
+    CREATING_NO_PRIOR = "creating-no-prior"
+    PRIOR_STAGED = "prior-staged"
+    ROLLBACK_PENDING = "rollback-pending"
+    COMMITTED = "committed"
+    CLEANUP_PENDING = "cleanup-pending"
+
+
+class PreparedOverwriteTransaction:
+    """One exact Overwrite transaction, frozen to the accepted target.
+
+    The phase is assigned before every fallible filesystem transition.  A
+    failed cleanup therefore leaves a precise retry owner rather than a
+    collection of booleans whose relationship must be reconstructed from the
+    current filesystem.
+    """
+
+    __slots__ = (
+        "enabled",
+        "target",
+        "backup",
+        "phase",
+        "_resume_pool",
+    )
+
+    def __init__(self, mode: str, target: str):
+        self.enabled = str(mode) == "Overwrite"
+        self.target = Path(target)
+        self.backup = self.target.with_name(
+            self.target.name + _REPLACING_SUFFIX)
+        self.phase = OverwritePhase.READY
+        self._resume_pool = None
+
+    @property
+    def ready_for_retry(self) -> bool:
+        return self.phase is OverwritePhase.READY
+
+    @property
+    def committed(self) -> bool:
+        return self.phase in {
+            OverwritePhase.COMMITTED,
+            OverwritePhase.CLEANUP_PENDING,
+        }
+
+    def retain_pool_resume(self, pool) -> None:
+        self._resume_pool = pool
+
+    def finish_pool_cleanup(self) -> None:
+        """Complete an interrupted pool-resume before releasing this owner."""
+        pool = self._resume_pool
+        if pool is None:
+            return
+        pool.resume(str(self.target))
+        self._resume_pool = None
+
+    def finish_filesystem_cleanup(self) -> None:
+        """Complete the exact filesystem phase retained by this owner.
+
+        The caller holds both writer isolation boundaries.  A failure leaves
+        the phase and paths unchanged, so public envelope release can retry
+        the same cleanup rather than dropping a partially-created target or
+        the only durable prior-result backup.
+        """
+        if self.phase is OverwritePhase.ROLLBACK_PENDING:
+            if self.target.exists():
+                self.target.unlink()
+            if self.backup.exists():
+                os.replace(self.backup, self.target)
+            self.phase = OverwritePhase.READY
+            return
+        if self.phase is OverwritePhase.CLEANUP_PENDING:
+            try:
+                self.backup.unlink()
+            except FileNotFoundError:
+                pass
+            self.phase = OverwritePhase.COMMITTED
+
+
+class PreparedXyeOutput:
+    """Run-owned XYE entries and stale-tail cleanup state."""
+
+    __slots__ = ("lock", "staged", "ready", "tail_pending", "ready_dirs")
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.staged: list[tuple[int, object]] = []
+        self.ready: list[tuple[int, object]] = []
+        # None = never discovered; [] = discovered and clean.
+        self.tail_pending: list[Path] | None = None
+        self.ready_dirs: set[str] = set()
+
+    @property
+    def entries(self) -> list[tuple[int, object]]:
+        """Detached inspection of every entry still owned by this run."""
+        with self.lock:
+            return list(self.ready) + list(self.staged)
+
+    def stage(self, idx: int, frame) -> None:
+        with self.lock:
+            self.staged.append((int(idx), frame))
+
+    def qualify(self, published_idxs) -> bool:
+        """Move successfully published staged entries into the ready set."""
+        with self.lock:
+            if published_idxs is None:
+                allowed = None
+            else:
+                allowed = {int(value) for value in published_idxs}
+            if allowed is None:
+                qualified = self.staged
+            else:
+                qualified = [
+                    item for item in self.staged if int(item[0]) in allowed]
+            self.staged = []
+            self.ready.extend(qualified)
+            return bool(self.ready)
+
+    def drain(self) -> list[tuple[int, object]]:
+        with self.lock:
+            entries = self.ready
+            self.ready = []
+            return entries
+
+    def retire(self) -> int:
+        with self.lock:
+            count = len(self.staged) + len(self.ready)
+            self.staged = []
+            self.ready = []
+            return count
+
+
 class PreparedNexusExecution:
     """The ONE prepared execution envelope for a NeXus run (§17.8 item 1).
 
@@ -167,10 +303,19 @@ class PreparedNexusExecution:
       retry can complete them instead of destroying or forgetting them).
     """
 
-    __slots__ = ("frozen", "target", "stack", "scan_metadata", "scan", "poni",
-                 "output_committed", "target_replaced", "replacement_backup",
-                 "commit_leftover_backup", "xye_tail_pending",
-                 "xye_withheld_idxs", "_closed")
+    __slots__ = (
+        "frozen",
+        "target",
+        "stack",
+        "scan_metadata",
+        "scan",
+        "poni",
+        "append_qualified",
+        "overwrite",
+        "xye",
+        "_adopted",
+        "_closed",
+    )
 
     def __init__(self, frozen, target, stack=None, scan_metadata=None):
         self.frozen = frozen
@@ -180,33 +325,26 @@ class PreparedNexusExecution:
         self.scan = None
         self.poni = target.poni() if target is not None else None
         #: Append qualification finished successfully (never set on refusal).
-        self.output_committed = False
-        #: An Overwrite replacement has been COMMITTED by a successful writer.
-        self.target_replaced = False
-        #: §19.3: the backup path of an UNRESOLVED rollback -- a writer failed,
-        #: and restoring the durable prior from the staging suffix failed too.
-        #: A later writer attempt must first complete this rollback; it may
-        #: never delete the backup merely to reuse the suffix.
-        self.replacement_backup = None
-        #: Panel finding R3-F2: a backup RESOLVED by a successful commit whose
-        #: unlink failed (transient reader/AV/NFS lock).  Disposable -- and the
-        #: envelope's fact to finish: each later successful commit retries the
-        #: removal, and a leftover still present at run end is surfaced
-        #: visibly.  Without this, one transient lock strands a suffix that
-        #: permanently refuses every later Overwrite run.
-        self.commit_leftover_backup = None
-        #: ``None`` until the stale XYE set is discovered (once, before this run
-        #: writes); then the list of artifacts still awaiting deletion.
-        self.xye_tail_pending = None
-        #: §19.4: the published frame indices whose XYE output is WITHHELD
-        #: while stale cleanup is pending -- preserved so a later clean flush
-        #: publishes exactly this run's landed frames, never a mixed identity.
-        self.xye_withheld_idxs = set()
+        self.append_qualified = False
+        self.overwrite = PreparedOverwriteTransaction(
+            getattr(frozen, "output_mode", "Append"),
+            target.output_path,
+        )
+        self.xye = PreparedXyeOutput()
+        self._adopted = False
         self._closed = False
 
     def owns(self, frozen) -> bool:
         """True only for the exact object this envelope was prepared for."""
         return frozen is self.frozen
+
+    @property
+    def adopted(self) -> bool:
+        """Whether every fallible worker-cursor adoption step completed."""
+        return self._adopted
+
+    def mark_adopted(self) -> None:
+        self._adopted = True
 
     def close(self) -> None:
         """Close the raw stack exactly once, retaining failed cleanup.
@@ -318,16 +456,10 @@ class nexusThread(wranglerThread):
             # inside the run appends into what this run created and the final
             # save can never mix a previous identity's rows under the new
             # provenance.  ``replace`` stays False here for exactly that reason.
-            with self.file_lock:
-                pool = _get_h5pool()
-                pool.pause(scan.data_file)
-                try:
-                    scan.default_geometry()
-                    scan.save_to_nexus(
-                        replace=False, finalize=is_finalize,
-                    )
-                finally:
-                    pool.resume(scan.data_file)
+            scan.default_geometry()
+            scan.save_to_nexus(
+                replace=False, finalize=is_finalize,
+            )
 
         # §16.4/§17.5: if no periodic save happened, THIS is the run's first
         # writer action, so the atomic Overwrite replacement belongs here -- the
@@ -552,7 +684,7 @@ class nexusThread(wranglerThread):
           until the raw stack is proved and a writer action COMMITS a
           replacement, exactly once (see :meth:`_write_run_result`).
 
-        The envelope's ``output_committed`` flag is set only after every proof
+        The envelope's ``append_qualified`` flag is set only after every proof
         and the reapply have succeeded.  The parent assigned its equivalent
         latch on entry, so one malformed or foreign target refused once and
         then let an exact retry return early, bypassing qualification entirely.
@@ -564,17 +696,16 @@ class nexusThread(wranglerThread):
             return False
         Path(os.path.dirname(scan.data_file)).mkdir(parents=True,
                                                     exist_ok=True)
-        if prepared.output_committed:
+        if prepared.append_qualified:
             return False
         if str(getattr(frozen, "output_mode", "Append")) == "Overwrite":
             # §16.4: retain the old target.  The first successful writer action
             # replaces it; nothing is destroyed during preparation.
-            prepared.output_committed = True
             return False
 
         target = Path(scan.data_file)
         if not target.exists():
-            prepared.output_committed = True
+            prepared.append_qualified = True
             return False
 
         def refuse(detail):
@@ -629,157 +760,211 @@ class nexusThread(wranglerThread):
             _apply_frozen_run_configuration(scan, frozen)
             for key, value in frozen.scan_args().items():
                 setattr(scan, key, value)
-        prepared.output_committed = True
+        prepared.append_qualified = True
         return True
 
-    def _begin_target_replacement(self, prepared, scan):
-        """Move a prior Overwrite target aside so a writer failure can undo it.
-
-        O-3N.R.2 §17.5.  The parent unlinked the prior target and only then
-        called the writer, so an injected writer failure left no old target and
-        no new result.  A rename within the output directory is atomic, so
-        there is no instant at which neither file exists; the backup is dropped
-        on commit and restored on rollback.
-
-        O-3N.R.3 §19.3: staging never destroys a durable prior.  Two cases the
-        parent got wrong by unconditionally unlinking an existing backup:
-
-        * the ENVELOPE's own unresolved rollback (a writer failed AND restoring
-          the prior failed) -- the backup is the only byte-identical prior
-          result.  A retry first COMPLETES that rollback: discard the failed
-          partial, restore the backup, and only then stage again.  If the
-          repair fails once more, the raise refuses this writer attempt with
-          the prior still safe at the staging suffix;
-        * a backup this envelope never staged (a crashed earlier process) --
-          indistinguishable on disk from an unresolved rollback, so it is
-          REFUSED loudly rather than destroyed.  Only a successful writer
-          commit may discard a durable prior.
-
-        Returns the backup path, or ``None`` when there is nothing to protect.
-        """
-        frozen = prepared.frozen
-        if str(getattr(frozen, "output_mode", "Append")) != "Overwrite":
-            return None
-        if prepared.target_replaced:
-            return None
-        target = Path(scan.data_file)
-        backup = target.with_name(target.name + _REPLACING_SUFFIX)
-        with self.file_lock:
-            pool = _get_h5pool()
-            pool.pause(str(target))
-            try:
-                pending = prepared.replacement_backup
-                if pending is not None:
-                    # Complete THIS run's unresolved rollback before anything
-                    # else: partial out, durable prior back at the target.
-                    if target.exists():
-                        target.unlink()
-                    os.replace(pending, target)
-                    prepared.replacement_backup = None
-                    logger.info(
-                        '[NEXUS] Overwrite: completed the pending rollback of '
-                        '%s before restaging', target)
-                if not target.exists():
-                    return None
-                if backup.exists():
-                    message = (
-                        f"an unresolved prior-result backup occupies "
-                        f"{backup}; refusing to destroy it to stage a new "
-                        f"replacement — restore or remove it first")
-                    # Visible as well as raised: the refusal reaches the
-                    # operator on the label even though the raise ends the
-                    # run through the untyped writer-error path.
-                    try:
-                        self.showLabel.emit(f"Run refused: {message}")
-                    except Exception:
-                        logger.debug("showLabel emit failed for staging "
-                                     "refusal", exc_info=True)
-                    raise OSError(message)
-                os.replace(target, backup)
-            finally:
-                pool.resume(str(target))
-        return backup
-
-    def _rollback_target_replacement(self, prepared, scan, backup):
-        """Restore the prior Overwrite target byte-for-byte after a failure.
-
-        §19.3: a FAILED restore is carried on the envelope as the unresolved
-        ``replacement_backup`` fact, so the next writer attempt completes the
-        rollback instead of deleting the only durable prior to reuse the
-        staging suffix.
-        """
-        target = Path(scan.data_file)
-        with self.file_lock:
-            pool = _get_h5pool()
-            pool.pause(str(target))
-            try:
-                if target.exists():
-                    target.unlink()            # discard the failed partial
-                os.replace(backup, target)
-                prepared.replacement_backup = None
-            except OSError:
-                # Loud, RECOVERABLE, and REMEMBERED: the prior result is still
-                # on disk under the staging name, and the envelope now owns
-                # completing this rollback before any restage.
-                prepared.replacement_backup = backup
-                logger.error(
-                    '[NEXUS] Overwrite rollback failed; the prior result is '
-                    'preserved at %s', backup, exc_info=True)
-            finally:
-                pool.resume(str(target))
-
-    def _write_run_result(self, prepared, scan, write):
-        """ONE atomic writer transaction for this run (§17.5).
-
-        Every ``.nxs`` writer action of a NeXus run goes through here --
-        periodic and final alike -- so "replace at the first SUCCESSFUL writer
-        action" is a property of the transaction rather than of one call site.
-        The once-only replacement identity is consumed after the commit, never
-        before: a failed writer restores the prior target and leaves one exact
-        retry available.
-        """
-        backup = nexusThread._begin_target_replacement(self, prepared, scan)
+    def _emit_overwrite_refusal(self, message):
         try:
-            result = write()
+            self.showLabel.emit(f"Run refused: {message}")
+        except Exception:
+            logger.debug("showLabel emit failed for staging refusal",
+                         exc_info=True)
+
+    def _repair_overwrite_locked(self, transaction):
+        """Complete an exact pending rollback before another writer attempt."""
+        if transaction.phase is not OverwritePhase.ROLLBACK_PENDING:
+            return
+        target = transaction.target
+        backup = transaction.backup
+        try:
+            if target.exists():
+                target.unlink()
+            if backup.exists():
+                os.replace(backup, target)
         except BaseException:
-            if backup is not None:
-                nexusThread._rollback_target_replacement(
-                    self, prepared, scan, backup)
+            logger.error(
+                "[NEXUS] Overwrite rollback remains pending for %s",
+                target,
+                exc_info=True,
+            )
             raise
-        if str(getattr(prepared.frozen, "output_mode", "Append")) == "Overwrite":
-            if not prepared.target_replaced:
-                logger.info(
-                    '[NEXUS] Overwrite: replaced %s at the first successful '
-                    'writer action', scan.data_file)
-            prepared.target_replaced = True
-        # Panel finding R3-F2: a leftover from an EARLIER successful commit of
-        # this run is disposable -- retry its removal at each later commit so
-        # a transient lock does not strand the staging suffix (which a future
-        # run's envelope could not distinguish from an unresolved rollback and
-        # would refuse over).
-        leftover = prepared.commit_leftover_backup
-        if leftover is not None:
+        transaction.phase = OverwritePhase.READY
+        logger.info("[NEXUS] completed pending Overwrite rollback for %s",
+                    target)
+
+    def _rollback_overwrite_locked(self, transaction):
+        """Restore a prior result, or remove a failed no-prior creation."""
+        target = transaction.target
+        backup = transaction.backup
+        had_prior = transaction.phase is OverwritePhase.PRIOR_STAGED
+        transaction.phase = OverwritePhase.ROLLBACK_PENDING
+        try:
+            if target.exists():
+                target.unlink()
+            if had_prior:
+                os.replace(backup, target)
+        except BaseException:
+            logger.error(
+                "[NEXUS] Overwrite rollback failed; exact cleanup remains "
+                "owned for %s",
+                target,
+                exc_info=True,
+            )
+            return
+        transaction.phase = OverwritePhase.READY
+
+    def _execute_overwrite_locked(self, transaction, write):
+        """Execute one writer while the caller owns lock and pool exclusion."""
+        if not transaction.enabled:
+            return write()
+
+        nexusThread._repair_overwrite_locked(self, transaction)
+        target = transaction.target
+        backup = transaction.backup
+
+        if transaction.phase is OverwritePhase.CLEANUP_PENDING:
             try:
-                leftover.unlink()
+                backup.unlink()
             except FileNotFoundError:
-                prepared.commit_leftover_backup = None
+                transaction.phase = OverwritePhase.COMMITTED
             except OSError:
                 logger.warning(
-                    '[NEXUS] the superseded backup is still locked: %s',
-                    leftover, exc_info=True)
+                    "[NEXUS] superseded backup cleanup remains pending: %s",
+                    backup,
+                    exc_info=True,
+                )
             else:
-                prepared.commit_leftover_backup = None
-                logger.info('[NEXUS] removed the previously locked superseded '
-                            'backup %s', leftover)
-        if backup is not None:
+                transaction.phase = OverwritePhase.COMMITTED
+
+        if transaction.committed:
+            return write()
+
+        # A suffix not owned by this transaction is always a durable prior.
+        # Check it before the absent-target branch.
+        if backup.exists():
+            message = (
+                f"an unresolved prior-result backup occupies {backup}; "
+                "refusing to destroy it to stage a new replacement — restore "
+                "or remove it first")
+            nexusThread._emit_overwrite_refusal(self, message)
+            raise OSError(message)
+
+        if target.exists():
+            transaction.phase = OverwritePhase.PRIOR_STAGED
+            try:
+                os.replace(target, backup)
+            except BaseException:
+                transaction.phase = (
+                    OverwritePhase.ROLLBACK_PENDING
+                    if backup.exists() else OverwritePhase.READY)
+                raise
+        else:
+            transaction.phase = OverwritePhase.CREATING_NO_PRIOR
+
+        try:
+            result = write()
+            if not target.exists():
+                raise OSError(
+                    f"the writer returned without creating accepted output "
+                    f"{target}")
+        except BaseException:
+            nexusThread._rollback_overwrite_locked(self, transaction)
+            raise
+
+        if transaction.phase is OverwritePhase.PRIOR_STAGED:
+            transaction.phase = OverwritePhase.CLEANUP_PENDING
             try:
                 backup.unlink()
             except OSError:
-                prepared.commit_leftover_backup = backup
                 logger.warning(
-                    '[NEXUS] the replaced prior target could not be removed: '
-                    '%s', backup, exc_info=True)
+                    "[NEXUS] replaced prior cleanup remains pending: %s",
+                    backup,
+                    exc_info=True,
+                )
+            else:
+                transaction.phase = OverwritePhase.COMMITTED
+        else:
+            transaction.phase = OverwritePhase.COMMITTED
+        logger.info("[NEXUS] Overwrite committed %s", target)
         return result
+
+    def _write_run_result(self, prepared, scan, write):
+        """Run one writer inside the exact accepted output transaction.
+
+        One outer reentrant ``file_lock`` and one refcounted HDF5-pool pause
+        span staging, the writer, rollback/commit, and backup disposition.
+        Readers can therefore never observe the canonical pathname between
+        transaction phases.
+        """
+        transaction = prepared.overwrite
+        actual = Path(scan.data_file)
+        if actual != transaction.target:
+            raise RunConfigurationRefused(
+                "foreign",
+                stage="nexus-output-transaction",
+                detail=(
+                    f"scan output {actual} is not the accepted output "
+                    f"{transaction.target}"),
+                generation=int(
+                    getattr(prepared.frozen, "generation", 0) or 0),
+            )
+
+        pool = _get_h5pool()
+        primary = None
+        result = None
+        with self.file_lock:
+            transaction.finish_pool_cleanup()
+            pool.pause(str(transaction.target))
+            try:
+                try:
+                    result = nexusThread._execute_overwrite_locked(
+                        self, transaction, write)
+                except BaseException as exc:
+                    primary = exc
+            finally:
+                try:
+                    pool.resume(str(transaction.target))
+                except BaseException as exc:
+                    transaction.retain_pool_resume(pool)
+                    if primary is None:
+                        raise
+                    raise primary.with_traceback(primary.__traceback__) from exc
+        if primary is not None:
+            raise primary.with_traceback(primary.__traceback__)
+        return result
+
+    def _finish_overwrite_cleanup(self, prepared):
+        """Retry the prepared transaction's exact terminal cleanup.
+
+        Cleanup runs under the same lock and refcounted pool exclusion as a
+        writer action.  Failure retains both the envelope and transaction
+        phase; a repeated public release retries only this owner.
+        """
+        transaction = prepared.overwrite
+        with self.file_lock:
+            transaction.finish_pool_cleanup()
+            if transaction.phase not in {
+                    OverwritePhase.ROLLBACK_PENDING,
+                    OverwritePhase.CLEANUP_PENDING}:
+                return
+            pool = _get_h5pool()
+            pool.pause(str(transaction.target))
+            primary = None
+            try:
+                transaction.finish_filesystem_cleanup()
+            except BaseException as exc:
+                primary = exc
+            finally:
+                try:
+                    pool.resume(str(transaction.target))
+                except BaseException as exc:
+                    transaction.retain_pool_resume(pool)
+                    if primary is None:
+                        raise
+                    raise primary.with_traceback(
+                        primary.__traceback__) from exc
+            if primary is not None:
+                raise primary.with_traceback(primary.__traceback__)
 
     def _adopt_frozen_source_target(self, prepared):
         """Initialize this worker's runtime cursors FROM the accepted values.
@@ -821,42 +1006,37 @@ class nexusThread(wranglerThread):
         prepared = nexusThread._require_execution(self, frozen)
         return nexusThread._write_run_result(
             self, prepared, scan,
-            lambda: wranglerThread._save_to_disk(self, frozen, scan))
+            lambda: scan._save_to_nexus())
 
     def _flush_xye_buffer(self, scan, published_idxs=None):
-        """Flush XYE, clearing an earlier longer run's tail under Overwrite.
+        """Qualify and flush this prepared run's owned XYE entries.
 
-        §16.4: an Overwrite XYE run must not leave higher-frame files from a
-        previous, longer run beside this run's output.
-
-        O-3N.R.3 §19.4: the tail outcome GATES this run's publication.  The
-        parent retained the pending set but delegated to the base writer
-        unconditionally, so a persistent delete failure published new XYE
-        files beside the old one — exactly the mixed-run state §17.8 item 6
-        forbids.  While cleanup is pending, the buffer is NOT drained (the
-        entries are this run's tail, preserved for retry) and the landed frame
-        indices are accumulated on the envelope so a later clean flush
-        publishes exactly this run's frames — never a mixed identity, and
-        never the base writer's drop-unpublished contract violated.
+        Reduced frames are merely staged.  Only indices whose publication
+        completed become eligible, and at least one eligible entry must exist
+        before an Overwrite run may discover/delete a prior tail.  Pending
+        cleanup retains those exact entries on the prepared envelope.
         """
         prepared = getattr(self, "_execution", None)
-        if prepared is not None:
-            if not nexusThread._clear_stale_xye_tail(self, prepared, scan):
-                if published_idxs is not None:
-                    prepared.xye_withheld_idxs |= {
-                        int(i) for i in published_idxs}
-                logger.warning(
-                    '[NEXUS] Overwrite: stale-XYE cleanup is PENDING; '
-                    'withholding this flush (%d buffered entries kept)',
-                    len(getattr(self, "_xye_buffer", ()) or ()))
-                return
-            if prepared.xye_withheld_idxs:
-                if published_idxs is not None:
-                    published_idxs = ({int(i) for i in published_idxs}
-                                      | prepared.xye_withheld_idxs)
-                prepared.xye_withheld_idxs = set()
-        return wranglerThread._flush_xye_buffer(
-            self, scan, published_idxs=published_idxs)
+        if prepared is None:
+            return
+        xye = prepared.xye
+        if not xye.qualify(published_idxs):
+            return
+        if not nexusThread._clear_stale_xye_tail(self, prepared, scan):
+            logger.warning(
+                '[NEXUS] Overwrite: stale-XYE cleanup is PENDING; '
+                'withholding this flush (%d owned entries kept)',
+                len(xye.entries),
+            )
+            return
+        entries = xye.drain()
+        return wranglerThread._write_xye_entries(
+            self,
+            scan,
+            entries,
+            ready_dirs=xye.ready_dirs,
+            ready_lock=xye.lock,
+        )
 
     def _clear_stale_xye_tail(self, prepared, scan):
         """All-or-pending stale-XYE deletion for an Overwrite run (§17.6).
@@ -881,19 +1061,20 @@ class nexusThread(wranglerThread):
         """
         if str(getattr(prepared.frozen, "output_mode", "Append")) != "Overwrite":
             return True
-        if prepared.xye_tail_pending is None:
+        xye = prepared.xye
+        if xye.tail_pending is None:
             root = Path(os.path.dirname(scan.data_file)) / str(scan.name)
-            prepared.xye_tail_pending = (sorted(root.glob("*.xye"))
-                                         if root.is_dir() else [])
+            xye.tail_pending = (sorted(root.glob("*.xye"))
+                                if root.is_dir() else [])
         remaining = []
-        for stale in prepared.xye_tail_pending:
+        for stale in xye.tail_pending:
             try:
                 stale.unlink()
             except FileNotFoundError:
                 continue
             except OSError:
                 remaining.append(stale)
-        prepared.xye_tail_pending = remaining
+        xye.tail_pending = remaining
         if remaining:
             logger.warning(
                 '[NEXUS] Overwrite: %d stale XYE file(s) could not be removed; '
@@ -923,19 +1104,15 @@ class nexusThread(wranglerThread):
         # the first chunk, a failed GI freeze scout — the prior run's XYE
         # files stay untouched, exactly as the ``.nxs`` half already behaves
         # (``_final_save_to_nexus`` no-ops on zero processed frames).
-        stake = (prepared.xye_tail_pending is not None
-                 or bool(prepared.xye_withheld_idxs))
-        if not stake:
-            with self._xye_lock:
-                stake = bool(self._xye_buffer)
+        xye = prepared.xye
+        stake = xye.tail_pending is not None or bool(xye.entries)
         if not stake:
             return True
-        self._flush_xye_buffer(scan, published_idxs=set())
-        pending = list(prepared.xye_tail_pending or ())
+        self._flush_xye_buffer(scan, published_idxs=None)
+        pending = list(xye.tail_pending or ())
         if not pending:
             return True
-        with self._xye_lock:
-            withheld = len(self._xye_buffer)
+        withheld = len(xye.entries)
         message = (
             f'Run INCOMPLETE — {len(pending)} stale XYE file(s) from a prior '
             f'run could not be removed; {withheld} new XYE file(s) withheld '
@@ -977,7 +1154,11 @@ class nexusThread(wranglerThread):
         """
         prepared = getattr(self, "_execution", None)
         if prepared is not None and prepared.owns(frozen):
-            return prepared
+            if prepared.adopted:
+                return prepared
+            # A prior adoption fault retained this envelope solely as a
+            # cleanup owner.  Complete that cleanup before preparing anew.
+            nexusThread._release_execution(self)
         accepted = nexusThread._require_run_configuration(
             self, "nexus-execution-preparation", candidate=frozen)
         # A superseded envelope never lingers beside a new one.
@@ -990,9 +1171,17 @@ class nexusThread(wranglerThread):
             prepared = PreparedNexusExecution(
                 accepted, target, source.stack, source.scan_metadata)
             nexusThread._adopt_frozen_source_target(self, prepared)
-        except BaseException:
+            prepared.mark_adopted()
+        except BaseException as primary:
             if prepared is not None:
-                prepared.close()
+                try:
+                    prepared.close()
+                except BaseException as cleanup:
+                    # The envelope is not executable, but remains the exact
+                    # retry owner for its source.  A later public release or
+                    # preparation attempt completes only this cleanup.
+                    self._execution = prepared
+                    raise cleanup from primary
             elif source is not None:
                 try:
                     source.stack.close()
@@ -1005,7 +1194,8 @@ class nexusThread(wranglerThread):
     def _require_execution(self, frozen):
         """The prepared envelope for the EXACT object, or a typed refusal."""
         prepared = getattr(self, "_execution", None)
-        if prepared is None or not prepared.owns(frozen):
+        if (prepared is None or not prepared.owns(frozen)
+                or not prepared.adopted):
             raise RunConfigurationRefused(
                 "foreign", stage="nexus-execution",
                 detail=("no prepared execution envelope owns this frozen "
@@ -1030,19 +1220,31 @@ class nexusThread(wranglerThread):
         """
         prepared = getattr(self, "_execution", None)
         if prepared is not None:
-            if (getattr(prepared, "xye_withheld_idxs", None)
-                    or getattr(prepared, "xye_tail_pending", None)):
-                lock = getattr(self, "_xye_lock", None)
-                if lock is not None:
-                    with lock:
-                        dropped = len(self._xye_buffer)
-                        self._xye_buffer = []
-                    if dropped:
-                        logger.warning(
-                            '[NEXUS] dropped %d withheld XYE entrie(s) with '
-                            'their released envelope; they were never '
-                            'published (run ended PENDING)', dropped)
-            prepared.close()
+            xye = getattr(prepared, "xye", None)
+            dropped = xye.retire() if xye is not None else 0
+            if dropped:
+                logger.warning(
+                    '[NEXUS] dropped %d uncommitted XYE entrie(s) with their '
+                    'released run owner', dropped)
+            primary = None
+            if getattr(prepared, "overwrite", None) is not None:
+                try:
+                    nexusThread._finish_overwrite_cleanup(self, prepared)
+                except BaseException as exc:
+                    primary = exc
+            try:
+                prepared.close()
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+                else:
+                    logger.error(
+                        "[NEXUS] source cleanup also failed while output "
+                        "cleanup remained pending",
+                        exc_info=True,
+                    )
+            if primary is not None:
+                raise primary.with_traceback(primary.__traceback__)
             self._execution = None
 
     def _project_gi_modes_onto_display_scan(self, frozen):
@@ -1300,18 +1502,19 @@ class nexusThread(wranglerThread):
                 for frame in frames:
                     if frame is None:
                         continue
-                    with self._xye_lock:
-                        self._xye_buffer.append((frame.idx, frame))
+                    prepared.xye.stage(frame.idx, frame)
 
                 # ── Serial accumulation into the scan ─────────────
                 # scan.add_frame and the sigUpdate emit happen serially; scan
                 # isn't thread-safe for concurrent writes, and the GUI widgets
                 # it feeds aren't either.
+                published_idxs = set()
                 for frame in frames:
                     if frame is None:
                         continue
                     self._publish(frozen, scan, frame)
                     self.sigUpdate.emit(frame.idx)
+                    published_idxs.add(int(frame.idx))
                     files_processed += 1
                     frames_since_save += 1
 
@@ -1325,7 +1528,6 @@ class nexusThread(wranglerThread):
                 # headless reduction call so a Stop-aborted batch doesn't
                 # leave orphan XYE files for frames that never landed in .nxs.
                 _t_xye = time.time()
-                published_idxs = {a.idx for a in frames if a is not None}
                 self._flush_xye_buffer(scan, published_idxs=published_idxs)
                 _t_xye = time.time() - _t_xye
 
@@ -1393,8 +1595,11 @@ class nexusThread(wranglerThread):
         # Panel finding R3-F2, visibility half: a superseded backup the
         # commits could not remove is surfaced NOW, on the visible label --
         # not discovered at the next run's unexplained staging refusal.
-        leftover = prepared.commit_leftover_backup
-        if leftover is not None:
+        transaction = prepared.overwrite
+        leftover = (transaction.backup
+                    if transaction.phase is OverwritePhase.CLEANUP_PENDING
+                    else None)
+        if leftover is not None and leftover.exists():
             message = (f'Done, with one leftover: the superseded backup '
                        f'{leftover.name} could not be removed and will block '
                        f'the next Overwrite run — remove it by hand.')
@@ -1553,4 +1758,3 @@ class nexusThread(wranglerThread):
     # from the chunk loop every LIVE_SAVE_INTERVAL frames so the
     # on-disk file stays close to in-memory state even if the user
     # kills the process mid-scan.
-

@@ -36,6 +36,7 @@ from xdart.gui.tabs.static_scan.wranglers import (  # noqa: E402
     nexus_wrangler_thread as nwt,
 )
 from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler_thread import (  # noqa: E402
+    FrozenSourceTarget,
     nexusThread,
 )
 from xdart.utils.h5pool import H5FilePool  # noqa: E402
@@ -160,6 +161,63 @@ def test_failed_source_close_retains_exact_cleanup_owner_for_retry() -> None:
     assert calls == ["close", "close"]
 
 
+def test_failed_adoption_close_retains_non_executable_cleanup_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frozen = SimpleNamespace(output_mode="Overwrite", generation=7)
+    target = FrozenSourceTarget(
+        uri=str(tmp_path / "source.nxs"),
+        entry="entry",
+        scan_name="scan",
+        output_path=str(tmp_path / "output.nxs"),
+    )
+    closes: list[str] = []
+
+    class _Stack:
+        def close(self):
+            closes.append("close")
+            if len(closes) == 1:
+                raise OSError("cleanup failed once")
+
+    source = SimpleNamespace(stack=_Stack(), scan_metadata=None)
+    worker = SimpleNamespace(
+        _execution=None,
+        file_lock=threading.RLock(),
+        showLabel=_Signal(),
+    )
+    monkeypatch.setattr(
+        nexusThread,
+        "_require_run_configuration",
+        lambda _self, _stage, candidate=None: candidate,
+    )
+    monkeypatch.setattr(
+        nexusThread, "_frozen_source_target", lambda _frozen: target)
+    monkeypatch.setattr(
+        nexusThread, "_preflight_execution_target",
+        lambda _self, _target: source,
+    )
+    monkeypatch.setattr(
+        nexusThread, "_adopt_frozen_source_target",
+        lambda _self, _prepared: (_ for _ in ()).throw(
+            RuntimeError("adoption failed")),
+    )
+
+    with pytest.raises(OSError, match="cleanup failed once"):
+        nexusThread._prepare_execution(worker, frozen)
+
+    prepared = worker._execution
+    assert prepared is not None
+    assert not prepared.adopted
+    with pytest.raises(Exception, match="no prepared execution"):
+        nexusThread._require_execution(worker, frozen)
+
+    nexusThread._release_execution(worker)
+
+    assert closes == ["close", "close"]
+    assert worker._execution is None
+
+
 def _overwrite_host(target: Path):
     frozen = SimpleNamespace(output_mode="Overwrite")
     prepared = _envelope(frozen, target)
@@ -189,6 +247,133 @@ def test_failed_first_overwrite_removes_partial_when_no_prior_exists(
 
     assert not target.exists()
     assert prepared.overwrite.ready_for_retry
+
+
+def test_failed_no_prior_cleanup_is_retained_and_retried_on_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "partial-result.nxs"
+    prepared, worker, scan = _overwrite_host(target)
+    worker._execution = prepared
+    pool = SimpleNamespace(pause=lambda _path: None, resume=lambda _path: None)
+    monkeypatch.setattr(nwt, "_get_h5pool", lambda: pool)
+    real_unlink = Path.unlink
+    attempts: list[str] = []
+    writes: list[str] = []
+
+    def fail_once(path, *args, **kwargs):
+        if Path(path) == target and not attempts:
+            attempts.append("failed")
+            raise OSError("unlink failed once")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_once)
+
+    def fail_writer():
+        writes.append("write")
+        target.write_bytes(b"partial")
+        raise OSError("writer failed")
+
+    with pytest.raises(OSError, match="writer failed"):
+        nexusThread._write_run_result(worker, prepared, scan, fail_writer)
+
+    assert target.read_bytes() == b"partial"
+    assert prepared.overwrite.phase is nwt.OverwritePhase.ROLLBACK_PENDING
+
+    nexusThread._release_execution(worker)
+
+    assert writes == ["write"]
+    assert not target.exists()
+    assert prepared.overwrite.ready_for_retry
+    assert worker._execution is None
+
+
+def test_failed_pool_resume_is_retained_without_replaying_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "resume-result.nxs"
+    prepared, worker, scan = _overwrite_host(target)
+    worker._execution = prepared
+    resumes: list[str] = []
+    writes: list[str] = []
+
+    class _Pool:
+        @staticmethod
+        def pause(_path):
+            return None
+
+        @staticmethod
+        def resume(_path):
+            resumes.append("resume")
+            if len(resumes) == 1:
+                raise OSError("resume failed once")
+
+    pool = _Pool()
+    monkeypatch.setattr(nwt, "_get_h5pool", lambda: pool)
+
+    def writer():
+        writes.append("write")
+        target.write_bytes(b"complete")
+
+    with pytest.raises(OSError, match="resume failed once"):
+        nexusThread._write_run_result(worker, prepared, scan, writer)
+
+    assert target.read_bytes() == b"complete"
+    assert prepared.overwrite.committed
+    assert writes == ["write"]
+
+    nexusThread._release_execution(worker)
+
+    assert resumes == ["resume", "resume"]
+    assert writes == ["write"]
+    assert worker._execution is None
+
+
+def test_output_cleanup_failure_still_closes_source_and_retains_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "cleanup-result.nxs"
+    prepared, worker, _scan = _overwrite_host(target)
+    worker._execution = prepared
+    backup = prepared.overwrite.backup
+    backup.write_bytes(b"superseded prior")
+    prepared.overwrite.phase = nwt.OverwritePhase.CLEANUP_PENDING
+    closes: list[str] = []
+
+    class _Stack:
+        @staticmethod
+        def close():
+            closes.append("close")
+
+    prepared.stack = _Stack()
+    pool = SimpleNamespace(pause=lambda _path: None, resume=lambda _path: None)
+    monkeypatch.setattr(nwt, "_get_h5pool", lambda: pool)
+    real_unlink = Path.unlink
+
+    def refuse_backup(path, *args, **kwargs):
+        if Path(path) == backup:
+            raise OSError("backup cleanup blocked")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse_backup)
+
+    with pytest.raises(OSError, match="backup cleanup blocked"):
+        nexusThread._release_execution(worker)
+
+    assert closes == ["close"]
+    assert prepared._closed
+    assert worker._execution is prepared
+    assert backup.exists()
+
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    nexusThread._release_execution(worker)
+
+    assert closes == ["close"]
+    assert worker._execution is None
+    assert not backup.exists()
 
 
 def test_unowned_backup_refuses_before_absent_target_branch(

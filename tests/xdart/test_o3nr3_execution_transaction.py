@@ -374,17 +374,18 @@ def test_pending_stale_tail_withholds_this_runs_xye_write(
 
     writes: list[str] = []
 
-    def write_current(self, scan, published_idxs=None):
+    def write_current(self, scan, entries, **_kwargs):
         writes.append("write")
         current.write_text("new run")
 
     monkeypatch.setattr(Path, "unlink", refuse_stale)
-    monkeypatch.setattr(wranglerThread, "_flush_xye_buffer", write_current)
+    monkeypatch.setattr(wranglerThread, "_write_xye_entries", write_current)
+    prepared.xye.stage(0, object())
 
     nexusThread._flush_xye_buffer(worker, scan, published_idxs={0})
 
     assert stale.exists()
-    assert prepared.xye_tail_pending == [stale]
+    assert prepared.xye.tail_pending == [stale]
     assert writes == [], (
         "new XYE was written while stale cleanup remained pending")
     assert not current.exists(), (
@@ -519,7 +520,7 @@ def test_failed_rollback_retry_never_destroys_the_prior_result(
 
     assert backup.read_bytes() == prior
     assert target.read_bytes() == b"partial-1"
-    assert prepared.target_replaced is False
+    assert prepared.overwrite.committed is False
 
     with pytest.raises(OSError, match="writer failure 2"):
         nexusThread._write_run_result(worker, prepared, scan, fail_writer)
@@ -531,7 +532,7 @@ def test_failed_rollback_retry_never_destroys_the_prior_result(
     ]
     assert prior in surviving, (
         "the exact retry destroyed the only byte-identical prior result")
-    assert prepared.target_replaced is False
+    assert prepared.overwrite.committed is False
 
 
 def test_an_unowned_replacing_artifact_is_refused_not_destroyed(
@@ -561,7 +562,7 @@ def test_an_unowned_replacing_artifact_is_refused_not_destroyed(
     assert stray.read_bytes() == stray_bytes, (
         "the unowned backup was destroyed to reuse the staging suffix")
     assert target.read_bytes() == b"current prior"
-    assert prepared.target_replaced is False
+    assert prepared.overwrite.committed is False
 
 
 # --------------------------------------------------------------------------- #
@@ -632,7 +633,7 @@ def test_a_commit_leftover_backup_is_retried_at_the_next_commit(
         target.write_bytes(b"new run bytes")
 
     nexusThread._write_run_result(worker, prepared, scan, write_ok)
-    assert prepared.target_replaced is True
+    assert prepared.overwrite.committed is True
     assert backup.exists(), "the injected transient unlink failure never fired"
 
     nexusThread._write_run_result(worker, prepared, scan, write_ok)
@@ -647,8 +648,9 @@ def test_a_stuck_commit_backup_is_surfaced_at_run_end(
         widget, tmp_path, monkeypatch):
     """Panel finding R3-F2, visibility half: when the leftover cannot be
     removed by run end, the operator is TOLD — on the same visible label —
-    which file to remove, at the moment it happens, not at the next run's
-    unexplained failure."""
+    which file to remove, at the moment it happens.  O-3N.D strengthens that
+    outcome: the exact envelope also remains the retry owner until cleanup
+    succeeds; it is not discarded after logging."""
     wrangler = _select_nexus(widget)
     widget.controls.set_write_mode("Overwrite")
     src, out = _arm_pilatus(wrangler, tmp_path)
@@ -669,12 +671,20 @@ def test_a_stuck_commit_backup_is_surfaced_at_run_end(
     said: list[str] = []
     thread.showLabel.connect(said.append)
 
-    thread.run()
+    with pytest.raises(OSError, match="persistent lock"):
+        thread.run()
 
     assert backup.exists()
+    assert thread._execution is not None
     assert any(backup.name in m for m in said), (
         f"the stuck superseded backup was never surfaced to the operator: "
         f"{said}")
+
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    nexusThread._release_execution(thread)
+
+    assert thread._execution is None
+    assert not backup.exists()
 
 
 def test_release_drops_withheld_xye_entries_with_their_envelope(
@@ -685,16 +695,14 @@ def test_release_drops_withheld_xye_entries_with_their_envelope(
     wrangler = _select_nexus(widget)
     _src, _out, thread = _started(wrangler, tmp_path, monkeypatch)
     prepared = nexusThread._prepare_execution(thread, thread.run_configuration)
-    prepared.xye_tail_pending = [tmp_path / "scan" / "iq_scan_0009.xye"]
-    prepared.xye_withheld_idxs = {0, 1}
-    with thread._xye_lock:
-        thread._xye_buffer.append((0, object()))
-        thread._xye_buffer.append((1, object()))
+    prepared.xye.tail_pending = [
+        tmp_path / "scan" / "iq_scan_0009.xye"]
+    prepared.xye.stage(0, object())
+    prepared.xye.stage(1, object())
+    prepared.xye.qualify({0, 1})
 
     nexusThread._release_execution(thread)
 
-    with thread._xye_lock:
-        leftover = list(thread._xye_buffer)
-    assert leftover == [], (
+    assert prepared.xye.entries == [], (
         "withheld XYE entries outlived their envelope; a later run would "
         "publish them under its own identity")

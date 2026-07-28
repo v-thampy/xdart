@@ -414,7 +414,7 @@ def test_failed_append_qualification_remains_failed_on_exact_retry(
 
     with pytest.raises(RunConfigurationRefused):
         nexusThread._prepare_output_for_run(worker, prepared, scan)
-    assert prepared.output_committed is False
+    assert prepared.append_qualified is False
     with pytest.raises(RunConfigurationRefused):
         nexusThread._prepare_output_for_run(worker, prepared, scan)
     assert target.read_bytes() == b"prior"
@@ -459,13 +459,13 @@ def test_a_failed_replacement_does_not_consume_the_once_identity(
         thread._save_to_disk(frozen, scan)
 
     assert Path(scan.data_file).read_bytes() == prior
-    assert prepared.target_replaced is False, (
+    assert prepared.overwrite.committed is False, (
         "a failed replacement consumed the replace-once identity")
 
     thread._save_to_disk(frozen, scan)            # one exact retry, and it works
 
     assert Path(scan.data_file).read_bytes() != prior
-    assert prepared.target_replaced is True
+    assert prepared.overwrite.committed is True
     assert len(attempts) >= 2
 
 
@@ -490,16 +490,18 @@ def test_writer_failure_preserves_the_prior_durable_target(
     scan_b.add_frame(frame=_fake_frame(0), calculate=False, update=True,
                      get_sd=True, set_mg=False, static=True, batch_save=True)
 
-    def fail_writer(_self, _frozen, _scan):
-        raise OSError("injected writer failure")
-
-    monkeypatch.setattr(wranglerThread, "_save_to_disk", fail_writer)
+    monkeypatch.setattr(
+        scan_b,
+        "_save_to_nexus",
+        lambda: (_ for _ in ()).throw(
+            OSError("injected writer failure")),
+    )
     with pytest.raises(OSError, match="injected writer failure"):
         thread_b._save_to_disk(thread_b.run_configuration, scan_b)
 
     assert target.read_bytes() == prior, (
         "a failed replacement writer destroyed the prior durable target")
-    assert prepared.target_replaced is False
+    assert prepared.overwrite.committed is False
     assert sorted(p.name for p in target.parent.glob("*")
                   if p.suffix != ".nxs") == [], (
         "the rollback left staging debris beside the accepted target")
@@ -507,7 +509,7 @@ def test_writer_failure_preserves_the_prior_durable_target(
     monkeypatch.undo()                             # one exact retry, and it works
     thread_b._save_to_disk(thread_b.run_configuration, scan_b)
     assert target.read_bytes() != prior
-    assert prepared.target_replaced is True
+    assert prepared.overwrite.committed is True
 
 
 # --------------------------------------------------------------------------- #
@@ -527,11 +529,12 @@ def test_xye_tail_policy_uses_the_envelope_not_the_mutable_carrier(
     prepared = _envelope(accepted, tmp_path / "scan.nxs")
     worker = SimpleNamespace(run_configuration=foreign, _execution=prepared)
     scan = SimpleNamespace(data_file=str(tmp_path / "scan.nxs"), name="scan")
+    prepared.xye.stage(0, object())
     monkeypatch.setattr(
-        wranglerThread, "_flush_xye_buffer",
-        lambda self, scan, published_idxs=None: None)
+        wranglerThread, "_write_xye_entries",
+        lambda self, scan, entries, **kwargs: None)
 
-    nexusThread._flush_xye_buffer(worker, scan, published_idxs=set())
+    nexusThread._flush_xye_buffer(worker, scan, published_idxs={0})
 
     assert not stale.exists()
 
@@ -559,18 +562,19 @@ def test_xye_tail_cleanup_retries_a_transient_unlink_failure(
         return real_unlink(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "unlink", fail_once)
+    prepared.xye.stage(0, object())
     monkeypatch.setattr(
-        wranglerThread, "_flush_xye_buffer",
-        lambda self, scan, published_idxs=None: None)
+        wranglerThread, "_write_xye_entries",
+        lambda self, scan, entries, **kwargs: None)
 
-    nexusThread._flush_xye_buffer(worker, scan, published_idxs=set())
+    nexusThread._flush_xye_buffer(worker, scan, published_idxs={0})
     assert stale.exists(), "a failed deletion was reported as done"
-    assert prepared.xye_tail_pending, "the pending cleanup was forgotten"
+    assert prepared.xye.tail_pending, "the pending cleanup was forgotten"
 
     nexusThread._flush_xye_buffer(worker, scan, published_idxs=set())
 
     assert not stale.exists()
-    assert prepared.xye_tail_pending == []
+    assert prepared.xye.tail_pending == []
     assert len(attempts) == 2
 
 
@@ -588,12 +592,13 @@ def test_xye_tail_discovery_never_deletes_this_run_s_own_output(
     scan = SimpleNamespace(data_file=str(tmp_path / "scan.nxs"), name="scan")
     ours = root / "iq_scan_0000.xye"
 
-    def write_ours(self, scan, published_idxs=None):
+    def write_ours(self, scan, entries, **_kwargs):
         ours.write_text("this run")
 
-    monkeypatch.setattr(wranglerThread, "_flush_xye_buffer", write_ours)
+    monkeypatch.setattr(wranglerThread, "_write_xye_entries", write_ours)
+    prepared.xye.stage(0, object())
 
-    nexusThread._flush_xye_buffer(worker, scan, published_idxs=set())
+    nexusThread._flush_xye_buffer(worker, scan, published_idxs={0})
     nexusThread._flush_xye_buffer(worker, scan, published_idxs=set())
 
     assert not stale.exists()

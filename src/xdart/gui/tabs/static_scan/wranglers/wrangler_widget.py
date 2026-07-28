@@ -1504,6 +1504,31 @@ class wranglerThread(Qt.QtCore.QThread):
                 return
             buf = self._xye_buffer
             self._xye_buffer = []
+        return self._write_xye_entries(
+            scan,
+            buf,
+            published_idxs=published_idxs,
+            ready_dirs=self._xye_ready_dirs,
+            ready_lock=self._xye_lock,
+        )
+
+    def _write_xye_entries(
+        self,
+        scan,
+        entries,
+        *,
+        published_idxs=None,
+        ready_dirs=None,
+        ready_lock=None,
+    ):
+        """Write an already-owned batch of XYE entries.
+
+        The base/image worker drains its historical worker buffer before
+        calling this value operation.  NeXus supplies entries from its
+        run-owned prepared transaction instead, so no implementation needs to
+        transplant one run's buffer onto a reusable worker.
+        """
+        buf = list(entries)
         if published_idxs is not None:
             published_idxs = {int(i) for i in published_idxs}
             dropped = [t for t in buf if int(t[0]) not in published_idxs]
@@ -1513,7 +1538,13 @@ class wranglerThread(Qt.QtCore.QThread):
                     'XYE: dropped %d unpublished entries (Stop mid-batch)',
                     len(dropped),
                 )
-        ready_dirs = []
+        if not buf:
+            return
+        if ready_dirs is None:
+            ready_dirs = self._xye_ready_dirs
+        if ready_lock is None:
+            ready_lock = self._xye_lock
+        ready_outputs = []
         for img_number, frame in buf:
             try:
                 fname = self.save_1d(scan, frame, img_number)
@@ -1526,12 +1557,12 @@ class wranglerThread(Qt.QtCore.QThread):
                 continue
             output_dir = os.path.dirname(os.path.abspath(fname))
             output_key = os.path.normcase(output_dir)
-            with self._xye_lock:
-                if output_key in self._xye_ready_dirs:
+            with ready_lock:
+                if output_key in ready_dirs:
                     continue
-                self._xye_ready_dirs.add(output_key)
-            ready_dirs.append(output_dir)
-        for output_dir in ready_dirs:
+                ready_dirs.add(output_key)
+            ready_outputs.append(output_dir)
+        for output_dir in ready_outputs:
             try:
                 self.sigXyeOutputReady.emit(output_dir)
             except Exception:
