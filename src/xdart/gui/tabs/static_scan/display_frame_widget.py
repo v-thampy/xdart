@@ -101,14 +101,31 @@ def _hydration_owner(owner):
     broken completion is refused instead of propagating a conversion exception
     through a Qt signal into the render path.
     """
-    if isinstance(owner, HydrationOwner):
+    if type(owner) is HydrationOwner:
         return owner
-    if isinstance(owner, (tuple, list)) and len(owner) in (2, 4):
+    if type(owner) in (tuple, list):
         try:
-            return HydrationOwner.of(*owner)
-        except Exception:
+            if len(owner) in (2, 4):
+                return HydrationOwner.of(*owner)
+        except BaseException:
             return HydrationOwner()
     return HydrationOwner()
+
+
+def _context_hydration_owner(context):
+    """Return the context's one exact owner projection, or the inert owner.
+
+    ACTIVE compatibility may not reconstruct an authority from parallel
+    fields.  A missing, foreign or raising projection is an unresolved owner
+    and therefore cannot enqueue or admit.
+    """
+    try:
+        owner = context.hydration_owner
+    except BaseException:
+        return HydrationOwner()
+    return owner if type(owner) is HydrationOwner else HydrationOwner()
+
+
 from .run_config_debug import (
     DECISION_CAPABILITY_FORCES_CLEAR,
     DECISION_HYDRATION_CONTEXT_MISMATCH,
@@ -1678,14 +1695,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 stores=(),
                 commit_gate=None,
             )
-        owner = getattr(context, "hydration_owner", None)
-        if owner is None:
-            owner = HydrationOwner(
-                getattr(context, "context_token", ""),
-                getattr(context, "scan_key", ""),
-                (getattr(context, "source", "")
-                 or getattr(context, "source_path", "")),
-                getattr(context, "commit_epoch", 0))
+        owner = _context_hydration_owner(context)
         return HydrationRequest(
             label=label,
             purpose=str(purpose or "full"),
@@ -1725,19 +1735,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             if not request.qualified and not request.context_token:
                 return True
         if state is _CONTEXT_ACTIVE:
-            # §12.6 B — compare against the context's OWN projection, so the
-            # mint and the comparison cannot disagree.  A duck context that
-            # exposes only the underlying fields is normalized through the very
-            # same constructor; that is one contract used twice, not a second
-            # mint with its own rules.
-            expected = getattr(context, "hydration_owner", None)
-            if expected is None:
-                expected = HydrationOwner(
-                    getattr(context, "context_token", ""),
-                    getattr(context, "scan_key", ""),
-                    (getattr(context, "source", "")
-                     or getattr(context, "source_path", "")),
-                    getattr(context, "commit_epoch", 0))
+            # §12.6 B — compare against the context's OWN exact projection, so
+            # the mint and comparison cannot disagree.  Missing, foreign or
+            # raising projections are inert; ACTIVE has no scalar fallback.
+            expected = _context_hydration_owner(context)
         else:
             # ERROR, or a host that advertises a token but exposes no owner:
             # active enough to be strict, unable to supply a complete

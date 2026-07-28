@@ -1482,11 +1482,11 @@ class integratorTree(QtWidgets.QWidget):
         # GI/threshold state and started the thread.
         if result is None:
             return False
-        if isinstance(result, str) and result:
+        if type(result) is str and result:
             return True
         logger.warning(
             "reintegration refused: the run-owner probe returned a malformed "
-            "result %r (expected a non-empty owner label or None)", result)
+            "result (expected a non-empty owner label or None)")
         return True
 
     def bai_2d(self, q):

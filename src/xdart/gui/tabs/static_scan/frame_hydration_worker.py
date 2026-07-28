@@ -169,22 +169,19 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
             self, label, generation: int, *, purpose: str = "full",
             consumer=ConsumerKind.PLOT_1D,
             supersede_reason=SupersedeReason.SELECTION,
-            owner=None, context_token: str = "", context_scan_key: str = "",
-            stores=None, commit_gate=None, epoch: int = 0,
-            context_source: str = "") -> None:
+            owner=None, stores=None, commit_gate=None) -> None:
         """Enqueue a hydration request (non-blocking; returns immediately).
 
-        ``context_token``/``context_scan_key`` name the display context at
-        REQUEST time (X1 O-3 c3).  They are carried untouched to the completion
-        so admission can compare against the context that is selected THEN.
+        ``owner`` is the complete display-context identity captured at REQUEST
+        time and echoed unchanged with the completion (§12.6 B.3).  ``None`` is
+        the explicit ownerless idle adapter.
         """
         generation = int(generation)
         # §12.6 B.3: an owner supplied whole is carried unchanged.  The
-        # scalar keywords remain only for the tests and legacy callers that
-        # still speak them, and they are normalized by the SAME constructor.
+        # ownerless value is the explicit idle adapter; active production
+        # callers may not rebuild an owner here from parallel scalar fields.
         if owner is None:
-            owner = HydrationOwner(context_token, context_scan_key,
-                                   context_source, epoch)
+            owner = HydrationOwner()
         # §9.2.3: resolve the target NOW.  Doing it in `run()` meant the store
         # was chosen after the display may already have moved on.
         if stores is None:

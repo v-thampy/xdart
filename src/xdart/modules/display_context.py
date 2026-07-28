@@ -242,14 +242,24 @@ class DisplayBindings:
 
 def _owner_text(value) -> str:
     """One text rule for every owner field.  Never raises (§12.6 A.2)."""
-    if value is None or isinstance(value, (bytes, bytearray)):
+    if value is None or type(value) in (bytes, bytearray):
         return ""
-    if isinstance(value, str):
+    if type(value) is str:
         return value
-    try:
-        return str(value) if value else ""
-    except Exception:
+    # A ``str`` subclass can override truthiness or conversion.  It is not an
+    # already-canonical value, and accepting it unchanged would let that code
+    # execute later from ``qualified`` on the GUI completion path.
+    if type(value) is not str and issubclass(type(value), str):
         return ""
+    try:
+        if not value:
+            return ""
+        text = str(value)
+    except BaseException:
+        return ""
+    # Keep the stored value exact and inert even when a coercion protocol
+    # returns a hostile ``str`` subclass.
+    return text if type(text) is str else ""
 
 
 def _owner_epoch(value) -> int:
@@ -259,7 +269,9 @@ def _owner_epoch(value) -> int:
     merely coerces to one: those are malformed inputs, and inventing a number
     from them is how a forged owner compared equal to a real one.
     """
-    if isinstance(value, bool) or not isinstance(value, int):
+    # Exact ``int`` only.  An ``int`` subclass can override comparison and
+    # escape this total decoder just as readily as a coercion-only object.
+    if type(value) is not int:
         return 0
     return value if value > 0 else 0
 

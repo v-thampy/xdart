@@ -2035,7 +2035,7 @@ class staticWidget(QWidget):
         # owner, so a hydration request can freeze its target and its commit
         # authority at request time (§9.2.3).
         self.displayframe.selected_display_context = (
-            self._selected_display_context)
+            self._resolve_selected_display_context)
         self.h5viewer.begin_paused_browse = self._begin_paused_browse
         self.h5viewer.file_thread.sigBrowseLoaded.connect(self._on_browse_loaded)
         self.displayframe._resolve_overlay_grid_mismatch = (
@@ -12933,6 +12933,23 @@ class staticWidget(QWidget):
             return browse if selection.names(browse) else None
         acquisition = getattr(self, "_acquisition_context", None)
         return acquisition if selection.names(acquisition) else None
+
+    def _resolve_selected_display_context(self):
+        """Resolve the display owner strictly for hydration admission.
+
+        ``_selected_display_context`` retains its bounded query semantics for
+        callers that separately inspect the selection.  The hydration seam
+        cannot collapse its two ``None`` cases, however: no installed
+        selection is IDLE, while a selection that names no context this widget
+        still owns is ERROR.  Raising here lets the display's three-state
+        resolver turn only the latter into a non-enqueueable request.
+        """
+        selection = getattr(self, "_display_selection", None)
+        context = staticWidget._selected_display_context(self)
+        if selection is not None and context is None:
+            raise DisplayContextError(
+                "the installed display selection names no owned context")
+        return context
 
     def _display_selected_stores(self):
         """``(record_store, publication_store)`` for the SELECTED context.

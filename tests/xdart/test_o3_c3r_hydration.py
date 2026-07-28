@@ -44,6 +44,7 @@ from xdart.gui.tabs.static_scan.static_scan_widget import (
 from xdart.modules.display_context import (
     BrowseContext,
     ContextKind,
+    HydrationOwner,
     new_context_token,
 )
 
@@ -212,11 +213,10 @@ def test_request_hydrates_the_request_time_store_not_the_later_selection():
         _DIRECT)
     worker.start()
     try:
-        worker.request(1, 3, context_token="context-B",
-                       context_scan_key="scan-B")
+        owner = HydrationOwner("context-B", "scan-B", "/data/B", 1)
+        worker.request(1, 3, owner=owner)
         assert entered.wait(5.0)
-        worker.request(2, 3, context_token="context-B",
-                       context_scan_key="scan-B")
+        worker.request(2, 3, owner=owner)
         stores["current"] = (Store("A"),)
         release.set()
         assert complete.wait(5.0)
@@ -239,10 +239,10 @@ def test_same_label_generation_in_two_scan_keys_is_not_deduped():
             return {"label": label}
 
     worker = FrameHydrationWorker(Store())
-    worker.request(7, 3, context_token="context-A",
-                   context_scan_key="scan-one")
-    worker.request(7, 3, context_token="context-A",
-                   context_scan_key="scan-two")
+    worker.request(
+        7, 3, owner=HydrationOwner("context-A", "scan-one", "/data/A", 1))
+    worker.request(
+        7, 3, owner=HydrationOwner("context-A", "scan-two", "/data/A", 1))
     worker.start()
     try:
         assert done.wait(2.0)

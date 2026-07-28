@@ -100,6 +100,38 @@ class _ExplosiveEpoch:
         raise RuntimeError("epoch truthiness escaped")
 
 
+class _ExplosiveStr(str):
+    def __bool__(self):
+        raise RuntimeError("text truthiness escaped")
+
+
+class _ExplosiveInt(int):
+    def __gt__(self, other):
+        raise RuntimeError("integer comparison escaped")
+
+
+class _ExplosiveList(list):
+    def __len__(self):
+        raise RuntimeError("container length escaped")
+
+
+class _ExplosiveOwner(HydrationOwner):
+    @property
+    def qualified(self):
+        raise RuntimeError("owner subclass escaped")
+
+
+class _ExplosiveActionStr(str):
+    def __bool__(self):
+        raise RuntimeError("action truthiness escaped")
+
+
+class _ExplosiveClass:
+    @property
+    def __class__(self):
+        raise RuntimeError("class lookup escaped")
+
+
 @pytest.mark.parametrize(
     "epoch", [True, False, "7", "not-an-int", 1.5, object(), None, [],
               _ExplosiveEpoch()])
@@ -132,6 +164,21 @@ def test_qualified_is_total_on_a_directly_constructed_owner():
     assert owner.qualified is False
 
 
+def test_accepted_type_subclasses_cannot_escape_owner_normalization():
+    """§12.6 A.2/A.3 applies to hostile subclasses, not only other types."""
+    owner = HydrationOwner(
+        _ExplosiveStr("tok"), "key", "/data/a.nxs", _ExplosiveInt(7))
+    assert owner.context_token == ""
+    assert owner.epoch == 0
+    assert owner.qualified is False
+
+
+def test_foreign_class_protocol_cannot_escape_text_normalization():
+    owner = HydrationOwner(_ExplosiveClass(), "key", "/data/a.nxs", 7)
+    assert type(owner.context_token) is str
+    assert isinstance(owner.qualified, bool)
+
+
 def test_a_directly_constructed_malformed_owner_is_refused_without_raising():
     context = _context()
     display = _display(context)
@@ -140,6 +187,19 @@ def test_a_directly_constructed_malformed_owner_is_refused_without_raising():
             context.context_token, context.scan_key, context.source, epoch)
         assert displayFrameWidget._admit_hydration_owner(
             display, malformed, 1, 7) is False, epoch
+
+
+def test_foreign_decoder_subclasses_are_inert_nonthrowing_refusals():
+    """§11.1.2/§12.6 A — accepted-looking subclasses are still foreign."""
+    context = _context()
+    display = _display(context)
+    malformed = (
+        _ExplosiveList(["tok", "key"]),
+        _ExplosiveOwner("tok", "key", "/data/a.nxs", 7),
+    )
+    for value in malformed:
+        assert displayFrameWidget._admit_hydration_owner(
+            display, value, 1, 7) is False
 
 
 # --------------------------------------------------------------------------- #
@@ -186,6 +246,30 @@ def test_a_request_built_after_a_rescope_is_admitted_by_its_own_context():
 
     assert displayFrameWidget._admit_hydration_owner(
         display, request.owner, request.label, request.generation) is True
+
+
+def test_active_context_never_reconstructs_a_missing_owner_projection():
+    """§12.6 B.1 — the context projection is the only active mint."""
+    context = SimpleNamespace(
+        hydration_owner=object(),
+        context_token="forged-token",
+        scan_key="forged-key",
+        source="/forged/source",
+        commit_epoch=9,
+        commit_gate=object(),
+    )
+    display = _display(context)
+    request = displayFrameWidget._build_hydration_request(
+        display, 1, purpose="2d")
+    assert request is not None
+    assert request.owner == HydrationOwner()
+    assert request.enqueueable is False
+    assert displayFrameWidget._admit_hydration_owner(
+        display,
+        HydrationOwner("forged-token", "forged-key", "/forged/source", 9),
+        1,
+        request.generation,
+    ) is False
 
 
 def test_the_selection_is_minted_from_the_current_source():
@@ -288,6 +372,24 @@ def test_a_broken_resolver_does_not_mint_an_ownerless_request():
         "an unresolvable owner produced an enqueueable request")
 
 
+def test_an_installed_but_unresolved_selection_is_error_not_idle(widget):
+    """The real host must distinguish stale selection from no selection."""
+    widget._enter_run_state(origin=RUN_ORIGIN_REINTEGRATE)
+    context = widget._acquisition_context
+    display = widget.displayframe
+    try:
+        # Keep the installed selection but withdraw the context it names.
+        widget._acquisition_context = None
+        request = displayFrameWidget._build_hydration_request(
+            display, 1, purpose="2d")
+        assert request is not None
+        assert request.enqueueable is False
+        assert request.owner == HydrationOwner()
+        assert request.stores == ()
+    finally:
+        widget._acquisition_context = context
+
+
 def test_an_ownerful_late_completion_is_not_the_idle_compatibility_call():
     """A complete owner from a RETIRED context is not an idle completion."""
     display = SimpleNamespace(
@@ -357,7 +459,9 @@ def _arm(tree, monkeypatch, events):
                         lambda: events.append("start"))
 
 
-@pytest.mark.parametrize("malformed", [False, 0, "", [], {}, 0.0, object()])
+@pytest.mark.parametrize(
+    "malformed",
+    [False, 0, "", [], {}, 0.0, object(), _ExplosiveActionStr("owner")])
 @pytest.mark.parametrize("action", ["bai_1d", "bai_2d"])
 def test_a_malformed_action_result_refuses_rather_than_permits(
         widget, monkeypatch, malformed, action):
@@ -420,7 +524,7 @@ def test_the_action_matrix_walks_the_real_wrangler_stack(widget):
 
 @pytest.mark.parametrize("owner_result", ["raise", "falsey-malformed"])
 def test_both_real_public_starts_fail_closed_before_side_effects(
-        widget, monkeypatch, owner_result):
+        qapp, widget, monkeypatch, owner_result):
     """§12.6 E.3 — drive each real stack entry's own public ``start()``."""
     def probe():
         if owner_result == "raise":
@@ -431,10 +535,14 @@ def test_both_real_public_starts_fail_closed_before_side_effects(
         direct = getattr(one, name, None)
         return direct if direct is not None else getattr(one.ui, name)
 
-    for wrangler in _stack_wranglers(widget):
+    monkeypatch.setattr(widget, "_controls_v2_active_run_owner", probe)
+    stack = widget.ui.wranglerStack
+    for index, wrangler in enumerate(_stack_wranglers(widget)):
         events = []
-        wrangler._h19_host = SimpleNamespace(
-            _controls_v2_active_run_owner=probe)
+        stack.setCurrentIndex(index)
+        qapp.processEvents()
+        assert widget.wrangler is wrangler
+        assert wrangler._h19_host is widget
         wrangler.sigStart.connect(lambda e=events: e.append("sigStart"))
         before = (
             getattr(wrangler, "command", None),

@@ -51,10 +51,12 @@ makes them the right pair: no assertion here can pass by coincidence.
 from __future__ import annotations
 
 import importlib
+import hashlib
 import inspect
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -116,6 +118,8 @@ _A_MASK = _DATA / "nexus" / "mask.edf"
 #: B — the Rayonix GI processed result the operator browses while paused.
 _B_RESULT = (_DATA / "xdart_processed_data"
              / "Combi4_Angledependence_samz_4p9_03271005.nxs")
+_B_RESULT_SHA256 = (
+    "6110bedb3bb14c1c30978f84b43716339ff099856ab55f96e4ca7f2d9c56a3c6")
 
 _REQUIRED = (_A_SOURCE, _A_PONI, _A_MASK, _B_RESULT)
 
@@ -144,6 +148,18 @@ _COLLIDING_LABELS = (1, 2, 3)
 @pytest.fixture(scope="module")
 def qapp():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+
+@pytest.fixture(scope="module", autouse=True)
+def trusted_context_fixture():
+    """Fail closed if the writable shared real-data oracle was replaced."""
+    if not all(path.exists() for path in _REQUIRED):
+        return
+    with _B_RESULT.open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    assert digest == _B_RESULT_SHA256, (
+        "the O-3 browse fixture is not the accepted GI object: "
+        f"{_B_RESULT} sha256={digest}")
 
 
 # --------------------------------------------------------------------------- #
@@ -689,10 +705,14 @@ def _correlated_hydration_rejections(
 def _held_request_context_token(kwargs):
     """The context token a hydration request carries, or ``""``.
 
-    Nothing supplies one at this parent — which is the defect — so this returns
-    empty and the correlation above cannot match.  O-3 threads the browse
-    context's token through the request and echoes it in the rejection.
+    c3D carries the canonical ``HydrationOwner`` whole; older parents used one
+    of the scalar compatibility spellings below.  The spy must observe either
+    production shape without reconstructing a second owner.
     """
+    owner = kwargs.get("owner")
+    value = getattr(owner, "context_token", None)
+    if value:
+        return str(value)
     for key in ("context_token", "owner_token", "request_token", "context_id"):
         value = kwargs.get(key)
         if value:
@@ -950,7 +970,13 @@ def test_resume_restores_acquisition_coherently(qapp, acquisition):
     _resume_acquisition(qapp, widget, recorder)
     _wait_until(qapp, lambda: len(recorder.frames) > frames_at_resume + 1,
                 _RUN_TIMEOUT_S, "the next reduced frame from acquisition A")
-    _pump(qapp, 2.0)
+    _wait_until(
+        qapp,
+        lambda: _panel_image_shape(widget.displayframe.image_data)
+        == captured["raw_shape"],
+        _BOUNDARY_TIMEOUT_S,
+        "the resumed acquisition raw panel",
+    )
 
     observed = _resume_rows(widget, captured, held,
                             browse_raw_shape=browse_raw_shape)
@@ -1263,16 +1289,14 @@ def test_same_label_collision_preserves_both_owners(qapp, acquisition):
 def _dotted_stem_link(tmp_path, source):
     """A REAL dotted-stem container: the real B result under a dotted name.
 
-    A link, not a copy: the bytes under test are the shipped fixture's, so the
-    load is a genuine load and the only thing that changed is the name the two
-    parsers disagree about.
+    A private copy: the bytes under test are the shipped fixture's and the only
+    semantic change is the name the two parsers disagree about. A hard-link is
+    forbidden here because any writer accidentally aimed at the test path would
+    mutate the shared scientific oracle's inode.
     """
     target = tmp_path / "Combi4.v2_03271005.nxs"
     if not target.exists():
-        try:
-            os.link(source, target)
-        except OSError:
-            os.symlink(source, target)
+        shutil.copy2(source, target)
     return target
 
 
@@ -1611,9 +1635,22 @@ def test_capability_blanking_is_recorded_on_both_paths(
     widget, _recorder = acquisition()
     _browse_load(qapp, widget, _B_RESULT)
     _select_frame_row(qapp, widget, 2)
+    _display_a_mode_the_record_does_not_hold(widget)
 
-    records = [event for event in _rejection_events(caplog)
-               if event["decision"] == DECISION_CAPABILITY_FORCES_CLEAR]
+    # A fully servable browse no longer blanks incidentally.  Drive both
+    # production states explicitly, as the two qualified successor rows below
+    # do independently, so this retained aggregate test cannot depend on a
+    # missing browse tier or on whatever mode an earlier singleton left behind.
+    caplog.clear()
+    _drive_capability_blank(qapp, widget, processing_active=False)
+    ordinary = list(_capability_records(caplog))
+    caplog.clear()
+    try:
+        _drive_capability_blank(qapp, widget, processing_active=True)
+        persistent = list(_capability_records(caplog))
+    finally:
+        widget.displayframe.set_processing_active(False)
+    records = ordinary + persistent
     assert records, "no capability blanking was recorded at all"
     outcomes = {event["outcome"] for event in records}
     assert {"normal_clear", "persistence_override"} <= outcomes, (
@@ -1954,6 +1991,15 @@ def _display_a_mode_the_record_does_not_hold(widget):
     unheld = {"bai_1d_args": ("gi_mode_1d", "q_oop"),
               "bai_2d_args": ("gi_mode_2d", "q_chi")}
     config = displayFrameWidget._display_reduction_config(scan)
+    # This helper's purpose is to drive the GI-mode capability branch with a
+    # mode the selected record does not hold.  The loaded real-file fixture can
+    # legitimately report Standard here (and did so nondeterministically under
+    # the old shared scan); state the test precondition explicitly instead of
+    # relying on whichever singleton carrier happened to survive the browse.
+    if isinstance(config, dict):
+        config["gi"] = True
+    else:
+        scan.gi = True
     for args_key, (mode_key, value) in unheld.items():
         if isinstance(config, dict) and isinstance(config.get(args_key), dict):
             config[args_key][mode_key] = value
