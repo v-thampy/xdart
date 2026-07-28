@@ -290,15 +290,32 @@ def test_single_file_nexus_wrangler_rejects_processed_cleanly(tmp_path):
     )
     from xrd_tools.session import RunIntent
 
+    # O-3N.R.1 §16.3/§16.5: an accepted NeXus run now carries an entry and a
+    # constructible calibration, so the fixture supplies both; without them the
+    # preparation owner refuses earlier and this row would stop testing the
+    # processed-source rejection it exists for.
+    from dataclasses import replace as _replace
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+
     t.run_configuration = t._admitted_run_configuration = RunIntent(
         processing_mode="Int 2D",
         save_path=str(out),
-        source_spec=container_source(proc),
+        source_spec=SourceSpec(str(proc), SourceKind.NEXUS_STACK,
+                               entry="entry"),
+        poni_values={"dist": 0.2, "poni1": 0.1, "poni2": 0.1, "rot1": 0.0,
+                     "rot2": 0.0, "rot3": 0.0, "wavelength": 1e-10},
     ).freeze()
     labels = []
     t.showLabel.connect(labels.append)
-    # Must return cleanly (before the diff: uncaught ProcessedXdartInputError).
-    t._run_impl(t.run_configuration)
+    # O-3N.R.1 §16.3/§16.4: the processed-source rejection moved INTO the worker
+    # preparation owner, where it happens before any output action, and it is
+    # now the shared TYPED refusal (``run()`` catches it and reports).  The
+    # product contract this row pins is unchanged: an actionable message and no
+    # output.  What changed is that the stop is typed instead of a bare return.
+    from xrd_tools.session.run_configuration import RunConfigurationRefused
+
+    with pytest.raises(RunConfigurationRefused):
+        t._run_impl(t.run_configuration)
     assert any("processed xdart" in m.lower() for m in labels), labels
     # No output was written on rejection (rejection precedes any reduction/save).
     assert not (out / "scan.nxs").exists()

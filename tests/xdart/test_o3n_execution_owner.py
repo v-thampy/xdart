@@ -165,13 +165,18 @@ def test_link_identity_collision_is_refused_not_lexical(
     wrangler.parameters.child("NeXus File", "nexus_file").setValue(str(src))
     wrangler.parameters.child("NeXus File", "entry").setValue("entry")
     wrangler.parameters.child("Output", "h5_dir").setValue(str(link))
-    started = _start_recorder(wrangler, monkeypatch)
+    _start_recorder(wrangler, monkeypatch)
     before = src.read_bytes()
-
     wrangler.start()
+    thread = wrangler.thread
+    said = []
+    thread.showLabel.connect(said.append)
 
-    assert started == [], (
-        "a symlinked output directory bypassed the collision guard")
+    # §16.6: the collision guard is the WORKER's, so this drives the worker.
+    thread.run()
+
+    assert any("refused" in text.lower() for text in said), (
+        f"a symlinked output directory bypassed the collision guard: {said}")
     assert src.read_bytes() == before, "the raw acquisition was touched"
 
 
@@ -292,8 +297,10 @@ def test_overwrite_replaces_a_prior_same_stem_result(
     stale.write_bytes(b"not a real nxs")
 
     scan = thread._initialize_scan(Path(frozen.source.uri).stem)
-    assert not stale.exists(), "Overwrite did not replace the prior result"
-    scan.save_to_nexus()
+    # O-3N.R.1 §16.4: initialization is NOT destructive -- the prior result
+    # survives until the first successful writer action.
+    assert stale.exists(), "Overwrite destroyed the prior target too early"
+    thread._save_to_disk(frozen, scan)
 
     stored = (read_provenance(str(stale)).get("config") or {}).get(
         "run_configuration")

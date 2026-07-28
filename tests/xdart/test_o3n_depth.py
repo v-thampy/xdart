@@ -42,6 +42,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("pyqtgraph")
 from pyqtgraph.Qt import QtWidgets  # noqa: E402
 
+from tests.xdart.test_o3n_nexus_freeze_identity import _write_poni  # noqa: E402
 from xrd_tools.session.run_configuration import (  # noqa: E402
     RunConfigurationRefused,
 )
@@ -94,6 +95,13 @@ def _arm(wrangler, tmp_path, *, entry):
     src.write_bytes(b"source")
     out = tmp_path / "out"
     out.mkdir(exist_ok=True)
+    # O-3N.R.1 §16.5: a constructible calibration is now an ADMISSION fact, so
+    # every row that expects an accepted Start must arm one.  The preserved
+    # module armed none, which under the corrected rule is itself a refusal --
+    # pinned by test_o3nr1_totality::test_public_start_without_calibration_
+    # refuses_zero_delta.
+    wrangler.parameters.child("Calibration", "poni_file").setValue(
+        _write_poni(tmp_path / "cal.poni"))
     wrangler.parameters.child("NeXus File", "nexus_file").setValue(str(src))
     wrangler.parameters.child("NeXus File", "entry").setValue(entry)
     wrangler.parameters.child("Output", "h5_dir").setValue(str(out))

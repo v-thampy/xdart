@@ -669,24 +669,10 @@ JUSTIFIED_DISPLAY_SCAN_SURVIVORS = {
      "bai_1d_args", "read"): "ALLOW_BACKWARD_DISPLAY_WRITE",
     ("nexus_wrangler_thread.py", "_project_gi_modes_onto_display_scan",
      "bai_2d_args", "read"): "ALLOW_BACKWARD_DISPLAY_WRITE",
-    # the NeXus worker still executes ON the display scan object (pre-existing
-    # architecture, ledgered): every value it writes there is frozen-derived.
-    ("nexus_wrangler_thread.py", "_initialize_scan", "name", "write"):
-        "ALLOW_BACKWARD_DISPLAY_WRITE",
-    ("nexus_wrangler_thread.py", "_initialize_scan", "gi", "write"):
-        "ALLOW_BACKWARD_DISPLAY_WRITE",
-    ("nexus_wrangler_thread.py", "_initialize_scan", "static", "write"):
-        "ALLOW_BACKWARD_DISPLAY_WRITE",
-    ("nexus_wrangler_thread.py", "_initialize_scan", "source_base", "write"):
-        "ALLOW_BACKWARD_DISPLAY_WRITE",
-    # O-3N.R §15.1: THE writer target.  Both saves and every XYE file resolve
-    # through ``scan.data_file``; until this write the only repoint was the
-    # ASYNCHRONOUS GUI ``sigUpdateFile`` chain, so a previous/default/browsed
-    # file could receive the run.  The value is the accepted frozen output.
-    ("nexus_wrangler_thread.py", "_initialize_scan", "data_file", "write"):
-        "FROZEN_RUN_OUTPUT_TARGET",
-    ("nexus_wrangler_thread.py", "_initialize_scan", "<self.scan>", "read"):
-        "JUSTIFIED_NON_CONFIGURATION_READ",
+    # O-3N.R.1 §16.1: the NeXus worker no longer executes on the display scan at
+    # all -- ``_initialize_scan`` builds a FRESH per-run ``LiveScan``, as the
+    # image worker does, so every ``self.scan`` write it used to make is gone.
+    # The residual that carried them is closed, not re-dispositioned.
 }
 
 
