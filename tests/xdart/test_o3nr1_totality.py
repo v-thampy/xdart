@@ -66,6 +66,18 @@ def test_strict_preflight_rejects_an_existing_dataset_as_entry(
 def test_direct_run_impl_performs_strict_preflight_before_content_read(
     widget, tmp_path, monkeypatch
 ):
+    """A direct ``_run_impl`` with an unqualifiable entry refuses before ANY
+    source content is read and before any output is touched.
+
+    O-3N.R.3 reshape (declared): the parent observed the body's path-based
+    ``read_nexus`` seam, which §19.1 deleted — metadata now detaches inside
+    the strict execution opener, and raw content binds there too.  The same
+    fact is therefore observed at BOTH post-§19.1 content seams: raw-stack
+    construction and entry-metadata extraction.  Neither may be reached when
+    entry qualification refuses.
+    """
+    import xrd_tools.io.nexus as nexus_io
+
     wrangler = _select_nexus(widget)
     source, output = _arm_container_without_frames(wrangler, tmp_path)
     wrangler.parameters.child("NeXus File", "entry").setValue("missing")
@@ -82,10 +94,9 @@ def test_direct_run_impl_performs_strict_preflight_before_content_read(
         observed.append((args, kwargs))
         raise StopProbe
 
+    monkeypatch.setattr(nexus_io, "NexusImageStack", content_read)
     monkeypatch.setattr(
-        "xdart.gui.tabs.static_scan.wranglers.nexus_wrangler_thread.read_nexus",
-        content_read,
-    )
+        nexus_io, "_read_scan_metadata_from_entry", content_read)
     with pytest.raises(RunConfigurationRefused):
         nexusThread._run_impl(thread, frozen)
     assert observed == []

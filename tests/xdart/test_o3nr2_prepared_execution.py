@@ -250,21 +250,28 @@ def test_preflight_proves_and_binds_the_source_in_one_open(
     """§17.3: the parent proved the Group with one open, CLOSED it, and opened
     the file again to bind the stack.  Replacing the selected Group between the
     two opens bound ``/fallback/...`` under ``selected``'s provenance.  One open
-    makes that window structurally unreachable."""
+    makes that window structurally unreachable.
+
+    O-3N.R.3 reshape (declared): §19.1 extended the strict prepared-source
+    operation, so preflight now returns the execution-source PAIR — the same
+    one open additionally detaches the scan metadata.  The row's fact is
+    unchanged and strictly stronger: still exactly one open of the source.
+    """
     wrangler = _select_nexus(widget)
     src, _out, thread = _started(wrangler, tmp_path, monkeypatch)
     target = nexusThread._frozen_source_target(thread.run_configuration)
     opens = _collect_source_handles(monkeypatch, src)
 
-    stack = nexusThread._preflight_execution_target(thread, target)
+    source = nexusThread._preflight_execution_target(thread, target)
     try:
-        assert all(path.startswith(f"/{target.entry}/") for path in stack.paths)
+        assert all(path.startswith(f"/{target.entry}/")
+                   for path in source.stack.paths)
     finally:
-        stack.close()
+        source.stack.close()
 
     assert len(opens) == 1, (
-        f"qualification and binding used {len(opens)} separate opens of the "
-        "source; they must describe the same resource")
+        f"qualification, binding and metadata used {len(opens)} separate "
+        "opens of the source; they must describe the same resource")
 
 
 # --------------------------------------------------------------------------- #
