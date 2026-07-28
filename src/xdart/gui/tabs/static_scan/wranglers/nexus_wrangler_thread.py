@@ -62,7 +62,7 @@ from xrd_tools.session.readiness import (
 )
 from xrd_tools.integrate.calibration import poni_to_integrator, get_detector
 from xrd_tools.reduction import GIFreezeError
-from xrd_tools.io.nexus import open_nexus_image_stack_exact, read_nexus
+from xrd_tools.io.nexus import open_nexus_execution_source
 from xrd_tools.io.image import read_image
 from xrd_tools.io.processed_scan_id import ProcessedXdartInputError
 from xrd_tools.io.export import write_xye
@@ -155,28 +155,44 @@ class PreparedNexusExecution:
       reference.  Every later decision compares against it by ``is``;
     * ``target`` -- the one derived :class:`FrozenSourceTarget`;
     * ``stack`` -- the strict exact-entry raw stack, closed exactly once;
+    * ``scan_metadata`` -- the detached per-frame counters/angles, read on the
+      SAME held handle as the stack (O-3N.R.3 §19.1: the body used to reopen
+      the accepted pathname with ``read_nexus()``, so a replacement inode could
+      supply motor angles for the accepted inode's pixels);
     * ``scan`` -- this run's own ``LiveScan``;
-    * the output-transaction state, each flag consumed only AFTER the operation
-      it describes has succeeded.
+    * the output-transaction state, each fact consumed only AFTER the operation
+      it describes has reached its terminal state (§19.3/§19.4 complete this:
+      an UNRESOLVED rollback and a WITHHELD XYE tail are carried too, so a
+      retry can complete them instead of destroying or forgetting them).
     """
 
-    __slots__ = ("frozen", "target", "stack", "scan", "poni",
-                 "output_committed", "target_replaced", "xye_tail_pending",
-                 "_closed")
+    __slots__ = ("frozen", "target", "stack", "scan_metadata", "scan", "poni",
+                 "output_committed", "target_replaced", "replacement_backup",
+                 "xye_tail_pending", "xye_withheld_idxs", "_closed")
 
-    def __init__(self, frozen, target, stack=None):
+    def __init__(self, frozen, target, stack=None, scan_metadata=None):
         self.frozen = frozen
         self.target = target
         self.stack = stack
+        self.scan_metadata = scan_metadata
         self.scan = None
         self.poni = target.poni() if target is not None else None
         #: Append qualification finished successfully (never set on refusal).
         self.output_committed = False
         #: An Overwrite replacement has been COMMITTED by a successful writer.
         self.target_replaced = False
+        #: §19.3: the backup path of an UNRESOLVED rollback -- a writer failed,
+        #: and restoring the durable prior from the staging suffix failed too.
+        #: A later writer attempt must first complete this rollback; it may
+        #: never delete the backup merely to reuse the suffix.
+        self.replacement_backup = None
         #: ``None`` until the stale XYE set is discovered (once, before this run
         #: writes); then the list of artifacts still awaiting deletion.
         self.xye_tail_pending = None
+        #: §19.4: the published frame indices whose XYE output is WITHHELD
+        #: while stale cleanup is pending -- preserved so a later clean flush
+        #: publishes exactly this run's landed frames, never a mixed identity.
+        self.xye_withheld_idxs = set()
         self._closed = False
 
     def owns(self, frozen) -> bool:
@@ -420,8 +436,9 @@ class nexusThread(wranglerThread):
           headless :func:`check_output_not_source` owner, so symlink/hard-link
           identity is one policy;
         * the SELECTED entry is an HDF5 **Group** carrying a RUNNABLE raw
-          stack, proved by :func:`open_nexus_image_stack_exact` -- ONE open
-          that both qualifies the group and binds the stack.
+          stack, proved by :func:`open_nexus_execution_source` -- ONE open
+          that qualifies the group, binds the stack AND detaches the scan
+          metadata.
 
           O-3N.R.2 §17.3: this used to be two facts.  The group was proved with
           one ``h5py.File`` open, that handle was closed, and the shared opener
@@ -434,11 +451,19 @@ class nexusThread(wranglerThread):
           qualification and binding described different resources.  One strict
           open closes both.
 
+          O-3N.R.3 §19.1 completes the closure: scan METADATA is part of the
+          same accepted resource.  The body's later ``read_nexus(path, entry)``
+          reopened the pathname, so a replacement after preparation fed the
+          run counters and motor angles from a different inode than its raw
+          pixels -- a scientific TOCTOU.  The metadata is detached here, on
+          the stack's own handle, and nothing later re-resolves the pathname.
+
           §16.4: output ownership must not become destructive before this
           holds, or a valid-but-frameless container destroys a durable prior
           result and creates nothing.
 
-        Returns the proved ``NexusImageStack``; the ENVELOPE owns closing it.
+        Returns the proved ``NexusExecutionSource`` (stack + detached
+        metadata); the ENVELOPE owns closing the stack.
         """
         def refuse(detail):
             raise RunConfigurationRefused(
@@ -461,10 +486,11 @@ class nexusThread(wranglerThread):
                                     input_files=[target.uri])
         except OutputCollisionError as exc:
             refuse(str(exc))
-        # Strict source open: the selected group IS the bound stack.  This is
+        # Strict source open: the selected group IS the bound stack, and the
+        # detached scan metadata rides the same held handle (§19.1).  This is
         # the last precondition for output ownership becoming destructive.
         try:
-            stack = open_nexus_image_stack_exact(target.uri, target.entry)
+            source = open_nexus_execution_source(target.uri, target.entry)
         except ProcessedXdartInputError:
             # F-NXS-2 keeps its actionable operator message; the STOP is now the
             # shared typed refusal, raised before any output action.
@@ -481,7 +507,7 @@ class nexusThread(wranglerThread):
             refuse(f"the selected entry carries no runnable detector stack: "
                    f"{exc}")
             raise                                      # unreachable; refuse()
-        return stack
+        return source
 
     @staticmethod
     def _append_identity(mapping):
@@ -609,6 +635,20 @@ class nexusThread(wranglerThread):
         there is no instant at which neither file exists; the backup is dropped
         on commit and restored on rollback.
 
+        O-3N.R.3 §19.3: staging never destroys a durable prior.  Two cases the
+        parent got wrong by unconditionally unlinking an existing backup:
+
+        * the ENVELOPE's own unresolved rollback (a writer failed AND restoring
+          the prior failed) -- the backup is the only byte-identical prior
+          result.  A retry first COMPLETES that rollback: discard the failed
+          partial, restore the backup, and only then stage again.  If the
+          repair fails once more, the raise refuses this writer attempt with
+          the prior still safe at the staging suffix;
+        * a backup this envelope never staged (a crashed earlier process) --
+          indistinguishable on disk from an unresolved rollback, so it is
+          REFUSED loudly rather than destroyed.  Only a successful writer
+          commit may discard a durable prior.
+
         Returns the backup path, or ``None`` when there is nothing to protect.
         """
         frozen = prepared.frozen
@@ -617,22 +657,42 @@ class nexusThread(wranglerThread):
         if prepared.target_replaced:
             return None
         target = Path(scan.data_file)
-        if not target.exists():
-            return None
         backup = target.with_name(target.name + _REPLACING_SUFFIX)
         with self.file_lock:
             pool = _get_h5pool()
             pool.pause(str(target))
             try:
+                pending = prepared.replacement_backup
+                if pending is not None:
+                    # Complete THIS run's unresolved rollback before anything
+                    # else: partial out, durable prior back at the target.
+                    if target.exists():
+                        target.unlink()
+                    os.replace(pending, target)
+                    prepared.replacement_backup = None
+                    logger.info(
+                        '[NEXUS] Overwrite: completed the pending rollback of '
+                        '%s before restaging', target)
+                if not target.exists():
+                    return None
                 if backup.exists():
-                    backup.unlink()
+                    raise OSError(
+                        f"an unresolved prior-result backup occupies "
+                        f"{backup}; refusing to destroy it to stage a new "
+                        f"replacement — restore or remove it first")
                 os.replace(target, backup)
             finally:
                 pool.resume(str(target))
         return backup
 
-    def _rollback_target_replacement(self, scan, backup):
-        """Restore the prior Overwrite target byte-for-byte after a failure."""
+    def _rollback_target_replacement(self, prepared, scan, backup):
+        """Restore the prior Overwrite target byte-for-byte after a failure.
+
+        §19.3: a FAILED restore is carried on the envelope as the unresolved
+        ``replacement_backup`` fact, so the next writer attempt completes the
+        rollback instead of deleting the only durable prior to reuse the
+        staging suffix.
+        """
         target = Path(scan.data_file)
         with self.file_lock:
             pool = _get_h5pool()
@@ -641,9 +701,12 @@ class nexusThread(wranglerThread):
                 if target.exists():
                     target.unlink()            # discard the failed partial
                 os.replace(backup, target)
+                prepared.replacement_backup = None
             except OSError:
-                # Loud, and RECOVERABLE: the prior result is still on disk
-                # under the staging name, so an operator can restore it.
+                # Loud, RECOVERABLE, and REMEMBERED: the prior result is still
+                # on disk under the staging name, and the envelope now owns
+                # completing this rollback before any restage.
+                prepared.replacement_backup = backup
                 logger.error(
                     '[NEXUS] Overwrite rollback failed; the prior result is '
                     'preserved at %s', backup, exc_info=True)
@@ -665,7 +728,8 @@ class nexusThread(wranglerThread):
             result = write()
         except BaseException:
             if backup is not None:
-                nexusThread._rollback_target_replacement(self, scan, backup)
+                nexusThread._rollback_target_replacement(
+                    self, prepared, scan, backup)
             raise
         if str(getattr(prepared.frozen, "output_mode", "Append")) == "Overwrite":
             if not prepared.target_replaced:
@@ -729,10 +793,33 @@ class nexusThread(wranglerThread):
 
         §16.4: an Overwrite XYE run must not leave higher-frame files from a
         previous, longer run beside this run's output.
+
+        O-3N.R.3 §19.4: the tail outcome GATES this run's publication.  The
+        parent retained the pending set but delegated to the base writer
+        unconditionally, so a persistent delete failure published new XYE
+        files beside the old one — exactly the mixed-run state §17.8 item 6
+        forbids.  While cleanup is pending, the buffer is NOT drained (the
+        entries are this run's tail, preserved for retry) and the landed frame
+        indices are accumulated on the envelope so a later clean flush
+        publishes exactly this run's frames — never a mixed identity, and
+        never the base writer's drop-unpublished contract violated.
         """
         prepared = getattr(self, "_execution", None)
         if prepared is not None:
-            nexusThread._clear_stale_xye_tail(self, prepared, scan)
+            if not nexusThread._clear_stale_xye_tail(self, prepared, scan):
+                if published_idxs is not None:
+                    prepared.xye_withheld_idxs |= {
+                        int(i) for i in published_idxs}
+                logger.warning(
+                    '[NEXUS] Overwrite: stale-XYE cleanup is PENDING; '
+                    'withholding this flush (%d buffered entries kept)',
+                    len(getattr(self, "_xye_buffer", ()) or ()))
+                return
+            if prepared.xye_withheld_idxs:
+                if published_idxs is not None:
+                    published_idxs = ({int(i) for i in published_idxs}
+                                      | prepared.xye_withheld_idxs)
+                prepared.xye_withheld_idxs = set()
         return wranglerThread._flush_xye_buffer(
             self, scan, published_idxs=published_idxs)
 
@@ -752,9 +839,13 @@ class nexusThread(wranglerThread):
 
         The stale set is discovered ONCE, before this run has written anything,
         so a retry can never sweep the run's own output.
+
+        Returns ``True`` when the tail is CLEAN (nothing pending) and ``False``
+        while any stale artifact remains — the load-bearing outcome §19.4
+        requires: publication may proceed only on ``True``.
         """
         if str(getattr(prepared.frozen, "output_mode", "Append")) != "Overwrite":
-            return
+            return True
         if prepared.xye_tail_pending is None:
             root = Path(os.path.dirname(scan.data_file)) / str(scan.name)
             prepared.xye_tail_pending = (sorted(root.glob("*.xye"))
@@ -773,6 +864,40 @@ class nexusThread(wranglerThread):
                 '[NEXUS] Overwrite: %d stale XYE file(s) could not be removed; '
                 'cleanup stays PENDING and the next flush retries: %s',
                 len(remaining), [str(p) for p in remaining])
+            return False
+        return True
+
+    def _finish_xye_output(self, prepared, scan):
+        """The run's terminal XYE outcome: clean, or VISIBLY pending (§19.4).
+
+        A one-chunk run has no later flush for the promised retry, so this is
+        the only/final attempt: retry the stale tail once more and, if it
+        clears, publish the withheld buffer (exactly the landed frames the
+        envelope accumulated).  If any stale artifact still remains, the run
+        may not report clean completion — the withheld output stays withheld
+        (no mixed run) and the pending state is surfaced on the same visible
+        label every other terminal outcome uses.
+
+        Returns ``True`` when this run's XYE output is complete and clean.
+        """
+        self._flush_xye_buffer(scan, published_idxs=set())
+        pending = list(prepared.xye_tail_pending or ())
+        if not pending:
+            return True
+        with self._xye_lock:
+            withheld = len(self._xye_buffer)
+        message = (
+            f'Run INCOMPLETE — {len(pending)} stale XYE file(s) from a prior '
+            f'run could not be removed; {withheld} new XYE file(s) withheld '
+            f'(no mixed output). Remove the stale file(s) and run again.')
+        logger.error('[NEXUS] %s  pending: %s', message,
+                     [str(p) for p in pending])
+        try:
+            self.showLabel.emit(message)
+        except Exception:                              # noqa: BLE001
+            logger.debug("showLabel emit failed for pending XYE tail",
+                         exc_info=True)
+        return False
 
     def _prepare_execution(self, frozen):
         """THE worker execution-preparation owner (§16.7 R.1-1, §17.8 item 1).
@@ -789,6 +914,14 @@ class nexusThread(wranglerThread):
         one invocation could read a foreign source while writing accepted
         output and provenance.
 
+        O-3N.R.3 §19.2: publication comes LAST, and the whole interval is
+        ``BaseException``-total.  The parent assigned ``self._execution`` and
+        only then adopted the worker cursors; an adoption fault (including an
+        interrupt) left the envelope PUBLISHED and its exact HDF5 handle live,
+        with the direct entry's ``finally`` not yet armed.  Nothing may
+        survive a failed transfer: every fallible step runs first, and any
+        throwable closes the envelope before it can be observed.
+
         Returns the :class:`PreparedNexusExecution` envelope; the WORKER owns
         releasing it.
         """
@@ -799,20 +932,24 @@ class nexusThread(wranglerThread):
             self, "nexus-execution-preparation", candidate=frozen)
         # A superseded envelope never lingers beside a new one.
         nexusThread._release_execution(self)
-        stack = None
+        prepared = None
+        source = None
         try:
             target = nexusThread._frozen_source_target(accepted)
-            stack = nexusThread._preflight_execution_target(self, target)
-            prepared = PreparedNexusExecution(accepted, target, stack)
+            source = nexusThread._preflight_execution_target(self, target)
+            prepared = PreparedNexusExecution(
+                accepted, target, source.stack, source.scan_metadata)
+            nexusThread._adopt_frozen_source_target(self, prepared)
         except BaseException:
-            if stack is not None:
+            if prepared is not None:
+                prepared.close()
+            elif source is not None:
                 try:
-                    stack.close()
+                    source.stack.close()
                 except Exception:                      # noqa: BLE001
                     logger.debug("stack close failed", exc_info=True)
             raise
         self._execution = prepared
-        nexusThread._adopt_frozen_source_target(self, prepared)
         return prepared
 
     def _require_execution(self, frozen):
@@ -931,11 +1068,15 @@ class nexusThread(wranglerThread):
 
         nexusThread._project_gi_modes_onto_display_scan(self, frozen)
 
-        # Read scan-level metadata once (counters/angles per-frame
-        # arrays).  Per-frame slicing happens later.
+        # Scan-level metadata (counters/angles per-frame arrays) is the
+        # ENVELOPE's, detached during strict preparation on the SAME held
+        # handle as the raw stack (§19.1).  Re-resolving the pathname here is
+        # exactly the scientific TOCTOU O-3N.R.3 removed: a replacement file
+        # at the accepted path fed the run foreign motor angles for the
+        # accepted inode's pixels.  Per-frame slicing happens later.
+        scan_meta = prepared.scan_metadata
+        base_meta = {}
         try:
-            scan_meta = read_nexus(self.nexus_file, self.entry)
-            base_meta = {}
             for k, v in scan_meta.counters.items():
                 if len(v) > 0:
                     base_meta[k] = float(v[0])
@@ -943,6 +1084,8 @@ class nexusThread(wranglerThread):
                 if len(v) > 0:
                     base_meta[k] = float(v[0])
         except Exception:
+            # Advisory metadata: a malformed per-point value degrades to the
+            # empty base exactly as the pre-§19.1 path-based read did.
             scan_meta = None
             base_meta = {}
 
@@ -962,7 +1105,7 @@ class nexusThread(wranglerThread):
         )
 
         files_processed = 0
-        # ``open_nexus_image_stack`` transparently handles two layouts:
+        # The strict execution source transparently handles two layouts:
         #   • single 3D dataset (e.g. /entry/instrument/detector/data)
         #   • Eiger master with sibling external links
         #     /entry/data/data_NNNNNN → individual _data_*.h5 files.
@@ -1164,6 +1307,15 @@ class nexusThread(wranglerThread):
         # the outer hold is the ordering guard that prevents pause/close from
         # racing a load worker that borrowed a pooled read handle under file_lock.
         self._final_save_to_nexus(frozen, scan, files_processed)
+
+        # §19.4: the terminal outcome is truthful.  The only/final XYE attempt
+        # runs here — a transiently blocked tail publishes the withheld files
+        # now; a persistent one leaves the run visibly PENDING, never 'Done'.
+        if not nexusThread._finish_xye_output(self, prepared, scan):
+            logger.info(
+                'NeXus run ended PENDING (stale XYE tail): %.2fs, %d frames',
+                time.time() - t0, files_processed)
+            return
 
         self.showLabel.emit(f'Done — {files_processed} frames processed')
         logger.info(

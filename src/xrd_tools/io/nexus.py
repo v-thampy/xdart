@@ -38,7 +38,7 @@ import logging
 import os
 import warnings
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, NamedTuple, Sequence
 
 import h5py
 import numpy as np
@@ -164,15 +164,33 @@ def read_nexus(
                 f"Entry group {entry!r} not found in {p}. "
                 f"Available top-level keys: {list(f.keys())}"
             )
-        grp = f[entry]
+        return _read_scan_metadata_from_entry(
+            f[entry], scan_id=p.stem,
+            motor_names=motor_names, counter_names=counter_names,
+        )
 
-        scan_id = p.stem
-        energy = _read_energy(grp)
-        wavelength = _read_wavelength(grp, energy)
-        ub_matrix = _read_ub_matrix(grp)
-        sample_name = _read_sample_name(grp)
-        angles, counters = _read_data_group(grp, motor_names, counter_names)
 
+def _read_scan_metadata_from_entry(
+    entry_grp: h5py.Group,
+    *,
+    scan_id: str,
+    motor_names: list[str] | None = None,
+    counter_names: list[str] | None = None,
+) -> ScanMetadata:
+    """Extract :class:`ScanMetadata` from an ALREADY-OPEN entry group.
+
+    The one shared body of :func:`read_nexus`, split out for callers that hold
+    the container open already (O-3N.R.3, handoff §19.1: the strict execution
+    opener reads raw stack and scan metadata on ONE held handle, so a pathname
+    replacement cannot hand one run pixels from the accepted inode and motor
+    angles from another).  Everything returned is detached — plain Python
+    values and materialized numpy arrays — so it survives the file's close.
+    """
+    energy = _read_energy(entry_grp)
+    wavelength = _read_wavelength(entry_grp, energy)
+    ub_matrix = _read_ub_matrix(entry_grp)
+    sample_name = _read_sample_name(entry_grp)
+    angles, counters = _read_data_group(entry_grp, motor_names, counter_names)
     return ScanMetadata(
         scan_id=scan_id,
         energy=energy,
@@ -182,7 +200,7 @@ def read_nexus(
         ub_matrix=ub_matrix,
         sample_name=sample_name,
         source="nexus",
-        h5_path=p,
+        h5_path=Path(entry_grp.file.filename),
     )
 
 
@@ -630,47 +648,120 @@ def open_nexus_image_stack_exact(
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"NeXus file not found: {p}")
+    name = _require_exact_entry_name(entry)
+
+    h5f = h5py.File(p, "r")
+    try:
+        return NexusImageStack(h5f, _exact_entry_stack_paths(h5f, p, name))
+    except BaseException:
+        # O-3N.R.3 (§19.2): TOTAL.  ``except Exception`` leaked the sole HDF5
+        # handle when stack construction was interrupted — the acquisition
+        # boundary must close on ANY throwable before ownership transfers.
+        h5f.close()
+        raise
+
+
+def _require_exact_entry_name(entry: str) -> str:
     name = str(entry or "").strip().strip("/")
     if not name:
         raise ValueError(
             "an exact NeXus stack open requires a named entry; there is no "
             "safe group to guess"
         )
+    return name
+
+
+def _exact_entry_stack_paths(
+    h5f: h5py.File, p: Path, name: str
+) -> list[str]:
+    """Prove the EXACT entry and resolve its raw stack paths, no fallback.
+
+    The shared strict core of :func:`open_nexus_image_stack_exact` and
+    :func:`open_nexus_execution_source`: one already-open handle, the literal
+    entry name, Group qualification, the Eiger/single-dataset resolution, and
+    the outside-the-selected-group rejection.
+    """
+    node = h5f.get(name)
+    if node is None:
+        raise KeyError(f"entry {name!r} does not exist in {p}")
+    if not isinstance(node, h5py.Group):
+        raise KeyError(
+            f"entry {name!r} in {p} is not an HDF5 group "
+            f"(got {type(node).__name__})"
+        )
+    ext_paths = _find_eiger_external_link_paths(h5f, name)
+    if ext_paths:
+        # Same provisional-link contract as the shared opener (NXS-LINK-1).
+        missing = [lp for lp in ext_paths if h5f.get(lp) is None]
+        if missing:
+            raise UnresolvedSourceLinkError(
+                f"Eiger data link(s) {missing} in {p} do not resolve yet "
+                f"(target not landed); container is still being written"
+            )
+        paths = list(ext_paths)
+    else:
+        single = find_nexus_image_dataset_in_open_file(h5f, name)
+        if single is None:
+            raise KeyError(f"No image dataset found in {p}:{name}")
+        paths = [single]
+    prefix = f"/{name}/"
+    outside = [q for q in paths if not q.startswith(prefix)]
+    if outside:
+        raise KeyError(
+            f"the image dataset(s) {outside} resolved outside the selected "
+            f"entry {name!r} in {p}"
+        )
+    return paths
+
+
+class NexusExecutionSource(NamedTuple):
+    """One strictly-proved execution source: raw stack + detached metadata.
+
+    O-3N.R.3 (§19.1/§19.6 item 1).  ``stack`` owns the ONE ``h5py.File`` this
+    open created; ``scan_metadata`` is fully detached (or ``None`` when the
+    container carries no readable per-point tables — metadata is advisory for
+    an execution, exactly as the graceful ``read_nexus`` consumer treated it).
+    """
+
+    stack: NexusImageStack
+    scan_metadata: "ScanMetadata | None"
+
+
+def open_nexus_execution_source(
+    path: Path | str,
+    entry: str,
+) -> NexusExecutionSource:
+    """Open EVERYTHING one execution needs from its source, in ONE strict open.
+
+    The extension of :func:`open_nexus_image_stack_exact` that §19.1 requires:
+    qualifying the exact group, binding the raw stack, and detaching the scan
+    metadata (counters/motor angles per frame) all happen on a SINGLE held
+    ``h5py.File``.  A pathname replacement after this open therefore cannot
+    split one run's facts across two inodes — the accepted resource is one
+    handle, and nothing about the execution re-resolves the pathname.
+
+    Same strictness and exception surface as the exact stack opener; the
+    metadata read alone is best-effort (``scan_metadata=None`` on a malformed
+    per-point table, matching the pre-existing graceful consumer).  Total on
+    every throwable: no path leaks the handle before the caller owns it.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"NeXus file not found: {p}")
+    name = _require_exact_entry_name(entry)
 
     h5f = h5py.File(p, "r")
     try:
-        node = h5f.get(name)
-        if node is None:
-            raise KeyError(f"entry {name!r} does not exist in {p}")
-        if not isinstance(node, h5py.Group):
-            raise KeyError(
-                f"entry {name!r} in {p} is not an HDF5 group "
-                f"(got {type(node).__name__})"
-            )
-        ext_paths = _find_eiger_external_link_paths(h5f, name)
-        if ext_paths:
-            # Same provisional-link contract as the shared opener (NXS-LINK-1).
-            missing = [lp for lp in ext_paths if h5f.get(lp) is None]
-            if missing:
-                raise UnresolvedSourceLinkError(
-                    f"Eiger data link(s) {missing} in {p} do not resolve yet "
-                    f"(target not landed); container is still being written"
-                )
-            paths = list(ext_paths)
-        else:
-            single = find_nexus_image_dataset_in_open_file(h5f, name)
-            if single is None:
-                raise KeyError(f"No image dataset found in {p}:{name}")
-            paths = [single]
-        prefix = f"/{name}/"
-        outside = [q for q in paths if not q.startswith(prefix)]
-        if outside:
-            raise KeyError(
-                f"the image dataset(s) {outside} resolved outside the selected "
-                f"entry {name!r} in {p}"
-            )
-        return NexusImageStack(h5f, paths)
-    except Exception:
+        paths = _exact_entry_stack_paths(h5f, p, name)
+        try:
+            scan_metadata = _read_scan_metadata_from_entry(
+                h5f[name], scan_id=p.stem)
+        except Exception:                              # noqa: BLE001
+            logger.debug("scan metadata extraction failed for %s:%s",
+                         p, name, exc_info=True)
+            scan_metadata = None
+        return NexusExecutionSource(NexusImageStack(h5f, paths), scan_metadata)
+    except BaseException:
         h5f.close()
         raise
 
