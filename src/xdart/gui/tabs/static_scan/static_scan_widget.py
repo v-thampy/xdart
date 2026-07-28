@@ -406,15 +406,9 @@ class _ControlsStrictWriteError(Exception):
 
     Carries the ONE thing the transaction reports: ``reason``, the forward
     diagnostic.  When the setter failed, the setter stays the PRIMARY reason
-    even if cleanup also failed (§24.4 req 5).
-
-    R4-G: this type used to carry two further slots — a tuple of signal owners
-    left unrestored, and the originating setter exception.  Since §25.4 the
-    STRICT writer REGISTERS every owner it touches in the transaction's one
-    signal registry, so final recovery observes owners stranded by the rollback
-    too, not only by the forward writer.  Both slots therefore had no shipped
-    reader; the single catch site consumes ``reason`` alone.
-    """
+    even if cleanup also failed (§24.4 req 5).  R4-G deleted this type's two
+    reporting slots: since §25.4 the transaction's signal registry owns
+    stranded-owner recovery, so neither had a shipped reader."""
 
     def __init__(self, reason):
         self.reason = str(reason)
@@ -15891,12 +15885,8 @@ class staticWidget(QWidget):
             self.h5viewer._apply_frames_panel_width(viewer_mode)
             if hasattr(self, "metawidget"):
                 self.metawidget.viewer_mode = viewer_mode
-            # R4-G: the displayframe used to be handed a wrangler reference
-            # here "for mask/threshold".  That consumer is gone -- nothing ever
-            # read the slot -- and holding it made the display widget retain a
-            # wrangler, and through it a worker thread, for the lifetime of a
-            # viewer mode.  Mask and threshold reach the display through the
-            # publication/projection path like every other value.
+            # R4-G deleted the displayframe wrangler hand-off here: no reader,
+            # and it retained a wrangler (and its worker) across viewer modes.
             # In viewer mode, disable New/Save (keep Open Folder and Export)
             self.h5viewer.actionNewFile.setEnabled(not is_viewer)
             self.h5viewer.actionSaveDataAs.setEnabled(not is_viewer)

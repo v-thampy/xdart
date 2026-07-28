@@ -1123,12 +1123,9 @@ class wranglerThread(Qt.QtCore.QThread):
         fname: str, path to data file.
         file_lock: mp.Condition, process safe lock for file access
 
-        R4-G: ``scan_args`` was retired from this signature.  The wrangler
-        WIDGET still owns a live ``scan_args`` slot -- populated from the
-        accepted frozen configuration at admission and read at the
-        readiness/metadata seam -- but it was constructed empty and handed
-        here before that ever happened, and no worker stored it.
-        """
+        R4-G retired ``scan_args`` here: it arrived EMPTY (the wrangler
+        widget's live slot is filled later, at admission) and no worker
+        stored it."""
         super().__init__(parent)
         self.input_q = command_queue # thread queue
         self.fname = fname

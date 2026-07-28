@@ -672,24 +672,11 @@ class imageThread(wranglerThread):
             command,
             scan,
             parent=None):
-        """R4-G: seventeen retired parameters were removed here.
-
-        W-1R-D deleted every worker SLOT they used to seed (review §44.2), so
-        from that commit on they were accepted and dropped on the floor.  What
-        each one used to configure -- acquisition shape, source family,
-        traversal, reader selection, output policy, GI geometry, live mode and
-        the worker cap -- is read from the accepted ``FrozenRunConfiguration``
-        and from nowhere else.  ``scan_args`` went with them: it was an
-        always-EMPTY snapshot at construction time (the wrangler populates its
-        own slot later, at admission), threaded into a parameter the base
-        class never stored.
-
-        Retired: ``scan_args``, ``h5_dir``, ``single_img``, ``inp_type``,
-        ``img_dir``, ``include_subdir``, ``img_ext``, ``series_average``,
-        ``meta_ext``, ``file_filter``, ``mask_file``, ``write_mode``, ``gi``,
-        ``th_mtr``, ``sample_orientation``, ``tilt_angle``, ``live_mode``,
-        ``max_cores``.
-        """
+        """R4-G retired eighteen parameters here (W-1R-D had already deleted
+        every worker slot they seeded, review §44.2).  Acquisition shape,
+        source family, traversal, reader selection, output policy, GI
+        geometry, live mode and the worker cap are read from the accepted
+        ``FrozenRunConfiguration`` and nowhere else."""
 
         super().__init__(command_queue, fname, file_lock, parent)
 
