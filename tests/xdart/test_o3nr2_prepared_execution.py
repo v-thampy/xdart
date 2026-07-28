@@ -190,6 +190,46 @@ def test_the_exact_opener_refuses_where_the_shared_opener_falls_back(tmp_path):
             open_nexus_image_stack_exact(source, hint)
 
 
+def test_a_non_group_entry_refuses_precisely_with_no_fallback_to_shadow_it(
+        widget, tmp_path, monkeypatch):
+    """The Group check is not subsumed by the outside-the-group check.
+
+    Mutation M-2b (delete the Group check) survived the first oracle, because a
+    Dataset hint beside a runnable NXentry is still caught by the
+    resolved-outside-the-selected-entry check.  It is NOT equivalent: with no
+    other entry to fall back to, the dataset finder walks a Dataset as if it
+    were a group and leaks whatever numpy/h5py raises — an internal
+    ``ValueError`` about array truth values, or a ``TypeError`` the preflight
+    does not even catch.  The Group check is what makes the refusal precise and
+    typed, so it gets its own row.
+    """
+    source = tmp_path / "three-d-dataset-hint-alone.nxs"
+    with h5py.File(source, "w") as handle:
+        handle.create_dataset(
+            "selected", data=np.zeros((2, 4, 4), dtype=np.float32))
+
+    with pytest.raises(KeyError, match="not an HDF5 group"):
+        open_nexus_image_stack_exact(source, "selected")
+
+    # And through the real worker preflight: one typed refusal, no output.
+    wrangler = _select_nexus(widget)
+    output = tmp_path / "out"
+    output.mkdir()
+    wrangler.parameters.child("Calibration", "poni_file").setValue(
+        _write_poni(tmp_path / "cal.poni"))
+    wrangler.parameters.child("NeXus File", "nexus_file").setValue(str(source))
+    wrangler.parameters.child("NeXus File", "entry").setValue("selected")
+    wrangler.parameters.child("Output", "h5_dir").setValue(str(output))
+    _start_recorder(wrangler, monkeypatch)
+    wrangler.start()
+    thread = wrangler.thread
+    target = nexusThread._frozen_source_target(thread.run_configuration)
+
+    with pytest.raises(RunConfigurationRefused):
+        nexusThread._preflight_execution_target(thread, target)
+    assert list(output.iterdir()) == []
+
+
 def test_the_exact_opener_binds_only_within_the_selected_group(tmp_path):
     source = tmp_path / "two-entry.nxs"
     with h5py.File(source, "w") as handle:
