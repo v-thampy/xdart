@@ -19,12 +19,25 @@ from tests.xdart.test_o3n_execution_owner import (  # noqa: E402
 )
 
 
-def _arm_entry_only(wrangler, tmp_path: Path, *, xye_only: bool = False):
+def _arm_entry_only(wrangler, tmp_path: Path, *, xye_only: bool = False,
+                    runnable: bool = False):
+    """Arm a container whose ``entry`` group exists but carries NO raw stack.
+
+    ``runnable=True`` gives it one, for the rows whose subject is the output
+    transaction rather than the refusal (§16.4: output ownership is unreachable
+    until the source is proved runnable, so those rows need a real source).
+    """
+    import numpy as np
+
     source = tmp_path / "raw" / "acq.nxs"
     source.parent.mkdir()
     with h5py.File(source, "w") as handle:
         entry = handle.create_group("entry")
         entry.attrs["NX_class"] = "NXentry"
+        if runnable:
+            detector = entry.create_group("instrument/detector")
+            detector.create_dataset(
+                "data", data=np.zeros((2, 8, 8), dtype=np.float32))
     output = tmp_path / "out"
     output.mkdir()
     wrangler.parameters.child("Calibration", "poni_file").setValue(
@@ -62,7 +75,10 @@ def test_xye_only_overwrite_does_not_delete_an_nxs_it_will_never_replace(
 ):
     wrangler = _select_nexus(widget)
     widget.controls.set_write_mode("Overwrite")
-    source, output = _arm_entry_only(wrangler, tmp_path, xye_only=True)
+    # The subject here is the XYE-only OUTPUT TRANSACTION, so the source must be
+    # runnable; the sibling row above owns the not-runnable refusal.
+    source, output = _arm_entry_only(
+        wrangler, tmp_path, xye_only=True, runnable=True)
     _start_recorder(wrangler, monkeypatch)
     wrangler.start()
     thread = wrangler.thread
@@ -99,8 +115,17 @@ def test_append_existing_different_identity_is_refused_before_writer(
         data_file=str(output),
         _save_to_nexus=lambda: writes.append("writer reached"),
     )
+    # O-3N.R.2 §17.4: the run's output transaction lives on the prepared
+    # envelope, so the qualification is asked of a REAL envelope over a REAL
+    # target rather than of a latch on a stand-in worker.
+    from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler_thread import (
+        PreparedNexusExecution,
+    )
+
+    prepared = PreparedNexusExecution(
+        frozen, nexusThread._frozen_source_target(frozen))
     worker = SimpleNamespace(
-        _run_output_prepared=None,
+        _execution=prepared,
         file_lock=__import__("threading").RLock(),
     )
     monkeypatch.setattr(
@@ -109,6 +134,7 @@ def test_append_existing_different_identity_is_refused_before_writer(
     )
 
     with pytest.raises(RunConfigurationRefused):
-        nexusThread._prepare_output_for_run(worker, frozen, scan)
+        nexusThread._prepare_output_for_run(worker, prepared, scan)
 
     assert writes == []
+    assert prepared.output_committed is False

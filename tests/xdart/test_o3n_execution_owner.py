@@ -186,7 +186,13 @@ def test_link_identity_collision_is_refused_not_lexical(
 
 def test_execution_poni_comes_from_frozen_values_not_the_panel(
         widget, tmp_path, monkeypatch):
-    """`setup()` used to reread the PONI editor and rebuild `self.poni`."""
+    """`setup()` used to reread the PONI editor and rebuild `self.poni`.
+
+    O-3N.R.2 §17.7/§17.8 item 7: this used to drive ``_execution_poni()``, a
+    helper with no production callers — so the row proved a fact about a dead
+    accessor rather than about execution.  It now drives the REAL preparation
+    owner and asserts on the calibration the worker actually integrates with.
+    """
     from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler_thread import (
         nexusThread,
     )
@@ -203,11 +209,12 @@ def test_execution_poni_comes_from_frozen_values_not_the_panel(
         str(poisoned))
     wrangler.poni_file = str(poisoned)
 
-    poni = nexusThread._execution_poni(thread, frozen)
+    prepared = nexusThread._prepare_execution(thread, frozen)
 
-    assert poni is not None
-    assert poni.to_dict()["dist"] == pytest.approx(accepted["dist"])
-    assert poni.to_dict()["dist"] != pytest.approx(9.9)
+    for poni in (prepared.poni, thread.poni, prepared.target.poni()):
+        assert poni is not None
+        assert poni.to_dict()["dist"] == pytest.approx(accepted["dist"])
+        assert poni.to_dict()["dist"] != pytest.approx(9.9)
 
 
 def test_source_base_comes_from_the_frozen_project_root(

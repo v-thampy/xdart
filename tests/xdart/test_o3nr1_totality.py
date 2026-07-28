@@ -123,8 +123,17 @@ def test_missing_frozen_poni_cannot_reuse_a_stale_worker_poni(
     # while the worker still carries the prior PONI object.
     from dataclasses import replace
 
+    from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler_thread import (
+        PreparedNexusExecution,
+    )
+
     no_poni = replace(frozen, poni_file="", _poni_values=("none",))
-    nexusThread._adopt_frozen_source_target(thread, no_poni)
+    # O-3N.R.2 §17.1: adoption consumes the prepared ENVELOPE, so there is one
+    # derivation of the target and one construction of the calibration.
+    target = nexusThread._frozen_source_target(no_poni)
+    assert target.poni() is None
+    prepared = PreparedNexusExecution(no_poni, target)
+    nexusThread._adopt_frozen_source_target(thread, prepared)
 
     assert thread.poni is None
 
@@ -168,7 +177,15 @@ def test_incompatible_append_is_refused_before_existing_target_is_used(
     prior = Path(target.output_path)
     prior.write_bytes(b"prior incompatible run")
     scan = SimpleNamespace(data_file=str(prior))
+    # O-3N.R.2 §17.4: the output transaction is owned by the envelope, so the
+    # refusal cannot be bypassed by re-entering with the same frozen object.
+    from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler_thread import (
+        PreparedNexusExecution,
+    )
+
+    prepared = PreparedNexusExecution(frozen, target)
 
     with pytest.raises(RunConfigurationRefused):
-        nexusThread._prepare_output_for_run(thread, frozen, scan)
+        nexusThread._prepare_output_for_run(thread, prepared, scan)
     assert prior.read_bytes() == b"prior incompatible run"
+    assert prepared.output_committed is False

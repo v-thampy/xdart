@@ -110,8 +110,10 @@ def test_source_and_output_must_not_resolve_to_same_file(
 def test_worker_scan_owns_the_frozen_output_before_writer_use(
         widget, tmp_path, monkeypatch):
     wrangler = _select_nexus(widget)
+    # O-3N.R.2 §16.4: the run scan is created by the worker's preparation owner,
+    # which proves the exact source runnable before any output ownership.
     source, output = _arm_nexus(
-        wrangler, tmp_path, name="source.nxs", entry="entry")
+        wrangler, tmp_path, name="source.nxs", entry="entry", runnable=True)
     _start_recorder(wrangler, monkeypatch)
     wrangler.start()
     thread = wrangler.thread

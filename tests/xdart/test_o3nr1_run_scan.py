@@ -302,6 +302,7 @@ _O3N_MODULES = (
     "test_o3nr1_run_scan.py",
     "test_o3nr1_exact_review.py",
     "test_o3nr1_totality.py",
+    "test_o3nr2_prepared_execution.py",
 )
 
 

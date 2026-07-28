@@ -118,11 +118,39 @@ def _write_poni(path: Path) -> str:
     return str(path)
 
 
+def _write_runnable_container(path: Path, entry: str) -> Path:
+    """A REAL container whose EXACT named group carries a runnable raw stack.
+
+    O-3N.R.2 §16.4/§17.3: the corrected worker cannot take output ownership over
+    a source it has not proved runnable, and it proves the exact selected group.
+    Rows that drive ``_initialize_scan`` therefore need a real container; a
+    ``b"source"`` stub only ever exercised the freeze, never the run.
+    """
+    import h5py
+    import numpy as np
+
+    with h5py.File(path, "w") as handle:
+        group = handle.require_group(entry)
+        group.attrs["NX_class"] = "NXentry"
+        detector = group.create_group("instrument/detector")
+        detector.attrs["NX_class"] = "NXdetector"
+        detector.create_dataset(
+            "data", data=np.arange(2 * 8 * 8, dtype=np.float32).reshape(2, 8, 8))
+    return path
+
+
 def _arm_nexus(wrangler, tmp_path, *, name="source.nxs", entry="entry",
-               source=True, output=True):
-    """Arm exactly what the NeXus page owns: file, entry, calibration, output."""
+               source=True, output=True, runnable=False):
+    """Arm exactly what the NeXus page owns: file, entry, calibration, output.
+
+    ``runnable=True`` writes a real readable container instead of a stub, for
+    the rows that go on to drive the worker rather than only the freeze.
+    """
     src = tmp_path / name
-    src.write_bytes(b"source")
+    if runnable:
+        _write_runnable_container(src, entry)
+    else:
+        src.write_bytes(b"source")
     out = tmp_path / "output"
     out.mkdir(exist_ok=True)
     wrangler.parameters.child("Calibration", "poni_file").setValue(
@@ -470,7 +498,11 @@ def test_one_nexus_identity_from_start_through_provenance_and_reload(
     from xrd_tools.core.provenance import read_provenance
 
     wrangler = _select_nexus(widget)
-    src, out = _arm_nexus(wrangler, tmp_path, entry="entry/data")
+    # O-3N.R.2: this row drives the worker's own ``_initialize_scan``, which can
+    # no longer take output ownership over a source it has not proved runnable
+    # (§16.4).  A real nested-entry container also makes the "the reloaded
+    # provenance names the entry that was REDUCED" claim below literally true.
+    src, out = _arm_nexus(wrangler, tmp_path, entry="entry/data", runnable=True)
     _start_recorder(wrangler, monkeypatch)
     wrangler.start()
 

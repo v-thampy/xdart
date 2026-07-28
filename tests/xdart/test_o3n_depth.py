@@ -42,7 +42,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("pyqtgraph")
 from pyqtgraph.Qt import QtWidgets  # noqa: E402
 
-from tests.xdart.test_o3n_nexus_freeze_identity import _write_poni  # noqa: E402
+from tests.xdart.test_o3n_nexus_freeze_identity import (  # noqa: E402
+    _write_poni,
+    _write_runnable_container,
+)
 from xrd_tools.session.run_configuration import (  # noqa: E402
     RunConfigurationRefused,
 )
@@ -90,9 +93,14 @@ def _select_nexus(widget):
     raise AssertionError("missing NeXus wrangler")
 
 
-def _arm(wrangler, tmp_path, *, entry):
+def _arm(wrangler, tmp_path, *, entry, runnable=False):
     src = tmp_path / "source.nxs"
-    src.write_bytes(b"source")
+    if runnable:
+        # O-3N.R.2 §16.4: a row that drives the worker needs a source the
+        # preparation owner can prove runnable before it takes output ownership.
+        _write_runnable_container(src, entry)
+    else:
+        src.write_bytes(b"source")
     out = tmp_path / "out"
     out.mkdir(exist_ok=True)
     # O-3N.R.1 §16.5: a constructible calibration is now an ADMISSION fact, so
@@ -155,7 +163,7 @@ def test_worker_scan_writes_the_frozen_output_target(
     )
 
     wrangler = _select_nexus(widget)
-    src, out = _arm(wrangler, tmp_path, entry="entry")
+    src, out = _arm(wrangler, tmp_path, entry="entry", runnable=True)
     monkeypatch.setattr(nexusThread, "start", lambda self: None)
     wrangler.start()
     thread = wrangler.thread
