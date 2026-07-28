@@ -400,6 +400,10 @@ DECISION_RUN_CONFIGURATION_UNADMITTED = "run_configuration_unadmitted"
 #: awaiting cleanup — its finalization has not succeeded (§9.1.5).
 DECISION_RESIDUAL_CONTEXT_RETAINED = "residual_context_retained"
 
+#: A run action refused at the canonical early admission predicate because some
+#: owner is not idle (§10.4.3).
+DECISION_RUN_ACTION_REFUSED = "run_action_refused"
+
 FAIL_CLOSED_DECISIONS = (
     DECISION_RECORD_STORE_SKIPPED,
     DECISION_PUBLICATION_ABSENT,
@@ -414,6 +418,7 @@ FAIL_CLOSED_DECISIONS = (
     DECISION_SELECTION_UNRESOLVED,
     DECISION_RUN_CONFIGURATION_UNADMITTED,
     DECISION_RESIDUAL_CONTEXT_RETAINED,
+    DECISION_RUN_ACTION_REFUSED,
 )
 
 #: Process-unique operation counter.  A browse load crosses a thread boundary,

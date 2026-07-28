@@ -31,6 +31,7 @@ from .run_config_debug import (
     DECISION_SELECTION_UNRESOLVED,
     DECISION_RUN_CONFIGURATION_UNADMITTED,
     DECISION_RESIDUAL_CONTEXT_RETAINED,
+    DECISION_RUN_ACTION_REFUSED,
     bump_run_config_debug_generation,
     capture_diagnostic_run_identity,
     display_context_transition_log,
@@ -2056,6 +2057,12 @@ class staticWidget(QWidget):
             self.frames, self.frame_ids,
             data_lock=self.data_lock,
             publication_store=self.publication_store)
+        # §10.4.3: reintegration asks the HOST's one canonical admission
+        # predicate at its action entry.  The bound callback is the established
+        # ownership pattern here — the host stays the single owner of the
+        # question, and the panel only asks.
+        self.integratorTree._refuse_run_action = (
+            self._refuse_action_for_active_owner)
         # Stitch worker (Stitch 1D / Stitch 2D modes): a one-shot off-thread
         # reduction of the loaded scan, routed through the SAME run-state owner
         # (_enter/_exit_run_state) as a wrangler run or a reintegrate.
@@ -12220,6 +12227,20 @@ class staticWidget(QWidget):
         # inside a long MultiGeometry call at app close, so request stop for the
         # pre-start window and bound-wait like the other run threads.
         self._stop_stitch_thread_on_close()
+        # §10.4.1 — the three run owners are now stopped and the viewer/display
+        # state is still intact, so this is the ONE point at which public Close
+        # can honour a retained cleanup owner.  A run whose finalization failed
+        # twice was otherwise abandoned here with its stamp never written: the
+        # residual path existed but only the private helper reached it.  One
+        # LOCAL receipt, the existing four seams and the existing collector —
+        # no persistent Close receipt, and successful unrelated seams are not
+        # replayed because only the context seams are driven.
+        try:
+            if staticWidget._has_residual_context_cleanup(self):
+                staticWidget._drive_residual_cleanup_on_close(self)
+        except Exception:
+            logger.debug("residual context cleanup on close failed",
+                         exc_info=True)
         # Stop the viewer's long-running background threads BEFORE teardown so
         # the persistent fileHandlerThread / async load worker aren't destroyed
         # while running ("QThread: Destroyed while thread is still running") on
@@ -12674,6 +12695,15 @@ class staticWidget(QWidget):
             return "run"
         if session_state == "unknown":
             return "run-session" + suffix
+        # §10.4.2 — a RETAINED cleanup owner is an active owner for admission
+        # purposes.  `_enter_run_state()` refused it, but by then a wrangler
+        # Start had already applied configuration, assigned source state, called
+        # `setup()` and configured the plan, and the two thread owners had
+        # already been started.  Reported HERE, the canonical predicate refuses
+        # before any of that.  Checked after `_run_active` so a live run keeps
+        # reporting "run".
+        if staticWidget._has_residual_context_cleanup(self):
+            return "context-cleanup"
         for label, owner in (
             ("wrangler",
              getattr(getattr(self, 'wrangler', None), 'thread', None)),
@@ -13061,6 +13091,66 @@ class staticWidget(QWidget):
             selected_generation=selection.display_generation,
             commit_epoch=context.commit_epoch)
         return selection
+
+    def _drive_residual_cleanup_on_close(self) -> None:
+        """Retry a retained cleanup owner once, from public Close (§10.4.1)."""
+        receipt = staticWidget._new_projection_receipt()
+        staticWidget._run_residual_context_cleanup(self, receipt)
+        failures = []
+        for attempt in receipt.attempts.values():
+            if attempt.initial_error is None:
+                continue
+            if attempt.completed:
+                failures.append(
+                    (attempt.seam + " (recovered on retry)",
+                     attempt.initial_error))
+            else:
+                failures.append((attempt.seam, attempt.initial_error))
+                if attempt.recovery_error is not None:
+                    failures.append(
+                        (attempt.seam + " (recovery failed)",
+                         attempt.recovery_error))
+        if failures:
+            staticWidget._report_run_lifecycle_closure_failures(
+                self, "close", failures, False)
+
+    def _refuse_action_for_active_owner(self, action) -> str | None:
+        """The ONE early admission check every run action shares (§10.4.3).
+
+        Returns the owner label that refuses *action*, or ``None`` to proceed.
+        Consulted BEFORE configuration or scan mutation, before ``setup()`` and
+        before any ``QThread.start()`` — `_enter_run_state()` remains a
+        defensive second check, but by the time it runs a wrangler Start has
+        already mutated run state and the two thread owners have already been
+        started.
+        """
+        owner = staticWidget._controls_v2_active_run_owner(self)
+        if owner is None:
+            return None
+        fail_closed_rejection_log(
+            logger, DECISION_RESIDUAL_CONTEXT_RETAINED
+            if owner == "context-cleanup" else DECISION_RUN_ACTION_REFUSED,
+            reason=f"{action} refused: the {owner} owner is not idle",
+            outcome="action_refused", blanks_panel=False,
+            expected="idle", found=owner,
+            origin=f"staticWidget.{action}")
+        try:
+            staticWidget._report_run_owner_refusal(self, action, owner)
+        except Exception:
+            logger.debug("run-action refusal status failed", exc_info=True)
+        return owner
+
+    def _report_run_owner_refusal(self, action, owner) -> None:
+        """Surface the refusal where the operator can see it."""
+        status = getattr(self, "_stitch_status", None)
+        message = (
+            "Finish cleaning up the previous run before starting another."
+            if owner == "context-cleanup"
+            else f"{action} unavailable: {owner} is still active.")
+        if action == "stitch" and callable(status):
+            status(message)
+        else:
+            logger.info("%s refused (%s): %s", action, owner, message)
 
     def _select_acquisition_context(self, *, origin=""):
         """Point the display back at the acquisition context.
@@ -13637,19 +13727,20 @@ class staticWidget(QWidget):
         self._display_selection = None
 
     def _finalize_acquisition_context_scan(self) -> None:
-        """Run-end substep 2: finalize the acquisition context's scan.
+        """Run-end substep 2: attempt the acquisition scan's finalization ONCE.
 
         X1 Slice 3a (R3-P5): stamps the run scan's persisted wavelength from
         the run cache before the context is dropped.  Pause never reaches here;
         it goes through ``_on_run_paused``.
 
-        T-4.2 (§35.7.C) preserved under the O-3 owner: the ONE finalization
-        claim is consumed ATOMICALLY FIRST and the fallible finalizer is then
-        driven from the local.  Taking the claim afterwards meant a persistent
-        finalizer failure left the live run scan owned after terminal closure
-        and the recovery pass finalized the same identity twice.  An absent
-        context — or an already-consumed claim — is a no-op, so a retry can
-        never re-finalize.
+        The state machine is what makes this retryable without ever finalizing
+        twice (§9.1, corrected in c3R.1).  An attempt is GRANTED only from the
+        pending state; a failure returns to pending, so the seam can be retried
+        by a later pass or by public Close; and only success reaches finalized,
+        which is the sole authority the release substep accepts.  The parent
+        consumed a one-shot claim before the fallible finalizer, so a failure
+        left the context unable ever to finalize while the release seam — which
+        asked only whether the claim had been taken — discarded it anyway.
 
         The context OBJECT is released by its own later substep, and only once
         this one has succeeded; dropping it here would discard the run identity
@@ -14389,6 +14480,8 @@ class staticWidget(QWidget):
             self._stitch_status('Could not read stitch settings.')
             return
         self.stitch_thread.mode = mode
+        if staticWidget._refuse_action_for_active_owner(self, "stitch"):
+            return
         self.stitch_thread.params = params
         self.stitch_thread.stop_requested = False
         # Fail-loud UX: a detector mask that can't be applied to the stitch
@@ -14402,6 +14495,7 @@ class staticWidget(QWidget):
         else:
             self._stitch_status(f'Stitching ({mode.upper()})…')
         self.stitch_thread.start()         # started -> _enter_run_state
+
 
     def _build_stitch_params(self, mode):
         """run_stitch kwargs from the integrator's existing 1D/2D fields (reused

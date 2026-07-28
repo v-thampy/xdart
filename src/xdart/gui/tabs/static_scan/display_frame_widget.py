@@ -5513,14 +5513,19 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         scan-key guard in ``_get_wavelength`` tier 2; no reseed, no clear."""
 
     def finish_processing(self, run_scan=None, run_scan_key=None):
-        """FINAL run exit (not Pause): stamp the CAPTURED run scan's persisted
-        wavelength from the run cache, then clear the cache in ``finally``
-        (R3-P5).  Whatever scan is currently displayed is irrelevant.
+        """FINAL run exit (not Pause): stamp the run scan's persisted
+        wavelength from the run cache (R3-P5).  Whatever scan is currently
+        displayed is irrelevant — the acquisition context supplies both the
+        scan and the key.
 
-        The stamp is skipped fail-closed when the cache's scan identity does
-        not match the captured scan's CURRENT identity (e.g. Stop while
-        paused-browsing another scan repointed the singleton) and when the
-        scan already carries a persisted value (disk truth wins)."""
+        RETRY-SAFE (§9.1.2, corrected in c3R.1): the decision is staged first,
+        the write is idempotent, and the run cache is cleared only after a
+        SUCCESSFUL commit.  The cache used to be cleared in a ``finally``,
+        which destroyed the very state a retry needed, so a second attempt
+        could only ever be a silent no-op.  The stamp still lands exactly once,
+        because it is skipped when the scan already carries a persisted value
+        (disk truth wins) and fail-closed when the cache's scan identity does
+        not match the key it was asked to finalize."""
         if run_scan is None:
             run_scan = getattr(self, '_wavelength_run_scan', None)
         # §9.1.2 — RETRY-SAFE.  The decision is staged first, the write is

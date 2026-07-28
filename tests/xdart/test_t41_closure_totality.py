@@ -181,7 +181,14 @@ def test_ready_profile_recovers_every_control_after_early_exit_failure(
     assert after == before, (
         f"controls stranded after an early exit failure: {after} != {before}")
     assert _lifecycle_truth(widget) == _TRUTHFUL_IDLE
-    assert widget._controls_v2_active_run_owner() is None
+    # X1 O-3 (c3R.1 §10.4.2): the injected failure is at the FINALIZER, so the
+    # acquisition context is legitimately retained as a cleanup owner — and the
+    # canonical admission predicate must SAY so, because a new Run may not
+    # overwrite a run whose stamp never landed.  Every control is still
+    # recovered (asserted above); what refuses is Start, which is the point.
+    assert widget._acquisition_context is not None
+    assert widget._acquisition_context.finalized is False
+    assert widget._controls_v2_active_run_owner() == "context-cleanup"
 
 
 # --------------------------------------------------------------------------- #

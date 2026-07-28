@@ -506,7 +506,13 @@ def test_receipt_contract_is_typed_mandatory_and_allocated_only_at_entries():
                 if not carries_receipt:
                     missing_receipt_calls.append((method.name, target))
 
+    # X1 O-3 (c3R.1 §10.4.1): public Close is a fourth legitimate LOCAL
+    # allocation site.  A run whose finalization failed twice is retained as a
+    # cleanup owner, and Close is the qualified delivery that retries it — with
+    # its own per-delivery receipt, dropped on return like every other one.
+    # Nothing is stored on the widget; the pin below still forbids that.
     assert sorted(allocation_sites) == [
+        "_drive_residual_cleanup_on_close",
         "integrator_thread_finished",
         "stitch_thread_finished",
         "wrangler_finished",

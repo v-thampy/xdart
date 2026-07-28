@@ -384,9 +384,16 @@ def test_a_persistent_finalizer_failure_retains_the_owner_and_refuses_a_new_run(
     assert widget._run_active is False
 
 
-def test_a_later_qualified_delivery_retries_the_retained_cleanup_owner(
+def test_public_close_retries_the_retained_cleanup_owner(
         widget, monkeypatch, tmp_path):
-    """§9.1.7 case 5 — Close retries the residual owner, and only that seam."""
+    """§10.4.1/10.4.4 — the REAL Close entry, not the private helper.
+
+    The residual path existed but only ``_close_run_lifecycle()`` reached it,
+    and public ``close()`` never called that.  A run whose finalization failed
+    twice was therefore abandoned at Close with its stamp never written — and
+    the in-tree case that called itself a Close test proved nothing about it,
+    because it invoked the private helper directly.
+    """
     widget._enter_run_state(origin=RUN_ORIGIN_REINTEGRATE)
     acquisition = widget._acquisition_context
     finish_calls = []
@@ -405,19 +412,78 @@ def test_a_later_qualified_delivery_retries_the_retained_cleanup_owner(
     with pytest.raises(RuntimeError):
         widget._exit_run_state(receipt)
     staticWidget._run_idle_lifecycle_projection(widget, receipt)
-    assert widget._acquisition_context is acquisition
     assert widget._run_active is False
-    writes_after_first_delivery = len(writing_calls)
+    assert widget._acquisition_context is acquisition
+    assert len(finish_calls) == 2
+    writes_before_close = len(writing_calls)
 
-    # A later qualified delivery — Close — must drive the residual cleanup even
-    # though `_run_active` is already False, and must NOT replay seams that
-    # already succeeded.
-    later = widget._new_projection_receipt()
-    staticWidget._close_run_lifecycle(
-        widget, "integrator", receipt=later, release_source=False)
-    assert len(finish_calls) == 3
+    widget.close()
+
+    assert len(finish_calls) == 3, "public Close made no third attempt"
     assert acquisition.finalized is True
     assert widget._acquisition_context is None
-    assert len(writing_calls) == writes_after_first_delivery, (
-        "an already-successful UNRELATED seam was replayed on the residual "
-        "retry; residual cleanup drives only the context seams (§9.1.6)")
+    assert len(writing_calls) == writes_before_close, (
+        "Close replayed an already-successful unrelated seam")
+    # The retired owner's commit authority is withdrawn with it.
+    assert acquisition.commit_gate.cancelled is True
+
+
+def test_every_run_action_refuses_a_retained_cleanup_owner(
+        widget, monkeypatch, tmp_path):
+    """§10.4.2/10.4.4 — the action matrix, at the EARLIEST guard.
+
+    Each action must refuse before it mutates anything and before it starts a
+    worker.  ``_enter_run_state()`` alone was far too late: a wrangler Start had
+    already applied configuration, called ``setup()`` and configured the plan,
+    and the two thread owners had already been started.
+
+    The reintegration legs are driven through the real ``bai_1d``/``bai_2d``
+    entries with only their pre-existing frame/calibration preconditions
+    satisfied, so what is measured is the new guard's PLACEMENT — ahead of the
+    first scan mutation and ahead of ``QThread.start()``.
+    """
+    widget._enter_run_state(origin=RUN_ORIGIN_REINTEGRATE)
+    retained = widget._acquisition_context
+    widget._run_active = False
+
+    # The one canonical predicate names it.
+    assert widget._controls_v2_active_run_owner() == "context-cleanup"
+
+    tree = widget.integratorTree
+    started, mutated = [], []
+    # Satisfy the pre-existing preconditions so no modal is raised; the guard
+    # under test sits AFTER them and before everything that follows.
+    monkeypatch.setattr(tree, "_block_if_no_frames", lambda _dim: False)
+    monkeypatch.setattr(tree, "_block_if_reload_only_frames",
+                        lambda _dim: False)
+    monkeypatch.setattr(tree, "_ensure_reintegration_calibration",
+                        lambda _dim: True)
+    monkeypatch.setattr(tree, "_apply_gi_config_to_scan",
+                        lambda: mutated.append("gi_config"))
+    monkeypatch.setattr(tree, "_apply_threshold_config_to_thread",
+                        lambda: mutated.append("thresholds"))
+    monkeypatch.setattr(tree.integrator_thread, "start",
+                        lambda: started.append("reintegration"),
+                        raising=False)
+    monkeypatch.setattr(widget.stitch_thread, "start",
+                        lambda: started.append("stitch"), raising=False)
+
+    tree.bai_1d(None)
+    tree.bai_2d(None)
+    assert started == [], f"a run action started a worker: {started}"
+    assert mutated == [], (
+        f"a run action mutated state before refusing: {mutated}")
+
+    # Stitch refuses at its own entry, through the same predicate.
+    assert staticWidget._refuse_action_for_active_owner(
+        widget, "stitch") == "context-cleanup"
+    assert started == []
+
+    # The owner is still retained, and nothing became active.
+    assert widget._acquisition_context is retained
+    assert widget._run_active is False
+
+    # The defensive second check still refuses at the run-state owner.
+    with pytest.raises(DisplayContextError):
+        widget._enter_run_state(origin=RUN_ORIGIN_REINTEGRATE)
+    assert widget._run_active is False

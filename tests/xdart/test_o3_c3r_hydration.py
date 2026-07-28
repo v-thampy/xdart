@@ -393,3 +393,129 @@ def test_a_rescope_restamps_the_acquisition_selection(
     assert after.context_token == acquisition.context_token
     assert widget.displayframe.display_context_token == \
         acquisition.context_token
+
+
+# --------------------------------------------------------------------------- #
+# §10.1 — the REAL FrameRecordStore under the commit gate
+# --------------------------------------------------------------------------- #
+
+def _record_store_with_evicted_frame():
+    import numpy as np
+    from xrd_tools.core import FrameRecord, FrameView, IntegrationResult1D
+    from xrd_tools.session import FrameRecordStore
+
+    def view(label, scale):
+        intensity = scale * np.array([3.0, 6.0, 12.0])
+        return FrameView.from_results(
+            label=label,
+            result_1d=IntegrationResult1D(
+                radial=np.array([0.1, 0.2, 0.3]),
+                intensity=intensity, sigma=np.sqrt(intensity),
+                unit="q_A^-1"))
+
+    store = FrameRecordStore(max_heavy_items=1)
+    original = view(1, 1.0)
+    store.upsert(FrameRecord.from_view(original), persisted=True)
+    store.upsert(FrameRecord.from_view(view(2, 2.0)), persisted=True)
+    assert not store.has_heavy_payload(1)
+    return store, original
+
+
+def test_the_real_record_store_hydrates_under_a_live_gate():
+    """§10.1 — the owned `purpose="2d"` consumer, on the real store.
+
+    `_hydration_stores()` captures BOTH stores and c3R-b sends the gate to
+    every one of them, but only `PublicationStore` accepted it; the worker
+    swallowed the resulting `TypeError` as a generic hydration failure, so an
+    evicted integrated frame reported completion and never came back.
+    """
+    from xrd_tools.core import FrameRecord
+    from xdart.modules.display_context import CommitGate
+
+    store, original = _record_store_with_evicted_frame()
+    store.set_hydrator(lambda label: FrameRecord.from_view(original))
+    gate = CommitGate()
+
+    assert store.get_or_hydrate(
+        1, commit_gate=gate, commit_epoch=gate.epoch) is not None
+    assert store.has_heavy_payload(1)
+
+
+def test_the_real_record_store_still_hydrates_without_a_gate():
+    """§10.1.1 — the no-gate API is preserved for idle and legacy callers."""
+    from xrd_tools.core import FrameRecord
+
+    store, original = _record_store_with_evicted_frame()
+    store.set_hydrator(lambda label: FrameRecord.from_view(original))
+    assert store.get_or_hydrate(1) is not None
+    assert store.has_heavy_payload(1)
+
+
+def test_a_gate_cancelled_while_the_record_hydrator_is_latched_inserts_nothing():
+    """§10.1.3 — a cancelled gate inserts NOTHING and moves no bookkeeping.
+
+    It must not fall back to an ungated upsert, and the persisted-mode and
+    source-identity bookkeeping must be exactly as it was.
+    """
+    from xrd_tools.core import FrameRecord
+    from xdart.modules.display_context import CommitGate
+
+    store, original = _record_store_with_evicted_frame()
+    gate = CommitGate()
+    epoch = gate.epoch
+    persisted_before = store.persisted_modes(1)
+    source_before = store.source_identity(1)
+
+    def latched_hydrator(label):
+        # The context is retired WHILE the read is in flight — the exact race
+        # §10.2 closes, seen from the store's side.
+        gate.cancel()
+        return FrameRecord.from_view(original)
+
+    store.set_hydrator(latched_hydrator)
+    store.get_or_hydrate(1, commit_gate=gate, commit_epoch=epoch)
+
+    assert not store.has_heavy_payload(1), (
+        "a cancelled gate still inserted the read payload")
+    assert store.persisted_modes(1) == persisted_before
+    assert store.source_identity(1) == source_before
+
+
+# --------------------------------------------------------------------------- #
+# §10.3 — completion admission is source- and epoch-qualified
+# --------------------------------------------------------------------------- #
+
+def test_completion_admission_refuses_a_foreign_source_and_a_stale_epoch(
+        widget, monkeypatch, tmp_path):
+    """§10.3.3/10.3.5 — the whole owner qualifies, not part of it.
+
+    Two sub-scans of one container share a context token, a scan key, a label
+    and a display generation; only the SOURCE tells them apart.  And a request
+    minted before a rescope carries a superseded epoch.
+    """
+    widget._enter_run_state(origin=RUN_ORIGIN_REINTEGRATE)
+    display = widget.displayframe
+    context = widget._acquisition_context
+    request = display._build_hydration_request(4, purpose="full")
+    assert request is not None
+    good = request.owner
+    assert good.source and good.epoch
+
+    assert displayFrameWidget._admit_hydration_owner(
+        display, good, 4, request.generation) is True
+
+    from xdart.modules.display_context import HydrationOwner
+
+    foreign_source = HydrationOwner.of(
+        context_token=good.context_token, scan_key=good.scan_key,
+        source="/data/another_sub_scan.nxs", epoch=good.epoch)
+    assert displayFrameWidget._admit_hydration_owner(
+        display, foreign_source, 4, request.generation) is False, (
+        "a completion from a different source was admitted")
+
+    stale_epoch = HydrationOwner.of(
+        context_token=good.context_token, scan_key=good.scan_key,
+        source=good.source, epoch=good.epoch + 1)
+    assert displayFrameWidget._admit_hydration_owner(
+        display, stale_epoch, 4, request.generation) is False, (
+        "a completion from a superseded epoch was admitted")

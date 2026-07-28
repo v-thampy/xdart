@@ -1440,6 +1440,8 @@ class integratorTree(QtWidgets.QWidget):
             return
         if not self._ensure_reintegration_calibration('1D'):
             return
+        if self._refuse_reintegration_for_active_owner():
+            return
         self._apply_gi_config_to_scan()
         self._apply_threshold_config_to_thread()
         with self.integrator_thread.lock:
@@ -1450,6 +1452,25 @@ class integratorTree(QtWidgets.QWidget):
         if not self.integrator_thread.isRunning():
             self.integrator_thread.start()
 
+    def _refuse_reintegration_for_active_owner(self) -> bool:
+        """§10.4.3 — refuse BEFORE any scan/thread mutation.
+
+        Reintegration admission used to run from ``QThread.started``, i.e. after
+        the worker had already been started, so a retained cleanup owner could
+        not stop it in time.  The host owns the one canonical predicate; this
+        consults it at the action entry.
+        """
+        refuse = getattr(self, "_refuse_run_action", None)
+        if not callable(refuse):
+            # No host bound (duck-typed panels in the suite): the host's own
+            # `_enter_run_state()` check remains the defensive backstop.
+            return False
+        try:
+            return bool(refuse("reintegration"))
+        except Exception:
+            logger.debug("reintegration admission probe failed", exc_info=True)
+            return False
+
     def bai_2d(self, q):
         """Uses the integrator_thread attribute to call bai_2d
         """
@@ -1458,6 +1479,8 @@ class integratorTree(QtWidgets.QWidget):
         if self._block_if_reload_only_frames('2D'):
             return
         if not self._ensure_reintegration_calibration('2D'):
+            return
+        if self._refuse_reintegration_for_active_owner():
             return
         self._apply_gi_config_to_scan()
         self._apply_threshold_config_to_thread()
