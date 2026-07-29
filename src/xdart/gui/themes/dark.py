@@ -12,6 +12,17 @@ from __future__ import annotations
 
 import string
 
+from .accent import (
+    DEFAULT_ACCENT_COLOR,
+    normalize_accent_color,
+    selected_color,
+)
+from .spacing import (
+    DEFAULT_SPACING,
+    normalize_spacing,
+    set_current_spacing,
+    spacing_tokens,
+)
 from .typography import (
     DEFAULT_FONT_SCALE,
     FONT_SCALE_TOKENS,
@@ -125,11 +136,36 @@ def _blend(a, b, t):
         _clamp(ba + (bb - ba) * t))
 
 
+def _contrast_text(color):
+    """Choose dark/light text from the selected colour's relative luminance."""
+    channels = []
+    for value in _hex(color):
+        component = value / 255.0
+        channels.append(
+            component / 12.92
+            if component <= 0.04045
+            else ((component + 0.055) / 1.055) ** 2.4
+        )
+    luminance = (
+        0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+    )
+    dark_ratio = (luminance + 0.05) / 0.06
+    light_ratio = 1.05 / (luminance + 0.05)
+    return "#1a1a1a" if dark_ratio >= light_ratio else "#ffffff"
+
+
 _ACTIVE = {"active": "#ffb86c", "active_border": "#e0a050",
            "active_hover": "#ffc987", "active_muted": "#5a4a35"}
 
 
-def _resolve(base, *, is_light, font_scale=DEFAULT_FONT_SCALE):
+def _resolve(
+    base,
+    *,
+    is_light,
+    font_scale=DEFAULT_FONT_SCALE,
+    accent_color=DEFAULT_ACCENT_COLOR,
+    spacing=DEFAULT_SPACING,
+):
     """Palette + the derived state shades the template needs."""
     p = dict(base)
     p["accent_on_text"] = "#ffffff" if is_light else "#1a1a1a"
@@ -144,10 +180,19 @@ def _resolve(base, *, is_light, font_scale=DEFAULT_FONT_SCALE):
     p["start_muted"] = _blend(base["start"], base["field"], 0.6)
     p["stop_hover"] = _blend(base["stop_bg"], base["stop_text"], 0.15)
     p["stop_muted"] = _blend(base["stop_bg"], base["panel"], 0.5)
+    selection = selected_color(
+        normalize_accent_color(accent_color),
+        theme_default=base["accent"],
+    )
+    p["selection_accent"] = selection
+    p["selection_accent_on_text"] = _contrast_text(selection)
+    p["selection_accent_hover"] = _shade(selection, 0.12)
+    p["selection_accent_muted"] = _blend(selection, base["field"], 0.6)
     p.update(_ACTIVE)
     # Rule 4 of the font contract: the dense Controls tokens are a presentation
     # density variant of the ONE application tier, not a second setting.
     p.update(qss_font_tokens(font_scale))
+    p.update(spacing_tokens(normalize_spacing(spacing)).qss_tokens())
     return p
 
 
@@ -250,7 +295,7 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit, QPlainTextEdit {
     color: $text;
     border: 1px solid $field_border;
     border-radius: 5px;
-    padding: 2px 4px;
+    padding: $field_padding;
     selection-background-color: $field_border;
 }
 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus,
@@ -278,8 +323,8 @@ QPushButton#BrowseButton {
     background-color: $browse;
     color: $browse_text;
     border: 1px solid $browse_border;
-    border-radius: 6px;
-    padding: 1px 6px;
+    border-radius: 0px;
+    padding: $browse_button_padding;
 }
 QPushButton#BrowseButton:hover {
     background-color: $browse_hover;
@@ -317,8 +362,8 @@ QCheckBox::indicator, QRadioButton::indicator {
     border-radius: 2px;
 }
 QCheckBox::indicator:checked, QRadioButton::indicator:checked {
-    background-color: $accent;
-    border: 1px solid $accent;
+    background-color: $selection_accent;
+    border: 1px solid $selection_accent;
 }
 QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {
     background-color: $panel;
@@ -330,8 +375,8 @@ QPushButton {
     background-color: $field;
     color: $text;
     border: 1px solid $field_border;
-    border-radius: 6px;
-    padding: 4px 12px;
+    border-radius: 0px;
+    padding: $button_padding;
 }
 QPushButton:hover {
     background-color: $field_border;
@@ -358,8 +403,8 @@ QToolButton {
     background-color: $field;
     color: $text;
     border: 1px solid $field_border;
-    border-radius: 6px;
-    padding: 3px 9px;
+    border-radius: 0px;
+    padding: $tool_button_padding;
 }
 QToolButton:hover {
     background-color: $field_border;
@@ -382,18 +427,18 @@ QToolButton#helpMenuButton::menu-indicator {
    state is obvious.  ``:checked`` only matches checkable buttons, so
    plain action buttons are unaffected. */
 QPushButton:checked {
-    background-color: $accent;
-    color: $accent_on_text;
-    border: 1px solid $accent;
+    background-color: $selection_accent;
+    color: $selection_accent_on_text;
+    border: 1px solid $selection_accent;
     font-weight: bold;
 }
 QPushButton:checked:hover {
-    background-color: $accent_hover;
+    background-color: $selection_accent_hover;
 }
 QPushButton:checked:disabled {
-    background-color: $accent_muted;
+    background-color: $selection_accent_muted;
     color: $text_muted;
-    border-color: $accent_muted;
+    border-color: $selection_accent_muted;
 }
 
 /* Accented Start / Stop — colour-coded primary CTAs.  Wranglers
@@ -639,8 +684,8 @@ QPushButton#toolButton {
     background-color: $field;
     color: $text;
     border: 1px solid $field_border;
-    border-radius: 5px;
-    padding: 4px 10px;
+    border-radius: 0px;
+    padding: $button_padding;
     text-align: center;
     font-weight: 600;
 }
@@ -657,8 +702,8 @@ QPushButton#toolOpen, QPushButton#peakFitGo {
     background-color: $accent;
     color: $accent_on_text;
     border: 1px solid $accent;
-    border-radius: 4px;
-    padding: 1px 10px;
+    border-radius: 0px;
+    padding: $compact_action_padding;
     font-weight: 700;
 }
 QPushButton#toolOpen:hover, QPushButton#peakFitGo:hover {
@@ -675,20 +720,20 @@ QLabel#peakFitStatus {
    end caps rounded to match and a hairline divider between them. */
 QFrame#displayScaleGroup {
     border: 1px solid $field_border;
-    border-radius: 6px;
+    border-radius: 0px;
     background-color: $field;
 }
 QFrame#displayScaleGroup QComboBox {
     border: none;
-    border-top-left-radius: 5px;
-    border-bottom-left-radius: 5px;
+    border-top-left-radius: 0px;
+    border-bottom-left-radius: 0px;
     border-top-right-radius: 0px;
     border-bottom-right-radius: 0px;
 }
 QFrame#displayScaleGroup QPushButton {
     border: none;
-    border-top-right-radius: 5px;
-    border-bottom-right-radius: 5px;
+    border-top-right-radius: 0px;
+    border-bottom-right-radius: 0px;
     border-top-left-radius: 0px;
     border-bottom-left-radius: 0px;
 }
@@ -724,8 +769,8 @@ QPushButton#controlsV2ActionButton {
     background-color: $field;
     color: $text;
     border: 1px solid $field_border;
-    border-radius: 7px;
-    padding: 6px 10px;
+    border-radius: 0px;
+    padding: $control_action_padding;
     font-weight: 500;
 }
 /* Reintegrate = transparent green (run-like); Advanced = transparent red
@@ -891,7 +936,7 @@ QComboBox#controlsV2ComboBox {
     color: $text;
     border: 1px solid $field_border;
     border-radius: 5px;
-    padding: 3px 7px;
+    padding: $control_field_padding;
 }
 QLineEdit#controlsV2LineEdit:disabled,
 QComboBox#controlsV2ComboBox:disabled {
@@ -903,8 +948,8 @@ QToolButton#controlsV2MoreButton {
     background-color: #4d6fbd;
     color: $browse_text;
     border: 1px solid #6483ce;
-    border-radius: 5px;
-    padding: 2px 4px;
+    border-radius: 0px;
+    padding: $control_browse_padding;
     font-weight: 800;
     font-size: $control_panel_browse_font;
     min-width: 28px;
@@ -922,22 +967,22 @@ QPushButton#controlsV2PillButton {
     background-color: $field;
     color: $text_2;
     border: 1px solid $field_border;
-    border-radius: 7px;
-    padding: 5px 8px;
+    border-radius: 0px;
+    padding: $toggle_padding;
     font-weight: 700;
     text-align: center;
 }
 QPushButton#controlsV2ToggleButton:checked,
 QPushButton#controlsV2PillButton:checked {
-    background-color: $accent;
-    color: $accent_on_text;
-    border-color: $accent;
+    background-color: $selection_accent;
+    color: $selection_accent_on_text;
+    border-color: $selection_accent;
 }
 QPushButton#controlsV2ToggleButton:checked:disabled,
 QPushButton#controlsV2PillButton:checked:disabled {
-    background-color: $accent_muted;
+    background-color: $selection_accent_muted;
     color: $text_2;
-    border-color: $accent_muted;
+    border-color: $selection_accent_muted;
 }
 QPushButton#controlsV2ToggleButton:disabled,
 QPushButton#controlsV2PillButton:disabled {
@@ -952,14 +997,8 @@ QPushButton#controlsV2PillButton:disabled {
    polish, whereas a property selector only takes effect after a global restyle
    -- which left the pills boxy until an unrelated font-size change. */
 QPushButton#controlsV2PillButton {
-    border-radius: 13px;
-    padding: 4px 13px;
-    /* macOS (QMacStyle) renders a rounded QPushButton bezel only when the button
-       is tall enough that the 13px radius stays clear of ~half its height; at
-       the body-font height (~25px) cocoa gives up and draws SQUARE corners.
-       Floor the height so the pill lands at ~28px (min-height is the content
-       box; padding + border add ~10px) and the rounded bezel always renders --
-       at every font preset.  Harmless on platforms that already round it. */
+    border-radius: 0px;
+    padding: $pill_padding;
     min-height: 18px;
 }
 /* The compact RangeRow's ✦ auto/enable toggle + the low–high separator. */
@@ -967,19 +1006,19 @@ QToolButton#controlsV2AutoButton {
     background-color: $field;
     color: $accent_text;
     border: 1px solid $field_border;
-    border-radius: 6px;
-    padding: 4px 7px;
+    border-radius: 0px;
+    padding: $auto_padding;
     font-weight: 700;
 }
 QToolButton#controlsV2AutoButton:checked {
-    background-color: $accent;
-    color: $accent_on_text;
-    border-color: $accent;
+    background-color: $selection_accent;
+    color: $selection_accent_on_text;
+    border-color: $selection_accent;
 }
 QToolButton#controlsV2AutoButton:checked:disabled {
-    background-color: $accent_muted;
+    background-color: $selection_accent_muted;
     color: $text_2;
-    border-color: $accent_muted;
+    border-color: $selection_accent_muted;
 }
 QToolButton#controlsV2AutoButton:disabled {
     background-color: $panel;
@@ -1090,6 +1129,9 @@ QProgressBar::chunk {
 QSplitter::handle {
     background-color: $field_border;
 }
+QSplitter#e3BrowserLists::handle {
+    background-color: $win_bg;
+}
 
 /* ── Tooltips ──────────────────────────────────────────────────── */
 QToolTip {
@@ -1162,18 +1204,38 @@ def _branch_qss(right_url, down_url):
         f'\n    image: url("{down_url}"); }}\n')
 
 
-def render_qss(name="dark", font_scale=DEFAULT_FONT_SCALE):
-    """Render the QSS for theme ``name`` ("dark"/"light") at ``font_scale``.
+def render_qss(
+    name="dark",
+    font_scale=DEFAULT_FONT_SCALE,
+    *,
+    accent_color=DEFAULT_ACCENT_COLOR,
+    spacing=DEFAULT_SPACING,
+):
+    """Render one complete theme/font/accent/spacing stylesheet.
 
     Pure and Qt-free, so the import-time ``DARK_QSS`` render still works with no
     QApplication."""
     base, is_light = _THEMES.get(name, _THEMES["dark"])
     return string.Template(_QSS_TEMPLATE).substitute(
-        _resolve(base, is_light=is_light, font_scale=font_scale))
+        _resolve(
+            base,
+            is_light=is_light,
+            font_scale=font_scale,
+            accent_color=accent_color,
+            spacing=spacing,
+        )
+    )
 
 
-def apply_theme(app, name="dark", font_scale=DEFAULT_FONT_SCALE) -> None:
-    """Apply theme ``name`` at ``font_scale`` to a live QApplication.
+def apply_theme(
+    app,
+    name="dark",
+    font_scale=DEFAULT_FONT_SCALE,
+    *,
+    accent_color=DEFAULT_ACCENT_COLOR,
+    spacing=DEFAULT_SPACING,
+) -> None:
+    """Apply one complete appearance to a live QApplication.
 
     THE single entry point for appearance: it owns the application font, the
     QSS, the pyqtgraph config, and the restyle of plots that already exist.
@@ -1198,14 +1260,28 @@ def apply_theme(app, name="dark", font_scale=DEFAULT_FONT_SCALE) -> None:
     which is how startup uses it.
     """
     font_scale = normalize_font_scale(font_scale)
+    accent_color = normalize_accent_color(accent_color)
+    spacing = set_current_spacing(normalize_spacing(spacing))
     apply_application_font(app, font_scale)
-    qss = render_qss(name, font_scale=font_scale)
+    qss = render_qss(
+        name,
+        font_scale=font_scale,
+        accent_color=accent_color,
+        spacing=spacing,
+    )
     # Visible, themed expand/collapse arrows for the wrangler ParameterTree.
     # Generated lazily (needs a live QApplication) and appended here rather than
     # in render_qss so the import-time DARK_QSS render stays Qt-free.
     base, is_light = _THEMES.get(name, _THEMES["dark"])
     right_url, down_url = _arrow_icon_paths(
-        _resolve(base, is_light=is_light, font_scale=font_scale)["text"])
+        _resolve(
+            base,
+            is_light=is_light,
+            font_scale=font_scale,
+            accent_color=accent_color,
+            spacing=spacing,
+        )["text"]
+    )
     if right_url and down_url:
         qss += _branch_qss(right_url, down_url)
     import sys as _sys

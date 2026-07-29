@@ -374,9 +374,17 @@ def test_live_change_applies_once_and_persists_once(
     import xdart.gui.themes as themes
     monkeypatch.setattr(
         themes, "apply_theme",
-        lambda app, name="dark", *, font_scale=typo.DEFAULT_FONT_SCALE: (
+        lambda app, name="dark", *, font_scale=typo.DEFAULT_FONT_SCALE,
+        **appearance: (
             calls.append((name, font_scale)),
-            real_apply(app, name, font_scale=font_scale))[1])
+            real_apply(
+                app,
+                name,
+                font_scale=font_scale,
+                **appearance,
+            ),
+        )[1],
+    )
 
     _trigger_tier(window, "Large")
 

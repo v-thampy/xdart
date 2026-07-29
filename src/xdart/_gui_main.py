@@ -207,6 +207,18 @@ from xdart.gui.themes.typography import (
     normalize_font_scale,
     resolve_font_scale,
 )
+from xdart.gui.themes.accent import (
+    ACCENT_COLOR_MENU,
+    ACCENT_COLOR_SETTINGS_KEY,
+    normalize_accent_color,
+    resolve_accent_color,
+)
+from xdart.gui.themes.spacing import (
+    SPACING_MENU,
+    SPACING_SETTINGS_KEY,
+    normalize_spacing,
+    resolve_spacing,
+)
 
 
 QMainWindow = QtWidgets.QMainWindow
@@ -312,7 +324,7 @@ class Main(QMainWindow):
             self.resize(1600, 920)
 
     def _init_theme_menu(self):
-        """Add the Theme and Font Size submenus to the in-window Config menu.
+        """Add the application appearance submenus to the in-window Config menu.
 
         The visible File/Config controls are the H5Viewer toolbar's tool-buttons
         (``h5viewer.paramMenu``), NOT the QMainWindow menu bar (which on macOS is
@@ -330,6 +342,8 @@ class Main(QMainWindow):
         settings = _app_settings()
         current = _resolve_theme(settings)
         font_scale = resolve_font_scale(settings)
+        accent_color = resolve_accent_color(settings)
+        spacing = resolve_spacing(settings)
         config_menu.addSeparator()
         theme_menu = config_menu.addMenu("Theme")
         group = QtGui.QActionGroup(self)
@@ -359,6 +373,36 @@ class Main(QMainWindow):
             font_group.addAction(action)
             self.fontSizeMenu.addAction(action)
             self.fontSizeActions[scale] = action
+        self.accentColorMenu = config_menu.addMenu("Accent Color")
+        accent_group = QtGui.QActionGroup(self)
+        accent_group.setExclusive(True)
+        self.accentColorActions = {}
+        for choice, label in ACCENT_COLOR_MENU:
+            action = QtGui.QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(choice == accent_color)
+            action.triggered.connect(
+                lambda _checked=False, value=choice:
+                    self._set_accent_color(value)
+            )
+            accent_group.addAction(action)
+            self.accentColorMenu.addAction(action)
+            self.accentColorActions[choice] = action
+        self.spacingMenu = config_menu.addMenu("Spacing")
+        spacing_group = QtGui.QActionGroup(self)
+        spacing_group.setExclusive(True)
+        self.spacingActions = {}
+        for choice, label in SPACING_MENU:
+            action = QtGui.QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(choice == spacing)
+            action.triggered.connect(
+                lambda _checked=False, value=choice:
+                    self._set_spacing(value)
+            )
+            spacing_group.addAction(action)
+            self.spacingMenu.addAction(action)
+            self.spacingActions[choice] = action
         self.debugMenu = config_menu.addMenu("Debug")
         self.actionDebugWindowState = QtGui.QAction("Window State", self)
         self.actionDebugWindowState.triggered.connect(self._log_window_state)
@@ -704,15 +748,19 @@ class Main(QMainWindow):
     def _shortcut_save_settings(self):
         self._main_widget_shortcut("shortcut_save_settings")
 
-    def _apply_appearance(self, *, theme=None, font_scale=None):
+    def _apply_appearance(
+        self,
+        *,
+        theme=None,
+        font_scale=None,
+        accent_color=None,
+        spacing=None,
+    ):
         """Persist one appearance change and apply the whole look ONCE.
 
-        Theme and font tier are two halves of one appearance, so whichever one
-        the user just changed, the other is read back from settings and both go
-        into a single ``apply_theme`` call.  That is what keeps a theme switch
-        from resetting the font tier (and a font change from resetting the
-        theme), and it is why a live change emits exactly one apply and one
-        write rather than one per half.
+        Whichever value changed, the other three are read back from settings
+        and all four go into one ``apply_theme`` call.  A theme or font change
+        therefore cannot reset the chosen toggle colour or spacing tier.
         """
         settings = _app_settings()
         if theme is not None:
@@ -727,11 +775,27 @@ class Main(QMainWindow):
             settings.setValue(FONT_SCALE_SETTINGS_KEY, font_scale)
         else:
             font_scale = resolve_font_scale(settings)
+        if accent_color is not None:
+            accent_color = normalize_accent_color(accent_color)
+            settings.setValue(ACCENT_COLOR_SETTINGS_KEY, accent_color)
+        else:
+            accent_color = resolve_accent_color(settings)
+        if spacing is not None:
+            spacing = normalize_spacing(spacing)
+            settings.setValue(SPACING_SETTINGS_KEY, spacing)
+        else:
+            spacing = resolve_spacing(settings)
         app = QtWidgets.QApplication.instance()
         if app is not None:
             from xdart.gui.themes import apply_theme
-            apply_theme(app, theme, font_scale=font_scale)
-        return theme, font_scale
+            apply_theme(
+                app,
+                theme,
+                font_scale=font_scale,
+                accent_color=accent_color,
+                spacing=spacing,
+            )
+        return theme, font_scale, accent_color, spacing
 
     def _set_theme(self, name):
         """Apply theme ``name`` live and persist the choice."""
@@ -740,6 +804,14 @@ class Main(QMainWindow):
     def _set_application_font_size(self, scale):
         """Apply the application-wide font tier live and persist the choice."""
         self._apply_appearance(font_scale=scale)
+
+    def _set_accent_color(self, choice):
+        """Apply the selected-control accent live and persist the choice."""
+        self._apply_appearance(accent_color=choice)
+
+    def _set_spacing(self, choice):
+        """Apply application spacing live and persist the choice."""
+        self._apply_appearance(spacing=choice)
 
     def exit(self):
         try:
@@ -817,7 +889,13 @@ def _start_gui(app, window_factory=None):
         capture_application_baseline(app)
         from xdart.gui.themes import apply_theme
         settings = _app_settings()
-        apply_theme(app, _resolve_theme(settings), resolve_font_scale(settings))
+        apply_theme(
+            app,
+            _resolve_theme(settings),
+            resolve_font_scale(settings),
+            accent_color=resolve_accent_color(settings),
+            spacing=resolve_spacing(settings),
+        )
     except Exception:
         logger.exception("Failed to apply the saved appearance; using Qt default")
     mw = (window_factory or Main)()

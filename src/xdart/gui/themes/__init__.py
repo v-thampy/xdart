@@ -1,11 +1,18 @@
 """xdart UI themes.
 
-Two owners, one preference.  :mod:`.typography` owns the application-wide font
-scale (the five ``Font Size`` tiers, the captured platform baseline, the token
-table, and the weak plot registry); :mod:`.dark` owns the palettes and the QSS
-that consumes those tokens.  ``apply_theme`` is the single entry point that
-applies both together, in the order Qt requires.
+The small values modules own font, selected-control accent, and spacing
+choices; :mod:`.dark` owns the palettes and QSS that consume them.
+``apply_theme`` remains the only live appearance entry point.
 """
+
+from . import accent, spacing
+from .accent import (
+    ACCENT_COLOR_MENU,
+    ACCENT_COLOR_SETTINGS_KEY,
+    DEFAULT_ACCENT_COLOR,
+    normalize_accent_color,
+    resolve_accent_color,
+)
 
 from .dark import (
     DARK,
@@ -36,11 +43,23 @@ from .typography import (
     restyle_live_plots,
     style_plot_fonts,
 )
+from .spacing import (
+    DEFAULT_SPACING,
+    SPACING_MENU,
+    SPACING_SETTINGS_KEY,
+    current_spacing,
+    current_spacing_tokens,
+    normalize_spacing,
+    resolve_spacing,
+    spacing_tokens,
+)
 
 __all__ = [
     "DARK",
     "LIGHT",
     "DARK_QSS",
+    "accent",
+    "spacing",
     "apply_dark_theme",
     "apply_theme",
     "render_qss",
@@ -64,4 +83,17 @@ __all__ = [
     "live_plot_item_count",
     "restyle_live_plots",
     "style_plot_fonts",
+    "ACCENT_COLOR_MENU",
+    "ACCENT_COLOR_SETTINGS_KEY",
+    "DEFAULT_ACCENT_COLOR",
+    "normalize_accent_color",
+    "resolve_accent_color",
+    "DEFAULT_SPACING",
+    "SPACING_MENU",
+    "SPACING_SETTINGS_KEY",
+    "current_spacing",
+    "current_spacing_tokens",
+    "normalize_spacing",
+    "resolve_spacing",
+    "spacing_tokens",
 ]

@@ -144,9 +144,36 @@ def test_theme_default_is_byte_compatible_and_candidates_only_recolor_selection(
     assert "background-color: #bd93f9;" in _selector_body(
         baseline, "QPushButton:checked"
     )
-    assert _selector_body(mauve, "QLineEdit:focus") == _selector_body(
-        baseline, "QLineEdit:focus"
+    assert _selector_body(mauve, "QLineEdit#BrowsePathEdit:focus") == (
+        _selector_body(baseline, "QLineEdit#BrowsePathEdit:focus")
     ), "the selected-control picker must not recolor focus/policy accents"
+
+
+@pytest.mark.parametrize("theme_name", ["dark", "light"])
+@pytest.mark.parametrize(
+    "choice, expected",
+    [
+        ("mauve_grey", "#a49bb0"),
+        ("periwinkle_light", "#b9bee3"),
+        ("periwinkle_mid", "#a7afd6"),
+        ("periwinkle_muted", "#8f98b8"),
+    ],
+)
+def test_each_candidate_reaches_every_selected_control_family(
+    theme_name, choice, expected
+):
+    qss = render_qss(theme_name, accent_color=choice)
+    for selector in (
+        "QPushButton:checked",
+        "QCheckBox::indicator:checked, QRadioButton::indicator:checked",
+        "QPushButton#controlsV2ToggleButton:checked,\n"
+        "QPushButton#controlsV2PillButton:checked",
+        "QToolButton#controlsV2AutoButton:checked",
+    ):
+        assert f"background-color: {expected};" in _selector_body(
+            qss, selector
+        ), selector
+    assert "color: #1a1a1a;" in _selector_body(qss, "QPushButton:checked")
 
 
 def test_buttons_are_square_while_panel_cards_remain_rounded():
