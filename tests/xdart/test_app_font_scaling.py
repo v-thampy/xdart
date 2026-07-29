@@ -1,0 +1,626 @@
+"""Frozen acceptance oracle for the application-wide five-tier font scale.
+
+Config ▸ **Font Size** owns ONE preference —
+``extra_small / small / default / large / extra_large`` — that applies to the
+whole xdart application: ordinary Qt widgets (via ``QApplication.setFont``),
+the theme's dense Controls QSS tokens, and pyqtgraph tick / axis / legend
+fonts on plots that already exist.  The shared theme layer is the only owner:
+pages never read ``QSettings`` and never hold a second scale value.
+
+Every row here maps to a required mutation red (see the packet's mutation
+table), so read a failure as "the contract moved", not "the test is fussy":
+
+===========================================  =================================
+production mutation                          row that must go red
+===========================================  =================================
+derive the tier from the *current* font      ``test_default_large_default_restores_exact_metrics``
+                                             ``test_reapplying_the_same_tier_is_idempotent``
+scale only the Controls selectors            ``test_tier_reaches_ordinary_widgets_and_dialogs``
+omit plot restyling                          ``test_plot_built_before_the_change_converges_with_one_built_after``
+retain plots strongly                        ``test_closed_plots_release_from_the_registry``
+apply the saved tier only after widgets      ``test_saved_tier_is_applied_before_widget_construction``
+drop the legacy-key migration                ``test_legacy_control_panel_key_migrates_without_drift``
+remove Extra Small or Extra Large            ``test_menu_exposes_exactly_five_exclusive_tiers``
+hard-code one fixed toolbar height at XL     ``test_extreme_tiers_do_not_clip_the_three_column_shell``
+reapply the theme at Default regardless      ``test_theme_switch_preserves_the_selected_tier``
+===========================================  =================================
+
+Settings isolation: the theme layer reads ``XDART_SETTINGS_FILE`` (the same
+shape as ``XDART_SESSION_FILE``), so no test — and no standalone probe — can
+touch the maintainer's real ``com.xdart.xdart`` preferences.  ``conftest.py``
+points it at a scratch ``.ini`` for the whole session; the ``settings``
+fixture below narrows it to one file per test.
+"""
+import gc
+import os
+import weakref
+from pathlib import Path
+from types import SimpleNamespace
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pytest
+
+pytest.importorskip("pyqtgraph")
+import pyqtgraph as pg
+from pyqtgraph import QtWidgets
+
+from xdart.gui.themes import apply_theme, render_qss
+from xdart.gui.themes import typography as typo
+
+
+# ── harness ──────────────────────────────────────────────────────────────
+
+@pytest.fixture(scope="module")
+def qapp():
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    # Capture the pristine platform baseline BEFORE any row applies a tier, so
+    # every row derives from the same immutable origin (contract rule 1).
+    typo.capture_application_baseline(app)
+    return app
+
+
+@pytest.fixture
+def settings(tmp_path, monkeypatch):
+    """A real QSettings on a scratch .ini — the production accessor, redirected."""
+    monkeypatch.setenv("XDART_SETTINGS_FILE", str(tmp_path / "xdart.ini"))
+    return typo.application_settings()
+
+
+@pytest.fixture(autouse=True)
+def _restore_default_tier(qapp):
+    """Leave the process at Default so row order cannot matter."""
+    yield
+    apply_theme(qapp, "dark", font_scale=typo.DEFAULT_FONT_SCALE)
+
+
+class _FakeStaticWidget(QtWidgets.QWidget):
+    """The host page stub used by the existing main-window menu sentinel.
+
+    The seam under test is the menu/preference owner inside ``Main`` — the page
+    is only the surface the Config menu is hung on, so the real (multi-second)
+    staticWidget is not needed for the menu rows.  Geometry rows below use the
+    real page.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.h5viewer = SimpleNamespace(
+            paramMenu=QtWidgets.QMenu(self), helpMenu=QtWidgets.QMenu(self))
+        self.ui = SimpleNamespace(
+            leftFrame=QtWidgets.QFrame(self),
+            middleFrame=QtWidgets.QFrame(self),
+            rightFrame=QtWidgets.QFrame(self),
+        )
+
+    def enable_async_hydration(self):
+        pass
+
+
+def _main_window(monkeypatch):
+    from xdart import _gui_main
+    monkeypatch.setattr(
+        _gui_main.tabs.static_scan, "staticWidget", _FakeStaticWidget)
+    return _gui_main.Main()
+
+
+def _submenu(window, title):
+    for action in window.main_widget.h5viewer.paramMenu.actions():
+        menu = action.menu()
+        if menu is not None and menu.title() == title:
+            return menu
+    return None
+
+
+def _font_actions(window):
+    menu = _submenu(window, "Font Size")
+    assert menu is not None, "Config ▸ Font Size submenu is missing"
+    return menu.actions()
+
+
+def _trigger_tier(window, label):
+    for action in _font_actions(window):
+        if action.text() == label:
+            action.trigger()
+            return action
+    raise AssertionError(f"no {label!r} action in Config ▸ Font Size")
+
+
+def _probe_metrics(qapp):
+    """Metrics that must restore EXACTLY across a tier round-trip."""
+    label = QtWidgets.QLabel("Refresh")
+    button = QtWidgets.QPushButton("Reintegrate")
+    combo = QtWidgets.QComboBox()
+    combo.addItem("q (A-1)")
+    return {
+        "app_pt": qapp.font().pointSize(),
+        "label_hint": (label.sizeHint().width(), label.sizeHint().height()),
+        "button_hint": (button.sizeHint().width(), button.sizeHint().height()),
+        "combo_hint": (combo.sizeHint().width(), combo.sizeHint().height()),
+        "qss": render_qss("dark", font_scale=typo.current_font_scale()),
+        "plot_pt": typo.plot_font().pointSize(),
+    }
+
+
+def _styled_plot():
+    """A production-shaped pyqtgraph plot: built, labelled, legended, styled."""
+    from xdart.gui.themes import apply_seaborn_plot_style
+    widget = pg.GraphicsLayoutWidget()
+    plot = widget.addPlot()
+    plot.setLabel("bottom", "q")
+    plot.setLabel("left", "Intensity")
+    legend = plot.addLegend()
+    plot.plot([0, 1, 2], [1, 2, 3], name="frame 0")
+    apply_seaborn_plot_style(plot)
+    return widget, plot, legend
+
+
+def _plot_font_metrics(plot, legend):
+    bottom = plot.getAxis("bottom")
+    left = plot.getAxis("left")
+    return {
+        "tick_bottom": bottom.style["tickFont"].pointSize(),
+        "tick_left": left.style["tickFont"].pointSize(),
+        "label_bottom": bottom.label.font().pointSize(),
+        "label_left": left.label.font().pointSize(),
+        "legend": legend.labelTextSize(),
+    }
+
+
+# ── 1. menu inventory and default selection ──────────────────────────────
+
+def test_menu_exposes_exactly_five_exclusive_tiers(qapp, settings, monkeypatch):
+    window = _main_window(monkeypatch)
+    actions = _font_actions(window)
+
+    assert [a.text() for a in actions] == [
+        "Extra Small", "Small", "Default", "Large", "Extra Large"]
+    assert all(a.isCheckable() for a in actions)
+
+    groups = {a.actionGroup() for a in actions}
+    assert len(groups) == 1, "the five tiers must share one action group"
+    group = groups.pop()
+    assert group is not None and group.isExclusive()
+
+    assert [a.isChecked() for a in actions] == [
+        False, False, True, False, False], "Default is the default selection"
+
+    assert _submenu(window, "Control Panel Font Size") is None, (
+        "the superseded Controls-only submenu must be gone")
+
+
+def test_saved_tier_is_preselected_in_the_menu(qapp, settings, monkeypatch):
+    settings.setValue(typo.FONT_SCALE_SETTINGS_KEY, "extra_large")
+    settings.sync()
+    window = _main_window(monkeypatch)
+    checked = [a.text() for a in _font_actions(window) if a.isChecked()]
+    assert checked == ["Extra Large"]
+
+
+# ── 2 + 12. settings migration and malformed-value fallback ──────────────
+
+@pytest.mark.parametrize("legacy", ["small", "default", "large"])
+def test_legacy_control_panel_key_migrates_without_drift(settings, legacy):
+    settings.setValue(typo.LEGACY_FONT_SCALE_SETTINGS_KEY, legacy)
+    settings.sync()
+    assert typo.resolve_font_scale(settings) == legacy
+
+
+def test_new_key_wins_over_the_legacy_key(settings):
+    settings.setValue(typo.FONT_SCALE_SETTINGS_KEY, "extra_small")
+    settings.setValue(typo.LEGACY_FONT_SCALE_SETTINGS_KEY, "large")
+    settings.sync()
+    assert typo.resolve_font_scale(settings) == "extra_small"
+
+
+def test_absent_keys_resolve_to_default(settings):
+    assert typo.resolve_font_scale(settings) == typo.DEFAULT_FONT_SCALE
+
+
+@pytest.mark.parametrize("junk", [
+    "", "  ", "HUGE", "12", "Large", "extra large", "extra-large", None, 3.5, [],
+])
+def test_malformed_values_fall_back_to_default(settings, junk):
+    settings.setValue(typo.FONT_SCALE_SETTINGS_KEY, junk)
+    settings.sync()
+    assert typo.resolve_font_scale(settings) == typo.DEFAULT_FONT_SCALE
+    assert typo.normalize_font_scale(junk) == typo.DEFAULT_FONT_SCALE
+
+
+def test_only_exact_known_values_are_persisted(qapp, settings, monkeypatch):
+    window = _main_window(monkeypatch)
+    window._set_application_font_size("not-a-tier")
+    assert settings.value(typo.FONT_SCALE_SETTINGS_KEY) == typo.DEFAULT_FONT_SCALE
+
+
+def test_the_five_tiers_are_the_whole_contract():
+    assert typo.FONT_SCALES == (
+        "extra_small", "small", "default", "large", "extra_large")
+    assert typo.DEFAULT_FONT_SCALE == "default"
+    assert [label for _key, label in typo.FONT_SCALE_MENU] == [
+        "Extra Small", "Small", "Default", "Large", "Extra Large"]
+    assert tuple(key for key, _label in typo.FONT_SCALE_MENU) == typo.FONT_SCALES
+    assert set(typo.FONT_SCALE_TOKENS) == set(typo.FONT_SCALES)
+
+
+def test_token_table_is_monotonic_and_centred_on_default():
+    offsets = [typo.FONT_SCALE_TOKENS[s].app_offset_pt for s in typo.FONT_SCALES]
+    assert offsets == sorted(offsets) and len(set(offsets)) == 5
+    assert typo.FONT_SCALE_TOKENS["default"].app_offset_pt == 0
+    for field in ("control_px", "browse_px", "plot_pt", "title_pt"):
+        values = [getattr(typo.FONT_SCALE_TOKENS[s], field)
+                  for s in typo.FONT_SCALES]
+        assert values == sorted(values) and len(set(values)) == 5, field
+
+
+def test_default_tier_preserves_the_pre_change_dense_tokens():
+    """Default must render byte-identically to the superseded 'default' preset."""
+    tokens = typo.qss_font_tokens("default")
+    assert tokens["control_panel_font"] == "12px"
+    assert tokens["control_panel_status_font"] == "12px"
+    assert tokens["control_panel_tick_font"] == "12px"
+    assert tokens["control_panel_browse_font"] == "13px"
+    assert tokens["control_panel_run_font"] == "13px"
+    assert typo.FONT_SCALE_TOKENS["default"].plot_pt == 11
+
+
+# ── 3. app-wide effect: ordinary widget, Controls field, dialog, plot ────
+
+def test_tier_reaches_ordinary_widgets_and_dialogs(qapp):
+    apply_theme(qapp, "dark", font_scale="default")
+    label = QtWidgets.QLabel("DATA BROWSER")
+    button = QtWidgets.QPushButton("Refresh")
+    dialog = QtWidgets.QDialog()
+    dialog_label = QtWidgets.QLabel("Update available", dialog)
+    small = {
+        "app": qapp.font().pointSize(),
+        "label": label.sizeHint().height(),
+        "button": button.sizeHint().height(),
+        "dialog": dialog_label.sizeHint().height(),
+    }
+
+    apply_theme(qapp, "dark", font_scale="extra_large")
+    big = {
+        "app": qapp.font().pointSize(),
+        "label": label.sizeHint().height(),
+        "button": button.sizeHint().height(),
+        "dialog": dialog_label.sizeHint().height(),
+    }
+
+    assert big["app"] > small["app"]
+    for key in ("label", "button", "dialog"):
+        assert big[key] > small[key], (
+            f"{key} did not grow: a Controls-only scale is not application-wide")
+
+
+def test_tier_reaches_the_controls_panel_fields(qapp):
+    from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import ControlsPanelV2
+    apply_theme(qapp, "dark", font_scale="default")
+    panel = ControlsPanelV2()
+    panel.show()
+    edits = panel.findChildren(QtWidgets.QLineEdit)
+    assert edits, "ControlsPanelV2 exposes no QLineEdit to measure"
+    probe = edits[0]
+    qapp.processEvents()
+    small = probe.font().pixelSize(), probe.sizeHint().height()
+
+    apply_theme(qapp, "dark", font_scale="extra_large")
+    qapp.processEvents()
+    big = probe.font().pixelSize(), probe.sizeHint().height()
+
+    assert big[0] > small[0], "the dense Controls token did not follow the tier"
+    assert big[1] > small[1]
+    panel.close()
+
+
+def test_tier_reaches_pyqtgraph_axis_tick_and_legend(qapp):
+    apply_theme(qapp, "dark", font_scale="default")
+    widget, plot, legend = _styled_plot()
+    small = _plot_font_metrics(plot, legend)
+
+    apply_theme(qapp, "dark", font_scale="extra_large")
+    big = _plot_font_metrics(plot, legend)
+
+    assert big["tick_bottom"] > small["tick_bottom"]
+    assert big["tick_left"] > small["tick_left"]
+    assert big["label_bottom"] > small["label_bottom"]
+    assert big["label_left"] > small["label_left"]
+    assert big["legend"] != small["legend"]
+    widget.close()
+
+
+# ── 4. live change now, and persistence across a restart ────────────────
+
+def test_live_change_applies_once_and_persists_once(
+        qapp, settings, monkeypatch):
+    window = _main_window(monkeypatch)
+    baseline = typo.application_baseline_point_size()
+
+    calls = []
+    real_apply = apply_theme
+    import xdart.gui.themes as themes
+    monkeypatch.setattr(
+        themes, "apply_theme",
+        lambda app, name="dark", *, font_scale=typo.DEFAULT_FONT_SCALE: (
+            calls.append((name, font_scale)),
+            real_apply(app, name, font_scale=font_scale))[1])
+
+    _trigger_tier(window, "Large")
+
+    assert calls == [("dark", "large")], "one apply per live change"
+    assert qapp.font().pointSize() == baseline + 1
+    assert settings.value(typo.FONT_SCALE_SETTINGS_KEY) == "large"
+
+    # "restart": a fresh accessor over the same persisted file.
+    assert typo.resolve_font_scale(typo.application_settings()) == "large"
+
+
+def test_saved_tier_is_applied_before_widget_construction(
+        qapp, settings, monkeypatch):
+    """Startup must scale the app BEFORE any widget or plot is constructed.
+
+    Driven through the real ordering owner (``_gui_main._start_gui``) rather
+    than ``run()``: run() also claims process-global state (the QtAgg
+    matplotlib flip, faulthandler, the rotating log file) that a test must not
+    hijack — see the module banner in ``_gui_main``.  The guard below pins that
+    ``run()`` still delegates here.
+    """
+    from xdart import _gui_main
+    settings.setValue(typo.FONT_SCALE_SETTINGS_KEY, "extra_large")
+    settings.sync()
+    apply_theme(qapp, "dark", font_scale="default")
+
+    baseline = typo.application_baseline_point_size()
+    seen = []
+
+    class _RecordingWindow(QtWidgets.QWidget):
+        def __init__(self):
+            # Point size AT CONSTRUCTION TIME — the whole assertion.
+            seen.append(qapp.font().pointSize())
+            super().__init__()
+
+    _gui_main._start_gui(qapp, window_factory=_RecordingWindow)
+
+    assert seen == [baseline + 2], (
+        "the window was constructed before the saved tier was applied")
+
+
+def test_run_delegates_startup_to_the_ordering_owner():
+    main = (Path(__file__).resolve().parents[2] / "src" / "xdart"
+            / "_gui_main.py").read_text(encoding="utf-8")
+    run_body = main.split("\ndef run():", 1)[1].split("\nmain = run", 1)[0]
+    assert "_start_gui(app)" in run_body
+    assert "Main()" not in run_body, (
+        "run() must construct the window through _start_gui so the saved tier "
+        "is always applied first")
+
+
+# ── 5 + 6. exact restoration and idempotence ────────────────────────────
+
+def test_default_large_default_restores_exact_metrics(qapp):
+    apply_theme(qapp, "dark", font_scale="default")
+    before = _probe_metrics(qapp)
+
+    apply_theme(qapp, "dark", font_scale="large")
+    during = _probe_metrics(qapp)
+    assert during != before
+
+    apply_theme(qapp, "dark", font_scale="default")
+    after = _probe_metrics(qapp)
+
+    assert after == before, (
+        "Default → Large → Default drifted: the tier is being derived from the "
+        "CURRENT font instead of the captured platform baseline")
+
+
+def test_every_tier_round_trips_through_default(qapp):
+    apply_theme(qapp, "dark", font_scale="default")
+    origin = _probe_metrics(qapp)
+    for scale in typo.FONT_SCALES:
+        apply_theme(qapp, "dark", font_scale=scale)
+        apply_theme(qapp, "dark", font_scale="default")
+        assert _probe_metrics(qapp) == origin, f"drift after visiting {scale}"
+
+
+def test_reapplying_the_same_tier_is_idempotent(qapp):
+    apply_theme(qapp, "dark", font_scale="large")
+    once = _probe_metrics(qapp)
+    for _ in range(4):
+        apply_theme(qapp, "dark", font_scale="large")
+    assert _probe_metrics(qapp) == once
+
+
+def test_tiers_are_derived_from_the_captured_baseline(qapp):
+    baseline = typo.application_baseline_point_size()
+    assert baseline > 0
+    for scale in typo.FONT_SCALES:
+        apply_theme(qapp, "dark", font_scale=scale)
+        expected = baseline + typo.FONT_SCALE_TOKENS[scale].app_offset_pt
+        assert qapp.font().pointSize() == expected, scale
+        assert typo.application_baseline_point_size() == baseline, (
+            "the baseline moved: it must be captured once, never re-read")
+
+
+# ── 7 + 8. live plots: convergence and weak release ─────────────────────
+
+def test_plot_built_before_the_change_converges_with_one_built_after(qapp):
+    apply_theme(qapp, "dark", font_scale="default")
+    old_widget, old_plot, old_legend = _styled_plot()
+
+    apply_theme(qapp, "dark", font_scale="extra_large")
+    new_widget, new_plot, new_legend = _styled_plot()
+
+    assert _plot_font_metrics(old_plot, old_legend) == \
+        _plot_font_metrics(new_plot, new_legend), (
+            "a plot that existed before the change did not follow the tier")
+    old_widget.close()
+    new_widget.close()
+
+
+def test_closed_plots_release_from_the_registry(qapp):
+    apply_theme(qapp, "dark", font_scale="default")
+    before = typo.registered_plot_count()
+
+    widget, plot, _legend = _styled_plot()
+    assert typo.registered_plot_count() == before + 1
+    ref = weakref.ref(plot)
+
+    widget.close()
+    del widget, plot, _legend
+    gc.collect()
+    qapp.processEvents()
+    gc.collect()
+
+    apply_theme(qapp, "dark", font_scale="large")
+
+    assert ref() is None, "the registry retained a closed plot strongly"
+    assert typo.registered_plot_count() == before
+
+
+def test_the_registry_holds_only_weak_references(qapp):
+    assert isinstance(typo._PLOT_REGISTRY, weakref.WeakSet)
+
+
+# ── 9. geometry: extreme tiers against the three-column shell ───────────
+
+SHELL_SIZES = [(1920, 1080), (1440, 900)]
+
+
+def _clipped_widgets(root):
+    """Visible widgets whose hard height/width ceiling is below what their own
+    content needs — i.e. text the user cannot read at this tier."""
+    bad = []
+    for w in root.findChildren(QtWidgets.QWidget):
+        if not w.isVisibleTo(root):
+            continue
+        hint = w.minimumSizeHint()
+        if 0 < w.maximumHeight() < hint.height():
+            bad.append(f"{w.objectName() or type(w).__name__}: "
+                       f"maxH={w.maximumHeight()} < needs {hint.height()}")
+        if 0 < w.maximumWidth() < hint.width():
+            bad.append(f"{w.objectName() or type(w).__name__}: "
+                       f"maxW={w.maximumWidth()} < needs {hint.width()}")
+    return bad
+
+
+@pytest.fixture(scope="module")
+def shell(qapp):
+    from xdart.gui.tabs.static_scan import staticWidget
+    window = QtWidgets.QMainWindow()
+    widget = staticWidget()
+    window.setCentralWidget(widget)
+    window.show()
+    yield window, widget
+    window.close()
+
+
+@pytest.mark.parametrize("scale", ["extra_small", "extra_large"])
+@pytest.mark.parametrize("size", SHELL_SIZES)
+def test_extreme_tiers_do_not_clip_the_three_column_shell(
+        qapp, shell, scale, size):
+    window, widget = shell
+    apply_theme(qapp, "dark", font_scale=scale)
+    window.resize(*size)
+    qapp.processEvents()
+
+    for name in ("leftFrame", "middleFrame", "rightFrame"):
+        column = getattr(widget.ui, name)
+        assert column.width() > 0 and column.height() > 0, (
+            f"{name} collapsed at {scale} / {size[0]}x{size[1]}")
+
+    clipped = _clipped_widgets(widget)
+    assert clipped == [], (
+        f"clipped at {scale} / {size[0]}x{size[1]}: {clipped[:8]}")
+
+
+@pytest.mark.parametrize("scale", ["extra_small", "extra_large"])
+def test_narrow_shell_keeps_controls_scroll_reachable(qapp, shell, scale):
+    """1024x900 may need scrolling — it must never hide a control outright."""
+    window, widget = shell
+    apply_theme(qapp, "dark", font_scale=scale)
+    window.resize(1024, 900)
+    qapp.processEvents()
+
+    areas = widget.findChildren(QtWidgets.QScrollArea)
+    assert areas, "the controls column is not inside a QScrollArea"
+    for area in areas:
+        if not area.isVisibleTo(widget):
+            continue
+        inner = area.widget()
+        if inner is None:
+            continue
+        bar = area.verticalScrollBar()
+        assert bar.maximum() >= 0
+        assert bar.maximum() + area.viewport().height() >= min(
+            inner.sizeHint().height(), inner.height()), (
+                "content extends past the scrollable range — unreachable")
+
+    assert _clipped_widgets(widget) == []
+
+
+# ── 10. theme switching preserves the tier ─────────────────────────────
+
+def test_theme_switch_preserves_the_selected_tier(qapp, settings, monkeypatch):
+    window = _main_window(monkeypatch)
+    _trigger_tier(window, "Extra Large")
+    baseline = typo.application_baseline_point_size()
+    expected = baseline + typo.FONT_SCALE_TOKENS["extra_large"].app_offset_pt
+    assert qapp.font().pointSize() == expected
+
+    window._set_theme("light")
+
+    assert qapp.font().pointSize() == expected, (
+        "switching theme reset the font tier to Default")
+    assert typo.current_font_scale() == "extra_large"
+    assert settings.value(typo.FONT_SCALE_SETTINGS_KEY) == "extra_large"
+    assert settings.value("theme") == "light"
+
+    window._set_theme("dark")
+    assert qapp.font().pointSize() == expected
+
+
+def test_font_change_preserves_the_selected_theme(qapp, settings, monkeypatch):
+    window = _main_window(monkeypatch)
+    window._set_theme("light")
+    _trigger_tier(window, "Small")
+    assert settings.value("theme") == "light"
+    assert "#ffffff" in qapp.styleSheet() or "#f5f6fa" in qapp.styleSheet()
+
+
+# ── 11. one owner: no page reads QSettings or holds a second scale ─────
+
+_GUI_ROOT = Path(__file__).resolve().parents[2] / "src" / "xdart" / "gui"
+
+
+def test_no_page_reads_qsettings_or_owns_a_second_scale():
+    offenders = []
+    for path in sorted(_GUI_ROOT.rglob("*.py")):
+        rel = path.relative_to(_GUI_ROOT)
+        if rel.parts[0] == "themes":
+            continue                      # the theme layer IS the owner
+        text = path.read_text(encoding="utf-8")
+        if "QSettings" in text:
+            offenders.append(f"{rel}: reads QSettings")
+        for token in ("control_panel_font_size", "application_font_size"):
+            if token in text:
+                offenders.append(f"{rel}: holds the preference key {token!r}")
+    assert offenders == [], (
+        "pages must inherit the shared preference, not own one: %s" % offenders)
+
+
+def test_the_main_window_reaches_settings_only_through_the_theme_owner():
+    main = (Path(__file__).resolve().parents[2] / "src" / "xdart"
+            / "_gui_main.py").read_text(encoding="utf-8")
+    assert "QSettings(" not in main, (
+        "_gui_main must use themes.typography.application_settings(), so a "
+        "scratch XDART_SETTINGS_FILE protects the real user preferences")
+
+
+def test_settings_accessor_honours_the_scratch_override(tmp_path, monkeypatch):
+    target = tmp_path / "scratch.ini"
+    monkeypatch.setenv("XDART_SETTINGS_FILE", str(target))
+    handle = typo.application_settings()
+    handle.setValue(typo.FONT_SCALE_SETTINGS_KEY, "small")
+    handle.sync()
+    assert target.exists()
+    assert Path(handle.fileName()) == target

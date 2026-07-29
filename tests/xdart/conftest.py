@@ -25,6 +25,19 @@ os.environ.setdefault(
                  "session.json"),
 )
 
+# Isolate application PREFERENCES the same way.  The theme/typography owner is
+# the only QSettings reader in the GUI and it honours XDART_SETTINGS_FILE, so
+# this one line keeps every test -- and every standalone probe that sets it --
+# out of the maintainer's real `com.xdart.xdart` preferences.  QSettings cannot
+# be redirected after the fact on macOS (the two-argument constructor ignores
+# setDefaultFormat and always resolves to the native plist), which is exactly
+# why the override lives at the accessor instead.
+os.environ.setdefault(
+    "XDART_SETTINGS_FILE",
+    os.path.join(tempfile.mkdtemp(prefix="xdart_test_settings_"),
+                 "xdart.ini"),
+)
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _qt_session_teardown():
