@@ -27,11 +27,11 @@ from .typography import (
     application_settings,
     capture_application_baseline,
     current_font_scale,
+    live_plot_item_count,
     normalize_font_scale,
     plot_font,
-    register_plot,
     resolve_font_scale,
-    restyle_registered_plots,
+    restyle_live_plots,
     style_plot_fonts,
 )
 
@@ -57,7 +57,7 @@ __all__ = [
     "normalize_font_scale",
     "resolve_font_scale",
     "plot_font",
-    "register_plot",
-    "restyle_registered_plots",
+    "live_plot_item_count",
+    "restyle_live_plots",
     "style_plot_fonts",
 ]

@@ -12,6 +12,18 @@ from __future__ import annotations
 
 import string
 
+from .typography import (
+    DEFAULT_FONT_SCALE,
+    FONT_SCALE_TOKENS,
+    apply_application_font,
+    calibration_button_font,
+    current_font_scale,
+    normalize_font_scale,
+    qss_font_tokens,
+    restyle_live_plots,
+    style_plot_fonts,
+)
+
 DARK = {
     "accent": "#bd93f9",
     "accent_text": "#d6c2fb",
@@ -116,26 +128,7 @@ _ACTIVE = {"active": "#ffb86c", "active_border": "#e0a050",
            "active_hover": "#ffc987", "active_muted": "#5a4a35"}
 
 
-_CONTROL_PANEL_FONT_OFFSETS = {
-    "small": -1,
-    "default": 0,
-    "large": 1,
-}
-
-
-def _control_panel_font_tokens(size="default"):
-    key = str(size or "default").strip().lower()
-    offset = _CONTROL_PANEL_FONT_OFFSETS.get(key, 0)
-    return {
-        "control_panel_font": f"{12 + offset}px",
-        "control_panel_status_font": f"{12 + offset}px",
-        "control_panel_tick_font": f"{12 + offset}px",
-        "control_panel_browse_font": f"{13 + offset}px",
-        "control_panel_run_font": f"{13 + offset}px",
-    }
-
-
-def _resolve(base, *, is_light, control_panel_font_size="default"):
+def _resolve(base, *, is_light, font_scale=DEFAULT_FONT_SCALE):
     """Palette + the derived state shades the template needs."""
     p = dict(base)
     p["accent_on_text"] = "#ffffff" if is_light else "#1a1a1a"
@@ -151,7 +144,9 @@ def _resolve(base, *, is_light, control_panel_font_size="default"):
     p["stop_hover"] = _blend(base["stop_bg"], base["stop_text"], 0.15)
     p["stop_muted"] = _blend(base["stop_bg"], base["panel"], 0.5)
     p.update(_ACTIVE)
-    p.update(_control_panel_font_tokens(control_panel_font_size))
+    # Rule 4 of the font contract: the dense Controls tokens are a presentation
+    # density variant of the ONE application tier, not a second setting.
+    p.update(qss_font_tokens(font_scale))
     return p
 
 
@@ -205,6 +200,16 @@ QLabel {
 QFrame#frame_4, QFrame#frame_5, QFrame#frame_6, QLabel#labelCurrent {
     border: none;
     background: transparent;
+}
+/* The display top-bar title carries a hard 15 pt QFont from the generated UI
+   (displayFrameUI: font.setPointSize(15); labelCurrent.setFont(font)), so it
+   would sit frozen while the rest of the application scaled.  A QSS font-size
+   outranks a widget's own setFont (measured on cocoa and offscreen), which is
+   how every legacy generated-UI size below follows the tier without editing a
+   generated file.  $display_title_font is 15pt at Default -- byte-identical to
+   what shipped. */
+QLabel#labelCurrent {
+    font-size: $display_title_font;
 }
 /* DATA BROWSER header bar: a clean title row (label left, Refresh right) — no
    card box around it. */
@@ -573,6 +578,11 @@ QLabel#label1D, QLabel#label2D {
     color: $browse_text;
     border-radius: 4px;
     font-weight: 700;
+    /* Generated UI pins these at 11 pt bold; $legacy_pill_font is 11pt at
+       Default and follows the tier from there.  Direct #id selector only --
+       frame1D/frame2D are reparented at runtime and a descendant rule across
+       that subtree crashes Qt's style engine (the Stage-3b guard). */
+    font-size: $legacy_pill_font;
 }
 /* When the 1-D/2-D card is disabled (viewer modes / Int-1D 2-D block / during a
    run) the pill must dim with the rest of the card — the ID selector outranks
@@ -589,6 +599,17 @@ QFrame#frame_pixreject, QFrame#frame_reint {
     border: 1px solid $field_border;
     border-radius: 6px;
 }
+/* The integrator's action buttons carry a hard 14 pt Arial QFont from the
+   generated UI (integratorUI `font2`), so like #labelCurrent they need the tier
+   through QSS.  $legacy_action_font is 14pt at Default.  #pyfai_calib and
+   #get_mask are listed here for completeness; on Windows the narrower rule
+   appended by apply_theme() overrides them, and it scales with the tier too. */
+QPushButton#raw_to_tif, QPushButton#pyfai_calib, QPushButton#get_mask,
+QPushButton#reintegrate1D, QPushButton#reintegrate2D,
+QPushButton#advanced_int {
+    font-size: $legacy_action_font;
+}
+
 /* Integrator panel title — section-header tint, left of the GI row. */
 QLabel#integration_heading {
     font-weight: 700;
@@ -1140,39 +1161,55 @@ def _branch_qss(right_url, down_url):
         f'\n    image: url("{down_url}"); }}\n')
 
 
-def render_qss(name="dark", control_panel_font_size="default"):
-    """Render the QSS for theme ``name`` ("dark"/"light")."""
+def render_qss(name="dark", font_scale=DEFAULT_FONT_SCALE):
+    """Render the QSS for theme ``name`` ("dark"/"light") at ``font_scale``.
+
+    Pure and Qt-free, so the import-time ``DARK_QSS`` render still works with no
+    QApplication."""
     base, is_light = _THEMES.get(name, _THEMES["dark"])
     return string.Template(_QSS_TEMPLATE).substitute(
-        _resolve(
-            base,
-            is_light=is_light,
-            control_panel_font_size=control_panel_font_size,
-        ))
+        _resolve(base, is_light=is_light, font_scale=font_scale))
 
 
-def apply_theme(app, name="dark", control_panel_font_size="default") -> None:
-    """Apply theme ``name`` to a live QApplication (QSS + pyqtgraph config).
+def apply_theme(app, name="dark", font_scale=DEFAULT_FONT_SCALE) -> None:
+    """Apply theme ``name`` at ``font_scale`` to a live QApplication.
 
-    Must run before pyqtgraph plot widgets are constructed."""
-    qss = render_qss(
-        name, control_panel_font_size=control_panel_font_size)
+    THE single entry point for appearance: it owns the application font, the
+    QSS, the pyqtgraph config, and the restyle of plots that already exist.
+    Callers pass a theme and a tier; nothing else may set any of the three.
+
+    The order is load-bearing and measured, not stylistic:
+
+    1. ``QApplication.setFont`` first.  On its own it does NOT reach widgets
+       while an application stylesheet is installed -- Qt's stylesheet style
+       caches each widget's resolved font and only re-resolves on a re-polish.
+    2. ``setStyleSheet`` second, which forces exactly that re-polish.  Qt
+       re-polishes even for an identical stylesheet string, so reapplying the
+       same tier stays correct rather than becoming a no-op that strands the
+       new font.
+    3. The live-plot restyle last, once ordinary widgets have settled.
+
+    Still safe to call before any plot widget exists (step 3 finds nothing),
+    which is how startup uses it.
+    """
+    font_scale = normalize_font_scale(font_scale)
+    apply_application_font(app, font_scale)
+    qss = render_qss(name, font_scale=font_scale)
     # Visible, themed expand/collapse arrows for the wrangler ParameterTree.
     # Generated lazily (needs a live QApplication) and appended here rather than
     # in render_qss so the import-time DARK_QSS render stays Qt-free.
     base, is_light = _THEMES.get(name, _THEMES["dark"])
     right_url, down_url = _arrow_icon_paths(
-        _resolve(
-            base,
-            is_light=is_light,
-            control_panel_font_size=control_panel_font_size,
-        )["text"])
+        _resolve(base, is_light=is_light, font_scale=font_scale)["text"])
     if right_url and down_url:
         qss += _branch_qss(right_url, down_url)
     import sys as _sys
     if _sys.platform == "win32":
+        # These two buttons are too narrow for the 14 pt the generated UI gives
+        # them on Windows.  The override stays, but it rides the tier now --
+        # hard-coding 8.5pt here would have frozen them at Extra Large.
         qss += ("\nQPushButton#pyfai_calib, QPushButton#get_mask "
-                "{ font-size: 8.5pt; }\n")
+                f"{{ font-size: {calibration_button_font(font_scale)}; }}\n")
     app.setStyleSheet(qss)
     try:
         import pyqtgraph as pg
@@ -1181,6 +1218,7 @@ def apply_theme(app, name="dark", control_panel_font_size="default") -> None:
         pg.setConfigOption("antialias", True)
     except ImportError:  # pragma: no cover
         pass
+    restyle_live_plots(font_scale)
 
 
 def apply_dark_theme(app) -> None:
@@ -1195,10 +1233,13 @@ DARK_QSS = render_qss("dark")
 SEABORN_BG = "#EAEAF2"      # seaborn darkgrid panel
 SEABORN_FG = "#2e2e2e"      # axis / tick text
 SEABORN_GRID = "#ffffff"    # gridline color
-SEABORN_FONT_PT = 11        # "talk-context" rough match
+#: The plot font at the Default tier — the "talk-context" rough match this
+#: styling has always used.  Kept as a name because it is the anchor the token
+#: table's ``plot_pt`` column steps around; read the tier, not this constant.
+SEABORN_FONT_PT = FONT_SCALE_TOKENS[DEFAULT_FONT_SCALE].plot_pt
 
 
-def apply_seaborn_plot_style(plot, *, font_pt: int = SEABORN_FONT_PT,
+def apply_seaborn_plot_style(plot, *, font_pt: int | None = None,
                               grid: bool = True) -> None:
     """Apply seaborn-darkgrid + talk-context styling to a PlotItem.
 
@@ -1217,15 +1258,18 @@ def apply_seaborn_plot_style(plot, *, font_pt: int = SEABORN_FONT_PT,
     plot
         A :class:`pyqtgraph.PlotItem` (returned by ``addPlot()``).
     font_pt
-        Point size for axis labels and tick labels.  Default 11
-        matches seaborn's "talk" context roughly.
+        Point size for axis labels and tick labels.  ``None`` (the default, and
+        what every caller uses) means the current application font tier, so a
+        plot is born at the same size as every plot already on screen.  Passing
+        an explicit size opts this plot OUT of the preference until the next
+        scale change, so it is only for callers that genuinely need a fixed
+        size.
     grid
         Whether to enable gridlines.  True for 1D / line plots,
         False for image / heatmap plots.
     """
     try:
         import pyqtgraph as pg  # noqa: F401
-        from PySide6.QtGui import QFont
     except ImportError:  # pragma: no cover
         return
 
@@ -1240,10 +1284,16 @@ def apply_seaborn_plot_style(plot, *, font_pt: int = SEABORN_FONT_PT,
         except Exception:  # pragma: no cover — older pyqtgraph
             pass
 
-    # Tick + label fonts.  pyqtgraph's AxisItem stores the tick
-    # font separately from the label font; set both so "talk
-    # context" applies consistently.
-    font = QFont()
+    if font_pt is None:
+        # Tick font, axis-label font and legend, straight from the tier.  The
+        # tick font is the reason this call is needed at all: setting it here
+        # is what makes the axis IGNORE the application font, so it has to be
+        # the tier's size or the plot silently opts out of the preference.
+        style_plot_fonts(plot, current_font_scale())
+        return
+
+    from pyqtgraph.Qt import QtGui
+    font = QtGui.QFont()
     font.setPointSize(font_pt)
     for axis_name in ("bottom", "left", "top", "right"):
         try:

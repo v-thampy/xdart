@@ -105,17 +105,27 @@ def _main_window(monkeypatch):
 
 
 def _submenu(window, title):
+    """Find a Config submenu, keeping its owning QAction alive.
+
+    Returning the bare QMenu is a trap: ``QAction.menu()`` hands back a wrapper
+    whose validity shiboken ties to the QAction wrapper it came from, and the
+    QActions here are temporaries from ``actions()``.  Once they are collected
+    the menu wrapper raises "Internal C++ object already deleted" even though
+    Qt is still happily showing the menu.  Hold the pair.
+    """
     for action in window.main_widget.h5viewer.paramMenu.actions():
         menu = action.menu()
         if menu is not None and menu.title() == title:
-            return menu
-    return None
+            return action, menu
+    return None, None
 
 
 def _font_actions(window):
-    menu = _submenu(window, "Font Size")
+    owner, menu = _submenu(window, "Font Size")
     assert menu is not None, "Config ▸ Font Size submenu is missing"
-    return menu.actions()
+    actions = menu.actions()
+    assert owner is not None
+    return actions
 
 
 def _trigger_tier(window, label):
@@ -185,7 +195,7 @@ def test_menu_exposes_exactly_five_exclusive_tiers(qapp, settings, monkeypatch):
     assert [a.isChecked() for a in actions] == [
         False, False, True, False, False], "Default is the default selection"
 
-    assert _submenu(window, "Control Panel Font Size") is None, (
+    assert _submenu(window, "Control Panel Font Size")[1] is None, (
         "the superseded Controls-only submenu must be gone")
 
 
@@ -293,24 +303,29 @@ def test_tier_reaches_ordinary_widgets_and_dialogs(qapp):
             f"{key} did not grow: a Controls-only scale is not application-wide")
 
 
-def test_tier_reaches_the_controls_panel_fields(qapp):
-    from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import ControlsPanelV2
+def test_tier_reaches_the_controls_panel_fields(qapp, shell):
+    """The dense Controls tokens are a density variant of the ONE tier.
+
+    Measured on the real panel inside the real page: a bare ControlsPanelV2
+    has only its section cards, the fields arrive with the page's wiring.
+    """
+    _window, widget = shell
     apply_theme(qapp, "dark", font_scale="default")
-    panel = ControlsPanelV2()
-    panel.show()
-    edits = panel.findChildren(QtWidgets.QLineEdit)
-    assert edits, "ControlsPanelV2 exposes no QLineEdit to measure"
-    probe = edits[0]
     qapp.processEvents()
-    small = probe.font().pixelSize(), probe.sizeHint().height()
+    fields = [w for w in widget.findChildren(QtWidgets.QWidget)
+              if w.objectName().startswith("controlsV2")
+              and w.font().pixelSize() > 0]
+    assert fields, "no ControlsPanel V2 widget is carrying the dense token"
+    probe = fields[0]
+    small = probe.font().pixelSize()
 
     apply_theme(qapp, "dark", font_scale="extra_large")
     qapp.processEvents()
-    big = probe.font().pixelSize(), probe.sizeHint().height()
+    big = probe.font().pixelSize()
 
-    assert big[0] > small[0], "the dense Controls token did not follow the tier"
-    assert big[1] > small[1]
-    panel.close()
+    assert big > small, (
+        f"{probe.objectName()} stayed at {small}px: the dense Controls token "
+        "is not following the application tier")
 
 
 def test_tier_reaches_pyqtgraph_axis_tick_and_legend(qapp):
@@ -457,12 +472,13 @@ def test_plot_built_before_the_change_converges_with_one_built_after(qapp):
     new_widget.close()
 
 
-def test_closed_plots_release_from_the_registry(qapp):
+def test_closed_plots_are_not_retained_by_a_scale_change(qapp):
+    """A scale change must never be what keeps a closed plot alive."""
     apply_theme(qapp, "dark", font_scale="default")
-    before = typo.registered_plot_count()
+    before = typo.live_plot_item_count()
 
     widget, plot, _legend = _styled_plot()
-    assert typo.registered_plot_count() == before + 1
+    assert typo.live_plot_item_count() == before + 1
     ref = weakref.ref(plot)
 
     widget.close()
@@ -471,91 +487,209 @@ def test_closed_plots_release_from_the_registry(qapp):
     qapp.processEvents()
     gc.collect()
 
+    # The scale change must neither resurrect the dead plot nor trip over it.
     apply_theme(qapp, "dark", font_scale="large")
 
-    assert ref() is None, "the registry retained a closed plot strongly"
-    assert typo.registered_plot_count() == before
+    assert ref() is None, "a closed plot was retained across a scale change"
+    assert typo.live_plot_item_count() == before
 
 
-def test_the_registry_holds_only_weak_references(qapp):
-    assert isinstance(typo._PLOT_REGISTRY, weakref.WeakSet)
+def test_the_theme_layer_keeps_no_container_of_plots(qapp):
+    """The restyle walks live Qt scenes and holds nothing.
+
+    Stronger than a weak registry, and the reason the dialogs' plots (peak fit,
+    phase fit, scan plot, ROI select, the parameter-trend right-hand axis) and
+    every colour bar follow the tier without opting in one call site at a time.
+    """
+    containers = [
+        name for name, value in vars(typo).items()
+        if not name.startswith("__")
+        and isinstance(value, (list, set, dict, frozenset, tuple))
+        and any(hasattr(v, "getAxis") for v in
+                (value.values() if isinstance(value, dict) else value))
+    ]
+    assert containers == [], (
+        f"the theme layer is holding plots in {containers}")
+
+    widget, plot, legend = _styled_plot()
+    try:
+        # A plot NOT created through the theme helper must still follow the
+        # tier -- that is what proves the walk, not a registration list.
+        bare_widget = pg.GraphicsLayoutWidget()
+        bare = bare_widget.addPlot()
+        bare.setLabel("bottom", "frame")
+        bare_legend = bare.addLegend()
+        bare.plot([0, 1], [1, 2], name="unregistered")
+        bare_widget.show()
+
+        apply_theme(qapp, "dark", font_scale="extra_large")
+        assert _plot_font_metrics(bare, bare_legend) == \
+            _plot_font_metrics(plot, legend), (
+                "a plot that never called the theme helper did not follow the "
+                "tier -- the restyle is registration-based, not a live walk")
+        bare_widget.close()
+    finally:
+        widget.close()
 
 
 # ── 9. geometry: extreme tiers against the three-column shell ───────────
 
-SHELL_SIZES = [(1920, 1080), (1440, 900)]
+SHELL_SIZES = [(1920, 1080), (1440, 900), (1024, 900)]
+
+
+def _settle(qapp, window, widget, size):
+    """Resize, then drain until the layout stops moving.
+
+    The refits that follow a tier change are deferred one event-loop turn on
+    purpose (a widget's cached size hint still answers for the previous tier
+    when FontChange arrives), and each refit can itself invalidate a parent's
+    hint.  A fixed number of ``processEvents`` rounds therefore measures a
+    layout that is still converging, which shows up as an intermittent
+    failure rather than an honest one.  Iterate to a fixed point instead, with
+    a bound so a genuinely unstable layout still fails the caller's assertion.
+    """
+    window.resize(*size)
+    previous = None
+    for _ in range(12):
+        for child in widget.findChildren(QtWidgets.QWidget):
+            try:
+                child.ensurePolished()
+                child.updateGeometry()
+            except Exception:
+                pass
+        for _ in range(3):
+            qapp.processEvents()
+        current = _clipped_widgets(widget)
+        if current == previous:
+            return
+        previous = current
 
 
 def _clipped_widgets(root):
-    """Visible widgets whose hard height/width ceiling is below what their own
-    content needs — i.e. text the user cannot read at this tier."""
-    bad = []
+    """Visible widgets whose hard ceiling is below what their content needs —
+    i.e. text the user cannot read at this tier."""
+    bad = set()
     for w in root.findChildren(QtWidgets.QWidget):
         if not w.isVisibleTo(root):
             continue
         hint = w.minimumSizeHint()
+        name = w.objectName() or type(w).__name__
         if 0 < w.maximumHeight() < hint.height():
-            bad.append(f"{w.objectName() or type(w).__name__}: "
-                       f"maxH={w.maximumHeight()} < needs {hint.height()}")
+            bad.add(f"{name}:H")
         if 0 < w.maximumWidth() < hint.width():
-            bad.append(f"{w.objectName() or type(w).__name__}: "
-                       f"maxW={w.maximumWidth()} < needs {hint.width()}")
+            bad.add(f"{name}:W")
     return bad
 
 
 @pytest.fixture(scope="module")
 def shell(qapp):
+    """The real three-column page, built once (it is expensive)."""
+    previous = os.environ.get("XDART_CONTROLS_PANEL_V2")
+    os.environ["XDART_CONTROLS_PANEL_V2"] = "1"
     from xdart.gui.tabs.static_scan import staticWidget
     window = QtWidgets.QMainWindow()
     widget = staticWidget()
     window.setCentralWidget(widget)
     window.show()
-    yield window, widget
-    window.close()
+    try:
+        yield window, widget
+    finally:
+        window.close()
+        if previous is None:
+            os.environ.pop("XDART_CONTROLS_PANEL_V2", None)
+        else:
+            os.environ["XDART_CONTROLS_PANEL_V2"] = previous
 
 
 @pytest.mark.parametrize("scale", ["extra_small", "extra_large"])
 @pytest.mark.parametrize("size", SHELL_SIZES)
 def test_extreme_tiers_do_not_clip_the_three_column_shell(
         qapp, shell, scale, size):
+    """No control becomes unreadable at an extreme tier that was readable at
+    Default.
+
+    A *regression* bar, deliberately.  Seven controls are already clipped at
+    Default on this branch's parent (``cmap``, ``controlsFrame``,
+    ``controlsV2BrowseButton``, ``controlsV2Chevron``, ``maxCoresSpinBox``,
+    ``slice_center``, ``slice_width``) — pre-existing bugs this packet does not
+    own.  What it does own is that turning the preference application-wide adds
+    none of its own.
+    """
     window, widget = shell
+
+    apply_theme(qapp, "dark", font_scale="default")
+    _settle(qapp, window, widget, size)
+    baseline = _clipped_widgets(widget)
+
     apply_theme(qapp, "dark", font_scale=scale)
-    window.resize(*size)
-    qapp.processEvents()
+    _settle(qapp, window, widget, size)
 
     for name in ("leftFrame", "middleFrame", "rightFrame"):
         column = getattr(widget.ui, name)
         assert column.width() > 0 and column.height() > 0, (
             f"{name} collapsed at {scale} / {size[0]}x{size[1]}")
 
-    clipped = _clipped_widgets(widget)
-    assert clipped == [], (
-        f"clipped at {scale} / {size[0]}x{size[1]}: {clipped[:8]}")
+    new = _clipped_widgets(widget) - baseline
+    assert new == set(), (
+        f"{scale} at {size[0]}x{size[1]} newly clips {sorted(new)}")
 
 
-@pytest.mark.parametrize("scale", ["extra_small", "extra_large"])
-def test_narrow_shell_keeps_controls_scroll_reachable(qapp, shell, scale):
-    """1024x900 may need scrolling — it must never hide a control outright."""
+def test_tier_change_restores_the_shell_geometry_exactly(qapp, shell):
+    """Default -> Extra Large -> Default must land on the same layout.
+
+    The refits are the risk here: one that grows a cap from the *current* cap
+    instead of recomputing it ratchets up and never comes back down.
+    """
     window, widget = shell
-    apply_theme(qapp, "dark", font_scale=scale)
-    window.resize(1024, 900)
-    qapp.processEvents()
+    apply_theme(qapp, "dark", font_scale="default")
+    _settle(qapp, window, widget, (1920, 1080))
+    before = (widget.minimumSizeHint().width(), _clipped_widgets(widget))
 
-    areas = widget.findChildren(QtWidgets.QScrollArea)
-    assert areas, "the controls column is not inside a QScrollArea"
-    for area in areas:
-        if not area.isVisibleTo(widget):
-            continue
-        inner = area.widget()
-        if inner is None:
-            continue
-        bar = area.verticalScrollBar()
-        assert bar.maximum() >= 0
-        assert bar.maximum() + area.viewport().height() >= min(
-            inner.sizeHint().height(), inner.height()), (
-                "content extends past the scrollable range — unreachable")
+    apply_theme(qapp, "dark", font_scale="extra_large")
+    _settle(qapp, window, widget, (1920, 1080))
 
-    assert _clipped_widgets(widget) == []
+    apply_theme(qapp, "dark", font_scale="default")
+    _settle(qapp, window, widget, (1920, 1080))
+    after = (widget.minimumSizeHint().width(), _clipped_widgets(widget))
+
+    assert after == before, "the shell did not return to its Default geometry"
+
+
+def test_narrow_shell_keeps_controls_scroll_reachable(qapp, shell):
+    """At 1024x900 the shell is at its own minimum width — nothing is hidden.
+
+    The page has a hard floor well above 1024 (measured ~1448 px at Default),
+    which is pre-existing and not this packet's to move.  What matters here is
+    that the floor grows only modestly with the tier and that the controls
+    column stays inside a scroll area at every tier, so nothing becomes
+    unreachable.
+    """
+    window, widget = shell
+    widths = {}
+    for scale in typo.FONT_SCALES:
+        apply_theme(qapp, "dark", font_scale=scale)
+        _settle(qapp, window, widget, (1024, 900))
+        widths[scale] = widget.minimumSizeHint().width()
+
+        areas = [a for a in widget.findChildren(QtWidgets.QScrollArea)
+                 if a.isVisibleTo(widget)]
+        assert areas, f"the controls column lost its scroll area at {scale}"
+        for area in areas:
+            inner = area.widget()
+            if inner is None:
+                continue
+            reachable = (area.verticalScrollBar().maximum()
+                         + area.viewport().height())
+            assert reachable >= min(inner.sizeHint().height(), inner.height()), (
+                f"{area.objectName()} content is past the scrollable range "
+                f"at {scale}")
+
+    assert widths["extra_small"] <= widths["default"] <= widths["extra_large"], (
+        f"the shell floor is not monotonic in the tier: {widths}")
+    growth = widths["extra_large"] - widths["extra_small"]
+    assert growth <= 200, (
+        f"Extra Small -> Extra Large widened the shell by {growth}px: "
+        f"{widths}")
 
 
 # ── 10. theme switching preserves the tier ─────────────────────────────

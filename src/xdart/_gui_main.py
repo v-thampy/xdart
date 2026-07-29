@@ -199,9 +199,23 @@ else:
 # This module imports
 from xdart.gui.mainWindow import Ui_MainWindow
 from xdart.gui import tabs
+from xdart.gui.themes.typography import (
+    FONT_SCALE_MENU,
+    FONT_SCALE_SETTINGS_KEY,
+    application_settings as _app_settings,
+    capture_application_baseline,
+    normalize_font_scale,
+    resolve_font_scale,
+)
 
 
 QMainWindow = QtWidgets.QMainWindow
+
+
+def _resolve_theme(settings):
+    """The saved theme, defaulting anything unrecognised to ``dark``."""
+    theme = settings.value("theme", "dark")
+    return theme if theme in ("dark", "light") else "dark"
 
 
 # One modal error dialog in flight at a time.  A repeating error source (e.g. a
@@ -298,28 +312,24 @@ class Main(QMainWindow):
             self.resize(1600, 920)
 
     def _init_theme_menu(self):
-        """Add a Theme (Dark/Light) submenu to the in-window Config menu.
+        """Add the Theme and Font Size submenus to the in-window Config menu.
 
         The visible File/Config controls are the H5Viewer toolbar's tool-buttons
         (``h5viewer.paramMenu``), NOT the QMainWindow menu bar (which on macOS is
-        the native top-of-screen bar).  Add Theme there so it sits next to
-        Save/Load/Advanced where the user expects it.  Persisted in QSettings;
-        switching re-applies the QSS live (the pyqtgraph plot-canvas background
-        is snapshotted at widget creation, so a full plot recolor needs a
-        relaunch -- a later stage owns per-mode plot backgrounds)."""
+        the native top-of-screen bar).  Add them there so they sit next to
+        Save/Load/Advanced where the user expects them.  Both are persisted; a
+        change re-applies live through the one appearance owner (the pyqtgraph
+        plot-canvas *background* is still snapshotted at widget creation, so a
+        full plot recolor on a THEME switch needs a relaunch -- a later stage
+        owns per-mode plot backgrounds.  Plot FONTS do follow live)."""
         try:
             config_menu = self.main_widget.h5viewer.paramMenu
         except Exception:
             logger.exception("Could not locate the Config menu for the theme toggle")
             return
-        settings = QtCore.QSettings("xdart", "xdart")
-        current = settings.value("theme", "dark")
-        if current not in ("dark", "light"):
-            current = "dark"
-        panel_font_size = settings.value(
-            "control_panel_font_size", "default")
-        if panel_font_size not in ("small", "default", "large"):
-            panel_font_size = "default"
+        settings = _app_settings()
+        current = _resolve_theme(settings)
+        font_scale = resolve_font_scale(settings)
         config_menu.addSeparator()
         theme_menu = config_menu.addMenu("Theme")
         group = QtGui.QActionGroup(self)
@@ -332,22 +342,23 @@ class Main(QMainWindow):
                 lambda _checked=False, n=name: self._set_theme(n))
             group.addAction(action)
             theme_menu.addAction(action)
-        font_menu = config_menu.addMenu("Control Panel Font Size")
+        # ONE application-wide preference, five exclusive tiers.  The menu is
+        # generated from the theme layer's table so a tier cannot exist in the
+        # contract and be missing here (or vice versa).
+        self.fontSizeMenu = config_menu.addMenu("Font Size")
         font_group = QtGui.QActionGroup(self)
         font_group.setExclusive(True)
-        for size, label in (
-            ("small", "Small"),
-            ("default", "Default"),
-            ("large", "Large"),
-        ):
+        self.fontSizeActions = {}
+        for scale, label in FONT_SCALE_MENU:
             action = QtGui.QAction(label, self)
             action.setCheckable(True)
-            action.setChecked(size == panel_font_size)
+            action.setChecked(scale == font_scale)
             action.triggered.connect(
-                lambda _checked=False, s=size:
-                    self._set_control_panel_font_size(s))
+                lambda _checked=False, s=scale:
+                    self._set_application_font_size(s))
             font_group.addAction(action)
-            font_menu.addAction(action)
+            self.fontSizeMenu.addAction(action)
+            self.fontSizeActions[scale] = action
         self.debugMenu = config_menu.addMenu("Debug")
         self.actionDebugWindowState = QtGui.QAction("Window State", self)
         self.actionDebugWindowState.triggered.connect(self._log_window_state)
@@ -693,31 +704,42 @@ class Main(QMainWindow):
     def _shortcut_save_settings(self):
         self._main_widget_shortcut("shortcut_save_settings")
 
+    def _apply_appearance(self, *, theme=None, font_scale=None):
+        """Persist one appearance change and apply the whole look ONCE.
+
+        Theme and font tier are two halves of one appearance, so whichever one
+        the user just changed, the other is read back from settings and both go
+        into a single ``apply_theme`` call.  That is what keeps a theme switch
+        from resetting the font tier (and a font change from resetting the
+        theme), and it is why a live change emits exactly one apply and one
+        write rather than one per half.
+        """
+        settings = _app_settings()
+        if theme is not None:
+            theme = theme if theme in ("dark", "light") else "dark"
+            settings.setValue("theme", theme)
+        else:
+            theme = _resolve_theme(settings)
+        if font_scale is not None:
+            # Only ever persist an exact known tier: a malformed write would
+            # otherwise be read back forever as a broken preference.
+            font_scale = normalize_font_scale(font_scale)
+            settings.setValue(FONT_SCALE_SETTINGS_KEY, font_scale)
+        else:
+            font_scale = resolve_font_scale(settings)
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            from xdart.gui.themes import apply_theme
+            apply_theme(app, theme, font_scale=font_scale)
+        return theme, font_scale
+
     def _set_theme(self, name):
         """Apply theme ``name`` live and persist the choice."""
-        from xdart.gui.themes import apply_theme
-        settings = QtCore.QSettings("xdart", "xdart")
-        panel_font_size = settings.value(
-            "control_panel_font_size", "default")
-        app = QtWidgets.QApplication.instance()
-        if app is not None:
-            apply_theme(
-                app, name, control_panel_font_size=panel_font_size)
-        settings.setValue("theme", name)
+        self._apply_appearance(theme=name)
 
-    def _set_control_panel_font_size(self, size):
-        """Apply the Controls-panel-only font-size preset and persist it."""
-        if size not in ("small", "default", "large"):
-            size = "default"
-        settings = QtCore.QSettings("xdart", "xdart")
-        settings.setValue("control_panel_font_size", size)
-        theme = settings.value("theme", "dark")
-        if theme not in ("dark", "light"):
-            theme = "dark"
-        from xdart.gui.themes import apply_theme
-        app = QtWidgets.QApplication.instance()
-        if app is not None:
-            apply_theme(app, theme, control_panel_font_size=size)
+    def _set_application_font_size(self, scale):
+        """Apply the application-wide font tier live and persist the choice."""
+        self._apply_appearance(font_scale=scale)
 
     def exit(self):
         try:
@@ -777,6 +799,32 @@ def _apply_cli_session_args(argv):
     return [argv[0], *rest]
 
 
+def _start_gui(app, window_factory=None):
+    """Apply the saved appearance, THEN build and show the main window.
+
+    The order is the whole point of this function existing, so it is worth one
+    place that owns it: pyqtgraph snapshots its config (plot backgrounds) at
+    widget creation, and a widget built before ``QApplication.setFont`` keeps
+    the platform default until something else forces a re-polish.  Both mean
+    the saved theme AND the saved font tier must land before the first widget.
+
+    Appearance failure must never stop the GUI from starting -- a user with a
+    corrupt preferences file gets Qt's default look, not a dead launcher.
+    """
+    try:
+        # Snapshot the platform baseline while the font is still pristine:
+        # every tier is derived from it, and after the first apply it is gone.
+        capture_application_baseline(app)
+        from xdart.gui.themes import apply_theme
+        settings = _app_settings()
+        apply_theme(app, _resolve_theme(settings), resolve_font_scale(settings))
+    except Exception:
+        logger.exception("Failed to apply the saved appearance; using Qt default")
+    mw = (window_factory or Main)()
+    mw.show()
+    return mw
+
+
 def run():
     # Process-global state claimed HERE, at real GUI launch — never on import.
     # File logging FIRST: a windowless launch (the pythonw Start-menu
@@ -831,24 +879,7 @@ def run():
     # never as an import-time side effect (importing this module must not hijack
     # the process-global sys.excepthook for tests / headless / embedding hosts).
     sys.excepthook = _xdart_excepthook
-    # N8: apply the saved theme before any widget construction so
-    # pyqtgraph plot backgrounds are set in time (pyqtgraph
-    # snapshots the config at widget creation).
-    try:
-        from xdart.gui.themes import apply_theme
-        settings = QtCore.QSettings("xdart", "xdart")
-        theme = settings.value("theme", "dark")
-        if theme not in ("dark", "light"):
-            theme = "dark"
-        panel_font_size = settings.value(
-            "control_panel_font_size", "default")
-        if panel_font_size not in ("small", "default", "large"):
-            panel_font_size = "default"
-        apply_theme(app, theme, control_panel_font_size=panel_font_size)
-    except Exception:
-        logger.exception("Failed to apply theme; using Qt default")
-    mw = Main()
-    mw.show()
+    _start_gui(app)
     app.exec()
 
 
