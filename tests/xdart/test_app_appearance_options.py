@@ -237,6 +237,12 @@ def test_spacing_changes_real_qss_padding_without_changing_font_or_color():
     assert "padding: 1px 6px;" in tight_button
     assert "padding: 8px 18px;" in roomy_button
     assert tight_button.replace("1px 6px", "8px 18px") == roomy_button
+    compact_selector = (
+        "QPushButton#e3BrowserCompactButton,\n"
+        "QToolButton#e3RefreshBrowser"
+    )
+    assert "padding: 1px 2px;" in _selector_body(tight, compact_selector)
+    assert "padding: 5px 8px;" in _selector_body(roomy, compact_selector)
     assert spacing_owner.spacing_tokens("extra_tight").layout_gap < (
         spacing_owner.spacing_tokens("extra_spacious").layout_gap
     )
