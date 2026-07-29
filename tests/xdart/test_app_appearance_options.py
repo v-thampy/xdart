@@ -132,6 +132,9 @@ def test_omitted_and_explicit_defaults_match_and_candidates_only_recolor_selecti
         spacing="normal",
     )
     assert explicit == baseline
+    assert render_qss(
+        "light", accent_color="theme_default", spacing="normal"
+    ) == render_qss("light")
 
     mauve = render_qss(
         "dark",
@@ -145,9 +148,17 @@ def test_omitted_and_explicit_defaults_match_and_candidates_only_recolor_selecti
     assert "background-color: #bd93f9;" in _selector_body(
         baseline, "QPushButton:checked"
     )
-    assert _selector_body(mauve, "QLineEdit#BrowsePathEdit:focus") == (
-        _selector_body(baseline, "QLineEdit#BrowsePathEdit:focus")
-    ), "the selected-control picker must not recolor focus/policy accents"
+    for selector in (
+        "QToolButton:pressed",
+        "QLineEdit#BrowsePathEdit:focus",
+        "QPushButton#BrowseButton",
+        "QPushButton#startButton",
+        'QFrame#controlsV2SectionHeader[accent="project"]',
+        "QProgressBar::chunk",
+    ):
+        assert _selector_body(mauve, selector) == _selector_body(
+            baseline, selector
+        ), f"selected-control colour leaked into {selector}"
 
 
 @pytest.mark.parametrize("theme_name", ["dark", "light"])
