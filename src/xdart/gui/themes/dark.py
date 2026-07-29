@@ -410,8 +410,22 @@ QToolButton:hover {
     background-color: $field_border;
     border-color: $text_muted;
 }
-QToolButton:pressed, QToolButton:checked {
+QToolButton:pressed {
     background-color: $field_border;
+}
+QToolButton:checked {
+    background-color: $selection_accent;
+    color: $selection_accent_on_text;
+    border-color: $selection_accent;
+    font-weight: bold;
+}
+QToolButton:checked:hover {
+    background-color: $selection_accent_hover;
+}
+QToolButton:checked:disabled {
+    background-color: $selection_accent_muted;
+    color: $text_muted;
+    border-color: $selection_accent_muted;
 }
 /* File / Config / Help open their menu on click (InstantPopup) — the oversized
    down-arrow menu-indicator is redundant noise, so drop it entirely. */
@@ -714,10 +728,8 @@ QLabel#peakFitStatus {
     color: $text_muted;
 }
 
-/* Segmented "colormap | Log" pill on the display top bar — the colormap
-   selector and the Log scale toggle read as one unit.  The container owns the
-   rounded border; the inner combo/button go borderless and square, with the
-   end caps rounded to match and a hairline divider between them. */
+/* Segmented "colormap | Log" group on the display top bar.  The wrapper owns
+   the border while the inner combo/button stay borderless and square. */
 QFrame#displayScaleGroup {
     border: 1px solid $field_border;
     border-radius: 0px;
@@ -990,12 +1002,8 @@ QPushButton#controlsV2PillButton:disabled {
     color: $text_muted;
     border-color: $field_border;
 }
-/* Pill variant (Conditioning / Corrections toggles): fully rounded + content-
-   sized so several share a row, instead of full-width stacked buttons.  Styled
-   by a DEDICATED object name (#controlsV2PillButton), NOT a [pill="true"]
-   dynamic property: an object-name selector is applied at the button's first
-   polish, whereas a property selector only takes effect after a global restyle
-   -- which left the pills boxy until an unrelated font-size change. */
+/* Compact Conditioning / Corrections toggles.  A dedicated object name makes
+   their first polish deterministic while several controls still share a row. */
 QPushButton#controlsV2PillButton {
     border-radius: 0px;
     padding: $pill_padding;

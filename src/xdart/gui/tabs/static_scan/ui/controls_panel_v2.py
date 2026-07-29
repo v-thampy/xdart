@@ -14,6 +14,8 @@ from collections.abc import Iterable, Sequence
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
+from xdart.gui.themes.spacing import SpacingTokens, current_spacing_tokens
+
 from ..controls_logic import (
     AnalysisLauncherSpec,
     BoundControlState,
@@ -30,6 +32,12 @@ from ..controls_logic import (
     StatusKind,
     build_bound_control_state,
 )
+
+
+def _spaced(base: int, tokens: SpacingTokens) -> int:
+    """Scale a legacy layout value while keeping Normal byte-compatible."""
+    return max(0, base + tokens.layout_gap - 8)
+
 
 # Order: Project · Experiment · Source · Processing (instrument config before
 # data, matching the notebook workflow, Vivek).  The number follows the order;
@@ -201,6 +209,7 @@ class SectionCard(QtWidgets.QFrame):
         self._collapsed = False
         self._collapsible = bool(collapsible)
         outer = QtWidgets.QVBoxLayout(self)
+        self._outer_layout = outer
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
@@ -208,6 +217,7 @@ class SectionCard(QtWidgets.QFrame):
         self.header.setObjectName("controlsV2SectionHeader")
         self.header.setProperty("accent", accent)
         header_lay = QtWidgets.QHBoxLayout(self.header)
+        self._header_layout = header_lay
         header_lay.setContentsMargins(7, 5, 8, 5)
         header_lay.setSpacing(7)
         self.toggle = QtWidgets.QToolButton()
@@ -255,6 +265,34 @@ class SectionCard(QtWidgets.QFrame):
         self.embedded_layout.setSpacing(0)
         self.embedded.hide()
         self.body_layout.addWidget(self.embedded)
+        self._apply_spacing(current_spacing_tokens())
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() in {
+            QtCore.QEvent.Type.StyleChange,
+            QtCore.QEvent.Type.FontChange,
+        } and hasattr(self, "embedded_layout"):
+            self._apply_spacing(current_spacing_tokens())
+
+    def _apply_spacing(self, tokens: SpacingTokens) -> None:
+        self._header_layout.setContentsMargins(
+            _spaced(7, tokens),
+            _spaced(5, tokens),
+            _spaced(8, tokens),
+            _spaced(5, tokens),
+        )
+        self._header_layout.setSpacing(_spaced(7, tokens))
+        self.body_layout.setContentsMargins(
+            _spaced(8, tokens),
+            _spaced(7, tokens),
+            _spaced(8, tokens),
+            _spaced(8, tokens),
+        )
+        self.body_layout.setSpacing(_spaced(5, tokens))
+        self.embedded_layout.setContentsMargins(
+            0, _spaced(4, tokens), 0, 0
+        )
 
     def toggle_collapsed(self) -> None:
         if self._collapsible:
@@ -366,11 +404,13 @@ class SubsectionCard(QtWidgets.QFrame):
         self.setObjectName("controlsV2SubsectionCard")
         self._collapsed = False
         outer = QtWidgets.QVBoxLayout(self)
+        self._outer_layout = outer
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         self.header = QtWidgets.QFrame()
         self.header.setObjectName("controlsV2SubsectionHeader")
         h_lay = QtWidgets.QHBoxLayout(self.header)
+        self._header_layout = h_lay
         h_lay.setContentsMargins(7, 4, 7, 4)
         h_lay.setSpacing(6)
         self.toggle = QtWidgets.QToolButton()
@@ -424,6 +464,32 @@ class SubsectionCard(QtWidgets.QFrame):
         self.body_layout.setContentsMargins(7, 5, 7, 7)
         self.body_layout.setSpacing(4)
         outer.addWidget(self.body)
+        self._apply_spacing(current_spacing_tokens())
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() in {
+            QtCore.QEvent.Type.StyleChange,
+            QtCore.QEvent.Type.FontChange,
+        } and hasattr(self, "body_layout"):
+            self._apply_spacing(current_spacing_tokens())
+
+    def _apply_spacing(self, tokens: SpacingTokens) -> None:
+        self._header_layout.setContentsMargins(
+            _spaced(7, tokens),
+            _spaced(4, tokens),
+            _spaced(7, tokens),
+            _spaced(4, tokens),
+        )
+        self._header_layout.setSpacing(_spaced(6, tokens))
+        self.header_extra_layout.setSpacing(_spaced(5, tokens))
+        self.body_layout.setContentsMargins(
+            _spaced(7, tokens),
+            _spaced(5, tokens),
+            _spaced(7, tokens),
+            _spaced(7, tokens),
+        )
+        self.body_layout.setSpacing(_spaced(4, tokens))
 
     def toggle_collapsed(self) -> None:
         self.set_collapsed(not self._collapsed)
@@ -935,6 +1001,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
         self.setObjectName("controlsPanelV2")
         self.setMinimumWidth(360)
         lay = QtWidgets.QVBoxLayout(self)
+        self._root_layout = lay
         lay.setContentsMargins(5, 5, 5, 5)
         # Roomier gap between the workflow sections for visual separation (Vivek).
         lay.setSpacing(12)
@@ -964,6 +1031,23 @@ class ControlsPanelV2(QtWidgets.QWidget):
         lay.addStretch(1)
         self._profile = None
         self._bound_state: BoundControlState | None = None
+        self._apply_spacing(current_spacing_tokens())
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() in {
+            QtCore.QEvent.Type.StyleChange,
+            QtCore.QEvent.Type.FontChange,
+        } and hasattr(self, "top_action_layout"):
+            self._apply_spacing(current_spacing_tokens())
+
+    def _apply_spacing(self, tokens: SpacingTokens) -> None:
+        margin = _spaced(5, tokens)
+        self._root_layout.setContentsMargins(
+            margin, margin, margin, margin
+        )
+        self._root_layout.setSpacing(tokens.tools_vertical_margin)
+        self.top_action_layout.setSpacing(_spaced(7, tokens))
 
     @staticmethod
     def _make_section(section: SectionId) -> SectionCard:
