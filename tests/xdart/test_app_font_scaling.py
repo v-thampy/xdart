@@ -53,11 +53,29 @@ from xdart.gui.themes import typography as typo
 
 @pytest.fixture(scope="module")
 def qapp():
+    """The session QApplication, restored to how this module found it.
+
+    This is the only module in the suite that installs an application
+    stylesheet or changes the application font, and both are process-global:
+    left behind, they would silently move every sizeHint and font metric in
+    whatever module pytest runs next.  Snapshot and put them back.
+    """
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     # Capture the pristine platform baseline BEFORE any row applies a tier, so
     # every row derives from the same immutable origin (contract rule 1).
     typo.capture_application_baseline(app)
-    return app
+    original_qss = app.styleSheet()
+    original_font = QtGui.QFont(app.font())
+    try:
+        yield app
+    finally:
+        app.setStyleSheet(original_qss)
+        app.setFont(original_font)
+        # setFont clears the per-class hash; put the platform's own sizes back
+        # at offset 0 so a later module sees exactly what it would have seen.
+        typo.restore_platform_class_fonts(app, typo.DEFAULT_FONT_SCALE)
+        for _ in range(3):
+            app.processEvents()
 
 
 @pytest.fixture
