@@ -43,7 +43,7 @@ import pytest
 
 pytest.importorskip("pyqtgraph")
 import pyqtgraph as pg
-from pyqtgraph import QtWidgets
+from pyqtgraph import QtGui, QtWidgets
 
 from xdart.gui.themes import apply_theme, render_qss
 from xdart.gui.themes import typography as typo
@@ -454,6 +454,56 @@ def test_tiers_are_derived_from_the_captured_baseline(qapp):
         assert qapp.font().pointSize() == expected, scale
         assert typo.application_baseline_point_size() == baseline, (
             "the baseline moved: it must be captured once, never re-read")
+
+
+def test_platform_per_class_fonts_ride_the_tier(qapp):
+    """A platform that gives a widget class its own font keeps that relationship.
+
+    macOS does, and the gaps are large — measured on cocoa, ``QToolButton`` is
+    10 pt against a 13 pt application font, and ``QTipLabel``/``QHeaderView``/
+    ``QSmallFont`` are 11 pt.  Both ``QApplication.setFont`` and the FIRST
+    ``setStyleSheet`` wipe that hash, so without an explicit restore the
+    *Default* tier would enlarge every tool button by 30% — a change to the
+    shipped look that no tier asked for.
+
+    The offscreen platform used by this suite defines no per-class fonts at
+    all, so a plain assertion here would be structurally blind and pass on a
+    branch that regressed macOS.  Seed one and re-arm the one-shot capture.
+    """
+    saved = (typo._BASELINE_FONT, typo._BASELINE_POINT_SIZE,
+             typo._BASELINE_CLASS_FONTS, typo._CURRENT_SCALE)
+    try:
+        apply_theme(qapp, "dark", font_scale="default")
+        seeded = max(1, qapp.font().pointSize() - 3)
+        probe = QtGui.QFont(qapp.font())
+        probe.setPointSize(seeded)
+        # QMiniFont deliberately: it is a Qt pseudo-class no widget in the
+        # shell resolves against, so seeding it exercises the capture/shift/
+        # restore path without leaving a real control pinned to one tier for
+        # every later row in the file.
+        qapp.setFont(probe, "QMiniFont")
+
+        typo._BASELINE_FONT = None
+        typo._BASELINE_POINT_SIZE = 0
+        typo._BASELINE_CLASS_FONTS = {}
+        typo.capture_application_baseline(qapp)
+        assert typo.platform_class_font_baseline().get("QMiniFont") == seeded
+
+        for scale in typo.FONT_SCALES:
+            apply_theme(qapp, "dark", font_scale=scale)
+            offset = typo.FONT_SCALE_TOKENS[scale].app_offset_pt
+            actual = QtWidgets.QApplication.font("QMiniFont").pointSize()
+            assert actual == seeded + offset, (
+                f"{scale}: QMiniFont is {actual}pt, expected "
+                f"{seeded + offset}pt — the platform's own sizing was lost")
+
+        apply_theme(qapp, "dark", font_scale="default")
+        assert QtWidgets.QApplication.font("QMiniFont").pointSize() == seeded, (
+            "Default is not a no-op for the platform's per-class fonts")
+    finally:
+        (typo._BASELINE_FONT, typo._BASELINE_POINT_SIZE,
+         typo._BASELINE_CLASS_FONTS, typo._CURRENT_SCALE) = saved
+        apply_theme(qapp, "dark", font_scale=typo.DEFAULT_FONT_SCALE)
 
 
 # ── 7 + 8. live plots: convergence and weak release ─────────────────────

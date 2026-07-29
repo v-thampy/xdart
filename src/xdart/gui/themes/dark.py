@@ -20,6 +20,7 @@ from .typography import (
     current_font_scale,
     normalize_font_scale,
     qss_font_tokens,
+    restore_platform_class_fonts,
     restyle_live_plots,
     style_plot_fonts,
 )
@@ -1187,7 +1188,11 @@ def apply_theme(app, name="dark", font_scale=DEFAULT_FONT_SCALE) -> None:
        re-polishes even for an identical stylesheet string, so reapplying the
        same tier stays correct rather than becoming a no-op that strands the
        new font.
-    3. The live-plot restyle last, once ordinary widgets have settled.
+    3. The platform per-class fonts third -- AFTER the stylesheet, because the
+       first ``setStyleSheet`` on the application resets that hash to the
+       platform theme's values (measured; see
+       :func:`~.typography.restore_platform_class_fonts`).
+    4. The live-plot restyle last, once ordinary widgets have settled.
 
     Still safe to call before any plot widget exists (step 3 finds nothing),
     which is how startup uses it.
@@ -1211,6 +1216,9 @@ def apply_theme(app, name="dark", font_scale=DEFAULT_FONT_SCALE) -> None:
         qss += ("\nQPushButton#pyfai_calib, QPushButton#get_mask "
                 f"{{ font-size: {calibration_button_font(font_scale)}; }}\n")
     app.setStyleSheet(qss)
+    # After the stylesheet, never before: the first setStyleSheet on the
+    # application resets the per-class font hash to the platform theme's sizes.
+    restore_platform_class_fonts(app, font_scale)
     try:
         import pyqtgraph as pg
         pg.setConfigOption("background", SEABORN_BG)

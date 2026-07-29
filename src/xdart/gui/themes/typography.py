@@ -32,6 +32,19 @@ Settings live behind :func:`application_settings`, which honours
 ``XDART_SETTINGS_FILE`` exactly the way session state honours
 ``XDART_SESSION_FILE``.  Tests and probes point it at scratch space so
 automated work can never read or write the maintainer's real preferences.
+
+**What this preference deliberately does NOT cover.**  pyFAI's calibration and
+mask tools are launched as separate OS processes (``subprocess.run``/``Popen``
+of ``pyFAI-calib2`` / ``pyFAI-drawmask`` from the integrator), not as in-process
+Qt windows.  They inherit neither ``QApplication.font()`` nor the stylesheet,
+so they keep their own platform default at every tier and will visibly differ
+from xdart at Extra Small and Extra Large.  That is out of scope on purpose:
+the only handle on a child process is an environment variable
+(``QT_FONT_DPI`` / ``QT_SCALE_FACTOR``), which would scale those tools' whole
+UI rather than just their text, and no production-shaped test could cover it
+from here.  xdart itself renders no matplotlib figures — the GUI's only
+matplotlib use is colormap lookup — so there is no in-process matplotlib font
+to scale either.
 """
 
 from __future__ import annotations
@@ -180,20 +193,36 @@ def application_settings():
 
 _BASELINE_FONT = None
 _BASELINE_POINT_SIZE = 0
+_BASELINE_CLASS_FONTS = {}
 _CURRENT_SCALE = DEFAULT_FONT_SCALE
+
+#: Widget classes for which a platform theme may set a font of its own.
+#: macOS does, and the differences are large: measured on cocoa, QToolButton is
+#: 10 pt against a 13 pt application font, and QTipLabel / QHeaderView /
+#: QSmallFont are 11 pt.  ``QApplication.setFont(f)`` with no class name CLEARS
+#: that whole hash, so scaling naively would drag every tool button up 30% at
+#: the *Default* tier -- a change to the shipped look that no tier asked for.
+_PLATFORM_FONT_CLASSES = (
+    "QToolButton", "QTipLabel", "QHeaderView", "QSmallFont", "QMiniFont",
+    "QMenu", "QMenuBar", "QMessageBox", "QLabel", "QPushButton",
+    "QStatusBar", "QAbstractItemView", "QComboBox", "QLineEdit", "QGroupBox",
+)
 
 
 def capture_application_baseline(app) -> int:
-    """Snapshot the platform's default application font, once.
+    """Snapshot the platform's default fonts, once.
 
     Idempotent, and deliberately never refreshed: after the first tier is
     applied ``app.font()`` is a *scaled* font, and re-capturing it would make
     every later tier relative to the last one.
+
+    Captures the per-class platform fonts alongside the application font, so
+    :func:`apply_application_font` can put them back at the same offset.
     """
-    global _BASELINE_FONT, _BASELINE_POINT_SIZE
+    global _BASELINE_FONT, _BASELINE_POINT_SIZE, _BASELINE_CLASS_FONTS
     if _BASELINE_FONT is not None:
         return _BASELINE_POINT_SIZE
-    from pyqtgraph.Qt import QtGui
+    from pyqtgraph.Qt import QtGui, QtWidgets
     font = QtGui.QFont(app.font())
     size = font.pointSize()
     if size <= 0:
@@ -202,6 +231,16 @@ def capture_application_baseline(app) -> int:
         size = QtGui.QFontInfo(font).pointSize()
     _BASELINE_FONT = font
     _BASELINE_POINT_SIZE = int(size)
+    classes = {}
+    for name in _PLATFORM_FONT_CLASSES:
+        try:
+            class_font = QtGui.QFont(QtWidgets.QApplication.font(name))
+        except Exception:
+            continue
+        class_pt = class_font.pointSize()
+        if class_pt > 0 and class_pt != _BASELINE_POINT_SIZE:
+            classes[name] = (class_font, class_pt)
+    _BASELINE_CLASS_FONTS = classes
     return _BASELINE_POINT_SIZE
 
 
@@ -242,6 +281,44 @@ def apply_application_font(app, scale=DEFAULT_FONT_SCALE) -> str:
     app.setFont(scaled_application_font(app, scale))
     _CURRENT_SCALE = scale
     return scale
+
+
+def restore_platform_class_fonts(app, scale=None) -> int:
+    """Put the platform's per-class fonts back, shifted by the tier's offset.
+
+    macOS gives several widget classes a font of their own -- measured on
+    cocoa, ``QToolButton`` is 10 pt against a 13 pt application font, and
+    ``QTipLabel`` / ``QHeaderView`` / ``QSmallFont`` are 11 pt.  Two separate Qt
+    behaviours wipe that hash: ``QApplication.setFont(f)`` with no class name,
+    and -- less obviously -- the FIRST ``setStyleSheet`` on the application,
+    which resets it to the platform theme's values.  Left alone, the *Default*
+    tier would therefore enlarge every tool button by 30% and every tooltip and
+    tree header by 18%: a change to the shipped look that no tier asked for.
+
+    So this MUST run after the stylesheet, not with the application font.  A
+    second identical ``setStyleSheet`` does not reset the hash again, which is
+    exactly why the bug hid: the first apply looked broken and every later one
+    looked fine.  Returns how many classes were restored.
+    """
+    from pyqtgraph.Qt import QtGui
+    scale = normalize_font_scale(scale if scale is not None else _CURRENT_SCALE)
+    offset = FONT_SCALE_TOKENS[scale].app_offset_pt
+    restored = 0
+    for name, (class_font, class_pt) in _BASELINE_CLASS_FONTS.items():
+        try:
+            shifted = QtGui.QFont(class_font)
+            shifted.setPointSize(max(1, class_pt + offset))
+            app.setFont(shifted, name)
+            restored += 1
+        except Exception:
+            logger.debug("could not restore the %s platform font", name,
+                         exc_info=True)
+    return restored
+
+
+def platform_class_font_baseline() -> dict:
+    """``{className: point size}`` captured from the platform theme."""
+    return {name: pt for name, (_font, pt) in _BASELINE_CLASS_FONTS.items()}
 
 
 def font_scale_ratio(scale=None) -> float:
