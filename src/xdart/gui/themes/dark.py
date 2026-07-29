@@ -426,6 +426,12 @@ QToolButton:checked:disabled {
     color: $text_muted;
     border-color: $selection_accent_muted;
 }
+/* The left browser has several three-across/header actions.  They follow the
+   selected density without allowing generous tiers to make their text clip. */
+QPushButton#e3BrowserCompactButton,
+QToolButton#e3RefreshBrowser {
+    padding: $control_browse_padding;
+}
 /* File / Config / Help open their menu on click (InstantPopup) — the oversized
    down-arrow menu-indicator is redundant noise, so drop it entirely. */
 QToolButton#fileMenuButton::menu-indicator,
