@@ -417,7 +417,6 @@ QToolButton:checked {
     background-color: $selection_accent;
     color: $selection_accent_on_text;
     border-color: $selection_accent;
-    font-weight: bold;
 }
 QToolButton:checked:hover {
     background-color: $selection_accent_hover;
