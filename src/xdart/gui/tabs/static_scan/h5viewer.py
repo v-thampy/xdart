@@ -649,7 +649,6 @@ class H5Viewer(QWidget):
         """
         self.ui.refresh = QtWidgets.QPushButton('Refresh')
         self.ui.refresh.setObjectName('refresh')
-        self.ui.refresh.setMaximumSize(QtCore.QSize(16777215, 25))
         # date_sort_scans: a CHECKABLE "Date" toggle sits to the LEFT of Refresh;
         # when checked, listScans sorts by last-modified (newest first) instead of
         # the natural-name order.  Toggling re-reads + re-sorts via
@@ -658,7 +657,6 @@ class H5Viewer(QWidget):
         self.ui.dateSort = QtWidgets.QPushButton('Date')
         self.ui.dateSort.setObjectName('dateSort')
         self.ui.dateSort.setCheckable(True)
-        self.ui.dateSort.setMaximumSize(QtCore.QSize(16777215, 25))
         # The label clips on Windows (different font metrics): reserve the
         # size hint + 10% (maintainer request 2026-07-12).
         self.ui.dateSort.setMinimumWidth(
@@ -672,8 +670,10 @@ class H5Viewer(QWidget):
         btn_row = QtWidgets.QWidget()
         # Constrain the row to the button height so it doesn't steal vertical
         # stretch from the lists splitter above (which would leave the buttons
-        # floating in the middle of the panel).
-        btn_row.setFixedHeight(25)
+        # floating in the middle of the panel).  The height itself is derived
+        # from font metrics by _fit_browser_button_heights below, not pinned --
+        # a hard 25 px clipped every one of these labels from Large upward.
+        btn_row.setObjectName('browserButtonRow')
         btn_row.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Preferred,
             QtWidgets.QSizePolicy.Policy.Fixed,
@@ -690,11 +690,76 @@ class H5Viewer(QWidget):
         # staticWidget._connect_signals -> _open_metadata_dialog).
         self.ui.metadata_btn = QtWidgets.QPushButton('Metadata ▾')
         self.ui.metadata_btn.setObjectName('metadata_btn')
-        self.ui.metadata_btn.setMaximumSize(QtCore.QSize(16777215, 25))
         # Order: Show All | Metadata | Auto Last (Auto Last rightmost).
         btn_layout.addWidget(self.ui.metadata_btn)
         btn_layout.addWidget(self.ui.auto_last)
         self.ui.gridLayout.addWidget(btn_row, 3, 0, 1, 2)
+        self._browser_button_row = btn_row
+        self._fit_browser_button_heights()
+
+    #: The compact browser-button height the panel was laid out at.  It stays
+    #: the floor so the Default tier is pixel-identical to what shipped; the
+    #: cap only rises when a button genuinely needs the room.
+    _BROWSER_BUTTON_MIN_H = 25
+
+    def _browser_buttons(self):
+        ui = self.ui
+        return [b for b in (getattr(ui, name, None) for name in
+                            ('refresh', 'dateSort', 'metadata_btn',
+                             'show_all', 'auto_last'))
+                if b is not None]
+
+    def _fit_browser_button_heights(self):
+        """Cap the browser buttons at their own natural height, not at 25 px.
+
+        These five buttons and their row were pinned to a hard 25 px so the row
+        could not steal vertical stretch from the scan/frame lists above.  That
+        held at the shipped font and truncated every label from the Large tier
+        upward.  Font metrics give the same 25 px at Default -- the buttons ask
+        for less than that -- and grow only when the text actually needs it, so
+        the compact look survives and the clipping does not.
+
+        Recomputed from scratch every time, never ratcheted up from the current
+        cap: `Default -> Extra Large -> Default` has to land back on 25.
+        """
+        try:
+            buttons = self._browser_buttons()
+            if not buttons:
+                return
+            height = max([self._BROWSER_BUTTON_MIN_H]
+                         + [b.minimumSizeHint().height() for b in buttons])
+            for button in buttons:
+                button.setMaximumHeight(height)
+            row = getattr(self, '_browser_button_row', None)
+            if row is not None:
+                row.setFixedHeight(height)
+        except Exception:
+            logger.debug("browser button height fit failed", exc_info=True)
+
+    def changeEvent(self, event):
+        """Re-derive the font-dependent button heights when the tier changes.
+
+        ``QApplication.setFont`` + the theme re-polish deliver a FontChange to
+        every widget, which is the one signal a page needs here: it inherits
+        the shared preference without reading it (or owning a copy of it).
+
+        The refit is DEFERRED by one event-loop turn, and that is the whole
+        trick.  When FontChange arrives here the child buttons have not been
+        re-laid-out yet, so ``minimumSizeHint()`` still answers with the
+        PREVIOUS tier's metrics -- instrumented and confirmed: a synchronous
+        refit sized Large from Default's hints and clipped, then a later
+        Default kept Extra Large's cap because the stale reading only ever
+        ratcheted upward.  ``ensurePolished()`` does not help; the widget is
+        already polished, it is the cached hint that is stale.  One turn later
+        every hint is current and the same recomputation is exact in both
+        directions.
+        """
+        try:
+            if event.type() == QtCore.QEvent.Type.FontChange:
+                QtCore.QTimer.singleShot(0, self._fit_browser_button_heights)
+        except Exception:
+            logger.debug("font-change refit failed", exc_info=True)
+        super().changeEvent(event)
 
     def refresh_directory(self, *_signal_args):
         """Re-read the current directory's file listing (Refresh button).

@@ -5841,23 +5841,90 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     # ── Image preview dialog ──────────────────────────────────────
 
+    def _refit_font_scaled_controls(self):
+        """Re-run the top-bar width fits after an application font change.
+
+        ``_fit_combo_width`` / ``_fit_button_width`` end in ``setFixedWidth``,
+        so the result is frozen at construction time.  That was invisible
+        while the font never moved; with a five-tier application scale the bar
+        would keep the widths it was born with and truncate its own labels.
+        Re-run exactly the construction-time calls, with the same arguments.
+        """
+        try:
+            for combo in (self.ui.normChannel, self.ui.scale, self.ui.cmap):
+                displayFrameWidget._fit_combo_width(combo, max_w=130)
+            # The colormap selector is trimmed ~15% inside the compact scale
+            # pill; re-derive that from the freshly fitted width.
+            cmw = self.ui.cmap.maximumWidth()
+            self.ui.cmap.setFixedWidth(
+                int(cmw * 0.85) if 0 < cmw < 16777215 else 110)
+            displayFrameWidget._fit_button_width(self.ui.setBkg, scale=1.177)
+            for name, kwargs in (("_logBtn", {}),
+                                 ("_intensityAuto", {"pad": 34}),
+                                 ("_showImageBtn", {})):
+                button = getattr(self, name, None)
+                if button is not None:
+                    displayFrameWidget._fit_button_width(button, **kwargs)
+        except Exception:
+            logger.debug("font-change control refit failed", exc_info=True)
+
+    def changeEvent(self, event):
+        """Refit the frozen top-bar widths when the application font changes.
+
+        ``QApplication.setFont`` plus the theme re-polish deliver a FontChange
+        to every widget; that is the only signal this page needs.  It inherits
+        the shared preference here — it never reads or stores one.
+        """
+        try:
+            if event.type() == Qt.QtCore.QEvent.Type.FontChange:
+                # Deferred by one event-loop turn: when FontChange arrives the
+                # children have not been re-laid-out, so their size hints and
+                # style metrics still answer for the PREVIOUS tier (measured --
+                # a synchronous refit sized each tier from the one before it).
+                Qt.QtCore.QTimer.singleShot(
+                    0, self._refit_font_scaled_controls)
+        except Exception:
+            logger.debug("font-change refit failed", exc_info=True)
+        super().changeEvent(event)
+
     @staticmethod
     def _fit_combo_width(combo, *, max_w=200, arrow=34):
-        """Fixed width = widest item text + dropdown-arrow allowance."""
+        """Fixed width = widest item text + dropdown-arrow allowance.
+
+        The text width is already font-derived; ``arrow`` and ``max_w`` are
+        pixel allowances tuned at the Default font tier, so they ride the tier
+        ratio.  Without that the ceiling truncated the metric-derived width at
+        the larger tiers -- "Norm Channel" needs more than the 130 px cap once
+        the application font grows.
+        """
         try:
+            from xdart.gui.themes.typography import font_scale_ratio
+            ratio = font_scale_ratio()
             fm = combo.fontMetrics()
             texts = [combo.itemText(i) for i in range(combo.count())] or ['']
             w = max(fm.horizontalAdvance(t) for t in texts)
-            combo.setFixedWidth(min(w + arrow, max_w))
+            combo.setFixedWidth(min(w + int(round(arrow * ratio)),
+                                    int(round(max_w * ratio))))
         except Exception:
             logger.debug("combo width fit failed", exc_info=True)
 
     @staticmethod
     def _fit_button_width(btn, *, pad=26, scale=1.0):
-        """Fixed width = (label text + padding) * scale."""
+        """Fixed width = (label text + padding) * scale.
+
+        ``pad`` is the QSS horizontal padding, which is a fixed pixel budget
+        tuned at the Default tier, so it rides the tier ratio like ``arrow``
+        above."""
         try:
+            from xdart.gui.themes.typography import font_scale_ratio
+            btn.ensurePolished()
+            pad = int(round(pad * font_scale_ratio()))
             w = btn.fontMetrics().horizontalAdvance(btn.text()) + pad
-            btn.setFixedWidth(int(round(w * scale)))
+            # Never fix the width below what the style itself needs: at the
+            # small tiers the scaled padding alone can land under the button's
+            # own minimum, which clips the label the fit exists to protect.
+            btn.setFixedWidth(max(int(round(w * scale)),
+                                  btn.minimumSizeHint().width()))
         except Exception:
             logger.debug("button width fit failed", exc_info=True)
 

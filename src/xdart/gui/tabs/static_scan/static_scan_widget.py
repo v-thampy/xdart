@@ -10394,13 +10394,30 @@ class staticWidget(QWidget):
         init -- the run row hides in viewer modes, mode-specific widgets toggle
         per profile -- so a height frozen from the initial sizeHint would leave
         slack (run row hidden) or clip (content grown).  Called at init and after
-        every profile / mode change."""
+        every profile / mode change, and after an application font change: the
+        content grows with the tier exactly as it does when a row appears."""
         try:
             self.ui.controlsFrame.setFixedHeight(
                 self.controls.sizeHint().height()
                 + 2 * self.ui.controlsFrame.frameWidth())
         except Exception:
             logger.debug("fit controls height failed", exc_info=True)
+
+    def changeEvent(self, event):
+        """Re-fit the bottom controls bar when the application font changes.
+
+        Deferred one event-loop turn: when FontChange arrives, StaticControls'
+        cached sizeHint still answers for the previous tier, so a synchronous
+        refit would pin the bar one tier behind and clip it.  The page inherits
+        the shared preference through this event -- it reads no setting and
+        keeps no scale of its own.
+        """
+        try:
+            if event.type() == QtCore.QEvent.Type.FontChange:
+                QtCore.QTimer.singleShot(0, self._fit_controls_height)
+        except Exception:
+            logger.debug("font-change controls refit failed", exc_info=True)
+        super().changeEvent(event)
 
     def _commit_shortcut_focus(self):
         """Commit focused editors before a command-key action reads controls."""

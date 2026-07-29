@@ -22,6 +22,8 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xrd_tools.sources.probe import probe_first_frame, raw_is_reachable  # noqa: F401
 
+from xdart.gui.themes import plot_font
+
 from .peak_fit_util import CURVE_PENS
 from .plot_axes import add_right_series, attach_right_axis
 
@@ -188,8 +190,13 @@ class ScanPlotDialog(QtWidgets.QDialog):
         body.addLayout(y_col)
         self.plot = pg.PlotWidget()
         self.legend = self.plot.addLegend(offset=(-10, 10))
-        # ~50% larger than pyqtgraph's ~9pt legend default (readability).
-        self.legend.setLabelTextSize("13pt")
+        # ~50% larger than pyqtgraph's ~9pt legend default (readability).  Two
+        # points above the application plot tier reproduces the 13pt this had
+        # at the Default tier and keeps the emphasis at every other one; a
+        # literal here would have frozen this one legend while the rest of the
+        # application scaled.
+        self.legend.setLabelTextSize(
+            f"{plot_font().pointSize() + 2}pt")
         self.right_vb, self.right_axis = attach_right_axis(self.plot)
         body.addWidget(self.plot, 1)
         lay.addLayout(body, 1)
