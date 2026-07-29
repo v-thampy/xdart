@@ -811,7 +811,12 @@ def test_no_page_reads_qsettings_or_owns_a_second_scale():
         text = path.read_text(encoding="utf-8")
         if "QSettings" in text:
             offenders.append(f"{rel}: reads QSettings")
-        for token in ("control_panel_font_size", "application_font_size"):
+        for token in (
+            "control_panel_font_size",
+            "application_font_size",
+            "appearance/toggle_accent",
+            "appearance/spacing",
+        ):
             if token in text:
                 offenders.append(f"{rel}: holds the preference key {token!r}")
     assert offenders == [], (

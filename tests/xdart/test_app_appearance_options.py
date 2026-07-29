@@ -122,7 +122,8 @@ def test_accent_and_spacing_tables_are_exact_and_total():
     assert spacing_owner.normalize_spacing("unknown") == "normal"
 
 
-def test_theme_default_is_byte_compatible_and_candidates_only_recolor_selection():
+def test_omitted_and_explicit_defaults_match_and_candidates_only_recolor_selection(
+):
     baseline = render_qss("dark", font_scale="default")
     explicit = render_qss(
         "dark",
@@ -165,6 +166,7 @@ def test_each_candidate_reaches_every_selected_control_family(
     qss = render_qss(theme_name, accent_color=choice)
     for selector in (
         "QPushButton:checked",
+        "QToolButton:checked",
         "QCheckBox::indicator:checked, QRadioButton::indicator:checked",
         "QPushButton#controlsV2ToggleButton:checked,\n"
         "QPushButton#controlsV2PillButton:checked",
@@ -200,6 +202,23 @@ def test_buttons_are_square_while_panel_cards_remain_rounded():
 
 def test_spacing_changes_real_qss_padding_without_changing_font_or_color():
     spacing_owner = themes.spacing
+    ordered = [
+        spacing_owner.spacing_tokens(name)
+        for name, _label in spacing_owner.SPACING_MENU
+    ]
+    for attribute in (
+        "button_y",
+        "button_x",
+        "layout_gap",
+        "panel_margin",
+        "browser_gap",
+        "tools_gap",
+        "tools_vertical_margin",
+    ):
+        values = [getattr(tokens, attribute) for tokens in ordered]
+        assert values == sorted(values)
+        assert len(set(values)) == 5
+
     tight = render_qss("dark", spacing="extra_tight")
     roomy = render_qss("dark", spacing="extra_spacious")
     tight_button = _selector_body(tight, "QPushButton")
@@ -210,6 +229,52 @@ def test_spacing_changes_real_qss_padding_without_changing_font_or_color():
     assert spacing_owner.spacing_tokens("extra_tight").layout_gap < (
         spacing_owner.spacing_tokens("extra_spacious").layout_gap
     )
+
+
+def test_apply_theme_publishes_the_exact_spacing_for_responsive_layouts(qapp):
+    try:
+        apply_theme(qapp, "dark", spacing="spacious")
+        assert themes.spacing.current_spacing() == "spacious"
+    finally:
+        apply_theme(qapp, "dark", spacing="normal")
+
+
+def test_controls_cards_follow_all_five_spacing_tiers_live(qapp):
+    from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import (
+        ControlsPanelV2,
+        SubsectionCard,
+    )
+
+    panel = ControlsPanelV2()
+    subsection = SubsectionCard("Example")
+    panel.show()
+    subsection.show()
+    qapp.processEvents()
+    try:
+        observed = []
+        for name, _label in themes.spacing.SPACING_MENU:
+            apply_theme(qapp, "dark", spacing=name)
+            qapp.processEvents()
+            observed.append(
+                (
+                    panel.layout().spacing(),
+                    panel.layout().contentsMargins().left(),
+                    panel.project_card.body_layout.spacing(),
+                    panel.project_card.body_layout.contentsMargins().top(),
+                    subsection.body_layout.spacing(),
+                )
+            )
+        for values in zip(*observed):
+            assert tuple(values) == tuple(sorted(values))
+            assert len(set(values)) == 5
+        assert observed[2] == (12, 5, 5, 7, 4)
+    finally:
+        apply_theme(qapp, "dark", spacing="normal")
+        panel.close()
+        subsection.close()
+        panel.deleteLater()
+        subsection.deleteLater()
+        qapp.processEvents()
 
 
 def test_config_menus_are_exclusive_persisted_and_apply_one_complete_appearance(
