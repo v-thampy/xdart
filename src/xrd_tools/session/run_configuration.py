@@ -483,6 +483,20 @@ def _detached_container(value: Any) -> Any:
         "an equivalent detached value")
 
 
+def _detached_scalar(value: Any, canonicalize) -> Any:
+    """Capture one scalar through its existing run-boundary conversion.
+
+    GI and threshold fields accept the standard scalar protocols (``__bool__``,
+    ``__str__``, ``__float__`` and ``__int__``), which are broader than the
+    ``item``/``tolist`` value-container algebra above.  Preserve a proven
+    detached container such as a NumPy value; otherwise capture the canonical
+    scalar now instead of retaining an arbitrary mutable producer by identity.
+    """
+
+    detached = _detached_value(value)
+    return canonicalize(value) if detached is value else detached
+
+
 def _detached_source_spec(value):
     """A detached copy of one typed source selection (review §41.3.A)."""
     if value is None:
@@ -1061,19 +1075,45 @@ class RunIntent:
             bai_1d_args=_detached_value(dict(self.bai_1d_args or {})),
             bai_2d_args=_detached_value(dict(self.bai_2d_args or {})),
             gi=GIIntent(
-                enabled=_detached_value(self.gi.enabled),
-                incidence_motor=_detached_value(self.gi.incidence_motor),
-                th_val=_detached_value(self.gi.th_val),
-                sample_orientation=_detached_value(self.gi.sample_orientation),
-                tilt_angle=_detached_value(self.gi.tilt_angle),
-                mode_1d=_detached_value(self.gi.mode_1d),
-                mode_2d=_detached_value(self.gi.mode_2d),
+                enabled=_detached_scalar(self.gi.enabled, bool),
+                incidence_motor=_detached_scalar(
+                    self.gi.incidence_motor,
+                    lambda value: str(value or "Manual"),
+                ),
+                th_val=_detached_scalar(self.gi.th_val, float),
+                sample_orientation=_detached_scalar(
+                    self.gi.sample_orientation,
+                    int,
+                ),
+                tilt_angle=_detached_scalar(self.gi.tilt_angle, float),
+                mode_1d=_detached_scalar(
+                    self.gi.mode_1d,
+                    lambda value: str(value or "q_total"),
+                ),
+                mode_2d=_detached_scalar(
+                    self.gi.mode_2d,
+                    lambda value: str(value or "qip_qoop"),
+                ),
             ),
             threshold=ThresholdIntent(
-                apply_threshold=_detached_value(self.threshold.apply_threshold),
-                threshold_min=_detached_value(self.threshold.threshold_min),
-                threshold_max=_detached_value(self.threshold.threshold_max),
-                mask_saturation=_detached_value(self.threshold.mask_saturation),
+                apply_threshold=_detached_scalar(
+                    self.threshold.apply_threshold,
+                    bool,
+                ),
+                threshold_min=(
+                    None
+                    if self.threshold.threshold_min is None
+                    else _detached_scalar(self.threshold.threshold_min, float)
+                ),
+                threshold_max=(
+                    None
+                    if self.threshold.threshold_max is None
+                    else _detached_scalar(self.threshold.threshold_max, float)
+                ),
+                mask_saturation=_detached_scalar(
+                    self.threshold.mask_saturation,
+                    bool,
+                ),
             ),
             poni_file=self.poni_file,
             poni_values=(

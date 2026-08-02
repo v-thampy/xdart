@@ -123,6 +123,60 @@ def test_clone_candidate_detaches_mutable_gi_and_threshold_values():
     assert original.threshold.threshold_min == 9.0
 
 
+class _MutableNumber:
+    def __init__(self, value):
+        self.value = float(value)
+
+    def __float__(self):
+        return self.value
+
+    def __deepcopy__(self, _memo):
+        raise AssertionError("canonical clone invoked arbitrary deepcopy")
+
+
+def test_clone_and_store_capture_float_coercible_values_without_aliasing():
+    from xrd_tools.session.intent_store import (
+        IntentCommitAccepted,
+        IntentFreezeAccepted,
+        RunIntentStore,
+    )
+
+    gi_value = _MutableNumber(0.2)
+    threshold_value = _MutableNumber(1.0)
+    original = RunIntent(
+        gi=GIIntent(enabled=True, th_val=gi_value),
+        threshold=ThresholdIntent(threshold_min=threshold_value),
+    )
+    candidate = original.clone_candidate()
+    store = RunIntentStore(original)
+
+    gi_value.value = 1.3
+    threshold_value.value = 9.0
+
+    assert candidate.freeze().gi.th_val == 0.2
+    stored = store.snapshot().thaw()
+    assert float(stored.gi.th_val) == 0.2
+    assert float(stored.threshold.threshold_min) == 1.0
+
+    committed_gi = _MutableNumber(0.4)
+    committed_threshold = _MutableNumber(2.0)
+    committed = store.commit(
+        RunIntent(
+            gi=GIIntent(enabled=True, th_val=committed_gi),
+            threshold=ThresholdIntent(threshold_min=committed_threshold),
+        ),
+        expected_revision=0,
+    )
+    assert isinstance(committed, IntentCommitAccepted)
+    committed_gi.value = 3.4
+    committed_threshold.value = 8.0
+
+    frozen = store.freeze(expected_revision=1)
+    assert isinstance(frozen, IntentFreezeAccepted)
+    assert frozen.configuration.gi.th_val == 0.4
+    assert frozen.configuration.threshold.threshold_min == 2.0
+
+
 def test_intent_store_delegates_to_canonical_clone_without_copy_hooks():
     class HostileDeepcopyValue:
         def tolist(self):
