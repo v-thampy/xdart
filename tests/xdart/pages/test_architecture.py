@@ -75,7 +75,7 @@ def test_contract_modules_have_no_science_settings_or_main_imports():
         if path.name == "services.py":
             for sanctioned in (
                 "ExperimentEditorPort",
-                "ExperimentProvider",
+                "_ExperimentProvider",
                 "_SelectedExperiments",
                 "_NullExperiments",
             ):

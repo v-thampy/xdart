@@ -32,16 +32,10 @@ class _NoneSources:
         return None
 
 
-class _NoneExperiments:
-    def experiment_for(self, _key):
-        return None
-
-
 def _services(profile=ExecutionProfile.TEST):
     return HostServices(
         status=_NoopStatus(), run_intents=_NoneIntents(),
         execution=_NoneExecution(), sources=_NoneSources(),
-        experiments=_NoneExperiments(),
         execution_profile=profile,
         diagnostics=DiagnosticIdentity("tests.legacy"),
     )

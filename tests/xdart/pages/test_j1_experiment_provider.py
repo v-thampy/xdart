@@ -13,6 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import xdart.gui.pages.services as services_module
 from xdart.gui.pages.services import (
     DiagnosticIdentity,
     ExecutionProfile,
@@ -88,9 +89,9 @@ def _host(experiments) -> HostServices:
         run_intents=_NoneIntents(),
         execution=_NoneExecution(),
         sources=_NoneSources(),
-        experiments=experiments,
         execution_profile=ExecutionProfile.TEST,
         diagnostics=DiagnosticIdentity("tests.j1"),
+        _experiments=experiments,
     )
 
 
@@ -143,6 +144,24 @@ def test_empty_host_services_return_none_for_every_key():
         assert bound.experiment_for(key) is None
 
 
+def test_experiment_provider_backing_stays_private_and_null_by_default():
+    public_fields = {
+        name for name in HostServices.__dataclass_fields__
+        if not name.startswith("_")
+    }
+    assert public_fields == {
+        "status",
+        "run_intents",
+        "execution",
+        "sources",
+        "execution_profile",
+        "diagnostics",
+    }
+    assert "_experiments" in HostServices.__dataclass_fields__
+    assert not hasattr(services_module, "ExperimentProvider")
+    assert not hasattr(_host(_EditorSpy({})), "experiments")
+
+
 def test_existing_provider_isolation_is_unchanged_beside_the_new_seam():
     calls = []
 
@@ -166,9 +185,9 @@ def test_existing_provider_isolation_is_unchanged_beside_the_new_seam():
         run_intents=_Intents(),
         execution=_Execution(),
         sources=_Sources(),
-        experiments=_EditorSpy({}),
         execution_profile=ExecutionProfile.TEST,
         diagnostics=DiagnosticIdentity("tests.j1"),
+        _experiments=_EditorSpy({}),
     ).for_page(SELECTED)
     assert bound.run_intents.store_for(SELECTED) == ("intent", SELECTED)
     assert bound.execution.executor_for(SELECTED) == ("executor", SELECTED)

@@ -90,9 +90,9 @@ def _services(calls):
         run_intents=_RunIntents(calls),
         execution=_Execution(calls),
         sources=_Sources(calls),
-        experiments=_Experiments(calls),
         execution_profile=ExecutionProfile.TEST,
         diagnostics=DiagnosticIdentity("tests.synthetic"),
+        _experiments=_Experiments(calls),
     )
 
 
