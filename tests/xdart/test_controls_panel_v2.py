@@ -985,6 +985,26 @@ def test_controls_panel_v2_detector_status_uses_poni_summary(qapp):
     assert detector.status.text() == "Eiger 1M · 200.4mm · fitted"
 
 
+def test_controls_panel_v2_custom_title_keeps_specialized_gi_layout(qapp):
+    state = build_control_panel_state(
+        ControlState(),
+        {("GI", "Grazing"): False},
+    )
+    panel = ControlsPanelV2(experiment_title="Configuration")
+    try:
+        panel.set_state(state)
+        group = next(
+            card for card in panel.experiment_card.findChildren(SubsectionCard)
+            if card.title.text() == "Configuration"
+        )
+        assert [row.path for row in group.findChildren(SegmentedControl)] == [
+            ("GI", "Grazing")
+        ]
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
 def test_controls_panel_v2_section_ticks_and_source_synopsis(qapp):
     profile = build_control_profile(
         ControlState(
@@ -7148,3 +7168,23 @@ def test_t2r_same_value_source_edit_does_not_reconcile(qapp, monkeypatch):
     finally:
         widget.close()
         widget.deleteLater()
+
+
+def test_section_number_presentation_option_preserves_canonical_default(qapp):
+    compact = ControlsPanelV2(show_section_numbers=False)
+    canonical = ControlsPanelV2()
+    try:
+        canonical_chips = canonical.findChildren(
+            QtWidgets.QLabel, "controlsV2SectionChip")
+        compact_chips = compact.findChildren(
+            QtWidgets.QLabel, "controlsV2SectionChip")
+
+        assert any(
+            chip.text() == "1" and not chip.isHidden()
+            for chip in canonical_chips)
+        assert all(chip.isHidden() for chip in compact_chips)
+    finally:
+        canonical.close()
+        canonical.deleteLater()
+        compact.close()
+        compact.deleteLater()

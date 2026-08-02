@@ -996,8 +996,16 @@ class ControlsPanelV2(QtWidgets.QWidget):
     fieldDraftChanged = QtCore.Signal(object, object)
     fieldBrowseRequested = QtCore.Signal(object)
 
-    def __init__(self, parent=None):
+    def __init__(
+        self,
+        parent=None,
+        *,
+        experiment_title: str = "Sample & measurement",
+        show_section_numbers: bool = True,
+    ):
         super().__init__(parent)
+        self._experiment_title = experiment_title
+        self._show_section_numbers = bool(show_section_numbers)
         self.setObjectName("controlsPanelV2")
         self.setMinimumWidth(360)
         lay = QtWidgets.QVBoxLayout(self)
@@ -1049,9 +1057,10 @@ class ControlsPanelV2(QtWidgets.QWidget):
         self._root_layout.setSpacing(tokens.tools_vertical_margin)
         self.top_action_layout.setSpacing(_spaced(7, tokens))
 
-    @staticmethod
-    def _make_section(section: SectionId) -> SectionCard:
+    def _make_section(self, section: SectionId) -> SectionCard:
         number, title, accent = _SECTION_META[section]
+        if not self._show_section_numbers:
+            number = ""
         return SectionCard(title, number=number, accent=accent)
 
     def set_processing_widget(
@@ -1463,7 +1472,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
                 self._detector_status(fields, profile.detector_summary),
             ),
             (
-                "Sample & measurement",
+                self._experiment_title,
                 tuple(field for field in fields if field.path in gi_paths),
                 self._experiment_status(fields),
             ),
@@ -1474,7 +1483,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
             if not group_fields:
                 continue
             group = SubsectionCard(title, status=status, accent="experiment")
-            if title == "Sample & measurement":
+            if title == self._experiment_title:
                 self._render_sample_measurement_rows(group, group_fields)
             else:
                 for field in group_fields:
