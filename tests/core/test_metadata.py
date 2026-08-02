@@ -13,6 +13,7 @@ from xrd_tools.io.metadata import (
     _find_sidecar,
     _parse_kv_pairs,
     read_image_metadata,
+    read_image_metadata_observed,
     read_pdi_metadata,
     read_txt_metadata,
 )
@@ -290,6 +291,23 @@ class TestReadImageMetadata:
         result = read_image_metadata(image, meta_format="txt")
         assert result["i0"] == pytest.approx(1000.0)
 
+        observed = read_image_metadata_observed(image, meta_format="txt")
+        assert observed.source_path == replaced
+        assert observed.values["i0"] == pytest.approx(1000.0)
+
+    def test_observed_metadata_reports_no_file_when_discovery_consumes_none(
+        self,
+        tmp_path: Path,
+        clear_auto_sidecar_cache,
+    ) -> None:
+        image = tmp_path / "scan_0001.tif"
+        image.touch()
+
+        observed = read_image_metadata_observed(image, meta_format="auto")
+
+        assert dict(observed.values) == {}
+        assert observed.source_path is None
+
     def test_unknown_format_returns_empty(self, tmp_path: Path) -> None:
         image = tmp_path / "scan_0001.tif"
         image.touch()
@@ -456,6 +474,10 @@ class TestReadImageMetadata:
 
         assert result["i0"] == pytest.approx(1000.0)
         assert result["del"] == pytest.approx(15.5)
+
+        observed = read_image_metadata_observed(image, meta_format="auto")
+        assert observed.source_path == tmp_path / "scan_0001.txt"
+        assert observed.values["i0"] == pytest.approx(1000.0)
 
     def test_auto_metadata_does_not_cache_negative_late_sidecar(
         self,
@@ -744,6 +766,34 @@ def test_read_spec_metadata_finds_extensionless_spec_within_two_parents(
     assert md["i0"] == 110.0    # per-point counter at image index 1
     assert md["chi"] == 5.0     # constant non-scanned motor
     assert md["phi"] == 10.0
+
+    observed = read_image_metadata_observed(image, meta_format="SPEC")
+    assert observed.source_path == spec
+    assert observed.values["i0"] == 110.0
+
+
+def test_read_spec_metadata_observes_explicit_meta_dir_source(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("silx")
+
+    img_dir = tmp_path / "images"
+    meta_dir = tmp_path / "spec"
+    img_dir.mkdir()
+    meta_dir.mkdir()
+    image = img_dir / "myscan_scan5_0001.tif"
+    image.write_bytes(b"")
+    spec = meta_dir / "myscan"
+    spec.write_text(_SPEC_MINIMAL)
+
+    observed = read_image_metadata_observed(
+        image,
+        meta_format="SPEC",
+        meta_dir=meta_dir,
+    )
+
+    assert observed.source_path == spec
+    assert observed.values["i0"] == 110.0
 
 
 def test_read_spec_metadata_ignores_spec_beyond_two_parents(tmp_path: Path) -> None:

@@ -35,6 +35,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import numpy as np
+
 from xrd_tools.core import DEFAULT_MODE_KEY
 from xrd_tools.reduction import FlushPolicy
 from xrd_tools.session import FrozenRunConfiguration
@@ -93,6 +95,7 @@ class QtNexusSink:
         self._scan = scan
         self._plan = plan
         self._mask = mask
+        self._run_saturation_mask = None
         self._record_store = record_store
         self._registry: dict[int, Any] = {}
         self._since_save = 0
@@ -115,6 +118,39 @@ class QtNexusSink:
     def begin(self, scan, plan) -> None:
         self._since_save = 0
         self._published.clear()
+
+    def _bind_run_saturation_mask(self, state) -> None:
+        self._run_saturation_mask = state
+
+    def _thumbnail_global_mask(self):
+        """Union the detector mask with the session's scan-stable value mask.
+
+        ``LiveFrame.make_thumbnail`` accepts either flat indices or a 2-D bool
+        mask.  Normalize only when both owners contribute; duplicate indices
+        are harmless and avoiding unique/sort keeps the per-frame path cheap.
+        """
+        state = self._run_saturation_mask
+        value_mask = (
+            state.mask
+            if state is not None and state.seeded and state.enabled
+            else None
+        )
+        if value_mask is None:
+            return self._mask
+        value_indices = np.flatnonzero(value_mask)
+        if self._mask is None:
+            return value_indices
+        static = np.asarray(self._mask)
+        static_indices = (
+            np.flatnonzero(static)
+            if static.ndim >= 2
+            else np.asarray(static, dtype=np.intp).ravel()
+        )
+        if not static_indices.size:
+            return value_indices
+        if not value_indices.size:
+            return static_indices
+        return np.concatenate((static_indices, value_indices))
 
     def write(self, frame, reduction) -> None:
         live = self._registry.pop(int(frame.index), None)
@@ -216,7 +252,7 @@ class QtNexusSink:
         if not skip:
             try:
                 live.make_thumbnail(
-                    global_mask=self._mask,
+                    global_mask=self._thumbnail_global_mask(),
                     corrected_image=getattr(reduction, "corrected_image", None),
                 )
             except Exception as e:

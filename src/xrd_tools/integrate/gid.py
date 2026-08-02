@@ -238,7 +238,7 @@ def _nan_empty_2d(arr, result):
 
     The GI 2D cake never got the 1D path's empty-bin treatment, so the missing
     wedge / masked detector gaps — which pyFAI fills with the dummy (``-1`` under
-    method ``'no'``, the live path; ``0`` under split methods) — averaged into the
+    the Python histogram method; ``0`` under split methods) — averaged into the
     cake→1D projection (``nanmean`` treats ``-1`` as real data) and the 2D Overall
     aggregate, dragging the projected profile spuriously negative/depressed across
     the gap columns.  Keyed on COUNT, not value, so genuine zero-photon bins
@@ -262,7 +262,7 @@ def integrate_gi_1d(
     npt: int = 1000,
     npt_oop: int | None = None,
     unit: str = "qoop_A^-1",
-    method: str = "no",
+    method: str = "cython",
     mask: np.ndarray | None = None,
     radial_range: tuple[float, float] | None = None,
     azimuth_range: tuple[float, float] | None = None,
@@ -291,7 +291,7 @@ def integrate_gi_1d(
         Out-of-plane (OOP) coordinate unit, e.g. ``"qoop_A^-1"``.
         Override in-plane unit via ``unit_ip=`` in ``**kwargs``.
     method : str, optional
-        Integration method.  Default ``"no"`` (no pixel-splitting).
+        Integration method.  Default ``"cython"`` (compiled histogram).
     mask : ndarray or None, optional
         Boolean bad-pixel mask.
     radial_range : tuple of float or None, optional
@@ -352,7 +352,7 @@ def integrate_gi_2d(
     npt_rad: int = 500,
     npt_azim: int = 500,
     unit: str = "qip_A^-1",
-    method: str = "no",
+    method: str = "cython",
     mask: np.ndarray | None = None,
     radial_range: tuple[float, float] | None = None,
     azimuth_range: tuple[float, float] | None = None,
@@ -379,7 +379,7 @@ def integrate_gi_2d(
         In-plane unit, e.g. ``"qip_A^-1"``.
         Override OOP unit via ``unit_oop=`` in ``**kwargs``.
     method : str, optional
-        Integration method.  Default ``"no"``.
+        Integration method.  Default ``"cython"`` (compiled histogram).
     mask : ndarray or None, optional
         Boolean bad-pixel mask.
     radial_range : tuple of float or None, optional
@@ -428,7 +428,7 @@ def integrate_gi_polar(
     npt_rad: int = 500,
     npt_azim: int = 500,
     unit: str = "q_A^-1",
-    method: str = "no",
+    method: str = "cython",
     mask: np.ndarray | None = None,
     radial_range: tuple[float, float] | None = None,
     azimuth_range: tuple[float, float] | None = None,
@@ -458,7 +458,7 @@ def integrate_gi_polar(
         Hint for Q unit: ``"q_A^-1"`` → ``qtot_A^-1``;
         anything else → ``qtot_nm^-1``.
     method : str, optional
-        Integration method.  Default ``"no"``.
+        Integration method.  Default ``"cython"`` (compiled histogram).
     mask : ndarray or None, optional
         Boolean bad-pixel mask.
     incident_angle, tilt_angle : float or None, optional
@@ -506,7 +506,7 @@ def integrate_gi_exitangles(
     npt_rad: int = 500,
     npt_azim: int = 500,
     unit: str = "q_A^-1",
-    method: str = "no",
+    method: str = "cython",
     mask: np.ndarray | None = None,
     radial_range: tuple[float, float] | None = None,
     azimuth_range: tuple[float, float] | None = None,
@@ -536,7 +536,7 @@ def integrate_gi_exitangles(
     unit : str, optional
         Kept for API consistency; unused (units are fixed as exit angles).
     method : str, optional
-        Integration method.  Default ``"no"``.
+        Integration method.  Default ``"cython"`` (compiled histogram).
     mask : ndarray or None, optional
         Boolean bad-pixel mask.
     incident_angle, tilt_angle : float or None, optional
@@ -580,7 +580,7 @@ def integrate_gi_polar_1d(
     fi: FiberIntegrator,
     npt: int = 1000,
     unit: str = "q_A^-1",
-    method: str = "no",
+    method: str = "cython",
     mask: np.ndarray | None = None,
     radial_range: tuple[float, float] | None = None,
     azimuth_range: tuple[float, float] | None = None,
@@ -620,7 +620,7 @@ def integrate_gi_polar_1d(
         Hint for the Q axis unit: ``"q_A^-1"`` (or any string containing
         ``"A^-1"``) → ``"A^-1"``; anything else → ``"nm^-1"``.
     method : str, optional
-        Integration method.  Default ``"no"`` (no pixel-splitting).
+        Integration method.  Default ``"cython"`` (compiled histogram).
     mask : ndarray or None, optional
         Boolean bad-pixel mask.
     incident_angle, tilt_angle : float or None, optional
@@ -705,7 +705,7 @@ def integrate_gi_azimuthal_1d(
     fi: FiberIntegrator,
     npt: int = 500,
     npt_q: int = 1000,
-    method: str = "no",
+    method: str = "cython",
     mask: np.ndarray | None = None,
     radial_range: tuple[float, float] | None = None,    # q_total band
     azimuth_range: tuple[float, float] | None = None,   # optional χ_GI clip
@@ -782,7 +782,7 @@ def integrate_gi_exitangles_1d(
     image: np.ndarray,
     fi: FiberIntegrator,
     npt: int = 1000,
-    method: str = "no",
+    method: str = "cython",
     mask: np.ndarray | None = None,
     radial_range: tuple[float, float] | None = None,
     azimuth_range: tuple[float, float] | None = None,
@@ -807,7 +807,7 @@ def integrate_gi_exitangles_1d(
     npt : int, optional
         Number of output bins.  Passed as both ``npt_ip`` and ``npt_oop``.
     method : str, optional
-        Integration method.  Default ``"no"`` (no pixel-splitting).
+        Integration method.  Default ``"cython"`` (compiled histogram).
     mask : ndarray or None, optional
         Boolean bad-pixel mask.
     incident_angle, tilt_angle : float or None, optional

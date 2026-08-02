@@ -12,6 +12,7 @@ from xdart.gui.tabs.scattering.display_runtime import (
 )
 from xdart.gui.tabs.scattering.events import RunIdentity
 from xrd_tools.reduction.core import _RunSaturationMask
+from xrd_tools.session import RunIntent
 from xrd_tools.session.scan_session import _EventSink
 
 
@@ -108,10 +109,13 @@ def test_scan_session_forwards_runtime_mask_to_qt_thumbnail_owner() -> None:
     raw = np.zeros((4, 4), dtype=np.int16)
     raw[0, 0] = -1
     runtime.seed(raw)
+    configuration = RunIntent().freeze()
+    host = SimpleNamespace(_admitted_run_configuration=configuration)
     sink = QtNexusSink(
+        host,
         SimpleNamespace(),
         SimpleNamespace(),
-        SimpleNamespace(),
+        run_configuration=configuration,
         mask=np.array([3], dtype=np.intp),
     )
 

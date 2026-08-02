@@ -401,7 +401,7 @@ def plan_from_live_scan(
         npt_oop = _pop_first(args_2d, ("npt_oop",), None)
     gi_method = _pop_first(args_1d, ("gi_method_1d",), None)
     if gi_method is None:
-        gi_method = _pop_first(args_2d, ("gi_method_2d",), "no")
+        gi_method = _pop_first(args_2d, ("gi_method_2d",), "cython")
 
     if not is_gi:
         _strip_nonstandard_args(args_1d)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 import numpy as np
 import pytest
 
@@ -32,6 +34,26 @@ pytestmark = pytest.mark.skipif(
     not _HAS_FIBER,
     reason="FiberIntegrator requires pyFAI >= 2025.01",
 )
+
+
+def test_public_gi_integrations_default_to_compiled_histogram():
+    from xrd_tools.reduction import GIMode
+
+    assert GIMode().method == "cython"
+    integrations = (
+        integrate_gi_1d,
+        integrate_gi_2d,
+        integrate_gi_polar,
+        integrate_gi_exitangles,
+        integrate_gi_polar_1d,
+        integrate_gi_azimuthal_1d,
+        integrate_gi_exitangles_1d,
+    )
+
+    for integrate in integrations:
+        assert inspect.signature(integrate).parameters["method"].default == (
+            "cython"
+        )
 
 
 def test_create_fiber_integrator(poni_fixture):

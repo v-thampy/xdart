@@ -68,6 +68,42 @@ def test_image_file_source_uses_existing_reader(tmp_path):
     assert isinstance(open_source(path), ImageFileSource)
 
 
+def test_image_sources_preserve_native_dtype_for_saturation(tmp_path):
+    tifffile = pytest.importorskip("tifffile")
+    from xrd_tools.core.invalid import detector_value_mask
+    from xrd_tools.sources import ImageFileSource, TiffSeriesSource
+
+    images = []
+    for index in (1, 2):
+        image = np.zeros((100, 100), dtype=np.uint16)
+        image[:5, :] = np.iinfo(image.dtype).max
+        image[5:, :] = index
+        tifffile.imwrite(tmp_path / f"scan_{index:04d}.tif", image)
+        images.append(image)
+
+    single = ImageFileSource(tmp_path / "scan_0001.tif")
+    series = TiffSeriesSource.from_directory(
+        tmp_path,
+        pattern="scan_*.tif",
+        metadata_format=None,
+    )
+    loaded = (
+        single.load_frame(0),
+        single.frame_for(0).load_image(),
+        series.load_frame(1),
+        series.frame_for(2).load_image(),
+        next(series.iter_chunks(2))[0],
+    )
+
+    assert [item.dtype for item in loaded] == [np.uint16] * len(loaded)
+    np.testing.assert_array_equal(loaded[0], images[0])
+    np.testing.assert_array_equal(loaded[3], images[1])
+    assert loaded[4].shape == (2, 100, 100)
+    mask = detector_value_mask(None, loaded[2], enabled=True)
+    assert mask is not None
+    assert int(mask.sum()) == 500
+
+
 def test_image_file_source_reads_headerless_raw_without_frame_count_warning(
         tmp_path, caplog):
     from xrd_tools.sources import ImageFileSource
@@ -141,6 +177,95 @@ def test_tiff_series_from_directory_uses_natural_order_and_pattern(tmp_path):
         "scan_10.tif",
     ]
     assert source.frame_indices == [1, 2, 3, 4]
+
+
+def test_tiff_series_overlays_exact_admitted_motor_values(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    from xrd_tools.sources import image as image_module
+    from xrd_tools.sources import TiffSeriesSource
+
+    files = tuple(tmp_path / f"scan_{index:04d}.tif" for index in (1, 2))
+    monkeypatch.setattr(
+        image_module,
+        "read_image_metadata",
+        lambda *_args, **_kwargs: {
+            "TH": 9.0,
+            "th": 99.0,
+            "exposure": 3.0,
+        },
+    )
+    source = TiffSeriesSource(
+        files,
+        metadata_format="auto",
+        admitted_motor_values=(
+            (str(files[0]), "th", 0.15),
+            (str(files[1]), "th", 0.25),
+        ),
+    )
+
+    assert source.metadata_for(1) == {"th": 0.15, "exposure": 3.0}
+    assert source.metadata_for(2) == {"th": 0.25, "exposure": 3.0}
+
+
+def test_tiff_series_keeps_duplicate_member_overrides_positional(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    from xrd_tools.sources import image as image_module
+    from xrd_tools.sources import TiffSeriesSource
+
+    path = tmp_path / "same.tif"
+    monkeypatch.setattr(
+        image_module,
+        "read_image_metadata",
+        lambda *_args, **_kwargs: {"th": 99.0},
+    )
+    source = TiffSeriesSource(
+        [path, path],
+        metadata_format="auto",
+        admitted_motor_values=(
+            (str(path), "th", 0.15),
+            (str(path), "th", 0.25),
+        ),
+    )
+
+    assert source.metadata_for(1)["th"] == pytest.approx(0.15)
+    assert source.metadata_for(2)["th"] == pytest.approx(0.25)
+
+
+@pytest.mark.parametrize(
+    ("values", "error"),
+    (
+        (("only-one",), TypeError),
+        (("wrong-path", "th", 0.1), TypeError),
+        (("matching", "th", np.nan), ValueError),
+        (("matching", "th", True), TypeError),
+    ),
+)
+def test_tiff_series_rejects_invalid_admitted_motor_values(
+    tmp_path,
+    values,
+    error,
+):
+    from xrd_tools.sources import TiffSeriesSource
+
+    path = tmp_path / "matching"
+    snapshots = (
+        values
+        if values == ("only-one",)
+        else ((str(path) if values[0] == "matching" else values[0], *values[1:]),)
+    )
+
+    with pytest.raises(error):
+        TiffSeriesSource([path], admitted_motor_values=snapshots)
+
+    with pytest.raises(ValueError, match="cover every TIFF member"):
+        TiffSeriesSource(
+            [path, tmp_path / "second"],
+            admitted_motor_values=((str(path), "th", 0.1),),
+        )
 
 
 def test_raw_series_from_directory_threads_binary_read_parameters(tmp_path):

@@ -288,6 +288,30 @@ def test_event_sink_wrapper_preserves_single_writer_contract():
     assert_streaming_contract(spy, caller, n_frames=4, expect_worker_process=True)
 
 
+def test_event_sink_exposes_worker_process_only_when_inner_sink_owns_it():
+    """A plain sink must not make reduction build a discarded corrected image."""
+    from types import SimpleNamespace
+
+    from xrd_tools.session.scan_session import _EventSink
+
+    plain = _EventSink(SimpleNamespace(), lambda _frame, _reduction: None)
+    assert getattr(plain, "worker_process", None) is None
+
+    calls = []
+    hooked = _EventSink(
+        SimpleNamespace(
+            worker_process=lambda frame, reduction: calls.append(
+                (frame, reduction)
+            )
+        ),
+        lambda _frame, _reduction: None,
+    )
+    worker_process = getattr(hooked, "worker_process", None)
+    assert callable(worker_process)
+    worker_process("frame", "reduction")
+    assert calls == [("frame", "reduction")]
+
+
 # ── adversarial-audit hardening (the event contract must be tamper-evident +
 #    thread-pinned before the xdart bridge builds on it) ───────────────────────
 
@@ -563,6 +587,57 @@ def test_optional_record_store_can_mark_completed_writes_persisted_for_eviction(
     assert store.get(0) is not None and store.get(1) is not None
     assert not store.has_heavy_payload(0)
     assert store.has_heavy_payload(1)
+
+
+def test_buffered_sink_marks_records_only_after_durable_receipt():
+    class BufferedSink:
+        def __init__(self):
+            self.pending: list[int] = []
+            self.receipts: list[int] = []
+
+        def begin(self, scan, plan):
+            return None
+
+        def write(self, frame, reduction):
+            self.pending.append(int(frame.index))
+            if len(self.pending) == 2:
+                self.receipts.extend(self.pending)
+                self.pending.clear()
+
+        def take_persisted_labels(self):
+            labels = tuple(self.receipts)
+            self.receipts.clear()
+            return labels
+
+        def finish(self, result):
+            self.receipts.extend(self.pending)
+            self.pending.clear()
+
+    store = FrameRecordStore(max_heavy_items=None)
+    frames = _frames(3)
+    sink = BufferedSink()
+    sess = ScanSession(
+        ReductionPlan(integration_2d=None),
+        Scan("s", frames, integrator=object()),
+        sink=sink,
+        executor=1,
+        record_store=store,
+        record_store_persisted_on_write=False,
+    )
+    sess.submit(frames[0])
+    assert sess.pause(timeout=10)
+    assert not store.is_persisted(0)
+
+    sess.resume()
+    sess.submit(frames[1])
+    assert sess.pause(timeout=10)
+    assert store.is_persisted(0)
+    assert store.is_persisted(1)
+
+    sess.resume()
+    sess.submit(frames[2])
+    sess.finish()
+    assert store.is_persisted(2)
 
 
 def test_live_store_config_wired_through_scan_session_evicts_persisted_completions():

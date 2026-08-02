@@ -643,14 +643,11 @@ class LiveFrame():
                 mask = self.get_mask(global_mask)
                 gi_mode_1d = kwargs.get('gi_mode_1d', 'q_total')
                 npt_oop = kwargs.get('npt_oop', numpoints)
-                # pyFAI 2025.x's fiber integrators do NOT have CSR fast
-                # paths for the qip/qoop/qtot/exit spaces — passing
-                # method='csr' triggers a "No fast path for space" warning
-                # and falls back to a much slower (and visually incorrect)
-                # code path.  Keep 'no' here.  The standard transmission
-                # integration in frame.integrate_1d (non-GI branch) still
-                # uses csr via bai_1d_args['method'].
-                gi_method = 'no'
+                # Fiber has its own histogram backends; the standard
+                # transmission ``method`` value (normally CSR) does not select
+                # them.  Cython is the GI default, while an explicit
+                # ``gi_method_1d='python'`` retains pyFAI's reference histogram.
+                gi_method = kwargs.get('gi_method_1d', 'cython')
 
                 # Only compute the selected GI 1D mode
                 if gi_mode_1d == 'q_ip':
@@ -810,9 +807,9 @@ class LiveFrame():
                 image_data = (self.map_raw - self.bg_raw) / self.map_norm
                 mask = self.get_mask(global_mask)
                 gi_mode_2d = kwargs.get('gi_mode_2d', 'qip_qoop')
-                # See integrate_1d for why GI sticks with method='no':
-                # pyFAI 2025.x has no CSR fast-path for qip/qoop spaces.
-                gi_method = 'no'
+                # See integrate_1d: GI owns a separate histogram-backend
+                # choice instead of inheriting the standard CSR method.
+                gi_method = kwargs.get('gi_method_2d', 'cython')
 
                 # Only compute the selected GI 2D mode
                 if gi_mode_2d == 'q_chi':

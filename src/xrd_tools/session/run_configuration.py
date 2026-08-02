@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import Any
 
 from xrd_tools.core.scan import SourceSpec
-from xrd_tools.session.gi_motor import pick_default_gi_motor
 from xrd_tools.sources.selection import (
     DirectorySourceSpec,
     normalize_image_source_metadata,
@@ -179,16 +178,16 @@ def resolve_gi_motor(
     raw: str,
     choices: "list[str] | tuple[str, ...] | None",
 ) -> str:
-    """Resolve the effective GI incidence motor ONCE, from a choices list.
+    """Validate the effective GI incidence motor ONCE at the run boundary.
 
     ``raw`` is the operator's stored selection; ``choices`` is the source's real
     motor list (may include ``'Manual'``).  Rule (R4B-8, one policy):
 
     * a deliberate ``'Manual'`` stays ``'Manual'``;
     * a valid explicit selection (``raw`` is a real motor of the source) wins;
-    * otherwise the shared default policy (:func:`pick_default_gi_motor`) picks
-      over the source's real motors — never injecting a motor absent from the
-      source;
+    * a known catalog missing the explicit selection is rejected; it never
+      substitutes another motor and never turns an explicit motor into
+      ``'Manual'``;
     * when no choices list is supplied (``choices is None``) the raw selection
       is honored as-is — the caller could not offer a source motor list to
       verify against, so degrading an explicit motor to Manual would silently
@@ -196,7 +195,8 @@ def resolve_gi_motor(
       empty-and-known (the source was probed and has no real motors); a caller
       that has NOT probed must pass ``None``, not ``()``.
     """
-    raw = str(raw or "Manual")
+    if type(raw) is not str or not raw.strip():
+        raise ValueError("GI incidence motor must be an explicit nonempty value")
     if choices is None:
         return raw
     real = [str(c) for c in choices if str(c) and str(c) != "Manual"]
@@ -204,7 +204,10 @@ def resolve_gi_motor(
         return "Manual"
     if raw in real:
         return raw
-    return pick_default_gi_motor(real)
+    raise ValueError(
+        f"GI metadata motor '{raw}' is not present in the admitted motor "
+        "catalog; choose an available motor or select Manual deliberately."
+    )
 
 
 def _mapping_value(value: Mapping[Any, Any] | None) -> _FrozenValue:
@@ -235,11 +238,16 @@ class GIIntent:
         *,
         choices: "list[str] | tuple[str, ...] | None" = None,
     ) -> "FrozenGIConfiguration":
-        raw = str(self.incidence_motor or "Manual")
+        raw = self.incidence_motor
+        if type(raw) is not str or not raw.strip():
+            raise ValueError("GI incidence motor must be an explicit nonempty value")
+        enabled = bool(self.enabled)
         return FrozenGIConfiguration(
-            enabled=bool(self.enabled),
+            enabled=enabled,
             incidence_motor=raw,
-            resolved_motor=resolve_gi_motor(raw, choices),
+            resolved_motor=(
+                resolve_gi_motor(raw, choices) if enabled else raw
+            ),
             th_val=float(self.th_val),
             sample_orientation=int(self.sample_orientation),
             tilt_angle=float(self.tilt_angle),
@@ -275,10 +283,9 @@ class FrozenGIConfiguration:
     """Deeply immutable grazing-incidence configuration for one run.
 
     ``incidence_motor`` is the operator's RAW selection; ``resolved_motor`` is
-    the effective incidence axis chosen once by the shared policy from the
-    source's motor list (R4B-8).  Every RUN consumer (plan builder, worker,
-    writer provenance) uses the resolved value; the raw selection is retained
-    for provenance/audit.
+    its run-boundary-validated identity.  Every RUN consumer (plan builder,
+    worker, writer provenance) uses that same value.  An explicit metadata
+    motor can never silently become another motor or ``Manual``.
     """
 
     enabled: bool = False
@@ -291,6 +298,11 @@ class FrozenGIConfiguration:
     mode_2d: str = "qip_qoop"
 
     def __post_init__(self) -> None:
+        if (
+            type(self.incidence_motor) is not str
+            or not self.incidence_motor.strip()
+        ):
+            raise ValueError("incidence_motor must be an explicit nonempty value")
         if int(self.sample_orientation) not in range(1, 9):
             raise ValueError("sample_orientation must be between 1 and 8")
         if not math.isfinite(float(self.th_val)):
@@ -301,7 +313,11 @@ class FrozenGIConfiguration:
         # the raw selection so the resolved value is always populated.
         if not str(self.resolved_motor or ""):
             object.__setattr__(
-                self, "resolved_motor", str(self.incidence_motor or "Manual"))
+                self, "resolved_motor", self.incidence_motor)
+        if self.enabled and self.resolved_motor != self.incidence_motor:
+            raise ValueError(
+                "enabled GI raw and resolved motors must be identical"
+            )
 
     @property
     def effective_motor(self) -> str:

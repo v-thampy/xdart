@@ -1368,7 +1368,11 @@ def build_native_int_reduction_plan_from_args(
         npt_oop = _native_pop_first(args_2d, ("npt_oop",), None)
     gi_method = _native_pop_first(args_1d, ("gi_method_1d",), None)
     if gi_method is None:
-        gi_method = _native_pop_first(args_2d, ("gi_method_2d",), "no")
+        gi_method = _native_pop_first(
+            args_2d,
+            ("gi_method_2d",),
+            "cython",
+        )
     gi_method = str(gi_method)
 
     if not gi_enabled:

@@ -123,5 +123,6 @@ def test_plan_from_live_scan_preserves_gi_submodes(tmp_path):
     assert plan.gi.mode_1d.value == "q_oop"
     assert plan.gi.mode_2d.value == "q_chi"
     assert plan.gi.npt_oop == 123
+    assert plan.gi.method == "cython"
     assert plan.integration_1d.npt == 7
     assert plan.integration_2d.npt_rad == 8

@@ -66,6 +66,17 @@ def test_open_source_consumes_frozen_image_series_membership(tmp_path):
     assert tuple(source.files) == paths
 
 
+def test_open_source_consumes_explicit_single_image_marker(tmp_path):
+    selected = tmp_path / "single_0002.tif"
+    selected.write_bytes(b"x")
+
+    source = open_source(single_image_spec(selected))
+
+    assert source.frame_indices == [1]
+    assert tuple(source.files) == (selected,)
+    assert source.name == "single_0002"
+
+
 @pytest.mark.parametrize("suffix", (".h5", ".hdf5", ".nxs", ".cxi"))
 def test_single_image_rejects_container_extensions(suffix, tmp_path):
     with pytest.raises(ValueError, match="Image Series"):

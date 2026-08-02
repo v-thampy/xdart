@@ -22,6 +22,7 @@ from xrd_tools.reduction import (
     ReductionPlan,
     Scan,
     ReductionSession,
+    XYESink,
     run_reduction,
 )
 import xrd_tools.reduction.core as reduction_core
@@ -962,6 +963,66 @@ def test_nexus_sink_writes_frame_results(
         )
 
 
+def test_composite_nexus_sink_prepares_thumbnails_off_writer_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_1d",
+        lambda image, ai, **kwargs: _r1d(float(np.sum(image))),
+    )
+    prepare_threads: list[int] = []
+    write_threads: list[int] = []
+    original_prepare = NexusSink._prepare_frame_thumbnail
+    original_write = NexusSink._write_frame_record
+
+    def observed_prepare(self, frame, *, corrected_image=None):
+        prepare_threads.append(threading.get_ident())
+        return original_prepare(
+            self,
+            frame,
+            corrected_image=corrected_image,
+        )
+
+    def observed_write(self, frame, reduction, *, prepared=None):
+        write_threads.append(threading.get_ident())
+        return original_write(
+            self,
+            frame,
+            reduction,
+            prepared=prepared,
+        )
+
+    monkeypatch.setattr(
+        NexusSink,
+        "_prepare_frame_thumbnail",
+        observed_prepare,
+    )
+    monkeypatch.setattr(NexusSink, "_write_frame_record", observed_write)
+    out = tmp_path / "parallel-thumbnails.nxs"
+    frames = [
+        Frame(index, image=np.full((32, 24), index + 1.0))
+        for index in range(4)
+    ]
+    nexus = NexusSink(out, overwrite=True)
+
+    result = run_reduction(
+        ReductionPlan(integration_2d=None),
+        Scan("scan", frames, integrator=object()),
+        (nexus, MemorySink()),
+        executor=2,
+    )
+
+    assert result.n_processed == 4
+    assert len(prepare_threads) == 4
+    assert len(write_threads) == 4
+    assert set(prepare_threads).isdisjoint(write_threads)
+    with h5py.File(out, "r") as h5:
+        for index in range(4):
+            assert f"entry/frames/frame_{index:04d}/thumbnail" in h5
+
+
 def test_nexus_sink_persists_non_gi_chi_1d_axis(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1112,6 +1173,119 @@ def test_nexus_sink_flush_policy(
             Scan("scan", [Frame(0, image=np.ones((2, 2)))], integrator=object()),
             ReductionPlan(),
         )
+
+
+def test_nexus_sink_batches_integrated_stack_writes_at_flush_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The live sink crosses Python/HDF5 once per dimension per batch."""
+    import xrd_tools.io.nexus as nexus_io
+
+    calls: list[tuple[tuple[int, ...], bool, bool]] = []
+    real_write = nexus_io.write_integrated_stack
+
+    def observed(entry, *, frame_indices, results_1d=None, results_2d=None, **kwargs):
+        calls.append((
+            tuple(int(value) for value in frame_indices),
+            results_1d is not None,
+            results_2d is not None,
+        ))
+        return real_write(
+            entry,
+            frame_indices=frame_indices,
+            results_1d=results_1d,
+            results_2d=results_2d,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(nexus_io, "write_integrated_stack", observed)
+    sink = NexusSink(
+        tmp_path / "batched.nxs",
+        overwrite=True,
+        flush_every=3,
+        complete_record=False,
+        compression=None,
+    )
+    scan = Scan("s", [Frame(i, image=np.ones((2, 2))) for i in range(3)])
+    sink.begin(scan, ReductionPlan())
+    for index in range(2):
+        sink.write(
+            scan.frames[index],
+            reduction_core.FrameReduction(
+                frame_index=index,
+                result_1d=_r1d(float(index)),
+                result_2d=_r2d(float(index)),
+            ),
+        )
+    assert calls == []
+
+    sink.write(
+        scan.frames[2],
+        reduction_core.FrameReduction(
+            frame_index=2,
+            result_1d=_r1d(2.0),
+            result_2d=_r2d(2.0),
+        ),
+    )
+    assert calls == [
+        ((0, 1, 2), True, False),
+        ((0, 1, 2), False, True),
+    ]
+    assert sink.take_persisted_labels() == (0, 1, 2)
+    assert sink.take_persisted_labels() == ()
+    sink.finish(result=None)
+
+
+def test_xye_sink_writes_on_bounded_owned_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    worker_names: list[str] = []
+
+    def observed_write(*_args) -> None:
+        worker_names.append(threading.current_thread().name)
+        entered.set()
+        assert release.wait(timeout=2.0)
+
+    monkeypatch.setattr(reduction_core, "write_xye", observed_write)
+    scan = Scan("scan", [Frame(1, image=np.ones((2, 2)))])
+    sink = XYESink(tmp_path / "xye")
+    sink.begin(scan, ReductionPlan())
+
+    sink.write(
+        scan.frames[0],
+        reduction_core.FrameReduction(1, result_1d=_r1d(1.0)),
+    )
+
+    assert entered.wait(timeout=2.0)
+    assert worker_names == ["xrd-tools-xye-writer"]
+    release.set()
+    sink.finish(result=None)
+
+
+def test_xye_sink_reports_failure_once_then_allows_cleanup_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def fail_write(*_args) -> None:
+        raise OSError("xye write failed")
+
+    monkeypatch.setattr(reduction_core, "write_xye", fail_write)
+    scan = Scan("scan", [Frame(1, image=np.ones((2, 2)))])
+    sink = XYESink(tmp_path / "xye")
+    sink.begin(scan, ReductionPlan())
+    sink.write(
+        scan.frames[0],
+        reduction_core.FrameReduction(1, result_1d=_r1d(1.0)),
+    )
+
+    with pytest.raises(OSError, match="xye write failed"):
+        sink.finish(result=None)
+
+    sink.abort(result=None)
 
 
 def test_existing_notebook_import_surface_still_imports() -> None:
