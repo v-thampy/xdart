@@ -14,6 +14,7 @@ import sys
 
 import pytest
 
+from xrd_tools.core.metadata import resolve_monitor_norm
 from xrd_tools.session.scan_norm import (
     ScanNormAggregate,
     accepts_norm_aggregate,
@@ -46,8 +47,39 @@ def test_fold_accumulates_finite_positive_channels():
     agg = fold_norm_metadata(agg, {"Monitor": 2.0, "i0": 4.5})
     agg = fold_norm_metadata(agg, {"Monitor": 3.0, "i0": 0.5})
     assert agg.row_count == 2
-    assert agg.channels["Monitor"] == (5.0, 2)
+    assert agg.channels["monitor"] == (5.0, 2)
     assert agg.channels["i0"] == (5.0, 2)
+
+
+def test_fold_canonicalizes_case_aliases_across_rows():
+    agg = empty_norm_aggregate(ACQ_IDENTITY)
+    agg = fold_norm_metadata(agg, {"Monitor": 2.0})
+    agg = fold_norm_metadata(agg, {"monitor": 3.0})
+
+    assert dict(agg.channels) == {"monitor": (5.0, 2)}
+    assert channel_is_partial(agg, "monitor") is False
+
+
+def test_fold_counts_same_row_case_alias_once_via_the_existing_kernel():
+    metadata = {"Monitor": 2.0, "monitor": 3.0}
+    expected = resolve_monitor_norm(metadata, "monitor")
+    assert expected == 2.0  # the shared kernel's deterministic first match
+
+    agg = fold_norm_metadata(empty_norm_aggregate(ACQ_IDENTITY), metadata)
+
+    assert dict(agg.channels) == {"monitor": (expected, 1)}
+
+
+def test_canonical_channel_order_is_deterministic():
+    left = fold_norm_metadata(
+        empty_norm_aggregate(ACQ_IDENTITY), {"Z": 1.0, "a": 2.0}
+    )
+    right = fold_norm_metadata(
+        empty_norm_aggregate(ACQ_IDENTITY), {"a": 2.0, "Z": 1.0}
+    )
+
+    assert tuple(left.channels) == ("a", "z")
+    assert tuple(right.channels) == tuple(left.channels)
 
 
 def test_fold_applies_the_absent_rule_per_kernel():
@@ -73,11 +105,11 @@ def test_fold_with_empty_or_none_metadata_counts_the_row_only():
 def test_channel_appears_only_after_first_valid_row_and_partial_rule():
     agg = empty_norm_aggregate(ACQ_IDENTITY)
     agg = fold_norm_metadata(agg, {"Monitor": 0.0})  # invalid -> no channel
-    assert "Monitor" not in agg.channels
+    assert "monitor" not in agg.channels
     agg = fold_norm_metadata(agg, {"Monitor": 1.5})
-    assert agg.channels["Monitor"] == (1.5, 1)
+    assert agg.channels["monitor"] == (1.5, 1)
     assert agg.row_count == 2
-    assert channel_is_partial(agg, "Monitor") is True
+    assert channel_is_partial(agg, "monitor") is True
     agg2 = fold_norm_metadata(
         fold_norm_metadata(empty_norm_aggregate(ACQ_IDENTITY), {"m": 1.0}),
         {"m": 2.0},
@@ -180,10 +212,9 @@ def test_fold_rejects_foreign_row_types_loudly():
 
 
 def test_case_insensitive_kernel_reuse():
-    # resolve_monitor_norm resolves the exact numeric key case-insensitively;
-    # the aggregate keys stay the producer's exact metadata keys.
+    # Aggregate keys use the same lowercase equivalence as the shared kernel.
     agg = fold_norm_metadata(empty_norm_aggregate(ACQ_IDENTITY), {"MONITOR": 2.0})
-    assert agg.channels["MONITOR"] == (2.0, 1)
+    assert agg.channels["monitor"] == (2.0, 1)
 
 
 def test_import_purity_no_qt_h5py_pandas():

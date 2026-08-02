@@ -4,7 +4,7 @@
 ``ScanNormAggregate`` is the headless shared value behind normalization
 channel choices: an exact display-context/scan identity, a monotonic
 producer revision, ``row_count``, and per-channel
-``{key: (finite_sum, finite_count)}`` statistics folded under the one
+``{canonical_key: (finite_sum, finite_count)}`` statistics folded under the one
 ABSENT rule (:func:`xrd_tools.core.metadata.resolve_monitor_norm` — a row
 contributes to a channel only when the kernel yields a finite positive
 value; every folded row contributes to ``row_count``).
@@ -46,6 +46,12 @@ __all__ = [
 _IDENTITY_PRIMITIVES = (str, int, float, bool, type(None))
 
 
+def _canonical_channel_key(key: str) -> str:
+    """The exact case-equivalence spelling used by ``resolve_monitor_norm``."""
+
+    return key.lower()
+
+
 def _validated_identity(identity: Any) -> tuple[Any, ...]:
     if isinstance(identity, (str, bytes)) or not isinstance(identity, Sequence):
         raise TypeError(
@@ -66,10 +72,12 @@ def _validated_identity(identity: Any) -> tuple[Any, ...]:
 class ScanNormAggregate:
     """Immutable per-identity normalization statistics.
 
-    ``channels`` maps the producer's exact metadata key to
+    ``channels`` maps the kernel's deterministic lowercase metadata key to
     ``(finite_sum, finite_count)`` where ``1 <= finite_count <= row_count``
     and ``finite_sum`` is a finite positive float; a channel key exists
-    only once at least one row passed the ABSENT-rule kernel.
+    only once at least one row passed the ABSENT-rule kernel.  Metadata keys
+    that differ only by the kernel's case-insensitive equivalence belong to
+    one channel and contribute at most once per row.
     """
 
     identity: tuple[Any, ...]
@@ -91,8 +99,14 @@ class ScanNormAggregate:
             )
         frozen: dict[str, tuple[float, int]] = {}
         for key, stat in self.channels.items():
-            if not isinstance(key, str) or not key:
+            if not isinstance(key, str) or not key.strip():
                 raise TypeError(f"channel keys must be non-empty str, got {key!r}")
+            canonical_key = _canonical_channel_key(key)
+            if canonical_key in frozen:
+                raise ValueError(
+                    "channel keys must be unique under case-insensitive "
+                    f"normalization, got duplicate {key!r}"
+                )
             try:
                 total, count = stat
             except (TypeError, ValueError):
@@ -111,8 +125,12 @@ class ScanNormAggregate:
                     f"channel {key!r} finite_count must be in 1..row_count "
                     f"({self.row_count}), got {count}"
                 )
-            frozen[key] = (total, count)
-        object.__setattr__(self, "channels", MappingProxyType(frozen))
+            frozen[canonical_key] = (total, count)
+        object.__setattr__(
+            self,
+            "channels",
+            MappingProxyType(dict(sorted(frozen.items()))),
+        )
 
 
 def empty_norm_aggregate(identity: Sequence[Any]) -> ScanNormAggregate:
@@ -127,7 +145,7 @@ def fold_norm_metadata(
     """Fold ONE row's metadata; returns a new value at the SAME revision.
 
     Every row increments ``row_count``.  A channel accumulates only when
-    :func:`resolve_monitor_norm` yields a value for that exact numeric key
+    :func:`resolve_monitor_norm` yields a value for that canonical numeric key
     (the one ABSENT rule: absent, nonnumeric, non-finite, zero and
     negative all contribute nothing).
     """
@@ -137,7 +155,10 @@ def fold_norm_metadata(
             f"metadata must be a mapping or None, got {type(metadata).__name__}"
         )
     folded = dict(aggregate.channels)
-    for key in numeric_metadata(metadata):
+    canonical_keys = {
+        _canonical_channel_key(key) for key in numeric_metadata(metadata)
+    }
+    for key in sorted(canonical_keys):
         value = resolve_monitor_norm(metadata, key)
         if value is None:
             continue
