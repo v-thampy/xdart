@@ -1,9 +1,4 @@
-"""Typed Browse preview lifecycle around one admitted hydration owner.
-
-The one-read Browse resolution and its request construction live in
-``ContextProjection.resolve_browse``; this module owns only the owner-bound
-repaint/polling/terminal queries and the release path.
-"""
+"""Owner-bound Browse repaint, polling, terminal, and release lifecycle."""
 
 from __future__ import annotations
 
