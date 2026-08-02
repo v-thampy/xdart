@@ -91,8 +91,8 @@ class MaskState:
         if any(type(value) is not int or value <= 0 for value in shape):
             raise ValueError("mask shape entries must be positive integers")
         object.__setattr__(self, "shape", shape)
-        if self.status is FactStatus.PRESENT and not (self.source_uri or self.sha256):
-            raise ValueError("a present mask needs a source or digest")
+        if self.status is FactStatus.PRESENT and not self.sha256:
+            raise ValueError("a present mask needs a content digest")
     @classmethod
     def absent(cls) -> MaskState:
         return cls()

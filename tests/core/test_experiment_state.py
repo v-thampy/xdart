@@ -210,6 +210,15 @@ def test_energy_status_cannot_hide_evidence_or_an_unqualified_selection() -> Non
         )
 
 
+def test_present_mask_requires_content_digest() -> None:
+    with pytest.raises(ValueError, match="digest"):
+        MaskState(source_uri="mask.edf", status=FactStatus.PRESENT)
+
+    evidence = MaskState(source_uri="mask.edf", status=FactStatus.CONFLICT)
+    assert evidence.sha256 == ""
+    assert evidence.status is FactStatus.CONFLICT
+
+
 def test_schema_version_rejects_bool_alias_for_one() -> None:
     with pytest.raises(ValueError):
         dataclasses.replace(_state(), schema_version=True)
@@ -360,6 +369,16 @@ def test_editor_mask_proposal_changes_only_mask_and_one_revision() -> None:
     assert outcome.state.energy is initial.energy
     assert outcome.state.geometry is initial.geometry
     assert outcome.state.sample is initial.sample
+
+    changed_bytes = dataclasses.replace(mask, sha256="n" * 64)
+    changed = editor.propose_mask(
+        changed_bytes,
+        experiment_id=initial.experiment_id,
+        expected_revision=outcome.state.revision,
+    )
+    assert changed.status is CasStatus.ACCEPTED
+    assert changed.state.calibration.mask.source_uri == mask.source_uri
+    assert changed.state.content_fingerprint != outcome.state.content_fingerprint
 
 
 def test_q3_modules_keep_the_frozen_import_and_owner_boundary() -> None:

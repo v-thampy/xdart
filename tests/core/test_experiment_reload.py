@@ -301,6 +301,42 @@ def test_partial_reload_does_not_relabel_run_fingerprint_as_experiment_content(
     assert result.content_fingerprint is None
 
 
+def test_partial_source_only_mask_is_conflicting_evidence_not_present(
+    tmp_path: Path,
+) -> None:
+    record = tmp_path / "partial-source-only-mask.nxs"
+    poni_values = {
+        "dist": 0.2,
+        "poni1": 0.01,
+        "poni2": 0.02,
+        "rot1": 0.0,
+        "rot2": 0.0,
+        "rot3": 0.0,
+        "wavelength_m": 1.0e-10,
+    }
+    with h5py.File(record, "w") as handle:
+        write_provenance(
+            handle,
+            config={
+                "run_configuration": {
+                    "mask_file": "mask.edf",
+                    "scientific_signature": {
+                        "accepted_scientific_assets": {
+                            "poni_values": poni_values,
+                        },
+                    },
+                },
+            },
+        )
+
+    result = LegacyRecordAdapter().read(record)
+    assert result.status is ReloadStatus.PARTIAL
+    assert result.calibration is not None
+    assert result.calibration.mask.status is FactStatus.CONFLICT
+    assert result.calibration.mask.source_uri == "mask.edf"
+    assert result.calibration.mask.sha256 == ""
+
+
 def test_malformed_exact_projection_fails_closed(tmp_path: Path) -> None:
     state = _exact_state()
     payload = state.to_provenance()

@@ -96,8 +96,9 @@ def _calibration(run: Mapping[str, Any]) -> CalibrationState | None:
     if wavelength is None or any(value is None for value in numbers):
         return None
     digest, source = str(assets.get("mask_sha256") or ""), str(run.get("mask_file") or "")
-    mask = (MaskState(source_uri=source, sha256=digest, status=FactStatus.PRESENT)
-            if source or digest else MaskState.absent())
+    mask = (MaskState(source_uri=source, sha256=digest, status=(
+        FactStatus.PRESENT if digest else FactStatus.CONFLICT
+    )) if source or digest else MaskState.absent())
     return CalibrationState(
         values=PoniValues(*numbers, wavelength),
         detector_id=str(raw.get("detector") or ""),
