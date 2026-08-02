@@ -295,8 +295,14 @@ def _read_thumbnail_direct(path, frame) -> "np.ndarray | None":
         return None
 
 
-def load_processed_raw_or_thumbnail(path, frame, *, source_root=None,
-                                    strict=None) -> RawFrameResult:
+def load_processed_raw_or_thumbnail(
+    path,
+    frame,
+    *,
+    source_root=None,
+    strict=None,
+    preserve_raw_dtype: bool = False,
+) -> RawFrameResult:
     """For a processed ``.nxs``: return the full-resolution raw image for a
     frame **label** if the per-frame source master resolves, else the
     dequantized thumbnail, else nothing — recording which in ``source``.
@@ -313,6 +319,9 @@ def load_processed_raw_or_thumbnail(path, frame, *, source_root=None,
     (an analysis caller that must have the genuine full-res raw).  Note the
     headless FrameSource raw path is strict by a different mechanism — it calls
     ``get_raw_frame(allow_thumbnail=False)`` directly and is untouched here.
+    ``preserve_raw_dtype`` preserves native integer dtype only for a genuine
+    raw result so presentation masking can recover the detector ceiling.
+    Thumbnails and the default API remain floating point.
     """
     from xrd_tools.io.read import get_raw_frame
     from xrd_tools.core.strictness import StrictPolicy
@@ -322,9 +331,19 @@ def load_processed_raw_or_thumbnail(path, frame, *, source_root=None,
     frame = int(frame)
     # Strict raw first (no thumbnail) so we know it's genuinely full-res.
     try:
-        img = get_raw_frame(path, frame, allow_thumbnail=False, source_root=source_root)
-        return RawFrameResult(image=np.asarray(img, dtype=float),
-                              source="raw", frame=frame)
+        img = get_raw_frame(
+            path,
+            frame,
+            allow_thumbnail=False,
+            source_root=source_root,
+            preserve_dtype=preserve_raw_dtype,
+        )
+        raw = (
+            np.asarray(img)
+            if preserve_raw_dtype
+            else np.asarray(img, dtype=float)
+        )
+        return RawFrameResult(image=raw, source="raw", frame=frame)
     except Exception:
         if strict.thumbnail_fallback:
             # D7 loud: surface the missing full-res raw (with read.py's

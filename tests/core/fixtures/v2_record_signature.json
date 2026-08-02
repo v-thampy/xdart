@@ -61,6 +61,7 @@
  "entry/frames/frame_0000/thumbnail": {
   "attrs": {
    "dtype": "86768c6a5f7b7aad",
+   "mask_baked": "4bf5122f344554c5",
    "vmax": "e813a4d5118962f7",
    "vmin": "4940eeb364bd6079"
   },
@@ -116,6 +117,7 @@
  "entry/frames/frame_0001/thumbnail": {
   "attrs": {
    "dtype": "86768c6a5f7b7aad",
+   "mask_baked": "4bf5122f344554c5",
    "vmax": "3b7ecd21e834871e",
    "vmin": "777e00243be2052f"
   },
@@ -171,6 +173,7 @@
  "entry/frames/frame_0002/thumbnail": {
   "attrs": {
    "dtype": "86768c6a5f7b7aad",
+   "mask_baked": "4bf5122f344554c5",
    "vmax": "f7d1d1ac2d1c6982",
    "vmin": "9ef56932ab92571b"
   },

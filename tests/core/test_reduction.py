@@ -1000,6 +1000,8 @@ def test_nexus_sink_atomic_overwrite_preserves_target_on_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import xrd_tools.io.nexus as nexus_io
+
     monkeypatch.setattr(
         reduction_core,
         "integrate_1d",
@@ -1009,7 +1011,7 @@ def test_nexus_sink_atomic_overwrite_preserves_target_on_failure(
     def fail_write(*args, **kwargs):
         raise RuntimeError("simulated write failure")
 
-    monkeypatch.setattr(reduction_core, "write_nexus_frame", fail_write)
+    monkeypatch.setattr(nexus_io, "write_integrated_stack", fail_write)
     out = tmp_path / "scan.nxs"
     original = b"old complete file"
     out.write_bytes(original)
@@ -1066,6 +1068,10 @@ def test_nexus_sink_flush_policy(
     class FakeH5:
         def __init__(self):
             self._h5 = h5py.File(tmp_path / "flush_policy_fake.h5", "w")
+            self._h5.require_group("entry")
+
+        def __getitem__(self, key):
+            return self._h5[key]
 
         def require_group(self, *args, **kwargs):
             return self._h5.require_group(*args, **kwargs)
@@ -1079,8 +1085,6 @@ def test_nexus_sink_flush_policy(
             self._h5.close()
 
     monkeypatch.setattr(reduction_core, "open_nexus_writer", lambda *a, **k: FakeH5())
-    monkeypatch.setattr(reduction_core, "write_nexus_frame", lambda *a, **k: None)
-
     result = run_reduction(
         ReductionPlan(),
         Scan(

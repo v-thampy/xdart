@@ -1,8 +1,8 @@
-"""6a gate: the refactored writer produces a content-identical v2 record.
+"""Ratified v2 writer content and storage-layout gate.
 
-The committed fixture is the content signature of a deterministic scan
-written by the PRE-6a (all-xdart) writer.  Any 6a step that changes what
-lands on disk for an identical scan fails here.
+The committed fixture began as the PRE-6a all-xdart signature. Intentional,
+backward-readable schema additions are folded into it only after explicit
+boundary review. Any unreviewed change to an identical scan still fails here.
 """
 import json
 from pathlib import Path
@@ -11,10 +11,10 @@ import pytest
 
 pytest.importorskip("xdart", reason="gate exercises the GUI-side writer")
 
-FIXTURE = Path(__file__).parent / "fixtures" / "v2_record_signature_pre6a.json"
+FIXTURE = Path(__file__).parent / "fixtures" / "v2_record_signature.json"
 
 
-def test_v2_record_content_identical_to_pre6a(tmp_path):
+def test_v2_record_content_matches_ratified_signature(tmp_path):
     from tests.core._v2_record_fixture import write_reference_scan
     from tests.core.h5sig import h5_content_signature
 
