@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -60,3 +62,43 @@ def test_canonical_scan_rejects_duplicate_indices():
 
     with pytest.raises(ValueError, match="duplicate frame indices"):
         Scan("dupes", [ScanFrame(1, image=np.zeros((1, 1))), ScanFrame(1, image=np.ones((1, 1)))])
+
+
+def test_scan_metadata_delegates_wavelength_conversion_to_core_energy(monkeypatch):
+    from xrd_tools.core import energy as core_energy
+    from xrd_tools.core.scan import Scan, ScanFrame
+
+    calls: list[float] = []
+
+    def inverse(wavelength_m: float) -> float:
+        calls.append(wavelength_m)
+        return 43210.0
+
+    monkeypatch.setattr(core_energy, "wavelength_m_to_energy_eV", inverse)
+    scan = Scan(
+        "energy",
+        [ScanFrame(1, image=np.ones((1, 1)))],
+        wavelength=1.25,
+    )
+
+    metadata = scan.to_metadata()
+    assert metadata is not None
+    assert metadata.energy == pytest.approx(43.21)
+    assert calls == [pytest.approx(1.25e-10)]
+
+
+def test_scan_metadata_retires_approximate_energy_literal():
+    from xrd_tools.core.scan import Scan, ScanFrame
+
+    scan = Scan(
+        "energy",
+        [ScanFrame(1, image=np.ones((1, 1)))],
+        wavelength=1.0,
+    )
+    metadata = scan.to_metadata()
+    assert metadata is not None
+    assert metadata.energy == pytest.approx(12.39841984, rel=1e-12)
+
+    source = (Path(__file__).resolve().parents[2]
+              / "src/xrd_tools/core/scan.py").read_text()
+    assert "12.398 / wavelength_A" not in source

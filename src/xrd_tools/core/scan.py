@@ -16,6 +16,8 @@ from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 
+from xrd_tools.core import energy as _energy
+
 # NOTE: keep this module import-light (no h5py/fabio/pyFAI/Qt): it is part
 # of the Qt-free core-contracts surface that pure display-logic / CI
 # environments import.  Heavy readers (e.g. xrd_tools.io.image.read_image)
@@ -337,7 +339,10 @@ class Scan:
 
         energy_keV = self.energy
         if energy_keV is None and wavelength_A and wavelength_A > 0:
-            energy_keV = 12.398 / wavelength_A
+            energy_keV = (
+                _energy.wavelength_m_to_energy_eV(wavelength_A * 1.0e-10)
+                / 1000.0
+            )
         if energy_keV is None or wavelength_A is None:
             return None
 

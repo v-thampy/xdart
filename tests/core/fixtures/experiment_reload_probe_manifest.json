@@ -1,0 +1,2413 @@
+{
+  "records": [
+    {
+      "record_id": "record-0001",
+      "relative_path": "test_data/test_relative_path/xdart_processed_data/LaB6_detx54_detyn1p5_eta3_scan001.nxs"
+    },
+    {
+      "record_id": "record-0002",
+      "relative_path": "test_data/test_relative_path/xdart_processed_data/eiger_S069Ta_redo_eta2p0_1_scan001.nxs"
+    },
+    {
+      "record_id": "record-0003",
+      "relative_path": "tmp/vnext-live-20260727-201103-XtKFGo/gi-processed/num_2_716V_5ms_sfpx_70p28_halpha_0p04_00001.nxs"
+    },
+    {
+      "record_id": "record-0004",
+      "relative_path": "tmp/vnext-live-20260727-201103-XtKFGo/gi-processed/num_2_716V_5ms_sfpx_70p62_halpha_0p04_00001.nxs"
+    },
+    {
+      "record_id": "record-0005",
+      "relative_path": "tmp/vnext-live-20260727-201103-XtKFGo/gi-processed/num_2_716V_5ms_sfpx_70p97_halpha_0p04_00001.nxs"
+    },
+    {
+      "record_id": "record-0006",
+      "relative_path": "tmp/vnext-live-20260727-201103-XtKFGo/gi-processed/num_2_716V_5ms_sfpx_71p31_halpha_0p04_00001.nxs"
+    },
+    {
+      "record_id": "record-0007",
+      "relative_path": "tmp/vnext-live-20260727-201103-XtKFGo/gi-processed/num_2_716V_5ms_sfpx_71p66_halpha_0p04_00001.nxs"
+    },
+    {
+      "record_id": "record-0008",
+      "relative_path": "tmp/vnext-live-20260727-201553-fbqopk/eiger-processed/LaB6_detx54_detyn1p5_eta3_scan001.nxs"
+    },
+    {
+      "record_id": "record-0009",
+      "relative_path": "tmp/vnext-live-20260727-202023-mo8xoD/eiger-processed/Eiger_NbN_1_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0010",
+      "relative_path": "tmp/vnext-live-20260727-202023-mo8xoD/eiger-processed/Eiger_NbN_2_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0011",
+      "relative_path": "tmp/vnext-live-20260727-202023-mo8xoD/eiger-processed/eiger_w2s3_test_2_scan001.nxs"
+    },
+    {
+      "record_id": "record-0012",
+      "relative_path": "tmp/vnext-live-20260727-202023-mo8xoD/eiger-processed/eiger_w2s4_1_eta_0p118_scan002.nxs"
+    },
+    {
+      "record_id": "record-0013",
+      "relative_path": "tmp/codex-8241c3fc-review-controls-basetemp/test_source_card_mounts_shared0/processed.nxs"
+    },
+    {
+      "record_id": "record-0014",
+      "relative_path": "tmp/codex-8241c3fc-review-controls-basetemp/test_controls_panel_v2_loaded_0/project/processed.nxs"
+    },
+    {
+      "record_id": "record-0015",
+      "relative_path": "tmp/codex-8241c3fc-review-controls-basetemp/test_controls_panel_v2_append_0/project/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0016",
+      "relative_path": "tmp/codex-8241c3fc-review-controls-basetemp/test_controls_panel_v2_append_1/project/xdart_processed_data/displayed.nxs"
+    },
+    {
+      "record_id": "record-0017",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_historical_dense_integer_0/processed_uint16.nxs"
+    },
+    {
+      "record_id": "record-0018",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_historical_dense_integer_1/processed_uint32.nxs"
+    },
+    {
+      "record_id": "record-0019",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_multi_output_run_has_one_0/processed/first.nxs"
+    },
+    {
+      "record_id": "record-0020",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_multi_output_run_has_one_0/processed/second.nxs"
+    },
+    {
+      "record_id": "record-0021",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_delayed_frame_event_route0/processed/first.nxs"
+    },
+    {
+      "record_id": "record-0022",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_delayed_frame_event_route0/processed/second.nxs"
+    },
+    {
+      "record_id": "record-0023",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_multi_output_gi_repeated_0/processed/first.nxs"
+    },
+    {
+      "record_id": "record-0024",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_multi_output_gi_repeated_0/processed/second.nxs"
+    },
+    {
+      "record_id": "record-0025",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_eiger_outputs_with_repeat0/processed/Eiger_NbN_1_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0026",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_eiger_outputs_with_repeat0/processed/Eiger_NbN_2_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0027",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_every_public_projection_h0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0028",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_every_public_projection_h0/c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0029",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_every_public_projection_h0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0030",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_page_polls_cancelled_c_re0/c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0031",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_page_polls_cancelled_c_re0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0032",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_page_polls_cancelled_c_re0/a/project/processed/run.second.nxs"
+    },
+    {
+      "record_id": "record-0033",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_select_scan_b_release_fai0/browse-b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0034",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_select_scan_b_release_fai0/browse-c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0035",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_select_scan_b_release_fai0/acquisition-a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0036",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_j3_real_mounted_run_pause2/eiger-processed/Eiger_NbN_1_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0037",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_j3_real_mounted_run_pause2/eiger-processed/Eiger_NbN_2_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0038",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_j3_mounted_qualified_xye_0/acquisition/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0039",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_j0_01_run_mounts_exact_a_0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0040",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_j0_02_browser_footer_shar0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0041",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_j0_02_browser_footer_shar0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0042",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_j0_03_pause_closes_submis0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0043",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_j0_04_browse_b_is_off_gui0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0044",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_j0_04_browse_b_is_off_gui0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0045",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_j0_05_resume_is_an_a_poin0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0046",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_j0_05_resume_is_an_a_poin0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0047",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_j0_06_stop_is_fail_closed0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0048",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_j0_06_stop_is_fail_closed0/running/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0049",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_j0_06_stop_is_fail_closed0/paused/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0050",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_j0_06_stop_is_fail_closed0/browse/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0051",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_j0_06_stop_is_fail_closed0/resumed/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0052",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_j0_07_b_to_c_releases_b_b0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0053",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_j0_07_b_to_c_releases_b_b0/c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0054",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_j0_07_b_to_c_releases_b_b0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0055",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering-basetemp/test_j0_08_evicted_hydration_i0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0056",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_historical_dense_integer_0/processed_uint16.nxs"
+    },
+    {
+      "record_id": "record-0057",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_historical_dense_integer_1/processed_uint32.nxs"
+    },
+    {
+      "record_id": "record-0058",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_multi_output_run_has_one_0/processed/first.nxs"
+    },
+    {
+      "record_id": "record-0059",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_multi_output_run_has_one_0/processed/second.nxs"
+    },
+    {
+      "record_id": "record-0060",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_delayed_frame_event_route0/processed/first.nxs"
+    },
+    {
+      "record_id": "record-0061",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_delayed_frame_event_route0/processed/second.nxs"
+    },
+    {
+      "record_id": "record-0062",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_multi_output_gi_repeated_0/processed/first.nxs"
+    },
+    {
+      "record_id": "record-0063",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_multi_output_gi_repeated_0/processed/second.nxs"
+    },
+    {
+      "record_id": "record-0064",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_eiger_outputs_with_repeat0/processed/Eiger_NbN_1_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0065",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_eiger_outputs_with_repeat0/processed/Eiger_NbN_2_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0066",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_every_public_projection_h0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0067",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_every_public_projection_h0/c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0068",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_every_public_projection_h0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0069",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_page_polls_cancelled_c_re0/c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0070",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_page_polls_cancelled_c_re0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0071",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_page_polls_cancelled_c_re0/a/project/processed/run.second.nxs"
+    },
+    {
+      "record_id": "record-0072",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_select_scan_b_release_fai0/browse-b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0073",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_select_scan_b_release_fai0/browse-c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0074",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_select_scan_b_release_fai0/acquisition-a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0075",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j3_real_mounted_run_pause2/eiger-processed/Eiger_NbN_1_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0076",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j3_real_mounted_run_pause2/eiger-processed/Eiger_NbN_2_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0077",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j3_mounted_qualified_xye_0/acquisition/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0078",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j0_01_run_mounts_exact_a_0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0079",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j0_02_browser_footer_shar0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0080",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j0_02_browser_footer_shar0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0081",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j0_03_pause_closes_submis0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0082",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j0_04_browse_b_is_off_gui0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0083",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j0_04_browse_b_is_off_gui0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0084",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j0_05_resume_is_an_a_poin0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0085",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j0_05_resume_is_an_a_poin0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0086",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j0_06_stop_is_fail_closed0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0087",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j0_06_stop_is_fail_closed0/running/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0088",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j0_06_stop_is_fail_closed0/paused/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0089",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j0_06_stop_is_fail_closed0/browse/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0090",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j0_06_stop_is_fail_closed0/resumed/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0091",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j0_07_b_to_c_releases_b_b0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0092",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j0_07_b_to_c_releases_b_b0/c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0093",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j0_07_b_to_c_releases_b_b0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0094",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j0_08_evicted_hydration_i0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0095",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j0_09_equal_foreign_stale0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0096",
+      "relative_path": "tmp/codex-8241c3fc-review-scattering2-basetemp/test_j0_11_relative_raw_path_s0/relocated/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0097",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw15/test_processed_scan_property0/scan.nxs"
+    },
+    {
+      "record_id": "record-0098",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw15/test_processed_scan_property_n0/old.nxs"
+    },
+    {
+      "record_id": "record-0099",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw15/test_processed_scan_refresh_re0/scan.nxs"
+    },
+    {
+      "record_id": "record-0100",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw14/test_processed_output_via_real0/processed.nxs"
+    },
+    {
+      "record_id": "record-0101",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw5/test_headless_run_writes_compl0/relocated/processed/scan.nxs"
+    },
+    {
+      "record_id": "record-0102",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw14/test_processed_output_and_inva0/f0.nxs"
+    },
+    {
+      "record_id": "record-0103",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw14/test_processed_output_and_inva0/f1.nxs"
+    },
+    {
+      "record_id": "record-0104",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw13/test_classify_processed_with_m0/scan.nxs"
+    },
+    {
+      "record_id": "record-0105",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw9/test_processed_scan_source_con0/proj/processed/scan.nxs"
+    },
+    {
+      "record_id": "record-0106",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw2/test_process_series0/processed/scan1_processed.nxs"
+    },
+    {
+      "record_id": "record-0107",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw2/test_process_series0/processed/scan2_processed.nxs"
+    },
+    {
+      "record_id": "record-0108",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw13/test_load_processed_returns_ra0/scan.nxs"
+    },
+    {
+      "record_id": "record-0109",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw13/test_load_processed_falls_back0/thumb_only.nxs"
+    },
+    {
+      "record_id": "record-0110",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw13/test_load_processed_none_when_0/barren.nxs"
+    },
+    {
+      "record_id": "record-0111",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw13/test_load_processed_direct_thu0/thumb_only.nxs"
+    },
+    {
+      "record_id": "record-0112",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw14/test_get_raw_frame_resolves_re0/processed/scan.nxs"
+    },
+    {
+      "record_id": "record-0113",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw11/test_session_persists_index_an0/processed_1.nxs"
+    },
+    {
+      "record_id": "record-0114",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw14/test_processed_nexus_source_lo0/processed/scan.nxs"
+    },
+    {
+      "record_id": "record-0115",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw5/test_processed_never_resolves_0/processed.nxs"
+    },
+    {
+      "record_id": "record-0116",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw14/test_processed_nexus_source_so0/scan.nxs"
+    },
+    {
+      "record_id": "record-0117",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw14/test_harvest_from_processed_ne0/processed/scan.nxs"
+    },
+    {
+      "record_id": "record-0118",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw14/test_harvest_from_processed_ne0/stitch.nxs"
+    },
+    {
+      "record_id": "record-0119",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw14/test_open_scan_iter_chunks_reu0/processed/scan.nxs"
+    },
+    {
+      "record_id": "record-0120",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw14/test_processed_nexus_source_lo1/scan.nxs"
+    },
+    {
+      "record_id": "record-0121",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw9/test_nxprocess_attr_set0/out.nxs"
+    },
+    {
+      "record_id": "record-0122",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw12/test_get_raw_frame_resolves_si0/processed/scan.nxs"
+    },
+    {
+      "record_id": "record-0123",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw12/test_read_image_rejects_proces0/processed.nxs"
+    },
+    {
+      "record_id": "record-0124",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw2/test_directory_watcher_detects0/watch_detect_out/new_frame_0000_processed.nxs"
+    },
+    {
+      "record_id": "record-0125",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw2/test_is_bluesky_nxwriter_false1/processed.nxs"
+    },
+    {
+      "record_id": "record-0126",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw9/test_get_raw_frame_resolves_ab0/processed/scan.nxs"
+    },
+    {
+      "record_id": "record-0127",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw2/test_alternate_entry_processed0/processed_entry1.nxs"
+    },
+    {
+      "record_id": "record-0128",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw14/test_source_readiness_processe0/scan.nxs"
+    },
+    {
+      "record_id": "record-0129",
+      "relative_path": "tmp/codex-8241c3fc-review-core-basetemp/popen-gw14/test_processed_nexus_source_re0/processed.nxs"
+    },
+    {
+      "record_id": "record-0130",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_source_card_mounts_shared0/processed.nxs"
+    },
+    {
+      "record_id": "record-0131",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_controls_panel_v2_loaded_0/project/processed.nxs"
+    },
+    {
+      "record_id": "record-0132",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_controls_panel_v2_append_0/project/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0133",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_controls_panel_v2_append_1/project/xdart_processed_data/displayed.nxs"
+    },
+    {
+      "record_id": "record-0134",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_processed_record_caps_rea0/scan.nxs"
+    },
+    {
+      "record_id": "record-0135",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_processed_reachability_ho0/records/browsed.nxs"
+    },
+    {
+      "record_id": "record-0136",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_active_run_output_keeps_r0/processed_out/browsed.nxs"
+    },
+    {
+      "record_id": "record-0137",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_same_stem_cross_root_publ0/processed/B/scan_0001.nxs"
+    },
+    {
+      "record_id": "record-0138",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_acquisition_master_public0/processed_out/browsed.nxs"
+    },
+    {
+      "record_id": "record-0139",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_one_based_record_provenan0/processed_out/browsed.nxs"
+    },
+    {
+      "record_id": "record-0140",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_live_xye_last_folder_appe0/processed/older_scan.nxs"
+    },
+    {
+      "record_id": "record-0141",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_thumbnail_preview_opens_p0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0142",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_no_thumbnail_preview_read0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0143",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_no_thumbnail_without_exac0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0144",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_saturation_projection_use0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0145",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_detector_value_toggle_use0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0146",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_upper_threshold_is_indepe0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0147",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_full_is_distinct_after_th0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0148",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_preview_refuses_numeric_s0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0149",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_missing_or_negative_detec0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0150",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_missing_or_negative_detec1/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0151",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_one_frame_preview_reads_o0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0152",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_preview_honors_exact_pers0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0153",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_eiger_anchor_reads_global0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0154",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_eiger_external_link_ancho0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0155",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_eiger_external_link_ancho1/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0156",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_exact_single_frame_source0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0157",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_exact_single_frame_source1/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0158",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_hdf_fallback_without_data0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0159",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_preview_preserves_explici0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0160",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_legacy_thumbnail_without_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0161",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_relative_raw_locator_uses0/moved/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0162",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_wrong_mask_shape_never_ex0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0163",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_frame_preview_result_reje0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0164",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_get_raw_frame_resolves_ab0/processed/scan.nxs"
+    },
+    {
+      "record_id": "record-0165",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_get_raw_frame_resolves_si0/processed/scan.nxs"
+    },
+    {
+      "record_id": "record-0166",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_read_image_rejects_proces0/processed.nxs"
+    },
+    {
+      "record_id": "record-0167",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_classify_processed_with_m0/scan.nxs"
+    },
+    {
+      "record_id": "record-0168",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_load_processed_returns_ra0/scan.nxs"
+    },
+    {
+      "record_id": "record-0169",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_load_processed_falls_back0/thumb_only.nxs"
+    },
+    {
+      "record_id": "record-0170",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_load_processed_none_when_0/barren.nxs"
+    },
+    {
+      "record_id": "record-0171",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_load_processed_direct_thu0/thumb_only.nxs"
+    },
+    {
+      "record_id": "record-0172",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_get_raw_frame_resolves_re0/processed/scan.nxs"
+    },
+    {
+      "record_id": "record-0173",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_processed_nexus_source_lo0/processed/scan.nxs"
+    },
+    {
+      "record_id": "record-0174",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_processed_nexus_source_so0/scan.nxs"
+    },
+    {
+      "record_id": "record-0175",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_harvest_from_processed_ne0/processed/scan.nxs"
+    },
+    {
+      "record_id": "record-0176",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_harvest_from_processed_ne0/stitch.nxs"
+    },
+    {
+      "record_id": "record-0177",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_open_scan_iter_chunks_reu0/processed/scan.nxs"
+    },
+    {
+      "record_id": "record-0178",
+      "relative_path": "tmp/e4r-port-core-basetemp/test_processed_nexus_source_lo1/scan.nxs"
+    },
+    {
+      "record_id": "record-0179",
+      "relative_path": "tmp/e4r-port-depth-basetemp/test_historical_dense_integer_0/processed_uint16.nxs"
+    },
+    {
+      "record_id": "record-0180",
+      "relative_path": "tmp/e4r-port-depth-basetemp/test_historical_dense_integer_1/processed_uint32.nxs"
+    },
+    {
+      "record_id": "record-0181",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_processed_with_reachable_0/scan.nxs"
+    },
+    {
+      "record_id": "record-0182",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_processed_without_reachab0/thumb_only.nxs"
+    },
+    {
+      "record_id": "record-0183",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_reduction_only_nxs_not_lo0/old_processed.nxs"
+    },
+    {
+      "record_id": "record-0184",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_processed_xdart_markers_s0/processed_integrated_1d.nxs"
+    },
+    {
+      "record_id": "record-0185",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_processed_xdart_markers_s0/processed_integrated_2d.nxs"
+    },
+    {
+      "record_id": "record-0186",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_processed_xdart_markers_s0/processed_frames.nxs"
+    },
+    {
+      "record_id": "record-0187",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_processed_xdart_markers_s0/bare_frames.nxs"
+    },
+    {
+      "record_id": "record-0188",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_processed_xdart_markers_s0/reduction_only.nxs"
+    },
+    {
+      "record_id": "record-0189",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_processed_image_viewer_fa0/thumb_fallback.nxs"
+    },
+    {
+      "record_id": "record-0190",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_n1_writer_to_ssrl_reader_0/processed/scan.nxs"
+    },
+    {
+      "record_id": "record-0191",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_load_frame_v2_resolves_re0/proj/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0192",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_processed_file_in_watched0/watch/00_previous_run_00001.nxs"
+    },
+    {
+      "record_id": "record-0193",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_processed_file_in_watched0/watch/10_acq_00001.nxs"
+    },
+    {
+      "record_id": "record-0194",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_processed_and_imageless_m0/watch/01_align_00001.nxs"
+    },
+    {
+      "record_id": "record-0195",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_processed_and_imageless_m0/watch/02_processed_00001.nxs"
+    },
+    {
+      "record_id": "record-0196",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_processed_and_imageless_m0/watch/03_data_00001.nxs"
+    },
+    {
+      "record_id": "record-0197",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_processed_and_imageless_m0/watch/04_data_00002.nxs"
+    },
+    {
+      "record_id": "record-0198",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_processed_file_never_reso0/watch/proc_00001.nxs"
+    },
+    {
+      "record_id": "record-0199",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_reload_probe_resolves_rel0/project/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0200",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_qt_sink_worker_process_ru0/wp.nxs"
+    },
+    {
+      "record_id": "record-0201",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_scan_plot_processed_reads0/processed_scan.nxs"
+    },
+    {
+      "record_id": "record-0202",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_bluesky_metadata_projecti0/processed.nxs"
+    },
+    {
+      "record_id": "record-0203",
+      "relative_path": "tmp/r4gm-2026-07-28/gateC-bt/test_wavelength_evidence_live_0/processed.nxs"
+    },
+    {
+      "record_id": "record-0204",
+      "relative_path": "tmp/e4r0-failbefore-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0205",
+      "relative_path": "tmp/e4r0-failbefore-basetemp/test_browse_evicted_frame_rehy0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0206",
+      "relative_path": "tmp/e4r1-headless-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0207",
+      "relative_path": "tmp/e4r1-headless-basetemp/test_absent_frame_fails_typed_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0208",
+      "relative_path": "tmp/e4r1-headless-basetemp/test_no_thumbnail_qualified_fa0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0209",
+      "relative_path": "tmp/e4r1-headless-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0210",
+      "relative_path": "tmp/e4r1-headless-basetemp/test_full_after_thumbnail_prev0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0211",
+      "relative_path": "tmp/e4r1-headless-basetemp/test_same_read_coalesces_and_e0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0212",
+      "relative_path": "tmp/e4r1-headless-basetemp/test_rapid_navigation_latest_s0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0213",
+      "relative_path": "tmp/e4r1-headless-basetemp/test_stale_mutations_reject_be0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0214",
+      "relative_path": "tmp/e4r1-headless-basetemp/test_stale_mutations_reject_be1/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0215",
+      "relative_path": "tmp/e4r1-headless-basetemp/test_stale_mutations_reject_be2/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0216",
+      "relative_path": "tmp/e4r1-headless-basetemp/test_stale_mutations_reject_be3/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0217",
+      "relative_path": "tmp/e4r1-headless-basetemp/test_closed_integrated_only_re0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0218",
+      "relative_path": "tmp/e4r1-headless-basetemp/test_running_detector_miss_rem0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0219",
+      "relative_path": "tmp/e4r1-headless-basetemp/test_injected_store_caps_bound0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0220",
+      "relative_path": "tmp/e4r1-headless-basetemp/test_retire_during_held_read_c0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0221",
+      "relative_path": "tmp/e4r1-headless-basetemp/test_cancel_gate_drops_queued_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0222",
+      "relative_path": "tmp/e4r1-headless-basetemp/test_injected_commit_failure_r0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0223",
+      "relative_path": "tmp/e4r1-headless-basetemp/test_queued_reference_carries_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0224",
+      "relative_path": "tmp/e4r1-headless-basetemp/test_legacy_optional_identity_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0225",
+      "relative_path": "tmp/e4r1-headless-basetemp/test_light_one_d_history_order0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0226",
+      "relative_path": "tmp/e4r1-headless-basetemp2/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0227",
+      "relative_path": "tmp/e4r1-headless-basetemp2/test_light_one_d_history_order0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0228",
+      "relative_path": "tmp/e4r1-h3-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0229",
+      "relative_path": "tmp/e4r1-h3-basetemp/test_rapid_navigation_latest_s0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0230",
+      "relative_path": "tmp/e4r1-h3-basetemp/test_injected_store_caps_bound0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0231",
+      "relative_path": "tmp/e4r1-h4-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0232",
+      "relative_path": "tmp/e4r1-h5-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0233",
+      "relative_path": "tmp/e4r1-h6-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0234",
+      "relative_path": "tmp/e4r1-h6-basetemp/test_absent_frame_fails_typed_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0235",
+      "relative_path": "tmp/e4r1-h6-basetemp/test_no_thumbnail_qualified_fa0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0236",
+      "relative_path": "tmp/e4r1-h6-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0237",
+      "relative_path": "tmp/e4r1-h6-basetemp/test_full_after_thumbnail_prev0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0238",
+      "relative_path": "tmp/e4r1-full-probe-t6krioay/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0239",
+      "relative_path": "tmp/e4r1-full-probe2-lg9j2m3t/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0240",
+      "relative_path": "tmp/e4r1-loop1-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0241",
+      "relative_path": "tmp/e4r1-loop1-basetemp/test_absent_frame_fails_typed_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0242",
+      "relative_path": "tmp/e4r1-loop1-basetemp/test_no_thumbnail_qualified_fa0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0243",
+      "relative_path": "tmp/e4r1-loop1-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0244",
+      "relative_path": "tmp/e4r1-loop1-basetemp/test_full_after_thumbnail_prev0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0245",
+      "relative_path": "tmp/e4r1-loop2-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0246",
+      "relative_path": "tmp/e4r1-loop2-basetemp/test_absent_frame_fails_typed_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0247",
+      "relative_path": "tmp/e4r1-loop2-basetemp/test_no_thumbnail_qualified_fa0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0248",
+      "relative_path": "tmp/e4r1-loop2-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0249",
+      "relative_path": "tmp/e4r1-loop2-basetemp/test_full_after_thumbnail_prev0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0250",
+      "relative_path": "tmp/e4r1-loop3-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0251",
+      "relative_path": "tmp/e4r1-loop3-basetemp/test_absent_frame_fails_typed_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0252",
+      "relative_path": "tmp/e4r1-loop3-basetemp/test_no_thumbnail_qualified_fa0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0253",
+      "relative_path": "tmp/e4r1-loop3-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0254",
+      "relative_path": "tmp/e4r1-loop3-basetemp/test_full_after_thumbnail_prev0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0255",
+      "relative_path": "tmp/e4r1-loop4-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0256",
+      "relative_path": "tmp/e4r1-loop4-basetemp/test_absent_frame_fails_typed_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0257",
+      "relative_path": "tmp/e4r1-loop4-basetemp/test_no_thumbnail_qualified_fa0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0258",
+      "relative_path": "tmp/e4r1-loop4-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0259",
+      "relative_path": "tmp/e4r1-loop4-basetemp/test_full_after_thumbnail_prev0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0260",
+      "relative_path": "tmp/e4r1-loop5-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0261",
+      "relative_path": "tmp/e4r1-loop5-basetemp/test_absent_frame_fails_typed_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0262",
+      "relative_path": "tmp/e4r1-loop5-basetemp/test_no_thumbnail_qualified_fa0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0263",
+      "relative_path": "tmp/e4r1-loop5-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0264",
+      "relative_path": "tmp/e4r1-loop5-basetemp/test_full_after_thumbnail_prev0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0265",
+      "relative_path": "tmp/e4r1-loop6-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0266",
+      "relative_path": "tmp/e4r1-loop6-basetemp/test_absent_frame_fails_typed_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0267",
+      "relative_path": "tmp/e4r1-loop6-basetemp/test_no_thumbnail_qualified_fa0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0268",
+      "relative_path": "tmp/e4r1-loop6-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0269",
+      "relative_path": "tmp/e4r1-loop6-basetemp/test_full_after_thumbnail_prev0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0270",
+      "relative_path": "tmp/e4r1-p3-0-lrqgdbc4/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0271",
+      "relative_path": "tmp/e4r1-p3-1-7s2v21vf/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0272",
+      "relative_path": "tmp/e4r1-p3-2-a6w4hyt0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0273",
+      "relative_path": "tmp/e4r1-p3-3-zha25ozx/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0274",
+      "relative_path": "tmp/e4r1-p3-4-3gvop9hh/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0275",
+      "relative_path": "tmp/e4r1-p3-5-4dr38e_1/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0276",
+      "relative_path": "tmp/e4r1-p3-6-bsqca_4h/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0277",
+      "relative_path": "tmp/e4r1-p3-7-hzl1rstc/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0278",
+      "relative_path": "tmp/e4r1-p3-8-x2t8pmkj/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0279",
+      "relative_path": "tmp/e4r1-p3-9-3wb9ez4h/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0280",
+      "relative_path": "tmp/e4r1-p3-10-xbft7dml/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0281",
+      "relative_path": "tmp/e4r1-p3-11-swohh_9l/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0282",
+      "relative_path": "tmp/e4r1-p3-12-1yk9us75/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0283",
+      "relative_path": "tmp/e4r1-p3-13-q3mftpcs/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0284",
+      "relative_path": "tmp/e4r1-p3-14-7gtq0pz_/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0285",
+      "relative_path": "tmp/e4r1-p3-15-81v3zihr/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0286",
+      "relative_path": "tmp/e4r1-p3-16-5otken2b/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0287",
+      "relative_path": "tmp/e4r1-p3-17-jxe7kbeh/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0288",
+      "relative_path": "tmp/e4r1-p3-18-n7kt5ixg/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0289",
+      "relative_path": "tmp/e4r1-p3-19-yudcki18/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0290",
+      "relative_path": "tmp/e4r1-p3-20-x81hf11c/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0291",
+      "relative_path": "tmp/e4r1-p3-21-3crwswkq/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0292",
+      "relative_path": "tmp/e4r1-p3-22-7gfkvg_1/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0293",
+      "relative_path": "tmp/e4r1-p3-23-a555pjqm/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0294",
+      "relative_path": "tmp/e4r1-p3-24-7koix757/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0295",
+      "relative_path": "tmp/e4r1-dbg1-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0296",
+      "relative_path": "tmp/e4r1-dbg1-basetemp/test_absent_frame_fails_typed_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0297",
+      "relative_path": "tmp/e4r1-dbg1-basetemp/test_no_thumbnail_qualified_fa0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0298",
+      "relative_path": "tmp/e4r1-dbg1-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0299",
+      "relative_path": "tmp/e4r1-dbg1-basetemp/test_full_after_thumbnail_prev0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0300",
+      "relative_path": "tmp/e4r1-dbg2-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0301",
+      "relative_path": "tmp/e4r1-dbg2-basetemp/test_absent_frame_fails_typed_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0302",
+      "relative_path": "tmp/e4r1-dbg2-basetemp/test_no_thumbnail_qualified_fa0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0303",
+      "relative_path": "tmp/e4r1-dbg2-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0304",
+      "relative_path": "tmp/e4r1-dbg2-basetemp/test_full_after_thumbnail_prev0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0305",
+      "relative_path": "tmp/e4r1-dbg3-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0306",
+      "relative_path": "tmp/e4r1-dbg3-basetemp/test_absent_frame_fails_typed_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0307",
+      "relative_path": "tmp/e4r1-dbg3-basetemp/test_no_thumbnail_qualified_fa0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0308",
+      "relative_path": "tmp/e4r1-dbg3-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0309",
+      "relative_path": "tmp/e4r1-dbg3-basetemp/test_full_after_thumbnail_prev0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0310",
+      "relative_path": "tmp/e4r1-dbg4-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0311",
+      "relative_path": "tmp/e4r1-dbg4-basetemp/test_absent_frame_fails_typed_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0312",
+      "relative_path": "tmp/e4r1-dbg4-basetemp/test_no_thumbnail_qualified_fa0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0313",
+      "relative_path": "tmp/e4r1-dbg4-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0314",
+      "relative_path": "tmp/e4r1-dbg4-basetemp/test_full_after_thumbnail_prev0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0315",
+      "relative_path": "tmp/e4r1-dbg5-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0316",
+      "relative_path": "tmp/e4r1-dbg5-basetemp/test_absent_frame_fails_typed_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0317",
+      "relative_path": "tmp/e4r1-dbg5-basetemp/test_no_thumbnail_qualified_fa0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0318",
+      "relative_path": "tmp/e4r1-dbg5-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0319",
+      "relative_path": "tmp/e4r1-dbg5-basetemp/test_full_after_thumbnail_prev0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0320",
+      "relative_path": "tmp/e4r1-dbg6-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0321",
+      "relative_path": "tmp/e4r1-dbg6-basetemp/test_absent_frame_fails_typed_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0322",
+      "relative_path": "tmp/e4r1-dbg6-basetemp/test_no_thumbnail_qualified_fa0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0323",
+      "relative_path": "tmp/e4r1-dbg6-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0324",
+      "relative_path": "tmp/e4r1-dbg6-basetemp/test_full_after_thumbnail_prev0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0325",
+      "relative_path": "tmp/e4r1-dbg7-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0326",
+      "relative_path": "tmp/e4r1-dbg7-basetemp/test_absent_frame_fails_typed_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0327",
+      "relative_path": "tmp/e4r1-dbg7-basetemp/test_no_thumbnail_qualified_fa0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0328",
+      "relative_path": "tmp/e4r1-dbg7-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0329",
+      "relative_path": "tmp/e4r1-dbg7-basetemp/test_full_after_thumbnail_prev0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0330",
+      "relative_path": "tmp/e4r1-dbg8-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0331",
+      "relative_path": "tmp/e4r1-dbg8-basetemp/test_absent_frame_fails_typed_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0332",
+      "relative_path": "tmp/e4r1-dbg8-basetemp/test_no_thumbnail_qualified_fa0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0333",
+      "relative_path": "tmp/e4r1-dbg8-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0334",
+      "relative_path": "tmp/e4r1-dbg8-basetemp/test_full_after_thumbnail_prev0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0335",
+      "relative_path": "tmp/e4r1-green1-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0336",
+      "relative_path": "tmp/e4r1-green1-basetemp/test_absent_frame_fails_typed_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0337",
+      "relative_path": "tmp/e4r1-green1-basetemp/test_no_thumbnail_qualified_fa0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0338",
+      "relative_path": "tmp/e4r1-green1-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0339",
+      "relative_path": "tmp/e4r1-green1-basetemp/test_full_after_thumbnail_prev0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0340",
+      "relative_path": "tmp/e4r1-green1-basetemp/test_same_read_coalesces_and_e0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0341",
+      "relative_path": "tmp/e4r1-green1-basetemp/test_rapid_navigation_latest_s0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0342",
+      "relative_path": "tmp/e4r1-green1-basetemp/test_stale_mutations_reject_be0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0343",
+      "relative_path": "tmp/e4r1-green1-basetemp/test_stale_mutations_reject_be1/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0344",
+      "relative_path": "tmp/e4r1-green1-basetemp/test_stale_mutations_reject_be2/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0345",
+      "relative_path": "tmp/e4r1-green1-basetemp/test_stale_mutations_reject_be3/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0346",
+      "relative_path": "tmp/e4r1-green1-basetemp/test_closed_integrated_only_re0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0347",
+      "relative_path": "tmp/e4r1-green1-basetemp/test_running_detector_miss_rem0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0348",
+      "relative_path": "tmp/e4r1-green1-basetemp/test_injected_store_caps_bound0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0349",
+      "relative_path": "tmp/e4r1-green1-basetemp/test_retire_during_held_read_c0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0350",
+      "relative_path": "tmp/e4r1-green1-basetemp/test_cancel_gate_drops_queued_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0351",
+      "relative_path": "tmp/e4r1-green1-basetemp/test_injected_commit_failure_r0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0352",
+      "relative_path": "tmp/e4r1-green1-basetemp/test_queued_reference_carries_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0353",
+      "relative_path": "tmp/e4r1-green1-basetemp/test_legacy_optional_identity_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0354",
+      "relative_path": "tmp/e4r1-green1-basetemp/test_light_one_d_history_order0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0355",
+      "relative_path": "tmp/e4r1-green2-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0356",
+      "relative_path": "tmp/e4r1-green2-basetemp/test_absent_frame_fails_typed_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0357",
+      "relative_path": "tmp/e4r1-green2-basetemp/test_no_thumbnail_qualified_fa0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0358",
+      "relative_path": "tmp/e4r1-green2-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0359",
+      "relative_path": "tmp/e4r1-green2-basetemp/test_full_after_thumbnail_prev0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0360",
+      "relative_path": "tmp/e4r1-green2-basetemp/test_same_read_coalesces_and_e0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0361",
+      "relative_path": "tmp/e4r1-green2-basetemp/test_rapid_navigation_latest_s0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0362",
+      "relative_path": "tmp/e4r1-green2-basetemp/test_stale_mutations_reject_be0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0363",
+      "relative_path": "tmp/e4r1-green2-basetemp/test_stale_mutations_reject_be1/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0364",
+      "relative_path": "tmp/e4r1-green2-basetemp/test_stale_mutations_reject_be2/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0365",
+      "relative_path": "tmp/e4r1-green2-basetemp/test_stale_mutations_reject_be3/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0366",
+      "relative_path": "tmp/e4r1-green2-basetemp/test_closed_integrated_only_re0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0367",
+      "relative_path": "tmp/e4r1-green2-basetemp/test_running_detector_miss_rem0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0368",
+      "relative_path": "tmp/e4r1-green2-basetemp/test_injected_store_caps_bound0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0369",
+      "relative_path": "tmp/e4r1-green2-basetemp/test_retire_during_held_read_c0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0370",
+      "relative_path": "tmp/e4r1-green2-basetemp/test_cancel_gate_drops_queued_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0371",
+      "relative_path": "tmp/e4r1-green2-basetemp/test_injected_commit_failure_r0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0372",
+      "relative_path": "tmp/e4r1-green2-basetemp/test_queued_reference_carries_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0373",
+      "relative_path": "tmp/e4r1-green2-basetemp/test_legacy_optional_identity_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0374",
+      "relative_path": "tmp/e4r1-green2-basetemp/test_light_one_d_history_order0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0375",
+      "relative_path": "tmp/e4r1-green3-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0376",
+      "relative_path": "tmp/e4r1-green3-basetemp/test_absent_frame_fails_typed_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0377",
+      "relative_path": "tmp/e4r1-green3-basetemp/test_no_thumbnail_qualified_fa0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0378",
+      "relative_path": "tmp/e4r1-green3-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0379",
+      "relative_path": "tmp/e4r1-green3-basetemp/test_full_after_thumbnail_prev0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0380",
+      "relative_path": "tmp/e4r1-green3-basetemp/test_same_read_coalesces_and_e0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0381",
+      "relative_path": "tmp/e4r1-green3-basetemp/test_rapid_navigation_latest_s0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0382",
+      "relative_path": "tmp/e4r1-green3-basetemp/test_stale_mutations_reject_be0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0383",
+      "relative_path": "tmp/e4r1-green3-basetemp/test_stale_mutations_reject_be1/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0384",
+      "relative_path": "tmp/e4r1-green3-basetemp/test_stale_mutations_reject_be2/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0385",
+      "relative_path": "tmp/e4r1-green3-basetemp/test_stale_mutations_reject_be3/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0386",
+      "relative_path": "tmp/e4r1-green3-basetemp/test_closed_integrated_only_re0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0387",
+      "relative_path": "tmp/e4r1-green3-basetemp/test_running_detector_miss_rem0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0388",
+      "relative_path": "tmp/e4r1-green3-basetemp/test_injected_store_caps_bound0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0389",
+      "relative_path": "tmp/e4r1-green3-basetemp/test_retire_during_held_read_c0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0390",
+      "relative_path": "tmp/e4r1-green3-basetemp/test_cancel_gate_drops_queued_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0391",
+      "relative_path": "tmp/e4r1-green3-basetemp/test_injected_commit_failure_r0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0392",
+      "relative_path": "tmp/e4r1-green3-basetemp/test_queued_reference_carries_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0393",
+      "relative_path": "tmp/e4r1-green3-basetemp/test_legacy_optional_identity_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0394",
+      "relative_path": "tmp/e4r1-green3-basetemp/test_light_one_d_history_order0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0395",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_historical_dense_integer_0/processed_uint16.nxs"
+    },
+    {
+      "record_id": "record-0396",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_historical_dense_integer_1/processed_uint32.nxs"
+    },
+    {
+      "record_id": "record-0397",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_multi_output_run_has_one_0/processed/first.nxs"
+    },
+    {
+      "record_id": "record-0398",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_multi_output_run_has_one_0/processed/second.nxs"
+    },
+    {
+      "record_id": "record-0399",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_delayed_frame_event_route0/processed/first.nxs"
+    },
+    {
+      "record_id": "record-0400",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_delayed_frame_event_route0/processed/second.nxs"
+    },
+    {
+      "record_id": "record-0401",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_multi_output_gi_repeated_0/processed/first.nxs"
+    },
+    {
+      "record_id": "record-0402",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_multi_output_gi_repeated_0/processed/second.nxs"
+    },
+    {
+      "record_id": "record-0403",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_eiger_outputs_with_repeat0/processed/Eiger_NbN_1_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0404",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_eiger_outputs_with_repeat0/processed/Eiger_NbN_2_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0405",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_every_public_projection_h0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0406",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_every_public_projection_h0/c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0407",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_every_public_projection_h0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0408",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_page_polls_cancelled_c_re0/c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0409",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_page_polls_cancelled_c_re0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0410",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_page_polls_cancelled_c_re0/a/project/processed/run.second.nxs"
+    },
+    {
+      "record_id": "record-0411",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_select_scan_b_release_fai0/browse-b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0412",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_select_scan_b_release_fai0/browse-c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0413",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_select_scan_b_release_fai0/acquisition-a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0414",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j3_real_mounted_run_pause2/eiger-processed/Eiger_NbN_1_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0415",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j3_real_mounted_run_pause2/eiger-processed/Eiger_NbN_2_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0416",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j3_mounted_qualified_xye_0/acquisition/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0417",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j0_01_run_mounts_exact_a_0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0418",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j0_02_browser_footer_shar0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0419",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j0_02_browser_footer_shar0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0420",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j0_03_pause_closes_submis0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0421",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j0_04_browse_b_is_off_gui0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0422",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j0_04_browse_b_is_off_gui0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0423",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j0_05_resume_is_an_a_poin0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0424",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j0_05_resume_is_an_a_poin0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0425",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j0_06_stop_is_fail_closed0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0426",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j0_06_stop_is_fail_closed0/running/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0427",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j0_06_stop_is_fail_closed0/paused/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0428",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j0_06_stop_is_fail_closed0/browse/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0429",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j0_06_stop_is_fail_closed0/resumed/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0430",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j0_07_b_to_c_releases_b_b0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0431",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j0_07_b_to_c_releases_b_b0/c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0432",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j0_07_b_to_c_releases_b_b0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0433",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j0_08_evicted_hydration_i0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0434",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j0_09_equal_foreign_stale0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0435",
+      "relative_path": "tmp/e4r1-scat-basetemp/test_j0_11_relative_raw_path_s0/relocated/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0436",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_historical_dense_integer_0/processed_uint16.nxs"
+    },
+    {
+      "record_id": "record-0437",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_historical_dense_integer_1/processed_uint32.nxs"
+    },
+    {
+      "record_id": "record-0438",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_multi_output_run_has_one_0/processed/first.nxs"
+    },
+    {
+      "record_id": "record-0439",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_multi_output_run_has_one_0/processed/second.nxs"
+    },
+    {
+      "record_id": "record-0440",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_delayed_frame_event_route0/processed/first.nxs"
+    },
+    {
+      "record_id": "record-0441",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_delayed_frame_event_route0/processed/second.nxs"
+    },
+    {
+      "record_id": "record-0442",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_multi_output_gi_repeated_0/processed/first.nxs"
+    },
+    {
+      "record_id": "record-0443",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_multi_output_gi_repeated_0/processed/second.nxs"
+    },
+    {
+      "record_id": "record-0444",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_eiger_outputs_with_repeat0/processed/Eiger_NbN_1_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0445",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_eiger_outputs_with_repeat0/processed/Eiger_NbN_2_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0446",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_every_public_projection_h0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0447",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_every_public_projection_h0/c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0448",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_every_public_projection_h0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0449",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_page_polls_cancelled_c_re0/c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0450",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_page_polls_cancelled_c_re0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0451",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_page_polls_cancelled_c_re0/a/project/processed/run.second.nxs"
+    },
+    {
+      "record_id": "record-0452",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_select_scan_b_release_fai0/browse-b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0453",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_select_scan_b_release_fai0/browse-c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0454",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_select_scan_b_release_fai0/acquisition-a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0455",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j3_real_mounted_run_pause2/eiger-processed/Eiger_NbN_1_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0456",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j3_real_mounted_run_pause2/eiger-processed/Eiger_NbN_2_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0457",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j3_mounted_qualified_xye_0/acquisition/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0458",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j0_01_run_mounts_exact_a_0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0459",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j0_02_browser_footer_shar0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0460",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j0_02_browser_footer_shar0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0461",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j0_03_pause_closes_submis0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0462",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j0_04_browse_b_is_off_gui0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0463",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j0_04_browse_b_is_off_gui0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0464",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j0_05_resume_is_an_a_poin0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0465",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j0_05_resume_is_an_a_poin0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0466",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j0_06_stop_is_fail_closed0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0467",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j0_06_stop_is_fail_closed0/running/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0468",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j0_06_stop_is_fail_closed0/paused/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0469",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j0_06_stop_is_fail_closed0/browse/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0470",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j0_06_stop_is_fail_closed0/resumed/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0471",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j0_07_b_to_c_releases_b_b0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0472",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j0_07_b_to_c_releases_b_b0/c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0473",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j0_07_b_to_c_releases_b_b0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0474",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j0_08_evicted_hydration_i0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0475",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j0_09_equal_foreign_stale0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0476",
+      "relative_path": "tmp/e4r1-scat2-basetemp/test_j0_11_relative_raw_path_s0/relocated/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0477",
+      "relative_path": "tmp/e4r1-hang-basetemp/test_multi_output_run_has_one_0/processed/first.nxs"
+    },
+    {
+      "record_id": "record-0478",
+      "relative_path": "tmp/e4r1-hang-basetemp/test_multi_output_run_has_one_0/processed/second.nxs"
+    },
+    {
+      "record_id": "record-0479",
+      "relative_path": "tmp/e4r1-hang-basetemp/test_delayed_frame_event_route0/processed/first.nxs"
+    },
+    {
+      "record_id": "record-0480",
+      "relative_path": "tmp/e4r1-hang-basetemp/test_delayed_frame_event_route0/processed/second.nxs"
+    },
+    {
+      "record_id": "record-0481",
+      "relative_path": "tmp/e4r1-hang-basetemp/test_historical_dense_integer_0/processed_uint16.nxs"
+    },
+    {
+      "record_id": "record-0482",
+      "relative_path": "tmp/e4r1-hang-basetemp/test_historical_dense_integer_1/processed_uint32.nxs"
+    },
+    {
+      "record_id": "record-0483",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_page_polls_cancelled_c_re0/c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0484",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_page_polls_cancelled_c_re0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0485",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_page_polls_cancelled_c_re0/a/project/processed/run.second.nxs"
+    },
+    {
+      "record_id": "record-0486",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_select_scan_b_release_fai0/browse-b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0487",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_select_scan_b_release_fai0/browse-c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0488",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_select_scan_b_release_fai0/acquisition-a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0489",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j3_real_mounted_run_pause2/eiger-processed/Eiger_NbN_1_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0490",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j3_real_mounted_run_pause2/eiger-processed/Eiger_NbN_2_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0491",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j3_mounted_qualified_xye_0/acquisition/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0492",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j0_01_run_mounts_exact_a_0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0493",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j0_02_browser_footer_shar0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0494",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j0_02_browser_footer_shar0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0495",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j0_03_pause_closes_submis0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0496",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j0_04_browse_b_is_off_gui0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0497",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j0_04_browse_b_is_off_gui0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0498",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j0_05_resume_is_an_a_poin0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0499",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j0_05_resume_is_an_a_poin0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0500",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j0_06_stop_is_fail_closed0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0501",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j0_06_stop_is_fail_closed0/running/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0502",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j0_06_stop_is_fail_closed0/paused/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0503",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j0_06_stop_is_fail_closed0/browse/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0504",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j0_06_stop_is_fail_closed0/resumed/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0505",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j0_07_b_to_c_releases_b_b0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0506",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j0_07_b_to_c_releases_b_b0/c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0507",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j0_07_b_to_c_releases_b_b0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0508",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j0_08_evicted_hydration_i0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0509",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j0_09_equal_foreign_stale0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0510",
+      "relative_path": "tmp/e4r1-hang3-basetemp/test_j0_11_relative_raw_path_s0/relocated/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0511",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0512",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_absent_frame_fails_typed_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0513",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_no_thumbnail_qualified_fa0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0514",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_frame_mask_qualified_no_t0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0515",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_full_after_thumbnail_prev0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0516",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_same_read_coalesces_and_e0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0517",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_rapid_navigation_latest_s0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0518",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_stale_mutations_reject_be0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0519",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_stale_mutations_reject_be1/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0520",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_stale_mutations_reject_be2/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0521",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_stale_mutations_reject_be3/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0522",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_closed_integrated_only_re0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0523",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_running_detector_miss_rem0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0524",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_injected_store_caps_bound0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0525",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_retire_during_held_read_c0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0526",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_cancel_gate_drops_queued_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0527",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_injected_commit_failure_r0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0528",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_queued_reference_carries_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0529",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_legacy_optional_identity_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0530",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_light_one_d_history_order0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0531",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_browse_evicted_frame_rehy0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0532",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_resume_makes_late_browse_0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0533",
+      "relative_path": "tmp/e4r1-hang4-basetemp/test_close_withholds_cleaned_u0/xdart_processed_data/scan.nxs"
+    },
+    {
+      "record_id": "record-0534",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_every_public_projection_h0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0535",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_every_public_projection_h0/c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0536",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_every_public_projection_h0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0537",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_page_polls_cancelled_c_re0/c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0538",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_page_polls_cancelled_c_re0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0539",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_page_polls_cancelled_c_re0/a/project/processed/run.second.nxs"
+    },
+    {
+      "record_id": "record-0540",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_select_scan_b_release_fai0/browse-b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0541",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_select_scan_b_release_fai0/browse-c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0542",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_select_scan_b_release_fai0/acquisition-a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0543",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_j0_01_run_mounts_exact_a_0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0544",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_j0_02_browser_footer_shar0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0545",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_j0_02_browser_footer_shar0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0546",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_j0_03_pause_closes_submis0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0547",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_j0_04_browse_b_is_off_gui0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0548",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_j0_04_browse_b_is_off_gui0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0549",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_j0_05_resume_is_an_a_poin0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0550",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_j0_05_resume_is_an_a_poin0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0551",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_j0_06_stop_is_fail_closed0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0552",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_j0_06_stop_is_fail_closed0/running/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0553",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_j0_06_stop_is_fail_closed0/paused/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0554",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_j0_06_stop_is_fail_closed0/browse/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0555",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_j0_06_stop_is_fail_closed0/resumed/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0556",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_j0_07_b_to_c_releases_b_b0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0557",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_j0_07_b_to_c_releases_b_b0/c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0558",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_j0_07_b_to_c_releases_b_b0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0559",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_j0_08_evicted_hydration_i0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0560",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_j0_09_equal_foreign_stale0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0561",
+      "relative_path": "tmp/e4r1-band2-basetemp/test_j0_11_relative_raw_path_s0/relocated/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0562",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_every_public_projection_h0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0563",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_every_public_projection_h0/c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0564",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_every_public_projection_h0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0565",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_page_polls_cancelled_c_re0/c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0566",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_page_polls_cancelled_c_re0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0567",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_page_polls_cancelled_c_re0/a/project/processed/run.second.nxs"
+    },
+    {
+      "record_id": "record-0568",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_select_scan_b_release_fai0/browse-b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0569",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_select_scan_b_release_fai0/browse-c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0570",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_select_scan_b_release_fai0/acquisition-a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0571",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_j0_01_run_mounts_exact_a_0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0572",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_j0_02_browser_footer_shar0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0573",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_j0_02_browser_footer_shar0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0574",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_j0_03_pause_closes_submis0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0575",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_j0_04_browse_b_is_off_gui0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0576",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_j0_04_browse_b_is_off_gui0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0577",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_j0_05_resume_is_an_a_poin0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0578",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_j0_05_resume_is_an_a_poin0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0579",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_j0_06_stop_is_fail_closed0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0580",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_j0_06_stop_is_fail_closed0/running/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0581",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_j0_06_stop_is_fail_closed0/paused/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0582",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_j0_06_stop_is_fail_closed0/browse/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0583",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_j0_06_stop_is_fail_closed0/resumed/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0584",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_j0_07_b_to_c_releases_b_b0/b/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0585",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_j0_07_b_to_c_releases_b_b0/c/project/processed/browse.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0586",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_j0_07_b_to_c_releases_b_b0/a/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0587",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_j0_08_evicted_hydration_i0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0588",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_j0_09_equal_foreign_stale0/project/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0589",
+      "relative_path": "tmp/e4r1-band4-basetemp/test_j0_11_relative_raw_path_s0/relocated/processed/run.with.dots.nxs"
+    },
+    {
+      "record_id": "record-0590",
+      "relative_path": "tmp/e4r1-full-basetemp/test_historical_dense_integer_0/processed_uint16.nxs"
+    },
+    {
+      "record_id": "record-0591",
+      "relative_path": "tmp/e4r1-full-basetemp/test_historical_dense_integer_1/processed_uint32.nxs"
+    },
+    {
+      "record_id": "record-0592",
+      "relative_path": "tmp/e4r1-full-basetemp/test_multi_output_run_has_one_0/processed/first.nxs"
+    },
+    {
+      "record_id": "record-0593",
+      "relative_path": "tmp/e4r1-full-basetemp/test_multi_output_run_has_one_0/processed/second.nxs"
+    },
+    {
+      "record_id": "record-0594",
+      "relative_path": "tmp/e4r1-full-basetemp/test_delayed_frame_event_route0/processed/first.nxs"
+    },
+    {
+      "record_id": "record-0595",
+      "relative_path": "tmp/e4r1-full-basetemp/test_delayed_frame_event_route0/processed/second.nxs"
+    },
+    {
+      "record_id": "record-0596",
+      "relative_path": "tmp/e4r1-full-basetemp/test_multi_output_gi_repeated_0/processed/first.nxs"
+    },
+    {
+      "record_id": "record-0597",
+      "relative_path": "tmp/e4r1-full-basetemp/test_multi_output_gi_repeated_0/processed/second.nxs"
+    },
+    {
+      "record_id": "record-0598",
+      "relative_path": "tmp/e4r1-full-basetemp/test_eiger_outputs_with_repeat0/processed/Eiger_NbN_1_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0599",
+      "relative_path": "tmp/e4r1-full-basetemp/test_eiger_outputs_with_repeat0/processed/Eiger_NbN_2_thin_test__200mdeg_scan001.nxs"
+    },
+    {
+      "record_id": "record-0600",
+      "relative_path": "tmp/e4r1-trim-basetemp/test_thumbnail_preview_one_ope0/xdart_processed_data/scan.nxs"
+    }
+  ],
+  "schema_version": 1,
+  "selection": {
+    "count": 600,
+    "roots": [
+      "test_data",
+      "tmp"
+    ],
+    "rule": "oldest mtime_ns then relative path; *.nxs path contains process"
+  }
+}
