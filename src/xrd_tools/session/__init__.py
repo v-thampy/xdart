@@ -54,6 +54,13 @@ __all__ = [
     "GI_MOTOR_PREFERENCE",
     "pick_default_gi_motor",
     "resolve_gi_motor",
+    # Slice-5 whole-scan normalization aggregate (headless value):
+    "ScanNormAggregate",
+    "accepts_norm_aggregate",
+    "channel_is_partial",
+    "empty_norm_aggregate",
+    "fold_norm_metadata",
+    "next_norm_revision",
 ]
 
 _SCAN_SESSION_EXPORTS = {
@@ -105,6 +112,16 @@ _GI_MOTOR_EXPORTS = {
 }
 
 
+_SCAN_NORM_EXPORTS = {
+    "ScanNormAggregate",
+    "accepts_norm_aggregate",
+    "channel_is_partial",
+    "empty_norm_aggregate",
+    "fold_norm_metadata",
+    "next_norm_revision",
+}
+
+
 def __getattr__(name: str) -> Any:
     if name == "FrameRecordStore":
         value = getattr(import_module("xrd_tools.session.frame_record_store"), name)
@@ -116,6 +133,8 @@ def __getattr__(name: str) -> Any:
         value = getattr(import_module("xrd_tools.session.frame_projection"), name)
     elif name in _RUN_CONFIGURATION_EXPORTS:
         value = getattr(import_module("xrd_tools.session.run_configuration"), name)
+    elif name in _SCAN_NORM_EXPORTS:
+        value = getattr(import_module("xrd_tools.session.scan_norm"), name)
     else:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     globals()[name] = value
