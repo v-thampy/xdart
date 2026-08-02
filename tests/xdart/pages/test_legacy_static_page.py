@@ -94,6 +94,11 @@ class _FakeLegacy:
         self.calls.append("save")
 
 
+class _HydrationFailureLegacy(_FakeLegacy):
+    def enable_async_hydration(self):
+        raise RuntimeError("hydrate boom")
+
+
 def test_legacy_descriptor_is_lazy_exit_only_and_keeps_app_menus_host_owned():
     assert LEGACY_STATIC_PAGE.key == DEFAULT_PAGE_KEY
     assert LEGACY_STATIC_PAGE.lifecycle is PageLifecycle.EXIT_ONLY
@@ -124,6 +129,17 @@ def test_legacy_adapter_routes_declared_ports_and_live_profile_hydration():
         "hydrate", "load", "save", "run", "stop", "toggle", "pin"]
     assert handle.app_menus is None
     assert handle.open_folder is None
+
+
+def test_live_hydration_setup_failure_does_not_abort_legacy_page_build(caplog):
+    handle = build_legacy_static(
+        _services(ExecutionProfile.LIVE),
+        None,
+        _widget_factory=_HydrationFailureLegacy,
+    )
+
+    assert isinstance(handle.widget, _HydrationFailureLegacy)
+    assert "Could not enable legacy async hydration" in caplog.text
 
 
 def test_legacy_close_receipt_is_verified_and_latched_not_hard_coded_clean():

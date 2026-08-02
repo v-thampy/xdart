@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -14,6 +15,9 @@ from .values import (
     PageCleanup,
     PageKey,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,7 +159,10 @@ def build_legacy_static(
         _widget_factory = staticWidget
     widget = _widget_factory(parent)
     if services.execution_profile is ExecutionProfile.LIVE:
-        widget.enable_async_hydration()
+        try:
+            widget.enable_async_hydration()
+        except Exception:
+            logger.exception("Could not enable legacy async hydration")
 
     activity = _Activity(
         lambda: bool(widget.displayframe._processing_active)
