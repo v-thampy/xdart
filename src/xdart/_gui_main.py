@@ -198,7 +198,24 @@ else:
 
 # This module imports
 from xdart.gui.mainWindow import Ui_MainWindow
-from xdart.gui import tabs
+from xdart.gui.pages.catalog import BUILTIN_PAGES, DEFAULT_PAGE_KEY
+from xdart.gui.pages.descriptors import PageDescriptor
+from xdart.gui.pages.handle import validate_page_handle
+from xdart.gui.pages.registry import PageRegistry
+from xdart.gui.pages.services import empty_host_services
+from xdart.gui.pages.values import (
+    ActionCompleted,
+    ActionRefused,
+    CAPABILITY_UNAVAILABLE,
+    CLEANUP_PENDING,
+    EXIT_ONLY_PAGE,
+    PAGE_ACTIVE,
+    UNKNOWN_PAGE,
+    PageCapability,
+    PageCleanup,
+    PageKey,
+    PageLifecycle,
+)
 from xdart.gui.themes.typography import (
     FONT_SCALE_MENU,
     FONT_SCALE_SETTINGS_KEY,
@@ -284,30 +301,58 @@ class _UpdateCheckThread(QtCore.QThread):
         self.result_ready.emit(updater.fetch_latest_pypi())
 
 
+class _StatusBarPresenter:
+    def __init__(self, window):
+        self._window = window
+
+    def show(self, text, timeout_ms=0):
+        self._window.statusBar().showMessage(text, timeout_ms)
+
+
 class Main(QMainWindow):
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        page_descriptors=None,
+        host_services=None,
+        selected_page_key=None,
+    ):
         super().__init__()
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
         self.setWindowTitle('xdart')
         self.ui.actionOpen.triggered.connect(self.openFile)
         self.ui.actionExit.triggered.connect(self.exit)
-        self.fname = None
+        self._menus_initialized = False
+        self._close_retry_scheduled = False
+        self._process_exit_requested = False
 
-        # Embed the main widget directly (no tab container).
-        # The widget chooses its own scratch directory via get_fname_dir().
-        self.main_widget = tabs.static_scan.staticWidget()
-        self.setCentralWidget(self.main_widget)
-        # D2 (greenfield Phase 3): in the live app, rehydrate evicted frames off
-        # the GUI thread so scroll-back no longer freezes on a ~5 s .nxs open.
-        # Done here (not in widget construction) so headless widget tests keep
-        # their synchronous reads.
-        try:
-            self.main_widget.enable_async_hydration()
-        except Exception:
-            pass
-        self._init_theme_menu()
+        descriptors = tuple(
+            BUILTIN_PAGES if page_descriptors is None else page_descriptors)
+        self.page_registry = PageRegistry(descriptors).freeze()
+        default = self.page_registry.get(DEFAULT_PAGE_KEY)
+        if not isinstance(default, PageDescriptor):
+            default = next(
+                (item for item in self.page_registry
+                 if isinstance(item, PageDescriptor)),
+                None,
+            )
+        if default is None:
+            raise ValueError("the page catalog contains no page descriptor")
+        self._default_page_key = default.key
+        self._host_services = host_services or empty_host_services(
+            _StatusBarPresenter(self))
+        persisted = (
+            selected_page_key if selected_page_key is not None
+            else _app_settings().value("page.selected")
+        )
+        descriptor = self.page_registry.select(persisted, self._default_page_key)
+        self._mount_page(descriptor)
         self._init_shortcut_actions()
+        self._init_theme_menu()
+        self._menus_initialized = True
+        self._attach_application_menus()
+        self._sync_capability_actions()
 
         # Default size: 90% of the available screen, centered (was a fixed
         # 1600x920, whose width clamped the middle display panels below
@@ -323,29 +368,37 @@ class Main(QMainWindow):
         except Exception:
             self.resize(1600, 920)
 
-    def _init_theme_menu(self):
-        """Add the application appearance submenus to the in-window Config menu.
+    def _mount_page(self, descriptor):
+        services = self._host_services.for_page(descriptor.key)
+        handle = descriptor.build(services, self)
+        validate_page_handle(descriptor, handle)
+        self.page_descriptor = descriptor
+        self.page_handle = handle
+        self.selected_page_key = descriptor.key
+        # Compatibility name for consumers that need the mounted root widget;
+        # host behavior routes only through the typed handle below.
+        self.main_widget = handle.widget
+        self.setCentralWidget(handle.widget)
+        if self._menus_initialized:
+            self._attach_application_menus()
+            self._sync_capability_actions()
 
-        The visible File/Config controls are the H5Viewer toolbar's tool-buttons
-        (``h5viewer.paramMenu``), NOT the QMainWindow menu bar (which on macOS is
-        the native top-of-screen bar).  Add them there so they sit next to
-        Save/Load/Advanced where the user expects them.  Both are persisted; a
-        change re-applies live through the one appearance owner (the pyqtgraph
-        plot-canvas *background* is still snapshotted at widget creation, so a
-        full plot recolor on a THEME switch needs a relaunch -- a later stage
-        owns per-mode plot backgrounds.  Plot FONTS do follow live)."""
-        try:
-            config_menu = self.main_widget.h5viewer.paramMenu
-        except Exception:
-            logger.exception("Could not locate the Config menu for the theme toggle")
-            return
+    def _init_theme_menu(self):
+        """Build the one application-owned Config/Help action set."""
         settings = _app_settings()
         current = _resolve_theme(settings)
         font_scale = resolve_font_scale(settings)
         accent_color = resolve_accent_color(settings)
         spacing = resolve_spacing(settings)
-        config_menu.addSeparator()
-        theme_menu = config_menu.addMenu("Theme")
+        self.host_config_menu = QtWidgets.QMenu("Config", self.ui.menubar)
+        self.host_config_menu.setObjectName("menuConfig")
+        self.host_help_menu = QtWidgets.QMenu("Help", self.ui.menubar)
+        self.host_help_menu.setObjectName("menuHelp")
+        self.ui.menubar.addAction(self.host_config_menu.menuAction())
+        self.ui.menubar.addAction(self.host_help_menu.menuAction())
+        self._config_separator = QtGui.QAction(self)
+        self._config_separator.setSeparator(True)
+        self.themeMenu = QtWidgets.QMenu("Theme", self)
         group = QtGui.QActionGroup(self)
         group.setExclusive(True)
         for name, label in (("dark", "Dark"), ("light", "Light")):
@@ -355,11 +408,11 @@ class Main(QMainWindow):
             action.triggered.connect(
                 lambda _checked=False, n=name: self._set_theme(n))
             group.addAction(action)
-            theme_menu.addAction(action)
+            self.themeMenu.addAction(action)
         # ONE application-wide preference, five exclusive tiers.  The menu is
         # generated from the theme layer's table so a tier cannot exist in the
         # contract and be missing here (or vice versa).
-        self.fontSizeMenu = config_menu.addMenu("Font Size")
+        self.fontSizeMenu = QtWidgets.QMenu("Font Size", self)
         font_group = QtGui.QActionGroup(self)
         font_group.setExclusive(True)
         self.fontSizeActions = {}
@@ -373,7 +426,7 @@ class Main(QMainWindow):
             font_group.addAction(action)
             self.fontSizeMenu.addAction(action)
             self.fontSizeActions[scale] = action
-        self.accentColorMenu = config_menu.addMenu("Accent Color")
+        self.accentColorMenu = QtWidgets.QMenu("Accent Color", self)
         accent_group = QtGui.QActionGroup(self)
         accent_group.setExclusive(True)
         self.accentColorActions = {}
@@ -388,7 +441,7 @@ class Main(QMainWindow):
             accent_group.addAction(action)
             self.accentColorMenu.addAction(action)
             self.accentColorActions[choice] = action
-        self.spacingMenu = config_menu.addMenu("Spacing")
+        self.spacingMenu = QtWidgets.QMenu("Spacing", self)
         spacing_group = QtGui.QActionGroup(self)
         spacing_group.setExclusive(True)
         self.spacingActions = {}
@@ -403,23 +456,52 @@ class Main(QMainWindow):
             spacing_group.addAction(action)
             self.spacingMenu.addAction(action)
             self.spacingActions[choice] = action
-        self.debugMenu = config_menu.addMenu("Debug")
+        self.debugMenu = QtWidgets.QMenu("Debug", self)
         self.actionDebugWindowState = QtGui.QAction("Window State", self)
         self.actionDebugWindowState.triggered.connect(self._log_window_state)
         self.debugMenu.addAction(self.actionDebugWindowState)
+        self.actionCheckForUpdates = QtGui.QAction("Check for Updates…", self)
+        self.actionCheckForUpdates.triggered.connect(self._check_for_updates)
+        self.actionOpenLogLocation = QtGui.QAction("Open Log Location", self)
+        self.actionOpenLogLocation.triggered.connect(self._open_log_location)
+        self.application_config_actions = (
+            self._config_separator,
+            self.themeMenu.menuAction(),
+            self.fontSizeMenu.menuAction(),
+            self.accentColorMenu.menuAction(),
+            self.spacingMenu.menuAction(),
+            self.debugMenu.menuAction(),
+        )
+        self.application_help_actions = (
+            self.actionCheckForUpdates,
+            self.actionOpenLogLocation,
+        )
+        self._attached_config_menu = None
+        self._attached_help_menu = None
 
-        # Help toolbar group (a top-level group next to Config): Check for
-        # Updates... now; help-doc links can join it later.
+    def _attach_application_menus(self):
+        if PageCapability.APP_MENU_HOSTS in self.page_descriptor.capabilities:
+            points = self.page_handle.app_menus.mount_points()
+            config_menu, help_menu = points.config_menu, points.help_menu
+        else:
+            config_menu, help_menu = self.host_config_menu, self.host_help_menu
         try:
-            help_menu = self.main_widget.h5viewer.helpMenu
-            update_action = QtGui.QAction("Check for Updates…", self)
-            update_action.triggered.connect(self._check_for_updates)
-            help_menu.addAction(update_action)
-            log_action = QtGui.QAction("Open Log Location", self)
-            log_action.triggered.connect(self._open_log_location)
-            help_menu.addAction(log_action)
-        except Exception:
-            logger.exception("Could not set up the Help menu")
+            if self._attached_config_menu is not None:
+                for action in self.application_config_actions:
+                    self._attached_config_menu.removeAction(action)
+            if self._attached_help_menu is not None:
+                for action in self.application_help_actions:
+                    self._attached_help_menu.removeAction(action)
+        except RuntimeError:
+            pass  # a CLEAN page may already have destroyed its menu host
+        for action in self.application_config_actions:
+            config_menu.addAction(action)
+            action.setEnabled(True)
+        for action in self.application_help_actions:
+            help_menu.addAction(action)
+            action.setEnabled(True)
+        self._attached_config_menu = config_menu
+        self._attached_help_menu = help_menu
 
     def _open_log_location(self):
         """Help ▸ Open Log Location — reveal the rotating log file in the OS file
@@ -445,13 +527,15 @@ class Main(QMainWindow):
             QtWidgets.QMessageBox.information(self, "Log Location", str(path))
 
     # ── In-app updater (Help → Check for Updates…) — spec section 4 ───────────
-    def _run_active(self):
-        """True while a processing run holds the display — never update mid-run."""
+    def _run_active(self, *, require_known=False):
+        """Query selected-page activity without inspecting its widget."""
+        if PageCapability.RUN_ACTIVITY not in self.page_descriptor.capabilities:
+            return bool(require_known)
         try:
-            return bool(getattr(
-                self.main_widget.displayframe, "_processing_active", False))
+            return bool(self.page_handle.activity.active())
         except Exception:
-            return False
+            logger.exception("Selected page activity query failed")
+            return True
 
     def _check_for_updates(self):
         from xdart.modules import updater
@@ -511,7 +595,7 @@ class Main(QMainWindow):
             return
         # S3: a processing run may have started during the async PyPI fetch or
         # while this dialog was open -- never rewrite the env under a live run.
-        if self._run_active():
+        if self._run_active(require_known=True):
             QtWidgets.QMessageBox.information(
                 self, "Check for Updates",
                 "A processing run is now active — try again after it finishes.")
@@ -563,15 +647,6 @@ class Main(QMainWindow):
         return str(value)
 
     @classmethod
-    def _widget_size_state(cls, widget):
-        return (
-            f"size={cls._qsize_text(widget.size())} "
-            f"minHint={cls._qsize_text(widget.minimumSizeHint())} "
-            f"min={cls._qsize_text(widget.minimumSize())} "
-            f"max={cls._qsize_text(widget.maximumSize())}"
-        )
-
-    @classmethod
     def _top_level_widget_summary(cls, widget):
         name = widget.objectName() or "-"
         title = widget.windowTitle() or "-"
@@ -579,29 +654,6 @@ class Main(QMainWindow):
             f"{type(widget).__name__}(name={name!r}, title={title!r}, "
             f"size={cls._qsize_text(widget.size())})"
         )
-
-    def _splitter_diagnostic_children(self):
-        ui = getattr(getattr(self, "main_widget", None), "ui", None)
-        labels = (
-            ("left browser", "leftFrame"),
-            ("middle display", "middleFrame"),
-            ("right controls", "rightFrame"),
-        )
-        children = []
-        for label, attr in labels:
-            widget = getattr(ui, attr, None)
-            if widget is not None:
-                children.append((label, widget))
-        if children:
-            return children
-        splitter = getattr(ui, "mainSplitter", None)
-        if splitter is None or not hasattr(splitter, "count"):
-            return []
-        return [
-            (f"mainSplitter[{idx}]", splitter.widget(idx))
-            for idx in range(splitter.count())
-            if splitter.widget(idx) is not None
-        ]
 
     def _log_window_state(self):
         """Log resize/cursor state for diagnosing sporadic window lockups."""
@@ -616,12 +668,14 @@ class Main(QMainWindow):
             self.isMaximized(),
             self.isFullScreen(),
         )
-        for label, widget in self._splitter_diagnostic_children():
-            logger.warning(
-                "Window State splitter child %s: %s",
-                label,
-                self._widget_size_state(widget),
-            )
+        if PageCapability.LAYOUT_DIAGNOSTICS in self.page_descriptor.capabilities:
+            try:
+                logger.warning(
+                    "Window State page: %s",
+                    self.page_handle.diagnostics.describe_layout(),
+                )
+            except Exception:
+                logger.exception("Selected page layout diagnostics failed")
         cursor = QtWidgets.QApplication.overrideCursor()
         cursor_text = "None"
         if cursor is not None:
@@ -720,33 +774,73 @@ class Main(QMainWindow):
             self._shortcut_pin_slice_cut,
         )
 
-    def _main_widget_shortcut(self, method_name):
-        method = getattr(getattr(self, "main_widget", None), method_name, None)
-        if method is None:
-            logger.warning("Shortcut target missing on main_widget: %s", method_name)
-            return
-        try:
-            method()
-        except Exception:
-            logger.exception("Error handling shortcut %s", method_name)
+    @staticmethod
+    def _set_capability_actions(actions, enabled, reason):
+        for action in actions:
+            action.setEnabled(enabled)
+            action.setToolTip("" if enabled else reason)
+            action.setStatusTip("" if enabled else reason)
+
+    def _sync_capability_actions(self):
+        capabilities = self.page_descriptor.capabilities
+        rows = (
+            (PageCapability.OPEN_FOLDER, (self.ui.actionOpen,),
+             "Open Folder is unavailable on this page."),
+            (PageCapability.SETTINGS_PERSISTENCE,
+             (self.actionLoadSettings, self.actionSaveSettings),
+             "Settings persistence is unavailable on this page."),
+            (PageCapability.RUN_CONTROL,
+             (self.actionRunPause, self.actionStopRun),
+             "Run control is unavailable on this page."),
+            (PageCapability.WRITE_MODE_TOGGLE,
+             (self.actionToggleWriteMode,),
+             "Write-mode toggle is unavailable on this page."),
+            (PageCapability.SLICE_PIN, (self.actionPinSliceCut,),
+             "Slice pinning is unavailable on this page."),
+        )
+        for capability, actions, reason in rows:
+            self._set_capability_actions(
+                actions, capability in capabilities, reason)
+
+    def _present_action_outcome(self, outcome):
+        if isinstance(outcome, ActionRefused):
+            self._host_services.status.show(outcome.reason, 5000)
+        return outcome
+
+    def _capability_absent(self):
+        return self._present_action_outcome(
+            ActionRefused(CAPABILITY_UNAVAILABLE))
 
     def _shortcut_run_pause(self):
-        self._main_widget_shortcut("shortcut_run_pause")
+        if PageCapability.RUN_CONTROL not in self.page_descriptor.capabilities:
+            return self._capability_absent()
+        return self._present_action_outcome(
+            self.page_handle.run_control.run_pause())
 
     def _shortcut_stop(self):
-        self._main_widget_shortcut("shortcut_stop")
+        if PageCapability.RUN_CONTROL not in self.page_descriptor.capabilities:
+            return self._capability_absent()
+        return self._present_action_outcome(self.page_handle.run_control.stop())
 
     def _shortcut_toggle_write_mode(self):
-        self._main_widget_shortcut("shortcut_toggle_write_mode")
+        if PageCapability.WRITE_MODE_TOGGLE not in self.page_descriptor.capabilities:
+            return self._capability_absent()
+        return self._present_action_outcome(self.page_handle.write_mode.toggle())
 
     def _shortcut_pin_slice_cut(self):
-        self._main_widget_shortcut("shortcut_pin_slice_cut")
+        if PageCapability.SLICE_PIN not in self.page_descriptor.capabilities:
+            return self._capability_absent()
+        return self._present_action_outcome(self.page_handle.slice_pin.pin())
 
     def _shortcut_load_settings(self):
-        self._main_widget_shortcut("shortcut_load_settings")
+        if PageCapability.SETTINGS_PERSISTENCE not in self.page_descriptor.capabilities:
+            return self._capability_absent()
+        return self._present_action_outcome(self.page_handle.settings_io.load())
 
     def _shortcut_save_settings(self):
-        self._main_widget_shortcut("shortcut_save_settings")
+        if PageCapability.SETTINGS_PERSISTENCE not in self.page_descriptor.capabilities:
+            return self._capability_absent()
+        return self._present_action_outcome(self.page_handle.settings_io.save())
 
     def _apply_appearance(
         self,
@@ -813,27 +907,68 @@ class Main(QMainWindow):
         """Apply application spacing live and persist the choice."""
         self._apply_appearance(spacing=choice)
 
-    def exit(self):
+    def select_page(self, key):
+        target = self.page_registry.get(PageKey(str(key)))
+        if not isinstance(target, PageDescriptor):
+            return ActionRefused(UNKNOWN_PAGE)
+        if target.key == self.selected_page_key:
+            return ActionCompleted(str(target.key))
+        if self.page_descriptor.lifecycle is PageLifecycle.EXIT_ONLY:
+            return ActionRefused(EXIT_ONLY_PAGE)
+        if (PageCapability.RUN_ACTIVITY in self.page_descriptor.capabilities
+                and self._run_active()):
+            return ActionRefused(PAGE_ACTIVE)
+        receipt = self._close_page()
+        if receipt.status is PageCleanup.PENDING:
+            return ActionRefused(CLEANUP_PENDING)
+        self._mount_page(target)
+        _app_settings().setValue("page.selected", str(target.key))
+        return ActionCompleted(str(target.key))
+
+    def _close_page(self):
         try:
-            self.main_widget.close()
-        finally:
-            self.close()
-            gc.collect()
-            # os.killpg is POSIX-only; on Windows it raises AttributeError, which
-            # would escape and skip sys.exit(0) (matters now that exit() is also
-            # the in-app updater's teardown path).
-            if hasattr(os, "killpg"):
-                try:
-                    os.killpg(os.getpid(), signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-            sys.exit(0)
+            return self.page_handle.close()
+        except Exception as exc:
+            logger.exception("Selected page close failed")
+            from xdart.gui.pages.values import CloseReceipt
+            return CloseReceipt(PageCleanup.PENDING, f"close failed: {exc}")
+
+    def closeEvent(self, event):
+        receipt = self._close_page()
+        if receipt.status is PageCleanup.PENDING:
+            event.ignore()
+            if not self._close_retry_scheduled:
+                self._close_retry_scheduled = True
+                QtCore.QTimer.singleShot(50, self._retry_close)
+            return
+        self._close_retry_scheduled = False
+        event.accept()
+        if self._process_exit_requested:
+            QtCore.QTimer.singleShot(0, self._terminate_process)
+
+    def _retry_close(self):
+        self._close_retry_scheduled = False
+        self.close()
+
+    def _terminate_process(self):
+        gc.collect()
+        # os.killpg is POSIX-only; on Windows it raises AttributeError.
+        if hasattr(os, "killpg"):
+            try:
+                os.killpg(os.getpid(), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        sys.exit(0)
+
+    def exit(self):
+        self._process_exit_requested = True
+        self.close()
 
     def openFile(self):
-        try:
-            self.main_widget.open_file()
-        except Exception:
-            logger.exception("Error opening file")
+        if PageCapability.OPEN_FOLDER not in self.page_descriptor.capabilities:
+            return self._capability_absent()
+        return self._present_action_outcome(
+            self.page_handle.open_folder.request())
 
 
 def _apply_cli_session_args(argv):

@@ -101,8 +101,8 @@ class _FakeStaticWidget(QtWidgets.QWidget):
     real page.
     """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.h5viewer = SimpleNamespace(
             paramMenu=QtWidgets.QMenu(self), helpMenu=QtWidgets.QMenu(self))
         self.ui = SimpleNamespace(
@@ -117,9 +117,24 @@ class _FakeStaticWidget(QtWidgets.QWidget):
 
 def _main_window(monkeypatch):
     from xdart import _gui_main
-    monkeypatch.setattr(
-        _gui_main.tabs.static_scan, "staticWidget", _FakeStaticWidget)
-    return _gui_main.Main()
+    from xdart.gui.pages.descriptors import PageDescriptor
+    from xdart.gui.pages.handle import PageHandle
+    from xdart.gui.pages.values import (
+        CloseReceipt, PageCleanup, PageKey, PageLifecycle,
+    )
+    key = PageKey("font-test")
+    clean = CloseReceipt(PageCleanup.CLEAN, "verified")
+
+    def build(_services, parent):
+        return PageHandle(
+            key=key, widget=_FakeStaticWidget(parent), close=lambda: clean)
+
+    descriptor = PageDescriptor(
+        key=key, label="Font Test", order=0, build=build,
+        lifecycle=PageLifecycle.SWITCHABLE, capabilities=frozenset(),
+    )
+    return _gui_main.Main(
+        page_descriptors=(descriptor,), selected_page_key=key)
 
 
 def _submenu(window, title):
@@ -131,7 +146,7 @@ def _submenu(window, title):
     the menu wrapper raises "Internal C++ object already deleted" even though
     Qt is still happily showing the menu.  Hold the pair.
     """
-    for action in window.main_widget.h5viewer.paramMenu.actions():
+    for action in window.host_config_menu.actions():
         menu = action.menu()
         if menu is not None and menu.title() == title:
             return action, menu

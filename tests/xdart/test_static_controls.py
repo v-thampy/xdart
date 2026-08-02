@@ -228,10 +228,14 @@ def test_main_window_shortcuts_are_menu_backed(qapp, monkeypatch, caplog):
     from xdart import _gui_main
 
     class FakeStaticWidget(QtWidgets.QWidget):
-        def __init__(self):
-            super().__init__()
+        def __init__(self, parent=None):
+            super().__init__(parent)
             self.calls = []
             self.h5viewer = SimpleNamespace(paramMenu=QtWidgets.QMenu(self))
+            self.displayframe = SimpleNamespace(_processing_active=False)
+            self.wrangler = SimpleNamespace(thread=None, timers=())
+            self.integratorTree = SimpleNamespace(integrator_thread=None)
+            self.stitch_thread = None
             self.ui = SimpleNamespace(
                 leftFrame=QtWidgets.QFrame(self),
                 middleFrame=QtWidgets.QFrame(self),
@@ -265,13 +269,21 @@ def test_main_window_shortcuts_are_menu_backed(qapp, monkeypatch, caplog):
         def shortcut_save_settings(self):
             self.calls.append("save")
 
-    monkeypatch.setattr(
-        _gui_main.tabs.static_scan, "staticWidget", FakeStaticWidget)
-    window = _gui_main.Main()
+    from dataclasses import replace
+    from xdart.gui.pages.catalog import LEGACY_STATIC_PAGE
+    from xdart.gui.pages.legacy_static import build_legacy_static
+
+    def build(services, parent):
+        return build_legacy_static(
+            services, parent, _widget_factory=FakeStaticWidget)
+
+    descriptor = replace(LEGACY_STATIC_PAGE, build=build)
+    window = _gui_main.Main(
+        page_descriptors=(descriptor,), selected_page_key=descriptor.key)
     try:
         file_actions = [a.text() for a in window.ui.menuFile.actions()]
         run_actions = [a.text() for a in window.ui.menuRun.actions()]
-        config_actions = window.main_widget.h5viewer.paramMenu.actions()
+        config_actions = window.host_config_menu.actions()
 
         assert "Load Settings" in file_actions
         assert "Save Settings" in file_actions
