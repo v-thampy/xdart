@@ -305,6 +305,40 @@ def test_editor_cas_is_identity_and_revision_qualified() -> None:
     assert no_change.state is accepted.state
 
 
+@pytest.mark.parametrize("revision_alias", [True, 1.0])
+def test_editor_refuses_non_integer_revision_aliases(revision_alias: object) -> None:
+    initial = _state(revision=1)
+    editor = ExperimentEditor(initial)
+
+    outcome = editor.propose_calibration(
+        _calibration(wavelength_m=1.2e-10),
+        experiment_id=initial.experiment_id,
+        expected_revision=revision_alias,  # type: ignore[arg-type]
+    )
+
+    assert outcome.status is CasStatus.STALE_REVISION
+    assert outcome.state is initial
+    assert editor.current() is initial
+
+
+def test_editor_refuses_non_string_identity_without_custom_equality() -> None:
+    class EqualityTrap:
+        def __eq__(self, other: object) -> bool:
+            raise AssertionError(f"custom equality invoked with {other!r}")
+
+    initial = _state(revision=1)
+    editor = ExperimentEditor(initial)
+    outcome = editor.propose_mask(
+        MaskState.absent(),
+        experiment_id=EqualityTrap(),  # type: ignore[arg-type]
+        expected_revision=1,
+    )
+
+    assert outcome.status is CasStatus.FOREIGN_IDENTITY
+    assert outcome.state is initial
+    assert editor.current() is initial
+
+
 def test_editor_mask_proposal_changes_only_mask_and_one_revision() -> None:
     initial = _state()
     editor = ExperimentEditor(initial)

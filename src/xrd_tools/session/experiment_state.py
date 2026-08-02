@@ -395,7 +395,6 @@ class ExperimentEditorPort(Protocol):
                             expected_revision: int) -> CasOutcome: ...
     def propose_mask(self, candidate: MaskState, *, experiment_id: str,
                      expected_revision: int) -> CasOutcome: ...
-
 class ExperimentEditor:
     """One locked owner for identity-and-revision-qualified proposals."""
     def __init__(self, initial: ExperimentState):
@@ -406,10 +405,10 @@ class ExperimentEditor:
         with self._lock:
             return self._state
     def _refusal(self, experiment_id: str, revision: int) -> CasOutcome | None:
-        if experiment_id != self._state.experiment_id:
+        if not isinstance(experiment_id, str) or experiment_id != self._state.experiment_id:
             return CasOutcome(CasStatus.FOREIGN_IDENTITY, self._state,
                               "foreign experiment identity")
-        if revision != self._state.revision:
+        if type(revision) is not int or revision != self._state.revision:
             return CasOutcome(CasStatus.STALE_REVISION, self._state,
                               "stale experiment revision")
         return None

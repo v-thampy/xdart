@@ -111,10 +111,11 @@ def _calibration(run: Mapping[str, Any]) -> CalibrationState | None:
 def _geometry(value: Any) -> GeometryState | None:
     gi = _mapping(value)
     if gi is None: return None
-    enabled = gi.get("enabled", False)
-    motor = gi.get("resolved_motor") or gi.get("incidence_motor") or ""
-    if type(enabled) is not bool or not isinstance(motor, str): return None
-    angle = _number(gi.get("th_val"))
+    enabled, motor = gi.get("enabled"), gi.get("resolved_motor") or gi.get("incidence_motor") or ""
+    angle, tilt = _number(gi.get("th_val")), _number(gi.get("tilt_angle"))
+    if (enabled is not None and type(enabled) is not bool) or not isinstance(motor, str): return None
+    if not any((type(enabled) is bool, bool(motor) and (motor.lower() != "manual" or angle is not None), angle is not None, tilt is not None)): return None
+    enabled = enabled is True
     if motor and motor.lower() != "manual":
         incidence = IncidenceState(IncidenceKind.MOTOR, motor,
                                    bool(gi.get("resolved_motor")))
@@ -122,9 +123,8 @@ def _geometry(value: Any) -> GeometryState | None:
         incidence = IncidenceState(IncidenceKind.MANUAL, manual_angle_deg=angle)
     else:
         incidence = IncidenceState()
-    return GeometryState(enabled, incidence, _number(gi.get("tilt_angle")) or 0.0,
+    return GeometryState(enabled, incidence, tilt or 0.0,
                          "pyfai-fiber-v1" if enabled else "")
-
 
 def _sample(value: Any) -> SampleState | None:
     gi = _mapping(value)
@@ -134,7 +134,6 @@ def _sample(value: Any) -> SampleState | None:
     return SampleState(orientation=OrientationState(
         code, "pyfai-fiber-sample-orientation-v1"
     ))
-
 
 class LegacyRecordAdapter:
     """The sole interpreter for Experiment facts in persisted NeXus records."""
@@ -170,19 +169,23 @@ class LegacyRecordAdapter:
         if config is None:
             return PersistedExperimentFacts(ReloadStatus.ABSENT,
                                             reason="reduction config is not a mapping")
-        exact = _mapping(config.get("experiment"))
-        if exact is not None:
+        if "experiment" in config:
+            exact = _mapping(config.get("experiment"))
+            if exact is None: return PersistedExperimentFacts(ReloadStatus.ABSENT, reason="experiment marker is not a mapping")
             state = ExperimentState.from_provenance(exact)
             return PersistedExperimentFacts(
                 ReloadStatus.EXACT, state, state.calibration, state.geometry,
                 state.energy, state.sample, state.content_fingerprint,
             )
         run = _mapping(config.get("run_configuration"))
+        if "run_configuration" in config and run is None: return PersistedExperimentFacts(ReloadStatus.ABSENT, reason="run configuration marker is not a mapping")
         if run is not None:
             calibration, geometry = _calibration(run), _geometry(run.get("gi"))
+            energy, sample = _energy(handle[entry], calibration), _sample(run.get("gi"))
+            if not any((calibration, geometry, energy, sample)): return PersistedExperimentFacts(ReloadStatus.ABSENT, reason="run configuration contains no experiment facts")
             return PersistedExperimentFacts(
                 ReloadStatus.PARTIAL, calibration=calibration, geometry=geometry,
-                energy=_energy(handle[entry], calibration), sample=_sample(run.get("gi")),
+                energy=energy, sample=sample,
                 content_fingerprint=str(run.get("fingerprint") or "") or None,
             )
         gi = config.get("gi_config")
@@ -193,6 +196,4 @@ class LegacyRecordAdapter:
         return PersistedExperimentFacts(
             ReloadStatus.LEGACY, geometry=geometry, energy=energy, sample=sample,
         )
-
-
 __all__ = ["LegacyRecordAdapter", "PersistedExperimentFacts", "ReloadStatus"]

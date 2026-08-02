@@ -170,7 +170,7 @@ def test_disagreeing_persisted_wavelengths_fail_closed_as_conflict(
     assert set(result.energy.evidence) == {"headless", "legacy_source"}
 
 
-def test_partial_malformed_geometry_does_not_invent_bool_semantics(
+def test_malformed_geometry_envelope_is_absent_not_defaulted(
     tmp_path: Path,
 ) -> None:
     record = tmp_path / "malformed-geometry.nxs"
@@ -181,8 +181,106 @@ def test_partial_malformed_geometry_does_not_invent_bool_semantics(
         )
 
     result = LegacyRecordAdapter().read(record)
-    assert result.status is ReloadStatus.PARTIAL
+    assert result.status is ReloadStatus.ABSENT
     assert result.geometry is None
+    assert result.reason
+
+
+@pytest.mark.parametrize("marker", ["not-a-mapping", None, []])
+def test_malformed_exact_marker_cannot_downgrade_to_partial(
+    tmp_path: Path,
+    marker: object,
+) -> None:
+    record = tmp_path / "malformed-exact-marker.nxs"
+    with h5py.File(record, "w") as handle:
+        write_provenance(
+            handle,
+            config={
+                "experiment": marker,
+                "run_configuration": {"gi": {"enabled": False}},
+            },
+        )
+
+    result = LegacyRecordAdapter().read(record)
+    assert result.status is ReloadStatus.ABSENT
+    assert result.experiment is None
+    assert result.geometry is None
+    assert "experiment" in result.reason.lower()
+
+
+@pytest.mark.parametrize("marker", ["not-a-mapping", None, []])
+def test_malformed_run_marker_cannot_downgrade_to_legacy(
+    tmp_path: Path,
+    marker: object,
+) -> None:
+    record = tmp_path / "malformed-run-marker.nxs"
+    with h5py.File(record, "w") as handle:
+        write_provenance(
+            handle,
+            config={
+                "run_configuration": marker,
+                "gi_config": {"enabled": False},
+            },
+        )
+
+    result = LegacyRecordAdapter().read(record)
+    assert result.status is ReloadStatus.ABSENT
+    assert result.experiment is None
+    assert result.geometry is None
+    assert "run configuration" in result.reason.lower()
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"run_configuration": {}},
+        {"gi_config": {}},
+        {"gi_config": {"th_val": None}},
+        {"gi_config": {"tilt_angle": None}},
+        {"gi_config": {"incidence_motor": ""}},
+    ],
+)
+def test_empty_legacy_envelopes_do_not_invent_experiment_facts(
+    tmp_path: Path,
+    config: dict[str, object],
+) -> None:
+    record = tmp_path / "empty-envelope.nxs"
+    with h5py.File(record, "w") as handle:
+        write_provenance(handle, config=config)
+
+    result = LegacyRecordAdapter().read(record)
+    assert result.status is ReloadStatus.ABSENT
+    assert result.experiment is None
+    assert result.calibration is None
+    assert result.geometry is None
+    assert result.energy is None
+    assert result.sample is None
+    assert result.reason
+
+
+@pytest.mark.parametrize(
+    ("config", "status"),
+    [
+        ({"run_configuration": {}}, ReloadStatus.PARTIAL),
+        ({"gi_config": {}}, ReloadStatus.LEGACY),
+    ],
+)
+def test_empty_envelope_keeps_genuine_persisted_energy_fact(
+    tmp_path: Path,
+    config: dict[str, object],
+    status: ReloadStatus,
+) -> None:
+    record = tmp_path / "empty-envelope-with-energy.nxs"
+    with h5py.File(record, "w") as handle:
+        write_provenance(handle, config=config)
+        mono = handle.require_group("entry/instrument/monochromator")
+        mono["wavelength"] = 1.0
+
+    result = LegacyRecordAdapter().read(record)
+    assert result.status is status
+    assert result.geometry is None
+    assert result.energy is not None
+    assert result.energy.wavelength_m == pytest.approx(1.0e-10)
 
 
 def test_malformed_exact_projection_fails_closed(tmp_path: Path) -> None:
