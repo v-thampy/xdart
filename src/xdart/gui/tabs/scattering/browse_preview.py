@@ -1,25 +1,20 @@
-"""Typed Browse preview issuing through one admitted hydration owner."""
+"""Typed Browse preview lifecycle around one admitted hydration owner.
+
+The one-read Browse resolution and its request construction live in
+``ContextProjection.resolve_browse``; this module owns only the owner-bound
+repaint/polling/terminal queries and the release path.
+"""
 
 from __future__ import annotations
 
-from xdart.modules.display_context import BrowseContext, HydrationRequest
-from xrd_tools.session.hydration import (
-    HydrationPurpose,
-    HydrationReadKey,
-    HydrationScope,
-    HydrationToken,
-)
+from xdart.modules.display_context import BrowseContext
 
 from .browse_hydration import _BrowseHydrationOwner
 from .browse_values import (
     BrowseCleanupReceipt,
     BrowseLoadRequest,
 )
-from .context_projection import ProjectionRequest
-from .display_runtime import (
-    DetectorHydrationOutcome,
-    publication_needs_hydration,
-)
+from .display_runtime import DetectorHydrationOutcome
 from .events import CleanupStatus
 
 
@@ -63,60 +58,6 @@ def browse_preview_polling_needed(runtime, owner) -> bool:
 
     bound = _current_browse_hydration(runtime, owner)
     return bound is not None and bound.polling_needed()
-
-
-def request_browse_preview(runtime, request: ProjectionRequest, owner) -> None:
-    """Submit one typed B ``PREVIEW`` for the exact current browse frame
-    whose detector tier is missing/demoted; refuse everything else."""
-    from xdart.modules.display_context import ContextKind
-
-    selection = runtime.selection
-    browse = runtime.browse_context
-    frame = getattr(request, "frame", None)
-    bound = _current_browse_hydration(runtime, owner)
-    if (
-        type(request) is not ProjectionRequest
-        or not request.require_complete
-        or selection is None
-        or request.selection is not selection
-        or selection.kind is not ContextKind.BROWSE
-        or browse is None
-        or browse.invalidated
-        or browse.released
-        or not browse.loaded
-        or bound is None
-        or not runtime.owns_frame(frame)
-        or frame.source_scan != browse.scan_key
-        or frame.artifact != browse.requested_path
-    ):
-        return
-    publication = browse.publication_store.get(frame.local_frame_label)
-    if not publication_needs_hydration(publication, None):
-        return
-    hydration_owner = browse.hydration_owner
-    if not hydration_owner.qualified:
-        return
-    generation = selection.display_generation
-    try:
-        read_key = HydrationReadKey(
-            HydrationScope(*hydration_owner.as_tuple()),
-            browse.requested_path,
-            frame.local_frame_label,
-            HydrationPurpose.PREVIEW,
-        )
-        typed = HydrationRequest(
-            frame.local_frame_label,
-            HydrationPurpose.PREVIEW,
-            generation,
-            hydration_owner,
-            (browse.publication_store,),
-            browse.commit_gate,
-            read_key=read_key,
-            token=HydrationToken(read_key, generation),
-        )
-    except (TypeError, ValueError):
-        return
-    bound.submit(typed)
 
 
 def qualified_event_frame(runtime, event):
@@ -172,5 +113,4 @@ __all__ = [
     "cold_browse_detector_outcome",
     "qualified_event_frame",
     "release_browse",
-    "request_browse_preview",
 ]

@@ -6,14 +6,22 @@ from dataclasses import dataclass
 
 from xdart.modules.display_context import (
     AcquisitionContext, BrowseContext, ContextKind, DisplaySelection)
+from xrd_tools.session.hydration import (
+    HydrationPurpose, HydrationReadKey, HydrationToken)
 
+from .browse_hydration import _BrowseHydrationOwner
 from .browse_preview import qualified_event_frame
 from .browse_values import BrowseLoadRequest
 from .context_projection import ContextProjection, ProjectionRequest
 from .context_values import (
+    _BrowseProjectionPass,
     _navigation_after_append,
     _normalized_navigation,
     _PendingBrowseReplacement,
+    BrowseMissReason,
+    HydrationEligibleMiss,
+    QualifiedPayload,
+    TerminalMiss,
 )
 from .display_retirement import DisplayRetirementReceipt
 from .display_values import (
@@ -34,6 +42,40 @@ class _PendingTraceProjection:
     target: tuple[DisplayFrameKey, ...]
 
 
+def _qualified_browse_resolution(resolution, identity, current, generation,
+                                 browse):
+    """THE one typed-resolution qualifier (§22.3): an exactly valid payload,
+    a miss whose every carried field names the exact current Browse read, or
+    a finite terminal — anything else disqualifies to None."""
+    if type(resolution) is QualifiedPayload:
+        return resolution if display_payload_is_valid(
+            resolution.payload, identity, current, generation) else None
+    if type(resolution) is TerminalMiss:
+        return (resolution
+                if type(resolution.reason) is BrowseMissReason else None)
+    if type(resolution) is not HydrationEligibleMiss:
+        return None
+    request = resolution.request
+    label = current.local_frame_label
+    read_key = request.read_key
+    return resolution if (
+        request.label == label
+        and request.purpose is HydrationPurpose.PREVIEW
+        and request.generation == generation
+        and request.owner == browse.hydration_owner
+        and request.stores == (browse.publication_store,)
+        and request.commit_gate is browse.commit_gate
+        and type(read_key) is HydrationReadKey
+        and read_key.scope == request.scope
+        and read_key.artifact_identity == browse.requested_path
+        and read_key.frame_identity == label
+        and read_key.purpose is HydrationPurpose.PREVIEW
+        and type(request.token) is HydrationToken
+        and request.token.read_key is read_key
+        and request.token.presentation_generation == generation
+    ) else None
+
+
 class _ContextRuntime:
     """Single value owner behind the command-facing context controller."""
 
@@ -52,6 +94,7 @@ class _ContextRuntime:
         self._committed_trace_scope: tuple[object, ...] | None = None
         self._committed_trace_selection: tuple[DisplayFrameKey, ...] = ()
         self._pending_trace_projection: _PendingTraceProjection | None = None
+        self._browse_pass: _BrowseProjectionPass | None = None
 
     @property
     def run_identity(self) -> RunIdentity | None:
@@ -129,6 +172,27 @@ class _ContextRuntime:
             # stale owner.  Residency must reject it too so the shell sees one
             # coherent pending state instead of "resident but no payload".
             return frozenset()
+        if selection.kind is ContextKind.BROWSE:
+            # Residency REUSES only a still-qualified QUALIFIED pass for
+            # current — never a store reread — and clears a disqualified one.
+            current = self._browse_navigation.current
+            others = tuple(
+                frame for frame in self.frame_keys if frame is not current
+            )
+            resident = projection.resident_frame_keys(
+                context, others, browse_hydration_owner
+            )
+            snapshot = self._browse_pass
+            if snapshot is not None and not self._browse_scope_qualified(
+                snapshot.selection, snapshot.current,
+                snapshot.generation, browse_hydration_owner,
+            ):
+                self._browse_pass = None
+                snapshot = None
+            if (current is not None and snapshot is not None
+                    and type(snapshot.resolution) is QualifiedPayload):
+                resident = resident | {current}
+            return resident
         return projection.resident_frame_keys(
             context, self.frame_keys, browse_hydration_owner
         )
@@ -156,6 +220,7 @@ class _ContextRuntime:
             and self._acquisition is not context
         ):
             raise RuntimeError("context runtime already owns acquisition")
+        self.invalidate_browse_pass()
         self._run_identity = run_identity
         self._acquisition = context
         try:
@@ -412,6 +477,88 @@ class _ContextRuntime:
             require_complete,
         )
 
+    def invalidate_browse_pass(self) -> None:
+        self._browse_pass = None
+
+    def _browse_scope_qualified(
+        self, selection, current, generation, owner
+    ) -> bool:
+        """THE one exact-scope predicate (§22.3), requalified around every
+        miss submit, qualified install and pass reuse: the exact live view, a
+        loaded non-invalidated non-released Browse behind an open gate, still
+        named by its selection and bound owner, with nothing pending."""
+        browse = self._browse
+        if browse is None or type(browse) is not BrowseContext:
+            return False
+        return (
+            self._pending_replacement is None
+            and type(owner) is _BrowseHydrationOwner
+            and selection is not None
+            and selection is self._selection
+            and selection.kind is ContextKind.BROWSE
+            and current is not None
+            and current is self._browse_navigation.current
+            and generation == selection.display_generation
+            and browse.loaded
+            and not browse.invalidated
+            and not browse.released
+            and not browse.commit_gate.cancelled
+            and selection.names(browse)
+            and owner.names(browse)
+        )
+
+    def _resolve_browse_pass(
+        self, projection: ContextProjection, request: ProjectionRequest, owner
+    ) -> _BrowseProjectionPass | None:
+        """One-read resolve of the exact anchored current-Browse request: a
+        miss is scope-requalified before and after its verbatim submit, a
+        payload before install; a terminal truthfully records a dead/foreign
+        scope, so it rechecks only exact view identity.  Any exception,
+        malformed result, refused submit or failed qualification: NO pass."""
+        self._browse_pass = None
+        selection = request.selection
+        current = request.frame
+        generation = selection.display_generation
+        browse = self._browse
+        try:
+            resolution = projection.resolve_browse(
+                browse, request, self._selection,
+                self._browse_navigation.current, owner,
+            )
+        except Exception:
+            return None
+        resolution = _qualified_browse_resolution(
+            resolution, request.run_identity, current, generation, browse)
+        if resolution is None:
+            return None
+        if type(resolution) is HydrationEligibleMiss:
+            if not self._browse_scope_qualified(
+                selection, current, generation, owner
+            ):
+                return None
+            try:
+                admitted = owner.submit(resolution.request)
+            except Exception:
+                return None
+            if admitted is None:
+                return None
+        if type(resolution) is TerminalMiss:
+            if (
+                selection is not self._selection
+                or current is not self._browse_navigation.current
+                or generation != selection.display_generation
+                or self._pending_replacement is not None
+            ):
+                return None
+        elif not self._browse_scope_qualified(
+            selection, current, generation, owner
+        ):
+            return None
+        snapshot = _BrowseProjectionPass(
+            selection, current, generation, resolution)
+        self._browse_pass = snapshot
+        return snapshot
+
     def resolve_projection(
         self,
         projection: ContextProjection,
@@ -432,14 +579,38 @@ class _ContextRuntime:
         )
         if context is None:
             return None
-        payload = projection.project(
-            context,
-            request,
-            self._selection,
-            identity,
-            self._selected_frame_by_id(),
-            browse_hydration_owner,
-        )
+        if (
+            request.selection.kind is ContextKind.BROWSE
+            and request.require_complete
+            and request.frame is self._browse_navigation.current
+        ):
+            # THE authoritative current-Browse path: a disqualified held pass
+            # clears and fails this call closed; a qualified one repaints with
+            # no reread; anything else re-resolves once and is consumed HERE.
+            snapshot = self._browse_pass
+            if snapshot is not None and not self._browse_scope_qualified(
+                snapshot.selection, snapshot.current,
+                snapshot.generation, browse_hydration_owner,
+            ):
+                self._browse_pass = None
+                payload = None
+            else:
+                if (snapshot is None
+                        or type(snapshot.resolution) is not QualifiedPayload):
+                    snapshot = self._resolve_browse_pass(
+                        projection, request, browse_hydration_owner)
+                resolution = None if snapshot is None else snapshot.resolution
+                payload = (resolution.payload
+                           if type(resolution) is QualifiedPayload else None)
+        else:
+            payload = projection.project(
+                context,
+                request,
+                self._selection,
+                identity,
+                self._selected_frame_by_id(),
+                browse_hydration_owner,
+            )
         if (
             type(payload) is not StandardDisplayPayload
             or not display_payload_is_valid(
@@ -461,6 +632,10 @@ class _ContextRuntime:
         payloads: list[StandardDisplayPayload] = []
         navigation = self.navigation
         selected = navigation.selected
+        browse_selected = (
+            self._selection is not None
+            and self._selection.kind is ContextKind.BROWSE
+        )
         accumulating = (
             preferences is not None
             and getattr(preferences, "plot_mode", None)
@@ -522,7 +697,9 @@ class _ContextRuntime:
                 payload = self.resolve_projection(
                     projection, request, browse_hydration_owner
                 )
-                if payload is None and require_complete:
+                if payload is None and require_complete and not browse_selected:
+                    # E4's incomplete-acquisition fallback only: a typed
+                    # Browse miss/terminal never buys a second current read.
                     request = self.project_request(
                         frame,
                         require_complete=False,
@@ -661,6 +838,7 @@ class _ContextRuntime:
         pending = self._pending_replacement
         if pending is None or pending.request is not request:
             return False
+        self.invalidate_browse_pass()
         self._pending_replacement = None
         self._selection = None
         self._browse_projection_identity = None
@@ -669,6 +847,7 @@ class _ContextRuntime:
         return True
 
     def invalidate_browse(self) -> None:
+        self.invalidate_browse_pass()
         if self._browse is not None:
             self._browse.invalidate()
 
@@ -710,6 +889,7 @@ class _ContextRuntime:
     def _select(
         self, context: AcquisitionContext | BrowseContext
     ) -> DisplaySelection:
+        self.invalidate_browse_pass()
         self._display_generation += 1
         selection = DisplaySelection.for_context(
             context, self._display_generation)
@@ -778,6 +958,7 @@ class _ContextRuntime:
         self,
         navigation: FrameNavigationProjection,
     ) -> None:
+        self.invalidate_browse_pass()
         prior_frames = self._browse_navigation.frames
         self._browse_navigation = navigation
         if navigation.frames is not prior_frames:

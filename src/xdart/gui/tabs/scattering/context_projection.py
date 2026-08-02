@@ -8,16 +8,31 @@ import json
 from xdart.modules.display_context import (
     AcquisitionContext,
     BrowseContext,
+    ContextKind,
     DisplaySelection,
+    HydrationRequest,
 )
 from xrd_tools.core.energy import (
     WavelengthUnit,
     canonical_wavelength_m,
 )
+from xrd_tools.session.hydration import (
+    HydrationPurpose,
+    HydrationReadKey,
+    HydrationScope,
+    HydrationToken,
+)
 from xrd_tools.session.readiness import ControlPanelRenderState
 from xrd_tools.session.run_configuration import RunIntent
 
 from .browser_catalog import BrowserCatalogEntry
+from .context_values import (
+    BrowseMissReason,
+    BrowseProjectionResolution,
+    HydrationEligibleMiss,
+    QualifiedPayload,
+    TerminalMiss,
+)
 from .controls_readiness import ControlsReadinessProjection
 from .display_values import (
     DisplayFrameKey,
@@ -251,43 +266,137 @@ class ContextProjection:
             )
         ):
             return None
-        view = publication.view
-        records = context.record_store
-        record = (
-            None
-            if records is None
-            else records.get(label)
-        )
-        if record is not None:
-            light_view = record.active_view()
-            view = replace(
-                view,
-                axis_1d=light_view.axis_1d,
-                intensity_1d=light_view.intensity_1d,
-                sigma_1d=light_view.sigma_1d,
-            )
-        measurement, motor = _browse_measurement(context, publication)
-        return StandardDisplayPayload(
-            request.selection.display_generation,
+        return _browse_payload(
+            context,
+            publication,
             frame,
-            f"Browse · {context.scan_key} · frame {label}",
-            view,
-            "browse",
-            measurement_mode=measurement,
-            gi_incidence_motor=motor,
-            gi_resolved_motor=motor,
-            gi_mode_1d=(
-                publication.record.active_mode_1d
-                if measurement == "GI"
-                else ""
-            ),
-            gi_mode_2d=(
-                publication.record.active_mode_2d
-                if measurement == "GI"
-                else ""
-            ),
-            wavelength_m=_browse_wavelength(context),
+            request.selection.display_generation,
         )
+
+    def resolve_browse(
+        self,
+        context: BrowseContext,
+        request: ProjectionRequest,
+        current_selection: DisplaySelection | None,
+        current_frame: DisplayFrameKey | None,
+        owner,
+    ) -> BrowseProjectionResolution:
+        """Resolve the CURRENT Browse frame with at most ONE store read.
+
+        The runtime-owned anchors refuse a request whose selection or frame
+        is not those exact objects by identity, before the read; the Browse
+        request/read key/token are constructed only here, the transport never.
+        """
+        from .browse_hydration import _BrowseHydrationOwner
+
+        if (
+            type(context) is not BrowseContext
+            or type(request) is not ProjectionRequest
+            or type(owner) is not _BrowseHydrationOwner
+        ):
+            return TerminalMiss(BrowseMissReason.UNRESOLVABLE)
+        selection = request.selection
+        frame = request.frame
+        if selection is not current_selection or frame is not current_frame:
+            return TerminalMiss(BrowseMissReason.FOREIGN)
+        generation = selection.display_generation
+        if context.released or context.invalidated or not context.loaded:
+            return TerminalMiss(BrowseMissReason.RETIRED)
+        if context.commit_gate.cancelled:
+            return TerminalMiss(BrowseMissReason.CLOSED)
+        if (
+            selection.kind is not ContextKind.BROWSE
+            or not selection.names(context)
+            or selection.owner != context.hydration_owner
+            or not owner.names(context)
+            or frame.source_scan != context.scan_key
+            or frame.artifact != context.requested_path
+        ):
+            return TerminalMiss(BrowseMissReason.FOREIGN)
+        hydration_owner = context.hydration_owner
+        if not hydration_owner.qualified:
+            return TerminalMiss(BrowseMissReason.UNRESOLVABLE)
+        label = frame.local_frame_label
+        publication = context.publication_store.get(label)
+        if (
+            publication is not None
+            and publication.scan_key != context.scan_key
+        ):
+            return TerminalMiss(BrowseMissReason.FOREIGN)
+        if publication is not None and not publication_needs_hydration(
+            publication,
+            _browse_detector_outcome(context, label, owner),
+        ):
+            return QualifiedPayload(
+                _browse_payload(context, publication, frame, generation)
+            )
+        try:
+            read_key = HydrationReadKey(
+                HydrationScope(*hydration_owner.as_tuple()),
+                context.requested_path,
+                label,
+                HydrationPurpose.PREVIEW,
+            )
+            request = HydrationRequest(
+                label,
+                HydrationPurpose.PREVIEW,
+                generation,
+                hydration_owner,
+                (context.publication_store,),
+                context.commit_gate,
+                read_key=read_key,
+                token=HydrationToken(read_key, generation),
+            )
+        except (TypeError, ValueError):
+            return TerminalMiss(BrowseMissReason.UNRESOLVABLE)
+        return HydrationEligibleMiss(request)
+
+
+def _browse_payload(
+    context: BrowseContext,
+    publication,
+    frame: DisplayFrameKey,
+    generation: int,
+) -> StandardDisplayPayload:
+    """Build the one Browse payload shape from an already-read publication."""
+    label = frame.local_frame_label
+    view = publication.view
+    records = context.record_store
+    record = (
+        None
+        if records is None
+        else records.get(label)
+    )
+    if record is not None:
+        light_view = record.active_view()
+        view = replace(
+            view,
+            axis_1d=light_view.axis_1d,
+            intensity_1d=light_view.intensity_1d,
+            sigma_1d=light_view.sigma_1d,
+        )
+    measurement, motor = _browse_measurement(context, publication)
+    return StandardDisplayPayload(
+        generation,
+        frame,
+        f"Browse · {context.scan_key} · frame {label}",
+        view,
+        "browse",
+        measurement_mode=measurement,
+        gi_incidence_motor=motor,
+        gi_resolved_motor=motor,
+        gi_mode_1d=(
+            publication.record.active_mode_1d
+            if measurement == "GI"
+            else ""
+        ),
+        gi_mode_2d=(
+            publication.record.active_mode_2d
+            if measurement == "GI"
+            else ""
+        ),
+        wavelength_m=_browse_wavelength(context),
+    )
 
 
 def _browse_detector_outcome(

@@ -13,7 +13,6 @@ from .browse_preview import (
     browse_preview_polling_needed,
     browse_preview_repaint_ready,
     release_browse,
-    request_browse_preview,
 )
 from .browse_values import (
     BrowseCleanupReceipt, BrowseLoadOutcome, BrowseLoadRequest,
@@ -111,12 +110,17 @@ class ContextController:
         return self._runtime.owns_frame(frame)
 
     def poll_browse_preview(self) -> bool:
-        return (
+        consumed = (
             not self._closed
             and browse_preview_repaint_ready(
                 self._runtime, self._browse_hydration_owner
             )
         )
+        if consumed:
+            # A consumed cold repaint invalidates the projection pass: the
+            # completed read changed exactly what the pass snapshotted.
+            self._runtime.invalidate_browse_pass()
+        return consumed
 
     def adopt_acquisition(self, run_identity: RunIdentity) -> DisplaySelection:
         if self._closed or type(run_identity) is not RunIdentity:
@@ -305,13 +309,9 @@ class ContextController:
     def resolve_projection(
         self, request: ProjectionRequest
     ) -> StandardDisplayPayload | None:
-        payload = self._runtime.resolve_projection(
+        return self._runtime.resolve_projection(
             self._projection, request, self._browse_hydration_owner
         )
-        request_browse_preview(
-            self._runtime, request, self._browse_hydration_owner
-        )
-        return payload
 
     def project(self, frame: object) -> StandardDisplayPayload | None:
         return self.resolve_projection(self.project_request(frame))
@@ -325,19 +325,6 @@ class ContextController:
     ) -> tuple[StandardDisplayPayload, ...]:
         if self._closed:
             return ()
-        current = self._runtime.navigation.current
-        if current is not None:
-            try:
-                request_browse_preview(
-                    self._runtime,
-                    self._runtime.project_request(
-                        current,
-                        require_complete=True,
-                    ),
-                    self._browse_hydration_owner,
-                )
-            except (RuntimeError, TypeError):
-                pass
         return self._runtime.project_navigation(
             self._projection,
             preferences=preferences,
