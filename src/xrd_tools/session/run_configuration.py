@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from xrd_tools.core.scan import SourceSpec
+from xrd_tools.session.gi_motor import pick_default_gi_motor
 from xrd_tools.sources.selection import (
     DirectorySourceSpec,
     normalize_image_source_metadata,
@@ -178,31 +179,44 @@ def resolve_gi_motor(
     raw: str,
     choices: "list[str] | tuple[str, ...] | None",
 ) -> str:
-    """Validate the effective GI incidence motor ONCE at the run boundary.
+    """Resolve a GI motor for editable, pre-admission projection.
 
     ``raw`` is the operator's stored selection; ``choices`` is the source's real
-    motor list (may include ``'Manual'``).  Rule (R4B-8, one policy):
+    motor list (may include ``'Manual'``).  This public policy keeps Controls
+    constructible while its source catalog is absent or changing:
 
     * a deliberate ``'Manual'`` stays ``'Manual'``;
     * a valid explicit selection (``raw`` is a real motor of the source) wins;
-    * a known catalog missing the explicit selection is rejected; it never
-      substitutes another motor and never turns an explicit motor into
-      ``'Manual'``;
+    * a stale selection falls back to the source's preferred motor or
+      ``'Manual'`` when the known catalog has no incidence-like motor;
     * when no choices list is supplied (``choices is None``) the raw selection
-      is honored as-is — the caller could not offer a source motor list to
-      verify against, so degrading an explicit motor to Manual would silently
-      diverge from what the operator sees.  ``()`` means genuinely
-      empty-and-known (the source was probed and has no real motors); a caller
-      that has NOT probed must pass ``None``, not ``()``.
+      is honored as-is because the caller cannot project against a catalog.
+
+    Run admission deliberately uses :func:`_validate_gi_motor_for_run`
+    instead; an enabled run may never substitute a different motor identity.
     """
-    if type(raw) is not str or not raw.strip():
-        raise ValueError("GI incidence motor must be an explicit nonempty value")
+    raw = str(raw or "Manual")
     if choices is None:
         return raw
     real = [str(c) for c in choices if str(c) and str(c) != "Manual"]
     if raw == "Manual":
         return "Manual"
     if raw in real:
+        return raw
+    return pick_default_gi_motor(real)
+
+
+def _validate_gi_motor_for_run(
+    raw: str,
+    choices: "list[str] | tuple[str, ...] | None",
+) -> str:
+    """Validate an enabled run's GI motor without changing its identity."""
+    if type(raw) is not str or not raw.strip():
+        raise ValueError("GI incidence motor must be an explicit nonempty value")
+    if choices is None:
+        return raw
+    real = [str(c) for c in choices if str(c) and str(c) != "Manual"]
+    if raw == "Manual" or raw in real:
         return raw
     raise ValueError(
         f"GI metadata motor '{raw}' is not present in the admitted motor "
@@ -246,7 +260,7 @@ class GIIntent:
             enabled=enabled,
             incidence_motor=raw,
             resolved_motor=(
-                resolve_gi_motor(raw, choices) if enabled else raw
+                _validate_gi_motor_for_run(raw, choices) if enabled else raw
             ),
             th_val=float(self.th_val),
             sample_orientation=int(self.sample_orientation),

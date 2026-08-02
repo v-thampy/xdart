@@ -10,6 +10,7 @@ import pytest
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.session.readiness import processing_config_from_mapping
 from xrd_tools.session.run_configuration import (
+    FrozenGIConfiguration,
     FrozenRunConfiguration,
     FrozenSourceSpec,
     GIIntent,
@@ -252,16 +253,14 @@ def test_session_package_exposes_values_lazily_without_qt():
 
 
 def test_gi_motor_resolved_once_from_choices():
-    """The effective GI motor is validated once without substitution."""
+    """Editable projection falls back while run admission does not."""
     from xrd_tools.session.run_configuration import resolve_gi_motor
 
+    assert resolve_gi_motor("th", ["halpha", "detx"]) == "halpha"
     assert resolve_gi_motor("halpha", ["halpha", "detx"]) == "halpha"
     assert resolve_gi_motor("detx", ["detx", "dety"]) == "detx"
     assert resolve_gi_motor("Manual", ["halpha"]) == "Manual"
-    with pytest.raises(ValueError, match="GI metadata motor 'th'"):
-        resolve_gi_motor("th", ["halpha", "detx"])
-    with pytest.raises(ValueError, match="GI metadata motor 'th'"):
-        resolve_gi_motor("th", ["detx", "dety"])
+    assert resolve_gi_motor("th", ["detx", "dety"]) == "Manual"
     assert resolve_gi_motor("th", None) == "th"
 
     frozen = GIIntent(enabled=True, incidence_motor="th", th_val=0.2).freeze(
@@ -285,6 +284,15 @@ def test_gi_missing_raw_motor_cannot_create_a_fallback_run_identity():
             RunIntent(
                 gi=GIIntent(enabled=True, incidence_motor="th")
             ).freeze(gi_motor_choices=choices)
+
+
+def test_enabled_gi_raw_and_resolved_motor_identity_cannot_diverge():
+    with pytest.raises(ValueError, match="raw and resolved motors"):
+        FrozenGIConfiguration(
+            enabled=True,
+            incidence_motor="th",
+            resolved_motor="halpha",
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -620,17 +628,15 @@ def test_clone_candidate_rejects_value_changing_numpy_deepcopy(monkeypatch):
 def test_resolve_gi_motor_none_vs_empty_choices_escape():
     """The ()-vs-None distinction (T-1 escape fix): an explicit saved motor with
     UNKNOWN choices (``None``) must be HONORED (display/frozen must not diverge),
-    while a genuinely EMPTY-and-known list (``()``) rejects it.  No explicit
-    metadata motor may silently become a fixed-angle run."""
+    while editable projection with an EMPTY-and-known list falls back to
+    ``Manual``.  Enabled run admission still rejects that stale identity."""
     from xrd_tools.session.run_configuration import resolve_gi_motor
 
     # Unknown choices (None): the explicit motor is honored as-is.
     assert resolve_gi_motor("halpha", None) == "halpha"
     assert resolve_gi_motor("th", None) == "th"
-    with pytest.raises(ValueError, match="GI metadata motor 'halpha'"):
-        resolve_gi_motor("halpha", ())
-    with pytest.raises(ValueError, match="GI metadata motor 'th'"):
-        resolve_gi_motor("th", ())
+    assert resolve_gi_motor("halpha", ()) == "Manual"
+    assert resolve_gi_motor("th", ()) == "Manual"
     # Freeze honors an explicit motor when the caller cannot supply a list.
     frozen_unknown = GIIntent(enabled=True, incidence_motor="halpha").freeze(
         choices=None)
