@@ -6156,8 +6156,9 @@ def test_t1r_gi_motor_observation_is_source_qualified(qapp, monkeypatch):
         widget._controls_v2_record_gi_motor_observation(["halpha", "detx"])
         obs_a = widget._controls_v2_capture_gi_motor_observation()
         assert obs_a.state == GIMotorObservation.KNOWN_NONEMPTY
-        # choices_for_freeze() is the source's real motor LIST (resolve_gi_motor
-        # then picks the effective motor from it), not the resolved motor.
+        # choices_for_freeze() is the source's real motor list.  Enabled run
+        # admission validates the explicit identity against that list; it does
+        # not apply the editable projection fallback.
         assert obs_a.choices_for_freeze() == ("halpha", "detx")
 
         # Switch to source B (no observation yet) -> UNKNOWN (A's is not reused).
@@ -6181,12 +6182,14 @@ def test_t1r_gi_motor_observation_is_source_qualified(qapp, monkeypatch):
         widget.deleteLater()
 
 
-def test_t1r_unknown_preserves_motor_known_empty_resolves_manual(qapp, monkeypatch):
+def test_t1r_unknown_preserves_motor_known_empty_refuses_enabled_run(
+        qapp, monkeypatch):
     """§12 test 12: at freeze, UNKNOWN choices preserve the operator's explicit
-    motor while KNOWN_EMPTY resolves it to Manual.
+    motor while KNOWN_EMPTY refuses that now-stale enabled-run identity.
 
     RED at 4b59b7da: the GUI mapped every no-real-choice case to None, so the
-    core policy's known-empty ()→Manual distinction was unreachable."""
+    core policy's known-empty distinction was unreachable.  The E6 owner split
+    retains editable fallback but makes enabled run admission fail closed."""
     from xdart.gui.tabs.static_scan.static_scan_widget import GIMotorObservation
     widget = _t1r_widget(monkeypatch)
     try:
@@ -6200,10 +6203,11 @@ def test_t1r_unknown_preserves_motor_known_empty_resolves_manual(qapp, monkeypat
         frozen = widget._prepare_controls_v2_run_configuration()
         assert frozen.gi.effective_motor == "halpha"
 
-        # KNOWN_EMPTY: the source is probed and has no real motors -> Manual.
+        # KNOWN_EMPTY: the source is probed and has no real motors, so an
+        # enabled run cannot retain the explicit halpha identity.
         widget._controls_v2_record_gi_motor_observation([])
-        frozen2 = widget._prepare_controls_v2_run_configuration()
-        assert frozen2.gi.effective_motor == "Manual"
+        with pytest.raises(ValueError, match="GI metadata motor 'halpha'"):
+            widget._prepare_controls_v2_run_configuration()
     finally:
         widget.close()
         widget.deleteLater()
