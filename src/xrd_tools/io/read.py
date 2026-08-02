@@ -387,7 +387,13 @@ def _dequantize_thumbnail(ds: h5py.Dataset) -> np.ndarray:
     vmax = float(ds.attrs.get(vmax_key, 1.0))
     dt = _decode(ds.attrs.get(dtype_key, "uint8"))
     scale = 65535.0 if str(dt) == "uint16" else 255.0
-    return vmin + (arr / scale) * (vmax - vmin)
+    result = vmin + (arr / scale) * (vmax - vmin)
+    mask = ds.parent.get("thumbnail_mask")
+    if mask is not None:
+        invalid = np.asarray(mask[()], dtype=bool)
+        if invalid.shape == result.shape:
+            result[invalid] = np.nan
+    return result
 
 
 def resolve_source_master(
@@ -586,6 +592,7 @@ def get_raw_frame(
     entry: str = "entry",
     allow_thumbnail: bool = True,
     source_root: str | Path | None = None,
+    preserve_dtype: bool = False,
 ) -> np.ndarray:
     """Return the raw detector image for one ``frame`` of a processed scan.
 
@@ -609,6 +616,8 @@ def get_raw_frame(
     grouped Stitch/RSM result (``frames/scan_<scan>/frame_NNNN``), ``None`` is
     the flat single-scan record.  Raises ``KeyError`` when neither a usable
     source pointer nor a thumbnail is present.
+    ``preserve_dtype=True`` is reserved for detector-aware presentation
+    callers; the default retains the historical floating-point result.
     """
     scan_file = Path(scan_file)
     with h5py.File(scan_file, "r") as f:
@@ -626,6 +635,7 @@ def get_raw_frame(
         src_frame_idx,
         thumb,
         allow_thumbnail=allow_thumbnail,
+        preserve_dtype=preserve_dtype,
     )
 
 
@@ -788,12 +798,22 @@ def _raw_frame_or_thumbnail(
     thumb: np.ndarray | None,
     *,
     allow_thumbnail: bool = True,
+    preserve_dtype: bool = False,
 ) -> np.ndarray:
     from xrd_tools.io.image import read_image
 
     if master is not None:
         try:
-            return np.asarray(read_image(master, frame=src_frame_idx), dtype=float)
+            image = read_image(
+                master,
+                frame=src_frame_idx,
+                preserve_dtype=preserve_dtype,
+            )
+            return (
+                np.asarray(image)
+                if preserve_dtype
+                else np.asarray(image, dtype=float)
+            )
         except Exception:
             logger.debug(
                 "get_raw_frame: failed reading master %s frame %d; %s thumbnail",

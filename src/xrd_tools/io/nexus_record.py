@@ -280,21 +280,28 @@ def make_thumbnail_array(image, *, mask_flat=None, global_mask_flat=None,
     """
     if image is None:
         return None
-    arr = np.asarray(image, dtype=np.float32)
-    if arr.ndim != 2:
+    source = np.asarray(image)
+    if source.ndim != 2:
         return None
 
     all_mask = []
     if mask_flat is not None and len(mask_flat) > 0:
-        all_mask.append(np.asarray(mask_flat, dtype=int))
+        all_mask.append(np.asarray(mask_flat, dtype=np.intp).ravel())
     if global_mask_flat is not None and len(global_mask_flat) > 0:
-        all_mask.append(np.asarray(global_mask_flat, dtype=int))
+        all_mask.append(np.asarray(global_mask_flat, dtype=np.intp).ravel())
     if all_mask:
-        flat_mask = np.unique(np.concatenate(all_mask))
-        flat_mask = flat_mask[flat_mask < arr.size]
-        arr_flat = arr.ravel().copy()
-        arr_flat[flat_mask] = np.nan
-        arr = arr_flat.reshape(arr.shape)
+        # Flat-index assignment is already idempotent, so sorting and
+        # uniquing detector-sized masks only adds work to every frame.
+        flat_mask = (
+            all_mask[0] if len(all_mask) == 1 else np.concatenate(all_mask)
+        )
+        flat_mask = flat_mask[
+            (flat_mask >= 0) & (flat_mask < source.size)
+        ]
+        arr = np.array(source, dtype=np.float32, copy=True)
+        arr.ravel()[flat_mask] = np.nan
+    else:
+        arr = np.asarray(source, dtype=np.float32)
 
     h, w = arr.shape
     if h <= max_size and w <= max_size:
@@ -385,13 +392,27 @@ def ensure_frames_container(entry_grp: h5py.Group) -> h5py.Group:
     return _nxcollection(entry_grp, "frames")
 
 
-def write_thumbnail(frame_grp: h5py.Group, thumbnail,
-                    dtype: str = "uint8") -> None:
+def write_thumbnail(
+    frame_grp: h5py.Group,
+    thumbnail,
+    dtype: str = "uint8",
+    *,
+    mask_baked: bool = True,
+) -> None:
     """Quantize + store ``thumbnail`` with its inversion LUT attributes."""
-    arr, lut = quantize_thumbnail(np.asarray(thumbnail), dtype=dtype)
+    source = np.asarray(thumbnail)
+    arr, lut = quantize_thumbnail(source, dtype=dtype)
     ds = frame_grp.create_dataset("thumbnail", data=arr)
     for key, value in zip(THUMBNAIL_LUT_ATTRS, lut):
         ds.attrs[key] = value
+    ds.attrs["mask_baked"] = bool(mask_baked)
+    invalid = ~np.isfinite(source)
+    if invalid.any():
+        frame_grp.create_dataset(
+            "thumbnail_mask",
+            data=invalid,
+            compression="gzip",
+        )
 
 
 def write_frame_source_ref(
@@ -417,6 +438,7 @@ def write_frame_source_ref(
     sub["frame_index"] = int(frame_index)
     snapshot = dict(source_snapshot or {})
     attr_names = {
+        "adapter_id": "adapter_id",
         "size": "file_size",
         "mtime_ns": "file_mtime_ns",
         "frame_count": "frame_count",
@@ -446,6 +468,7 @@ def write_frame_source_ref(
 
 def write_frame_record(frames_grp: h5py.Group, frame_key: str, *,
                        thumbnail=None, thumbnail_dtype: str = "uint8",
+                       thumbnail_mask_baked: bool = True,
                        source_path=None, source_frame_index: int = 0,
                        timestamp=None, source_base=None,
                        source_snapshot=None) -> h5py.Group:
@@ -457,7 +480,12 @@ def write_frame_record(frames_grp: h5py.Group, frame_key: str, *,
     """
     fg = _nxcollection(frames_grp, frame_key)
     if thumbnail is not None and "thumbnail" not in fg:
-        write_thumbnail(fg, thumbnail, dtype=thumbnail_dtype)
+        write_thumbnail(
+            fg,
+            thumbnail,
+            dtype=thumbnail_dtype,
+            mask_baked=thumbnail_mask_baked,
+        )
     if source_path and "source" not in fg:
         write_frame_source_ref(fg, source_path, source_frame_index,
                                source_base=source_base,

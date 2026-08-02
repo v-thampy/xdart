@@ -3,10 +3,8 @@
 Detector-agnostic image I/O for xrd_tools.
 
 Handles: EDF, TIFF, CBF, MarCCD, raw binary, Eiger HDF5, NeXus (.nxs).
-All reads go through fabio so format detection is automatic.
-Eiger master files (``*_master.h5``) are read via fabio's EigerImage,
-which handles external data-file linking transparently.  Other HDF5
-files (NeXus, etc.) fall back to raw h5py when fabio cannot open them.
+HDF5 uses fabio with bounded h5py fallbacks for exact persisted selectors.
+Eiger link stacks retain their master selectors on one open handle.
 Masks come from pyFAI's detector registry, not hardcoded arrays.
 """
 from __future__ import annotations
@@ -195,6 +193,9 @@ def read_image(
     detector: str | tuple[int, int] | None = None,
     raw_dtype: str = "int32",
     raw_header_skip: int = 0,
+    dataset_path: str | None = None,
+    preserve_dtype: bool = False,
+    exact_frame: bool = False,
 ) -> np.ndarray:
     """
     Read a single detector image frame.
@@ -227,7 +228,6 @@ def read_image(
         NumPy dtype string for raw binary files (default ``'int32'``).
     raw_header_skip : int
         Bytes to skip at the start of raw binary files (default ``0``).
-
     Returns
     -------
     np.ndarray
@@ -235,6 +235,11 @@ def read_image(
     """
     path = Path(path)
     ext = path.suffix.lower()
+    if (type(preserve_dtype) is not bool or type(exact_frame) is not bool or
+            (dataset_path is not None and (type(dataset_path) is not str or not dataset_path))):
+        raise TypeError("dataset selector/native-dtype policy is malformed")
+    if exact_frame and (type(frame) is not int or frame < 0):
+        raise TypeError("exact frame index must be a nonnegative integer")
 
     # Resolve detector shape: explicit tuple wins, then detector name lookup
     shape = detector_shape or resolve_detector_shape(detector)
@@ -248,9 +253,14 @@ def read_image(
         arr = np.load(path)
         if arr.ndim > 2:
             arr = arr[frame]
+        elif exact_frame and frame:
+            raise IndexError("single-frame source has only frame 0")
+    elif dataset_path is not None and ext in {".h5", ".hdf5", ".nxs"}:
+        if not exact_frame:
+            _reject_if_processed_xdart(path)
+        arr = _read_hdf5_frame(path, frame, dataset_path, exact=exact_frame)
     elif ext in {".h5", ".hdf5"} and _is_eiger_master(path):
-        # Eiger master files — fabio handles external data-file linking
-        arr = _read_fabio_frame(path, frame)
+        arr = _read_fabio_frame(path, frame, exact=exact_frame)
     elif ext in {".h5", ".hdf5", ".nxs"}:
         # Reject processed xdart scan files up front (before fabio, which
         # might otherwise pick up a reduced dataset) — they carry no raw
@@ -258,22 +268,25 @@ def read_image(
         _reject_if_processed_xdart(path)
         # Other HDF5 (NeXus, etc.) — try fabio first, fall back to h5py
         try:
-            arr = _read_fabio_frame(path, frame)
+            arr = _read_fabio_frame(path, frame, exact=exact_frame)
         except Exception:
             logger.debug("fabio could not open %s, falling back to h5py", path)
             arr = _read_hdf5_frame(path, frame)
     else:
         # EDF, TIFF, CBF, raw, etc. — try fabio, fall back to raw binary
         try:
-            arr = _read_fabio_frame(path, frame)
+            arr = _read_fabio_frame(path, frame, exact=exact_frame)
         except Exception:
             if shape is None:
                 raise
+            if exact_frame and frame:
+                raise IndexError("single-frame source has only frame 0")
             logger.debug("fabio could not open %s, falling back to raw binary",
                          path)
             arr = _read_raw_binary(path, shape, raw_dtype, raw_header_skip)
 
-    arr = arr.astype(float, copy=False)
+    if not preserve_dtype or threshold is not None or mask is not None:
+        arr = arr.astype(float, copy=False)
 
     if threshold is not None:
         arr[arr > threshold] = np.nan
@@ -597,9 +610,11 @@ def count_frames(path: Path | str) -> int:
 
 # --- private helpers ---
 
-def _read_fabio_frame(path: Path, frame: int) -> np.ndarray:
+def _read_fabio_frame(path: Path, frame: int, *, exact: bool = False) -> np.ndarray:
     """Read a single frame via fabio (works for all formats incl. Eiger)."""
     with fabio.open(path) as f:
+        if exact and not 0 <= frame < f.nframes:
+            raise IndexError(f"frame index {frame} out of range [0, {f.nframes})")
         if f.nframes == 1 or frame == 0:
             return np.asarray(f.data)
         return np.asarray(f.get_frame(frame).data)
@@ -641,10 +656,26 @@ def _reject_if_processed_xdart(path: Path) -> None:
         )
 
 
-def _read_hdf5_frame(path: Path, frame: int) -> np.ndarray:
+def _read_hdf5_frame(path: Path, frame: int, dataset_path: str | None = None, *, exact: bool = False) -> np.ndarray:
     """Read a single frame via raw h5py (fallback for non-Eiger HDF5)."""
     with h5py.File(path, "r") as f:
-        dataset = _find_hdf5_image_dataset(f)
+        anchor = dataset_path or ""
+        parent, _, name = anchor.rpartition("/")
+        dataset = f[dataset_path] if dataset_path is not None else _find_hdf5_image_dataset(f)
+        if exact:
+            from xrd_tools.io.nexus import NexusImageStack
+            from xrd_tools.io.processed_scan_id import ProcessedXdartInputError, is_processed_xdart_file
+            if is_processed_xdart_file(f):
+                raise ProcessedXdartInputError(f"{path} is a processed xdart scan file")
+            if not anchor:
+                anchor = dataset.name
+                parent, _, name = anchor.rpartition("/")
+            paths = [anchor]
+            if name.startswith("data_") and len(name) == 11 and name[5:].isdigit():
+                paths = [f"{parent}/{key}" for key in sorted(f[parent or "/"]) if
+                         key.startswith("data_") and len(key) == 11 and key[5:].isdigit()]
+            with NexusImageStack(f, paths) as stack:
+                return np.asarray(stack[frame])
         if dataset.ndim == 2:
             return dataset[:]
         return dataset[frame]

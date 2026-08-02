@@ -151,6 +151,7 @@ def open_source(uri_or_spec: str | Path | SourceSpec | FrameSource, **opts: Any)
         opts = dict(spec.options)
         files = opts.pop("files", ())
         opts.pop("selected_file", None)
+        opts.pop("selection_mode", None)
         scan_name = opts.pop("scan_name", None)
         if files:
             opts.pop("pattern", None)
@@ -325,6 +326,7 @@ def _tiff_series_open(spec: SourceSpec) -> FrameSource:
     opts = dict(spec.options)
     files = opts.pop("files", ())
     opts.pop("selected_file", None)
+    opts.pop("selection_mode", None)
     scan_name = opts.pop("scan_name", None)
     if files:
         opts.pop("pattern", None)

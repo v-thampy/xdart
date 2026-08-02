@@ -1,0 +1,327 @@
+{
+  "schema": 1,
+  "baseline_commit": "c1e354c3017c9da206bb6ebde66fc322c0084c55",
+  "baseline_tree": "e33fa460a1694e8e0c3cdb3420fe6073897b6270",
+  "scan_roots": [
+    "src/xdart/gui/tabs/scattering",
+    "tests/xdart/scattering"
+  ],
+  "match": "whole_name_source",
+  "removed_files": [
+    {
+      "path": "src/xdart/gui/tabs/scattering/display_view.py",
+      "baseline_blob": "4e2c71cd5f72bc9d23f195a49d499b16d473d1ed"
+    },
+    {
+      "path": "src/xdart/gui/tabs/scattering/close_owner.py",
+      "baseline_blob": "3901a292d942aa1e0cba40be5c83c768e8c0c441"
+    }
+  ],
+  "retired_tokens": [
+    {
+      "token": "DisplayTarget",
+      "baseline_production": 10,
+      "baseline_tests": 4,
+      "tip_expected": 0
+    },
+    {
+      "token": "display_target",
+      "baseline_production": 1,
+      "baseline_tests": 1,
+      "tip_expected": 0
+    },
+    {
+      "token": "_display_target",
+      "baseline_production": 5,
+      "baseline_tests": 0,
+      "tip_expected": 0
+    },
+    {
+      "token": "select_display_target",
+      "baseline_production": 1,
+      "baseline_tests": 1,
+      "tip_expected": 0
+    },
+    {
+      "token": "project_display",
+      "baseline_production": 3,
+      "baseline_tests": 12,
+      "tip_expected": 0
+    },
+    {
+      "token": "StandardDisplayView",
+      "baseline_production": 4,
+      "baseline_tests": 20,
+      "tip_expected": 0
+    },
+    {
+      "token": "display_view",
+      "baseline_production": 1,
+      "baseline_tests": 16,
+      "tip_expected": 0
+    },
+    {
+      "token": "_selection_generation",
+      "baseline_production": 4,
+      "baseline_tests": 1,
+      "tip_expected": 0
+    },
+    {
+      "token": "_display_identity",
+      "baseline_production": 11,
+      "baseline_tests": 15,
+      "tip_expected": 0
+    },
+    {
+      "token": "_pending_display_cleanup",
+      "baseline_production": 1,
+      "baseline_tests": 19,
+      "tip_expected": 0
+    },
+    {
+      "token": "_close_historical_display",
+      "baseline_production": 2,
+      "baseline_tests": 0,
+      "tip_expected": 0
+    },
+    {
+      "token": "_select_display_frame",
+      "baseline_production": 3,
+      "baseline_tests": 10,
+      "tip_expected": 0
+    },
+    {
+      "token": "_render_display_selection",
+      "baseline_production": 3,
+      "baseline_tests": 0,
+      "tip_expected": 0
+    },
+    {
+      "token": "_active_mode",
+      "baseline_production": 5,
+      "baseline_tests": 0,
+      "tip_expected": 0
+    },
+    {
+      "token": "CloseObligation",
+      "baseline_production": 13,
+      "baseline_tests": 0,
+      "tip_expected": 0
+    },
+    {
+      "token": "PendingClose",
+      "baseline_production": 7,
+      "baseline_tests": 0,
+      "tip_expected": 0
+    },
+    {
+      "token": "close_owner",
+      "baseline_production": 16,
+      "baseline_tests": 0,
+      "tip_expected": 0
+    },
+    {
+      "token": "_pending_close",
+      "baseline_production": 12,
+      "baseline_tests": 0,
+      "tip_expected": 0
+    },
+    {
+      "token": "_retry_pending_close",
+      "baseline_production": 2,
+      "baseline_tests": 0,
+      "tip_expected": 0
+    },
+    {
+      "token": "_complete_pending_close",
+      "baseline_production": 5,
+      "baseline_tests": 0,
+      "tip_expected": 0
+    },
+    {
+      "token": "frame_label",
+      "baseline_production": 17,
+      "baseline_tests": 33,
+      "tip_expected": 0
+    },
+    {
+      "token": "available_frame_labels",
+      "baseline_production": 5,
+      "baseline_tests": 2,
+      "tip_expected": 0
+    },
+    {
+      "token": "available_frame_keys",
+      "baseline_production": 7,
+      "baseline_tests": 1,
+      "tip_expected": 0
+    },
+    {
+      "token": "append_frame",
+      "baseline_production": 6,
+      "baseline_tests": 3,
+      "tip_expected": 0
+    },
+    {
+      "token": "artifact_keys",
+      "baseline_production": 2,
+      "baseline_tests": 0,
+      "tip_expected": 0
+    },
+    {
+      "token": "for_artifact",
+      "baseline_production": 5,
+      "baseline_tests": 0,
+      "tip_expected": 0
+    },
+    {
+      "token": "display_artifacts",
+      "baseline_production": 3,
+      "baseline_tests": 2,
+      "tip_expected": 0
+    },
+    {
+      "token": "start_closed_is_valid",
+      "baseline_production": 4,
+      "baseline_tests": 0,
+      "tip_expected": 0
+    }
+  ],
+  "forbidden_class_members": [
+    {
+      "path": "src/xdart/gui/tabs/scattering/display_values.py",
+      "class": "StandardRunEvent",
+      "members": [
+        "frame_label"
+      ]
+    },
+    {
+      "path": "src/xdart/gui/tabs/scattering/display_values.py",
+      "class": "StandardDisplayPayload",
+      "members": [
+        "run_identity",
+        "frame_label",
+        "progress_completed",
+        "progress_total",
+        "artifact",
+        "available_frame_labels",
+        "available_frame_keys"
+      ]
+    },
+    {
+      "path": "src/xdart/gui/tabs/scattering/display_catalog.py",
+      "class": "DisplayCatalogIndex",
+      "members": [
+        "_artifacts",
+        "_labels",
+        "current_artifact",
+        "adopt",
+        "for_artifact"
+      ]
+    },
+    {
+      "path": "src/xdart/gui/tabs/scattering/display_runtime.py",
+      "class": "RunDisplayState",
+      "members": [
+        "entries",
+        "append_frame",
+        "artifact_keys",
+        "for_artifact"
+      ]
+    },
+    {
+      "path": "src/xdart/gui/tabs/scattering/adapters/run_executor.py",
+      "class": "_StandardRun",
+      "members": [
+        "payloads",
+        "display_artifacts",
+        "frame_catalog",
+        "hydration_generation",
+        "hydration_thread",
+        "hydration_request",
+        "hydration_failure"
+      ]
+    },
+    {
+      "path": "src/xdart/gui/tabs/scattering/browse_values.py",
+      "class": "BrowseLoadRequest",
+      "members": [
+        "context_token"
+      ]
+    }
+  ],
+  "forbidden_constructor_parameters": [
+    {
+      "path": "src/xdart/gui/tabs/scattering/display_runtime.py",
+      "class": "RunDisplayState",
+      "parameters": [
+        "payloads",
+        "catalog"
+      ]
+    }
+  ],
+  "forbidden_module_members": [
+    {
+      "path": "src/xdart/gui/tabs/scattering/display_runtime.py",
+      "members": [
+        "_CatalogIndex"
+      ]
+    }
+  ],
+  "exact_key_methods": [
+    {
+      "path": "src/xdart/gui/tabs/scattering/display_catalog.py",
+      "class": "DisplayCatalogIndex",
+      "method": "resolve",
+      "parameter": "frame"
+    },
+    {
+      "path": "src/xdart/gui/tabs/scattering/display_runtime.py",
+      "class": "RunDisplayState",
+      "method": "resolve_frame",
+      "parameter": "frame"
+    },
+    {
+      "path": "src/xdart/gui/tabs/scattering/display_runtime.py",
+      "class": "RunDisplayState",
+      "method": "project",
+      "parameter": "frame"
+    }
+  ],
+  "single_publication": {
+    "token": "APPEND_UNAVAILABLE",
+    "owner": "src/xdart/gui/tabs/scattering/output_values.py",
+    "forbidden_import_module": "xdart.gui.tabs.scattering.output_preflight"
+  },
+  "forbidden_page_members": [
+    "display",
+    "controls",
+    "source_view",
+    "readiness_label",
+    "notice_label",
+    "run_button",
+    "stop_button",
+    "_selection_generation",
+    "_display_identity",
+    "_display_target",
+    "_active_mode",
+    "_current_frame",
+    "_current_frame_key",
+    "_selected_frame",
+    "_selected_frames",
+    "_frame",
+    "_frame_label",
+    "_frame_keys",
+    "_available_frame_labels",
+    "_available_frame_keys",
+    "_display_payload",
+    "_last_display_payload",
+    "_shell_projection",
+    "_shell_state",
+    "_projection_cache",
+    "_run_identity",
+    "_selection",
+    "_acquisition",
+    "_browse"
+  ]
+}

@@ -52,8 +52,17 @@ import threading
 from dataclasses import dataclass, field, fields as dataclass_fields
 from enum import Enum
 
+from xrd_tools.session.hydration import (
+    HydrationPurpose,
+    HydrationReadKey,
+    HydrationScope,
+    HydrationToken,
+    normalize_hydration_purpose,
+)
+
 __all__ = [
     "CommitGate",
+    "CurrentDisplayScope",
     "HydrationOwner",
     "HydrationRequest",
     "FINALIZATION_FINALIZED",
@@ -156,12 +165,13 @@ class CommitGate:
     context owners, created with them and cancelled by their own lifecycle.
     """
 
-    __slots__ = ("_lock", "_epoch", "_cancelled")
+    __slots__ = ("_lock", "_epoch", "_cancelled", "_reserved_epoch")
 
     def __init__(self):
         self._lock = threading.Lock()
         self._epoch = 1
         self._cancelled = False
+        self._reserved_epoch = 0
 
     @property
     def epoch(self) -> int:
@@ -191,13 +201,33 @@ class CommitGate:
     def advance(self) -> int:
         """Move to a new epoch, invalidating every request minted before it."""
         with self._lock:
+            if self._reserved_epoch:
+                epoch = self._reserved_epoch
+                self._reserved_epoch = 0
+                return epoch
             self._epoch += 1
+            return self._epoch
+
+    def reserve_advance(self) -> int:
+        """Invalidate the old epoch before an owner publishes replacement state.
+
+        The owner then calls :meth:`advance` to consume this one reservation
+        before publishing its immutable replacement reference.  The narrow
+        interval between the calls can expose only the old coherent reference,
+        whose epoch this gate already refuses.
+        """
+        with self._lock:
+            if self._reserved_epoch:
+                raise DisplayContextError("a commit-gate advance is in progress")
+            self._epoch += 1
+            self._reserved_epoch = self._epoch
             return self._epoch
 
     def cancel(self) -> None:
         """Permanently withdraw commit authority (idempotent)."""
         with self._lock:
             self._cancelled = True
+            self._reserved_epoch = 0
             self._epoch += 1
 
 
@@ -238,6 +268,16 @@ class DisplayBindings:
     @classmethod
     def field_names(cls) -> tuple:
         return tuple(f.name for f in dataclass_fields(cls))
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentDisplayScope:
+    """One coherent acquisition display scope, published by one reference."""
+
+    scan_key: str
+    source: str
+    display_scan: object
+    commit_epoch: int
 
 
 def _owner_text(value) -> str:
@@ -339,8 +379,8 @@ class HydrationRequest:
     the resumed run's store.
     """
 
-    label: object
-    purpose: str
+    label: int | str
+    purpose: HydrationPurpose
     generation: int
     #: §12.6 B.2 — the context's OWN projection, stored whole.  Four parallel
     #: scalars meant the owner was RECONSTRUCTED at every hop, and each
@@ -349,6 +389,41 @@ class HydrationRequest:
     owner: HydrationOwner
     stores: tuple
     commit_gate: object
+    read_key: HydrationReadKey | None = None
+    token: HydrationToken | None = None
+    scope: HydrationScope = field(init=False)
+
+    def __post_init__(self):
+        if (
+            type(self.label) not in (int, str)
+            or self.label == ""
+            or type(self.generation) is not int
+            or self.generation < 0
+        ):
+            raise TypeError("hydration label/generation must be exact values")
+        if type(self.owner) is not HydrationOwner or type(self.stores) is not tuple:
+            raise TypeError("hydration owner and store references are malformed")
+        purpose = normalize_hydration_purpose(self.purpose)
+        scope = HydrationScope(*self.owner.as_tuple())
+        object.__setattr__(self, "purpose", purpose)
+        object.__setattr__(self, "scope", scope)
+        if (self.read_key is None) != (self.token is None):
+            raise ValueError("read_key and token must be supplied together")
+        if self.read_key is None:
+            return
+        if (
+            type(self.read_key) is not HydrationReadKey
+            or type(self.token) is not HydrationToken
+        ):
+            raise TypeError("typed hydration identity is malformed")
+        if (
+            self.token.read_key != self.read_key
+            or self.read_key.scope != scope
+            or self.read_key.purpose is not purpose
+            or self.read_key.frame_identity != self.label
+            or self.token.presentation_generation != self.generation
+        ):
+            raise ValueError("hydration request identity is inconsistent")
 
     @property
     def context_token(self) -> str:
@@ -464,14 +539,10 @@ class AcquisitionContext(_WriteOnceIdentity):
     poni_identity: str = ""
     mask_identity: str = ""
     geometry_identity: str = ""
-    #: The live sub-scan key.  SINGLE WRITER: :meth:`rescope_to`, driven by the
-    #: frame-driven scan-boundary owner.  Initialised to ``run_scan_key``.
-    current_scan_key: str = ""
-    #: The live sub-scan SOURCE, analogous to ``current_scan_key`` and written
-    #: by the same single writer (§11.2.2).  A Directory run's members each
-    #: have their own source file, so a key alone cannot identify which member
-    #: a hydration belongs to.  Initialised to the admitted source.
-    current_source: str = ""
+    #: The live key, source, exact display scan and commit epoch.  SINGLE
+    #: WRITER: :meth:`rescope_to`, which publishes a complete immutable scope
+    #: by replacing this one reference.
+    _current_scope: object = field(init=False, default=_UNSET, repr=False)
     #: This context's commit authority (§9.2.4).  Created with the context and
     #: cancelled by its own lifecycle — one per owner, not a new authority.
     commit_gate: CommitGate = field(default_factory=CommitGate)
@@ -505,14 +576,34 @@ class AcquisitionContext(_WriteOnceIdentity):
     })
 
     def __post_init__(self):
-        if not self.current_scan_key:
-            self.current_scan_key = str(self.run_scan_key or "")
-        if not self.current_source:
-            self.current_source = str(self.source_path or "")
+        if self._current_scope is _UNSET:
+            self._current_scope = CurrentDisplayScope(
+                scan_key=str(self.run_scan_key or ""),
+                source=str(self.source_path or ""),
+                display_scan=self.scan,
+                commit_epoch=self.commit_gate.epoch,
+            )
+
+    @property
+    def current_scope(self) -> CurrentDisplayScope:
+        """The one immutable scope reference currently published."""
+        return self._current_scope
+
+    @property
+    def current_scan_key(self) -> str:
+        return self._current_scope.scan_key
+
+    @property
+    def current_source(self) -> str:
+        return self._current_scope.source
+
+    @property
+    def current_display_scan(self):
+        return self._current_scope.display_scan
 
     @property
     def commit_epoch(self) -> int:
-        return self.commit_gate.epoch
+        return self._current_scope.commit_epoch
 
     @property
     def kind(self) -> ContextKind:
@@ -521,12 +612,14 @@ class AcquisitionContext(_WriteOnceIdentity):
     @property
     def scan_key(self) -> str:
         """The key the display is currently scoped to within this run."""
-        return self.current_scan_key or self.run_scan_key
+        scope = self._current_scope
+        return scope.scan_key or self.run_scan_key
 
     @property
     def source(self) -> str:
         """The source the display is currently scoped to within this run."""
-        return self.current_source or self.source_path
+        scope = self._current_scope
+        return scope.source or self.source_path
 
     @property
     def admitted_source(self) -> str:
@@ -541,36 +634,50 @@ class AcquisitionContext(_WriteOnceIdentity):
     @property
     def hydration_owner(self) -> "HydrationOwner":
         """THE production mint (§12.6 B.1) — one owner, from CURRENT identity."""
-        return HydrationOwner(self.context_token, self.scan_key, self.source,
-                              self.commit_epoch)
+        scope = self._current_scope
+        return HydrationOwner(
+            self.context_token,
+            scope.scan_key or self.run_scan_key,
+            scope.source or self.source_path,
+            scope.commit_epoch,
+        )
 
-    def rescope_to(self, scan_key, source) -> None:
-        """Replace the sub-scan identity with a COMPLETE pair (§12.6 C).
+    def rescope_to(self, scan_key, source, display_scan=_UNSET) -> None:
+        """Replace the sub-scan identity with one COMPLETE selection (§12.6 C).
 
-        Both halves are required and validated BEFORE either is written, so the
-        invalid partial transition is not representable.  An optional
-        ``source`` meant omission could silently mean "reuse the previous one",
-        which is how a new key ended up paired with the previous member's
-        source; and a signal-only rescope could advance the key and the epoch
-        while the later, authoritative frame then saw a matching key and never
-        restamped.
+        Key, source and display scan are validated BEFORE any is written, then
+        advance under the same commit epoch.  Omitting ``display_scan`` keeps
+        the existing scan for genuine within-scan callers; a caller that owns
+        a new artifact passes its exact newly constructed scan.
 
         A genuine same-source rescope passes the current source explicitly —
         see :meth:`rescope_within_source`.
         """
         scan_key = str(scan_key or "")
         source = str(source or "")
-        if not scan_key or not source:
+        scope = self._current_scope
+        display_scan = (
+            scope.display_scan if display_scan is _UNSET else display_scan
+        )
+        if not scan_key or not source or display_scan is None:
             raise DisplayContextError(
-                "a sub-scan boundary needs a complete (scan key, source) "
-                f"pair; got ({scan_key!r}, {source!r})")
-        self.current_scan_key = scan_key
-        self.current_source = source
-        self.commit_gate.advance()
+                "a sub-scan boundary needs a complete "
+                "(scan key, source, display scan) selection")
+        epoch = self.commit_gate.reserve_advance()
+        self._current_scope = CurrentDisplayScope(
+            scan_key=scan_key,
+            source=source,
+            display_scan=display_scan,
+            commit_epoch=epoch,
+        )
+        committed_epoch = self.commit_gate.advance()
+        if committed_epoch != epoch:
+            raise DisplayContextError("commit-gate epoch reservation changed")
 
     def rescope_within_source(self, scan_key) -> None:
         """A boundary that genuinely keeps the current source, said out loud."""
-        self.rescope_to(scan_key, self.source)
+        scope = self._current_scope
+        self.rescope_to(scan_key, scope.source, scope.display_scan)
 
     def adopt_record_store(self, store) -> None:
         """Adopt the streaming session's per-run record store."""
@@ -578,8 +685,9 @@ class AcquisitionContext(_WriteOnceIdentity):
 
     def display_bindings(self) -> DisplayBindings:
         """The complete display surface the selection owner swaps IN."""
+        scope = self._current_scope
         return DisplayBindings(
-            scan=self.scan,
+            scan=scope.display_scan,
             frame=self.frame,
             frame_ids=self.frame_ids,
             frames=self.frames,

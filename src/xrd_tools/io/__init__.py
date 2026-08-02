@@ -113,6 +113,7 @@ from xrd_tools.io.image_source import (
     load_image_frame,
     load_processed_raw_or_thumbnail,
 )
+from xrd_tools.io.frame_preview import DetectorPreviewProjection, FramePreview, read_frame_preview
 
 try:
     from xrd_tools.io.tiled import (

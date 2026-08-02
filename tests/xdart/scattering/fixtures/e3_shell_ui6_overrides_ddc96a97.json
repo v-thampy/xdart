@@ -1,0 +1,18 @@
+{
+  "parent_commit": "ddc96a97e11e19bd6261f6eeeed2716683d1fbb9",
+  "canonical_inventory": "e3_shell_inventory_ff5380a7.json",
+  "ui5_override": "e3_shell_ui5_overrides_2e712ced.json",
+  "image_panes": "canvas and native pyqtgraph interaction only; no standalone image toolbar",
+  "browser": {
+    "refresh": "icon-only standard reload tool button with Refresh tooltip and accessible name",
+    "directory": "separate middle-elided label with exact full-path tooltip"
+  },
+  "tools": "no heading; content-sized buttons in a vertically scrollable container",
+  "section_numbers": "hidden only for the vNext shell through a default-preserving panel option",
+  "navigation": {
+    "owner": "one exact FrameNavigationProjection on ShellProjection",
+    "single": "footer catalogs all frames and selection is the current singleton",
+    "multiple": "footer catalogs selected frames and changes focus without changing membership",
+    "identity": "all membership and commands route by exact DisplayFrameKey identity"
+  }
+}

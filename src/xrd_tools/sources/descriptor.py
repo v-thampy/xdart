@@ -80,6 +80,7 @@ class ContainerDescriptor:
     self_contained: bool | None = None
     # -- cheap physics + lifecycle -------------------------------------------
     wavelength: float | None = None
+    motor_names: tuple[str, ...] | None = None
     is_bluesky: bool = False
     finalized: bool = True
 
@@ -125,6 +126,7 @@ class ContainerDescriptor:
             "is_2d": self.is_2d,
             "self_contained": self.self_contained,
             "wavelength": self.wavelength,
+            "motor_names": self.motor_names,
             "is_bluesky": self.is_bluesky,
             "finalized": self.finalized,
         }
@@ -451,10 +453,17 @@ def describe_container_from_open(
     finalized = (not is_bluesky) or has_end
     scan_name = _scan_name(path)
 
+    motor_names = None
+    if entry_grp is not None:
+        try:
+            from xrd_tools.io.bluesky_nexus import bluesky_all_motor_names
+            motor_names = tuple(bluesky_all_motor_names(entry_grp))
+        except Exception:
+            pass
     common: dict[str, Any] = dict(
         path=path, size=size, mtime_ns=mtime_ns, adapter_id=adapter_id,
         scan_name=scan_name, requested_entry=entry, resolved_entry=resolved_entry,
-        is_bluesky=is_bluesky, finalized=finalized,
+        is_bluesky=is_bluesky, finalized=finalized, motor_names=motor_names,
     )
 
     # Processed xdart output is a decisive terminal skip — never raw input.

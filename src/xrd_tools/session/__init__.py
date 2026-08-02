@@ -67,6 +67,14 @@ __all__ = [
     "empty_norm_aggregate",
     "fold_norm_metadata",
     "next_norm_revision",
+    # Revision-qualified hydration request/completion values (headless):
+    "HydrationPurpose",
+    "HydrationOutcome",
+    "HydrationScope",
+    "HydrationReadKey",
+    "HydrationToken",
+    "HydrationCompletion",
+    "normalize_hydration_purpose",
 ]
 
 _SCAN_SESSION_EXPORTS = {
@@ -137,6 +145,17 @@ _SCAN_NORM_EXPORTS = {
 }
 
 
+_HYDRATION_EXPORTS = {
+    "HydrationPurpose",
+    "HydrationOutcome",
+    "HydrationScope",
+    "HydrationReadKey",
+    "HydrationToken",
+    "HydrationCompletion",
+    "normalize_hydration_purpose",
+}
+
+
 def __getattr__(name: str) -> Any:
     if name == "FrameRecordStore":
         value = getattr(import_module("xrd_tools.session.frame_record_store"), name)
@@ -150,6 +169,8 @@ def __getattr__(name: str) -> Any:
         value = getattr(import_module("xrd_tools.session.run_configuration"), name)
     elif name in _INTENT_STORE_EXPORTS:
         value = getattr(import_module("xrd_tools.session.intent_store"), name)
+    elif name in _HYDRATION_EXPORTS:
+        value = getattr(import_module("xrd_tools.session.hydration"), name)
     elif name in _SCAN_NORM_EXPORTS:
         value = getattr(import_module("xrd_tools.session.scan_norm"), name)
     else:

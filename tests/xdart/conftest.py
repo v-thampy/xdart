@@ -11,6 +11,13 @@ import tempfile
 
 import pytest
 
+
+_GC_WAS_ENABLED = gc.isenabled()
+# Disable the threshold-driven collector as soon as pytest imports this
+# package-local conftest.  Reference counting remains active; the harness
+# below owns every explicit cyclic collection on QApplication's thread.
+gc.disable()
+
 os.environ.setdefault("PYQTGRAPH_QT_LIB", "PySide6")
 os.environ.setdefault("QT_API", "PySide6")
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -40,7 +47,32 @@ os.environ.setdefault(
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _qt_session_teardown():
+def _xdart_qt_harness():
+    """Own QApplication strongly and make cyclic GC main-thread explicit."""
+
+    from tests.xdart.qt_test_harness import QtTestHarness
+
+    harness = QtTestHarness.create()
+    try:
+        yield harness
+    finally:
+        # Dependent session finalizers have completed before this owner retires.
+        if _GC_WAS_ENABLED:
+            gc.enable()
+
+
+@pytest.fixture(autouse=True)
+def _qt_test_boundary(_xdart_qt_harness):
+    """Retire one test's Qt roots, then collect its cycles on the GUI thread."""
+
+    baseline = _xdart_qt_harness.top_level_snapshot()
+    yield
+    _xdart_qt_harness.retire_new_top_levels(baseline)
+    _xdart_qt_harness.collect()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _qt_session_teardown(_xdart_qt_harness):
     """Session-end thread/handle cleanup — the SAFE subset only.
 
     Runs while the interpreter is fully alive: bounded-wait the deliberately
@@ -105,7 +137,7 @@ def _qt_session_teardown():
         pass
     # 4. Python-side garbage only (no Qt event delivery).
     try:
-        gc.collect()
+        _xdart_qt_harness.collect()
     except Exception:
         pass
 

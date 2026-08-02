@@ -148,6 +148,27 @@ def _convert_radial_axis(
     )
 
 
+def convert_radial_axis(
+    radial: np.ndarray,
+    from_unit: str,
+    to_unit: str,
+    wavelength_A: float | None = None,
+) -> np.ndarray:
+    """Convert one detached radial coordinate array.
+
+    This is the public, array-only form of the conversion used by the
+    integration-result containers.  Display consumers can therefore change
+    coordinate presentation without fabricating an integration result or
+    duplicating the wavelength-sensitive q/2theta equations.
+    """
+    return _convert_radial_axis(
+        np.asarray(radial, dtype=float),
+        str(from_unit),
+        str(to_unit),
+        wavelength_A,
+    )
+
+
 def _convert_angular_axis(
     arr: np.ndarray,
     from_unit: str,

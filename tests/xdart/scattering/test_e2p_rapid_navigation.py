@@ -1,0 +1,507 @@
+from __future__ import annotations
+
+import gc
+import json
+import math
+from pathlib import Path
+from threading import current_thread
+from types import SimpleNamespace
+import time
+import weakref
+
+import fabio
+import numpy as np
+from pyqtgraph.Qt import QtCore, QtWidgets
+
+from tests.xdart.scattering import test_e2lv_live_display as lv_support
+from xrd_tools.core.scan import Scan, ScanFrame
+from xrd_tools.reduction import Integration1DPlan, ReductionPlan
+from xrd_tools.session.frame_record_store import FrameRecordStore
+from xrd_tools.core.staging import (
+    browse_publication_max_items,
+    heavy_window,
+    live_record_store_max_items,
+)
+from xrd_tools.session.intent_store import RunIntentStore
+from xrd_tools.session.run_configuration import RunIntent
+from xrd_tools.session.scan_session import ScanSession
+from xrd_tools.sources.selection import image_series_spec
+from xdart.gui.tabs.scattering.adapters import run_executor as executor_module
+from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
+from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
+from xdart.gui.tabs.scattering.contracts import (
+    AcceptedScientificAssets,
+    AdmittedMetadataSource,
+    AdmittedOutput,
+    AdmissionReceipt,
+    OutputDisposition,
+    OutputFact,
+    PlannedOutput,
+    SourceExecutionStamp,
+    SourceFileState,
+)
+from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
+from xdart.gui.tabs.scattering.display_values import StandardEventKind
+from xdart.gui.tabs.scattering.events import CleanupStatus
+from xdart.gui.tabs.scattering.output_preflight import OutputCandidate
+from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+from xdart.gui.tabs.scattering.state_machine import RunPhase
+
+
+_FRAME_COUNT = 651
+_DISPLAY_LIMIT = 2
+# Clean runs are measured in tens of milliseconds; these subsecond ceilings
+# retain ample platform headroom while rejecting a user-visible GUI stall.
+_HEARTBEAT_P95_LIMIT_S = 0.25
+_HEARTBEAT_MAX_LIMIT_S = 0.50
+
+
+def _wait(
+    qapp: QtWidgets.QApplication,
+    predicate,
+    *,
+    timeout: float = 30.0,
+    diagnostic=lambda: "",
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        if predicate():
+            return
+        time.sleep(0.001)
+    raise AssertionError(
+        f"production-shaped E2-P.1 run timed out: {diagnostic()}"
+    )
+
+
+class _TinyIntegrator:
+    detector = SimpleNamespace(mask=None)
+
+    def integrate1d(self, image, npt, *, unit, **_kwargs):
+        time.sleep(0.001)
+        value = float(np.asarray(image).mean())
+        return SimpleNamespace(
+            radial=np.linspace(0.0, 1.0, npt),
+            intensity=np.full(npt, value),
+            sigma=None,
+            unit=unit,
+        )
+
+
+class _TinySource:
+    def __init__(
+        self,
+        selected: Path,
+        lifecycle_facts: list[tuple[str, str]],
+    ) -> None:
+        self._selected = selected
+        self._lifecycle_facts = lifecycle_facts
+        lifecycle_facts.append(("construct", current_thread().name))
+
+    def to_scan(self, *, poni, integrator, output_path):
+        self._lifecycle_facts.append(("to_scan", current_thread().name))
+        frames = [
+            ScanFrame(
+                label,
+                image=np.full((2, 2), label, dtype=np.float32),
+                source_path=self._selected,
+                source_frame_index=label,
+            )
+            for label in range(1, _FRAME_COUNT + 1)
+        ]
+        return Scan(
+            "tiny-651",
+            frames,
+            poni=poni,
+            integrator=integrator,
+            output_path=output_path,
+        )
+
+    def close(self) -> None:
+        self._lifecycle_facts.append(("close", current_thread().name))
+
+
+class _DroppingSink:
+    def __init__(self, *_args, **_kwargs) -> None:
+        self.begin_calls = 0
+        self.write_calls = 0
+        self.finish_calls = 0
+        self.abort_calls = 0
+
+    def begin(self, _scan, _plan) -> None:
+        self.begin_calls += 1
+
+    def write(self, _frame, _reduction) -> None:
+        self.write_calls += 1
+
+    def finish(self, _result) -> None:
+        self.finish_calls += 1
+
+    def abort(self, _result) -> None:
+        self.abort_calls += 1
+
+
+class _TrackingRecordStore(FrameRecordStore):
+    instances: list["_TrackingRecordStore"] = []
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.item_peak = 0
+        self.heavy_peak = 0
+        type(self).instances.append(self)
+
+    def upsert(self, record, **kwargs):
+        result = super().upsert(record, **kwargs)
+        self.item_peak = max(self.item_peak, len(self))
+        self.heavy_peak = max(self.heavy_peak, len(self._heavy_labels))
+        return result
+
+
+class _TrackingScanSession(ScanSession):
+    references: list[weakref.ReferenceType[ScanSession]] = []
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        type(self).references.append(weakref.ref(self))
+
+
+class _TrackingExecutor(StandardRunExecutor):
+    def __init__(self) -> None:
+        super().__init__(max_display_items=_DISPLAY_LIMIT)
+        self.delivered_labels: list[int] = []
+        self.publication_peak = 0
+        self.observed_identity = None
+        self.terminal_detail = ""
+
+    def drain_events(self):
+        events = super().drain_events()
+        self.delivered_labels.extend(
+            event.frame_key.local_frame_label
+            for event in events
+            if (
+                event.kind is StandardEventKind.FRAME_READY
+                and event.frame_key is not None
+            )
+        )
+        if events:
+            self.observed_identity = events[-1].run_identity
+        for event in events:
+            if event.kind is StandardEventKind.FAILED:
+                self.terminal_detail = event.detail
+        run = self._exact_run(self.observed_identity)
+        if run is not None:
+            self.publication_peak = max(
+                self.publication_peak, len(run.display.payloads)
+            )
+        return events
+
+    def terminal_owners(self, run_identity) -> tuple[object, ...]:
+        run = self._exact_run(run_identity)
+        assert run is not None
+        return (
+            run.closed,
+            run.cleanup_status,
+            run.source,
+            run.session,
+            run.records,
+            len(run.display.payloads),
+        )
+
+
+def _accepted_admission(
+    capture,
+    *,
+    cancelled,
+    session_owner,
+    targets_owner,
+) -> AdmissionReceipt:
+    del session_owner
+    if cancelled():
+        raise RuntimeError("admission cancelled")
+    assets = AcceptedScientificAssets(
+        (0.1, 0.01, 0.01, 0.0, 0.0, 0.0, 1e-10, "Tiny"),
+        None,
+        None,
+        None,
+        "tiny-poni",
+        None,
+    )
+    candidate = OutputCandidate.from_start_capture(capture, assets, ())
+    selected = Path(capture.source_capture.source.options["selected_file"])
+    state = SourceFileState.capture(selected)
+    target = Path(capture.intent_snapshot.thaw().save_path)
+    item = PlannedOutput(
+        candidate.source,
+        selected,
+        target,
+        SourceExecutionStamp(
+            state,
+            "tiff_series",
+            _FRAME_COUNT,
+            1,
+            (state,),
+            metadata_sources=(
+                AdmittedMetadataSource(state.path, None),
+            ),
+        ),
+        motor_names=(),
+    )
+    targets_owner((target,))
+    return AdmissionReceipt(
+        capture.request_id,
+        capture.intent_snapshot.revision,
+        capture.source_capture,
+        candidate,
+        (
+            AdmittedOutput(
+                item,
+                OutputDisposition.WRITE,
+                tuple(range(1, _FRAME_COUNT + 1)),
+                OutputFact(False),
+            ),
+        ),
+        assets,
+        (),
+    )
+
+
+def _heartbeat(timer: QtCore.QTimer) -> tuple[list[float], object]:
+    interval = 0.016
+    lateness: list[float] = []
+    last = time.perf_counter()
+
+    def tick() -> None:
+        nonlocal last
+        current = time.perf_counter()
+        lateness.append(max(0.0, current - last - interval))
+        last = current
+
+    timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
+    timer.setInterval(16)
+    timer.timeout.connect(tick)
+    return lateness, tick
+
+
+def test_public_run_delivers_651_frames_with_bounded_retention(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    selected = tmp_path / "tiny_0001.tif"
+    fabio.tifimage.TifImage(
+        data=np.ones((2, 2), dtype=np.uint16)
+    ).write(str(selected))
+    poni = tmp_path / "tiny.poni"
+    poni.write_text("deterministic test calibration")
+    output = tmp_path / "tiny.nxs"
+    source_lifecycle: list[tuple[str, str]] = []
+    source_references: list[weakref.ReferenceType[_TinySource]] = []
+    sinks: list[_DroppingSink] = []
+    _TrackingRecordStore.instances.clear()
+    _TrackingScanSession.references.clear()
+
+    monkeypatch.setattr(
+        executor_module, "build_admission_receipt", _accepted_admission
+    )
+
+    def open_source(_spec):
+        source = _TinySource(selected, source_lifecycle)
+        source_references.append(weakref.ref(source))
+        return source
+
+    monkeypatch.setattr(executor_module, "open_source", open_source)
+    monkeypatch.setattr(
+        executor_module, "poni_to_integrator", lambda _poni: _TinyIntegrator()
+    )
+    monkeypatch.setattr(
+        executor_module,
+        "build_native_int_reduction_plan_from_args",
+        lambda *_args, **_kwargs: ReductionPlan(
+            integration_1d=Integration1DPlan(npt=2),
+            integration_2d=None,
+        ),
+    )
+
+    def sink_factory(*args, **kwargs):
+        sink = _DroppingSink(*args, **kwargs)
+        sinks.append(sink)
+        return sink
+
+    monkeypatch.setattr(executor_module, "NexusSink", sink_factory)
+    monkeypatch.setattr(
+        executor_module, "FrameRecordStore", _TrackingRecordStore
+    )
+    monkeypatch.setattr(executor_module, "ScanSession", _TrackingScanSession)
+
+    intent = RunIntent(
+        source_spec=image_series_spec(selected),
+        poni_file=str(poni),
+        project_root=str(tmp_path),
+        save_path=str(output),
+        output_mode="Overwrite",
+        max_cores=1,
+    )
+    lifecycle = ScatteringCoordinator()
+    executor = _TrackingExecutor()
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(intent),
+        lifecycle=lifecycle,
+        sources=FilesystemSourceAdapter(),
+        executor=executor,
+    )
+    page_ref = weakref.ref(page)
+    shell, controller = lv_support._mounted(page)
+    rendered_raw: list[weakref.ReferenceType[np.ndarray]] = []
+    rendered_labels: list[int] = []
+    original_apply_state = shell.apply_state
+
+    def record_apply_state(state, *, preserve_display: bool = False) -> None:
+        heavy = state.scientific.heavy
+        if heavy is not None:
+            rendered_labels.append(heavy.frame.local_frame_label)
+            if heavy.raw is not None:
+                rendered_raw.append(weakref.ref(heavy.raw))
+        original_apply_state(state, preserve_display=preserve_display)
+
+    shell.apply_state = record_apply_state
+    heartbeat_timer = QtCore.QTimer(page)
+    lateness, heartbeat_slot = _heartbeat(heartbeat_timer)
+    del heartbeat_slot
+    page.show()
+    qapp.processEvents()
+
+    try:
+        _wait(
+            qapp,
+            lambda: shell.run_controls.startButton.isEnabled(),
+        )
+        heartbeat_timer.start()
+        started = time.perf_counter()
+        shell.run_controls.startButton.click()
+        _wait(
+            qapp,
+            lambda: (
+                lifecycle.phase is RunPhase.IDLE
+                and len(executor.delivered_labels) == _FRAME_COUNT
+            ),
+            diagnostic=lambda: (
+                f"phase={lifecycle.phase.value}; "
+                f"delivered={len(executor.delivered_labels)}; "
+                f"terminal={executor.terminal_detail!r}; "
+                f"{lv_support._shell_diagnostic(shell, lifecycle)}"
+            ),
+        )
+        qapp.processEvents()
+        elapsed = time.perf_counter() - started
+        heartbeat_timer.stop()
+
+        assert executor.delivered_labels == list(range(1, _FRAME_COUNT + 1))
+        assert rendered_labels
+        assert rendered_labels[-1] == _FRAME_COUNT
+        assert (
+            shell.scientific.frame_selector.currentData()
+            is controller.frame_keys[-1]
+        )
+        assert (
+            controller.frame_keys[-1].local_frame_label
+            == _FRAME_COUNT
+        )
+        assert shell.scientific.title.text() == "tiny_0001.tif"
+        assert executor.publication_peak <= _DISPLAY_LIMIT
+
+        records = _TrackingRecordStore.instances
+        assert len(records) == 2
+        scientific_records, light_records = records
+        identity = controller.run_identity
+        assert identity is not None
+        assert identity is executor.observed_identity
+        run = executor._exact_run(identity)
+        assert run is not None
+        residency = run.display.residency_snapshot()
+        assert residency.limits.live == live_record_store_max_items(0)
+        assert residency.limits.heavy == heavy_window()
+        assert residency.limits.browse == browse_publication_max_items(0)
+        assert scientific_records._max_items is None
+        assert scientific_records._max_heavy_items is None
+        assert scientific_records.item_peak <= residency.limits.live + 1
+        assert scientific_records.heavy_peak <= residency.limits.heavy + 1
+        assert light_records._max_items is None
+        assert light_records._max_heavy_items is None
+        assert light_records.item_peak == _FRAME_COUNT
+        assert executor.terminal_owners(identity) == (
+            True,
+            CleanupStatus.CLEANED,
+            None,
+            None,
+            None,
+            _DISPLAY_LIMIT,
+        )
+        assert source_lifecycle == [
+            ("construct", "scattering-standard"),
+            ("to_scan", "scattering-standard"),
+            ("close", "scattering-standard"),
+        ]
+        assert len(source_references) == 1
+        assert len(sinks) == 1
+        assert (
+            sinks[0].begin_calls,
+            sinks[0].write_calls,
+            sinks[0].finish_calls,
+            sinks[0].abort_calls,
+        ) == (1, _FRAME_COUNT, 1, 0)
+
+        ordered = sorted(lateness)
+        assert len(ordered) >= 8
+        assert all(math.isfinite(value) and value >= 0.0 for value in ordered)
+        p95 = ordered[min(len(ordered) - 1, int(0.95 * len(ordered)))]
+        maximum = ordered[-1]
+        assert p95 < _HEARTBEAT_P95_LIMIT_S
+        assert maximum < _HEARTBEAT_MAX_LIMIT_S
+        (tmp_path / "e2p1-heartbeat.json").write_text(
+            json.dumps(
+                {
+                    "frames": _FRAME_COUNT,
+                    "projected_in_order": True,
+                    "rendered_final": rendered_labels[-1],
+                    "publication_peak": executor.publication_peak,
+                    "record_peak": scientific_records.item_peak,
+                    "heavy_record_peak": scientific_records.heavy_peak,
+                    "light_record_peak": light_records.item_peak,
+                    "heartbeat_count": len(ordered),
+                    "heartbeat_p95_limit_s": _HEARTBEAT_P95_LIMIT_S,
+                    "heartbeat_max_limit_s": _HEARTBEAT_MAX_LIMIT_S,
+                    "heartbeat_p95_lateness_s": p95,
+                    "heartbeat_max_lateness_s": maximum,
+                    "delivery_wall_s": elapsed,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    finally:
+        heartbeat_timer.stop()
+        page.close_workspace()
+        page.close()
+        page.deleteLater()
+        QtCore.QCoreApplication.sendPostedEvents(
+            None, QtCore.QEvent.Type.DeferredDelete
+        )
+        qapp.processEvents()
+
+    assert lifecycle.closed
+    assert not any(isinstance(value, np.ndarray) for value in vars(page).values())
+    session_refs = tuple(_TrackingScanSession.references)
+    del heartbeat_timer
+    del original_apply_state
+    del record_apply_state
+    del shell
+    del controller
+    del page
+    del executor
+    del run
+    gc.collect()
+    qapp.processEvents()
+    assert page_ref() is None
+    assert all(reference() is None for reference in source_references)
+    assert all(reference() is None for reference in session_refs)
+    assert all(reference() is None for reference in rendered_raw)

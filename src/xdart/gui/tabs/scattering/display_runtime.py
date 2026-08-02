@@ -1,0 +1,983 @@
+"""Qt-free run-scoped display catalog and residency ownership."""
+
+from __future__ import annotations
+
+import logging
+from collections import OrderedDict
+from dataclasses import dataclass, replace
+from enum import Enum
+from pathlib import Path
+from threading import RLock, Thread
+from typing import Callable
+
+import numpy as np
+
+from xdart.modules.display_context import HydrationOwner, HydrationRequest
+from xdart.modules.frame_publication import (
+    FramePublication,
+    PublicationStore,
+    _publication_has_heavy_payload,
+    _publication_has_full_payload,
+)
+from xrd_tools.core import FrameRecord
+from xrd_tools.core.frame_view import DEFAULT_MODE_KEY
+from xrd_tools.core.invalid import (
+    combine_detector_masks,
+    detector_value_mask,
+    integer_saturation_ceiling,
+)
+from xrd_tools.core.staging import (
+    browse_publication_max_items,
+    heavy_window,
+    live_record_store_max_items,
+)
+from xrd_tools.io.frame_preview import DetectorPreviewProjection
+from xrd_tools.session.frame_record_store import FrameRecordStore
+from xrd_tools.session.hydration import (
+    HydrationOutcome,
+    HydrationPurpose,
+    HydrationReadKey,
+    HydrationScope,
+    HydrationToken,
+)
+
+from .display_values import (
+    DisplayFrameCatalog,
+    DisplayFrameKey,
+    DisplayNavigationDelta,
+    StandardDisplayPayload,
+    StandardEventKind,
+    StandardRunEvent,
+)
+from .display_catalog import CATALOG_MAX_ITEMS, DisplayCatalogIndex
+from .display_residency import (
+    DisplayResidencyLimits,
+    DisplayResidencySnapshot,
+    RunDisplayResidency,
+)
+from .events import RunIdentity
+from .hydration_transport import HydrationTransport, PreparedHydrationCommit
+
+
+logger = logging.getLogger(__name__)
+
+THUMBNAIL_MAX_ITEMS = 512
+
+
+class DetectorHydrationOutcome(str, Enum):
+    FRAME_MASK_UNAVAILABLE = "frame_mask_unavailable"
+    DETECTOR_UNAVAILABLE = "detector_unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedCommitState:
+    """Exact pre-attempt state of every public-consumed surface for ONE key
+    (§22.3 prepare half): the abort half restores these captured facts by
+    identity instead of re-deriving them from mutated stores."""
+
+    key: DisplayFrameKey
+    record: FrameRecord | None
+    light: FrameRecord | None
+    outcome_present: bool
+    outcome: "DetectorHydrationOutcome | None"
+    residency: tuple
+
+
+@dataclass(slots=True)
+class DisplayArtifact:
+    artifact: Path
+    source_scan: str
+    records: FrameRecordStore
+    light_records: FrameRecordStore
+    publications: PublicationStore
+    mask: np.ndarray | None = None
+    mask_saturation: bool = True
+    measurement_mode: str = "Standard"
+    gi_incidence_motor: str = ""
+    gi_resolved_motor: str = ""
+    gi_mode_1d: str = ""
+    gi_mode_2d: str = ""
+    #: The accepted detector saturation ceiling, stamped ONCE from the first
+    #: live frame's native integer dtype (single writer:
+    #: :meth:`RunDisplayState.stamp_saturation_ceiling`).  ``None`` means the
+    #: accepted saturation input is unavailable and a toggle-ON preview
+    #: fallback fails closed instead of guessing a ceiling.
+    saturation_ceiling: float | None = None
+    #: Session-owned first-frame value mask copied once for live, persisted,
+    #: and rehydrated detector parity.  ``saturation_mask_seeded`` distinguishes
+    #: a valid empty mask from a run that has not accepted its first frame.
+    saturation_mask: np.ndarray | None = None
+    saturation_mask_seeded: bool = False
+    wavelength_m: float | None = None
+
+
+class RunDisplayState:
+    """One run owner for catalog, payload, and all artifact residency budgets."""
+
+    def __init__(
+        self,
+        identity: RunIdentity,
+        *,
+        max_payload_items: int,
+        catalog_max_items: int | None = None,
+    ) -> None:
+        if type(max_payload_items) is not int or max_payload_items < 1:
+            raise ValueError("max_payload_items must be positive")
+        self.identity = identity
+        self.max_payload_items = max_payload_items
+        self.payloads: OrderedDict[
+            DisplayFrameKey, StandardDisplayPayload
+        ] = OrderedDict()
+        self.artifacts: OrderedDict[str, DisplayArtifact] = OrderedDict()
+        self._catalog_capacity_explicit = catalog_max_items is not None
+        self.catalog = DisplayCatalogIndex(
+            identity,
+            max_items=(
+                CATALOG_MAX_ITEMS
+                if catalog_max_items is None
+                else catalog_max_items
+            ),
+        )
+        self._partition_count = 1
+        self._partition_index = 0
+        self._npt = 0
+        self._frame_bytes: int | None = None
+        self._record_store_factory: Callable[..., FrameRecordStore] = (
+            FrameRecordStore
+        )
+        self._publication_store_factory: Callable[
+            ..., PublicationStore
+        ] = PublicationStore
+        self._configured = False
+        self._residency = RunDisplayResidency(
+            DisplayResidencyLimits(1, 1, 1, 1)
+        )
+        self._lock = RLock()
+        self._event_sink: Callable[[StandardRunEvent], object] | None = None
+        self._transport = HydrationTransport(
+            self.commit_preview, self._derive_target
+        )
+        self._frame_mask_qualified: set[DisplayFrameKey] = set()
+        self._detector_outcomes: dict[
+            DisplayFrameKey, DetectorHydrationOutcome
+        ] = {}
+        self._retired = False
+
+    @property
+    def configured(self) -> bool:
+        return self._configured
+
+    @property
+    def transport(self) -> HydrationTransport:
+        """The ONE composed preview transport this run owns."""
+        return self._transport
+
+    @property
+    def hydration_thread(self) -> Thread | None:
+        """The transport's worker, exposed for page liveness polling."""
+        return self._transport.worker
+
+    def set_factories(
+        self,
+        record_store_factory: Callable[..., FrameRecordStore],
+        publication_store_factory: Callable[..., PublicationStore],
+    ) -> None:
+        if self.artifacts:
+            return
+        self._record_store_factory = record_store_factory
+        self._publication_store_factory = publication_store_factory
+
+    def bind_transport(
+        self,
+        *,
+        event_sink: Callable[[StandardRunEvent], object],
+    ) -> None:
+        """Bind the one repaint event sink; reads go through the transport."""
+        with self._lock:
+            if self._retired:
+                return
+            self._event_sink = event_sink
+
+    def configure(
+        self,
+        *,
+        partition_count: int,
+        npt: int,
+        frame_bytes: int | None,
+    ) -> None:
+        if type(partition_count) is not int or partition_count < 1:
+            raise ValueError("display partition count must be positive")
+        if self.artifacts:
+            return
+        self._partition_count = partition_count
+        self._npt = npt if type(npt) is int and npt > 0 else 0
+        self._frame_bytes = (
+            frame_bytes
+            if type(frame_bytes) is int and frame_bytes > 0
+            else None
+        )
+        self._configured = True
+        if not self._catalog_capacity_explicit:
+            self.catalog.resize(
+                browse_publication_max_items(self._npt)
+            )
+        self._residency = RunDisplayResidency(
+            DisplayResidencyLimits(
+                heavy_window(self._frame_bytes),
+                THUMBNAIL_MAX_ITEMS,
+                browse_publication_max_items(self._npt),
+                live_record_store_max_items(self._npt),
+            )
+        )
+
+    def add_artifact(
+        self,
+        artifact: Path,
+        source_scan: str,
+        *,
+        mask: np.ndarray | None,
+        mask_saturation: bool,
+        measurement_mode: str,
+        gi_incidence_motor: str = "",
+        gi_resolved_motor: str = "",
+        gi_mode_1d: str = "",
+        gi_mode_2d: str = "",
+        wavelength_m: float | None = None,
+    ) -> DisplayArtifact:
+        if not self._configured:
+            self.configure(
+                partition_count=1,
+                npt=0,
+                frame_bytes=None,
+            )
+        if self._partition_index >= self._partition_count:
+            raise RuntimeError("display received more artifacts than admitted")
+        records = self._record_store_factory(
+            max_items=None,
+            max_heavy_items=None,
+        )
+        light_records = self._record_store_factory(
+            max_items=None,
+            max_heavy_items=None,
+        )
+        publications = self._publication_store_factory(
+            max_items=None,
+            max_heavy_items=None,
+            max_thumbnail_items=None,
+        )
+        publications.set_evictable_probe(records.is_persisted)
+        frozen_mask = None if mask is None else np.asarray(mask, dtype=bool)
+        if frozen_mask is not None:
+            frozen_mask.setflags(write=False)
+        owner = DisplayArtifact(
+            artifact=artifact,
+            source_scan=source_scan,
+            records=records,
+            light_records=light_records,
+            publications=publications,
+            mask=frozen_mask,
+            mask_saturation=bool(mask_saturation),
+            measurement_mode=measurement_mode,
+            gi_incidence_motor=gi_incidence_motor,
+            gi_resolved_motor=gi_resolved_motor,
+            gi_mode_1d=gi_mode_1d,
+            gi_mode_2d=gi_mode_2d,
+            wavelength_m=(
+                None if wavelength_m is None else float(wavelength_m)
+            ),
+        )
+        self.artifacts[str(artifact)] = owner
+        self._partition_index += 1
+        return owner
+
+    def append_navigation(
+        self,
+        source_scan: str,
+        artifact: str,
+        local_frame_label: int,
+    ) -> DisplayNavigationDelta:
+        with self._lock:
+            delta = self.catalog.append(
+                source_scan, artifact, local_frame_label
+            )
+            for retired in delta.retired:
+                self._frame_mask_qualified.discard(retired)
+                self._detector_outcomes.pop(retired, None)
+            self._residency.retire_navigation(delta.retired)
+        return delta
+
+    @property
+    def navigation_capacity(self) -> int:
+        return self.catalog.max_items
+
+    def retain_frame(
+        self,
+        owner: DisplayArtifact,
+        key: DisplayFrameKey,
+        record: FrameRecord,
+        publication: FramePublication,
+        *,
+        source_identity: str,
+        frame_mask_qualified: bool,
+    ) -> None:
+        with self._lock:
+            self._detector_outcomes.pop(key, None)
+            if frame_mask_qualified:
+                self._frame_mask_qualified.add(key)
+            else:
+                self._frame_mask_qualified.discard(key)
+            # Residency rollback captures and restores the complete four-tier
+            # order under this same lock. Keep the live producer's stores,
+            # publication, and residency touch in that ownership boundary so
+            # a failed historical hydration cannot restore over a concurrently
+            # published live frame.
+            owner.records.upsert(
+                record,
+                source_identity=source_identity,
+                persisted=True,
+            )
+            owner.light_records.upsert(
+                light_record(record),
+                source_identity=source_identity,
+                persisted=True,
+            )
+            owner.publications.upsert(publication)
+            self._residency.observe(
+                key,
+                records=owner.records,
+                light_records=owner.light_records,
+                publications=owner.publications,
+            )
+            self._residency.enforce()
+
+    def residency_snapshot(self) -> DisplayResidencySnapshot:
+        return self._residency.snapshot()
+
+    def detector_outcome(
+        self, key: DisplayFrameKey
+    ) -> DetectorHydrationOutcome | None:
+        with self._lock:
+            return self._detector_outcomes.get(key)
+
+    def resolve_frame(
+        self, frame: DisplayFrameKey
+    ) -> DisplayFrameKey | None:
+        return self.catalog.resolve(frame)
+
+    def project(
+        self,
+        frame: DisplayFrameKey,
+        selection_generation: int,
+        *,
+        closed: bool,
+        owner: HydrationOwner | None = None,
+        commit_gate: object | None = None,
+        require_complete: bool = True,
+    ) -> StandardDisplayPayload | None:
+        """Project one frame; a missing display tier submits one typed
+        ``PREVIEW`` through the transport when the caller supplies its exact
+        context identity (``owner``) and commit authority (``commit_gate``)."""
+        with self._lock:
+            if self._retired:
+                return None
+            key = self.catalog.resolve(frame)
+            if key is None:
+                return None
+            payload = self.payloads.get(key)
+            artifact_owner = self.artifacts.get(key.artifact)
+            publication = (
+                None
+                if artifact_owner is None
+                else artifact_owner.publications.get(key.local_frame_label)
+            )
+            detector_outcome = self._detector_outcomes.get(key)
+        if artifact_owner is None:
+            return self._qualified_payload(
+                payload,
+                key,
+                selection_generation,
+            )
+        needs_hydration = publication_needs_hydration(
+            publication,
+            detector_outcome,
+        )
+        if needs_hydration and require_complete:
+            self._request_preview(
+                artifact_owner,
+                key,
+                selection_generation,
+                closed,
+                owner,
+                commit_gate,
+            )
+            return None
+        if publication is None:
+            return self._qualified_payload(
+                payload,
+                key,
+                selection_generation,
+            )
+        if payload is None:
+            payload = self._payload_from_publication(
+                artifact_owner,
+                key,
+                publication,
+                closed=closed,
+            )
+        return self._qualified_payload(
+            payload,
+            key,
+            selection_generation,
+        )
+
+    def catalog_snapshot(self) -> DisplayFrameCatalog:
+        return self.catalog.snapshot()
+
+    def put_payload(self, payload: StandardDisplayPayload) -> None:
+        key = payload.frame_key
+        if type(key) is not DisplayFrameKey:
+            return
+        with self._lock:
+            if self._retired:
+                return
+            self.payloads[key] = payload
+            self.payloads.move_to_end(key)
+            while len(self.payloads) > self.max_payload_items:
+                self.payloads.popitem(last=False)
+
+    def retire(self, *, join_timeout: float) -> bool:
+        """Invalidate queued hydration and join or report its exact worker."""
+        with self._lock:
+            self._retired = True
+        return self._transport.retire(join_timeout=join_timeout)
+
+    def _qualified_payload(
+        self,
+        payload: StandardDisplayPayload | None,
+        key: DisplayFrameKey,
+        selection_generation: int,
+    ) -> StandardDisplayPayload | None:
+        if payload is None or payload.frame_key is not key:
+            return None
+        return replace(
+            payload,
+            selection_generation=selection_generation,
+        )
+
+    def _payload_from_publication(
+        self,
+        owner: DisplayArtifact,
+        key: DisplayFrameKey,
+        publication: FramePublication,
+        *,
+        closed: bool,
+    ) -> StandardDisplayPayload:
+        view = publication.view
+        light = owner.light_records.get(key.local_frame_label)
+        if light is not None:
+            light_view = light.active_view()
+            view = replace(
+                view,
+                axis_1d=light_view.axis_1d,
+                intensity_1d=light_view.intensity_1d,
+                sigma_1d=light_view.sigma_1d,
+            )
+        return StandardDisplayPayload(
+            0,
+            key,
+            (
+                f"{owner.measurement_mode} · {key.source_scan} · "
+                f"frame {key.local_frame_label}"
+            ),
+            view,
+            "finished" if closed else "running",
+            measurement_mode=owner.measurement_mode,
+            gi_incidence_motor=owner.gi_incidence_motor,
+            gi_resolved_motor=owner.gi_resolved_motor,
+            gi_mode_1d=owner.gi_mode_1d,
+            gi_mode_2d=owner.gi_mode_2d,
+            wavelength_m=owner.wavelength_m,
+        )
+
+    def stamp_saturation_ceiling(
+        self, owner: DisplayArtifact, image: object
+    ) -> None:
+        """Stamp the dtype-derived ceiling once from the exact live frame;
+        a float frame yields none and a toggle-ON fallback then fails closed
+        rather than inventing one."""
+        if owner.saturation_ceiling is None:
+            owner.saturation_ceiling = integer_saturation_ceiling(image)
+
+    def stamp_saturation_mask(
+        self,
+        owner: DisplayArtifact,
+        mask: np.ndarray | None,
+    ) -> None:
+        """Copy the session's immutable first-frame value mask exactly once."""
+        frozen = None
+        if mask is not None:
+            frozen = np.array(mask, dtype=bool, copy=True)
+            frozen.setflags(write=False)
+        if owner.saturation_mask_seeded:
+            current = owner.saturation_mask
+            if (current is None) != (frozen is None) or (
+                current is not None
+                and frozen is not None
+                and not np.array_equal(current, frozen)
+            ):
+                raise RuntimeError("display saturation mask changed within one run")
+            return
+        owner.saturation_mask = frozen
+        owner.saturation_mask_seeded = True
+
+    def _request_preview(
+        self,
+        art: DisplayArtifact,
+        key: DisplayFrameKey,
+        selection_generation: int,
+        closed: bool,
+        owner: HydrationOwner | None,
+        commit_gate: object | None,
+    ) -> None:
+        """Build and submit one typed acquisition ``PREVIEW`` request."""
+        if (
+            type(owner) is not HydrationOwner
+            or not owner.qualified
+            or commit_gate is None
+        ):
+            return
+        try:
+            scope = HydrationScope(*owner.as_tuple())
+            read_key = HydrationReadKey(
+                scope,
+                key.artifact,
+                key.local_frame_label,
+                HydrationPurpose.PREVIEW,
+            )
+            token = HydrationToken(read_key, int(selection_generation))
+            request = HydrationRequest(
+                key.local_frame_label,
+                HydrationPurpose.PREVIEW,
+                int(selection_generation),
+                owner,
+                (art.records, art.light_records, art.publications),
+                commit_gate,
+                read_key=read_key,
+                token=token,
+            )
+        except (TypeError, ValueError):
+            return
+        self._transport.submit(request, closed=closed)
+
+    def _derive_target(self, request: HydrationRequest):
+        """Derive the frozen values-only projection and exact key ONCE at
+        submit from the exact carried target.  A non-owned target (a Browse
+        store) gets no projection — thumbnails stay free, detector fallback
+        fails closed; a frame-mask-qualified key or a toggle-ON artifact
+        without an accepted ceiling derives the explicit unavailable marker."""
+        artifact = request.read_key.artifact_identity
+        label = request.read_key.frame_identity
+        with self._lock:
+            art = self.artifacts.get(artifact)
+            stores = request.stores
+            exact = (
+                art is not None
+                and len(stores) == 3
+                and stores[0] is art.records
+                and stores[1] is art.light_records
+                and stores[2] is art.publications
+            )
+            if not exact:
+                return None, None
+            key = self.catalog.resolve_exact(artifact, label)
+            if key is not None and key in self._frame_mask_qualified:
+                return DetectorPreviewProjection.unavailable(), key
+            if (
+                art.mask_saturation
+                and not art.saturation_mask_seeded
+                and art.saturation_ceiling is None
+            ):
+                return DetectorPreviewProjection.unavailable(), key
+            projection_mask = art.mask
+            dynamic_saturation = bool(art.mask_saturation)
+            if art.mask_saturation and art.saturation_mask_seeded:
+                dynamic_saturation = False
+                if art.saturation_mask is not None:
+                    projection_mask = combine_detector_masks(
+                        art.mask,
+                        art.saturation_mask,
+                        art.saturation_mask.shape,
+                    )
+            policy = {
+                "mask_saturation": dynamic_saturation,
+                "saturation_ceiling": (
+                    art.saturation_ceiling if dynamic_saturation else None
+                ),
+            }
+            if projection_mask is not None:
+                return (
+                    DetectorPreviewProjection.from_mask(projection_mask, **policy),
+                    key,
+                )
+            return DetectorPreviewProjection.without_static_mask(**policy), key
+
+    def commit_preview(
+        self, prepared: PreparedHydrationCommit
+    ) -> HydrationOutcome:
+        """THE one target-port operation: validate under this run's lock plus
+        the exact request-carried CommitGate, perform the idempotent
+        supporting updates, publish the authoritative publication/payload
+        last; rejection changes no public state."""
+        if type(prepared) is not PreparedHydrationCommit:
+            raise TypeError(
+                "commit_preview consumes one PreparedHydrationCommit"
+            )
+        request = prepared.request
+        preview = prepared.preview
+        if preview.read_key != request.read_key:
+            return HydrationOutcome.OWNER_MISMATCH
+        gate = request.commit_gate
+        stores = request.stores
+        event: StandardRunEvent | None = None
+        with self._lock:
+            if self._retired:
+                return HydrationOutcome.CANCELLED
+            art = self.artifacts.get(request.read_key.artifact_identity)
+            acquisition_target = (
+                art is not None
+                and len(stores) == 3
+                and stores[0] is art.records
+                and stores[1] is art.light_records
+                and stores[2] is art.publications
+            )
+            browse_target = not acquisition_target and len(stores) == 1
+            key = None
+            if acquisition_target:
+                key = prepared.key or self.catalog.resolve_exact(
+                    request.read_key.artifact_identity,
+                    request.read_key.frame_identity,
+                )
+                if key is None or self.catalog.resolve(key) is not key:
+                    return HydrationOutcome.OWNER_MISMATCH
+            elif not browse_target:
+                return HydrationOutcome.OWNER_MISMATCH
+            if not gate.enter(request.epoch):
+                return (
+                    HydrationOutcome.CANCELLED
+                    if bool(getattr(gate, "cancelled", False))
+                    else HydrationOutcome.OWNER_MISMATCH
+                )
+            try:
+                if acquisition_target:
+                    event = self._commit_acquisition_locked(
+                        art, key, prepared
+                    )
+                else:
+                    event = self._commit_browse_locked(stores[0], prepared)
+            finally:
+                gate.leave()
+            if acquisition_target:
+                # The commit is SEALED: publication/payload landed coherently.
+                # Cap enforcement is demotion-only bookkeeping by the same
+                # trusted owner; a raise here must not un-publish the sealed
+                # commit — it is logged and the next commit's enforce retries
+                # the identical trims over current state.
+                try:
+                    self._residency.enforce()
+                except Exception:
+                    logger.exception(
+                        "display residency cap enforcement failed; the next "
+                        "commit re-enforces over current state"
+                    )
+        event_sink = self._event_sink
+        if event is not None and event_sink is not None:
+            event_sink(event)
+        return HydrationOutcome.HYDRATED
+
+    def _commit_acquisition_locked(
+        self,
+        art: DisplayArtifact,
+        key: DisplayFrameKey,
+        prepared: PreparedHydrationCommit,
+    ) -> StandardRunEvent | None:
+        preview = prepared.preview
+        view = preview.view
+        if preview.raw is not None:
+            view = replace(
+                view,
+                raw=preview.raw,
+                mask_baked=(
+                    view.mask_baked
+                    or _projection_masks_values(prepared.projection)
+                ),
+            )
+        detector_outcome = self._detector_outcomes.get(key)
+        if (
+            detector_outcome is None
+            and view.thumbnail is None
+            and preview.raw is None
+        ):
+            if key in self._frame_mask_qualified:
+                detector_outcome = (
+                    DetectorHydrationOutcome.FRAME_MASK_UNAVAILABLE
+                )
+            elif (
+                prepared.closed
+                and preview.detector_diagnostic is not None
+                and has_integrated_values(view)
+            ):
+                detector_outcome = (
+                    DetectorHydrationOutcome.DETECTOR_UNAVAILABLE
+                )
+        record = FrameRecord.from_view(
+            view,
+            mode_1d=art.gi_mode_1d or DEFAULT_MODE_KEY,
+            mode_2d=art.gi_mode_2d or DEFAULT_MODE_KEY,
+        )
+        source_identity = (
+            f"{view.source_path or ''}#{view.source_frame_index}"
+        )
+        candidate = FramePublication(
+            view,
+            record=record,
+            source_identity=source_identity,
+            scan_key=art.source_scan,
+        )
+        # §22.3 failure-atomic prepared commit: capture the exact pre-attempt
+        # state of every public-consumed surface, run the fallible supporting
+        # seams before the authoritative publication, and on ANY throw restore
+        # the captured state exactly — never re-derive it from stores the
+        # failed attempt already mutated.  The detector outcome, payload and
+        # event are written only after the publication landed.
+        undo = _PreparedCommitState(
+            key=key,
+            record=art.records.get(key.local_frame_label),
+            light=art.light_records.get(key.local_frame_label),
+            outcome_present=key in self._detector_outcomes,
+            outcome=self._detector_outcomes.get(key),
+            residency=self._residency.capture(key),
+        )
+        try:
+            art.records.upsert(
+                record,
+                source_identity=source_identity,
+                persisted=True,
+            )
+            art.light_records.upsert(
+                light_record(record),
+                source_identity=source_identity,
+                persisted=True,
+            )
+            self._residency.observe(
+                key,
+                records=art.records,
+                light_records=art.light_records,
+                publications=art.publications,
+                incoming_heavy=_publication_has_heavy_payload(candidate),
+                incoming_thumbnail=view.thumbnail is not None,
+            )
+            publication = art.publications.upsert(candidate)
+        except BaseException:
+            self._abort_commit_locked(art, undo)
+            raise
+        if detector_outcome is not None:
+            self._detector_outcomes[key] = detector_outcome
+        payload = replace(
+            self._payload_from_publication(
+                art,
+                key,
+                publication,
+                closed=prepared.closed,
+            ),
+            selection_generation=prepared.token.presentation_generation,
+        )
+        self.put_payload(payload)
+        return StandardRunEvent(
+            self.identity,
+            StandardEventKind.DISPLAY_READY,
+            artifact=key.artifact,
+            frame_key=key,
+            selection_generation=prepared.token.presentation_generation,
+        )
+
+    def _abort_commit_locked(
+        self, art: DisplayArtifact, undo: _PreparedCommitState
+    ) -> None:
+        """Restore the exact captured pre-attempt state (§22.3 abort half).
+
+        The identity-compare guards make each restore a no-op for a seam
+        whose mutation never happened (including the seam that raised), so
+        the abort never re-enters the method that just failed.  Restored
+        record/light entries re-insert into an EMPTY slot (discard first),
+        so the store's merge path cannot contaminate them; both display
+        stores only ever hold persisted entries, and the source identity is
+        the one deterministic formula both write paths use.
+        """
+        key = undo.key
+        label = key.local_frame_label
+        if undo.outcome_present:
+            self._detector_outcomes[key] = undo.outcome
+        else:
+            self._detector_outcomes.pop(key, None)
+        if art.records.get(label) is not undo.record:
+            art.records.discard(label)
+            if undo.record is not None:
+                art.records.upsert(
+                    undo.record,
+                    source_identity=_record_source_identity(undo.record),
+                    persisted=True,
+                )
+        if art.light_records.get(label) is not undo.light:
+            art.light_records.discard(label)
+            if undo.light is not None:
+                art.light_records.upsert(
+                    undo.light,
+                    source_identity=_record_source_identity(undo.light),
+                    persisted=True,
+                )
+        self._residency.restore(undo.residency)
+
+    def _commit_browse_locked(
+        self, store: object, prepared: PreparedHydrationCommit
+    ) -> StandardRunEvent:
+        """Upsert one Browse publication into exactly the carried B store."""
+        preview = prepared.preview
+        view = preview.view
+        if preview.raw is not None:
+            view = replace(
+                view,
+                raw=preview.raw,
+                mask_baked=(
+                    view.mask_baked
+                    or _projection_masks_values(prepared.projection)
+                ),
+            )
+        record = FrameRecord.from_view(view)
+        source_identity = (
+            f"{view.source_path or ''}#{view.source_frame_index}"
+        )
+        store.upsert(
+            FramePublication(
+                view,
+                record=record,
+                source_identity=source_identity,
+                scan_key=prepared.request.owner.scan_key,
+            )
+        )
+        # The Browse repaint hint: no DisplayFrameKey exists at this seam, so
+        # the event carries the artifact identity and the exact presentation
+        # generation; the context runtime re-projects the current selection.
+        return StandardRunEvent(
+            self.identity,
+            StandardEventKind.DISPLAY_READY,
+            artifact=prepared.request.read_key.artifact_identity,
+            selection_generation=prepared.token.presentation_generation,
+        )
+
+
+def has_integrated_values(view: object) -> bool:
+    try:
+        return any(
+            value is not None and np.asarray(value).size > 0
+            for value in (view.intensity_1d, view.intensity_2d)
+        )
+    except Exception:
+        return False
+
+
+def _record_source_identity(record: FrameRecord) -> str:
+    """The one deterministic source-identity formula both write paths use."""
+    view = record.active_view()
+    return f"{view.source_path or ''}#{view.source_frame_index}"
+
+
+def _projection_masks_values(
+    projection: DetectorPreviewProjection | None,
+) -> bool:
+    """Whether the applied projection baked any value/static mask at all."""
+    return projection is not None and bool(
+        projection.mask_saturation
+        or projection.apply_threshold
+        or (projection.mask_available and projection.mask_bytes)
+    )
+
+
+def light_record(record: FrameRecord) -> FrameRecord:
+    return FrameRecord(
+        record.label,
+        results_1d=dict(record.results_1d),
+        active_mode_1d=record.active_mode_1d,
+    )
+
+
+def publication_needs_hydration(
+    publication: FramePublication | None,
+    detector_outcome: DetectorHydrationOutcome | None,
+) -> bool:
+    return (
+        publication is None
+        or not _publication_has_full_payload(publication)
+        or (
+            publication.view.raw is None
+            and publication.view.thumbnail is None
+            and detector_outcome is None
+        )
+        or (
+            bool(publication.record.results_2d)
+            and publication.view.intensity_2d is None
+        )
+    )
+
+
+def project_detector_values(
+    image: object,
+    mask: np.ndarray | None,
+    *,
+    value_mask_enabled: bool,
+) -> tuple[np.ndarray, bool]:
+    """Return immutable detector values with the accepted mask baked once."""
+    raw = np.asarray(image)
+    resolved = detector_value_mask(
+        mask,
+        raw,
+        enabled=value_mask_enabled,
+    )
+    if resolved is None:
+        result = raw.copy()
+    else:
+        result = np.array(raw, dtype=float, copy=True)
+        result[resolved] = np.nan
+    result.setflags(write=False)
+    return result, resolved is not None
+
+
+def project_frame_detector_values(
+    image: object,
+    static_mask: np.ndarray | None,
+    frame_mask: object,
+    *,
+    value_mask_enabled: bool,
+    stable_value_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, bool]:
+    """Project live detector values with the reduction-qualified mask union."""
+    raw = np.asarray(image)
+    resolved = combine_detector_masks(static_mask, frame_mask, raw.shape)
+    resolved = combine_detector_masks(resolved, stable_value_mask, raw.shape)
+    return project_detector_values(
+        raw,
+        resolved,
+        value_mask_enabled=value_mask_enabled,
+    )
+
+
+__all__ = [
+    "CATALOG_MAX_ITEMS",
+    "DetectorHydrationOutcome",
+    "DisplayArtifact",
+    "RunDisplayState",
+    "THUMBNAIL_MAX_ITEMS",
+    "has_integrated_values",
+    "light_record",
+    "project_detector_values",
+    "project_frame_detector_values",
+]

@@ -944,6 +944,62 @@ class PublicationStore:
         with self._lock:
             return self._items.get(label)
 
+    def has_heavy_payload(self, label: int | str) -> bool:
+        with self._lock:
+            publication = self._items.get(label)
+            return bool(
+                publication is not None
+                and _publication_has_heavy_payload(publication)
+            )
+
+    def has_thumbnail(self, label: int | str) -> bool:
+        with self._lock:
+            publication = self._items.get(label)
+            return bool(
+                publication is not None
+                and publication.view.thumbnail is not None
+            )
+
+    def evict_heavy(self, label: int | str) -> bool:
+        """Drop full arrays for one evictable publication, retaining thumbnail."""
+        with self._lock:
+            publication = self._items.get(label)
+            if (
+                publication is None
+                or not _publication_has_heavy_payload(publication)
+                or not self._label_evictable_locked(label)
+            ):
+                return False
+            self._items[label] = _semilight_publication(publication)
+            self._drop_heavy_label_locked(label)
+            return True
+
+    def evict_thumbnail(self, label: int | str) -> bool:
+        """Drop the thumbnail for one evictable publication."""
+        with self._lock:
+            publication = self._items.get(label)
+            if (
+                publication is None
+                or publication.view.thumbnail is None
+                or not self._label_evictable_locked(label)
+            ):
+                return False
+            self._items[label] = _lightweight_publication(publication)
+            self._drop_heavy_label_locked(label)
+            self._drop_thumb_label_locked(label)
+            return True
+
+    def discard(self, label: int | str) -> bool:
+        """Remove one evictable publication from the resident lookup tier."""
+        with self._lock:
+            if label not in self._items or not self._label_evictable_locked(label):
+                return False
+            self._items.pop(label, None)
+            self._drop_heavy_label_locked(label)
+            self._drop_thumb_label_locked(label)
+            self._carryover.pop(label, None)
+            return True
+
     def get_many(
         self, labels: Iterable[int | str]
     ) -> dict[int | str, FramePublication]:
@@ -993,6 +1049,15 @@ class PublicationStore:
         stores, whose publications come FROM disk, keep it unset)."""
         with self._lock:
             self._evictable = probe
+
+    def _label_evictable_locked(self, label: int | str) -> bool:
+        probe = self._evictable
+        if probe is None:
+            return True
+        try:
+            return bool(probe(label))
+        except Exception:
+            return False
 
     def _enforce_bounds_locked(self) -> None:
         if self._max_items is not None:

@@ -1,0 +1,978 @@
+"""Frozen mounted-shell oracle for the E3 context/shell join.
+
+Every operator action in this module enters through the public composition
+root: a real shell click or the shell's typed command signal.  Tests may
+inspect the mounted controller and executor after the fact, but never drive a
+private controller beside a decorative shell.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from pathlib import Path
+import shutil
+from threading import Event, current_thread
+import time
+
+import fabio.tifimage
+import h5py
+import numpy as np
+from pyqtgraph.Qt import QtCore, QtWidgets
+
+from xdart.gui.tabs.scattering.adapters import (
+    browse_loader as browse_module,
+)
+from xdart.gui.tabs.scattering.adapters import (
+    run_executor as executor_module,
+)
+from xdart.gui.tabs.scattering.adapters.browse_loader import BrowseLoader
+from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
+from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
+from xdart.gui.tabs.scattering.browse_values import (
+    BrowseLoadRequest,
+    BrowseLoadStatus,
+)
+from xdart.gui.tabs.scattering.context_controller import ContextController
+from xdart.gui.tabs.scattering.context_projection import ContextProjection
+from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
+from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
+from xdart.gui.tabs.scattering.events import CleanupStatus
+from xdart.gui.tabs.scattering import page as page_module
+from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+from xdart.gui.tabs.scattering.shell_values import (
+    ShellCommand,
+    ShellCommandKind,
+)
+from xdart.gui.tabs.scattering.state_machine import RunPhase
+from xdart.gui.tabs.scattering.workspace_shell import (
+    ScatteringWorkspaceShell,
+)
+from xdart.modules.display_context import ContextKind
+from xrd_tools.core.scan import Scan, ScanFrame
+from xrd_tools.io import (
+    ProcessedScan,
+    get_raw_frame,
+    iter_frame_records,
+)
+from xrd_tools.session.intent_store import RunIntentStore
+from xrd_tools.session.run_configuration import RunIntent
+from xrd_tools.sources.selection import image_series_spec
+
+from tests.xdart.scattering.test_e2lv_live_display import (
+    _Integrator,
+    _accepted_admission,
+)
+
+
+_PRODUCTION_SINK = executor_module.NexusSink
+
+
+def _wait(
+    app: QtWidgets.QApplication,
+    predicate,
+    *,
+    timeout: float = 20.0,
+    diagnostic=lambda: "",
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        app.processEvents()
+        if predicate():
+            return
+        time.sleep(0.002)
+    raise AssertionError(f"E3-J0 timed out: {diagnostic()}")
+
+
+class _RecordingIntegrator(_Integrator):
+    def __init__(
+        self,
+        facts: list[tuple[str, str]],
+        *,
+        delay: float,
+    ) -> None:
+        self._facts = facts
+        self._delay = delay
+
+    def integrate1d(self, *args, **kwargs):
+        self._facts.append(("integrate1d", current_thread().name))
+        if self._delay:
+            time.sleep(self._delay)
+        return super().integrate1d(*args, **kwargs)
+
+    def integrate2d(self, *args, **kwargs):
+        self._facts.append(("integrate2d", current_thread().name))
+        if self._delay:
+            time.sleep(self._delay)
+        return super().integrate2d(*args, **kwargs)
+
+
+class _RecordingSource:
+    def __init__(
+        self,
+        selected: Path,
+        labels: tuple[int, ...],
+        scan_name: str,
+        facts: list[tuple[str, str]],
+    ) -> None:
+        self._selected = selected
+        self._labels = labels
+        self._scan_name = scan_name
+        self._facts = facts
+        facts.append(("source-open", current_thread().name))
+
+    def to_scan(self, *, poni, integrator, output_path):
+        self._facts.append(("source-to-scan", current_thread().name))
+        return Scan(
+            self._scan_name,
+            [
+                ScanFrame(
+                    label,
+                    image=(
+                        np.arange(24, dtype=np.uint32).reshape(4, 6)
+                        + ordinal
+                    ),
+                    source_path=self._selected,
+                    source_frame_index=0,
+                )
+                for ordinal, label in enumerate(self._labels, 1)
+            ],
+            poni=poni,
+            integrator=integrator,
+            output_path=output_path,
+        )
+
+    def close(self) -> None:
+        self._facts.append(("source-close", current_thread().name))
+
+
+@dataclass(slots=True)
+class _MountedRig:
+    app: QtWidgets.QApplication
+    page: ScatteringWorkspace
+    lifecycle: ScatteringCoordinator
+    executor: StandardRunExecutor
+    loader: BrowseLoader
+    project: Path
+    selected: Path
+    output: Path
+    facts: list[tuple[str, str]]
+    browse_facts: list[tuple[str, str]]
+
+    @property
+    def shell(self) -> ScatteringWorkspaceShell:
+        shell = self.page.findChild(ScatteringWorkspaceShell)
+        assert shell is not None, (
+            "the public ScatteringWorkspace still has no mounted E3 shell"
+        )
+        return shell
+
+    @property
+    def controller(self) -> ContextController:
+        value = self.page._context_controller
+        assert type(value) is ContextController
+        return value
+
+    def command(self, command: ShellCommand) -> None:
+        self.shell.commandRequested.emit(command)
+        self.app.processEvents()
+
+    def close(self):
+        receipt = self.page.close_workspace()
+        if receipt is None:
+            return None
+        deadline = time.monotonic() + 10.0
+        while (
+            receipt.cleanup_status is not CleanupStatus.CLEANED
+            and time.monotonic() < deadline
+        ):
+            self.app.processEvents()
+            receipt = self.page.close_workspace()
+        return receipt
+
+
+def _mount(
+    monkeypatch,
+    root: Path,
+    *,
+    labels: tuple[int, ...] = tuple(range(1, 65)),
+    scan_name: str = "run.with.dots",
+    output_mode: str = "Overwrite",
+    max_display_items: int = 2,
+    reduction_delay: float = 0.0,
+    browse_entered: Event | None = None,
+    browse_release: Event | None = None,
+    browse_join_timeout: float = 5.0,
+) -> _MountedRig:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    project = root / "project"
+    raw = project / "raw"
+    processed = project / "processed"
+    raw.mkdir(parents=True)
+    processed.mkdir(parents=True)
+    selected = raw / "run.with.dots_0001.tif"
+    fabio.tifimage.TifImage(
+        data=np.arange(24, dtype=np.uint16).reshape(4, 6)
+    ).write(str(selected))
+    poni = project / "detector.poni"
+    poni.write_text("accepted through immutable test assets")
+    output = processed / "run.with.dots.nxs"
+    facts: list[tuple[str, str]] = []
+    browse_facts: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        executor_module,
+        "build_admission_receipt",
+        _accepted_admission(labels),
+    )
+    monkeypatch.setattr(
+        executor_module,
+        "open_source",
+        lambda _spec: _RecordingSource(
+            selected, labels, scan_name, facts
+        ),
+    )
+    monkeypatch.setattr(
+        executor_module,
+        "poni_to_integrator",
+        lambda _poni: _RecordingIntegrator(
+            facts, delay=reduction_delay
+        ),
+    )
+
+    def sink_factory(*args, **kwargs):
+        facts.append(("sink-open", current_thread().name))
+        return _PRODUCTION_SINK(*args, **kwargs)
+
+    monkeypatch.setattr(executor_module, "NexusSink", sink_factory)
+
+    def open_scan(source):
+        browse_facts.append(("open-scan", current_thread().name))
+        return ProcessedScan(source)
+
+    def read_records(source):
+        browse_facts.append(("read-records", current_thread().name))
+        if browse_entered is not None:
+            browse_entered.set()
+        if browse_release is not None:
+            browse_release.wait(timeout=10.0)
+        yield from iter_frame_records(source)
+
+    loader = BrowseLoader(
+        max_items=32,
+        join_timeout=browse_join_timeout,
+        open_scan=open_scan,
+        read_records=read_records,
+    )
+    # The parent has no loader at all.  Patching the future production factory
+    # preserves a meaningful parent-red assertion: no mounted shell, rather
+    # than an unexpected constructor keyword.
+    monkeypatch.setattr(
+        page_module, "BrowseLoader", lambda **_kwargs: loader, raising=False
+    )
+    lifecycle = ScatteringCoordinator()
+    executor = StandardRunExecutor(
+        max_display_items=max_display_items
+    )
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(
+            RunIntent(
+                source_spec=image_series_spec(selected),
+                poni_file=str(poni),
+                project_root=str(project),
+                save_path=str(output),
+                output_mode=output_mode,
+                max_cores=1,
+                bai_1d_args={"npt": 12},
+                bai_2d_args={"npt_rad": 10, "npt_azim": 8},
+            )
+        ),
+        lifecycle=lifecycle,
+        sources=FilesystemSourceAdapter(),
+        executor=executor,
+    )
+    page.show()
+    app.processEvents()
+    return _MountedRig(
+        app,
+        page,
+        lifecycle,
+        executor,
+        loader,
+        project,
+        selected,
+        output,
+        facts,
+        browse_facts,
+    )
+
+
+def _run(rig: _MountedRig) -> None:
+    _wait(
+        rig.app,
+        lambda: rig.shell.run_controls.startButton.isEnabled(),
+    )
+    rig.shell.run_controls.startButton.click()
+    _wait(
+        rig.app,
+        lambda: rig.controller.acquisition_context is not None,
+        diagnostic=lambda: rig.lifecycle.phase.value,
+    )
+
+
+def _pause(rig: _MountedRig) -> None:
+    if rig.lifecycle.phase is RunPhase.RUNNING:
+        _wait(
+            rig.app,
+            lambda: "Pause" in rig.shell.run_controls.startButton.text(),
+        )
+        rig.shell.run_controls.startButton.click()
+    _wait(
+        rig.app,
+        lambda: rig.lifecycle.phase is RunPhase.PAUSED,
+        diagnostic=lambda: rig.lifecycle.phase.value,
+    )
+
+
+def _produce_browse_artifact(monkeypatch, root: Path) -> Path:
+    rig = _mount(
+        monkeypatch,
+        root,
+        labels=(1, 2, 3),
+        scan_name="browse.with.dots",
+        max_display_items=3,
+    )
+    try:
+        _run(rig)
+        _wait(rig.app, lambda: rig.lifecycle.phase is RunPhase.IDLE)
+        assert rig.output.is_file()
+        result = rig.output.with_name("browse.with.dots.nxs")
+        if result != rig.output:
+            rig.output.rename(result)
+        return result
+    finally:
+        rig.close()
+        rig.page.deleteLater()
+        rig.app.processEvents()
+
+
+def test_j0_01_run_mounts_exact_a_and_shell_bindings(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    rig = _mount(monkeypatch, tmp_path, reduction_delay=0.001)
+    try:
+        assert type(rig.shell) is ScatteringWorkspaceShell
+        assert type(rig.page._context_projection) is ContextProjection
+        assert (
+            rig.controller._projection
+            is rig.page._context_projection
+        )
+        assert len(
+            rig.page.findChildren(ScatteringWorkspaceShell)
+        ) == 1
+        _run(rig)
+        context = rig.controller.acquisition_context
+        identity = rig.controller.run_identity
+        assert context is rig.executor.acquisition_context(identity)
+        assert rig.controller.selection.names(context)
+        assert context.scan is context.current_display_scan
+        assert context.record_store is context.publication_store
+        bindings = context.display_bindings()
+        assert bindings.scan is context.scan
+        assert bindings.record_store is context.record_store
+        assert bindings.publication_store is context.publication_store
+
+        _wait(rig.app, lambda: bool(rig.controller.frame_keys))
+        keys = rig.controller.frame_keys
+        assert all(
+            rig.shell.scientific.frame_selector.itemData(index) is key
+            for index, key in enumerate(keys)
+        )
+        assert all(
+            thread == "scattering-standard"
+            for operation, thread in rig.facts
+            if operation != "source-close"
+        )
+        assert [item[0] for item in rig.facts].count("source-open") == 1
+        assert [item[0] for item in rig.facts].count("sink-open") == 1
+    finally:
+        rig.close()
+
+
+def test_j0_02_browser_footer_share_repeated_dotted_exact_keys(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    browse = _produce_browse_artifact(monkeypatch, tmp_path / "b")
+    rig = _mount(
+        monkeypatch,
+        tmp_path / "a",
+        labels=tuple(range(1, 80)),
+        reduction_delay=0.001,
+    )
+    try:
+        _run(rig)
+        _pause(rig)
+        a_one = next(
+            key for key in rig.controller.frame_keys
+            if key.local_frame_label == 1
+        )
+        rig.command(
+            ShellCommand(
+                ShellCommandKind.SELECT_SCAN, str(browse)
+            )
+        )
+        _wait(
+            rig.app,
+            lambda: (
+                rig.controller.selection is not None
+                and rig.controller.selection.kind is ContextKind.BROWSE
+            ),
+        )
+        b_one = next(
+            key for key in rig.controller.frame_keys
+            if key.local_frame_label == 1
+        )
+        assert a_one is not b_one
+        assert a_one.local_frame_label == b_one.local_frame_label == 1
+        assert b_one.source_scan == "browse.with.dots"
+        assert rig.shell.scientific.frame_selector.currentData() is b_one
+        row = rig.shell.browser.frame_model.row_for(b_one)
+        assert row is not None
+        assert (
+            rig.shell.browser.frame_model.index(row, 0).data(
+                QtCore.Qt.ItemDataRole.UserRole
+            )
+            is b_one
+        )
+    finally:
+        rig.close()
+
+
+def test_j0_03_pause_closes_submission_and_exposes_a(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    rig = _mount(
+        monkeypatch,
+        tmp_path,
+        labels=tuple(range(1, 160)),
+        reduction_delay=0.0015,
+    )
+    try:
+        _run(rig)
+        _wait(rig.app, lambda: len(rig.controller.frame_keys) >= 2)
+        _pause(rig)
+        context = rig.controller.acquisition_context
+        before = len(context.record_store.catalog_snapshot().entries)
+        deadline = time.monotonic() + 0.08
+        while time.monotonic() < deadline:
+            rig.app.processEvents()
+            time.sleep(0.002)
+        assert (
+            len(context.record_store.catalog_snapshot().entries)
+            == before
+        )
+        assert rig.controller.selection.names(context)
+        assert "Resume" in rig.shell.run_controls.startButton.text()
+        assert rig.shell.run_controls.startButton.isEnabled()
+    finally:
+        rig.close()
+
+
+def test_j0_04_browse_b_is_off_gui_and_selected_only_after_ready(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    browse = _produce_browse_artifact(monkeypatch, tmp_path / "b")
+    entered, release = Event(), Event()
+    rig = _mount(
+        monkeypatch,
+        tmp_path / "a",
+        labels=tuple(range(1, 100)),
+        reduction_delay=0.001,
+        browse_entered=entered,
+        browse_release=release,
+    )
+    try:
+        _run(rig)
+        _pause(rig)
+        acquisition = rig.controller.acquisition_context
+        a_selection = rig.controller.selection
+        rig.command(
+            ShellCommand(
+                ShellCommandKind.SELECT_SCAN, str(browse)
+            )
+        )
+        assert entered.wait(timeout=5.0)
+        rig.app.processEvents()
+        assert rig.controller.selection is a_selection
+        release.set()
+        _wait(
+            rig.app,
+            lambda: (
+                rig.controller.selection is not None
+                and rig.controller.selection.kind is ContextKind.BROWSE
+            ),
+        )
+        browsed = rig.controller.browse_context
+        assert browsed.record_store is not acquisition.record_store
+        assert (
+            browsed.publication_store
+            is not acquisition.publication_store
+        )
+        assert rig.browse_facts == [
+            ("open-scan", "scattering-browse"),
+            ("read-records", "scattering-browse"),
+        ]
+        assert rig.shell.scientific.frame_selector.currentData() is (
+            rig.controller.frame_keys[0]
+        )
+    finally:
+        release.set()
+        rig.close()
+
+
+def test_j0_05_resume_is_an_a_pointer_move_without_b_to_a_writes(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    browse = _produce_browse_artifact(monkeypatch, tmp_path / "b")
+    rig = _mount(
+        monkeypatch,
+        tmp_path / "a",
+        labels=tuple(range(1, 120)),
+        reduction_delay=0.001,
+    )
+    try:
+        _run(rig)
+        _pause(rig)
+        acquisition = rig.controller.acquisition_context
+        frozen_configuration = acquisition.run_configuration
+        frozen_scan = acquisition.scan
+        frozen_records = acquisition.record_store
+        frozen_publications = acquisition.publication_store
+        frozen_catalog = frozen_publications.catalog_snapshot()
+        frozen_residency = frozen_publications.residency_snapshot()
+        rig.command(
+            ShellCommand(
+                ShellCommandKind.SELECT_SCAN, str(browse)
+            )
+        )
+        _wait(
+            rig.app,
+            lambda: (
+                rig.controller.selection is not None
+                and rig.controller.selection.kind is ContextKind.BROWSE
+            ),
+        )
+        browsed = rig.controller.browse_context
+        assert frozen_publications.catalog_snapshot() == frozen_catalog
+        assert frozen_publications.residency_snapshot() == frozen_residency
+        rig.shell.run_controls.startButton.click()
+        _wait(rig.app, lambda: rig.lifecycle.phase is RunPhase.RUNNING)
+        assert rig.controller.selection.names(acquisition)
+        assert browsed.invalidated is True
+        assert rig.controller.acquisition_context is acquisition
+        assert acquisition.run_configuration is frozen_configuration
+        assert acquisition.scan is frozen_scan
+        assert acquisition.record_store is frozen_records
+        assert acquisition.publication_store is frozen_publications
+        resumed_catalog = frozen_publications.catalog_snapshot()
+        assert len(resumed_catalog.entries) >= len(frozen_catalog.entries)
+        assert all(
+            resumed is paused
+            for resumed, paused in zip(
+                resumed_catalog.entries,
+                frozen_catalog.entries,
+                strict=False,
+            )
+        )
+        assert all(
+            key.artifact != browsed.requested_path
+            for key in resumed_catalog.entries
+        )
+    finally:
+        rig.close()
+
+
+def test_j0_06_stop_is_fail_closed_without_orphan_work(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    browse = _produce_browse_artifact(monkeypatch, tmp_path / "b")
+    entered, release = Event(), Event()
+    for state in ("running", "paused", "browse", "resumed"):
+        rig = _mount(
+            monkeypatch,
+            tmp_path / state,
+            labels=tuple(range(1, 180)),
+            reduction_delay=0.001,
+            browse_entered=entered if state == "browse" else None,
+            browse_release=release if state == "browse" else None,
+            browse_join_timeout=0.02,
+        )
+        try:
+            entered.clear()
+            release.clear()
+            _run(rig)
+            if state != "running":
+                _pause(rig)
+            if state == "browse":
+                rig.command(
+                    ShellCommand(
+                        ShellCommandKind.SELECT_SCAN, str(browse)
+                    )
+                )
+                assert entered.wait(timeout=5.0)
+            elif state == "resumed":
+                rig.shell.run_controls.startButton.click()
+                _wait(
+                    rig.app,
+                    lambda: rig.lifecycle.phase is RunPhase.RUNNING,
+                )
+            rig.shell.run_controls.stopButton.click()
+            release.set()
+            _wait(
+                rig.app,
+                lambda: rig.lifecycle.phase
+                in {RunPhase.IDLE, RunPhase.FAILED},
+            )
+            assert rig.controller.browse_pending is False
+            assert not rig.shell.run_controls.stopButton.isEnabled()
+        finally:
+            release.set()
+            receipt = rig.close()
+            assert receipt.cleanup_status is CleanupStatus.CLEANED
+            worker = rig.loader._worker
+            assert worker is None or not worker.is_alive()
+
+
+def test_j0_07_b_to_c_releases_b_before_c_and_retains_failed_owner(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    b = _produce_browse_artifact(monkeypatch, tmp_path / "b")
+    c = _produce_browse_artifact(monkeypatch, tmp_path / "c")
+    rig = _mount(
+        monkeypatch,
+        tmp_path / "a",
+        labels=tuple(range(1, 100)),
+        reduction_delay=0.001,
+    )
+    try:
+        _run(rig)
+        _pause(rig)
+        rig.command(
+            ShellCommand(ShellCommandKind.SELECT_SCAN, str(b))
+        )
+        _wait(
+            rig.app,
+            lambda: (
+                rig.controller.selection is not None
+                and rig.controller.selection.kind is ContextKind.BROWSE
+            ),
+        )
+        context_b = rig.controller.browse_context
+        frame_b = rig.controller.navigation.current
+        assert frame_b is not None
+        assert rig.shell.scientific.raw.image.image is not None
+        assert rig.shell.scientific.cake.image.image is not None
+        assert rig.shell.scientific.curve.listDataItems()
+        presentations: list[
+            tuple[
+                DisplayFrameKey | None,
+                str,
+                bool,
+                bool,
+                int,
+            ]
+        ] = []
+        apply_state = rig.shell.apply_state
+
+        def record_presentation(state) -> None:
+            apply_state(state)
+            presentations.append(
+                (
+                    state.navigation.current,
+                    rig.shell.scientific.title.text(),
+                    rig.shell.scientific.raw.image.image is not None,
+                    rig.shell.scientific.cake.image.image is not None,
+                    len(rig.shell.scientific.curve.listDataItems()),
+                )
+            )
+
+        monkeypatch.setattr(
+            rig.shell, "apply_state", record_presentation
+        )
+        real_release = rig.loader.release_context
+        cancelled_requests: list[BrowseLoadRequest] = []
+
+        def pending_once(context):
+            monkeypatch.setattr(
+                rig.loader, "release_context", real_release
+            )
+            operation = rig.loader._active
+            assert operation is not None
+            cancelled_requests.append(operation.request)
+            from xdart.gui.tabs.scattering.browse_values import (
+                BrowseCleanupReceipt,
+            )
+
+            return BrowseCleanupReceipt(
+                context.load_request,
+                CleanupStatus.CLEANUP_PENDING,
+            )
+
+        monkeypatch.setattr(
+            rig.loader, "release_context", pending_once
+        )
+        rig.command(
+            ShellCommand(ShellCommandKind.SELECT_SCAN, str(c))
+        )
+        assert len(cancelled_requests) == 1
+        cancelled_c = cancelled_requests[0]
+        assert rig.controller.browse_context is context_b
+        assert context_b.released is False
+        assert sum(
+            operation == "open-scan"
+            for operation, _thread in rig.browse_facts
+        ) == 1
+
+        # The refused replacement remains one exact loader-owned cleanup
+        # operation.  Ordinary page polling must retire it before another C
+        # request can be admitted, without releasing or blanking B.
+        _wait(
+            rig.app,
+            lambda: (
+                not rig.controller.browse_pending
+                and not rig.loader.owns_request(cancelled_c)
+            ),
+        )
+        assert rig.controller._cleanup_receipt is None
+        assert rig.controller.browse_context is context_b
+        assert context_b.released is False
+
+        rig.command(
+            ShellCommand(ShellCommandKind.SELECT_SCAN, str(c))
+        )
+        _wait(
+            rig.app,
+            lambda: (
+                rig.controller.browse_context is not None
+                and rig.controller.browse_context is not context_b
+                and rig.controller.browse_context.requested_path == str(c)
+                and rig.controller.selection.names(
+                    rig.controller.browse_context
+                )
+            ),
+        )
+        assert context_b.released is True
+        assert len(context_b.record_store) == 0
+        context_c = rig.controller.browse_context
+        assert context_c is not None
+        assert context_c.load_request is not cancelled_c
+        assert (
+            context_c.load_request.load_generation
+            == cancelled_c.load_generation + 1
+        )
+        frame_c = rig.controller.navigation.current
+        assert frame_c is not None and frame_c is not frame_b
+        assert presentations
+        assert presentations[0][0] is frame_b
+        assert presentations[-1][0] is frame_c
+        assert all(title for _frame, title, _raw, _cake, _traces in presentations)
+        assert all(raw for _frame, _title, raw, _cake, _traces in presentations)
+        assert all(cake for _frame, _title, _raw, cake, _traces in presentations)
+        assert all(traces for _frame, _title, _raw, _cake, traces in presentations)
+    finally:
+        rig.close()
+
+
+def test_j0_08_evicted_hydration_is_single_flight_and_does_not_blank(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDART_HEAVY_WINDOW", "1")
+    rig = _mount(
+        monkeypatch,
+        tmp_path,
+        labels=tuple(range(1, 13)),
+        max_display_items=1,
+    )
+    try:
+        _run(rig)
+        _wait(rig.app, lambda: rig.lifecycle.phase is RunPhase.IDLE)
+        first = rig.controller.frame_keys[0]
+        from xdart.gui.tabs.scattering import hydration_transport
+
+        read_labels: list[int] = []
+        real_read = hydration_transport.read_frame_preview
+
+        def counted_read(read_key, **kwargs):
+            read_labels.append(int(read_key.frame_identity))
+            return real_read(read_key, **kwargs)
+
+        monkeypatch.setattr(
+            hydration_transport, "read_frame_preview", counted_read
+        )
+        before_raw = np.array(
+            rig.shell.scientific.raw.image, copy=True
+        )
+        command = ShellCommand(
+            ShellCommandKind.HYDRATE_FRAME,
+            frame=first,
+            frames=(first,),
+        )
+        rig.command(command)
+        rig.command(command)
+        np.testing.assert_array_equal(
+            rig.shell.scientific.raw.image, before_raw
+        )
+        _wait(
+            rig.app,
+            lambda: (
+                rig.shell.scientific.frame_selector.currentData()
+                is first
+                and rig.shell.scientific.title.text()
+                == "run.with.dots_0001.tif"
+            ),
+        )
+        # Single flight: the repeated command coalesced onto ONE exact read.
+        assert read_labels.count(first.local_frame_label) == 1
+    finally:
+        rig.close()
+
+
+def test_j0_09_equal_foreign_stale_and_late_values_are_inert(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    rig = _mount(
+        monkeypatch,
+        tmp_path,
+        labels=tuple(range(1, 16)),
+    )
+    try:
+        _run(rig)
+        _wait(rig.app, lambda: rig.lifecycle.phase is RunPhase.IDLE)
+        accepted = rig.controller.frame_keys[-1]
+        prior = rig.shell.scientific.frame_selector.currentData()
+        equal_foreign = replace(accepted)
+        assert equal_foreign == accepted
+        assert equal_foreign is not accepted
+        rig.command(
+            ShellCommand(
+                ShellCommandKind.SELECT_FRAME,
+                frame=equal_foreign,
+                frames=(equal_foreign,),
+            )
+        )
+        assert (
+            rig.shell.scientific.frame_selector.currentData() is prior
+        )
+
+        foreign = DisplayFrameKey(
+            replace(accepted.run_identity, fingerprint="foreign"),
+            accepted.source_scan,
+            accepted.artifact,
+            accepted.local_frame_label,
+            accepted.work_ordinal,
+        )
+        rig.command(
+            ShellCommand(
+                ShellCommandKind.HYDRATE_FRAME,
+                frame=foreign,
+                frames=(foreign,),
+            )
+        )
+        assert (
+            rig.shell.scientific.frame_selector.currentData() is prior
+        )
+    finally:
+        rig.close()
+
+
+def test_j0_10_close_closeevent_and_deferreddelete_share_cached_receipt(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    for entrypoint in ("close", "close_event", "deferred_delete"):
+        rig = _mount(monkeypatch, tmp_path / entrypoint, labels=(1,))
+        if entrypoint == "close":
+            first = rig.page.close_workspace()
+        elif entrypoint == "close_event":
+            rig.page.close()
+            first = rig.page.close_workspace()
+        else:
+            QtWidgets.QApplication.sendEvent(
+                rig.page,
+                QtCore.QEvent(QtCore.QEvent.DeferredDelete),
+            )
+            first = rig.page.close_workspace()
+        _wait(
+            rig.app,
+            lambda: (
+                rig.page.close_workspace().cleanup_status
+                is CleanupStatus.CLEANED
+            ),
+        )
+        terminal = rig.page.close_workspace()
+        duplicate = rig.page.close_workspace()
+        assert terminal is duplicate
+        assert terminal.cleanup_status is CleanupStatus.CLEANED
+        if first.cleanup_identity is not None:
+            assert terminal.cleanup_identity is first.cleanup_identity
+
+
+def test_j0_11_relative_raw_path_survives_project_tree_move(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    rig = _mount(monkeypatch, tmp_path, labels=(1,))
+    try:
+        _run(rig)
+        _wait(rig.app, lambda: rig.lifecycle.phase is RunPhase.IDLE)
+        with h5py.File(rig.output, "r") as handle:
+            source = handle["entry/frames/frame_0001/source/path"][()]
+            if isinstance(source, bytes):
+                source = source.decode()
+            assert source == "raw/run.with.dots_0001.tif"
+        rig.close()
+        moved = tmp_path / "relocated"
+        shutil.move(str(rig.project), str(moved))
+        raw = get_raw_frame(
+            moved / "processed" / rig.output.name, 1
+        )
+        np.testing.assert_array_equal(
+            np.asarray(raw),
+            np.arange(24, dtype=np.uint16).reshape(4, 6),
+        )
+    finally:
+        if not rig.page._closed:
+            rig.close()
+
+
+def test_j0_12_append_is_visible_and_refused_before_any_preflight_owner(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+
+    def forbidden(*_args, **_kwargs):
+        calls.append("preflight")
+        raise AssertionError("Append reached output preflight")
+
+    rig = _mount(
+        monkeypatch,
+        tmp_path,
+        labels=(1,),
+        output_mode="Append",
+    )
+    monkeypatch.setattr(
+        executor_module, "build_admission_receipt", forbidden
+    )
+    try:
+        state = rig.shell.run_controls
+        assert state.write_mode() == "Append"
+        assert "H23" in state.readinessLabel.full_text()
+        assert not state.startButton.isEnabled()
+        rig.command(ShellCommand(ShellCommandKind.RUN_ACTION))
+        deadline = time.monotonic() + 0.05
+        while time.monotonic() < deadline:
+            rig.app.processEvents()
+            time.sleep(0.002)
+        assert calls == []
+        assert rig.lifecycle.phase is RunPhase.IDLE
+        assert rig.executor._active is None
+        assert not rig.output.exists()
+    finally:
+        rig.close()

@@ -5,14 +5,45 @@ import configparser
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
+from typing import Mapping
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["read_txt_metadata", "read_pdi_metadata", "read_image_metadata"]
+__all__ = [
+    "ImageMetadataRead",
+    "read_txt_metadata",
+    "read_pdi_metadata",
+    "read_image_metadata",
+    "read_image_metadata_observed",
+]
 
 MetadataValue = int | float | str
+
+
+@dataclass(frozen=True, slots=True)
+class ImageMetadataRead:
+    """One metadata result plus the exact file that supplied it.
+
+    ``source_path`` is ``None`` when discovery consumed no accepted metadata
+    file.  In particular, Auto reports the candidate whose parser succeeded,
+    not merely the first companion name that existed.
+    """
+
+    values: Mapping[str, MetadataValue]
+    source_path: Path | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "values",
+            MappingProxyType(dict(self.values)),
+        )
+        if self.source_path is not None:
+            object.__setattr__(self, "source_path", Path(self.source_path))
 
 _STRUCTURED_SIDECAR_MIN_PAIRS = 3
 _AUTO_SIDECAR_CACHE: dict[tuple[Path, str], tuple[str, str]] = {}
@@ -406,18 +437,18 @@ def _discover_auto_sidecar(
     return None
 
 
-def _read_auto_metadata(image_path: Path) -> dict[str, MetadataValue]:
+def _read_auto_metadata_observed(image_path: Path) -> ImageMetadataRead:
     cached_sidecar = _auto_sidecar_from_cache(image_path)
     if cached_sidecar is not None:
         metadata = _read_auto_candidate_metadata(cached_sidecar)
         if metadata is not None:
-            return metadata
+            return ImageMetadataRead(metadata, cached_sidecar)
         _AUTO_SIDECAR_CACHE.pop(_auto_cache_key(image_path), None)
 
     discovered = _discover_auto_sidecar(image_path)
     if discovered is None:
         logger.debug("read_image_metadata: no auto sidecar found for %s", image_path)
-        return {}
+        return ImageMetadataRead({}, None)
 
     candidate, convention, suffix, metadata = discovered
     _AUTO_SIDECAR_CACHE[_auto_cache_key(image_path)] = (convention, suffix)
@@ -425,7 +456,11 @@ def _read_auto_metadata(image_path: Path) -> dict[str, MetadataValue]:
     # the run log (it is then applied to EVERY frame via the cache).
     logger.info("metadata: auto locked onto %s-form '*%s' (%d fields, e.g. %s)",
                 convention, suffix, len(metadata), candidate.name)
-    return metadata
+    return ImageMetadataRead(metadata, candidate)
+
+
+def _read_auto_metadata(image_path: Path) -> dict[str, MetadataValue]:
+    return dict(_read_auto_metadata_observed(image_path).values)
 
 
 def _extract_scan_info(image_path: Path) -> tuple[str | None, int | None, int]:
@@ -659,6 +694,27 @@ def read_image_metadata(
         floats; structured sidecars may also return strings.  Returns ``{}``
         when no sidecar is found or parsing fails.
     """
+    return dict(
+        read_image_metadata_observed(
+            image_path,
+            meta_format=meta_format,
+            meta_dir=meta_dir,
+        ).values
+    )
+
+
+def read_image_metadata_observed(
+    image_path: Path | str,
+    meta_format: str | None = "txt",
+    meta_dir: Path | str | None = None,
+) -> ImageMetadataRead:
+    """Read image metadata and report the exact accepted metadata file.
+
+    The parsing and discovery policy is identical to :func:`read_image_metadata`.
+    The additional path is intended for admission, collision protection, and
+    provenance owners that must retain the file actually consumed.
+    """
+
     image_path = Path(image_path)
 
     # Normalise case so callers can pass "SPEC" / "Spec" / "spec"
@@ -672,7 +728,7 @@ def read_image_metadata(
     )
 
     if meta_format_norm == "auto":
-        return _read_auto_metadata(image_path)
+        return _read_auto_metadata_observed(image_path)
 
     if meta_format_norm in ("txt", "pdi"):
         sidecar = _find_sidecar(image_path, meta_format_norm)
@@ -682,10 +738,10 @@ def read_image_metadata(
                 meta_format_norm,
                 image_path,
             )
-            return {}
+            return ImageMetadataRead({}, None)
         if meta_format_norm == "txt":
-            return read_txt_metadata(sidecar)
-        return read_pdi_metadata(sidecar)
+            return ImageMetadataRead(read_txt_metadata(sidecar), sidecar)
+        return ImageMetadataRead(read_pdi_metadata(sidecar), sidecar)
 
     if meta_format_norm == "spec":
         # Normalise empty-string to None for downstream "use default
@@ -693,24 +749,27 @@ def read_image_metadata(
         search_dir = (
             Path(meta_dir) if meta_dir not in (None, "") else None
         )
-        return _read_spec_metadata(image_path, search_dir=search_dir)
+        return _read_spec_metadata_observed(
+            image_path,
+            search_dir=search_dir,
+        )
 
     # Any other value is treated as a generic structured-sidecar extension.
     sidecar = _find_sidecar(image_path, meta_format_norm)
     if sidecar is None:
         logger.debug("read_image_metadata: no %r sidecar found for %s",
                      meta_format, image_path)
-        return {}
+        return ImageMetadataRead({}, None)
     # BL-3: an EXPLICIT format is a deliberate user choice — accept a 1-2 field
     # sidecar (the AUTO min-pairs=3 plausibility gate does NOT apply here; before
     # this, 1-2-pair explicit sidecars were silently dropped with a misleading
     # "unknown meta_format" warning).
     metadata = _parse_structured_sidecar_if_plausible(sidecar, min_pairs=1)
     if metadata is not None:
-        return metadata
+        return ImageMetadataRead(metadata, sidecar)
     logger.warning("read_image_metadata: %s (format %r) had no readable "
                    "key=value fields", sidecar, meta_format)
-    return {}
+    return ImageMetadataRead({}, sidecar)
 
 
 # ---------------------------------------------------------------------------
@@ -718,10 +777,10 @@ def read_image_metadata(
 # ---------------------------------------------------------------------------
 
 
-def _read_spec_metadata(
+def _read_spec_metadata_observed(
     image_path: Path,
     search_dir: Path | None = None,
-) -> dict[str, float]:
+) -> ImageMetadataRead:
     """Extract per-image counters and motor positions from a SPEC file.
 
     The SPEC file (a SPEC data file, named with NO extension — the bare
@@ -754,8 +813,9 @@ def _read_spec_metadata(
         from silx.io.specfile import SpecFile  # noqa: PLC0415
     except ImportError:
         logger.warning("read_image_metadata (spec): silx is not installed")
-        return {}
+        return ImageMetadataRead({}, None)
 
+    spec_file: Path | None = None
     try:
         spec_fname, scan_number, image_number = _extract_scan_info(image_path)
         if spec_fname is None or scan_number is None:
@@ -763,7 +823,7 @@ def _read_spec_metadata(
                 "_read_spec_metadata: cannot parse scan info from filename %s",
                 image_path.name,
             )
-            return {}
+            return ImageMetadataRead({}, None)
 
         # Build the ordered search list — explicit dir first (when
         # given), then the default fallbacks.  Duplicates are harmless
@@ -779,7 +839,6 @@ def _read_spec_metadata(
             image_path.parent.parent.parent,
         ])
 
-        spec_file: Path | None = None
         for sd in candidate_dirs:
             candidate = sd / spec_fname
             if candidate.is_file():
@@ -792,7 +851,7 @@ def _read_spec_metadata(
                 spec_fname,
                 [str(d) for d in candidate_dirs],
             )
-            return {}
+            return ImageMetadataRead({}, None)
 
         sf = SpecFile(str(spec_file))
         scan = sf[f"{scan_number}.1"]
@@ -808,7 +867,7 @@ def _read_spec_metadata(
             for name in scan.motor_names
         }
 
-        return {**counters, **motors}
+        return ImageMetadataRead({**counters, **motors}, spec_file)
 
     except Exception:
         logger.warning(
@@ -816,4 +875,16 @@ def _read_spec_metadata(
             image_path,
             exc_info=True,
         )
-        return {}
+        return ImageMetadataRead({}, spec_file)
+
+
+def _read_spec_metadata(
+    image_path: Path,
+    search_dir: Path | None = None,
+) -> dict[str, float]:
+    return dict(
+        _read_spec_metadata_observed(
+            image_path,
+            search_dir=search_dir,
+        ).values
+    )

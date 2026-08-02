@@ -1,0 +1,125 @@
+{
+  "schema": 1,
+  "canonical_commit": "ff5380a7716df5927c19fe6f96c9cfce02cd12cd",
+  "capture_checksum_sha256": "ece35e271a3c921b718845f247a214459f5d0403c1a5fd9906de8e1d134d3335",
+  "viewports": [
+    [1440, 900],
+    [1920, 1080],
+    [1024, 900]
+  ],
+  "columns": [
+    {
+      "id": "browser",
+      "minimum_width": 300,
+      "items": [
+        "File",
+        "Config",
+        "Help",
+        "DATA BROWSER",
+        "Date",
+        "Refresh",
+        "Scans",
+        "Frames",
+        "Show All",
+        "Metadata",
+        "Auto Last",
+        "TOOLS",
+        "Peak Fitting",
+        "Phase Fitting",
+        "Plot Metadata"
+      ]
+    },
+    {
+      "id": "scientific",
+      "minimum_width": 300,
+      "items": [
+        "Norm Channel",
+        "Set BG",
+        "Current",
+        "Default",
+        "Log",
+        "raw",
+        "cake",
+        "Q-Chi",
+        "2Th-Chi",
+        "Q",
+        "2theta",
+        "chi",
+        "Pin",
+        "Single",
+        "Overlay",
+        "Average",
+        "Sum",
+        "Waterfall",
+        "Options",
+        "Clear",
+        "Share Axis",
+        "frame selector",
+        "global progress"
+      ]
+    },
+    {
+      "id": "controls",
+      "minimum_width": 360,
+      "items": [
+        "1 PROJECT",
+        "2 EXPERIMENT",
+        "3 SOURCE",
+        "4 PROCESSING",
+        "Folder",
+        "Save Path",
+        "Calibration",
+        "Mask",
+        "Standard",
+        "Grazing",
+        "Source Type",
+        "Mode",
+        "Threshold",
+        "Integration",
+        "Output",
+        "Status",
+        "Batch",
+        "Cores",
+        "Run",
+        "Stop",
+        "Append",
+        "Overwrite"
+      ]
+    }
+  ],
+  "presentation": {
+    "raw_orientation": "detector rows are horizontal after one display transpose",
+    "cake_x_axis": "radial",
+    "cake_y_axis": "azimuthal",
+    "one_d_modes": ["Single", "Overlay", "Waterfall"],
+    "history_scope": "all retained cheap 1-D rows",
+    "heavy_selection": "emit hydration and preserve last qualified heavy presentation"
+  },
+  "run_states": [
+    "idle",
+    "preparing",
+    "running",
+    "paused",
+    "stopping",
+    "failed",
+    "closed"
+  ],
+  "ownership": {
+    "shell": ["Qt widgets", "last scalar reconciliation key"],
+    "forbidden": [
+      "scan",
+      "store",
+      "source",
+      "file handle",
+      "executor",
+      "context",
+      "worker",
+      "writer",
+      "lifecycle state machine",
+      "ParameterTree",
+      "legacy staticWidget",
+      "legacy H5Viewer",
+      "legacy displayFrameWidget"
+    ]
+  }
+}

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import fnmatch
+import math
+import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -75,6 +77,7 @@ class ImageFileSource(BaseFrameSource):
                 detector=self.detector,
                 raw_dtype=self.raw_dtype,
                 raw_header_skip=self.raw_header_skip,
+                preserve_dtype=True,
             )
         )
 
@@ -111,6 +114,7 @@ class TiffSeriesSource(BaseFrameSource):
         detector: str | tuple[int, int] | None = None,
         raw_dtype: str = "int32",
         raw_header_skip: int = 0,
+        admitted_motor_values: Sequence[tuple[str, str, float]] = (),
     ) -> None:
         self.files = [Path(p) for p in files]
         self.metadata_format = metadata_format
@@ -119,6 +123,50 @@ class TiffSeriesSource(BaseFrameSource):
         self.detector = detector
         self.raw_dtype = str(raw_dtype)
         self.raw_header_skip = int(raw_header_skip)
+        self._admitted_motor_by_index: dict[int, tuple[str, float]] = {}
+        snapshots = tuple(admitted_motor_values)
+        if snapshots:
+            if len(snapshots) != len(self.files):
+                raise ValueError(
+                    "admitted motor values must cover every TIFF member"
+                )
+            motor_name: str | None = None
+            for index, (path, snapshot) in enumerate(
+                zip(self.files, snapshots),
+                start=1,
+            ):
+                if type(snapshot) not in {tuple, list} or len(snapshot) != 3:
+                    raise TypeError(
+                        "admitted motor value must be a "
+                        "path/motor/value triple"
+                    )
+                source_path, motor, raw_value = snapshot
+                if (
+                    type(source_path) is not str
+                    or not os.path.isabs(source_path)
+                    or type(motor) is not str
+                    or not motor
+                    or motor == "Manual"
+                    or type(raw_value) is not float
+                ):
+                    raise TypeError("admitted motor value is invalid")
+                value = raw_value
+                if not math.isfinite(value):
+                    raise ValueError("admitted motor value must be finite")
+                actual = Path(os.path.abspath(path.expanduser()))
+                admitted_path = Path(
+                    os.path.abspath(Path(source_path).expanduser())
+                )
+                if admitted_path != actual:
+                    raise ValueError(
+                        "admitted motor value path does not match TIFF member"
+                    )
+                if motor_name is not None and motor != motor_name:
+                    raise ValueError(
+                        "admitted motor values must use one exact motor"
+                    )
+                motor_name = motor
+                self._admitted_motor_by_index[index] = (motor, value)
         self._path_by_index = {
             int(index): path
             for index, path in zip(range(1, len(self.files) + 1), self.files)
@@ -150,6 +198,7 @@ class TiffSeriesSource(BaseFrameSource):
         detector: str | tuple[int, int] | None = None,
         raw_dtype: str = "int32",
         raw_header_skip: int = 0,
+        admitted_motor_values: Sequence[tuple[str, str, float]] = (),
     ) -> "TiffSeriesSource":
         files = [
             path for path in find_image_files(directory)
@@ -163,6 +212,7 @@ class TiffSeriesSource(BaseFrameSource):
             detector=detector,
             raw_dtype=raw_dtype,
             raw_header_skip=raw_header_skip,
+            admitted_motor_values=admitted_motor_values,
         )
 
     def _path_for(self, index: int) -> Path:
@@ -181,13 +231,27 @@ class TiffSeriesSource(BaseFrameSource):
             detector=self.detector,
             raw_dtype=self.raw_dtype,
             raw_header_skip=self.raw_header_skip,
+            preserve_dtype=True,
         ))
 
     def metadata_for(self, index: int) -> Mapping[str, Any]:
-        if self.metadata_format is None:
-            return {}
-        return read_image_metadata(self._path_for(index), self.metadata_format,
-                                   meta_dir=self.meta_dir)
+        path = self._path_for(index)
+        metadata = (
+            {}
+            if self.metadata_format is None
+            else dict(read_image_metadata(
+                path, self.metadata_format, meta_dir=self.meta_dir
+            ))
+        )
+        admitted = self._admitted_motor_by_index.get(int(index))
+        if admitted is not None:
+            motor, value = admitted
+            folded = motor.casefold()
+            for key in tuple(metadata):
+                if type(key) is str and key.casefold() == folded:
+                    del metadata[key]
+            metadata[motor] = value
+        return metadata
 
     def frame_for(self, index: int) -> ScanFrame:
         path = self._path_for(index)

@@ -87,7 +87,12 @@ if TYPE_CHECKING:
         register_source,
     )
     from xrd_tools.sources.spec import SpecSource
-    from xrd_tools.sources.selection import DirectorySourceSpec, image_series_spec
+    from xrd_tools.sources.selection import (
+        DirectorySourceSpec,
+        image_series_spec,
+        is_single_image_spec,
+        single_image_spec,
+    )
 
 
 _LAZY_EXPORTS = {
@@ -144,6 +149,7 @@ _LAZY_EXPORTS = {
     "get_adapter": "xrd_tools.sources.adapters",
     "guess_source_kind": "xrd_tools.sources.registry",
     "image_series_spec": "xrd_tools.sources.selection",
+    "is_single_image_spec": "xrd_tools.sources.selection",
     "nxwriter_finalization_policy": "xrd_tools.sources.readiness",
     "open_source": "xrd_tools.sources.registry",
     "parse_scan_groups": "xrd_tools.sources.grouping",
@@ -151,6 +157,7 @@ _LAZY_EXPORTS = {
     "raw_is_reachable": "xrd_tools.sources.probe",
     "register_adapter": "xrd_tools.sources.adapters",
     "register_source": "xrd_tools.sources.registry",
+    "single_image_spec": "xrd_tools.sources.selection",
 }
 
 
@@ -225,6 +232,7 @@ __all__ = [
     "get_adapter",
     "guess_source_kind",
     "image_series_spec",
+    "is_single_image_spec",
     "nxwriter_finalization_policy",
     "open_source",
     "parse_scan_groups",
@@ -232,4 +240,5 @@ __all__ = [
     "raw_is_reachable",
     "register_adapter",
     "register_source",
+    "single_image_spec",
 ]

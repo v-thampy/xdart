@@ -29,7 +29,77 @@ import numpy as np
 #: uint32 max — the unambiguous dead/hot-pixel dummy (Eiger masters etc.).
 UINT32_CEILING = 4294967295.0
 
-__all__ = ["UINT32_CEILING", "integer_saturation_ceiling", "saturation_pixels"]
+__all__ = [
+    "UINT32_CEILING",
+    "combine_detector_masks",
+    "detector_value_mask",
+    "integer_saturation_ceiling",
+    "saturation_pixels",
+]
+
+
+def combine_detector_masks(
+    static_mask,
+    frame_mask,
+    image_shape: tuple[int, int],
+) -> np.ndarray | None:
+    """Resolve and union static and frame-local detector masks exactly once."""
+    from xrd_tools.core.scan import MaskSpec
+
+    def resolved(mask, name: str) -> np.ndarray | None:
+        if mask is None:
+            return None
+        value = (
+            mask.to_bool(image_shape)
+            if isinstance(mask, MaskSpec)
+            else np.asarray(mask, dtype=bool)
+        )
+        if value.shape != image_shape:
+            raise ValueError(
+                f"{name} shape {value.shape} does not match "
+                f"image shape {image_shape}"
+            )
+        return value
+
+    static = resolved(static_mask, "static detector mask")
+    local = resolved(frame_mask, "frame detector mask")
+    if static is None:
+        return local
+    if local is None:
+        return static
+    return static | local
+
+
+def detector_value_mask(
+    mask,
+    raw_image,
+    *,
+    enabled: bool,
+) -> np.ndarray | None:
+    """Union the accepted detector-value policy with an existing static mask.
+
+    The operator toggle controls value masking only.  An existing static mask
+    remains authoritative when value masking is disabled.  Enabled masking
+    adds negative values, the unambiguous UINT32 dummy, and the existing
+    fraction-guarded native integer ceiling.
+    """
+    if not enabled:
+        return mask
+    raw = np.asarray(raw_image)
+    bad = (raw < 0) | (raw >= UINT32_CEILING)
+    bad |= saturation_pixels(
+        raw,
+        ceiling=integer_saturation_ceiling(raw),
+    )
+    if mask is None:
+        return bad if bad.any() else None
+    static = np.asarray(mask, dtype=bool)
+    if static.shape != raw.shape:
+        raise ValueError(
+            f"detector mask shape {static.shape} does not match "
+            f"image shape {raw.shape}"
+        )
+    return static if not bad.any() else (static | bad)
 
 
 def integer_saturation_ceiling(arr) -> float | None:

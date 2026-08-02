@@ -1,0 +1,40 @@
+{
+  "e2_parent": "69b4afc16088eb09aec6a95902eb1f26cfac47d8",
+  "canonical_context_commit": "72b7b08efd4d24df0f74aa462a4b1766a97be6b2",
+  "canonical_context_blob": "3329391554910eb2e062da0a6c2afe3415db398c",
+  "canonical_context_sha256": "7664a4c0979336015a0779b568461e2953ec04295a503c04cc711521594da825",
+  "baseline_lines": {
+    "page.py": 829,
+    "display_view.py": 336,
+    "coordinator.py": 306,
+    "contracts.py": 613,
+    "state_machine.py": 114,
+    "events.py": 186,
+    "display_runtime.py": 818,
+    "adapters/run_executor.py": 865
+  },
+  "protected_blobs": {
+    "page.py": "faee8c91b2b35c3bed312cb2ce1b8971ea71c62a",
+    "display_view.py": "4e2c71cd5f72bc9d23f195a49d499b16d473d1ed"
+  },
+  "executor_context_mapping": {
+    "scan": "exact first _StandardRun.scan",
+    "run_configuration": "exact _StandardRun.configuration",
+    "record_store": "exact _StandardRun.display",
+    "publication_store": "exact _StandardRun.display",
+    "frame_ids": "exact _StandardRun.display.catalog",
+    "frames": "exact _StandardRun.display.artifacts",
+    "directory_rescope": "AcquisitionContext.rescope_to(source_scan, source_path)"
+  },
+  "forbidden_bridges": [
+    "dummy store",
+    "proxy cache",
+    "copied store",
+    "store-bearing event",
+    "second lifecycle authority"
+  ],
+  "integration_deletions": [
+    "ScatteringCoordinator scalar DisplayTarget",
+    "page direct StandardRunExecutor.project_display route"
+  ]
+}

@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import os
 import queue
 import threading
 import time
 import uuid
 import warnings
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -33,6 +34,7 @@ from xrd_tools.core.containers import (
     PONI,
 )
 from xrd_tools.core.frame_view import DEFAULT_MODE_KEY
+from xrd_tools.core.invalid import combine_detector_masks, detector_value_mask
 from xrd_tools.core.metadata import ScanMetadata, resolve_monitor_norm
 from xrd_tools.core.scan import (
     FrameSource as CoreFrameSource,
@@ -63,6 +65,35 @@ if TYPE_CHECKING:  # C4 — tighter Scan.integrator type without forcing the imp
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator
 
 ProgressCallback = Callable[["ReductionProgress"], None]
+
+
+def _copy_json_provenance(value: object) -> dict[str, Any]:
+    """Validate and detach the finite JSON-native run-provenance algebra."""
+
+    def copy_value(item: object) -> Any:
+        if item is None or type(item) in (bool, int, str):
+            return item
+        if type(item) is float:
+            if not math.isfinite(item):
+                raise ValueError("run configuration provenance floats must be finite")
+            return item
+        if type(item) is list:
+            return [copy_value(child) for child in item]
+        if type(item) is dict:
+            copied: dict[str, Any] = {}
+            for key, child in item.items():
+                if type(key) is not str:
+                    raise ValueError("run configuration provenance keys must be strings")
+                copied[key] = copy_value(child)
+            return copied
+        raise ValueError("run configuration provenance must be JSON-native")
+
+    if type(value) is not dict:
+        raise ValueError("run configuration provenance must be a dict")
+    copied = copy_value(value)
+    if type(copied) is not dict:
+        raise ValueError("run configuration provenance must be a dict")
+    return copied
 
 
 class GIFreezeError(ValueError):
@@ -260,7 +291,7 @@ class GIMode:
     incidence_motor: str | None = None
     tilt_angle: float = 0.0
     sample_orientation: int = 1
-    method: str = "no"
+    method: str = "cython"
     mode_1d: GI1DMode | str = GI1DMode.Q_TOTAL
     mode_2d: GI2DMode | str = GI2DMode.QIP_QOOP
     npt_oop: int | None = None
@@ -292,12 +323,12 @@ class ReductionPlan:
     threshold_min: float | None = None
     threshold_max: float | None = None
     # R3-C: opt-in detector-saturation masking in the HEADLESS reduction path.
-    # When True, _reduce_frame excludes the dtype-derived saturation ceiling
-    # (np.iinfo(dtype).max, e.g. uint16 65535) using the same fraction-guarded
-    # policy as the GUI (xrd_tools.core.invalid.saturation_pixels): masked only
-    # when a whole module sits at the ceiling (>1e-4 of the frame), never a few
-    # genuinely-saturated Bragg pixels.  Default False is behavior-preserving;
-    # core never hardcodes 65535 (a float-dtype frame -> ceiling None -> no-op).
+    # When True, the first naturally-read frame resolves one scan-stable value
+    # mask: negatives and the unambiguous uint32 dummy are excluded, and the
+    # dtype-derived detector ceiling (np.iinfo(dtype).max, e.g. uint16 65535)
+    # is fraction-guarded via xrd_tools.core.invalid.saturation_pixels.  The
+    # stable mask keeps pyFAI's mask/LUT identity fixed across the scan; explicit
+    # thresholds remain per-frame.  Default False is an exact no-op.
     mask_saturation: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -418,6 +449,22 @@ class CompositeSink:
         for sink in self.sinks:
             sink.write(frame, reduction)
 
+    def worker_process(
+        self, frame: Frame, reduction: FrameReduction
+    ) -> None:
+        """Fan out optional parallel preparation before the writer boundary."""
+
+        for sink in self.sinks:
+            prepare = getattr(sink, "worker_process", None)
+            if callable(prepare):
+                prepare(frame, reduction)
+
+    def _bind_run_saturation_mask(self, state: "_RunSaturationMask") -> None:
+        for sink in self.sinks:
+            bind = getattr(sink, "_bind_run_saturation_mask", None)
+            if callable(bind):
+                bind(state)
+
     def replace(self, frame: Frame, reduction: FrameReduction) -> None:
         for sink in self.sinks:
             _emit_sink_replace(sink, frame, reduction)
@@ -446,6 +493,36 @@ class CompositeSink:
         if errors:
             raise errors[0]
 
+    def flush(self, *, force: bool = False) -> None:
+        """Flush every buffering child at the shared durability boundary."""
+
+        for sink in self.sinks:
+            flush = getattr(sink, "flush", None)
+            if callable(flush):
+                flush(force=force)
+
+    def take_persisted_labels(self) -> tuple[int, ...]:
+        """Collect one-shot durability receipts from child sinks."""
+
+        labels: list[int] = []
+        for sink in self.sinks:
+            take = getattr(sink, "take_persisted_labels", None)
+            if callable(take):
+                labels.extend(int(label) for label in take())
+        return tuple(dict.fromkeys(labels))
+
+    def perf_snapshot(self) -> dict[str, float]:
+        """Return merged, read-only performance counters from child sinks."""
+
+        values: dict[str, float] = {}
+        for sink in self.sinks:
+            snapshot = getattr(sink, "perf_snapshot", None)
+            if not callable(snapshot):
+                continue
+            for key, elapsed in snapshot().items():
+                values[key] = values.get(key, 0.0) + float(elapsed)
+        return values
+
 
 def _emit_sink_replace(
     sink: ReductionSink, frame: Frame, reduction: FrameReduction
@@ -466,6 +543,9 @@ def _emit_sink_replace(
         sink.write(frame, reduction)
 
 
+_XYE_WRITE_END = object()
+
+
 @dataclass(slots=True)
 class XYESink:
     """Write 1D reductions as one ``.xye`` file per frame."""
@@ -473,14 +553,50 @@ class XYESink:
     directory: Path | str
     pattern: str = "{scan}_{frame:04d}.xye"
     _scan_name: str = field(default="", init=False, repr=False)
+    _perf_enabled: bool = field(default=False, init=False, repr=False)
+    _perf_write: float = field(default=0.0, init=False, repr=False)
+    _pending: Any = field(default=None, init=False, repr=False)
+    _worker: Any = field(default=None, init=False, repr=False)
+    _errors: list[BaseException] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.directory, Path):
             self.directory = Path(self.directory)
+        self._perf_enabled = bool(os.environ.get("XDART_PERF"))
 
     def begin(self, scan: Scan, plan: ReductionPlan) -> None:
         self._scan_name = scan.name
+        self._perf_write = 0.0
+        self._errors.clear()
         self.directory.mkdir(parents=True, exist_ok=True)
+        pending: queue.Queue[object] = queue.Queue(maxsize=16)
+        self._pending = pending
+
+        def write_pending() -> None:
+            while True:
+                item = pending.get()
+                try:
+                    if item is _XYE_WRITE_END:
+                        return
+                    path, radial, intensity, sigma = item
+                    started = time.perf_counter() if self._perf_enabled else 0.0
+                    try:
+                        write_xye(path, radial, intensity, sigma)
+                    except BaseException as error:
+                        self._errors.append(error)
+                    finally:
+                        if self._perf_enabled:
+                            self._perf_write += time.perf_counter() - started
+                finally:
+                    pending.task_done()
+
+        worker = threading.Thread(
+            target=write_pending,
+            name="xrd-tools-xye-writer",
+            daemon=True,
+        )
+        self._worker = worker
+        worker.start()
 
     def write(self, frame: Frame, reduction: FrameReduction) -> None:
         result = reduction.result_1d
@@ -491,10 +607,49 @@ class XYESink:
             frame=int(frame.index),
             label=frame.label,
         )
-        write_xye(path, result.radial, result.intensity, result.sigma)
+        pending = self._pending
+        if pending is None:
+            raise RuntimeError("XYESink.write called before begin().")
+        # The result arrays are immutable session outputs.  A bounded queue
+        # keeps at most 16 frames alive while preserving writer order (including
+        # replacement writes) without serializing text I/O on the HDF5 owner.
+        pending.put((
+            path,
+            result.radial,
+            result.intensity,
+            result.sigma,
+        ))
 
     def finish(self, result: ReductionResult) -> None:
-        return None
+        pending, worker = self._pending, self._worker
+        if pending is not None and worker is not None:
+            pending.put(_XYE_WRITE_END)
+            worker.join()
+        self._pending = None
+        self._worker = None
+        if self._errors:
+            # Surface the primary failure once, then permit the run owner's
+            # retryable cleanup pass to close the already-drained sink.
+            error = self._errors[0]
+            self._errors.clear()
+            raise error
+
+    def abort(self, result: ReductionResult) -> None:
+        # Completed per-frame exports remain useful beside a partial NeXus
+        # artifact.  Drain the bounded prefix and report any write failure.
+        self.finish(result)
+
+    def perf_snapshot(self) -> dict[str, float]:
+        return {"sink_xye_write": self._perf_write}
+
+
+@dataclass(slots=True)
+class _PendingNexusWrite:
+    frame: Frame
+    reduction: FrameReduction
+    mode_1d: str
+    mode_2d: str
+    prepared_thumbnail: tuple[np.ndarray | None, bool] | None
 
 
 @dataclass(slots=True)
@@ -524,24 +679,88 @@ class NexusSink:
     source_base: Path | str | None = None
     write_thumbnails: bool = True
     thumbnail_max: int = 256
+    run_configuration_provenance: Mapping[str, Any] | None = field(default=None, repr=False)
+    source_execution_provenance: Mapping[str, Any] | None = field(default=None, repr=False)
+    source_snapshots_provenance: Mapping[str, Mapping[str, Any]] | None = None
+    expected_target_state: tuple[int, int, int, int, int] | bool | None = None
     _norm_source_base: str | None = field(default=None, init=False, repr=False)
     _h5: Any | None = field(default=None, init=False, repr=False)
     _n_written: int = field(default=0, init=False, repr=False)
     _scan: "Scan | None" = field(default=None, init=False, repr=False)
     _plan: "ReductionPlan | None" = field(default=None, init=False, repr=False)
+    _run_saturation_mask: "_RunSaturationMask | None" = field(
+        default=None, init=False, repr=False,
+    )
     _active_path: Path | None = field(default=None, init=False, repr=False)
     _tmp_path: Path | None = field(default=None, init=False, repr=False)
     _primary_mode_1d: str = field(default=DEFAULT_MODE_KEY, init=False, repr=False)
     _primary_mode_2d: str = field(default=DEFAULT_MODE_KEY, init=False, repr=False)
+    _run_configuration_provenance: dict[str, Any] | None = field(default=None, init=False, repr=False)
+    _source_execution_provenance: dict[str, Any] | None = field(default=None, init=False, repr=False)
+    _source_snapshots_provenance: dict[str, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
+    _prepared_thumbnails: dict[int, tuple[np.ndarray | None, bool]] = field(
+        default_factory=dict, init=False, repr=False,
+    )
+    _prepared_thumbnails_lock: Any = field(
+        default_factory=threading.Lock, init=False, repr=False,
+    )
+    _perf_enabled: bool = field(default=False, init=False, repr=False)
+    _perf_values: dict[str, float] = field(
+        default_factory=dict, init=False, repr=False,
+    )
+    _pending: list[_PendingNexusWrite] = field(
+        default_factory=list, init=False, repr=False,
+    )
+    _awaiting_durable: list[int] = field(
+        default_factory=list, init=False, repr=False,
+    )
+    _persisted_receipts: list[int] = field(
+        default_factory=list, init=False, repr=False,
+    )
+    _flush_failed: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.path, Path):
             self.path = Path(self.path)
+        self._perf_enabled = bool(os.environ.get("XDART_PERF"))
+        value = self.run_configuration_provenance
+        self.run_configuration_provenance = None
+        if value is not None:
+            copied = _copy_json_provenance(value)
+            if (
+                type(copied.get("generation")) is not int
+                or copied["generation"] < 1
+                or not isinstance(copied.get("fingerprint"), str)
+                or not copied["fingerprint"]
+                or type(copied.get("schema_version")) is not int
+            ):
+                raise ValueError("run configuration provenance has an invalid identity")
+            self._run_configuration_provenance = copied
+        source_execution = self.source_execution_provenance
+        self.source_execution_provenance = None
+        if source_execution is not None:
+            self._source_execution_provenance = _copy_json_provenance(source_execution)
+        source_snapshots = self.source_snapshots_provenance
+        self.source_snapshots_provenance = None
+        if source_snapshots is not None:
+            self._source_snapshots_provenance = {
+                str(path): _copy_json_provenance(snapshot)
+                for path, snapshot in source_snapshots.items()
+            }
 
     def begin(self, scan: Scan, plan: ReductionPlan) -> None:
         if self.flush_every is not None and self.flush_every <= 0:
             raise ValueError(f"flush_every must be > 0 or None; got {self.flush_every}")
         self._n_written = 0
+        self._perf_values.clear()
+        self._pending.clear()
+        self._awaiting_durable.clear()
+        self._persisted_receipts.clear()
+        self._flush_failed = False
+        with self._prepared_thumbnails_lock:
+            self._prepared_thumbnails.clear()
+        if self.expected_target_state is None:
+            self.expected_target_state = _target_state(self.path)
         # Stash the scan so finish() can persist its per-frame condition table
         # (scan_data) alongside the integrated stacks (core provenance).
         self._scan = scan
@@ -574,6 +793,9 @@ class NexusSink:
                 self._h5[self.entry], self.source_base
             )
 
+    def _bind_run_saturation_mask(self, state: "_RunSaturationMask") -> None:
+        self._run_saturation_mask = state
+
     def write(self, frame: Frame, reduction: FrameReduction) -> None:
         if self._h5 is None:
             raise RuntimeError("NexusSink.write called before begin().")
@@ -581,31 +803,146 @@ class NexusSink:
                       or self._primary_mode_1d or DEFAULT_MODE_KEY)
         mode_2d = str(getattr(reduction, "mode_2d", None)
                       or self._primary_mode_2d or DEFAULT_MODE_KEY)
-        top_1d = (
-            reduction.result_1d
-            if mode_1d in (self._primary_mode_1d, DEFAULT_MODE_KEY)
-            else None
-        )
-        top_2d = (
-            reduction.result_2d
-            if mode_2d in (self._primary_mode_2d, DEFAULT_MODE_KEY)
-            else None
-        )
-        if top_1d is not None or top_2d is not None:
-            write_nexus_frame(
-                self._h5,
-                frame.index,
-                result_1d=top_1d,
-                result_2d=top_2d,
-                entry=self.entry,
-                compression=self.compression,
-            )
-        self._write_named_modes(frame, reduction, mode_1d=mode_1d, mode_2d=mode_2d)
+        # A direct caller can feed the same label twice without going through
+        # ReductionSession.replace().  Keep a pending batch duplicate-free so
+        # the canonical stacked writer's upsert contract remains exact.
+        if any(int(item.frame.index) == int(frame.index) for item in self._pending):
+            self._flush_pending(force=True)
+
+        prepared = None
         if self.complete_record:
-            self._write_frame_record(frame)
-        self._n_written += 1
-        if self.flush_every is not None and self._n_written % self.flush_every == 0:
-            self._h5.flush()
+            with self._prepared_thumbnails_lock:
+                prepared = self._prepared_thumbnails.pop(id(reduction), None)
+            if prepared is None:
+                prepared = self._prepare_frame_thumbnail(frame)
+        self._pending.append(_PendingNexusWrite(
+            frame=frame,
+            reduction=reduction,
+            mode_1d=mode_1d,
+            mode_2d=mode_2d,
+            prepared_thumbnail=prepared,
+        ))
+        self._flush_pending(force=False)
+
+    def replace(self, frame: Frame, reduction: FrameReduction) -> None:
+        # Reintegrations are sparse and must not be reordered across an older
+        # live batch.  Flush the prefix, then persist the replacement now.
+        self._flush_pending(force=True)
+        self.write(frame, reduction)
+        self._flush_pending(force=True)
+
+    def flush(self, *, force: bool = False) -> None:
+        self._flush_pending(force=force)
+
+    def take_persisted_labels(self) -> tuple[int, ...]:
+        labels = tuple(self._persisted_receipts)
+        self._persisted_receipts.clear()
+        return labels
+
+    def _flush_pending(self, *, force: bool, sync: bool = True) -> None:
+        if self._h5 is None or not self._pending:
+            return
+        threshold = 1 if self.flush_every is None else int(self.flush_every)
+        if not force and len(self._pending) < threshold:
+            return
+        pending = tuple(self._pending)
+        try:
+            started = time.perf_counter() if self._perf_enabled else 0.0
+            try:
+                self._write_integrated_batch(pending)
+            finally:
+                self._perf_add("sink_nexus_integrated", started)
+            if self.complete_record:
+                started = time.perf_counter() if self._perf_enabled else 0.0
+                try:
+                    for item in pending:
+                        self._write_frame_record(
+                            item.frame,
+                            item.reduction,
+                            prepared=item.prepared_thumbnail,
+                        )
+                finally:
+                    self._perf_add("sink_nexus_frame_record", started)
+            self._n_written += len(pending)
+            self._awaiting_durable.extend(int(item.frame.index) for item in pending)
+            self._pending.clear()
+            if sync:
+                started = time.perf_counter() if self._perf_enabled else 0.0
+                try:
+                    self._h5.flush()
+                finally:
+                    self._perf_add("sink_nexus_h5_flush", started)
+                self._mark_pending_durable()
+        except BaseException:
+            self._flush_failed = True
+            raise
+
+    def _mark_pending_durable(self) -> None:
+        self._persisted_receipts.extend(self._awaiting_durable)
+        self._awaiting_durable.clear()
+
+    def _write_integrated_batch(
+        self, pending: tuple[_PendingNexusWrite, ...]
+    ) -> None:
+        from xrd_tools.io.nexus import write_integrated_stack
+
+        entry = self._h5[self.entry]
+
+        def write_dimension(dimension: str) -> None:
+            primary = (
+                self._primary_mode_1d if dimension == "1d"
+                else self._primary_mode_2d
+            )
+            mode_attr = "mode_1d" if dimension == "1d" else "mode_2d"
+            result_attr = "result_1d" if dimension == "1d" else "result_2d"
+            top = [
+                item for item in pending
+                if getattr(item.reduction, result_attr) is not None
+                and getattr(item, mode_attr) in (primary, DEFAULT_MODE_KEY)
+            ]
+            if top:
+                kwargs = {
+                    "frame_indices": [int(item.frame.index) for item in top],
+                    f"results_{dimension}": [
+                        getattr(item.reduction, result_attr) for item in top
+                    ],
+                    f"primary_mode_{dimension}": primary,
+                    "compression": self.compression,
+                }
+                write_integrated_stack(entry, **kwargs)
+
+            extras: dict[str, list[_PendingNexusWrite]] = {}
+            for item in pending:
+                result = getattr(item.reduction, result_attr)
+                mode = getattr(item, mode_attr)
+                if result is not None and mode not in (primary, DEFAULT_MODE_KEY):
+                    extras.setdefault(mode, []).append(item)
+            for mode, items in extras.items():
+                kwargs = {
+                    "frame_indices": [int(item.frame.index) for item in items],
+                    f"extra_modes_{dimension}": {
+                        mode: [getattr(item.reduction, result_attr) for item in items]
+                    },
+                    f"extra_mode_indices_{dimension}": {
+                        mode: [int(item.frame.index) for item in items]
+                    },
+                    f"primary_mode_{dimension}": primary,
+                    "compression": self.compression,
+                }
+                write_integrated_stack(entry, **kwargs)
+
+        write_dimension("1d")
+        write_dimension("2d")
+
+    def _perf_add(self, key: str, started: float) -> None:
+        if not self._perf_enabled:
+            return
+        self._perf_values[key] = self._perf_values.get(key, 0.0) + max(
+            0.0, time.perf_counter() - started,
+        )
+
+    def perf_snapshot(self) -> dict[str, float]:
+        return dict(self._perf_values)
 
     def _write_named_modes(
         self,
@@ -661,25 +998,95 @@ class NexusSink:
             compression=self.compression,
         )
 
-    def _write_frame_record(self, frame: Frame) -> None:
-        """Per-frame source pointer + thumbnail (complete-record mode)."""
-        from xrd_tools.io.nexus_record import (
-            ensure_frames_container, make_thumbnail_array, write_frame_record,
-        )
+    def worker_process(
+        self, frame: Frame, reduction: FrameReduction
+    ) -> None:
+        """Prepare the persisted thumbnail on the parallel reduction worker."""
 
-        thumb = None
-        if self.write_thumbnails and frame.image is not None:
-            img = np.asarray(frame.image, dtype=np.float32)
+        prepared = self._prepare_frame_thumbnail(
+            frame,
+            corrected_image=reduction.corrected_image,
+        )
+        with self._prepared_thumbnails_lock:
+            # A Frame object may be re-fed while an earlier reduction for the
+            # same frame is still in flight.  Bind preparation to the exact
+            # result instead of the mutable/reusable Frame owner.
+            self._prepared_thumbnails[id(reduction)] = prepared
+
+    def _prepare_frame_thumbnail(
+        self,
+        frame: Frame,
+        *,
+        corrected_image: np.ndarray | None = None,
+    ) -> tuple[np.ndarray | None, bool]:
+        from xrd_tools.io.nexus_record import make_thumbnail_array
+
+        if not self.write_thumbnails or frame.image is None:
+            return None, False
+        raw = np.asarray(frame.image)
+        if corrected_image is None:
+            img = np.asarray(raw, dtype=np.float32)
             bg = frame.background
             if bg is not None:
                 bg_arr = np.asarray(bg, dtype=np.float32)
                 if bg_arr.shape == () or bg_arr.shape == img.shape:
                     img = img - bg_arr
-            thumb = make_thumbnail_array(img, max_size=self.thumbnail_max)
+        else:
+            img = np.asarray(corrected_image, dtype=np.float32)
+        plan = self._plan
+        static_mask = None
+        if plan is not None:
+            static_mask = _as_bool_mask(
+                plan.mask,
+                "ReductionPlan.mask",
+                image_shape=raw.shape,
+            )
+            static_mask = _combined_mask(static_mask, frame.mask, raw.shape)
+        run_mask = self._run_saturation_mask
+        resolved_mask = (
+            run_mask.combine(static_mask, raw.shape)
+            if run_mask is not None and run_mask.seeded
+            else detector_value_mask(
+                static_mask,
+                raw,
+                enabled=bool(plan is not None and plan.mask_saturation),
+            )
+        )
+        return (
+            make_thumbnail_array(
+                img,
+                mask_flat=(
+                    None
+                    if resolved_mask is None
+                    else np.flatnonzero(resolved_mask)
+                ),
+                max_size=self.thumbnail_max,
+            ),
+            resolved_mask is not None,
+        )
+
+    def _write_frame_record(
+        self,
+        frame: Frame,
+        reduction: FrameReduction,
+        *,
+        prepared: tuple[np.ndarray | None, bool] | None = None,
+    ) -> None:
+        """Per-frame source pointer + thumbnail (complete-record mode)."""
+        from xrd_tools.io.nexus_record import (
+            ensure_frames_container, write_frame_record,
+        )
+
+        thumb, mask_baked = (
+            prepared
+            if prepared is not None
+            else self._prepare_frame_thumbnail(frame)
+        )
         write_frame_record(
             ensure_frames_container(self._h5[self.entry]),
             f"frame_{int(frame.index):04d}",
             thumbnail=thumb,
+            thumbnail_mask_baked=mask_baked,
             source_path=(str(frame.source_path)
                          if frame.source_path is not None else None),
             source_frame_index=(int(frame.source_frame_index)
@@ -687,6 +1094,7 @@ class NexusSink:
                                 else 0),
             timestamp=frame.metadata.get("timestamp"),
             source_base=self._norm_source_base,
+            source_snapshot=self._source_snapshots_provenance.get(str(frame.source_path)),
         )
 
     def finish(self, result: ReductionResult) -> None:
@@ -694,6 +1102,9 @@ class NexusSink:
             return
         tmp_path = self._tmp_path
         try:
+            # Write the final short block without a redundant HDF5 sync; the
+            # metadata/provenance flush below is the one durable boundary.
+            self._flush_pending(force=True, sync=False)
             # Persist the per-frame condition table (scan_data) after the final
             # integrated frame, before close.  A finish-time single upsert is
             # correct for a batch sink; only the GUI's SWMR live consumers would
@@ -736,6 +1147,14 @@ class NexusSink:
                     )
 
                     config, inputs = build_reduction_config((scan, plan))
+                    if self._run_configuration_provenance is not None:
+                        config["run_configuration"] = copy.deepcopy(
+                            self._run_configuration_provenance,
+                        )
+                    if self._source_execution_provenance is not None:
+                        config["source_execution"] = copy.deepcopy(
+                            self._source_execution_provenance,
+                        )
                     write_provenance(
                         self._h5,
                         entry=self.entry,
@@ -745,11 +1164,14 @@ class NexusSink:
                         inputs=inputs or None,
                     )
             self._h5.flush()
+            self._mark_pending_durable()
             self._h5.close()
             self._h5 = None
             self._scan = None
             self._plan = None
             if tmp_path is not None:
+                if _target_state(self.path) != self.expected_target_state:
+                    raise RuntimeError("output target changed after writer admission")
                 tmp_path.replace(self.path)
         except BaseException:
             try:
@@ -759,6 +1181,8 @@ class NexusSink:
         finally:
             self._active_path = None
             self._tmp_path = None
+            with self._prepared_thumbnails_lock:
+                self._prepared_thumbnails.clear()
 
     def abort(self, result: ReductionResult) -> None:
         """Failure teardown.  NEVER destroys written data (T0-6/S7): in atomic
@@ -768,11 +1192,22 @@ class NexusSink:
         names it.  Non-atomic mode writes in place — nothing to move."""
         h5 = self._h5
         tmp_path = self._tmp_path
+        if h5 is not None and self._pending and not self._flush_failed:
+            try:
+                # Preserve successfully reduced frames in the partial artifact
+                # even when a different frame failed later in the run.
+                self._flush_pending(force=True, sync=False)
+            except Exception:
+                pass
         self._h5 = None
         self._scan = None
         self._plan = None
         self._active_path = None
         self._tmp_path = None
+        with self._prepared_thumbnails_lock:
+            self._prepared_thumbnails.clear()
+        self._pending.clear()
+        self._awaiting_durable.clear()
         if h5 is not None:
             try:
                 h5.close()
@@ -795,6 +1230,81 @@ class NexusSink:
                     f"partial output; data left at {tmp_path}.",
                     RuntimeWarning, stacklevel=2,
                 )
+
+
+def _target_state(path: Path) -> tuple[int, int, int, int, int] | bool:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return False
+    return (int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ctime_ns),
+            int(stat.st_dev), int(stat.st_ino))
+
+
+class _RunSaturationMask:
+    """Session-owned, first-frame detector-value mask.
+
+    This state is deliberately outside :class:`ReductionPlan`: it is derived
+    runtime data, not frozen operator intent or provenance.  One lock protects
+    the first seed so pool workers can share one immutable bool array.
+    """
+
+    __slots__ = ("enabled", "_seeded", "_mask", "_lock")
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        self._seeded = False
+        self._mask: np.ndarray | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def seeded(self) -> bool:
+        with self._lock:
+            return self._seeded
+
+    @property
+    def mask(self) -> np.ndarray | None:
+        with self._lock:
+            return self._mask
+
+    def seed(self, raw_image: object | None = None) -> None:
+        with self._lock:
+            if self._seeded:
+                return
+            if not self.enabled:
+                self._seeded = True
+                return
+            if raw_image is None:
+                raise RuntimeError(
+                    "enabled run saturation mask requires the first raw frame"
+                )
+            resolved = detector_value_mask(
+                None,
+                np.asarray(raw_image),
+                enabled=True,
+            )
+            if resolved is not None:
+                resolved = np.array(resolved, dtype=bool, copy=True)
+                resolved.setflags(write=False)
+            self._mask = resolved
+            self._seeded = True
+
+    def apply(self, mask: np.ndarray | None, raw_image: object) -> np.ndarray | None:
+        self.seed(raw_image)
+        return self.combine(mask, np.asarray(raw_image).shape)
+
+    def combine(
+        self,
+        mask: np.ndarray | None,
+        image_shape: tuple[int, ...],
+    ) -> np.ndarray | None:
+        if len(image_shape) != 2:
+            raise ValueError(f"detector image must be 2D; got shape {image_shape}")
+        with self._lock:
+            if not self._seeded:
+                raise RuntimeError("run saturation mask used before first-frame seed")
+            value_mask = self._mask
+        return combine_detector_masks(mask, value_mask, image_shape)
 
 
 @dataclass(slots=True)
@@ -856,6 +1366,7 @@ class ReductionSession:
     _frame_masks: dict[tuple[int, tuple[int, int]], tuple[Any, np.ndarray | None]] = field(
         default_factory=dict, init=False, repr=False,
     )
+    _run_saturation_mask: _RunSaturationMask = field(init=False, repr=False)
     # S8: per-SCAN monitor warn-once state (shared with pool workers like
     # _plan_masks; set.add is GIL-atomic).  Session-owned so a dead monitor
     # warns again on the next scan and concurrent sessions don't cross-talk.
@@ -921,6 +1432,10 @@ class ReductionSession:
             raise ValueError(f"chunk_size must be > 0; got {self.chunk_size}")
         self.scan = _coerce_to_scan(self.source)
         self._sink = _coerce_sink(self.sink)
+        self._run_saturation_mask = _RunSaturationMask(self.plan.mask_saturation)
+        bind_run_mask = getattr(self._sink, "_bind_run_saturation_mask", None)
+        if callable(bind_run_mask):
+            bind_run_mask(self._run_saturation_mask)
         self.cancel_token = self.cancel_token or CancelToken()
         self._freeze_policy = _normalize_gi_freeze_mode(self.gi_freeze_mode)
         self._output_path = _sink_path(self._sink) or (
@@ -990,6 +1505,14 @@ class ReductionSession:
         """Completed frame reductions accumulated so far."""
 
         return self._products
+
+    @property
+    def saturation_mask_seeded(self) -> bool:
+        return self._run_saturation_mask.seeded
+
+    @property
+    def saturation_mask(self) -> np.ndarray | None:
+        return self._run_saturation_mask.mask
 
     def release_products(self, indices) -> None:
         """Drop retained :class:`FrameReduction` objects for *indices*.
@@ -1152,8 +1675,9 @@ class ReductionSession:
         # Permit held and not cancelled: NOW it is safe to register the frame in
         # the scan inventory and dispatch it — every registered/counted frame
         # from here on is genuinely in flight.
-        self._register_process_frames([frame])
         try:
+            image = self._prime_saturation_mask(frame, image)
+            self._register_process_frames([frame])
             future = self._worker.submit(self._stream_reduce, frame, image)
         except BaseException as exc:
             # Pool/interpreter-level dispatch failure: the in-flight permit
@@ -1181,6 +1705,7 @@ class ReductionSession:
             self._frame_masks,
             self.cancel_token, self._warned_monitor_keys,
             include_corrected_image=callable(worker_process),
+            run_saturation_mask=self._run_saturation_mask,
             strict=self.strict,
         )
         try:
@@ -1491,8 +2016,29 @@ class ReductionSession:
             fi=None,
             initial_incident_angle=self._initial_incident_angle,
             warned_monitor_keys=self._warned_monitor_keys,
+            run_saturation_mask=self._run_saturation_mask,
         )
         self._gi_freeze_applied = True
+
+    def _prime_saturation_mask(
+        self,
+        frame: Frame,
+        image: np.ndarray | None,
+    ) -> np.ndarray | None:
+        """Seed from the first image already entering this session.
+
+        Source-fed streaming passes that array straight through.  A direct
+        frame submission loads at most once and returns the same array to the
+        worker, so first-frame seeding never introduces a second source open.
+        """
+        if self._run_saturation_mask.seeded:
+            return image
+        if not self._run_saturation_mask.enabled:
+            self._run_saturation_mask.seed()
+            return image
+        raw = np.asarray(image) if image is not None else np.asarray(frame.load_image())
+        self._run_saturation_mask.seed(raw)
+        return raw
 
     def _normalize_process_input(
         self,
@@ -1578,6 +2124,7 @@ class ReductionSession:
             if self.cancel_token.cancelled:
                 self._mark_cancelled()
                 break
+            raw_image = self._prime_saturation_mask(frame, raw_image)
             _emit(self.progress_cb, self.scan.name, "load", frame.index, self._completed, len(self.scan))
             _emit(self.progress_cb, self.scan.name, "integrate", frame.index, self._completed, len(self.scan))
             if self._worker is None:
@@ -1591,6 +2138,7 @@ class ReductionSession:
                         self._frame_masks,
                         cancel_token=self.cancel_token,
                         warned_monitor_keys=self._warned_monitor_keys,
+                        run_saturation_mask=self._run_saturation_mask,
                         strict=self.strict,
                     )
                 except _ReductionCancelled:
@@ -1624,6 +2172,7 @@ class ReductionSession:
                         self._frame_masks,
                         self.cancel_token,
                         self._warned_monitor_keys,
+                        run_saturation_mask=self._run_saturation_mask,
                         strict=self.strict,
                     ),
                 ))
@@ -2002,6 +2551,7 @@ def _apply_gi_freeze_policy(
     fi: Any,
     initial_incident_angle: float | None,
     warned_monitor_keys: set[str] | None = None,
+    run_saturation_mask: _RunSaturationMask | None = None,
 ) -> ReductionPlan:
     """Return a copy of *plan* with missing GI output ranges frozen.
 
@@ -2038,7 +2588,8 @@ def _apply_gi_freeze_policy(
         frame = scan._frame_by_index[int(idx)]
         was_empty = frame.image is None
         reduction = _reduce_frame(frame, None, plan, scout_integrators, masks,
-                                  warned_monitor_keys=warned_monitor_keys)
+                                  warned_monitor_keys=warned_monitor_keys,
+                                  run_saturation_mask=run_saturation_mask)
         if reduction.result_1d is not None:
             scout_results_1d.append(reduction.result_1d)
         if reduction.result_2d is not None:
@@ -2335,6 +2886,7 @@ def _reduce_frame(
     warned_monitor_keys: set[str] | None = None,
     *,
     include_corrected_image: bool = False,
+    run_saturation_mask: _RunSaturationMask | None = None,
     strict: StrictPolicy | None = None,
 ) -> FrameReduction:
     if cancel_token is not None and cancel_token.cancelled:
@@ -2362,7 +2914,12 @@ def _reduce_frame(
         plan_masks,
     )
     mask = _combined_mask(plan_mask, frame.mask, image.shape, frame_masks)
-    mask = _apply_saturation_mask(mask, raw_image_arr, plan)
+    mask = _apply_saturation_mask(
+        mask,
+        raw_image_arr,
+        plan,
+        run_saturation_mask=run_saturation_mask,
+    )
 
     if plan.gi is not None:
         fi = integrators.fiber()
@@ -2820,20 +3377,7 @@ def _combined_mask(
         image_shape,
         frame_mask_cache,
     )
-    if plan_mask is not None and plan_mask.shape != image_shape:
-        raise ValueError(
-            f"ReductionPlan.mask shape {plan_mask.shape} does not match "
-            f"image shape {image_shape}"
-        )
-    if frame_mask is not None and frame_mask.shape != image_shape:
-        raise ValueError(
-            f"Frame.mask shape {frame_mask.shape} does not match image shape {image_shape}"
-        )
-    if plan_mask is None:
-        return frame_mask
-    if frame_mask is None:
-        return plan_mask
-    return plan_mask | frame_mask
+    return combine_detector_masks(plan_mask, frame_mask, image_shape)
 
 
 def _cached_frame_mask_for_shape(
@@ -2855,25 +3399,26 @@ def _cached_frame_mask_for_shape(
     return resolved
 
 
-def _apply_saturation_mask(mask, raw_image, plan):
-    """R3-C: OR the fraction-guarded detector-saturation mask into ``mask``.
+def _apply_saturation_mask(
+    mask,
+    raw_image,
+    plan,
+    *,
+    run_saturation_mask: _RunSaturationMask | None = None,
+):
+    """Union the toggle-qualified detector value mask into ``mask``.
 
-    No-op unless ``plan.mask_saturation`` is set.  The ceiling is derived from
-    the RAW integer dtype (uint16 -> 65535, uint8 -> 255), read from the
-    pre-float ``raw_image`` — core never hardcodes 65535, so a float-dtype frame
-    (ceiling None) yields an all-False mask and this stays a no-op.  Mirrors the
-    GUI policy (saturation_pixels' >1e-4 fraction guard) so live/GUI and headless
-    masks agree when both opt in.  ``raw_image`` (original detector counts) is
-    used deliberately — thresholding-to-NaN / background subtraction would
-    corrupt the exact-ceiling equality test."""
-    if not plan.mask_saturation:
-        return mask
-    from xrd_tools.core.invalid import integer_saturation_ceiling, saturation_pixels
-
-    sat = saturation_pixels(raw_image, ceiling=integer_saturation_ceiling(raw_image))
-    if not sat.any():
-        return mask
-    return sat if mask is None else (mask | sat)
+    A session supplies ``run_saturation_mask`` so the first native frame owns
+    one immutable mask for the scan.  The no-state path remains dynamic for
+    direct/private callers.  Disabled behavior is an exact no-op.
+    """
+    if run_saturation_mask is not None:
+        return run_saturation_mask.apply(mask, raw_image)
+    return detector_value_mask(
+        mask,
+        raw_image,
+        enabled=bool(plan.mask_saturation),
+    )
 
 
 # S8: fallback warn-state for direct (sessionless) calls.  Sessions own

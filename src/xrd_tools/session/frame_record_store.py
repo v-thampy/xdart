@@ -414,6 +414,37 @@ class FrameRecordStore:
             record = self._records.get(label)
             return bool(record is not None and _has_heavy_payload(record))
 
+    def evict_heavy(self, label: int | str) -> bool:
+        """Thin one exact persisted record without changing its identity."""
+        with self._lock:
+            record = self._records.get(label)
+            if (
+                record is None
+                or not _has_heavy_payload(record)
+                or (
+                    self._require_persisted_for_eviction
+                    and not self._label_heavy_payload_persisted_locked(label)
+                )
+            ):
+                return False
+            self._records[label] = _thin_record(record)
+            self._drop_heavy_label_locked(label)
+            return True
+
+    def discard(self, label: int | str) -> bool:
+        """Remove one exact persisted record from the resident lookup tier."""
+        with self._lock:
+            if label not in self._records or (
+                self._require_persisted_for_eviction
+                and not self._label_persisted_locked(label)
+            ):
+                return False
+            self._records.pop(label, None)
+            self._source_ids.pop(label, None)
+            self._persisted_modes.pop(label, None)
+            self._drop_heavy_label_locked(label)
+            return True
+
     def source_identity(self, label: int | str) -> str:
         with self._lock:
             return self._source_ids.get(label, "")

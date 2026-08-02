@@ -152,6 +152,7 @@ class DirectoryIndexSession:
         self._max_probes_per_observation = int(max_probes_per_observation)
         self._probe_time_budget_s = float(probe_time_budget_s)
         self._probe_candidates = bool(probe_candidates)
+        self._probe_excluded: set[Candidate] = set()
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="xdart-directory-index")
         self._closed = False
@@ -203,6 +204,13 @@ class DirectoryIndexSession:
 
     def observe(self, *, refresh: bool = True) -> DirectoryObservation:
         return self.observe_async(refresh=refresh).result()
+
+    def enable_probes(self, *, exclude: tuple[Candidate, ...] = ()) -> None:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("directory index session is closed")
+            self._probe_candidates = True
+            self._probe_excluded = set(exclude)
 
     def _request(self) -> tuple[int, DirectorySessionConfig]:
         with self._lock:
@@ -271,7 +279,7 @@ class DirectoryIndexSession:
         for candidate in snapshot.candidates:
             stored = self._results.get(candidate.path)
             retrying = index.retry_state(candidate.path) is not None
-            if stored is None:
+            if stored is None and candidate not in self._probe_excluded:
                 unseen.append(candidate)
             elif retrying:
                 retrying_candidates.append(candidate)
@@ -361,6 +369,7 @@ class DirectoryIndexSession:
         )
         unprobed_count = sum(
             candidate.path not in self._results
+            and candidate not in self._probe_excluded
             for candidate in snapshot.candidates
         )
         ready_candidates = tuple(

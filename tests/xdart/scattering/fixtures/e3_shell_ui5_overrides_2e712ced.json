@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "parent_commit": "2e712cedd17bea4feb6d4c6894721f15345be32f",
+  "canonical_inventory": "e3_shell_inventory_ff5380a7.json",
+  "detector": [
+    ["Poni", ["Signal", "poni_file"]],
+    ["Mask File", ["Signal", "mask_file"]]
+  ],
+  "directory_source_rows": [
+    [["Source", ["Signal", "inp_type"]], ["Subdirs", ["Signal", "include_subdir"]]],
+    [["Directory", ["Signal", "img_dir"]]],
+    [["File Type", ["Signal", "img_ext"]], ["Meta Type", ["Signal", "meta_ext"]], ["more", ["Source", "energy_preference"]]],
+    [["Filter", ["Signal", "Filter"]]]
+  ],
+  "processing": {
+    "1-D": {
+      "axis_row": [
+        ["Axis", ["Int1D", "axis"]],
+        ["Pts", ["Int1D", "points"]]
+      ],
+      "ranges": [
+        ["Q (Å⁻¹)", ["Int1D", "radial_low"], ["Int1D", "radial_high"]],
+        ["χ (°)", ["Int1D", "azim_low"], ["Int1D", "azim_high"]]
+      ]
+    },
+    "2-D": {
+      "axis_row": [
+        ["Axis", ["Int2D", "axis"]],
+        ["Pts", ["Int2D", "radial_points"], ["Int2D", "azim_points"]]
+      ],
+      "ranges": [
+        ["Q (Å⁻¹)", ["Int2D", "radial_low"], ["Int2D", "radial_high"]],
+        ["χ (°)", ["Int2D", "azim_low"], ["Int2D", "azim_high"]]
+      ]
+    },
+    "conditioning_pills": [
+      ["Mask Saturated", ["MaskSat", "mask_sentinel"]],
+      ["Average Scan", ["Signal", "series_average"]]
+    ]
+  },
+  "frame_caption": "local_frame_label only; exact DisplayFrameKey remains item data",
+  "metadata": "one plain push action with no attached menu"
+}

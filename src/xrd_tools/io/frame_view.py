@@ -23,6 +23,7 @@ from xrd_tools.io.read import _decode, _dequantize_thumbnail, _entry
 from xrd_tools.io.schema import (
     GI_MODE_KEYS_1D,
     GI_MODE_KEYS_2D,
+    MONOTONIC_ATTR,
     MULTI_RESULT_MODES_ATTR,
     PRIMARY_MODE_ATTR,
     mode_subgroup_name,
@@ -38,10 +39,31 @@ def _decode_kind(value, x_unit: str | None, y_unit: str | None) -> TwoDKind:
     return two_d_kind_from_units(x_unit, y_unit)
 
 
-def _frame_map(group: h5py.Group | None) -> dict[int, int]:
+def _frame_map(group: h5py.Group | None, target_frame: int | None = None) -> dict[int, int]:
     if group is None or "frame_index" not in group:
         return {}
-    labels = [int(v) for v in np.asarray(group["frame_index"][()]).ravel()]
+    dataset = group["frame_index"]
+    if target_frame is not None:
+        target = int(target_frame)
+        size = int(dataset.size)
+        marker = group.attrs.get(MONOTONIC_ATTR)
+        if marker is not None and bool(marker):
+            low, high = 0, size
+            while low < high:
+                middle = (low + high) // 2
+                value = int(np.asarray(dataset[middle]).ravel()[0])
+                low, high = (middle + 1, high) if value < target else (low, middle)
+            found = low < size and int(np.asarray(dataset[low]).ravel()[0]) == target
+            return {target: low} if found else {}
+        rows = []
+        step = dataset.chunks[0] if dataset.chunks else 4096
+        for start in range(0, size, step):
+            labels = np.asarray(dataset[start : start + step]).ravel()
+            rows.extend(start + int(offset) for offset in np.flatnonzero(labels == target))
+        if len(rows) > 1:
+            raise ValueError(f"{group.name}/frame_index contains duplicate labels")
+        return {} if not rows else {target: rows[0]}
+    labels = [int(v) for v in np.asarray(dataset[()]).ravel()]
     if len(labels) != len(set(labels)):
         raise ValueError(f"{group.name}/frame_index contains duplicate labels")
     return {label: row for row, label in enumerate(labels)}
@@ -79,6 +101,8 @@ class FrameViewReader:
         entry: str = "entry",
         include_thumbnail: bool = True,
         source_root: str | Path | None = None,
+        resolve_source: bool = True,
+        target_frame: int | None = None,
     ) -> None:
         self.path = Path(scan_file)
         self.entry_name = entry
@@ -87,6 +111,10 @@ class FrameViewReader:
         # project root the relative source paths were written against is read
         # from the file in __enter__.
         self.source_root = source_root
+        self.resolve_source = bool(resolve_source)
+        if target_frame is not None and (type(target_frame) is not int or target_frame < 0):
+            raise TypeError("target_frame must be an exact nonnegative integer")
+        self.target_frame = target_frame
         self._source_base: str | None = None
         self._h5: h5py.File | None = None
         self._entry: h5py.Group | None = None
@@ -153,10 +181,10 @@ class FrameViewReader:
         self._g2, _ = resolve_integrated_group(self._entry, "integrated_2d")
         self._geom = self._entry.get("per_frame_geometry")
         self._scan_data = self._entry.get("scan_data")
-        self._map_1d = _frame_map(self._g1)
-        self._map_2d = _frame_map(self._g2)
-        self._map_geom = _frame_map(self._geom)
-        self._map_scan_data = _frame_map(self._scan_data)
+        self._map_1d = _frame_map(self._g1, self.target_frame)
+        self._map_2d = _frame_map(self._g2, self.target_frame)
+        self._map_geom = _frame_map(self._geom, self.target_frame)
+        self._map_scan_data = _frame_map(self._scan_data, self.target_frame)
         self._scan_data_columns = None  # rebuild lazily for this open
 
         # Multi-result discovery (ADR-0003).  Read the per-scan primary + the
@@ -182,7 +210,7 @@ class FrameViewReader:
             if "intensity" not in g or "q" not in g:
                 return
             self._g1_modes[mode] = g
-            self._map_1d_modes[mode] = _frame_map(g)
+            self._map_1d_modes[mode] = _frame_map(g, self.target_frame)
             self._axis_1d_modes[mode] = axis_from_unit(
                 _dataset_unit(g, "q"), np.asarray(g["q"][()]))
 
@@ -190,7 +218,7 @@ class FrameViewReader:
             if "intensity" not in g or "q" not in g or "chi" not in g:
                 return
             self._g2_modes[mode] = g
-            self._map_2d_modes[mode] = _frame_map(g)
+            self._map_2d_modes[mode] = _frame_map(g, self.target_frame)
             qu, cu = _dataset_unit(g, "q"), _dataset_unit(g, "chi")
             self._axis_2d_x_modes[mode] = axis_from_unit(qu, np.asarray(g["q"][()]))
             self._axis_2d_y_modes[mode] = axis_from_unit(cu, np.asarray(g["chi"][()]))
@@ -251,11 +279,33 @@ class FrameViewReader:
                     continue
         return tuple(sorted(labels))
 
+    def has_frame(self, frame: int) -> bool:
+        """Whether one exact frame has any persisted processed record."""
+        frame = int(frame)
+        maps = (self._map_1d, self._map_2d, self._map_geom, self._map_scan_data,
+                *self._map_1d_modes.values(), *self._map_2d_modes.values())
+        if any(frame in mapping for mapping in maps):
+            return True
+        record = None if self._entry is None else self._entry.get(f"frames/frame_{frame:04d}")
+        return bool(record is not None and len(record))
+
     def _metadata_for_frame(self, frame: int) -> dict[str, object]:
         row = self._row(self._map_scan_data, frame)
         group = self._scan_data
         if row is None or group is None:
             return {}
+        if self.target_frame is not None:
+            out: dict[str, object] = {}
+            for key, item in group.items():
+                if key == "frame_index" or not isinstance(item, h5py.Dataset):
+                    continue
+                try:
+                    value = item[row]
+                except (IndexError, TypeError, ValueError):
+                    continue
+                if np.asarray(value).shape == ():
+                    out[str(key)] = _decode(np.asarray(value).item())
+            return out
         cols = self._scan_data_columns
         if cols is None:
             # Read each scan_data column ONCE per open, then slice by row —
@@ -310,7 +360,9 @@ class FrameViewReader:
         fg = entry.get(f"frames/frame_{int(frame):04d}")
         if fg is None or "thumbnail" not in fg:
             return None, False
-        return _dequantize_thumbnail(fg["thumbnail"]), True
+        thumbnail = fg["thumbnail"]
+        return _dequantize_thumbnail(thumbnail), bool(
+            thumbnail.attrs.get("mask_baked", True))
 
     def _source_for_frame(self, frame: int) -> tuple[str | None, int | None]:
         entry = self._entry
@@ -324,17 +376,16 @@ class FrameViewReader:
         source_idx = None
         if "path" in src:
             stored = str(_decode(src["path"][()]))
-            # N1: resolve the (relative) stored path to an absolute master so
-            # FrameView consumers (FrameSource/Scan/notebooks/RSM/stitch) can
-            # locate the raw after the data moves.  Precedence source_root >
-            # @source_base > scan dir; absolute paths used as-is (back-compat).
-            # Fall back to the stored string when nothing resolves, so the
-            # field is never silently blanked (provenance preserved).
-            from xrd_tools.io.read import resolve_source_master
-            resolved = resolve_source_master(
-                stored, scan_file=self.path,
-                source_base=self._source_base, source_root=self.source_root)
-            path = str(resolved) if resolved is not None else stored
+            if not self.resolve_source:
+                path = stored
+            else:
+                # Resolve for normal FrameView consumers; FramePreview asks for
+                # the exact persisted locator and performs its own bounded read.
+                from xrd_tools.io.read import resolve_source_master
+                resolved = resolve_source_master(
+                    stored, scan_file=self.path,
+                    source_base=self._source_base, source_root=self.source_root)
+                path = str(resolved) if resolved is not None else stored
         if "frame_index" in src:
             source_idx = int(np.asarray(src["frame_index"][()]).ravel()[0])
         return path, source_idx

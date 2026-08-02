@@ -33,6 +33,7 @@ if TYPE_CHECKING:  # static mirror of the lazy __getattr__ exports below
     )
 
 from xrd_tools.core.containers import (
+    convert_radial_axis,
     IntegrationResult1D,
     IntegrationResult2D,
     PONI,
@@ -50,6 +51,8 @@ from xrd_tools.core.staging import (
 )
 from xrd_tools.core.invalid import (
     UINT32_CEILING,
+    combine_detector_masks,
+    detector_value_mask,
     integer_saturation_ceiling,
     saturation_pixels,
 )
@@ -127,6 +130,9 @@ __all__ = [
     "IntegrationResult1D",
     "IntegrationResult2D",
     "PONI",
+    "convert_radial_axis",
+    "combine_detector_masks",
+    "detector_value_mask",
     "heavy_window",
     "heavy_window_log_line",
     "reduction_worker_cap",

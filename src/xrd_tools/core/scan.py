@@ -254,6 +254,7 @@ class Scan:
     output_path: Path | str | None = None
     sample_name: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
+    gi_config: dict[str, Any] = field(default_factory=dict)
     capabilities: SourceCapabilities = field(
         default_factory=lambda: SourceCapabilities(
             is_streaming=False,

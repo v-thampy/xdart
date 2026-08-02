@@ -53,6 +53,7 @@ __all__ = [
     "ReadBlock",
     "CursorClosedError",
     "ContainerNotReadyError",
+    "open_container_cursor",
 ]
 
 
@@ -367,3 +368,14 @@ class ContainerCursor:
             reason = desc.reason if desc is not None else "no detector dataset"
             raise ValueError(
                 f"{self._path} has no readable detector dataset ({reason})")
+
+
+def open_container_cursor(
+    path: str | Path,
+    *,
+    entry: str = "entry",
+    candidate: object | None = None,
+) -> ContainerCursor:
+    """Open one exact cursor through the reviewed source-adapter boundary."""
+
+    return ContainerCursor(path, entry=entry, candidate=candidate).open()

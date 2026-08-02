@@ -1,0 +1,1235 @@
+from __future__ import annotations
+from dataclasses import dataclass, field, replace
+import logging
+import os
+from pathlib import Path
+from queue import Empty, Full, Queue, SimpleQueue
+from threading import Event, Lock, Thread, current_thread
+from time import monotonic
+from typing import Any
+import numpy as np
+from xdart.modules.frame_publication import FramePublication, PublicationStore
+from xrd_tools.core.scan import SourceKind
+from xrd_tools.integrate.calibration import load_poni, poni_to_integrator
+from xrd_tools.reduction import CompositeSink, NexusSink, XYESink
+from xrd_tools.session.display_logic import xye_prefix_for_unit
+from xrd_tools.session.frame_record_store import FrameRecordStore
+from xrd_tools.session.readiness import build_native_int_reduction_plan_from_args
+from xrd_tools.session.run_configuration import FrozenRunConfiguration
+from xrd_tools.session.scan_session import ScanSession
+from xrd_tools.sources import open_source
+from xrd_tools.sources.cursor import open_container_cursor
+from xrd_tools.sources.nexus import NexusStackSource
+from ..contracts import (
+    AdmittedOutput, AdmissionFailure, AdmissionReceipt, AdmissionReleased,
+    AdmissionToken,
+    SourceCapture, StartCapture, executor_start_inputs_are_valid,
+)
+from ..acquisition_runtime import AcquisitionRuntime
+from ..display_values import (
+    DisplayFrameCatalog,
+    DisplayFrameKey,
+    StandardDisplayPayload,
+    StandardEventKind,
+    StandardRunEvent,
+    standard_progress,
+)
+from ..display_runtime import (
+    DisplayArtifact,
+    RunDisplayState,
+    project_frame_detector_values,
+)
+from ..display_retirement import (
+    DisplayRetirementOwner,
+    NO_DISPLAY_RETIREMENT,
+)
+from ..events import (
+    CleanupStatus, DetachedDiagnostic, DurablePaused, ExecutorAccepted, ExecutorClosed,
+    ExecutorStartFailed, RunIdentity, detach_exception,
+)
+from ..output_preflight import (
+    OutputDisposition, PlannedOutput, execution_plan_values,
+    prepare_output as build_admission_receipt, source_snapshots,
+    target_state_matches, validate_admitted_receipt, validate_planned_source,
+)
+from ..output_values import APPEND_UNAVAILABLE
+from .target_reservation import (
+    AdmissionOperation as _AdmissionOperation,
+    RunResources,
+)
+
+logger = logging.getLogger(__name__)
+
+# Match the established live writer cadence while keeping source reads bounded.
+# A per-frame HDF5 flush roughly doubled long Eiger runs, while requesting the
+# entire container as one chunk made Stop wait behind a large read.
+_LIVE_SINK_FLUSH_EVERY = 8
+_CONTAINER_READ_CHUNK_FRAMES = 8
+_SOURCE_PREFETCH_FRAMES = 4
+_DISPLAY_PROJECTION_FRAMES = 8
+
+_SOURCE_SUBMISSION_END = object()
+_DISPLAY_PROJECTION_END = object()
+
+@dataclass(slots=True)
+class _StandardRun:
+    configuration: FrozenRunConfiguration | None
+    identity: RunIdentity
+    scan: Any | None
+    source: Any | None
+    session: ScanSession | None
+    records: FrameRecordStore | None
+    artifact: Path
+    max_display_items: int = 2
+    capture: SourceCapture | None = None
+    sink: NexusSink | None = None
+    worker: Thread | None = None
+    stop_requested: bool = False
+    sink_requires_abort: bool = False
+    closed: bool = False
+    cleanup_status: CleanupStatus = CleanupStatus.CLEANUP_PENDING
+    primary: DetachedDiagnostic | None = None
+    cleanup_failures: list[DetachedDiagnostic] = field(default_factory=list)
+    cleanup_lock: Lock = field(default_factory=Lock)
+    terminal_emitted: bool = False
+    artifacts: list[Path] = field(default_factory=list)
+    completed: int = 0
+    total: int = 0
+    resources: RunResources | None = None
+    display: RunDisplayState = field(init=False)
+    context_runtime: AcquisitionRuntime | None = None
+    frames_by_label: dict[int, Any] = field(default_factory=dict)
+    perf_enabled: bool = field(init=False)
+    perf_values: dict[str, float] = field(default_factory=dict)
+    perf_lock: Lock = field(default_factory=Lock)
+    display_projection_queue: Queue[object] | None = None
+    display_projection_worker: Thread | None = None
+    display_projection_errors: list[BaseException] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.perf_enabled = bool(os.environ.get("XDART_PERF"))
+        self.display = RunDisplayState(
+            self.identity,
+            max_payload_items=self.max_display_items,
+        )
+
+
+def _perf_add(run: _StandardRun, key: str, elapsed: float) -> None:
+    if not run.perf_enabled:
+        return
+    with run.perf_lock:
+        run.perf_values[key] = run.perf_values.get(key, 0.0) + max(
+            0.0, float(elapsed)
+        )
+
+
+class StandardRunExecutor:
+
+    def __init__(self, *, max_display_items: int=2, join_timeout: float=5.0) -> None:
+        if type(max_display_items) is not int or max_display_items < 1:
+            raise ValueError('max_display_items must be a positive integer')
+        self._lock = Lock()
+        self._events: SimpleQueue[StandardRunEvent] = SimpleQueue()
+        self._active: _StandardRun | None = None
+        self._admission: _AdmissionOperation | None = None
+        self._retirement: DisplayRetirementOwner | None = None
+        self._max_display_items = max_display_items
+        self._join_timeout = float(join_timeout)
+
+    def start(self, configuration, source: SourceCapture, run_identity: RunIdentity, admission: AdmissionReceipt):
+        with self._lock:
+            operation = self._admission
+            owned_admission = operation is not None and operation.result is admission and (type(admission) is AdmissionReceipt)
+            active = self._active
+            valid_admission = (
+                owned_admission
+                and executor_start_inputs_are_valid(
+                    configuration, source, run_identity
+                )
+                and admission.source_capture is source
+                and admission.request_id is source.request_id
+                and admission.candidate.matches(configuration)
+                and not operation.cancelled.is_set()
+                and active is None
+                and admission.display_retirement
+                is operation.retirement_receipt
+            )
+            resources = operation.transfer(admission) if valid_admission else None
+            if resources is not None:
+                self._admission = None
+                if operation.retirement_owner is self._retirement:
+                    self._retirement = None
+        if not valid_admission:
+            if operation is not None and owned_admission:
+                operation.request_cancel()
+                self._cleanup_admission(operation)
+                status = operation.cleanup_receipt().cleanup_status
+            else:
+                status = CleanupStatus.CLEANED
+            return ExecutorStartFailed(run_identity, status)
+        if resources is None:
+            return ExecutorStartFailed(run_identity, CleanupStatus.CLEANUP_PENDING)
+        run = _StandardRun(
+            configuration, run_identity, None, None, None, None,
+            Path(configuration.save_path),
+            max_display_items=self._max_display_items,
+            capture=source,
+            resources=resources,
+        )
+        run.display.set_factories(FrameRecordStore, PublicationStore)
+        run.display.bind_transport(event_sink=self._events.put)
+        with self._lock:
+            self._active = run
+        worker = Thread(target=self._run, args=(run,), name='scattering-standard', daemon=True)
+        run.worker = worker
+        try:
+            worker.start()
+        except Exception as error:
+            run.worker = None
+            receipt = self._cleanup(run, detach_exception(error, 'thread.start'))
+            if receipt.cleanup_status is CleanupStatus.CLEANED:
+                with self._lock:
+                    if self._active is run:
+                        self._active = None
+            return ExecutorStartFailed(run_identity, receipt.cleanup_status, primary=receipt.primary, cleanup_failures=receipt.cleanup_failures)
+        return ExecutorAccepted(run_identity)
+
+    def begin_admission(self, capture: StartCapture) -> AdmissionToken:
+        if type(capture) is not StartCapture:
+            raise TypeError('admission requires StartCapture')
+        token = AdmissionToken(capture.request_id, capture.intent_snapshot.revision)
+        with self._lock:
+            active = self._active
+            if self._admission is not None or (
+                active is not None and not active.closed
+            ):
+                raise RuntimeError('executor already owns an operation')
+            owner = self._retirement
+            if active is not None and (
+                owner is None
+                or owner.run_identity is not active.identity
+            ):
+                owner = DisplayRetirementOwner(
+                    active.identity,
+                    lambda identity=active.identity: self._close_run(
+                        identity
+                    ),
+                )
+                self._retirement = owner
+            operation = _AdmissionOperation(
+                token, capture, retirement_owner=owner
+            )
+            if owner is not None:
+                operation.retirement_receipt = owner.proof
+            self._admission = operation
+        if capture.intent_snapshot.thaw().output_mode != 'Overwrite':
+            operation.finish_worker(
+                AdmissionFailure(token, APPEND_UNAVAILABLE)
+            )
+            return token
+        worker = Thread(target=self._perform_admission, args=(operation,), name='scattering-admission', daemon=True)
+        try:
+            worker.start()
+        except Exception:
+            operation.finish_worker(None)
+            operation.request_cancel()
+            self._cleanup_admission(operation)
+            raise
+        return token
+
+    def poll_admission(self, token: AdmissionToken) -> AdmissionReceipt | AdmissionFailure | None:
+        with self._lock:
+            operation = self._admission
+            if operation is None or operation.token is not token:
+                return None
+            return operation.result
+
+    def cancel_admission(self, token: AdmissionToken) -> AdmissionReleased:
+        with self._lock:
+            operation = self._admission
+            if operation is None or operation.token is not token:
+                return AdmissionReleased(token, CleanupStatus.CLEANED)
+        operation.request_cancel()
+        operation.retain_retirement_release()
+        self._cleanup_admission(operation)
+        released = replace(
+            operation.cleanup_receipt(),
+            display_retirement=operation.retirement_receipt,
+        )
+        if released.cleanup_status is CleanupStatus.CLEANED:
+            operation.consume_retirement_release()
+            self._forget_clean_admission(operation)
+        return released
+
+    def release_admission(self, token: AdmissionToken) -> AdmissionReleased:
+        return self.cancel_admission(token)
+
+    def _cleanup_admission(self, operation: _AdmissionOperation) -> None:
+        automatic_retry = True
+        while operation.begin_cleanup():
+            try:
+                succeeded = operation.cleanup_once()
+            finally:
+                cleaned, requested = operation.finish_cleanup()
+            if cleaned:
+                break
+            if requested:
+                automatic_retry = False
+                continue
+            if succeeded or not automatic_retry:
+                break
+            automatic_retry = False
+        self._forget_clean_admission(operation)
+
+    def _forget_clean_admission(
+        self, operation: _AdmissionOperation
+    ) -> None:
+        if operation.cleanup_receipt().cleanup_status is not CleanupStatus.CLEANED:
+            return
+        if operation.retirement_release_is_pending():
+            return
+        with self._lock:
+            if self._admission is operation:
+                self._admission = None
+            if (
+                operation.retirement_owner is self._retirement
+                and operation.retirement_receipt.cleanup_status
+                is CleanupStatus.CLEANED
+            ):
+                self._retirement = None
+
+    def _perform_admission(self, operation: _AdmissionOperation) -> None:
+        result: AdmissionReceipt | AdmissionFailure | None = None
+        try:
+            proof = self._retire_display(operation)
+            if proof.cleanup_status is not CleanupStatus.CLEANED:
+                result = AdmissionFailure(
+                    operation.token,
+                    "Historical display cleanup remains pending.",
+                )
+            elif not operation.cancelled.is_set():
+                result = replace(
+                    build_admission_receipt(
+                        operation.capture,
+                        cancelled=operation.cancelled.is_set,
+                        session_owner=operation.register_directory_session,
+                        targets_owner=operation.reserve_targets,
+                    ),
+                    display_retirement=proof,
+                )
+        except Exception as error:
+            result = AdmissionFailure(
+                operation.token,
+                detach_exception(error, 'admission').message,
+            )
+        finally:
+            operation.finish_worker(result)
+            if operation.cancelled.is_set():
+                self._cleanup_admission(operation)
+
+    def _retire_display(self, operation: _AdmissionOperation):
+        owner = operation.retirement_owner
+        if owner is None:
+            operation.retirement_receipt = NO_DISPLAY_RETIREMENT
+            return NO_DISPLAY_RETIREMENT
+        owner.attempt()
+        proof = owner.proof
+        operation.retirement_receipt = proof
+        if proof.cleanup_status is not CleanupStatus.CLEANED:
+            return proof
+        with self._lock:
+            active = self._active
+            if (
+                active is not None
+                and (
+                    active.identity is not owner.run_identity
+                    or not active.closed
+                )
+            ):
+                return replace(
+                    proof,
+                    cleanup_status=CleanupStatus.CLEANUP_PENDING,
+                )
+            if active is not None:
+                self._active = None
+        return proof
+
+    def stop(self, run_identity: RunIdentity) -> None:
+        run = self._exact_run(run_identity)
+        if run is None or run.closed:
+            return
+        run.stop_requested = True
+        session = run.session
+        if session is not None:
+            runtime = run.context_runtime
+            if runtime is None:
+                session.stop()
+            else:
+                runtime.stop(session)
+
+    def pause(self, run_identity: RunIdentity) -> DurablePaused:
+        run = self._exact_run(run_identity)
+        if run is None or run.closed or run.session is None:
+            raise RuntimeError("acquisition is not pausable")
+        runtime = run.context_runtime
+        if runtime is None:
+            raise RuntimeError("acquisition context is not ready")
+        return runtime.pause(run.session, run_identity, self._join_timeout)
+
+    def resume(self, run_identity: RunIdentity) -> None:
+        run = self._exact_run(run_identity)
+        if run is None or run.closed or run.session is None:
+            raise RuntimeError("acquisition is not resumable")
+        runtime = run.context_runtime
+        if runtime is None:
+            raise RuntimeError("acquisition context is not ready")
+        runtime.resume(run.session)
+
+    def close(self, run_identity: RunIdentity) -> ExecutorClosed:
+        with self._lock:
+            owner = self._retirement
+        if (
+            owner is not None
+            and owner.run_identity is run_identity
+        ):
+            receipt = owner.attempt()
+            if receipt.cleanup_status is CleanupStatus.CLEANED:
+                with self._lock:
+                    active = self._active
+                    if (
+                        active is not None
+                        and active.identity is run_identity
+                    ):
+                        self._active = None
+            return receipt
+        return self._close_run(run_identity)
+
+    def _close_run(self, run_identity: RunIdentity) -> ExecutorClosed:
+        run = self._exact_run(run_identity)
+        if run is None:
+            return ExecutorClosed(run_identity, CleanupStatus.CLEANUP_PENDING)
+        if run.context_runtime is not None:
+            run.context_runtime.retire()
+        display_clean = run.display.retire(
+            join_timeout=self._join_timeout
+        )
+        try:
+            self.stop(run_identity)
+        except Exception as error:
+            with run.cleanup_lock:
+                run.cleanup_failures.append(detach_exception(error, 'session.stop'))
+        worker = run.worker
+        if worker is not None and worker is not current_thread() and (worker.ident is not None):
+            worker.join(timeout=self._join_timeout)
+        if worker is not None and worker.is_alive():
+            return self._receipt(run)
+        if not run.closed:
+            worker = self._start_cleanup_retry(run)
+            if worker is not None and worker is not current_thread():
+                worker.join(timeout=self._join_timeout)
+        if not display_clean:
+            run.cleanup_status = CleanupStatus.CLEANUP_PENDING
+        elif (
+            run.closed
+            and all(
+                value is None
+                for value in (
+                    run.session,
+                    run.sink,
+                    run.source,
+                    run.resources,
+                )
+            )
+        ):
+            run.cleanup_status = CleanupStatus.CLEANED
+        return self._receipt(run)
+
+    def drain_events(self) -> tuple[StandardRunEvent, ...]:
+        events: list[StandardRunEvent] = []
+        while not self._events.empty():
+            events.append(self._events.get())
+        return tuple(events)
+
+    def _start_display_projection(self, run: _StandardRun) -> None:
+        """Build display publications off the single HDF5 writer thread.
+
+        The completion listener transfers one native image reference into a
+        bounded queue.  Projection is CPU-only and owns no Qt object; public
+        events remain arrays-free and are still coalesced by the page's normal
+        125 ms drain.
+        """
+        if run.display_projection_worker is not None:
+            raise RuntimeError("display projection worker already exists")
+        pending: Queue[object] = Queue(maxsize=_DISPLAY_PROJECTION_FRAMES)
+        run.display_projection_queue = pending
+        run.display_projection_errors.clear()
+
+        def project_pending() -> None:
+            try:
+                while True:
+                    item = pending.get()
+                    try:
+                        if item is _DISPLAY_PROJECTION_END:
+                            return
+                        event, image = item
+                        started = monotonic()
+                        self._frame_ready_owned(run, event, image)
+                        _perf_add(
+                            run,
+                            "display_projection",
+                            monotonic() - started,
+                        )
+                    finally:
+                        pending.task_done()
+            except BaseException as error:
+                run.display_projection_errors.append(error)
+
+        worker = Thread(
+            target=project_pending,
+            name="scattering-display-projection",
+            daemon=True,
+        )
+        run.display_projection_worker = worker
+        worker.start()
+
+    @staticmethod
+    def _finish_display_projection(run: _StandardRun) -> None:
+        pending = run.display_projection_queue
+        worker = run.display_projection_worker
+        if pending is None or worker is None:
+            return
+        if worker.is_alive():
+            pending.put(_DISPLAY_PROJECTION_END)
+            worker.join()
+        run.display_projection_queue = None
+        run.display_projection_worker = None
+        if run.display_projection_errors:
+            raise run.display_projection_errors[0]
+
+    def frame_catalog(
+        self, run_identity: RunIdentity
+    ) -> DisplayFrameCatalog | None:
+        run = self._exact_run(run_identity)
+        if run is None:
+            return None
+        with self._lock:
+            return run.display.catalog_snapshot()
+
+    def acquisition_context(self, run_identity: RunIdentity):
+        run = self._exact_run(run_identity)
+        runtime = None if run is None else run.context_runtime
+        return None if runtime is None else runtime.context
+
+    def _construct(self, run: _StandardRun, *, item: PlannedOutput | None=None, labels: tuple[int, ...] | None=None, decision: AdmittedOutput | None=None) -> _StandardRun:
+        configuration, capture = (run.configuration, run.capture)
+        if configuration is None or capture is None:
+            raise RuntimeError('run construction shell is incomplete')
+        source_spec = item.source_spec if item is not None else configuration.thaw_source_spec()
+        if source_spec is None or not configuration.poni_file or (not configuration.save_path):
+            raise ValueError('Standard execution requires source, PONI, and output paths')
+        artifact = item.target if item is not None else Path(configuration.save_path)
+        if configuration.output_mode != 'Overwrite':
+            raise ValueError(APPEND_UNAVAILABLE)
+        if item is not None:
+            validate_planned_source(item)
+        run.artifact = artifact
+        if item is not None and item.candidate is not None and (item.descriptor is not None) and (item.descriptor.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}):
+            cursor = open_container_cursor(item.source_path, entry=item.source_spec.entry or 'entry', candidate=item.candidate)
+            try:
+                run.source = NexusStackSource(item.source_path, entry=item.source_spec.entry or 'entry', cursor=cursor)
+            except Exception:
+                cursor.close()
+                raise
+        else:
+            run.source = open_source(source_spec)
+        admission = None if run.resources is None else run.resources.admission
+        assets = None if admission is None else admission.scientific_assets
+        poni = assets.poni if assets is not None else load_poni(configuration.poni_file)
+        if poni is None:
+            raise ValueError('accepted PONI asset is unavailable')
+        run.scan = run.source.to_scan(poni=poni, integrator=poni_to_integrator(poni), output_path=artifact)
+        run.scan.gi_config = configuration.gi.scan_config().copy()
+        if labels is not None:
+            wanted = set(labels)
+            run.scan.frames = [frame for frame in run.scan.frames if int(frame.index) in wanted]
+        args_1d, args_2d, values = execution_plan_values(configuration, None if assets is None else assets.mask)
+        plan = build_native_int_reduction_plan_from_args(args_1d, args_2d, **values)
+        try:
+            npt = int(configuration.bai_1d_args.get("npt", 0))
+        except (TypeError, ValueError):
+            npt = 0
+        run.display.set_factories(FrameRecordStore, PublicationStore)
+        if not run.display.configured:
+            descriptor_bytes = (
+                item.descriptor.frame_bytes
+                if item is not None and item.descriptor is not None
+                else None
+            )
+            first_image = next(
+                (
+                    np.asarray(image)
+                    for frame in getattr(run.scan, "frames", ())
+                    if (image := getattr(frame, "image", None)) is not None
+                ),
+                None,
+            )
+            run.display.configure(
+                partition_count=1,
+                npt=npt,
+                frame_bytes=(
+                    descriptor_bytes
+                    if descriptor_bytes is not None
+                    else None if first_image is None else first_image.nbytes
+                ),
+            )
+        mask = None if assets is None else assets.mask
+        owner = run.display.add_artifact(
+            artifact,
+            str(
+                getattr(run.scan, "name", "")
+                or Path(source_spec.uri).stem
+                or "scan"
+            ),
+            mask=mask,
+            mask_saturation=bool(
+                getattr(plan, "mask_saturation", False)
+            ),
+            measurement_mode=(
+                "GI" if configuration.gi.enabled else "Standard"
+            ),
+            gi_incidence_motor=(
+                configuration.gi.incidence_motor
+                if configuration.gi.enabled else ""
+            ),
+            gi_resolved_motor=(
+                configuration.gi.effective_motor
+                if configuration.gi.enabled else ""
+            ),
+            gi_mode_1d=(
+                configuration.gi.mode_1d if configuration.gi.enabled else ""
+            ),
+            gi_mode_2d=(
+                configuration.gi.mode_2d if configuration.gi.enabled else ""
+            ),
+            wavelength_m=(
+                float(poni.wavelength)
+                if getattr(poni, "wavelength", None)
+                and float(poni.wavelength) > 0.0
+                else None
+            ),
+        )
+        run.records = owner.records
+        run_provenance = configuration.as_provenance()
+        if admission is not None:
+            run_provenance['scientific_signature'] = admission.candidate.processing_mapping()
+        run.sink = NexusSink(artifact, overwrite=True, flush_every=_LIVE_SINK_FLUSH_EVERY, run_configuration_provenance=run_provenance, source_execution_provenance=item.source_stamp.as_dict() if item is not None else None, source_snapshots_provenance=source_snapshots(item) if item is not None else None, source_base=configuration.project_root or None, expected_target_state=decision.fact.target_state if decision is not None else None)
+        run.sink_requires_abort = True
+        session_sink = run.sink
+        integration_1d = getattr(plan, "integration_1d", None)
+        if integration_1d is not None:
+            xye_directory = artifact.parent / str(run.scan.name)
+            xye_pattern = (
+                f"{xye_prefix_for_unit(integration_1d.unit)}"
+                "_{scan}_{frame:04d}.xye"
+            )
+            session_sink = CompositeSink((
+                run.sink,
+                XYESink(xye_directory, pattern=xye_pattern),
+            ))
+        run.session = ScanSession(plan, run.scan, session_sink, executor=configuration.max_cores, inflight_max=max(1, configuration.max_cores), gi_freeze_mode='scout_union' if configuration.gi.enabled else None, clear_frame_images=True, record_store=run.records, record_store_persisted_on_write=False)
+        run.sink_requires_abort = False
+        self._start_display_projection(run)
+        run.session.on_frame_completed(lambda event: self._frame_ready(run, event))
+        self._adopt_acquisition_context(
+            run, owner, source_path=str(source_spec.uri)
+        )
+        return run
+
+    def _adopt_acquisition_context(
+        self, run: _StandardRun, owner: DisplayArtifact, *, source_path: str
+    ):
+        created = run.context_runtime is None
+        runtime = run.context_runtime or AcquisitionRuntime()
+        run.context_runtime = runtime
+        previous = (
+            None
+            if runtime.context is None
+            else runtime.context.hydration_owner
+        )
+        context = runtime.adopt(run, owner, source_path)
+        if created or context.hydration_owner != previous:
+            self._events.put(StandardRunEvent(
+                run.identity, StandardEventKind.CONTEXT_READY
+            ))
+        return context
+
+    def _run(self, run: _StandardRun) -> None:
+        started_at = monotonic()
+        primary: DetachedDiagnostic | None = None
+        stopped = False
+        try:
+            core_count = int(getattr(run.configuration, "max_cores", 0))
+        except (TypeError, ValueError):
+            core_count = 0
+        try:
+            configuration = run.configuration
+            if run.scan is not None and run.session is not None:
+                stopped = self._execute_current(run, construct=False)
+            elif type(configuration) is not FrozenRunConfiguration:
+                stopped = self._execute_current(run)
+            else:
+                stopped = self._execute_admitted(run)
+        except Exception as error:
+            primary = detach_exception(error)
+        work_elapsed = max(0.0, monotonic() - started_at)
+        completed, total = standard_progress(run)
+        cleanup_started_at = monotonic()
+        receipt = self._cleanup(run, primary)
+        elapsed = max(0.0, monotonic() - started_at)
+        cleanup_elapsed = max(
+            0.0,
+            elapsed - (cleanup_started_at - started_at),
+        )
+        if primary is None and receipt.cleanup_status is CleanupStatus.CLEANED:
+            kind = StandardEventKind.STOPPED if stopped else StandardEventKind.FINISHED
+        else:
+            kind = StandardEventKind.FAILED
+        self._terminal_event(
+            run,
+            kind,
+            receipt,
+            completed,
+            total,
+            elapsed=elapsed,
+            work_elapsed=work_elapsed,
+            cleanup_elapsed=cleanup_elapsed,
+            core_count=core_count,
+        )
+
+    def _execute_admitted(self, run: _StandardRun) -> bool:
+        receipt = None if run.resources is None else run.resources.admission
+        if type(receipt) is not AdmissionReceipt:
+            raise RuntimeError('executor lost its consumed admission receipt')
+        if run.stop_requested:
+            return True
+        outputs = receipt.outputs
+        resources = run.resources
+        try:
+            validate_admitted_receipt(
+                receipt,
+                None if resources is None else resources.directory_session,
+                cancelled=lambda: run.stop_requested,
+            )
+        except RuntimeError as error:
+            if (
+                run.stop_requested
+                and error.args == ('admission cancelled',)
+            ):
+                return True
+            raise
+        if run.stop_requested:
+            return True
+        try:
+            npt = int(run.configuration.bai_1d_args.get("npt", 0))
+        except (TypeError, ValueError):
+            npt = 0
+        frame_bytes = max(
+            (
+                output.item.descriptor.frame_bytes or 0
+                for output in outputs
+                if output.item.descriptor is not None
+            ),
+            default=0,
+        )
+        run.display.configure(
+            partition_count=len(outputs),
+            npt=npt,
+            frame_bytes=frame_bytes or None,
+        )
+        run.total = sum(output.item.source_stamp.frame_count for output in outputs)
+        self._events.put(StandardRunEvent(run.identity, StandardEventKind.DISCOVERY, total=run.total, detail=f"{('GI' if run.configuration.gi.enabled else 'Standard')} · {len(outputs)} admitted candidates"))
+        stopped = False
+        for decision in outputs:
+            item = decision.item
+            if run.stop_requested:
+                stopped = True
+                break
+            if not target_state_matches(decision):
+                raise RuntimeError(f'output target changed after admission: {item.target}')
+            run.completed += item.source_stamp.frame_count - len(decision.labels)
+            self._construct(run, item=item, labels=decision.labels, decision=decision)
+            stopped = self._execute_current(run, construct=False) or stopped
+            run.artifacts.append(item.target)
+        return stopped
+
+    def _execute_current(self, run: _StandardRun, *, construct: bool=True) -> bool:
+        if construct and run.session is None:
+            self._construct(run)
+        scan, session = (run.scan, run.session)
+        if scan is None or session is None:
+            raise RuntimeError('scattering executor lost its constructed owners')
+        run.frames_by_label = {
+            int(frame.index): frame for frame in scan.frames
+        }
+        session.start()
+        if run.stop_requested:
+            session.stop()
+        if isinstance(run.source, NexusStackSource):
+            self._submit_container_source(run, session)
+        else:
+            for frame in scan.frames:
+                if run.stop_requested:
+                    session.stop()
+                runtime = run.context_runtime
+                submit_started = monotonic()
+                if not (
+                    session.submit(frame)
+                    if runtime is None
+                    else runtime.submit(session, frame)
+                ):
+                    _perf_add(run, "submit_wait", monotonic() - submit_started)
+                    break
+                _perf_add(run, "submit_wait", monotonic() - submit_started)
+        finish_started = monotonic()
+        session_error: BaseException | None = None
+        projection_error: BaseException | None = None
+        result = None
+        try:
+            result = self._finish_session(run)
+        except BaseException as error:
+            session_error = error
+        try:
+            self._finish_display_projection(run)
+        except BaseException as error:
+            projection_error = error
+        _perf_add(run, "finish_wait", monotonic() - finish_started)
+        if session_error is not None:
+            raise session_error.with_traceback(session_error.__traceback__)
+        if projection_error is not None:
+            raise projection_error.with_traceback(projection_error.__traceback__)
+        if result is None:  # pragma: no cover - defensive type narrowing
+            raise RuntimeError("scattering session returned no terminal result")
+        if run.perf_enabled:
+            snapshot = getattr(session, "perf_snapshot", None)
+            if callable(snapshot):
+                for key, elapsed in snapshot().items():
+                    _perf_add(run, key, elapsed)
+        run.completed += int(getattr(result, 'n_processed', 0) or 0)
+        if result.failed:
+            raise RuntimeError(result.error or 'scattering reduction failed')
+        close = getattr(run.source, 'close', None)
+        if callable(close):
+            close()
+        run.source = None
+        run.scan = None
+        run.records = None
+        run.frames_by_label.clear()
+        return bool(result.cancelled or run.stop_requested)
+
+    @staticmethod
+    def _submit_container_source(run: _StandardRun, session: ScanSession) -> None:
+        """Overlap bounded container reads with reduction backpressure.
+
+        The executor thread remains the sole HDF5/cursor owner.  One bounded
+        consumer thread performs only ``session.submit`` calls, allowing the
+        next source frame to decode while the previous frame waits for a
+        reduction slot.  Four queued native frames matches the established
+        production prefetch cadence without transferring an h5py object across
+        threads or retaining an unbounded source window.
+        """
+        source = run.source
+        if not isinstance(source, NexusStackSource):
+            raise TypeError("container submission requires NexusStackSource")
+
+        pending: Queue[object] = Queue(maxsize=_SOURCE_PREFETCH_FRAMES)
+        accepting = Event()
+        accepting.set()
+        consumer_done = Event()
+        consumer_errors: list[BaseException] = []
+
+        def submit_pending() -> None:
+            try:
+                while True:
+                    if not accepting.is_set():
+                        return
+                    try:
+                        item = pending.get(timeout=0.05)
+                    except Empty:
+                        continue
+                    if item is _SOURCE_SUBMISSION_END:
+                        return
+                    frame, image = item
+                    if run.stop_requested:
+                        session.stop()
+                    runtime = run.context_runtime
+                    submit_started = monotonic()
+                    accepted = (
+                        session.submit(frame, image)
+                        if runtime is None
+                        else runtime.submit(session, frame, image)
+                    )
+                    _perf_add(
+                        run, "submit_wait", monotonic() - submit_started
+                    )
+                    if not accepted:
+                        accepting.clear()
+                        return
+            except BaseException as error:
+                consumer_errors.append(error)
+                accepting.clear()
+            finally:
+                consumer_done.set()
+
+        consumer = Thread(
+            target=submit_pending,
+            name="scattering-source-submit",
+            daemon=True,
+        )
+        consumer.start()
+
+        def enqueue(item: object) -> bool:
+            while accepting.is_set() and not consumer_done.is_set():
+                if run.stop_requested:
+                    session.stop()
+                try:
+                    pending.put(item, timeout=0.05)
+                    return True
+                except Full:
+                    continue
+            return False
+
+        chunks = iter(source.iter_chunks(_CONTAINER_READ_CHUNK_FRAMES))
+        producer_error: BaseException | None = None
+        try:
+            while accepting.is_set() and not run.stop_requested:
+                read_started = monotonic()
+                try:
+                    block, labels = next(chunks)
+                except StopIteration:
+                    _perf_add(
+                        run, "source_read", monotonic() - read_started
+                    )
+                    break
+                _perf_add(run, "source_read", monotonic() - read_started)
+                for offset, label in enumerate(labels):
+                    if not accepting.is_set() or run.stop_requested:
+                        break
+                    frame = run.frames_by_label.get(int(label))
+                    if frame is None:
+                        continue
+                    if not enqueue((frame, np.asarray(block[offset]))):
+                        break
+        except BaseException as error:
+            producer_error = error
+            accepting.clear()
+            session.stop()
+        finally:
+            close_chunks = getattr(chunks, "close", None)
+            if callable(close_chunks):
+                close_chunks()
+            if run.stop_requested:
+                session.stop()
+            if accepting.is_set() and not consumer_done.is_set():
+                enqueue(_SOURCE_SUBMISSION_END)
+            consumer.join()
+
+        if consumer_errors:
+            raise consumer_errors[0]
+        if producer_error is not None:
+            raise producer_error
+
+    def _frame_ready(self, run: _StandardRun, event: Any) -> None:
+        started = monotonic()
+        try:
+            pending = run.display_projection_queue
+            frame = run.frames_by_label.get(int(event.frame_index))
+            image = None if frame is None else frame.image
+            if pending is not None:
+                while True:
+                    if run.display_projection_errors:
+                        return
+                    try:
+                        pending.put((event, image), timeout=0.05)
+                        break
+                    except Full:
+                        continue
+        finally:
+            _perf_add(run, "display_callback", monotonic() - started)
+
+    def _frame_ready_owned(
+        self, run: _StandardRun, event: Any, image: np.ndarray | None
+    ) -> None:
+        records, scan, session = (run.records, run.scan, run.session)
+        if records is None or scan is None or session is None:
+            return
+        label = int(event.frame_index)
+        record = records.get(label)
+        frame = run.frames_by_label.get(label)
+        if record is None or frame is None:
+            return
+        owner = run.display.artifacts.get(str(run.artifact))
+        if owner is None:
+            return
+        if image is not None:
+            run.display.stamp_saturation_ceiling(owner, image)
+        stable_seeded = bool(session.saturation_mask_seeded)
+        if stable_seeded and not owner.saturation_mask_seeded:
+            run.display.stamp_saturation_mask(owner, session.saturation_mask)
+        if image is None:
+            raw, mask_baked = None, False
+        else:
+            raw, mask_baked = project_frame_detector_values(
+                image,
+                owner.mask,
+                frame.mask,
+                value_mask_enabled=bool(
+                    owner.mask_saturation and not stable_seeded
+                ),
+                stable_value_mask=(
+                    session.saturation_mask
+                    if owner.mask_saturation and stable_seeded
+                    else None
+                ),
+            )
+        view = replace(
+            record.active_view(),
+            raw=raw,
+            mask_baked=mask_baked,
+        )
+        configuration = run.configuration
+        is_gi = bool(configuration is not None and configuration.gi.enabled)
+        mode = 'GI' if is_gi else 'Standard'
+        navigation = run.display.append_navigation(
+            owner.source_scan,
+            str(owner.artifact),
+            label,
+        )
+        key = navigation.appended
+        source_identity = (
+            f"{view.source_path or ''}#{view.source_frame_index}"
+        )
+        publication = FramePublication(
+            view,
+            record=record,
+            source_identity=source_identity,
+            scan_key=owner.source_scan,
+        )
+        run.display.retain_frame(
+            owner,
+            key,
+            record,
+            publication,
+            source_identity=source_identity,
+            frame_mask_qualified=frame.mask is not None,
+        )
+        payload = StandardDisplayPayload(
+            0,
+            key,
+            f"{mode} · {scan.name} · frame {label}",
+            view,
+            "running",
+            measurement_mode=mode,
+            gi_incidence_motor=(
+                configuration.gi.incidence_motor if is_gi else ""
+            ),
+            gi_resolved_motor=(
+                configuration.gi.effective_motor if is_gi else ""
+            ),
+            gi_mode_1d=configuration.gi.mode_1d if is_gi else "",
+            gi_mode_2d=configuration.gi.mode_2d if is_gi else "",
+            wavelength_m=owner.wavelength_m,
+        )
+        self._publish_payload(
+            run,
+            payload,
+            run.completed + session.frames_completed,
+            run.total,
+            navigation=navigation,
+        )
+
+    def _publish_payload(
+        self,
+        run: _StandardRun,
+        payload: StandardDisplayPayload,
+        completed: int,
+        total: int,
+        *,
+        navigation=None,
+    ) -> None:
+        key = payload.frame_key
+        if type(key) is not DisplayFrameKey:
+            return
+        with self._lock:
+            if self._active is not run or run.closed:
+                return
+            run.display.put_payload(payload)
+        self._events.put(StandardRunEvent(
+            run.identity,
+            StandardEventKind.FRAME_READY,
+            completed=completed,
+            total=total,
+            artifact=key.artifact,
+            frame_key=key,
+            navigation_delta=navigation,
+        ))
+
+    def _cleanup(self, run: _StandardRun, primary: DetachedDiagnostic | None=None) -> ExecutorClosed:
+        with run.cleanup_lock:
+            if primary is not None and run.primary is None:
+                run.primary = primary
+            if run.closed:
+                return self._receipt(run)
+            if run.session is not None:
+                try:
+                    self._finish_session(run)
+                except Exception as error:
+                    run.cleanup_failures.append(detach_exception(error, 'session.finish'))
+            try:
+                self._finish_display_projection(run)
+            except Exception as error:
+                run.cleanup_failures.append(detach_exception(
+                    error, 'display_projection.finish'
+                ))
+            sink = run.sink
+            if sink is not None and (run.session is None or run.sink_requires_abort):
+                try:
+                    sink.abort(None)
+                except Exception as error:
+                    run.cleanup_failures.append(detach_exception(error, 'sink.abort'))
+                else:
+                    run.sink = None
+            source = run.source
+            if source is not None:
+                try:
+                    close = getattr(source, 'close', None)
+                    if close is not None:
+                        close()
+                except Exception as error:
+                    run.cleanup_failures.append(detach_exception(error, 'source.close'))
+                else:
+                    run.source = None
+            resources = run.resources
+            if resources is not None:
+                release_target = all(value is None for value in (
+                    run.session, run.sink, run.source,
+                ))
+                for context, error in resources.cleanup(
+                    release_target=release_target
+                ):
+                    run.cleanup_failures.append(detach_exception(error, context))
+                if resources.cleaned:
+                    run.resources = None
+            cleaned = all(value is None for value in (
+                run.session, run.sink, run.source, run.resources))
+            run.cleanup_status = CleanupStatus.CLEANED if cleaned else CleanupStatus.CLEANUP_PENDING
+            if cleaned:
+                run.closed = True
+                run.configuration = None
+                run.capture = None
+                run.scan = None
+                run.records = None
+                run.frames_by_label.clear()
+            return self._receipt(run)
+
+    @staticmethod
+    def _finish_session(run: _StandardRun) -> object:
+        session = run.session
+        try:
+            result = session.finish(raise_on_failure=False)
+        except Exception:
+            run.sink_requires_abort = True
+            raise
+        run.session = None
+        if not run.sink_requires_abort:
+            run.sink = None
+        return result
+
+    def _terminal_event(
+        self,
+        run: _StandardRun,
+        kind: StandardEventKind,
+        receipt: ExecutorClosed,
+        completed: int,
+        total: int,
+        *,
+        elapsed: float = 0.0,
+        work_elapsed: float = 0.0,
+        cleanup_elapsed: float = 0.0,
+        core_count: int = 0,
+    ) -> None:
+        with run.cleanup_lock:
+            if run.terminal_emitted:
+                return
+            run.terminal_emitted = True
+        detail = receipt.primary.message if receipt.primary is not None else receipt.cleanup_failures[0].message if receipt.cleanup_failures else next(reversed(run.display.payloads.values())).measurement_mode if run.display.payloads else 'Standard'
+        self._events.put(StandardRunEvent(run.identity, kind, completed=completed, total=total, artifact=str(run.artifact), detail=detail, cleanup_status=receipt.cleanup_status, primary=receipt.primary, cleanup_failures=receipt.cleanup_failures, artifacts=tuple((str(item) for item in run.artifacts))))
+        throughput = completed / elapsed if completed and elapsed > 0.0 else 0.0
+        logger.info("Total Frames Processed: %d", completed)
+        logger.info("Total Time: %.2fs", elapsed)
+        logger.info(
+            "[PERF-SUMMARY] outcome=%s frames=%d/%d cores=%s | "
+            "total=%.2fs work=%.2fs cleanup=%.2fs | "
+            "throughput=%.1f frames/s | output=%s",
+            kind.value,
+            completed,
+            total,
+            core_count if core_count > 0 else "unknown",
+            elapsed,
+            work_elapsed,
+            cleanup_elapsed,
+            throughput,
+            run.artifact,
+        )
+        if run.perf_enabled:
+            with run.perf_lock:
+                perf = dict(run.perf_values)
+            logger.info(
+                "[PERF-DETAIL] source-read=%.2fs submit/backpressure=%.2fs "
+                "finish/drain=%.2fs display-callback=%.2fs "
+                "display-projection=%.2fs "
+                "(parallel timers may overlap)",
+                perf.get("source_read", 0.0),
+                perf.get("submit_wait", 0.0),
+                perf.get("finish_wait", 0.0),
+                perf.get("display_callback", 0.0),
+                perf.get("display_projection", 0.0),
+            )
+            logger.info(
+                "[PERF-WRITER] nexus-integrated=%.2fs named-modes=%.2fs "
+                "frame-record=%.2fs h5-flush=%.2fs xye=%.2fs | "
+                "record-upsert=%.2fs completion-listeners=%.2fs "
+                "progress-listeners=%.2fs",
+                perf.get("sink_nexus_integrated", 0.0),
+                perf.get("sink_nexus_named_modes", 0.0),
+                perf.get("sink_nexus_frame_record", 0.0),
+                perf.get("sink_nexus_h5_flush", 0.0),
+                perf.get("sink_xye_write", 0.0),
+                perf.get("session_record_upsert", 0.0),
+                perf.get("session_frame_listeners", 0.0),
+                perf.get("session_progress_listeners", 0.0),
+            )
+
+    def _exact_run(self, identity: RunIdentity) -> _StandardRun | None:
+        with self._lock:
+            run = self._active
+        return run if run is not None and identity is run.identity else None
+
+    def _start_cleanup_retry(self, run: _StandardRun) -> Thread | None:
+        with self._lock:
+            worker = run.worker
+            if run.closed or (worker is not None and worker.is_alive()):
+                return worker
+            retry = Thread(target=self._cleanup, args=(run,), name='scattering-cleanup', daemon=True)
+            run.worker = retry
+            try:
+                retry.start()
+            except Exception as error:
+                run.worker = None
+                with run.cleanup_lock:
+                    run.cleanup_failures.append(detach_exception(error, 'cleanup.retry'))
+                return None
+            return retry
+
+    @staticmethod
+    def _receipt(run: _StandardRun) -> ExecutorClosed:
+        return ExecutorClosed(run.identity, run.cleanup_status, run.primary, tuple(run.cleanup_failures))

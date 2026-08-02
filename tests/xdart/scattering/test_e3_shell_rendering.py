@@ -1,0 +1,708 @@
+from __future__ import annotations
+
+from dataclasses import replace
+
+import numpy as np
+import pytest
+import pyqtgraph as pg
+from pyqtgraph.Qt import QtCore, QtWidgets
+
+from xrd_tools.core import FrameView
+from xdart.gui.tabs.scattering.display_values import (
+    StandardDisplayPayload,
+    display_payload_is_valid,
+)
+from xdart.gui.tabs.scattering.shell_projection import (
+    ScientificPreferences,
+    build_scientific_projection,
+)
+from xdart.gui.tabs.scattering.shell_values import (
+    AxisProjection,
+    HeavyProjection,
+)
+from xdart.gui.tabs.scattering.workspace_shell import (
+    ScatteringWorkspaceShell,
+)
+
+from tests.xdart.scattering.e3_shell_support import make_shell_projection
+
+
+@pytest.fixture
+def qapp() -> QtWidgets.QApplication:
+    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+
+def test_e3_ui2_renders_raw_cake_axes_and_all_retained_overlay_rows(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection()
+    try:
+        shell.apply_state(state)
+
+        assert shell.scientific.raw.image.image.shape == (64, 48)
+        assert shell.scientific.cake.image.image.shape == (32, 24)
+        raw_levels = tuple(np.nanpercentile(np.arange(1.0, 3073.0), (2, 98)))
+        cake_levels = tuple(
+            np.nanpercentile(np.arange(1.0, 769.0), (0.5, 99.5))
+        )
+        assert shell.scientific.raw.color_scale.levels() == pytest.approx(
+            raw_levels
+        )
+        assert shell.scientific.cake.color_scale.levels() == pytest.approx(
+            cake_levels
+        )
+        np.testing.assert_allclose(
+            shell.scientific.raw.image.getLevels(), raw_levels
+        )
+        np.testing.assert_allclose(
+            shell.scientific.cake.image.getLevels(), cake_levels
+        )
+        assert (
+            shell.scientific.cake.plot.getAxis("bottom").labelText
+            == "Q"
+        )
+        assert (
+            shell.scientific.cake.plot.getAxis("left").labelText
+                == "χ"
+        )
+        assert len(shell.scientific.curve.listDataItems()) == 5
+        assert shell.scientific.frame_selector.count() == 5
+        assert [
+            shell.scientific.frame_selector.itemText(index)
+            for index in range(shell.scientific.frame_selector.count())
+        ] == ["1", "2", "3", "4", "5"]
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+@pytest.mark.parametrize(
+    ("mode", "line_count", "waterfall_rows"),
+    [
+        ("Single", 1, 0),
+        ("Overlay", 5, 0),
+        ("Waterfall", 0, 5),
+    ],
+)
+def test_e3_ui2_one_d_modes_preserve_expected_history_scope(
+    qapp: QtWidgets.QApplication,
+    mode: str,
+    line_count: int,
+    waterfall_rows: int,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(plot_mode=mode)
+    try:
+        shell.apply_state(state)
+        assert len(shell.scientific.curve.listDataItems()) == line_count
+        assert len(shell.scientific._rendered_trace_keys) == (
+            waterfall_rows or line_count
+        )
+        if waterfall_rows:
+            assert (
+                shell.scientific.bottom_stack.currentWidget()
+                is shell.scientific.waterfall
+            )
+            assert shell.scientific.waterfall.image.image.shape == (
+                64,
+                waterfall_rows,
+            )
+        else:
+            assert (
+                shell.scientific.bottom_stack.currentWidget()
+                is shell.scientific.curve
+            )
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_e3_ui2_restores_control_inventory_and_ranges(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    shell.resize(1920, 1080)
+    shell.show()
+    try:
+        shell.apply_state(make_shell_projection())
+        qapp.processEvents()
+        labels = {
+            widget.text()
+            for widget in shell.findChildren(QtWidgets.QLabel)
+            if widget.text()
+        }
+        buttons = {
+            widget.text()
+            for widget in shell.findChildren(QtWidgets.QAbstractButton)
+            if widget.text()
+        }
+        assert {"PROJECT", "EXPERIMENT", "SOURCE", "PROCESSING"} <= labels
+        assert {
+            "Poni",
+            "Mask File",
+            "Grazing",
+            "Source",
+            "Threshold",
+        } <= labels | buttons
+        assert {
+            "File",
+            "Config",
+            "Help",
+            "Show All",
+            "Metadata",
+            "Auto Last",
+            "Peak Fitting",
+            "Phase Fitting",
+            "Plot Metadata",
+            "Run",
+        } <= {
+            text.removeprefix("▶ ")
+            .removeprefix("∧ ")
+            .removeprefix("≈ ")
+            .removeprefix("▤ ")
+            for text in buttons
+        }
+        options = shell.scientific.plot_options_dialog
+        assert options.waterfall_y_axis.currentText() == "Frame #"
+        assert options.waterfall_start.value() == 1
+        assert options.waterfall_stop.value() == 0
+        assert options.waterfall_step.value() == 1
+        assert options.overlay_offset.value() == pytest.approx(5.0)
+        assert options.show_legend.isChecked()
+        assert options.intensity_scale.currentText() == "Linear"
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_e3_ui2_view_objects_do_not_cache_projection_ndarrays(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    try:
+        shell.apply_state(make_shell_projection())
+        for owner in (shell, shell.browser, shell.scientific):
+            assert not any(
+                type(value) is np.ndarray for value in vars(owner).values()
+            )
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_e3_ui2_scientific_images_transpose_once_and_keep_axis_geometry(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(
+        frame_count=1,
+        heavy_indices=(0,),
+        plot_mode="Single",
+    )
+    frame = state.navigation.current
+    assert frame is not None
+    raw_yx = np.array(
+        [
+            [1.0, 2.0, 3.0, 4.0],
+            [5.0, np.nan, 7.0, 4294967295.0],
+        ]
+    )
+    cake_yx = np.zeros((3, 4))
+    cake_yx[2, 3] = 17.0
+    x_axis = AxisProjection(
+        np.array([-4.0, -1.0, 2.0, 5.0]),
+        "Q",
+        "q_A^-1",
+    )
+    y_axis = AxisProjection(
+        np.array([-6.0, 0.0, 9.0]),
+        "chi",
+        "chi_deg",
+    )
+    scientific = replace(
+        state.scientific,
+        heavy=HeavyProjection(
+            frame,
+            raw_yx,
+            cake_yx,
+            x_axis,
+            y_axis,
+        ),
+    )
+    try:
+        shell.apply_state(replace(state, scientific=scientific))
+
+        raw_item = shell.scientific.raw.image
+        cake_item = shell.scientific.cake.image
+        np.testing.assert_allclose(
+            raw_item.image,
+            raw_yx.T[:, ::-1],
+            equal_nan=True,
+        )
+        np.testing.assert_array_equal(cake_item.image, cake_yx.T)
+        assert raw_item.axisOrder == "col-major"
+        assert cake_item.axisOrder == "col-major"
+        raw_levels = raw_item.getLevels()
+        assert all(np.isfinite(raw_levels))
+        assert raw_levels[1] < 4294967295.0
+        assert (
+            shell.scientific.raw.color_scale.levels()[1]
+            < 4294967295.0
+        )
+        rect = cake_item.mapRectToParent(QtCore.QRectF(0, 0, 4, 3))
+        marker = cake_item.mapToParent(QtCore.QPointF(3.5, 2.5))
+        raw_range = shell.scientific.raw.plot.viewRange()
+        cake_range = shell.scientific.cake.plot.viewRange()
+        plot = shell.scientific.cake.plot
+        assert rect == QtCore.QRectF(-4.0, -6.0, 9.0, 15.0)
+        assert marker.x() > 0 and marker.y() > 0
+        assert raw_range[0][0] <= 0.0 and raw_range[0][1] >= 4.0
+        assert raw_range[1][0] <= 0.0 and raw_range[1][1] >= 2.0
+        assert cake_range[0][0] <= -4.0 and cake_range[0][1] >= 5.0
+        assert cake_range[1][0] <= -6.0 and cake_range[1][1] >= 9.0
+        assert (
+            shell.scientific.raw.plot.getViewBox().state["aspectLocked"]
+            is not False
+        )
+        assert (
+            shell.scientific.cake.plot.getViewBox().state["aspectLocked"]
+            is False
+        )
+        assert plot.getAxis("bottom").labelText == "Q"
+        assert plot.getAxis("bottom").labelUnits == "Å⁻¹"
+        assert plot.getAxis("left").labelText == "χ"
+        assert plot.getAxis("left").labelUnits == "°"
+        assert plot.getViewBox().state["yInverted"] is False
+        raw_bottom = shell.scientific.raw.plot.getAxis("bottom")
+        raw_left = shell.scientific.raw.plot.getAxis("left")
+        assert raw_bottom.labelText == "x (Pixels)"
+        assert raw_bottom.labelUnits == ""
+        assert raw_left.labelText == "y (Pixels)"
+        assert raw_left.labelUnits == ""
+        assert raw_bottom.autoSIPrefix is False
+        assert raw_left.autoSIPrefix is False
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_e3_ui2_rapid_distinct_frames_do_not_share_percentile_levels(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(
+        frame_count=2,
+        heavy_indices=(0, 1),
+        plot_mode="Single",
+    )
+    first = state.navigation.frames[0]
+    second = replace(first)
+    assert second == first
+    assert second is not first
+    state = replace(
+        state,
+        navigation=replace(
+            state.navigation,
+            frames=(first, second),
+            current=first,
+            selected=(first,),
+        ),
+    )
+    uniform = np.linspace(0.0, 100.0, 10_000).reshape(100, 100)
+    # Keep the widget cache's sampled min/max identical across both frames.
+    # The frame identity, rather than an incidental range difference, must
+    # invalidate the percentile result.
+    uniform[0, 4] = 100.0
+    sparse = np.zeros((100, 100))
+    sparse[0, 4] = 100.0
+    replacement = np.zeros((100, 100))
+    replacement[50:, :] = 100.0
+    try:
+        shell.apply_state(
+            replace(
+                state,
+                scientific=replace(
+                    state.scientific,
+                    heavy=HeavyProjection(first, uniform, None),
+                ),
+            )
+        )
+        first_levels = shell.scientific.raw.image.getLevels()
+
+        shell.apply_state(
+            replace(
+                state,
+                revision=state.revision + 1,
+                navigation=replace(
+                    state.navigation,
+                    current=second,
+                    selected=(second,),
+                ),
+                scientific=replace(
+                    state.scientific,
+                    heavy=HeavyProjection(second, sparse, None),
+                    title="scan-a:2",
+                ),
+            )
+        )
+        second_levels = shell.scientific.raw.image.getLevels()
+
+        assert first_levels != pytest.approx(second_levels)
+        assert second_levels == pytest.approx(
+            tuple(np.nanpercentile(sparse, (2.0, 98.0)))
+        )
+
+        shell.apply_state(
+            replace(
+                state,
+                revision=state.revision + 2,
+                navigation=replace(
+                    state.navigation,
+                    current=second,
+                    selected=(second,),
+                ),
+                scientific=replace(
+                    state.scientific,
+                    heavy=HeavyProjection(second, replacement, None),
+                    title="scan-a:2 replaced",
+                ),
+            )
+        )
+        replacement_levels = shell.scientific.raw.image.getLevels()
+        assert replacement_levels != pytest.approx(second_levels)
+        assert replacement_levels == pytest.approx(
+            tuple(np.nanpercentile(replacement, (2.0, 98.0)))
+        )
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_e3_ui2_image_adapter_prewarms_default_colormap_at_construction(
+    qapp: QtWidgets.QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    resolve = pg.colormap.getFromMatplotlib
+
+    def observed(name: str):
+        calls.append(name)
+        return resolve(name)
+
+    monkeypatch.setattr(pg.colormap, "getFromMatplotlib", observed)
+    from xdart.gui.tabs.scattering.shell_widgets import ScientificImagePane
+
+    pane = ScientificImagePane(lock_aspect=True)
+    try:
+        assert calls == ["viridis"]
+    finally:
+        pane.close()
+        pane.deleteLater()
+        qapp.processEvents()
+
+
+def test_e3_ui2_processed_cake_keeps_valid_65535_contrast(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(
+        frame_count=1,
+        heavy_indices=(0,),
+        plot_mode="Single",
+    )
+    frame = state.navigation.current
+    assert frame is not None
+    cake = np.zeros((20, 20), dtype=float)
+    cake[10, 10] = 65535.0
+    x_axis = AxisProjection(np.arange(20.0), "Q", "q_A^-1")
+    y_axis = AxisProjection(np.arange(20.0), "chi", "chi_deg")
+    try:
+        shell.apply_state(
+            replace(
+                state,
+                scientific=replace(
+                    state.scientific,
+                    heavy=HeavyProjection(
+                        frame,
+                        None,
+                        cake,
+                        x_axis,
+                        y_axis,
+                    ),
+                ),
+            )
+        )
+
+        assert shell.scientific.cake.image.getLevels() == pytest.approx(
+            (0.0, 65535.0)
+        )
+        assert shell.scientific.cake.color_scale.levels() == pytest.approx(
+            (0.0, 65535.0)
+        )
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_e3_ui2_gi_trace_and_cake_use_canonical_axis_presentation(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(
+        frame_count=1,
+        heavy_indices=(0,),
+        plot_mode="Single",
+    )
+    frame = state.navigation.current
+    assert frame is not None
+    trace = state.scientific.traces[0]
+    cake = np.arange(12.0).reshape(3, 4)
+    cake_x = AxisProjection(
+        np.arange(4.0),
+        "Q_ip",
+        "qip_A^-1",
+    )
+    cake_y = AxisProjection(
+        np.arange(3.0),
+        "Q_oop",
+        "qoop_A^-1",
+    )
+    trace_axis = AxisProjection(
+        trace.axis.values,
+        "Q_total",
+        "qtot_A^-1",
+    )
+    try:
+        shell.apply_state(
+            replace(
+                state,
+                scientific=replace(
+                    state.scientific,
+                    heavy=HeavyProjection(
+                        frame,
+                        None,
+                        cake,
+                        cake_x,
+                        cake_y,
+                    ),
+                    traces=(replace(trace, axis=trace_axis),),
+                ),
+            )
+        )
+
+        trace_plot = shell.scientific.curve.getPlotItem()
+        cake_plot = shell.scientific.cake.plot
+        assert trace_plot.getAxis("bottom").labelText == "Q<sub>total</sub>"
+        assert trace_plot.getAxis("bottom").labelUnits == "Å⁻¹"
+        assert cake_plot.getAxis("bottom").labelText == "Q<sub>ip</sub>"
+        assert cake_plot.getAxis("bottom").labelUnits == "Å⁻¹"
+        assert cake_plot.getAxis("left").labelText == "Q<sub>oop</sub>"
+        assert cake_plot.getAxis("left").labelUnits == "Å⁻¹"
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_e3_ui2_one_d_axis_follows_trace_and_clears_with_exact_absence(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(
+        frame_count=1,
+        heavy_indices=(0,),
+        plot_mode="Single",
+    )
+    try:
+        shell.apply_state(state)
+        axis = shell.scientific.curve.getPlotItem().getAxis("bottom")
+        assert axis.labelText == "Q"
+        assert axis.labelUnits == "Å⁻¹"
+
+        shell.apply_state(
+            replace(
+                state,
+                revision=state.revision + 1,
+                scientific=replace(
+                    state.scientific,
+                    traces=(),
+                    title="no 1-D",
+                    retain_display=False,
+                ),
+            )
+        )
+        assert shell.scientific.curve.listDataItems() == []
+        assert axis.labelText == ""
+        assert axis.labelUnits in ("", None)
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_e3_ui2_exact_heavy_wins_over_retain_for_complete_presentation(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(
+        frame_count=2,
+        heavy_indices=(0,),
+        plot_mode="Single",
+    )
+    qualified = state.navigation.frames[1]
+    expected_trace = state.scientific.traces[1]
+    try:
+        shell.apply_state(state)
+        shell.apply_state(
+            replace(
+                state,
+                revision=state.revision + 1,
+                navigation=replace(
+                    state.navigation,
+                    current=qualified,
+                    selected=(qualified,),
+                ),
+                scientific=replace(
+                    state.scientific,
+                    heavy=HeavyProjection(qualified, None, None),
+                    title="qualified scan-a:2",
+                    retain_display=True,
+                ),
+            )
+        )
+
+        assert shell.scientific.title.text() == "qualified scan-a:2"
+        assert shell.scientific.raw.image.image is None
+        assert shell.scientific.cake.image.image is None
+        rendered = shell.scientific.curve.listDataItems()
+        assert len(rendered) == 1
+        np.testing.assert_array_equal(rendered[0].xData, expected_trace.axis.values)
+        np.testing.assert_array_equal(rendered[0].yData, expected_trace.intensity)
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+@pytest.mark.parametrize(
+    ("label", "unit", "expected_label", "expected_unit"),
+    [
+        ("Q", "q_A^-1", "Q", "Å⁻¹"),
+        ("2theta", "2th_deg", "2θ", "°"),
+        ("chi", "chi_deg", "χ", "°"),
+    ],
+)
+def test_e3_ui2_one_d_axis_uses_shared_scientific_presentation_vocabulary(
+    qapp: QtWidgets.QApplication,
+    label: str,
+    unit: str,
+    expected_label: str,
+    expected_unit: str,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(
+        frame_count=1,
+        heavy_indices=(0,),
+        plot_mode="Single",
+    )
+    trace = state.scientific.traces[0]
+    raw_axis = AxisProjection(trace.axis.values, label, unit)
+    try:
+        shell.apply_state(
+            replace(
+                state,
+                scientific=replace(
+                    state.scientific,
+                    traces=(replace(trace, axis=raw_axis),),
+                ),
+            )
+        )
+        axis = shell.scientific.curve.getPlotItem().getAxis("bottom")
+        assert axis.labelText == expected_label
+        assert axis.labelUnits == expected_unit
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_e3_ui2_status_fallback_and_non_string_rejection_are_exact(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection(
+        frame_count=1,
+        heavy_indices=(0,),
+        plot_mode="Single",
+    )
+    frame = state.navigation.current
+    assert frame is not None
+    payload = StandardDisplayPayload(
+        1,
+        frame,
+        "finished",
+        FrameView(
+            frame.local_frame_label,
+            raw=np.ones((2, 3)),
+        ),
+        status="finished",
+    )
+    scientific = build_scientific_projection(
+        (payload,),
+        state.navigation,
+        frozenset({frame}),
+        ScientificPreferences(),
+        "",
+    )
+    try:
+        shell.apply_state(replace(state, scientific=scientific))
+        assert shell.scientific.status.text() == "finished"
+        assert shell.scientific.title.text() == "finished"
+
+        malformed = replace(payload, status=object())
+        assert (
+            display_payload_is_valid(
+                malformed,
+                frame.run_identity,
+                frame,
+                payload.selection_generation,
+            )
+            is False
+        )
+        rejected = build_scientific_projection(
+            (malformed,),
+            state.navigation,
+            frozenset({frame}),
+            ScientificPreferences(),
+            "",
+        )
+        assert rejected.heavy is None
+        assert rejected.traces == ()
+        assert rejected.retain_display is True
+        # Projection and residency are separate bounded reads.  If a live
+        # publication lands between them, the current frame can appear
+        # resident before its qualified payload is in this projection.  That
+        # transient must keep the last coherent three-panel presentation.
+        raw_before = np.array(shell.scientific.raw.image.image, copy=True)
+        shell.apply_state(replace(
+            state,
+            revision=state.revision + 1,
+            scientific=rejected,
+        ))
+        assert shell.scientific.title.text() == "finished"
+        np.testing.assert_array_equal(
+            shell.scientific.raw.image.image,
+            raw_before,
+        )
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
