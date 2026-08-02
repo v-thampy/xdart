@@ -75,12 +75,22 @@ class _Sources:
         return ("source", key)
 
 
+class _Experiments:
+    def __init__(self, calls):
+        self.calls = calls
+
+    def experiment_for(self, key):
+        self.calls.append(("experiment", key))
+        return ("experiment", key)
+
+
 def _services(calls):
     return HostServices(
         status=_Status(),
         run_intents=_RunIntents(calls),
         execution=_Execution(calls),
         sources=_Sources(calls),
+        experiments=_Experiments(calls),
         execution_profile=ExecutionProfile.TEST,
         diagnostics=DiagnosticIdentity("tests.synthetic"),
     )
@@ -184,7 +194,9 @@ def _descriptor(
         assert services.run_intents.store_for(PageKey(key)) == ("intent", PageKey(key))
         assert services.execution.executor_for(PageKey(key)) == ("executor", PageKey(key))
         assert services.sources.source_port_for(PageKey(key)) == ("source", PageKey(key))
+        assert services.experiment_for(PageKey(key)) == ("experiment", PageKey(key))
         assert services.execution.executor_for(PageKey("wrong-key")) is None
+        assert services.experiment_for(PageKey("wrong-key")) is None
         widget = QtWidgets.QWidget(parent)
         menu_port = None
         if menus:
@@ -246,6 +258,7 @@ def test_two_synthetic_pages_mount_lazily_and_route_selected_only(qapp, tmp_path
             ("intent", page_a.key),
             ("executor", page_a.key),
             ("source", page_a.key),
+            ("experiment", page_a.key),
         ]
         assert not window.actionToggleWriteMode.isEnabled()
         assert "unavailable" in window.actionToggleWriteMode.toolTip().lower()

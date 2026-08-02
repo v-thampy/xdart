@@ -399,6 +399,7 @@ def test_q3_modules_keep_the_frozen_import_and_owner_boundary() -> None:
         "PySide",
         "PyQt",
         "qtpy",
+        "pyqtgraph",
     )
     assert {needle for needle in forbidden if needle in combined} == set()
     # The imported PONI wavelength is read only for energy arbitration and its
@@ -416,7 +417,7 @@ before = set(sys.modules)
 import xrd_tools.session.experiment_state
 import xrd_tools.session.experiment_reload
 loaded = set(sys.modules) - before
-forbidden = ("h5py", "PySide", "PyQt", "qtpy", "pyFAI", "fabio", "xdart")
+forbidden = ("h5py", "PySide", "PyQt", "qtpy", "pyqtgraph", "pyFAI", "fabio", "xdart")
 bad = sorted(name for name in loaded if any(
     name == root or name.startswith(root + ".") for root in forbidden
 ))

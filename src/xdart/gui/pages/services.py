@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol
+from typing import Protocol, TYPE_CHECKING
 
 from .values import PageKey
+
+if TYPE_CHECKING:
+    from xrd_tools.session.experiment_state import ExperimentEditorPort
 
 
 class StatusPresenter(Protocol):
@@ -23,6 +26,10 @@ class ExecutionProvider(Protocol):
 
 class SourceProvider(Protocol):
     def source_port_for(self, key: PageKey) -> object | None: ...
+
+
+class ExperimentProvider(Protocol):
+    def experiment_for(self, key: PageKey) -> ExperimentEditorPort | None: ...
 
 
 class ExecutionProfile(str, Enum):
@@ -73,13 +80,29 @@ class _SelectedSources:
 
 
 @dataclass(frozen=True, slots=True)
+class _SelectedExperiments:
+    selected: PageKey
+    provider: ExperimentProvider
+
+    def experiment_for(self, key: PageKey) -> ExperimentEditorPort | None:
+        if key != self.selected:
+            return None
+        return self.provider.experiment_for(self.selected)
+
+
+@dataclass(frozen=True, slots=True)
 class HostServices:
     status: StatusPresenter
     run_intents: RunIntentProvider
     execution: ExecutionProvider
     sources: SourceProvider
+    experiments: ExperimentProvider
     execution_profile: ExecutionProfile
     diagnostics: DiagnosticIdentity
+
+    def experiment_for(self, key: PageKey) -> ExperimentEditorPort | None:
+        """Return the borrowed experiment editor for that exact key, or None."""
+        return self.experiments.experiment_for(key)
 
     def for_page(self, key: PageKey) -> "HostServices":
         """Return providers that refuse every key except the selected one."""
@@ -88,6 +111,7 @@ class HostServices:
             run_intents=_SelectedRunIntents(key, self.run_intents),
             execution=_SelectedExecution(key, self.execution),
             sources=_SelectedSources(key, self.sources),
+            experiments=_SelectedExperiments(key, self.experiments),
             execution_profile=self.execution_profile,
             diagnostics=self.diagnostics,
         )
@@ -108,6 +132,11 @@ class _NullSources:
         return None
 
 
+class _NullExperiments:
+    def experiment_for(self, _key: PageKey) -> None:
+        return None
+
+
 def empty_host_services(
     status: StatusPresenter,
     *,
@@ -119,6 +148,7 @@ def empty_host_services(
         run_intents=_NullRunIntents(),
         execution=_NullExecution(),
         sources=_NullSources(),
+        experiments=_NullExperiments(),
         execution_profile=execution_profile,
         diagnostics=DiagnosticIdentity(logger_namespace),
     )

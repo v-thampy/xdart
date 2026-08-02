@@ -16,11 +16,13 @@ def test_pages_contract_import_is_lazy_and_constructs_no_qt_or_page_package():
     script = """
 import sys
 import xdart.gui.pages.catalog
+import xdart.gui.pages.services
 for name in (
     'xdart.gui.tabs.static_scan',
     'xdart.gui.tabs.static_scan.static_scan_widget',
     'xdart.gui.tabs.scattering',
     'xdart.gui.tabs.scattering.page',
+    'xrd_tools.session.experiment_state',
 ):
     assert name not in sys.modules, name
 assert not any(name.startswith('PySide6.QtWidgets') for name in sys.modules)
@@ -35,14 +37,34 @@ def test_contract_modules_have_no_science_settings_or_main_imports():
     forbidden_import_roots = (
         "xdart.gui.tabs", "xrd_tools", "xdart.modules", "xdart._gui_main",
     )
+    # The one ratified J1 exemption: services.py may name the Q3 editor port
+    # for annotations only, inside ``if TYPE_CHECKING:``; every runtime
+    # science import and every other spelling stays forbidden.
     for path in sorted(PAGES.glob("*.py")):
         if path.name == "legacy_static.py":
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        type_checking_imports = {
+            child
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "TYPE_CHECKING"
+            for child in node.body
+            if isinstance(child, ast.ImportFrom)
+        }
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 names = [alias.name for alias in node.names]
             elif isinstance(node, ast.ImportFrom):
+                if (
+                    path.name == "services.py"
+                    and node in type_checking_imports
+                    and node.module == "xrd_tools.session.experiment_state"
+                    and [alias.name for alias in node.names]
+                    == ["ExperimentEditorPort"]
+                ):
+                    continue
                 names = [node.module or ""]
             else:
                 continue
@@ -50,6 +72,14 @@ def test_contract_modules_have_no_science_settings_or_main_imports():
                 if name.startswith(forbidden_import_roots):
                     offenders.append(f"{path.name}: imports {name}")
         text = path.read_text(encoding="utf-8")
+        if path.name == "services.py":
+            for sanctioned in (
+                "ExperimentEditorPort",
+                "ExperimentProvider",
+                "_SelectedExperiments",
+                "_NullExperiments",
+            ):
+                text = text.replace(sanctioned, "")
         for token in ("QSettings", "Scattering", "Experiment", "operations_for", "OperationOwners"):
             if token in text:
                 offenders.append(f"{path.name}: contains {token}")
