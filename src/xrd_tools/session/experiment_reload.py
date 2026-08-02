@@ -186,7 +186,6 @@ class LegacyRecordAdapter:
             return PersistedExperimentFacts(
                 ReloadStatus.PARTIAL, calibration=calibration, geometry=geometry,
                 energy=energy, sample=sample,
-                content_fingerprint=str(run.get("fingerprint") or "") or None,
             )
         gi = config.get("gi_config")
         geometry, energy, sample = _geometry(gi), _energy(handle[entry], None), _sample(gi)

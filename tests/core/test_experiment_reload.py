@@ -283,6 +283,24 @@ def test_empty_envelope_keeps_genuine_persisted_energy_fact(
     assert result.energy.wavelength_m == pytest.approx(1.0e-10)
 
 
+def test_partial_reload_does_not_relabel_run_fingerprint_as_experiment_content(
+    tmp_path: Path,
+) -> None:
+    record = tmp_path / "partial-run-fingerprint.nxs"
+    with h5py.File(record, "w") as handle:
+        write_provenance(
+            handle,
+            config={"run_configuration": {"fingerprint": "run-fingerprint"}},
+        )
+        mono = handle.require_group("entry/instrument/monochromator")
+        mono["wavelength"] = 1.0
+
+    result = LegacyRecordAdapter().read(record)
+    assert result.status is ReloadStatus.PARTIAL
+    assert result.energy is not None
+    assert result.content_fingerprint is None
+
+
 def test_malformed_exact_projection_fails_closed(tmp_path: Path) -> None:
     state = _exact_state()
     payload = state.to_provenance()
