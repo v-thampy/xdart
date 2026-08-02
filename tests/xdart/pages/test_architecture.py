@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -10,6 +11,22 @@ import sys
 ROOT = Path(__file__).resolve().parents[3]
 PAGES = ROOT / "src" / "xdart" / "gui" / "pages"
 GUI_MAIN = ROOT / "src" / "xdart" / "_gui_main.py"
+_SANCTIONED_J1_EXPERIMENT_IDENTIFIERS = (
+    "ExperimentEditorPort",
+    "_ExperimentProvider",
+    "_SelectedExperiments",
+    "_NullExperiments",
+)
+
+
+def _strip_sanctioned_j1_experiment_identifiers(text: str) -> str:
+    for identifier in _SANCTIONED_J1_EXPERIMENT_IDENTIFIERS:
+        text = re.sub(
+            rf"(?<!\w){re.escape(identifier)}(?!\w)",
+            "",
+            text,
+        )
+    return text
 
 
 def test_pages_contract_import_is_lazy_and_constructs_no_qt_or_page_package():
@@ -73,17 +90,19 @@ def test_contract_modules_have_no_science_settings_or_main_imports():
                     offenders.append(f"{path.name}: imports {name}")
         text = path.read_text(encoding="utf-8")
         if path.name == "services.py":
-            for sanctioned in (
-                "ExperimentEditorPort",
-                "_ExperimentProvider",
-                "_SelectedExperiments",
-                "_NullExperiments",
-            ):
-                text = text.replace(sanctioned, "")
+            text = _strip_sanctioned_j1_experiment_identifiers(text)
         for token in ("QSettings", "Scattering", "Experiment", "operations_for", "OperationOwners"):
             if token in text:
                 offenders.append(f"{path.name}: contains {token}")
     assert offenders == []
+
+
+def test_j1_experiment_identifier_allowlist_is_exact():
+    text = " ".join((*_SANCTIONED_J1_EXPERIMENT_IDENTIFIERS,
+                     "_ExperimentProviderBundle"))
+    assert _strip_sanctioned_j1_experiment_identifiers(text).split() == [
+        "_ExperimentProviderBundle"
+    ]
 
 
 def test_main_host_has_no_page_name_branch_or_legacy_widget_reach_in():
