@@ -1,7 +1,14 @@
 """Typed mode-specific source-selection contracts."""
 
+import pytest
+
 from xrd_tools.core.scan import SourceKind
 from xrd_tools.sources import image_series_spec, open_source
+from xrd_tools.sources.selection import (
+    DirectorySourceSpec,
+    normalize_metadata_format,
+    single_image_spec,
+)
 
 
 def test_image_series_spec_freezes_all_members_from_selected_fourth(tmp_path):
@@ -15,6 +22,33 @@ def test_image_series_spec_freezes_all_members_from_selected_fourth(tmp_path):
     assert spec.kind is SourceKind.TIFF_SERIES
     assert spec.options["selected_file"] == str(paths[3])
     assert tuple(spec.options["files"]) == tuple(str(path) for path in paths)
+    assert spec.options["metadata_format"] == "auto"
+
+
+def test_container_image_selection_carries_actual_auto_metadata_policy(tmp_path):
+    selected = tmp_path / "scan.nxs"
+
+    spec = image_series_spec(selected)
+
+    assert spec.kind is SourceKind.NEXUS_STACK
+    assert spec.options["metadata_format"] == "auto"
+
+
+@pytest.mark.parametrize("saved", (None, "", "None", "none"))
+def test_legacy_profile_metadata_off_encodings_migrate_to_auto(saved):
+    assert normalize_metadata_format(
+        saved,
+        legacy_none_is_auto=True,
+    ) == "auto"
+
+
+def test_live_metadata_none_remains_explicitly_off(tmp_path):
+    assert normalize_metadata_format(None) is None
+    assert normalize_metadata_format("None") is None
+    assert DirectorySourceSpec(
+        tmp_path,
+        metadata_format="None",
+    ).metadata_format is None
 
 
 def test_open_source_consumes_frozen_image_series_membership(tmp_path):
@@ -30,3 +64,9 @@ def test_open_source_consumes_frozen_image_series_membership(tmp_path):
     assert source.name == "series"
     assert source.frame_indices == [1, 2, 3, 4, 5]
     assert tuple(source.files) == paths
+
+
+@pytest.mark.parametrize("suffix", (".h5", ".hdf5", ".nxs", ".cxi"))
+def test_single_image_rejects_container_extensions(suffix, tmp_path):
+    with pytest.raises(ValueError, match="Image Series"):
+        single_image_spec(tmp_path / f"container{suffix}")

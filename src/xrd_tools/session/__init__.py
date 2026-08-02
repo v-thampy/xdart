@@ -47,6 +47,12 @@ __all__ = [
     "admit_run_configuration",
     "require_run_configuration",
     "jsonable_run_value",
+    # Canonical revisioned RunIntent owner (headless):
+    "RunIntentSnapshot",
+    "IntentCommitAccepted",
+    "IntentFreezeAccepted",
+    "IntentRecaptureRequired",
+    "RunIntentStore",
     # GI theta-motor policy (Qt-free, single source of truth).  `resolve_gi_motor`
     # is THE motor-resolution decision (raw selection + choice knowledge ->
     # effective motor); `pick_default_gi_motor` is the default-pick it delegates
@@ -106,6 +112,15 @@ _RUN_CONFIGURATION_EXPORTS = {
 }
 
 
+_INTENT_STORE_EXPORTS = {
+    "RunIntentSnapshot",
+    "IntentCommitAccepted",
+    "IntentFreezeAccepted",
+    "IntentRecaptureRequired",
+    "RunIntentStore",
+}
+
+
 _GI_MOTOR_EXPORTS = {
     "GI_MOTOR_PREFERENCE",
     "pick_default_gi_motor",
@@ -133,6 +148,8 @@ def __getattr__(name: str) -> Any:
         value = getattr(import_module("xrd_tools.session.frame_projection"), name)
     elif name in _RUN_CONFIGURATION_EXPORTS:
         value = getattr(import_module("xrd_tools.session.run_configuration"), name)
+    elif name in _INTENT_STORE_EXPORTS:
+        value = getattr(import_module("xrd_tools.session.intent_store"), name)
     elif name in _SCAN_NORM_EXPORTS:
         value = getattr(import_module("xrd_tools.session.scan_norm"), name)
     else:

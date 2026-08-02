@@ -21,14 +21,17 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass, field, replace as dataclass_replace
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from xrd_tools.core.scan import SourceSpec
 from xrd_tools.session.gi_motor import pick_default_gi_motor
-from xrd_tools.sources.selection import DirectorySourceSpec
+from xrd_tools.sources.selection import (
+    DirectorySourceSpec,
+    normalize_image_source_metadata,
+)
 
 
 _SCHEMA_VERSION = 1
@@ -495,6 +498,7 @@ def _detached_source_spec(value):
             suffixes=tuple(value.suffixes),
             name_filter=value.name_filter,
             generation=int(value.generation),
+            metadata_format=value.metadata_format,
         )
     if isinstance(value, SourceSpec):
         return SourceSpec(
@@ -541,6 +545,7 @@ class FrozenSourceSpec:
     suffixes: tuple[str, ...] = ()
     name_filter: str | None = None
     generation: int = 0
+    metadata_format: str | None = "auto"
     uri_was_path: bool = True
     metadata_uri_was_path: bool = True
 
@@ -557,6 +562,7 @@ class FrozenSourceSpec:
                 suffixes=tuple(str(item) for item in value.suffixes),
                 name_filter=value.name_filter,
                 generation=int(value.generation),
+                metadata_format=value.metadata_format,
             )
         if isinstance(value, SourceSpec):
             metadata_uri = value.metadata_uri
@@ -629,6 +635,7 @@ class FrozenSourceSpec:
                 suffixes=tuple(self.suffixes),
                 name_filter=self.name_filter,
                 generation=int(self.generation),
+                metadata_format=self.metadata_format,
             )
         if self.family == "source":
             uri: str | Path = Path(self.uri) if self.uri_was_path else self.uri
@@ -653,6 +660,7 @@ class FrozenSourceSpec:
                 "suffixes": list(self.suffixes),
                 "name_filter": self.name_filter,
                 "generation": int(self.generation),
+                "metadata_format": self.metadata_format,
             }
         return {
             "family": "source",
@@ -664,7 +672,7 @@ class FrozenSourceSpec:
         }
 
     def _fingerprint_value(self) -> tuple[Any, ...]:
-        return (
+        value = (
             self.family,
             self.uri,
             self.source_kind,
@@ -675,6 +683,10 @@ class FrozenSourceSpec:
             tuple(self.suffixes),
             self.name_filter,
             int(self.generation),
+        )
+        if self.family == "directory":
+            value += (self.metadata_format,)
+        return value + (
             bool(self.uri_was_path),
             bool(self.metadata_uri_was_path),
         )
@@ -962,6 +974,8 @@ class RunIntent:
             raise TypeError(
                 "source_spec must be SourceSpec, DirectorySourceSpec, or None"
             )
+        if type(self.source_spec) is SourceSpec:
+            self.source_spec = normalize_image_source_metadata(self.source_spec)
         self.generation = int(self.generation)
         if self.generation < 0:
             raise ValueError("generation cannot be negative")
@@ -987,10 +1001,13 @@ class RunIntent:
                 raise ValueError(
                     "explicit generation must be greater than the current generation"
                 )
+        source_spec = self.source_spec
+        if type(source_spec) is SourceSpec:
+            source_spec = normalize_image_source_metadata(source_spec)
         source = (
             None
-            if self.source_spec is None
-            else FrozenSourceSpec.from_source(self.source_spec)
+            if source_spec is None
+            else FrozenSourceSpec.from_source(source_spec)
         )
         frozen = FrozenRunConfiguration(
             generation=next_generation,
@@ -1043,8 +1060,21 @@ class RunIntent:
             max_cores=int(self.max_cores),
             bai_1d_args=_detached_value(dict(self.bai_1d_args or {})),
             bai_2d_args=_detached_value(dict(self.bai_2d_args or {})),
-            gi=dataclass_replace(self.gi),
-            threshold=dataclass_replace(self.threshold),
+            gi=GIIntent(
+                enabled=_detached_value(self.gi.enabled),
+                incidence_motor=_detached_value(self.gi.incidence_motor),
+                th_val=_detached_value(self.gi.th_val),
+                sample_orientation=_detached_value(self.gi.sample_orientation),
+                tilt_angle=_detached_value(self.gi.tilt_angle),
+                mode_1d=_detached_value(self.gi.mode_1d),
+                mode_2d=_detached_value(self.gi.mode_2d),
+            ),
+            threshold=ThresholdIntent(
+                apply_threshold=_detached_value(self.threshold.apply_threshold),
+                threshold_min=_detached_value(self.threshold.threshold_min),
+                threshold_max=_detached_value(self.threshold.threshold_max),
+                mask_saturation=_detached_value(self.threshold.mask_saturation),
+            ),
             poni_file=self.poni_file,
             poni_values=(
                 None if self.poni_values is None
