@@ -65,6 +65,7 @@ class ContextProjection:
         self,
         context: AcquisitionContext | BrowseContext | None,
         frames: tuple[DisplayFrameKey, ...],
+        browse_hydration_owner=None,
     ) -> frozenset[DisplayFrameKey]:
         """Project exact heavy residency without retaining store state."""
 
@@ -80,6 +81,7 @@ class ContextProjection:
                     _browse_detector_outcome(
                         context,
                         frame.local_frame_label,
+                        browse_hydration_owner,
                     ),
                 )
             )
@@ -192,6 +194,7 @@ class ContextProjection:
         current_selection: DisplaySelection,
         accepted_run_identity: RunIdentity | None,
         frame_keys: tuple[DisplayFrameKey, ...] | dict[int, DisplayFrameKey],
+        browse_hydration_owner=None,
     ) -> StandardDisplayPayload | None:
         if type(frame_keys) is dict:
             owns_frame = frame_keys.get(id(request.frame)) is request.frame
@@ -242,7 +245,9 @@ class ContextProjection:
             request.require_complete
             and publication_needs_hydration(
                 publication,
-                _browse_detector_outcome(context, label),
+                _browse_detector_outcome(
+                    context, label, browse_hydration_owner
+                ),
             )
         ):
             return None
@@ -285,12 +290,16 @@ class ContextProjection:
         )
 
 
-def _browse_detector_outcome(context: BrowseContext, label):
+def _browse_detector_outcome(
+    context: BrowseContext, label, browse_hydration_owner=None
+):
     # Local import preserves the existing browse_preview -> ProjectionRequest
     # module direction while querying only B's already-created exact owner.
     from .browse_preview import cold_browse_detector_outcome
 
-    return cold_browse_detector_outcome(context, label)
+    return cold_browse_detector_outcome(
+        context, label, browse_hydration_owner
+    )
 
 
 def _browse_measurement(

@@ -8,6 +8,7 @@ from xdart.modules.display_context import (
 )
 
 from .acquisition_runtime import CommandCompensationFailure
+from .browse_hydration import _BrowseHydrationOwner
 from .browse_preview import (
     browse_preview_polling_needed,
     browse_preview_repaint_ready,
@@ -46,6 +47,7 @@ class ContextController:
         self._projection = projection
         self._runtime = _ContextRuntime()
         self._browse_request: BrowseLoadRequest | None = None
+        self._browse_hydration_owner: _BrowseHydrationOwner | None = None
         self._cleanup_receipt: BrowseCleanupReceipt | None = None
         self._load_generation = 0
         self._close: BrowseCleanupReceipt | None = None
@@ -86,7 +88,9 @@ class ContextController:
     def browse_preview_polling_needed(self) -> bool:
         return (
             not self._closed
-            and browse_preview_polling_needed(self._runtime)
+            and browse_preview_polling_needed(
+                self._runtime, self._browse_hydration_owner
+            )
         )
 
     @property
@@ -99,7 +103,9 @@ class ContextController:
 
     @property
     def resident_frame_keys(self) -> frozenset[DisplayFrameKey]:
-        return self._runtime.resident_frame_keys(self._projection)
+        return self._runtime.resident_frame_keys(
+            self._projection, self._browse_hydration_owner
+        )
 
     def owns_frame(self, frame: object) -> bool:
         return self._runtime.owns_frame(frame)
@@ -107,7 +113,9 @@ class ContextController:
     def poll_browse_preview(self) -> bool:
         return (
             not self._closed
-            and browse_preview_repaint_ready(self._runtime)
+            and browse_preview_repaint_ready(
+                self._runtime, self._browse_hydration_owner
+            )
         )
 
     def adopt_acquisition(self, run_identity: RunIdentity) -> DisplaySelection:
@@ -177,7 +185,7 @@ class ContextController:
             return False
         browse = self._runtime.browse_context
         if browse is not None:
-            released = release_browse(self._browse_loader, self._runtime, browse)
+            released = self._release_browse(browse)
             if (
                 type(released) is not BrowseCleanupReceipt
                 or released.request is not browse.load_request
@@ -298,9 +306,11 @@ class ContextController:
         self, request: ProjectionRequest
     ) -> StandardDisplayPayload | None:
         payload = self._runtime.resolve_projection(
-            self._projection, request
+            self._projection, request, self._browse_hydration_owner
         )
-        request_browse_preview(self._runtime, request)
+        request_browse_preview(
+            self._runtime, request, self._browse_hydration_owner
+        )
         return payload
 
     def project(self, frame: object) -> StandardDisplayPayload | None:
@@ -324,6 +334,7 @@ class ContextController:
                         current,
                         require_complete=True,
                     ),
+                    self._browse_hydration_owner,
                 )
             except (RuntimeError, TypeError):
                 pass
@@ -332,6 +343,7 @@ class ContextController:
             preferences=preferences,
             processing_mode=processing_mode,
             live_update=live_update,
+            browse_hydration_owner=self._browse_hydration_owner,
         )
 
     def commit_navigation_projection(
@@ -350,7 +362,7 @@ class ContextController:
         if self._closed:
             return None
         return self._runtime.qualify_display_event(
-            self._projection, event
+            self._projection, event, self._browse_hydration_owner
         )
 
     def begin_browse(self, source_path: str) -> BrowseLoadRequest:
@@ -381,7 +393,7 @@ class ContextController:
                 self._runtime.selection is not None
                 and self._runtime.selection.names(browse)
             )
-            receipt = release_browse(self._browse_loader, self._runtime, browse)
+            receipt = self._release_browse(browse)
             if (
                 type(receipt) is not BrowseCleanupReceipt
                 or receipt.request is not browse.load_request
@@ -459,6 +471,16 @@ class ContextController:
             if receipt.cleanup_status is CleanupStatus.CLEANED:
                 self._runtime.finish_replacement(request)
             return None
+        prior = self._runtime.browse_context
+        if outcome.status is BrowseLoadStatus.READY and prior is not None:
+            receipt = self._release_browse(prior)
+            if (
+                type(receipt) is not BrowseCleanupReceipt
+                or receipt.request is not prior.load_request
+                or receipt.cleanup_status is not CleanupStatus.CLEANED
+            ):
+                self._invalidate_browse_request()
+                return None
         context = self._browse_loader.consume(outcome)
         if outcome.status is not BrowseLoadStatus.READY:
             self._runtime.finish_replacement(request)
@@ -469,10 +491,16 @@ class ContextController:
             or type(context) is not BrowseContext
         ):
             return None
-        prior = self._runtime.browse_context
-        if prior is not None:
-            release_browse(self._browse_loader, self._runtime, prior)
+        acquisition = self._runtime.acquisition_context
+        display = (
+            None if acquisition is None else acquisition.publication_store
+        )
+        owner = _BrowseHydrationOwner(
+            context,
+            borrowed_transport=getattr(display, "transport", None),
+        )
         self._runtime.adopt_browse(context, request)
+        self._browse_hydration_owner = owner
         self._browse_request = None
         return outcome
 
@@ -501,7 +529,7 @@ class ContextController:
                 failures = loader_receipt.cleanup_failures
             return self._set_close(expected, failures)
         if browse is not None:
-            released = release_browse(self._browse_loader, self._runtime, browse)
+            released = self._release_browse(browse)
             if (
                 type(released) is BrowseCleanupReceipt
                 and released.request is browse.load_request
@@ -595,6 +623,21 @@ class ContextController:
         finished = self._runtime.finish_replacement(request)
         self._retain_cancel(request)
         return finished
+
+    def _release_browse(
+        self, browse: BrowseContext
+    ) -> BrowseCleanupReceipt:
+        owner = self._browse_hydration_owner
+        receipt = release_browse(self._browse_loader, browse, owner)
+        if (
+            type(receipt) is BrowseCleanupReceipt
+            and receipt.request is browse.load_request
+            and receipt.cleanup_status is CleanupStatus.CLEANED
+            and type(owner) is _BrowseHydrationOwner
+            and owner._owns(browse)
+        ):
+            self._browse_hydration_owner = None
+        return receipt
 
     def _retain_cancel(self, request: BrowseLoadRequest) -> BrowseCleanupReceipt:
         receipt = self._browse_loader.cancel(request)

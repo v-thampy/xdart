@@ -107,7 +107,7 @@ class _ContextRuntime:
         return self.navigation.frames if self.selection is not None else ()
 
     def resident_frame_keys(
-        self, projection: ContextProjection
+        self, projection: ContextProjection, browse_hydration_owner=None
     ) -> frozenset[DisplayFrameKey]:
         if self._pending_replacement is not None:
             return frozenset()
@@ -129,7 +129,9 @@ class _ContextRuntime:
             # stale owner.  Residency must reject it too so the shell sees one
             # coherent pending state instead of "resident but no payload".
             return frozenset()
-        return projection.resident_frame_keys(context, self.frame_keys)
+        return projection.resident_frame_keys(
+            context, self.frame_keys, browse_hydration_owner
+        )
 
     def owns_frame(self, frame: object) -> bool:
         return (
@@ -411,7 +413,10 @@ class _ContextRuntime:
         )
 
     def resolve_projection(
-        self, projection: ContextProjection, request: ProjectionRequest
+        self,
+        projection: ContextProjection,
+        request: ProjectionRequest,
+        browse_hydration_owner=None,
     ) -> StandardDisplayPayload | None:
         identity = self._selected_projection_identity()
         if (
@@ -433,6 +438,7 @@ class _ContextRuntime:
             self._selection,
             identity,
             self._selected_frame_by_id(),
+            browse_hydration_owner,
         )
         if (
             type(payload) is not StandardDisplayPayload
@@ -450,6 +456,7 @@ class _ContextRuntime:
         preferences: object | None = None,
         processing_mode: str = "Int 2D",
         live_update: bool = False,
+        browse_hydration_owner=None,
     ) -> tuple[StandardDisplayPayload, ...]:
         payloads: list[StandardDisplayPayload] = []
         navigation = self.navigation
@@ -512,13 +519,17 @@ class _ContextRuntime:
                     frame,
                     require_complete=require_complete,
                 )
-                payload = self.resolve_projection(projection, request)
+                payload = self.resolve_projection(
+                    projection, request, browse_hydration_owner
+                )
                 if payload is None and require_complete:
                     request = self.project_request(
                         frame,
                         require_complete=False,
                     )
-                    payload = self.resolve_projection(projection, request)
+                    payload = self.resolve_projection(
+                        projection, request, browse_hydration_owner
+                    )
             except (RuntimeError, TypeError):
                 payload = None
             if type(payload) is StandardDisplayPayload:
@@ -554,7 +565,10 @@ class _ContextRuntime:
         return True
 
     def qualify_display_event(
-        self, projection: ContextProjection, event: StandardRunEvent
+        self,
+        projection: ContextProjection,
+        event: StandardRunEvent,
+        browse_hydration_owner=None,
     ) -> StandardDisplayPayload | None:
         selection = self._selection
         identity = self._selected_projection_identity()
@@ -569,7 +583,9 @@ class _ContextRuntime:
         ):
             return None
         request = ProjectionRequest(event.run_identity, selection, frame)
-        return self.resolve_projection(projection, request)
+        return self.resolve_projection(
+            projection, request, browse_hydration_owner
+        )
 
     def adopt_browse(
         self, context: BrowseContext, request: BrowseLoadRequest

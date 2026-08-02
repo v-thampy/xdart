@@ -680,6 +680,10 @@ def test_page_retains_one_shot_retirement_proof_until_browse_is_clean(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    from xdart.gui.tabs.scattering.browse_hydration import (
+        _BrowseHydrationOwner,
+    )
+
     executor = _SequencedExecutor(["cleaned"])
     qapp, page, lifecycle, first = _active_page(tmp_path, executor)
     _finish_run(page, lifecycle, first)
@@ -690,6 +694,7 @@ def test_page_retains_one_shot_retirement_proof_until_browse_is_clean(
         scan_key="retained-b",
     )
     controller._runtime.adopt_browse(browse, request)
+    controller._browse_hydration_owner = _BrowseHydrationOwner(browse)
     browse_statuses = deque(
         (CleanupStatus.CLEANUP_PENDING, CleanupStatus.CLEANED)
     )

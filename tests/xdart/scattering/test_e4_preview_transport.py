@@ -1980,8 +1980,7 @@ def test_cold_browse_evicted_frame_rehydrates_its_exact_store(
     assert browse.publication_store.get(1) is None
 
     assert controller.project(key) is None
-    preview = import_module("xdart.gui.tabs.scattering.browse_preview")
-    transport = preview.display_transport(controller._runtime)
+    transport = controller._browse_hydration_owner.transport
     assert transport is not None
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
@@ -2022,10 +2021,8 @@ def test_cold_browse_no_thumbnail_exact_read_terminalizes_once(
     key = _browse_key(controller, 1)
     assert browse.publication_store.get(1) is None
     counts = _instrument_reads(monkeypatch, processed)
-    preview = import_module("xdart.gui.tabs.scattering.browse_preview")
-
     assert controller.project(key) is None
-    transport = preview.display_transport(controller._runtime)
+    transport = controller._browse_hydration_owner.transport
     assert transport is not None
     deadline = time.monotonic() + 10.0
     while (
@@ -2097,8 +2094,7 @@ def test_cold_browse_close_retries_its_exact_active_transport(
 
     monkeypatch.setattr(_transport_api(), "read_frame_preview", holding_read)
     assert controller.project(key) is None
-    preview = import_module("xdart.gui.tabs.scattering.browse_preview")
-    transport = preview.display_transport(controller._runtime)
+    transport = controller._browse_hydration_owner.transport
     assert hold.wait(timeout=10.0)
 
     receipt = controller.close()
