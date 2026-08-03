@@ -8,6 +8,8 @@ from xdart.modules.display_context import (
     AcquisitionContext, BrowseContext, ContextKind, DisplaySelection)
 from xrd_tools.session.hydration import (
     HydrationPurpose, HydrationReadKey, HydrationToken)
+from xrd_tools.session.scan_norm import (
+    ScanNormAggregate, accepts_norm_aggregate)
 
 from .browse_hydration import _BrowseHydrationOwner
 from .browse_preview import qualified_event_frame
@@ -33,6 +35,7 @@ from .display_values import (
     display_payload_is_valid,
 )
 from .events import CleanupStatus, RunIdentity
+from .scientific_axes import resolve_norm_presentation
 from .shell_values import FrameNavigationProjection
 
 
@@ -95,6 +98,12 @@ class _ContextRuntime:
         self._committed_trace_selection: tuple[DisplayFrameKey, ...] = ()
         self._pending_trace_projection: _PendingTraceProjection | None = None
         self._browse_pass: _BrowseProjectionPass | None = None
+        self._norm_aggregate: ScanNormAggregate | None = None
+
+    @property
+    def norm_aggregate(self) -> ScanNormAggregate | None:
+        """The one §25.3 runtime-held snapshot, borrowed per refresh."""
+        return self._norm_aggregate
 
     @property
     def run_identity(self) -> RunIdentity | None:
@@ -620,6 +629,77 @@ class _ContextRuntime:
             return None
         return payload
 
+    def _capture_norm_aggregate(self) -> None:
+        """THE one §25.3 capture: at most ONE candidate from the exact
+        current selection, admitted only through the Q2 acceptance gate.
+
+        A dead, cancelled or stale live-Browse scope and a rescoped
+        acquisition owner are capture NO-OPS — a refusal cannot change what
+        is presented.  A context switch never exposes the prior identity's
+        aggregate; revision 0 and older revisions are refused; an
+        equal-revision replay keeps the exact held object.
+        """
+        if self._pending_replacement is not None:
+            return
+        selection = self._selection
+        expected = None
+        candidate = None
+        if selection is not None and selection.kind is ContextKind.BROWSE:
+            browse = self._browse
+            if browse is not None:
+                if (
+                    browse.invalidated
+                    or browse.released
+                    or not browse.loaded
+                    or browse.commit_gate.cancelled
+                    or not selection.names(browse)
+                ):
+                    return
+                expected = (
+                    browse.context_token,
+                    browse.scan_key,
+                    browse.requested_path,
+                )
+                candidate = browse.norm_aggregate
+        elif selection is not None:
+            context = self._acquisition
+            identity = self._run_identity
+            current = self._acquisition_navigation.current
+            if (
+                context is not None
+                and identity is not None
+                and current is not None
+            ):
+                if selection.owner != context.hydration_owner:
+                    return
+                expected = (
+                    identity.generation,
+                    identity.fingerprint,
+                    str(current.artifact),
+                    current.source_scan,
+                )
+                try:
+                    candidate = (
+                        context.publication_store.frame_norm_aggregate(
+                            current
+                        )
+                    )
+                except Exception:
+                    candidate = None
+        held = self._norm_aggregate
+        if held is not None and (
+            expected is None or held.identity != expected
+        ):
+            held = None
+        if (
+            expected is not None
+            and type(candidate) is ScanNormAggregate
+            and candidate.revision > 0
+            and accepts_norm_aggregate(held, candidate, expected)
+        ):
+            held = candidate
+        self._norm_aggregate = held
+
     def project_navigation(
         self,
         projection: ContextProjection,
@@ -629,6 +709,7 @@ class _ContextRuntime:
         live_update: bool = False,
         browse_hydration_owner=None,
     ) -> tuple[StandardDisplayPayload, ...]:
+        self._capture_norm_aggregate()
         payloads: list[StandardDisplayPayload] = []
         navigation = self.navigation
         selected = navigation.selected
@@ -973,6 +1054,16 @@ class _ContextRuntime:
     ) -> tuple[object, ...]:
         selection = self._selection
         identity = self._selected_projection_identity()
+        # E6-NORM-N2 (§25.3): the SAME resolution the projection consumes,
+        # so a newly accepted revision or an effective-channel change at a
+        # stable selected prefix reseeds the complete exact selected set.
+        norm_identity, norm_revision, effective_channel, _ = (
+            resolve_norm_presentation(
+                self._norm_aggregate,
+                getattr(preferences, "norm_channel", None),
+                self.navigation.selected,
+            )
+        )
         return (
             id(identity),
             None if selection is None else selection.kind,
@@ -985,6 +1076,9 @@ class _ContextRuntime:
             getattr(preferences, "slice_enabled", None),
             getattr(preferences, "slice_center", None),
             getattr(preferences, "slice_width", None),
+            norm_identity,
+            norm_revision,
+            effective_channel,
         )
 
     def _reset_trace_projection(self) -> None:

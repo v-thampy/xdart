@@ -1319,6 +1319,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             source_count_includes_immediate=(
                 source_count_includes_immediate
             ),
+            norm_aggregate=self._context_controller.norm_aggregate,
         )
         try:
             self._shell.apply_state(

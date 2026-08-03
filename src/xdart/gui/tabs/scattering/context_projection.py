@@ -149,6 +149,7 @@ class ContextProjection:
         source_count: int | None = None,
         source_count_is_files: bool = False,
         source_count_includes_immediate: bool = False,
+        norm_aggregate: object = None,
     ) -> ShellProjection:
         """Build the one complete shell value; retain no input or output."""
 
@@ -194,6 +195,9 @@ class ContextProjection:
                 notice,
                 phase,
                 processing_mode=intent.processing_mode,
+                # E6-NORM-N2 (§25.3): the exact runtime-captured snapshot,
+                # one-refresh transport — never a reread of the producer.
+                norm_aggregate=norm_aggregate,
             ),
             navigation,
             controls,

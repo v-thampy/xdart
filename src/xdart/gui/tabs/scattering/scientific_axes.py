@@ -11,9 +11,14 @@ from xrd_tools.core import (
     axis_from_unit,
     convert_radial_axis,
 )
+from xrd_tools.core.metadata import resolve_monitor_norm
 from xrd_tools.session.display_logic import (
     canonical_axis_key,
     nanmean_slice,
+)
+from xrd_tools.session.scan_norm import (
+    ScanNormAggregate,
+    channel_is_partial,
 )
 
 from .display_values import (
@@ -110,6 +115,7 @@ def trace_projection(
     slice_enabled: bool,
     slice_center: float,
     slice_width: float,
+    norm_channel: str = "",
 ) -> TraceProjection | None:
     try:
         frame = payload.frame_key
@@ -157,6 +163,18 @@ def trace_projection(
         if selected is None:
             return None
         axis, intensity = selected
+        if norm_channel:
+            # E6-NORM-N2 (§25.3): the divisor is this exact admitted
+            # payload's own kernel value.  A complete channel with no valid
+            # row here fails the trace CLOSED — never an unnormalized trace
+            # under an ``I / channel`` label.  Division builds a new array
+            # before intensity scaling and before Sum/Average.
+            divisor = resolve_monitor_norm(
+                view.metadata_numeric, norm_channel
+            )
+            if divisor is None:
+                return None
+            intensity = intensity / divisor
         # Match the production accumulator presentation: scan name plus the
         # one-based frame number. The persisted frame key remains unchanged.
         source_name = os.path.basename(str(view.source_path or ""))
@@ -428,6 +446,69 @@ def _present_radial_axis(
     )
 
 
+def _frame_owns_norm_identity(identity, frame: DisplayFrameKey) -> bool:
+    """Match one frame against the two frozen §25.2 identity shapes."""
+
+    if len(identity) == 4:
+        run = frame.run_identity
+        return identity == (
+            run.generation,
+            run.fingerprint,
+            str(frame.artifact),
+            frame.source_scan,
+        )
+    return (
+        len(identity) == 3
+        and identity[1] == frame.source_scan
+        and identity[2] == frame.artifact
+    )
+
+
+def resolve_norm_presentation(
+    aggregate: object,
+    saved_channel: object,
+    frames: tuple[DisplayFrameKey, ...],
+) -> tuple[tuple | None, int, str, tuple[str, ...]]:
+    """THE one §25.3 consumer resolution from ONE captured aggregate.
+
+    Returns ``(identity, revision, effective_channel, choices)`` for both
+    the runtime trace-delta scope and the scientific projection, so the two
+    scopes can never disagree.  Exact type and revision are validated here;
+    choices carry only complete channels; the effective channel is empty
+    unless the one accepted aggregate covers EVERY selected frame and the
+    saved selection case-insensitively names a complete channel.
+    """
+
+    if type(aggregate) is not ScanNormAggregate:
+        return None, 0, "", ("Norm Channel",)
+    accepted: ScanNormAggregate = aggregate
+    if accepted.revision < 1:
+        return None, 0, "", ("Norm Channel",)
+    choices = (
+        "Norm Channel",
+        *(
+            key
+            for key in accepted.channels
+            if not channel_is_partial(accepted, key)
+        ),
+    )
+    effective = ""
+    if (
+        type(saved_channel) is str
+        and frames
+        and all(
+            _frame_owns_norm_identity(accepted.identity, frame)
+            for frame in frames
+        )
+    ):
+        key = saved_channel.strip().lower()
+        if key in accepted.channels and not channel_is_partial(
+            accepted, key
+        ):
+            effective = key
+    return accepted.identity, accepted.revision, effective, choices
+
+
 def requested_image_axis(
     payload: StandardDisplayPayload,
     preference: str,
@@ -484,6 +565,7 @@ __all__ = [
     "payload_is_qualified",
     "plot_axis_choice",
     "requested_image_axis",
+    "resolve_norm_presentation",
     "share_plot_axis_for_image",
     "trace_projection",
 ]

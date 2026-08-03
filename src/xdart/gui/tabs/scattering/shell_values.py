@@ -292,6 +292,11 @@ class ScientificProjection:
     status: str = ""
     retain_display: bool = False
     live_update: bool = False
+    #: E6-NORM-N2 (§25.3): the accepted aggregate's identity and revision
+    #: travel with the effective ``norm_channel`` so both delta scopes
+    #: reseed coherently.  Backward-safe defaults mean "no accepted value".
+    norm_identity: tuple[object, ...] | None = None
+    norm_revision: int = 0
 
 
 @dataclass(frozen=True, slots=True)

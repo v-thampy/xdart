@@ -882,6 +882,12 @@ class ScientificView(QtWidgets.QFrame):
             state.slice_enabled,
             state.slice_center,
             state.slice_width,
+            # E6-NORM-N2 (§25.3): a changed normalization identity,
+            # accepted revision or effective channel reseeds detached
+            # history — and, through this scope, the waterfall contract.
+            state.norm_identity,
+            state.norm_revision,
+            state.norm_channel,
         )
         selected = navigation.selected
         prefix = (

@@ -106,6 +106,11 @@ class ContextController:
             self._projection, self._browse_hydration_owner
         )
 
+    @property
+    def norm_aggregate(self):
+        """Borrow the §25.3 runtime-held snapshot for ONE shell refresh."""
+        return self._runtime.norm_aggregate
+
     def owns_frame(self, frame: object) -> bool:
         return self._runtime.owns_frame(frame)
 

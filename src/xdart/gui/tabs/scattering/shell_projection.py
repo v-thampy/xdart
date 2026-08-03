@@ -33,6 +33,7 @@ from .scientific_axes import (
     image_axis_choice,
     plot_axis_choice,
     requested_image_axis as project_requested_image_axis,
+    resolve_norm_presentation,
     share_plot_axis_for_image,
     trace_projection,
 )
@@ -171,6 +172,7 @@ def build_scientific_projection(
     phase: RunPhase | None = None,
     *,
     processing_mode: str = "Int 2D",
+    norm_aggregate: object = None,
 ) -> ScientificProjection:
     frame_by_id = {id(frame): frame for frame in navigation.frames}
     selected_ids = {id(frame) for frame in navigation.selected}
@@ -268,6 +270,16 @@ def build_scientific_projection(
             share_plot_axis_for_image(rendered_image_axis)
             or requested_plot_axis
         )
+    # E6-NORM-N2 (§25.3): ONE resolution of the ONE captured aggregate
+    # yields choices, effective selection, identity and revision; every
+    # selected trace divides by its own payload's kernel value.
+    norm_identity, norm_revision, effective_channel, norm_choices = (
+        resolve_norm_presentation(
+            norm_aggregate,
+            preferences.norm_channel,
+            navigation.selected,
+        )
+    )
     traces = tuple(
         trace
         for payload in accepted
@@ -279,6 +291,7 @@ def build_scientific_projection(
             slice_enabled=preferences.slice_enabled,
             slice_center=preferences.slice_center,
             slice_width=preferences.slice_width,
+            norm_channel=effective_channel,
         )) is not None
     )
     rendered_plot_axis = plot_axis_choice(
@@ -306,7 +319,10 @@ def build_scientific_projection(
         measurement_mode=measurement_mode,
         gi_mode_1d=gi_mode_1d,
         gi_mode_2d=gi_mode_2d,
-        norm_channel=preferences.norm_channel,
+        norm_channels=norm_choices,
+        norm_channel=effective_channel or "Norm Channel",
+        norm_identity=norm_identity,
+        norm_revision=norm_revision,
         color_map=preferences.color_map,
         log_scale=preferences.log_scale,
         image_axis=rendered_image_axis,
