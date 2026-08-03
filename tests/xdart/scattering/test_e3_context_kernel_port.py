@@ -23,12 +23,20 @@ from xdart.modules.display_context import (
 
 # The E3-accepted kernel (7c379710 / blob 73449efe) was superseded by the
 # accepted E4-S canonical-first revision that composes the typed shared
-# hydration purpose/token; the pinned object below is the byte-exact accepted
-# E4-S kernel ported at E4-R.
-_CANONICAL_COMMIT = "72b7b08efd4d24df0f74aa462a4b1766a97be6b2"
-_CANONICAL_BLOB = "3329391554910eb2e062da0a6c2afe3415db398c"
-_CANONICAL_SHA256 = (
+# hydration purpose/token; that accepted E4-S image (kept below as the
+# superseded ancestry record) was in turn superseded by E6-NORM-N1, which
+# adds exactly the ONE write-once ``norm_aggregate`` construction field to
+# the browse context (handoff §25.1).  The live pin names the N1 bytes; a
+# commit cannot contain its own hash, so the commit->blob ancestry leg stays
+# asserted for the accepted E4-S object.
+_E4S_COMMIT = "72b7b08efd4d24df0f74aa462a4b1766a97be6b2"
+_E4S_BLOB = "3329391554910eb2e062da0a6c2afe3415db398c"
+_E4S_SHA256 = (
     "7664a4c0979336015a0779b568461e2953ec04295a503c04cc711521594da825"
+)
+_CANONICAL_BLOB = "ea99f4b98e5a3db4937a4e89c774b055f8bbcc0d"
+_CANONICAL_SHA256 = (
+    "80a8573efecb3d42f309697aa827f8faee4800ad8ee8af721bf50cf25a230819"
 )
 _MODULE = (
     Path(__file__).parents[3]
@@ -76,24 +84,24 @@ def test_port_is_byte_identical_to_the_accepted_canonical_blob() -> None:
         text=True,
     ).stdout.strip()
     assert blob == _CANONICAL_BLOB
-    canonical = subprocess.run(
+    superseded = subprocess.run(
         [
             "git",
             "rev-parse",
-            f"{_CANONICAL_COMMIT}:src/xdart/modules/display_context.py",
+            f"{_E4S_COMMIT}:src/xdart/modules/display_context.py",
         ],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
-    assert canonical == blob
+    assert superseded == _E4S_BLOB
 
 
 def test_dependency_inventory_names_the_accepted_canonical_object() -> None:
     inventory = json.loads(_INVENTORY.read_text(encoding="utf-8"))
-    assert inventory["canonical_context_commit"] == _CANONICAL_COMMIT
-    assert inventory["canonical_context_blob"] == _CANONICAL_BLOB
-    assert inventory["canonical_context_sha256"] == _CANONICAL_SHA256
+    assert inventory["canonical_context_commit"] == _E4S_COMMIT
+    assert inventory["canonical_context_blob"] == _E4S_BLOB
+    assert inventory["canonical_context_sha256"] == _E4S_SHA256
 
 
 def test_port_import_is_headless_in_a_fresh_interpreter() -> None:

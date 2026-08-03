@@ -17,6 +17,11 @@ from xrd_tools.core.energy import (
 from xrd_tools.core.provenance import read_provenance
 from xrd_tools.io import ProcessedScan, iter_frame_records
 from xrd_tools.session.frame_record_store import FrameRecordStore
+from xrd_tools.session.scan_norm import (
+    empty_norm_aggregate,
+    fold_norm_metadata,
+    next_norm_revision,
+)
 
 from ..browse_values import (
     BrowseCleanupReceipt,
@@ -586,6 +591,12 @@ class BrowseLoader:
         publications = PublicationStore(max_items=self._max_items)
         labels: list[int] = []
         first = None
+        # E6-NORM-N1: ONE revision-0 draft folded once per accepted record in
+        # this sole pass; the single advance happens only after the complete
+        # noncancelled, nonempty pass and travels with the ready context.
+        draft = empty_norm_aggregate(
+            (request.token, scan_key, request.source_path)
+        )
         for record in self._read_records(request.source_path):
             if cancelled.is_set():
                 records.clear()
@@ -594,6 +605,7 @@ class BrowseLoader:
             if type(record.label) is not int:
                 raise TypeError("processed frame labels must be integers")
             view = record.active_view()
+            draft = fold_norm_metadata(draft, view.metadata_numeric)
             source = f"{view.source_path or request.source_path}#{record.label}"
             records.upsert(
                 record, source_identity=source, persisted=True
@@ -625,6 +637,7 @@ class BrowseLoader:
             viewer_rows_2d={},
             publication_store=publications,
             record_store=records,
+            norm_aggregate=next_norm_revision(draft),
         )
         context.adopt_load_request(request)
         persisted = read_provenance(request.source_path)

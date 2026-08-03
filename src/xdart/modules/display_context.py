@@ -778,6 +778,11 @@ class BrowseContext(_WriteOnceIdentity):
     #: acquisition's scan-qualified record store.  Present so the swap surface
     #: is complete by construction rather than by omission.
     record_store: object = None
+    #: The whole-scan normalization aggregate folded by the ONE loader pass
+    #: (E6-NORM-N1): an object-typed, write-once construction value.  This
+    #: module never imports the value's own module or an array library; the
+    #: consumer boundary validates the exact type.
+    norm_aggregate: object = None
     #: This context's commit authority (§9.2.4).  Created with the context and
     #: cancelled by its own lifecycle — one per owner, not a new authority.
     commit_gate: CommitGate = field(default_factory=CommitGate)
@@ -804,6 +809,8 @@ class BrowseContext(_WriteOnceIdentity):
         "context_token", "load_generation", "operation", "requested_path",
         "scan_key", "scan", "frame", "frame_ids", "frames", "viewer_rows_1d",
         "viewer_rows_2d", "publication_store", "record_store",
+        # E6-NORM-N1: the aggregate travels with the context, write-once.
+        "norm_aggregate",
         # §10.2: one gate, created with the context and mutated only through
         # its own methods — never replaceable by assignment.
         "commit_gate",

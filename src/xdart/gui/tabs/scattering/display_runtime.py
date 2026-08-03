@@ -40,6 +40,12 @@ from xrd_tools.session.hydration import (
     HydrationScope,
     HydrationToken,
 )
+from xrd_tools.session.scan_norm import (
+    ScanNormAggregate,
+    empty_norm_aggregate,
+    fold_norm_metadata,
+    next_norm_revision,
+)
 
 from .display_values import (
     DisplayFrameCatalog,
@@ -109,6 +115,11 @@ class DisplayArtifact:
     saturation_mask: np.ndarray | None = None
     saturation_mask_seeded: bool = False
     wavelength_m: float | None = None
+    #: The per-artifact whole-scan normalization aggregate (E6-NORM-N1).
+    #: ``None`` until the first successful live retain; assigned only at the
+    #: successful tail of :meth:`RunDisplayState.retain_frame`, so revision 0
+    #: is never observable and a failed retain leaves the prior value.
+    norm_aggregate: ScanNormAggregate | None = None
 
 
 class RunDisplayState:
@@ -326,6 +337,21 @@ class RunDisplayState:
                 self._frame_mask_qualified.add(key)
             else:
                 self._frame_mask_qualified.discard(key)
+            # H10 fold (§25.2): draft from the artifact's current aggregate,
+            # fold the accepted publication's admitted numeric metadata once,
+            # and publish with ONE revision advance only at the successful
+            # transaction tail — a failed retain leaves the prior aggregate.
+            draft = owner.norm_aggregate
+            if draft is None:
+                draft = empty_norm_aggregate((
+                    self.identity.generation,
+                    self.identity.fingerprint,
+                    str(owner.artifact),
+                    owner.source_scan,
+                ))
+            draft = fold_norm_metadata(
+                draft, publication.view.metadata_numeric
+            )
             # Residency rollback captures and restores the complete four-tier
             # order under this same lock. Keep the live producer's stores,
             # publication, and residency touch in that ownership boundary so
@@ -349,6 +375,23 @@ class RunDisplayState:
                 publications=owner.publications,
             )
             self._residency.enforce()
+            owner.norm_aggregate = next_norm_revision(draft)
+
+    def frame_norm_aggregate(
+        self, key: DisplayFrameKey
+    ) -> ScanNormAggregate | None:
+        """The exact-frame read of the per-artifact aggregate (E6-NORM-N1).
+
+        A foreign run identity, artifact or source scan returns ``None``;
+        callers never traverse ``artifacts`` to reconstruct normalization.
+        """
+        with self._lock:
+            if key.run_identity != self.identity:
+                return None
+            owner = self.artifacts.get(key.artifact)
+            if owner is None or owner.source_scan != key.source_scan:
+                return None
+            return owner.norm_aggregate
 
     def residency_snapshot(self) -> DisplayResidencySnapshot:
         return self._residency.snapshot()
