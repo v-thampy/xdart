@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 
 from .frame import LiveFrame
 from .frame_series import LiveFrameSeries
+from xrd_tools.io.output_path import default_output_path
 from xdart import utils
 from xdart.modules.live_compat import normalize_live_class_names
 from xdart.modules.wavelength import (
@@ -135,7 +136,9 @@ class LiveScan:
         else:
             self.name = name
         if data_file is None:
-            self.data_file = name + ".nxs"
+            # P4/OUT-1: a generated default target comes from the shared
+            # output-path owner; an explicit data_file is preserved exactly.
+            self.data_file = os.fspath(default_output_path("", name))
         else:
             self.data_file = data_file
 

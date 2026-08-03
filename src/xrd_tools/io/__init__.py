@@ -1,3 +1,11 @@
+from xrd_tools.io.output_path import (
+    LEGACY_OUTPUT_SUFFIX,
+    NEW_OUTPUT_SUFFIX,
+    READABLE_OUTPUT_SUFFIXES,
+    default_output_path,
+    is_readable_output_path,
+    resolve_output_target,
+)
 from xrd_tools.io.metadata import (
     read_image_metadata,
     read_pdi_metadata,

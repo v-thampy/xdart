@@ -31,6 +31,8 @@ from pathlib import Path
 
 import numpy as np
 
+from xrd_tools.io.output_path import NEW_OUTPUT_SUFFIX
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -42,7 +44,7 @@ __all__ = [
     "load_processed_raw_or_thumbnail",
 ]
 
-_HDF5_SUFFIXES = (".h5", ".hdf5", ".nxs", ".cxi")
+_HDF5_SUFFIXES = (".h5", ".hdf5", ".nxs", ".cxi", NEW_OUTPUT_SUFFIX)
 
 # Raw-detector dataset candidates (mirrors the GUI's old _is_xdart_processed).
 # ``entry/data/eiger_image`` is the embedded Bluesky/apstools NXWriter detector

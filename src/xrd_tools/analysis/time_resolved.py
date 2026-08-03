@@ -20,6 +20,7 @@ import xarray as xr
 
 from xrd_tools.analysis.axis_units import canonical_q_unit, require_inverse_angstrom
 from xrd_tools.io import (
+    READABLE_OUTPUT_SUFFIXES,
     get_1d,
     get_2d,
     get_metadata,
@@ -60,7 +61,7 @@ def _natural_key(path: Path) -> tuple:
 def discover_processed_scans(
     directory: str | Path,
     *,
-    pattern: str = "*.nxs",
+    pattern: str | None = None,
     recursive: bool = False,
 ) -> list[Path]:
     """Return naturally sorted processed 1-D NeXus files under ``directory``.
@@ -68,11 +69,21 @@ def discover_processed_scans(
     Acquisition NeXus files and unrelated ``.nxs`` files can live beside
     processed results.  Inspect only their lightweight metadata here; the 1-D
     stacks remain untouched until :func:`load_time_resolved_series` is called.
+
+    By default every readable output suffix is discovered (``.nexus`` and
+    ``.nxs``), so a directory holding both new and legacy results is ordered as
+    one natural series.  An explicitly passed ``pattern`` keeps its exact
+    meaning and narrows discovery to that glob alone.
     """
     root = Path(directory).expanduser()
     if not root.is_dir():
         raise NotADirectoryError(root)
-    paths = root.rglob(pattern) if recursive else root.glob(pattern)
+    patterns = ([pattern] if pattern is not None
+                else [f"*{suffix}" for suffix in READABLE_OUTPUT_SUFFIXES])
+    paths: list[Path] = []
+    for glob_pattern in patterns:
+        paths.extend(root.rglob(glob_pattern) if recursive
+                     else root.glob(glob_pattern))
     processed: list[Path] = []
     for path in paths:
         if not path.is_file():

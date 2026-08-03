@@ -18,10 +18,19 @@ import h5py
 import numpy as np
 from joblib import Parallel, delayed
 
+from xrd_tools.io.output_path import NEW_OUTPUT_SUFFIX
+
 logger = logging.getLogger(__name__)
 
 SUPPORTED_EXTS = {".edf", ".tif", ".tiff", ".cbf", ".img", ".mar3450",
                   ".h5", ".hdf5", ".nxs", ".raw"}
+
+# HDF5/NeXus-family suffixes for EXPLICIT reads.  ``.nexus`` belongs here (an
+# explicitly opened processed output must read) but deliberately NOT in
+# SUPPORTED_EXTS, which drives RAW discovery (find_image_files,
+# sources.discover, sources.registry._image_is_candidate) — .nexus is
+# output-only and must never be discovered as a raw input (P4/OUT-1).
+_HDF5_READ_EXTS = {".h5", ".hdf5", ".nxs", NEW_OUTPUT_SUFFIX}
 
 # Established detector layouts for headerless binary frames.  This table is a
 # headless I/O capability shared by the GUI and every FrameSource; matching is
@@ -261,7 +270,7 @@ def read_image(
         arr = _read_hdf5_frame(path, frame, dataset_path, exact=exact_frame)
     elif ext in {".h5", ".hdf5"} and _is_eiger_master(path):
         arr = _read_fabio_frame(path, frame, exact=exact_frame)
-    elif ext in {".h5", ".hdf5", ".nxs"}:
+    elif ext in _HDF5_READ_EXTS:
         # Reject processed xdart scan files up front (before fabio, which
         # might otherwise pick up a reduced dataset) — they carry no raw
         # detector image; callers should use io.read.get_raw_frame.
@@ -315,7 +324,7 @@ def read_image_stack(
     ext = path.suffix.lower()
 
     if reduce in {"mean", "sum"}:
-        if ext in {".h5", ".hdf5", ".nxs"} and not _is_eiger_master(path):
+        if ext in _HDF5_READ_EXTS and not _is_eiger_master(path):
             _reject_if_processed_xdart(path)
         return _reduce_image_stack(
             path,
@@ -325,7 +334,7 @@ def read_image_stack(
             reduce=reduce,
         )
 
-    if ext in {".h5", ".hdf5", ".nxs"} and not _is_eiger_master(path):
+    if ext in _HDF5_READ_EXTS and not _is_eiger_master(path):
         _reject_if_processed_xdart(path)
         # Non-Eiger HDF5 / NeXus — try fabio first, fall back to h5py
         try:
@@ -540,7 +549,7 @@ def count_frames(path: Path | str) -> int:
     path = Path(path)
     ext = path.suffix.lower()
     try:
-        if ext == ".nxs" and not _is_eiger_master(path):
+        if ext in {".nxs", NEW_OUTPUT_SUFFIX} and not _is_eiger_master(path):
             # .nxs: h5py FIRST — fabio has no reader for NeXus container
             # layouts (Bluesky/NXWriter, beamline scan files) and fails
             # SLOWLY (a full per-format parse attempt, ~0.5 s/file on a
@@ -572,7 +581,7 @@ def count_frames(path: Path | str) -> int:
                 with h5py.File(path, "r") as f:
                     ds = _find_hdf5_image_dataset(f)
                     return ds.shape[0] if ds.ndim >= 3 else 1
-        elif ext in {".h5", ".hdf5", ".nxs"}:
+        elif ext in _HDF5_READ_EXTS:
             # Eiger-master-named HDF5: fabio first, h5py fallback — the
             # bl17-2 *_master.h5 NXWriter files are not Eiger-shaped and
             # fabio rejects them (DIR-2b); the h5py finder reads them.
@@ -592,7 +601,7 @@ def count_frames(path: Path | str) -> int:
         # directories).  That is a normal zero-frame classification, not a
         # damaged file.  Keep genuinely unreadable/torn containers on the
         # warning path below.
-        if (ext in {".h5", ".hdf5", ".nxs"}
+        if (ext in _HDF5_READ_EXTS
                 and str(exc).startswith("No 2-D+ dataset found")):
             logger.debug("No detector image dataset in %s", path)
             return 0

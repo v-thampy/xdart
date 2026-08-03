@@ -30,6 +30,7 @@ import h5py
 import numpy as np
 
 from xrd_tools.io.export import write_h5
+from xrd_tools.io.output_path import default_output_path
 from xrd_tools.io.image import (
     SUPPORTED_EXTS,
     count_frames,
@@ -310,7 +311,7 @@ def process_series(
     n = len(scan_paths)  # type: ignore[arg-type]
     for i, raw_path in enumerate(scan_paths, start=1):
         scan_path = _as_path(raw_path)
-        out_h5 = out_dir / f"{scan_path.stem}_processed.nxs"
+        out_h5 = default_output_path(out_dir, f"{scan_path.stem}_processed")
         logger.info("[%d/%d] Processing %s", i, n, scan_path.name)
         try:
             out = process_scan(
@@ -470,7 +471,7 @@ class DirectoryWatcher:
             self._on_file_found(path)
             
         self._processed.add(path)
-        out_h5 = self._output_dir / f"{path.stem}_processed.nxs"
+        out_h5 = default_output_path(self._output_dir, f"{path.stem}_processed")
         logger.info("DirectoryWatcher: new file detected: %s", path)
         
         def _prog_cb(num_done: int, num_total: int) -> None:
