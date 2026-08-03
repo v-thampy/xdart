@@ -621,6 +621,12 @@ class BrowseLoader:
             labels.append(record.label)
             if first is None:
                 first = view
+        # Cancellation may arrive as the iterator reports exhaustion after its
+        # final yield.  Recheck before the one revision bump/context publish.
+        if cancelled.is_set():
+            records.clear()
+            publications.clear()
+            return None
         if not labels:
             raise ValueError("processed browse artifact has no frames")
         context = BrowseContext(

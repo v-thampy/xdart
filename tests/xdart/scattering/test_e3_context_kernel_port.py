@@ -26,7 +26,7 @@ from xdart.modules.display_context import (
 # hydration purpose/token; that accepted E4-S image (kept below as the
 # superseded ancestry record) was in turn superseded by E6-NORM-N1, which
 # adds exactly the ONE write-once ``norm_aggregate`` construction field to
-# the browse context (handoff §25.1).  The live pin names the N1 bytes; a
+# the browse context (handoff §25.1).  The live pin names the E6-NORM-N1 bytes; a
 # commit cannot contain its own hash, so the commit->blob ancestry leg stays
 # asserted for the accepted E4-S object.
 _E4S_COMMIT = "72b7b08efd4d24df0f74aa462a4b1766a97be6b2"

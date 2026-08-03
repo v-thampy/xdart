@@ -335,6 +335,22 @@ def test_injected_retain_failure_leaves_the_exact_prior_aggregate():
     assert dict(recovered.channels) == {"mon": (5.0, 2)}
 
 
+def test_late_residency_failure_leaves_the_exact_prior_aggregate(monkeypatch):
+    display, owner = _display()
+    _retain(display, owner, 1, {"mon": 2.0})
+    prior = owner.norm_aggregate
+
+    def fail_after_publication():
+        raise _InjectedRetainFailure("armed late residency failure")
+
+    monkeypatch.setattr(display._residency, "enforce", fail_after_publication)
+    with pytest.raises(_InjectedRetainFailure):
+        _retain(display, owner, 2, {"mon": 100.0})
+    assert owner.norm_aggregate is prior
+    assert (prior.revision, prior.row_count) == (1, 1)
+    assert dict(prior.channels) == {"mon": (2.0, 1)}
+
+
 def test_projection_and_redraw_paths_do_not_change_count_or_revision():
     display, owner = _display()
     key = _retain(display, owner, 1, {"mon": 2.0})
@@ -462,11 +478,28 @@ def test_browse_cancellation_failure_and_empty_input_publish_nothing(
     )
     assert loader._read_context(request, scan_key, cancelled) is None
 
+    exhausted = Event()
+
+    def _cancel_after_final_record(_path):
+        yield records[0]
+        exhausted.set()
+
+    exhausted_request = BrowseLoadRequest("browse-tail-cancel", 7, source)
+    exhausted_loader = BrowseLoader(
+        open_scan=lambda _path: _BrowseScan(),
+        read_records=_cancel_after_final_record,
+    )
+    exhausted_context = exhausted_loader._read_context(
+        exhausted_request, scan_key, exhausted
+    )
+    assert exhausted.is_set()
+    assert exhausted_context is None
+
     def _failing_records(_path):
         yield records[0]
         raise RuntimeError("reader failure")
 
-    failing_request = BrowseLoadRequest("browse-fail", 7, source)
+    failing_request = BrowseLoadRequest("browse-fail", 8, source)
     failing_loader = BrowseLoader(
         open_scan=lambda _path: _BrowseScan(),
         read_records=_failing_records,
@@ -474,7 +507,7 @@ def test_browse_cancellation_failure_and_empty_input_publish_nothing(
     with pytest.raises(RuntimeError):
         failing_loader._read_context(failing_request, scan_key, Event())
 
-    empty_request = BrowseLoadRequest("browse-empty", 8, source)
+    empty_request = BrowseLoadRequest("browse-empty", 9, source)
     empty_loader = BrowseLoader(
         open_scan=lambda _path: _BrowseScan(),
         read_records=lambda _path: iter(()),
@@ -560,6 +593,27 @@ def test_no_attachment_beyond_the_two_retention_owners(tmp_path):
     assert type(context.norm_aggregate) is ScanNormAggregate
 
 
+def test_browse_record_reader_is_invoked_once(tmp_path):
+    source = _artifact_file(tmp_path, "scan_0005.nxs")
+    request = BrowseLoadRequest("browse-one-reader", 14, source)
+    records = _records([{"mon": 2.0}, {"mon": 3.0}])
+    calls = []
+
+    def read_records(path):
+        calls.append(path)
+        return iter(records)
+
+    loader = BrowseLoader(
+        open_scan=lambda _path: _BrowseScan(),
+        read_records=read_records,
+    )
+    context = loader._read_context(
+        request, canonical_browse_scan_key(source), Event()
+    )
+    assert type(context) is BrowseContext
+    assert calls == [source]
+
+
 def test_census_single_fold_sites_one_browse_pass_no_forbidden_routes():
     sources = {name: path.read_text() for name, path in PRODUCTION.items()}
     for name, source in sources.items():
@@ -621,6 +675,22 @@ def test_census_single_fold_sites_one_browse_pass_no_forbidden_routes():
     assert _enclosing_functions(browse_tree, browse_folds) == [
         "_read_context"
     ]
+    for tree in (display_tree, browse_tree):
+        fold_symbol_loads = [
+            node
+            for node in ast.walk(tree)
+            if (
+                isinstance(node, ast.Name)
+                and node.id == "fold_norm_metadata"
+                and isinstance(node.ctx, ast.Load)
+            )
+            or (
+                isinstance(node, ast.Attribute)
+                and node.attr == "fold_norm_metadata"
+                and isinstance(node.ctx, ast.Load)
+            )
+        ]
+        assert len(fold_symbol_loads) == 1
     assert "fold_norm_metadata" not in sources["run_executor"]
     assert "norm_aggregate" not in sources["run_executor"]
     assert "metadata_numeric" in sources["display_runtime"]
@@ -640,3 +710,13 @@ def test_census_single_fold_sites_one_browse_pass_no_forbidden_routes():
     ]
     assert len(read_loops) == 1
     assert len(read_calls) == 1
+    read_symbol_loads = [
+        node
+        for node in ast.walk(browse_tree)
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "_read_records"
+            and isinstance(node.ctx, ast.Load)
+        )
+    ]
+    assert len(read_symbol_loads) == 1

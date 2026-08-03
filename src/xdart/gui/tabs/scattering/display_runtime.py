@@ -337,7 +337,7 @@ class RunDisplayState:
                 self._frame_mask_qualified.add(key)
             else:
                 self._frame_mask_qualified.discard(key)
-            # H10 fold (§25.2): draft from the artifact's current aggregate,
+            # E6-NORM-N1 (§25.2): draft from the artifact's current aggregate,
             # fold the accepted publication's admitted numeric metadata once,
             # and publish with ONE revision advance only at the successful
             # transaction tail — a failed retain leaves the prior aggregate.
