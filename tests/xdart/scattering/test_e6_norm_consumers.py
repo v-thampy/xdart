@@ -15,12 +15,19 @@ candidate per refresh through the Q2 ``accepts_norm_aggregate`` gate;
 object; ``trace_projection`` divides each admitted payload's new 1-D array
 by its OWN ``resolve_monitor_norm`` value before scaling and Sum/Average;
 identity, revision and the effective channel enter both delta scopes.
+
+E6-NORM-N2 correction 1 (handoff §27): the cross-token refused-switch rows
+and the reserved-sentinel row were frozen RED on the exact held candidate
+``19aeb62a345e79d415b2fff068347aa723ba6b96``; the fail-closed divisor
+matrix, the alias-hardened census and the real four-route consumer parity
+node are §27.3 oracle completion.
 """
 
 from __future__ import annotations
 
 import ast
 import os
+import re
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -68,10 +75,12 @@ from xdart.modules.display_context import (
 )
 from xdart.modules.frame_publication import FramePublication, PublicationStore
 from xrd_tools.core import Axis, FrameRecord, FrameView
+from xrd_tools.core.metadata import resolve_monitor_norm
 from xrd_tools.session.display_logic import nanmean_slice
 from xrd_tools.session.frame_record_store import FrameRecordStore
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.session.scan_norm import (
+    channel_is_partial,
     empty_norm_aggregate,
     fold_norm_metadata,
     next_norm_revision,
@@ -485,6 +494,39 @@ def test_case_alias_selection_divides_native_and_cake_traces_per_payload():
     np.testing.assert_allclose(values[2], nanmean_slice(cake, 0) / 4.0)
 
 
+@pytest.mark.parametrize(
+    "bad",
+    (
+        pytest.param({}, id="missing"),
+        pytest.param({"mon": None}, id="none"),
+        pytest.param({"mon": "wat"}, id="nonnumeric"),
+        pytest.param({"mon": float("nan")}, id="nan"),
+        pytest.param({"mon": 0.0}, id="zero"),
+        pytest.param({"mon": -3.0}, id="negative"),
+    ),
+)
+def test_complete_channel_with_bad_payload_divisor_fails_closed(bad) -> None:
+    # §27.3 completion: the accepted aggregate says ``mon`` is complete,
+    # but THIS admitted payload's own row cannot divide.  The effective
+    # ``mon`` selection stays, and that one trace fails CLOSED — never a
+    # substituted divisor 1.0, never an unnormalized trace under an
+    # ``I / mon`` label.
+    parts = _fabricated([(1, 1.0, {"mon": 2.0}), (2, 2.0, bad)])
+    complete = _kernel_aggregate(
+        _acq_identity(parts.identity, ARTIFACT, SCAN),
+        [{"mon": 2.0}, {"mon": 4.0}],
+    )
+    state = _build(
+        parts.payloads, parts.navigation, _prefs(norm_channel="mon"),
+        complete,
+    )
+    assert state.norm_channel == "mon"
+    assert state.norm_revision == 1
+    values = _trace_by_label(state)
+    assert set(values) == {1}
+    np.testing.assert_allclose(values[1], np.array([1.0, 2.0]) / 2.0)
+
+
 def test_unknown_and_partial_selection_are_the_global_unnormalized_fallback():
     parts = _fabricated(
         [(1, 1.0, {"mon": 2.0, "bstop": 3.0}), (2, 2.0, {"mon": 4.0})]
@@ -498,6 +540,49 @@ def test_unknown_and_partial_selection_are_the_global_unnormalized_fallback():
         values = _trace_by_label(state)
         np.testing.assert_array_equal(values[1], np.array([1.0, 2.0]))
         np.testing.assert_array_equal(values[2], np.array([2.0, 3.0]))
+
+
+def test_reserved_sentinel_channel_is_neither_offered_nor_effective():
+    # §27.2 blocker 2 (§25.3 amended): a complete metadata channel that
+    # canonicalizes to ``norm channel`` collides with the display
+    # placeholder.  It is reserved case-insensitively — never offered,
+    # never effective — and DEFAULT preferences must not silently divide.
+    # With the colliding channel ALONE, choices are EXACTLY the
+    # placeholder: no duplicate-looking entry survives in any form.
+    alone = _fabricated(
+        [(1, 1.0, {"Norm Channel": 2.0}), (2, 2.0, {"norm channel": 4.0})]
+    )
+    parts = _fabricated(
+        [(1, 1.0, {"Norm Channel": 2.0, "mon": 3.0}),
+         (2, 2.0, {"norm channel": 4.0, "mon": 6.0})]
+    )
+    for prefs in (_prefs(), _prefs(norm_channel="NORM CHANNEL")):
+        state = _build(
+            alone.payloads, alone.navigation, prefs, alone.aggregate
+        )
+        assert state.norm_channels == (PLACEHOLDER,)
+        assert state.norm_channel == PLACEHOLDER
+        values = _trace_by_label(state)
+        np.testing.assert_array_equal(values[1], np.array([1.0, 2.0]))
+        np.testing.assert_array_equal(values[2], np.array([2.0, 3.0]))
+        state = _build(
+            parts.payloads, parts.navigation, prefs, parts.aggregate
+        )
+        assert state.norm_channels == (PLACEHOLDER, "mon")
+        assert state.norm_channel == PLACEHOLDER
+        values = _trace_by_label(state)
+        np.testing.assert_array_equal(values[1], np.array([1.0, 2.0]))
+        np.testing.assert_array_equal(values[2], np.array([2.0, 3.0]))
+    # The reservation is surgical: a genuine channel beside the colliding
+    # key still divides each payload by its own row.
+    state = _build(
+        parts.payloads, parts.navigation, _prefs(norm_channel="mon"),
+        parts.aggregate,
+    )
+    assert state.norm_channel == "mon"
+    values = _trace_by_label(state)
+    np.testing.assert_allclose(values[1], np.array([1.0, 2.0]) / 3.0)
+    np.testing.assert_allclose(values[2], np.array([2.0, 3.0]) / 6.0)
 
 
 @pytest.mark.parametrize(
@@ -571,6 +656,69 @@ def test_browse_refusals_are_independent_and_cannot_change_presentation(
     # what is presented, in either direction.
     _project(parts, prefs)
     assert parts.runtime.norm_aggregate is admitted
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    ("invalidated", "released", "cancelled_gate", "stale_selection"),
+)
+def test_refused_new_browse_context_cannot_expose_the_prior_token(
+    refusal: str,
+) -> None:
+    # §27.2 blocker 1: ``adopt_browse`` installs a NEW token over the same
+    # scan/path.  If the new context is refused before its FIRST capture,
+    # the held prior-token aggregate is foreign to the currently owned
+    # context and must clear — Browse frame coverage compares only
+    # scan/path, so a stale hold would divide the new context's frames.
+    prefs = _prefs(norm_channel="mon")
+    b1 = _browse_parts()
+    _project(b1, prefs)
+    assert b1.runtime.norm_aggregate is b1.aggregate
+    b2 = _browse_parts(with_aggregate=False)
+    b1.runtime.adopt_browse(b2.context, b2.request)
+    if refusal == "invalidated":
+        b2.context.invalidate()
+    elif refusal == "released":
+        b2.context.release()
+    elif refusal == "cancelled_gate":
+        b2.context.commit_gate.cancel()
+    else:
+        third = _browse_parts(
+            scan_key="browse.z", path="/processed/z.nxs",
+            with_aggregate=False,
+        )
+        b1.runtime._selection = DisplaySelection.for_context(
+            third.context, 99
+        )
+    payloads = _project(b1, prefs)
+    assert b1.runtime.norm_aggregate is None
+    state = _build(
+        payloads, b1.runtime.navigation, prefs,
+        b1.runtime.norm_aggregate,
+    )
+    assert state.norm_channel == PLACEHOLDER
+
+
+def test_pending_replacement_retains_the_outgoing_presentation():
+    # §25.3, preserved by correction 1: during _PendingBrowseReplacement
+    # the OUTGOING presentation — navigation AND the held aggregate — is
+    # deliberately retained.  Capture is a strict no-op there, never a
+    # clear.
+    prefs = _prefs(norm_channel="mon")
+    b1 = _browse_parts()
+    _project(b1, prefs)
+    assert b1.runtime.norm_aggregate is b1.aggregate
+    b1.context.release()
+    replacement = BrowseLoadRequest(
+        new_context_token(ContextKind.BROWSE), 4, "/processed/next.nxs"
+    )
+    b1.runtime.begin_replacement(replacement)
+    _project(b1, prefs)
+    assert b1.runtime.norm_aggregate is b1.aggregate
+    state = _build(
+        (), b1.runtime.navigation, prefs, b1.runtime.norm_aggregate
+    )
+    assert state.norm_channel == "mon"
 
 
 def test_same_channel_foreign_artifact_cannot_cross_and_span_falls_back():
@@ -1167,50 +1315,100 @@ def test_census_one_capture_one_borrow_no_second_read_no_forbidden_routes():
     assert resolver_calls["context_projection"] == 0
     assert resolver_calls["scientific_view"] == 0
 
+    # §27.3 hardening: import-alias, module-attribute and string-getattr
+    # routes must not evade the one-resolver/one-divisor census.  Token
+    # counts pin EVERY textual occurrence of the symbols — imports, calls,
+    # strings — so an aliased or getattr-string second route changes the
+    # count even when the AST name census cannot see it.
+    def _token_count(source, symbol):
+        return len(
+            re.findall(
+                rf"(?<![A-Za-z0-9_]){re.escape(symbol)}(?![A-Za-z0-9_])",
+                source,
+            )
+        )
+
+    assert {
+        name: _token_count(source, "resolve_norm_presentation")
+        for name, source in sources.items()
+    } == {
+        "context_runtime": 2,      # one import, one scope call
+        "shell_projection": 2,     # one import, one projection call
+        "scientific_axes": 2,      # the def and its __all__ export
+        "context_controller": 0,
+        "page": 0,
+        "context_projection": 0,
+        "shell_values": 0,
+        "scientific_view": 0,
+    }
+    assert {
+        name: _token_count(source, "resolve_monitor_norm")
+        for name, source in sources.items()
+    } == {name: (2 if name == "scientific_axes" else 0)
+          for name in PRODUCTION}
+    assert {
+        name: _token_count(source, "frame_norm_aggregate")
+        for name, source in sources.items()
+    } == {name: (1 if name == "context_runtime" else 0)
+          for name in PRODUCTION}
+    for symbol in ("resolve_norm_presentation", "resolve_monitor_norm"):
+        for name, tree in trees.items():
+            assert not _attribute_loads(tree, symbol), (name, symbol)
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    for alias in node.names:
+                        if alias.name.split(".")[-1] == symbol:
+                            assert alias.asname is None, (name, symbol)
+
+
+def _browse_load(path: Path, generation: int):
+    from xdart.gui.tabs.scattering.adapters.browse_loader import BrowseLoader
+
+    loader = BrowseLoader()
+    request = BrowseLoadRequest(
+        new_context_token(ContextKind.BROWSE), generation, str(path)
+    )
+    assert loader.begin(request) is request
+    deadline = time.monotonic() + 120.0
+    outcome = None
+    while time.monotonic() < deadline:
+        outcome = loader.poll(request)
+        if outcome is not None:
+            break
+        time.sleep(0.05)
+    assert outcome is not None and (
+        outcome.status is BrowseLoadStatus.READY
+    ), f"browse load did not become ready for {path}"
+    context = loader.consume(outcome)
+    assert type(context) is BrowseContext
+    return context, request
+
 
 @pytest.mark.skipif(
     not os.environ.get("XDART_TEST_DATA"),
     reason=(
-        "XDART_TEST_DATA not set: real Standard/GI/Browse/reload "
-        "normalization parity needs the real data root"
+        "XDART_TEST_DATA not set: real Browse/reload aggregate fold "
+        "parity needs the real data root"
     ),
 )
-def test_real_standard_gi_browse_reload_norm_parity():
-    from xdart.gui.tabs.scattering.adapters.browse_loader import BrowseLoader
-
+def test_real_browse_reload_aggregate_fold_parity():
+    # Renamed by §27.3: this node loads Browse twice and compares kernel
+    # aggregate FACTS against an independent fold.  It does NOT drive
+    # Standard/GI consumer traces — that claim belongs to
+    # test_real_standard_gi_browse_reload_consumer_trace_parity below.
     root = Path(os.environ["XDART_TEST_DATA"])
     candidates = sorted(root.rglob("*.nxs"))
     assert candidates, f"no .nxs artifact under {root}"
 
-    def _load(path: Path, generation: int):
-        loader = BrowseLoader()
-        request = BrowseLoadRequest(
-            new_context_token(ContextKind.BROWSE), generation, str(path)
-        )
-        assert loader.begin(request) is request
-        deadline = time.monotonic() + 120.0
-        outcome = None
-        while time.monotonic() < deadline:
-            outcome = loader.poll(request)
-            if outcome is not None:
-                break
-            time.sleep(0.05)
-        assert outcome is not None and (
-            outcome.status is BrowseLoadStatus.READY
-        ), f"browse load did not become ready for {path}"
-        context = loader.consume(outcome)
-        assert type(context) is BrowseContext
-        return context
-
     context = None
     for candidate in candidates:
         try:
-            context = _load(candidate, 1)
+            context, _ = _browse_load(candidate, 1)
             break
         except AssertionError:
             continue
     assert context is not None, "no loadable real artifact"
-    reloaded = _load(Path(context.requested_path), 2)
+    reloaded, _ = _browse_load(Path(context.requested_path), 2)
     first = context.norm_aggregate
     second = reloaded.norm_aggregate
     assert first is not None and second is not None
@@ -1227,3 +1425,202 @@ def test_real_standard_gi_browse_reload_norm_parity():
     expected = next_norm_revision(expected)
     assert first.row_count == expected.row_count
     assert dict(first.channels) == dict(expected.channels)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("XDART_TEST_DATA"),
+    reason=(
+        "XDART_TEST_DATA not set: real Standard/GI/Browse/reload consumer "
+        "trace parity needs the real data root"
+    ),
+)
+def test_real_standard_gi_browse_reload_consumer_trace_parity():
+    # §27.3: drive the PRODUCTION N2 consumer — runtime capture through
+    # the Q2 gate, the one shared resolution, per-payload division — over
+    # ONE real processed artifact on all four routes (acquisition
+    # Standard, acquisition GI, Browse, Browse reload) and compare every
+    # normalized trace against an independent kernel division of the same
+    # real records.
+    root = Path(os.environ["XDART_TEST_DATA"])
+    candidates = sorted(root.rglob("*.nxs"))
+    assert candidates, f"no .nxs artifact under {root}"
+
+    def _usable_channel(context):
+        aggregate = context.norm_aggregate
+        if aggregate is None or aggregate.revision != 1:
+            return None
+        records = [
+            context.record_store.get(int(label))
+            for label in context.frame_ids
+        ]
+        if not records or any(record is None for record in records):
+            return None
+        rows = [record.active_view() for record in records]
+        if any(view.intensity_1d is None for view in rows):
+            return None
+        for key in ("mon", *aggregate.channels):
+            if key not in aggregate.channels:
+                continue
+            if channel_is_partial(aggregate, key):
+                continue
+            if all(
+                resolve_monitor_norm(view.metadata_numeric, key)
+                is not None
+                for view in rows
+            ):
+                return key
+        return None
+
+    browse = browse_request = channel = None
+    for candidate in candidates:
+        try:
+            context, request = _browse_load(candidate, 1)
+        except AssertionError:
+            continue
+        key = _usable_channel(context)
+        if key is not None and 2 <= len(context.frame_ids) <= 16:
+            browse, browse_request, channel = context, request, key
+            break
+    assert browse is not None and channel is not None, (
+        "four-route real parity is UNVERIFIED: no loadable artifact with "
+        "a complete, positively-resolvable channel and 2..16 frames"
+    )
+    views = {
+        int(label): browse.record_store.get(int(label)).active_view()
+        for label in browse.frame_ids
+    }
+    expected_traces = {}
+    for label, view in views.items():
+        divisor = resolve_monitor_norm(view.metadata_numeric, channel)
+        expected_traces[label] = np.asarray(view.intensity_1d) / divisor
+    prefs = _prefs(plot_mode="Overlay", norm_channel=channel.upper())
+
+    def _browse_route(context, request):
+        runtime = _ContextRuntime()
+        runtime.adopt_browse(context, request)
+        assert runtime.select_latest_navigation(plot_mode="Overlay")
+        runtime.project_navigation(
+            ContextProjection(), preferences=prefs,
+            processing_mode="Int 2D",
+        )
+        captured = runtime.norm_aggregate
+        assert captured is context.norm_aggregate
+        payloads = tuple(
+            StandardDisplayPayload(
+                0, frame, f"Browse · {frame.local_frame_label}",
+                views[frame.local_frame_label],
+            )
+            for frame in runtime.navigation.frames
+        )
+        return _build(payloads, runtime.navigation, prefs, captured)
+
+    def _acquisition_route(gi: bool):
+        configuration = _configuration(gi=gi)
+        identity = RunIdentity.from_configuration(configuration)
+        display = RunDisplayState(identity, max_payload_items=16)
+        display.set_factories(FrameRecordStore, PublicationStore)
+        display.configure(
+            partition_count=1, npt=1000, frame_bytes=8000
+        )
+        artifact = str(browse.requested_path)
+        scan_key = browse.scan_key
+        mode = "GI" if gi else "Standard"
+        owner = display.add_artifact(
+            Path(artifact),
+            scan_key,
+            mask=None,
+            mask_saturation=True,
+            measurement_mode=mode,
+            gi_incidence_motor="th" if gi else "",
+            gi_resolved_motor="th" if gi else "",
+            gi_mode_1d="q_total" if gi else "",
+            gi_mode_2d="qip_qoop" if gi else "",
+        )
+        for label, view in sorted(views.items()):
+            record = FrameRecord.from_view(view)
+            publication = FramePublication(
+                view,
+                record=record,
+                source_identity=f"{artifact}#{label}",
+                scan_key=scan_key,
+            )
+            delta = display.append_navigation(scan_key, artifact, label)
+            display.retain_frame(
+                owner,
+                delta.appended,
+                record,
+                publication,
+                source_identity=publication.source_identity,
+                frame_mask_qualified=False,
+            )
+            display.put_payload(
+                StandardDisplayPayload(
+                    0,
+                    delta.appended,
+                    f"{mode} · {scan_key} · {label}",
+                    view,
+                    measurement_mode=mode,
+                    gi_incidence_motor="th" if gi else "",
+                    gi_resolved_motor="th" if gi else "",
+                    gi_mode_1d="q_total" if gi else "",
+                    gi_mode_2d="qip_qoop" if gi else "",
+                )
+            )
+        context = AcquisitionContext(
+            context_token=new_context_token(ContextKind.ACQUISITION),
+            run_configuration=configuration,
+            config_generation=configuration.generation,
+            config_fingerprint=configuration.fingerprint,
+            run_scan_key=scan_key,
+            source_path=artifact,
+            scan=object(),
+            frame=None,
+            frame_ids=display.catalog,
+            frames=display.artifacts,
+            viewer_rows_1d=(),
+            viewer_rows_2d=(),
+            publication_store=display,
+            origin="scattering-standard",
+            poni_identity=configuration.poni_file,
+        )
+        context.adopt_record_store(display)
+        runtime = _ContextRuntime()
+        runtime.adopt_acquisition(identity, context)
+        runtime.select_latest_navigation(plot_mode="Overlay")
+        payloads = runtime.project_navigation(
+            ContextProjection(), preferences=prefs,
+            processing_mode="Int 2D",
+        )
+        captured = runtime.norm_aggregate
+        assert captured is not None
+        assert captured.revision == len(views)
+        assert len(payloads) == len(views)
+        return _build(payloads, runtime.navigation, prefs, captured)
+
+    reloaded, reload_request = _browse_load(
+        Path(browse.requested_path), 2
+    )
+    states = {
+        "standard": _acquisition_route(gi=False),
+        "gi": _acquisition_route(gi=True),
+        "browse": _browse_route(browse, browse_request),
+        "reload": _browse_route(reloaded, reload_request),
+    }
+    for name, state in states.items():
+        assert state.norm_channel == channel, name
+        assert channel in state.norm_channels, name
+        values = _trace_by_label(state)
+        assert set(values) == set(views), name
+        for label, expected in expected_traces.items():
+            np.testing.assert_allclose(
+                values[label], expected, err_msg=f"{name}:{label}"
+            )
+    assert states["browse"].norm_identity == (
+        browse.context_token, browse.scan_key, browse.requested_path,
+    )
+    assert states["reload"].norm_identity == (
+        reloaded.context_token, reloaded.scan_key, reloaded.requested_path,
+    )
+    assert states["browse"].norm_identity != states["reload"].norm_identity
+    assert states["browse"].norm_revision == 1
+    assert states["reload"].norm_revision == 1

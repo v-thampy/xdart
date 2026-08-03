@@ -634,10 +634,13 @@ class _ContextRuntime:
         current selection, admitted only through the Q2 acceptance gate.
 
         A dead, cancelled or stale live-Browse scope and a rescoped
-        acquisition owner are capture NO-OPS — a refusal cannot change what
-        is presented.  A context switch never exposes the prior identity's
-        aggregate; revision 0 and older revisions are refused; an
-        equal-revision replay keeps the exact held object.
+        acquisition owner are capture NO-OPS — a refusal cannot admit a
+        candidate.  Within the owned context the held object survives the
+        refusal untouched; a held identity FOREIGN to the owned Browse
+        context clears on the refused switch (§27.2).  A context switch
+        never exposes the prior identity's aggregate; revision 0 and older
+        revisions are refused; an equal-revision replay keeps the exact
+        held object.
         """
         if self._pending_replacement is not None:
             return
@@ -654,6 +657,19 @@ class _ContextRuntime:
                     or browse.commit_gate.cancelled
                     or not selection.names(browse)
                 ):
+                    # §27.2: a refusal is a presentation no-op only INSIDE
+                    # the currently owned context.  A held aggregate whose
+                    # identity is foreign to the owned context must not
+                    # survive a refused switch — Browse frame coverage
+                    # compares scan/path, so a stale prior-token hold
+                    # would divide the new context's frames.
+                    held = self._norm_aggregate
+                    if held is not None and held.identity != (
+                        browse.context_token,
+                        browse.scan_key,
+                        browse.requested_path,
+                    ):
+                        self._norm_aggregate = None
                     return
                 expected = (
                     browse.context_token,

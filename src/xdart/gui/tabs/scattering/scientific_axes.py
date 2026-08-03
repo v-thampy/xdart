@@ -464,6 +464,12 @@ def _frame_owns_norm_identity(identity, frame: DisplayFrameKey) -> bool:
     )
 
 
+#: §25.3 (amended by §27): the display placeholder is a RESERVED sentinel
+#: case-insensitively.  A metadata channel canonicalizing to it is neither
+#: offered nor effective — default preferences must never silently divide.
+_RESERVED_NORM_SENTINEL = "norm channel"
+
+
 def resolve_norm_presentation(
     aggregate: object,
     saved_channel: object,
@@ -474,9 +480,10 @@ def resolve_norm_presentation(
     Returns ``(identity, revision, effective_channel, choices)`` for both
     the runtime trace-delta scope and the scientific projection, so the two
     scopes can never disagree.  Exact type and revision are validated here;
-    choices carry only complete channels; the effective channel is empty
-    unless the one accepted aggregate covers EVERY selected frame and the
-    saved selection case-insensitively names a complete channel.
+    choices carry only complete channels outside the reserved sentinel; the
+    effective channel is empty unless the one accepted aggregate covers
+    EVERY selected frame and the saved selection case-insensitively names a
+    complete, non-reserved channel.
     """
 
     if type(aggregate) is not ScanNormAggregate:
@@ -489,7 +496,8 @@ def resolve_norm_presentation(
         *(
             key
             for key in accepted.channels
-            if not channel_is_partial(accepted, key)
+            if key.strip().lower() != _RESERVED_NORM_SENTINEL
+            and not channel_is_partial(accepted, key)
         ),
     )
     effective = ""
@@ -502,8 +510,10 @@ def resolve_norm_presentation(
         )
     ):
         key = saved_channel.strip().lower()
-        if key in accepted.channels and not channel_is_partial(
-            accepted, key
+        if (
+            key != _RESERVED_NORM_SENTINEL
+            and key in accepted.channels
+            and not channel_is_partial(accepted, key)
         ):
             effective = key
     return accepted.identity, accepted.revision, effective, choices
