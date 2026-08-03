@@ -153,6 +153,7 @@ from xrd_tools.core import (
     FrameRecord,
     live_record_store_max_items,
 )
+from xrd_tools.io import resolve_output_target
 from xrd_tools.core.provenance import read_provenance_from_handle
 from xrd_tools.integrate.gid import gi_1d_output_axis_key
 from xrd_tools.integrate.calibration import poni_to_integrator, get_detector
@@ -1210,7 +1211,8 @@ class imageThread(wranglerThread):
         cache[key] = existing
 
     def _append_output_path(self, frozen, scan_name):
-        return os.path.join(frozen.save_path, str(scan_name) + '.nxs')
+        return os.fspath(resolve_output_target(
+            frozen.save_path, str(scan_name), mode=frozen.output_mode))
 
     def _append_run_start_scan_names(self, frozen):
         if not self._append_skip_enabled(frozen):
@@ -5857,7 +5859,8 @@ class imageThread(wranglerThread):
         scan_kwargs = frozen.scan_kwargs()
         series_average = frozen.run_options.get("series_average", False)
         xye_only = frozen.run_options.get("xye_only", False)
-        fname = os.path.join(frozen.save_path, self.scan_name + '.nxs')
+        fname = os.fspath(resolve_output_target(
+            frozen.save_path, self.scan_name, mode=frozen.output_mode))
         # F-NXS-1: refuse to (over)write when the derived output collides with a
         # raw source — Save Path == the watched raw directory makes source ==
         # output for a same-stem container, which overwrote a 1.8 MB raw

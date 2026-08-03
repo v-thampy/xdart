@@ -26,6 +26,8 @@ from pyqtgraph.Qt import QtWidgets, QtCore
 from pyqtgraph.parametertree import ParameterTree, Parameter
 
 # Project imports
+from xrd_tools.io import resolve_output_target
+from xrd_tools.io.output_path import OVERWRITE_MODE
 from xrd_tools.core.containers import PONI
 from xrd_tools.session.run_configuration import RunConfigurationRefused
 from .wrangler_widget import (
@@ -663,7 +665,11 @@ class nexusWrangler(wranglerWidget):
                 self.h5_dir = h5_dir
             scan_name = (Path(self.nexus_file).stem if self.nexus_file
                          else 'nexus_scan')
-            self.fname = os.path.join(self.h5_dir, f'{scan_name}.nxs')
+            # This wrangler has no Append mode — it always produces a fresh
+            # output — so the generated target is unconditionally the
+            # new-suffix name (P4/OUT-1).
+            self.fname = os.fspath(resolve_output_target(
+                self.h5_dir, scan_name, mode=OVERWRITE_MODE))
             self.scan_name = scan_name
         else:
             self.h5_dir = os.path.dirname(_target.output_path)

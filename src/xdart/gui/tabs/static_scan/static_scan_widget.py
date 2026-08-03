@@ -216,16 +216,22 @@ def _finished_output_file(thread, wrangler, *, all_skipped_append=False):
             if not frame_ids:
                 continue
             try:
-                candidate = (output_path(scan_name) if callable(output_path)
-                             else os.path.join(
-                                 os.fspath(getattr(
-                                     _accepted_run_policy(thread),
-                                     "save_path", "") or ""),
-                                 f"{scan_name}.nxs"))
+                if callable(output_path):
+                    candidates = [output_path(scan_name)]
+                else:
+                    h5_dir = os.fspath(getattr(
+                        _accepted_run_policy(thread), "save_path", "") or "")
+                    # Locating an ALREADY-written output: accept every readable
+                    # output suffix, newest-policy first (P4/OUT-1).
+                    candidates = [
+                        os.path.join(h5_dir, f"{scan_name}{suffix}")
+                        for suffix in READABLE_OUTPUT_SUFFIXES
+                    ]
             except (TypeError, ValueError):
                 continue
-            if candidate and os.path.exists(candidate):
-                return os.fspath(candidate)
+            for candidate in candidates:
+                if candidate and os.path.exists(candidate):
+                    return os.fspath(candidate)
 
     for owner in (thread, wrangler):
         candidate = getattr(owner, "fname", None)
@@ -282,6 +288,11 @@ from xdart.modules.frame_publication import (
     publication_error_details,
     publication_from_live_frame,
     publication_has_2d_errors,
+)
+from xrd_tools.io import (
+    NEW_OUTPUT_SUFFIX,
+    READABLE_OUTPUT_SUFFIXES,
+    default_output_path,
 )
 from xrd_tools.core import browse_publication_max_items
 from xrd_tools.session.display_logic import SupersedeReason
@@ -1785,7 +1796,7 @@ class staticWidget(QWidget):
         self.local_path = get_fname_dir()
         self.dirname = self.local_path
 
-        self.fname = os.path.join(self.dirname, 'default.nxs')
+        self.fname = os.fspath(default_output_path(self.dirname, 'default'))
         # H18 (H5 finding 3): remember the PRISTINE scratch placeholder so the
         # readiness gate can tell "nothing loaded yet" from a genuinely
         # loaded/processed scan.  LiveScan needs a default data_file, but that
@@ -11781,7 +11792,7 @@ class staticWidget(QWidget):
         text = str(name)
         path = Path(text)
         token = path.stem if path.suffix.lower() in {
-            ".h5", ".hdf5", ".nxs", ".cxi"
+            ".h5", ".hdf5", ".nxs", ".cxi", NEW_OUTPUT_SUFFIX
         } else path.name
         if token.lower().endswith("_master"):
             token = token[:-7]

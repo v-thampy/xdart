@@ -8915,6 +8915,11 @@ def _append_modal_host(tmp_path, *, raw_name="scan_0001.tif",
     raw = tmp_path / raw_name
     raw.write_bytes(b"")
     target = tmp_path / target_name
+    # The append target must EXIST on disk, as it does in production: the
+    # loaded scan was read from this file.  Under the P4/OUT-1 path policy an
+    # Append with no existing sibling generates ``.nexus``, so a fixture that
+    # never created the target no longer resolves to the legacy name.
+    target.write_bytes(b"sentinel")
     host.img_file = str(raw)
     # Keep the Source card and the runtime cursor telling the SAME story
     # (O-1a-W1R-D1): the readiness gate now validates the card.

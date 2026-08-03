@@ -114,6 +114,12 @@ from xdart.utils.h5pool import get_pool
 from pyqtgraph import Qt
 from pyqtgraph.Qt import QtWidgets, QtCore, QtGui
 
+from xrd_tools.io import (
+    NEW_OUTPUT_SUFFIX,
+    READABLE_OUTPUT_SUFFIXES,
+    is_readable_output_path,
+)
+
 try:
     # shiboken validity check: True only while the C++ half of a QObject is
     # still alive.  Used to avoid touching / GC-deleting a moveToThread'd
@@ -1063,9 +1069,10 @@ class H5Viewer(QWidget):
         self.update_data()
 
     # File extensions for viewer modes
-    _IMAGE_EXTS = {'.tif', '.tiff', '.raw', '.edf', '.h5', '.hdf5', '.nxs'}
+    _IMAGE_EXTS = {'.tif', '.tiff', '.raw', '.edf', '.h5', '.hdf5', '.nxs',
+                   NEW_OUTPUT_SUFFIX}
     _XYE_EXTS = {'.xye'}
-    _NEXUS_EXTS = {'.h5', '.hdf5', '.nxs'}
+    _NEXUS_EXTS = {'.h5', '.hdf5', '.nxs', NEW_OUTPUT_SUFFIX}
 
     @staticmethod
     def _natural_sort_key(text):
@@ -1210,7 +1217,8 @@ class H5Viewer(QWidget):
                             lw.addItem(name)
                     else:
                         # Normal mode: only HDF5/NeXus scan files
-                        if name.split('.')[-1] in ('h5', 'hdf5', 'nxs'):
+                        if ('.' + name.split('.')[-1]) in (
+                                '.h5', '.hdf5', *READABLE_OUTPUT_SUFFIXES):
                             lw.addItem(name)
 
             # Restore the prior multi-selection by name (signals stay blocked, so
@@ -1229,20 +1237,20 @@ class H5Viewer(QWidget):
                 # the display had already moved to the new one.  Select the entry
                 # for the current scan_name (signals blocked, so no re-load).
                 sname = str(self.scan_name)
-                target = "%s.nxs" % sname
+                targets = tuple(f"{sname}{suffix}"
+                                for suffix in READABLE_OUTPUT_SUFFIXES)
                 matched_row = None
                 fuzzy_row = None
                 for row in range(lw.count()):
                     text = lw.item(row).text()
-                    if text == target:                  # exact <scan_name>.nxs
+                    if text in targets:        # exact <scan_name>.nexus/.nxs
                         matched_row = row
                         break
                     # Tolerate a scan_name that carries a frame-count/display
                     # suffix the file stem does not (e.g. "<scan>_5" vs the file
                     # "<scan>.nxs"), and the "<scan>/" directory form.
-                    if text.endswith(".nxs"):
-                        stem = text[:-4]
-                    elif text.endswith((".h5", ".hdf5")):
+                    if (is_readable_output_path(text)
+                            or text.endswith((".h5", ".hdf5"))):
                         stem = text.rsplit(".", 1)[0]
                     else:
                         stem = text.rstrip("/")
@@ -1254,9 +1262,9 @@ class H5Viewer(QWidget):
                                       QItemSelectionModel.ClearAndSelect)
                 if os.environ.get("XDART_PERF"):
                     logger.info(
-                        "[PERF] update_scans select: scan_name=%r target=%r "
+                        "[PERF] update_scans select: scan_name=%r targets=%r "
                         "exact=%s fuzzy=%s n_items=%d",
-                        sname, target, matched_row, fuzzy_row, lw.count())
+                        sname, targets, matched_row, fuzzy_row, lw.count())
         finally:
             lw.blockSignals(was_blocked)
 
@@ -1309,18 +1317,20 @@ class H5Viewer(QWidget):
         """
         lw = self.ui.listScans
         fname = getattr(getattr(self, "file_thread", None), "fname", None)
-        target = os.path.basename(fname) if fname else None
-        if not target:
+        targets = (os.path.basename(fname),) if fname else ()
+        if not targets:
             scan_name = getattr(self, "scan_name", None)
-            target = f"{scan_name}.nxs" if scan_name else None
-        if not target:
+            targets = (tuple(f"{scan_name}{suffix}"
+                             for suffix in READABLE_OUTPUT_SUFFIXES)
+                       if scan_name else ())
+        if not targets:
             return False
         was_blocked = lw.blockSignals(True)
         try:
             lw.clearSelection()
             for row in range(lw.count()):
                 item = lw.item(row)
-                if item.text() == target:
+                if item.text() in targets:
                     lw.setCurrentItem(
                         item, QItemSelectionModel.ClearAndSelect)
                     return True
@@ -2598,7 +2608,7 @@ class H5Viewer(QWidget):
             self.sigUpdate.emit()
             return
 
-        if (ext in ('.h5', '.hdf5', '.nxs')
+        if (ext in ('.h5', '.hdf5', '.nxs', NEW_OUTPUT_SUFFIX)
                 and self._viewer_source_info.kind is ImageSourceKind.UNKNOWN):
             logger.warning(
                 '%s is not a viewable image or xdart processed scan.',
@@ -2611,7 +2621,7 @@ class H5Viewer(QWidget):
             return
 
         # Check for multi-frame files
-        if ext in ('.h5', '.hdf5', '.nxs'):
+        if ext in ('.h5', '.hdf5', '.nxs', NEW_OUTPUT_SUFFIX):
             nframes = count_frames(fpath)
             if nframes == 0:
                 # count_frames failed — try loading as single frame
@@ -2627,7 +2637,7 @@ class H5Viewer(QWidget):
                 nframes = 1
 
         # HDF5/NeXus files always show frame numbers (even with 1 frame)
-        is_hdf5 = ext in ('.h5', '.hdf5', '.nxs')
+        is_hdf5 = ext in ('.h5', '.hdf5', '.nxs', NEW_OUTPUT_SUFFIX)
 
         if nframes > 1 or (is_hdf5 and nframes >= 1):
             # Multi-frame or HDF5: populate listData with frame numbers

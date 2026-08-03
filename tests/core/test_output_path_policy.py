@@ -421,6 +421,19 @@ def test_row12_enumerate_candidates_excludes_nexus(tmp_path):
     assert "out.nexus" not in names
 
 
+def test_row12_discover_scans_excludes_nexus_from_raw_containers(tmp_path):
+    """The raw NeXus-family directory scan must not surface a ``.nexus``."""
+    from xrd_tools.sources.discover import discover_scans
+
+    _write_raw_master(tmp_path / "raw.nxs")
+    _write_processed(tmp_path / "out.nexus")
+
+    names = {Path(spec.uri).name
+             for spec in discover_scans(tmp_path, "nexus_stack")}
+    assert "raw.nxs" in names
+    assert "out.nexus" not in names
+
+
 def test_row12_nexus_is_not_a_supported_raw_image_extension():
     from xrd_tools.io.image import SUPPORTED_EXTS
 

@@ -19,6 +19,7 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 from pyqtgraph.parametertree import ParameterTree, Parameter
 
 # Project imports
+from xrd_tools.io import resolve_output_target
 from xrd_tools.core.containers import PONI
 from xrd_tools.io.metadata import read_image_metadata
 from xrd_tools.session.readiness import (
@@ -1202,7 +1203,7 @@ class imageWrangler(wranglerWidget):
         return getter() if callable(getter) else 'Append'
 
     def _candidate_append_target_file(self, *, refresh_source=False):
-        """Return the .nxs path this raw-source run would append to, if known."""
+        """Return the output path this raw-source run would append to, if known."""
 
         if refresh_source:
             try:
@@ -1235,9 +1236,13 @@ class imageWrangler(wranglerWidget):
             h5_dir = getattr(self, "h5_dir", "")
         if not h5_dir:
             return ""
-        return os.path.abspath(
-            os.path.expanduser(os.path.join(str(h5_dir), scan_name + ".nxs"))
-        )
+        # Unbound call: this helper is also driven with a plain host object
+        # that carries no bound accessor (see the same pattern below).
+        return os.path.abspath(os.path.expanduser(os.fspath(
+            resolve_output_target(
+                str(h5_dir), scan_name,
+                mode=imageWrangler._active_write_mode(self))
+        )))
 
     @staticmethod
     def _append_scan_name_for_source(path):
@@ -1566,7 +1571,8 @@ class imageWrangler(wranglerWidget):
         self.thread.meta_dir = self.meta_dir
 
         self._sync_h5_dir_from_parameters()
-        self.fname = os.path.join(self.h5_dir, self.scan_name + '.nxs')
+        self.fname = os.fspath(resolve_output_target(
+            self.h5_dir, self.scan_name, mode=self._active_write_mode()))
         self.thread.fname = self.fname
 
         self.mask_file = self.parameters.child('Signal').child('mask_file').value()
