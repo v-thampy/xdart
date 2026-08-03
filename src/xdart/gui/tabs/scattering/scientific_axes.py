@@ -496,7 +496,7 @@ def resolve_norm_presentation(
         *(
             key
             for key in accepted.channels
-            if key.strip().lower() != _RESERVED_NORM_SENTINEL
+            if key.lower() != _RESERVED_NORM_SENTINEL
             and not channel_is_partial(accepted, key)
         ),
     )
@@ -509,7 +509,7 @@ def resolve_norm_presentation(
             for frame in frames
         )
     ):
-        key = saved_channel.strip().lower()
+        key = saved_channel.lower()
         if (
             key != _RESERVED_NORM_SENTINEL
             and key in accepted.channels

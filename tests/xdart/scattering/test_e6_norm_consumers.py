@@ -21,6 +21,14 @@ and the reserved-sentinel row were frozen RED on the exact held candidate
 ``19aeb62a345e79d415b2fff068347aa723ba6b96``; the fail-closed divisor
 matrix, the alias-hardened census and the real four-route consumer parity
 node are §27.3 oracle completion.
+
+E6-NORM-N2 correction 2 (handoff §28): the acquisition rescope-refusal
+foreign-hold rows and the lowercase-only whitespace-equivalence rows were
+frozen RED on the exact rejected correction-1 descendant
+``e4c5eea2520c35731a72a5c8bf4926f493ea087e``.  Channel equivalence is the
+frozen kernel rule — ``str.lower()`` only, whitespace preserved — and an
+owner-mismatch capture refusal preserves exactly a hold whose identity
+equals the selected acquisition frame's four-part identity.
 """
 
 from __future__ import annotations
@@ -585,6 +593,66 @@ def test_reserved_sentinel_channel_is_neither_offered_nor_effective():
     np.testing.assert_allclose(values[2], np.array([2.0, 3.0]) / 6.0)
 
 
+def test_whitespace_channel_matches_by_kernel_lowercase_equivalence():
+    # §28.2 blocker 2 (§25.3): Q2 and ``resolve_monitor_norm`` canonicalize
+    # CASE only — whitespace is preserved.  The consumer matches the saved
+    # selection by that same lowercase-only equivalence: the exact offered
+    # key " mon " becomes effective, a case alias normalizes to the
+    # canonical lowercase key, and every trace divides by its own
+    # payload's row.
+    parts = _fabricated(
+        [(1, 1.0, {" mon ": 2.0}), (2, 2.0, {" MON ": 4.0})]
+    )
+    # The EXACT offered choice becomes effective and divides per payload.
+    state = _build(
+        parts.payloads, parts.navigation, _prefs(norm_channel=" mon "),
+        parts.aggregate,
+    )
+    assert " mon " in state.norm_channels
+    assert state.norm_channel == " mon "
+    values = _trace_by_label(state)
+    np.testing.assert_allclose(values[1], np.array([1.0, 2.0]) / 2.0)
+    np.testing.assert_allclose(values[2], np.array([2.0, 3.0]) / 4.0)
+    # A saved case alias resolves and normalizes to the canonical key.
+    state = _build(
+        parts.payloads, parts.navigation, _prefs(norm_channel=" MON "),
+        parts.aggregate,
+    )
+    assert state.norm_channel == " mon "
+    values = _trace_by_label(state)
+    np.testing.assert_allclose(values[1], np.array([1.0, 2.0]) / 2.0)
+    np.testing.assert_allclose(values[2], np.array([2.0, 3.0]) / 4.0)
+
+
+def test_only_the_exact_lowercase_canonical_placeholder_is_reserved():
+    # §28.2 blocker 2 (§25.3): only a key whose lowercase-only canonical
+    # spelling is exactly ``norm channel`` collides with the display
+    # placeholder.  " norm channel " is whitespace-distinct under the
+    # frozen kernel equivalence — a genuine, offerable, effective channel.
+    parts = _fabricated(
+        [(1, 1.0, {" norm channel ": 4.0, "mon": 3.0}),
+         (2, 2.0, {" norm channel ": 8.0, "mon": 6.0})]
+    )
+    state = _build(
+        parts.payloads, parts.navigation,
+        _prefs(norm_channel=" norm channel "), parts.aggregate,
+    )
+    assert state.norm_channels == (PLACEHOLDER, " norm channel ", "mon")
+    assert state.norm_channel == " norm channel "
+    values = _trace_by_label(state)
+    np.testing.assert_allclose(values[1], np.array([1.0, 2.0]) / 4.0)
+    np.testing.assert_allclose(values[2], np.array([2.0, 3.0]) / 8.0)
+    # Exact case aliases of the placeholder remain reserved.
+    state = _build(
+        parts.payloads, parts.navigation,
+        _prefs(norm_channel="NORM CHANNEL"), parts.aggregate,
+    )
+    assert state.norm_channel == PLACEHOLDER
+    np.testing.assert_array_equal(
+        _trace_by_label(state)[1], np.array([1.0, 2.0])
+    )
+
+
 @pytest.mark.parametrize(
     "refusal",
     (
@@ -717,6 +785,67 @@ def test_pending_replacement_retains_the_outgoing_presentation():
     assert b1.runtime.norm_aggregate is b1.aggregate
     state = _build(
         (), b1.runtime.navigation, prefs, b1.runtime.norm_aggregate
+    )
+    assert state.norm_channel == "mon"
+
+
+def test_acquisition_rescope_refusal_cannot_expose_a_browse_hold():
+    # §28.2 blocker 1: the page synchronizes acquisition scope, then the
+    # worker may ``rescope_to`` BEFORE this refresh captures.  The stale
+    # selection owner is a capture refusal — but a held BROWSE aggregate
+    # for the same scan/path is foreign to the selected acquisition
+    # frame's four-part identity and must clear: Browse frame coverage
+    # compares only scan/path, so the prior token would divide the
+    # acquisition frames even while payload projection fails closed.
+    prefs = _prefs(norm_channel="mon")
+    acquisition = _acquisition_parts(
+        [(1, 10.0, {"mon": 2.0}), (2, 20.0, {"mon": 4.0})]
+    )
+    browse = _browse_parts(
+        scan_key=SCAN, path=ARTIFACT,
+        rows=({"mon": 2.0}, {"mon": 4.0}), values=(10.0, 20.0),
+    )
+    acquisition.runtime.adopt_browse(browse.context, browse.request)
+    acquisition.runtime.select_latest_navigation(plot_mode="Overlay")
+    _project(acquisition, prefs)
+    assert acquisition.runtime.norm_aggregate is browse.aggregate
+    acquisition.runtime.select_acquisition()
+    acquisition.context.rescope_to("run.next", "/data/next.tif", object())
+    payloads = _project(acquisition, prefs)
+    # Payload projection fails closed on the stale owner; normalization
+    # fails closed WITH it instead of retaining the foreign token.
+    assert payloads == ()
+    assert acquisition.runtime.norm_aggregate is None
+    state = _build(
+        payloads, acquisition.runtime.navigation, prefs,
+        acquisition.runtime.norm_aggregate,
+    )
+    assert state.norm_identity is None
+    assert state.norm_channel == PLACEHOLDER
+    assert state.norm_channels == (PLACEHOLDER,)
+    assert state.traces == ()
+
+
+def test_acquisition_rescope_refusal_keeps_the_owned_acquisition_hold():
+    # The §28 clear is surgical, never blind: an aggregate held FOR the
+    # still-selected old acquisition identity survives the same
+    # owner-mismatch refusal untouched, exactly like a same-context
+    # Browse refusal (§27.2).
+    prefs = _prefs(norm_channel="mon")
+    parts = _acquisition_parts(
+        [(1, 10.0, {"mon": 2.0}), (2, 20.0, {"mon": 4.0})]
+    )
+    _project(parts, prefs)
+    held = parts.runtime.norm_aggregate
+    assert held is not None
+    assert held.identity == parts.expected_identity
+    parts.context.rescope_to("run.next", "/data/next.tif", object())
+    payloads = _project(parts, prefs)
+    assert payloads == ()
+    assert parts.runtime.norm_aggregate is held
+    state = _build(
+        payloads, parts.runtime.navigation, prefs,
+        parts.runtime.norm_aggregate,
     )
     assert state.norm_channel == "mon"
 

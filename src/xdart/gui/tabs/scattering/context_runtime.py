@@ -636,8 +636,8 @@ class _ContextRuntime:
         A dead, cancelled or stale live-Browse scope and a rescoped
         acquisition owner are capture NO-OPS — a refusal cannot admit a
         candidate.  Within the owned context the held object survives the
-        refusal untouched; a held identity FOREIGN to the owned Browse
-        context clears on the refused switch (§27.2).  A context switch
+        refusal untouched; a held identity FOREIGN to the owned
+        context clears on the refused switch (§27.2, §28).  A context switch
         never exposes the prior identity's aggregate; revision 0 and older
         revisions are refused; an equal-revision replay keeps the exact
         held object.
@@ -687,6 +687,12 @@ class _ContextRuntime:
                 and current is not None
             ):
                 if selection.owner != context.hydration_owner:
+                    held = self._norm_aggregate
+                    if held is not None and held.identity != (
+                        identity.generation, identity.fingerprint,
+                        str(current.artifact), current.source_scan,
+                    ):
+                        self._norm_aggregate = None
                     return
                 expected = (
                     identity.generation,
