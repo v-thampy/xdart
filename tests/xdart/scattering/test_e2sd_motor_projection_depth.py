@@ -261,7 +261,8 @@ def test_form_row_never_invents_a_value_absent_from_typed_choices() -> None:
             row.editor.itemText(index)
             for index in range(row.editor.count())
         )
-        assert visible == ("Manual", "halpha")
+        # Typed choices plus the explicit current appended last — never more.
+        assert visible == ("Manual", "eta", "halpha")
         assert row.editor.currentText() == "halpha"
     finally:
         row.close()

@@ -270,11 +270,22 @@ def test_freeze_race_uses_ticket_snapshot_revision_and_requires_explicit_recaptu
 def test_source_choices_are_preserved_without_normalization(choices):
     source = RecordingSource(choices=choices)
     store = TracingStore(_intent())
-    pipeline, _, _, _, _ = _pipeline(source=source, store=store)
+    pipeline, _, lifecycle, _, executor = _pipeline(source=source, store=store)
 
     capture = pipeline.begin()
     assert isinstance(capture, StartCapture)
-    assert isinstance(pipeline.start(_admit(capture)), StartLaunched)
+    outcome = pipeline.start(_admit(capture))
+
+    if choices is None:
+        # No admitted catalog: the explicit motor passes through unvalidated.
+        assert isinstance(outcome, StartLaunched)
+    else:
+        # Strict GI admission refuses: 'th' is absent from the catalog.
+        assert isinstance(outcome, StartRefused)
+        assert outcome.reason is StartRefusal.FREEZE_VALIDATION
+        assert "admitted motor catalog" in outcome.detail
+        assert lifecycle.phase is RunPhase.IDLE
+        assert executor.calls == []
 
     assert store.freeze_inputs == [(0, choices)]
 
@@ -429,7 +440,11 @@ def test_source_observation_advance_invalidates_old_choices_and_recaptures():
     retry = pipeline.recapture(ticket)
     assert isinstance(retry, StartCapture)
     assert retry.source_capture.gi_motor_choices == ("eta",)
-    assert isinstance(pipeline.start(_admit(retry)), StartLaunched)
+    # Strict GI admission refuses the recapture: 'th' is absent from it.
+    outcome = pipeline.start(_admit(retry))
+    assert isinstance(outcome, StartRefused)
+    assert outcome.reason is StartRefusal.FREEZE_VALIDATION
+    assert "admitted motor catalog" in outcome.detail
     assert store.freeze_inputs == [(0, ("eta",))]
 
 

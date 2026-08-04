@@ -7188,3 +7188,96 @@ def test_section_number_presentation_option_preserves_canonical_default(qapp):
         canonical.deleteLater()
         compact.close()
         compact.deleteLater()
+
+
+_COMBO_PATH = ("gi", "motor")
+
+
+def _combo_row(*, value="Manual", choices=("Manual",)):
+    return FormRow(
+        label="Motor", path=_COMBO_PATH, value=value,
+        kind="combo", choices=choices,
+    )
+
+
+def _combo_field(choices, value="Manual"):
+    return ControlFormField(
+        SectionId.EXPERIMENT, "Motor", _COMBO_PATH, value,
+        ControlFieldKind.COMBO, tuple(choices),
+    )
+
+
+def _combo_items(row):
+    return tuple(
+        row.editor.itemText(index) for index in range(row.editor.count())
+    )
+
+
+def test_form_row_combo_reconciles_added_removed_and_reordered_choices(qapp):
+    """Projected ``field.choices`` are the authoritative combo vocabulary."""
+    row = _combo_row()
+    emitted = []
+    row.valueChanged.connect(lambda *values: emitted.append(values))
+    try:
+        assert row.apply_field(_combo_field(("Manual", "th", "eta")))
+        assert _combo_items(row) == ("Manual", "th", "eta")
+
+        assert row.apply_field(_combo_field(("Manual", "eta")))
+        assert _combo_items(row) == ("Manual", "eta")
+
+        assert row.apply_field(_combo_field(("eta", "Manual")))
+        assert _combo_items(row) == ("eta", "Manual")
+
+        assert row.editor.currentText() == "Manual"
+        qapp.processEvents()
+        assert emitted == []
+    finally:
+        row.close()
+        row.deleteLater()
+
+
+def test_form_row_combo_appends_absent_explicit_current_last(qapp):
+    """An absent explicit current value is appended LAST, typed order kept."""
+    row = _combo_row()
+    try:
+        assert row.apply_field(_combo_field(("Manual", "eta"), value="halpha"))
+        assert _combo_items(row) == ("Manual", "eta", "halpha")
+        assert row.editor.currentText() == "halpha"
+    finally:
+        row.close()
+        row.deleteLater()
+
+
+def test_form_row_combo_reconciliation_emits_no_field_value_changed(qapp):
+    """A rebuild is silent on ``fieldValueChanged``; a real pick still emits."""
+    panel = ControlsPanelV2()
+    row = _combo_row(value="halpha", choices=("Manual", "halpha"))
+    row.valueChanged.connect(panel.fieldValueChanged)
+    emitted = []
+    panel.fieldValueChanged.connect(lambda *values: emitted.append(values))
+    try:
+        assert row.apply_field(_combo_field(("Manual", "eta"), value="eta"))
+        qapp.processEvents()
+        assert emitted == []
+        assert row.editor.currentText() == "eta"
+
+        row.editor.setCurrentIndex(0)
+        qapp.processEvents()
+        assert emitted == [(_COMBO_PATH, "Manual")]
+    finally:
+        row.close()
+        row.deleteLater()
+        panel.close()
+        panel.deleteLater()
+
+
+def test_form_row_combo_restores_a_previously_blocked_signal_state(qapp):
+    """``apply_field`` restores the PRIOR blocked state, never force-clears."""
+    row = _combo_row()
+    try:
+        row.editor.blockSignals(True)
+        assert row.apply_field(_combo_field(("Manual", "eta"), value="eta"))
+        assert row.editor.signalsBlocked() is True
+    finally:
+        row.close()
+        row.deleteLater()

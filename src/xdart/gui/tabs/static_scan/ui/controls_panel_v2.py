@@ -692,11 +692,23 @@ class FormRow(QtWidgets.QWidget):
                 if self.editor.isChecked() != checked:
                     self.editor.setChecked(checked)
             elif self._kind == "combo":
+                # The projected ``field.choices`` are the authoritative combo
+                # vocabulary; construction-time items must not outlive them.
+                # An explicit current value absent from the vocabulary is
+                # appended last for representability only — never invented,
+                # never reordered into the typed choices.
+                desired = [str(choice) for choice in field.choices]
+                if value and value not in desired:
+                    desired.append(value)
+                current_items = [
+                    self.editor.itemText(index)
+                    for index in range(self.editor.count())
+                ]
+                if current_items != desired:
+                    self.editor.clear()
+                    self.editor.addItems(desired)
                 if self.editor.currentText() != value:
                     idx = self.editor.findText(value)
-                    if idx < 0 and value:
-                        self.editor.addItem(value)
-                        idx = self.editor.findText(value)
                     if idx >= 0:
                         self.editor.setCurrentIndex(idx)
             elif not self.editor.hasFocus() and self.editor.text() != value:
