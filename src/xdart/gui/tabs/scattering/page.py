@@ -12,6 +12,9 @@ import weakref
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xrd_tools.core.scan import SourceKind, SourceSpec
+from xrd_tools.session.gi_motor import pick_default_gi_motor
+
+_NO_DELIBERATE_MANUAL = object()
 from xrd_tools.session.intent_store import (
     IntentCommitAccepted,
     IntentRecaptureRequired,
@@ -51,6 +54,7 @@ from .controls_projection import (
     OUTPUT_MODE,
     SOURCE_DIRECTORY,
     SOURCE_FILE,
+    GI_MOTOR,
     SOURCE_TYPE,
     reduce_advanced_settings,
     reduce_control_edit,
@@ -202,6 +206,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         self._observation: _ObservationOperation | None = None
         self._source_observation: SourceObservation | None = None
+        # LV-UI-5b: source_spec a DELIBERATE user 'Manual' belongs to
+        # (F3 sticky rule).  A sentinel — NOT None — marks "no deliberate
+        # Manual": a source_spec can itself be None, and the default state
+        # must never compare equal to it.
+        self._gi_manual_source = _NO_DELIBERATE_MANUAL
         self._observation_token = 0
         self._browser_catalog_pool: ThreadPoolExecutor | None = (
             ThreadPoolExecutor(max_workers=1)
@@ -1704,6 +1713,31 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             self._reconcile_snapshot(snapshot, result.snapshot)
 
+    def _maybe_default_gi_motor(self, observation) -> None:
+        """LV-UI-5b: adopt the metadata-preferred incidence motor.
+
+        The default POLICY is owned by
+        :func:`xrd_tools.session.gi_motor.pick_default_gi_motor`; this seam
+        only decides WHEN it may apply: the intent still carries the
+        construction default ``'Manual'``, the user has not deliberately
+        chosen Manual for this exact source (F3 sticky rule), and the
+        observation names motors for the selected source.  The pick commits
+        through the one ``_on_field_value`` CAS path.
+        """
+        choices = getattr(observation, "gi_motor_choices", None)
+        if not choices:
+            return
+        intent = self._intents.snapshot().thaw()
+        if intent.gi.incidence_motor != "Manual":
+            return
+        if (self._gi_manual_source is not _NO_DELIBERATE_MANUAL
+                and self._gi_manual_source == intent.source_spec):
+            return
+        preferred = pick_default_gi_motor(choices)
+        if preferred == "Manual":
+            return
+        self._on_field_value(GI_MOTOR, preferred)
+
     def _on_field_value(
         self, path: object, value: object
     ) -> None:
@@ -1736,6 +1770,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             reduced, expected_revision=snapshot.revision
         )
         if type(result) is IntentCommitAccepted:
+            if path == GI_MOTOR:
+                # F3 sticky rule: only an ACCEPTED deliberate 'Manual' pins
+                # Manual for this exact source; any real pick releases it.
+                self._gi_manual_source = (
+                    snapshot.thaw().source_spec
+                    if value == "Manual" else _NO_DELIBERATE_MANUAL
+                )
             self._notice("")
             self._reconcile_snapshot(snapshot, result.snapshot)
         elif type(result) is IntentRecaptureRequired:
@@ -1833,6 +1874,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if snapshot.thaw().source_spec != request.source:
             return
         self._source_observation = observation
+        self._maybe_default_gi_motor(observation)
         if operation.preview:
             self._sources.publish_motor_knowledge(observation)
         self._source_status.render(observation)

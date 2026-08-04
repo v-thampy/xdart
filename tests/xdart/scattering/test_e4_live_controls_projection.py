@@ -536,3 +536,64 @@ def test_production_projection_mounts_full_processing_subsections() -> None:
         panel.close()
         panel.deleteLater()
         app.processEvents()
+
+
+# ---------------------------------------------------------------------------
+# LV-UI-5b — metadata-preferred incidence motor (F3 sticky Manual)
+# ---------------------------------------------------------------------------
+
+def _motor_page():
+    from pyqtgraph.Qt import QtWidgets
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xdart.gui.tabs.scattering.adapters.run_executor import (
+        StandardRunExecutor,
+    )
+    from xdart.gui.tabs.scattering.adapters.source import (
+        FilesystemSourceAdapter,
+    )
+    from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
+    from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    return ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(output_mode="Overwrite")),
+        lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter(),
+        executor=StandardRunExecutor(),
+    )
+
+
+def _motor_knowledge(*choices):
+    from types import SimpleNamespace
+
+    # The seam consumes exactly ``gi_motor_choices``; the qualification of a
+    # full SourceObservation is proven by the _on_observation rows above.
+    return SimpleNamespace(gi_motor_choices=tuple(choices))
+
+
+def test_metadata_motor_default_pick_adopts_the_preferred_motor():
+    page = _motor_page()
+    try:
+        page._maybe_default_gi_motor(_motor_knowledge("exposure", "chi", "th"))
+        assert page._intents.snapshot().thaw().gi.incidence_motor == "th"
+    finally:
+        page.close_workspace()
+        page.deleteLater()
+
+
+def test_metadata_motor_default_pick_respects_a_deliberate_manual():
+    from xdart.gui.tabs.scattering.controls_inventory import GI_MOTOR
+
+    page = _motor_page()
+    try:
+        page._maybe_default_gi_motor(_motor_knowledge("exposure", "chi", "th"))
+        assert page._intents.snapshot().thaw().gi.incidence_motor == "th"
+        # The user deliberately chooses Manual for this source...
+        page._on_field_value(GI_MOTOR, "Manual")
+        assert page._intents.snapshot().thaw().gi.incidence_motor == "Manual"
+        # ...and a re-observation must NOT flip it back (F3 sticky rule).
+        page._maybe_default_gi_motor(_motor_knowledge("exposure", "chi", "th"))
+        assert page._intents.snapshot().thaw().gi.incidence_motor == "Manual"
+    finally:
+        page.close_workspace()
+        page.deleteLater()
