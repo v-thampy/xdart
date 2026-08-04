@@ -15,8 +15,11 @@ import inspect
 import threading
 import time
 
+import numpy as np
+
 from xdart.gui.tabs.scattering.events import CleanupStatus
 from xrd_tools.session.hydration import (
+    HydrationOutcome,
     HydrationPurpose,
     HydrationReadKey,
     HydrationScope,
@@ -27,8 +30,69 @@ from tests.xdart.scattering.test_e4_preview_transport import (
     _adopted_cold_browse,
     _browse_key,
     _demote_browse_publication,
+    _instrument_reads,
     _transport_api,
+    _write_processed,
 )
+
+
+def _warm_browse_without_detector(tmp_path):
+    """Warm Browse (borrowed transport) over a 1-D-only container."""
+
+    from tests.xdart.scattering.test_e3_context_contract import (
+        _running_controller,
+    )
+    from xdart.gui.tabs.scattering.adapters.browse_loader import BrowseLoader
+    from xdart.gui.tabs.scattering.context_controller import ContextController
+    from xdart.gui.tabs.scattering.context_projection import ContextProjection
+
+    processed, _raw = _write_processed(
+        tmp_path, labels=(1, 2, 3), thumbnails=False
+    )
+    _, lifecycle, executor, _, acquisition = _running_controller()
+    controller = ContextController(
+        lifecycle=lifecycle,
+        executor=executor,
+        browse_loader=BrowseLoader(max_items=32),
+        projection=ContextProjection(),
+    )
+    controller.adopt_acquisition(executor.identity)
+    controller.pause()
+    request = controller.begin_browse(str(processed))
+    deadline = time.monotonic() + 15.0
+    outcome = None
+    while outcome is None and time.monotonic() < deadline:
+        outcome = controller.poll_browse()
+        if outcome is None:
+            time.sleep(0.005)
+    assert outcome is not None and outcome.request is request
+    browse = controller.browse_context
+    assert browse is not None and browse.loaded
+    return controller, acquisition, browse, processed
+
+
+def _settle_transport(transport, *, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while (
+        transport.queued_token is not None
+        or transport.active_token is not None
+    ) and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+
+def _admitted_browse_token(controller, browse, label):
+    """The exact token the Browse resolver admits, from public values."""
+    from xrd_tools.session.hydration import HydrationToken
+
+    read_key = HydrationReadKey(
+        HydrationScope(*browse.hydration_owner.as_tuple()),
+        browse.requested_path,
+        label,
+        HydrationPurpose.PREVIEW,
+    )
+    return HydrationToken(
+        read_key, controller.selection.display_generation
+    )
 
 
 def _bound_owner(controller):
@@ -444,3 +508,117 @@ def test_poll_browse_never_replaces_owner_while_prior_release_is_pending(
     assert candidate.invalidated is True
     assert candidate.released is True
     assert controller._browse_loader.owns_request(request) is False
+
+
+# Warm borrowed-transport terminal repaint (E6-PM2 root cause, 2026-08-04): the
+# borrowed sink is the acquisition owner's, so Browse reads its PUBLIC snapshot.
+
+
+def test_warm_borrowed_terminal_1d_completion_wakes_once_and_qualifies(
+    monkeypatch,
+    tmp_path,
+):
+    controller, acquisition, browse, processed = (
+        _warm_browse_without_detector(tmp_path)
+    )
+    owner = _bound_owner(controller)
+    transport = owner.transport
+    assert owner.owns_transport is False
+    assert transport is acquisition.publication_store.transport
+
+    key = _browse_key(controller, 1)
+    # Resident 1-D record with no detector payload: still needs a read.
+    resident = browse.publication_store.get(1)
+    assert resident is not None and resident.view.raw is None
+    assert resident.view.thumbnail is None
+    counts = _instrument_reads(monkeypatch, processed)
+    assert controller.project(key) is None  # exact hydration starts
+    _settle_transport(transport)
+    assert counts["detector"] == 0
+
+    # THE defect: the borrowed completion must produce exactly one repaint.
+    assert controller.poll_browse_preview() is True
+    assert controller.poll_browse_preview() is False
+
+    complete = controller.project(key)
+    assert complete is not None and complete.view.raw is None
+    np.testing.assert_allclose(
+        complete.view.intensity_1d, np.array([2.0, 3.0, 4.0])
+    )
+
+
+def test_warm_borrowed_terminal_read_is_not_reenqueued_and_polling_settles(
+    tmp_path,
+):
+    controller, _acquisition, browse, _processed = (
+        _warm_browse_without_detector(tmp_path)
+    )
+    owner = _bound_owner(controller)
+    transport = owner.transport
+    key = _browse_key(controller, 1)
+
+    assert controller.project(key) is None
+    assert controller.browse_preview_polling_needed is True
+    _settle_transport(transport)
+    hydrated = transport.counters()[HydrationOutcome.HYDRATED]
+
+    assert controller.poll_browse_preview() is True
+    assert controller.project(key) is not None
+
+    # Terminal here: no re-enqueue, and the owner stops requesting ticks.
+    time.sleep(0.05)
+    assert transport.queued_token is None
+    assert transport.active_token is None
+    assert transport.counters()[HydrationOutcome.HYDRATED] == hydrated
+    assert controller.browse_preview_polling_needed is False
+    assert owner.detector_outcome(browse, 1) is not None
+
+
+def test_foreign_or_superseded_completion_is_inert_for_browse_owner(
+    monkeypatch,
+    tmp_path,
+):
+    from xrd_tools.session.hydration import (
+        HydrationCompletion,
+        HydrationToken,
+    )
+
+    controller, _acquisition, browse, _processed = (
+        _warm_browse_without_detector(tmp_path)
+    )
+    owner = _bound_owner(controller)
+    key = _browse_key(controller, 1)
+    exact = _admitted_browse_token(controller, browse, 1)
+    assert controller.project(key) is None  # admit the exact borrowed read
+
+    # Foreign acquisition, equal-valued foreign Browse frame, superseded
+    # generation: none is this owner's current Browse completion.
+    inert = (
+        HydrationToken(
+            HydrationReadKey(
+                HydrationScope("acq-token", "acq-scan", "acq-source", 7),
+                "/acquisition/other.nxs",
+                1,
+                HydrationPurpose.PREVIEW,
+            ),
+            exact.presentation_generation,
+        ),
+        HydrationToken(
+            replace(exact.read_key, frame_identity=2),
+            exact.presentation_generation,
+        ),
+        HydrationToken(exact.read_key, exact.presentation_generation + 1),
+    )
+    assert all(token != exact for token in inert)
+    monkeypatch.setattr(
+        owner.transport,
+        "completions",
+        lambda: tuple(
+            HydrationCompletion(token, HydrationOutcome.FAILED)
+            for token in inert
+        ),
+    )
+    assert owner.consume_repaint() is False
+    assert controller.poll_browse_preview() is False
+    assert owner.detector_outcome(browse, 1) is None
+    assert owner.detector_outcome(browse, 2) is None

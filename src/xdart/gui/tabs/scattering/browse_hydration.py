@@ -15,6 +15,7 @@ from xrd_tools.session.hydration import (
     HydrationPurpose,
     HydrationReadKey,
     HydrationScope,
+    HydrationToken,
 )
 
 from .browse_values import BrowseCleanupReceipt, BrowseLoadRequest
@@ -47,6 +48,12 @@ class _BrowseHydrationOwner:
         self._terminal_lock = Lock()
         self._terminal_reads: set[HydrationReadKey] = set()
         self._repaints = SimpleQueue()
+        #: Exact tokens this owner admitted onto a BORROWED transport and
+        #: whose completion it has not yet observed.  The borrowed transport's
+        #: sink belongs to the acquisition owner, so the Browse completion is
+        #: read from its public snapshot instead — by exact token, never by a
+        #: deque offset, which rotation would invalidate.
+        self._borrowed_tokens: set[HydrationToken] = set()
         self._owns_transport = borrowed_transport is None
         self.transport = (
             HydrationTransport(
@@ -132,7 +139,17 @@ class _BrowseHydrationOwner:
         with self._terminal_lock:
             if read_key in self._terminal_reads:
                 return None
-        return self.transport.submit(request)
+        token = self.transport.submit(request)
+        if (
+            not self._owns_transport
+            and type(token) is HydrationToken
+            and token == request.token
+        ):
+            # Retain the fact only for the exact token the transport admitted:
+            # a refusal (None) or any other token is not this Browse read.
+            with self._terminal_lock:
+                self._borrowed_tokens.add(token)
+        return token
 
     def detector_outcome(self, browse: BrowseContext, label):
         if (
@@ -201,9 +218,32 @@ class _BrowseHydrationOwner:
             gate.leave()
         return HydrationOutcome.HYDRATED
 
+    def _observe_borrowed(self) -> None:
+        """Turn this owner's own borrowed completions into owned-path wakes.
+
+        Reads only the transport's public completion snapshot and matches by
+        exact admitted token, so a foreign acquisition read, an equal-valued
+        foreign Browse read and a superseded presentation generation are all
+        inert.  Each exact token is consumed once, giving one repaint per
+        terminal completion rather than an unbounded sequence.
+        """
+
+        with self._terminal_lock:
+            if not self._borrowed_tokens:
+                return
+        for completion in self.transport.completions():
+            if type(completion) is not HydrationCompletion:
+                continue
+            with self._terminal_lock:
+                if completion.token not in self._borrowed_tokens:
+                    continue
+                self._borrowed_tokens.discard(completion.token)
+            # Released before _complete: _terminalize takes the same lock.
+            self._complete(completion)
+
     def consume_repaint(self) -> bool:
         if not self._owns_transport:
-            return False
+            self._observe_borrowed()
         consumed = False
         while True:
             try:
@@ -214,7 +254,12 @@ class _BrowseHydrationOwner:
 
     def polling_needed(self) -> bool:
         if not self._owns_transport:
-            return False
+            # Never the shared worker: unrelated acquisition reads must not
+            # keep this page awake.  Only this owner's own outstanding read
+            # or an unconsumed wake does.
+            with self._terminal_lock:
+                awaiting = bool(self._borrowed_tokens)
+            return awaiting or not self._repaints.empty()
         worker = self.transport.worker
         return (
             (worker is not None and worker.is_alive())

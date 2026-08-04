@@ -113,6 +113,9 @@ def test_e3_ui61_user_clear_emits_empty_membership_then_projects_total(
         assert commands == []
 
         shell.apply_state(replace(state, revision=4))
+        # The WHOLE membership tuple is exactly the retained frame: proving
+        # only element 0 would let a mutant append the newly focused frame.
+        assert _browser_selected(shell) == (state.navigation.current,)
         assert len(_browser_selected(shell)) == 1
         assert _browser_selected(shell)[0] is state.navigation.current
         commands.clear()
@@ -122,7 +125,10 @@ def test_e3_ui61_user_clear_emits_empty_membership_then_projects_total(
         )
         # An empty projection retracts focus but not an accumulated visit:
         # membership is retired by the user or by a new catalog, never by a
-        # projection alone.
+        # projection alone.  Assert the WHOLE tuple, not just element 0, so a
+        # transient append of the newly focused frame cannot escape.
+        assert _browser_selected(shell) == (state.navigation.current,)
+        assert len(_browser_selected(shell)) == 1
         assert _browser_selected(shell)[0] is state.navigation.current
         assert not shell.browser.frames.currentIndex().isValid()
         assert shell.scientific.frame_selector.count() == 0
@@ -225,6 +231,11 @@ def test_e3_ui61_equal_distinct_membership_and_current_move_by_identity(
         # two keys compare equal, so a value match would collapse them.
         assert _row_of(shell, frame_a) == 0
         assert _row_of(shell, frame_b) == 1
+        # The WHOLE membership tuple stays exactly the one visited frame:
+        # proving only element 0 would let the newly focused frame_b be
+        # appended alongside the retained frame_a.
+        assert len(_browser_selected(shell)) == 1
+        assert _browser_selected(shell) == (frame_a,)
         assert _browser_selected(shell)[0] is frame_a
         assert shell.browser.frames.currentIndex().row() == _row_of(
             shell, frame_b
