@@ -874,12 +874,18 @@ class RangeRow(QtWidgets.QWidget):
             btn.setObjectName("controlsV2AutoButton")
             btn.setText("✦")
             btn.setCheckable(True)
-            btn.setChecked(bool(toggle.get("value")))
+            # LV-UI-1 (Threshold-style contract): the button reads as "use the
+            # explicit bounds".  UNTOGGLED = auto range; TOGGLED = the input
+            # boxes apply.  The MODEL field stays ``*_auto`` — inverted only at
+            # this one presentation seam, exactly like Threshold's enable.
+            btn.setChecked(not bool(toggle.get("value")))
             btn.setEnabled(bool(toggle.get("enabled", True)))
-            btn.setToolTip(toggle.get("tooltip", "Auto"))
+            btn.setToolTip(toggle.get("tooltip", "Explicit range (off = auto)"))
             btn.setMinimumWidth(31)
             tpath = tuple(toggle["path"])
-            btn.toggled.connect(lambda checked, p=tpath: self.valueChanged.emit(p, bool(checked)))
+            btn.toggled.connect(
+                lambda checked, p=tpath:
+                    self.valueChanged.emit(p, not bool(checked)))
             lay.addWidget(btn)
             self._toggle = (tpath, btn)
 
@@ -901,7 +907,7 @@ class RangeRow(QtWidgets.QWidget):
     def current_edits(self) -> tuple[tuple[tuple[str, ...], object], ...]:
         out = []
         if self._toggle is not None:
-            out.append((self._toggle[0], bool(self._toggle[1].isChecked())))
+            out.append((self._toggle[0], not bool(self._toggle[1].isChecked())))
         if self._low.isEnabled():
             out.append((tuple(self._low_path), self._low.text()))
         if self._high.isEnabled():
@@ -925,7 +931,9 @@ class RangeRow(QtWidgets.QWidget):
                 return False
             was_blocked = btn.blockSignals(True)
             try:
-                checked = bool(field.value)
+                # LV-UI-1: checked means MANUAL (Threshold style); the model
+                # field remains ``*_auto``.
+                checked = not bool(field.value)
                 if btn.isChecked() != checked:
                     btn.setChecked(checked)
             finally:
@@ -1883,7 +1891,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
                 "path": toggle_field.path,
                 "value": toggle_field.value,
                 "enabled": toggle_field.enabled,
-                "tooltip": toggle_field.reason or "Auto",
+                "tooltip": toggle_field.reason or "Explicit range (off = auto)",
             }
         row = RangeRow(
             label=label,

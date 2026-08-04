@@ -4938,11 +4938,13 @@ def test_controls_panel_v2_auto_rows_disable_range_edits(qapp, monkeypatch):
 
 def test_controls_panel_v2_auto_stays_visibly_checked_while_run_locked(
         qapp, monkeypatch):
-    """Auto remains visibly on while disabled during processing.
+    """The range toggle remains visibly on while disabled during processing.
 
-    The logical checked bit already survived the run lock, but the generic
-    ``:disabled`` QSS rule painted the compact QToolButton like an unchecked
-    control.  Require the more-specific checked+disabled rule in both themes.
+    LV-UI-1 semantics: checked now means EXPLICIT bounds (model
+    ``radial_auto=False``).  The logical checked bit already survived the run
+    lock, but the generic ``:disabled`` QSS rule painted the compact
+    QToolButton like an unchecked control.  Require the more-specific
+    checked+disabled rule in both themes.
     """
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -4951,7 +4953,7 @@ def test_controls_panel_v2_auto_stays_visibly_checked_while_run_locked(
 
     widget = staticWidget()
     try:
-        widget._on_controls_v2_field_changed(("Int1D", "radial_auto"), True)
+        widget._on_controls_v2_field_changed(("Int1D", "radial_auto"), False)
         widget._refresh_controls_v2_profile_now()
         widget._enter_run_state()
 
@@ -4970,6 +4972,33 @@ def test_controls_panel_v2_auto_stays_visibly_checked_while_run_locked(
         widget.close()
         widget.deleteLater()
 
+
+
+def test_range_toggle_follows_threshold_style_manual_semantics(qapp):
+    """LV-UI-1: untoggled = auto range; toggled = the explicit input bounds.
+
+    The MODEL field stays ``*_auto`` — the inversion lives only at the
+    presentation seam, mirroring Threshold's enable toggle."""
+    from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import RangeRow
+
+    emitted = []
+    row = RangeRow(
+        label="Q",
+        low={"path": ("Int1D", "radial_low"), "value": 0.0},
+        high={"path": ("Int1D", "radial_high"), "value": 5.0},
+        toggle={"path": ("Int1D", "radial_auto"), "value": True},
+    )
+    row.valueChanged.connect(lambda p, v: emitted.append((tuple(p), v)))
+    try:
+        btn = row._toggle[1]
+        assert not btn.isChecked()                     # auto -> untoggled
+        assert (("Int1D", "radial_auto"), True) in row.current_edits()
+        btn.setChecked(True)                           # explicit bounds ON
+        assert emitted == [(("Int1D", "radial_auto"), False)]
+        assert (("Int1D", "radial_auto"), False) in row.current_edits()
+    finally:
+        row.close()
+        row.deleteLater()
 
 def test_controls_panel_v2_pending_manual_range_survives_run_commit(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
