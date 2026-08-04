@@ -1,29 +1,35 @@
 # -*- coding: utf-8 -*-
-"""Pure, Qt-free detector raw-dtype saturation-ceiling policy.
+"""Pure, Qt-free detector-family DISPLAY-DEFAULT saturation ceiling.
 
-Single source of truth for "the max intensity used by Mask Saturated" shown as
-the GUI's manual-threshold default (LV-UI-11).  Saturated-pixel masking itself
-is dtype-derived at reduction time (:func:`xrd_tools.core.invalid.
-integer_saturation_ceiling` — ``np.iinfo(frame.dtype).max``); pyFAI detector
-models carry no bit-depth fact, so this module maps the detector FAMILY named
-in the PONI to the raw dtype that family's frames arrive in, and returns that
-dtype's integer ceiling.
+SCOPE (review 2026-08-04): this is a beamline-scoped GUI seed, NOT an
+acquisition-dtype oracle.  A PONI names a detector family but carries no
+bit-depth fact, and one family can legitimately deliver more than one raw
+dtype (the supported Eiger path preserves uint16 AND uint32 frames —
+``xdart.modules.ewald.frame``).  The value produced here therefore only SEEDS
+the manual-threshold inputs (LV-UI-11, maintainer-confirmed 0..detector-max
+defaults); saturated-pixel masking itself always derives its ceiling from the
+ACQUIRED frame's own dtype at reduction time
+(:func:`xrd_tools.core.invalid.integer_saturation_ceiling` —
+``np.iinfo(frame.dtype).max``) and is never governed by this table.
 
-The table lists only families whose raw dtype this codebase has verified
-against real data; an unknown or absent detector returns ``None`` — the GUI
-shows a blank default rather than a guessed number.  Extend the table with the
-family's raw dtype when a new detector is validated, never with a hand-derived
-physical well depth (the masking keys off the FILE dtype, not the sensor).
+The table lists the typical raw stream of the families this deployment has
+verified (SSRL beamlines); an unknown or absent detector returns ``None`` and
+the GUI shows a blank default rather than a guessed number.  A family default
+that overshoots a narrower acquisition (uint32 ceiling seeded for a uint16
+Eiger stream) is benign as a manual bound — a max above the data range clips
+nothing.  Extend the table with a family's verified typical stream dtype,
+never with a hand-derived physical well depth.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-#: Detector family (normalized-name prefix) -> raw frame dtype, as written by
-#: the beamline file formats this codebase has verified: Eiger/Eiger2 HDF5 is
-#: uint32 (its saturation sentinel is the uint32 max, 4294967295); Rayonix TIFF
-#: and Perkin-Elmer are uint16 (ceiling 65535).
+#: Detector family (normalized-name prefix) -> TYPICAL raw stream dtype for
+#: the deployments this codebase has verified: Eiger/Eiger2 HDF5 streams here
+#: are uint32 (the stream carrying the 4294967295 saturation sentinel);
+#: Rayonix TIFF and Perkin-Elmer are uint16 (ceiling 65535).  Display-default
+#: scope only — see the module docstring.
 DETECTOR_FAMILY_RAW_DTYPES: dict[str, str] = {
     "eiger": "uint32",
     "rayonix": "uint16",

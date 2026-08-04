@@ -4411,6 +4411,23 @@ def test_controls_panel_v2_path_fields_show_full_path_tooltip(qapp, monkeypatch)
         assert editor.text() == "scan_0001.tif"
         assert editor.toolTip() == "/data/very/long/path/scan_0001.tif"
         assert rows[0].current_value() == "/data/very/long/path/scan_0001.tif"
+
+        # LV-UI-6 (Codex REWORK): Save Path is part of the same contract —
+        # basename display, full-path tooltip, full committed value.
+        widget._on_controls_v2_field_changed(
+            ("Project", "h5_dir"), "/data/project/xdart_processed_data")
+        widget._refresh_controls_v2_profile_now()
+        save_rows = [
+            r for r in widget.controls_v2.project_card.body.findChildren(FormRow)
+            if r.path == ("Project", "h5_dir")
+        ]
+        assert save_rows
+        save_editor = save_rows[0].editor
+        assert save_editor.text() == "xdart_processed_data"
+        assert save_editor.toolTip() == "/data/project/xdart_processed_data"
+        assert save_rows[0].current_value() == (
+            "/data/project/xdart_processed_data"
+        )
     finally:
         widget.close()
         widget.deleteLater()
@@ -5052,6 +5069,13 @@ def test_threshold_row_adopts_mask_saturated_auto_toggle_in_vnext(qapp):
             tuple(path) != MASK_SATURATION
             for path, _ in pill_rows[0].current_edits()
         )
+
+        # Scope guard (Codex P2): the seeded max is a detector-FAMILY display
+        # default, not an acquisition-dtype fact — the hover text must say so.
+        from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import (
+            _FIELD_TOOLTIPS,
+        )
+        assert "display default" in _FIELD_TOOLTIPS[("Mask", "max")]
     finally:
         panel.close()
         panel.deleteLater()

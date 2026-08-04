@@ -89,6 +89,13 @@ _FIELD_TOOLTIPS: dict[tuple[str, ...], str] = {
         "Average all frames in the series into one frame before integration."),
     ("Mask", "Threshold"): (
         "Clip pixel intensities outside the [min, max] band before integration."),
+    ("Mask", "min"): (
+        "Manual threshold lower bound (pixels below are masked). Default 0."),
+    ("Mask", "max"): (
+        "Manual threshold upper bound (pixels above are masked). The default "
+        "is the detector family's typical raw-stream ceiling — a display "
+        "default only; saturated-pixel masking always follows the acquired "
+        "frame's own data type."),
     # Source
     ("Signal", "inp_type"): (
         "Source kind: a numbered image series, a directory of images, or a "
@@ -122,6 +129,7 @@ _SOURCE_ENERGY_PATH = ("Source", "energy_preference")
 _SOURCE_ENERGY_OPTIONS = (("PONI", "poni"), ("Metadata", "metadata"))
 _FILE_NAME_ONLY_PATHS = {
     ("Calibration", "poni_file"),
+    ("Project", "h5_dir"),
     ("Signal", "poni_file"),
     ("Signal", "mask_file"),
     ("Signal", "File"),
