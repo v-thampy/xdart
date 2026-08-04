@@ -385,7 +385,9 @@ class ContextController:
                 self._runtime.selection is not None
                 and self._runtime.selection.names(browse)
             )
-            receipt = self._release_browse(browse)
+            receipt = self._release_browse(
+                browse, preserve_pending_repaint=True
+            )
             if (
                 type(receipt) is not BrowseCleanupReceipt
                 or receipt.request is not browse.load_request
@@ -465,7 +467,9 @@ class ContextController:
             return None
         prior = self._runtime.browse_context
         if outcome.status is BrowseLoadStatus.READY and prior is not None:
-            receipt = self._release_browse(prior)
+            receipt = self._release_browse(
+                prior, preserve_pending_repaint=True
+            )
             if (
                 type(receipt) is not BrowseCleanupReceipt
                 or receipt.request is not prior.load_request
@@ -617,10 +621,13 @@ class ContextController:
         return finished
 
     def _release_browse(
-        self, browse: BrowseContext
+        self, browse: BrowseContext, *, preserve_pending_repaint=False
     ) -> BrowseCleanupReceipt:
         owner = self._browse_hydration_owner
-        receipt = release_browse(self._browse_loader, browse, owner)
+        receipt = release_browse(
+            self._browse_loader, browse, owner,
+            preserve_pending_repaint=preserve_pending_repaint,
+        )
         if (
             type(receipt) is BrowseCleanupReceipt
             and receipt.request is browse.load_request

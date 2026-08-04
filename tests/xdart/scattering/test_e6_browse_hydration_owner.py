@@ -479,7 +479,7 @@ def test_poll_browse_never_replaces_owner_while_prior_release_is_pending(
     monkeypatch.setattr(
         controller,
         "_release_browse",
-        lambda context: BrowseCleanupReceipt(
+        lambda context, **_purpose: BrowseCleanupReceipt(
             context.load_request,
             CleanupStatus.CLEANUP_PENDING,
         ),
@@ -893,3 +893,110 @@ def test_e6pm2_a_to_b_to_a_split_resolves_by_admission_identity(
     assert first.result().outcome is HydrationOutcome.SUPERSEDED
     assert moved.result().outcome is HydrationOutcome.SUPERSEDED
     assert back.result().outcome is HydrationOutcome.ALREADY_RESIDENT
+
+
+# E6-PM2 correction 1 (2026-08-04): a pending B-to-C retry must not discard B's
+# settled borrowed receipt.  Replacement release preserves the wake; terminal
+# close/retirement must never wait for a repaint their timer will not consume.
+
+
+def _held_b_with_settled_ticket(monkeypatch, tmp_path):
+    """Warm B whose borrowed read settles while its first release is pending."""
+
+    controller, _acq, browse, processed = _adopted_browse(tmp_path)
+    owner = _bound_owner(controller)
+    _browse_key(controller, 2)
+    _demote_browse_publication(browse, 2)
+    entered, release = _hold_browse_reads(monkeypatch)
+    assert owner.submit(_browse_request(controller, browse, 2)) is not None
+    assert entered.wait(timeout=10.0)
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="previous Browse cleanup is pending"):
+        controller.begin_browse(str(processed))
+    assert controller.browse_context is browse
+    deadline = time.monotonic() + 10.0
+    while controller.browse_pending and time.monotonic() < deadline:
+        controller.poll_browse()
+        time.sleep(0.005)
+    assert controller.browse_pending is False
+
+    release.set()
+    _settle_transport(owner.transport)
+    assert owner.polling_needed() is True
+    return controller, owner, browse, processed
+
+
+def test_e6pm2_pending_b_to_c_retry_preserves_the_settled_b_wake(
+    monkeypatch, tmp_path
+):
+    controller, owner, browse, processed = _held_b_with_settled_ticket(
+        monkeypatch, tmp_path
+    )
+
+    import pytest
+
+    # Retry before any timer tick: cleanup applies B's settled receipt first,
+    # then holds B and its owner so the page poll can still reach the wake.
+    with pytest.raises(RuntimeError, match="previous Browse cleanup is pending"):
+        controller.begin_browse(str(processed))
+    assert controller.browse_context is browse
+    assert controller._browse_hydration_owner is owner
+
+    # The normal controller repaint poll consumes exactly one B wake.
+    assert controller.poll_browse_preview() is True
+    assert controller.poll_browse_preview() is False
+
+    # Only the NEXT exact replacement release may clean B.
+    deadline = time.monotonic() + 10.0
+    while controller.browse_pending and time.monotonic() < deadline:
+        controller.poll_browse()
+        time.sleep(0.005)
+    controller.begin_browse(str(processed))
+    assert controller.browse_context is not browse
+
+
+def test_e6pm2_terminal_close_never_waits_for_a_pending_repaint(
+    monkeypatch, tmp_path
+):
+    controller, owner, browse, _processed = _held_b_with_settled_ticket(
+        monkeypatch, tmp_path
+    )
+
+    # close() is terminal/discarding: its presentation timer is stopped, so it
+    # must finish rather than hold B for a wake nobody will consume.
+    receipt = controller.close()
+    deadline = time.monotonic() + 10.0
+    while (
+        receipt.cleanup_status is not CleanupStatus.CLEANED
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
+        receipt = controller.close()
+    assert receipt.cleanup_status is CleanupStatus.CLEANED
+    assert browse.released is True
+
+
+def test_e6pm2_forged_cleaned_receipt_cannot_clear_b_owner_or_wake(
+    monkeypatch, tmp_path
+):
+    from xdart.gui.tabs.scattering.browse_values import BrowseCleanupReceipt
+
+    controller, owner, browse, _processed = _held_b_with_settled_ticket(
+        monkeypatch, tmp_path
+    )
+    foreign = BrowseCleanupReceipt(None, CleanupStatus.CLEANED)
+    monkeypatch.setattr(
+        controller._browse_loader,
+        "release_context",
+        lambda _context: foreign,
+    )
+
+    receipt = controller._release_browse(browse)
+    assert receipt is foreign
+    # A mismatched request must not clear the bound owner, current B, or the
+    # already-applied wake.
+    assert controller._browse_hydration_owner is owner
+    assert controller.browse_context is browse
+    assert owner.consume_repaint() is True

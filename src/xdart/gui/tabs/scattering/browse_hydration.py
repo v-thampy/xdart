@@ -282,7 +282,13 @@ class _BrowseHydrationOwner:
             else True
         )
 
-    def release(self, loader, browse: BrowseContext) -> BrowseCleanupReceipt:
+    def release(
+        self,
+        loader,
+        browse: BrowseContext,
+        *,
+        preserve_pending_repaint: bool = False,
+    ) -> BrowseCleanupReceipt:
         request = (
             browse.load_request
             if type(browse) is BrowseContext
@@ -301,12 +307,27 @@ class _BrowseHydrationOwner:
             return BrowseCleanupReceipt(
                 request, CleanupStatus.CLEANUP_PENDING
             )
+        if not self._owns_transport:
+            # The gate is free: apply every settled receipt BEFORE cleanup so
+            # a B-to-C retry cannot discard B's exact terminal wake.
+            self._observe_borrowed()
+        if preserve_pending_repaint and not self._repaints.empty():
+            # Replacement release only: hold B and its owner current until the
+            # normal page poll consumes the wake.  A terminal/discarding
+            # command never waits — its presentation timer is already stopped.
+            return BrowseCleanupReceipt(
+                request, CleanupStatus.CLEANUP_PENDING
+            )
         if not self.retire():
             return BrowseCleanupReceipt(
                 request, CleanupStatus.CLEANUP_PENDING
             )
         receipt = loader.release_context(browse)
-        if receipt.cleanup_status is CleanupStatus.CLEANED:
+        if (
+            type(receipt) is BrowseCleanupReceipt
+            and receipt.request is request
+            and receipt.cleanup_status is CleanupStatus.CLEANED
+        ):
             with self._terminal_lock:
                 self._borrowed_tickets = []
         return receipt

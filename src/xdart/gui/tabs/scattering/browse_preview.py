@@ -87,12 +87,18 @@ def qualified_event_frame(runtime, event):
 
 
 def release_browse(
-    loader, browse: BrowseContext, owner
+    loader,
+    browse: BrowseContext,
+    owner,
+    *,
+    preserve_pending_repaint: bool = False,
 ) -> BrowseCleanupReceipt:
     """Release only through the one exact controller-bound owner."""
 
     if type(owner) is _BrowseHydrationOwner:
-        return owner.release(loader, browse)
+        return owner.release(
+            loader, browse, preserve_pending_repaint=preserve_pending_repaint
+        )
     request = (
         browse.load_request
         if type(browse) is BrowseContext
