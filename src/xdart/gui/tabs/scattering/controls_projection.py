@@ -76,7 +76,7 @@ from .controls_inventory import (
     source_mode,
     truthful_field,
 )
-from .detector_projection import detector_summary
+from .detector_projection import detector_summary, poni_saturation_ceiling
 from .output_values import APPEND_UNAVAILABLE
 from .state_machine import RunPhase
 
@@ -221,6 +221,7 @@ def project_controls(
         2,
     )
     fields.insert(insertion, output)
+    fields = _threshold_auto_fields(fields, intent, unlocked=unlocked)
     fields = [truthful_field(candidate) for candidate in fields]
     reintegration_unavailable = (
         "Loaded-result reintegration is not available in this workspace yet."
@@ -300,6 +301,54 @@ def project_controls(
         profile,
         BoundControlState(tuple(fields)),
     )
+
+
+def _threshold_auto_fields(
+    fields: list,
+    intent,
+    *,
+    unlocked: bool,
+) -> list:
+    """LV-UI-11: one Auto control for saturated-pixel masking vs manual band.
+
+    The vNext Threshold row's Auto toggle IS the Mask-Saturated fact, so the
+    separate True=apply Threshold field is not rendered here (the legacy
+    static_scan panel keeps it).  The manual min/max bounds are editable
+    exactly when Auto is off, and display the [0, detector-ceiling] defaults
+    when the intent carries none — the ceiling blank until a valid PONI names
+    a known detector family."""
+    auto_on = bool(intent.threshold.mask_saturation)
+    out = []
+    for candidate in fields:
+        if candidate.path == THRESHOLD_ENABLED:
+            continue
+        if candidate.path in {THRESHOLD_MIN, THRESHOLD_MAX}:
+            value = candidate.value
+            if value is None:
+                value = (
+                    0.0
+                    if candidate.path == THRESHOLD_MIN
+                    else poni_saturation_ceiling(intent.poni_file)
+                )
+            reason = (
+                "Controls are locked during the active run."
+                if not unlocked
+                else "Auto masks saturated pixels; turn it off to set "
+                "a manual threshold band."
+                if auto_on
+                else ""
+            )
+            out.append(replace(
+                candidate,
+                value=value,
+                enabled=unlocked and not auto_on,
+                reason=reason,
+            ))
+            continue
+        out.append(candidate)
+    return out
+
+
 __all__ = [
     "AVERAGE_SCAN",
     "AdvancedSettingsValues",

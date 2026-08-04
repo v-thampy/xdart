@@ -5004,6 +5004,59 @@ def test_apply_state_update_refuses_fast_path_when_fields_appear(qapp):
         panel.deleteLater()
 
 
+def test_threshold_row_adopts_mask_saturated_auto_toggle_in_vnext(qapp):
+    """LV-UI-11: the vNext projection omits the Threshold enable field, so the
+    row's Auto toggle IS Mask Saturated — checked by default (sentinel masking
+    on, manual bounds asleep), unchecking emits the MaskSat path directly, and
+    the Mask Saturated pill stays visible as a DISPLAY-ONLY mirror (disabled,
+    excluded from edit harvesting)."""
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.run_configuration import RunIntent
+    from xdart.gui.tabs.scattering.controls_inventory import MASK_SATURATION
+    from xdart.gui.tabs.scattering.controls_projection import project_controls
+    from xdart.gui.tabs.scattering.state_machine import RunPhase
+    from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import PillRow, RangeRow
+
+    panel = ControlsPanelV2()
+    try:
+        panel.set_state(project_controls(
+            RunIntentStore(RunIntent()).snapshot(), None, RunPhase.IDLE))
+        row = next(
+            r for r in panel.findChildren(RangeRow)
+            if tuple(r._low_path) == ("Mask", "min")
+        )
+        tpath, btn = row._toggle
+        assert tuple(tpath) == MASK_SATURATION
+        assert btn.isChecked()                     # default intent: Auto ON
+        assert not row._low.isEnabled()
+        assert not row._high.isEnabled()
+
+        emitted = []
+        panel.fieldValueChanged.connect(
+            lambda p, v: emitted.append((tuple(p), v)))
+        btn.setChecked(False)                      # user selects manual band
+        assert (MASK_SATURATION, False) in emitted
+
+        pill_rows = [
+            p for p in panel.findChildren(PillRow)
+            if any(tuple(path) == MASK_SATURATION for path, _ in p._pills)
+        ]
+        assert pill_rows, "the Mask Saturated pill must stay visible"
+        pill = next(
+            b for path, b in pill_rows[0]._pills
+            if tuple(path) == MASK_SATURATION
+        )
+        assert not pill.isEnabled()                # display-only mirror
+        assert pill.isChecked()                    # mirrors the projected fact
+        assert all(
+            tuple(path) != MASK_SATURATION
+            for path, _ in pill_rows[0].current_edits()
+        )
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
 def test_range_toggle_is_direct_polarity_auto_when_toggled(qapp):
     """LV-UI-11 (reverts LV-UI-1/1b): the range toggle maps DIRECTLY onto the
     ``*_auto`` model field — toggled ON = auto range, untoggled = the explicit

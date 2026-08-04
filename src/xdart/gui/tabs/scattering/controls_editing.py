@@ -13,6 +13,7 @@ from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import DirectorySourceSpec
 
 from .contracts import SourceSelection
+from .detector_projection import poni_saturation_ceiling
 from .controls_inventory import (
     GI_1D_AXES,
     GI_2D_AXES,
@@ -411,13 +412,39 @@ def reduce_control_edit(
             candidate,
             was_enabled=intent.gi.enabled,
         )
-    elif (
-        path in {THRESHOLD_MIN, THRESHOLD_MAX}
-        and parsed is not None
-        and parsed != 0.0
-    ):
+    elif path in {THRESHOLD_MIN, THRESHOLD_MAX} and parsed is not None:
+        # LV-UI-11: setting a manual bound IS choosing manual thresholding —
+        # the sentinel Auto masking and the manual band are exclusive.
         candidate.threshold.apply_threshold = True
+        candidate.threshold.mask_saturation = False
+    elif path == MASK_SATURATION:
+        # LV-UI-11: the Threshold row's Auto toggle.  ON = mask saturated
+        # pixels, no manual band; OFF = the manual [min, max] band applies,
+        # seeded to the visible defaults on first use.
+        candidate.threshold.apply_threshold = not parsed
+        if not parsed:
+            _seed_manual_threshold(candidate)
+    elif path == THRESHOLD_ENABLED:
+        # Kept for the legacy static_scan binding and programmatic edits; the
+        # same exclusivity holds in both directions.
+        candidate.threshold.mask_saturation = not parsed
+        if parsed:
+            _seed_manual_threshold(candidate)
     return candidate
+
+
+def _seed_manual_threshold(intent: RunIntent) -> None:
+    """Fill absent manual-threshold bounds with the LV-UI-11 display defaults:
+    0 and the PONI-declared detector's raw-dtype saturation ceiling (the value
+    Mask Saturated keys off).  An unknown detector leaves the max absent —
+    blank in the GUI — rather than guessing."""
+    threshold = intent.threshold
+    if threshold.threshold_min is None:
+        threshold.threshold_min = 0.0
+    if threshold.threshold_max is None:
+        ceiling = poni_saturation_ceiling(intent.poni_file)
+        if ceiling is not None and float(threshold.threshold_min) <= ceiling:
+            threshold.threshold_max = ceiling
 
 
 def _normalize_gi_units(intent: RunIntent, *, was_enabled: bool) -> None:

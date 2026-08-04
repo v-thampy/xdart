@@ -82,7 +82,8 @@ _FIELD_TOOLTIPS: dict[tuple[str, ...], str] = {
     ("GI", "tilt_angle"): "Sample tilt angle in degrees for the grazing geometry.",
     # Processing / conditioning
     ("MaskSat", "mask_sentinel"): (
-        "Mask dead/saturated detector pixels (the uint32 sentinel). OFF keeps "
+        "Auto: mask dead/saturated detector pixels (the detector's saturation "
+        "sentinel). Turn off to set a manual threshold band instead; OFF keeps "
         "strong saturated Bragg peaks unmasked."),
     ("Signal", "series_average"): (
         "Average all frames in the series into one frame before integration."),
@@ -959,13 +960,26 @@ class PillRow(QtWidgets.QWidget):
 
     valueChanged = QtCore.Signal(object, object)
 
-    def __init__(self, fields: Sequence[ControlFormField], parent=None):
+    #: Tooltip for a pill that mirrors a fact whose editor lives elsewhere
+    #: (LV-UI-11: Mask Saturated is driven by the Threshold row's Auto toggle).
+    _DISPLAY_ONLY_TOOLTIP = "Set by the Threshold row's Auto toggle."
+
+    def __init__(
+        self,
+        fields: Sequence[ControlFormField],
+        parent=None,
+        *,
+        display_only_paths: frozenset[tuple[str, ...]] = frozenset(),
+    ):
         super().__init__(parent)
         self.setObjectName("controlsV2PillRow")
         lay = QtWidgets.QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
         self._pills: list[tuple[tuple[str, ...], QtWidgets.QPushButton]] = []
+        self._display_only = frozenset(
+            tuple(path) for path in display_only_paths
+        )
         for field in fields:
             btn = QtWidgets.QPushButton(field.label)
             # Reuse the accent-when-checked toggle styling, but content-sized and
@@ -977,8 +991,12 @@ class PillRow(QtWidgets.QWidget):
             btn.setObjectName("controlsV2PillButton")
             btn.setCheckable(True)
             btn.setChecked(bool(field.value))
-            btn.setEnabled(bool(field.enabled))
-            btn.setToolTip(_field_tooltip(field.path, field.reason))
+            display_only = tuple(field.path) in self._display_only
+            btn.setEnabled(bool(field.enabled) and not display_only)
+            btn.setToolTip(
+                self._DISPLAY_ONLY_TOOLTIP
+                if display_only
+                else _field_tooltip(field.path, field.reason))
             btn.setSizePolicy(
                 QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed
             )
@@ -991,7 +1009,11 @@ class PillRow(QtWidgets.QWidget):
         lay.addStretch(1)
 
     def current_edits(self) -> tuple[tuple[tuple[str, ...], object], ...]:
-        return tuple((p, bool(btn.isChecked())) for p, btn in self._pills)
+        return tuple(
+            (p, bool(btn.isChecked()))
+            for p, btn in self._pills
+            if p not in self._display_only
+        )
 
     def apply_fields(
         self,
@@ -1008,8 +1030,12 @@ class PillRow(QtWidgets.QWidget):
                     btn.setChecked(checked)
             finally:
                 btn.blockSignals(was_blocked)
-            btn.setEnabled(bool(field.enabled))
-            btn.setToolTip(_field_tooltip(field.path, field.reason))
+            display_only = path in self._display_only
+            btn.setEnabled(bool(field.enabled) and not display_only)
+            btn.setToolTip(
+                self._DISPLAY_ONLY_TOOLTIP
+                if display_only
+                else _field_tooltip(field.path, field.reason))
         return True
 
 
@@ -1777,10 +1803,14 @@ class ControlsPanelV2(QtWidgets.QWidget):
         # Consecutive standalone bool toggles render as one compact pill row
         # (mockup), not full-width stacked buttons.
         pending_pills: list[ControlFormField] = []
+        display_only_pills: set[tuple[str, ...]] = set()
 
         def flush_pills() -> None:
             if pending_pills:
-                row = PillRow(list(pending_pills))
+                row = PillRow(
+                    list(pending_pills),
+                    display_only_paths=frozenset(display_only_pills),
+                )
                 row.valueChanged.connect(self.fieldValueChanged)
                 sub.add_row(row)
                 pending_pills.clear()
@@ -1810,10 +1840,20 @@ class ControlsPanelV2(QtWidgets.QWidget):
                 consumed.add(path)
                 continue
             # Threshold: (Mask, Threshold)=enable + (Mask, min) + (Mask, max).
+            # LV-UI-11: when the projection omits the Threshold enable (the
+            # vNext scattering page), the row's Auto toggle IS Mask Saturated —
+            # toggled ON masks the saturated sentinel and the manual bounds
+            # sleep, matching the range rows' auto-when-toggled reading.  Its
+            # pill stays visible below as a display-only state indicator.
             if path == ("Mask", "min") and ("Mask", "max") in by_path:
                 flush_pills()
+                toggle_field = by_path.get(("Mask", "Threshold"))
+                if toggle_field is None:
+                    toggle_field = by_path.get(("MaskSat", "mask_sentinel"))
+                    if toggle_field is not None:
+                        display_only_pills.add(("MaskSat", "mask_sentinel"))
                 sub.add_row(self._make_range_row(
-                    field, by_path[("Mask", "max")], by_path.get(("Mask", "Threshold")),
+                    field, by_path[("Mask", "max")], toggle_field,
                     label="Threshold"))
                 consumed.update({("Mask", "min"), ("Mask", "max"), ("Mask", "Threshold")})
                 continue

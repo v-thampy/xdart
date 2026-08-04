@@ -90,12 +90,16 @@ def test_production_projection_supplies_source_and_integration_inventory() -> No
         ("Int2D", "azim_auto"),
         ("Int2D", "azim_low"),
         ("Int2D", "azim_high"),
-        ("Mask", "Threshold"),
+        # LV-UI-11: no separate ("Mask", "Threshold") enable — the manual
+        # bounds render with Mask Saturated as the row's Auto toggle.
+        ("Mask", "min"),
+        ("Mask", "max"),
         ("MaskSat", "mask_sentinel"),
         ("Signal", "series_average"),
         ("BG", "bg_type"),
     }
     assert required <= fields.keys()
+    assert ("Mask", "Threshold") not in fields
     assert fields[("Signal", "inp_type")].value == "Image Directory"
     assert fields[("Signal", "img_dir")].value == "/raw/eiger"
     assert fields[("Signal", "include_subdir")].value is True
@@ -409,18 +413,143 @@ def test_gi_transition_normalizes_units_and_only_incompatible_ranges() -> None:
     assert "radial_range" not in changed_semantic.bai_2d_args
 
 
-def test_nonzero_threshold_bound_enables_next_run_threshold() -> None:
+def test_any_manual_threshold_bound_edit_selects_manual_mode() -> None:
+    """LV-UI-11: touching a manual bound IS choosing the manual band — it
+    enables thresholding AND turns the exclusive Auto sentinel masking off,
+    zero included (0 is a legitimate manual lower bound)."""
     snapshot = RunIntentStore(_intent()).snapshot()
     changed = reduce_control_edit(snapshot, ("Mask", "max"), "1000")
     assert type(changed) is RunIntent
     assert changed.threshold.threshold_max == 1000.0
     assert changed.threshold.apply_threshold is True
+    assert changed.threshold.mask_saturation is False
     assert snapshot.thaw().threshold.apply_threshold is False
 
-    zero = reduce_control_edit(snapshot, ("Mask", "max"), "0")
+    zero = reduce_control_edit(snapshot, ("Mask", "min"), "0")
     assert type(zero) is RunIntent
-    assert zero.threshold.threshold_max == 0.0
-    assert zero.threshold.apply_threshold is False
+    assert zero.threshold.threshold_min == 0.0
+    assert zero.threshold.apply_threshold is True
+    assert zero.threshold.mask_saturation is False
+
+
+def _eiger_poni(tmp_path: Path) -> str:
+    poni = tmp_path / "eiger.poni"
+    poni.write_text(
+        "Detector: Eiger1M\n"
+        "Distance: 0.2\n"
+        "Poni1: 0.1\n"
+        "Poni2: 0.2\n"
+    )
+    return str(poni)
+
+
+def test_auto_toggle_maps_to_the_exclusive_threshold_intent_pair(
+    tmp_path: Path,
+) -> None:
+    """LV-UI-11 mapping (maintainer-confirmed): Auto ON -> mask_saturation
+    True + apply_threshold False; Auto OFF -> manual band applies, seeded to
+    the visible [0, detector-ceiling] defaults on first use."""
+    from xdart.gui.tabs.scattering.controls_inventory import MASK_SATURATION
+
+    intent = _intent()
+    intent.poni_file = _eiger_poni(tmp_path)
+    manual = reduce_control_edit(
+        RunIntentStore(intent).snapshot(), MASK_SATURATION, False
+    )
+    assert type(manual) is RunIntent
+    assert manual.threshold.mask_saturation is False
+    assert manual.threshold.apply_threshold is True
+    assert manual.threshold.threshold_min == 0.0
+    assert manual.threshold.threshold_max == 4294967295.0
+
+    back = reduce_control_edit(
+        RunIntentStore(manual).snapshot(), MASK_SATURATION, True
+    )
+    assert type(back) is RunIntent
+    assert back.threshold.mask_saturation is True
+    assert back.threshold.apply_threshold is False
+    # The manual bounds survive the round trip for the next manual use.
+    assert back.threshold.threshold_min == 0.0
+    assert back.threshold.threshold_max == 4294967295.0
+
+
+def test_auto_toggle_off_leaves_the_max_blank_without_a_known_detector() -> None:
+    from xdart.gui.tabs.scattering.controls_inventory import MASK_SATURATION
+
+    manual = reduce_control_edit(
+        RunIntentStore(_intent()).snapshot(), MASK_SATURATION, False
+    )
+    assert type(manual) is RunIntent
+    assert manual.threshold.threshold_min == 0.0
+    assert manual.threshold.threshold_max is None
+
+
+def test_vnext_threshold_fields_follow_the_auto_masksat_model(
+    tmp_path: Path,
+) -> None:
+    """LV-UI-11 projection: no separate Threshold enable field; the manual
+    bounds are disabled while Auto is on and display the [0, detector-ceiling]
+    defaults; Mask Saturated itself stays projected (the row's Auto toggle and
+    its display-only pill both render from it)."""
+    from xdart.gui.tabs.scattering.controls_inventory import (
+        MASK_SATURATION,
+        THRESHOLD_ENABLED,
+        THRESHOLD_MAX,
+        THRESHOLD_MIN,
+    )
+
+    intent = _intent()
+    intent.poni_file = _eiger_poni(tmp_path)
+    state = project_controls(
+        RunIntentStore(intent).snapshot(), None, RunPhase.IDLE
+    )
+    by_path = {field.path: field for field in state.bound_controls.fields}
+    assert THRESHOLD_ENABLED not in by_path
+    assert by_path[MASK_SATURATION].enabled is True
+    low, high = by_path[THRESHOLD_MIN], by_path[THRESHOLD_MAX]
+    assert low.value == 0.0 and high.value == 4294967295.0
+    assert low.enabled is False and high.enabled is False
+    assert "Auto masks saturated pixels" in low.reason
+
+    intent.threshold.mask_saturation = False
+    intent.threshold.apply_threshold = True
+    manual_state = project_controls(
+        RunIntentStore(intent).snapshot(), None, RunPhase.IDLE
+    )
+    manual = {f.path: f for f in manual_state.bound_controls.fields}
+    assert manual[THRESHOLD_MIN].enabled is True
+    assert manual[THRESHOLD_MAX].enabled is True
+
+
+def test_vnext_threshold_max_is_blank_until_a_valid_detector(
+    tmp_path: Path,
+) -> None:
+    from xdart.gui.tabs.scattering.controls_inventory import (
+        THRESHOLD_MAX,
+        THRESHOLD_MIN,
+    )
+    from xdart.gui.tabs.scattering.detector_projection import (
+        poni_saturation_ceiling,
+    )
+
+    state = project_controls(
+        RunIntentStore(_intent()).snapshot(), None, RunPhase.IDLE
+    )
+    by_path = {field.path: field for field in state.bound_controls.fields}
+    assert by_path[THRESHOLD_MIN].value == 0.0
+    assert by_path[THRESHOLD_MAX].value is None
+
+    unknown = tmp_path / "unknown.poni"
+    unknown.write_text(
+        "Detector: Pilatus1M\n"
+        "Distance: 0.2\n"
+        "Poni1: 0.1\n"
+        "Poni2: 0.2\n"
+    )
+    assert poni_saturation_ceiling(str(unknown)) is None
+    assert poni_saturation_ceiling(_eiger_poni(tmp_path)) == 4294967295.0
+    assert poni_saturation_ceiling("") is None
+    assert poni_saturation_ceiling(str(tmp_path / "missing.poni")) is None
 
 
 def test_unrepresentable_suffix_tuple_is_exact_and_not_editable() -> None:
