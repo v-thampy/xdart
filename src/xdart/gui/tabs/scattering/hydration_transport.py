@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from threading import RLock, Thread, current_thread
+from threading import Lock, RLock, Thread, current_thread
 
 from xdart.modules.display_context import HydrationRequest
 from xrd_tools.io.frame_preview import (
@@ -36,6 +36,41 @@ from xrd_tools.session.hydration import (
 from .display_values import DisplayFrameKey
 
 
+class _HydrationTicket:
+    """One admission's terminal fact.  Tokens are VALUES, so ticket OBJECT
+    IDENTITY separates admissions and survives diagnostic-deque rotation."""
+
+    __slots__ = ("_lock", "_token", "_completion")
+
+    def __init__(self, token: HydrationToken) -> None:
+        if type(token) is not HydrationToken:
+            raise TypeError("an admission ticket requires one exact token")
+        self._lock = Lock()
+        self._token = token
+        self._completion: HydrationCompletion | None = None
+
+    @property
+    def token(self) -> HydrationToken:
+        return self._token
+
+    def result(self) -> HydrationCompletion | None:
+        with self._lock:
+            return self._completion
+
+    def _settle(self, completion: HydrationCompletion) -> bool:
+        """First-wins settlement; returns whether THIS call settled it."""
+        if (
+            type(completion) is not HydrationCompletion
+            or completion.token != self._token
+        ):
+            return False
+        with self._lock:
+            if self._completion is not None:
+                return False
+            self._completion = completion
+            return True
+
+
 @dataclass(slots=True)
 class _TransportEntry:
     """One admitted read: the request, its frozen projection, and the LATEST
@@ -46,8 +81,12 @@ class _TransportEntry:
     key: DisplayFrameKey | None
     closed: bool
     token: HydrationToken
+    #: The current presentation's admission receipt.
+    ticket: _HydrationTicket
     #: The token snapshot the commit was built with (worker-only writer).
     committed_token: HydrationToken | None = None
+    #: Paired ATOMICALLY with committed_token for the final split.
+    committed_ticket: _HydrationTicket | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,7 +149,14 @@ class HydrationTransport:
     def submit(
         self, request: HydrationRequest, *, closed: bool = False
     ) -> HydrationToken | None:
-        """Admit one typed artifact-bearing request, or refuse with ``None``.
+        """Admit one typed request, or refuse with ``None`` (tokens only)."""
+        ticket = self._submit_admission(request, closed=closed)
+        return None if ticket is None else ticket.token
+
+    def _submit_admission(
+        self, request: HydrationRequest, *, closed: bool = False
+    ) -> _HydrationTicket | None:
+        """Admit one request and return its admission receipt, or ``None``.
 
         The inventoried canonical legacy shape (``read_key=None``) is refused:
         terminal-total accounting begins only for the typed E4 shape.
@@ -133,10 +179,16 @@ class HydrationTransport:
             ):
                 # Same exact read: reuse it, move only the presentation token.
                 displaced = active.token
+                displaced_ticket = active.ticket
                 active.token = token
                 active.closed = bool(closed)
                 if displaced != token:
-                    self._complete_locked(displaced, HydrationOutcome.SUPERSEDED)
+                    active.ticket = _HydrationTicket(token)
+                    self._complete_locked(
+                        displaced,
+                        HydrationOutcome.SUPERSEDED,
+                        ticket=displaced_ticket,
+                    )
                 # The newest selection IS this active read: any older queued
                 # entry is no longer latest and terminalizes SUPERSEDED now
                 # (§20.4 — the active read itself is never cancelled).
@@ -144,19 +196,26 @@ class HydrationTransport:
                 if queued is not None:
                     self._queued = None
                     self._complete_locked(
-                        queued.token, HydrationOutcome.SUPERSEDED
+                        queued.token,
+                        HydrationOutcome.SUPERSEDED,
+                        ticket=queued.ticket,
                     )
-                return token
+                return active.ticket
             projection, key = self._derive(request)
             entry = _TransportEntry(
-                request, projection, key, bool(closed), token
+                request, projection, key, bool(closed), token,
+                _HydrationTicket(token),
             )
             queued = self._queued
             if queued is not None:
-                self._complete_locked(queued.token, HydrationOutcome.SUPERSEDED)
+                self._complete_locked(
+                    queued.token,
+                    HydrationOutcome.SUPERSEDED,
+                    ticket=queued.ticket,
+                )
             self._queued = entry
             self._ensure_worker_locked()
-            return token
+            return entry.ticket
 
     # -- cancellation and retirement ---------------------------------------- #
 
@@ -167,7 +226,11 @@ class HydrationTransport:
             queued = self._queued
             if queued is not None and queued.request.commit_gate is gate:
                 self._queued = None
-                self._complete_locked(queued.token, HydrationOutcome.CANCELLED)
+                self._complete_locked(
+                    queued.token,
+                    HydrationOutcome.CANCELLED,
+                    ticket=queued.ticket,
+                )
 
     def retains_gate(self, gate) -> bool:
         """Whether any admitted request still carries *gate* (stores/gate)."""
@@ -183,7 +246,11 @@ class HydrationTransport:
             self._retired = True
             queued, self._queued = self._queued, None
             if queued is not None:
-                self._complete_locked(queued.token, HydrationOutcome.CANCELLED)
+                self._complete_locked(
+                    queued.token,
+                    HydrationOutcome.CANCELLED,
+                    ticket=queued.ticket,
+                )
             worker = self._worker
         if (
             worker is not None
@@ -216,6 +283,7 @@ class HydrationTransport:
                         queued.token,
                         HydrationOutcome.FAILED,
                         "transport worker failed to start",
+                        ticket=queued.ticket,
                     )
 
     def _run(self) -> None:
@@ -229,17 +297,29 @@ class HydrationTransport:
             outcome, diagnostic = self._execute(entry)
             with self._lock:
                 final = entry.token
+                current_ticket = entry.ticket
                 self._active = None
                 committed = entry.committed_token
-                if committed is not None and final != committed:
-                    # The presentation moved after the read was committed: the
-                    # data is resident, the newer token re-projects from it.
-                    self._complete_locked(committed, outcome, diagnostic)
+                committed_ticket = entry.committed_ticket
+                if (
+                    committed_ticket is not None
+                    and committed_ticket is not current_ticket
+                ):
+                    # Presentation moved after the commit.  Compare ADMISSION
+                    # IDENTITY so A-to-B-to-A (equal values, distinct
+                    # admissions) resolves; first-wins keeps the SUPERSEDED.
                     self._complete_locked(
-                        final, HydrationOutcome.ALREADY_RESIDENT
+                        committed, outcome, diagnostic, ticket=committed_ticket
+                    )
+                    self._complete_locked(
+                        final,
+                        HydrationOutcome.ALREADY_RESIDENT,
+                        ticket=current_ticket,
                     )
                 else:
-                    self._complete_locked(final, outcome, diagnostic)
+                    self._complete_locked(
+                        final, outcome, diagnostic, ticket=current_ticket
+                    )
 
     def _execute(self, entry: _TransportEntry):
         try:
@@ -250,12 +330,14 @@ class HydrationTransport:
         except Exception as error:
             return HydrationOutcome.FAILED, _diagnostic(error)
         with self._lock:
+            # Snapshot token AND receipt together, before the commit is built.
             token = entry.token
             closed = entry.closed
+            entry.committed_token = token
+            entry.committed_ticket = entry.ticket
         prepared = PreparedHydrationCommit(
             entry.request, token, entry.key, closed, preview, entry.projection
         )
-        entry.committed_token = token
         for attempt in (0, 1):
             try:
                 outcome = self._commit(prepared)
@@ -276,12 +358,17 @@ class HydrationTransport:
         token: HydrationToken,
         outcome: HydrationOutcome,
         diagnostic: str | None = None,
+        *,
+        ticket: _HydrationTicket | None = None,
     ) -> None:
         completion = HydrationCompletion(token, outcome, diagnostic or None)
+        # Raw diagnostics stay truthful even if a receipt refuses the event.
         self._counters[outcome] += 1
         self._completions.append(completion)
+        settled = True if ticket is None else ticket._settle(completion)
         sink = self._completion_sink
-        if sink is not None:
+        # Only a FIRST settlement reaches the sink.
+        if sink is not None and settled:
             try:
                 sink(completion)
             except Exception:

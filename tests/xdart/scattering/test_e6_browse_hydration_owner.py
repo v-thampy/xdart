@@ -19,6 +19,7 @@ import numpy as np
 
 from xdart.gui.tabs.scattering.events import CleanupStatus
 from xrd_tools.session.hydration import (
+    HydrationCompletion,
     HydrationOutcome,
     HydrationPurpose,
     HydrationReadKey,
@@ -194,13 +195,15 @@ def test_warm_browse_transport_choice_is_frozen_once_at_admission(
     calls: list[str] = []
 
     class _LateTransport:
-        def submit(self, _request, **_kwargs):
+        def _submit_admission(self, _request, **_kwargs):
             calls.append("late")
             return None
 
+    # Borrowed Browse admits through the private ticket seam (E6-PM2), so the
+    # frozen-choice fact is observed there; the asserted contract is unchanged.
     monkeypatch.setattr(
         admitted_transport,
-        "submit",
+        "_submit_admission",
         lambda _request, **_kwargs: calls.append("admitted"),
     )
     monkeypatch.setattr(acquisition.publication_store, "_transport", _LateTransport())
@@ -622,3 +625,271 @@ def test_foreign_or_superseded_completion_is_inert_for_browse_owner(
     assert controller.poll_browse_preview() is False
     assert owner.detector_outcome(browse, 1) is None
     assert owner.detector_outcome(browse, 2) is None
+
+
+# E6-PM2 ratified admission tickets (2026-08-04): the owner tracks transport
+# ticket OBJECTS, never token values and never the diagnostic deque, so an
+# equal-valued token from a later admission cannot consume a stale completion
+# and a rotated-out completion cannot be lost.
+
+
+def _foreign_request(browse, label, generation):
+    """An admission for a DIFFERENT frame of the same Browse artifact."""
+
+    from xdart.modules.display_context import HydrationRequest
+    from xrd_tools.session.hydration import HydrationToken
+
+    read_key = HydrationReadKey(
+        HydrationScope(*browse.hydration_owner.as_tuple()),
+        browse.requested_path,
+        label,
+        HydrationPurpose.PREVIEW,
+    )
+    return HydrationRequest(
+        label,
+        HydrationPurpose.PREVIEW,
+        generation,
+        browse.hydration_owner,
+        (browse.publication_store,),
+        browse.commit_gate,
+        read_key=read_key,
+        token=HydrationToken(read_key, generation),
+    )
+
+
+def _browse_request(controller, browse, label):
+    return _foreign_request(
+        browse, label, controller.selection.display_generation
+    )
+
+
+def _hold_browse_reads(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    original = _transport_api().read_frame_preview
+
+    def held(*args, **kwargs):
+        entered.set()
+        release.wait(timeout=10.0)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(_transport_api(), "read_frame_preview", held)
+    return entered, release
+
+
+def test_e6pm2_same_token_rehydration_does_not_consume_a_stale_completion(
+    monkeypatch, tmp_path
+):
+    """The ratified ABA row: equal token, different admission."""
+
+    controller, _acquisition, browse, _processed = _adopted_browse(tmp_path)
+    owner = _bound_owner(controller)
+    transport = owner.transport
+    _browse_key(controller, 2)
+    request = _browse_request(controller, browse, 2)
+
+    _demote_browse_publication(browse, 2)
+    assert owner.submit(request) == request.token
+    _settle_transport(transport)
+    assert owner.consume_repaint() is True
+
+    entered, release = _hold_browse_reads(monkeypatch)
+    assert owner.submit(request) == request.token
+    assert entered.wait(timeout=10.0)
+
+    # Only the FIRST admission's completion is available; it must not satisfy
+    # this one.
+    assert owner.consume_repaint() is False
+    assert owner.polling_needed() is True
+
+    release.set()
+    _settle_transport(transport)
+    assert owner.consume_repaint() is True
+    assert owner.polling_needed() is False
+
+
+def test_e6pm2_rotated_out_completion_is_still_observed_exactly_once(
+    monkeypatch, tmp_path
+):
+    controller, _acquisition, browse, _processed = _adopted_browse(tmp_path)
+    owner = _bound_owner(controller)
+    transport = owner.transport
+    _browse_key(controller, 2)
+    _demote_browse_publication(browse, 2)
+
+    assert owner.submit(_browse_request(controller, browse, 2)) is not None
+    _settle_transport(transport)
+
+    # Push the owned completion out of the bounded 32-entry diagnostic deque
+    # with FOREIGN traffic the owner does not track, BEFORE it ever looks, so
+    # the rotated-out receipt is the only thing that can produce a wake.
+    entered, release = _hold_browse_reads(monkeypatch)
+    transport.submit(_foreign_request(browse, 1, 500))
+    assert entered.wait(timeout=10.0)
+    for generation in range(100, 134):
+        transport.submit(_foreign_request(browse, 3, generation))
+    assert len(transport.completions()) == 32
+    owned = _admitted_browse_token(controller, browse, 2)
+    assert all(
+        completion.token != owned for completion in transport.completions()
+    )
+
+    release.set()
+    _settle_transport(transport)
+    # The consumer holds its own receipt, so rotation cannot lose the fact.
+    assert owner.consume_repaint() is True
+    assert owner.consume_repaint() is False
+
+
+def test_e6pm2_active_and_queued_admissions_both_retain_terminal_facts(
+    monkeypatch, tmp_path
+):
+    controller, _acquisition, browse, _processed = (
+        _warm_browse_without_detector(tmp_path)
+    )
+    owner = _bound_owner(controller)
+    transport = owner.transport
+    _browse_key(controller, 2)
+
+    entered, release = _hold_browse_reads(monkeypatch)
+    first = _browse_request(controller, browse, 2)
+    assert owner.submit(first) is not None
+    assert entered.wait(timeout=10.0)
+    # Same admission resubmitted: deduplicated by ticket identity.  (Done
+    # BEFORE queuing B: a same-read resubmit legitimately supersedes a queued
+    # entry, which is the accepted latest-selection-wins rule.)
+    assert owner.submit(first) is not None
+    # Active A plus queued B is normal; one slot would drop A's fact.
+    assert owner.submit(_browse_request(controller, browse, 3)) is not None
+    assert owner.polling_needed() is True
+
+    release.set()
+    _settle_transport(transport)
+    assert owner.consume_repaint() is True
+    assert owner.consume_repaint() is False
+    assert owner.polling_needed() is False
+    # BOTH admissions' terminal facts were applied, not just the latest.
+    assert owner.detector_outcome(browse, 2) is not None
+    assert owner.detector_outcome(browse, 3) is not None
+
+
+def test_e6pm2_superseded_is_inert_on_borrowed_and_owned_paths(
+    monkeypatch, tmp_path
+):
+    controller, _acquisition, browse, _processed = _adopted_browse(tmp_path)
+    owner = _bound_owner(controller)
+    transport = owner.transport
+    _browse_key(controller, 2)
+    _demote_browse_publication(browse, 2)
+
+    entered, release = _hold_browse_reads(monkeypatch)
+    assert owner.submit(_browse_request(controller, browse, 2)) is not None
+    assert entered.wait(timeout=10.0)
+    # Move the presentation on the SAME read: the displaced admission settles
+    # SUPERSEDED and must neither terminalize nor repaint.
+    moved = _foreign_request(
+        browse, 2, controller.selection.display_generation + 1
+    )
+    assert owner.submit(moved) is not None
+    assert transport.counters()[HydrationOutcome.SUPERSEDED] >= 1
+    assert owner.consume_repaint() is False
+    assert owner.detector_outcome(browse, 2) is None
+
+    release.set()
+    _settle_transport(transport)
+    assert owner.consume_repaint() is True
+
+    # The cold OWNED sink obeys the same rule.
+    cold_controller, cold_browse, _p = _adopted_cold_browse(tmp_path / "cold")
+    cold_owner = _bound_owner(cold_controller)
+    cold_owner._complete(
+        HydrationCompletion(
+            _admitted_browse_token(cold_controller, cold_browse, 1),
+            HydrationOutcome.SUPERSEDED,
+        )
+    )
+    assert cold_owner.consume_repaint() is False
+    assert cold_owner.detector_outcome(cold_browse, 1) is None
+
+
+def test_e6pm2_borrowed_release_never_cancels_or_retires_and_keeps_tickets(
+    monkeypatch, tmp_path
+):
+    controller, acquisition, browse, _processed = _adopted_browse(tmp_path)
+    owner = _bound_owner(controller)
+    transport = owner.transport
+    _browse_key(controller, 2)
+    _demote_browse_publication(browse, 2)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        transport, "cancel_gate", lambda gate: calls.append("cancel_gate")
+    )
+    monkeypatch.setattr(
+        transport, "retire", lambda **kwargs: calls.append("retire") or True
+    )
+
+    entered, release = _hold_browse_reads(monkeypatch)
+    assert owner.submit(_browse_request(controller, browse, 2)) is not None
+    assert entered.wait(timeout=10.0)
+
+    receipt = controller.close()
+    assert receipt.cleanup_status is CleanupStatus.CLEANUP_PENDING
+    # Borrowed release touches neither lifecycle seam and keeps its receipts.
+    assert calls == []
+    assert owner.polling_needed() is True
+
+    release.set()
+    _settle_transport(transport)
+    deadline = time.monotonic() + 10.0
+    while (
+        receipt.cleanup_status is not CleanupStatus.CLEANED
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
+        receipt = controller.close()
+    assert receipt.cleanup_status is CleanupStatus.CLEANED
+    assert calls == []
+    assert transport is acquisition.publication_store.transport
+
+
+def test_e6pm2_a_to_b_to_a_split_resolves_by_admission_identity(
+    monkeypatch, tmp_path
+):
+    """Token values compare equal across A-to-B-to-A; admissions do not."""
+
+    controller, _acquisition, browse, _processed = (
+        _warm_browse_without_detector(tmp_path)
+    )
+    owner = _bound_owner(controller)
+    transport = owner.transport
+    _browse_key(controller, 2)
+    generation = controller.selection.display_generation
+    entered = threading.Event()
+    release = threading.Event()
+    original_commit = transport._commit
+
+    def held_commit(prepared):
+        entered.set()
+        release.wait(timeout=10.0)
+        return original_commit(prepared)
+
+    monkeypatch.setattr(transport, "_commit", held_commit)
+
+    first = transport._submit_admission(_foreign_request(browse, 2, generation))
+    assert entered.wait(timeout=10.0)  # committed_token/ticket now snapshotted
+    moved = transport._submit_admission(
+        _foreign_request(browse, 2, generation + 1)
+    )
+    back = transport._submit_admission(
+        _foreign_request(browse, 2, generation)
+    )
+    assert back is not first and back is not moved
+    assert back.token == first.token  # equal VALUE, different admission
+
+    release.set()
+    _settle_transport(transport)
+    # First-wins keeps the displaced facts; only the CURRENT admission takes
+    # the already-resident terminal fact.
+    assert first.result().outcome is HydrationOutcome.SUPERSEDED
+    assert moved.result().outcome is HydrationOutcome.SUPERSEDED
+    assert back.result().outcome is HydrationOutcome.ALREADY_RESIDENT

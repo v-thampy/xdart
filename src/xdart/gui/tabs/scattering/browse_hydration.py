@@ -15,7 +15,6 @@ from xrd_tools.session.hydration import (
     HydrationPurpose,
     HydrationReadKey,
     HydrationScope,
-    HydrationToken,
 )
 
 from .browse_values import BrowseCleanupReceipt, BrowseLoadRequest
@@ -24,7 +23,11 @@ from .display_runtime import (
     publication_needs_hydration,
 )
 from .events import CleanupStatus
-from .hydration_transport import HydrationTransport, PreparedHydrationCommit
+from .hydration_transport import (
+    HydrationTransport,
+    PreparedHydrationCommit,
+    _HydrationTicket,
+)
 
 
 class _BrowseHydrationOwner:
@@ -48,12 +51,10 @@ class _BrowseHydrationOwner:
         self._terminal_lock = Lock()
         self._terminal_reads: set[HydrationReadKey] = set()
         self._repaints = SimpleQueue()
-        #: Exact tokens this owner admitted onto a BORROWED transport and
-        #: whose completion it has not yet observed.  The borrowed transport's
-        #: sink belongs to the acquisition owner, so the Browse completion is
-        #: read from its public snapshot instead — by exact token, never by a
-        #: deque offset, which rotation would invalidate.
-        self._borrowed_tokens: set[HydrationToken] = set()
+        #: Admission receipts held on a BORROWED transport (whose sink is the
+        #: acquisition owner's).  Tokens are VALUES, so identity is the ticket
+        #: OBJECT; bounded by one-active plus one-latest-queued.
+        self._borrowed_tickets: list[_HydrationTicket] = []
         self._owns_transport = borrowed_transport is None
         self.transport = (
             HydrationTransport(
@@ -116,6 +117,11 @@ class _BrowseHydrationOwner:
 
     def _complete(self, completion: HydrationCompletion) -> None:
         if (
+            type(completion) is not HydrationCompletion
+            or completion.outcome is HydrationOutcome.SUPERSEDED
+        ):
+            return  # inert on BOTH Browse paths: the newer admission owns it
+        if (
             type(completion) is HydrationCompletion
             and completion.outcome is not HydrationOutcome.SUPERSEDED
         ):
@@ -139,17 +145,18 @@ class _BrowseHydrationOwner:
         with self._terminal_lock:
             if read_key in self._terminal_reads:
                 return None
-        token = self.transport.submit(request)
-        if (
-            not self._owns_transport
-            and type(token) is HydrationToken
-            and token == request.token
-        ):
-            # Retain the fact only for the exact token the transport admitted:
-            # a refusal (None) or any other token is not this Browse read.
-            with self._terminal_lock:
-                self._borrowed_tokens.add(token)
-        return token
+        if self._owns_transport:
+            return self.transport.submit(request)
+        self._observe_borrowed()
+        ticket = self.transport._submit_admission(request)
+        if type(ticket) is not _HydrationTicket:
+            return None
+        with self._terminal_lock:
+            # Deduplicate a re-returned outstanding receipt by IDENTITY.
+            if not any(held is ticket for held in self._borrowed_tickets):
+                self._borrowed_tickets.append(ticket)
+        self._observe_borrowed()
+        return ticket.token
 
     def detector_outcome(self, browse: BrowseContext, label):
         if (
@@ -219,27 +226,29 @@ class _BrowseHydrationOwner:
         return HydrationOutcome.HYDRATED
 
     def _observe_borrowed(self) -> None:
-        """Turn this owner's own borrowed completions into owned-path wakes.
+        """Sweep settled receipts into owned-path wakes, each exactly once.
+        The deque is never consulted: a receipt carries its own fact, so an
+        equal-valued admission cannot satisfy this one and rotation is safe."""
 
-        Reads only the transport's public completion snapshot and matches by
-        exact admitted token, so a foreign acquisition read, an equal-valued
-        foreign Browse read and a superseded presentation generation are all
-        inert.  Each exact token is consumed once, giving one repaint per
-        terminal completion rather than an unbounded sequence.
-        """
-
-        with self._terminal_lock:
-            if not self._borrowed_tokens:
-                return
-        for completion in self.transport.completions():
-            if type(completion) is not HydrationCompletion:
-                continue
+        while True:
             with self._terminal_lock:
-                if completion.token not in self._borrowed_tokens:
-                    continue
-                self._borrowed_tokens.discard(completion.token)
+                settled = next(
+                    (
+                        held
+                        for held in self._borrowed_tickets
+                        if held.result() is not None
+                    ),
+                    None,
+                )
+                if settled is None:
+                    return
+                self._borrowed_tickets = [
+                    held
+                    for held in self._borrowed_tickets
+                    if held is not settled
+                ]
             # Released before _complete: _terminalize takes the same lock.
-            self._complete(completion)
+            self._complete(settled.result())
 
     def consume_repaint(self) -> bool:
         if not self._owns_transport:
@@ -258,7 +267,7 @@ class _BrowseHydrationOwner:
             # keep this page awake.  Only this owner's own outstanding read
             # or an unconsumed wake does.
             with self._terminal_lock:
-                awaiting = bool(self._borrowed_tokens)
+                awaiting = bool(self._borrowed_tickets)
             return awaiting or not self._repaints.empty()
         worker = self.transport.worker
         return (
@@ -284,8 +293,11 @@ class _BrowseHydrationOwner:
             return BrowseCleanupReceipt(
                 request, CleanupStatus.CLEANUP_PENDING
             )
-        self.transport.cancel_gate(self._gate)
+        if self._owns_transport:
+            # Only an OWNED transport is cancelled/retired here.
+            self.transport.cancel_gate(self._gate)
         if self.transport.retains_gate(self._gate):
+            # Retain receipts: pending B-to-C leaves B current and its wake due.
             return BrowseCleanupReceipt(
                 request, CleanupStatus.CLEANUP_PENDING
             )
@@ -293,7 +305,11 @@ class _BrowseHydrationOwner:
             return BrowseCleanupReceipt(
                 request, CleanupStatus.CLEANUP_PENDING
             )
-        return loader.release_context(browse)
+        receipt = loader.release_context(browse)
+        if receipt.cleanup_status is CleanupStatus.CLEANED:
+            with self._terminal_lock:
+                self._borrowed_tickets = []
+        return receipt
 
 
 __all__ = []

@@ -2593,3 +2593,220 @@ def test_batch_run_click_projects_phase_and_control_lock_without_display_repaint
         page.close_workspace()
         page.deleteLater()
         qapp.processEvents()
+
+
+# E6-PM2 admission-instance tickets (ratified 2026-08-04): HydrationToken is a
+# VALUE, so a re-admitted equal-generation read yields an equal token while the
+# first completion still sits in the bounded diagnostic deque.  The transport
+# mints one private ticket per admission; ticket OBJECT IDENTITY is the
+# admission identity.  The deque and counters stay raw.
+
+
+def _ticket_type():
+    return getattr(_transport_api(), "_HydrationTicket", None)
+
+
+def _admit(transport, request, *, closed=False):
+    seam = getattr(transport, "_submit_admission", None)
+    assert seam is not None, "transport must expose the private ticket seam"
+    return seam(request, closed=closed)
+
+
+def _hold_reads(monkeypatch):
+    """Block the worker inside the real read; returns (entered, release)."""
+
+    entered = threading.Event()
+    release = threading.Event()
+    original = _transport_api().read_frame_preview
+
+    def held(*args, **kwargs):
+        entered.set()
+        release.wait(timeout=10.0)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(_transport_api(), "read_frame_preview", held)
+    return entered, release
+
+
+def test_e6pm2_ticket_contract_refusal_and_distinct_admissions(
+    monkeypatch, tmp_path
+):
+    api = _transport_api()
+    ticket_type = _ticket_type()
+    assert ticket_type is not None, "hydration_transport needs _HydrationTicket"
+    assert api.__all__ == ["HydrationTransport", "PreparedHydrationCommit"]
+
+    state, owner, processed, _raw, _events = _bound_state(monkeypatch, tmp_path)
+    art_owner, gate = _acquisition_identity(state)
+    transport = state.transport
+    request = _typed_request(
+        state, art_owner, gate, processed, 2, HydrationPurpose.PREVIEW, 1
+    )
+
+    first = _admit(transport, request)
+    assert type(first) is ticket_type
+    assert first.token == request.token
+    assert first.result() is None and first.result() is None
+    assert _wait_transport_idle(state)
+    assert first.result() is not None
+
+    # Equal-valued token, a brand-new admission: a DIFFERENT ticket object.
+    second = _admit(transport, request)
+    assert second is not first
+    assert second.token == first.token
+    assert _wait_transport_idle(state)
+
+    # The public seam still speaks tokens only, never a ticket.
+    third = transport.submit(request)
+    assert type(third) is HydrationToken
+    assert _wait_transport_idle(state)
+
+    # A refused admission (retired transport) mints nothing.
+    transport.retire(join_timeout=1.0)
+    assert _admit(transport, request) is None
+    assert transport.submit(request) is None
+
+
+def test_e6pm2_same_active_same_token_resubmit_returns_one_ticket(
+    monkeypatch, tmp_path
+):
+    state, owner, processed, _raw, _events = _bound_state(monkeypatch, tmp_path)
+    art_owner, gate = _acquisition_identity(state)
+    transport = state.transport
+    request = _typed_request(
+        state, art_owner, gate, processed, 2, HydrationPurpose.PREVIEW, 1
+    )
+    entered, release = _hold_reads(monkeypatch)
+
+    first = _admit(transport, request)
+    assert entered.wait(timeout=10.0)
+    assert _admit(transport, request) is first  # one outstanding receipt
+
+    release.set()
+    assert _wait_transport_idle(state)
+    assert first.result() is not None
+    assert first.result().outcome is not HydrationOutcome.SUPERSEDED
+
+
+def test_e6pm2_moved_presentation_supersedes_the_displaced_ticket(
+    monkeypatch, tmp_path
+):
+    state, owner, processed, _raw, _events = _bound_state(monkeypatch, tmp_path)
+    art_owner, gate = _acquisition_identity(state)
+    transport = state.transport
+    entered, release = _hold_reads(monkeypatch)
+
+    ticket_a = _admit(
+        transport,
+        _typed_request(
+            state, art_owner, gate, processed, 2, HydrationPurpose.PREVIEW, 1
+        ),
+    )
+    assert entered.wait(timeout=10.0)
+    before = len(transport.completions())
+    ticket_b = _admit(
+        transport,
+        _typed_request(
+            state, art_owner, gate, processed, 2, HydrationPurpose.PREVIEW, 2
+        ),
+    )
+    assert ticket_b is not ticket_a
+    # The displaced presentation settles at once; the raw deque still records it.
+    assert ticket_a.result().outcome is HydrationOutcome.SUPERSEDED
+    assert len(transport.completions()) == before + 1
+    assert transport.counters()[HydrationOutcome.SUPERSEDED] >= 1
+    assert ticket_b.result() is None
+
+    release.set()
+    assert _wait_transport_idle(state)
+    assert ticket_b.result() is not None
+    # First-wins keeps the superseded fact immutable through the final split.
+    assert ticket_a.result().outcome is HydrationOutcome.SUPERSEDED
+
+
+def test_e6pm2_settlement_validates_token_and_is_first_wins(
+    monkeypatch, tmp_path
+):
+    ticket_type = _ticket_type()
+    assert ticket_type is not None
+    state, owner, processed, _raw, _events = _bound_state(monkeypatch, tmp_path)
+    art_owner, gate = _acquisition_identity(state)
+    mine = _typed_request(
+        state, art_owner, gate, processed, 2, HydrationPurpose.PREVIEW, 1
+    )
+    other = _typed_request(
+        state, art_owner, gate, processed, 3, HydrationPurpose.PREVIEW, 1
+    )
+    ticket = ticket_type(mine.token)
+
+    assert ticket._settle(
+        HydrationCompletion(other.token, HydrationOutcome.HYDRATED)
+    ) is False
+    assert ticket.result() is None
+
+    exact = HydrationCompletion(mine.token, HydrationOutcome.FAILED, "one")
+    assert ticket._settle(exact) is True
+    assert ticket.result() is exact
+    assert ticket._settle(
+        HydrationCompletion(mine.token, HydrationOutcome.HYDRATED, "two")
+    ) is False
+    assert ticket.result() is exact
+
+
+def test_e6pm2_queued_displacement_cancel_and_worker_failure_settle_exactly(
+    monkeypatch, tmp_path
+):
+    state, owner, processed, _raw, _events = _bound_state(monkeypatch, tmp_path)
+    art_owner, gate = _acquisition_identity(state)
+    transport = state.transport
+    entered, release = _hold_reads(monkeypatch)
+
+    active = _admit(
+        transport,
+        _typed_request(
+            state, art_owner, gate, processed, 2, HydrationPurpose.PREVIEW, 1
+        ),
+    )
+    assert entered.wait(timeout=10.0)
+    queued_first = _admit(
+        transport,
+        _typed_request(
+            state, art_owner, gate, processed, 3, HydrationPurpose.PREVIEW, 1
+        ),
+    )
+    queued_second = _admit(
+        transport,
+        _typed_request(
+            state, art_owner, gate, processed, 4, HydrationPurpose.PREVIEW, 1
+        ),
+    )
+    assert queued_first.result().outcome is HydrationOutcome.SUPERSEDED
+    assert queued_second.result() is None
+
+    transport.cancel_gate(gate)
+    assert queued_second.result().outcome is HydrationOutcome.CANCELLED
+    # An ACTIVE ticket settles only through its own execution/commit path.
+    assert active.result() is None
+
+    release.set()
+    assert _wait_transport_idle(state)
+    assert active.result() is not None
+    assert active.result().outcome is not HydrationOutcome.CANCELLED
+
+
+def test_e6pm2_worker_start_failure_settles_failed(monkeypatch, tmp_path):
+    state, owner, processed, _raw, _events = _bound_state(monkeypatch, tmp_path)
+    art_owner, gate = _acquisition_identity(state)
+
+    def refuse_start(self):
+        raise RuntimeError("no thread")
+
+    monkeypatch.setattr(threading.Thread, "start", refuse_start)
+    ticket = _admit(
+        state.transport,
+        _typed_request(
+            state, art_owner, gate, processed, 2, HydrationPurpose.PREVIEW, 1
+        ),
+    )
+    assert ticket is not None
+    assert ticket.result().outcome is HydrationOutcome.FAILED
