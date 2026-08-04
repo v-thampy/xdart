@@ -132,8 +132,10 @@ def test_multi_output_gi_repeated_labels_keep_distinct_catalog_entries(
             for index in range(selector.count())
         ) == catalog.entries
         assert shell.scientific.progress.text() == "2/2"
-        assert shell.scientific.status.text() == "second.nxs · frame 0"
-        assert shell.scientific.title.text() == "second.nxs · frame 0"
+        # Container members are presented one-based (source_frame_index + 1)
+        # while the catalog key keeps its 0-based local_frame_label.
+        assert shell.scientific.status.text() == "second.nxs · frame 1"
+        assert shell.scientific.title.text() == "second.nxs · frame 1"
     finally:
         page.close_workspace()
         page.deleteLater()
@@ -204,7 +206,9 @@ def test_eiger_outputs_with_repeated_local_labels_remain_navigable(
             qapp,
             lambda: (
                 selector.currentData() is first
-                and "frame 0" in shell.scientific.title.text()
+                and shell.scientific.title.text().endswith(
+                    "· frame 1"
+                )
             ),
             page=page,
             lifecycle=lifecycle,

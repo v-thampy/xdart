@@ -940,8 +940,12 @@ def test_every_public_projection_holds_released_b_until_atomic_c(
         observations: list[tuple[ShellProjection, tuple]] = []
         real_apply = rig.shell.apply_state
 
-        def observe(state: ShellProjection) -> None:
-            real_apply(state)
+        def observe(
+            state: ShellProjection,
+            *,
+            preserve_display: bool = False,
+        ) -> None:
+            real_apply(state, preserve_display=preserve_display)
             current_index = rig.shell.browser.frames.currentIndex()
             selected_scans = tuple(
                 item.data(QtCore.Qt.ItemDataRole.UserRole)

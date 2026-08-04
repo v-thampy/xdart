@@ -37,6 +37,24 @@ def _browser_selected(
     )
 
 
+def _row_of(
+    shell: ScatteringWorkspaceShell,
+    frame: DisplayFrameKey,
+) -> int | None:
+    """Locate a catalog row the way production does: by object identity."""
+
+    model = shell.browser.frames.model()
+    return next(
+        (
+            row
+            for row in range(model.rowCount())
+            if model.index(row, 0).data(QtCore.Qt.ItemDataRole.UserRole)
+            is frame
+        ),
+        None,
+    )
+
+
 def test_e3_ui61_user_clear_emits_empty_membership_then_projects_total(
     qapp: QtWidgets.QApplication,
 ) -> None:
@@ -48,7 +66,9 @@ def test_e3_ui61_user_clear_emits_empty_membership_then_projects_total(
     shell.browser.commandRequested.connect(browser_commands.append)
     try:
         shell.apply_state(state)
-        assert len(_browser_selected(shell)) == 5
+        # A fresh Overlay catalog collapses membership to the current frame.
+        assert len(_browser_selected(shell)) == 1
+        assert _browser_selected(shell)[0] is state.navigation.current
 
         shell.browser.frames.selectionModel().clearSelection()
         QtTest.QTest.qWait(130)
@@ -56,8 +76,19 @@ def test_e3_ui61_user_clear_emits_empty_membership_then_projects_total(
         assert commands[0].kind is (
             ShellCommandKind.SELECT_BROWSER_FRAMES
         )
-        assert commands[0].frame is None
-        assert commands[0].frames == ()
+        # Accepted split: a user clear reports the still-current frame and
+        # the committed membership.  The browser no longer synthesises an
+        # empty membership — the page owns accumulation and projects the
+        # empty total below.
+        assert commands[0].frame is state.navigation.current
+        assert all(
+            actual is expected
+            for actual, expected in zip(
+                commands[0].frames,
+                state.navigation.selected,
+                strict=True,
+            )
+        )
         assert browser_commands == commands
 
         empty = replace(
@@ -82,13 +113,19 @@ def test_e3_ui61_user_clear_emits_empty_membership_then_projects_total(
         assert commands == []
 
         shell.apply_state(replace(state, revision=4))
-        assert len(_browser_selected(shell)) == 5
+        assert len(_browser_selected(shell)) == 1
+        assert _browser_selected(shell)[0] is state.navigation.current
         commands.clear()
         browser_commands.clear()
         shell.apply_state(
             replace(state, revision=5, navigation=empty)
         )
-        assert _browser_selected(shell) == ()
+        # An empty projection retracts focus but not an accumulated visit:
+        # membership is retired by the user or by a new catalog, never by a
+        # projection alone.
+        assert _browser_selected(shell)[0] is state.navigation.current
+        assert not shell.browser.frames.currentIndex().isValid()
+        assert shell.scientific.frame_selector.count() == 0
         assert commands == []
         assert browser_commands == []
     finally:
@@ -176,13 +213,22 @@ def test_e3_ui61_equal_distinct_membership_and_current_move_by_identity(
             replace(state, navigation=first)
         )
         assert _browser_selected(shell) == (frame_a,)
+        assert _browser_selected(shell)[0] is frame_a
 
         shell.apply_state(
             replace(state, revision=2, navigation=second)
         )
         assert commands == []
-        assert _browser_selected(shell) == (frame_b,)
-        assert _browser_selected(shell)[0] is frame_b
+        # Accepted split: focus moves to the equal-but-distinct key while
+        # accumulated membership stays on the frame the user actually
+        # visited.  Both resolve by object identity, never by value — the
+        # two keys compare equal, so a value match would collapse them.
+        assert _row_of(shell, frame_a) == 0
+        assert _row_of(shell, frame_b) == 1
+        assert _browser_selected(shell)[0] is frame_a
+        assert shell.browser.frames.currentIndex().row() == _row_of(
+            shell, frame_b
+        )
         assert shell.browser.frames.currentIndex().data(
             QtCore.Qt.ItemDataRole.UserRole
         ) is frame_b

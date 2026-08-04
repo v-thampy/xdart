@@ -65,7 +65,14 @@ from tests.xdart.scattering.test_e3_join_oracle import (
 
 
 _B_SHA256 = (
-    "6110bedb3bb14c1c30978f84b43716339ff099856ab55f96e4ca7f2d9c56a3c6"
+    "7107a9e1c1e726893503b375374206148af14eeab5cf2d5f3697258658d69e05"
+)
+_B_RELATIVE = (
+    "xdart_processed_data/accepted_e6_pm2/"
+    "Combi4_Angledependence_samz_4p9_03271005-7107a9e1c1e7.nxs"
+)
+_B_SHARED_RELATIVE = (
+    "xdart_processed_data/Combi4_Angledependence_samz_4p9_03271005.nxs"
 )
 _XYE_SHA256 = (
     "4e61db7153772697d9cf7a5e728314ffdf4abb3150c5254d2372ca27e99a175b"
@@ -97,11 +104,17 @@ def _real_data_root() -> Path:
 
 @lru_cache(maxsize=1)
 def _accepted_browse_nxs() -> Path:
-    path = (
-        _real_data_root()
-        / "xdart_processed_data"
-        / "Combi4_Angledependence_samz_4p9_03271005.nxs"
-    )
+    # The shared processed output is regenerated in place by live E4 runs, so
+    # it cannot authenticate a Browse boundary.  B2-B4 read a dedicated
+    # immutable copy instead; that path and digest are their sole data
+    # authority.
+    root = _real_data_root()
+    path = root / _B_RELATIVE
+    if path == root / _B_SHARED_RELATIVE:
+        raise RuntimeError(
+            "accepted Browse fixture must be the immutable copy, not the "
+            f"regenerated shared output: {path}"
+        )
     if not path.is_file():
         raise RuntimeError(f"accepted Browse fixture is unavailable: {path}")
     with path.open("rb") as stream:
@@ -415,9 +428,13 @@ def test_j3_real_mounted_run_pause_browse_resume_stop_close(
     applied: list[ShellProjection] = []
     apply_state = shell.apply_state
 
-    def observe(state: ShellProjection) -> None:
+    def observe(
+        state: ShellProjection,
+        *,
+        preserve_display: bool = False,
+    ) -> None:
         applied.append(state)
-        apply_state(state)
+        apply_state(state, preserve_display=preserve_display)
 
     monkeypatch.setattr(shell, "apply_state", observe)
 
@@ -814,11 +831,17 @@ def test_j3_mounted_qualified_xye_only_replaces_images_and_renders_trace(
     )
     shell = rig.shell
     applied: list[ShellProjection] = []
+    preserved: list[bool] = []
     apply_state = shell.apply_state
 
-    def observe(state: ShellProjection) -> None:
+    def observe(
+        state: ShellProjection,
+        *,
+        preserve_display: bool = False,
+    ) -> None:
         applied.append(state)
-        apply_state(state)
+        preserved.append(preserve_display)
+        apply_state(state, preserve_display=preserve_display)
 
     monkeypatch.setattr(shell, "apply_state", observe)
     try:
@@ -868,6 +891,27 @@ def test_j3_mounted_qualified_xye_only_replaces_images_and_renders_trace(
         assert browse.requested_path == str(b_path)
         b_key = rig.controller.frame_keys[0]
         assert b_key.local_frame_label == 44
+
+        def browse_diagnostic() -> str:
+            last = applied[-1] if applied else None
+            painted = (
+                "qualified Browse projection: current_is_b_key="
+                f"{shell.scientific.frame_selector.currentData() is b_key}"
+                f" title={shell.scientific.title.text()!r}"
+                f" raw_cleared={shell.scientific.raw.image.image is None}"
+                f" cake_cleared={shell.scientific.cake.image.image is None}"
+                f" curves={len(shell.scientific.curve.listDataItems())}"
+                f" | applied={len(applied)}"
+            )
+            if last is None:
+                return painted
+            return painted + (
+                f" last_title={last.scientific.title!r}"
+                f" last_heavy={last.scientific.heavy is not None}"
+                f" last_retain={last.scientific.retain_display}"
+                f" preserve_display_tail={preserved[-4:]}"
+            )
+
         _wait(
             rig.app,
             lambda: (
@@ -878,6 +922,7 @@ def test_j3_mounted_qualified_xye_only_replaces_images_and_renders_trace(
                 and shell.scientific.cake.image.image is None
                 and len(shell.scientific.curve.listDataItems()) == 1
             ),
+            diagnostic=browse_diagnostic,
         )
 
         projection = next(

@@ -69,7 +69,16 @@ def test_e3_ui2_browser_multi_selection_carries_exact_frame_keys_once(
     shell.commandRequested.connect(commands.append)
     emitted = QtTest.QSignalSpy(shell.commandRequested)
     selection = shell.browser.frames.selectionModel()
-    assert len(selection.selectedRows()) == 5
+    # A fresh Overlay catalog collapses accumulated membership to the current
+    # frame; membership grows from user visits, not from the projection.
+    assert len(selection.selectedRows()) == 1
+    assert selection.selectedRows()[0].row() == 0
+    catalog = tuple(
+        shell.browser.frames.model().index(row, 0).data(
+            QtCore.Qt.ItemDataRole.UserRole
+        )
+        for row in range(shell.browser.frames.model().rowCount())
+    )
 
     chosen = QtCore.QItemSelection()
     chosen.select(
@@ -93,15 +102,16 @@ def test_e3_ui2_browser_multi_selection_carries_exact_frame_keys_once(
 
     assert len(commands) == 1
     assert commands[0].kind is ShellCommandKind.SELECT_BROWSER_FRAMES
-    assert commands[0].frames == (
-        shell.browser.frames.model().index(0, 0).data(
-            QtCore.Qt.ItemDataRole.UserRole
-        ),
-        shell.browser.frames.model().index(1, 0).data(
-            QtCore.Qt.ItemDataRole.UserRole
-        ),
+    # Overlay decouples focus from membership: the browser reports the newly
+    # focused key plus the committed membership, each as the exact catalog
+    # object.  Accumulating those into a new membership is the page's job.
+    assert commands[0].frame is catalog[1]
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            commands[0].frames, catalog, strict=True
+        )
     )
-    assert commands[0].frame is commands[0].frames[-1]
 
 
 def test_e3_ui2_evicted_selection_requests_hydration_without_blank(

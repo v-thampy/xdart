@@ -415,11 +415,43 @@ def test_j0_02_browser_footer_share_repeated_dotted_exact_keys(
             key for key in rig.controller.frame_keys
             if key.local_frame_label == 1
         )
-        rig.command(
-            ShellCommand(
-                ShellCommandKind.SELECT_SCAN, str(browse)
-            )
+        # Production only emits SELECT_SCAN for a row the filesystem catalog
+        # actually discovered, so the operator route is: open the artifact's
+        # folder, let the real catalog find it, then click that row.
+        monkeypatch.setattr(
+            rig.page,
+            "_browser_directory_chooser",
+            lambda _current: str(browse.parent),
         )
+        rig.command(
+            ShellCommand(ShellCommandKind.MENU, "File:Open Folder")
+        )
+
+        def catalog_row():
+            scans = rig.shell.browser.scans
+            return next(
+                (
+                    scans.item(index)
+                    for index in range(scans.count())
+                    if scans.item(index).data(
+                        QtCore.Qt.ItemDataRole.UserRole
+                    )
+                    == str(browse)
+                ),
+                None,
+            )
+
+        _wait(
+            rig.app,
+            lambda: catalog_row() is not None,
+            diagnostic=lambda: (
+                f"{browse} never entered the browser catalog"
+            ),
+        )
+        discovered = catalog_row()
+        assert discovered is not None
+        discovered.setSelected(True)
+        rig.app.processEvents()
         _wait(
             rig.app,
             lambda: (
@@ -683,8 +715,12 @@ def test_j0_07_b_to_c_releases_b_before_c_and_retains_failed_owner(
         ] = []
         apply_state = rig.shell.apply_state
 
-        def record_presentation(state) -> None:
-            apply_state(state)
+        def record_presentation(
+            state,
+            *,
+            preserve_display: bool = False,
+        ) -> None:
+            apply_state(state, preserve_display=preserve_display)
             presentations.append(
                 (
                     state.navigation.current,
