@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 #: define a scale value.
 FONT_SCALES = ("extra_small", "small", "default", "large", "extra_large")
 
-DEFAULT_FONT_SCALE = "default"
+DEFAULT_FONT_SCALE = "small"
 
 #: ``(key, visible label)`` in menu order.
 FONT_SCALE_MENU = (
@@ -363,8 +363,12 @@ def calibration_button_font(scale=DEFAULT_FONT_SCALE) -> str:
 
 # ── pyqtgraph: one tier for new AND existing plots ───────────────────────
 
+PLOT_TICK_SCALE = 1.30
+PLOT_AXIS_LABEL_SCALE = 1.50
+
+
 def plot_font(scale=None):
-    """Point-sized QFont for pyqtgraph ticks, axis labels and legends."""
+    """Base point-sized QFont for pyqtgraph legends and plot annotations."""
     from pyqtgraph.Qt import QtGui
     scale = normalize_font_scale(scale if scale is not None else _CURRENT_SCALE)
     font = QtGui.QFont(_BASELINE_FONT) if _BASELINE_FONT is not None \
@@ -373,22 +377,35 @@ def plot_font(scale=None):
     return font
 
 
+def _scaled_plot_font(font, factor: float):
+    """Return a detached plot font scaled from the one appearance tier."""
+    from pyqtgraph.Qt import QtGui
+    scaled = QtGui.QFont(font)
+    point_size = font.pointSizeF()
+    if point_size <= 0:
+        point_size = float(font.pointSize())
+    scaled.setPointSizeF(point_size * factor)
+    return scaled
+
+
 def _restyle_axis(axis, font) -> None:
-    """Tick font + axis-label font, then invalidate the cached tick picture.
+    """Scaled tick/label fonts, then invalidate the cached tick picture.
 
     Without the invalidation the axis keeps its cached ``QPicture`` and the
     tick-text space it reserved at the old size, so the labels redraw but the
     geometry does not — the trick ``display_frame_widget._set_raw_pixel_axes``
     already uses.
     """
+    tick_font = _scaled_plot_font(font, PLOT_TICK_SCALE)
+    label_font = _scaled_plot_font(font, PLOT_AXIS_LABEL_SCALE)
     try:
-        axis.setStyle(tickFont=font)
+        axis.setStyle(tickFont=tick_font)
     except Exception:
         return
     label = getattr(axis, "label", None)
     if label is not None:
         try:
-            label.setFont(font)
+            label.setFont(label_font)
         except Exception:
             pass
     try:

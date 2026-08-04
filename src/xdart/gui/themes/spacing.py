@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 
 SPACING_SETTINGS_KEY = "appearance/spacing"
-DEFAULT_SPACING = "normal"
+DEFAULT_SPACING = "tight"
 
 SPACING_MENU = (
     ("extra_tight", "Extra Tight"),
@@ -76,14 +76,14 @@ class SpacingTokens:
 
 SPACING_TOKENS = {
     "extra_tight": SpacingTokens(
-        1, 6, 1, 5, 1, 2, 1, 4, 3, 6, 2, 5, 2, 7, 2, 4,
-        0, 4, 1, 2, 0, 6,
-        3, 4, 4, 4, 6,
-    ),
-    "tight": SpacingTokens(
         3, 9, 2, 7, 1, 3, 2, 5, 4, 8, 3, 6, 3, 10, 3, 5,
         1, 5, 1, 3, 1, 8,
         5, 6, 6, 6, 9,
+    ),
+    "tight": SpacingTokens(
+        3, 10, 2, 8, 1, 3, 2, 6, 5, 9, 4, 7, 3, 11, 3, 6,
+        1, 5, 1, 3, 1, 9,
+        6, 7, 7, 7, 10,
     ),
     "normal": SpacingTokens(
         4, 12, 3, 9, 2, 4, 3, 7, 6, 10, 5, 8, 4, 13, 4, 7,
@@ -91,14 +91,14 @@ SPACING_TOKENS = {
         8, 8, 8, 8, 12,
     ),
     "spacious": SpacingTokens(
+        5, 13, 4, 10, 3, 5, 4, 8, 7, 11, 6, 9, 5, 14, 5, 8,
+        2, 7, 2, 5, 2, 11,
+        9, 10, 9, 9, 13,
+    ),
+    "extra_spacious": SpacingTokens(
         6, 15, 5, 12, 4, 6, 5, 9, 8, 13, 7, 11, 6, 16, 6, 10,
         3, 9, 3, 6, 3, 12,
         11, 12, 11, 11, 15,
-    ),
-    "extra_spacious": SpacingTokens(
-        8, 18, 7, 15, 6, 8, 7, 11, 10, 16, 9, 14, 8, 19, 8, 13,
-        5, 12, 5, 8, 5, 15,
-        14, 16, 14, 14, 18,
     ),
 }
 

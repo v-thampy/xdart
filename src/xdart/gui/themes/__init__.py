@@ -1,11 +1,12 @@
 """xdart UI themes.
 
-The small values modules own font, selected-control accent, and spacing
-choices; :mod:`.dark` owns the palettes and QSS that consume them.
+The small values modules own font, selected-control accent, spacing, and
+Controls-card corner choices; :mod:`.dark` owns the palettes and QSS that
+consume them.
 ``apply_theme`` remains the only live appearance entry point.
 """
 
-from . import accent, spacing
+from . import accent, corners, spacing
 from .accent import (
     ACCENT_COLOR_MENU,
     ACCENT_COLOR_SETTINGS_KEY,
@@ -53,12 +54,22 @@ from .spacing import (
     resolve_spacing,
     spacing_tokens,
 )
+from .corners import (
+    CONTROLS_CARD_CORNERS_SETTINGS_KEY,
+    DEFAULT_CONTROLS_CARD_CORNERS,
+    controls_card_radius,
+    current_controls_card_corners,
+    normalize_controls_card_corners,
+    resolve_controls_card_corners,
+    set_current_controls_card_corners,
+)
 
 __all__ = [
     "DARK",
     "LIGHT",
     "DARK_QSS",
     "accent",
+    "corners",
     "spacing",
     "apply_dark_theme",
     "apply_theme",
@@ -96,4 +107,11 @@ __all__ = [
     "normalize_spacing",
     "resolve_spacing",
     "spacing_tokens",
+    "CONTROLS_CARD_CORNERS_SETTINGS_KEY",
+    "DEFAULT_CONTROLS_CARD_CORNERS",
+    "controls_card_radius",
+    "current_controls_card_corners",
+    "normalize_controls_card_corners",
+    "resolve_controls_card_corners",
+    "set_current_controls_card_corners",
 ]

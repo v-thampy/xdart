@@ -236,6 +236,11 @@ from xdart.gui.themes.spacing import (
     normalize_spacing,
     resolve_spacing,
 )
+from xdart.gui.themes.corners import (
+    CONTROLS_CARD_CORNERS_SETTINGS_KEY,
+    normalize_controls_card_corners,
+    resolve_controls_card_corners,
+)
 
 
 QMainWindow = QtWidgets.QMainWindow
@@ -390,6 +395,7 @@ class Main(QMainWindow):
         font_scale = resolve_font_scale(settings)
         accent_color = resolve_accent_color(settings)
         spacing = resolve_spacing(settings)
+        controls_card_corners = resolve_controls_card_corners(settings)
         self.host_config_menu = QtWidgets.QMenu("Config", self.ui.menubar)
         self.host_config_menu.setObjectName("menuConfig")
         self.host_help_menu = QtWidgets.QMenu("Help", self.ui.menubar)
@@ -456,6 +462,15 @@ class Main(QMainWindow):
             spacing_group.addAction(action)
             self.spacingMenu.addAction(action)
             self.spacingActions[choice] = action
+        self.actionRoundedCorners = QtGui.QAction(
+            "Rounded Corners",
+            self,
+        )
+        self.actionRoundedCorners.setCheckable(True)
+        self.actionRoundedCorners.setChecked(controls_card_corners)
+        self.actionRoundedCorners.triggered.connect(
+            self._set_rounded_corners
+        )
         self.debugMenu = QtWidgets.QMenu("Debug", self)
         self.actionDebugWindowState = QtGui.QAction("Window State", self)
         self.actionDebugWindowState.triggered.connect(self._log_window_state)
@@ -470,6 +485,7 @@ class Main(QMainWindow):
             self.fontSizeMenu.menuAction(),
             self.accentColorMenu.menuAction(),
             self.spacingMenu.menuAction(),
+            self.actionRoundedCorners,
             self.debugMenu.menuAction(),
         )
         self.application_help_actions = (
@@ -879,6 +895,16 @@ class Main(QMainWindow):
             settings.setValue(SPACING_SETTINGS_KEY, spacing)
         else:
             spacing = resolve_spacing(settings)
+        if controls_card_corners is not None:
+            controls_card_corners = normalize_controls_card_corners(
+                controls_card_corners
+            )
+            settings.setValue(
+                CONTROLS_CARD_CORNERS_SETTINGS_KEY,
+                controls_card_corners,
+            )
+        else:
+            controls_card_corners = resolve_controls_card_corners(settings)
         app = QtWidgets.QApplication.instance()
         if app is not None:
             from xdart.gui.themes import apply_theme
@@ -888,12 +914,23 @@ class Main(QMainWindow):
                 font_scale=font_scale,
                 accent_color=accent_color,
                 spacing=spacing,
+                controls_card_corners=controls_card_corners,
             )
-        return theme, font_scale, accent_color, spacing
+        return (
+            theme,
+            font_scale,
+            accent_color,
+            spacing,
+            controls_card_corners,
+        )
 
     def _set_theme(self, name):
         """Apply theme ``name`` live and persist the choice."""
         self._apply_appearance(theme=name)
+
+    def _set_rounded_corners(self, rounded):
+        """Apply panel/container corner treatment live and persist it."""
+        self._apply_appearance(controls_card_corners=rounded)
 
     def _set_application_font_size(self, scale):
         """Apply the application-wide font tier live and persist the choice."""
@@ -1030,6 +1067,7 @@ def _start_gui(app, window_factory=None):
             resolve_font_scale(settings),
             accent_color=resolve_accent_color(settings),
             spacing=resolve_spacing(settings),
+            controls_card_corners=resolve_controls_card_corners(settings),
         )
     except Exception:
         logger.exception("Failed to apply the saved appearance; using Qt default")

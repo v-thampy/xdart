@@ -10,12 +10,19 @@ accent / #5269a8 browse).  ``apply_dark_theme``/``DARK_QSS`` stay as aliases.
 
 from __future__ import annotations
 
+import re
 import string
 
 from .accent import (
     DEFAULT_ACCENT_COLOR,
     normalize_accent_color,
     selected_color,
+)
+from .corners import (
+    DEFAULT_CONTROLS_CARD_CORNERS,
+    normalize_controls_card_corners,
+    rounded_container_radius,
+    set_current_controls_card_corners,
 )
 from .spacing import (
     DEFAULT_SPACING,
@@ -165,6 +172,7 @@ def _resolve(
     font_scale=DEFAULT_FONT_SCALE,
     accent_color=DEFAULT_ACCENT_COLOR,
     spacing=DEFAULT_SPACING,
+    controls_card_corners=DEFAULT_CONTROLS_CARD_CORNERS,
 ):
     """Palette + the derived state shades the template needs."""
     p = dict(base)
@@ -191,8 +199,25 @@ def _resolve(
     p.update(_ACTIVE)
     # Rule 4 of the font contract: the dense Controls tokens are a presentation
     # density variant of the ONE application tier, not a second setting.
+    font_scale = normalize_font_scale(font_scale)
+    density = spacing_tokens(normalize_spacing(spacing))
     p.update(qss_font_tokens(font_scale))
-    p.update(spacing_tokens(normalize_spacing(spacing)).qss_tokens())
+    p.update(density.qss_tokens())
+    # One content-height floor for every interactive Controls surface.  Vertical
+    # density belongs here, beside the font and spacing tables, so line edits,
+    # combos, range bounds, toggles and their compact buttons cannot drift by
+    # independently combining native metrics with unrelated padding tokens.
+    # Normal/Default remains the accepted 28 px outer height (26 px content +
+    # the 1 px border); larger/smaller tiers move monotonically from that base.
+    interactive_height = (
+        26
+        + 2 * (density.control_field_y - 3)
+        + (FONT_SCALE_TOKENS[font_scale].browse_px - 13)
+    )
+    p["control_interactive_height"] = f"{max(18, interactive_height)}px"
+    p["panel_corner_radius"] = rounded_container_radius(
+        controls_card_corners
+    )
     return p
 
 
@@ -228,7 +253,15 @@ QMainWindow, QDialog {
 QFrame, QGroupBox {
     background-color: $panel;
     border: 1px solid $field_border;
-    border-radius: 8px;
+    border-radius: $panel_corner_radius;
+}
+/* QSplitter inherits QFrame.  The mounted three-column shell owns its column
+   separation through splitter handles, so inheriting the generic card border
+   would inset every column by one pixel and silently consume two layout pixels. */
+QSplitter#e3MainSplitter {
+    border: none;
+    border-radius: 0px;
+    background: transparent;
 }
 /* QLabel subclasses QFrame, so the blanket border above boxes EVERY text label
    (most visibly 'Pts'/'Motor' on the decluttered integrator rows).  Labels are
@@ -349,6 +382,12 @@ QComboBox QAbstractItemView {
     selection-background-color: $field_border;
     border: 1px solid $field_border;
 }
+/* Popup rows keep an independent readable floor.  In particular, Tight may
+   compact the closed field without collapsing native combo-menu choices. */
+QComboBox QAbstractItemView::item {
+    min-height: $control_interactive_height;
+    padding: 2px 6px;
+}
 
 QCheckBox, QRadioButton {
     color: $text;
@@ -432,13 +471,28 @@ QPushButton#e3BrowserCompactButton,
 QToolButton#e3RefreshBrowser {
     padding: $control_browse_padding;
 }
-/* File / Config / Help open their menu on click (InstantPopup) — the oversized
-   down-arrow menu-indicator is redundant noise, so drop it entirely. */
+/* File / Config / Help open their menu on click (InstantPopup).  Paint one
+   deliberately small theme-coloured caret rather than Qt's oversized native
+   menu glyph.  Plain/checkable tool buttons have no matching selector, so
+   toggles remain indicator-free. */
 QToolButton#fileMenuButton::menu-indicator,
 QToolButton#configMenuButton::menu-indicator,
 QToolButton#helpMenuButton::menu-indicator {
     image: none;
     width: 0px;
+    height: 0px;
+    border-left: 3px solid transparent;
+    border-right: 3px solid transparent;
+    border-top: 4px solid $text_muted;
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    right: 3px;
+}
+QToolButton#fileMenuButton,
+QToolButton#configMenuButton,
+QToolButton#helpMenuButton {
+    font-size: $control_panel_browse_font;
+    padding-right: 12px;
 }
 
 /* Checkable *toggle* buttons (Live, Batch, Auto, Legend, Share Axis,
@@ -628,7 +682,7 @@ QTreeView#WranglerTree QAbstractSpinBox {
 QFrame#frame1D, QFrame#frame2D {
     background-color: $card;
     border: 1px solid $field_border;
-    border-radius: 6px;
+    border-radius: $panel_corner_radius;
 }
 QFrame#frame1D_header, QFrame#frame1D_range,
 QFrame#frame2D_header, QFrame#frame2D_range {
@@ -662,7 +716,7 @@ QLabel#label1D:disabled, QLabel#label2D:disabled {
 QFrame#frame_pixreject, QFrame#frame_reint {
     background-color: $card;
     border: 1px solid $field_border;
-    border-radius: 6px;
+    border-radius: $panel_corner_radius;
 }
 /* The integrator's action buttons carry a hard 14 pt Arial QFont from the
    generated UI (integratorUI `font2`), so like #labelCurrent they need the tier
@@ -694,7 +748,7 @@ QLabel#toolsHeader {
 QFrame#toolsPlaceholder {
     background-color: $card;
     border: 1px dashed $field_border;
-    border-radius: 7px;
+    border-radius: $panel_corner_radius;
 }
 /* Each tool is now a full-width button labelled with the tool name (tooltip
    carries the description).  Left-aligned text reads as a menu of tools; hover
@@ -819,8 +873,8 @@ QFrame#controlsV2SectionHeader {
     background-color: $panel;
     border: 1px solid $field_border;
     border-left: 4px solid $field_border;
-    border-top-left-radius: 7px;
-    border-top-right-radius: 7px;
+    border-top-left-radius: $panel_corner_radius;
+    border-top-right-radius: $panel_corner_radius;
     border-bottom-left-radius: 0px;
     border-bottom-right-radius: 0px;
 }
@@ -892,20 +946,20 @@ QFrame#controlsV2SectionBody {
     background-color: $card;
     border: 1px solid $field_border;
     border-top: none;
-    border-bottom-left-radius: 7px;
-    border-bottom-right-radius: 7px;
+    border-bottom-left-radius: $panel_corner_radius;
+    border-bottom-right-radius: $panel_corner_radius;
 }
 
 QFrame#controlsV2SubsectionCard {
     background-color: transparent;
     border: 1px solid $field_border;
-    border-radius: 7px;
+    border-radius: $panel_corner_radius;
 }
 QFrame#controlsV2SubsectionHeader {
     background-color: $panel;
     border: none;
-    border-top-left-radius: 7px;
-    border-top-right-radius: 7px;
+    border-top-left-radius: $panel_corner_radius;
+    border-top-right-radius: $panel_corner_radius;
 }
 QFrame#controlsV2SubsectionBody {
     background-color: transparent;
@@ -952,7 +1006,7 @@ QComboBox#controlsV2ComboBox {
     background-color: $field;
     color: $text;
     border: 1px solid $field_border;
-    border-radius: 5px;
+    border-radius: 0px;
     padding: $control_field_padding;
 }
 QLineEdit#controlsV2LineEdit:disabled,
@@ -1037,6 +1091,113 @@ QToolButton#controlsV2AutoButton:disabled {
     background-color: $panel;
     color: $text_muted;
     border-color: $field_border;
+}
+/* The complete vNext shell uses one compact square interactive surface.
+   Cards may still use the independent Controls-card corner option; values,
+   combos and action/toggle buttons do not. */
+QWidget#scatteringWorkspaceShell QLineEdit,
+QWidget#scatteringWorkspaceShell QComboBox,
+QWidget#scatteringWorkspaceShell QSpinBox,
+QWidget#scatteringWorkspaceShell QDoubleSpinBox,
+QWidget#scatteringWorkspaceShell QPushButton,
+QWidget#scatteringWorkspaceShell QToolButton#e4FrameNavigationButton {
+    min-height: $control_interactive_height;
+    max-height: $control_interactive_height;
+    padding-top: 0px;
+    padding-bottom: 0px;
+    border-radius: 0px;
+}
+QWidget#scatteringWorkspaceShell QComboBox::drop-down,
+QWidget#scatteringWorkspaceShell QSpinBox::up-button,
+QWidget#scatteringWorkspaceShell QSpinBox::down-button,
+QWidget#scatteringWorkspaceShell QDoubleSpinBox::up-button,
+QWidget#scatteringWorkspaceShell QDoubleSpinBox::down-button {
+    border-radius: 0px;
+}
+QWidget#scatteringWorkspaceShell QSpinBox::up-button,
+QWidget#scatteringWorkspaceShell QSpinBox::down-button,
+QWidget#scatteringWorkspaceShell QDoubleSpinBox::up-button,
+QWidget#scatteringWorkspaceShell QDoubleSpinBox::down-button {
+    width: 14px;
+    background-color: $field;
+    border-left: 1px solid $field_border;
+}
+QWidget#scatteringWorkspaceShell QSpinBox::up-arrow,
+QWidget#scatteringWorkspaceShell QDoubleSpinBox::up-arrow {
+    image: none;
+    width: 0px;
+    height: 0px;
+    border-left: 3px solid transparent;
+    border-right: 3px solid transparent;
+    border-bottom: 4px solid $text_muted;
+}
+QWidget#scatteringWorkspaceShell QSpinBox::down-arrow,
+QWidget#scatteringWorkspaceShell QDoubleSpinBox::down-arrow {
+    image: none;
+    width: 0px;
+    height: 0px;
+    border-left: 3px solid transparent;
+    border-right: 3px solid transparent;
+    border-top: 4px solid $text_muted;
+}
+QWidget#scatteringWorkspaceShell QComboBox::drop-down {
+    width: 16px;
+}
+QWidget#scatteringWorkspaceShell QComboBox::down-arrow {
+    image: none;
+    width: 0px;
+    height: 0px;
+    border-left: 3px solid transparent;
+    border-right: 3px solid transparent;
+    border-top: 4px solid $text_muted;
+}
+/* Every value-changing Controls surface shares one content-height floor and
+   square chrome.  Individual spacing tokens still own horizontal breathing
+   room; zeroing only the vertical padding lets the common floor determine the
+   exact outer height instead of each widget class growing independently. */
+QWidget#controlsPanelV2 QLineEdit#controlsV2LineEdit,
+QWidget#controlsPanelV2 QComboBox#controlsV2ComboBox,
+QWidget#controlsPanelV2 QSpinBox,
+QWidget#controlsPanelV2 QDoubleSpinBox,
+QWidget#controlsPanelV2 QPushButton#controlsV2ActionButton,
+QWidget#controlsPanelV2 QPushButton#controlsV2ToggleButton,
+QWidget#controlsPanelV2 QPushButton#controlsV2PillButton,
+QWidget#controlsPanelV2 QPushButton#controlsV2SegmentButton,
+QWidget#controlsPanelV2 QToolButton#controlsV2BrowseButton,
+QWidget#controlsPanelV2 QToolButton#controlsV2MoreButton,
+QWidget#controlsPanelV2 QToolButton#controlsV2AutoButton,
+QWidget#staticRunControls QComboBox,
+QWidget#staticRunControls QSpinBox,
+QWidget#staticRunControls QDoubleSpinBox,
+QWidget#staticRunControls QPushButton {
+    min-height: $control_interactive_height;
+    max-height: $control_interactive_height;
+    padding-top: 0px;
+    padding-bottom: 0px;
+    border-radius: 0px;
+}
+QWidget#controlsPanelV2 QComboBox#controlsV2ComboBox::drop-down,
+QWidget#controlsPanelV2 QSpinBox::up-button,
+QWidget#controlsPanelV2 QSpinBox::down-button,
+QWidget#controlsPanelV2 QDoubleSpinBox::up-button,
+QWidget#controlsPanelV2 QDoubleSpinBox::down-button,
+QWidget#staticRunControls QComboBox::drop-down,
+QWidget#staticRunControls QSpinBox::up-button,
+QWidget#staticRunControls QSpinBox::down-button {
+    border-radius: 0px;
+}
+QWidget#controlsPanelV2 QComboBox#controlsV2ComboBox::drop-down,
+QWidget#staticRunControls QComboBox::drop-down {
+    width: 16px;
+}
+QWidget#controlsPanelV2 QComboBox#controlsV2ComboBox::down-arrow,
+QWidget#staticRunControls QComboBox::down-arrow {
+    image: none;
+    width: 0px;
+    height: 0px;
+    border-left: 3px solid transparent;
+    border-right: 3px solid transparent;
+    border-top: 4px solid $text_muted;
 }
 QLabel#controlsV2RangeDash {
     color: $text_muted;
@@ -1223,21 +1384,36 @@ def render_qss(
     *,
     accent_color=DEFAULT_ACCENT_COLOR,
     spacing=DEFAULT_SPACING,
+    controls_card_corners=DEFAULT_CONTROLS_CARD_CORNERS,
 ):
-    """Render one complete theme/font/accent/spacing stylesheet.
+    """Render one complete application appearance stylesheet.
 
     Pure and Qt-free, so the import-time ``DARK_QSS`` render still works with no
-    QApplication."""
+    QApplication.
+
+    Corners contract (maintainer decision, live review 2026-08-04): with the
+    Rounded Corners option OFF, rounding is removed EVERYWHERE — panels,
+    cards, chips, indicators and scrollbars alike — so the post-pass below
+    squares every radius by construction rather than trusting each selector.
+    """
     base, is_light = _THEMES.get(name, _THEMES["dark"])
-    return string.Template(_QSS_TEMPLATE).substitute(
+    rendered = string.Template(_QSS_TEMPLATE).substitute(
         _resolve(
             base,
             is_light=is_light,
             font_scale=font_scale,
             accent_color=accent_color,
             spacing=spacing,
+            controls_card_corners=controls_card_corners,
         )
     )
+    if not normalize_controls_card_corners(controls_card_corners):
+        rendered = re.sub(
+            r"(border(?:-[a-z]+)*-radius:\s*)\d+px",
+            r"\g<1>0px",
+            rendered,
+        )
+    return rendered
 
 
 def apply_theme(
@@ -1247,12 +1423,14 @@ def apply_theme(
     *,
     accent_color=DEFAULT_ACCENT_COLOR,
     spacing=DEFAULT_SPACING,
+    controls_card_corners=DEFAULT_CONTROLS_CARD_CORNERS,
 ) -> None:
     """Apply one complete appearance to a live QApplication.
 
     THE single entry point for appearance: it owns the application font, the
     QSS, the pyqtgraph config, and the restyle of plots that already exist.
-    Callers pass a theme and a tier; nothing else may set any of the three.
+    Callers pass the complete resolved appearance; no widget may install a
+    competing theme or corner treatment.
 
     The order is load-bearing and measured, not stylistic:
 
@@ -1275,12 +1453,16 @@ def apply_theme(
     font_scale = normalize_font_scale(font_scale)
     accent_color = normalize_accent_color(accent_color)
     spacing = set_current_spacing(normalize_spacing(spacing))
+    controls_card_corners = set_current_controls_card_corners(
+        normalize_controls_card_corners(controls_card_corners)
+    )
     apply_application_font(app, font_scale)
     qss = render_qss(
         name,
         font_scale=font_scale,
         accent_color=accent_color,
         spacing=spacing,
+        controls_card_corners=controls_card_corners,
     )
     # Visible, themed expand/collapse arrows for the wrangler ParameterTree.
     # Generated lazily (needs a live QApplication) and appended here rather than
@@ -1293,6 +1475,7 @@ def apply_theme(
             font_scale=font_scale,
             accent_color=accent_color,
             spacing=spacing,
+            controls_card_corners=controls_card_corners,
         )["text"]
     )
     if right_url and down_url:
