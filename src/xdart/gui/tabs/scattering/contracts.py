@@ -753,7 +753,22 @@ class RunExecutorPort(Protocol):
 
     def drain_events(self) -> tuple[StandardRunEvent, ...]: ...
 
+def threshold_pair_is_canonical(threshold: object) -> bool:
+    """LV-UI-11 canonical run identity: exactly ONE of the two exclusive
+    threshold facts is active (``apply_threshold != mask_saturation``).
+
+    The vNext start capture canonicalizes a degenerate (equal) pair through
+    the intent store BEFORE any admission signature, frozen configuration,
+    fingerprint, or provenance is derived; every later boundary REFUSES a
+    degenerate pair instead of silently reinterpreting it (Codex P1,
+    2026-08-04: execution-vs-identity split).  Accepts any carrier with the
+    two attributes (mutable ``ThresholdIntent`` or ``FrozenThresholdPolicy``).
+    """
+    return bool(threshold.apply_threshold) != bool(threshold.mask_saturation)
+
+
 __all__ = [
+    "threshold_pair_is_canonical",
     "RunExecutorPort",
     "AdmissionFailure",
     "AdmissionReceipt",

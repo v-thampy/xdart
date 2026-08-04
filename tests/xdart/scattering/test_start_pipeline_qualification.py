@@ -145,3 +145,105 @@ def test_unexpected_freeze_exception_is_closed_invariant_not_a_validation_refusa
     assert isinstance(failed, StartFailed)
     assert failed.reason.value == "canonical_invariant"
     assert executor.calls == []
+
+
+def test_degenerate_threshold_pair_is_canonical_from_capture_through_provenance():
+    """End-to-end LV-UI-11 identity oracle (Codex P1, 2026-08-04): for BOTH
+    degenerate intent pairs, the start capture canonicalizes THROUGH the
+    store, and capture, admission signature, frozen configuration, execution
+    values, fingerprint and writer provenance all describe the SAME canonical
+    pair.  The displayed Auto fact (mask_saturation) wins."""
+    from xdart.gui.tabs.scattering.contracts import threshold_pair_is_canonical
+    from xdart.gui.tabs.scattering.output_preflight import (
+        OutputCandidate,
+        execution_plan_values,
+    )
+
+    for apply_flag, mask_flag in ((True, True), (False, False)):
+        intent = _intent()
+        intent.output_mode = "Overwrite"
+        intent.threshold.apply_threshold = apply_flag
+        intent.threshold.mask_saturation = mask_flag
+        intent.threshold.threshold_min = 1.0
+        intent.threshold.threshold_max = 2.0
+        store = RunIntentStore(intent)
+        pipeline, _, _ = _pipeline(store)
+
+        capture = _capture(pipeline)
+
+        # 1. capture: canonicalized through the store, not a local copy.
+        captured = capture.intent_snapshot.thaw().threshold
+        assert threshold_pair_is_canonical(captured)
+        assert captured.mask_saturation is mask_flag
+        assert captured.apply_threshold is (not mask_flag)
+        stored = store.snapshot().thaw().threshold
+        assert stored.apply_threshold is (not mask_flag)
+        assert stored.mask_saturation is mask_flag
+
+        canonical_dict = {
+            "apply_threshold": not mask_flag,
+            "threshold_min": 1.0,
+            "threshold_max": 2.0,
+            "mask_saturation": mask_flag,
+        }
+
+        # 2. admission signature.
+        candidate = OutputCandidate.from_start_capture(capture)
+        assert candidate.processing_mapping()["threshold"] == canonical_dict
+
+        # 3. frozen configuration (the store freeze start() performs).
+        result = store.freeze(
+            expected_revision=capture.intent_snapshot.revision
+        )
+        assert isinstance(result, IntentFreezeAccepted)
+        configuration = result.configuration
+        assert configuration.threshold.apply_threshold is (not mask_flag)
+        assert configuration.threshold.mask_saturation is mask_flag
+
+        # 4. fingerprint: the signed candidate and the executed
+        # configuration carry one identity.
+        assert candidate.fingerprint == configuration.fingerprint
+
+        # 5. execution values agree with the canonical identity.
+        _, _, values = execution_plan_values(configuration)
+        if mask_flag:
+            assert values["threshold_min"] is None
+            assert values["threshold_max"] is None
+            assert values["mask_saturation"] is True
+        else:
+            assert values["threshold_min"] == 1.0
+            assert values["threshold_max"] == 2.0
+            assert values["mask_saturation"] is False
+
+        # 6. writer provenance records that same canonical mapping.
+        assert configuration.as_provenance()["threshold"] == canonical_dict
+
+
+def test_boundaries_refuse_a_degenerate_pair_that_bypassed_capture():
+    """Admission and execution REJECT a degenerate pair instead of silently
+    reinterpreting it — canonicalization has exactly one owner (capture)."""
+    import dataclasses
+
+    import pytest
+
+    from xdart.gui.tabs.scattering.output_preflight import (
+        OutputCandidate,
+        execution_plan_values,
+    )
+
+    degenerate = _intent()
+    degenerate.output_mode = "Overwrite"
+    degenerate.threshold.apply_threshold = True
+    degenerate.threshold.mask_saturation = True
+
+    pipeline, _, _ = _pipeline(RunIntentStore(_intent()))
+    capture = _capture(pipeline)
+    bypassed = dataclasses.replace(
+        capture,
+        intent_snapshot=RunIntentStore(degenerate).snapshot(),
+    )
+    with pytest.raises(ValueError, match="degenerate threshold identity"):
+        OutputCandidate.from_start_capture(bypassed)
+
+    with pytest.raises(ValueError, match="degenerate threshold identity"):
+        execution_plan_values(degenerate.freeze())

@@ -24,6 +24,7 @@ from .contracts import (
     AdmittedMotorValue, AdmittedOutput, AdmissionReceipt,
     ExternalSourceState, OutputDisposition, OutputFact, PlannedOutput,
     SourceExecutionStamp, SourceFileState, StartCapture,
+    threshold_pair_is_canonical,
 )
 from . import output_values
 from .source_metadata import (
@@ -56,6 +57,13 @@ class OutputCandidate:
         gi_motor_choices: tuple[str, ...] | None = None,
     ) -> "OutputCandidate":
         intent = capture.intent_snapshot.thaw()
+        if not threshold_pair_is_canonical(intent.threshold):
+            raise ValueError(
+                "degenerate threshold identity at admission (apply_threshold "
+                "== mask_saturation); the start capture canonicalizes this "
+                "pair — refusing to sign a configuration that would not "
+                "describe its own execution"
+            )
         if str(intent.output_mode).strip().lower() != "overwrite":
             raise ValueError(output_values.APPEND_UNAVAILABLE)
         source = intent.source_spec
@@ -759,6 +767,14 @@ def execution_plan_values(
     configuration: FrozenRunConfiguration, detector_mask: np.ndarray | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     threshold, gi = configuration.threshold, configuration.gi
+    if not threshold_pair_is_canonical(threshold):
+        raise ValueError(
+            "degenerate threshold identity reached execution "
+            f"(apply_threshold={threshold.apply_threshold}, "
+            f"mask_saturation={threshold.mask_saturation}); the start "
+            "capture canonicalizes this pair — refusing to execute a "
+            "configuration that does not describe its own run"
+        )
     if detector_mask is None and configuration.mask_file:
         path = Path(configuration.mask_file)
         detector_mask = np.load(path) if path.suffix == ".npy" else load_mask(path)
@@ -777,17 +793,11 @@ def execution_plan_values(
             and "1D" in configuration.processing_mode
             and "2D" not in configuration.processing_mode
         ),
-        # LV-UI-11 adoption rule (vNext only): the run receives exactly what
-        # the Auto control displays — sentinel masking XOR the manual band,
-        # gated on mask_saturation alone.  For the two normal pairs this is
-        # identity; the two degenerate equal pairs (both True / both False,
-        # reachable only from pre-LV-UI-11 or programmatic intents) are
-        # ADOPTED to the displayed semantics rather than run as-is.
         "threshold_min": (
-            threshold.threshold_min if not threshold.mask_saturation else None
+            threshold.threshold_min if threshold.apply_threshold else None
         ),
         "threshold_max": (
-            threshold.threshold_max if not threshold.mask_saturation else None
+            threshold.threshold_max if threshold.apply_threshold else None
         ),
         "mask_saturation": threshold.mask_saturation,
         "detector_mask": detector_mask,

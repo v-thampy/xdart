@@ -485,16 +485,15 @@ def test_auto_toggle_off_leaves_the_max_blank_without_a_known_detector() -> None
     assert manual.threshold.threshold_max is None
 
 
-def test_degenerate_threshold_pairs_normalize_on_touch_and_adopt_at_run() -> None:
-    """Frozen rows (Codex REWORK 2026-08-04): the two EQUAL intent pairs —
+def test_degenerate_threshold_pairs_normalize_on_touch() -> None:
+    """Reducer rows (Codex REWORK 2026-08-04): the two EQUAL intent pairs —
     (apply=True, mask=True) and (apply=False, mask=False), reachable only from
-    pre-LV-UI-11 or programmatic intents — must neither absorb a touch of the
-    shown Auto value as EditNoChange nor reach the run as-is.  Touch
-    normalizes to the displayed semantics; the run boundary adopts them."""
+    pre-LV-UI-11 or programmatic intents — must not absorb a touch of the
+    shown Auto value as EditNoChange: the touch normalizes to the displayed
+    semantics.  The RUN-side identity story (capture canonicalization,
+    admission/fingerprint/provenance agreement, boundary refusals) is the
+    end-to-end oracle in test_start_pipeline_qualification.py."""
     from xdart.gui.tabs.scattering.controls_inventory import MASK_SATURATION
-    from xdart.gui.tabs.scattering.output_preflight import (
-        execution_plan_values,
-    )
 
     both_on = RunIntent()
     both_on.threshold.apply_threshold = True
@@ -507,10 +506,6 @@ def test_degenerate_threshold_pairs_normalize_on_touch_and_adopt_at_run() -> Non
     assert type(touched) is RunIntent            # NOT EditNoChange
     assert touched.threshold.mask_saturation is True
     assert touched.threshold.apply_threshold is False
-    _, _, run_values = execution_plan_values(both_on.freeze())
-    assert run_values["mask_saturation"] is True
-    assert run_values["threshold_min"] is None   # adopted: Auto ON, no band
-    assert run_values["threshold_max"] is None
 
     both_off = RunIntent()
     both_off.threshold.apply_threshold = False
@@ -523,10 +518,6 @@ def test_degenerate_threshold_pairs_normalize_on_touch_and_adopt_at_run() -> Non
     assert type(touched) is RunIntent            # NOT EditNoChange
     assert touched.threshold.mask_saturation is False
     assert touched.threshold.apply_threshold is True
-    _, _, run_values = execution_plan_values(both_off.freeze())
-    assert run_values["mask_saturation"] is False
-    assert run_values["threshold_min"] == 1.0    # adopted: manual band shown
-    assert run_values["threshold_max"] == 2.0
 
     # The exclusive pairs keep EditNoChange for a same-value touch.
     normal = RunIntent()                          # (apply=False, mask=True)

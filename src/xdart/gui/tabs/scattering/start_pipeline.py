@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from xrd_tools.session.intent_store import RunIntentSnapshot, RunIntentStore
+from xrd_tools.session.intent_store import (IntentCommitAccepted,
+                                            RunIntentSnapshot, RunIntentStore)
 from xrd_tools.session.run_configuration import FrozenRunConfiguration, RunIntent
 
 from .contracts import (AdmissionReceipt, AdmissionToken, RunExecutorPort,
-                        SourceCapture, SourcePort, admitted_capture)
+                        SourceCapture, SourcePort, admitted_capture,
+                        threshold_pair_is_canonical)
 from .coordinator import ScatteringCoordinator
 from .events import (CleanupStatus, ExecutorAccepted, ExecutorClosed, ExecutorStartFailed, LifecycleError,
                      LifecycleResult, LifecycleStatus, OwnersClosed, PreflightAccepted,
@@ -235,6 +237,12 @@ class StartPipeline:
         if not snapshot_is_valid(snapshot):
             return self._closed_invariant(TypeError("RunIntentStore.snapshot() returned an invalid result"))
         try:
+            snapshot = self._canonical_threshold_snapshot(snapshot)
+        except Exception as error:
+            return self._closed_invariant(error)
+        if not snapshot_is_valid(snapshot):
+            return self._closed_invariant(TypeError("threshold canonicalization returned an invalid snapshot"))
+        try:
             source = snapshot.thaw().source_spec
         except Exception as error:
             return self._closed_invariant(error)
@@ -256,6 +264,38 @@ class StartPipeline:
         self._capture = capture
         self._recapture = None
         return capture
+
+    def _canonical_threshold_snapshot(
+        self, snapshot: RunIntentSnapshot
+    ) -> RunIntentSnapshot:
+        """Canonicalize a degenerate threshold pair THROUGH the store at the
+        start/capture boundary (Codex P1, 2026-08-04).
+
+        Both run freezes — the admission candidate's local freeze and the
+        store freeze that produces the executed configuration — derive from
+        this one revisioned state, so committing the canonical pair here is
+        the single point where identity, fingerprint, execution values and
+        persisted provenance are all made to agree.  The displayed Auto fact
+        (``mask_saturation``) wins, matching the reducer's touch
+        normalization.  Later boundaries REFUSE any degenerate pair instead
+        of reinterpreting it.  The bounded retry only re-runs on a genuine
+        concurrent-revision race; on exhaustion the raw snapshot is returned
+        and the downstream refusals fail the start loudly.
+        """
+        for _ in range(3):
+            intent = snapshot.thaw()
+            if threshold_pair_is_canonical(intent.threshold):
+                return snapshot
+            intent.threshold.apply_threshold = not bool(
+                intent.threshold.mask_saturation
+            )
+            result = self._intents.commit(
+                intent, expected_revision=snapshot.revision
+            )
+            if isinstance(result, IntentCommitAccepted):
+                return result.snapshot
+            snapshot = result.snapshot
+        return snapshot
 
     def begin(self) -> StartCapture | StartRefused | StartRejected | StartFailed:
         try:
