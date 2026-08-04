@@ -26,6 +26,46 @@ from .shell_values import (
 from .tools_view import ToolsView
 
 
+class _HugWidthScrollArea(QtWidgets.QScrollArea):
+    """A vertical-only scroll surface whose minimum width tracks its widget.
+
+    LV-UI-7: the controls column previously carried three disagreeing width
+    constants (column permitted 306, panel hint 313, stale root pin 360), so
+    the splitter could allocate less than the panel truly needed and the
+    right edge clipped behind a horizontal scrollbar at 1440x900.  Deriving
+    the minimum here — inner widget's ``minimumSizeHint`` plus frame and
+    vertical-scrollbar allowance — leaves ONE owner (the panel's layout) and
+    makes horizontal overflow impossible by construction: the splitter can
+    shrink plots, never the controls below their real minimum.
+    """
+
+    def minimumSizeHint(self) -> QtCore.QSize:
+        base = super().minimumSizeHint()
+        inner = self.widget()
+        if inner is None:
+            return base
+        width = (
+            inner.minimumSizeHint().width()
+            + 2 * self.frameWidth()
+            + self.verticalScrollBar().sizeHint().width()
+        )
+        return QtCore.QSize(width, base.height())
+
+    def eventFilter(self, obj, event) -> bool:
+        # QScrollArea absorbs the inner widget's LayoutRequest (scrolling
+        # normally hides growth), so a repopulated panel never invalidates
+        # the CACHED minimum the splitter distributes by — the fix above
+        # would compute the right floor that nothing ever re-reads.  Forward
+        # the invalidation explicitly.
+        handled = super().eventFilter(obj, event)
+        if (
+            obj is self.widget()
+            and event.type() == QtCore.QEvent.Type.LayoutRequest
+        ):
+            self.updateGeometry()
+        return handled
+
+
 class ScatteringWorkspaceShell(QtWidgets.QWidget):
     """A passive view: immutable state in, typed operator commands out."""
 
@@ -74,11 +114,16 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
     def _make_right_column(self) -> QtWidgets.QFrame:
         column = QtWidgets.QFrame()
         column.setObjectName("e3ControlsColumn")
-        column.setMinimumWidth(306)
+        # LV-UI-7: no hand-pinned column minimum — it disagreed with the
+        # panel's real need (306 permitted vs 313 required vs a stale 360
+        # root pin), which is exactly how the 1440x900 clip happened.  The
+        # width-hugging scroll area below derives the floor from the panel's
+        # own minimumSizeHint, so the splitter can never starve the controls
+        # and horizontal overflow is impossible by construction.
         layout = QtWidgets.QVBoxLayout(column)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
-        self.control_scroll = QtWidgets.QScrollArea()
+        self.control_scroll = _HugWidthScrollArea()
         self.control_scroll.setObjectName("e3ControlsScroll")
         self.control_scroll.setWidgetResizable(True)
         self.controls = ControlsPanelV2(

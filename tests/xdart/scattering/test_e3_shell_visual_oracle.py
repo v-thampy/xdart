@@ -69,7 +69,29 @@ def test_e3_ui4_viewport_structure_is_exact(
         assert geometries[0].right() < geometries[1].left()
         assert geometries[1].right() < geometries[2].left()
         assert geometries[0].width() >= 255
-        assert geometries[2].width() >= 306
+        # LV-UI-7 replacement oracle: the controls column must receive at
+        # least the panel-derived floor, and the panel must fit its viewport
+        # with ZERO horizontal overflow — clipping is a failure even when a
+        # scrollbar could reach it.
+        controls_floor = shell.control_scroll.minimumSizeHint().width()
+        assert controls_floor >= shell.controls.minimumSizeHint().width()
+        assert geometries[2].width() >= controls_floor
+        assert shell.control_scroll.horizontalScrollBar().maximum() == 0
+        viewport = shell.control_scroll.viewport()
+        rows = [
+            row for row in shell.controls.findChildren(RangeRow)
+            if row._toggle is not None and row.isVisibleTo(shell.controls)
+        ]
+        assert rows, "populated shell must expose range rows"
+        for row in rows:
+            btn = row._toggle[1]
+            right_edge = btn.mapTo(
+                viewport, btn.rect().topRight()
+            ).x()
+            assert right_edge <= viewport.width(), (
+                f"rightmost control clipped: {row._display_label!r} "
+                f"{right_edge} > {viewport.width()}"
+            )
 
         rows = shell.scientific.vertical_splitter.sizes()
         assert abs(rows[0] - rows[1]) <= 1

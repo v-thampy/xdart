@@ -1147,7 +1147,12 @@ class ControlsPanelV2(QtWidgets.QWidget):
         self._experiment_title = experiment_title
         self._show_section_numbers = bool(show_section_numbers)
         self.setObjectName("controlsPanelV2")
-        self.setMinimumWidth(360)
+        # LV-UI-7: no explicit root minimum — the layout's minimumSizeHint is
+        # the panel's one true width floor, so embedding surfaces (the vNext
+        # shell's width-hugging scroll column) can derive exactly what the
+        # panel needs and the boxes contract instead of clipping.  The old
+        # hand-pinned 360 predated the row-based redesign and forced a 61 px
+        # horizontal overflow at 1440x900.
         lay = QtWidgets.QVBoxLayout(self)
         self._root_layout = lay
         lay.setContentsMargins(5, 5, 5, 5)

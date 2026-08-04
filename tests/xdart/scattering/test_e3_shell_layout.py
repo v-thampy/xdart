@@ -33,7 +33,13 @@ def test_e3_ui1_composes_exact_three_column_shell(
         ]
         assert shell.left.minimumWidth() == 255
         assert shell.scientific.minimumWidth() == 300
-        assert shell.right.minimumWidth() == 306
+        # LV-UI-7: the controls column carries NO hand-pinned minimum — its
+        # floor derives from the embedded panel through the width-hugging
+        # scroll area, so the constants can never disagree again.
+        assert shell.right.minimumWidth() == 0
+        assert shell.control_scroll.minimumSizeHint().width() >= (
+            shell.controls.minimumSizeHint().width()
+        )
         assert type(shell.controls) is ControlsPanelV2
         assert type(shell.run_controls) is StaticControls
     finally:
