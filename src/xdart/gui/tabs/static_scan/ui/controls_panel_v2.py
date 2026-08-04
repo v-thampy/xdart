@@ -1236,6 +1236,28 @@ class ControlsPanelV2(QtWidgets.QWidget):
 
         if self._bound_state is None or state.bound_controls is None:
             return False
+        current_fields = {
+            tuple(field.path): field
+            for field in self._bound_state.fields
+        }
+        next_fields = {
+            tuple(field.path): field
+            for field in state.bound_controls.fields
+        }
+        # The row walkers below prove that every existing row still has an
+        # owner.  Exact set equality also proves the inverse: no newly
+        # projected field is silently omitted by a stale fast-path layout —
+        # LV-UI-5: switching Standard→Grazing ADDS the θ-motor field, and the
+        # in-place path must force a rebuild for it to appear.  (Unlike the
+        # E4-era guard, a changed combo CHOICE inventory does NOT force a
+        # rebuild: PM1's accepted apply_field reconciles vocabulary in place.)
+        if current_fields.keys() != next_fields.keys():
+            return False
+        if any(
+            current_fields[path].kind != next_fields[path].kind
+            for path in current_fields
+        ):
+            return False
         self._profile = state.profile
         self._bound_state = state.bound_controls
         fields_by_path = {

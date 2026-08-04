@@ -4974,6 +4974,37 @@ def test_controls_panel_v2_auto_stays_visibly_checked_while_run_locked(
 
 
 
+def test_apply_state_update_refuses_fast_path_when_fields_appear(qapp):
+    """LV-UI-5: Standard→Grazing ADDS the θ-motor field; the in-place fast
+    path must refuse (keys changed) so the full render mounts the new row —
+    production falls back to ``set_state`` exactly as the shell does."""
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.run_configuration import RunIntent
+    from xdart.gui.tabs.scattering.controls_inventory import GI_MOTOR
+    from xdart.gui.tabs.scattering.controls_projection import project_controls
+    from xdart.gui.tabs.scattering.state_machine import RunPhase
+
+    panel = ControlsPanelV2()
+    try:
+        intent = RunIntent()
+        panel.set_state(project_controls(
+            RunIntentStore(intent).snapshot(), None, RunPhase.IDLE))
+        assert not [r for r in panel.findChildren(FormRow)
+                    if tuple(r.path) == GI_MOTOR]
+
+        intent.gi.enabled = True
+        grazing = project_controls(
+            RunIntentStore(intent).snapshot(), None, RunPhase.IDLE)
+        assert panel.apply_state_update(grazing) is False
+        panel.set_state(grazing)
+        rows = [r for r in panel.findChildren(FormRow)
+                if tuple(r.path) == GI_MOTOR]
+        assert rows, "theta-motor row must mount on the Grazing switch"
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
 def test_range_toggle_follows_threshold_style_manual_semantics(qapp):
     """LV-UI-1: untoggled = auto range; toggled = the explicit input bounds.
 

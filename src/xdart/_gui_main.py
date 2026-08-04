@@ -865,6 +865,7 @@ class Main(QMainWindow):
         font_scale=None,
         accent_color=None,
         spacing=None,
+        controls_card_corners=None,
     ):
         """Persist one appearance change and apply the whole look ONCE.
 
