@@ -163,7 +163,7 @@ def _real_intent(mode: str, tmp_path: Path) -> RunIntent:
 
     if mode != "eiger":
         raise ValueError(f"unsupported J3 real-data mode: {mode}")
-    fixture_root = root / "eiger" / "short"
+    fixture_root = root / "eiger"
     raw = tmp_path / "eiger-raw"
     raw.mkdir()
     for stem in (

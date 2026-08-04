@@ -1000,3 +1000,29 @@ def test_e6pm2_forged_cleaned_receipt_cannot_clear_b_owner_or_wake(
     assert controller._browse_hydration_owner is owner
     assert controller.browse_context is browse
     assert owner.consume_repaint() is True
+
+
+def test_e6pm2_settled_ticket_display_retirement_releases_b_and_owner(
+    monkeypatch, tmp_path
+):
+    from xdart.gui.tabs.scattering.display_retirement import (
+        DisplayRetirementReceipt,
+    )
+
+    controller, owner, browse, _processed = _held_b_with_settled_ticket(
+        monkeypatch, tmp_path
+    )
+    assert owner.polling_needed() is True
+
+    # Display retirement is terminal/discarding like close(): it applies B's
+    # settled receipt on the discarding path and must not hold B for a repaint
+    # its timer will never consume.
+    receipt = DisplayRetirementReceipt(
+        controller.run_identity, CleanupStatus.CLEANED
+    )
+    assert controller.apply_display_retirement(receipt) is True
+    assert browse.released is True
+    assert controller.browse_context is None
+    assert controller._browse_hydration_owner is None
+    assert controller.run_identity is None
+    assert controller.acquisition_context is None

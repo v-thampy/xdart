@@ -52,7 +52,7 @@ DATA = (
     if _DATA_ROOT
     else Path("__xdart_test_data_unset__")
 )
-EIGER_SHORT = DATA / "eiger" / "short"
+EIGER_ROOT = DATA / "eiger"
 EIGER_PONI = DATA / "eiger" / "LaB6_detxn26_detyn6p5_eta4p5.poni"
 GI_DIRECTORY = DATA / "nexus" / "bluesky_data"
 GI_PONI = GI_DIRECTORY / "LaB6_align61_0003_SR.poni"
@@ -484,7 +484,7 @@ def test_all_short_eiger_standard_outputs_match_explicit_mask(
     tmp_path: Path,
     master_name: str,
 ) -> None:
-    master = EIGER_SHORT / master_name
+    master = EIGER_ROOT / master_name
     poni = PONI.from_poni_file(EIGER_PONI)
     plan = _plan()
     output = tmp_path / f"{master.stem}.nxs"
