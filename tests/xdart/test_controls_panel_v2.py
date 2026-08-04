@@ -5031,6 +5031,32 @@ def test_range_toggle_follows_threshold_style_manual_semantics(qapp):
         row.close()
         row.deleteLater()
 
+
+def test_threshold_toggle_keeps_direct_apply_polarity(qapp):
+    """LV-UI-1 scope: Threshold's ("Mask", "Threshold") enable is True=apply —
+    NOT an *_auto field — so its toggle maps directly: toggled ON enables the
+    thresholding and emits True."""
+    from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import RangeRow
+
+    emitted = []
+    row = RangeRow(
+        label="Threshold",
+        low={"path": ("Mask", "min"), "value": None},
+        high={"path": ("Mask", "max"), "value": None},
+        toggle={"path": ("Mask", "Threshold"), "value": False},
+    )
+    row.valueChanged.connect(lambda p, v: emitted.append((tuple(p), v)))
+    try:
+        btn = row._toggle[1]
+        assert not btn.isChecked()                    # off -> not applied
+        assert (("Mask", "Threshold"), False) in row.current_edits()
+        btn.setChecked(True)                          # user enables threshold
+        assert emitted == [(("Mask", "Threshold"), True)]
+        assert (("Mask", "Threshold"), True) in row.current_edits()
+    finally:
+        row.close()
+        row.deleteLater()
+
 def test_controls_panel_v2_pending_manual_range_survives_run_commit(qapp, monkeypatch):
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
