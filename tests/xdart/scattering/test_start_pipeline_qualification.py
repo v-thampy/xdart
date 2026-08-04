@@ -247,3 +247,97 @@ def test_boundaries_refuse_a_degenerate_pair_that_bypassed_capture():
 
     with pytest.raises(ValueError, match="degenerate threshold identity"):
         execution_plan_values(degenerate.freeze())
+
+
+def _eiger_poni(tmp_path: Path) -> str:
+    poni = tmp_path / "eiger.poni"
+    poni.write_text(
+        "Detector: Eiger1M\n"
+        "Distance: 0.2\n"
+        "Poni1: 0.1\n"
+        "Poni2: 0.2\n"
+        "Rot1: 0.0\n"
+        "Rot2: 0.0\n"
+        "Rot3: 0.0\n"
+        "Wavelength: 1e-10\n"
+    )
+    return str(poni)
+
+
+def test_defaulted_bounds_materialize_to_exactly_the_displayed_band(tmp_path):
+    """DESIGN_STOP oracle (2026-08-04): manual mode with absent/cleared bounds
+    DISPLAYS a substituted band; the start capture must MATERIALIZE that exact
+    band into the one run identity.  Known detector -> the finite displayed
+    band everywhere; unknown detector -> blank max = open-ended, EVERYWHERE
+    (display and identity agree in both directions).  Spans rendered values,
+    capture/store, admission signature, fingerprint, execution values and
+    writer provenance."""
+    from xdart.gui.tabs.scattering.controls_inventory import (
+        THRESHOLD_MAX,
+        THRESHOLD_MIN,
+    )
+    from xdart.gui.tabs.scattering.controls_projection import project_controls
+    from xdart.gui.tabs.scattering.output_preflight import (
+        OutputCandidate,
+        execution_plan_values,
+    )
+    from xdart.gui.tabs.scattering.state_machine import RunPhase
+
+    for poni_file, want_max in ((_eiger_poni(tmp_path), 4294967295.0), ("", None)):
+        intent = _intent()
+        intent.output_mode = "Overwrite"
+        intent.poni_file = poni_file
+        intent.threshold.apply_threshold = True
+        intent.threshold.mask_saturation = False
+        assert intent.threshold.threshold_min is None   # cleared/absent bounds
+        assert intent.threshold.threshold_max is None
+        store = RunIntentStore(intent)
+
+        # 1. rendered values: what the panel actually shows pre-run.
+        shown = {
+            field.path: field.value
+            for field in project_controls(
+                store.snapshot(), None, RunPhase.IDLE
+            ).bound_controls.fields
+        }
+        assert shown[THRESHOLD_MIN] == 0.0
+        assert shown[THRESHOLD_MAX] == want_max
+
+        # 2. capture + store: the displayed band is MATERIALIZED through the
+        # store even though the boolean pair was already exclusive.
+        pipeline, _, _ = _pipeline(store)
+        capture = _capture(pipeline)
+        captured = capture.intent_snapshot.thaw().threshold
+        assert captured.threshold_min == 0.0
+        assert captured.threshold_max == want_max
+        stored = store.snapshot().thaw().threshold
+        assert stored.threshold_min == 0.0
+        assert stored.threshold_max == want_max
+
+        canonical = {
+            "apply_threshold": True,
+            "threshold_min": 0.0,
+            "threshold_max": want_max,
+            "mask_saturation": False,
+        }
+
+        # 3. admission signature.
+        candidate = OutputCandidate.from_start_capture(capture)
+        assert candidate.processing_mapping()["threshold"] == canonical
+
+        # 4. frozen configuration + fingerprint agreement.
+        result = store.freeze(
+            expected_revision=capture.intent_snapshot.revision
+        )
+        assert isinstance(result, IntentFreezeAccepted)
+        configuration = result.configuration
+        assert candidate.fingerprint == configuration.fingerprint
+
+        # 5. execution values are the displayed band, not a silent no-op.
+        _, _, values = execution_plan_values(configuration)
+        assert values["threshold_min"] == 0.0
+        assert values["threshold_max"] == want_max
+        assert values["mask_saturation"] is False
+
+        # 6. writer provenance records the same canonical mapping.
+        assert configuration.as_provenance()["threshold"] == canonical

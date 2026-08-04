@@ -303,6 +303,16 @@ def project_controls(
     )
 
 
+#: Detector-scope hover guard: rides every disabled reason for the manual
+#: max bound AND its enabled-state tooltip, so it is visible whichever state
+#: the row renders in.
+_MAX_BOUND_SCOPE_CAVEAT = (
+    " The default max is the detector family's typical raw-stream ceiling "
+    "— a display default only; masking follows the acquired frame's own "
+    "data type."
+)
+
+
 def _threshold_auto_fields(
     fields: list,
     intent,
@@ -331,21 +341,20 @@ def _threshold_auto_fields(
                     else poni_saturation_ceiling(intent.poni_file)
                 )
             # The disabled reason takes tooltip precedence, so the max
-            # bound's detector-scope caveat must ride the Auto-on reason
-            # too — the hover guard has to hold in BOTH Auto states
-            # (review P2, 2026-08-04).
+            # bound's detector-scope caveat must ride EVERY disabled reason
+            # — Auto-on AND run-locked — or the hover guard silently
+            # disappears in that state (review P2 + DESIGN_STOP secondary,
+            # 2026-08-04).
+            caveat = (
+                _MAX_BOUND_SCOPE_CAVEAT
+                if candidate.path == THRESHOLD_MAX
+                else ""
+            )
             reason = (
-                "Controls are locked during the active run."
+                "Controls are locked during the active run." + caveat
                 if not unlocked
                 else "Auto masks saturated pixels; turn it off to set "
-                "a manual threshold band."
-                + (
-                    " The default max is the detector family's typical "
-                    "raw-stream ceiling — a display default only; masking "
-                    "follows the acquired frame's own data type."
-                    if candidate.path == THRESHOLD_MAX
-                    else ""
-                )
+                "a manual threshold band." + caveat
                 if auto_on
                 else ""
             )

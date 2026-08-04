@@ -398,17 +398,19 @@ def reduce_control_edit(
     if isinstance(parsed, EditRefusal):
         return parsed
     current = _current_value(intent, path)
-    # LV-UI-11 invariant repair: a degenerate threshold pair (apply ==
-    # mask_saturation, reachable only from pre-LV-UI-11 or programmatic
-    # intents) must NOT absorb a touch of either bool as EditNoChange —
-    # the same-value edit falls through so the exclusivity branch below
-    # normalizes the complement to what the Auto control displays.
-    degenerate_threshold_pair = (
-        path in {MASK_SATURATION, THRESHOLD_ENABLED}
-        and bool(intent.threshold.apply_threshold)
-        == bool(intent.threshold.mask_saturation)
+    # Design checkpoint 2026-08-04: a touch of any threshold control must NOT
+    # absorb as EditNoChange while the intent's threshold identity differs
+    # from what the panel displays (degenerate booleans OR unmaterialized
+    # displayed defaults) — the same-value edit falls through so the shared
+    # canonicalizer below makes identity match display.  The probe runs on a
+    # detached thawed copy.
+    noncanonical_threshold_touch = (
+        path in {
+            MASK_SATURATION, THRESHOLD_ENABLED, THRESHOLD_MIN, THRESHOLD_MAX,
+        }
+        and canonicalize_threshold_intent(snapshot.thaw())
     )
-    if parsed == current and not degenerate_threshold_pair:
+    if parsed == current and not noncanonical_threshold_touch:
         return EditNoChange()
     if path in {THRESHOLD_MIN, THRESHOLD_MAX}:
         low = parsed if path == THRESHOLD_MIN else intent.threshold.threshold_min
@@ -422,41 +424,67 @@ def reduce_control_edit(
             candidate,
             was_enabled=intent.gi.enabled,
         )
-    elif path in {THRESHOLD_MIN, THRESHOLD_MAX} and parsed is not None:
+    elif path in {THRESHOLD_MIN, THRESHOLD_MAX}:
         # LV-UI-11: setting a manual bound IS choosing manual thresholding —
-        # the sentinel Auto masking and the manual band are exclusive.
-        candidate.threshold.apply_threshold = True
-        candidate.threshold.mask_saturation = False
+        # the sentinel Auto masking and the manual band are exclusive.  A
+        # CLEARED bound (parsed None) keeps the mode and re-materializes to
+        # the displayed default through the canonicalizer below.
+        if parsed is not None:
+            candidate.threshold.apply_threshold = True
+            candidate.threshold.mask_saturation = False
+        canonicalize_threshold_intent(candidate)
     elif path == MASK_SATURATION:
         # LV-UI-11: the Threshold row's Auto toggle.  ON = mask saturated
-        # pixels, no manual band; OFF = the manual [min, max] band applies,
-        # seeded to the visible defaults on first use.
+        # pixels, no manual band; OFF = the manual [min, max] band applies
+        # at exactly the displayed defaults.
         candidate.threshold.apply_threshold = not parsed
-        if not parsed:
-            _seed_manual_threshold(candidate)
+        canonicalize_threshold_intent(candidate)
     elif path == THRESHOLD_ENABLED:
         # Kept for the legacy static_scan binding and programmatic edits; the
         # same exclusivity holds in both directions.
         candidate.threshold.mask_saturation = not parsed
-        if parsed:
-            _seed_manual_threshold(candidate)
+        canonicalize_threshold_intent(candidate)
     return candidate
 
 
-def _seed_manual_threshold(intent: RunIntent) -> None:
-    """Fill absent manual-threshold bounds with the LV-UI-11 display
-    defaults: 0 and the detector family's typical raw-stream ceiling — a
-    DISPLAY default, not an acquisition fact (saturation masking derives its
-    ceiling from the acquired frame's own dtype at reduction time).  An
-    unknown detector leaves the max absent — blank in the GUI — rather than
-    guessing."""
+def canonicalize_threshold_intent(intent: RunIntent) -> bool:
+    """THE shared vNext threshold canonicalizer (frozen design checkpoint,
+    2026-08-04): one function makes an intent's threshold identity describe
+    exactly what the panel displays.  Used by BOTH the edit reducer and the
+    start capture; returns True when the intent was changed.
+
+    - Exclusive booleans: a degenerate pair adopts the displayed Auto fact —
+      ``apply_threshold = not mask_saturation``.
+    - Manual mode MATERIALIZES the displayed defaults into the identity:
+      missing minimum -> 0.0; missing maximum -> the detector family's
+      display default when known, otherwise None (the box renders blank and
+      execution stays open-ended above — display and identity agree either
+      way).  The ceiling is a display default, not an acquisition fact;
+      reduction-time masking keys off the acquired frame's own dtype.
+    - Runs even when the booleans are already exclusive: the defaulted-bound
+      gap (Codex DESIGN_STOP) was a boolean-canonical pair whose cleared
+      bounds stored None while the projection displayed substituted
+      defaults, so the run executed a band the panel never showed.
+    - No min<=max guard here: materialization mirrors the display verbatim,
+      and a nonsensical band refuses LOUDLY at freeze
+      (``FrozenThresholdPolicy`` validation) instead of being silently
+      un-materialized.
+    """
     threshold = intent.threshold
-    if threshold.threshold_min is None:
-        threshold.threshold_min = 0.0
-    if threshold.threshold_max is None:
-        ceiling = poni_saturation_ceiling(intent.poni_file)
-        if ceiling is not None and float(threshold.threshold_min) <= ceiling:
-            threshold.threshold_max = ceiling
+    changed = False
+    if bool(threshold.apply_threshold) == bool(threshold.mask_saturation):
+        threshold.apply_threshold = not bool(threshold.mask_saturation)
+        changed = True
+    if threshold.apply_threshold:
+        if threshold.threshold_min is None:
+            threshold.threshold_min = 0.0
+            changed = True
+        if threshold.threshold_max is None:
+            ceiling = poni_saturation_ceiling(intent.poni_file)
+            if ceiling is not None:
+                threshold.threshold_max = ceiling
+                changed = True
+    return changed
 
 
 def _normalize_gi_units(intent: RunIntent, *, was_enabled: bool) -> None:

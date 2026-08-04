@@ -527,6 +527,50 @@ def test_degenerate_threshold_pairs_normalize_on_touch() -> None:
     assert type(unchanged) is EditNoChange
 
 
+def test_clearing_a_manual_bound_rematerializes_the_displayed_default(
+    tmp_path: Path,
+) -> None:
+    """DESIGN_STOP (2026-08-04): clearing a bound must not leave the identity
+    holding None while the panel displays the substituted default — the
+    shared canonicalizer re-materializes it in the same reduced candidate.
+    Unknown detector: a cleared max stays None and the box renders blank
+    (open-ended above, displayed and executed alike)."""
+    from xdart.gui.tabs.scattering.controls_inventory import (
+        THRESHOLD_MAX,
+        THRESHOLD_MIN,
+    )
+
+    manual = _intent()
+    manual.poni_file = _eiger_poni(tmp_path)
+    manual.threshold.apply_threshold = True
+    manual.threshold.mask_saturation = False
+    manual.threshold.threshold_min = 1.0
+    manual.threshold.threshold_max = 2.0
+
+    cleared_max = reduce_control_edit(
+        RunIntentStore(manual).snapshot(), THRESHOLD_MAX, ""
+    )
+    assert type(cleared_max) is RunIntent
+    assert cleared_max.threshold.threshold_max == 4294967295.0
+
+    cleared_min = reduce_control_edit(
+        RunIntentStore(manual).snapshot(), THRESHOLD_MIN, ""
+    )
+    assert type(cleared_min) is RunIntent
+    assert cleared_min.threshold.threshold_min == 0.0
+
+    unknown = _intent()
+    unknown.threshold.apply_threshold = True
+    unknown.threshold.mask_saturation = False
+    unknown.threshold.threshold_min = 1.0
+    unknown.threshold.threshold_max = 2.0
+    cleared = reduce_control_edit(
+        RunIntentStore(unknown).snapshot(), THRESHOLD_MAX, ""
+    )
+    assert type(cleared) is RunIntent
+    assert cleared.threshold.threshold_max is None
+
+
 def test_vnext_threshold_fields_follow_the_auto_masksat_model(
     tmp_path: Path,
 ) -> None:

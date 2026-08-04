@@ -45,8 +45,14 @@ def _normalized(detector: object) -> str:
 
 
 def detector_saturation_ceiling(detector: object) -> float | None:
-    """The raw-frame integer saturation ceiling for a named detector, or
-    ``None`` when the family (and therefore the raw dtype) is not known."""
+    """The DISPLAY-DEFAULT ceiling for a named detector's family, or ``None``
+    when the family is not in the table.
+
+    A family does NOT determine an acquisition's raw dtype (the supported
+    Eiger path delivers uint16 and uint32 alike); this value is the family's
+    typical raw-stream ceiling, used only to seed the GUI's manual-threshold
+    inputs.  Reduction-time saturation masking keys off the acquired frame's
+    own dtype and never reads this table."""
     name = _normalized(detector)
     if not name:
         return None

@@ -4428,6 +4428,37 @@ def test_controls_panel_v2_path_fields_show_full_path_tooltip(qapp, monkeypatch)
         assert save_rows[0].current_value() == (
             "/data/project/xdart_processed_data"
         )
+
+        # Exception-based policy (maintainer 2026-08-04): ONLY the project
+        # folder displays its full path; every other browse-backed path —
+        # explicitly including Image Directory — shows its basename / final
+        # directory component.
+        widget._on_controls_v2_field_changed(
+            ("Project", "project_folder"), "/data/very/long/project")
+        widget._on_controls_v2_field_changed(
+            ("Signal", "inp_type"), "Image Directory")
+        widget._on_controls_v2_field_changed(
+            ("Signal", "img_dir"), "/data/very/long/project/raw_images")
+        widget._refresh_controls_v2_profile_now()
+        rows_by_path = {
+            tuple(r.path): r
+            for r in widget.controls_v2.findChildren(FormRow)
+        }
+        folder = rows_by_path[("Project", "project_folder")]
+        assert folder.editor.text() == "/data/very/long/project"
+        directory = rows_by_path[("Signal", "img_dir")]
+        assert directory.editor.text() == "raw_images"
+        assert directory.editor.toolTip() == (
+            "/data/very/long/project/raw_images"
+        )
+        assert directory.current_value() == (
+            "/data/very/long/project/raw_images"
+        )
+
+        # Filter usage guidance renders on the Image Directory Filter field.
+        filter_row = rows_by_path[("Signal", "Filter")]
+        assert "OR" in filter_row.editor.toolTip()
+        assert "-term" in filter_row.editor.toolTip()
     finally:
         widget.close()
         widget.deleteLater()
@@ -5087,6 +5118,52 @@ def test_threshold_row_adopts_mask_saturated_auto_toggle_in_vnext(qapp):
         )
         assert manual_row._high.isEnabled()               # Auto OFF, manual
         assert "display default" in manual_row._high.toolTip()
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
+def test_max_bound_scope_caveat_survives_run_lock(qapp):
+    """DESIGN_STOP secondary (2026-08-04): the lock reason outranks the
+    tooltip table too, so the detector-scope caveat must ride the LOCKED
+    max-bound reason — at construction under lock and across in-place
+    lock/unlock state updates."""
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.run_configuration import RunIntent
+    from xdart.gui.tabs.scattering.controls_projection import project_controls
+    from xdart.gui.tabs.scattering.state_machine import RunPhase
+    from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import RangeRow
+
+    def _row(host):
+        return next(
+            r for r in host.findChildren(RangeRow)
+            if tuple(r._low_path) == ("Mask", "min")
+        )
+
+    store = RunIntentStore(RunIntent())
+    panel = ControlsPanelV2()
+    try:
+        # Construction while run-locked.
+        panel.set_state(project_controls(
+            store.snapshot(), None, RunPhase.RUNNING))
+        locked = _row(panel)
+        assert not locked._high.isEnabled()
+        assert "locked" in locked._high.toolTip()
+        assert "display default" in locked._high.toolTip()
+
+        # In-place unlock, then re-lock, through the update path.
+        if not panel.apply_state_update(project_controls(
+                store.snapshot(), None, RunPhase.IDLE)):
+            panel.set_state(project_controls(
+                store.snapshot(), None, RunPhase.IDLE))
+        assert "display default" in _row(panel)._high.toolTip()
+        if not panel.apply_state_update(project_controls(
+                store.snapshot(), None, RunPhase.RUNNING)):
+            panel.set_state(project_controls(
+                store.snapshot(), None, RunPhase.RUNNING))
+        relocked = _row(panel)
+        assert "locked" in relocked._high.toolTip()
+        assert "display default" in relocked._high.toolTip()
     finally:
         panel.close()
         panel.deleteLater()
