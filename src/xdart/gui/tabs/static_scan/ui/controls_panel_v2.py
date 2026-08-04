@@ -11,6 +11,7 @@ objects directly.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from pathlib import PurePath
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
@@ -37,6 +38,10 @@ from ..controls_logic import (
 def _spaced(base: int, tokens: SpacingTokens) -> int:
     """Scale a legacy layout value while keeping Normal byte-compatible."""
     return max(0, base + tokens.layout_gap - 8)
+
+
+PROCESSING_ROW_LABEL_WIDTH = 72
+PROCESSING_ROW_GAP = 5
 
 
 # Order: Project · Experiment · Source · Processing (instrument config before
@@ -114,6 +119,12 @@ def _field_tooltip(path, reason: str = "") -> str:
 
 _SOURCE_ENERGY_PATH = ("Source", "energy_preference")
 _SOURCE_ENERGY_OPTIONS = (("PONI", "poni"), ("Metadata", "metadata"))
+_FILE_NAME_ONLY_PATHS = {
+    ("Calibration", "poni_file"),
+    ("Signal", "poni_file"),
+    ("Signal", "mask_file"),
+    ("Signal", "File"),
+}
 
 
 class StatusBadge(QtWidgets.QLabel):
@@ -548,6 +559,55 @@ class FieldRow(QtWidgets.QWidget):
         return self._status
 
 
+class _ComboPopupItemDelegate(QtWidgets.QStyledItemDelegate):
+    """Keep native combo popup rows readable at compact spacing tiers.
+
+    The platform popup view does not consistently honor an item ``min-height``
+    from QSS.  Deriving the floor from the live closed control keeps the popup
+    responsive to font/spacing changes without baking another appearance
+    constant into Controls.
+    """
+
+    def __init__(self, combo: QtWidgets.QComboBox):
+        super().__init__(combo)
+        self._combo = combo
+
+    def sizeHint(self, option, index) -> QtCore.QSize:
+        size = super().sizeHint(option, index)
+        control_height = max(
+            self._combo.height(),
+            self._combo.sizeHint().height(),
+        )
+        size.setHeight(max(size.height(), control_height))
+        return size
+
+
+class _ControlsComboBox(QtWidgets.QComboBox):
+    """Combo whose popup capacity survives Controls form reconstruction.
+
+    On macOS the styled popup container can retain the closed control's Tight
+    height after a mounted form is rebuilt.  The item delegate still gives
+    every row the right height, but the viewport then shows only one or two
+    rows plus native scroll affordances.  Recompute the viewport floor at the
+    only authoritative boundary -- immediately before the popup is shown.
+    """
+
+    def showPopup(self) -> None:
+        view = self.view()
+        view.doItemsLayout()
+        visible = min(self.count(), max(1, self.maxVisibleItems()))
+        row_height = max(
+            (view.sizeHintForRow(row) for row in range(visible)),
+            default=max(self.height(), self.sizeHint().height()),
+        )
+        # Include the view frame without imposing a maximum: longer choice
+        # inventories retain native scrolling after ``maxVisibleItems``.
+        viewport_floor = visible * row_height + 2 * view.frameWidth()
+        view.setMinimumHeight(max(1, viewport_floor))
+        view.updateGeometry()
+        super().showPopup()
+
+
 class FormRow(QtWidgets.QWidget):
     """One editable row in the transitional V2 form."""
 
@@ -576,6 +636,13 @@ class FormRow(QtWidgets.QWidget):
         self._path = tuple(path)
         self._kind = kind
         self._enabled = bool(enabled)
+        self._file_name_only = (
+            kind == "line"
+            and browse
+            and self._path in _FILE_NAME_ONLY_PATHS
+        )
+        self._model_value = "" if value is None else str(value)
+        self._editor_dirty = False
         lay = QtWidgets.QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
@@ -603,8 +670,13 @@ class FormRow(QtWidgets.QWidget):
             lay.addWidget(editor, 1)
         elif kind == "combo":
             lay.addWidget(self.label)
-            editor = QtWidgets.QComboBox()
+            editor = _ControlsComboBox()
             editor.setObjectName("controlsV2ComboBox")
+            # Qt's native popup ignores the QSS item-height floor on some
+            # platforms.  Keep this parented delegate alive with the row so a
+            # Tight live-theme change cannot compress choices into one line.
+            self._combo_popup_delegate = _ComboPopupItemDelegate(editor)
+            editor.setItemDelegate(self._combo_popup_delegate)
             values = [str(choice) for choice in choices]
             if not values and value not in (None, ""):
                 values = [str(value)]
@@ -616,23 +688,27 @@ class FormRow(QtWidgets.QWidget):
             elif text:
                 editor.addItem(text)
                 editor.setCurrentText(text)
-            editor.currentTextChanged.connect(
-                lambda text: self._emit_edit(text)
+            # ``currentTextChanged`` also fires for programmatic reconciliation,
+            # and rebuilding the passive Controls form synchronously from that
+            # signal can destroy a native popup while it is still open.  Accept
+            # only a genuine user choice and commit it on the next event-loop
+            # turn, after the popup has closed.
+            editor.textActivated.connect(
+                lambda text: QtCore.QTimer.singleShot(
+                    0,
+                    lambda selected=str(text): self._emit_edit(selected),
+                )
             )
             lay.addWidget(editor, 1)
         else:
             lay.addWidget(self.label)
-            editor = QtWidgets.QLineEdit("" if value is None else str(value))
+            editor = QtWidgets.QLineEdit(self._line_display_value(value))
             editor.setObjectName("controlsV2LineEdit")
-            editor.editingFinished.connect(
-                lambda e=editor: self._emit_edit(e.text())
-            )
+            editor.editingFinished.connect(self._emit_editor_edit)
             # A focused draft (user typing, NOT programmatic setText) is
             # revisioned at action time so it survives a rebuild and wins by
             # revision (§12.4); it commits (and applies) on editingFinished.
-            editor.textEdited.connect(
-                lambda text, p=self._path: self.draftChanged.emit(p, text)
-            )
+            editor.textEdited.connect(self._draft_edited)
             lay.addWidget(editor, 1)
 
         self.editor = editor
@@ -653,7 +729,13 @@ class FormRow(QtWidgets.QWidget):
             btn.setEnabled(self._enabled)
             lay.addWidget(btn)
             self.browse_button = btn
-        self.setToolTip(reason or "")
+        tip = (
+            self._model_value
+            if browse and self._model_value and not reason
+            else _field_tooltip(self._path, reason)
+        )
+        for widget in (self, self.editor, self.label):
+            widget.setToolTip(tip)
 
     @property
     def path(self) -> tuple[str, ...]:
@@ -670,6 +752,8 @@ class FormRow(QtWidgets.QWidget):
             return bool(self.editor.isChecked())
         if self._kind == "combo":
             return self.editor.currentText()
+        if self._file_name_only and not self._editor_dirty:
+            return self._model_value
         return self.editor.text()
 
     def apply_field(self, field: ControlFormField) -> bool:
@@ -711,8 +795,12 @@ class FormRow(QtWidgets.QWidget):
                     idx = self.editor.findText(value)
                     if idx >= 0:
                         self.editor.setCurrentIndex(idx)
-            elif not self.editor.hasFocus() and self.editor.text() != value:
-                self.editor.setText(value)
+            elif not self.editor.hasFocus():
+                shown = self._line_display_value(value)
+                if self.editor.text() != shown:
+                    self.editor.setText(shown)
+                self._model_value = value
+                self._editor_dirty = False
                 if field.browse:
                     self.editor.setCursorPosition(0)
         finally:
@@ -726,6 +814,19 @@ class FormRow(QtWidgets.QWidget):
             if widget is not None and widget.toolTip() != tip:
                 widget.setToolTip(tip)
         return True
+
+    def _line_display_value(self, value) -> str:
+        text = "" if value is None else str(value)
+        if self._file_name_only and text:
+            return PurePath(text).name
+        return text
+
+    def _draft_edited(self, text: str) -> None:
+        self._editor_dirty = True
+        self.draftChanged.emit(self._path, text)
+
+    def _emit_editor_edit(self) -> None:
+        self._emit_edit(self.current_value())
 
     def _emit_edit(self, value) -> None:
         edit = ControlFormEdit(path=self._path, value=value)
@@ -753,11 +854,11 @@ class RangeRow(QtWidgets.QWidget):
         self._display_label = str(label)
         lay = QtWidgets.QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(5)
+        lay.setSpacing(PROCESSING_ROW_GAP)
 
         self.label = QtWidgets.QLabel(self._display_label)
         self.label.setObjectName("controlsV2FieldLabel")
-        self.label.setMinimumWidth(72)
+        self.label.setMinimumWidth(PROCESSING_ROW_LABEL_WIDTH)
         lay.addWidget(self.label)
 
         self._low, self._low_path = self._edit(low, lay)
@@ -1704,6 +1805,11 @@ class ControlsPanelV2(QtWidgets.QWidget):
                 # Drop the redundant "1D"/"2D" prefix and park the Pts cluster to
                 # the right of the Axis dropdown (frees the header for status).
                 row = self._make_bound_row(field, label="Axis")
+                # RangeRow is the alignment owner for the bounds directly
+                # below.  Match its label width and gap so the Axis combo and
+                # both range editors share one exact left edge.
+                row.label.setMinimumWidth(PROCESSING_ROW_LABEL_WIDTH)
+                row.layout().setSpacing(PROCESSING_ROW_GAP)
                 if point_fields:
                     self._attach_points_to_row(row, point_fields)
                     points_attached = True

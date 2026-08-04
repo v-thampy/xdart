@@ -4405,10 +4405,12 @@ def test_controls_panel_v2_path_fields_show_full_path_tooltip(qapp, monkeypatch)
         ]
         assert rows
         editor = rows[0].editor
-        # The tooltip is the full path (the editor's own text), not empty/a blurb.
-        assert editor.toolTip()
-        assert editor.toolTip() == editor.text()
-        assert "/" in editor.toolTip()
+        # LV-UI-6 (accepted E4 behavior): the editor displays only the file
+        # name; the FULL path lives in the tooltip — and the committed value
+        # stays the full model path, never the displayed stem.
+        assert editor.text() == "scan_0001.tif"
+        assert editor.toolTip() == "/data/very/long/path/scan_0001.tif"
+        assert rows[0].current_value() == "/data/very/long/path/scan_0001.tif"
     finally:
         widget.close()
         widget.deleteLater()
@@ -7261,7 +7263,14 @@ def test_form_row_combo_reconciliation_emits_no_field_value_changed(qapp):
         assert emitted == []
         assert row.editor.currentText() == "eta"
 
+        # E4-accepted seam: ANY programmatic index/text set stays silent (a
+        # synchronous rebuild from currentTextChanged could destroy a native
+        # popup mid-open); only a genuine user activation commits, deferred
+        # one event-loop turn.
         row.editor.setCurrentIndex(0)
+        qapp.processEvents()
+        assert emitted == []
+        row.editor.textActivated.emit("Manual")
         qapp.processEvents()
         assert emitted == [(_COMBO_PATH, "Manual")]
     finally:
