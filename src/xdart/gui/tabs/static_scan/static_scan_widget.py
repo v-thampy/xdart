@@ -296,6 +296,7 @@ from xrd_tools.io import (
     resolve_output_target,
 )
 from xrd_tools.io.output_path import APPEND_MODE
+from xrd_tools.io.output_safety import OutputCollisionError
 from xrd_tools.core import browse_publication_max_items
 from xrd_tools.session.display_logic import SupersedeReason
 from xrd_tools.core.energy import normalize_wavelength_m, wavelength_m_to_energy_eV
@@ -9998,6 +9999,30 @@ class staticWidget(QWidget):
         # reads itself) and for live runs (injected into the wrangler at
         # run-setup; see _push_threshold_to_wrangler).
 
+    def _setup_wrangler_guarded(self) -> bool:
+        """Run the active wrangler's ``setup()``, absorbing ONLY a typed
+        source/output collision.  True when setup completed.
+
+        ``setup()`` became fallible when P4/OUT-1 moved the suffix-independent
+        collision preflight ahead of scan mutation, and both GUI callers still
+        consumed it as infallible: activation runs inside a Qt ``currentChanged``
+        slot, where PySide prints and swallows the exception so the caller can
+        neither catch it nor tell the operator, and run start had already flipped
+        Start/Stop and disabled the panel with no thread left to restore the UI.
+
+        Only ``OutputCollisionError`` is caught — it is the one failure the
+        operator can fix from the panel.  Every other setup error stays
+        fail-loud, and a direct ``wrangler.setup()`` still raises.
+        """
+        try:
+            self.wrangler.setup()
+        except OutputCollisionError as exc:
+            status = getattr(self.wrangler, 'showLabel', None)
+            if status is not None:
+                status.emit(str(exc))
+            return False
+        return True
+
     def _show_reintegration_write_error(self, message: str) -> None:
         """Surface reintegration save failures in the same status area as runs."""
         try:
@@ -10630,7 +10655,10 @@ class staticWidget(QWidget):
             if self._controls_v2_enabled()
             else None
         )
-        self.wrangler.setup()
+        # Activation is not a run: a refused setup must not escape this Qt slot,
+        # and the rest of attachment still completes so the operator can correct
+        # the source/output pair from the panel.
+        self._setup_wrangler_guarded()
         self._connect_controls_v2_source_tree()
         self._sync_controls_v2_source_index()
         if native_gi_cfg is not None:
@@ -15329,8 +15357,13 @@ class staticWidget(QWidget):
             self._controls_v2_freeze_container_frame_counts(source_plan))
         self.wrangler.source_pending_count = 0
         _t1 = _time.perf_counter() if _perf else 0.0
+        # Fallible setup runs BEFORE the panel is disabled: a refusal starts no
+        # thread, so there is no finished signal to restore the UI afterwards.
+        if not self._setup_wrangler_guarded():
+            self.wrangler.stop()        # restores command + Start/Stop state
+            self._clear_controls_v2_run_source_authority()
+            return
         self.wrangler.enabled(False)
-        self.wrangler.setup()
         run_config_debug_log(
             logger,
             "wrangler_setup_exit",

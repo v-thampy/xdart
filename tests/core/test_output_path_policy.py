@@ -685,6 +685,44 @@ def test_c2row3_explicit_pattern_narrowing_stays_exact(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Post-design — a non-file entry is never an output sibling
+# ---------------------------------------------------------------------------
+
+def test_pd_row6_a_directory_never_shadows_a_valid_case_variant_file(tmp_path):
+    """PD row 6 — real files are filtered BEFORE canonical/class ranking.
+
+    Needs a case-sensitive filesystem: elsewhere the two spellings are one
+    entry, so the shadowing is not expressible.
+    """
+    from xrd_tools.io import resolve_output_target
+
+    if not _case_sensitive_fs(tmp_path):
+        pytest.skip("case-insensitive filesystem: the two spellings are one entry")
+    (tmp_path / "scan_042.nexus").mkdir()       # canonical spelling is a DIRECTORY
+    real = _write_processed(tmp_path / "scan_042.NEXUS")
+
+    resolved = resolve_output_target(tmp_path, "scan_042", mode="Append")
+
+    assert resolved == real
+    assert resolved.name == "scan_042.NEXUS"
+
+
+def test_pd_row6_non_file_entries_are_never_returned_as_siblings(tmp_path):
+    """Platform-independent half: a directory is not an output sibling."""
+    from xrd_tools.io import resolve_output_target
+
+    (tmp_path / "scan_042.nexus").mkdir()
+    legacy = _write_processed(tmp_path / "scan_042.nxs")
+
+    assert resolve_output_target(
+        tmp_path, "scan_042", mode="Append") == legacy
+
+    legacy.unlink()
+    assert resolve_output_target(
+        tmp_path, "scan_042", mode="Append") == tmp_path / "scan_042.nexus"
+
+
+# ---------------------------------------------------------------------------
 # Correction round 2 — collision preflight on the headless writer path
 #
 # ``source_architecture.md`` and handoff §2 rule 8 require the suffix-independent

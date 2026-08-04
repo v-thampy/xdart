@@ -104,15 +104,19 @@ def _existing_sibling(directory: "os.PathLike[str] | str",
     by_class: dict[str, list[str]] = {}
     for name in names:
         stem, dot, suffix = name.rpartition(".")
-        if dot and stem == scan_name:
-            by_class.setdefault(f".{suffix}".lower(), []).append(name)
+        cls = f".{suffix}".lower()
+        # Real FILES only, filtered BEFORE ranking.  Filtering afterwards let a
+        # directory named `scan.nexus` win its class on canonical spelling and
+        # then fail the file test, abandoning the whole class — hiding a valid
+        # `scan.NEXUS` file and dropping Append to a legacy sibling.
+        if (dot and stem == scan_name and cls in READABLE_OUTPUT_SUFFIXES
+                and (root / name).is_file()):
+            by_class.setdefault(cls, []).append(name)
     for cls in READABLE_OUTPUT_SUFFIXES:
         matches = sorted(by_class.get(cls, ()))
         if matches:
             canonical = f"{scan_name}{cls}"
-            chosen = root / (canonical if canonical in matches else matches[0])
-            if chosen.is_file():
-                return chosen
+            return root / (canonical if canonical in matches else matches[0])
     return None
 
 

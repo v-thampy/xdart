@@ -632,6 +632,148 @@ def test_c2row9_nexus_setup_accepts_a_separate_output_directory(
 
 
 # ---------------------------------------------------------------------------
+# Post-design root cause — one typed GUI setup failure boundary.  `setup()`
+# became fallible when the collision preflight moved ahead of scan mutation, but
+# both callers consumed it as infallible: `set_wrangler` runs inside a Qt
+# `currentChanged` slot where PySide prints and swallows the exception, and
+# `start_wrangler` refused only after Start/Stop flipped and the panel was off.
+# ---------------------------------------------------------------------------
+
+def _nexus_index(widget):
+    stack = widget.ui.wranglerStack
+    return next(i for i in range(stack.count())
+                if stack.widget(i).parameters.name() == "nexus_wrangler")
+
+
+def _status_text(wrangler):
+    """The full operator status; the tooltip carries the unelided text."""
+    label = wrangler._status_label()
+    return "" if label is None else (label.toolTip() or label.text())
+
+
+def _colliding_nexus(widget, tmp_path):
+    """The real NeXus wrangler aimed at a source its resolved target aliases."""
+    source = _write_processed(tmp_path / "raw_source.h5")
+    os.link(source, tmp_path / "raw_source.nexus")
+    nexus = widget.ui.wranglerStack.widget(_nexus_index(widget))
+    nexus.parameters.child('NeXus File').child('nexus_file').setValue(str(source))
+    nexus.parameters.child('Output').child('h5_dir').setValue(str(tmp_path))
+    return nexus, source
+
+
+def test_pd_row1_activation_collision_does_not_cross_the_qt_slot(qapp, tmp_path):
+    """PD row 1 — activation finishes coherently and names the collision."""
+    widget = staticWidget()
+    try:
+        nexus, source = _colliding_nexus(widget, tmp_path)
+        src_bytes = source.read_bytes()
+        prior_file = nexus.scan.data_file
+        prior_frames = nexus.scan.frames.data_file
+        widget.ui.wranglerStack.setCurrentIndex(_nexus_index(widget))
+
+        assert widget.wrangler is nexus            # activation completed
+        assert nexus.tree.isEnabled()              # panel still editable
+        assert not getattr(widget, "_run_active", False)
+        assert not nexus.thread.isRunning()
+        assert nexus.scan.data_file == prior_file      # scan identity exact
+        assert nexus.scan.frames.data_file == prior_frames
+        assert source.read_bytes() == src_bytes
+        assert "same file" in _status_text(nexus).lower()
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_pd_row2_run_refusal_leaves_the_panel_idle_and_editable(qapp, tmp_path):
+    """PD row 2 — refusal restores idle controls and clears run authority."""
+    widget = staticWidget()
+    try:
+        nexus, source = _colliding_nexus(widget, tmp_path)
+        src_bytes = source.read_bytes()
+        prior_file = nexus.scan.data_file
+        widget.ui.wranglerStack.setCurrentIndex(_nexus_index(widget))
+        auto_last_before = widget.h5viewer.auto_last
+        # Start enablement belongs to the Controls-V2 readiness model, not to
+        # this refusal: pin it to its pre-Start baseline.
+        start_enabled_before = nexus.startButton.isEnabled()
+        nexus.thread.source_run_plan = object()     # stale frozen handoff
+        nexus.thread.source_index_session = object()
+
+        nexus.start()                               # real Start path -> sigStart
+
+        assert nexus.command == 'stop'
+        assert nexus.thread.command == 'stop'
+        assert nexus.startButton.isEnabled() == start_enabled_before
+        assert not nexus.stopButton.isEnabled()
+        assert nexus.tree.isEnabled()
+        assert not getattr(widget, "_run_active", False)
+        assert widget.h5viewer.auto_last == auto_last_before
+        assert nexus.thread.source_run_plan is None      # authority cleared
+        assert nexus.thread.source_index_session is None
+        assert not nexus.thread.isRunning()
+        assert nexus.scan.data_file == prior_file
+        assert source.read_bytes() == src_bytes
+        status = _status_text(nexus).lower()
+        assert "same file" in status and "save path" in status
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_pd_row3_corrected_destination_permits_one_normal_run(
+        qapp, tmp_path, monkeypatch):
+    """PD row 3 — after a refusal, fixing the output starts exactly one run."""
+    from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler_thread import (
+        nexusThread,
+    )
+
+    started = []
+    monkeypatch.setattr(nexusThread, "start",
+                        lambda self, *a, **k: started.append(self))
+
+    widget = staticWidget()
+    try:
+        nexus, _source = _colliding_nexus(widget, tmp_path)
+        widget.ui.wranglerStack.setCurrentIndex(_nexus_index(widget))
+
+        nexus.start()
+        assert started == []                        # refused, nothing launched
+        assert nexus.tree.isEnabled()               # ...and still correctable
+
+        out = tmp_path / "out"
+        out.mkdir()
+        # Correct it as an operator does: the Controls-V2 field-edit slot owns
+        # the panel model, so a raw parameter write would just be overwritten.
+        widget._on_controls_v2_field_changed(("Output", "h5_dir"), str(out))
+
+        nexus.start()
+
+        assert len(started) == 1
+        assert getattr(widget, "_run_active", False)
+        assert not nexus.tree.isEnabled()           # normal run state entered
+        assert Path(nexus.fname) == out / "raw_source.nexus"
+        assert Path(nexus.scan.data_file) == out / "raw_source.nexus"
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+def test_pd_row5_an_unrelated_setup_error_is_not_swallowed(
+        qapp, tmp_path, monkeypatch):
+    """PD row 5 — the boundary catches ONLY the typed collision."""
+    widget = staticWidget()
+    try:
+        def boom():
+            raise RuntimeError("unrelated setup failure")
+        monkeypatch.setattr(widget.wrangler, "setup", boom)
+        with pytest.raises(RuntimeError, match="unrelated setup failure"):
+            widget._setup_wrangler_guarded()
+    finally:
+        widget.close()
+        widget.deleteLater()
+
+
+# ---------------------------------------------------------------------------
 # Row 15 (GUI) — function-scoped owner census
 # ---------------------------------------------------------------------------
 
