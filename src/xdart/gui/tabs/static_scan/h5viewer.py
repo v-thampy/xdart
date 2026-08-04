@@ -117,7 +117,6 @@ from pyqtgraph.Qt import QtWidgets, QtCore, QtGui
 from xrd_tools.io import (
     NEW_OUTPUT_SUFFIX,
     READABLE_OUTPUT_SUFFIXES,
-    is_readable_output_path,
 )
 
 try:
@@ -187,6 +186,21 @@ def _frame_label_sort_key(value):
         return (0, int(text))
     except (TypeError, ValueError):
         return (1, text)
+
+
+def _readable_output_rank(name):
+    """Policy rank of *name*'s processed-output suffix, or ``None``.
+
+    ``0`` = ``.nexus``, ``1`` = ``.nxs`` — ``READABLE_OUTPUT_SUFFIXES`` order,
+    i.e. the frozen ".nexus wins" rule (P4/OUT-1 §2 rule 4) — matched
+    case-insensitively (§2 rule 5).  Every viewer selection path ranks by this
+    instead of by list position: Date sort visits a newer legacy sibling FIRST,
+    and presentation order must never invert the policy.
+    """
+    suffix = os.path.splitext(str(name))[1].lower()
+    if suffix in READABLE_OUTPUT_SUFFIXES:
+        return READABLE_OUTPUT_SUFFIXES.index(suffix)
+    return None
 
 
 def _browse_one_shot_enabled(viewer) -> bool:
@@ -1216,9 +1230,10 @@ class H5Viewer(QWidget):
                         if ext in self._NEXUS_EXTS:
                             lw.addItem(name)
                     else:
-                        # Normal mode: only HDF5/NeXus scan files
-                        if ('.' + name.split('.')[-1]) in (
-                                '.h5', '.hdf5', *READABLE_OUTPUT_SUFFIXES):
+                        # Normal mode: only HDF5/NeXus scan files.  ``ext`` is
+                        # already lowercased, so a case-preserving share's
+                        # SCAN.NEXUS / SCAN.NXS lists like any other (§2 rule 5).
+                        if ext in ('.h5', '.hdf5', *READABLE_OUTPUT_SUFFIXES):
                             lw.addItem(name)
 
             # Restore the prior multi-selection by name (signals stay blocked, so
@@ -1237,34 +1252,36 @@ class H5Viewer(QWidget):
                 # the display had already moved to the new one.  Select the entry
                 # for the current scan_name (signals blocked, so no re-load).
                 sname = str(self.scan_name)
-                targets = tuple(f"{sname}{suffix}"
-                                for suffix in READABLE_OUTPUT_SUFFIXES)
-                matched_row = None
-                fuzzy_row = None
+                # (rank, row) keyed by SUFFIX rank, never by row position: Date
+                # sort lists a newer .nxs first and .nexus must still win.
+                unranked = len(READABLE_OUTPUT_SUFFIXES)
+                matched = fuzzy = None
                 for row in range(lw.count()):
                     text = lw.item(row).text()
-                    if text in targets:        # exact <scan_name>.nexus/.nxs
-                        matched_row = row
-                        break
-                    # Tolerate a scan_name that carries a frame-count/display
-                    # suffix the file stem does not (e.g. "<scan>_5" vs the file
-                    # "<scan>.nxs"), and the "<scan>/" directory form.
-                    if (is_readable_output_path(text)
-                            or text.endswith((".h5", ".hdf5"))):
+                    rank = _readable_output_rank(text)
+                    if (rank is not None
+                            or text.lower().endswith((".h5", ".hdf5"))):
                         stem = text.rsplit(".", 1)[0]
                     else:
                         stem = text.rstrip("/")
-                    if stem and (stem == sname or sname.startswith(stem + "_")):
-                        fuzzy_row = row
-                sel_row = matched_row if matched_row is not None else fuzzy_row
-                if sel_row is not None:
-                    lw.setCurrentItem(lw.item(sel_row),
+                    if rank is not None and stem == sname:
+                        key = (rank, row)          # exact <scan_name>.nexus/.nxs
+                        matched = key if matched is None else min(matched, key)
+                    # Tolerate a scan_name that carries a frame-count/display
+                    # suffix the file stem does not (e.g. "<scan>_5" vs the file
+                    # "<scan>.nxs"), and the "<scan>/" directory form.
+                    elif stem and (stem == sname
+                                   or sname.startswith(stem + "_")):
+                        key = (unranked if rank is None else rank, row)
+                        fuzzy = key if fuzzy is None else min(fuzzy, key)
+                sel = matched if matched is not None else fuzzy
+                if sel is not None:
+                    lw.setCurrentItem(lw.item(sel[1]),
                                       QItemSelectionModel.ClearAndSelect)
                 if os.environ.get("XDART_PERF"):
                     logger.info(
-                        "[PERF] update_scans select: scan_name=%r targets=%r "
-                        "exact=%s fuzzy=%s n_items=%d",
-                        sname, targets, matched_row, fuzzy_row, lw.count())
+                        "[PERF] update_scans select: scan_name=%r exact=%r "
+                        "fuzzy=%r n_items=%d", sname, matched, fuzzy, lw.count())
         finally:
             lw.blockSignals(was_blocked)
 
@@ -1317,23 +1334,33 @@ class H5Viewer(QWidget):
         """
         lw = self.ui.listScans
         fname = getattr(getattr(self, "file_thread", None), "fname", None)
-        targets = (os.path.basename(fname),) if fname else ()
-        if not targets:
-            scan_name = getattr(self, "scan_name", None)
-            targets = (tuple(f"{scan_name}{suffix}"
-                             for suffix in READABLE_OUTPUT_SUFFIXES)
-                       if scan_name else ())
-        if not targets:
+        exact = os.path.basename(fname) if fname else None
+        sname = None if exact else getattr(self, "scan_name", None)
+        if exact is None and sname is None:
             return False
+        sname = None if sname is None else str(sname)
         was_blocked = lw.blockSignals(True)
         try:
             lw.clearSelection()
+            # Without a loaded filename, suffix RANK picks the sibling — not
+            # whichever row Date sorting happened to put first (§2 rule 4).
+            best = None
             for row in range(lw.count()):
-                item = lw.item(row)
-                if item.text() in targets:
-                    lw.setCurrentItem(
-                        item, QItemSelectionModel.ClearAndSelect)
+                text = lw.item(row).text()
+                if exact is not None:
+                    if text != exact:
+                        continue
+                    lw.setCurrentItem(lw.item(row),
+                                      QItemSelectionModel.ClearAndSelect)
                     return True
+                rank = _readable_output_rank(text)
+                if rank is not None and text.rsplit(".", 1)[0] == sname:
+                    key = (rank, row)
+                    best = key if best is None else min(best, key)
+            if best is not None:
+                lw.setCurrentItem(lw.item(best[1]),
+                                  QItemSelectionModel.ClearAndSelect)
+                return True
         finally:
             lw.blockSignals(was_blocked)
         return False

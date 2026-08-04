@@ -221,12 +221,13 @@ def _finished_output_file(thread, wrangler, *, all_skipped_append=False):
                 else:
                     h5_dir = os.fspath(getattr(
                         _accepted_run_policy(thread), "save_path", "") or "")
-                    # Locating an ALREADY-written output: accept every readable
-                    # output suffix, newest-policy first (P4/OUT-1).
-                    candidates = [
-                        os.path.join(h5_dir, f"{scan_name}{suffix}")
-                        for suffix in READABLE_OUTPUT_SUFFIXES
-                    ]
+                    # Locating an ALREADY-written output is exactly the shared
+                    # Append resolution: it ranks .nexus over .nxs and returns
+                    # the file's REAL spelling, so a case-variant output is
+                    # preserved rather than respelled.  No second sibling finder
+                    # lives here (P4/OUT-1).
+                    candidates = [os.fspath(resolve_output_target(
+                        h5_dir, scan_name, mode=APPEND_MODE))]
             except (TypeError, ValueError):
                 continue
             for candidate in candidates:
@@ -291,9 +292,10 @@ from xdart.modules.frame_publication import (
 )
 from xrd_tools.io import (
     NEW_OUTPUT_SUFFIX,
-    READABLE_OUTPUT_SUFFIXES,
     default_output_path,
+    resolve_output_target,
 )
+from xrd_tools.io.output_path import APPEND_MODE
 from xrd_tools.core import browse_publication_max_items
 from xrd_tools.session.display_logic import SupersedeReason
 from xrd_tools.core.energy import normalize_wavelength_m, wavelength_m_to_energy_eV

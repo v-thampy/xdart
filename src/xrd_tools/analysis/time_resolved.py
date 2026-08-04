@@ -20,7 +20,7 @@ import xarray as xr
 
 from xrd_tools.analysis.axis_units import canonical_q_unit, require_inverse_angstrom
 from xrd_tools.io import (
-    READABLE_OUTPUT_SUFFIXES,
+    is_readable_output_path,
     get_1d,
     get_2d,
     get_metadata,
@@ -71,19 +71,22 @@ def discover_processed_scans(
     stacks remain untouched until :func:`load_time_resolved_series` is called.
 
     By default every readable output suffix is discovered (``.nexus`` and
-    ``.nxs``), so a directory holding both new and legacy results is ordered as
+    ``.nxs``), case-insensitively, so a directory holding both new and legacy
+    results — including a case-preserving share's ``SCAN.NXS`` — is ordered as
     one natural series.  An explicitly passed ``pattern`` keeps its exact
     meaning and narrows discovery to that glob alone.
     """
     root = Path(directory).expanduser()
     if not root.is_dir():
         raise NotADirectoryError(root)
-    patterns = ([pattern] if pattern is not None
-                else [f"*{suffix}" for suffix in READABLE_OUTPUT_SUFFIXES])
     paths: list[Path] = []
-    for glob_pattern in patterns:
-        paths.extend(root.rglob(glob_pattern) if recursive
-                     else root.glob(glob_pattern))
+    if pattern is not None:
+        paths.extend(root.rglob(pattern) if recursive else root.glob(pattern))
+    else:
+        # Classify rather than glob: ``Path.glob`` matches case-sensitively on
+        # POSIX, so a lowercase suffix pattern silently skips ``.NEXUS``.
+        paths.extend(p for p in (root.rglob("*") if recursive else root.glob("*"))
+                     if is_readable_output_path(p))
     processed: list[Path] = []
     for path in paths:
         if not path.is_file():

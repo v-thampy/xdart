@@ -31,6 +31,7 @@ import numpy as np
 
 from xrd_tools.io.export import write_h5
 from xrd_tools.io.output_path import default_output_path
+from xrd_tools.io.output_safety import check_output_not_source
 from xrd_tools.io.image import (
     SUPPORTED_EXTS,
     count_frames,
@@ -183,9 +184,27 @@ def process_scan(
     -------
     Path
         Absolute path to the output HDF5 file.
+
+    Raises
+    ------
+    OutputCollisionError
+        If *output_path* is, or aliases, one of this run's own input files.
+        Raised before anything is created or opened, so the raw source and any
+        existing destination keep their bytes.
     """
     scan_path = _as_path(scan_dir)
     out_path = _as_path(output_path)
+
+    # Suffix-independent source/output collision preflight before anything is
+    # created or opened (source_architecture.md; §2 rule 8).  Directory mode
+    # checks every discovered member, so a hardlink/symlink alias of one frame
+    # cannot be written over.  ``process_series`` and ``DirectoryWatcher``
+    # inherit this by calling through here; neither carries its own copy.
+    inputs: list[Path] = [scan_path]
+    if scan_path.is_dir():
+        inputs.extend(find_image_files(scan_path))
+    check_output_not_source(out_path, input_files=inputs)
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     frames, effective_mask, n_total = _frame_iterator(

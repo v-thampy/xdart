@@ -555,6 +555,198 @@ def test_row14_owner_imports_no_writer_or_schema_code():
 
 
 # ---------------------------------------------------------------------------
+# Correction round 2 — case-insensitive, spelling-preserving reader policy
+#
+# §2 rule 5 promises case-insensitive suffix recognition and no silent path
+# rewrite.  Classification honoured it; the implicit Append lookup and the
+# default time-resolved globs did not, so on a case-sensitive filesystem an
+# existing ``scan.NEXUS`` was ignored and silently respelled.
+# ---------------------------------------------------------------------------
+
+def _case_sensitive_fs(directory: Path) -> bool:
+    """Whether *directory*'s filesystem distinguishes ``A`` from ``a``.
+
+    macOS ships case-INsensitive APFS by default, where the two spellings of one
+    stem are the same file and cannot both exist; Linux CI is case-sensitive.
+    Only the within-class canonical-preference row needs both to coexist.
+    """
+    probe = directory / "_CaseProbe"
+    probe.write_text("x", encoding="utf-8")
+    try:
+        return not (directory / "_caseprobe").exists()
+    finally:
+        probe.unlink()
+
+
+def test_c2row1_append_preserves_a_real_uppercase_nexus_path(tmp_path):
+    """C2 row 1 — a real ``scan.NEXUS`` is found and returned in ITS spelling."""
+    from xrd_tools.io import resolve_output_target
+
+    real = _write_processed(tmp_path / "scan_042.NEXUS")
+    before = real.read_bytes()
+
+    resolved = resolve_output_target(tmp_path, "scan_042", mode="Append")
+
+    assert resolved.name == "scan_042.NEXUS"
+    assert resolved == real
+    assert real.read_bytes() == before          # selection never rewrites bytes
+
+
+def test_c2row2_append_reuses_a_sole_uppercase_legacy_file(tmp_path):
+    """C2 row 2a — a sole ``scan.NXS`` is reused, spelling preserved."""
+    from xrd_tools.io import resolve_output_target
+
+    real = _write_processed(tmp_path / "scan_042.NXS")
+
+    resolved = resolve_output_target(tmp_path, "scan_042", mode="Append")
+
+    assert resolved.name == "scan_042.NXS"
+    assert resolved == real
+
+
+def test_c2row2_mixed_case_both_siblings_prefer_the_new_suffix(tmp_path):
+    """C2 row 2b — ``.nexus`` still wins across a case boundary (§2 rule 4)."""
+    from xrd_tools.io import resolve_output_target
+
+    _write_processed(tmp_path / "scan_042.NEXUS")
+    _write_processed(tmp_path / "scan_042.nxs")
+
+    resolved = resolve_output_target(tmp_path, "scan_042", mode="Append")
+
+    assert resolved.name == "scan_042.NEXUS"
+
+
+def test_c2row2_canonical_lowercase_wins_within_a_suffix_class(tmp_path):
+    """Within one suffix class the exact canonical spelling is preferred.
+
+    Requires a case-sensitive filesystem: elsewhere the two spellings ARE one
+    file, so there is nothing to prefer.  Reported as a conditional row.
+    """
+    from xrd_tools.io import resolve_output_target
+
+    if not _case_sensitive_fs(tmp_path):
+        pytest.skip("case-insensitive filesystem: one file, nothing to rank")
+    _write_processed(tmp_path / "scan_042.NEXUS")
+    _write_processed(tmp_path / "scan_042.nexus")
+
+    resolved = resolve_output_target(tmp_path, "scan_042", mode="Append")
+
+    assert resolved.name == "scan_042.nexus"
+
+
+def test_c2row2_the_scan_stem_itself_is_never_case_folded(tmp_path):
+    """Only the SUFFIX is matched case-insensitively — never the stem."""
+    from xrd_tools.io import resolve_output_target
+
+    _write_processed(tmp_path / "SCAN_042.nexus")
+
+    resolved = resolve_output_target(tmp_path, "scan_042", mode="Append")
+
+    assert resolved.name == "scan_042.nexus"        # a different scan entirely
+
+
+def test_c2row2_an_explicit_target_is_still_returned_unchanged(tmp_path):
+    """Case-insensitive lookup must not touch the explicit-target path."""
+    from xrd_tools.io import resolve_output_target
+
+    _write_processed(tmp_path / "scan_042.NEXUS")
+    explicit = tmp_path / "chosen.NXS"
+
+    resolved = resolve_output_target(
+        tmp_path, "scan_042", mode="Append", explicit_target=explicit)
+
+    assert resolved == explicit
+
+
+def test_c2row3_default_discovery_finds_mixed_case_processed_records(tmp_path):
+    """C2 row 3a — default discovery is case-insensitive over both suffixes."""
+    from xrd_tools.analysis.time_resolved import discover_processed_scans
+
+    _write_processed(tmp_path / "scan_1.NEXUS")
+    _write_processed(tmp_path / "scan_2.NXS")
+    _write_processed(tmp_path / "scan_3.nexus")
+
+    found = discover_processed_scans(tmp_path)
+
+    assert [p.name for p in found] == [
+        "scan_1.NEXUS", "scan_2.NXS", "scan_3.nexus"]
+
+
+def test_c2row3_explicit_pattern_narrowing_stays_exact(tmp_path):
+    """C2 row 3b — an explicit glob keeps its exact, case-sensitive meaning."""
+    from xrd_tools.analysis.time_resolved import discover_processed_scans
+
+    _write_processed(tmp_path / "scan_1.NEXUS")
+    _write_processed(tmp_path / "scan_2.nxs")
+
+    assert [p.name for p in discover_processed_scans(tmp_path, pattern="*.nxs")
+            ] == ["scan_2.nxs"]
+    assert discover_processed_scans(tmp_path, pattern="*.nexus") == []
+
+
+# ---------------------------------------------------------------------------
+# Correction round 2 — collision preflight on the headless writer path
+#
+# ``source_architecture.md`` and handoff §2 rule 8 require the suffix-independent
+# guard before EVERY writer open.  ``process_series`` and ``DirectoryWatcher``
+# inherit it by calling through ``process_scan``; there is no second guard.
+# ---------------------------------------------------------------------------
+
+def test_c2row10_process_scan_rejects_a_same_inode_container_target(tmp_path):
+    """C2 row 10 — a hardlink alias of the container source is refused."""
+    from xrd_tools.integrate.batch import process_scan
+    from xrd_tools.io.output_safety import OutputCollisionError
+
+    source = _write_raw_master(tmp_path / "raw.h5")
+    before = source.read_bytes()
+    alias = tmp_path / "raw_alias.h5"
+    os.link(source, alias)
+
+    with pytest.raises(OutputCollisionError):
+        process_scan(source, object(), alias, npt=2, npt_rad=2, npt_azim=2)
+
+    assert source.read_bytes() == before
+
+
+def test_c2row11_process_scan_rejects_a_target_aliasing_a_directory_member(
+        tmp_path):
+    """C2 row 11 — the guard covers every member of an image directory."""
+    from xrd_tools.integrate.batch import process_scan
+    from xrd_tools.io.output_safety import OutputCollisionError
+
+    scan_dir = tmp_path / "images"
+    scan_dir.mkdir()
+    member = scan_dir / "frame_0002.tif"
+    member.write_bytes(b"\x49\x49\x2a\x00not-a-real-tif")
+    (scan_dir / "frame_0001.tif").write_bytes(b"\x49\x49\x2a\x00other")
+    before = member.read_bytes()
+
+    alias = tmp_path / "out.h5"
+    os.link(member, alias)
+
+    with pytest.raises(OutputCollisionError):
+        process_scan(scan_dir, object(), alias, npt=2, npt_rad=2, npt_azim=2)
+
+    assert member.read_bytes() == before
+
+
+def test_c2row10_a_safe_headless_target_is_still_accepted(tmp_path):
+    """Retained: the preflight must not reject an ordinary separate target."""
+    from xrd_tools.integrate.batch import process_scan
+
+    source = _write_raw_master(tmp_path / "raw.h5")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    # ``ai=object()`` fails per frame and is logged, but the run must reach the
+    # loop at all — the guard is what this row proves does NOT fire.
+    result = process_scan(source, object(), out_dir / "raw_processed.nexus",
+                          npt=2, npt_rad=2, npt_azim=2)
+
+    assert Path(result).name == "raw_processed.nexus"
+
+
+# ---------------------------------------------------------------------------
 # Row 15 (headless half) — function-scoped owner census
 # ---------------------------------------------------------------------------
 
@@ -564,10 +756,15 @@ HEADLESS_PRODUCERS = (
     ("xrd_tools/integrate/batch.py", "process_series"),
     ("xrd_tools/integrate/batch.py", "DirectoryWatcher._process_new_file"),
     ("xdart/modules/ewald/scan.py", "LiveScan.__init__"),
+    ("xrd_tools/analysis/time_resolved.py", "discover_processed_scans"),
 )
 
+#: The owner's real API names.  A bare ``output_path`` is deliberately absent:
+#: as an AST name it matches ``process_scan``'s own ``output_path`` parameter
+#: and locals such as ``_append_output_path``, which consume nothing.
 OWNER_NAMES = ("resolve_output_target", "default_output_path",
-               "NEW_OUTPUT_SUFFIX", "output_path")
+               "NEW_OUTPUT_SUFFIX", "READABLE_OUTPUT_SUFFIXES",
+               "is_readable_output_path")
 
 def _function_node(path: Path, qualname: str):
     tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -582,12 +779,6 @@ def _function_node(path: Path, qualname: str):
         else:                                       # pragma: no cover
             raise AssertionError(f"{qualname} not found in {path}")
     return node
-
-
-def _function_source(path: Path, qualname: str) -> str:
-    return ast.get_source_segment(
-        path.read_text(encoding="utf-8"),
-        _function_node(path, qualname)) or ""
 
 
 def _legacy_literals(path: Path, qualname: str) -> list[str]:
@@ -620,11 +811,52 @@ def _legacy_literals(path: Path, qualname: str) -> list[str]:
     return found
 
 
+def _owner_references(path: Path, qualname: str) -> set[str]:
+    """Owner API names actually LOADED or CALLED inside *qualname*.
+
+    C2 row 12.  Counts real ``ast.Name``/``ast.Attribute`` loads — which is also
+    every call target, since ``Call.func`` is one of those nodes — so a comment,
+    a docstring, or a dead string that merely spells ``resolve_output_target``
+    can never satisfy the census.  The superseded check was a substring scan over
+    the function's source text and accepted exactly that (C2 mutation 9).
+    """
+    node = _function_node(path, qualname)
+    seen: set[str] = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+            seen.add(sub.id)
+        elif isinstance(sub, ast.Attribute) and isinstance(sub.ctx, ast.Load):
+            seen.add(sub.attr)
+    return seen & set(OWNER_NAMES)
+
+
 @pytest.mark.parametrize("rel_path,qualname", HEADLESS_PRODUCERS)
 def test_row15_headless_producer_consumes_the_shared_owner(rel_path, qualname):
-    source = _function_source(SRC / rel_path, qualname)
-    assert any(name in source for name in OWNER_NAMES), (
+    assert _owner_references(SRC / rel_path, qualname), (
         f"{rel_path}::{qualname} does not consume the shared path owner")
+
+
+def test_c2row12_census_counts_loads_not_comments_or_dead_strings(tmp_path):
+    """C2 row 12 — prose naming the owner is not consumption of the owner."""
+    decoy = tmp_path / "decoy_producer.py"
+    decoy.write_text(
+        "def build(directory, name):\n"
+        '    """Resolves via resolve_output_target."""\n'
+        '    # return resolve_output_target(directory, name, mode="Append")\n'
+        '    _unused = "default_output_path"\n'
+        '    return f"{directory}/{name}.nexus"\n',
+        encoding="utf-8")
+    assert _owner_references(decoy, "build") == set()
+    assert any(n in decoy.read_text(encoding="utf-8") for n in OWNER_NAMES), (
+        "the decoy must still satisfy the superseded substring census")
+
+    honest = tmp_path / "honest_producer.py"
+    honest.write_text(
+        "from xrd_tools.io import resolve_output_target\n"
+        "def build(directory, name):\n"
+        "    return resolve_output_target(directory, name, mode='Append')\n",
+        encoding="utf-8")
+    assert _owner_references(honest, "build") == {"resolve_output_target"}
 
 
 @pytest.mark.parametrize("rel_path,qualname", HEADLESS_PRODUCERS)

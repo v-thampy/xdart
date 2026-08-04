@@ -28,6 +28,7 @@ from pyqtgraph.parametertree import ParameterTree, Parameter
 # Project imports
 from xrd_tools.io import resolve_output_target
 from xrd_tools.io.output_path import OVERWRITE_MODE
+from xrd_tools.io.output_safety import check_output_not_source
 from xrd_tools.core.containers import PONI
 from xrd_tools.session.run_configuration import RunConfigurationRefused
 from .wrangler_widget import (
@@ -675,6 +676,21 @@ class nexusWrangler(wranglerWidget):
             self.h5_dir = os.path.dirname(_target.output_path)
             self.fname = _target.output_path
             self.scan_name = _target.scan_name
+
+        # Collision preflight on the RESOLVED target before the scan is touched
+        # or the worker is built (source_architecture.md; §2 rule 8): an aliased
+        # source raises here, so the acquisition and the scan's current identity
+        # both survive.
+        check_output_not_source(self.fname, input_files=[self.nexus_file])
+
+        # nexusThread saves through ``scan.data_file``, not ``self.fname`` — a
+        # reused LiveScan otherwise keeps the previous run's path while the UI
+        # advertises this one.  Names only: no writer opened, nothing loaded.
+        if self.scan is not None:
+            self.scan.data_file = self.fname
+            frames = getattr(self.scan, 'frames', None)
+            if frames is not None:
+                frames.data_file = self.fname
 
         # GI parameters
         self.gi = self.parameters.child('GI').child('Grazing').value()
