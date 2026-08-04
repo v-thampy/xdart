@@ -5,6 +5,7 @@ from pathlib import Path
 from pyqtgraph.Qt import QtWidgets
 
 from xdart.gui.tabs.scattering.controls_projection import (
+    EditNoChange,
     EditRefusal,
     GI_ENABLED,
     GI_MOTOR,
@@ -482,6 +483,57 @@ def test_auto_toggle_off_leaves_the_max_blank_without_a_known_detector() -> None
     assert type(manual) is RunIntent
     assert manual.threshold.threshold_min == 0.0
     assert manual.threshold.threshold_max is None
+
+
+def test_degenerate_threshold_pairs_normalize_on_touch_and_adopt_at_run() -> None:
+    """Frozen rows (Codex REWORK 2026-08-04): the two EQUAL intent pairs —
+    (apply=True, mask=True) and (apply=False, mask=False), reachable only from
+    pre-LV-UI-11 or programmatic intents — must neither absorb a touch of the
+    shown Auto value as EditNoChange nor reach the run as-is.  Touch
+    normalizes to the displayed semantics; the run boundary adopts them."""
+    from xdart.gui.tabs.scattering.controls_inventory import MASK_SATURATION
+    from xdart.gui.tabs.scattering.output_preflight import (
+        execution_plan_values,
+    )
+
+    both_on = RunIntent()
+    both_on.threshold.apply_threshold = True
+    both_on.threshold.mask_saturation = True
+    both_on.threshold.threshold_min = 5.0
+    both_on.threshold.threshold_max = 1000.0
+    touched = reduce_control_edit(
+        RunIntentStore(both_on).snapshot(), MASK_SATURATION, True
+    )
+    assert type(touched) is RunIntent            # NOT EditNoChange
+    assert touched.threshold.mask_saturation is True
+    assert touched.threshold.apply_threshold is False
+    _, _, run_values = execution_plan_values(both_on.freeze())
+    assert run_values["mask_saturation"] is True
+    assert run_values["threshold_min"] is None   # adopted: Auto ON, no band
+    assert run_values["threshold_max"] is None
+
+    both_off = RunIntent()
+    both_off.threshold.apply_threshold = False
+    both_off.threshold.mask_saturation = False
+    both_off.threshold.threshold_min = 1.0
+    both_off.threshold.threshold_max = 2.0
+    touched = reduce_control_edit(
+        RunIntentStore(both_off).snapshot(), MASK_SATURATION, False
+    )
+    assert type(touched) is RunIntent            # NOT EditNoChange
+    assert touched.threshold.mask_saturation is False
+    assert touched.threshold.apply_threshold is True
+    _, _, run_values = execution_plan_values(both_off.freeze())
+    assert run_values["mask_saturation"] is False
+    assert run_values["threshold_min"] == 1.0    # adopted: manual band shown
+    assert run_values["threshold_max"] == 2.0
+
+    # The exclusive pairs keep EditNoChange for a same-value touch.
+    normal = RunIntent()                          # (apply=False, mask=True)
+    unchanged = reduce_control_edit(
+        RunIntentStore(normal).snapshot(), MASK_SATURATION, True
+    )
+    assert type(unchanged) is EditNoChange
 
 
 def test_vnext_threshold_fields_follow_the_auto_masksat_model(

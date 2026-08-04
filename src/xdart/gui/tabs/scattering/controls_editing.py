@@ -398,7 +398,17 @@ def reduce_control_edit(
     if isinstance(parsed, EditRefusal):
         return parsed
     current = _current_value(intent, path)
-    if parsed == current:
+    # LV-UI-11 invariant repair: a degenerate threshold pair (apply ==
+    # mask_saturation, reachable only from pre-LV-UI-11 or programmatic
+    # intents) must NOT absorb a touch of either bool as EditNoChange —
+    # the same-value edit falls through so the exclusivity branch below
+    # normalizes the complement to what the Auto control displays.
+    degenerate_threshold_pair = (
+        path in {MASK_SATURATION, THRESHOLD_ENABLED}
+        and bool(intent.threshold.apply_threshold)
+        == bool(intent.threshold.mask_saturation)
+    )
+    if parsed == current and not degenerate_threshold_pair:
         return EditNoChange()
     if path in {THRESHOLD_MIN, THRESHOLD_MAX}:
         low = parsed if path == THRESHOLD_MIN else intent.threshold.threshold_min
