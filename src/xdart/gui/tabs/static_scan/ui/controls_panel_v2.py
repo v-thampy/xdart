@@ -101,6 +101,12 @@ _FIELD_TOOLTIPS: dict[tuple[str, ...], str] = {
         "Source kind: a numbered image series, a directory of images, or a "
         "single image."),
     ("Signal", "include_subdir"): "Also search sub-directories for matching images.",
+    ("Signal", "Filter"): (
+        "Filename filter. Space-separated terms must ALL match "
+        "(case-insensitive substrings, any order): 'lab6 cal'. "
+        "Alternatives with | or OR: 'scan1 | scan2'. "
+        "Exclude with -term or NOT term: 'scan -bg'. "
+        "Empty matches every file."),
     ("Signal", "img_ext"): "Image file type (extension).",
     ("Signal", "meta_ext"): "Per-frame metadata format (auto, none, txt, metadata, spec, pdi).",
     ("Signal", "meta_dir"): (
@@ -127,12 +133,13 @@ def _field_tooltip(path, reason: str = "") -> str:
 
 _SOURCE_ENERGY_PATH = ("Source", "energy_preference")
 _SOURCE_ENERGY_OPTIONS = (("PONI", "poni"), ("Metadata", "metadata"))
-_FILE_NAME_ONLY_PATHS = {
-    ("Calibration", "poni_file"),
-    ("Project", "h5_dir"),
-    ("Signal", "poni_file"),
-    ("Signal", "mask_file"),
-    ("Signal", "File"),
+# Maintainer policy (2026-08-04, exception-based — supersedes the old
+# enumerated allowlist): ONLY the project folder displays its full path (it
+# anchors the whole session); every other browse-backed path field displays
+# its basename / final directory component, with the full path in the
+# tooltip and the committed model value.
+_FULL_PATH_DISPLAY_PATHS = {
+    ("Project", "project_folder"),
 }
 
 
@@ -648,7 +655,7 @@ class FormRow(QtWidgets.QWidget):
         self._file_name_only = (
             kind == "line"
             and browse
-            and self._path in _FILE_NAME_ONLY_PATHS
+            and self._path not in _FULL_PATH_DISPLAY_PATHS
         )
         self._model_value = "" if value is None else str(value)
         self._editor_dirty = False
