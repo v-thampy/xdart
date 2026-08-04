@@ -874,30 +874,13 @@ class RangeRow(QtWidgets.QWidget):
             btn.setObjectName("controlsV2AutoButton")
             btn.setText("✦")
             btn.setCheckable(True)
-            tpath = tuple(toggle["path"])
-            # LV-UI-1 (Threshold-style contract): every range toggle reads as
-            # "use the explicit bounds" — UNTOGGLED = auto, TOGGLED = the input
-            # boxes apply.  ``*_auto`` MODEL fields are therefore inverted at
-            # this one presentation seam; direct-polarity enables (Threshold's
-            # ("Mask", "Threshold") = True-means-apply) pass through unchanged.
-            self._toggle_inverted = bool(tpath) and tpath[-1].endswith("_auto")
-
-            def _model(checked: bool) -> bool:
-                return (not checked) if self._toggle_inverted else checked
-
-            self._toggle_model = _model
-            # checked<->model is an involution, so one mapping serves both
-            # directions.
-            btn.setChecked(_model(bool(toggle.get("value"))))
+            btn.setChecked(bool(toggle.get("value")))
             btn.setEnabled(bool(toggle.get("enabled", True)))
-            btn.setToolTip(toggle.get(
-                "tooltip",
-                "Explicit range (off = auto)"
-                if self._toggle_inverted else "Apply"))
+            btn.setToolTip(toggle.get("tooltip", "Auto"))
             btn.setMinimumWidth(31)
+            tpath = tuple(toggle["path"])
             btn.toggled.connect(
-                lambda checked, p=tpath:
-                    self.valueChanged.emit(p, self._toggle_model(bool(checked))))
+                lambda checked, p=tpath: self.valueChanged.emit(p, bool(checked)))
             lay.addWidget(btn)
             self._toggle = (tpath, btn)
 
@@ -919,10 +902,7 @@ class RangeRow(QtWidgets.QWidget):
     def current_edits(self) -> tuple[tuple[tuple[str, ...], object], ...]:
         out = []
         if self._toggle is not None:
-            out.append((
-                self._toggle[0],
-                self._toggle_model(bool(self._toggle[1].isChecked())),
-            ))
+            out.append((self._toggle[0], bool(self._toggle[1].isChecked())))
         if self._low.isEnabled():
             out.append((tuple(self._low_path), self._low.text()))
         if self._high.isEnabled():
@@ -946,11 +926,7 @@ class RangeRow(QtWidgets.QWidget):
                 return False
             was_blocked = btn.blockSignals(True)
             try:
-                # LV-UI-1: checked means "explicit values apply"; only *_auto
-                # model fields invert (see the constructor).
-                checked = (
-                    not bool(field.value)
-                    if self._toggle_inverted else bool(field.value))
+                checked = bool(field.value)
                 if btn.isChecked() != checked:
                     btn.setChecked(checked)
             finally:
@@ -1930,7 +1906,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
                 "path": toggle_field.path,
                 "value": toggle_field.value,
                 "enabled": toggle_field.enabled,
-                "tooltip": toggle_field.reason or "Explicit range (off = auto)",
+                "tooltip": toggle_field.reason or "Auto",
             }
         row = RangeRow(
             label=label,

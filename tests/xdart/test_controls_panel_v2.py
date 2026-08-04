@@ -4940,10 +4940,10 @@ def test_controls_panel_v2_auto_stays_visibly_checked_while_run_locked(
         qapp, monkeypatch):
     """The range toggle remains visibly on while disabled during processing.
 
-    LV-UI-1 semantics: checked now means EXPLICIT bounds (model
-    ``radial_auto=False``).  The logical checked bit already survived the run
-    lock, but the generic ``:disabled`` QSS rule painted the compact
-    QToolButton like an unchecked control.  Require the more-specific
+    Direct polarity (LV-UI-11 revert): checked = auto (model
+    ``radial_auto=True``, the default).  The logical checked bit already
+    survived the run lock, but the generic ``:disabled`` QSS rule painted the
+    compact QToolButton like an unchecked control.  Require the more-specific
     checked+disabled rule in both themes.
     """
     monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
@@ -4953,7 +4953,6 @@ def test_controls_panel_v2_auto_stays_visibly_checked_while_run_locked(
 
     widget = staticWidget()
     try:
-        widget._on_controls_v2_field_changed(("Int1D", "radial_auto"), False)
         widget._refresh_controls_v2_profile_now()
         widget._enter_run_state()
 
@@ -5005,11 +5004,10 @@ def test_apply_state_update_refuses_fast_path_when_fields_appear(qapp):
         panel.deleteLater()
 
 
-def test_range_toggle_follows_threshold_style_manual_semantics(qapp):
-    """LV-UI-1: untoggled = auto range; toggled = the explicit input bounds.
-
-    The MODEL field stays ``*_auto`` — the inversion lives only at the
-    presentation seam, mirroring Threshold's enable toggle."""
+def test_range_toggle_is_direct_polarity_auto_when_toggled(qapp):
+    """LV-UI-11 (reverts LV-UI-1/1b): the range toggle maps DIRECTLY onto the
+    ``*_auto`` model field — toggled ON = auto range, untoggled = the explicit
+    input bounds.  No presentation-seam inversion remains."""
     from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import RangeRow
 
     emitted = []
@@ -5022,9 +5020,9 @@ def test_range_toggle_follows_threshold_style_manual_semantics(qapp):
     row.valueChanged.connect(lambda p, v: emitted.append((tuple(p), v)))
     try:
         btn = row._toggle[1]
-        assert not btn.isChecked()                     # auto -> untoggled
+        assert btn.isChecked()                         # auto -> toggled ON
         assert (("Int1D", "radial_auto"), True) in row.current_edits()
-        btn.setChecked(True)                           # explicit bounds ON
+        btn.setChecked(False)                          # explicit bounds ON
         assert emitted == [(("Int1D", "radial_auto"), False)]
         assert (("Int1D", "radial_auto"), False) in row.current_edits()
     finally:
@@ -5033,9 +5031,10 @@ def test_range_toggle_follows_threshold_style_manual_semantics(qapp):
 
 
 def test_threshold_toggle_keeps_direct_apply_polarity(qapp):
-    """LV-UI-1 scope: Threshold's ("Mask", "Threshold") enable is True=apply —
-    NOT an *_auto field — so its toggle maps directly: toggled ON enables the
-    thresholding and emits True."""
+    """Legacy static_scan composition: Threshold's ("Mask", "Threshold") enable
+    is True=apply, and the toggle maps directly — toggled ON enables the
+    thresholding and emits True.  (The vNext scattering projection replaces
+    this toggle with the Mask-Saturated Auto toggle; see LV-UI-11.)"""
     from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import RangeRow
 
     emitted = []
