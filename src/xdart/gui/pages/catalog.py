@@ -33,4 +33,27 @@ LEGACY_STATIC_PAGE = PageDescriptor(
     build=_build_legacy_static,
 )
 
-BUILTIN_PAGES = (LEGACY_STATIC_PAGE,)
+def _build_scattering_workspace(services, parent):
+    from .scattering_workspace import build_scattering_workspace
+    return build_scattering_workspace(services, parent)
+
+
+SCATTERING_WORKSPACE_PAGE = PageDescriptor(
+    key=PageKey("scattering-workspace"),
+    label="Scattering Workspace",
+    description="vNext scattering reduction workspace (opt-in)",
+    icon_key="scattering-workspace",
+    category="workspace",
+    order=1,
+    lifecycle=PageLifecycle.EXIT_ONLY,
+    capabilities=frozenset({
+        PageCapability.OPEN_FOLDER,
+        PageCapability.RUN_CONTROL,
+        PageCapability.WRITE_MODE_TOGGLE,
+        PageCapability.RUN_ACTIVITY,
+        PageCapability.APP_MENU_HOSTS,
+    }),
+    build=_build_scattering_workspace,
+)
+
+BUILTIN_PAGES = (LEGACY_STATIC_PAGE, SCATTERING_WORKSPACE_PAGE)

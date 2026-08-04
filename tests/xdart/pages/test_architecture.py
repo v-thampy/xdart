@@ -60,6 +60,12 @@ def test_contract_modules_have_no_science_settings_or_main_imports():
     for path in sorted(PAGES.glob("*.py")):
         if path.name == "legacy_static.py":
             continue
+        # The vNext lazy adapter is a sanctioned science bridge, but only for
+        # imports deferred inside build-time function bodies: its MODULE level
+        # stays subject to the same prohibition as every contract module, and
+        # only the import census is narrowed (the token census below is
+        # skipped for it — the adapter names its own page by design).
+        adapter_lazy = path.name == "scattering_workspace.py"
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         type_checking_imports = {
             child
@@ -70,10 +76,17 @@ def test_contract_modules_have_no_science_settings_or_main_imports():
             for child in node.body
             if isinstance(child, ast.ImportFrom)
         }
-        for node in ast.walk(tree):
+        import_nodes = (
+            [node for node in tree.body
+             if isinstance(node, (ast.Import, ast.ImportFrom))]
+            if adapter_lazy
+            else [node for node in ast.walk(tree)
+                  if isinstance(node, (ast.Import, ast.ImportFrom))]
+        )
+        for node in import_nodes:
             if isinstance(node, ast.Import):
                 names = [alias.name for alias in node.names]
-            elif isinstance(node, ast.ImportFrom):
+            else:
                 if (
                     path.name == "services.py"
                     and node in type_checking_imports
@@ -83,14 +96,21 @@ def test_contract_modules_have_no_science_settings_or_main_imports():
                 ):
                     continue
                 names = [node.module or ""]
-            else:
-                continue
             for name in names:
                 if name.startswith(forbidden_import_roots):
                     offenders.append(f"{path.name}: imports {name}")
+        if adapter_lazy:
+            continue
         text = path.read_text(encoding="utf-8")
         if path.name == "services.py":
             text = _strip_sanctioned_j1_experiment_identifiers(text)
+        if path.name == "catalog.py":
+            # The catalog is the one module that NAMES pages; strip the exact
+            # registered vNext label — exactly one occurrence, so a second
+            # spelling can never ride the sanctioned strip — and every other
+            # Scattering token in a contract module still trips the census.
+            assert text.count('"Scattering Workspace"') == 1
+            text = text.replace('"Scattering Workspace"', "")
         for token in ("QSettings", "Scattering", "Experiment", "operations_for", "OperationOwners"):
             if token in text:
                 offenders.append(f"{path.name}: contains {token}")
