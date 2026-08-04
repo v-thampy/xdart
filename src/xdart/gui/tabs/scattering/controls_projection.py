@@ -330,11 +330,22 @@ def _threshold_auto_fields(
                     if candidate.path == THRESHOLD_MIN
                     else poni_saturation_ceiling(intent.poni_file)
                 )
+            # The disabled reason takes tooltip precedence, so the max
+            # bound's detector-scope caveat must ride the Auto-on reason
+            # too — the hover guard has to hold in BOTH Auto states
+            # (review P2, 2026-08-04).
             reason = (
                 "Controls are locked during the active run."
                 if not unlocked
                 else "Auto masks saturated pixels; turn it off to set "
                 "a manual threshold band."
+                + (
+                    " The default max is the detector family's typical "
+                    "raw-stream ceiling — a display default only; masking "
+                    "follows the acquired frame's own data type."
+                    if candidate.path == THRESHOLD_MAX
+                    else ""
+                )
                 if auto_on
                 else ""
             )

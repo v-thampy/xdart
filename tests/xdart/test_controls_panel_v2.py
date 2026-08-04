@@ -5071,11 +5071,22 @@ def test_threshold_row_adopts_mask_saturated_auto_toggle_in_vnext(qapp):
         )
 
         # Scope guard (Codex P2): the seeded max is a detector-FAMILY display
-        # default, not an acquisition-dtype fact — the hover text must say so.
-        from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import (
-            _FIELD_TOOLTIPS,
+        # default, not an acquisition-dtype fact — the RENDERED max-bound
+        # widget must say so in BOTH Auto states (the disabled reason takes
+        # tooltip precedence, so the Auto-on reason carries the caveat too).
+        assert "display default" in row._high.toolTip()   # Auto ON, disabled
+
+        manual = RunIntent()
+        manual.threshold.mask_saturation = False
+        manual.threshold.apply_threshold = True
+        panel.set_state(project_controls(
+            RunIntentStore(manual).snapshot(), None, RunPhase.IDLE))
+        manual_row = next(
+            r for r in panel.findChildren(RangeRow)
+            if tuple(r._low_path) == ("Mask", "min")
         )
-        assert "display default" in _FIELD_TOOLTIPS[("Mask", "max")]
+        assert manual_row._high.isEnabled()               # Auto OFF, manual
+        assert "display default" in manual_row._high.toolTip()
     finally:
         panel.close()
         panel.deleteLater()

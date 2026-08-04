@@ -899,6 +899,9 @@ class RangeRow(QtWidgets.QWidget):
         edit.setObjectName("controlsV2LineEdit")
         edit.setEnabled(bool(spec.get("enabled", True)))
         path = tuple(spec["path"])
+        # Same tooltip rule as _apply_edit: a full render must not leave the
+        # bounds without their hover text until the first state UPDATE.
+        edit.setToolTip(_field_tooltip(path, spec.get("reason", "")))
         edit.editingFinished.connect(
             lambda e=edit, p=path: self.valueChanged.emit(p, e.text())
         )
@@ -1964,9 +1967,9 @@ class ControlsPanelV2(QtWidgets.QWidget):
         row = RangeRow(
             label=label,
             low={"path": low_field.path, "value": low_field.value,
-                 "enabled": low_field.enabled},
+                 "enabled": low_field.enabled, "reason": low_field.reason},
             high={"path": high_field.path, "value": high_field.value,
-                  "enabled": high_field.enabled},
+                  "enabled": high_field.enabled, "reason": high_field.reason},
             toggle=toggle,
         )
         row.valueChanged.connect(self.fieldValueChanged)

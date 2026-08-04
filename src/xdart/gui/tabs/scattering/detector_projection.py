@@ -23,10 +23,14 @@ def detector_calibration_ready(poni_file: str) -> bool:
 
 
 def poni_saturation_ceiling(poni_file: str) -> float | None:
-    """The raw-dtype saturation ceiling of the PONI-declared detector family
-    (the value Mask Saturated keys off), or ``None`` when no valid PONI is
-    mounted or the family's raw dtype is unknown (LV-UI-11: the GUI shows a
-    blank manual-threshold default rather than a guessed number)."""
+    """The DISPLAY-DEFAULT ceiling for the PONI-declared detector family, or
+    ``None`` when no valid PONI is mounted or the family is unknown
+    (LV-UI-11: blank manual-threshold default rather than a guessed number).
+
+    This is the family's typical raw-stream ceiling used only to SEED the
+    manual-threshold inputs — not an acquisition fact: saturated-pixel
+    masking derives its ceiling from the acquired frame's own dtype at
+    reduction time (see ``xrd_tools.session.detector_limits``)."""
 
     return _detector_projection(poni_file, "")[2]
 

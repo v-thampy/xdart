@@ -444,10 +444,12 @@ def reduce_control_edit(
 
 
 def _seed_manual_threshold(intent: RunIntent) -> None:
-    """Fill absent manual-threshold bounds with the LV-UI-11 display defaults:
-    0 and the PONI-declared detector's raw-dtype saturation ceiling (the value
-    Mask Saturated keys off).  An unknown detector leaves the max absent —
-    blank in the GUI — rather than guessing."""
+    """Fill absent manual-threshold bounds with the LV-UI-11 display
+    defaults: 0 and the detector family's typical raw-stream ceiling — a
+    DISPLAY default, not an acquisition fact (saturation masking derives its
+    ceiling from the acquired frame's own dtype at reduction time).  An
+    unknown detector leaves the max absent — blank in the GUI — rather than
+    guessing."""
     threshold = intent.threshold
     if threshold.threshold_min is None:
         threshold.threshold_min = 0.0
