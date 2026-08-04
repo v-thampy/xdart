@@ -65,7 +65,10 @@ def test_embedded_source_visibility_is_explicit_through_recovery() -> None:
         _dispose(panel)
 
 
-def test_combo_reconciliation_preserves_construction_owned_choices() -> None:
+def test_combo_reconciliation_replaces_construction_owned_choices() -> None:
+    """Accepted PM1 contract: the projected ``ControlFormField.choices`` are
+    the authoritative combo vocabulary — construction-time items are removed,
+    not preserved, and no per-item metadata migrates across the rebuild."""
     QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     row = FormRow(
         label="Motor",
@@ -91,13 +94,19 @@ def test_combo_reconciliation_preserves_construction_owned_choices() -> None:
         )
 
         assert row.apply_field(field) is True
-        assert tuple(
+        visible = tuple(
             row.editor.itemText(index)
             for index in range(row.editor.count())
-        ) == ("Manual", "owner_th", "owner_eta", "projection_only")
+        )
+        assert "owner_th" not in visible
+        assert "owner_eta" not in visible
+        assert visible == ("Manual", "projection_only")
+        assert row.editor.itemData(
+            0, QtCore.Qt.ItemDataRole.UserRole
+        ) is not token
         assert row.editor.itemData(
             1, QtCore.Qt.ItemDataRole.UserRole
-        ) is token
+        ) is not token
         assert row.current_value() == "projection_only"
         assert edits == []
     finally:
