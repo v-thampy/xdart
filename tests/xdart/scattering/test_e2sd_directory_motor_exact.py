@@ -449,6 +449,9 @@ def test_tiff_revalidation_cancels_after_first_member_state_capture(
         cancelled=lambda: False,
         session_owner=lambda _session: None,
     )
+    # P4/OUT-1 retained-green: an explicit suffix-shaped save target is the
+    # operator's exact choice and is preserved byte-for-byte.
+    assert receipt.outputs[0].item.target == tmp_path / "processed.nxs"
     cancelled = Event()
     calls: list[Path] = []
     original = SourceFileState.capture
@@ -1324,7 +1327,7 @@ def test_exact_tiff_suffix_excludes_edf_mask_candidate(tmp_path: Path) -> None:
     try:
         assert len(receipt.outputs) == 1
         item = receipt.outputs[0].item
-        assert item.target.name == "scan.nxs"
+        assert item.target.name == "scan.nexus"
         assert tuple(Path(value.path) for value in item.source_stamp.members) == (
             image,
         )

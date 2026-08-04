@@ -12,6 +12,7 @@ from xrd_tools.core import (
     convert_radial_axis,
 )
 from xrd_tools.core.metadata import resolve_monitor_norm
+from xrd_tools.io import is_readable_output_path
 from xrd_tools.session.display_logic import (
     canonical_axis_key,
     nanmean_slice,
@@ -182,7 +183,8 @@ def trace_projection(
         frame_label = (
             int(view.source_frame_index) + 1
             if view.source_frame_index is not None
-            and source_suffix in {".h5", ".hdf5", ".nxs"}
+            and (source_suffix in {".h5", ".hdf5"}
+                 or is_readable_output_path(source_name))
             else frame.local_frame_label
         )
         title = (

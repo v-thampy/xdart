@@ -9,6 +9,7 @@ import numpy as np
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.integrate.calibration import load_poni
 from xrd_tools.io import load_mask
+from xrd_tools.io.output_path import OVERWRITE_MODE, resolve_output_target
 from xrd_tools.io.output_safety import check_output_not_source
 from xrd_tools.session.intent_store import RunIntentSnapshot
 from xrd_tools.session.run_configuration import FrozenRunConfiguration, RunIntent
@@ -298,6 +299,24 @@ def _selected_tiff_gi_motor(
     return motor if motor and motor != "Manual" else None
 
 
+def _resolved_generated_target(save_path: str, scan_name: str) -> Path:
+    """Delegate vNext's one generated-output naming decision to the shared owner.
+
+    vNext admission is Overwrite-only.  A suffix-shaped requested path is the
+    operator's explicit target and is preserved byte-for-byte; a directory
+    request generates ``<scan>.nexus`` (P4/OUT-1).  This helper only decides
+    how the captured ``save_path`` is supplied to the shared API — suffix,
+    collision, writer and transaction policy stay with their owners.
+    """
+    requested = Path(save_path)
+    return Path(resolve_output_target(
+        requested.parent if requested.suffix else requested,
+        scan_name,
+        mode=OVERWRITE_MODE,
+        explicit_target=requested if requested.suffix else None,
+    ))
+
+
 def _not_cancelled() -> bool:
     return False
 
@@ -454,8 +473,7 @@ def _series_item(
     members = members or (Path(options.get("selected_file") or source.uri),)
     states = _capture_source_states(members, cancelled)
     name = str(options.get("scan_name") or members[0].stem)
-    requested = Path(configuration.save_path)
-    target = requested if requested.suffix else requested / f"{name}.nxs"
+    target = _resolved_generated_target(configuration.save_path, name)
     motor_names = None
     admitted: tuple[AdmittedMotorValue, ...] = ()
     metadata_sources: tuple[AdmittedMetadataSource, ...] = ()
@@ -522,8 +540,7 @@ def _container_item(
         entry=descriptor.resolved_entry or descriptor.requested_entry,
     )
     name = descriptor.scan_name or path.stem.removesuffix("_master")
-    requested = Path(configuration.save_path)
-    target = requested if requested.suffix else requested / f"{name}.nxs"
+    target = _resolved_generated_target(configuration.save_path, name)
     stamp = SourceExecutionStamp(
         state,
         owner.id,
@@ -642,7 +659,7 @@ def _directory_items(
         items.append(PlannedOutput(
             spec,
             candidate.path,
-            root / f"{name}.nxs",
+            _resolved_generated_target(configuration.save_path, name),
             stamp,
             candidate,
             descriptor,

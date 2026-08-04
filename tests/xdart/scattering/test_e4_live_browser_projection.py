@@ -84,6 +84,7 @@ def test_processed_catalog_naturally_interleaves_directories_and_artifacts(
     (root / "scan_2").mkdir()
     (root / "scan_20").mkdir()
     (root / "scan_1.nxs").touch()
+    (root / "scan_3.nexus").touch()
     (root / "scan_10.nxs").touch()
 
     catalog = enumerate_processed_artifacts(str(root))
@@ -92,9 +93,17 @@ def test_processed_catalog_naturally_interleaves_directories_and_artifacts(
         "..",
         "scan_1.nxs",
         "scan_2/",
+        "scan_3.nexus",
         "scan_10.nxs",
         "scan_20/",
     )
+
+
+def test_processed_directory_maps_explicit_nexus_artifact_to_parent(tmp_path):
+    from xdart.gui.tabs.scattering.browser_catalog import processed_directory
+
+    target = tmp_path / "out" / "scan.nexus"
+    assert processed_directory(str(target)) == str(tmp_path / "out")
 
 
 def test_browser_time_sort_interleaves_directories_and_artifacts() -> None:

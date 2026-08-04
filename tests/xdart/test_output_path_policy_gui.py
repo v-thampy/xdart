@@ -42,11 +42,14 @@ from xdart.gui.tabs.static_scan.static_scan_widget import (
     _finished_output_file, staticWidget,
 )
 from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler_thread import nexusThread
 from tests.xdart._accepted_run import (
     accepted_run,
     admitted_worker,
+    container_source,
     directory_source,
 )
+from tests.xdart.test_o3n_nexus_freeze_identity import _write_poni
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -656,6 +659,8 @@ def _colliding_nexus(widget, tmp_path):
     source = _write_processed(tmp_path / "raw_source.h5")
     os.link(source, tmp_path / "raw_source.nexus")
     nexus = widget.ui.wranglerStack.widget(_nexus_index(widget))
+    nexus.parameters.child('Calibration').child('poni_file').setValue(
+        _write_poni(tmp_path / "cal.poni"))
     nexus.parameters.child('NeXus File').child('nexus_file').setValue(str(source))
     nexus.parameters.child('Output').child('h5_dir').setValue(str(tmp_path))
     return nexus, source
@@ -773,6 +778,25 @@ def test_pd_row5_an_unrelated_setup_error_is_not_swallowed(
         widget.deleteLater()
 
 
+def _admitted_nexus_target(out_dir, mode):
+    return nexusThread._frozen_source_target(accepted_run(
+        processing_mode="Int 2D", output_mode=mode, save_path=str(out_dir),
+        source_spec=container_source(out_dir / "acq" / "scan_042.nxs")))
+
+
+def test_cr_admitted_target_resolves_by_frozen_mode(tmp_path):
+    """Admitted target by frozen mode; the spelling row kills mutation 1."""
+    assert (Path(_admitted_nexus_target(tmp_path, "Overwrite").output_path)
+            == tmp_path / "scan_042.nexus")
+    assert (Path(_admitted_nexus_target(tmp_path, "Append").output_path)
+            == tmp_path / "scan_042.nexus")
+    legacy = _write_processed(tmp_path / "scan_042.NXS")
+    assert Path(_admitted_nexus_target(tmp_path, "Append").output_path) == legacy
+    preferred = _write_processed(tmp_path / "scan_042.nexus")
+    assert (Path(_admitted_nexus_target(tmp_path, "Append").output_path)
+            == preferred)
+
+
 # ---------------------------------------------------------------------------
 # Row 15 (GUI) — function-scoped owner census
 # ---------------------------------------------------------------------------
@@ -798,6 +822,13 @@ GUI_PRODUCERS = (
      "imageThread.initialize_scan"),
     ("xdart/gui/tabs/static_scan/wranglers/nexus_wrangler.py",
      "nexusWrangler.setup"),
+    ("xdart/gui/tabs/static_scan/wranglers/nexus_wrangler_thread.py",
+     "nexusThread._frozen_source_target"),
+    ("xdart/gui/tabs/scattering/output_preflight.py",
+     "_resolved_generated_target"),
+    ("xdart/gui/tabs/scattering/output_preflight.py", "_series_item"),
+    ("xdart/gui/tabs/scattering/output_preflight.py", "_container_item"),
+    ("xdart/gui/tabs/scattering/output_preflight.py", "_directory_items"),
 )
 
 #: Only the owner's real API names count as "consumes the owner".  A bare
@@ -809,7 +840,8 @@ GUI_PRODUCERS = (
 #: one such helper, not a second policy owner.
 OWNER_NAMES = ("resolve_output_target", "default_output_path",
                "NEW_OUTPUT_SUFFIX", "READABLE_OUTPUT_SUFFIXES",
-               "is_readable_output_path", "_readable_output_rank")
+               "is_readable_output_path", "_readable_output_rank",
+               "_resolved_generated_target")
 
 
 def _function_node(path: Path, qualname: str):
@@ -901,3 +933,5 @@ def test_row15_raw_source_pickers_keep_their_literal_nxs():
     ) or ""
     assert 'suffixes = (".nxs",)' in watch
     assert NEW_OUTPUT_SUFFIX not in watch
+    from xdart.gui.tabs.scattering.controls_inventory import SOURCE_FORMAT_SUFFIXES
+    assert SOURCE_FORMAT_SUFFIXES["nxs"] == (".nxs",)

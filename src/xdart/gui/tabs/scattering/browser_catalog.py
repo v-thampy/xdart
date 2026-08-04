@@ -8,6 +8,8 @@ from pathlib import Path
 import re
 import stat
 
+from xrd_tools.io import is_readable_output_path
+
 
 @dataclass(frozen=True, slots=True)
 class BrowserCatalogEntry:
@@ -39,7 +41,7 @@ def processed_directory(save_path: str) -> str:
     requested = Path(save_path).expanduser()
     directory = (
         requested.parent
-        if requested.suffix.casefold() == ".nxs"
+        if is_readable_output_path(requested)
         else requested
     )
     return os.path.abspath(os.fspath(directory))
@@ -79,7 +81,7 @@ def enumerate_processed_artifacts(
             ))
             continue
         if (
-            child.suffix.casefold() != ".nxs"
+            not is_readable_output_path(child)
             or not child.is_file()
         ):
             continue

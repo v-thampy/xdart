@@ -65,6 +65,7 @@ from xrd_tools.session.readiness import (
 )
 from xrd_tools.integrate.calibration import poni_to_integrator, get_detector
 from xrd_tools.reduction import GIFreezeError
+from xrd_tools.io import resolve_output_target
 from xrd_tools.io.nexus import open_nexus_execution_source
 from xrd_tools.io.image import read_image
 from xrd_tools.io.processed_scan_id import ProcessedXdartInputError
@@ -553,7 +554,8 @@ class nexusThread(wranglerThread):
             poni_values = tuple(values.items())
         return FrozenSourceTarget(
             uri, entry, scan_name,
-            os.path.join(save_path, f"{scan_name}.nxs"),
+            os.fspath(resolve_output_target(
+                save_path, scan_name, mode=frozen.output_mode)),
             output_dir=save_path,
             source_base=str(getattr(frozen, "project_root", "") or ""),
             output_mode=str(getattr(frozen, "output_mode", "") or "Append"),

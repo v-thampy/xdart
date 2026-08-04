@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 
+from xrd_tools.io import is_readable_output_path
 from xdart.modules.display_context import (
     AcquisitionContext,
     BrowseContext,
@@ -357,7 +358,7 @@ def _source_member_label(payload: StandardDisplayPayload) -> str:
     if not name:
         return payload.title
     suffix = os.path.splitext(name)[1].casefold()
-    if suffix not in {".h5", ".hdf5", ".nxs"}:
+    if suffix not in {".h5", ".hdf5"} and not is_readable_output_path(name):
         return name
     source_frame = payload.view.source_frame_index
     label = (

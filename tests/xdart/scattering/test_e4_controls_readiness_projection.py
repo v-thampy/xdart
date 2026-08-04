@@ -399,6 +399,11 @@ def test_project_header_requires_existing_project_and_creatable_save_target(
     ))
     assert not file_shaped_save.ready
 
+    intent.save_path = str(project / "new-output.nexus")
+    assert not project_header_projection(project_controls(
+        RunIntentStore(intent).snapshot(), None, RunPhase.IDLE,
+    )).ready
+
 
 def test_experiment_header_requires_readable_parseable_poni(
     tmp_path: Path,

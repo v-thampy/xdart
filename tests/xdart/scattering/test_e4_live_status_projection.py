@@ -89,6 +89,7 @@ def test_image_member_name_owns_live_status_and_plot_title(
             12,
             "bluesky_17_2_00090.nxs · frame 13",
         ),
+        ("/processed/scan_00090.nexus", 12, "scan_00090.nexus · frame 13"),
     ],
 )
 def test_container_member_name_includes_exact_source_frame(

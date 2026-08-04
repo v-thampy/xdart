@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 
+from xrd_tools.io import is_readable_output_path
+
 
 @dataclass(frozen=True, slots=True)
 class SectionHeaderProjection:
@@ -66,7 +68,7 @@ def _directory_target_is_ready(path: Path) -> bool:
         # A not-yet-created directory may legitimately contain dots. Reject
         # only the explicit processed-artifact shape this directory field used
         # to receive, rather than treating every suffix as a filename.
-        if path.suffix.casefold() == ".nxs":
+        if is_readable_output_path(path):
             return False
         ancestor = path.parent
         while not ancestor.exists():
