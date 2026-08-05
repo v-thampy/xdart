@@ -23,6 +23,7 @@ from xrd_tools.sources.selection import (
     DirectorySourceSpec,
     is_single_image_spec,
 )
+from xdart.utils.browse import browse_start_dir, remember_browse_path
 from .advanced_editor import AdvancedSettingsDialog
 from .adapters.browse_loader import BrowseLoader
 from .browser_catalog import (
@@ -122,6 +123,16 @@ _LIVE_EVENT_DRAIN_INTERVAL_MS = 125
 _BROWSER_CATALOG_REFRESH_INTERVAL_MS = 1500
 
 
+def _source_selection_path(source: object) -> str:
+    """Return the concrete browse pick represented by a source selection."""
+    if type(source) is DirectorySourceSpec:
+        return str(source.root)
+    if type(source) is not SourceSpec:
+        return ""
+    selected = source.options.get("selected_file")
+    return str(selected or source.uri)
+
+
 @dataclass(frozen=True, slots=True)
 class _ObservationOperation:
     request: SourceObservationRequest
@@ -164,14 +175,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         sources: SourcePort,
         executor: RunExecutorPort | None = None,
         browser_directory_chooser: (
-            Callable[[str], str | None] | None
+            Callable[[str, str], str | None] | None
         ) = None,
         control_path_chooser: (
-            Callable[[tuple[str, ...], str], str | None] | None
+            Callable[[tuple[str, ...], str, str], str | None] | None
         ) = None,
         source_selection_chooser: (
             Callable[
-                [SourceSelection | None, str | None],
+                [SourceSelection | None, str | None, str],
                 SourceSelection | None,
             ]
             | None
@@ -2028,11 +2039,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._request_observation(current)
         self._retry_deferred_gi_motor_default()
 
-    def _choose_directory_dialog(self, current: str) -> str | None:
+    def _choose_directory_dialog(
+        self,
+        _current: str,
+        start_directory: str,
+    ) -> str | None:
         chosen = QtWidgets.QFileDialog.getExistingDirectory(
             self,
             "Open processed data folder",
-            current,
+            start_directory,
         )
         return chosen or None
 
@@ -2079,13 +2094,19 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice("Unknown control.")
             return
         current = "" if field.value is None else str(field.value)
+        project_root = snapshot.thaw().project_root
+        start_directory = browse_start_dir(
+            current,
+            fallback=project_root,
+        )
         try:
-            selected = chooser(path, current)
+            selected = chooser(path, current, start_directory)
         except Exception as error:
             self._error_notice("Browse failed", error)
             return
         if type(selected) is not str or not selected:
             return
+        remember_browse_path(selected)
         self._on_field_value(path, selected)
 
     def _choose_source_selection(
@@ -2097,14 +2118,24 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self.sourceSelectionRequested.emit(desired_mode)
             self._refresh_shell()
             return
-        current = self._intents.snapshot().thaw().source_spec
+        intent = self._intents.snapshot().thaw()
+        current = intent.source_spec
         requested_mode = desired_mode or self._source_mode
+        start_directory = browse_start_dir(
+            _source_selection_path(current),
+            fallback=intent.project_root,
+        )
         try:
-            selected = chooser(current, requested_mode)
+            selected = chooser(
+                current,
+                requested_mode,
+                start_directory,
+            )
         except Exception as error:
             self._error_notice("Choose source failed", error)
             return
         if selected is not None:
+            remember_browse_path(_source_selection_path(selected))
             self.select_source(selected)
         else:
             self._refresh_shell()
@@ -2143,15 +2174,22 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._reconcile_snapshot(snapshot, result.snapshot)
 
     def _choose_browser_directory(self) -> None:
+        project_root = self._intents.snapshot().thaw().project_root
+        start_directory = browse_start_dir(
+            self._browser_directory,
+            fallback=project_root,
+        )
         try:
             selected = self._browser_directory_chooser(
-                self._browser_directory
+                self._browser_directory,
+                start_directory,
             )
         except Exception as error:
             self._error_notice("Open folder failed", error)
             return
         if type(selected) is not str or not selected:
             return
+        remember_browse_path(selected)
         self._set_browser_directory(selected, explicit=True)
 
     def _set_browser_directory(

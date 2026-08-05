@@ -142,7 +142,11 @@ def test_host_choosers_commit_paths_and_complete_source_values(
     path_calls: list[tuple[tuple[str, ...], str]] = []
     source_calls: list[tuple[object, str | None]] = []
 
-    def choose_path(path: tuple[str, ...], current: str) -> str | None:
+    def choose_path(
+        path: tuple[str, ...],
+        current: str,
+        _start_directory: str,
+    ) -> str | None:
         path_calls.append((path, current))
         return {
             PROJECT_ROOT: "/replacement/project",
@@ -151,7 +155,7 @@ def test_host_choosers_commit_paths_and_complete_source_values(
 
     replacement = _source("/replacement/source", generation=7)
 
-    def choose_source(current, desired_mode):
+    def choose_source(current, desired_mode, _start_directory):
         source_calls.append((current, desired_mode))
         return replacement
 
@@ -203,6 +207,137 @@ def test_host_choosers_commit_paths_and_complete_source_values(
         page.close()
 
 
+def test_vnext_choosers_share_and_persist_last_successful_directory(
+    qapp: QtWidgets.QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BD-1 spans control, source, and processed-browser chooser seams."""
+    session_file = tmp_path / "session.json"
+    monkeypatch.setenv("XDART_SESSION_FILE", str(session_file))
+    monkeypatch.delenv("XDART_SESSION_FRESH", raising=False)
+
+    initial_project = tmp_path / "initial-project"
+    initial_source = tmp_path / "initial-source"
+    initial_processed = tmp_path / "initial-processed"
+    picked_control = tmp_path / "picked-control"
+    picked_source = tmp_path / "picked-source"
+    for directory in (
+        initial_project,
+        initial_source,
+        initial_processed,
+        picked_control,
+        picked_source,
+    ):
+        directory.mkdir()
+    initial_poni = initial_project / "initial.poni"
+    initial_poni.touch()
+    selected_poni = picked_control / "selected.poni"
+    selected_poni.touch()
+
+    path_starts: list[tuple[tuple[str, ...], str]] = []
+    source_starts: list[str] = []
+    browser_starts: list[str] = []
+    path_results = iter((str(selected_poni), None))
+
+    def choose_path(
+        path: tuple[str, ...],
+        _current: str,
+        start_directory: str,
+    ) -> str | None:
+        path_starts.append((path, start_directory))
+        return next(path_results)
+
+    def choose_source(_current, _desired_mode, start_directory):
+        source_starts.append(start_directory)
+        return _source(str(picked_source), generation=1)
+
+    def choose_browser(_current: str, start_directory: str) -> None:
+        browser_starts.append(start_directory)
+        return None
+
+    store = RunIntentStore(RunIntent(
+        source_spec=_source(str(initial_source)),
+        project_root=str(initial_project),
+        poni_file=str(initial_poni),
+        save_path=str(initial_processed),
+        output_mode="Overwrite",
+    ))
+    page = ScatteringWorkspace(
+        intents=store,
+        lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter(),
+        browser_directory_chooser=choose_browser,
+        control_path_chooser=choose_path,
+        source_selection_chooser=choose_source,
+    )
+    try:
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.CONTROL_BROWSE,
+            path=PONI_FILE,
+        ))
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.CONTROL_BROWSE,
+            path=PROJECT_ROOT,
+        ))
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.CONTROL_BROWSE,
+            path=SOURCE_DIRECTORY,
+        ))
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.MENU,
+            "File:Open Folder",
+        ))
+
+        assert path_starts == [
+            (PONI_FILE, str(initial_project)),
+            (PROJECT_ROOT, str(picked_control)),
+        ]
+        assert source_starts == [str(picked_control)]
+        assert browser_starts == [str(picked_source)]
+    finally:
+        page.close_workspace()
+        page.close()
+
+    # A reconstructed host reads the same persisted owner.  The cancelled
+    # processed-browser dialog above must not have displaced the source pick.
+    restart_starts: list[str] = []
+
+    def choose_after_restart(_path, _current, start_directory):
+        restart_starts.append(start_directory)
+        return None
+
+    restarted = ScatteringWorkspace(
+        intents=RunIntentStore(store.snapshot().thaw()),
+        lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter(),
+        control_path_chooser=choose_after_restart,
+    )
+    try:
+        restarted._handle_shell_command(ShellCommand(
+            ShellCommandKind.CONTROL_BROWSE,
+            path=PONI_FILE,
+        ))
+        assert restart_starts == [str(picked_source)]
+
+        default_dialog_starts: list[str] = []
+
+        def cancel_default_dialog(_parent, _title, start):
+            default_dialog_starts.append(start)
+            return ""
+
+        monkeypatch.setattr(
+            QtWidgets.QFileDialog,
+            "getExistingDirectory",
+            cancel_default_dialog,
+        )
+        restarted._choose_browser_directory()
+        assert default_dialog_starts == [str(picked_source)]
+    finally:
+        restarted.close_workspace()
+        restarted.close()
+
+
 def test_source_form_is_the_only_picker_and_browse_replaces_complete_source(
     qapp: QtWidgets.QApplication,
 ) -> None:
@@ -224,7 +359,7 @@ def test_source_form_is_the_only_picker_and_browse_replaces_complete_source(
     )
     source_calls: list[tuple[object, str | None]] = []
 
-    def choose_source(selected, desired_mode):
+    def choose_source(selected, desired_mode, _start_directory):
         source_calls.append((selected, desired_mode))
         return replacement
 
@@ -277,7 +412,7 @@ def test_source_mode_switch_is_value_only_and_restores_each_mode(
     current = _source("/raw")
     source_calls: list[tuple[object, str | None]] = []
 
-    def choose_source(selected, desired_mode):
+    def choose_source(selected, desired_mode, _start_directory):
         source_calls.append((selected, desired_mode))
         return None
 

@@ -421,7 +421,7 @@ def test_j0_02_browser_footer_share_repeated_dotted_exact_keys(
         monkeypatch.setattr(
             rig.page,
             "_browser_directory_chooser",
-            lambda _current: str(browse.parent),
+            lambda _current, _start_directory: str(browse.parent),
         )
         rig.command(
             ShellCommand(ShellCommandKind.MENU, "File:Open Folder")

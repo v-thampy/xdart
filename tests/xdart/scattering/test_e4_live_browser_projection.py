@@ -405,7 +405,7 @@ def test_open_folder_and_refresh_publish_processed_catalog(
     (nested / "inside.nxs").touch()
     chooser_calls: list[str] = []
 
-    def choose(current: str) -> str:
+    def choose(current: str, _start_directory: str) -> str:
         chooser_calls.append(current)
         return str(selected)
 
@@ -581,7 +581,9 @@ def test_published_artifact_auto_follows_until_user_opens_folder(
         ),
         lifecycle=ScatteringCoordinator(),
         sources=FilesystemSourceAdapter(),
-        browser_directory_chooser=lambda _current: str(selected),
+        browser_directory_chooser=(
+            lambda _current, _start_directory: str(selected)
+        ),
     )
     shell = page.findChild(ScatteringWorkspaceShell)
     assert shell is not None
