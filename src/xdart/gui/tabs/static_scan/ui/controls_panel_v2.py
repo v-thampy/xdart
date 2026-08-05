@@ -863,10 +863,21 @@ class RangeRow(QtWidgets.QWidget):
     #: — never programmatic ``setText``), revisioned at action time (§12.4).
     draftChanged = QtCore.Signal(object, object)
 
-    def __init__(self, *, label, low, high, toggle=None, parent=None):
+    def __init__(
+        self,
+        *,
+        label,
+        low,
+        high,
+        toggle=None,
+        display_decimals: int | None = None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.setObjectName("controlsV2RangeRow")
         self._entries: list[tuple[tuple[str, ...], str]] = []
+        self._display_decimals = display_decimals
+        self._model_text_by_path: dict[tuple[str, ...], str] = {}
         self._display_label = str(label)
         lay = QtWidgets.QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -902,30 +913,76 @@ class RangeRow(QtWidgets.QWidget):
 
     def _edit(self, spec, lay):
         value = spec.get("value")
-        edit = QtWidgets.QLineEdit("" if value is None else str(value))
+        path = tuple(spec["path"])
+        self._model_text_by_path[path] = self._model_text(value)
+        edit = QtWidgets.QLineEdit(self._display_text(value))
+        edit.setModified(False)
         edit.setObjectName("controlsV2LineEdit")
         edit.setEnabled(bool(spec.get("enabled", True)))
-        path = tuple(spec["path"])
         # Same tooltip rule as _apply_edit: a full render must not leave the
         # bounds without their hover text until the first state UPDATE.
         edit.setToolTip(_field_tooltip(path, spec.get("reason", "")))
         edit.editingFinished.connect(
-            lambda e=edit, p=path: self.valueChanged.emit(p, e.text())
+            lambda e=edit, p=path: self.valueChanged.emit(
+                p, self._current_edit_value(e, p)
+            )
         )
         edit.textEdited.connect(
-            lambda text, p=path: self.draftChanged.emit(p, text)
+            lambda text, e=edit, p=path: self._draft_edited(e, p, text)
         )
         lay.addWidget(edit, 1)
         return edit, path
+
+    @staticmethod
+    def _model_text(value) -> str:
+        return "" if value is None else str(value)
+
+    def _display_text(self, value) -> str:
+        text = self._model_text(value)
+        if self._display_decimals is None or not text:
+            return text
+        try:
+            return format(float(value), f".{self._display_decimals}f")
+        except (TypeError, ValueError):
+            return text
+
+    def _draft_edited(
+        self,
+        edit: QtWidgets.QLineEdit,
+        path: tuple[str, ...],
+        text: str,
+    ) -> None:
+        edit.setModified(True)
+        self.draftChanged.emit(path, text)
+
+    def _current_edit_value(
+        self,
+        edit: QtWidgets.QLineEdit,
+        path: tuple[str, ...],
+    ) -> str:
+        # A formatted projection is not user intent.  Until textEdited marks a
+        # real draft, harvest the exact unformatted model value so focus/blur
+        # cannot round a threshold behind the operator's back.
+        return (
+            edit.text()
+            if edit.isModified()
+            else self._model_text_by_path[path]
+        )
 
     def current_edits(self) -> tuple[tuple[tuple[str, ...], object], ...]:
         out = []
         if self._toggle is not None:
             out.append((self._toggle[0], bool(self._toggle[1].isChecked())))
         if self._low.isEnabled():
-            out.append((tuple(self._low_path), self._low.text()))
+            out.append((
+                tuple(self._low_path),
+                self._current_edit_value(self._low, self._low_path),
+            ))
         if self._high.isEnabled():
-            out.append((tuple(self._high_path), self._high.text()))
+            out.append((
+                tuple(self._high_path),
+                self._current_edit_value(self._high, self._high_path),
+            ))
         return tuple(out)
 
     def apply_fields(
@@ -954,18 +1011,27 @@ class RangeRow(QtWidgets.QWidget):
             btn.setToolTip(_field_tooltip(field.path, field.reason) or "Auto")
         return True
 
-    @staticmethod
-    def _apply_edit(edit: QtWidgets.QLineEdit, field: ControlFormField) -> None:
+    def _apply_edit(
+        self,
+        edit: QtWidgets.QLineEdit,
+        field: ControlFormField,
+    ) -> None:
         edit.setEnabled(bool(field.enabled))
         edit.setToolTip(_field_tooltip(field.path, field.reason))
-        value = "" if field.value is None else str(field.value)
-        if edit.hasFocus() or edit.text() == value:
+        path = tuple(field.path)
+        self._model_text_by_path[path] = self._model_text(field.value)
+        value = self._display_text(field.value)
+        if edit.hasFocus():
             return
-        was_blocked = edit.blockSignals(True)
-        try:
-            edit.setText(value)
-        finally:
-            edit.blockSignals(was_blocked)
+        if edit.text() != value:
+            was_blocked = edit.blockSignals(True)
+            try:
+                edit.setText(value)
+            finally:
+                edit.blockSignals(was_blocked)
+        # Even when two exact model values share one rounded presentation,
+        # this accepted unfocused projection supersedes the prior UI draft.
+        edit.setModified(False)
 
 
 class PillRow(QtWidgets.QWidget):
@@ -1386,7 +1452,10 @@ class ControlsPanelV2(QtWidgets.QWidget):
                 (row._low, row._low_path), (row._high, row._high_path)
             ):
                 if (editor is not None and editor.hasFocus()):
-                    return ControlFormEdit(path=path, value=editor.text())
+                    return ControlFormEdit(
+                        path=path,
+                        value=row._current_edit_value(editor, path),
+                    )
         return None
 
     def _render_summary(self, profile: ControlProfile) -> None:
@@ -1877,7 +1946,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
                         display_only_pills.add(("MaskSat", "mask_sentinel"))
                 sub.add_row(self._make_range_row(
                     field, by_path[("Mask", "max")], toggle_field,
-                    label="Threshold"))
+                    label="Threshold", display_decimals=0))
                 consumed.update({("Mask", "min"), ("Mask", "max"), ("Mask", "Threshold")})
                 continue
             if path in {("Mask", "max"), ("Mask", "Threshold")} and ("Mask", "min") in by_path:
@@ -1956,6 +2025,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
         toggle_field: ControlFormField | None,
         *,
         label: str | None = None,
+        display_decimals: int | None = None,
     ) -> "RangeRow":
         if label is None:
             label = low_field.label
@@ -1978,6 +2048,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
             high={"path": high_field.path, "value": high_field.value,
                   "enabled": high_field.enabled, "reason": high_field.reason},
             toggle=toggle,
+            display_decimals=display_decimals,
         )
         row.valueChanged.connect(self.fieldValueChanged)
         row.draftChanged.connect(self.fieldDraftChanged)

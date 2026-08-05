@@ -5123,6 +5123,102 @@ def test_threshold_row_adopts_mask_saturated_auto_toggle_in_vnext(qapp):
         panel.deleteLater()
 
 
+def test_threshold_bounds_render_without_decimals_without_rounding_the_model(
+    qapp,
+):
+    """Threshold formatting is presentation-only; edits retain float truth."""
+
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.run_configuration import RunIntent
+    from xdart.gui.tabs.scattering.controls_projection import project_controls
+    from xdart.gui.tabs.scattering.state_machine import RunPhase
+
+    def _threshold_row(host):
+        return next(
+            row for row in host.findChildren(RangeRow)
+            if tuple(row._low_path) == ("Mask", "min")
+        )
+
+    intent = RunIntent()
+    intent.threshold.apply_threshold = True
+    intent.threshold.mask_saturation = False
+    intent.threshold.threshold_min = 12.25
+    intent.threshold.threshold_max = 4294967295.0
+    panel = ControlsPanelV2()
+    generic = RangeRow(
+        label="Q",
+        low={"path": ("Int1D", "radial_low"), "value": 0.25},
+        high={"path": ("Int1D", "radial_high"), "value": 4.75},
+    )
+    try:
+        panel.set_state(project_controls(
+            RunIntentStore(intent).snapshot(), None, RunPhase.IDLE
+        ))
+        row = _threshold_row(panel)
+        assert row._low.text() == "12"
+        assert row._high.text() == "4294967295"
+        assert (("Mask", "min"), "12.25") in row.current_edits()
+        assert (
+            (("Mask", "max"), "4294967295.0") in row.current_edits()
+        )
+
+        emitted = []
+        row.valueChanged.connect(
+            lambda path, value: emitted.append((tuple(path), value))
+        )
+        row._low.editingFinished.emit()
+        assert emitted[-1] == (("Mask", "min"), "12.25")
+
+        _user_types(qapp, panel, row._low, "12")
+        focused = panel.focused_form_edit()
+        assert focused is not None
+        assert focused.path == ("Mask", "min")
+        assert focused.value == "12"
+        row._low.editingFinished.emit()
+        assert emitted[-1] == (("Mask", "min"), "12")
+
+        row._low.clearFocus()
+        qapp.processEvents()
+        # A later accepted exact value can share the same rounded display
+        # bucket.  It must clear the old draft marker and remain authoritative
+        # when the untouched editor is focused/harvested again.
+        assert panel.apply_state_update(project_controls(
+            RunIntentStore(intent).snapshot(), None, RunPhase.IDLE
+        ))
+        row = _threshold_row(panel)
+        assert row._low.text() == "12"
+        assert (("Mask", "min"), "12.25") in row.current_edits()
+        row._low.setFocus()
+        qapp.processEvents()
+        focused = panel.focused_form_edit()
+        assert focused is not None and focused.value == "12.25"
+        row._low.clearFocus()
+        qapp.processEvents()
+
+        updated = RunIntent()
+        updated.threshold.apply_threshold = True
+        updated.threshold.mask_saturation = False
+        updated.threshold.threshold_min = 8.75
+        updated.threshold.threshold_max = 100.75
+        assert panel.apply_state_update(project_controls(
+            RunIntentStore(updated).snapshot(), None, RunPhase.IDLE
+        ))
+        row = _threshold_row(panel)
+        assert row._low.text() == "9"
+        assert row._high.text() == "101"
+        assert (("Mask", "min"), "8.75") in row.current_edits()
+        assert (("Mask", "max"), "100.75") in row.current_edits()
+
+        # Other numeric ranges keep their existing precision.
+        assert generic._low.text() == "0.25"
+        assert generic._high.text() == "4.75"
+    finally:
+        generic.close()
+        generic.deleteLater()
+        panel.close()
+        panel.deleteLater()
+
+
 def test_max_bound_scope_caveat_survives_run_lock(qapp):
     """DESIGN_STOP secondary (2026-08-04): the lock reason outranks the
     tooltip table too, so the detector-scope caveat must ride the LOCKED
