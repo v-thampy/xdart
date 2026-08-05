@@ -7,7 +7,11 @@ import math
 from pathlib import Path
 
 from xrd_tools.core.scan import SourceSpec
-from xrd_tools.session.intent_store import RunIntentSnapshot
+from xrd_tools.session.intent_store import (
+    IntentCommitAccepted,
+    RunIntentSnapshot,
+    RunIntentStore,
+)
 from xrd_tools.session.readiness import INTEGRATION_CONTROL_SPECS
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import DirectorySourceSpec
@@ -485,6 +489,32 @@ def canonicalize_threshold_intent(intent: RunIntent) -> bool:
                 threshold.threshold_max = ceiling
                 changed = True
     return changed
+
+
+def commit_canonical_threshold(
+    store: RunIntentStore, snapshot: RunIntentSnapshot
+) -> RunIntentSnapshot | None:
+    """Run the shared canonicalizer THROUGH the revisioned store and return
+    the canonical snapshot (``snapshot`` itself when already canonical).
+
+    Hosted HERE rather than in the start pipeline because candidate
+    mutation belongs to the editing module: callers hand in a snapshot and
+    receive a snapshot back, so no raw thawed ``RunIntent`` ever crosses a
+    kernel-module boundary (the semantic architecture guard permits a raw
+    intent outside the reducer only as the direct candidate of a store
+    ``commit``).  The bounded retry re-runs only on a genuine concurrent-
+    revision race; exhaustion returns ``None`` and the caller must refuse
+    with a typed outcome — a raw non-canonical capture is never produced.
+    """
+    for _ in range(3):
+        intent = snapshot.thaw()
+        if not canonicalize_threshold_intent(intent):
+            return snapshot
+        result = store.commit(intent, expected_revision=snapshot.revision)
+        if isinstance(result, IntentCommitAccepted):
+            return result.snapshot
+        snapshot = result.snapshot
+    return None
 
 
 def _normalize_gi_units(intent: RunIntent, *, was_enabled: bool) -> None:

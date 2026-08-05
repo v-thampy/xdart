@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from xrd_tools.session.intent_store import (IntentCommitAccepted,
-                                            RunIntentSnapshot, RunIntentStore)
+from xrd_tools.session.intent_store import RunIntentSnapshot, RunIntentStore
 from xrd_tools.session.run_configuration import FrozenRunConfiguration, RunIntent
 
 from .contracts import (AdmissionReceipt, AdmissionToken, RunExecutorPort,
                         SourceCapture, SourcePort, admitted_capture)
-from .controls_editing import canonicalize_threshold_intent
+from .controls_editing import commit_canonical_threshold
 from .coordinator import ScatteringCoordinator
 from .events import (CleanupStatus, ExecutorAccepted, ExecutorClosed, ExecutorStartFailed, LifecycleError,
                      LifecycleResult, LifecycleStatus, OwnersClosed, PreflightAccepted,
@@ -288,21 +287,14 @@ class StartPipeline:
         capture, not only for degenerate boolean pairs: manual mode must
         also MATERIALIZE the displayed default bounds (a cleared bound
         stores None while the panel shows the substituted default).  The
-        bounded retry only re-runs on a genuine concurrent-revision race;
-        exhaustion returns ``None`` and the caller refuses the start with a
-        typed outcome — a raw non-canonical capture is never produced.
+        CAS loop itself is hosted by the editing module
+        (:func:`commit_canonical_threshold`) so the pipeline never handles
+        a raw thawed intent — this seam receives and returns snapshots
+        only.  Exhaustion returns ``None`` and the caller refuses the
+        start with a typed outcome — a raw non-canonical capture is never
+        produced.
         """
-        for _ in range(3):
-            intent = snapshot.thaw()
-            if not canonicalize_threshold_intent(intent):
-                return snapshot
-            result = self._intents.commit(
-                intent, expected_revision=snapshot.revision
-            )
-            if isinstance(result, IntentCommitAccepted):
-                return result.snapshot
-            snapshot = result.snapshot
-        return None
+        return commit_canonical_threshold(self._intents, snapshot)
 
     def begin(self) -> StartCapture | StartRefused | StartRejected | StartFailed:
         try:
@@ -347,12 +339,6 @@ class StartPipeline:
             return StartRejected(StartRejection.STALE_CAPTURE)
         expected = capture.intent_snapshot.revision
         try:
-            # Design checkpoint 2026-08-04: every StartCapture creation path
-            # routes through the shared canonicalizer.  Canonicalizing the
-            # operator candidate BEFORE the commit keeps the accepted
-            # snapshot exact (the replacement capture must use the returned
-            # snapshot identity, not a later store read).
-            canonicalize_threshold_intent(candidate)
             result = self._intents.commit(candidate, expected_revision=expected)
         except Exception as error:
             return self._closed_invariant(error)
@@ -360,15 +346,38 @@ class StartPipeline:
             return self._recapture_required(capture, StartRecaptureCause.COMMIT_RACE, result.snapshot)
         if commit_result_is_valid(result, expected):
             self._capture = None
-            if result.snapshot.thaw().source_spec == capture.source_capture.source:
+            # Design checkpoint 2026-08-04: every StartCapture creation path
+            # routes through the shared canonicalizer.  The operator
+            # candidate commits first (the store commit is the only seam
+            # that may receive a raw intent); the ACCEPTED snapshot is then
+            # canonicalized through the same store loop, so the replacement
+            # capture still uses an exact store-accepted identity, never a
+            # later re-read.  Already-canonical candidates take no extra
+            # revision.
+            try:
+                canonical = self._canonical_threshold_snapshot(result.snapshot)
+            except Exception as error:
+                return self._closed_invariant(error)
+            if canonical is None:
+                return self._refuse(
+                    capture.request_id,
+                    StartRefusal.FREEZE_VALIDATION,
+                    detail=(
+                        "threshold canonicalization lost three consecutive "
+                        "intent revisions; retry the start"
+                    ),
+                )
+            if not snapshot_is_valid(canonical):
+                return self._closed_invariant(TypeError("threshold canonicalization returned an invalid snapshot"))
+            if canonical.thaw().source_spec == capture.source_capture.source:
                 self._capture_sequence += 1
                 replacement = StartCapture(
                     capture.request_id, self._capture_sequence,
-                    result.snapshot, capture.source_capture,
+                    canonical, capture.source_capture,
                 )
                 self._capture = replacement
                 return replacement
-            return self._capture_from_snapshot(result.snapshot, capture.request_id)
+            return self._capture_from_snapshot(canonical, capture.request_id)
         return self._closed_invariant(TypeError("RunIntentStore.commit() returned an invalid result"))
 
     def source_observation_changed(
