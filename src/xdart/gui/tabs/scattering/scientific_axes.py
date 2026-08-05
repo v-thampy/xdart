@@ -479,13 +479,14 @@ def resolve_norm_presentation(
 ) -> tuple[tuple | None, int, str, tuple[str, ...]]:
     """THE one §25.3 consumer resolution from ONE captured aggregate.
 
-    Returns ``(identity, revision, effective_channel, choices)`` for both
-    the runtime trace-delta scope and the scientific projection, so the two
-    scopes can never disagree.  Exact type and revision are validated here;
-    choices carry only complete channels outside the reserved sentinel; the
-    effective channel is empty unless the one accepted aggregate covers
-    EVERY selected frame and the saved selection case-insensitively names a
-    complete, non-reserved channel.
+    Returns ``(identity, revision, effective_channel, choices)`` from the one
+    aggregate both consumers borrow, so presentation provenance and numeric
+    normalization cannot disagree.  :func:`trace_normalization_scope` derives
+    the narrower trace-cache regime from that result.  Exact type and revision
+    are validated here; choices carry only complete channels outside the
+    reserved sentinel; the effective channel is empty unless the one accepted
+    aggregate covers EVERY selected frame and the saved selection
+    case-insensitively names a complete, non-reserved channel.
     """
 
     if type(aggregate) is not ScanNormAggregate:
@@ -519,6 +520,28 @@ def resolve_norm_presentation(
         ):
             effective = key
     return accepted.identity, accepted.revision, effective, choices
+
+
+def trace_normalization_scope(
+    identity: tuple | None,
+    effective_channel: object,
+) -> tuple[object, ...]:
+    """Return the numeric regime that can invalidate retained 1-D traces.
+
+    Aggregate revision is intentionally absent.  Each trace divides by the
+    immutable metadata carried by its own frame, so folding a later frame into
+    the same aggregate cannot change an earlier trace.  Identity and the
+    effective channel still invalidate the cache; the reserved display label
+    canonicalizes to the same unnormalized regime as an empty channel.
+    """
+
+    channel = (
+        effective_channel.lower()
+        if type(effective_channel) is str
+        and effective_channel.lower() != _RESERVED_NORM_SENTINEL
+        else ""
+    )
+    return identity, channel
 
 
 def requested_image_axis(
@@ -579,5 +602,6 @@ __all__ = [
     "requested_image_axis",
     "resolve_norm_presentation",
     "share_plot_axis_for_image",
+    "trace_normalization_scope",
     "trace_projection",
 ]

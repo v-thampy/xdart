@@ -35,7 +35,10 @@ from .display_values import (
     display_payload_is_valid,
 )
 from .events import CleanupStatus, RunIdentity
-from .scientific_axes import resolve_norm_presentation
+from .scientific_axes import (
+    resolve_norm_presentation,
+    trace_normalization_scope,
+)
 from .shell_values import FrameNavigationProjection
 
 
@@ -1076,10 +1079,11 @@ class _ContextRuntime:
     ) -> tuple[object, ...]:
         selection = self._selection
         identity = self._selected_projection_identity()
-        # E6-NORM-N2 (§25.3): the SAME resolution the projection consumes,
-        # so a newly accepted revision or an effective-channel change at a
-        # stable selected prefix reseeds the complete exact selected set.
-        norm_identity, norm_revision, effective_channel, _ = (
+        # The SAME resolution the projection consumes.  Aggregate revision is
+        # provenance, not a numeric trace-cache key: an appended frame cannot
+        # change an earlier frame's own metadata divisor.  A changed identity
+        # or effective channel still reseeds the complete selected set.
+        norm_identity, _norm_revision, effective_channel, _ = (
             resolve_norm_presentation(
                 self._norm_aggregate,
                 getattr(preferences, "norm_channel", None),
@@ -1098,9 +1102,10 @@ class _ContextRuntime:
             getattr(preferences, "slice_enabled", None),
             getattr(preferences, "slice_center", None),
             getattr(preferences, "slice_width", None),
-            norm_identity,
-            norm_revision,
-            effective_channel,
+            *trace_normalization_scope(
+                norm_identity,
+                effective_channel,
+            ),
         )
 
     def _reset_trace_projection(self) -> None:

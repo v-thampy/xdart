@@ -18,6 +18,7 @@ from xrd_tools.session.display_logic import (
 )
 
 from .display_values import DisplayFrameKey
+from .scientific_axes import trace_normalization_scope
 from .scientific_plot_options import (
     PLOT_OPTION_COMMAND_PATHS,
     PlotOptionsDialog,
@@ -882,12 +883,13 @@ class ScientificView(QtWidgets.QFrame):
             state.slice_enabled,
             state.slice_center,
             state.slice_width,
-            # E6-NORM-N2 (§25.3): a changed normalization identity,
-            # accepted revision or effective channel reseeds detached
-            # history — and, through this scope, the waterfall contract.
-            state.norm_identity,
-            state.norm_revision,
-            state.norm_channel,
+            # Aggregate revision remains visible provenance but does not
+            # change an earlier trace's per-frame metadata divisor.  Only the
+            # semantic normalization regime reseeds detached history.
+            *trace_normalization_scope(
+                state.norm_identity,
+                state.norm_channel,
+            ),
         )
         selected = navigation.selected
         prefix = (

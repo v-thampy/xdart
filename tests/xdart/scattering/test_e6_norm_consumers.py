@@ -14,7 +14,9 @@ candidate per refresh through the Q2 ``accepts_norm_aggregate`` gate;
 ``build_shell``/``build_scientific_projection`` consume that exact captured
 object; ``trace_projection`` divides each admitted payload's new 1-D array
 by its OWN ``resolve_monitor_norm`` value before scaling and Sum/Average;
-identity, revision and the effective channel enter both delta scopes.
+identity and the effective channel enter both trace-cache scopes; revision
+remains truthful aggregate provenance but cannot invalidate traces whose
+per-frame divisor regime is unchanged.
 
 E6-NORM-N2 correction 1 (handoff §27): the cross-token refused-switch rows
 and the reserved-sentinel row were frozen RED on the exact held candidate
@@ -228,11 +230,20 @@ def _acquisition_context(configuration, display) -> AcquisitionContext:
     return context
 
 
-def _acquisition_parts(rows, *, plot_mode: str = "Overlay", partitions=1):
+def _acquisition_parts(
+    rows,
+    *,
+    plot_mode: str = "Overlay",
+    partitions=1,
+    max_payload_items: int = 16,
+):
     """Real display + runtime: retained rows, adopted, latest-all selected."""
     configuration = _configuration()
     identity = RunIdentity.from_configuration(configuration)
-    display = RunDisplayState(identity, max_payload_items=16)
+    display = RunDisplayState(
+        identity,
+        max_payload_items=max_payload_items,
+    )
     display.set_factories(FrameRecordStore, PublicationStore)
     display.configure(partition_count=partitions, npt=2, frame_bytes=48)
     owner = _add_artifact(display, ARTIFACT, SCAN)
@@ -927,7 +938,7 @@ def test_same_channel_foreign_artifact_cannot_cross_and_span_falls_back():
     np.testing.assert_allclose(values[2], np.array([2.0, 3.0]) / 4.0)
 
 
-def test_new_revision_at_stable_prefix_reseeds_the_selected_set_once():
+def test_new_revision_at_stable_prefix_projects_only_the_appended_suffix():
     parts = _acquisition_parts(
         [(1, 1.0, {"mon": 2.0}), (2, 2.0, {"mon": 4.0})]
     )
@@ -943,19 +954,60 @@ def test_new_revision_at_stable_prefix_reseeds_the_selected_set_once():
     frames = parts.runtime.navigation.frames
     assert parts.runtime.select_navigation(frames[-1], frames)
     payloads = _project(parts, prefs)
-    # The newly accepted revision reprojects the COMPLETE exact selected
-    # set once — not only the appended suffix.
-    assert {
+    # Each trace divides by that frame's own immutable metadata value.  A
+    # newer aggregate revision therefore changes provenance/choices, not the
+    # already-rendered prefix's numeric regime.
+    assert [
         payload.frame_key.local_frame_label for payload in payloads
-    } == {1, 2, 3}
+    ] == [3]
     assert parts.runtime.norm_aggregate.revision == 3
     assert parts.runtime.commit_navigation_projection(
-        tuple(payload.frame_key for payload in payloads)
+        parts.runtime.navigation.selected
     )
     replay = _project(parts, prefs)
     assert [
         payload.frame_key.local_frame_label for payload in replay
     ] == [3]
+
+
+def test_revision_growth_keeps_trace_projection_work_linear():
+    """A retained prefix is projected once, not once per aggregate revision."""
+
+    frame_count = 651
+    parts = _acquisition_parts(
+        [(1, 1.0, {"mon": 2.0})],
+        max_payload_items=frame_count + 1,
+    )
+    prefs = _prefs(plot_mode="Overlay", norm_channel="mon")
+    projected = _project(parts, prefs)
+    projection_count = len(projected)
+    assert parts.runtime.commit_navigation_projection(
+        parts.runtime.navigation.selected
+    )
+
+    for label in range(2, frame_count + 1):
+        _, delta = _retain(
+            parts.display,
+            parts.owner,
+            SCAN,
+            ARTIFACT,
+            label,
+            float(label),
+            {"mon": float(label + 1)},
+        )
+        assert parts.runtime.accept_navigation(delta, plot_mode="Overlay")
+        frames = parts.runtime.navigation.frames
+        assert parts.runtime.select_navigation(frames[-1], frames)
+        projected = _project(parts, prefs, live_update=True)
+        projection_count += len(projected)
+        assert [
+            payload.frame_key.local_frame_label for payload in projected
+        ] == [label]
+        assert parts.runtime.commit_navigation_projection(
+            parts.runtime.navigation.selected
+        )
+
+    assert projection_count == frame_count
 
 
 def test_channel_change_at_stable_prefix_reseeds_the_runtime_ledger():
@@ -1123,21 +1175,22 @@ def test_context_switch_never_exposes_the_prior_identity_aggregate():
     assert parts.runtime.norm_aggregate is None
 
 
-def test_runtime_delta_scope_carries_identity_revision_and_channel():
+def test_runtime_delta_scope_uses_identity_and_channel_not_revision():
     parts = _acquisition_parts(
         [(1, 1.0, {"mon": 2.0}), (2, 2.0, {"mon": 4.0})]
     )
     prefs = _prefs(plot_mode="Overlay", norm_channel="Mon")
     _project(parts, prefs)
     scope = parts.runtime._trace_projection_scope(prefs, "Int 2D")
-    assert scope[-3:] == (parts.expected_identity, 2, "mon")
+    assert parts.runtime.norm_aggregate.revision == 2
+    assert scope[-2:] == (parts.expected_identity, "mon")
     placeholder = _prefs(plot_mode="Overlay", norm_channel="wat")
     scope = parts.runtime._trace_projection_scope(placeholder, "Int 2D")
-    assert scope[-3:] == (parts.expected_identity, 2, "")
+    assert scope[-2:] == (parts.expected_identity, "")
 
 
-@pytest.mark.parametrize("changed", ("identity", "revision", "channel"))
-def test_view_history_scope_reseeds_on_identity_revision_and_channel(
+@pytest.mark.parametrize("changed", ("identity", "channel"))
+def test_view_history_scope_reseeds_on_identity_and_channel(
     qapp: QtWidgets.QApplication,
     changed: str,
 ) -> None:
@@ -1155,7 +1208,6 @@ def test_view_history_scope_reseeds_on_identity_revision_and_channel(
     )
     doctored = {
         "identity": {"norm_identity": ("doctored", "identity", "tuple")},
-        "revision": {"norm_revision": first.norm_revision + 1},
         "channel": {"norm_channel": "i0"},
     }[changed]
     second = replace(first, traces=delta_trace, **doctored)
@@ -1176,6 +1228,39 @@ def test_view_history_scope_reseeds_on_identity_revision_and_channel(
             second, parts.navigation, completed=0, total=0, detail=""
         )
         assert view.trace_history_keys == (parts.frames[1],)
+    finally:
+        view.close()
+
+
+def test_view_history_preserves_prefix_across_revision_only(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    parts = _fabricated(
+        [(1, 1.0, {"mon": 2.0}), (2, 2.0, {"mon": 4.0})]
+    )
+    first = _build(
+        parts.payloads,
+        parts.navigation,
+        _prefs(plot_mode="Overlay", norm_channel="mon"),
+        parts.aggregate,
+    )
+    delta_trace = tuple(
+        trace for trace in first.traces if trace.frame is parts.frames[1]
+    )
+    second = replace(
+        first,
+        traces=delta_trace,
+        norm_revision=first.norm_revision + 1,
+    )
+    view = ScientificView()
+    try:
+        view.reconcile(
+            first, parts.navigation, completed=0, total=0, detail=""
+        )
+        view.reconcile(
+            second, parts.navigation, completed=0, total=0, detail=""
+        )
+        assert view.trace_history_keys == parts.frames
     finally:
         view.close()
 
