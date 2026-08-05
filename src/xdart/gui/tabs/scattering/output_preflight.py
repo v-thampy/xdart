@@ -575,7 +575,15 @@ def _directory_items(
     *,
     cancelled: Callable[[], bool] = _not_cancelled,
 ) -> tuple[PlannedOutput, ...]:
-    root, items, consumed = Path(configuration.save_path), [], set()
+    output_root, items, consumed = Path(configuration.save_path), [], set()
+    resolved_output_root = None
+    if not output_root.suffix:
+        try:
+            resolved_output_root = output_root.resolve(strict=False)
+        except (OSError, RuntimeError) as error:
+            raise ValueError(
+                f"directory output could not be resolved: {output_root}"
+            ) from error
     selected_source = (
         configuration.thaw_source_spec()
         if type(configuration) is FrozenRunConfiguration
@@ -664,10 +672,39 @@ def _directory_items(
                 candidate.adapter_id, descriptor.frame_count, 0,
                 external_members=external_members,
             )
+        output_request = configuration.save_path
+        if not output_root.suffix:
+            try:
+                relative_parent = candidate.path.parent.relative_to(plan.root)
+            except ValueError as error:
+                raise ValueError(
+                    "directory candidate escaped admitted root: "
+                    f"{candidate.path}"
+                ) from error
+            # Preserve each recursive source parent beneath the selected
+            # output directory. Direct children keep the existing flat shape;
+            # the shared owner still makes the filename/suffix decision.
+            output_directory = output_root / relative_parent
+            try:
+                resolved_output = output_directory.resolve(strict=False)
+            except (OSError, RuntimeError) as error:
+                raise ValueError(
+                    "directory output could not be resolved: "
+                    f"{output_directory}"
+                ) from error
+            if (
+                resolved_output_root is None
+                or not resolved_output.is_relative_to(resolved_output_root)
+            ):
+                raise ValueError(
+                    "directory output escaped selected root: "
+                    f"{output_directory}"
+                )
+            output_request = str(output_directory)
         items.append(PlannedOutput(
             spec,
             candidate.path,
-            _resolved_generated_target(configuration.save_path, name),
+            _resolved_generated_target(output_request, name),
             stamp,
             candidate,
             descriptor,

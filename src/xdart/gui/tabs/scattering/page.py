@@ -918,7 +918,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 detail="Finishing prior display cleanup…"
             )
             self._ensure_timer()
-            return False
+            return True
         if self._intents.snapshot().revision != result.revision:
             self._release_admission(token)
             self._render_start_outcome(
@@ -1497,7 +1497,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return False, "Workspace is closing"
         if self._run_executor is None or self._pipeline is None:
             return False, "Execution is unavailable"
-        if self._admission is not None:
+        admission = self._admission_state
+        if admission is not None:
+            if not admission.releasing:
+                return False, (
+                    "Finishing prior display cleanup…"
+                    if admission.admission_receipt is not None
+                    else "Checking output targets…"
+                )
+            released = admission.release_receipt
+            if (
+                released is not None
+                and released.cleanup_status is CleanupStatus.CLEANED
+            ):
+                return False, "Finishing prior display cleanup…"
             return False, "Output cleanup remains pending"
         if self._context_controller.browse_pending:
             return False, "Browse cleanup remains pending"

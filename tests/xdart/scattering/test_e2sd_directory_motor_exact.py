@@ -135,6 +135,138 @@ def test_numbered_directory_preview_uses_one_canonical_candidate_order(
     assert preview.gi_motor_choices == ("halpha",)
 
 
+def _recursive_container_start(
+    tmp_path: Path,
+    *,
+    save_path: Path | None = None,
+) -> tuple[StartCapture, tuple[Path, Path], Path]:
+    raw = tmp_path / "raw"
+    first = raw / "data" / "scan_0001.nxs"
+    second = raw / "live_test" / "scan_0001.nxs"
+    first.parent.mkdir(parents=True)
+    second.parent.mkdir(parents=True)
+    write_motor_container(first)
+    write_motor_container(second)
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    output = save_path or (tmp_path / "processed")
+    source = DirectorySourceSpec(
+        raw,
+        recursive=True,
+        suffixes=(".nxs",),
+    )
+    snapshot = RunIntentStore(RunIntent(
+        source_spec=source,
+        poni_file=str(poni),
+        save_path=str(output),
+        output_mode="Overwrite",
+    )).snapshot()
+    request = RequestId(719)
+    return (
+        StartCapture(
+            request,
+            1,
+            snapshot,
+            SourceCapture(request, 1, source),
+        ),
+        (first, second),
+        output,
+    )
+
+
+def test_recursive_same_named_containers_preserve_relative_output_directories(
+    tmp_path: Path,
+) -> None:
+    start, (first, second), output = _recursive_container_start(tmp_path)
+    sessions: list[DirectoryIndexSession] = []
+    reservations: list[tuple[Path, ...]] = []
+
+    receipt = prepare_output(
+        start,
+        cancelled=lambda: False,
+        session_owner=sessions.append,
+        targets_owner=reservations.append,
+    )
+    assert len(sessions) == 1
+    session = sessions[0]
+    try:
+        targets = {
+            item.item.source_path: item.item.target
+            for item in receipt.outputs
+        }
+        assert targets == {
+            first: output / "data" / "scan_0001.nexus",
+            second: output / "live_test" / "scan_0001.nexus",
+        }
+        assert len(reservations) == 1
+        assert set(reservations[0]) == set(targets.values())
+        assert all(not target.exists() for target in targets.values())
+        validate_admitted_receipt(receipt, session)
+    finally:
+        session.close()
+
+
+def test_recursive_explicit_target_refuses_before_reservation(
+    tmp_path: Path,
+) -> None:
+    explicit = tmp_path / "processed.nxs"
+    start, sources, _output = _recursive_container_start(
+        tmp_path,
+        save_path=explicit,
+    )
+    sessions: list[DirectoryIndexSession] = []
+    reservations: list[tuple[Path, ...]] = []
+    source_bytes = tuple(path.read_bytes() for path in sources)
+    try:
+        with pytest.raises(ValueError, match="duplicate output target"):
+            prepare_output(
+                start,
+                cancelled=lambda: False,
+                session_owner=sessions.append,
+                targets_owner=reservations.append,
+            )
+        assert reservations == []
+        assert not explicit.exists()
+        assert tuple(path.read_bytes() for path in sources) == source_bytes
+    finally:
+        for session in sessions:
+            session.close()
+
+
+def test_recursive_output_parent_symlink_cannot_escape_selected_root(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "processed"
+    outside = tmp_path / "outside"
+    output.mkdir()
+    outside.mkdir()
+    (output / "data").symlink_to(outside, target_is_directory=True)
+    start, sources, _output = _recursive_container_start(
+        tmp_path,
+        save_path=output,
+    )
+    sessions: list[DirectoryIndexSession] = []
+    reservations: list[tuple[Path, ...]] = []
+    source_bytes = tuple(path.read_bytes() for path in sources)
+    try:
+        with pytest.raises(
+            ValueError,
+            match="directory output escaped selected root",
+        ):
+            prepare_output(
+                start,
+                cancelled=lambda: False,
+                session_owner=sessions.append,
+                targets_owner=reservations.append,
+            )
+        assert reservations == []
+        assert tuple(outside.iterdir()) == ()
+        assert tuple(path.read_bytes() for path in sources) == source_bytes
+    finally:
+        for session in sessions:
+            session.close()
+
+
 def test_tiff_metadata_motor_names_are_finite_filtered_and_disabled_is_empty(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

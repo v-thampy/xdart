@@ -359,6 +359,10 @@ def test_reconcile_retains_pending_token_and_disables_run(
         assert page._admission is token
         assert executor._admission is operation
         assert not _shell(page).run_controls.startButton.isEnabled()
+        assert (
+            _shell(page).run_controls.readinessLabel.text()
+            == "Output cleanup remains pending"
+        )
         assert lifecycle.phase is RunPhase.IDLE
 
         session.failing = False

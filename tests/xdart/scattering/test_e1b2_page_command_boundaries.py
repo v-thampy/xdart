@@ -222,6 +222,43 @@ def test_executor_drain_timer_tracks_only_launched_run_lifetime(qapp: QtWidgets.
         _dispose(page, qapp)
 
 
+def test_fresh_run_projects_output_checking_not_cleanup(
+    qapp: QtWidgets.QApplication,
+    tmp_path: Path,
+) -> None:
+    executor = _Executor()
+    lifecycle = ScatteringCoordinator()
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(
+            RunIntent(
+                source_spec=image_series_spec(tmp_path / "frame_0001.tif"),
+                poni_file=str(tmp_path / "calibration.poni"),
+                save_path=str(tmp_path / "output.nxs"),
+                output_mode="Overwrite",
+            )
+        ),
+        lifecycle=lifecycle,
+        sources=_Sources(),
+        executor=executor,
+    )
+    try:
+        shell = _shell(page)
+        shell.commandRequested.emit(
+            ShellCommand(ShellCommandKind.RUN_ACTION)
+        )
+
+        assert lifecycle.phase is RunPhase.PREPARING
+        assert executor.start_calls == 0
+        assert page._admission is not None
+        assert not shell.run_controls.startButton.isEnabled()
+        assert (
+            shell.run_controls.readinessLabel.text()
+            == "Checking output targets…"
+        )
+    finally:
+        _dispose(page, qapp)
+
+
 def test_run_click_preserves_outgoing_paint_until_a_frame_arrives(
     qapp: QtWidgets.QApplication,
     tmp_path: Path,
@@ -544,10 +581,72 @@ def test_run_retries_transient_prior_display_cleanup_without_second_click(
         assert executor.start_calls == 0
         assert page._admission is not None
         assert "Prior display cleanup" not in page._notice_text
+        assert (
+            _shell(page).run_controls.readinessLabel.text()
+            == "Finishing prior display cleanup…"
+        )
 
         page._drain_executor()
         assert executor.start_calls == 1
         assert page._admission is None
         assert attempts[0] is attempts[1]
+    finally:
+        _dispose(page, qapp)
+
+
+def test_clean_output_release_projects_pending_display_retirement(
+    qapp: QtWidgets.QApplication,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    executor = _Executor()
+    lifecycle = ScatteringCoordinator()
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(
+            RunIntent(
+                source_spec=image_series_spec(tmp_path / "frame_0001.tif"),
+                poni_file=str(tmp_path / "calibration.poni"),
+                save_path=str(tmp_path / "output.nxs"),
+                output_mode="Overwrite",
+            )
+        ),
+        lifecycle=lifecycle,
+        sources=_Sources(),
+        executor=executor,
+    )
+    allow_retirement = False
+
+    def apply_retirement(_receipt) -> bool:
+        return allow_retirement
+
+    monkeypatch.setattr(
+        page._context_controller,
+        "apply_display_retirement",
+        apply_retirement,
+    )
+    try:
+        shell = _shell(page)
+        shell.commandRequested.emit(
+            ShellCommand(ShellCommandKind.RUN_ACTION)
+        )
+        page._drain_executor()
+        assert page._admission is not None
+
+        shell.commandRequested.emit(ShellCommand(ShellCommandKind.STOP))
+
+        state = page._admission_state
+        assert state is not None
+        assert state.releasing
+        assert state.release_receipt is not None
+        assert state.release_receipt.cleanup_status is CleanupStatus.CLEANED
+        assert lifecycle.phase is RunPhase.IDLE
+        assert (
+            shell.run_controls.readinessLabel.text()
+            == "Finishing prior display cleanup…"
+        )
+
+        allow_retirement = True
+        page._drain_executor()
+        assert page._admission is None
     finally:
         _dispose(page, qapp)
